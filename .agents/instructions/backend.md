@@ -257,16 +257,21 @@ Rules:
 
 ## 24. Canonical build and run entrypoints
 
-For the daily Docker development workspace, use `scripts/docker_dev.py` (or
-its `just docker-dev` wrapper) as the canonical entrypoint. `up` builds and
-starts the two services, `build` creates a backend package without starting
-them, and `recreate` applies an explicitly named existing assembly receipt to
-an explicitly named idle run without another backend build. The receipt paths,
-previous runtime-config SHA-256, source root, and port must be supplied
-explicitly; there is no `latest` lookup or automatic restart. Native Windows
-launcher and `Fullmag_build_runner` routes remain separate managed paths for
-release and non-development qualification; repository CI has its own workflow.
-Neither route is the daily Docker development default.
+For daily Docker development, use `scripts/docker_dev.py` and the `justfile`
+wrappers. First bind the selected registered checkout to its Compose project:
+`fullmag-master` or `fullmag-worktree-<worktree_id>`. All builds for that checkout
+must run within that project, never on the host, in another project, in an
+independent build container, or through the old runner. A missing compliant
+recipe is a route to fix, not permission for a fallback.
+
+The persistent `backend` service owns compilation and runtime. On every start,
+including an ordinary Docker Desktop restart, it checks current mounted sources
+and dependencies, prepares consistent build inputs, compiles only what is needed
+with the durable ext4 cache, validates the result, and starts API/native runtime
+in that same container. Unchanged inputs reuse the existing result. No separate
+host manifest-refresh command is required. The persistent `frontend` service
+keeps Next.js HMR running. Preserve native drain, recovery, data, and receipts.
+See [ADR 0061](../../docs/adr/0061-docker-development-build-and-runtime-container.md).
 
 For managed/container build tasks outside that daily Docker workspace, the
 repository `justfile` is the first place to look. If a managed/container recipe
@@ -295,9 +300,14 @@ the build path.
 
 ### Canonical daily Docker development recipes
 
-- `python -B scripts/docker_dev.py ... up` — build the selected backend and start the two services.
-- `python -B scripts/docker_dev.py ... build` — create the backend package without starting services.
-- `python -B scripts/docker_dev.py ... recreate` — apply an explicitly named existing package to an explicitly named idle run without another build; supply the receipts, previous config SHA-256, source root, and port.
+- `python -B scripts/setup_docker.py` — configure host storage, sources and port.
+- `just docker-dev-toolchain` — prepare pinned dependencies in the selected group.
+- `just docker-dev "<checkout>" <port> ["<script.py>"]` — start backend and frontend.
+- Restart the selected backend after saving the project and finishing active
+  simulations; it checks current sources and builds as needed by itself.
+
+Do not use the old separate build/assembly/recreate cycle for daily iteration.
+Treat the new lifecycle as `NOT VERIFIED` until actual runtime evidence exists.
 
 ### Canonical managed entrypoints outside daily Docker development
 

@@ -45,15 +45,16 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 
 ## Build i dowody
 
+- Każdy build podczas pracy nad `master` lub worktree musi należeć do grupy Docker Compose wybranego checkoutu: `fullmag-master` albo `fullmag-worktree-<worktree_id>`. Ustal tę grupę przed rozpoczęciem budowania. Wszystkie buildy backendu, frontendu i ich zależności wykonuj wyłącznie w jej ramach — nigdy na hoście, w innej grupie, w niezależnym kontenerze ani przez dawny runner. Backend kompiluje i następnie uruchamia API/native runtime w tym samym stałym kontenerze `backend`; frontend używa swojej usługi `frontend` i HMR. Nie twórz osobnego kontenera `backend-build`. Zarządzane recepty muszą jawnie zachowywać projekt Compose, źródła, trwały cache, storage, blokady i receipty tej grupy. Brak zgodnej recepty oznacza konieczność naprawy tej ścieżki, nie zgodę na build poza grupą.
 - Tymczasowo nie buduj testów jednostkowych ani nie uruchamiaj zadań, których celem jest ich kompilacja; zakaz obowiązuje do odwołania przez użytkownika.
-- Codzienny development Fullmaga wykonuj wyłącznie przez bezpośrednią ścieżkę Docker Compose: `python -B scripts/setup_docker.py`, `just docker-dev-toolchain`, `just docker-dev` oraz `just docker-dev-build`. Ta ścieżka używa natywnego Windows Python/PowerShell, Docker Desktop z silnikiem Linux i zarejestrowanego checkoutu jako bind mountu. Nie kieruj developmentu do `Fullmag_build_runner`, hostowego `cargo`/`cmake`, natywnego launchera Windows ani ręcznego Docker; wybór, storage, lock, provenance i końcowy receipt muszą przejść przez istniejący launcher oraz resolver. Jawne bramki release, GitHub CI/self-hosted i kwalifikacja naukowa zachowują własne, osobno udokumentowane zarządzane recepty.
+- Codzienny development Fullmaga wykonuj wyłącznie przez bezpośrednią ścieżkę Docker Compose w grupie wybranego checkoutu: `python -B scripts/setup_docker.py`, `just docker-dev-toolchain` i `just docker-dev`. Ta ścieżka używa natywnego Windows Python/PowerShell, Docker Desktop z silnikiem Linux i zarejestrowanego checkoutu jako bind mountu. Nie kieruj developmentu do `Fullmag_build_runner`, hostowego `cargo`/`cmake`, natywnego launchera Windows ani ręcznego Docker; wybór, storage, lock, provenance i końcowy receipt muszą przejść przez istniejący launcher oraz resolver. Jawne bramki release, GitHub CI/self-hosted i kwalifikacja naukowa zachowują własne, osobno udokumentowane zarządzane recepty.
 - Dla Docker dev jawnie wybierz zarejestrowany checkout/worktree przez `--source-root` lub argument `just docker-dev`; launcher wyprowadza źródła i storage przez resolver, bez cichego fallbacku. Dla osobnych bramek release/CI/naukowych jawnie przypnij `snapshot` albo pełny SHA commita i użyj właściwej udokumentowanej recepty. Nie zamieniaj żądanego GPU na CPU. Testy lekkie i odrębne bramki runtime/nauki zachowują swoje recepty; sukces buildu nie zastępuje ich dowodów.
 
 - Nowy worktree na tym samym hoście nie potrzebuje własnego `.env`: resolver ustala główny checkout przez Git i czyta jego plik. Instrukcja i `.env.example` są wersjonowane; wartości hosta pozostają lokalne. Dla nowego klona na innym hoście przed pierwszym buildem skonfiguruj `.env` głównego checkoutu według `.env.example`, zachowując istniejące ustawienia. Jeśli lokalizacja storage nie została określona, uzyskaj ją od użytkownika; nie kopiuj ścieżki z innego hosta ani nie traktuj fallbacku resolvera jako konfiguracji operatora.
 
 - Fizyczną lokalizację storage hosta deklaruj przez `FULLMAG_PROJECT_STORAGE_ROOT` w lokalnym `.env` głównego checkoutu (szablon: `.env.example`). Worktree korzystają z tej samej konfiguracji przez resolver. Nie wpisuj stałych ścieżek Windows/Linux do instrukcji ani skilli i nie kopiuj całego `.env` do worktree. Buildy są podkatalogami rozwiązanego storage; jawne zmienne procesu, w tym mapowanie kontenera, mają pierwszeństwo i podlegają tej samej walidacji.
 
-- Przed wyborem polecenia builda czytaj `justfile`. Docker dev używa `just docker-dev-toolchain`, `just docker-dev` i `just docker-dev-build`; natywne FEM/MFEM/CUDA/hypre/libCEED pozostają container-backed i używają właściwej zarządzanej recepty wyłącznie dla jawnych bramek release/naukowych. Hostowe `cargo`, `cmake`, bezpośrednie binaria i ręczny Docker nie są ścieżką kwalifikacji.
+- Przed wyborem polecenia builda czytaj `justfile`. Docker dev używa recept grupy `just docker-dev-toolchain` i `just docker-dev`; natywne FEM/MFEM/CUDA/hypre/libCEED pozostają container-backed i używają właściwej zarządzanej recepty wyłącznie dla jawnych bramek release/naukowych. Hostowe `cargo`, `cmake`, bezpośrednie binaria i ręczny Docker nie są ścieżką kwalifikacji.
 - Docker dev uruchamiaj z natywnego Windows PowerShell przez Docker Desktop w trybie kontenerów Linux; WSL może czytać i edytować checkout, ale nie uruchamia `scripts/docker_dev.py` ani `scripts/setup_docker.py` jako ścieżki startu. Wszystkie nowe kontrolowane dane kieruj do kanonicznego `storage` projektu; `FULLMAG_WINDOWS_*_ROOT` pozostaje wyłącznie zwalidowanym adapterem zgodności i nie może tworzyć alternatywnych rootów poza konfiguracją.
 - Przed buildem, uruchomieniem lub porządkowaniem storage przeczytaj [reguły backendu i wykonania](.agents/instructions/backend.md), w tym dokładne ścieżki Linux/Windows. Linuxowy runner nigdy nie buduje bezpośrednio na CIFS. Prune jest domyślnie tylko dry-run przez `FULLMAG_RUNTIME_DRY_RUN=1`; usunięcie wymaga autoryzacji.
 - Obowiązująca polityka worktree, profili buildów, `justfile`, cache, runów i sprzątania znajduje się w [Fullmag build-storage governance](docs/guides/fullmag-build-storage-governance.md). Resolver wyprowadza project root ze wspólnego katalogu Git głównego checkoutu; `storage` i `worktrees` są jego rodzeństwem. Przed utworzeniem worktree sprawdź rejestr i użyj istniejącej izolacji; bez automatycznego `fetch`/`pull`/bootstrapu.
@@ -65,57 +66,67 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 
 ### Docker Compose — jedyna ścieżka codziennego developmentu
 
+Obowiązuje grupa Docker Compose przypisana do wybranego checkoutu: `fullmag-master`
+lub `fullmag-worktree-<worktree_id>`. Przed jakimkolwiek buildem ustal źródła i tę
+grupę. Wszystkie buildy odbywają się w jej ramach; osobny kontener budujący poza
+grupą, hostowy kompilator i dawny runner są niedozwolone. Nie uruchamiaj zastępczej
+trasy, jeżeli launcher nie realizuje tego kontraktu — popraw właściwą receptę.
+
+Grupa ma dokładnie dwie stałe usługi aplikacji:
+
+- `backend` — sprawdzenie wejść, przyrostowy build, walidacja pakietu, następnie
+  API i native runtime FDM/FEM CPU/GPU w tym samym kontenerze;
+- `frontend` — Next.js dev z HMR z tego samego checkoutu.
+
+Kompilacja i start backendu są widoczne w jego logu Docker Desktop. Nie twórz
+osobnego `backend-build` i nie przenoś dużego pakietu między kontenerami przez
+storage Windows. Kontrakt: [ADR 0061](docs/adr/0061-docker-development-build-and-runtime-container.md).
+
 Na nowym hoście uruchom z natywnego PowerShella `python -B scripts/setup_docker.py`.
 Kreator zapisuje wybrany `FULLMAG_PROJECT_STORAGE_ROOT`, checkout źródeł i port
 frontendu do lokalnego `.env` głównego checkoutu; nie buduje, nie uruchamia i nie
-usuwa kontenerów. Sprawdzenie bez zapisu wykonuje `python -B scripts/setup_docker.py --check`.
+usuwa kontenerów. Sprawdzenie bez zapisu: `python -B scripts/setup_docker.py --check`.
 
-Po konfiguracji używaj:
+Zarejestrowany checkout jest readonly bind mountem obu usług. Backend buduje
+zweryfikowany cień źródeł i zachowuje cache Cargo/CMake na trwałym ext4; frontend
+reaguje przez HMR na zapis plików Windows. Przy KAŻDYM starcie, również po zwykłym
+restarcie w Docker Desktop, backend sam sprawdza aktualne zamontowane źródła,
+przygotowuje ich spójne wejście do kompilacji i przebudowuje tylko zmienione elementy
+oraz wymaganych konsumentów. Bez zmian używa istniejącego wyniku i startuje API.
+Nie wymagaj od użytkownika osobnego odświeżania manifestu ani hostowego polecenia
+builda. W trybie dev nie pakuj źródeł do ZIP/TAR i nie wysyłaj archiwum do
+kontenera: oba serwisy korzystają z live bind mountu wybranego checkoutu. Cache pozostaje trwały. Przed restartem zapisz projekt i zakończ symulację;
+zatrzymanie zachowuje native drain, a niepotwierdzony owner wymaga recovery.
+Przy zgodnym obrazie i mountach restart zachowuje container ID backendu oraz
+działający frontend. Zmiana obrazu lub mountów może wymagać odtworzenia usługi.
+
+Start po konfiguracji (recepty muszą spełniać powyższy kontrakt grupy):
 
 ```powershell
 just docker-dev-toolchain
 just docker-dev "<absolutny-checkout-lub-worktree>" 3197
+# Opcjonalnie: aktywny model z pliku w wybranym checkoutcie.
+just docker-dev "<absolutny-checkout-lub-worktree>" 3197 "examples/fem_relax_gpu_smoke.py"
 ```
 
-`just docker-dev` buduje backend w usłudze Compose i uruchamia prywatną grupę
-`backend`/`frontend`. Wybrany checkout jest zarejestrowany w Git, montowany
-readonly do obu usług i pozostaje źródłem HMR frontendu. `just docker-dev-build`
-wykonuje kolejną jawną kompilację backendu z cache, bez restartu aktywnej grupy
-ani symulacji. Zmiana backendu nie uruchamia builda automatycznie; zastosowanie
-nowego pakietu wymaga kontrolowanego, jawnego startu po bezpiecznym zatrzymaniu.
+Bez `just`: `python -B <main>\scripts\docker_dev.py --repo-root <main> up --source-root <worktree> --port <port> [--script <script>]`.
+Plik `.py` jest rozwiązywany względem wybranych źródeł, walidowany i hashowany.
+`study.wait_for_solve(True)` publikuje model oczekujący na Compute; zwykły skrypt
+uruchamia Solve automatycznie. Restart backendu nie oznacza ponownego Solve.
 
-Bez `just` użyj natywnego Pythona: `python -B <main>\scripts\bootstrap_docker_toolchain.py --repo-root <main> --direct-development`, następnie `python -B <main>\scripts\docker_dev.py --repo-root <main> up --source-root <worktree> --port <port>` (start), `python -B <main>\scripts\docker_dev.py --repo-root <main> build --source-root <worktree>` (sam cache build) albo `python -B <main>\scripts\docker_dev.py --repo-root <main> up --source-root <worktree> --port <port> --script <script>` (start ze skryptem). Główna grupa Compose to `fullmag-master`, worktree otrzymuje `fullmag-worktree-<worktree_id>`; port wybiera operator i musi być unikalny, launcher go nie dobiera automatycznie.
+Frontend publikuje jeden jawnie wybrany, unikalny port loopback. Backend pozostaje
+prywatny pod `backend:8081`. Sieć, ustawienia i `workspace.db` są odrębne per grupa;
+sesje i wyniki pozostają w fizycznym storage Windows. Nie resetuj ownera, nie
+przejmuj obcej grupy i nie usuwaj cache, sesji ani wyników jako skutku restartu.
 
-Frontend publikuje wyłącznie wybrany port loopback hosta, a backend jest dostępny
-tylko jako `backend:8081` w prywatnej sieci tej grupy. Projekt Compose, sieć,
-port i `workspace.db` są izolowane per checkout; sesje, wyniki, logi, cache i
-receipty pozostają w resolverze storage. Launcher odrzuca kolizję portu lub
-aktywną grupę i nie wykonuje automatycznego restartu, przejęcia ani resetu.
+Profil dev (`backend-dev`, `live-shadow-v1`) jest odrębny od release/frozen.
+Deklaracje bibliotek są w `docker/fem-gpu/Dockerfile`, `rust-toolchain.toml`,
+manifestach Cargo i `Cargo.lock`, `packages/fullmag-py/pyproject.toml`,
+`apps/control-room/package.json` oraz `pnpm-lock.yaml`; nie instaluj ich na hoście.
+Instrukcja jest kontraktem, nie dowodem implementacji. Dopóki właściwa recepta
+nie spełnia go i nie ma dowodu runtime, oznacz ją `NOT VERIFIED`.
 
-Skrypt startowy jest opcjonalnym argumentem trzecim `just docker-dev` i jest
-rozwiązywany względem wybranego checkoutu:
-
-```powershell
-just docker-dev "<absolutny-worktree>" 3197 "examples/fem_relax_gpu_smoke.py"
-```
-
-Walidacja ścieżki, hasha, provenance i odpowiedzi API pozostaje fail-closed.
-Skrypt z `study.wait_for_solve(True)` (przykład:
-`examples/fem_de_smoke_numeric.py`) kończy aktywację w stanie oczekiwania na
-Compute; nie jest to cichy fallback ani dowód wykonania GPU. WSL służy tu do
-edycji i diagnostyki źródeł; start, build i konfigurację Docker dev wykonuj
-z natywnego Windows PowerShella.
-
-Profil `dev` używa `backend-dev`, `live-shadow-v1`, trwałego cache i bind mountu
-źródeł. Profil `release`/`frozen` jest osobną, przypiętą ścieżką archiwum i
-kwalifikacji; nie używaj go do codziennej iteracji. Piny toolchaina są źródłowo
-w `docker/fem-gpu/Dockerfile`, `rust-toolchain.toml`, manifestach Cargo,
-repozytoryjnym `Cargo.lock`, `packages/fullmag-py/pyproject.toml` oraz
-`apps/control-room/package.json` z repozytoryjnym `pnpm-lock.yaml`;
-`docker-dev-toolchain` korzysta z tych deklaracji w kontenerze.
-
-Szczegółowy kontrakt znajduje się w
-[Docker development architecture](docs/guides/docker-development-architecture.md).
+Szczegóły: [Docker development architecture](docs/guides/docker-development-architecture.md).
 
 ## Sprzątanie danych po etapie deweloperskim
 

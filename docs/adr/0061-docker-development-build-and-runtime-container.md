@@ -33,13 +33,20 @@ i FEM GPU; wybór realizacji pozostaje w authored intent i plannerze. Wymuszone
 GPU nie ma fallbacku CPU. Zmiana mechaniki budowania nie poszerza kwalifikacji
 fizyki ani wspieranych kombinacji modelu.
 
-Restart developerskiego backendu jest jawną operacją zarządzanego launchera:
-sprawdza wybraną grupę i bezczynność, uzyskuje potwierdzony native drain,
-przygotowuje nowe wejście źródeł i ponownie uruchamia ten sam kontener, gdy
-konfiguracja obrazu i mountów się nie zmieniła. Zmiana obrazu lub mountów może
-wymagać jawnego odtworzenia usługi. Frontend pozostaje uruchomiony. Nie wolno
-zastępować kontenera na podstawie samego timeoutu ani uznawać utraty obserwacji
-za potwierdzenie zatrzymania. Niepotwierdzony owner wymaga kanonicznego recovery.
+Każdy start backendu, także zwykły restart w Docker Desktop, samodzielnie sprawdza
+aktualne zamontowane źródła i zależności, przygotowuje spójne wejście kompilacji
+i korzysta z trwałego cache. Bez zmian uruchamia istniejący wynik; po zmianach
+przebudowuje tylko to, co wymaga kompilator. Nie ma dodatkowej czynności użytkownika
+odświeżającej manifest na hoście. Manifest i provenance powstają wewnątrz kontenera
+z rzeczywistego wejścia danego buildu. Edycja podczas kompilacji nie miesza wersji.
+
+Przed restartem użytkownik zapisuje projekt i kończy aktywną symulację. Zatrzymanie
+backendu zachowuje potwierdzony native drain. Przy zgodnym obrazie i mountach
+restart używa tego samego container ID, a frontend pozostaje uruchomiony. Zmiana
+obrazu lub mountów może wymagać odtworzenia usługi. Nie wolno zastępować kontenera
+na podstawie timeoutu ani uznawać utraty obserwacji za potwierdzenie zatrzymania.
+Niepotwierdzony owner wymaga kanonicznego recovery. Koordynacja ciężkich buildów
+musi działać wewnątrz usługi także bez obecnego procesu launchera na hoście.
 
 Budowanie odbywa się przed startem API; nie podmienia plików wykonywanych przez
 aktywną symulację. Nieudany build zachowuje logi i receipt, pozostawia backend
@@ -62,7 +69,8 @@ publikuje aktywny model i zachowuje automatyczne Solve albo trwałe oczekiwanie
 2. Przenieść cache, manifest i wejścia Git do stałej usługi `backend`;
    zachować hardening, osobne sieci, frontend HMR oraz storage Windows.
 3. Usunąć jednorazowy build z developerskiego `up`; dodać kontrolowany restart
-   z odświeżeniem manifestu i zachowaniem container ID, gdy konfiguracja zgodna.
+   ze sprawdzeniem aktualnych źródeł wewnątrz kontenera i zachowaniem container ID,
+   gdy konfiguracja zgodna; zwykły restart Docker Desktop nie wymaga host-refresh.
    Uaktualnić README, AGENTS i przewodnik; rozdzielić opis dev od release.
 4. Wykonać adekwatne regresje Pythona i rzeczywisty start dwóch usług. Sprawdzić
    log kompilacji w `backend`, API/UI, ponowne użycie cache po restarcie, trwałe

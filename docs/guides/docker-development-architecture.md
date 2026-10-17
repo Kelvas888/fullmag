@@ -1,576 +1,234 @@
 # Architektura developerska Fullmaga w Docker Compose
 
-Uzgodnienie użytkownika: 16.10.2026. Status: kontrakt docelowy; bezpośredni
-build pełnego backendu jest potwierdzony; stabilny start i kwalifikacja runtime
-pozostają NOT VERIFIED.
-Ten dokument określa jedyną ścieżkę codziennego developmentu: bezpośredni,
-dwukontenerowy Docker Compose. Fullmag_build_runner, natywny launcher Windows,
-hostowy Cargo/CMake i ręczne `docker compose up` pozostają poza tą ścieżką.
-GitHub CI/self-hosted oraz kwalifikacja naukowa mają własne, osobno
-udokumentowane zarządzane recepty; nie są domyślną ścieżką developmentu.
+Decyzja użytkownika z 17.10.2026: [ADR 0061](../adr/0061-docker-development-build-and-runtime-container.md).
+Kontrakt: dwa stałe kontenery aplikacji; backend buduje i uruchamia kod w tej
+samej instancji. Wdrożenie i dowody tego wariantu: **NOT VERIFIED**.
 
 ## Źródła i usługi
 
-Docelowy projekt Compose jest przypisany do wybranego checkoutu i zawiera dwie usługi aplikacji:
-`backend` oraz `frontend`. Jedna wartość `FULLMAG_SOURCE_ROOT` wybiera główny
-checkout albo konkretne worktree. Obie usługi otrzymują bind mount tego samego
-checkoutu; źródła pozostają na hoście, edytowane zwykłym edytorem Windows.
-Checkout ma być montowany readonly dla procesów aplikacji. Zależności oraz
-wyniki kompilacji nie mają zaśmiecać źródeł.
+[`compose.dev.yaml`](../../compose.dev.yaml) definiuje projekt wybranego,
+zarejestrowanego checkoutu Git. Jedna ścieżka wskazuje główny checkout lub
+worktree; oba kontenery dostają jego readonly bind mount.
 
-| Element | Odpowiedzialność |
-| --- | --- |
-| `frontend` | Instalacja przypiętych zależności JS wewnątrz kontenera, Next.js dev, HMR i proxy do backendu |
-| `backend` | Budowa pełnego Fullmaga wewnątrz kontenera, API, Python DSL i procesy wykonawcze |
-| Toolchain | CUDA i pozostałe narzędzia oraz biblioteki natywne; budowane przez Docker, współdzielone warstwy/cache |
-| Prywatna sieć Compose | Frontend łączy się z `backend:8081`; backend nie publikuje portu hosta |
-| Port frontendu | Jeden konfigurowalny port loopback hosta; przeglądarka korzysta z UI i API pod jednym adresem |
+| Usługa | Odpowiedzialność | Dostęp sieciowy |
+| --- | --- | --- |
+| `frontend` | Przypięte zależności JS, Next.js dev, HMR i proxy API | Jeden wybrany port `127.0.0.1:<port>:8080` |
+| `backend` | Przyrostowy build, potem API, Python DSL i native runtime | Wyłącznie `backend:8081` w prywatnej sieci projektu |
 
-Backend zawiera FDM CPU, FDM GPU, FEM CPU oraz FEM GPU. Rodzinę solvera oraz
-urządzenie wybiera dopiero konfiguracja symulacji i planner. Nazwa istniejącego
-Dockerfile `docker/fem-gpu/Dockerfile` opisuje toolchain, nie ograniczenie całej
-aplikacji do FEM. Wymuszone GPU nie może przejść niejawnie na CPU. Obecność
-wszystkich wariantów w buildzie nie potwierdza obsługi dowolnej kombinacji
-fizyki ani poprawności jej wykonania.
+Backend zawiera FDM CPU, FDM GPU, FEM CPU i FEM GPU. Wybór realizacji następuje
+w modelu i plannerze, a wymuszone GPU nie ma cichego fallbacku CPU. Obecność
+bibliotek i udany build nie dowodzą wykonania ani obsługi dowolnego modelu.
+
+Główny checkout używa `fullmag-master`, a worktree
+`fullmag-worktree-<worktree_id>`. Każda grupa ma własną sieć bridge, port,
+ustawienia i historię projektów. Docker IPAM przydziela osobną podsieć;
+nie używamy sieci external, host network ani stałych adresów IP.
+Port wybiera operator. Kolizja kończy się błędem, bez automatycznego
+przejęcia portu lub zatrzymania innej grupy.
 
 ### Kontrakt wejść developerskich
 
-Tryb `dev` używa jawnego `source_mode=live-shadow-v1`. `compose.dev.yaml`
-opisuje topologię usług działających, a jednorazowy build backendu korzysta z
-nakładki `compose.backend-build-live.yaml`. Launcher przekazuje do kontenera:
+Launcher rozwiązuje storage i tożsamość checkoutu oraz przekazuje readonly źródła
+i Git common directory. Przy każdym starcie backend sam sprawdza aktualne pliki
+i zależności i przygotowuje zweryfikowany manifest oraz prywatny cień ext4.
+Kompilator pracuje na spójnym wejściu danego buildu; zapis kolejnej zmiany
+w Windows nie miesza plików trwającej kompilacji. Provenance opisuje rzeczywiste
+wejście tego buildu, także po restarcie bez procesu launchera na hoście.
 
-- wybrany checkout Windows jako `/opt/fullmag/source`, tylko do odczytu;
-- odpowiadający mu wspólny katalog Git jako `/opt/fullmag/source-git`, tylko do
-  odczytu, aby manifest mógł zweryfikować także pliki nieobecne lokalnie, ale
-  obecne jako dozwolone obiekty Git;
-- kompaktowy manifest z digestem źródeł, natywną tożsamością checkoutu i
-  polityką dozwolonych plików.
+Ten sam kontener `backend` wykonuje build i następnie uruchamia aplikację.
+Nie powstaje oddzielny kontener `backend-build` dla iteracji dev; nie ma też
+TAR-u źródeł ani transferu dużego pakietu przez storage Windows między
+kontenerem budującym a runtime. Przygotowanie przypiętego obrazu toolchaina
+oraz krótkie narzędzia sprawdzające storage są osobnymi operacjami utrzymania,
+a nie dodatkowymi usługami aplikacji.
 
-Kontener synchronizuje zweryfikowane wejścia do niezmiennego cienia w
-linuxowym cache ext4 pod `/build` (workspace buildu). Po synchronizacji pliki
-cienia są tylko do odczytu, a ich inwentarz i digest są sprawdzane ponownie po
-wykonaniu `Make`. Tryb dev nie tworzy ani nie montuje archiwum TAR źródeł przy
-każdej iteracji. Cargo, CMake, CUDA i pozostałe wyjścia kompilacji pozostają w
-kontenerze i utrwalonym cache; późniejsza edycja checkoutu Windows nie zmienia
-już uruchomionego buildu, tylko staje się wejściem następnego jawnego buildu.
-
-`release` oraz jawny build `frozen` zachowują oddzielną ścieżkę z
-`compose.backend-build.yaml`: manifest jest przypięty do niezmiennego archiwum
-źródeł, a hash archiwum jest częścią provenance. Nie wolno wypełniać pól
-archiwum sztucznymi wartościami dla trybu `live-shadow-v1`. Frontend dev nadal
-czyta wybrany bind mount checkoutu i może używać HMR; cień ext4 dotyczy wejść
-kompilacji backendu.
-
-## Grupy checkoutów i izolacja
-
-Użytkownik zatwierdził osobne projekty Compose: `fullmag-master` dla głównego
-checkoutu oraz `fullmag-worktree-<worktree_id>` dla wybranego worktree.
-Tożsamość wynika z rzeczywistego zarejestrowanego checkoutu; nazwy muszą być
-poprawne dla Compose i jednoznaczne także przy podobnych nazwach katalogów.
-Profil dev/release jest jawny w receipt i etykietach; równocześnie uruchomione
-warianty nie mogą współdzielić nazwy projektu.
-
-Każda grupa ma własne usługi frontend/backend, osobną sieć bridge i podsieć
-przydzielaną przez Docker IPAM, własny loopback port frontendu oraz osobny
-stan runtime. Nie używamy wspólnej sieci external ani stałej listy adresów IP.
-Backend pozostaje dostępny jako `backend:8081` wyłącznie w sieci swojej grupy.
-Kolizja ręcznie wybranego portu kończy się czytelnym błędem; launcher nie
-wyszukuje automatycznie wolnego portu i nie zatrzymuje innej grupy. Toolchain
-jest współdzielonym niezmiennym obrazem, a cache
-kompilacji pozostaje przypisany do checkoutu i profilu. Limit ciężkich buildów
-hosta nadal obowiązuje; równoległe działanie grup nie znosi tego limitu.
-
-Ustawienia i lista ostatnich projektów są osobne dla każdej grupy — to jawna
-decyzja użytkownika. Baza ma stały fizyczny katalog Windows w rozwiązanym
-storage, niezależny od identyfikatora runu, pakietu i recreate. Utrwalenie samego
-pliku bazy nie dowodzi dostępności zapisanych ścieżek projektów i wyników;
-mapowanie danych oraz ponowny odczyt po recreate wymagają osobnej weryfikacji.
-
-Istniejąca grupa `fullmag` jest przejściową instancją bieżącego zadania.
-Nie zmieniamy nazw działających kontenerów ani nie przenosimy ich danych
-automatycznie. Migracja do grupy checkoutu wymaga potwierdzonego bezczynnego
-stanu, zachowania danych i sprawdzenia nowej instancji. Nazewnictwo grup,
-izolacja portów/sieci i trwała baza grupy pozostają NOT VERIFIED do czasu
-wdrożenia i rzeczywistego sprawdzenia.
-
-Osobne grupy nie tworzą osobnych fizycznych hostów. Wykrywanie sprzętu oraz
-rezerwacje CPU/GPU muszą pozostać wspólne, aby dwie grupy nie przydzieliły
-tej samej pamięci GPU niezależnie. Bieżący host ledger dopuszcza jedną
-generację readiness; równoległy start różnych buildów wymaga osobnego,
-wersjonowanego rozszerzenia rejestracji generacji. Sama izolacja Compose
-nie jest dowodem obsługi tego scenariusza. Nie obchodzimy tej kontroli przez
-kopiowanie ledgeru ani zmianę tożsamości hosta na nazwę worktree.
-
-### Przydział CPU w profilu Dockera
-
-Generator profilu używa rzeczywistych CPU IDs dopuszczonych przez system
-kontenera. Przydział compute jest wspólny dla ofert CPU i GPU, ponieważ pula
-compute wykonuje najwyżej jedno zadanie naraz. Przygotowanie FEM otrzymuje
-rozłączny przydział CPU. Budżety pozostają ograniczone pojemnością hosta,
-a przydziały mają wystarczającą liczbę rdzeni także dla niecałkowitych limitów
-CPU. Brak wystarczających zasobów zatrzymuje inicjalizację z błędem; nie tworzy
-pustego przydziału i nie wyłącza kontroli powinowactwa procesu. Rezerwacja GPU
-nadal wskazuje dokładny fizyczny UUID i korzysta ze wspólnego ledgera.
-
-## Home i gotowość wykonania
-
-Home jest niezależnym ekranem startowym aplikacji. Jego widoczność, układ oraz
-pozycja nawigacji nie zależą od odpowiedzi listy sesji ani statusu bieżącej
-sesji. Odczyty tych zasobów zasilają historię i warunki dostępności operacji;
-nie przełączają całego Home pomiędzy ładowaniem, błędem i workspace.
-Automatyczny retry nie pokazuje naprzemiennie „Checking for sessions” oraz
-„Session list unavailable”. Informacja o połączeniu ma stałe miejsce i nie
-usuwa treści ani nie przemieszcza układu przy każdym ponowieniu.
-
-Start bez wskazanego skryptu otwiera Home. Samo znalezienie zapisanej sesji nie
-jest jawnym poleceniem jej aktywacji. Jawne otwarcie projektu/sesji lub start ze
-skryptem zachowuje właściwy model i jego interaktywną semantykę.
-
-Frontend uruchamia się po starcie kontenera backendu, bez wymagania zdrowia
-native runtime. Dzięki temu awaria wykonawcy nie blokuje pobrania interfejsu.
-Health/admission backendu nadal odmawia gotowości do symulacji; widoczny Home
-nie jest dowodem sprawnego API ani wykonania GPU. Polecenie kontrolujące
-pełny start może zgłosić błąd backendu mimo dostępnego już frontendu.
-
-Nadzorca korzysta z przypiętej tożsamości API, bezpośredniego odczytu
-ograniczonego `OWNER.json` i natywnego potwierdzenia liveness przez API.
-Odczyt statusu podczas pracy nie uruchamia kolejnego procesu CLI. Natywne
-polecenia nadal odpowiadają za utworzenie usługi i uwierzytelniony drenaż.
-
-Przejściowe błędy transportu oraz `live_probe_failed`, `owner_read_failed`
-i `owner_invalid` mogą odzyskać obserwację w ciągu 30 sekund tylko wtedy,
-gdy niezależny odczyt potwierdza zgodność przypiętego ownera. Błędna tożsamość,
-schemat lub binding kończą nadzór od razu. Okno obserwacji nie zmienia
-healthcheck ani admission: API nadal blokuje obliczenia bez aktualnego
-potwierdzenia gotowości natywnej usługi.
-
-## Cykl edycji i przebudowy
-
-Pierwszy start przygotowuje obrazy narzędziowe, kompiluje backend oraz instaluje
-zależności i uruchamia frontend. Kompilatory i instalatory działają wewnątrz
-odpowiednich kontenerów, bez starej kolejki runnera.
-
-Zmiana pliku frontendu na hoście jest od razu widoczna przez bind mount.
-Next.js wykrywa zapis i uruchamia HMR. W Docker Desktop wykrywanie zmian wymaga
-właściwej konfiguracji watchera, w razie potrzeby pollingu; rzeczywisty zapis
-pliku Windows musi to potwierdzić.
-
-### Polling Watchpack dla bind mountu Windows
-
-Compose przekazuje frontendowi `FULLMAG_WATCHPACK_POLLING_MS`. Wartość domyślna
-to `2000` ms, a dozwolony zakres to `250`–`10000` ms. Operator może ustawić ją
-lokalnie w `.env`, na przykład:
-
-```dotenv
-FULLMAG_WATCHPACK_POLLING_MS=2000
-```
-
-Polling obserwuje ten sam checkout zamontowany z Windows i podtrzymuje
-automatyczny HMR frontendu, gdy zdarzenia plikowe Docker Desktop nie są
-wystarczające. Zmiana tej wartości dotyczy wyłącznie watchera: nie kopiuje
-źródeł do obrazu, nie odtwarza `node_modules` ani cache Next/pnpm i nie
-unieważnia trwałego cache zależności frontendu. Cache pozostaje oddzielony od
-sesji i wyników.
-
-Watcher frontendu nie uruchamia budowania backendu. Backend kompiluje się na
-jawne żądanie, wewnątrz kontenera, dla FDM CPU, FDM GPU, FEM CPU i FEM GPU;
-wymuszone GPU kończy się błędem, gdy ścieżka GPU nie jest dostępna, bez cichego
-fallbacku do CPU. Ustawienie pollingu opisuje konfigurację ścieżki HMR;
-widoczny Home, działanie HMR i wykonanie GPU pozostają `NOT VERIFIED` do czasu
-odpowiednich dowodów runtime.
-
-Zmiana backendu nie uruchamia kompilacji ani restartu automatycznie. Użytkownik
-jawnie zleca przebudowę backendu. Ta operacja pobiera aktualny stan wybranego
-checkoutu i kompiluje go w kontenerze z zachowaniem cache Cargo i kompilacji
-natywnej. W trybie `live-shadow-v1` manifest jest zamykany przed wejściem do
-kompilatora, a zweryfikowane wejścia są kopiowane do niezmiennego cienia ext4;
-edycje podczas kompilacji nie mieszają wersji. W trybie release/frozen tę samą
-granicę zapewnia przypięte archiwum. Checkout nadal pozostaje zamontowany na
-żywo dla usług developerskich, ale nie jest źródłem odczytywanym przez aktywny
-backend build po utworzeniu cienia. Pomyślny build nie może sam zatrzymać
-aktywnej symulacji; zastosowanie nowego pakietu wymaga kontrolowanego restartu.
-
-### Oddzielny root pakietu i storage runtime
-
-`FULLMAG_RUNTIME_ROOT` zachowuje dotychczasowy kontrakt każdego launchera:
-storage runtime resolver dla natywnego Windows i storage worktree, a w all-in-one
-istniejące stałe ustawienie pakietu dla starszych konsumentów usługi. Nie jest to
-zmienna wybierająca package root dla discovery capabilities. API odkrywa
-manifesty pakietu wyłącznie pod prywatnym `FULLMAG_RUNTIME_PACKAGE_ROOT`; proces
-backendu ustawia ją na zweryfikowany katalog pakietu, a brak tej zmiennej
-zachowuje dotychczasowy fallback natywnego Windows do `repo_root`.
-
-Jawnie skonfigurowany package root musi być absolutnym, istniejącym katalogiem
-z czytelnym `runtimes/`. Manifesty są częścią attested receipt i statusu
-RuntimeRegistry; same flagi kompilacji nie tworzą dostępności urządzenia ani
-nie promują eksperymentalnego FEM do publicznego runtime.
-
-Obraz narzędziowy i pakiet aplikacji są osobnymi warstwami. Zmiana kodu Rust
-nie powinna wymuszać ponownego budowania CUDA, hypre, MFEM czy libCEED.
-Zwykły restart kontenera nie usuwa cache. Zmiany zależności lub flag mogą
-wymagać szerszej kompilacji; cache nie gwarantuje pominięcia każdego kroku.
-Bezpośrednią ścieżkę uruchamiają poniższe recepty. Ich końcowa kwalifikacja
-runtime pozostaje w toku; starsze polecenia oparte na job ID nie są jej częścią.
-
-Bazowy obraz toolchaina i obraz developerski z zaufanym helperem mają osobne
-tożsamości. `FULLMAG_TOOLCHAIN_IMAGE_ID` wskazuje niezmienny obraz narzędziowy,
-a `development-base-context` zapisuje hash manifestu zależności oraz dokładnych
-plików helpera kopiowanych do `Dockerfile.dev`. Launcher może ponownie użyć
-obrazu developerskiego tylko wtedy, gdy zgadzają się obraz bazowy, manifest,
-hash kontekstu i receipt; zmiana helpera wymusza nowy kontekst i obraz pochodny.
-Aktualizacja orkiestracji nie podmienia obrazu sama przez się, więc nie ukrywa
-zmiany helpera ani nie udaje jej wdrożenia. Ta kontrola tożsamości obrazu nie
-jest dowodem uruchomienia runtime.
-
-## Oddzielne ścieżki dev i release
-
-Uzgodnienie użytkownika z 16.10.2026: priorytetem trybu developerskiego są
-prostota i szybkie iteracje. Poniższy podział jest zatwierdzonym kontraktem;
-wdrożenie i pomiar kolejnego buildu pozostają w toku.
-
-- `dev` używa istniejącego profilu Cargo `backend-dev`, zachowuje kompilację
-  przyrostową i cache między jawnymi żądaniami buildu. Frontend pracuje z HMR
-  na wybranym checkoutcie Windows.
-- `release` używa zoptymalizowanego profilu release i przygotowuje gotowe
-  artefakty/obrazy dystrybucyjne. Nie jest domyślną ścieżką codziennej edycji.
-- Receipt, ścieżki pakietów i katalogi profili jednoznacznie rozróżniają dev
-  oraz release. Nie wolno oznaczać niezoptymalizowanego buildu jako release.
-- Oba profile zawierają FDM CPU, FDM GPU, FEM CPU i FEM GPU. Profil kompilacji
-  nie zmienia requested/resolved execution ani zakazu cichego fallbacku GPU.
-- Obraz toolchaina CUDA/FEM i przypięte biblioteki są współdzielone. Zmiana
-  kodu aplikacji nie jest powodem przebudowania tego obrazu.
-
-Identyfikacja źródeł musi pozostać w provenance gotowego artefaktu, ale zmiana
-hasza całego repo nie może sama unieważniać wszystkich obiektów C++/CUDA.
-Identyfikacja buildu ma być kompilowana oddzielnie od kodu solverów. To nie
-pozwala użyć starego obiektu po rzeczywistej zmianie jego źródeł, nagłówków,
-kompilatora, zależności lub flag.
-
-Pierwszy build profilu rozgrzewa jego cache. Kryterium szybkości dotyczy
-kolejnego buildu po małej zmianie modułu i wymaga pomiaru czasu oraz listy
-ponownie kompilowanych elementów; nie jest obietnicą stałego czasu dla każdej
-zmiany. Własne archiwum całego repo nie jest wymaganiem docelowego trybu dev.
-Zamrożenie wejść backendu na czas danego buildu odbywa się przyrostowo przez
-manifest i niezmienny cień ext4, bez przebudowy toolchaina, bez TAR-u i bez
-kopiowania kodu frontendu do obrazu. Release/frozen pozostaje osobną ścieżką
-archiwum.
+Cache Cargo i osobne katalogi CMake FDM/FEM leżą na trwałym ext4 przypisanym do
+checkoutu/profilu. Nie zależą od UUID kolejnego uruchomienia. Niezmienione pliki
+cienia zachowują zawartość i metadane potrzebne kompilacji przyrostowej.
+Zmiana modułu przebudowuje go oraz rzeczywistych zależnych konsumentów;
+zmiana wspólnego typu może wymagać więcej pracy niż zmiana pliku wykonawczego.
+Zmiana kodu aplikacji nie przebudowuje automatycznie CUDA, MFEM, hypre ani
+libCEED. Zmiana zależności, kompilatora lub flag może unieważnić szerszy cache.
 
 ## Polecenia trybu developerskiego
 
-Polecenia wykonujemy z checkoutu Fullmaga w natywnym PowerShellu Windows,
-z uruchomionym Docker Desktop w trybie kontenerów Linux i dostępem do NVIDIA.
-WSL może czytać i edytować wybrany checkout, ale launcher odrzuca uruchomienie
-ścieżki developerskiej z WSL. Zastąp wartości w nawiasach rzeczywistymi
-ścieżkami Windows. Wymagane są Git i natywny Python; Docker Desktop musi używać
-silnika Linux i Compose, a NVIDIA jest wymagana dla lane GPU. `just` jest
-opcjonalny przy bezpośrednim użyciu natywnego CLI Pythona, ale recepty `just`
-i pełny preflight `setup_docker.py --check` go sprawdzają. Hostowy Python
-uruchamia tylko launcher, a kod backendu kompiluje się w usłudze Compose.
-Na nowym komputerze najpierw uruchamiamy kreator:
+Uruchamiaj je z natywnego PowerShella Windows, z Git, natywnym Pythonem i Docker
+Desktop w trybie kontenerów Linux. GPU wymaga obsługi NVIDIA w Docker Desktop.
+WSL może edytować źródła; obecny launcher odrzuca WSL jako ścieżkę startową.
+Host nie potrzebuje Cargo ani CMake. `just` jest potrzebny dla recept i pełnego
+`setup_docker.py --check`; launcher Pythona można wywołać bez niego.
+
+### Nowy klon i konfiguracja
+
+Zastąp przykładowe ścieżki własnymi. Storage musi być poza checkoutami.
+Dla głównego checkoutu ustaw `$source = $main`; worktree jest opcjonalne.
 
 ```powershell
-python -B scripts/setup_docker.py `
-  --repo-root <main-checkout> `
-  --storage-root <storage-outside-checkouts> `
-  --source-root <registered-main-or-worktree> `
-  --port 3197
-python -B scripts/setup_docker.py --repo-root <main-checkout> --check
+$main = "C:\path\to\fullmag-project\fullmag"
+$source = "C:\path\to\fullmag-project\worktrees\my-task"
+$storage = "C:\path\to\fullmag-storage"
+
+git clone https://github.com/MateuszZelent/fullmag $main
+Set-Location $main
+git worktree add $source -b codex/my-task master
+python -B scripts/setup_docker.py --repo-root $main --source-root $source --storage-root $storage --port 3197
+python -B scripts/setup_docker.py --repo-root $main --check
 ```
 
-Kreator zapisuje lokalną konfigurację hosta w `.env` głównego checkoutu, w tym
-wybrany przez operatora storage, checkout źródeł i port. Nie buduje, nie
-uruchamia, nie zatrzymuje i nie usuwa aplikacji. Następnie:
+Kreator zachowuje istniejące ustawienia i sekrety `.env`. Pyta o ścieżki i port,
+zapisuje `FULLMAG_PROJECT_STORAGE_ROOT` oraz konfigurację hosta w głównym
+checkoutcie i waliduje marker storage. Nie buduje, nie uruchamia ani nie
+zatrzymuje kontenerów i nie usuwa danych. Nowe worktree tego samego projektu
+korzystają z tej konfiguracji przez resolver, bez kopiowania `.env`.
+
+### Start
 
 ```powershell
+Set-Location $source
+just --list
 just docker-dev-toolchain
-just docker-dev "<registered-checkout-or-worktree>" 3197
+just docker-dev "$source" 3197
 ```
 
-Równoważna ścieżka bez `just` używa tego samego launchera Pythona:
+Toolchain przygotowuje się przy pierwszym użyciu lub zmianie przypiętych
+zależności. Start uruchamia dwie stałe usługi; backend wykonuje swój build
+przed API. Otwórz `http://127.0.0.1:3197/workspace`. Brak `--script` oznacza Home,
+a nie automatyczny wybór dawnej sesji.
+
+Odpowiednik bez `just`:
 
 ```powershell
-python -B "<main-checkout>\scripts\bootstrap_docker_toolchain.py" --repo-root "<main-checkout>" --direct-development
-# Start without a startup script:
-python -B "<main-checkout>\scripts\docker_dev.py" --repo-root "<main-checkout>" up --source-root "<registered-checkout-or-worktree>" --port 3197
-# Or build only, without starting services:
-# python -B "<main-checkout>\scripts\docker_dev.py" --repo-root "<main-checkout>" build --source-root "<registered-checkout-or-worktree>"
-# Or start with a startup script:
-# python -B "<main-checkout>\scripts\docker_dev.py" --repo-root "<main-checkout>" up --source-root "<registered-checkout-or-worktree>" --port 3197 --script "examples/fem_relax_gpu_smoke.py"
+python -B "$main\scripts\bootstrap_docker_toolchain.py" --repo-root $main --direct-development
+python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $source --port 3197
 ```
 
-Pierwsza recepta przygotowuje przypięty obraz toolchaina w Dockerze. Druga przygotowuje obrazy
-pomocnicze, buduje backend w jego kontenerze i uruchamia obie usługi z frontendem
-na `http://127.0.0.1:3197/workspace`. Wynik kompilacji nie zastępuje potwierdzenia
-Home w przeglądarce. Przy istniejącej aktywnej instancji launcher odmawia
-samoczynnego zastąpienia jej i podaje polecenie zatrzymania konkretnego projektu.
-Nie wykonuje automatycznego restartu, przejęcia ani resetu; przed kolejnym
-startem musi istnieć bezpieczny, nieaktywny stan wybranej grupy.
+### Cykl edycji i przebudowy
 
-Wybór innego zarejestrowanego checkoutu/worktree, portu i skryptu:
+Frontend reaguje przez HMR na zapis plików Windows. Watchpack domyślnie używa
+pollingu `2000` ms; lokalne `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza
+`250`–`10000` ms. Zależności pnpm i cache Next zostają na ext4; HMR nie buduje
+backendu ani toolchaina.
+
+Backend przebudowuje się po jawnym restarcie. Przed nim zapisz projekt i zakończ
+aktywną symulację. W Docker Desktop otwórz backend właściwej grupy i wybierz
+Restart; odpowiednik CLI to:
 
 ```powershell
-just docker-dev "<absolutna-sciezka-checkoutu>" 3197 "examples/fem_relax_gpu_smoke.py"
+docker ps --filter "label=com.docker.compose.project=<compose-project>" --filter "label=com.docker.compose.service=backend"
+docker restart <backend-container-id>
+docker logs -f <backend-container-id>
 ```
 
-Samo jawne przebudowanie backendu z zachowaniem cache, bez restartu działającej
-symulacji:
+Każdy start sam sprawdza aktualne zamontowane źródła. Bez zmian używa istniejącego
+wyniku; po edycji kompiluje zmienione moduły oraz ich zależnych konsumentów,
+zachowując cache. Użytkownik nie odświeża osobno manifestu i nie uruchamia drugiego
+kontenera budującego. Frontend pozostaje uruchomiony.
+
+Przy zgodnym obrazie i mountach restart zachowuje ID backendu. Zmiana obrazu lub
+mountów może wymagać odtworzenia usługi. Sesje, wyniki i baza grupy pozostają.
+Nie zastępuj tego procedurą `down --volumes`, przejęciem obcej grupy ani resetem
+ownera. Niepotwierdzone zatrzymanie wymaga kanonicznego recovery; nie jest zgodą
+na ponowne uruchomienie aktywnej symulacji. Zachowaj logi i receipty błędu.
+
+### Logi i gotowość
+
+Docker Desktop pokazuje kompilację i późniejszy start API w logu tej samej
+usługi `backend`. Można również znaleźć jej ID i śledzić stdout/stderr:
 
 ```powershell
-just docker-dev-build "<absolutna-sciezka-checkoutu>"
+docker ps --filter "label=com.docker.compose.project=<compose-project>"
+docker logs -f <backend-container-id>
 ```
 
-Skrypt `examples/permalloy_layer_cofeb_rings_relax_300nm.py` jest śledzony w
-repozytorium, ale bieżąca walidacja startu odrzuca ten dwumateriałowy przykład
-rings kodem `material_count_not_one`; nie jest on aktualnym dowodem FEM GPU.
-
-Port jest wybierany ręcznie i musi być unikalny dla każdej aktywnej grupy;
-launcher nie wyszukuje automatycznie wolnego portu. Główny checkout używa
-projektu Compose `fullmag-master`, a zarejestrowany worktree projektu
-`fullmag-worktree-<worktree_id>`.
-
-Definicje usług runtime są jawnie w `compose.dev.yaml`.
-Developerski build bez TAR-u korzysta z `compose.backend-build-live.yaml`,
-natomiast `compose.backend-build.yaml` jest nakładką wyłącznie dla źródeł
-release/frozen. Obie nakładki rozwiązują cache, output i host ledger przez
-lokalny resolver. Launcher zapisuje wynikową konfigurację Compose, logi oraz
-receipty w storage; frontend HMR czyta bezpośrednio bind mount checkoutu.
-
-### Zakres dowodów dla tej konfiguracji
-
-Sprawdzenia źródłowe obejmują walidację manifestu i trybu `live-shadow-v1`,
-kontrolę montowań obu nakładek Compose, parser konfiguracji YAML, AST skryptów
-launchera oraz interpretowane regresje resolvera i odtwarzania konfiguracji.
-Potwierdzają one kontrakt wejść i fail-closed, nie działanie usług.
-
-Nadal `NOT VERIFIED` pozostają: rzeczywisty `docker compose up` z live shadow,
-stabilny start API, dev-warm po kolejnym buildzie, HMR potwierdzony w
-przeglądarce, odczyt/zapis i recreate `workspace.db`, roundtrip sesji/wyników
-oraz wykonanie FDM/FEM na GPU. Dowód wcześniejszego builda lub offline Home nie
-zastępuje tych bramek.
+Faza budowania nie oznacza gotowości do symulacji. Po udanym Make wrapper
+sprawdza artefakty i provenance, a następnie uruchamia istniejący nadzór API
+oraz native runtime. Błąd buildu zachowuje log i receipt; nie uruchamia API
+z częściowo opublikowanym pakietem. Home może być dostępny podczas budowania.
+Stan `ready` wymaga rzeczywistego health/readiness, nie samego otwartego portu.
 
 ## Skrypt symulacji jako parametr startu
 
-Start przyjmuje opcjonalny parametr `--script`, wskazujący plik Python wewnątrz
-wybranego checkoutu (w `just docker-dev` jest to trzeci argument po źródle i
-porcie). Ścieżka względna jest rozwiązywana względem
-`FULLMAG_SOURCE_ROOT`; ścieżka absolutna musi wskazywać plik w tym samym drzewie.
-Hostowa ścieżka Windows jest mapowana na zamontowane źródła kontenera.
-Ścieżka względna, zawartość i hash skryptu należą do provenance uruchomienia.
+Trzeci argument recepty `just docker-dev` wybiera plik w tym samym checkoutcie:
 
-Po starcie przeglądarka pokazuje Workspace z modelem tego skryptu jako aktywnym.
-W zwykłym skrypcie aktywacja automatycznie uruchamia wykonanie; interaktywny
-`wait_for_solve(True)` przygotowuje model i siatkę oraz publikuje Workspace
-czekający na Compute. Sam serwer HTTP lub wczytany tekst skryptu nie dowodzi
-aktywacji modelu.
-Start bez skryptu otwiera Home; nie wybiera sam przypadkowej sesji.
+```powershell
+just docker-dev "$source" 3197 "examples/fem_relax_gpu_smoke.py"
+# Bez just:
+python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $source --port 3197 --script "examples/fem_relax_gpu_smoke.py"
+```
 
-Jawne odrzucenie walidacji skryptu przez API (`400`/`422` z typowanym kodem
-walidacji) jest wynikiem polecenia, a nie awarią usługi. Kontener zachowuje
-API i natywny runtime w stanie `ready`, a proces tree zapisuje przypięty do
-request ID i hash źródła wynik `startup_activation.state=rejected`. Launcher
-kończy polecenie błędem, zapisuje `startup_activation_outcome=rejected` oraz
-`runtime_state=ready` i pozostawia grupę dostępną pod jej dotychczasowym portem.
-Nie oznacza skryptu jako aktywowanego ani wykonanego. Niezgodność proweniencji,
-błąd helpera, transportu lub serwera nadal korzystają z dotychczasowej ścieżki
-fail-closed; nie są przeklasyfikowywane na odrzucenie modelu.
+Ścieżka względna jest rozwiązywana względem `$source`. Absolutna ścieżka Windows
+również musi należeć do tego checkoutu. Launcher zapisuje ścieżkę, hash treści
+i request ID, a backend publikuje model jako aktywny w Workspace.
+
+Zwykły skrypt uruchamia Solve automatycznie. `study.wait_for_solve(True)`
+przygotowuje model i siatkę oraz czeka na Compute; przykładem jest
+`examples/fem_de_smoke_numeric.py`. Restart backendu nie tworzy niejawnego
+nowego polecenia Solve.
+
+Typowane odrzucenie modelu przez API (`400`/`422`) zostawia API/runtime gotowe,
+a polecenie startowe kończy błędem i zapisuje wynik `rejected` z provenance.
+Błąd transportu lub niezgodność tożsamości nie są takim odrzuceniem.
+
+`examples/permalloy_layer_cofeb_rings_relax_300nm.py` pozostaje odrzucony kodem
+`material_count_not_one`: obecna ścieżka nie obsługuje tego dwumateriałowego
+przykładu. Udany smoke jednego materiału nie jest dowodem wykonania rings.
 
 ## Dane i wersje
 
-Sesje, modele, wyniki oraz logi pozostają w rzeczywistym storage Windows,
-wybranym w lokalnym `.env` przez `FULLMAG_PROJECT_STORAGE_ROOT` i bind mount.
-Nie zastępujemy tego storage ukrytym wolumenem Docker Desktop. Zachowujemy
-walidację dostępu i trwałości zapisu Windows.
+| Dane | Trwałe miejsce |
+| --- | --- |
+| Źródła | Wybrany checkout Windows, readonly bind; frontend HMR |
+| Build, zależności i pakiet dev | Prywatny trwały ext4 cache w zarządzanym backing storage |
+| Sesje, modele, wyniki, logi i receipty | Fizyczny storage Windows, mount `/state` |
+| Ustawienia i ostatnie projekty | `storage/user-data/<compose-project>/workspace.db`, mount `/user-data` |
+| Przydziały fizycznego CPU/GPU | Wspólny `host-ledger-v1` na zarządzanym ext4; nie osobny ledger per grupa |
 
-Trwałe dane workspace mają osobną, stabilną przestrzeń per projekt Compose.
-Resolver mapuje hostowy katalog `storage/user-data/<compose-project>/` do
-kontenera jako `/user-data`, a backend otrzymuje
-`FULLMAG_WORKSPACE_STATE_DIR=/user-data`; kanoniczna baza workspace znajduje
-się w `storage/user-data/<compose-project>/workspace.db`. Ten katalog nie zależy
-od identyfikatora runu ani recreate. Nakładki buildu montują `/user-data` tylko
-do odczytu i używają oddzielnego `/state` jako scratch; `/state` pozostaje
-rzeczywistym Windows storage dla sesji, wyników, logów i receiptów runu.
-Obecność mapowania i ochrony przed zapisem buildu jest sprawdzana źródłowo;
-rzeczywisty zapis, odczyt i odtworzenie `workspace.db` po recreate pozostają
-`NOT VERIFIED`.
+Backend nie udostępnia frontendowi host ledgeru, GPU ani accepted store.
+Osobne grupy nie oznaczają osobnych fizycznych GPU. Zmiana generacji nadal
+wymaga zgodnej polityki, rzeczywistego probe i zwolnionych rezerwacji;
+`Tentative`, `Committed`, `Quarantined` albo niepotwierdzony owner blokują
+przejęcie. Nie usuwamy historii rezerwacji ani nie uznajemy jej za aktywne
+zadania, jeżeli zwolnienia mają zweryfikowane trwałe dowody.
 
-Cache zależności i buildów jest trwały, oddzielony od wyników i jawnie
-zdefiniowany w konfiguracji. Może używać natywnego systemu plików Linux dla
-wydajności; nie przenosi to sesji ani wyników z Windows. Ten sam cache nie
-może być równolegle modyfikowany przez nieskoordynowane buildy.
+`FULLMAG_RUNTIME_PACKAGE_ROOT` wskazuje zweryfikowany pakiet dla discovery
+capabilities; nie wolno utożsamiać go ze storage sesji. Błąd, timeout i
+utrata obserwacji zachowują fail-closed admission oraz dowody recovery.
+Szczegóły: [ADR 0049](../adr/0049-native-runtime-owner-control.md),
+[storage Windows](../adr/0059-docker-desktop-windows-session-storage.md) oraz
+[accepted FEM GPU](../adr/0060-accepted-fem-gpu-docker-workspace.md).
 
-Deklaracje wersji bibliotek natywnych pozostają w kanonicznym
-`docker/fem-gpu/Dockerfile`; obraz publikuje rzeczywiste wersje i commity w
-`/opt/fullmag-deps/share/fullmag/dependency-versions.json`. Rust używa
-`rust-toolchain.toml`, workspace `Cargo.toml` i repozytoryjnego `Cargo.lock`;
-frontend korzysta z `apps/control-room/package.json` i repozytoryjnego
-`./pnpm-lock.yaml`. Nowy tryb nie tworzy drugiej,
-niezależnej listy wersji.
+Wersje bibliotek deklaruje repozytorium:
 
-## Przebudowa backendu a trwały rejestr GPU
+- CUDA, CMake, MFEM, hypre, libCEED: `docker/fem-gpu/Dockerfile` i obrazowy
+  `/opt/fullmag-deps/share/fullmag/dependency-versions.json`;
+- Rust: `rust-toolchain.toml`, `Cargo.toml`, repozytoryjny `Cargo.lock`;
+- Python: `packages/fullmag-py/pyproject.toml`;
+- frontend: `apps/control-room/package.json`, repozytoryjny `pnpm-lock.yaml`.
 
-Stan z 16.10.2026: implementacja kontrolowanej aktualizacji generacji jest
-zapisana na branchu zadania. Inicjalizacja API wykonuje rzeczywisty probe
-readiness i przypina generację konfiguracji, żądań i pozwoleń. Rejestr V4
-odgradza stare generacje od nowych przyjęć zadań; zmiana generacji wymaga
-braku aktywnego właściciela inventory i zwolnienia wszystkich rezerwacji.
-Readiness oraz snapshot są publikowane jako obiekty CAS przed zmianą wskaźnika.
-Te kontrole przeszły sprawdzenia źródeł; migracja i ponowne uruchomienie po
-wykonanej symulacji pozostają `NOT VERIFIED`.
-
-Initializer Docker rozdziela fizyczną tożsamość demona od logicznego `host_id`
-polityki rejestru. `FULLMAG_DOCKER_HOST_ID` pozostaje zweryfikowanym digestem
-demona i jest przekazywany do adaptera razem z profilem
-`FULLMAG_HOST_LEDGER_PROFILE=host-ledger-v1`. Przed wywołaniem natywnej fabryki
-initializer bounded/no-follow odczytuje istniejący
-`/host-ledger/ledger/HOST_RESOURCE_LEDGER.json`: zachowuje wyłącznie historyczne
-`docker-all-host` albo bieżący digest demona, a nowy rejestr dostaje bieżący
-digest. Każdy inny zapis `policy.host_id` kończy się błędem bez mutacji; natywna
-fabryka nadal sprawdza marker, pełną politykę, topologię i readiness pod blokadą.
-
-Pełny pakiet FDM/FEM CPU/GPU został zbudowany w bezpośredniej ścieżce Compose.
-Build `49d57aec5e25404a9771032f92558f9c` zakończył się `succeeded`, exit 0,
-i obejmuje nowy helper frontendu z proxy API pod adresem przeglądarki.
-Backend w tym pakiecie używa jawnie ponownie wybranych zamrożonych źródeł
-commita `56229c9658a08ebecc2f71009774257b8dadfc4a`; późniejsze zmiany helperów
-nie są przedstawiane jako ponowna kompilacja nowszego kodu Rust.
-Build nie dowodzi stabilnego API ani wykonania symulacji GPU.
-
-Poprawka niezależnego Home przeszła rzeczywistą próbę Chrome z niedostępnym
-backendem (HTTP 500, bez mockowania sieci). Home pozostawał widoczny, a Retry
-zachował te same elementy DOM Home, slotu i hosta, bez przesunięć układu,
-chwilowych bramek sesji ani błędów JavaScript/CORS. Dowód dla runu
-`4ae4802036e44cc0a1fcc8b810ee598a`:
-`browser-offline-home-2a14d253fe614eaaae2c555472e94278/receipt.json`.
-Ten test potwierdza zachowanie Home przy awarii połączenia; nie potwierdza
-poprawnego startu API, wykonania GPU ani reguły aktywacji historycznej sesji.
-
-`docker_dev.py up` zawsze wykonuje kolejny backend build. Jeżeli pakiet backendu
-został już zbudowany, po kontrolowanym graceful stopie własnych usług można
-odtworzyć ten sam run i jego `session-store` przez `recreate`, bez drugiej
-kompilacji. Udany `docker_dev.py build` wypisuje JSON z dokładnym polem
-`assembly_receipt` oraz `run_root`; do odtworzenia należy użyć wskazanego tam
-`assembly.json`. Start istniejącego runtime wypisuje `state_root`; jego sąsiadujący
-`receipt.json` jest właściwym receipt runu, o kształcie
-`<storage>\runs\<worktree-id>\docker-all\<run-id>\receipt.json`.
-Nie wyszukuj `latest` ani nie wybieraj pliku przez sortowanie katalogu.
-
-Hash konfiguracji trzeba policzyć z dokładnego, wskazanego runu:
-
-```powershell
-$runRoot = "C:\path\to\storage\runs\<worktree-id>\docker-all\<run-id>"
-$runReceipt = Join-Path $runRoot "receipt.json"
-$assemblyReceipt = "C:\path\to\storage\builds\<worktree-id>\docker-all-gpu\direct-compose\<build-id>\assembly.json"
-$previousConfigSha256 = (Get-FileHash -Algorithm SHA256 `
-  -LiteralPath "$runRoot\state\.fullmag\runtime-service\docker-all.json").Hash.ToLowerInvariant()
-
-python -B "<main-checkout>\scripts\docker_dev.py" --repo-root "<main-checkout>" recreate `
-  --run-receipt $runReceipt `
-  --assembly-receipt $assemblyReceipt `
-  --previous-config-sha256 $previousConfigSha256 `
-  --source-root "<registered-checkout-or-worktree>" `
-  --port 3197
-```
-
-Użyj literalnych ścieżek `assembly_receipt` i run receipt z tych konkretnych
-wyjść. `recreate` waliduje właściciela, projekt, checkout, oba receipty i CAS
-konfiguracji, ale nie buduje, nie publikuje drugiego pakietu, nie szuka
-`latest` i nie tworzy nowego rootu sesji. Zachowuje state, `session-store`,
-sesje, wyniki, bazę workspace oraz historię w `receipt-history`; zmienia tylko
-przypięty pakiet zgodnie z kontrolą runtime.
-
-Jeżeli launcher zgłosi, że wybrana grupa nadal ma kontenery, najpierw potwierdź
-właściwy run receipt oraz brak aktywnego compute i rezerwacji w host ledgerze.
-Uruchom wyłącznie dokładną komendę `docker compose ... down` wypisaną przez
-launcher dla tego projektu, katalogu roboczego i rozstrzygniętych plików JSON.
-Nie zastępuj jej ogólnym projektem, wildcardem ani `--volumes`; storage,
-receipty, state i historia muszą pozostać.
-
-Zmienna `FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256` jest przekazywana do backendu
-wyłącznie w tej jawnej ścieżce. Runtime service dopuszcza wtedy tylko przypiętą
-zmianę generacji po własnym sprawdzeniu zatrzymania i aktualnego readiness;
-zwykły start nadal odrzuca zmianę profilu.
-
-Warunki implementacji tej części trybu developerskiego:
-
-- Zachować wspólny fizyczny rejestr, politykę pojemności, historię rezerwacji,
-  sesje, wyniki i provenance. Nowa generacja buildu nie otrzymuje osobnej,
-  niezależnej puli tego samego GPU.
-- Aktualizować generację tylko w kontrolowanym stanie bez aktywnych zadań,
-  workerów i rezerwacji. `Tentative`, `Committed` lub `Quarantined` blokują
-  aktualizację; nie wolno uznawać ich za zakończone na podstawie wieku.
-- Przed przyjęciem nowej generacji wykonać jej rzeczywisty probe oraz
-  zweryfikować zgodność fizycznego hosta i GPU z przypiętą polityką.
-- Trwale odgrodzić stare binaria, konfiguracje i pozwolenia od admission nowej
-  generacji, również dla usług innego store korzystających z tego hosta.
-- Zapewnić atomową publikację albo jawny trwały fence dla przerwanej zmiany.
-  Nieznany wynik pozostawia admission zamknięte i zachowuje dowody odzyskania.
-- Potwierdzić kolejną przebudowę/start po wykonanej symulacji i restart z
-  zachowaniem zapisanych wyników. Sama pierwsza inicjalizacja pustego rejestru
-  nie dowodzi poprawnej aktualizacji.
-
-Format generacji i procedurę migracji opisują ADR 0052 oraz kontrakt
-compute-resource execution. Wdrożenie wymaga udanego buildu i rzeczywistego
-sprawdzenia uruchomienia, wykonania GPU oraz odtworzenia usług z wynikami.
-
-### Trwały cache kompilacji natywnej
-
-Bezpośredni build wskazuje osobne, stałe katalogi CMake dla FDM i FEM wewnątrz
-cache `/build`. Nie są one zależne od zmieniającego się fingerprintu Cargo
-`OUT_DIR`. Klucz cache nadal rozdziela checkout/worktree oraz toolchain;
-zmiana tych wejść nie może użyć niezgodnego katalogu. Pakowanie FDM korzysta
-z jawnie wskazanego katalogu i odrzuca brak biblioteki lub błąd kopiowania.
-FEM zachowuje sprawdzenie tożsamości snapshotu biblioteki.
-
-Pierwsze użycie stałych katalogów może wymagać ponownej kompilacji bibliotek
-natywnych. Przyrostowość potwierdziła kolejna kompilacja z tymi samymi zamrożonymi
-źródłami: build `5bcbce5785b14ad583d539baaa763e37` zakończył fazy CLI, API
-i Python odpowiednio w 15,07 s, 35,75 s i 1,08 s. Pomiar dotyczy ponownego
-użycia niezmienionych wejść, nie dowolnej przyszłej zmiany modułu. Cache
-powiększono z 12 do 24 GiB z zachowaniem UUID i istniejących obiektów.
-Nie usunięto wyników symulacji ani współdzielonego cache.
-
-### Ostatni potwierdzony build i poprawka cache
-
-Build release `dd1e867a397f4ba48c2e8b8db811c7e7` ze źródeł `291d736` zakończył
-się `succeeded`, exit 0; zbudował CLI, API i rozszerzenie Python. Nowy run
-`093108f2bcd14b75a103c8931961fa37` uruchomił dwie stałe usługi w projekcie
-`fullmag-worktree-docker-all-windows-20261014-f009a6a0b6d6e110`, na wspólnej
-prywatnej sieci. Frontend publikuje wyłącznie loopback `32871`; backend nie
-publikuje portów hosta. Poprzedni pusty store techniczny i jego receipt
-zachowano oraz sprawdzono hashami przed i po nowym starcie.
-
-Obie usługi osiągnęły początkowo `healthy`, lecz późniejsza publikacja próbki
-sprzętu została odrzucona: czas próbki nie wyprzedzał poprzedniej w obrębie
-jednego bootu. Nadzór zamknął API po `live_probe_failed`. Początkowy receipt
-`running/PASS` jest dowodem startu w danym momencie; bieżąca gotowość wymaga
-aktualnej obserwacji usługi. Działające połączenie UI–API nadal pozostaje
-`NOT VERIFIED`; samo grupowanie kontenerów jest potwierdzone.
-
-Commity `e9beea1` i `c81f298` zawierają live inputs, scoped bazę grupy oraz
-obsługę legalnie nieutworzonego checkpointu schedulera. Są zapisane na branchu
-zadania, ale pakiet binarny `291d736` ich nie zawiera. Build `backend-dev`,
-pomiar małej zmiany, trwałość scoped DB i wykonanie GPU wymagają osobnych
-dowodów. Wynik release nie jest pomiarem szybkości trybu dev.
-
-Commit `a37e7ab54f5ea11657b7ade4734b499f9090327d` usuwa kolejną przyczynę
-zbędnej kompilacji FEM. Zmienny hash snapshotu trafia do wygenerowanego nagłówka
-używanego tylko przez `runtime_build_info.cpp`. Sprawdzenie configure-only
-potwierdziło, że zmiana snapshotu zmienia nagłówek, zachowując zawartość i mtime
-wspólnego `flags.make`; legacy managed capsule zachowuje swój guard.
-Osobna regresja sprawdza, że pakowanie nie dobiera bibliotek z obcego profilu.
-Nie jest to jeszcze dowód czasu następnej kompilacji ani wykonania GPU.
+Nie instaluj osobnego hostowego toolchaina ani nie zmieniaj bibliotek ręcznie
+w działającym kontenerze. Profil dev korzysta z Cargo `backend-dev`; release
+przygotowuje osobny, gotowy artefakt/obraz z zamrożonych wejść i własną
+kwalifikacją. Release nie jest domyślnym sposobem codziennej edycji.
 
 ## Warunki odbioru
 
-1. Bezpośredni start dwóch usług w projekcie przypisanym do checkoutu: `fullmag-master` albo czytelne `fullmag-worktree-<worktree_id>`, bez zgłoszenia joba runnera. Tymczasowy build backendu należy do tego samego projektu Compose.
-2. Pełny backend zbudowany w swoim kontenerze, frontend uruchomiony w swoim.
-3. Home widoczny w przeglądarce oraz działające połączenie z API pod tym samym adresem.
-4. Zapis źródła Windows powoduje HMR; jawna kolejna przebudowa backendu używa cache.
-5. Sesje i wyniki są widoczne w wybranym rzeczywistym storage Windows po restarcie.
-6. Start ze skryptem aktywuje właściwy model i respektuje interaktywny `wait_for_solve`.
-7. Osobne dowody wykonania CPU/GPU; sam build, wykrycie GPU i HTTP 200 nie są takim dowodem.
-8. Dwie grupy mają odrębne porty, sieci, ustawienia i historię projektów; recreate zachowuje dane właściwej grupy. Równoległe działanie różnych generacji nie może omijać wspólnych rezerwacji sprzętu.
-9. Tryb dev nie pakuje całego repozytorium do tar-a przy każdej iteracji; mała zmiana backendu zachowuje niezmienione obiekty i ma zmierzony czas przebudowy. Release zachowuje odrębną ścieżkę dystrybucyjną.
+Nowy wariant wymaga rzeczywistego potwierdzenia:
+
+1. Dwa stałe kontenery w grupie checkoutu; ten sam backend buduje i uruchamia API.
+2. Jeden log backendu, ponowne użycie cache i kontrolowany restart ze stałym ID.
+3. Widoczny Home, API pod adresem frontendu oraz HMR po edycji Windows.
+4. Start `.py`: aktywny model, auto Solve i osobno `wait_for_solve`.
+5. Trwałość bazy grupy, sesji i wyników po restarcie.
+6. Rzeczywiste wykonanie CPU/GPU oraz poprawne artefakty; build nie wystarcza.
+7. Izolacja dwóch grup i brak obejścia wspólnych rezerwacji sprzętu.
+
+Wcześniejszy backend ze źródeł `4b3a89501c3ec8cd2bb2fc9aaba34ad1a0de7900`
+zbudował się poprawnie; ten wynik nie kwalifikuje jeszcze nowego cyklu
+jednego kontenera. Wcześniejsze próby przeglądarkowe i HMR dotyczą starej
+orkiestracji. Wykonanie FEM GPU i oryginalnego rings pozostaje **NOT VERIFIED**.
+Wymagane CI/review/merge oraz dostępność prywatnego runnera managed FEM są
+osobnymi bramkami. Szczegółowe dowody i ograniczenia trafiają do checkpointu
+zadania w rozwiązanym storage, nie do rosnącej historii komend w tym przewodniku.
 
 ## Kolejność wdrożenia — stałe numery zadań
 
@@ -581,13 +239,13 @@ Nie jest to jeszcze dowód czasu następnej kompilacji ani wykonania GPU.
 5. Uruchomić trwały cache kompilacji backendu.
 6. Zbudować pełny backend: FDM/FEM, CPU/GPU.
 7. Uruchomić frontend Next.js z montowanych źródeł.
-8. Uruchomić oba kontenery w grupie przypisanej do checkoutu, z osobną siecią i portem.
+8. Uruchomić oba kontenery w grupie checkoutu, z osobną siecią i portem.
 9. Sprawdzić widoczny Home i komunikację UI–API.
 10. Potwierdzić HMR po edycji pliku w Windows.
 11. Potwierdzić przyrostową przebudowę backendu bez utraty cache.
 12. Sprawdzić parametr skryptu, aktywację modelu, wykonanie GPU i zapis wyników w Windows.
 13. Uzupełnić instrukcję, przeprowadzić wymagane CI/review i scalić na `master`.
 
-Aktualizacje postępu używają formatu „Zadanie X/13”. Numery oznaczają stałe
-etapy, nie deklarację ich ukończenia; dowody i bieżący stan trafiają do
-checkpointu zadania w rozwiązanym storage.
+Aktualizacje postępu używają „Zadanie X/13”. Numery oznaczają etapy;
+nie są deklaracją ukończenia. Zmiana z ADR 0061 wymaga ponownego sprawdzenia
+cyklu start/restart, zanim wcześniejsze dowody zostaną do niego przypisane.

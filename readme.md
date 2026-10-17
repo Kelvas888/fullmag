@@ -153,7 +153,17 @@ Recipes are defined in [`justfile`](justfile); run `just --list` from the
 selected checkout to list them. The two-service topology, mounts, and network
 are defined in [`compose.dev.yaml`](compose.dev.yaml). See the
 [Docker development guide](docs/guides/docker-development-architecture.md)
-for the detailed architecture and lifecycle contract.
+for the detailed architecture and lifecycle contract and
+[ADR 0061](docs/adr/0061-docker-development-build-and-runtime-container.md)
+for the same-container build and runtime decision.
+
+Each checkout group has two persistent application services: `frontend` and
+`backend`. The backend container compiles the selected source using its durable
+ext4 cache and then starts API and native runtime in that same container. Its
+Docker Desktop Logs show compilation and service startup together. Development
+does not use a separate one-shot backend-build container or transfer the built
+package through Windows storage. This lifecycle is being integrated; the new
+end-to-end startup and controlled restart remain **NOT VERIFIED**.
 
 Daily FullMag development uses the direct Docker Compose workspace. Run the
 launcher from native Windows PowerShell with Docker Desktop using Linux
@@ -219,14 +229,12 @@ The equivalent native Python commands are useful when `just` is unavailable:
 python -B "$main\scripts\bootstrap_docker_toolchain.py" --repo-root $main --direct-development
 # Start without a startup script:
 python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $worktree --port 3197
-# Or build only, without starting services:
-# python -B "$main\scripts\docker_dev.py" --repo-root $main build --source-root $worktree
 # Or start with a startup script:
 # python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $worktree --port 3197 --script "examples/fem_relax_gpu_smoke.py"
 ```
 
-The `up` command builds the selected backend package in Docker and then starts
-the services; `build` performs the cached backend build without starting them.
+The `up` command starts the two services. The backend itself checks current
+mounted source, builds as needed with its persistent cache, and then starts API.
 Open `http://127.0.0.1:3197/workspace` after startup. A startup script without
 `study.wait_for_solve(True)` is activated and executed automatically; a script
 with that call publishes an interactive workspace waiting for Compute.
@@ -239,60 +247,27 @@ does not forward Windows file events reliably. Frontend dependencies, Next
 output, and watcher state stay in the group cache rather than being written to
 the checkout.
 
-Backend edits require a deliberate cached build:
+After editing backend code, save the project, finish active simulations, and
+restart the **backend service in the selected group** in Docker Desktop:
 
 ```powershell
-just docker-dev-build "$worktree"
+docker ps --filter "label=com.docker.compose.project=<compose-project>" --filter "label=com.docker.compose.service=backend"
+docker restart <backend-container-id>
+docker logs -f <backend-container-id>
 ```
 
-This command does not restart the active services or simulation. To apply
-its package without a second build, use the controlled `recreate` flow below
-after the selected group is safely stopped and has no active compute. `up`
-remains the build-and-start path; the launcher rejects an active group or a port
-collision and never silently restarts, takes over, or resets another group.
+Every backend start checks the current mounted source and dependencies itself.
+Unchanged inputs reuse the existing result; changed modules and their dependants
+are compiled incrementally. No separate host manifest refresh, build container,
+package transfer, or second startup command is required. The frontend stays
+running. With unchanged image and mounts, the backend keeps its container ID.
+Changing the image or mount configuration can require service recreation.
 
-### Apply an existing backend package without rebuilding
-
-`docker_dev.py up` always performs another backend build. When a successful
-backend package already exists, apply it with `recreate` instead. The successful
-`docker_dev.py build` output contains the exact `assembly_receipt` path and
-`run_root`; pass that printed `assembly.json` path unchanged. The existing runtime
-start receipt is the `receipt.json` beside the exact `state_root` reported by that run,
-with the usual shape
-`<storage>\runs\<worktree-id>\docker-all\<run-id>\receipt.json`. Do not
-search for a latest run or select a receipt by directory ordering.
-
-After the selected group has been gracefully stopped and verified idle, compute
-the previous configuration digest from that same run root and reuse its state:
-
-```powershell
-$runRoot = "C:\path\to\storage\runs\<worktree-id>\docker-all\<run-id>"
-$runReceipt = Join-Path $runRoot "receipt.json"
-$assemblyReceipt = "C:\path\to\storage\builds\<worktree-id>\docker-all-gpu\direct-compose\<build-id>\assembly.json"
-$previousConfigSha256 = (Get-FileHash -Algorithm SHA256 `
-  -LiteralPath "$runRoot\state\.fullmag\runtime-service\docker-all.json").Hash.ToLowerInvariant()
-
-python -B "$main\scripts\docker_dev.py" --repo-root $main recreate `
-  --run-receipt $runReceipt `
-  --assembly-receipt $assemblyReceipt `
-  --previous-config-sha256 $previousConfigSha256 `
-  --source-root $worktree `
-  --port 3197
-```
-
-Use the literal `assembly_receipt` path printed by the build and the literal run
-receipt derived from that run's output. The `recreate` command does not build,
-publish a second package, choose `latest`, or create a new session root. It
-validates both receipts and the old configuration hash, then preserves the run
-state, sessions, results, workspace database, and `receipt-history` while
-applying the already-built package.
-
-If the launcher reports that the selected group still owns containers, first
-confirm that the exact run receipt is yours and that the host ledger has no
-active compute or reservation. Run only the exact `docker compose ... down`
-command printed by the launcher for that project, working directory, and
-resolved JSON files. Do not replace it with a generic project, wildcard, or
-`--volumes` command; preserve the storage, receipts, state, and history.
+Stopping must preserve the native drain and ownership checks. An unconfirmed
+owner requires canonical recovery; do not reset it, take over another group,
+remove volumes, or restart an active simulation. Cache, sessions, results, and
+workspace settings remain durable. The new lifecycle remains **NOT VERIFIED**
+until its actual container startup and restart checks are recorded.
 
 An optional third `just docker-dev` argument selects a Python startup script
 inside the same checkout. The path is contained, hashed, and recorded in
@@ -337,8 +312,8 @@ start or build fails.
 The default `dev` profile uses Cargo `backend-dev`, `live-shadow-v1`, persistent
 incremental cache, and a live source bind for the running services. The backend
 build is isolated in a Linux ext4 shadow of the validated source manifest, so a
-checkout edit during compilation cannot mix versions; the next explicit build
-captures the next manifest. Release or frozen inputs use the separate `release`
+checkout edit during compilation cannot mix versions; the next backend start
+captures current sources itself. Release or frozen inputs use the separate `release`
 profile and immutable archive/snapshot path and do not provide the HMR workflow.
 
 The dependency declarations are repository-owned: CUDA, CMake, MFEM, hypre,
