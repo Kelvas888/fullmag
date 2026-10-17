@@ -33,6 +33,7 @@ import { useObjectVisualizationSelector } from "@/kernel/visualization/useObject
 import { VisualizationDebugController } from "@/kernel/visualization/VisualizationDebugController";
 import { VisualizationSurfaceColoringSection, VisualizationVectorsSection } from "@/modules/inspector/panels/ObjectVisualizationTargetSection";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import { Viewport3DFieldLabel } from "@/modules/viewport-3d/Viewport3DFieldLabel";
 import { useArtifactFieldOverlay } from "@/modules/viewport-3d/hooks/useArtifactFieldOverlay";
 import { artifactRenderedSurfaceRanges } from "@/modules/viewport-3d/model/artifactFieldOverlayModel";
 import { viewport3dStore } from "@/modules/viewport-3d/viewport3dStore";
@@ -278,6 +279,7 @@ function View({ fixture, dedicated = false }: { fixture: ReturnType<typeof makeF
     <label>Geometry scope<select aria-label="Fixture geometry scope" value={settings.geometryScope} onChange={event => { void patch({ geometryScope: event.target.value as "full" | "surface" }); }}><option value="full">Full</option><option value="surface">Surface</option></select></label>
     <label>Glyph budget<input aria-label="Fixture glyph budget" type="number" min={0} value={settings.vectorBudget} onChange={event => { void patch({ vectorBudget: Number(event.target.value) }); }} /></label></> : null}
     <p role="status">{result.error ?? (result.model ? `${quantity}: historical inspection · ${result.model.count} samples` : "No historical model")}</p>
+    <div data-artifact-field-hud><Viewport3DFieldLabel quantityId="m" label="m" historical={result.historical} model={result.model} error={result.error} /></div>
     <div data-artifact-field-viewport style={{ height: 480, width: "100%", position: "relative" }}><Viewport3DCanvas camera={{ position: [2.4, 1.7, 1.3], fov: 45, near: .01, far: 100 }} frameloop="demand">
       <VectorGlyphDerivedBufferCacheProvider tracker={tracker}><Probe /><ArtifactFieldLayer model={result.model} tracker={tracker} sessionIdentity={session} adoptionRegistry={adoptionRegistry} colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} /></VectorGlyphDerivedBufferCacheProvider>
     </Viewport3DCanvas><div className="fm-viewport-3d__colorbar-stack">{resolveArtifactFieldColorbars(result.model).map(({ key, legend }) => <Viewport3DColorbar key={key} legend={legend} />)}</div></div>

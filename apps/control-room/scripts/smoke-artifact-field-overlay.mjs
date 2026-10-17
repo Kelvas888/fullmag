@@ -48,6 +48,10 @@ try {
     assert.equal(await page.locator("[data-artifact-field-viewport] canvas").isVisible(), true);
     assert.equal(result.canvas.lost, false); assert.ok(result.canvas.width > 0 && result.canvas.height > 0);
     assert.equal(result.state.historical, true); assert.equal(result.state.error, null); assert.deepEqual(result.state.unexpected, []);
+    const fieldLabel = page.locator("[data-artifact-field-hud] [data-quantity-id]");
+    assert.equal(await fieldLabel.getAttribute("data-quantity-id"), q);
+    assert.equal(await fieldLabel.getAttribute("data-field-state"), "ready");
+    assert.equal(await fieldLabel.textContent(), `${q} [${result.state.unit}]`);
     return result;
   };
   const screenshot = async name => { const path = resolve(directory, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
@@ -448,6 +452,10 @@ try {
       return state && !state.model && Boolean(state.error);
     });
     await page.waitForFunction(() => window.__artifactOverlayCanvas?.().groups === 0);
+    const rejectedLabel = page.locator("[data-artifact-field-hud] [data-quantity-id]");
+    assert.equal(await rejectedLabel.getAttribute("data-field-state"), "unavailable");
+    assert.equal(await rejectedLabel.textContent(), "m · unavailable");
+    assert.ok(await rejectedLabel.getAttribute("title"));
     const rejectedCatalog = await read();
     assert.equal(rejectedCatalog.state.calls.filter(call => call.binary).length, beforeWrongCatalog.state.calls.filter(call => call.binary).length);
     assert.ok(rejectedCatalog.state.calls.slice(beforeWrongCatalog.state.calls.length).filter(call => catalogPaths.includes(call.path)).every(call => call.stage === "execution-inspect"));
