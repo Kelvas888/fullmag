@@ -771,27 +771,8 @@ export interface ObjectPatchRequest extends BaseAuthoringTransaction {
   transform?: JsonObject | null;
   visible?: boolean | null;
 }
-export interface ObjectMetricsResource {
-  energies: {
-    anisotropy: number;
-    demag: number;
-    dmi: number;
-    exchange: number;
-    total: number;
-    zeeman: number;
-  };
-  has_solver_sample: boolean;
-  magnetization_average: {
-    mx: number;
-    my: number;
-    mz: number;
-  } | null;
-  object_id: string;
-  revision: number;
-  source: string;
-  step: number;
-  time_seconds: number;
-}
+export type ObjectMetricsResource = components["schemas"]["ObjectMetricsResource"];
+
 export type SceneResource = components["schemas"]["SceneResource"];
 export type FrozenSpinsCollectionResource =
   components["schemas"]["FrozenSpinsCollectionResource"];

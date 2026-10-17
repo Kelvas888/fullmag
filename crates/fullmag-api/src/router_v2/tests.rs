@@ -28096,7 +28096,7 @@ async fn solver_energies_history_endpoint_honors_limit() {
 }
 
 #[tokio::test]
-async fn object_metrics_endpoint_returns_zero_energies_before_solver_sample() {
+async fn object_metrics_endpoint_returns_null_energies_before_solver_sample() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(sample_scene_document());
@@ -28122,7 +28122,12 @@ async fn object_metrics_endpoint_returns_zero_energies_before_solver_sample() {
     assert_eq!(json["magnetization_average"]["mx"], 1.0);
     assert_eq!(json["magnetization_average"]["my"], 0.0);
     assert_eq!(json["magnetization_average"]["mz"], 0.0);
-    assert_eq!(json["energies"]["total"], 0.0);
+    for key in ["total", "exchange", "demag", "zeeman", "anisotropy", "dmi"] {
+        let value = json["energies"]
+            .get(key)
+            .expect("energy key must remain present");
+        assert!(value.is_null(), "missing {key} must not become zero");
+    }
 }
 
 #[tokio::test]
@@ -28183,9 +28188,10 @@ async fn object_metrics_endpoint_prefers_per_object_solver_scalars() {
         });
         snapshot.scalar_revision = 21;
     }
-    let app = build_v2_router().with_state(state);
+    let app = build_v2_router().with_state(state.clone());
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -28204,6 +28210,40 @@ async fn object_metrics_endpoint_prefers_per_object_solver_scalars() {
     assert_eq!(json["magnetization_average"]["mx"], 0.25);
     assert_eq!(json["energies"]["exchange"], 11.0);
     assert_eq!(json["energies"]["total"], 65.0);
+
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        let values = snapshot
+            .live_state
+            .as_mut()
+            .unwrap()
+            .latest_step
+            .per_object_scalars
+            .get_mut("body")
+            .unwrap();
+        values.remove("e_dmi");
+        values.insert("e_ext".into(), f64::NAN);
+        values.insert("e_total".into(), 0.0);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v2/sessions/current/simulation/objects/body/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let partial = body_json(response).await;
+    assert_eq!(partial["energies"]["total"], 0.0);
+    assert_eq!(partial["energies"]["exchange"], 11.0);
+    for key in ["zeeman", "dmi"] {
+        assert!(partial["energies"]
+            .get(key)
+            .expect("nullable energy key")
+            .is_null());
+    }
 }
 
 #[tokio::test]

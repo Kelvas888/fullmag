@@ -11037,19 +11037,20 @@ export interface components {
             transform?: Record<string, never> | null;
             universe?: Record<string, never> | null;
         };
+        /** @description Per-energy availability is explicit: null is missing, while Some(0.0) is an observed zero. */
         ObjectEnergySummary: {
             /** Format: double */
-            anisotropy: number;
+            anisotropy: number | null;
             /** Format: double */
-            demag: number;
+            demag: number | null;
             /** Format: double */
-            dmi: number;
+            dmi: number | null;
             /** Format: double */
-            exchange: number;
+            exchange: number | null;
             /** Format: double */
-            total: number;
+            total: number | null;
             /** Format: double */
-            zeeman: number;
+            zeeman: number | null;
         };
         ObjectGeometryPatchRequest: {
             /** Format: int64 */

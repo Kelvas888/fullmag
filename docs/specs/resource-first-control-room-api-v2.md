@@ -1685,3 +1685,13 @@ nowy current step mógłby ponownie certyfikować stare dane. Stary m preview
 nie jest kopiowany przez zmianę domain/topology. Dowód bundle wymaga
 obowiązkowego nonnull carrier/frame/physical-row match w positive fixture;
 warunkowe sprawdzenie tylko gdy bundle istnieje jest niewystarczające.
+
+### Dostępność energii obiektu
+
+`simulation/objects/{object_id}/metrics` zachowuje sześć kluczy `energies`.
+Każdy ma wartość liczbową albo `null`: brak próbki, brak konkretnej składowej
+lub wartość nieskończona/NaN nie oznacza energii zerowej. Obliczone `0` pozostaje
+liczbą. Częściowego wiersza obiektowego nie uzupełnia się globalnymi energiami;
+konsument może jawnie pokazać globalne podsumowanie z odrębnym oznaczeniem zakresu.
+`has_solver_sample` opisuje obecność próbki, a nie kompletność wszystkich energii.
+Starsze klienty wymagające wyłącznie liczb muszą zostać zaktualizowane razem z API.

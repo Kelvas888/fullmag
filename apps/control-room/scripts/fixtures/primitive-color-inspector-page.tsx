@@ -91,7 +91,7 @@ function makeFixture() {
     if (path === DATA_FIELDS_PATH) return json({ revision: 1, fields: [] });
     if (path === DATA_QUANTITIES_PATH) return json({ revision: 1, quantities: [] });
     const metricsPrefix = SIMULATION_OBJECT_METRICS_PATH.split("{")[0];
-    if (path === SIMULATION_OBJECT_METRICS_PATH.replace("{object_id}", "explicit-magnetic")) return json({ revision: state.telemetryRevision, object_id: "explicit-magnetic", has_solver_sample: state.objectSample, source: state.objectGlobal ? "solver_energy_only" : "solver_per_object", step: 1, time_seconds: 0, magnetization_average: { mx: 0.9, my: 0, mz: 0 }, energies: state.objectZero ? { total: 0, exchange: 0, demag: 0, zeeman: 0, anisotropy: 0, dmi: 0 } : { total: null, exchange: 4, demag: null, zeeman: null, anisotropy: null, dmi: null } });
+    if (path === SIMULATION_OBJECT_METRICS_PATH.replace("{object_id}", "explicit-magnetic")) return json({ revision: state.telemetryRevision, object_id: "explicit-magnetic", has_solver_sample: state.objectSample, source: state.objectGlobal ? "solver_energy_only" : "solver_per_object", step: 1, time_seconds: 0, magnetization_average: { mx: 0.9, my: 0, mz: 0 }, energies: !state.objectSample ? { total: null, exchange: null, demag: null, zeeman: null, anisotropy: null, dmi: null } : state.objectZero ? { total: 0, exchange: 0, demag: 0, zeeman: 0, anisotropy: 0, dmi: 0 } : { total: null, exchange: 4, demag: null, zeeman: null, anisotropy: null, dmi: null } });
     if (path.startsWith(metricsPrefix)) return json({ error: "No solver sample in controlled fixture" }, 404);
     unexpected.push(`${request.method} ${path}`); throw new Error(`Unexpected fixture request: ${path}`);
   } });
