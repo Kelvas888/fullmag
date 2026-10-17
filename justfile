@@ -23,6 +23,32 @@ help:
 storage-info:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_storage.py" resolve --repo-root "{{repo_root}}" --format json
 
+# Submit a clean commit to the shared runner using independent source copies.
+docker-all-build commit:
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" submit --commit {{quote(commit)}}
+
+# Assemble a complete offline GPU image from a verified managed release.
+docker-all-image job_id commit:
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" build-image --job-id {{quote(job_id)}} --commit {{quote(commit)}}
+
+docker-all-start assembly_receipt port="3197":
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" start --assembly-receipt {{quote(assembly_receipt)}} --port {{quote(port)}}
+
+# Live source defaults to the Git main checkout; source_root can select a worktree.
+docker-all-dev assembly_receipt port="3197" source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" start --assembly-receipt {{quote(assembly_receipt)}} --port {{quote(port)}} --frontend 'dev' {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
+
+# Explicit immutable snapshot of the selected checkout; no restart.
+docker-all-dev-backend-build source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" submit-development {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
+
+docker-all-dev-image job_id commit source_digest="" native_snapshot_sha256="" source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" build-image --job-id {{quote(job_id)}} --commit {{quote(commit)}} --development {{if (source_digest + native_snapshot_sha256) == "" { "" } else { "--source-digest " + quote(source_digest) + " --native-snapshot-sha256 " + quote(native_snapshot_sha256) }}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
+
+# Fixed GPU execution and FMS round-trip; never build or restart a runtime.
+docker-all-verify run_receipt:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_docker_all_runtime.py" --repo-root "{{repo_root}}" {{quote(run_receipt)}}
+
 storage-inventory:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_storage.py" inventory --repo-root "{{repo_root}}" --format json
 
@@ -322,6 +348,10 @@ verify-windows-project-document:
 verify-windows-project-document-frozen build_id:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}"
 
+# Real product workspace and project archive lifecycle without a runtime session.
+verify-windows-project-document-browser build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}" --project-document-browser
+
 # Preserve a verified old API package for an owned subsequent restart proof.
 archive-windows-native-build build_id:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}" --archive-frozen-bundle
@@ -600,6 +630,10 @@ verify-antenna-regional-drive-browser:
 # Production Explorer tree against controlled scene inputs; no solver or unit builds.
 verify-explorer-physics-reporting-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3259 --scenario explorer-physics-reporting
+
+# Production preparation status, Inspector and viewport; controlled preparation, no solver.
+verify-preparation-workspace-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3268 --scenario preparation-workspace
 
 # Production antenna Inspector and resource hooks in an isolated browser fixture.
 verify-antenna-source-spectrum-browser dependency_workspace="":

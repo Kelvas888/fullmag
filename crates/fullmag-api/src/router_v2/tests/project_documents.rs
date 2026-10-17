@@ -3832,11 +3832,29 @@ async fn project_batch_submit_replays_and_lists_durable_parent() {
         },
     )
     .unwrap();
+    let mut problem = ProblemIR::bootstrap_example();
+    problem.object_regions.push(fullmag_ir::ObjectRegionIR {
+        region_id: "strip:core".into(),
+        owner_object: "strip".into(),
+        name: "core".into(),
+        shape: fullmag_ir::RegionShapeIR::Box {
+            size: [200e-9, 20e-9, 6e-9],
+            center: [0.0, 0.0, 0.0],
+        },
+        frame: fullmag_ir::RegionFrameIR::Object,
+        enabled: true,
+        priority: 1,
+        mesh_policy: None,
+        material_overrides: Vec::new(),
+        texture_override: None,
+        material_transition: None,
+        realization_policy: fullmag_ir::RegionRealizationPolicyIR::Inherit,
+    });
     let catalog = StudyProblemCatalog::from_entries(
         &study,
         vec![StudyProblemCatalogEntry::from_step(
             &study.steps[0],
-            ProblemIR::bootstrap_example(),
+            problem,
         )],
     )
     .unwrap();
@@ -3981,16 +3999,19 @@ async fn project_batch_submit_replays_and_lists_durable_parent() {
         .expect("accepted batch manifest is durable");
     let mut manifest: fullmag_application::BatchExpansionManifest =
         serde_json::from_slice(&manifest_bytes).unwrap();
-    let initial_progress = fullmag_session::FmsBatchExpansionProgress::new(
-        &batch_intent,
-        u64::try_from(manifest.cases.len()).unwrap(),
-        0,
-        1,
-    )
-    .unwrap();
+    let initial_progress = store
+        .read_batch_expansion_progress(&batch_intent.batch_id)
+        .unwrap()
+        .expect("accepted batch submission seeds durable expansion progress");
     assert_eq!(
-        store.commit_batch_expansion_progress(0, &initial_progress).unwrap(),
-        fullmag_session::BatchExpansionProgressCommitDisposition::Accepted
+        initial_progress.total_cases,
+        u64::try_from(manifest.cases.len()).unwrap()
+    );
+    assert_eq!(initial_progress.sequence, 1);
+    assert_eq!(initial_progress.next_case_index, 0);
+    assert_eq!(
+        initial_progress.state,
+        fullmag_session::FmsBatchExpansionState::Pending
     );
 
     // Recreate the publisher crash window: the child intent commits before
@@ -4137,6 +4158,53 @@ async fn project_batch_submit_replays_and_lists_durable_parent() {
     assert_eq!(published_run["catalog_revision"], 1);
     assert_eq!(published_run["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(published_run["tasks"][0]["lifecycle"], "accepted");
+    assert_eq!(published_run["tasks"][0]["cancellation_requested"], false);
+
+    let task_id = published_run["tasks"][0]["task_id"].as_str().unwrap();
+    let cancellation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/v2/persistence/projects/project-batch-http/runs/{first_run_id}/tasks/{task_id}/cancellation",
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "reason": "batch cancellation reconciliation test",
+                        "cancellation_id": "cancel-batch-case",
+                        "expected_catalog_revision": 1,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancellation.status(), StatusCode::ACCEPTED);
+
+    let cancellation_reflected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(concat!(
+                    "/v2/persistence/projects/project-batch-http/batches/batch-http/cases",
+                    "?limit=1",
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancellation_reflected.status(), StatusCode::OK);
+    let cancellation_reflected = body_json(cancellation_reflected).await;
+    assert_eq!(
+        cancellation_reflected["cases"][0]["published_run"]["tasks"][0]
+            ["cancellation_requested"],
+        true
+    );
 
     let second_page = app
         .clone()

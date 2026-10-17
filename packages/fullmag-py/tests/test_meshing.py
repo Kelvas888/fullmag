@@ -8590,7 +8590,12 @@ class MeshScaffoldTests(unittest.TestCase):
                 self.option = _FakeOption()
 
         fake = _FakeGmsh()
-        actual = _configure_gmsh_threads(fake, requested_threads=4)
+        with patch.dict(
+            os.environ,
+            {"FULLMAG_GMSH_THREADS": "", "FULLMAG_CPU_THREADS": ""},
+            clear=False,
+        ):
+            actual = _configure_gmsh_threads(fake, requested_threads=4)
         self.assertEqual(actual, 4)
         self.assertEqual(fake.option.values["General.NumThreads"], 4)
         self.assertEqual(fake.option.values["Mesh.MaxNumThreads1D"], 4)
@@ -9877,11 +9882,16 @@ class FieldStackAcceptanceTests(unittest.TestCase):
             {"left"},
         )
 
-        generated: list[tuple[str, float, list[dict[str, object]]]] = []
+        geometry_object_ids = {
+            "left": "object-left",
+            "left_geom": "object-left-geom",
+        }
+        generated: list[tuple[str, str, float, list[dict[str, object]]]] = []
 
-        def generate(_geometry, *, hmax, order, options):
+        def generate(_geometry, *, object_id, hmax, order, options):
             generated.append(
                 (
+                    object_id,
                     _geometry.geometry_name,
                     float(hmax),
                     list(options.lower_bound_fields),
@@ -9911,17 +9921,21 @@ class FieldStackAcceptanceTests(unittest.TestCase):
                 discretization=fm.DiscretizationHints(fem=hints),
                 mesh_workflow=mesh_workflow,
                 per_object_recipes=recipes,
+                geometry_object_ids=geometry_object_ids,
             )
 
         self.assertEqual(
-            [(name, hmax) for name, hmax, _lower_bounds in generated],
-            [("left", 5e-9), ("left_geom", 20e-9)],
+            [(object_id, name, hmax) for object_id, name, hmax, _lower_bounds in generated],
+            [
+                ("object-left", "left", 5e-9),
+                ("object-left-geom", "left_geom", 20e-9),
+            ],
         )
         self.assertEqual(
-            [field["params"]["MinimumElementSize"] for field in generated[0][2]],
+            [field["params"]["MinimumElementSize"] for field in generated[0][3]],
             [2e-9],
         )
-        self.assertEqual(generated[1][2], [])
+        self.assertEqual(generated[1][3], [])
         self.assertEqual(
             [entry["geometry_name"] for entry in assets["fem_mesh_assets"]],
             ["left", "left_geom"],
@@ -9983,13 +9997,18 @@ class FieldStackAcceptanceTests(unittest.TestCase):
             },
         }
         recipes = {"left": PerObjectMeshRecipe(hmax=20e-9, hmin=2e-9)}
+        geometry_object_ids = {
+            "left": "object-left",
+            "left_geom": "object-left-geom",
+        }
         generated: dict[
             str,
-            tuple[float, list[dict[str, object]], list[dict[str, object]]],
+            tuple[str, float, list[dict[str, object]], list[dict[str, object]]],
         ] = {}
 
-        def generate(_geometry, *, hmax, order, options):
+        def generate(_geometry, *, object_id, hmax, order, options):
             generated[_geometry.geometry_name] = (
+                object_id,
                 float(hmax),
                 list(options.size_fields),
                 list(options.lower_bound_fields),
@@ -10018,9 +10037,11 @@ class FieldStackAcceptanceTests(unittest.TestCase):
                 discretization=fm.DiscretizationHints(fem=hints),
                 mesh_workflow=mesh_workflow,
                 per_object_recipes=recipes,
+                geometry_object_ids=geometry_object_ids,
             )
 
-        left_hmax, left_fields, left_lower_bounds = generated["left"]
+        left_object_id, left_hmax, left_fields, left_lower_bounds = generated["left"]
+        self.assertEqual(left_object_id, geometry_object_ids["left"])
         self.assertEqual(left_hmax, 20e-9)
         self.assertFalse(
             any(
@@ -10063,7 +10084,8 @@ class FieldStackAcceptanceTests(unittest.TestCase):
             },
         )
 
-        right_hmax, right_fields, _right_lower_bounds = generated["left_geom"]
+        right_object_id, right_hmax, right_fields, _right_lower_bounds = generated["left_geom"]
+        self.assertEqual(right_object_id, geometry_object_ids["left_geom"])
         self.assertEqual(right_hmax, 25e-9)
         self.assertTrue(
             any(
@@ -11121,7 +11143,7 @@ class FieldStackAcceptanceTests(unittest.TestCase):
             10.0e-9,
         )
 
-    def test_periodic_airbox_z_padding_reports_magnetic_submesh_signature_drift(self) -> None:
+    def test_periodic_airbox_z_padding_preserves_magnetic_submesh_signature(self) -> None:
         try:
             import gmsh  # noqa: F401
         except ImportError:
@@ -11232,19 +11254,23 @@ class FieldStackAcceptanceTests(unittest.TestCase):
 
         baseline = _build_report_signature(90.0e-9)
         padded = _build_report_signature(90.1e-9)
-        self.assertNotEqual(
-            (
-                baseline["node_count"],
-                baseline["tetra_count"],
-                baseline["edge_count"],
-                baseline["digest"],
-            ),
-            (
-                padded["node_count"],
-                padded["tetra_count"],
-                padded["edge_count"],
-                padded["digest"],
-            ),
+        baseline_key = (
+            baseline["node_count"],
+            baseline["tetra_count"],
+            baseline["edge_count"],
+            baseline["digest"],
+        )
+        padded_key = (
+            padded["node_count"],
+            padded["tetra_count"],
+            padded["edge_count"],
+            padded["digest"],
+        )
+        self.assertEqual(
+            baseline_key,
+            padded_key,
+            "magnetic submesh signature changed with exterior airbox padding: "
+            f"baseline={baseline_key!r}, padded={padded_key!r}",
         )
 
     def test_periodic_antidot_frozen_magnetic_submesh_stays_stable_across_airbox_z_padding(self) -> None:
@@ -14076,7 +14102,7 @@ class RegionMeshPolicyTests(unittest.TestCase):
                     symmetric=False,
                     recombine=False,
                     airbox=AirboxOptions(
-                        size=(100e-9, 80e-9, 100e-9),
+                        size=(160e-9, 120e-9, 100e-9),
                         center=(0.0, 0.0, 0.0),
                         maximum_element_size=30e-9,
                     ),
@@ -14114,6 +14140,175 @@ class RegionMeshPolicyTests(unittest.TestCase):
         self.assertGreater(core_median, 4e-9)
         self.assertLess(core_median, 16e-9)
         self.assertGreater(bulk_median, core_median)
+
+    def test_source_plane_seed_rejects_invalid_surface_bounding_box(self) -> None:
+        options = MeshOptions(
+            size_fields=[
+                {
+                    "kind": "ComponentRestrictedBox",
+                    "params": {
+                        "GeometryName": "source-owner",
+                        "VIn": 2e-9,
+                        "VOut": 20e-9,
+                        "XMin": -18e-9,
+                        "XMax": 18e-9,
+                        "YMin": -13e-9,
+                        "YMax": 13e-9,
+                        "ZMin": -10e-9,
+                        "ZMax": 6e-9,
+                    },
+                }
+            ]
+        )
+        invalid_boxes = (
+            object(),
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 1.0, float("nan")],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        )
+        for invalid_bbox in invalid_boxes:
+            with self.subTest(invalid_bbox=repr(invalid_bbox)):
+                fake_gmsh = SimpleNamespace(
+                    model=SimpleNamespace(
+                        getBoundingBox=lambda _dim, _tag, value=invalid_bbox: value
+                    )
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "source-surface bounding-box"
+                ):
+                    gmsh_swept._embed_mixed_source_face_seed_points(
+                        fake_gmsh,
+                        source_surface=7,
+                        opts=options,
+                        hscale=1.0e6,
+                        source_geometry_name="source-owner",
+                    )
+
+    def test_source_plane_seed_supports_graded_component_fields(self) -> None:
+        class _SourceFaceGmsh:
+            def __init__(self) -> None:
+                self.field = _RecordingFieldApi()
+                self.field.list = lambda: list(self.field.kinds)  # type: ignore[attr-defined]
+                self.points: list[tuple[float, float, float, float]] = []
+                self.embeds: list[tuple[int, list[int], int, int]] = []
+                self.inside_calls: list[tuple[int, int, list[float]]] = []
+                self.option = SimpleNamespace(setNumber=lambda _name, _value: None)
+                self.model = SimpleNamespace(
+                    mesh=SimpleNamespace(
+                        field=self.field,
+                        embed=self._embed,
+                    ),
+                    geo=SimpleNamespace(
+                        addPoint=self._add_point,
+                        synchronize=lambda: None,
+                    ),
+                    getBoundingBox=lambda _dim, _tag: (
+                        -4.0, -3.0, 0.0, 4.0, 3.0, 0.0
+                    ),
+                    isInside=self._is_inside,
+                )
+
+            def _add_point(
+                self, x: float, y: float, z: float, mesh_size: float
+            ) -> int:
+                self.points.append((x, y, z, mesh_size))
+                return len(self.points)
+
+            def _embed(
+                self, dimension: int, tags: list[int], target_dimension: int, target: int
+            ) -> None:
+                self.embeds.append((dimension, list(tags), target_dimension, target))
+
+            def _is_inside(
+                self, dimension: int, tag: int, point: list[float]
+            ) -> int:
+                self.inside_calls.append((dimension, tag, list(point)))
+                # Simulate the circular CSG hole in the source face.
+                return int(np.hypot(point[0], point[1]) >= 0.5)
+
+        graded_box = {
+            "kind": "ComponentRestrictedGradedBox",
+            "params": {
+                "GeometryName": "source-owner",
+                "VIn": 1.0,
+                "VOut": 8.0,
+                "TransitionDistance": 2.0,
+                "Size": [4.0, 4.0, 4.0],
+                "Center": [0.0, 0.0, 0.0],
+            },
+        }
+        graded_cylinder = {
+            "kind": "ComponentRestrictedGradedCylinder",
+            "params": {
+                "GeometryName": "source-owner",
+                "VIn": 1.0,
+                "VOut": 8.0,
+                "TransitionDistance": 2.0,
+                "Radius": 1.0,
+                "Height": 4.0,
+                "Center": [0.0, 0.0, 0.0],
+                "Axis": [0.0, 0.0, 1.0],
+            },
+        }
+        options = MeshOptions(size_fields=[graded_box, graded_cylinder])
+        gmsh = _SourceFaceGmsh()
+        with patch.object(gmsh_swept, "_apply_mesh_options") as apply_mesh_options:
+            restricted = gmsh_swept._apply_mixed_source_face_mesh_options(
+                gmsh,
+                source_surface=7,
+                hmax_scaled=8.0,
+                order=1,
+                opts=options,
+                hscale=1.0,
+                source_geometry_name="source-owner",
+            )
+
+        apply_mesh_options.assert_called_once()
+        self.assertIsInstance(restricted, int)
+        self.assertTrue(gmsh.embeds)
+        self.assertTrue(gmsh.inside_calls)
+        self.assertTrue(
+            all(np.hypot(point[0], point[1]) >= 0.5 for point in gmsh.points)
+        )
+        self.assertEqual(
+            gmsh_swept._localize_source_plane_seed_descriptor(
+                graded_box, normal_axis=2, face_axes=[0, 1]
+            )["params"]["TransitionDistance"],
+            2.0,
+        )
+        default_axis_cylinder = {
+            "kind": graded_cylinder["kind"],
+            "params": {
+                key: value
+                for key, value in graded_cylinder["params"].items()
+                if key != "Axis"
+            },
+        }
+        self.assertEqual(
+            gmsh_swept._localize_source_plane_seed_descriptor(
+                default_axis_cylinder, normal_axis=2, face_axes=[0, 1]
+            )["params"]["Axis"],
+            [0.0, 0.0, 1.0],
+        )
+
+        non_projectable_cylinder = {
+            "kind": "ComponentRestrictedGradedCylinder",
+            "params": {
+                **graded_cylinder["params"],
+                "Axis": [1.0, 0.0, 0.0],
+            },
+        }
+        bad_options = MeshOptions(size_fields=[non_projectable_cylinder])
+        with self.assertRaisesRegex(ValueError, "axis parallel to the source-face normal"):
+            gmsh_swept._apply_mixed_source_face_mesh_options(
+                _SourceFaceGmsh(),
+                source_surface=7,
+                hmax_scaled=8.0,
+                order=1,
+                opts=bad_options,
+                hscale=1.0,
+                source_geometry_name="source-owner",
+            )
 
     def test_ring_chordal_bound_guard_and_refinement(self) -> None:
         quarter_circle_gaps = np.full(4, 0.5 * np.pi, dtype=np.float64)
@@ -15097,7 +15292,11 @@ class RegionMeshPolicyTests(unittest.TestCase):
         assert bounds is not None
         scale = 1.0e6
         xmin, ymin, zmin, xmax, ymax, zmax = (value * scale for value in bounds)
-        levels = {"z": zmin}
+        # The production route starts at the source face's body_bottom and
+        # resets to that same CAD face before traversing the lower intervals.
+        # The mock records each source face explicitly so invalid topology
+        # cannot be hidden by a fallback z cursor.
+        body_bottom = -0.5 * float(geometry.size[2]) * scale
         surface_planes: dict[int, float] = {}
         next_tag_value = 1
 
@@ -15107,11 +15306,21 @@ class RegionMeshPolicyTests(unittest.TestCase):
             next_tag_value += 1
             return tag
 
-        def extrude(_source, _dx, _dy, step, **_kwargs):
-            levels["z"] += float(step)
+        def add_plane_surface(_wire_tags):
+            tag = next_tag()
+            surface_planes[tag] = body_bottom
+            return tag
+
+        def extrude(source_entities, _dx, _dy, step, **_kwargs):
+            source_surfaces = [
+                int(tag) for dimension, tag in source_entities if int(dimension) == 2
+            ]
+            if len(source_surfaces) != 1 or source_surfaces[0] not in surface_planes:
+                raise AssertionError("extrusion must start from one known body or airbox cap")
+            top_plane = surface_planes[source_surfaces[0]] + float(step)
             volume_tag = next_tag()
             top_surface_tag = next_tag()
-            surface_planes[top_surface_tag] = levels["z"]
+            surface_planes[top_surface_tag] = top_plane
             return [(3, volume_tag), (2, top_surface_tag)]
 
         def bounding_box(dimension, tag):
@@ -15125,7 +15334,7 @@ class RegionMeshPolicyTests(unittest.TestCase):
         gmsh.model.geo.addPoint.side_effect = next_tag
         gmsh.model.geo.addLine.side_effect = next_tag
         gmsh.model.geo.addCurveLoop.side_effect = next_tag
-        gmsh.model.geo.addPlaneSurface.side_effect = next_tag
+        gmsh.model.geo.addPlaneSurface.side_effect = add_plane_surface
         gmsh.model.geo.extrude.side_effect = extrude
         gmsh.model.getBoundingBox.side_effect = bounding_box
         gmsh.model.getBoundary.return_value = []

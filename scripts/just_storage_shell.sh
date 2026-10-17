@@ -141,6 +141,22 @@ case "${recipe}" in
     echo "[fullmag just] invalid managed BORIS runtime recipe" >&2
     exit 2
     ;;
+  *"scripts/verify_docker_all_runtime.py"*)
+    docker_verify_pattern="^[^[:space:]]+ \"[^\"]+/scripts/verify_docker_all_runtime.py\" --repo-root \"[^\"]+\" '[^']+'$"
+    if [[ ! "${recipe}" =~ ${docker_verify_pattern} ]]; then
+      echo "[fullmag just] invalid all-in-Docker verification recipe" >&2
+      exit 2
+    fi
+    exec "${python_cmd}" "${resolver}" run --repo-root "${repo_root}" --profile docker-all-gpu -- "${bash_executable}" -euo pipefail -c "${recipe}"
+    ;;
+  *"scripts/fullmag_docker_runtime.py"*)
+    docker_runtime_pattern="^[^[:space:]]+ \"[^\"]+/scripts/fullmag_docker_runtime.py\" --repo-root \"[^\"]+\" (submit-development( --source-root '[^']+')?|submit --commit '[a-f0-9]{40}'|build-image --job-id '[a-f0-9]{32}' --commit '[a-f0-9]{40}'( --development)?( --source-digest '[a-f0-9]{64}' --native-snapshot-sha256 '[a-f0-9]{64}')?( --source-root '[^']+')?|start --assembly-receipt '[^']+' --port '[0-9]{4,5}'( --frontend 'dev')?( --source-root '[^']+')?)[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${docker_runtime_pattern} ]]; then
+      echo "[fullmag just] invalid all-in-Docker recipe" >&2
+      exit 2
+    fi
+    exec "${python_cmd}" "${resolver}" run --repo-root "${repo_root}" --profile docker-all-gpu -- "${bash_executable}" -euo pipefail -c "${recipe}"
+    ;;
   *"scripts/verify_antenna_field_reader.py"*)
     antenna_reader_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_antenna_field_reader.py" --repo-root "[^"]+"$'
     if [[ ! "${recipe}" =~ ${antenna_reader_pattern} ]]; then
@@ -221,6 +237,10 @@ case "${recipe}" in
     exec "${python_cmd}" "${script_dir}/export_runner_openapi.py" --repo-root "${repo_root}" --job-id "${BASH_REMATCH[1]}" --expected-commit "${BASH_REMATCH[2]}"
     ;;
     *"scripts/verify_development_backend_api.py"*)
+    frozen_project_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --project-document-only --frozen-native-build-id "([0-9a-f]{64})" --project-document-browser$'
+    if [[ "${recipe}" =~ ${frozen_project_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --project-document-only --frozen-native-build-id "${BASH_REMATCH[1]}" --project-document-browser
+    fi
     frozen_project_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --project-document-only --frozen-native-build-id "([0-9a-f]{64})"( --archive-frozen-bundle)?$'
     if [[ "${recipe}" =~ ${frozen_project_pattern} ]]; then
       if ! is_windows_shell; then
@@ -479,6 +499,10 @@ case "${recipe}" in
     exec "${python_cmd}" "${script_dir}/verify_saved_fem_archive_roundtrip.py" --repo-root "${repo_root}"
     ;;
   *"scripts/verify_pinned_dataset_browser.py"*)
+    preparation_workspace_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3268 --scenario preparation-workspace$'
+    if [[ "${recipe}" =~ ${preparation_workspace_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3268 --scenario preparation-workspace
+    fi
     antenna_workspace_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3274 --scenario antenna-workspace-authoring( --dependency-workspace "([^"]+)")?[[:space:]]*$'
     if [[ "${recipe}" =~ ${antenna_workspace_browser_pattern} ]]; then
       dependency_workspace="${BASH_REMATCH[2]}"
