@@ -767,6 +767,9 @@ jobs:
           python -B scripts/test_docker_startup_script.py -v
           python -B scripts/test_windows_folder_evidence.py -v
           python -B scripts/test_windows_folder_probe.py -v
+          python -B scripts/test_docker_orphan_recovery.py -v
+          python -B scripts/test_recover_docker_orphan.py -v
+          python -B scripts/test_just_orphan_recovery_shell.py -v
 
       - name: Audit managed FEM CPU-only verification configuration
         run: python scripts/test_audit_fem_cpu_only_runtime.py -v

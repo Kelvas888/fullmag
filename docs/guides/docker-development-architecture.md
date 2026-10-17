@@ -335,6 +335,43 @@ w działającym kontenerze. Profil dev korzysta z Cargo `backend-dev`; release
 przygotowuje osobny, gotowy artefakt/obraz z zamrożonych wejść i własną
 kwalifikacją. Release nie jest domyślnym sposobem codziennej edycji.
 
+## Kontrolowane odzyskanie zasobów po awarii workera
+
+Zwykły restart nie zwalnia rezerwacji, jeśli worker utracił trwały dowód
+zakończenia. W takiej sytuacji operator może użyć jawnie przypiętej procedury
+z [ADR 0062](../adr/0062-worker-orphan-namespace-teardown.md):
+
+```sh
+just docker-dev-recover-orphan PINS_JSON CONTAINER_ID COMPOSE_PROJECT DIAGNOSTICS_ROOT
+```
+
+`PINS_JSON` to uprzednio sprawdzony plik tożsamości runu, zadania, próby,
+rezerwacji, lease, ownera, obrazu i współdzielonego ledgera. Nie jest to
+szablon do wypełnienia przypadkowymi identyfikatorami. `CONTAINER_ID` musi
+być pełnym identyfikatorem 64-znakowym; `COMPOSE_PROJECT` wskazuje dokładną
+grupę checkoutu. `DIAGNOSTICS_ROOT` musi odpowiadać katalogowi
+`/state/diagnostics` tego backendu na hoście. Narzędzie odrzuca inne mounty,
+niezgodne digesty oraz aktywnych klientów współdzielonego ledgera.
+
+Procedura wykonuje próby tylko do odczytu, przygotowuje natywny intent,
+zatrzymuje dokładnie wskazany backend i potwierdza zakończenie jego prywatnej
+przestrzeni procesów. Osobny, krótkotrwały serwis `backend-recovery` w tej
+samej grupie nie uruchamia buildu, API ani solvera; nie ma sieci, GPU ani
+publikowanych portów. Wyłącznie natywne CLI zapisuje dowód i zwalnia zasoby.
+Historia runu i zużyty token startu pozostają; Solve nie jest ponawiany.
+
+Nie zmieniaj UUID requestu ani pliku pins przy ponowieniu po przerwaniu.
+Wynik `unknown` wymaga uzgodnienia z zachowanymi dowodami; nie wolno usuwać
+blokad ani wpisywać ręcznie stanu `stopped`. Po potwierdzonym odzyskaniu
+stary run pozostaje archiwalny. Kolejny zwykły start powinien użyć nowego
+run namespace, zachowując ustawienia grupy, cache, sesje i wyniki; wycofanie
+starych kontenerów i sieci wymaga osobnej kontroli ich tożsamości i użycia.
+Narzędzie odzyskiwania nie wykonuje tej operacji automatycznie.
+
+Regresje kontraktu i adaptera nie zastępują wykonania tej procedury na żywo.
+Kwalifikacja runtime pozostaje **NOT VERIFIED**, dopóki nie ma dowodu
+zakończenia, zwolnienia dokładnej rezerwacji i poprawnego nowego startu.
+
 ## Warunki odbioru
 
 Nowy wariant wymaga rzeczywistego potwierdzenia:

@@ -37,6 +37,11 @@ docker-dev source_root="" port="3197" script="":
 docker-dev-recreate run_receipt previous_config_sha256 source_root="" port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate --direct-development --run-receipt {{quote(run_receipt)}} --previous-config-sha256 {{quote(previous_config_sha256)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} --port {{quote(port)}}
 
+# Explicit operator-only recovery of a consumed worker permit after namespace teardown.
+# The pinned request never retries Solve; unknown outcome and history are retained.
+docker-dev-recover-orphan pins target_container project diagnostics_root:
+    @{{storage_python}} "{{repo_root}}/scripts/recover_docker_orphan.py" --pins {{quote(pins)}} --target-container {{quote(target_container)}} --project {{quote(project)}} --diagnostics-root {{quote(diagnostics_root)}}
+
 # Compatibility start alias: starts both fixed services; use backend restart for iteration.
 docker-dev-build source_root="":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" build {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
