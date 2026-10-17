@@ -11,7 +11,6 @@ import json
 import os
 from pathlib import Path
 import re
-import stat
 
 import fullmag_storage as storage
 from windows_folder_host import local_volume, read_owned_regular
@@ -73,50 +72,10 @@ def _read_json_file(path, label):
 
 
 def _pnpm_patch_relatives(source):
-    """Return every regular ``*.patch`` file below the checkout's patches/."""
-    source = Path(source)
-    root = source / "patches"
-    try:
-        if storage.is_link(root):
-            raise ValueError("Pnpm patches root is a reparse point")
-        if not root.exists():
-            return ()
-        if not root.is_dir():
-            raise ValueError("Pnpm patches root is not a directory")
-    except OSError as error:
-        raise ValueError(f"Cannot inspect Pnpm patches root: {root}") from error
+    """Compatibility wrapper for the canonical no-follow patch inventory."""
+    from windows.stage_workspace_frontend import patch_file_relatives
 
-    relatives = []
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        try:
-            if storage.is_link(directory):
-                raise ValueError(f"Pnpm patch directory is a reparse point: {directory}")
-            children = sorted(directory.iterdir(), key=lambda path: path.as_posix())
-        except OSError as error:
-            raise ValueError(f"Cannot inspect Pnpm patch directory: {directory}") from error
-        for child in children:
-            try:
-                if storage.is_link(child):
-                    raise ValueError(f"Pnpm patch tree contains a reparse point: {child}")
-                mode = child.lstat().st_mode
-            except OSError as error:
-                raise ValueError(f"Cannot inspect Pnpm patch entry: {child}") from error
-            if stat.S_ISDIR(mode):
-                pending.append(child)
-                continue
-            if not stat.S_ISREG(mode):
-                if child.name.endswith(".patch"):
-                    raise ValueError(f"Pnpm patch file is not regular: {child}")
-                continue
-            if child.name.endswith(".patch"):
-                try:
-                    relative = child.relative_to(source)
-                except ValueError as error:
-                    raise ValueError(f"Pnpm patch path escaped the checkout: {child}") from error
-                relatives.append(relative)
-    return tuple(sorted(relatives, key=lambda path: path.as_posix()))
+    return patch_file_relatives(Path(source))
 
 
 def _next_generated_seed_variants(relative, source):
