@@ -204,6 +204,7 @@ fn fixture() -> Fixture {
         heartbeat_at: now,
         heartbeat_sequence: 0,
         released_at: None,
+        host_launch_binding: None,
     };
     store.commit_resource_lease(&lease).unwrap();
     let mut coordinator =
