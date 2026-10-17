@@ -585,7 +585,7 @@ fn admit_candidate(
     host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
 ) -> Result<Option<FmsPreparationResourceLease>> {
     if let Some(host) = host {
-        if !host.has_current_compute_snapshot()? {
+        if !preparation_admission_snapshot_ready(|| host.has_current_compute_snapshot())? {
             return Ok(None);
         }
     }
@@ -611,7 +611,7 @@ fn admit_candidate(
             host_launch_binding: None,
         };
         let disposition = if let Some(host) = host {
-            if !host.has_current_compute_snapshot()? {
+            if !preparation_admission_snapshot_ready(|| host.has_current_compute_snapshot())? {
                 return Ok(None);
             }
             lease.host_launch_binding = Some(retry_store_writer_busy(|| {
@@ -776,6 +776,19 @@ fn is_store_writer_busy(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
+}
+
+/// Defer only this pre-admission snapshot gate when the shared host writer is
+/// busy. No lease or launch record exists yet, so the next scheduler poll can
+/// safely repeat the observation; all other failures remain fatal.
+fn preparation_admission_snapshot_ready(
+    read_snapshot: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    match read_snapshot() {
+        Ok(ready) => Ok(ready),
+        Err(error) if is_store_writer_busy(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn sibling_preparer_executable() -> Result<PathBuf> {
@@ -959,4 +972,30 @@ fn parse_usize(flag: &str, value: std::ffi::OsString) -> Result<usize> {
         .map_err(|_| anyhow::anyhow!("preparation scheduler option `{flag}` must be valid UTF-8"))?
         .parse::<usize>()
         .with_context(|| format!("preparation scheduler option `{flag}` must be an integer"))
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+    use super::preparation_admission_snapshot_ready;
+
+    #[test]
+    fn pre_admission_snapshot_deferral_classifies_only_typed_busy() {
+        let typed_busy = anyhow::Error::new(fullmag_session::StoreWriterBusy).context("wrapped");
+        assert!(!preparation_admission_snapshot_ready(|| Err(typed_busy)).unwrap());
+        assert!(preparation_admission_snapshot_ready(|| Ok(true)).unwrap());
+        assert!(!preparation_admission_snapshot_ready(|| Ok(false)).unwrap());
+
+        let ordinary = preparation_admission_snapshot_ready(|| {
+            Err(anyhow::anyhow!("snapshot identity mismatch"))
+        })
+        .unwrap_err();
+        assert_eq!(ordinary.to_string(), "snapshot identity mismatch");
+
+        let text_only_busy = preparation_admission_snapshot_ready(|| {
+            Err(anyhow::anyhow!("session store writer is busy"))
+        })
+        .unwrap_err();
+        assert_eq!(text_only_busy.to_string(), "session store writer is busy");
+    }
 }
