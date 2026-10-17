@@ -741,6 +741,9 @@ jobs:
       - name: Run managed runtime startup identity contracts
         run: python -B scripts/test_validate_managed_fem_runtime_bundle.py
 
+      - name: Run managed GPU device cubin requirement contracts
+        run: python -B -m pytest -q scripts/test_export_fem_gpu_runtime_copy_helpers.py -k "export_native_cubin_requirement_follows_expected_device or export_rejects_malformed_expected_device_capability"
+
       - name: Run managed runtime artifact root contracts
         run: python scripts/test_managed_runtime_artifact_root.py -v
 
