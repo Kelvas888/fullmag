@@ -17,6 +17,18 @@ import run_managed_browser as managed
 
 
 class DockerRuntimeContract(unittest.TestCase):
+    def test_live_compose_rejects_non_mapping_start_inputs_before_docker(self):
+        with patch.object(runtime, "docker") as docker_call:
+            with self.assertRaisesRegex(ValueError, "Backend start inputs must be an object"):
+                runtime.compose_spec(
+                    "sha256:" + "a" * 64, Path("/state-host"), 3197,
+                    host_certificate=Path("/host-certificate.json"),
+                    workspace_state_root=Path("/user-data"),
+                    package="/mnt/cache/package", provenance=Path("/provenance.json"),
+                    inputs_path=Path("/inputs.json"), backend_start=[],
+                )
+            docker_call.assert_not_called()
+
     def test_development_backend_package_does_not_require_static_frontend(self):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory)

@@ -1,10 +1,12 @@
-"""Assemble a complete Docker runtime from a verified managed GPU release.
+"""Start verified Fullmag runtime services with managed storage admission.
 
-No compiler is invoked here. Full builds remain owned by Fullmag_build_runner.
+Live development delegates compilation to the persistent Compose backend.
+Packaged release starts retain the frozen assembly contract.
 """
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import getpass
 import hashlib
 import json
