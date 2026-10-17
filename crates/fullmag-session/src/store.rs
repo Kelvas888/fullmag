@@ -34,6 +34,7 @@ use crate::types::*;
 use crate::writer::{WriteTransaction, Writer};
 
 const MAX_TASK_ADMISSION_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_JOB_SUBMISSION_BYTES: usize = 64 * 1024;
 
 #[path = "accepted_start_gate.rs"]
 mod accepted_start_gate;
@@ -599,7 +600,42 @@ impl SessionStore {
         Ok(Some(progress))
     }
 
-    /// Append a durable admission command to the expansion checkpoint. The
+    /// Validate a batch command against its current durable revision and
+    /// lifecycle without publishing it. Callers composing a retry with this
+    /// append can hold one outer write transaction across validation and use.
+    pub fn validate_batch_command(
+        &self,
+        command: &FmsBatchCommandIntent,
+    ) -> Result<BatchCommandCommitDisposition> {
+        command.validate()?;
+        let _lease = self.write_transaction()?;
+        let intent = self
+            .read_batch_intent(&command.batch_id)?
+            .context("batch command parent intent is missing")?;
+        let manifest_bytes = self
+            .cas
+            .get(&intent.manifest_object_ref)?
+            .context("batch expansion manifest object is missing")?;
+        intent.validate_manifest_bytes(&manifest_bytes)?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
+        let total_cases = manifest
+            .get("cases")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .context("batch expansion manifest has no cases array")?;
+        let total_cases = u64::try_from(total_cases)?;
+        let progress = match self.read_batch_expansion_progress(&command.batch_id)? {
+            Some(progress) => progress,
+            None => FmsBatchExpansionProgress::new(&intent, total_cases, 0, 1)?,
+        };
+        let (next, disposition) = progress.with_command(command)?;
+        if disposition == BatchCommandCommitDisposition::Accepted {
+            next.validate_for_manifest(&intent, &manifest_bytes)?;
+        }
+        Ok(disposition)
+    }
+
+    /// Append a durable batch command to the expansion checkpoint. The
     /// checkpoint writer serializes commands against child publication.
     pub fn commit_batch_command(
         &self,
@@ -622,70 +658,14 @@ impl SessionStore {
             .map(Vec::len)
             .context("batch expansion manifest has no cases array")?;
         let total_cases = u64::try_from(total_cases)?;
-        let mut progress = match self.read_batch_expansion_progress(&command.batch_id)? {
+        let progress = match self.read_batch_expansion_progress(&command.batch_id)? {
             Some(progress) => progress,
             None => FmsBatchExpansionProgress::new(&intent, total_cases, 0, 1)?,
         };
-
-        if let Some(existing) = progress
-            .commands
-            .iter()
-            .find(|existing| existing.command_id == command.command_id)
-        {
-            if existing.payload_sha256 == command.payload_sha256 {
-                return Ok(BatchCommandCommitDisposition::Replayed);
-            }
-            return Err(BatchCommandConflict::Identity.into());
+        let (progress, disposition) = progress.with_command(command)?;
+        if disposition == BatchCommandCommitDisposition::Replayed {
+            return Ok(disposition);
         }
-        let actual_revision = u64::try_from(progress.commands.len())?;
-        if command.expected_revision != actual_revision || command.revision != actual_revision + 1 {
-            return Err(BatchCommandConflict::Revision {
-                expected: command.expected_revision,
-                actual: actual_revision,
-            }
-            .into());
-        }
-
-        let next_state = match (progress.state, command.action) {
-            (
-                FmsBatchExpansionState::Pending | FmsBatchExpansionState::Expanding,
-                FmsBatchCommandAction::PauseAdmission,
-            ) if progress.next_case_index < progress.total_cases => FmsBatchExpansionState::Paused,
-            (FmsBatchExpansionState::Paused, FmsBatchCommandAction::ResumeAdmission) => {
-                if progress.next_case_index == 0 {
-                    FmsBatchExpansionState::Pending
-                } else if progress.next_case_index == progress.total_cases {
-                    FmsBatchExpansionState::Complete
-                } else {
-                    FmsBatchExpansionState::Expanding
-                }
-            }
-            (
-                FmsBatchExpansionState::Pending
-                | FmsBatchExpansionState::Expanding
-                | FmsBatchExpansionState::Paused,
-                FmsBatchCommandAction::CancelAdmission,
-            ) => FmsBatchExpansionState::Cancelled,
-            (state, action) => {
-                return Err(BatchCommandConflict::InvalidTransition {
-                    action: action.as_str(),
-                    state,
-                }
-                .into());
-            }
-        };
-
-        if progress.commands.len() >= FMS_BATCH_COMMAND_HISTORY_MAX {
-            anyhow::bail!("batch command history is full");
-        }
-        progress.commands.push(command.clone());
-        progress.sequence = progress
-            .sequence
-            .checked_add(1)
-            .context("batch expansion sequence overflow")?;
-        progress.schema_version = FMS_BATCH_EXPANSION_PROGRESS_SCHEMA.into();
-        progress.state = next_state;
-        progress.updated_at = chrono::Utc::now();
         progress.validate_for_manifest(&intent, &manifest_bytes)?;
         let json = serde_json::to_vec_pretty(&progress)?;
         if json.len() as u64 > crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES {
@@ -694,7 +674,7 @@ impl SessionStore {
         let relative = format!("batches/{}/expansion_progress.json", command.batch_id);
         let path = create_parent(&self.root, &relative)?;
         atomic_write(&path, &json)?;
-        Ok(BatchCommandCommitDisposition::Accepted)
+        Ok(disposition)
     }
 
     /// Advance a batch's durable child-publication cursor under a sequence
@@ -1778,6 +1758,9 @@ impl SessionStore {
             .find(|task| task.task_id == decision.task_id)
             .context("retry decision task is missing from the run catalog")?;
         decision.validate_for_task(task)?;
+        if decision.action == FmsRetryAction::Retry {
+            self.ensure_provider_job_terminal_before_retry_unlocked(&decision.run_id, task)?;
+        }
 
         let path = checked_path(
             &self.root,
@@ -1904,6 +1887,7 @@ impl SessionStore {
                         );
                     }
                 }
+                self.ensure_provider_job_terminal_before_retry_unlocked(&decision.run_id, task)?;
                 task.lifecycle = FmsTaskLifecycle::Queued;
                 task.observation = Some(FmsObservationState::Reconciling);
                 task.attempt_id = None;
@@ -3594,6 +3578,228 @@ impl SessionStore {
         Ok(Some(catalog))
     }
 
+    /// Persist the external dispatch identity before contacting its provider.
+    /// Replaying the same identity returns `Replayed`, including after the
+    /// stored status has advanced; it never authorizes a second submission.
+    pub fn prepare_provider_job_submission(
+        &self,
+        submission: &FmsProviderJobSubmission,
+    ) -> Result<ProviderJobSubmissionDisposition> {
+        submission.validate()?;
+        if submission.status != FmsProviderJobStatus::SubmissionUnknown
+            || submission.provider_job_id.is_some()
+            || submission.revision != 1
+            || submission.updated_at != submission.created_at
+        {
+            anyhow::bail!("provider dispatch intent must start in submission_unknown revision 1");
+        }
+
+        let _writer_lease = self.write_transaction()?;
+        self.ensure_development_admission_open_unlocked()?;
+        let path = self.provider_job_submission_path(
+            &submission.run_id,
+            &submission.task_id,
+            &submission.attempt_id,
+        )?;
+        reject_link(&path)?;
+        if let Some(existing) = self.read_provider_job_submission(
+            &submission.run_id,
+            &submission.task_id,
+            &submission.attempt_id,
+        )? {
+            if existing.matches_dispatch_identity(submission) {
+                return Ok(ProviderJobSubmissionDisposition::Replayed);
+            }
+            anyhow::bail!("provider dispatch attempt conflicts with its durable identity");
+        }
+
+        self.ensure_provider_jobs_terminal_for_task_unlocked(
+            &submission.run_id,
+            &submission.task_id,
+        )?;
+        let admission = self
+            .read_task_admission(
+                &submission.run_id,
+                &submission.task_id,
+                &submission.attempt_id,
+            )?
+            .context("provider dispatch requires a durable task admission")?;
+        if admission.lease.ownership_epoch != submission.ownership_epoch
+            || admission.lease.resource_id != submission.resource_id
+            || admission.task.attempt_id.as_deref() != Some(submission.attempt_id.as_str())
+            || admission.task.ownership_epoch != Some(submission.ownership_epoch)
+            || admission.lease.state != FmsResourceLeaseState::Active
+        {
+            anyhow::bail!("provider dispatch does not match an active admitted attempt");
+        }
+        let current_lease = self
+            .read_resource_lease(
+                &submission.run_id,
+                &admission.lease.resource_id,
+                &admission.lease.lease_token,
+            )?
+            .context("provider dispatch resource lease is missing")?;
+        if current_lease.state != FmsResourceLeaseState::Active
+            || !current_lease.identity_matches(&admission.lease)
+            || current_lease.kind != admission.lease.kind
+            || current_lease.budget != admission.lease.budget
+        {
+            anyhow::bail!("provider dispatch requires the exact active admitted resource lease");
+        }
+        let catalog = self
+            .read_run_catalog(&submission.run_id)?
+            .context("provider dispatch requires a durable run catalog")?;
+        let task = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == submission.task_id)
+            .context("provider dispatch task is missing from the run catalog")?;
+        if task.lifecycle != FmsTaskLifecycle::Preparing
+            || task.attempt_id.as_deref() != Some(submission.attempt_id.as_str())
+            || task.ownership_epoch != Some(submission.ownership_epoch)
+        {
+            anyhow::bail!("provider dispatch does not match the current preparing attempt");
+        }
+
+        let path = create_parent(
+            &self.root,
+            &format!(
+                "runs/{}/provider_job_submissions/{}/{}.json",
+                submission.run_id, submission.task_id, submission.attempt_id
+            ),
+        )?;
+        atomic_write(&path, &serde_json::to_vec_pretty(submission)?)?;
+        Ok(ProviderJobSubmissionDisposition::Prepared)
+    }
+
+    /// Record a provider acknowledgement or lifecycle observation using
+    /// compare-and-swap revisioning. The same provider job ID is immutable.
+    pub fn commit_provider_job_observation(
+        &self,
+        observation: &FmsProviderJobSubmission,
+    ) -> Result<ProviderJobSubmissionDisposition> {
+        observation.validate()?;
+        let _writer_lease = self.write_transaction()?;
+        let existing = self
+            .read_provider_job_submission(
+                &observation.run_id,
+                &observation.task_id,
+                &observation.attempt_id,
+            )?
+            .context("provider job observation requires a durable dispatch intent")?;
+        if existing == *observation {
+            return Ok(ProviderJobSubmissionDisposition::Replayed);
+        }
+        observation.validate_transition_from(&existing)?;
+
+        let catalog = self
+            .read_run_catalog(&observation.run_id)?
+            .context("provider job observation requires a durable run catalog")?;
+        let task = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == observation.task_id)
+            .context("provider job observation task is missing from the run catalog")?;
+        if task.attempt_id.as_deref() != Some(observation.attempt_id.as_str())
+            || task.ownership_epoch != Some(observation.ownership_epoch)
+        {
+            anyhow::bail!("provider job observation ownership fence is stale");
+        }
+
+        let path = self.provider_job_submission_path(
+            &observation.run_id,
+            &observation.task_id,
+            &observation.attempt_id,
+        )?;
+        atomic_write(&path, &serde_json::to_vec_pretty(observation)?)?;
+        Ok(ProviderJobSubmissionDisposition::Updated)
+    }
+
+    /// Read one durable provider job binding by its exact attempt identity.
+    pub fn read_provider_job_submission(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<FmsProviderJobSubmission>> {
+        let path = self.provider_job_submission_path(run_id, task_id, attempt_id)?;
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .context("provider job submission path is outside the session store")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let data = match crate::repository_path::read_bounded_regular_file(
+            &self.root,
+            &relative_path,
+            MAX_PROVIDER_JOB_SUBMISSION_BYTES,
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                let is_not_found = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                if is_not_found {
+                    let root_metadata = fs::metadata(&self.root)
+                        .context("validating session store root after missing provider job")?;
+                    if !root_metadata.is_dir() {
+                        anyhow::bail!("session store root is not a directory");
+                    }
+                    return Ok(None);
+                }
+                return Err(error).with_context(|| {
+                    format!("reading provider job submission {}", path.display())
+                });
+            }
+        };
+        let submission: FmsProviderJobSubmission = serde_json::from_slice(&data)
+            .with_context(|| format!("parsing provider job submission {}", path.display()))?;
+        submission
+            .validate()
+            .with_context(|| format!("validating provider job submission {}", path.display()))?;
+        if submission.run_id != run_id
+            || submission.task_id != task_id
+            || submission.attempt_id != attempt_id
+        {
+            anyhow::bail!("provider job submission identity does not match its path");
+        }
+        Ok(Some(submission))
+    }
+
+    /// Enumerate provider bindings for coordinator restart/reconnect recovery.
+    pub fn list_provider_job_submissions(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<FmsProviderJobSubmission>> {
+        validate_store_id(run_id)?;
+        let _writer_lease = self.write_transaction()?;
+        let root = checked_path(&self.root, &format!("runs/{run_id}/provider_job_submissions"))?;
+        reject_link(&root)?;
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut submissions = Vec::new();
+        for task_dir in fs::read_dir(&root)? {
+            let task_dir = task_dir?;
+            reject_link(&task_dir.path())?;
+            if !task_dir.file_type()?.is_dir() {
+                anyhow::bail!("provider job submission task entry is not a directory");
+            }
+            let task_id = task_dir
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 provider job task identity"))?;
+            validate_store_id(&task_id)?;
+            submissions.extend(self.provider_job_submissions_for_task_unlocked(run_id, &task_id)?);
+        }
+        submissions.sort_by(|left, right| {
+            left.task_id
+                .cmp(&right.task_id)
+                .then_with(|| left.ownership_epoch.cmp(&right.ownership_epoch))
+                .then_with(|| left.attempt_id.cmp(&right.attempt_id))
+        });
+        Ok(submissions)
+    }
+
     /// Admit one queued task using a durable intent before publishing its
     /// preparing catalog projection and resource lease. Replaying the same
     /// lease finishes an interrupted admission; a new token cannot replace it.
@@ -3667,6 +3873,7 @@ impl SessionStore {
         {
             anyhow::bail!("task admission requires a ready, unclaimed queued task");
         }
+        self.ensure_provider_jobs_terminal_for_task_unlocked(&lease.run_id, &lease.task_id)?;
         let expected_epoch = queued_task
             .ownership_epoch
             .map_or(Some(1), |epoch| epoch.checked_add(1))
@@ -4702,6 +4909,111 @@ impl SessionStore {
                 lease.run_id, lease.resource_id, lease.lease_token
             ),
         )?)
+    }
+
+    fn provider_job_submission_path(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<PathBuf> {
+        for value in [run_id, task_id, attempt_id] {
+            validate_store_id(value)?;
+        }
+        Ok(checked_path(
+            &self.root,
+            &format!(
+                "runs/{run_id}/provider_job_submissions/{task_id}/{attempt_id}.json"
+            ),
+        )?)
+    }
+
+    fn provider_job_submissions_for_task_unlocked(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<FmsProviderJobSubmission>> {
+        validate_store_id(run_id)?;
+        validate_store_id(task_id)?;
+        let root = checked_path(
+            &self.root,
+            &format!("runs/{run_id}/provider_job_submissions/{task_id}"),
+        )?;
+        reject_link(&root)?;
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        if !fs::metadata(&root)?.is_dir() {
+            anyhow::bail!("provider job task path is not a directory");
+        }
+        let mut submissions = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let path = entry.path();
+            reject_link(&path)?;
+            if !entry.file_type()?.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                anyhow::bail!("provider job submission entry must be a JSON file");
+            }
+            let attempt_id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("provider job submission has no UTF-8 attempt identity")?;
+            let submission = self
+                .read_provider_job_submission(run_id, task_id, attempt_id)?
+                .context("provider job submission disappeared during enumeration")?;
+            submissions.push(submission);
+        }
+        submissions.sort_by(|left, right| {
+            (left.ownership_epoch, &left.attempt_id)
+                .cmp(&(right.ownership_epoch, &right.attempt_id))
+        });
+        Ok(submissions)
+    }
+
+    fn ensure_provider_jobs_terminal_for_task_unlocked(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        for submission in self.provider_job_submissions_for_task_unlocked(run_id, task_id)? {
+            if !submission.status.is_terminal() {
+                anyhow::bail!(
+                    "task `{task_id}` has unresolved provider job `{}` in status {:?}",
+                    submission.attempt_id,
+                    submission.status
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_provider_job_terminal_before_retry_unlocked(
+        &self,
+        run_id: &str,
+        task: &FmsTaskCatalogEntry,
+    ) -> Result<()> {
+        let (Some(attempt_id), Some(ownership_epoch)) =
+            (task.attempt_id.as_deref(), task.ownership_epoch)
+        else {
+            return Ok(());
+        };
+        let Some(submission) =
+            self.read_provider_job_submission(run_id, &task.task_id, attempt_id)?
+        else {
+            return Ok(());
+        };
+        if submission.ownership_epoch != ownership_epoch {
+            anyhow::bail!("provider job retry fence does not match the task catalog");
+        }
+        if !submission.status.is_terminal() {
+            anyhow::bail!(
+                "retry requires provider job reconciliation for attempt `{attempt_id}`; current status is {:?}",
+                submission.status
+            );
+        }
+        Ok(())
     }
 
     fn task_admission_path(
@@ -5762,6 +6074,155 @@ mod tests {
     }
 
     #[test]
+    fn provider_job_intent_is_replayed_and_blocks_retry_until_remote_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path().join("session-store")).unwrap();
+        let run_id = "run-provider-job";
+        let task_id = "task-provider-job";
+        let now = Utc::now();
+        store
+            .commit_run_catalog(&FmsRunCatalog {
+                schema_version: FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.into(),
+                revision: 1,
+                updated_at: now,
+                tasks: vec![FmsTaskCatalogEntry {
+                    task_id: task_id.into(),
+                    input_fingerprint: "a".repeat(64),
+                    lifecycle: FmsTaskLifecycle::Queued,
+                    readiness: FmsTaskReadiness::Ready,
+                    observation: None,
+                    attempt_id: None,
+                    ownership_epoch: None,
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: None,
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+        let lease = test_resource_lease(
+            run_id,
+            task_id,
+            "attempt-provider-one",
+            1,
+            "cpu-provider-one",
+            "lease-provider-one",
+            now,
+        );
+        assert_eq!(
+            store.commit_task_admission(&lease).unwrap(),
+            TaskAdmissionCommitDisposition::Admitted
+        );
+
+        let mut intent = FmsProviderJobSubmission {
+            schema_version: FMS_PROVIDER_JOB_SUBMISSION_SCHEMA.into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            attempt_id: lease.attempt_id.clone(),
+            ownership_epoch: lease.ownership_epoch,
+            provider_id: "provider-one".into(),
+            target_id: "pool-one".into(),
+            scheduler_id: "slurm".into(),
+            resource_id: lease.resource_id.clone(),
+            idempotency_key: String::new(),
+            request_digest: format!("sha256:{}", "b".repeat(64)),
+            status: FmsProviderJobStatus::SubmissionUnknown,
+            provider_job_id: None,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        intent.idempotency_key = intent.expected_idempotency_key();
+        assert_eq!(
+            store.prepare_provider_job_submission(&intent).unwrap(),
+            ProviderJobSubmissionDisposition::Prepared
+        );
+        assert_eq!(
+            store.prepare_provider_job_submission(&intent).unwrap(),
+            ProviderJobSubmissionDisposition::Replayed
+        );
+
+        let mut running = intent.clone();
+        running.status = FmsProviderJobStatus::Running;
+        running.provider_job_id = Some("3917;cluster-a".into());
+        running.revision = 2;
+        running.updated_at = now + chrono::Duration::seconds(1);
+        assert_eq!(
+            store.commit_provider_job_observation(&running).unwrap(),
+            ProviderJobSubmissionDisposition::Updated
+        );
+        assert_eq!(
+            store.list_provider_job_submissions(run_id).unwrap(),
+            vec![running.clone()]
+        );
+        let mut changed_provider_job_id = running.clone();
+        changed_provider_job_id.status = FmsProviderJobStatus::Succeeded;
+        changed_provider_job_id.provider_job_id = Some("3918;cluster-a".into());
+        changed_provider_job_id.revision += 1;
+        changed_provider_job_id.updated_at = now + chrono::Duration::seconds(2);
+        assert!(store
+            .commit_provider_job_observation(&changed_provider_job_id)
+            .is_err());
+
+        let mut catalog = store.read_run_catalog(run_id).unwrap().unwrap();
+        catalog.tasks[0].lifecycle = FmsTaskLifecycle::Failed;
+        catalog.tasks[0].observation = Some(FmsObservationState::Reconciling);
+        catalog.revision += 1;
+        catalog.updated_at = now + chrono::Duration::seconds(2);
+        store.commit_run_catalog(&catalog).unwrap();
+        let retry = FmsRetryDecision {
+            schema_version: FMS_RETRY_DECISION_SCHEMA.into(),
+            decision_id: "decision-provider-retry".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            attempt_id: lease.attempt_id.clone(),
+            ownership_epoch: lease.ownership_epoch,
+            trigger: FmsRetryTrigger::WorkerDisconnected,
+            action: FmsRetryAction::Retry,
+            reason: "provider status has not reached a terminal state".into(),
+            created_at: now + chrono::Duration::seconds(3),
+        };
+        assert!(store.commit_retry_decision(&retry).is_err());
+        assert!(store
+            .read_retry_decision(run_id, "decision-provider-retry")
+            .unwrap()
+            .is_none());
+
+        let mut failed = running.clone();
+        failed.status = FmsProviderJobStatus::Failed;
+        failed.revision += 1;
+        failed.updated_at = now + chrono::Duration::seconds(4);
+        assert_eq!(
+            store.commit_provider_job_observation(&failed).unwrap(),
+            ProviderJobSubmissionDisposition::Updated
+        );
+        assert_eq!(
+            store.commit_retry_decision(&retry).unwrap(),
+            RetryDecisionCommitDisposition::Accepted
+        );
+        store.release_resource_lease(&lease).unwrap();
+        assert_eq!(
+            store.apply_retry_decision(&retry).unwrap(),
+            RetryDecisionApplyDisposition::Applied
+        );
+        let next_lease = test_resource_lease(
+            run_id,
+            task_id,
+            "attempt-provider-two",
+            2,
+            "cpu-provider-one",
+            "lease-provider-two",
+            now + chrono::Duration::seconds(5),
+        );
+        assert_eq!(
+            store.commit_task_admission(&next_lease).unwrap(),
+            TaskAdmissionCommitDisposition::Admitted
+        );
+    }
+
+    #[test]
     fn raw_solver_lease_scan_finds_active_lease_after_catalog_claim_is_cleared() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::open(dir.path().join("session-store")).unwrap();
@@ -6103,15 +6564,59 @@ mod tests {
             store.commit_batch_command(&pause).unwrap(),
             BatchCommandCommitDisposition::Replayed
         );
+        let mut legacy_pause = FmsBatchCommandIntent::new(
+            "batch-legacy-command",
+            "legacy-pause",
+            0,
+            FmsBatchCommandAction::PauseAdmission,
+            "legacy operator pause",
+        );
+        legacy_pause.schema_version = FMS_BATCH_COMMAND_LEGACY_SCHEMA.into();
+        legacy_pause.validate().unwrap();
+        let legacy_round_trip: FmsBatchCommandIntent =
+            serde_json::from_slice(&serde_json::to_vec(&legacy_pause).unwrap()).unwrap();
+        assert_eq!(legacy_round_trip, legacy_pause);
         let paused_progress = store
             .read_batch_expansion_progress("batch-1")
             .unwrap()
             .unwrap();
         assert_eq!(paused_progress.state, FmsBatchExpansionState::Paused);
+        let retry_target = FmsBatchRetryTarget {
+            case_id: "case-1".into(),
+            run_id: "run-1".into(),
+            task_id: "task-1".into(),
+            retry_id: "retry-1".into(),
+            expected_catalog_revision: 3,
+        };
+        let retry = FmsBatchCommandIntent::new_retry(
+            "batch-1",
+            "retry-command-1",
+            1,
+            retry_target.clone(),
+            "operator retry",
+        );
+        assert_eq!(
+            store.validate_batch_command(&retry).unwrap(),
+            BatchCommandCommitDisposition::Accepted
+        );
+        assert_eq!(
+            store.commit_batch_command(&retry).unwrap(),
+            BatchCommandCommitDisposition::Accepted
+        );
+        assert_eq!(
+            store.commit_batch_command(&retry).unwrap(),
+            BatchCommandCommitDisposition::Replayed
+        );
+        let progress_with_retry = store
+            .read_batch_expansion_progress("batch-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress_with_retry.state, FmsBatchExpansionState::Paused);
+        assert_eq!(progress_with_retry.commands.last().unwrap().retry_target, Some(retry_target));
         let resume = FmsBatchCommandIntent::new(
             "batch-1",
             "resume-1",
-            1,
+            2,
             FmsBatchCommandAction::ResumeAdmission,
             "operator resume",
         );
@@ -6124,11 +6629,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resumed_progress.state, FmsBatchExpansionState::Pending);
-        let mut completed_progress = FmsBatchExpansionProgress::new(&first, 1, 1, 4).unwrap();
+        let mut completed_progress = FmsBatchExpansionProgress::new(&first, 1, 1, 5).unwrap();
         completed_progress.commands = resumed_progress.commands.clone();
         assert_eq!(
             store
-                .commit_batch_expansion_progress(3, &completed_progress)
+                .commit_batch_expansion_progress(4, &completed_progress)
                 .unwrap(),
             BatchExpansionProgressCommitDisposition::Accepted
         );
@@ -6136,17 +6641,12 @@ mod tests {
             store.read_batch_expansion_progress("batch-1").unwrap(),
             Some(completed_progress.clone())
         );
-        let mut backwards_progress = FmsBatchExpansionProgress::new(&first, 1, 0, 5).unwrap();
+        let mut backwards_progress = FmsBatchExpansionProgress::new(&first, 1, 0, 6).unwrap();
         backwards_progress.commands = completed_progress.commands.clone();
-        assert!(
-            store
-                .commit_batch_expansion_progress(4, &backwards_progress)
-                .is_err()
-        );
-        assert_eq!(
-            store.find_batch_intent("submit-batch-1").unwrap(),
-            Some(first.clone())
-        );
+        assert!(store
+            .commit_batch_expansion_progress(5, &backwards_progress)
+            .is_err());
+        assert_eq!(store.find_batch_intent("submit-batch-1").unwrap(), Some(first.clone()));
         assert_eq!(store.list_batch_intents().unwrap(), vec![first]);
 
         let conflict = make_intent("batch-2", "different expansion");

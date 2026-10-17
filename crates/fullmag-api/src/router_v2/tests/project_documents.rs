@@ -999,6 +999,13 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         persisted_receipt.payload["accepted_run_source"]["step_id"],
         persisted_receipt.step_id
     );
+    assert_eq!(
+        read_back["tasks"][0]["execution"]["step_id"],
+        persisted_receipt.step_id
+    );
+    assert!(read_back["tasks"][0]["execution"]
+        .get("materialization")
+        .is_none());
     let repeated_catalog = app.clone().oneshot(materialize()).await.unwrap();
     assert_eq!(body_json(repeated_catalog).await, first_catalog);
     let submitted_again = app.clone().oneshot(submit(body.clone())).await.unwrap();
@@ -4161,6 +4168,75 @@ async fn project_batch_submit_replays_and_lists_durable_parent() {
     assert_eq!(published_run["tasks"][0]["cancellation_requested"], false);
 
     let task_id = published_run["tasks"][0]["task_id"].as_str().unwrap();
+    let case_id = materialized["cases"][0]["case_id"].as_str().unwrap();
+    let retry_not_terminal = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/v2/persistence/projects/project-batch-http/runs/{first_run_id}/tasks/{task_id}/retry",
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "retry_id": "retry-batch-case",
+                        "expected_catalog_revision": 1,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry_not_terminal.status(), StatusCode::CONFLICT);
+
+    let batch_retry_not_terminal = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v2/persistence/projects/project-batch-http/batches/batch-http/commands")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "command_id": "batch-retry-not-terminal",
+                        "expected_revision": 0,
+                        "action": "retry",
+                        "reason": "operator retry reconciliation test",
+                        "retry": {
+                            "case_id": case_id,
+                            "task_id": task_id,
+                            "retry_id": "retry-batch-command",
+                            "expected_catalog_revision": 1,
+                        },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(batch_retry_not_terminal.status(), StatusCode::CONFLICT);
+
+    let batches_after_retry_rejection = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v2/persistence/projects/project-batch-http/batches?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(batches_after_retry_rejection.status(), StatusCode::OK);
+    let batches_after_retry_rejection = body_json(batches_after_retry_rejection).await;
+    assert_eq!(
+        batches_after_retry_rejection["batches"][0]["command_revision"],
+        0
+    );
+
     let cancellation = app
         .clone()
         .oneshot(

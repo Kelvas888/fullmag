@@ -5,6 +5,7 @@ import { Activity, Cpu, HardDrive, RefreshCw } from "lucide-react";
 import { Button } from "@/shared/ui/Button";
 
 import { formatTelemetrySampleTime } from "../model/computeTelemetry";
+import { ComputeNodeOverviewSummary } from "../ComputeNodeOverviewSummary";
 import { ComputeNodeInventoryDetails } from "../ComputeNodeInventoryDetails";
 import { ComputeNodeInventoryStatus } from "../ComputeNodeInventoryStatus";
 import type {
@@ -94,6 +95,16 @@ export function ComputeEnvironmentSettings({
           </Button>
         ) : null}
       </div>
+
+      {overview && nodeInventory ? (
+        <>
+          <ComputeNodeInventoryStatus
+            className="fm-start-compute-settings__policy"
+            summary={nodeInventory}
+          />
+          <ComputeNodeOverviewSummary summary={nodeInventory} />
+        </>
+      ) : null}
 
       {overview && compute === undefined ? (
         <div aria-live="polite" className="fm-start-compute-settings__notice">

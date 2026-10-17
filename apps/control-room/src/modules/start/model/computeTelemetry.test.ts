@@ -62,6 +62,35 @@ describe("compute telemetry sample time", () => {
   });
 });
 
+describe("runtime lanes without hardware telemetry", () => {
+  it("keeps reported solver capabilities visible without inventing hardware readings", () => {
+    const capabilities: PlatformCapabilitiesResource = {
+      engines: [{
+        backend: "FDM",
+        device: "CPU",
+        mode: "strict",
+        precision: "double",
+        public: true,
+        runtime_family: "test-runtime",
+        runtime_version: "1",
+        stability: "production",
+        status: "available",
+        worker: "test-worker",
+      }],
+      profile_version: "1",
+    };
+
+    const compute = computeFromTelemetry(null, null, capabilities);
+
+    expect(compute?.cpuProbeStatus).toBe("unavailable");
+    expect(compute?.gpuProbeStatus).toBe("unavailable");
+    expect(compute?.runtimeLanes?.find((lane) => lane.backend === "FDM" && lane.device === "CPU")?.availability)
+      .toBe("available");
+    expect(compute?.runtimeLanes?.find((lane) => lane.backend === "FDM" && lane.device === "GPU")?.availability)
+      .toBe("unknown");
+  });
+});
+
 describe("compute telemetry freshness", () => {
   it("keeps a sample current through 30 seconds and marks older samples stale", () => {
     const now = 60_000;

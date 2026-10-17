@@ -477,15 +477,27 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
     {
         bail!("resource lease changed while the supervisor captured its task claim");
     }
-    let (gpu_uuid, cpu_ids) = if let Some(host) = host {
+    let _allocated_cpu_millis = lease.budget.cpu_millis;
+    let (gpu_uuid, cpu_ids, _cpu_capacity_millis) = if let Some(host) = host {
         verify_host_solver_claim_before_spawn(host, store, &claim)?;
         let placement = host.solver_placement(&lease.resource_id)?;
-        (placement.gpu_uuid.clone(), placement.cpu_ids.clone())
+        let snapshot = host
+            .current_compute_node_snapshot()?
+            .context("accepted worker launch requires a current compute-node sample")?;
+        let cpu_capacity_millis = match snapshot.cpu.effective_capacity_millis {
+            fullmag_session::compute_node_snapshot::Observation::Available { value } => value,
+            _ => bail!("accepted worker launch requires measured effective CPU capacity"),
+        };
+        (
+            placement.gpu_uuid.clone(),
+            placement.cpu_ids.clone(),
+            cpu_capacity_millis,
+        )
     } else {
         if lease.host_launch_binding.is_some() {
             bail!("host-bound worker lease requires its pinned host supervisor context");
         }
-        (worker_gpu_uuid(&lease)?, BTreeSet::new())
+        (worker_gpu_uuid(&lease)?, BTreeSet::new(), 0)
     };
 
     let recovered_before_spawn =
@@ -586,6 +598,27 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
     } else {
         Vec::new()
     };
+    #[cfg(windows)]
+    let cpu_rate_limit = if host.is_some() {
+        Some(owned_worker_process::cpu_rate_limit(
+            _allocated_cpu_millis,
+            _cpu_capacity_millis,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let cpu_rate_limit = None;
+    #[cfg(target_os = "linux")]
+    let linux_cgroup = if host.is_some() {
+        Some(owned_worker_process::LinuxWorkerCgroup::prepare(
+            _allocated_cpu_millis,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let linux_cgroup = None;
     let mut active_lease = lease;
     let host_launch_token = host
         .map(|host| authorize_host_worker_launch(host.ledger(), store, &active_lease))
@@ -599,6 +632,8 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
         &cpu_ids,
         &cpu_thread_environment,
         host_launch_token.as_deref(),
+        cpu_rate_limit,
+        linux_cgroup,
         worker_timeout,
         heartbeat_interval,
         || renew_resource_lease(store, &mut active_lease),
@@ -941,6 +976,8 @@ fn spawn_worker<H, C>(
     cpu_ids: &BTreeSet<u32>,
     cpu_thread_environment: &[(&'static str, String)],
     host_launch_token: Option<&str>,
+    cpu_rate_limit: Option<u32>,
+    linux_cgroup: Option<owned_worker_process::LinuxWorkerCgroup>,
     worker_timeout: Duration,
     heartbeat_interval: Duration,
     heartbeat: H,
@@ -1001,7 +1038,7 @@ where
         }
         command.creation_flags(flags);
     }
-    let child = OwnedWorkerProcess::spawn(&mut command, cpu_ids)
+    let child = OwnedWorkerProcess::spawn(&mut command, cpu_ids, cpu_rate_limit, linux_cgroup)
         .with_context(|| format!("spawn accepted worker `{}`", worker_executable.display()))?;
     observe_child(
         child,
@@ -2213,6 +2250,7 @@ mod tests {
     struct HostLaunchTestFixture {
         store: SessionStore,
         ledger: fullmag_session::host_resource_ledger::HostResourceLedger,
+        application_state_root: PathBuf,
         ledger_root: PathBuf,
         lease: FmsResourceLease,
         claim: fullmag_application::TaskClaim,
@@ -2226,6 +2264,8 @@ mod tests {
             .tempdir()
             .unwrap();
         let store = SessionStore::open(root.path().join("store")).unwrap();
+        let application_state_root = root.path().join("application-state");
+        std::fs::create_dir(&application_state_root).unwrap();
         let budget = fullmag_session::FmsResourceBudget {
             cpu_millis: 1000,
             memory_bytes: 1024,
@@ -2249,7 +2289,8 @@ mod tests {
             gpu_vram_bytes_by_uuid: std::collections::BTreeMap::new(),
         };
         let ledger_root = root.path().join("host");
-        let ledger = fullmag_session::host_resource_ledger::HostResourceLedger::initialize(
+        let ledger = fullmag_session::host_resource_ledger::HostResourceLedger::initialize_for_application(
+            &application_state_root,
             &ledger_root,
             policy.clone(),
         )
@@ -2365,6 +2406,7 @@ mod tests {
         HostLaunchTestFixture {
             store,
             ledger,
+            application_state_root,
             ledger_root,
             lease: active_lease,
             claim,
@@ -2395,7 +2437,8 @@ mod tests {
         acquired_receiver
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
-        let busy = match fullmag_session::host_resource_ledger::HostResourceLedger::open(
+        let busy = match fullmag_session::host_resource_ledger::HostResourceLedger::open_for_application(
+            &fixture.application_state_root,
             &fixture.ledger_root,
             fixture.ledger.policy().clone(),
         ) {
@@ -2691,6 +2734,8 @@ mod tests {
             None,
             &BTreeSet::new(),
             &[],
+            None,
+            None,
             None,
             Duration::from_secs(5),
             Duration::from_secs(1),

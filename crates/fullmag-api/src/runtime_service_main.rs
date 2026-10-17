@@ -1117,8 +1117,14 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     }
     persisted_readiness.inventory_sha256 = Some(provisional.inventory_sha256.clone());
     persisted_readiness.capabilities_sha256 = Some(capabilities_sha256.clone());
+    let application_state_root =
+        fullmag_runtime_control::python_runtime::validated_state_override(
+            std::env::var_os("FULLMAG_STATE_ROOT").map(PathBuf::from),
+        )?
+        .context("Docker host initialization requires explicit FULLMAG_STATE_ROOT")?;
     let ledger = fullmag_runtime_control::retry_store_writer_busy(|| {
-        HostResourceLedger::initialize_or_upgrade_with_readiness(
+        HostResourceLedger::initialize_or_upgrade_with_readiness_for_application(
+            &application_state_root,
             &args.ledger_root,
             policy.clone(),
             persisted_readiness.clone(),
@@ -2079,7 +2085,10 @@ fn run_orphan_teardown(
         .host_execution
         .as_ref()
         .context("orphan teardown requires the configured host ledger binding")?;
-    let ledger = HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())?;
+    let ledger = HostResourceLedger::open_for_current_application(
+        &binding.ledger_root,
+        binding.policy.clone(),
+    )?;
     if documents.request.host_id != ledger.policy().host_id {
         bail!("orphan teardown request targets a different host ledger");
     }
@@ -2274,7 +2283,10 @@ fn run_service(path: PathBuf) -> Result<()> {
         .as_ref()
         .map(|binding| {
             fullmag_runtime_control::retry_store_writer_busy(|| {
-                HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())
+                HostResourceLedger::open_for_current_application(
+                    &binding.ledger_root,
+                    binding.policy.clone(),
+                )
             })
             .context("open the configured host ledger for compute-node sampling")
             .map(Arc::new)

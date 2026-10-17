@@ -193,6 +193,7 @@ fn main() -> Result<()> {
                 serde_json::to_string(&runtime_service_client::initialize_host_application(
                     &config,
                     &config_sha256,
+                    &control_room::runtime_state_root(&control_room::repo_root()),
                 )?)?
             );
         }

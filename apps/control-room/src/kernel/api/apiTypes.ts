@@ -918,6 +918,10 @@ export type ProjectRunTaskCancellationRequest =
   components["schemas"]["ProjectRunTaskCancellationRequest"];
 export type ProjectRunTaskCancellationResource =
   components["schemas"]["ProjectRunTaskCancellationResource"];
+export type ProjectRunTaskRetryRequest =
+  components["schemas"]["ProjectRunTaskRetryRequest"];
+export type ProjectRunTaskRetryResource =
+  components["schemas"]["ProjectRunTaskRetryResource"];
 export type SolutionSetDiscoveryPageResource =
   components["schemas"]["SolutionSetDiscoveryPageResource"];
 export type SolutionSetDiscoveryPageQuery =

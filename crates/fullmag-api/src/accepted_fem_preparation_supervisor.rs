@@ -152,6 +152,44 @@ pub(crate) fn run_supervised_accepted_fem_preparation_with_host(
             bail!("host preparation launch gate is not Pending; explicit migration or recovery is required before publishing a launch record");
         }
     }
+    let cpu_ids = host
+        .map(|host| host.preparation_cpu_ids(&active_lease.resource_id).cloned())
+        .transpose()?
+        .unwrap_or_default();
+    let thread_environment = preparation_thread_environment(&cpu_ids, host.is_some())?;
+    let _cpu_capacity_millis = if let Some(host) = host {
+        let snapshot = host
+            .current_compute_node_snapshot()?
+            .context("FEM preparation launch requires a current compute-node sample")?;
+        match snapshot.cpu.effective_capacity_millis {
+            fullmag_session::compute_node_snapshot::Observation::Available { value } => value,
+            _ => bail!("FEM preparation launch requires measured effective CPU capacity"),
+        }
+    } else {
+        0
+    };
+    let _allocated_cpu_millis = active_lease.budget.cpu_millis;
+    #[cfg(windows)]
+    let cpu_rate_limit = if host.is_some() {
+        Some(owned_worker_process::cpu_rate_limit(
+            _allocated_cpu_millis,
+            _cpu_capacity_millis,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let cpu_rate_limit = None;
+    #[cfg(target_os = "linux")]
+    let linux_cgroup = if host.is_some() {
+        Some(owned_worker_process::LinuxWorkerCgroup::prepare(
+            _allocated_cpu_millis,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let linux_cgroup = None;
     validate_preparer_executable(preparer_executable)?;
 
     let supervisor_process_id = std::process::id();
@@ -186,11 +224,6 @@ pub(crate) fn run_supervised_accepted_fem_preparation_with_host(
     {
         bail!("pending cancellation requires reconciliation before preparation spawn");
     }
-    let cpu_ids = host
-        .map(|host| host.preparation_cpu_ids(&active_lease.resource_id).cloned())
-        .transpose()?
-        .unwrap_or_default();
-    let thread_environment = preparation_thread_environment(&cpu_ids, host.is_some())?;
     let host_launch_token = host
         .map(|host| {
             retry_store_writer_busy(|| {
@@ -211,6 +244,8 @@ pub(crate) fn run_supervised_accepted_fem_preparation_with_host(
         &cpu_ids,
         &thread_environment,
         host_launch_token.as_deref(),
+        cpu_rate_limit,
+        linux_cgroup,
         process_timeout,
         heartbeat_interval,
         || renew_preparation_lease(store, &mut active_lease),
@@ -322,6 +357,8 @@ fn observe_preparer<H>(
     cpu_ids: &BTreeSet<u32>,
     thread_environment: &[(&'static str, Option<String>)],
     host_launch_token: Option<&str>,
+    cpu_rate_limit: Option<u32>,
+    linux_cgroup: Option<owned_worker_process::LinuxWorkerCgroup>,
     timeout: Duration,
     heartbeat_interval: Duration,
     mut heartbeat: H,
@@ -381,7 +418,7 @@ where
         }
         command.creation_flags(flags);
     }
-    let child = OwnedWorkerProcess::spawn(&mut command, cpu_ids)
+    let child = OwnedWorkerProcess::spawn(&mut command, cpu_ids, cpu_rate_limit, linux_cgroup)
         .with_context(|| format!("spawn FEM preparer `{}`", executable.display()))?;
     observe_child(child, timeout, heartbeat_interval, &mut heartbeat)
 }

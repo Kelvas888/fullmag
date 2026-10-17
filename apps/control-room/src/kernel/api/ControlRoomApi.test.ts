@@ -33,6 +33,7 @@ import type {
   ProjectBatchCommandResource,
   ProjectBatchSubmitRequest,
   ProjectBatchSubmitResource,
+  PublishExecutionProfileRequest,
 } from "./apiTypes";
 import {
   ANALYSIS_RESULT_BRANCH_POINTS_PATH,
@@ -5314,6 +5315,77 @@ describe("ControlRoomApi", () => {
       method: "POST",
       url: "http://127.0.0.1:8765/v2/persistence/projects/project-1/runs/run-1/tasks/task-1/cancellation",
     }]);
+  });
+
+  it("requests a durable task retry with its stable retry identity", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url: String(url),
+        });
+        return jsonResponse({
+          disposition: "accepted",
+          run_id: "run-1",
+          task_id: "task-1",
+          retry_id: "retry-1",
+          previous_attempt_id: "attempt-1",
+          previous_ownership_epoch: 2,
+          lifecycle: "queued",
+          catalog_revision: 5,
+        });
+      },
+    });
+    const request = { retry_id: "retry-1", expected_catalog_revision: 4 };
+
+    const result = await api.persistence.projects.retryRunTask(
+      "project-1",
+      "run-1",
+      "task-1",
+      request,
+    );
+
+    expect(result).toMatchObject({
+      disposition: "accepted",
+      lifecycle: "queued",
+      catalog_revision: 5,
+      retry_id: request.retry_id,
+    });
+    expect(requests).toEqual([{
+      body: request,
+      method: "POST",
+      url: "http://127.0.0.1:8765/v2/persistence/projects/project-1/runs/run-1/tasks/task-1/retry",
+    }]);
+  });
+
+  it("sends the local operator capability when publishing an execution profile", async () => {
+    let observedHeaders = new Headers();
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (_url, init) => {
+        observedHeaders = new Headers(init?.headers);
+        return jsonResponse({});
+      },
+    });
+    const request: PublishExecutionProfileRequest = {
+      expected_revision: 0,
+      client_intent_id: "profile-intent-1",
+      profile: {
+        schema_version: "execution_profile.v1",
+        profile_id: "exec:interactive",
+        version: "1",
+        defaults: {},
+      },
+    };
+
+    await api.platform.publishComputeProfile(request, {
+      operatorCapability: "a".repeat(32),
+    });
+
+    expect(observedHeaders.get("authorization")).toBe(`Bearer ${"a".repeat(32)}`);
   });
 
   it("reads a durable project run without a current-session target", async () => {

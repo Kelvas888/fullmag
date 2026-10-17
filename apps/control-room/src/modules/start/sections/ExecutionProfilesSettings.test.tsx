@@ -51,7 +51,6 @@ const { resource } = vi.hoisted(() => {
       error: null,
       refreshError: null,
       refetch: vi.fn(),
-      publish: vi.fn(),
       findPublication: vi.fn(),
       scope: "test-resource-scope",
     },
@@ -93,7 +92,7 @@ describe("execution profile settings", () => {
     expect(existingGpuDraft.profile.defaults.device).toBe("gpu");
   });
 
-  it("inspects resolved profile defaults and offers duplicate and new-version actions", () => {
+  it("inspects profile defaults while keeping publication actions read-only without the local operator", () => {
     const html = renderToStaticMarkup(<ExecutionProfilesSettings />);
 
     expect(html).toContain("<summary>Inspect</summary>");
@@ -101,6 +100,21 @@ describe("execution profile settings", () => {
     expect(html).toContain("GPU-0123456789abcdef");
     expect(html).toContain("8 GiB");
     expect(html).toContain("16 GiB");
+    expect(html).toContain("Publishing profiles is available only in the local Fullmag desktop app.");
+    expect(html).toContain("Duplicate");
+    expect(html).toContain("New version");
+    expect(html).toContain("disabled");
+  });
+
+  it("enables publication actions only when a local operator callback is provided", () => {
+    const html = renderToStaticMarkup(
+      <ExecutionProfilesSettings
+        canPublishExecutionProfiles
+        onPublishExecutionProfile={() => Promise.resolve({} as never)}
+      />,
+    );
+
+    expect(html).not.toContain("Publishing profiles is available only in the local Fullmag desktop app.");
     expect(html).toContain("Duplicate");
     expect(html).toContain("New version");
   });

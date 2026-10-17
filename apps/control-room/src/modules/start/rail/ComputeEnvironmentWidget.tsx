@@ -2,11 +2,13 @@
 
 import { cva } from "class-variance-authority";
 import { Cpu, RefreshCw, Settings } from "lucide-react";
+import { useState } from "react";
 
 import { Button } from "@/shared/ui/Button";
 import { cn } from "@/shared/utils/className";
 
 import { formatTelemetrySampleTime } from "../model/computeTelemetry";
+import { ComputeNodeOverviewSummary } from "../ComputeNodeOverviewSummary";
 import { ComputeNodeInventoryStatus } from "../ComputeNodeInventoryStatus";
 import type { ComputeEnvironment, ComputeNodeInventorySummary, ComputeProbeState, GpuInfo } from "../model/types";
 
@@ -25,6 +27,7 @@ const environmentVariants = cva("fm-start-env", {
 });
 
 const GIGABYTE = 1e9;
+const INITIAL_GPU_SUMMARY_COUNT = 3;
 
 const gigabytes = new Intl.NumberFormat(undefined, {
   maximumFractionDigits: 1,
@@ -140,10 +143,13 @@ export function ComputeEnvironmentWidget({
       <div className="fm-start-env__body">
         <ProbeStatus compute={compute} error={error} refreshing={refreshing} stale={stale} />
         {nodeInventory ? (
-          <ComputeNodeInventoryStatus
-            className="fm-start-env__note"
-            summary={nodeInventory}
-          />
+          <>
+            <ComputeNodeInventoryStatus
+              className="fm-start-env__note"
+              summary={nodeInventory}
+            />
+            <ComputeNodeOverviewSummary summary={nodeInventory} />
+          </>
         ) : null}
         {sampleTime ? (
           <p className="fm-start-env__note">
@@ -310,6 +316,7 @@ function ProbeStatus({
 }
 
 function ProbedEnvironment({ compute }: { readonly compute: ComputeEnvironment }) {
+  const [showAllGpus, setShowAllGpus] = useState(false);
   const threadsAvailable = Number.isFinite(compute.cpuThreads) && compute.cpuThreads > 0;
   const ram =
     compute.cpuProbeStatus === "unavailable"
@@ -336,11 +343,27 @@ function ProbedEnvironment({ compute }: { readonly compute: ComputeEnvironment }
         </p>
       ) : null}
       {compute.gpus.length > 0 ? (
-        <ul aria-label="Detected GPUs" className="fm-start-env__gpu-list">
-          {compute.gpus.map((gpu, index) => (
+        <>
+          {compute.gpus.length > INITIAL_GPU_SUMMARY_COUNT ? (
+            <Button
+              aria-expanded={showAllGpus}
+              className="fm-start-env__gpu-expand"
+              onClick={() => setShowAllGpus((current) => !current)}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              {showAllGpus ? "Show fewer GPUs" : `Show all ${compute.gpus.length} GPUs`}
+            </Button>
+          ) : null}
+          <ul aria-label="Detected GPUs" className="fm-start-env__gpu-list">
+            {compute.gpus
+              .slice(0, showAllGpus ? compute.gpus.length : INITIAL_GPU_SUMMARY_COUNT)
+              .map((gpu, index) => (
             <GpuSummary gpu={gpu} key={gpu.index ?? gpu.name} position={index + 1} />
-          ))}
-        </ul>
+              ))}
+          </ul>
+        </>
       ) : null}
 
       <div className="fm-start-env__cpu">

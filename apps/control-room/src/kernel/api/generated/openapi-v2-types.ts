@@ -436,6 +436,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/persistence/projects/{project_id}/runs/{run_id}/tasks/{task_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["persistence_post_persistence_projects_project_id_runs_run_id_tasks_task_id_retry"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/platform/asyncapi.json": {
         parameters: {
             query?: never;
@@ -6039,15 +6055,15 @@ export interface components {
             base_revision?: number | null;
             /** @enum {string} */
             kind: "replace_scene";
-            scene: Record<string, unknown>;
+            scene: Record<string, never>;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
             /** @enum {string} */
             kind: "merge_patch";
-            merge_patch: Record<string, unknown>;
+            merge_patch: Record<string, never>;
         } | {
-            asset?: Record<string, unknown> | null;
+            asset?: Record<string, never> | null;
             /** Format: int64 */
             base_revision?: number | null;
             /** @enum {string} */
@@ -6058,27 +6074,27 @@ export interface components {
         } | {
             /** Format: int64 */
             base_revision?: number | null;
-            geometry: Record<string, unknown>;
+            geometry: Record<string, never>;
             /** @enum {string} */
             kind: "patch_object_geometry";
             object_id: string;
-            transform?: Record<string, unknown> | null;
+            transform?: Record<string, never> | null;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
-            geometry: Record<string, unknown>;
+            geometry: Record<string, never>;
             /** @enum {string} */
             kind: "create_object";
-            magnetization_asset?: Record<string, unknown> | null;
+            magnetization_asset?: Record<string, never> | null;
             magnetization_ref?: string | null;
-            material_asset?: Record<string, unknown> | null;
+            material_asset?: Record<string, never> | null;
             material_ref?: string | null;
             name: string;
             object_id: string;
             region_name?: string | null;
-            study_universe_mesh?: Record<string, unknown> | null;
-            transform?: Record<string, unknown> | null;
-            universe?: Record<string, unknown> | null;
+            study_universe_mesh?: Record<string, never> | null;
+            transform?: Record<string, never> | null;
+            universe?: Record<string, never> | null;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
@@ -6120,14 +6136,14 @@ export interface components {
             /** @enum {string} */
             kind: "commit_object_transform";
             object_id: string;
-            transform: Record<string, unknown>;
+            transform: Record<string, never>;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
             /** @enum {string} */
             kind: "patch_universe";
             sync_study_universe_mesh?: boolean;
-            universe: Record<string, unknown>;
+            universe: Record<string, never>;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
@@ -6569,7 +6585,7 @@ export interface components {
              * @description Durable snapshot payload. Its versioned shapes are defined by
              *     `compute_node_snapshot.v1` and `compute_node_snapshot.v2` in the session model.
              */
-            snapshot: Record<string, unknown>;
+            snapshot: Record<string, never>;
             /** Format: int64 */
             stale_after_seconds: number;
             state: components["schemas"]["ComputeNodesState"];
@@ -8208,7 +8224,7 @@ export interface components {
             mesh_generation_id?: string | null;
             mesh_id?: string | null;
             schema_version: string;
-            source_identity: Record<string, unknown>;
+            source_identity: Record<string, never>;
             topology_fingerprint?: string | null;
         };
         FrequencyDomainCapabilityEntryResource: {
@@ -10277,16 +10293,16 @@ export interface components {
         };
         MeshActiveBuildResource: {
             /** @description Current active build descriptor and progress metadata. */
-            active_build?: Record<string, unknown> | null;
+            active_build?: Record<string, never> | null;
             /** @description Resolved target for the current build. Summary-level copies are transitional dashboard projections. */
-            effective_airbox_target?: Record<string, unknown> | null;
+            effective_airbox_target?: Record<string, never> | null;
             /** @description Resolved per-object targets for the current build. Summary-level copies are transitional dashboard projections. */
-            effective_per_object_targets?: Record<string, unknown> | null;
+            effective_per_object_targets?: Record<string, never> | null;
             /** Format: int64 */
             geometry_realization_revision?: number | null;
             last_build_error?: string | null;
             /** @description Current/last build summary for build panels. Latest-success endpoint owns stable successful build references. */
-            last_build_summary?: Record<string, unknown> | null;
+            last_build_summary?: Record<string, never> | null;
             /** @description Build/pipeline state for build panels. */
             mesh_pipeline_status?: components["schemas"]["MeshBuildPipelinePhaseResource"][] | null;
             mixed_layer_topology_rejection?: null | components["schemas"]["MeshMixedLayerTopologyRejectionResource"];
@@ -10295,7 +10311,7 @@ export interface components {
             provenance?: null | components["schemas"]["MeshBuildProvenanceResource"];
             published_resources?: null | components["schemas"]["MeshBuildPublishedResourcesResource"];
             /** @description Resolved policy used by the build. This is execution reality, not the authoring draft. */
-            resolved_policy?: Record<string, unknown> | null;
+            resolved_policy?: Record<string, never> | null;
             /** Format: int64 */
             revision: number;
             shared_domain_build_report?: null | components["schemas"]["MeshSharedDomainBuildReportResource"];
@@ -10311,23 +10327,23 @@ export interface components {
             minimum_element_size?: number | null;
         };
         MeshBuildCommandRequest: {
-            mesh_options?: Record<string, unknown> | null;
+            mesh_options?: Record<string, never> | null;
             mesh_reason?: string | null;
             mesh_target?: null | components["schemas"]["MeshCommandTarget"];
         };
         MeshBuildDiagnosticsResource: {
             last_build_error?: string | null;
             /** @description Detailed latest build summary for diagnostics and inspectors. */
-            last_build_summary?: Record<string, unknown> | null;
+            last_build_summary?: Record<string, never> | null;
             /** @description Detailed build pipeline state for diagnostics and build panels. */
             mesh_pipeline_status?: components["schemas"]["MeshBuildPipelinePhaseResource"][] | null;
             /** @description Detailed mesh-build quality diagnostics. Dashboard quality summaries are transitional projections only. */
-            mesh_quality_summary?: Record<string, unknown> | null;
+            mesh_quality_summary?: Record<string, never> | null;
             /** @description Full mesh statistics report for realized solver mesh diagnostics. */
-            mesh_statistics?: Record<string, unknown> | null;
+            mesh_statistics?: Record<string, never> | null;
         };
         MeshBuildHistoryResource: {
-            history: Record<string, unknown>[];
+            history: Record<string, never>[];
             /** Format: int64 */
             revision: number;
         };
@@ -10345,9 +10361,9 @@ export interface components {
         MeshBuildPolicyDiffResource: {
             effect?: string | null;
             path: string;
-            previous?: Record<string, unknown> | null;
-            realized?: Record<string, unknown> | null;
-            requested?: Record<string, unknown> | null;
+            previous?: Record<string, never> | null;
+            realized?: Record<string, never> | null;
+            requested?: Record<string, never> | null;
             scope: string;
         };
         MeshBuildProvenanceResource: {
@@ -10424,38 +10440,38 @@ export interface components {
             part_id: string;
         };
         MeshInterfaceConfigReplaceRequest: {
-            config?: Record<string, unknown> | null;
+            config?: Record<string, never> | null;
             owner_a?: string | null;
             owner_b?: string | null;
         };
         MeshInterfaceConfigResource: {
-            config?: Record<string, unknown> | null;
+            config?: Record<string, never> | null;
             interface_id: string;
             /** Format: int64 */
             revision: number;
         };
         MeshInterfaceQualityResource: {
             interface_id: string;
-            quality?: Record<string, unknown> | null;
+            quality?: Record<string, never> | null;
             /** Format: int64 */
             revision: number;
         };
         MeshInterfaceReportResource: {
             interface_id: string;
-            report?: Record<string, unknown> | null;
+            report?: Record<string, never> | null;
             /** Format: int64 */
             revision: number;
         };
         MeshLastSuccessfulBuildResource: {
             /** @description Transitional target projection retained for current frontend adapters. */
-            effective_airbox_target?: Record<string, unknown> | null;
+            effective_airbox_target?: Record<string, never> | null;
             /** @description Transitional target projection retained for current frontend adapters. */
-            effective_per_object_targets?: Record<string, unknown> | null;
+            effective_per_object_targets?: Record<string, never> | null;
             /** Format: int64 */
             geometry_realization_revision?: number | null;
             last_build_error?: string | null;
             /** @description Last successful build artifact/reference summary. It must not become a copy of the active build resource. */
-            last_success?: Record<string, unknown> | null;
+            last_success?: Record<string, never> | null;
             /** Format: int64 */
             revision: number;
             /** Format: int64 */
@@ -10565,13 +10581,13 @@ export interface components {
         };
         MeshObjectQualityResource: {
             object_id: string;
-            quality?: Record<string, unknown> | null;
+            quality?: Record<string, never> | null;
             /** Format: int64 */
             revision: number;
         };
         MeshObjectReportResource: {
             object_id: string;
-            report?: Record<string, unknown> | null;
+            report?: Record<string, never> | null;
             /** Format: int64 */
             revision: number;
         };
@@ -10602,7 +10618,7 @@ export interface components {
             object_id: string;
             /** Format: int64 */
             revision: number;
-            size_field?: Record<string, unknown> | null;
+            size_field?: Record<string, never> | null;
         };
         MeshOperationStatusResource: {
             actual_method?: string | null;
@@ -10754,7 +10770,7 @@ export interface components {
             topology_fingerprint?: string | null;
         };
         MeshQualityGatesResource: {
-            gates?: Record<string, unknown> | null;
+            gates?: Record<string, never> | null;
             mixed_certificate: components["schemas"]["MeshMixedCertificateQualityEvidenceResource"];
             /** Format: int64 */
             revision: number;
@@ -10764,7 +10780,7 @@ export interface components {
             /** Format: int64 */
             gmsh_field_id?: number | null;
             kind: string;
-            params?: Record<string, unknown> | null;
+            params?: Record<string, never> | null;
             reason?: string | null;
             source?: string | null;
             status: string;
@@ -10816,7 +10832,7 @@ export interface components {
             topology_fingerprint?: string | null;
         };
         MeshRegionQualityResource: {
-            quality?: Record<string, unknown> | null;
+            quality?: Record<string, never> | null;
             region_id: string;
             /** Format: int64 */
             revision: number;
@@ -10846,7 +10862,7 @@ export interface components {
             shared_domain_config: unknown;
             solver_mesh?: null | components["schemas"]["MeshSolverMeshResource"];
             /** @description Solver-domain universe mesh policy. This endpoint owns mesh semantics, not build diagnostics. */
-            universe_config?: Record<string, unknown> | null;
+            universe_config?: Record<string, never> | null;
         };
         MeshSharedDomainBuildReportResource: {
             /** Format: int32 */
@@ -10871,16 +10887,16 @@ export interface components {
             gmsh_version?: string | null;
             mixed_layer_topology_certificate?: null | components["schemas"]["MeshMixedLayerTopologyCertificateSummaryResource"];
             mixed_topology_provenance?: null | components["schemas"]["MeshMixedTopologyProvenanceResource"];
-            object_region_markers?: Record<string, unknown>[];
+            object_region_markers?: Record<string, never>[];
             operation_statuses?: components["schemas"]["MeshOperationStatusResource"][];
             orphan_entities?: components["schemas"]["MeshOrphanEntityResource"][];
             /** Format: int32 */
             realized_regions_count?: number | null;
             region_markers?: components["schemas"]["MeshDomainRegionMarkerResource"][];
-            rejected_element_types?: Record<string, unknown>[];
+            rejected_element_types?: Record<string, never>[];
             requested_layered_policy?: null | components["schemas"]["MeshLayeredPolicyResource"];
             resolved_layered_policy?: null | components["schemas"]["MeshLayeredPolicyResource"];
-            selector_resolution?: Record<string, unknown>[];
+            selector_resolution?: Record<string, never>[];
             size_fields_realized?: components["schemas"]["MeshRealizedSizeFieldResource"][];
             thin_film_diagnostics?: components["schemas"]["MeshThinFilmDiagnosticResource"][];
             /** Format: int32 */
@@ -10888,7 +10904,7 @@ export interface components {
             used_size_field_kinds?: string[];
         };
         MeshSharedDomainConfigReplaceRequest: {
-            config: Record<string, unknown>;
+            config: Record<string, never>;
         };
         MeshSharedDomainConfigResource: {
             config: {
@@ -11012,12 +11028,12 @@ export interface components {
             revision: number;
         };
         MeshUniverseQualityResource: {
-            quality?: Record<string, unknown> | null;
+            quality?: Record<string, never> | null;
             /** Format: int64 */
             revision: number;
         };
         MeshUniverseReportResource: {
-            report?: Record<string, unknown> | null;
+            report?: Record<string, never> | null;
             /** Format: int64 */
             revision: number;
         };
@@ -11185,17 +11201,17 @@ export interface components {
         ObjectCreateRequest: {
             /** Format: int64 */
             base_revision?: number | null;
-            geometry: Record<string, unknown>;
-            magnetization_asset?: Record<string, unknown> | null;
+            geometry: Record<string, never>;
+            magnetization_asset?: Record<string, never> | null;
             magnetization_ref?: string | null;
-            material_asset?: Record<string, unknown> | null;
+            material_asset?: Record<string, never> | null;
             material_ref?: string | null;
             name: string;
             object_id: string;
             region_name?: string | null;
-            study_universe_mesh?: Record<string, unknown> | null;
-            transform?: Record<string, unknown> | null;
-            universe?: Record<string, unknown> | null;
+            study_universe_mesh?: Record<string, never> | null;
+            transform?: Record<string, never> | null;
+            universe?: Record<string, never> | null;
         };
         /** @description Per-energy availability is explicit: null is missing, while Some(0.0) is an observed zero. */
         ObjectEnergySummary: {
@@ -11215,21 +11231,21 @@ export interface components {
         ObjectGeometryPatchRequest: {
             /** Format: int64 */
             base_revision?: number | null;
-            geometry: Record<string, unknown>;
-            transform?: Record<string, unknown> | null;
+            geometry: Record<string, never>;
+            transform?: Record<string, never> | null;
         };
         ObjectInteractionPatchRequest: {
             /** Format: int64 */
             base_revision?: number | null;
             enabled?: boolean | null;
-            params: Record<string, unknown>;
+            params: Record<string, never>;
             present?: boolean | null;
         };
         ObjectInteractionResource: {
             enabled: boolean;
             interaction_kind: string;
             object_id: string;
-            params: Record<string, unknown>;
+            params: Record<string, never>;
             present: boolean;
             /** Format: int64 */
             scene_revision: number;
@@ -11256,16 +11272,16 @@ export interface components {
             time_seconds: number;
         };
         ObjectPatchRequest: {
-            absorbing_boundary?: Record<string, unknown> | null;
+            absorbing_boundary?: Record<string, never> | null;
             /** Format: int64 */
             base_revision?: number | null;
-            geometry?: Record<string, unknown> | null;
+            geometry?: Record<string, never> | null;
             magnetization_ref?: string | null;
             material_ref?: string | null;
             name?: string | null;
             notes?: string | null;
             region_name?: string | null;
-            transform?: Record<string, unknown> | null;
+            transform?: Record<string, never> | null;
             visible?: boolean | null;
         };
         ObjectRegionCreateRequest: {
@@ -12132,7 +12148,7 @@ export interface components {
             next_cursor?: string | null;
         };
         /** @enum {string} */
-        ProjectBatchCommandAction: "pause_admission" | "resume_admission" | "cancel_admission";
+        ProjectBatchCommandAction: "pause_admission" | "resume_admission" | "cancel_admission" | "retry";
         /** @enum {string} */
         ProjectBatchCommandDisposition: "accepted" | "replayed";
         ProjectBatchCommandRequest: {
@@ -12141,6 +12157,7 @@ export interface components {
             /** Format: int64 */
             expected_revision: number;
             reason: string;
+            retry?: null | components["schemas"]["ProjectBatchRetryRequest"];
         };
         ProjectBatchCommandResource: {
             action: components["schemas"]["ProjectBatchCommandAction"];
@@ -12150,6 +12167,7 @@ export interface components {
             command_revision: number;
             disposition: components["schemas"]["ProjectBatchCommandDisposition"];
             expansion_state: components["schemas"]["ProjectBatchExpansionState"];
+            retry?: null | components["schemas"]["ProjectBatchRetryResource"];
             /** Format: int64 */
             revision: number;
         };
@@ -12170,6 +12188,17 @@ export interface components {
             batches: components["schemas"]["ProjectBatchSummaryResource"][];
             next_cursor?: string | null;
             project_id: string;
+        };
+        ProjectBatchRetryRequest: {
+            case_id: string;
+            /** Format: int64 */
+            expected_catalog_revision: number;
+            retry_id: string;
+            task_id: string;
+        };
+        ProjectBatchRetryResource: {
+            case_id: string;
+            task: components["schemas"]["ProjectRunTaskRetryResource"];
         };
         /**
          * @description Immutable independent batch submission. The server deserializes
@@ -12524,6 +12553,10 @@ export interface components {
             expected_catalog_revision: number;
             reason: string;
         };
+        ProjectRunTaskExecutionResource: {
+            materialization?: components["schemas"]["ExecutionMaterializationSchema"];
+            step_id: string;
+        };
         /** @enum {string} */
         ProjectRunTaskLifecycle: "accepted" | "queued" | "preparing" | "running" | "stopping" | "succeeded" | "failed" | "cancelled" | "interrupted";
         ProjectRunTaskReadiness: {
@@ -12539,6 +12572,7 @@ export interface components {
             artifact_ids: string[];
             attempt_id?: string | null;
             cancellation_intent?: null | components["schemas"]["ProjectRunTaskCancellationSummary"];
+            execution?: components["schemas"]["ProjectRunTaskExecutionResource"];
             input_fingerprint: string;
             lifecycle: components["schemas"]["ProjectRunTaskLifecycle"];
             observation?: null | components["schemas"]["ProjectRunObservationState"];
@@ -12547,6 +12581,32 @@ export interface components {
             readiness: components["schemas"]["ProjectRunTaskReadiness"];
             resolved_input_fingerprint?: string | null;
             resource_id?: string | null;
+            task_id: string;
+        };
+        /** @enum {string} */
+        ProjectRunTaskRetryDisposition: "accepted" | "replayed";
+        /** @description Revision-fenced request to create a fresh attempt for one terminal task. */
+        ProjectRunTaskRetryRequest: {
+            /**
+             * Format: int64
+             * @description Catalog revision observed by the caller before requesting the retry.
+             */
+            expected_catalog_revision: number;
+            /** @description Stable idempotency identity for this operator retry request. */
+            retry_id: string;
+        };
+        ProjectRunTaskRetryResource: {
+            /** Format: int64 */
+            catalog_revision: number;
+            disposition: components["schemas"]["ProjectRunTaskRetryDisposition"];
+            /** @description Retry ACK reports the durable task state, not solver completion. */
+            lifecycle: components["schemas"]["ProjectRunTaskLifecycle"];
+            /** @description Attempt that was terminal when the retry was requested. */
+            previous_attempt_id: string;
+            /** Format: int64 */
+            previous_ownership_epoch: number;
+            retry_id: string;
+            run_id: string;
             task_id: string;
         };
         ProjectRunTaskStopResource: {
@@ -13536,7 +13596,7 @@ export interface components {
             texture_override?: null | components["schemas"]["SceneTextureOverride"];
         };
         SceneObjectResource: {
-            absorbing_boundary?: Record<string, unknown> | null;
+            absorbing_boundary?: Record<string, never> | null;
             allocated_region_ids?: string[];
             geometry?: {
                 [key: string]: unknown;
@@ -13604,7 +13664,7 @@ export interface components {
             t0: number;
         };
         ScenePatchRequest: {
-            merge_patch: Record<string, unknown>;
+            merge_patch: Record<string, never>;
         };
         ScenePrescribedSotDrive: {
             /** Format: double */
@@ -13688,7 +13748,7 @@ export interface components {
             /** Format: double */
             radius: number;
         } | {
-            expression: Record<string, unknown>;
+            expression: Record<string, never>;
             /** @enum {string} */
             kind: "csg";
         };
@@ -15473,14 +15533,14 @@ export interface components {
             /** @enum {string} */
             kind: "close";
         }) | (components["schemas"]["RuntimeCommandIntent"] & {
-            mesh_options?: Record<string, unknown> | null;
+            mesh_options?: Record<string, never> | null;
             mesh_reason?: string | null;
             mesh_target?: null | components["schemas"]["MeshCommandTarget"];
         } & {
             /** @enum {string} */
             kind: "mesh_build";
         }) | (components["schemas"]["RuntimeCommandIntent"] & {
-            mesh_options?: Record<string, unknown> | null;
+            mesh_options?: Record<string, never> | null;
         } & {
             /** @enum {string} */
             kind: "fdm_grid_refresh";
@@ -15647,7 +15707,7 @@ export interface components {
             qualification_validator_schema?: string | null;
             runtime_source_inputs_sha256?: string | null;
             timestep_policy: string;
-            validated_scope?: Record<string, unknown> | null;
+            validated_scope?: Record<string, never> | null;
             validation_state: components["schemas"]["TimestepValidationStateResource"];
         };
         /** @enum {string} */
@@ -15955,7 +16015,7 @@ export interface components {
             /** Format: int64 */
             base_revision?: number | null;
             sync_study_universe_mesh?: boolean;
-            universe: Record<string, unknown>;
+            universe: Record<string, never>;
         };
         UniverseResource: {
             mesh_dirty: boolean;
@@ -15963,8 +16023,8 @@ export interface components {
             object_bounds_min?: number[] | null;
             /** Format: int64 */
             scene_revision: number;
-            study_universe_mesh: Record<string, unknown> | null;
-            universe: Record<string, unknown> | null;
+            study_universe_mesh: Record<string, never> | null;
+            universe: Record<string, never> | null;
         };
         UnsupportedAuthoringRecord: {
             [key: string]: unknown;
@@ -16331,7 +16391,7 @@ export interface components {
             /** @description `desktop`, `cli`, `python` or `web`. */
             actor: string;
             at: string;
-            detail: Record<string, unknown>;
+            detail: Record<string, never>;
             /** @description Row id as a decimal string. */
             id: string;
             /** @description `open`, `save`, `run`, `create`, `import`, `pin`, `unpin`, `forget` or `edit`. */
@@ -16353,7 +16413,7 @@ export interface components {
             kind: components["schemas"]["WorkspaceItemKind"];
             last_used_at: string;
             /** @description Per-kind facts written by Fullmag front ends; unknown keys are kept. */
-            meta: Record<string, unknown>;
+            meta: Record<string, never>;
             modified_at?: string | null;
             name: string;
             /** @description Absolute path as the person would type it (no `\\?\` prefix). */
@@ -16482,7 +16542,7 @@ export interface components {
             /** @description `telemetry.enabled` or `update.available`. */
             key: string;
             /** @description The stored value, or the default (`false` / `null`) when unset. */
-            value: Record<string, unknown>;
+            value: Record<string, never>;
             /**
              * @description The API accepts `PUT` for the key. `update.available` is written by an
              *     updater, never by the renderer.
@@ -16490,7 +16550,7 @@ export interface components {
             writable: boolean;
         };
         WorkspaceSettingRequest: {
-            value: Record<string, unknown>;
+            value: Record<string, never>;
         };
         WorkspaceStageLayout: {
             bottom_dock?: string | null;
@@ -18051,6 +18111,67 @@ export interface operations {
             };
         };
     };
+    persistence_post_persistence_projects_project_id_runs_run_id_tasks_task_id_retry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Pinned project identity */
+                project_id: string;
+                /** @description Accepted durable child run identity */
+                run_id: string;
+                /** @description Exact durable task identity */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectRunTaskRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Identical retry request replayed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectRunTaskRetryResource"];
+                };
+            };
+            /** @description A fresh attempt was durably queued after terminal reconciliation */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectRunTaskRetryResource"];
+                };
+            };
+            /** @description Invalid retry identity or catalog revision */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Accepted run intent is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Task is not retryable, the catalog changed, terminal proof or its exact lease release is missing, or a lease is still active */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     platform_get_platform_asyncapi_json: {
         parameters: {
             query?: never;
@@ -18397,7 +18518,10 @@ export interface operations {
     platform_post_platform_compute_profiles: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Bearer capability issued by the local Fullmag desktop application */
+                Authorization: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -18427,6 +18551,13 @@ export interface operations {
             };
             /** @description Invalid profile or publication identity */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A local desktop-operator capability is required */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

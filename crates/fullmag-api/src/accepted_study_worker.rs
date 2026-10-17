@@ -303,7 +303,7 @@ fn verify_host_worker_launch_for_claim(
         claim.run_id.as_str(),
         claim.task_id.as_str(),
         || {
-            fullmag_session::host_resource_ledger::HostResourceLedger::open(
+            fullmag_session::host_resource_ledger::HostResourceLedger::open_for_current_application(
                 &binding.ledger_root,
                 binding.policy.clone(),
             )

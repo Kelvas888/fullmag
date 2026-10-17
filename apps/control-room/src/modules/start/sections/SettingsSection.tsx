@@ -36,6 +36,8 @@ interface SettingsSectionProps {
   readonly nodeInventory?: ComputeNodeInventorySummary;
   readonly canEditNodePolicy?: boolean;
   readonly onUpdateNodePolicy?: ComputeProbeController["updateNodePolicy"];
+  readonly canPublishExecutionProfiles?: boolean;
+  readonly onPublishExecutionProfile?: ComputeProbeController["publishExecutionProfile"];
   readonly refreshing?: boolean;
   readonly stale?: boolean;
   readonly computeError?: string | null;
@@ -50,6 +52,8 @@ export function SettingsSection({
   nodeInventory,
   canEditNodePolicy = false,
   onUpdateNodePolicy,
+  canPublishExecutionProfiles = false,
+  onPublishExecutionProfile,
   refreshing = false,
   stale = false,
   computeError = null,
@@ -101,7 +105,11 @@ export function SettingsSection({
           />
         </div>
         <div hidden={computeView !== "profiles"}>
-          <ExecutionProfilesSettings executionAvailability={executionAvailability} />
+          <ExecutionProfilesSettings
+            canPublishExecutionProfiles={canPublishExecutionProfiles}
+            onPublishExecutionProfile={onPublishExecutionProfile}
+            executionAvailability={executionAvailability}
+          />
         </div>
       </section>
 

@@ -2089,9 +2089,55 @@ impl HostResourceLedger {
         Ok(reservation.clone())
     }
 
-    /// Create the exact ledger namespace once, or validate an existing one
-    /// against the supplied policy. Existing budgets are never resampled.
-    pub fn initialize(root: impl AsRef<Path>, policy: HostResourceLedgerPolicy) -> Result<Self> {
+    /// Initialize a ledger after pinning its canonical path in shared local
+    /// application state. A second store cannot create another ledger for the
+    /// same physical host identity.
+    pub fn initialize_for_application(
+        application_state_root: &Path,
+        root: impl AsRef<Path>,
+        policy: HostResourceLedgerPolicy,
+    ) -> Result<Self> {
+        let root = crate::host_ledger_registry::pin_host_ledger_root(
+            application_state_root,
+            root.as_ref(),
+            &policy,
+        )?;
+        Self::initialize(root, policy)
+    }
+
+    /// Open an existing ledger only after validating its shared application
+    /// state binding for the configured host identity. This never creates a
+    /// missing registry entry; local operator initialization is required.
+    pub fn open_for_application(
+        application_state_root: &Path,
+        root: impl AsRef<Path>,
+        policy: HostResourceLedgerPolicy,
+    ) -> Result<Self> {
+        let root = crate::host_ledger_registry::require_pinned_host_ledger_root(
+            application_state_root,
+            root.as_ref(),
+            &policy,
+        )?;
+        Self::open(root, policy)
+    }
+
+    /// Open a host ledger for a process launched by the local application.
+    /// Missing or invalid application state fails closed.
+    pub fn open_for_current_application(
+        root: impl AsRef<Path>,
+        policy: HostResourceLedgerPolicy,
+    ) -> Result<Self> {
+        let application_state_root =
+            crate::host_ledger_registry::application_state_root_from_environment()?;
+        Self::open_for_application(&application_state_root, root, policy)
+    }
+
+    /// Low-level initializer for same-crate persistence tests.
+    /// Production host services must use `initialize_for_application`.
+    pub(crate) fn initialize(
+        root: impl AsRef<Path>,
+        policy: HostResourceLedgerPolicy,
+    ) -> Result<Self> {
         policy.validate()?;
         if policy.schema_version == HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2 {
             bail!("host resource ledger policy v2 requires initialize_with_readiness");
@@ -2284,6 +2330,24 @@ impl HostResourceLedger {
         Self::initialize_with_readiness(root, policy, readiness)
     }
 
+    /// Initialize or upgrade typed runtime readiness after pinning the ledger
+    /// to the local application's one host-bound registry entry.
+    pub fn initialize_or_upgrade_with_readiness_for_application(
+        application_state_root: &Path,
+        root: impl AsRef<Path>,
+        policy: HostResourceLedgerPolicy,
+        readiness: HostRuntimeReadiness,
+    ) -> Result<Self> {
+        policy.validate()?;
+        readiness.validate_persisted(&policy)?;
+        let root = crate::host_ledger_registry::pin_host_ledger_root(
+            application_state_root,
+            root.as_ref(),
+            &policy,
+        )?;
+        Self::initialize_or_upgrade_with_readiness(root, policy, readiness)
+    }
+
     /// Rotate the immutable runtime-readiness generation while preserving the
     /// policy, reservations, node policy, and all legacy evidence files.
     ///
@@ -2359,7 +2423,7 @@ impl HostResourceLedger {
     /// Open a previously initialized ledger without creating or repairing its
     /// policy, marker, or reservation state. V2 also requires its persisted
     /// native readiness record before it can be admitted.
-    pub fn open(root: impl AsRef<Path>, expected_policy: HostResourceLedgerPolicy) -> Result<Self> {
+    pub(crate) fn open(root: impl AsRef<Path>, expected_policy: HostResourceLedgerPolicy) -> Result<Self> {
         expected_policy.validate()?;
         let root = canonical_ledger_root(root.as_ref(), false)?;
         let ledger = Self::new(root, expected_policy);
@@ -2757,9 +2821,9 @@ impl HostResourceLedger {
     }
 
     /// Bound new CPU admission and launch to the configured policy and the
-    /// latest effective OS/cgroup capacity. Unknown capacity cannot authorize
-    /// an owner-bound CPU reservation; the snapshot still does not prove that
-    /// a worker enforces the limit.
+    /// latest effective OS/cgroup capacity. Unknown capacity or unavailable
+    /// Linux worker-quota enforcement cannot authorize an owner-bound CPU
+    /// reservation; a worker-specific receipt still proves actual application.
     fn validate_observed_cpu_capacity_locked(
         &self,
         document: &HostResourceLedgerDocument,
@@ -2776,6 +2840,16 @@ impl HostResourceLedger {
         let snapshot = self
             .read_compute_node_snapshot_locked()?
             .context("host CPU admission requires a published compute-node sample")?;
+        if cfg!(target_os = "linux")
+            && snapshot.enforcement.cpu_quota
+                != crate::compute_node_snapshot::EnforcementStatus::Supported
+        {
+            return Err(HostResourceCapacityUnavailable(
+                "Linux host CPU admission requires verified per-worker cgroup quota enforcement"
+                    .into(),
+            )
+            .into());
+        }
         let observed_capacity_millis = match &snapshot.cpu.effective_capacity_millis {
             crate::compute_node_snapshot::Observation::Available { value } => *value,
             crate::compute_node_snapshot::Observation::Unavailable { reason } => {
@@ -4763,7 +4837,7 @@ fn validate_inventory_owner_record(
     Ok(())
 }
 
-fn canonical_ledger_root(root: &Path, create_leaf: bool) -> Result<PathBuf> {
+pub(crate) fn canonical_ledger_root(root: &Path, create_leaf: bool) -> Result<PathBuf> {
     if !root.is_absolute() {
         bail!("host resource ledger root must be an explicit absolute path");
     }
@@ -6783,7 +6857,11 @@ mod tests {
                 ),
                 enforcement: EnforcementSnapshot {
                     cpu_affinity: EnforcementStatus::Unavailable,
-                    cpu_quota: EnforcementStatus::Unavailable,
+                    cpu_quota: if cfg!(target_os = "linux") {
+                        EnforcementStatus::Supported
+                    } else {
+                        EnforcementStatus::Unavailable
+                    },
                     memory_cap: EnforcementStatus::Unavailable,
                     gpu_visibility: EnforcementStatus::Unavailable,
                     storage_quota: EnforcementStatus::Unavailable,
@@ -7338,6 +7416,40 @@ mod tests {
             &policy,
             &format!("sha256:{}", "1".repeat(64)),
             "unknown-effective-cpu",
+            budget(100, 1024, 0),
+            &[],
+            &[],
+            &[],
+        );
+        request.expected_compute_node_owner_id = Some(owner.descriptor().host_owner_id.clone());
+        request.expected_compute_node_owner_epoch = Some(owner.descriptor().host_owner_epoch);
+
+        let error = ledger.reserve(&request).unwrap_err();
+        assert!(error.is::<HostResourceCapacityUnavailable>());
+        assert!(ledger.read().unwrap().reservations.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_reservation_rejects_unavailable_worker_cpu_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = policy();
+        let ledger = HostResourceLedger::initialize(directory.path(), policy.clone()).unwrap();
+        let owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        let mut sample = compute_node_snapshot(&policy, ledger.node_id(), chrono::Utc::now(), 1, 1);
+        sample.schema_version = crate::compute_node_snapshot::COMPUTE_NODE_SNAPSHOT_SCHEMA_V2.into();
+        sample.runtime_owner_id = ledger.owner_id();
+        sample.host_owner_id = Some(owner.descriptor().host_owner_id.clone());
+        sample.host_owner_epoch = Some(owner.descriptor().host_owner_epoch);
+        sample.enforcement.cpu_quota = crate::compute_node_snapshot::EnforcementStatus::Unavailable;
+        ledger
+            .publish_compute_node_snapshot_with_owner(&owner, &sample)
+            .unwrap();
+
+        let mut request = request(
+            &policy,
+            &format!("sha256:{}", "1".repeat(64)),
+            "unavailable-worker-cpu-quota",
             budget(100, 1024, 0),
             &[],
             &[],

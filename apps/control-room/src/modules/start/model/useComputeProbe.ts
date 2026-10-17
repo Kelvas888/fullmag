@@ -107,7 +107,7 @@ export function useComputeProbe(): ComputeProbeController {
   const [desktopFailed, setDesktopFailed] = useState(false);
   const [desktopRefreshId, setDesktopRefreshId] = useState(0);
   const operatorCapability = useRef<string | null>(null);
-  const [canEditNodePolicy, setCanEditNodePolicy] = useState(false);
+  const [hasLocalComputeOperator, setHasLocalComputeOperator] = useState(false);
   const needsDesktop = cpu.status === "error" && gpu.status === "error" && !cpu.data && !gpu.data;
 
   useEffect(() => {
@@ -118,12 +118,12 @@ export function useComputeProbe(): ComputeProbeController {
       if (cancelled) return;
       if (typeof value === "string" && /^[0-9a-f]{32}$/.test(value)) {
         operatorCapability.current = value;
-        setCanEditNodePolicy(true);
+        setHasLocalComputeOperator(true);
       }
     }).catch(() => {
       if (!cancelled) {
         operatorCapability.current = null;
-        setCanEditNodePolicy(false);
+        setHasLocalComputeOperator(false);
       }
     });
     return () => {
@@ -180,6 +180,11 @@ export function useComputeProbe(): ComputeProbeController {
     if (!parsed) throw new Error("The API returned an invalid compute-node policy.");
     return parsed;
   }, [api, refetchNodeInventory]);
+  const publishExecutionProfile = useCallback((request: Parameters<ComputeProbeController["publishExecutionProfile"]>[0]) => {
+    const capability = operatorCapability.current;
+    if (!capability) throw new Error("Profile publishing is available only in the local Fullmag desktop app.");
+    return api.platform.publishComputeProfile(request, { operatorCapability: capability });
+  }, [api]);
   const refresh = useCallback(() => {
     setFreshnessNow(Date.now());
     setResourceClockNow(monotonicNow());
@@ -255,7 +260,8 @@ export function useComputeProbe(): ComputeProbeController {
   return {
     compute,
     nodeInventory,
-    canEditNodePolicy,
+    canEditNodePolicy: hasLocalComputeOperator,
+    canPublishExecutionProfiles: hasLocalComputeOperator,
     refreshing: (needsDesktop && desktopRefreshing) ||
       nodeInventoryResource.status === "loading" ||
       (nodeInventoryResource.status === "stale" && !nodeInventoryResource.refreshError) ||
@@ -269,5 +275,6 @@ export function useComputeProbe(): ComputeProbeController {
       : null,
     refresh,
     updateNodePolicy,
+    publishExecutionProfile,
   };
 }

@@ -19,7 +19,7 @@ use fullmag_ir::{TextureMappingIR, TextureProjectionMode, TextureTransform3DIR};
 use fullmag_plan::{sample_preset_texture_versioned, TextureSamplePoint};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2611,7 +2611,14 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8081);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let bind_ip = match std::env::var("FULLMAG_API_BIND_IP") {
+        Ok(value) => value
+            .parse::<IpAddr>()
+            .expect("FULLMAG_API_BIND_IP must be a valid IP address"),
+        Err(std::env::VarError::NotPresent) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        Err(error) => panic!("reading FULLMAG_API_BIND_IP failed: {error}"),
+    };
+    let addr = SocketAddr::new(bind_ip, port);
     info!(%addr, "starting fullmag-api");
 
     let listener = tokio::net::TcpListener::bind(addr)

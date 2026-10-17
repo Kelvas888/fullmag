@@ -106,7 +106,7 @@ export function computeFromTelemetry(
   gpu: GpuTelemetryResource | null,
   capabilities: PlatformCapabilitiesResource | null,
 ): ComputeEnvironment | null {
-  if (!cpu && !gpu) return null;
+  if (!cpu && !gpu && !capabilities) return null;
   const cpuReady = cpu?.status === "available";
   const gpuReady = gpu?.status === "available";
   const gpus: GpuInfo[] = gpuReady
