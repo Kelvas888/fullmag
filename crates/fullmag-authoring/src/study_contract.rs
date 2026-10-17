@@ -1279,14 +1279,14 @@ mod tests {
     fn completion_fixture() -> StudyPlan {
         serde_json::from_value(json!({
             "schema_version": "study_plan.v2", "study_id": "completion", "revision": 1,
-            "steps": ["a", "b", "c"].map(|id| json!({
+            "steps": (["a", "b", "c"].map(|id| json!({
                 "step_id": id, "label": id, "kind": {"kind": "primitive", "stage_kind": "relax"},
                 "model": {"model_id": "m", "version": "v1"},
                 "solver_config": {"preset_id": "s", "version": "v1"},
                 "discretization": {"recipe_id": "d", "version": "v1"},
                 "execution_profile": {"profile_id": "e", "version": "v1"},
                 "acceptance": {"kind": "any"}, "acquisition": "exclusive"
-            }))
+            })))
         }))
         .unwrap()
     }

@@ -6348,7 +6348,7 @@ describe("ControlRoomApi", () => {
         url: "http://127.0.0.1:8765/v2/sessions/current/meshing/policies/objects/free%20layer",
       },
       {
-        body: { config: { maximum_element_size: 5e-9 } },
+        body: { config: { maximum_element_size: "5e-9" } },
         method: "PUT",
         url: "http://127.0.0.1:8765/v2/sessions/current/meshing/policies/objects/free%20layer",
       },

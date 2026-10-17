@@ -2286,7 +2286,7 @@ mod tests {
     #[test]
     fn published_spectrum_rejects_uncertified_or_ignored_analysis_references() {
         let mut transverse = request("transverse");
-        transverse.equilibrium_ref = Some("equilibrium_1".into());
+        transverse.equilibrium_ref = Some(fullmag_ir::EquilibriumRefIR::LegacyId("equilibrium_1".into()));
         let samples = solution_samples_for(&transverse);
         let equilibrium = vec![[0.0, 0.0, 1.0]; 16];
         let error = compute_antenna_source_spectrum_artifact(
@@ -2295,7 +2295,7 @@ mod tests {
         assert!(error.message.contains("verified equilibrium resource loader"));
 
         let mut cartesian = request("x");
-        cartesian.equilibrium_ref = Some("equilibrium_1".into());
+        cartesian.equilibrium_ref = Some(fullmag_ir::EquilibriumRefIR::LegacyId("equilibrium_1".into()));
         let error = compute_antenna_source_spectrum_artifact(
             &cartesian, &samples, None,
         ).unwrap_err();
