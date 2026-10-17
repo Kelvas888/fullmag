@@ -1682,9 +1682,19 @@ def _publish_restart_sentinel(state, payload):
             temporary.unlink()
 
 
-def _reuse_host_certificate(reuse, assembly, engine_id):
+def _reuse_host_certificate(reuse, assembly, engine_id, *, development_build=None):
     """Rotate only the image fields of the existing owned Windows certificate."""
-    from windows_folder_host import HOST_SCHEMA, local_volume, publish_evidence
+    from windows_folder_host import (
+        HOST_SCHEMA,
+        _validate_development_build,
+        local_volume,
+        publish_evidence,
+    )
+
+    delegated_build = (
+        _validate_development_build(development_build)
+        if development_build is not None else None
+    )
 
     certificate = _read_reuse_json(reuse["host_certificate"], "Windows host certificate")
     marker = _read_reuse_json(reuse["owner_marker"], "Windows storage owner marker")
@@ -1720,6 +1730,8 @@ def _reuse_host_certificate(reuse, assembly, engine_id):
         ).hexdigest(),
         restart_verified=False,
     )
+    if delegated_build is not None:
+        rotated["development_build"] = delegated_build
     _publish_restart_sentinel(
         reuse["state"],
         (owner + ":" + assembly["image_id"]).encode("ascii"),
@@ -2753,14 +2765,29 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             provisional_assembly, provisional_hashes, delegation = (
                 _provisional_development_certificate(backend_start, source_identity)
             )
-            certificate = attest(
-                state,
-                provisional_assembly,
-                engine_id,
-                provisional_hashes,
-                development_build=delegation,
-            )
-            publish_evidence(host_certificate, certificate)
+            provisional_assembly = {
+                **provisional_assembly,
+                "binary_hashes": provisional_hashes,
+            }
+            if reuse is not None:
+                # Reuse already has an attested probe directory and owner
+                # marker.  Creating a fresh probe would collide with that
+                # durable evidence and would also mint a second owner token.
+                certificate = _reuse_host_certificate(
+                    reuse,
+                    provisional_assembly,
+                    engine_id,
+                    development_build=delegation,
+                )
+            else:
+                certificate = attest(
+                    state,
+                    provisional_assembly,
+                    engine_id,
+                    provisional_hashes,
+                    development_build=delegation,
+                )
+                publish_evidence(host_certificate, certificate)
         elif reuse is not None:
             certificate = _reuse_host_certificate(reuse, assembly, engine_id)
         else:
@@ -2863,7 +2890,14 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             receipt["backend_build_state"] = "succeeded"
             receipt["backend_build_receipt_sha256"] = assembly["build_receipt_sha256"]
             if reuse is not None:
-                certificate = _reuse_host_certificate(reuse, assembly, engine_id)
+                certificate = _refresh_development_certificate(
+                    certificate, assembly, backend_start
+                )
+                _publish_bound_development_certificate(
+                    host_certificate,
+                    state / ".fullmag-windows-folder-owner.json",
+                    certificate,
+                )
             else:
                 if certificate is None:
                     raise ValueError("Development backend build has no provisional host certificate")

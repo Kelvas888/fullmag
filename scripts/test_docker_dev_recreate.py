@@ -17,6 +17,7 @@ import docker_development_inputs as development_inputs
 import docker_frontend_cache as frontend_cache
 import fullmag_docker_runtime as runtime
 import fullmag_storage as storage
+import windows_folder_host as windows_host
 
 
 def _sha256(path: Path) -> str:
@@ -343,6 +344,126 @@ class DockerDevRecreateContract(unittest.TestCase):
             "runs_root": str(runs_root),
         }
         return temporary, layout, receipt_path, config
+
+    @staticmethod
+    def _development_delegation():
+        return {
+            "schema": "fullmag.windows-folder-development-build.v1",
+            "cargo_profile": "backend-dev",
+            "toolchain_image_id": "sha256:" + "3" * 64,
+            "package_root": "/opt/fullmag/package",
+            "provenance_path": "/opt/fullmag/provenance.json",
+            "group_identity": "fullmag",
+            "source_identity": {
+                "commit": "0" * 40,
+                "source_digest": "0" * 64,
+                "source_snapshot_sha256": "0" * 64,
+                "native_source_identity_sha256": "0" * 64,
+            },
+        }
+
+    def test_reused_backend_start_rotates_existing_certificate_with_delegation(self):
+        temporary, _layout, receipt_path, _config = self._run_fixture()
+        try:
+            state = receipt_path.parent / "state"
+            old_image = "sha256:" + "1" * 64
+            new_image = "sha256:" + "2" * 64
+            owner = "00000000-0000-4000-8000-000000000001"
+            native = {
+                "host_root": str(receipt_path.parent),
+                "host_filesystem": "NTFS",
+                "host_drive_type": 3,
+                "host_volume_serial": 42,
+                "host_root_no_reparse": True,
+            }
+            binary_hashes = {name: "0" * 64 for name in runtime.REQUIRED_BINARIES}
+            old_certificate = {
+                "schema": "fullmag.windows-folder-host.v1",
+                "storage_profile": "windows-folder-v1",
+                "role": "session",
+                "owner_scope": "docker-desktop-linux",
+                **native,
+                "owner_token": owner,
+                "engine_id": "engine-test",
+                "image_id": old_image,
+                "source_commit": "0" * 40,
+                "binary_hashes": binary_hashes,
+                "artifact_receipt_sha256": "0" * 64,
+                "restart_expected_sha256": hashlib.sha256(
+                    (owner + ":" + old_image).encode("ascii")
+                ).hexdigest(),
+                "restart_verified": True,
+            }
+            host_certificate = receipt_path.parent / "windows-folder-host.json"
+            owner_marker = state / ".fullmag-windows-folder-owner.json"
+            for path in (host_certificate, owner_marker):
+                path.write_text(json.dumps(old_certificate), encoding="utf-8")
+            reuse = {
+                "host_certificate": host_certificate,
+                "owner_marker": owner_marker,
+                "state": state,
+                "receipt": {"image_id": old_image},
+            }
+            provisional = {
+                "image_id": new_image,
+                "commit": "0" * 40,
+                "binary_hashes": binary_hashes,
+                "build_receipt_sha256": "0" * 64,
+            }
+            with patch.object(windows_host, "local_volume", return_value=native), \
+                    patch.object(windows_host, "publish_evidence") as publish, \
+                    patch.object(runtime, "_publish_restart_sentinel"):
+                rotated = runtime._reuse_host_certificate(
+                    reuse,
+                    provisional,
+                    "engine-test",
+                    development_build=self._development_delegation(),
+                )
+            self.assertEqual(rotated["image_id"], new_image)
+            self.assertEqual(rotated["binary_hashes"], binary_hashes)
+            self.assertEqual(
+                rotated["development_build"], self._development_delegation()
+            )
+            self.assertEqual(publish.call_count, 2)
+        finally:
+            temporary.cleanup()
+
+    def test_reused_backend_start_refresh_keeps_new_binary_attestation(self):
+        certificate = {
+            "image_id": "sha256:" + "2" * 64,
+            "development_build": self._development_delegation(),
+        }
+        final_hashes = {name: "a" * 64 for name in runtime.REQUIRED_BINARIES}
+        native = {
+            "head_commit_full": "b" * 40,
+            "source_snapshot_sha256": "c" * 64,
+        }
+        assembly = {
+            "commit": "b" * 40,
+            "source_digest": "d" * 64,
+            "source_snapshot_sha256": "c" * 64,
+            "native_source_identity": native,
+            "binary_hashes": final_hashes,
+            "build_receipt_sha256": "e" * 64,
+        }
+        refreshed = runtime._refresh_development_certificate(
+            certificate,
+            assembly,
+            {"source_mode": "live-shadow-v1"},
+        )
+        self.assertEqual(refreshed["binary_hashes"], final_hashes)
+        self.assertEqual(refreshed["source_commit"], "b" * 40)
+        self.assertEqual(
+            refreshed["development_build"]["source_identity"]["commit"],
+            "b" * 40,
+        )
+        self.assertEqual(
+            refreshed["development_build"]["source_identity"]["native_source_identity_sha256"],
+            hashlib.sha256(
+                (json.dumps(native, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n")
+                .encode("utf-8")
+            ).hexdigest(),
+        )
 
     @staticmethod
     def _fake_docker(state, image, running=()):
