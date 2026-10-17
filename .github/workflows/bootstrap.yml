@@ -491,6 +491,9 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Verify pinned Next development route discovery
+        run: python3 -B scripts/test_next_route_patch.py -v
+
       - name: Install architecture gate dependencies
         run: |
           sudo apt-get update
