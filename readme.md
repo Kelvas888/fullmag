@@ -111,6 +111,11 @@ and is not treated as scientific validation.
 
 ## Quick start
 
+The commands in this section install and smoke-test the authoring/runtime
+packages. For daily application development with source HMR and persistent
+Docker state, use the [Docker development workspace](#docker-development-workspace)
+below.
+
 Install the Python authoring layer:
 
 ```bash
@@ -141,6 +146,160 @@ just ensure-managed-fem-runtime
 
 Platform-specific setup is documented in the
 [installation guide](https://fullmag.mzelent.pl/getting-started/installation.html).
+
+## Docker development workspace
+
+Daily FullMag development uses the direct Docker Compose workspace. Run the
+launcher from native Windows PowerShell with Docker Desktop using Linux
+containers and NVIDIA support. WSL is suitable for reading and editing the
+checkout, but `scripts/setup_docker.py` and `scripts/docker_dev.py` reject WSL
+as the development start path.
+
+Git and a native Windows Python are required. Docker Desktop must use the
+Linux engine and Compose; NVIDIA support is required for GPU lanes. `just` is
+optional when invoking the native Python CLI directly, but is required by the
+`just` recipes and by the complete `setup_docker.py --check` preflight. The
+host Python only runs the managed launcher; backend code is compiled inside the
+Docker Compose backend service, so host Cargo and CMake are not development
+prerequisites.
+
+### Clone, select a checkout, and configure storage
+
+The resolver identifies the project from Git. Keep the main checkout and any
+worktrees under one project parent, and keep durable storage outside every
+checkout. Replace the placeholder values below with paths on the host:
+
+```powershell
+$projectRoot = "C:\path\to\fullmag-project"
+$main = "$projectRoot\fullmag"
+$worktree = "$projectRoot\worktrees\cofeb-dev"
+$storage = "C:\path\to\fullmag-storage"
+
+git clone https://github.com/MateuszZelent/fullmag $main
+Set-Location $main
+git worktree add $worktree -b codex/cofeb-dev master
+git worktree list --porcelain
+
+python -B scripts/setup_docker.py `
+  --repo-root $main `
+  --storage-root $storage `
+  --source-root $worktree `
+  --port 3197
+python -B scripts/setup_docker.py --repo-root $main --check
+```
+
+The setup wizard keeps the existing `.env` comments and secrets, writes the
+selected `FULLMAG_PROJECT_STORAGE_ROOT`, source checkout, and frontend port to
+the main checkout, and initializes only the validated storage marker. It does
+not build images, start containers, stop a running group, or remove data. The
+interactive prompts show the values supplied above; accept them only after
+checking the displayed paths.
+
+### Start and iterate
+
+Run the commands from the selected checkout. The first command prepares the
+pinned toolchain image; the second builds the complete backend in its Compose
+service and starts the `backend` and `frontend` services:
+
+```powershell
+Set-Location $worktree
+just docker-dev-toolchain
+just docker-dev "$worktree" 3197
+```
+
+The equivalent native Python commands are useful when `just` is unavailable:
+
+```powershell
+python -B "$main\scripts\bootstrap_docker_toolchain.py" --repo-root $main --direct-development
+# Start without a startup script:
+python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $worktree --port 3197
+# Or build only, without starting services:
+# python -B "$main\scripts\docker_dev.py" --repo-root $main build --source-root $worktree
+# Or start with a startup script:
+# python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $worktree --port 3197 --script "examples/fem_relax_gpu_smoke.py"
+```
+
+The `up` command builds the selected backend package in Docker and then starts
+the services; `build` performs the cached backend build without starting them.
+Open `http://127.0.0.1:3197/workspace` after startup. A startup script without
+`study.wait_for_solve(True)` is activated and executed automatically; a script
+with that call publishes an interactive workspace waiting for Compute.
+
+The selected checkout must be a Git-registered checkout of this project. Both
+services receive the same checkout as a read-only source bind. Frontend edits
+are picked up by Next.js HMR; `FULLMAG_WATCHPACK_POLLING_MS` defaults to `2000`
+milliseconds and can be set in the main checkout `.env` when Docker Desktop
+does not forward Windows file events reliably. Frontend dependencies, Next
+output, and watcher state stay in the group cache rather than being written to
+the checkout.
+
+Backend edits require a deliberate cached build:
+
+```powershell
+just docker-dev-build "$worktree"
+```
+
+This command does not restart the active services or simulation. Apply a new
+package only through a later controlled `docker_dev.py up` start after the
+selected group is safely stopped and has no active compute. The launcher rejects
+an active group or a port collision; it never silently restarts, takes over, or
+resets another group.
+
+An optional third `just docker-dev` argument selects a Python startup script
+inside the same checkout. The path is contained, hashed, and recorded in
+startup provenance:
+
+```powershell
+just docker-dev "$worktree" 3197 `
+  "examples/fem_relax_gpu_smoke.py"
+```
+
+The referenced example is tracked in this repository. The requested
+`examples/permalloy_layer_cofeb_rings_relax_300nm.py` is also tracked, but the
+current startup validation rejects this two-material rings example with
+`material_count_not_one`; it is not a current FEM GPU smoke proof. A script
+that sets `study.wait_for_solve(True)` (for example,
+`examples/fem_de_smoke_numeric.py`) publishes an interactive activation that
+waits for Compute and does not silently switch from GPU to CPU. A start without
+`--script` opens Home and does not select an arbitrary saved session.
+
+### Ports, isolation, and persistence
+
+The frontend binds one manually chosen loopback port, such as
+`127.0.0.1:3197`, to its container port `8080`; it never auto-selects a free
+port, so each active group needs a unique operator-selected port. The main
+checkout uses Compose project `fullmag-master`; a registered worktree uses
+`fullmag-worktree-<worktree_id>`. The backend publishes no host port; the
+frontend reaches it as `backend:8081` over the private bridge network for the
+selected Compose project. Project name, network, port, workspace settings, and
+user data are derived per registered checkout, so a worktree does not share a
+frontend port or `workspace.db` with the main checkout. The launcher persists sessions,
+results, logs, receipts, and build/cache state under the configured storage
+resolver; group user data includes `storage/user-data/<compose-project>/workspace.db`.
+
+Do not run a plain `docker compose up` for this workspace. The managed launcher
+attests the source bind, package and dependency identities, Windows storage,
+host ledger, owner record, startup response, and resolved Compose configuration
+before it starts the services. Keep the exact receipts and stop evidence when a
+start or build fails.
+
+### Development and release inputs
+
+The default `dev` profile uses Cargo `backend-dev`, `live-shadow-v1`, persistent
+incremental cache, and a live source bind for the running services. The backend
+build is isolated in a Linux ext4 shadow of the validated source manifest, so a
+checkout edit during compilation cannot mix versions; the next explicit build
+captures the next manifest. Release or frozen inputs use the separate `release`
+profile and immutable archive/snapshot path and do not provide the HMR workflow.
+
+The dependency declarations are repository-owned: CUDA, CMake, MFEM, hypre,
+libCEED, and the native toolchain are pinned in
+`docker/fem-gpu/Dockerfile`; Rust uses `rust-toolchain.toml`, the workspace
+Cargo manifests, and the repository-root `Cargo.lock`; Python uses
+`packages/fullmag-py/pyproject.toml`; and the Control Room uses
+`apps/control-room/package.json` plus the repository-root `pnpm-lock.yaml`.
+`just docker-dev-toolchain` consumes these declarations inside Docker. Do not
+install a second host toolchain or edit a runtime image by hand for daily dev.
 
 <details>
 <summary><strong>Show the FDM CPU relaxation example</strong></summary>
@@ -275,8 +434,8 @@ no longer matches the source files.
 | Core toolchain | Python `>=3.10`; Node `24.18.0`; Rust `stable` / edition `2021` | `pyproject.toml`, `.node-version`, `rust-toolchain.toml`, `Cargo.toml` | compatibility range or pinned channel/version |
 | Managed FEM/GPU bundle | CUDA `12.4.1`; CMake `3.30.5`; MFEM `4.10`; hypre `3.1.0`; libCEED `0.12.0` | `docker/fem-gpu/Dockerfile` | exact reproducible build pins |
 | Python scientific API | NumPy `>=1.24,<3`; Zarr `>=2.18,<4`; h5py `>=3.9,<4`; Gmsh `>=4.12,<5` | `packages/fullmag-py/pyproject.toml` | declared compatibility ranges |
-| Control Room direct stack | Next.js `16.3.8`; React `19.2.4`; TypeScript `npm:@typescript/typescript6@6.0.2`; Three.js `^0.186.1`; ECharts `^6.1.0` | `apps/control-room/package.json` | direct constraints; complete transitive resolution is pinned in `pnpm-lock.yaml` |
-| Rust/Python and desktop bridge | PyO3 `0.29`; Tauri `2.11.1` | `Cargo.toml` | workspace dependency constraints |
+| Control Room direct stack | Next.js `16.3.8`; React `19.2.4`; TypeScript `npm:@typescript/typescript6@6.0.2`; Three.js `^0.186.1`; ECharts `^6.1.0` | `apps/control-room/package.json`, repository-root `pnpm-lock.yaml` | direct constraints; complete transitive resolution is pinned in the repository-root lockfile |
+| Rust/Python and desktop bridge | PyO3 `0.29`; Tauri `2.11.1` | `Cargo.toml`, repository-root `Cargo.lock` | workspace dependency constraints and resolved dependencies |
 
 Regenerate after changing a version source:
 

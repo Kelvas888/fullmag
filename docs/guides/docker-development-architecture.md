@@ -3,8 +3,11 @@
 Uzgodnienie użytkownika: 16.10.2026. Status: kontrakt docelowy; bezpośredni
 build pełnego backendu jest potwierdzony; stabilny start i kwalifikacja runtime
 pozostają NOT VERIFIED.
-Ten dokument określa nowy tryb developerski. Wcześniejsza procedura budowania
-przez Fullmag_build_runner nie jest warunkiem tej ścieżki.
+Ten dokument określa jedyną ścieżkę codziennego developmentu: bezpośredni,
+dwukontenerowy Docker Compose. Fullmag_build_runner, natywny launcher Windows,
+hostowy Cargo/CMake i ręczne `docker compose up` pozostają poza tą ścieżką.
+GitHub CI/self-hosted oraz kwalifikacja naukowa mają własne, osobno
+udokumentowane zarządzane recepty; nie są domyślną ścieżką developmentu.
 
 ## Źródła i usługi
 
@@ -61,7 +64,7 @@ kompilacji backendu.
 ## Grupy checkoutów i izolacja
 
 Użytkownik zatwierdził osobne projekty Compose: `fullmag-master` dla głównego
-checkoutu na masterze oraz `fullmag-worktree-<nazwa>` dla wybranego worktree.
+checkoutu oraz `fullmag-worktree-<worktree_id>` dla wybranego worktree.
 Tożsamość wynika z rzeczywistego zarejestrowanego checkoutu; nazwy muszą być
 poprawne dla Compose i jednoznaczne także przy podobnych nazwach katalogów.
 Profil dev/release jest jawny w receipt i etykietach; równocześnie uruchomione
@@ -71,8 +74,9 @@ Każda grupa ma własne usługi frontend/backend, osobną sieć bridge i podsie�
 przydzielaną przez Docker IPAM, własny loopback port frontendu oraz osobny
 stan runtime. Nie używamy wspólnej sieci external ani stałej listy adresów IP.
 Backend pozostaje dostępny jako `backend:8081` wyłącznie w sieci swojej grupy.
-Kolizja jawnie wybranego portu kończy się czytelnym błędem; nie zatrzymuje
-innej grupy. Toolchain jest współdzielonym niezmiennym obrazem, a cache
+Kolizja ręcznie wybranego portu kończy się czytelnym błędem; launcher nie
+wyszukuje automatycznie wolnego portu i nie zatrzymuje innej grupy. Toolchain
+jest współdzielonym niezmiennym obrazem, a cache
 kompilacji pozostaje przypisany do checkoutu i profilu. Limit ciężkich buildów
 hosta nadal obowiązuje; równoległe działanie grup nie znosi tego limitu.
 
@@ -253,39 +257,76 @@ archiwum.
 
 ## Polecenia trybu developerskiego
 
-Polecenia wykonujemy z checkoutu Fullmaga w natywnym terminalu Windows,
+Polecenia wykonujemy z checkoutu Fullmaga w natywnym PowerShellu Windows,
 z uruchomionym Docker Desktop w trybie kontenerów Linux i dostępem do NVIDIA.
-Na nowym komputerze najpierw uruchamiamy konfigurator:
+WSL może czytać i edytować wybrany checkout, ale launcher odrzuca uruchomienie
+ścieżki developerskiej z WSL. Zastąp wartości w nawiasach rzeczywistymi
+ścieżkami Windows. Wymagane są Git i natywny Python; Docker Desktop musi używać
+silnika Linux i Compose, a NVIDIA jest wymagana dla lane GPU. `just` jest
+opcjonalny przy bezpośrednim użyciu natywnego CLI Pythona, ale recepty `just`
+i pełny preflight `setup_docker.py --check` go sprawdzają. Hostowy Python
+uruchamia tylko launcher, a kod backendu kompiluje się w usłudze Compose.
+Na nowym komputerze najpierw uruchamiamy kreator:
 
 ```powershell
-python scripts/setup_docker.py
+python -B scripts/setup_docker.py `
+  --repo-root <main-checkout> `
+  --storage-root <storage-outside-checkouts> `
+  --source-root <registered-main-or-worktree> `
+  --port 3197
+python -B scripts/setup_docker.py --repo-root <main-checkout> --check
 ```
 
-Konfigurator zapisuje lokalną konfigurację hosta, w tym wybrany przez operatora
-storage. Nie buduje ani nie uruchamia aplikacji. Następnie:
+Kreator zapisuje lokalną konfigurację hosta w `.env` głównego checkoutu, w tym
+wybrany przez operatora storage, checkout źródeł i port. Nie buduje, nie
+uruchamia, nie zatrzymuje i nie usuwa aplikacji. Następnie:
 
 ```powershell
 just docker-dev-toolchain
-just docker-dev
+just docker-dev "<registered-checkout-or-worktree>" 3197
 ```
 
-Pierwsza recepta przygotowuje zależności natywne. Druga przygotowuje obrazy
+Równoważna ścieżka bez `just` używa tego samego launchera Pythona:
+
+```powershell
+python -B "<main-checkout>\scripts\bootstrap_docker_toolchain.py" --repo-root "<main-checkout>" --direct-development
+# Start without a startup script:
+python -B "<main-checkout>\scripts\docker_dev.py" --repo-root "<main-checkout>" up --source-root "<registered-checkout-or-worktree>" --port 3197
+# Or build only, without starting services:
+# python -B "<main-checkout>\scripts\docker_dev.py" --repo-root "<main-checkout>" build --source-root "<registered-checkout-or-worktree>"
+# Or start with a startup script:
+# python -B "<main-checkout>\scripts\docker_dev.py" --repo-root "<main-checkout>" up --source-root "<registered-checkout-or-worktree>" --port 3197 --script "examples/fem_relax_gpu_smoke.py"
+```
+
+Pierwsza recepta przygotowuje przypięty obraz toolchaina w Dockerze. Druga przygotowuje obrazy
 pomocnicze, buduje backend w jego kontenerze i uruchamia obie usługi z frontendem
 na `http://127.0.0.1:3197/workspace`. Wynik kompilacji nie zastępuje potwierdzenia
 Home w przeglądarce. Przy istniejącej aktywnej instancji launcher odmawia
 samoczynnego zastąpienia jej i podaje polecenie zatrzymania konkretnego projektu.
+Nie wykonuje automatycznego restartu, przejęcia ani resetu; przed kolejnym
+startem musi istnieć bezpieczny, nieaktywny stan wybranej grupy.
 
 Wybór innego zarejestrowanego checkoutu/worktree, portu i skryptu:
 
 ```powershell
-just docker-dev "<absolutna-sciezka-checkoutu>" 3197 "examples/skrypt.py"
+just docker-dev "<absolutna-sciezka-checkoutu>" 3197 "examples/fem_relax_gpu_smoke.py"
 ```
 
-Samo jawne przebudowanie backendu, bez restartu działającej symulacji:
+Samo jawne przebudowanie backendu z zachowaniem cache, bez restartu działającej
+symulacji:
 
 ```powershell
 just docker-dev-build "<absolutna-sciezka-checkoutu>"
 ```
+
+Skrypt `examples/permalloy_layer_cofeb_rings_relax_300nm.py` jest śledzony w
+repozytorium, ale bieżąca walidacja startu odrzuca ten dwumateriałowy przykład
+rings kodem `material_count_not_one`; nie jest on aktualnym dowodem FEM GPU.
+
+Port jest wybierany ręcznie i musi być unikalny dla każdej aktywnej grupy;
+launcher nie wyszukuje automatycznie wolnego portu. Główny checkout używa
+projektu Compose `fullmag-master`, a zarejestrowany worktree projektu
+`fullmag-worktree-<worktree_id>`.
 
 Definicje usług runtime są jawnie w `compose.dev.yaml`.
 Developerski build bez TAR-u korzysta z `compose.backend-build-live.yaml`,
@@ -310,15 +351,17 @@ zastępuje tych bramek.
 ## Skrypt symulacji jako parametr startu
 
 Start przyjmuje opcjonalny parametr `--script`, wskazujący plik Python wewnątrz
-wybranego checkoutu. Ścieżka względna jest rozwiązywana względem
+wybranego checkoutu (w `just docker-dev` jest to trzeci argument po źródle i
+porcie). Ścieżka względna jest rozwiązywana względem
 `FULLMAG_SOURCE_ROOT`; ścieżka absolutna musi wskazywać plik w tym samym drzewie.
 Hostowa ścieżka Windows jest mapowana na zamontowane źródła kontenera.
 Ścieżka względna, zawartość i hash skryptu należą do provenance uruchomienia.
 
 Po starcie przeglądarka pokazuje Workspace z modelem tego skryptu jako aktywnym.
-Wykonanie zachowuje semantykę autora: zwykły skrypt uruchamia symulację,
-a interaktywny `wait_for_solve` przygotowuje model i siatkę oraz czeka na Compute.
-Sam serwer HTTP lub wczytany tekst skryptu nie dowodzi aktywacji modelu.
+W zwykłym skrypcie aktywacja automatycznie uruchamia wykonanie; interaktywny
+`wait_for_solve(True)` przygotowuje model i siatkę oraz publikuje Workspace
+czekający na Compute. Sam serwer HTTP lub wczytany tekst skryptu nie dowodzi
+aktywacji modelu.
 Start bez skryptu otwiera Home; nie wybiera sam przypadkowej sesji.
 
 Jawne odrzucenie walidacji skryptu przez API (`400`/`422` z typowanym kodem
@@ -357,8 +400,10 @@ może być równolegle modyfikowany przez nieskoordynowane buildy.
 
 Deklaracje wersji bibliotek natywnych pozostają w kanonicznym
 `docker/fem-gpu/Dockerfile`; obraz publikuje rzeczywiste wersje i commity w
-`/opt/fullmag-deps/share/fullmag/dependency-versions.json`. Frontend korzysta z
-przypiętych wersji narzędzi i lockfile. Nowy tryb nie tworzy drugiej,
+`/opt/fullmag-deps/share/fullmag/dependency-versions.json`. Rust używa
+`rust-toolchain.toml`, workspace `Cargo.toml` i repozytoryjnego `Cargo.lock`;
+frontend korzysta z `apps/control-room/package.json` i repozytoryjnego
+`./pnpm-lock.yaml`. Nowy tryb nie tworzy drugiej,
 niezależnej listy wersji.
 
 ## Przebudowa backendu a trwały rejestr GPU
@@ -491,7 +536,7 @@ Nie jest to jeszcze dowód czasu następnej kompilacji ani wykonania GPU.
 
 ## Warunki odbioru
 
-1. Bezpośredni start dwóch usług w projekcie przypisanym do checkoutu: `fullmag-master` albo czytelne `fullmag-worktree-<nazwa>`, bez zgłoszenia joba runnera. Tymczasowy build backendu należy do tego samego projektu Compose.
+1. Bezpośredni start dwóch usług w projekcie przypisanym do checkoutu: `fullmag-master` albo czytelne `fullmag-worktree-<worktree_id>`, bez zgłoszenia joba runnera. Tymczasowy build backendu należy do tego samego projektu Compose.
 2. Pełny backend zbudowany w swoim kontenerze, frontend uruchomiony w swoim.
 3. Home widoczny w przeglądarce oraz działające połączenie z API pod tym samym adresem.
 4. Zapis źródła Windows powoduje HMR; jawna kolejna przebudowa backendu używa cache.
