@@ -152,6 +152,11 @@ def serve():
         service._atomic_json(receipt_path, receipt, "process tree receipt")
         handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"],
                                configuration=configuration)
+        # Persist the authenticated owner before optional startup activation.
+        # Activation may reject or fail after service.start has pinned the
+        # native owner; the terminal drain receipt must retain that identity.
+        receipt["service_owner"] = handle.owner
+        service._atomic_json(receipt_path, receipt, "process tree receipt")
         last_full_api_probe = time.monotonic()
         startup_result = activate_startup_script()
         if startup_result is not None:

@@ -732,6 +732,58 @@ class DockerRuntimeContract(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_entrypoint_persists_owner_before_startup_activation_failure(self):
+        import copy
+        from types import SimpleNamespace
+
+        service_module = self.load_service()
+        entrypoint = self.load_entrypoint()
+        owner = {"owner_token": "known", "state": "ready"}
+        terminal = {"owner_token": "known", "state": "drained"}
+        handle = service_module.RuntimeHandle(
+            service_module.RuntimePaths(), {}, owner, 8081
+        )
+        paths = SimpleNamespace(
+            state_root=Path("/state/.fullmag"), store=Path("/state/runs/docker-all/session-store")
+        )
+        receipts = []
+        api = SimpleNamespace(
+            pid=123,
+            poll=lambda: None,
+            terminate=lambda: None,
+            wait=lambda timeout: 0,
+        )
+        service = SimpleNamespace(
+            RuntimeHandle=service_module.RuntimeHandle,
+            prepare_storage=lambda: paths,
+            initialize_accepted_store=lambda _paths: {"binding": "test"},
+            recover_idle_failure=lambda _paths: None,
+            ensure_configuration=lambda _paths: {},
+            process_environment=lambda _paths: {},
+            start=lambda _paths, **_kwargs: handle,
+            stop=lambda _handle, timeout: terminal,
+            _atomic_json=lambda _path, value, _label: receipts.append(copy.deepcopy(value)),
+        )
+
+        def fail_activation():
+            self.assertEqual(receipts[-1]["service_owner"], owner)
+            raise RuntimeError("startup activation failed")
+
+        event = SimpleNamespace(wait=lambda _seconds: True)
+        with patch.dict(sys.modules, {"runtime_service": service}), \
+                patch.object(entrypoint.threading, "Event", return_value=event), \
+                patch.object(entrypoint.signal, "signal"), \
+                patch.object(entrypoint.subprocess, "Popen", return_value=api), \
+                patch.object(entrypoint, "activate_startup_script", side_effect=fail_activation):
+            self.assertEqual(entrypoint.serve(), 1)
+
+        self.assertGreaterEqual(len(receipts), 4)
+        self.assertEqual(receipts[1]["service_owner"], owner)
+        self.assertEqual(receipts[-1]["state"], "drained")
+        self.assertEqual(receipts[-1]["service_owner"], owner)
+        self.assertEqual(receipts[-1]["terminal_service_owner"], terminal)
+        self.assertEqual(receipts[-1]["error"], "startup activation failed")
+
     def test_service_budget_is_cpu_only_and_fits_container(self):
         service = self.load_service()
         config = service.build_configuration(service.RuntimePaths(), {})
@@ -774,6 +826,64 @@ class DockerRuntimeContract(unittest.TestCase):
         }
         return {"schema_version": service.HOST_PROFILE_SCHEMA, "configuration": config,
                 "runtime_generation_sha256": "a" * 64}
+
+    def _write_authenticated_drain_fixture(self, service, paths, *, include_service_owner=True):
+        import copy
+
+        runtime_services = paths.store / "runtime-services"
+        runtime_services.mkdir(parents=True)
+        (paths.state_root / "runtime-service").mkdir(parents=True)
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "owner_token": "11111111-1111-4111-8111-111111111111",
+            "process_start_token": "22222222-2222-4222-8222-222222222222",
+            "pid": 1234,
+            "host": "fullmag-test-host",
+            "target_id": service.TARGET_ID,
+            "protocol": "stdin-v1",
+            "state": "ready",
+            "acquired_at": "2026-10-17T10:00:00Z",
+            "heartbeat_at": "2026-10-17T10:00:01Z",
+            "compute_pool_generation": 7,
+            "preparation_pool_generation": 8,
+            "control_address": "127.0.0.1:43123",
+            "build_commit": "a" * 40,
+            "build_snapshot": "b" * 64,
+            "compute_pool_id": service.COMPUTE_POOL_ID,
+            "preparation_pool_id": service.PREPARATION_POOL_ID,
+            "children": [
+                {"role": "compute", "pid": 17, "status": "running"},
+                {"role": "preparation", "pid": 18, "status": "running"},
+            ],
+        }
+        terminal = copy.deepcopy(owner)
+        terminal["state"] = "drained"
+        terminal["children"] = [
+            {**child, "status": "exited_success"} for child in owner["children"]
+        ]
+        receipt = {
+            "schema": "fullmag.docker-process-tree.v1",
+            "state": "drained",
+            "terminal_service_owner": terminal,
+        }
+        if include_service_owner:
+            receipt["service_owner"] = owner
+        service._atomic_json(
+            paths.state_root / "runtime-service/process-tree.json",
+            receipt,
+            "test process tree receipt",
+        )
+        service._atomic_json(
+            runtime_services / "OWNER.json", terminal, "test terminal owner"
+        )
+        service._atomic_json(
+            runtime_services / f"docker-client-{owner['owner_token']}.json",
+            owner,
+            "test owner pin",
+        )
+        lock_path = runtime_services / "OWNER.lock"
+        lock_path.write_bytes(b"runtime-service-owner-lock\n")
+        return owner, terminal, lock_path
 
     def _initialize_host_fixture(self, service, stored_host_id, ledger_document=None):
         from dataclasses import replace
@@ -1007,6 +1117,114 @@ class DockerRuntimeContract(unittest.TestCase):
             self.assertEqual(json.loads(paths.config.read_bytes()), expected)
             self.assertEqual((root / f"docker-all.previous-{old_sha}.json").read_bytes(), original)
             self.assertEqual(sentinel.read_bytes(), b"user session remains intact")
+
+    @unittest.skipIf(os.name == "nt", "Guest owner lock is qualified on Linux")
+    def test_ordinary_host_restart_rotates_generation_after_authenticated_drain(self):
+        import copy
+        import hashlib
+        from dataclasses import replace
+
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths = replace(
+                service.RuntimePaths(),
+                state=root,
+                storage=root,
+                runs=root / "runs" / service.WORKTREE_ID,
+                store=root / "runs" / service.WORKTREE_ID / "session-store",
+                state_root=root / ".fullmag",
+                config=root / "runtime.json",
+            )
+            old = self.host_profile_fixture(service)["configuration"]
+            expected = copy.deepcopy(old)
+            expected["host_execution"]["runtime_generation_sha256"] = "b" * 64
+            service._atomic_json(paths.config, old, "test config")
+            original = paths.config.read_bytes()
+            old_sha = hashlib.sha256(original).hexdigest()
+            self._write_authenticated_drain_fixture(
+                service, paths, include_service_owner=False
+            )
+            environment = {"FULLMAG_DOCKER_HOST_EXECUTION": "1"}
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                    service, "initialize_host_configuration", return_value=expected):
+                self.assertEqual(service.ensure_configuration(paths), expected)
+                self.assertEqual(service.ensure_configuration(paths), expected)
+            self.assertEqual(json.loads(paths.config.read_bytes()), expected)
+            self.assertEqual(
+                (root / f"docker-all.previous-{old_sha}.json").read_bytes(), original
+            )
+
+    @unittest.skipIf(os.name == "nt", "Guest owner lock is qualified on Linux")
+    def test_ordinary_host_restart_rejects_active_or_unknown_previous_owner(self):
+        import copy
+        from dataclasses import replace
+
+        service = self.load_service()
+        for scenario in ("active", "unknown"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                paths = replace(
+                    service.RuntimePaths(),
+                    state=root,
+                    storage=root,
+                    runs=root / "runs" / service.WORKTREE_ID,
+                    store=root / "runs" / service.WORKTREE_ID / "session-store",
+                    state_root=root / ".fullmag",
+                    config=root / "runtime.json",
+                )
+                old = self.host_profile_fixture(service)["configuration"]
+                expected = copy.deepcopy(old)
+                expected["host_execution"]["runtime_generation_sha256"] = "b" * 64
+                service._atomic_json(paths.config, old, "test config")
+                original = paths.config.read_bytes()
+                _, terminal, lock_path = self._write_authenticated_drain_fixture(
+                    service, paths
+                )
+                if scenario == "unknown":
+                    terminal["state"] = "unknown"
+                    service._atomic_json(
+                        paths.store / "runtime-services/OWNER.json",
+                        terminal,
+                        "test unknown owner",
+                    )
+                environment = {"FULLMAG_DOCKER_HOST_EXECUTION": "1"}
+                holder = None
+                try:
+                    if scenario == "active":
+                        holder = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-c",
+                                (
+                                    "import fcntl, sys; "
+                                    "stream = open(sys.argv[1], 'r+b'); "
+                                    "fcntl.flock(stream.fileno(), fcntl.LOCK_EX); "
+                                    "print('locked', flush=True); sys.stdin.read()"
+                                ),
+                                str(lock_path),
+                            ],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            text=True,
+                        )
+                        self.assertEqual(holder.stdout.readline().strip(), "locked")
+                    with patch.dict(os.environ, environment, clear=True), patch.object(
+                            service, "initialize_host_configuration", return_value=expected):
+                        with self.assertRaisesRegex(
+                                service.RuntimeServiceError,
+                                "still active" if scenario == "active" else "not drained"):
+                            service.ensure_configuration(paths)
+                finally:
+                    if holder is not None:
+                        holder.stdin.close()
+                        try:
+                            holder.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            holder.terminate()
+                            holder.wait(timeout=3)
+                        holder.stdout.close()
+                self.assertEqual(paths.config.read_bytes(), original)
 
     @unittest.skipIf(os.name == "nt", "Guest publication fsync is qualified on Linux")
     def test_recreate_rejects_missing_wrong_hash_or_operator_profile_changes(self):

@@ -6,6 +6,7 @@ container paths, API binding, canonical CLI calls, and canonical lifecycle CLI c
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import dataclasses
 import http.client
 import hashlib
@@ -819,8 +820,20 @@ def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
         return expected
     if current != expected:
         if previous_sha256 is None:
-            _fail("stable runtime service configuration differs from the operator profile")
-        _rotate_configuration_generation(paths, current, expected, previous_sha256)
+            if host_mode != "1":
+                _fail("stable runtime service configuration differs from the operator profile")
+            # A normal Docker restart has no host-side config digest.  Derive
+            # it from the exact current bytes only after the previous native
+            # owner has published an authenticated, successful drain.  The
+            # lock and all owner/pin/receipt checks remain inside this fence.
+            with _authenticated_terminal_drain(paths) as assert_owner_lock:
+                previous_sha256 = hashlib.sha256(
+                    _bounded_regular(paths.config, "runtime configuration before automatic rotation")
+                ).hexdigest()
+                assert_owner_lock()
+                _rotate_configuration_generation(paths, current, expected, previous_sha256)
+        else:
+            _rotate_configuration_generation(paths, current, expected, previous_sha256)
         return expected
     return current
 
@@ -1384,6 +1397,24 @@ def wait_for_api(
 
 
 def _owner_fingerprint(owner: Mapping[str, Any]) -> str:
+    identity = _owner_identity(owner)
+    children = owner.get("children")
+    if not isinstance(children, list):
+        _fail("canonical runtime service output omitted children")
+    compact: list[list[Any]] = []
+    for child in children:
+        if not isinstance(child, dict):
+            _fail("canonical runtime service output has an invalid child")
+        compact.append([child.get("role"), child.get("pid"), child.get("status")])
+    compact.sort(key=lambda item: (str(item[0]), str(item[1])))
+    return json.dumps(
+        {"identity": identity, "children": compact},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _owner_identity(owner: Mapping[str, Any]) -> dict[str, Any]:
     fields = (
         "owner_token",
         "process_start_token",
@@ -1398,20 +1429,185 @@ def _owner_fingerprint(owner: Mapping[str, Any]) -> str:
         "compute_pool_generation",
         "preparation_pool_generation",
     )
+    return {field: owner.get(field) for field in fields}
+
+
+def _owner_child_identity(owner: Mapping[str, Any]) -> list[tuple[Any, Any]]:
     children = owner.get("children")
     if not isinstance(children, list):
         _fail("canonical runtime service output omitted children")
-    compact: list[list[Any]] = []
+    identity: list[tuple[Any, Any]] = []
     for child in children:
         if not isinstance(child, dict):
             _fail("canonical runtime service output has an invalid child")
-        compact.append([child.get("role"), child.get("pid"), child.get("status")])
-    compact.sort(key=lambda item: (str(item[0]), str(item[1])))
-    return json.dumps(
-        {"identity": {field: owner.get(field) for field in fields}, "children": compact},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+        identity.append((child.get("role"), child.get("pid")))
+    return sorted(identity, key=lambda item: (str(item[0]), str(item[1])))
+
+
+def _terminal_owner_children(owner: Mapping[str, Any], *, state: str, name: str) -> None:
+    """Require the two native scheduler children for one terminal proof."""
+
+    children = owner.get("children")
+    if not isinstance(children, list) or len(children) != 2:
+        _fail(f"{name} has no exact compute and preparation child proof")
+    by_role: dict[str, Mapping[str, Any]] = {}
+    pids: set[int] = set()
+    for child in children:
+        if not isinstance(child, dict):
+            _fail(f"{name} has an invalid scheduler child")
+        role = child.get("role")
+        pid = child.get("pid")
+        if role in by_role or role not in {"compute", "preparation"}:
+            _fail(f"{name} has an unexpected scheduler child set")
+        if type(pid) is not int or pid <= 0 or pid in pids:
+            _fail(f"{name} has an invalid scheduler child pid")
+        by_role[role] = child
+        pids.add(pid)
+    if set(by_role) != {"compute", "preparation"}:
+        _fail(f"{name} has an unexpected scheduler child set")
+    expected_status = "running" if state == "ready" else "exited_success"
+    if any(child.get("status") != expected_status for child in by_role.values()):
+        _fail(f"{name} child status is not {expected_status}")
+
+
+def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str) -> None:
+    if owner.get("schema_version") != "runtime_service_owner.v1":
+        _fail(f"{name} schema is unsupported")
+    if owner.get("state") != state:
+        _fail(f"{name} is not {state}")
+    if owner.get("protocol") != "stdin-v1" or owner.get("target_id") != TARGET_ID:
+        _fail(f"{name} is bound to a different runtime service")
+    token = owner.get("owner_token")
+    start_token = owner.get("process_start_token")
+    if (not isinstance(token, str) or UUID_RE.fullmatch(token) is None
+            or not isinstance(start_token, str) or UUID_RE.fullmatch(start_token) is None):
+        _fail(f"{name} has invalid owner identity")
+    if type(owner.get("pid")) is not int or owner["pid"] <= 0:
+        _fail(f"{name} has an invalid owner pid")
+    if not isinstance(owner.get("host"), str) or not owner["host"]:
+        _fail(f"{name} has no host identity")
+    for field in ("acquired_at", "heartbeat_at"):
+        if not isinstance(owner.get(field), str) or not owner[field]:
+            _fail(f"{name} has no {field} timestamp")
+    for field, pattern in (("build_commit", HEX40), ("build_snapshot", HEX64)):
+        value = owner.get(field)
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            _fail(f"{name} has invalid {field}")
+    for field in ("compute_pool_generation", "preparation_pool_generation"):
+        if type(owner.get(field)) is not int or owner[field] <= 0:
+            _fail(f"{name} has invalid {field}")
+    compute_pool = owner.get("compute_pool_id")
+    preparation_pool = owner.get("preparation_pool_id")
+    if (not isinstance(compute_pool, str) or not compute_pool
+            or not isinstance(preparation_pool, str) or not preparation_pool
+            or compute_pool == preparation_pool):
+        _fail(f"{name} has invalid scheduler pool identity")
+    if not isinstance(owner.get("control_address"), str) or not owner["control_address"]:
+        _fail(f"{name} has no control address")
+    _terminal_owner_children(owner, state=state, name=name)
+    _owner_fingerprint(owner)
+
+
+def _read_authenticated_terminal_drain(paths: RuntimePaths) -> dict[str, Any]:
+    """Validate the previous entrypoint's authenticated terminal drain proof."""
+
+    receipt_path = paths.state_root / "runtime-service/process-tree.json"
+    receipt = _read_json(receipt_path, "previous runtime service process receipt")
+    if (receipt.get("schema") != "fullmag.docker-process-tree.v1"
+            or receipt.get("state") != "drained"):
+        _fail("runtime configuration rotation requires an authenticated drained process receipt")
+    service_owner_present = "service_owner" in receipt
+    service_owner = receipt.get("service_owner")
+    terminal_owner = receipt.get("terminal_service_owner")
+    if not isinstance(terminal_owner, dict) or (
+        service_owner_present and not isinstance(service_owner, dict)
+    ):
+        _fail("drained process receipt has no complete owner transition")
+    _validate_terminal_owner(terminal_owner, state="drained", name="terminal service owner")
+    if service_owner_present:
+        _validate_terminal_owner(service_owner, state="ready", name="previous service owner")
+
+    owner_path = paths.store / "runtime-services" / "OWNER.json"
+    owner = _read_json(owner_path, "terminal runtime service owner")
+    _validate_terminal_owner(owner, state="drained", name="persisted terminal owner")
+    if (_owner_identity(owner) != _owner_identity(terminal_owner)
+            or _owner_child_identity(owner) != _owner_child_identity(terminal_owner)):
+        _fail("persisted terminal owner differs from the authenticated drain receipt")
+
+    if service_owner_present:
+        pin_path = _owner_pin_path(paths, service_owner)
+    else:
+        # Older failure receipts omitted service_owner when activation failed
+        # after service.start().  The durable ready pin is the only compatible
+        # source, and it must still match the terminal owner exactly.
+        pin_path = _owner_pin_path(paths, terminal_owner)
+    pin = _read_json(pin_path, "previous pinned runtime service owner")
+    _validate_terminal_owner(pin, state="ready", name="previous pinned service owner")
+    if service_owner_present:
+        if _owner_fingerprint(pin) != _owner_fingerprint(service_owner):
+            _fail("previous pinned service owner differs from the authenticated drain receipt")
+    elif (_owner_identity(pin) != _owner_identity(terminal_owner)
+          or _owner_child_identity(pin) != _owner_child_identity(terminal_owner)):
+        _fail("previous pinned service owner differs from the authenticated drain receipt")
+    service_owner = pin if not service_owner_present else service_owner
+    if (_owner_identity(service_owner) != _owner_identity(terminal_owner)
+            or _owner_child_identity(service_owner) != _owner_child_identity(terminal_owner)):
+        _fail("previous pinned service owner differs from the authenticated drain receipt")
+    return {"receipt": receipt, "owner": owner, "pin": pin}
+
+
+def _assert_owner_lock_identity(
+    lock_path: Path, descriptor: int, expected_identity: tuple[int, int]
+) -> None:
+    descriptor_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(descriptor_stat.st_mode):
+        _fail("runtime service owner lock is not a regular file")
+    try:
+        path_stat = os.stat(lock_path, follow_symlinks=False)
+    except OSError as error:
+        _fail(f"runtime service owner lock changed during rotation: {error}")
+    if (not stat.S_ISREG(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino) != expected_identity
+            or (descriptor_stat.st_dev, descriptor_stat.st_ino) != expected_identity):
+        _fail("runtime service owner lock changed during rotation")
+
+
+@contextmanager
+def _authenticated_terminal_drain(paths: RuntimePaths):
+    """Hold the native owner lock while validating and rotating generations."""
+
+    lock_path = paths.store / "runtime-services" / "OWNER.lock"
+    _assert_no_links(lock_path, "runtime service owner lock")
+    try:
+        import fcntl
+    except ImportError as error:
+        _fail(f"runtime service owner lock cannot be probed on this platform: {error}")
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        _fail("runtime service owner lock is missing; controlled recovery required")
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            _fail("runtime service owner lock is not a regular file")
+        expected_identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+        _assert_owner_lock_identity(lock_path, descriptor, expected_identity)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _fail("runtime service owner is still active; configuration rotation refused")
+        except OSError as error:
+            if getattr(error, "errno", None) in {11, 13}:
+                _fail("runtime service owner is still active; configuration rotation refused")
+            raise
+        try:
+            _read_authenticated_terminal_drain(paths)
+            _assert_owner_lock_identity(lock_path, descriptor, expected_identity)
+            yield lambda: _assert_owner_lock_identity(lock_path, descriptor, expected_identity)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _is_transient_supervision_observation(error: BaseException) -> bool:
