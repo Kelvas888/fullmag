@@ -738,6 +738,9 @@ jobs:
       - name: Run FEM tested/runtime library identity contracts
         run: python scripts/test_fem_modal_library_identity.py -v
 
+      - name: Run managed runtime startup identity contracts
+        run: python -B scripts/test_validate_managed_fem_runtime_bundle.py
+
       - name: Run managed runtime artifact root contracts
         run: python scripts/test_managed_runtime_artifact_root.py -v
 
