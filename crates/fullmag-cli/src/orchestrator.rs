@@ -9257,7 +9257,6 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     crate::python_bridge::bind_script_execution_profiles(
                         &mut config,
                         &phase1_execution_layers,
-                        phase1_runtime_device,
                     )?;
                     Ok(config)
                 })

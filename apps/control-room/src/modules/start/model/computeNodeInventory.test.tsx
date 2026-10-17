@@ -115,6 +115,29 @@ describe("compute-node snapshot inventory", () => {
     expect(html).toContain("Current sample");
   });
 
+  it("shows why observed CPU capacity is unavailable", () => {
+    const parsed = parseComputeNodeSnapshot("desktop-host", {
+      ...snapshot,
+      cpu: {
+        ...snapshot.cpu,
+        effective_capacity_millis: { status: "unavailable", reason: "unsupported" },
+      },
+    });
+    expect(parsed?.cpu.effectiveCapacityReason).toBe("unsupported");
+
+    const summary: ComputeNodeInventorySummary = {
+      hasSnapshot: true,
+      nodeCount: 1,
+      nodes: [{ nodeId: "desktop-host", state: "current", snapshot: parsed, nodePolicy: null }],
+      refreshFailed: false,
+      resourceStatus: "ready",
+      staleAfterSeconds: 30,
+      state: "current",
+    };
+    const html = renderToStaticMarkup(<ComputeNodeInventoryDetails summary={summary} />);
+    expect(html).toContain("Unavailable · unsupported on this host");
+  });
+
   it.each([
     ["browser clock behind the server", "2026-10-13T12:05:00Z"],
     ["browser clock ahead of the server", "2026-10-13T11:55:00Z"],

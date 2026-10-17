@@ -482,6 +482,21 @@ fn sample_compute_node_inner(
         ),
     };
 
+    let cpu_quota_enforcement = {
+        #[cfg(target_os = "linux")]
+        {
+            if crate::worker_cgroup::probe_delegated_cpu_quota().is_ok() {
+                EnforcementStatus::Supported
+            } else {
+                EnforcementStatus::Unavailable
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            EnforcementStatus::Advisory
+        }
+    };
+
     let topology = reported_probe(
         cpu_topology_probe,
         previous.and_then(|snapshot| snapshot.cpu.topology.known_value().cloned()),
@@ -531,7 +546,7 @@ fn sample_compute_node_inner(
             .with_boot_monotonic_ns(boot_monotonic_ns),
         enforcement: EnforcementSnapshot {
             cpu_affinity: EnforcementStatus::Unavailable,
-            cpu_quota: EnforcementStatus::Advisory,
+            cpu_quota: cpu_quota_enforcement,
             memory_cap: EnforcementStatus::Advisory,
             // Native readiness is the only accepted proof for v2 GPU
             // visibility; v1 keeps the historical explicit-unavailable state.

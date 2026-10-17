@@ -5,6 +5,7 @@ import { useRef, useState } from "react";
 import type { ExecutionProfile, PublishExecutionProfileRequest } from "@/kernel/api/apiTypes";
 import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 import { useExecutionProfilesResource } from "@/kernel/resources/useExecutionProfilesResource";
+import type { ComputeProbeController } from "../model/types";
 import { Button } from "@/shared/ui/Button";
 import { Input } from "@/shared/ui/Input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
@@ -26,11 +27,23 @@ type Defaults = ExecutionProfile["defaults"];
 type PublicationRequest = Omit<PublishExecutionProfileRequest, "profile"> & { profile: ExecutionProfile };
 const GIB_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 
-export function ExecutionProfilesSettings({ executionAvailability }: {
+export function ExecutionProfilesSettings({
+  canPublishExecutionProfiles = false,
+  onPublishExecutionProfile,
+  executionAvailability,
+}: {
+  readonly canPublishExecutionProfiles?: boolean;
+  readonly onPublishExecutionProfile?: ComputeProbeController["publishExecutionProfile"];
   readonly executionAvailability?: ExecutionAvailability;
 }) {
   const resource = useExecutionProfilesResource();
-  return <ProfileEditor executionAvailability={executionAvailability} key={resource.scope} resource={resource} />;
+  return <ProfileEditor
+    executionAvailability={executionAvailability}
+    key={resource.scope}
+    resource={resource}
+    canPublish={canPublishExecutionProfiles && onPublishExecutionProfile !== undefined}
+    onPublish={onPublishExecutionProfile}
+  />;
 }
 
 export function newExecutionProfileDraft(
@@ -53,12 +66,11 @@ export function newExecutionProfileDraft(
   return nextDraft;
 }
 
-function ProfileEditor({
-  executionAvailability,
-  resource,
-}: {
+function ProfileEditor({ executionAvailability, resource, canPublish, onPublish }: {
   readonly executionAvailability?: ExecutionAvailability;
   readonly resource: Profiles;
+  readonly canPublish: boolean;
+  readonly onPublish?: ComputeProbeController["publishExecutionProfile"];
 }) {
   const [draft, setDraft] = useState<ExecutionProfileDraft | null>(null);
   const [pending, setPending] = useState<PublicationRequest | null>(null);
@@ -89,13 +101,17 @@ function ProfileEditor({
     return false;
   };
   const publish = async (request: PublicationRequest) => {
+    if (!canPublish || !onPublish) {
+      report("Publishing profiles is available only in the local Fullmag desktop app.", true);
+      return;
+    }
     if (inflight.current) return;
     inflight.current = true;
     setBusy(true);
     setPending(request);
     report("Publishing profile…");
     try {
-      const result = await resource.publish(request);
+      const result = await onPublish(request);
       if (!sameProfile(result.entry.profile, request.profile)) throw new Error("The publication response does not match the draft.");
       finish(result.entry.profile);
     } catch (error) {
@@ -167,7 +183,7 @@ function ProfileEditor({
       {resource.data ? <p className="fm-start-compute-settings__intro">{resource.data.entries.length} saved versions · catalogue revision {resource.data.revision}</p> : null}
       {!draft ? <>
         <div className="fm-start-profiles__actions">
-          <Button disabled={!ready} onClick={() => begin()} size="sm">Create profile</Button>
+          <Button disabled={!ready || !canPublish} onClick={() => begin()} size="sm">Create profile</Button>
         </div>
         {resource.data?.entries.length ? <ul className="fm-start-profiles__list">
           {[...resource.data.entries].reverse().map((entry) => <li key={entry.client_intent_id}>
@@ -178,7 +194,7 @@ function ProfileEditor({
             <div className="fm-start-profiles__list-actions">
               <Button
                 aria-label={`Duplicate ${entry.profile.profile_id} ${entry.profile.version}`}
-                disabled={!ready}
+                disabled={!ready || !canPublish}
                 onClick={() => beginDuplicate(entry.profile)}
                 size="sm"
                 variant="secondary"
@@ -187,7 +203,7 @@ function ProfileEditor({
               </Button>
               <Button
                 aria-label={`New version of ${entry.profile.profile_id} ${entry.profile.version}`}
-                disabled={!ready}
+                disabled={!ready || !canPublish}
                 onClick={() => begin(entry.profile)}
                 size="sm"
                 variant="secondary"
@@ -198,21 +214,21 @@ function ProfileEditor({
           </li>)}
         </ul> : ready ? <p className="fm-start-compute-settings__intro">No profiles yet. Create a version to save your preferred solver settings.</p> : null}
       </> : <form onSubmit={(event) => { event.preventDefault(); apply(); }}>
-        <fieldset className="fm-start-profiles__fields" disabled={locked}>
+        <fieldset className="fm-start-profiles__fields" disabled={locked || !canPublish}>
           <label>Profile ID<Input value={draft.profile.profile_id} onChange={(event) => update({ profile_id: event.target.value })} placeholder="exec:interactive" /></label>
           <label>Version<Input value={draft.profile.version} onChange={(event) => update({ version: event.target.value })} placeholder="2" /></label>
           <label className="fm-start-profiles__wide">Description<Input value={draft.profile.description} onChange={(event) => update({ description: event.target.value })} /></label>
-          <ProfileChoice label="Backend" value={draft.profile.defaults.backend} options={["auto", "fdm", "fem", "hybrid"]} onChange={(value) => updateDefault("backend", value)} disabled={locked} />
+          <ProfileChoice label="Backend" value={draft.profile.defaults.backend} options={["auto", "fdm", "fem", "hybrid"]} onChange={(value) => updateDefault("backend", value)} disabled={locked || !canPublish} />
           <ProfileChoice
-            disabled={locked}
+            disabled={locked || !canPublish}
             disabledOptions={deviceAvailability?.gpu.enabled ? undefined : { gpu: deviceAvailability?.gpu.reason ?? "GPU availability is not confirmed." }}
             label="Device"
             onChange={(value) => updateDefault("device", value)}
             options={["auto", "cpu", "gpu"]}
             value={draft.profile.defaults.device}
           />
-          <ProfileChoice label="Precision" value={draft.profile.defaults.precision} options={["single", "double"]} onChange={(value) => updateDefault("precision", value)} disabled={locked} />
-          <ProfileChoice label="Execution mode" value={draft.profile.defaults.mode} options={["strict", "extended", "hybrid"]} onChange={(value) => updateDefault("mode", value)} disabled={locked} />
+          <ProfileChoice label="Precision" value={draft.profile.defaults.precision} options={["single", "double"]} onChange={(value) => updateDefault("precision", value)} disabled={locked || !canPublish} />
+          <ProfileChoice label="Execution mode" value={draft.profile.defaults.mode} options={["strict", "extended", "hybrid"]} onChange={(value) => updateDefault("mode", value)} disabled={locked || !canPublish} />
           <label>CPU threads per task<Input value={draft.threads} onChange={(event) => setDraft({ ...draft, threads: event.target.value })} placeholder="Inherit · auto · 8" /></label>
           <label>RAM per task (GiB)<Input type="number" min="0" step="any" value={draft.ramGiB} onChange={(event) => setDraft({ ...draft, ramGiB: event.target.value })} placeholder={hasExplicitReset(draft.profile.defaults.resources?.ram) ? "Reset retained" : "Inherit"} /></label>
           <label>Scratch per task (GiB)<Input type="number" min="0" step="any" value={draft.scratchGiB} onChange={(event) => setDraft({ ...draft, scratchGiB: event.target.value })} placeholder={hasExplicitReset(draft.profile.defaults.resources?.scratch) ? "Reset retained" : "Inherit"} /></label>
@@ -229,13 +245,14 @@ function ProfileEditor({
         <div className="fm-start-profiles__actions">
           {pending ? <>
             <Button disabled={busy} onClick={() => void checkPublication()} type="button" size="sm">Check publication</Button>
-            <Button disabled={busy} onClick={() => void publish(pending)} type="button" size="sm" variant="secondary">Retry same publication</Button>
+            <Button disabled={busy || !canPublish} onClick={() => void publish(pending)} type="button" size="sm" variant="secondary">Retry same publication</Button>
           </> : <>
-            <Button disabled={!ready || busy || refreshRequired} type="submit" size="sm">Apply profile</Button>
+            <Button disabled={!ready || busy || refreshRequired || !canPublish} type="submit" size="sm">Apply profile</Button>
             <Button disabled={busy} onClick={() => { setDraft(null); report(""); }} type="button" size="sm" variant="secondary">Cancel</Button>
           </>}
         </div>
       </form>}
+      {!canPublish ? <p className="fm-start-compute-settings__notice">Publishing profiles is available only in the local Fullmag desktop app.</p> : null}
       {message ? <p className={failed ? "fm-start-compute-settings__error" : "fm-start-compute-settings__notice"} role={failed ? "alert" : "status"}>{message}</p> : null}
     </section>
   );

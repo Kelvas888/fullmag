@@ -399,6 +399,8 @@ export function StartScreen({ kernel }: ModuleProps) {
               nodeInventory={computeProbe.nodeInventory}
               canEditNodePolicy={computeProbe.canEditNodePolicy}
               onUpdateNodePolicy={computeProbe.updateNodePolicy}
+              canPublishExecutionProfiles={computeProbe.canPublishExecutionProfiles}
+              onPublishExecutionProfile={computeProbe.publishExecutionProfile}
               computeError={computeProbe.error}
               refreshing={computeProbe.refreshing}
               stale={computeProbe.stale}

@@ -34,6 +34,7 @@ pub mod execution_profiles;
 pub mod fms;
 pub mod frequency_domain_artifact_generation;
 pub mod host_resource_ledger;
+mod host_ledger_registry;
 pub mod materialized_dataset;
 pub mod mesh_operation;
 pub mod reachability;

@@ -16,6 +16,8 @@ pub mod host_runtime;
 pub mod local_resources;
 pub mod process_environment;
 pub mod runtime_service_client;
+#[cfg(target_os = "linux")]
+pub mod worker_cgroup;
 use fullmag_application::{
     CoordinatorMessage, CoordinatorTransition, WorkerEvent, COORDINATOR_TRANSITION_SCHEMA,
 };

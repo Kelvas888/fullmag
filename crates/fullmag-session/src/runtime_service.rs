@@ -1369,7 +1369,11 @@ impl RuntimeServiceConfig {
     /// ledger initialization so no launcher can publish a launch record in
     /// between. A ledger failure leaves the exact application configuration
     /// pinned for a safe retry.
-    pub fn initialize_host_application(store: &SessionStore, candidate: &Self) -> Result<Self> {
+    pub fn initialize_host_application(
+        store: &SessionStore,
+        candidate: &Self,
+        application_state_root: &Path,
+    ) -> Result<Self> {
         candidate.validate()?;
         if candidate.schema_version != RUNTIME_SERVICE_CONFIG_SCHEMA_V2
             || candidate.host_execution.is_none()
@@ -1401,7 +1405,8 @@ impl RuntimeServiceConfig {
             .host_execution
             .as_ref()
             .context("persisted host application has no host execution binding")?;
-        crate::host_resource_ledger::HostResourceLedger::initialize(
+        crate::host_resource_ledger::HostResourceLedger::initialize_for_application(
+            application_state_root,
             &host_execution.ledger_root,
             host_execution.policy.clone(),
         )?;
@@ -3393,6 +3398,23 @@ mod application_configuration_tests {
         config
     }
 
+    fn application_state_root(store: &SessionStore) -> PathBuf {
+        let root = store.root().join("test-application-state");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn initialize_host_application(
+        store: &SessionStore,
+        candidate: &RuntimeServiceConfig,
+    ) -> Result<RuntimeServiceConfig> {
+        RuntimeServiceConfig::initialize_host_application(
+            store,
+            candidate,
+            &application_state_root(store),
+        )
+    }
+
     fn gpu_v2_config(store: &SessionStore) -> RuntimeServiceConfig {
         let mut config = config(store);
         config.compute_resources[0].kind = FmsResourceKind::Gpu;
@@ -3737,7 +3759,7 @@ mod application_configuration_tests {
             .clone();
         assert!(!ledger_root.exists());
 
-        let first = RuntimeServiceConfig::initialize_host_application(&store, &candidate).unwrap();
+        let first = initialize_host_application(&store, &candidate).unwrap();
         let application_path = store.root().join("runtime-services/APPLICATION.json");
         let application_bytes = std::fs::read(&application_path).unwrap();
         let marker_path = ledger_root.join("HOST_RESOURCE_LEDGER.init.json");
@@ -3745,14 +3767,14 @@ mod application_configuration_tests {
         let marker_bytes = std::fs::read(&marker_path).unwrap();
         let document_bytes = std::fs::read(&document_path).unwrap();
         assert_eq!(first, candidate);
-        assert!(HostResourceLedger::open(
+        assert!(HostResourceLedger::open_for_application(
+            &application_state_root(&store),
             &ledger_root,
             candidate.host_execution.as_ref().unwrap().policy.clone(),
         )
         .is_ok());
 
-        let repeated =
-            RuntimeServiceConfig::initialize_host_application(&store, &candidate).unwrap();
+        let repeated = initialize_host_application(&store, &candidate).unwrap();
         assert_eq!(repeated, candidate);
         assert_eq!(std::fs::read(application_path).unwrap(), application_bytes);
         assert_eq!(std::fs::read(marker_path).unwrap(), marker_bytes);
@@ -3779,16 +3801,16 @@ mod application_configuration_tests {
 
         let mut changed = candidate.clone();
         changed.host_execution.as_mut().unwrap().policy.revision += 1;
-        assert!(RuntimeServiceConfig::initialize_host_application(&store, &changed).is_err());
+        assert!(initialize_host_application(&store, &changed).is_err());
         assert!(!ledger_root.exists());
         assert_eq!(std::fs::read(&application_path).unwrap(), application_bytes);
 
-        RuntimeServiceConfig::initialize_host_application(&store, &candidate).unwrap();
+        initialize_host_application(&store, &candidate).unwrap();
         let marker_path = ledger_root.join("HOST_RESOURCE_LEDGER.init.json");
         let document_path = ledger_root.join("HOST_RESOURCE_LEDGER.json");
         let marker_bytes = std::fs::read(&marker_path).unwrap();
         let document_bytes = std::fs::read(&document_path).unwrap();
-        assert!(RuntimeServiceConfig::initialize_host_application(&store, &changed).is_err());
+        assert!(initialize_host_application(&store, &changed).is_err());
         assert_eq!(std::fs::read(marker_path).unwrap(), marker_bytes);
         assert_eq!(std::fs::read(document_path).unwrap(), document_bytes);
     }
@@ -3798,7 +3820,7 @@ mod application_configuration_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::open(directory.path()).unwrap();
         let legacy = config(&store);
-        assert!(RuntimeServiceConfig::initialize_host_application(&store, &legacy).is_err());
+        assert!(initialize_host_application(&store, &legacy).is_err());
         assert!(!store
             .root()
             .join("runtime-services/APPLICATION.json")
@@ -3809,7 +3831,7 @@ mod application_configuration_tests {
         let application_path = store.root().join("runtime-services/APPLICATION.json");
         let application_bytes = std::fs::read(&application_path).unwrap();
         let candidate = v2_config(&store);
-        assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+        assert!(initialize_host_application(&store, &candidate).is_err());
         assert_eq!(std::fs::read(application_path).unwrap(), application_bytes);
         assert!(!candidate
             .host_execution
@@ -3834,7 +3856,7 @@ mod application_configuration_tests {
         let marker_path = ledger_root.join("HOST_RESOURCE_LEDGER.init.json");
         std::fs::write(&marker_path, b"existing partial marker").unwrap();
 
-        assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+        assert!(initialize_host_application(&store, &candidate).is_err());
         let application_path = store.root().join("runtime-services/APPLICATION.json");
         assert_eq!(
             RuntimeServiceConfig::read(&application_path).unwrap(),
@@ -3845,7 +3867,7 @@ mod application_configuration_tests {
             b"existing partial marker"
         );
         assert!(!ledger_root.join("HOST_RESOURCE_LEDGER.json").exists());
-        assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+        assert!(initialize_host_application(&store, &candidate).is_err());
         assert_eq!(
             std::fs::read(&marker_path).unwrap(),
             b"existing partial marker"
@@ -3866,7 +3888,7 @@ mod application_configuration_tests {
             let record_path = create_parent(store.root(), record).unwrap();
             std::fs::write(&record_path, b"preserve owner evidence").unwrap();
 
-            assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+            assert!(initialize_host_application(&store, &candidate).is_err());
             assert_eq!(
                 std::fs::read(record_path).unwrap(),
                 b"preserve owner evidence"
@@ -3892,7 +3914,7 @@ mod application_configuration_tests {
         let fence = store
             .acquire_development_idle_fence("owner-init", "nonce-init")
             .unwrap();
-        assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+        assert!(initialize_host_application(&store, &candidate).is_err());
         assert_eq!(store.read_development_idle_fence().unwrap(), Some(fence));
         assert!(!store
             .root()

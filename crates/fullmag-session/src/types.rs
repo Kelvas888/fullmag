@@ -423,7 +423,8 @@ pub const FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_SCHEMA: &str = "batch_output_storage
 pub const FMS_BATCH_EXPANSION_MANIFEST_SCHEMA: &str = "batch_expansion_manifest.v2";
 pub const FMS_BATCH_EXPANSION_PROGRESS_LEGACY_SCHEMA: &str = "batch_expansion_progress.v1";
 pub const FMS_BATCH_EXPANSION_PROGRESS_SCHEMA: &str = "batch_expansion_progress.v2";
-pub const FMS_BATCH_COMMAND_SCHEMA: &str = "batch_command.v1";
+pub const FMS_BATCH_COMMAND_LEGACY_SCHEMA: &str = "batch_command.v1";
+pub const FMS_BATCH_COMMAND_SCHEMA: &str = "batch_command.v2";
 const FMS_BATCH_EXPANSION_MAX_CASES: usize = 10_000;
 pub(crate) const FMS_BATCH_COMMAND_HISTORY_MAX: usize = 128;
 
@@ -813,6 +814,7 @@ pub enum FmsBatchCommandAction {
     PauseAdmission,
     ResumeAdmission,
     CancelAdmission,
+    Retry,
 }
 
 impl FmsBatchCommandAction {
@@ -821,7 +823,34 @@ impl FmsBatchCommandAction {
             Self::PauseAdmission => "pause_admission",
             Self::ResumeAdmission => "resume_admission",
             Self::CancelAdmission => "cancel_admission",
+            Self::Retry => "retry",
         }
+    }
+}
+
+/// Immutable target for a case-scoped retry command. The run ID is pinned in
+/// addition to the case ID so a replay cannot be redirected by a changed or
+/// malformed expansion manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FmsBatchRetryTarget {
+    pub case_id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub retry_id: String,
+    pub expected_catalog_revision: u64,
+}
+
+impl FmsBatchRetryTarget {
+    fn validate(&self) -> Result<()> {
+        crate::repository_path::validate_store_id(&self.case_id)?;
+        crate::repository_path::validate_store_id(&self.run_id)?;
+        crate::repository_path::validate_store_id(&self.task_id)?;
+        crate::repository_path::validate_store_id(&self.retry_id)?;
+        if self.expected_catalog_revision == 0 {
+            bail!("batch retry target requires a positive task catalog revision");
+        }
+        Ok(())
     }
 }
 
@@ -836,6 +865,9 @@ pub struct FmsBatchCommandIntent {
     pub revision: u64,
     pub action: FmsBatchCommandAction,
     pub reason: String,
+    /// Present only for the v2 case retry action. Missing on v1 records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_target: Option<FmsBatchRetryTarget>,
     pub created_at: DateTime<Utc>,
     pub payload_sha256: String,
 }
@@ -848,18 +880,58 @@ impl FmsBatchCommandIntent {
         action: FmsBatchCommandAction,
         reason: impl Into<String>,
     ) -> Self {
+        Self::new_with_retry_target(
+            batch_id,
+            command_id,
+            expected_revision,
+            action,
+            reason,
+            None,
+        )
+    }
+
+    pub fn new_retry(
+        batch_id: impl Into<String>,
+        command_id: impl Into<String>,
+        expected_revision: u64,
+        target: FmsBatchRetryTarget,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new_with_retry_target(
+            batch_id,
+            command_id,
+            expected_revision,
+            FmsBatchCommandAction::Retry,
+            reason,
+            Some(target),
+        )
+    }
+
+    fn new_with_retry_target(
+        batch_id: impl Into<String>,
+        command_id: impl Into<String>,
+        expected_revision: u64,
+        action: FmsBatchCommandAction,
+        reason: impl Into<String>,
+        retry_target: Option<FmsBatchRetryTarget>,
+    ) -> Self {
         let batch_id = batch_id.into();
         let command_id = command_id.into();
         let reason = reason.into();
         let revision = expected_revision.saturating_add(1);
-        let payload_sha256 = canonical_json_sha256(&serde_json::json!({
+        let mut payload = serde_json::json!({
             "batch_id": batch_id,
             "command_id": command_id,
             "expected_revision": expected_revision,
             "revision": revision,
             "action": action.as_str(),
             "reason": reason,
-        }));
+        });
+        if let Some(target) = retry_target.as_ref() {
+            payload["retry_target"] = serde_json::to_value(target)
+                .expect("batch retry target is serializable");
+        }
+        let payload_sha256 = canonical_json_sha256(&payload);
         Self {
             schema_version: FMS_BATCH_COMMAND_SCHEMA.into(),
             batch_id,
@@ -868,13 +940,16 @@ impl FmsBatchCommandIntent {
             revision,
             action,
             reason,
+            retry_target,
             created_at: Utc::now(),
             payload_sha256,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != FMS_BATCH_COMMAND_SCHEMA {
+        if self.schema_version != FMS_BATCH_COMMAND_SCHEMA
+            && self.schema_version != FMS_BATCH_COMMAND_LEGACY_SCHEMA
+        {
             bail!("unsupported batch command schema `{}`", self.schema_version);
         }
         crate::repository_path::validate_store_id(&self.batch_id)?;
@@ -890,15 +965,40 @@ impl FmsBatchCommandIntent {
         if self.reason.trim().is_empty() || self.reason.len() > 1024 {
             bail!("batch command reason must be nonempty and at most 1024 bytes");
         }
+        match (
+            self.schema_version.as_str(),
+            self.action,
+            self.retry_target.as_ref(),
+        ) {
+            (FMS_BATCH_COMMAND_LEGACY_SCHEMA, FmsBatchCommandAction::Retry, _)
+            | (FMS_BATCH_COMMAND_LEGACY_SCHEMA, _, Some(_))
+            | (FMS_BATCH_COMMAND_SCHEMA, FmsBatchCommandAction::Retry, None) => {
+                bail!("batch command retry target does not match its schema and action");
+            }
+            (FMS_BATCH_COMMAND_SCHEMA, _, Some(_))
+                if self.action != FmsBatchCommandAction::Retry =>
+            {
+                bail!("batch command retry target does not match its schema and action");
+            }
+            (FMS_BATCH_COMMAND_SCHEMA, FmsBatchCommandAction::Retry, Some(target)) => {
+                target.validate()?;
+            }
+            (FMS_BATCH_COMMAND_LEGACY_SCHEMA | FMS_BATCH_COMMAND_SCHEMA, _, None) => {}
+            _ => bail!("batch command retry target is invalid for its action"),
+        }
         validate_sha256(&self.payload_sha256, "payload_sha256")?;
-        let expected = canonical_json_sha256(&serde_json::json!({
+        let mut payload = serde_json::json!({
             "batch_id": self.batch_id,
             "command_id": self.command_id,
             "expected_revision": self.expected_revision,
             "revision": self.revision,
             "action": self.action.as_str(),
             "reason": self.reason,
-        }));
+        });
+        if let Some(target) = self.retry_target.as_ref() {
+            payload["retry_target"] = serde_json::to_value(target)?;
+        }
+        let expected = canonical_json_sha256(&payload);
         if self.payload_sha256 != expected {
             bail!("batch command payload digest does not match its contents");
         }
@@ -1006,14 +1106,19 @@ impl FmsBatchExpansionProgress {
         let valid_stopped_state = self.state == FmsBatchExpansionState::Stopped
             && self.next_case_index > 0
             && self.next_case_index < self.total_cases;
-        let latest_action = self.commands.last().map(|command| command.action);
+        let latest_admission_action = self
+            .commands
+            .iter()
+            .rev()
+            .map(|command| command.action)
+            .find(|action| *action != FmsBatchCommandAction::Retry);
         let valid_command_state = match self.state {
             FmsBatchExpansionState::Paused => {
                 self.next_case_index < self.total_cases
-                    && latest_action == Some(FmsBatchCommandAction::PauseAdmission)
+                    && latest_admission_action == Some(FmsBatchCommandAction::PauseAdmission)
             }
             FmsBatchExpansionState::Cancelled => {
-                latest_action == Some(FmsBatchCommandAction::CancelAdmission)
+                latest_admission_action == Some(FmsBatchCommandAction::CancelAdmission)
             }
             _ => false,
         };
@@ -1055,6 +1160,81 @@ impl FmsBatchExpansionProgress {
             bail!("batch expansion progress differs from its immutable intent");
         }
         Ok(())
+    }
+
+    /// Apply one command to a candidate progress snapshot without writing it.
+    /// The session store uses this both to preflight a compound retry request
+    /// and to commit the exact same command under the writer lease.
+    pub fn with_command(
+        &self,
+        command: &FmsBatchCommandIntent,
+    ) -> Result<(Self, BatchCommandCommitDisposition)> {
+        self.validate()?;
+        command.validate()?;
+        if command.batch_id != self.batch_id {
+            bail!("batch command targets a different progress record");
+        }
+        if let Some(existing) = self
+            .commands
+            .iter()
+            .find(|existing| existing.command_id == command.command_id)
+        {
+            if existing.payload_sha256 == command.payload_sha256 {
+                return Ok((self.clone(), BatchCommandCommitDisposition::Replayed));
+            }
+            return Err(BatchCommandConflict::Identity.into());
+        }
+        let actual_revision = u64::try_from(self.commands.len())?;
+        if command.expected_revision != actual_revision || command.revision != actual_revision + 1 {
+            return Err(BatchCommandConflict::Revision {
+                expected: command.expected_revision,
+                actual: actual_revision,
+            }
+            .into());
+        }
+        if self.commands.len() >= FMS_BATCH_COMMAND_HISTORY_MAX {
+            bail!("batch command history is full");
+        }
+        let next_state = match (self.state, command.action) {
+            (
+                FmsBatchExpansionState::Pending | FmsBatchExpansionState::Expanding,
+                FmsBatchCommandAction::PauseAdmission,
+            ) if self.next_case_index < self.total_cases => FmsBatchExpansionState::Paused,
+            (FmsBatchExpansionState::Paused, FmsBatchCommandAction::ResumeAdmission) => {
+                if self.next_case_index == 0 {
+                    FmsBatchExpansionState::Pending
+                } else if self.next_case_index == self.total_cases {
+                    FmsBatchExpansionState::Complete
+                } else {
+                    FmsBatchExpansionState::Expanding
+                }
+            }
+            (
+                FmsBatchExpansionState::Pending
+                | FmsBatchExpansionState::Expanding
+                | FmsBatchExpansionState::Paused,
+                FmsBatchCommandAction::CancelAdmission,
+            ) => FmsBatchExpansionState::Cancelled,
+            (state, FmsBatchCommandAction::Retry) if command.retry_target.is_some() => state,
+            (state, action) => {
+                return Err(BatchCommandConflict::InvalidTransition {
+                    action: action.as_str(),
+                    state,
+                }
+                .into())
+            }
+        };
+        let mut next = self.clone();
+        next.commands.push(command.clone());
+        next.sequence = self
+            .sequence
+            .checked_add(1)
+            .context("batch expansion sequence overflow")?;
+        next.schema_version = FMS_BATCH_EXPANSION_PROGRESS_SCHEMA.into();
+        next.state = next_state;
+        next.updated_at = Utc::now();
+        next.validate()?;
+        Ok((next, BatchCommandCommitDisposition::Accepted))
     }
 }
 
@@ -3613,6 +3793,198 @@ impl FmsTaskAdmissionRecord {
         }
         Ok(())
     }
+}
+
+/// Durable dispatch identity for one externally scheduled solver attempt.
+///
+/// The record is written before a provider is contacted. Its initial
+/// `submission_unknown` state is intentionally conservative: after a process
+/// restart the coordinator must look up this idempotency key before it can
+/// submit again. A retry is a new Fullmag attempt and never reuses this record.
+pub const FMS_PROVIDER_JOB_SUBMISSION_SCHEMA: &str = "provider_job_submission.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FmsProviderJobStatus {
+    SubmissionUnknown,
+    Rejected,
+    Submitted,
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl FmsProviderJobStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Rejected | Self::Succeeded | Self::Failed | Self::Cancelled
+        )
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        use FmsProviderJobStatus::*;
+        match self {
+            SubmissionUnknown => matches!(
+                next,
+                Rejected | Submitted | Queued | Running | Succeeded | Failed | Cancelled
+            ),
+            Submitted => matches!(next, Queued | Running | Succeeded | Failed | Cancelled),
+            Queued => matches!(next, Running | Succeeded | Failed | Cancelled),
+            Running => matches!(next, Succeeded | Failed | Cancelled),
+            Rejected | Succeeded | Failed | Cancelled => false,
+        }
+    }
+}
+
+/// Durable binding between one Fullmag attempt and one external provider job.
+///
+/// Provider credentials and arbitrary command text are deliberately absent.
+/// The request digest binds the immutable submission payload; the idempotency
+/// key is stable for the attempt/provider/target tuple and is safe to use for
+/// lookup after an ACK timeout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FmsProviderJobSubmission {
+    pub schema_version: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub ownership_epoch: u64,
+    pub provider_id: String,
+    pub target_id: String,
+    pub scheduler_id: String,
+    pub resource_id: String,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub status: FmsProviderJobStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_job_id: Option<String>,
+    pub revision: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl FmsProviderJobSubmission {
+    pub fn expected_idempotency_key(&self) -> String {
+        let identity = serde_json::json!({
+            "run_id": &self.run_id,
+            "task_id": &self.task_id,
+            "attempt_id": &self.attempt_id,
+            "ownership_epoch": self.ownership_epoch,
+            "provider_id": &self.provider_id,
+            "target_id": &self.target_id,
+            "scheduler_id": &self.scheduler_id,
+            "resource_id": &self.resource_id,
+        });
+        format!("fullmag-{}", canonical_json_sha256(&identity))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != FMS_PROVIDER_JOB_SUBMISSION_SCHEMA {
+            bail!(
+                "unsupported provider job submission schema `{}`",
+                self.schema_version
+            );
+        }
+        for (value, field) in [
+            (self.run_id.as_str(), "run_id"),
+            (self.task_id.as_str(), "task_id"),
+            (self.attempt_id.as_str(), "attempt_id"),
+            (self.provider_id.as_str(), "provider_id"),
+            (self.target_id.as_str(), "target_id"),
+            (self.scheduler_id.as_str(), "scheduler_id"),
+            (self.resource_id.as_str(), "resource_id"),
+        ] {
+            crate::repository_path::validate_store_id(value)
+                .with_context(|| format!("invalid provider job submission {field}"))?;
+        }
+        if self.ownership_epoch == 0 || self.revision == 0 {
+            bail!("provider job submission epoch and revision must be positive");
+        }
+        validate_prefixed_sha256(&self.request_digest, "provider job request_digest")?;
+        if self.idempotency_key != self.expected_idempotency_key() {
+            bail!("provider job submission idempotency key does not match its attempt");
+        }
+        if self.updated_at < self.created_at {
+            bail!("provider job submission updated_at precedes created_at");
+        }
+        match (self.status, self.provider_job_id.as_deref()) {
+            (FmsProviderJobStatus::SubmissionUnknown, None) => {}
+            (FmsProviderJobStatus::SubmissionUnknown, Some(_)) => {
+                bail!("unknown provider submission must not claim a provider job id")
+            }
+            (FmsProviderJobStatus::Rejected, None) => {}
+            (FmsProviderJobStatus::Rejected, Some(_)) => {
+                bail!("rejected provider submission must not claim a provider job id")
+            }
+            (_, Some(provider_job_id))
+                if !provider_job_id.trim().is_empty()
+                    && provider_job_id.len() <= 1024
+                    && !provider_job_id.chars().any(char::is_control) => {}
+            (_, _) => bail!("known provider job status requires a valid provider_job_id"),
+        }
+        Ok(())
+    }
+
+    pub fn matches_dispatch_identity(&self, other: &Self) -> bool {
+        self.run_id == other.run_id
+            && self.task_id == other.task_id
+            && self.attempt_id == other.attempt_id
+            && self.ownership_epoch == other.ownership_epoch
+            && self.schema_version == other.schema_version
+            && self.provider_id == other.provider_id
+            && self.target_id == other.target_id
+            && self.scheduler_id == other.scheduler_id
+            && self.resource_id == other.resource_id
+            && self.idempotency_key == other.idempotency_key
+            && self.request_digest == other.request_digest
+    }
+
+    pub fn validate_transition_from(&self, previous: &Self) -> Result<()> {
+        self.validate()?;
+        previous.validate()?;
+        if !self.matches_dispatch_identity(previous) {
+            bail!("provider job update changed its immutable dispatch identity");
+        }
+        if self.created_at != previous.created_at {
+            bail!("provider job update changed its creation timestamp");
+        }
+        let expected_revision = previous
+            .revision
+            .checked_add(1)
+            .context("provider job submission revision exhausted")?;
+        if self.revision != expected_revision {
+            bail!("provider job submission revision is stale or skipped");
+        }
+        if !previous.status.can_transition_to(self.status) {
+            bail!(
+                "provider job status cannot transition from {:?} to {:?}",
+                previous.status,
+                self.status
+            );
+        }
+        if previous
+            .provider_job_id
+            .as_ref()
+            .is_some_and(|provider_job_id| self.provider_job_id.as_ref() != Some(provider_job_id))
+        {
+            bail!("provider job update changed the provider job id");
+        }
+        if self.updated_at < previous.updated_at {
+            bail!("provider job submission update timestamp moved backwards");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderJobSubmissionDisposition {
+    Prepared,
+    Updated,
+    Replayed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -285,7 +285,10 @@ mod tests {
     ) {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::open(directory.path().join("store")).unwrap();
-        let ledger = HostResourceLedger::initialize(
+        let application_state_root = directory.path().join("application-state");
+        std::fs::create_dir(&application_state_root).unwrap();
+        let ledger = HostResourceLedger::initialize_for_application(
+            &application_state_root,
             directory.path().join("host"),
             HostResourceLedgerPolicy {
                 schema_version: HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V1.into(),

@@ -145,6 +145,26 @@ z dowolnego host_resource_id ani tworzony automatycznie per SessionStore.
 Polityka ma stable host ID, topology digest, policy revision i owner epoch.
 Te wartości wymagają właściciela inventory/config; ledger ich nie wykrywa
 i nie nadaje wykrytym ofertom statusu physical-host qualification.
+Owner-bound CPU admission wymaga świeżego `cpu.effective_capacity_millis`;
+brak pomiaru, `Unavailable` lub `stale` nie otwiera nowej rezerwacji. Limit
+operatora pozostaje górną granicą, ale nie zastępuje odczytu aktywnych
+ograniczeń OS/cgroup. Dotyczy to także CPU przygotowania; istniejące rezerwacje
+nie są zwalniane przez sam brak lub spadek próbki.
+
+Lokalna aplikacja utrwala też mapowanie `host_id` → dokładny kanoniczny root
+ledgera w rejestrze pod wspólnym `FULLMAG_STATE_ROOT`, chronionym istniejącym
+native Writer i publikowanym atomowo. Pierwsza jawna inicjalizacja operatora
+przypina root; każde późniejsze otwarcie tylko weryfikuje mapowanie i nie
+tworzy brakującego wpisu. Drugi root dla tego samego hosta oraz brak lub
+uszkodzenie rejestru zatrzymują admission przed utworzeniem drugiego ledgera.
+Zmiana wymaga uzgodnienia operatora; automatyczne łączenie, przenoszenie ani
+migracja istniejących ledgerów nie zachodzą.
+
+Na Windows przynależność procesu do Job Object bez potwierdzonego pełnego
+łańcucha limitów daje pojemność `Unavailable`. Odczyt bezpośredniego joba w
+zagnieżdżonej hierarchii nie dowodzi limitu parent; nowe owner-bound CPU
+admission pozostaje zamknięte. Implementacja nie wyprowadza limitu przodka z
+samej konfiguracji CPU child joba.
 
 CPU/RAM/scratch są liczone raz dla hosta. GPU są wyłączne po pełnym UUID,
 a VRAM jest oceniany osobno dla każdej karty. Opcjonalne jawne CPU IDs

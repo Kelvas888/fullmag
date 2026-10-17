@@ -3,7 +3,7 @@ name: eigensolve-method-contracts
 on:
   workflow_dispatch:
   push:
-    branches: ['codex/**']
+    branches: [master, main]
     paths:
       - 'crates/fullmag-runner/**'
       - 'docs/physics/0600-fem-eigenmodes-linearized-llg*'
@@ -16,6 +16,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   source-contracts:

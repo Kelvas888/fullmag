@@ -1149,6 +1149,9 @@ export const PROJECT_SAVED_FIELD_SUPPORT_PATH = openApiV2Path(
 export const PROJECT_RUN_TASK_CANCELLATION_PATH = openApiV2Path(
   "/v2/persistence/projects/{project_id}/runs/{run_id}/tasks/{task_id}/cancellation",
 );
+export const PROJECT_RUN_TASK_RETRY_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/tasks/{task_id}/retry",
+);
 
 export const PERSISTENCE_RECOVERY_PATH = openApiV2Path(
   "/v2/sessions/current/persistence/recovery",

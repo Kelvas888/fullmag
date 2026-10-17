@@ -119,7 +119,8 @@ try {
         assert.equal(await componentEditor.locator("option:checked").textContent(), "Transverse (equilibrium projection)");
       }
       const component = transverse ? "H transverse (x, y, z)" : scenario === "ready-vector" ? "H vector (x, y, z)" : "H_x";
-      assert.equal(await page.getByRole("heading", { name: `Source FFT power · ${component}`, exact: true }).count(), 1);
+      assert.equal(await page.getByRole("heading", { name: `Source FFT · |H̃|² · ${component}`, exact: true }).count(), 1);
+      assert.ok(text.includes("squared field magnitude, not watts"), "The field spectrum must not be presented as electrical power");
       assert.ok(text.includes(`${scenario === "ready-unitary" ? "Unitary discrete" : "Integral SI"} normalization`), "Chart must name the verified normalization");
       assert.ok((await page.getByRole("group", { name: "Selected source spectrum sample", exact: true }).innerText()).includes(component), "Selected sample lost component identity");
       assert.ok(text.includes(transverse ? "|H\u22a5_x|² + |H\u22a5_y|² + |H\u22a5_z|²" : scenario === "ready-vector" ? "|H_x|² + |H_y|² + |H_z|²" : "|H_x|²"), "Power expression must match the manifest components");
@@ -127,10 +128,34 @@ try {
       assert.ok((await page.getByRole("gridcell").first().getAttribute("aria-label"))?.includes(unit), "Scientific cell tooltip lost power SI unit");
       assert.ok((await page.getByRole("group", { name: "Source spectrum color scale" }).innerText()).includes(unit), "Color scale lost its physical power unit");
       const actionGroup = page.getByRole("group", { name: "Source spectrum actions", exact: true });
-      assert.equal(await actionGroup.getByRole("button").count(), 2);
+      assert.equal(await actionGroup.getByRole("button").count(), 5);
       const exportBox = await actionGroup.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).boundingBox();
       const peakBox = await actionGroup.getByRole("button", { name: "Inspect peak", exact: true }).boundingBox();
-      assert.ok(exportBox && peakBox && Math.abs(exportBox.y - peakBox.y) < 2, "Wide Inspector actions should share one wrapping toolbar");
+      assert.ok(exportBox && peakBox, "Export and peak inspection must remain available in the shared toolbar");
+      const grid = page.getByRole("grid");
+      const gridCellCount = await grid.getByRole("gridcell").count();
+      await actionGroup.getByRole("button", { name: "Zoom in", exact: true }).click();
+      assert.ok((await grid.getAttribute("style"))?.includes("scale(2)"), "Zoom in must enlarge the source map");
+      assert.equal(await grid.getByRole("gridcell").count(), gridCellCount, "Zoom must not add cells or expand the data payload");
+      await actionGroup.getByRole("button", { name: "Zoom out", exact: true }).click();
+      assert.equal(await grid.evaluate(element => element.style.transform), "", "Zoom out must return to the unscaled map");
+      await actionGroup.getByRole("button", { name: "Zoom in", exact: true }).click();
+      await actionGroup.getByRole("button", { name: "Reset zoom", exact: true }).click();
+      assert.equal(await grid.evaluate(element => element.style.transform), "", "Reset zoom must restore the full map");
+      const cutCharts = page.locator("svg.fm-antenna-spectrum__cut-chart");
+      assert.equal(await cutCharts.count(), 2, "The selected k point must produce u and v cut lines");
+      for (const chart of await cutCharts.all()) {
+        const label = await chart.getAttribute("aria-label");
+        assert.ok(label?.includes("x-axis k_") && label.includes("rad/m"), "Each cut must name its physical wave-vector axis and unit");
+        assert.ok(label.includes("y-axis squared field magnitude") && label.includes("linear scale"), "Each cut must identify squared-field magnitude and its scale");
+        assert.ok(await chart.locator("path.fm-antenna-spectrum__cut-line").getAttribute("d"), "Each cut must render its sampled line");
+      }
+      if (scenario === "ready") {
+        await page.getByRole("radio", { name: "Log", exact: true }).click();
+        assert.ok((await page.getByRole("group", { name: "Source spectrum color scale" }).innerText()).includes("Logarithmic squared-field scale"));
+        assert.ok((await cutCharts.first().getAttribute("aria-label"))?.includes("log scale"), "Cut axes must follow the selected log scale");
+        await page.getByRole("radio", { name: "Linear", exact: true }).click();
+      }
       const exportReads = await page.evaluate(() => window.__spectrumDecodeReads);
       const downloadEvent = page.waitForEvent("download");
       await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
@@ -262,11 +287,16 @@ try {
       assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, before.calls.length);
       checks.push({ name: "Three unrelated production Inspector renders reuse decoded spectrum data without binary reads or resource requests", passed: true, decodeReads });
       const grid = page.getByRole("grid");
+      const cutMarkers = page.locator(".fm-antenna-spectrum__cut-selected");
+      assert.equal(await cutMarkers.count(), 2, "Each cut must mark the selected k-grid sample");
+      const markerPositionsBefore = await cutMarkers.evaluateAll((markers) => markers.map((marker) => [marker.getAttribute("cx"), marker.getAttribute("cy")]));
       await page.evaluate(() => { window.__spectrumKeyboardGrid = document.querySelector('[role="grid"]'); });
       const mouseCell = grid.getByRole("gridcell").nth(1);
       await mouseCell.click();
       assert.equal(await mouseCell.getAttribute("aria-selected"), "true");
       assert.equal(await mouseCell.evaluate(cell => getComputedStyle(cell).outlineWidth), "2px");
+      const markerPositionsAfter = await cutMarkers.evaluateAll((markers) => markers.map((marker) => [marker.getAttribute("cx"), marker.getAttribute("cy")]));
+      assert.notDeepEqual(markerPositionsAfter, markerPositionsBefore, "Moving the selected cursor must update both cut markers");
       assert.ok((await page.getByRole("group", { name: "Selected source spectrum sample" }).innerText()).includes("4.000e+0"));
       await grid.getByRole("gridcell").first().focus();
       const focusedIndex = () => page.evaluate(() => document.activeElement?.getAttribute("data-spectrum-cell-index"));
@@ -279,7 +309,7 @@ try {
       await page.keyboard.press("Control+End");
       assert.equal(await focusedIndex(), "3", "Ctrl+End must reach the last sample");
       assert.equal(await grid.locator('[role="gridcell"][tabindex="0"]').count(), 1, "The grid must have one tab stop");
-      assert.ok((await page.getByRole("group", { name: "Selected source spectrum sample" }).innerText()).includes("Power"));
+      assert.ok((await page.getByRole("group", { name: "Selected source spectrum sample" }).innerText()).includes("|H̃|²"));
       assert.equal(await page.evaluate(() => document.querySelector('[role="grid"]') === window.__spectrumKeyboardGrid), true);
       const afterKeyboard = await page.evaluate(() => window.__antennaSpectrumFixture.read());
       assert.equal(afterKeyboard.calls.length, before.calls.length, "Keyboard inspection must not refetch payloads");

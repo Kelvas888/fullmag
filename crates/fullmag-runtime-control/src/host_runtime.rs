@@ -91,7 +91,14 @@ mod recovery_tests {
             gpu_vram_bytes_by_uuid: BTreeMap::new(),
         };
         let ledger_root = directory.path().join("host");
-        let ledger = HostResourceLedger::initialize(&ledger_root, policy.clone()).unwrap();
+        let application_state_root = directory.path().join("application-state");
+        std::fs::create_dir(&application_state_root).unwrap();
+        let ledger = HostResourceLedger::initialize_for_application(
+            &application_state_root,
+            &ledger_root,
+            policy.clone(),
+        )
+        .unwrap();
         let inventory_owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
         if include_sample {
             let sample = crate::compute_node_probe::sample_compute_node_for_owner(
@@ -172,7 +179,9 @@ mod recovery_tests {
             scheduling_priority: 0,
             parallelism: fullmag_ir::compute_resources::ComputeParallelismIR::SingleProcess,
         };
-        let context = HostRuntimeAdmission::open(&config).unwrap().unwrap();
+        let context = HostRuntimeAdmission::open_for_application(&config, &application_state_root)
+            .unwrap()
+            .unwrap();
 
         RecoveryFixture {
             _directory: directory,
@@ -190,6 +199,7 @@ mod recovery_tests {
     fn host_admission_retries_when_ledger_writer_is_temporarily_busy() {
         let fixture = recovery_fixture();
         let config = fixture.config.clone();
+        let application_state_root = fixture._directory.path().join("application-state");
         let binding = config.host_execution.as_ref().unwrap();
         let ledger_root = binding.ledger_root.clone();
         let policy = binding.policy.clone();
@@ -212,7 +222,7 @@ mod recovery_tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
 
-        let busy = match HostResourceLedger::open(&ledger_root, policy.clone()) {
+        let busy = match HostResourceLedger::open_for_application(&application_state_root, &ledger_root, policy.clone()) {
             Ok(_) => false,
             Err(error) => error
                 .chain()
@@ -228,7 +238,7 @@ mod recovery_tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
             release_sender.send(()).unwrap();
         });
-        let opened = HostRuntimeAdmission::open(&config);
+        let opened = HostRuntimeAdmission::open_for_application(&config, &application_state_root);
         releaser.join().unwrap();
         holder.join().unwrap();
         assert!(opened
@@ -243,7 +253,7 @@ mod recovery_tests {
             .policy
             .topology_sha256 = "b".repeat(64);
         let started = std::time::Instant::now();
-        let error = match HostRuntimeAdmission::open(&corrupt) {
+        let error = match HostRuntimeAdmission::open_for_application(&corrupt, &application_state_root) {
             Ok(_) => panic!("corrupt host policy unexpectedly opened"),
             Err(error) => error,
         };
@@ -258,6 +268,7 @@ mod recovery_tests {
     fn missing_compute_node_sample_defers_host_admission() {
         let fixture = recovery_fixture_without_sample();
         assert!(!fixture.context.has_current_compute_snapshot().unwrap());
+        assert!(fixture.context.current_compute_node_snapshot().unwrap().is_none());
         assert_eq!(
             fixture.context.compute_snapshot_admission_failure().unwrap(),
             Some("compute-node snapshot is missing".into())
@@ -268,8 +279,10 @@ mod recovery_tests {
     fn current_snapshot_requires_the_active_shared_host_inventory_owner() {
         let fixture = recovery_fixture();
         assert!(fixture.context.has_current_compute_snapshot().unwrap());
+        assert!(fixture.context.current_compute_node_snapshot().unwrap().is_some());
         drop(fixture.inventory_owner);
         assert!(!fixture.context.has_current_compute_snapshot().unwrap());
+        assert!(fixture.context.current_compute_node_snapshot().unwrap().is_none());
         assert_eq!(
             fixture.context.compute_snapshot_admission_failure().unwrap(),
             Some("shared host inventory owner is not active".into())
@@ -292,6 +305,7 @@ mod recovery_tests {
             .unwrap();
 
         assert!(!fixture.context.has_current_compute_snapshot().unwrap());
+        assert!(fixture.context.current_compute_node_snapshot().unwrap().is_none());
     }
 
     #[test]
@@ -313,6 +327,7 @@ mod recovery_tests {
             .unwrap();
 
         assert!(!fixture.context.has_current_compute_snapshot().unwrap());
+        assert!(fixture.context.current_compute_node_snapshot().unwrap().is_none());
         let reason = fixture
             .context
             .compute_snapshot_admission_failure()
@@ -837,9 +852,41 @@ impl HostRuntimeAdmission {
             return Ok(None);
         };
         let ledger = crate::retry_store_writer_busy(|| {
-            HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())
+            HostResourceLedger::open_for_current_application(
+                &binding.ledger_root,
+                binding.policy.clone(),
+            )
         })
         .context("open the exact configured physical-host resource ledger")?;
+        Self::from_config_and_ledger(config, binding, ledger).map(Some)
+    }
+
+    /// Open using an explicit local application state root. This is also used
+    /// by isolated callers that cannot rely on process-global environment.
+    pub fn open_for_application(
+        config: &RuntimeServiceConfig,
+        application_state_root: &Path,
+    ) -> Result<Option<Self>> {
+        config.validate()?;
+        let Some(binding) = config.host_execution.as_ref() else {
+            return Ok(None);
+        };
+        let ledger = crate::retry_store_writer_busy(|| {
+            HostResourceLedger::open_for_application(
+                application_state_root,
+                &binding.ledger_root,
+                binding.policy.clone(),
+            )
+        })
+        .context("open the exact configured physical-host resource ledger")?;
+        Self::from_config_and_ledger(config, binding, ledger).map(Some)
+    }
+
+    fn from_config_and_ledger(
+        config: &RuntimeServiceConfig,
+        binding: &fullmag_session::runtime_service_host::RuntimeServiceHostExecution,
+        ledger: HostResourceLedger,
+    ) -> Result<Self> {
         if let Some(expected) = binding.runtime_generation_sha256.as_deref() {
             crate::retry_store_writer_busy(|| ledger.validate_runtime_generation(expected))?;
         } else if binding.policy.schema_version
@@ -847,7 +894,7 @@ impl HostRuntimeAdmission {
         {
             bail!("v2 host runtime service has no pinned runtime_generation_sha256");
         }
-        Ok(Some(Self {
+        Ok(Self {
             ledger: Arc::new(ledger),
             compute_placements: binding.compute_placements.clone(),
             preparation_cpu_ids: binding.preparation_cpu_ids.clone(),
@@ -861,7 +908,7 @@ impl HostRuntimeAdmission {
             ),
             runtime_generation_sha256: binding.runtime_generation_sha256.clone(),
             cuda_device_uuids: Arc::new(OnceLock::new()),
-        }))
+        })
     }
 
     pub fn ledger(&self) -> &HostResourceLedger {
@@ -883,13 +930,27 @@ impl HostRuntimeAdmission {
     /// Report the reason from the same observation that gates admission.
     /// This does not refresh a sample, acquire an inventory owner, or relax freshness.
     pub fn compute_snapshot_admission_failure(&self) -> Result<Option<String>> {
+        Ok(self.current_compute_snapshot_or_failure()?.err())
+    }
+
+    /// Return the same validated observation used by the admission diagnostic.
+    /// I/O and ownership errors remain errors; an unavailable sample is not capacity.
+    pub fn current_compute_node_snapshot(
+        &self,
+    ) -> Result<Option<fullmag_session::compute_node_snapshot::ComputeNodeSnapshot>> {
+        Ok(self.current_compute_snapshot_or_failure()?.ok())
+    }
+
+    fn current_compute_snapshot_or_failure(
+        &self,
+    ) -> Result<std::result::Result<fullmag_session::compute_node_snapshot::ComputeNodeSnapshot, String>> {
         if let Some(expected) = self.runtime_generation_sha256.as_deref() {
             crate::retry_store_writer_busy(|| self.ledger.validate_runtime_generation(expected))?;
         }
         let Some(snapshot) =
             crate::retry_store_writer_busy(|| self.ledger.read_compute_node_snapshot())?
         else {
-            return Ok(Some("compute-node snapshot is missing".into()));
+            return Ok(Err("compute-node snapshot is missing".into()));
         };
         snapshot.validate()?;
         if snapshot.node_id != self.ledger.node_id()
@@ -900,7 +961,7 @@ impl HostRuntimeAdmission {
         }
 
         if snapshot.schema_version != COMPUTE_NODE_SNAPSHOT_SCHEMA_V2 {
-            return Ok(Some(format!(
+            return Ok(Err(format!(
                 "compute-node snapshot schema is {}, expected {}",
                 snapshot.schema_version, COMPUTE_NODE_SNAPSHOT_SCHEMA_V2
             )));
@@ -908,12 +969,12 @@ impl HostRuntimeAdmission {
         let Some(active_owner) =
             crate::retry_store_writer_busy(|| self.ledger.active_inventory_owner())?
         else {
-            return Ok(Some("shared host inventory owner is not active".into()));
+            return Ok(Err("shared host inventory owner is not active".into()));
         };
         if snapshot.host_owner_id.as_deref() != Some(active_owner.host_owner_id.as_str())
             || snapshot.host_owner_epoch != Some(active_owner.host_owner_epoch)
         {
-            return Ok(Some(format!(
+            return Ok(Err(format!(
                 "compute-node inventory owner differs: sample_id={:?}, sample_epoch={:?}, active_id={}, active_epoch={}",
                 snapshot.host_owner_id,
                 snapshot.host_owner_epoch,
@@ -925,15 +986,15 @@ impl HostRuntimeAdmission {
         let now = chrono::Utc::now();
         let current_boot_id = crate::compute_node_probe::current_host_boot_id(now.clone())?;
         if snapshot.boot_id != current_boot_id {
-            return Ok(Some(format!(
+            return Ok(Err(format!(
                 "compute-node boot differs: sample={}, current={}",
                 snapshot.boot_id, current_boot_id
             )));
         }
         if snapshot.is_current_at(now.clone())? {
-            return Ok(None);
+            return Ok(Ok(snapshot));
         }
-        Ok(Some(format!(
+        Ok(Err(format!(
             "compute-node sample freshness is {:?}: collected_at={}, observed_at={}",
             snapshot.sample.freshness_at(now.clone()),
             snapshot.sample.collected_at.to_rfc3339(),

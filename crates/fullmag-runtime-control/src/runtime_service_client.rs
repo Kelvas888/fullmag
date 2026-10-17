@@ -26,6 +26,7 @@ const MAX_RESPONSE: usize = 256 * 1024;
 pub fn initialize_host_application(
     configuration_path: &Path,
     expected_configuration_sha256: &str,
+    application_state_root: &Path,
 ) -> Result<serde_json::Value> {
     if expected_configuration_sha256.len() != 64
         || !expected_configuration_sha256
@@ -41,7 +42,11 @@ pub fn initialize_host_application(
         bail!("host initialization configuration digest differs from the operator pin");
     }
     let store = fullmag_session::SessionStore::open_existing(&candidate.store_root)?;
-    let config = RuntimeServiceConfig::initialize_host_application(&store, &candidate)?;
+    let config = RuntimeServiceConfig::initialize_host_application(
+        &store,
+        &candidate,
+        application_state_root,
+    )?;
     let host = config
         .host_execution
         .as_ref()
@@ -1000,7 +1005,8 @@ mod tests {
             "A".repeat(64),
             "g".repeat(64),
         ] {
-            let error = super::initialize_host_application(&path, &pin).unwrap_err();
+            let error =
+                super::initialize_host_application(&path, &pin, directory.path()).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("lowercase canonical configuration SHA-256"));
@@ -1030,7 +1036,7 @@ mod tests {
         } else {
             "a".repeat(64)
         };
-        let error = super::initialize_host_application(&path, &stale).unwrap_err();
+        let error = super::initialize_host_application(&path, &stale, directory.path()).unwrap_err();
         assert!(error
             .to_string()
             .contains("digest differs from the operator pin"));

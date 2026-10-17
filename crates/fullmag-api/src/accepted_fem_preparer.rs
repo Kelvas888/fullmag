@@ -77,7 +77,7 @@ pub(crate) fn prepare_accepted_fem_task(
         let token = std::env::var("FULLMAG_HOST_PREPARATION_LAUNCH_TOKEN")
             .context("host-bound FEM preparer requires its supervisor launch permit")?;
         let ledger = retry_preparation_store_writer_busy(|| {
-            fullmag_session::host_resource_ledger::HostResourceLedger::open(
+            fullmag_session::host_resource_ledger::HostResourceLedger::open_for_current_application(
                 &binding.ledger_root,
                 binding.policy.clone(),
             )

@@ -1357,6 +1357,24 @@ if ($RunMode -eq "workspace") {
   $env:FULLMAG_FRONTEND_ROOT = $FrontendCacheRoot
   $env:FULLMAG_STATE_ROOT = Join-Path $StorageLayout.runtime_root "state"
   $env:FULLMAG_DEV_SOURCE_ROOT = if ($Frontend -eq "dev") { Join-Path $RepoRoot "apps\control-room" } else { "" }
+  if ($Frontend -eq "dev" -and $SelectedBackendProfile -eq "dev") {
+    $backendGeneration = [string]$env:FULLMAG_NATIVE_RUNTIME_NONCE
+    $backendSource = [string]$manifest.backend_source_sha256
+    $backendVersion = [string]$manifest.build_version.product_version
+    $backendStatusPath = Join-Path $BuildRoot "backend-watch-status.json"
+    if ($env:FULLMAG_NATIVE_RUNTIME_ACTIVE -ne "1" -or
+        $backendGeneration -notmatch '^[0-9a-f]{32}$' -or
+        $backendSource -notmatch '^[0-9a-f]{64}$' -or
+        [string]::IsNullOrWhiteSpace($backendVersion)) {
+      throw "Managed development workspace has incomplete API owner identity"
+    }
+    $backendStatusPath = Assert-FullmagStoragePath -Layout $StorageLayout -Path $backendStatusPath -Label "development API backend status" -Parent $BuildRoot
+    # Bind backend observations to this exact runtime launch so stale watcher status is ignored.
+    $env:FULLMAG_DEVELOPMENT_BACKEND_GENERATION = $backendGeneration
+    $env:FULLMAG_DEVELOPMENT_BACKEND_STATUS_FILE = $backendStatusPath
+    $env:FULLMAG_DEVELOPMENT_BACKEND_SOURCE = $backendSource
+    $env:FULLMAG_DEVELOPMENT_BACKEND_VERSION = $backendVersion
+  }
   $workspaceArguments = @("ui", "--web-port", $WebPort.ToString())
   if ($Frontend -eq "dev") { $workspaceArguments += "--dev" }
   Push-Location $RepoRoot

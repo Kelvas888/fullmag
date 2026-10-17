@@ -216,6 +216,7 @@ import {
   PROJECT_RUN_MATERIALIZATION_PATH,
   PROJECT_RUN_PATH,
   PROJECT_RUN_TASK_CANCELLATION_PATH,
+  PROJECT_RUN_TASK_RETRY_PATH,
   PROJECT_BATCHES_PATH,
   PROJECT_BATCH_CASES_PATH,
   PROJECT_BATCH_COMMANDS_PATH,
@@ -532,6 +533,8 @@ import type {
   ProjectRunListResource,
   ProjectRunTaskCancellationRequest,
   ProjectRunTaskCancellationResource,
+  ProjectRunTaskRetryRequest,
+  ProjectRunTaskRetryResource,
   ProjectBatchSubmitRequest,
   ProjectBatchSubmitResource,
   ProjectBatchCommandRequest,
@@ -1015,6 +1018,10 @@ interface ComputeNodePolicyWriteOptions extends RequestOptions {
   readonly expectedRevision: number;
 }
 
+interface ComputeProfileWriteOptions extends RequestOptions {
+  readonly operatorCapability: string;
+}
+
 function baseRevisionPayload(options?: AuthoringWriteOptions): { base_revision?: number } {
   return options?.baseRevision === undefined
     ? {}
@@ -1205,8 +1212,14 @@ export class ControlRoomApi {
       this.postJson<ComputePreviewResource, ComputePreviewRequest>(PLATFORM_COMPUTE_PREVIEW_PATH, input, options),
     computeProfiles: (query: ExecutionProfileCatalogQuery = {}, options?: RequestOptions) =>
       this.requestJson<ExecutionProfileCatalogResource>(PLATFORM_COMPUTE_PROFILES_PATH, options, { query }),
-    publishComputeProfile: (input: PublishExecutionProfileRequest, options?: RequestOptions) =>
-      this.postJson<PublishExecutionProfileResource, PublishExecutionProfileRequest>(PLATFORM_COMPUTE_PROFILES_PATH, input, options),
+    publishComputeProfile: (input: PublishExecutionProfileRequest, options: ComputeProfileWriteOptions) =>
+      this.postJson<PublishExecutionProfileResource, PublishExecutionProfileRequest>(
+        PLATFORM_COMPUTE_PROFILES_PATH,
+        input,
+        { sessionScopeKey: options.sessionScopeKey, signal: options.signal },
+        undefined,
+        { Authorization: `Bearer ${options.operatorCapability}` },
+      ),
     outputStorageDefaults: (options?: RequestOptions) =>
       this.requestJson<OutputStorageDefaultsResource>(PLATFORM_OUTPUT_STORAGE_PATH, options),
     saveOutputStorageDefaults: (input: OutputStorageDefaultsRequest, options?: RequestOptions) =>
@@ -3535,6 +3548,25 @@ export class ControlRoomApi {
             },
           },
         ),
+      retryRunTask: (
+        projectId: string,
+        runId: string,
+        taskId: string,
+        request: ProjectRunTaskRetryRequest,
+        options?: RequestOptions,
+      ) =>
+        this.postJson<ProjectRunTaskRetryResource, ProjectRunTaskRetryRequest>(
+          PROJECT_RUN_TASK_RETRY_PATH,
+          request,
+          options,
+          {
+            path: {
+              project_id: projectId,
+              run_id: runId,
+              task_id: taskId,
+            },
+          },
+        ),
     },
   };
 
@@ -3837,11 +3869,12 @@ export class ControlRoomApi {
     body: TBody,
     options: RequestOptions = {},
     params?: Record<string, unknown>,
+    additionalHeaders?: Record<string, string>,
   ): Promise<TResponse> {
     const result = await this.transport.POST(path as never, {
       body,
       cache: "no-store",
-      headers: sessionScopeHeaders(options),
+      headers: { ...sessionScopeHeaders(options), ...additionalHeaders },
       params,
       signal: options.signal,
     } as never);
