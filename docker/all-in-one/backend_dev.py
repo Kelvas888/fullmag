@@ -1670,6 +1670,76 @@ def _validated_package(
     )
 
 
+BACKEND_BUILD_IDENTITY_FIELDS = (
+    "cargo_profile",
+    "cargo_target_profile_dir",
+    "mode",
+    "features",
+    "fullmag_build_cpu_only",
+    "fem_gpu_required",
+    "libceed_required",
+)
+
+
+def _expected_backend_build_identity(cargo_profile: str) -> dict[str, Any]:
+    """Return the fixed ABI/build inputs that make a package reusable."""
+
+    cargo_profile = _validate_cargo_profile(cargo_profile)
+    return {
+        "cargo_profile": cargo_profile,
+        "cargo_target_profile_dir": cargo_profile,
+        "mode": "cuda-fem-gpu",
+        "features": ["cuda", "fem-gpu"],
+        "fullmag_build_cpu_only": False,
+        "fem_gpu_required": True,
+        "libceed_required": True,
+    }
+
+
+def _package_matches_fresh_live_manifest(
+    receipt: Mapping[str, Any],
+    manifest_path: Path,
+    toolchain: Mapping[str, Any],
+    cargo_profile: str,
+) -> bool:
+    """Check whether a verified package exactly matches a fresh source capture.
+
+    Capture ids, timestamps, the manifest digest, and the live-manifest digest
+    are intentionally excluded: each start creates a new closed manifest even
+    when its source identity is unchanged.  The source/native identities,
+    toolchain, and fixed build inputs remain exact bindings.
+    """
+
+    source = receipt.get("source")
+    native = receipt.get("native_source_identity")
+    build = receipt.get("build")
+    if not isinstance(source, Mapping) or not isinstance(native, Mapping) or not isinstance(build, Mapping):
+        return False
+    if receipt.get("native_source_identity_sha256") != _sha256_bytes(_canonical(native)):
+        return False
+    try:
+        document, _ = _read_json(manifest_path, "fresh live source manifest", 64 * 1024 * 1024)
+        capsule, fresh_native, _git_object_ids, _live_manifest_sha256 = _validate_live_manifest(document)
+    except BackendBuildError:
+        # The normal prepare path reads and validates the same manifest and
+        # remains fail-closed if the trusted capture is malformed.
+        raise
+    if (
+        source.get("source_mode") != LIVE_SOURCE_MODE
+        or source.get("source_digest") != capsule.get("source_digest")
+        or source.get("resolved_commit") != capsule.get("resolved_commit")
+        or source.get("source_snapshot_sha256") != fresh_native.get("source_snapshot_sha256")
+        or dict(native) != fresh_native
+        or receipt.get("native_source_identity_sha256")
+        != _sha256_bytes(_canonical(fresh_native))
+    ):
+        return False
+    if receipt.get("toolchain") != dict(toolchain):
+        return False
+    expected_build = _expected_backend_build_identity(cargo_profile)
+    return all(build.get(field) == expected_build[field] for field in BACKEND_BUILD_IDENTITY_FIELDS)
+
+
 def _rename_package_child(source_root: Path, target_root: Path, name: str, label: str) -> None:
     source = source_root / name
     target = target_root / name
@@ -2228,6 +2298,15 @@ def _start(args: argparse.Namespace) -> int:
             start_args = argparse.Namespace(**vars(args))
             start_args.manifest = _capture_start_manifest(args, build_root)
             start_args.source_tar = None
+            if previous_receipt is not None and _package_matches_fresh_live_manifest(
+                previous_receipt[0], start_args.manifest, toolchain, cargo_profile
+            ):
+                _log_phase("start", "cache-hit", source="verified-package")
+                provenance_before = _snapshot_bound_provenance()
+                provenance_publish_started = True
+                _publish_runtime_provenance(output)
+                _log_phase("start", "handoff", cache="hit")
+                return _serve([])
             candidate = Path(
                 tempfile.mkdtemp(
                     prefix=".backend-package-candidate-",

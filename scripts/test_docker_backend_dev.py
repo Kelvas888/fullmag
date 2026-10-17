@@ -74,6 +74,97 @@ class BackendPackageTests(unittest.TestCase):
         records = backend._copy_package(workspace, output)
         return output, records
 
+    @staticmethod
+    def _live_manifest(root, *, commit="a" * 40, capture_id="test-capture"):
+        capsule = {
+            "schema": "fullmag.source-capsule.v1",
+            "schema_version": "fullmag.source-capsule.v1",
+            "source_mode": "snapshot",
+            "resolved_commit": commit,
+            "files": [],
+            "deleted": [],
+            "included_untracked": [],
+            "excluded": [],
+        }
+        capsule["source_digest"] = backend._sha256_bytes(
+            backend._canonical(
+                {
+                    "schema_version": capsule["schema_version"],
+                    "source_mode": capsule["source_mode"],
+                    "resolved_commit": capsule["resolved_commit"],
+                    "files": capsule["files"],
+                    "deleted": capsule["deleted"],
+                    "included_untracked": capsule["included_untracked"],
+                    "excluded": capsule["excluded"],
+                }
+            )
+        )
+        native = {
+            "schema": "fullmag.source-snapshot.v2",
+            "head_commit_full": commit,
+            "head_tree_sha256": "b" * 64,
+            "dirty_content_sha256": "c" * 64,
+            "source_snapshot_sha256": "d" * 64,
+            "source_snapshot_dirty": False,
+            "ignored_non_runtime_dirty": False,
+            "git_status_porcelain_v1": [],
+            "dirty_path_content": [],
+        }
+        document = {
+            "schema": backend.LIVE_MANIFEST_SCHEMA,
+            "capture_id": capture_id,
+            "source_mode": backend.LIVE_SOURCE_MODE,
+            "source_root": str(root / "source"),
+            "git_common_dir": str(root / "git-common"),
+            "resolved_commit": commit,
+            "source_digest": capsule["source_digest"],
+            "source_snapshot_sha256": native["source_snapshot_sha256"],
+            "native_source_identity": native,
+            "source_manifest": capsule,
+            "source_manifest_sha256": backend._sha256_bytes(backend._canonical(capsule)),
+            "git_object_ids": {},
+            "created_at": "2026-10-17T00:00:00Z",
+        }
+        document["live_manifest_sha256"] = backend._sha256_bytes(backend._canonical(document))
+        path = root / f"{capture_id}.json"
+        backend._write_json(path, document, "test live source manifest")
+        return path, document
+
+    @staticmethod
+    def _toolchain_fixture():
+        return {
+            "image_id": "sha256:" + "e" * 64,
+            "dependency_manifest_sha256": "f" * 64,
+            "dependency_schema": "fullmag.docker.fem-gpu-dependencies.v1",
+            "actual_source_commits": {
+                "mfem": "1" * 40,
+                "libceed": "2" * 40,
+                "hypre": "3" * 40,
+                "petsc": "4" * 40,
+                "slepc": "5" * 40,
+            },
+        }
+
+    @staticmethod
+    def _receipt_for_manifest(records, manifest, toolchain):
+        native = manifest["native_source_identity"]
+        return {
+            "schema": backend.RECEIPT_SCHEMA,
+            "state": "succeeded",
+            "execution_lanes": {lane: {"status": "compiled"} for lane in backend.LANES},
+            "source": {
+                "source_mode": backend.LIVE_SOURCE_MODE,
+                "resolved_commit": manifest["resolved_commit"],
+                "source_digest": manifest["source_digest"],
+                "source_snapshot_sha256": manifest["source_snapshot_sha256"],
+            },
+            "native_source_identity": native,
+            "native_source_identity_sha256": backend._sha256_bytes(backend._canonical(native)),
+            "toolchain": toolchain,
+            "build": backend._expected_backend_build_identity("backend-dev"),
+            "artifacts": records,
+        }
+
     def test_live_source_copy_performs_one_verified_read(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -391,6 +482,153 @@ class BackendPackageTests(unittest.TestCase):
                         ).glob(".backend-package-candidate-*")
                     )
                 )
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_start_reuses_verified_package_without_prepare_or_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package, records = self._published_package(root)
+            manifest_path, manifest = self._live_manifest(root)
+            toolchain = self._toolchain_fixture()
+            backend._write_json(
+                package / "backend-build-receipt.json",
+                self._receipt_for_manifest(records, manifest, toolchain),
+                "test backend build receipt",
+            )
+            provenance = root / "provenance.json"
+            provenance.write_bytes(b'{"state":"previous"}\n')
+            original_package_root = backend.PACKAGE_ROOT
+            original_provenance_path = backend.PROVENANCE_PATH
+            backend.PACKAGE_ROOT = package
+            backend.PROVENANCE_PATH = provenance
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(toolchain["image_id"], toolchain),
+                    ),
+                    patch.object(backend, "_capture_start_manifest", return_value=manifest_path),
+                    patch.object(backend, "_prepare_locked") as prepare,
+                    patch.object(backend, "_rotate_package") as rotate,
+                    patch.object(backend, "_publish_runtime_provenance") as publish,
+                    patch.object(backend, "_serve", return_value=0) as serve,
+                ):
+                    self.assertEqual(
+                        backend.main(["start", "--build-root", str(build_root)]),
+                        0,
+                    )
+                prepare.assert_not_called()
+                rotate.assert_not_called()
+                publish.assert_called_once_with(package)
+                serve.assert_called_once_with([])
+                self.assertFalse(
+                    list(
+                        (package / backend.PACKAGE_DEVELOPMENT_DIRNAME / backend.PACKAGE_CANDIDATES_DIRNAME)
+                        .glob(".backend-package-candidate-*")
+                    )
+                )
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+                backend.PROVENANCE_PATH = original_provenance_path
+
+    def test_start_rebuilds_when_fresh_source_identity_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package, records = self._published_package(root)
+            old_manifest_path, old_manifest = self._live_manifest(root, capture_id="old-capture")
+            changed_manifest_path, changed_manifest = self._live_manifest(
+                root, commit="b" * 40, capture_id="changed-capture"
+            )
+            toolchain = self._toolchain_fixture()
+            backend._write_json(
+                package / "backend-build-receipt.json",
+                self._receipt_for_manifest(records, old_manifest, toolchain),
+                "test backend build receipt",
+            )
+            provenance = root / "provenance.json"
+            provenance.touch()
+            original_package_root = backend.PACKAGE_ROOT
+            original_provenance_path = backend.PROVENANCE_PATH
+            backend.PACKAGE_ROOT = package
+            backend.PROVENANCE_PATH = provenance
+
+            def prepare_candidate(*args):
+                candidate = args[2]
+                workspace = self._package_workspace(root / "changed-candidate")
+                candidate_records = backend._copy_package(workspace, candidate)
+                (candidate / "bin/fullmag-bin").write_bytes(b"changed source candidate\n")
+                candidate_records = backend._hash_package(candidate)
+                backend._write_json(
+                    candidate / "backend-build-receipt.json",
+                    self._receipt_for_manifest(candidate_records, changed_manifest, toolchain),
+                    "test candidate receipt",
+                )
+                return 0
+
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(toolchain["image_id"], toolchain),
+                    ),
+                    patch.object(backend, "_capture_start_manifest", return_value=changed_manifest_path),
+                    patch.object(backend, "_prepare_locked", side_effect=prepare_candidate) as prepare,
+                    patch.object(backend, "_publish_runtime_provenance"),
+                    patch.object(backend, "_serve", return_value=0) as serve,
+                ):
+                    self.assertEqual(
+                        backend.main(["start", "--build-root", str(build_root)]),
+                        0,
+                    )
+                prepare.assert_called_once()
+                serve.assert_called_once_with([])
+                self.assertNotEqual(
+                    (package / "bin/fullmag-bin").read_bytes(), b"package\n"
+                )
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+                backend.PROVENANCE_PATH = original_provenance_path
+
+    def test_start_rejects_corrupt_existing_artifact_before_reuse_or_api(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package, records = self._published_package(root)
+            manifest_path, manifest = self._live_manifest(root)
+            toolchain = self._toolchain_fixture()
+            backend._write_json(
+                package / "backend-build-receipt.json",
+                self._receipt_for_manifest(records, manifest, toolchain),
+                "test backend build receipt",
+            )
+            (package / "bin/fullmag-bin").write_bytes(b"tampered\n")
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            try:
+                with (
+                    patch.object(backend, "_toolchain_identity") as toolchain_identity,
+                    patch.object(backend, "_capture_start_manifest") as capture,
+                    patch.object(backend, "_prepare_locked") as prepare,
+                    patch.object(backend, "_serve") as serve,
+                ):
+                    self.assertEqual(
+                        backend.main(["start", "--build-root", str(build_root)]),
+                        2,
+                    )
+                toolchain_identity.assert_not_called()
+                capture.assert_not_called()
+                prepare.assert_not_called()
+                serve.assert_not_called()
             finally:
                 backend.PACKAGE_ROOT = original_package_root
 
