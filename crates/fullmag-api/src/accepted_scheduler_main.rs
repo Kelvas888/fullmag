@@ -131,6 +131,12 @@ impl Drop for ActiveWorkers {
     }
 }
 
+#[derive(Debug)]
+enum SchedulerOperation<T> {
+    Completed(T),
+    Deferred,
+}
+
 impl TryFrom<FmsSchedulerResourceOffer> for SchedulerResourceOffer {
     type Error = anyhow::Error;
 
@@ -426,6 +432,7 @@ fn run_scheduler(
                 Err(error) => return Err(error),
             }
         }
+        let mut scheduling_deferred = false;
         let mut scheduled_any = false;
         // Host reconciliation is the admission fence. Do not discover runs,
         // resume leases, or create new admissions until the complete fence
@@ -539,17 +546,35 @@ fn run_scheduler(
                 if let Some(host) = host_admission.as_ref() {
                     let mut resumed = None;
                     for run_id in &checkpoint_run_ids {
-                        if let Some(scheduled) =
-                            fullmag_runtime_control::resume_next_admitted_accepted_task_with_host(
-                                &store,
-                                run_id,
-                                &resource.resource_id,
-                                host,
-                            )?
-                        {
-                            resumed = Some((run_id.clone(), scheduled));
-                            break;
+                        match defer_scheduler_writer_busy(
+                            || {
+                                fullmag_runtime_control::resume_next_admitted_accepted_task_with_host(
+                                    &store,
+                                    run_id,
+                                    &resource.resource_id,
+                                    host,
+                                )
+                            },
+                            || {
+                                format!(
+                                    "compute scheduler: resume admitted task on resource `{}`",
+                                    resource.resource_id
+                                )
+                            },
+                        )? {
+                            SchedulerOperation::Completed(Some(scheduled)) => {
+                                resumed = Some((run_id.clone(), scheduled));
+                                break;
+                            }
+                            SchedulerOperation::Completed(None) => {}
+                            SchedulerOperation::Deferred => {
+                                scheduling_deferred = true;
+                                break;
+                            }
                         }
+                    }
+                    if scheduling_deferred {
+                        break;
                     }
                     if let Some((run_id, scheduled)) = resumed {
                         scheduled_any = true;
@@ -571,23 +596,53 @@ fn run_scheduler(
                     )
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                     let scheduled = if let Some(host_admission) = host_admission.as_ref() {
-                        fullmag_runtime_control::schedule_next_ready_accepted_task_with_host(
-                            &store,
-                            &candidate.run_id,
-                            offer,
-                            host_admission,
+                        defer_scheduler_writer_busy(
+                            || {
+                                fullmag_runtime_control::schedule_next_ready_accepted_task_with_host(
+                                    &store,
+                                    &candidate.run_id,
+                                    offer.clone(),
+                                    host_admission,
+                                )
+                            },
+                            || {
+                                format!(
+                                    "compute scheduler: admit run `{}` on resource `{}`",
+                                    candidate.run_id, resource.resource_id
+                                )
+                            },
                         )?
                     } else {
-                        fullmag_runtime_control::schedule_next_ready_accepted_task(
-                            &store,
-                            &candidate.run_id,
-                            offer,
+                        defer_scheduler_writer_busy(
+                            || {
+                                fullmag_runtime_control::schedule_next_ready_accepted_task(
+                                    &store,
+                                    &candidate.run_id,
+                                    offer.clone(),
+                                )
+                            },
+                            || {
+                                format!(
+                                    "compute scheduler: admit run `{}` on resource `{}`",
+                                    candidate.run_id, resource.resource_id
+                                )
+                            },
                         )?
                     };
-                    if let Some(scheduled) = scheduled {
-                        selected = Some((run_index, scheduled));
-                        break;
+                    match scheduled {
+                        SchedulerOperation::Completed(Some(scheduled)) => {
+                            selected = Some((run_index, scheduled));
+                            break;
+                        }
+                        SchedulerOperation::Completed(None) => {}
+                        SchedulerOperation::Deferred => {
+                            scheduling_deferred = true;
+                            break;
+                        }
                     }
+                }
+                if scheduling_deferred {
+                    break;
                 }
                 let Some((run_index, scheduled)) = selected else {
                     continue;
@@ -627,7 +682,7 @@ fn run_scheduler(
             }
         }
         if active_workers.is_empty() {
-            if reconciliation_deferred {
+            if reconciliation_deferred || scheduling_deferred {
                 if shutdown_requested.load(Ordering::Acquire) {
                     break;
                 }
@@ -651,7 +706,7 @@ fn run_scheduler(
         let Some(resource_id) = active_workers.iter().find_map(|(resource_id, worker)| {
             worker.handle.is_finished().then(|| resource_id.clone())
         }) else {
-            std::thread::sleep(if reconciliation_deferred {
+            std::thread::sleep(if reconciliation_deferred || scheduling_deferred {
                 args.idle_poll_interval
             } else {
                 Duration::from_millis(10)
@@ -854,6 +909,32 @@ fn spawn_supervised_worker(
 
 fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
     fullmag_runtime_control::retry_store_writer_busy(&mut operation)
+}
+
+fn defer_scheduler_writer_busy<T>(
+    operation: impl FnOnce() -> Result<T>,
+    context: impl FnOnce() -> String,
+) -> Result<SchedulerOperation<T>> {
+    // The runtime-control operation owns retries for each idempotent durable
+    // sub-operation. Do not replay the whole scheduling pass here: admission
+    // may already have published a Preparing claim before a later Prepare or
+    // Start publication reports its final typed collision. Defer that pass so
+    // the next iteration enters the durable recovery path first.
+    classify_scheduler_operation(operation().with_context(context))
+}
+
+fn classify_scheduler_operation<T>(result: Result<T>) -> Result<SchedulerOperation<T>> {
+    match result {
+        Ok(value) => Ok(SchedulerOperation::Completed(value)),
+        Err(error) if is_store_writer_busy(&error) => {
+            tracing::warn!(
+                error = ?error,
+                "compute scheduler deferred an operation while the session store writer is busy"
+            );
+            Ok(SchedulerOperation::Deferred)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn is_store_writer_busy(error: &anyhow::Error) -> bool {
@@ -1217,5 +1298,50 @@ mod host_service_binding_tests {
             validate_host_service_binding_pair(Some(&absolute), Some(&digest.to_uppercase()))
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod scheduler_writer_busy_tests {
+    use super::{classify_scheduler_operation, defer_scheduler_writer_busy, SchedulerOperation};
+    use anyhow::Context;
+
+    #[test]
+    fn scheduler_defers_final_typed_busy_without_replaying_the_scheduler_pass() {
+        let mut attempts = 0;
+        let deferred = defer_scheduler_writer_busy(
+            || {
+                attempts += 1;
+                Err::<u8, _>(
+                    anyhow::Error::new(fullmag_session::StoreWriterBusy).context("wrapped"),
+                )
+            },
+            || "compute scheduler admission".to_owned(),
+        )
+        .unwrap();
+        assert!(matches!(deferred, SchedulerOperation::Deferred));
+        assert_eq!(attempts, 1);
+
+        let typed_busy = classify_scheduler_operation::<u8>(Err(anyhow::Error::new(
+            fullmag_session::StoreWriterBusy,
+        )
+        .context("wrapped")))
+        .unwrap();
+        assert!(matches!(typed_busy, SchedulerOperation::Deferred));
+
+        let ordinary = classify_scheduler_operation::<u8>(Err(anyhow::anyhow!(
+            "host launch binding identity mismatch"
+        )))
+        .unwrap_err();
+        assert_eq!(
+            ordinary.to_string(),
+            "host launch binding identity mismatch"
+        );
+
+        let text_only = classify_scheduler_operation::<u8>(Err(anyhow::anyhow!(
+            "session store writer is busy"
+        )))
+        .unwrap_err();
+        assert_eq!(text_only.to_string(), "session store writer is busy");
     }
 }
