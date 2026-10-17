@@ -16,18 +16,50 @@ import {
   sameProfile,
   type ExecutionProfileDraft,
 } from "../model/executionProfileDraft";
+import {
+  executionAvailabilityFor,
+  type ExecutionAvailability,
+} from "../model/executionAvailability";
 
 type Profiles = ReturnType<typeof useExecutionProfilesResource>;
 type Defaults = ExecutionProfile["defaults"];
 type PublicationRequest = Omit<PublishExecutionProfileRequest, "profile"> & { profile: ExecutionProfile };
 const GIB_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 
-export function ExecutionProfilesSettings() {
+export function ExecutionProfilesSettings({ executionAvailability }: {
+  readonly executionAvailability?: ExecutionAvailability;
+}) {
   const resource = useExecutionProfilesResource();
-  return <ProfileEditor key={resource.scope} resource={resource} />;
+  return <ProfileEditor executionAvailability={executionAvailability} key={resource.scope} resource={resource} />;
 }
 
-function ProfileEditor({ resource }: { resource: Profiles }) {
+export function newExecutionProfileDraft(
+  source: ExecutionProfile | undefined,
+  executionAvailability?: ExecutionAvailability,
+): ExecutionProfileDraft {
+  const nextDraft = newProfileDraft(source);
+  if (!source) {
+    const availability = executionAvailabilityFor(
+      executionAvailability,
+      nextDraft.profile.defaults.backend,
+    );
+    if (!availability.gpu.enabled && availability.cpu.enabled) {
+      nextDraft.profile = {
+        ...nextDraft.profile,
+        defaults: { ...nextDraft.profile.defaults, device: "cpu" },
+      };
+    }
+  }
+  return nextDraft;
+}
+
+function ProfileEditor({
+  executionAvailability,
+  resource,
+}: {
+  readonly executionAvailability?: ExecutionAvailability;
+  readonly resource: Profiles;
+}) {
   const [draft, setDraft] = useState<ExecutionProfileDraft | null>(null);
   const [pending, setPending] = useState<PublicationRequest | null>(null);
   const [busy, setBusy] = useState(false);
@@ -97,7 +129,8 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
     } catch (error) { report(error instanceof Error ? error.message : "Check the profile fields.", true); }
   };
   const begin = (profile?: ExecutionProfile) => {
-    setDraft(newProfileDraft(profile));
+    const nextDraft = newExecutionProfileDraft(profile, executionAvailability);
+    setDraft(nextDraft);
     setRefreshRequired(false);
     report("");
   };
@@ -115,6 +148,9 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
     else defaults[key] = value;
     update({ defaults });
   };
+  const deviceAvailability = draft
+    ? executionAvailabilityFor(executionAvailability, draft.profile.defaults.backend)
+    : null;
 
   return (
     <section aria-labelledby="fm-start-profiles-title" className="fm-start-section fm-start-profiles" data-execution-profiles="">
@@ -167,7 +203,14 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
           <label>Version<Input value={draft.profile.version} onChange={(event) => update({ version: event.target.value })} placeholder="2" /></label>
           <label className="fm-start-profiles__wide">Description<Input value={draft.profile.description} onChange={(event) => update({ description: event.target.value })} /></label>
           <ProfileChoice label="Backend" value={draft.profile.defaults.backend} options={["auto", "fdm", "fem", "hybrid"]} onChange={(value) => updateDefault("backend", value)} disabled={locked} />
-          <ProfileChoice label="Device" value={draft.profile.defaults.device} options={["auto", "cpu", "gpu"]} onChange={(value) => updateDefault("device", value)} disabled={locked} />
+          <ProfileChoice
+            disabled={locked}
+            disabledOptions={deviceAvailability?.gpu.enabled ? undefined : { gpu: deviceAvailability?.gpu.reason ?? "GPU availability is not confirmed." }}
+            label="Device"
+            onChange={(value) => updateDefault("device", value)}
+            options={["auto", "cpu", "gpu"]}
+            value={draft.profile.defaults.device}
+          />
           <ProfileChoice label="Precision" value={draft.profile.defaults.precision} options={["single", "double"]} onChange={(value) => updateDefault("precision", value)} disabled={locked} />
           <ProfileChoice label="Execution mode" value={draft.profile.defaults.mode} options={["strict", "extended", "hybrid"]} onChange={(value) => updateDefault("mode", value)} disabled={locked} />
           <label>CPU threads per task<Input value={draft.threads} onChange={(event) => setDraft({ ...draft, threads: event.target.value })} placeholder="Inherit · auto · 8" /></label>
@@ -176,6 +219,11 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
           <label>GPU VRAM per device (GiB)<Input type="number" min="0" step="any" value={draft.vramGiB} onChange={(event) => setDraft({ ...draft, vramGiB: event.target.value })} placeholder={draft.profile.defaults.resources?.gpu === null || draft.profile.defaults.resources?.gpu?.vram_per_device_bytes === null ? "Reset retained" : "Inherit"} /></label>
         </fieldset>
         <p className="fm-start-compute-settings__intro">Inherit leaves the preference unset. Auto records an explicit automatic choice. GPU requests require a GPU; availability is checked when a task is submitted.</p>
+        {deviceAvailability && !deviceAvailability.gpu.enabled ? (
+          <p className="fm-start-compute-settings__notice" role="status">
+            GPU is unavailable: {deviceAvailability.gpu.reason}
+          </p>
+        ) : null}
         <p className="fm-start-compute-settings__intro">Blank values inherit unless an existing explicit reset is retained unchanged. RAM, scratch, and VRAM values are requested per-task limits; actual admission and allocation are resolved when a task starts.</p>
         <p className="fm-start-compute-settings__intro">Other advanced resource settings are retained when creating a new version. Saving a profile does not assign it to a study.</p>
         <div className="fm-start-profiles__actions">
@@ -272,13 +320,23 @@ function memoryValue(bytes: number | null | undefined): string {
   return `${GIB_FORMAT.format(bytes / 1024 ** 3)} GiB`;
 }
 
-function ProfileChoice<T extends string>({ label, value, options, onChange, disabled }: {
-  label: string; value?: T; options: readonly T[]; onChange: (value: T | "inherit") => void; disabled: boolean;
+function ProfileChoice<T extends string>({ label, value, options, onChange, disabled, disabledOptions }: {
+  label: string;
+  value?: T;
+  options: readonly T[];
+  onChange: (value: T | "inherit") => void;
+  disabled: boolean;
+  disabledOptions?: Partial<Record<T, string>>;
 }) {
   return <div className="fm-start-profiles__choice"><span>{label}</span>
     <Select value={value ?? "inherit"} onValueChange={(next) => { if (next === "inherit" || options.includes(next as T)) onChange(next as T | "inherit"); }} disabled={disabled}>
       <SelectTrigger aria-label={label}><SelectValue /></SelectTrigger>
-      <SelectContent><SelectItem value="inherit">Inherit</SelectItem>{options.map((option) => <SelectItem key={option} value={option}>{option === "auto" ? "Auto" : option.toUpperCase()}</SelectItem>)}</SelectContent>
+      <SelectContent><SelectItem value="inherit">Inherit</SelectItem>{options.map((option) => {
+        const reason = disabledOptions?.[option];
+        return <SelectItem disabled={Boolean(reason)} key={option} title={reason} value={option}>
+          {option === "auto" ? "Auto" : option.toUpperCase()}{reason ? " (unavailable)" : ""}
+        </SelectItem>;
+      })}</SelectContent>
     </Select>
   </div>;
 }

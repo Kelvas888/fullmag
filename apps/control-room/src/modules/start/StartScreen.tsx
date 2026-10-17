@@ -21,6 +21,7 @@ import {
   type ProjectCreator,
 } from "./model/scriptProject";
 import { useAuthorName } from "./model/useAuthorName";
+import { useExecutionAvailability } from "./model/executionAvailability";
 import { useComputeProbe } from "./model/useComputeProbe";
 import { useRecentIndex } from "./model/useRecentIndex";
 import { useWorkspaceItemDetail, useWorkspaceItems } from "./model/useWorkspaceItems";
@@ -78,6 +79,13 @@ export function StartScreen({ kernel }: ModuleProps) {
   const [scriptFlowNotice, setScriptFlowNotice] = useState<string | null>(null);
   const computeProbe = useComputeProbe();
   const { compute } = computeProbe;
+  const executionAvailability = useExecutionAvailability({
+    compute,
+    error: computeProbe.error,
+    nodeInventory: computeProbe.nodeInventory,
+    refreshing: computeProbe.refreshing,
+    stale: computeProbe.stale,
+  });
   const authorName = useAuthorName();
   const {
     section,
@@ -395,6 +403,7 @@ export function StartScreen({ kernel }: ModuleProps) {
               refreshing={computeProbe.refreshing}
               stale={computeProbe.stale}
               onRefreshCompute={computeProbe.refresh}
+              executionAvailability={executionAvailability}
               recent={recent}
               workspace={workspaceApi}
             />
@@ -454,6 +463,7 @@ export function StartScreen({ kernel }: ModuleProps) {
             startScreenStore.setSelectedScript(null);
             void scripts.forget(id);
           },
+          executionAvailability,
         }}
         projectCreator={projectCreator}
         scriptSaver={scriptSaver}

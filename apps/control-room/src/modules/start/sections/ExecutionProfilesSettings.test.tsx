@@ -1,8 +1,10 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
+import type { ExecutionProfile } from "@/kernel/api/apiTypes";
+
 const { resource } = vi.hoisted(() => {
-  const profile = {
+  const profile: ExecutionProfile = {
     schema_version: "execution_profile.v1",
     profile_id: "exec:interactive",
     version: "2",
@@ -60,9 +62,37 @@ vi.mock("@/kernel/resources/useExecutionProfilesResource", () => ({
   useExecutionProfilesResource: () => resource,
 }));
 
-import { ExecutionProfilesSettings } from "./ExecutionProfilesSettings";
+import {
+  ExecutionProfilesSettings,
+  newExecutionProfileDraft,
+} from "./ExecutionProfilesSettings";
+import {
+  EXECUTION_BACKENDS,
+  unavailableExecutionAvailability,
+  type ExecutionAvailability,
+} from "../model/executionAvailability";
+
+const cpuOnlyAvailability: ExecutionAvailability = {
+  byBackend: Object.fromEntries(
+    EXECUTION_BACKENDS.map((backend) => [backend, {
+      cpu: { enabled: true, reason: "" },
+      gpu: unavailableExecutionAvailability.byBackend[backend].gpu,
+    }]),
+  ) as ExecutionAvailability["byBackend"],
+};
 
 describe("execution profile settings", () => {
+  it("defaults a new profile to CPU without rewriting an existing GPU intent", () => {
+    const newDraft = newExecutionProfileDraft(undefined, cpuOnlyAvailability);
+    const existingGpuDraft = newExecutionProfileDraft(
+      resource.data.entries[0].profile,
+      cpuOnlyAvailability,
+    );
+
+    expect(newDraft.profile.defaults.device).toBe("cpu");
+    expect(existingGpuDraft.profile.defaults.device).toBe("gpu");
+  });
+
   it("inspects resolved profile defaults and offers duplicate and new-version actions", () => {
     const html = renderToStaticMarkup(<ExecutionProfilesSettings />);
 

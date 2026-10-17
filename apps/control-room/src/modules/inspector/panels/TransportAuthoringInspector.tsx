@@ -495,7 +495,12 @@ export function TransportAuthoringInspector({
         ) : family === "current_transport" ? (
           <CurrentFields draft={draft as CurrentTransportDraft} focus={structuredCurrentFocus} identityReadOnly={Boolean(selectedId) || pending} patch={patch} />
         ) : (
-          <SpinFields draft={draft as SpinTransportDraft} identityReadOnly={Boolean(selectedId) || pending} patch={patch} />
+          <SpinFields
+            capabilities={capabilities}
+            draft={draft as SpinTransportDraft}
+            identityReadOnly={Boolean(selectedId) || pending}
+            patch={patch}
+          />
         )}
         {feedback ? <FeedbackBanner kind={feedback.kind} message={feedback.message} /> : null}
         {targetUnavailable ? <FeedbackBanner kind="warning" message="The selected transport no longer exists. Select another resource or explicitly create a new one." /> : null}
@@ -794,8 +799,15 @@ function StructuredCurrentClosureFields({
   </div>;
 }
 
-function SpinFields({ draft, identityReadOnly, patch }: { draft: SpinTransportDraft; identityReadOnly: boolean; patch: (value: Partial<Draft>) => void }) {
+function SpinFields({ capabilities, draft, identityReadOnly, patch }: {
+  capabilities: TransportAuthoringCapabilityMap | null;
+  draft: SpinTransportDraft;
+  identityReadOnly: boolean;
+  patch: (value: Partial<Draft>) => void;
+}) {
   const field = (key: keyof SpinTransportDraft) => (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => patch({ [key]: event.target.value });
+  const gpuUnavailable = capabilities?.gpu?.authoring_allowed !== true;
+  const gpuReason = capabilities?.gpu?.reason?.trim() || "GPU transport authoring is unavailable.";
   return <>
     <FormField label="Id" readOnly={identityReadOnly} value={draft.id} onChange={field("id")} />
     <FormField label="Schema version" value={draft.schemaVersion} onChange={field("schemaVersion")} />
@@ -808,7 +820,17 @@ function SpinFields({ draft, identityReadOnly, patch }: { draft: SpinTransportDr
     <SolverFields draft={draft} field={field} patch={patch} />
     <FormField label="Default external boundary" value={draft.solverDefaultExternalBoundary} onChange={field("solverDefaultExternalBoundary")} />
     <FormField label="Requested discretization" type="select" value={draft.executionDiscretization} onChange={field("executionDiscretization")}><option value="auto">Auto</option><option value="fdm">FDM</option><option value="fem">FEM</option></FormField>
-    <FormField label="Requested device" type="select" value={draft.executionDevice} onChange={field("executionDevice")}><option value="auto">Auto</option><option value="cpu">CPU</option><option value="gpu">GPU</option></FormField>
+    <FormField
+      hint={gpuUnavailable ? gpuReason : undefined}
+      label="Requested device"
+      type="select"
+      value={draft.executionDevice}
+      onChange={field("executionDevice")}
+    >
+      <option value="auto">Auto</option>
+      <option value="cpu">CPU</option>
+      <option disabled={gpuUnavailable} title={gpuUnavailable ? gpuReason : undefined} value="gpu">GPU{gpuUnavailable ? " (unavailable)" : ""}</option>
+    </FormField>
     <FormField label="Requested precision" type="select" value={draft.executionPrecision} onChange={field("executionPrecision")}><option value="double">Double</option><option value="single">Single</option></FormField>
     <FormField label="Requested execution mode" type="select" value={draft.executionMode} onChange={field("executionMode")}><option value="strict">Strict</option><option value="extended">Extended</option></FormField>
     <FormField label="Constitutive version" value={draft.constitutiveVersion} onChange={field("constitutiveVersion")} />
