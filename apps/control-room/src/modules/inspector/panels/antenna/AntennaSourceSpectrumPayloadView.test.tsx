@@ -136,10 +136,11 @@ describe("AntennaSourceSpectrumPayloadView", () => {
       const firstCell = firstByRole(container as unknown as TestNode, "gridcell");
       expect(firstCell?.getAttribute("aria-label")).toContain("(A/m/A)^2");
       expect(firstCell?.getAttribute("title")).toContain("(A/m/A)^2");
-      const grid = firstByRole(container as unknown as TestNode, "grid");
-      const zoomIn = firstByRoleAndText(container as unknown as TestNode, "button", "Zoom in");
-      await act(async () => zoomIn?.click());
-      expect(grid?.style.transform).toContain("scale(2)");
+      const zoomIn = firstByTagNameAndText(container as unknown as TestNode, "button", "Zoom in");
+      expect(zoomIn).toBeTruthy();
+      await act(async () => zoomIn!.click());
+      const zoomedGrid = firstByRole(container as unknown as TestNode, "grid");
+      expect(zoomedGrid?.style.transform).toContain("scale(2)");
       expect(countByRole(container as unknown as TestNode, "gridcell")).toBe(4);
       expect(container.textContent).toContain("Zoom 2×");
     } finally {
@@ -593,6 +594,15 @@ function firstByTagName(root: TestNode, tagName: string): TestElement | null {
   if (root instanceof TestElement && root.tagName === tagName.toUpperCase()) return root;
   for (const child of root.childNodes) {
     const match = firstByTagName(child, tagName);
+    if (match) return match;
+  }
+  return null;
+}
+
+function firstByTagNameAndText(root: TestNode, tagName: string, text: string): TestElement | null {
+  if (root instanceof TestElement && root.tagName === tagName.toUpperCase() && root.textContent === text) return root;
+  for (const child of root.childNodes) {
+    const match = firstByTagNameAndText(child, tagName, text);
     if (match) return match;
   }
   return null;
