@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,13 +25,16 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 PROFILE = "managed-antenna-http-ram-cpu"
 SCHEMA = "fullmag.managed-antenna-http-ram.v1"
-TOOLS = (
+TOOLS_V1 = (
     "run_managed_antenna_http_ram.py", "smoke_antenna_external_lead_inspection.py",
     "smoke_antenna_inspection_display.py", "antenna_rt0_fixture_check.py",
     "antenna_current_display_fixture_check.py", "antenna_current_source_oracle.py",
     "antenna_inspection_cold_import_check.py",
     "antenna_standalone_fixture.py",
 )
+TOOLS_V2 = TOOLS_V1 + ("smoke_antenna_closed_loop_inspection.py",)
+CANONICAL_FIELD_SMOKE = "smoke_antenna_artifact_fields.py"
+TOOLS = TOOLS_V2 + (CANONICAL_FIELD_SMOKE,)
 ORIGIN = "http://127.0.0.1:8081"
 MAX_JSON = 4 << 20
 
@@ -39,12 +43,17 @@ MAX_ARCHIVE = 16 << 20
 NONMAGNETIC_SHA = "e3ce550d020ca3e2c811b87f3686890a671b6bf592521a8af5ecfdff06986199"
 
 
+CLOSEDLOOP_SHA = "16904540d169037480b563ec05e4cdb786c772caefba8c3e5a9b66365aa22a62"
+
+
 def fixture_contract(fixture="magnetic"):
     import run_managed_antenna_ram as ram
     files = dict(ram.FIXTURE_FILES)
     if fixture == "nonmagnetic":
         files.pop("fem_antenna_current_source_inspection.py")
         files["fem_antenna_field_only_nonmagnetic.py"] = NONMAGNETIC_SHA
+    elif fixture == "closedloop":
+        files = {"fem_antenna_closed_loop_nonmagnetic.py": CLOSEDLOOP_SHA}
     elif fixture != "magnetic":
         raise ValueError("Unsupported antenna fixture")
     return files
@@ -58,16 +67,16 @@ def sha(path):
         return digest.hexdigest()
 
 
-def tool_manifest(root):
-    paths = [root / name for name in TOOLS]
+def tool_manifest(root, names=TOOLS):
+    paths = [root / name for name in names]
     if any(path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_JSON
            for path in paths):
         raise ValueError("HTTP gate requires bounded regular host tool files")
-    return {name: sha(root / name) for name in TOOLS}
+    return {name: sha(root / name) for name in names}
 
 
 def check_tools(root, expected):
-    if set(expected) != set(TOOLS) or tool_manifest(root) != expected:
+    if set(expected) not in (set(TOOLS_V1), set(TOOLS_V2), set(TOOLS)) or tool_manifest(root, tuple(expected)) != expected:
         raise ValueError("HTTP gate host tool identity changed")
 
 
@@ -191,12 +200,21 @@ def export_archive(export):
     return encoded, response["session_id"]
 
 
+def smoke_scripts(fixture_script):
+    return ("smoke_antenna_closed_loop_inspection.py",) if fixture_script == "fem_antenna_closed_loop_nonmagnetic.py" else ("smoke_antenna_external_lead_inspection.py", "smoke_antenna_inspection_display.py")
+
+
 def compare_cold_metadata(warm, cold):
     # Revisions and request incarnation must change; scientific identity must not.
     if not warm.get("outputs") or warm.get("runtime_stage_id") != "stage-000" \
             or warm.get("runtime_stage_id") != cold.get("runtime_stage_id") \
             or warm.get("outputs") != cold.get("outputs"):
         raise ValueError("Cold archive changed canonical inspection identity")
+    if warm.get("schema_version") == "antenna_closed_loop_stage_output.v2":
+        if cold.get("schema_version") != warm["schema_version"] or warm.get("closed_loop_manifest") != cold.get("closed_loop_manifest") or warm.get("record_content_digest") != cold.get("record_content_digest") or warm.get("session_id") != cold.get("session_id") or warm.get("run_id") != cold.get("run_id"):
+            raise ValueError("Cold archive changed closed-loop scientific identity")
+        if warm.get("request_scope_epoch") == cold.get("request_scope_epoch"):
+            raise ValueError("Cold import reused the warm request incarnation")
 
 
 def wait_api(api, timeout=45):
@@ -244,11 +262,40 @@ def smoke(script, stage, export):
     expected_status = {
         "smoke_antenna_external_lead_inspection.py": "pass",
         "smoke_antenna_inspection_display.py": "passed",
+        "smoke_antenna_closed_loop_inspection.py": "pass",
+        CANONICAL_FIELD_SMOKE: "passed",
     }.get(script)
     if expected_status is None or result.get("status") != expected_status \
             or result.get("physics_qualified") is not False:
         raise ValueError("HTTP smoke failed or promoted inspection scope")
     return result
+
+
+def canonical_field_identity(report):
+    if report.get("schema") != "fullmag.antenna_artifact_fields_http.v1" \
+            or report.get("status") != "passed" or report.get("physics_qualified") is not False \
+            or report.get("production_frontend_codec_qualified") is not False \
+            or report.get("cold_load_qualified") is not False \
+            or report.get("inspection_family") != "closed_loop" \
+            or report.get("runtime_stage_id") != "stage-000" or not report.get("run_id"):
+        raise ValueError("Canonical field HTTP report is absent or promotes qualification")
+    fields = report.get("fields")
+    if not isinstance(fields, dict) or set(fields) != {"V_electric", "J_charge", "H_ant"}:
+        raise ValueError("Canonical HTTP must retain exactly V, J and H")
+    identity = {}
+    for quantity, unit, components in (("V_electric", "V", 1), ("J_charge", "A/m^2", 3), ("H_ant", "A/m", 3)):
+        field = fields[quantity]
+        if not isinstance(field, dict) or field.get("unit") != unit or field.get("components") != components \
+                or type(field.get("samples")) is not int or field["samples"] <= 0 \
+                or not isinstance(field.get("values_sha256"), str) \
+                or not re.fullmatch(r"[0-9a-f]{64}", field["values_sha256"]):
+            raise ValueError("Canonical field units, cardinality or value digest differ")
+        stable_digests = ("positions_sha256", "sample_identity_sha256", "connectivity_sha256")
+        if any(not isinstance(field.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", field[key]) for key in stable_digests):
+            raise ValueError("Canonical field geometry or lossless sample identity is absent")
+        # Session-scoped carriers and encoded headers change after cold import.
+        identity[quantity] = {key: field[key] for key in ("unit", "components", "samples", "values_sha256", *stable_digests)}
+    return {"run_id": report["run_id"], "fields": identity}
 
 
 def reject_stale_terminal_owners():
@@ -348,14 +395,17 @@ def execute_in_container(verify_cold_import=False, standalone=False):
     sys.path.insert(0, str(tools))
     from antenna_standalone_fixture import SCRIPT_NAME
     fixture = expected.get("fixture", "magnetic")
-    if fixture not in ("magnetic", "nonmagnetic") or standalone and fixture != "magnetic":
+    if fixture not in ("magnetic", "nonmagnetic", "closedloop") or standalone and fixture != "magnetic":
         raise ValueError("Unsupported antenna fixture combination")
-    variant = "standalone" if standalone else ("nonmagnetic" if fixture == "nonmagnetic" else "magnetic_probe")
+    if fixture == "closedloop" and verify_cold_import:
+        raise ValueError("The optional legacy cold-import probe supports external leads; closed-loop uses the restarted API gate")
+    variant = "standalone" if standalone else (fixture if fixture != "magnetic" else "magnetic_probe")
     if expected.get("fixture_variant", "magnetic_probe") != variant:
         raise ValueError("HTTP fixture variant differs from owned command")
     script = SCRIPT_NAME if standalone else "fem_antenna_current_source_inspection.py"
     fixture_sha = expected["fixture_sha256"]
     fixture_script = expected.get("fixture_script", script)
+    selected_smokes = smoke_scripts(fixture_script)
     if fixture_script not in fixture_sha or standalone and fixture_script != SCRIPT_NAME:
         raise ValueError("Fixture script is absent from pinned inputs")
     for name, digest in fixture_sha.items():
@@ -404,7 +454,10 @@ def execute_in_container(verify_cold_import=False, standalone=False):
             (export / "inspection-metadata.json").write_text(json.dumps(metadata, sort_keys=True))
             result["http_smokes"] = {
                 name: smoke(name, "stage-000", export) for name in
-                ("smoke_antenna_external_lead_inspection.py", "smoke_antenna_inspection_display.py")}
+                selected_smokes}
+            if fixture == "closedloop" and CANONICAL_FIELD_SMOKE in expected["tools_sha256"]:
+                result["canonical_fields_http"] = smoke(CANONICAL_FIELD_SMOKE, "stage-000", export)
+                canonical_field_identity(result["canonical_fields_http"])
             result["terminal_owner_negative_admission"] = reject_stale_terminal_owners()
             if standalone:
                 result["standalone_read_model"] = check_standalone_read_model()
@@ -413,7 +466,7 @@ def execute_in_container(verify_cold_import=False, standalone=False):
             # Python smoke itself correctly does not claim native decoding.
             result.update(state="warm_http_pass", runtime_stage_id="stage-000",
                 native_canonical_bundle_redecoded=True,
-                canonical_decoder_owner="API load_published_antenna_external_lead_solution",
+                canonical_decoder_owner="API load_published_antenna_closed_loop_inspection" if len(selected_smokes) == 1 else "API load_published_antenna_external_lead_solution",
                 inspection_ref=metadata["outputs"][0]["inspection_ref"])
             if verify_cold_import:
                 from antenna_inspection_cold_import_check import verify_cold_import as check_cold
@@ -453,10 +506,15 @@ def execute_in_container(verify_cold_import=False, standalone=False):
                 cold_export = export / "cold-http"
                 cold_export.mkdir()
                 result["cold_http_smokes"] = {name: smoke(name, "stage-000", cold_export)
-                    for name in ("smoke_antenna_external_lead_inspection.py",
-                                 "smoke_antenna_inspection_display.py")}
+                    for name in selected_smokes}
+                if fixture == "closedloop" and CANONICAL_FIELD_SMOKE in expected["tools_sha256"]:
+                    result["cold_canonical_fields_http"] = smoke(CANONICAL_FIELD_SMOKE, "stage-000", cold_export)
+                    if canonical_field_identity(result["canonical_fields_http"]) != canonical_field_identity(result["cold_canonical_fields_http"]):
+                        raise ValueError("Cold import changed canonical V/J/H values, units or sampling")
                 if standalone:
                     result["standalone_restarted_read_model"] = check_standalone_read_model()
+                if len(selected_smokes) == 1 and result["http_smokes"][selected_smokes[0]]["scientific_identity"] != result["cold_http_smokes"][selected_smokes[0]]["scientific_identity"]:
+                    raise ValueError("Cold HTTP changed decoded closed-loop scientific identity")
                 result.update(state="cold_http_pass", cold_archive_import="PASS",
                     archive_sha256=sha(export / "snapshot.fms"),
                     cold_process_state_root=str(cold_root), cold_solver_executed=False)
@@ -509,8 +567,10 @@ def resolved(repo, job, commit, source, native):
 def start(repo, job, commit, source_digest, native_digest, fixture="magnetic", verify_cold_import=False, *, standalone=False):
     if not isinstance(standalone, bool) or not isinstance(verify_cold_import, bool):
         raise ValueError("Invalid HTTP gate mode")
-    if fixture not in ("magnetic", "nonmagnetic") or standalone and fixture != "magnetic":
+    if fixture not in ("magnetic", "nonmagnetic", "closedloop") or standalone and fixture != "magnetic":
         raise ValueError("Unsupported antenna fixture combination")
+    if fixture == "closedloop" and verify_cold_import:
+        raise ValueError("The optional legacy cold-import probe supports external leads; closed-loop uses the restarted API gate")
     import fullmag_storage as storage
     import run_managed_antenna_ram as ram
     from run_managed_browser import docker
@@ -552,11 +612,11 @@ def start(repo, job, commit, source_digest, native_digest, fixture="magnetic", v
         (inputs / ram.SCRIPT_NAME).write_bytes(generated)
         if sha(inputs / ram.SCRIPT_NAME) != fixture_sha[ram.SCRIPT_NAME]:
             raise ValueError("Standalone fixture changed during staging")
-    variant_name = "standalone" if standalone else ("nonmagnetic" if fixture == "nonmagnetic" else "magnetic_probe")
+    variant_name = "standalone" if standalone else (fixture if fixture != "magnetic" else "magnetic_probe")
     variant = {"fixture_variant": variant_name} if variant_name != "magnetic_probe" else {}
     storage.atomic_json(tools / "manifest.json", {"tools_sha256": tools_sha,
         "fixture_sha256": fixture_sha, "fixture": fixture, "fixture_script": fixture_script,
-        "solver_capsule_attribution": False, **variant})
+        "solver_capsule_attribution": False, "tool_manifest_version": 3, **variant})
     spec = http_spec(context["image_digest"], capsule / "tree", package, inputs, export, tools,
                      verify_cold_import, standalone=standalone)
     storage.atomic_json(root / "compose.json", spec)
@@ -603,10 +663,11 @@ def observe(repo, root):
     native = receipt["native_source_identity"]
     fixture = receipt.get("fixture", "magnetic")
     variant = receipt.get("fixture_variant", "magnetic_probe")
-    if variant not in ("standalone", "magnetic_probe", "nonmagnetic"):
+    if variant not in ("standalone", "magnetic_probe", "nonmagnetic", "closedloop"):
         raise ValueError("Unknown scientific fixture variant")
     standalone = variant == "standalone"
-    if fixture not in ("magnetic", "nonmagnetic") or (variant == "nonmagnetic") != (fixture == "nonmagnetic"):
+    if fixture not in ("magnetic", "nonmagnetic", "closedloop") or standalone and fixture != "magnetic" or variant != (
+            "standalone" if standalone else fixture if fixture != "magnetic" else "magnetic_probe"):
         raise ValueError("Scientific fixture variant differs from source selection")
     fixture_sha = ram.fixture_identity(repo, True)[1] if standalone else fixture_contract(fixture)
     variant_fields = {"fixture_variant": variant} if variant != "magnetic_probe" else {}
@@ -618,9 +679,15 @@ def observe(repo, root):
     tools, inputs = root / "tools", root / "input"
     check_tools(tools, receipt["tools_sha256"])
     manifest = read_json(tools / "manifest.json")
+    expected_manifest = {"tools_sha256": receipt["tools_sha256"], "fixture_sha256": fixture_sha,
+        "fixture": fixture, "fixture_script": receipt["fixture_script"],
+        "solver_capsule_attribution": False, **variant_fields}
+    if set(receipt["tools_sha256"]) == set(TOOLS):
+        expected_manifest["tool_manifest_version"] = 3
+    elif set(receipt["tools_sha256"]) == set(TOOLS_V2):
+        expected_manifest["tool_manifest_version"] = 2
     if receipt["tool_manifest_sha256"] != sha(tools / "manifest.json") \
-            or manifest != {"tools_sha256": receipt["tools_sha256"],
-                            "fixture_sha256": fixture_sha, "fixture": fixture, "fixture_script": receipt["fixture_script"], "solver_capsule_attribution": False, **variant_fields}:
+            or manifest != expected_manifest:
         raise ValueError("Pinned host-tool manifest differs")
     for name, expected in fixture_sha.items():
         if sha(inputs / name) != expected or storage.is_link(inputs / name):
@@ -693,6 +760,14 @@ def observe(repo, root):
                 or result["warm_api_pid"] == result["cold_api_pid"] \
                 or result.get("archive_sha256") != sha(export / "snapshot.fms"):
             raise ValueError("Cold archive proof is missing")
+        if receipt.get("fixture") == "closedloop":
+            name = "smoke_antenna_closed_loop_inspection.py"
+            warm_smoke, cold_smoke = result.get("http_smokes", {}).get(name, {}), result.get("cold_http_smokes", {}).get(name, {})
+            if warm_smoke.get("status") != "pass" or cold_smoke.get("status") != "pass" or warm_smoke.get("physics_qualified") is not False or cold_smoke.get("physics_qualified") is not False or not warm_smoke.get("scientific_identity") or warm_smoke["scientific_identity"] != cold_smoke.get("scientific_identity"):
+                raise ValueError("Closed-loop warm/cold decoded HTTP proof missing")
+        if receipt.get("fixture") == "closedloop" and CANONICAL_FIELD_SMOKE in receipt["tools_sha256"]:
+            if canonical_field_identity(result.get("canonical_fields_http", {})) != canonical_field_identity(result.get("cold_canonical_fields_http", {})):
+                raise ValueError("Retained canonical V/J/H warm/cold identity differs")
         compare_cold_metadata(read_json(export / "inspection-metadata.json"),
                               read_json(export / "cold-inspection-metadata.json"))
         receipt.update(state="cold_http_pass_resources_retained", startup_identity="PASS",
@@ -716,7 +791,7 @@ if __name__ == "__main__":
     start_args = sub.add_parser("start")
     for flag in ("job-id", "commit", "source-digest", "native-snapshot-sha256"):
         start_args.add_argument("--" + flag, required=True)
-    start_args.add_argument("--fixture", choices=("magnetic", "nonmagnetic"), default="magnetic")
+    start_args.add_argument("--fixture", choices=("magnetic", "nonmagnetic", "closedloop"), default="magnetic")
     start_args.add_argument("--verify-cold-import", action="store_true")
     start_args.add_argument("--standalone", action="store_true")
     sub.add_parser("observe").add_argument("--run-root", type=Path, required=True)

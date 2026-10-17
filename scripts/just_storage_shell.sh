@@ -425,7 +425,7 @@ case "${recipe}" in
     exit 2
     ;;
   *"scripts/run_managed_antenna_http_ram.py"*)
-    antenna_http_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_http_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'( --fixture '(magnetic|nonmagnetic)')?( --verify-cold-import)?( --standalone)?$"
+    antenna_http_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_http_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'( --fixture '(magnetic|nonmagnetic|closedloop)')?( --verify-cold-import)?( --standalone)?$"
     if [[ "${recipe}" =~ ${antenna_http_start_pattern} ]]; then
       antenna_http_args=()
       if [[ -n "${BASH_REMATCH[6]}" ]]; then antenna_http_args+=(--fixture "${BASH_REMATCH[6]}"); fi
