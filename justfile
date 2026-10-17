@@ -32,6 +32,11 @@ docker-dev-toolchain:
 docker-dev source_root="" port="3197" script="":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" up --port {{quote(port)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if script == "" { "" } else { "--script " + quote(script) }}}
 
+# Controlled recreation of one terminal failed direct-development run.  The
+# receipt and config digest are mandatory; this is not unknown-owner recovery.
+docker-dev-recreate run_receipt previous_config_sha256 source_root="" port="3197":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate --direct-development --run-receipt {{quote(run_receipt)}} --previous-config-sha256 {{quote(previous_config_sha256)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} --port {{quote(port)}}
+
 # Compatibility start alias: starts both fixed services; use backend restart for iteration.
 docker-dev-build source_root="":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" build {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}

@@ -137,6 +137,34 @@ Nie zastępuj tego procedurą `down --volumes`, przejęciem obcej grupy ani rese
 ownera. Niepotwierdzone zatrzymanie wymaga kanonicznego recovery; nie jest zgodą
 na ponowne uruchomienie aktywnej symulacji. Zachowaj logi i receipty błędu.
 
+### Kontrolowane odtworzenie terminalnego failed run
+
+Jeżeli własny backend zakończył się terminalnym błędem, a jego usługi są
+zatrzymane i wszystkie należące do niego rezerwacje native zostały zwolnione,
+można jawnie odtworzyć ten sam stan przez `docker-dev-recreate`. Polecenie
+wymaga dokładnego receiptu tego runu oraz dokładnego SHA-256 poprzedniej
+konfiguracji runtime; nie wyszukuje „najnowszego” runu i odrzuca niezgodność
+CAS. Opcjonalny checkout musi być tym samym checkoutem zapisanym w receipcie,
+a port powinien pozostać taki sam:
+
+```powershell
+just docker-dev-recreate `
+  $runReceipt $previousConfigSha256 $source 3197
+```
+
+Recepta wywołuje `recreate --direct-development`, więc po walidacji używa tego
+samego backendowego build-then-serve i istniejącego cache. Zachowuje run state,
+session store i zaakceptowany marker. Identyfikatory kontenerów mogą się
+zmienić; run, sesja i zadanie pozostają te same. Nie ponawia startupowego POST
+ani polecenia Solve i nie uruchamia osobnego `up` lub kontenera budującego.
+
+Ta ścieżka nie jest recovery nieznanego ownera. Nie używaj jej dla aktywnego
+runu, niepotwierdzonego zatrzymania, obcej grupy ani niewolnych rezerwacji.
+Nie dodawaj `--recover-idle-failure`, `--assembly-receipt` ani skryptu startowego;
+nie resetuje ownera, nie usuwa cache i nie tworzy nowej grupy. W razie błędu
+tożsamości, CAS, provenance lub storage pozostaje fail-closed, z zachowanym
+receiptem i diagnostyką.
+
 ### Logi i gotowość
 
 Docker Desktop pokazuje kompilację i późniejszy start API w logu tej samej

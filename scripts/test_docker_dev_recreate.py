@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -15,6 +16,7 @@ import docker_dev
 import docker_development_inputs as development_inputs
 import docker_frontend_cache as frontend_cache
 import fullmag_docker_runtime as runtime
+import fullmag_storage as storage
 
 
 def _sha256(path: Path) -> str:
@@ -26,6 +28,125 @@ class DockerDevRecreateContract(unittest.TestCase):
         parsed = docker_dev._parser().parse_args(["build", "--port", "4242"])
         self.assertEqual(parsed.port, 4242)
         self.assertIsNone(parsed.script)
+
+    def test_recreate_parser_selects_explicit_direct_development_mode(self):
+        parsed = docker_dev._parser().parse_args([
+            "recreate",
+            "--direct-development",
+            "--run-receipt",
+            "/owned/receipt.json",
+            "--previous-config-sha256",
+            "a" * 64,
+            "--image",
+            "fullmag/fullmag-dev:operator-pin",
+            "--toolchain-image",
+            "fullmag/development-base:operator-pin",
+        ])
+        self.assertTrue(parsed.direct_development)
+        self.assertIsNone(parsed.assembly_receipt)
+        self.assertEqual(parsed.image, "fullmag/fullmag-dev:operator-pin")
+        self.assertEqual(parsed.toolchain_image, "fullmag/development-base:operator-pin")
+
+    def test_direct_recreate_preflights_named_run_before_new_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "checkout"
+            source.mkdir()
+            args = types.SimpleNamespace(
+                source_root=source,
+                run_receipt=root / "receipt.json",
+                previous_config_sha256="b" * 64,
+            )
+            layout = {"build_root": root / "build", "build_storage_root": root / "build"}
+            identity = {
+                "project_name": "fullmag",
+                "project_id": "project-test",
+                "worktree_id": "worktree-test",
+                "checkout_kind": "worktree",
+            }
+            reuse = {
+                "source_root": str(source),
+                "project": "fullmag",
+                "receipt": {
+                    "source_project_id": identity["project_id"],
+                    "source_worktree_id": identity["worktree_id"],
+                    "source_checkout_kind": identity["checkout_kind"],
+                },
+            }
+            events = []
+            fake_runtime = types.ModuleType("fullmag_docker_runtime")
+
+            def load_reuse(*_args, **_kwargs):
+                events.append("preflight")
+                return reuse
+
+            fake_runtime._load_reuse_run = load_reuse
+            fake_runtime._select_reuse_compose_identity = Mock()
+
+            def new_run_root(_layout):
+                events.append("new-generation")
+                return "c" * 32, root / "generation"
+
+            def backend_start(_args, **_kwargs):
+                events.append("backend-inputs")
+                return {"schema": "backend-start-v1"}, root / "generation"
+
+            with patch.object(storage, "resolve_layout", return_value=layout), \
+                    patch.object(docker_dev, "_compose_identity",
+                                 return_value=identity), \
+                    patch.object(docker_dev, "_direct_heavy_lock",
+                                 return_value=nullcontext()), \
+                    patch.object(docker_dev, "_new_run_root", side_effect=new_run_root), \
+                    patch.object(docker_dev, "_backend_start_inputs",
+                                 side_effect=backend_start), \
+                    patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
+                selected, inputs = docker_dev._prepare_direct_recreate_backend_start(
+                    args, root
+                )
+
+            self.assertEqual(selected, source.resolve())
+            self.assertEqual(inputs, {"schema": "backend-start-v1"})
+            self.assertEqual(events, ["preflight", "new-generation", "backend-inputs"])
+            fake_runtime._select_reuse_compose_identity.assert_called_once()
+
+    def test_direct_recreate_rejects_canonical_identity_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "checkout"
+            source.mkdir()
+            args = types.SimpleNamespace(
+                source_root=source,
+                run_receipt=root / "receipt.json",
+                previous_config_sha256="b" * 64,
+            )
+            layout = {"build_root": root / "build", "build_storage_root": root / "build"}
+            identity = {
+                "project_name": "fullmag",
+                "project_id": "project-test",
+                "worktree_id": "worktree-test",
+                "checkout_kind": "worktree",
+            }
+            reuse = {
+                "source_root": str(source),
+                "project": "fullmag",
+                "receipt": {
+                    "source_project_id": "foreign-project",
+                    "source_worktree_id": identity["worktree_id"],
+                    "source_checkout_kind": identity["checkout_kind"],
+                },
+            }
+            fake_runtime = types.ModuleType("fullmag_docker_runtime")
+            fake_runtime._load_reuse_run = Mock(return_value=reuse)
+            fake_runtime._select_reuse_compose_identity = Mock()
+            with patch.object(storage, "resolve_layout", return_value=layout), \
+                    patch.object(docker_dev, "_compose_identity", return_value=identity), \
+                    patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
+                with self.assertRaisesRegex(
+                    docker_dev.DirectDockerError,
+                    r"source_project_id",
+                ):
+                    docker_dev._prepare_direct_recreate_backend_start(args, root)
+            fake_runtime._select_reuse_compose_identity.assert_not_called()
 
     def test_pnpm_patch_tree_collects_regular_files_without_manifest_parsing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1128,6 +1249,100 @@ class DockerDevRecreateContract(unittest.TestCase):
             migrate_compose_project=True,
         )
         guard.assert_not_called()
+
+    def test_direct_recreate_passes_backend_start_without_legacy_assembly(self):
+        fake_runtime = types.ModuleType("fullmag_docker_runtime")
+        fake_runtime.start = Mock()
+        repo = Path(__file__).resolve().parents[1]
+        source = Path("/owned/checkout")
+        backend_start = {"schema": "backend-start-v1"}
+        args = types.SimpleNamespace(
+            repo_root=repo,
+            run_receipt=Path("/owned/receipt.json"),
+            assembly_receipt=None,
+            direct_development=True,
+            previous_config_sha256="e" * 64,
+            source_root=source,
+            port=3197,
+            script=None,
+            migrate_compose_project=False,
+            recover_idle_failure=None,
+        )
+        with patch.object(docker_dev, "_require_native_windows"), \
+                patch.object(docker_dev, "_assert_no_running_fullmag") as guard, \
+                patch.object(docker_dev, "_prepare_direct_recreate_backend_start",
+                             return_value=(source, backend_start)), \
+                patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
+            docker_dev.recreate(args)
+        fake_runtime.start.assert_called_once_with(
+            repo.resolve(),
+            None,
+            3197,
+            frontend="dev",
+            source_root=source,
+            startup_script=None,
+            project_name=None,
+            compose_template=repo.resolve() / docker_dev.COMPOSE_RUNTIME_FILE,
+            run_receipt=args.run_receipt,
+            previous_config_sha256=args.previous_config_sha256,
+            migrate_compose_project=False,
+            backend_start=backend_start,
+        )
+        guard.assert_not_called()
+
+    def test_direct_recreate_rejects_legacy_assembly(self):
+        fake_runtime = types.ModuleType("fullmag_docker_runtime")
+        fake_runtime.start = Mock()
+        repo = Path(__file__).resolve().parents[1]
+        args = types.SimpleNamespace(
+            repo_root=repo,
+            run_receipt=Path("/owned/receipt.json"),
+            assembly_receipt=Path("/owned/assembly.json"),
+            direct_development=True,
+            previous_config_sha256="f" * 64,
+            source_root=None,
+            port=3197,
+            script=None,
+            migrate_compose_project=False,
+            recover_idle_failure=None,
+        )
+        with patch.object(docker_dev, "_require_native_windows"), \
+                patch.object(docker_dev, "_prepare_direct_recreate_backend_start") as prepare, \
+                patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
+            with self.assertRaisesRegex(
+                docker_dev.DirectDockerError,
+                r"cannot be combined with --assembly-receipt",
+            ):
+                docker_dev.recreate(args)
+        prepare.assert_not_called()
+        fake_runtime.start.assert_not_called()
+
+    def test_direct_recreate_rejects_new_startup_script(self):
+        fake_runtime = types.ModuleType("fullmag_docker_runtime")
+        fake_runtime.start = Mock()
+        repo = Path(__file__).resolve().parents[1]
+        args = types.SimpleNamespace(
+            repo_root=repo,
+            run_receipt=Path("/owned/receipt.json"),
+            assembly_receipt=None,
+            direct_development=True,
+            previous_config_sha256="f" * 64,
+            source_root=None,
+            port=3197,
+            script=Path("scripts/new.py"),
+            migrate_compose_project=False,
+            recover_idle_failure=None,
+        )
+        with patch.object(docker_dev, "_require_native_windows"), \
+                patch.object(docker_dev, "_prepare_direct_recreate_backend_start") as prepare, \
+                patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
+            with self.assertRaisesRegex(
+                docker_dev.DirectDockerError,
+                r"cannot be combined with --script",
+            ):
+                docker_dev.recreate(args)
+        prepare.assert_not_called()
+        fake_runtime.start.assert_not_called()
 
     def test_reuse_restart_sentinel_rotates_with_new_image_identity(self):
         with tempfile.TemporaryDirectory() as directory:

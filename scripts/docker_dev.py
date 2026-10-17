@@ -812,6 +812,80 @@ def _new_run_root(layout: Mapping[str, object]) -> tuple[str, Path]:
     return run_id, root
 
 
+def _direct_recreate_source_root(args: argparse.Namespace) -> Path:
+    """Resolve the explicitly reused checkout without initializing storage."""
+
+    source_value = getattr(args, "source_root", None)
+    if source_value is None:
+        receipt, _ = _read_json(Path(args.run_receipt), "Docker runtime run receipt")
+        source_value = receipt.get("frontend_source_root") or receipt.get("source_root")
+        if not isinstance(source_value, str) or not source_value:
+            raise _fail("Direct development recreate requires the run receipt's source checkout")
+    candidate = Path(source_value)
+    if candidate.is_symlink():
+        raise _fail("Direct development recreate source checkout must not be a reparse point")
+    try:
+        selected = candidate.resolve(strict=True)
+    except OSError as error:
+        raise _fail(f"Direct development recreate source checkout is unavailable: {candidate}") from error
+    if not selected.is_dir() or selected.is_symlink():
+        raise _fail("Direct development recreate source checkout is not a real directory")
+    return selected
+
+
+def _prepare_direct_recreate_backend_start(
+    args: argparse.Namespace, repo: Path
+) -> tuple[Path, dict[str, object]]:
+    """Validate the old run, then prepare a new live-source generation."""
+
+    from fullmag_docker_runtime import _load_reuse_run, _select_reuse_compose_identity
+    from fullmag_storage import resolve_layout
+
+    selected = _direct_recreate_source_root(args)
+    layout = resolve_layout(selected, STORAGE_PROFILE)
+    reuse = _load_reuse_run(
+        layout,
+        args.run_receipt,
+        project_name=None,
+        frontend="dev",
+        previous_config_sha256=args.previous_config_sha256,
+    )
+    if reuse is None or reuse.get("source_root") is None:
+        raise _fail("Direct development recreate could not validate the named run")
+    if Path(reuse["source_root"]).resolve() != selected:
+        raise _fail("Direct development recreate source checkout differs from the reused run")
+    source_identity = _compose_identity(layout)
+    if reuse.get("project") == source_identity["project_name"]:
+        receipt = reuse.get("receipt")
+        if not isinstance(receipt, Mapping):
+            raise _fail("Direct development recreate has no validated source identity receipt")
+        for receipt_field, identity_field in (
+            ("source_project_id", "project_id"),
+            ("source_worktree_id", "worktree_id"),
+            ("source_checkout_kind", "checkout_kind"),
+        ):
+            if receipt.get(receipt_field) != source_identity[identity_field]:
+                raise _fail(
+                    "Direct development recreate source identity differs from the reused run: "
+                    + receipt_field
+                )
+    _select_reuse_compose_identity(
+        source_identity, source_identity["project_name"], reuse
+    )
+
+    direct_args = argparse.Namespace(**vars(args))
+    direct_args.source_root = selected
+    with _direct_heavy_lock(layout):
+        run_id, run_root = _new_run_root(layout)
+        backend_start, _ = _backend_start_inputs(
+            direct_args,
+            run_root=run_root,
+            run_id=run_id,
+            heavy_lock_held=True,
+        )
+    return selected, backend_start
+
+
 def _direct_compose_files(
     repo: Path,
     cache: Mapping[str, object] | None = None,
@@ -1945,6 +2019,42 @@ def recreate(args: argparse.Namespace) -> None:
     repo = Path(args.repo_root).resolve(strict=True)
     from fullmag_docker_runtime import start
 
+    direct_development = bool(getattr(args, "direct_development", False))
+    if direct_development:
+        if args.assembly_receipt is not None:
+            raise _fail(
+                "--direct-development cannot be combined with --assembly-receipt"
+            )
+        if getattr(args, "script", None) is not None:
+            raise _fail(
+                "--direct-development cannot be combined with --script; "
+                "the existing startup activation is preserved"
+            )
+        if getattr(args, "recover_idle_failure", None) is not None:
+            raise _fail(
+                "--direct-development cannot be combined with --recover-idle-failure"
+            )
+        selected, backend_start = _prepare_direct_recreate_backend_start(args, repo)
+        start(
+            repo,
+            None,
+            args.port,
+            frontend="dev",
+            source_root=selected,
+            startup_script=None,
+            project_name=None,
+            compose_template=repo / COMPOSE_RUNTIME_FILE,
+            run_receipt=args.run_receipt,
+            previous_config_sha256=args.previous_config_sha256,
+            migrate_compose_project=getattr(args, "migrate_compose_project", False),
+            backend_start=backend_start,
+        )
+        return
+    if args.assembly_receipt is None:
+        raise _fail(
+            "recreate requires --assembly-receipt unless --direct-development is selected"
+        )
+
     # No build or latest-run lookup is allowed here.  The runtime validates the
     # receipt, owner marker, source checkout, config CAS and package receipt
     # before it mutates the explicitly named run namespace.
@@ -2001,9 +2111,25 @@ def _parser() -> argparse.ArgumentParser:
         "--run-receipt", type=Path, required=True,
         help="receipt.json of the one existing run to reuse; latest lookup is forbidden",
     )
+    recreate_mode = recreate_parser.add_mutually_exclusive_group(required=True)
+    recreate_mode.add_argument(
+        "--assembly-receipt", type=Path,
+        help="new successful development assembly receipt to mount (legacy mode)",
+    )
+    recreate_mode.add_argument(
+        "--direct-development", action="store_true",
+        help=(
+            "reuse the named DEV run with live backend_start inputs; requires "
+            "--run-receipt and --previous-config-sha256 and excludes --assembly-receipt"
+        ),
+    )
     recreate_parser.add_argument(
-        "--assembly-receipt", type=Path, required=True,
-        help="new successful development assembly receipt to mount",
+        "--image",
+        help="optional immutable development image/tag override for direct development mode",
+    )
+    recreate_parser.add_argument(
+        "--toolchain-image",
+        help="optional immutable toolchain image/tag override for direct development mode",
     )
     recreate_parser.add_argument(
         "--previous-config-sha256", required=True,
