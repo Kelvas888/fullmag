@@ -149,14 +149,15 @@ afterEach(() => {
 describe("AntennaCompositionPanel runtime results", () => {
   it("authors the per-ampere source FFT from a symbolic solve output", async () => {
     mocks.scene.data = {
+      ...sceneFixture(),
       revision: 15,
-      objects: [{ id: "antenna-1" }, { id: "magnet-1" }],
+      objects: [{ id: "antenna-1", role: "antenna" }, { id: "magnet-1" }],
       antenna_field_solve_stages: [{
         id: "solve-1", source_object_id: "antenna-1", current_transport_id: "current-1",
         port_mode_ids: ["port-1"], outputs: [{ id: "basis-1", quantity: "H_ant_basis" }],
-        field_sampling_domain: { kind: "global" }, target_refs: [],
+        field_sampling_domain: { kind: "global" }, target_refs: [{ kind: "global" }],
       }],
-      antenna_port_modes: [{ id: "port-1", source_object_id: "antenna-1", current_transport_id: "current-1" }],
+      antenna_port_modes: sceneFixture().antenna_port_modes,
       antenna_spectrum_requests: [],
     } as unknown as SceneResource;
     mocks.commitTransaction.mockResolvedValue({ scene_revision: 16 });
@@ -207,15 +208,16 @@ describe("AntennaCompositionPanel runtime results", () => {
   });
   it("creates a projection and drive atomically from the selected solve stage", async () => {
     mocks.scene.data = {
+      ...sceneFixture(),
       revision: 11,
-      objects: [{ id: "antenna-1", name: "Conductor" }, { id: "magnet-1", name: "Magnet" }],
+      objects: [{ id: "antenna-1", name: "Conductor", role: "antenna" }, { id: "magnet-1", name: "Magnet" }],
       study: { stages: [{ kind: "run", stage_id: "run-1" }] },
       antenna_field_solve_stages: [{
         id: "solve-1", source_object_id: "antenna-1", current_transport_id: "current-1",
         port_mode_ids: ["port-1"], outputs: [{ id: "basis-1", quantity: "H_ant_basis" }],
-        field_sampling_domain: { kind: "global" }, target_refs: [],
+        field_sampling_domain: { kind: "global" }, target_refs: [{ kind: "global" }],
       }],
-      antenna_port_modes: [{ id: "port-1", source_object_id: "antenna-1", current_transport_id: "current-1" }],
+      antenna_port_modes: sceneFixture().antenna_port_modes,
       antenna_target_projections: [], solved_antenna_drives: [],
     } as unknown as SceneResource;
     mocks.commitTransaction.mockResolvedValue({ scene_revision: 12 });
@@ -913,7 +915,7 @@ describe("AntennaCompositionPanel runtime results", () => {
     }
   });
 
-  it("marks unsupported transverse and modal spectra invalid before execution", async () => {
+  it("rejects malformed transverse equilibrium references and unsupported modal spectra before execution", async () => {
     mocks.scene.data = {
       objects: [{ id: "antenna-1" }],
       antenna_spectrum_requests: [{
@@ -946,7 +948,7 @@ describe("AntennaCompositionPanel runtime results", () => {
       await act(async () => root.render(
         <AntennaCompositionPanel kind="spectrum" selection={spectrumSelection()} />,
       ));
-      expect(container.textContent).toContain("transverse spectrum is unsupported");
+      expect(container.textContent).toContain("transverse spectrum requires a valid equilibrium_ref");
       expect(container.textContent).toContain("mode_basis_ref is unsupported");
       expect(findGroupBadge(container, "invalid · result pending")).toBeDefined();
       const scene = mocks.scene.data as unknown as { antenna_spectrum_requests: Array<Record<string, unknown>> };
@@ -1064,7 +1066,7 @@ describe("AntennaCompositionPanel runtime results", () => {
         ),
       );
       expect(container.textContent).toContain("LayoutMicrostripAntennaLayout");
-      expect(container.textContent).toContain("Layout conductivity5.8000e+7 S/m");
+      expect(container.textContent).toContain("Layout conductivity58 MS/m");
       expect(container.textContent).toContain("No explicit current module is assigned to this object.");
       expect(container.textContent).not.toContain("Station 1");
       expect(container.textContent).not.toContain("Return width");
@@ -1231,10 +1233,32 @@ describe("AntennaCompositionPanel runtime results", () => {
 
 function sceneFixture(): SceneResource {
   return {
-    objects: [{ id: "antenna-1" }],
+    objects: [{ id: "antenna-1", role: "antenna" }],
+    current_transports: [{
+      name: "current-1", kind: "current_transport", model: "ohmic_poisson",
+      domain: [{ object_id: "antenna-1" }],
+      boundaries: ["signal-in", "signal-out", "return-in", "return-out"].map(id => ({
+        id, kind: "equipotential_current_terminal",
+        surfaces: [{ object_id: "antenna-1", surface_id: id, orientation: [0, 1, 0] }],
+      })),
+      // Structural authoring fixture only; this does not qualify a native current view.
+      conservative_current_view: {
+        stable_vertex_ids: [1], boundary_faces: [{}], identity: {}, pins: {}, closure: {},
+      },
+    }],
+    antenna_port_modes: [{
+      id: "port-1", schema_version: "antenna_port_mode.v2", source_object_id: "antenna-1",
+      current_transport_id: "current-1", normalization_current_a: 1,
+      branches: [
+        { id: "signal", inlet_terminal_ref: "signal-in", outlet_terminal_ref: "signal-out", signed_weight: 1 },
+        { id: "return", inlet_terminal_ref: "return-in", outlet_terminal_ref: "return-out", signed_weight: -1 },
+      ],
+    }],
     antenna_field_solve_stages: [
       {
-        id: "solve-1", source_object_id: "antenna-1",
+        id: "solve-1", source_object_id: "antenna-1", current_transport_id: "current-1",
+        port_mode_ids: ["port-1"], target_refs: [{ kind: "global" }],
+        field_sampling_domain: { kind: "global" },
         outputs: [{ id: "solution-1", quantity: "H_ant_basis" }],
       },
     ],

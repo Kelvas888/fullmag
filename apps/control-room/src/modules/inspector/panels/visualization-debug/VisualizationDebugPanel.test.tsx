@@ -1,7 +1,13 @@
 import { readFileSync } from "node:fs";
-import { renderToStaticMarkup } from "react-dom/server";
+import type { ReactNode } from "react";
+import { renderToStaticMarkup as renderWithoutKernel } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { EventBus } from "@/kernel/events/EventBus";
+import type { KernelEventMap } from "@/kernel/events/eventTypes";
+import { KernelContext } from "@/kernel/KernelContext";
+import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
+import type { KernelApi } from "@/kernel/types";
 import type { FieldMetaResource } from "@/kernel/api/apiTypes";
 import { DATA_FIELD_VECTOR_PATH } from "@/kernel/api/apiPaths";
 import type { RequestDiagnosticEntry } from "@/kernel/api/RequestDiagnosticsController";
@@ -13,6 +19,20 @@ import type {
 } from "./VisualizationDebugPanelModel";
 import { VisualizationDebugPanelView } from "./VisualizationDebugPanel";
 import { memoryGroups } from "./visualizationDebugPresentation";
+
+// SSR keeps the real sample table and resource hooks on their server snapshots.
+function renderToStaticMarkup(element: ReactNode): string {
+  const bus = new EventBus<KernelEventMap>();
+  const kernel = {
+    api: { resourceCacheScope: "visualization-debug-view-ssr" },
+    bus,
+    diagnosticRecorder: { record: vi.fn() },
+    resources: new ResourceInvalidationController(bus),
+  } as unknown as KernelApi;
+  return renderWithoutKernel(
+    <KernelContext.Provider value={kernel}>{element}</KernelContext.Provider>,
+  );
+}
 
 const SECTION_TITLES = [
   "Health",

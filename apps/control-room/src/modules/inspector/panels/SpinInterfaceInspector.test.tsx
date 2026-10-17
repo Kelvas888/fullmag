@@ -12,6 +12,20 @@ const known = { id: "nf", kind: "mixing_conductance", normal_side: { object_id: 
 const opaque = { id: "future", kind: "vendor.interface.v9", exact: { preserve: true } };
 
 vi.mock("@/kernel/resources/spinAuthoringResources", () => ({
+  useSpinAuthoringGeometryResource: () => ({
+    data: {
+      revision: 4,
+      objects: [{ id: "stack", name: "Stack", regions: [
+        { region_id: "n", name: "Normal metal" },
+        { region_id: "f", name: "Ferromagnet" },
+      ] }],
+      current_transports: [],
+      spin_transports: [{ id: "spin", interfaces: [known, opaque] }],
+    },
+    error: null,
+    revision: 4,
+    status: "ready",
+  }),
   SPIN_INTERFACES_RESOURCE_KEY: "interfaces",
   SPIN_TRANSPORTS_RESOURCE_KEY: "transports",
   useSpinInterfacesResource: () => ({ data: { scene_revision: 4, items: [

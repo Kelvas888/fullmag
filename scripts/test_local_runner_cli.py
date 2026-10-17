@@ -44,6 +44,7 @@ class ClientTests(unittest.TestCase):
             enable_current_contracts=False,
             enable_slepc_modal=True,
             enable_slepc_runtime_v2=False,
+            enable_boris_cpu=False,
         )
 
     def test_list_does_not_create_empty_queue(self):

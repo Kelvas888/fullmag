@@ -233,6 +233,7 @@ vi.mock("@/kernel/layout/useLayout", () => ({
 }));
 vi.mock("@/modules/viewport-3d/public", () => ({
   manifestRenderableCarriers: () => [],
+  useViewport3DArtifactInspectionPresentation: () => null,
 }));
 vi.mock("../primitives/FieldRow", () => ({
   FieldRow: ({ label, value }: { label: React.ReactNode; value: React.ReactNode }) => (

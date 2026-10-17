@@ -44,10 +44,11 @@ describe("composeAntennaProjectionDrive", () => {
     const existing = {
       ...scene,
       antenna_target_projections: [{ id: "solve:projection:1" }],
-      solved_antenna_drives: [{ id: "solve:drive:1" }],
+      solved_antenna_drives: [{ id: "solve:drive:1", name: "Current drive 1" }],
     } as SceneResource;
     const created = composeAntennaProjectionDrive(existing, "solve", "magnet", "run", "0.01", "1e9");
     expect(created.projection.id).toBe("solve:projection:2");
     expect(created.drive.id).toBe("solve:drive:2");
+    expect(created.drive.name).toBe("Current drive 2");
   });
 });
