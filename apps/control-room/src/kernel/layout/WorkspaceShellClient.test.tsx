@@ -594,7 +594,9 @@ describe("WorkspaceShellClient Home entry surface", () => {
       expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeTruthy();
       expect(launchTile(container, "start.new-fdm")?.getAttribute("disabled")).not.toBeNull();
       expect(launchTile(container, "start.new-fem")?.getAttribute("disabled")).not.toBeNull();
-      expect(list).toHaveBeenCalledTimes(1);
+      // An unconfirmed status identity triggers one shared collection recovery.
+      // Home stays mounted while that bounded refresh is in flight.
+      expect(list).toHaveBeenCalledTimes(2);
       expect(currentStatus).toHaveBeenCalledTimes(1);
 
       const retry = findElements(
@@ -608,7 +610,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
       });
 
       expect(currentStatus).toHaveBeenCalledTimes(2);
-      expect(list).toHaveBeenCalledTimes(2);
+      expect(list).toHaveBeenCalledTimes(3);
       expect(findByAttribute(container, "data-state", "home-session-reconnecting")).toBeNull();
       expect(findByAttribute(container, "data-slot-id", "viewport-main")).toBeTruthy();
     } finally {
