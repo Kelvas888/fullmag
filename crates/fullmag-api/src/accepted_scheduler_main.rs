@@ -608,7 +608,7 @@ fn run_scheduler(
                             || {
                                 format!(
                                     "compute scheduler: admit run `{}` on resource `{}`",
-                                    candidate.run_id, resource.resource_id
+                                    candidate.run_id.as_str(), resource.resource_id
                                 )
                             },
                         )?
@@ -624,7 +624,7 @@ fn run_scheduler(
                             || {
                                 format!(
                                     "compute scheduler: admit run `{}` on resource `{}`",
-                                    candidate.run_id, resource.resource_id
+                                    candidate.run_id.as_str(), resource.resource_id
                                 )
                             },
                         )?
