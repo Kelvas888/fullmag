@@ -267,7 +267,7 @@ describe("TransportAuthoringInspector", () => {
     );
 
     expect(html).toContain('value="ohmic_poisson" selected=""');
-    expect(html).toContain('&quot;region_id&quot;: &quot;free-layer&quot;');
+    expect(html).toContain('value="[&quot;pillar&quot;,&quot;free-layer&quot;]" selected=""');
     expect(html).toContain('data-scope-kind="region"');
     expect(html).toContain("region:pillar:free-layer");
   });
@@ -286,8 +286,7 @@ describe("TransportAuthoringInspector", () => {
       </KernelContext.Provider>,
     );
 
-    expect(html).toContain('&quot;object_id&quot;: &quot;pillar&quot;');
-    expect(html).toContain('&quot;region_id&quot;: &quot;free-layer&quot;');
+    expect(html).toContain('value="[&quot;pillar&quot;,&quot;free-layer&quot;]" selected=""');
     expect(html).toContain('data-scope-kind="region"');
     expect(html).toContain("region:pillar:free-layer");
   });
@@ -305,8 +304,8 @@ describe("TransportAuthoringInspector", () => {
       </KernelContext.Provider>,
     );
 
-    expect(html).toContain('&quot;object_id&quot;: &quot;free-layer&quot;');
-    expect(html).not.toContain('&quot;region_id&quot;');
+    expect(html).toContain('value="[&quot;free-layer&quot;,&quot;&quot;]" selected=""');
+    expect(html).not.toMatch(/<option[^>]*value="\[&quot;free-layer&quot;,&quot;[^&]+&quot;\]"[^>]*selected=""/);
     expect(html).toContain('data-scope-kind="object"');
     expect(html).toContain("object:free-layer");
   });

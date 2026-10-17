@@ -42,6 +42,7 @@ const mocks = vi.hoisted(() => ({
     status: "idle" as "idle" | "loading" | "ready" | "stale" | "error",
   },
   scene: {
+    sessionScopeKey: "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7",
     data: null as SceneResource | null,
     error: null as Error | null,
     refetch: vi.fn(),
@@ -122,7 +123,7 @@ import { AntennaGeometryPanel } from "./AntennaGeometryPanel";
 
 function committedDriveAck(transaction: {
   base_revision: number;
-  merge_patch: { solved_antenna_drives: SceneResource["solved_antenna_drives"] };
+  merge_patch: Partial<SceneResource>;
 }) {
   const revision = transaction.base_revision + 1;
   return {
@@ -160,7 +161,7 @@ describe("AntennaCompositionPanel runtime results", () => {
       antenna_port_modes: sceneFixture().antenna_port_modes,
       antenna_spectrum_requests: [],
     } as unknown as SceneResource;
-    mocks.commitTransaction.mockResolvedValue({ scene_revision: 16 });
+    mocks.commitTransaction.mockImplementation(async transaction => committedDriveAck(transaction));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
     const root = createRoot(container as unknown as Element);
@@ -182,7 +183,9 @@ describe("AntennaCompositionPanel runtime results", () => {
       target.value = "magnet-1";
       await act(async () => target.dispatchEvent(new TestEvent("change", { bubbles: true })));
       for (const [label, value] of [
-        ["Plane origin", "0,0,0"], ["Axis u", "1,0,0"], ["Axis v", "0,1,0"],
+        ["Plane origin X", "0"], ["Plane origin Y", "0"], ["Plane origin Z", "0"],
+        ["Axis u X", "1"], ["Axis u Y", "0"], ["Axis u Z", "0"],
+        ["Axis v X", "0"], ["Axis v Y", "1"], ["Axis v Z", "0"],
         ["Extent u", "2e-7"], ["Extent v", "1e-7"], ["Samples u", "33"], ["Samples v", "17"],
       ]) {
         const input = find("INPUT", label);
@@ -198,7 +201,7 @@ describe("AntennaCompositionPanel runtime results", () => {
           transform: "spatial_fft",
           sampling_plane: expect.objectContaining({ sample_count_u: 33, sample_count_v: 17, interpolation: "fem_element" }),
         })] },
-      });
+      }, { sessionScopeKey: "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7" });
       await act(async () => find("BUTTON", "Create source FFT request").dispatchEvent(new TestEvent("click", { bubbles: true })));
       expect(mocks.commitTransaction).toHaveBeenCalledTimes(1);
     } finally {
@@ -220,7 +223,7 @@ describe("AntennaCompositionPanel runtime results", () => {
       antenna_port_modes: sceneFixture().antenna_port_modes,
       antenna_target_projections: [], solved_antenna_drives: [],
     } as unknown as SceneResource;
-    mocks.commitTransaction.mockResolvedValue({ scene_revision: 12 });
+    mocks.commitTransaction.mockImplementation(async transaction => committedDriveAck(transaction));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
     const root = createRoot(container as unknown as Element);
@@ -237,10 +240,13 @@ describe("AntennaCompositionPanel runtime results", () => {
     };
     try {
       await act(async () => root.render(<AntennaCompositionPanel kind="solution" selection={solutionSelection()} />));
-      await act(async () => find("BUTTON", "Create projection and drive").dispatchEvent(new TestEvent("click", { bubbles: true })));
+      await act(async () => find("BUTTON", "Create projection").dispatchEvent(new TestEvent("click", { bubbles: true })));
       expect(mocks.commitTransaction).not.toHaveBeenCalled();
-      const target = find("SELECT", "Target object");
-      target.value = "magnet-1";
+      const composition = find("SELECT", "Projection composition");
+      composition.value = "drive";
+      await act(async () => composition.dispatchEvent(new TestEvent("change", { bubbles: true })));
+      const target = find("SELECT", "Projection target");
+      target.value = JSON.stringify(["object", "magnet-1"]);
       await act(async () => target.dispatchEvent(new TestEvent("change", { bubbles: true })));
       const run = find("SELECT", "Run stage");
       run.value = "run-1";
@@ -263,18 +269,21 @@ describe("AntennaCompositionPanel runtime results", () => {
             activation: { kind: "stage_ids", stage_ids: ["run-1"] },
           })],
         },
-      });
+      }, { sessionScopeKey: "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7" });
       await act(async () => find("BUTTON", "Create projection and drive").dispatchEvent(new TestEvent("click", { bubbles: true })));
       expect(mocks.commitTransaction).toHaveBeenCalledTimes(1);
       mocks.scene.data = { ...mocks.scene.data!, revision: 12 } as SceneResource;
       mocks.commitTransaction.mockRejectedValueOnce({ status: 409 });
       await act(async () => root.render(<AntennaCompositionPanel kind="solution" selection={solutionSelection()} />));
+      const peak = find("INPUT", "Peak current");
+      Object.getOwnPropertyDescriptor(TestElement.prototype, "value")?.set?.call(peak, "0.02");
+      await act(async () => peak.dispatchEvent(new TestEvent("input", { bubbles: true })));
       await act(async () => find("BUTTON", "Create projection and drive").dispatchEvent(new TestEvent("click", { bubbles: true })));
-      expect(container.textContent).toContain("Scene revision conflict");
+      expect(container.textContent).toContain("Scene changed or the previous write was not confirmed");
       await act(async () => find("BUTTON", "Create projection and drive").dispatchEvent(new TestEvent("click", { bubbles: true })));
       expect(mocks.commitTransaction).toHaveBeenCalledTimes(2);
-      await act(async () => find("BUTTON", "Refetch Scene").dispatchEvent(new TestEvent("click", { bubbles: true })));
-      expect(mocks.scene.refetch).toHaveBeenCalledTimes(1);
+      await act(async () => find("BUTTON", "Refresh projection source").dispatchEvent(new TestEvent("click", { bubbles: true })));
+      expect(mocks.scene.refetch).toHaveBeenCalledTimes(2);
     } finally {
       await act(async () => root.unmount());
       dom.restore();
@@ -358,7 +367,7 @@ describe("AntennaCompositionPanel runtime results", () => {
           expect.objectContaining({ id: "drive-1", peak_current_a: 3 }),
           expect.objectContaining({ id: "drive-2", peak_current_a: 2 }),
         ] }),
-        8, undefined, true,
+        8, undefined, false,
         "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7", undefined,
       );
       expect(mocks.invalidate).toHaveBeenCalled();
@@ -1199,8 +1208,8 @@ describe("AntennaCompositionPanel runtime results", () => {
       expect(container.textContent).toContain("Requested executionbackend=fem · device=auto · precision=double · mode=strict");
       expect(container.textContent).toContain("Resolved executionbackend=fem · device=cpu · precision=double · mode=strict");
       expect(container.textContent).toContain("Gauge policyzero_mean");
-      expect(container.textContent).toContain("Port port-1 measured current2.0000e+0 A");
-      expect(container.textContent).toContain("Port port-1 normalization1.0000e+0 A");
+      expect(container.textContent).toContain("Port port-1 measured current2 A");
+      expect(container.textContent).toContain("Port port-1 normalization1 A");
       expect(container.textContent).toContain("Port port-1 current certificatesha256:certificate");
       expect(container.textContent).toContain("Port port-1 magnetic basisA/m/A · 6 values");
       expect(container.textContent).toContain("Oersted field H/I");
@@ -1233,6 +1242,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
 function sceneFixture(): SceneResource {
   return {
+    scene: { id: "session-1" },
     objects: [{ id: "antenna-1", role: "antenna" }],
     current_transports: [{
       name: "current-1", kind: "current_transport", model: "ohmic_poisson",

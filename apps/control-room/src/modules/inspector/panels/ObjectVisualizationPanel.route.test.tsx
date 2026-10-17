@@ -77,8 +77,12 @@ vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
       status: testState.fieldCatalog ? testState.fieldCatalogStatus : "idle",
     };
   },
-  useQuantityCatalogResource: ({ enabled }: { enabled: boolean }) => {
+  useQuantityCatalogResource: ({ enabled = true }: { enabled?: boolean } = {}) => {
     resourceCall("quantity-catalog", enabled);
+    return { data: null, error: null, revision: null, status: "idle" };
+  },
+  useFieldMetaResource: ({ enabled = true }: { enabled?: boolean }) => {
+    resourceCall("field-meta", enabled);
     return { data: null, error: null, revision: null, status: "idle" };
   },
   useSolverStatusResource: ({ enabled }: { enabled: boolean }) => {

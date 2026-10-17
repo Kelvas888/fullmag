@@ -971,7 +971,19 @@ async function installBrowserAuditInstrumentation(page) {
 }
 
 async function waitForViewportDiagnostics(page) {
-  await page.waitForFunction(() => Array.from(document.querySelectorAll(".fm-viewport-3d__hud span")).some((node) => node.textContent?.includes("geo:")), undefined, { timeout: 20_000 });
+  const trigger = page.locator(".fm-viewport-3d").getByRole("button", { name: "Render details", exact: true });
+  if (await trigger.getAttribute("aria-expanded") !== "true") {
+    await trigger.click();
+  }
+  // Render diagnostics is portalled outside the viewport HUD.
+  const details = page.getByRole("dialog", { name: "Render diagnostics", exact: true });
+  await details.waitFor({ state: "visible", timeout: 20_000 });
+  await waitForCondition(
+    async () => (await details.textContent())?.includes("geo:"),
+    20_000,
+    "Timed out waiting for viewport render diagnostics.",
+  );
+  return details;
 }
 
 async function readBrowserAuditCounters(page) {
@@ -979,9 +991,8 @@ async function readBrowserAuditCounters(page) {
 }
 
 async function readViewportDiagnostics(page) {
-  const raw = await page.locator(".fm-viewport-3d__hud span").evaluateAll((nodes) =>
-    nodes.find((node) => node.textContent?.includes("geo:"))?.textContent ?? "",
-  );
+  const details = await waitForViewportDiagnostics(page);
+  const raw = await details.textContent() ?? "";
   const match = raw.match(/(?:^|\s)geo:(\d+)/);
   return { geo: Number(match?.[1] ?? 0), raw };
 }

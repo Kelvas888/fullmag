@@ -244,7 +244,7 @@ describe("VisualizationDebugPanelView", () => {
     expect(html).not.toContain("tabindex=\"-1\"");
   });
 
-  it("caps samples at 12 rows and components at 8 without raw tuples", () => {
+  it("caps samples at 12 rows and components at 9 without raw tuples", () => {
     const model = mapCarrier(readyModel(), (carrier) => ({
       ...carrier,
       payload: { ...carrier.payload!, nComp: 10 },
@@ -259,8 +259,8 @@ describe("VisualizationDebugPanelView", () => {
       <VisualizationDebugPanelView model={model} nowMs={2_000} />,
     );
     expect((html.match(/data-sample-row=/g) ?? [])).toHaveLength(12);
-    expect(html).toContain("c7");
-    expect(html).not.toContain("c8");
+    expect(html).toContain("c8");
+    expect(html).not.toContain("c9");
     expect(html).not.toContain("[0,0.1");
     expect(html).not.toMatch(/<tr[^>]*data-sample-row=[^>]*title=/);
     expect(html).toContain("Showing 12 of 18 samples");

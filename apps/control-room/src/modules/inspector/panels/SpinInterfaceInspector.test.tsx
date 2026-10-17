@@ -26,6 +26,7 @@ vi.mock("@/kernel/resources/spinAuthoringResources", () => ({
     revision: 4,
     status: "ready",
   }),
+  useSpinInterfaceMeshEvidenceResource: () => ({ data: null, error: null, revision: null, status: "idle" }),
   SPIN_INTERFACES_RESOURCE_KEY: "interfaces",
   SPIN_TRANSPORTS_RESOURCE_KEY: "transports",
   useSpinInterfacesResource: () => ({ data: { scene_revision: 4, items: [

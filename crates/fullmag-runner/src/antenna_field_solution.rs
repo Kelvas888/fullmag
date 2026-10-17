@@ -3219,13 +3219,25 @@ mod tests {
         )
         .is_err());
 
+        verify_antenna_field_solution_referenced_data(
+            &artifacts.last().unwrap().bytes,
+            &artifacts[..artifacts.len() - 1],
+        )
+        .expect("untampered fixture passes referenced payload integrity");
         let mut payloads = artifacts[..artifacts.len() - 1].to_vec();
-        payloads
+        let field_payload = payloads
             .iter_mut()
             .find(|artifact| artifact.relative_path.ends_with("H_per_A.f64le"))
-            .expect("magnetic field payload")
-            .bytes[0] ^= 1;
-        assert!(load_solved_antenna_drive_basis_projected(
+            .expect("magnetic field payload");
+        let original_bytes = field_payload.bytes.clone();
+        field_payload.bytes[0] ^= 1;
+        assert_eq!(field_payload.bytes.len(), original_bytes.len());
+        assert!(field_payload.bytes.chunks_exact(8).all(|chunk| {
+            f64::from_le_bytes(chunk.try_into().unwrap()).is_finite()
+        }));
+        assert_ne!(sha256(&field_payload.bytes), sha256(&original_bytes));
+        let field_path = field_payload.relative_path.clone();
+        let error = load_solved_antenna_drive_basis_projected(
             &artifacts.last().unwrap().bytes,
             &payloads,
             drive(),
@@ -3236,9 +3248,13 @@ mod tests {
             &[[0.1, 0.2, 0.3]],
             None,
         )
-        .unwrap_err()
-        .message
-        .contains("sha256 mismatch"));
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            format!(
+                "antenna field payload '{field_path}' sha256, size, or finite-value check failed"
+            )
+        );
 
         assert!(load_solved_antenna_drive_basis_projected(
             &artifacts.last().unwrap().bytes,

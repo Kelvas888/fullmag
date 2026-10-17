@@ -167,7 +167,7 @@ describe("Visualization Debug integrated React lifecycle stress", () => {
             carrier.samples.map((sample) => sample.componentValues.length),
           ),
         ),
-      ).toBe(8);
+      ).toBe(9);
       assertNoBinaryCarrier(snapshots);
       assertNoBinaryCarrier(observedModels);
 

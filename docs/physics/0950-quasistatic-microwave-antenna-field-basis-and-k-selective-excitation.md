@@ -1021,8 +1021,15 @@ rozwiązania algebraicznego; nie zmienia więzów KKT ani niezależnego
 certyfikatu fizycznego `1e-18 A + 1e-10 * scale_A`. Zerowy RHS nadal
 podlega istniejącej obsłudze solvera. Globalna norma KKT nie zastępuje
 certyfikatu każdego elementu, również wiersza pominiętego jako zależny.
-Kompilacja i zarządzana próba pełnego obwodu po tej zmianie pozostają
-NOT VERIFIED; wcześniejszy przebieg odrzucił publikację przed V/J/H.
+Zarządzany build 93 (`8cd0f267d22c45cab01f59c64e227541`) zakończył się
+sukcesem dla zamrożonych źródeł sprzed integracji mastera. Rzeczywista próba
+pełnego obwodu `ea21876f779342dfbb00922ad3a90574` odrzuciła publikację:
+lokalny residual elementu wyniósł $-2.3634108111867357\times10^{-15}\,\mathrm A$
+przy skali $1.516892541918217\times10^{-5}\,\mathrm A$, przekraczając
+niezmieniony certyfikat fizyczny. Bramka zgłosiła `elements_ok=0`,
+`faces_ok=1`, `pairs_ok=1`. V/J/H nie zostały zaakceptowane; dodatni odczyt
+HTTP i zimny odczyt pozostają NOT VERIFIED. Sukces kompilacji nie kwalifikuje
+rozwiązania fizycznego ani późniejszego połączenia gałęzi z masterem.
 
 
 | Prywatne wejście | Typ/default | Jednostka SI | Walidacja |
