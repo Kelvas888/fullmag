@@ -129,7 +129,7 @@ case "${recipe}" in
     exec "${python_cmd}" "${script_dir}/bootstrap_docker_toolchain.py" --repo-root "${repo_root}" "${toolchain_mode[@]}"
     ;;
   *"scripts/recover_docker_orphan.py"*)
-    orphan_recovery_pattern="^[^[:space:]]+ \"[^\"]+/scripts/recover_docker_orphan.py\" --pins '([^']+)' --target-container '([0-9a-f]{64})' --project '(fullmag-(master|worktree-[a-z0-9._-]+))' --diagnostics-root '([^']+)'[[:space:]]*$"
+    orphan_recovery_pattern="^[^[:space:]]+ \"[^\"]+/scripts/recover_docker_orphan.py\" --pins '([^']+)' --target-container '([0-9a-f]{64})' --project '(fullmag-(master|worktree-[a-z0-9._-]+))' --diagnostics-root '([^']+)'( --resume-before-stop)?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${orphan_recovery_pattern} ]]; then
       echo "[fullmag just] invalid controlled worker orphan recovery recipe" >&2
       exit 2
@@ -140,10 +140,14 @@ case "${recipe}" in
     orphan_container="${BASH_REMATCH[2]}"
     orphan_project="${BASH_REMATCH[3]}"
     orphan_diagnostics="${BASH_REMATCH[5]}"
+    orphan_resume=()
+    if [[ -n "${BASH_REMATCH[6]:-}" ]]; then
+      orphan_resume=(--resume-before-stop)
+    fi
     exec "${python_cmd}" "${resolver}" run --repo-root "${repo_root}" --profile docker-all-gpu -- \
       "${python_cmd}" "${script_dir}/recover_docker_orphan.py" --pins "${orphan_pins}" \
       --target-container "${orphan_container}" --project "${orphan_project}" \
-      --diagnostics-root "${orphan_diagnostics}"
+      --diagnostics-root "${orphan_diagnostics}" "${orphan_resume[@]}"
     ;;
   *"scripts/docker_dev.py"*)
     docker_dev_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" (build|up --port '[0-9]{4,5}')( --source-root '[^']+')?( --script '[^']+')?[[:space:]]*$"

@@ -44,6 +44,13 @@ class OrphanRecoveryShellBoundaryTests(unittest.TestCase):
                          'fullmag-worktree-task-123', '--diagnostics-root',
                          '/storage/run/state/diagnostics/orphan'])
 
+    def test_dispatches_explicit_pre_stop_resume_as_one_fixed_flag(self):
+        result = self.dispatch(self.recipe() + " --resume-before-stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)[-1], "--resume-before-stop")
+        result = self.dispatch(self.recipe() + " --resume-before-stop; printf injected")
+        self.assertEqual(result.returncode, 2, result.stderr)
+
     def test_literal_shell_syntax_is_data_not_a_second_command(self):
         pins = '/storage/$(printf injected);literal/pins.json'
         result = self.dispatch(self.recipe(pins=pins))
