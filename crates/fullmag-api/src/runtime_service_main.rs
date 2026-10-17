@@ -5,22 +5,26 @@ use anyhow::{bail, Context, Result};
 use fullmag_session::{
     compute_node_snapshot::Reported,
     host_resource_ledger::{
-        HostInventoryOwner, HostInventoryOwnerDescriptor, HostResourceLedger,
-        HostResourceLedgerPolicy, HostRuntimeReadiness,
-        HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2,
+        HostInventoryOwner, HostInventoryOwnerDescriptor, HostReservationIdentity,
+        HostReservationOwner, HostResourceLedger, HostResourceLedgerPolicy,
+        HostResourceReservation, HostResourceReservationState, HostRuntimeReadiness,
+        HostWorkerLaunchGate, HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2,
     },
     repository_path::{checked_path, validate_store_id},
     runtime_service::{
-        RuntimeServiceChild, RuntimeServiceConfig as ServiceConfig, RuntimeServiceOwner,
-        RuntimeServiceState, RUNTIME_SERVICE_CONFIG_SCHEMA_V2,
+        validate_descriptor, RuntimeServiceChild, RuntimeServiceConfig as ServiceConfig,
+        RuntimeServiceLaunchGuard, RuntimeServiceOwner, RuntimeServiceOwnerDescriptor,
+        RuntimeServiceOwnerLockGuard, RuntimeServiceState, RUNTIME_SERVICE_CONFIG_SCHEMA_V2,
+        RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH,
     },
     runtime_service_host::{
         RuntimeServiceHostExecution, RuntimeServiceHostPlacement,
         RUNTIME_SERVICE_HOST_EXECUTION_SCHEMA_V1,
     },
+    runtime_service_startup::RuntimeServiceStartupGuard,
     FmsPreparationResourceOffer, FmsPreparationResourcePool, FmsResourceBudget, FmsResourceKind,
-    FmsSchedulerResourceOffer, FmsSchedulerResourcePool, SessionStore,
-    FMS_PREPARATION_RESOURCE_POOL_SCHEMA, FMS_SCHEDULER_RESOURCE_POOL_SCHEMA,
+    FmsResourceLease, FmsResourceLeaseState, FmsSchedulerResourceOffer, FmsSchedulerResourcePool,
+    SessionStore, FMS_PREPARATION_RESOURCE_POOL_SCHEMA, FMS_SCHEDULER_RESOURCE_POOL_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1275,6 +1279,595 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     Ok(())
 }
 
+const FAILED_NO_SPAWN_CANCELLATION_SCHEMA: &str = "runtime_service_failed_no_spawn_cancellation.v1";
+const FAILED_NO_SPAWN_CANCELLATION_MAX_REQUEST_BYTES: usize = 256 * 1024;
+
+/// Operator authorization for cancelling one accepted solver task after the
+/// native service has durably failed before the worker launch permit was used.
+/// Every digest is over the complete typed record observed by the operator;
+/// partial identity checks would allow a stale request to target a new retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailedNoSpawnCancellationRequest {
+    schema_version: String,
+    request_id: String,
+    config_sha256: String,
+    owner_sha256: String,
+    expected_owner: RuntimeServiceOwnerDescriptor,
+    claim_sha256: String,
+    lease_sha256: String,
+    reservation_sha256: String,
+    identity: HostReservationIdentity,
+    reason: String,
+}
+
+impl FailedNoSpawnCancellationRequest {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != FAILED_NO_SPAWN_CANCELLATION_SCHEMA {
+            bail!("unsupported failed no-spawn cancellation schema");
+        }
+        let request_id = uuid::Uuid::parse_str(&self.request_id)
+            .context("failed no-spawn cancellation request id is not a UUID")?;
+        if request_id.is_nil() || request_id.to_string() != self.request_id {
+            bail!("failed no-spawn cancellation request id must be canonical and nonzero");
+        }
+        for (value, field) in [
+            (&self.config_sha256, "config_sha256"),
+            (&self.owner_sha256, "owner_sha256"),
+            (&self.claim_sha256, "claim_sha256"),
+            (&self.lease_sha256, "lease_sha256"),
+            (&self.reservation_sha256, "reservation_sha256"),
+        ] {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!("{field} must be a lowercase SHA-256 digest");
+            }
+        }
+        validate_store_id(&self.identity.store_id).context("cancellation store id")?;
+        for (value, field) in [
+            (&self.identity.run_id, "run_id"),
+            (&self.identity.task_id, "task_id"),
+            (&self.identity.resource_id, "resource_id"),
+            (&self.identity.lease_token, "lease_token"),
+        ] {
+            validate_store_id(value).with_context(|| format!("cancellation {field}"))?;
+        }
+        match &self.identity.owner {
+            HostReservationOwner::Solver {
+                attempt_id,
+                ownership_epoch,
+            } => {
+                validate_store_id(attempt_id).context("cancellation attempt id")?;
+                if *ownership_epoch == 0 {
+                    bail!("cancellation ownership epoch must be positive");
+                }
+            }
+            HostReservationOwner::Preparation { .. } => {
+                bail!("failed no-spawn cancellation requires a solver reservation")
+            }
+        }
+        validate_descriptor(&self.expected_owner)?;
+        if self.expected_owner.state != RuntimeServiceState::Failed {
+            bail!("failed no-spawn cancellation requires a Failed owner descriptor");
+        }
+        if self.reason.trim().is_empty()
+            || self.reason.len() > 4096
+            || self.reason.chars().any(char::is_control)
+        {
+            bail!("failed no-spawn cancellation reason is empty, too long, or unsafe");
+        }
+        Ok(())
+    }
+}
+
+fn read_stable_absolute_operational_file(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("operational file path must be absolute without parent traversal");
+    }
+    let parent = path.parent().context("operational file has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("operational file name is not UTF-8")?;
+    let first = fullmag_session::repository_path::read_bounded_regular_file(parent, name, maximum)?;
+    let second =
+        fullmag_session::repository_path::read_bounded_regular_file(parent, name, maximum)?;
+    if first != second {
+        bail!("operational file changed during its bounded read");
+    }
+    Ok(first)
+}
+
+fn read_stable_store_operational_file(
+    store: &SessionStore,
+    relative: &str,
+    maximum: usize,
+) -> Result<Vec<u8>> {
+    let first = fullmag_session::repository_path::read_bounded_regular_file(
+        store.root(),
+        relative,
+        maximum,
+    )?;
+    let second = fullmag_session::repository_path::read_bounded_regular_file(
+        store.root(),
+        relative,
+        maximum,
+    )?;
+    if first != second {
+        bail!("store operational file changed during its bounded read: {relative}");
+    }
+    Ok(first)
+}
+
+fn parse_failed_no_spawn_cancellation_args(
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<(PathBuf, PathBuf)> {
+    let mut config = None;
+    let mut request = None;
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--config") => {
+                if config.is_some() {
+                    bail!("failed no-spawn cancellation received duplicate --config");
+                }
+                config = Some(PathBuf::from(args.next().context("missing --config path")?));
+            }
+            Some("--request") => {
+                if request.is_some() {
+                    bail!("failed no-spawn cancellation received duplicate --request");
+                }
+                request = Some(PathBuf::from(
+                    args.next().context("missing --request path")?,
+                ));
+            }
+            Some(value) => bail!("unknown failed no-spawn cancellation option `{value}`"),
+            None => bail!("failed no-spawn cancellation option is not UTF-8"),
+        }
+    }
+    Ok((
+        config.context("failed no-spawn cancellation requires --config")?,
+        request.context("failed no-spawn cancellation requires --request")?,
+    ))
+}
+
+fn validate_failed_no_spawn_gate(
+    state: HostResourceReservationState,
+    gate: Option<&HostWorkerLaunchGate>,
+) -> Result<()> {
+    if state != HostResourceReservationState::Committed {
+        bail!("failed no-spawn cancellation requires a committed reservation");
+    }
+    match gate {
+        Some(HostWorkerLaunchGate::Pending | HostWorkerLaunchGate::Closed) => Ok(()),
+        Some(HostWorkerLaunchGate::Consumed { .. }) => {
+            bail!("failed no-spawn cancellation cannot prove a consumed worker launch permit")
+        }
+        None => bail!("failed no-spawn cancellation requires a worker launch permit"),
+    }
+}
+
+/// A retry request may be authored after an earlier cancellation step has
+/// durably advanced the same reservation.  The request still pins the exact
+/// record that the operator observed; only the state/gate/proof transition is
+/// allowed to differ from the original pre-cancellation record.
+fn validate_failed_no_spawn_reservation(
+    reservation: &HostResourceReservation,
+    expected_digest: &str,
+) -> Result<()> {
+    match reservation.state {
+        HostResourceReservationState::Committed => {
+            validate_failed_no_spawn_gate(
+                reservation.state,
+                reservation.worker_launch_gate.as_ref(),
+            )?;
+        }
+        HostResourceReservationState::Released => {
+            if reservation.worker_launch_gate != Some(HostWorkerLaunchGate::Closed)
+                || reservation.release_proof_sha256.is_none()
+            {
+                bail!("released no-spawn reservation lacks its closed gate or release proof");
+            }
+        }
+        HostResourceReservationState::Tentative | HostResourceReservationState::Quarantined => {
+            bail!("failed no-spawn cancellation requires a committed or released reservation")
+        }
+    }
+
+    if fullmag_session::canonical_json_sha256(&serde_json::to_value(reservation)?)
+        == expected_digest
+    {
+        return Ok(());
+    }
+
+    let mut original = reservation.clone();
+    original.state = HostResourceReservationState::Committed;
+    original.release_proof_sha256 = None;
+    let mut matches_original = false;
+    for gate in [
+        Some(HostWorkerLaunchGate::Pending),
+        Some(HostWorkerLaunchGate::Closed),
+    ] {
+        original.worker_launch_gate = gate;
+        if fullmag_session::canonical_json_sha256(&serde_json::to_value(&original)?)
+            == expected_digest
+        {
+            matches_original = true;
+            break;
+        }
+    }
+    if !matches_original {
+        bail!(
+            "host reservation is not an allowed state transition from the pinned cancellation record"
+        );
+    }
+    Ok(())
+}
+
+/// The local lease can only move once, from Active to Released.  Replaying a
+/// request therefore compares a released lease with its exact active form,
+/// while retaining every immutable field and heartbeat fence.
+fn validate_failed_no_spawn_lease(lease: &FmsResourceLease, expected_digest: &str) -> Result<()> {
+    match lease.state {
+        FmsResourceLeaseState::Active => {}
+        FmsResourceLeaseState::Released if lease.released_at.is_some() => {}
+        FmsResourceLeaseState::Released => {
+            bail!("released no-spawn lease has no release timestamp")
+        }
+    }
+    if fullmag_session::canonical_json_sha256(&serde_json::to_value(lease)?) == expected_digest {
+        return Ok(());
+    }
+    let mut original = lease.clone();
+    original.state = FmsResourceLeaseState::Active;
+    original.released_at = None;
+    if fullmag_session::canonical_json_sha256(&serde_json::to_value(&original)?) != expected_digest
+    {
+        bail!("local lease is not an allowed state transition from the pinned cancellation record");
+    }
+    Ok(())
+}
+
+/// Recover the original typed claim for a retry after local lease release.
+/// `load_current_task_claim` intentionally refuses terminal catalog entries;
+/// the immutable admission genesis (or its first journal transition) remains
+/// the only allowed source for a `Cancelled` replay.
+fn load_failed_no_spawn_claim(
+    store: &SessionStore,
+    run_id: &fullmag_application::RunId,
+    task_id: &str,
+    lease: &FmsResourceLease,
+) -> Result<fullmag_application::TaskClaim> {
+    let catalog = store
+        .read_run_catalog(run_id.as_str())?
+        .context("failed no-spawn claim recovery requires a durable run catalog")?;
+    let task = catalog
+        .tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .context("failed no-spawn claim recovery task is missing")?;
+    if matches!(
+        task.lifecycle,
+        fullmag_session::FmsTaskLifecycle::Preparing
+            | fullmag_session::FmsTaskLifecycle::Running
+            | fullmag_session::FmsTaskLifecycle::Stopping
+    ) && lease.state == FmsResourceLeaseState::Active
+    {
+        return fullmag_runtime_control::load_current_task_claim(store, run_id, task_id);
+    }
+    if task.lifecycle != fullmag_session::FmsTaskLifecycle::Cancelled {
+        bail!(
+            "failed no-spawn claim recovery requires an active task or a terminal Cancelled task"
+        );
+    }
+    if task.attempt_id.as_deref() != Some(lease.attempt_id.as_str())
+        || task.ownership_epoch != Some(lease.ownership_epoch)
+        || task.resource_id.as_deref() != Some(lease.resource_id.as_str())
+    {
+        bail!("cancelled task catalog differs from the exact released lease");
+    }
+
+    let claim = if let Some(genesis) = &task.coordinator_genesis {
+        if genesis.run_id != run_id.as_str()
+            || genesis.task_id != task_id
+            || genesis.attempt_id != lease.attempt_id
+            || genesis.ownership_epoch != lease.ownership_epoch
+            || genesis.lease_token != lease.lease_token
+            || genesis.lease_heartbeat_sequence != lease.heartbeat_sequence
+        {
+            bail!("cancelled task coordinator genesis differs from the exact released lease");
+        }
+        let checkpoint: fullmag_application::CoordinatorCheckpoint =
+            serde_json::from_value(genesis.checkpoint.clone())
+                .context("parse cancelled task coordinator genesis")?;
+        checkpoint.claim
+    } else {
+        let mut candidates = store
+            .read_coordinator_journal(run_id.as_str())?
+            .into_iter()
+            .filter(|entry| {
+                entry.task_id == task_id
+                    && entry.attempt_id == lease.attempt_id
+                    && entry.ownership_epoch == lease.ownership_epoch
+            })
+            .map(|entry| {
+                let transition: fullmag_application::CoordinatorTransition =
+                    serde_json::from_value(entry.payload)
+                        .context("parse cancelled task coordinator journal")?;
+                Ok::<_, anyhow::Error>(transition.checkpoint.claim)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        candidates.sort_by_key(|claim| claim.lease.heartbeat_sequence);
+        candidates
+            .into_iter()
+            .next()
+            .context("cancelled task has no immutable coordinator claim")?
+    };
+    if claim.run_id.as_str() != run_id.as_str()
+        || claim.task_id.as_str() != task_id
+        || claim.attempt_id.as_str() != lease.attempt_id
+        || claim.ownership_epoch.value() != lease.ownership_epoch
+        || claim.lease.resource_id.as_str() != lease.resource_id
+        || claim.lease.lease_token.as_str() != lease.lease_token
+        || claim.lease.heartbeat_sequence != lease.heartbeat_sequence
+    {
+        bail!("cancelled task coordinator claim differs from the exact released lease");
+    }
+    Ok(claim)
+}
+
+fn cancel_failed_no_spawn(args: impl Iterator<Item = OsString>) -> Result<()> {
+    let (config_path, request_path) = parse_failed_no_spawn_cancellation_args(args)?;
+    let config_bytes = read_stable_absolute_operational_file(&config_path, 65_536)?;
+    let config: ServiceConfig = serde_json::from_slice(&config_bytes)
+        .context("parse failed no-spawn cancellation service config")?;
+    config.validate()?;
+    let config_sha256 = fullmag_session::canonical_json_sha256(&serde_json::to_value(&config)?);
+
+    let request_bytes = read_stable_absolute_operational_file(
+        &request_path,
+        FAILED_NO_SPAWN_CANCELLATION_MAX_REQUEST_BYTES,
+    )?;
+    let request: FailedNoSpawnCancellationRequest = serde_json::from_slice(&request_bytes)
+        .context("parse failed no-spawn cancellation request")?;
+    request.validate()?;
+    if request.config_sha256 != config_sha256 {
+        bail!("failed no-spawn cancellation config digest differs from the request");
+    }
+
+    let store = SessionStore::open_existing(&config.store_root)?;
+    if request.identity.store_id != HostResourceLedger::store_id(store.root())? {
+        bail!("failed no-spawn cancellation store identity differs from the request");
+    }
+    // The startup gate is the native serialization boundary used by
+    // RuntimeServiceOwner::acquire.  Keep both gates through the complete
+    // cancellation so a new service cannot replace the Failed owner between
+    // validation and any idempotent journal/ledger publication.
+    let _startup_guard = fullmag_runtime_control::retry_store_writer_busy(|| {
+        RuntimeServiceStartupGuard::try_acquire(store.root())
+    })?
+    .context("failed no-spawn cancellation startup gate is busy")?;
+    let _launch_guard = fullmag_runtime_control::retry_store_writer_busy(|| {
+        RuntimeServiceLaunchGuard::try_acquire(store.root())
+    })?
+    .context("failed no-spawn cancellation launch gate is busy")?;
+    let _owner_lock_guard = RuntimeServiceOwnerLockGuard::try_acquire_existing(store.root())?
+        .context("failed no-spawn cancellation owner lock is busy")?;
+    let owner_bytes = read_stable_store_operational_file(
+        &store,
+        RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH,
+        FAILED_NO_SPAWN_CANCELLATION_MAX_REQUEST_BYTES,
+    )?;
+    let owner: RuntimeServiceOwnerDescriptor = serde_json::from_slice(&owner_bytes)
+        .context("parse failed runtime service owner descriptor")?;
+    validate_descriptor(&owner)?;
+    if owner != request.expected_owner {
+        bail!("runtime service owner descriptor differs from the exact cancellation request");
+    }
+    if owner.target_id != config.target_id || owner.state != RuntimeServiceState::Failed {
+        bail!("failed no-spawn cancellation owner is not the configured Failed service");
+    }
+    let owner_roles = owner
+        .children
+        .iter()
+        .map(|child| child.role.as_str())
+        .collect::<BTreeSet<_>>();
+    if owner_roles.len() != 2
+        || !owner_roles.contains("compute")
+        || !owner_roles.contains("preparation")
+        || owner
+            .children
+            .iter()
+            .any(|child| !matches!(child.status.as_str(), "exited_success" | "exited_failure"))
+    {
+        bail!("failed no-spawn cancellation lacks terminal compute and preparation child proof");
+    }
+    if fullmag_session::hex_sha256(&owner_bytes) != request.owner_sha256 {
+        bail!("runtime service owner bytes differ from the exact cancellation request");
+    }
+
+    let admission = fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(&config)?
+        .context("failed no-spawn cancellation requires host execution admission")?;
+    let snapshot = admission.ledger().read()?;
+    let reservation = snapshot
+        .reservations
+        .iter()
+        .find(|reservation| reservation.identity == request.identity)
+        .context("failed no-spawn cancellation reservation is missing")?;
+    validate_failed_no_spawn_reservation(reservation, &request.reservation_sha256)?;
+    if snapshot
+        .reservations
+        .iter()
+        .filter(|reservation| reservation.state != HostResourceReservationState::Released)
+        .any(|candidate| candidate.identity != request.identity)
+    {
+        bail!("failed no-spawn cancellation requires every other host reservation to be released");
+    }
+    let HostReservationOwner::Solver {
+        attempt_id,
+        ownership_epoch,
+    } = &request.identity.owner
+    else {
+        unreachable!("request validation rejects preparation reservations")
+    };
+    let lease = store
+        .read_resource_lease(
+            &request.identity.run_id,
+            &request.identity.resource_id,
+            &request.identity.lease_token,
+        )?
+        .context("failed no-spawn cancellation local lease is missing")?;
+    if lease.run_id != request.identity.run_id
+        || lease.task_id != request.identity.task_id
+        || lease.resource_id != request.identity.resource_id
+        || lease.lease_token != request.identity.lease_token
+        || lease.attempt_id != *attempt_id
+        || lease.ownership_epoch != *ownership_epoch
+    {
+        bail!("failed no-spawn cancellation local lease differs from its host reservation");
+    }
+    validate_failed_no_spawn_lease(&lease, &request.lease_sha256)?;
+    match (reservation.state, lease.state) {
+        (HostResourceReservationState::Committed, FmsResourceLeaseState::Active)
+            if reservation.worker_launch_gate == Some(HostWorkerLaunchGate::Closed)
+                || reservation.worker_launch_gate == Some(HostWorkerLaunchGate::Pending) => {}
+        (HostResourceReservationState::Committed, FmsResourceLeaseState::Released)
+            if reservation.worker_launch_gate == Some(HostWorkerLaunchGate::Closed) => {}
+        (HostResourceReservationState::Released, FmsResourceLeaseState::Released)
+            if reservation.worker_launch_gate == Some(HostWorkerLaunchGate::Closed) => {}
+        _ => bail!("failed no-spawn cancellation has an impossible reservation/lease state pair"),
+    }
+    let run_id = fullmag_application::RunId::parse(&request.identity.run_id)?;
+    let claim = load_failed_no_spawn_claim(&store, &run_id, &request.identity.task_id, &lease)?;
+    if claim.run_id.as_str() != request.identity.run_id.as_str()
+        || claim.task_id.as_str() != request.identity.task_id.as_str()
+        || claim.attempt_id.as_str() != attempt_id.as_str()
+        || claim.ownership_epoch.value() != *ownership_epoch
+        || claim.lease.resource_id.as_str() != request.identity.resource_id.as_str()
+        || claim.lease.lease_token.as_str() != request.identity.lease_token.as_str()
+        || claim.lease.heartbeat_sequence != lease.heartbeat_sequence
+        || serde_json::to_value(&claim.lease.kind)? != serde_json::to_value(&lease.kind)?
+        || serde_json::to_value(&claim.lease.budget)? != serde_json::to_value(&lease.budget)?
+    {
+        bail!("current task claim differs from the exact cancellation request");
+    }
+    if fullmag_session::canonical_json_sha256(&serde_json::to_value(&claim)?)
+        != request.claim_sha256
+    {
+        bail!("current task claim digest differs from the exact cancellation request");
+    }
+    if store
+        .list_worker_process_exit_receipts(&request.identity.run_id)?
+        .into_iter()
+        .any(|receipt| receipt.task_id == request.identity.task_id)
+    {
+        bail!("failed no-spawn cancellation found a worker process exit receipt");
+    }
+    let recovered = fullmag_runtime_control::recover_coordinator(&store, &claim)?;
+    if recovered
+        .events
+        .iter()
+        .any(|event| matches!(&event.event, fullmag_application::WorkerEvent::Started))
+    {
+        bail!("failed no-spawn cancellation found a durable worker Started event");
+    }
+
+    let stop_disposition = match recovered.coordinator.phase() {
+        fullmag_application::CoordinatorPhase::Preparing
+        | fullmag_application::CoordinatorPhase::Running
+        | fullmag_application::CoordinatorPhase::Stopping => Some(
+            fullmag_runtime_control::retry_store_writer_busy(|| {
+                fullmag_runtime_control::request_accepted_task_stop(
+                    &store,
+                    &run_id,
+                    &request.identity.task_id,
+                    &request.reason,
+                )
+            })?
+            .disposition,
+        ),
+        fullmag_application::CoordinatorPhase::Terminal => {
+            if recovered.coordinator.task().lifecycle
+                != fullmag_application::TaskLifecycle::Cancelled
+            {
+                bail!("terminal no-spawn cancellation task is not Cancelled");
+            }
+            None
+        }
+        fullmag_application::CoordinatorPhase::ReleaseRequested => {
+            bail!("failed no-spawn cancellation found a release-requested task")
+        }
+    };
+    let repaired = fullmag_runtime_control::retry_store_writer_busy(|| {
+        admission.reconcile_prestart_stopping_store_reservations(&store)
+    })?;
+    if repaired > 1 {
+        bail!(
+            "failed no-spawn cancellation reconciled {repaired} reservations, expected at most one"
+        );
+    }
+    fullmag_runtime_control::retry_store_writer_busy(|| {
+        admission
+            .ledger()
+            .release_worker_without_spawn(&store, &request.identity)
+    })
+    .context("publish the exact WorkerNoSpawn host release proof")?;
+    let final_snapshot = admission.ledger().read()?;
+    let final_reservation = final_snapshot
+        .reservations
+        .iter()
+        .find(|reservation| reservation.identity == request.identity)
+        .context("failed no-spawn cancellation lost its host reservation")?;
+    if final_reservation.state != HostResourceReservationState::Released
+        || final_reservation.release_proof_sha256.is_none()
+        || final_reservation.worker_launch_gate != Some(HostWorkerLaunchGate::Closed)
+    {
+        bail!("failed no-spawn cancellation did not publish a complete WorkerNoSpawn release");
+    }
+    let final_lease = store
+        .read_resource_lease(
+            &request.identity.run_id,
+            &request.identity.resource_id,
+            &request.identity.lease_token,
+        )?
+        .context("failed no-spawn cancellation lost its local lease")?;
+    if final_lease.state != FmsResourceLeaseState::Released {
+        bail!("failed no-spawn cancellation did not release its exact local lease");
+    }
+    let final_catalog = store
+        .read_run_catalog(&request.identity.run_id)?
+        .context("failed no-spawn cancellation lost its run catalog")?;
+    let final_task = final_catalog
+        .tasks
+        .iter()
+        .find(|task| task.task_id == request.identity.task_id)
+        .context("failed no-spawn cancellation lost its task catalog entry")?;
+    if final_task.lifecycle != fullmag_session::FmsTaskLifecycle::Cancelled {
+        bail!("failed no-spawn cancellation task catalog is not Cancelled");
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": FAILED_NO_SPAWN_CANCELLATION_SCHEMA,
+            "request_id": request.request_id,
+            "status": "cancelled_no_spawn",
+            "stop_disposition": stop_disposition
+                .map(|disposition| format!("{disposition:?}"))
+                .unwrap_or_else(|| "already_terminal".into()),
+            "run_id": request.identity.run_id,
+            "task_id": request.identity.task_id,
+            "release_proof_sha256": final_reservation.release_proof_sha256.clone(),
+        }))?
+    );
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("native runtime service failed: {error:#}");
@@ -1287,6 +1880,9 @@ fn run() -> Result<()> {
         Some(value) if value == OsString::from("--initialize-docker-host") => {
             initialize_docker_host(args)
         }
+        Some(value) if value == OsString::from("--cancel-failed-no-spawn") => {
+            cancel_failed_no_spawn(args)
+        }
         Some(value) if value == OsString::from("--config") => {
             let path = PathBuf::from(args.next().context("missing --config path")?);
             if !path.is_absolute() || args.next().is_some() {
@@ -1294,7 +1890,7 @@ fn run() -> Result<()> {
             }
             run_service(path)
         }
-        _ => bail!("usage: fullmag-runtime-service --config <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--native-fem-gpu-readiness <absolute-json-path>] [--host-id <stable-id>]")
+        _ => bail!("usage: fullmag-runtime-service --config <absolute-json-path> | --cancel-failed-no-spawn --config <absolute-json-path> --request <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--native-fem-gpu-readiness <absolute-json-path>] [--host-id <stable-id>]")
     }
 }
 
@@ -1859,6 +2455,339 @@ mod tests {
         assert!(!is_store_writer_busy(&anyhow::anyhow!(
             "session store writer is busy"
         )));
+    }
+
+    #[test]
+    fn failed_no_spawn_cancellation_rejects_consumed_or_uncommitted_gate() {
+        assert!(validate_failed_no_spawn_gate(
+            HostResourceReservationState::Committed,
+            Some(&HostWorkerLaunchGate::Pending),
+        )
+        .is_ok());
+        assert!(validate_failed_no_spawn_gate(
+            HostResourceReservationState::Committed,
+            Some(&HostWorkerLaunchGate::Closed),
+        )
+        .is_ok());
+        assert!(validate_failed_no_spawn_gate(
+            HostResourceReservationState::Committed,
+            Some(&HostWorkerLaunchGate::Consumed {
+                token: "launch-token".into(),
+            }),
+        )
+        .is_err());
+        assert!(validate_failed_no_spawn_gate(
+            HostResourceReservationState::Tentative,
+            Some(&HostWorkerLaunchGate::Pending),
+        )
+        .is_err());
+        assert!(
+            validate_failed_no_spawn_gate(HostResourceReservationState::Committed, None,).is_err()
+        );
+    }
+
+    #[test]
+    fn failed_no_spawn_partial_state_replay_is_exact_and_monotonic() {
+        let identity = HostReservationIdentity {
+            store_id: "store".into(),
+            run_id: "run".into(),
+            task_id: "task".into(),
+            resource_id: "resource".into(),
+            owner: HostReservationOwner::Solver {
+                attempt_id: "attempt".into(),
+                ownership_epoch: 1,
+            },
+            lease_token: "lease".into(),
+        };
+        let mut original = HostResourceReservation {
+            identity,
+            request_sha256: "a".repeat(64),
+            host_id: "host".into(),
+            policy_revision: 1,
+            host_owner_epoch: 1,
+            runtime_generation_sha256: None,
+            compute_node_owner_id: None,
+            compute_node_owner_epoch: None,
+            topology_sha256: "b".repeat(64),
+            budget: FmsResourceBudget {
+                cpu_millis: 1000,
+                memory_bytes: 1024,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1024,
+            },
+            exclusive_gpu_uuids: BTreeSet::new(),
+            gpu_vram_bytes_by_uuid: BTreeMap::new(),
+            cpu_ids: BTreeSet::new(),
+            release_proof_sha256: None,
+            state: HostResourceReservationState::Committed,
+            worker_launch_gate: Some(HostWorkerLaunchGate::Pending),
+            preparation_launch_gate: None,
+            preparation_launch_owner: None,
+            node_policy_revision: 1,
+            scheduling_priority: 0,
+            parallelism: fullmag_ir::compute_resources::ComputeParallelismIR::SingleProcess,
+        };
+        let original_digest =
+            fullmag_session::canonical_json_sha256(&serde_json::to_value(&original).unwrap());
+        assert!(validate_failed_no_spawn_reservation(&original, &original_digest).is_ok());
+
+        original.worker_launch_gate = Some(HostWorkerLaunchGate::Closed);
+        assert!(validate_failed_no_spawn_reservation(&original, &original_digest).is_ok());
+
+        original.state = HostResourceReservationState::Released;
+        original.release_proof_sha256 = Some("c".repeat(64));
+        let released_digest =
+            fullmag_session::canonical_json_sha256(&serde_json::to_value(&original).unwrap());
+        assert!(validate_failed_no_spawn_reservation(&original, &released_digest).is_ok());
+        assert!(validate_failed_no_spawn_reservation(&original, &original_digest).is_ok());
+
+        original.state = HostResourceReservationState::Committed;
+        original.release_proof_sha256 = None;
+        original.worker_launch_gate = Some(HostWorkerLaunchGate::Consumed {
+            token: "launch-token".into(),
+        });
+        assert!(validate_failed_no_spawn_reservation(&original, &original_digest).is_err());
+    }
+
+    #[test]
+    fn failed_no_spawn_partial_replay_recovers_genesis_after_lease_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let run_id = fullmag_application::RunId::parse("run").unwrap();
+        let claim = fullmag_application::TaskClaim {
+            run_id: run_id.clone(),
+            task_id: fullmag_application::TaskId::parse("task").unwrap(),
+            attempt_id: fullmag_application::AttemptId::parse("attempt").unwrap(),
+            ownership_epoch: fullmag_application::OwnershipEpoch::INITIAL,
+            lease: fullmag_application::ResourceLease::new(
+                "resource",
+                fullmag_application::ResourceKind::Cpu,
+                fullmag_application::ResourceBudget {
+                    cpu_millis: 1000,
+                    memory_bytes: 1024,
+                    gpu_memory_bytes: 0,
+                    storage_bytes: 1024,
+                },
+            )
+            .unwrap(),
+        };
+        let now = chrono::Utc::now();
+        store
+            .commit_run_catalog(&fullmag_session::FmsRunCatalog {
+                schema_version: fullmag_session::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.as_str().into(),
+                revision: 1,
+                updated_at: now,
+                tasks: vec![fullmag_session::FmsTaskCatalogEntry {
+                    task_id: claim.task_id.as_str().into(),
+                    input_fingerprint: "a".repeat(64),
+                    lifecycle: fullmag_session::FmsTaskLifecycle::Preparing,
+                    readiness: fullmag_session::FmsTaskReadiness::Ready,
+                    observation: None,
+                    attempt_id: Some(claim.attempt_id.as_str().into()),
+                    ownership_epoch: Some(claim.ownership_epoch.value()),
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: Some(claim.lease.resource_id.clone()),
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+        let lease = FmsResourceLease {
+            schema_version: fullmag_session::FMS_RESOURCE_LEASE_SCHEMA.into(),
+            resource_id: claim.lease.resource_id.clone(),
+            kind: FmsResourceKind::Cpu,
+            budget: FmsResourceBudget {
+                cpu_millis: 1000,
+                memory_bytes: 1024,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1024,
+            },
+            run_id: run_id.as_str().into(),
+            task_id: claim.task_id.as_str().into(),
+            attempt_id: claim.attempt_id.as_str().into(),
+            ownership_epoch: claim.ownership_epoch.value(),
+            lease_token: claim.lease.lease_token.as_str().into(),
+            state: FmsResourceLeaseState::Active,
+            acquired_at: now,
+            heartbeat_at: now,
+            heartbeat_sequence: claim.lease.heartbeat_sequence,
+            released_at: None,
+            host_launch_binding: None,
+        };
+        store.commit_resource_lease(&lease).unwrap();
+        let task = fullmag_application::TaskRecord {
+            run_id: claim.run_id.clone(),
+            task_id: claim.task_id.clone(),
+            input_fingerprint: "a".repeat(64),
+            lifecycle: fullmag_application::TaskLifecycle::Preparing,
+            readiness: fullmag_application::TaskReadiness::Ready,
+            observation: None,
+            assessment: None,
+            attempt_id: Some(claim.attempt_id.clone()),
+            ownership_epoch: Some(claim.ownership_epoch),
+            claim: Some(claim.clone()),
+        };
+        let coordinator = fullmag_application::WorkerCoordinator::new(task, claim.clone()).unwrap();
+        fullmag_runtime_control::commit_coordinator_genesis(&store, &coordinator.checkpoint())
+            .unwrap();
+        let mut durable = fullmag_application::DurableWorkerCoordinator::new(coordinator);
+        durable
+            .commit_command(
+                fullmag_application::WorkerCommand::Stop {
+                    reason: "partial replay regression".into(),
+                },
+                None,
+                |transition| {
+                    fullmag_runtime_control::commit_transition(&store, transition)
+                        .map(|_| ())
+                        .map_err(|error| {
+                            fullmag_application::CoordinatorError::Invalid(format!("{error:#}"))
+                        })
+                },
+            )
+            .unwrap();
+        durable
+            .commit_event(
+                fullmag_application::WorkerEventEnvelope {
+                    schema_version: fullmag_application::WORKER_PROTOCOL_SCHEMA.into(),
+                    message_id: "event-stopped-partial-replay".into(),
+                    sequence: 1,
+                    claim: claim.identity(),
+                    event: fullmag_application::WorkerEvent::Stopped,
+                },
+                |transition| {
+                    fullmag_runtime_control::commit_transition(&store, transition)
+                        .map(|_| ())
+                        .map_err(|error| {
+                            fullmag_application::CoordinatorError::Invalid(format!("{error:#}"))
+                        })
+                },
+            )
+            .unwrap();
+        store.release_resource_lease(&lease).unwrap();
+
+        let released = store
+            .read_resource_lease(
+                run_id.as_str(),
+                claim.lease.resource_id.as_str(),
+                claim.lease.lease_token.as_str(),
+            )
+            .unwrap()
+            .unwrap();
+        let recovered =
+            load_failed_no_spawn_claim(&store, &run_id, claim.task_id.as_str(), &released).unwrap();
+        assert_eq!(recovered, claim);
+        assert_eq!(
+            fullmag_runtime_control::recover_coordinator(&store, &recovered)
+                .unwrap()
+                .coordinator
+                .phase(),
+            fullmag_application::CoordinatorPhase::Terminal
+        );
+    }
+
+    #[test]
+    fn failed_no_spawn_request_rejects_unknown_owner_and_preparation_identity() {
+        let now = chrono::Utc::now();
+        let owner = RuntimeServiceOwnerDescriptor {
+            schema_version: fullmag_session::runtime_service::RUNTIME_SERVICE_OWNER_SCHEMA.into(),
+            owner_token: uuid::Uuid::new_v4().to_string(),
+            process_start_token: uuid::Uuid::new_v4().to_string(),
+            pid: 1,
+            host: "host".into(),
+            target_id: "target".into(),
+            protocol: fullmag_session::runtime_service::RUNTIME_SERVICE_OWNER_PROTOCOL.into(),
+            state: RuntimeServiceState::Failed,
+            acquired_at: now,
+            heartbeat_at: now,
+            compute_pool_generation: None,
+            preparation_pool_generation: None,
+            control_address: None,
+            build_commit: None,
+            build_snapshot: None,
+            compute_pool_id: None,
+            preparation_pool_id: None,
+            children: vec![
+                RuntimeServiceChild {
+                    role: "compute".into(),
+                    pid: 2,
+                    status: "exited_failure".into(),
+                },
+                RuntimeServiceChild {
+                    role: "preparation".into(),
+                    pid: 3,
+                    status: "exited_success".into(),
+                },
+            ],
+        };
+        let mut request = FailedNoSpawnCancellationRequest {
+            schema_version: FAILED_NO_SPAWN_CANCELLATION_SCHEMA.into(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            config_sha256: "a".repeat(64),
+            owner_sha256: "b".repeat(64),
+            expected_owner: owner,
+            claim_sha256: "c".repeat(64),
+            lease_sha256: "d".repeat(64),
+            reservation_sha256: "e".repeat(64),
+            identity: HostReservationIdentity {
+                store_id: "store".into(),
+                run_id: "run".into(),
+                task_id: "task".into(),
+                resource_id: "resource".into(),
+                owner: HostReservationOwner::Solver {
+                    attempt_id: "attempt".into(),
+                    ownership_epoch: 1,
+                },
+                lease_token: "lease".into(),
+            },
+            reason: "failed native service before worker spawn".into(),
+        };
+        assert!(request.validate().is_ok());
+        request.expected_owner.state = RuntimeServiceState::Unknown;
+        assert!(request.validate().is_err());
+        request.expected_owner.state = RuntimeServiceState::Failed;
+        request.identity.owner = HostReservationOwner::Preparation {
+            preparation_attempt_id: "prep-attempt".into(),
+        };
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn failed_no_spawn_cli_requires_exact_config_and_request_paths() {
+        let parsed = parse_failed_no_spawn_cancellation_args(
+            [
+                OsString::from("--config"),
+                OsString::from("/state/config.json"),
+                OsString::from("--request"),
+                OsString::from("/state/cancel.json"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(parsed.0, PathBuf::from("/state/config.json"));
+        assert_eq!(parsed.1, PathBuf::from("/state/cancel.json"));
+        assert!(parse_failed_no_spawn_cancellation_args(
+            [
+                OsString::from("--config"),
+                OsString::from("/state/config.json")
+            ]
+            .into_iter()
+        )
+        .is_err());
+        assert!(parse_failed_no_spawn_cancellation_args(
+            [
+                OsString::from("--config"),
+                OsString::from("/state/config.json"),
+                OsString::from("--request"),
+                OsString::from("/state/cancel.json"),
+                OsString::from("--request"),
+                OsString::from("/state/other.json"),
+            ]
+            .into_iter()
+        )
+        .is_err());
     }
 
     #[test]

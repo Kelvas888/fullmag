@@ -83,6 +83,28 @@ Launcher nie uznaje takiej aktywacji za udaną kwalifikację. Błędy integralno
 provenance, polityki i kontraktu odpowiedzi pozostają fatalne. Zmiana nie
 poszerza listy znanych odrzuceń fizyki i nie resetuje ownera ani historii.
 
+## Terminalna awaria przed startem workera
+
+Kontrolowany operator `fullmag-runtime-service --cancel-failed-no-spawn`
+rozszerza istniejący protokół `WorkerNoSpawn` o przypadek terminalnego ownera
+`Failed` z niewykorzystaną rezerwacją solvera. Nie zmienia wyboru CPU/GPU,
+publicznego API ani formatu snapshotów. Pod blokadami startup, launch i istniejącego ownera wymaga
+przypiętych digestów konfiguracji, ownera, claimu, lease i rezerwacji, terminalnych
+procesów potomnych oraz dowodu niewykorzystania bramki startu workera.
+
+Publikuje wyłącznie kanoniczne Stop/Cancelled i release proof. Zachowuje store,
+logi, aktywację skryptu i historię rezerwacji; nie uruchamia ponownie symulacji.
+Odtwarzanie po częściowym zapisie korzysta z immutable genesis/journal oraz
+wyłącznie dozwolonych monotonicznych przejść tej samej rezerwacji. `Consumed`,
+`Unknown`, obca tożsamość i inne aktywne rezerwacje blokują operację. Nie wolno
+zastępować jej ręcznym resetem ani usunięciem rekordów.
+
+Implementacja: `crates/fullmag-api/src/runtime_service_main.rs`; regresje tej
+binarki uruchamia istniejący job CI. Kwalifikacja runtime wymaga rzeczywistego
+`WorkerNoSpawn` i potwierdzenia zwolnienia obu lease; do tego czasu pozostaje
+**NOT VERIFIED**. Instrukcja operatora znajduje się w przewodniku architektury
+Docker dev. Nie zmienia to standardowego restartu zdrowego backendu.
+
 ## Retencja technicznych pakietów dev
 
 Decyzja użytkownika z 17.10.2026 rozszerza publikację dev o automatyczne

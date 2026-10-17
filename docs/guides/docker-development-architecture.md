@@ -137,6 +137,34 @@ Nie zastępuj tego procedurą `down --volumes`, przejęciem obcej grupy ani rese
 ownera. Niepotwierdzone zatrzymanie wymaga kanonicznego recovery; nie jest zgodą
 na ponowne uruchomienie aktywnej symulacji. Zachowaj logi i receipty błędu.
 
+### Anulowanie nieudanej próby przed startem workera
+
+Jeżeli natywny owner ma stan `Failed`, oba jego procesy potomne zakończyły się,
+a rezerwacja solvera pozostała `Committed` z bramką `Pending`, nie usuwaj
+rezerwacji ani pliku ownera ręcznie. Operator może użyć natywnego polecenia:
+
+```text
+fullmag-runtime-service --cancel-failed-no-spawn --config <absolute-config.json> --request <absolute-request.json>
+```
+
+Polecenie jest przeznaczone do kontrolowanego odzyskania po awarii, nie do
+zwykłego uruchamiania symulacji. Żądanie
+`runtime_service_failed_no_spawn_cancellation.v1` przypina SHA-256 konfiguracji,
+surowych bajtów ownera, kanonicznego claimu, lokalnego lease i rezerwacji oraz
+pełną tożsamość ownera i rezerwacji. Należy użyć konfiguracji nieudanej generacji.
+Operację wykonuje się wewnątrz backendu właściwej grupy, po potwierdzeniu braku
+aktywnego workera; nie inicjalizuje ona nowej generacji runtime.
+
+Pod blokadami startup, launch i istniejącego ownera polecenie sprawdza terminalne procesy potomne,
+brak zdarzenia `Started`, brak worker exit receipt i brak innych aktywnych
+rezerwacji hosta. Następnie używa kanonicznego Stop, reconciliacji i dowodu
+`WorkerNoSpawn`, zachowując historię. Wynik wymaga zadania `Cancelled`, lokalnego
+lease `Released` i rezerwacji `Released` z zamkniętą bramką oraz trwałym dowodem.
+Dokładnie przypięte częściowe zakończenie można dokończyć tym samym żądaniem;
+`Consumed`, nieznany owner i niezgodna tożsamość są odrzucane. Nie jest to
+reset, ponowienie Solve ani automatyczne odtworzenie zaakceptowanego skryptu.
+Implementacja i regresje źródłowe nie zastępują testu tej operacji w Dockerze.
+
 ### Kontrolowane odtworzenie terminalnego failed run
 
 Jeżeli własny backend zakończył się terminalnym błędem, a jego usługi są

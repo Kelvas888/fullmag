@@ -283,6 +283,21 @@ pub struct RuntimeServiceOwner {
     descriptor: RuntimeServiceOwnerDescriptor,
 }
 
+/// Holds the existing owner lock while a guarded terminal operation observes
+/// and reconciles the matching owner descriptor. A missing or corrupt lock is
+/// an error; `None` means another process still owns the native lock.
+pub struct RuntimeServiceOwnerLockGuard {
+    _lock: File,
+}
+
+impl RuntimeServiceOwnerLockGuard {
+    /// Try to hold the existing owner lock without creating it.
+    pub fn try_acquire_existing(root: &Path) -> Result<Option<Self>> {
+        let path = checked_path(root, RUNTIME_SERVICE_OWNER_LOCK_PATH)?;
+        Ok(try_open_existing_owner_lock(&path)?.map(|lock| Self { _lock: lock }))
+    }
+}
+
 impl RuntimeServiceOwner {
     /// Acquire the single service owner for the complete session store.
     ///
@@ -524,6 +539,10 @@ fn open_owner_lock(path: &Path) -> Result<(File, bool)> {
 }
 
 fn open_existing_owner_lock(path: &Path) -> Result<File> {
+    try_open_existing_owner_lock(path)?.context("runtime service owner is already active")
+}
+
+fn try_open_existing_owner_lock(path: &Path) -> Result<Option<File>> {
     reject_link(path)?;
     let mut file = OpenOptions::new()
         .read(true)
@@ -532,9 +551,7 @@ fn open_existing_owner_lock(path: &Path) -> Result<File> {
         .with_context(|| format!("opening existing runtime service owner lock {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            bail!("runtime service owner is already active")
-        }
+        Err(TryLockError::WouldBlock) => return Ok(None),
         Err(TryLockError::Error(error)) => {
             return Err(error).context("acquiring native runtime service owner lock")
         }
@@ -549,7 +566,7 @@ fn open_existing_owner_lock(path: &Path) -> Result<File> {
             "runtime service owner lock descriptor is missing or corrupt; controlled recovery required"
         );
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 fn read_descriptor(path: &Path) -> Result<Option<RuntimeServiceOwnerDescriptor>> {
@@ -911,6 +928,25 @@ mod tests {
         let _owner = RuntimeServiceOwner::acquire(&store, "desktop-local").unwrap();
         let reopened = SessionStore::open_existing(store.root()).unwrap();
         assert!(RuntimeServiceOwner::acquire(&reopened, "other-target").is_err());
+    }
+
+    #[test]
+    fn existing_owner_lock_guard_blocks_terminal_observation_without_mutation() {
+        let directory = tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let owner = RuntimeServiceOwner::acquire(&store, "desktop-local").unwrap();
+        let descriptor_path = store.root().join(RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH);
+        let before = std::fs::read(&descriptor_path).unwrap();
+
+        assert!(RuntimeServiceOwnerLockGuard::try_acquire_existing(store.root())
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(&descriptor_path).unwrap(), before);
+        drop(owner);
+
+        assert!(RuntimeServiceOwnerLockGuard::try_acquire_existing(store.root())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
