@@ -415,9 +415,11 @@ def _docker_factual_not_found(error: BaseException) -> bool:
             ("container" in text and "not found" in text))
 
 
-def _docker_call(client: Callable[..., Any], *args: str, timeout: int = 60) -> str:
+def _docker_call(client: Callable[..., Any], *args: str, timeout: int = 60,
+                 combined: bool = False) -> str:
     try:
-        value = client(*args, timeout=timeout)
+        value = (client(*args, timeout=timeout, combined=True) if combined
+                 else client(*args, timeout=timeout))
     except BaseException as error:
         if _docker_unknown(error):
             raise RecoveryUnknown(f"Docker operation timed out or became unknown: {args[0]}") from error
@@ -714,7 +716,8 @@ def _maintenance_run(client: Callable[..., Any], target: Mapping[str, Any], proj
         _docker_call(client, "start", created, timeout=60)
         started = True
         _docker_call(client, "wait", created, timeout=300)
-        output = _docker_call(client, "logs", "--tail", "200", created, timeout=30)
+        output = _docker_call(client, "logs", "--tail", "200", created,
+                              timeout=30, combined=True)
         inspected = _inspect(client, created)
     except RecoveryUnknown:
         raise

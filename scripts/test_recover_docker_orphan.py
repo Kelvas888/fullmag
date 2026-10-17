@@ -762,6 +762,35 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
             self.assertIn(f"/state/diagnostics/orphan/{REQUEST}/request.json", prepare[2])
             self.assertIn(f"/state/diagnostics/orphan/{REQUEST}/attestation.json", complete[2])
 
+    def test_failed_maintenance_reports_container_stderr(self):
+        document = self._created_maintenance_document()
+        calls = []
+        started = False
+
+        def client(*args, timeout=60, combined=False):
+            nonlocal started
+            calls.append(args)
+            if args[0] == "create":
+                return document["Id"]
+            if args[0] == "start":
+                started = True
+                return document["Id"]
+            if args[0] == "inspect":
+                current = copy.deepcopy(document)
+                if started:
+                    current["State"] = {"Status": "exited", "Running": False,
+                                        "Pid": 0, "ExitCode": 1}
+                return json.dumps([current])
+            if args[0] == "logs":
+                return "native admission denied: namespace mismatch" if combined else ""
+            return ""
+
+        with self.assertRaisesRegex(recovery.RecoveryUnknown, "namespace mismatch"):
+            recovery._maintenance_run(
+                client, target(), PROJECT, REQUEST,
+                ["python3", "-c", "print(1)"], preflight=True, phase="probe")
+        self.assertNotIn("rm", [call[0] for call in calls])
+
     def test_maintenance_retains_terminal_evidence_until_explicit_cleanup(self):
         created = "d" * 64
         calls = []
@@ -773,7 +802,7 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
             "RW": not item["read_only"],
         } for item in service["volumes"]]
         class MaintenanceDocker:
-            def __call__(self, *args, timeout=60):
+            def __call__(self, *args, timeout=60, combined=False):
                 calls.append(args)
                 if args[0] == "create":
                     return created + "\n"
