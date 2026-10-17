@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -198,6 +198,7 @@ pub(crate) async fn submit_live_command_with_transition(
         materialize_live_accepted(
             &repo_root,
             &workspace_root,
+            None,
             &store_root,
             backlog_limit,
             &api_instance_id,
@@ -389,6 +390,29 @@ pub(crate) async fn submit_live_study_with_transition(
     source_sha256: String,
     auto_run: bool,
 ) -> Result<AcceptedLiveStudyExecution, ApiError> {
+    submit_live_study_with_transition_with_asset_root(
+        state,
+        context,
+        scene,
+        request_id,
+        source_sha256,
+        auto_run,
+        None,
+    )
+    .await
+}
+
+/// Startup variant that keeps the writable workspace root separate from the
+/// trusted immutable source parent used for relative imported assets.
+pub(crate) async fn submit_live_study_with_transition_with_asset_root(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+    scene: fullmag_authoring::SceneDocument,
+    request_id: String,
+    source_sha256: String,
+    auto_run: bool,
+    asset_root: Option<PathBuf>,
+) -> Result<AcceptedLiveStudyExecution, ApiError> {
     {
         let current = state.current_live_state.read().await;
         let snapshot = current
@@ -429,6 +453,7 @@ pub(crate) async fn submit_live_study_with_transition(
         materialize_live_accepted(
             &repo_root,
             &workspace_root,
+            asset_root.as_deref(),
             &store_root,
             backlog_limit,
             &api_instance_id,
@@ -763,6 +788,7 @@ fn request_accepted_stop_for_catalog(
 fn materialize_live_accepted(
     repo_root: &Path,
     workspace_root: &Path,
+    asset_root: Option<&Path>,
     store_root: &Path,
     backlog_limit: NonZeroUsize,
     api_instance_id: &str,
@@ -918,9 +944,10 @@ fn materialize_live_accepted(
         )
     })?;
 
-    let mut inputs = crate::script::scene_document_to_study_execution_inputs(
+    let mut inputs = crate::script::scene_document_to_study_execution_inputs_with_asset_root(
         repo_root,
         workspace_root,
+        asset_root,
         &effective_scene,
         &requested_execution,
         &study,

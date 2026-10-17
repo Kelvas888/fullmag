@@ -638,12 +638,35 @@ pub(crate) fn scene_document_to_study_execution_inputs(
     requested_execution: &fullmag_application::RequestedExecution,
     study: &StudyPlan,
 ) -> Result<Vec<fullmag_application::StudyStepExecutionInput>, ApiError> {
+    scene_document_to_study_execution_inputs_with_asset_root(
+        repo_root,
+        workspace_root,
+        None,
+        scene_document,
+        requested_execution,
+        study,
+    )
+}
+
+/// As above, but allow a trusted startup caller to resolve relative imported
+/// assets from the immutable script's parent while keeping generated files in
+/// the writable workspace root. `None` preserves the existing workspace-root
+/// fallback for callers that do not have a script source root.
+pub(crate) fn scene_document_to_study_execution_inputs_with_asset_root(
+    repo_root: &Path,
+    workspace_root: &Path,
+    asset_root: Option<&Path>,
+    scene_document: &SceneDocument,
+    requested_execution: &fullmag_application::RequestedExecution,
+    study: &StudyPlan,
+) -> Result<Vec<fullmag_application::StudyStepExecutionInput>, ApiError> {
     requested_execution
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let stages = scene_document_to_prepared_stages(
+    let stages = scene_document_to_prepared_stages_with_asset_root(
         repo_root,
         workspace_root,
+        asset_root,
         scene_document,
         requested_execution,
     )?;
@@ -733,19 +756,17 @@ pub(crate) fn scene_document_to_authored_stages(
     materialize_scene_document_stages(config)
 }
 
-/// Project accepted-execution stages through the canonical geometry and lead
-/// input producers. Authoring and preview keep the lightweight capture above;
-/// only accepted execution needs the materialized assets consumed by the
-/// runtime planner.
-fn scene_document_to_prepared_stages(
+fn scene_document_to_prepared_stages_with_asset_root(
     repo_root: &Path,
     workspace_root: &Path,
+    asset_root: Option<&Path>,
     scene_document: &SceneDocument,
     requested_execution: &fullmag_application::RequestedExecution,
 ) -> Result<Vec<fullmag_application::script_stage_contract::ResolvedScriptStage>, ApiError> {
-    let config = scene_document_to_prepared_script_config(
+    let config = scene_document_to_prepared_script_config_with_asset_root(
         repo_root,
         workspace_root,
+        asset_root,
         scene_document,
         requested_execution,
     )?;
@@ -776,9 +797,28 @@ pub(crate) fn scene_document_to_prepared_script_config(
     scene_document: &SceneDocument,
     requested_execution: &fullmag_application::RequestedExecution,
 ) -> Result<fullmag_application::script_stage_contract::ScriptExecutionConfig, ApiError> {
-    capture_authored_scene(
+    scene_document_to_prepared_script_config_with_asset_root(
         repo_root,
         workspace_root,
+        None,
+        scene_document,
+        requested_execution,
+    )
+}
+
+/// Prepared execution capture with an optional trusted source root. The
+/// workspace root remains the destination for the temporary SceneDocument.
+pub(crate) fn scene_document_to_prepared_script_config_with_asset_root(
+    repo_root: &Path,
+    workspace_root: &Path,
+    asset_root: Option<&Path>,
+    scene_document: &SceneDocument,
+    requested_execution: &fullmag_application::RequestedExecution,
+) -> Result<fullmag_application::script_stage_contract::ScriptExecutionConfig, ApiError> {
+    capture_authored_scene_with_asset_root(
+        repo_root,
+        workspace_root,
+        asset_root,
         scene_document,
         requested_execution,
         SceneCaptureKind::PreparedExecutionConfig,
@@ -821,6 +861,24 @@ fn capture_authored_scene<T: serde::de::DeserializeOwned>(
     requested_execution: &fullmag_application::RequestedExecution,
     kind: SceneCaptureKind,
 ) -> Result<T, ApiError> {
+    capture_authored_scene_with_asset_root(
+        repo_root,
+        workspace_root,
+        None,
+        scene_document,
+        requested_execution,
+        kind,
+    )
+}
+
+fn capture_authored_scene_with_asset_root<T: serde::de::DeserializeOwned>(
+    repo_root: &Path,
+    workspace_root: &Path,
+    asset_root: Option<&Path>,
+    scene_document: &SceneDocument,
+    requested_execution: &fullmag_application::RequestedExecution,
+    kind: SceneCaptureKind,
+) -> Result<T, ApiError> {
     requested_execution
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -857,7 +915,7 @@ fn capture_authored_scene<T: serde::de::DeserializeOwned>(
         "--mode".to_string(),
         requested_execution.mode.clone(),
         "--asset-root".to_string(),
-        workspace_root.display().to_string(),
+        asset_root.unwrap_or(workspace_root).display().to_string(),
     ];
     kind.append_preparation_args(&mut helper_args);
     let output = run_python_helper(repo_root, &helper_args);
@@ -1263,15 +1321,40 @@ mod tests {
     }
 
     #[test]
-    fn accepted_study_execution_materializes_shared_fem_mesh_asset() {
+    fn accepted_fem_execution_materializes_shared_mesh_asset() {
         let root = repo_root();
         let workspace = tempfile::tempdir().expect("create accepted execution workspace");
-        let scene = load_scene_document_state(
-            &root,
-            workspace.path(),
-            &root.join("examples/fem_relax_gpu_smoke.py"),
+        let source_path = workspace
+            .path()
+            .join("fem_capture_without_prebuilt_mesh.py");
+        std::fs::write(
+            &source_path,
+            r#"import fullmag as fm
+
+study = fm.study("accepted_fem_geometry_capture")
+study.engine("fem")
+study.device("cpu", precision="double")
+study.mode("strict")
+study.universe(mode="auto", size=(160e-9, 120e-9, 80e-9),
+               center=(0.0, 0.0, 0.0), padding=(0.0, 0.0, 0.0))
+study.universe.mesh(maximum_element_size=80e-9)
+body = study.geometry(fm.Box(120e-9, 80e-9, 20e-9), name="body")
+body.Ms = 800e3
+body.Aex = 13e-12
+body.alpha = 0.5
+body.m = fm.texture.uniform(1.0, 0.0, 0.0)
+body.mesh(maximum_element_size=40e-9, order=1)
+study.build_domain_mesh()
+study.demag(enabled=False)
+study.solver(dt=1e-13)
+study.relax(algorithm="projected_gradient_bb", max_steps=4, tolA=1e-30)
+"#,
         )
-        .expect("export FEM smoke SceneDocument through Python");
+        .expect("write FEM capture fixture");
+        let scene = load_scene_document_state(&root, workspace.path(), &source_path)
+            .expect("export FEM capture SceneDocument through Python");
+        assert_eq!(scene.study.requested_backend, "fem");
+        assert_eq!(scene.study.requested_device, "cpu");
         let defaults = fullmag_authoring::StudyPlanMigrationDefaults {
             model: fullmag_authoring::StudyModelReference {
                 model_id: "model:accepted-geometry-regression".into(),
@@ -1298,8 +1381,8 @@ mod tests {
         )
         .expect("project FEM SceneDocument to StudyPlan");
         let requested_execution = fullmag_application::RequestedExecution {
-            backend: "auto".into(),
-            device: "auto".into(),
+            backend: "fem".into(),
+            device: "cpu".into(),
             precision: "double".into(),
             mode: "strict".into(),
             minimum_resources: None,
@@ -1312,8 +1395,11 @@ mod tests {
             &requested_execution,
             &study,
         )
-        .expect("accepted execution should project prepared stage inputs");
-        assert!(!inputs.is_empty(), "FEM smoke StudyPlan should have a step");
+        .expect("accepted FEM execution should materialize prepared stage inputs");
+        assert!(
+            !inputs.is_empty(),
+            "FEM capture StudyPlan should have a solver step"
+        );
         assert!(
             inputs.iter().all(|input| input
                 .problem
@@ -1321,7 +1407,109 @@ mod tests {
                 .as_ref()
                 .and_then(|assets| assets.fem_domain_mesh_asset.as_ref())
                 .is_some()),
-            "accepted execution must carry the materialized shared FEM mesh asset",
+            "accepted execution must materialize the shared FEM mesh asset"
+        );
+    }
+
+    #[test]
+    fn accepted_fem_preparation_resolves_imported_asset_from_source_root() {
+        let root = repo_root();
+        let source_root = tempfile::tempdir().expect("create immutable source root");
+        let workspace = tempfile::tempdir().expect("create writable preparation workspace");
+        assert_ne!(source_root.path(), workspace.path());
+
+        std::fs::write(
+            source_root.path().join("shape.stl"),
+            r#"solid shape
+facet normal 0 0 -1
+  outer loop
+    vertex 0 0 0
+    vertex 0 10 0
+    vertex 10 0 0
+  endloop
+endfacet
+facet normal 0 -1 0
+  outer loop
+    vertex 0 0 0
+    vertex 10 0 0
+    vertex 0 0 10
+  endloop
+endfacet
+facet normal -1 0 0
+  outer loop
+    vertex 0 0 0
+    vertex 0 0 10
+    vertex 0 10 0
+  endloop
+endfacet
+facet normal 1 1 1
+  outer loop
+    vertex 10 0 0
+    vertex 0 10 0
+    vertex 0 0 10
+  endloop
+endfacet
+endsolid shape
+"#,
+        )
+        .expect("write relative FEM STL fixture");
+        let source_path = source_root.path().join("imported_fem.py");
+        std::fs::write(
+            &source_path,
+            r#"import fullmag as fm
+
+study = fm.study("accepted_fem_relative_asset")
+study.engine("fem")
+study.device("cpu", precision="double")
+study.mode("strict")
+study.universe(mode="auto", size=(40e-9, 40e-9, 40e-9),
+               center=(0.0, 0.0, 0.0), padding=(0.0, 0.0, 0.0))
+study.universe.mesh(maximum_element_size=8e-9)
+body = study.geometry(
+    fm.ImportedGeometry(source="shape.stl", name="shape", units="nm"),
+    name="shape",
+)
+body.Ms = 800e3
+body.Aex = 13e-12
+body.alpha = 0.5
+body.m = fm.texture.uniform(1.0, 0.0, 0.0)
+body.mesh(maximum_element_size=4e-9, order=1)
+study.build_domain_mesh()
+study.demag(enabled=False)
+study.solver(dt=1e-13)
+study.relax(algorithm="projected_gradient_bb", max_steps=1, tolA=1e-30)
+"#,
+        )
+        .expect("write relative FEM source fixture");
+
+        let scene = load_scene_document_state(&root, workspace.path(), &source_path)
+            .expect("export imported FEM SceneDocument through Python");
+        let requested_execution = fullmag_application::RequestedExecution {
+            backend: "fem".into(),
+            device: "cpu".into(),
+            precision: "double".into(),
+            mode: "strict".into(),
+            minimum_resources: None,
+        };
+        let config = scene_document_to_prepared_script_config_with_asset_root(
+            &root,
+            workspace.path(),
+            Some(source_root.path()),
+            &scene,
+            &requested_execution,
+        )
+        .expect("prepared helper should resolve the immutable source root");
+        let shared_assets = config
+            .shared_geometry_assets
+            .as_ref()
+            .expect("prepared config should publish shared geometry assets");
+        assert!(
+            shared_assets.fem_domain_mesh_asset.is_some(),
+            "prepared config must materialize the imported FEM domain mesh"
+        );
+        assert!(
+            !workspace.path().join("shape.stl").exists(),
+            "the prepared helper must not fall back to the writable workspace root"
         );
     }
 

@@ -125,6 +125,12 @@ pub(crate) async fn activate_current_live_startup(
     }
 
     let loaded = load_startup_scene(&state, &request).await?;
+    let source_root = loaded
+        .source
+        .path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| ApiError::internal("docker startup source path has no parent"))?;
 
     let session_id = startup_session_id(&request, &loaded.source);
     let initial_run_id = format!("run-{session_id}");
@@ -145,25 +151,27 @@ pub(crate) async fn activate_current_live_startup(
     // accepted preparation scheduler can only produce native FEM evidence for
     // a durable RunIntent; direct current-scene materialization would either
     // fabricate that evidence or reject FEM before the accepted run exists.
-    let accepted = match crate::live_accepted_execution::submit_live_study_with_transition(
-        &state,
-        &context,
-        loaded.scene.clone(),
-        request.request_id.clone(),
-        loaded.source.sha256.clone(),
-        false,
-    )
-    .await
-    {
-        Ok(accepted) => accepted,
-        Err(error) => {
-            // Preserve the failed owner record and its source identity.  A
-            // later request must not silently replace a possibly partially
-            // committed accepted run after an unknown failure.
-            mark_startup_failure(&state, &context, &request, &loaded, &error).await;
-            return Err(error);
-        }
-    };
+    let accepted =
+        match crate::live_accepted_execution::submit_live_study_with_transition_with_asset_root(
+            &state,
+            &context,
+            loaded.scene.clone(),
+            request.request_id.clone(),
+            loaded.source.sha256.clone(),
+            false,
+            Some(source_root),
+        )
+        .await
+        {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // Preserve the failed owner record and its source identity.  A
+                // later request must not silently replace a possibly partially
+                // committed accepted run after an unknown failure.
+                mark_startup_failure(&state, &context, &request, &loaded, &error).await;
+                return Err(error);
+            }
+        };
 
     if let Err(error) =
         crate::router_v2::handlers::simulation::commands::publish_accepted_live_study_under_transition(
