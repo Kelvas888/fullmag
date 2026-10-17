@@ -165,6 +165,16 @@ class StartupOutcomeUnknown(RuntimeError):
         self.timeout_seconds = timeout
 
 
+class StartupScriptRejected(RuntimeError):
+    """The script failed validation while its owning runtime remains ready."""
+
+    def __init__(self, activation):
+        self.activation = activation
+        self.operation = ["startup-activation", activation["request_id"]]
+        detail = activation["rejection"]
+        super().__init__(f"Startup script rejected; runtime remains ready: {detail['message']}")
+
+
 def _startup_process_receipt_path(state):
     return Path(state) / ".fullmag/runtime-service/process-tree.json"
 
@@ -179,6 +189,11 @@ def _validate_startup_process_receipt(value, authorization=None, startup_helper=
     activation = value.get("startup_activation")
     if not isinstance(activation, dict):
         raise ValueError("Runtime process-tree receipt has no startup activation")
+    if activation.get("state") == "rejected":
+        if startup_helper is None:
+            raise ValueError("Startup rejection validation requires the attested helper module")
+        rejection = startup_helper.validate_rejection_receipt(activation, authorization)
+        raise StartupScriptRejected(rejection)
     if (activation.get("schema") != "fullmag.startup-script-activation.v1"
             or activation.get("state") != "activated"
             or activation.get("request_id") != authorization.get("request_id")
@@ -2265,6 +2280,10 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         if isinstance(error, DockerOutcomeUnknown):
             receipt.update(operation_outcome="unknown", timed_out_operation=error.operation,
                            client_timeout_seconds=error.timeout_seconds)
+        elif isinstance(error, StartupScriptRejected):
+            receipt.update(startup_activation_outcome="rejected",
+                           startup_activation=error.activation,
+                           runtime_state="ready", health="PASS")
         elif isinstance(error, StartupOutcomeUnknown):
             receipt.update(startup_activation_outcome="unknown",
                            timed_out_operation=error.operation,

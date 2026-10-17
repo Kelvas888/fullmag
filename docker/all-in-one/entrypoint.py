@@ -156,6 +156,12 @@ def serve():
         startup_result = activate_startup_script()
         if startup_result is not None:
             receipt["startup_activation"] = startup_result
+            if startup_result.get("state") == "rejected":
+                print(
+                    "[fullmag-backend] Startup script rejected; API and runtime remain available: "
+                    + startup_result["rejection"]["message"],
+                    file=sys.stderr, flush=True,
+                )
         receipt.update(state="ready", service_owner=handle.owner)
         service._atomic_json(receipt_path, receipt, "process tree receipt")
         print("[fullmag-backend] Ready: API and runtime service", flush=True)

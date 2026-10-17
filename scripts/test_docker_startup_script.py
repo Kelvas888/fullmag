@@ -337,5 +337,136 @@ class DockerStartupScriptTests(unittest.TestCase):
                 module.activate_startup_script()
 
 
+class StartupRejectionTests(unittest.TestCase):
+    def authorization(self):
+        return {
+            "schema": startup.AUTHORIZATION_SCHEMA,
+            "authorization": startup.AUTHORIZATION_KIND,
+            "request_id": "startup-rejection-test",
+            "source_sha256": hashlib.sha256(b"script").hexdigest(),
+            "source_relative": "models/scene.py",
+            "source_size_bytes": len(b"script"),
+            "container_script_path": "/opt/fullmag/source/models/scene.py",
+            "container_source_root": "/opt/fullmag/source",
+        }
+
+    def run_environment(self):
+        authorization = self.authorization()
+        return mock.patch.dict(os.environ, {
+            "FULLMAG_STARTUP_ENABLED": "1",
+            "FULLMAG_STARTUP_SCRIPT": authorization["container_script_path"],
+            "FULLMAG_STARTUP_PROVENANCE": "/run/fullmag/startup-provenance.json",
+            startup.PROVENANCE_SHA256_ENV: "a" * 64,
+        }, clear=True)
+
+    def test_only_structured_validation_http_errors_are_known_rejections(self):
+        import io
+        import urllib.error
+        for status, payload, known in [
+            (400, {"code": "bad_request", "message": "unsupported model"}, True),
+            (422, {"code": "validation_error", "message": "invalid model"}, True),
+            (400, {"code": "unsupported_capability", "message": "interactive=false with wait_for_solve=true"}, True),
+            (422, {"code": "docker_startup_execution_policy_rejected", "message": "invalid protocol envelope"}, False),
+            (500, {"code": "internal_error", "message": "service failure"}, False),
+            (403, {"code": "forbidden", "message": "owner mismatch"}, False),
+            (400, {"code": "bad_request"}, False),
+            (400, {"code": [], "message": "invalid response"}, False),
+        ]:
+            error = urllib.error.HTTPError("http://127.0.0.1:8081", status, "error", {},
+                                           io.BytesIO(json.dumps(payload).encode()))
+            opener = mock.Mock()
+            opener.open.side_effect = error
+            with self.subTest(status=status, payload=payload), mock.patch.object(
+                startup.urllib.request, "build_opener", return_value=opener,
+            ):
+                with self.assertRaises(startup.StartupScriptError) as caught:
+                    startup.activate(self.authorization())
+                self.assertEqual(isinstance(caught.exception, startup.StartupScriptRejected), known)
+
+    def test_rejection_is_durable_bounded_and_fenced_without_activation(self):
+        authorization = self.authorization()
+        with self.run_environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(authorization, "a" * 64),
+        ), mock.patch.object(startup, "_bounded_regular", return_value=b"script"), mock.patch.object(
+            startup, "activate", side_effect=startup.StartupScriptRejected(400, "bad_request", "x" * 3000),
+        ):
+            receipt = startup.run_from_environment()
+        self.assertEqual(receipt["state"], "rejected")
+        self.assertNotIn("response", receipt)
+        self.assertEqual(len(receipt["rejection"]["message"]), 2048)
+        self.assertEqual(startup.validate_rejection_receipt(receipt, authorization), receipt)
+        with self.assertRaises(docker_runtime.StartupScriptRejected) as caught:
+            docker_runtime._validate_startup_process_receipt({
+                "schema": "fullmag.docker-process-tree.v1", "state": "ready",
+                "startup_activation": receipt,
+            }, authorization, startup)
+        self.assertEqual(caught.exception.activation, receipt)
+        for key in ("request_id", "source_sha256", "source_relative"):
+            altered = {**receipt, key: "foreign"}
+            with self.subTest(key=key), self.assertRaises(startup.StartupScriptError):
+                startup.validate_rejection_receipt(altered, authorization)
+
+    def test_infrastructure_and_provenance_failures_remain_fatal(self):
+        authorization = self.authorization()
+        with self.run_environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(authorization, "a" * 64),
+        ), mock.patch.object(startup, "_bounded_regular", return_value=b"script"), mock.patch.object(
+            startup, "activate", side_effect=startup.StartupScriptError("HTTP 500"),
+        ):
+            with self.assertRaisesRegex(startup.StartupScriptError, "HTTP 500"):
+                startup.run_from_environment()
+        with self.run_environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(authorization, "b" * 64),
+        ), mock.patch.object(startup, "activate") as activate:
+            with self.assertRaisesRegex(startup.StartupScriptError, "provenance differs"):
+                startup.run_from_environment()
+            activate.assert_not_called()
+
+    def test_rejected_script_enters_healthy_supervision_before_user_shutdown(self):
+        import copy
+        import sys
+        from types import SimpleNamespace
+        entrypoint = Path(__file__).parents[1] / "docker/all-in-one/entrypoint.py"
+        spec = importlib.util.spec_from_file_location("fullmag_rejection_entrypoint", entrypoint)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        authorization = self.authorization()
+        receipts = []
+        api = mock.Mock(pid=123)
+        api.poll.return_value = None
+        api.wait.return_value = 0
+        with tempfile.TemporaryDirectory() as directory:
+            paths = SimpleNamespace(state_root=Path(directory), store=Path(directory) / "store")
+            handle = SimpleNamespace(owner={"state": "ready"})
+            service = SimpleNamespace(
+                prepare_storage=mock.Mock(return_value=paths),
+                initialize_accepted_store=mock.Mock(return_value={"binding": "test"}),
+                recover_idle_failure=mock.Mock(return_value=None),
+                ensure_configuration=mock.Mock(return_value={}),
+                process_environment=mock.Mock(return_value={}),
+                start=mock.Mock(return_value=handle),
+                stop=mock.Mock(return_value={"state": "drained"}),
+                _atomic_json=lambda _path, value, _label: receipts.append(copy.deepcopy(value)),
+            )
+            def user_shutdown(_seconds):
+                api.terminate.assert_not_called()
+                self.assertEqual(receipts[-1]["state"], "ready")
+                self.assertEqual(receipts[-1]["startup_activation"]["state"], "rejected")
+                return True
+            event = mock.Mock()
+            event.wait.side_effect = user_shutdown
+            with self.run_environment(), mock.patch.dict(sys.modules, {"runtime_service": service}), \
+                    mock.patch.object(module.threading, "Event", return_value=event), \
+                    mock.patch.object(module.signal, "signal"), \
+                    mock.patch.object(module.subprocess, "Popen", return_value=api), \
+                    mock.patch.object(module, "activate_startup_script", side_effect=startup.run_from_environment), \
+                    mock.patch.object(startup, "_load_provenance_with_digest", return_value=(authorization, "a" * 64)), \
+                    mock.patch.object(startup, "_bounded_regular", return_value=b"script"), \
+                    mock.patch.object(startup, "activate", side_effect=startup.StartupScriptRejected(400, "bad_request", "unsupported model")):
+                self.assertEqual(module.serve(), 0)
+            service.stop.assert_called_once_with(handle, timeout=30)
+            self.assertEqual(receipts[-1]["state"], "drained")
+
+
 if __name__ == "__main__":
     unittest.main()

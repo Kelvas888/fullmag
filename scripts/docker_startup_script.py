@@ -42,10 +42,25 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PROVENANCE_SHA256_ENV = "FULLMAG_STARTUP_PROVENANCE_SHA256"
+# Script authoring/capability failures are command outcomes. A rejected
+# execution-policy envelope is a launcher/protocol error and stays fatal.
+SCRIPT_REJECTION_CODES = frozenset({
+    "bad_request", "validation_error", "unprocessable_entity", "unsupported_capability",
+})
 
 
 class StartupScriptError(ValueError):
     """Fail-closed source or activation admission error."""
+
+
+class StartupScriptRejected(StartupScriptError):
+    """An authoritative script validation rejection, before solver admission."""
+
+    def __init__(self, http_status: int, code: str, message: str):
+        self.http_status = http_status
+        self.code = code
+        self.message = message[:2048]
+        super().__init__(f"startup script rejected (HTTP {http_status}, {code}): {self.message}")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -445,6 +460,22 @@ def activate(
             body = result.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
         body = error.read(MAX_RESPONSE_BYTES + 1)
+        # Only a well-formed validation response is a known command rejection.
+        # Authentication, transport, malformed responses and server failures
+        # retain their existing fail-closed startup behavior.
+        if error.code in {400, 422} and len(body) <= MAX_RESPONSE_BYTES:
+            try:
+                rejection = json.loads(body.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+            except (UnicodeDecodeError, ValueError):
+                rejection = None
+            if (isinstance(rejection, dict)
+                    and isinstance(rejection.get("code"), str)
+                    and rejection.get("code") in SCRIPT_REJECTION_CODES
+                    and isinstance(rejection.get("message"), str)
+                    and rejection["message"].strip()):
+                raise StartupScriptRejected(
+                    error.code, rejection["code"], rejection["message"],
+                ) from error
         detail = body[:4096].decode("utf-8", errors="replace")
         raise StartupScriptError(
             f"startup activation returned HTTP {error.code}: {detail}"
@@ -494,7 +525,21 @@ def run_from_environment() -> dict[str, Any] | None:
         raise StartupScriptError("mounted startup script size differs from host-attested bytes")
     if authorization.get("container_script_path") != values["script"]:
         raise StartupScriptError("mounted startup script path differs from provenance")
-    response = activate(authorization, api_base=values["api"])
+    try:
+        response = activate(authorization, api_base=values["api"])
+    except StartupScriptRejected as error:
+        return {
+            "schema": RESPONSE_SCHEMA,
+            "state": "rejected",
+            "request_id": authorization["request_id"],
+            "source_sha256": authorization["source_sha256"],
+            "source_relative": authorization["source_relative"],
+            "rejection": {
+                "http_status": error.http_status,
+                "code": error.code,
+                "message": error.message,
+            },
+        }
     return {
         "schema": RESPONSE_SCHEMA,
         "state": "activated",
@@ -505,17 +550,40 @@ def run_from_environment() -> dict[str, Any] | None:
     }
 
 
+def validate_rejection_receipt(value: Mapping[str, Any], authorization: Mapping[str, Any]) -> dict[str, Any]:
+    """Fence a known rejection to the same host-authorized script request."""
+    build_activation_request(authorization)
+    if (not isinstance(value, dict) or value.get("schema") != RESPONSE_SCHEMA
+            or value.get("state") != "rejected"
+            or any(value.get(key) != authorization.get(key)
+                   for key in ("request_id", "source_sha256", "source_relative"))
+            or "response" in value):
+        raise StartupScriptError("startup rejection fence differs from the host authorization")
+    rejection = value.get("rejection")
+    if (not isinstance(rejection, dict)
+            or type(rejection.get("http_status")) is not int
+            or rejection["http_status"] not in {400, 422}
+            or not isinstance(rejection.get("code"), str)
+            or rejection.get("code") not in SCRIPT_REJECTION_CODES
+            or not isinstance(rejection.get("message"), str)
+            or not rejection["message"].strip() or len(rejection["message"]) > 2048):
+        raise StartupScriptError("startup rejection response is invalid")
+    return dict(value)
+
+
 __all__ = [
     "AUTHORIZATION_SCHEMA",
     "REQUEST_SCHEMA",
     "RESPONSE_SCHEMA",
     "StartupScriptAuthorization",
     "StartupScriptError",
+    "StartupScriptRejected",
     "STARTUP_ACTIVATION_TIMEOUT_SECONDS",
     "activate",
     "build_activation_request",
     "prepare",
     "run_from_environment",
     "validate_activation_response",
+    "validate_rejection_receipt",
     "write_provenance",
 ]

@@ -310,6 +310,16 @@ a interaktywny `wait_for_solve` przygotowuje model i siatkę oraz czeka na Compu
 Sam serwer HTTP lub wczytany tekst skryptu nie dowodzi aktywacji modelu.
 Start bez skryptu otwiera Home; nie wybiera sam przypadkowej sesji.
 
+Jawne odrzucenie walidacji skryptu przez API (`400`/`422` z typowanym kodem
+walidacji) jest wynikiem polecenia, a nie awarią usługi. Kontener zachowuje
+API i natywny runtime w stanie `ready`, a proces tree zapisuje przypięty do
+request ID i hash źródła wynik `startup_activation.state=rejected`. Launcher
+kończy polecenie błędem, zapisuje `startup_activation_outcome=rejected` oraz
+`runtime_state=ready` i pozostawia grupę dostępną pod jej dotychczasowym portem.
+Nie oznacza skryptu jako aktywowanego ani wykonanego. Niezgodność proweniencji,
+błąd helpera, transportu lub serwera nadal korzystają z dotychczasowej ścieżki
+fail-closed; nie są przeklasyfikowywane na odrzucenie modelu.
+
 ## Dane i wersje
 
 Sesje, modele, wyniki oraz logi pozostają w rzeczywistym storage Windows,
