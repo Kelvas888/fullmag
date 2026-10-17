@@ -168,6 +168,24 @@ class LoadedProblem:
     auto_execute_stages: bool = False
     antenna_inventory: AntennaAuthoringInventory = field(default_factory=AntennaAuthoringInventory)
 
+    def has_declared_execution_profile(self) -> bool:
+        """Whether any lowered problem in this script uses typed execution intent.
+
+        A single launcher-wide runtime-device override cannot represent a
+        script whose independent stages declare different backends/devices.
+        The Rust execution-profile binder imports legacy environment values
+        per ProblemIR after export, so Python must not stamp a global override
+        onto any problem in such a script.
+        """
+        problems = [self.problem, *[stage.problem for stage in self.stages]]
+        if self.workspace_problem is not None:
+            problems.append(self.workspace_problem)
+        return any(
+            "execution_profile" in problem.runtime_metadata
+            or "execution_materialization" in problem.runtime_metadata
+            for problem in problems
+        )
+
     def pipeline_base_problem(self, problem: Problem | None = None) -> Problem:
         """Return persistent problem state before ordered action stages run."""
         candidate = self.antenna_inventory.execution_base(problem or self.problem)

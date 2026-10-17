@@ -336,6 +336,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             args,
             lightweight_assets=getattr(args, "skip_geometry_assets", False),
         )
+        runtime_device_override = getattr(args, "runtime_device", None)
+        if loaded.has_declared_execution_profile():
+            # A global FEM-first/FDM-first device hint can contradict a
+            # different per-stage profile. Those requests are materialized
+            # by the Rust resolver from each stage's backend-specific env.
+            runtime_device_override = None
         asset_cache = loaded.problem.geometry_asset_cache
         requested_backend = BackendTarget(args.backend) if args.backend is not None else None
         execution_mode = ExecutionMode(args.mode) if args.mode is not None else None
@@ -349,7 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             execution_precision=execution_precision,
             asset_cache=asset_cache,
             include_geometry_assets=not getattr(args, "skip_geometry_assets", False),
-            runtime_device_override=getattr(args, "runtime_device", None),
+            runtime_device_override=runtime_device_override,
             _copy_cached_geometry_assets=False,
         )
         _write_executed_problem_ir_identity(_benchmark_problem_ir_identity(ir))
@@ -364,7 +370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     requested_backend=requested_backend,
                     execution_mode=execution_mode,
                     execution_precision=execution_precision,
-                    runtime_device_override=getattr(args, "runtime_device", None),
+                    runtime_device_override=runtime_device_override,
                     include_geometry_assets=not getattr(args, "skip_geometry_assets", False),
                     source_root=loaded.source_path.parent,
                     source_stem=loaded.source_path.stem,

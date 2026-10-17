@@ -887,7 +887,7 @@ pub(crate) fn snapshot_step_update_from_stats(
 pub(crate) fn materialize_script_stages(
     mut config: ScriptExecutionConfig,
 ) -> Result<Vec<ResolvedScriptStage>> {
-    crate::python_bridge::bind_script_execution_profiles(&mut config, &[], None)?;
+    crate::python_bridge::bind_script_execution_profiles(&mut config, &[])?;
     materialize_script_stages_with_output_policy(
         config,
         fullmag_runner::project_storage::configure_project_autosave,
