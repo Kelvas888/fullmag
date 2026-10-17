@@ -8,13 +8,11 @@ import {
   useRetryProjectRunTask,
 } from "./projectRunResources";
 import { useRetryProjectBatchCaseTask } from "./projectBatchResources";
-import { useRetryProjectBatchCaseTask } from "./projectBatchResources";
 
 const stub = vi.hoisted(() => ({
   cancel: vi.fn(),
   materialize: vi.fn(),
   retry: vi.fn(),
-  commandBatch: vi.fn(),
   commandBatch: vi.fn(),
   invalidate: vi.fn(),
   invalidatePrefix: vi.fn(),
@@ -25,7 +23,6 @@ vi.mock("../KernelContext", () => ({
       cancelRunTask: stub.cancel,
       materializeRun: stub.materialize,
       retryRunTask: stub.retry,
-      commandBatch: stub.commandBatch,
       commandBatch: stub.commandBatch,
     } } },
     resources: {

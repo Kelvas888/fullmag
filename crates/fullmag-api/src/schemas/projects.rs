@@ -168,6 +168,7 @@ pub(crate) struct ProjectBatchRetryRequest {
     pub case_id: String,
     pub task_id: String,
     pub retry_id: String,
+    #[schema(minimum = 1)]
     pub expected_catalog_revision: u64,
 }
 

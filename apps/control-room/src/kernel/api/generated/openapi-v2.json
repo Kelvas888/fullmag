@@ -29683,7 +29683,7 @@
           },
           "expected_catalog_revision": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           },
           "retry_id": {

@@ -484,6 +484,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/platform/compute/allocations/{allocation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["platform_get_platform_compute_allocations_allocation_id"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/platform/compute/nodes": {
         parameters: {
             query?: never;
@@ -558,6 +574,22 @@ export interface paths {
         get: operations["platform_get_platform_compute_profiles"];
         put?: never;
         post: operations["platform_post_platform_compute_profiles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/platform/compute/queue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["platform_get_platform_compute_queue"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -6500,6 +6532,51 @@ export interface components {
         CompressionProfile: "speed" | "balanced" | "smallest";
         /** @enum {string} */
         ComputeAdmissionState: "not_evaluated";
+        ComputeAllocationOwner: {
+            attempt_id: string;
+            /** @enum {string} */
+            kind: "solver";
+            /** Format: int64 */
+            ownership_epoch: number;
+        } | {
+            /** @enum {string} */
+            kind: "preparation";
+            preparation_attempt_id: string;
+        };
+        /** @description Read-only detail of one exact host-ledger allocation, without lease tokens. */
+        ComputeAllocationResource: {
+            allocation_id: string;
+            budget: components["schemas"]["ComputeNodePolicyBudget"];
+            /** Format: int64 */
+            compute_node_owner_epoch?: number | null;
+            compute_node_owner_id?: string | null;
+            cpu_ids: number[];
+            exclusive_gpu_uuids: string[];
+            gpu_vram_bytes_by_uuid?: {
+                [key: string]: number;
+            };
+            host_id: string;
+            /** Format: int64 */
+            host_owner_epoch: number;
+            node_id: string;
+            /** Format: int64 */
+            node_policy_revision: number;
+            owner: components["schemas"]["ComputeAllocationOwner"];
+            /** @description Canonical parallelism intent; returned as JSON to preserve its versioned shape. */
+            parallelism: Record<string, never>;
+            /** Format: int64 */
+            policy_revision: number;
+            resource_id: string;
+            run_id: string;
+            /** Format: int32 */
+            scheduling_priority: number;
+            schema_version: string;
+            state: components["schemas"]["ComputeAllocationState"];
+            task_id: string;
+            topology_sha256: string;
+        };
+        /** @enum {string} */
+        ComputeAllocationState: "tentative" | "committed" | "quarantined" | "released";
         ComputeNodeParallelismPattern: {
             /** @enum {string} */
             kind: "single_process";
@@ -6662,6 +6739,34 @@ export interface components {
         ComputePreviewStep: {
             execution: components["schemas"]["ExecutionMaterializationSchema"];
             step_id: string;
+        };
+        /** @description One non-terminal accepted run or task projected from the existing durable store. */
+        ComputeQueueItemResource: {
+            accepted_at: string;
+            attempt_id?: string | null;
+            blocking_reason?: string | null;
+            /** @description Stable opaque cursor identity, not an operational capability. */
+            item_id: string;
+            /** Format: int64 */
+            ownership_epoch?: number | null;
+            project_id: string;
+            /** @description Stable scheduler resource name; contains no lease token. */
+            resource_id?: string | null;
+            run_id: string;
+            /** Format: int32 */
+            scheduling_priority: number;
+            state: components["schemas"]["ComputeQueueItemState"];
+            task_id?: string | null;
+        };
+        /** @enum {string} */
+        ComputeQueueItemState: "pending_materialization" | "accepted" | "queued" | "preparing" | "running" | "stopping";
+        /** @description Bounded page of the durable accepted-run scheduler read model. */
+        ComputeQueueResource: {
+            items: components["schemas"]["ComputeQueueItemResource"][];
+            next_cursor?: string | null;
+            /** @description Digest of the observed durable queue rows; cursors are tied to this revision. */
+            revision: string;
+            schema_version: string;
         };
         ComputeResourcePatchSchema: {
             cpu?: components["schemas"]["CpuResourcePatchSchema"];
@@ -18219,6 +18324,50 @@ export interface operations {
             };
         };
     };
+    platform_get_platform_compute_allocations_allocation_id: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Stable opaque allocation identity */
+                allocation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read-only allocation detail without operational tokens */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComputeAllocationResource"];
+                };
+            };
+            /** @description The allocation is unchanged for the supplied ETag */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The allocation is not present in the configured local host ledger */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The configured local host ledger could not be safely read */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     platform_get_platform_compute_nodes: {
         parameters: {
             query?: never;
@@ -18571,6 +18720,59 @@ export interface operations {
                 content?: never;
             };
             /** @description No configured profile store */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    platform_get_platform_compute_queue: {
+        parameters: {
+            query?: {
+                /** @description Opaque continuation cursor returned by the previous page. */
+                cursor?: string;
+                /** @description Default 50, maximum 100. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded read model of the existing durable run scheduler */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComputeQueueResource"];
+                };
+            };
+            /** @description The requested compute queue page is unchanged */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid page size or cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The queue changed while paging; refresh from the first page */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Managed accepted-run storage is unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
