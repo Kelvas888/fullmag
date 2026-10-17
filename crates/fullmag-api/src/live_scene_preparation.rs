@@ -1249,13 +1249,15 @@ pub(crate) async fn commit_live_preparation_receipt_for_context_under_transition
             ));
         }
 
-        let stage_disposition = accepted_store
-            .commit_accepted_stage_preparation_receipt(&stage_receipt)
-            .map_err(|error| ApiError::conflict(error.to_string()))?;
+        let stage_disposition = fullmag_runtime_control::retry_store_writer_busy(|| {
+            accepted_store.commit_accepted_stage_preparation_receipt(&stage_receipt)
+        })
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
         match previous_durable_receipt.as_ref() {
-            None => accepted_store
-                .commit_preparation_receipt(&durable_receipt)
-                .map_err(|error| ApiError::conflict(error.to_string()))?,
+            None => fullmag_runtime_control::retry_store_writer_busy(|| {
+                accepted_store.commit_preparation_receipt(&durable_receipt)
+            })
+            .map_err(|error| ApiError::conflict(error.to_string()))?,
             Some(existing) if existing.same_immutable_payload(&durable_receipt) => {
                 fullmag_session::PreparationReceiptCommitDisposition::Replayed
             }
@@ -2267,12 +2269,85 @@ mod tests {
         let context = crate::capture_current_live_request_context(&state)
             .await
             .unwrap();
+        let contention_store =
+            fullmag_session::SessionStore::open_existing(&accepted_root).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let contention_thread = std::thread::spawn(move || {
+            let Ok(lease) = contention_store.write_transaction() else {
+                let _ = ready_tx.send(false);
+                return;
+            };
+            if ready_tx.send(true).is_err() {
+                drop(lease);
+                return;
+            }
+            if go_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+            {
+                // Start the bounded hold only after the main thread has
+                // witnessed the native conflict and is about to call the API.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            drop(lease);
+        });
+        let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let probe_error = match (
+            &ready,
+            fullmag_session::SessionStore::open_existing(&accepted_root),
+        ) {
+            (Ok(true), Ok(probe)) => match probe.write_transaction() {
+                Ok(lease) => {
+                    drop(lease);
+                    None
+                }
+                Err(error) => Some(error),
+            },
+            (_, Err(error)) => Some(error),
+            _ => None,
+        };
+        let native_busy = probe_error.as_ref().is_some_and(|error| {
+            error
+                .chain()
+                .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
+                && format!("{error:#}").contains("conflict=native descriptor")
+        });
         let _transition = state.current_live_session_transition.lock().await;
-        let disposition = commit_live_preparation_receipt_for_context_under_transition(
-            &state, &context, receipt.clone(), None, None, Some(run_id),
-        )
-        .await
-        .unwrap();
+        let go_sent = go_tx.send(()).is_ok();
+        let disposition = if native_busy && go_sent {
+            commit_live_preparation_receipt_for_context_under_transition(
+                &state,
+                &context,
+                receipt.clone(),
+                None,
+                None,
+                Some(run_id),
+            )
+            .await
+        } else {
+            Err(ApiError::conflict(
+                "test setup did not establish native writer contention",
+            ))
+        };
+        let contention_join = contention_thread.join();
+        assert!(
+            matches!(ready, Ok(true)),
+            "contention thread did not acquire the native writer: {ready:?}"
+        );
+        assert!(
+            native_busy,
+            "test setup must observe native StoreWriterBusy before accepted commit: {probe_error:?}"
+        );
+        assert!(
+            go_sent,
+            "contention thread was not ready to start its bounded hold"
+        );
+        assert!(
+            contention_join.is_ok(),
+            "contention thread must finish bounded cleanup"
+        );
+        let disposition = disposition.unwrap();
         assert_eq!(
             disposition,
             fullmag_session::PreparationReceiptCommitDisposition::Accepted
