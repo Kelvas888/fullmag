@@ -509,11 +509,11 @@ else:
                         watchpack_polling_ms=receipt["watchpack_polling_ms"],
                         uv_threadpool_size=receipt["uv_threadpool_size"],
                     )
-            self.assertEqual(environment["WATCHPACK_POLLING"], "2000")
-            self.assertEqual(receipt["watchpack_polling_ms"], 2000)
+            self.assertEqual(environment["WATCHPACK_POLLING"], "5000")
+            self.assertEqual(receipt["watchpack_polling_ms"], 5000)
             self.assertEqual(environment["UV_THREADPOOL_SIZE"], "8")
             self.assertEqual(receipt["uv_threadpool_size"], 8)
-            self.assertIn("watchpack_polling_ms=2000", stdout.getvalue())
+            self.assertIn("watchpack_polling_ms=5000", stdout.getvalue())
             self.assertIn("uv_threadpool_size=8", stdout.getvalue())
 
             with patch.dict(
@@ -677,7 +677,7 @@ else:
         compose = MODULE_PATH.parents[2] / "compose.dev.yaml"
         text = compose.read_text(encoding="utf-8")
         self.assertIn(
-            "FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-2000}",
+            "FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-5000}",
             text,
         )
 

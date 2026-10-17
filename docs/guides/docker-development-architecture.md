@@ -109,9 +109,12 @@ python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $sour
 ### Cykl edycji i przebudowy
 
 Frontend reaguje przez HMR na zapis plików Windows. Watchpack domyślnie używa
-pollingu `2000` ms; lokalne `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza
-`250`–`10000` ms. Zależności pnpm i cache Next zostają na ext4; HMR nie buduje
-backendu ani toolchaina.
+pollingu `5000` ms; lokalne `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza
+`250`–`10000` ms. Wykrycie edycji może więc poczekać do następnego skanu,
+po którym Next przebudowuje zmienione moduły. Docker DEV pomija wygenerowane
+katalogi `.fullmag-frontend`, `.next*` i `node_modules`; `app`, `src`, `public`
+i `scripts` pozostają obserwowane. Zależności pnpm i cache Next zostają na
+ext4; HMR nie buduje backendu ani toolchaina.
 
 Backend przebudowuje się po jawnym restarcie. Przed nim zapisz projekt i zakończ
 aktywną symulację. W Docker Desktop otwórz backend właściwej grupy i wybierz

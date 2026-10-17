@@ -246,7 +246,7 @@ with that call publishes an interactive workspace waiting for Compute.
 
 The selected checkout must be a Git-registered checkout of this project. Both
 services receive the same checkout as a read-only source bind. Frontend edits
-are picked up by Next.js HMR; `FULLMAG_WATCHPACK_POLLING_MS` defaults to `2000`
+are picked up by Next.js HMR; `FULLMAG_WATCHPACK_POLLING_MS` defaults to `5000`
 milliseconds and can be set in the main checkout `.env` when Docker Desktop
 does not forward Windows file events reliably. Frontend dependencies, Next
 output, and watcher state stay in the group cache rather than being written to
