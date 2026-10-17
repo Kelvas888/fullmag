@@ -612,31 +612,48 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
             ));
         }
     };
-    if let Err(error) = reconcile_final_resource_heartbeat(store, &claim, &mut active_lease) {
+    // Keep the final heartbeat result local until the reaped-child proof is
+    // durable. The heartbeat reconciliation may advance the lease and then
+    // discover another pending command; the receipt must bind that latest
+    // sequence so recovery can retain the ambiguous pending Start exactly.
+    let final_heartbeat_result =
+        reconcile_final_resource_heartbeat(store, &claim, &mut active_lease);
+    let receipt_lease = match receipt_lease_after_final_heartbeat(
+        store,
+        &claim,
+        &active_lease,
+        &final_heartbeat_result,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            slot.retain_for_reconciliation();
+            return Err(error.context(
+                "confirm durable resource lease before process-exit receipt; supervisor slot retained",
+            ));
+        }
+    };
+    let process_exit_receipt = match persist_worker_process_exit_receipt(
+        store,
+        &claim,
+        &receipt_lease,
+        &outcome,
+    ) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            slot.retain_for_reconciliation();
+            return Err(
+                error.context("persist confirmed worker process exit; supervisor slot retained")
+            );
+        }
+    };
+    accepted_supervisor_test_fail_after_process_exit_receipt()?;
+    if let Err(error) = final_heartbeat_result {
         slot.retain_for_reconciliation();
         return Err(error.context(format!(
             "reconcile final worker-acknowledged resource heartbeat; {}",
             worker_failure_reason(&outcome)
         )));
     }
-    let process_exit_receipt = match worker_process_exit_receipt(&claim, &active_lease, &outcome) {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            slot.retain_for_reconciliation();
-            return Err(
-                error.context("build durable process-exit receipt; supervisor slot retained")
-            );
-        }
-    };
-    if let Err(error) =
-        retry_store_writer_busy(|| store.commit_worker_process_exit_receipt(&process_exit_receipt))
-    {
-        slot.retain_for_reconciliation();
-        return Err(
-            error.context("persist confirmed worker process exit; supervisor slot retained")
-        );
-    }
-    accepted_supervisor_test_fail_after_process_exit_receipt()?;
     let reconciliation = reconcile_worker_exit(
         store,
         &claim,
@@ -1692,6 +1709,36 @@ fn worker_process_exit_receipt(
     Ok(receipt)
 }
 
+fn receipt_lease_after_final_heartbeat(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    active_lease: &FmsResourceLease,
+    final_heartbeat_result: &Result<()>,
+) -> Result<FmsResourceLease> {
+    if final_heartbeat_result.is_ok() {
+        return Ok(active_lease.clone());
+    }
+    retry_store_writer_busy(|| {
+        store.read_resource_lease(
+            claim.run_id.as_str(),
+            active_lease.resource_id.as_str(),
+            active_lease.lease_token.as_str(),
+        )
+    })?
+    .context("active resource lease disappeared after final heartbeat failure")
+}
+
+fn persist_worker_process_exit_receipt(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    lease: &FmsResourceLease,
+    outcome: &ObservedWorkerProcess,
+) -> Result<FmsWorkerProcessExitReceipt> {
+    let receipt = worker_process_exit_receipt(claim, lease, outcome)?;
+    retry_store_writer_busy(|| store.commit_worker_process_exit_receipt(&receipt))?;
+    Ok(receipt)
+}
+
 fn worker_process_exit_receipt_for_current_task(
     store: &SessionStore,
     run_id: &str,
@@ -2522,6 +2569,64 @@ mod tests {
                 assert_eq!(receipt.failure_reason.as_deref(), Some(expected.as_str()));
             }
         }
+    }
+
+    #[test]
+    fn reaped_child_receipt_survives_unacknowledged_final_heartbeat() {
+        let fixture = host_launch_test_fixture();
+        let current_test_process = std::env::current_exe().unwrap();
+        let outcome = spawn_worker(
+            &current_test_process,
+            fixture.store.root(),
+            fixture.claim.run_id.as_str(),
+            fixture.claim.task_id.as_str(),
+            None,
+            &BTreeSet::new(),
+            &[],
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            || Ok(false),
+            || Ok(false),
+        )
+        .unwrap();
+        assert!(outcome.process_id > 0);
+
+        let mut durable_lease = fixture.lease.clone();
+        durable_lease.heartbeat_sequence += 1;
+        durable_lease.heartbeat_at = chrono::Utc::now();
+        fixture
+            .store
+            .heartbeat_resource_lease(&durable_lease)
+            .unwrap();
+        let final_heartbeat_result: Result<()> = Err(anyhow::anyhow!(
+            "accepted worker exited with an unacknowledged heartbeat command"
+        ));
+        let receipt_lease = receipt_lease_after_final_heartbeat(
+            &fixture.store,
+            &fixture.claim,
+            &fixture.lease,
+            &final_heartbeat_result,
+        )
+        .unwrap();
+        assert_eq!(receipt_lease.heartbeat_sequence, durable_lease.heartbeat_sequence);
+        let receipt = persist_worker_process_exit_receipt(
+            &fixture.store,
+            &fixture.claim,
+            &receipt_lease,
+            &outcome,
+        )
+        .unwrap();
+        assert!(final_heartbeat_result.is_err());
+        assert_eq!(
+            fixture
+                .store
+                .read_worker_process_exit_receipt(fixture.claim.run_id.as_str(), &receipt.receipt_id)
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(receipt.process_id, outcome.process_id);
+        assert!(!receipt.status_success);
     }
 
     #[test]

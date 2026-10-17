@@ -28,6 +28,12 @@ const WORKER_PRELAUNCH_FAILED_RECEIPT: &str = "worker_prelaunch_failed.v1.json";
 const WORKER_EXECUTION_COMPLETED_RECEIPT: &str = "worker_execution_completed.v1.json";
 const WORKER_EXECUTION_RECEIPT_SCHEMA: &str = "fullmag.accepted_worker_execution.v1";
 
+// Claim validation is read-only and idempotent, but it can briefly contend
+// with the supervisor heartbeat writer. Keep this retry local to claim
+// validation; never replay worker startup or solver effects.
+const ACCEPTED_WORKER_CLAIM_RETRY_LIMIT: Duration = Duration::from_secs(30);
+const ACCEPTED_WORKER_CLAIM_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 pub(crate) struct AcceptedRunnerExecution {
     pub(crate) status: RunStatus,
     pub(crate) completed_step_count: usize,
@@ -147,10 +153,15 @@ pub(crate) fn create_private_attempt_output_dir(
     let _writer = store
         .write_transaction()
         .context("lock session store before reserving worker attempt output")?;
-    let current_claim = fullmag_runtime_control::load_current_task_claim(
+    let current_claim = retry_worker_claim_store_busy(
         store,
-        &claim.run_id,
+        claim.run_id.as_str(),
         claim.task_id.as_str(),
+        || fullmag_runtime_control::load_current_task_claim(
+            store,
+            &claim.run_id,
+            claim.task_id.as_str(),
+        ),
     )
     .context("worker attempt output requires a current durable claim")?;
     if !claim.is_same_or_renewed_by(&current_claim) {
@@ -264,9 +275,18 @@ fn verify_host_worker_launch_for_claim(
     claim: &fullmag_application::TaskClaim,
     require_gpu_binding: bool,
 ) -> Result<Option<String>> {
-    let lease = store
-        .read_active_resource_lease_for_task(claim.run_id.as_str(), claim.task_id.as_str())?
-        .context("worker execution requires its active local lease")?;
+    let lease = retry_worker_claim_store_busy(
+        store,
+        claim.run_id.as_str(),
+        claim.task_id.as_str(),
+        || {
+            store.read_active_resource_lease_for_task(
+                claim.run_id.as_str(),
+                claim.task_id.as_str(),
+            )
+        },
+    )?
+    .context("worker execution requires its active local lease")?;
     validate_active_fms_lease_matches_claim(&lease, claim)?;
     let require_gpu_binding =
         requires_gpu_host_binding(lease.kind, require_gpu_binding);
@@ -278,19 +298,34 @@ fn verify_host_worker_launch_for_claim(
     };
     let token = std::env::var("FULLMAG_HOST_LAUNCH_TOKEN")
         .context("host-bound worker requires its supervisor launch permit")?;
-    let ledger = fullmag_session::host_resource_ledger::HostResourceLedger::open(
-        &binding.ledger_root,
-        binding.policy.clone(),
+    let ledger = retry_worker_claim_store_busy(
+        store,
+        claim.run_id.as_str(),
+        claim.task_id.as_str(),
+        || {
+            fullmag_session::host_resource_ledger::HostResourceLedger::open(
+                &binding.ledger_root,
+                binding.policy.clone(),
+            )
+        },
     )?;
     if binding.policy.schema_version
         == fullmag_session::host_resource_ledger::HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2
     {
         let expected_generation = binding.require_runtime_generation_sha256()?;
-        fullmag_runtime_control::retry_store_writer_busy(|| {
-            ledger.validate_runtime_generation(expected_generation)
-        })?;
+        retry_worker_claim_store_busy(
+            store,
+            claim.run_id.as_str(),
+            claim.task_id.as_str(),
+            || ledger.validate_runtime_generation(expected_generation),
+        )?;
     }
-    let reservation = ledger.validate_worker_launch(store, &lease, &token)?;
+    let reservation = retry_worker_claim_store_busy(
+        store,
+        claim.run_id.as_str(),
+        claim.task_id.as_str(),
+        || ledger.validate_worker_launch(store, &lease, &token),
+    )?;
     if lease.kind == fullmag_session::FmsResourceKind::Gpu {
         if reservation.exclusive_gpu_uuids.len() != 1
             || reservation.gpu_vram_bytes_by_uuid.len() != 1
@@ -334,12 +369,18 @@ pub(crate) fn resolve_accepted_fem_runtime(
     store: &SessionStore,
     accepted_step: &AcceptedWorkerStep,
 ) -> Result<AcceptedFemRuntime> {
-    let lease = store
-        .read_active_resource_lease_for_task(
-            accepted_step.claim.run_id.as_str(),
-            accepted_step.claim.task_id.as_str(),
-        )?
-        .context("accepted FEM execution requires its active local lease")?;
+    let lease = retry_worker_claim_store_busy(
+        store,
+        accepted_step.claim.run_id.as_str(),
+        accepted_step.claim.task_id.as_str(),
+        || {
+            store.read_active_resource_lease_for_task(
+                accepted_step.claim.run_id.as_str(),
+                accepted_step.claim.task_id.as_str(),
+            )
+        },
+    )?
+    .context("accepted FEM execution requires its active local lease")?;
     validate_active_fms_lease_matches_claim(&lease, &accepted_step.claim)?;
     let resolved_device = resolve_requested_fem_device(
         accepted_step.resolved_input.requested_execution.device.as_str(),
@@ -1192,13 +1233,18 @@ pub(crate) fn execute_accepted_worker_start(
     {
         bail!("accepted Start is not the durable command after one applied Prepare");
     }
-    let current_claim = retry_store_writer_busy(|| {
-        fullmag_runtime_control::load_current_task_claim(
-            store,
-            &accepted_step.claim.run_id,
-            accepted_step.claim.task_id.as_str(),
-        )
-    })
+    let current_claim = retry_worker_claim_store_busy(
+        store,
+        accepted_step.claim.run_id.as_str(),
+        accepted_step.claim.task_id.as_str(),
+        || {
+            fullmag_runtime_control::load_current_task_claim(
+                store,
+                &accepted_step.claim.run_id,
+                accepted_step.claim.task_id.as_str(),
+            )
+        },
+    )
     .context("accepted Start no longer owns the current task claim")?;
     if !accepted_step.claim.is_same_or_renewed_by(&current_claim) {
         bail!("accepted Start worker context has a stale task claim");
@@ -1690,13 +1736,18 @@ fn execute_accepted_antenna_worker_start(
         store, accepted, step, study_step, case_id,
     )?;
     let recover = |path: PathBuf| -> Result<AcceptedRunnerExecution> {
-        let current = retry_store_writer_busy(|| {
-            fullmag_runtime_control::load_current_task_claim(
-                store,
-                &step.claim.run_id,
-                step.claim.task_id.as_str(),
-            )
-        })?;
+        let current = retry_worker_claim_store_busy(
+            store,
+            step.claim.run_id.as_str(),
+            step.claim.task_id.as_str(),
+            || {
+                fullmag_runtime_control::load_current_task_claim(
+                    store,
+                    &step.claim.run_id,
+                    step.claim.task_id.as_str(),
+                )
+            },
+        )?;
         if !step.claim.is_same_or_renewed_by(&current) {
             bail!("antenna inspection recovery belongs to a stale claim");
         }
@@ -1888,13 +1939,18 @@ fn recover_accepted_fdm_worker_attempt(
     declared_outputs: &[StudyOutputPort],
     existing_path: PathBuf,
 ) -> Result<AcceptedRunnerExecution> {
-    let current_claim = retry_store_writer_busy(|| {
-        fullmag_runtime_control::load_current_task_claim(
-            store,
-            &accepted_step.claim.run_id,
-            accepted_step.claim.task_id.as_str(),
-        )
-    })
+    let current_claim = retry_worker_claim_store_busy(
+        store,
+        accepted_step.claim.run_id.as_str(),
+        accepted_step.claim.task_id.as_str(),
+        || {
+            fullmag_runtime_control::load_current_task_claim(
+                store,
+                &accepted_step.claim.run_id,
+                accepted_step.claim.task_id.as_str(),
+            )
+        },
+    )
     .context("reconcile accepted worker receipt under the current claim")?;
     if !accepted_step.claim.is_same_or_renewed_by(&current_claim) {
         bail!("accepted worker receipt belongs to a stale task claim");
@@ -1922,13 +1978,18 @@ fn recover_accepted_fem_worker_attempt(
     existing_path: PathBuf,
     runtime: &AcceptedFemRuntime,
 ) -> Result<AcceptedRunnerExecution> {
-    let current_claim = retry_store_writer_busy(|| {
-        fullmag_runtime_control::load_current_task_claim(
-            store,
-            &accepted_step.claim.run_id,
-            accepted_step.claim.task_id.as_str(),
-        )
-    })
+    let current_claim = retry_worker_claim_store_busy(
+        store,
+        accepted_step.claim.run_id.as_str(),
+        accepted_step.claim.task_id.as_str(),
+        || {
+            fullmag_runtime_control::load_current_task_claim(
+                store,
+                &accepted_step.claim.run_id,
+                accepted_step.claim.task_id.as_str(),
+            )
+        },
+    )
     .context("reconcile accepted FEM worker receipt under the current claim")?;
     if !accepted_step.claim.is_same_or_renewed_by(&current_claim) {
         bail!("accepted FEM worker receipt belongs to a stale task claim");
@@ -2006,9 +2067,12 @@ pub(crate) fn run_pending_accepted_start(
         )
     })
     .context("load immutable accepted study for worker process")?;
-    let claim = retry_store_writer_busy(|| {
-        fullmag_runtime_control::load_current_task_claim(store, &run_id, task_id)
-    })
+    let claim = retry_worker_claim_store_busy(
+        store,
+        run_id.as_str(),
+        task_id,
+        || fullmag_runtime_control::load_current_task_claim(store, &run_id, task_id),
+    )
     .context("worker process requires the exact active durable task claim")?;
     verify_host_worker_launch(store, &claim)?;
     let recovered =
@@ -2083,13 +2147,18 @@ pub(crate) fn run_pending_accepted_start(
             if envelope != &start {
                 return Err(fullmag_application::ExecutionError::ProtocolFenceRejected);
             }
-            let current_claim = retry_store_writer_busy(|| {
-                fullmag_runtime_control::load_current_task_claim(
-                    store,
-                    &claim.run_id,
-                    claim.task_id.as_str(),
-                )
-            })
+            let current_claim = retry_worker_claim_store_busy(
+                store,
+                claim.run_id.as_str(),
+                claim.task_id.as_str(),
+                || {
+                    fullmag_runtime_control::load_current_task_claim(
+                        store,
+                        &claim.run_id,
+                        claim.task_id.as_str(),
+                    )
+                },
+            )
             .map_err(|error| {
                 fullmag_application::ExecutionError::Invalid(format!(
                     "revalidate worker process claim: {error:#}"
@@ -2473,6 +2542,39 @@ fn accepted_worker_test_fail_before_start_effect() -> Result<()> {
 
 fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
     fullmag_runtime_control::retry_store_writer_busy(&mut operation)
+}
+
+/// Retry only idempotent claim/lease validation while honoring a durable
+/// cancellation intent. Durable inbox, journal, and solver effects keep
+/// their existing reconciliation boundaries and are never replayed here.
+fn retry_worker_claim_store_busy<T>(
+    store: &SessionStore,
+    run_id: &str,
+    task_id: &str,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + ACCEPTED_WORKER_CLAIM_RETRY_LIMIT;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_store_writer_busy(&error) && Instant::now() < deadline =>
+            {
+                if store
+                    .read_task_cancellation_intent(run_id, task_id)?
+                    .is_some()
+                {
+                    bail!("accepted worker claim operation cancelled by durable task cancellation");
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(ACCEPTED_WORKER_CLAIM_RETRY_DELAY.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn accepted_worker_test_delay_after_started(interrupt_requested: &AtomicBool) -> Result<()> {
@@ -2974,5 +3076,150 @@ mod accepted_fem_runtime_tests {
             format!("{error:#}").contains("explicit Compute release"),
             "missing exact release must fail before claim recovery: {error:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod accepted_worker_claim_retry_tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+    use std::thread;
+    use std::time::Duration;
+
+    fn unclaimed_task(task_id: &str) -> fullmag_session::FmsTaskCatalogEntry {
+        fullmag_session::FmsTaskCatalogEntry {
+            task_id: task_id.into(),
+            input_fingerprint: "a".repeat(64),
+            lifecycle: fullmag_session::FmsTaskLifecycle::Queued,
+            readiness: fullmag_session::FmsTaskReadiness::Ready,
+            observation: None,
+            attempt_id: None,
+            ownership_epoch: Some(1),
+            resolved_input_fingerprint: None,
+            artifact_ids: Vec::new(),
+            resource_id: None,
+            coordinator_watermark: None,
+            coordinator_genesis: None,
+        }
+    }
+
+    fn cancellation_store() -> (tempfile::TempDir, SessionStore) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let run_id = "run-worker-claim-cancel";
+        let task_id = "task-worker-claim-cancel";
+        store
+            .commit_run_catalog(&fullmag_session::FmsRunCatalog {
+                schema_version: fullmag_session::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.into(),
+                revision: 1,
+                updated_at: chrono::Utc::now(),
+                tasks: vec![unclaimed_task(task_id)],
+            })
+            .unwrap();
+        store
+            .request_task_cancellation_intent(
+                run_id,
+                task_id,
+                "cancel-worker-claim",
+                1,
+                "operator requested cancellation",
+            )
+            .unwrap();
+        (directory, store)
+    }
+
+    #[test]
+    fn typed_native_writer_conflict_retries_after_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let holder_store = SessionStore::open(store.root().to_path_buf()).unwrap();
+        let (acquired_sender, acquired_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let holder = thread::spawn(move || {
+            let transaction = holder_store.write_transaction().unwrap();
+            acquired_sender.send(()).unwrap();
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            drop(transaction);
+        });
+        acquired_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let mut busy_count = 0_u32;
+        let mut release_sender = Some(release_sender);
+        let result = retry_worker_claim_store_busy(
+            &store,
+            "run-worker-claim-retry",
+            "task-worker-claim-retry",
+            || match store.write_transaction() {
+                Ok(transaction) => {
+                    drop(transaction);
+                    Ok(())
+                }
+                Err(error) => {
+                    busy_count = busy_count.saturating_add(1);
+                    if busy_count == 1 {
+                        release_sender.take().unwrap().send(()).unwrap();
+                    }
+                    Err(error)
+                }
+            },
+        );
+        if let Some(sender) = release_sender.take() {
+            sender.send(()).unwrap();
+        }
+        holder.join().unwrap();
+
+        assert!(result.is_ok(), "typed writer conflict should retry: {result:#?}");
+        assert!(
+            busy_count > 0,
+            "the fixture must observe a native typed StoreWriterBusy conflict"
+        );
+    }
+
+    #[test]
+    fn textual_busy_and_nonbusy_errors_are_not_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        for message in [
+            "session store writer is busy: fake textual error",
+            "claim validation failed permanently",
+        ] {
+            let mut attempts = 0_u32;
+            let error = retry_worker_claim_store_busy(
+                &store,
+                "run-worker-claim-error",
+                "task-worker-claim-error",
+                || {
+                    attempts = attempts.saturating_add(1);
+                    Err::<(), _>(anyhow::anyhow!(message))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(attempts, 1, "error must fail closed without replay: {message}");
+            assert!(format!("{error:#}").contains(message));
+        }
+    }
+
+    #[test]
+    fn durable_cancellation_stops_a_typed_busy_retry() {
+        let (_directory, store) = cancellation_store();
+        let mut attempts = 0_u32;
+        let error = retry_worker_claim_store_busy(
+            &store,
+            "run-worker-claim-cancel",
+            "task-worker-claim-cancel",
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(anyhow::Error::new(fullmag_session::StoreWriterBusy))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, 1, "durable cancellation must stop before retry");
+        assert!(format!("{error:#}").contains("cancelled by durable task cancellation"));
     }
 }
