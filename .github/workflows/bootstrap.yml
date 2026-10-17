@@ -334,12 +334,24 @@ jobs:
           cargo test -p fullmag-api --bin fullmag-api-accepted-scheduler accepted_study_supervisor::tests::reaped_child_receipt_survives_unacknowledged_final_heartbeat -- --exact
           cargo test -p fullmag-api --bin fullmag-api-accepted-worker accepted_study_supervisor::tests::host_bound_pre_spawn_retries_writer_busy_without_re_admission -- --exact
           cargo test -p fullmag-api --bin fullmag-api-accepted-scheduler scheduler_writer_busy_tests
+          cargo test -p fullmag-api --bin fullmag-runtime-service orphan_teardown_
           cargo test -p fullmag-runtime-control --lib claim::host_binding_tests::fresh_v2_host_claim_receives_the_canonical_runtime_generation_binding -- --exact
           cargo test -p fullmag-runner --lib fem_gpu_execution_receipt_contract_tests
           cargo test -p fullmag-session --lib host_resource_ledger
           cargo test -p fullmag-runtime-control --lib compute_node_probe
           cargo test -p fullmag-runtime-control --lib nvml_gpu_partition
           cargo test -p fullmag-runtime-control --lib host_runtime
+
+      - name: Run native worker orphan teardown contracts
+        env:
+          RUST_MIN_STACK: 8388608
+        run: |
+          cargo test -p fullmag-session --lib worker_orphan_teardown_success_releases_capacity_and_reconciles_unknown
+          cargo test -p fullmag-session --lib worker_orphan_teardown_replays_exactly_and_rejects_changed_pins
+          cargo test -p fullmag-session --lib worker_orphan_teardown_replays_after_partial_proof_and_lease_publication
+          cargo test -p fullmag-session --lib worker_orphan_teardown_requires_inventory_quiescence
+          cargo test -p fullmag-session --lib worker_orphan_teardown_rejects_durable_started_receipt
+          cargo test -p fullmag-session --lib request_rejects_nil_uuid_and_unprefixed_store_identity
 
       - name: Run Rust quantity, API and CLI contracts
         env:

@@ -1739,6 +1739,45 @@ fault-injection przed i po atomicznej publikacji pointera. Wymagany jest także
 test granicy małego dokumentu z zachowaną rezerwą oraz testów limitów 256 KiB
 i 4 MiB. Do czasu przejścia tych bramek status pozostaje PLANOWANE.
 
+### 13.31 Jawny teardown prywatnego środowiska osieroconego workera
+
+[ADR 0062](../adr/0062-worker-orphan-namespace-teardown.md) ustanawia oddzielny
+proof `WorkerOrphanTeardown`; nie jest to `Worker`, `WorkerNoSpawn` ani wynik
+symulacji. Zakres to jedna rezerwacja `Committed`, dokładny aktywny lease i
+bramka `Consumed`, gdy nie istnieje trwały worker exit receipt. Wynik pozostaje
+nieznany. Implementacja oraz rzeczywisty odbiór Docker: **NOT VERIFIED**.
+
+Request `host_worker_orphan_teardown_request.v1` przypina store/host,
+run/task/attempt/ownership epoch, resource/lease, runtime generation, token
+Consumed i digests rezerwacji oraz lease. Digests dokumentów typowanych liczy
+się z canonical JSON; zewnętrzne owner/config/launch i receipt są przypięte
+po surowych bajtach. Request nie zawiera własnego digestu. Zawiera też hostową
+autoryzację, storage certificate/mount attestation, Engine ID oraz dokładny
+container/image/config i mapowanie GPU prywatnego dedykowanego backendu.
+
+`begin_worker_orphan_teardown` pod host→store writerami zapisuje immutable
+intent, potem `Quarantined`. Capacity nadal jest zajęte. Powtórzenie tego
+samego requestu po awarii między zapisami kontynuuje jego intent; inny request
+nie może przejąć kwarantanny. Brak aktywnego inventory ownera i innych
+niezwolnionych rezerwacji jest wymagany pod writerem. Host sprawdza też brak
+innych działających klientów z RW mountem tego samego ledgeru.
+
+Po autorytatywnym zatrzymaniu dokładnego prywatnego PID namespace host tworzy
+`docker_namespace_teardown_attestation.v1`: ten sam Engine/container/image/
+config, rzeczywiste `exited`, PID 0, `FinishedAt`, zero potomków i odłączone
+dokładne mapowanie zasobu. Niepewny stop lub współdzielony/hostowy namespace
+nie uprawnia do zwolnienia. Native completion ponownie sprawdza request,
+immutable intent i attestation; zapisuje `AwaitReconciliation`, osobny v2
+release proof oraz zwalnia wyłącznie przypięty local lease i host reservation.
+
+Historyczny token pozostaje `Consumed`. Nie powstaje syntetyczny PID, worker
+exit receipt, Started ani heartbeat acknowledgement. Solve nie jest
+powtarzany. Exact replay kończy częściową publikację; już zwolniony lease
+wymaga dokładnego istniejącego proofu. Journale i wyniki pozostają zachowane.
+Przed publikacją nowego proofu wszyscy współdzieleni klienci wymagają upgrade;
+starszy reader ma odmówić odczytu nieznanego proofu. Nie deklarujemy zgodności
+wstecznej tej nowej operacji. Testy regresji i live Docker są osobnymi bramkami.
+
 ## Wspólna normalizacja authoring — ADR0057
 
 Scoped korekta ownership z E1: pure replay execution profile/layers jest współdzielony przez IR core, a application re-exportuje te same funkcje i nadal wiąże ProblemIR, rozstrzyga capability oraz steruje submit/runtime. Algorytm precedence, origins i immutable hashes pozostaje bez zmian. Authoring adaptive waliduje efektywne requested intent, zamiast stale legacy fields sceny. Nie ma zmiany wire, fizyki ani nowego GPU fallback. [ADR0057](../adr/0057-shared-execution-intent-normalization.md) określa zakres i bramki; implementacja/runtime wymagają osobnych dowodów.

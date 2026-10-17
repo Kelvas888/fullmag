@@ -424,3 +424,20 @@ porównuje zegarów między różnymi `boot_id`.
 Dowód bieżącej ścieżki Docker dotyczy Linux `CLOCK_BOOTTIME`. Native Windows
 boot identity i tick-source pozostają osobną kwalifikacją; ten kontrakt nie
 ogłasza ich równoważności bez takiego dowodu.
+
+## Kontrolowane odzyskanie po utracie exit receiptu workera
+
+Decyzja [ADR 0062](../adr/0062-worker-orphan-namespace-teardown.md) dodaje dwa
+jawne polecenia operatora: `--prepare-orphan-teardown --config <absolute>
+--request <absolute>` oraz `--recover-orphan-after-teardown --config <absolute>
+--request <absolute> --attestation <absolute>`. Nie są częścią zwykłego startu,
+restartu ani `service-ensure`. Korzystają z istniejących startup/launch/owner
+blokad, bounded no-follow odczytów i dokładnych raw pinów owner/config/launch.
+Native host ledger jest jedynym właścicielem zmian rezerwacji i SessionStore;
+Docker Engine teardown poświadcza osobno hostowy adapter.
+
+Zakończenie zwalnia zasób z osobnym proofem i zachowuje Consumed oraz nieznany
+wynik, bez worker exit receiptu, ponowienia Solve i uruchomienia schedulerów.
+Ścieżka nie zastępuje idle-owner recovery ani no-spawn cancellation. Szczegóły
+protokołu i bramek zawiera sekcja 13.31 specyfikacji compute-resource-execution.
+Runtime tej nowej ścieżki pozostaje **NOT VERIFIED**.

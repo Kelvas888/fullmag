@@ -4,11 +4,19 @@ mod compute_operator_env;
 use anyhow::{bail, Context, Result};
 use fullmag_session::{
     compute_node_snapshot::Reported,
+    host_resource_ledger::worker_orphan_teardown::{
+        DockerContainerAfterObservation, DockerContainerBeforeObservation,
+        DockerContainerTeardownObservation, DockerDeviceReleaseObservation,
+        DockerNamespaceTeardownResult,
+    },
     host_resource_ledger::{
-        HostInventoryOwner, HostInventoryOwnerDescriptor, HostReservationIdentity,
-        HostReservationOwner, HostResourceLedger, HostResourceLedgerPolicy,
-        HostResourceReservation, HostResourceReservationState, HostRuntimeReadiness,
-        HostWorkerLaunchGate, HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2,
+        DockerNamespaceTeardownAttestation, HostInventoryOwner, HostInventoryOwnerDescriptor,
+        HostReservationIdentity, HostReservationOwner, HostResourceLedger,
+        HostResourceLedgerPolicy, HostResourceReservation, HostResourceReservationState,
+        HostRuntimeReadiness, HostWorkerLaunchGate, WorkerOrphanContainerBinding,
+        WorkerOrphanContainerScope, WorkerOrphanExpectedEvidence, WorkerOrphanLaunchGate,
+        WorkerOrphanReservationState, WorkerOrphanTeardownRequest,
+        HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2,
     },
     repository_path::{checked_path, validate_store_id},
     runtime_service::{
@@ -1451,6 +1459,178 @@ fn parse_failed_no_spawn_cancellation_args(
     ))
 }
 
+const ORPHAN_TEARDOWN_REQUEST_SCHEMA: &str =
+    fullmag_session::host_resource_ledger::HOST_WORKER_ORPHAN_TEARDOWN_REQUEST_SCHEMA;
+const ORPHAN_TEARDOWN_ATTESTATION_SCHEMA: &str =
+    fullmag_session::host_resource_ledger::DOCKER_NAMESPACE_TEARDOWN_ATTESTATION_SCHEMA;
+const ORPHAN_TEARDOWN_MAX_REQUEST_BYTES: usize = 512 * 1024;
+const ORPHAN_TEARDOWN_MAX_ATTESTATION_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanTeardownPhase {
+    Prepare,
+    Recover,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrphanTeardownCliArgs {
+    phase: OrphanTeardownPhase,
+    config: PathBuf,
+    request: PathBuf,
+    attestation: Option<PathBuf>,
+}
+
+/// Parse the two explicit orphan-teardown phases without interpreting any
+/// target-container process state. The recovery service has a private PID
+/// namespace, so process evidence is supplied only by the host-pinned request
+/// and the post-teardown Docker Engine attestation.
+fn parse_orphan_teardown_args(
+    phase: OrphanTeardownPhase,
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<OrphanTeardownCliArgs> {
+    let mut config = None;
+    let mut request = None;
+    let mut attestation = None;
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--config") => {
+                if config.is_some() {
+                    bail!("orphan teardown received duplicate --config");
+                }
+                config = Some(PathBuf::from(args.next().context("missing --config path")?));
+            }
+            Some("--request") => {
+                if request.is_some() {
+                    bail!("orphan teardown received duplicate --request");
+                }
+                request = Some(PathBuf::from(
+                    args.next().context("missing --request path")?,
+                ));
+            }
+            Some("--attestation") => {
+                if attestation.is_some() {
+                    bail!("orphan teardown received duplicate --attestation");
+                }
+                attestation = Some(PathBuf::from(
+                    args.next().context("missing --attestation path")?,
+                ));
+            }
+            Some(value) => bail!("unknown orphan teardown option `{value}`"),
+            None => bail!("orphan teardown option is not UTF-8"),
+        }
+    }
+    let config = config.context("orphan teardown requires --config")?;
+    let request = request.context("orphan teardown requires --request")?;
+    match phase {
+        OrphanTeardownPhase::Prepare if attestation.is_some() => {
+            bail!("orphan teardown preparation does not accept --attestation")
+        }
+        OrphanTeardownPhase::Recover if attestation.is_none() => {
+            bail!("orphan teardown recovery requires --attestation")
+        }
+        _ => {}
+    }
+    Ok(OrphanTeardownCliArgs {
+        phase,
+        config,
+        request,
+        attestation,
+    })
+}
+
+struct OrphanTeardownDocuments {
+    phase: OrphanTeardownPhase,
+    config: ServiceConfig,
+    config_sha256: String,
+    request: WorkerOrphanTeardownRequest,
+    attestation: Option<DockerNamespaceTeardownAttestation>,
+}
+
+/// Read the operator envelope with bounded no-follow reads. The corrected
+/// request has no self-referential digest; its typed canonical digest is
+/// computed by `WorkerOrphanTeardownRequest::request_sha256`, and only the
+/// Engine attestation may refer to that digest.
+fn read_orphan_teardown_documents(args: &OrphanTeardownCliArgs) -> Result<OrphanTeardownDocuments> {
+    let config_bytes = read_stable_absolute_operational_file(&args.config, 65_536)?;
+    let config: ServiceConfig =
+        serde_json::from_slice(&config_bytes).context("parse orphan teardown service config")?;
+    config.validate()?;
+    let config_sha256 = fullmag_session::hex_sha256(&config_bytes);
+
+    let request_bytes =
+        read_stable_absolute_operational_file(&args.request, ORPHAN_TEARDOWN_MAX_REQUEST_BYTES)?;
+    let request: WorkerOrphanTeardownRequest =
+        serde_json::from_slice(&request_bytes).context("parse orphan teardown request envelope")?;
+    request.validate()?;
+    request.bounded_bytes()?;
+    if request.config_sha256 != config_sha256 {
+        bail!("orphan teardown request config digest differs from exact config bytes");
+    }
+    let attestation = match args.phase {
+        OrphanTeardownPhase::Prepare => None,
+        OrphanTeardownPhase::Recover => {
+            let path = args
+                .attestation
+                .as_ref()
+                .context("orphan teardown recovery attestation path is missing")?;
+            let bytes =
+                read_stable_absolute_operational_file(path, ORPHAN_TEARDOWN_MAX_ATTESTATION_BYTES)?;
+            let value: DockerNamespaceTeardownAttestation = serde_json::from_slice(&bytes)
+                .context("parse orphan teardown Docker attestation")?;
+            value.validate_for_request(&request)?;
+            let _ = value.sha256()?;
+            Some(value)
+        }
+    };
+    Ok(OrphanTeardownDocuments {
+        phase: args.phase,
+        config,
+        config_sha256,
+        request,
+        attestation,
+    })
+}
+
+fn reread_orphan_teardown_documents(
+    args: &OrphanTeardownCliArgs,
+    expected: &OrphanTeardownDocuments,
+) -> Result<()> {
+    let config_bytes = read_stable_absolute_operational_file(&args.config, 65_536)?;
+    if fullmag_session::hex_sha256(&config_bytes) != expected.config_sha256 {
+        bail!("orphan teardown config changed after its guarded read");
+    }
+    let config: ServiceConfig =
+        serde_json::from_slice(&config_bytes).context("reparse orphan teardown service config")?;
+    config.validate()?;
+    if config != expected.config {
+        bail!("orphan teardown config identity changed after its guarded read");
+    }
+    let request_bytes =
+        read_stable_absolute_operational_file(&args.request, ORPHAN_TEARDOWN_MAX_REQUEST_BYTES)?;
+    let request: WorkerOrphanTeardownRequest = serde_json::from_slice(&request_bytes)
+        .context("reparse orphan teardown request envelope")?;
+    request.validate()?;
+    request.bounded_bytes()?;
+    if request != expected.request {
+        bail!("orphan teardown request changed after its guarded read");
+    }
+    if let Some(expected_attestation) = expected.attestation.as_ref() {
+        let path = args
+            .attestation
+            .as_ref()
+            .context("orphan teardown attestation path disappeared")?;
+        let bytes =
+            read_stable_absolute_operational_file(path, ORPHAN_TEARDOWN_MAX_ATTESTATION_BYTES)?;
+        let attestation: DockerNamespaceTeardownAttestation =
+            serde_json::from_slice(&bytes).context("reparse orphan teardown Docker attestation")?;
+        attestation.validate_for_request(&request)?;
+        if &attestation != expected_attestation {
+            bail!("orphan teardown attestation changed after its guarded read");
+        }
+    }
+    Ok(())
+}
+
 fn validate_failed_no_spawn_gate(
     state: HostResourceReservationState,
     gate: Option<&HostWorkerLaunchGate>,
@@ -1882,6 +2062,149 @@ fn cancel_failed_no_spawn(args: impl Iterator<Item = OsString>) -> Result<()> {
     Ok(())
 }
 
+fn run_orphan_teardown(
+    phase: OrphanTeardownPhase,
+    args: impl Iterator<Item = OsString>,
+) -> Result<()> {
+    let cli = parse_orphan_teardown_args(phase, args)?;
+    let documents = read_orphan_teardown_documents(&cli)?;
+    let store = SessionStore::open_existing(&documents.config.store_root)
+        .context("open orphan teardown session store")?;
+    let store_id = HostResourceLedger::store_id(store.root())?;
+    if documents.request.store_id != store_id {
+        bail!("orphan teardown request targets a different session store");
+    }
+    let binding = documents
+        .config
+        .host_execution
+        .as_ref()
+        .context("orphan teardown requires the configured host ledger binding")?;
+    let ledger = HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())?;
+    if documents.request.host_id != ledger.policy().host_id {
+        bail!("orphan teardown request targets a different host ledger");
+    }
+    let configured_generation = binding
+        .runtime_generation_sha256
+        .as_deref()
+        .context("orphan teardown requires a pinned host runtime generation")?;
+    if configured_generation != documents.request.runtime_generation_sha256.as_str() {
+        bail!("orphan teardown request targets a different runtime generation");
+    }
+
+    // These guards are acquired before the host-ledger API and held through
+    // its host->store transaction.  The recovery service must never create a
+    // replacement owner while the target Failed owner is being reconciled.
+    let _startup_guard = fullmag_runtime_control::retry_store_writer_busy(|| {
+        RuntimeServiceStartupGuard::try_acquire(store.root())
+    })?
+    .context("orphan teardown startup gate is busy")?;
+    let _launch_guard = fullmag_runtime_control::retry_store_writer_busy(|| {
+        RuntimeServiceLaunchGuard::try_acquire(store.root())
+    })?
+    .context("orphan teardown launch gate is busy")?;
+    let _owner_lock_guard = RuntimeServiceOwnerLockGuard::try_acquire_existing(store.root())?
+        .context("orphan teardown owner lock is busy")?;
+    reread_orphan_teardown_documents(&cli, &documents)?;
+    let owner_bytes = read_stable_store_operational_file(
+        &store,
+        RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH,
+        ORPHAN_TEARDOWN_MAX_REQUEST_BYTES,
+    )?;
+    let owner: RuntimeServiceOwnerDescriptor = serde_json::from_slice(&owner_bytes)
+        .context("parse orphan teardown runtime owner descriptor")?;
+    validate_descriptor(&owner)?;
+    if owner.target_id != documents.config.target_id || owner.state != RuntimeServiceState::Failed {
+        bail!("orphan teardown requires the exact Failed target owner");
+    }
+    if fullmag_session::hex_sha256(&owner_bytes) != documents.request.owner_sha256 {
+        bail!("orphan teardown owner bytes differ from the pinned owner");
+    }
+    let launch_bytes = read_stable_store_operational_file(
+        &store,
+        "runtime-services/LAUNCH.json",
+        ORPHAN_TEARDOWN_MAX_REQUEST_BYTES,
+    )?;
+    if fullmag_session::hex_sha256(&launch_bytes) != documents.request.launch_sha256 {
+        bail!("orphan teardown launch bytes differ from the pinned launch");
+    }
+    let launch: serde_json::Value =
+        serde_json::from_slice(&launch_bytes).context("parse orphan teardown launch record")?;
+    if !matches!(
+        launch.get("state").and_then(serde_json::Value::as_str),
+        Some("ready") | Some("failed")
+    ) {
+        bail!("orphan teardown requires a ready or failed launch record");
+    }
+    if store
+        .list_worker_process_exit_receipts(&documents.request.run_id)?
+        .into_iter()
+        .any(|receipt| {
+            receipt.task_id == documents.request.task_id
+                && receipt.attempt_id == documents.request.attempt_id
+                && receipt.resource_id == documents.request.resource_id
+                && receipt.lease_token == documents.request.lease_token
+        })
+    {
+        bail!("orphan teardown cannot replace an existing worker exit receipt");
+    }
+    let child_roles = owner
+        .children
+        .iter()
+        .map(|child| child.role.as_str())
+        .collect::<BTreeSet<_>>();
+    if child_roles.len() != 2
+        || !child_roles.contains("compute")
+        || !child_roles.contains("preparation")
+        || owner
+            .children
+            .iter()
+            .any(|child| !matches!(child.status.as_str(), "exited_success" | "exited_failure"))
+    {
+        bail!("orphan teardown lacks terminal proof for every target owner child");
+    }
+
+    let result = match (documents.phase, documents.attestation.as_ref()) {
+        (OrphanTeardownPhase::Prepare, None) => {
+            let intent = fullmag_runtime_control::retry_store_writer_busy(|| {
+                ledger.begin_worker_orphan_teardown(&store, &documents.request)
+            })
+            .context("begin worker orphan teardown")?;
+            serde_json::to_value(intent).context("serialize orphan teardown intent")?
+        }
+        (OrphanTeardownPhase::Recover, Some(attestation)) => {
+            let reservation = fullmag_runtime_control::retry_store_writer_busy(|| {
+                ledger.complete_worker_orphan_teardown(&store, &documents.request, attestation)
+            })
+            .context("complete worker orphan teardown")?;
+            serde_json::to_value(reservation).context("serialize orphan teardown reservation")?
+        }
+        (OrphanTeardownPhase::Prepare, Some(_)) => {
+            bail!("orphan teardown preparation unexpectedly received an attestation")
+        }
+        (OrphanTeardownPhase::Recover, None) => {
+            bail!("orphan teardown recovery has no Docker attestation")
+        }
+    };
+    let output = serde_json::json!({
+        "schema_version": "runtime_service_orphan_teardown_result.v1",
+        "status": match documents.phase {
+            OrphanTeardownPhase::Prepare => "prepared",
+            OrphanTeardownPhase::Recover => "completed",
+        },
+        "request_sha256": documents.request.request_sha256()?,
+        "started": false,
+        "solve_replayed": false,
+        "startup_replayed": false,
+        "result": result,
+    });
+    println!(
+        "{}",
+        String::from_utf8(serde_json::to_vec(&output)?)
+            .context("orphan teardown result is not UTF-8")?
+    );
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("native runtime service failed: {error:#}");
@@ -1897,6 +2220,12 @@ fn run() -> Result<()> {
         Some(value) if value == OsString::from("--cancel-failed-no-spawn") => {
             cancel_failed_no_spawn(args)
         }
+        Some(value) if value == OsString::from("--prepare-orphan-teardown") => {
+            run_orphan_teardown(OrphanTeardownPhase::Prepare, args)
+        }
+        Some(value) if value == OsString::from("--recover-orphan-after-teardown") => {
+            run_orphan_teardown(OrphanTeardownPhase::Recover, args)
+        }
         Some(value) if value == OsString::from("--config") => {
             let path = PathBuf::from(args.next().context("missing --config path")?);
             if !path.is_absolute() || args.next().is_some() {
@@ -1904,7 +2233,7 @@ fn run() -> Result<()> {
             }
             run_service(path)
         }
-        _ => bail!("usage: fullmag-runtime-service --config <absolute-json-path> | --cancel-failed-no-spawn --config <absolute-json-path> --request <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--native-fem-gpu-readiness <absolute-json-path>] [--host-id <stable-id>]")
+        _ => bail!("usage: fullmag-runtime-service --config <absolute-json-path> | --cancel-failed-no-spawn --config <absolute-json-path> --request <absolute-json-path> | --prepare-orphan-teardown --config <absolute-json-path> --request <absolute-json-path> | --recover-orphan-after-teardown --config <absolute-json-path> --request <absolute-json-path> --attestation <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--native-fem-gpu-readiness <absolute-json-path>] [--host-id <stable-id>]")
     }
 }
 
@@ -3067,6 +3396,191 @@ mod tests {
         assert!(result.is_err());
         assert!(unknown);
         assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn orphan_teardown_parser_separates_prepare_and_recover_attestation() {
+        let prepare = parse_orphan_teardown_args(
+            OrphanTeardownPhase::Prepare,
+            [
+                "--config",
+                "/state/config.json",
+                "--request",
+                "/state/orphan-request.json",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(prepare.phase, OrphanTeardownPhase::Prepare);
+        assert_eq!(prepare.attestation, None);
+
+        let recover = parse_orphan_teardown_args(
+            OrphanTeardownPhase::Recover,
+            [
+                "--config",
+                "/state/config.json",
+                "--request",
+                "/state/orphan-request.json",
+                "--attestation",
+                "/state/teardown-attestation.json",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(recover.phase, OrphanTeardownPhase::Recover);
+        assert_eq!(
+            recover.attestation,
+            Some(PathBuf::from("/state/teardown-attestation.json"))
+        );
+
+        assert!(parse_orphan_teardown_args(
+            OrphanTeardownPhase::Prepare,
+            [
+                "--config",
+                "/state/config.json",
+                "--request",
+                "/state/orphan-request.json",
+                "--attestation",
+                "/state/teardown-attestation.json",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .is_err());
+        assert!(parse_orphan_teardown_args(
+            OrphanTeardownPhase::Recover,
+            [
+                "--config",
+                "/state/config.json",
+                "--request",
+                "/state/orphan-request.json",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn orphan_teardown_loader_binds_attestation_to_canonical_request_digest() {
+        let root =
+            std::env::temp_dir().join(format!("fullmag-orphan-loader-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.json");
+        let request_path = root.join("request.json");
+        let attestation_path = root.join("attestation.json");
+        let config_bytes = serde_json::to_vec(&config()).unwrap();
+        std::fs::write(&config_path, &config_bytes).unwrap();
+        let digest = "a".repeat(64);
+        let request = WorkerOrphanTeardownRequest {
+            schema_version: ORPHAN_TEARDOWN_REQUEST_SCHEMA.to_string(),
+            request_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            store_id: format!("sha256:{}", "c".repeat(64)),
+            host_id: "host-orphan".to_string(),
+            run_id: "run-orphan".to_string(),
+            task_id: "task-orphan".to_string(),
+            attempt_id: "attempt-orphan".to_string(),
+            ownership_epoch: 1,
+            resource_id: "gpu-orphan".to_string(),
+            lease_token: "lease-orphan".to_string(),
+            reservation_request_sha256: digest.clone(),
+            reservation_before_sha256: digest.clone(),
+            lease_before_sha256: digest.clone(),
+            runtime_generation_sha256: digest.clone(),
+            worker_launch_gate: WorkerOrphanLaunchGate::Consumed {
+                token: "00000000-0000-4000-8000-000000000002".to_string(),
+            },
+            run_receipt_sha256: digest.clone(),
+            owner_sha256: digest.clone(),
+            config_sha256: fullmag_session::hex_sha256(&config_bytes),
+            launch_sha256: digest.clone(),
+            host_authorization_sha256: digest.clone(),
+            windows_folder_host_sha256: digest.clone(),
+            mount_attestation_sha256: digest.clone(),
+            docker_engine_id_sha256: digest,
+            containers: vec![WorkerOrphanContainerBinding {
+                scope: WorkerOrphanContainerScope::DedicatedParent,
+                container_id: "container-orphan".to_string(),
+                image_id: "image-orphan".to_string(),
+                compose_project: "project-orphan".to_string(),
+                service: "worker".to_string(),
+                config_sha256: "b".repeat(64),
+                private_pid_namespace: true,
+                host_pid: false,
+                sole_worker_scope: true,
+                device_requests: vec![],
+            }],
+            expected: WorkerOrphanExpectedEvidence {
+                reservation_state: WorkerOrphanReservationState::Committed,
+                local_lease_state: "active".to_string(),
+                started_receipt_absent: true,
+                worker_exit_receipt_absent: true,
+                container_state: "exited".to_string(),
+                pid: 0,
+                finished_at_required: true,
+                descendant_count: 0,
+                task_outcome: "unknown".to_string(),
+                solve_replay: false,
+            },
+        };
+        let request_bytes = serde_json::to_vec(&request).unwrap();
+        std::fs::write(&request_path, &request_bytes).unwrap();
+        let request_sha256 = request.request_sha256().unwrap();
+        let container = &request.containers[0];
+        let attestation = DockerNamespaceTeardownAttestation {
+            schema_version: ORPHAN_TEARDOWN_ATTESTATION_SCHEMA.to_string(),
+            request_sha256: request_sha256.clone(),
+            docker_engine_id_sha256: request.docker_engine_id_sha256.clone(),
+            containers: vec![DockerContainerTeardownObservation {
+                container_id: container.container_id.clone(),
+                image_id: container.image_id.clone(),
+                config_sha256: container.config_sha256.clone(),
+                before: DockerContainerBeforeObservation {
+                    private_pid_namespace: true,
+                    host_pid: false,
+                    device_requests_sha256: container.device_requests_sha256(),
+                },
+                after: DockerContainerAfterObservation {
+                    state: "exited".to_string(),
+                    pid: 0,
+                    finished_at: "2026-10-17T22:00:00Z".to_string(),
+                    descendant_count: 0,
+                    private_pid_namespace: true,
+                    host_pid: false,
+                    device_requests_sha256: container.device_requests_sha256(),
+                },
+            }],
+            device_release: DockerDeviceReleaseObservation {
+                resource_id: request.resource_id.clone(),
+                gpu_uuid: None,
+                mapping_sha256: "c".repeat(64),
+                mapping_detached: true,
+            },
+            manifest_sha256: "d".repeat(64),
+            result: DockerNamespaceTeardownResult::AuthoritativeTeardown,
+        };
+        let attestation_bytes = serde_json::to_vec(&attestation).unwrap();
+        std::fs::write(&attestation_path, &attestation_bytes).unwrap();
+        let args = OrphanTeardownCliArgs {
+            phase: OrphanTeardownPhase::Recover,
+            config: config_path,
+            request: request_path,
+            attestation: Some(attestation_path),
+        };
+        let documents = read_orphan_teardown_documents(&args).unwrap();
+        assert_eq!(documents.request.request_sha256().unwrap(), request_sha256);
+        assert_eq!(documents.attestation.as_ref(), Some(&attestation));
+        let mut tampered = attestation;
+        tampered.request_sha256 = "f".repeat(64);
+        std::fs::write(
+            root.join("attestation.json"),
+            serde_json::to_vec(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(read_orphan_teardown_documents(&args).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn config() -> ServiceConfig {

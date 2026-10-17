@@ -25,10 +25,14 @@ use crate::store::SessionStore;
 use crate::types::{
     FmsPreparationProcessExitReceipt, FmsPreparationResourceLease, FmsResourceBudget,
     FmsResourceKind, FmsResourceLease, FmsResourceLeaseState, FmsWorkerProcessExitReceipt,
+    FmsRetryAction, FmsRetryDecision, FmsRetryTrigger,
     PreparationProcessFinalizationDisposition, PreparationResourceLeaseCommitDisposition,
     TaskAdmissionCommitDisposition,
 };
 use crate::writer::Writer;
+
+pub mod worker_orphan_teardown;
+pub use worker_orphan_teardown::*;
 
 pub const HOST_RESOURCE_LEDGER_SCHEMA_V1: &str = "host_resource_ledger.v1";
 /// Current durable ledger schema with compute-node producer fencing fields.
@@ -44,6 +48,10 @@ pub const HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2: &str = "host_resource_ledger_po
 pub const HOST_RUNTIME_READINESS_SCHEMA_V1: &str = "host_runtime_readiness.v1";
 pub const HOST_RUNTIME_STATE_SCHEMA_V1: &str = "host_runtime_state.v1";
 pub const HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1: &str = "host_resource_release_proof.v1";
+/// Proof schema for an authoritative Docker namespace teardown. Older
+/// readers reject this schema and therefore fail closed until all clients are
+/// upgraded or the reservation is quiesced through the legacy path.
+pub const HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V2: &str = "host_resource_release_proof.v2";
 
 const HOST_RESOURCE_LEDGER_FILE: &str = "HOST_RESOURCE_LEDGER.json";
 const HOST_RESOURCE_LEDGER_MARKER_FILE: &str = "HOST_RESOURCE_LEDGER.init.json";
@@ -88,6 +96,10 @@ const MAX_COMPUTE_NODE_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HOST_RUNTIME_READINESS_BYTES: usize = 256 * 1024;
 const MAX_HOST_INVENTORY_OWNER_RECORD_BYTES: usize = 4096;
 const MAX_RUNTIME_SNAPSHOT_GC_ENTRIES: usize = 256;
+/// The accepted-worker protocol's immutable receipt proving that the worker
+/// crossed its durable start boundary. Orphan teardown is allowed only when
+/// this exact attempt receipt is absent.
+const WORKER_EXECUTION_STARTED_RECEIPT_FILE: &str = "worker_execution_started.v1.json";
 
 /// Ordinary contention in a validated host ledger. Corruption and fencing
 /// failures remain errors; schedulers may wait only for this admission outcome.
@@ -785,6 +797,7 @@ enum HostResourceReleaseProofKind {
     AdmissionAbsent,
     PreparationAdmissionAbsent,
     PreparationNoSpawn,
+    WorkerOrphanTeardown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -807,6 +820,8 @@ struct HostResourceReleaseProof {
     unadmitted_task: Option<crate::FmsTaskCatalogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preparation_launch_owner: Option<HostPreparationLaunchOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    orphan_teardown: Option<WorkerOrphanTeardownReleaseProof>,
 }
 
 /// A validated read of the complete ledger and its pinned policy.
@@ -1069,6 +1084,7 @@ impl HostResourceLedger {
             released_preparation_lease: None,
             unadmitted_task: Some(task.clone()),
             preparation_launch_owner: None,
+            orphan_teardown: None,
         };
         let bytes = bounded_json_bytes(
             &proof,
@@ -1596,6 +1612,7 @@ impl HostResourceLedger {
             released_preparation_lease: None,
             unadmitted_task: Some(task.clone()),
             preparation_launch_owner: None,
+            orphan_teardown: None,
         };
         let bytes = bounded_json_bytes(
             &proof,
@@ -1911,6 +1928,7 @@ impl HostResourceLedger {
             released_preparation_lease: Some(released),
             unadmitted_task: Some(task.clone()),
             preparation_launch_owner: None,
+            orphan_teardown: None,
         };
         let bytes = bounded_json_bytes(
             &proof,
@@ -3855,6 +3873,356 @@ impl HostResourceLedger {
         Ok(Some(disposition))
     }
 
+    /// Durably quarantine one exact consumed worker reservation before an
+    /// operator tears down its private Docker namespace. The consumed gate is
+    /// retained: this operation never converts it into a no-spawn closure.
+    pub fn begin_worker_orphan_teardown(
+        &self,
+        store: &SessionStore,
+        request: &WorkerOrphanTeardownRequest,
+    ) -> Result<WorkerOrphanTeardownIntent> {
+        request.validate()?;
+        let request_sha256 = request.request_sha256()?;
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let store_id = Self::store_id(store.root())?;
+        if request.store_id != store_id {
+            bail!("worker orphan teardown belongs to another SessionStore");
+        }
+        let mut document = self.read_document_locked()?;
+        let identity = worker_orphan_reservation_identity(request)?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|reservation| reservation.identity == identity)
+            .context("worker orphan teardown has no exact host reservation")?;
+
+        let intent = read_worker_orphan_teardown_intent(&self.root, &request_sha256)?;
+        if let Some(intent) = &intent {
+            intent.validate()?;
+            if intent.request != *request {
+                bail!("worker orphan teardown replay differs from its immutable request");
+            }
+        }
+        let reservation = &document.reservations[index];
+        validate_worker_orphan_request_matches_reservation(
+            reservation,
+            &document.policy,
+            &store_id,
+            request,
+        )?;
+        ensure_worker_started_receipt_absent(store, request)?;
+        match reservation.state {
+            HostResourceReservationState::Released => {
+                if intent.is_none() {
+                    bail!("released host reservation has no orphan teardown intent");
+                }
+                validate_release_proof(&self.root, &document.policy, reservation)?;
+                let proof_digest = reservation
+                    .release_proof_sha256
+                    .as_deref()
+                    .context("released orphan reservation has no proof digest")?;
+                let proof_bytes = read_bounded_regular_file(
+                    &self.root,
+                    &release_proof_relative_path(proof_digest)?,
+                    MAX_RELEASE_PROOF_BYTES,
+                )?;
+                let proof: HostResourceReleaseProof = serde_json::from_slice(&proof_bytes)?;
+                if proof.kind != HostResourceReleaseProofKind::WorkerOrphanTeardown {
+                    bail!("released reservation was not released by orphan teardown");
+                }
+                return Ok(intent.expect("checked above"));
+            }
+            HostResourceReservationState::Tentative => {
+                bail!("worker orphan teardown requires a committed reservation")
+            }
+            HostResourceReservationState::Committed => {
+                if request.expected.reservation_state
+                    != worker_orphan_teardown::WorkerOrphanReservationState::Committed
+                {
+                    bail!("first worker orphan teardown request must pin committed state");
+                }
+                let reservation_sha256 = canonical_json_sha256(
+                    &serde_json::to_value(reservation)
+                        .context("serializing reservation before orphan quarantine")?,
+                );
+                if reservation_sha256 != request.reservation_before_sha256 {
+                    bail!("worker orphan teardown reservation-before digest differs");
+                }
+            }
+            HostResourceReservationState::Quarantined => {
+                return intent
+                    .context("quarantined reservation is missing its orphan teardown intent");
+            }
+        }
+        ensure_worker_orphan_quiescence_locked(self, &document, &identity)?;
+
+        let lease = store
+            .read_resource_lease(&request.run_id, &request.resource_id, &request.lease_token)?
+            .context("worker orphan teardown requires its exact local lease")?;
+        validate_worker_orphan_active_lease(request, &lease)?;
+        validate_reservation_host_binding(
+            &self.root,
+            &document.policy,
+            reservation,
+            lease.host_launch_binding.as_ref(),
+            "worker orphan teardown",
+        )?;
+        let lease_sha256 = canonical_json_sha256(
+            &serde_json::to_value(&lease).context("serializing lease before orphan quarantine")?,
+        );
+        if lease_sha256 != request.lease_before_sha256 {
+            bail!("worker orphan teardown lease-before digest differs");
+        }
+        if store
+            .list_worker_process_exit_receipts(&request.run_id)?
+            .iter()
+            .any(|receipt| {
+                receipt.task_id == request.task_id
+                    && receipt.attempt_id == request.attempt_id
+                    && receipt.resource_id == request.resource_id
+                    && receipt.lease_token == request.lease_token
+            })
+        {
+            bail!("worker orphan teardown cannot replace an existing worker exit receipt");
+        }
+
+        let intent = WorkerOrphanTeardownIntent::from_request(request.clone())?;
+        let intent_bytes = bounded_json_bytes(
+            &intent,
+            MAX_RELEASE_PROOF_BYTES,
+            "worker orphan teardown intent",
+        )?;
+        let intent_relative = worker_orphan_teardown::intent_relative_path(&request_sha256)?;
+        crate::repository_path::create_parent(&self.root, &intent_relative)?;
+        publish_immutable_exact(
+            &self.root,
+            &intent_relative,
+            &intent_bytes,
+            MAX_RELEASE_PROOF_BYTES,
+        )?;
+        document.reservations[index].state = HostResourceReservationState::Quarantined;
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(intent)
+    }
+
+    /// Complete an exact orphan teardown only after a typed Docker Engine
+    /// attestation proves the dedicated private namespace exited. The local
+    /// task outcome remains unknown and is marked AwaitReconciliation; no
+    /// worker receipt or solver replay is fabricated.
+    pub fn complete_worker_orphan_teardown(
+        &self,
+        store: &SessionStore,
+        request: &WorkerOrphanTeardownRequest,
+        attestation: &DockerNamespaceTeardownAttestation,
+    ) -> Result<HostResourceReservation> {
+        request.validate()?;
+        attestation.validate_for_request(request)?;
+        let request_sha256 = request.request_sha256()?;
+        let nested_proof = WorkerOrphanTeardownReleaseProof::from_request_and_attestation(
+            request,
+            attestation,
+        )?;
+        let _host_writer = self.writer.acquire()?;
+
+        {
+            let _store_writer = store.write_transaction()?;
+            let document = self.read_document_locked()?;
+            let store_id = Self::store_id(store.root())?;
+            if request.store_id != store_id {
+                bail!("worker orphan teardown belongs to another SessionStore");
+            }
+            let identity = worker_orphan_reservation_identity(request)?;
+            let reservation = document
+                .reservations
+                .iter()
+                .find(|reservation| reservation.identity == identity)
+                .context("worker orphan teardown has no exact host reservation")?;
+            validate_worker_orphan_request_matches_reservation(
+                reservation,
+                &document.policy,
+                &store_id,
+                request,
+            )?;
+            ensure_worker_started_receipt_absent(store, request)?;
+            if reservation.state == HostResourceReservationState::Released {
+                let proof_sha256 = orphan_release_proof_sha256(
+                    reservation,
+                    &document.policy,
+                    &store_id,
+                    &nested_proof,
+                )?;
+                if reservation.release_proof_sha256.as_deref() != Some(proof_sha256.as_str()) {
+                    bail!("released orphan reservation replay differs from its proof");
+                }
+                validate_release_proof(&self.root, &document.policy, reservation)?;
+                return Ok(reservation.clone());
+            }
+            ensure_worker_orphan_quiescence_locked(self, &document, &identity)?;
+            if reservation.state != HostResourceReservationState::Quarantined {
+                bail!("worker orphan teardown requires its begin phase to quarantine the reservation");
+            }
+            let intent = read_worker_orphan_teardown_intent(&self.root, &request_sha256)?
+                .context("worker orphan teardown intent is missing")?;
+            intent.validate()?;
+            if intent.request != *request {
+                bail!("worker orphan teardown intent differs from its completion request");
+            }
+            if store
+                .list_worker_process_exit_receipts(&request.run_id)?
+                .iter()
+                .any(|receipt| {
+                    receipt.task_id == request.task_id
+                        && receipt.attempt_id == request.attempt_id
+                        && receipt.resource_id == request.resource_id
+                        && receipt.lease_token == request.lease_token
+                })
+            {
+                bail!("worker orphan teardown cannot replace an existing worker exit receipt");
+            }
+            ensure_worker_started_receipt_absent(store, request)?;
+            let lease = store
+                .read_resource_lease(&request.run_id, &request.resource_id, &request.lease_token)?
+                .context("worker orphan teardown requires its exact local lease")?;
+            match lease.state {
+                FmsResourceLeaseState::Active => {
+                    validate_worker_orphan_active_lease(request, &lease)?;
+                    validate_reservation_host_binding(
+                        &self.root,
+                        &document.policy,
+                        reservation,
+                        lease.host_launch_binding.as_ref(),
+                        "worker orphan teardown",
+                    )?;
+                }
+                FmsResourceLeaseState::Released => {
+                    validate_worker_orphan_lease_identity(request, &lease)?;
+                    validate_worker_orphan_release_proof_file(
+                        &self.root,
+                        &document.policy,
+                        reservation,
+                        &nested_proof,
+                    )?;
+                }
+            }
+        }
+
+        let attestation_sha256 = attestation.sha256()?;
+        let attestation_bytes = attestation.bounded_bytes()?;
+        let attestation_relative = worker_orphan_teardown::attestation_relative_path(
+            &attestation_sha256,
+        )?;
+        crate::repository_path::create_parent(&self.root, &attestation_relative)?;
+        publish_immutable_exact(
+            &self.root,
+            &attestation_relative,
+            &attestation_bytes,
+            MAX_RELEASE_PROOF_BYTES,
+        )?;
+
+        // Persist the unknown outcome before releasing capacity. Replaying
+        // this deterministic decision is safe after a crash at any later
+        // publication boundary.
+        ensure_worker_orphan_reconciliation(store, request, &request_sha256)?;
+
+        let mut document = self.read_document_locked()?;
+        let store_id = Self::store_id(store.root())?;
+        let identity = worker_orphan_reservation_identity(request)?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|reservation| reservation.identity == identity)
+            .context("worker orphan teardown reservation disappeared")?;
+        validate_worker_orphan_request_matches_reservation(
+            &document.reservations[index],
+            &document.policy,
+            &store_id,
+            request,
+        )?;
+        if document.reservations[index].state != HostResourceReservationState::Quarantined {
+            bail!("worker orphan teardown reservation is no longer quarantined");
+        }
+        ensure_worker_orphan_quiescence_locked(self, &document, &identity)?;
+        let proof = HostResourceReleaseProof {
+            schema_version: HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V2.to_string(),
+            kind: HostResourceReleaseProofKind::WorkerOrphanTeardown,
+            host_id: document.policy.host_id.clone(),
+            store_id: store_id.clone(),
+            request_sha256: document.reservations[index].request_sha256.clone(),
+            worker_receipt: None,
+            released_worker_lease: None,
+            preparation_receipt: None,
+            released_preparation_lease: None,
+            unadmitted_task: None,
+            preparation_launch_owner: None,
+            orphan_teardown: Some(nested_proof.clone()),
+        };
+        let proof_bytes = bounded_json_bytes(
+            &proof,
+            MAX_RELEASE_PROOF_BYTES,
+            "worker orphan teardown proof",
+        )?;
+        let proof_sha256 = format!("{:x}", Sha256::digest(&proof_bytes));
+        let proof_relative = release_proof_relative_path(&proof_sha256)?;
+        crate::repository_path::create_parent(&self.root, &proof_relative)?;
+        publish_immutable_exact(
+            &self.root,
+            &proof_relative,
+            &proof_bytes,
+            MAX_RELEASE_PROOF_BYTES,
+        )?;
+
+        {
+            let _store_writer = store.write_transaction()?;
+            if store
+                .list_worker_process_exit_receipts(&request.run_id)?
+                .iter()
+                .any(|receipt| {
+                    receipt.task_id == request.task_id
+                        && receipt.attempt_id == request.attempt_id
+                        && receipt.resource_id == request.resource_id
+                        && receipt.lease_token == request.lease_token
+                })
+            {
+                bail!("worker orphan teardown cannot replace an existing worker exit receipt");
+            }
+            ensure_worker_started_receipt_absent(store, request)?;
+            let lease = store
+                .read_resource_lease(&request.run_id, &request.resource_id, &request.lease_token)?
+                .context("worker orphan teardown lease disappeared before release")?;
+            match lease.state {
+                FmsResourceLeaseState::Active => {
+                    validate_worker_orphan_active_lease(request, &lease)?;
+                    validate_reservation_host_binding(
+                        &self.root,
+                        &document.policy,
+                        &document.reservations[index],
+                        lease.host_launch_binding.as_ref(),
+                        "worker orphan teardown",
+                    )?;
+                    store.release_resource_lease_unlocked(&lease)?;
+                }
+                FmsResourceLeaseState::Released => {
+                    validate_worker_orphan_lease_identity(request, &lease)?;
+                    validate_worker_orphan_release_proof_file(
+                        &self.root,
+                        &document.policy,
+                        &document.reservations[index],
+                        &nested_proof,
+                    )?;
+                }
+            }
+        }
+
+        document.reservations[index].release_proof_sha256 = Some(proof_sha256);
+        document.reservations[index].state = HostResourceReservationState::Released;
+        let released = document.reservations[index].clone();
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(released)
+    }
+
     /// Release one reservation only after both the durable worker exit receipt
     /// and the matching local resource lease are present in the SessionStore,
     /// with the local lease already in Released state.
@@ -3923,6 +4291,7 @@ impl HostResourceLedger {
             released_preparation_lease: None,
             unadmitted_task: None,
             preparation_launch_owner: None,
+            orphan_teardown: None,
         };
         let proof_bytes =
             bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "worker release proof")?;
@@ -3996,6 +4365,7 @@ impl HostResourceLedger {
             released_preparation_lease: None,
             unadmitted_task: None,
             preparation_launch_owner: None,
+            orphan_teardown: None,
         };
         let bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "worker no-spawn proof")?;
         let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -4185,6 +4555,7 @@ impl HostResourceLedger {
             preparation_launch_owner: document.reservations[index]
                 .preparation_launch_owner
                 .clone(),
+            orphan_teardown: None,
         };
         let proof_bytes =
             bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "preparation release proof")?;
@@ -5211,6 +5582,250 @@ fn release_proof_relative_path(digest: &str) -> Result<String> {
     Ok(format!("proofs/{digest}.json"))
 }
 
+fn worker_orphan_reservation_identity(
+    request: &WorkerOrphanTeardownRequest,
+) -> Result<HostReservationIdentity> {
+    let identity = HostReservationIdentity {
+        store_id: request.store_id.clone(),
+        run_id: request.run_id.clone(),
+        task_id: request.task_id.clone(),
+        resource_id: request.resource_id.clone(),
+        owner: HostReservationOwner::Solver {
+            attempt_id: request.attempt_id.clone(),
+            ownership_epoch: request.ownership_epoch,
+        },
+        lease_token: request.lease_token.clone(),
+    };
+    identity.validate()?;
+    Ok(identity)
+}
+
+fn ensure_worker_orphan_quiescence_locked(
+    ledger: &HostResourceLedger,
+    document: &HostResourceLedgerDocument,
+    target: &HostReservationIdentity,
+) -> Result<()> {
+    if ledger.active_inventory_owner_locked()?.is_some() {
+        bail!("worker orphan teardown requires the active inventory publisher to be absent");
+    }
+    if document
+        .reservations
+        .iter()
+        .any(|reservation| reservation.identity != *target
+            && reservation.state != HostResourceReservationState::Released)
+    {
+        bail!("worker orphan teardown requires all other host reservations to be released");
+    }
+    Ok(())
+}
+
+fn worker_started_receipt_relative_path(
+    request: &WorkerOrphanTeardownRequest,
+) -> Result<String> {
+    for (value, field) in [
+        (request.run_id.as_str(), "run_id"),
+        (request.task_id.as_str(), "task_id"),
+        (request.attempt_id.as_str(), "attempt_id"),
+    ] {
+        crate::repository_path::validate_store_id(value)
+            .with_context(|| format!("invalid worker started receipt {field}"))?;
+    }
+    Ok(format!(
+        "runs/{}/worker-attempts/{}/{}/epoch-{}/{}",
+        request.run_id,
+        request.task_id,
+        request.attempt_id,
+        request.ownership_epoch,
+        WORKER_EXECUTION_STARTED_RECEIPT_FILE,
+    ))
+}
+
+/// Check the actual accepted-worker attempt journal while the SessionStore
+/// writer is held. The request's boolean is only an expected observation; a
+/// durable Started receipt wins and blocks orphan recovery.
+fn ensure_worker_started_receipt_absent(
+    store: &SessionStore,
+    request: &WorkerOrphanTeardownRequest,
+) -> Result<()> {
+    let relative = worker_started_receipt_relative_path(request)?;
+    let path = checked_path(store.root(), &relative)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                bail!(
+                    "worker orphan teardown started receipt path is not a regular file: {}",
+                    path.display()
+                );
+            }
+            bail!(
+                "worker orphan teardown requires the durable Started receipt to be absent: {}",
+                path.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "checking worker orphan teardown started receipt `{}`",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn validate_worker_orphan_request_matches_reservation(
+    reservation: &HostResourceReservation,
+    policy: &HostResourceLedgerPolicy,
+    store_id: &str,
+    request: &WorkerOrphanTeardownRequest,
+) -> Result<()> {
+    let identity = worker_orphan_reservation_identity(request)?;
+    if reservation.identity != identity {
+        bail!("worker orphan teardown request differs from the exact reservation identity");
+    }
+    if store_id != request.store_id
+        || reservation.host_id != request.host_id
+        || reservation.host_id != policy.host_id
+        || reservation.request_sha256 != request.reservation_request_sha256
+        || reservation.runtime_generation_sha256.as_deref()
+            != Some(request.runtime_generation_sha256.as_str())
+    {
+        bail!("worker orphan teardown request differs from the pinned reservation");
+    }
+    match (
+        reservation.worker_launch_gate.as_ref(),
+        &request.worker_launch_gate,
+    ) {
+        (
+            Some(HostWorkerLaunchGate::Consumed { token: current }),
+            worker_orphan_teardown::WorkerOrphanLaunchGate::Consumed { token: requested },
+        ) if current == requested => {}
+        _ => bail!("worker orphan teardown requires the original consumed launch token"),
+    }
+    Ok(())
+}
+
+fn validate_worker_orphan_active_lease(
+    request: &WorkerOrphanTeardownRequest,
+    lease: &FmsResourceLease,
+) -> Result<()> {
+    validate_worker_orphan_lease_identity(request, lease)?;
+    if lease.state != FmsResourceLeaseState::Active {
+        bail!("worker orphan teardown requires the exact active local lease");
+    }
+    Ok(())
+}
+
+fn validate_worker_orphan_lease_identity(
+    request: &WorkerOrphanTeardownRequest,
+    lease: &FmsResourceLease,
+) -> Result<()> {
+    lease.validate()?;
+    if lease.run_id != request.run_id
+        || lease.task_id != request.task_id
+        || lease.attempt_id != request.attempt_id
+        || lease.ownership_epoch != request.ownership_epoch
+        || lease.resource_id != request.resource_id
+        || lease.lease_token != request.lease_token
+    {
+        bail!("worker orphan teardown requires the exact local lease identity");
+    }
+    Ok(())
+}
+
+fn read_worker_orphan_teardown_intent(
+    root: &Path,
+    request_sha256: &str,
+) -> Result<Option<WorkerOrphanTeardownIntent>> {
+    let relative = worker_orphan_teardown::intent_relative_path(request_sha256)?;
+    let path = checked_path(root, &relative)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("worker orphan teardown intent is not a regular file");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("checking worker orphan teardown intent"),
+    }
+    let bytes = read_bounded_regular_file(root, &relative, MAX_RELEASE_PROOF_BYTES)
+        .context("reading worker orphan teardown intent")?;
+    let intent: WorkerOrphanTeardownIntent = serde_json::from_slice(&bytes)
+        .context("parsing worker orphan teardown intent")?;
+    intent.validate()?;
+    if intent.request_sha256 != request_sha256 {
+        bail!("worker orphan teardown intent path does not match its digest");
+    }
+    Ok(Some(intent))
+}
+
+fn orphan_release_proof_sha256(
+    reservation: &HostResourceReservation,
+    policy: &HostResourceLedgerPolicy,
+    store_id: &str,
+    nested_proof: &WorkerOrphanTeardownReleaseProof,
+) -> Result<String> {
+    let proof = HostResourceReleaseProof {
+        schema_version: HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V2.to_string(),
+        kind: HostResourceReleaseProofKind::WorkerOrphanTeardown,
+        host_id: policy.host_id.clone(),
+        store_id: store_id.to_string(),
+        request_sha256: reservation.request_sha256.clone(),
+        worker_receipt: None,
+        released_worker_lease: None,
+        preparation_receipt: None,
+        released_preparation_lease: None,
+        unadmitted_task: None,
+        preparation_launch_owner: None,
+        orphan_teardown: Some(nested_proof.clone()),
+    };
+    let bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "worker orphan teardown proof")?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn validate_worker_orphan_release_proof_file(
+    root: &Path,
+    policy: &HostResourceLedgerPolicy,
+    reservation: &HostResourceReservation,
+    nested_proof: &WorkerOrphanTeardownReleaseProof,
+) -> Result<()> {
+    let proof_sha256 = orphan_release_proof_sha256(
+        reservation,
+        policy,
+        &reservation.identity.store_id,
+        nested_proof,
+    )?;
+    let mut released = reservation.clone();
+    released.state = HostResourceReservationState::Released;
+    released.release_proof_sha256 = Some(proof_sha256);
+    validate_release_proof(root, policy, &released)
+}
+
+fn ensure_worker_orphan_reconciliation(
+    store: &SessionStore,
+    request: &WorkerOrphanTeardownRequest,
+    request_sha256: &str,
+) -> Result<()> {
+    let created_at = store
+        .read_retry_decision(&request.run_id, request_sha256)?
+        .map(|decision| decision.created_at)
+        .unwrap_or_else(chrono::Utc::now);
+    let decision = FmsRetryDecision {
+        schema_version: crate::FMS_RETRY_DECISION_SCHEMA.to_string(),
+        decision_id: request_sha256.to_string(),
+        run_id: request.run_id.clone(),
+        task_id: request.task_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        ownership_epoch: request.ownership_epoch,
+        trigger: FmsRetryTrigger::ExplicitOperatorRequest,
+        action: FmsRetryAction::AwaitReconciliation,
+        reason: "worker orphan teardown completed with unknown task outcome".to_string(),
+        created_at,
+    };
+    store.commit_retry_decision(&decision)?;
+    store.apply_retry_decision(&decision)?;
+    Ok(())
+}
+
 fn validate_worker_exit_receipt_lease(
     receipt: &FmsWorkerProcessExitReceipt,
     lease: &FmsResourceLease,
@@ -5613,6 +6228,7 @@ fn replay_released_preparation_reservation(
         released_preparation_lease: Some(lease.clone()),
         unadmitted_task: None,
         preparation_launch_owner: reservation.preparation_launch_owner.clone(),
+        orphan_teardown: None,
     };
     let proof_bytes = bounded_json_bytes(
         &proof,
@@ -5646,12 +6262,23 @@ fn validate_release_proof(
     }
     let proof: HostResourceReleaseProof = serde_json::from_slice(&bytes)
         .context("corrupt host release proof; refusing to free host capacity")?;
-    if proof.schema_version != HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1
+    if (proof.schema_version != HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1
+        && proof.schema_version != HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V2)
         || proof.host_id != policy.host_id
         || proof.store_id != reservation.identity.store_id
         || proof.request_sha256 != reservation.request_sha256
     {
         bail!("host release proof differs from the pinned host reservation");
+    }
+    if proof.schema_version == HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V2
+        && proof.kind != HostResourceReleaseProofKind::WorkerOrphanTeardown
+    {
+        bail!("v2 host release proof has an unsupported proof kind");
+    }
+    if proof.schema_version == HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1
+        && proof.kind == HostResourceReleaseProofKind::WorkerOrphanTeardown
+    {
+        bail!("orphan teardown proof requires the v2 host release schema");
     }
     if !matches!(
         proof.kind,
@@ -5806,7 +6433,131 @@ fn validate_release_proof(
                 lease,
             )
         }
+        HostResourceReleaseProofKind::WorkerOrphanTeardown => {
+            if proof.schema_version != HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V2
+                || proof.worker_receipt.is_some()
+                || proof.released_worker_lease.is_some()
+                || proof.preparation_receipt.is_some()
+                || proof.released_preparation_lease.is_some()
+                || proof.unadmitted_task.is_some()
+                || proof.preparation_launch_owner.is_some()
+            {
+                bail!("orphan teardown proof contains process or no-spawn evidence");
+            }
+            let orphan = proof
+                .orphan_teardown
+                .as_ref()
+                .context("orphan teardown proof has no typed teardown evidence")?;
+            validate_worker_orphan_release_proof_identity(root, policy, reservation, orphan)
+        }
     }
+}
+
+fn validate_worker_orphan_release_proof_identity(
+    root: &Path,
+    policy: &HostResourceLedgerPolicy,
+    reservation: &HostResourceReservation,
+    proof: &WorkerOrphanTeardownReleaseProof,
+) -> Result<()> {
+    if proof.schema_version
+        != worker_orphan_teardown::HOST_WORKER_ORPHAN_TEARDOWN_PROOF_SCHEMA
+    {
+        bail!("unsupported worker orphan teardown proof schema");
+    }
+    let intent = read_worker_orphan_teardown_intent(root, &proof.teardown_request_sha256)?
+        .context("orphan teardown proof is missing its immutable teardown intent")?;
+    if intent.request_sha256 != proof.teardown_request_sha256
+        || intent.request.exact_identity() != proof.exact_identity
+        || &intent.request.worker_launch_gate != &proof.worker_launch_gate
+    {
+        bail!("orphan teardown proof differs from its immutable teardown intent");
+    }
+    for (value, field) in [
+        (proof.teardown_request_sha256.as_str(), "teardown_request_sha256"),
+        (proof.attestation_sha256.as_str(), "attestation_sha256"),
+        (proof.manifest_sha256.as_str(), "manifest_sha256"),
+    ] {
+        validate_sha256(value, field)?;
+    }
+    let attestation_relative =
+        worker_orphan_teardown::attestation_relative_path(&proof.attestation_sha256)?;
+    let attestation_bytes = read_bounded_regular_file(
+        root,
+        &attestation_relative,
+        MAX_RELEASE_PROOF_BYTES,
+    )
+    .context("orphan teardown proof is missing its immutable Docker attestation")?;
+    let attestation: DockerNamespaceTeardownAttestation = serde_json::from_slice(&attestation_bytes)
+        .context("orphan teardown Docker attestation is corrupt")?;
+    attestation.validate_for_request(&intent.request)?;
+    if attestation.request_sha256 != proof.teardown_request_sha256
+        || attestation.sha256()? != proof.attestation_sha256
+        || attestation.manifest_sha256 != proof.manifest_sha256
+    {
+        bail!("orphan teardown proof Docker attestation digest differs");
+    }
+    let identity = &proof.exact_identity;
+    validate_sha256(
+        &identity.reservation_request_sha256,
+        "orphan proof reservation_request_sha256",
+    )?;
+    validate_sha256(
+        &identity.reservation_before_sha256,
+        "orphan proof reservation_before_sha256",
+    )?;
+    validate_sha256(
+        &identity.lease_before_sha256,
+        "orphan proof lease_before_sha256",
+    )?;
+    validate_sha256(
+        &identity.runtime_generation_sha256,
+        "orphan proof runtime_generation_sha256",
+    )?;
+    if identity.store_id != reservation.identity.store_id
+        || identity.host_id != policy.host_id
+        || identity.run_id != reservation.identity.run_id
+        || identity.task_id != reservation.identity.task_id
+        || identity.resource_id != reservation.identity.resource_id
+        || identity.lease_token != reservation.identity.lease_token
+        || identity.reservation_request_sha256 != reservation.request_sha256
+        || identity.runtime_generation_sha256
+            != reservation
+                .runtime_generation_sha256
+                .as_deref()
+                .context("orphan proof reservation has no runtime generation")?
+    {
+        bail!("orphan teardown proof identity differs from its reservation");
+    }
+    match (&reservation.identity.owner, &proof.worker_launch_gate) {
+        (
+            HostReservationOwner::Solver {
+                attempt_id,
+                ownership_epoch,
+            },
+            worker_orphan_teardown::WorkerOrphanLaunchGate::Consumed { token },
+        ) if *attempt_id == identity.attempt_id
+            && *ownership_epoch == identity.ownership_epoch
+            && reservation.worker_launch_gate
+                == Some(HostWorkerLaunchGate::Consumed {
+                    token: token.clone(),
+                }) => {}
+        _ => bail!("orphan teardown proof does not retain the consumed launch fence"),
+    }
+    if proof.task_outcome.outcome != "unknown"
+        || proof.task_outcome.reconciliation != "await_reconciliation"
+        || proof.task_outcome.solve_replay
+        || proof.release.local_lease != "released"
+        || proof.release.host_reservation != "released"
+        || !proof.release.capacity_released
+        || !proof.history.immutable
+        || proof.history.prior_receipts_overwritten
+    {
+        bail!("orphan teardown proof does not preserve unknown outcome history");
+    }
+    if root.as_os_str().is_empty() {
+        bail!("orphan teardown proof has no ledger root");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7171,6 +7922,211 @@ mod tests {
         }
     }
 
+    fn worker_orphan_teardown_fixture(
+        task_id: &str,
+    ) -> (
+        V4WorkerLaunchFixture,
+        WorkerOrphanTeardownRequest,
+        DockerNamespaceTeardownAttestation,
+    ) {
+        let mut fixture = v4_worker_launch_fixture(task_id);
+        let launch_token = "00000000-0000-4000-8000-000000000101".to_string();
+        {
+            let _writer = fixture.ledger.writer.acquire().unwrap();
+            let mut document = fixture.ledger.read_document_locked().unwrap();
+            let reservation = document
+                .reservations
+                .iter_mut()
+                .find(|reservation| reservation.identity.task_id == task_id)
+                .unwrap();
+            reservation.worker_launch_gate = Some(HostWorkerLaunchGate::Consumed {
+                token: launch_token.clone(),
+            });
+            validate_ledger_document(&document, &fixture.ledger.root).unwrap();
+            fixture.ledger.publish_document_locked(&document).unwrap();
+        }
+        drop(fixture.inventory_owner.take());
+
+        let reservation = fixture
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity.task_id == task_id)
+            .unwrap();
+        let lease = fixture
+            .store
+            .read_resource_lease(
+                &fixture.lease.run_id,
+                &fixture.lease.resource_id,
+                &fixture.lease.lease_token,
+            )
+            .unwrap()
+            .unwrap();
+        let attempt_id = match &fixture.request.identity.owner {
+            HostReservationOwner::Solver { attempt_id, .. } => attempt_id.clone(),
+            HostReservationOwner::Preparation { .. } => unreachable!(),
+        };
+        let digest = "a".repeat(64);
+        let request = WorkerOrphanTeardownRequest {
+            schema_version: HOST_WORKER_ORPHAN_TEARDOWN_REQUEST_SCHEMA.to_string(),
+            request_id: "00000000-0000-4000-8000-000000000102".to_string(),
+            store_id: fixture.request.identity.store_id.clone(),
+            host_id: fixture.ledger.policy.host_id.clone(),
+            run_id: fixture.request.identity.run_id.clone(),
+            task_id: fixture.request.identity.task_id.clone(),
+            attempt_id,
+            ownership_epoch: fixture.request.identity.owner.solver_epoch().unwrap(),
+            resource_id: fixture.request.identity.resource_id.clone(),
+            lease_token: fixture.request.identity.lease_token.clone(),
+            reservation_request_sha256: reservation.request_sha256.clone(),
+            reservation_before_sha256: canonical_json_sha256(
+                &serde_json::to_value(&reservation).unwrap(),
+            ),
+            lease_before_sha256: canonical_json_sha256(&serde_json::to_value(&lease).unwrap()),
+            runtime_generation_sha256: reservation.runtime_generation_sha256.clone().unwrap(),
+            worker_launch_gate: WorkerOrphanLaunchGate::Consumed {
+                token: launch_token,
+            },
+            run_receipt_sha256: digest.clone(),
+            owner_sha256: digest.clone(),
+            config_sha256: digest.clone(),
+            launch_sha256: digest.clone(),
+            host_authorization_sha256: digest.clone(),
+            windows_folder_host_sha256: digest.clone(),
+            mount_attestation_sha256: digest.clone(),
+            docker_engine_id_sha256: "b".repeat(64),
+            containers: vec![WorkerOrphanContainerBinding {
+                scope: WorkerOrphanContainerScope::DedicatedParent,
+                container_id: "orphan-parent-container".to_string(),
+                image_id: "orphan-worker-image".to_string(),
+                compose_project: "fullmag-orphan".to_string(),
+                service: "worker".to_string(),
+                config_sha256: "c".repeat(64),
+                private_pid_namespace: true,
+                host_pid: false,
+                sole_worker_scope: true,
+                device_requests: Vec::new(),
+            }],
+            expected: WorkerOrphanExpectedEvidence {
+                reservation_state: WorkerOrphanReservationState::Committed,
+                local_lease_state: "active".to_string(),
+                started_receipt_absent: true,
+                worker_exit_receipt_absent: true,
+                container_state: "exited".to_string(),
+                pid: 0,
+                finished_at_required: true,
+                descendant_count: 0,
+                task_outcome: "unknown".to_string(),
+                solve_replay: false,
+            },
+        };
+        request.validate().unwrap();
+        let device_requests_sha256 = request.containers[0].device_requests_sha256();
+        let attestation = DockerNamespaceTeardownAttestation {
+            schema_version: DOCKER_NAMESPACE_TEARDOWN_ATTESTATION_SCHEMA.to_string(),
+            request_sha256: request.request_sha256().unwrap(),
+            docker_engine_id_sha256: request.docker_engine_id_sha256.clone(),
+            containers: vec![DockerContainerTeardownObservation {
+                container_id: request.containers[0].container_id.clone(),
+                image_id: request.containers[0].image_id.clone(),
+                config_sha256: request.containers[0].config_sha256.clone(),
+                before: DockerContainerBeforeObservation {
+                    private_pid_namespace: true,
+                    host_pid: false,
+                    device_requests_sha256: device_requests_sha256.clone(),
+                },
+                after: DockerContainerAfterObservation {
+                    state: "exited".to_string(),
+                    pid: 0,
+                    finished_at: "2026-10-17T00:00:00Z".to_string(),
+                    descendant_count: 0,
+                    private_pid_namespace: true,
+                    host_pid: false,
+                    device_requests_sha256,
+                },
+            }],
+            device_release: DockerDeviceReleaseObservation {
+                resource_id: request.resource_id.clone(),
+                gpu_uuid: Some(GPU_A.to_string()),
+                mapping_sha256: "d".repeat(64),
+                mapping_detached: true,
+            },
+            manifest_sha256: "e".repeat(64),
+            result: DockerNamespaceTeardownResult::AuthoritativeTeardown,
+        };
+        attestation.validate_for_request(&request).unwrap();
+        (fixture, request, attestation)
+    }
+
+    fn publish_partial_worker_orphan_proof(
+        fixture: &V4WorkerLaunchFixture,
+        request: &WorkerOrphanTeardownRequest,
+        attestation: &DockerNamespaceTeardownAttestation,
+    ) -> String {
+        let nested_proof = WorkerOrphanTeardownReleaseProof::from_request_and_attestation(
+            request,
+            attestation,
+        )
+        .unwrap();
+        let attestation_sha256 = attestation.sha256().unwrap();
+        let attestation_relative = worker_orphan_teardown::attestation_relative_path(
+            &attestation_sha256,
+        )
+        .unwrap();
+        let attestation_bytes = attestation.bounded_bytes().unwrap();
+        crate::repository_path::create_parent(&fixture.ledger.root, &attestation_relative)
+            .unwrap();
+        publish_immutable_exact(
+            &fixture.ledger.root,
+            &attestation_relative,
+            &attestation_bytes,
+            MAX_RELEASE_PROOF_BYTES,
+        )
+        .unwrap();
+
+        let reservation = fixture
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity.task_id == request.task_id)
+            .unwrap();
+        let proof = HostResourceReleaseProof {
+            schema_version: HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V2.to_string(),
+            kind: HostResourceReleaseProofKind::WorkerOrphanTeardown,
+            host_id: fixture.ledger.policy.host_id.clone(),
+            store_id: request.store_id.clone(),
+            request_sha256: reservation.request_sha256,
+            worker_receipt: None,
+            released_worker_lease: None,
+            preparation_receipt: None,
+            released_preparation_lease: None,
+            unadmitted_task: None,
+            preparation_launch_owner: None,
+            orphan_teardown: Some(nested_proof),
+        };
+        let proof_bytes = bounded_json_bytes(
+            &proof,
+            MAX_RELEASE_PROOF_BYTES,
+            "partial worker orphan teardown proof",
+        )
+        .unwrap();
+        let proof_sha256 = format!("{:x}", Sha256::digest(&proof_bytes));
+        let proof_relative = release_proof_relative_path(&proof_sha256).unwrap();
+        crate::repository_path::create_parent(&fixture.ledger.root, &proof_relative).unwrap();
+        publish_immutable_exact(
+            &fixture.ledger.root,
+            &proof_relative,
+            &proof_bytes,
+            MAX_RELEASE_PROOF_BYTES,
+        )
+        .unwrap();
+        proof_sha256
+    }
+
     fn ledger_root(base: &Path) -> PathBuf {
         base.join("shared-host-ledger")
     }
@@ -7515,6 +8471,167 @@ mod tests {
     }
 
     #[test]
+    fn worker_orphan_teardown_success_releases_capacity_and_reconciles_unknown() {
+        let (fixture, request, attestation) = worker_orphan_teardown_fixture("orphan-success");
+        assert!(request.store_id.starts_with("sha256:"));
+
+        let intent = fixture
+            .ledger
+            .begin_worker_orphan_teardown(&fixture.store, &request)
+            .unwrap();
+        assert_eq!(intent.request, request);
+        assert_eq!(
+            fixture.ledger.read().unwrap().reservations[0].state,
+            HostResourceReservationState::Quarantined
+        );
+
+        let released = fixture
+            .ledger
+            .complete_worker_orphan_teardown(&fixture.store, &request, &attestation)
+            .unwrap();
+        assert_eq!(released.state, HostResourceReservationState::Released);
+        assert_eq!(
+            released.worker_launch_gate,
+            Some(HostWorkerLaunchGate::Consumed {
+                token: "00000000-0000-4000-8000-000000000101".to_string(),
+            })
+        );
+        assert!(released.release_proof_sha256.is_some());
+
+        let lease = fixture
+            .store
+            .read_resource_lease(
+                &request.run_id,
+                &request.resource_id,
+                &request.lease_token,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.state, FmsResourceLeaseState::Released);
+        let catalog = fixture.store.read_run_catalog(&request.run_id).unwrap().unwrap();
+        assert_eq!(
+            catalog.tasks[0].observation,
+            Some(crate::FmsObservationState::Reconciling)
+        );
+        assert!(fixture
+            .store
+            .list_worker_process_exit_receipts(&request.run_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn worker_orphan_teardown_replays_exactly_and_rejects_changed_pins() {
+        let (fixture, request, attestation) = worker_orphan_teardown_fixture("orphan-replay");
+        let first_intent = fixture
+            .ledger
+            .begin_worker_orphan_teardown(&fixture.store, &request)
+            .unwrap();
+        let first = fixture
+            .ledger
+            .complete_worker_orphan_teardown(&fixture.store, &request, &attestation)
+            .unwrap();
+
+        assert_eq!(
+            fixture
+                .ledger
+                .begin_worker_orphan_teardown(&fixture.store, &request)
+                .unwrap(),
+            first_intent
+        );
+        assert_eq!(
+            fixture
+                .ledger
+                .complete_worker_orphan_teardown(&fixture.store, &request, &attestation)
+                .unwrap(),
+            first
+        );
+
+        let mut changed_request = request.clone();
+        changed_request.config_sha256 = "f".repeat(64);
+        assert!(fixture
+            .ledger
+            .begin_worker_orphan_teardown(&fixture.store, &changed_request)
+            .is_err());
+
+        let mut changed_attestation = attestation.clone();
+        changed_attestation.manifest_sha256 = "f".repeat(64);
+        assert!(fixture
+            .ledger
+            .complete_worker_orphan_teardown(
+                &fixture.store,
+                &request,
+                &changed_attestation,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn worker_orphan_teardown_replays_after_partial_proof_and_lease_publication() {
+        let (fixture, request, attestation) = worker_orphan_teardown_fixture("orphan-partial");
+        fixture
+            .ledger
+            .begin_worker_orphan_teardown(&fixture.store, &request)
+            .unwrap();
+        let proof_sha256 = publish_partial_worker_orphan_proof(&fixture, &request, &attestation);
+        fixture.store.release_resource_lease(&fixture.lease).unwrap();
+
+        let released = fixture
+            .ledger
+            .complete_worker_orphan_teardown(&fixture.store, &request, &attestation)
+            .unwrap();
+        assert_eq!(released.state, HostResourceReservationState::Released);
+        assert_eq!(released.release_proof_sha256.as_deref(), Some(proof_sha256.as_str()));
+        assert_eq!(
+            fixture
+                .store
+                .read_run_catalog(&request.run_id)
+                .unwrap()
+                .unwrap()
+                .tasks[0]
+                .observation,
+            Some(crate::FmsObservationState::Reconciling)
+        );
+    }
+
+    #[test]
+    fn worker_orphan_teardown_requires_inventory_quiescence() {
+        let fixture = v4_worker_launch_fixture("orphan-owner");
+        let document = fixture.ledger.read_document_locked().unwrap();
+        assert!(ensure_worker_orphan_quiescence_locked(
+            &fixture.ledger,
+            &document,
+            &fixture.request.identity,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn worker_orphan_teardown_rejects_durable_started_receipt() {
+        let (fixture, request, attestation) =
+            worker_orphan_teardown_fixture("orphan-started-receipt");
+        let relative = worker_started_receipt_relative_path(&request).unwrap();
+        let receipt_path = crate::repository_path::create_parent(fixture.store.root(), &relative)
+            .unwrap();
+        fs::write(&receipt_path, b"{}").unwrap();
+        assert!(fixture
+            .ledger
+            .begin_worker_orphan_teardown(&fixture.store, &request)
+            .is_err());
+
+        fs::remove_file(&receipt_path).unwrap();
+        fixture
+            .ledger
+            .begin_worker_orphan_teardown(&fixture.store, &request)
+            .unwrap();
+        fs::write(&receipt_path, b"{}").unwrap();
+        assert!(fixture
+            .ledger
+            .complete_worker_orphan_teardown(&fixture.store, &request, &attestation)
+            .is_err());
+    }
+
+    #[test]
     fn gpu_identity_requires_a_canonical_physical_nvml_uuid() {
         assert!(validate_gpu_uuid(GPU_A).is_ok());
         assert!(validate_gpu_uuid("00000000-0000-4000-8000-000000000001").is_err());
@@ -7791,6 +8908,7 @@ mod tests {
             released_preparation_lease: None,
             unadmitted_task: None,
             preparation_launch_owner: None,
+            orphan_teardown: None,
         };
         let bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "proof").unwrap();
         let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -7870,6 +8988,7 @@ mod tests {
             released_preparation_lease: None,
             unadmitted_task: None,
             preparation_launch_owner: None,
+            orphan_teardown: None,
         };
         let proof_bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "proof").unwrap();
         let proof_sha256 = format!("{:x}", Sha256::digest(&proof_bytes));
@@ -8826,6 +9945,7 @@ mod tests {
             released_preparation_lease: Some(lease.clone()),
             unadmitted_task: None,
             preparation_launch_owner: released.preparation_launch_owner.clone(),
+            orphan_teardown: None,
         };
         let proof_bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "proof").unwrap();
         let proof_sha256 = format!("{:x}", Sha256::digest(&proof_bytes));
