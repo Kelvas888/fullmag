@@ -275,6 +275,12 @@ class OrphanRecoveryContractTests(unittest.TestCase):
         self.assertEqual(self.request["containers"][0]["device_requests"][0]["Count"], -1)
         self.assertEqual(validate_orphan_request(self.request)["run_id"], self.run_id)
 
+    def test_pinned_engine_digest_must_match_observed_engine(self) -> None:
+        for pin in ({"docker_engine_id_sha256": "7" * 64},
+                    {"engine": {"sha256": "7" * 64}}):
+            with self.subTest(pin=pin), self.assertRaises(OrphanRecoveryError):
+                build_orphan_request({**self.pins, **pin}, self.engine, self.before)
+
     def test_uuid_engine_identity_is_hashed_without_rewriting(self) -> None:
         self.engine_id = "81a2002d-4c88-48aa-b4da-fed771788cfa"
         self.engine = {"ID": self.engine_id}

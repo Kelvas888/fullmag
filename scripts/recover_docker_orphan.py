@@ -1345,6 +1345,19 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
         raise RecoveryAborted(
             f"device release evidence failed before native prepare: {error}"
         ) from error
+    # Read-only probes may take time. Refresh engine, target and shared-ledger
+    # clients before native prepare, while no native state has been mutated.
+    current_engine = _engine(client)
+    current_target = _inspect(client, target_container_id)
+    if current_engine != engine_before:
+        raise RecoveryAborted("Docker engine identity changed before native prepare")
+    current_state = current_target.get("State", {})
+    if (_container_identity(current_target) != _container_identity(target_before) or
+            not isinstance(current_state, Mapping) or
+            current_state.get("Running") is not True or
+            current_state.get("Status") != "running"):
+        raise RecoveryAborted("backend identity or running state changed before native prepare")
+    assert_shared_clients_quiescent(current_target, _running_containers(client))
     request_sha = _write_record(request_path, request)
     prepare_command = noncompute_command(
         native_arguments("prepare", request_container_path), loader_digest)

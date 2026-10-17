@@ -273,6 +273,26 @@ class RecoveryRunnerTests(unittest.TestCase):
                 docker_client=docker,
                 maintenance_runner=self._runner(events, fail_phase=fail_phase, docker=docker))
 
+    def test_engine_change_during_probes_aborts_before_native_prepare(self):
+        docker = FakeDocker(target())
+        events = []
+        original_call = docker.__call__
+        infos = 0
+
+        def changing_engine(*args, **kwargs):
+            nonlocal infos
+            if args[:2] == ("info", "--format"):
+                infos += 1
+                if infos > 1:
+                    return "81a2002d-4c88-48aa-b4da-fed771788cfa"
+            return original_call(*args, **kwargs)
+
+        with mock.patch.object(FakeDocker, "__call__", side_effect=changing_engine):
+            with self.assertRaises(recovery.RecoveryAborted):
+                self._run(docker, events)
+        self.assertNotIn("prepare", [event[0] for event in events])
+        self.assertNotIn("stop", [call[0] for call in docker.calls])
+
     def test_preflight_failure_does_not_prepare_or_stop(self):
         docker = FakeDocker(target())
         events = []

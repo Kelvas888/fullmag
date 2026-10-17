@@ -339,12 +339,17 @@ def _engine_id(document: Mapping[str, Any], label: str) -> str:
 
 
 def _engine_id_sha(document: Mapping[str, Any], pins: Mapping[str, Any]) -> str:
-    if "docker_engine_id_sha256" in pins:
-        return _sha(pins["docker_engine_id_sha256"], "docker_engine_id_sha256", nonzero=True)
-    if isinstance(pins.get("engine"), Mapping) and "sha256" in pins["engine"]:
-        return _sha(pins["engine"]["sha256"], "docker_engine_id_sha256", nonzero=True)
     engine_id = _engine_id(document, "Docker engine")
-    return hashlib.sha256(engine_id.encode("utf-8")).hexdigest()
+    observed = hashlib.sha256(engine_id.encode("utf-8")).hexdigest()
+    candidates = []
+    if "docker_engine_id_sha256" in pins:
+        candidates.append(pins["docker_engine_id_sha256"])
+    if isinstance(pins.get("engine"), Mapping) and "sha256" in pins["engine"]:
+        candidates.append(pins["engine"]["sha256"])
+    for candidate in candidates:
+        if _sha(candidate, "docker_engine_id_sha256", nonzero=True) != observed:
+            _fail("pinned Docker engine digest differs from the observed engine")
+    return observed
 
 
 def _labels(container: Mapping[str, Any]) -> dict[str, Any]:
