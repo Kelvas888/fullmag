@@ -17,6 +17,7 @@ use fullmag_ir::compute_resources::ComputeParallelismIR;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::canonical_json_sha256;
 use crate::compute_node_snapshot::{ComputeNodeSnapshot, EnforcementStatus, GpuPartition, Reported};
 use crate::compute_node_policy::{NodePolicy, NodePolicyStatus};
 use crate::durability::{atomic_write, confirm_publication, sync_directory};
