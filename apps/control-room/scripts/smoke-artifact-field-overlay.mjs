@@ -326,6 +326,7 @@ try {
   assert.equal((await read()).state.calls.length, settled.state.calls.length);
   assert.deepEqual((await read()).state.unexpected, []); assert.deepEqual(errors, []);
   checks.push("Valid owner restores both exact ranges and controls remain idle without repeat requests");
+  const dedicatedCallStart = (await read()).state.calls.length;
   await page.getByRole("button", { name: "Mount dedicated antenna Inspector", exact: true }).click();
   const dedicated = page.getByRole("complementary", { name: "Dedicated antenna Inspector", exact: true });
   await dedicated.locator('[data-inspector-owner="object.antenna.visualization"]').waitFor();
@@ -361,6 +362,11 @@ try {
     }
     assert.deepEqual(forbidden((await read()).state.calls), []);
   }
+  const catalogPaths = ["/v2/sessions/current/data/fields", "/v2/sessions/current/data/quantities"];
+  const catalogReads = (await read()).state.calls.filter(call => catalogPaths.includes(call.path));
+  for (const path of catalogPaths) assert.ok(catalogReads.some(call => call.path === path && call.stage === "execution-inspect"), path);
+  assert.ok((await read()).state.calls.slice(dedicatedCallStart).filter(call => catalogPaths.includes(call.path)).every(call => call.stage === "execution-inspect"), "Dedicated historical Inspector never requests the live catalog");
+  checks.push("Overlay and dedicated Inspector load fields and quantities with exact execution stage; historical selection never falls back to an unscoped live catalog");
   checks.push("Actual dedicated shared groups select H/J/V with canonical units, raw projection and available full/surface scopes; scalar V exposes no vector controls and WebGL remains live");
   await quantitySource.selectOption("H_ant"); await ready("H_ant");
   await page.waitForFunction(() => window.__artifactDedicatedFixture && !window.__artifactDedicatedFixture.read().pending);
@@ -434,6 +440,45 @@ try {
   assert.deepEqual(forbidden((await read()).state.calls), []);
   await screenshot("09-full-dedicated-inspector-ack");
   checks.push("Genuine VisualizationRegistrySyncController PATCH pending/ACK preserves the dedicated Inspector root, unrelated controls, focus, scroll and draft with no opacity animation, geometry replacement or binary reload and bounded requests/renders");
+  for (const mode of ["wrong-stage", "wrong-run"]) {
+    const beforeWrongCatalog = await read();
+    await page.evaluate(mode => window.__artifactDedicatedFixture.setCatalogMode(mode), mode);
+    await page.waitForFunction(() => {
+      const state = window.__artifactOverlayFixture?.read();
+      return state && !state.model && Boolean(state.error);
+    });
+    await page.waitForFunction(() => window.__artifactOverlayCanvas?.().groups === 0);
+    const rejectedCatalog = await read();
+    assert.equal(rejectedCatalog.state.calls.filter(call => call.binary).length, beforeWrongCatalog.state.calls.filter(call => call.binary).length);
+    assert.ok(rejectedCatalog.state.calls.slice(beforeWrongCatalog.state.calls.length).filter(call => catalogPaths.includes(call.path)).every(call => call.stage === "execution-inspect"));
+    await page.evaluate(() => window.__artifactDedicatedFixture.setCatalogMode("valid"));
+    await ready("H_ant");
+    checks.push(`${mode} carrier in the scoped field catalog removes the historical model without binary fetch or live fallback; restoring the exact execution catalog recovers WebGL rendering`);
+  }
+  const firstExecution = await ready("H_ant");
+  await page.evaluate(() => window.__artifactDedicatedFixture.enableSecondExecution());
+  const executionSelect = page.getByRole("combobox", { name: "Antenna inspection execution" });
+  await executionSelect.click();
+  const secondOption = page.getByRole("option", { name: "inspect-second · execution-inspect-second · completed", exact: true });
+  await secondOption.waitFor({ state: "visible" });
+  const beforeSecondSelection = await read();
+  await secondOption.click();
+  await page.waitForFunction(() => window.__artifactOverlayFixture?.read().values[0] === 7);
+  const secondExecution = await ready("H_ant");
+  assert.deepEqual(secondExecution.state.values, firstExecution.state.values.map(value => value * 7));
+  const secondCalls = secondExecution.state.calls.slice(beforeSecondSelection.state.calls.length);
+  assert.ok(catalogPaths.every(path => secondCalls.some(call => call.path === path && call.stage === "execution-inspect-second")));
+  assert.ok(secondCalls.some(call => call.binary));
+  assert.ok(secondCalls.filter(call => call.binary).every(call => call.stage === "execution-inspect-second" && call.carrier.includes("2".repeat(64))), JSON.stringify(secondCalls.filter(call => call.binary)));
+  assert.notDeepEqual(secondExecution.canvas.geometryIds, firstExecution.canvas.geometryIds);
+  await screenshot("10-second-execution");
+  await executionSelect.click();
+  await page.getByRole("option", { name: "inspect · execution-inspect · completed", exact: true }).click();
+  await page.waitForFunction(() => window.__artifactOverlayFixture?.read().values[0] === 1);
+  const restoredExecution = await ready("H_ant");
+  assert.deepEqual(restoredExecution.state.values, firstExecution.state.values);
+  assert.ok(restoredExecution.state.calls.slice(secondExecution.state.calls.length).filter(call => call.binary).every(call => call.stage === "execution-inspect" && call.carrier.includes("b".repeat(64))));
+  checks.push("Actual Inspector execution selector switches between two valid scoped catalogs and distinct carrier binaries/values, then restores the first execution without cross-owner samples; WebGL remains live");
   assert.deepEqual((await read()).state.unexpected, []); assert.deepEqual(errors, []);
 } catch (error) {
   failure = error instanceof Error ? error : new Error(String(error));

@@ -47,7 +47,8 @@ const instance = "66666666-6666-4666-8666-666666666666";
 const owner = { session_id: "artifact-overlay-fixture", session_epoch: "artifact-overlay-fixture@1", request_scope_epoch: `${instance}:1` };
 const identity = { sessionId: owner.session_id, sessionEpoch: owner.session_epoch, requestScopeEpoch: owner.request_scope_epoch };
 const runId = "run-artifact-overlay", runtimeStageId = "execution-inspect", authoredStageId = "inspect";
-const definitions = [{ id: authoredStageId, source_object_id: "antenna" }];
+const secondStageId = "execution-inspect-second";
+const definitions = [{ id: authoredStageId, source_object_id: "antenna" }, { id: "inspect-second", source_object_id: "antenna" }];
 const sourceDigest = `sha256:${"d".repeat(64)}`, contentDigest = `sha256:${"e".repeat(64)}`;
 const physical = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, -1]];
 const local = [0, 1, 2, 3, 0, 2, 1, 4];
@@ -56,42 +57,43 @@ const subscribe = () => () => {};
 const fixtureTarget = { id: "antenna", kind: "object" as const };
 type Quantity = "H_ant" | "J_charge" | "V_electric";
 const inspectorSelection: Selection = { kind: "object.antenna.visualization", objectId: "antenna", nodeId: "model:object:antenna:visualization", label: "Fixture antenna", moduleSource: "fixture", ref: { type: "scene-object", kind: "object.antenna.visualization", objectId: "antenna", nodeId: "model:object:antenna:visualization", visualizationTargetId: "object:antenna", objectRole: "antenna" } };
-declare global { interface Window { __artifactDedicatedFixture?: { holdWrites(): void; releaseWrites(): void; read(): { pending: boolean; pendingWrites: number; writes: number; renders: number; revision: number; legacyIntent: unknown } }; } }
+declare global { interface Window { __artifactDedicatedFixture?: { holdWrites(): void; releaseWrites(): void; enableSecondExecution(): void; setCatalogMode(mode: "valid" | "wrong-stage" | "wrong-run"): void; read(): { pending: boolean; pendingWrites: number; writes: number; renders: number; revision: number; legacyIntent: unknown } }; } }
 type FixtureRead = { quantity: Quantity; unit: string | null; model: boolean; count: number; triangles: number; minimum: number | null; maximum: number | null; values: number[]; glyphCount: number; pointCount: number; availableGlyphCount: number; surfaceOffsetDistance: number; scope: string; calls: { path: string; binary: boolean; carrier: string | null; component: string | null; stage: string | null; revision: string | null }[]; unexpected: string[]; historical: boolean; error: string | null; resources: ReturnType<Viewport3DResourceTracker["getSnapshot"]> };
 declare global { interface Window { __artifactOverlayFixture?: { read(): FixtureRead; replaceSurfaceRangeOwner(mode: "foreign" | "live" | "restore"): void }; __artifactOverlayCanvas?: () => { lost: boolean; width: number; height: number; groups: number; surfaceTriangles: number; geometryIds: string[]; materialIds: string[]; paletteIds: string[]; surfaceOpacity: number; paletteName: string; surfacePresentation: Array<{ mode: string; color: string }>; surfaceVertexCounts: number[]; scalarSurface: { normalized: number[]; opacity: number; paletteId: number; materialId: string } | null; auxiliaryMaterials: Array<{ id: string; version: number; opacity: number; transparent: boolean }>; frame: number; pointCounts: number[]; pointBufferIds: string[]; glyphCounts: number[]; glyphMatrices: number[][]; glyphColors: number[][]; glyphInstances: number }; } }
 
-function carrier(q: Quantity) {
-  const digest = (q === "V_electric" ? "a" : q === "H_ant" ? "b" : "c").repeat(64);
+function carrier(q: Quantity, stage = runtimeStageId) {
+  const digest = (stage === secondStageId ? q === "V_electric" ? "1" : q === "H_ant" ? "2" : "3" : q === "V_electric" ? "a" : q === "H_ant" ? "b" : "c").repeat(64);
   const hash = Uint8Array.from(digest.match(/../g)!, pair => parseInt(pair, 16));
   const revision = new DataView(hash.buffer).getBigUint64(0, true).toString();
   const indexing = q === "V_electric" ? "source_nodes" : q === "H_ant" ? "sample_nodes" : "tet4_cell_local_nodes";
   return { carrier_id: `artifact:${digest}:${indexing}`, carrier_digest: digest, carrier_revision: revision,
     carrier_scope_kind: "object", carrier_scope_id: "antenna", indexing, sample_count: q === "J_charge" ? 8 : q === "H_ant" ? 5 : 4,
     coordinate_frame: "world", coordinate_unit: "m", topology_binary_schema: "FMMT.v2",
-    owner: { ...owner, run_id: runId, runtime_stage_id: runtimeStageId, authored_stage_id: authoredStageId,
+    owner: { ...owner, run_id: runId, runtime_stage_id: stage, authored_stage_id: stage === secondStageId ? "inspect-second" : authoredStageId,
       module_id: "transport", object_id: "antenna", output_id: "inspection", source_digest: sourceDigest,
-      content_digest: contentDigest, native_mesh_identity: "source-mesh", native_topology_identity: "source-topology", historical_inspection: true } };
+      content_digest: stage === secondStageId ? `sha256:${"f".repeat(64)}` : contentDigest, native_mesh_identity: "source-mesh", native_topology_identity: "source-topology", historical_inspection: true } };
 }
 function values(q: Quantity) { return q === "V_electric" ? [-2, 0, 1, 4] : q === "H_ant" ? [1, 0, 0, 0, 2, 0, 0, 0, 3, -4, 0, 0, 0, 0, 2] : [1, 0, 0, 0, 2, 0, 0, 0, 3, -4, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 30, -40, 0, 0]; }
 function positions(q: Quantity) { return q === "H_ant" ? [...physical.slice(0, 4).flat(), .2, .2, .2] : (q === "J_charge" ? local : [0, 1, 2, 3]).flatMap(i => physical[i]); }
-function capability(q: Quantity, live = false) {
-  const c = carrier(q);
+function executionValues(q: Quantity, stage: string) { return values(q).map(value => stage === secondStageId ? value * 7 : value); }
+function capability(q: Quantity, live = false, stage = runtimeStageId) {
+  const c = carrier(q, stage);
   return { quantity_id: q, lane: live ? "fdm_cpu" : "artifact_inspection_read_only", provider: "available", request: "field_vector", render: "renderable", publication: "interactive", materialization: "materialized", reason_code: "historical_inspection_read_only",
     carriers: [{ carrier_id: c.carrier_id, carrier_fingerprint: c.carrier_digest, scope_kind: "object", scope_id: "antenna", payload_state: live ? "current" : "historical", payload_version: "FMVP.v6", components: q === "V_electric" ? 1 : 3, indexing: c.indexing }] };
 }
-function catalog(live: boolean): QuantityCatalogResource {
-  return { schema_version: "fixture", quantities: (["H_ant", "J_charge", "V_electric"] as const).map(q => ({ id: q, label: q, unit: q === "V_electric" ? "V" : q === "H_ant" ? "A/m" : "A/m^2", n_comp: q === "V_electric" ? 1 : 3, resolved_capability: capability(q, live) })) } as unknown as QuantityCatalogResource;
+function catalog(live: boolean, stage = runtimeStageId): QuantityCatalogResource {
+  return { schema_version: "fixture", quantities: (["H_ant", "J_charge", "V_electric"] as const).map(q => ({ id: q, label: q, unit: q === "V_electric" ? "V" : q === "H_ant" ? "A/m" : "A/m^2", n_comp: q === "V_electric" ? 1 : 3, resolved_capability: capability(q, live, stage) })) } as unknown as QuantityCatalogResource;
 }
-function vectorBytes(q: Quantity) {
-  const c = carrier(q), code = q === "V_electric" ? 4 : q === "H_ant" ? 5 : 7, stride = code === 7 ? 24 : 8;
-  const strings = ["object", "antenna", c.carrier_digest, "artifact_inspection", sourceDigest, contentDigest].map(s => new TextEncoder().encode(s));
+function vectorBytes(q: Quantity, stage = runtimeStageId) {
+  const c = carrier(q, stage), code = q === "V_electric" ? 4 : q === "H_ant" ? 5 : 7, stride = code === 7 ? 24 : 8;
+  const strings = ["object", "antenna", c.carrier_digest, "artifact_inspection", sourceDigest, c.owner.content_digest].map(s => new TextEncoder().encode(s));
   const metadataLength = Math.ceil((88 + strings.reduce((n, s) => n + s.length, 0) + c.sample_count * stride) / 8) * 8;
   const buffer = new ArrayBuffer(48 + metadataLength + c.sample_count * (q === "V_electric" ? 8 : 24)), view = new DataView(buffer);
   const put = (offset: number, s: string) => new Uint8Array(buffer, offset, s.length).set(new TextEncoder().encode(s));
   put(0, "FMVP"); view.setUint8(4, 6); view.setUint8(5, 1); view.setUint8(6, q === "V_electric" ? 1 : 3);
   view.setUint32(8, metadataLength, true); view.setUint32(12, c.sample_count * (q === "V_electric" ? 1 : 3), true); view.setUint32(16, c.sample_count, true); view.setUint32(20, 1, true); view.setUint32(24, 1, true); put(28, q);
   const start = 48; put(start, "FMMI"); view.setUint16(start + 4, 4, true); view.setBigUint64(start + 16, BigInt(c.carrier_revision), true);
-  new Uint8Array(buffer, start + 24, 32).fill(code === 4 ? 0xaa : code === 5 ? 0xbb : 0xcc);
+  new Uint8Array(buffer, start + 24, 32).set(Uint8Array.from(c.carrier_digest.match(/../g)!, pair => parseInt(pair, 16)));
   view.setUint32(start + 56, code, true); view.setUint32(start + 60, c.sample_count, true); view.setBigUint64(start + 68, BigInt(1), true); view.setUint32(start + 76, stride, true); view.setUint32(start + 80, code, true);
   let offset = start + 88;
   [64, 66, 8, 10, 12, 14].forEach((at, i) => { view.setUint16(start + at, strings[i].length, true); new Uint8Array(buffer, offset, strings[i].length).set(strings[i]); offset += strings[i].length; });
@@ -100,11 +102,11 @@ function vectorBytes(q: Quantity) {
     view.setBigUint64(at, code === 4 ? stable[i] : code === 5 ? BigInt(i) : BigInt(100 + Math.floor(i / 4)), true);
     if (code === 7) { view.setUint8(at + 8, i % 4); view.setBigUint64(at + 16, stable[local[i]], true); }
   }
-  values(q).forEach((v, i) => view.setFloat64(48 + metadataLength + i * 8, v, true));
+  executionValues(q, stage).forEach((v, i) => view.setFloat64(48 + metadataLength + i * 8, v, true));
   return buffer;
 }
-function topologyBytes(q: Quantity) {
-  const n = carrier(q).sample_count, cells = q === "J_charge" ? 2 : q === "H_ant" ? 4 : 1;
+function topologyBytes(q: Quantity, stage = runtimeStageId) {
+  const n = carrier(q, stage).sample_count, cells = q === "J_charge" ? 2 : q === "H_ant" ? 4 : 1;
   const header = new ArrayBuffer(64), view = new DataView(header);
   new Uint8Array(header, 0, 4).set(new TextEncoder().encode("FMMT")); view.setUint8(4, 2); view.setUint8(5, 1);
   view.setUint32(8, n, true); view.setUint32(12, cells, true); view.setUint32(20, cells * 4, true); view.setUint32(36, 64, true);
@@ -126,6 +128,9 @@ function makeFixture() {
   const scope = () => sessionRequestScopeKey(identity);
   const pendingWrites: (() => void)[] = [];
   const fullState = { hold: false, writes: 0, renders: 0 };
+  let secondExecution = false;
+  let liveCatalog = false, catalogMode: "valid" | "wrong-stage" | "wrong-run" = "valid", catalogRevision = 1;
+  const invalidateCatalogs = () => { for (const path of [DATA_FIELDS_PATH, DATA_QUANTITIES_PATH]) resources.invalidate(`${path}?stage_id=${runtimeStageId}:run=${encodeURIComponent(runId)}`, ++catalogRevision); };
   const scene = { revision: 1, scene_revision: 1, scene: { id: "artifact-fixture", name: "Artifact fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, objects: [{ id: "antenna", name: "Fixture antenna", role: "antenna", geometry: { kind: "Box", size: [1, 1, 1], center: [0, 0, 0] } }], antenna_field_solve_stages: definitions } as unknown as SceneResource;
   let remote = { revision: 1, overrides: mergeVisualizationStateTargetOverride([], fixtureTarget, { visible: true, activeQuantityId: "H_ant", shaderVisible: true, pointsVisible: true, wireframeVisible: true, vectorsVisible: false, surfaceColorSource: "component_x", surfaceProjectionMode: "raw_nodal", viewportColorbarVisible: true, vectorBudget: 100, shaderMonoColor: "#12ab34" }), camera: DEFAULT_CAMERA_REGISTRY_STATE, layers: { airbox: { visible: false, surface: { visible: false, opacity: .2 }, wireframe: { visible: false }, points: { visible: false }, vectors: { visible: false } } } } as unknown as VisualizationStateResource;
   let rangeMode: "valid" | "foreign" | "malformed" = "valid", rangeRevision = 1;
@@ -147,16 +152,30 @@ function makeFixture() {
     if (request.method !== "GET") { unexpected.push(`${request.method} ${url.pathname}`); throw new Error("Unexpected fixture mutation"); }
     if (url.pathname === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", current: true, status: "idle" }] });
     if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, run: { run_id: runId }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
-    if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) return json({ ...owner, run_id: runId, revision: 1, runtime_state: "completed", total_stages: 1, stage_statuses: ["completed"], completed_stage_indexes: [0], stages: [{ stage_id: runtimeStageId, antenna_solve_stage_id: authoredStageId, status: "completed", stage_index: 0 }] });
+    if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) {
+      const stages = [{ stage_id: runtimeStageId, antenna_solve_stage_id: authoredStageId, status: "completed", stage_index: 0 }, ...(secondExecution ? [{ stage_id: secondStageId, antenna_solve_stage_id: "inspect-second", status: "completed", stage_index: 1 }] : [])];
+      return json({ ...owner, run_id: runId, revision: secondExecution ? 2 : 1, runtime_state: "completed", total_stages: stages.length, stage_statuses: stages.map(() => "completed"), completed_stage_indexes: stages.map((_, index) => index), stages });
+    }
     const q: Quantity = url.pathname.includes("V_electric") || url.searchParams.get("carrier_id")?.includes(":source_nodes") ? "V_electric" : url.pathname.includes("J_charge") || url.searchParams.get("carrier_id")?.includes(":tet4_cell_local_nodes") ? "J_charge" : "H_ant";
-    const c = carrier(q), scoped = request.headers.get("x-fullmag-session-scope");
+    const executionStage = url.searchParams.get("stage_id") ?? runtimeStageId;
+    if (executionStage !== runtimeStageId && !(secondExecution && executionStage === secondStageId)) throw new Error("Unknown execution stage");
+    const c = carrier(q, executionStage), scoped = request.headers.get("x-fullmag-session-scope");
     if (scoped !== sessionRequestScopeKey(identity)) throw new Error("Unconfirmed fixture session scope");
     if (url.pathname === VISUALIZATION_STATE_PATH) return json(remote);
     if (url.pathname === MODEL_SCENE_PATH) return json(scene);
-    if (url.pathname === DATA_QUANTITIES_PATH) return json(catalog(false));
-    if (url.pathname === DATA_FIELDS_PATH) return json({ domain_generation_id: "fixture", quantities: (["H_ant", "J_charge", "V_electric"] as const).map(quantity => ({ quantity_id: quantity, label: quantity, unit: quantity === "V_electric" ? "V" : quantity === "H_ant" ? "A/m" : "A/m^2", components: quantity === "V_electric" ? 1 : 3, ui_exposed: true, spatial: true, kind: quantity === "V_electric" ? "scalar" : "vector", domain: "spatial", available: true, state: "stale_complete", location: carrier(quantity).indexing, artifact_field_locator: carrier(quantity), resolved_capability: capability(quantity), field_revision: 1, domain_generation_id: carrier(quantity).carrier_digest })) });
+    if (url.pathname === DATA_QUANTITIES_PATH) {
+      const stage = url.searchParams.get("stage_id");
+      if (stage !== null && stage !== runtimeStageId && !(secondExecution && stage === secondStageId)) throw new Error("Unknown scoped quantity catalog execution");
+      return json(catalog(stage === null || liveCatalog, executionStage));
+    }
+    if (url.pathname === DATA_FIELDS_PATH) {
+      const stage = url.searchParams.get("stage_id");
+      if (stage !== null && stage !== runtimeStageId && !(secondExecution && stage === secondStageId)) throw new Error("Unknown scoped field catalog execution");
+      const historical = stage !== null && !liveCatalog;
+      return json({ domain_generation_id: "fixture", quantities: (["H_ant", "J_charge", "V_electric"] as const).map(quantity => ({ quantity_id: quantity, label: quantity, unit: quantity === "V_electric" ? "V" : quantity === "H_ant" ? "A/m" : "A/m^2", components: quantity === "V_electric" ? 1 : 3, ui_exposed: true, spatial: true, kind: quantity === "V_electric" ? "scalar" : "vector", domain: "spatial", available: true, state: "stale_complete", location: carrier(quantity, executionStage).indexing, artifact_field_locator: historical ? { ...carrier(quantity, executionStage), owner: { ...carrier(quantity, executionStage).owner, runtime_stage_id: catalogMode === "wrong-stage" ? "execution-foreign" : executionStage, run_id: catalogMode === "wrong-run" ? "run-foreign" : runId } } : undefined, resolved_capability: capability(quantity, !historical, executionStage), field_revision: 1, domain_generation_id: carrier(quantity, executionStage).carrier_digest })) });
+    }
     if (url.pathname === DATA_FIELD_AVAILABILITY_PATH.replace("{quantity_id}", q)) {
-      if (url.searchParams.get("carrier_id") !== c.carrier_id || url.searchParams.get("stage_id") !== runtimeStageId || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision) throw new Error("Unpinned dedicated Inspector availability");
+      if (url.searchParams.get("carrier_id") !== c.carrier_id || url.searchParams.get("stage_id") !== executionStage || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision) throw new Error("Unpinned dedicated Inspector availability");
       return json({ quantity_id: q, target_id: "antenna", scope_kind: "object", scope_id: "antenna", supported: true, materialized: true, pending: false, state: "stale", carrier_id: c.carrier_id, generation: c.carrier_digest, revision: 1, reason_code: "historical_inspection_read_only" });
     }
     const metaPath = DATA_FIELD_META_PATH.replace("{quantity_id}", q), vectorPath = DATA_FIELD_VECTOR_PATH.replace("{quantity_id}", q);
@@ -164,20 +183,20 @@ function makeFixture() {
       const pin = url.searchParams.get("carrier_id"); if (pin && pin !== c.carrier_id) throw new Error("Stale carrier leaked across quantities");
       const component = url.searchParams.get("component");
       const isRange = component !== "full";
-      if (isRange && (pin !== c.carrier_id || url.searchParams.get("stage_id") !== runtimeStageId || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision)) throw new Error("Inspector range request has no exact result pins");
-      const samples = values(q), projected = q === "V_electric" ? samples : component === "magnitude" ? Array.from({ length: c.sample_count }, (_, i) => Math.hypot(...samples.slice(i * 3, i * 3 + 3))) : samples.filter((_, i) => i % 3 === (component === "y" ? 1 : component === "z" ? 2 : 0));
+      if (isRange && (pin !== c.carrier_id || url.searchParams.get("stage_id") !== executionStage || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision)) throw new Error("Inspector range request has no exact result pins");
+      const samples = executionValues(q, executionStage), projected = q === "V_electric" ? samples : component === "magnitude" ? Array.from({ length: c.sample_count }, (_, i) => Math.hypot(...samples.slice(i * 3, i * 3 + 3))) : samples.filter((_, i) => i % 3 === (component === "y" ? 1 : component === "z" ? 2 : 0));
       const locator = isRange && rangeMode === "malformed" ? {} : isRange && rangeMode === "foreign" ? { ...c, owner: { ...c.owner, run_id: "foreign-run" } } : c;
-      return json({ quantity_id: q, unit: q === "V_electric" ? "V" : q === "H_ant" ? "A/m" : "A/m^2", components: q === "V_electric" ? 1 : 3, state: "stale_complete", materialization_reason_code: "historical_inspection_read_only", resolved_capability: capability(q), artifact_field_locator: locator, stats: { min: component === "magnitude" ? 0 : Math.min(...projected), max: Math.max(...projected) } });
+      return json({ quantity_id: q, unit: q === "V_electric" ? "V" : q === "H_ant" ? "A/m" : "A/m^2", components: q === "V_electric" ? 1 : 3, state: "stale_complete", materialization_reason_code: "historical_inspection_read_only", resolved_capability: capability(q, false, executionStage), artifact_field_locator: locator, stats: { min: component === "magnitude" ? 0 : Math.min(...projected), max: Math.max(...projected) } });
     }
     if (url.pathname === vectorPath || url.pathname === DATA_DOMAIN_TOPOLOGY_PATH) {
-      if (url.searchParams.get("carrier_id") !== c.carrier_id || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision || url.searchParams.get("stage_id") !== runtimeStageId) throw new Error("Unpinned artifact binary request");
-      const headers = { ...common, "content-type": "application/octet-stream", etag: `"${q}-${url.pathname === vectorPath ? "values" : "geometry"}"`,
+      if (url.searchParams.get("carrier_id") !== c.carrier_id || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision || url.searchParams.get("stage_id") !== executionStage) throw new Error("Unpinned artifact binary request");
+      const headers = { ...common, "content-type": "application/octet-stream", etag: `"${executionStage}-${q}-${url.pathname === vectorPath ? "values" : "geometry"}"`,
         "x-fullmag-carrier-id": c.carrier_id, "x-fullmag-carrier-digest": c.carrier_digest, "x-fullmag-carrier-revision": c.carrier_revision,
         "x-fullmag-mesh-topology-hash": c.carrier_digest, "x-fullmag-coordinate-frame": "world", "x-fullmag-coordinate-unit": "m",
         "x-fullmag-component": "full", "x-fullmag-quantity-id": q, "x-fullmag-n-comp": q === "V_electric" ? "1" : "3", "x-fullmag-point-count": String(c.sample_count), "x-fullmag-value-count": String(c.sample_count * (q === "V_electric" ? 1 : 3)),
-        "x-fullmag-source-kind": "artifact_inspection", "x-fullmag-source-id": sourceDigest, "x-fullmag-source-revision": "1", "x-fullmag-field-generation-id": contentDigest,
+        "x-fullmag-source-kind": "artifact_inspection", "x-fullmag-source-id": sourceDigest, "x-fullmag-source-revision": "1", "x-fullmag-field-generation-id": c.owner.content_digest,
         "x-fullmag-domain-generation-id": c.carrier_digest, "x-fullmag-field-indexing": c.indexing, "x-fullmag-scope-kind": "object", "x-fullmag-scope-id": "antenna" };
-      return new Response(url.pathname === vectorPath ? vectorBytes(q) : topologyBytes(q), { headers });
+      return new Response(url.pathname === vectorPath ? vectorBytes(q, executionStage) : topologyBytes(q, executionStage), { headers });
     }
     unexpected.push(url.pathname); throw new Error(`Unexpected artifact fixture request: ${url.pathname}`);
   } });
@@ -187,9 +206,10 @@ function makeFixture() {
   const layout = new LayoutController(bus); layout.setActiveTab("geometry"); layout.setActiveViewportMainModule("viewport-3d");
   const selection = new SelectionController(bus); selection.set(inspectorSelection, "inspector");
   const cameraRegistry = new CameraRegistryController({ api: api.visualization, getSessionScopeKey: scope, idleFlushMs: null });
-  return { kernel: { api, resources, bus, diagnostics, diagnosticRecorder, visualization, visualizationDebug, visualizationSync, commands, layout, selection, cameraRegistry, analysisFieldOverlay: new AnalysisFieldOverlayController(), authoringHistory: new AuthoringHistoryController(api, resources) } as unknown as KernelApi, calls, unexpected, visualization, fullState,
+  return { kernel: { api, resources, bus, diagnostics, diagnosticRecorder, visualization, visualizationDebug, visualizationSync, commands, layout, selection, cameraRegistry, analysisFieldOverlay: new AnalysisFieldOverlayController(), authoringHistory: new AuthoringHistoryController(api, resources) } as unknown as KernelApi, calls, unexpected, visualization, recordRender: () => { fullState.renders++; },
     enterDedicated() { visualization.clearTarget(fixtureTarget); },
-    dedicated: { holdWrites() { fullState.hold = true; }, releaseWrites() { fullState.hold = false; if (!pendingWrites.length) throw new Error("No pending dedicated Inspector PATCH"); for (const release of pendingWrites.splice(0)) release(); }, read: () => ({ pending: Boolean(visualizationSync.getSnapshot().pendingPatch || visualizationSync.getSnapshot().inflightPatch), pendingWrites: pendingWrites.length, writes: fullState.writes, renders: fullState.renders, revision: remote.revision, legacyIntent: visualization.getSnapshot().antennaFieldIntent }) },
+    setLiveCatalog(value: boolean) { liveCatalog = value; invalidateCatalogs(); },
+    dedicated: { enableSecondExecution() { secondExecution = true; resources.invalidate(SIMULATION_STAGES_EXECUTION_PATH, 2); }, setCatalogMode(mode: typeof catalogMode) { catalogMode = mode; invalidateCatalogs(); }, holdWrites() { fullState.hold = true; }, releaseWrites() { fullState.hold = false; if (!pendingWrites.length) throw new Error("No pending dedicated Inspector PATCH"); for (const release of pendingWrites.splice(0)) release(); }, read: () => ({ pending: Boolean(visualizationSync.getSnapshot().pendingPatch || visualizationSync.getSnapshot().inflightPatch), pendingWrites: pendingWrites.length, writes: fullState.writes, renders: fullState.renders, revision: remote.revision, legacyIntent: visualization.getSnapshot().antennaFieldIntent }) },
     setRangeMode(mode: typeof rangeMode) { rangeMode = mode; resources.invalidateMatching(key => key.includes("/meta") && !key.includes("component=full"), ++rangeRevision); } };
 }
 function Probe() {
@@ -233,7 +253,7 @@ function View({ fixture, dedicated = false }: { fixture: ReturnType<typeof makeF
   const settings = dedicated ? resolveTargetVisualization({ snapshot: canonicalSnapshot, target: fixtureTarget, visualizationState: canonical.optimisticData ?? canonical.data }).settings : sharedSettings;
   const quantity = (dedicated ? settings.activeQuantityId : fixtureQuantity) as Quantity;
   const quantities = useMemo(() => catalog(live), [live]);
-  const result = useArtifactFieldOverlay(quantity, "antenna", settings, false, definitions, quantities);
+  const result = useArtifactFieldOverlay(quantity, "antenna", settings, false, definitions);
   const selected = useObjectVisualizationSelector(snapshot => snapshot.artifactFieldSelection ?? null);
   const binding = artifactInspectorFieldBinding({ catalog: quantities, quantityId: quantity, selection: selected, sessionIdentity: session, targetScope: { scopeKind: "object", scopeId: "antenna" } });
   const target = fixtureTarget;
@@ -249,7 +269,7 @@ function View({ fixture, dedicated = false }: { fixture: ReturnType<typeof makeF
   }, [quantity, result, fixture, tracker, settings.geometryScope]);
   useEffect(() => () => { tracker.disposeAll(); delete window.__artifactOverlayFixture; }, [tracker]);
   return <main><h1>Artifact field overlay · controlled transport</h1>{!dedicated ? <><label>Quantity<select aria-label="Fixture quantity" value={quantity} onChange={e => setQuantity(e.target.value as Quantity)}><option>H_ant</option><option>J_charge</option><option>V_electric</option></select></label>
-    <label><input aria-label="Fixture live lane" type="checkbox" checked={live} onChange={e => setLive(e.target.checked)} /> Live solver lane</label>
+    <label><input aria-label="Fixture live lane" type="checkbox" checked={live} onChange={e => { fixture.setLiveCatalog(e.target.checked); setLive(e.target.checked); }} /> Live solver lane</label>
     <button onClick={() => fixture.visualization.setArtifactFieldSelection({ identity, runId: "foreign-run", runtimeStageId, authoredStageId, sourceObjectId: "antenna" })}>Select foreign owner</button>
     <button onClick={() => fixture.visualization.setArtifactFieldSelection(null)}>Clear owner selection</button>
     <button aria-pressed={vectors} onClick={() => setVectors(value => !value)}>Toggle fixture vectors</button>
@@ -263,7 +283,7 @@ function View({ fixture, dedicated = false }: { fixture: ReturnType<typeof makeF
     </Viewport3DCanvas><div className="fm-viewport-3d__colorbar-stack">{resolveArtifactFieldColorbars(result.model).map(({ key, legend }) => <Viewport3DColorbar key={key} legend={legend} />)}</div></div>
     {dedicated ? <aside aria-label="Dedicated antenna Inspector" data-testid="dedicated-inspector-scroll" style={{ height: 600, overflow: "auto" }}>
       <label>Persistent unrelated draft<input aria-label="Dedicated unrelated draft" defaultValue="untouched" /></label>
-      <Profiler id="dedicated-antenna-inspector" onRender={() => { fixture.fullState.renders++; }}><AntennaVisualizationPanel selection={inspectorSelection} /></Profiler>
+      <Profiler id="dedicated-antenna-inspector" onRender={fixture.recordRender}><AntennaVisualizationPanel selection={inspectorSelection} /></Profiler>
       <div style={{ height: 500 }} aria-hidden="true" />
     </aside> : !live ? <aside aria-label="Shared inspection controls" className="fm-inspector-panel">
       <VisualizationSurfaceColoringSection {...controls} onFieldCatalogRequest={() => {}} />

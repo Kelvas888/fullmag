@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef } from "react";
+import { fieldCatalogResourceKey } from "./fieldCatalogScope";
 
 import {
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_BRANCHES_V2_PATH,
@@ -2260,19 +2261,21 @@ export function useHysteresisReversalFieldsResource(
 
 export function useFieldCatalogResource({
   enabled = true,
-}: RuntimeResourceOptions = {}) {
+  stageId,
+  runId,
+}: RuntimeResourceOptions & { stageId?: string | null; runId?: string | null } = {}) {
   const { api } = useKernel();
   const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
-    DATA_FIELDS_PATH,
+    fieldCatalogResourceKey(DATA_FIELDS_PATH, stageId, runId),
   );
   const load = useCallback(
     ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
-      api.data.fields.catalog({ sessionScopeKey, signal }),
-    [api],
+      api.data.fields.catalog({ sessionScopeKey, signal }, stageId == null ? {} : { stage_id: stageId }),
+    [api, stageId],
   );
 
   return useResource<FieldCatalogResource>({
-    enabled: enabled && sessionIdentity !== null,
+    enabled: enabled && sessionIdentity !== null && (stageId == null || stageId.length > 0),
     load,
     resolveRevision: (data) => data.revision,
     resourceKey,
@@ -2281,21 +2284,23 @@ export function useFieldCatalogResource({
 
 export function useQuantityCatalogResource({
   enabled = true,
-}: RuntimeResourceOptions = {}) {
+  stageId,
+  runId,
+}: RuntimeResourceOptions & { stageId?: string | null; runId?: string | null } = {}) {
   const { api } = useKernel();
   const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
-    DATA_QUANTITIES_PATH,
+    fieldCatalogResourceKey(DATA_QUANTITIES_PATH, stageId, runId),
   );
   const load = useCallback(
     ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
-      api.data.quantities.catalog({ sessionScopeKey, signal }),
-    [api],
+      api.data.quantities.catalog({ sessionScopeKey, signal }, stageId == null ? {} : { stage_id: stageId }),
+    [api, stageId],
   );
 
   return useResource<QuantityCatalogResource>({
-    enabled: enabled && sessionIdentity !== null,
+    enabled: enabled && sessionIdentity !== null && (stageId == null || stageId.length > 0),
     load,
-    resolveRevision: (data) => data.schema_version,
+    resolveRevision: (data) => stageId == null ? data.schema_version : JSON.stringify([data.schema_version, data.quantities.map(entry => [entry.id, entry.materialization_state, entry.resolved_capability])]),
     resourceKey,
   });
 }

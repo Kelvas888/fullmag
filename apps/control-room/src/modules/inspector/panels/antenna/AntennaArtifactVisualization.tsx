@@ -24,12 +24,13 @@ const OWNER: VisualizationInspectorOwner = {
 type Props = InspectorPanelProps & { scene: ReturnType<typeof useSceneResource> };
 
 export function AntennaArtifactVisualization({ selection, scene }: Props) {
-  return <VisualizationTargetInspectorPanel owner={OWNER} selection={selection} sceneOverride={scene} artifactInspection>
-    <AntennaInspectionSource selection={selection} scene={scene} />
+  const source = useAntennaInspectionSource({ selection, scene });
+  return <VisualizationTargetInspectorPanel owner={OWNER} selection={selection} sceneOverride={scene} artifactInspection artifactInspectionOwner={source.selected}>
+    <AntennaInspectionSource source={source} />
   </VisualizationTargetInspectorPanel>;
 }
 
-function AntennaInspectionSource({ selection, scene }: Props) {
+function useAntennaInspectionSource({ selection, scene }: Props) {
   const objectId = selection.ref?.type === "scene-object" ? selection.ref.objectId : selection.objectId;
   const visualization = useObjectVisualizationController();
   const session = useSessionResourceIdentity();
@@ -41,6 +42,11 @@ function AntennaInspectionSource({ selection, scene }: Props) {
   const candidates = plan.candidates.filter(candidate => candidate.sourceObjectId === objectId);
   const selected = plan.selected?.sourceObjectId === objectId ? plan.selected : null;
   const error = execution.error?.message ?? execution.refreshError?.message ?? plan.error;
+  return { objectId, visualization, execution, pin, candidates, selected, error };
+}
+
+function AntennaInspectionSource({ source }: { source: ReturnType<typeof useAntennaInspectionSource> }) {
+  const { objectId, visualization, execution, pin, candidates, selected, error } = source;
   return <InspectorGroup title="Source and execution" collapsible defaultOpen>
     <FieldRow label="Source object" value={objectId ?? "none"} mono />
     <FieldRow label="Result state" value="Historical inspection; raw SI values; read-only" />

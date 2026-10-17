@@ -44,6 +44,7 @@ export type FdmNativeLayerRegionMembershipResource =
   components["schemas"]["FdmNativeLayerRegionMembershipResource"];
 export type EngineLogResource = components["schemas"]["EngineLogResource"];
 export type FieldCatalogResource = components["schemas"]["FieldCatalog"];
+export type ArtifactFieldCatalogQuery = Pick<FieldVectorQuery, "stage_id">;
 export type FieldAvailabilityResource =
   components["schemas"]["FieldAvailabilityResource"];
 export type FieldMetaResource = components["schemas"]["FieldMeta"];

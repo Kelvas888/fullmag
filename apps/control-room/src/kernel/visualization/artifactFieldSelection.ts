@@ -1,4 +1,4 @@
-import type { FieldMetaResource, QuantityCatalogResource, StageExecutionResource } from "../api/apiTypes";
+import type { FieldCatalogResource, FieldMetaResource, QuantityCatalogResource, StageExecutionResource } from "../api/apiTypes";
 import { quantityCatalogEntrySupportsSpatialVisualization } from "../api/quantityIds";
 import type { SessionResourceIdentity } from "../resources/sessionResourceIdentity";
 
@@ -23,13 +23,13 @@ export function artifactSelectionMatchesSession(selection: ArtifactFieldSelectio
 /** Historical artifact routing never follows a quantity name alone. */
 export function artifactInspectionQuantity(catalog: QuantityCatalogResource | null, quantityId: string): boolean {
   if (quantityId !== "H_ant" && quantityId !== "J_charge" && quantityId !== "V_electric") return false;
-  const entries = catalog?.quantities.filter(entry => entry.id === quantityId) ?? [];
+  const entries = Array.isArray(catalog?.quantities) ? catalog.quantities.filter(entry => entry?.id === quantityId) : [];
   if (entries.length !== 1) return false;
   const entry = entries[0], capability = entry.resolved_capability, components = quantityId === "V_electric" ? 1 : 3;
   return Boolean(entry.n_comp === components && entry.unit === (quantityId === "V_electric" ? "V" : quantityId === "J_charge" ? "A/m^2" : "A/m") &&
     quantityCatalogEntrySupportsSpatialVisualization(entry) && capability?.quantity_id === quantityId &&
     capability.lane === "artifact_inspection_read_only" && capability.materialization === "materialized" &&
-    capability.carriers.some(carrier => carrier.payload_state === "historical" && carrier.components === components &&
+    Array.isArray(capability.carriers) && capability.carriers.some(carrier => carrier.payload_state === "historical" && carrier.components === components &&
       (quantityId === "V_electric" ? carrier.indexing === "source_nodes" : quantityId === "J_charge" ? carrier.indexing === "tet4_cell_local_nodes" : ["sample_nodes", "point_samples"].includes(carrier.indexing))));
 }
 
@@ -149,4 +149,35 @@ export function artifactSurfaceRangeKey(
 ): string | null {
   const key = artifactCarrierPresentationKey(owner, carrier);
   return key ? JSON.stringify([key, projectionMode ?? "raw_nodal"]) : null;
+}
+
+/** A scoped catalog must describe this exact immutable execution, never another cache entry. */
+export function artifactFieldCatalogMatchesOwner(catalog: FieldCatalogResource | null, selection: ArtifactFieldSelection | null): boolean {
+  if (!catalog || !selection || !Array.isArray(catalog.quantities) || catalog.quantities.length === 0) return false;
+  const ids = new Set<string>();
+  return catalog.quantities.every(entry => {
+    if (!entry) return false;
+    const locator = entry.artifact_field_locator, owner = locator?.owner;
+    if (!locator || !owner || ids.has(entry.quantity_id) || !["H_ant", "J_charge", "V_electric"].includes(entry.quantity_id)) return false;
+    ids.add(entry.quantity_id);
+    return entry.state === "stale_complete" && owner.historical_inspection === true &&
+      owner.session_id === selection.identity.sessionId && owner.session_epoch === selection.identity.sessionEpoch &&
+      owner.request_scope_epoch === selection.identity.requestScopeEpoch && owner.run_id === selection.runId &&
+      owner.runtime_stage_id === selection.runtimeStageId && owner.authored_stage_id === selection.authoredStageId && owner.object_id === selection.sourceObjectId &&
+      entry.resolved_capability?.lane === "artifact_inspection_read_only" && Array.isArray(entry.resolved_capability.carriers) &&
+      entry.resolved_capability.carriers.some(carrier => carrier.payload_state === "historical" && carrier.components === entry.components && carrier.indexing === locator.indexing &&
+        carrier.carrier_id === locator.carrier_id && carrier.carrier_fingerprint === locator.carrier_digest);
+  });
+}
+
+/** Only a positive live-runtime contract can release a pending historical route. */
+export function artifactCatalogHasExplicitLiveQuantity(catalog: QuantityCatalogResource | null, quantityId: string): boolean {
+  const entries = Array.isArray(catalog?.quantities) ? catalog.quantities.filter(entry => entry?.id === quantityId) : [];
+  if (entries.length !== 1 || !["H_ant", "J_charge", "V_electric"].includes(quantityId)) return false;
+  const entry = entries[0], capability = entry.resolved_capability, components = quantityId === "V_electric" ? 1 : 3;
+  return Boolean(entry.n_comp === components && entry.unit === (quantityId === "V_electric" ? "V" : quantityId === "J_charge" ? "A/m^2" : "A/m") &&
+    quantityCatalogEntrySupportsSpatialVisualization(entry) && capability?.quantity_id === quantityId &&
+    ["fdm_cpu", "fdm_gpu", "fem_cpu", "fem_gpu"].includes(capability.lane) && capability.provider === "available" &&
+    capability.request === "field_vector" && capability.render === "renderable" && Array.isArray(capability.carriers) &&
+    capability.carriers.some(carrier => carrier.payload_state === "current" && carrier.components === components));
 }

@@ -3245,9 +3245,10 @@ export function buildVisualizationPanelSections({
 }
 
 /** Historical carrier admission is independent of live magnetic materialization. */
-export function resolveArtifactInspectionDataState({ catalogReady, catalogError, quantityAvailable, ownerReady, presentationReady }: {
-  catalogReady: boolean; catalogError: boolean; quantityAvailable: boolean; ownerReady: boolean; presentationReady: boolean;
+export function resolveArtifactInspectionDataState({ executionSelected = true, catalogReady, catalogError, quantityAvailable, ownerReady, presentationReady }: {
+  executionSelected?: boolean; catalogReady: boolean; catalogError: boolean; quantityAvailable: boolean; ownerReady: boolean; presentationReady: boolean;
 }): string {
+  if (!executionSelected) return "Select execution";
   if (catalogError) return "Unavailable";
   if (!catalogReady) return "Loading catalog";
   if (!quantityAvailable) return "Select raw SI quantity";

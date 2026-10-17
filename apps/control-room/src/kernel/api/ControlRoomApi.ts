@@ -325,6 +325,7 @@ import type {
   EngineLogResource,
   FieldAvailabilityQuery,
   FieldAvailabilityResource,
+  ArtifactFieldCatalogQuery,
   FieldCatalogResource,
   QuantityCatalogResource,
   FieldVectorIdentityIssue,
@@ -1881,8 +1882,8 @@ export class ControlRoomApi {
         ),
     },
     fields: {
-      catalog: (options?: RequestOptions) =>
-        this.requestJson<FieldCatalogResource>(DATA_FIELDS_PATH, options).then(
+      catalog: (options?: RequestOptions, query: ArtifactFieldCatalogQuery = {}) =>
+        this.requestJson<FieldCatalogResource>(DATA_FIELDS_PATH, options, { query }).then(
           withDerivedDriveFluxDensity,
         ),
       availability: (
@@ -2072,8 +2073,8 @@ export class ControlRoomApi {
       },
     },
     quantities: {
-      catalog: (options?: RequestOptions) =>
-        this.requestJson<QuantityCatalogResource>(DATA_QUANTITIES_PATH, options),
+      catalog: (options?: RequestOptions, query: ArtifactFieldCatalogQuery = {}) =>
+        this.requestJson<QuantityCatalogResource>(DATA_QUANTITIES_PATH, options, { query }),
     },
     meshRegionMembership: (
       ownerObjectId: string,

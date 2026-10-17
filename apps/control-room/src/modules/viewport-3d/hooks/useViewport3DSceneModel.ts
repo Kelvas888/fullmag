@@ -7089,8 +7089,7 @@ export function useViewport3DSceneModel({
   };
 
   return {
-    artifactInspectionCatalog: quantityCatalog.status === "ready" && !quantityCatalog.refreshError && !savedSelectionActive ? quantityCatalog.data : null,
-    artifactInspectionDefinitions: scene.status === "ready" ? scene.data?.antenna_field_solve_stages ?? [] : [],
+    artifactInspectionDefinitions: !savedSelectionActive && scene.status === "ready" ? scene.data?.antenna_field_solve_stages ?? [] : [],
     airboxSettings,
     availableQuantityIds: savedSelectionActive
       ? SAVED_VIEWPORT_AVAILABLE_QUANTITIES

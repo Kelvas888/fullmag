@@ -1,7 +1,7 @@
 "use client";
 import { isScalarSpatialQuantityId } from "@/kernel/api/quantityIds";
 
-import { artifactCarrierPresentationKey, artifactInspectionQuantity, artifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
+import { artifactFieldCatalogMatchesOwner, type ArtifactFieldSelection, artifactCarrierPresentationKey, artifactInspectionQuantity, artifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
 import { useVisualizationFieldMeta } from "@/kernel/resources/useVisualizationFieldMeta";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { Eye } from "lucide-react";
@@ -261,6 +261,7 @@ function useObjectVisualizationPanelState(
   selection: InspectorPanelProps["selection"],
   sceneOverride?: ReturnType<typeof useSceneResource>,
   artifactInspection = false,
+  artifactInspectionOwner: ArtifactFieldSelection | null = null,
 ) {
   const selectionTarget = resolveVisualizationTargetFromSelection(selection);
   const kernel = useKernel();
@@ -548,8 +549,10 @@ function useObjectVisualizationPanelState(
   const fieldCatalogRequested =
     targetKey !== null && fieldCatalogRequestedTargetKey === targetKey;
   const rawFieldCatalog = useFieldCatalogResource({
-    enabled:
-      artifactInspection || fdmTarget ||
+    stageId: artifactInspection ? artifactInspectionOwner?.runtimeStageId ?? "" : undefined,
+    runId: artifactInspectionOwner?.runId,
+    enabled: artifactInspection ? Boolean(artifactInspectionOwner) :
+      fdmTarget ||
       target?.kind === "airbox" ||
       shouldLoadObjectVisualizationFieldCatalog({
         requested: fieldCatalogRequested,
@@ -559,8 +562,10 @@ function useObjectVisualizationPanelState(
       }),
   });
   const rawQuantityCatalog = useQuantityCatalogResource({
-    enabled:
-      artifactInspection || fdmTarget ||
+    stageId: artifactInspection ? artifactInspectionOwner?.runtimeStageId ?? "" : undefined,
+    runId: artifactInspectionOwner?.runId,
+    enabled: artifactInspection ? Boolean(artifactInspectionOwner) :
+      fdmTarget ||
       target?.kind === "airbox" ||
       shouldLoadObjectVisualizationFieldCatalog({
         requested: fieldCatalogRequested,
@@ -569,12 +574,14 @@ function useObjectVisualizationPanelState(
         vectorsVisible: Boolean(settings?.vectorsVisible),
       }),
   });
+  const catalogOwnerReady = !artifactInspection || artifactFieldCatalogMatchesOwner(rawFieldCatalog.data, artifactInspectionOwner);
+  const catalogOwnerError = artifactInspection && Boolean(artifactInspectionOwner) && rawFieldCatalog.status === "ready" && !catalogOwnerReady;
   const quantityCatalog = useMemo(() => !artifactInspection || !rawQuantityCatalog.data ? rawQuantityCatalog : ({
     ...rawQuantityCatalog, data: { ...rawQuantityCatalog.data, quantities: rawQuantityCatalog.data.quantities.filter(entry => artifactInspectionQuantity(rawQuantityCatalog.data, entry.id)) },
   }), [artifactInspection, rawQuantityCatalog]);
   const fieldCatalog = useMemo(() => !artifactInspection || !rawFieldCatalog.data ? rawFieldCatalog : ({
-    ...rawFieldCatalog, data: { ...rawFieldCatalog.data, quantities: rawFieldCatalog.data.quantities.filter(entry => artifactInspectionQuantity(rawQuantityCatalog.data, entry.quantity_id)) },
-  }), [artifactInspection, rawFieldCatalog, rawQuantityCatalog.data]);
+    ...rawFieldCatalog, data: { ...rawFieldCatalog.data, quantities: rawFieldCatalog.data.quantities.filter(entry => catalogOwnerReady && artifactInspectionQuantity(rawQuantityCatalog.data, entry.quantity_id)) },
+  }), [artifactInspection, catalogOwnerReady, rawFieldCatalog, rawQuantityCatalog.data]);
   const requiresFieldData = Boolean(
     resolvedTarget &&
       settings &&
@@ -595,7 +602,7 @@ function useObjectVisualizationPanelState(
   const artifactFieldBinding = artifactInspectorFieldBinding({
     catalog: rawQuantityCatalog.data,
     inspectionOnly: artifactInspection,
-    catalogReady: rawQuantityCatalog.status === "ready" && !rawQuantityCatalog.refreshError,
+    catalogReady: catalogOwnerReady && rawQuantityCatalog.status === "ready" && !rawQuantityCatalog.refreshError,
     quantityId: settings?.activeQuantityId ?? "",
     selection: artifactSelection,
     sessionIdentity: artifactSession,
@@ -648,10 +655,11 @@ function useObjectVisualizationPanelState(
     target: resolvedTarget,
   });
   const dataState = artifactInspection ? resolveArtifactInspectionDataState({
-    catalogReady: rawQuantityCatalog.status === "ready" && rawFieldCatalog.status === "ready",
-    catalogError: Boolean(rawQuantityCatalog.error || rawQuantityCatalog.refreshError || rawFieldCatalog.error || rawFieldCatalog.refreshError),
+    executionSelected: Boolean(artifactInspectionOwner),
+    catalogReady: catalogOwnerReady && rawQuantityCatalog.status === "ready" && rawFieldCatalog.status === "ready",
+    catalogError: catalogOwnerError || Boolean(rawQuantityCatalog.error || rawQuantityCatalog.refreshError || rawFieldCatalog.error || rawFieldCatalog.refreshError),
     quantityAvailable: artifactInspectionQuantity(rawQuantityCatalog.data, settings?.activeQuantityId ?? ""),
-    ownerReady: artifactOwnerReady, presentationReady: Boolean(artifactPresentation),
+    ownerReady: Boolean(artifactInspectionOwner), presentationReady: Boolean(artifactPresentation),
   }) : ordinaryDataState;
   const targetFieldAvailability = resolvedTarget
     ? (() => {
@@ -1187,14 +1195,16 @@ export function VisualizationTargetInspectorPanel({
   selection,
   sceneOverride,
   artifactInspection = false,
+  artifactInspectionOwner = null,
 }: InspectorPanelProps & {
   /** Owner-specific nav sections (e.g. complex representation and phase for a mode), shown after "View" in 3D. */
   children?: React.ReactNode;
   owner: VisualizationInspectorOwner;
   sceneOverride?: ReturnType<typeof useSceneResource>;
   artifactInspection?: boolean;
+  artifactInspectionOwner?: ArtifactFieldSelection | null;
 }) {
-  const panel = useObjectVisualizationPanelState(selection, sceneOverride, artifactInspection);
+  const panel = useObjectVisualizationPanelState(selection, sceneOverride, artifactInspection, artifactInspectionOwner);
   const {
     carrierIdentity,
     displaySettings,

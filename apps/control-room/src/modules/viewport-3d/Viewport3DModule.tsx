@@ -1,7 +1,6 @@
 "use client";
 import { artifactRenderedSurfaceRanges } from "./model/artifactFieldOverlayModel";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
-import { artifactInspectionQuantity } from "@/kernel/visualization/artifactFieldSelection";
 import type { ArtifactFieldOverlayModel } from "./model/artifactFieldOverlayModel";
 import { useArtifactFieldOverlay } from "./hooks/useArtifactFieldOverlay";
 import { useAntennaFieldOverlay } from "./hooks/useAntennaFieldOverlay";
@@ -28,7 +27,6 @@ import type {
   FdmRegionMembershipResource,
   ResourceRevision,
   VisualizationStatePatch,
-  QuantityCatalogResource,
   VisualizationStateResource,
 } from "@/kernel/api/apiTypes";
 import {
@@ -1373,7 +1371,6 @@ interface Viewport3DFrameProps
     | "orbitDebugCommitRevision"
     | "orbitDebugRevision"
   > {
-  artifactInspectionCatalog: QuantityCatalogResource | null;
   artifactInspectionDefinitions: ReadonlyArray<{ id?: string; source_object_id?: string }>;
   cameraDialogOpen: boolean;
   cameraDialogState: Viewport3DSceneProps["cameraState"];
@@ -2007,7 +2004,6 @@ function useViewport3DSelectionHandlers({
 
 const Viewport3DFrame = memo(function Viewport3DFrame({
   artifactInspectionDefinitions,
-  artifactInspectionCatalog,
   captureRevision,
   cameraDialogOpen,
   cameraDialogState,
@@ -2051,7 +2047,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   const antennaFieldOverlay = useAntennaFieldOverlay();
   const artifactTarget = sceneProps.primitiveModel?.objects.find(object => object.objectId === sceneProps.selectedObjectId);
   const artifactSettings = artifactTarget ? sceneProps.getObjectSettings(artifactTarget) : sceneProps.fdmSettings;
-  const artifactField = useArtifactFieldOverlay(quantityId, sceneProps.selectedObjectId, artifactSettings, Boolean(antennaFieldOverlay), artifactInspectionDefinitions, artifactInspectionCatalog);
+  const artifactField = useArtifactFieldOverlay(quantityId, sceneProps.selectedObjectId, artifactSettings, Boolean(antennaFieldOverlay), artifactInspectionDefinitions);
   const antennaFieldSourceLabel = antennaFieldOverlay
     ? sceneProps.primitiveModel?.objects.find(
         (object) => object.objectId === antennaFieldOverlay.intent.sourceObjectId,
@@ -2741,7 +2737,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
         <span>{artifactField.model ? `${artifactField.model.count} owned samples · historical inspection · ${artifactField.model.unit}` : antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
-        {artifactInspectionQuantity(artifactInspectionCatalog, quantityId) && !antennaFieldOverlay && artifactField.candidates.length > 0 ? (
+        {!antennaFieldOverlay && artifactField.candidates.length > 0 ? (
           <Select value={artifactField.selectedStageId} onValueChange={artifactField.select}>
             <SelectTrigger aria-label="Field inspection source and execution" className="fm-viewport-artifact-owner-select"><SelectValue placeholder="Select source and execution" /></SelectTrigger>
             <SelectContent>{artifactField.candidates.map(candidate => <SelectItem key={candidate.runtimeStageId} value={candidate.runtimeStageId}>{candidate.sourceObjectId} · {candidate.authoredStageId} · {candidate.runtimeStageId} · {candidate.status}</SelectItem>)}</SelectContent>
