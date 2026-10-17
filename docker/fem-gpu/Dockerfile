@@ -277,8 +277,8 @@ RUN git clone --no-hardlinks /tmp/build/slepc /tmp/build/slepc-cpu && \
     cd /tmp/build/slepc-cpu && \
     SLEPC_DIR=/tmp/build/slepc-cpu PETSC_DIR=/opt/fullmag-mfem-cpu PETSC_ARCH= \
       python3 ./configure --prefix=/opt/fullmag-mfem-cpu && \
-    make SLEPC_DIR=/tmp/build/slepc-cpu PETSC_DIR=/opt/fullmag-mfem-cpu PETSC_ARCH= -j2 all && \
-    make SLEPC_DIR=/tmp/build/slepc-cpu PETSC_DIR=/opt/fullmag-mfem-cpu PETSC_ARCH= install
+    make SLEPC_DIR=/tmp/build/slepc-cpu PETSC_DIR=/opt/fullmag-mfem-cpu -j2 all && \
+    make SLEPC_DIR=/tmp/build/slepc-cpu PETSC_DIR=/opt/fullmag-mfem-cpu install
 
 # The CPU FEM client is compiled with the host C++ compiler. Keep its MFEM
 # headers and library in a separate, CUDA-free prefix so SparseMatrix has the
