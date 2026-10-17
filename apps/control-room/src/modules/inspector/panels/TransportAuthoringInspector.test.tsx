@@ -327,6 +327,23 @@ describe("TransportAuthoringInspector", () => {
     expect(html).not.toContain('value="other"');
   });
 
+  it("disables an unavailable GPU transport choice while retaining the CPU request", () => {
+    const html = renderToStaticMarkup(
+      <KernelContext.Provider value={kernel}>
+        <SpinTransportInspectorPanel selection={selection("physics.spin-transport", {
+          kind: "physics.spin-transport",
+          nodeId: "model:physics:spin-transports:moved",
+          spinTransportId: "moved",
+          type: "spin-transport",
+        })} />
+      </KernelContext.Provider>,
+    );
+
+    expect(html).toContain('value="cpu" selected=""');
+    expect(html).toMatch(/<option(?=[^>]*\bvalue="gpu")(?=[^>]*\bdisabled="")[^>]*>/);
+    expect(html).toContain("GPU unavailable");
+  });
+
   it("renders a future current model losslessly without edit, Replace, or Delete actions", () => {
     const html = renderToStaticMarkup(
       <KernelContext.Provider value={kernel}>

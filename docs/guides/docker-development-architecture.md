@@ -19,6 +19,14 @@ Backend zawiera FDM CPU, FDM GPU, FEM CPU i FEM GPU. Wybór realizacji następuj
 w modelu i plannerze, a wymuszone GPU nie ma cichego fallbacku CPU. Obecność
 bibliotek i udany build nie dowodzą wykonania ani obsługi dowolnego modelu.
 
+Dostępność wyboru GPU w formularzu wymaga aktualnego potwierdzenia urządzenia
+przez backend oraz obsługi wybranej ścieżki FDM/FEM przez runtime. Brak GPU,
+nieaktualny odczyt, błąd lub trwające wykrywanie blokują wybór GPU z podaniem
+powodu; poprzednia próbka nie zastępuje aktualnego potwierdzenia. CPU pozostaje
+dostępne, jeżeli runtime zgłasza obsługę tej ścieżki. Zapisany model lub skrypt
+wymuszający GPU zachowuje ten zamiar i otrzymuje błąd dostępności zamiast
+niejawnego przełączenia na CPU.
+
 Główny checkout używa `fullmag-master`, a worktree
 `fullmag-worktree-<worktree_id>`. Każda grupa ma własną sieć bridge, port,
 ustawienia i historię projektów. Docker IPAM przydziela osobną podsieć;
