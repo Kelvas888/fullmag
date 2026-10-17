@@ -405,6 +405,17 @@ async function measureFemTopologyUploads({ browser, partCount, passConfig, url }
       },
     );
     const diagnostics = await readViewportDiagnostics(page);
+    const webgl = await canvas.evaluate((element) => {
+      const gl = element.getContext("webgl2") ?? element.getContext("webgl");
+      return {
+        contextLost: gl?.isContextLost() ?? true,
+        drawingBufferHeight: gl?.drawingBufferHeight ?? 0,
+        drawingBufferWidth: gl?.drawingBufferWidth ?? 0,
+      };
+    });
+    if (webgl.contextLost || webgl.drawingBufferHeight <= 0 || webgl.drawingBufferWidth <= 0) {
+      throw new Error(`FEM ${passConfig.id} fixture WebGL is not renderable: ${JSON.stringify(webgl)}`);
+    }
     const gpu = await readBrowserAuditCounters(page);
     const rawPerformanceTrace = [
       await captureViewportPerformanceSnapshot(page, `${passConfig.id}:parts=${partCount}`),
@@ -430,6 +441,7 @@ async function measureFemTopologyUploads({ browser, partCount, passConfig, url }
       partCount,
       pass: passConfig.id,
       rawPerformanceTrace,
+      webgl,
     };
   } finally {
     await page.close();
