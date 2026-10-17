@@ -323,8 +323,11 @@ transakcjami. Pod nimi trzeba potwierdzić jednocześnie:
 - brak runów, batch intentów (również bez utworzonych runów), zadań recovery,
   kolejek, manifestów, pinów i aktywnych lease;
 - zgodność aktualnych pul z przypiętymi generacjami;
-- brak aktywnego host inventory writera oraz brak rezerwacji hosta, również
-  tentative, committed i quarantined; odmowa nie zwalnia ich automatycznie.
+- brak aktywnego host inventory writera oraz brak niezwolnionych rezerwacji
+  hosta, również tentative, committed i quarantined; odmowa nie zwalnia ich
+  automatycznie. Historyczne rekordy `released` mogą pozostać wyłącznie po
+  walidacji przypiętych, trwałych dowodów zwolnienia. Cała historia pozostaje
+  niezmieniona, a host writer jest trzymany od walidacji do końca recovery.
 
 Przed publikacją zachowujemy niezmienione bytes konfiguracji, ownera, launch
 oraz dowodów quiescence w operacyjnym namespace `runtime-services`. Nie są
@@ -398,3 +401,26 @@ mountów. Natywna komenda nie interpretuje pochodzenia Docker: pozostaje jedynym
 właścicielem blokad i mutacji SessionStore. Tylko jawny tryb
 `recreate --recover-idle-failure <authorization.json>` przekazuje ten request;
 zwykły start i `service-ensure` nie wykonują recovery.
+
+## Boot-relative ordering of compute-node samples
+
+Kolejność próbek tego samego node i bootu korzysta dodatkowo z prywatnego
+`boot_monotonic_ns`, pobieranego z zegara monotonicznego względem uruchomienia
+systemu. Wartość nie trafia do JSON snapshotu: v4 ledger zapisuje ją w
+niemutowalnym, content-addressed rekordzie `compute_node_sample_order.v2` pod
+`runtime-state/cas/snapshot-order-v2`,
+opublikowanym przed wskazaniem snapshotu jako bieżącego, a ten sam bounded GC
+usuwa wyłącznie nieosiągalne rekordy. Rekord wiąże digest pełnego snapshotu,
+`node_id` i `boot_id`; wcześniejsza walidacja snapshotu wiąże również jego
+owner stamp. Konflikt bytes dla tego samego digestu jest odrzucany.
+
+`collected_at` pozostaje czasem UTC używanym do freshness i admission. Brak
+rekordu oznacza snapshot zapisany przez starszego writera i zachowuje ścisłe
+porównanie UTC; starszy rekord z poprzedniego katalogu `snapshot-order` jest
+celowo ignorowany. Istniejący v2 uszkodzony, podlinkowany albo niedopasowany rekord
+zamyka ledger błędem; system nie tworzy syntetycznego watermarku ani nie
+porównuje zegarów między różnymi `boot_id`.
+
+Dowód bieżącej ścieżki Docker dotyczy Linux `CLOCK_BOOTTIME`. Native Windows
+boot identity i tick-source pozostają osobną kwalifikacją; ten kontrakt nie
+ogłasza ich równoważności bez takiego dowodu.

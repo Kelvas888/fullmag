@@ -169,9 +169,34 @@ jest `Failed`, nigdy syntetyczne `Drained` ani `Ready`. Identyczne ponowienie
 może odczytać lub dokończyć swój własny wynik; mismatch pozostawia admission
 zamknięte. Niepewna publikacja wymaga odczytu dowodów pod tymi samymi blokadami.
 
+Doprecyzowanie 17.10.2026: pusty runtime store nie wymaga skasowania historii
+host ledgeru. Dopuszczamy zachowanie wyłącznie rekordów `released`, których
+przypięte trwałe dowody zwolnienia zostały zweryfikowane pod host writerem.
+Niezwolniona rezerwacja lub aktywny inventory owner nadal blokuje operację.
+Writer pozostaje trzymany przez całą operację, a recovery nie zmienia ani
+nie usuwa historycznych rezerwacji, dowodów czy rekordów innych store.
+
 To nie jest odzyskiwanie trwających zadań ani zgoda na automatyczny restart.
-Store zawierający pracę, aktywne lease lub rezerwacje wymaga właściwego
+Store zawierający pracę, aktywne lease lub niezwolnione rezerwacje wymaga właściwego
 recovery tej pracy. Po zakończeniu tej operacji nowy start nadal przechodzi
 pełne probe/readiness i kontrole generacji z ADR 0052. Szczegóły oraz bramki
 są w kontrakcie native-runtime-service-v1. Publiczny OpenAPI i fizyka solverów
 nie zmieniają się przez tę lokalną operację.
+
+## Boot-relative ordering of compute-node samples
+
+Doprecyzowanie 17.10.2026: korekta zegara ściennego nie może odrzucić nowszej
+próbki hosta tylko dlatego, że `collected_at` cofnął się. Snapshot zachowuje
+schemat JSON bez pola watermarku, a ledger przechowuje bootowy czas
+monotoniczny w osobnym immutable CAS `compute_node_sample_order.v2` pod
+`runtime-state/cas/snapshot-order-v2`, związanym
+z digestem snapshotu, `node_id` i `boot_id`. Rekord jest publikowany przed
+przesunięciem bieżącego pointera i podlega temu samemu fail-closed GC. Brak
+rekordu starego writera zachowuje ścisłą regułę UTC; starszy rekord z katalogu
+`snapshot-order` jest ignorowany. Rekord v2 obecny, lecz
+uszkodzony, podlinkowany lub niedopasowany odmawia odczytu. Nie ma syntetycznego
+watermarku ani porównania próbek różnych bootów, a owner stamp pozostaje
+zweryfikowany przez pełny digest snapshotu.
+Dowód bieżącej ścieżki Docker dotyczy Linux `CLOCK_BOOTTIME`; natywna ścieżka
+Windows pozostaje osobną kwalifikacją i nie jest przez ten kontrakt ogłaszana
+równoważną bez własnego dowodu.

@@ -119,21 +119,11 @@ fn sample_compute_node_with_advanced_timestamp(
         capture,
         move |candidate| {
             let previous = previous?;
-            sample_timestamp_is_non_advancing(
-                Some((
-                    previous.node_id.as_str(),
-                    previous.boot_id.as_str(),
-                    &previous.sample.collected_at,
-                )),
-                (
-                    candidate.node_id.as_str(),
-                    candidate.boot_id.as_str(),
-                    &candidate.sample.collected_at,
-                ),
-            )
-            .then(|| {
+            candidate.sample_does_not_advance(previous).then(|| {
                 format!(
-                    "previous_collected_at={}, current_collected_at={}",
+                    "previous_boot_monotonic_ns={:?}, current_boot_monotonic_ns={:?}, previous_collected_at={}, current_collected_at={}",
+                    previous.sample.boot_monotonic_ns,
+                    candidate.sample.boot_monotonic_ns,
                     previous.sample.collected_at.to_rfc3339(),
                     candidate.sample.collected_at.to_rfc3339(),
                 )
@@ -177,6 +167,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn sample_timestamp_is_non_advancing(
     previous: Option<(&str, &str, &DateTime<Utc>)>,
     candidate: (&str, &str, &DateTime<Utc>),
@@ -400,6 +391,7 @@ fn sample_compute_node_inner(
     let memory = observe_memory();
     let gpus = discover_nvidia_gpus();
     let now = Utc::now();
+    let boot_monotonic_ns = current_boot_monotonic_ns()?;
     let boot_id = current_host_boot_id(now.clone())?;
 
     let cpu_failed = cpu_capacity.is_err()
@@ -535,7 +527,8 @@ fn sample_compute_node_inner(
         },
         gpus: gpu_inventory,
         capabilities,
-        sample: ComputeNodeSample::new(SampleSource::HostOs, now.clone(), sample_error, now.clone()),
+        sample: ComputeNodeSample::new(SampleSource::HostOs, now.clone(), sample_error, now.clone())
+            .with_boot_monotonic_ns(boot_monotonic_ns),
         enforcement: EnforcementSnapshot {
             cpu_affinity: EnforcementStatus::Unavailable,
             cpu_quota: EnforcementStatus::Advisory,
@@ -1809,6 +1802,43 @@ fn gpu_failure_reason(error: &anyhow::Error) -> UnavailableReason {
     } else {
         UnavailableReason::ProbeFailed
     }
+}
+
+/// Nanoseconds since boot from `CLOCK_BOOTTIME`, which includes suspend and
+/// is never stepped by wall-clock synchronization.
+#[cfg(target_os = "linux")]
+pub fn current_boot_monotonic_ns() -> Result<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is a valid, writable timespec for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut value) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read Linux CLOCK_BOOTTIME");
+    }
+    let seconds = u64::try_from(value.tv_sec).context("CLOCK_BOOTTIME seconds are negative")?;
+    let nanoseconds =
+        u64::try_from(value.tv_nsec).context("CLOCK_BOOTTIME nanoseconds are negative")?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .context("CLOCK_BOOTTIME overflow")
+}
+
+/// Milliseconds since boot scaled to nanoseconds; the tick counter is never
+/// adjusted by wall-clock synchronization.
+#[cfg(windows)]
+pub fn current_boot_monotonic_ns() -> Result<u64> {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+
+    unsafe { GetTickCount64() }
+        .checked_mul(1_000_000)
+        .context("Windows tick count overflow")
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn current_boot_monotonic_ns() -> Result<u64> {
+    bail!("boot-relative monotonic time is unsupported on this operating system")
 }
 
 #[cfg(target_os = "linux")]

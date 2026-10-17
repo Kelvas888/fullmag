@@ -51,6 +51,31 @@ const HOST_COMPUTE_NODE_SNAPSHOT_FILE: &str = "COMPUTE_NODE_SNAPSHOT.json";
 const HOST_RUNTIME_READINESS_FILE: &str = "HOST_RUNTIME_READINESS.json";
 const HOST_RUNTIME_READINESS_CAS_DIR: &str = "runtime-state/cas/readiness";
 const HOST_COMPUTE_NODE_SNAPSHOT_CAS_DIR: &str = "runtime-state/cas/snapshot";
+/// Boot-relative ordering of one published snapshot, keyed by its digest.
+/// Kept outside the snapshot bytes so older readers never observe it.
+const HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR: &str = "runtime-state/cas/snapshot-order-v2";
+const COMPUTE_NODE_SAMPLE_ORDER_SCHEMA_V2: &str = "compute_node_sample_order.v2";
+const MAX_COMPUTE_NODE_SAMPLE_ORDER_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ComputeNodeSampleOrderRecord {
+    schema_version: String,
+    snapshot_sha256: String,
+    node_id: String,
+    boot_id: String,
+    boot_monotonic_ns: u64,
+    checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ComputeNodeSampleOrderPayload<'a> {
+    schema_version: &'a str,
+    snapshot_sha256: &'a str,
+    node_id: &'a str,
+    boot_id: &'a str,
+    boot_monotonic_ns: u64,
+}
 const HOST_INVENTORY_OWNER_LOCK_FILE: &str = "HOST_INVENTORY_OWNER.lock";
 const HOST_INVENTORY_OWNER_RECORD_FILE: &str = "HOST_INVENTORY_OWNER.json";
 const HOST_INVENTORY_OWNER_RECORD_SCHEMA_V1: &str = "host_inventory_owner.v1";
@@ -3113,23 +3138,59 @@ impl HostResourceLedger {
         &self,
         document: &HostResourceLedgerDocument,
     ) -> Result<()> {
-        if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4 {
-            return Ok(());
+        let (current_snapshot_digest, is_v4) =
+            if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+                (
+                    document
+                        .runtime_state
+                        .as_ref()
+                        .and_then(|state| state.snapshot_sha256.clone()),
+                    true,
+                )
+            } else {
+                let snapshot_path = checked_path(&self.root, HOST_COMPUTE_NODE_SNAPSHOT_FILE)?;
+                match fs::symlink_metadata(&snapshot_path) {
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                        bail!("compute-node snapshot must be a regular file")
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error).context("inspect compute-node snapshot"),
+                }
+                let bytes = read_bounded_regular_file(
+                    &self.root,
+                    HOST_COMPUTE_NODE_SNAPSHOT_FILE,
+                    MAX_COMPUTE_NODE_SNAPSHOT_BYTES,
+                )?;
+                let digest = runtime_cas_digest(&bytes);
+                (Some(digest), false)
+            };
+        if is_v4 {
+            self.gc_unreachable_cas_directory_locked(
+                HOST_COMPUTE_NODE_SNAPSHOT_CAS_DIR,
+                current_snapshot_digest.as_deref(),
+            )?;
         }
-        let current_snapshot_digest = document
-            .runtime_state
-            .as_ref()
-            .and_then(|state| state.snapshot_sha256.as_deref());
-        let directory = checked_path(&self.root, HOST_COMPUTE_NODE_SNAPSHOT_CAS_DIR)?;
+        self.gc_unreachable_cas_directory_locked(
+            HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR,
+            current_snapshot_digest.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    fn gc_unreachable_cas_directory_locked(
+        &self,
+        directory_relative: &str,
+        current_snapshot_digest: Option<&str>,
+    ) -> Result<()> {
+        let directory = checked_path(&self.root, directory_relative)?;
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!(
-                        "enumerating compute-node snapshot CAS directory {}",
-                        directory.display()
-                    )
+                    format!("enumerating runtime CAS directory {}", directory.display())
                 })
             }
         };
@@ -3157,7 +3218,7 @@ impl HostResourceLedger {
             let Some(digest) = file_name.strip_suffix(".json") else {
                 continue;
             };
-            if validate_runtime_cas_digest(digest, "snapshot CAS filename").is_err()
+            if validate_runtime_cas_digest(digest, "runtime CAS filename").is_err()
                 || current_snapshot_digest == Some(digest)
             {
                 continue;
@@ -3168,7 +3229,7 @@ impl HostResourceLedger {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(error)
-                        .with_context(|| format!("removing stale snapshot CAS {}", path.display()))
+                        .with_context(|| format!("removing stale runtime CAS {}", path.display()))
                 }
             }
         }
@@ -3187,16 +3248,20 @@ impl HostResourceLedger {
         let mut document = self.read_document_locked()?;
         if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
             if let Some(previous) = self.read_compute_node_snapshot_locked()? {
-                if previous == *snapshot {
+                let previous_bytes = bounded_json_bytes(
+                    &previous,
+                    MAX_COMPUTE_NODE_SNAPSHOT_BYTES,
+                    "compute-node snapshot",
+                )?;
+                if previous_bytes == bytes {
                     self.gc_unreachable_snapshot_cas_locked(&document)?;
                     return Ok(ComputeNodeSnapshotPublicationDisposition::Replayed);
                 }
-                if snapshot.node_id == previous.node_id
-                    && snapshot.boot_id == previous.boot_id
-                    && snapshot.sample.collected_at <= previous.sample.collected_at
-                {
+                if snapshot.sample_does_not_advance(&previous) {
                     bail!(
-                        "compute-node snapshot sample time must advance within one boot: previous_collected_at={}, candidate_collected_at={}, previous_node_id={:?}, candidate_node_id={:?}, previous_boot_id={:?}, candidate_boot_id={:?}, previous_owner_epoch={}, candidate_owner_epoch={}, previous_host_owner_epoch={:?}, candidate_host_owner_epoch={:?}",
+                        "compute-node snapshot sample time must advance within one boot: previous_boot_monotonic_ns={:?}, candidate_boot_monotonic_ns={:?}, previous_collected_at={}, candidate_collected_at={}, previous_node_id={:?}, candidate_node_id={:?}, previous_boot_id={:?}, candidate_boot_id={:?}, previous_owner_epoch={}, candidate_owner_epoch={}, previous_host_owner_epoch={:?}, candidate_host_owner_epoch={:?}",
+                        previous.sample.boot_monotonic_ns,
+                        snapshot.sample.boot_monotonic_ns,
                         previous.sample.collected_at,
                         snapshot.sample.collected_at,
                         previous.node_id,
@@ -3220,6 +3285,7 @@ impl HostResourceLedger {
                 MAX_COMPUTE_NODE_SNAPSHOT_BYTES,
                 "compute-node snapshot",
             )?;
+            self.publish_sample_order_locked(snapshot, &digest)?;
             let state = document
                 .runtime_state
                 .as_mut()
@@ -3230,15 +3296,19 @@ impl HostResourceLedger {
             return Ok(ComputeNodeSnapshotPublicationDisposition::Accepted);
         }
         if let Some(previous) = self.read_compute_node_snapshot_locked()? {
-            if previous == *snapshot {
+            let previous_bytes = bounded_json_bytes(
+                &previous,
+                MAX_COMPUTE_NODE_SNAPSHOT_BYTES,
+                "compute-node snapshot",
+            )?;
+            if previous_bytes == bytes {
                 return Ok(ComputeNodeSnapshotPublicationDisposition::Replayed);
             }
-            if snapshot.node_id == previous.node_id
-                && snapshot.boot_id == previous.boot_id
-                && snapshot.sample.collected_at <= previous.sample.collected_at
-            {
+            if snapshot.sample_does_not_advance(&previous) {
                 bail!(
-                    "compute-node snapshot sample time must advance within one boot: previous_collected_at={}, candidate_collected_at={}, previous_node_id={:?}, candidate_node_id={:?}, previous_boot_id={:?}, candidate_boot_id={:?}, previous_owner_epoch={}, candidate_owner_epoch={}, previous_host_owner_epoch={:?}, candidate_host_owner_epoch={:?}",
+                    "compute-node snapshot sample time must advance within one boot: previous_boot_monotonic_ns={:?}, candidate_boot_monotonic_ns={:?}, previous_collected_at={}, candidate_collected_at={}, previous_node_id={:?}, candidate_node_id={:?}, previous_boot_id={:?}, candidate_boot_id={:?}, previous_owner_epoch={}, candidate_owner_epoch={}, previous_host_owner_epoch={:?}, candidate_host_owner_epoch={:?}",
+                    previous.sample.boot_monotonic_ns,
+                    snapshot.sample.boot_monotonic_ns,
                     previous.sample.collected_at,
                     snapshot.sample.collected_at,
                     previous.node_id,
@@ -3256,6 +3326,8 @@ impl HostResourceLedger {
             bail!("first compute-node snapshot must start revisions at one");
         }
 
+        let digest = runtime_cas_digest(bytes);
+        self.publish_sample_order_locked(snapshot, &digest)?;
         let destination = checked_path(&self.root, HOST_COMPUTE_NODE_SNAPSHOT_FILE)?;
         reject_link(&destination)?;
         match atomic_write(&destination, bytes) {
@@ -3271,7 +3343,93 @@ impl HostResourceLedger {
                 _ => return Err(write_error),
             },
         }
+        self.gc_unreachable_snapshot_cas_locked(&document)?;
         Ok(ComputeNodeSnapshotPublicationDisposition::Accepted)
+    }
+
+    fn publish_sample_order_locked(
+        &self,
+        snapshot: &ComputeNodeSnapshot,
+        snapshot_sha256: &str,
+    ) -> Result<()> {
+        let Some(boot_monotonic_ns) = snapshot.sample.boot_monotonic_ns else {
+            return Ok(());
+        };
+        let mut record = ComputeNodeSampleOrderRecord {
+            schema_version: COMPUTE_NODE_SAMPLE_ORDER_SCHEMA_V2.to_string(),
+            snapshot_sha256: snapshot_sha256.to_string(),
+            node_id: snapshot.node_id.clone(),
+            boot_id: snapshot.boot_id.clone(),
+            boot_monotonic_ns,
+            checksum_sha256: String::new(),
+        };
+        record.checksum_sha256 = compute_node_sample_order_checksum(&record)?;
+        let bytes = bounded_json_bytes(
+            &record,
+            MAX_COMPUTE_NODE_SAMPLE_ORDER_BYTES,
+            "compute-node sample order",
+        )?;
+        let relative = runtime_cas_relative_path(
+            HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR,
+            snapshot_sha256,
+            "compute-node sample order",
+        )?;
+        crate::repository_path::create_parent(&self.root, &relative)?;
+        publish_immutable_exact(
+            &self.root,
+            &relative,
+            &bytes,
+            MAX_COMPUTE_NODE_SAMPLE_ORDER_BYTES,
+        )
+    }
+
+    /// Read the optional sidecar for a snapshot published by a newer writer.
+    /// A missing file is the legacy-writer case and keeps the strict UTC
+    /// ordering rule. An existing malformed, linked, or mismatched record is
+    /// corruption and must fence the ledger rather than silently falling back.
+    fn read_sample_order_locked(
+        &self,
+        snapshot: &ComputeNodeSnapshot,
+        snapshot_sha256: &str,
+    ) -> Result<Option<u64>> {
+        let relative = runtime_cas_relative_path(
+            HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR,
+            snapshot_sha256,
+            "compute-node sample order",
+        )?;
+        let path = checked_path(&self.root, &relative)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect compute-node sample order {}", path.display())
+                })
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("compute-node sample order must be a regular file");
+        }
+        let bytes =
+            read_bounded_regular_file(&self.root, &relative, MAX_COMPUTE_NODE_SAMPLE_ORDER_BYTES)
+                .with_context(|| format!("read compute-node sample order {}", path.display()))?;
+        let record: ComputeNodeSampleOrderRecord = serde_json::from_slice(&bytes)
+            .context("corrupt content-addressed compute-node sample order")?;
+        if record.schema_version != COMPUTE_NODE_SAMPLE_ORDER_SCHEMA_V2
+            || record.snapshot_sha256 != snapshot_sha256
+            || record.node_id != snapshot.node_id
+            || record.boot_id != snapshot.boot_id
+        {
+            bail!("compute-node sample order does not match its snapshot");
+        }
+        validate_runtime_cas_digest(
+            &record.checksum_sha256,
+            "compute-node sample order checksum",
+        )?;
+        if compute_node_sample_order_checksum(&record)? != record.checksum_sha256 {
+            bail!("compute-node sample order checksum does not match its contents");
+        }
+        Ok(Some(record.boot_monotonic_ns))
     }
 
     fn read_compute_node_snapshot_locked(&self) -> Result<Option<ComputeNodeSnapshot>> {
@@ -3290,9 +3448,11 @@ impl HostResourceLedger {
                 MAX_COMPUTE_NODE_SNAPSHOT_BYTES,
                 "compute-node snapshot",
             )?;
-            let snapshot: ComputeNodeSnapshot = serde_json::from_slice(&bytes)
+            let mut snapshot: ComputeNodeSnapshot = serde_json::from_slice(&bytes)
                 .context("corrupt content-addressed compute-node snapshot")?;
             snapshot.validate()?;
+            snapshot.sample.boot_monotonic_ns =
+                self.read_sample_order_locked(&snapshot, snapshot_digest)?;
             return Ok(Some(snapshot));
         }
         let path = checked_path(&self.root, HOST_COMPUTE_NODE_SNAPSHOT_FILE)?;
@@ -3309,9 +3469,12 @@ impl HostResourceLedger {
             HOST_COMPUTE_NODE_SNAPSHOT_FILE,
             MAX_COMPUTE_NODE_SNAPSHOT_BYTES,
         )?;
-        let snapshot: ComputeNodeSnapshot = serde_json::from_slice(&bytes)
-            .context("parse persisted compute-node snapshot")?;
+        let mut snapshot: ComputeNodeSnapshot =
+            serde_json::from_slice(&bytes).context("parse persisted compute-node snapshot")?;
         snapshot.validate()?;
+        let snapshot_digest = runtime_cas_digest(&bytes);
+        snapshot.sample.boot_monotonic_ns =
+            self.read_sample_order_locked(&snapshot, &snapshot_digest)?;
         Ok(Some(snapshot))
     }
 
@@ -3332,19 +3495,23 @@ impl HostResourceLedger {
     /// so a direct ledger caller cannot publish a reservation or acquire the
     /// inventory owner between the proof and the recovery publication.
     ///
-    /// This is intentionally stricter than ordinary admission: a recovery of
-    /// an unknown runtime owner is allowed only for a ledger with no durable
-    /// reservations at all and without an active inventory owner.  Historical
-    /// owner metadata may remain after a clean release; the native lock, not
-    /// its timestamp or record, decides whether the owner is active.
+    /// Recovery requires no nonreleased reservation and no active inventory
+    /// owner. Released history remains immutable: read_document_locked verifies
+    /// every durable release proof before this check. Historical owner metadata
+    /// may remain after a clean release; the native lock, not its timestamp or
+    /// record, decides whether the owner is active.
     pub fn with_runtime_recovery_quiescence<T>(
         &self,
         operation: impl FnOnce(&HostResourceLedgerSnapshot) -> Result<T>,
     ) -> Result<T> {
         let _host_writer = self.writer.acquire()?;
         let document = self.read_document_locked()?;
-        if !document.reservations.is_empty() {
-            bail!("runtime service recovery requires a host ledger with no reservations");
+        if document
+            .reservations
+            .iter()
+            .any(|reservation| reservation.state != HostResourceReservationState::Released)
+        {
+            bail!("runtime service recovery requires a host ledger with no nonreleased reservations");
         }
         if self.active_inventory_owner_locked()?.is_some() {
             bail!(
@@ -4328,6 +4495,17 @@ fn runtime_readiness_abi_compatible(
 
 fn runtime_cas_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn compute_node_sample_order_checksum(record: &ComputeNodeSampleOrderRecord) -> Result<String> {
+    let payload = ComputeNodeSampleOrderPayload {
+        schema_version: &record.schema_version,
+        snapshot_sha256: &record.snapshot_sha256,
+        node_id: &record.node_id,
+        boot_id: &record.boot_id,
+        boot_monotonic_ns: record.boot_monotonic_ns,
+    };
+    Ok(crate::canonical_json_sha256(&serde_json::to_value(payload)?))
 }
 
 fn runtime_cas_relative_path(directory: &str, digest: &str, field: &str) -> Result<String> {
@@ -5817,15 +5995,17 @@ mod tests {
     #[test]
     fn compute_node_snapshot_is_bounded_owner_bound_and_replayable() {
         let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
         let policy = policy();
         let ledger = HostResourceLedger::initialize(directory.path(), policy.clone()).unwrap();
-        let snapshot = compute_node_snapshot(
+        let mut snapshot = compute_node_snapshot(
             &policy,
             ledger.node_id(),
             chrono::Utc::now(),
             1,
             1,
         );
+        snapshot.sample.boot_monotonic_ns = Some(10);
 
         assert_eq!(
             ledger.publish_compute_node_snapshot(&snapshot).unwrap(),
@@ -5836,10 +6016,297 @@ mod tests {
             ComputeNodeSnapshotPublicationDisposition::Replayed
         );
         assert_eq!(ledger.read_compute_node_snapshot().unwrap(), Some(snapshot.clone()));
+        let snapshot_bytes = bounded_json_bytes(
+            &snapshot,
+            MAX_COMPUTE_NODE_SNAPSHOT_BYTES,
+            "compute-node snapshot",
+        )
+        .unwrap();
+        let snapshot_digest = runtime_cas_digest(&snapshot_bytes);
+        assert!(root
+            .join(
+                runtime_cas_relative_path(
+                    HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR,
+                    &snapshot_digest,
+                    "compute-node sample order",
+                )
+                .unwrap(),
+            )
+            .is_file());
 
-        let mut stale_owner_epoch = snapshot;
+        let orphan_order = root.join(
+            runtime_cas_relative_path(
+                HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR,
+                &"b".repeat(64),
+                "compute-node sample order",
+            )
+            .unwrap(),
+        );
+        fs::write(&orphan_order, b"orphaned sample order").unwrap();
+        let mut newer = snapshot.clone();
+        newer.sample.collected_at -= chrono::Duration::seconds(1);
+        newer.sample.boot_monotonic_ns = Some(20);
+        newer.memory.available_bytes = crate::compute_node_snapshot::Observation::Available {
+            value: 5000,
+        };
+        assert_eq!(
+            ledger.publish_compute_node_snapshot(&newer).unwrap(),
+            ComputeNodeSnapshotPublicationDisposition::Accepted
+        );
+        assert_eq!(
+            ledger
+                .read_compute_node_snapshot()
+                .unwrap()
+                .unwrap()
+                .sample
+                .boot_monotonic_ns,
+            Some(20)
+        );
+        assert!(!orphan_order.exists());
+
+        let mut stale_owner_epoch = newer;
         stale_owner_epoch.owner_epoch += 1;
         assert!(ledger.publish_compute_node_snapshot(&stale_owner_epoch).is_err());
+    }
+
+    #[test]
+    fn v4_compute_node_sample_order_sidecar_is_immutable_and_legacy_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = ledger_root(directory.path());
+        let mut policy = policy();
+        policy.schema_version = HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2.into();
+        let collected_at = chrono::Utc::now();
+        let mut template = compute_node_snapshot(
+            &policy,
+            HostResourceLedger::node_id_for_host_id(&policy.host_id),
+            collected_at.clone(),
+            1,
+            1,
+        );
+        template.capabilities = Reported::Available {
+            value: vec!["fem.gpu".into()],
+        };
+        if let Reported::Available { value } = &mut template.gpus {
+            for device in value {
+                device.runtime_compatibility = Reported::Available {
+                    value: vec!["fem.gpu".into()],
+                };
+            }
+        }
+        let capabilities_sha256 = template.computed_capabilities_sha256().unwrap();
+        policy.topology_sha256 = template.inventory_sha256.clone();
+        let mut readiness = v4_readiness(&policy, &"1".repeat(64), &"2".repeat(64));
+        readiness.capabilities_sha256 = Some(capabilities_sha256);
+        let ledger =
+            HostResourceLedger::initialize_with_readiness(&root, policy.clone(), readiness)
+                .unwrap();
+        let owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+
+        let mut first = template;
+        first.schema_version = crate::compute_node_snapshot::COMPUTE_NODE_SNAPSHOT_SCHEMA_V2.into();
+        first.runtime_owner_id = ledger.owner_id();
+        first.host_owner_id = Some(owner.descriptor().host_owner_id.clone());
+        first.host_owner_epoch = Some(owner.descriptor().host_owner_epoch);
+        first.enforcement.gpu_visibility = EnforcementStatus::Supported;
+        first.sample = first.sample.with_boot_monotonic_ns(10);
+        first.validate().unwrap();
+        assert_eq!(
+            ledger
+                .publish_compute_node_snapshot_with_owner(&owner, &first)
+                .unwrap(),
+            ComputeNodeSnapshotPublicationDisposition::Accepted
+        );
+        assert_eq!(
+            ledger
+                .read_compute_node_snapshot()
+                .unwrap()
+                .unwrap()
+                .sample
+                .boot_monotonic_ns,
+            Some(10)
+        );
+
+        let mut replay_without_order = first.clone();
+        replay_without_order.sample.boot_monotonic_ns = None;
+        assert_eq!(
+            ledger
+                .publish_compute_node_snapshot_with_owner(&owner, &replay_without_order)
+                .unwrap(),
+            ComputeNodeSnapshotPublicationDisposition::Replayed
+        );
+        assert_eq!(
+            ledger
+                .read_compute_node_snapshot()
+                .unwrap()
+                .unwrap()
+                .sample
+                .boot_monotonic_ns,
+            Some(10)
+        );
+        let first_bytes = bounded_json_bytes(
+            &first,
+            MAX_COMPUTE_NODE_SNAPSHOT_BYTES,
+            "compute-node snapshot",
+        )
+        .unwrap();
+        let first_digest = runtime_cas_digest(&first_bytes);
+        let first_order_relative = runtime_cas_relative_path(
+            HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR,
+            &first_digest,
+            "compute-node sample order",
+        )
+        .unwrap();
+        fs::remove_file(root.join(&first_order_relative)).unwrap();
+        assert_eq!(
+            ledger
+                .publish_compute_node_snapshot_with_owner(&owner, &first)
+                .unwrap(),
+            ComputeNodeSnapshotPublicationDisposition::Replayed
+        );
+        assert_eq!(
+            ledger
+                .read_compute_node_snapshot()
+                .unwrap()
+                .unwrap()
+                .sample
+                .boot_monotonic_ns,
+            None
+        );
+
+        let mut legacy_backwards = first.clone();
+        legacy_backwards.sample.collected_at = collected_at - chrono::Duration::seconds(1);
+        legacy_backwards.sample.boot_monotonic_ns = Some(20);
+        legacy_backwards.memory.available_bytes =
+            crate::compute_node_snapshot::Observation::Available { value: 4999 };
+        assert!(ledger
+            .publish_compute_node_snapshot_with_owner(&owner, &legacy_backwards)
+            .unwrap_err()
+            .to_string()
+            .contains("must advance within one boot"));
+
+        let mut second = first.clone();
+        second.sample.collected_at = collected_at + chrono::Duration::seconds(1);
+        second.sample.boot_monotonic_ns = Some(20);
+        second.memory.available_bytes = crate::compute_node_snapshot::Observation::Available {
+            value: 5000,
+        };
+        ledger
+            .publish_compute_node_snapshot_with_owner(&owner, &second)
+            .unwrap();
+        assert_eq!(
+            ledger
+                .read_compute_node_snapshot()
+                .unwrap()
+                .unwrap()
+                .sample
+                .boot_monotonic_ns,
+            Some(20)
+        );
+
+        let mut third = second.clone();
+        third.sample.collected_at = collected_at;
+        third.sample.boot_monotonic_ns = Some(30);
+        third.memory.available_bytes = crate::compute_node_snapshot::Observation::Available {
+            value: 5001,
+        };
+        ledger
+            .publish_compute_node_snapshot_with_owner(&owner, &third)
+            .unwrap();
+        assert_eq!(
+            ledger
+                .read_compute_node_snapshot()
+                .unwrap()
+                .unwrap()
+                .sample
+                .boot_monotonic_ns,
+            Some(30)
+        );
+
+        let mut stale = third.clone();
+        stale.sample.boot_monotonic_ns = Some(25);
+        stale.memory.available_bytes = crate::compute_node_snapshot::Observation::Available {
+            value: 5002,
+        };
+        assert!(ledger
+            .publish_compute_node_snapshot_with_owner(&owner, &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("must advance within one boot"));
+
+        let mut replay_with_different_order = third.clone();
+        replay_with_different_order.sample.boot_monotonic_ns = Some(40);
+        assert_eq!(
+            ledger
+                .publish_compute_node_snapshot_with_owner(&owner, &replay_with_different_order)
+                .unwrap(),
+            ComputeNodeSnapshotPublicationDisposition::Replayed
+        );
+        assert_eq!(
+            ledger
+                .read_compute_node_snapshot()
+                .unwrap()
+                .unwrap()
+                .sample
+                .boot_monotonic_ns,
+            Some(30)
+        );
+
+        let current_digest = ledger
+            .read_runtime_state()
+            .unwrap()
+            .unwrap()
+            .snapshot_sha256
+            .unwrap();
+        let mut conflicting_order = third.clone();
+        conflicting_order.sample.boot_monotonic_ns = Some(40);
+        let conflict = ledger
+            .publish_sample_order_locked(&conflicting_order, &current_digest)
+            .unwrap_err();
+        assert!(conflict.to_string().contains("different bytes"));
+
+        let order_relative = runtime_cas_relative_path(
+            HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR,
+            &current_digest,
+            "compute-node sample order",
+        )
+        .unwrap();
+        let mut tampered: ComputeNodeSampleOrderRecord =
+            serde_json::from_slice(&fs::read(root.join(&order_relative)).unwrap()).unwrap();
+        tampered.boot_monotonic_ns = 31;
+        fs::write(
+            root.join(&order_relative),
+            bounded_json_bytes(
+                &tampered,
+                MAX_COMPUTE_NODE_SAMPLE_ORDER_BYTES,
+                "compute-node sample order",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(ledger
+            .read_compute_node_snapshot()
+            .unwrap_err()
+            .to_string()
+            .contains("checksum does not match"));
+        fs::write(root.join(&order_relative), b"not-json").unwrap();
+        assert!(ledger
+            .read_compute_node_snapshot()
+            .unwrap_err()
+            .to_string()
+            .contains("corrupt content-addressed compute-node sample order"));
+
+        fs::remove_file(root.join(&order_relative)).unwrap();
+        let mut legacy_order = third.clone();
+        legacy_order.sample.boot_monotonic_ns = Some(50);
+        legacy_order.memory.available_bytes = crate::compute_node_snapshot::Observation::Available {
+            value: 5003,
+        };
+        let missing = ledger
+            .publish_compute_node_snapshot_with_owner(&owner, &legacy_order)
+            .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("must advance within one boot"));
     }
 
     #[test]
@@ -7142,6 +7609,86 @@ mod tests {
             &format!("sha256:{}", "7".repeat(64)),
         )
         .is_err());
+    }
+
+    #[test]
+    fn runtime_recovery_preserves_verified_released_history_and_rejects_live_capacity() {
+        let (policy, request, mut released, receipt, lease) = worker_release_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = HostResourceLedger::initialize(directory.path(), policy.clone()).unwrap();
+        let proof = HostResourceReleaseProof {
+            schema_version: HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1.to_string(),
+            kind: HostResourceReleaseProofKind::Worker,
+            host_id: policy.host_id.clone(),
+            store_id: released.identity.store_id.clone(),
+            request_sha256: released.request_sha256.clone(),
+            worker_receipt: Some(receipt),
+            released_worker_lease: Some(lease),
+            preparation_receipt: None,
+            released_preparation_lease: None,
+            unadmitted_task: None,
+            preparation_launch_owner: None,
+        };
+        let bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "proof").unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let relative = release_proof_relative_path(&digest).unwrap();
+        crate::repository_path::create_parent(&ledger.root, &relative).unwrap();
+        publish_immutable_exact(&ledger.root, &relative, &bytes, MAX_RELEASE_PROOF_BYTES).unwrap();
+        released.state = HostResourceReservationState::Released;
+        released.release_proof_sha256 = Some(digest);
+        {
+            let _writer = ledger.writer.acquire().unwrap();
+            let mut document = ledger.read_document_locked().unwrap();
+            document.reservations.push(released.clone());
+            ledger.publish_document_locked(&document).unwrap();
+        }
+        let before = fs::read(ledger.root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap();
+        ledger
+            .with_runtime_recovery_quiescence(|snapshot| {
+                assert_eq!(snapshot.reservations, vec![released.clone()]);
+                let writer = Arc::clone(&ledger.writer);
+                let blocked = std::thread::spawn(move || writer.acquire().is_err())
+                    .join()
+                    .unwrap();
+                assert!(blocked, "host writer must fence the callback");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read(ledger.root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap(),
+            before
+        );
+
+        let inventory_owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        assert!(ledger.with_runtime_recovery_quiescence(|_| Ok(())).is_err());
+        drop(inventory_owner);
+
+        let mut active_request = request;
+        active_request.identity.task_id = "task-live-recovery".to_string();
+        active_request.identity.run_id = "run-live-recovery".to_string();
+        active_request.identity.lease_token = "lease-live-recovery".to_string();
+        {
+            let _writer = ledger.writer.acquire().unwrap();
+            let mut document = ledger.read_document_locked().unwrap();
+            document
+                .reservations
+                .push(HostResourceReservation::from_request(&active_request).unwrap());
+            ledger.publish_document_locked(&document).unwrap();
+        }
+        let error = ledger
+            .with_runtime_recovery_quiescence(|_| Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("nonreleased reservations"));
+        {
+            let _writer = ledger.writer.acquire().unwrap();
+            let mut document = ledger.read_document_locked().unwrap();
+            document
+                .reservations
+                .retain(|reservation| reservation.state == HostResourceReservationState::Released);
+            ledger.publish_document_locked(&document).unwrap();
+        }
+        fs::write(ledger.root.join(&relative), b"tampered release proof").unwrap();
+        assert!(ledger.with_runtime_recovery_quiescence(|_| Ok(())).is_err());
     }
 
     #[test]
@@ -8632,18 +9179,32 @@ mod tests {
         let old_generation = ledger.read_runtime_generation_sha256().unwrap();
         let snapshot_dir = root.join(HOST_COMPUTE_NODE_SNAPSHOT_CAS_DIR);
         fs::create_dir_all(&snapshot_dir).unwrap();
+        let sample_order_dir = root.join(HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR);
+        fs::create_dir_all(&sample_order_dir).unwrap();
         let stale_snapshot = "b".repeat(64);
         fs::write(
             snapshot_dir.join(format!("{stale_snapshot}.json")),
             b"orphaned snapshot",
         )
         .unwrap();
+        let stale_sample_order = "8".repeat(64);
+        fs::write(
+            sample_order_dir.join(format!("{stale_sample_order}.json")),
+            b"orphaned sample order",
+        )
+        .unwrap();
         let malformed_name = snapshot_dir.join(format!("{}.json", "B".repeat(64)));
         fs::write(&malformed_name, b"preserve malformed name").unwrap();
+        let malformed_order_name = sample_order_dir.join(format!("{}.json", "G".repeat(64)));
+        fs::write(&malformed_order_name, b"preserve malformed order name").unwrap();
         let wrong_extension = snapshot_dir.join(format!("{}.tmp", "c".repeat(64)));
         fs::write(&wrong_extension, b"preserve wrong extension").unwrap();
+        let wrong_order_extension = sample_order_dir.join(format!("{}.tmp", "h".repeat(64)));
+        fs::write(&wrong_order_extension, b"preserve wrong order extension").unwrap();
         let non_regular_name = snapshot_dir.join(format!("{}.json", "d".repeat(64)));
         fs::create_dir(&non_regular_name).unwrap();
+        let non_regular_order_name = sample_order_dir.join(format!("{}.json", "i".repeat(64)));
+        fs::create_dir(&non_regular_order_name).unwrap();
         let legacy_readiness = root.join(HOST_RUNTIME_READINESS_FILE);
         let legacy_snapshot = root.join(HOST_COMPUTE_NODE_SNAPSHOT_FILE);
         fs::write(&legacy_readiness, b"legacy readiness evidence").unwrap();
@@ -8673,9 +9234,15 @@ mod tests {
             None
         );
         assert!(!snapshot_dir.join(format!("{stale_snapshot}.json")).exists());
+        assert!(!sample_order_dir
+            .join(format!("{stale_sample_order}.json"))
+            .exists());
         assert!(malformed_name.is_file());
+        assert!(malformed_order_name.is_file());
         assert!(wrong_extension.is_file());
+        assert!(wrong_order_extension.is_file());
         assert!(non_regular_name.is_dir());
+        assert!(non_regular_order_name.is_dir());
         assert!(legacy_readiness.is_file());
         assert!(legacy_snapshot.is_file());
         assert!(readiness_history.is_file());
