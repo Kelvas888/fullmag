@@ -365,6 +365,12 @@ class StartupRejectionTests(unittest.TestCase):
         for status, payload, known in [
             (400, {"code": "bad_request", "message": "unsupported model"}, True),
             (422, {"code": "validation_error", "message": "invalid model"}, True),
+            (422, {"code": "accepted_execution_plan_invalid", "message": "canonical accepted study lowering failed: shared-domain mesh missing"}, True),
+            (422, {"code": "accepted_gpu_scope_unsupported", "message": "unsupported GPU study"}, True),
+            (422, {"code": "accepted_run_commit_failed", "message": "durable store failed"}, False),
+            (422, {"code": "accepted_run_catalog_failed", "message": "catalog publication failed"}, False),
+            (422, {"code": "accepted_unknown_future_code", "message": "unknown boundary"}, False),
+            (409, {"code": "accepted_execution_plan_invalid", "message": "release conflict after admission"}, False),
             (400, {"code": "unsupported_capability", "message": "interactive=false with wait_for_solve=true"}, True),
             (422, {"code": "docker_startup_execution_policy_rejected", "message": "invalid protocol envelope"}, False),
             (500, {"code": "internal_error", "message": "service failure"}, False),

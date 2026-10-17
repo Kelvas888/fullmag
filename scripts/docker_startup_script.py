@@ -46,6 +46,12 @@ PROVENANCE_SHA256_ENV = "FULLMAG_STARTUP_PROVENANCE_SHA256"
 # execution-policy envelope is a launcher/protocol error and stays fatal.
 SCRIPT_REJECTION_CODES = frozenset({
     "bad_request", "validation_error", "unprocessable_entity", "unsupported_capability",
+    # Canonical accepted-study validation runs before durable RunIntent admission.
+    # Do not include commit/catalog/storage errors or accept an "accepted_" prefix.
+    "accepted_execution_command_unsupported", "accepted_study_plan_invalid",
+    "accepted_execution_stage_missing", "accepted_gpu_scope_unsupported",
+    "accepted_execution_plan_invalid", "accepted_backend_unsupported",
+    "accepted_study_step_unsupported", "accepted_study_step_ambiguous",
 })
 
 
