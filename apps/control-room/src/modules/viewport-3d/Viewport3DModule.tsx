@@ -30,6 +30,7 @@ import type {
   VisualizationStateResource,
 } from "@/kernel/api/apiTypes";
 import {
+  isScalarSpatialQuantityId,
   quantityUnitForColorbar,
   resolveCanonicalQuantityId,
 } from "@/kernel/api/quantityIds";
@@ -2892,7 +2893,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           </fieldset>
         ) : null}
         <Viewport3DFieldRefreshCountdown refresh={fieldRefresh} />
-        <span>{diagnostics}</span>
+        {!savedViewportActive ? <span>{diagnostics}</span> : null}
       </div>
       {clientReady && colors ? (
         <Viewport3DCanvas
@@ -3226,7 +3227,9 @@ export const Viewport3DColorbar = memo(function Viewport3DColorbar({
         )
       : legend.maxLabel;
   const targetLabel = legend.labelPrefix?.replace(/:\s*$/, "") ?? "";
-  const componentLabel = viewport3DColorbarComponentLabel(legend.colorMode);
+  const componentLabel = legend.quantityId && isScalarSpatialQuantityId(legend.quantityId)
+    ? null
+    : viewport3DColorbarComponentLabel(legend.colorMode);
   const unitLabel = effectiveDisplayUnit || legend.sourceUnit || "1";
   const rangeLabel = range ? "Rendered range" : "Loading field range";
   return (
