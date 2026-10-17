@@ -21,7 +21,7 @@ import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
   resetSharedResourceRuntimeStoreForTests,
 } from "../resources/ResourceRuntimeStore";
-import type { KernelApi } from "../types";
+import type { KernelApi, ModuleManifest } from "../types";
 
 import { LayoutController } from "./LayoutController";
 import { SHELL_COMMANDS } from "./shellCommands";
@@ -109,6 +109,41 @@ describe("WorkspaceShellClient Home entry surface", () => {
       expect(container.textContent).toContain("Home remains available");
       expect(container.textContent).not.toContain("Checking for sessions");
       expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeTruthy();
+      expect(currentStatus).not.toHaveBeenCalled();
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("keeps Home readable while the start-screen chunk is cold", async () => {
+    const coldStartScreen = new Promise<
+      Awaited<ReturnType<ModuleManifest["component"]>>
+    >(() => undefined);
+    const currentStatus = vi.fn();
+    const { container, dispose } = await mountWorkspace(
+      makeKernel(
+        vi.fn(async () => { throw new Error("session collection unavailable"); }),
+        currentStatus,
+        undefined,
+        {
+          startScreenComponent: () => coldStartScreen,
+          startScreenId: "start-screen-cold-test",
+        },
+      ),
+    );
+
+    try {
+      await settle();
+      expect(
+        findByAttribute(container, "data-state", "home-session-reconnecting"),
+      ).toBeTruthy();
+      expect(
+        findByAttribute(container, "data-start-screen-fallback", "reconnecting"),
+      ).toBeTruthy();
+      expect(container.textContent).toContain("Welcome to Fullmag");
+      expect(container.textContent).toContain("Session services are reconnecting");
+      expect(container.textContent).not.toContain("Loading…");
+      expect(findByAttribute(container, "data-command-id", "start.new-fdm")).toBeNull();
       expect(currentStatus).not.toHaveBeenCalled();
     } finally {
       await dispose();
@@ -630,13 +665,21 @@ function makeKernel(
   preparation: () => Promise<SimulationPreparationResource> = async () => {
     throw new Error("simulation preparation is not served in this test");
   },
-  options: { readonly includeStartScreen?: boolean } = {},
+  options: {
+    readonly includeStartScreen?: boolean;
+    readonly startScreenComponent?: ModuleManifest["component"];
+    readonly startScreenId?: string;
+  } = {},
 ): KernelApi {
   const bus = new EventBus<KernelEventMap>();
   const commands = new CommandRegistry();
   const modules = new ModuleRegistry();
   if (options.includeStartScreen !== false) {
-    modules.register({ ...startScreenManifest, component: async () => ({ default: StartScreen }) });
+    modules.register({
+      ...startScreenManifest,
+      id: options.startScreenId ?? startScreenManifest.id,
+      component: options.startScreenComponent ?? (async () => ({ default: StartScreen })),
+    });
   }
   modules.register({
     id: "workspace-shell-test-viewport",

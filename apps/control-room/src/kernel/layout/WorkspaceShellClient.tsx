@@ -144,6 +144,9 @@ function HomeShell({
   readonly onRetry: () => void;
 }) {
   const sessionUnavailable = state !== "no-session";
+  const startScreenFallback = (
+    <StartScreenLoadingFallback mode={sessionUnavailable ? "reconnecting" : "empty"} />
+  );
 
   return (
     <div
@@ -160,11 +163,33 @@ function HomeShell({
           <Button size="sm" type="button" variant="ghost" onClick={onRetry}>Retry</Button>
         </div>
       ) : null}
-      <SlotHost slotId="start-screen" />
+      <SlotHost loadingFallback={startScreenFallback} slotId="start-screen" />
       <div className="fm-workspace-overlay-host">
         <SlotHost slotId="overlay" />
       </div>
     </div>
+  );
+}
+
+function StartScreenLoadingFallback({
+  mode,
+}: {
+  readonly mode: "reconnecting" | "empty" | "overlay";
+}) {
+  const detail = mode === "reconnecting"
+    ? "Session services are reconnecting. Home remains available."
+    : mode === "empty"
+      ? "Start from an empty FDM or FEM problem, or open a project archive."
+      : "Home remains available while its module finishes loading.";
+  return (
+    <main
+      className="grid h-full min-h-0 place-content-center gap-2 bg-fm-app p-8 text-center text-fm-primary"
+      data-start-screen-fallback={mode}
+      id="fm-main-content"
+    >
+      <h1 className="m-0 font-fm-ui text-fm-lg font-semibold">Welcome to Fullmag</h1>
+      <p className="m-0 text-fm-secondary">{detail}</p>
+    </main>
   );
 }
 
@@ -197,7 +222,10 @@ function ActiveWorkspaceShell() {
 function HomeOverlay() {
   return (
     <div className="fm-home-overlay" data-state="home-overlay">
-      <SlotHost slotId="start-screen" />
+      <SlotHost
+        loadingFallback={<StartScreenLoadingFallback mode="overlay" />}
+        slotId="start-screen"
+      />
     </div>
   );
 }
