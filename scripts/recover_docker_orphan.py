@@ -855,13 +855,19 @@ def _manifest_observation(document: Mapping[str, Any], *, stopped: bool) -> dict
     }
 
 
-def _validate_release_pin(pins: Mapping[str, Any], resource_id: str) -> dict[str, Any]:
+def _validate_release_pin(pins: Mapping[str, Any], resource_id: str, *,
+                          stopped_replay: bool = False) -> dict[str, Any]:
     release = pins.get("device_release")
     require(isinstance(release, Mapping),
-            "explicit device_release evidence is required before target stop")
+            "explicit device mapping pin is required before target stop")
     release = dict(release)
-    require(release.get("resource_id") == resource_id and release.get("mapping_detached") is True,
-            "device_release is not bound to the exact resource")
+    require(release.get("resource_id") == resource_id,
+            "device mapping pin is not bound to the exact resource")
+    # Preserve immutable legacy pins only after the replay path independently
+    # verified the exact stopped namespace and its recorded attestation.
+    require("mapping_detached" not in release or
+            (stopped_replay and release["mapping_detached"] is True),
+            "device mapping pin cannot assert detachment before factual target exit")
     require(isinstance(release.get("mapping_sha256"), str) and
             re.fullmatch(r"[0-9a-f]{64}", release["mapping_sha256"]),
             "device_release mapping hash is invalid")
@@ -1087,11 +1093,13 @@ def _resume_existing_recovery(
             attested_after.get("device_requests_sha256") == canonical_json_sha256(
                 current_host["DeviceRequests"]),
             "teardown attestation does not bind the current stopped target")
-    pinned_release = pins.get("device_release")
+    pinned_release = _validate_release_pin(
+        pins, request["resource_id"], stopped_replay=True)
     attested_release = attestation.get("device_release")
     require(isinstance(pinned_release, Mapping) and isinstance(attested_release, Mapping) and
             attested_release.get("resource_id") == pinned_release.get("resource_id") and
             attested_release.get("mapping_sha256") == pinned_release.get("mapping_sha256") and
+            attested_release.get("gpu_uuid") == pinned_release.get("gpu_uuid") and
             attested_release.get("mapping_detached") is True,
             "teardown attestation does not bind the reviewed device release")
 
@@ -1387,7 +1395,9 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
         manifest = {
             "before": _manifest_observation(target_before, stopped=False),
             "after": _manifest_observation(target_after, stopped=True),
-            "device_release": release,
+            # This observation exists only after Docker proves the exact
+            # private namespace exited. The reviewed pin makes no future claim.
+            "device_release": {**release, "mapping_detached": True},
         }
         manifest_path = request_dir / "teardown-manifest.json"
         manifest_sha = _write_record(manifest_path, manifest)

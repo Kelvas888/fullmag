@@ -142,8 +142,7 @@ def recovery_pins():
         "receipt_sha256": "d" * 64, "package_sha256": "e" * 64,
         "read_only": True, "state": "succeeded",
         "schema": "fullmag.direct-compose.backend-build-receipt.v1"},
-        "device_release": {"resource_id": "resource-1", "mapping_sha256": "2" * 64,
-                           "mapping_detached": True}}
+        "device_release": {"resource_id": "resource-1", "mapping_sha256": "2" * 64}}
 
 
 class RecoveryRunnerTests(unittest.TestCase):
@@ -206,16 +205,17 @@ class RecoveryRunnerTests(unittest.TestCase):
             raise AssertionError(phase)
         return run
 
-    def _seed_stopped_replay(self, docker, state_root, *, complete=False):
+    def _seed_stopped_replay(self, docker, state_root, *, complete=False, pins=None):
+        pins = recovery_pins() if pins is None else pins
         request_dir = state_root / "diagnostics" / "orphan" / REQUEST
         request_dir.mkdir(parents=True)
         build_request = fake_pure()[0]
-        request = build_request(recovery_pins(), "sha256:" + "f" * 64, docker.after)
+        request = build_request(pins, "sha256:" + "f" * 64, docker.after)
         (request_dir / "request.json").write_text(
             json.dumps(request, sort_keys=True, separators=(",", ":")), encoding="utf-8")
         (request_dir / "pins-sha256.json").write_text(json.dumps({
             "schema": "fullmag.docker.orphan-pins-digest.v1",
-            "sha256": recovery._pins_digest(recovery_pins(), ""),
+            "sha256": recovery._pins_digest(pins, ""),
         }, sort_keys=True, separators=(",", ":")), encoding="utf-8")
         manifest = {"after": recovery._manifest_observation(docker.after, stopped=True)}
         manifest_path = request_dir / "teardown-manifest.json"
@@ -225,9 +225,7 @@ class RecoveryRunnerTests(unittest.TestCase):
         (request_dir / "attestation.json").write_text(json.dumps({
             "schema_version": "docker_namespace_teardown_attestation.v1",
             "request_sha256": "a" * 64, "manifest_sha256": manifest_sha,
-            "device_release": {"resource_id": "resource-1",
-                               "mapping_sha256": "2" * 64,
-                               "mapping_detached": True},
+            "device_release": {**pins["device_release"], "mapping_detached": True},
             "containers": [{
                 "container_id": docker.after["Id"], "image_id": docker.after["Image"],
                 "config_sha256": "a" * 64,
@@ -339,6 +337,39 @@ class RecoveryRunnerTests(unittest.TestCase):
         self.assertNotIn("prepare", [event[0] for event in events])
         self.assertNotIn("stop", [call[0] for call in docker.calls])
 
+    def test_detachment_is_observed_only_after_factual_target_stop(self):
+        docker = FakeDocker(target())
+        events = []
+        pins = recovery_pins()
+        pins["device_release"].pop("mapping_detached", None)
+        published = []
+        write_record = recovery._write_record
+
+        def observe_record(path, value):
+            if Path(path).name == "teardown-manifest.json":
+                self.assertTrue(docker.stopped)
+                self.assertEqual(value["after"]["state"], "exited")
+                self.assertEqual(value["after"]["pid"], 0)
+                self.assertTrue(value["device_release"]["mapping_detached"])
+                published.append(copy.deepcopy(value))
+            return write_record(path, value)
+
+        with mock.patch.object(recovery, "_write_record", side_effect=observe_record):
+            result = self._run(docker, events, pins=pins)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(published), 1)
+        self.assertNotIn("mapping_detached", pins["device_release"])
+
+    def test_future_detachment_claim_is_rejected_before_native_prepare(self):
+        docker = FakeDocker(target())
+        events = []
+        pins = recovery_pins()
+        pins["device_release"]["mapping_detached"] = True
+        with self.assertRaises(recovery.RecoveryAborted):
+            self._run(docker, events, pins=pins)
+        self.assertNotIn("prepare", [event[0] for event in events])
+        self.assertNotIn("stop", [call[0] for call in docker.calls])
+
     def test_success_has_exact_prepare_stop_complete_order(self):
         docker = FakeDocker(target())
         events = []
@@ -365,6 +396,60 @@ class RecoveryRunnerTests(unittest.TestCase):
             self._seed_stopped_replay(docker, state_root)
             result = recovery.recover_orphan(
                 recovery_pins(), target()["Id"], PROJECT, state_root / "diagnostics",
+                docker_client=docker,
+                maintenance_runner=self._runner(events, docker=docker),
+            )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([event[0] for event in events], ["complete-replay"])
+        self.assertNotIn("stop", [call[0] for call in docker.calls])
+
+    def test_replay_rejects_changed_gpu_uuid_before_native_completion(self):
+        docker = FakeDocker(target())
+        docker.stopped = True
+        events = []
+        pins = recovery_pins()
+        pins["device_release"]["gpu_uuid"] = "GPU-pinned-device"
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                recovery, "_pure_module", return_value=fake_pure()), mock.patch.object(
+                recovery, "_pure_validators", return_value=fake_validators()):
+            state_root = Path(temporary) / "state"
+            state_root.mkdir()
+            for document in (docker.before, docker.after):
+                for mount in document["Mounts"]:
+                    if mount["Destination"] == "/state":
+                        mount["Source"] = str(state_root)
+            self._seed_stopped_replay(docker, state_root, pins=pins)
+            attestation_path = state_root / "diagnostics" / "orphan" / REQUEST / "attestation.json"
+            attestation = json.loads(attestation_path.read_text())
+            attestation["device_release"]["gpu_uuid"] = "GPU-another-device"
+            attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+            with self.assertRaises(recovery.RecoveryUnknown):
+                recovery.recover_orphan(
+                    pins, target()["Id"], PROJECT, state_root / "diagnostics",
+                    docker_client=docker,
+                    maintenance_runner=self._runner(events, docker=docker),
+                )
+        self.assertEqual(events, [])
+        self.assertNotIn("stop", [call[0] for call in docker.calls])
+
+    def test_legacy_detachment_pin_replays_only_recorded_stopped_namespace(self):
+        docker = FakeDocker(target())
+        docker.stopped = True
+        events = []
+        pins = recovery_pins()
+        pins["device_release"]["mapping_detached"] = True
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                recovery, "_pure_module", return_value=fake_pure()), mock.patch.object(
+                recovery, "_pure_validators", return_value=fake_validators()):
+            state_root = Path(temporary) / "state"
+            state_root.mkdir()
+            for document in (docker.before, docker.after):
+                for mount in document["Mounts"]:
+                    if mount["Destination"] == "/state":
+                        mount["Source"] = str(state_root)
+            self._seed_stopped_replay(docker, state_root, pins=pins)
+            result = recovery.recover_orphan(
+                pins, target()["Id"], PROJECT, state_root / "diagnostics",
                 docker_client=docker,
                 maintenance_runner=self._runner(events, docker=docker),
             )
@@ -809,10 +894,9 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
             recovery._manifest_observation(stopped, stopped=True)
 
     def test_release_pin_rejects_all_zero_mapping_digest(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "cannot be all zeroes"):
             recovery._validate_release_pin({
                 "device_release": {"resource_id": "resource-1",
-                                    "mapping_detached": True,
                                     "mapping_sha256": "0" * 64}},
                 "resource-1")
 
