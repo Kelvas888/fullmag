@@ -52925,6 +52925,17 @@
         "operationId": "data_get_sessions_current_data_fields",
         "parameters": [
           {
+            "in": "query",
+            "name": "stage_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "$ref": "#/components/parameters/FullmagSessionScope"
           }
         ],
@@ -59029,6 +59040,17 @@
       "get": {
         "operationId": "data_get_sessions_current_data_quantities",
         "parameters": [
+          {
+            "in": "query",
+            "name": "stage_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           {
             "$ref": "#/components/parameters/FullmagSessionScope"
           }
