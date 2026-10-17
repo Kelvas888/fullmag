@@ -699,6 +699,12 @@ describe("viewport smoke projection round-trip", () => {
     expect(femTopologyAuditScript).toContain("drawCalls <= 0");
     expect(femTopologyAuditScript).toContain("Position upload grew with FEM part count");
     expect(femTopologyAuditScript).toContain("fem-topology-upload-metrics.json");
+    expect(femTopologyAuditScript).toContain('requestPath === "/v2/sessions/current/data/fields"');
+    expect(femTopologyAuditScript).toContain('requestPath === "/v2/sessions/current/data/quantities"');
+    expect(femTopologyAuditScript).toContain("domain_generation_id: fixture.manifest.generation_id");
+    expect(femTopologyAuditScript).toContain("await assertNoFixtureResourceFailures(page)");
+    expect(femTopologyAuditScript).toContain('text.includes("resource:load-failed")');
+    expect(femTopologyAuditScript).toContain("response.status() >= 400");
   });
 
   it("browser-proves semantic picks and keeps outer boundary under Universe", () => {

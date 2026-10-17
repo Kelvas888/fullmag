@@ -155,6 +155,7 @@ async function verifySemanticTargetExplorerInvariant({ browser, url }) {
   ]);
   const selectedNodeIds = new Set();
   const errors = [];
+  const abortedRequests = await installFixtureResourceFailureAudit(page, errors);
   await installFemFixtureApi(page, fixture);
   await page.addInitScript(({ baseUrl }) => {
     window.__FULLMAG_CONFIG__ = {
@@ -326,6 +327,7 @@ async function verifySemanticTargetExplorerInvariant({ browser, url }) {
         `Boundary Faces interaction left WebGL unrenderable: ${JSON.stringify(postInteractionWebgl)}`,
       );
     }
+    await assertNoFixtureResourceFailures(page);
     await page.screenshot({
       path: path.join(
         auditArtifactsDirectory,
@@ -344,6 +346,7 @@ async function verifySemanticTargetExplorerInvariant({ browser, url }) {
       [...selectedNodeIds].sort().join(","),
     );
     return {
+      abortedRequests,
       boundaryFacesExplorerNodeId: "model:boundary-faces",
       boundaryFacesFields,
       boundaryFacesInspectorVisible: true,
@@ -362,6 +365,7 @@ async function measureFemTopologyUploads({ browser, partCount, passConfig, url }
   const page = await browser.newPage({ viewport: { height: 900, width: 1440 } });
   const fixture = createFemTopologyFixture({ partCount, passConfig });
   const errors = [];
+  const abortedRequests = await installFixtureResourceFailureAudit(page, errors);
   await installBrowserAuditInstrumentation(page);
   await installViewportPerformanceProbe(page);
   await installFemFixtureApi(page, fixture);
@@ -405,6 +409,7 @@ async function measureFemTopologyUploads({ browser, partCount, passConfig, url }
       },
     );
     const diagnostics = await readViewportDiagnostics(page);
+    await assertNoFixtureResourceFailures(page);
     const webgl = await canvas.evaluate((element) => {
       const gl = element.getContext("webgl2") ?? element.getContext("webgl");
       return {
@@ -435,6 +440,7 @@ async function measureFemTopologyUploads({ browser, partCount, passConfig, url }
       throw new Error(`FEM browser fixture emitted errors:\n${errors.join("\n")}`);
     }
     return {
+      abortedRequests,
       expectedPositionBytes: fixture.expectedPositionBytes,
       diagnostics,
       gpu,
@@ -870,6 +876,61 @@ function makeFemTopologyBuffer(partCount) {
   return buffer;
 }
 
+async function installFixtureResourceFailureAudit(page, errors) {
+  const abortedRequests = [];
+  page.on("response", (response) => {
+    if (new URL(response.url()).pathname.startsWith("/v2/") && response.status() >= 400) {
+      errors.push(`API HTTP ${response.status()}: ${response.url()}`);
+    }
+  });
+  page.on("requestfailed", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/v2/")) {
+      const failure = request.failure()?.errorText;
+      // Resource scopes cancel obsolete reads during semantic selection.
+      if (failure === "net::ERR_ABORTED") {
+        if (abortedRequests.length < 16) abortedRequests.push(request.url());
+        return;
+      }
+      errors.push(`API request failed: ${request.url()}: ${failure}`);
+    }
+  });
+  await page.addInitScript(() => {
+    // Keep failures after a toast disappears; inspecting only the final frame
+    // could miss a broken catalog that failed earlier during startup.
+    const failures = [];
+    window.__FM_FEM_AUDIT_RESOURCE_FAILURES__ = failures;
+    new MutationObserver(() => {
+      for (const toast of document.querySelectorAll(".fm-toast")) {
+        const text = toast.textContent ?? "";
+        const title = toast.querySelector(".fm-toast__title")?.textContent;
+        const failed = title === "Resource load failed" || title === "Quantity data unavailable" || text.includes("resource:load-failed");
+        if (failed && !failures.includes(text) && failures.length < 16) {
+          failures.push(text);
+        }
+      }
+    }).observe(document, { childList: true, subtree: true, characterData: true });
+  });
+  return abortedRequests;
+}
+
+async function assertNoFixtureResourceFailures(page) {
+  await waitForCondition(
+    () => page.evaluate(() => ["fields", "quantities"].every((name) => {
+      const catalog = window.__FULLMAG_CONTROL_ROOM_AUDIT__?.readViewportAuditResource(
+        `/v2/sessions/current/data/${name}`,
+      );
+      return catalog?.status === "ready" && Array.isArray(catalog.data?.quantities) && catalog.data.quantities.length === 0;
+    })),
+    15_000,
+    "FEM fixture did not load its canonical empty field and quantity catalogs.",
+  );
+  const failures = await page.evaluate(() => window.__FM_FEM_AUDIT_RESOURCE_FAILURES__);
+  if (!Array.isArray(failures)) throw new Error("Fixture resource failure observer was not installed.");
+  if (failures.length > 0) {
+    throw new Error(`FEM fixture emitted resource-load-failed notifications:\n${failures.join("\n")}`);
+  }
+}
+
 async function installFemFixtureApi(page, fixture) {
   await page.route("**/v2/**", async (route) => {
     const request = route.request();
@@ -901,6 +962,16 @@ async function installFemFixtureApi(page, fixture) {
     }
     if (requestPath === "/v2/sessions/current/status") return fulfillJson(route, femStatusFixture());
     if (requestPath === "/v2/sessions/current/visualization/state") return fulfillJson(route, fixture.visualizationState);
+    if (requestPath === "/v2/sessions/current/data/fields") {
+      return fulfillJson(route, {
+        domain_generation_id: fixture.manifest.generation_id,
+        quantities: [],
+        revision: 1,
+      });
+    }
+    if (requestPath === "/v2/sessions/current/data/quantities") {
+      return fulfillJson(route, { quantities: [], schema_version: "2.0.0" });
+    }
     if (requestPath === "/v2/sessions/current/data/domain/meta") return fulfillJson(route, fixture.domainMeta ?? femDomainMetaFixture());
     if (requestPath === "/v2/sessions/current/data/domain/topology") return fulfillTopology(route, fixture.topology);
     if (requestPath === "/v2/sessions/current/meshing/meshes/shared-domain/manifest") return fulfillJson(route, fixture.manifest);
