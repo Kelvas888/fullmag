@@ -143,7 +143,9 @@ async fn submit_structured_command_impl_with_context(
         // Scene export may need the transition fence itself, so complete it
         // before taking the fence that spans accepted RunIntent and journal
         // publication.
-        crate::get_or_load_current_live_scene_document_for_context(&state, context).await?;
+        if !matches!(command.kind.as_str(), "remesh" | "fdm_grid_refresh") {
+            crate::get_or_load_current_live_scene_document_for_context(&state, context).await?;
+        }
         let transition_guard = state.current_live_session_transition.lock().await;
         if crate::live_accepted_execution::docker_api_only_runtime()
             && matches!(command.kind.as_str(), "remesh" | "fdm_grid_refresh")
@@ -362,6 +364,11 @@ async fn fdm_grid_refresh_rejection_reason(
     if !fdm_grid_refresh_targets_active_fdm_lane(snapshot) {
         return Ok(Some(
             "FDM grid refresh is only applicable to an FDM structured-grid session.".into(),
+        ));
+    }
+    if snapshot.scene_document.is_none() {
+        return Ok(Some(
+            "FDM grid refresh requires a materialized authoring scene.".into(),
         ));
     }
     Ok(None)
@@ -1168,7 +1175,17 @@ async fn validate_authoring_gate_for_command_with_context(
     if !should_check_mesh && !should_check_run {
         return Ok(None);
     }
-    let Some(scene) = current_authoring_gate_scene_with_context(state, context).await? else {
+    // Mesh admission must inspect only the already-materialized canonical
+    // scene. Loading a script here mutates the live snapshot before runtime
+    // admission, so a rejected paused/active remesh would no longer be
+    // side-effect free and a missing-scene FDM refresh could be admitted from
+    // an unrelated script path.
+    let scene = if should_check_mesh {
+        current_materialized_authoring_scene_with_context(state, context).await?
+    } else {
+        current_authoring_gate_scene_with_context(state, context).await?
+    };
+    let Some(scene) = scene else {
         return Ok(None);
     };
     let backend_target = GeometryBackendTarget::from_scene(&scene);
@@ -1238,6 +1255,26 @@ async fn current_authoring_gate_scene_with_context(
         Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+async fn current_materialized_authoring_scene_with_context(
+    state: &Arc<AppState>,
+    context: Option<&crate::types::CurrentLiveRequestContext>,
+) -> Result<Option<SceneDocument>, ApiError> {
+    let current = state.current_live_state.read().await;
+    let Some(snapshot) = current.as_ref() else {
+        return Err(ApiError::not_found("no active local live workspace"));
+    };
+    if let Some(context) = context {
+        crate::ensure_current_live_request_context(
+            snapshot,
+            context,
+            state
+                .current_live_session_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )?;
+    }
+    Ok(snapshot.scene_document.clone())
 }
 
 fn attach_geometry_realization_to_mesh_request(
