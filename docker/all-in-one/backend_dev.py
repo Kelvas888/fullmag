@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Direct Compose builder and server for the all-in-one backend image.
 
-The host submits either the existing immutable source archive or an attested
-compact live-source manifest.  This entrypoint materializes the selected
-contract in the image-owned build volume, synchronizes live inputs into an
-immutable shadow when requested, invokes the repository Make target with the
-complete CUDA/FEM feature set, and publishes one package receipt.  The server
-only consumes a receipt-validated package and then hands process ownership to
-the existing all-in-one entrypoint.
+Explicit prepare/build operations may receive the existing immutable source
+archive.  Development start reads the mounted readonly checkout and Git common
+directory itself, writes a closed live-source manifest in the image-owned ext4
+build volume, synchronizes those inputs into an immutable shadow, invokes the
+repository Make target with the complete CUDA/FEM feature set, and publishes
+one package receipt.  The server only consumes a receipt-validated package and
+then hands process ownership to the existing all-in-one entrypoint.
 
 This command deliberately has no public build-command option.  The source
 contract is data, never a shell script supplied by the caller, and the only
@@ -29,6 +29,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, NoReturn
 
 try:
@@ -38,6 +39,7 @@ except ImportError:  # pragma: no cover - direct backend images are Linux
 
 from backend_source import (
     BackendSourceError,
+    capture_live_source_manifest,
     extract_frozen_source,
 )
 
@@ -58,6 +60,19 @@ CAPTURE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 BUILD_ROOT = Path("/build")
 OUTPUT_ROOT = Path("/output")
 PACKAGE_ROOT = Path("/opt/fullmag/package")
+PROVENANCE_PATH = Path("/opt/fullmag/provenance.json")
+HOST_ATTESTATION_PATH = Path("/run/fullmag/windows-folder-host.json")
+WINDOWS_FOLDER_OWNER_PATH = Path("/state/.fullmag-windows-folder-owner.json")
+WINDOWS_FOLDER_HOST_SCHEMA = "fullmag.windows-folder-host.v1"
+WINDOWS_FOLDER_DEVELOPMENT_SCHEMA = "fullmag.windows-folder-development-build.v1"
+WINDOWS_FOLDER_STORAGE_PROFILE = "windows-folder-v1"
+WINDOWS_FOLDER_GATE_TIMEOUT_SECONDS = 120.0
+WINDOWS_FOLDER_GATE_POLL_SECONDS = 0.25
+PACKAGE_DEVELOPMENT_DIRNAME = ".development"
+PACKAGE_DEVELOPMENT_SCHEMA = "fullmag.direct-compose.package-development.v1"
+PACKAGE_DEVELOPMENT_OWNER = "owner.json"
+PACKAGE_CANDIDATES_DIRNAME = "candidates"
+PACKAGE_BACKUPS_DIRNAME = "backups"
 OWNER_MARKER = ".fullmag-direct-backend-owner.json"
 WORKSPACE_INVENTORY_SCHEMA = "fullmag.direct-compose.workspace-inventory.v1"
 RUNTIME_LOCK_NAME = ".fullmag-backend-runtime.lock"
@@ -288,6 +303,60 @@ def _remove_owned_tree(path: Path) -> None:
         path.unlink()
     else:
         _fail(f"owned workspace contains a special file: {path}")
+
+
+def _ensure_package_development_root(output: Path) -> Path:
+    """Create and validate the private control tree inside the package mount."""
+
+    output = _ensure_directory(output, "backend output")
+    control = output / PACKAGE_DEVELOPMENT_DIRNAME
+    _ensure_directory(control, "backend package development control directory")
+    owner = control / PACKAGE_DEVELOPMENT_OWNER
+    candidates = control / PACKAGE_CANDIDATES_DIRNAME
+    backups = control / PACKAGE_BACKUPS_DIRNAME
+    allowed = {
+        PACKAGE_DEVELOPMENT_OWNER,
+        PACKAGE_CANDIDATES_DIRNAME,
+        PACKAGE_BACKUPS_DIRNAME,
+    }
+    try:
+        entries = tuple(control.iterdir())
+    except OSError as error:
+        _fail(f"cannot inspect backend package development control directory: {error}")
+    for entry in entries:
+        if entry.name not in allowed:
+            _fail(f"backend package development control has an unknown entry: {entry.name}")
+        metadata = entry.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            _fail(f"backend package development control contains a symlink: {entry.name}")
+    if owner.exists():
+        metadata = owner.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            _fail("backend package development owner marker is not one regular file")
+        document, _ = _read_json(
+            owner, "backend package development owner marker", 16 * 1024
+        )
+        if (
+            document.get("schema") != PACKAGE_DEVELOPMENT_SCHEMA
+            or document.get("state") != "owned"
+            or document.get("package_root") != str(output)
+        ):
+            _fail("backend package development owner marker does not match this mount")
+    else:
+        if entries:
+            _fail("backend package development owner marker is missing")
+        _write_json(
+            owner,
+            {
+                "schema": PACKAGE_DEVELOPMENT_SCHEMA,
+                "state": "owned",
+                "package_root": str(output),
+            },
+            "backend package development owner marker",
+        )
+    _ensure_directory(candidates, "backend package candidate directory")
+    _ensure_directory(backups, "backend package backup directory")
+    return control
 
 
 def _prepare_workspace(build_root: Path) -> Path:
@@ -1528,6 +1597,196 @@ def _hash_package(root: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _package_children(
+    root: Path, name: str, *, exclude_development_control: bool = False
+) -> dict[str, tuple[int, int, int, int, int]]:
+    """Return package entries, excluding only the owned control directory."""
+
+    root = _absolute(root, name)
+    _ensure_directory(root, name)
+    children: dict[str, tuple[int, int, int, int, int]] = {}
+    try:
+        entries = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError as error:
+        _fail(f"cannot inspect {name}: {error}")
+    for child in entries:
+        metadata = child.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            _fail(f"{name} contains an unsafe top-level symlink: {child.name}")
+        if child.name == PACKAGE_DEVELOPMENT_DIRNAME:
+            if not exclude_development_control:
+                _fail(f"{name} contains the reserved development control directory")
+            if not stat.S_ISDIR(metadata.st_mode):
+                _fail(f"{name} development control entry is not a directory")
+            continue
+        children[child.name] = _file_signature(metadata)
+    return children
+
+
+def _validated_package(
+    root: Path, name: str, *, exclude_development_control: bool = False
+) -> tuple[dict[str, Any], bytes, dict[str, tuple[int, int, int, int, int]]]:
+    """Validate a complete package and retain its exact receipt/entry snapshot."""
+
+    receipt_path = root / "backend-build-receipt.json"
+    receipt, receipt_bytes = _read_json(receipt_path, f"{name} receipt", 8 * 1024 * 1024)
+    if receipt.get("schema") != RECEIPT_SCHEMA or receipt.get("state") != "succeeded":
+        _fail(f"{name} receipt is not a successful direct-compose receipt")
+    lanes = receipt.get("execution_lanes")
+    if not isinstance(lanes, dict) or set(lanes) != set(LANES):
+        _fail(f"{name} receipt does not attest all four execution lanes")
+    records = _hash_package(root)
+    if receipt.get("artifacts") != records:
+        _fail(f"{name} artifacts differ from its build receipt")
+    return receipt, receipt_bytes, _package_children(
+        root, name, exclude_development_control=exclude_development_control
+    )
+
+
+def _rename_package_child(source_root: Path, target_root: Path, name: str, label: str) -> None:
+    source = source_root / name
+    target = target_root / name
+    if (not source.exists() and not source.is_symlink()) or source.is_symlink():
+        _fail(f"{label} source child is missing or unsafe: {name}")
+    if target.exists() or target.is_symlink():
+        _fail(f"{label} destination child already exists: {name}")
+    try:
+        os.rename(source, target)
+    except OSError as error:
+        _fail(f"cannot atomically move {label} child {name}: {error}")
+
+
+def _rollback_package_rotation(rotation: Mapping[str, Any]) -> list[str]:
+    """Move only this rotation's children back, refusing destination overwrite."""
+
+    output = Path(str(rotation["output"]))
+    candidate = Path(str(rotation["candidate"]))
+    backup_value = rotation.get("backup")
+    backup = Path(str(backup_value)) if backup_value is not None else None
+    new_names = [str(name) for name in rotation["new_children"]]
+    old_names = [str(name) for name in rotation["old_children"]]
+    errors: list[str] = []
+    for name in reversed(new_names):
+        source = output / name
+        target = candidate / name
+        if not source.exists() and not source.is_symlink():
+            continue
+        if target.exists() or target.is_symlink():
+            errors.append(f"candidate rollback destination already exists: {name}")
+            continue
+        try:
+            os.rename(source, target)
+        except OSError as error:
+            errors.append(f"candidate rollback failed for {name}: {error}")
+    if backup is not None:
+        for name in old_names:
+            source = backup / name
+            target = output / name
+            if not source.exists() and not source.is_symlink():
+                errors.append(f"backup rollback source is missing: {name}")
+                continue
+            if target.exists() or target.is_symlink():
+                errors.append(f"old package rollback destination already exists: {name}")
+                continue
+            try:
+                os.rename(source, target)
+            except OSError as error:
+                errors.append(f"old package rollback failed for {name}: {error}")
+    return errors
+
+
+def _rotate_package(
+    output: Path,
+    candidate: Path,
+    control_root: Path,
+    previous_children: Mapping[str, tuple[int, int, int, int, int]],
+    previous_receipt_bytes: bytes | None,
+    candidate_receipt_bytes: bytes,
+) -> dict[str, Any]:
+    """Atomically replace package children while retaining the previous tree."""
+
+    output = _absolute(output, "backend output")
+    control_root = _absolute(control_root, "backend package development control directory")
+    if control_root != output / PACKAGE_DEVELOPMENT_DIRNAME:
+        _fail("backend package development control directory is not under the package mount")
+    _ensure_package_development_root(output)
+    current_children = _package_children(
+        output, "current backend package", exclude_development_control=True
+    )
+    if dict(current_children) != dict(previous_children):
+        _fail("backend package changed while its build candidate was prepared")
+    candidate_children = _package_children(candidate, "candidate backend package")
+    new_names = sorted(candidate_children)
+    if "backend-build-receipt.json" not in candidate_children:
+        _fail("candidate backend package has no build receipt")
+    ordered_new_names = [name for name in new_names if name != "backend-build-receipt.json"]
+    ordered_new_names.append("backend-build-receipt.json")
+    old_names = sorted(current_children)
+    backup: Path | None = None
+    if old_names:
+        try:
+            backup = Path(
+                tempfile.mkdtemp(
+                    prefix=".backend-package-backup-",
+                    dir=control_root / PACKAGE_BACKUPS_DIRNAME,
+                )
+            )
+        except OSError as error:
+            _fail(f"cannot create retained backend package backup: {error}")
+    rotation: dict[str, Any] = {
+        "output": str(output),
+        "candidate": str(candidate),
+        "backup": str(backup) if backup is not None else None,
+        "old_children": old_names,
+        "new_children": ordered_new_names,
+    }
+    moved_old: list[str] = []
+    moved_new: list[str] = []
+    try:
+        if backup is not None:
+            for name in old_names:
+                _rename_package_child(output, backup, name, "old package backup")
+                moved_old.append(name)
+        for name in ordered_new_names:
+            _rename_package_child(candidate, output, name, "candidate package")
+            moved_new.append(name)
+        if backup is not None:
+            _write_json(
+                backup / "rotation.json",
+                {
+                    "schema": "fullmag.direct-compose.package-rotation.v1",
+                    "state": "succeeded",
+                    "old_receipt_sha256": (
+                        _sha256_bytes(previous_receipt_bytes)
+                        if previous_receipt_bytes is not None
+                        else None
+                    ),
+                    "new_receipt_sha256": _sha256_bytes(candidate_receipt_bytes),
+                    "old_children": old_names,
+                    "new_children": ordered_new_names,
+                },
+                "backend package rotation metadata",
+            )
+        return rotation
+    except (BackendBuildError, OSError) as error:
+        rollback = {**rotation, "old_children": moved_old, "new_children": moved_new}
+        rollback_errors = _rollback_package_rotation(rollback)
+        if not rollback_errors and backup is not None:
+            try:
+                if not any(backup.iterdir()):
+                    _remove_owned_tree(backup)
+            except OSError as cleanup_error:
+                rollback_errors.append(f"empty backup cleanup failed: {cleanup_error}")
+        if rollback_errors:
+            _fail(
+                "backend package publication failed and rollback is incomplete; "
+                f"retained backup={backup}: {'; '.join(rollback_errors)}"
+            )
+        if isinstance(error, BackendBuildError):
+            raise
+        _fail(f"backend package publication failed: {error}")
+
+
 def _copy_package(workspace: Path, output: Path) -> list[dict[str, Any]]:
     source = workspace / ".fullmag" / "local"
     if source.is_symlink() or not source.is_dir():
@@ -1693,14 +1952,518 @@ def _prepare(args: argparse.Namespace) -> int:
         return _prepare_locked(args, build_root, output, jobs, toolchain)
 
 
+def _validate_start_output(output: Path, build_root: Path) -> None:
+    """Require the dev handoff to use the canonical package mount."""
+
+    output = _absolute(output, "backend output")
+    _absolute(build_root, "build root")
+    if output != PACKAGE_ROOT:
+        _fail("start output must be the canonical /opt/fullmag/package mount")
+    _ensure_directory(output, "backend output")
+
+
+def _capture_start_manifest(args: argparse.Namespace, build_root: Path) -> Path:
+    """Capture the current readonly checkout inside the trusted image."""
+
+    try:
+        return capture_live_source_manifest(
+            Path(args.source_root),
+            Path(args.git_common_root),
+            build_root,
+        )
+    except BackendSourceError as error:
+        _fail(f"current live source capture failed: {error}")
+
+
+def _publish_runtime_provenance(output: Path) -> None:
+    """Publish the source identity consumed by runtime-service before exec."""
+
+    receipt_path = output / "backend-build-receipt.json"
+    receipt, receipt_bytes = _read_json(
+        receipt_path, "backend build receipt", 8 * 1024 * 1024
+    )
+    if receipt.get("schema") != RECEIPT_SCHEMA or receipt.get("state") != "succeeded":
+        _fail("cannot publish runtime provenance from an unsuccessful build receipt")
+    source = receipt.get("source")
+    native = receipt.get("native_source_identity")
+    toolchain = receipt.get("toolchain")
+    build = receipt.get("build")
+    if not isinstance(source, dict) or not isinstance(native, dict):
+        _fail("backend build receipt has incomplete source provenance")
+    if not isinstance(toolchain, dict) or not isinstance(build, dict):
+        _fail("backend build receipt has incomplete build provenance")
+    commit = source.get("resolved_commit")
+    snapshot = native.get("source_snapshot_sha256")
+    if not isinstance(commit, str) or not GIT_OBJECT_RE.fullmatch(commit):
+        _fail("backend build receipt has no pinned source commit")
+    if not isinstance(snapshot, str) or not SHA256_RE.fullmatch(snapshot):
+        _fail("backend build receipt has no pinned source snapshot")
+    if PROVENANCE_PATH.is_symlink():
+        _fail("runtime provenance path must not be a symlink")
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, list):
+        _fail("backend build receipt has no artifact provenance")
+    binary_hashes = {
+        str(record["path"])[len("bin/"):]: record["sha256"]
+        for record in artifacts
+        if isinstance(record, dict)
+        and isinstance(record.get("path"), str)
+        and record["path"].startswith("bin/")
+        and isinstance(record.get("sha256"), str)
+    }
+    provenance: dict[str, Any] = {
+        "schema": "fullmag.docker-all-image.v1",
+        "state": "succeeded",
+        "qualification": "NOT VERIFIED",
+        "build_kind": "direct-compose",
+        "direct_source_provenance": (
+            "fullmag.docker-backend-live-source.v1"
+            if source.get("source_mode") == LIVE_SOURCE_MODE
+            else "fullmag.docker-backend-source.v1"
+        ),
+        "commit": commit,
+        "source_mode": source.get("source_mode"),
+        "source_digest": source.get("source_digest"),
+        "source_snapshot_sha256": snapshot,
+        "native_source_identity": native,
+        "native_source_identity_sha256": receipt.get("native_source_identity_sha256"),
+        "toolchain": toolchain,
+        "toolchain_image_id": toolchain.get("image_id"),
+        "cargo_profile": build.get("cargo_profile"),
+        "cargo_target_profile_dir": build.get("cargo_target_profile_dir"),
+        "package_root": str(output),
+        "binary_hashes": binary_hashes,
+        "artifacts": artifacts,
+        "execution_lanes": receipt.get("execution_lanes"),
+        "backend_build_receipt": str(receipt_path),
+        "backend_build_receipt_schema": receipt.get("schema"),
+        "build_receipt_sha256": _sha256_bytes(receipt_bytes),
+    }
+    _write_bound_json(PROVENANCE_PATH, provenance, "runtime provenance")
+
+
+def _write_bound_bytes(path: Path, data: bytes, name: str) -> None:
+    """Rewrite an explicitly mounted regular file without replacing its mount."""
+
+    path = _absolute(path, name)
+    _assert_no_links(path.parent, f"{name} parent")
+    if path.is_symlink():
+        _fail(f"{name} must not be a symlink")
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        _fail(f"cannot open mounted {name}: {error}")
+    locked = False
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            _fail(f"mounted {name} is not one regular file")
+        if fcntl is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as error:
+                _fail(f"mounted {name} is already in use: {error}")
+            locked = True
+        os.ftruncate(descriptor, 0)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                _fail(f"short write while publishing {name}")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        observed = bytearray()
+        while len(observed) <= len(data):
+            block = os.read(descriptor, min(1024 * 1024, len(data) + 1 - len(observed)))
+            if not block:
+                break
+            observed.extend(block)
+        observed_bytes = bytes(observed)
+        if _sha256_bytes(observed_bytes) != _sha256_bytes(data) or observed_bytes != data:
+            _fail(f"mounted {name} changed while publishing")
+    except OSError as error:
+        _fail(f"cannot publish mounted {name}: {error}")
+    finally:
+        if locked:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(descriptor)
+
+
+def _write_bound_json(path: Path, value: Mapping[str, Any], name: str) -> None:
+    _write_bound_bytes(path, _canonical(value), name)
+
+
+def _snapshot_bound_provenance() -> bytes | None:
+    """Read the prior bound bytes, tolerating only a genuinely absent file."""
+
+    if PROVENANCE_PATH.is_symlink():
+        _fail("runtime provenance path must not be a symlink")
+    try:
+        return _read_regular(PROVENANCE_PATH, "previous runtime provenance", MAX_MANIFEST_BYTES)[0]
+    except BackendBuildError:
+        if PROVENANCE_PATH.exists():
+            raise
+        return None
+
+
+def _restore_bound_provenance(data: bytes) -> None:
+    _write_bound_bytes(PROVENANCE_PATH, data, "runtime provenance rollback")
+
+
+def _start(args: argparse.Namespace) -> int:
+    """Build and hand off to the API in this same backend container."""
+
+    build_root = _absolute(Path(args.build_root), "build root")
+    output = _absolute(Path(args.output), "backend output")
+    jobs = int(args.jobs)
+    if jobs < 1 or jobs > 64:
+        _fail("jobs must be between 1 and 64")
+    cargo_profile = _validate_cargo_profile(
+        os.environ.get("FULLMAG_BACKEND_CARGO_PROFILE", BACKEND_CARGO_PROFILE)
+    )
+    if cargo_profile != BACKEND_CARGO_PROFILE:
+        _fail("start is reserved for the backend-dev profile; use prepare/build for release")
+    _validate_start_output(output, build_root)
+    candidate: Path | None = None
+    rotation: dict[str, Any] | None = None
+    rollback_failed = False
+    provenance_before: bytes | None = None
+    provenance_publish_started = False
+    # Keep the lock across package verification and the exec handoff.  The
+    # descriptor is O_CLOEXEC, so the API process does not inherit a stale
+    # build lock after execvpe.  A failed build therefore cannot start API.
+    with _runtime_build_lock(build_root):
+        try:
+            control_root = _ensure_package_development_root(output)
+            previous_receipt: tuple[dict[str, Any], bytes, dict[str, tuple[int, int, int, int, int]]] | None
+            existing_children = _package_children(
+                output,
+                "existing backend package",
+                exclude_development_control=True,
+            )
+            if existing_children:
+                previous_receipt = _validated_package(
+                    output,
+                    "existing backend package",
+                    exclude_development_control=True,
+                )
+            else:
+                previous_receipt = None
+            _, toolchain = _toolchain_identity()
+            start_args = argparse.Namespace(**vars(args))
+            start_args.manifest = _capture_start_manifest(args, build_root)
+            start_args.source_tar = None
+            candidate = Path(
+                tempfile.mkdtemp(
+                    prefix=".backend-package-candidate-",
+                    dir=control_root / PACKAGE_CANDIDATES_DIRNAME,
+                )
+            )
+            result = _prepare_locked(start_args, build_root, candidate, jobs, toolchain)
+            if result != 0:
+                _fail(f"backend preparation failed with exit code {result}")
+            _candidate_receipt, candidate_receipt_bytes, _candidate_children = _validated_package(
+                candidate, "candidate backend package"
+            )
+            if previous_receipt is not None:
+                _validated_package(
+                    output,
+                    "existing backend package",
+                    exclude_development_control=True,
+                )
+            previous_children = previous_receipt[2] if previous_receipt is not None else {}
+            previous_receipt_bytes = previous_receipt[1] if previous_receipt is not None else None
+            rotation = _rotate_package(
+                output,
+                candidate,
+                control_root,
+                previous_children,
+                previous_receipt_bytes,
+                candidate_receipt_bytes,
+            )
+            provenance_before = _snapshot_bound_provenance()
+            provenance_publish_started = True
+            _publish_runtime_provenance(output)
+            _remove_owned_tree(candidate)
+            candidate = None
+        except (BackendBuildError, OSError) as error:
+            rollback_errors: list[str] = []
+            if provenance_publish_started:
+                if provenance_before is None:
+                    rollback_errors.append(
+                        "previous runtime provenance bytes were unavailable; outcome is unknown"
+                    )
+                else:
+                    try:
+                        _restore_bound_provenance(provenance_before)
+                    except (BackendBuildError, OSError) as restore_error:
+                        rollback_errors.append(
+                            f"runtime provenance rollback failed: {restore_error}"
+                        )
+            if rotation is not None:
+                rollback_errors.extend(_rollback_package_rotation(rotation))
+                if rollback_errors:
+                    rollback_failed = True
+                    _fail(
+                        "backend publication failed and rollback is incomplete; "
+                        f"retained backup={rotation.get('backup')}: {'; '.join(rollback_errors)}; "
+                        f"original error: {error}"
+                    )
+            raise
+        finally:
+            if candidate is not None and candidate.exists() and not rollback_failed:
+                _remove_owned_tree(candidate)
+        return _serve([])
+
+
+def _read_optional_storage_attestation(path: Path, name: str) -> dict[str, Any] | None:
+    """Read one host-owned certificate, treating only an absent/partial write as pending."""
+
+    path = _absolute(path, name)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        _fail(f"cannot inspect {name}: {error}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        _fail(f"{name} is not one regular file")
+    if metadata.st_size == 0:
+        return None
+    try:
+        value, _ = _read_json(path, name, 1024 * 1024)
+    except BackendBuildError as error:
+        # The host writer updates this bound file in place.  A read racing its
+        # truncate/write window is retryable; a parsed identity conflict below
+        # remains fail-closed.
+        if "not valid JSON" in str(error):
+            return None
+        raise
+    return value
+
+
+def _validate_development_source_identity(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {
+        "commit",
+        "source_digest",
+        "source_snapshot_sha256",
+        "native_source_identity_sha256",
+    }:
+        _fail("Windows-folder development source identity fields are invalid")
+    source_identity = dict(value)
+    if not isinstance(source_identity["commit"], str) or not GIT_OBJECT_RE.fullmatch(
+        source_identity["commit"]
+    ):
+        _fail("runtime provenance has no valid development source commit")
+    for field in ("source_digest", "source_snapshot_sha256", "native_source_identity_sha256"):
+        value = source_identity[field]
+        if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+            _fail(f"runtime provenance has no valid development source identity: {field}")
+    return source_identity  # type: ignore[return-value]
+
+
+def _development_refresh_publication_pending(
+    host: Mapping[str, Any], owner: Mapping[str, Any]
+) -> bool:
+    """Recognize the bounded bootstrap-to-live audit publication window."""
+
+    if (
+        host.get("restart_verified") is not False
+        or owner.get("restart_verified") is not False
+    ):
+        return False
+    for document in (host, owner):
+        if (
+            document.get("schema") != WINDOWS_FOLDER_HOST_SCHEMA
+            or document.get("storage_profile") != WINDOWS_FOLDER_STORAGE_PROFILE
+            or document.get("role") != "session"
+            or document.get("owner_scope") != "docker-desktop-linux"
+        ):
+            return False
+    image_id = os.environ.get("FULLMAG_RUNTIME_IMAGE_ID", "")
+    if (
+        not IMAGE_RE.fullmatch(image_id)
+        or host.get("image_id") != image_id
+        or owner.get("image_id") != image_id
+        or host.get("owner_token") != owner.get("owner_token")
+        or not isinstance(host.get("owner_token"), str)
+        or not host["owner_token"]
+    ):
+        return False
+
+    required_delegation = {
+        "schema",
+        "cargo_profile",
+        "toolchain_image_id",
+        "package_root",
+        "provenance_path",
+        "group_identity",
+        "source_identity",
+    }
+    toolchain = os.environ.get("FULLMAG_TOOLCHAIN_IMAGE_ID", "")
+    group_identity = os.environ.get("FULLMAG_COMPOSE_PROJECT", "")
+    normalized: list[dict[str, Any]] = []
+    for document in (host, owner):
+        # The audit fields must exist in both records; their values are the
+        # only fields allowed to change during this publication window.
+        if any(field not in document for field in (
+            "source_commit", "binary_hashes", "artifact_receipt_sha256"
+        )):
+            return False
+        delegation = document.get("development_build")
+        if not isinstance(delegation, dict) or set(delegation) != required_delegation:
+            return False
+        if (
+            delegation.get("schema") != WINDOWS_FOLDER_DEVELOPMENT_SCHEMA
+            or delegation.get("cargo_profile") != BACKEND_CARGO_PROFILE
+            or not IMAGE_RE.fullmatch(toolchain)
+            or delegation.get("toolchain_image_id") != toolchain
+            or delegation.get("package_root") != str(PACKAGE_ROOT)
+            or delegation.get("provenance_path") != str(PROVENANCE_PATH)
+            or not group_identity
+            or delegation.get("group_identity") != group_identity
+        ):
+            return False
+        _validate_development_source_identity(delegation.get("source_identity"))
+        stable = dict(document)
+        for field in ("source_commit", "binary_hashes", "artifact_receipt_sha256"):
+            stable.pop(field, None)
+        stable_delegation = dict(delegation)
+        stable_delegation.pop("source_identity")
+        stable["development_build"] = stable_delegation
+        normalized.append(stable)
+    return normalized[0] == normalized[1]
+
+
+def _validate_windows_folder_attestation(
+    host: Mapping[str, Any] | None,
+    owner: Mapping[str, Any] | None,
+    provenance: Mapping[str, Any],
+    receipt_sha256: str,
+) -> str:
+    """Return ``ready``/``pending`` or fail on a conflicting host identity."""
+
+    if host is None or owner is None:
+        return "pending"
+    if host != owner:
+        if _development_refresh_publication_pending(host, owner):
+            return "pending"
+        host_without_restart = {
+            key: value for key, value in host.items() if key != "restart_verified"
+        }
+        owner_without_restart = {
+            key: value for key, value in owner.items() if key != "restart_verified"
+        }
+        if (
+            host_without_restart == owner_without_restart
+            and isinstance(host.get("restart_verified"), bool)
+            and isinstance(owner.get("restart_verified"), bool)
+        ):
+            return "pending"
+        _fail("Windows-folder host certificate and owner marker differ")
+    if host.get("schema") != WINDOWS_FOLDER_HOST_SCHEMA:
+        _fail("Windows-folder host attestation schema is unsupported")
+    if (
+        host.get("storage_profile") != WINDOWS_FOLDER_STORAGE_PROFILE
+        or host.get("role") != "session"
+        or host.get("owner_scope") != "docker-desktop-linux"
+    ):
+        _fail("Windows-folder host attestation scope is invalid")
+    image_id = os.environ.get("FULLMAG_RUNTIME_IMAGE_ID", "")
+    if not IMAGE_RE.fullmatch(image_id) or host.get("image_id") != image_id:
+        _fail("Windows-folder host image identity differs from the running image")
+    owner_token = host.get("owner_token")
+    if not isinstance(owner_token, str) or not owner_token:
+        _fail("Windows-folder host attestation has no owner token")
+    if host.get("restart_verified") is not True:
+        return "pending"
+
+    delegation = host.get("development_build")
+    if delegation is None:
+        if host.get("source_commit") != provenance.get("commit"):
+            _fail("Windows-folder host source identity differs from runtime provenance")
+        if host.get("binary_hashes") != provenance.get("binary_hashes"):
+            _fail("Windows-folder host binary identity differs from runtime provenance")
+        if host.get("artifact_receipt_sha256") != receipt_sha256:
+            _fail("Windows-folder host receipt identity differs from the package")
+        return "ready"
+    if not isinstance(delegation, dict):
+        _fail("Windows-folder development delegation is malformed")
+    required = {
+        "schema",
+        "cargo_profile",
+        "toolchain_image_id",
+        "package_root",
+        "provenance_path",
+        "group_identity",
+        "source_identity",
+    }
+    if set(delegation) != required or delegation.get("schema") != WINDOWS_FOLDER_DEVELOPMENT_SCHEMA:
+        _fail("Windows-folder development delegation fields are invalid")
+    if delegation.get("cargo_profile") != BACKEND_CARGO_PROFILE:
+        _fail("Windows-folder development delegation has an invalid Cargo profile")
+    toolchain = os.environ.get("FULLMAG_TOOLCHAIN_IMAGE_ID", "")
+    if not IMAGE_RE.fullmatch(toolchain) or delegation.get("toolchain_image_id") != toolchain:
+        _fail("Windows-folder development delegation toolchain identity differs")
+    group_identity = os.environ.get("FULLMAG_COMPOSE_PROJECT", "")
+    if (
+        delegation.get("package_root") != str(PACKAGE_ROOT)
+        or delegation.get("provenance_path") != str(PROVENANCE_PATH)
+        or not group_identity
+        or delegation.get("group_identity") != group_identity
+    ):
+        _fail("Windows-folder development delegation is bound to another package or group")
+    _validate_development_source_identity(delegation.get("source_identity"))
+    if provenance.get("schema") != "fullmag.docker-all-image.v1" or provenance.get("state") != "succeeded":
+        _fail("runtime provenance is not a succeeded development build")
+    if provenance.get("cargo_profile") != BACKEND_CARGO_PROFILE:
+        _fail("runtime provenance has an invalid development Cargo profile")
+    if provenance.get("toolchain_image_id") != toolchain:
+        _fail("runtime provenance toolchain identity differs from the delegation")
+    if provenance.get("package_root") != str(PACKAGE_ROOT):
+        _fail("runtime provenance package root differs from the delegation")
+    return "ready"
+
+
+def _wait_for_windows_folder_attestation(
+    provenance: Mapping[str, Any], receipt_sha256: str
+) -> None:
+    """Wait for the host writer's matching cert before handing off to entrypoint."""
+
+    deadline = time.monotonic() + WINDOWS_FOLDER_GATE_TIMEOUT_SECONDS
+    while True:
+        host = _read_optional_storage_attestation(HOST_ATTESTATION_PATH, "Windows-folder host attestation")
+        owner = _read_optional_storage_attestation(WINDOWS_FOLDER_OWNER_PATH, "Windows-folder owner marker")
+        if _validate_windows_folder_attestation(host, owner, provenance, receipt_sha256) == "ready":
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _fail(
+                "timed out waiting for a matching Windows-folder host attestation "
+                f"after {WINDOWS_FOLDER_GATE_TIMEOUT_SECONDS:g} seconds"
+            )
+        time.sleep(min(WINDOWS_FOLDER_GATE_POLL_SECONDS, remaining))
+
+
 def _serve(extra: list[str]) -> int:
     if os.environ.get("FULLMAG_DOCKER_ROLE") == "frontend":
         environment = dict(os.environ)
         command = [sys.executable, "/opt/fullmag/entrypoint.py", *extra]
         os.execvpe(sys.executable, command, environment)
         return 0
+    if extra == ["--storage-probe"]:
+        environment = dict(os.environ)
+        environment["FULLMAG_DOCKER_ROLE"] = "backend"
+        command = [sys.executable, "/opt/fullmag/entrypoint.py", *extra]
+        os.execvpe(sys.executable, command, environment)
+        return 0
     receipt_path = PACKAGE_ROOT / "backend-build-receipt.json"
-    receipt, _ = _read_json(receipt_path, "backend build receipt", 8 * 1024 * 1024)
+    receipt, receipt_bytes = _read_json(receipt_path, "backend build receipt", 8 * 1024 * 1024)
     if receipt.get("schema") != RECEIPT_SCHEMA or receipt.get("state") != "succeeded":
         _fail("runtime package receipt is not a successful direct-compose receipt")
     lanes = receipt.get("execution_lanes")
@@ -1709,12 +2472,17 @@ def _serve(extra: list[str]) -> int:
     actual_artifacts = _hash_package(PACKAGE_ROOT)
     if receipt.get("artifacts") != actual_artifacts:
         _fail("runtime package artifacts differ from the build receipt")
+    receipt_sha256 = _sha256_bytes(receipt_bytes)
+    if os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == WINDOWS_FOLDER_STORAGE_PROFILE:
+        provenance, _ = _read_json(PROVENANCE_PATH, "runtime provenance", 8 * 1024 * 1024)
+        _wait_for_windows_folder_attestation(provenance, receipt_sha256)
     environment = dict(os.environ)
     environment.update(
         {
             "FULLMAG_DOCKER_ROLE": "backend",
             "FULLMAG_RUNTIME_ROOT": str(PACKAGE_ROOT),
             "FULLMAG_RUNTIME_PACKAGE_ROOT": str(PACKAGE_ROOT),
+            "FULLMAG_PACKAGE_PROVENANCE": "/opt/fullmag/provenance.json",
             "FULLMAG_WEB_STATIC_DIR": str(PACKAGE_ROOT / "web"),
             "PATH": f"{PACKAGE_ROOT / 'bin'}:/opt/fullmag-deps/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin",
         }
@@ -1740,6 +2508,24 @@ def _parser() -> argparse.ArgumentParser:
         subparser.add_argument("--output", default=OUTPUT_ROOT, type=Path)
         subparser.add_argument("--build-root", default=BUILD_ROOT, type=Path)
         subparser.add_argument("--jobs", default=int(os.environ.get("CARGO_BUILD_JOBS", "2")), type=int)
+    start = subparsers.add_parser(
+        "start", help="build and serve the receipt-validated package in this container"
+    )
+    start.add_argument("--source-tar", type=Path)
+    # Dev ``start`` captures the currently mounted checkout inside the trusted
+    # image.  The optional path is retained as a bootstrap compatibility
+    # argument for older Compose metadata; it is never the restart source of
+    # truth.  Archive ``prepare``/``build`` keep their required manifest.
+    start.add_argument("--manifest", type=Path)
+    start.add_argument("--source-root", default=Path("/opt/fullmag/source"), type=Path)
+    start.add_argument(
+        "--git-common-root",
+        default=Path(os.environ.get("FULLMAG_SOURCE_GIT_COMMON", "/opt/fullmag/source-git")),
+        type=Path,
+    )
+    start.add_argument("--output", default=PACKAGE_ROOT, type=Path)
+    start.add_argument("--build-root", default=BUILD_ROOT, type=Path)
+    start.add_argument("--jobs", default=int(os.environ.get("CARGO_BUILD_JOBS", "2")), type=int)
     subparsers.add_parser("serve", help="serve the receipt-validated package")
     return parser
 
@@ -1752,6 +2538,10 @@ def main(argv: list[str] | None = None) -> int:
             if extra:
                 parser.error(f"unexpected arguments for {args.operation}: {' '.join(extra)}")
             return _prepare(args)
+        if args.operation == "start":
+            if extra:
+                parser.error(f"unexpected arguments for start: {' '.join(extra)}")
+            return _start(args)
         return _serve(extra)
     except BackendBuildError as error:
         print(f"backend-dev: {error}", file=sys.stderr)

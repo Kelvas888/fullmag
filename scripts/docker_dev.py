@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
-"""Start Fullmag's direct, two-container Docker development workspace.
+"""Start Fullmag's direct, fixed two-container Docker development workspace.
 
-The launcher has two deliberately separate phases:
+``up`` prepares one registered Windows checkout, starts the persistent backend
+service and frontend service, and waits for the backend service to publish its
+receipt-validated package and runtime provenance.  The backend compiles inside
+that same long-lived service; no host package transfer or one-shot backend
+container is used.  ``build`` is an explicit alias for this service-owned
+build gate and leaves both services running so the receipt remains observable.
 
-``build``
-    Selects one registered Windows checkout, records a compact live manifest
-    for the dev profile (or an immutable archive for release/frozen input),
-    runs the four-lane backend build in a Compose build container, and records
-    a development assembly receipt.
-
-``up``
-    Performs ``build`` and hands the resulting receipt to the existing runtime
-    launcher.  The runtime launcher owns Windows storage attestation, the
-    frontend cache, host ledger, startup-script admission, and the final
-    Compose start.  No managed Fullmag_build_runner job is submitted here.
-
-The source checkout itself remains the live, read-only bind used by the
-runtime containers.  Only the backend compilation consumes the immutable
-archive created for that build.  Frontend edits therefore remain HMR-driven;
-backend edits require another ``build`` or ``up`` invocation.
+The existing runtime launcher still owns Windows storage attestation, the
+frontend cache, host ledger, startup-script admission, and final Compose
+readiness.  The canonical Windows heavy-build lease covers only preparation
+of the image, toolchain, cache, and backend-start receipt.  The long-lived
+backend service owns its compile after that lease is released.  Frontend edits
+remain HMR-driven; an ordinary restart of the fixed backend service re-observes
+the live readonly source and rebuilds incrementally without a host ``up`` or
+``build`` invocation.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -49,6 +47,7 @@ TOOLCHAIN_MANIFEST_SCHEMA = "fullmag.docker.fem-gpu-dependencies.v1"
 DEVELOPMENT_BASE_CONTEXT_SCHEMA = "fullmag.direct-compose.development-base-context.v1"
 DEVELOPMENT_IMAGE_SCHEMA = "fullmag.direct-compose.development-image.v1"
 RUNTIME_IMAGE_CONTEXT_SCHEMA = "fullmag.direct-compose.runtime-image-context.v1"
+BACKEND_START_INPUTS_SCHEMA = "fullmag.direct-compose.backend-start-inputs.v1"
 BASE_CONTEXT_FILES = (
     ("Dockerfile.dev", "docker/all-in-one/Dockerfile.dev"),
     ("entrypoint.py", "docker/all-in-one/entrypoint.py"),
@@ -87,6 +86,7 @@ class DirectDockerError(RuntimeError):
 
 class DirectDockerOutcomeUnknown(DirectDockerError):
     """The Docker client timed out while the daemon may still own resources."""
+
 
 
 def _fail(message: str) -> DirectDockerError:
@@ -154,7 +154,13 @@ def _docker_capture(*arguments: object, timeout: int = 60,
 
 def _docker_live(log_path: Path, *arguments: object, timeout: int,
                  environment: Mapping[str, str] | None = None) -> None:
-    """Run a mutating Docker command while teeing compiler output to host storage."""
+    """Run a mutating Docker command while teeing compiler output.
+
+    Once Docker owns a mutating build, a host-side timeout or interrupt is not
+    evidence that the daemon stopped.  Continue draining the client until its
+    terminal exit so the caller keeps the heavy lease for the real operation;
+    no fallback or retry is launched from this path.
+    """
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command = _docker_argv(arguments)
@@ -171,36 +177,41 @@ def _docker_live(log_path: Path, *arguments: object, timeout: int,
         raise _fail(f"cannot start Docker client: {error}") from error
 
     deadline = time.monotonic() + timeout
+    warned = False
+    interrupted = False
     try:
         with log_path.open("w", encoding="utf-8", newline="") as log:
             assert process.stdout is not None
-            for line in process.stdout:
+            while True:
+                try:
+                    line = process.stdout.readline()
+                except KeyboardInterrupt:
+                    interrupted = True
+                    continue
+                if not line:
+                    break
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 log.write(line)
                 log.flush()
-                if time.monotonic() > deadline:
-                    raise subprocess.TimeoutExpired(command, timeout)
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            exit_code = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as error:
-            raise DirectDockerOutcomeUnknown(
-                f"Docker client timed out after {timeout}s; daemon ownership is unknown: "
-                + " ".join(command)
-            ) from error
-    except subprocess.TimeoutExpired as error:
-        # Do not issue a second Docker mutation after an unconfirmed timeout.
-        # Releasing only this client leaves the daemon-owned build/container for
-        # inspection and keeps the run root as evidence.
-        try:
-            process.kill()
-        except OSError:
-            pass
-        raise DirectDockerOutcomeUnknown(
-            f"Docker client timed out after {timeout}s; daemon ownership is unknown: "
-            + " ".join(command)
-        ) from error
+                if not warned and time.monotonic() > deadline:
+                    warned = True
+                    print(
+                        "[docker-dev] Docker build exceeded its observation budget; "
+                        "waiting for terminal client exit before releasing the heavy lease",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        while True:
+            try:
+                exit_code = process.wait()
+                break
+            except KeyboardInterrupt:
+                interrupted = True
+    except OSError as error:
+        raise _fail(f"Docker client failed while streaming build output: {error}") from error
+    if interrupted:
+        raise KeyboardInterrupt
     if exit_code:
         raise _fail(f"Docker command failed with exit code {exit_code}; see {log_path}")
 
@@ -644,7 +655,13 @@ def _ensure_development_base(args: argparse.Namespace, repo: Path,
     # bootstrap receipt.  This also covers the case where that image happens
     # to be an older source-bind development base: the current Dockerfile and
     # helper context must still be copied into a newly derived image.
-    toolchain_base = f"fullmag/direct-toolchain:{run_root.name}"
+    # Keep the temporary tag inside the selected checkout's Compose group.  A
+    # fixed global ``fullmag/direct-toolchain`` tag would let two registered
+    # worktrees overwrite each other's bootstrap alias while Docker still
+    # owns the build.
+    compose_identity = _compose_identity(layout)
+    compose_project = compose_identity["project_name"]
+    toolchain_base = f"fullmag/{compose_project}-direct-toolchain:{run_root.name}"
     _docker_capture("tag", toolchain_id, toolchain_base, timeout=60)
     aliased_id, _aliased_document = _inspect_image(toolchain_base)
     if aliased_id != toolchain_id:
@@ -725,6 +742,22 @@ def _select_source(repo: Path, source_root: Path | None) -> tuple[Path, dict[str
     layout = resolve_layout(selected, STORAGE_PROFILE)
     initialize(layout)
     return selected, layout
+
+
+def _source_git_common_directory(selected: Path) -> Path:
+    """Resolve only the Git common directory needed for the readonly bind.
+
+    Source bytes and dirty state are intentionally not captured on the host.
+    ``backend_dev start`` observes the mounted checkout inside its trusted
+    container immediately before building.
+    """
+
+    from docker_backend_inputs import _git_common_directory
+
+    try:
+        return _git_common_directory(selected)
+    except Exception as error:
+        raise _fail(f"selected checkout Git common directory is unavailable: {error}") from error
 
 
 def _compose_identity(layout: Mapping[str, object]) -> dict[str, str]:
@@ -1065,12 +1098,52 @@ def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: s
     return dict(profile)
 
 
+def _backend_cache_package_root(cache: Mapping[str, object]) -> PurePosixPath:
+    """Return the helper-attested ext4 package directory for the backend.
+
+    The backend cache helper owns this directory and creates it with the
+    container UID before Compose is evaluated.  The host launcher must pass
+    that exact typed path through unchanged; deriving a sibling under the
+    Windows run root would silently put the package outside the persistent
+    cache and break the fixed-container contract.
+    """
+
+    package_value = cache.get("package_root")
+    mount_value = cache.get("mount_root")
+    environment = cache.get("environment")
+    if not isinstance(package_value, str):
+        raise _fail("backend cache did not return an absolute package_root")
+    if not isinstance(mount_value, str):
+        raise _fail("backend cache did not return an absolute mount_root")
+    try:
+        package = PurePosixPath(package_value)
+        mount = PurePosixPath(mount_value)
+    except (TypeError, ValueError) as error:
+        raise _fail("backend cache paths are malformed") from error
+    if (not package.is_absolute() or not mount.is_absolute()
+            or any(part in {"", ".", ".."} for part in package.parts[1:])
+            or any(part in {"", ".", ".."} for part in mount.parts[1:])):
+        raise _fail("backend cache did not return safe absolute daemon paths")
+    if not isinstance(environment, Mapping):
+        raise _fail("backend cache did not return its resolved environment")
+    if environment.get("FULLMAG_BACKEND_PACKAGE") != package_value:
+        raise _fail("backend cache package environment differs from package_root")
+    try:
+        relative = package.relative_to(mount)
+    except ValueError as error:
+        raise _fail("backend cache package_root escapes its attested mount_root") from error
+    if relative != PurePosixPath("package"):
+        raise _fail("backend cache package_root is not its attested package child")
+    return package
+
+
 def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
                  source_bundle: Mapping[str, object], package: Path, image_ref: str,
                  image_id: str, toolchain_id: str, cache: Mapping[str, object],
                  base_reference: str, cargo_profile: str) -> dict[str, str]:
     cargo_profile = _validate_cargo_profile(cargo_profile)
-    manifest = Path(str(source_bundle["manifest_path"]))
+    manifest_value = source_bundle.get("manifest_path")
+    manifest = Path(str(manifest_value)) if manifest_value is not None else None
     source_mode = str(source_bundle.get("source_mode", "archive"))
     if source_mode not in {"archive", "commit", "snapshot", "live-shadow-v1"}:
         raise _fail(f"unsupported backend source mode: {source_mode}")
@@ -1079,7 +1152,6 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
     (run_root / "host-certificate.json").touch(exist_ok=True)
     (run_root / "provenance.json").touch(exist_ok=True)
     (run_root / "development-inputs.json").touch(exist_ok=True)
-    package.mkdir(exist_ok=True)
     compose_project = _compose_identity(layout)["project_name"]
     workspace_state_root = _workspace_state_root(layout, compose_project)
     build_state_root = _backend_build_state_root(layout, run_root)
@@ -1092,7 +1164,6 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
         "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_id,
         "FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile,
         "FULLMAG_SOURCE_ROOT": str(selected),
-        "FULLMAG_BACKEND_SOURCE_MANIFEST": str(manifest),
         "FULLMAG_BACKEND_PACKAGE": str(package),
         "FULLMAG_DEVELOPMENT_BASE_IMAGE": base_reference,
         "FULLMAG_STATE_ROOT": str(state),
@@ -1116,7 +1187,6 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
     # Keep the source/package identities after the helper environment so the
     # backend-build overlay cannot accidentally inherit a stale host setting.
     environment.update({
-        "FULLMAG_BACKEND_SOURCE_MANIFEST": str(manifest),
         "FULLMAG_BACKEND_PACKAGE": str(package),
         "FULLMAG_SOURCE_ROOT": str(selected),
         "FULLMAG_RUNTIME_IMAGE_ID": image_id,
@@ -1127,6 +1197,8 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
         "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
         "FULLMAG_BACKEND_BUILD_STATE_ROOT": str(build_state_root),
     })
+    if manifest is not None:
+        environment["FULLMAG_BACKEND_SOURCE_MANIFEST"] = str(manifest)
     if source_mode != "live-shadow-v1":
         environment["FULLMAG_BACKEND_SOURCE_TAR"] = str(source_bundle["archive_path"])
     else:
@@ -1506,102 +1578,179 @@ def _frozen_source_bundle(manifest_path: Path, layout: Mapping[str, object], sel
         raise _fail(f"Cannot resume frozen backend inputs: {error}") from error
 
 
-def build(args: argparse.Namespace) -> Path:
+def _publish_backend_start_manifest(source_manifest: Path, destination: Path) -> str:
+    """Publish the mutable run-owned manifest mount used by backend start.
+
+    The capture remains immutable evidence under the build storage root.  A
+    stable run-owned copy is mounted by Compose so a controlled backend restart
+    can publish a new observation after the old service has drained without
+    changing the container's mount target or command.  Once the single-file
+    bind mount exists, update its inode in place: ``os.replace`` would leave a
+    running Linux container attached to the old inode.
+    """
+
+    if source_manifest.is_symlink() or not source_manifest.is_file():
+        raise _fail(f"backend source manifest is not a regular file: {source_manifest}")
+    data = source_manifest.read_bytes()
+    if not data or len(data) > 64 * 1024 * 1024:
+        raise _fail("backend source manifest is empty or oversized")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_file():
+            raise _fail(f"published backend source manifest is not a regular file: {destination}")
+        try:
+            # The run-owned copy is read-only between observations.  Relax
+            # only this file for the bounded writer, then restore the mode
+            # before the next Compose publication.
+            try:
+                destination.chmod(0o600)
+            except OSError:
+                pass
+            try:
+                with destination.open("r+b") as stream:
+                    stream.seek(0)
+                    stream.truncate(0)
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            finally:
+                try:
+                    destination.chmod(0o444)
+                except OSError:
+                    pass
+        except OSError as error:
+            raise _fail(f"cannot update published backend source manifest in place: {error}") from error
+    else:
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_bytes(data)
+            try:
+                temporary.chmod(0o444)
+            except OSError:
+                pass
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    if _sha256_file(destination, "published backend source manifest") != _sha256_bytes(data):
+        raise _fail("published backend source manifest changed during publication")
+    return str(destination)
+
+
+def _backend_start_inputs(
+    args: argparse.Namespace,
+    *,
+    run_root: Path | None = None,
+    run_id: str | None = None,
+    heavy_lock_held: bool = False,
+) -> tuple[dict[str, object], Path]:
+    """Prepare only the inputs for the fixed backend service.
+
+    This phase may build/admit the Docker runtime image and prepare its
+    persistent cache, but it never invokes a backend one-shot container or
+    captures source bytes.  The backend service receives only readonly source
+    and Git binds and performs the fresh source observation/package build in
+    its own long-lived container via ``backend_dev start``.
+    """
+
     _require_native_windows()
     build_profile = getattr(args, "profile", DEFAULT_BUILD_PROFILE)
+    if build_profile != DEFAULT_BUILD_PROFILE:
+        raise _fail(
+            "docker-dev uses the backend-dev profile; release packages use the managed image route"
+        )
+    if getattr(args, "source_manifest", None) is not None:
+        raise _fail(
+            "--source-manifest is unsupported by docker-dev's live source service; "
+            "use the managed frozen-input route for an immutable source manifest"
+        )
+    if getattr(args, "include_untracked", None):
+        raise _fail(
+            "--include-untracked is unsupported by docker-dev's live source service; "
+            "add new source files to the selected Git index before starting the service"
+        )
     cargo_profile = _cargo_profile_for_build(build_profile)
     repo = Path(args.repo_root).resolve(strict=True)
-    selected, layout = _select_source(repo, args.source_root)
+    selected, layout = _select_source(repo, getattr(args, "source_root", None))
     compose_project = _compose_identity(layout)["project_name"]
-    run_id, run_root = _new_run_root(layout)
+    if run_root is None:
+        resolved_run_id, resolved_root = _new_run_root(layout)
+    else:
+        resolved_root = Path(run_root).resolve()
+        if not resolved_root.is_absolute() or resolved_root.is_symlink() or not resolved_root.is_dir():
+            raise _fail("controlled backend restart requires an existing real run root")
+        resolved_run_id = run_id or resolved_root.name
+    if not isinstance(resolved_run_id, str) or re.fullmatch(r"[0-9a-f]{32}", resolved_run_id) is None:
+        raise _fail("direct backend run ID is not a canonical 32-character value")
+
     terminal = {
-        "schema": "fullmag.direct-compose-build.v1",
-        "state": "building",
-        "run_id": run_id,
+        "schema": "fullmag.direct-compose-backend-start.v1",
+        "state": "preparing",
+        "run_id": resolved_run_id,
         "source_root": str(selected),
-        "run_root": str(run_root),
-        "backend_log": str(run_root / "backend-build.log"),
-        "image_log": str(run_root / "image-build.log"),
-        "development_base_log": str(run_root / "development-base-build.log"),
+        "run_root": str(resolved_root),
         "queue": "not-used",
         "build_profile": build_profile,
         "cargo_profile": cargo_profile,
         "compose_project": compose_project,
     }
-    _write_json(run_root / "receipt.json", terminal)
+    terminal_path = resolved_root / "backend-start-receipt.json"
+    _write_json(terminal_path, terminal)
 
-    from fullmag_storage import file_lock, validate_path
+    if heavy_lock_held:
+        lock_context = nullcontext()
+    else:
+        from fullmag_storage import file_lock, validate_path
 
-    # Direct Docker builds share the canonical heavy slot with every other
-    # Fullmag compiler. This route intentionally does not submit a queue job,
-    # but it must still serialize image/cache/backend mutations and retain the
-    # same durable lock path used by the managed build executor.
-    lock_context = None
-    try:
         storage_root = Path(str(layout["storage_root"]))
         heavy_lock = validate_path(
             storage_root / "locks" / "fullmag-heavy.lock",
             storage_root,
-            "direct Docker heavy build lock",
+            "direct Docker backend start lock",
         )
         lock_context = file_lock(
             heavy_lock,
-            "direct Docker Fullmag build",
+            "direct Docker backend start preparation",
             wait_timeout_seconds=120,
         )
-        lock_context.__enter__()
-    except Exception as error:
-        terminal.update(
-            state=("outcome_unknown_resources_retained"
-                   if isinstance(error, DirectDockerOutcomeUnknown)
-                   else "failed_resources_retained"),
-            exit_code=2,
-            error=str(error),
-        )
-        try:
-            _write_json(run_root / "receipt.json", terminal)
-        except Exception:
-            pass
-        raise
-
     try:
-        frozen_bundle = None
-        if getattr(args, "source_manifest", None) is not None:
-            if args.include_untracked:
-                raise _fail("Frozen inputs cannot include additional untracked files")
-            frozen_bundle = _frozen_source_bundle(args.source_manifest, layout, selected)
-        # Resolve the existing versioned development image before creating any
-        # backend cache.  A missing image is built by compose.dev's dedicated
-        # Dockerfile.backend; it is never fetched implicitly from a registry.
+        lock_context.__enter__()
+        backend_context = resolved_root / "backend-start-context"
+        backend_context.mkdir(parents=True, exist_ok=True)
         workspace_state_root = _workspace_state_root(layout, compose_project)
-        build_state_root = _backend_build_state_root(layout, run_root)
+        build_state_root = _backend_build_state_root(layout, resolved_root)
         placeholder_environment = {
             **_compose_identity_environment(layout),
-            "FULLMAG_DEV_IMAGE": args.image or os.environ.get("FULLMAG_DEV_IMAGE", DEFAULT_IMAGE),
-            "FULLMAG_RELEASE_IMAGE": args.image or os.environ.get("FULLMAG_DEV_IMAGE", DEFAULT_IMAGE),
-            "FULLMAG_TOOLCHAIN_IMAGE": args.toolchain_image or os.environ.get("FULLMAG_TOOLCHAIN_IMAGE", DEFAULT_BASE_IMAGE),
-            "FULLMAG_TOOLCHAIN_IMAGE_ID": args.toolchain_image or os.environ.get("FULLMAG_TOOLCHAIN_IMAGE_ID", "pending"),
+            "FULLMAG_DEV_IMAGE": getattr(args, "image", None)
+            or os.environ.get("FULLMAG_DEV_IMAGE", DEFAULT_IMAGE),
+            "FULLMAG_RELEASE_IMAGE": getattr(args, "image", None)
+            or os.environ.get("FULLMAG_DEV_IMAGE", DEFAULT_IMAGE),
+            "FULLMAG_TOOLCHAIN_IMAGE": getattr(args, "toolchain_image", None)
+            or os.environ.get("FULLMAG_TOOLCHAIN_IMAGE", DEFAULT_BASE_IMAGE),
+            "FULLMAG_TOOLCHAIN_IMAGE_ID": getattr(args, "toolchain_image", None)
+            or os.environ.get("FULLMAG_TOOLCHAIN_IMAGE_ID", "pending"),
             "FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile,
             "FULLMAG_DEVELOPMENT_BASE_IMAGE": os.environ.get(
                 "FULLMAG_DEVELOPMENT_BASE_IMAGE", DEFAULT_BASE_IMAGE
             ),
             "FULLMAG_SOURCE_ROOT": str(selected),
-            "FULLMAG_BACKEND_PACKAGE": str(run_root / "package"),
-            "FULLMAG_BACKEND_SOURCE_TAR": str(run_root / "placeholder-source.tar"),
-            "FULLMAG_BACKEND_SOURCE_MANIFEST": str(run_root / "placeholder-source-manifest.json"),
-            "FULLMAG_STATE_ROOT": str(run_root / "state"),
+            "FULLMAG_BACKEND_PACKAGE": str(resolved_root / "package"),
+            "FULLMAG_STATE_ROOT": str(resolved_root / "state"),
             "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
             "FULLMAG_BACKEND_BUILD_STATE_ROOT": str(build_state_root),
-            "FULLMAG_HOST_CERTIFICATE": str(run_root / "host-certificate.json"),
-            "FULLMAG_PACKAGE_PROVENANCE": str(run_root / "provenance.json"),
-            "FULLMAG_DEVELOPMENT_INPUTS": str(run_root / "development-inputs.json"),
-            "FULLMAG_BACKEND_HOSTNAME": "fullmag-direct-backend-" + run_id[:12],
+            "FULLMAG_HOST_CERTIFICATE": str(resolved_root / "host-certificate.json"),
+            "FULLMAG_PACKAGE_PROVENANCE": str(resolved_root / "provenance.json"),
+            "FULLMAG_DEVELOPMENT_INPUTS": str(resolved_root / "development-inputs.json"),
+            "FULLMAG_BACKEND_HOSTNAME": "fullmag-direct-backend-" + resolved_run_id[:12],
         }
-        (run_root / "package").mkdir(exist_ok=True)
-        (run_root / "state" / "development").mkdir(parents=True, exist_ok=True)
+        package_placeholder = resolved_root / "backend-package-placeholder"
+        package_placeholder.mkdir(parents=True, exist_ok=True)
+        (resolved_root / "state" / "development").mkdir(parents=True, exist_ok=True)
         for placeholder in ("host-certificate.json", "provenance.json", "development-inputs.json"):
-            (run_root / placeholder).touch(exist_ok=True)
-        base_info = _ensure_development_base(args, repo, layout, run_root)
+            (resolved_root / placeholder).touch(exist_ok=True)
+        placeholder_environment["FULLMAG_BACKEND_PACKAGE"] = str(package_placeholder)
+
+        base_info = _ensure_development_base(args, repo, layout, resolved_root)
         terminal.update(
             development_base_image=base_info["reference"],
             development_base_image_id=base_info["image_id"],
@@ -1609,131 +1758,93 @@ def build(args: argparse.Namespace) -> Path:
             toolchain_manifest_sha256=base_info["toolchain_manifest_sha256"],
             development_base_context_sha256=base_info.get("context_sha256"),
         )
-        _write_json(run_root / "receipt.json", terminal)
+        _write_json(terminal_path, terminal)
         placeholder_environment["FULLMAG_DEVELOPMENT_BASE_IMAGE"] = str(base_info["reference"])
         placeholder_environment["FULLMAG_TOOLCHAIN_IMAGE"] = str(base_info["toolchain_image_id"])
         placeholder_environment["FULLMAG_TOOLCHAIN_IMAGE_ID"] = str(base_info["toolchain_image_id"])
         image_ref, image_id, _image_document, image_built = _runtime_image_reference(
-            args, repo, placeholder_environment, run_root, layout, base_info,
+            args, repo, placeholder_environment, resolved_root, layout, base_info,
             compose_project,
         )
         toolchain_id = str(base_info["toolchain_image_id"])
-        terminal.update(
-            image_reference=image_ref,
-            image_id=image_id,
-            runtime_image_built=image_built,
-        )
-        _write_json(run_root / "receipt.json", terminal)
+        helper_hashes = _image_helper_inventory(image_id, backend_context)
 
-        from docker_backend_inputs import capture_backend_live_manifest, capture_backend_source
-
-        if frozen_bundle is not None:
-            source_bundle = frozen_bundle
-            terminal.update(
-                source_mode="archive",
-                source_input_policy="explicit_frozen_inputs; later checkout edits not included",
-                source_digest=source_bundle["source_digest"],
-                source_archive_sha256=source_bundle["archive_sha256"],
-                source_manifest=str(source_bundle["manifest_path"]),
-            )
-        elif build_profile == "dev":
-            source_bundle = capture_backend_live_manifest(
-                repo,
-                source_root=selected,
-                output_dir=run_root / "source",
-                capture_id=run_id,
-                profile=STORAGE_PROFILE,
-                include_untracked=tuple(args.include_untracked),
-                require_windows=True,
-            )
-            terminal.update(
-                source_mode="live-shadow-v1",
-                source_digest=source_bundle["source_digest"],
-                live_manifest_sha256=source_bundle["live_manifest_sha256"],
-                source_manifest=str(source_bundle["manifest_path"]),
-            )
-        else:
-            source_bundle = capture_backend_source(
-                repo,
-                source_root=selected,
-                mode="snapshot",
-                include_untracked=tuple(args.include_untracked),
-                output_dir=run_root / "source",
-                capture_id=run_id,
-                profile=STORAGE_PROFILE,
-                require_windows=True,
-            )
-            terminal.update(
-                source_mode="archive",
-                source_digest=source_bundle["source_digest"],
-                source_archive_sha256=source_bundle["archive_sha256"],
-                source_manifest=str(source_bundle["manifest_path"]),
-            )
-        _write_json(run_root / "receipt.json", terminal)
-        package = run_root / "package"
-        cache = _prepare_backend_cache(layout, repo, image_id, run_root, selected, toolchain_id)
-        compose_source_mode = (
-            "live-shadow-v1"
-            if source_bundle.get("source_mode") == "live-shadow-v1"
-            else "archive"
-        )
-        files = _direct_compose_files(repo, cache, source_mode=compose_source_mode)
+        git_common = _source_git_common_directory(selected)
+        source_for_environment = {
+            "source_mode": "live-shadow-v1",
+            "git_common_dir": str(git_common),
+        }
+        cache = _prepare_backend_cache(layout, repo, image_id, resolved_root, selected, toolchain_id)
+        package = _backend_cache_package_root(cache)
+        # ``package`` is a daemon-side /mnt path supplied by the cache helper;
+        # native Windows Python cannot inspect it.  The fixed backend service
+        # owns the attempt fence and publishes a fresh receipt after its
+        # in-container source scan.  Do not read or hash a guessed host path.
+        previous_receipt_sha256 = None
         environment = _environment(
-            layout, selected, run_root, source_bundle, package, image_ref, image_id, toolchain_id, cache,
-            str(base_info["reference"]),
-            cargo_profile,
+            layout, selected, resolved_root, source_for_environment,
+            package, image_ref, image_id, toolchain_id, cache,
+            str(base_info["reference"]), cargo_profile,
         )
+        # No backend package or source snapshot is built/captured in this host
+        # preparation phase.  The service observes the live readonly mounts on
+        # every start, including an ordinary Docker Desktop restart.
+        environment["FULLMAG_SOURCE_GIT_COMMON"] = str(git_common)
+        files = [repo / COMPOSE_RUNTIME_FILE, Path(str(cache["compose_overlay"]))]
         config = _compose_config(repo, files, environment, project=compose_project)
-        backend = config["services"]["backend"]
-        if not isinstance(backend, dict):
-            raise _fail("direct Compose backend service is malformed")
-        mount_targets = _mount_targets(backend)
-        required_mounts = {"/input/manifest.json", "/build"}
-        if compose_source_mode == "live-shadow-v1":
-            required_mounts.update({"/opt/fullmag/source", "/opt/fullmag/source-git"})
-        else:
-            required_mounts.add("/input/backend-source.tar")
-        missing_mounts = required_mounts - mount_targets
-        if "/opt/fullmag/package" not in mount_targets:
-            missing_mounts.add("/opt/fullmag/package")
-        if missing_mounts:
-            raise _fail("direct backend Compose service misses mounts: " + ", ".join(sorted(missing_mounts)))
-        override = _prepare_override(backend, compose_source_mode)
-        build_container_name = f"{compose_project}-backend-build-{run_id[:16]}"
-        terminal["build_container_name"] = build_container_name
-        _write_json(run_root / "receipt.json", terminal)
-        command = [
-            *_compose_prefix(repo, files, compose_project),
-            "run", "--rm", "--no-deps", "--name", build_container_name,
-            "backend", *override,
-        ]
-        _docker_live(
-            run_root / "backend-build.log",
-            *command,
-            timeout=4 * 60 * 60,
-            environment=environment,
-        )
-        prepare_receipt, prepare_receipt_bytes = _validate_prepare_receipt(
-            package, source_bundle, toolchain_id, cargo_profile
-        )
-        assembly_receipt = _assembly(
-            layout, run_id, run_root, selected, source_bundle, package, image_id, toolchain_id,
-            prepare_receipt, prepare_receipt_bytes, base_info, build_profile, cargo_profile,
-        )
-        terminal.update(state="succeeded", exit_code=0, assembly_receipt=str(assembly_receipt))
-        _write_json(run_root / "receipt.json", terminal)
-        print(json.dumps({
-            "state": "succeeded",
-            "assembly_receipt": str(assembly_receipt),
-            "package_root": str(package),
+        services = config.get("services", {})
+        if not isinstance(services, Mapping) or set(services) != {"backend", "frontend"}:
+            raise _fail("direct development Compose must contain exactly backend and frontend services")
+        backend_service = services.get("backend")
+        if not isinstance(backend_service, dict):
+            raise _fail("direct development Compose backend service is malformed")
+        tokens = _service_tokens(backend_service)
+        if "start" not in tokens or "backend_dev.py" not in " ".join(tokens):
+            raise _fail("direct development backend service does not own the typed start operation")
+
+        inputs = {
+            "schema": BACKEND_START_INPUTS_SCHEMA,
+            "state": "ready",
+            "run_id": resolved_run_id,
+            "compose_project": compose_project,
+            "source_project_id": compose_identity["project_id"],
+            "source_worktree_id": compose_identity["worktree_id"],
+            "source_checkout_kind": compose_identity["checkout_kind"],
             "source_root": str(selected),
+            "source_mode": "live-shadow-v1",
+            "git_common_dir": str(git_common),
+            "image_reference": image_ref,
             "image_id": image_id,
             "toolchain_image_id": toolchain_id,
+            "toolchain_manifest_sha256": base_info["toolchain_manifest_sha256"],
+            "development_base_image": str(base_info["reference"]),
+            "development_base_image_id": base_info["image_id"],
             "build_profile": build_profile,
             "cargo_profile": cargo_profile,
-            "run_root": str(run_root),
-        }, indent=2))
-        return assembly_receipt
+            "package_root": str(package),
+            "provenance_path": str(resolved_root / "provenance.json"),
+            "host_certificate": str(resolved_root / "host-certificate.json"),
+            "helper_context": str(backend_context),
+            "startup_helper_hashes": helper_hashes,
+            "backend_cache": dict(cache),
+            "runtime_image_built": image_built,
+            "backend_start_receipt": str(terminal_path),
+            "previous_backend_build_receipt_sha256": previous_receipt_sha256,
+        }
+        inputs_path = resolved_root / "backend-start-inputs.json"
+        _write_json(inputs_path, inputs)
+        terminal.update(
+            state="ready",
+            backend_start_inputs=str(inputs_path),
+            backend_start_inputs_sha256=_sha256_file(inputs_path, "backend start inputs"),
+            image_id=image_id,
+            image_reference=image_ref,
+            toolchain_image_id=toolchain_id,
+            runtime_image_built=image_built,
+            backend_cache_receipt=cache.get("receipt_path"),
+        )
+        _write_json(terminal_path, terminal)
+        return inputs, resolved_root
     except Exception as error:
         terminal.update(
             state=("outcome_unknown_resources_retained"
@@ -1743,13 +1854,48 @@ def build(args: argparse.Namespace) -> Path:
             error=str(error),
         )
         try:
-            _write_json(run_root / "receipt.json", terminal)
+            _write_json(terminal_path, terminal)
         except Exception:
             pass
         raise
     finally:
-        if lock_context is not None:
+        if not heavy_lock_held:
             lock_context.__exit__(None, None, None)
+
+
+def _direct_heavy_lock(layout: Mapping[str, object]):
+    """Return the Windows lease for backend-start preparation only."""
+
+    from fullmag_storage import file_lock, validate_path
+
+    storage_root = Path(str(layout["storage_root"]))
+    lock = validate_path(
+        storage_root / "locks" / "fullmag-heavy.lock",
+        storage_root,
+        "direct Docker backend start lock",
+    )
+    return file_lock(
+        lock,
+        "direct Docker backend start preparation",
+        wait_timeout_seconds=120,
+    )
+
+
+def build(args: argparse.Namespace) -> None:
+    """Explicit dev alias for the fixed two-service backend build gate.
+
+    The backend package is built by the long-lived Compose backend service;
+    this command never starts a one-shot backend container or copies a package
+    through the host. It leaves the fixed frontend/backend services running,
+    matching the up command so the backend receipt and runtime remain observable.
+    """
+
+    if getattr(args, "profile", DEFAULT_BUILD_PROFILE) != DEFAULT_BUILD_PROFILE:
+        raise _fail(
+            "docker-dev build only supports the fixed backend-dev service; "
+            "release packages use the managed image route"
+        )
+    up(args)
 
 
 def up(args: argparse.Namespace) -> None:
@@ -1761,20 +1907,30 @@ def up(args: argparse.Namespace) -> None:
     _assert_no_running_fullmag(compose_project, source_identity)
     from fullmag_docker_runtime import assert_loopback_port_available, start
     assert_loopback_port_available(args.port, compose_project)
-    assembly_receipt = build(args)
+    # The Windows heavy-build lease is intentionally limited to preparation of
+    # the image, toolchain, cache, and start receipt.  The fixed backend service
+    # compiles from its live readonly source after this context exits; its
+    # per-cache lease and terminal receipt govern that operation.  If Docker
+    # later reports an unknown result, leave the owned containers and receipt
+    # for explicit inspection instead of holding a host lease or retrying.
+    with _direct_heavy_lock(layout):
+        backend_start, _backend_input_root = _backend_start_inputs(
+            args, heavy_lock_held=True
+        )
     _assert_no_running_fullmag(compose_project, source_identity)
     # Keep startup_script opaque to this launcher.  The existing startup helper
-    # performs the path admission, source containment, hash, and wait_for_solve
-    # policy checks against the same selected live checkout.
+    # performs path admission, source containment, hash, and wait_for_solve
+    # policy checks against the same checkout.
     start(
         repo,
-        assembly_receipt,
+        None,
         args.port,
         frontend="dev",
         source_root=selected,
         startup_script=args.script,
         project_name=compose_project,
         compose_template=repo / COMPOSE_RUNTIME_FILE,
+        backend_start=backend_start,
     )
 
 
@@ -1810,7 +1966,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="action", required=True)
     for name in ("build", "up"):
         command = subparsers.add_parser(name, help=(
-            "build the backend package without starting services"
+            "start the fixed backend and frontend services; backend builds in-place"
             if name == "build" else "build and start backend plus frontend"
         ))
         command.add_argument("--source-root", type=Path,
@@ -1823,15 +1979,15 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--image", help="existing/buildable development image/tag; default: FULLMAG_DEV_IMAGE or fullmag/fullmag-dev:local")
         command.add_argument("--toolchain-image", help="immutable toolchain image ID/tag; default: image label or configured value")
         command.add_argument("--source-manifest", type=Path,
-                             help="absolute manifest path to resume verified frozen backend inputs; later checkout edits are not included")
+                             help="unsupported compatibility flag: live docker-dev does not consume frozen source manifests")
         command.add_argument("--include-untracked", action="append", default=[],
-                             help="relative untracked source path to include in the frozen backend archive (repeatable)")
+                             help="unsupported compatibility flag: add new source files to the selected Git index instead")
         command.add_argument("--port", type=int, default=3197,
                              help="loopback frontend port (up only)")
         command.add_argument("--script", "--startup-script", dest="script", type=Path,
                              help="optional simulation script, relative to the selected checkout or absolute inside it (up only)")
         if name == "build":
-            command.set_defaults(port=3197, script=None)
+            command.set_defaults(script=None)
     recreate_parser = subparsers.add_parser(
         "recreate",
         help="recreate the named development run while retaining its state and session store",

@@ -17,7 +17,7 @@ import sys
 import time
 import types
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import fullmag_storage as storage
 from local_runner.runtime_use import runtime_package_use, register_runtime_reference_root
@@ -55,6 +55,9 @@ RUNTIME_CONFIG_HISTORY_RELATIVE = Path("state") / RUNTIME_CONFIG_RELATIVE
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONFIG_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+_DEVELOPMENT_BUILD_SCHEMA = "fullmag.windows-folder-development-build.v1"
+_PROVISIONAL_COMMIT = "0" * 40
+_PROVISIONAL_DIGEST = "0" * 64
 _SOURCE_IDENTITY_FIELDS = (
     "source_project_id", "source_worktree_id", "source_checkout_kind",
 )
@@ -438,7 +441,7 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
                  project="fullmag-config-check", source_identity=None, workspace_state_root=None,
                  template=None, host_ledger=None, startup=None, frontend_cache=None,
-                 previous_config_sha256=None, recovery=None):
+                 previous_config_sha256=None, recovery=None, backend_start=None):
     """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
@@ -467,19 +470,46 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         if _CONFIG_SHA256_RE.fullmatch(str(previous_config_sha256)) is None:
             raise ValueError("Previous runtime configuration digest must be a lowercase SHA-256")
         environment["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = str(previous_config_sha256)
-    if inputs is not None:
+    if inputs is not None or backend_start is not None:
         if package is None or provenance is None or inputs_path is None:
             raise ValueError("Development Compose requires a managed package and provenance")
-        environment.update(FULLMAG_SOURCE_ROOT=str(inputs["source_root"]),
-                           FULLMAG_BACKEND_PACKAGE=str(package),
-                           FULLMAG_PACKAGE_PROVENANCE=str(provenance),
-                           FULLMAG_DEVELOPMENT_INPUTS=str(inputs_path))
+        if backend_start is not None:
+            if not isinstance(backend_start, Mapping):
+                raise ValueError("Backend start inputs must be an object")
+            source_root = backend_start.get("source_root")
+            source_manifest = backend_start.get("source_manifest")
+            git_common = backend_start.get("git_common_dir")
+            if not all(isinstance(value, str) and value for value in (source_root, git_common)):
+                raise ValueError("Backend start inputs have incomplete source mounts")
+            environment.update(
+                FULLMAG_SOURCE_ROOT=source_root,
+                FULLMAG_SOURCE_GIT_COMMON=git_common,
+                FULLMAG_BACKEND_PACKAGE=str(package),
+                FULLMAG_PACKAGE_PROVENANCE=str(provenance),
+                FULLMAG_DEVELOPMENT_INPUTS=str(inputs_path),
+                # The backend worker remains PID 1 until the host publishes
+                # the post-build certificate.  This fence prevents a stale
+                # certificate from admitting an old package on restart.
+                FULLMAG_BACKEND_BUILD_GATE="1",
+                FULLMAG_BACKEND_BUILD_RECEIPT="/opt/fullmag/package/backend-build-receipt.json",
+                FULLMAG_BACKEND_PROVENANCE="/opt/fullmag/provenance.json",
+            )
+            # A live start captures the mounted checkout inside backend_dev.
+            # Keep this optional solely for older archived Compose metadata;
+            # normal fresh starts must not bind a host-created manifest.
+            if isinstance(source_manifest, str) and source_manifest:
+                environment["FULLMAG_BACKEND_SOURCE_MANIFEST"] = source_manifest
+        else:
+            environment.update(FULLMAG_SOURCE_ROOT=str(inputs["source_root"]),
+                               FULLMAG_BACKEND_PACKAGE=str(package),
+                               FULLMAG_PACKAGE_PROVENANCE=str(provenance),
+                               FULLMAG_DEVELOPMENT_INPUTS=str(inputs_path))
     definitions = ["-f", str(template)]
     if host_ledger is not None:
         environment.update(host_ledger["environment"])
         definitions.extend(["-f", host_ledger["compose_overlay"]])
     if frontend_cache is not None:
-        if inputs is None:
+        if inputs is None and backend_start is None:
             raise ValueError("Frontend cache requires development inputs")
         overlay = frontend_cache.get("compose_overlay")
         cache_environment = frontend_cache.get("environment")
@@ -491,6 +521,20 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
             raise ValueError("Frontend cache has no attested ext4 UUID")
         environment.update(cache_environment)
         definitions.extend(["-f", overlay])
+    if backend_start is not None:
+        backend_cache = backend_start.get("backend_cache")
+        if not isinstance(backend_cache, dict) or backend_cache.get("state") != "ready":
+            raise ValueError("Backend start has no ready backend cache profile")
+        cache_overlay = backend_cache.get("compose_overlay")
+        cache_environment = backend_cache.get("environment")
+        if (not isinstance(cache_overlay, str) or not Path(cache_overlay).is_file()
+                or not isinstance(cache_environment, dict)):
+            raise ValueError("Backend start cache overlay or environment is missing")
+        if (cache_environment.get("FULLMAG_BACKEND_PACKAGE")
+                != backend_start.get("package_root")):
+            raise ValueError("Backend start cache package environment differs from its descriptor")
+        environment.update({str(key): str(value) for key, value in cache_environment.items()})
+        definitions.extend(["-f", cache_overlay])
     if startup is not None:
         overlay = startup.get("compose_overlay")
         if not isinstance(overlay, str) or not Path(overlay).is_file():
@@ -516,7 +560,7 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         configured.get("services", {}).pop("host-ledger-maintenance", None)
     if frontend_cache is not None:
         configured.get("services", {}).pop("frontend-cache-maintenance", None)
-    expected = {"backend", "frontend"} if inputs is not None else {"backend"}
+    expected = {"backend", "frontend"} if (inputs is not None or backend_start is not None) else {"backend"}
     if set(configured.get("services", {})) != expected:
         raise ValueError("Versioned Compose has unexpected services")
     # A running configuration pins an existing image and never triggers a build.
@@ -998,9 +1042,11 @@ def _validate_assembly_source_provenance(assembly, *, frontend):
             raise ValueError("Live source assembly has no canonical live manifest digest")
         source_manifest = assembly.get("source_manifest")
         git_common = assembly.get("source_git_common_dir")
-        if (not isinstance(source_manifest, str) or not source_manifest
-                or not isinstance(git_common, str) or not git_common):
-            raise ValueError("Live source assembly has incomplete manifest provenance")
+        if not isinstance(git_common, str) or not git_common:
+            raise ValueError("Live source assembly has incomplete Git provenance")
+        if source_manifest is not None and (
+                not isinstance(source_manifest, str) or not source_manifest):
+            raise ValueError("Live source assembly has an invalid optional manifest provenance")
         if "source_archive" in assembly or "source_tar_sha256" in assembly:
             raise ValueError("Live source assembly must not claim a source archive")
         return {
@@ -1072,6 +1118,20 @@ def _container_inspect(container_id):
             or not actual_id.startswith(container_id)):
         raise ValueError("Reused Docker container identity changed")
     return document
+
+
+def _compose_service_container_id(compose_args, service):
+    """Return exactly one running container ID for an owned Compose service."""
+
+    if not isinstance(service, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", service):
+        raise ValueError("Compose service name is invalid")
+    raw = docker(*compose_args, "ps", "--quiet", service)
+    ids = [item.strip() for item in raw.splitlines() if item.strip()]
+    if len(ids) != 1 or _CONTAINER_ID_RE.fullmatch(ids[0]) is None:
+        raise ValueError(
+            f"Compose service {service} did not return exactly one valid running container ID"
+        )
+    return ids[0]
 
 
 def _mount_source(source):
@@ -1628,12 +1688,617 @@ def _reuse_host_certificate(reuse, assembly, engine_id):
     return rotated
 
 
+def _validate_backend_start_inputs(value, layout):
+    """Validate the host-owned pre-build descriptor before Compose mutation."""
+
+    if not isinstance(value, dict) or value.get("schema") != "fullmag.direct-compose.backend-start-inputs.v1":
+        raise ValueError("Backend start inputs have an unsupported schema")
+    if value.get("state") != "ready" or value.get("source_mode") != "live-shadow-v1":
+        raise ValueError("Backend start inputs are not ready live-source inputs")
+    image = value.get("image_id")
+    toolchain = value.get("toolchain_image_id")
+    if not isinstance(image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        raise ValueError("Backend start inputs have no immutable runtime image")
+    if not isinstance(toolchain, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", toolchain):
+        raise ValueError("Backend start inputs have no immutable toolchain image")
+    toolchain_manifest = value.get("toolchain_manifest_sha256")
+    if not isinstance(toolchain_manifest, str) or _CONFIG_SHA256_RE.fullmatch(toolchain_manifest) is None:
+        raise ValueError("Backend start inputs have no pinned toolchain manifest")
+    if value.get("cargo_profile") != "backend-dev" or value.get("build_profile") != "dev":
+        raise ValueError("Backend start inputs are not the supported GPU development profile")
+    source_group = {
+        "source_project_id": value.get("source_project_id"),
+        "source_worktree_id": value.get("source_worktree_id"),
+        "source_checkout_kind": value.get("source_checkout_kind"),
+    }
+    if any(not isinstance(item, str) or not item for item in source_group.values()):
+        raise ValueError("Backend start inputs have no complete source group identity")
+    if any(not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", item)
+           for item in source_group.values()):
+        raise ValueError("Backend start source group identity is invalid")
+    for field in (
+        "source_root", "git_common_dir", "provenance_path",
+        "helper_context", "backend_start_receipt",
+    ):
+        item = value.get(field)
+        if not isinstance(item, str) or not Path(item).is_absolute():
+            raise ValueError(f"Backend start inputs have no absolute {field}")
+    package_value = value.get("package_root")
+    if not isinstance(package_value, str):
+        raise ValueError("Backend start inputs have no package_root")
+    try:
+        package_daemon_path = PurePosixPath(package_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Backend start package_root is malformed") from error
+    if not package_daemon_path.is_absolute() or any(
+        part in {"", ".", ".."} for part in package_daemon_path.parts[1:]
+    ):
+        raise ValueError("Backend start package_root is not a safe daemon path")
+    # Fresh starts intentionally do not carry a host-captured source snapshot.
+    # If an older caller supplies the complete identity, validate it as an
+    # admission pin; otherwise the backend receipt is the sole source authority.
+    identity_fields = ("resolved_commit", "source_digest", "source_snapshot_sha256",
+                       "live_manifest_sha256", "native_source_identity")
+    supplied_identity = [value.get(field) for field in identity_fields]
+    if any(item is not None for item in supplied_identity):
+        if not all(item is not None for item in supplied_identity):
+            raise ValueError("Backend start source identity is incomplete")
+        commit = value["resolved_commit"]
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError("Backend start source commit is invalid")
+        for field in ("source_digest", "source_snapshot_sha256", "live_manifest_sha256"):
+            item = value[field]
+            if not isinstance(item, str) or _CONFIG_SHA256_RE.fullmatch(item) is None:
+                raise ValueError(f"Backend start source identity is invalid: {field}")
+        native = value["native_source_identity"]
+        if not isinstance(native, dict) or native.get("head_commit_full") != commit:
+            raise ValueError("Backend start native source identity differs from its commit")
+    source_manifest = value.get("source_manifest")
+    if source_manifest is not None and (
+        not isinstance(source_manifest, str) or not Path(source_manifest).is_absolute()
+    ):
+        raise ValueError("Backend start source manifest path is invalid")
+    for field in ("provenance_path", "backend_start_receipt"):
+        path = Path(value[field])
+        if path.is_symlink() or not path.exists():
+            raise ValueError(f"Backend start {field} is missing or a reparse point")
+    provenance = Path(value["provenance_path"])
+    if provenance.is_symlink() or not provenance.is_file():
+        raise ValueError("Backend start provenance handoff is not a regular file")
+    helpers = value.get("startup_helper_hashes")
+    if (not isinstance(helpers, dict) or set(helpers) != {"docker_startup_script.py", "fullmag_storage.py"}
+            or any(not isinstance(item, str) or _CONFIG_SHA256_RE.fullmatch(item) is None
+                   for item in helpers.values())):
+        raise ValueError("Backend start inputs have no complete startup helper inventory")
+    cache = value.get("backend_cache")
+    if not isinstance(cache, dict) or cache.get("state") != "ready":
+        raise ValueError("Backend start inputs have no ready backend cache profile")
+    cache_package = cache.get("package_root")
+    cache_mount = cache.get("mount_root")
+    cache_environment = cache.get("environment")
+    if (not isinstance(cache_package, str) or not isinstance(cache_mount, str)
+            or not isinstance(cache_environment, dict)
+            or cache_package != value.get("package_root")
+            or cache_environment.get("FULLMAG_BACKEND_PACKAGE") != cache_package):
+        raise ValueError("Backend start package is not the cache helper's typed package root")
+    try:
+        cache_package_path = PurePosixPath(cache_package)
+        cache_mount_path = PurePosixPath(cache_mount)
+        relative = cache_package_path.relative_to(cache_mount_path)
+    except ValueError as error:
+        raise ValueError("Backend start package escapes the attested backend cache mount") from error
+    if (not cache_package_path.is_absolute() or not cache_mount_path.is_absolute()
+            or relative != PurePosixPath("package")
+            or cache_package_path != package_daemon_path):
+        raise ValueError("Backend start package is not the attested daemon package child")
+    previous_receipt = value.get("previous_backend_build_receipt_sha256")
+    if previous_receipt is not None and (
+        not isinstance(previous_receipt, str) or _CONFIG_SHA256_RE.fullmatch(previous_receipt) is None
+    ):
+        raise ValueError("Backend start previous receipt identity is invalid")
+    return value
+
+
+def _validate_backend_start_source_group(backend_start, source_identity):
+    """Bind backend-start labels to the canonical Compose identity fields."""
+
+    for backend_field, identity_field in (
+        ("source_project_id", "project_id"),
+        ("source_worktree_id", "worktree_id"),
+        ("source_checkout_kind", "checkout_kind"),
+    ):
+        if backend_start[backend_field] != source_identity[identity_field]:
+            raise ValueError("Backend start source group differs from the selected checkout")
+
+
+def _daemon_mount_path(value, label):
+    """Validate one daemon-namespace mount path without host resolution."""
+
+    try:
+        path = PurePosixPath(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} is not a valid daemon path") from error
+    if (not path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts[1:])):
+        raise ValueError(f"{label} is not a canonical daemon path")
+    return path
+
+
+_BACKEND_BUILD_DOCUMENTS_SCRIPT = r'''
+import hashlib
+import json
+import os
+import stat
+
+MAXIMUM = 16 * 1024 * 1024
+FLAGS = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+
+
+def read(path):
+    descriptor = os.open(path, FLAGS)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError("build handoff is not one regular file")
+        if metadata.st_size <= 0 or metadata.st_size > MAXIMUM:
+            raise RuntimeError("build handoff exceeds its size bound")
+        chunks = bytearray()
+        while len(chunks) <= MAXIMUM:
+            block = os.read(descriptor, min(1024 * 1024, MAXIMUM + 1 - len(chunks)))
+            if not block:
+                break
+            chunks.extend(block)
+        if len(chunks) > MAXIMUM:
+            raise RuntimeError("build handoff exceeds its size bound")
+        raw = bytes(chunks)
+        return {"value": json.loads(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    finally:
+        os.close(descriptor)
+
+
+print(json.dumps({
+    "receipt": read("/opt/fullmag/package/backend-build-receipt.json"),
+    "provenance": read("/opt/fullmag/provenance.json"),
+}, separators=(",", ":")))
+'''
+
+
+_BACKEND_BINARY_DIGESTS_SCRIPT = r'''
+import hashlib
+import json
+import os
+import stat
+import sys
+
+FLAGS = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+MAXIMUM = 16 * 1024 * 1024 * 1024
+result = {}
+for name in sys.argv[1:]:
+    path = "/opt/fullmag/package/bin/" + name
+    descriptor = os.open(path, FLAGS)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError("runtime artifact is not one regular file")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            total += len(block)
+            if total > MAXIMUM:
+                raise RuntimeError("runtime artifact exceeds its size bound")
+            digest.update(block)
+        result[name] = digest.hexdigest()
+    finally:
+        os.close(descriptor)
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+'''
+
+
+def _read_backend_binary_hashes(inputs, container_id):
+    """Hash published binaries inside the daemon package mount."""
+
+    package_path = Path(str(inputs["package_root"]))
+    if package_path.is_dir():
+        return {
+            name: digest(package_path / "bin" / name)
+            for name in REQUIRED_BINARIES
+        }
+    if not container_id:
+        raise ValueError("Backend package is daemon-owned and has no running container for attestation")
+    try:
+        raw = docker(
+            "exec", container_id, "/usr/local/bin/python3", "-c",
+            _BACKEND_BINARY_DIGESTS_SCRIPT, *REQUIRED_BINARIES, timeout=120,
+        )
+        value = json.loads(raw)
+    except DockerOutcomeUnknown:
+        raise
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError("Backend container binary attestation returned invalid JSON") from error
+    if (not isinstance(value, dict)
+            or set(value) != set(REQUIRED_BINARIES)
+            or any(not isinstance(item, str) or _CONFIG_SHA256_RE.fullmatch(item) is None
+                   for item in value.values())):
+        raise ValueError("Backend container binary attestation is incomplete")
+    return value
+
+
+def _read_backend_build_documents(inputs, container_id):
+    """Read package/provenance from the daemon mount or local test fixture."""
+
+    package_path = Path(str(inputs["package_root"]))
+    if package_path.is_dir():
+        receipt_path = package_path / "backend-build-receipt.json"
+        provenance_path = Path(inputs["provenance_path"])
+        if not receipt_path.exists() or receipt_path.is_symlink():
+            return None
+        try:
+            receipt = _read_reuse_json(
+                receipt_path, "backend build receipt", maximum=16 * 1024 * 1024
+            )
+            provenance = _read_reuse_json(
+                provenance_path, "backend runtime provenance", maximum=16 * 1024 * 1024
+            )
+        except (OSError, ValueError):
+            return None
+        return receipt, provenance, digest(receipt_path)
+    if not container_id:
+        return None
+    try:
+        raw = docker(
+            "exec", container_id, "/usr/local/bin/python3", "-c",
+            _BACKEND_BUILD_DOCUMENTS_SCRIPT, timeout=30,
+        )
+        observed = json.loads(raw)
+        receipt_record = observed.get("receipt")
+        provenance_record = observed.get("provenance")
+        if (not isinstance(receipt_record, dict) or not isinstance(provenance_record, dict)
+                or not isinstance(receipt_record.get("value"), dict)
+                or not isinstance(provenance_record.get("value"), dict)
+                or not isinstance(receipt_record.get("sha256"), str)):
+            return None
+        return (
+            receipt_record["value"],
+            provenance_record["value"],
+            receipt_record["sha256"],
+        )
+    except DockerOutcomeUnknown:
+        raise
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _wait_for_backend_build(inputs, container_id, *, timeout):
+    """Observe the fixed backend service's final receipt before host attestation."""
+
+    deadline = time.monotonic() + timeout
+    while True:
+        observed_documents = _read_backend_build_documents(inputs, container_id)
+        if observed_documents is not None:
+            receipt, provenance, receipt_digest = observed_documents
+            if receipt.get("state") in {"failed", "failed_resources_retained"}:
+                raise ValueError("Backend service published a failed build receipt")
+            if (receipt.get("schema") == "fullmag.direct-compose.backend-build-receipt.v1"
+                    and receipt.get("state") == "succeeded"
+                    and provenance.get("state") == "succeeded"):
+                previous_digest = inputs.get("previous_backend_build_receipt_sha256")
+                if (receipt_digest != previous_digest
+                        and provenance.get("build_receipt_sha256") == receipt_digest):
+                    return receipt, provenance
+        if container_id:
+            document = _container_inspect(container_id)
+            state = document.get("State")
+            if isinstance(state, dict) and state.get("Running") is False:
+                raise ValueError("Backend service exited before publishing final build provenance")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DockerOutcomeUnknown(["backend-build", str(container_id or "unknown")], timeout)
+        time.sleep(min(0.25, remaining))
+
+
+def _assembly_from_backend_start(inputs, receipt, provenance, *, container_id=None):
+    """Map the backend's post-build provenance into the existing runtime contract."""
+
+    binary_hashes = provenance.get("binary_hashes")
+    if not isinstance(binary_hashes, dict) or set(binary_hashes) != set(REQUIRED_BINARIES):
+        raise ValueError("Backend runtime provenance has no complete binary inventory")
+    observed_binary_hashes = _read_backend_binary_hashes(inputs, container_id)
+    for name, expected in binary_hashes.items():
+        if not isinstance(expected, str) or _CONFIG_SHA256_RE.fullmatch(expected) is None:
+            raise ValueError("Backend runtime provenance has an invalid binary digest")
+        observed = observed_binary_hashes.get(name)
+        if observed != expected:
+            raise ValueError("Backend package differs from its post-build provenance: " + name)
+    # A fresh service start has no host-captured source identity.  In that
+    # mode the backend's successful receipt/provenance is authoritative; an
+    # older descriptor may still provide all fields as an admission pin.
+    admitted_fields = {
+        "commit": inputs.get("resolved_commit"),
+        "source_digest": inputs.get("source_digest"),
+        "source_snapshot_sha256": inputs.get("source_snapshot_sha256"),
+        "source_mode": inputs.get("source_mode"),
+    }
+    for field, admitted in admitted_fields.items():
+        if admitted is not None and provenance.get(field) != admitted:
+            raise ValueError("Backend runtime provenance differs from the admitted source identity: " + field)
+    receipt_source = receipt.get("source")
+    if not isinstance(receipt_source, dict):
+        raise ValueError("Backend build receipt has no source identity")
+    receipt_identity = {
+        "commit": receipt_source.get("resolved_commit"),
+        "source_digest": receipt_source.get("source_digest"),
+        "source_snapshot_sha256": receipt_source.get("source_snapshot_sha256"),
+        "source_mode": receipt_source.get("source_mode"),
+        "live_manifest_sha256": receipt_source.get("live_manifest_sha256"),
+    }
+    if (not isinstance(receipt_identity["commit"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", receipt_identity["commit"])
+            or any(not isinstance(receipt_identity[field], str)
+                   or _CONFIG_SHA256_RE.fullmatch(receipt_identity[field]) is None
+                   for field in ("source_digest", "source_snapshot_sha256", "live_manifest_sha256"))
+            or receipt_identity["source_mode"] != "live-shadow-v1"):
+        raise ValueError("Backend build receipt has incomplete live source identity")
+    for field in ("commit", "source_digest", "source_snapshot_sha256", "source_mode"):
+        if provenance.get(field) != receipt_identity[field]:
+            raise ValueError("Backend receipt and runtime provenance differ: " + field)
+    receipt_native = receipt.get("native_source_identity")
+    if not isinstance(receipt_native, dict) or provenance.get("native_source_identity") != receipt_native:
+        raise ValueError("Backend receipt and runtime provenance differ: native source identity")
+    if provenance.get("toolchain_image_id") != inputs["toolchain_image_id"]:
+        raise ValueError("Backend runtime provenance differs from the admitted toolchain image")
+    assembly = {
+        "schema": "fullmag.docker-all-image.v1",
+        "state": "succeeded",
+        "exit_code": 0,
+        "qualification": "NOT VERIFIED",
+        "build_kind": "direct-compose",
+        "direct_source_provenance": "fullmag.docker-backend-live-source.v1",
+        "direct_build_id": inputs["run_id"],
+        "commit": provenance["commit"],
+        "source_mode": provenance["source_mode"],
+        "source_root": inputs["source_root"],
+        "source_digest": provenance["source_digest"],
+        "source_snapshot_sha256": provenance["source_snapshot_sha256"],
+        "native_source_identity": provenance["native_source_identity"],
+        "source_git_common_dir": inputs["git_common_dir"],
+        "image_id": inputs["image_id"],
+        "base_image": inputs["toolchain_image_id"],
+        "toolchain_image_id": inputs["toolchain_image_id"],
+        "development_base_image": inputs.get("development_base_image"),
+        "development_base_image_id": inputs.get("development_base_image_id"),
+        "runtime_mode": "development_source_bind",
+        "build_profile": inputs["build_profile"],
+        "cargo_profile": provenance.get("cargo_profile"),
+        "cargo_target_profile_dir": provenance.get("cargo_target_profile_dir"),
+        "package_root": inputs["package_root"],
+        "binary_hashes": binary_hashes,
+        "startup_helper_hashes": inputs["startup_helper_hashes"],
+        "build_receipt_sha256": provenance["build_receipt_sha256"],
+        "backend_build_receipt": str(Path(inputs["package_root"]) / "backend-build-receipt.json"),
+        "backend_build_receipt_schema": receipt.get("schema"),
+        "output": str(Path(inputs["backend_start_receipt"]).parent),
+        "context": inputs["helper_context"],
+    }
+    source_manifest = inputs.get("source_manifest")
+    if source_manifest is not None:
+        assembly["source_manifest"] = source_manifest
+    assembly["live_manifest_sha256"] = receipt_identity["live_manifest_sha256"]
+    return assembly
+
+
+def _provisional_development_certificate(inputs, source_identity):
+    """Return the pre-build certificate and delegation for the backend gate.
+
+    The backend service must be able to run the guest storage probes before a
+    package receipt exists.  The provisional values are deliberately unusable
+    as a release identity.  The development delegation is a bootstrap audit
+    bound to this immutable image/toolchain and selected Compose group; the
+    live backend receipt remains authoritative for later builds.
+    """
+
+    binary_hashes = {name: _PROVISIONAL_DIGEST for name in REQUIRED_BINARIES}
+    project = source_identity.get("project_name")
+    if not isinstance(project, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
+        raise ValueError("Development host certificate has no valid Compose project identity")
+    delegation = {
+        "schema": _DEVELOPMENT_BUILD_SCHEMA,
+        "cargo_profile": "backend-dev",
+        "toolchain_image_id": inputs["toolchain_image_id"],
+        "package_root": "/opt/fullmag/package",
+        "provenance_path": "/opt/fullmag/provenance.json",
+        "group_identity": project,
+        "source_identity": {
+            "commit": _PROVISIONAL_COMMIT,
+            "source_digest": _PROVISIONAL_DIGEST,
+            "source_snapshot_sha256": _PROVISIONAL_DIGEST,
+            "native_source_identity_sha256": _PROVISIONAL_DIGEST,
+        },
+    }
+    assembly = {
+        "image_id": inputs["image_id"],
+        "commit": _PROVISIONAL_COMMIT,
+        "build_receipt_sha256": _PROVISIONAL_DIGEST,
+    }
+    return assembly, binary_hashes, delegation
+
+
+def _refresh_development_certificate(certificate, assembly, inputs):
+    """Bind the first live build receipt while retaining the bootstrap delegation."""
+
+    refreshed = dict(certificate)
+    refreshed.update(
+        source_commit=assembly["commit"],
+        binary_hashes=dict(assembly["binary_hashes"]),
+        artifact_receipt_sha256=assembly["build_receipt_sha256"],
+        restart_verified=False,
+    )
+    delegation = refreshed.get("development_build")
+    if not isinstance(delegation, dict):
+        raise ValueError("Initial development host certificate has no delegation")
+    expected_fields = {
+        "schema", "cargo_profile", "toolchain_image_id", "package_root",
+        "provenance_path", "group_identity", "source_identity",
+    }
+    if set(delegation) != expected_fields:
+        raise ValueError("Initial development host certificate has an invalid delegation")
+    source_identity = delegation.get("source_identity")
+    if not isinstance(source_identity, dict) or set(source_identity) != {
+        "commit", "source_digest", "source_snapshot_sha256", "native_source_identity_sha256",
+    }:
+        raise ValueError("Initial development host certificate has an invalid source audit")
+    for field in ("commit", "source_digest", "source_snapshot_sha256", "native_source_identity_sha256"):
+        if not isinstance(source_identity[field], str):
+            raise ValueError("Initial development host certificate has an invalid source audit")
+    if source_identity == {
+        "commit": _PROVISIONAL_COMMIT,
+        "source_digest": _PROVISIONAL_DIGEST,
+        "source_snapshot_sha256": _PROVISIONAL_DIGEST,
+        "native_source_identity_sha256": _PROVISIONAL_DIGEST,
+    }:
+        commit = assembly.get("commit")
+        source_digest = assembly.get("source_digest")
+        source_snapshot = assembly.get("source_snapshot_sha256")
+        native = assembly.get("native_source_identity")
+        if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+                or not isinstance(source_digest, str) or not _CONFIG_SHA256_RE.fullmatch(source_digest)
+                or not isinstance(source_snapshot, str) or not _CONFIG_SHA256_RE.fullmatch(source_snapshot)
+                or not isinstance(native, dict) or native.get("head_commit_full") != commit):
+            raise ValueError("Backend assembly has no complete source audit for development delegation")
+        native_source_identity_sha256 = hashlib.sha256(
+            (json.dumps(native, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n")
+            .encode("utf-8")
+        ).hexdigest()
+        updated_delegation = dict(delegation)
+        updated_delegation["source_identity"] = {
+            "commit": commit,
+            "source_digest": source_digest,
+            "source_snapshot_sha256": source_snapshot,
+            "native_source_identity_sha256": native_source_identity_sha256,
+        }
+        refreshed["development_build"] = updated_delegation
+    # Once populated, this audit is retained for provenance only.  The live
+    # receipt/provenance remains authoritative and is never pinned to it on a
+    # later ordinary backend restart.
+    return refreshed
+
+
+def _publish_bound_development_certificate(host_certificate, owner_marker, certificate):
+    """Update the mounted certificate inode, then atomically rotate its marker."""
+
+    from windows_folder_host import publish_evidence, write_bound_evidence
+
+    write_bound_evidence(host_certificate, certificate)
+    publish_evidence(owner_marker, certificate)
+
+
+def _complete_backend_storage_preflight(docker_client, container_id, state, host_certificate, certificate, root):
+    """Run the two guest storage observations without creating a third service."""
+
+    logs = []
+    for number in ("first", "restart"):
+        output = docker_client(
+            "exec", container_id, "/usr/local/bin/python3", "/opt/fullmag/entrypoint.py",
+            "--storage-probe", timeout=120, combined=True,
+        )
+        logs.append(output)
+    (Path(root) / "storage-probe.log").write_text("\n".join(logs), encoding="utf-8")
+    from windows_folder_host import local_volume, publish_evidence, read_owned_regular, write_bound_evidence
+
+    probe_path = Path(state) / ".windows-folder-probe" / "probe-restart.json"
+    if not probe_path.is_file() or probe_path.is_symlink():
+        raise ValueError("Backend storage preflight did not publish a restart probe")
+    probe = json.loads(read_owned_regular(probe_path))
+    checks = (
+        "file_sync", "directory_sync", "atomic_replace", "atomic_directory_publish",
+        "process_lock", "no_follow_symlink", "no_follow_junction",
+        "sqlite_transactions", "restart_readback",
+    )
+    if (not isinstance(probe, dict) or set(probe.get("checks", {})) != set(checks)
+            or not all(probe["checks"].values())):
+        raise ValueError("Backend storage preflight checks were not all successful")
+    sentinel = Path(state) / ".windows-folder-probe" / "restart-sentinel.bin"
+    if hashlib.sha256(read_owned_regular(sentinel)).hexdigest() != certificate["restart_expected_sha256"]:
+        raise ValueError("Backend storage restart sentinel differs from host attestation")
+    for key, value in local_volume(state).items():
+        if certificate.get(key) != value:
+            raise ValueError("Native Windows volume identity changed during backend preflight: " + key)
+    certificate["restart_verified"] = True
+    publish_evidence(Path(state) / ".fullmag-windows-folder-owner.json", certificate)
+    write_bound_evidence(host_certificate, certificate)
+    return probe["checks"]
+
+
+def _legacy_storage_preflight(configured, spec, compose_args, docker_client, root, state,
+                              host_certificate, certificate):
+    """Retain the static/assembly storage probe contract."""
+
+    probe_service = configured["services"]["backend"]
+    probe_service["command"] = ["--storage-probe"]
+    probe_service["healthcheck"] = {"disable": True}
+    storage.atomic_json(spec, configured)
+    docker_client(*compose_args, "config", "--quiet")
+    docker_client(*compose_args, "up", "--detach", "--no-build", "--pull", "never", "backend")
+    probe_container = docker_client(*compose_args, "ps", "--all", "--quiet", "backend")
+    first_exit = docker_client("wait", probe_container, timeout=120)
+    (Path(root) / "storage-first.log").write_text(
+        docker_client("logs", probe_container, combined=True), encoding="utf-8"
+    )
+    if first_exit != "0":
+        raise ValueError("Windows storage first probe failed: " + docker_client(
+            "logs", probe_container, combined=True
+        ))
+    docker_client("start", probe_container)
+    restart_exit = docker_client("wait", probe_container, timeout=120)
+    (Path(root) / "storage-restart.log").write_text(
+        docker_client("logs", probe_container, combined=True), encoding="utf-8"
+    )
+    if restart_exit != "0":
+        raise ValueError("Windows storage restart probe failed: " + docker_client(
+            "logs", probe_container, combined=True
+        ))
+    from windows_folder_host import local_volume, read_owned_regular
+
+    probe = json.loads(read_owned_regular(
+        Path(state) / ".windows-folder-probe/probe-restart.json"
+    ))
+    checks = (
+        "file_sync", "directory_sync", "atomic_replace", "atomic_directory_publish",
+        "process_lock", "no_follow_symlink", "no_follow_junction",
+        "sqlite_transactions", "restart_readback",
+    )
+    if set(probe["checks"]) != set(checks) or not all(probe["checks"].values()):
+        raise ValueError("Windows session storage probes were not all successful")
+    if hashlib.sha256(read_owned_regular(
+            Path(state) / ".windows-folder-probe/restart-sentinel.bin"
+    )).hexdigest() != certificate["restart_expected_sha256"]:
+        raise ValueError("Native Windows restart readback differs from the guest")
+    if any(certificate[key] != value for key, value in local_volume(state).items()):
+        raise ValueError("Native Windows volume identity changed during preflight")
+    certificate["restart_verified"] = True
+    from windows_folder_host import publish_evidence
+    publish_evidence(Path(state) / ".fullmag-windows-folder-owner.json", certificate)
+    publish_evidence(host_certificate, certificate)
+    return probe["checks"]
+
+
 def start(repo, assembly_receipt, port, frontend="static", source_root=None,
           startup_script=None, *, project_name=None, compose_template=None,
           run_receipt=None, previous_config_sha256=None,
-          recovery_authorization=None, migrate_compose_project=False):
+          recovery_authorization=None, migrate_compose_project=False,
+          backend_start=None):
     if project_name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project_name):
         raise ValueError("Invalid Compose project name")
+    if (assembly_receipt is None) == (backend_start is None):
+        raise ValueError("Exactly one of an assembly receipt or backend start inputs is required")
+    if backend_start is not None and recovery_authorization is not None:
+        raise ValueError("Backend start inputs cannot be combined with native recovery authorization")
+    if backend_start is not None and source_root is None and isinstance(backend_start, dict):
+        recorded_source = backend_start.get("source_root")
+        if isinstance(recorded_source, str):
+            source_root = Path(recorded_source)
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
     if frontend not in {"static", "dev"}:
@@ -1714,11 +2379,39 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         # project network. It is deliberately read-only: migration never
         # stops or removes a conflicting target instance.
         _assert_compose_project_absent(project, source_identity)
-    assembly_receipt = storage.validate_path(assembly_receipt, Path(layout["build_storage_root"]))
-    assembly = read_json(assembly_receipt)
-    if assembly.get("schema") != "fullmag.docker-all-image.v1" or assembly.get("state") != "succeeded" or assembly.get("exit_code") != 0:
-        raise ValueError("A successful all-in-Docker assembly receipt is required")
-    source_provenance = _validate_assembly_source_provenance(assembly, frontend=frontend)
+    backend_start = (
+        _validate_backend_start_inputs(backend_start, layout)
+        if backend_start is not None else None
+    )
+    if backend_start is not None:
+        _validate_backend_start_source_group(backend_start, source_identity)
+    if backend_start is None:
+        assembly_receipt = storage.validate_path(assembly_receipt, Path(layout["build_storage_root"]))
+        assembly = read_json(assembly_receipt)
+        if assembly.get("schema") != "fullmag.docker-all-image.v1" or assembly.get("state") != "succeeded" or assembly.get("exit_code") != 0:
+            raise ValueError("A successful all-in-Docker assembly receipt is required")
+        source_provenance = _validate_assembly_source_provenance(assembly, frontend=frontend)
+    else:
+        source_provenance = {"source_mode": backend_start["source_mode"]}
+        for field in ("source_digest", "source_snapshot_sha256", "live_manifest_sha256"):
+            if backend_start.get(field) is not None:
+                source_provenance[field] = backend_start[field]
+        assembly = {
+            "schema": "fullmag.docker-all-image.v1",
+            "state": "building",
+            "exit_code": 0,
+            "runtime_mode": "development_source_bind",
+            "source_mode": backend_start["source_mode"],
+            "source_root": backend_start["source_root"],
+            "source_git_common_dir": backend_start["git_common_dir"],
+            "image_id": backend_start["image_id"],
+            "base_image": backend_start["toolchain_image_id"],
+            "toolchain_image_id": backend_start["toolchain_image_id"],
+            "package_root": backend_start["package_root"],
+            "startup_helper_hashes": backend_start["startup_helper_hashes"],
+            "output": str(Path(backend_start["backend_start_receipt"]).parent),
+            "context": backend_start["helper_context"],
+        }
     image = assembly.get("image_id", "")
     observed = image_id(image)
     validate_workspace_environment(observed["Config"])
@@ -1734,11 +2427,12 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         if (assembly.get("runtime_mode") != "development_source_bind"
                 or observed["Config"].get("Labels", {}).get("org.fullmag.development") != "source-bind-v1"):
             raise ValueError("Development requires a source-bind image without copied application sources")
-        package = storage.validate_path(Path(assembly["package_root"]), Path(layout["storage_root"]))
-        validate_runtime_artifacts(package, development=True)
-        if any(digest(package / "bin" / name) != assembly["binary_hashes"].get(name)
-               for name in REQUIRED_BINARIES):
-            raise ValueError("Mounted backend package changed since image assembly")
+        if backend_start is None:
+            package = storage.validate_path(Path(assembly["package_root"]), Path(layout["storage_root"]))
+            validate_runtime_artifacts(package, development=True)
+            if any(digest(package / "bin" / name) != assembly["binary_hashes"].get(name)
+                   for name in REQUIRED_BINARIES):
+                raise ValueError("Mounted backend package changed since image assembly")
     elif assembly.get("runtime_mode") == "development_source_bind":
         raise ValueError("Static mode requires a packaged release image")
     assert_loopback_port_available(port, project)
@@ -1780,6 +2474,12 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
     register_runtime_reference_root(layout, root)
     spec = root / "compose.json"
     host_certificate = root / "windows-folder-host.json"
+    if backend_start is not None:
+        # Keep a typed pointer in the run receipt while the fixed backend
+        # service is still compiling.  It is replaced atomically by the final
+        # post-build assembly after the host has validated its receipt.
+        assembly_receipt = metadata_root / "backend-assembly.json"
+        storage.atomic_json(assembly_receipt, assembly)
     receipt = {"schema": "fullmag.docker-all-run.v1", "state": "starting", "image_id": image,
                "compose_project": project, "compose_file": str(spec), "state_root": str(state),
                "source_project_id": source_identity["project_id"],
@@ -1788,16 +2488,21 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                "host_certificate": str(host_certificate),
                "workspace_state_root": str(workspace_state_root),
                "assembly_receipt": str(assembly_receipt), "assembly_receipt_sha256": digest(assembly_receipt),
-               "native_source_identity": assembly["native_source_identity"],
                "source_mode": source_provenance["source_mode"],
-               "source_digest": source_provenance["source_digest"],
-               "source_snapshot_sha256": source_provenance["source_snapshot_sha256"],
                "url": f"http://localhost:{port}/workspace", "qualification": "NOT VERIFIED",
                "frontend_mode": frontend, "container_http_port": 8080 if frontend == "dev" else 8081}
+    for field in ("native_source_identity", "source_digest", "source_snapshot_sha256"):
+        if field in assembly:
+            receipt[field] = assembly[field]
     if "live_manifest_sha256" in source_provenance:
         receipt["live_manifest_sha256"] = source_provenance["live_manifest_sha256"]
-        receipt["source_manifest"] = assembly["source_manifest"]
         receipt["source_git_common_dir"] = assembly["source_git_common_dir"]
+        if "source_manifest" in assembly:
+            receipt["source_manifest"] = assembly["source_manifest"]
+    if backend_start is not None:
+        receipt["backend_start_inputs"] = backend_start["backend_start_receipt"]
+        receipt["backend_start_inputs_sha256"] = digest(Path(backend_start["backend_start_receipt"]).with_name("backend-start-inputs.json"))
+        receipt["backend_build_state"] = "building"
     elif isinstance(assembly.get("source_archive"), dict):
         # Preserve the immutable legacy descriptor when one exists.  Live
         # source runs intentionally take the branch above and never invent a
@@ -1952,21 +2657,43 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             shutil.copyfile(source_template, compose_source_path)
 
         def configured_spec():
+            package_provenance = (
+                Path(backend_start["provenance_path"])
+                if backend_start is not None else assembly_receipt
+            )
             return compose_spec(image, state.resolve(), port, host_certificate.resolve(),
                                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                                 package=assembly.get("package_root"),
-                                provenance=assembly_receipt, project=project, source_identity=source_identity,
+                                provenance=package_provenance, project=project, source_identity=source_identity,
                                 workspace_state_root=workspace_state_root,
                                 toolchain_image=assembly.get("base_image"), template=compose_source_path,
                                 host_ledger=host_ledger, startup=startup,
                                 frontend_cache=frontend_cache, recovery=recovery,
-                                previous_config_sha256=previous_config_sha256)
+                                previous_config_sha256=previous_config_sha256,
+                                backend_start=backend_start)
         if os.name != "nt":
             raise ValueError("This Windows-folder launcher requires native Windows host attestation")
         from windows_folder_host import attest, local_volume, publish_evidence, read_owned_regular
         from docker_host_ledger import prepare as prepare_host_ledger
         engine_id = docker("info", "--format", "{{.ID}}")
-        if reuse is not None:
+        if backend_start is not None:
+            # The fixed backend service starts in a build gate.  Publish a
+            # provisional development delegation before Compose creation so
+            # its two guest probes can run while the package is compiling.
+            host_certificate.parent.mkdir(parents=True, exist_ok=True)
+            host_certificate.touch(exist_ok=True)
+            provisional_assembly, provisional_hashes, delegation = (
+                _provisional_development_certificate(backend_start, source_identity)
+            )
+            certificate = attest(
+                state,
+                provisional_assembly,
+                engine_id,
+                provisional_hashes,
+                development_build=delegation,
+            )
+            publish_evidence(host_certificate, certificate)
+        elif reuse is not None:
             certificate = _reuse_host_certificate(reuse, assembly, engine_id)
         else:
             certificate = None
@@ -2008,9 +2735,10 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 "receipt_path": frontend_cache["receipt_path"],
             }
             storage.atomic_json(root / "receipt.json", receipt)
-        if certificate is None:
+        if certificate is None and backend_start is None:
             certificate = attest(state, assembly, engine_id, assembly["binary_hashes"])
-        publish_evidence(host_certificate, certificate)
+        if certificate is not None:
+            publish_evidence(host_certificate, certificate)
         if recovery_info is not None:
             from docker_runtime_recovery import validate_postrotation_identity
 
@@ -2039,39 +2767,51 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             if (not isinstance(binding, dict) or not isinstance(binding.get("path"), str)
                     or digest(Path(binding["path"])) != binding.get("sha256")):
                 raise ValueError("Post-rotation storage identity binding changed before Compose publication")
-        probe_service = configured["services"]["backend"]
-        probe_service["command"] = ["--storage-probe"]
-        probe_service["healthcheck"] = {"disable": True}
-        storage.atomic_json(spec, configured)
-        docker(*args, "config", "--quiet")
-        docker(*args, "up", "--detach", "--no-build", "--pull", "never", "backend")
-        probe_container = docker(*args, "ps", "--all", "--quiet", "backend")
-        receipt["probe_container_id"] = probe_container
-        receipt["first_probe_exit_code"] = docker("wait", probe_container, timeout=120)
-        (root / "storage-first.log").write_text(docker("logs", probe_container, combined=True))
-        if receipt["first_probe_exit_code"] != "0":
-            raise ValueError("Windows storage first probe failed: " + docker("logs", probe_container, combined=True))
-        docker("start", probe_container)
-        receipt["restart_probe_exit_code"] = docker("wait", probe_container, timeout=120)
-        (root / "storage-restart.log").write_text(docker("logs", probe_container, combined=True))
-        if receipt["restart_probe_exit_code"] != "0":
-            raise ValueError("Windows storage restart probe failed: " + docker("logs", probe_container, combined=True))
-        probe = json.loads(read_owned_regular(state / ".windows-folder-probe/probe-restart.json"))
-        CHECKS = ("file_sync", "directory_sync", "atomic_replace", "atomic_directory_publish",
-                  "process_lock", "no_follow_symlink", "no_follow_junction",
-                  "sqlite_transactions", "restart_readback")
-        if set(probe["checks"]) != set(CHECKS) or not all(value is True for value in probe["checks"].values()):
-            raise ValueError("Windows session storage probes were not all successful")
-        import hashlib
-        if hashlib.sha256(read_owned_regular(state / ".windows-folder-probe/restart-sentinel.bin")).hexdigest() != certificate["restart_expected_sha256"]:
-            raise ValueError("Native Windows restart readback differs from the guest")
-        if any(certificate[key] != value for key, value in local_volume(state).items()):
-            raise ValueError("Native Windows volume identity changed during preflight")
-        certificate["restart_verified"] = True
-        publish_evidence(state / ".fullmag-windows-folder-owner.json", certificate)
-        publish_evidence(host_certificate, certificate)
-        receipt["storage_operational_checks"] = probe["checks"]
-        receipt["storage_power_loss"] = "NOT VERIFIED"
+        initial_service_ids = None
+        if backend_start is not None:
+            # The backend service stays alive in its typed build gate.  It is
+            # the only application container that runs the two guest probes;
+            # no third probe container is created.
+            storage.atomic_json(spec, configured)
+            docker(*args, "config", "--quiet")
+            docker(*args, "up", "--detach", "--no-build", "--pull", "never")
+            container = _compose_service_container_id(args, "backend")
+            frontend_container = _compose_service_container_id(args, "frontend")
+            initial_service_ids = {
+                "backend": container,
+                "frontend": frontend_container,
+            }
+            backend_receipt, backend_provenance = _wait_for_backend_build(
+                backend_start, container, timeout=FRONTEND_DEV_READY_TIMEOUT_SECONDS
+            )
+            assembly = _assembly_from_backend_start(
+                backend_start, backend_receipt, backend_provenance,
+                container_id=container,
+            )
+            storage.atomic_json(assembly_receipt, assembly)
+            receipt["assembly_receipt_sha256"] = digest(assembly_receipt)
+            receipt["backend_build_state"] = "succeeded"
+            receipt["backend_build_receipt_sha256"] = assembly["build_receipt_sha256"]
+            if reuse is not None:
+                certificate = _reuse_host_certificate(reuse, assembly, engine_id)
+            else:
+                if certificate is None:
+                    raise ValueError("Development backend build has no provisional host certificate")
+                certificate = _refresh_development_certificate(certificate, assembly, backend_start)
+                _publish_bound_development_certificate(
+                    host_certificate,
+                    state / ".fullmag-windows-folder-owner.json",
+                    certificate,
+                )
+            receipt["storage_operational_checks"] = _complete_backend_storage_preflight(
+                docker, container, state, host_certificate, certificate, root
+            )
+            receipt["storage_power_loss"] = "NOT VERIFIED"
+        else:
+            receipt["storage_operational_checks"] = _legacy_storage_preflight(
+                configured, spec, args, docker, root, state, host_certificate, certificate
+            )
+            receipt["storage_power_loss"] = "NOT VERIFIED"
         if recovery_info is not None:
             if digest(recovery_info["path"]) != recovery_info["authorization_sha256"]:
                 raise ValueError("Runtime recovery authorization changed before service startup")
@@ -2083,8 +2823,18 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         ready_timeout, docker_client_timeout = _runtime_ready_timeouts(inputs, startup)
         docker(*args, "up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout",
                str(ready_timeout), timeout=docker_client_timeout)
-        container = docker(*args, "ps", "--quiet", "backend")
+        container = _compose_service_container_id(args, "backend")
         receipt["container_id"] = container
+        if initial_service_ids is not None:
+            frontend_container = _compose_service_container_id(args, "frontend")
+            if container != initial_service_ids["backend"]:
+                raise ValueError(
+                    "Backend Compose container was recreated between build and readiness"
+                )
+            if frontend_container != initial_service_ids["frontend"]:
+                raise ValueError(
+                    "Frontend Compose container was recreated between build and readiness"
+                )
         actual = json.loads(docker("inspect", container))[0]
         from docker_compose_identity import validate_source_labels
         validate_source_labels(actual, source_identity)
@@ -2094,7 +2844,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                     [{"HostIp": "127.0.0.1", "HostPort": str(port)}]}
         if inputs is not None:
             from docker_development_inputs import attest_mounts
-            frontend_container = docker(*args, "ps", "--quiet", "frontend")
+            if initial_service_ids is None:
+                frontend_container = _compose_service_container_id(args, "frontend")
             receipt["frontend_container_id"] = frontend_container
             front = json.loads(docker("inspect", frontend_container))[0]
             validate_source_labels(front, source_identity)
@@ -2129,20 +2880,53 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         host = actual["HostConfig"]
         if actual["Image"] != image or (host.get("PortBindings") or {}) != bindings:
             raise ValueError("Runtime image or loopback port attestation mismatch")
-        if inputs is not None:
-            expected_readonly = {"/opt/fullmag/source": Path(inputs["source_root"]).resolve(),
-                                 "/opt/fullmag/package": package.resolve(),
-                                 "/opt/fullmag/provenance.json": assembly_receipt.resolve()}
+        if backend_start is not None:
+            expected_readonly = {
+                "/opt/fullmag/source": Path(backend_start["source_root"]).resolve(),
+                "/opt/fullmag/source-git": Path(backend_start["git_common_dir"]).resolve(),
+            }
+            expected_readwrite = {
+                # The cache helper returns the package root in the Docker
+                # daemon namespace (for example /mnt/fullmag-cache/package).
+                # Native Windows Python must compare that lexical POSIX path
+                # with Docker inspect output; Path.resolve()/stat would
+                # reinterpret it in the host namespace.
+                "/opt/fullmag/package": _daemon_mount_path(
+                    backend_start["package_root"], "Backend package root"
+                ),
+                "/opt/fullmag/provenance.json": Path(backend_start["provenance_path"]).resolve(),
+            }
+        elif inputs is not None:
+            expected_readonly = {"/opt/fullmag/source": Path(inputs["source_root"]).resolve()}
+            expected_readwrite = {
+                "/opt/fullmag/package": package.resolve(),
+                "/opt/fullmag/provenance.json": assembly_receipt.resolve(),
+            }
         elif startup is not None:
             expected_readonly = {"/opt/fullmag/source": Path(startup["authorization"]["source_root"]).resolve()}
+            expected_readwrite = {}
         else:
             expected_readonly = {}
-        if inputs is not None or startup is not None:
+            expected_readwrite = {}
+        if inputs is not None or backend_start is not None or startup is not None:
             for destination, source in expected_readonly.items():
                 bound = [m for m in actual["Mounts"] if m["Destination"] == destination]
                 if (len(bound) != 1 or bound[0]["Type"] != "bind" or bound[0]["RW"]
                         or host_path(bound[0]["Source"]) != source):
                     raise ValueError("Development readonly bind differs: " + destination)
+            for destination, source in expected_readwrite.items():
+                bound = [m for m in actual["Mounts"] if m["Destination"] == destination]
+                if len(bound) != 1 or bound[0]["Type"] != "bind" or not bound[0]["RW"]:
+                    raise ValueError("Development writable bind differs: " + destination)
+                observed_source = bound[0].get("Source")
+                if destination == "/opt/fullmag/package" and backend_start is not None:
+                    observed_daemon_source = _daemon_mount_path(
+                        observed_source, "Development backend package bind"
+                    )
+                    if observed_daemon_source != source:
+                        raise ValueError("Development writable bind differs: " + destination)
+                elif host_path(observed_source) != source:
+                    raise ValueError("Development writable bind differs: " + destination)
         if recovery is not None:
             recovery_env = dict(
                 value.split("=", 1)
@@ -2199,11 +2983,16 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         if not any(d.get("Count") == -1 and ["gpu"] in d.get("Capabilities", []) for d in host.get("DeviceRequests", [])):
             raise ValueError("Runtime NVIDIA GPU request is missing")
         provenance = json.loads(docker("exec", container, "cat", "/opt/fullmag/provenance.json"))
-        if any(provenance.get(key) != assembly.get(key) for key in
-               ("commit", "job_id", "source_digest", "base_image", "native_source_identity",
-                "source_mode", "source_snapshot_sha256", "live_manifest_sha256",
-                "source_git_common_dir", "binary_hashes", "startup_helper_hashes",
-                "build_receipt_sha256")):
+        if backend_start is not None:
+            if any(provenance.get(key) != assembly.get(key) for key in (
+                    "commit", "source_digest", "native_source_identity", "source_mode",
+                    "source_snapshot_sha256", "binary_hashes", "build_receipt_sha256")):
+                raise ValueError("Runtime backend provenance differs from post-build receipt")
+        elif any(provenance.get(key) != assembly.get(key) for key in
+                 ("commit", "job_id", "source_digest", "base_image", "native_source_identity",
+                  "source_mode", "source_snapshot_sha256", "live_manifest_sha256",
+                  "source_git_common_dir", "binary_hashes", "startup_helper_hashes",
+                  "build_receipt_sha256")):
             raise ValueError("Runtime image provenance differs from assembly receipt")
         for name, expected in helper_hashes.items():
             observed_helper = docker("exec", container, "sha256sum", "/opt/fullmag/" + name).split()[0]

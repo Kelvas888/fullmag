@@ -1,6 +1,6 @@
 # Fullmag development on Docker Desktop. Sources stay in the selected checkout.
 # The direct development launcher resolves paths, builds inside the backend
-# service on request, checks Windows storage and records the resolved config.
+# service at each start, checks Windows storage and records the resolved config.
 # Compose project identity is injected by the managed launcher.  The default
 # keeps direct config inspection deterministic; selected worktrees override it.
 name: ${FULLMAG_COMPOSE_PROJECT:-fullmag-master}
@@ -32,16 +32,35 @@ services:
     security_opt: ["no-new-privileges:true"]
     stop_grace_period: 60s
     hostname: ${FULLMAG_BACKEND_HOSTNAME:?Managed run hostname is required}
-    # Verify the immutable package receipt and artifact hashes before handing
-    # control to the shared all-in-one backend entrypoint.  Keep `serve` in
-    # the entrypoint so the managed storage probe can append its flag as the
-    # Compose command without bypassing receipt validation.
-    entrypoint: ["/usr/local/bin/python3", "/opt/fullmag/backend_dev.py", "serve"]
+    # Capture the current mounted checkout on every start, build as needed in
+    # this same container, then hand the receipt-validated package to runtime.
+    # The managed storage probe overrides this command with
+    # `serve --storage-probe`; keeping the operation outside the entrypoint
+    # preserves that preflight boundary without allowing a shell command from
+    # the host.
+    entrypoint: ["/usr/local/bin/python3", "/opt/fullmag/backend_dev.py"]
+    command:
+      - start
+      - --source-root
+      - /opt/fullmag/source
+      - --git-common-root
+      - /opt/fullmag/source-git
+      - --output
+      - /opt/fullmag/package
+      - --build-root
+      - /build
     environment:
       FULLMAG_DOCKER_ROLE: backend
+      FULLMAG_COMPOSE_PROJECT: ${FULLMAG_COMPOSE_PROJECT:-fullmag-master}
+      FULLMAG_SOURCE_HOST_ROOT: ${FULLMAG_SOURCE_ROOT:?Select the Windows source checkout}
       FULLMAG_SESSION_STORAGE_PROFILE: windows-folder-v1
       FULLMAG_RUNTIME_IMAGE_ID: ${FULLMAG_DEV_IMAGE}
+      FULLMAG_TOOLCHAIN_IMAGE_ID: ${FULLMAG_TOOLCHAIN_IMAGE_ID:?Pin the toolchain identity}
       FULLMAG_BACKEND_CARGO_PROFILE: ${FULLMAG_BACKEND_CARGO_PROFILE:-backend-dev}
+      FULLMAG_REPO_ROOT: /opt/fullmag/source
+      FULLMAG_RUNTIME_PACKAGE_ROOT: /opt/fullmag/package
+      FULLMAG_PACKAGE_PROVENANCE: /opt/fullmag/provenance.json
+      PYTHONPATH: /build/workspace/packages/fullmag-py/src:/opt/fullmag/package
       # Durable workspace metadata is isolated per Compose source group.
       FULLMAG_WORKSPACE_STATE_DIR: /user-data
     expose: ["8081"]
@@ -52,16 +71,27 @@ services:
         target: /opt/fullmag/source
         read_only: true
         bind: {create_host_path: false}
-      # Compiled backend output, not a Windows executable or source copy.
+      # The live Git common directory is read-only input for the authenticated
+      # source manifest.  It is never used as a mutable build workspace.
+      - type: bind
+        source: ${FULLMAG_SOURCE_GIT_COMMON:?Mount the selected checkout Git common directory}
+        target: /opt/fullmag/source-git
+        read_only: true
+        bind: {create_host_path: false}
+      # Compiled backend output is the fixed package child of the helper-attested
+      # ext4 cache; the launcher preserves its Docker-daemon path unchanged.
       - type: bind
         source: ${FULLMAG_BACKEND_PACKAGE:?Build the backend inside its Compose service}
         target: /opt/fullmag/package
-        read_only: true
+        read_only: false
         bind: {create_host_path: false}
       - type: bind
         source: ${FULLMAG_PACKAGE_PROVENANCE:?Backend build provenance is required}
         target: /opt/fullmag/provenance.json
-        read_only: true
+        # This is the small run-owned handoff record.  The backend writer
+        # updates it in place while API admission is still closed; the parent
+        # /opt/fullmag tree remains read-only and no directory is overmounted.
+        read_only: false
         bind: {create_host_path: false}
       # Per-group durable user data: workspace.db and related settings only.
       # Runtime sessions/results remain in the per-run /state bind below.
@@ -81,15 +111,14 @@ services:
         bind: {create_host_path: false}
     tmpfs: ["/tmp:rw,nosuid,nodev,size=512m"]
     healthcheck:
-      # Backend startup is bounded by accepted-store bootstrap (180s), API
-      # binding (60s), service-ensure (90s), and pinned API liveness (30s).
-      # Keep a 30s scheduling margin without weakening the readiness command
-      # or its retry policy. The command covers healthz (2s), native status
-      # (5s), and Python/receipt overhead within its 10s deadline.
+      # Cold CUDA/FEM compilation runs before the API process exists.  Keep a
+      # four-hour start budget aligned with the bounded direct backend build;
+      # readiness still requires the existing process-tree, healthz, and
+      # native-service checks in healthcheck.py.
       test: ["CMD", "/usr/local/bin/python3", "/opt/fullmag/healthcheck.py"]
       interval: 5s
       timeout: 10s
-      start_period: 390s
+      start_period: 14400s
       retries: 6
     networks: [fullmag]
 

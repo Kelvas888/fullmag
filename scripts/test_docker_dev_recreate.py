@@ -21,6 +21,26 @@ def _sha256(path: Path) -> str:
 
 
 class DockerDevRecreateContract(unittest.TestCase):
+    def test_build_parser_preserves_explicit_port(self):
+        parsed = docker_dev._parser().parse_args(["build", "--port", "4242"])
+        self.assertEqual(parsed.port, 4242)
+        self.assertIsNone(parsed.script)
+
+    def test_live_service_rejects_frozen_source_options_explicitly(self):
+        base = types.SimpleNamespace(
+            profile="dev",
+            source_manifest=None,
+            include_untracked=[],
+        )
+        with patch.object(docker_dev, "_require_native_windows"):
+            base.source_manifest = Path("/owned/frozen-manifest.json")
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "source-manifest.*unsupported"):
+                docker_dev._backend_start_inputs(base)
+            base.source_manifest = None
+            base.include_untracked = ["new/example.py"]
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "include-untracked.*unsupported.*Git index"):
+                docker_dev._backend_start_inputs(base)
+
     def _run_fixture(self):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name).resolve()
@@ -343,6 +363,7 @@ class DockerDevRecreateContract(unittest.TestCase):
             run_root = build_root / "direct-compose" / ("a" * 32)
             run_root.mkdir(parents=True)
             package = run_root / "package"
+            package.mkdir()
             source_manifest = run_root / "source.json"
             source_archive = run_root / "source.tar"
             layout = {
@@ -371,7 +392,8 @@ class DockerDevRecreateContract(unittest.TestCase):
                 environment = docker_dev._environment(
                     layout, selected, run_root, source_bundle, package,
                     "fullmag-dev:local", "sha256:" + "a" * 64,
-                    "sha256:" + "b" * 64, {"environment": {}},
+                    "sha256:" + "b" * 64,
+                    {"environment": {"FULLMAG_BACKEND_PACKAGE": str(package)}},
                     "fullmag/development-base:local", "backend-dev",
                 )
             expected_user_data = storage_root / "user-data" / identity["project_name"]
@@ -387,6 +409,47 @@ class DockerDevRecreateContract(unittest.TestCase):
                 self.assertIn("read_only: true", overlay)
                 self.assertIn("FULLMAG_BACKEND_BUILD_STATE_ROOT", overlay)
                 self.assertIn("target: /state", overlay)
+
+    def test_live_backend_environment_leaves_source_capture_to_guest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            storage_root = root / "storage"
+            for path in (storage_root, storage_root / "build", storage_root / "cache",
+                         storage_root / "runtime"):
+                path.mkdir(parents=True)
+            selected = root / "checkout"
+            selected.mkdir()
+            run_root = storage_root / "build" / "direct-compose" / ("a" * 32)
+            run_root.mkdir(parents=True)
+            identity = {
+                "project_name": "fullmag-worktree-live-capture",
+                "network_name": "fullmag-worktree-live-capture_fullmag",
+                "project_id": "project-test",
+                "worktree_id": "live-capture",
+                "checkout_kind": "worktree",
+            }
+            layout = {
+                "storage_root": str(storage_root),
+                "build_root": str(storage_root / "build"),
+                "build_storage_root": str(storage_root / "build"),
+                "cache_root": str(storage_root / "cache"),
+                "runtime_root": str(storage_root / "runtime"),
+            }
+            package = root / "daemon-package"
+            source_bundle = {
+                "source_mode": "live-shadow-v1",
+                "git_common_dir": "/opt/fullmag/source-git",
+            }
+            cache = {"environment": {"FULLMAG_BACKEND_PACKAGE": str(package)}}
+            with patch.object(docker_dev, "_compose_identity", return_value=identity):
+                environment = docker_dev._environment(
+                    layout, selected, run_root, source_bundle, package,
+                    "sha256:" + "a" * 64, "sha256:" + "b" * 64,
+                    "sha256:" + "c" * 64, cache,
+                    "fullmag/development-base:local", "backend-dev",
+                )
+            self.assertEqual(environment["FULLMAG_SOURCE_GIT_COMMON"], "/opt/fullmag/source-git")
+            self.assertNotIn("FULLMAG_BACKEND_SOURCE_MANIFEST", environment)
 
     def test_empty_owned_network_is_reusable_but_foreign_or_attached_is_rejected(self):
         project = "fullmag-worktree-network-test"
@@ -451,17 +514,165 @@ class DockerDevRecreateContract(unittest.TestCase):
             script=None,
         )
         calls = []
+        events = []
+        backend_start = {"source_root": str(repo)}
+
+        class RecordingLease:
+            def __enter__(self):
+                events.append("lease-enter")
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                events.append("lease-exit")
+                return False
+
+        def prepare_backend(*_args, **kwargs):
+            events.append(("prepare", kwargs.get("heavy_lock_held")))
+            return backend_start, repo
+
+        def start_runtime(*_args, **_kwargs):
+            events.append("runtime-start")
+
         with patch.object(docker_dev, "_require_native_windows"), \
                 patch.object(docker_dev, "_select_source", return_value=(repo, layout)), \
                 patch.object(docker_dev, "_compose_identity", return_value=identity), \
                 patch.object(docker_dev, "_assert_no_running_fullmag", side_effect=lambda *value: calls.append(value)), \
-                patch.object(docker_dev, "_docker_capture", return_value=""), \
-                patch.object(docker_dev, "build", return_value=repo / "assembly.json"), \
+                patch.object(docker_dev, "_direct_heavy_lock", return_value=RecordingLease()), \
+                patch.object(docker_dev, "_backend_start_inputs", side_effect=prepare_backend), \
                 patch.object(runtime, "assert_loopback_port_available"), \
-                patch.object(runtime, "start"):
+                patch.object(runtime, "start", side_effect=start_runtime) as start_mock:
             docker_dev.up(args)
+        self.assertEqual(events, ["lease-enter", ("prepare", True), "lease-exit", "runtime-start"])
         self.assertEqual(calls, [(identity["project_name"], identity),
                                  (identity["project_name"], identity)])
+        start_mock.assert_called_once_with(
+            repo,
+            None,
+            args.port,
+            frontend="dev",
+            source_root=repo,
+            startup_script=None,
+            project_name=identity["project_name"],
+            compose_template=repo / docker_dev.COMPOSE_RUNTIME_FILE,
+            backend_start=backend_start,
+        )
+
+    def test_backend_wait_does_not_accept_retained_receipt_on_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            package.mkdir()
+            receipt_path = package / "backend-build-receipt.json"
+            receipt_path.write_text(
+                json.dumps({
+                    "schema": "fullmag.direct-compose.backend-build-receipt.v1",
+                    "state": "succeeded",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            provenance = root / "provenance.json"
+            provenance.write_text(
+                json.dumps({
+                    "state": "succeeded",
+                    "build_receipt_sha256": _sha256(receipt_path),
+                }) + "\n",
+                encoding="utf-8",
+            )
+            inputs = {
+                "package_root": str(package),
+                "provenance_path": str(provenance),
+                "previous_backend_build_receipt_sha256": _sha256(receipt_path),
+            }
+            with patch.object(runtime, "_container_inspect", return_value={
+                "State": {"Running": True}
+            }):
+                with self.assertRaises(runtime.DockerOutcomeUnknown):
+                    runtime._wait_for_backend_build(inputs, "container", timeout=0.01)
+
+    def test_postbuild_receipt_supplies_fresh_source_identity_without_host_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            start_receipt = root / "backend-start-receipt.json"
+            start_receipt.write_text("{}\n", encoding="utf-8")
+            binary_hashes = {name: "a" * 64 for name in runtime.REQUIRED_BINARIES}
+            inputs = {
+                "run_id": "b" * 32,
+                "source_mode": "live-shadow-v1",
+                "source_root": "/opt/fullmag/source",
+                "git_common_dir": "/opt/fullmag/source-git",
+                "image_id": "sha256:" + "b" * 64,
+                "toolchain_image_id": "sha256:" + "c" * 64,
+                "build_profile": "dev",
+                "package_root": "/mnt/fullmag-cache/package",
+                "backend_start_receipt": str(start_receipt),
+                "helper_context": "/run/fullmag/backend-context",
+                "startup_helper_hashes": {
+                    "docker_startup_script.py": "d" * 64,
+                    "fullmag_storage.py": "e" * 64,
+                },
+            }
+            receipt_source = {
+                "source_mode": "live-shadow-v1",
+                "resolved_commit": "f" * 40,
+                "source_digest": "1" * 64,
+                "source_snapshot_sha256": "2" * 64,
+                "live_manifest_sha256": "3" * 64,
+            }
+            native_identity = {
+                "head_commit_full": receipt_source["resolved_commit"],
+                "source_snapshot_sha256": receipt_source["source_snapshot_sha256"],
+            }
+            receipt = {"schema": "fullmag.direct-compose.backend-build-receipt.v1",
+                       "source": receipt_source,
+                       "native_source_identity": native_identity}
+            provenance = {
+                "state": "succeeded",
+                "commit": receipt_source["resolved_commit"],
+                "source_mode": receipt_source["source_mode"],
+                "source_digest": receipt_source["source_digest"],
+                "source_snapshot_sha256": receipt_source["source_snapshot_sha256"],
+                "native_source_identity": native_identity,
+                "toolchain_image_id": inputs["toolchain_image_id"],
+                "binary_hashes": binary_hashes,
+                "build_receipt_sha256": "4" * 64,
+            }
+            with patch.object(runtime, "_read_backend_binary_hashes", return_value=binary_hashes):
+                assembly = runtime._assembly_from_backend_start(inputs, receipt, provenance)
+            self.assertEqual(assembly["commit"], receipt_source["resolved_commit"])
+            self.assertEqual(assembly["live_manifest_sha256"], receipt_source["live_manifest_sha256"])
+            self.assertNotIn("source_manifest", assembly)
+
+    def test_backend_manifest_refresh_preserves_existing_bind_mount_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "capture.json"
+            destination = root / "backend-start" / "manifest.json"
+            source.write_bytes(b'{"capture":1}\n')
+            docker_dev._publish_backend_start_manifest(source, destination)
+            inode = destination.stat().st_ino
+            source.write_bytes(b'{"capture":2,"source":"same-run"}\n')
+            docker_dev._publish_backend_start_manifest(source, destination)
+            self.assertEqual(destination.stat().st_ino, inode)
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+
+    def test_backend_cache_package_root_is_the_attested_mount_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mount = Path(directory) / "ext4-cache"
+            package = mount / "package"
+            package.mkdir(parents=True)
+            cache = {
+                "mount_root": str(mount),
+                "package_root": str(package),
+                "environment": {"FULLMAG_BACKEND_PACKAGE": str(package)},
+            }
+            self.assertEqual(docker_dev._backend_cache_package_root(cache), package)
+            cache["environment"]["FULLMAG_BACKEND_PACKAGE"] = str(Path(directory) / "other")
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "package environment"):
+                docker_dev._backend_cache_package_root(cache)
+            cache["package_root"] = str(Path(directory) / "escape")
+            cache["environment"]["FULLMAG_BACKEND_PACKAGE"] = str(Path(directory) / "escape")
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "escapes"):
+                docker_dev._backend_cache_package_root(cache)
 
     def test_frontend_workspace_reuse_checks_dependency_bytes_without_reseeding(self):
         with tempfile.TemporaryDirectory() as directory:

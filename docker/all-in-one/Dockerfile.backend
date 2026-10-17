@@ -21,7 +21,7 @@ RUN set -eu; \
     test -x /root/.cargo/bin/cargo; \
     chmod o+x /root; \
     chmod o+rx /root/.cargo /root/.cargo/bin /root/.rustup /root/.rustup/toolchains; \
-    mkdir -p /build/workspace /build/cargo /output; \
+    mkdir -p /build/workspace /build/cargo /output /input /opt/fullmag/source-git; \
     if [ -e /workspace ] || [ -L /workspace ]; then \
         test ! -L /workspace; \
         test -d /workspace; \
@@ -34,7 +34,10 @@ RUN set -eu; \
     chmod 0644 /opt/fullmag/backend_source.py
 
 ENV FULLMAG_RUNTIME_ROOT=/opt/fullmag/package \
+    FULLMAG_REPO_ROOT=/opt/fullmag/source \
     FULLMAG_WEB_STATIC_DIR=/opt/fullmag/package/web \
+    FULLMAG_RUNTIME_PACKAGE_ROOT=/opt/fullmag/package \
+    FULLMAG_PACKAGE_PROVENANCE=/opt/fullmag/provenance.json \
     FULLMAG_DISABLE_MANAGED_FEM_GPU_RUNTIME=1 \
     FULLMAG_FORCE_LOCAL_FEM_GPU=0 \
     FULLMAG_FORCE_LOCAL_FEM_CPU=0 \
@@ -51,10 +54,11 @@ ENV FULLMAG_RUNTIME_ROOT=/opt/fullmag/package \
     RUSTUP_HOME=/root/.rustup \
     RUSTUP_TOOLCHAIN=nightly \
     RUSTUP_AUTO_INSTALL=0 \
+    PYTHONPATH=/build/workspace/packages/fullmag-py/src:/opt/fullmag/package \
     PATH=/root/.cargo/bin:/opt/fullmag/package/bin:/opt/fullmag-deps/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 WORKDIR /build
 USER 65532:65532
-# Keep the shared image's normal all-in-one entrypoint for frontend/regular
-# runtime.  Compose invokes backend_dev.py explicitly for prepare/build (and
-# may invoke its receipt-validated serve operation for the backend service).
+# Keep the shared image's normal all-in-one entrypoint for non-backend roles.
+# Compose invokes backend_dev.py explicitly for the typed start/serve boundary
+# used by the backend service.

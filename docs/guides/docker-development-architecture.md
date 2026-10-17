@@ -49,6 +49,10 @@ Zmiana modułu przebudowuje go oraz rzeczywistych zależnych konsumentów;
 zmiana wspólnego typu może wymagać więcej pracy niż zmiana pliku wykonawczego.
 Zmiana kodu aplikacji nie przebudowuje automatycznie CUDA, MFEM, hypre ani
 libCEED. Zmiana zależności, kompilatora lub flag może unieważnić szerszy cache.
+Blokada backendu chroni konkretny trwały cache; odrębne grupy mogą kompilować
+równolegle. Hostowy heavy lock służy przygotowaniu obrazów i receiptów, nie
+obejmuje kompilacji w uruchomionej usłudze. Przydział fizycznego GPU nadal
+przechodzi przez wspólny host ledger.
 
 ## Polecenia trybu developerskiego
 
@@ -145,6 +149,16 @@ sprawdza artefakty i provenance, a następnie uruchamia istniejący nadzór API
 oraz native runtime. Błąd buildu zachowuje log i receipt; nie uruchamia API
 z częściowo opublikowanym pakietem. Home może być dostępny podczas budowania.
 Stan `ready` wymaga rzeczywistego health/readiness, nie samego otwartego portu.
+
+### Pierwszy start i następne restarty
+
+Przy pierwszym starcie backend po buildzie czeka na wydanie hostowego certyfikatu
+storage i potwierdzenie prób odczytu/zapisu. Dopiero potem uruchamia API. Dla live
+dev certyfikat zawiera wąską delegację zaufanego buildera przypisaną do obrazu,
+toolchaina i grupy. Przy późniejszym restarcie nadal sprawdzany jest nowy rzeczywisty
+receipt/provenance i hash binarki; sam zapis zmiany kodu nie wymaga nowej zgody
+hosta dla niezmienionego storage. Ścieżka release zachowuje dokładne hostowe piny.
+Szczegóły i zakres delegacji określa ADR 0061; wdrożenie pozostaje **NOT VERIFIED**.
 
 ## Skrypt symulacji jako parametr startu
 

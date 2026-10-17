@@ -27,12 +27,12 @@ storage-info:
 docker-dev-toolchain:
     @{{storage_python}} "{{repo_root}}/scripts/bootstrap_docker_toolchain.py" --repo-root "{{repo_root}}" --direct-development
 
-# Direct two-service development: each application part builds in its container.
+# Direct two-service development: the persistent backend checks/builds source at every start.
 # The source parameter selects the main checkout or a registered worktree.
 docker-dev source_root="" port="3197" script="":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" up --port {{quote(port)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if script == "" { "" } else { "--script " + quote(script) }}}
 
-# Build the current backend snapshot with persistent cache; do not restart a simulation.
+# Compatibility start alias: starts both fixed services; use backend restart for iteration.
 docker-dev-build source_root="":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" build {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
 

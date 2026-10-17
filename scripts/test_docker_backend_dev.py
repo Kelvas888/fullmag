@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -132,7 +133,23 @@ class BackendPackageTests(unittest.TestCase):
             "\n  frontend:\n", 1
         )[0]
         self.assertIn(
-            'entrypoint: ["/usr/local/bin/python3", "/opt/fullmag/backend_dev.py", "serve"]',
+            'entrypoint: ["/usr/local/bin/python3", "/opt/fullmag/backend_dev.py"]',
+            backend_block,
+        )
+        self.assertIn("      - start\n", backend_block)
+        for token in (
+            "/opt/fullmag/source",
+            "/opt/fullmag/source-git",
+            "/opt/fullmag/package",
+            "/build",
+        ):
+            self.assertIn(token, backend_block)
+        for removed_token in ("/input/manifest.json", "--manifest", "--source-tar"):
+            self.assertNotIn(removed_token, backend_block)
+        self.assertIn("read_only: false", backend_block)
+        self.assertIn("start_period: 14400s", backend_block)
+        self.assertIn(
+            "PYTHONPATH: /build/workspace/packages/fullmag-py/src:/opt/fullmag/package",
             backend_block,
         )
         static_compose = (repository / "compose.static.yaml").read_text(encoding="utf-8")
@@ -173,6 +190,10 @@ class BackendPackageTests(unittest.TestCase):
                     execvpe.call_args_list[0].args[2]["FULLMAG_RUNTIME_PACKAGE_ROOT"],
                     str(output),
                 )
+                self.assertEqual(
+                    execvpe.call_args_list[0].args[2]["FULLMAG_PACKAGE_PROVENANCE"],
+                    "/opt/fullmag/provenance.json",
+                )
 
                 manifest = output / "runtimes/fem-gpu/manifest.json"
                 manifest.write_text(
@@ -183,6 +204,960 @@ class BackendPackageTests(unittest.TestCase):
                     tampered_exec.assert_not_called()
             finally:
                 backend.PACKAGE_ROOT = original_package_root
+
+    def test_start_prepares_and_serves_in_one_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package = root / "package"
+            package.mkdir()
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            events = []
+            build_number = 0
+
+            def prepare_candidate(*args):
+                nonlocal build_number
+                candidate = args[2]
+                build_number += 1
+                workspace = self._package_workspace(root / f"candidate-{build_number}")
+                records = backend._copy_package(workspace, candidate)
+                if build_number == 2:
+                    binary = candidate / "bin/fullmag-bin"
+                    binary.write_bytes(b"changed candidate\n")
+                    records = backend._hash_package(candidate)
+                backend._write_json(
+                    candidate / "backend-build-receipt.json",
+                    {
+                        "schema": backend.RECEIPT_SCHEMA,
+                        "state": "succeeded",
+                        "execution_lanes": {
+                            lane: {"status": "compiled"} for lane in backend.LANES
+                        },
+                        "artifacts": records,
+                    },
+                    "test candidate receipt",
+                )
+                events.append(("prepare", args))
+                return 0
+
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(
+                            "sha256:" + "a" * 64,
+                            {"image_id": "sha256:" + "a" * 64},
+                        ),
+                    ),
+                    patch.object(
+                        backend,
+                        "_prepare_locked",
+                        side_effect=prepare_candidate,
+                    ),
+                    patch.object(
+                        backend,
+                        "_capture_start_manifest",
+                        return_value=Path("/build/live-source/manifest.json"),
+                    ),
+                    patch.object(
+                        backend,
+                        "_publish_runtime_provenance",
+                        side_effect=lambda output: events.append(("provenance", output)) or 0,
+                    ),
+                    patch.object(
+                        backend,
+                        "_serve",
+                        side_effect=lambda extra: events.append(("serve", extra)) or 0,
+                    ),
+                ):
+                    command = [
+                        "start",
+                        "--build-root",
+                        str(build_root),
+                        "--jobs",
+                        "3",
+                    ]
+                    self.assertEqual(backend.main(command), 0)
+                    self.assertEqual(backend.main(command), 0)
+                self.assertEqual(
+                    [event[0] for event in events],
+                    ["prepare", "provenance", "serve"] * 2,
+                )
+                prepare_args = events[0][1]
+                self.assertEqual(
+                    prepare_args[0].manifest,
+                    Path("/build/live-source/manifest.json"),
+                )
+                self.assertIsNone(prepare_args[0].source_tar)
+                self.assertEqual(prepare_args[1], build_root)
+                self.assertTrue(
+                    prepare_args[2].is_relative_to(
+                        package / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                    )
+                )
+                self.assertTrue(
+                    prepare_args[2].is_relative_to(
+                        package
+                        / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                        / backend.PACKAGE_CANDIDATES_DIRNAME
+                    )
+                )
+                self.assertFalse(prepare_args[2].is_relative_to(build_root))
+                self.assertNotEqual(prepare_args[2], package)
+                self.assertEqual(prepare_args[3], 3)
+                self.assertEqual(events[1][1], package)
+                self.assertEqual(events[2][1], [])
+                self.assertNotEqual((package / "bin/fullmag-bin").read_bytes(), b"package\n")
+                backups = sorted(
+                    (
+                        package
+                        / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                        / backend.PACKAGE_BACKUPS_DIRNAME
+                    ).glob(".backend-package-backup-*")
+                )
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(
+                    (backups[0] / "bin/fullmag-bin").read_bytes(), b"package\n"
+                )
+                rotation = json.loads(
+                    (backups[0] / "rotation.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    rotation["schema"], "fullmag.direct-compose.package-rotation.v1"
+                )
+                self.assertEqual(rotation["state"], "succeeded")
+                self.assertFalse(
+                    list(
+                        (
+                            package
+                            / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                            / backend.PACKAGE_CANDIDATES_DIRNAME
+                        ).glob(".backend-package-candidate-*")
+                    )
+                )
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_storage_probe_bypasses_missing_package_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            package.mkdir()
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            try:
+                with (
+                    patch.object(backend.os, "execvpe") as execvpe,
+                    patch.object(backend, "_prepare_locked") as prepare,
+                ):
+                    self.assertEqual(backend.main(["serve", "--storage-probe"]), 0)
+                    execvpe.assert_called_once()
+                    prepare.assert_not_called()
+                    self.assertEqual(
+                        execvpe.call_args.args[1][1:],
+                        ["/opt/fullmag/entrypoint.py", "--storage-probe"],
+                    )
+                    self.assertEqual(
+                        execvpe.call_args.args[2]["FULLMAG_DOCKER_ROLE"], "backend"
+                    )
+                with patch.object(backend.os, "execvpe") as ordinary_exec:
+                    self.assertEqual(backend.main(["serve"]), 2)
+                    ordinary_exec.assert_not_called()
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def _windows_folder_development_gate_fixture(self, root):
+        package = root / "package"
+        package.mkdir()
+        host_path = root / "windows-folder-host.json"
+        owner_path = root / "windows-folder-owner.json"
+        image_id = "sha256:" + "a" * 64
+        toolchain_image_id = "sha256:" + "b" * 64
+        group_identity = "fullmag-dev"
+        provenance = {
+            "schema": "fullmag.docker-all-image.v1",
+            "state": "succeeded",
+            "cargo_profile": backend.BACKEND_CARGO_PROFILE,
+            "toolchain_image_id": toolchain_image_id,
+            "package_root": str(package),
+        }
+        development_build = {
+            "schema": backend.WINDOWS_FOLDER_DEVELOPMENT_SCHEMA,
+            "cargo_profile": backend.BACKEND_CARGO_PROFILE,
+            "toolchain_image_id": toolchain_image_id,
+            "package_root": str(package),
+            "provenance_path": str(root / "provenance.json"),
+            "group_identity": group_identity,
+            "source_identity": {
+                # Bootstrap evidence is deliberately different from the
+                # current build identity; the Rust verifier binds the latter
+                # to the current provenance and receipt instead.
+                "commit": "c" * 40,
+                "source_digest": "d" * 64,
+                "source_snapshot_sha256": "e" * 64,
+                "native_source_identity_sha256": "f" * 64,
+            },
+        }
+        host = {
+            "schema": backend.WINDOWS_FOLDER_HOST_SCHEMA,
+            "storage_profile": backend.WINDOWS_FOLDER_STORAGE_PROFILE,
+            "role": "session",
+            "owner_scope": "docker-desktop-linux",
+            "image_id": image_id,
+            "owner_token": "owner-token",
+            "restart_verified": True,
+            "development_build": development_build,
+        }
+        return (
+            package,
+            host_path,
+            owner_path,
+            host,
+            provenance,
+            "1" * 64,
+            {
+                "FULLMAG_RUNTIME_IMAGE_ID": image_id,
+                "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_image_id,
+                "FULLMAG_COMPOSE_PROJECT": group_identity,
+            },
+        )
+
+    def test_windows_folder_development_gate_accepts_matching_certificate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                package,
+                host_path,
+                owner_path,
+                host,
+                provenance,
+                receipt_sha256,
+                environment,
+            ) = self._windows_folder_development_gate_fixture(Path(directory))
+            backend._write_json(host_path, host, "test Windows-folder host certificate")
+            backend._write_json(owner_path, host, "test Windows-folder owner marker")
+            with (
+                patch.object(backend, "PACKAGE_ROOT", package),
+                patch.object(backend, "PROVENANCE_PATH", package.parent / "provenance.json"),
+                patch.object(backend, "HOST_ATTESTATION_PATH", host_path),
+                patch.object(backend, "WINDOWS_FOLDER_OWNER_PATH", owner_path),
+                patch.dict(os.environ, environment, clear=False),
+            ):
+                backend._wait_for_windows_folder_attestation(provenance, receipt_sha256)
+
+    def test_windows_folder_development_gate_times_out_without_certificate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                package,
+                host_path,
+                owner_path,
+                _host,
+                provenance,
+                receipt_sha256,
+                environment,
+            ) = self._windows_folder_development_gate_fixture(Path(directory))
+            with (
+                patch.object(backend, "PACKAGE_ROOT", package),
+                patch.object(backend, "PROVENANCE_PATH", package.parent / "provenance.json"),
+                patch.object(backend, "HOST_ATTESTATION_PATH", host_path),
+                patch.object(backend, "WINDOWS_FOLDER_OWNER_PATH", owner_path),
+                patch.object(backend, "WINDOWS_FOLDER_GATE_TIMEOUT_SECONDS", 0.0),
+                patch.dict(os.environ, environment, clear=False),
+            ):
+                with self.assertRaisesRegex(
+                    backend.BackendBuildError,
+                    "timed out waiting for a matching Windows-folder host attestation",
+                ):
+                    backend._wait_for_windows_folder_attestation(provenance, receipt_sha256)
+
+    def test_windows_folder_development_gate_rejects_certificate_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                package,
+                host_path,
+                owner_path,
+                host,
+                provenance,
+                receipt_sha256,
+                environment,
+            ) = self._windows_folder_development_gate_fixture(Path(directory))
+            backend._write_json(host_path, host, "test Windows-folder host certificate")
+            conflicting_owner = dict(host)
+            conflicting_owner["owner_token"] = "different-owner-token"
+            backend._write_json(
+                owner_path, conflicting_owner, "test Windows-folder owner marker"
+            )
+            with (
+                patch.object(backend, "PACKAGE_ROOT", package),
+                patch.object(backend, "PROVENANCE_PATH", package.parent / "provenance.json"),
+                patch.object(backend, "HOST_ATTESTATION_PATH", host_path),
+                patch.object(backend, "WINDOWS_FOLDER_OWNER_PATH", owner_path),
+                patch.dict(os.environ, environment, clear=False),
+            ):
+                with self.assertRaisesRegex(
+                    backend.BackendBuildError,
+                    "host certificate and owner marker differ",
+                ):
+                    backend._wait_for_windows_folder_attestation(provenance, receipt_sha256)
+
+    def test_windows_folder_development_gate_retries_restart_flag_publication_race(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                package,
+                host_path,
+                owner_path,
+                host,
+                provenance,
+                receipt_sha256,
+                environment,
+            ) = self._windows_folder_development_gate_fixture(Path(directory))
+            host_before_restart_readback = dict(host)
+            host_before_restart_readback["restart_verified"] = False
+            backend._write_json(
+                host_path,
+                host_before_restart_readback,
+                "test Windows-folder host certificate",
+            )
+            backend._write_json(owner_path, host, "test Windows-folder owner marker")
+            with (
+                patch.object(backend, "PACKAGE_ROOT", package),
+                patch.object(backend, "PROVENANCE_PATH", package.parent / "provenance.json"),
+                patch.object(backend, "HOST_ATTESTATION_PATH", host_path),
+                patch.object(backend, "WINDOWS_FOLDER_OWNER_PATH", owner_path),
+                patch.object(backend, "WINDOWS_FOLDER_GATE_TIMEOUT_SECONDS", 0.0),
+                patch.dict(os.environ, environment, clear=False),
+            ):
+                with self.assertRaisesRegex(
+                    backend.BackendBuildError,
+                    "timed out waiting for a matching Windows-folder host attestation",
+                ):
+                    backend._wait_for_windows_folder_attestation(provenance, receipt_sha256)
+
+    def test_windows_folder_development_gate_retries_bootstrap_to_live_audit_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                package,
+                _host_path,
+                _owner_path,
+                host,
+                provenance,
+                receipt_sha256,
+                environment,
+            ) = self._windows_folder_development_gate_fixture(Path(directory))
+            bootstrap = dict(host)
+            bootstrap.update(
+                source_commit="0" * 40,
+                binary_hashes={"fullmag-api": "0" * 64},
+                artifact_receipt_sha256="0" * 64,
+                restart_verified=False,
+            )
+            bootstrap_delegation = dict(bootstrap["development_build"])
+            bootstrap_delegation["source_identity"] = {
+                "commit": "0" * 40,
+                "source_digest": "0" * 64,
+                "source_snapshot_sha256": "0" * 64,
+                "native_source_identity_sha256": "0" * 64,
+            }
+            bootstrap["development_build"] = bootstrap_delegation
+
+            live = dict(bootstrap)
+            live.update(
+                source_commit="1" * 40,
+                binary_hashes={"fullmag-api": "2" * 64},
+                artifact_receipt_sha256="3" * 64,
+            )
+            live_delegation = dict(bootstrap_delegation)
+            live_delegation["source_identity"] = {
+                "commit": "4" * 40,
+                "source_digest": "5" * 64,
+                "source_snapshot_sha256": "6" * 64,
+                "native_source_identity_sha256": "7" * 64,
+            }
+            live["development_build"] = live_delegation
+
+            with (
+                patch.object(backend, "PACKAGE_ROOT", package),
+                patch.object(backend, "PROVENANCE_PATH", package.parent / "provenance.json"),
+                patch.dict(os.environ, environment, clear=False),
+            ):
+                self.assertEqual(
+                    backend._validate_windows_folder_attestation(
+                        live, bootstrap, provenance, receipt_sha256
+                    ),
+                    "pending",
+                )
+                live_verified = dict(live)
+                live_verified["restart_verified"] = True
+                self.assertEqual(
+                    backend._validate_windows_folder_attestation(
+                        live_verified, live_verified, provenance, receipt_sha256
+                    ),
+                    "ready",
+                )
+                bootstrap_verified = dict(bootstrap)
+                bootstrap_verified["restart_verified"] = True
+                with self.assertRaisesRegex(
+                    backend.BackendBuildError,
+                    "host certificate and owner marker differ",
+                ):
+                    backend._validate_windows_folder_attestation(
+                        live_verified, bootstrap_verified, provenance, receipt_sha256
+                    )
+
+    def test_start_capture_reads_current_worktree_git_file_and_refreshes_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+
+            def git(*arguments):
+                subprocess.run(
+                    ["git", "-C", str(repository), *arguments],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+            git("init", "--quiet")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "Fullmag test")
+            source_file = repository / "src" / "main.rs"
+            source_file.parent.mkdir()
+            source_file.write_text("pub fn value() -> u8 { 1 }\n", encoding="utf-8")
+            git("add", "src/main.rs")
+            git("commit", "--quiet", "-m", "fixture")
+            worktree = root / "worktree"
+            subprocess.run(
+                ["git", "-C", str(repository), "worktree", "add", "--quiet", "--detach", str(worktree), "HEAD"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            live_file = worktree / "src" / "main.rs"
+            live_file.write_text("pub fn value() -> u8 { 2 }\n", encoding="utf-8")
+            build_root = root / "build"
+            build_root.mkdir()
+            common_root = repository / ".git"
+
+            first_path = backend.capture_live_source_manifest(worktree, common_root, build_root)
+            first_document = json.loads(first_path.read_text(encoding="utf-8"))
+            backend._validate_live_manifest(first_document)
+            first_entry = next(
+                entry for entry in first_document["source_manifest"]["files"]
+                if entry["path"] == "src/main.rs"
+            )
+            self.assertEqual(first_entry["sha256"], hashlib.sha256(live_file.read_bytes()).hexdigest())
+            self.assertEqual(first_document["source_root"], str(worktree))
+            self.assertEqual(first_document["git_common_dir"], str(common_root))
+
+            live_file.write_text("pub fn value() -> u8 { 3 }\n", encoding="utf-8")
+            second_path = backend.capture_live_source_manifest(worktree, common_root, build_root)
+            second_document = json.loads(second_path.read_text(encoding="utf-8"))
+            second_entry = next(
+                entry for entry in second_document["source_manifest"]["files"]
+                if entry["path"] == "src/main.rs"
+            )
+            self.assertNotEqual(first_document["source_digest"], second_document["source_digest"])
+            self.assertNotEqual(first_entry["sha256"], second_entry["sha256"])
+            self.assertEqual(second_entry["sha256"], hashlib.sha256(live_file.read_bytes()).hexdigest())
+
+    def test_start_does_not_serve_after_a_failed_prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package = root / "package"
+            package.mkdir()
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(
+                            "sha256:" + "a" * 64,
+                            {"image_id": "sha256:" + "a" * 64},
+                        ),
+                    ),
+                    patch.object(
+                        backend,
+                        "_prepare_locked",
+                        side_effect=backend.BackendBuildError("prepare failed"),
+                    ),
+                    patch.object(
+                        backend,
+                        "_capture_start_manifest",
+                        return_value=Path("/build/live-source/manifest.json"),
+                    ),
+                    patch.object(backend, "_serve") as serve,
+                ):
+                    self.assertEqual(
+                        backend.main(
+                            [
+                                "start",
+                                "--manifest",
+                                "/input/manifest.json",
+                                "--build-root",
+                                str(build_root),
+                            ]
+                        ),
+                        2,
+                    )
+                serve.assert_not_called()
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_failed_restart_keeps_the_previous_package_byte_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package = root / "package"
+            package.mkdir()
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            calls = 0
+
+            def prepare_candidate(*args):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise backend.BackendBuildError("candidate build failed")
+                candidate = args[2]
+                workspace = self._package_workspace(root / "candidate")
+                records = backend._copy_package(workspace, candidate)
+                backend._write_json(
+                    candidate / "backend-build-receipt.json",
+                    {
+                        "schema": backend.RECEIPT_SCHEMA,
+                        "state": "succeeded",
+                        "execution_lanes": {
+                            lane: {"status": "compiled"} for lane in backend.LANES
+                        },
+                        "artifacts": records,
+                    },
+                    "test candidate receipt",
+                )
+                return 0
+
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(
+                            "sha256:" + "a" * 64,
+                            {"image_id": "sha256:" + "a" * 64},
+                        ),
+                    ),
+                    patch.object(backend, "_prepare_locked", side_effect=prepare_candidate),
+                    patch.object(
+                        backend,
+                        "_capture_start_manifest",
+                        return_value=Path("/build/live-source/manifest.json"),
+                    ),
+                    patch.object(backend, "_publish_runtime_provenance"),
+                    patch.object(backend, "_serve", return_value=0) as serve,
+                ):
+                    command = [
+                        "start",
+                        "--manifest",
+                        "/input/manifest.json",
+                        "--build-root",
+                        str(build_root),
+                    ]
+                    self.assertEqual(backend.main(command), 0)
+                    before = {
+                        path.relative_to(package).as_posix(): path.read_bytes()
+                        for path in package.rglob("*")
+                        if path.is_file()
+                    }
+                    self.assertEqual(backend.main(command), 2)
+                after = {
+                    path.relative_to(package).as_posix(): path.read_bytes()
+                    for path in package.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+                self.assertEqual(serve.call_count, 1)
+                self.assertFalse(
+                    list(
+                        (
+                            package
+                            / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                            / backend.PACKAGE_CANDIDATES_DIRNAME
+                        ).glob(".backend-package-candidate-*")
+                    )
+                )
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_start_rejects_noncanonical_package_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package = root / "package"
+            package.mkdir()
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            try:
+                with patch.object(backend, "_toolchain_identity") as toolchain:
+                    self.assertEqual(
+                        backend.main(
+                            [
+                                "start",
+                                "--manifest",
+                                "/input/manifest.json",
+                                "--output",
+                                str(root / "other-package"),
+                                "--build-root",
+                                str(build_root),
+                            ]
+                        ),
+                        2,
+                    )
+                toolchain.assert_not_called()
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_start_rejects_an_unverified_existing_package_mount(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package = root / "package"
+            package.mkdir()
+            retained = package / "backend-build-receipt.json"
+            retained_bytes = b"unverified receipt"
+            retained.write_bytes(retained_bytes)
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(backend, "_toolchain_identity") as toolchain,
+                    patch.object(backend, "_prepare_locked") as prepare,
+                    patch.object(backend, "_serve") as serve,
+                ):
+                    self.assertEqual(
+                        backend.main(
+                            [
+                                "start",
+                                "--manifest",
+                                "/input/manifest.json",
+                                "--build-root",
+                                str(build_root),
+                            ]
+                        ),
+                        2,
+                    )
+                toolchain.assert_not_called()
+                prepare.assert_not_called()
+                serve.assert_not_called()
+                self.assertEqual(retained.read_bytes(), retained_bytes)
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_start_rejects_unowned_package_development_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package = root / "package"
+            control = package / backend.PACKAGE_DEVELOPMENT_DIRNAME
+            (control / "foreign").mkdir(parents=True)
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(backend, "_toolchain_identity") as toolchain,
+                    patch.object(backend, "_prepare_locked") as prepare,
+                    patch.object(backend, "_serve") as serve,
+                ):
+                    self.assertEqual(
+                        backend.main(
+                            [
+                                "start",
+                                "--manifest",
+                                "/input/manifest.json",
+                                "--build-root",
+                                str(build_root),
+                            ]
+                        ),
+                        2,
+                    )
+                toolchain.assert_not_called()
+                prepare.assert_not_called()
+                serve.assert_not_called()
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_start_does_not_serve_after_a_failed_package_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package = root / "package"
+            package.mkdir()
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = package
+            prepare_calls = 0
+
+            def prepare_candidate(*args):
+                nonlocal prepare_calls
+                prepare_calls += 1
+                candidate = args[2]
+                workspace = self._package_workspace(root / f"publication-{prepare_calls}")
+                records = backend._copy_package(workspace, candidate)
+                if prepare_calls == 2:
+                    binary = candidate / "bin/fullmag-bin"
+                    binary.write_bytes(b"changed candidate\n")
+                    records = backend._hash_package(candidate)
+                backend._write_json(
+                    candidate / "backend-build-receipt.json",
+                    {
+                        "schema": backend.RECEIPT_SCHEMA,
+                        "state": "succeeded",
+                        "execution_lanes": {
+                            lane: {"status": "compiled"} for lane in backend.LANES
+                        },
+                        "artifacts": records,
+                    },
+                    "test candidate receipt",
+                )
+                return 0
+
+            original_rename = backend._rename_package_child
+
+            def fail_second_publication(source_root, target_root, name, label):
+                if prepare_calls == 2 and label == "candidate package":
+                    raise backend.BackendBuildError("injected publication failure")
+                return original_rename(source_root, target_root, name, label)
+
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(
+                            "sha256:" + "a" * 64,
+                            {"image_id": "sha256:" + "a" * 64},
+                        ),
+                    ),
+                    patch.object(backend, "_prepare_locked", side_effect=prepare_candidate),
+                    patch.object(
+                        backend,
+                        "_capture_start_manifest",
+                        return_value=Path("/build/live-source/manifest.json"),
+                    ),
+                    patch.object(backend, "_publish_runtime_provenance"),
+                    patch.object(backend, "_rename_package_child", side_effect=fail_second_publication),
+                    patch.object(backend, "_serve", return_value=0) as serve,
+                ):
+                    command = [
+                        "start",
+                        "--manifest",
+                        "/input/manifest.json",
+                        "--build-root",
+                        str(build_root),
+                    ]
+                    self.assertEqual(backend.main(command), 0)
+                    before = {
+                        path.relative_to(package).as_posix(): path.read_bytes()
+                        for path in package.rglob("*")
+                        if path.is_file()
+                    }
+                    self.assertEqual(backend.main(command), 2)
+                after = {
+                    path.relative_to(package).as_posix(): path.read_bytes()
+                    for path in package.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+                self.assertEqual(serve.call_count, 1)
+                self.assertFalse(
+                    list(
+                        (
+                            package
+                            / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                            / backend.PACKAGE_CANDIDATES_DIRNAME
+                        ).glob(".backend-package-candidate-*")
+                    )
+                )
+                self.assertFalse(
+                    list(
+                        (
+                            package
+                            / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                            / backend.PACKAGE_BACKUPS_DIRNAME
+                        ).glob(".backend-package-backup-*")
+                    )
+                )
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_failed_provenance_publication_restores_previous_bytes_and_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package = root / "package"
+            package.mkdir()
+            provenance = root / "provenance.json"
+            previous_provenance = b'{"state":"previous"}\n'
+            provenance.write_bytes(previous_provenance)
+            original_package_root = backend.PACKAGE_ROOT
+            original_provenance_path = backend.PROVENANCE_PATH
+            backend.PACKAGE_ROOT = package
+            backend.PROVENANCE_PATH = provenance
+            calls = 0
+
+            def prepare_candidate(*args):
+                nonlocal calls
+                calls += 1
+                candidate = args[2]
+                workspace = self._package_workspace(root / f"candidate-{calls}")
+                records = backend._copy_package(workspace, candidate)
+                if calls == 2:
+                    binary = candidate / "bin/fullmag-bin"
+                    binary.write_bytes(b"changed candidate\n")
+                    records = backend._hash_package(candidate)
+                backend._write_json(
+                    candidate / "backend-build-receipt.json",
+                    {
+                        "schema": backend.RECEIPT_SCHEMA,
+                        "state": "succeeded",
+                        "execution_lanes": {lane: {} for lane in backend.LANES},
+                        "artifacts": records,
+                    },
+                    "test candidate receipt",
+                )
+                return 0
+
+            publish_calls = 0
+
+            def publish_provenance(_output):
+                nonlocal publish_calls
+                publish_calls += 1
+                if publish_calls == 2:
+                    provenance.write_bytes(b"partial publication\n")
+                    raise backend.BackendBuildError("injected provenance publication failure")
+
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(
+                            "sha256:" + "a" * 64,
+                            {"image_id": "sha256:" + "a" * 64},
+                        ),
+                    ),
+                    patch.object(backend, "_prepare_locked", side_effect=prepare_candidate),
+                    patch.object(
+                        backend,
+                        "_capture_start_manifest",
+                        return_value=Path("/build/live-source/manifest.json"),
+                    ),
+                    patch.object(backend, "_publish_runtime_provenance", side_effect=publish_provenance),
+                    patch.object(backend, "_serve", return_value=0) as serve,
+                ):
+                    command = [
+                        "start",
+                        "--manifest",
+                        "/input/manifest.json",
+                        "--build-root",
+                        str(build_root),
+                    ]
+                    self.assertEqual(backend.main(command), 0)
+                    before_package = {
+                        path.relative_to(package).as_posix(): path.read_bytes()
+                        for path in package.rglob("*")
+                        if path.is_file()
+                        and not path.relative_to(package).parts[:1]
+                        == (backend.PACKAGE_DEVELOPMENT_DIRNAME,)
+                    }
+                    self.assertEqual(backend.main(command), 2)
+                after_package = {
+                    path.relative_to(package).as_posix(): path.read_bytes()
+                    for path in package.rglob("*")
+                    if path.is_file()
+                    and not path.relative_to(package).parts[:1]
+                    == (backend.PACKAGE_DEVELOPMENT_DIRNAME,)
+                }
+                self.assertEqual(after_package, before_package)
+                self.assertEqual(provenance.read_bytes(), previous_provenance)
+                self.assertEqual(serve.call_count, 1)
+                self.assertTrue(
+                    list(
+                        (
+                            package
+                            / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                            / backend.PACKAGE_BACKUPS_DIRNAME
+                        ).glob(".backend-package-backup-*")
+                    )
+                )
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+                backend.PROVENANCE_PATH = original_provenance_path
+
+    def test_start_provenance_binds_source_and_receipt_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, records = self._published_package(root)
+            receipt = {
+                "schema": backend.RECEIPT_SCHEMA,
+                "state": "succeeded",
+                "source": {
+                    "source_mode": backend.LIVE_SOURCE_MODE,
+                    "resolved_commit": "a" * 40,
+                    "source_digest": "b" * 64,
+                },
+                "native_source_identity": {"source_snapshot_sha256": "c" * 64},
+                "native_source_identity_sha256": "d" * 64,
+                "toolchain": {"image_id": "sha256:" + "e" * 64},
+                "build": {
+                    "cargo_profile": "backend-dev",
+                    "cargo_target_profile_dir": "backend-dev",
+                },
+                "execution_lanes": {lane: {"status": "compiled"} for lane in backend.LANES},
+                "artifacts": records,
+            }
+            backend._write_json(
+                output / "backend-build-receipt.json", receipt, "test backend build receipt"
+            )
+            provenance_path = root / "provenance.json"
+            provenance_path.touch()
+            original_provenance_path = backend.PROVENANCE_PATH
+            backend.PROVENANCE_PATH = provenance_path
+            try:
+                backend._publish_runtime_provenance(output)
+                provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            finally:
+                backend.PROVENANCE_PATH = original_provenance_path
+            self.assertEqual(provenance["commit"], "a" * 40)
+            self.assertEqual(
+                provenance["native_source_identity"]["source_snapshot_sha256"], "c" * 64
+            )
+            self.assertEqual(
+                provenance["backend_build_receipt_schema"], backend.RECEIPT_SCHEMA
+            )
+            self.assertEqual(
+                provenance["build_receipt_sha256"],
+                hashlib.sha256(
+                    (output / "backend-build-receipt.json").read_bytes()
+                ).hexdigest(),
+            )
 
     def test_native_soname_alias_is_published_as_regular_file(self):
         with tempfile.TemporaryDirectory() as directory:

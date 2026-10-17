@@ -45,8 +45,16 @@ backendu zachowuje potwierdzony native drain. Przy zgodnym obrazie i mountach
 restart używa tego samego container ID, a frontend pozostaje uruchomiony. Zmiana
 obrazu lub mountów może wymagać odtworzenia usługi. Nie wolno zastępować kontenera
 na podstawie timeoutu ani uznawać utraty obserwacji za potwierdzenie zatrzymania.
-Niepotwierdzony owner wymaga kanonicznego recovery. Koordynacja ciężkich buildów
-musi działać wewnątrz usługi także bez obecnego procesu launchera na hoście.
+Niepotwierdzony owner wymaga kanonicznego recovery przy ponownym użyciu jego
+store. Świeży start tworzy osobny namespace; zachowuje dawny store i nie resetuje
+jego ownera. Nadal wymaga kanonicznej walidacji wspólnego ledgeru i release proofs.
+
+Kompilację chroni blokada per trwały cache wewnątrz backendu, także bez launchera
+na hoście. Odrębne grupy z własnymi cache mogą budować równolegle; nie współdzielą
+mutowalnych katalogów Cargo/CMake. Hostowy heavy lock obejmuje przygotowanie
+obrazów/toolchaina i hostowych receiptów, a kończy się przed uruchomieniem usług.
+Nie traktujemy Win32 lock i Linux flock na bindzie Windows jako wspólnej blokady.
+Wspólny host ledger nadal chroni przydział fizycznych CPU/GPU podczas symulacji.
 
 Budowanie odbywa się przed startem API; nie podmienia plików wykonywanych przez
 aktywną symulację. Nieudany build zachowuje logi i receipt, pozostawia backend
@@ -61,6 +69,37 @@ port loopback. Home może działać podczas budowania lub niedostępności API.
 Opcjonalny plik `.py` pozostaje wejściem startowym tego samego launchera:
 publikuje aktywny model i zachowuje automatyczne Solve albo trwałe oczekiwanie
 `wait_for_solve`. Restart backendu nie jest nowym, niejawnym poleceniem Solve.
+
+## Admission storage Windows po przebudowie dev
+
+ADR 0059 pozostaje kontraktem filesystemu, ownera i grantów. Dla live dev host
+wydaje dodatkową, opcjonalną delegację `development_build` w readonly certyfikacie:
+`fullmag.windows-folder-development-build.v1`, `cargo_profile=backend-dev`,
+przypięty `toolchain_image_id`, `group_identity`, kanoniczne `package_root` oraz
+`provenance_path`, a także `source_identity` pierwszego zweryfikowanego buildu.
+To pole jest zakresem autoryzacji zaufanego buildera tego samego obrazu i grupy;
+nie jest drugim pinem blokującym przyszłe zmiany kodu. Bez delegacji zachowujemy
+dokładne przypięcie źródeł i binariów z dotychczasowej ścieżki release/static.
+
+Każda nowa binarka nadal sprawdza bieżący compiled commit i własny hash, dane
+rzeczywistego receipt/provenance, jego digest, profil i toolchain. Walidacja
+nowego pakietu nie może zostać zastąpiona flagą środowiskową. Hostowy certyfikat
+nie traci powiązania z image, engine, ownerem, lokalnym NTFS/ReFS, no-reparse,
+operacyjnymi próbami storage i readback. Runtime weryfikuje aktualny mount grant.
+
+Pierwszy start ma kolejność: build i receipt → hostowy certyfikat → niezależne
+próby storage i readback → `restart_verified` → start API/native runtime.
+Backend czeka na tę granicę z ograniczonym czasem, zachowując logi po błędzie.
+Host aktualizuje pojedynczy bind certyfikatu in-place z flush/readback, ponieważ
+podmiana nazwy pliku nie aktualizuje pewnie istniejącego bind mountu. Przejściowa
+różnica samego `restart_verified` między certyfikatem i markerem jest stanem
+oczekiwania; inna tożsamość ownera lub obrazu pozostaje błędem.
+
+Kolejny zwykły restart używa tej samej delegacji storage, ale sprawdza nowy
+rzeczywisty pakiet i ponawia guest storage preflight. Nie wymaga hostowego
+odświeżania certyfikatu dla każdej zmiany kodu. Cofnięcie delegacji wymaga
+potwierdzonego zatrzymania i jawnego wdrożenia zgodnego pakietu z dokładnym
+certyfikatem; zachowuje sesje, wyniki i dotychczasowe dowody.
 
 ## Wdrożenie i weryfikacja
 

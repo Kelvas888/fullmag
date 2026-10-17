@@ -1,5 +1,6 @@
 """Source-only checks; no Rust/native test compilation or Docker mutation."""
 import importlib.util
+import hashlib
 import json
 import tempfile
 import os
@@ -30,12 +31,143 @@ class DockerRuntimeContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "bin/fullmag-api"):
                 runtime.validate_runtime_artifacts(package, development=True)
 
+    def test_backend_package_mount_stays_in_daemon_posix_namespace(self):
+        expected = runtime._daemon_mount_path(
+            "/mnt/fullmag-cache/package", "backend package root"
+        )
+        self.assertEqual(expected, runtime.PurePosixPath("/mnt/fullmag-cache/package"))
+        self.assertEqual(
+            runtime._daemon_mount_path(
+                "/mnt/fullmag-cache/package", "backend package bind"
+            ),
+            expected,
+        )
+        for value in ("C:/fullmag/package", "relative/package", "/mnt/cache/../package"):
+            with self.assertRaisesRegex(ValueError, "canonical daemon path"):
+                runtime._daemon_mount_path(value, "backend package root")
+
+    def test_development_gate_starts_with_provisional_certificate_then_binds_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provenance = root / "provenance.json"
+            provenance.write_text("{}\n", encoding="utf-8")
+            inputs = {
+                "image_id": "sha256:" + "a" * 64,
+                "toolchain_image_id": "sha256:" + "b" * 64,
+                "toolchain_manifest_sha256": "c" * 64,
+                "provenance_path": str(provenance),
+            }
+            source_identity = {"project_name": "fullmag-worktree-test"}
+            provisional, hashes, delegation = runtime._provisional_development_certificate(
+                inputs, source_identity
+            )
+            self.assertEqual(provisional["commit"], "0" * 40)
+            self.assertEqual(set(hashes), set(runtime.REQUIRED_BINARIES))
+            self.assertEqual(
+                set(delegation),
+                {
+                    "schema", "cargo_profile", "toolchain_image_id", "package_root",
+                    "provenance_path", "group_identity", "source_identity",
+                },
+            )
+            self.assertEqual(delegation["cargo_profile"], "backend-dev")
+            self.assertEqual(delegation["toolchain_image_id"], inputs["toolchain_image_id"])
+            self.assertEqual(delegation["package_root"], "/opt/fullmag/package")
+            self.assertEqual(delegation["provenance_path"], "/opt/fullmag/provenance.json")
+            self.assertEqual(delegation["group_identity"], "fullmag-worktree-test")
+            self.assertEqual(
+                delegation["source_identity"],
+                {
+                    "commit": "0" * 40,
+                    "source_digest": "0" * 64,
+                    "source_snapshot_sha256": "0" * 64,
+                    "native_source_identity_sha256": "0" * 64,
+                },
+            )
+            certificate = {
+                "image_id": inputs["image_id"],
+                "source_commit": provisional["commit"],
+                "binary_hashes": hashes,
+                "artifact_receipt_sha256": provisional["build_receipt_sha256"],
+                "development_build": delegation,
+                "restart_verified": False,
+            }
+            assembly = {
+                "commit": "d" * 40,
+                "source_digest": "1" * 64,
+                "source_snapshot_sha256": "2" * 64,
+                "native_source_identity": {"head_commit_full": "d" * 40, "source_snapshot_sha256": "2" * 64},
+                "binary_hashes": {name: "e" * 64 for name in runtime.REQUIRED_BINARIES},
+                "build_receipt_sha256": "f" * 64,
+            }
+            refreshed = runtime._refresh_development_certificate(certificate, assembly, inputs)
+            self.assertEqual(refreshed["source_commit"], "d" * 40)
+            self.assertEqual(refreshed["binary_hashes"], assembly["binary_hashes"])
+            self.assertFalse(refreshed["restart_verified"])
+            expected_native_identity_sha256 = hashlib.sha256(
+                (json.dumps(assembly["native_source_identity"], separators=(",", ":"), sort_keys=True) + "\n")
+                .encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(
+                refreshed["development_build"]["source_identity"],
+                {
+                    "commit": "d" * 40,
+                    "source_digest": "1" * 64,
+                    "source_snapshot_sha256": "2" * 64,
+                    "native_source_identity_sha256": expected_native_identity_sha256,
+                },
+            )
+            changed_assembly = dict(assembly)
+            changed_assembly.update(
+                commit="a" * 40,
+                source_digest="3" * 64,
+                source_snapshot_sha256="4" * 64,
+                native_source_identity={"head_commit_full": "a" * 40, "source_snapshot_sha256": "4" * 64},
+            )
+            retained = runtime._refresh_development_certificate(
+                refreshed, changed_assembly, inputs
+            )
+            self.assertEqual(
+                retained["development_build"]["source_identity"],
+                refreshed["development_build"]["source_identity"],
+            )
+
     def test_direct_project_name_is_validated_before_startup_mutations(self):
         with patch.object(runtime.storage, "resolve_layout") as resolve:
             for name in ("../fullmag", "Fullmag", "fullmag;other", ""):
                 with self.assertRaisesRegex(ValueError, "Invalid Compose project name"):
                     runtime.start(None, None, 3197, project_name=name)
             resolve.assert_not_called()
+
+    def test_backend_start_source_group_maps_to_compose_identity_fields(self):
+        backend_start = {
+            "source_project_id": "project-test",
+            "source_worktree_id": "worktree-test",
+            "source_checkout_kind": "worktree",
+        }
+        source_identity = {
+            "project_name": "fullmag-worktree-test",
+            "project_id": "project-test",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        runtime._validate_backend_start_source_group(backend_start, source_identity)
+        source_identity["checkout_kind"] = "main-checkout"
+        with self.assertRaisesRegex(ValueError, "source group"):
+            runtime._validate_backend_start_source_group(backend_start, source_identity)
+
+    def test_compose_service_container_id_requires_one_valid_service(self):
+        compose_args = ["compose", "--project-name", "fullmag-test"]
+        with patch.object(runtime, "docker", return_value="a" * 64 + "\n") as docker_call:
+            self.assertEqual(
+                runtime._compose_service_container_id(compose_args, "backend"),
+                "a" * 64,
+            )
+        docker_call.assert_called_once_with(*compose_args, "ps", "--quiet", "backend")
+        for output in ("", "a" * 64 + "\n" + "b" * 64 + "\n", "not-an-id\n"):
+            with patch.object(runtime, "docker", return_value=output):
+                with self.assertRaisesRegex(ValueError, "exactly one valid running container ID"):
+                    runtime._compose_service_container_id(compose_args, "backend")
 
     def test_workspace_user_data_is_stable_and_scoped_to_compose_group(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -238,6 +370,11 @@ class DockerRuntimeContract(unittest.TestCase):
         observed = runtime._validate_assembly_source_provenance(assembly, frontend="dev")
         self.assertEqual(observed["source_mode"], "live-shadow-v1")
         self.assertEqual(observed["live_manifest_sha256"], "d" * 64)
+        observed_without_host_manifest = runtime._validate_assembly_source_provenance(
+            {key: value for key, value in assembly.items() if key != "source_manifest"},
+            frontend="dev",
+        )
+        self.assertEqual(observed_without_host_manifest["live_manifest_sha256"], "d" * 64)
         with self.assertRaisesRegex(ValueError, "development runtime"):
             runtime._validate_assembly_source_provenance(assembly, frontend="static")
         with self.assertRaisesRegex(ValueError, "must not claim a source archive"):
