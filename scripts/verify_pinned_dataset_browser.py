@@ -257,7 +257,8 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
         api_target = managed_browser_target(repo, os.environ.get("FULLMAG_MANAGED_BROWSER_RECEIPT", ""),
             os.environ.get("FULLMAG_MANAGED_BROWSER_RECEIPT_SHA256"), require_fresh=True)
     smoke_name, receipt_schema, fixture_route, report_prefix = SCENARIOS[scenario]
-    browser_timeout_seconds = 360 if scenario == "antenna-workspace-authoring" else 240
+    # The antenna profile includes carrier rejection, vector lifecycle and tensor dialog cases.
+    browser_timeout_seconds = 600 if scenario == "antenna-visualization" else (360 if scenario == "antenna-workspace-authoring" else 240)
     layout = storage.resolve_layout(repo, PROFILE)
     storage.initialize(layout)
     app = repo / "apps/control-room"

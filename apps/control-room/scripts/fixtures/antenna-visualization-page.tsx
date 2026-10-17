@@ -4,6 +4,13 @@ import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { useThree } from "@react-three/fiber";
 import { BufferGeometry, InstancedMesh, Matrix4, ShaderMaterial, SRGBColorSpace, Vector2, Vector3, WebGLRenderTarget } from "three";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
+import { decodeFieldVector } from "@/kernel/api/codecs/fieldVectorCodec";
+import { DataPreviewDialog } from "@/kernel/layout/DataPreviewDialog";
+import { LayoutController } from "@/kernel/layout/LayoutController";
+import { VisualizationDebugController } from "@/kernel/visualization/VisualizationDebugController";
+import { AnalysisFieldOverlayController } from "@/kernel/visualization/AnalysisFieldOverlayController";
+import { AuthoringHistoryController } from "@/kernel/authoring/AuthoringHistoryController";
+import { DATA_FIELDS_PATH, DATA_FIELD_VECTOR_PATH, SIMULATION_SOLVER_STATUS_PATH } from "@/kernel/api/apiPaths";
 import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, VISUALIZATION_STATE_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH, SIMULATION_STAGES_EXECUTION_PATH, DATA_QUANTITIES_PATH } from "@/kernel/api/apiPaths";
 import type { VisualizationStateResource, VisualizationStatePatch, AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource, StageExecutionResource } from "@/kernel/api/apiTypes";
 import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsController";
@@ -46,7 +53,7 @@ const digest = `sha256:${"a".repeat(64)}`;
 const subscribe = () => () => {};
 const client = () => true;
 const server = () => false;
-type Call = { method: string; path: string; range: string | null; scope: string | null; port: string | null };
+type Call = { method: string; path: string; range: string | null; scope: string | null; port: string | null; component?: string | null; maxSamples?: string | null; decodedQuantityId?: string };
 declare global { interface Window { __antennaVisualizationFixture?: { read(): { calls: Call[]; tree: unknown; unexpected: string[] }; selectOther(): void; }; __antennaFieldPixel?: (position: number[]) => number[]; __antennaFieldCanvas?: () => { glyphMeshUuids: string[]; glyphMaterialUuids: string[]; clippingPlanes: number; lost: boolean; width: number; height: number; sampleCount: number; pointCount: number; glyphCount: number; surfaceTriangles: number; wireframeEdges: number; normalization: string; quantity: string; colorMinimum: number; colorMaximum: number; pointColors: number[]; surfaceColors: number[]; glyphColors: number[][]; glyphMatrices: number[][]; glyphPixelBounds: number[][]; glyphDepthTests: boolean[]; glyphDepthWrites: boolean[]; rangeMinimum: number; rangeMaximum: number; shaderMinimum: number; shaderMaximum: number; vectorScale: number; currentVertices: number; currentMaterial: string; currentComponent: number; paletteTextures: number; minimum: number; maximum: number; surfaceUuid: string; wireUuid: string; pointsUuid: string; materialUuid: string; paletteUuid: string; }; } }
 
 function makeFixture() {
@@ -194,6 +201,8 @@ function makeFixture() {
   const pendingClip: (() => void)[] = [];
   const bus = new EventBus<KernelEventMap>(), resources = new ResourceInvalidationController(bus), diagnostics = new RequestDiagnosticsController();
   const selection = new SelectionController(bus), visualization = new ObjectVisualizationController();
+  const layout = new LayoutController(bus); layout.setActiveTab("geometry"); layout.setActiveViewportMainModule("viewport-3d");
+  const visualizationDebug = new VisualizationDebugController();
   const commands = new CommandRegistry();
   for (const command of viewport3dManifest.contributes?.commands ?? []) {
     if (scenario !== "camera-unavailable" && ["viewport-3d.fit", "viewport-3d.reset-camera", "viewport-3d.open-camera-dialog"].includes(command.id)) commands.register(command);
@@ -211,7 +220,8 @@ function makeFixture() {
   const payloadPrefix = path(DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, "solution_id", "solution").split("{payload_kind}")[0];
   const api = new ControlRoomApi({ baseUrl: "http://antenna-visualization.fixture.invalid", expectedApiInstance: instance, diagnostics, maxGetRetries: 0, fetchImpl: async (input, init) => {
     const request = new Request(input, init), url = new URL(request.url);
-    calls.push({ method: request.method, path: url.pathname, range: request.headers.get("range"), scope: request.headers.get("x-fullmag-session-scope"), port: url.searchParams.get("port_mode_id") });
+    const call: Call = { method: request.method, path: url.pathname, range: request.headers.get("range"), scope: request.headers.get("x-fullmag-session-scope"), port: url.searchParams.get("port_mode_id") };
+    calls.push(call);
     if (calls.length > 100) throw new Error("Fixture request budget exceeded");
     if (url.pathname === VISUALIZATION_STATE_PATH) {
       if (request.headers.get("x-fullmag-session-scope") !== scope()) throw new Error("Unconfirmed section scope");
@@ -229,9 +239,31 @@ function makeFixture() {
       return json(remote);
     }
     if (request.method !== "GET") throw new Error("Fixture method violation");
+    if (scenario === "tensor-data-preview") {
+      if (url.pathname === SIMULATION_SOLVER_STATUS_PATH) return json({ revision: 1, step_index: 3, sim_time_seconds: 0, runtime_state: "idle" });
+      if (url.pathname === DATA_FIELDS_PATH) return json({ revision: 1, quantities: [{ quantity_id: "m" }, { quantity_id: "spin_current_tensor" }] });
+      const vectorPrefix = DATA_FIELD_VECTOR_PATH.split("{quantity_id}")[0];
+      if (url.pathname.startsWith(vectorPrefix) && url.pathname.endsWith("/samples/vector")) {
+        const quantityId = decodeURIComponent(url.pathname.slice(vectorPrefix.length).split("/")[0]);
+        const component = url.searchParams.get("component"), maxSamples = url.searchParams.get("max_samples");
+        Object.assign(call, { component, maxSamples });
+        if (request.headers.get("x-fullmag-session-scope") !== scope() || maxSamples !== "17" ||
+            !(quantityId === "spin_current_tensor" && component === "full" || quantityId === "m" && (component === "full" || component === "x"))) throw new Error("Unexpected Data Preview field query");
+        const tensor = quantityId === "spin_current_tensor";
+        const values = tensor ? [1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 17, -18] : component === "x" ? [2, -5] : [2, 3, 4, -5, 6, 7];
+        const nComp = tensor ? 9 : component === "x" ? 1 : 3;
+        const body = previewFieldBuffer(quantityId, nComp, values);
+        call.decodedQuantityId = decodeFieldVector(body).quantityId;
+        if (call.decodedQuantityId !== quantityId) throw new Error("Data Preview fixture lost full decoded quantity identity");
+        return new Response(body, { headers: { ...headers, "content-type": "application/octet-stream", "x-fullmag-encoding": "FMVP;version=5", "x-fullmag-quantity-id": quantityId, etag: `"preview-${quantityId}-${component}"` } });
+      }
+    }
     if (url.pathname === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", current: true, status: "idle" }] });
     if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, run: { run_id: execution.run_id }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
-    if (url.pathname === DATA_QUANTITIES_PATH && scenario === "tensor-table") return json({ schema_version: "tensor-fixture.v1", quantities: [{ id: "spin_current_tensor", tensor: { rank: 2, shape: [3, 3], layout: "flow_major", axes: ["flow", "spin"], component_labels: ["Q_xx", "Q_xy", "Q_xz", "Q_yx", "Q_yy", "Q_yz", "Q_zx", "Q_zy", "Q_zz"] } }] });
+    if (url.pathname === DATA_QUANTITIES_PATH && (scenario === "tensor-table" || scenario === "tensor-data-preview")) return json({ schema_version: "tensor-fixture.v1", quantities: [{ id: "spin_current_tensor", tensor: { rank: 2, shape: [3, 3], layout: "flow_major", axes: ["flow", "spin"], component_labels: ["Q_xx", "Q_xy", "Q_xz", "Q_yx", "Q_yy", "Q_yz", "Q_zx", "Q_zy", "Q_zz"] } }] });
+    // This fixture has no canonical raw artifact carriers; their public path has a separate fixture.
+    if (url.pathname === DATA_FIELDS_PATH) return json({ revision: 1, quantities: [] });
+    if (url.pathname === DATA_QUANTITIES_PATH) return json({ schema_version: "basis-fixture.v1", quantities: [] });
     if (url.pathname === MODEL_SCENE_PATH) return json(scene);
     if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) return json(execution);
     if (url.pathname === metadataPath) return isInspection ? new Response("{}", { status: 404, headers }) : json(solution);
@@ -287,7 +319,7 @@ function makeFixture() {
   const visualizationSync = new VisualizationRegistrySyncController({ api: api.visualization, resourceCacheScope: api.resourceCacheScope, resources });
   const cameraRegistry = new CameraRegistryController({ api: api.visualization, idleFlushMs: null, windowTarget: null, documentTarget: null });
   cameraRegistry.patchCamera({ position: [7e-7, 2e-7, 5e-7] });
-  return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder, selection, visualization, commands, cameraRegistry, visualizationSync } as unknown as KernelApi, control: { read: () => ({ calls, tree, unexpected, camera: cameraRegistry.getSnapshot(), viewport: viewport3dStore.getSnapshot(), clip: remote.clip, clipPending: pendingClip.length }), holdClip: () => { holdClip = true; }, releaseClip: () => { holdClip = false; for (const resolve of pendingClip.splice(0)) resolve(); }, selectOther: () => selection.set({ objectId: "other", ref: null }, "inspector") } };
+  return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder, layout, visualizationDebug, analysisFieldOverlay: new AnalysisFieldOverlayController(), authoringHistory: new AuthoringHistoryController(api, resources), selection, visualization, commands, cameraRegistry, visualizationSync } as unknown as KernelApi, control: { read: () => ({ calls, tree, unexpected, camera: cameraRegistry.getSnapshot(), viewport: viewport3dStore.getSnapshot(), clip: remote.clip, clipPending: pendingClip.length }), holdClip: () => { holdClip = true; }, releaseClip: () => { holdClip = false; for (const resolve of pendingClip.splice(0)) resolve(); }, selectOther: () => selection.set({ objectId: "other", ref: null }, "inspector") } };
 }
 
 function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
@@ -395,6 +427,26 @@ function FieldViewport() {
   </div>;
 }
 
+// FMVP v5 retains the complete quantity ID after the fixed 16-byte legacy prefix.
+function previewFieldBuffer(quantityId: string, nComp: number, values: number[]) {
+  const encoder = new TextEncoder(), quantity = encoder.encode(quantityId), domain = encoder.encode("preview-domain"), scopeKind = encoder.encode("full");
+  const metadataLength = (88 + scopeKind.length + domain.length + quantity.length + 7) & ~7;
+  const buffer = new ArrayBuffer(48 + metadataLength + values.length * 8), header = new DataView(buffer);
+  new Uint8Array(buffer, 0, 4).set(encoder.encode("FMVP"));
+  header.setUint8(4, 5); header.setUint8(5, 1); header.setUint8(6, nComp);
+  header.setUint32(8, metadataLength, true); header.setUint32(12, values.length, true);
+  header.setUint32(16, 2, true); header.setUint32(20, 1, true); header.setUint32(24, 1, true);
+  new Uint8Array(buffer, 28, 16).set(quantity.subarray(0, 16));
+  const metadata = new DataView(buffer, 48, metadataLength);
+  new Uint8Array(buffer, 48, 4).set(encoder.encode("FMMI"));
+  metadata.setUint16(4, 4, true); metadata.setUint16(8, domain.length, true);
+  metadata.setUint16(64, scopeKind.length, true); metadata.setUint16(80, quantity.length, true);
+  let offset = 48 + 88;
+  for (const bytes of [scopeKind, domain, quantity]) { new Uint8Array(buffer, offset, bytes.length).set(bytes); offset += bytes.length; }
+  new Float64Array(buffer, 48 + metadataLength).set(values);
+  return buffer;
+}
+
 function TensorSampleTableFixture() {
   const samples = buildFieldVectorDebugSamples({ nComp: 9, pointCount: 2, nodeIndices: new Uint32Array([7, 19]), values: Float64Array.from([1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 17, -18]) }).samples;
   const model = { viewports: [{ carriers: [{ carrierId: "tensor-fixture", observations: [{ query: { quantityId: "spin_current_tensor", component: "full" }, backendMeta: { unit: "fixture-unit" }, carrier: { samples } }] }] }] } as unknown as VisualizationDebugPanelModel;
@@ -408,7 +460,8 @@ function MountedFixture() {
   const kind = legacy ? "object.visualization" : "object.antenna.visualization";
   const Panel = resolveInspectorRoute(kind)!.component;
   const tensorTable = new URL(window.location.href).searchParams.get("scenario") === "tensor-table";
-  return <KernelContext.Provider value={fixture.kernel}><FieldViewport /><Panel selection={{ ...EMPTY_SELECTION, kind, objectId: "antenna", ref: { type: "scene-object", kind, nodeId: "model:object:antenna:visualization", objectId: "antenna", visualizationTargetId: "object:antenna" } }} />{tensorTable ? <TensorSampleTableFixture /> : null}</KernelContext.Provider>;
+  const dataPreview = new URL(window.location.href).searchParams.get("scenario") === "tensor-data-preview";
+  return <KernelContext.Provider value={fixture.kernel}><FieldViewport /><Panel selection={{ ...EMPTY_SELECTION, kind, objectId: "antenna", ref: { type: "scene-object", kind, nodeId: "model:object:antenna:visualization", objectId: "antenna", visualizationTargetId: "object:antenna" } }} />{tensorTable ? <TensorSampleTableFixture /> : null}{dataPreview ? <DataPreviewDialog open={true} onOpenChange={() => {}} /> : null}</KernelContext.Provider>;
 }
 
 export default function AntennaVisualizationFixturePage() {

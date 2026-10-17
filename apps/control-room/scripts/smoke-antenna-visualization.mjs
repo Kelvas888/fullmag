@@ -27,6 +27,9 @@ try {
   const open = async (scenario, legacy = false) => {
     const target = new URL(url); target.searchParams.set("scenario", scenario); if (legacy) target.searchParams.set("legacy", "1");
     await page.goto(target.href);
+    // This profile qualifies the explicitly selected basis/legacy-inspection representation.
+    // The canonical raw V/J/H representation is covered by artifact-field-overlay-browser.
+    await page.getByRole("combobox", { name: "Result representation", exact: true }).selectOption("basis");
     await root.waitFor({ state: "visible", timeout: 60000 });
   };
   const shot = async (name, viewportOnly = false, selector = null) => { const path = resolve(directory, `${name}.png`); if (selector) await page.locator(selector).screenshot({ path }); else if (viewportOnly) await page.locator("[data-antenna-field-viewport]").screenshot({ path }); else await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
@@ -407,9 +410,62 @@ try {
   const tensorShot = resolve(directory, "14-tensor-nine-components.png");
   await tensorRegion.screenshot({ path: tensorShot }); screenshots.push(tensorShot);
   checks.push("Actual debug table renders two complete3x3flow-major matrices, all nine values, Frobenius and provider unit through canonical quantity resource; synthetic UI only");
+  await page.addInitScript(() => {
+    window.__dataPreviewClipboard = [];
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { window.__dataPreviewClipboard.push(text); } } });
+  });
+  await open("tensor-data-preview");
+  const preview = page.getByRole("dialog", { name: "Data Preview", exact: true });
+  await preview.waitFor({ state: "visible" });
+  const previewQuantity = preview.getByRole("combobox", { name: "Quantity", exact: true });
+  const previewComponent = preview.getByRole("combobox", { name: "Component", exact: true });
+  const previewReads = async () => (await page.evaluate(() => window.__antennaVisualizationFixture.read())).calls.filter(call => call.path.endsWith("/samples/vector"));
+  const previewRows = async () => preview.locator("tbody tr").evaluateAll(rows => rows.map(row => row.lastElementChild.textContent.trim()));
+  const waitPreview = async (shape, rows) => {
+    await page.waitForFunction(([expectedShape, expectedRows]) => {
+      const dialog = document.querySelector('[role="dialog"][aria-label="Data Preview"]');
+      return dialog?.textContent.includes(expectedShape) && JSON.stringify([...dialog.querySelectorAll("tbody tr")].map(row => row.lastElementChild.textContent.trim())) === JSON.stringify(expectedRows);
+    }, [shape, rows]);
+    assert.deepEqual(await previewRows(), rows);
+  };
+  const copyPreview = async () => {
+    const before = (await previewReads()).length;
+    await preview.getByRole("button", { name: "Copy data preview log", exact: true }).click();
+    const copied = await page.evaluate(() => window.__dataPreviewClipboard.at(-1));
+    assert.ok(copied.includes("Component: full\n"));
+    assert.equal((await previewReads()).length, before);
+    return copied;
+  };
+  await waitPreview("2 points x 3", ["2  3  4", "-5  6  7"]);
+  await previewQuantity.selectOption("spin_current_tensor");
+  await waitPreview("2 points x 9", ["1  -2  3  -4  5  -6  7  -8  9", "-10  11  -12  13  -14  15  -16  17  -18"]);
+  for (const label of ["Q_xx", "Q_xy", "Q_xz", "Q_yx", "Q_yy", "Q_yz", "Q_zx", "Q_zy", "Q_zz"]) assert.equal(await previewComponent.getByRole("option", { name: label, exact: true }).count(), 1);
+  const tensorReads = await previewReads();
+  assert.ok(tensorReads.some(call => call.decodedQuantityId === "spin_current_tensor" && call.component === "full"));
+  await previewComponent.selectOption("c0");
+  await waitPreview("2 points x 1", ["1", "-10"]);
+  assert.equal((await previewReads()).length, tensorReads.length);
+  await previewQuantity.selectOption("m");
+  await waitPreview("2 points x 3", ["2  3  4", "-5  6  7"]);
+  assert.equal(await previewComponent.inputValue(), "full");
+  assert.ok((await copyPreview()).includes("Quantity: m\n"));
+  await previewComponent.selectOption("x");
+  await waitPreview("2 points x 1", ["2", "-5"]);
+  await previewQuantity.selectOption("spin_current_tensor");
+  await waitPreview("2 points x 9", ["1  -2  3  -4  5  -6  7  -8  9", "-10  11  -12  13  -14  15  -16  17  -18"]);
+  assert.equal(await previewComponent.inputValue(), "full");
+  const tensorCopy = await copyPreview();
+  assert.ok(tensorCopy.includes("Quantity: spin_current_tensor\n")); assert.ok(tensorCopy.includes("Shape: 2 points x 9\n"));
+  const previewFinal = await page.evaluate(() => window.__antennaVisualizationFixture.read());
+  assert.deepEqual(previewFinal.unexpected, []);
+  assert.ok(previewFinal.calls.every(call => call.method === "GET"));
+  assert.deepEqual((await previewReads()).map(call => [call.decodedQuantityId, call.component, call.maxSamples]), [["m", "full", "17"], ["spin_current_tensor", "full", "17"], ["m", "full", "17"], ["m", "x", "17"], ["spin_current_tensor", "full", "17"]]);
+  const previewShot = resolve(directory, "16-tensor-data-preview-dialog.png");
+  await preview.screenshot({ path: previewShot }); screenshots.push(previewShot);
+  checks.push("Actual DataPreviewDialog through production API/hooks and FMVPv5 full quantity identity: all nine tensor values/labels, local c0 with zero requests, c0->vector and x->tensor resolve full with accurate copied metadata; GET-only max17, clipboard captured in memory");
   assert.deepEqual(errors, []);
 } catch (error) { failure = error.stack ?? String(error); }
 finally { if (browser) await browser.close(); }
-await writeFile(resolve(directory, "antenna-visualization.json"), JSON.stringify({ passed: !failure, checks, screenshots, errors, failure, qualification: "production_UI_and_unified_3D_layers_controlled_transport_not_solver_qualification" }, null, 2));
+await writeFile(resolve(directory, "antenna-visualization.json"), JSON.stringify({ passed: !failure, checks, screenshots, errors, failure, qualification: "production_basis_legacy_inspection_and_data_preview_controlled_transport_not_canonical_raw_or_solver_qualification" }, null, 2));
 if (failure) throw new Error(failure);
 console.log(JSON.stringify({ passed: true, checks, screenshots }));

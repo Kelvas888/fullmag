@@ -5,8 +5,8 @@ import vm from "node:vm";
 
 const src = new URL("../src/", import.meta.url);
 async function pure(path) {
-  const module = new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(new URL(path, src), "utf8")));
-  await module.link(() => { throw new Error("Unexpected pure dependency"); }); await module.evaluate(); return module;
+  const sourceModule = new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(new URL(path, src), "utf8")));
+  await sourceModule.link(() => { throw new Error("Unexpected pure dependency"); }); await sourceModule.evaluate(); return sourceModule;
 }
 const source = await pure("shared/domain/study/studyStageSource.ts");
 const capability = await pure("shared/domain/study/antennaFieldSolveCapability.ts");
@@ -14,9 +14,9 @@ const command = readFileSync(new URL("kernel/runtime/antennaFieldSolveStudyComma
 const first = command.indexOf("/** Build a reference instruction"), last = command.indexOf("export const addAntennaFieldSolveStudyCommand");
 assert.ok(first >= 0 && last > first);
 const code = 'import { readStudyStageSource } from "source"; import { antennaFieldSolveDefinitionPortError } from "capability";\n' + command.slice(first, last);
-const module = new vm.SourceTextModule(stripTypeScriptTypes(code));
-await module.link(name => { assert.ok(["source", "capability"].includes(name)); return name === "source" ? source : capability; }); await module.evaluate();
-const resolve = module.namespace.antennaFieldSolveStudyReference;
+const sourceModule = new vm.SourceTextModule(stripTypeScriptTypes(code));
+await sourceModule.link(name => { assert.ok(["source", "capability"].includes(name)); return name === "source" ? source : capability; }); await sourceModule.evaluate();
+const resolve = sourceModule.namespace.antennaFieldSolveStudyReference;
 const target = { objectId: "source", stageId: "definition", portModeId: "port" };
 const action = { kind: "antenna_field_solve", entrypoint_kind: "flat_antenna_field_solve", stage_id: "definition", port_mode_ids: ["port"] };
 const scene = { objects: [{ id: "source" }], antenna_field_solve_stages: [{ id: "definition", source_object_id: "source", current_transport_id: "charge", port_mode_ids: ["port"] }], antenna_port_modes: [{ id: "port", source_object_id: "source", current_transport_id: "charge" }], study: { stages: [] } };

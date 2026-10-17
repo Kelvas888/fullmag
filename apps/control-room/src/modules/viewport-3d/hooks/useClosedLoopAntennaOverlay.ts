@@ -25,7 +25,7 @@ export function useClosedLoopAntennaOverlay(intent: AntennaFieldIntent | null, i
       const kinds: ClosedLoopPayloadKind[] = current ? ["vertex_xyz", perAmpere ? "j_center_per_a" : "j_center_raw", "cells", "stable_vertex_ids", perAmpere ? "j_local_per_a" : "j_local_raw"] : scalar ? ["vertex_xyz", perAmpere ? "v_per_a" : "v_raw", "cells", "stable_vertex_ids"] : ["sample_xyz", perAmpere ? "h_per_a" : "h_raw", "sample_cells"];
       if ((!current && !scalar && (manifest.target_count > MAX_ANTENNA_DISPLAY_SAMPLES || manifest.sample_cell_count > MAX_ANTENNA_DISPLAY_CELLS)) || (current || scalar) && (manifest.vertex_count > MAX_ANTENNA_DISPLAY_SAMPLES || manifest.cell_count > MAX_ANTENNA_DISPLAY_CELLS) ||
           kinds.reduce((sum, kind) => sum + manifest.payloads[kind].byte_length, 0) > MAX_ANTENNA_DISPLAY_PAYLOAD_BYTES) return null;
-      return { manifest, kinds, current, scalar, perAmpere };
+      return { manifest, kinds, isCurrent: current, scalar, perAmpere };
     } catch { return null; }
   }, [active, carrierIntent, inspection, display]);
   const options = (index: number) => {
@@ -41,14 +41,20 @@ export function useClosedLoopAntennaOverlay(intent: AntennaFieldIntent | null, i
   const result = useMemo(() => {
     const intent = carrierIntent;
     if (!plan || !intent) return null;
-    const resources = [positions, values, cells, ids, local].slice(0, plan.kinds.length);
+    const resources = [
+      { status: positions.status, data: positions.data },
+      { status: values.status, data: values.data },
+      { status: cells.status, data: cells.data },
+      { status: ids.status, data: ids.data },
+      { status: local.status, data: local.data },
+    ].slice(0, plan.kinds.length);
     if (resources.some((resource) => resource.status !== "ready" || resource.data?.status !== "ready")) return null;
     const buffers = resources.map((resource) => resource.data!.status === "ready" ? resource.data!.data : null);
     if (buffers.some((buffer) => !buffer)) return null;
     const [position, value, cell, id, trace] = buffers as ArrayBuffer[];
     try {
       const m = plan.manifest;
-      const model = plan.current ? buildClosedLoopCurrentOverlayModel(id, position, cell, value, trace, m.vertex_count, m.cell_count, intent, plan.perAmpere ? m.scale_per_a : 1)
+      const model = plan.isCurrent ? buildClosedLoopCurrentOverlayModel(id, position, cell, value, trace, m.vertex_count, m.cell_count, intent, plan.perAmpere ? m.scale_per_a : 1)
         : plan.scalar ? buildClosedLoopPotentialOverlayModel(id, position, cell, value, m.vertex_count, m.cell_count, intent)
         : buildClosedLoopMagneticOverlayModel(position, value, cell, m.target_count, m.sample_cell_count, intent);
       return { model, error: null };
@@ -59,7 +65,7 @@ export function useClosedLoopAntennaOverlay(intent: AntennaFieldIntent | null, i
     const model = result?.model;
     if (!model || !intent) return null;
     try {
-    if (model.surfaceVectorValues && plan?.current && values.data?.status === "ready" && local.data?.status === "ready") {
+    if (model.surfaceVectorValues && plan?.isCurrent && values.data?.status === "ready" && local.data?.status === "ready") {
       const raw = projectAntennaCurrentOverlayModel(model, values.data.data, local.data.data, { ...intent, quantity: "current_density" });
       return { model: { ...raw, key: JSON.stringify(intent), intent }, error: null };
     }
@@ -69,6 +75,6 @@ export function useClosedLoopAntennaOverlay(intent: AntennaFieldIntent | null, i
     }
     return { model: { ...model, key: JSON.stringify(intent), intent, vectorSegments: null }, error: null };
     } catch (error) { return { model: null, error: error instanceof Error ? error.message : String(error) }; }
-  }, [result, intent, plan?.current, plan?.scalar, positions.data, values.data, local.data]);
+  }, [result, intent, plan?.isCurrent, plan?.scalar, positions.data, values.data, local.data]);
   return { active, plan, model: projected?.model ?? null, error: projected?.error ?? error };
 }
