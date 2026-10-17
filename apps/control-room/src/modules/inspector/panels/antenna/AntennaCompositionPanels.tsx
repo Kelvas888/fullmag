@@ -1,3 +1,4 @@
+import { antennaResourceOwner } from "@/shared/domain/physics/antennaResourceOwner";
 import { useKernel } from "@/kernel/KernelContext";
 import { Button } from "@/shared/ui/Button";
 
@@ -861,7 +862,11 @@ export function AntennaCompositionPanel({
   const objectId = selectedObjectId(selection);
   const resourceId = selectedResourceId(selection);
   const selectedKind = selectedResourceKind(selection) ?? kind;
-  const ids = resolveAntennaRuntimeIds(selectedKind, resourceId, scene.data);
+  const selectionOwned = Boolean(scene.data && objectId &&
+    scene.data.objects?.filter(object => object.id === objectId).length === 1 &&
+    selectedKind === kind && (kind === "conductor" ||
+      resourceId && antennaResourceOwner(scene.data, kind, resourceId) === objectId));
+  const ids = resolveAntennaRuntimeIds(selectedKind, resourceId, selectionOwned ? scene.data : null);
   const fieldSolution = useAntennaFieldSolutionResource(ids.solutionId, {
     enabled:
       kind === "solution" ||
@@ -886,6 +891,13 @@ export function AntennaCompositionPanel({
     stageOutputCatalog,
     sourceSpectrum,
   );
+
+  if (!selectionOwned) return <div className="fm-inspector-panel">
+    <InspectorGroup title="Antenna resource unavailable">
+      {!scene.data && !scene.error ? <p role="status">Loading antenna resource…</p> :
+        <FeedbackBanner kind={scene.error ? "error" : "warning"} message={scene.error?.message ?? "The selected antenna resource or its source binding changed, is missing or is ambiguous. Select the resource again in Explorer."} />}
+    </InspectorGroup>
+  </div>;
 
   return (
     <div className="fm-inspector-panel" data-inspector-owner={kind === "conductor" ? "object.antenna.conductor" : undefined}>

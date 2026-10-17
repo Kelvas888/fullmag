@@ -5,7 +5,7 @@ import { modelTreeSnapshotFromScene } from "./builders/sceneModelTreeAdapter";
 import { selectionRefFromNode } from "./explorerSelection";
 import type { ExplorerNode } from "./explorerTypes";
 
-type ResourceKind = "port" | "solution" | "projection" | "drive" | "spectrum";
+import { antennaResourceOwner, type AntennaOwnedResourceKind as ResourceKind } from "@/shared/domain/physics/antennaResourceOwner";
 export interface AntennaNavigationLink {
   key: string;
   label: string;
@@ -25,20 +25,12 @@ export function antennaNavigationLinks(scene: SceneResource, origin: Selection):
   const objectId = ref.objectId;
   const object = unique(scene.objects ?? [], item => item.id === objectId);
   if (!object) return [{ key: "missing-owner", label: "Related resources", selection: null, reason: "The source object is missing or ambiguous." }];
-  const ports = scene.antenna_port_modes ?? [], stages = scene.antenna_field_solve_stages ?? [];
+  const stages = scene.antenna_field_solve_stages ?? [];
   const projections = scene.antenna_target_projections ?? [], drives = scene.solved_antenna_drives ?? [];
   const spectra = scene.antenna_spectrum_requests ?? [];
-  const port = (id: string) => unique(ports, item => item.id === id);
   const stage = (id: string) => unique(stages, item => item.id === id);
   const projection = (id: string) => unique(projections, item => item.id === id);
-  function resourceOwner(kind: ResourceKind, id: string): string | null {
-    if (kind === "port") return port(id)?.source_object_id ?? null;
-    if (kind === "solution") return stage(id)?.source_object_id ?? null;
-    if (kind === "projection") { const item = projection(id); return item ? stage(item.solution.stage_id)?.source_object_id ?? null : null; }
-    if (kind === "spectrum") { const item = unique(spectra, item => item.id === id); return item ? stage(item.solution_ref.stage_id)?.source_object_id ?? null : null; }
-    const item = unique(drives, item => item.id === id), bound = item ? projection(item.projection_ref) : null;
-    return bound ? stage(bound.solution.stage_id)?.source_object_id ?? null : null;
-  }
+  const resourceOwner = (kind: ResourceKind, id: string) => antennaResourceOwner(scene, kind, id);
   const kind = ref.antennaResourceKind;
   const id = ref.antennaResourceId;
   if (kind && kind !== "terminals" && kind !== "conductor" && (!id || resourceOwner(kind, id) !== objectId)) {

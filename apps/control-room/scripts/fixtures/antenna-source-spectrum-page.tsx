@@ -23,7 +23,7 @@ const SCENARIOS = ["ready", "ready-tied-peak", "ready-vector", "ready-unitary", 
 const subscribe = () => () => {};
 type RefreshKind = "metadata" | "catalog" | "power";
 interface Evidence { scenario: string; calls: { path: string; scope: string | null }[]; unexpected: string[]; pending: number; streamCancelled: boolean; snapshots: Record<RefreshKind, { status: string; hasData: boolean; error: string | null }>; }
-declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence; refresh(kind: RefreshKind): void; release(fail?: boolean): void; }; } }
+declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence; refresh(kind: RefreshKind): void; release(fail?: boolean): void; rebindSource(foreign: boolean): void; }; } }
 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
@@ -37,7 +37,7 @@ function makeFixture() {
   const amplitudeUnit = normalization === "integral_si" ? "A*m/A" : "A/m/A";
   const plane = { origin_m: [0, 0, 0], axis_u: [1, 0, 0], axis_v: [0, 1, 0], extent_u_m: 1e-6, extent_v_m: 1e-6, sample_count_u: uCount, sample_count_v: vCount, interpolation: "fem_element", outside_policy: "error" as const };
   const ref = { kind: "stage_output", stage_id: "solve", output_id: "basis" };
-  const scene = { revision: 1, objects: [], antenna_port_modes: [{ id: "port" }], antenna_field_solve_stages: [{ id: "solve", port_mode_ids: ["port"], outputs: [{ id: "basis", quantity: "H_ant_basis" }] }], antenna_spectrum_requests: [{ id: "request", output_id: "fft", solution_ref: ref, target: { kind: "global" }, component: scenario === "invalid-authoring" ? "transverse" : vector ? "vector_power" : "x", transform: "spatial_fft", window: "rectangular", normalization, port_mode_id: "port", sampling_plane: plane, nonuniform_k_grid: null }] };
+  const scene = { revision: 1, objects: [{ id: "antenna", name: "Antenna", role: "antenna" }, { id: "other", name: "Other antenna", role: "antenna" }], antenna_port_modes: [{ id: "port", source_object_id: "antenna", schema_version: "antenna_port_mode.v2", branches: [] }], antenna_field_solve_stages: [{ id: "solve", source_object_id: "antenna", port_mode_ids: ["port"], outputs: [{ id: "basis", quantity: "H_ant_basis" }] }], antenna_spectrum_requests: [{ id: "request", output_id: "fft", solution_ref: ref, target: { kind: "global" }, component: scenario === "invalid-authoring" ? "transverse" : vector ? "vector_power" : "x", transform: "spatial_fft", window: "rectangular", normalization, port_mode_id: "port", sampling_plane: plane, nonuniform_k_grid: null }] };
   const componentAmplitudes = Array.from({ length: cellCount * 2 }, (_, index) => index % 2 ? 0 : Math.floor(index / 2) + 1);
   const payloadValues = { k_u_rad_per_m: uCount === 2 ? [-1, 1] : Array.from({ length: uCount }, (_, index) => index - 32), k_v_rad_per_m: vCount === 2 ? [-1, 1] : Array.from({ length: vCount }, (_, index) => index - 33), amplitudes_re_im: vector ? [...componentAmplitudes, ...componentAmplitudes, ...componentAmplitudes] : componentAmplitudes, power: Array.from({ length: cellCount }, (_, index) => (index + 1) ** 2 * (vector ? 3 : 1)) };
   if (scenario === "ready-tied-peak") {
@@ -145,6 +145,11 @@ function makeFixture() {
       resources.invalidate(kind === "power" ? powerKey : heldPath, ++refreshRevision);
     },
     release: (fail = false) => { if (!pending) throw new Error("No held refresh to release"); pending.release(fail); },
+    rebindSource: (foreign: boolean) => {
+      scene.antenna_field_solve_stages[0]!.source_object_id = foreign ? "other" : "antenna";
+      scene.revision++;
+      resources.invalidate(MODEL_SCENE_PATH, ++refreshRevision);
+    },
   } };
 }
 

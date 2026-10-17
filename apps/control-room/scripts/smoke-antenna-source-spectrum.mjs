@@ -406,6 +406,31 @@ try {
     }
     assert.ok((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length <= 15);
   }
+  {
+    const location = new URL(url); location.searchParams.set("scenario", "ready");
+    await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.getByRole("grid").waitFor({ timeout: 60_000 });
+    const baseline = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+    const runtimeCalls = value => value.calls.filter(call => call.path !== "/v2/sessions/current/model/scene");
+    await page.evaluate(() => window.__antennaSpectrumFixture.rebindSource(true));
+    await page.getByText("The selected antenna resource or its source binding changed, is missing or is ambiguous. Select the resource again in Explorer.", { exact: true }).waitFor();
+    assert.equal(await page.getByRole("gridcell").count(), 0);
+    assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
+    assert.equal(await page.getByText("Immutable resource ID", { exact: true }).count(), 0);
+    const foreign = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+    assert.deepEqual(runtimeCalls(foreign), runtimeCalls(baseline), "A stale source selection must not fetch the foreign owner's runtime");
+    await page.evaluate(() => window.__antennaSpectrumFixture.rebindSource(false));
+    await page.getByRole("grid").waitFor({ timeout: 60_000 });
+    const restored = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+    const rereads = restored.calls.slice(foreign.calls.length).filter(call => call.path !== "/v2/sessions/current/model/scene");
+    const initialDataReads = baseline.calls.filter(call => call.path.startsWith("/v2/sessions/current/data/antenna/"));
+    assert.equal(rereads.length, 6, "Restoring the owner permits one metadata/catalog read and four released payloads");
+    assert.deepEqual(rereads.map(call => call.path).sort(), initialDataReads.map(call => call.path).sort());
+    assert.ok(rereads.every(call => call.scope === initialDataReads[0].scope));
+    await page.waitForTimeout(300);
+    assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, restored.calls.length);
+    checks.push({ name: "Source ownership change blocks stale Inspector fields and editors; restoring the owner revalidates six scoped resources without polling", passed: true });
+  }
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(consoleErrors, []);
   assert.ok(checks.every((check) => check.passed), "Unconfirmed or invalid source FFT mounted/read binary payloads");
