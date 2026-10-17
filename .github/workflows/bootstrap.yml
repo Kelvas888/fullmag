@@ -125,6 +125,7 @@ jobs:
           cargo test -p fullmag-api --bin fullmag-api accepted_fem_study_worker::source_contract_tests
           cargo test -p fullmag-api --bin fullmag-api-accepted-worker accepted_fem_study_worker::source_contract_tests
           cargo test -p fullmag-api --bin fullmag-api live_scene_preparation::tests
+          cargo test -p fullmag-api --bin fullmag-api-accepted-fem-preparation-scheduler --no-fail-fast
           cargo test -p fullmag-api --bin fullmag-api accepted_preparation_completion_keeps_reserved_record_after_mesh_revision_moves
           cargo test -p fullmag-api --bin fullmag-api preparation_failure_and_stop_terminalize_only_their_reserved_records
           cargo test -p fullmag-api --bin fullmag-api old_preparation_terminalization_does_not_mutate_replacement_session_ledger
