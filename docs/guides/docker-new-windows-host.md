@@ -32,10 +32,10 @@ uruchamia kontenerów**; te etapy opisano poniżej. Checkout i port zapisuje w
 `index/docker-host-settings.json` rozwiązanego storage; przy starcie przekazuj je
 jako jawne argumenty poleceń z sekcji 4.
 
-W WSL można uruchomić diagnostykę przez `python3 -B scripts/setup_docker.py --check`.
-Dla obecnej trasy zwróci ona informację o wymaganiu natywnego Windows i kod
-wyjścia `2`. Nie zapisuj ścieżki `~/git` jako ścieżki Windows: otwórz PowerShell
-w klonie na lokalnym NTFS/ReFS. Sam kreator nie przenosi klona ani danych.
+Kreator obsługuje również osobną trasę Linux/WSL `linux-native-v1`, opisaną
+w [Docker w WSL](docker-wsl.md). Checkout pod `~/git` i storage na lokalnym
+systemie plików Linux konfiguruj z powłoki WSL. Trasa Windows nadal wymaga
+PowerShell oraz lokalnego NTFS/ReFS; kreator nie przenosi klona ani danych.
 
 ## 1. System i narzędzia hosta
 
@@ -192,8 +192,8 @@ sukcesem przed Compose; `eval` nie może maskować jego błędu. Ten krok usuwa
 błąd konfiguracji starego kontenera narzędziowego, nie buduje ani nie uruchamia
 nowej aplikacji. Ostrzeżenia MinIO/PostgreSQL wynikają z braku `.env`.
 
-Aktualny launcher `docker-all-dev` wykonuje native Windows attestation i
-wymaga checkoutu/storage na lokalnym Windows NTFS/ReFS. Repo pod `~/git` w WSL
-nie jest tym samym typem mountu; adapter Windows odrzuca UNC i ścieżki Linux.
-Równoważny start z Linux/WSL wymaga osobnej kwalifikacji, zamiast obchodzenia
-preflight przez ręczne wpisanie zmiennych.
+Launcher `docker-all-dev` wybiera trasę hosta: Windows używa atestacji
+`windows-folder-v1`, a Linux/WSL lokalnego storage `linux-native-v1`. Repo pod
+`~/git` w WSL konfiguruj zgodnie z [przewodnikiem WSL](docker-wsl.md). Nie
+przekazuj ścieżek Linux do adaptera Windows ani nie obchodź preflight ręcznymi
+zmiennymi. Pełny runtime WSL wymaga osobnej kwalifikacji.

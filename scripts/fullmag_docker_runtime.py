@@ -81,14 +81,16 @@ def validate_workspace_environment(config):
 
 def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
-                 project="fullmag-config-check", template=None):
+                 project="fullmag-config-check", template=None, storage_profile="windows-folder-v1"):
     """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
     if host_certificate is None:
-        raise ValueError("Windows host certificate is required")
+        raise ValueError("Host certificate is required")
+    if storage_profile not in {"windows-folder-v1", "linux-native-v1"}:
+        raise ValueError("Unsupported host storage profile")
     repo = Path(repo or Path(__file__).resolve().parents[1])
     template = Path(template) if template is not None else repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml")
     environment = {
@@ -97,6 +99,8 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_image or image,
         "FULLMAG_STATE_ROOT": str(state), "FULLMAG_HTTP_PORT": str(port),
         "FULLMAG_HOST_CERTIFICATE": str(host_certificate),
+        "FULLMAG_SESSION_STORAGE_PROFILE": storage_profile,
+        "FULLMAG_HOST_CERTIFICATE_TARGET": certificate_target(storage_profile),
         "FULLMAG_BACKEND_HOSTNAME": "fullmag-" + state.parent.name,
     }
     if inputs is not None:
@@ -295,6 +299,69 @@ def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha
             print(json.dumps(receipt, indent=2))
 
 
+def publish_container_metadata(path, value):
+    """Publish non-secret run inputs readable by the isolated container UID."""
+    storage.atomic_json(path, value)
+    if os.name != "nt":
+        path.chmod(0o644)
+
+
+def certificate_target(profile):
+    return ("/run/fullmag/linux-native-host.json" if profile == "linux-native-v1"
+            else "/run/fullmag/windows-folder-host.json")
+
+
+def admit_linux_storage(state, host_certificate, image, args, spec, configured, receipt, root):
+    """Verify the mapped native writer with one stopped probe and a restart."""
+    import hashlib
+    from linux_docker_host import local_volume, read_owned_regular
+    from windows_folder_host import publish_evidence
+    volume = local_volume(state)
+    owner = uuid.uuid4().hex
+    sentinel = (owner + ":" + image).encode()
+    certificate = {"schema": "fullmag.linux-native-host.v1", "storage_profile": "linux-native-v1",
+                   "image_id": image, "owner_token": owner, "host_volume": volume,
+                   "restart_expected_sha256": hashlib.sha256(sentinel).hexdigest(),
+                   "restart_verified": False}
+    with (state / ".linux-native-sentinel").open("xb") as stream:
+        stream.write(sentinel)
+        stream.flush()
+        os.fchmod(stream.fileno(), 0o644)
+        os.fsync(stream.fileno())
+    publish_evidence(host_certificate, certificate)
+    host_certificate.chmod(0o644)
+    probe_service = configured["services"]["backend"]
+    probe_service["command"] = ["--storage-probe"]
+    probe_service["healthcheck"] = {"disable": True}
+    storage.atomic_json(spec, configured)
+    docker(*args, "config", "--quiet")
+    docker(*args, "up", "--detach", "--no-build", "--pull", "never", "backend")
+    container = docker(*args, "ps", "--all", "--quiet", "backend")
+    receipt["probe_container_id"] = container
+    for phase in ("first", "restart"):
+        if phase == "restart":
+            docker("start", container)
+        code = docker("wait", container, timeout=120)
+        receipt[phase + "_probe_exit_code"] = code
+        log = docker("logs", container, combined=True)
+        (root / ("storage-" + phase + ".log")).write_text(log)
+        if code != "0":
+            raise ValueError("Linux storage " + phase + " probe failed: " + log)
+    probe = json.loads(read_owned_regular(state / ".linux-native-probe.json"))
+    expected = {"file_sync", "directory_sync", "atomic_replace", "process_lock",
+                "sqlite_transactions", "restart_readback"}
+    if set(probe.get("checks", {})) != expected or not all(value is True for value in probe["checks"].values()):
+        raise ValueError("Native Linux session storage probes were not all successful")
+    if (hashlib.sha256(read_owned_regular(state / ".linux-native-restart")).hexdigest()
+            != certificate["restart_expected_sha256"] or local_volume(state) != volume):
+        raise ValueError("Native Linux host restart readback or volume identity differs")
+    certificate["restart_verified"] = True
+    publish_evidence(host_certificate, certificate)
+    host_certificate.chmod(0o644)
+    receipt["storage_operational_checks"] = probe["checks"]
+    receipt["storage_power_loss"] = "NOT VERIFIED"
+
+
 def start(repo, assembly_receipt, port, frontend="static", source_root=None):
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
@@ -329,12 +396,14 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
     register_runtime_reference_root(layout, root)
     project = "fullmag-all-" + root.name
     spec = root / "compose.json"
-    host_certificate = root / "windows-folder-host.json"
+    storage_profile = "windows-folder-v1" if os.name == "nt" else "linux-native-v1"
+    host_certificate = root / ("windows-folder-host.json" if os.name == "nt" else "linux-native-host.json")
     receipt = {"schema": "fullmag.docker-all-run.v1", "state": "starting", "image_id": image,
                "compose_project": project, "compose_file": str(spec), "state_root": str(state),
                "assembly_receipt": str(assembly_receipt), "assembly_receipt_sha256": digest(assembly_receipt),
                "native_source_identity": assembly["native_source_identity"],
                "url": f"http://localhost:{port}/workspace", "qualification": "NOT VERIFIED",
+               "storage_profile": storage_profile,
                "frontend_mode": frontend, "container_http_port": 8080 if frontend == "dev" else 8081}
     storage.atomic_json(root / "receipt.json", receipt)
     inputs = None
@@ -346,10 +415,10 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
         if frontend == "dev":
             from docker_development_inputs import seed, select_checkout
             inputs = seed(select_checkout(repo, source_root), state, port)
-            storage.atomic_json(inputs_path, inputs)
+            publish_container_metadata(inputs_path, inputs)
             from local_runner.build_source import native_identity
             receipt["mounted_source_identity_at_start"] = native_identity(Path(inputs["source_root"]), "snapshot")
-            receipt["source_selection"] = "live_windows_selected_checkout"
+            receipt["source_selection"] = inputs["source_selection"]
             receipt["source_root"] = inputs["source_root"]
             receipt["compiled_source_commit"] = assembly["commit"]
             receipt["frontend_source_root"] = inputs["source_root"]
@@ -357,55 +426,64 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
             receipt["frontend_inputs"] = str(inputs_path)
             receipt["frontend_inputs_sha256"] = digest(inputs_path)
 
+        package_provenance = assembly_receipt
+        if inputs is not None and os.name != "nt":
+            # Preserve operator permissions on the original assembly receipt.
+            package_provenance = root / "package-provenance.json"
+            publish_container_metadata(package_provenance, assembly)
+            receipt["mounted_package_provenance"] = str(package_provenance)
+
         def configured_spec():
             return compose_spec(image, state.resolve(), port, host_certificate.resolve(),
                                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                                 package=assembly.get("package_root"),
-                                provenance=assembly_receipt, project=project,
-                                toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml")
-        if os.name != "nt":
-            raise ValueError("This Windows-folder launcher requires native Windows host attestation")
-        from windows_folder_host import attest, local_volume, publish_evidence, read_owned_regular
-        certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
-        publish_evidence(host_certificate, certificate)
+                                provenance=package_provenance, project=project,
+                                toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml",
+                                storage_profile=storage_profile)
         shutil.copyfile(repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml"),
                         root / "compose.source.yaml")
         receipt["compose_source"] = str(root / "compose.source.yaml")
         receipt["compose_source_sha256"] = digest(root / "compose.source.yaml")
-        configured = configured_spec()
-        probe_service = configured["services"]["backend"]
-        probe_service["command"] = ["--storage-probe"]
-        probe_service["healthcheck"] = {"disable": True}
-        storage.atomic_json(spec, configured)
-        docker(*args, "config", "--quiet")
-        docker(*args, "up", "--detach", "--no-build", "--pull", "never", "backend")
-        probe_container = docker(*args, "ps", "--all", "--quiet", "backend")
-        receipt["probe_container_id"] = probe_container
-        receipt["first_probe_exit_code"] = docker("wait", probe_container, timeout=120)
-        (root / "storage-first.log").write_text(docker("logs", probe_container, combined=True))
-        if receipt["first_probe_exit_code"] != "0":
-            raise ValueError("Windows storage first probe failed: " + docker("logs", probe_container, combined=True))
-        docker("start", probe_container)
-        receipt["restart_probe_exit_code"] = docker("wait", probe_container, timeout=120)
-        (root / "storage-restart.log").write_text(docker("logs", probe_container, combined=True))
-        if receipt["restart_probe_exit_code"] != "0":
-            raise ValueError("Windows storage restart probe failed: " + docker("logs", probe_container, combined=True))
-        probe = json.loads(read_owned_regular(state / ".windows-folder-probe/probe-restart.json"))
-        CHECKS = ("file_sync", "directory_sync", "atomic_replace", "atomic_directory_publish",
-                  "process_lock", "no_follow_symlink", "no_follow_junction",
-                  "sqlite_transactions", "restart_readback")
-        if set(probe["checks"]) != set(CHECKS) or not all(value is True for value in probe["checks"].values()):
-            raise ValueError("Windows session storage probes were not all successful")
-        import hashlib
-        if hashlib.sha256(read_owned_regular(state / ".windows-folder-probe/restart-sentinel.bin")).hexdigest() != certificate["restart_expected_sha256"]:
-            raise ValueError("Native Windows restart readback differs from the guest")
-        if any(certificate[key] != value for key, value in local_volume(state).items()):
-            raise ValueError("Native Windows volume identity changed during preflight")
-        certificate["restart_verified"] = True
-        publish_evidence(state / ".fullmag-windows-folder-owner.json", certificate)
-        publish_evidence(host_certificate, certificate)
-        receipt["storage_operational_checks"] = probe["checks"]
-        receipt["storage_power_loss"] = "NOT VERIFIED"
+        if storage_profile == "linux-native-v1":
+            admit_linux_storage(state, host_certificate, image, args, spec, configured_spec(), receipt, root)
+        else:
+            from windows_folder_host import attest, local_volume, publish_evidence, read_owned_regular
+            certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
+            publish_evidence(host_certificate, certificate)
+            configured = configured_spec()
+            probe_service = configured["services"]["backend"]
+            probe_service["command"] = ["--storage-probe"]
+            probe_service["healthcheck"] = {"disable": True}
+            storage.atomic_json(spec, configured)
+            docker(*args, "config", "--quiet")
+            docker(*args, "up", "--detach", "--no-build", "--pull", "never", "backend")
+            probe_container = docker(*args, "ps", "--all", "--quiet", "backend")
+            receipt["probe_container_id"] = probe_container
+            receipt["first_probe_exit_code"] = docker("wait", probe_container, timeout=120)
+            (root / "storage-first.log").write_text(docker("logs", probe_container, combined=True))
+            if receipt["first_probe_exit_code"] != "0":
+                raise ValueError("Windows storage first probe failed: " + docker("logs", probe_container, combined=True))
+            docker("start", probe_container)
+            receipt["restart_probe_exit_code"] = docker("wait", probe_container, timeout=120)
+            (root / "storage-restart.log").write_text(docker("logs", probe_container, combined=True))
+            if receipt["restart_probe_exit_code"] != "0":
+                raise ValueError("Windows storage restart probe failed: " + docker("logs", probe_container, combined=True))
+            probe = json.loads(read_owned_regular(state / ".windows-folder-probe/probe-restart.json"))
+            CHECKS = ("file_sync", "directory_sync", "atomic_replace", "atomic_directory_publish",
+                      "process_lock", "no_follow_symlink", "no_follow_junction",
+                      "sqlite_transactions", "restart_readback")
+            if set(probe["checks"]) != set(CHECKS) or not all(value is True for value in probe["checks"].values()):
+                raise ValueError("Windows session storage probes were not all successful")
+            import hashlib
+            if hashlib.sha256(read_owned_regular(state / ".windows-folder-probe/restart-sentinel.bin")).hexdigest() != certificate["restart_expected_sha256"]:
+                raise ValueError("Native Windows restart readback differs from the guest")
+            if any(certificate[key] != value for key, value in local_volume(state).items()):
+                raise ValueError("Native Windows volume identity changed during preflight")
+            certificate["restart_verified"] = True
+            publish_evidence(state / ".fullmag-windows-folder-owner.json", certificate)
+            publish_evidence(host_certificate, certificate)
+            receipt["storage_operational_checks"] = probe["checks"]
+            receipt["storage_power_loss"] = "NOT VERIFIED"
         storage.atomic_json(spec, configured_spec())
         docker(*args, "up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout",
                "2100" if inputs is not None else "90", timeout=2160 if inputs is not None else 150)
@@ -445,7 +523,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
         if inputs is not None:
             expected_readonly = {"/opt/fullmag/source": Path(inputs["source_root"]).resolve(),
                                  "/opt/fullmag/package": package.resolve(),
-                                 "/opt/fullmag/provenance.json": assembly_receipt.resolve()}
+                                 "/opt/fullmag/provenance.json": package_provenance.resolve()}
             for destination, source in expected_readonly.items():
                 bound = [m for m in actual["Mounts"] if m["Destination"] == destination]
                 if (len(bound) != 1 or bound[0]["Type"] != "bind" or bound[0]["RW"]
@@ -454,10 +532,10 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
         mounts = [m for m in actual["Mounts"] if m["Destination"] == "/state"]
         if len(mounts) != 1 or mounts[0]["Type"] != "bind" or not mounts[0]["RW"] or host_path(mounts[0]["Source"]) != state.resolve():
             raise ValueError("Runtime state mount attestation mismatch")
-        certificates = [m for m in actual["Mounts"] if m["Destination"] == "/run/fullmag/windows-folder-host.json"]
+        certificates = [m for m in actual["Mounts"] if m["Destination"] == certificate_target(storage_profile)]
         if (len(certificates) != 1 or certificates[0]["Type"] != "bind" or certificates[0]["RW"]
                 or host_path(certificates[0]["Source"]) != host_certificate.resolve()):
-            raise ValueError("Readonly Windows host attestation mount mismatch")
+            raise ValueError("Readonly host attestation mount mismatch")
         if not host.get("ReadonlyRootfs") or host.get("Privileged") or actual["Config"].get("User") != "65532:65532":
             raise ValueError("Runtime isolation attestation mismatch")
         if not any(d.get("Count") == -1 and ["gpu"] in d.get("Capabilities", []) for d in host.get("DeviceRequests", [])):

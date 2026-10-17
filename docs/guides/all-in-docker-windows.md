@@ -8,6 +8,10 @@ socketu Dockera ani hostowego Pythona podczas uruchomienia. Tryb developerski
 ma osobny kontrakt dwóch usług i korzysta z readonly bindów wybranego checkoutu,
 opisanych niżej.
 
+Dla checkoutu i storage w Linux/WSL używaj osobnej trasy
+[`linux-native-v1`](docker-wsl.md). Poniższy opis atestacji NTFS/ReFS i 9p
+dotyczy trasy Windows `windows-folder-v1`.
+
 ## Główna ścieżka developerska
 
 Z głównego checkoutu lub worktree wykonaj kolejno:
