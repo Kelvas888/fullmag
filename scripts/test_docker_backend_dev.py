@@ -1,5 +1,7 @@
 """Interpreted package publication regressions; no native compilation."""
+from contextlib import redirect_stderr
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -71,6 +73,56 @@ class BackendPackageTests(unittest.TestCase):
         output = root / "package"
         records = backend._copy_package(workspace, output)
         return output, records
+
+    def test_live_source_copy_performs_one_verified_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rs"
+            target = root / "shadow/source.rs"
+            content = b"pub fn value() -> u8 { 1 }\n"
+            source.write_bytes(content)
+            entry = {
+                "path": "source.rs",
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "mode": "100644",
+            }
+            original_open_regular = backend._open_regular
+            source_opens = []
+
+            def tracking_open_regular(path, name, maximum):
+                if name == "live source source.rs":
+                    source_opens.append(path)
+                return original_open_regular(path, name, maximum)
+
+            with patch.object(backend, "_open_regular", side_effect=tracking_open_regular):
+                backend._copy_live_regular_file(source, target, "source.rs", entry)
+
+            self.assertEqual(source_opens, [source])
+            self.assertEqual(target.read_bytes(), content)
+
+    def test_phase_log_is_flushable_and_excludes_paths_or_contents(self):
+        class FlushTrackingStream(io.StringIO):
+            flushed = False
+
+            def flush(self):
+                self.flushed = True
+                super().flush()
+
+        stream = FlushTrackingStream()
+        with redirect_stderr(stream):
+            backend._log_phase(
+                "capture",
+                "complete",
+                files=9000,
+                path="/sensitive/source.rs",
+                content="private source",
+            )
+        output = stream.getvalue()
+        self.assertTrue(stream.flushed)
+        self.assertIn("backend-dev: phase=capture state=complete files=9000", output)
+        self.assertNotIn("sensitive", output)
+        self.assertNotIn("private source", output)
 
     def test_local_runtime_manifests_are_attested_and_resolve_workers_inside_package(self):
         with tempfile.TemporaryDirectory() as directory:

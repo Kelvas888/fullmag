@@ -12,6 +12,7 @@ checkout-owned host helper.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -21,6 +22,7 @@ import re
 import selectors
 import shutil
 import stat
+import sys
 import tarfile
 import tempfile
 import subprocess
@@ -43,13 +45,15 @@ LIVE_GIT_CHUNK_BYTES = 64 * 1024
 LIVE_GIT_STDERR_BYTES = 64 * 1024
 LIVE_GIT_HEADER_BYTES = 4 * 1024
 LIVE_GIT_MARKER_BYTES = 4 * 1024
+LIVE_HASH_WORKERS = 8
+LIVE_HASH_CHUNK_BYTES = 1024 * 1024
 CAPTURE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 LIVE_MANIFEST_SCHEMA = "fullmag.docker-backend-live-source.v1"
 LIVE_SOURCE_MODE = "live-shadow-v1"
 LIVE_MANIFEST_DIRNAME = ".fullmag-live-source"
 LIVE_MANIFEST_FILENAME = "manifest.json"
 LIVE_LFS_POINTER_RE = re.compile(
-    rb"\AVersion https://git-lfs\.github\.com/spec/v1\r?\n"
+    rb"\A[vV]ersion https://git-lfs\.github\.com/spec/v1\r?\n"
     rb"oid sha256:[0-9a-f]{64}\r?\n"
     rb"size [0-9]+(?:\r?\n|\Z)"
 )
@@ -83,11 +87,36 @@ LIVE_NON_RUNTIME_EXACT = frozenset(
     {
         ".fullmag-build", ".fullmag-cache", ".fullmag-cargo", ".fullmag-rustup",
         "Codex-Usage", ".impl-racetrack", ".worktrees", "apps/control-room/next-env.d.ts",
-        "justfile", "scripts/capture_source_snapshot_identity.py",
+        "justfile", "scripts/export_fem_gpu_runtime.sh",
+        "scripts/capture_source_snapshot_identity.py",
+        "scripts/lib/managed_fem_image_identity.sh",
+        "scripts/prune_managed_fem_runtimes.sh",
+        "scripts/public_docs_information_architecture.py",
         "scripts/runtime_source_change_policy.py",
     }
 )
 LIVE_NON_RUNTIME_SUFFIXES = (".md", ".rst", ".source-map.json")
+
+# Keep this pathspec contract aligned with
+# scripts/capture_source_snapshot_identity.py::_runtime_status_pathspecs.
+LIVE_RUNTIME_STATUS_EXCLUSIONS = (
+    ":(exclude).fullmag-build/**",
+    ":(exclude).fullmag-cache/**",
+    ":(exclude).fullmag-cargo/**",
+    ":(exclude).fullmag-rustup/**",
+    ":(exclude)external_solvers/**",
+    ":(exclude).agents/**",
+    ":(exclude).codex/**",
+    ":(exclude).github/**",
+    ":(exclude)apps/control-room/**",
+    ":(exclude)docs/**",
+    ":(exclude)public_docs/**",
+    ":(exclude)scripts/test_*",
+    ":(exclude)scripts/test_*/**",
+    ":(exclude)**/*.md",
+    ":(exclude)**/*.rst",
+    ":(exclude)**/*.source-map.json",
+)
 
 
 class BackendSourceError(RuntimeError):
@@ -866,8 +895,7 @@ def _live_index(
     return records, native_entries, gitlinks
 
 
-def _live_tree(source_root: Path, git_dir: Path, exclusions: list[object]) -> dict[str, tuple[str, str]]:
-    raw = _live_run_git(source_root, git_dir, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+def _live_tree(raw: bytes, exclusions: list[object]) -> dict[str, tuple[str, str]]:
     records: dict[str, tuple[str, str]] = {}
     for relative, mode, descriptor in _live_parse_git_records(raw, "committed Git tree"):
         kind, object_id = descriptor.split(":", 1)
@@ -886,6 +914,17 @@ def _live_tree(source_root: Path, git_dir: Path, exclusions: list[object]) -> di
             _live_fail(f"unsupported committed source entry at {relative}")
         records[relative] = (mode, object_id)
     return records
+
+
+def _live_runtime_status_pathspecs(tree_bytes: bytes) -> tuple[str, ...]:
+    """Build the canonical runtime-only status pathspec from the HEAD tree."""
+    top_level: set[str] = set()
+    for relative, _mode, _descriptor in _live_parse_git_records(tree_bytes, "committed Git tree"):
+        top_level.add(relative.split("/", 1)[0])
+    pathspecs = [path for path in sorted(top_level) if not _live_non_runtime(path)]
+    if not pathspecs:
+        _live_fail("cannot construct runtime source pathspecs")
+    return tuple([*pathspecs, ":(top)*", *LIVE_RUNTIME_STATUS_EXCLUSIONS])
 
 
 def _live_check_lfs_attributes(source_root: Path, git_dir: Path, paths: list[str]) -> None:
@@ -973,9 +1012,8 @@ def _live_skip_worktree(source_root: Path, git_dir: Path) -> set[str]:
     return result
 
 
-def _live_read_regular(source_root: Path, relative: str) -> tuple[str, bytes] | None:
+def _live_regular_path(source_root: Path, relative: str) -> Path | None:
     path = source_root.joinpath(*PurePosixPath(relative).parts)
-    parent = path.parent
     current = source_root
     for part in PurePosixPath(relative).parts[:-1]:
         current /= part
@@ -993,6 +1031,24 @@ def _live_read_regular(source_root: Path, relative: str) -> tuple[str, bytes] | 
         _live_fail(f"live source entry is a symlink or reparse point: {relative}")
     if not stat.S_ISREG(metadata.st_mode):
         _live_fail(f"live source entry is not a regular file: {relative}")
+    return path
+
+
+def _live_metadata_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _live_read_regular(source_root: Path, relative: str) -> tuple[str, bytes] | None:
+    path = _live_regular_path(source_root, relative)
+    if path is None:
+        return None
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as error:
@@ -1014,17 +1070,88 @@ def _live_read_regular(source_root: Path, relative: str) -> tuple[str, bytes] | 
         os.close(descriptor)
     if len(content) > MAX_FILE_BYTES or before.st_size != len(content):
         _live_fail(f"live source file exceeds its size bound or changed: {relative}")
-    if (
-        before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns
-    ) != (
-        after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns
-    ):
+    if _live_metadata_signature(before) != _live_metadata_signature(after):
         _live_fail(f"live source file changed while being read: {relative}")
     if LIVE_LFS_POINTER_RE.match(bytes(content)):
         _live_fail(f"Git-LFS pointer is not materialized: {relative}")
     return ("100755" if before.st_mode & stat.S_IXUSR else "100644", bytes(content))
 
 
+
+
+def _live_hash_regular(source_root: Path, relative: str) -> tuple[str, int, str] | None:
+    """Hash one regular source file without retaining its content in memory."""
+    path = _live_regular_path(source_root, relative)
+    if path is None:
+        return None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise BackendSourceError(f"cannot open live source file {relative}") from error
+    digest = hashlib.sha256()
+    total = 0
+    prefix = bytearray()
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            _live_fail(f"live source file is not one regular file: {relative}")
+        while total <= MAX_FILE_BYTES:
+            block = os.read(
+                descriptor,
+                min(LIVE_HASH_CHUNK_BYTES, MAX_FILE_BYTES + 1 - total),
+            )
+            if not block:
+                break
+            total += len(block)
+            digest.update(block)
+            if len(prefix) < LIVE_GIT_MARKER_BYTES:
+                prefix.extend(block[: LIVE_GIT_MARKER_BYTES - len(prefix)])
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise BackendSourceError(f"cannot read live source file {relative}") from error
+    finally:
+        os.close(descriptor)
+    if total > MAX_FILE_BYTES or before.st_size != total:
+        _live_fail(f"live source file exceeds its size bound or changed: {relative}")
+    if _live_metadata_signature(before) != _live_metadata_signature(after):
+        _live_fail(f"live source file changed while being read: {relative}")
+    # Normal Git-LFS pointers are well below the bounded probe.  Keep the
+    # probe bounded while preserving the existing exact check for such files.
+    if LIVE_LFS_POINTER_RE.match(bytes(prefix)):
+        _live_fail(f"Git-LFS pointer is not materialized: {relative}")
+    return (
+        "100755" if before.st_mode & stat.S_IXUSR else "100644",
+        total,
+        digest.hexdigest(),
+    )
+
+
+def _live_hash_regular_files(
+    source_root: Path, relatives: list[str]
+) -> dict[str, tuple[str, int, str] | None]:
+    """Hash sorted source paths with at most eight in-flight reads."""
+    relatives = sorted(relatives)
+    result: dict[str, tuple[str, int, str] | None] = {}
+    iterator = iter(relatives)
+    pending = {}
+    with ThreadPoolExecutor(max_workers=LIVE_HASH_WORKERS) as executor:
+        for _ in range(LIVE_HASH_WORKERS):
+            try:
+                relative = next(iterator)
+            except StopIteration:
+                break
+            pending[executor.submit(_live_hash_regular, source_root, relative)] = relative
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                relative = pending.pop(future)
+                result[relative] = future.result()
+                try:
+                    next_relative = next(iterator)
+                except StopIteration:
+                    continue
+                pending[executor.submit(_live_hash_regular, source_root, next_relative)] = next_relative
+    return {relative: result[relative] for relative in relatives}
 
 
 def _live_parse_status(raw: bytes) -> list[dict[str, object]]:
@@ -1051,6 +1178,21 @@ def _live_parse_status(raw: bytes) -> list[dict[str, object]]:
             index += 1
         records.append({"status": status, "paths": paths})
     return records
+
+
+def _live_untracked_records(raw: bytes) -> tuple[list[str], list[dict[str, object]]]:
+    paths: list[str] = []
+    records: list[dict[str, object]] = []
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        try:
+            relative = _live_safe_relative(item.decode("utf-8"), "untracked source")
+        except UnicodeDecodeError as error:
+            raise BackendSourceError("cannot decode untracked source path") from error
+        paths.append(relative)
+        records.append({"status": "??", "paths": [relative]})
+    return paths, records
 
 
 def _live_non_runtime(relative: str) -> bool:
@@ -1157,9 +1299,9 @@ def _capture_live_source_once(
         raise BackendSourceError("live source Git HEAD is not ASCII") from error
     if not SHA40_RE.fullmatch(head):
         _live_fail("live source Git HEAD is not a full commit SHA")
-    tree_bytes = _live_run_git(source_root, git_dir, "ls-tree", "-r", "--full-tree", head)
+    tree_bytes = _live_run_git(source_root, git_dir, "ls-tree", "-r", "-z", "--full-tree", head)
     exclusions: list[object] = []
-    tree = _live_tree(source_root, git_dir, exclusions)
+    tree = _live_tree(tree_bytes, exclusions)
     index, native_index, gitlinks = _live_index(source_root, git_dir, exclusions)
     records = dict(tree)
     records.update({path: (mode, object_id) for path, (mode, object_id, _stage) in index.items()})
@@ -1168,23 +1310,24 @@ def _capture_live_source_once(
     files: list[dict[str, Any]] = []
     deleted: list[str] = []
     sparse_objects: dict[str, str] = {}
+    current_files = _live_hash_regular_files(source_root, sorted(records))
     for relative in sorted(records):
         mode, object_id = records[relative]
-        current = _live_read_regular(source_root, relative)
+        current = current_files[relative]
         if current is None:
             if relative in skip_worktree and mode in {"100644", "100755"}:
                 sparse_objects[relative] = object_id
                 continue
             deleted.append(relative)
             continue
-        current_mode, content = current
+        current_mode, size, digest = current
         files.append(
             {
                 "path": relative,
                 "type": "file",
                 "mode": current_mode,
-                "size": len(content),
-                "sha256": _live_sha256(content),
+                "size": size,
+                "sha256": digest,
             }
         )
     sparse = _live_read_blobs(git_dir, sparse_objects)
@@ -1206,7 +1349,9 @@ def _capture_live_source_once(
         "--porcelain=v1",
         "-z",
         "--no-renames",
-        "--untracked-files=all",
+        "--untracked-files=no",
+        "--",
+        *_live_runtime_status_pathspecs(tree_bytes),
         maximum=MAX_MANIFEST_BYTES,
     )
     status_records = _live_parse_status(status_raw)
@@ -1219,14 +1364,14 @@ def _capture_live_source_once(
         "-z",
         maximum=MAX_MANIFEST_BYTES,
     )
-    for item in untracked_raw.split(b"\0"):
-        if item:
-            try:
-                exclusions.append(_live_safe_relative(item.decode("utf-8"), "untracked source"))
-            except UnicodeDecodeError as error:
-                raise BackendSourceError("cannot decode untracked source path") from error
+    untracked_paths, untracked_records = _live_untracked_records(untracked_raw)
+    exclusions.extend(untracked_paths)
+    status_records.extend(untracked_records)
     excluded = _live_normalize_excluded(exclusions)
     files.sort(key=lambda entry: entry["path"])
+    native = _live_native_identity(
+        source_root, git_dir, head, tree_bytes, status_records, native_index, gitlinks
+    )
     capsule_core = {
         "schema_version": "fullmag.source-capsule.v1",
         "source_mode": "snapshot",
@@ -1248,7 +1393,9 @@ def _capture_live_source_once(
         "resolved_commit": head,
         "head_commit": head,
         "dirty": True,
-        "working_tree_dirty": bool(status_records),
+        # This is deliberately the backend/runtime observation after the
+        # canonical runtime and Gitlink filters, not a full Git status flag.
+        "working_tree_dirty": bool(native["source_snapshot_dirty"]),
         "files": files,
         "entries": files,
         "deleted": sorted(deleted),
@@ -1257,10 +1404,36 @@ def _capture_live_source_once(
         "source_digest": source_digest,
         "source_digest_sha256": source_digest,
     }
-    native = _live_native_identity(
-        source_root, git_dir, head, tree_bytes, status_records, native_index, gitlinks
-    )
     return capsule, native, sparse_objects
+
+
+def _capture_live_source_pass(
+    source_root: Path, git_common_root: Path, pass_number: int
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    started = time.monotonic()
+    print(f"fullmag-live-source capture_pass={pass_number} phase=start", file=sys.stderr, flush=True)
+    try:
+        result = _capture_live_source_once(source_root, git_common_root)
+    except Exception as error:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        print(
+            f"fullmag-live-source capture_pass={pass_number} phase=end outcome=error "
+            f"error_type={type(error).__name__} elapsed_ms={elapsed_ms}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+    capsule, native, _git_object_ids = result
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    print(
+        f"fullmag-live-source capture_pass={pass_number} phase=end outcome=success "
+        f"files={len(capsule['files'])} deleted={len(capsule['deleted'])} "
+        f"status={len(native['git_status_porcelain_v1'])} excluded={len(capsule['excluded'])} "
+        f"elapsed_ms={elapsed_ms}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return result
 
 
 def capture_live_source_manifest(
@@ -1276,8 +1449,8 @@ def capture_live_source_manifest(
     source_root = Path(source_root)
     git_common_root = Path(git_common_root)
     build_root = Path(build_root)
-    first = _capture_live_source_once(source_root, git_common_root)
-    second = _capture_live_source_once(source_root, git_common_root)
+    first = _capture_live_source_pass(source_root, git_common_root, 1)
+    second = _capture_live_source_pass(source_root, git_common_root, 2)
     if second != first:
         _live_fail("live source changed while creating its closed manifest")
     capsule, native, git_object_ids = first

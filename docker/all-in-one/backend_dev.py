@@ -150,6 +150,44 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _log_phase(phase: str, state: str, **fields: object) -> None:
+    """Emit a bounded, flushable lifecycle marker without source contents."""
+
+    allowed_fields = frozenset(
+        {
+            "bytes",
+            "duration_ms",
+            "error",
+            "exit_code",
+            "files",
+            "mode",
+            "profile",
+            "reason",
+            "sparse",
+            "target",
+        }
+    )
+    parts = [f"phase={phase}", f"state={state}"]
+    for name, value in fields.items():
+        if name not in allowed_fields:
+            continue
+        if isinstance(value, bool):
+            encoded = "true" if value else "false"
+        elif isinstance(value, int):
+            encoded = str(value)
+        elif isinstance(value, float):
+            encoded = f"{value:.3f}"
+        elif isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,64}", value):
+            encoded = value
+        else:
+            continue
+        parts.append(f"{name}={encoded}")
+    try:
+        print("backend-dev: " + " ".join(parts), file=sys.stderr, flush=True)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+
+
 def _sha256_file(path: Path, name: str, maximum: int | None = None) -> tuple[str, os.stat_result]:
     path = _absolute(path, name)
     descriptor = _open_regular(path, name, maximum)
@@ -697,25 +735,6 @@ def _live_source_path(source_root: Path, relative: str) -> Path:
     return path
 
 
-def _hash_live_regular(path: Path, relative: str, entry: Mapping[str, Any]) -> None:
-    descriptor = _open_regular(path, f"live source {relative}", MAX_SOURCE_BYTES)
-    try:
-        before = os.fstat(descriptor)
-        digest = hashlib.sha256()
-        total = 0
-        while True:
-            block = os.read(descriptor, 1024 * 1024)
-            if not block:
-                break
-            total += len(block)
-            digest.update(block)
-        after = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    if total != entry["size"] or digest.hexdigest() != entry["sha256"] or _file_signature(before) != _file_signature(after):
-        _fail(f"live source changed or differs from manifest: {relative}")
-
-
 def _publish_shadow_bytes(target: Path, data: bytes, mode: int, label: str) -> None:
     _ensure_directory(target.parent, f"shadow source directory {target.parent}")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
@@ -789,6 +808,8 @@ def _sync_live_source_tree(
     source_root = _absolute(source_root, "live source root")
     _assert_no_links(source_root, "live source root")
     expected = _source_manifest_inventory(capsule)
+    started = time.monotonic()
+    _log_phase("sync", "start", files=len(expected))
     _remove_generated_build_output(workspace)
     existing_files, existing_directories = _workspace_tree_inventory(workspace)
     for relative in existing_directories:
@@ -844,7 +865,6 @@ def _sync_live_source_tree(
                 _fail(f"live source is missing manifest file: {relative}")
             sparse_object_ids[relative] = object_id
         else:
-            _hash_live_regular(source, relative, entry)
             _copy_live_regular_file(source, target, relative, entry)
 
     sparse_blobs = _read_git_blobs(git_common_root, sparse_object_ids)
@@ -874,6 +894,13 @@ def _sync_live_source_tree(
         "workspace_inventory_schema": WORKSPACE_INVENTORY_SCHEMA,
         "workspace_inventory_sha256": new_digest,
     }, "backend workspace owner")
+    _log_phase(
+        "sync",
+        "complete",
+        files=len(expected),
+        sparse=len(sparse_object_ids),
+        duration_ms=round((time.monotonic() - started) * 1000),
+    )
 
 
 def _verify_shadow_source(workspace: Path, capsule: Mapping[str, Any]) -> None:
@@ -1827,6 +1854,8 @@ def _write_console_chunk(chunk: bytes) -> None:
 
 
 def _run_canonical_make(command: list[str], workspace: Path, environment: Mapping[str, str], log_path: Path) -> int:
+    started = time.monotonic()
+    _log_phase("make", "start", target=command[-1])
     try:
         with log_path.open("wb") as log:
             process = subprocess.Popen(
@@ -1847,8 +1876,21 @@ def _run_canonical_make(command: list[str], workspace: Path, environment: Mappin
                     log.write(chunk)
                     log.flush()
                     _write_console_chunk(chunk)
-            return process.wait()
+            return_code = process.wait()
+            _log_phase(
+                "make",
+                "complete",
+                exit_code=return_code,
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+            return return_code
     except OSError as error:
+        _log_phase(
+            "make",
+            "failed",
+            error=type(error).__name__,
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
         _fail(f"cannot execute canonical Make target: {error}")
 
 
@@ -1893,6 +1935,8 @@ def _publish_completed_build(
     cargo_profile: str,
 ) -> int:
     """Publish verified artifacts after the canonical Make invocation succeeded."""
+    started = time.monotonic()
+    _log_phase("package", "start")
     cargo_profile = _validate_cargo_profile(cargo_profile)
     records = _copy_package(workspace, output)
     source_record: dict[str, Any] = {
@@ -1938,6 +1982,12 @@ def _publish_completed_build(
         "artifacts": records,
     }
     _write_json(output / "backend-build-receipt.json", receipt, "backend build receipt")
+    _log_phase(
+        "package",
+        "complete",
+        files=len(records),
+        duration_ms=round((time.monotonic() - started) * 1000),
+    )
     return 0
 
 
@@ -1965,14 +2015,33 @@ def _validate_start_output(output: Path, build_root: Path) -> None:
 def _capture_start_manifest(args: argparse.Namespace, build_root: Path) -> Path:
     """Capture the current readonly checkout inside the trusted image."""
 
+    started = time.monotonic()
+    _log_phase("capture", "start")
     try:
-        return capture_live_source_manifest(
+        manifest = capture_live_source_manifest(
             Path(args.source_root),
             Path(args.git_common_root),
             build_root,
         )
     except BackendSourceError as error:
+        _log_phase(
+            "capture",
+            "failed",
+            error=type(error).__name__,
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
         _fail(f"current live source capture failed: {error}")
+    try:
+        manifest_bytes = manifest.stat().st_size
+    except OSError:
+        manifest_bytes = 0
+    _log_phase(
+        "capture",
+        "complete",
+        bytes=manifest_bytes,
+        duration_ms=round((time.monotonic() - started) * 1000),
+    )
+    return manifest
 
 
 def _publish_runtime_provenance(output: Path) -> None:
@@ -2118,6 +2187,7 @@ def _restore_bound_provenance(data: bytes) -> None:
 def _start(args: argparse.Namespace) -> int:
     """Build and hand off to the API in this same backend container."""
 
+    _log_phase("start", "begin", mode="backend-dev")
     build_root = _absolute(Path(args.build_root), "build root")
     output = _absolute(Path(args.output), "backend output")
     jobs = int(args.jobs)
@@ -2218,6 +2288,7 @@ def _start(args: argparse.Namespace) -> int:
         finally:
             if candidate is not None and candidate.exists() and not rollback_failed:
                 _remove_owned_tree(candidate)
+        _log_phase("start", "handoff")
         return _serve([])
 
 
@@ -2454,14 +2525,18 @@ def _serve(extra: list[str]) -> int:
     if os.environ.get("FULLMAG_DOCKER_ROLE") == "frontend":
         environment = dict(os.environ)
         command = [sys.executable, "/opt/fullmag/entrypoint.py", *extra]
+        _log_phase("api", "exec", mode="frontend")
         os.execvpe(sys.executable, command, environment)
         return 0
     if extra == ["--storage-probe"]:
         environment = dict(os.environ)
         environment["FULLMAG_DOCKER_ROLE"] = "backend"
         command = [sys.executable, "/opt/fullmag/entrypoint.py", *extra]
+        _log_phase("api", "exec", mode="storage-probe")
         os.execvpe(sys.executable, command, environment)
         return 0
+    package_started = time.monotonic()
+    _log_phase("package", "verify-start")
     receipt_path = PACKAGE_ROOT / "backend-build-receipt.json"
     receipt, receipt_bytes = _read_json(receipt_path, "backend build receipt", 8 * 1024 * 1024)
     if receipt.get("schema") != RECEIPT_SCHEMA or receipt.get("state") != "succeeded":
@@ -2472,10 +2547,24 @@ def _serve(extra: list[str]) -> int:
     actual_artifacts = _hash_package(PACKAGE_ROOT)
     if receipt.get("artifacts") != actual_artifacts:
         _fail("runtime package artifacts differ from the build receipt")
+    _log_phase(
+        "package",
+        "verify-complete",
+        files=len(actual_artifacts),
+        duration_ms=round((time.monotonic() - package_started) * 1000),
+    )
     receipt_sha256 = _sha256_bytes(receipt_bytes)
     if os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == WINDOWS_FOLDER_STORAGE_PROFILE:
+        _log_phase("gate", "start", profile=WINDOWS_FOLDER_STORAGE_PROFILE)
         provenance, _ = _read_json(PROVENANCE_PATH, "runtime provenance", 8 * 1024 * 1024)
-        _wait_for_windows_folder_attestation(provenance, receipt_sha256)
+        try:
+            _wait_for_windows_folder_attestation(provenance, receipt_sha256)
+        except (BackendBuildError, OSError) as error:
+            _log_phase("gate", "failed", error=type(error).__name__)
+            raise
+        _log_phase("gate", "complete", profile=WINDOWS_FOLDER_STORAGE_PROFILE)
+    else:
+        _log_phase("gate", "skipped", reason="storage-profile")
     environment = dict(os.environ)
     environment.update(
         {
@@ -2488,6 +2577,7 @@ def _serve(extra: list[str]) -> int:
         }
     )
     command = [sys.executable, "/opt/fullmag/entrypoint.py", *extra]
+    _log_phase("api", "exec", mode="backend")
     os.execvpe(sys.executable, command, environment)
     return 0
 

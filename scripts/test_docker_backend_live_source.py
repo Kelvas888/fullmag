@@ -1,5 +1,7 @@
 """Bounded live-source Git and Windows worktree marker regressions."""
 
+import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import stat
@@ -125,6 +127,131 @@ class LiveSourceGitTests(unittest.TestCase):
                     ),
                     {"source.txt": b"abc"},
                 )
+
+    def test_runtime_status_pathspec_matches_canonical_helper(self):
+        canonical_path = Path(__file__).resolve().parent / "capture_source_snapshot_identity.py"
+        spec = importlib.util.spec_from_file_location("canonical_source_identity", canonical_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        canonical = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(canonical)
+        tree = b"\0".join(
+            b"100644 blob " + (b"a" * 40) + b"\t" + path
+            for path in (
+                (
+                    b".agents/metadata.txt",
+                    b"apps/control-room/main.ts",
+                    b"docs/guide.md",
+                    b"external_solvers/3/README",
+                    b"README.md",
+                    b"runtime.py",
+                    b"scripts/test_fixture.py",
+                    b"src/main.py",
+                )
+            )
+        ) + b"\0"
+        top_level = b"\n".join(
+            (
+                b".agents",
+                b"apps",
+                b"docs",
+                b"external_solvers",
+                b"README.md",
+                b"runtime.py",
+                b"scripts",
+                b"src",
+            )
+        ) + b"\n"
+        with patch.object(canonical, "_git", return_value=top_level):
+            expected = canonical._runtime_status_pathspecs(Path("/unused"))
+        self.assertEqual(backend_source._live_runtime_status_pathspecs(tree), expected)
+
+    def test_full_untracked_scan_reconstructs_porcelain_records(self):
+        paths, records = backend_source._live_untracked_records(
+            b"src/new.py\0docs/new.md\0"
+        )
+        self.assertEqual(paths, ["src/new.py", "docs/new.md"])
+        self.assertEqual(
+            records,
+            [
+                {"status": "??", "paths": ["src/new.py"]},
+                {"status": "??", "paths": ["docs/new.md"]},
+            ],
+        )
+
+    def test_stream_hash_is_bounded_deterministic_and_preserves_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contents = {
+                "z-last.bin": b"z" * (backend_source.LIVE_HASH_CHUNK_BYTES + 17),
+                "a-first.txt": b"first\n",
+                "m-middle.txt": b"middle\n",
+            }
+            for relative, content in contents.items():
+                (root / relative).write_bytes(content)
+            relatives = sorted(contents)
+            expected = {
+                relative: (
+                    "100644",
+                    len(contents[relative]),
+                    hashlib.sha256(contents[relative]).hexdigest(),
+                )
+                for relative in relatives
+            }
+            self.assertEqual(backend_source._live_hash_regular_files(root, relatives), expected)
+            self.assertEqual(backend_source._live_hash_regular_files(root, relatives), expected)
+
+    def test_stream_hash_rejects_unsafe_parent_and_changed_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.mkdir()
+            (target / "file.txt").write_text("safe", encoding="utf-8")
+            (root / "link").symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(
+                backend_source.BackendSourceError,
+                "unsafe parent",
+            ):
+                backend_source._live_hash_regular(root, "link/file.txt")
+
+            regular = root / "stable.txt"
+            regular.write_text("stable", encoding="utf-8")
+            original_signature = backend_source._live_metadata_signature
+            calls = 0
+
+            def changed_signature(metadata):
+                nonlocal calls
+                calls += 1
+                signature = original_signature(metadata)
+                if calls == 2:
+                    return (*signature[:-1], signature[-1] + 1)
+                return signature
+
+            with patch.object(
+                backend_source,
+                "_live_metadata_signature",
+                side_effect=changed_signature,
+            ):
+                with self.assertRaisesRegex(
+                    backend_source.BackendSourceError,
+                    "changed while being read",
+                ):
+                    backend_source._live_hash_regular(root, "stable.txt")
+
+    def test_stream_hash_rejects_lowercase_lfs_pointer_with_padding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pointer = (
+                b"version https://git-lfs.github.com/spec/v1\n"
+                b"oid sha256:" + b"a" * 64 + b"\n"
+                b"size 4\n"
+            )
+            (root / "pointer.dat").write_bytes(pointer + b"x" * (backend_source.LIVE_GIT_MARKER_BYTES + 1))
+            with self.assertRaisesRegex(
+                backend_source.BackendSourceError,
+                "Git-LFS pointer",
+            ):
+                backend_source._live_hash_regular(root, "pointer.dat")
 
 
 if __name__ == "__main__":
