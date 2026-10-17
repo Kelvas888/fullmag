@@ -13,6 +13,7 @@ import json
 import os
 import re
 import stat
+import uuid
 from contextlib import nullcontext
 import urllib.error
 import urllib.parse
@@ -27,6 +28,7 @@ import fullmag_storage as storage
 AUTHORIZATION_SCHEMA = "fullmag.docker-startup-script.v1"
 REQUEST_SCHEMA = "fullmag.startup-script-activation-request.v1"
 RESPONSE_SCHEMA = "fullmag.startup-script-activation.v1"
+ACTIVATION_RECEIPT_SCHEMA = "fullmag.docker-startup-activation-receipt.v1"
 AUTHORIZATION_KIND = "explicit_startup_script"
 # The existing script importer and Python helper both use a 1 MiB source
 # boundary.  Startup must not create a larger, parallel script transport.
@@ -37,11 +39,13 @@ STARTUP_ENDPOINT = "/v1/internal/live/current/startup"
 MAX_SCRIPT_BYTES = 1024 * 1024
 MAX_PROVENANCE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_ACTIVATION_RECEIPT_BYTES = 2 * MAX_RESPONSE_BYTES
 STARTUP_ACTIVATION_TIMEOUT_SECONDS = 2100.0
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PROVENANCE_SHA256_ENV = "FULLMAG_STARTUP_PROVENANCE_SHA256"
+ACTIVATION_RECEIPT_PATH = Path("/state/.fullmag/docker-startup/activation.json")
 # Script authoring/capability failures are command outcomes. A rejected
 # execution-policy envelope is a launcher/protocol error and stays fatal.
 SCRIPT_REJECTION_CODES = frozenset({
@@ -271,11 +275,29 @@ def _pinned_parent(path: Path):
     return _pinned_no_reparse_ancestors(path)
 
 
-def _exclusive_json(path: Path, value: Mapping[str, Any]) -> str:
+def _json_payload(value: Mapping[str, Any], maximum: int, label: str) -> bytes:
+    try:
+        payload = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise StartupScriptError(f"{label} is not serializable JSON") from error
+    if len(payload) > maximum:
+        raise StartupScriptError(f"{label} exceeds its {maximum}-byte bound")
+    return payload
+
+
+def _exclusive_json(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    label: str = "startup provenance",
+    maximum: int | None = None,
+) -> str:
     """Create one durable JSON file without replacing a concurrent publication."""
 
-    parent = _no_reparse_path(path.parent, "startup provenance parent", require_directory=True)
-    payload = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    parent = _no_reparse_path(path.parent, f"{label} parent", require_directory=True)
+    payload = _json_payload(value, maximum, label) if maximum is not None else (
+        json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
     # The Windows CRT defaults file descriptors to text mode.  Provenance is
     # attested as bytes, so force binary mode before writing; otherwise the
     # CRT may expand LF to CRLF and the returned digest would not describe the
@@ -303,14 +325,119 @@ def _exclusive_json(path: Path, value: Mapping[str, Any]) -> str:
             if parent_fd is not None:
                 os.fsync(parent_fd)
     except FileExistsError as error:
-        raise StartupScriptError("startup provenance destination already exists") from error
+        raise StartupScriptError(f"{label} destination already exists") from error
     except OSError as error:
-        raise StartupScriptError(f"cannot publish startup provenance: {error}") from error
+        raise StartupScriptError(f"cannot publish {label}: {error}") from error
     finally:
         if descriptor is not None:
             os.close(descriptor)
         if parent_fd is not None:
             os.close(parent_fd)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _ensure_activation_receipt_parent(path: Path) -> Path:
+    """Create the one missing receipt directory under an already owned state root."""
+
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        raise StartupScriptError("startup activation receipt must be an absolute path")
+    parent = path.parent
+    # The entrypoint creates /state/.fullmag before importing this helper.  Do
+    # not recursively create arbitrary path components: only the final,
+    # helper-owned directory may be added here.
+    state_parent = _no_reparse_path(parent.parent, "startup activation state parent", require_directory=True)
+    if os.path.lexists(parent):
+        return _no_reparse_path(parent, "startup activation receipt parent", require_directory=True)
+    try:
+        with _pinned_parent(state_parent):
+            os.mkdir(parent, 0o770)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise StartupScriptError(f"cannot create startup activation receipt parent: {error}") from error
+    result = _no_reparse_path(parent, "startup activation receipt parent", require_directory=True)
+    if os.name != "nt":
+        try:
+            descriptor = os.open(
+                str(state_parent),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise StartupScriptError("cannot durably publish startup activation parent") from error
+    return result
+
+
+def _replace_json(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    label: str,
+    maximum: int,
+) -> str:
+    """Atomically replace a validated receipt with a flushed terminal result."""
+
+    path = Path(path)
+    parent = _no_reparse_path(path.parent, f"{label} parent", require_directory=True)
+    _no_reparse_path(path, label)
+    payload = _json_payload(value, maximum, label)
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    temporary = parent / temporary_name
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    parent_fd = None
+    descriptor = None
+    try:
+        with _pinned_parent(parent):
+            if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
+                parent_fd = os.open(
+                    str(parent), os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+                )
+                descriptor = os.open(temporary_name, flags, 0o660, dir_fd=parent_fd)
+            else:
+                descriptor = os.open(str(temporary), flags, 0o660)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+            if descriptor is not None:
+                os.close(descriptor)
+                descriptor = None
+            if os.name != "nt":
+                os.replace(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.fsync(parent_fd)
+            else:
+                from windows_folder_host import _replace_write_through
+
+                _replace_write_through(temporary, path)
+    except OSError as error:
+        raise StartupScriptError(f"cannot publish {label}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        try:
+            if os.path.lexists(temporary):
+                os.unlink(temporary)
+        except OSError:
+            # The terminal publication error is the useful evidence; never
+            # remove an unrelated path while trying to clean our own temp name.
+            pass
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -497,6 +624,151 @@ def activate(
     return validate_activation_response(response, authorization)
 
 
+def _activation_receipt_started(
+    authorization: Mapping[str, Any], provenance_sha256: str
+) -> dict[str, Any]:
+    """Build the durable pre-POST marker from one host-attested request."""
+
+    build_activation_request(authorization)
+    source_sha256 = authorization.get("source_sha256")
+    if not isinstance(source_sha256, str) or not SHA256_RE.fullmatch(source_sha256):
+        raise StartupScriptError("startup activation authorization has an invalid source hash")
+    if not isinstance(provenance_sha256, str) or not SHA256_RE.fullmatch(provenance_sha256):
+        raise StartupScriptError("startup activation provenance hash is invalid")
+    _validate_source_size(authorization, "startup activation authorization")
+    return {
+        "schema": ACTIVATION_RECEIPT_SCHEMA,
+        "state": "started",
+        "request_id": authorization["request_id"],
+        "provenance_sha256": provenance_sha256,
+        "source_sha256": source_sha256,
+        "authorization": dict(authorization),
+    }
+
+
+def _validate_source_size(authorization: Mapping[str, Any], label: str) -> None:
+    source_size_bytes = authorization.get("source_size_bytes")
+    if (isinstance(source_size_bytes, bool) or not isinstance(source_size_bytes, int)
+            or not 0 <= source_size_bytes <= MAX_SCRIPT_BYTES):
+        raise StartupScriptError(f"{label} source size is invalid")
+
+
+def _validate_activation_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a bounded receipt before it can influence startup behavior."""
+
+    if not isinstance(value, dict) or value.get("schema") != ACTIVATION_RECEIPT_SCHEMA:
+        raise StartupScriptError("startup activation receipt schema mismatch")
+    state = value.get("state")
+    if state not in {"started", "activated", "rejected"}:
+        raise StartupScriptError("startup activation receipt state is unknown")
+    base_fields = {
+        "schema", "state", "request_id", "provenance_sha256",
+        "source_sha256", "authorization",
+    }
+    expected_fields = base_fields if state == "started" else base_fields | {"result"}
+    if set(value) != expected_fields:
+        raise StartupScriptError("startup activation receipt fields are invalid")
+    request_id = value.get("request_id")
+    if not isinstance(request_id, str) or not REQUEST_ID_RE.fullmatch(request_id):
+        raise StartupScriptError("startup activation receipt request id is invalid")
+    for field in ("provenance_sha256", "source_sha256"):
+        candidate = value.get(field)
+        if not isinstance(candidate, str) or not SHA256_RE.fullmatch(candidate):
+            raise StartupScriptError(f"startup activation receipt {field} is invalid")
+    authorization = value.get("authorization")
+    if not isinstance(authorization, dict):
+        raise StartupScriptError("startup activation receipt authorization is missing")
+    build_activation_request(authorization)
+    if authorization.get("request_id") != request_id:
+        raise StartupScriptError("startup activation receipt request fence differs")
+    if authorization.get("source_sha256") != value.get("source_sha256"):
+        raise StartupScriptError("startup activation receipt source hash fence differs")
+    _validate_source_size(authorization, "startup activation receipt")
+    if state == "started":
+        return dict(value)
+    result = value.get("result")
+    if not isinstance(result, dict) or result.get("state") != state:
+        raise StartupScriptError("startup activation receipt terminal result is invalid")
+    if state == "rejected":
+        validate_rejection_receipt(result, authorization)
+    else:
+        if (result.get("schema") != RESPONSE_SCHEMA
+                or result.get("request_id") != request_id
+                or result.get("source_sha256") != value.get("source_sha256")
+                or result.get("source_relative") != authorization.get("source_relative")):
+            raise StartupScriptError("startup activation receipt terminal fence differs")
+        response = result.get("response")
+        if not isinstance(response, dict):
+            raise StartupScriptError("startup activation receipt activation response is missing")
+        validate_activation_response(response, authorization)
+    return dict(value)
+
+
+def _load_activation_receipt(path: Path) -> dict[str, Any] | None:
+    """Read a receipt only through the bounded no-reparse reader."""
+
+    if not os.path.lexists(path):
+        return None
+    raw = _bounded_regular(path, MAX_ACTIVATION_RECEIPT_BYTES, "startup activation receipt")
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StartupScriptError("startup activation receipt is not valid JSON") from error
+    return _validate_activation_receipt(value)
+
+
+def _receipt_identity_matches(
+    receipt: Mapping[str, Any], authorization: Mapping[str, Any], provenance_sha256: str
+) -> bool:
+    stored_authorization = receipt.get("authorization")
+    if not isinstance(stored_authorization, Mapping):
+        return False
+    if receipt.get("provenance_sha256") != provenance_sha256:
+        return False
+    if receipt.get("request_id") != authorization.get("request_id"):
+        return False
+    if receipt.get("source_sha256") != authorization.get("source_sha256"):
+        return False
+    return dict(stored_authorization) == dict(authorization)
+
+
+def _replay_or_reject_existing_receipt(
+    receipt: Mapping[str, Any], authorization: Mapping[str, Any], provenance_sha256: str
+) -> dict[str, Any]:
+    if not _receipt_identity_matches(receipt, authorization, provenance_sha256):
+        raise StartupScriptError("startup activation receipt belongs to a different request")
+    if receipt.get("state") == "started":
+        raise StartupScriptError(
+            "startup activation outcome is unknown; durable started receipt prevents a retry"
+        )
+    result = receipt.get("result")
+    if not isinstance(result, dict):
+        raise StartupScriptError("startup activation receipt terminal result is missing")
+    return dict(result)
+
+
+def _publish_activation_terminal(
+    path: Path,
+    started: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> None:
+    """Publish activated/rejected only if the pre-POST marker is still intact."""
+
+    current = _load_activation_receipt(path)
+    if current != dict(started):
+        raise StartupScriptError("startup activation started receipt changed before terminal publication")
+    terminal = dict(started)
+    terminal["state"] = result.get("state")
+    terminal["result"] = dict(result)
+    _validate_activation_receipt(terminal)
+    _replace_json(
+        path,
+        terminal,
+        label="startup activation receipt",
+        maximum=MAX_ACTIVATION_RECEIPT_BYTES,
+    )
+
+
 def run_from_environment() -> dict[str, Any] | None:
     """Run the optional startup activation after the API is ready."""
 
@@ -523,18 +795,39 @@ def run_from_environment() -> dict[str, Any] | None:
     authorization, provenance_sha256 = _load_provenance_with_digest(values["provenance"])
     if provenance_sha256 != values["provenance_sha256"]:
         raise StartupScriptError("mounted startup provenance differs from host-attested bytes")
+    build_activation_request(authorization)
+    _validate_source_size(authorization, "startup activation authorization")
+    if authorization.get("container_script_path") != values["script"]:
+        raise StartupScriptError("mounted startup script path differs from provenance")
+    receipt_path = _ensure_activation_receipt_parent(ACTIVATION_RECEIPT_PATH) / ACTIVATION_RECEIPT_PATH.name
+    existing = _load_activation_receipt(receipt_path)
+    if existing is not None:
+        return _replay_or_reject_existing_receipt(existing, authorization, provenance_sha256)
     script_data = _bounded_regular(Path(values["script"]), MAX_SCRIPT_BYTES, "mounted startup script")
     observed = hashlib.sha256(script_data).hexdigest()
     if observed != authorization.get("source_sha256"):
         raise StartupScriptError("mounted startup script differs from host-attested bytes")
     if len(script_data) != authorization.get("source_size_bytes"):
         raise StartupScriptError("mounted startup script size differs from host-attested bytes")
-    if authorization.get("container_script_path") != values["script"]:
-        raise StartupScriptError("mounted startup script path differs from provenance")
+    started = _activation_receipt_started(authorization, provenance_sha256)
+    try:
+        _exclusive_json(
+            receipt_path,
+            started,
+            label="startup activation receipt",
+            maximum=MAX_ACTIVATION_RECEIPT_BYTES,
+        )
+    except StartupScriptError:
+        if not os.path.lexists(receipt_path):
+            raise
+        raced = _load_activation_receipt(receipt_path)
+        if raced is None:
+            raise
+        return _replay_or_reject_existing_receipt(raced, authorization, provenance_sha256)
     try:
         response = activate(authorization, api_base=values["api"])
     except StartupScriptRejected as error:
-        return {
+        result = {
             "schema": RESPONSE_SCHEMA,
             "state": "rejected",
             "request_id": authorization["request_id"],
@@ -546,7 +839,9 @@ def run_from_environment() -> dict[str, Any] | None:
                 "message": error.message,
             },
         }
-    return {
+        _publish_activation_terminal(receipt_path, started, result)
+        return result
+    result = {
         "schema": RESPONSE_SCHEMA,
         "state": "activated",
         "request_id": authorization["request_id"],
@@ -554,6 +849,8 @@ def run_from_environment() -> dict[str, Any] | None:
         "source_relative": authorization["source_relative"],
         "response": response,
     }
+    _publish_activation_terminal(receipt_path, started, result)
+    return result
 
 
 def validate_rejection_receipt(value: Mapping[str, Any], authorization: Mapping[str, Any]) -> dict[str, Any]:
@@ -579,6 +876,8 @@ def validate_rejection_receipt(value: Mapping[str, Any], authorization: Mapping[
 
 __all__ = [
     "AUTHORIZATION_SCHEMA",
+    "ACTIVATION_RECEIPT_PATH",
+    "ACTIVATION_RECEIPT_SCHEMA",
     "REQUEST_SCHEMA",
     "RESPONSE_SCHEMA",
     "StartupScriptAuthorization",

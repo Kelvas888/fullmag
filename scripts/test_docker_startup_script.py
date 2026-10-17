@@ -338,6 +338,16 @@ class DockerStartupScriptTests(unittest.TestCase):
 
 
 class StartupRejectionTests(unittest.TestCase):
+    def setUp(self):
+        self.receipt_directory = tempfile.TemporaryDirectory()
+        self.receipt_path = Path(self.receipt_directory.name) / "activation.json"
+        self.receipt_patch = mock.patch.object(startup, "ACTIVATION_RECEIPT_PATH", self.receipt_path)
+        self.receipt_patch.start()
+
+    def tearDown(self):
+        self.receipt_patch.stop()
+        self.receipt_directory.cleanup()
+
     def authorization(self):
         return {
             "schema": startup.AUTHORIZATION_SCHEMA,
@@ -358,6 +368,11 @@ class StartupRejectionTests(unittest.TestCase):
             "FULLMAG_STARTUP_PROVENANCE": "/run/fullmag/startup-provenance.json",
             startup.PROVENANCE_SHA256_ENV: "a" * 64,
         }, clear=True)
+
+    def bounded_regular(self, path, _maximum, label):
+        if label == "startup activation receipt":
+            return self.receipt_path.read_bytes()
+        return b"script"
 
     def test_only_structured_validation_http_errors_are_known_rejections(self):
         import io
@@ -393,7 +408,7 @@ class StartupRejectionTests(unittest.TestCase):
         authorization = self.authorization()
         with self.run_environment(), mock.patch.object(
             startup, "_load_provenance_with_digest", return_value=(authorization, "a" * 64),
-        ), mock.patch.object(startup, "_bounded_regular", return_value=b"script"), mock.patch.object(
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
             startup, "activate", side_effect=startup.StartupScriptRejected(400, "bad_request", "x" * 3000),
         ):
             receipt = startup.run_from_environment()
@@ -416,11 +431,12 @@ class StartupRejectionTests(unittest.TestCase):
         authorization = self.authorization()
         with self.run_environment(), mock.patch.object(
             startup, "_load_provenance_with_digest", return_value=(authorization, "a" * 64),
-        ), mock.patch.object(startup, "_bounded_regular", return_value=b"script"), mock.patch.object(
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
             startup, "activate", side_effect=startup.StartupScriptError("HTTP 500"),
         ):
             with self.assertRaisesRegex(startup.StartupScriptError, "HTTP 500"):
                 startup.run_from_environment()
+        self.receipt_path.unlink()
         with self.run_environment(), mock.patch.object(
             startup, "_load_provenance_with_digest", return_value=(authorization, "b" * 64),
         ), mock.patch.object(startup, "activate") as activate:
@@ -467,11 +483,200 @@ class StartupRejectionTests(unittest.TestCase):
                     mock.patch.object(module.subprocess, "Popen", return_value=api), \
                     mock.patch.object(module, "activate_startup_script", side_effect=startup.run_from_environment), \
                     mock.patch.object(startup, "_load_provenance_with_digest", return_value=(authorization, "a" * 64)), \
-                    mock.patch.object(startup, "_bounded_regular", return_value=b"script"), \
+                    mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), \
                     mock.patch.object(startup, "activate", side_effect=startup.StartupScriptRejected(400, "bad_request", "unsupported model")):
                 self.assertEqual(module.serve(), 0)
             service.stop.assert_called_once_with(handle, timeout=30)
             self.assertEqual(receipts[-1]["state"], "drained")
+
+
+class ActivationReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self.receipt_directory = tempfile.TemporaryDirectory()
+        self.receipt_path = Path(self.receipt_directory.name) / "activation.json"
+        self.receipt_patch = mock.patch.object(startup, "ACTIVATION_RECEIPT_PATH", self.receipt_path)
+        self.receipt_patch.start()
+        self.source_bytes = b"script"
+        self.authorization = {
+            "schema": startup.AUTHORIZATION_SCHEMA,
+            "authorization": startup.AUTHORIZATION_KIND,
+            "request_id": "startup-receipt-test",
+            "source_sha256": hashlib.sha256(self.source_bytes).hexdigest(),
+            "source_relative": "models/scene.py",
+            "source_size_bytes": len(self.source_bytes),
+            "container_script_path": "/opt/fullmag/source/models/scene.py",
+            "container_source_root": "/opt/fullmag/source",
+        }
+        self.provenance_sha256 = "a" * 64
+
+    def tearDown(self):
+        self.receipt_patch.stop()
+        self.receipt_directory.cleanup()
+
+    def environment(self):
+        return mock.patch.dict(os.environ, {
+            "FULLMAG_STARTUP_ENABLED": "1",
+            "FULLMAG_STARTUP_SCRIPT": self.authorization["container_script_path"],
+            "FULLMAG_STARTUP_PROVENANCE": "/run/fullmag/startup-provenance.json",
+            startup.PROVENANCE_SHA256_ENV: self.provenance_sha256,
+        }, clear=True)
+
+    def bounded_regular(self, path, _maximum, label):
+        if label == "startup activation receipt":
+            return self.receipt_path.read_bytes()
+        if label == "mounted startup script":
+            return self.source_bytes
+        raise AssertionError(f"unexpected bounded read: {label}")
+
+    def response(self):
+        return {
+            "schema": startup.RESPONSE_SCHEMA,
+            "authorization": startup.AUTHORIZATION_KIND,
+            "request_id": self.authorization["request_id"],
+            "source_sha256": self.authorization["source_sha256"],
+            "status": "accepted",
+            "session_id": "session-startup-receipt-test",
+            "run_id": "run-startup-receipt-test",
+            "step_ids": ["step-startup-receipt-test"],
+            "scene_revision": 2,
+            "runtime_metadata": {"interactive": True, "wait_for_solve": False},
+            "execution": {
+                "mode": "canonical_live_v2",
+                "auto_study": True,
+                "interactive": "script_metadata",
+                "wait_for_solve": "script_metadata",
+                "legacy_cli": False,
+            },
+        }
+
+    def test_terminal_activation_replays_without_reading_changed_script_or_posting(self):
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate", return_value=self.response(),
+        ) as activate:
+            first = startup.run_from_environment()
+        activate.assert_called_once()
+        self.assertEqual(first["state"], "activated")
+        durable = json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(durable["schema"], startup.ACTIVATION_RECEIPT_SCHEMA)
+        self.assertEqual(durable["state"], "activated")
+        self.assertEqual(durable["request_id"], self.authorization["request_id"])
+        self.assertEqual(durable["provenance_sha256"], self.provenance_sha256)
+        self.assertEqual(durable["source_sha256"], self.authorization["source_sha256"])
+        self.source_bytes = b"changed-script"
+        def no_script_read(path, _maximum, label):
+            if label == "startup activation receipt":
+                return self.receipt_path.read_bytes()
+            raise AssertionError("terminal replay must not reread the mounted startup script")
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=no_script_read), mock.patch.object(
+            startup, "activate",
+        ) as activate:
+            replay = startup.run_from_environment()
+        self.assertEqual(replay, first)
+        activate.assert_not_called()
+
+    def test_started_receipt_blocks_unknown_post_retry(self):
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate", side_effect=startup.StartupScriptError("HTTP 500"),
+        ) as activate:
+            with self.assertRaisesRegex(startup.StartupScriptError, "HTTP 500"):
+                startup.run_from_environment()
+        activate.assert_called_once()
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate",
+        ) as activate:
+            with self.assertRaisesRegex(startup.StartupScriptError, "prevents a retry"):
+                startup.run_from_environment()
+        activate.assert_not_called()
+
+    def test_rejected_terminal_result_replays_without_posting(self):
+        rejection = startup.StartupScriptRejected(422, "validation_error", "invalid model")
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate", side_effect=rejection,
+        ) as activate:
+            first = startup.run_from_environment()
+        self.assertEqual(first["state"], "rejected")
+        activate.assert_called_once()
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate",
+        ) as activate:
+            replay = startup.run_from_environment()
+        self.assertEqual(replay, first)
+        activate.assert_not_called()
+
+    def test_foreign_receipt_hash_fails_closed_without_post(self):
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate", return_value=self.response(),
+        ):
+            startup.run_from_environment()
+        document = json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        document["provenance_sha256"] = "b" * 64
+        self.receipt_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate",
+        ) as activate:
+            with self.assertRaisesRegex(startup.StartupScriptError, "different request"):
+                startup.run_from_environment()
+        activate.assert_not_called()
+
+    def test_changed_receipt_authorization_snapshot_fails_closed_without_post(self):
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate", return_value=self.response(),
+        ):
+            startup.run_from_environment()
+        document = json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        document["authorization"]["source_size_bytes"] += 1
+        self.receipt_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate",
+        ) as activate:
+            with self.assertRaisesRegex(startup.StartupScriptError, "different request"):
+                startup.run_from_environment()
+        activate.assert_not_called()
+
+    def test_receipt_symlink_is_rejected_without_post(self):
+        target = self.receipt_path.with_name("foreign-receipt.json")
+        target.write_text("{}", encoding="utf-8")
+        try:
+            self.receipt_path.symlink_to(target)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "activate") as activate:
+            with self.assertRaises(startup.StartupScriptError):
+                startup.run_from_environment()
+        activate.assert_not_called()
+
+    def test_corrupt_receipt_is_retained_and_blocks_post(self):
+        self.receipt_path.write_text("{", encoding="utf-8")
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate",
+        ) as activate:
+            with self.assertRaisesRegex(startup.StartupScriptError, "not valid JSON"):
+                startup.run_from_environment()
+        activate.assert_not_called()
 
 
 if __name__ == "__main__":
