@@ -21,7 +21,7 @@ function unique<T>(items: readonly T[], matches: (item: T) => boolean): T | null
 /** Derive routes from the same builders as Explorer; never persist another tree. */
 export function antennaNavigationLinks(scene: SceneResource, origin: Selection): AntennaNavigationLink[] {
   const ref = origin.ref;
-  if (ref?.type !== "scene-object" || !ref.kind.startsWith("object.antenna.")) return [];
+  if (ref?.type !== "scene-object" || (ref.kind !== "object.antenna" && !ref.kind.startsWith("object.antenna."))) return [];
   const objectId = ref.objectId;
   const object = unique(scene.objects ?? [], item => item.id === objectId);
   if (!object) return [{ key: "missing-owner", label: "Related resources", selection: null, reason: "The source object is missing or ambiguous." }];
@@ -62,6 +62,17 @@ export function antennaNavigationLinks(scene: SceneResource, origin: Selection):
     if (target.kind === "global") {
       links.push({ key: "global-target", label: "Global receiver", selection: null, reason: "Global scope has no single receiver object to open." });
     } else add(`target:${target.object_id}:${target.kind === "region" ? target.region_id : "object"}`, "Receiver", target.object_id, target.kind === "region" ? "object.region" : "object.root", undefined, target.kind === "region" ? target.region_id : undefined);
+  }
+  if (ref.kind === "object.antenna") {
+    add("conductor", "Conductor", objectId, "object.antenna.conductor");
+    add("geometry", "Geometry", objectId, "object.antenna.geometry");
+    add("terminals", "Terminals and source", objectId, "object.antenna.terminals");
+    for (const item of scene.antenna_port_modes ?? []) if (item.source_object_id === objectId) addResource("port", item.id, "Port");
+    for (const item of stages) if (item.source_object_id === objectId) addResource("solution", item.id, "Field solve");
+    for (const item of projections) if (resourceOwner("projection", item.id) === objectId) addResource("projection", item.id, "Projection");
+    for (const item of drives) if (resourceOwner("drive", item.id) === objectId) addResource("drive", item.id, "Current drive");
+    for (const item of spectra) if (resourceOwner("spectrum", item.id) === objectId) addResource("spectrum", item.id, "Source spectrum");
+    add("regional", "Regional field drive", objectId, "object.antenna.regional");
   }
   if (kind === "conductor") {
     add("geometry", "Geometry", objectId, "object.antenna.geometry");

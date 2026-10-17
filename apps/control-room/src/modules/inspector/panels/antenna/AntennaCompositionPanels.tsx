@@ -967,7 +967,7 @@ export function AntennaCompositionPanel({
           solution={fieldSolution.data}
         />
       ) : null}
-      {(kind === "port" || kind === "projection" || kind === "spectrum") && resourceId ? <AntennaResourceEditor kind={kind} resourceId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
+      {(kind === "port" || kind === "projection" || kind === "spectrum") && resourceId ? <AntennaResourceEditor kind={kind} resourceId={resourceId} removeOnly={kind === "port"} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "drive" && resourceId ? <SolvedAntennaDriveEditor driveId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
 
     </div>

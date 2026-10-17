@@ -519,8 +519,12 @@ case "${recipe}" in
     if [[ "${recipe}" =~ ${solve_targets_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3256 --scenario antenna-solve-targets
     fi
-    port_editor_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3264 --scenario antenna-port-editor$'
+    port_editor_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3264 --scenario antenna-port-editor( --dependency-workspace "([^"]+)")?[[:space:]]*$'
     if [[ "${recipe}" =~ ${port_editor_browser_pattern} ]]; then
+      dependency_workspace="${BASH_REMATCH[2]:-}"
+      if [[ -n "${dependency_workspace}" ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3264 --scenario antenna-port-editor --dependency-workspace "${dependency_workspace}"
+      fi
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3264 --scenario antenna-port-editor
     fi
     inspector_actions_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3257 --scenario inspector-actions$'
@@ -531,7 +535,7 @@ case "${recipe}" in
     if [[ "${recipe}" =~ ${primitive_color_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3257 --scenario primitive-color-inspector
     fi
-    stations_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3253 --scenario antenna-microstrip-stations$'
+    stations_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3253 --scenario antenna-microstrip-stations( --dependency-workspace "([^"]+)")?[[:space:]]*$'
     object_material_editor_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3266 --scenario object-material-editor$'
     if [[ "${recipe}" =~ ${object_material_editor_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3266 --scenario object-material-editor
@@ -545,6 +549,10 @@ case "${recipe}" in
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3265 --scenario antenna-drive-editor
     fi
     if [[ "${recipe}" =~ ${stations_browser_pattern} ]]; then
+      dependency_workspace="${BASH_REMATCH[2]:-}"
+      if [[ -n "${dependency_workspace}" ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3253 --scenario antenna-microstrip-stations --dependency-workspace "${dependency_workspace}"
+      fi
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3253 --scenario antenna-microstrip-stations
     fi
     antenna_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3252 --scenario antenna-external-lead-inspection$'

@@ -355,6 +355,27 @@ try {
   await screenshot("16-geometry-inspector");
   assert.equal(pageErrors.length, 0, pageErrors.join(" | "));
   checks.push({ name: `${layout} Explorer Geometry routes to its dedicated layout and placement inspector`, passed: true });
+  await page.evaluate(() => window.__antennaStationsFixture.selectComposition("fixture-microstrip-conductor"));
+  const composition = page.getByTestId("antenna-composition-summary");
+  await composition.waitFor({ timeout });
+  for (const name of ["Conductor", "Ports", "Field solves", "Projections", "Current drives", "Source spectra", "Regional field drive"]) {
+    assert.equal(await composition.getByRole("heading", { name, exact: true }).count(), 1);
+  }
+  assert.ok((await composition.innerText()).includes("Configured resources do not establish a completed solve"));
+  assert.equal(await composition.getByRole("textbox").count(), 0, "Composition must navigate to dedicated editors instead of duplicating authoring");
+  await screenshot("16a-composition-inspector");
+  await composition.getByRole("button", { name: "Open Conductor", exact: true }).click();
+  await page.getByRole("heading", { name: "Antenna conductor", exact: true }).waitFor({ timeout });
+  assert.equal((await page.evaluate(() => window.__antennaStationsFixture.readSelection())).kind, "object.antenna.conductor");
+  await page.evaluate(() => window.__antennaStationsFixture.selectComposition("fixture-microstrip-conductor"));
+  await composition.getByRole("button", { name: "Open Regional field drive", exact: true }).click();
+  assert.equal((await page.evaluate(() => window.__antennaStationsFixture.readSelection())).kind, "object.antenna.regional");
+  await composition.waitFor({ state: "detached", timeout });
+  assert.equal(await page.getByTestId("antenna-composition-summary").count(), 0);
+  await page.evaluate(() => window.__antennaStationsFixture.selectComposition("fixture-microstrip-conductor"));
+  await composition.getByRole("button", { name: "Open Geometry", exact: true }).click();
+  await geometryPanel.getByRole("textbox", { name: "Station 1 signal width", exact: true }).waitFor({ timeout });
+  checks.push({ name: `${layout} selectable composition has six distinct workflow groups and canonical Conductor, Regional and Geometry routes`, passed: true });
   const dimensionField = (name) => geometryPanel.getByRole("textbox", { name, exact: true });
   const saveDimensions = () => geometryPanel.getByRole("button", { name: "Save conductor authoring", exact: true }).evaluate((button) => button.click());
   const dimensionBefore = await read();
@@ -438,10 +459,13 @@ try {
   await page.goto(conductorUrl.href, { waitUntil: "domcontentloaded", timeout }); await ready();
   const conductor = page.locator('[data-inspector-owner="object.antenna.conductor"]'); await conductor.waitFor({ timeout });
   const conductorText = await conductor.innerText();
-  assert.ok(conductorText.includes("Layout conductivity") && conductorText.includes("5.8000e+7 S/m"));
-  assert.ok(conductorText.includes("Charge conductivity") && conductorText.includes("3.2000e+7 S/m") && conductorText.includes("4.1000e+7 S/m"));
+  assert.ok(conductorText.includes("Layout conductivity") && conductorText.includes("58 MS/m"));
+  assert.ok(conductorText.includes("Charge conductivity") && conductorText.includes("32 MS/m") && conductorText.includes("41 MS/m"));
   assert.ok(conductorText.includes("explicit-charge") && conductorText.includes("ohmic_poisson"));
-  assert.equal(await conductor.getByRole("textbox").count(), 0, "Conductor must not duplicate geometry/placement editors");
+  for (const name of ["Conductor length", "Conductor thickness", "Station 1 signal width", "Return width"]) {
+    assert.equal(await conductor.getByRole("textbox", { name, exact: true }).count(), 0, "Conductor must not duplicate geometry editors");
+  }
+  assert.equal(await conductor.getByRole("combobox", { name: "Placement side", exact: true }).count(), 0, "Placement belongs to Geometry");
   assert.ok(!conductorText.includes("Station 1") && !conductorText.includes("Return width"));
   await screenshot("18-conductor-materials");
   const navigationBefore = await read();
@@ -462,7 +486,7 @@ try {
     await page.goto(missingUrl.href, { waitUntil: "domcontentloaded", timeout }); await ready();
     const missing = page.locator('[data-inspector-owner="object.antenna.conductor"]'); await missing.waitFor({ timeout });
     const text = await missing.innerText();
-    assert.ok(text.includes(message) && text.includes("5.8000e+7 S/m"));
+    assert.ok(text.includes(message) && text.includes("58 MS/m"));
     assert.ok(!text.includes("Charge conductivity"), "Missing charge materials must not fall back to layout conductivity");
     assert.deepEqual((await read()).unexpected, []);
     checks.push({ name: `${layout} Conductor explicitly reports ${charge === "none" ? "missing current module" : "missing charge materials"} without conductivity fallback`, passed: true });

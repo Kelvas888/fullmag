@@ -39,6 +39,7 @@ const serverHydrated = () => false;
 interface Call { method: string; path: string; scope: string | null; revision: number; body: unknown; }
 interface FixtureControl {
   selectGeometry(objectId: string): void;
+  selectComposition(objectId: string): void;
   studyNodeRef(stageId: string): unknown;
   readSelection(): Selection;
   subscribeSelection(listener: () => void): () => void;
@@ -75,7 +76,7 @@ function makeFixture() {
     }));
     params.conductors = [{ id: "trace", kind: "signal" }, { id: "left", kind: "ground_left" }, { id: "right", kind: "ground_right" }];
   }
-  const state = { scene: { revision: 1, scene_revision: 1, scene: { id: "restored-authoring-model", name: "Fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, objects: [{ id: OBJECT_ID, name: "Microstrip fixture", geometry, notes: "initial" }] } as SceneResource, renderCommits: 0, holdScene: false };
+  const state = { scene: { revision: 1, scene_revision: 1, scene: { id: "restored-authoring-model", name: "Fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, objects: [{ id: OBJECT_ID, name: "Microstrip fixture", role: "antenna", geometry, notes: "initial" }] } as SceneResource, renderCommits: 0, holdScene: false };
   const placementMode = typeof window !== "undefined" && new URL(window.location.href).searchParams.has("placement");
   if (placementMode) {
     state.scene.objects!.push({ id: "placement-target", name: "Explicit magnetic target", magnetization_ref: "authored-magnetization", geometry: { geometry_kind: "Box", geometry_params: {} } });
@@ -185,6 +186,13 @@ function makeFixture() {
       if (!node) throw new Error("Production Geometry route is missing");
       selection.set({ ...EMPTY_SELECTION, kind: node.kind, objectId, nodeId: node.id, ref: selectionRefFromNode(node) }, "explorer");
     },
+    selectComposition: (objectId) => {
+      const snapshot = modelTreeSnapshotFromScene(state.scene).objects?.find(object => object.id === objectId);
+      if (!snapshot) throw new Error("Unknown fixture object");
+      const node = buildObjectExplorerNode(snapshot, { scene: state.scene }).children?.find(child => child.kind === "object.antenna");
+      if (!node || node.selectable === false) throw new Error("Production composition route is unavailable");
+      selection.set({ ...EMPTY_SELECTION, kind: node.kind, label: node.label, objectId, nodeId: node.id, ref: selectionRefFromNode(node) }, "explorer");
+    },
     studyNodeRef: stageId => {
       const snapshot = modelTreeSnapshotFromScene(state.scene);
       const stages = buildStudyNodes(snapshot.study).children?.find(node => node.kind === "study.stages");
@@ -249,7 +257,7 @@ function EditorHarness({ control }: { control: FixtureControl }) {
   const studyMode = new URL(window.location.href).searchParams.has("study");
   const ownerId = selected.ref?.type === "scene-object" ? selected.ref.objectId : null;
   const solves = resource.data?.antenna_field_solve_stages?.filter(stage => stage.source_object_id === ownerId) ?? [];
-  const Panel = selected.kind === "object.antenna.geometry" || selected.kind === "object.antenna.conductor" ? resolveInspectorRoute(selected.kind)?.component : undefined;
+  const Panel = selected.kind?.startsWith("object.antenna") ? resolveInspectorRoute(selected.kind)?.component : undefined;
   return <div data-testid="antenna-stations-editor" data-resource-status={resource.status} data-scene-revision={resource.data?.revision}>
     {routedInspector && Panel ? <Panel selection={selected} /> : <MicrostripGeometryEditor objectId={OBJECT_ID} scene={resource.data} status={resource.status} refetch={resource.refetch} />}
     {studyMode ? <label><input type="checkbox" aria-label="Use previous-session scene scope" checked={foreignScope} onChange={event => setForeignScope(event.currentTarget.checked)} />Use previous-session scene scope</label> : null}

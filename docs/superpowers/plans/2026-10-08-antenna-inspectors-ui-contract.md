@@ -43,9 +43,9 @@ snapshotem; zmiana wejść nie może uczynić go pozornie aktualnym.
 |---|---|---|---|
 | Nazwa anteny / `object.root` | Nazwa, notatki, ID, jawna rola, typ geometrii, widoczność, readiness | Tożsamość, notatki, usunięcie z kontrolą referencji, kolor prezentacyjny | Istniejący ObjectGeneral; nie może prezentować średniej m i energii magnetycznych niemagnetycznego przewodnika. Moduły fizyki pozostają osobnymi węzłami. |
 | Geometry / `object.antenna.geometry` | CPW/microstrip, części, rzeczywiste wymiary i stacje, transformacja, odstęp od odbiorcy | Długość/grubość, szerokości/szczeliny, return geometry, stacje, transformacja i ustawienie nad/pod celem | Dedykowany routing dodawany w tym etapie. Istniejący edytor obsługuje stacje i placement; pełna edycja pozostałych wymiarów nadal do wykonania. |
-| Antenna / `object.antenna` | Grupuje Conductor, porty, solve, projections, drives, spectra | Nawigacja i tworzenie dzieci | Obecnie nieselektowalny kontener. Jego historyczny route do Regional field drive nie jest podsumowaniem kompozycji; trzeba rozdzielić przy usunięciu legacy routingu. |
+| Antenna / `object.antenna` | Grupuje Conductor, porty, solve, projections, drives, spectra | Nawigacja i tworzenie dzieci | Wybieralny węzeł z własnym podsumowaniem kompozycji i nawigacją do dedykowanych paneli. Tworzenie dzieci pozostaje w Conductor i Field solve; Regional field drive ma osobną trasę. Dowody zakresu poniżej z 17.10.2026. |
 | Conductor / `object.antenna.conductor` | Przewodność, materiał, signal/return IDs, terminale, siatka przewodnika i transport | Materiał/przewodność, terminale i polityka siatki; przejście do geometrii | Obecnie pokazuje geometrię i edytory stacji/placement. Pozostają skrótem zgodności do czasu migracji istniejących workflow; docelowym właścicielem geometrii jest Geometry. Nie dublować nowych edytorów. |
-| Port / `object.antenna.port` | Port ID, transport, normalizacja, wszystkie gałęzie, terminale, signed weights, walidacja | Dodawanie/edycja/usuwanie portów i gałęzi, wybór istniejących terminali | Obecny dedykowany panel jest read-only. Wymagany autorujący formularz oraz walidacja referencji i bilansu. |
+| Port / `object.antenna.port` | Port ID, transport, normalizacja, wszystkie gałęzie, terminale, signed weights, walidacja | Dodawanie/edycja/usuwanie portów i gałęzi, wybór istniejących terminali | Jeden dedykowany edytor gałęzi korzysta z inventory terminali. Osobna akcja usunięcia nie przejmuje sesji Apply/Discard i odmawia przy szkicu, pending lub zależnościach. Kontrolowane regresje authoringu nie kwalifikują fizycznego bilansu źródła. |
 | Field solve / `object.antenna.solution` | Model, porty, transport, sampling domain, targets, mesh/solver policy, outputy, runtime i provenance | Konfiguracja i samodzielne obliczenie anteny bez LLG; publikacja i reuse zgodnie z runtime | Edycja targets i kompozytory istnieją; większość konfiguracji jest read-only. Sampling domain nie jest tym samym co target list. Wymagany rzeczywisty lifecycle komendy i pole błędu. |
 | Projection / `object.antenna.projection` | Powiązanie opublikowanej bazy z konkretnym targetem/regionem, carrier identity, podpisy | Wybór/edycja odbiorcy i jawna publikacja zgodnej projekcji | Obecnie read-only; tworzenie projection+drive jest skrótem przy Solution. Nie nazywać samej definicji gotowym wynikiem. |
 | Drive / `object.antenna.drive` | Projection/port, prąd, waveform, pasmo, aktywacja w etapach i jednostki | Prąd i funkcja czasu; powiązania, aktywacja, włącz/wyłącz | Edytor waveform istnieje. Powiązania projection/port wymagają pełnej edycji. Prąd nie jest amplitudą B regionalnego źródła. |
@@ -195,3 +195,37 @@ zero. Ten punkt pozostaje otwarty i wymaga regresji wyboru antena ↔ ferromagne
 
 Cały kontrakt inspektorów oraz pełna wizualizacja V/J/H pozostają nieukończone.
 Ten etap nie zamyka sześciu bramek wymienionych powyżej.
+
+## Dowody etapu kompozycji i pojedynczego edytora portu — 17.10.2026
+
+Główny węzeł Antenna otwiera teraz własny Inspector z grupami Conductor,
+Ports, Field solves, Projections, Current drives i Source spectra. Linki
+pochodzą z kanonicznego buildera Explorera, a kliknięcie ponownie sprawdza
+aktualną scenę i scope. Regional field drive zachowuje oddzielny model i panel.
+Podsumowanie pokazuje konfigurację, bez sugerowania opublikowanego wyniku.
+
+Port ma dokładnie jeden formularz edycji. Akcja usunięcia obserwuje jego
+sesję, ale jej nie rejestruje: globalne Apply/Discard nadal należą do edytora.
+Szkic, trwający zapis i istniejące zależności blokują usunięcie bez kaskady.
+Regresja potwierdza zachowanie nowszego szkicu, fokusu, przewinięcia i tożsamości
+panelu przez pending/ACK, bez zmian disabled/opacity niepowiązanych pól.
+
+Dowody w `storage/builds/antenna-equilibrium-integration--8af052fe52d9cfb4`:
+
+| Kontrola | Receipt / wynik | Zakres |
+|---|---|---|
+| Produkcyjne źródła TypeScript | `windows-control-room-source-check/production-source/d0e8e8dc44ae46b686e484b01d5c00d4/receipt.json` — PASS | Bez kompilowania testów jednostkowych; późniejsze zmiany fixture i smoke mają odrębną kontrolę lint/browser |
+| Port | `windows-control-room-browser-fixture/antenna-port-editor-browser/cedd8dfd96d241b78541fabfbfbb9d14/receipt.json` — 26 kontroli PASS | Pojedynczy edytor, inventory, globalne Apply/Discard, pending/ACK i usuwanie bez kaskady |
+| Kompozycja, CPW i microstrip | `windows-control-room-browser-fixture/antenna-microstrip-stations-browser/b753c31151c4481da98ddf244306b75e/receipt.json` — 45 kontroli PASS | Kanoniczny routing kompozycji, Conductor/Regional/Geometry i istniejący authoring; kontrolowany transport |
+
+Końcowy ukierunkowany ESLint ośmiu zmienionych plików TS zakończył się exit 0,
+bez ostrzeżeń, na kopii bajtowo identycznej z checkoutem. Kontrole przeglądarkowe
+potwierdzają niezmienność źródeł i zamknięcie własnych serwerów. Nie są dowodem
+wykonania solvera, rzeczywistych pól V/J/H, kontekstu WebGL ani cold reopen.
+
+Nowe mapowanie źródeł: `AntennaCompositionSummaryPanel` w
+`apps/control-room/src/modules/inspector/panels/antenna/AntennaCompositionSummaryPanel.tsx`
+korzysta z `antennaNavigationLinks` w
+`apps/control-room/src/modules/explorer/antennaNavigation.ts`;
+`AntennaResourceEditor` i jego prywatny `AntennaResourceEditSession` zachowują
+jednego właściciela sesji edycji portu.

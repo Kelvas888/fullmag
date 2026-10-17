@@ -350,6 +350,66 @@ try {
   assert.equal(await composer.getByText(/old-owner-port.*committed/).count(), 0);
   checks.push({ name: "Creator session ABA fences old ACK and preserves the new owner's draft", passed: true });
   await budget("creator session ABA");
+  await boot("composed-port-dependent");
+  assert.equal(await button("Apply port").count(), 1, "The composed Inspector must expose exactly one port editor");
+  assert.equal(await editor.getByText("Edit antenna port", { exact: true }).count(), 0, "The generic branch form must not duplicate the inventory editor");
+  assert.equal(await button("Remove port (no cascade)").isDisabled(), true);
+  assert.ok((await editor.innerText()).includes("dependent-solve"));
+  assert.equal(writes(await read()).length, 0);
+  checks.push({ name: "Composed port Inspector has one editor and blocks removal of a referenced port", passed: true });
+  await screenshot("composed-port-dependent");
+
+  await boot("composed-port");
+  assert.equal(await button("Apply port").count(), 1);
+  const composedUnrelated = (await read()).scene.antenna_port_modes[1];
+  await terminal("Branch 2 outlet terminal").selectOption("return2-out");
+  assert.equal(await page.getByTestId("port-global-discard").isDisabled(), false);
+  await page.getByTestId("port-global-discard").evaluate(element => element.click());
+  await wait(() => document.querySelector('[data-testid="port-dirty"]')?.textContent === "false");
+  assert.equal(await terminal("Branch 2 outlet terminal").inputValue(), "return-out", "Global Discard must belong to the inventory editor");
+  await terminal("Branch 2 outlet terminal").selectOption("return2-out");
+  assert.equal(await button("Remove port (no cascade)").isDisabled(), true, "A port draft must block concurrent removal");
+  await terminal("Branch 2 outlet terminal").evaluate(input => {
+    const root = document.querySelector('[data-testid="port-editor"] > .fm-inspector-panel'), scroll = document.querySelector('[data-testid="port-scroll"]');
+    const unrelated = document.querySelector('[data-testid="port-unrelated"]');
+    scroll.scrollTop = 100; input.focus({ preventScroll: true });
+    const proof = { root, input, scroll, top: scroll.scrollTop, changes: 0,
+      controls: [input, unrelated].map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity })) };
+    const sample = () => {
+      if (!root.isConnected || document.querySelector('[data-testid="port-editor"] .fm-inspector-panel') !== root) proof.changes++;
+      for (const saved of proof.controls) if (!saved.element.isConnected || saved.element.disabled !== saved.disabled || getComputedStyle(saved.element).opacity !== saved.opacity) proof.changes++;
+      if (root.getAnimations({ subtree: true }).some(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame))) proof.changes++;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { subtree: true, childList: true, attributes: true }); observer.observe(unrelated, { attributes: true });
+    window.__composedPortStable = { proof, sample, observer }; sample();
+  });
+  assert.equal(await page.getByTestId("port-global-apply").isDisabled(), false);
+  await page.getByTestId("port-global-apply").evaluate(element => element.click());
+  await wait(() => window.__antennaPortEditorFixture.read().pending === 1);
+  assert.equal(await button("Remove port (no cascade)").isDisabled(), true, "A pending port mutation must block removal");
+  await field("Branch 1 ID").fill("composed-newer-draft");
+  await page.evaluate(() => { const { proof } = window.__composedPortStable; proof.scroll.scrollTop = proof.top; proof.input.focus({ preventScroll: true }); });
+  await release();
+  await wait(() => ![...document.querySelectorAll('[data-testid="port-editor"] button')].find(button => button.textContent === "Apply port")?.disabled);
+  assert.equal(await field("Branch 1 ID").inputValue(), "composed-newer-draft");
+  const composedStable = await page.evaluate(() => { const { proof, sample, observer } = window.__composedPortStable; sample(); observer.disconnect(); return { changes: proof.changes, focus: document.activeElement === proof.input, scroll: proof.scroll.scrollTop === proof.top }; });
+  assert.deepEqual(composedStable, { changes: 0, focus: true, scroll: true });
+  await page.getByTestId("port-global-discard").evaluate(element => element.click());
+  await wait(() => document.querySelector('[data-testid="port-dirty"]')?.textContent === "false");
+  assert.equal(await field("Branch 1 ID").inputValue(), "signal");
+  checks.push({ name: "Composed port owns global Apply/Discard and preserves root, focus, scroll and newer draft through pending/ACK", passed: true, composedStable });
+  await wait(() => window.__antennaPortEditorFixture.read().scene.antenna_port_modes[0].branches[1].outlet_terminal_ref === "return2-out");
+  assert.equal(await terminal("Branch 2 outlet terminal").inputValue(), "return2-out");
+  assert.equal(await button("Remove port (no cascade)").isDisabled(), false);
+  await screenshot("composed-port-single-editor");
+  await click("Remove port (no cascade)");
+  await wait(() => window.__antennaPortEditorFixture.read().pending === 1);
+  await release();
+  await wait(() => !window.__antennaPortEditorFixture.read().scene.antenna_port_modes.some(port => port.id === "antenna-port"));
+  assert.deepEqual((await read()).scene.antenna_port_modes, [composedUnrelated]);
+  checks.push({ name: "Composed port edits through terminal inventory and removes only the unreferenced port", passed: true });
+  await budget("composed port");
+
   const beforeIdle = await read(); await page.waitForTimeout(700); const afterIdle = await read();
   assert.equal(afterIdle.calls.length, beforeIdle.calls.length); assert.equal(afterIdle.renders, beforeIdle.renders);
   assert.deepEqual(pageErrors, []); assert.deepEqual(consoleErrors, []);

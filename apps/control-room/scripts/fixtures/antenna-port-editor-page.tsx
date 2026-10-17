@@ -18,6 +18,7 @@ import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus
 import type { KernelApi } from "@/kernel/types";
 import { InspectorEditSessionProvider, useInspectorEditSession } from "@/modules/inspector/InspectorEditSession";
 import { AntennaConductorAuthoring } from "@/modules/inspector/panels/antenna/AntennaConductorAuthoring";
+import { AntennaCompositionPanel } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
 import { AntennaPortEditor } from "@/modules/inspector/panels/antenna/AntennaPortEditor";
 
 const API_INSTANCE = "66666666-6666-4666-8666-666666666666";
@@ -53,6 +54,13 @@ function makeScene(name: string): SceneResource {
     })), antenna_port_modes: [port, { ...structuredClone(port), id: "unrelated-port" }],
   };
   const scenario = typeof window === "undefined" ? null : new URL(window.location.href).searchParams.get("scenario");
+  if (scenario === "composed-port-dependent") scene.antenna_field_solve_stages = [{
+    id: "dependent-solve", source_object_id: sourceId, current_transport_id: "transport", port_mode_ids: [portId],
+    conductor_mesh_policy: "inherit_source", solver_policy: "default", model: "quasistatic_conduction_biot_savart3d",
+    oersted_realization: "direct_tetra_quadrature", field_sampling_domain: { kind: "object", object_id: returnId },
+    target_refs: [{ kind: "object", object_id: returnId }],
+    outputs: [{ id: "basis", quantity: "H_ant_basis" }],
+  }];
   if (scenario === "malformed-source") Object.assign(scene.current_transports![0], { conservative_current_source: {} });
   if (scenario === "structured-v3") {
     Object.assign(scene.antenna_port_modes![0], { schema_version: "antenna_port_mode.v3",
@@ -143,16 +151,18 @@ function makeFixture() {
 function EditorOwner() {
   const scene = useSceneResource(), session = useInspectorEditSession();
   const creator = new URL(window.location.href).searchParams.get("creator") === "1";
+  const composed = new URL(window.location.href).searchParams.get("scenario")?.startsWith("composed-port");
+  const nodeId = `model:object:${sourceId}:antenna:port:${portId}`;
   return <>
     <output data-testid="port-owner">{scene.data?.scene?.id}</output>
     <output data-testid="port-dirty">{String(session?.dirty ?? false)}</output>
     <output data-testid="port-global-valid">{String(session?.valid ?? false)}</output>
     <output data-testid="port-global-reason">{session?.applyBlockReason}</output>
-    {creator ? <>
-      <button type="button" disabled={!session?.dirty || !session?.valid || session?.applying} onClick={() => { void session?.apply(); }}>Apply conductor changes</button>
-      <button type="button" disabled={!session?.dirty || session?.applying} onClick={() => { void session?.reset(); }}>Discard conductor changes</button>
+    {creator || composed ? <>
+      <button data-testid="port-global-apply" type="button" disabled={!session?.dirty || !session?.valid || session?.applying} onClick={() => { void session?.apply(); }}>{creator ? "Apply conductor changes" : "Apply port changes"}</button>
+      <button data-testid="port-global-discard" type="button" disabled={!session?.dirty || session?.applying} onClick={() => { void session?.reset(); }}>{creator ? "Discard conductor changes" : "Discard port changes"}</button>
     </> : null}
-    <section data-testid="port-editor">{creator ? <AntennaConductorAuthoring objectId={sourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : <AntennaPortEditor objectId={sourceId} portId={portId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} />}</section>
+    <section data-testid="port-editor">{creator ? <AntennaConductorAuthoring objectId={sourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : composed ? <AntennaCompositionPanel kind="port" selection={{ kind: "object.antenna.port", objectId: sourceId, nodeId, label: "Port", moduleSource: null, ref: { type: "scene-object", kind: "object.antenna.port", objectId: sourceId, nodeId, visualizationTargetId: `object:${sourceId}`, antennaResourceKind: "port", antennaResourceId: portId } }} /> : <AntennaPortEditor objectId={sourceId} portId={portId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} />}</section>
     <div style={{ height: 550 }} aria-hidden="true" />
   </>;
 }

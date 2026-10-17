@@ -9,7 +9,7 @@ import { publishCommittedSceneResource } from "@/kernel/resources/geometryLifecy
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
-import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
+import { useInspectorEditSession, useRegisterInspectorEditSession } from "../../InspectorEditSession";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FieldRow } from "../../primitives/FieldRow";
 import { FormField } from "../../primitives/FormField";
@@ -23,10 +23,20 @@ import {
   type AntennaEditableKind, type AntennaResourceDraft,
 } from "./AntennaResourceEditorModel";
 
-interface Props { kind: AntennaEditableKind; resourceId: string; scene: SceneResource | null; sceneScopeKey: string | null; status: string; refetch: () => void }
+interface Props { removeOnly?: boolean; kind: AntennaEditableKind; resourceId: string; scene: SceneResource | null; sceneScopeKey: string | null; status: string; refetch: () => void }
 
-export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, status, refetch }: Props) {
+function AntennaResourceEditSession({ pending, dirty, valid, reason, apply, reset }: {
+  pending: boolean; dirty: boolean; valid: boolean; reason: string | null;
+  apply: () => Promise<boolean>; reset: () => void;
+}) {
+  useRegisterInspectorEditSession("staged", pending, dirty, valid, undefined,
+    apply, reset, { historyMode: "mutation-owned", applyBlockReason: reason ?? undefined });
+  return null;
+}
+
+export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, status, refetch, removeOnly = false }: Props) {
   const { api, resources, commands, authoringHistory, selection } = useKernel();
+  const editSession = useInspectorEditSession();
   const identity = useSessionResourceIdentity();
   const scope = sessionRequestScopeKey(identity);
   const key = JSON.stringify([scope, kind, resourceId]);
@@ -48,6 +58,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
   const draft = local?.key === key ? local : initial;
   const dirty = local?.key === key;
   const pending = pendingState?.token === context.token || awaitingScene;
+  const removalBlockedByDraft = removeOnly && Boolean(editSession?.dirty || editSession?.applying);
   const revision = typeof scene?.revision === "number" && Number.isSafeInteger(scene.revision) ? scene.revision : null;
   const conflict = Boolean(dirty && !awaitingScene && draft?.baseRevision !== revision);
   const scoped = Boolean(scope && scene?.scene?.id && sceneScopeKey === scope && revision !== null);
@@ -57,7 +68,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
   try {
     if (awaitingScene) throw new Error("Waiting for the committed scene revision.");
     if (!scoped || !scene || !draft || status !== "ready") throw new Error("Current session-scoped scene is required.");
-    transaction = buildAntennaResourceTransaction(scene, kind, resourceId, draft);
+    transaction = buildAntennaResourceTransaction(scene, kind, resourceId, draft, removeOnly);
   } catch (error) { reason = error instanceof Error ? error.message : String(error); }
   function update(values: Record<string, string>) {
     if (draft && scoped) { setLocal({ ...draft, values: { ...draft.values, ...values } }); setFeedback(null); }
@@ -66,6 +77,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
     if (draft && scoped) { setLocal({ ...draft, branches: draft.branches.map((branch, i) => i === index ? { ...branch, ...patch } : branch) }); setFeedback(null); }
   }
   async function commit(remove = false): Promise<boolean> {
+    if (remove && removalBlockedByDraft) return false;
     if (!scene || !draft || !scope || !scoped || status !== "ready" || pending || conflict || inflight.current) return false;
     const submitted = draft;
     let request;
@@ -109,15 +121,16 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
       setPending((current) => current?.token === ownerToken ? null : current);
     }
   }
-  useRegisterInspectorEditSession("staged", pending, dirty, Boolean(transaction && !conflict), undefined,
-    () => commit(), () => setLocal(null), { historyMode: "mutation-owned", applyBlockReason: reason ?? undefined });
+
   // Keep the last draft visible through invalidation and ACK; only the transaction buttons are pending.
   if (!draft) return null;
   const values = draft.values;
   const field = (name: string, label: string, unit?: string) => <FormField key={name} label={label} unit={unit} value={values[name] ?? ""} onChange={(event) => update({ [name]: event.currentTarget.value })} />;
   const choice = (name: string, label: string, options: Array<[string, string]>) => <FormField key={name} type="select" label={label} value={values[name] ?? ""} onChange={(event) => update({ [name]: event.currentTarget.value })}>{options.map(([value, text]) => <option key={value} value={value}>{text}</option>)}</FormField>;
-  return <InspectorGroup title={`Edit antenna ${kind}`} collapsible defaultOpen>
+  return <InspectorGroup title={removeOnly ? `Remove antenna ${kind}` : `Edit antenna ${kind}`} collapsible defaultOpen>
+    {!removeOnly ? <AntennaResourceEditSession pending={pending} dirty={dirty} valid={Boolean(transaction && !conflict)} reason={reason} apply={() => commit()} reset={() => setLocal(null)} /> : null}
     <FieldRow label="Immutable resource ID" value={resourceId} mono />
+    {!removeOnly ? <>
     {kind === "port" ? <>
       <p className="fm-inspector-hint">Signed weights define a normalized port mode. They do not set terminal currents or activate a solve.</p>
       {draft.branches.map((branch, index) => <InspectorGroup key={index} title={`Branch ${index + 1}`}>
@@ -140,15 +153,17 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
       {choice("outsidePolicy", "Outside domain", [["error", "Fail request"], ["zero", "Explicit zero outside"]])}
       <p className="fm-inspector-hint">Source spatial FFT only. Interpolation and immutable request/output IDs remain unchanged. Saving does not qualify or publish a spectrum.</p>
     </> : null}
+    </> : <p className="fm-inspector-hint">Removal never cascades. Rebind or remove every dependent resource before removing this port.</p>}
     {reason ? <FeedbackBanner kind={conflict ? "error" : "warning"} message={reason} /> : null}
     {feedback?.key === key ? <FeedbackBanner kind={feedback.kind} message={feedback.message} /> : null}
+    {removalBlockedByDraft ? <FeedbackBanner kind="warning" message="Apply or discard the current port draft before removal." /> : null}
     {dependents.length ? <FeedbackBanner kind="warning" message={`Removal refused until dependents are rebound or removed: ${dependents.join(", ")}.`} /> : null}
     <div className="fm-microstrip-station-actions">
       <Button type="button" onClick={refetch}>Refresh resource</Button>
-      {dirty ? <Button type="button" disabled={pending} onClick={() => setLocal(null)}>Discard draft</Button> : null}
-      {conflict && revision !== null ? <Button type="button" disabled={pending || status !== "ready"} onClick={() => setLocal((current) => current?.key === key ? { ...current, baseRevision: revision } : current)}>Rebase draft explicitly</Button> : null}
-      <Button type="button" disabled={!dirty || !transaction || conflict || pending} onClick={() => void commit()}>Apply {kind}</Button>
-      <Button type="button" disabled={!scoped || status !== "ready" || pending || conflict || dirty || dependents.length > 0} onClick={() => void commit(true)}>Remove {kind} (no cascade)</Button>
+      {!removeOnly && dirty ? <Button type="button" disabled={pending} onClick={() => setLocal(null)}>Discard draft</Button> : null}
+      {!removeOnly && conflict && revision !== null ? <Button type="button" disabled={pending || status !== "ready"} onClick={() => setLocal((current) => current?.key === key ? { ...current, baseRevision: revision } : current)}>Rebase draft explicitly</Button> : null}
+      {!removeOnly ? <Button type="button" disabled={!dirty || !transaction || conflict || pending} onClick={() => void commit()}>Apply {kind}</Button> : null}
+      <Button type="button" disabled={!scoped || status !== "ready" || pending || conflict || dirty || removalBlockedByDraft || dependents.length > 0} onClick={() => void commit(true)}>Remove {kind} (no cascade)</Button>
     </div>
   </InspectorGroup>;
 }

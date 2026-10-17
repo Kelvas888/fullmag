@@ -112,7 +112,7 @@ export function buildObjectExplorerNode(
           badge: "composition",
           icon: "wave",
           objectId,
-          selectable: false,
+          selectable: true,
           status: "ready",
           contextCommands: ["workspace.focus-selection"],
           children: [
