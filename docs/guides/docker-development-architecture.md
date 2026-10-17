@@ -235,6 +235,29 @@ Szczegóły: [ADR 0049](../adr/0049-native-runtime-owner-control.md),
 [storage Windows](../adr/0059-docker-desktop-windows-session-storage.md) oraz
 [accepted FEM GPU](../adr/0060-accepted-fem-gpu-docker-workspace.md).
 
+### Retencja pakietów developerskich
+
+Decyzja użytkownika z 17.10.2026: kolejne buildy automatycznie usuwają
+zweryfikowane, zastąpione pakiety techniczne. Bieżący pakiet i bezpośrednio
+poprzedni pakiet do rollbacku pozostają. Wiek lub nazwa katalogu nie stanowią
+dowodu zbędności: wymagane są zgodne receipty i łańcuch zakończonych rotacji.
+
+Sprzątanie odbywa się wewnątrz backendu pod blokadą jego cache, po trwałej,
+zweryfikowanej publikacji nowego pakietu. Przed usunięciem kopii zachowuje
+log buildu, receipt, zapis rotacji i raport wykonania. Nieznane, niespójne lub
+używane dane pozostają z diagnostyką. Niepowodzenie sprzątania nie unieważnia
+poprawnie opublikowanego pakietu.
+
+Retencja nie obejmuje cache Cargo/CMake/CUDA, źródeł, sesji, projektów, wyników,
+bazy grupy ani historii rezerwacji. Restart używający aktualnego pakietu nie
+tworzy kolejnej kopii. Po zmianach źródeł kontrola miejsca na nowego kandydata
+powinna zgłosić niedostatek w konkretnym cache przed kosztownym buildem, jeśli
+rozmiar poprzedniego zweryfikowanego pakietu już wykazuje brak miejsca. Jest to
+oszacowanie, nie gwarancja rozmiaru przyszłego buildu.
+
+Automatyczna ścieżka wymaga regresji retencji oraz dowodu z działającego
+kontenera; do ich uzyskania pozostaje **NOT VERIFIED**.
+
 Wersje bibliotek deklaruje repozytorium:
 
 - CUDA, CMake, MFEM, hypre, libCEED: `docker/fem-gpu/Dockerfile` i obrazowy

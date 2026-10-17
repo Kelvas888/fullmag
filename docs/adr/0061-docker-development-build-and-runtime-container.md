@@ -83,6 +83,27 @@ Launcher nie uznaje takiej aktywacji za udaną kwalifikację. Błędy integralno
 provenance, polityki i kontraktu odpowiedzi pozostają fatalne. Zmiana nie
 poszerza listy znanych odrzuceń fizyki i nie resetuje ownera ani historii.
 
+## Retencja technicznych pakietów dev
+
+Decyzja użytkownika z 17.10.2026 rozszerza publikację dev o automatyczne
+usuwanie zastąpionych, zweryfikowanych pakietów. Zachowujemy bieżący pakiet
+i bezpośredni rollback. O kwalifikacji decydują receipty i łańcuch poprawnie
+zakończonych rotacji, nie czas utworzenia ani nazwa katalogu.
+
+Operacja pozostaje w tym samym backendzie i pod blokadą trwałego cache.
+Nowy pakiet musi być trwale opublikowany i zweryfikowany przed usunięciem
+starszych kopii. Najpierw utrwalamy logi, receipty, metadane rotacji i raport
+sprzątania. Nieznane, niespójne lub używane dane są zachowywane z diagnostyką.
+Błąd sprzątania nie cofa poprawnej publikacji ani nie usuwa ostatniego rollbacku.
+
+Zakres nie obejmuje mutowalnego cache kompilacji, źródeł, danych użytkownika,
+sesji, wyników, ustawień ani historii rezerwacji. Nie zmienia formatu API,
+semantyki solverów i reguł aktywacji skryptu. Implementacja dotyczy
+`docker/all-in-one/backend_dev.py`, regresji publikacji i tego przewodnika.
+Wymaga dowodu retain-current/rollback, ochrony nieudanej publikacji,
+zachowania nieznanych danych oraz rzeczywistego odzyskania miejsca w kontenerze.
+Do wykonania tych bramek automatyczna ścieżka pozostaje **NOT VERIFIED**.
+
 ## Admission storage Windows po przebudowie dev
 
 ADR 0059 pozostaje kontraktem filesystemu, ownera i grantów. Dla live dev host
