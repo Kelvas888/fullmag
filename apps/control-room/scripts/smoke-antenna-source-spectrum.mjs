@@ -97,6 +97,11 @@ try {
       assert.ok(gridBox && Math.abs(gridBox.x + gridBox.width / 2 - payloadBox.x - payloadBox.width / 2) < 2, "The bounded source map must remain centered in the Inspector");
       assert.equal(await page.getByRole("button", { name: /Configuration and provenance/ }).getAttribute("aria-expanded"), "false");
       const unit = scenario === "ready-unitary" ? "(A/m/A)^2" : "(A*m/A)^2";
+      const component = scenario === "ready-vector" ? "H vector (x, y, z)" : "H_x";
+      assert.equal(await page.getByRole("heading", { name: `Source FFT power · ${component}`, exact: true }).count(), 1);
+      assert.ok(text.includes(`${scenario === "ready-unitary" ? "Unitary discrete" : "Integral SI"} normalization`), "Chart must name the verified normalization");
+      assert.ok((await page.getByRole("group", { name: "Selected source spectrum sample", exact: true }).innerText()).includes(component), "Selected sample lost component identity");
+      assert.ok(text.includes(scenario === "ready-vector" ? "|H_x|² + |H_y|² + |H_z|²" : "|H_x|²"), "Power expression must match the manifest components");
       assert.ok(text.includes(`Peak ${scenario === "ready-tied-peak" ? "9.000e+0" : scenario === "ready-vector" ? "4.800e+1" : scenario === "ready-large" ? "1.897e+7" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
       assert.ok((await page.getByRole("gridcell").first().getAttribute("aria-label"))?.includes(unit), "Scientific cell tooltip lost power SI unit");
       assert.ok((await page.getByRole("group", { name: "Source spectrum color scale" }).innerText()).includes(unit), "Color scale lost its physical power unit");

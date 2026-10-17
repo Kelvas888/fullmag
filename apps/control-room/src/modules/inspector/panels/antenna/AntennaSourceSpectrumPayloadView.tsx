@@ -159,15 +159,19 @@ export function AntennaSourceSpectrumPayloadView({
   const isBinned = payloads.value.kU.length > MAX_AXIS_CELLS ||
     payloads.value.kV.length > MAX_AXIS_CELLS;
   const powerUnit = spectrum.payloads?.power.unit ?? `(${spectrum.amplitude_unit})^2`;
+  const componentLabel = spectrum.component === "vector_power" ? "H vector (x, y, z)" : `H_${spectrum.component}`;
+  const powerExpression = spectrum.component === "vector_power"
+    ? "|H_x|² + |H_y|² + |H_z|²" : `|H_${spectrum.component}|²`;
+  const normalizationLabel = spectrum.normalization === "integral_si" ? "Integral SI" : "Unitary discrete";
 
   return (
     <section className="fm-antenna-spectrum" aria-label="Antenna source spectrum payload">
       <div className="fm-antenna-spectrum__header">
         <div>
-          <h3 className="fm-antenna-spectrum__title">Source FFT power</h3>
+          <h3 className="fm-antenna-spectrum__title">Source FFT power · {componentLabel}</h3>
           <p className="fm-antenna-spectrum__subtitle">
-            |H(k<sub>u</sub>, k<sub>v</sub>)|² · per 1 A port-current basis; drive
-            waveform not applied
+            {powerExpression} at (k<sub>u</sub>, k<sub>v</sub>) · {normalizationLabel} normalization
+            {" · "}per 1 A port-current basis; drive waveform not applied
           </p>
         </div>
         <span className="fm-antenna-spectrum__badge" data-status="ready">
@@ -175,7 +179,7 @@ export function AntennaSourceSpectrumPayloadView({
         </span>
       </div>
       <SpectrumPowerGrid cells={cells} kU={payloads.value.kU} kV={payloads.value.kV}
-        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} isBinned={isBinned} peakIndex={extrema?.peakIndex ?? -1}>
+        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} componentLabel={componentLabel} isBinned={isBinned} peakIndex={extrema?.peakIndex ?? -1}>
         <AntennaSpectrumExport spectrum={spectrum} amplitudes={payloads.value.amplitudes}
           kU={payloads.value.kU} kV={payloads.value.kV} power={payloads.value.power} />
       </SpectrumPowerGrid>
@@ -238,9 +242,9 @@ function spectrumGridTarget(key: string, index: number, columns: number, count: 
 }
 
 /** Selection stays local: keyboard inspection never redecodes payloads or refetches resources. */
-function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, isBinned, peakIndex, children }: {
+function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, componentLabel, isBinned, peakIndex, children }: {
   cells: readonly HeatmapCell[]; kU: readonly number[]; kV: readonly number[];
-  waveVectorUnit: string; powerUnit: string; isBinned: boolean; peakIndex: number; children: ReactNode;
+  waveVectorUnit: string; powerUnit: string; componentLabel: string; isBinned: boolean; peakIndex: number; children: ReactNode;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const helpId = useId();
@@ -289,7 +293,7 @@ function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, isBinned,
       </div>)}
     </div>
     <div className="fm-antenna-spectrum__sample" role="group" aria-label="Selected source spectrum sample">
-      <span>{isBinned ? "Bin maximum" : "Selected sample"}</span>
+      <span>{isBinned ? "Bin maximum" : "Selected sample"} · {componentLabel}</span>
       <span>k_u {formatScientific(selected ? kU[selected.kUIndex] : undefined)} {waveVectorUnit}</span>
       <span>k_v {formatScientific(selected ? kV[selected.kVIndex] : undefined)} {waveVectorUnit}</span>
       <span>Power {formatScientific(selected?.power)} {powerUnit}</span>
