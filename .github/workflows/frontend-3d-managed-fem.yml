@@ -23,5 +23,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare canonical Fullmag Python environment
+        run: just ensure-python
+
       - name: Run managed FEM magnetic-only and shared-air qualification
         run: ./scripts/ci/run_frontend3d_required_gate.sh managed-fem-qualification

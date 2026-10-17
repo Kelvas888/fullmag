@@ -1,10 +1,10 @@
 //! Resolve accepted study inputs without mutable session state.
 use anyhow::{bail, Context, Result};
 use fullmag_application::{
-    CoordinatorError, CoordinatorMessage, CoordinatorTransition, DurableWorkerCoordinator,
-    PreparationBinding, PreparationReceipt, ProjectId, ResolvedInput, ResolvedStudyArtifact,
-    ResolvedTaskInput, RunId, RunSpecification, TaskClaim, TaskRecord, WorkerCommand,
-    WorkerCommandEnvelope, COORDINATOR_TRANSITION_SCHEMA,
+    COORDINATOR_TRANSITION_SCHEMA, CoordinatorError, CoordinatorMessage, CoordinatorTransition,
+    DurableWorkerCoordinator, AcceptedPreparationReceipt, ClosedLoopPreparationReceipt, PreparationBinding, PreparationReceipt, ProjectId, ResolvedInput,
+    ResolvedStudyArtifact, ResolvedTaskInput, RunId, RunSpecification, TaskClaim, TaskRecord,
+    WorkerCommand, WorkerCommandEnvelope,
 };
 use fullmag_authoring::{
     StudyInputPort, StudyInputSource, StudyPlan, StudyPortDataKind, StudyStep,
@@ -316,6 +316,33 @@ impl AcceptedStudySnapshot {
             .context("durable task preparation receipt does not match accepted study snapshot")
     }
 
+    /// Read readiness using the immutable step kind, never by silently upgrading a legacy receipt.
+    pub fn read_task_preparation(
+        &self, store: &SessionStore, task_id: &str,
+    ) -> Result<AcceptedPreparationReceipt> {
+        let durable = store.read_task_preparation_receipt(self.run.specification.run_id.as_str(), task_id)?
+            .context("accepted task has no durable preparation")?;
+        let step = self.lowered.steps.iter().find(|step| step.step_id == durable.step_id)
+            .context("preparation has no accepted step")?;
+        if !matches!(step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) {
+            return self.read_task_preparation_receipt(store, task_id).map(AcceptedPreparationReceipt::Solver);
+        }
+        let receipt: ClosedLoopPreparationReceipt = serde_json::from_value(durable.payload.clone())
+            .context("inspection readiness is not a strict operation receipt")?;
+        let entry = self.catalog.entries().iter().find(|entry| entry.step_id() == step.step_id)
+            .context("inspection readiness has no captured ProblemIR")?;
+        let canonical_task_id = fullmag_session::task_id_for_study_step(self.run.specification.run_id.as_str(), &step.step_id)?;
+        if task_id != canonical_task_id || durable.task_id != canonical_task_id {
+            bail!("inspection readiness has another canonical accepted task identity");
+        }
+        receipt.validate_for(&self.run.specification, &canonical_task_id, step, entry.problem())?;
+        if durable.run_id != self.run.specification.run_id.as_str() || durable.task_id != task_id
+            || durable.preparation_id != receipt.preparation_id || durable.plan_fingerprint != receipt.plan_fingerprint {
+            bail!("inspection readiness differs from durable envelope");
+        }
+        Ok(AcceptedPreparationReceipt::ClosedLoop(receipt))
+    }
+
     /// Resolve a claimed study task using only its durable preparation receipt
     /// and this immutable accepted snapshot. This does not create or persist a
     /// claim, admit execution, or change task readiness. The dispatch boundary
@@ -339,7 +366,7 @@ impl AcceptedStudySnapshot {
         claim: &TaskClaim,
         step_id: &str,
         inputs: std::collections::BTreeMap<String, ResolvedInput>,
-    ) -> Result<(PreparationReceipt, ResolvedTaskInput)> {
+    ) -> Result<(AcceptedPreparationReceipt, ResolvedTaskInput)> {
         let run_id = self.run.specification.run_id.as_str();
         let expected_task_id = fullmag_session::task_id_for_study_step(run_id, step_id)?;
         if task.task_id.as_str() != expected_task_id.as_str()
@@ -411,21 +438,20 @@ impl AcceptedStudySnapshot {
         if stored_lease.kind != expected_kind || stored_lease.budget != expected_budget {
             bail!("durable resource lease kind or budget differs from the task claim");
         }
-        let receipt = self.read_task_preparation_receipt(store, &expected_task_id)?;
-        let source = receipt
-            .accepted_run_source
-            .as_ref()
-            .context("durable task preparation receipt has no accepted-run source")?;
+        let receipt = self.read_task_preparation(store, &expected_task_id)?;
+        let source = receipt.source()?;
         if source.step_id != step_id || source.run_id != self.run.specification.run_id {
             bail!("durable task preparation receipt is bound to another study step");
         }
-        let resolved_input = self.resolved_task_input_from_bound_receipt(
-            task,
-            claim,
-            step_id,
-            &receipt,
-            resolved_inputs,
-        )?;
+        let resolved_input = match &receipt {
+            AcceptedPreparationReceipt::Solver(receipt) => self.resolved_task_input_from_bound_receipt(task, claim, step_id, receipt, resolved_inputs)?,
+            AcceptedPreparationReceipt::ClosedLoop(receipt) => {
+                if !resolved_inputs.is_empty() { bail!("inspection cannot consume solver state inputs"); }
+                let step = self.lowered.steps.iter().find(|step| step.step_id == step_id).context("inspection step is missing")?;
+                let entry = self.catalog.entries().iter().find(|entry| entry.step_id() == step_id).context("inspection ProblemIR is missing")?;
+                task.resolved_closed_loop_study_input(claim, &self.run.specification, step, entry.problem(), receipt)?
+            }
+        };
         Ok((receipt, resolved_input))
     }
 
@@ -504,6 +530,7 @@ pub fn queue_accepted_study_task(
     step_id: &str,
     inputs: std::collections::BTreeMap<String, ResolvedInput>,
 ) -> Result<QueuedAcceptedStudyTask> {
+    let _writer = store.write_transaction()?;
     if !store.accepted_run_start_permitted(run_id.as_str())? {
         bail!("accepted run is waiting for explicit Compute release");
     }
@@ -527,6 +554,9 @@ pub fn queue_accepted_study_task(
         || !matches!(&execution_step.status, StudyStepLoweringStatus::Planned)
     {
         bail!("only an enabled, planned accepted study step can enter the ready queue");
+    }
+    if !crate::study_completion::dependencies_ready_locked(store, &accepted, study_step)? {
+        bail!("accepted task is blocked until its completion dependencies succeed");
     }
     let expected_task_id = fullmag_session::task_id_for_study_step(run_id.as_str(), step_id)?;
     let expected_fingerprint = fullmag_application::study_task_input_fingerprint(
@@ -603,7 +633,7 @@ pub fn queue_accepted_study_task(
 
     // Receipt and inputs are revalidated on both first queueing and replay;
     // readiness cannot be preserved after its durable prerequisites diverge.
-    accepted.read_task_preparation_receipt(store, &expected_task_id)?;
+    accepted.read_task_preparation(store, &expected_task_id)?;
     let resolved_inputs = resolve_accepted_study_inputs(
         store,
         run_id.as_str(),
@@ -674,6 +704,7 @@ pub fn load_accepted_worker_step(
     project_id: &ProjectId,
     envelope: &WorkerCommandEnvelope,
 ) -> Result<AcceptedWorkerStep> {
+    let _writer = store.write_transaction()?;
     let resolved_input = match &envelope.command {
         WorkerCommand::Prepare { resolved_input } => resolved_input,
         _ => bail!("accepted worker step requires a Prepare command"),
@@ -722,6 +753,9 @@ pub fn load_accepted_worker_step(
         bail!("worker task does not identify exactly one accepted study step");
     }
     let study_step = matching_steps[0];
+    if !crate::study_completion::dependencies_ready_locked(store, &accepted, study_step)? {
+        bail!("worker Prepare is blocked by completion dependencies");
+    }
     let step_id = study_step.step_id.as_str();
     let execution_step = accepted
         .lowered
@@ -732,6 +766,7 @@ pub fn load_accepted_worker_step(
     if !execution_step.enabled
         || !matches!(&execution_step.status, StudyStepLoweringStatus::Planned)
         || execution_step.until_seconds != study_step.until_seconds
+        || execution_step.completion_dependencies != study_step.completion_dependencies
     {
         bail!("accepted study step is disabled or its execution controls differ");
     }
@@ -789,8 +824,8 @@ pub fn load_accepted_worker_step(
         bail!("worker Prepare input differs from the accepted execution plan digest");
     }
 
-    let receipt = accepted.read_task_preparation_receipt(store, task_id)?;
-    let preparation = PreparationBinding::from_receipt(&receipt)?;
+    let receipt = accepted.read_task_preparation(store, task_id)?;
+    let preparation = receipt.binding()?;
     if resolved_input.preparation != preparation {
         bail!("worker Prepare input differs from its accepted preparation receipt");
     }
@@ -868,6 +903,7 @@ pub fn load_accepted_worker_step_for_start(
     project_id: &ProjectId,
     start_envelope: &WorkerCommandEnvelope,
 ) -> Result<AcceptedWorkerStep> {
+    let _writer = store.write_transaction()?;
     if !matches!(&start_envelope.command, WorkerCommand::Start) {
         bail!("accepted worker start requires a Start command");
     }
@@ -1346,6 +1382,11 @@ pub fn publish_study_outputs(
                 )
             })?;
         let data_kind = study_port_data_kind_label(&declared.data_kind);
+        if output.codec_id==fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_ID {
+            if accepted_state_ref.is_some() || observation_source.is_some() || output.port_id!="inspection" || output.case_id!="default" { bail!("inspection output cannot fabricate magnetic state or another case"); }
+            let problem=accepted.catalog.entries().iter().find(|entry|entry.step_id()==step_id).context("inspection publication ProblemIR missing")?.problem();
+            crate::study_inspection::validate_accepted_inspection_bytes(problem,step,&output.bytes,crate::study_inspection::inspection_bundle_budget(claim)?)?;
+        } else if matches!(step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) { bail!("inspection output requires its single registered bundle codec"); }
         fullmag_application::decode_study_artifact_bytes(
             data_kind,
             &output.codec_id,
@@ -1774,12 +1815,21 @@ pub fn validate_study_task_completion(store: &SessionStore, claim: &TaskClaim) -
         {
             bail!("study completion manifest entry differs from its published artifact");
         }
-        let output_bytes = store.cas().get(&output.object_ref)?.with_context(|| {
+        let inspection=matches!(source_step.kind,fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. });
+        let maximum=if inspection { Some(crate::study_inspection::inspection_bundle_budget(claim)?) } else {None};
+        let output_bytes = if let Some(maximum)=maximum {
+            store.cas().get_bounded(&output.object_ref,maximum as u64)?
+        } else { store.cas().get(&output.object_ref)? }.with_context(|| {
             format!(
                 "study completion output `{}` CAS object is missing",
                 output.artifact_id
             )
         })?;
+        if let Some(maximum)=maximum {
+            if output.codec_id!=fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_ID || output.codec_version!=fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION || output.case_id!="default" || manifest.accepted_state_ref.is_some() || manifest.observation_source.is_some() { bail!("inspection completion cannot accept solver outputs or state"); }
+            let problem=accepted.catalog.entries().iter().find(|entry|entry.step_id()==source_step.step_id).context("inspection completion ProblemIR missing")?.problem();
+            crate::study_inspection::validate_accepted_inspection_bytes(problem,source_step,&output_bytes,maximum)?;
+        }
         let resolved_artifact = fullmag_application::ResolvedStudyArtifact {
             artifact_id: output.artifact_id.clone(),
             object_ref: output.object_ref.clone(),
@@ -2839,10 +2889,22 @@ pub fn load_accepted_study_snapshot(
                 asset.asset_id
             );
         }
-        // Verify the complete asset without allocating a discarded payload buffer.
-        store.cas().verified_length(object_ref)?.with_context(|| {
+        // Verify all bytes without retaining a discarded buffer, preserving the v4 cap.
+        let length = store.cas().verified_length(object_ref)?;
+        if study.schema_version == fullmag_authoring::STUDY_PLAN_SCHEMA_VERSION_V4
+            && length.is_some_and(|bytes| bytes > 32 * 1024 * 1024) {
+            bail!("accepted v4 run asset exceeds its metadata budget");
+        }
+        length.with_context(|| {
             format!("accepted run asset `{}` object is missing", asset.asset_id)
         })?;
+    }
+    if study.schema_version==fullmag_authoring::STUDY_PLAN_SCHEMA_VERSION_V4 {
+        let asset=specification.immutable_assets.iter().find(|asset|asset.asset_id==fullmag_application::SCRIPT_PIPELINE_SOURCE_ASSET_ID)
+            .context("accepted v4 requires captured compiled source asset")?;
+        let bytes=store.cas().get_bounded(&asset.content_sha256,16*1024*1024)?.context("accepted v4 source asset missing")?;
+        let source=fullmag_application::validate_accepted_script_pipeline_source(&study,&catalog,&bytes)?;
+        fullmag_application::validate_script_source_assets(specification,&source,|hash,maximum|store.cas().get_bounded(hash,maximum)?.context("accepted source file missing"))?;
     }
     let lowered = lower_study_plan_with_catalog(&study, &catalog)
         .context("lower immutable study through canonical planner")?;
@@ -2954,6 +3016,7 @@ pub fn validate_requested_execution(
         }
 
         let planned_precision = match &execution.backend_plan {
+            fullmag_ir::BackendPlanIR::AntennaFieldOnly(_) => Some(fullmag_ir::ExecutionPrecision::Double),
             fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
                 let intent = &inspection.requested_execution;
                 if step_requested.backend != "fem"

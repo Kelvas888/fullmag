@@ -19,6 +19,8 @@ pub fn commit_claimed_task_admission(
     claim: &TaskClaim,
 ) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
     commit_claimed_task_admission_with(store, task, claim, |lease| {
+        let _writer = store.write_transaction()?;
+        crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())?;
         store.commit_task_admission(lease).map(Some)
     })?
     .context("local task admission unexpectedly returned no disposition")
@@ -40,7 +42,9 @@ pub fn commit_claimed_task_admission_with_host(
     commit_claimed_task_admission_with(store, task, claim, |lease| {
         let lease = attach_host_launch_binding(ledger, lease)?;
         ledger
-            .commit_task_admission(request, store, &lease, &inputs)
+            .commit_task_admission_checked(request, store, &lease, &inputs, || {
+                crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())
+            })
             .map(Some)
     })?
     .context("host task admission unexpectedly returned no disposition")
@@ -59,7 +63,9 @@ pub fn try_commit_claimed_task_admission_with_host(
     let inputs = capture_admission_inputs(inputs)?;
     commit_claimed_task_admission_with(store, task, claim, |lease| {
         let lease = attach_host_launch_binding(ledger, lease)?;
-        ledger.try_commit_task_admission(request, store, &lease, &inputs)
+        ledger.try_commit_task_admission_checked(request, store, &lease, &inputs, || {
+            crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())
+        })
     })
 }
 
@@ -265,6 +271,12 @@ pub(crate) fn claimed_task_resource_compatibility(
                 study_step.step_id
             )
         })?;
+    if matches!(study_step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) {
+        if claim.lease.kind != ResourceKind::Cpu {
+            return Ok(ClaimedTaskResourceCompatibility::Incompatible("inspection realizes auto only on a CPU resource".into()));
+        }
+        crate::study_inspection::inspection_bundle_budget(claim)?;
+    }
     let compatibility = solver_resource_compatibility(
         &task_request.device,
         &claim.lease.kind,

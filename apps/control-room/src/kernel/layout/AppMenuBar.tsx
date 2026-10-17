@@ -169,11 +169,17 @@ function HeaderDropdown({
   menu: AppMenuNode;
   onCommand: (commandId: string, input?: unknown) => void;
 }) {
+  const hydrated = useSyncExternalStore(
+    subscribeToHydration,
+    clientHydratedSnapshot,
+    serverHydratedSnapshot,
+  );
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
           className="fm-header__nav-item"
+          disabled={!hydrated}
           size="sm"
           type="button"
           variant="ghost"

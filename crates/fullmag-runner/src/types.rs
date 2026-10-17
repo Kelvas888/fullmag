@@ -2584,6 +2584,7 @@ impl FemStageExecutionContext {
 
     pub fn from_backend_plan(plan: &fullmag_ir::BackendPlanIR) -> Option<Self> {
         let mesh_identity = match plan {
+            fullmag_ir::BackendPlanIR::AntennaFieldOnly(plan) => StageFemMeshAsset::build_from_antenna_field_only_plan(plan).identity,
             fullmag_ir::BackendPlanIR::Fem(plan) => StageFemMeshIdentity::from_fem_plan(plan),
             fullmag_ir::BackendPlanIR::FemEigen(plan) => {
                 StageFemMeshIdentity::from_fem_eigen_plan(plan)
@@ -2798,6 +2799,7 @@ impl FemMeshPayload {
 impl StageFemMeshAsset {
     pub fn build_from_backend_plan(plan: &fullmag_ir::BackendPlanIR) -> Option<Self> {
         match plan {
+            fullmag_ir::BackendPlanIR::AntennaFieldOnly(plan) => Some(Self::build_from_antenna_field_only_plan(plan)),
             fullmag_ir::BackendPlanIR::Fem(plan) => Some(Self::build_from_fem_plan(plan)),
             fullmag_ir::BackendPlanIR::FemEigen(plan) => {
                 Some(Self::build_from_fem_eigen_plan(plan))
@@ -2809,6 +2811,34 @@ impl StageFemMeshAsset {
             | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
             | fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_) => None,
         }
+    }
+
+    pub fn build_from_antenna_field_only_plan(plan: &fullmag_ir::AntennaFieldOnlyPlanIR) -> Self {
+        let mesh = &plan.source_mesh;
+        let mut hasher = Sha256::new();
+        update_hash_bytes(&mut hasher, "schema", b"fullmag:antenna-field-only-mesh:v1");
+        update_hash_serialized(&mut hasher, "source_mesh", mesh);
+        update_hash_serialized(&mut hasher, "source_object_segments", &plan.source_object_segments);
+        update_hash_serialized(&mut hasher, "source_mesh_parts", &plan.source_mesh_parts);
+        let generation_id = digest_hex(&hasher.finalize());
+        let identity = StageFemMeshIdentity::from_generation_id(generation_id.clone());
+        let payload = FemMeshPayload {
+            mesh_name: mesh.mesh_name.clone(), mesh_id: format!("{}:{}", mesh.mesh_name, generation_id),
+            nodes: mesh.nodes.clone(), cells: mesh.cells.clone(), element_markers: mesh.element_markers.clone(),
+            facets: mesh.facets.clone(), boundary_markers: mesh.boundary_markers.clone(),
+            periodic_boundary_pairs: mesh.periodic_boundary_pairs.clone(), periodic_node_pairs: mesh.periodic_node_pairs.clone(),
+            object_segments: plan.source_object_segments.iter().map(|segment| FemMeshObjectSegment {
+                object_id: segment.object_id.clone(), geometry_id: segment.geometry_id.clone(),
+                node_start: segment.node_start, node_count: segment.node_count,
+                element_start: segment.element_start, element_count: segment.element_count,
+                boundary_face_start: segment.boundary_face_start, boundary_face_count: segment.boundary_face_count,
+            }).collect(),
+            mesh_parts: plan.source_mesh_parts.iter().map(FemMeshPartPayload::from).collect(),
+            domain_mesh_mode: None, domain_frame: None, generation_id: Some(generation_id),
+            per_domain_quality: mesh.per_domain_quality.iter().map(|(key, value)| (*key, MeshQualityPayload::from(value))).collect(),
+            build_report: None,
+        };
+        Self { identity, payload }
     }
 
     pub fn build_from_fem_plan(plan: &fullmag_ir::FemPlanIR) -> Self {

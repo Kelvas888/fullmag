@@ -971,6 +971,23 @@ pub(crate) fn run_python_helper_with_interpreter(
     args: &[String],
     progress_callback: Option<PythonProgressCallback>,
 ) -> Result<std::process::Output> {
+    run_python_helper_with_interpreter_and_bound(root, interpreter, args, progress_callback, None)
+}
+
+pub(crate) fn run_python_capture_helper(args: &[String], max_bytes: usize) -> Result<std::process::Output> {
+    let root = repo_root();
+    let interpreter = fullmag_runtime_control::python_runtime::resolve_interpreter(&root)
+        .map_err(|error| anyhow!("{error}"))?;
+    run_python_helper_with_interpreter_and_bound(&root, &interpreter, args, None, Some(max_bytes))
+}
+
+fn run_python_helper_with_interpreter_and_bound(
+    root: &Path,
+    interpreter: &fullmag_runtime_control::python_runtime::ResolvedInterpreter,
+    args: &[String],
+    progress_callback: Option<PythonProgressCallback>,
+    capture_bound: Option<usize>,
+) -> Result<std::process::Output> {
     let uses_bundle = interpreter.isolated;
 
     let pythonpath = root.join("packages").join("fullmag-py").join("src");
@@ -986,6 +1003,12 @@ pub(crate) fn run_python_helper_with_interpreter(
         let mut command = interpreter
             .command(root)
             .context("bundled Python runtime is incomplete or invalid")?;
+        if capture_bound.is_some() {
+            command.env_clear();
+            if let Some(parent) = interpreter.path.parent() { command.env("PATH", parent); }
+            command.env("PYTHONHASHSEED", "0");
+            command.env("PYTHONDONTWRITEBYTECODE", "1");
+        }
         command.args(args);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -993,7 +1016,7 @@ pub(crate) fn run_python_helper_with_interpreter(
         if progress_callback.is_some() {
             command.env("FULLMAG_PROGRESS", "1");
         }
-        command.env("FULLMAG_FEM_MESH_CACHE_DIR", &fem_mesh_cache_dir);
+        if capture_bound.is_none() { command.env("FULLMAG_FEM_MESH_CACHE_DIR", &fem_mesh_cache_dir); }
         let mut python_paths = Vec::new();
         if pythonpath.is_dir() {
             python_paths.push(pythonpath.display().to_string());
@@ -1004,12 +1027,12 @@ pub(crate) fn run_python_helper_with_interpreter(
         if python_extension_root.is_dir() {
             python_paths.push(python_extension_root.display().to_string());
         }
-        if let Some(existing) = &inherited_pythonpath {
+        if let Some(existing) = inherited_pythonpath.as_ref().filter(|_| capture_bound.is_none()) {
             if !existing.is_empty() {
                 python_paths.push(existing.clone());
             }
         }
-        if !uses_bundle && !python_paths.is_empty() {
+        if capture_bound.is_none() && !uses_bundle && !python_paths.is_empty() {
             command.env(
                 "PYTHONPATH",
                 python_paths.join(if cfg!(windows) { ";" } else { ":" }),
@@ -1033,11 +1056,37 @@ pub(crate) fn run_python_helper_with_interpreter(
         let stdout_thread = std::thread::spawn(move || -> Result<Vec<u8>> {
             let mut stdout = stdout;
             let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes)?;
+            if let Some(limit) = capture_bound {
+                // Drain overflow before reporting it, so a full pipe cannot deadlock wait().
+                let mut block = [0u8; 8192];
+                let mut overflow = false;
+                loop {
+                    let count = stdout.read(&mut block)?;
+                    if count == 0 { break; }
+                    if bytes.len().checked_add(count).is_some_and(|n| n <= limit) {
+                        bytes.extend_from_slice(&block[..count]);
+                    } else { overflow = true; }
+                }
+                if overflow { bail!("accepted source capture stdout budget"); }
+            } else { stdout.read_to_end(&mut bytes)?; }
             Ok(bytes)
         });
         let stderr_progress = progress_callback.clone();
         let stderr_thread = std::thread::spawn(move || -> Result<Vec<u8>> {
+            if capture_bound.is_some() {
+                let mut stderr = stderr;
+                let mut bytes = Vec::new();
+                let mut block = [0u8; 8192];
+                let mut overflow = false;
+                loop {
+                    let count = stderr.read(&mut block)?;
+                    if count == 0 { break; }
+                    if bytes.len() + count <= 1024 * 1024 { bytes.extend_from_slice(&block[..count]); }
+                    else { overflow = true; }
+                }
+                if overflow { bail!("accepted source capture stderr budget"); }
+                return Ok(bytes);
+            }
             let mut reader = BufReader::new(stderr);
             let mut collected = Vec::new();
             loop {

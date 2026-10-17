@@ -4913,6 +4913,15 @@ export interface components {
             resource_id: string;
             schema_version: string;
         };
+        /** @description Durable accepted publication identity; epoch remains a lossless decimal string in JSON. */
+        AcceptedInspectionArtifactOwner: {
+            artifact_id: string;
+            attempt_id: string;
+            object_ref: string;
+            ownership_epoch: string;
+            project_id: string;
+            task_id: string;
+        };
         AcceptedObservationFrameRef: {
             domain_generation_id: string;
             observation_frame_id: string;
@@ -5421,7 +5430,57 @@ export interface components {
             /** @description Field of the run's validation intent that bounds the compared |k| [rad/m]. */
             wavevector_limit_source: string;
         };
+        AntennaClosedLoopInspectionDisplayResource: {
+            capabilities: components["schemas"]["AntennaInspectionDisplayCapabilities"];
+            closed_loop_display: unknown;
+            content_digest: string;
+            normalization: string;
+            record_content_digest: string;
+            request_scope_epoch: string;
+            resource_id: string;
+            run_id: string;
+            runtime_stage_id: string;
+            schema_version: string;
+            session_epoch: string;
+            session_id: string;
+            /** Format: int64 */
+            stage_revision: number;
+        };
+        AntennaEquilibriumBindingResource: {
+            acceptance_certificate_sha256: string;
+            asset_id: string;
+            authored_stage_id: string;
+            boundary_signature: string;
+            certified_fields_sha256: string;
+            completion_sha256: string;
+            content_digest: string;
+            equilibrium_content_sha256: string;
+            equilibrium_id: string;
+            indexing_sha256: string;
+            mapping_digest: string;
+            material_signature: string;
+            mesh_generation_id: string;
+            mesh_topology_sha256: string;
+            /** Format: double */
+            norm_floor: number;
+            normalization: string;
+            owning_plan_sha256: string;
+            part_registry_sha256: string;
+            producer_contract: string;
+            projection_version: string;
+            recomputed_certificate_sha256: string;
+            resolved_execution_engine: string;
+            schema_version: string;
+            source_carrier_sha256: string;
+            source_run_id: string;
+            source_solution_ref?: null | components["schemas"]["AntennaFieldSolutionRefResource"];
+            source_stage_id: string;
+            static_demag_sha256: string;
+            static_physics_signature: string;
+            target: components["schemas"]["FieldTargetResource"];
+        };
         AntennaExternalLeadInspectionResource: components["schemas"]["AntennaInspectionStageRecordResource"] & {
+            closed_loop_manifest?: unknown;
             manifest?: null | components["schemas"]["AntennaInspectionManifestResource"];
             record_content_digest: string;
             request_scope_epoch: string;
@@ -5579,6 +5638,7 @@ export interface components {
             source_object_id: string;
             status: string;
         };
+        AntennaInspectionDisplayFamilyResource: components["schemas"]["AntennaInspectionDisplayResource"] | components["schemas"]["AntennaClosedLoopInspectionDisplayResource"];
         AntennaInspectionDisplayResource: {
             capabilities: components["schemas"]["AntennaInspectionDisplayCapabilities"];
             content_digest: string;
@@ -5633,13 +5693,15 @@ export interface components {
             validation_scope: string;
         };
         AntennaInspectionOutputResource: {
+            content_digest?: string | null;
             inspection_ref: components["schemas"]["AntennaInspectionReferenceResource"];
             kind: string;
             manifest_ref: string;
             payload_units: {
                 [key: string]: string;
             };
-            reused_existing: boolean;
+            reused_existing?: boolean;
+            source?: unknown;
         };
         AntennaInspectionPayloadResource: {
             /** Format: int64 */
@@ -5674,6 +5736,7 @@ export interface components {
             qualification: string;
             resolved_action: string;
             schema_version: string;
+            source_object_id?: string | null;
             stage_id: string;
             stage_kind: string;
             status: string;
@@ -5731,6 +5794,7 @@ export interface components {
             component: string;
             component_labels: string[];
             content_digest: string;
+            equilibrium_binding?: null | components["schemas"]["AntennaEquilibriumBindingResource"];
             /** Format: double */
             equivalent_noise_bandwidth_bins: number;
             field_signature: string;
@@ -5777,7 +5841,7 @@ export interface components {
         };
         AntennaSpectrumRequestResource: {
             component: string;
-            equilibrium_ref?: string | null;
+            equilibrium_ref?: null | components["schemas"]["EquilibriumRefResource"];
             id: string;
             mode_basis_ref?: string | null;
             nonuniform_k_grid?: null | components["schemas"]["AntennaSpectrumKGridResource"];
@@ -5830,6 +5894,8 @@ export interface components {
             source_object_id: string;
             source_sample_count: number;
             target: components["schemas"]["AntennaFieldTargetResource"];
+            transform: string;
+            window: string;
         };
         /** @enum {string} */
         AntennaSpectrumTransformResource: "spatial_fft" | "nonuniform_spatial_fft";
@@ -5899,10 +5965,52 @@ export interface components {
             request_id?: string | null;
             revision_context?: unknown;
         };
+        ArtifactCarrierGeometryQuery: {
+            carrier_id?: string | null;
+            expected_carrier_revision?: string | null;
+            stage_id?: string | null;
+        };
         ArtifactEntry: {
             kind: string;
             path: string;
             region_owned_provenance?: null | components["schemas"]["RegionOwnedArtifactProvenance"];
+        };
+        ArtifactFieldLocatorResource: {
+            carrier_digest: string;
+            carrier_id: string;
+            /** @description Canonical decimal u64 string; exact across JavaScript JSON readers. */
+            carrier_revision: string;
+            carrier_scope_id?: string | null;
+            carrier_scope_kind: string;
+            coordinate_frame: string;
+            coordinate_unit: string;
+            indexing: components["schemas"]["ArtifactSampleIndexing"];
+            owner: components["schemas"]["ArtifactFieldOwnerBinding"];
+            /** Format: int64 */
+            sample_count: number;
+            topology_binary_schema: string;
+        };
+        /** @description Provider-owned immutable source identity. Stable native mesh IDs are binary-only. */
+        ArtifactFieldOwnerBinding: {
+            accepted_artifact?: null | components["schemas"]["AcceptedInspectionArtifactOwner"];
+            authored_stage_id: string;
+            content_digest: string;
+            historical_inspection: boolean;
+            module_id: string;
+            native_mesh_identity: string;
+            native_topology_identity: string;
+            object_id: string;
+            /** Format: int64 */
+            observation_mesh_revision: number;
+            /** Format: int64 */
+            observation_topology_revision: number;
+            output_id: string;
+            request_scope_epoch: string;
+            run_id: string;
+            runtime_stage_id: string;
+            session_epoch: string;
+            session_id: string;
+            source_digest: string;
         };
         ArtifactResource: {
             kind: string;
@@ -5910,6 +6018,8 @@ export interface components {
             region_owned_provenance?: null | components["schemas"]["RegionOwnedArtifactProvenance"];
             stage_autosave?: null | components["schemas"]["StageAutosaveArtifactMetadata"];
         };
+        /** @enum {string} */
+        ArtifactSampleIndexing: "source_nodes" | "sample_nodes" | "point_samples" | "tet4_cell_local_nodes" | "cell_centers";
         Author: {
             affiliation?: string | null;
             email?: string | null;
@@ -6983,6 +7093,19 @@ export interface components {
             revision: number;
             total: number;
         };
+        EquilibriumRefResource: components["schemas"]["EquilibriumReferenceResource"] | string;
+        EquilibriumReferenceResource: {
+            /** @enum {string} */
+            kind: "stage_output";
+            output_id: string;
+            stage_id: string;
+        } | {
+            asset_id: string;
+            content_digest: string;
+            equilibrium_id: string;
+            /** @enum {string} */
+            kind: "artifact";
+        };
         /** @enum {string} */
         ExecutionBackendSchema: "auto" | "fdm" | "fem" | "hybrid";
         /** @enum {string} */
@@ -7392,6 +7515,7 @@ export interface components {
         /** @enum {string} */
         FieldComponent: "x" | "y" | "z" | "magnitude";
         FieldDescriptor: {
+            artifact_field_locator?: null | components["schemas"]["ArtifactFieldLocatorResource"];
             available: boolean;
             /** Format: int32 */
             components: number;
@@ -7511,6 +7635,7 @@ export interface components {
             y_size: number;
         };
         FieldMeta: {
+            artifact_field_locator?: null | components["schemas"]["ArtifactFieldLocatorResource"];
             /** Format: int32 */
             components: number;
             domain_generation_id: string;
@@ -7545,7 +7670,7 @@ export interface components {
             unit: string;
         };
         /** @enum {string} */
-        FieldPayloadState: "current" | "legacy_unverified" | "unmaterialized";
+        FieldPayloadState: "current" | "historical" | "legacy_unverified" | "unmaterialized";
         FieldProjectionMaskDescriptor: {
             available: boolean;
             etag?: string | null;
@@ -7624,6 +7749,7 @@ export interface components {
             value: number;
         };
         FieldPublicationBinding: {
+            artifact_field_locator?: null | components["schemas"]["ArtifactFieldLocatorResource"];
             carrier_fingerprint: string;
             carrier_id: string;
             component: string;
@@ -7875,6 +8001,8 @@ export interface components {
         };
         /** @description Query parameters for the `/fields/{quantity_id}/vector` endpoint. */
         FieldVectorQuery: {
+            /** @description Exact immutable artifact carrier selector. */
+            carrier_id?: string | null;
             /**
              * @description Component to return.
              *
@@ -11069,19 +11197,20 @@ export interface components {
             transform?: Record<string, unknown> | null;
             universe?: Record<string, unknown> | null;
         };
+        /** @description Per-energy availability is explicit: null is missing, while Some(0.0) is an observed zero. */
         ObjectEnergySummary: {
             /** Format: double */
-            anisotropy: number;
+            anisotropy: number | null;
             /** Format: double */
-            demag: number;
+            demag: number | null;
             /** Format: double */
-            dmi: number;
+            dmi: number | null;
             /** Format: double */
-            exchange: number;
+            exchange: number | null;
             /** Format: double */
-            total: number;
+            total: number | null;
             /** Format: double */
-            zeeman: number;
+            zeeman: number | null;
         };
         ObjectGeometryPatchRequest: {
             /** Format: int64 */
@@ -11437,7 +11566,7 @@ export interface components {
             padding_m: number;
         };
         /** @enum {string} */
-        PlanarFieldComponent: "x" | "y" | "z" | "u" | "v" | "normal" | "magnitude" | "in_plane_magnitude" | "orientation";
+        PlanarFieldComponent: "c0" | "c1" | "c2" | "c3" | "c4" | "c5" | "c6" | "c7" | "c8" | "frobenius" | "spin_flow_x" | "spin_flow_y" | "spin_flow_z" | "x" | "y" | "z" | "u" | "v" | "normal" | "magnitude" | "in_plane_magnitude" | "orientation";
         PlanarFieldFrameResource: {
             bounds_uv_m: number[];
             normal: number[];
@@ -12334,7 +12463,7 @@ export interface components {
             run_intent: {
                 [key: string]: unknown;
             };
-            /** @description Versioned `study_plan.v2` object with typed steps, references and runner controls. */
+            /** @description Versioned `study_plan.v1/v2/v3/v4`; v4 adds typed inspection operations and captured source. */
             study_plan: {
                 [key: string]: unknown;
             };
@@ -12491,6 +12620,7 @@ export interface components {
             supports_history: boolean;
             supports_preview_2d: boolean;
             supports_preview_3d: boolean;
+            tensor?: null | components["schemas"]["QuantityTensorDescriptor"];
             unit: string;
         };
         QuantityCatalogResponse: {
@@ -12507,6 +12637,14 @@ export interface components {
         QuantityRenderCapability: "renderable" | "unsupported_shape" | "unavailable";
         /** @enum {string} */
         QuantityRequestCapability: "field_vector" | "scalar_resource" | "unsupported_shape" | "unavailable";
+        QuantityTensorDescriptor: {
+            axes: string[];
+            component_labels: string[];
+            layout: string;
+            /** Format: int32 */
+            rank: number;
+            shape: number[];
+        };
         QuantityVisualizationPatch: {
             active_quantity_id?: string | null;
             auto_contrast?: boolean | null;
@@ -13725,9 +13863,12 @@ export interface components {
         /** @enum {string} */
         SceneStructuredCutAxis: "x" | "y" | "z";
         /** @enum {string} */
+        SceneStructuredCutCoordinateFrame: "world" | "object";
+        /** @enum {string} */
         SceneStructuredCutNormal: "positive_axis" | "negative_axis";
         SceneStructuredCutPlane: {
             axis: components["schemas"]["SceneStructuredCutAxis"];
+            coordinate_frame?: null | components["schemas"]["SceneStructuredCutCoordinateFrame"];
             normal: components["schemas"]["SceneStructuredCutNormal"];
             /** Format: double */
             offset_m: number;
@@ -15975,6 +16116,8 @@ export interface components {
             surface_opacity: number;
             surface_projection_mode: components["schemas"]["SurfaceFieldProjectionMode"];
             surface_visible: boolean;
+            /** @description Explicit flow-major tensor projection; absent for scalar/vector fields. */
+            tensor_projection?: string | null;
             /** Format: double */
             vector_alpha: number;
             /** Format: int32 */
@@ -16157,6 +16300,7 @@ export interface components {
             surface_color_source?: null | components["schemas"]["SurfaceColorSource"];
             surface_mono_color?: string | null;
             surface_projection_mode?: null | components["schemas"]["SurfaceFieldProjectionMode"];
+            tensor_projection?: string | null;
             /** Format: double */
             vector_alpha?: number | null;
             /** Format: int32 */
@@ -20757,7 +20901,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Inspection record and manifest-only metadata; never a drive basis */
+            /** @description Inspection record; external-lead manifest metadata or fully verified closed-loop thin metadata; never a drive basis */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -20766,7 +20910,7 @@ export interface operations {
                     "application/json": components["schemas"]["AntennaExternalLeadInspectionResource"];
                 };
             };
-            /** @description Unchanged manifest-only resource */
+            /** @description Unchanged inspection resource after family validation */
             304: {
                 headers: {
                     [name: string]: unknown;
@@ -20837,7 +20981,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AntennaInspectionDisplayResource"];
+                    "application/json": components["schemas"]["AntennaInspectionDisplayFamilyResource"];
                 };
             };
             /** @description Unchanged after integrity validation */
@@ -21424,7 +21568,11 @@ export interface operations {
     };
     data_get_sessions_current_data_domain_topology: {
         parameters: {
-            query?: never;
+            query?: {
+                carrier_id?: string | null;
+                stage_id?: string | null;
+                expected_carrier_revision?: string | null;
+            };
             header?: {
                 /** @description Strong ETag from a previous domain topology response */
                 "If-None-Match"?: string | null;
@@ -21697,7 +21845,9 @@ export interface operations {
     };
     data_get_sessions_current_data_fields: {
         parameters: {
-            query?: never;
+            query?: {
+                stage_id?: string | null;
+            };
             header?: {
                 /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
                 "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
@@ -21728,6 +21878,14 @@ export interface operations {
     data_get_sessions_current_data_fields_quantity_id_availability: {
         parameters: {
             query?: {
+                /** @description Exact runtime stage that owns the immutable inspection. */
+                stage_id?: string | null;
+                /** @description Exact immutable carrier selected from field metadata. */
+                carrier_id?: string | null;
+                /** @description Optional inspection view: full or explicit J_charge cell_centers. */
+                view?: string | null;
+                /** @description Canonical nonzero decimal u64 precondition for the immutable carrier. */
+                expected_carrier_revision?: string | null;
                 /** @description Stable canonical frontend target identity. Airbox always uses `airbox`. */
                 target_id?: string | null;
                 /** @description Field carrier scope. Defaults to the complete domain carrier. */
@@ -21775,11 +21933,21 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Ambiguous owner, immutable carrier mismatch, or changed observation */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     data_get_sessions_current_data_fields_quantity_id_meta: {
         parameters: {
             query?: {
+                carrier_id?: string | null;
+                view?: string | null;
+                expected_carrier_revision?: string | null;
                 /** @description Optional component projection used for statistics (`x`, `y`, `z`, `magnitude`, `full`). */
                 component?: string | null;
                 /** @description Optional FEM or FDM scope used for statistics. */
@@ -23808,6 +23976,8 @@ export interface operations {
     data_get_sessions_current_data_fields_quantity_id_samples_vector: {
         parameters: {
             query?: {
+                /** @description Exact immutable artifact carrier selector. */
+                carrier_id?: string | null;
                 /**
                  * @description Component to return.
                  *
@@ -23915,16 +24085,22 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Binary FMVP field vector. Analysis response and eigen-mode vectors use FMVP v5 metadata with the full quantity ID and domain generation identity; when a mesh carrier is available they also include topology, scope, and indexing metadata. Analysis vectors without a mesh use the explicit legacy_count_only absent-topology sentinel and cannot establish topology-bound overlay compatibility. Other scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload. */
+            /** @description Binary FMVP field vector. Immutable artifact inspections use separate FMVP v6 metadata with lossless u64 sample identities, source ownership and carrier revision/digest; this does not change the generic v5 full-quantity-ID layout. Analysis response and eigen-mode vectors use FMVP v5 metadata with the full quantity ID and domain generation identity; when a mesh carrier is available they also include topology, scope, and indexing metadata. Analysis vectors without a mesh use the explicit legacy_count_only absent-topology sentinel and cannot establish topology-bound overlay compatibility. Other scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload. */
             200: {
                 headers: {
                     /** @description Committed analysis artifact generation identity; present only when the served field member is verified */
                     "x-fullmag-artifact-generation-id"?: string;
+                    /** @description Bare lowercase SHA256 artifact carrier digest; present for FMVP v6 */
+                    "x-fullmag-carrier-digest"?: string;
+                    /** @description Immutable artifact carrier ID; present for FMVP v6 */
+                    "x-fullmag-carrier-id"?: string;
+                    /** @description Lossless decimal u64 artifact carrier revision; present for FMVP v6 */
+                    "x-fullmag-carrier-revision"?: string;
                     /** @description Resolved component projection */
                     "x-fullmag-component"?: string;
                     /** @description Domain generation identity */
                     "x-fullmag-domain-generation-id"?: string;
-                    /** @description FMVP encoding and version */
+                    /** @description FMVP encoding and version, including FMVP;version=6 for immutable artifact inspections */
                     "x-fullmag-encoding"?: string;
                     /** @description Optional FMVP v3/v5 field indexing */
                     "x-fullmag-field-indexing"?: string;
@@ -24399,7 +24575,9 @@ export interface operations {
     };
     data_get_sessions_current_data_quantities: {
         parameters: {
-            query?: never;
+            query?: {
+                stage_id?: string | null;
+            };
             header?: {
                 /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
                 "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];

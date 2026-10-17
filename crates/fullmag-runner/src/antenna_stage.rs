@@ -1303,6 +1303,7 @@ mod tests {
             port_mode_id: "common".into(),
             solution_id: solution_id.into(),
             field_solution: crate::AntennaFieldSolutionSamples {
+                sample_carrier: None,
                 solution_id: solution_id.into(),
                 source_object_id: "antenna".into(),
                 port_mode_id: "common".into(),
@@ -1612,11 +1613,13 @@ mod tests {
         .expect_err("cancelled publication must not return a ready asset");
         assert!(error.message.contains("cancelled before atomic rename"));
         let (asset_id, _) = manifest_metadata(&result).unwrap();
-        assert!(!physical_solution_revision_dir(&root, "solution", &asset_id).exists());
-        // Publication may create the shared revision parent before cancellation,
-        // but must leave neither a published revision nor staged payloads.
-        let revision_parent = root.join(solution_prefix("solution"));
-        assert!(fs::read_dir(&revision_parent).unwrap().next().is_none());
+        assert!(!physical_solution_revision_dir(&root, &result.solution_id, &asset_id).exists());
+        let revision_parent = root.join(solution_prefix(&result.solution_id));
+        assert_eq!(
+            fs::read_dir(&revision_parent).unwrap().count(),
+            0,
+            "cancellation must leave neither a published revision nor temporary entries"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

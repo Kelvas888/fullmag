@@ -69,12 +69,23 @@ struct OwnerRecord {
 // Owns only a successfully acquired native lock, including admission failures.
 struct NativeLock {
     file: File,
+    locked: bool,
+}
+
+impl NativeLock {
+    fn unlock(&mut self) -> std::io::Result<()> {
+        if self.locked {
+            self.file.unlock()?;
+            self.locked = false;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for NativeLock {
     fn drop(&mut self) {
         // dup/fork may keep the open file description alive after our close.
-        if let Err(error) = File::unlock(&self.file) {
+        if let Err(error) = self.unlock() {
             tracing::error!(%error, "could not release native writer lock");
         }
     }
@@ -202,7 +213,7 @@ impl Drop for WriteTransaction {
             }
             // Unlock the shared open-file-description lock before closing our
             // descriptor. Cloned/inherited descriptors can outlive this token.
-            if let Err(error) = active.lock.file.unlock() {
+            if let Err(error) = active.lock.unlock() {
                 tracing::error!(%error, "could not unlock native writer descriptor; retaining it fail-closed");
                 return;
             }
@@ -239,7 +250,7 @@ fn open_lock_descriptor(root: &Path) -> Result<NativeLock> {
         }
     }
 
-    let mut lock = NativeLock { file };
+    let mut lock = NativeLock { file, locked: true };
     let mut descriptor = Vec::new();
     lock.file.read_to_end(&mut descriptor)?;
     if descriptor.is_empty() {

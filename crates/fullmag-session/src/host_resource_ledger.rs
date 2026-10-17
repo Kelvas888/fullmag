@@ -3657,6 +3657,25 @@ impl HostResourceLedger {
         lease: &FmsResourceLease,
         inputs: &crate::FmsResolvedInputsSnapshot,
     ) -> Result<Option<TaskAdmissionCommitDisposition>> {
+        self.try_commit_task_admission_checked(request, store, lease, inputs, || Ok(()))
+    }
+
+    /// Validate dependency readiness under host-before-store locks, before any reservation.
+    pub fn commit_task_admission_checked(
+        &self, request: &HostReservationRequest, store: &SessionStore,
+        lease: &FmsResourceLease, inputs: &crate::FmsResolvedInputsSnapshot,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<TaskAdmissionCommitDisposition> {
+        self.try_commit_task_admission_checked(request, store, lease, inputs, validate)?
+            .ok_or_else(|| HostResourceCapacityUnavailable(
+                "host capacity is occupied; task admission was not committed".into()).into())
+    }
+
+    pub fn try_commit_task_admission_checked(
+        &self, request: &HostReservationRequest, store: &SessionStore,
+        lease: &FmsResourceLease, inputs: &crate::FmsResolvedInputsSnapshot,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<TaskAdmissionCommitDisposition>> {
         inputs.validate()?;
         let _host_writer = self.writer.acquire()?;
         let _store_writer = store.write_transaction()?;
@@ -3667,6 +3686,7 @@ impl HostResourceLedger {
         {
             return Ok(None);
         }
+        validate()?;
 
         if store
             .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?
@@ -10772,4 +10792,29 @@ mod tests {
             .to_string()
             .contains("sum overflowed"));
     }
+
+    #[test]
+    fn checked_admission_failure_and_replay_publish_nothing_under_host_store_locks() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let other_store = SessionStore::open_existing(store.root().to_path_buf()).unwrap();
+        let (policy, mut request, _, _, mut lease) = worker_release_fixture();
+        request.identity.store_id = HostResourceLedger::store_id(store.root()).unwrap();
+        lease.state = FmsResourceLeaseState::Active; lease.released_at = None; lease.heartbeat_sequence = 0;
+        let ledger = HostResourceLedger::initialize(ledger_root(directory.path()), policy.clone()).unwrap();
+        let other_ledger = HostResourceLedger::open(ledger_root(directory.path()), policy).unwrap();
+        let before = ledger.read().unwrap();
+        for _ in 0..2 {
+            let result = ledger.commit_task_admission_checked(&request, &store, &lease, &crate::FmsResolvedInputsSnapshot::new(serde_json::json!({})).unwrap(), || {
+                assert!(other_store.write_transaction().is_err());
+                assert!(other_ledger.reserve(&request).is_err());
+                anyhow::bail!("dependency changed before exact admission/replay")
+            });
+            assert!(result.unwrap_err().to_string().contains("dependency changed"));
+            assert_eq!(ledger.read().unwrap(), before);
+            assert!(store.read_run_catalog(&lease.run_id).unwrap().is_none());
+            assert!(store.read_resource_lease(&lease.run_id, &lease.resource_id, &lease.lease_token).unwrap().is_none());
+        }
+    }
+
 }

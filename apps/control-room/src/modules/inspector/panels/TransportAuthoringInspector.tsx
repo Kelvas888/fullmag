@@ -3,9 +3,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 
 import type {
+  SceneResource,
   SceneCurrentTransport,
   SceneSpinTransport,
-  TransportAuthoringCapabilityMap,
   TransportValidationRequest,
   TransportValidationResponse,
 } from "@/kernel/api/apiTypes";
@@ -23,6 +23,7 @@ import {
   transportMutationResourceKeys,
   useCurrentTransportsResource,
   useSpinTransportsResource,
+  useSpinAuthoringGeometryResource,
 } from "@/kernel/resources/spinAuthoringResources";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import {
@@ -30,6 +31,7 @@ import {
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
+import { getTransportAuthoringCapability } from "@/shared/domain/physics/transportAuthoringCapabilities";
 import { Switch } from "@/shared/ui/Switch";
 
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
@@ -38,6 +40,7 @@ import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import { InspectorPropertyRow } from "../primitives/InspectorPropertyRow";
 import type { InspectorPanelProps } from "../inspectorTypes";
+import { TransportCollectionFields } from "./TransportCollectionFields";
 import { PhysicsInspectorOverview } from "./PhysicsInspectorOverview";
 import { buildPhysicsInspectorOverviewModel } from "./PhysicsInspectorOverviewModel";
 import {
@@ -67,24 +70,6 @@ type Draft = CurrentTransportDraft | SpinTransportDraft;
 
 const TRANSPORT_VALIDATION_VERSION = "transport-authoring-validation.v1";
 
-function requestedCapability(
-  family: Family,
-  draft: Draft,
-  capabilities: TransportAuthoringCapabilityMap | null,
-) {
-  if (!capabilities) return null;
-  if (family === "current_transport") {
-    return (draft as CurrentTransportDraft).coupling === "bidirectional"
-      ? capabilities.m2_reciprocal
-      : capabilities.m1_one_way_steady;
-  }
-  const spin = draft as SpinTransportDraft;
-  if (spin.mode === "transient") return capabilities.m3_transient;
-  if (spin.executionDevice === "gpu") return capabilities.gpu;
-  if (spin.executionPrecision === "single") return capabilities.single_precision;
-  return capabilities.m1_one_way_steady;
-}
-
 export function TransportAuthoringInspector({
   family,
   initialScope,
@@ -106,6 +91,7 @@ export function TransportAuthoringInspector({
   const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const current = useCurrentTransportsResource({ enabled: family === "current_transport" });
   const spin = useSpinTransportsResource({ enabled: family === "spin_transport" });
+  const geometry = useSpinAuthoringGeometryResource();
   const active = family === "current_transport" ? current : spin;
   const items = useMemo(
     () => (active.data?.items ?? []) as (SceneCurrentTransport | SceneSpinTransport)[],
@@ -209,7 +195,13 @@ export function TransportAuthoringInspector({
     (status) => status.data?.capabilities.transport_authoring ?? null,
     { enabled: true },
   );
-  const capability = requestedCapability(family, draft, capabilities);
+  const capabilityResource = family === "current_transport"
+    ? { name: (draft as CurrentTransportDraft).name, model: (draft as CurrentTransportDraft).model, coupling: (draft as CurrentTransportDraft).coupling }
+    : { current_source_id: (draft as SpinTransportDraft).currentSourceId, mode: (draft as SpinTransportDraft).mode,
+        constitutive_version: (draft as SpinTransportDraft).constitutiveVersion,
+        requested_execution: { device: (draft as SpinTransportDraft).executionDevice, precision: (draft as SpinTransportDraft).executionPrecision,
+          discretization: (draft as SpinTransportDraft).executionDiscretization, execution_mode: (draft as SpinTransportDraft).executionMode } };
+  const capability = getTransportAuthoringCapability(family, capabilityResource, geometry.data, capabilities);
   const dirty = !transportDraftValuesEqual(draft, baseDraft);
   const valid = Boolean(
     known && !targetUnavailable &&
@@ -493,9 +485,13 @@ export function TransportAuthoringInspector({
             <FormField label="Opaque payload" type="textarea" rows={20} readOnly value={readonlyTransportPayload(selected)} />
           </>
         ) : family === "current_transport" ? (
-          <CurrentFields draft={draft as CurrentTransportDraft} focus={structuredCurrentFocus} identityReadOnly={Boolean(selectedId) || pending} patch={patch} />
+          <CurrentFields scene={geometry.data} draft={draft as CurrentTransportDraft} focus={structuredCurrentFocus} identityReadOnly={Boolean(selectedId) || pending} patch={patch} />
         ) : (
-          <SpinFields draft={draft as SpinTransportDraft} identityReadOnly={Boolean(selectedId) || pending} patch={patch} />
+          <SpinFields onOpenInterface={(interfaceId) => {
+            if (!selectedId) { setFeedback({ kind: "error", message: "Commit the owning spin transport before authoring its interfaces." }); return; }
+            const nodeId = `model:physics:spin-interface:${selectedId}:${interfaceId ?? "draft"}`;
+            kernel.selection.set({ kind: "physics.spin-interface", label: interfaceId ?? "New spin interface", nodeId, objectId: null, ref: { type: "spin-interface", kind: "physics.spin-interface", nodeId, spinInterfaceOwnerId: selectedId, ...(interfaceId ? { spinInterfaceId: interfaceId } : {}) } }, "inspector");
+          }} scene={geometry.data} draft={draft as SpinTransportDraft} identityReadOnly={Boolean(selectedId) || pending} patch={patch} />
         )}
         {feedback ? <FeedbackBanner kind={feedback.kind} message={feedback.message} /> : null}
         {targetUnavailable ? <FeedbackBanner kind="warning" message="The selected transport no longer exists. Select another resource or explicitly create a new one." /> : null}
@@ -674,7 +670,7 @@ export function StructuredCurrentSourceCutInspectorPanel({ selection }: Inspecto
   );
 }
 
-function CurrentFields({ draft, focus, identityReadOnly, patch }: { draft: CurrentTransportDraft; focus?: { closureId: string; sourceCutId?: string } | null; identityReadOnly: boolean; patch: (value: Partial<Draft>) => void }) {
+function CurrentFields({ draft, scene, focus, identityReadOnly, patch }: { scene: SceneResource | null; draft: CurrentTransportDraft; focus?: { closureId: string; sourceCutId?: string } | null; identityReadOnly: boolean; patch: (value: Partial<Draft>) => void }) {
   const field = (key: keyof CurrentTransportDraft) => (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => patch({ [key]: event.target.value });
   const hasStructuredClosure = draft.structuredCurrentClosure !== null;
   return <>
@@ -684,9 +680,9 @@ function CurrentFields({ draft, focus, identityReadOnly, patch }: { draft: Curre
     <StructuredCurrentClosureFields draft={draft} focus={focus} patch={patch} />
     {!hasStructuredClosure ? <FormField label="Conservative RT0 current view (JSON; closed_geometry)" rows={12} type="textarea" value={draft.conservativeCurrentView} onChange={field("conservativeCurrentView")} /> : null}
     {draft.model === "prescribed_density" ? <FormField label="Current density vector" unit="A/m²" type="textarea" value={draft.currentDensity} onChange={field("currentDensity")} /> : <>
-      <FormField label="Domain region refs" type="textarea" rows={5} value={draft.domain} onChange={field("domain")} />
-      <FormField label="Material assignments (sigma_Spm; M2: sigma_parallel_Spm, sigma_perpendicular_Spm, sigma_AHE_Spm)" type="textarea" rows={9} value={draft.materials} onChange={field("materials")} />
-      <FormField label="Charge boundaries" type="textarea" rows={9} value={draft.boundaries} onChange={field("boundaries")} />
+      <TransportCollectionFields family={"id" in draft ? "spin_transport" : "current_transport"} collection="domain" value={draft.domain} scene={scene} onChange={(domain) => patch({ domain })} />
+      <TransportCollectionFields family="current_transport" collection="materials" value={draft.materials} scene={scene} onChange={(materials) => patch({ materials })} />
+      <TransportCollectionFields family="current_transport" collection="boundaries" value={draft.boundaries} scene={scene} onChange={(boundaries) => patch({ boundaries })} />
       <FormField label="Gauge" type="select" value={draft.gauge} onChange={field("gauge")}><option value="dirichlet_reference">Dirichlet reference</option><option value="zero_mean">Zero mean</option><option value="terminal_reference">Terminal reference</option></FormField>
       <SolverFields draft={draft} field={field} patch={patch} />
     </>}
@@ -794,17 +790,21 @@ function StructuredCurrentClosureFields({
   </div>;
 }
 
-function SpinFields({ draft, identityReadOnly, patch }: { draft: SpinTransportDraft; identityReadOnly: boolean; patch: (value: Partial<Draft>) => void }) {
+function SpinFields({ draft, scene, identityReadOnly, patch, onOpenInterface }: { onOpenInterface: (id: string | null) => void; scene: SceneResource | null; draft: SpinTransportDraft; identityReadOnly: boolean; patch: (value: Partial<Draft>) => void }) {
   const field = (key: keyof SpinTransportDraft) => (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => patch({ [key]: event.target.value });
   return <>
     <FormField label="Id" readOnly={identityReadOnly} value={draft.id} onChange={field("id")} />
     <FormField label="Schema version" value={draft.schemaVersion} onChange={field("schemaVersion")} />
     <FormField label="Current source id" value={draft.currentSourceId} onChange={field("currentSourceId")} />
     <FormField label="Mode" type="select" value={draft.mode} onChange={field("mode")}><option value="steady">Steady</option><option value="transient">Transient</option></FormField>
-    <FormField label="Domain region refs" type="textarea" rows={5} value={draft.domain} onChange={field("domain")} />
-    <FormField label="Spin material assignments (includes spin_capacitance_As_per_V_m3 and capacitance_formula_version)" type="textarea" rows={9} value={draft.materials} onChange={field("materials")} />
-    <FormField label="Interfaces" type="textarea" rows={9} value={draft.interfaces} onChange={field("interfaces")} />
-    <FormField label="Spin boundaries" type="textarea" rows={9} value={draft.boundaries} onChange={field("boundaries")} />
+    <TransportCollectionFields family={"id" in draft ? "spin_transport" : "current_transport"} collection="domain" value={draft.domain} scene={scene} onChange={(domain) => patch({ domain })} />
+    <TransportCollectionFields family="spin_transport" collection="materials" value={draft.materials} scene={scene} onChange={(materials) => patch({ materials })} />
+    <InspectorGroup title="Spin interfaces">
+      {(() => { try { return (JSON.parse(draft.interfaces) as Array<{ id?: string; kind?: string }>).map((item, index) => <Button key={`${item.id ?? "unknown"}:${index}`} type="button" disabled={!item.id} onClick={() => onOpenInterface(item.id ?? null)}>Edit {item.id ?? `unknown interface ${index + 1}`} - {item.kind ?? "unknown"}</Button>); } catch { return <FeedbackBanner kind="error" message="Interface collection is malformed; existing payload remains unchanged." />; } })()}
+      <Button type="button" onClick={() => onOpenInterface(null)}>Create interface through owning transport</Button>
+      <p className="fm-inspector-hint">Interface parameters and geometry bindings use the dedicated interface Inspector. Current unedited interface payloads remain unchanged.</p>
+    </InspectorGroup>
+    <TransportCollectionFields family="spin_transport" collection="boundaries" value={draft.boundaries} scene={scene} onChange={(boundaries) => patch({ boundaries })} />
     <SolverFields draft={draft} field={field} patch={patch} />
     <FormField label="Default external boundary" value={draft.solverDefaultExternalBoundary} onChange={field("solverDefaultExternalBoundary")} />
     <FormField label="Requested discretization" type="select" value={draft.executionDiscretization} onChange={field("executionDiscretization")}><option value="auto">Auto</option><option value="fdm">FDM</option><option value="fem">FEM</option></FormField>

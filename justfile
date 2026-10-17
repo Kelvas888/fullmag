@@ -85,6 +85,10 @@ run-managed-browser job_id commit port="3104":
 run-managed-browser-snapshot job_id commit source_digest native_snapshot_sha256 port="3104":
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_browser.py" --repo-root "{{repo_root}}" --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --port {{quote(port)}}
 
+# Real workspace on a private tmpfs session; retained launch evidence, no build.
+run-managed-browser-snapshot-ram job_id commit source_digest native_snapshot_sha256 port="3106":
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_browser.py" --repo-root "{{repo_root}}" --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --port {{quote(port)}} --ephemeral
+
 # Approved scientific fixture only: RAM session, retained export, no build.
 run-managed-antenna-ram job_id commit source_digest native_snapshot_sha256:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}}
@@ -92,13 +96,12 @@ run-managed-antenna-ram job_id commit source_digest native_snapshot_sha256:
 observe-managed-antenna-ram run_root:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_ram.py" --repo-root "{{repo_root}}" observe --run-root {{quote(run_root)}}
 
+# Real API publication/read-back: fixed CPU fixture, loopback-only RAM session.
+run-managed-antenna-http-ram job_id commit source_digest native_snapshot_sha256 fixture="magnetic":
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --fixture {{quote(fixture)}}
 # Same pinned current input, but no magnetic probe physics or LLG scaffold.
 run-managed-antenna-standalone-ram job_id commit source_digest native_snapshot_sha256:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --standalone
-
-# Real API publication/read-back: fixed CPU fixture, loopback-only RAM session.
-run-managed-antenna-http-ram job_id commit source_digest native_snapshot_sha256:
-    @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}}
 
 # Explicit archive round-trip gate in the same disposable RAM ownership boundary.
 run-managed-antenna-cold-http-ram job_id commit source_digest native_snapshot_sha256:
@@ -111,6 +114,17 @@ run-managed-antenna-standalone-cold-http-ram job_id commit source_digest native_
 observe-managed-antenna-http-ram run_root:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" observe --run-root {{quote(run_root)}}
 
+# No-build public accepted full-3D inspection from a pinned managed capsule.
+verify-api-accepted-closed-loop-runtime request request_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/launch_accepted_closed_loop_runtime.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}}
+
+# Fixed public FEM transport oracle from an already verified CPU package.
+run-managed-transport-oracles job_id commit source_digest native_snapshot_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_transport_oracles.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}}
+
+observe-managed-transport-oracles run_root:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_transport_oracles.py" --repo-root "{{repo_root}}" observe --run-root {{quote(run_root)}}
+
 storage-prepare:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_storage.py" prepare-links --repo-root "{{repo_root}}" --compat --frontend
 
@@ -121,8 +135,20 @@ runner-image:
 runner-build-image toolchain_image tag="fullmag/local-runner-build:development" cpu_mfem="0" network="none":
     docker --context desktop-linux build --network {{quote(network)}} --pull=false --build-arg TOOLCHAIN_IMAGE={{quote(toolchain_image)}} --build-arg CPU_MFEM_ONLY={{quote(cpu_mfem)}} -f scripts/local_runner/Dockerfile.build -t {{quote(tag)}} scripts/local_runner
 
+# Diagnostic legacy producer; use the frozen recipes for deployment evidence.
 runner-coordinator-image:
     docker --context desktop-linux build --network none --pull=false -f scripts/local_runner/Dockerfile.coordinator -t fullmag/build-runner:development scripts
+
+# Explicit network download of only the pinned coordinator base.
+runner-coordinator-base:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/coordinator_image.py" provision-base --repo-root {{quote(repo_root)}}
+
+# Freeze an explicit committed coordinator source without changing the operator.
+runner-coordinator-context ref:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/coordinator_image.py" prepare-image-context --repo-root {{quote(repo_root)}} --source commit --ref {{quote(ref)}}
+
+runner-coordinator-image-frozen context context_sha256 tag:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/coordinator_image.py" build-image --repo-root {{quote(repo_root)}} --context {{quote(context)}} --context-sha256 {{quote(context_sha256)}} --tag {{quote(tag)}}
 
 runner-container-configure image_id:
     {{storage_python}} scripts/local_runner_cli.py container-configure --image-id {{quote(image_id)}}
@@ -176,8 +202,41 @@ runner-once:
     {{storage_python}} scripts/local_runner_cli.py run-once
 
 # Build catalogue: immutable source selection, no user-supplied shell command.
-runner-build mode profile="fem-cpu-release" ref="":
-    {{storage_python}} scripts/local_runner_cli.py submit --operation build --profile {{quote(profile)}} --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
+runner-build mode profile="fem-cpu-release" ref="" untracked_manifest="":
+    {{storage_python}} scripts/local_runner_cli.py submit --operation build --profile {{quote(profile)}} --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}} {{if untracked_manifest == "" { "" } else { "--include-untracked-from " + quote(untracked_manifest) }}}
+
+# Offline external-reference image provisioning; native compilation uses the queue.
+runner-boris-toolchain-context bundle wheel_bundle base_image:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_toolchain.py" prepare-image-context --repo-root {{quote(repo_root)}} --bundle {{quote(bundle)}} --wheel-bundle {{quote(wheel_bundle)}} --base-image {{quote(base_image)}}
+
+runner-boris-toolchain-image context tag:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_toolchain.py" build-image --repo-root {{quote(repo_root)}} --context {{quote(context)}} --tag {{quote(tag)}}
+
+# Capture clean pinned BORIS sources under resolver-owned storage; no build.
+runner-boris-image-context boris_source toolchain_image toolchain_proof toolchain_context toolchain_container:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_cpu.py" prepare-image-context --repo-root {{quote(repo_root)}} --boris-source {{quote(boris_source)}} --toolchain-image {{quote(toolchain_image)}} --toolchain-proof {{quote(toolchain_proof)}} --toolchain-context {{quote(toolchain_context)}} --toolchain-container {{quote(toolchain_container)}}
+
+# This provisions source bytes only; solver compilation uses runner-boris-build.
+runner-boris-image context tag:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_cpu.py" build-image --repo-root {{quote(repo_root)}} --context {{quote(context)}} --tag {{quote(tag)}}
+
+# External CPU reference uses the same single heavy-build queue after opt-in.
+runner-boris-build mode ref="":
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner_cli.py" submit --operation build --profile boris-cpu-v1 --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
+
+# Fixed external CPU reference run from a successful receipt; no build/install.
+run-managed-boris-nf job_id resolution:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf.py" --repo-root {{quote(repo_root)}} start --job-id {{quote(job_id)}} --resolution {{quote(resolution)}}
+
+observe-managed-boris-nf runtime_id:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf.py" --repo-root {{quote(repo_root)}} observe --runtime-id {{quote(runtime_id)}}
+
+# Separate runtime-tools provenance; reuses an immutable successful BORIS build.
+run-managed-boris-nf-v2 job_id resolution:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf_v2.py" --repo-root {{quote(repo_root)}} run --job-id {{quote(job_id)}} --resolution {{quote(resolution)}}
+
+observe-managed-boris-nf-v2 runtime_id:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf_v2.py" --repo-root {{quote(repo_root)}} observe --runtime-id {{quote(runtime_id)}}
 
 # Consume one completed managed CPU/SLEPc build; this recipe never builds an
 # image or native target and writes only a new run below canonical storage.
@@ -585,6 +644,14 @@ verify-inspector-routing-browser:
 verify-study-execution-profile-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario study-execution-profile
 
+# Full current workspace against an explicitly pinned disposable managed API.
+verify-antenna-workspace-browser dependency_workspace="":
+    @{{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3274 --scenario antenna-workspace-authoring{{if dependency_workspace != "" { ' --dependency-workspace "' + dependency_workspace + '"' } else { "" }}}
+
+# Regional source creation through production Inspectors and controlled HTTP.
+verify-antenna-regional-drive-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3272 --scenario antenna-regional-drive
+
 # Production Explorer tree against controlled scene inputs; no solver or unit builds.
 verify-explorer-physics-reporting-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3259 --scenario explorer-physics-reporting
@@ -594,8 +661,12 @@ verify-preparation-workspace-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3268 --scenario preparation-workspace
 
 # Production antenna Inspector and resource hooks in an isolated browser fixture.
-verify-antenna-source-spectrum-browser:
-    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-source-spectrum
+verify-antenna-source-spectrum-browser dependency_workspace="":
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-source-spectrum {{if dependency_workspace != "" { "--dependency-workspace \"" + dependency_workspace + "\"" } else { "" }}}
+
+# Immutable artifact carriers through production binary transport and WebGL.
+verify-artifact-field-overlay-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3276 --scenario artifact-field-overlay
 
 verify-antenna-visualization-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3262 --scenario antenna-visualization
@@ -607,9 +678,13 @@ verify-antenna-external-lead-inspection-browser:
 verify-antenna-cpw-viewport-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3260 --scenario antenna-cpw-viewport
 
+# Sampling/targets on a confirmed restored model; no solver or unit build.
+verify-antenna-solve-targets-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario antenna-solve-targets
+
 # Production microstrip/CPW draft transactions in an isolated browser fixture.
-verify-antenna-microstrip-stations-browser:
-    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3253 --scenario antenna-microstrip-stations
+verify-antenna-microstrip-stations-browser dependency_workspace="":
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3253 --scenario antenna-microstrip-stations {{if dependency_workspace != "" { "--dependency-workspace \"" + dependency_workspace + "\"" } else { "" }}}
 
 verify-antenna-drive-editor-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-drive-editor
@@ -627,8 +702,8 @@ verify-antenna-port-diagnostics-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3263 --scenario antenna-port-diagnostics
 
 # Production existing-port authoring with delayed scoped HTTP acknowledgements.
-verify-antenna-port-editor-browser:
-    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3264 --scenario antenna-port-editor
+verify-antenna-port-editor-browser dependency_workspace="":
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3264 --scenario antenna-port-editor {{if dependency_workspace != "" { "--dependency-workspace \"" + dependency_workspace + "\"" } else { "" }}}
 
 # Production primitive color preferences and Object/Airbox Inspector stability.
 verify-primitive-color-inspector-browser:
@@ -1131,19 +1206,11 @@ verify-boris-nf-interface:
         PYTHONPATH=scripts python3 scripts/verify_boris_nf_interface.py "$run_dir" --output "$run_dir/validation-rerun.json"; \
       done'
 
-verify-boris-fullmag-she-nf:
-    bash -euo pipefail -c '\
-      boris_root="${FULLMAG_BORIS_BUILD_ROOT:-/zfn2/mateuszz/git/fullmag/boris-build/source}"; \
-      fullmag_bin="${FULLMAG_FULLMAG_BINARY:-{{repo_root}}/.fullmag/local/bin/fullmag}"; \
-      report_root="${FULLMAG_BORIS_FULLMAG_SHE_REPORT_ROOT:-/zfn2/mateuszz/git/fullmag/boris-build/reports/fullmag-boris-she-nf-v1}"; \
-      case "$boris_root" in /zfn2/mateuszz/git/fullmag/*) ;; *) echo "BORIS build root must be below /zfn2/mateuszz/git/fullmag" >&2; exit 2 ;; esac; \
-      case "$report_root" in /zfn2/mateuszz/git/fullmag/*) ;; *) echo "matrix report root must be below /zfn2/mateuszz/git/fullmag" >&2; exit 2 ;; esac; \
-      test -x "$boris_root/BorisLin"; \
-      test -f "$boris_root/source_manifest.json" || test -f "$boris_root/source-manifest.json"; \
-      test -x "$fullmag_bin"; \
-      if [ -e "$report_root/matrix.json" ]; then echo "matrix report already exists: $report_root/matrix.json" >&2; exit 3; fi; \
-      mkdir -p "$report_root"; \
-      PYTHONPATH="packages/fullmag-py/src:scripts${PYTHONPATH:+:$PYTHONPATH}" python3 scripts/run_boris_fullmag_she_nf_matrix.py --boris-build-root "$boris_root" --fullmag "$fullmag_bin" --report-root "$report_root" --device "${FULLMAG_BORIS_DEVICE:-cuda}"'
+# Windows-only: observe managed CPU references; never build or start BORIS.
+# Both Fullmag tolerances reuse each fixed BORIS reference, not a BORIS sweep.
+[windows]
+verify-boris-fullmag-she-nf-windows coarse_runtime medium_runtime fine_runtime fullmag fullmag_sha256 report_root native_sha256="":
+    @PYTHONPATH="{{repo_root}}/packages/fullmag-py/src" {{storage_python}} "{{repo_root}}/scripts/run_boris_fullmag_she_nf_matrix.py" --repo-root {{quote(repo_root)}} --boris-runtime-coarse {{quote(coarse_runtime)}} --boris-runtime-medium {{quote(medium_runtime)}} --boris-runtime-fine {{quote(fine_runtime)}} --fullmag {{quote(fullmag)}} --fullmag-sha256 {{quote(fullmag_sha256)}} --report-root {{quote(report_root)}} {{if native_sha256 == "" { "" } else { "--fullmag-native-sha256 " + quote(native_sha256) }}}
 
 verify-fdm-zhang-li-native-contract:
     docker compose --profile fem-gpu run --rm \

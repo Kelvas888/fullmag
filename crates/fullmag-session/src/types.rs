@@ -1537,6 +1537,9 @@ impl FmsTaskPreparationReceipt {
 
     fn validate_payload_identity(&self) -> Result<()> {
         let payload = &self.payload;
+        if payload["schema_version"] == "closed_loop_preparation_receipt.v1" {
+            return self.validate_closed_loop_payload_identity();
+        }
         if payload["schema_version"] != FMS_PREPARATION_RECEIPT_SCHEMA
             || payload["preparation_id"].as_str() != Some(self.preparation_id.as_str())
             || payload["plan_fingerprint"].as_str() != Some(self.plan_fingerprint.as_str())
@@ -1602,6 +1605,31 @@ impl FmsTaskPreparationReceipt {
         Ok(())
     }
 
+    fn validate_closed_loop_payload_identity(&self) -> Result<()> {
+        let payload = self.payload.as_object().context("inspection preparation is not an object")?;
+        let keys: std::collections::BTreeSet<_> = payload.keys().map(String::as_str).collect();
+        if keys != ["schema_version", "preparation_id", "plan_fingerprint", "plan", "native"].into_iter().collect()
+            || payload["preparation_id"].as_str() != Some(self.preparation_id.as_str())
+            || payload["plan_fingerprint"].as_str() != Some(self.plan_fingerprint.as_str()) {
+            bail!("inspection preparation payload identity differs from envelope");
+        }
+        let plan = payload["plan"].as_object().context("inspection preparation plan is missing")?;
+        let source = plan.get("source").and_then(Value::as_object).context("inspection preparation accepted source is missing")?;
+        if plan.get("schema_version").and_then(Value::as_str) != Some("closed_loop_preparation_plan.v1")
+            || source.get("schema_version").and_then(Value::as_str) != Some("accepted_run_preparation_source.v1")
+            || source.get("run_id").and_then(Value::as_str) != Some(self.run_id.as_str())
+            || source.get("step_id").and_then(Value::as_str) != Some(self.step_id.as_str())
+            || source.get("problem_fingerprint") != plan.get("problem_fingerprint")
+            || format!("sha256:{}", canonical_json_sha256(&payload["plan"])) != self.plan_fingerprint {
+            bail!("inspection preparation source differs from its envelope");
+        }
+        for field in ["problem_fingerprint", "carrier_fingerprint", "operation_fingerprint", "source_mesh_fingerprint"] {
+            validate_prefixed_sha256(plan.get(field).and_then(Value::as_str).context("inspection preparation digest missing")?, "inspection preparation fingerprint")?;
+        }
+        validate_prefixed_sha256(source.get("specification_fingerprint").and_then(Value::as_str).context("inspection accepted RunSpec digest missing")?, "inspection RunSpec fingerprint")?;
+        Ok(())
+    }
+
     pub fn relative_path(&self) -> Result<String> {
         self.validate()?;
         Ok(format!(
@@ -1638,7 +1666,10 @@ impl FmsTaskPreparationReceipt {
             bail!("accepted RunSpec run_id does not match task preparation receipt");
         }
         let expected = format!("sha256:{}", canonical_json_sha256(&intent.specification));
-        let actual = self.payload["accepted_run_source"]["specification_fingerprint"]
+        let source = if self.payload["schema_version"] == "closed_loop_preparation_receipt.v1" {
+            &self.payload["plan"]["source"]
+        } else { &self.payload["accepted_run_source"] };
+        let actual = source["specification_fingerprint"]
             .as_str()
             .context("accepted run specification fingerprint is missing")?;
         if actual != expected {
@@ -4039,6 +4070,31 @@ mod graph_schema_tests {
             "backend_family": "fdm", "extra": {"step": 0},
             "hidden_object_ref": "a".repeat(64)});
         assert!(serde_json::from_value::<BackendStatePayload>(backend).is_err());
+    }
+}
+
+#[cfg(test)]
+mod closed_loop_preparation_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn closed_loop_envelope_requires_session_derived_task_preparation_id() {
+        let run_id="run-inspection";
+        let step_id=format!("script-execution-{}","b".repeat(64));
+        let task_id=task_id_for_study_step(run_id,&step_id).unwrap();
+        assert_ne!(task_id,step_id);
+        let problem_fingerprint=format!("sha256:{}","c".repeat(64));
+        let plan=json!({"schema_version":"closed_loop_preparation_plan.v1", "source":{"schema_version":"accepted_run_preparation_source.v1","run_id":run_id,"step_id":step_id,"problem_fingerprint":problem_fingerprint,"specification_fingerprint":format!("sha256:{}","d".repeat(64))},"problem_fingerprint":problem_fingerprint,"carrier_fingerprint":format!("sha256:{}","e".repeat(64)),"operation_fingerprint":format!("sha256:{}","f".repeat(64)),"source_mesh_fingerprint":format!("sha256:{}","a".repeat(64))});
+        let plan_fingerprint=format!("sha256:{}",canonical_json_sha256(&plan));
+        // Metadata-only session fixture; application still requires genuine native mesh evidence.
+        let payload=|preparation_id:&str|json!({"schema_version":"closed_loop_preparation_receipt.v1","preparation_id":preparation_id,"plan_fingerprint":plan_fingerprint,"plan":plan,"native":{}});
+        let wrong=format!("prep-{step_id}");
+        assert!(FmsTaskPreparationReceipt::new(run_id,step_id.clone(),"a".repeat(64),wrong.clone(),plan_fingerprint.clone(),payload(&wrong)).is_err());
+        let expected=format!("prep-{task_id}");
+        let expected_payload=payload(&expected);
+        let receipt=FmsTaskPreparationReceipt::new(run_id,step_id,"a".repeat(64),expected.clone(),plan_fingerprint,expected_payload).unwrap();
+        assert_eq!(receipt.task_id,task_id);assert_eq!(receipt.preparation_id,expected);receipt.validate().unwrap();
     }
 }
 

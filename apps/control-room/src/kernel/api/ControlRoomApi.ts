@@ -1,3 +1,5 @@
+import { artifactFieldResponseIdentityError } from "./artifactFieldResponseIdentity";
+import { objectMeshPolicyWireRequest } from "./objectMeshPolicyWire";
 import { API_INSTANCE_HEADER, isApiInstanceId, resolveApiInstancePin } from "./apiInstancePin";
 import {
   ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
@@ -327,12 +329,14 @@ import type {
   EngineLogResource,
   FieldAvailabilityQuery,
   FieldAvailabilityResource,
+  ArtifactFieldCatalogQuery,
   FieldCatalogResource,
   QuantityCatalogResource,
   FieldVectorIdentityIssue,
   FieldVectorPendingResponse,
   FieldVectorResponseMetadata,
   FieldMetaResource,
+  ArtifactCarrierGeometryQuery,
   FieldMetaQuery,
   FieldStateExportRequest,
   FieldStateExportResponse,
@@ -585,6 +589,9 @@ export function parseFieldVectorResponseMetadata(
   headers: Headers,
 ): FieldVectorResponseMetadata {
   return {
+    carrierId: headers.get("x-fullmag-carrier-id"),
+    carrierRevision: headers.get("x-fullmag-carrier-revision"),
+    carrierDigest: headers.get("x-fullmag-carrier-digest"),
     component: headers.get("x-fullmag-component"),
     domainGenerationId: headers.get("x-fullmag-domain-generation-id"),
     artifactGenerationId: headers.get("x-fullmag-artifact-generation-id"),
@@ -629,7 +636,8 @@ export function collectFieldVectorIdentityIssues(
   if (
     payload.formatVersion === 3 ||
     payload.formatVersion === 4 ||
-    payload.formatVersion === 5
+    payload.formatVersion === 5 ||
+    payload.formatVersion === 6
   ) {
     compare("scopeKind", metadata.scopeKind, payload.scopeKind ?? null);
     compare("scopeId", metadata.scopeId, payload.scopeId ?? null);
@@ -657,7 +665,7 @@ export function collectFieldVectorIdentityIssues(
       payload.domainGenerationId ?? null,
     );
   }
-  if (payload.formatVersion === 4 || payload.formatVersion === 5) {
+  if (payload.formatVersion === 4 || payload.formatVersion === 5 || payload.formatVersion === 6) {
     compare("sourceKind", metadata.sourceKind ?? null, payload.sourceKind ?? null);
     compare("sourceId", metadata.sourceId ?? null, payload.sourceId ?? null);
     compare(
@@ -670,6 +678,10 @@ export function collectFieldVectorIdentityIssues(
       metadata.fieldGenerationId ?? null,
       payload.fieldGenerationId ?? null,
     );
+  }
+  if (payload.formatVersion === 6) {
+    compare("carrierRevision", metadata.carrierRevision ?? null, payload.meshTopologyRevision ?? null);
+    compare("carrierDigest", metadata.carrierDigest ?? null, payload.meshTopologyHash ?? null);
   }
   return issues;
 }
@@ -1868,8 +1880,10 @@ export class ControlRoomApi {
           options,
           { layer_id: layerId },
         ),
-      topology: (options?: BinaryRequestOptions) =>
-        this.requestTopology(DATA_DOMAIN_TOPOLOGY_PATH, options),
+      topology: (options?: BinaryRequestOptions, query?: ArtifactCarrierGeometryQuery) =>
+        this.requestTopology(DATA_DOMAIN_TOPOLOGY_PATH, options, undefined, query ? {
+          carrier_id: query.carrier_id, stage_id: query.stage_id, expected_carrier_revision: query.expected_carrier_revision,
+        } : undefined),
       topologyBytes: (options?: BinaryRequestOptions) =>
         this.requestBinaryBytes(DATA_DOMAIN_TOPOLOGY_PATH, options),
       topologyChunked: (options?: BinaryRequestOptions) =>
@@ -1900,8 +1914,8 @@ export class ControlRoomApi {
         ),
     },
     fields: {
-      catalog: (options?: RequestOptions) =>
-        this.requestJson<FieldCatalogResource>(DATA_FIELDS_PATH, options).then(
+      catalog: (options?: RequestOptions, query: ArtifactFieldCatalogQuery = {}) =>
+        this.requestJson<FieldCatalogResource>(DATA_FIELDS_PATH, options, { query }).then(
           withDerivedDriveFluxDensity,
         ),
       availability: (
@@ -2091,8 +2105,8 @@ export class ControlRoomApi {
       },
     },
     quantities: {
-      catalog: (options?: RequestOptions) =>
-        this.requestJson<QuantityCatalogResource>(DATA_QUANTITIES_PATH, options),
+      catalog: (options?: RequestOptions, query: ArtifactFieldCatalogQuery = {}) =>
+        this.requestJson<QuantityCatalogResource>(DATA_QUANTITIES_PATH, options, { query }),
     },
     meshRegionMembership: (
       ownerObjectId: string,
@@ -2311,7 +2325,7 @@ export class ControlRoomApi {
     ) =>
       this.putJson<MeshObjectConfigResource, MeshObjectConfigReplaceRequest>(
         MESHING_OBJECT_POLICY_PATH,
-        request,
+        objectMeshPolicyWireRequest(request),
         options,
         {
           path: { object_id: objectId },
@@ -3926,6 +3940,7 @@ export class ControlRoomApi {
     path: OpenApiV2Path,
     options: BinaryRequestOptions = {},
     pathParams?: PathParams,
+    query?: QueryParams,
   ): Promise<BinaryResourceResult<DecodedTopology>> {
     return this.requestBinaryResource(
       path,
@@ -3933,6 +3948,21 @@ export class ControlRoomApi {
       decodeTopology,
       options,
       pathParams,
+      query,
+      query?.carrier_id ? (response) => {
+        const carrierId = response.headers.get("x-fullmag-carrier-id");
+        const carrierRevision = response.headers.get("x-fullmag-carrier-revision");
+        const carrierDigest = response.headers.get("x-fullmag-carrier-digest");
+        if (carrierId !== query.carrier_id || carrierRevision !== query.expected_carrier_revision
+          || !carrierRevision || !/^[1-9][0-9]*$/.test(carrierRevision) || BigInt(carrierRevision) > BigInt("18446744073709551615")
+          || !carrierDigest || !/^[0-9a-f]{64}$/.test(carrierDigest)
+          || response.headers.get("x-fullmag-mesh-topology-hash")?.replace(/^sha256:/, "") !== carrierDigest
+          || response.headers.get("x-fullmag-coordinate-frame") !== "world"
+          || response.headers.get("x-fullmag-coordinate-unit") !== "m") {
+          throw new ControlRoomApiError("Artifact topology owner headers differ", 409);
+        }
+        return { carrierId, carrierRevision, carrierDigest, coordinateFrame: "world", coordinateUnit: "m" };
+      } : undefined,
     );
   }
 
@@ -4258,10 +4288,10 @@ export class ControlRoomApi {
             409,
           );
         }
-        return {
-          ...metadata,
-          identityIssues: collectFieldVectorIdentityIssues(data, metadata),
-        };
+        const identityIssues = collectFieldVectorIdentityIssues(data, metadata);
+        const artifactIdentityError = artifactFieldResponseIdentityError(String(pathParams.quantity_id), query, data, { ...metadata, identityIssues });
+        if (artifactIdentityError) throw new ControlRoomApiError(artifactIdentityError, 409);
+        return { ...metadata, identityIssues };
       },
     );
   }
@@ -4978,6 +5008,9 @@ function scalarWindowQueryParams(query: ScalarWindowQuery): QueryParams {
 
 function fieldMetaQueryParams(query: FieldMetaQuery): QueryParams {
   return {
+    carrier_id: query.carrier_id ?? undefined,
+    expected_carrier_revision: query.expected_carrier_revision ?? undefined,
+    view: query.view ?? undefined,
     component: query.component ?? undefined,
     owner_object_id: query.owner_object_id ?? undefined,
     scope_id: normalizeFieldMetaScopeId(
@@ -4992,6 +5025,10 @@ function fieldMetaQueryParams(query: FieldMetaQuery): QueryParams {
 
 function fieldAvailabilityQueryParams(query: FieldAvailabilityQuery): QueryParams {
   return {
+    stage_id: query.stage_id ?? undefined,
+    carrier_id: query.carrier_id ?? undefined,
+    expected_carrier_revision: query.expected_carrier_revision ?? undefined,
+    view: query.view ?? undefined,
     target_id: query.target_id ?? undefined,
     scope_kind: query.scope_kind ?? undefined,
     scope_id: query.scope_id ?? undefined,
