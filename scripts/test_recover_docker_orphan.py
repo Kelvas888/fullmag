@@ -960,7 +960,9 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
             helper = Path(temporary) / "backend_dev.py"
             helper.write_text(
                 "import json\n"
-                "def _validated_package(root, name):\n"
+                "def _validated_package(root, name, *, exclude_development_control=False):\n"
+                "    if not exclude_development_control:\n"
+                "        raise RuntimeError('development control exclusion was not requested')\n"
                 "    raw = (root / \"backend-build-receipt.json\").read_bytes()\n"
                 "    return json.loads(raw.decode()), raw, {}\n",
                 encoding="utf-8")
@@ -976,6 +978,68 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
             probe = json.loads(completed.stdout)
             self.assertEqual([item["mode"] for item in probe["artifacts"]],
                              ["100755", "100644"])
+
+    def test_package_probe_uses_exact_trusted_backend_validator_with_owned_control(self):
+        """Validate live-package artifacts while excluding its control directory."""
+        backend_source = Path(__file__).parents[1] / "docker" / "all-in-one" / "backend_source.py"
+        backend_dev = Path(__file__).parents[1] / "docker" / "all-in-one" / "backend_dev.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            root = temporary_root / "package"
+            trusted = temporary_root / "trusted"
+            root.mkdir()
+            trusted.mkdir()
+            trusted_source = trusted / "backend_source.py"
+            trusted_dev = trusted / "backend_dev.py"
+            trusted_source.write_bytes(backend_source.read_bytes())
+            trusted_dev.write_bytes(backend_dev.read_bytes())
+
+            module_spec = importlib.util.spec_from_file_location(
+                "trusted_backend_dev_fixture", trusted_dev)
+            self.assertIsNotNone(module_spec)
+            self.assertIsNotNone(module_spec.loader)
+            trusted_module = importlib.util.module_from_spec(module_spec)
+            sys.path.insert(0, str(trusted))
+            try:
+                module_spec.loader.exec_module(trusted_module)
+            finally:
+                sys.path.pop(0)
+
+            required = list(trusted_module.REQUIRED_PACKAGE_PATHS) + [
+                "lib/libfullmag_fdm.so", "lib/libfullmag_fem.so",
+            ]
+            for relative in required:
+                path = root.joinpath(*Path(relative).parts)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(relative.encode("utf-8"))
+                if relative.startswith("bin/"):
+                    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            (root / "launcher-build-mode").write_text("cuda-fem-gpu\n", encoding="utf-8")
+            development = root / ".development"
+            development.mkdir()
+            (development / "owner.json").write_text("{}\n", encoding="utf-8")
+            artifacts = trusted_module._hash_package(root)
+            receipt = {
+                "schema": "fullmag.direct-compose.backend-build-receipt.v1",
+                "state": "succeeded",
+                "execution_lanes": {lane: {} for lane in trusted_module.LANES},
+                "artifacts": artifacts,
+            }
+            (root / "backend-build-receipt.json").write_text(
+                json.dumps(receipt, sort_keys=True), encoding="utf-8")
+
+            script = recovery.PACKAGE_PROBE_SCRIPT
+            script = script.replace("pathlib.Path('/opt/fullmag/package')",
+                                    f"pathlib.Path({str(root)!r})", 1)
+            script = script.replace("pathlib.Path('/opt/fullmag/backend_dev.py')",
+                                    f"pathlib.Path({str(trusted_dev)!r})", 1)
+            completed = subprocess.run([sys.executable, "-c", script],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, check=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            probe = json.loads(completed.stdout)
+            self.assertEqual(probe["state"], "succeeded")
+            self.assertEqual(probe["artifacts"], artifacts)
 
     def test_native_command_has_fixed_program_config_phase_and_contained_inputs(self):
         request = "/state/diagnostics/orphan/request.json"

@@ -535,7 +535,9 @@ if spec is None or spec.loader is None:
 module = importlib.util.module_from_spec(spec)
 try:
     spec.loader.exec_module(module)
-    receipt, receipt_bytes, _children = module._validated_package(root, 'cached package')
+    receipt, receipt_bytes, _children = module._validated_package(
+        root, 'cached package', exclude_development_control=True
+    )
 except Exception as error:
     fail(f'trusted package validation failed: {error}')
 if not isinstance(receipt, dict) or receipt.get('state') != 'succeeded':
