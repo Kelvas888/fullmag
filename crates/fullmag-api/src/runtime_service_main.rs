@@ -1282,6 +1282,20 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
 const FAILED_NO_SPAWN_CANCELLATION_SCHEMA: &str = "runtime_service_failed_no_spawn_cancellation.v1";
 const FAILED_NO_SPAWN_CANCELLATION_MAX_REQUEST_BYTES: usize = 256 * 1024;
 
+fn validate_cancellation_store_id(value: &str) -> Result<()> {
+    let digest = value
+        .strip_prefix("sha256:")
+        .context("cancellation store id must use the sha256: identity format")?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("cancellation store id must contain a lowercase 64-character SHA-256 digest");
+    }
+    Ok(())
+}
+
 /// Operator authorization for cancelling one accepted solver task after the
 /// native service has durably failed before the worker launch permit was used.
 /// Every digest is over the complete typed record observed by the operator;
@@ -1326,7 +1340,7 @@ impl FailedNoSpawnCancellationRequest {
                 bail!("{field} must be a lowercase SHA-256 digest");
             }
         }
-        validate_store_id(&self.identity.store_id).context("cancellation store id")?;
+        validate_cancellation_store_id(&self.identity.store_id)?;
         for (value, field) in [
             (&self.identity.run_id, "run_id"),
             (&self.identity.task_id, "task_id"),
@@ -2691,6 +2705,8 @@ mod tests {
     #[test]
     fn failed_no_spawn_request_rejects_unknown_owner_and_preparation_identity() {
         let now = chrono::Utc::now();
+        let directory = tempfile::tempdir().unwrap();
+        let store_id = HostResourceLedger::store_id(directory.path()).unwrap();
         let owner = RuntimeServiceOwnerDescriptor {
             schema_version: fullmag_session::runtime_service::RUNTIME_SERVICE_OWNER_SCHEMA.into(),
             owner_token: uuid::Uuid::new_v4().to_string(),
@@ -2732,7 +2748,7 @@ mod tests {
             lease_sha256: "d".repeat(64),
             reservation_sha256: "e".repeat(64),
             identity: HostReservationIdentity {
-                store_id: "store".into(),
+                store_id,
                 run_id: "run".into(),
                 task_id: "task".into(),
                 resource_id: "resource".into(),
@@ -2745,6 +2761,9 @@ mod tests {
             reason: "failed native service before worker spawn".into(),
         };
         assert!(request.validate().is_ok());
+        request.identity.store_id = "store".into();
+        assert!(request.validate().is_err());
+        request.identity.store_id = HostResourceLedger::store_id(directory.path()).unwrap();
         request.expected_owner.state = RuntimeServiceState::Unknown;
         assert!(request.validate().is_err());
         request.expected_owner.state = RuntimeServiceState::Failed;
