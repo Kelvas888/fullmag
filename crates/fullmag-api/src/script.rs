@@ -627,9 +627,10 @@ pub(crate) fn scene_document_to_authored_problem_ir(
 /// A live v2 accepted run must preserve the authored stage identity and its
 /// physical study kind.  The legacy `scene_document_to_problem_ir` helper is
 /// intentionally narrower and rejects FEM; accepted execution therefore uses
-/// the shared stage materializer, then binds each authored stage through the
-/// application Study materializer.  No profile or host capability is inferred
-/// here.
+/// the prepared stage materializer, then binds each authored stage through the
+/// application Study materializer. Geometry/lead assets are materialized only
+/// for this accepted-execution boundary; no profile or host capability is
+/// inferred here.
 pub(crate) fn scene_document_to_study_execution_inputs(
     repo_root: &Path,
     workspace_root: &Path,
@@ -640,7 +641,7 @@ pub(crate) fn scene_document_to_study_execution_inputs(
     requested_execution
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let stages = scene_document_to_authored_stages(
+    let stages = scene_document_to_prepared_stages(
         repo_root,
         workspace_root,
         scene_document,
@@ -729,6 +730,31 @@ pub(crate) fn scene_document_to_authored_stages(
         scene_document,
         requested_execution,
     )?;
+    materialize_scene_document_stages(config)
+}
+
+/// Project accepted-execution stages through the canonical geometry and lead
+/// input producers. Authoring and preview keep the lightweight capture above;
+/// only accepted execution needs the materialized assets consumed by the
+/// runtime planner.
+fn scene_document_to_prepared_stages(
+    repo_root: &Path,
+    workspace_root: &Path,
+    scene_document: &SceneDocument,
+    requested_execution: &fullmag_application::RequestedExecution,
+) -> Result<Vec<fullmag_application::script_stage_contract::ResolvedScriptStage>, ApiError> {
+    let config = scene_document_to_prepared_script_config(
+        repo_root,
+        workspace_root,
+        scene_document,
+        requested_execution,
+    )?;
+    materialize_scene_document_stages(config)
+}
+
+fn materialize_scene_document_stages(
+    config: fullmag_application::script_stage_contract::ScriptExecutionConfig,
+) -> Result<Vec<fullmag_application::script_stage_contract::ResolvedScriptStage>, ApiError> {
     fullmag_application::script_stage_materialization::materialize_script_stages_with_output_policy_bounded(
         config,
         fullmag_ir::configure_project_autosave_policy,
@@ -1234,6 +1260,69 @@ mod tests {
                 prepared,
             );
         }
+    }
+
+    #[test]
+    fn accepted_study_execution_materializes_shared_fem_mesh_asset() {
+        let root = repo_root();
+        let workspace = tempfile::tempdir().expect("create accepted execution workspace");
+        let scene = load_scene_document_state(
+            &root,
+            workspace.path(),
+            &root.join("examples/fem_relax_gpu_smoke.py"),
+        )
+        .expect("export FEM smoke SceneDocument through Python");
+        let defaults = fullmag_authoring::StudyPlanMigrationDefaults {
+            model: fullmag_authoring::StudyModelReference {
+                model_id: "model:accepted-geometry-regression".into(),
+                version: "1".into(),
+            },
+            solver_config: fullmag_authoring::StudySolverConfigReference {
+                preset_id: "solver:accepted-geometry-regression".into(),
+                version: "1".into(),
+            },
+            discretization: fullmag_authoring::StudyDiscretizationReference {
+                recipe_id: "mesh:accepted-geometry-regression".into(),
+                version: "1".into(),
+            },
+            execution_profile: fullmag_authoring::StudyExecutionProfileReference {
+                profile_id: "exec:accepted-geometry-regression".into(),
+                version: "1".into(),
+            },
+        };
+        let study = fullmag_authoring::scene_document_to_study_plan(
+            &scene,
+            "study:accepted-geometry-regression".into(),
+            scene.revision,
+            &defaults,
+        )
+        .expect("project FEM SceneDocument to StudyPlan");
+        let requested_execution = fullmag_application::RequestedExecution {
+            backend: "auto".into(),
+            device: "auto".into(),
+            precision: "double".into(),
+            mode: "strict".into(),
+            minimum_resources: None,
+        };
+
+        let inputs = scene_document_to_study_execution_inputs(
+            &root,
+            workspace.path(),
+            &scene,
+            &requested_execution,
+            &study,
+        )
+        .expect("accepted execution should project prepared stage inputs");
+        assert!(!inputs.is_empty(), "FEM smoke StudyPlan should have a step");
+        assert!(
+            inputs.iter().all(|input| input
+                .problem
+                .geometry_assets
+                .as_ref()
+                .and_then(|assets| assets.fem_domain_mesh_asset.as_ref())
+                .is_some()),
+            "accepted execution must carry the materialized shared FEM mesh asset",
+        );
     }
 
     #[tokio::test]
