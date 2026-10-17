@@ -1672,7 +1672,8 @@ def _backend_start_inputs(
     cargo_profile = _cargo_profile_for_build(build_profile)
     repo = Path(args.repo_root).resolve(strict=True)
     selected, layout = _select_source(repo, getattr(args, "source_root", None))
-    compose_project = _compose_identity(layout)["project_name"]
+    compose_identity = _compose_identity(layout)
+    compose_project = compose_identity["project_name"]
     if run_root is None:
         resolved_run_id, resolved_root = _new_run_root(layout)
     else:
@@ -1719,6 +1720,10 @@ def _backend_start_inputs(
         backend_context.mkdir(parents=True, exist_ok=True)
         workspace_state_root = _workspace_state_root(layout, compose_project)
         build_state_root = _backend_build_state_root(layout, resolved_root)
+        # Resolve the Git common directory before any runtime image build or
+        # Compose interpolation.  The image build context validates this
+        # source bind before the long-lived backend service starts.
+        git_common = _source_git_common_directory(selected)
         placeholder_environment = {
             **_compose_identity_environment(layout),
             "FULLMAG_DEV_IMAGE": getattr(args, "image", None)
@@ -1734,6 +1739,7 @@ def _backend_start_inputs(
                 "FULLMAG_DEVELOPMENT_BASE_IMAGE", DEFAULT_BASE_IMAGE
             ),
             "FULLMAG_SOURCE_ROOT": str(selected),
+            "FULLMAG_SOURCE_GIT_COMMON": str(git_common),
             "FULLMAG_BACKEND_PACKAGE": str(resolved_root / "package"),
             "FULLMAG_STATE_ROOT": str(resolved_root / "state"),
             "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
@@ -1769,7 +1775,6 @@ def _backend_start_inputs(
         toolchain_id = str(base_info["toolchain_image_id"])
         helper_hashes = _image_helper_inventory(image_id, backend_context)
 
-        git_common = _source_git_common_directory(selected)
         source_for_environment = {
             "source_mode": "live-shadow-v1",
             "git_common_dir": str(git_common),

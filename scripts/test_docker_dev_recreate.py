@@ -451,6 +451,80 @@ class DockerDevRecreateContract(unittest.TestCase):
             self.assertEqual(environment["FULLMAG_SOURCE_GIT_COMMON"], "/opt/fullmag/source-git")
             self.assertNotIn("FULLMAG_BACKEND_SOURCE_MANIFEST", environment)
 
+    def test_backend_image_build_receives_git_common_before_first_compose_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            selected = root / "checkout"
+            run_root = root / "run"
+            for path in (repo, selected, run_root):
+                path.mkdir()
+            git_common_path = selected / ".git-common"
+            layout = {"repo_root": str(repo)}
+            identity = {
+                "project_name": "fullmag-worktree-early-env",
+                "project_id": "project-test",
+                "worktree_id": "worktree-test",
+                "checkout_kind": "worktree",
+            }
+            args = types.SimpleNamespace(
+                repo_root=repo,
+                source_root=None,
+                profile="dev",
+                source_manifest=None,
+                include_untracked=[],
+                image=None,
+                toolchain_image=None,
+            )
+            base_info = {
+                "reference": "fullmag/development-base:local",
+                "image_id": "sha256:" + "a" * 64,
+                "toolchain_image_id": "sha256:" + "b" * 64,
+                "toolchain_manifest_sha256": "c" * 64,
+            }
+            cache = {
+                "state": "ready",
+                "mount_root": "/mnt/fullmag-cache",
+                "package_root": "/mnt/fullmag-cache/package",
+                "environment": {"FULLMAG_BACKEND_PACKAGE": "/mnt/fullmag-cache/package"},
+                "compose_overlay": str(root / "cache-overlay.yaml"),
+            }
+            events = []
+
+            def resolve_git_common(_selected):
+                events.append("git-common")
+                return git_common_path
+
+            def runtime_image(_args, _repo, environment, *_rest):
+                events.append(("image-build", environment.get("FULLMAG_SOURCE_GIT_COMMON")))
+                return "fullmag/fullmag-dev:local", "sha256:" + "d" * 64, {}, False
+
+            compose_config = {
+                "services": {
+                    "backend": {"command": ["python", "backend_dev.py", "start"]},
+                    "frontend": {},
+                }
+            }
+            with patch.object(docker_dev, "_require_native_windows"), \
+                    patch.object(docker_dev, "_select_source", return_value=(selected, layout)), \
+                    patch.object(docker_dev, "_compose_identity", return_value=identity), \
+                    patch.object(docker_dev, "_compose_identity_environment", return_value={}), \
+                    patch.object(docker_dev, "_direct_heavy_lock", return_value=docker_dev.nullcontext()), \
+                    patch.object(docker_dev, "_workspace_state_root", return_value=root / "user-data"), \
+                    patch.object(docker_dev, "_backend_build_state_root", return_value=root / "build-state"), \
+                    patch.object(docker_dev, "_source_git_common_directory", side_effect=resolve_git_common), \
+                    patch.object(docker_dev, "_ensure_development_base", return_value=base_info), \
+                    patch.object(docker_dev, "_runtime_image_reference", side_effect=runtime_image), \
+                    patch.object(docker_dev, "_image_helper_inventory", return_value={}), \
+                    patch.object(docker_dev, "_prepare_backend_cache", return_value=cache), \
+                    patch.object(docker_dev, "_backend_cache_package_root", return_value=Path("/mnt/fullmag-cache/package")), \
+                    patch.object(docker_dev, "_environment", return_value={}), \
+                    patch.object(docker_dev, "_compose_config", return_value=compose_config):
+                docker_dev._backend_start_inputs(args, run_root=run_root, run_id="e" * 32,
+                                                 heavy_lock_held=True)
+
+            self.assertEqual(events, ["git-common", ("image-build", str(git_common_path))])
+
     def test_empty_owned_network_is_reusable_but_foreign_or_attached_is_rejected(self):
         project = "fullmag-worktree-network-test"
         identity = {
