@@ -932,6 +932,53 @@ fn required_observation<'a, T>(value: &'a fullmag_session::compute_node_snapshot
     }
 }
 
+fn docker_host_cpu_placements(
+    allowed_cpu_ids: &BTreeSet<u32>,
+    total_cpu_millis: u64,
+    compute_cpu_millis: u64,
+    preparation_cpu_millis: u64,
+) -> Result<(BTreeSet<u32>, BTreeSet<u32>)> {
+    if allowed_cpu_ids.is_empty() {
+        bail!(
+            "Docker host profile requires explicit OS-allowed CPU IDs for pinned compute and preparation placements"
+        );
+    }
+    if compute_cpu_millis == 0 || preparation_cpu_millis == 0 {
+        bail!("Docker host pinned compute and preparation CPU offers must be positive");
+    }
+    let requested_cpu_millis = compute_cpu_millis
+        .checked_add(preparation_cpu_millis)
+        .context("Docker host CPU offer budgets overflowed")?;
+    if requested_cpu_millis > total_cpu_millis {
+        bail!(
+            "Docker host CPU offers require {requested_cpu_millis} milli-CPUs but the bounded host capacity is {total_cpu_millis}"
+        );
+    }
+    let compute_cpu_count = usize::try_from(compute_cpu_millis.div_ceil(1000))
+        .context("Docker compute CPU placement count does not fit in usize")?;
+    let preparation_cpu_count = usize::try_from(preparation_cpu_millis.div_ceil(1000))
+        .context("Docker preparation CPU placement count does not fit in usize")?;
+    let required_cpu_count = compute_cpu_count
+        .checked_add(preparation_cpu_count)
+        .context("Docker CPU placement count overflowed")?;
+    if allowed_cpu_ids.len() < required_cpu_count {
+        bail!(
+            "Docker host profile requires {required_cpu_count} disjoint allowed CPU IDs for its pinned compute/preparation offers, observed {}",
+            allowed_cpu_ids.len()
+        );
+    }
+    let ordered_cpu_ids = allowed_cpu_ids.iter().copied().collect::<Vec<_>>();
+    let compute_cpu_ids = ordered_cpu_ids[..compute_cpu_count]
+        .iter()
+        .copied()
+        .collect();
+    let preparation_cpu_ids = ordered_cpu_ids[compute_cpu_count..required_cpu_count]
+        .iter()
+        .copied()
+        .collect();
+    Ok((compute_cpu_ids, preparation_cpu_ids))
+}
+
 fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     let args = parse_docker_host_init_args(args)?;
     let fixture_readiness = std::env::var("FULLMAG_DOCKER_HOST_READINESS_FIXTURE")
@@ -1107,8 +1154,21 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     let prep_offer_id = "docker-all.preparation.cpu".to_owned();
     let offer_cpu_millis = cpu_millis.min(1000).max(1);
     let offer_memory = memory_bytes.min(1024 * 1024 * 1024).max(1);
-    let cpu_offer_cpu_millis = cpu_millis.min(3000).max(1);
+    let cpu_offer_cpu_millis = cpu_millis
+        .saturating_sub(offer_cpu_millis)
+        .min(3000);
+    if cpu_offer_cpu_millis == 0 {
+        bail!(
+            "Docker host profile requires positive bounded compute CPU capacity after its preparation allocation"
+        );
+    }
     let cpu_offer_memory = memory_bytes.min(6 * 1024 * 1024 * 1024).max(1);
+    let (compute_cpu_ids, preparation_cpu_ids) = docker_host_cpu_placements(
+        &policy.allowed_cpu_ids,
+        cpu_millis,
+        cpu_offer_cpu_millis,
+        offer_cpu_millis,
+    )?;
     let offer_budget = |gpu_memory_bytes| FmsResourceBudget {
         cpu_millis: offer_cpu_millis,
         memory_bytes: offer_memory,
@@ -1128,9 +1188,7 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     let mut compute_placements = BTreeMap::from([(
         cpu_offer_id,
         RuntimeServiceHostPlacement {
-            // The host policy records the admissible CPU topology. The
-            // aggregate offer does not claim process-affinity enforcement.
-            cpu_ids: BTreeSet::new(),
+            cpu_ids: compute_cpu_ids.clone(),
             gpu_uuid: None,
         },
     )]);
@@ -1145,7 +1203,7 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         compute_placements.insert(
             resource_id,
             RuntimeServiceHostPlacement {
-                cpu_ids: BTreeSet::new(),
+                cpu_ids: compute_cpu_ids.clone(),
                 gpu_uuid: Some(uuid.clone()),
             },
         );
@@ -1162,7 +1220,7 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         compute_max_concurrency: 1,
         preparation_max_concurrency: 1,
         compute_placements,
-        preparation_cpu_ids: BTreeMap::from([(prep_offer_id.clone(), BTreeSet::new())]),
+        preparation_cpu_ids: BTreeMap::from([(prep_offer_id.clone(), preparation_cpu_ids)]),
     };
     let configuration = ServiceConfig {
         schema_version: RUNTIME_SERVICE_CONFIG_SCHEMA_V2.into(),
@@ -1726,6 +1784,46 @@ fn run_service(path: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_host_cpu_placements_are_sorted_disjoint_and_fail_closed() {
+        let allowed_cpu_ids = std::collections::BTreeSet::from([13, 2, 8, 4]);
+        let (compute_cpu_ids, preparation_cpu_ids) =
+            docker_host_cpu_placements(&allowed_cpu_ids, 4000, 3000, 1000).unwrap();
+        assert_eq!(compute_cpu_ids, std::collections::BTreeSet::from([2, 4, 8]));
+        assert_eq!(preparation_cpu_ids, std::collections::BTreeSet::from([13]));
+        assert!(compute_cpu_ids.is_disjoint(&preparation_cpu_ids));
+        assert!(compute_cpu_ids
+            .union(&preparation_cpu_ids)
+            .all(|cpu_id| allowed_cpu_ids.contains(cpu_id)));
+
+        let (non_integer_compute, non_integer_preparation) =
+            docker_host_cpu_placements(&allowed_cpu_ids, 3500, 2500, 1000).unwrap();
+        assert_eq!(non_integer_compute, compute_cpu_ids);
+        assert_eq!(non_integer_preparation, preparation_cpu_ids);
+
+        let two_cpu_ids = std::collections::BTreeSet::from([2, 13]);
+        let (two_compute, two_preparation) =
+            docker_host_cpu_placements(&two_cpu_ids, 2000, 1000, 1000).unwrap();
+        assert_eq!(two_compute, std::collections::BTreeSet::from([2]));
+        assert_eq!(two_preparation, std::collections::BTreeSet::from([13]));
+
+        let three_cpu_ids = std::collections::BTreeSet::from([2, 4, 8]);
+        let (three_compute, three_preparation) =
+            docker_host_cpu_placements(&three_cpu_ids, 3000, 2000, 1000).unwrap();
+        assert_eq!(three_compute, std::collections::BTreeSet::from([2, 4]));
+        assert_eq!(three_preparation, std::collections::BTreeSet::from([8]));
+
+        let undersized = std::collections::BTreeSet::from([2, 4, 8]);
+        assert!(docker_host_cpu_placements(&undersized, 4000, 3000, 1000).is_err());
+        let single_cpu = std::collections::BTreeSet::from([2]);
+        assert!(docker_host_cpu_placements(&single_cpu, 2000, 1000, 1000).is_err());
+        assert!(docker_host_cpu_placements(&single_cpu, 1000, 0, 1000).is_err());
+        assert!(
+            docker_host_cpu_placements(&std::collections::BTreeSet::new(), 4000, 3000, 1000,)
+                .is_err()
+        );
+    }
 
     #[test]
     fn sample_writer_busy_budget_allows_five_cycles_only() {

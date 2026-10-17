@@ -97,6 +97,17 @@ wersjonowanego rozszerzenia rejestracji generacji. Sama izolacja Compose
 nie jest dowodem obsługi tego scenariusza. Nie obchodzimy tej kontroli przez
 kopiowanie ledgeru ani zmianę tożsamości hosta na nazwę worktree.
 
+### Przydział CPU w profilu Dockera
+
+Generator profilu używa rzeczywistych CPU IDs dopuszczonych przez system
+kontenera. Przydział compute jest wspólny dla ofert CPU i GPU, ponieważ pula
+compute wykonuje najwyżej jedno zadanie naraz. Przygotowanie FEM otrzymuje
+rozłączny przydział CPU. Budżety pozostają ograniczone pojemnością hosta,
+a przydziały mają wystarczającą liczbę rdzeni także dla niecałkowitych limitów
+CPU. Brak wystarczających zasobów zatrzymuje inicjalizację z błędem; nie tworzy
+pustego przydziału i nie wyłącza kontroli powinowactwa procesu. Rezerwacja GPU
+nadal wskazuje dokładny fizyczny UUID i korzysta ze wspólnego ledgera.
+
 ## Home i gotowość wykonania
 
 Home jest niezależnym ekranem startowym aplikacji. Jego widoczność, układ oraz
