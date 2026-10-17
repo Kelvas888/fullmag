@@ -226,7 +226,7 @@ def stage_dependency_roots(repo, layout, binding_path, expected_sha256, source_d
     }
 
 
-def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
+def run(repo: Path, port: int, scenario: str = "pinned-dataset", dependency_workspace: Path | None = None):
     if scenario not in SCENARIOS:
         raise storage.StorageError("Unknown fixed browser fixture scenario")
     if scenario == "artifact-field-overlay" and port != 3276:
@@ -266,13 +266,15 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
     node = shutil.which("node")
     binding_path = os.environ.get("FULLMAG_BROWSER_DEPENDENCY_BINDING")
     binding_sha256 = os.environ.get("FULLMAG_BROWSER_DEPENDENCY_BINDING_SHA256")
+    if dependency_workspace is not None and binding_path:
+        raise storage.StorageError("Choose a native dependency workspace or a stage binding, not both")
     if bool(binding_path) != bool(binding_sha256):
         raise storage.StorageError("A dependency binding requires its explicit SHA256; no fallback")
     if not node or not smoke.is_file():
         raise storage.StorageError("Existing Node and pinned dataset smoke are required; no bootstrap")
     dependencies = app / "node_modules"
     real_dependencies = dependencies.resolve()
-    if not binding_path and not (real_dependencies == dependencies or
+    if dependency_workspace is None and not binding_path and not (real_dependencies == dependencies or
             storage.inside(real_dependencies, Path(layout["frontend_root"]).resolve())):
         raise storage.StorageError("Frontend dependencies belong to a different checkout")
     with socket.socket() as probe:
@@ -290,6 +292,14 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
             real_dependencies, stage_root_dependencies, dependency_stage_proof = stage_dependency_roots(
                 repo, layout, binding_path, binding_sha256, before,
             )
+        native_dependency_before = None
+        if dependency_workspace is not None:
+            from frontend_source_workspace import SOURCE_CHECK_PROFILE, validate_dependency_workspace
+            dependency_layout = storage.resolve_layout(repo, SOURCE_CHECK_PROFILE)
+            native_dependency_before = validate_dependency_workspace(repo, dependency_layout, dependency_workspace)
+            real_dependencies = Path(native_dependency_before["dependency_app_node_modules"])
+            stage_root_dependencies = Path(native_dependency_before["dependency_root_node_modules"])
+            dependency_stage_proof = native_dependency_before
         next_cli = real_dependencies / "next/dist/bin/next"
         if not next_cli.is_file():
             raise storage.StorageError("Existing Next is required; no bootstrap")
@@ -452,6 +462,14 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                     receipt["dependency_stage_revalidated"] = True
                 except (OSError, ValueError, KeyError, storage.StorageError) as error:
                     receipt.update(state="failed", exit_code=1, dependency_stage_error=str(error))
+            if dependency_workspace is not None:
+                try:
+                    native_dependency_after = validate_dependency_workspace(repo, dependency_layout, dependency_workspace)
+                    if native_dependency_after != native_dependency_before:
+                        raise storage.StorageError("Native dependency workspace changed during browser verification")
+                    receipt["dependency_stage_revalidated"] = True
+                except (OSError, RuntimeError, ValueError) as error:
+                    receipt.update(state="failed", exit_code=1, dependency_stage_error=str(error))
             if api_target:
                 try:
                     after_target = managed_browser_target(repo, api_target["receipt"], api_target["receipt_sha256"])
@@ -475,6 +493,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--port", type=int)
+    parser.add_argument("--dependency-workspace", type=Path)
     parser.add_argument("--scenario", choices=tuple(SCENARIOS), default="pinned-dataset")
     args = parser.parse_args()
     port = args.port if args.port is not None else {
@@ -487,4 +506,4 @@ if __name__ == "__main__":
     }.get(args.scenario, 3250)
     if not 1 <= port <= 65535:
         parser.error("port must be between 1 and 65535")
-    raise SystemExit(run(args.repo_root.resolve(), port, args.scenario))
+    raise SystemExit(run(args.repo_root.resolve(), port, args.scenario, args.dependency_workspace))
