@@ -15,11 +15,12 @@ export interface TensorFieldDescriptor {
 export function isFlowMajorTensorDescriptor(
   value: TensorFieldDescriptor | null | undefined,
 ): value is TensorFieldDescriptor {
-  return value?.rank === 2 && value.shape.length === 2 &&
+  return value?.rank === 2 && Array.isArray(value.shape) && value.shape.length === 2 &&
     value.shape[0] === 3 && value.shape[1] === 3 &&
-    value.layout === "flow_major" && value.axes.length === 2 &&
+    value.layout === "flow_major" && Array.isArray(value.axes) && value.axes.length === 2 &&
     value.axes[0] === "flow" && value.axes[1] === "spin" &&
-    value.component_labels.length === 9;
+    Array.isArray(value.component_labels) && value.component_labels.length === 9 &&
+    value.component_labels.every((label) => typeof label === "string" && label.trim().length > 0);
 }
 
 export function normalizeTensorProjection(value: unknown): TensorProjectionToken | null {
