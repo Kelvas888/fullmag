@@ -136,7 +136,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
       <AntennaSamplingResolution transform={resource && "transform" in resource ? resource.transform : ""} values={{ extentUM: values.extentUM ?? "", extentVM: values.extentVM ?? "", samplesU: values.samplesU ?? "", samplesV: values.samplesV ?? "" }} />
       {choice("windowKind", "Window", ["rectangular", "hann", "hamming", "blackman"].map((value): [string, string] => [value, value]))}
       {choice("normalization", "Normalization", [["integral_si", "Integral SI"], ["unitary_discrete", "Unitary discrete"]])}
-      {choice("component", "Component", ["x", "y", "z", "u", "v", "normal", "vector_power"].map((value): [string, string] => [value, value]))}
+      {choice("component", "Component", [...["x", "y", "z", "u", "v", "normal", "vector_power"].map((value): [string, string] => [value, value]), ...(resource && "component" in resource && resource.component === "transverse" ? [["transverse", "Transverse (equilibrium projection)"] as [string, string]] : [])])}
       {choice("outsidePolicy", "Outside domain", [["error", "Fail request"], ["zero", "Explicit zero outside"]])}
       <p className="fm-inspector-hint">Source spatial FFT only. Interpolation and immutable request/output IDs remain unchanged. Saving does not qualify or publish a spectrum.</p>
     </> : null}
