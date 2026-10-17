@@ -123,7 +123,8 @@ describe("AntennaSourceSpectrumPayloadView", () => {
           />,
         ),
       );
-      expect(container.textContent).toContain("Source FFT power");
+      expect(container.textContent).toContain("Source FFT · |H̃|²");
+      expect(container.textContent).toContain("squared field magnitude, not watts");
       expect(container.textContent).toContain(
         "per 1 A port-current basis; drive waveform not applied",
       );
@@ -135,6 +136,61 @@ describe("AntennaSourceSpectrumPayloadView", () => {
       const firstCell = firstByRole(container as unknown as TestNode, "gridcell");
       expect(firstCell?.getAttribute("aria-label")).toContain("(A/m/A)^2");
       expect(firstCell?.getAttribute("title")).toContain("(A/m/A)^2");
+      const grid = firstByRole(container as unknown as TestNode, "grid");
+      const zoomIn = firstByRoleAndText(container as unknown as TestNode, "button", "Zoom in");
+      await act(async () => zoomIn?.click());
+      expect(grid?.style.transform).toContain("scale(2)");
+      expect(countByRole(container as unknown as TestNode, "gridcell")).toBe(4);
+      expect(container.textContent).toContain("Zoom 2×");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("draws bounded extrema-preserving cuts and applies logarithmic power scale", async () => {
+    const kU = Array.from({ length: 1025 }, (_, index) => index);
+    const power = Array<number>(kU.length).fill(0);
+    power[518] = 100;
+    mocks.payloads = {
+      k_u_rad_per_m: readyPayload(kU, "etag-ku"),
+      k_v_rad_per_m: readyPayload([0], "etag-kv"),
+      amplitudes_re_im: readyPayload(power.flatMap((value) => [Math.sqrt(value), 0]), "etag-amplitudes"),
+      power: readyPayload(power, "etag-power"),
+    };
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <AntennaSourceSpectrumPayloadView
+          outputId="spectrum-1"
+          spectrum={spectrumFixture({
+            k_u_count: kU.length,
+            k_v_count: 1,
+            power_count: power.length,
+            amplitude_count: power.length,
+          })}
+        />,
+      ));
+
+      const logRadio = firstByRoleAndText(container as unknown as TestNode, "radio", "Log");
+      expect(logRadio?.getAttribute("aria-disabled")).toBeNull();
+      expect(allByRole(container as unknown as TestNode, "img")).toHaveLength(2);
+      const uChart = allByRole(container as unknown as TestNode, "img")
+        .find((chart) => chart.getAttribute("aria-label")?.startsWith("u cut at k_v"));
+      const label = uChart?.getAttribute("aria-label") ?? "";
+      const plottedCount = Number(/; (\d+) plotted points from 1025 samples/.exec(label)?.[1]);
+      expect(plottedCount).toBeGreaterThan(0);
+      expect(plottedCount).toBeLessThanOrEqual(512);
+      expect(firstByTagName(uChart ?? container as unknown as TestNode, "path")
+        ?.getAttribute("d")).toContain("202.75,12.00");
+      expect(uChart?.querySelector("circle")).toBeDefined();
+
+      await act(async () => logRadio?.click());
+      expect(logRadio?.getAttribute("aria-checked")).toBe("true");
+      expect(container.textContent).toContain("Logarithmic squared-field scale");
+      expect(container.textContent).toContain("zero-value samples are omitted, leaving gaps");
     } finally {
       await act(async () => root.unmount());
       dom.restore();
@@ -509,6 +565,34 @@ function firstByRole(root: TestNode, role: string): TestElement | null {
   }
   for (const child of root.childNodes) {
     const match = firstByRole(child, role);
+    if (match) return match;
+  }
+  return null;
+}
+
+function allByRole(root: TestNode, role: string): TestElement[] {
+  const matches: TestElement[] = [];
+  if (root instanceof TestElement && root.getAttribute("role") === role) {
+    matches.push(root);
+  }
+  for (const child of root.childNodes) matches.push(...allByRole(child, role));
+  return matches;
+}
+
+function firstByRoleAndText(root: TestNode, role: string, text: string): TestElement | null {
+  if (root instanceof TestElement && root.getAttribute("role") === role &&
+      root.textContent === text) return root;
+  for (const child of root.childNodes) {
+    const match = firstByRoleAndText(child, role, text);
+    if (match) return match;
+  }
+  return null;
+}
+
+function firstByTagName(root: TestNode, tagName: string): TestElement | null {
+  if (root instanceof TestElement && root.tagName === tagName.toUpperCase()) return root;
+  for (const child of root.childNodes) {
+    const match = firstByTagName(child, tagName);
     if (match) return match;
   }
   return null;
