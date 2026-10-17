@@ -572,7 +572,7 @@ mod host_binding_tests {
             .unwrap_err();
         assert!(
             format!("{after_binding:#}")
-                .contains("host admission requires a pinned compute-node owner ID and epoch"),
+                .contains("v4 host admission requires a pinned compute-node owner"),
             "bound claim must pass the host-binding guard before the next v2 fence: {after_binding:#}"
         );
         let binding = bound.host_launch_binding.unwrap();
