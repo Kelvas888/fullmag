@@ -212,11 +212,20 @@ def initialize_host_storage(layout, volume_probe):
     volume_probe(root)
 
 
+def compose_project(layout, *, direct_development=False):
+    """Bind development dependency builds to the registered checkout group."""
+    if not direct_development:
+        return "fullmag-toolchain"
+    from docker_compose_identity import compose_project_identity
+    return compose_project_identity(layout)["project_name"]
+
+
 def build(repo, *, direct_development=False):
     if os.name != "nt":
         raise BootstrapError("Use PowerShell in the Windows checkout for this host bootstrap")
     repo = Path(repo).resolve(strict=True)
     layout = storage.resolve_layout(repo, PROFILE)
+    project_name = compose_project(layout, direct_development=direct_development)
     from windows_folder_host import local_volume
     local_volume(repo)
     if docker("info", "--format", "{{.OSType}}").strip() != "linux":
@@ -241,15 +250,18 @@ def build(repo, *, direct_development=False):
                    "source_commit": storage.git(repo, "rev-parse", "HEAD"),
                    "context_root": str(context), "receipt_path": str(receipt_path),
                    "qualification": "NOT VERIFIED",
-                   "build_route": "direct-development" if direct_development else "fresh-host-enrollment"}
+                   "build_route": "direct-development" if direct_development else "fresh-host-enrollment",
+                   "compose_project": project_name}
         storage.atomic_json(receipt_path, receipt)
         storage.atomic_json(admission_path, receipt)
         try:
             manifest = capture_inputs(repo, context)
             receipt["source_inputs"] = manifest
-            definitions = ["compose", "--project-directory", str(context), "-f",
+            definitions = ["compose", "--project-name", project_name, "--project-directory", str(context), "-f",
                            str(context / "compose.toolchain.yaml"), "--profile", "toolchain"]
             configured = json.loads(docker(*definitions, "config", "--format", "json"))
+            if configured.get("name") != project_name:
+                raise BootstrapError("Dependency Compose lost the selected checkout project")
             if set(configured.get("services", {})) != {SERVICE}:
                 raise BootstrapError("Unexpected dependency Compose services")
             service = configured["services"][SERVICE]
@@ -263,7 +275,7 @@ def build(repo, *, direct_development=False):
                            compose_sha256=hashlib.sha256(spec.read_bytes()).hexdigest())
             storage.atomic_json(receipt_path, receipt)
             storage.atomic_json(admission_path, receipt)
-            code = storage.run(layout, ["docker", "--context", "desktop-linux", "compose", "-f", str(spec),
+            code = storage.run(layout, ["docker", "--context", "desktop-linux", "compose", "--project-name", project_name, "-f", str(spec),
                                         "--profile", "toolchain", "build", SERVICE])
             receipt["exit_code"] = code
             if code:
@@ -278,7 +290,10 @@ def build(repo, *, direct_development=False):
                            image_id=immutable, manifest_probe_container=probe_name)
             storage.atomic_json(receipt_path, receipt)
             storage.atomic_json(admission_path, receipt)
-            raw_manifest = docker("run", "--rm", "--name", probe_name, "--network", "none",
+            raw_manifest = docker("run", "--rm", "--name", probe_name,
+                                  "--label", "com.docker.compose.project=" + project_name,
+                                  "--label", "com.docker.compose.service=toolchain-manifest-probe",
+                                  "--network", "none",
                                   "--runtime", "runc", "--read-only", "--cap-drop", "ALL",
                                   "--security-opt", "no-new-privileges:true", "--user", "65532:65532",
                                   "--pids-limit", "16", "--memory", "64m", "--cpus", "0.25",

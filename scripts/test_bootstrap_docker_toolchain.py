@@ -34,6 +34,27 @@ class ToolchainBootstrapTests(unittest.TestCase):
         self.storage = self.root / "storage"
         (self.storage / "index").mkdir(parents=True)
 
+    def test_direct_dependency_build_uses_main_checkout_group(self):
+        layout = {"repo_root": str(self.repo), "worktree_id": "main-123",
+                  "env": {"FULLMAG_PROJECT_ID": "fullmag-test"}}
+        with mock.patch.object(bootstrap.storage, "worktree_records",
+                               return_value=[{"worktree": str(self.repo)}]):
+            self.assertEqual(bootstrap.compose_project(layout, direct_development=True),
+                             "fullmag-master")
+
+    def test_direct_dependency_build_uses_selected_worktree_group(self):
+        layout = {"repo_root": str(self.repo), "worktree_id": "feature-abc123",
+                  "env": {"FULLMAG_PROJECT_ID": "fullmag-test"}}
+        with mock.patch.object(bootstrap.storage, "worktree_records",
+                               return_value=[{"worktree": str(self.root / "main")} ]):
+            self.assertEqual(bootstrap.compose_project(layout, direct_development=True),
+                             "fullmag-worktree-feature-abc123")
+        self.assertEqual(bootstrap.compose_project(layout), "fullmag-toolchain")
+
+    def test_invalid_checkout_binding_cannot_fall_back_to_shared_toolchain_group(self):
+        with self.assertRaises(ValueError):
+            bootstrap.compose_project({}, direct_development=True)
+
     def test_new_storage_is_initialized_after_existing_parent_volume_admission(self):
         target = self.root / "not-created" / "storage"
         probes = []
