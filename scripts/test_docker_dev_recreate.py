@@ -27,31 +27,29 @@ class DockerDevRecreateContract(unittest.TestCase):
         self.assertEqual(parsed.port, 4242)
         self.assertIsNone(parsed.script)
 
-    def test_pnpm_patch_paths_are_bounded_checkout_relative_inputs(self):
-        package = json.dumps({
-            "pnpm": {
-                "patchedDependencies": {
-                    "next@16.3.8": "patches/next@16.3.8.patch",
-                },
-            },
-        }).encode()
-        self.assertEqual(
-            development_inputs._pnpm_patch_relatives(package),
-            (Path("patches/next@16.3.8.patch"),),
-        )
-        for raw_path in (
-            "../outside.patch",
-            "/tmp/next.patch",
-            "patches\\next.patch",
-            "patches/../next.patch",
-            "vendor/next.patch",
-        ):
-            with self.subTest(raw_path=raw_path), self.assertRaises(ValueError):
-                development_inputs._pnpm_patch_relatives(json.dumps({
-                    "pnpm": {"patchedDependencies": {"next@16.3.8": raw_path}},
-                }).encode())
+    def test_pnpm_patch_tree_collects_regular_files_without_manifest_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "checkout"
+            patches = source / "patches"
+            (patches / "nested").mkdir(parents=True)
+            (patches / "next.patch").write_bytes(b"next\n")
+            (patches / "nested" / "router.patch").write_bytes(b"router\n")
+            (patches / "README.md").write_text("notes\n", encoding="utf-8")
+            self.assertEqual(
+                development_inputs._pnpm_patch_relatives(source),
+                (Path("patches/nested/router.patch"), Path("patches/next.patch")),
+            )
 
-    def test_frontend_seed_freezes_declared_pnpm_patch_and_rejects_missing(self):
+    def test_pnpm_patch_tree_rejects_reparse_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "checkout"
+            patches = source / "patches"
+            patches.mkdir(parents=True)
+            (patches / "linked.patch").symlink_to(source / "outside.patch")
+            with self.assertRaisesRegex(ValueError, "reparse point"):
+                development_inputs._pnpm_patch_relatives(source)
+
+    def test_frontend_seed_freezes_pnpm_patch_tree_and_ignores_non_patch_notes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "checkout"
@@ -122,30 +120,29 @@ class DockerDevRecreateContract(unittest.TestCase):
                                  side_effect=lambda path, maximum: Path(path).read_bytes()), \
                     patch.object(development_inputs.storage, "git", return_value="a" * 40):
                 unreferenced_inputs = development_inputs.seed(source, unknown_state, 3197)
-            self.assertEqual(
+            self.assertNotEqual(
                 unreferenced_inputs["dependency_seed_sha256"],
                 inputs["dependency_seed_sha256"],
             )
             self.assertNotIn("patches/README.md", {
                 item["relative"] for item in unreferenced_inputs["files"]
             })
-            self.assertNotIn("patches/unregistered.patch", {
+            self.assertIn("patches/unregistered.patch", {
                 item["relative"] for item in unreferenced_inputs["files"]
             })
             self.assertNotIn("patches/README.md", unreferenced_inputs["dependency_seed_files"])
-            self.assertNotIn("patches/unregistered.patch", unreferenced_inputs["dependency_seed_files"])
+            self.assertIn("patches/unregistered.patch", unreferenced_inputs["dependency_seed_files"])
             readme_path.unlink()
             unknown_path.unlink()
 
-            patch_path.unlink()
-            missing_state = root / "missing-state"
-            with patch.object(development_inputs, "os", native_test_os), \
-                    patch.object(development_inputs, "local_volume", side_effect=lambda path: str(path)), \
-                    patch.object(development_inputs, "read_owned_regular",
-                                 side_effect=lambda path, maximum: Path(path).read_bytes()), \
-                    patch.object(development_inputs.storage, "git", return_value="a" * 40):
-                with self.assertRaisesRegex(ValueError, "Declared pnpm patch file is missing"):
-                    development_inputs.seed(source, missing_state, 3197)
+            self.assertEqual(
+                sorted(unreferenced_inputs["dependency_seed_files"]),
+                sorted({
+                    "apps/control-room/package.json", "package.json", "pnpm-lock.yaml",
+                    "pnpm-workspace.yaml",
+                    "patches/next@16.3.8.patch", "patches/unregistered.patch",
+                }),
+            )
 
     def test_live_service_rejects_frozen_source_options_explicitly(self):
         base = types.SimpleNamespace(
