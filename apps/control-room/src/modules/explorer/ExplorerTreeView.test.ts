@@ -440,7 +440,7 @@ describe("flattenVisibleExplorerRows", () => {
     expect(css).toContain(".fm-explorer-tree-row__label {\n  min-width: 0;");
     expect(css.indexOf("/* Compact metadata keeps deep object/resource names readable in docked panels."))
       .toBeGreaterThan(css.indexOf("/* Active field badge */"));
-    expect(explorerTreeViewSource).toContain('if (node.badge) tooltipParts.push(`— ${node.badge}`)');
+    expect(explorerTreeViewSource).toContain('if (node.badge) tooltipParts.push(`â€” ${node.badge}`)');
     expect(explorerTreeViewSource).toContain('className="fm-explorer-node-tooltip">{tooltipParts.join(" ")}');
     expect(explorerTreeViewSource).toContain('aria-describedby={tooltipParts.length > 1 ? statusReasonId : undefined}');
   });
