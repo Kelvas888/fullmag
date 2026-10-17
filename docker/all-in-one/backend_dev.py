@@ -73,6 +73,8 @@ PACKAGE_DEVELOPMENT_SCHEMA = "fullmag.direct-compose.package-development.v1"
 PACKAGE_DEVELOPMENT_OWNER = "owner.json"
 PACKAGE_CANDIDATES_DIRNAME = "candidates"
 PACKAGE_BACKUPS_DIRNAME = "backups"
+PACKAGE_RETENTION_ARCHIVE_DIRNAME = "retired"
+PACKAGE_RETENTION_SCHEMA = "fullmag.direct-compose.package-retention.v1"
 OWNER_MARKER = ".fullmag-direct-backend-owner.json"
 WORKSPACE_INVENTORY_SCHEMA = "fullmag.direct-compose.workspace-inventory.v1"
 RUNTIME_LOCK_NAME = ".fullmag-backend-runtime.lock"
@@ -156,10 +158,13 @@ def _log_phase(phase: str, state: str, **fields: object) -> None:
     allowed_fields = frozenset(
         {
             "bytes",
+            "cache_mount",
             "duration_ms",
             "error",
             "exit_code",
+            "estimated_bytes",
             "files",
+            "free_bytes",
             "mode",
             "profile",
             "reason",
@@ -343,6 +348,94 @@ def _remove_owned_tree(path: Path) -> None:
         _fail(f"owned workspace contains a special file: {path}")
 
 
+def _assert_safe_tree(path: Path, name: str) -> None:
+    """Reject links, reparse points, and special files before retention work."""
+
+    path = _absolute(path, name)
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        _fail(f"{name} contains a link or reparse point: {path}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        _fail(f"{name} is not a directory: {path}")
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        try:
+            children = tuple(current.iterdir())
+        except OSError as error:
+            _fail(f"cannot inspect {name}: {error}")
+        for child in children:
+            child_metadata = child.lstat()
+            if stat.S_ISLNK(child_metadata.st_mode) or bool(
+                getattr(child_metadata, "st_file_attributes", 0) & 0x400
+            ):
+                _fail(f"{name} contains a link or reparse point: {child}")
+            if stat.S_ISDIR(child_metadata.st_mode):
+                pending.append(child)
+            elif not stat.S_ISREG(child_metadata.st_mode):
+                _fail(f"{name} contains a special file: {child}")
+
+
+def _fsync_directory(path: Path, name: str) -> None:
+    """Make directory-entry publication durable on the package mount."""
+
+    path = _absolute(path, name)
+    _assert_no_links(path, name)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        _fail(f"cannot open {name} for durability: {error}")
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        _fail(f"cannot fsync {name}: {error}")
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_owned_tree(
+    path: Path, name: str, *, excluded_children: frozenset[str] = frozenset()
+) -> None:
+    """Durably sync one verified package tree without hashing it again."""
+
+    path = _absolute(path, name)
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        _fail(f"{name} contains a link or reparse point: {path}")
+    if stat.S_ISREG(metadata.st_mode):
+        descriptor = _open_regular(path, name, None)
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            _fail(f"cannot fsync {name}: {error}")
+        finally:
+            os.close(descriptor)
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        _fail(f"{name} contains a special file: {path}")
+    try:
+        children = tuple(sorted(path.iterdir(), key=lambda child: child.name))
+    except OSError as error:
+        _fail(f"cannot inspect {name}: {error}")
+    for child in children:
+        child_metadata = child.lstat()
+        if stat.S_ISLNK(child_metadata.st_mode) or bool(
+            getattr(child_metadata, "st_file_attributes", 0) & 0x400
+        ):
+            _fail(f"{name} contains a link or reparse point: {child}")
+        if child.name in excluded_children:
+            if not stat.S_ISDIR(child_metadata.st_mode):
+                _fail(f"{name} excluded child is not a directory: {child}")
+            continue
+        _fsync_owned_tree(child, f"{name}/{child.name}")
+    _fsync_directory(path, name)
+
+
 def _ensure_package_development_root(output: Path) -> Path:
     """Create and validate the private control tree inside the package mount."""
 
@@ -352,10 +445,12 @@ def _ensure_package_development_root(output: Path) -> Path:
     owner = control / PACKAGE_DEVELOPMENT_OWNER
     candidates = control / PACKAGE_CANDIDATES_DIRNAME
     backups = control / PACKAGE_BACKUPS_DIRNAME
+    retired = control / PACKAGE_RETENTION_ARCHIVE_DIRNAME
     allowed = {
         PACKAGE_DEVELOPMENT_OWNER,
         PACKAGE_CANDIDATES_DIRNAME,
         PACKAGE_BACKUPS_DIRNAME,
+        PACKAGE_RETENTION_ARCHIVE_DIRNAME,
     }
     try:
         entries = tuple(control.iterdir())
@@ -394,6 +489,7 @@ def _ensure_package_development_root(output: Path) -> Path:
         )
     _ensure_directory(candidates, "backend package candidate directory")
     _ensure_directory(backups, "backend package backup directory")
+    _ensure_directory(retired, "backend package retention archive directory")
     return control
 
 
@@ -1670,6 +1766,59 @@ def _validated_package(
     )
 
 
+def _preflight_candidate_storage(build_root: Path, receipt: Mapping[str, Any]) -> None:
+    """Reject a known-too-small cache before starting an expensive rebuild.
+
+    The verified package artifacts provide only a lower bound for the next
+    candidate.  Compiler scratch, incremental state, and changed artifacts can
+    require more space, so passing this check never guarantees the build will
+    fit.
+    """
+
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        _fail("verified backend receipt has no artifact sizes for cache preflight")
+    estimated_bytes = 0
+    for index, artifact in enumerate(artifacts):
+        if not isinstance(artifact, Mapping):
+            _fail(f"verified backend receipt artifact {index} is not an object")
+        size = artifact.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            _fail(f"verified backend receipt artifact {index} has an invalid size")
+        estimated_bytes += size
+    try:
+        usage = os.statvfs(build_root)
+    except OSError as error:
+        _fail(f"cannot inspect backend cache space at {build_root}: {error}")
+    if usage.f_frsize <= 0 or usage.f_bavail < 0:
+        _fail(f"backend cache space probe returned invalid values at {build_root}")
+    free_bytes = usage.f_bavail * usage.f_frsize
+    _log_phase(
+        "space",
+        "preflight",
+        cache_mount=str(build_root),
+        free_bytes=free_bytes,
+        estimated_bytes=estimated_bytes,
+    )
+    if free_bytes < estimated_bytes:
+        _log_phase(
+            "space",
+            "rejected",
+            cache_mount=str(build_root),
+            free_bytes=free_bytes,
+            estimated_bytes=estimated_bytes,
+            reason="verified-artifact-lower-bound-exceeds-free-space",
+        )
+        _fail(
+            "insufficient backend cache space before rebuild: "
+            f"cache_mount={build_root} free_bytes={free_bytes} "
+            f"estimated_candidate_artifact_bytes={estimated_bytes}; "
+            "estimate uses the previous verified receipt and excludes compiler "
+            "scratch or larger changed outputs, so it is only a lower bound; "
+            "previous package and cache were preserved"
+        )
+
+
 BACKEND_BUILD_IDENTITY_FIELDS = (
     "cargo_profile",
     "cargo_target_profile_dir",
@@ -1882,6 +2031,424 @@ def _rotate_package(
         if isinstance(error, BackendBuildError):
             raise
         _fail(f"backend package publication failed: {error}")
+
+
+def _retention_receipt_identity(
+    receipt: Mapping[str, Any], name: str
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Validate the identity fields used to join a backup to this cache chain."""
+
+    source = receipt.get("source")
+    native = receipt.get("native_source_identity")
+    toolchain = receipt.get("toolchain")
+    build = receipt.get("build")
+    if not isinstance(source, Mapping) or not isinstance(native, Mapping):
+        _fail(f"{name} has incomplete source identity")
+    if not isinstance(toolchain, Mapping) or not isinstance(build, Mapping):
+        _fail(f"{name} has incomplete build identity")
+    source_mode = source.get("source_mode")
+    commit = source.get("resolved_commit")
+    source_digest = source.get("source_digest")
+    source_snapshot = source.get("source_snapshot_sha256")
+    native_snapshot = native.get("source_snapshot_sha256")
+    native_digest = receipt.get("native_source_identity_sha256")
+    image_id = toolchain.get("image_id")
+    if (
+        not isinstance(source_mode, str)
+        or not source_mode
+        or not isinstance(commit, str)
+        or not GIT_OBJECT_RE.fullmatch(commit)
+        or not isinstance(source_digest, str)
+        or not SHA256_RE.fullmatch(source_digest)
+        or not isinstance(source_snapshot, str)
+        or not SHA256_RE.fullmatch(source_snapshot)
+        or native_snapshot != source_snapshot
+        or not isinstance(native_digest, str)
+        or native_digest != _sha256_bytes(_canonical(native))
+        or not isinstance(image_id, str)
+        or not IMAGE_RE.fullmatch(image_id)
+    ):
+        _fail(f"{name} has an invalid source or toolchain identity")
+    for field in BACKEND_BUILD_IDENTITY_FIELDS:
+        if field not in build:
+            _fail(f"{name} is missing build identity field {field}")
+    return source_mode, dict(build), dict(toolchain)
+
+
+def _retention_child_names(value: object, name: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        _fail(f"{name} child list is invalid")
+    result = [str(item) for item in value]
+    if len(result) != len(set(result)):
+        _fail(f"{name} child list contains duplicates")
+    if any(
+        not item
+        or item in {".", ".."}
+        or "/" in item
+        or "\\" in item
+        for item in result
+    ):
+        _fail(f"{name} child list contains an unsafe path")
+    return result
+
+
+def _validate_retention_archives(archive_root: Path) -> None:
+    """Validate archives left by earlier successful retention passes."""
+
+    try:
+        entries = tuple(sorted(archive_root.iterdir(), key=lambda path: path.name))
+    except OSError as error:
+        _fail(f"cannot inspect backend package retention archive: {error}")
+    for archive in entries:
+        if not re.fullmatch(r"\.backend-package-backup-[A-Za-z0-9._-]+", archive.name):
+            _fail(f"backend package retention archive has an unknown entry: {archive.name}")
+        _assert_safe_tree(archive, f"backend package retention archive {archive.name}")
+        manifest, _ = _read_json(
+            archive / "retention.json",
+            f"backend package retention archive {archive.name} manifest",
+            1024 * 1024,
+        )
+        if (
+            manifest.get("schema") != PACKAGE_RETENTION_SCHEMA
+            or manifest.get("state") != "succeeded"
+            or manifest.get("backup_name") != archive.name
+        ):
+            _fail(f"backend package retention archive {archive.name} manifest is invalid")
+        receipt_sha = manifest.get("receipt_sha256")
+        rotation_sha = manifest.get("rotation_sha256")
+        current_sha = manifest.get("current_receipt_sha256")
+        if (
+            not isinstance(receipt_sha, str)
+            or not SHA256_RE.fullmatch(receipt_sha)
+            or not isinstance(rotation_sha, str)
+            or not SHA256_RE.fullmatch(rotation_sha)
+            or not isinstance(current_sha, str)
+            or not SHA256_RE.fullmatch(current_sha)
+        ):
+            _fail(f"backend package retention archive {archive.name} has invalid hashes")
+        metadata = manifest.get("metadata")
+        if not isinstance(metadata, list) or not metadata:
+            _fail(f"backend package retention archive {archive.name} has no metadata")
+        expected = {"retention.json"}
+        metadata_by_path: dict[str, Mapping[str, Any]] = {}
+        for index, record in enumerate(metadata):
+            if not isinstance(record, Mapping):
+                _fail(f"backend package retention archive metadata {index} is invalid")
+            path = record.get("path")
+            size = record.get("size")
+            digest = record.get("sha256")
+            if (
+                not isinstance(path, str)
+                or path not in {"backend-build-receipt.json", "rotation.json", "direct-backend-build.log"}
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+                or not isinstance(digest, str)
+                or not SHA256_RE.fullmatch(digest)
+                or path in expected
+            ):
+                _fail(f"backend package retention archive metadata {index} is invalid")
+            expected.add(path)
+            metadata_by_path[path] = record
+            observed_digest, observed_stat = _sha256_file(
+                archive / path,
+                f"backend package retention archive {archive.name}/{path}",
+                MAX_SOURCE_BYTES,
+            )
+            if observed_stat.st_size != size or observed_digest != digest:
+                _fail(f"backend package retention archive {archive.name}/{path} changed")
+        required_metadata = {"backend-build-receipt.json", "rotation.json"}
+        if not required_metadata.issubset(metadata_by_path):
+            _fail(f"backend package retention archive {archive.name} is missing receipt metadata")
+        if (
+            metadata_by_path["backend-build-receipt.json"]["sha256"]
+            != manifest.get("receipt_sha256")
+            or metadata_by_path["rotation.json"]["sha256"]
+            != manifest.get("rotation_sha256")
+        ):
+            _fail(f"backend package retention archive {archive.name} metadata hashes are unbound")
+        actual = {child.name for child in archive.iterdir()}
+        if actual != expected:
+            _fail(f"backend package retention archive {archive.name} has unexpected files")
+
+
+def _copy_regular_file_fsync(source: Path, target: Path, name: str) -> tuple[str, int]:
+    """Copy one owned file into staging and verify the durable readback."""
+
+    _ensure_directory(target.parent, f"{name} destination parent")
+    if target.exists() or target.is_symlink():
+        _fail(f"{name} destination already exists")
+    source_descriptor = _open_regular(source, name, MAX_SOURCE_BYTES)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        before = os.fstat(source_descriptor)
+        stream = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with stream:
+            while True:
+                block = os.read(source_descriptor, 1024 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                digest.update(block)
+                stream.write(block)
+            stream.flush()
+            os.fsync(stream.fileno())
+        after = os.fstat(source_descriptor)
+        if _file_signature(before) != _file_signature(after):
+            _fail(f"{name} changed while archiving")
+        expected_digest = digest.hexdigest()
+        if total != before.st_size:
+            _fail(f"{name} size changed while archiving")
+        os.replace(temporary, target)
+        observed_digest, observed = _sha256_file(target, name, MAX_SOURCE_BYTES)
+        if observed.st_size != total or observed_digest != expected_digest:
+            _fail(f"{name} changed during archive readback")
+        _fsync_directory(target.parent, f"{name} staging directory")
+        return expected_digest, total
+    except OSError as error:
+        _fail(f"cannot archive {name}: {error}")
+    finally:
+        os.close(source_descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _archive_retired_backup(
+    backup: Path,
+    archive_root: Path,
+    current_receipt_sha256: str,
+    receipt_sha256: str,
+    rotation_sha256: str,
+) -> None:
+    """Archive metadata durably before deleting an obsolete backup."""
+
+    target = archive_root / backup.name
+    metadata_names = ["backend-build-receipt.json", "rotation.json"]
+    log_path = backup / "direct-backend-build.log"
+    if log_path.exists() or log_path.is_symlink():
+        metadata_names.append("direct-backend-build.log")
+    if target.exists() or target.is_symlink():
+        manifest, _ = _read_json(
+            target / "retention.json",
+            f"backend package retention archive {backup.name} manifest",
+            1024 * 1024,
+        )
+        archived_metadata = manifest.get("metadata")
+        if (
+            manifest.get("schema") != PACKAGE_RETENTION_SCHEMA
+            or manifest.get("state") != "succeeded"
+            or manifest.get("backup_name") != backup.name
+            or manifest.get("receipt_sha256") != receipt_sha256
+            or manifest.get("rotation_sha256") != rotation_sha256
+            or not isinstance(archived_metadata, list)
+            or {record.get("path") for record in archived_metadata if isinstance(record, Mapping)}
+            != set(metadata_names)
+        ):
+            _fail(f"backend package retention archive does not match backup: {backup.name}")
+        for record in archived_metadata:
+            if not isinstance(record, Mapping):
+                _fail(f"backend package retention archive metadata is invalid: {backup.name}")
+            filename = record.get("path")
+            if not isinstance(filename, str):
+                _fail(f"backend package retention archive metadata is invalid: {backup.name}")
+            digest, metadata = _sha256_file(
+                backup / filename,
+                f"obsolete backend package backup {backup.name}/{filename}",
+                MAX_SOURCE_BYTES,
+            )
+            if digest != record.get("sha256") or metadata.st_size != record.get("size"):
+                _fail(f"backend package retention archive source differs: {backup.name}")
+        return
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{backup.name}.retention-", dir=archive_root)
+    )
+    try:
+        metadata_records: list[dict[str, Any]] = []
+        for filename in metadata_names:
+            digest, size = _copy_regular_file_fsync(
+                backup / filename,
+                temporary / filename,
+                f"obsolete backend package backup {backup.name}/{filename}",
+            )
+            metadata_records.append({"path": filename, "size": size, "sha256": digest})
+        _write_json(
+            temporary / "retention.json",
+            {
+                "schema": PACKAGE_RETENTION_SCHEMA,
+                "state": "succeeded",
+                "backup_name": backup.name,
+                "receipt_sha256": receipt_sha256,
+                "rotation_sha256": rotation_sha256,
+                "current_receipt_sha256": current_receipt_sha256,
+                "metadata": metadata_records,
+            },
+            "backend package retention archive manifest",
+        )
+        _fsync_directory(temporary, "backend package retention staging directory")
+        os.rename(temporary, target)
+        _fsync_directory(archive_root, "backend package retention archive directory")
+    except (BackendBuildError, OSError):
+        if temporary.exists():
+            try:
+                _remove_owned_tree(temporary)
+            except (BackendBuildError, OSError):
+                pass
+        raise
+
+
+def _retain_package_backups(
+    output: Path,
+    control_root: Path,
+    current_receipt: Mapping[str, Any],
+    current_receipt_bytes: bytes,
+) -> None:
+    """Retain the direct rollback and retire only a verified older chain."""
+
+    output = _absolute(output, "backend output")
+    control_root = _absolute(control_root, "backend package development control directory")
+    if control_root != output / PACKAGE_DEVELOPMENT_DIRNAME:
+        _fail("backend package retention control directory is not under the package mount")
+    _ensure_package_development_root(output)
+    archive_root = control_root / PACKAGE_RETENTION_ARCHIVE_DIRNAME
+    backups_root = control_root / PACKAGE_BACKUPS_DIRNAME
+    candidates_root = control_root / PACKAGE_CANDIDATES_DIRNAME
+    _ensure_directory(archive_root, "backend package retention archive directory")
+    _ensure_directory(backups_root, "backend package backup directory")
+    try:
+        if any(candidates_root.iterdir()):
+            _fail("backend package candidate staging is not empty during retention")
+    except OSError as error:
+        _fail(f"cannot inspect backend package candidate staging: {error}")
+    _fsync_directory(output, "backend package output directory")
+    _fsync_directory(control_root, "backend package development control directory")
+    _fsync_directory(backups_root, "backend package backup directory")
+    _validate_retention_archives(archive_root)
+    current_mode, current_build, current_toolchain = _retention_receipt_identity(
+        current_receipt, "current backend package"
+    )
+    current_sha256 = _sha256_bytes(current_receipt_bytes)
+    observed_receipt_bytes, _ = _read_regular(
+        output / "backend-build-receipt.json", "current backend package receipt", 8 * 1024 * 1024
+    )
+    if observed_receipt_bytes != current_receipt_bytes:
+        _fail("current backend package receipt changed before backup retention")
+    current_children = _package_children(
+        output, "current backend package", exclude_development_control=True
+    )
+    try:
+        entries = tuple(sorted(backups_root.iterdir(), key=lambda path: path.name))
+    except OSError as error:
+        _fail(f"cannot inspect backend package backups: {error}")
+    if not entries:
+        return
+    nodes: list[dict[str, Any]] = []
+    by_new: dict[str, dict[str, Any]] = {}
+    for backup in entries:
+        if not re.fullmatch(r"\.backend-package-backup-[A-Za-z0-9._-]+", backup.name):
+            _fail(f"backend package backup has an unknown entry: {backup.name}")
+        _assert_safe_tree(backup, f"backend package backup {backup.name}")
+        receipt, receipt_bytes, children = _validated_package(
+            backup, f"backend package backup {backup.name}"
+        )
+        mode, build, toolchain = _retention_receipt_identity(
+            receipt, f"backend package backup {backup.name}"
+        )
+        if mode != current_mode or build != current_build or toolchain != current_toolchain:
+            _fail(f"backend package backup {backup.name} has a different cache identity")
+        rotation, rotation_bytes = _read_json(
+            backup / "rotation.json",
+            f"backend package backup {backup.name} rotation metadata",
+            1024 * 1024,
+        )
+        if (
+            rotation.get("schema") != "fullmag.direct-compose.package-rotation.v1"
+            or rotation.get("state") != "succeeded"
+        ):
+            _fail(f"backend package backup {backup.name} rotation metadata is invalid")
+        old_sha256 = rotation.get("old_receipt_sha256")
+        new_sha256 = rotation.get("new_receipt_sha256")
+        if (
+            not isinstance(old_sha256, str)
+            or not SHA256_RE.fullmatch(old_sha256)
+            or not isinstance(new_sha256, str)
+            or not SHA256_RE.fullmatch(new_sha256)
+            or old_sha256 != _sha256_bytes(receipt_bytes)
+        ):
+            _fail(f"backend package backup {backup.name} rotation receipt hashes are invalid")
+        old_children = _retention_child_names(
+            rotation.get("old_children"), f"backend package backup {backup.name} old"
+        )
+        new_children = _retention_child_names(
+            rotation.get("new_children"), f"backend package backup {backup.name} new"
+        )
+        if set(children) != set(old_children) | {"rotation.json"}:
+            _fail(f"backend package backup {backup.name} has unexpected package children")
+        node = {
+            "path": backup,
+            "receipt": receipt,
+            "receipt_bytes": receipt_bytes,
+            "receipt_sha256": old_sha256,
+            "new_receipt_sha256": new_sha256,
+            "rotation_sha256": _sha256_bytes(rotation_bytes),
+            "old_children": old_children,
+            "new_children": new_children,
+        }
+        if new_sha256 in by_new:
+            _fail(f"backend package backups have duplicate successor {new_sha256}")
+        by_new[new_sha256] = node
+        nodes.append(node)
+    direct = by_new.get(current_sha256)
+    if direct is None:
+        _fail("backend package backups have no direct rollback for the current receipt")
+    if set(direct["new_children"]) != set(current_children):
+        _fail("direct backend package rollback does not describe the current package")
+    chain: set[str] = set()
+    chain_nodes: list[dict[str, Any]] = []
+    cursor = current_sha256
+    while cursor in by_new:
+        node = by_new[cursor]
+        receipt_sha256 = str(node["receipt_sha256"])
+        if node["path"].name in chain:
+            _fail("backend package backup chain contains a cycle")
+        chain.add(node["path"].name)
+        chain_nodes.append(node)
+        cursor = receipt_sha256
+    if len(chain) != len(nodes):
+        _fail("backend package backups contain an unrelated or unreferenced entry")
+    for newer, older in zip(chain_nodes, chain_nodes[1:]):
+        if set(newer["old_children"]) != set(older["new_children"]):
+            _fail("backend package backup chain child sets do not match")
+    # The current package and its direct rollback are the two versions that
+    # must survive a crash while older backups are removed.  Sync only these
+    # small verified trees; the mutable build/cache trees are out of scope.
+    _fsync_owned_tree(
+        output,
+        "current backend package retained tree",
+        excluded_children=frozenset({PACKAGE_DEVELOPMENT_DIRNAME}),
+    )
+    _fsync_owned_tree(direct["path"], "direct backend package rollback retained tree")
+    # Walk current -> direct -> older and remove the tail first.  If a later
+    # deletion fails, the remaining backups still form a complete chain.
+    obsolete = list(reversed(chain_nodes[1:]))
+    for node in obsolete:
+        _archive_retired_backup(
+            node["path"],
+            archive_root,
+            current_sha256,
+            str(node["receipt_sha256"]),
+            str(node["rotation_sha256"]),
+        )
+        _remove_owned_tree(node["path"])
+        _fsync_directory(backups_root, "backend package backup directory")
+    if obsolete:
+        _log_phase("retention", "complete", files=len(obsolete))
 
 
 def _copy_package(workspace: Path, output: Path) -> list[dict[str, Any]]:
@@ -2307,6 +2874,8 @@ def _start(args: argparse.Namespace) -> int:
                 _publish_runtime_provenance(output)
                 _log_phase("start", "handoff", cache="hit")
                 return _serve([])
+            if previous_receipt is not None:
+                _preflight_candidate_storage(build_root, previous_receipt[0])
             candidate = Path(
                 tempfile.mkdtemp(
                     prefix=".backend-package-candidate-",
@@ -2340,6 +2909,26 @@ def _start(args: argparse.Namespace) -> int:
             _publish_runtime_provenance(output)
             _remove_owned_tree(candidate)
             candidate = None
+            try:
+                _retain_package_backups(
+                    output,
+                    control_root,
+                    _candidate_receipt,
+                    candidate_receipt_bytes,
+                )
+            except (BackendBuildError, OSError) as error:
+                # Publication is already durable.  Unknown or corrupt backup
+                # state is retained and diagnosed; it must never roll back a
+                # valid current package or delete a direct rollback.
+                retention_reason = re.sub(r"[^A-Za-z0-9_.:/-]+", "-", str(error)).strip("-")
+                if not retention_reason:
+                    retention_reason = type(error).__name__
+                _log_phase(
+                    "retention",
+                    "skipped",
+                    reason=retention_reason[:64],
+                    error=type(error).__name__,
+                )
         except (BackendBuildError, OSError) as error:
             rollback_errors: list[str] = []
             if provenance_publish_started:

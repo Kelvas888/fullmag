@@ -74,6 +74,54 @@ class BackendPackageTests(unittest.TestCase):
         records = backend._copy_package(workspace, output)
         return output, records
 
+    def _rotated_package_fixture(self, root, versions=3):
+        package, records = self._published_package(root)
+        toolchain = self._toolchain_fixture()
+        _, manifest = self._live_manifest(root, commit="a" * 40, capture_id="retention-0")
+        backend._write_json(
+            package / "backend-build-receipt.json",
+            self._receipt_for_manifest(records, manifest, toolchain),
+            "retention fixture initial receipt",
+        )
+        control = backend._ensure_package_development_root(package)
+        for index in range(1, versions + 1):
+            candidate = (
+                control / backend.PACKAGE_CANDIDATES_DIRNAME / f"candidate-{index}"
+            )
+            candidate.mkdir()
+            workspace = self._package_workspace(root / f"retention-workspace-{index}")
+            candidate_records = backend._copy_package(workspace, candidate)
+            (candidate / "bin/fullmag-bin").write_bytes(
+                f"retention-version-{index}\n".encode("ascii")
+            )
+            candidate_records = backend._hash_package(candidate)
+            _, manifest = self._live_manifest(
+                root,
+                commit=(chr(ord("a") + index) * 40),
+                capture_id=f"retention-{index}",
+            )
+            backend._write_json(
+                candidate / "backend-build-receipt.json",
+                self._receipt_for_manifest(candidate_records, manifest, toolchain),
+                "retention fixture candidate receipt",
+            )
+            previous = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            candidate_receipt_bytes = (
+                candidate / "backend-build-receipt.json"
+            ).read_bytes()
+            backend._rotate_package(
+                package,
+                candidate,
+                control,
+                previous[2],
+                previous[1],
+                candidate_receipt_bytes,
+            )
+            backend._remove_owned_tree(candidate)
+        return package, control, toolchain
+
     @staticmethod
     def _live_manifest(root, *, commit="a" * 40, capture_id="test-capture"):
         capsule = {
@@ -513,6 +561,7 @@ class BackendPackageTests(unittest.TestCase):
                         return_value=(toolchain["image_id"], toolchain),
                     ),
                     patch.object(backend, "_capture_start_manifest", return_value=manifest_path),
+                    patch.object(backend, "_preflight_candidate_storage") as space_preflight,
                     patch.object(backend, "_prepare_locked") as prepare,
                     patch.object(backend, "_rotate_package") as rotate,
                     patch.object(backend, "_publish_runtime_provenance") as publish,
@@ -523,6 +572,7 @@ class BackendPackageTests(unittest.TestCase):
                         0,
                     )
                 prepare.assert_not_called()
+                space_preflight.assert_not_called()
                 rotate.assert_not_called()
                 publish.assert_called_once_with(package)
                 serve.assert_called_once_with([])
@@ -535,6 +585,489 @@ class BackendPackageTests(unittest.TestCase):
             finally:
                 backend.PACKAGE_ROOT = original_package_root
                 backend.PROVENANCE_PATH = original_provenance_path
+
+    def test_start_rejects_known_insufficient_cache_before_prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package, records = self._published_package(root)
+            manifest_path, manifest = self._live_manifest(root)
+            toolchain = self._toolchain_fixture()
+            backend._write_json(
+                package / "backend-build-receipt.json",
+                self._receipt_for_manifest(records, manifest, toolchain),
+                "test backend build receipt",
+            )
+            provenance = root / "provenance.json"
+            provenance.write_bytes(b'{"state":"previous"}\n')
+            backend._ensure_package_development_root(package)
+            before = {
+                path.relative_to(package).as_posix(): path.read_bytes()
+                for path in package.rglob("*")
+                if path.is_file()
+            }
+            original_package_root = backend.PACKAGE_ROOT
+            original_provenance_path = backend.PROVENANCE_PATH
+            backend.PACKAGE_ROOT = package
+            backend.PROVENANCE_PATH = provenance
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(toolchain["image_id"], toolchain),
+                    ),
+                    patch.object(backend, "_capture_start_manifest", return_value=manifest_path),
+                    patch.object(backend, "_package_matches_fresh_live_manifest", return_value=False),
+                    patch.object(backend, "_prepare_locked") as prepare,
+                    patch.object(backend, "_serve") as serve,
+                    patch.object(
+                        backend.os,
+                        "statvfs",
+                        return_value=os.statvfs_result((4096, 4096, 1, 1, 0, 1, 1, 1, 0, 255)),
+                    ) as statvfs,
+                ):
+                    stderr = io.StringIO()
+                    with redirect_stderr(stderr):
+                        result = backend.main(
+                            [
+                                "start",
+                                "--output",
+                                str(package),
+                                "--build-root",
+                                str(build_root),
+                            ]
+                        )
+                self.assertEqual(result, 2)
+                statvfs.assert_called_once_with(build_root)
+                prepare.assert_not_called()
+                serve.assert_not_called()
+                message = stderr.getvalue()
+                self.assertIn("insufficient backend cache space before rebuild", message)
+                self.assertIn("cache_mount=", message)
+                self.assertIn("free_bytes=0", message)
+                self.assertIn("estimated_candidate_artifact_bytes=", message)
+                after = {
+                    path.relative_to(package).as_posix(): path.read_bytes()
+                    for path in package.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+                backend.PROVENANCE_PATH = original_provenance_path
+
+    def test_start_cache_miss_space_preflight_is_only_a_lower_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_root = root / "build"
+            build_root.mkdir()
+            package, records = self._published_package(root)
+            manifest_path, manifest = self._live_manifest(root)
+            toolchain = self._toolchain_fixture()
+            backend._write_json(
+                package / "backend-build-receipt.json",
+                self._receipt_for_manifest(records, manifest, toolchain),
+                "test backend build receipt",
+            )
+            provenance = root / "provenance.json"
+            provenance.touch()
+            estimated = sum(record["size"] for record in records)
+            block_size = 4096
+            available_blocks = (estimated + block_size - 1) // block_size
+            original_package_root = backend.PACKAGE_ROOT
+            original_provenance_path = backend.PROVENANCE_PATH
+            backend.PACKAGE_ROOT = package
+            backend.PROVENANCE_PATH = provenance
+            try:
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(
+                        backend,
+                        "_toolchain_identity",
+                        return_value=(toolchain["image_id"], toolchain),
+                    ),
+                    patch.object(backend, "_capture_start_manifest", return_value=manifest_path),
+                    patch.object(backend, "_package_matches_fresh_live_manifest", return_value=False),
+                    patch.object(
+                        backend,
+                        "_prepare_locked",
+                        side_effect=backend.BackendBuildError("prepare reached after space preflight"),
+                    ) as prepare,
+                    patch.object(backend, "_serve") as serve,
+                    patch.object(
+                        backend.os,
+                        "statvfs",
+                        return_value=os.statvfs_result(
+                            (block_size, block_size, 1, 1, available_blocks, 1, 1, 1, 0, 255)
+                        ),
+                    ) as statvfs,
+                ):
+                    stderr = io.StringIO()
+                    with redirect_stderr(stderr):
+                        result = backend.main(
+                            [
+                                "start",
+                                "--output",
+                                str(package),
+                                "--build-root",
+                                str(build_root),
+                            ]
+                        )
+                self.assertEqual(result, 2)
+                statvfs.assert_called_once_with(build_root)
+                prepare.assert_called_once()
+                serve.assert_not_called()
+                message = stderr.getvalue()
+                self.assertIn("phase=space state=preflight", message)
+                self.assertNotIn("insufficient backend cache space before rebuild", message)
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+                backend.PROVENANCE_PATH = original_provenance_path
+
+    def test_retention_keeps_direct_rollback_and_archives_verified_obsolete_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=3)
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            backend._retain_package_backups(package, control, current[0], current[1])
+            backups = sorted(
+                (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                    ".backend-package-backup-*"
+                )
+            )
+            archives = sorted(
+                (control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).glob(
+                    ".backend-package-backup-*"
+                )
+            )
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(len(archives), 2)
+            direct_rotation = json.loads(
+                (backups[0] / "rotation.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                direct_rotation["new_receipt_sha256"], backend._sha256_bytes(current[1])
+            )
+            for archive in archives:
+                self.assertEqual(
+                    {path.name for path in archive.iterdir()},
+                    {"backend-build-receipt.json", "rotation.json", "retention.json"},
+                )
+            backend._validate_retention_archives(
+                control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME
+            )
+            backend._validated_package(
+                package, "retention fixture current after cleanup", exclude_development_control=True
+            )
+
+    def test_retention_retries_after_archive_commit_without_losing_backup_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=3)
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            original_remove = backend._remove_owned_tree
+            failed = False
+
+            def fail_first_backup_delete(path):
+                nonlocal failed
+                if path.name.startswith(".backend-package-backup-") and not failed:
+                    failed = True
+                    raise backend.BackendBuildError("injected backup delete failure")
+                return original_remove(path)
+
+            with patch.object(backend, "_remove_owned_tree", side_effect=fail_first_backup_delete):
+                with self.assertRaises(backend.BackendBuildError):
+                    backend._retain_package_backups(package, control, current[0], current[1])
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).glob(
+                            ".backend-package-backup-*"
+                        )
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                            ".backend-package-backup-*"
+                        )
+                    )
+                ),
+                3,
+            )
+            backend._retain_package_backups(package, control, current[0], current[1])
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                            ".backend-package-backup-*"
+                        )
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).glob(
+                            ".backend-package-backup-*"
+                        )
+                    )
+                ),
+                2,
+            )
+
+    def test_retention_rejects_mismatched_chain_childsets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=3)
+            backups = sorted(
+                (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                    ".backend-package-backup-*"
+                )
+            )
+            parsed = [
+                (backup, json.loads((backup / "rotation.json").read_text(encoding="utf-8")))
+                for backup in backups
+            ]
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            direct = next(
+                item
+                for item in parsed
+                if item[1]["new_receipt_sha256"] == backend._sha256_bytes(current[1])
+            )
+            older = next(
+                item
+                for item in parsed
+                if item[1]["new_receipt_sha256"] == direct[1]["old_receipt_sha256"]
+            )
+            tampered = dict(older[1])
+            tampered["new_children"] = tampered["new_children"][:-1]
+            backend._write_json(
+                older[0] / "rotation.json", tampered, "tampered retention rotation"
+            )
+            with self.assertRaises(backend.BackendBuildError):
+                backend._retain_package_backups(package, control, current[0], current[1])
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                            ".backend-package-backup-*"
+                        )
+                    )
+                ),
+                3,
+            )
+
+    def test_retention_rejects_archive_missing_receipt_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=3)
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            backend._retain_package_backups(package, control, current[0], current[1])
+            archive = next(
+                (control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).glob(
+                    ".backend-package-backup-*"
+                )
+            )
+            (archive / "backend-build-receipt.json").unlink()
+            manifest, _ = backend._read_json(archive / "retention.json", "retention manifest")
+            manifest["metadata"] = [
+                record
+                for record in manifest["metadata"]
+                if record["path"] != "backend-build-receipt.json"
+            ]
+            backend._write_json(archive / "retention.json", manifest, "tampered retention manifest")
+            with self.assertRaises(backend.BackendBuildError):
+                backend._validate_retention_archives(
+                    control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME
+                )
+
+    def test_retention_rejects_archive_unbound_receipt_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=3)
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            backend._retain_package_backups(package, control, current[0], current[1])
+            archive = next(
+                (control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).glob(
+                    ".backend-package-backup-*"
+                )
+            )
+            manifest, _ = backend._read_json(archive / "retention.json", "retention manifest")
+            manifest["receipt_sha256"] = "0" * 64
+            backend._write_json(archive / "retention.json", manifest, "tampered retention manifest")
+            with self.assertRaises(backend.BackendBuildError):
+                backend._validate_retention_archives(
+                    control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME
+                )
+
+    def test_retention_archive_copy_failure_preserves_original_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=3)
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            backups_root = control / backend.PACKAGE_BACKUPS_DIRNAME
+            before = {
+                backup.name: {
+                    filename: (backup / filename).read_bytes()
+                    for filename in ("backend-build-receipt.json", "rotation.json")
+                }
+                for backup in backups_root.glob(".backend-package-backup-*")
+            }
+            with patch.object(
+                backend,
+                "_copy_regular_file_fsync",
+                side_effect=backend.BackendBuildError("injected archive copy failure"),
+            ):
+                with self.assertRaises(backend.BackendBuildError):
+                    backend._retain_package_backups(package, control, current[0], current[1])
+            after = {
+                backup.name: {
+                    filename: (backup / filename).read_bytes()
+                    for filename in ("backend-build-receipt.json", "rotation.json")
+                }
+                for backup in backups_root.glob(".backend-package-backup-*")
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(
+                list((control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).iterdir()), []
+            )
+
+    def test_retention_archive_fsync_failure_preserves_original_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=3)
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            backups_root = control / backend.PACKAGE_BACKUPS_DIRNAME
+            before = {
+                backup.name: {
+                    filename: (backup / filename).read_bytes()
+                    for filename in ("backend-build-receipt.json", "rotation.json")
+                }
+                for backup in backups_root.glob(".backend-package-backup-*")
+            }
+            original_fsync_directory = backend._fsync_directory
+
+            def fail_archive_staging_fsync(path, name):
+                if name == "backend package retention staging directory":
+                    raise backend.BackendBuildError("injected archive fsync failure")
+                return original_fsync_directory(path, name)
+
+            with patch.object(backend, "_fsync_directory", side_effect=fail_archive_staging_fsync):
+                with self.assertRaises(backend.BackendBuildError):
+                    backend._retain_package_backups(package, control, current[0], current[1])
+            after = {
+                backup.name: {
+                    filename: (backup / filename).read_bytes()
+                    for filename in ("backend-build-receipt.json", "rotation.json")
+                }
+                for backup in backups_root.glob(".backend-package-backup-*")
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(
+                list((control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).iterdir()), []
+            )
+
+    def test_retention_retained_tree_fsync_failure_deletes_no_obsolete_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=3)
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            backups_root = control / backend.PACKAGE_BACKUPS_DIRNAME
+            before = {
+                backup.name
+                for backup in backups_root.glob(".backend-package-backup-*")
+            }
+            original_fsync_owned_tree = backend._fsync_owned_tree
+
+            def fail_retained_tree_fsync(path, name, *, excluded_children=frozenset()):
+                if name == "current backend package retained tree":
+                    raise backend.BackendBuildError("injected retained tree fsync failure")
+                return original_fsync_owned_tree(
+                    path, name, excluded_children=excluded_children
+                )
+
+            with (
+                patch.object(backend, "_fsync_owned_tree", side_effect=fail_retained_tree_fsync),
+                patch.object(backend, "_remove_owned_tree", wraps=backend._remove_owned_tree) as remove,
+            ):
+                with self.assertRaises(backend.BackendBuildError):
+                    backend._retain_package_backups(package, control, current[0], current[1])
+            self.assertEqual(
+                {backup.name for backup in backups_root.glob(".backend-package-backup-*")},
+                before,
+            )
+            remove.assert_not_called()
+            self.assertEqual(
+                list((control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).iterdir()), []
+            )
+
+    def test_retention_preserves_unknown_backup_and_reports_without_deletion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=2)
+            unknown = control / backend.PACKAGE_BACKUPS_DIRNAME / "foreign-backup"
+            unknown.mkdir()
+            (unknown / "marker").write_text("unknown\n", encoding="utf-8")
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            with self.assertRaises(backend.BackendBuildError):
+                backend._retain_package_backups(package, control, current[0], current[1])
+            self.assertTrue(unknown.exists())
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).iterdir()
+                    )
+                ),
+                0,
+            )
+
+    def test_retention_preserves_corrupt_backup_and_does_not_touch_current_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(Path(directory), versions=2)
+            direct = next(
+                (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                    ".backend-package-backup-*"
+                )
+            )
+            (direct / "rotation.json").write_text("{\"state\":\"tampered\"}\n", encoding="utf-8")
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            before = {
+                path.relative_to(package).as_posix(): path.read_bytes()
+                for path in package.rglob("*")
+                if path.is_file()
+                and backend.PACKAGE_DEVELOPMENT_DIRNAME
+                not in path.relative_to(package).parts
+            }
+            with self.assertRaises(backend.BackendBuildError):
+                backend._retain_package_backups(package, control, current[0], current[1])
+            after = {
+                path.relative_to(package).as_posix(): path.read_bytes()
+                for path in package.rglob("*")
+                if path.is_file()
+                and backend.PACKAGE_DEVELOPMENT_DIRNAME
+                not in path.relative_to(package).parts
+            }
+            self.assertEqual(after, before)
+            self.assertTrue(direct.exists())
 
     def test_start_rebuilds_when_fresh_source_identity_changes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -573,6 +1106,7 @@ class BackendPackageTests(unittest.TestCase):
                 return 0
 
             try:
+                stderr = io.StringIO()
                 with (
                     patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
                     patch.object(
@@ -583,14 +1117,22 @@ class BackendPackageTests(unittest.TestCase):
                     patch.object(backend, "_capture_start_manifest", return_value=changed_manifest_path),
                     patch.object(backend, "_prepare_locked", side_effect=prepare_candidate) as prepare,
                     patch.object(backend, "_publish_runtime_provenance"),
+                    patch.object(
+                        backend,
+                        "_retain_package_backups",
+                        side_effect=backend.BackendBuildError("retention state is unknown"),
+                    ) as retain,
                     patch.object(backend, "_serve", return_value=0) as serve,
                 ):
-                    self.assertEqual(
-                        backend.main(["start", "--build-root", str(build_root)]),
-                        0,
-                    )
+                    with redirect_stderr(stderr):
+                        self.assertEqual(
+                            backend.main(["start", "--build-root", str(build_root)]),
+                            0,
+                        )
                 prepare.assert_called_once()
+                retain.assert_called_once()
                 serve.assert_called_once_with([])
+                self.assertIn("retention-state-is-unknown", stderr.getvalue())
                 self.assertNotEqual(
                     (package / "bin/fullmag-bin").read_bytes(), b"package\n"
                 )
