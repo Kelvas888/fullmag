@@ -1756,7 +1756,7 @@ def _backend_start_inputs(
             (resolved_root / placeholder).touch(exist_ok=True)
         placeholder_environment["FULLMAG_BACKEND_PACKAGE"] = str(package_placeholder)
 
-        base_info = _ensure_development_base(args, repo, layout, resolved_root)
+        base_info = _ensure_development_base(args, selected, layout, resolved_root)
         terminal.update(
             development_base_image=base_info["reference"],
             development_base_image_id=base_info["image_id"],
@@ -1769,7 +1769,7 @@ def _backend_start_inputs(
         placeholder_environment["FULLMAG_TOOLCHAIN_IMAGE"] = str(base_info["toolchain_image_id"])
         placeholder_environment["FULLMAG_TOOLCHAIN_IMAGE_ID"] = str(base_info["toolchain_image_id"])
         image_ref, image_id, _image_document, image_built = _runtime_image_reference(
-            args, repo, placeholder_environment, resolved_root, layout, base_info,
+            args, selected, placeholder_environment, resolved_root, layout, base_info,
             compose_project,
         )
         toolchain_id = str(base_info["toolchain_image_id"])
@@ -1779,7 +1779,7 @@ def _backend_start_inputs(
             "source_mode": "live-shadow-v1",
             "git_common_dir": str(git_common),
         }
-        cache = _prepare_backend_cache(layout, repo, image_id, resolved_root, selected, toolchain_id)
+        cache = _prepare_backend_cache(layout, selected, image_id, resolved_root, selected, toolchain_id)
         package = _backend_cache_package_root(cache)
         # ``package`` is a daemon-side /mnt path supplied by the cache helper;
         # native Windows Python cannot inspect it.  The fixed backend service
@@ -1795,8 +1795,8 @@ def _backend_start_inputs(
         # preparation phase.  The service observes the live readonly mounts on
         # every start, including an ordinary Docker Desktop restart.
         environment["FULLMAG_SOURCE_GIT_COMMON"] = str(git_common)
-        files = [repo / COMPOSE_RUNTIME_FILE, Path(str(cache["compose_overlay"]))]
-        config = _compose_config(repo, files, environment, project=compose_project)
+        files = [selected / COMPOSE_RUNTIME_FILE, Path(str(cache["compose_overlay"]))]
+        config = _compose_config(selected, files, environment, project=compose_project)
         services = config.get("services", {})
         if not isinstance(services, Mapping) or set(services) != {"backend", "frontend"}:
             raise _fail("direct development Compose must contain exactly backend and frontend services")
@@ -1927,14 +1927,14 @@ def up(args: argparse.Namespace) -> None:
     # performs path admission, source containment, hash, and wait_for_solve
     # policy checks against the same checkout.
     start(
-        repo,
+        selected,
         None,
         args.port,
         frontend="dev",
         source_root=selected,
         startup_script=args.script,
         project_name=compose_project,
-        compose_template=repo / COMPOSE_RUNTIME_FILE,
+        compose_template=selected / COMPOSE_RUNTIME_FILE,
         backend_start=backend_start,
     )
 

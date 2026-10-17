@@ -614,6 +614,7 @@ class DockerDevRecreateContract(unittest.TestCase):
                 return git_common_path
 
             def runtime_image(_args, _repo, environment, *_rest):
+                self.assertEqual(_repo, selected)
                 events.append(("image-build", environment.get("FULLMAG_SOURCE_GIT_COMMON")))
                 return "fullmag/fullmag-dev:local", "sha256:" + "d" * 64, {}, False
 
@@ -631,17 +632,22 @@ class DockerDevRecreateContract(unittest.TestCase):
                     patch.object(docker_dev, "_workspace_state_root", return_value=root / "user-data"), \
                     patch.object(docker_dev, "_backend_build_state_root", return_value=root / "build-state"), \
                     patch.object(docker_dev, "_source_git_common_directory", side_effect=resolve_git_common), \
-                    patch.object(docker_dev, "_ensure_development_base", return_value=base_info), \
+                    patch.object(docker_dev, "_ensure_development_base", return_value=base_info) as base_mock, \
                     patch.object(docker_dev, "_runtime_image_reference", side_effect=runtime_image), \
                     patch.object(docker_dev, "_image_helper_inventory", return_value={}), \
-                    patch.object(docker_dev, "_prepare_backend_cache", return_value=cache), \
+                    patch.object(docker_dev, "_prepare_backend_cache", return_value=cache) as cache_mock, \
                     patch.object(docker_dev, "_backend_cache_package_root", return_value=Path("/mnt/fullmag-cache/package")), \
                     patch.object(docker_dev, "_environment", return_value={}), \
-                    patch.object(docker_dev, "_compose_config", return_value=compose_config):
+                    patch.object(docker_dev, "_compose_config", return_value=compose_config) as compose_mock:
                 docker_dev._backend_start_inputs(args, run_root=run_root, run_id="e" * 32,
                                                  heavy_lock_held=True)
 
             self.assertEqual(events, ["git-common", ("image-build", str(git_common_path))])
+
+            self.assertEqual(base_mock.call_args.args[1], selected)
+            self.assertEqual(cache_mock.call_args.args[1], selected)
+            self.assertEqual(compose_mock.call_args.args[0], selected)
+            self.assertEqual(compose_mock.call_args.args[1][0], selected / docker_dev.COMPOSE_RUNTIME_FILE)
 
     def test_empty_owned_network_is_reusable_but_foreign_or_attached_is_rejected(self):
         project = "fullmag-worktree-network-test"
@@ -691,6 +697,7 @@ class DockerDevRecreateContract(unittest.TestCase):
 
     def test_up_passes_resolved_source_identity_to_both_network_fences(self):
         repo = Path(__file__).resolve().parents[1]
+        selected = repo / "apps"
         layout = {"repo_root": str(repo)}
         identity = {
             "project_name": "fullmag-worktree-network-test",
@@ -707,7 +714,7 @@ class DockerDevRecreateContract(unittest.TestCase):
         )
         calls = []
         events = []
-        backend_start = {"source_root": str(repo)}
+        backend_start = {"source_root": str(selected)}
 
         class RecordingLease:
             def __enter__(self):
@@ -726,7 +733,7 @@ class DockerDevRecreateContract(unittest.TestCase):
             events.append("runtime-start")
 
         with patch.object(docker_dev, "_require_native_windows"), \
-                patch.object(docker_dev, "_select_source", return_value=(repo, layout)), \
+                patch.object(docker_dev, "_select_source", return_value=(selected, layout)), \
                 patch.object(docker_dev, "_compose_identity", return_value=identity), \
                 patch.object(docker_dev, "_assert_no_running_fullmag", side_effect=lambda *value: calls.append(value)), \
                 patch.object(docker_dev, "_direct_heavy_lock", return_value=RecordingLease()), \
@@ -738,14 +745,14 @@ class DockerDevRecreateContract(unittest.TestCase):
         self.assertEqual(calls, [(identity["project_name"], identity),
                                  (identity["project_name"], identity)])
         start_mock.assert_called_once_with(
-            repo,
+            selected,
             None,
             args.port,
             frontend="dev",
-            source_root=repo,
+            source_root=selected,
             startup_script=None,
             project_name=identity["project_name"],
-            compose_template=repo / docker_dev.COMPOSE_RUNTIME_FILE,
+            compose_template=selected / docker_dev.COMPOSE_RUNTIME_FILE,
             backend_start=backend_start,
         )
 
