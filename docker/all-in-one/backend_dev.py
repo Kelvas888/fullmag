@@ -85,6 +85,8 @@ PACKAGE_CACHE_CONTROL_DIRNAME = "cache-maintenance"
 PACKAGE_CACHE_MARKER_NAME = ".fullmag-backend-cache-owner.json"
 PACKAGE_CACHE_READBACK_NAME = ".fullmag-backend-cache-readback"
 PACKAGE_RETENTION_SCHEMA = "fullmag.direct-compose.package-retention.v1"
+PACKAGE_RETENTION_ARCHIVE_COUNT_LIMIT = 8
+PACKAGE_RETENTION_ARCHIVE_BYTES_LIMIT = 64 * 1024 * 1024
 OWNER_MARKER = ".fullmag-direct-backend-owner.json"
 WORKSPACE_INVENTORY_SCHEMA = "fullmag.direct-compose.workspace-inventory.v1"
 RUNTIME_LOCK_NAME = ".fullmag-backend-runtime.lock"
@@ -2238,28 +2240,45 @@ def _retention_child_names(value: object, name: str) -> list[str]:
     return result
 
 
-def _validate_retention_archives(archive_root: Path) -> None:
-    """Validate archives left by earlier successful retention passes."""
+def _validate_retention_archives(
+    archive_root: Path, *, verify_disposable_logs: bool = True
+) -> list[dict[str, Any]]:
+    """Validate archive structure and bindings, optionally hashing legacy logs."""
 
     try:
         entries = tuple(sorted(archive_root.iterdir(), key=lambda path: path.name))
     except OSError as error:
         _fail(f"cannot inspect backend package retention archive: {error}")
+    validated: list[dict[str, Any]] = []
     for archive in entries:
         if not re.fullmatch(r"\.backend-package-backup-[A-Za-z0-9._-]+", archive.name):
             _fail(f"backend package retention archive has an unknown entry: {archive.name}")
         _assert_safe_tree(archive, f"backend package retention archive {archive.name}")
+        manifest_path = archive / "retention.json"
         manifest, _ = _read_json(
-            archive / "retention.json",
+            manifest_path,
             f"backend package retention archive {archive.name} manifest",
             1024 * 1024,
         )
+        manifest_stat = manifest_path.stat()
         if (
             manifest.get("schema") != PACKAGE_RETENTION_SCHEMA
             or manifest.get("state") != "succeeded"
             or manifest.get("backup_name") != archive.name
         ):
             _fail(f"backend package retention archive {archive.name} manifest is invalid")
+        retired_at_ns = manifest.get("retired_at_ns")
+        if retired_at_ns is None:
+            # Legacy archives did not record an order. Filesystem time only
+            # chooses which redundant audit copy to retain; it is not proof
+            # that any archive is safe to delete.
+            retired_at_ns = manifest_stat.st_mtime_ns
+        elif (
+            isinstance(retired_at_ns, bool)
+            or not isinstance(retired_at_ns, int)
+            or retired_at_ns < 0
+        ):
+            _fail(f"backend package retention archive {archive.name} has an invalid order")
         receipt_sha = manifest.get("receipt_sha256")
         rotation_sha = manifest.get("rotation_sha256")
         current_sha = manifest.get("current_receipt_sha256")
@@ -2277,18 +2296,24 @@ def _validate_retention_archives(archive_root: Path) -> None:
             _fail(f"backend package retention archive {archive.name} has no metadata")
         expected = {"retention.json"}
         metadata_by_path: dict[str, Mapping[str, Any]] = {}
+        archive_size = manifest_stat.st_size
         for index, record in enumerate(metadata):
             if not isinstance(record, Mapping):
                 _fail(f"backend package retention archive metadata {index} is invalid")
             path = record.get("path")
             size = record.get("size")
             digest = record.get("sha256")
+            maximum = {
+                "backend-build-receipt.json": 8 * 1024 * 1024,
+                "rotation.json": 1024 * 1024,
+                "direct-backend-build.log": MAX_SOURCE_BYTES,
+            }.get(path) if isinstance(path, str) else None
             if (
-                not isinstance(path, str)
-                or path not in {"backend-build-receipt.json", "rotation.json", "direct-backend-build.log"}
+                maximum is None
                 or isinstance(size, bool)
                 or not isinstance(size, int)
                 or size < 0
+                or size > maximum
                 or not isinstance(digest, str)
                 or not SHA256_RE.fullmatch(digest)
                 or path in expected
@@ -2296,26 +2321,106 @@ def _validate_retention_archives(archive_root: Path) -> None:
                 _fail(f"backend package retention archive metadata {index} is invalid")
             expected.add(path)
             metadata_by_path[path] = record
-            observed_digest, observed_stat = _sha256_file(
-                archive / path,
-                f"backend package retention archive {archive.name}/{path}",
-                MAX_SOURCE_BYTES,
-            )
-            if observed_stat.st_size != size or observed_digest != digest:
+            archived_path = archive / path
+            try:
+                observed_stat = archived_path.lstat()
+            except OSError as error:
+                _fail(
+                    "cannot inspect backend package retention archive "
+                    f"{archive.name}/{path}: {error}"
+                )
+            if not stat.S_ISREG(observed_stat.st_mode) or observed_stat.st_size != size:
                 _fail(f"backend package retention archive {archive.name}/{path} changed")
+            archive_size += size
+            if path != "direct-backend-build.log" or verify_disposable_logs:
+                observed_digest, observed_stat = _sha256_file(
+                    archived_path,
+                    f"backend package retention archive {archive.name}/{path}",
+                    maximum,
+                )
+                if observed_stat.st_size != size or observed_digest != digest:
+                    _fail(f"backend package retention archive {archive.name}/{path} changed")
         required_metadata = {"backend-build-receipt.json", "rotation.json"}
         if not required_metadata.issubset(metadata_by_path):
             _fail(f"backend package retention archive {archive.name} is missing receipt metadata")
         if (
-            metadata_by_path["backend-build-receipt.json"]["sha256"]
-            != manifest.get("receipt_sha256")
-            or metadata_by_path["rotation.json"]["sha256"]
-            != manifest.get("rotation_sha256")
+            metadata_by_path["backend-build-receipt.json"]["sha256"] != receipt_sha
+            or metadata_by_path["rotation.json"]["sha256"] != rotation_sha
         ):
             _fail(f"backend package retention archive {archive.name} metadata hashes are unbound")
+        archived_rotation, _ = _read_json(
+            archive / "rotation.json",
+            f"backend package retention archive {archive.name} rotation",
+            1024 * 1024,
+        )
+        if archived_rotation.get("old_receipt_sha256") != receipt_sha:
+            _fail(
+                f"backend package retention archive {archive.name} "
+                "rotation is not receipt-bound"
+            )
         actual = {child.name for child in archive.iterdir()}
         if actual != expected:
             _fail(f"backend package retention archive {archive.name} has unexpected files")
+        validated.append(
+            {
+                "path": archive,
+                "order": retired_at_ns,
+                "size": archive_size,
+                "metadata": metadata_by_path,
+            }
+        )
+    return validated
+
+
+def _prune_retention_archives(archive_root: Path) -> int:
+    """Keep a bounded, verified set of compact package-retirement evidence."""
+
+    archives = _validate_retention_archives(archive_root, verify_disposable_logs=False)
+    ordered = sorted(
+        archives,
+        key=lambda record: (record["order"], record["path"].name),
+        reverse=True,
+    )
+    retained: list[dict[str, Any]] = []
+    retained_bytes = 0
+    for record in ordered:
+        if len(retained) >= PACKAGE_RETENTION_ARCHIVE_COUNT_LIMIT:
+            break
+        if retained_bytes + record["size"] > PACKAGE_RETENTION_ARCHIVE_BYTES_LIMIT:
+            continue
+        retained.append(record)
+        retained_bytes += record["size"]
+    retained_names = {record["path"].name for record in retained}
+    # A legacy log can be kept only when the full retained archive set fits
+    # the byte budget and its content still matches the retention manifest.
+    for record in retained:
+        log_record = record["metadata"].get("direct-backend-build.log")
+        if log_record is None:
+            continue
+        log_path = record["path"] / "direct-backend-build.log"
+        observed_digest, observed_stat = _sha256_file(
+            log_path,
+            f"backend package retention archive {record['path'].name}/direct-backend-build.log",
+            MAX_SOURCE_BYTES,
+        )
+        if (
+            observed_stat.st_size != log_record["size"]
+            or observed_digest != log_record["sha256"]
+        ):
+            _fail(
+                "backend package retention archive "
+                f"{record['path'].name}/direct-backend-build.log changed"
+            )
+    removed = 0
+    for record in archives:
+        archive = record["path"]
+        if archive.name in retained_names:
+            continue
+        _remove_owned_tree(archive)
+        removed += 1
+    if removed:
+        _fsync_directory(archive_root, "backend package retention archive directory")
+    return removed
 
 
 def _copy_regular_file_fsync(source: Path, target: Path, name: str) -> tuple[str, int]:
@@ -2377,9 +2482,6 @@ def _archive_retired_backup(
 
     target = archive_root / backup.name
     metadata_names = ["backend-build-receipt.json", "rotation.json"]
-    log_path = backup / "direct-backend-build.log"
-    if log_path.exists() or log_path.is_symlink():
-        metadata_names.append("direct-backend-build.log")
     if target.exists() or target.is_symlink():
         manifest, _ = _read_json(
             target / "retention.json",
@@ -2394,10 +2496,15 @@ def _archive_retired_backup(
             or manifest.get("receipt_sha256") != receipt_sha256
             or manifest.get("rotation_sha256") != rotation_sha256
             or not isinstance(archived_metadata, list)
-            or {record.get("path") for record in archived_metadata if isinstance(record, Mapping)}
-            != set(metadata_names)
         ):
             _fail(f"backend package retention archive does not match backup: {backup.name}")
+        archived_names = {
+            record.get("path") for record in archived_metadata if isinstance(record, Mapping)
+        }
+        if not set(metadata_names).issubset(archived_names) or not archived_names.issubset(
+            {*metadata_names, "direct-backend-build.log"}
+        ):
+            _fail(f"backend package retention archive metadata is invalid: {backup.name}")
         for record in archived_metadata:
             if not isinstance(record, Mapping):
                 _fail(f"backend package retention archive metadata is invalid: {backup.name}")
@@ -2433,6 +2540,7 @@ def _archive_retired_backup(
                 "receipt_sha256": receipt_sha256,
                 "rotation_sha256": rotation_sha256,
                 "current_receipt_sha256": current_receipt_sha256,
+                "retired_at_ns": time.time_ns(),
                 "metadata": metadata_records,
             },
             "backend package retention archive manifest",
@@ -2475,7 +2583,7 @@ def _retain_package_backups(
     _fsync_directory(output, "backend package output directory")
     _fsync_directory(control_root, "backend package development control directory")
     _fsync_directory(backups_root, "backend package backup directory")
-    _validate_retention_archives(archive_root)
+    _validate_retention_archives(archive_root, verify_disposable_logs=False)
     current_mode, current_build, current_toolchain = _retention_receipt_identity(
         current_receipt, "current backend package"
     )
@@ -2493,6 +2601,7 @@ def _retain_package_backups(
     except OSError as error:
         _fail(f"cannot inspect backend package backups: {error}")
     if not entries:
+        _prune_retention_archives(archive_root)
         return
     nodes: list[dict[str, Any]] = []
     by_new: dict[str, dict[str, Any]] = {}
@@ -2596,8 +2705,14 @@ def _retain_package_backups(
         )
         _remove_owned_tree(node["path"])
         _fsync_directory(backups_root, "backend package backup directory")
-    if obsolete:
-        _log_phase("retention", "complete", files=len(obsolete))
+    removed_archives = _prune_retention_archives(archive_root)
+    if obsolete or removed_archives:
+        _log_phase(
+            "retention",
+            "complete",
+            files=len(obsolete),
+            archives_removed=removed_archives,
+        )
 
 
 def _copy_package(workspace: Path, output: Path) -> list[dict[str, Any]]:

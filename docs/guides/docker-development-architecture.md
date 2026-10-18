@@ -374,8 +374,12 @@ poprzedni pakiet do rollbacku pozostają. Wiek lub nazwa katalogu nie stanowią
 dowodu zbędności: wymagane są zgodne receipty i łańcuch zakończonych rotacji.
 
 Sprzątanie odbywa się wewnątrz backendu pod blokadą jego cache, po trwałej,
-zweryfikowanej publikacji nowego pakietu. Przed usunięciem kopii zachowuje
-log buildu, receipt, zapis rotacji i raport wykonania. Nieznane, niespójne lub
+zweryfikowanej publikacji nowego pakietu. Retired zachowuje tylko receipt i
+rotację, bez kolejnych kopii pełnego build logu. Zostawia najwyżej 8 archiwów
+i 64 MiB łącznego rozmiaru plików; zachowuje najnowsze według zapisanego
+`retired_at_ns` (dla starszych wpisów kolejność wyznacza czas pliku manifestu).
+Archiwa legacy z logiem są usuwane, jeśli przekraczają ten limit; log jest
+sprawdzany hashem, gdy pozostaje w zachowanym archiwum. Nieznane, niespójne lub
 używane dane pozostają z diagnostyką. Niepowodzenie sprzątania nie unieważnia
 poprawnie opublikowanego pakietu.
 

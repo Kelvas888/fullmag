@@ -59,13 +59,12 @@ na kontener; nie ogranicza plików w wolumenach ani BuildKit. Frontend otwiera
 `/state/development/next.log` przez `O_TRUNC` po przejęciu blokady, więc log nie
 narasta między restartami. Nie ma jeszcze limitu pliku w trakcie długiej sesji.
 
-Backend zapisuje `direct-backend-build.log` do stabilnego pakietu, a starsze
-pakiety po zachowaniu rollbacku mają log/receipt/rotation kopiowane do
-`/opt/fullmag/package/.development/retired`. Archiwum nie ma limitu wieku,
-rozmiaru ani liczby wpisów. Te logi i metadane są więc głównym bieżącym writerem
-generującym kolejne kopie; retencja całego dysku pozostaje niekompletna mimo
-rotacji Docker stdout. Pełny runtime Docker i pomiary wzrostu pozostają
-`NOT VERIFIED`.
+Backend zapisuje `direct-backend-build.log` do bieżącego pakietu; bezpośredni
+rollback zachowuje poprzedni pakiet. Starsze pakiety archiwizują receipt i
+rotację, ale nie pełny log. Retired ma limit 8 wpisów i 64 MiB payloadu.
+Logi Next w pojedynczej długiej sesji, Cargo/CMake, BuildKit i stare wolumeny
+nadal nie mają ogólnego limitu. Pełny runtime Docker i pomiary wzrostu
+pozostają `NOT VERIFIED`.
 
 Migracja **nie implementuje** automatycznego usuwania starych wersji named
 volumes, obrazów ani BuildKit cache i nie ustala quota. Wolumeny `external`
@@ -105,8 +104,8 @@ BuildKit, więc sam PASS takiego audytu jest tylko częściowy.
 |---|---|---|---|
 | Checkout/Git | `compose.dev.yaml:67-80` montuje wybrany checkout i Git common readonly | Windows checkout → `/opt/fullmag/source`, `/opt/fullmag/source-git` | To wejście, nie artefakt buildu. Jedna kopia źródła jest prawidłowa. |
 | Cień backendu | `backend_dev.py:921-1024` synchronizuje `/build/workspace` i usuwa wyłącznie nieaktualne pliki źródłowe | Named volume `/build` | Prawidłowa lokalizacja. Cache `.fullmag-build`, `.fullmag-cargo`, `.fullmag-rustup`, Cargo/CMake i `TMPDIR` są ustawiane pod `/build` (`backend_dev.py:1636-1705`). |
-| Pakiet, kandydat, rollback | `backend_dev.py:442-518`, `1996-2068`, `2880-3015` | Named volume `/opt/fullmag/package` | Prawidłowy current + bezpośredni rollback pod blokadą. `.development/retired` archiwizuje receipt/rotation/log, ale nie ma limitu bajtów, liczby ani wieku; błąd walidacji może pozostawić cały łańcuch (`backend_dev.py:2275-2506`, `2974-2986`). |
-| Log Make backendu | `backend_dev.py:2548-2578` zapisuje `direct-backend-build.log` i jednocześnie przekazuje strumień na stdout | Log w `/build/workspace/.fullmag/local` + Docker logging driver | Pełny strumień istnieje w dwóch miejscach. Brak sprawdzonej retencji logu/Docker drivera. |
+| Pakiet, kandydat, rollback | `backend_dev.py::_rotate_package`, `::_archive_retired_backup`, `::_retain_package_backups`, `::_publish_completed_build` | Named volume `/opt/fullmag/package` | Current + bezpośredni rollback pod blokadą. `.development/retired` przechowuje receipt/rotation, bez pełnych logów; ma limit 8 archiwów i 64 MiB payloadu. Legacy pełne logi są hashowane tylko, gdy archiwum pozostaje w budżecie (`::_validate_retention_archives`, `::_prune_retention_archives`). |
+| Log Make backendu | `backend_dev.py::_run_canonical_make` zapisuje `direct-backend-build.log` i przekazuje strumień na stdout | Aktywny pakiet `/opt/fullmag/package`, build workspace `/build`, Docker logging driver | Aktywny pakiet i jeden rollback zachowują log. Starsze archiwa nie kopiują go; Docker stdout ma rotację Compose `10m × 3`. |
 | Runtime provenance | `backend_dev.py:2739-2803` publikuje `/opt/fullmag/provenance.json`; zapis używa `O_RDWR` i `ftruncate` (`2806-2859`) | Host writable bind `${FULLMAG_PACKAGE_PROVENANCE}` → `/opt/fullmag/provenance.json` (`compose.dev.yaml:93-100`) | Narusza volume-only. To świadomy handoff do hostowego `run_root/provenance.json`, nie techniczny wyjątek runtime. |
 | Backend cache control/overlay | `docker_dev.py:1235-1330` zapisuje `backend-cache-maintenance.json` i `backend-cache-overlay.json`; v2 helper generuje parę named volumes | Hostowy run root dla overlay/receipt; dane builda w named volumes | Dane sterujące są hostowe. `docker_backend_volume_cache.py:199-257` ma dobrą tożsamość i labels, ale `363-430`, `886-946` nadal wylicza i zapisuje canonical host receipt. Para nie ma GC (`738-766` tylko tworzy brakujące volume). |
 | Toolchain context | `bootstrap_docker_toolchain.py:223-279` tworzy `runs_root/toolchain-bootstrap-<uuid>/context`, kopiuje wejścia (`capture_inputs`), renderuje `compose.json`, a `241-256` publikuje receipt/index | Hostowy `storage/runs` + `storage/index` | Każdy bootstrap może zostawić kontekst, Compose i receipt. Obraz/warstwy są dodatkowo w daemon image store/BuildKit. To co najmniej hostowa kopia kontekstu i metadata poza volume. |

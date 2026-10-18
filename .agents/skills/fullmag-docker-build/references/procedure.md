@@ -165,9 +165,9 @@ egzekwuje. Nie sumuj współdzielonych warstw obrazów jako niezależnych kopii.
 Retencja ma odróżniać:
 
 - **pakiety:** bieżący + jeden zweryfikowany rollback; starsze binaria dopiero
-  po trwałej publikacji i pod blokadą. Obecna implementacja archiwizuje log i
-  receipty każdej usuniętej generacji bez limitu; traktuj to jako nierozwiązaną
-  retencję, a nie jako bounded cleanup;
+  po trwałej publikacji i pod blokadą. Retired zachowuje receipt i rotację, bez
+  pełnych kopii logów; limit wynosi 8 archiwów i 64 MiB plików. Legacy logi
+  są hashowane tylko dla wpisów, które pozostaną w budżecie;
 - **aktywny cache przyrostowy:** pozostaje dla kolejnego buildu;
 - **nieaktywne generacje:** kandydaci do osobnego bounded cleanup po ustaleniu
   właścicieli, mountów, lease, rollbacku i referencji wyników;
@@ -175,8 +175,8 @@ Retencja ma odróżniać:
   wymaga dowodu zakończenia procesu/operacji i braku referencji;
 - **logi i metadane:** stdout/stderr usługi Compose ma obecnie rotację
   `json-file` `10m × 3`; `next.log` jest zerowany przy starcie, ale może rosnąć
-  w długiej sesji, a `/retired` nie ma limitu. Sama retencja binariów ich nie
-  ogranicza;
+  w długiej sesji; `/retired` ogranicza duplikację do 8 wpisów / 64 MiB, ale
+  Cargo/CMake/BuildKit i stare wolumeny nadal nie mają ogólnego GC;
 - **sesje/wyniki/settings/ledger:** poza cleanupem builda.
 
 Nie wykonuj globalnego `docker system prune`, `volume prune`, kasowania targetu
