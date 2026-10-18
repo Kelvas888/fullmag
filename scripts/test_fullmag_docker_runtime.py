@@ -15,6 +15,11 @@ from contextlib import nullcontext
 import fullmag_docker_runtime as runtime
 import run_managed_browser as managed
 import docker_backend_volume_cache as volume_cache
+from test_docker_backend_volume_cache import (
+    DockerVolumeFixture,
+    _maintenance_receipt,
+    _profile,
+)
 
 
 def _v2_cache_fixture(root):
@@ -87,6 +92,46 @@ def _v2_cache_fixture(root):
 
 
 class DockerRuntimeContract(unittest.TestCase):
+    def test_prepare_ready_profile_passes_runtime_cache_validator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile, layout, source, repo, runroot = _profile(directory)
+            docker = DockerVolumeFixture(profile)
+            ready = volume_cache.prepare_ready(
+                layout,
+                repo,
+                profile["runtime_image_id"],
+                runroot,
+                docker,
+                lambda prepared, overlay: _maintenance_receipt(prepared),
+                source_root=source,
+                toolchain_image=profile["toolchain_image_id"],
+            )
+
+            for field, path_field, digest_field in (
+                ("overlay", "compose_overlay", "compose_overlay_sha256"),
+                ("maintenance_overlay", "maintenance_compose_overlay", None),
+            ):
+                filename = (
+                    "backend-cache-overlay.json"
+                    if field == "overlay"
+                    else "backend-cache-maintenance.json"
+                )
+                path = runroot / filename
+                raw = json.dumps(
+                    ready[field], sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                path.write_bytes(raw)
+                ready[path_field] = str(path)
+                if digest_field is not None:
+                    ready[digest_field] = hashlib.sha256(raw).hexdigest()
+
+            self.assertIs(
+                runtime._validate_backend_volume_cache(
+                    ready, expected_package=volume_cache.PACKAGE_TARGET
+                ),
+                volume_cache,
+            )
+
     def test_v2_cache_accepts_independent_named_volume_targets_and_exact_records(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

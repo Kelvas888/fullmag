@@ -418,6 +418,7 @@ def _plan(
             }, PACKAGE_VOLUME_ROLE)},
         },
         "mount_root": BUILD_TARGET,
+        "build_root": BUILD_TARGET,
         "package_root": PACKAGE_TARGET,
         "receipt_path": str(receipt),
         "host_receipt_path": str(receipt),

@@ -247,6 +247,24 @@ class BackendVolumeCacheTests(unittest.TestCase):
             self.assertEqual(seen["profile"]["volume_names"], ready["volume_names"])
             self.assertEqual(set(ready["overlay"]["services"]), {"backend"})
 
+    def test_prepare_ready_publishes_canonical_build_root_in_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, layout, source, repo, runroot = _profile(tmp)
+            docker = DockerVolumeFixture(profile)
+
+            ready = cache.prepare_ready(
+                layout,
+                repo,
+                IMAGE,
+                runroot,
+                docker,
+                lambda prepared, overlay: _maintenance_receipt(prepared),
+                source_root=source,
+                toolchain_image=TOOLCHAIN,
+            )
+
+            self.assertEqual(ready["build_root"], cache.BUILD_TARGET)
+
     def test_partial_pair_and_foreign_pair_fail_closed_without_deletion(self):
         with tempfile.TemporaryDirectory() as tmp:
             profile, *_ = _profile(tmp)
