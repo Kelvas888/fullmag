@@ -157,8 +157,8 @@ case "${recipe}" in
     docker_dev_args=(--repo-root "${repo_root}")
     if [[ "${recipe}" =~ ${docker_dev_codegen_pattern} ]]; then
       docker_dev_args+=(codegen-openapi)
-      if [[ -n "${BASH_REMATCH[1]:-}" ]]; then
-        docker_dev_args+=(--source-root "${BASH_REMATCH[1]}")
+      if [[ -n "${BASH_REMATCH[2]:-}" ]]; then
+        docker_dev_args+=(--source-root "${BASH_REMATCH[2]}")
       fi
     elif [[ "${recipe}" =~ ${docker_dev_build_pattern} ]]; then
       docker_dev_args+=(build --gpu-access "${BASH_REMATCH[1]}")

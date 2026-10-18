@@ -74,6 +74,24 @@ bez niej nie twierdź, że całe zużycie dysku jest ograniczone. Aktywny Docker
 Desktop cold build/start, inspect, incremental cache-hit, HMR, run `.py` i GC
 pozostają `NOT VERIFIED`.
 
+### Generowanie źródeł API — delta 19.10.2026
+
+`scripts/docker_dev_codegen.py` wykonuje eksport i generatory przez `exec`
+w stałych usługach `backend` i `frontend` wybranej grupy. Staging jest w
+wolumenie frontendowym, receipt sukcesu i ograniczona diagnostyka awarii w
+control volume (`backend/codegen/openapi-v2/`). Standardowy staging jest
+sprzątany po operacji; timeout o nieznanym stanie zdalnego procesu zachowuje
+identyfikator do kontroli zamiast usuwać potencjalnie używane pliki.
+
+Jedyny trwały output hostowy tej trasy to cztery wersjonowane pliki
+`apps/control-room/src/kernel/api/generated/openapi-v2{.json,-types.ts,-client.ts,-paths.ts}`.
+Publikacja kontroluje poprzednie hashe i nie zastępuje równolegle zmienionych
+źródeł. `docker-dev-codegen` i codzienne `generate-api-openapi` omijają ogólny
+wrapper hostowego storage przez jawny dispatch. `generate-api-openapi-legacy`
+zachowuje starszą trasę wyłącznie jako oddzielne wejście release/CI.
+Bieżący audyt tras i hashe są w [recipe-audit.md](recipe-audit.md).
+To odczyt źródeł i lekkie testy helpera; wykonanie w usługach **NOT VERIFIED**.
+
 ## Wynik bazowego odczytu
 
 Wersja źródeł z tego bazowego odczytu nie spełniała granicy „wszystkie dane budowania wyłącznie w Docker

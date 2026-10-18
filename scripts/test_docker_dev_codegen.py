@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 import tempfile
@@ -13,6 +16,26 @@ import docker_dev_codegen as codegen  # noqa: E402
 
 
 class DockerDevCodegenTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires executable POSIX shell fixture")
+    def test_just_wrapper_preserves_explicit_codegen_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = Path(directory) / "python-probe"
+            interpreter.write_text(
+                f"#!{sys.executable}\nimport json, sys\n"
+                "if sys.argv[1:2] != ['-c']: print(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            interpreter.chmod(0o700)
+            root = Path(__file__).resolve().parents[1]
+            source = "/example/worktrees/selected checkout"
+            recipe = f'python3 "{root}/scripts/docker_dev.py" --repo-root "{root}" codegen-openapi --source-root \'{source}\''
+            result = subprocess.run(
+                ["bash", str(root / "scripts/just_storage_shell.sh"), recipe],
+                env={**os.environ, "FULLMAG_STORAGE_PYTHON": str(interpreter)},
+                text=True, capture_output=True, check=True,
+            )
+            self.assertEqual(json.loads(result.stdout)[-3:], ["codegen-openapi", "--source-root", source])
+
     def test_path_identity_normalizes_windows_and_wsl_forms(self) -> None:
         expected = codegen._path_identity(r"C:\git\fullmag\fullmag")
         for alias in (

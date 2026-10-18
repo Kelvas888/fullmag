@@ -52,6 +52,37 @@ Tabela i hash justfile poniżej zachowują odtwarzalność pierwotnego audytu
 wszystkich 612 aktywnych recept. Przed użyciem innych rodzin niż codzienny DEV
 sprawdź ich bieżące źródła i platformową trasę; to PR nie migruje ich writerów.
 
+## Delta tras codegen — odczyt 19.10.2026
+
+Odczytowy `just --justfile justfile --dump --dump-format json` zwrócił kod 0
+oraz **614 aktywnych recept**. Nie uruchamiał ich ciał. Historyczny manifest TSV
+powyżej pozostaje bazą z 18.10; nie przedstawiaj jego 612 nazw jako bieżącego dumpa.
+
+- `justfile`: 7523 linie, 717681 bajtów, SHA256
+  `4d09df29dc01e54cd48130fb7f152155378a23b0b497c73f6ef3fc6b866b54e8`.
+- `scripts/just_storage_shell.sh`: 883 linie, 60947 bajtów, SHA256
+  `090a3cefec756f03fbf72548feec8d2b9f846161f94af8bde23c51abbf277e9c`.
+- Doszły `docker-dev-codegen` i `generate-api-openapi-legacy`;
+  `generate-api-openapi` zmienił trasę. Ta delta nie kwalifikuje pozostałych rodzin.
+
+| Recepta | Trasa i granica zapisu |
+| --- | --- |
+| `docker-dev-codegen <source>` | `docker_dev.py codegen-openapi` → `docker_dev_codegen.py`; wymaga już działających stałych usług wybranej grupy. Eksportuje OpenAPI z istniejącej binarki backendu i uruchamia generatory w istniejącym frontendzie. Nie buduje, nie restartuje ani nie tworzy kontenerów. |
+| `generate-api-openapi <source>` | Alias tej samej trasy codziennego DEV, z jawnym checkoutem. Wrapper przekazuje samo `source_root`, bez prefiksu argumentu. |
+| `generate-api-openapi-legacy` | Zachowana odrębna trasa release/CI przez `verify_session_persistence.py`; nie jest fallbackiem DEV ani trasą volume-only. |
+
+Codegen zapisuje staging w wolumenie frontendu, a techniczny receipt pod
+`/opt/fullmag/control/backend/codegen/openapi-v2/`. Na hoście publikuje tylko
+cztery wersjonowane źródła w `apps/control-room/src/kernel/api/generated/`:
+`openapi-v2.json`, `openapi-v2-types.ts`, `openapi-v2-client.ts` i
+`openapi-v2-paths.ts`. To zamierzona zmiana kodu, bez hostowego cache/logu buildu.
+Sprawdza obraz, mounty, provenance binarki i zmianę źródeł przed publikacją;
+zmiana checkoutu lub niedostępna usługa zamyka trasę zamiast uruchamiać inną.
+
+Dowody tego etapu: 15 lekkich testów Pythona codegen zaliczonych, w tym
+wykonywalny test wrappera z wybraną ścieżką zawierającą spację. Rzeczywiste
+wykonanie codegen w obu usługach pozostaje **NOT VERIFIED** do ich startu.
+
 ## Granica wspólna dla recept
 
 Od tego miejsca szczegółowy inwentarz rodzin i numery linii opisują audyt bazowy, nie bieżącą trasę Docker DEV. Aktualna trasa jest opisana wyżej; historyczne wiersze Docker dev i Docker dev Compose niżej zachowują dowód wcześniejszych writerów i nie są instrukcją uruchamiania.

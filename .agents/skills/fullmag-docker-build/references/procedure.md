@@ -164,6 +164,24 @@ Tymczasowe metadane Compose mogą przejść przez systemowy temp i są usuwane p
 zakończeniu launchera. Sprawdź ten wyjątek po awarii launchera, ale nie umieszczaj
 tam źródeł, archiwów, pakietów ani logów.
 
+### Generowanie kontraktów API podczas developmentu
+
+Po zmianie schematu najpierw zbuduj i uruchom backend oraz frontend tej samej
+grupy. Następnie z wybranego checkoutu w natywnym PowerShell uruchom:
+
+```powershell
+just docker-dev-codegen "$source"
+# Równoważne wejście:
+just generate-api-openapi "$source"
+```
+
+To operacja na już działających usługach, bez lifecycle i bez dodatkowego
+kontenera budującego. Brak usług lub niezgodna provenance jest błędem; nie
+przechodź do hostowego Cargo ani `generate-api-openapi-legacy`. Staging,
+zależności i receipt pozostają w wolumenach. Cztery wygenerowane źródła
+OpenAPI/TypeScript są celowo publikowane w checkoutcie i wymagają przeglądu
+oraz commita. Test źródeł helpera nie zastępuje rzeczywistego wykonania codegen.
+
 ## 4. Miejsce i retencja
 
 Stosuj [kontrakt danych builda](artifact-policy.md): mapa writerów, ograniczenie
