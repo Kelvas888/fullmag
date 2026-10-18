@@ -390,7 +390,14 @@ uniaxial i cubic anisotropy, ale DMI odrzuca fail-closed z tokenem
 twierdzenia o kwalifikacji runtime. FEM/BEM, PBC/Floquet, STT/thermal/
 magnetoelastic, regional projections, eigen/frequency-domain, DG0/material
 interfaces, order>1, arbitrary OCC, multi-body i multilayer pozostają
-fail-closed do osobnego zakresu.
+fail-closed w bieżącym certyfikacie v1. Osobny, planowany certyfikat v2
+obejmie wyłącznie rozłączne ciała z dodatnią szczeliną: swept `prism6` dla
+warstwy oraz `tet4` dla odłączonego ciała, z body-owned nodal `Ms/Aex/alpha`
+i osobnymi markerami materiału. Demag pozostaje globalnym operatorem
+shared-domain, a exchange jest sumą operatorów body-local i nie przekracza
+szczeliny. Stykające lub nakładające się materiały oraz jawne interlayer
+exchange nadal pozostają fail-closed do czasu zdefiniowania operatora
+interfejsu.
 
 Obecny stan topologii, operatorów i rozszerzenia lokalnych interakcji jest
 `implemented`; dostępny dowód pozostaje wyłącznie source/contract. CPU obejmuje uniform/nodal
@@ -409,6 +416,38 @@ fallbacków zarówno w certyfikacie, jak i nadrzędnym build reporcie oraz
 `degraded=false`.
 Tetrahedralny FMMT v1 pozostaje wyłącznie readerem kompatybilności i nie może
 maskować ani obcinać komórek mieszanych.
+
+### 7.0.2 Planowany multi-material mixed-P1 v2
+
+Dokładny zakres `examples/permalloy_layer_cofeb_rings_relax_300nm.py` wymaga
+rozszerzenia v2, ponieważ obecny certyfikat v1 zakłada jeden magnetic marker i
+magnetic `prism6`. Nowy certyfikat musi zachować per-body `object_id`,
+`material_id`, cell family, exact-sweep record i wynik pomiaru gap/contact.
+Stare czytniki v1 mają odrzucać v2 przed alokacją operatorów.
+Regionalne rekordy v2 rozszerzają wspólny proof v1: cell/facet marker counts,
+Jacobian i scaled-quality evidence, manifold/interface counters, shared-domain
+volume checks oraz topology fingerprint i node-order binding pozostają
+wymagane. Nie mogą zostać zastąpione samym skrótem per-body.
+
+W rozłącznym modelu wystarczają unikalne body-owned nodalne pola P1 dla
+`Ms`, `Aex`, `alpha`, `Ku1` i osi anisotropii. Interpolacja działa tylko w
+`\Omega_b`; nie wolno tworzyć globalnego pola, uśredniać wartości na air gap
+ani stosować ukrytego smoothingu. Dla kontaktu wspólny węzeł nie koduje dwóch
+granic materiałowych, więc planner i native muszą pozostać fail-closed do
+dedykowanego DG0/conforming interface operatora. CPU MFEM/hypre i GPU
+MFEM/libCEED/CUDA mają zachować ten sam weak form, markery, kwadraturę, znaki,
+jednostki i requested/resolved/executed provenance; forced GPU nie może spaść
+na CPU.
+
+Planowane capability IDs to:
+
+```text
+mesh.topology.mixed_p1.v2.disconnected_bodies
+fem.cpu.exchange_demag.mixed_p1.disconnected_bodies
+fem.gpu.exchange_demag.mixed_p1.disconnected_bodies
+```
+
+Są to statusy `planned`, bez dowodu executable/runtime/physics validation.
 
 ## 7.1 Architektura FEM Frequency-Domain I Eigenmodes
 

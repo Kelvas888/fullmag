@@ -134,6 +134,9 @@ validation:
 | `mesh.exact_layer_count` | CPU/GPU `implemented`; FDM `unsupported` | implemented | accepted certificate requires requested = realized = `L`, exact `L+1` magnetic planes for `L in {1,2,3}`, empty report/certificate fallbacks, and `degraded=false` | exact `layers` in `{1,2,3}` for one physical film |
 | `fem.cpu.exchange_demag.mixed_p1` | `implemented` | implemented | bounded CPU/strict/double P1 exchange/Poisson/relaxation contracts accept uniform or nodal-P1 uniaxial and cubic anisotropy plus interfacial/bulk DMI on the magnetic prism oracle; evidence is source/contract only | MFEM/hypre CPU double, exchange + uniform Zeeman + uniform/nodal uniaxial/cubic anisotropy + CPU DMI + Poisson Robin/Dirichlet |
 | `fem.gpu.exchange_demag.mixed_p1` | `implemented` | implemented | bounded GPU/strict/double P1 contracts accept uniform or nodal-P1 uniaxial and cubic anisotropy; DMI remains fail-closed as `gpu_dmi_kernel_not_mixed_p1`; evidence is source/contract only and no runtime qualification is claimed | MFEM/libCEED/CUDA GPU double with uniform/nodal uniaxial/cubic anisotropy on the same certified mesh; GPU DMI rejected |
+| `mesh.topology.mixed_p1.v2.disconnected_bodies` | CPU/GPU `planned`; FDM `unsupported` | planned | additive certificate-v2 contract for per-body markers, `prism6` swept magnetic cells plus disconnected `tet4` magnetic cells, exact sweep evidence only for swept bodies, positive gap/contact evidence, and retention of v1 topology/quality/manifold/facet-marker/fingerprint proof; v1 readers reject v2 | one positive-gap shared-domain mesh with body-owned material records; no contact or bridge |
+| `fem.cpu.exchange_demag.mixed_p1.disconnected_bodies` | `planned` | planned | planned MFEM/hypre body-local exchange and material-weighted mass/damping with global Poisson demag; body-owned nodal P1 fields are allowed only because bodies are disconnected; no managed or scientific evidence | FEM CPU double, body-specific `Ms/Aex/alpha/Ku1/anisU`, PG-BB/LLG after dedicated validation |
+| `fem.gpu.exchange_demag.mixed_p1.disconnected_bodies` | `planned` | planned | planned libCEED/CUDA realization with the same marker, quadrature, weak-form and provenance contract as CPU; forced GPU fails closed when unavailable and cannot fall back to CPU | FEM GPU double, the same positive-gap workload and device-resident operator evidence |
 
 The current first-slice legality is explicit FEM, explicit CPU or GPU, strict mode,
 double precision, P1, one Box, an exact layer count in `{1,2,3}`, one shared-domain airbox,
@@ -152,13 +155,17 @@ or mixed-to-free-tetrahedral fallback is legal.
 
 Nodal `Ku1`/`Ku2` and `Kc1`/`Kc2`/`Kc3` fields and cubic anisotropy are part of
 the bounded source-contract slice. Nodal `Ms`/`Aex`/`alpha` fields remain
-rejected before backend startup. GPU DMI is rejected with the stable
+rejected before backend startup for certificate v1; the v2 disconnected-body
+rows above define a planned body-owned P1 extension without hidden smoothing.
+GPU DMI is rejected with the stable
 `gpu_dmi_kernel_not_mixed_p1` predicate; CPU DMI is admitted by the CPU row.
 Until separately qualified, all modes reject before backend startup when a
 mixed-P1 request includes FEM/BEM, PBC/Floquet, GPU DMI, STT, thermal,
 magnetoelasticity, regional projections, eigen/frequency-domain studies,
 DG0/material interfaces, order greater than one, arbitrary OCC shapes,
-multiple bodies, or multilayers. FDM and hybrid lanes are unsupported. The
+touching/overlapping multiple bodies, or multilayers. Disconnected multiple
+bodies remain rejected by v1 and are admitted only through the planned v2
+rows. FDM and hybrid lanes are unsupported. The
 Gmsh 4.15.2 fixture is topology feasibility evidence and does not promote any
 row to `production_executable` or `validated`. Promotion requires a fresh
 managed public CPU/GPU run of the exact SP4 relaxation stage with immutable
