@@ -20,6 +20,7 @@ import time
 import uuid
 
 import fullmag_storage as storage
+from docker_build_control import BuildControlError
 
 PROFILE = "docker-all-gpu"
 SERVICE = "fem-gpu-toolchain"
@@ -221,6 +222,9 @@ def compose_project(layout, *, direct_development=False):
 
 
 def build(repo, *, direct_development=False):
+    if direct_development:
+        from docker_build_control import build_volume_toolchain
+        return build_volume_toolchain(repo)
     if os.name != "nt":
         raise BootstrapError("Use PowerShell in the Windows checkout for this host bootstrap")
     repo = Path(repo).resolve(strict=True)
@@ -338,10 +342,22 @@ def main(argv=None):
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--direct-development", action="store_true",
                         help="Build dependencies for the independent Compose development route")
+    parser.add_argument("--prepare-development-images", action="store_true",
+                        help="Prepare DEV wrappers in the same project without host staging")
     args = parser.parse_args(argv)
     try:
-        build(args.repo_root, direct_development=args.direct_development)
-    except (BootstrapError, storage.StorageError, OSError, subprocess.SubprocessError) as error:
+        if args.prepare_development_images and not args.direct_development:
+            raise BootstrapError("Development wrappers require --direct-development")
+        receipt = build(args.repo_root, direct_development=args.direct_development)
+        if args.prepare_development_images:
+            from docker_build_control import BuildControl, build_volume_runtime_images
+            from docker_compose_identity import compose_project_identity
+            layout = storage.resolve_layout(args.repo_root, "docker-all-gpu")
+            helper = receipt["inputs"]["build_args"]["FULLMAG_CUDA_BASE_IMAGE"]
+            control = BuildControl(compose_project_identity(layout), helper)
+            build_volume_runtime_images(args.repo_root, control, receipt)
+    except (BootstrapError, storage.StorageError, OSError, subprocess.SubprocessError,
+            BuildControlError) as error:
         parser.exit(2, f"Docker toolchain bootstrap: {error}\n")
     return 0
 

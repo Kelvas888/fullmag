@@ -27,6 +27,10 @@ storage-info:
 docker-dev-toolchain:
     @{{storage_python}} "{{repo_root}}/scripts/bootstrap_docker_toolchain.py" --repo-root "{{repo_root}}" --direct-development
 
+# Prepare image-owned DEV helpers through BuildKit without host contexts.
+docker-dev-images:
+    @{{storage_python}} "{{repo_root}}/scripts/bootstrap_docker_toolchain.py" --repo-root "{{repo_root}}" --direct-development --prepare-development-images
+
 # Direct two-service development: the persistent backend checks/builds source at every start.
 # The source parameter selects the main checkout or a registered worktree.
 docker-dev source_root="" port="3197" script="":

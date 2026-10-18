@@ -116,7 +116,7 @@ esac
 # composite command cannot use a diagnostic marker to bypass its argument check.
 case "${recipe}" in
   *"scripts/bootstrap_docker_toolchain.py"*)
-    toolchain_bootstrap_pattern='^[^[:space:]]+ "[^"]+/scripts/bootstrap_docker_toolchain.py" --repo-root "[^"]+"( --direct-development)?$'
+    toolchain_bootstrap_pattern='^[^[:space:]]+ "[^"]+/scripts/bootstrap_docker_toolchain.py" --repo-root "[^"]+"( --direct-development( --prepare-development-images)?)?$'
     if [[ ! "${recipe}" =~ ${toolchain_bootstrap_pattern} ]]; then
       echo "[fullmag just] invalid Docker toolchain bootstrap recipe" >&2
       exit 2
@@ -125,7 +125,8 @@ case "${recipe}" in
     # heavy lock, and enrolled-runner admission. Do not run prepare-links or
     # the generic runner around it.
     toolchain_mode=()
-    if [[ "${recipe}" == *" --direct-development" ]]; then toolchain_mode+=(--direct-development); fi
+    if [[ "${recipe}" == *" --direct-development"* ]]; then toolchain_mode+=(--direct-development); fi
+    if [[ "${recipe}" == *" --prepare-development-images" ]]; then toolchain_mode+=(--prepare-development-images); fi
     exec "${python_cmd}" "${script_dir}/bootstrap_docker_toolchain.py" --repo-root "${repo_root}" "${toolchain_mode[@]}"
     ;;
   *"scripts/recover_docker_orphan.py"*)

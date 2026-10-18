@@ -369,6 +369,7 @@ def _plan(
     source_root: str | os.PathLike[str],
     toolchain_image: str,
     cargo_profile: str,
+    volume_receipt: str | None = None,
 ) -> dict[str, Any]:
     repo_path = Path(repo)
     if not repo_path.is_absolute() or repo_path.is_symlink() or not repo_path.is_dir():
@@ -377,7 +378,14 @@ def _plan(
     toolchain_image = _require_image_id(toolchain_image, "toolchain image")
     worktree_id = _require_identifier(str(layout.get("worktree_id", "")), "worktree_id")
     project_id = _safe_project_id(layout)
-    receipt = _receipt_path(layout, runroot)
+    if volume_receipt is None:
+        receipt = _receipt_path(layout, runroot)
+    else:
+        if not re.fullmatch(r"docker-volume://[a-z0-9][a-z0-9_.-]*/[a-zA-Z0-9_./-]+", volume_receipt):
+            raise BackendVolumeCacheError("Invalid Docker volume receipt location")
+        if ".." in PurePosixPath(volume_receipt.split("://", 1)[1]).parts:
+            raise BackendVolumeCacheError("Unsafe Docker volume receipt location")
+        receipt = volume_receipt
     identity = cache_key(source_root, worktree_id, toolchain_image, cargo_profile)
     unit_key = _sha256({
         "schema": SCHEMA,
@@ -440,6 +448,7 @@ def prepare(
     source_root: str | os.PathLike[str],
     toolchain_image: str,
     cargo_profile: str = "backend-dev",
+    volume_receipt: str | None = None,
     active_consumers: Iterable[Mapping[str, Any]]
     | Callable[[], Iterable[Mapping[str, Any]]] = (),
 ) -> dict[str, Any]:
@@ -453,7 +462,7 @@ def prepare(
 
     profile = _plan(
         layout, repo, image, runroot, source_root=source_root,
-        toolchain_image=toolchain_image, cargo_profile=cargo_profile,
+        toolchain_image=toolchain_image, cargo_profile=cargo_profile, volume_receipt=volume_receipt,
     )
     if docker is not None:
         profile["volume_documents"] = ensure_volume_pair(
@@ -891,6 +900,7 @@ def validate(
     | Callable[[], Iterable[Mapping[str, Any]]] = (),
     *,
     receipt_path: str | os.PathLike[str] | None = None,
+    receipt_writer: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Admit exact inspected volumes and a fixed maintenance probe receipt."""
 
@@ -907,8 +917,12 @@ def validate(
         checked_profile, _active_consumer_snapshot(active_consumers)
     )
     maintenance = _validate_maintenance_receipt(maintenance_receipt, profile)
-    path = Path(receipt_path or profile["receipt_path"])
-    expected_path = Path(profile["receipt_path"])
+    volume_backed = str(profile["receipt_path"]).startswith("docker-volume://")
+    if volume_backed != (receipt_writer is not None):
+        raise BackendVolumeCacheError("Receipt writer does not match its storage contract")
+    path = (str(receipt_path or profile["receipt_path"]) if volume_backed
+            else Path(receipt_path or profile["receipt_path"]))
+    expected_path = str(profile["receipt_path"]) if volume_backed else Path(profile["receipt_path"])
     if path != expected_path:
         raise BackendVolumeCacheError("backend cache receipt must use the canonical run path")
     receipt = {
@@ -931,7 +945,10 @@ def validate(
         "maintenance_receipt": maintenance,
         "host_receipt_path": str(path),
     }
-    _write_json(path, receipt)
+    if receipt_writer is None:
+        _write_json(path, receipt)
+    else:
+        receipt_writer(receipt)
     result = dict(profile)
     result.update({
         "state": "ready",

@@ -5,14 +5,17 @@ FROM ${DEV_BASE} AS fullmag-backend-direct
 
 USER root
 
-COPY backend_dev.py /opt/fullmag/backend_dev.py
+# Empty prefixes preserve the frozen release context; DEV reads an allowlisted checkout.
+ARG FULLMAG_DOCKER_HELPERS=""
+
+COPY ${FULLMAG_DOCKER_HELPERS}backend_dev.py /opt/fullmag/backend_dev.py
 # The source extractor is supplied by the image-runtime integration worker.
 # Keep it image-owned and immutable; backend_dev.py remains the command
 # boundary and never executes source-controlled commands.
-COPY backend_source.py /opt/fullmag/backend_source.py
+COPY ${FULLMAG_DOCKER_HELPERS}backend_source.py /opt/fullmag/backend_source.py
 # This fixed image-owned helper is used only by the isolated, networkless
 # CAP_CHOWN maintenance service before the unprivileged backend starts.
-COPY backend_volume_cache_maintenance.py /opt/fullmag/backend_volume_cache_maintenance.py
+COPY ${FULLMAG_DOCKER_HELPERS}backend_volume_cache_maintenance.py /opt/fullmag/backend_volume_cache_maintenance.py
 
 # The canonical Makefile's managed-container escape hatch uses /workspace for
 # the private source/build root.  It is an image-owned link to the persistent
