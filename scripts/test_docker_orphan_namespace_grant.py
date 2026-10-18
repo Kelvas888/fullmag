@@ -193,6 +193,21 @@ class NamespaceGrantTests(unittest.TestCase):
         self.assertEqual(validated["new_grant"]["mount_namespace_inode"],
                          os.stat("/proc/self/ns/mnt").st_ino)
 
+    def test_fresh_probe_is_valid_when_namespace_identity_is_reused(self):
+        temporary, root, context, host = _fixture()
+        self.addCleanup(temporary.cleanup)
+        namespace = {}
+        exec(compile(grant.GUEST_NAMESPACE_GRANT_SCRIPT,
+                     "<guest-namespace-grant>", "exec"), namespace)
+        probe = _Probe(namespace, root, host)
+        with mock.patch.dict(os.environ, {"FULLMAG_RUNTIME_IMAGE_ID": IMAGE_ID}, clear=False):
+            namespace["_issue_recovery_namespace_grant"](context, _fs_root=root, _probe=probe)
+            proof = namespace["_issue_recovery_namespace_grant"](
+                context, _fs_root=root, _probe=probe)
+        self.assertEqual(probe.called, [True, True])
+        self.assertEqual(proof["old_grant_sha256"], proof["new_grant_sha256"])
+        self.assertEqual(grant.validate_grant_receipt(proof, context)["status"], "ready")
+
     def test_guest_rejects_owner_replacement_after_probe(self):
         temporary, root, context, host = _fixture()
         self.addCleanup(temporary.cleanup)

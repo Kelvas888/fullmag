@@ -209,7 +209,10 @@ def _grant_context(target: Mapping[str, Any], request: Mapping[str, Any],
                    phase: str) -> dict[str, Any] | None:
     environment = dict(entry.split("=", 1) for entry in target["Config"].get("Env", [])
                        if "=" in entry)
-    if environment.get("FULLMAG_SESSION_STORAGE_PROFILE") != "windows-folder-v1":
+    profile = environment.get("FULLMAG_SESSION_STORAGE_PROFILE")
+    require(profile in {None, "windows-folder-v1"}, "unknown recovery session storage profile")
+    if profile is None:
+        # Native ext4 admission has no Windows storage-profile override.
         return None
     require(any(m.get("Destination") == "/run/fullmag/windows-folder-host.json"
                 for m in target.get("Mounts", [])),
@@ -897,9 +900,11 @@ def _manifest_observation(document: Mapping[str, Any], *, stopped: bool) -> dict
     pid_mode = host.get("PidMode", "")
     device_requests = host.get("DeviceRequests")
     require(isinstance(device_requests, list), "target inspection lacks DeviceRequests")
-    require(pid_mode in {"", "private"} and
-            host.get("NetworkMode") not in {"host"} and
-            host.get("IpcMode") not in {"host", "container"},
+    network_mode = host.get("NetworkMode", "")
+    require(pid_mode in {"", "private"} and host.get("Privileged") is False and
+            isinstance(network_mode, str) and network_mode not in {"host", "container"} and
+            not network_mode.startswith("container:") and
+            host.get("IpcMode", "") in {"", "private", "none"},
             "target does not prove private namespace")
     proof = None
     if stopped:
@@ -1259,9 +1264,13 @@ def _resume_existing_recovery(
         native_arguments("complete", request_container_path, attestation_container_path),
         sdk_result["stub_sha256"], complete_context,
     )
+    _, final_target = _revalidate_before_stop(
+        client, target_id, target_after, engine_before, pins, request, pins_sha256)
+    require(_manifest_observation(final_target, stopped=True) == observed_after,
+            "stopped target lifecycle changed before native completion replay")
     try:
         complete_phase = run_maintenance(
-            target_after, "complete", complete_command, False, "complete-replay"
+            final_target, "complete", complete_command, False, "complete-replay"
         )
     except RecoveryUnknown:
         raise
@@ -1324,6 +1333,7 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     attestation_container_path = f"/state/diagnostics/orphan/{request_id}/attestation.json"
     engine_before = _engine(client)
     target_before = _inspect(client, target_container_id)
+    _manifest_observation(target_before, stopped=_is_factually_stopped(target_before))
     running = _running_containers(client)
     assert_shared_clients_quiescent(target_before, running)
     root = _assert_diagnostics_binding(target_before, root)
@@ -1457,6 +1467,8 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
             current_state.get("Status") != "running"):
         raise RecoveryAborted("backend identity or running state changed before native prepare")
     assert_shared_clients_quiescent(current_target, _running_containers(client))
+    require(_pins_digest(pins, pins_sha256) == pin_digest,
+            "orphan recovery pins changed during read-only probes")
     request_sha = _write_record(request_path, request)
     prepare_context = _grant_context(target_before, request, "prepare")
     if prepare_context is not None:
@@ -1488,6 +1500,8 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     _, current_target = _revalidate_before_stop(
         client, target_container_id, target_before, engine_before, pins,
         request, pins_sha256)
+    if prepare_context is not None:
+        _assert_failed_keeper_only(client, current_target)
     try:
         release = _validate_release_pin(frozen_pins, request["resource_id"])
     except RecoveryUnknown:

@@ -26,8 +26,7 @@ def target():
         "Config": {"User": "65532:65532", "Labels": {
             "com.docker.compose.project": PROJECT,
             "com.docker.compose.service": "backend"},
-            "Env": ["FULLMAG_SESSION_STORAGE_PROFILE=managed-ext4-v1",
-                    "FULLMAG_COMPOSE_PROJECT=" + PROJECT,
+            "Env": ["FULLMAG_COMPOSE_PROJECT=" + PROJECT,
                     "FULLMAG_TOOLCHAIN_IMAGE_ID=sha256:" + "c" * 64,
                     "FULLMAG_BACKEND_CARGO_PROFILE=backend-dev",
                     "FULLMAG_STARTUP_SCRIPT=example.py", "SECRET=do-not-copy",
@@ -352,6 +351,41 @@ class RecoveryRunnerTests(unittest.TestCase):
             self.assertTrue((request_path.parent / "package-probe.json").exists())
             self.assertEqual(len(list((request_path.parent / "pre-stop-resume").iterdir())), 1)
 
+    def test_unknown_prepare_after_native_start_can_resume_exact_administrative_request(self):
+        docker = FakeDocker(target())
+        events = []
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                recovery, "_pure_module", return_value=fake_pure()):
+            root = Path(temporary) / "state"
+            root.mkdir()
+            for document in (docker.before, docker.after):
+                next(m for m in document["Mounts"] if m["Destination"] == "/state")["Source"] = str(root)
+            base_runner = self._runner(events, docker=docker)
+            def lose_native_result(target_document, name, command, preflight, phase):
+                result = base_runner(target_document, name, command, preflight, phase)
+                if phase == "prepare":
+                    raise recovery.RecoveryUnknown("native prepare ran; result observation lost")
+                return result
+            kwargs = dict(docker_client=docker, maintenance_runner=lose_native_result)
+            with self.assertRaises(recovery.RecoveryUnknown):
+                recovery.recover_orphan(recovery_pins(), target()["Id"], PROJECT,
+                                        root / "diagnostics", **kwargs)
+            request_path = root / "diagnostics" / "orphan" / REQUEST / "request.json"
+            original = request_path.read_bytes()
+            with self.assertRaises(recovery.RecoveryUnknown):
+                recovery.recover_orphan(recovery_pins(), target()["Id"], PROJECT,
+                                        root / "diagnostics", **kwargs)
+            self.assertFalse(docker.stopped)
+            kwargs["maintenance_runner"] = self._runner(events, docker=docker)
+            result = recovery.recover_orphan(
+                recovery_pins(), target()["Id"], PROJECT, root / "diagnostics",
+                resume_before_stop=True, **kwargs)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(request_path.read_bytes(), original)
+            self.assertEqual(sum(call[0] == "stop" for call in docker.calls), 1)
+            self.assertTrue((request_path.parent / "package-probe.json").exists())
+            self.assertEqual(len(list((request_path.parent / "pre-stop-resume").iterdir())), 1)
+
     def test_pre_stop_resume_requires_an_existing_request(self):
         docker = FakeDocker(target())
         events = []
@@ -392,6 +426,35 @@ class RecoveryRunnerTests(unittest.TestCase):
                     maintenance_runner=self._runner(events, docker=docker))
             self.assertEqual(events, previous_events)
             self.assertFalse(docker.stopped)
+
+    def test_pin_change_during_readonly_probes_does_not_prepare_or_stop(self):
+        docker = FakeDocker(target())
+        events = []
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "state"
+            state_root.mkdir()
+            for document in (docker.before, docker.after):
+                for mount in document["Mounts"]:
+                    if mount["Destination"] == "/state":
+                        mount["Source"] = str(state_root)
+            pins_path = Path(temporary) / "pins.json"
+            pins_path.write_text(json.dumps(recovery_pins(), sort_keys=True))
+            pins, pins_sha = recovery._load_pins(pins_path)
+            pins["pins_path"] = str(pins_path)
+            def runner(target_document, name, command, preflight, phase):
+                result = self._runner(events, docker=docker)(
+                    target_document, name, command, preflight, phase)
+                if phase == "loader-probe":
+                    pins_path.write_text(pins_path.read_text() + " ")
+                return result
+            with mock.patch.object(recovery, "_pure_module", return_value=fake_pure()):
+                with self.assertRaises((ValueError, recovery.RecoveryAborted)):
+                    recovery.recover_orphan(pins, target()["Id"], PROJECT, state_root / "diagnostics",
+                                            pins_sha256=pins_sha, docker_client=docker,
+                                            maintenance_runner=runner)
+        self.assertNotIn("stop", [call[0] for call in docker.calls])
+
+        self.assertNotIn("prepare", [event[0] for event in events])
 
     def test_pin_change_after_prepare_does_not_stop_target(self):
         docker = FakeDocker(target())
@@ -504,6 +567,28 @@ class RecoveryRunnerTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "completed")
         self.assertEqual([event[0] for event in events], ["complete-replay"])
+        self.assertNotIn("stop", [call[0] for call in docker.calls])
+
+    def test_stopped_replay_refreshes_engine_before_native_completion(self):
+        docker = FakeDocker(target())
+        docker.stopped = True
+        events = []
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                recovery, "_pure_module", return_value=fake_pure()), mock.patch.object(
+                recovery, "_pure_validators", return_value=fake_validators()):
+            root = Path(temporary) / "state"
+            root.mkdir()
+            for document in (docker.before, docker.after):
+                next(m for m in document["Mounts"] if m["Destination"] == "/state")["Source"] = str(root)
+            self._seed_stopped_replay(docker, root)
+            first_engine = recovery._engine(docker)
+            with mock.patch.object(recovery, "_engine", side_effect=[
+                    first_engine, {"ID": "81a2002d-4c88-48aa-b4da-fed771788cfa"}]), self.assertRaisesRegex(
+                        recovery.RecoveryUnknown, "engine identity changed"):
+                recovery.recover_orphan(
+                    recovery_pins(), target()["Id"], PROJECT, root / "diagnostics",
+                    docker_client=docker, maintenance_runner=self._runner(events, docker=docker))
+        self.assertEqual(events, [])
         self.assertNotIn("stop", [call[0] for call in docker.calls])
 
     def test_replay_rejects_changed_gpu_uuid_before_native_completion(self):
@@ -1152,6 +1237,17 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
             probe = json.loads(completed.stdout)
             self.assertEqual(probe["state"], "succeeded")
             self.assertEqual(probe["artifacts"], artifacts)
+
+    def test_unknown_profile_and_shared_namespace_modes_are_rejected(self):
+        document = target()
+        document["Config"]["Env"] = ["FULLMAG_SESSION_STORAGE_PROFILE=unknown-profile"]
+        with self.assertRaisesRegex(ValueError, "unknown recovery session storage profile"):
+            recovery._grant_context(document, {}, "prepare")
+        for field in ("NetworkMode", "IpcMode"):
+            document = target()
+            document["HostConfig"][field] = "container:" + "a" * 64
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "private namespace"):
+                recovery._manifest_observation(document, stopped=False)
 
     def test_windows_namespace_rotation_requires_exact_host_certificate_mount(self):
         document = target()
