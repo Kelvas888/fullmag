@@ -525,6 +525,67 @@ class DockerRuntimeContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exactly one valid running container ID"):
                     runtime._compose_service_container_id(compose_args, "backend")
 
+    def test_retained_container_discovery_is_readonly_and_project_source_bound(self):
+        identity = {
+            "project_name": "fullmag-worktree-test",
+            "project_id": "project-test",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        container_id = "a" * 64
+        document = {
+            "Id": container_id,
+            "Config": {"Labels": {
+                "com.docker.compose.project": identity["project_name"],
+                "org.fullmag.source.project-id": identity["project_id"],
+                "org.fullmag.source.worktree-id": identity["worktree_id"],
+                "org.fullmag.source.checkout-kind": identity["checkout_kind"],
+                "org.fullmag.compose.project": identity["project_name"],
+            }},
+        }
+
+        def read_only_docker(*args, **_kwargs):
+            if args[:2] == ("ps", "--all"):
+                return container_id + "\n"
+            if args[:2] == ("inspect", container_id):
+                return json.dumps([document])
+            raise AssertionError(f"unexpected lifecycle command: {args!r}")
+
+        with patch.object(runtime, "docker", side_effect=read_only_docker) as docker_call:
+            self.assertEqual(
+                runtime._discover_retained_project_containers(
+                    identity["project_name"], identity
+                ),
+                [container_id],
+            )
+        self.assertEqual(docker_call.call_args_list[0].args[:2], ("ps", "--all"))
+        self.assertNotIn("compose", docker_call.call_args_list[0].args)
+
+        foreign = json.loads(json.dumps(document))
+        foreign["Config"]["Labels"]["org.fullmag.source.worktree-id"] = "foreign-worktree"
+        with patch.object(runtime, "docker", side_effect=lambda *args, **_kwargs: (
+                container_id + "\n" if args[:2] == ("ps", "--all")
+                else json.dumps([foreign])
+        )):
+            with self.assertRaisesRegex(ValueError, "source labels"):
+                runtime._discover_retained_project_containers(
+                    identity["project_name"], identity
+                )
+
+    def test_retained_container_discovery_has_bounded_id_list(self):
+        identity = {
+            "project_name": "fullmag-worktree-test",
+            "project_id": "project-test",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        raw = "\n".join("a" * 63 + str(index % 10) for index in range(runtime._MAX_RETAINED_CONTAINER_IDS + 1))
+        with patch.object(runtime, "docker", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "too many container IDs"):
+                runtime._discover_retained_project_containers(
+                    identity["project_name"], identity
+                )
+
     def test_workspace_user_data_is_stable_and_scoped_to_compose_group(self):
         with tempfile.TemporaryDirectory() as directory:
             layout = {"storage_root": directory}

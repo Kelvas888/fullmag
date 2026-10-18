@@ -25,7 +25,7 @@ const HOST_ATTESTATION_PATH: &str = "/run/fullmag/windows-folder-host.json";
 const CONTAINER_ROOT: &str = "/state";
 const GRANT_NAME: &str = ".fullmag-windows-folder-grant.json";
 const DEVELOPMENT_PACKAGE_ROOT: &str = "/opt/fullmag/package";
-const DEVELOPMENT_PROVENANCE_PATH: &str = "/opt/fullmag/provenance.json";
+const DEVELOPMENT_PROVENANCE_PATH: &str = "/opt/fullmag/control/backend/runtime-provenance.json";
 const DEVELOPMENT_RECEIPT_PATH: &str = "/opt/fullmag/package/backend-build-receipt.json";
 const DEVELOPMENT_BUILD_SCHEMA: &str = "fullmag.windows-folder-development-build.v1";
 #[cfg(windows)]

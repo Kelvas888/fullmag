@@ -28,7 +28,7 @@ class WindowsFolderEvidence(unittest.TestCase):
             "cargo_profile": "backend-dev",
             "toolchain_image_id": "sha256:" + "2" * 64,
             "package_root": "/opt/fullmag/package",
-            "provenance_path": "/opt/fullmag/provenance.json",
+            "provenance_path": host.DEVELOPMENT_PROVENANCE_PATH,
             "group_identity": "fullmag-worktree-test",
             "source_identity": {
                 "commit": "a" * 40,
@@ -37,6 +37,13 @@ class WindowsFolderEvidence(unittest.TestCase):
                 "native_source_identity_sha256": "d" * 64,
             },
         }
+
+    def test_development_build_rejects_host_visible_provenance_path(self):
+        development_build = self._development_build({"fullmag": "e" * 64})
+        self.assertEqual(host._validate_development_build(development_build), development_build)
+        development_build["provenance_path"] = "/opt/fullmag/provenance.json"
+        with self.assertRaisesRegex(ValueError, "provenance path is invalid"):
+            host._validate_development_build(development_build)
 
     def test_flush_failure_retains_the_previously_published_certificate(self):
         with tempfile.TemporaryDirectory() as directory:

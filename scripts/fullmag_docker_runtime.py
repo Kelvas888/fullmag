@@ -75,6 +75,8 @@ _SOURCE_IDENTITY_FIELDS = (
     "source_project_id", "source_worktree_id", "source_checkout_kind",
 )
 _SOURCE_LABEL_VALUE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+_MAX_RETAINED_CONTAINER_IDS = 16
+_MAX_RETAINED_CONTAINER_LIST_BYTES = 16 * 1024
 
 
 def _validate_device_access(value: object) -> str:
@@ -1506,6 +1508,40 @@ def _container_inspect(container_id):
             or not actual_id.startswith(container_id)):
         raise ValueError("Reused Docker container identity changed")
     return document
+
+
+def _discover_retained_project_containers(project, source_identity):
+    """Discover owned containers without reopening a temporary Compose file.
+
+    This is an exception-path, read-only observation.  The Compose spec may
+    already have been removed after a failed start, so use Docker's project
+    label filter directly and revalidate every returned container's source
+    labels before recording its identity.
+    """
+    if not isinstance(project, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
+        raise ValueError("Retained container discovery has an invalid Compose project")
+    raw = docker(
+        "ps", "--all", "--quiet",
+        "--filter", f"label=com.docker.compose.project={project}",
+    )
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > _MAX_RETAINED_CONTAINER_LIST_BYTES:
+        raise ValueError("Retained container discovery exceeded its bounded output")
+    ids = [item.strip() for item in raw.splitlines() if item.strip()]
+    if len(ids) > _MAX_RETAINED_CONTAINER_IDS:
+        raise ValueError("Retained container discovery returned too many container IDs")
+    if len(set(ids)) != len(ids) or any(_CONTAINER_ID_RE.fullmatch(item) is None for item in ids):
+        raise ValueError("Retained container discovery returned invalid or duplicate container IDs")
+    from docker_compose_identity import validate_source_labels
+
+    retained = []
+    for container_id in ids:
+        document = _container_inspect(container_id)
+        labels = document.get("Config", {}).get("Labels") if isinstance(document.get("Config"), dict) else None
+        if not isinstance(labels, Mapping) or labels.get("com.docker.compose.project") != project:
+            raise ValueError("Retained container project label differs from the selected Compose group")
+        validate_source_labels(document, source_identity)
+        retained.append(container_id)
+    return retained
 
 
 def _compose_service_container_id(compose_args, service):
@@ -3951,7 +3987,9 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                            timed_out_operation=error.operation,
                            client_timeout_seconds=error.timeout_seconds)
         try:
-            receipt["retained_container_ids"] = docker(*args, "ps", "--all", "--quiet").splitlines()
+            receipt["retained_container_ids"] = _discover_retained_project_containers(
+                project, source_identity
+            )
         except Exception as inspection_error:
             receipt["container_inspection_error"] = str(inspection_error)
         raise
