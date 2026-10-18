@@ -150,13 +150,41 @@ case "${recipe}" in
       --diagnostics-root "${orphan_diagnostics}" "${orphan_resume[@]}"
     ;;
   *"scripts/docker_dev.py"*)
-    docker_dev_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" (build|up --port '[0-9]{4,5}')( --source-root '[^']+')?( --script '[^']+')?[[:space:]]*$"
-    docker_dev_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate --direct-development --run-receipt '[^']+' --previous-config-sha256 '[0-9a-f]{64}'[ ]+(--source-root '[^']+'[ ]+)?--port '[0-9]{4,5}'[[:space:]]*$"
-    if [[ ! "${recipe}" =~ ${docker_dev_pattern} && ! "${recipe}" =~ ${docker_dev_recreate_pattern} ]]; then
+    docker_dev_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" build --gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?[[:space:]]*$"
+    docker_dev_up_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" up --port '([0-9]{4,5})' --gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?( --script '([^']+)')?[[:space:]]*$"
+    docker_dev_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate --direct-development --run-receipt '([^']+)' --previous-config-sha256 '([0-9a-f]{64})' --gpu-access '(auto|required|disabled)'[ ]+(--source-root '([^']+)'[ ]+)?--port '([0-9]{4,5})'[[:space:]]*$"
+    docker_dev_args=(--repo-root "${repo_root}")
+    if [[ "${recipe}" =~ ${docker_dev_build_pattern} ]]; then
+      docker_dev_args+=(build --gpu-access "${BASH_REMATCH[1]}")
+      if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+        docker_dev_args+=(--source-root "${BASH_REMATCH[3]}")
+      fi
+    elif [[ "${recipe}" =~ ${docker_dev_up_pattern} ]]; then
+      docker_dev_args+=(up --port "${BASH_REMATCH[1]}" --gpu-access "${BASH_REMATCH[2]}")
+      if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+        docker_dev_args+=(--source-root "${BASH_REMATCH[4]}")
+      fi
+      if [[ -n "${BASH_REMATCH[6]:-}" ]]; then
+        docker_dev_args+=(--script "${BASH_REMATCH[6]}")
+      fi
+    elif [[ "${recipe}" =~ ${docker_dev_recreate_pattern} ]]; then
+      docker_dev_args+=(recreate --direct-development
+        --run-receipt "${BASH_REMATCH[1]}"
+        --previous-config-sha256 "${BASH_REMATCH[2]}"
+        --gpu-access "${BASH_REMATCH[3]}")
+      if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
+        docker_dev_args+=(--source-root "${BASH_REMATCH[5]}")
+      fi
+      docker_dev_args+=(--port "${BASH_REMATCH[6]}")
+    else
       echo "[fullmag just] invalid direct Docker development recipe" >&2
       exit 2
     fi
-    exec "${python_cmd}" "${resolver}" run --repo-root "${repo_root}" --profile docker-all-gpu -- "${bash_executable}" -euo pipefail -c "${recipe}"
+    # docker_dev.py owns its storage preflight, lifecycle receipt, and host
+    # heavy-lock admission. Do not wrap this path in the legacy generic build
+    # runner, which would create host storage/build-status.json and compatibility
+    # target/cache directories before the Docker-only build starts.
+    exec "${python_cmd}" "${script_dir}/docker_dev.py" "${docker_dev_args[@]}"
     ;;
   *"scripts/run_managed_boris_nf_v2.py"*)
     # Match just's quoted arguments, including escaped checkout apostrophes.
