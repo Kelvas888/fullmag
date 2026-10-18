@@ -66,11 +66,40 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 
 ### Docker Compose — jedyna ścieżka codziennego developmentu
 
+Decyzja użytkownika z 18.10.2026: dane **budowania** (zależności, cache,
+staging, pakiety, konteksty, provenance, logi i receipty builda) mają pozostawać
+w Docker named volumes / BuildKit, bez zapisu w hostowym `storage`. Sesje,
+wyniki, projekty i ustawienia pozostają w storage Windows. Użyj
+[fullmag-docker-build](.agents/skills/fullmag-docker-build/SKILL.md).
+Obecne launchery nie spełniają jeszcze całego tego kontraktu; sprawdź kod
+i mounty przed kwalifikacją. Nie opisuj starej ścieżki jako volume-only i nie
+usuwaj starych cache w ramach jej migracji. Poniższe recepty określają wejścia
+operacyjne, nie dowodzą ukończenia tej migracji.
+
 Obowiązuje grupa Docker Compose przypisana do wybranego checkoutu: `fullmag-master`
 lub `fullmag-worktree-<worktree_id>`. Przed jakimkolwiek buildem ustal źródła i tę
 grupę. Wszystkie buildy odbywają się w jej ramach; osobny kontener budujący poza
 grupą, hostowy kompilator i dawny runner są niedozwolone. Nie uruchamiaj zastępczej
 trasy, jeżeli launcher nie realizuje tego kontraktu — popraw właściwą receptę.
+
+Rozróżniaj dwa etapy: `just docker-dev-toolchain` buduje **obraz zależności**
+przez `docker compose build` / BuildKit, przypięty do projektu tego checkoutu.
+Nie kompiluje aplikacji i nie uruchamia trzeciej stałej usługi. Jego postęp jest
+w wyjściu polecenia / Docker Desktop Builds, nie w logu `backend`. Następnie
+`just docker-dev` uruchamia usługi; kompilacja **aplikacji backendowej** i jej
+runtime odbywają się w tym samym stałym kontenerze `backend`. Zasoby techniczne
+BuildKit i krótkie zarządzane probe nie są osobnymi backendami aplikacji.
+Przed startem launcher może też przez BuildKit przygotować brakujący zgodny
+obraz development-base/helper; nie zastępuje to buildu aplikacji w `backend`.
+Nie uruchamiaj usługi `fem-gpu-toolchain` przez `compose up` jako backendu.
+
+Oba etapy muszą wskazywać ten sam checkout/projekt. Recepta
+`docker-dev-toolchain` wybiera checkout z `repo_root` bieżącego `justfile`, nie
+z późniejszego argumentu `docker-dev`. Dlatego przed oboma poleceniami przejdź
+do wybranego worktree. Bez `just` przekaż ten checkout jako `--repo-root`
+`bootstrap_docker_toolchain.py --direct-development`; nie podawaj `$main`,
+jeżeli aplikacja ma korzystać z innego `$source`. Launcher bootstrapu sprawdza
+wynikową nazwę projektu Compose i zapisuje ją w receipcie.
 
 Grupa ma dokładnie dwie stałe usługi aplikacji:
 
@@ -103,6 +132,7 @@ działający frontend. Zmiana obrazu lub mountów może wymagać odtworzenia us�
 Start po konfiguracji (recepty muszą spełniać powyższy kontrakt grupy):
 
 ```powershell
+Set-Location "<absolutny-checkout-lub-worktree>"
 just docker-dev-toolchain
 just docker-dev "<absolutny-checkout-lub-worktree>" 3197
 # Opcjonalnie: aktywny model z pliku w wybranym checkoutcie.
@@ -126,7 +156,8 @@ manifestach Cargo i `Cargo.lock`, `packages/fullmag-py/pyproject.toml`,
 Instrukcja jest kontraktem, nie dowodem implementacji. Dopóki właściwa recepta
 nie spełnia go i nie ma dowodu runtime, oznacz ją `NOT VERIFIED`.
 
-Szczegóły: [Docker development architecture](docs/guides/docker-development-architecture.md).
+Szczegóły: [Docker development architecture](docs/guides/docker-development-architecture.md) oraz
+[budowanie, zapis danych i retencja](docs/guides/docker-build-storage-lifecycle.md).
 
 ## Sprzątanie danych po etapie deweloperskim
 

@@ -127,7 +127,7 @@ Brak miejsca przerywa start i zachowuje dotychczasowe cache oraz wyniki.
 Odpowiednik bez `just`:
 
 ```powershell
-python -B "$main\scripts\bootstrap_docker_toolchain.py" --repo-root $main --direct-development
+python -B "$source\scripts\bootstrap_docker_toolchain.py" --repo-root $source --direct-development
 python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $source --port 3197
 ```
 
@@ -298,6 +298,10 @@ pozostaje błędem startupu. Nie jest traktowana jako zwykłe odrzucenie modelu.
 przykładu. Udany smoke jednego materiału nie jest dowodem wykonania rings.
 
 ## Dane i wersje
+
+Dokładne lokalizacje, etapy toolchain/aplikacja, procedura kontroli miejsca
+i rzeczywiste granice automatycznego sprzątania:
+[Docker DEV — budowanie, zapis danych i retencja](docker-build-storage-lifecycle.md).
 
 | Dane | Trwałe miejsce |
 | --- | --- |
