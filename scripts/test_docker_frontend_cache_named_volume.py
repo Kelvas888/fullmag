@@ -46,7 +46,14 @@ class FakeDocker:
                 if value == "--label":
                     label, item = args[index + 1].split("=", 1)
                     labels[label] = item
-            self.volumes[name] = {"Name": name, "Driver": "local", "Labels": labels}
+            self.volumes[name] = {
+                "Name": name,
+                "Driver": "local",
+                "Scope": "local",
+                "Options": {},
+                "Mountpoint": f"/var/lib/docker/volumes/{name}/_data",
+                "Labels": labels,
+            }
             return name
         raise AssertionError(f"unexpected Docker call: {args!r}")
 
@@ -144,6 +151,75 @@ class FrontendNamedVolumeTests(unittest.TestCase):
             self.assertTrue(
                 all(args[:2] != ("compose", "run") for args, _ in docker.calls)
             )
+
+    def test_prepare_rejects_local_volumes_redirected_to_host_storage(self) -> None:
+        project_id = "fullmag-worktree-demo"
+        key = "a" * 64
+        state_name = cache._v2_volume_name(project_id, key)
+        labels = {
+            cache.VOLUME_SCHEMA_LABEL: cache.SCHEMA,
+            cache.VOLUME_PROFILE_LABEL: cache.PROFILE,
+            cache.VOLUME_PROJECT_LABEL: project_id,
+            cache.VOLUME_KEY_LABEL: key,
+        }
+        hostile_records = (
+            {
+                "Name": state_name,
+                "Driver": "local",
+                "Scope": "local",
+                "Options": {
+                    "type": "none",
+                    "device": "/run/desktop/mnt/host/c/fullmag/storage",
+                    "o": "bind",
+                },
+                "Mountpoint": f"/var/lib/docker/volumes/{state_name}/_data",
+                "Labels": labels,
+            },
+            {
+                "Name": state_name,
+                "Driver": "local",
+                "Scope": "local",
+                "Options": {},
+                "Mountpoint": "/run/desktop/mnt/host/c/fullmag/storage",
+                "Labels": labels,
+            },
+        )
+        for record in hostile_records:
+            with self.subTest(record=record):
+                docker = FakeDocker()
+                docker.volumes[state_name] = record
+                with self.assertRaises(cache.FrontendCacheError):
+                    cache._v2_ensure_volume(
+                        docker, name=state_name, project_id=project_id, key=key
+                    )
+
+    def test_prepare_rejects_control_volume_redirected_to_host_storage(self) -> None:
+        name = "fullmag-worktree-demo-build-control-v1"
+        for record in (
+            {
+                "Name": name,
+                "Driver": "local",
+                "Scope": "local",
+                "Options": {"type": "none", "device": "C:/fullmag/storage", "o": "bind"},
+                "Mountpoint": f"/var/lib/docker/volumes/{name}/_data",
+                "Labels": {},
+            },
+            {
+                "Name": name,
+                "Driver": "local",
+                "Scope": "local",
+                "Options": {},
+                "Mountpoint": "/mnt/c/fullmag/storage",
+                "Labels": {},
+            },
+        ):
+            with self.subTest(record=record):
+                docker = FakeDocker()
+                docker.volumes[name] = record
+                with self.assertRaises(cache.FrontendCacheError):
+                    cache._v2_ensure_control_volume(
+                        docker, name=name, project_id="fullmag-worktree-demo"
+                    )
 
     def test_fresh_state_volume_is_seeded_with_frontend_ownership(self) -> None:
         root = Path(__file__).parents[1]

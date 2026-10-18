@@ -19,6 +19,11 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 
+from docker_named_volume_safety import (
+    DockerNamedVolumeSafetyError,
+    validate_local_named_volume,
+)
+
 
 SCHEMA = "fullmag.frontend-cache.v2"
 KEY_SCHEMA = "fullmag.frontend-cache-key.v2"
@@ -772,10 +777,12 @@ def _v2_ensure_volume(
         record = _v2_volume_inspect(docker, name)
     if record is None:
         raise FrontendCacheError(f"Docker did not publish named volume {name}")
-    if record.get("Name") != name:
-        raise FrontendCacheError("Docker volume identity changed")
-    if record.get("Driver") not in (None, "local"):
-        raise FrontendCacheError("frontend development volume must use Docker's local driver")
+    try:
+        validate_local_named_volume(record, name)
+    except DockerNamedVolumeSafetyError as error:
+        raise FrontendCacheError(
+            f"frontend development volume has unsafe Docker backing: {error}"
+        ) from error
     observed = record.get("Labels")
     if not isinstance(observed, Mapping):
         raise FrontendCacheError("frontend development volume has no labels")
@@ -813,10 +820,14 @@ def _v2_ensure_control_volume(
             timeout=60,
         )
         record = _v2_volume_inspect(docker, name)
-    if record is None or record.get("Name") != name:
+    if record is None:
         raise FrontendCacheError("Docker did not publish the shared build-control volume")
-    if record.get("Driver") not in (None, "local"):
-        raise FrontendCacheError("shared build-control volume must use Docker's local driver")
+    try:
+        validate_local_named_volume(record, name)
+    except DockerNamedVolumeSafetyError as error:
+        raise FrontendCacheError(
+            f"shared build-control volume has unsafe Docker backing: {error}"
+        ) from error
     labels = record.get("Labels")
     if labels is not None and not isinstance(labels, Mapping):
         raise FrontendCacheError("shared build-control volume labels are malformed")

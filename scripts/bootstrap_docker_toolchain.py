@@ -20,6 +20,10 @@ import threading
 import time
 
 import fullmag_storage as storage
+from docker_named_volume_safety import (
+    DockerNamedVolumeSafetyError,
+    validate_local_named_volume,
+)
 
 PROFILE = "docker-all-gpu"
 SERVICE = "fem-gpu-toolchain"
@@ -361,7 +365,15 @@ def ensure_control_volume(project):
         )
         value = json.loads(docker("volume", "inspect", volume))
     document = value[0]
-    labels = document.get("Labels") if isinstance(document, dict) else None
+    if not isinstance(document, dict):
+        raise BootstrapError("Toolchain control volume inspection is malformed")
+    try:
+        validate_local_named_volume(document, volume)
+    except DockerNamedVolumeSafetyError as error:
+        raise BootstrapError(
+            f"Toolchain control volume has unsafe Docker backing: {error}"
+        ) from error
+    labels = document.get("Labels")
     if (not isinstance(labels, dict)
             or labels.get("com.fullmag.compose.project") != project
             or labels.get("com.fullmag.toolchain.control.schema") != CONTROL_VOLUME_SCHEMA

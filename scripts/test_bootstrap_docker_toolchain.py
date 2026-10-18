@@ -70,6 +70,33 @@ class ToolchainBootstrapTests(unittest.TestCase):
         })
         self.assertNotEqual(volume, bootstrap.control_volume_name("fullmag-master"))
 
+    def test_control_volume_rejects_local_driver_options_and_host_mountpoints(self):
+        project = "fullmag-worktree-feature-abc123"
+        volume = bootstrap.control_volume_name(project)
+        labels = {
+            "com.fullmag.compose.project": project,
+            "com.fullmag.toolchain.control.schema": bootstrap.CONTROL_VOLUME_SCHEMA,
+            "com.fullmag.toolchain.control.project": project,
+            "com.fullmag.toolchain.control.mount": bootstrap.CONTROL_ROOT,
+        }
+        hostile_records = (
+            {
+                "Name": volume, "Driver": "local", "Scope": "local",
+                "Options": {"type": "none", "device": "C:/fullmag/storage", "o": "bind"},
+                "Mountpoint": f"/var/lib/docker/volumes/{volume}/_data", "Labels": labels,
+            },
+            {
+                "Name": volume, "Driver": "local", "Scope": "local", "Options": {},
+                "Mountpoint": "/run/desktop/mnt/host/c/fullmag/storage", "Labels": labels,
+            },
+        )
+        for record in hostile_records:
+            with self.subTest(record=record), mock.patch.object(
+                bootstrap, "docker", return_value=json.dumps([record])
+            ):
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.ensure_control_volume(project)
+
     def test_toolchain_image_is_stable_and_group_scoped(self):
         project = "fullmag-worktree-feature-abc123"
         image = bootstrap.toolchain_image_reference(project)

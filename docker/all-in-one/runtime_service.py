@@ -54,6 +54,9 @@ MAX_HOST_LEDGER_BYTES = 8 * 1024 * 1024
 # service still receives the unchanged accepted-store root and therefore keeps
 # its session/result layout intact.
 RUNTIME_CONTROL_ROOT = Path("/opt/fullmag/runtime-control")
+BUILD_CONTROL_ROOT = Path("/opt/fullmag/control")
+RUNTIME_PROVENANCE_RELATIVE = Path("backend/runtime-provenance.json")
+RUNTIME_PROVENANCE_PATH = BUILD_CONTROL_ROOT / RUNTIME_PROVENANCE_RELATIVE
 RUNTIME_SERVICES_RELATIVE = Path("runtime-services")
 CONFIG_RELATIVE = Path("runtime-service/docker-all.json")
 PROCESS_RECEIPT_RELATIVE = Path("runtime-service/process-tree.json")
@@ -533,6 +536,14 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
     source = _env_path(environment, "FULLMAG_REPO_ROOT", SOURCE_ROOT)
     package = _env_path(environment, "FULLMAG_RUNTIME_ROOT", PACKAGE_ROOT)
     config = runtime_control / CONFIG_RELATIVE
+    provenance = _env_path(
+        environment, "FULLMAG_RUNTIME_PROVENANCE", IMAGE_ROOT / "provenance.json"
+    )
+    if (
+        "FULLMAG_RUNTIME_PROVENANCE" in environment
+        and provenance != RUNTIME_PROVENANCE_PATH
+    ):
+        _fail("FULLMAG_RUNTIME_PROVENANCE must use the fixed build-control provenance path")
     if state != STATE_ROOT or storage != STATE_ROOT:
         _fail("all-in-Docker accepted storage is fixed to /state")
     if runs != STATE_ROOT / "runs" / WORKTREE_ID:
@@ -561,7 +572,7 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
         source=source,
         package=package,
         config=config,
-        provenance=IMAGE_ROOT / "provenance.json",
+        provenance=provenance,
         host_certificate=HOST_CERTIFICATE,
     )
 

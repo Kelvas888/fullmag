@@ -52,6 +52,7 @@ def _docker_environment() -> dict[str, str]:
         ),
         "FULLMAG_REPO_ROOT": "/opt/fullmag/source",
         "FULLMAG_RUNTIME_ROOT": "/opt/fullmag/package",
+        "FULLMAG_RUNTIME_PROVENANCE": "/opt/fullmag/control/backend/runtime-provenance.json",
         "FULLMAG_WORKTREE_ID": "docker-all",
     }
 
@@ -63,6 +64,10 @@ class RuntimeControlVolumeTests(unittest.TestCase):
         self.assertEqual(paths.state, Path("/state"))
         self.assertEqual(paths.store, Path("/state/runs/docker-all/session-store"))
         self.assertEqual(paths.state_root, Path("/opt/fullmag/runtime-control"))
+        self.assertEqual(
+            paths.provenance,
+            Path("/opt/fullmag/control/backend/runtime-provenance.json"),
+        )
         self.assertEqual(
             runtime_service.runtime_services_root(paths),
             Path("/opt/fullmag/runtime-control/runtime-services"),
@@ -85,6 +90,24 @@ class RuntimeControlVolumeTests(unittest.TestCase):
             runtime_service._store_relative_path(paths, PurePosixPath("runs/run.json")),
             Path("/state/runs/docker-all/session-store/runs/run.json"),
         )
+
+    def test_canonical_paths_rejects_unmanaged_runtime_provenance_location(self):
+        environment = _docker_environment()
+        environment["FULLMAG_RUNTIME_PROVENANCE"] = "/state/provenance.json"
+        with self.assertRaisesRegex(
+            runtime_service.RuntimeServiceError, "FULLMAG_RUNTIME_PROVENANCE.*fixed"
+        ):
+            runtime_service.canonical_paths(environment)
+
+    def test_source_identity_uses_build_control_volume_provenance(self):
+        paths = runtime_service.canonical_paths(_docker_environment())
+        provenance = {
+            "commit": "a" * 40,
+            "native_source_identity": {"source_snapshot_sha256": "b" * 64},
+        }
+        with patch.object(runtime_service, "_read_json", return_value=provenance) as read_json:
+            self.assertEqual(runtime_service._source_identity(paths), ("a" * 40, "b" * 64))
+        read_json.assert_called_once_with(paths.provenance, "runtime image provenance")
 
     def test_api_environment_keeps_user_store_and_technical_cache_separate(self):
         paths = runtime_service.canonical_paths(_docker_environment())
