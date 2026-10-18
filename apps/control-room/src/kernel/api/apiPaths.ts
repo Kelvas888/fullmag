@@ -1190,6 +1190,8 @@ export function workspaceItemArchiveUrl(baseUrl: string, id: string): string {
 export function workspaceItemThumbnailUrl(baseUrl: string, id: string): string {
   return `${baseUrl}${WORKSPACE_ITEM_THUMBNAIL_PATH.replace("{id}", encodeURIComponent(id))}`;
 }
+export const PLATFORM_COMPUTE_ALLOCATION_PATH = openApiV2Path("/v2/platform/compute/allocations/{allocation_id}");
+export const PLATFORM_COMPUTE_QUEUE_PATH = openApiV2Path("/v2/platform/compute/queue");
 export const PLATFORM_COMPUTE_PROFILES_PATH = openApiV2Path("/v2/platform/compute/profiles");
 export const PLATFORM_COMPUTE_PREVIEW_PATH = openApiV2Path("/v2/platform/compute/preview");
 export const PLATFORM_COMPUTE_NODES_PATH = openApiV2Path("/v2/platform/compute/nodes");

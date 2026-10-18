@@ -2296,12 +2296,21 @@ mod tests {
         )
         .unwrap();
         let inventory_owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
-        let sample = fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner(
+        let mut sample = fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner(
             &ledger,
             inventory_owner.descriptor(),
             None,
         )
         .unwrap();
+        // This fixture exercises host admission and must not depend on the
+        // CI runner's delegated cgroup configuration. Keep the observed
+        // capacity deterministic while retaining the real owner identity.
+        sample.cpu.effective_capacity_millis =
+            fullmag_session::compute_node_snapshot::Observation::Available {
+                value: policy.total_budget.cpu_millis,
+            };
+        sample.enforcement.cpu_quota =
+            fullmag_session::compute_node_snapshot::EnforcementStatus::Supported;
         ledger
             .publish_compute_node_snapshot_with_owner(&inventory_owner, &sample)
             .unwrap();
@@ -2626,6 +2635,8 @@ mod tests {
             None,
             &BTreeSet::new(),
             &[],
+            None,
+            None,
             None,
             Duration::from_secs(5),
             Duration::from_secs(1),

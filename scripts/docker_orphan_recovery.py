@@ -103,10 +103,18 @@ def _container(value: Any, label: str) -> str:
     return value
 
 
-def _engine(value: Any, label: str) -> str:
-    if not isinstance(value, str) or ENGINE_RE.fullmatch(value) is None:
+def validate_engine_id(value: Any, label: str = "Docker engine ID") -> str:
+    """Preserve Docker's canonical UUID or legacy digest identity verbatim."""
+    if not isinstance(value, str):
         _fail(f"{label} must be an immutable Docker engine ID")
-    return value
+    if ENGINE_RE.fullmatch(value) is not None:
+        _sha(value.removeprefix("sha256:"), label, nonzero=True)
+        return value
+    return _uuid_text(value, label)
+
+
+def _engine(value: Any, label: str) -> str:
+    return validate_engine_id(value, label)
 
 
 def _portable_id(value: Any, label: str) -> str:
@@ -331,12 +339,17 @@ def _engine_id(document: Mapping[str, Any], label: str) -> str:
 
 
 def _engine_id_sha(document: Mapping[str, Any], pins: Mapping[str, Any]) -> str:
-    if "docker_engine_id_sha256" in pins:
-        return _sha(pins["docker_engine_id_sha256"], "docker_engine_id_sha256", nonzero=True)
-    if isinstance(pins.get("engine"), Mapping) and "sha256" in pins["engine"]:
-        return _sha(pins["engine"]["sha256"], "docker_engine_id_sha256", nonzero=True)
     engine_id = _engine_id(document, "Docker engine")
-    return hashlib.sha256(engine_id.encode("utf-8")).hexdigest()
+    observed = hashlib.sha256(engine_id.encode("utf-8")).hexdigest()
+    candidates = []
+    if "docker_engine_id_sha256" in pins:
+        candidates.append(pins["docker_engine_id_sha256"])
+    if isinstance(pins.get("engine"), Mapping) and "sha256" in pins["engine"]:
+        candidates.append(pins["engine"]["sha256"])
+    for candidate in candidates:
+        if _sha(candidate, "docker_engine_id_sha256", nonzero=True) != observed:
+            _fail("pinned Docker engine digest differs from the observed engine")
+    return observed
 
 
 def _labels(container: Mapping[str, Any]) -> dict[str, Any]:

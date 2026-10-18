@@ -495,7 +495,8 @@ function ProjectBatchesPage({ projectId }: { readonly projectId: string }) {
         kind: "status",
         message: caseLifecycleCompletionMessage(current.caseId, plan),
         cancellationRunId: reconciledRun?.run_id,
-        cancellationCatalogRevision: reconciledRun?.catalog_state === "materialized"
+        cancellationCatalogRevision: reconciledRun?.catalog_state === "materialized" &&
+            typeof reconciledRun.catalog_revision === "number"
           ? reconciledRun.catalog_revision
           : undefined,
       });
@@ -869,6 +870,7 @@ function ProjectBatchesPage({ projectId }: { readonly projectId: string }) {
                   const suppressCaseCancellation = caseFeedback?.kind === "status" &&
                     typeof caseFeedbackCatalogRevision === "number" &&
                     publishedRun?.catalog_state === "materialized" &&
+                    typeof publishedRun.catalog_revision === "number" &&
                     caseFeedback.cancellationRunId === publishedRun.run_id &&
                     publishedRun.catalog_revision <= caseFeedbackCatalogRevision;
                   const caseHasCancelableTasks = publishedRun?.catalog_state === "materialized" &&

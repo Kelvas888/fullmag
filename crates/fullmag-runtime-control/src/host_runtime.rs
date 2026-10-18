@@ -101,12 +101,20 @@ mod recovery_tests {
         .unwrap();
         let inventory_owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
         if include_sample {
-            let sample = crate::compute_node_probe::sample_compute_node_for_owner(
+            let mut sample = crate::compute_node_probe::sample_compute_node_for_owner(
                 &ledger,
                 inventory_owner.descriptor(),
                 None,
             )
             .unwrap();
+            // Recovery fixtures need admission-ready capacity independently of
+            // the runner's cgroup delegation, with the real inventory owner.
+            sample.cpu.effective_capacity_millis =
+                fullmag_session::compute_node_snapshot::Observation::Available {
+                    value: policy.total_budget.cpu_millis,
+                };
+            sample.enforcement.cpu_quota =
+                fullmag_session::compute_node_snapshot::EnforcementStatus::Supported;
             ledger
                 .publish_compute_node_snapshot_with_owner(&inventory_owner, &sample)
                 .unwrap();

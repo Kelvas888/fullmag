@@ -222,7 +222,9 @@ describe("ProjectBatchesSection", () => {
     expect(container.textContent).toContain("B_ext=0.01 T");
     expect(container.textContent).toContain("B_ext=0.02 T");
     expect(container.textContent).toContain("Planned run: run-a");
-    expect(container.textContent).toContain("Child run has not been published.");
+    expect(container.textContent).toContain(
+      "Child run has not been published; case cancellation is unavailable before publication.",
+    );
     expect(container.textContent).toContain("Published child run: run-b");
     expect(container.textContent).toContain("Task catalog revision 7 · 1 task(s)");
     expect(container.textContent).toContain("running · task-b");
@@ -585,6 +587,66 @@ describe("ProjectBatchesSection", () => {
       "task-b",
       "Cancelled from the project batch inspector",
       9,
+    );
+  });
+
+  it("does not send queued case cancellation when its catalog revision is unknown", async () => {
+    const cancelTask = vi.fn();
+    fakes.cancelTaskById.mockReturnValue(cancelTask);
+    const unknownRevisionCase = {
+      case_id: "case-unknown-revision",
+      parameter_tuple: { B_ext: 0.03 },
+      planned_run_id: "run-unknown-revision",
+      state: "materialized" as const,
+      published_run: {
+        run_id: "run-unknown-revision",
+        catalog_state: "materialized" as const,
+        catalog_revision: null,
+        tasks: [{ task_id: "task-unknown-revision", lifecycle: "queued" as const, cancellation_requested: false }],
+      },
+    };
+    const loadAllCases = vi.fn().mockResolvedValue([unknownRevisionCase]);
+    fakes.loadAllBatchCases.mockReturnValue(loadAllCases);
+    fakes.listBatchCases.mockImplementation((_projectId: string, batchId: string | null) => batchId === "batch-a"
+      ? {
+          data: {
+            batch_id: "batch-a",
+            axes: [{ name: "B_ext", canonical_unit: "T" }],
+            cases: [unknownRevisionCase],
+            next_cursor: null,
+          },
+          error: null,
+          refetch: vi.fn(),
+          status: "ready",
+        }
+      : {
+          data: null,
+          error: null,
+          refetch: vi.fn(),
+          status: "idle",
+        });
+    vi.stubGlobal("crypto", { randomUUID: vi.fn().mockReturnValue("operation-unknown-revision") });
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    roots.push(root);
+
+    await act(async () => root.render(<ProjectBatchesSection />));
+    const batch = findElement(
+      container as unknown as TestElement,
+      (element) => element.tagName === "BUTTON" && element.textContent?.trim() === "batch-a",
+      "batch disclosure",
+    );
+    await act(async () => batch.click());
+    const cancelCase = findElement(
+      container as unknown as TestElement,
+      (element) => element.tagName === "BUTTON" && element.getAttribute("aria-label") === "Cancel case case-unknown-revision",
+      "case cancellation button",
+    );
+    await act(async () => cancelCase.click());
+
+    expect(cancelTask).not.toHaveBeenCalled();
+    expect(container.textContent).toContain(
+      "Could not prepare case cancellation: Task catalog revision is missing for queued run run-unknown-revision.",
     );
   });
 

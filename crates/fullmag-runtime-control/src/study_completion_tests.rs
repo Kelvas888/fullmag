@@ -83,7 +83,7 @@ fn fixture() -> Fixture {
     let store = SessionStore::open(directory.path().join("store")).unwrap();
     let study: StudyPlan = serde_json::from_value(json!({
         "schema_version": STUDY_PLAN_SCHEMA_VERSION, "study_id": "completion-study", "revision": 1,
-        "steps": ["producer", "consumer"].map(|id| json!({
+        "steps": (["producer", "consumer"].map(|id| json!({
             "step_id": id, "label": id, "kind": {"kind": "primitive", "stage_kind": "run"},
             "model": {"model_id": "m", "version": "v1"},
             "solver_config": {"preset_id": "s", "version": "v1"},
@@ -91,7 +91,7 @@ fn fixture() -> Fixture {
             "execution_profile": {"profile_id": "e", "version": "v1"},
             "until_seconds": 1e-9, "acceptance": {"kind": "any"}, "acquisition": "exclusive",
             "completion_dependencies": if id == "consumer" { vec!["producer"] } else { vec![] }
-        }))
+        })))
     }))
     .unwrap();
     let catalog = StudyProblemCatalog::from_entries(
@@ -204,6 +204,7 @@ fn fixture() -> Fixture {
         heartbeat_at: now,
         heartbeat_sequence: 0,
         released_at: None,
+        host_launch_binding: None,
     };
     store.commit_resource_lease(&lease).unwrap();
     let mut coordinator =

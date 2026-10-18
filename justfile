@@ -39,8 +39,8 @@ docker-dev-recreate run_receipt previous_config_sha256 source_root="" port="3197
 
 # Explicit operator-only recovery of a consumed worker permit after namespace teardown.
 # The pinned request never retries Solve; unknown outcome and history are retained.
-docker-dev-recover-orphan pins target_container project diagnostics_root:
-    @{{storage_python}} "{{repo_root}}/scripts/recover_docker_orphan.py" --pins {{quote(pins)}} --target-container {{quote(target_container)}} --project {{quote(project)}} --diagnostics-root {{quote(diagnostics_root)}}
+docker-dev-recover-orphan pins target_container project diagnostics_root resume_before_stop="false":
+    @{{storage_python}} "{{repo_root}}/scripts/recover_docker_orphan.py" --pins {{quote(pins)}} --target-container {{quote(target_container)}} --project {{quote(project)}} --diagnostics-root {{quote(diagnostics_root)}} {{if resume_before_stop == "true" { "--resume-before-stop" } else if resume_before_stop == "false" { "" } else { error("resume_before_stop must be true or false") }}}
 
 # Compatibility start alias: starts both fixed services; use backend restart for iteration.
 docker-dev-build source_root="":

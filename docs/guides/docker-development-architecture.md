@@ -360,6 +360,15 @@ samej grupie nie uruchamia buildu, API ani solvera; nie ma sieci, GPU ani
 publikowanych portów. Wyłącznie natywne CLI zapisuje dowód i zwalnia zasoby.
 Historia runu i zużyty token startu pozostają; Solve nie jest ponawiany.
 
+Pin `device_release` przed zatrzymaniem zawiera dokładny `resource_id`,
+`mapping_sha256` i opcjonalny `gpu_uuid`, bez pola `mapping_detached`.
+Nie poświadcza przyszłego odłączenia. Dopiero rzeczywista obserwacja
+`exited` / PID 0 / `FinishedAt` prywatnego kontenera pozwala adapterowi
+zapisać `mapping_detached: true` w manifeście i atestacji zakończenia.
+Istniejące niezmienne piny starszej wersji z tym polem wolno odczytać
+wyłącznie podczas replayu już zakończonego namespace i zachowanej atestacji;
+nie uprawniają one do rozpoczęcia nowej procedury zatrzymania.
+
 Nie zmieniaj UUID requestu ani pliku pins przy ponowieniu po przerwaniu.
 Wynik `unknown` wymaga uzgodnienia z zachowanymi dowodami; nie wolno usuwać
 blokad ani wpisywać ręcznie stanu `stopped`. Po potwierdzonym odzyskaniu

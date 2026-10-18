@@ -62,6 +62,23 @@ korzysta z prawdziwego sterownika. Dowód loadera i jego digest pozostają
 w manifeście operatora. Probe jest tylko do odczytu i poprzedza mutacje intentu
 oraz zatrzymanie wskazanego backendu.
 
+Dla `windows-folder-v1` każda faza administracyjna wystawia własny grant
+storage w swojej przestrzeni montowania. Korzysta z przypiętego issuer'a
+`windows_folder_probe`, pełnych prób operacyjnych i hostowego certyfikatu.
+Grant poprzedniego backendu nie jest dowodem bieżącego namespace. Natywne
+sprawdzenie inode namespace pozostaje obowiązkowe. Przed rotacją adapter
+potwierdza brak writerów poza terminalnym keeperem, a helper ponownie wiąże
+request, konfigurację, Failed ownera i jego dwa terminalne procesy potomne.
+Dowód rotacji jest przypięty do fazy i tego samego requestu.
+
+Przerwanie przed potwierdzonym prepare nie zmienia UUID requestu. Jawny
+parametr `--resume-before-stop` pozwala ponowić wyłącznie administracyjne
+prepare z identycznym requestem i pins. Nowe próby tylko do odczytu mają
+oddzielny katalog dowodów; poprzednie rekordy nie są nadpisywane. Istniejący
+dowód prepare lub zatrzymania blokuje tę ścieżkę. Nie jest to wznowienie
+symulacji ani dowód wyjścia workera. Domyślne wywołanie nadal odmawia
+powtórzenia przy istniejącym request i działającym kontenerze.
+
 ## Zgodność i migracja
 
 Nowy proof ma odrębną semantykę i wersję. Nie kodujemy go jako `Worker`,

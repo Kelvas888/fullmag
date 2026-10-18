@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path
 import re
 import stat
@@ -155,7 +156,8 @@ print(json.dumps({'schema':'fullmag.orphan-recovery-loader.v1','status':'ready'}
 
 NONCOMPUTE_EXECUTOR = r'''
 import hashlib, json, os, pathlib, re, subprocess, sys, tempfile
-expected, binary, *arguments = sys.argv[1:]
+expected, grant_json, binary, *arguments = sys.argv[1:]
+grant_context = json.loads(grant_json)
 if binary != '/opt/fullmag/package/bin/fullmag-runtime-service' or not arguments:
     raise SystemExit('only the pinned native administrative command is permitted')
 if arguments[0] not in {'--fullmag-recovery-loader-probe',
@@ -187,29 +189,111 @@ if arguments[0] == '--fullmag-recovery-loader-probe':
     print(json.dumps({'schema':'fullmag.orphan-recovery-loader.v1', 'status':'ready',
                       'mode':'cuda-sdk-stub', 'stub_sha256':digest, 'gpu_devices':False}))
 else:
+    if grant_context is not None:
+        proof = _issue_recovery_namespace_grant(grant_context)
+        print(json.dumps(proof, sort_keys=True), flush=True)
     os.execve(binary, [binary, *arguments], environment)
 '''
 
 
-def noncompute_command(command: Sequence[str], stub_sha256: str) -> list[str]:
+def _namespace_grant_module():
+    import importlib.util
+    module_path = Path(__file__).with_name("docker_orphan_namespace_grant.py")
+    spec = importlib.util.spec_from_file_location("docker_orphan_namespace_grant", module_path)
+    require(spec is not None and spec.loader is not None, "namespace grant helper is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _grant_context(target: Mapping[str, Any], request: Mapping[str, Any],
+                   phase: str) -> dict[str, Any] | None:
+    environment = dict(entry.split("=", 1) for entry in target["Config"].get("Env", [])
+                       if "=" in entry)
+    profile = environment.get("FULLMAG_SESSION_STORAGE_PROFILE")
+    require(profile in {None, "windows-folder-v1"}, "unknown recovery session storage profile")
+    if profile is None:
+        # Native ext4 admission has no Windows storage-profile override.
+        return None
+    require(any(m.get("Destination") == "/run/fullmag/windows-folder-host.json"
+                for m in target.get("Mounts", [])),
+            "Windows recovery requires the exact mounted host certificate")
+    return _namespace_grant_module().build_grant_context(
+        request, phase, image_id=target["Image"], target_container_id=target["Id"])
+
+
+def _assert_failed_keeper_only(client: Callable[..., Any], target: Mapping[str, Any]) -> None:
+    """Before replacing a Windows grant, require the terminal keeper alone.
+
+    Failed owner metadata is checked again by the guest and native locks. This
+    host observation additionally rejects a live API, worker, or build process.
+    """
+    output = _docker_call(client, "top", str(target["Id"]), "-eo", "pid,ppid,comm,args")
+    rows = [line.split(None, 3) for line in output.splitlines()[1:] if line.strip()]
+    require(len(rows) == 2 and all(len(row) == 4 for row in rows),
+            "Windows grant rotation requires only the failed backend keeper")
+    init = next((row for row in rows if row[2] == "docker-init"), None)
+    keeper = next((row for row in rows if row[2] == "python3"), None)
+    require(init is not None and keeper is not None and
+            init[0].isdigit() and int(init[0]) == target["State"].get("Pid") and
+            keeper[1] == init[0] and
+            keeper[3] == "/usr/local/bin/python3 /opt/fullmag/entrypoint.py",
+            "a live writer or unexpected process blocks Windows grant rotation")
+
+
+def _validate_phase_grant(phase: Mapping[str, Any], context: Mapping[str, Any] | None) -> None:
+    if context is None:
+        return
+    module = _namespace_grant_module()
+    proofs = []
+    for line in str(phase.get("output", "")).splitlines():
+        try:
+            value = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, dict) and value.get("schema") == module.PROOF_SCHEMA:
+            proofs.append(value)
+    require(len(proofs) == 1, "maintenance lacks one exact namespace grant proof")
+    module.validate_grant_receipt(proofs[0], context)
+
+
+def noncompute_command(command: Sequence[str], stub_sha256: str,
+                       grant_context: Mapping[str, Any] | None = None) -> list[str]:
     require(re.fullmatch(r"[0-9a-f]{64}", stub_sha256), "invalid SDK loader digest")
     require(len(command) > 1 and command[0] == NATIVE_PROGRAM and command[1] in {
         "--fullmag-recovery-loader-probe", "--prepare-orphan-teardown",
         "--recover-orphan-after-teardown"}, "recovery cannot start an ordinary runtime")
-    return ["python3", "-c", NONCOMPUTE_EXECUTOR, stub_sha256, *command]
+    script = NONCOMPUTE_EXECUTOR
+    if grant_context is not None:
+        require(command[1] != "--fullmag-recovery-loader-probe",
+                "read-only loader probe must not rotate a grant")
+        script = _namespace_grant_module().GUEST_NAMESPACE_GRANT_SCRIPT + "\n" + script
+    return ["python3", "-c", script, stub_sha256,
+            json.dumps(grant_context, sort_keys=True, separators=(",", ":")), *command]
 
 
 def assert_shared_clients_quiescent(target: Mapping[str, Any],
                                     running: Sequence[Mapping[str, Any]]) -> None:
-    ledger_mount = next(item["Source"] for item in target["Mounts"]
-                        if item["Destination"] == "/host-ledger")
+    def normalized_source(source: Any) -> str:
+        require(isinstance(source, str) and source.startswith("/"),
+                "running client host mount source cannot be verified")
+        # These are Linux daemon paths, not paths on the Windows CLI host.
+        return posixpath.normpath("/" + source.lstrip("/"))
+
+    ledger_mount = normalized_source(next(item["Source"] for item in target["Mounts"]
+                                         if item["Destination"] == "/host-ledger"))
     for container in running:
         if container["Id"] == target["Id"]:
             continue
-        shared = any(item.get("Source") == ledger_mount and item.get("RW")
-                     for item in container.get("Mounts", []))
-        require(not shared, "another running client can write this host ledger; "
-                "stop and upgrade it before publishing the new release proof")
+        for item in container.get("Mounts", []):
+            if not item.get("RW") or item.get("Type") == "tmpfs":
+                continue
+            source = normalized_source(item.get("Source"))
+            shared = (source == ledger_mount
+                      or source.startswith(ledger_mount.rstrip("/") + "/")
+                      or ledger_mount.startswith(source.rstrip("/") + "/"))
+            require(not shared, "another running client can write this host ledger; "
+                    "stop and upgrade it before publishing the new release proof")
 
 
 class RecoveryUnknown(RuntimeError):
@@ -415,9 +499,11 @@ def _docker_factual_not_found(error: BaseException) -> bool:
             ("container" in text and "not found" in text))
 
 
-def _docker_call(client: Callable[..., Any], *args: str, timeout: int = 60) -> str:
+def _docker_call(client: Callable[..., Any], *args: str, timeout: int = 60,
+                 combined: bool = False) -> str:
     try:
-        value = client(*args, timeout=timeout)
+        value = (client(*args, timeout=timeout, combined=True) if combined
+                 else client(*args, timeout=timeout))
     except BaseException as error:
         if _docker_unknown(error):
             raise RecoveryUnknown(f"Docker operation timed out or became unknown: {args[0]}") from error
@@ -453,8 +539,12 @@ def _inspect(client: Callable[..., Any], container_id: str) -> dict[str, Any]:
 
 def _engine(client: Callable[..., Any]) -> dict[str, Any]:
     engine_id = _docker_call(client, "info", "--format", "{{.ID}}", timeout=30).strip()
-    if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", engine_id):
-        raise RecoveryAborted("Docker engine did not return an immutable ID")
+    from docker_orphan_recovery import OrphanRecoveryError, validate_engine_id
+
+    try:
+        validate_engine_id(engine_id)
+    except OrphanRecoveryError as error:
+        raise RecoveryAborted("Docker engine did not return an immutable ID") from error
     return {"ID": engine_id}
 
 
@@ -531,7 +621,9 @@ if spec is None or spec.loader is None:
 module = importlib.util.module_from_spec(spec)
 try:
     spec.loader.exec_module(module)
-    receipt, receipt_bytes, _children = module._validated_package(root, 'cached package')
+    receipt, receipt_bytes, _children = module._validated_package(
+        root, 'cached package', exclude_development_control=True
+    )
 except Exception as error:
     fail(f'trusted package validation failed: {error}')
 if not isinstance(receipt, dict) or receipt.get('state') != 'succeeded':
@@ -708,7 +800,8 @@ def _maintenance_run(client: Callable[..., Any], target: Mapping[str, Any], proj
         _docker_call(client, "start", created, timeout=60)
         started = True
         _docker_call(client, "wait", created, timeout=300)
-        output = _docker_call(client, "logs", "--tail", "200", created, timeout=30)
+        output = _docker_call(client, "logs", "--tail", "200", created,
+                              timeout=30, combined=True)
         inspected = _inspect(client, created)
     except RecoveryUnknown:
         raise
@@ -819,9 +912,11 @@ def _manifest_observation(document: Mapping[str, Any], *, stopped: bool) -> dict
     pid_mode = host.get("PidMode", "")
     device_requests = host.get("DeviceRequests")
     require(isinstance(device_requests, list), "target inspection lacks DeviceRequests")
-    require(pid_mode in {"", "private"} and
-            host.get("NetworkMode") not in {"host"} and
-            host.get("IpcMode") not in {"host", "container"},
+    network_mode = host.get("NetworkMode", "")
+    require(pid_mode in {"", "private"} and host.get("Privileged") is False and
+            isinstance(network_mode, str) and network_mode not in {"host", "container"} and
+            not network_mode.startswith("container:") and
+            host.get("IpcMode", "") in {"", "private", "none"},
             "target does not prove private namespace")
     proof = None
     if stopped:
@@ -855,13 +950,19 @@ def _manifest_observation(document: Mapping[str, Any], *, stopped: bool) -> dict
     }
 
 
-def _validate_release_pin(pins: Mapping[str, Any], resource_id: str) -> dict[str, Any]:
+def _validate_release_pin(pins: Mapping[str, Any], resource_id: str, *,
+                          stopped_replay: bool = False) -> dict[str, Any]:
     release = pins.get("device_release")
     require(isinstance(release, Mapping),
-            "explicit device_release evidence is required before target stop")
+            "explicit device mapping pin is required before target stop")
     release = dict(release)
-    require(release.get("resource_id") == resource_id and release.get("mapping_detached") is True,
-            "device_release is not bound to the exact resource")
+    require(release.get("resource_id") == resource_id,
+            "device mapping pin is not bound to the exact resource")
+    # Preserve immutable legacy pins only after the replay path independently
+    # verified the exact stopped namespace and its recorded attestation.
+    require("mapping_detached" not in release or
+            (stopped_replay and release["mapping_detached"] is True),
+            "device mapping pin cannot assert detachment before factual target exit")
     require(isinstance(release.get("mapping_sha256"), str) and
             re.fullmatch(r"[0-9a-f]{64}", release["mapping_sha256"]),
             "device_release mapping hash is invalid")
@@ -1087,11 +1188,13 @@ def _resume_existing_recovery(
             attested_after.get("device_requests_sha256") == canonical_json_sha256(
                 current_host["DeviceRequests"]),
             "teardown attestation does not bind the current stopped target")
-    pinned_release = pins.get("device_release")
+    pinned_release = _validate_release_pin(
+        pins, request["resource_id"], stopped_replay=True)
     attested_release = attestation.get("device_release")
     require(isinstance(pinned_release, Mapping) and isinstance(attested_release, Mapping) and
             attested_release.get("resource_id") == pinned_release.get("resource_id") and
             attested_release.get("mapping_sha256") == pinned_release.get("mapping_sha256") and
+            attested_release.get("gpu_uuid") == pinned_release.get("gpu_uuid") and
             attested_release.get("mapping_detached") is True,
             "teardown attestation does not bind the reviewed device release")
 
@@ -1168,18 +1271,24 @@ def _resume_existing_recovery(
     require(isinstance(loader_record.get("result"), Mapping) and
             loader_record["result"].get("status") == "ready",
             "replay lacks a completed noncompute loader proof")
+    complete_context = _grant_context(target_after, request, "complete")
     complete_command = noncompute_command(
         native_arguments("complete", request_container_path, attestation_container_path),
-        sdk_result["stub_sha256"],
+        sdk_result["stub_sha256"], complete_context,
     )
+    _, final_target = _revalidate_before_stop(
+        client, target_id, target_after, engine_before, pins, request, pins_sha256)
+    require(_manifest_observation(final_target, stopped=True) == observed_after,
+            "stopped target lifecycle changed before native completion replay")
     try:
         complete_phase = run_maintenance(
-            target_after, "complete", complete_command, False, "complete-replay"
+            final_target, "complete", complete_command, False, "complete-replay"
         )
     except RecoveryUnknown:
         raise
     except BaseException as error:
         raise RecoveryUnknown(f"native orphan replay complete failed: {error}") from error
+    _validate_phase_grant(complete_phase, complete_context)
     complete_result = complete_phase.get("result")
     require(isinstance(complete_result, Mapping), "native replay complete did not return a result")
     complete_result = _validate_native_result(
@@ -1207,7 +1316,7 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
                    diagnostics_root: str | Path, *, pins_sha256: str = "",
                    docker_client: Callable[..., Any] | None = None,
                    maintenance_runner: Callable[..., dict[str, Any]] | None = None,
-                   stop_timeout: int = 30) -> dict[str, Any]:
+                   stop_timeout: int = 30, resume_before_stop: bool = False) -> dict[str, Any]:
     """Perform one bounded, explicitly pinned orphan recovery.
 
     The caller supplies all ledger/run/source pins. Docker observations are
@@ -1236,6 +1345,7 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     attestation_container_path = f"/state/diagnostics/orphan/{request_id}/attestation.json"
     engine_before = _engine(client)
     target_before = _inspect(client, target_container_id)
+    _manifest_observation(target_before, stopped=_is_factually_stopped(target_before))
     running = _running_containers(client)
     assert_shared_clients_quiescent(target_before, running)
     root = _assert_diagnostics_binding(target_before, root)
@@ -1251,26 +1361,49 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
         run_maintenance = lambda target, name, command, preflight, phase: _maintenance_run(  # noqa: E731
             client, target, project, request_id, command, preflight=preflight, phase=phase)
     request_path = request_dir / "request.json"
-    if _record_exists(request_path, "orphan request"):
-        if not _is_factually_stopped(target_before):
+    probe_dir = request_dir
+    request_exists = _record_exists(request_path, "orphan request")
+    require(not resume_before_stop or request_exists,
+            "pre-stop resume requires an existing immutable request")
+    if request_exists:
+        if not _is_factually_stopped(target_before) and not resume_before_stop:
             raise RecoveryUnknown(
                 "immutable orphan request exists before factual target exit; refusing replay"
             )
-        try:
-            return _resume_existing_recovery(
-                pins=pins, pins_sha256=pins_sha256, target_id=target_container_id,
-                project=project, diagnostics_root=root, request_dir=request_dir,
-                request_container_path=request_container_path,
-                attestation_container_path=attestation_container_path,
-                engine_before=engine_before, target_after=target_before,
-                client=client, run_maintenance=run_maintenance,
-            )
-        except RecoveryUnknown:
-            raise
-        except BaseException as error:
-            raise RecoveryUnknown(
-                f"immutable orphan replay failed after target stop: {error}"
-            ) from error
+        if _is_factually_stopped(target_before):
+            try:
+                return _resume_existing_recovery(
+                    pins=pins, pins_sha256=pins_sha256, target_id=target_container_id,
+                    project=project, diagnostics_root=root, request_dir=request_dir,
+                    request_container_path=request_container_path,
+                    attestation_container_path=attestation_container_path,
+                    engine_before=engine_before, target_after=target_before,
+                    client=client, run_maintenance=run_maintenance,
+                )
+            except RecoveryUnknown:
+                raise
+            except BaseException as error:
+                raise RecoveryUnknown(
+                    f"immutable orphan replay failed after target stop: {error}"
+                ) from error
+        # An operator may retry administrative prepare with the exact immutable
+        # request. This never retries Solve and does not infer target exit.
+        prior_request = _read_json_record(request_path, "orphan request")
+        prior_pins = _read_json_record(request_dir / "pins-sha256.json", "orphan pins digest")
+        require(prior_pins.get("schema") == "fullmag.docker.orphan-pins-digest.v1" and
+                prior_pins.get("sha256") == _pins_digest(pins, pins_sha256),
+                "pre-stop resume pins differ from the immutable request")
+        require(prior_request.get("request_id") == request_id,
+                "pre-stop resume request ID differs from pins")
+        for name in ("prepare-result.json", "prepare-phase.json", "teardown-manifest.json",
+                     "attestation.json", "complete-result.json", "final-receipt.json"):
+            require(not _record_exists(request_dir / name, "later recovery evidence"),
+                    "pre-stop resume is only permitted before confirmed prepare or teardown")
+        # New read-only probe evidence is retained separately; original evidence
+        # is never replaced. The rebuilt request must still match byte-for-byte.
+        probe_dir = request_dir / "pre-stop-resume" / str(uuid.uuid4())
+        _absolute_no_follow(probe_dir, "pre-stop resume evidence directory")
+        probe_dir.mkdir(parents=True, exist_ok=False)
     if _is_factually_stopped(target_before):
         raise RecoveryUnknown(
             "target is already stopped without an immutable orphan request; refusing reconstruction"
@@ -1291,13 +1424,13 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     package_command = ["/usr/local/bin/python3", "-c", PACKAGE_PROBE_SCRIPT]
     package_phase = run_maintenance(target_before, "package", package_command, True, "package-probe")
     package_probe = _probe_package_output(package_phase["output"], target_before)
-    _write_record(request_dir / "package-probe.json", {
+    _write_record(probe_dir / "package-probe.json", {
         **_phase_evidence(package_phase, "package-probe"), "result": package_probe,
     })
     _cleanup_maintenance(client, package_phase)
     sdk_phase = _probe_image_loader(client, target_before, project, request_id, run_maintenance)
     sdk_result = sdk_phase.get("result")
-    _write_record(request_dir / "sdk-loader-probe.json", {
+    _write_record(probe_dir / "sdk-loader-probe.json", {
         **_phase_evidence(sdk_phase, "sdk-loader-probe"), "result": sdk_result,
     })
     _cleanup_maintenance(client, sdk_phase)
@@ -1313,7 +1446,7 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     loader_result = loader_phase.get("result", {})
     require(isinstance(loader_result, Mapping) and loader_result.get("status") == "ready",
             "maintenance loader probe did not complete")
-    _write_record(request_dir / "loader-probe.json", {
+    _write_record(probe_dir / "loader-probe.json", {
         **_phase_evidence(loader_phase, "loader-probe"), "result": loader_result,
     })
     _cleanup_maintenance(client, loader_phase)
@@ -1333,9 +1466,27 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
         raise RecoveryAborted(
             f"device release evidence failed before native prepare: {error}"
         ) from error
+    # Read-only probes may take time. Refresh engine, target and shared-ledger
+    # clients before native prepare, while no native state has been mutated.
+    current_engine = _engine(client)
+    current_target = _inspect(client, target_container_id)
+    if current_engine != engine_before:
+        raise RecoveryAborted("Docker engine identity changed before native prepare")
+    current_state = current_target.get("State", {})
+    if (_container_identity(current_target) != _container_identity(target_before) or
+            not isinstance(current_state, Mapping) or
+            current_state.get("Running") is not True or
+            current_state.get("Status") != "running"):
+        raise RecoveryAborted("backend identity or running state changed before native prepare")
+    assert_shared_clients_quiescent(current_target, _running_containers(client))
+    require(_pins_digest(pins, pins_sha256) == pin_digest,
+            "orphan recovery pins changed during read-only probes")
     request_sha = _write_record(request_path, request)
+    prepare_context = _grant_context(target_before, request, "prepare")
+    if prepare_context is not None:
+        _assert_failed_keeper_only(client, current_target)
     prepare_command = noncompute_command(
-        native_arguments("prepare", request_container_path), loader_digest)
+        native_arguments("prepare", request_container_path), loader_digest, prepare_context)
     try:
         prepare_phase = run_maintenance(target_before, "prepare", prepare_command, False, "prepare")
     except RecoveryUnknown:
@@ -1343,6 +1494,7 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     except BaseException as error:
         raise RecoveryAborted(f"native orphan prepare failed; target was not stopped: {error}") from error
     try:
+        _validate_phase_grant(prepare_phase, prepare_context)
         prepare_result = prepare_phase.get("result")
         require(isinstance(prepare_result, Mapping), "native prepare did not return a result")
         prepare_result = _validate_native_result(
@@ -1360,6 +1512,8 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     _, current_target = _revalidate_before_stop(
         client, target_container_id, target_before, engine_before, pins,
         request, pins_sha256)
+    if prepare_context is not None:
+        _assert_failed_keeper_only(client, current_target)
     try:
         release = _validate_release_pin(frozen_pins, request["resource_id"])
     except RecoveryUnknown:
@@ -1387,7 +1541,9 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
         manifest = {
             "before": _manifest_observation(target_before, stopped=False),
             "after": _manifest_observation(target_after, stopped=True),
-            "device_release": release,
+            # This observation exists only after Docker proves the exact
+            # private namespace exited. The reviewed pin makes no future claim.
+            "device_release": {**release, "mapping_detached": True},
         }
         manifest_path = request_dir / "teardown-manifest.json"
         manifest_sha = _write_record(manifest_path, manifest)
@@ -1413,8 +1569,10 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
         raise RecoveryUnknown(
             f"teardown attestation publication became uncertain: {error}"
         ) from error
+    complete_context = _grant_context(target_after, request, "complete")
     complete_command = noncompute_command(
-        native_arguments("complete", request_container_path, attestation_container_path), loader_digest)
+        native_arguments("complete", request_container_path, attestation_container_path),
+        loader_digest, complete_context)
     try:
         complete_phase = run_maintenance(target_after, "complete", complete_command, False, "complete")
     except RecoveryUnknown:
@@ -1422,6 +1580,7 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     except BaseException as error:
         raise RecoveryUnknown(f"native orphan complete failed; release remains unconfirmed: {error}") from error
     try:
+        _validate_phase_grant(complete_phase, complete_context)
         complete_result = complete_phase.get("result")
         require(isinstance(complete_result, Mapping), "native complete did not return a result")
         complete_result = _validate_native_result(
@@ -1445,13 +1604,14 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
 def run_from_pins(pins_path: str | Path, target_container_id: str, project: str,
                   diagnostics_root: str | Path, *, docker_client: Callable[..., Any] | None = None,
                   maintenance_runner: Callable[..., dict[str, Any]] | None = None,
-                  stop_timeout: int = 30) -> dict[str, Any]:
+                  stop_timeout: int = 30, resume_before_stop: bool = False) -> dict[str, Any]:
     pins, pins_sha = _load_pins(Path(pins_path))
     pins["pins_path"] = str(Path(pins_path))
     return recover_orphan(
         pins, target_container_id, project, diagnostics_root,
         pins_sha256=pins_sha, docker_client=docker_client,
-        maintenance_runner=maintenance_runner, stop_timeout=stop_timeout)
+        maintenance_runner=maintenance_runner, stop_timeout=stop_timeout,
+        resume_before_stop=resume_before_stop)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1462,6 +1622,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--project", required=True)
     parser.add_argument("--diagnostics-root", type=Path, required=True)
     parser.add_argument("--stop-timeout", type=int, default=30)
+    parser.add_argument("--resume-before-stop", action="store_true",
+                        help="explicitly retry prepare with the same immutable request before any stop")
     args = parser.parse_args(argv)
     require(re.fullmatch(r"[0-9a-f]{64}", args.target_container),
             "target container ID is invalid")
@@ -1477,7 +1639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = run_from_pins(
             args.pins, args.target_container, args.project, args.diagnostics_root,
-            stop_timeout=args.stop_timeout)
+            stop_timeout=args.stop_timeout, resume_before_stop=args.resume_before_stop)
     except RecoveryUnknown as error:
         print(json.dumps({"status": "unknown", "error": str(error)}, sort_keys=True), flush=True)
         return 2
