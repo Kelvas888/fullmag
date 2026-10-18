@@ -418,6 +418,7 @@ def _plan(
             }, PACKAGE_VOLUME_ROLE)},
         },
         "mount_root": BUILD_TARGET,
+        "build_root": BUILD_TARGET,
         "package_root": PACKAGE_TARGET,
         "receipt_path": str(receipt),
         "host_receipt_path": str(receipt),
@@ -439,7 +440,8 @@ def prepare(
     source_root: str | os.PathLike[str],
     toolchain_image: str,
     cargo_profile: str = "backend-dev",
-    active_consumers: Iterable[Mapping[str, Any]] = (),
+    active_consumers: Iterable[Mapping[str, Any]]
+    | Callable[[], Iterable[Mapping[str, Any]]] = (),
 ) -> dict[str, Any]:
     """Build the v2 plan and optionally create only its exact missing pair.
 
@@ -471,7 +473,8 @@ def prepare_ready(
     source_root: str | os.PathLike[str],
     toolchain_image: str,
     cargo_profile: str = "backend-dev",
-    active_consumers: Iterable[Mapping[str, Any]] = (),
+    active_consumers: Iterable[Mapping[str, Any]]
+    | Callable[[], Iterable[Mapping[str, Any]]] = (),
 ) -> dict[str, Any]:
     """Prepare and admit a pair after a managed guest maintenance callback.
 
@@ -571,11 +574,74 @@ def _validate_volume_documents(
     return result
 
 
+def _selected_volume_mountpoints(profile: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return inspected daemon mountpoints when the selected pair is known."""
+
+    documents = profile.get("volume_documents")
+    if documents is None:
+        return ()
+    if not isinstance(documents, Mapping):
+        raise BackendVolumeCacheError("backend cache volume inventory is malformed")
+    if set(documents) != {BUILD_VOLUME_ROLE, PACKAGE_VOLUME_ROLE}:
+        raise BackendVolumeCacheError("backend cache volume inventory is incomplete")
+    mountpoints: list[str] = []
+    for role in (BUILD_VOLUME_ROLE, PACKAGE_VOLUME_ROLE):
+        document = documents[role]
+        if not isinstance(document, Mapping):
+            raise BackendVolumeCacheError("backend cache volume inventory is malformed")
+        if document.get("Name") != profile["volume_names"][role]:
+            raise BackendVolumeCacheError("backend cache volume inventory changed")
+        mountpoints.append(_validate_mountpoint(document.get("Mountpoint")))
+    return tuple(mountpoints)
+
+
+def _daemon_paths_overlap(first: str, second: str) -> bool:
+    """Compare Docker daemon paths without resolving them on the host."""
+
+    def contains(parent: str, child: str) -> bool:
+        if parent == "/":
+            return child.startswith("/")
+        return child == parent or child.startswith(parent + "/")
+
+    return contains(first, second) or contains(second, first)
+
+
+def _linux_bind_source(value: Any) -> str | None:
+    """Classify a bind source without interpreting Windows text as POSIX."""
+
+    if not isinstance(value, str) or not value:
+        raise BackendVolumeCacheError("active bind source is malformed")
+    if _WINDOWS_ABSOLUTE.fullmatch(value) or value.startswith("\\\\"):
+        return None
+    if "\\" in value:
+        raise BackendVolumeCacheError("active bind source has unsupported path format")
+    if value.startswith("//"):
+        value = "/" + value.lstrip("/")
+    return _safe_daemon_path(value, "active bind source")
+
+
+def _active_consumer_snapshot(
+    source: Iterable[Mapping[str, Any]]
+    | Callable[[], Iterable[Mapping[str, Any]]],
+) -> tuple[Mapping[str, Any], ...]:
+    inventory = source() if callable(source) else source
+    if isinstance(inventory, Mapping) or isinstance(inventory, (str, bytes)):
+        raise BackendVolumeCacheError("active consumer inventory is not iterable")
+    try:
+        return tuple(inventory)
+    except TypeError as error:
+        raise BackendVolumeCacheError(
+            "active consumer inventory is not iterable"
+        ) from error
+
+
 def _assert_no_active_consumers(
     profile: Mapping[str, Any], consumers: Iterable[Mapping[str, Any]]
 ) -> None:
     names = set(profile["volume_names"].values())
-    targets = {BUILD_TARGET, PACKAGE_TARGET}
+    mountpoints = _selected_volume_mountpoints(profile)
+    expected_identity = _container_labels(profile)
+    exact_identity = (LABEL_OWNER, LABEL_UNIT, LABEL_CACHE_KEY)
     for document in consumers:
         if not isinstance(document, Mapping):
             raise BackendVolumeCacheError("active consumer inspect is not an object")
@@ -590,23 +656,48 @@ def _assert_no_active_consumers(
             labels = {}
         if not isinstance(labels, Mapping):
             raise BackendVolumeCacheError("active consumer label inventory is malformed")
-        if any(key.startswith(_LABEL_PREFIX) for key in labels):
-            expected_identity = _container_labels(profile)
-            if any(labels.get(key) != value for key, value in expected_identity.items()):
-                raise BackendVolumeCacheError("active consumer has a foreign backend-cache identity")
-            raise BackendVolumeCacheError("backend cache has an active owned consumer")
+        if all(labels.get(key) == expected_identity[key] for key in exact_identity):
+            raise BackendVolumeCacheError(
+                "backend cache has an active owned consumer"
+            )
         mounts = document.get("Mounts")
         if not isinstance(mounts, list):
             raise BackendVolumeCacheError("active consumer has no mount inventory")
         for mount in mounts:
             if not isinstance(mount, Mapping):
                 raise BackendVolumeCacheError("active consumer mount inventory is malformed")
-            if mount.get("Destination") in targets:
-                name = mount.get("Name", mount.get("Source"))
-                if mount.get("Type") != "volume" or name in names:
-                    raise BackendVolumeCacheError("active consumer overlaps backend cache target")
-            if mount.get("Type") == "volume" and mount.get("Name") in names:
-                raise BackendVolumeCacheError("active consumer mounts backend cache volume")
+            mount_type = mount.get("Type")
+            if not isinstance(mount_type, str):
+                raise BackendVolumeCacheError("active consumer mount type is malformed")
+            if mount_type == "volume":
+                name = mount.get("Name")
+                if not isinstance(name, str):
+                    raise BackendVolumeCacheError("active consumer volume name is malformed")
+                if name in names:
+                    raise BackendVolumeCacheError("active consumer mounts backend cache volume")
+                source = mount.get("Source")
+                if source is not None:
+                    source_path = _linux_bind_source(source)
+                    if source_path is not None and any(
+                        _daemon_paths_overlap(source_path, mountpoint)
+                        for mountpoint in mountpoints
+                    ):
+                        raise BackendVolumeCacheError(
+                            "active consumer bind aliases backend cache volume"
+                        )
+            elif mount_type == "bind":
+                source = _linux_bind_source(mount.get("Source"))
+                if source is not None and any(
+                    _daemon_paths_overlap(source, mountpoint)
+                    for mountpoint in mountpoints
+                ):
+                    raise BackendVolumeCacheError(
+                        "active consumer bind aliases backend cache volume"
+                    )
+            elif mount_type not in {"tmpfs", "npipe", "cluster", "image"}:
+                raise BackendVolumeCacheError(
+                    "active consumer mount type is unsupported"
+                )
 
 
 def inspect_volume_pair(
@@ -648,17 +739,31 @@ def ensure_volume_pair(
     docker: Callable[..., Any],
     profile: Mapping[str, Any],
     *,
-    active_consumers: Iterable[Mapping[str, Any]] = (),
+    active_consumers: Iterable[Mapping[str, Any]]
+    | Callable[[], Iterable[Mapping[str, Any]]] = (),
 ) -> dict[str, dict[str, Any]]:
     """Create only a completely missing exact pair and return its inspect docs."""
 
-    _assert_no_active_consumers(profile, active_consumers)
+    if callable(active_consumers):
+        consumer_snapshot = lambda: _active_consumer_snapshot(active_consumers)
+    else:
+        fixed_consumers = _active_consumer_snapshot(active_consumers)
+        consumer_snapshot = lambda: fixed_consumers
+    initial_consumers = consumer_snapshot()
     existing = inspect_volume_pair(docker, profile)
+    checked_profile = dict(profile)
     if existing:
+        checked_profile["volume_documents"] = existing
+    _assert_no_active_consumers(checked_profile, initial_consumers)
+    if existing:
+        _assert_no_active_consumers(checked_profile, consumer_snapshot())
         return existing
     for role in (BUILD_VOLUME_ROLE, PACKAGE_VOLUME_ROLE):
         _create_volume(docker, profile, role)
-    return _validate_volume_documents(inspect_volume_pair(docker, profile), profile)
+    created = _validate_volume_documents(inspect_volume_pair(docker, profile), profile)
+    checked_profile["volume_documents"] = created
+    _assert_no_active_consumers(checked_profile, consumer_snapshot())
+    return created
 
 
 def _validate_marker(marker: Any, profile: Mapping[str, Any], role: str) -> None:
@@ -782,7 +887,8 @@ def validate(
     profile: Mapping[str, Any],
     volume_documents: Mapping[str, Any] | None,
     maintenance_receipt: Mapping[str, Any],
-    active_consumers: Iterable[Mapping[str, Any]] = (),
+    active_consumers: Iterable[Mapping[str, Any]]
+    | Callable[[], Iterable[Mapping[str, Any]]] = (),
     *,
     receipt_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
@@ -795,7 +901,11 @@ def validate(
     if not isinstance(documents, Mapping):
         raise BackendVolumeCacheError("backend volume cache has no host volume receipt")
     inspected = _validate_volume_documents(documents, profile)
-    _assert_no_active_consumers(profile, active_consumers)
+    checked_profile = dict(profile)
+    checked_profile["volume_documents"] = inspected
+    _assert_no_active_consumers(
+        checked_profile, _active_consumer_snapshot(active_consumers)
+    )
     maintenance = _validate_maintenance_receipt(maintenance_receipt, profile)
     path = Path(receipt_path or profile["receipt_path"])
     expected_path = Path(profile["receipt_path"])

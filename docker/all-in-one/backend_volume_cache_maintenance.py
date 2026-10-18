@@ -30,6 +30,8 @@ BUILD_ROLE = "build"
 PACKAGE_ROLE = "package"
 BUILD_ROOT = "/build"
 PACKAGE_ROOT = "/opt/fullmag/package"
+PACKAGE_DEVELOPMENT_DIRNAME = ".development"
+PACKAGE_CACHE_CONTROL_DIRNAME = "cache-maintenance"
 MARKER_NAME = ".fullmag-backend-cache-owner.json"
 READBACK_NAME = ".fullmag-backend-cache-readback"
 DEFAULT_OWNER_UID = 65532
@@ -75,7 +77,11 @@ def _chown_record(directory: int, name: str, uid: int, gid: int) -> None:
 
 @contextmanager
 def _open_maintenance_record(
-    directory: int, name: str, flags: int
+    directory: int,
+    name: str,
+    flags: int,
+    *,
+    expected_nlink: int | None = 1,
 ) -> Iterator[tuple[int, os.stat_result]]:
     """Open a record while retaining access with CAP_CHOWN only.
 
@@ -95,6 +101,8 @@ def _open_maintenance_record(
         raise MaintenanceError(f"cannot inspect cache maintenance record: {name}") from error
     if stat.S_ISLNK(original.st_mode) or not stat.S_ISREG(original.st_mode):
         raise MaintenanceError(f"cache maintenance record is not regular: {name}")
+    if expected_nlink is not None and original.st_nlink != expected_nlink:
+        raise MaintenanceError(f"cache maintenance record has an unexpected link count: {name}")
 
     original_owner = (original.st_uid, original.st_gid)
     changed_owner = False
@@ -104,8 +112,10 @@ def _open_maintenance_record(
         if os.geteuid() == 0 and original_owner != (0, 0):
             _chown_record(directory, name, 0, 0)
             changed_owner = True
+        truncate = bool(flags & os.O_TRUNC)
+        open_flags = flags & ~os.O_TRUNC if truncate else flags
         try:
-            descriptor = os.open(name, flags | _O_NOFOLLOW, dir_fd=directory)
+            descriptor = os.open(name, open_flags | _O_NOFOLLOW, dir_fd=directory)
         except OSError as error:
             raise MaintenanceError(f"cannot open cache maintenance record: {name}") from error
         metadata = os.fstat(descriptor)
@@ -113,6 +123,13 @@ def _open_maintenance_record(
                 or (metadata.st_dev, metadata.st_ino)
                 != (original.st_dev, original.st_ino)):
             raise MaintenanceError(f"cache maintenance record changed during open: {name}")
+        if expected_nlink is not None and metadata.st_nlink != expected_nlink:
+            raise MaintenanceError(f"cache maintenance record has an unexpected link count: {name}")
+        if truncate:
+            try:
+                os.ftruncate(descriptor, 0)
+            except OSError as error:
+                raise MaintenanceError(f"cache maintenance record truncate failed: {name}") from error
         yield descriptor, original
     finally:
         if changed_owner:
@@ -135,9 +152,20 @@ def _open_maintenance_record(
             raise restoration_error
 
 
-def _read_record(directory: int, name: str, limit: int) -> tuple[Any, os.stat_result]:
+def _read_record_bytes(
+    directory: int,
+    name: str,
+    limit: int,
+    *,
+    expected_nlink: int | None = 1,
+) -> tuple[bytes, os.stat_result]:
     try:
-        with _open_maintenance_record(directory, name, os.O_RDONLY) as (descriptor, metadata):
+        with _open_maintenance_record(
+            directory,
+            name,
+            os.O_RDONLY,
+            expected_nlink=expected_nlink,
+        ) as (descriptor, metadata):
             raw = _read_bounded(descriptor, limit)
     except FileNotFoundError:
         raise
@@ -145,6 +173,11 @@ def _read_record(directory: int, name: str, limit: int) -> tuple[Any, os.stat_re
         raise
     except OSError as error:
         raise MaintenanceError(f"cannot open cache maintenance record: {name}") from error
+    return raw, metadata
+
+
+def _read_record(directory: int, name: str, limit: int) -> tuple[Any, os.stat_result]:
+    raw, metadata = _read_record_bytes(directory, name, limit)
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         value: dict[str, Any] = {}
         for key, item in pairs:
@@ -191,6 +224,311 @@ def _open_guest_root(path: str | os.PathLike[str], uid: int, gid: int) -> int:
         os.close(directory)
         raise
     return directory
+
+
+def _open_child_directory(parent: int, name: str, uid: int, gid: int, label: str) -> int:
+    """Open one fixed control child without following or replacing an entry."""
+
+    try:
+        metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o755, dir_fd=parent)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise MaintenanceError(f"cannot create {label}") from error
+        try:
+            metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError as error:
+            raise MaintenanceError(f"cannot inspect {label}") from error
+    except OSError as error:
+        raise MaintenanceError(f"cannot inspect {label}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise MaintenanceError(f"{label} is not a regular directory")
+    try:
+        directory = os.open(
+            name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=parent
+        )
+    except OSError as error:
+        raise MaintenanceError(f"cannot open {label}") from error
+    try:
+        opened = os.fstat(directory)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise MaintenanceError(f"{label} changed during open")
+        owner = (opened.st_uid, opened.st_gid)
+        if owner not in {(0, 0), (uid, gid)}:
+            raise MaintenanceError(f"{label} has a foreign owner")
+        if os.geteuid() == 0 and owner == (uid, gid):
+            try:
+                os.fchown(directory, 0, 0)
+            except OSError as error:
+                raise MaintenanceError(f"CAP_CHOWN could not prepare {label}") from error
+            handed_off = os.fstat(directory)
+            if (handed_off.st_uid, handed_off.st_gid) != (0, 0):
+                raise MaintenanceError(f"{label} ownership did not read back")
+        return directory
+    except BaseException:
+        os.close(directory)
+        raise
+
+
+def _fsync_directory_fd(directory: int, label: str) -> None:
+    try:
+        os.fsync(directory)
+    except OSError as error:
+        raise MaintenanceError(f"cannot sync {label}") from error
+
+
+def _entry_present(directory: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise MaintenanceError(f"cannot inspect cache maintenance entry: {name}") from error
+    return True
+
+
+def _validate_migration_record(
+    directory: int,
+    name: str,
+    expected: bytes,
+    uid: int,
+    gid: int,
+    label: str,
+    *,
+    expected_nlink: int | None = 1,
+    allow_root_owner: bool = False,
+) -> os.stat_result:
+    try:
+        raw, metadata = _read_record_bytes(
+            directory,
+            name,
+            max(MAX_MARKER_BYTES, MAX_READBACK_BYTES),
+            expected_nlink=expected_nlink,
+        )
+    except FileNotFoundError as error:
+        raise MaintenanceError(f"{label} is missing") from error
+    if expected_nlink is not None and metadata.st_nlink != expected_nlink:
+        raise MaintenanceError(f"{label} has an unexpected link count")
+    if (metadata.st_uid, metadata.st_gid) != (uid, gid):
+        if not (allow_root_owner and (metadata.st_uid, metadata.st_gid) == (0, 0)):
+            raise MaintenanceError(f"{label} has a foreign owner")
+        original_identity = (metadata.st_dev, metadata.st_ino)
+        _chown_record(directory, name, uid, gid)
+        metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) != original_identity or (
+            metadata.st_uid,
+            metadata.st_gid,
+        ) != (uid, gid):
+            raise MaintenanceError(f"{label} owner recovery changed the record")
+    if raw != expected:
+        raise MaintenanceError(f"{label} is foreign or incomplete")
+    return metadata
+
+
+def _migrate_record(
+    source: int,
+    destination: int,
+    name: str,
+    expected: bytes,
+    uid: int,
+    gid: int,
+    label: str,
+    *,
+    source_present: bool,
+    destination_present: bool,
+) -> None:
+    source_metadata: os.stat_result | None = None
+    if source_present:
+        source_metadata = _validate_migration_record(
+            source, name, expected, uid, gid, f"legacy {label}"
+        )
+    if destination_present:
+        destination_metadata = _validate_migration_record(
+            destination,
+            name,
+            expected,
+            uid,
+            gid,
+            f"package control {label}",
+            expected_nlink=None if source_present else 1,
+            allow_root_owner=True,
+        )
+        if source_metadata is not None and (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+        ) != (destination_metadata.st_dev, destination_metadata.st_ino):
+            raise MaintenanceError(f"package control {label} conflicts with legacy record")
+    elif not source_present:
+        raise MaintenanceError(f"package control {label} is missing")
+    else:
+        owner_changed = False
+        try:
+            if os.geteuid() == 0:
+                _chown_record(source, name, 0, 0)
+                owner_changed = True
+            os.link(
+                name,
+                name,
+                src_dir_fd=source,
+                dst_dir_fd=destination,
+                follow_symlinks=False,
+            )
+            if owner_changed:
+                # CAP_CHOWN is the only capability granted to this service.
+                # Make the source temporarily root-owned so protected-hardlink
+                # policy cannot turn migration into a DAC requirement, then
+                # restore the backend owner on the shared inode.
+                _chown_record(destination, name, uid, gid)
+        except (OSError, MaintenanceError) as error:
+            if owner_changed:
+                try:
+                    _chown_record(source, name, uid, gid)
+                except MaintenanceError as restore_error:
+                    raise MaintenanceError(
+                        f"cannot restore legacy {label} owner after migration failure"
+                    ) from restore_error
+            if isinstance(error, FileExistsError):
+                raise MaintenanceError(
+                    f"package control {label} appeared concurrently"
+                ) from error
+            if isinstance(error, MaintenanceError):
+                raise
+            raise MaintenanceError(
+                f"cannot migrate legacy {label} without copying"
+            ) from error
+        _fsync_directory_fd(destination, "package cache maintenance directory")
+        destination_metadata = _validate_migration_record(
+            destination,
+            name,
+            expected,
+            uid,
+            gid,
+            f"migrated package control {label}",
+            expected_nlink=2,
+        )
+        if source_metadata is None or (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+        ) != (destination_metadata.st_dev, destination_metadata.st_ino):
+            raise MaintenanceError(f"migrated package control {label} changed identity")
+
+    if source_present:
+        try:
+            os.unlink(name, dir_fd=source)
+        except OSError as error:
+            raise MaintenanceError(f"cannot retire legacy {label} after migration") from error
+        _fsync_directory_fd(source, "backend package root")
+    _validate_migration_record(
+        destination, name, expected, uid, gid, f"final package control {label}"
+    )
+
+
+def _prepare_package_control(
+    package_directory: int,
+    marker: Mapping[str, Any],
+    uid: int,
+    gid: int,
+) -> tuple[int, int, bytes]:
+    """Prepare the typed package control pair and migrate only exact legacy records."""
+
+    marker_raw = _canonical(marker)
+    expected_marker = marker_raw + b"\n"
+    expected_readback = b"fullmag-cache-readback:" + hashlib.sha256(marker_raw).hexdigest().encode(
+        "ascii"
+    )
+    legacy_marker_present = _entry_present(package_directory, MARKER_NAME)
+    legacy_readback_present = _entry_present(package_directory, READBACK_NAME)
+    if legacy_marker_present != legacy_readback_present:
+        raise MaintenanceError("legacy package cache marker pair is incomplete")
+    if legacy_marker_present:
+        _validate_migration_record(
+            package_directory,
+            MARKER_NAME,
+            expected_marker,
+            uid,
+            gid,
+            "legacy package cache marker",
+        )
+        _validate_migration_record(
+            package_directory,
+            READBACK_NAME,
+            expected_readback,
+            uid,
+            gid,
+            "legacy package cache readback",
+        )
+
+    development_directory = _open_child_directory(
+        package_directory,
+        PACKAGE_DEVELOPMENT_DIRNAME,
+        uid,
+        gid,
+        "backend package development control directory",
+    )
+    try:
+        cache_directory = _open_child_directory(
+            development_directory,
+            PACKAGE_CACHE_CONTROL_DIRNAME,
+            uid,
+            gid,
+            "backend cache maintenance control directory",
+        )
+    except BaseException:
+        os.close(development_directory)
+        raise
+    try:
+        try:
+            entries = set(os.listdir(cache_directory))
+        except OSError as error:
+            raise MaintenanceError("cannot inspect backend cache maintenance control directory") from error
+        allowed = {MARKER_NAME, READBACK_NAME}
+        if not entries.issubset(allowed):
+            raise MaintenanceError("backend cache maintenance control has an unknown entry")
+        control_marker_present = _entry_present(cache_directory, MARKER_NAME)
+        control_readback_present = _entry_present(cache_directory, READBACK_NAME)
+        if control_marker_present != control_readback_present:
+            if not legacy_marker_present:
+                raise MaintenanceError("package cache maintenance marker pair is incomplete")
+        _migrate_record(
+            package_directory,
+            cache_directory,
+            MARKER_NAME,
+            expected_marker,
+            uid,
+            gid,
+            "cache marker",
+            source_present=legacy_marker_present,
+            destination_present=control_marker_present,
+        ) if legacy_marker_present or control_marker_present else None
+        _migrate_record(
+            package_directory,
+            cache_directory,
+            READBACK_NAME,
+            expected_readback,
+            uid,
+            gid,
+            "cache readback",
+            source_present=legacy_readback_present,
+            destination_present=control_readback_present,
+        ) if legacy_readback_present or control_readback_present else None
+        marker_bytes = _ensure_marker(cache_directory, marker, uid, gid)
+        if marker_bytes != marker_raw:
+            raise MaintenanceError("package cache marker canonical bytes changed")
+        _prepare_readback(cache_directory, uid, gid)
+        _probe_readback(cache_directory, marker_bytes, uid, gid)
+        _finalize_guest_root(cache_directory, uid, gid)
+        _finalize_guest_root(development_directory, uid, gid)
+        return development_directory, cache_directory, marker_bytes
+    except BaseException:
+        os.close(cache_directory)
+        os.close(development_directory)
+        raise
 
 
 def _write_new_record(directory: int, name: str, value: Mapping[str, Any], uid: int, gid: int) -> None:
@@ -441,6 +779,7 @@ def ensure(
         raise MaintenanceError("cache maintenance owner ids are invalid")
     roots = {BUILD_ROLE: build_root, PACKAGE_ROLE: package_root}
     directories: dict[str, int] = {}
+    nested_directories: list[int] = []
     marker_raw: dict[str, bytes] = {}
     try:
         for role, root in roots.items():
@@ -456,11 +795,20 @@ def ensure(
                 "uid": uid,
                 "gid": gid,
             }
-            marker_raw[role] = _ensure_marker(directory, marker, uid, gid)
-            _prepare_readback(directory, uid, gid)
-            _probe_readback(directory, marker_raw[role], uid, gid)
+            if role == PACKAGE_ROLE:
+                development_directory, cache_directory, marker_bytes = _prepare_package_control(
+                    directory, marker, uid, gid
+                )
+                nested_directories.extend((cache_directory, development_directory))
+                marker_raw[role] = marker_bytes
+            else:
+                marker_raw[role] = _ensure_marker(directory, marker, uid, gid)
+                _prepare_readback(directory, uid, gid)
+                _probe_readback(directory, marker_raw[role], uid, gid)
             _finalize_guest_root(directory, uid, gid)
     finally:
+        for directory in reversed(nested_directories):
+            os.close(directory)
         for directory in directories.values():
             os.close(directory)
 
