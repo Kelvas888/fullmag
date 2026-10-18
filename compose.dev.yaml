@@ -78,13 +78,18 @@ services:
         target: /opt/fullmag/source-git
         read_only: true
         bind: {create_host_path: false}
-      # Compiled backend output is the fixed package child of the helper-attested
-      # ext4 cache; the launcher preserves its Docker-daemon path unchanged.
-      - type: bind
-        source: ${FULLMAG_BACKEND_PACKAGE:?Build the backend inside its Compose service}
+      # The v2 cache pair is already a Docker-VM named volume in the base
+      # contract.  docker_dev layers the exact identity-named declarations
+      # before startup; the bootstrap names below are only for image/config
+      # inspection and are never a host path or an implicit migration target.
+      - type: volume
+        source: backend-cache-build
+        target: /build
+        volume: {nocopy: true}
+      - type: volume
+        source: backend-cache-package
         target: /opt/fullmag/package
-        read_only: false
-        bind: {create_host_path: false}
+        volume: {nocopy: true}
       - type: bind
         source: ${FULLMAG_PACKAGE_PROVENANCE:?Backend build provenance is required}
         target: /opt/fullmag/provenance.json
@@ -202,3 +207,11 @@ networks:
     driver: bridge
     ipam:
       driver: default
+
+volumes:
+  backend-cache-build:
+    name: ${FULLMAG_BACKEND_CACHE_BUILD_VOLUME:-fullmag-backend-bootstrap-build}
+    external: true
+  backend-cache-package:
+    name: ${FULLMAG_BACKEND_CACHE_PACKAGE_VOLUME:-fullmag-backend-bootstrap-package}
+    external: true

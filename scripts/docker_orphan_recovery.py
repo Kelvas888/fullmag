@@ -382,6 +382,163 @@ def _binds(container: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _validate_backend_volume_cache(value: Any) -> dict[str, Any]:
+    """Validate the ready v2 cache descriptor and its published documents.
+
+    The descriptor is host provenance, while the two named volumes are
+    daemon-owned.  This function deliberately delegates the shared label,
+    volume-document, and overlay rules to the versioned adapter; an absent or
+    unknown schema never falls back to the v1 bind contract.
+    """
+    value = _mapping(value, "backend volume cache")
+    try:
+        import docker_backend_volume_cache as adapter
+    except ImportError as error:  # pragma: no cover - packaging error
+        _fail(f"backend volume cache adapter is unavailable: {error}")
+    if value.get("schema") != adapter.SCHEMA or value.get("profile") != adapter.PROFILE:
+        _fail("backend volume cache has an unsupported schema")
+    if value.get("state") != "ready":
+        _fail("backend volume cache is not ready")
+    if (value.get("build_root") != adapter.BUILD_TARGET
+            or value.get("mount_root") != adapter.BUILD_TARGET
+            or value.get("package_root") != adapter.PACKAGE_TARGET):
+        _fail("backend volume cache daemon targets are not canonical")
+    names = value.get("volume_names")
+    if (not isinstance(names, Mapping)
+            or set(names) != {adapter.BUILD_VOLUME_ROLE, adapter.PACKAGE_VOLUME_ROLE}
+            or any(not isinstance(name, str) or adapter._VOLUME_NAME.fullmatch(name) is None
+                   for name in names.values())):
+        _fail("backend volume cache does not pin the exact build/package volume pair")
+    if value.get("mounts") != adapter.mount_specs(value):
+        _fail("backend volume cache mounts are not the canonical nocopy pair")
+    environment = value.get("environment")
+    if environment != adapter._cache_environment(value):
+        _fail("backend volume cache environment is not canonical")
+    documents = value.get("volume_documents")
+    if not isinstance(documents, Mapping):
+        _fail("backend volume cache has no inspected volume documents")
+    try:
+        inspected = adapter._validate_volume_documents(documents, value)
+    except Exception as error:
+        _fail(f"backend volume cache volume labels or roles are invalid: {error}")
+    if dict(inspected) != dict(documents):
+        _fail("backend volume cache volume documents changed during validation")
+
+    receipt = _mapping(value.get("receipt"), "backend volume cache ready receipt")
+    receipt_path = _path(value.get("receipt_path"), "backend volume cache receipt")
+    raw = _read_regular(receipt_path, "backend volume cache receipt", 16 * 1024 * 1024)
+    if "receipt_sha256" in value:
+        if hashlib.sha256(raw).hexdigest() != _sha(
+                value["receipt_sha256"], "backend volume cache receipt_sha256", nonzero=True):
+            _fail("backend volume cache receipt bytes differ from its pin")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"backend volume cache receipt is not valid JSON: {error}")
+    if _mapping(parsed, "backend volume cache receipt file") != receipt:
+        _fail("backend volume cache receipt differs from its published descriptor")
+    if (receipt.get("schema") != adapter.SCHEMA
+            or receipt.get("profile") != adapter.PROFILE
+            or receipt.get("state") != "ready"
+            or receipt.get("project_id") != value.get("project_id")
+            or receipt.get("worktree_id") != value.get("worktree_id")
+            or receipt.get("cache_key") != value.get("cache_key")
+            or receipt.get("unit_key") != value.get("unit_key")
+            or receipt.get("owner_id") != value.get("owner_id")
+            or receipt.get("cargo_profile") != value.get("cargo_profile")
+            or receipt.get("runtime_image_id") != value.get("runtime_image_id")
+            or receipt.get("toolchain_image_id") != value.get("toolchain_image_id")
+            or receipt.get("volume_names") != dict(names)
+            or receipt.get("build_root") != adapter.BUILD_TARGET
+            or receipt.get("package_root") != adapter.PACKAGE_TARGET
+            or receipt.get("mounts") != value["mounts"]
+            or receipt.get("volume_documents") != dict(documents)):
+        _fail("backend volume cache ready receipt does not pin the exact pair")
+    maintenance_receipt = receipt.get("maintenance_receipt")
+    if not isinstance(maintenance_receipt, Mapping):
+        _fail("backend volume cache ready receipt has no maintenance proof")
+    try:
+        adapter._validate_maintenance_receipt(maintenance_receipt, value)
+    except Exception as error:
+        _fail(f"backend volume cache maintenance proof is invalid: {error}")
+    if value.get("maintenance_receipt") != dict(maintenance_receipt):
+        _fail("backend volume cache maintenance proof differs from its descriptor")
+    if receipt.get("host_receipt_path") is not None and not _same_path(
+            receipt["host_receipt_path"], receipt_path):
+        _fail("backend volume cache receipt path differs from its host pin")
+
+    overlay = _mapping(value.get("overlay"), "backend volume cache Compose overlay")
+    overlay_path = _path(value.get("compose_overlay"), "backend volume cache Compose overlay")
+    overlay_raw = _read_regular(overlay_path, "backend volume cache Compose overlay")
+    overlay_sha = _sha(value.get("compose_overlay_sha256"),
+                       "backend volume cache Compose overlay SHA-256", nonzero=True)
+    if hashlib.sha256(overlay_raw).hexdigest() != overlay_sha:
+        _fail("backend volume cache Compose overlay bytes differ from its pin")
+    try:
+        parsed_overlay = json.loads(overlay_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"backend volume cache Compose overlay is not valid JSON: {error}")
+    if _mapping(parsed_overlay, "backend volume cache Compose overlay file") != overlay:
+        _fail("backend volume cache Compose overlay differs from its published descriptor")
+    try:
+        if overlay != adapter.overlay(value):
+            _fail("backend volume cache Compose overlay is not canonical")
+        adapter.validate_overlay(overlay, value)
+    except OrphanRecoveryError:
+        raise
+    except Exception as error:
+        _fail(f"backend volume cache Compose overlay is invalid: {error}")
+
+    maintenance = _mapping(value.get("maintenance_overlay"),
+                           "backend volume cache maintenance overlay")
+    maintenance_path = _path(
+        value.get("maintenance_compose_overlay"),
+        "backend volume cache maintenance overlay",
+    )
+    maintenance_raw = _read_regular(
+        maintenance_path, "backend volume cache maintenance overlay")
+    maintenance_sha = value.get("maintenance_compose_overlay_sha256")
+    if maintenance_sha is not None and hashlib.sha256(maintenance_raw).hexdigest() != _sha(
+            maintenance_sha, "backend volume cache maintenance overlay SHA-256", nonzero=True):
+        _fail("backend volume cache maintenance overlay bytes differ from its pin")
+    try:
+        parsed_maintenance = json.loads(maintenance_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"backend volume cache maintenance overlay is not valid JSON: {error}")
+    if _mapping(parsed_maintenance, "backend volume cache maintenance overlay file") != maintenance:
+        _fail("backend volume cache maintenance overlay differs from its published descriptor")
+    try:
+        if maintenance != adapter.maintenance_overlay(value):
+            _fail("backend volume cache maintenance overlay is not canonical")
+        adapter.validate_maintenance_overlay(maintenance, value)
+    except OrphanRecoveryError:
+        raise
+    except Exception as error:
+        _fail(f"backend volume cache maintenance overlay is invalid: {error}")
+    return dict(value)
+
+
+def _validate_backend_volume_mounts(
+    mounts: Mapping[str, Mapping[str, Any]], cache: Mapping[str, Any]
+) -> None:
+    """Require both daemon-owned v2 volumes by exact Name and role target."""
+    try:
+        import docker_backend_volume_cache as adapter
+    except ImportError as error:  # pragma: no cover - packaging error
+        _fail(f"backend volume cache adapter is unavailable: {error}")
+    expected = {
+        adapter.BUILD_TARGET: adapter.BUILD_VOLUME_ROLE,
+        adapter.PACKAGE_TARGET: adapter.PACKAGE_VOLUME_ROLE,
+    }
+    for target, role in expected.items():
+        mount = mounts.get(target)
+        if (not isinstance(mount, Mapping)
+                or mount.get("Type") != "volume"
+                or mount.get("Name") != cache["volume_names"][role]
+                or mount.get("RW") is not True):
+            _fail(f"backend {target} is not the exact pinned named volume")
+
+
 def _parse_env(config: Mapping[str, Any]) -> dict[str, str]:
     values: dict[str, str] = {}
     raw = config.get("Env", [])
@@ -461,15 +618,44 @@ def _container_binding(
     if not isinstance(device_requests, list) or not device_requests:
         _fail("backend container has no exact GPU DeviceRequests")
     binds = _binds(container)
+    cache = None
+    if "backend_cache" in pins:
+        cache = _validate_backend_volume_cache(pins["backend_cache"])
+        _validate_backend_volume_mounts(binds, cache)
     state_bind = _mapping(backend.get("state_bind", binds.get("/state")), "backend.state_bind")
     package_bind = _mapping(backend.get("package_bind", binds.get("/opt/fullmag/package")), "backend.package_bind")
     if require_binds:
-        for target, item in (("/state", state_bind), ("/opt/fullmag/package", package_bind)):
-            if item.get("Destination") != target or item.get("Type") != "bind" or item.get("RW") is not True:
-                _fail(f"backend {target} bind is not the expected writable bind")
-            actual = binds.get(target)
-            if actual is None or any(actual.get(field) != item.get(field) for field in ("Source", "Destination", "RW", "Type")):
-                _fail(f"backend {target} bind differs from its exact pin")
+        if (state_bind.get("Destination") != "/state"
+                or state_bind.get("Type") != "bind"
+                or state_bind.get("RW") is not True):
+            _fail("backend /state bind is not the expected writable bind")
+        actual_state = binds.get("/state")
+        if (actual_state is None
+                or any(actual_state.get(field) != state_bind.get(field)
+                       for field in ("Source", "Destination", "RW", "Type"))):
+            _fail("backend /state bind differs from its exact pin")
+        if cache is None:
+            if (package_bind.get("Destination") != "/opt/fullmag/package"
+                    or package_bind.get("Type") != "bind"
+                    or package_bind.get("RW") is not True):
+                _fail("backend /opt/fullmag/package bind is not the expected writable bind")
+            actual_package = binds.get("/opt/fullmag/package")
+            if (actual_package is None
+                    or any(actual_package.get(field) != package_bind.get(field)
+                           for field in ("Source", "Destination", "RW", "Type"))):
+                _fail("backend /opt/fullmag/package bind differs from its exact pin")
+        else:
+            expected_package_name = cache["volume_names"]["package"]
+            if (package_bind.get("Destination") != "/opt/fullmag/package"
+                    or package_bind.get("Type") != "volume"
+                    or package_bind.get("Name") != expected_package_name
+                    or package_bind.get("RW") is not True):
+                _fail("backend /opt/fullmag/package is not the exact pinned v2 volume")
+            actual_package = binds.get("/opt/fullmag/package")
+            if (actual_package is None
+                    or any(actual_package.get(field) != package_bind.get(field)
+                           for field in ("Destination", "RW", "Type", "Name"))):
+                _fail("backend /opt/fullmag/package volume differs from its exact pin")
     state = _state(container)
     if stopped:
         if state.get("Status") != "exited" or state.get("Running") is not False or state.get("Pid") != 0:
@@ -496,6 +682,7 @@ def _container_binding(
         "device_requests": device_requests,
         "state_bind": state_bind,
         "package_bind": package_bind,
+        **({"backend_cache": cache} if cache is not None else {}),
     }
 
 
@@ -780,7 +967,10 @@ def build_orphan_request(
     run = _run_fields(pins)
     backend = _mapping(pins.get("backend", pins), "backend pin")
     backend = {**backend, "container_id": backend.get("container_id", container_inspect.get("Id"))}
-    binding = _container_binding(container_inspect, {"backend": backend}, stopped=False)
+    binding_pins: dict[str, Any] = {"backend": backend}
+    if "backend_cache" in pins:
+        binding_pins["backend_cache"] = pins["backend_cache"]
+    binding = _container_binding(container_inspect, binding_pins, stopped=False)
     if binding["compose_project"] != pins.get("compose_project", binding["compose_project"]):
         _fail("backend Compose project differs from the pinned project")
     if binding["scope"] != "dedicated_parent" or binding["sole_worker_scope"] is not True:
@@ -843,8 +1033,16 @@ def build_orphan_request(
         expected_container_id=binding["container_id"],
         expected_image_id=binding["image_id"],
     )
-    if not _same_path(binding["package_bind"].get("Source"), package["root"]):
-        _fail("backend package bind differs from the verified cached package root")
+    cache = binding.get("backend_cache")
+    if cache is None:
+        if not _same_path(binding["package_bind"].get("Source"), package["root"]):
+            _fail("backend package bind differs from the verified cached package root")
+    else:
+        if not _same_path(package["root"], cache["package_root"]):
+            _fail("backend package root differs from the exact v2 cache target")
+        expected_receipt = cache["package_root"].rstrip("/") + "/backend-build-receipt.json"
+        if not _same_path(package["receipt_path"], expected_receipt):
+            _fail("backend package receipt differs from the exact v2 cache target")
     _validate_quiescence(pins.get("quiescence"))
     return request
 

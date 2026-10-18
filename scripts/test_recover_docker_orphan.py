@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import docker_backend_volume_cache as volume_cache
+
 spec = importlib.util.spec_from_file_location(
     "recover_docker_orphan", Path(__file__).with_name("recover_docker_orphan.py"))
 recovery = importlib.util.module_from_spec(spec)
@@ -39,6 +41,121 @@ def target():
                     "Source": "/existing" + destination, "RW": True}
                    for destination in ["/state", "/host-ledger", "/opt/fullmag/package",
                                        "/user-data", "/var/run/docker.sock"]]}
+
+
+def v2_backend_cache(root: Path) -> dict[str, object]:
+    """Build the host-published v2 descriptor used by recovery tests."""
+    profile: dict[str, object] = {
+        "schema": volume_cache.SCHEMA,
+        "profile": volume_cache.PROFILE,
+        "state": "ready",
+        "project_id": "fullmag",
+        "worktree_id": "worktree-test",
+        "cache_key": "c" * 64,
+        "unit_key": "d" * 64,
+        "owner_id": "e" * 64,
+        "cargo_profile": "backend-dev",
+        "runtime_image_id": "sha256:" + "a" * 64,
+        "toolchain_image_id": "sha256:" + "b" * 64,
+        "volume_names": {
+            volume_cache.BUILD_VOLUME_ROLE: "fullmag-cache-build-test",
+            volume_cache.PACKAGE_VOLUME_ROLE: "fullmag-cache-package-test",
+        },
+        "build_root": volume_cache.BUILD_TARGET,
+        "mount_root": volume_cache.BUILD_TARGET,
+        "package_root": volume_cache.PACKAGE_TARGET,
+    }
+    profile["environment"] = volume_cache._cache_environment(profile)
+    profile["mounts"] = volume_cache.mount_specs(profile)
+    documents: dict[str, dict[str, object]] = {}
+    for role in (volume_cache.BUILD_VOLUME_ROLE, volume_cache.PACKAGE_VOLUME_ROLE):
+        documents[role] = {
+            "Name": profile["volume_names"][role],
+            "Driver": "local",
+            "Options": {},
+            "Scope": "local",
+            "Mountpoint": "/var/lib/docker/volumes/" + profile["volume_names"][role] + "/_data",
+            "Labels": volume_cache.volume_labels(profile, role),
+        }
+    profile["volume_documents"] = documents
+    maintenance = {
+        "schema": volume_cache.MAINTENANCE_RECEIPT_SCHEMA,
+        "profile": volume_cache.PROFILE,
+        "state": "ready",
+        "project_id": profile["project_id"],
+        "cache_key": profile["cache_key"],
+        "unit_key": profile["unit_key"],
+        "owner_id": profile["owner_id"],
+        "cargo_profile": profile["cargo_profile"],
+        "runtime_image_id": profile["runtime_image_id"],
+        "toolchain_image_id": profile["toolchain_image_id"],
+        "volume_names": dict(profile["volume_names"]),
+        "markers": {
+            role: {
+                "schema": volume_cache.OWNER_SCHEMA,
+                "state": "owned",
+                "unit_key": profile["unit_key"],
+                "owner_id": profile["owner_id"],
+                "role": role,
+                "volume_name": profile["volume_names"][role],
+                "uid": 65532,
+                "gid": 65532,
+            }
+            for role in (volume_cache.BUILD_VOLUME_ROLE, volume_cache.PACKAGE_VOLUME_ROLE)
+        },
+        "probe": {
+            "schema": volume_cache.PROBE_SCHEMA,
+            "state": "passed",
+            "owner_uid": 65532,
+            "owner_gid": 65532,
+            "volumes": {
+                role: {
+                    "regular_marker": True,
+                    "writable": True,
+                    "readonly_reopen": True,
+                    "no_reparse": True,
+                }
+                for role in (volume_cache.BUILD_VOLUME_ROLE, volume_cache.PACKAGE_VOLUME_ROLE)
+            },
+        },
+    }
+    profile["maintenance_receipt"] = maintenance
+    receipt = {
+        "schema": volume_cache.SCHEMA,
+        "profile": volume_cache.PROFILE,
+        "state": "ready",
+        "project_id": profile["project_id"],
+        "worktree_id": profile["worktree_id"],
+        "cache_key": profile["cache_key"],
+        "unit_key": profile["unit_key"],
+        "owner_id": profile["owner_id"],
+        "cargo_profile": profile["cargo_profile"],
+        "runtime_image_id": profile["runtime_image_id"],
+        "toolchain_image_id": profile["toolchain_image_id"],
+        "volume_names": dict(profile["volume_names"]),
+        "mounts": list(profile["mounts"]),
+        "build_root": volume_cache.BUILD_TARGET,
+        "package_root": volume_cache.PACKAGE_TARGET,
+        "volume_documents": documents,
+        "maintenance_receipt": maintenance,
+    }
+    receipt_path = root / "backend-volume-cache-receipt.json"
+    receipt["host_receipt_path"] = str(receipt_path)
+    profile["receipt"] = receipt
+    receipt_path.write_bytes(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode())
+    profile["receipt_path"] = str(receipt_path)
+    overlay_path = root / "compose.backend-cache-v2.json"
+    overlay = volume_cache.overlay(profile)
+    overlay_path.write_bytes(json.dumps(overlay, sort_keys=True, separators=(",", ":")).encode())
+    profile["overlay"] = overlay
+    profile["compose_overlay"] = str(overlay_path)
+    profile["compose_overlay_sha256"] = hashlib.sha256(overlay_path.read_bytes()).hexdigest()
+    maintenance_path = root / "compose.backend-cache-v2-maintenance.json"
+    maintenance_overlay = volume_cache.maintenance_overlay(profile)
+    maintenance_path.write_bytes(json.dumps(maintenance_overlay, sort_keys=True, separators=(",", ":")).encode())
+    profile["maintenance_overlay"] = maintenance_overlay
+    profile["maintenance_compose_overlay"] = str(maintenance_path)
+    return profile
 
 
 def package_probe_output():
@@ -871,6 +988,118 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
         self.assertTrue(all(not item["bind"]["create_host_path"] for item in mounts.values()))
         self.assertEqual(service["cap_drop"], ["ALL"])
         self.assertEqual(service["restart"], "no")
+
+    def test_v2_recovery_uses_the_pinned_package_volume_without_host_bind(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = v2_backend_cache(Path(temporary))
+            document = target()
+            package = next(item for item in document["Mounts"]
+                           if item["Destination"] == volume_cache.PACKAGE_TARGET)
+            package.pop("Source")
+            package.update({"Type": "volume",
+                            "Name": cache["volume_names"][volume_cache.PACKAGE_VOLUME_ROLE]})
+            document["Mounts"].append({
+                "Destination": volume_cache.BUILD_TARGET,
+                "Type": "volume",
+                "Name": cache["volume_names"][volume_cache.BUILD_VOLUME_ROLE],
+                "RW": True,
+            })
+            service = recovery.maintenance_compose(
+                document, PROJECT, REQUEST,
+                [recovery.NATIVE_PROGRAM, "--recover-orphan-after-teardown"],
+                backend_cache=cache,
+            )["services"]["backend-recovery"]
+            package_mount = next(item for item in service["volumes"]
+                                 if item["target"] == volume_cache.PACKAGE_TARGET)
+            self.assertEqual(package_mount["type"], "volume")
+            self.assertEqual(package_mount["source"],
+                             cache["volume_names"][volume_cache.PACKAGE_VOLUME_ROLE])
+            self.assertEqual(package_mount["volume"], {"nocopy": True})
+            args = recovery._maintenance_create_args(
+                {"name": PROJECT, "services": {"backend-recovery": service}},
+                name="fullmag-recovery-test")
+            mount_args = [args[index + 1] for index, value in enumerate(args[:-1])
+                          if value == "--mount"]
+            self.assertTrue(any(
+                "type=volume" in value
+                and "volume-nocopy" in value
+                and cache["volume_names"][volume_cache.PACKAGE_VOLUME_ROLE] in value
+                for value in mount_args
+            ))
+
+    def test_v2_recovery_rejects_a_foreign_cache_volume_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = v2_backend_cache(Path(temporary))
+            document = target()
+            package = next(item for item in document["Mounts"]
+                           if item["Destination"] == volume_cache.PACKAGE_TARGET)
+            package.pop("Source")
+            package.update({"Type": "volume", "Name": "foreign-cache-package"})
+            document["Mounts"].append({
+                "Destination": volume_cache.BUILD_TARGET,
+                "Type": "volume",
+                "Name": cache["volume_names"][volume_cache.BUILD_VOLUME_ROLE],
+                "RW": True,
+            })
+            with self.assertRaises(recovery.RecoveryAborted):
+                recovery.maintenance_compose(
+                    document, PROJECT, REQUEST, ["true"], backend_cache=cache)
+
+    def test_v2_descriptor_rejection_precedes_any_maintenance_runner(self):
+        for mutation in ("overlay", "receipt", "none", "absent"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                cache = v2_backend_cache(Path(temporary))
+                if mutation == "overlay":
+                    cache["compose_overlay_sha256"] = "0" * 64
+                elif mutation == "receipt":
+                    receipt_path = Path(cache["receipt_path"])
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    receipt["state"] = "failed"
+                    receipt_path.write_text(
+                        json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                document = target()
+                if mutation == "absent":
+                    package = next(item for item in document["Mounts"]
+                                   if item["Destination"] == volume_cache.PACKAGE_TARGET)
+                    package.pop("Source")
+                    package.update({
+                        "Type": "volume",
+                        "Name": cache["volume_names"][volume_cache.PACKAGE_VOLUME_ROLE],
+                    })
+                    document["Mounts"].append({
+                        "Destination": volume_cache.BUILD_TARGET,
+                        "Type": "volume",
+                        "Name": cache["volume_names"][volume_cache.BUILD_VOLUME_ROLE],
+                        "RW": True,
+                    })
+                docker = FakeDocker(document)
+                events = []
+                pins = recovery_pins()
+                if mutation == "none":
+                    pins["backend_cache"] = None
+                elif mutation != "absent":
+                    pins["backend_cache"] = cache
+                state_root = Path(temporary) / "state"
+                state_root.mkdir()
+                for document in (docker.before, docker.after):
+                    for mount in document["Mounts"]:
+                        if mount["Destination"] == "/state":
+                            mount["Source"] = str(state_root)
+                def runner(*args):
+                    events.append(args)
+                    raise AssertionError("maintenance runner must not be reached")
+                with mock.patch.object(recovery, "_pure_module", return_value=fake_pure()):
+                    with self.assertRaises(recovery.RecoveryAborted):
+                        recovery.recover_orphan(
+                            pins, target()["Id"], PROJECT,
+                            state_root / "diagnostics",
+                            docker_client=docker,
+                            maintenance_runner=runner,
+                        )
+                self.assertEqual(events, [])
+                self.assertFalse(any(call[0] == "volume" for call in docker.calls))
 
     def test_preflight_has_no_mutable_store_or_ledger_mount(self):
         service = recovery.maintenance_compose(

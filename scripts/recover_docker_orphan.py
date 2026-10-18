@@ -45,6 +45,106 @@ RECOVERY_CONTAINER_SERVICE = "backend-recovery"
 MAX_OUTPUT = 2 * 1024 * 1024
 
 
+def _backend_volume_cache_adapter(value: Any):
+    """Return the v2 adapter only for an explicit ready volume profile."""
+
+    if not isinstance(value, Mapping):
+        raise RecoveryAborted("v2 backend cache proof is missing")
+    try:
+        import docker_backend_volume_cache as adapter
+    except ImportError as error:  # pragma: no cover - packaging error
+        raise RecoveryAborted("backend volume cache adapter is unavailable") from error
+    if value.get("schema") != adapter.SCHEMA or value.get("profile") != adapter.PROFILE:
+        raise RecoveryAborted("backend cache profile is not the supported v2 schema")
+    if value.get("state") != "ready":
+        raise RecoveryAborted("backend volume cache proof is not ready")
+    if value.get("build_root") != adapter.BUILD_TARGET or value.get("mount_root") != adapter.BUILD_TARGET:
+        raise RecoveryAborted("backend volume cache build target differs from v2")
+    if value.get("package_root") != adapter.PACKAGE_TARGET:
+        raise RecoveryAborted("backend volume cache package target differs from v2")
+    names = value.get("volume_names")
+    if (not isinstance(names, Mapping)
+            or set(names) != {adapter.BUILD_VOLUME_ROLE, adapter.PACKAGE_VOLUME_ROLE}
+            or any(not isinstance(name, str) or adapter._VOLUME_NAME.fullmatch(name) is None
+                   for name in names.values())):
+        raise RecoveryAborted("backend volume cache names are invalid")
+    receipt = value.get("receipt")
+    if not isinstance(receipt, Mapping) or receipt.get("volume_names") != dict(names):
+        raise RecoveryAborted("backend volume cache receipt does not pin its volume pair")
+    receipt_path = value.get("receipt_path")
+    receipt_sha = value.get("receipt_sha256")
+    if not isinstance(receipt_path, str):
+        raise RecoveryAborted("backend volume cache receipt path is missing")
+    receipt_file = _absolute_no_follow(Path(receipt_path),
+                                       "backend volume cache receipt path")
+    if receipt_sha is not None and (
+            not isinstance(receipt_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", receipt_sha) is None):
+        raise RecoveryAborted("backend volume cache receipt digest is invalid")
+    receipt_document = _read_json_record(receipt_file, "backend volume cache receipt")
+    receipt_raw = _regular_bytes(receipt_file, "backend volume cache receipt")
+    if (receipt_document != dict(receipt)
+            or (receipt_sha is not None
+                and hashlib.sha256(receipt_raw).hexdigest() != receipt_sha)):
+        raise RecoveryAborted("backend volume cache receipt changed or differs from its pin")
+    documents = value.get("volume_documents")
+    if not isinstance(documents, Mapping):
+        raise RecoveryAborted("backend volume cache has no inspected volume pair")
+    try:
+        adapter._validate_volume_documents(documents, value)
+    except Exception as error:
+        raise RecoveryAborted(f"backend volume cache volume proof is invalid: {error}") from error
+    return adapter
+
+
+def _validate_backend_volume_cache_target(
+    target: Mapping[str, Any], cache: Mapping[str, Any], client: Callable[..., Any] | None = None,
+) -> None:
+    """Validate the ready descriptor before probing or mounting its volumes."""
+
+    try:
+        from docker_orphan_recovery import _validate_backend_volume_cache
+        _validate_backend_volume_cache(cache)
+    except RecoveryAborted:
+        raise
+    except Exception as error:
+        raise RecoveryAborted(
+            f"backend volume cache descriptor failed closed before maintenance: {error}"
+        ) from error
+
+    adapter = _backend_volume_cache_adapter(cache)
+    mounts = {
+        item.get("Destination"): item
+        for item in target.get("Mounts", [])
+        if isinstance(item, Mapping)
+    }
+    expected = {
+        adapter.BUILD_TARGET: adapter.BUILD_VOLUME_ROLE,
+        adapter.PACKAGE_TARGET: adapter.PACKAGE_VOLUME_ROLE,
+    }
+    for destination, role in expected.items():
+        mount = mounts.get(destination)
+        if (not isinstance(mount, Mapping) or mount.get("Type") != "volume"
+                or mount.get("Name") != cache["volume_names"][role]
+                or mount.get("RW") is not True):
+            raise RecoveryAborted(f"target cache mount {destination} is not the pinned named volume")
+    if client is None:
+        return
+    for role in (adapter.BUILD_VOLUME_ROLE, adapter.PACKAGE_VOLUME_ROLE):
+        name = cache["volume_names"][role]
+        try:
+            raw = _docker_call(client, "volume", "inspect", name, timeout=60)
+            document = json.loads(raw)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise RecoveryUnknown(f"backend cache volume {role} inspect is unavailable") from error
+        if not isinstance(document, list) or len(document) != 1:
+            raise RecoveryUnknown(f"backend cache volume {role} inspect is ambiguous")
+        try:
+            adapter._validate_volume_document(document[0], cache, role)
+        except Exception as error:
+            raise RecoveryUnknown(f"backend cache volume {role} identity changed") from error
+
+
 def require(condition: object, message: str) -> None:
     if not condition:
         raise ValueError(message)
@@ -86,7 +186,8 @@ def native_arguments(phase: str, request_path: str,
 
 def maintenance_compose(target: Mapping[str, Any], project: str,
                         request_id: str, command: Sequence[str], *,
-                        preflight: bool = False) -> dict[str, Any]:
+                        preflight: bool = False,
+                        backend_cache: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Derive minimum mounts from the exact backend; never inherit its GPU."""
     require_request_id(request_id)
     require(re.fullmatch(r"fullmag-(?:master|worktree-[a-z0-9._-]+)", project),
@@ -108,12 +209,23 @@ def maintenance_compose(target: Mapping[str, Any], project: str,
     volumes = []
     for destination in sorted((READONLY_MOUNTS | MUTABLE_MOUNTS) & mounts.keys()):
         mount = mounts[destination]
-        require(mount["Type"] == "bind" and mount.get("Source"),
-                "recovery requires an existing exact bind mount")
-        volumes.append({"type": "bind", "source": mount["Source"],
-                        "target": destination,
-                        "read_only": preflight or destination in READONLY_MOUNTS,
-                        "bind": {"create_host_path": False}})
+        read_only = preflight or destination in READONLY_MOUNTS
+        if mount.get("Type") == "volume":
+            require(destination == "/opt/fullmag/package" and backend_cache is not None,
+                    "v2 recovery requires the typed backend volume cache proof")
+            _validate_backend_volume_cache_target(target, backend_cache)
+            name = mount.get("Name")
+            require(name == backend_cache["volume_names"]["package"],
+                    "recovery package volume differs from its exact v2 pin")
+            volumes.append({"type": "volume", "source": name,
+                            "target": destination, "read_only": read_only,
+                            "volume": {"nocopy": True}})
+        else:
+            require(mount["Type"] == "bind" and mount.get("Source"),
+                    "recovery requires an existing exact bind mount")
+            volumes.append({"type": "bind", "source": mount["Source"],
+                            "target": destination, "read_only": read_only,
+                            "bind": {"create_host_path": False}})
     environment = {}
     for entry in target["Config"].get("Env", []):
         name, separator, value = entry.partition("=")
@@ -372,12 +484,16 @@ def _validate_maintenance_created_mounts(
             raise RecoveryAborted("maintenance volume specification is invalid")
         destination = volume.get("target")
         source = volume.get("source")
-        if not isinstance(destination, str) or not isinstance(source, str):
-            raise RecoveryAborted("maintenance volume has invalid path")
+        volume_type = volume.get("type")
+        if (not isinstance(destination, str) or not isinstance(source, str)
+                or volume_type not in {"bind", "volume"}):
+            raise RecoveryAborted("maintenance volume has invalid typed mount")
         if destination in expected:
             raise RecoveryAborted(f"duplicate maintenance mount: {destination}")
         expected[destination] = {
-            "Type": "bind", "Source": source, "Destination": destination,
+            "Type": volume_type,
+            ("Source" if volume_type == "bind" else "Name"): source,
+            "Destination": destination,
             "RW": not bool(volume.get("read_only", False)),
         }
     tmpfs_specs = service.get("tmpfs", [])
@@ -405,23 +521,24 @@ def _validate_maintenance_created_mounts(
         if not isinstance(destination, str) or destination in actual:
             raise RecoveryAborted("maintenance inspect contains duplicate mount")
         actual[destination] = mount
-    actual_bind_destinations = {
+    actual_managed_destinations = {
         destination for destination, mount in actual.items()
-        if mount.get("Type") == "bind"
+        if mount.get("Type") in {"bind", "volume"}
     }
-    if actual_bind_destinations != set(expected):
-        raise RecoveryAborted("maintenance bind mounts differ from the requested set")
+    if actual_managed_destinations != set(expected):
+        raise RecoveryAborted("maintenance managed mounts differ from the requested set")
     actual_tmpfs_destinations = {
         destination for destination, mount in actual.items()
         if mount.get("Type") == "tmpfs"
     }
-    if set(actual) != actual_bind_destinations | actual_tmpfs_destinations:
+    if set(actual) != actual_managed_destinations | actual_tmpfs_destinations:
         raise RecoveryAborted("maintenance inspect contains an unsupported mount type")
     if not actual_tmpfs_destinations <= set(expected_tmpfs):
         raise RecoveryAborted("maintenance inspect contains an undeclared tmpfs mount")
     for destination, wanted in expected.items():
         observed = actual[destination]
-        for field in ("Type", "Source", "Destination"):
+        fields = ("Type", "Source", "Destination") if wanted["Type"] == "bind" else ("Type", "Name", "Destination")
+        for field in fields:
             if observed.get(field) != wanted[field]:
                 raise RecoveryAborted(
                     f"maintenance mount {destination} has unexpected {field}"
@@ -750,9 +867,18 @@ def _maintenance_create_args(spec: Mapping[str, Any], *, name: str) -> list[str]
     for key, value in sorted(labels.items()):
         args += ["--label", f"{key}={value}"]
     for volume in service.get("volumes", []):
-        require(volume.get("type") == "bind" and volume.get("source") and volume.get("target"),
-                "maintenance service has an invalid bind")
-        mount = f"type=bind,src={volume['source']},dst={volume['target']}"
+        volume_type = volume.get("type")
+        require(volume_type in {"bind", "volume"} and volume.get("source")
+                and volume.get("target"), "maintenance service has an invalid typed mount")
+        if volume_type == "volume":
+            mount = f"type=volume,src={volume['source']},dst={volume['target']}"
+            options = volume.get("volume", {})
+            require(isinstance(options, Mapping),
+                    "maintenance service has invalid volume options")
+            if options.get("nocopy") is True:
+                mount += ",volume-nocopy"
+        else:
+            mount = f"type=bind,src={volume['source']},dst={volume['target']}"
         if volume.get("read_only"):
             mount += ",readonly"
         args += ["--mount", mount]
@@ -764,10 +890,14 @@ def _maintenance_create_args(spec: Mapping[str, Any], *, name: str) -> list[str]
 
 def _maintenance_run(client: Callable[..., Any], target: Mapping[str, Any], project: str,
                      request_id: str, command: Sequence[str], *, preflight: bool,
-                     phase: str) -> dict[str, Any]:
+                     phase: str,
+                     backend_cache: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Run one exact, non-networked maintenance container and retain evidence."""
 
-    spec = maintenance_compose(target, project, request_id, command, preflight=preflight)
+    spec = maintenance_compose(
+        target, project, request_id, command, preflight=preflight,
+        backend_cache=backend_cache,
+    )
     name = f"fullmag-recovery-{request_id[:8]}-{phase}"
     created = _docker_call(client, *_maintenance_create_args(spec, name=name), timeout=60).strip()
     if not re.fullmatch(r"[0-9a-f]{64}", created):
@@ -1346,6 +1476,20 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     engine_before = _engine(client)
     target_before = _inspect(client, target_container_id)
     _manifest_observation(target_before, stopped=_is_factually_stopped(target_before))
+    backend_cache = pins.get("backend_cache")
+    if "backend_cache" in pins:
+        _validate_backend_volume_cache_target(target_before, backend_cache, client)
+    else:
+        target_mounts = {
+            item.get("Destination"): item
+            for item in target_before.get("Mounts", [])
+            if isinstance(item, Mapping)
+        }
+        if any(target_mounts.get(destination, {}).get("Type") == "volume"
+               for destination in ("/build", "/opt/fullmag/package")):
+            raise RecoveryAborted(
+                "named-volume backend requires an explicit ready v2 cache proof"
+            )
     running = _running_containers(client)
     assert_shared_clients_quiescent(target_before, running)
     root = _assert_diagnostics_binding(target_before, root)
@@ -1359,7 +1503,8 @@ def recover_orphan(pins: Mapping[str, Any], target_container_id: str, project: s
     run_maintenance = maintenance_runner
     if run_maintenance is None:
         run_maintenance = lambda target, name, command, preflight, phase: _maintenance_run(  # noqa: E731
-            client, target, project, request_id, command, preflight=preflight, phase=phase)
+            client, target, project, request_id, command, preflight=preflight, phase=phase,
+            backend_cache=backend_cache)
     request_path = request_dir / "request.json"
     probe_dir = request_dir
     request_exists = _record_exists(request_path, "orphan request")

@@ -62,6 +62,10 @@ RUNTIME_IMAGE_CONTEXT_FILES = (
     ("Dockerfile.backend", "docker/all-in-one/Dockerfile.backend"),
     ("backend_dev.py", "docker/all-in-one/backend_dev.py"),
     ("backend_source.py", "docker/all-in-one/backend_source.py"),
+    (
+        "backend_volume_cache_maintenance.py",
+        "docker/all-in-one/backend_volume_cache_maintenance.py",
+    ),
 )
 REQUIRED_LANES = ("fdm-cpu", "fdm-gpu", "fem-cpu", "fem-gpu")
 BUILD_PROFILE_TO_CARGO_PROFILE = {
@@ -1023,6 +1027,7 @@ def _validate_runtime_image(reference: str, expected_toolchain_id: str,
     if labels.get("org.fullmag.toolchain.image-id") not in accepted_label_ids:
         raise _fail("development image toolchain label differs from the admitted base")
     _image_file(reference, "/opt/fullmag/backend_dev.py")
+    _image_file(reference, "/opt/fullmag/backend_volume_cache_maintenance.py")
     metadata = _read_image_metadata(layout, reference)
     if metadata is None:
         if require_receipt:
@@ -1155,31 +1160,109 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
 
 def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: str,
                            run_root: Path, selected: Path, toolchain_id: str) -> dict[str, object]:
-    """Use the versioned project backend-cache helper."""
+    """Prepare the v2 Docker-VM named-volume pair and its fixed helper.
 
-    from docker_backend_cache import prepare
-    profile = prepare(
-        layout,
-        repo,
-        image_id,
-        run_root,
-        _docker_capture,
-        source_root=selected,
-        toolchain_image=toolchain_id,
+    The legacy loop-image adapter remains available to its existing callers.
+    Direct Docker development uses this separate v2 identity, so a new cache
+    pair is created beside (and never migrates or deletes) any v1 cache.
+    """
+
+    from docker_backend_volume_cache import (
+        BackendVolumeCacheError,
+        VolumeNotFound,
+        prepare_ready,
     )
+
+    def volume_docker(*arguments: object) -> str:
+        try:
+            return _docker_capture(*arguments)
+        except DirectDockerError as error:
+            # ``ensure_volume_pair`` needs a typed absence so a missing pair
+            # can be created while every other inspect failure remains fatal.
+            if (len(arguments) >= 3
+                    and arguments[0] == "volume"
+                    and arguments[1] == "inspect"
+                    and any(
+                        marker in str(error).lower()
+                        for marker in ("no such volume", "volume not found")
+                    )):
+                raise VolumeNotFound(str(error)) from error
+            raise
+
+    project = str(_compose_identity(layout)["project_name"])
+    maintenance_overlay_path = run_root / "backend-cache-maintenance.json"
+
+    def running_consumers() -> tuple[Mapping[str, object], ...]:
+        raw_ids = _docker_capture("ps", "--quiet", "--no-trunc", timeout=60)
+        ids = tuple(line.strip() for line in raw_ids.splitlines() if line.strip())
+        if not ids:
+            return ()
+        inspected = _read_json_output(
+            _docker_capture("inspect", *ids, timeout=60),
+            "running Docker cache-consumer inventory",
+        )
+        if not isinstance(inspected, list):
+            raise _fail("running Docker cache-consumer inventory is not a list")
+        consumers: list[Mapping[str, object]] = []
+        for document in inspected:
+            if not isinstance(document, Mapping):
+                raise _fail("running Docker cache-consumer inventory is malformed")
+            state = document.get("State")
+            if not isinstance(state, Mapping) or state.get("Running") is not True:
+                raise _fail("Docker cache-consumer inventory changed during inspection")
+            consumers.append(document)
+        return tuple(consumers)
+
+    def maintenance(profile: Mapping[str, object], overlay: Mapping[str, object]) -> Mapping[str, object]:
+        _write_json(maintenance_overlay_path, overlay)
+        output = _docker_capture(
+            *_compose_prefix(repo, [maintenance_overlay_path], project),
+            "run", "--rm", "--no-deps", "backend-cache-volume-maintenance",
+            timeout=180,
+        )
+        value = _read_json_output(output, "backend cache maintenance receipt")
+        if not isinstance(value, dict):
+            raise _fail("backend cache maintenance returned no JSON receipt")
+        return value
+
+    try:
+        profile = prepare_ready(
+            layout,
+            repo,
+            image_id,
+            run_root,
+            volume_docker,
+            maintenance,
+            source_root=selected,
+            toolchain_image=toolchain_id,
+            active_consumers=running_consumers(),
+        )
+    except BackendVolumeCacheError as error:
+        raise _fail(f"backend named-volume cache was not admitted: {error}") from error
     if not isinstance(profile, Mapping) or profile.get("state") != "ready":
-        raise _fail("backend build cache did not reach ready state")
-    return dict(profile)
+        raise _fail("backend named-volume cache did not reach ready state")
+
+    runtime_overlay_path = run_root / "backend-cache-overlay.json"
+    runtime_overlay = profile.get("overlay")
+    if not isinstance(runtime_overlay, Mapping):
+        raise _fail("backend named-volume cache returned no runtime overlay")
+    _write_json(runtime_overlay_path, runtime_overlay)
+    result = dict(profile)
+    result["compose_overlay"] = str(runtime_overlay_path)
+    result["compose_overlay_sha256"] = _sha256_file(
+        runtime_overlay_path, "backend named-volume cache Compose overlay"
+    )
+    result["maintenance_compose_overlay"] = str(maintenance_overlay_path)
+    return result
 
 
 def _backend_cache_package_root(cache: Mapping[str, object]) -> PurePosixPath:
-    """Return the helper-attested ext4 package directory for the backend.
+    """Return the helper-attested daemon package target for the backend.
 
-    The backend cache helper owns this directory and creates it with the
-    container UID before Compose is evaluated.  The host launcher must pass
-    that exact typed path through unchanged; deriving a sibling under the
-    Windows run root would silently put the package outside the persistent
-    cache and break the fixed-container contract.
+    The v2 helper owns a named-volume pair and creates both volumes with the
+    container UID before Compose is evaluated.  Native Windows Python must
+    pass the daemon path through unchanged; deriving a sibling under the run
+    root would silently switch the package back to Windows storage.
     """
 
     package_value = cache.get("package_root")
@@ -1202,17 +1285,20 @@ def _backend_cache_package_root(cache: Mapping[str, object]) -> PurePosixPath:
         raise _fail("backend cache did not return its resolved environment")
     if environment.get("FULLMAG_BACKEND_PACKAGE") != package_value:
         raise _fail("backend cache package environment differs from package_root")
-    try:
-        relative = package.relative_to(mount)
-    except ValueError as error:
-        raise _fail("backend cache package_root escapes its attested mount_root") from error
-    if relative != PurePosixPath("package"):
-        raise _fail("backend cache package_root is not its attested package child")
+    # v2 deliberately uses two daemon named volumes: the Cargo/build volume
+    # is mounted at /build and the runtime package volume at /opt/fullmag/package.
+    # They are a pair, not a host-visible ``/build/package`` subtree.  Keep the
+    # exact paths here so a Windows path cannot be silently reinterpreted.
+    if package != PurePosixPath("/opt/fullmag/package"):
+        raise _fail("backend cache package_root is not the v2 daemon package target")
+    if mount != PurePosixPath("/build"):
+        raise _fail("backend cache mount_root is not the v2 daemon build target")
     return package
 
 
 def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
-                 source_bundle: Mapping[str, object], package: Path, image_ref: str,
+                 source_bundle: Mapping[str, object], package: str | PurePosixPath,
+                 image_ref: str,
                  image_id: str, toolchain_id: str, cache: Mapping[str, object],
                  base_reference: str, cargo_profile: str) -> dict[str, str]:
     cargo_profile = _validate_cargo_profile(cargo_profile)
