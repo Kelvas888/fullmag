@@ -165,14 +165,18 @@ egzekwuje. Nie sumuj współdzielonych warstw obrazów jako niezależnych kopii.
 Retencja ma odróżniać:
 
 - **pakiety:** bieżący + jeden zweryfikowany rollback; starsze binaria dopiero
-  po trwałej publikacji, pod blokadą, po zachowaniu logów/receiptów;
+  po trwałej publikacji i pod blokadą. Obecna implementacja archiwizuje log i
+  receipty każdej usuniętej generacji bez limitu; traktuj to jako nierozwiązaną
+  retencję, a nie jako bounded cleanup;
 - **aktywny cache przyrostowy:** pozostaje dla kolejnego buildu;
 - **nieaktywne generacje:** kandydaci do osobnego bounded cleanup po ustaleniu
   właścicieli, mountów, lease, rollbacku i referencji wyników;
 - **orphan staging po awarii:** nie usuwać wyłącznie po nazwie lub wieku;
   wymaga dowodu zakończenia procesu/operacji i braku referencji;
-- **logi i metadane:** wymagają osobnej jawnej polityki, bo sama retencja
-  binariów ich nie ogranicza;
+- **logi i metadane:** stdout/stderr usługi Compose ma obecnie rotację
+  `json-file` `10m × 3`; `next.log` jest zerowany przy starcie, ale może rosnąć
+  w długiej sesji, a `/retired` nie ma limitu. Sama retencja binariów ich nie
+  ogranicza;
 - **sesje/wyniki/settings/ledger:** poza cleanupem builda.
 
 Nie wykonuj globalnego `docker system prune`, `volume prune`, kasowania targetu

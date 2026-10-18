@@ -5,6 +5,12 @@
 # keeps direct config inspection deterministic; selected worktrees override it.
 name: ${FULLMAG_COMPOSE_PROJECT:-fullmag-master}
 
+x-fullmag-bounded-logging: &fullmag-bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-fullmag-source-labels: &fullmag-source-labels
   org.fullmag.source.project-id: ${FULLMAG_SOURCE_PROJECT_ID:-unknown}
   org.fullmag.source.worktree-id: ${FULLMAG_SOURCE_WORKTREE_ID:-unknown}
@@ -15,6 +21,7 @@ services:
   development-base:
     profiles: ["image-build"]
     labels: *fullmag-source-labels
+    logging: *fullmag-bounded-logging
     image: ${FULLMAG_DEVELOPMENT_BASE_IMAGE:-fullmag/development-base:local}
     pull_policy: never
     build:
@@ -29,6 +36,7 @@ services:
 
   backend-cache-volume-maintenance:
     profiles: ["backend-cache-maintenance"]
+    logging: *fullmag-bounded-logging
     labels:
       com.fullmag.source.project-id: ${FULLMAG_SOURCE_PROJECT_ID:-unknown}
       com.fullmag.source.worktree-id: ${FULLMAG_SOURCE_WORKTREE_ID:-unknown}
@@ -86,6 +94,7 @@ services:
 
   backend:
     labels: *fullmag-source-labels
+    logging: *fullmag-bounded-logging
     image: ${FULLMAG_DEV_IMAGE:?Prepare the development toolchain image}
     build:
       context: ./docker/all-in-one
@@ -222,6 +231,7 @@ services:
 
   frontend:
     labels: *fullmag-source-labels
+    logging: *fullmag-bounded-logging
     image: ${FULLMAG_DEV_IMAGE}
     pull_policy: never
     init: true

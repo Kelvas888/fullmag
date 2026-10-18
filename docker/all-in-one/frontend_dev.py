@@ -1272,12 +1272,12 @@ def _log_stream() -> Any:
         descriptor = os.open(
             LOG_PATH,
             os.O_WRONLY
-            | os.O_APPEND
+            | os.O_TRUNC
             | os.O_CREAT
             | getattr(os, "O_NOFOLLOW", 0),
             0o660,
         )
-        return os.fdopen(descriptor, "ab")
+        return os.fdopen(descriptor, "wb")
     except OSError as error:
         if descriptor is not None:
             os.close(descriptor)

@@ -161,6 +161,14 @@ docker restart <backend-container-id>
 docker logs -f <backend-container-id>
 ```
 
+Usługi Compose DEV ustawiają Docker `json-file` logging z rotacją `10m × 3`
+na każdy kontener. Frontend zapisuje szczegóły Next w stałym
+`/state/development/next.log` z named volume; plik jest zerowany przy każdym
+nowym starcie frontendu, więc restarty nie dopisują kolejnych kopii. To nie
+ogranicza rozmiaru `next.log` podczas jednej długiej sesji ani archiwów starych
+pakietów backendu. Pełna retencja tych technicznych plików nadal wymaga pracy;
+limit logów Docker nie jest quota dla wolumenów ani BuildKit.
+
 Każdy start sam sprawdza aktualne zamontowane źródła. Bez zmian używa istniejącego
 wyniku; po edycji kompiluje zmienione moduły oraz ich zależnych konsumentów,
 zachowując cache. Użytkownik nie odświeża osobno manifestu i nie uruchamia drugiego

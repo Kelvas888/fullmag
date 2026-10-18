@@ -437,9 +437,11 @@ class FrontendDevContractTests(TestCase):
     def test_log_tailer_streams_only_bytes_appended_after_start(self):
         with isolated(self.module) as (_root, _workspace, _inputs):
             self.module._prepare_state_directories()
+            self.module.LOG_PATH.write_bytes(b"previous frontend process log\n")
             log_stream = self.module._log_stream()
             tailer = None
             try:
+                self.assertEqual(self.module.LOG_PATH.read_bytes(), b"")
                 log_stream.write(
                     b"frontend tool probe result name=pnpm status=ok\n"
                     b"old install progress 1/758\n"

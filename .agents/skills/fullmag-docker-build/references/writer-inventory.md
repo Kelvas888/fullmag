@@ -50,6 +50,23 @@ Weryfikuj rzeczywiste nazwy i mounty przy zmianie launchera. Systemowy temp
 jest wyjątkiem dla krótkich metadanych Compose, nie miejscem na źródła, cache,
 pakiety, logi buildu ani trwałe receipty.
 
+### Kontrola retencji logów na branchu volume-only
+
+W Compose DEV każda z czterech usług (`development-base`, maintenance,
+`backend`, `frontend`) ma `json-file` z `max-size=10m`, `max-file=3`. To
+ogranicza stdout/stderr zarządzane przez Docker Engine do nominalnych 3 × 10 MiB
+na kontener; nie ogranicza plików w wolumenach ani BuildKit. Frontend otwiera
+`/state/development/next.log` przez `O_TRUNC` po przejęciu blokady, więc log nie
+narasta między restartami. Nie ma jeszcze limitu pliku w trakcie długiej sesji.
+
+Backend zapisuje `direct-backend-build.log` do stabilnego pakietu, a starsze
+pakiety po zachowaniu rollbacku mają log/receipt/rotation kopiowane do
+`/opt/fullmag/package/.development/retired`. Archiwum nie ma limitu wieku,
+rozmiaru ani liczby wpisów. Te logi i metadane są więc głównym bieżącym writerem
+generującym kolejne kopie; retencja całego dysku pozostaje niekompletna mimo
+rotacji Docker stdout. Pełny runtime Docker i pomiary wzrostu pozostają
+`NOT VERIFIED`.
+
 Migracja **nie implementuje** automatycznego usuwania starych wersji named
 volumes, obrazów ani BuildKit cache i nie ustala quota. Wolumeny `external`
 przeżywają odtworzenie/usunięcie kontenera. Nie używaj `compose down -v` jako

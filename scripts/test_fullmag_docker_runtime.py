@@ -604,6 +604,33 @@ class DockerRuntimeContract(unittest.TestCase):
         static_compose = (repository / "compose.static.yaml").read_text(encoding="utf-8")
         self.assertNotIn("\n  frontend:", static_compose)
 
+    def test_dev_compose_bounds_engine_logs_for_each_service(self):
+        repository = Path(__file__).resolve().parents[1]
+        source = (repository / "compose.dev.yaml").read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r"(?ms)^x-fullmag-bounded-logging: &fullmag-bounded-logging\n"
+            r"  driver: json-file\n"
+            r"  options:\n"
+            r"    max-size: \"10m\"\n"
+            r"    max-file: \"3\"$",
+        )
+        services = (
+            "development-base",
+            "backend-cache-volume-maintenance",
+            "backend",
+            "frontend",
+        )
+        for index, service in enumerate(services):
+            marker = f"\n  {service}:\n"
+            self.assertIn(marker, source)
+            block = source.split(marker, 1)[1]
+            if index + 1 < len(services):
+                block = block.split(f"\n  {services[index + 1]}:\n", 1)[0]
+            else:
+                block = block.split("\n# A separate project-scoped bridge", 1)[0]
+            self.assertIn("    logging: *fullmag-bounded-logging", block)
+
     def test_startup_receipt_requires_ready_matching_activation(self):
         authorization = {
             "schema": "fullmag.docker-startup-script.v1",
