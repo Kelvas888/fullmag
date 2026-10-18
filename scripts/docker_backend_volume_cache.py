@@ -25,6 +25,12 @@ import re
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping
 
+from docker_named_volume_safety import (
+    DockerNamedVolumeSafetyError,
+    validate_linux_volume_mountpoint,
+    validate_local_named_volume,
+)
+
 SCHEMA = "fullmag.backend-build-cache.v2"
 KEY_SCHEMA = "fullmag.backend-build-cache-key.v2"
 OWNER_SCHEMA = "fullmag.backend-build-cache-owner.v2"
@@ -560,28 +566,20 @@ def _normal_volume_document(value: Any, expected_name: str) -> dict[str, Any]:
 
 
 def _validate_mountpoint(value: Any) -> str:
-    if not isinstance(value, str) or not value.startswith("/") or "\\" in value:
-        raise BackendVolumeCacheError("named volume has no canonical Linux mountpoint")
-    path = PurePosixPath(value)
-    if any(part in {"", ".", ".."} for part in path.parts[1:]) or path == PurePosixPath("/"):
-        raise BackendVolumeCacheError("named volume mountpoint is unsafe")
-    lowered = value.lower()
-    if "/run/desktop/mnt/host" in lowered or "/mnt/c" in lowered or "/mnt/d" in lowered:
-        raise BackendVolumeCacheError("named volume resolves through a Windows host bind")
-    return str(path)
+    try:
+        return validate_linux_volume_mountpoint(value)
+    except DockerNamedVolumeSafetyError as error:
+        raise BackendVolumeCacheError(str(error)) from error
 
 
 def _validate_volume_document(
     document: Mapping[str, Any], profile: Mapping[str, Any], role: str
 ) -> dict[str, Any]:
     expected_name = profile["volume_names"][role]
-    if document.get("Name") != expected_name or document.get("Driver") != VOLUME_DRIVER:
-        raise BackendVolumeCacheError("named volume identity or driver changed")
-    options = document.get("Options")
-    if options not in (None, {}):
-        raise BackendVolumeCacheError("backend cache named volume must not have driver options")
-    if document.get("Scope") not in (None, "local"):
-        raise BackendVolumeCacheError("backend cache named volume is not local")
+    try:
+        mountpoint = validate_local_named_volume(document, expected_name)
+    except DockerNamedVolumeSafetyError as error:
+        raise BackendVolumeCacheError(str(error)) from error
     labels = document.get("Labels")
     if not isinstance(labels, Mapping):
         raise BackendVolumeCacheError("backend cache named volume has no labels")
@@ -603,7 +601,6 @@ def _validate_volume_document(
             raise BackendVolumeCacheError("shared control volume bootstrap labels are invalid")
         if any(key.startswith(_LABEL_PREFIX) for key in labels):
             raise BackendVolumeCacheError("shared control volume has backend cache labels")
-        mountpoint = _validate_mountpoint(document.get("Mountpoint"))
         return {**dict(document), "Mountpoint": mountpoint, "Labels": dict(labels)}
     expected = volume_labels(profile, role)
     for key, value in expected.items():
@@ -611,7 +608,6 @@ def _validate_volume_document(
             raise BackendVolumeCacheError(f"backend cache named volume label mismatch: {key}")
     if any(key.startswith(_LABEL_PREFIX) and key not in expected for key in labels):
         raise BackendVolumeCacheError("backend cache named volume has an unexpected identity label")
-    mountpoint = _validate_mountpoint(document.get("Mountpoint"))
     return {**dict(document), "Mountpoint": mountpoint, "Labels": dict(labels)}
 
 

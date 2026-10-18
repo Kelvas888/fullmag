@@ -33,7 +33,12 @@ def validate_local_named_volume(
     if document.get("Scope") not in (None, "local"):
         raise DockerNamedVolumeSafetyError("Docker named volume is not local scope")
 
-    mountpoint_value = document.get("Mountpoint")
+    return validate_linux_volume_mountpoint(document.get("Mountpoint"))
+
+
+def validate_linux_volume_mountpoint(mountpoint_value: Any) -> str:
+    """Admit a Docker-managed Linux mountpoint without Windows path aliases."""
+
     if (
         not isinstance(mountpoint_value, str)
         or not mountpoint_value.startswith("/")

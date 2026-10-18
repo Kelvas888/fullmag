@@ -793,6 +793,7 @@ def _v2_ensure_volume(
         "name": name,
         "driver": str(record.get("Driver", "local")),
         "labels": dict(observed),
+        "inspection": dict(record),
     }
 
 
@@ -835,7 +836,32 @@ def _v2_ensure_control_volume(
         "name": name,
         "driver": str(record.get("Driver", "local")),
         "labels": dict(labels or {}),
+        "inspection": dict(record),
     }
+
+
+def reinspect_volumes(profile: Mapping[str, Any], docker: Callable[..., Any]) -> None:
+    """Reject changed backing immediately before mounting prepared volumes."""
+
+    if profile.get("schema") != SCHEMA or profile.get("state") != "ready":
+        raise FrontendCacheError("frontend cache profile is not ready for volume reinspection")
+    for descriptor_key, name_key in (("volume", "volume_name"),
+                                     ("control_volume", "control_volume_name")):
+        descriptor = profile.get(descriptor_key)
+        expected = descriptor.get("inspection") if isinstance(descriptor, Mapping) else None
+        name = profile.get(name_key)
+        if not isinstance(expected, Mapping) or not isinstance(name, str):
+            raise FrontendCacheError("frontend volume has no admitted inspection identity")
+        observed = _v2_volume_inspect(docker, name)
+        if observed is None:
+            raise FrontendCacheError("frontend volume reinspection failed; no resources created")
+        try:
+            validate_local_named_volume(expected, name)
+            validate_local_named_volume(observed, name)
+        except DockerNamedVolumeSafetyError as error:
+            raise FrontendCacheError(f"frontend volume has unsafe backing: {error}") from error
+        if dict(observed) != dict(expected):
+            raise FrontendCacheError("frontend volume identity changed since admission")
 
 
 def _v2_cache_key(*args: Any, **kwargs: Any) -> dict[str, Any]:

@@ -268,6 +268,32 @@ class DockerRuntimeContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "build root"):
                 runtime._validate_backend_volume_cache(tampered)
 
+    def test_v2_cache_reinspection_reads_all_current_volume_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = _v2_cache_fixture(Path(directory))
+            by_name = {item["Name"]: item for item in cache["volume_documents"].values()}
+            def inspect(*args):
+                self.assertEqual(args[:2], ("volume", "inspect"))
+                return json.dumps([by_name[args[2]]])
+            with patch.object(runtime, "docker", side_effect=inspect) as command:
+                self.assertIs(runtime._reinspect_backend_volume_cache(cache), volume_cache)
+            self.assertEqual(command.call_count, 3)
+
+    def test_v2_cache_reinspection_rejects_recreated_or_redirected_volume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = _v2_cache_fixture(Path(directory))
+            for role in volume_cache.VOLUME_ROLES:
+                for field, changed in (("CreatedAt", "2026-10-19T00:00:00Z"),
+                                       ("Mountpoint", "/mnt/e/redirected"),
+                                       ("Options", {"device": "/host_mnt/e/build", "o": "bind"})):
+                    records = json.loads(json.dumps(cache["volume_documents"]))
+                    records[role][field] = changed
+                    by_name = {item["Name"]: item for item in records.values()}
+                    with self.subTest(role=role, field=field), patch.object(
+                            runtime, "docker", side_effect=lambda *args: json.dumps([by_name[args[2]]])):
+                        with self.assertRaisesRegex(ValueError, "volume"):
+                            runtime._reinspect_backend_volume_cache(cache)
+
     def test_backend_start_v2_does_not_apply_v1_child_path_rule(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

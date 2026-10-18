@@ -253,6 +253,31 @@ def _validate_backend_volume_cache(value, *, expected_package=None):
     return adapter
 
 
+
+def _reinspect_backend_volume_cache(value):
+    """Recheck daemon backing immediately before Compose can mount the cache."""
+
+    adapter = _validate_backend_volume_cache(value)
+    if adapter is None:
+        return None
+    try:
+        observed = adapter.inspect_volume_pair(docker, value)
+    except adapter.BackendVolumeCacheError as error:
+        raise ValueError(f"Backend cache volume reinspection failed: {error}") from error
+    if observed != value["volume_documents"]:
+        raise ValueError("Backend cache volume identity changed since admission")
+    return adapter
+
+
+
+def _reinspect_development_volumes(backend_start, frontend_cache):
+    if backend_start is not None:
+        _reinspect_backend_volume_cache(backend_start.get("backend_cache"))
+    if frontend_cache is not None:
+        from docker_frontend_cache import reinspect_volumes
+        reinspect_volumes(frontend_cache, docker)
+
+
 def validate_runtime_artifacts(package, *, development=False):
     web = () if development else ("web/index.html",)
     for relative in (*("bin/" + name for name in REQUIRED_BINARIES),
@@ -3560,6 +3585,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             # no third probe container is created.
             storage.atomic_json(spec, configured)
             docker(*args, "config", "--quiet")
+            _reinspect_development_volumes(backend_start, frontend_cache)
             docker(*args, "up", "--detach", "--no-build", "--pull", "never")
             container = _compose_service_container_id(args, "backend")
             frontend_container = _compose_service_container_id(args, "frontend")
@@ -3621,6 +3647,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 raise ValueError("Post-rotation storage identity binding changed before service startup")
         storage.atomic_json(spec, configured_spec())
         ready_timeout, docker_client_timeout = _runtime_ready_timeouts(inputs, startup)
+        _reinspect_development_volumes(backend_start, frontend_cache)
         docker(*args, "up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout",
                str(ready_timeout), timeout=docker_client_timeout)
         container = _compose_service_container_id(args, "backend")

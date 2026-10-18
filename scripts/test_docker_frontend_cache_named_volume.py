@@ -152,6 +152,36 @@ class FrontendNamedVolumeTests(unittest.TestCase):
                 all(args[:2] != ("compose", "run") for args, _ in docker.calls)
             )
 
+    def test_prepared_volumes_are_reinspected_without_creation_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "compose.frontend-cache.yaml").write_text("services: {}\n")
+            docker = FakeDocker()
+            profile = cache.prepare(
+                {"project_id": "fullmag-worktree-demo"}, source, IMAGE, root / "unused-run",
+                docker, source_root=source, worktree_id="worktree-demo", host_port=32871,
+                dependency_seed_sha256="a" * 64,
+                control_volume_name="fullmag-worktree-demo-build-control-v1",
+            )
+            self.assertIn("inspection", profile["volume"])
+            self.assertIn("inspection", profile["control_volume"])
+            before = len(docker.calls)
+            cache.reinspect_volumes(profile, docker)
+            for name in (profile["volume_name"], profile["control_volume_name"]):
+                original = json.loads(json.dumps(docker.volumes[name]))
+                for field, changed in (("CreatedAt", "2026-10-19T00:00:00Z"),
+                                       ("Mountpoint", "/mnt/e/redirected"),
+                                       ("Options", {"device": "/host_mnt/e/build", "o": "bind"})):
+                    docker.volumes[name][field] = changed
+                    with self.subTest(name=name, field=field), self.assertRaises(
+                            cache.FrontendCacheError):
+                        cache.reinspect_volumes(profile, docker)
+                    docker.volumes[name] = json.loads(json.dumps(original))
+            self.assertTrue(all(args[:2] == ("volume", "inspect")
+                                for args, _ in docker.calls[before:]))
+
     def test_prepare_rejects_local_volumes_redirected_to_host_storage(self) -> None:
         project_id = "fullmag-worktree-demo"
         key = "a" * 64
