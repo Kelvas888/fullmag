@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import sys
 import importlib.util
+import subprocess
 from unittest import mock
 
 import docker_backend_volume_cache as cache
@@ -139,6 +140,19 @@ class VolumeReceiptTests(unittest.TestCase):
                     with self.assertRaises(cache.BackendVolumeCacheError):
                         cache.validate(profile, volumes.documents, _maintenance_receipt(profile),
                                        receipt_path=location)
+
+    def test_just_guard_admits_device_policy_without_shell_tail(self):
+        wrapper = (Path(__file__).resolve().parents[1] / 'scripts/just_storage_shell.sh').read_text(encoding='utf-8')
+        assignment = next(line.strip() for line in wrapper.splitlines() if line.strip().startswith('docker_dev_pattern='))
+        base = 'python "D:/repo/scripts/docker_dev.py" --repo-root "D:/repo" '
+        for action in ('build', "up --port '3202'"):
+            for policy in ('auto', 'required', 'disabled'):
+                recipe = base + action + " --gpu-access '" + policy + "' --source-root 'D:/owned/worktree' "
+                for suffix, expected in (('', 0), ('; echo injected', 1)):
+                    with self.subTest(action=action, policy=policy, suffix=suffix):
+                        result = subprocess.run(['bash', '-c', assignment + '\n[[ "$1" =~ ${docker_dev_pattern} ]]',
+                                                 'recipe-guard', recipe + suffix], capture_output=True)
+                        self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_control_paths_cannot_address_host_or_parent_files(self):
         for path in ('../active', '/control/active', '/opt/fullmag/control/active', 'a/../../active', 'C:/host/data', "a'; touch /bad"):

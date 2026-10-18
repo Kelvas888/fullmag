@@ -167,7 +167,7 @@ case "${recipe}" in
     exec "${bash_executable}" -euo pipefail -c "${recipe}"
     ;;
   *"scripts/docker_dev.py"*)
-    docker_dev_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" (build|up --port '[0-9]{4,5}')( --source-root '[^']+')?( --script '[^']+')?[[:space:]]*$"
+    docker_dev_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" (build|up --port '[0-9]{4,5}')( --gpu-access '(auto|required|disabled)')?( --source-root '[^']+')?( --script '[^']+')?[[:space:]]*$"
     docker_dev_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate --direct-development --run-receipt '[^']+' --previous-config-sha256 '[0-9a-f]{64}'[ ]+(--source-root '[^']+'[ ]+)?--port '[0-9]{4,5}'[[:space:]]*$"
     docker_dev_resume_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" resume-volume --attempt '[0-9a-f]{32}' --config-sha256 '[0-9a-f]{64}' --source-root '[^']+' --port '[0-9]{4,5}'( --restart-backend)?[[:space:]]*$"
     docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '[0-9a-f]{32}' --config-sha256 '[0-9a-f]{64}' --source-root '[^']+' --port '[0-9]{4,5}'( --fresh-state)?[[:space:]]*$"
