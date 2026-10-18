@@ -66,6 +66,16 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 
 ### Docker Compose — jedyna ścieżka codziennego developmentu
 
+Decyzja użytkownika z 18.10.2026: dane **budowania** (zależności, cache,
+staging, pakiety, konteksty, provenance, logi i receipty builda) mają pozostawać
+w Docker named volumes / BuildKit, bez zapisu w hostowym `storage`. Sesje,
+wyniki, projekty i ustawienia pozostają w storage Windows. Użyj
+[fullmag-docker-build](.agents/skills/fullmag-docker-build/SKILL.md).
+Obecne launchery nie spełniają jeszcze całego tego kontraktu; sprawdź kod
+i mounty przed kwalifikacją. Nie opisuj starej ścieżki jako volume-only i nie
+usuwaj starych cache w ramach jej migracji. Poniższe recepty określają wejścia
+operacyjne, nie dowodzą ukończenia tej migracji.
+
 Obowiązuje grupa Docker Compose przypisana do wybranego checkoutu: `fullmag-master`
 lub `fullmag-worktree-<worktree_id>`. Przed jakimkolwiek buildem ustal źródła i tę
 grupę. Wszystkie buildy odbywają się w jej ramach; osobny kontener budujący poza

@@ -156,6 +156,11 @@ are defined in [`compose.dev.yaml`](compose.dev.yaml). See the
 for the detailed architecture and lifecycle contract and
 [ADR 0061](docs/adr/0061-docker-development-build-and-runtime-container.md)
 for the same-container build and runtime decision.
+The [Fullmag Docker build skill](.agents/skills/fullmag-docker-build/SKILL.md)
+defines the requested volume-only build-data boundary and its preflight.
+The current launchers still need migration; user sessions, results and settings
+remain on Windows. The skill does not claim this migration is complete.
+
 For storage locations, automatic retention, known cleanup gaps and the
 verification procedure, see [Docker build and storage lifecycle](docs/guides/docker-build-storage-lifecycle.md).
 

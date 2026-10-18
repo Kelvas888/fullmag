@@ -4,6 +4,12 @@ Stan audytu: 18.10.2026. Ten dokument opisuje bieżącą implementację i jej
 ograniczenia. Instrukcja startu: [architektura Docker DEV](docker-development-architecture.md).
 Polityka nadrzędna: [build-storage governance](fullmag-build-storage-governance.md).
 
+Aktualizacja celu 18.10.2026: użytkownik wymaga przeniesienia wszystkich danych
+budowania do Docker named volumes / BuildKit; sesje, wyniki i ustawienia
+pozostają na Windows. [Skill budowania](../../.agents/skills/fullmag-docker-build/SKILL.md)
+opisuje ten kontrakt i kontrolę zgodności. Poniższy audyt opisuje stan bazowy;
+nie jest deklaracją, że migracja zapisów hostowych została wykonana.
+
 **Nie mamy jeszcze kompletnego automatycznego sprzątania storage.** Kod usuwa
 zweryfikowane starsze pakiety backendu i nieosiągalne techniczne snapshoty
 ledgera. Nie usuwa automatycznie starych generacji cache, obrazów, katalogów

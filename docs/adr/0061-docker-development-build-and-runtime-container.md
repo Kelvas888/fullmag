@@ -121,6 +121,30 @@ Launcher nie uznaje takiej aktywacji za udaną kwalifikację. Błędy integralno
 provenance, polityki i kontraktu odpowiedzi pozostają fatalne. Zmiana nie
 poszerza listy znanych odrzuceń fizyki i nie resetuje ownera ani historii.
 
+## Rozszerzenie 18.10.2026 — wszystkie dane builda w Dockerze
+
+Użytkownik przyjął docelową granicę: zależności, cache, cień źródeł, pakiety,
+staging, wygenerowane konteksty, provenance, logi i receipty budowania mają być
+w named volumes Dockera lub magazynie BuildKit/obrazów. Hostowe `storage`
+pozostaje miejscem sesji, wyników, projektów i ustawień. Źródła są nadal
+readonly bindem wybranego checkoutu. Nie zmieniamy ledgeru runtime ani reguł
+rezerwacji GPU z powodu przeniesienia danych kompilacji.
+
+Powyższy opis hostowego receiptu v2 jest opisem etapu bazowego, nie wyjątkiem
+od nowej granicy. Pełne wdrożenie jest **NOT VERIFIED**: bootstrap/launchery
+nadal zapisują konteksty i receipty na hoście, provenance używa writable bind,
+a frontend ma hostowy ext4 backing i log rozwoju. Te miejsca wymagają migracji
+bez osłabienia locków, hashy, storage gates, recovery i provenance.
+
+Named volumes nie nakładają automatycznej quota. Odbiór wymaga pomiarów
+fizycznego dysku hosta, systemu plików VM i danych wolumenów oraz dowodów
+retencji po kolejnych buildach. Stare cache i staging pozostają do osobnego
+przeglądu użycia; sama decyzja nie autoryzuje ich usunięcia.
+
+Procedura i audyt częściowy:
+[fullmag-docker-build](../../.agents/skills/fullmag-docker-build/SKILL.md).
+Skill opisuje kontrakt i wykrywanie niezgodności, nie stanowi dowodu migracji.
+
 ## Terminalna awaria przed startem workera
 
 Kontrolowany operator `fullmag-runtime-service --cancel-failed-no-spawn`
