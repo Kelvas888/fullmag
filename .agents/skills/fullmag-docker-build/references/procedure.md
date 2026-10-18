@@ -81,8 +81,15 @@ Przed buildem:
 - zachowaj image pins, storage gates, locks, atomic publish i receipty;
 - uruchom audyt JSON Compose ze skilla i następnie sprawdź rzeczywisty inspect.
 
-Audyt mountów obejmuje usługi aplikacji, nie zapis hostowego launchera ani
-wewnętrzną alokację BuildKit. Jego PASS jest warunkiem częściowym.
+Audyt mountów obejmuje usługi aplikacji, w tym service-level `tmpfs`, duplikaty
+targetów i jawne wybrane zmienne cache. Nie odczytuje image ENV, runtime
+symlinków ani override wykonanych przez entrypoint. Nie obejmuje zapisu hostowego launchera ani
+wewnętrzną alokację BuildKit. Jego PASS jest warunkiem częściowym; wynik zawsze zawiera
+`build_data_qualification: NOT VERIFIED`. External volumes wymagają osobnego
+`volume inspect` oraz porównania dokładnej tożsamości/labels z receiptami.
+Nested build volumes są odrzucane do osobnego przeglądu ownership/retencji.
+Polecenia/entrypoint/ENV obrazu i hostowy BuildKit context muszą być sprawdzone
+niezależnie; skrypt nie interpretuje dowolnych programów powłoki.
 
 ## 3. Toolchain, aplikacja i iteracje
 
@@ -95,6 +102,10 @@ just docker-dev "$source" $port
 # Opcjonalny skrypt z tego samego checkoutu:
 just docker-dev "$source" $port "examples/fem_relax_gpu_smoke.py"
 ```
+
+Uwaga: w bazowej implementacji `just docker-dev-build` wywołuje ścieżkę `up`
+i może uruchomić usługi. Nie traktuj nazwy jako gwarancji build-only. Pozostałe
+trasy i pośrednie zapisy wrappera opisuje [audyt recept](recipe-audit.md).
 
 **Nie wykonuj tej sekwencji jako volume-only, dopóki kontrola kodu nie wykaże
 usunięcia zapisów builda w hostowym storage.** Te nazwy nie oznaczają, że migracja
@@ -133,6 +144,10 @@ zmienia natywnego dirty digestu. Nie osłabiaj provenance dla szybszego startu;
 oddzielną optymalizację uzasadnij pomiarem i testem.
 
 ## 4. Miejsce i retencja
+
+Stosuj [kontrakt danych builda](artifact-policy.md): mapa writerów, ograniczenie
+duplikacji, cache, Docker logs/BuildKit i rozdzielone operacje restart/recreate/GC.
+Sama obecność named volume nie dowodzi kontroli zużycia dysku.
 
 Przed zimnym buildem zmierz fizyczne wolne miejsce dysku danych Docker Desktop,
 wolne miejsce w systemie plików VM i w wolumenach. Nie przenoś starego progu

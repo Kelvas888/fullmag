@@ -21,15 +21,21 @@ cache. Aplikację buduje i uruchamia ten sam `backend`; Next/HMR działa w
   historia ostatnich projektów. Zachowaj ich dotychczasowy kontrakt/mounty;
   polecenie dotyczące builda nie autoryzuje przeniesienia ich do Dockera.
 - Cache ma przetrwać restart i zmianę źródeł. Nie usuwaj go dla zwykłego buildu.
+  Usunięcie kontenera nie usuwa named volumes ani obrazów/BuildKit.
+  Wycofanie build-data grupy wymaga osobnej, precyzyjnej operacji.
   Wolumen nie jest quota ani gwarancją braku wzrostu: wymagane są pomiary,
   kontrola generacji i bezpieczna retencja.
 
 ## Przed pierwszym wykonaniem
 
-Przeczytaj [procedurę od zera](references/procedure.md). Sprawdź `AGENTS.md`,
+Przeczytaj [procedurę od zera](references/procedure.md). Dla kontroli wszystkich
+writerów i retencji stosuj [kontrakt danych builda](references/artifact-policy.md). Sprawdź `AGENTS.md`,
 `justfile`, `.agents/instructions/backend.md` i aktualne
 [ustalenia audytu storage](../../../docs/guides/docker-build-storage-lifecycle.md).
 Kod i receipty rozstrzygają, czy dana recepta już spełnia nową granicę danych.
+Przy wyborze lub zmianie komendy czytaj [audyt wszystkich recept](references/recipe-audit.md)
+i manifest deklaracji. Porównaj hashe wejść; zmiana wrappera/resolvera wymaga
+ponownej oceny także recept, których treść się nie zmieniła.
 
 **Istotny stan bazowy:** audyt z 18.10.2026 potwierdził named volumes backendu
 v2, lecz nie pełną zgodność. Bootstrap/launchery zapisywały konteksty i receipty
@@ -48,8 +54,10 @@ zadania na przebudowę całego systemu.
    JSON Compose użyj
    `python -B scripts/audit_build_mounts.py --expected-project <project> <compose.json>`
    z katalogu tego skilla; `-` odczytuje stdin bez pliku na hoście. Skrypt jest
-   tylko odczytowym audytem mountów. Nie zastępuje kontroli kodu launchera,
-   BuildKit, ścieżek logów ani rzeczywistego `docker inspect`.
+   tylko odczytowym audytem mountów. `PASS` dotyczy wyłącznie topologii;
+   `build_data_qualification` pozostaje `NOT VERIFIED`. Nie zastępuje kontroli kodu launchera,
+   BuildKit, ścieżek logów ani rzeczywistego `docker inspect`. Kod wyjścia 0
+   tego helpera nie może samodzielnie otwierać bramki volume-only.
 3. Przygotuj przypięty toolchain i wrapper, następnie uruchom stałe usługi
    zarządzaną receptą, która przeszła kontrolę zgodności. Nie używaj dawnego
    runnera, hostowego Cargo/CMake, osobnego `backend-build` ani źródłowego ZIP/TAR.
