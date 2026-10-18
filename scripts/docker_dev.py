@@ -1578,11 +1578,13 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
               image_id: str, toolchain_id: str, prepare_receipt: Mapping[str, object],
               prepare_receipt_bytes: bytes, base_info: Mapping[str, object],
               build_profile: str, expected_cargo_profile: str) -> Path:
+    source_mode = str(source_bundle.get("source_mode", "snapshot"))
+    live_source = source_mode == "live-shadow-v1"
     expected_cargo_profile = _validate_cargo_profile(expected_cargo_profile)
     if _cargo_profile_for_build(build_profile) != expected_cargo_profile:
         raise _fail("assembly build profile does not match its Cargo profile")
     from fullmag_docker_runtime import REQUIRED_BINARIES
-    from fullmag_storage import atomic_json, validate_path
+    from fullmag_storage import validate_path
 
     # Startup helpers are already owned by the immutable runtime image. Keep
     # only their hashes in provenance; copying them to host staging would
@@ -1593,23 +1595,50 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
     if observed_image_id != image_id:
         raise _fail("runtime image changed while assembling provenance")
     runtime_labels = _image_labels(runtime_document)
-    binary_hashes: dict[str, str] = {}
-    for name in REQUIRED_BINARIES:
-        binary_hashes[name] = _sha256_file(package / "bin" / name, f"backend binary {name}")
-    if not (package / "_fullmag_core.so").is_file():
-        raise _fail("backend package has no _fullmag_core.so")
+    if live_source:
+        # The live package is a Docker named-volume path.  Native Windows
+        # Python cannot inspect it and must not materialize a host-side copy
+        # merely to assemble provenance.  The backend service already
+        # attests every published binary in its receipt.
+        artifacts = prepare_receipt.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise _fail("live backend build receipt has no artifact inventory")
+        binary_hashes = {
+            str(record["path"])[len("bin/"):]: record["sha256"]
+            for record in artifacts
+            if isinstance(record, Mapping)
+            and isinstance(record.get("path"), str)
+            and record["path"].startswith("bin/")
+            and isinstance(record.get("sha256"), str)
+        }
+        if set(binary_hashes) != set(REQUIRED_BINARIES):
+            raise _fail("live backend build receipt has an incomplete binary inventory")
+        package_root = str(package)
+        backend_build_receipt = "/opt/fullmag/package/backend-build-receipt.json"
+    else:
+        binary_hashes = {
+            name: _sha256_file(package / "bin" / name, f"backend binary {name}")
+            for name in REQUIRED_BINARIES
+        }
+        if not (package / "_fullmag_core.so").is_file():
+            raise _fail("backend package has no _fullmag_core.so")
+        package_root = str(validate_path(
+            package, Path(str(layout["build_storage_root"])), "backend package"
+        ))
+        backend_build_receipt = str(package / "backend-build-receipt.json")
     source_commit = str(source_bundle.get("resolved_commit", ""))
     if not COMMIT_RE.fullmatch(source_commit):
-        raise _fail("direct source archive has no canonical commit")
-    build_receipt = package / "backend-build-receipt.json"
-    if _sha256_bytes(prepare_receipt_bytes) != _sha256_file(build_receipt, "backend build receipt"):
-        raise _fail("backend build receipt changed while assembling provenance")
+        raise _fail("direct source has no canonical commit")
+    if not live_source:
+        build_receipt = package / "backend-build-receipt.json"
+        if _sha256_bytes(prepare_receipt_bytes) != _sha256_file(
+                build_receipt, "backend build receipt"):
+            raise _fail("backend build receipt changed while assembling provenance")
     build = prepare_receipt.get("build")
     if (not isinstance(build, dict)
             or build.get("cargo_profile") != expected_cargo_profile
             or build.get("cargo_target_profile_dir") != expected_cargo_profile):
         raise _fail("backend build receipt profile changed while assembling provenance")
-    source_mode = str(source_bundle.get("source_mode", "snapshot"))
     assembly = {
         "schema": "fullmag.docker-all-image.v1",
         "state": "succeeded",
@@ -1628,7 +1657,6 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
         "source_digest": str(source_bundle["source_digest"]),
         "source_snapshot_sha256": str(source_bundle["source_snapshot_sha256"]),
         "native_source_identity": source_bundle["native_source_identity"],
-        "source_manifest": str(source_bundle["manifest_path"]),
         # Keep the final runtime image separate from the immutable toolchain
         # base.  The runtime launcher consumes image_id; base_image is the
         # provenance identity passed as the toolchain image to Compose.
@@ -1647,11 +1675,11 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
         "build_profile": build_profile,
         "cargo_profile": build["cargo_profile"],
         "cargo_target_profile_dir": build["cargo_target_profile_dir"],
-        "package_root": str(validate_path(package, Path(str(layout["build_storage_root"])), "backend package")),
+        "package_root": package_root,
         "binary_hashes": binary_hashes,
         "startup_helper_hashes": helper_hashes,
         "build_receipt_sha256": _sha256_bytes(prepare_receipt_bytes),
-        "backend_build_receipt": str(build_receipt),
+        "backend_build_receipt": backend_build_receipt,
         "backend_build_receipt_schema": prepare_receipt.get("schema"),
         "output": str(run_root),
         "context": context,
@@ -1660,13 +1688,28 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
         assembly["live_manifest_sha256"] = str(source_bundle["live_manifest_sha256"])
         assembly["source_git_common_dir"] = str(source_bundle["git_common_dir"])
     else:
+        assembly["source_manifest"] = str(source_bundle["manifest_path"])
         assembly["source_archive"] = {
             "path": str(source_bundle["archive_path"]),
             "manifest_path": str(source_bundle["manifest_path"]),
             "sha256": str(source_bundle["archive_sha256"]),
             "bytes": source_bundle["archive_bytes"],
         }
-    receipt_path = validate_path(run_root / "assembly.json", Path(str(layout["build_storage_root"])), "direct assembly receipt")
+    if live_source:
+        # Keep technical assembly/provenance in the Compose group's control
+        # volume.  The host run root remains runtime handoff state only.
+        compose_project = _compose_identity(layout)["project_name"]
+        control_guest = _control_record_path("live-assembly", compose_project, run_id)
+        control_relative = _control_relative_from_guest(control_guest)
+        assembly["output"] = control_guest
+        _write_control_json(selected, compose_project, control_relative, assembly)
+        return Path(control_guest)
+
+    from fullmag_storage import atomic_json
+    receipt_path = validate_path(
+        run_root / "assembly.json", Path(str(layout["build_storage_root"])),
+        "direct assembly receipt",
+    )
     atomic_json(receipt_path, assembly)
     # The runtime binds this exact receipt as /opt/fullmag/provenance.json.
     _write_json(run_root / "provenance.json", assembly)
