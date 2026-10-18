@@ -6,7 +6,9 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use fullmag_application::TaskClaim;
-use fullmag_session::compute_node_snapshot::COMPUTE_NODE_SNAPSHOT_SCHEMA_V2;
+use fullmag_session::compute_node_snapshot::{
+    ComputeNodeSnapshot, Reported, COMPUTE_NODE_SNAPSHOT_SCHEMA_V2,
+};
 use fullmag_session::host_resource_ledger::HostResourceLedger;
 use fullmag_session::host_resource_ledger::{HostReservationRequest, HostResourceReservationState};
 use fullmag_session::runtime_service::RuntimeServiceConfig;
@@ -1024,6 +1026,9 @@ impl HostRuntimeAdmission {
         problem: &fullmag_ir::ProblemIR,
         placement: &HostTaskPlacement,
     ) -> Result<bool> {
+        if placement.gpu_uuid.is_some() && !self.current_gpu_inventory_is_available()? {
+            return Ok(false);
+        }
         if crate::host_allocation::legacy_cuda_device_index(problem)?.is_none() {
             return Ok(true);
         }
@@ -1494,6 +1499,14 @@ impl HostRuntimeAdmission {
         if !self.ledger.worker_has_pending_launch(store, &lease)? {
             return Ok(false);
         }
+        if claim.lease.kind == fullmag_application::ResourceKind::Gpu
+            && !self.current_gpu_inventory_is_available()?
+        {
+            // Keep the durable reservation and launch gate for exact recovery,
+            // but do not turn a transiently unavailable GPU into a scheduler
+            // failure or a worker spawn attempt.
+            return Ok(false);
+        }
         self.ensure_solver_claim_committed(store, claim)?;
         Ok(true)
     }
@@ -1591,8 +1604,12 @@ impl HostRuntimeAdmission {
     }
 
     fn ensure_committed_request(&self, request: &HostReservationRequest) -> Result<()> {
-        if !self.has_current_compute_snapshot()? {
-            bail!("process spawn requires a current compute-node sample for this boot");
+        let current_snapshot = self
+            .current_compute_node_snapshot()?
+            .context("process spawn requires a current compute-node sample for this boot")?;
+        if !request.exclusive_gpu_uuids.is_empty() && !gpu_snapshot_is_available(&current_snapshot)
+        {
+            bail!("GPU process spawn requires a current GPU inventory");
         }
         let snapshot = self.ledger.read()?;
         let reservation = snapshot
@@ -1620,4 +1637,14 @@ impl HostRuntimeAdmission {
         }
         Ok(())
     }
+
+    fn current_gpu_inventory_is_available(&self) -> Result<bool> {
+        Ok(self
+            .current_compute_node_snapshot()?
+            .is_some_and(|snapshot| gpu_snapshot_is_available(&snapshot)))
+    }
+}
+
+fn gpu_snapshot_is_available(snapshot: &ComputeNodeSnapshot) -> bool {
+    matches!(&snapshot.gpus, Reported::Available { value } if !value.is_empty())
 }

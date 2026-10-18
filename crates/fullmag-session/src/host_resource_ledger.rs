@@ -3094,7 +3094,7 @@ impl HostResourceLedger {
             )?;
             let readiness: HostRuntimeReadiness = serde_json::from_slice(&readiness_bytes)
                 .context("corrupt content-addressed host runtime readiness")?;
-            return validate_v2_snapshot_against_readiness(&self.policy, &readiness, snapshot);
+            return validate_v2_snapshot_static_against_readiness(&self.policy, &readiness, snapshot);
         }
         if snapshot.schema_version != crate::compute_node_snapshot::COMPUTE_NODE_SNAPSHOT_SCHEMA_V2
         {
@@ -5253,12 +5253,30 @@ fn validate_v4_runtime_state(document: &HostResourceLedgerDocument, root: &Path)
         let snapshot: ComputeNodeSnapshot = serde_json::from_slice(&snapshot_bytes)
             .context("corrupt content-addressed compute-node snapshot")?;
         snapshot.validate()?;
-        validate_v2_snapshot_against_readiness(&document.policy, &readiness, &snapshot)?;
+        validate_v2_snapshot_static_against_readiness(&document.policy, &readiness, &snapshot)?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_v2_snapshot_against_readiness(
+    policy: &HostResourceLedgerPolicy,
+    readiness: &HostRuntimeReadiness,
+    snapshot: &ComputeNodeSnapshot,
+) -> Result<()> {
+    validate_v2_snapshot_static_against_readiness(policy, readiness, snapshot)?;
+    if matches!(&snapshot.gpus, Reported::Unavailable { .. }) {
+        bail!("v2 host admission requires current GPU inventory");
+    }
+    Ok(())
+}
+
+/// Validate the immutable policy/readiness binding without turning a
+/// last-known GPU observation into a GPU admission proof. A warm partial
+/// sample may keep the static GPU identity while reporting that the current
+/// NVIDIA probe is unavailable; request-specific GPU validation remains
+/// strict in `validate_compute_node_request_locked`.
+fn validate_v2_snapshot_static_against_readiness(
     policy: &HostResourceLedgerPolicy,
     readiness: &HostRuntimeReadiness,
     snapshot: &ComputeNodeSnapshot,
@@ -5288,8 +5306,19 @@ fn validate_v2_snapshot_against_readiness(
     }
     let devices = match &snapshot.gpus {
         Reported::Available { value } => value,
-        Reported::Unavailable { .. } => {
-            bail!("v2 host admission requires current GPU inventory")
+        Reported::Unavailable {
+            last_known: Some(value),
+            ..
+        } => {
+            if snapshot.sample.error.is_some() {
+                bail!("warm GPU-unavailable snapshot cannot carry a whole-sample probe error");
+            }
+            value
+        }
+        Reported::Unavailable {
+            last_known: None, ..
+        } => {
+            bail!("warm GPU-unavailable snapshot is missing static GPU identity")
         }
     };
     let mut compatibility = BTreeMap::new();
@@ -7226,6 +7255,142 @@ mod tests {
         assert_eq!(
             ledger.read_compute_node_snapshot().unwrap(),
             Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn v4_warm_gpu_unavailable_snapshot_keeps_static_binding_but_rejects_gpu_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut policy = policy();
+        policy.schema_version = HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2.into();
+        let collected_at = chrono::Utc::now();
+        let mut full = compute_node_snapshot(
+            &policy,
+            HostResourceLedger::node_id_for_host_id(&policy.host_id),
+            collected_at,
+            1,
+            1,
+        );
+        full.schema_version = crate::compute_node_snapshot::COMPUTE_NODE_SNAPSHOT_SCHEMA_V2.into();
+        full.host_owner_id = Some("host-owner-warm".into());
+        full.host_owner_epoch = Some(1);
+        full.capabilities = Reported::Available {
+            value: vec!["fem.gpu".into()],
+        };
+        if let Reported::Available { value } = &mut full.gpus {
+            for device in value {
+                device.runtime_compatibility = Reported::Available {
+                    value: vec!["fem.gpu".into()],
+                };
+            }
+        }
+        full.enforcement.gpu_visibility = EnforcementStatus::Supported;
+        full.inventory_sha256 = full.computed_inventory_sha256().unwrap();
+        policy.topology_sha256 = full.inventory_sha256.clone();
+        let mut readiness = v4_readiness(&policy, &"1".repeat(64), &"2".repeat(64));
+        readiness.capabilities_sha256 = Some(full.computed_capabilities_sha256().unwrap());
+
+        let root = ledger_root(directory.path());
+        let ledger = HostResourceLedger::initialize_with_readiness(
+            &root,
+            policy.clone(),
+            readiness.clone(),
+        )
+        .unwrap();
+        let owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        full.runtime_owner_id = ledger.owner_id();
+        full.host_owner_id = Some(owner.descriptor().host_owner_id.clone());
+        full.host_owner_epoch = Some(owner.descriptor().host_owner_epoch);
+        full.validate().unwrap();
+        assert_eq!(
+            ledger
+                .publish_compute_node_snapshot_with_owner(&owner, &full)
+                .unwrap(),
+            ComputeNodeSnapshotPublicationDisposition::Accepted
+        );
+
+        let mut warm = full.clone();
+        warm.gpus = Reported::Unavailable {
+            reason: crate::compute_node_snapshot::UnavailableReason::ProbeFailed,
+            last_known: full.gpus.known_value().cloned(),
+        };
+        warm.sample.collected_at = chrono::Utc::now();
+        warm.sample
+            .refresh_freshness_at(warm.sample.collected_at.clone());
+        warm.validate().unwrap();
+
+        // Exercise the production v4 publication path, rather than only the
+        // test-only strict/static validators below.
+        assert_eq!(
+            ledger
+                .publish_compute_node_snapshot_with_owner(&owner, &warm)
+                .unwrap(),
+            ComputeNodeSnapshotPublicationDisposition::Accepted
+        );
+        let persisted = ledger.read_compute_node_snapshot().unwrap().unwrap();
+        assert!(matches!(
+            persisted.gpus,
+            Reported::Unavailable {
+                last_known: Some(_), ..
+            }
+        ));
+        validate_v2_snapshot_static_against_readiness(&policy, &readiness, &warm).unwrap();
+        assert!(validate_v2_snapshot_against_readiness(&policy, &readiness, &warm).is_err());
+        assert_eq!(warm.inventory_sha256, full.inventory_sha256);
+        assert_eq!(
+            warm.computed_capabilities_sha256().unwrap(),
+            full.computed_capabilities_sha256().unwrap()
+        );
+
+        let mut missing_identity = warm;
+        missing_identity.gpus = Reported::Unavailable {
+            reason: crate::compute_node_snapshot::UnavailableReason::ProbeFailed,
+            last_known: None,
+        };
+        assert!(validate_v2_snapshot_static_against_readiness(
+            &policy,
+            &readiness,
+            &missing_identity
+        )
+        .is_err());
+
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let store_id = HostResourceLedger::store_id(store.root()).unwrap();
+        let generation = ledger.read_runtime_generation_sha256().unwrap();
+        let mut cpu_request = request(
+            &policy,
+            &store_id,
+            "warm-cpu",
+            budget(1000, 100, 0),
+            &[],
+            &[],
+            &[0],
+        );
+        cpu_request.runtime_generation_sha256 = Some(generation.clone());
+        cpu_request.expected_compute_node_owner_id = Some(owner.descriptor().host_owner_id.clone());
+        cpu_request.expected_compute_node_owner_epoch = Some(owner.descriptor().host_owner_epoch);
+        let cpu_reservation = ledger.reserve(&cpu_request).unwrap();
+        assert_eq!(
+            cpu_reservation.state,
+            HostResourceReservationState::Tentative
+        );
+
+        let mut gpu_request = request(
+            &policy,
+            &store_id,
+            "warm-gpu",
+            budget(1000, 100, 100),
+            &[GPU_A],
+            &[(GPU_A.to_string(), 4096)],
+            &[1],
+        );
+        gpu_request.runtime_generation_sha256 = Some(generation);
+        gpu_request.expected_compute_node_owner_id = Some(owner.descriptor().host_owner_id.clone());
+        gpu_request.expected_compute_node_owner_epoch = Some(owner.descriptor().host_owner_epoch);
+        let error = ledger.reserve(&gpu_request).unwrap_err();
+        assert!(
+            error.to_string().contains("GPU host admission requires current GPU inventory"),
+            "GPU admission must remain closed on a warm-unavailable sample: {error:#}"
         );
     }
 

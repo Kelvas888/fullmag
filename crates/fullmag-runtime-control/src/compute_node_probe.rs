@@ -5,8 +5,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -19,7 +21,8 @@ use fullmag_session::{
     compute_node_snapshot::{
         ComputeNodeSample, ComputeNodeSnapshot, ComputeNodeSnapshotData, CpuLogicalProcessor,
         CpuOsConstraints, CpuQuota, CpuSnapshot, CpuTopology, EnforcementSnapshot,
-        EnforcementStatus, GpuDeviceSnapshot, GpuPartition, MemorySnapshot, Observation, Reported,
+        EnforcementStatus, GpuDeviceSnapshot, GpuPartition, GpuTopology, MemorySnapshot,
+        Observation, Reported,
         SampleSource, UnavailableReason,
     },
     host_resource_ledger::{HostInventoryOwnerDescriptor, HostResourceLedger, HostRuntimeReadiness},
@@ -29,6 +32,108 @@ use fullmag_session::{
 const NVIDIA_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
 const NVIDIA_NVML_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
 const NVIDIA_MEMORY_MIB: u64 = 1024 * 1024;
+
+#[derive(Debug)]
+enum NvidiaProbeUnavailableKind {
+    Launch(std::io::Error),
+    Poll(std::io::Error),
+    Collect(std::io::Error),
+    Timeout,
+    Exited {
+        status: ExitStatus,
+        stderr: String,
+    },
+}
+
+#[derive(Debug)]
+struct NvidiaProbeUnavailable {
+    kind: NvidiaProbeUnavailableKind,
+}
+
+impl NvidiaProbeUnavailable {
+    fn launch(error: std::io::Error) -> Self {
+        Self {
+            kind: NvidiaProbeUnavailableKind::Launch(error),
+        }
+    }
+
+    fn poll(error: std::io::Error) -> Self {
+        Self {
+            kind: NvidiaProbeUnavailableKind::Poll(error),
+        }
+    }
+
+    fn collect(error: std::io::Error) -> Self {
+        Self {
+            kind: NvidiaProbeUnavailableKind::Collect(error),
+        }
+    }
+
+    fn timeout() -> Self {
+        Self {
+            kind: NvidiaProbeUnavailableKind::Timeout,
+        }
+    }
+
+    fn exited(status: ExitStatus, stderr: String) -> Self {
+        Self {
+            kind: NvidiaProbeUnavailableKind::Exited { status, stderr },
+        }
+    }
+
+    fn reason(&self) -> UnavailableReason {
+        match &self.kind {
+            NvidiaProbeUnavailableKind::Launch(error)
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                UnavailableReason::SourceUnavailable
+            }
+            _ => UnavailableReason::ProbeFailed,
+        }
+    }
+
+    fn is_warm_recoverable(&self) -> bool {
+        match &self.kind {
+            NvidiaProbeUnavailableKind::Timeout => true,
+            NvidiaProbeUnavailableKind::Launch(error)
+                if error.kind() == std::io::ErrorKind::NotFound => true,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for NvidiaProbeUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            NvidiaProbeUnavailableKind::Launch(error) => {
+                write!(formatter, "launch nvidia-smi: {error}")
+            }
+            NvidiaProbeUnavailableKind::Poll(error) => {
+                write!(formatter, "poll nvidia-smi: {error}")
+            }
+            NvidiaProbeUnavailableKind::Collect(error) => {
+                write!(formatter, "collect nvidia-smi output: {error}")
+            }
+            NvidiaProbeUnavailableKind::Timeout => {
+                formatter.write_str("nvidia-smi exceeded its bounded sampling timeout")
+            }
+            NvidiaProbeUnavailableKind::Exited { status, stderr } => {
+                write!(formatter, "nvidia-smi exited with {status}: {stderr}")
+            }
+        }
+    }
+}
+
+impl Error for NvidiaProbeUnavailable {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            NvidiaProbeUnavailableKind::Launch(error)
+            | NvidiaProbeUnavailableKind::Poll(error)
+            | NvidiaProbeUnavailableKind::Collect(error) => Some(error),
+            NvidiaProbeUnavailableKind::Timeout | NvidiaProbeUnavailableKind::Exited { .. } => None,
+        }
+    }
+}
 
 /// Collect one bounded host sample and assign its durable revisions from the
 /// last snapshot stored by the shared host ledger.
@@ -427,60 +532,71 @@ fn sample_compute_node_inner(
             },
         ),
     };
-    let (gpu_inventory, capabilities, gpu_visibility) = match (gpus, readiness) {
-        (Ok(mut devices), Some(readiness)) => {
-            readiness.validate_probe()?;
-            let observed = devices
-                .iter()
-                .map(|device| device.uuid.clone())
-                .collect::<BTreeSet<_>>();
-            let expected = readiness
-                .gpu_runtime_compatibility
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if observed != expected {
-                bail!("native FEM/GPU readiness UUIDs differ from current NVIDIA inventory");
-            }
-            for device in &mut devices {
-                let compatibility = readiness
+    let (gpu_inventory, capabilities, gpu_visibility) =
+        match (gpus, readiness) {
+            (Ok(mut devices), Some(readiness)) => {
+                readiness.validate_probe()?;
+                let observed = devices
+                    .iter()
+                    .map(|device| device.uuid.clone())
+                    .collect::<BTreeSet<_>>();
+                let expected = readiness
                     .gpu_runtime_compatibility
-                    .get(&device.uuid)
-                    .context("native readiness is missing a current GPU UUID")?
-                    .clone();
-                device.runtime_compatibility = Reported::Available {
-                    value: compatibility,
-                };
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if observed != expected {
+                    bail!("native FEM/GPU readiness UUIDs differ from current NVIDIA inventory");
+                }
+                for device in &mut devices {
+                    let compatibility = readiness
+                        .gpu_runtime_compatibility
+                        .get(&device.uuid)
+                        .context("native readiness is missing a current GPU UUID")?
+                        .clone();
+                    device.runtime_compatibility = Reported::Available {
+                        value: compatibility,
+                    };
+                }
+                (
+                    Reported::Available { value: devices },
+                    Reported::Available {
+                        value: readiness.capabilities.clone(),
+                    },
+                    readiness.gpu_visibility,
+                )
             }
-            (
+            (Ok(devices), None) => (
                 Reported::Available { value: devices },
-                Reported::Available {
-                    value: readiness.capabilities.clone(),
+                Reported::Unavailable {
+                    reason: UnavailableReason::NotReported,
+                    last_known: previous
+                        .and_then(|snapshot| snapshot.capabilities.known_value().cloned()),
                 },
-                readiness.gpu_visibility,
-            )
-        }
-        (Ok(devices), None) => (
-            Reported::Available { value: devices },
-            Reported::Unavailable {
-                reason: UnavailableReason::NotReported,
-                last_known: previous.and_then(|snapshot| snapshot.capabilities.known_value().cloned()),
-            },
-            EnforcementStatus::Unavailable,
-        ),
-        (Err(error), Some(_)) => return Err(error).context("native FEM/GPU readiness requires a current NVIDIA inventory"),
-        (Err(error), None) => (
-            Reported::Unavailable {
-                reason: gpu_failure_reason(&error),
-                last_known: previous.and_then(|snapshot| snapshot.gpus.known_value().cloned()),
-            },
-            Reported::Unavailable {
-                reason: UnavailableReason::NotReported,
-                last_known: previous.and_then(|snapshot| snapshot.capabilities.known_value().cloned()),
-            },
-            EnforcementStatus::Unavailable,
-        ),
-    };
+                EnforcementStatus::Unavailable,
+            ),
+            (Err(error), Some(readiness))
+                if !cpu_failed && !memory_failed && nvidia_probe_unavailable(&error).is_some() =>
+            {
+                warm_gpu_probe_projection(&error, previous, readiness)?
+            }
+            (Err(error), Some(_)) => {
+                return Err(error)
+                    .context("native FEM/GPU readiness requires a current NVIDIA inventory")
+            }
+            (Err(error), None) => (
+                Reported::Unavailable {
+                    reason: gpu_failure_reason(&error),
+                    last_known: previous.and_then(|snapshot| snapshot.gpus.known_value().cloned()),
+                },
+                Reported::Unavailable {
+                    reason: UnavailableReason::NotReported,
+                    last_known: previous
+                        .and_then(|snapshot| snapshot.capabilities.known_value().cloned()),
+                },
+                EnforcementStatus::Unavailable,
+            ),
+        };
 
     let cpu_quota_enforcement = {
         #[cfg(target_os = "linux")]
@@ -516,6 +632,16 @@ fn sample_compute_node_inner(
     let sample_error = (cpu_failed && memory_failed && gpu_failed)
         .then_some(UnavailableReason::ProbeFailed);
 
+    let enforcement = EnforcementSnapshot {
+        cpu_affinity: EnforcementStatus::Unavailable,
+        cpu_quota: cpu_quota_enforcement,
+        memory_cap: EnforcementStatus::Advisory,
+        // Native readiness is the only accepted proof for v2 GPU
+        // visibility; v1 keeps the historical explicit-unavailable state.
+        gpu_visibility,
+        storage_quota: EnforcementStatus::Advisory,
+    };
+
     let data = ComputeNodeSnapshotData {
         node_id,
         boot_id,
@@ -544,17 +670,128 @@ fn sample_compute_node_inner(
         capabilities,
         sample: ComputeNodeSample::new(SampleSource::HostOs, now.clone(), sample_error, now.clone())
             .with_boot_monotonic_ns(boot_monotonic_ns),
-        enforcement: EnforcementSnapshot {
-            cpu_affinity: EnforcementStatus::Unavailable,
-            cpu_quota: cpu_quota_enforcement,
-            memory_cap: EnforcementStatus::Advisory,
-            // Native readiness is the only accepted proof for v2 GPU
-            // visibility; v1 keeps the historical explicit-unavailable state.
-            gpu_visibility,
-            storage_quota: EnforcementStatus::Advisory,
-        },
+        enforcement,
     };
     ComputeNodeSnapshot::successor(data, previous, now)
+}
+
+fn nvidia_probe_unavailable(error: &anyhow::Error) -> Option<&NvidiaProbeUnavailable> {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<NvidiaProbeUnavailable>()
+                .filter(|probe| probe.is_warm_recoverable())
+        })
+}
+
+fn nvidia_probe_reason(error: &anyhow::Error) -> UnavailableReason {
+    nvidia_probe_unavailable(error)
+        .map(NvidiaProbeUnavailable::reason)
+        .unwrap_or(UnavailableReason::ProbeFailed)
+}
+
+fn warm_gpu_probe_projection(
+    error: &anyhow::Error,
+    previous: Option<&ComputeNodeSnapshot>,
+    readiness: &HostRuntimeReadiness,
+) -> Result<(
+    Reported<Vec<GpuDeviceSnapshot>>,
+    Reported<Vec<String>>,
+    EnforcementStatus,
+)> {
+    nvidia_probe_unavailable(error).context("NVIDIA probe failure is not warm-recoverable")?;
+    let previous = previous.context(
+        "a transient NVIDIA probe failure requires a previous GPU inventory",
+    )?;
+    let last_known = validate_warm_gpu_inventory(previous, readiness)?;
+    Ok((
+        Reported::Unavailable {
+            reason: nvidia_probe_reason(error),
+            last_known: Some(last_known),
+        },
+        Reported::Available {
+            value: readiness.capabilities.clone(),
+        },
+        readiness.gpu_visibility,
+    ))
+}
+
+fn validate_warm_gpu_inventory(
+    previous: &ComputeNodeSnapshot,
+    readiness: &HostRuntimeReadiness,
+) -> Result<Vec<GpuDeviceSnapshot>> {
+    readiness.validate_probe()?;
+    let expected_inventory = readiness
+        .inventory_sha256
+        .as_deref()
+        .context("warm NVIDIA recovery requires a persisted inventory digest")?;
+    let expected_capabilities = readiness
+        .capabilities_sha256
+        .as_deref()
+        .context("warm NVIDIA recovery requires a persisted capability digest")?;
+    if previous.inventory_sha256 != expected_inventory
+        || previous.computed_inventory_sha256()? != expected_inventory
+        || previous.computed_capabilities_sha256()? != expected_capabilities
+        || previous.capabilities.known_value() != Some(&readiness.capabilities)
+        || previous.enforcement.gpu_visibility != readiness.gpu_visibility
+    {
+        bail!("previous GPU inventory does not match persisted native readiness or host policy");
+    }
+
+    let devices = previous
+        .gpus
+        .known_value()
+        .cloned()
+        .context("warm NVIDIA recovery has no last-known GPU identity")?;
+    if devices.is_empty() {
+        bail!("warm NVIDIA recovery has an empty last-known GPU inventory");
+    }
+    let observed = devices
+        .iter()
+        .map(|device| device.uuid.clone())
+        .collect::<BTreeSet<_>>();
+    let expected = readiness
+        .gpu_runtime_compatibility
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if observed != expected {
+        bail!("previous GPU UUIDs differ from persisted native readiness");
+    }
+    for device in &devices {
+        if !matches!(
+            &device.vram_bytes,
+            Reported::Available { value } if *value > 0
+        ) {
+            bail!(
+                "previous GPU {} has no complete durable VRAM identity",
+                device.uuid
+            );
+        }
+        if !matches!(&device.partition, Reported::Available { .. }) {
+            bail!(
+                "previous GPU {} has no complete durable partition identity",
+                device.uuid
+            );
+        }
+        let compatibility = match &device.runtime_compatibility {
+            Reported::Available { value } => value,
+            Reported::Unavailable { .. } => {
+                bail!(
+                    "previous GPU {} has no complete runtime compatibility identity",
+                    device.uuid
+                )
+            }
+        };
+        if readiness.gpu_runtime_compatibility.get(&device.uuid) != Some(compatibility) {
+            bail!(
+                "previous GPU {} runtime compatibility differs from persisted readiness",
+                device.uuid
+            );
+        }
+    }
+    Ok(devices)
 }
 
 fn effective_cpu_capacity_millis(
@@ -1608,7 +1845,7 @@ fn discover_nvidia_gpus() -> Result<Vec<GpuDeviceSnapshot>> {
                 .with_context(|| format!("MIG-aware nvidia-smi query failed: {mig_query_error:#}"))?;
             (output, false)
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
     let stdout = String::from_utf8(output).context("nvidia-smi output is not UTF-8")?;
     let mut devices = parse_nvidia_smi_output(&stdout, includes_mig_mode)?;
@@ -1649,7 +1886,10 @@ fn discover_nvidia_gpus() -> Result<Vec<GpuDeviceSnapshot>> {
     Ok(devices)
 }
 
-fn query_nvidia_smi(query: &str, deadline: Instant) -> Result<Vec<u8>> {
+fn query_nvidia_smi(
+    query: &str,
+    deadline: Instant,
+) -> std::result::Result<Vec<u8>, NvidiaProbeUnavailable> {
     let query_arg = format!("--query-gpu={query}");
     let mut command = Command::new("nvidia-smi");
     remove_local_compute_operator_token(&mut command);
@@ -1658,22 +1898,28 @@ fn query_nvidia_smi(query: &str, deadline: Instant) -> Result<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("launch nvidia-smi")?;
+        .map_err(NvidiaProbeUnavailable::launch)?;
     loop {
-        if child.try_wait()?.is_some() {
+        if child
+            .try_wait()
+            .map_err(NvidiaProbeUnavailable::poll)?
+            .is_some()
+        {
             break;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("nvidia-smi exceeded its two-second sampling limit");
+            return Err(NvidiaProbeUnavailable::timeout());
         }
         thread::sleep(Duration::from_millis(25));
     }
-    let output = child.wait_with_output().context("collect nvidia-smi output")?;
+    let output = child
+        .wait_with_output()
+        .map_err(NvidiaProbeUnavailable::collect)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!("nvidia-smi exited with {}: {stderr}", output.status);
+        return Err(NvidiaProbeUnavailable::exited(output.status, stderr));
     }
     Ok(output.stdout)
 }
@@ -1896,6 +2142,110 @@ pub fn current_host_boot_id(_now: DateTime<Utc>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn warm_probe_fixture() -> (ComputeNodeSnapshot, HostRuntimeReadiness) {
+        let now = Utc::now();
+        let uuid = "GPU-00000000-0000-4000-8000-000000000001".to_owned();
+        let snapshot = ComputeNodeSnapshot::new(
+            ComputeNodeSnapshotData {
+                node_id: "node-warm".into(),
+                boot_id: "boot-warm".into(),
+                runtime_owner_id: "runtime-owner".into(),
+                owner_epoch: 1,
+                host_owner_id: Some("host-owner".into()),
+                host_owner_epoch: Some(1),
+                inventory_revision: 1,
+                capabilities_revision: 1,
+                cpu: CpuSnapshot {
+                    topology: Reported::Available {
+                        value: CpuTopology {
+                            logical_cpus: vec![CpuLogicalProcessor {
+                                id: 0,
+                                socket_id: Some(0),
+                                numa_node_id: Some(0),
+                                core_id: Some(0),
+                                smt_sibling_ids: vec![0],
+                                processor_group: None,
+                                group_logical_cpu_id: None,
+                            }],
+                        },
+                    },
+                    os_constraints: CpuOsConstraints {
+                        allowed_logical_cpu_ids: Reported::Available {
+                            value: BTreeSet::from([0]),
+                        },
+                        quota: Reported::Available {
+                            value: CpuQuota::Unlimited,
+                        },
+                    },
+                    effective_capacity_millis: Observation::Available { value: 1000 },
+                    load_percent: Observation::Unavailable {
+                        reason: UnavailableReason::NotReported,
+                    },
+                },
+                memory: MemorySnapshot {
+                    total_bytes: Observation::Available { value: 1024 },
+                    available_bytes: Observation::Available { value: 512 },
+                },
+                gpus: Reported::Available {
+                    value: vec![GpuDeviceSnapshot {
+                        uuid: uuid.clone(),
+                        pci_id: Reported::Available {
+                            value: "0000:01:00.0".into(),
+                        },
+                        name: Reported::Available {
+                            value: "Fixture GPU".into(),
+                        },
+                        local_ordinal: Observation::Available { value: 0 },
+                        vram_bytes: Reported::Available { value: 4096 },
+                        utilization_percent: Observation::Available { value: 0 },
+                        temperature_millicelsius: Observation::Available { value: 40000 },
+                        partition: Reported::Available {
+                            value: GpuPartition::FullDevice,
+                        },
+                        topology: Reported::Available {
+                            value: GpuTopology {
+                                numa_node_id: Some(0),
+                                pci_root_id: Some("0000:00:00.0".into()),
+                            },
+                        },
+                        runtime_compatibility: Reported::Available {
+                            value: vec!["fem.gpu".into()],
+                        },
+                    }],
+                },
+                capabilities: Reported::Available {
+                    value: vec!["fem.gpu".into()],
+                },
+                sample: ComputeNodeSample::new(SampleSource::HostOs, now.clone(), None, now.clone()),
+                enforcement: EnforcementSnapshot {
+                    cpu_affinity: EnforcementStatus::Unavailable,
+                    cpu_quota: EnforcementStatus::Supported,
+                    memory_cap: EnforcementStatus::Advisory,
+                    gpu_visibility: EnforcementStatus::Supported,
+                    storage_quota: EnforcementStatus::Advisory,
+                },
+            },
+            now,
+        )
+        .unwrap();
+        let readiness = HostRuntimeReadiness {
+            schema_version: fullmag_session::host_resource_ledger::HOST_RUNTIME_READINESS_SCHEMA_V1
+                .into(),
+            status: "ready".into(),
+            source_kind: "native_fem_gpu_abi".into(),
+            source_snapshot_sha256: "a".repeat(64),
+            runtime_identity_sha256: "b".repeat(64),
+            capabilities: vec!["fem.gpu".into()],
+            gpu_runtime_compatibility: [(uuid, vec!["fem.gpu".into()])]
+                .into_iter()
+                .collect(),
+            gpu_visibility: EnforcementStatus::Supported,
+            inventory_sha256: Some(snapshot.inventory_sha256.clone()),
+            capabilities_sha256: Some(snapshot.computed_capabilities_sha256().unwrap()),
+        };
+        (snapshot, readiness)
+    }
 
     #[test]
     fn sample_timestamp_retry_only_applies_to_the_same_node_and_boot() {
@@ -2215,5 +2565,93 @@ mod tests {
     fn empty_or_malformed_gpu_discovery_is_not_reported_as_no_gpu() {
         assert!(parse_nvidia_smi_output("", true).is_err());
         assert!(parse_nvidia_smi_output("GPU-x,only-two-fields", false).is_err());
+    }
+
+    #[test]
+    fn only_typed_nvidia_probe_failures_are_warm_recoverable() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let timeout = anyhow::Error::new(NvidiaProbeUnavailable::timeout());
+        assert!(nvidia_probe_unavailable(&timeout).is_some());
+        assert_eq!(nvidia_probe_reason(&timeout), UnavailableReason::ProbeFailed);
+
+        let missing_command = anyhow::Error::new(NvidiaProbeUnavailable::launch(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "nvidia-smi"),
+        ));
+        assert_eq!(
+            nvidia_probe_reason(&missing_command),
+            UnavailableReason::SourceUnavailable
+        );
+
+        assert!(nvidia_probe_unavailable(&anyhow::Error::new(
+            NvidiaProbeUnavailable::launch(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "nvidia-smi access denied",
+            )),
+        ))
+        .is_none());
+        assert!(nvidia_probe_unavailable(&anyhow::Error::new(
+            NvidiaProbeUnavailable::poll(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "nvidia-smi access denied",
+            )),
+        ))
+        .is_none());
+        assert!(nvidia_probe_unavailable(&anyhow::Error::new(
+            NvidiaProbeUnavailable::collect(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "nvidia-smi access denied",
+            )),
+        ))
+        .is_none());
+
+        let exited = anyhow::Error::new(NvidiaProbeUnavailable::exited(
+            std::process::ExitStatus::from_raw(1),
+            "nvidia-smi reported a driver error".into(),
+        ));
+        assert!(nvidia_probe_unavailable(&exited).is_none());
+
+        let malformed = anyhow::anyhow!("nvidia-smi returned an unexpected GPU row shape");
+        assert!(nvidia_probe_unavailable(&malformed).is_none());
+    }
+
+    #[test]
+    fn typed_timeout_keeps_fresh_cpu_and_marks_gpu_unavailable_with_last_known_identity() {
+        let (previous, readiness) = warm_probe_fixture();
+        assert_eq!(
+            previous.sample.freshness_at(Utc::now()),
+            fullmag_session::compute_node_snapshot::SampleFreshness::Current
+        );
+        assert!(previous.cpu.effective_capacity_millis.value().is_some());
+
+        let timeout = anyhow::Error::new(NvidiaProbeUnavailable::timeout());
+        let (gpus, capabilities, gpu_visibility) =
+            warm_gpu_probe_projection(&timeout, Some(&previous), &readiness).unwrap();
+        assert!(matches!(
+            capabilities,
+            Reported::Available { ref value } if value == &readiness.capabilities
+        ));
+        assert_eq!(gpu_visibility, EnforcementStatus::Supported);
+        match gpus {
+            Reported::Unavailable {
+                reason: UnavailableReason::ProbeFailed,
+                last_known: Some(value),
+            } => assert_eq!(Some(&value), previous.gpus.known_value()),
+            other => panic!("warm timeout must retain only explicitly last-known GPU identity: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_timeout_without_previous_gpu_inventory_fails_closed() {
+        let (_previous, readiness) = warm_probe_fixture();
+        let timeout = anyhow::Error::new(NvidiaProbeUnavailable::timeout());
+        let error = warm_gpu_probe_projection(&timeout, None, &readiness).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("requires a previous GPU inventory"),
+            "cold-start transient GPU failure must remain an admission error: {error:#}"
+        );
     }
 }
