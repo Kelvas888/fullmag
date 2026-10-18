@@ -141,6 +141,11 @@ katalogi `.fullmag-frontend`, `.next*` i `node_modules`; `app`, `src`, `public`
 i `scripts` pozostają obserwowane. Zależności pnpm i cache Next zostają na
 ext4; HMR nie buduje backendu ani toolchaina.
 
+Tailwind używa jawnych wzorców plików w `app/globals.css`, ograniczonych do
+`app` i `src`. Nowe pasujące pliki i klasy pozostają wykrywane przez HMR.
+Wzorce unikają kosztownego wyznaczania globów katalogów na montowaniu Windows;
+nie zmieniają źródeł na kopię w kontenerze ani nie obejmują storage/cache.
+
 Backend przebudowuje się po jawnym restarcie. Przed nim zapisz projekt i zakończ
 aktywną symulację. W Docker Desktop otwórz backend właściwej grupy i wybierz
 Restart; odpowiednik CLI to:
