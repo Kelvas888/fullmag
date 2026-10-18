@@ -26,25 +26,43 @@ cache. Aplikację buduje i uruchamia ten sam `backend`; Next/HMR działa w
   Wolumen nie jest quota ani gwarancją braku wzrostu: wymagane są pomiary,
   kontrola generacji i bezpieczna retencja.
 
-## Przed pierwszym wykonaniem
+## Dobierz instrukcje do zadania
 
-Przeczytaj [procedurę od zera](references/procedure.md). Dla kontroli wszystkich
-writerów i retencji stosuj [kontrakt danych builda](references/artifact-policy.md). Sprawdź `AGENTS.md`,
-`justfile`, `.agents/instructions/backend.md` i aktualne
-[ustalenia audytu storage](../../../docs/guides/docker-build-storage-lifecycle.md).
-Kod i receipty rozstrzygają, czy dana recepta już spełnia nową granicę danych.
-Przy wyborze lub zmianie komendy czytaj [audyt wszystkich recept](references/recipe-audit.md)
-i manifest deklaracji. Porównaj hashe wejść; zmiana wrappera/resolvera wymaga
-ponownej oceny także recept, których treść się nie zmieniła.
+Przed uruchomieniem Docker DEV przeczytaj główny [AGENTS.md](../../../AGENTS.md),
+[reguły backendu](../../instructions/backend.md), [justfile](../../../justfile)
+oraz [procedurę od zera](references/procedure.md). Rutynowy start lub restart
+nie wymaga ładowania pełnego audytu 612 recept.
 
-**Istotny stan bazowy:** audyt z 18.10.2026 potwierdził named volumes backendu
-v2, lecz nie pełną zgodność. Bootstrap/launchery zapisywały konteksty i receipty
-w hostowym storage, provenance miało writable bind, frontend używał backing
-ext4 oraz logu w Windows. Nie uruchamiaj tych recept jako rzekomo zgodnej
-ścieżki volume-only. Przeczytaj wskazane funkcje, sprawdź bieżący kod i mounty;
-jeżeli niezgodność pozostaje, podaj ją konkretnie. W zadaniu implementacyjnym
-napraw launcher przed buildem; samo wywołanie skilla nie rozszerza zakresu
-zadania na przebudowę całego systemu.
+- Nowy klon/host: wykonaj konfigurację hosta z procedury, a następnie jej
+  --check.
+- Retencja, pomiar miejsca lub plan sprzątania: użyj kontraktu danych builda
+  i bieżącej części inwentarza writerów.
+- Zmiana komendy, resolvera, launchera lub recepty: przejrzyj audyt recept,
+  inwentarz writerów i aktualny kod. Porównaj hashe wejść; zmiana wrappera lub
+  resolvera wymaga ponownej oceny także recept, których treść się nie zmieniła.
+- Pełny audyt zapisów: przejrzyj wszystkie sekcje inwentarza writerów i
+  kontraktu danych builda.
+
+Historia z pierwszego audytu 18.10.2026 opisuje problemy bazowe, które później
+migrowano. Nie traktuj jej jako opisu aktualnego Docker DEV ani jako polecenia
+wstrzymania bieżącej recepty. Bieżącą granicę opisuje sekcja Aktualny daily
+live-shadow-v1 w inwentarzu writerów; mounty i zapis launchera nadal trzeba
+sprawdzić, jeśli źródła się zmieniły.
+
+## Granica danych i retencja
+
+Buildowe zależności, cache Cargo/CMake/pnpm/Next, pakiety, logi i techniczne
+receipty aktywnej trasy są przypięte do named volumes grupy lub magazynu
+BuildKit. Nie zapisuj ich do storage Windows. Hostowe storage zachowuje
+jawne dane użytkownika oraz małe, wymagane handoffy runtime, rejestry/locki i
+dowody przyjęcia storage; nie są one cache ani artefaktami buildu. Krótkotrwałe
+pliki Compose w systemowym temp nie mogą zawierać źródeł, pakietów ani cache.
+
+Named volumes, obrazy i BuildKit przeżywają usunięcie kontenera. Obecna ścieżka
+nie ma ogólnego GC ani quota dla tych zasobów, więc wolumeny ograniczają miejsce
+zapisu, ale same nie gwarantują ograniczonego zużycia dysku. Nie deklaruj
+pełnej kontroli retencji, dopóki brakujący mechanizm nie zostanie wdrożony i
+zweryfikowany. Nie używaj globalnego prune ani compose down -v.
 
 ## Wykonanie i dowody
 

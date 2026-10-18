@@ -4,6 +4,8 @@ Data audytu: 2026-10-18. Zakres: tylko odczyt worktree wybranego worktree zadani
 
 ## Dowód kompletności
 
+Hashe w tym rozdziale zapisują wejścia odczytu bazowego z 18.10.2026; nie są hashami bieżącego HEAD.
+
 - `justfile` ma 7514 linii, 716999 bajtów, SHA256 `5d0c021a54207c282aecfebf0ff663997441f11787400b9ddf77f1af28dace32`.
 - Wejścia route wrapperów: `scripts/just_storage_shell.sh` SHA256 `5855ef72b187eb812cb1c8bda9f7c75a2d663a0357b803ad7f54c6e2bbc6cb76`; `scripts/new-problem-verification.just` SHA256 `c4f9b4fb284608cf6043ddf1832151ce91f79dc0c65a3963bad5df60ed98ecda`.
 - `just --justfile .../justfile --dump --dump-format json` zakończył się kodem 0; dump zawiera 612 aktywnych recept. Parser źródła wykrywa dodatkowo 1 deklarację platformową `[windows]` (`verify-boris-fullmag-she-nf-windows`, linie 1217–1219), więc 613 deklaracji jest widocznych w pliku, a 612 jest aktywnych w bieżącym środowisku. Pełna lista deklaracji znajduje się w [manifeście TSV](recipe-inventory.tsv).
@@ -12,6 +14,10 @@ Data audytu: 2026-10-18. Zakres: tylko odczyt worktree wybranego worktree zadani
 - Tożsamość i dirty status potwierdził agent nadrzędny natywnym Git dla Windows. Odczyt WSL Git nie interpretuje Windowsowego wskaźnika worktree.
 
 ## Aktualizacja aktywnej trasy Docker DEV — źródło `9a798d280`
+
+Aktualny hash wrappera scripts/just_storage_shell.sh to
+1617d8746b330e01c3ad4fb6fb3f16e71a2ef5450aaf2ca79f42e1656bfe6e1e.
+Wartość 5855ef… powyżej należy do historycznego odczytu bazowego.
 
 Powyższy inwentarz justfile jest audytem bazowym z 18.10.2026. Jego wiersze
 `Docker dev` i `Docker dev Compose` opisują stan sprzed migracji i nie są opisem
@@ -48,6 +54,8 @@ sprawdź ich bieżące źródła i platformową trasę; to PR nie migruje ich wr
 
 ## Granica wspólna dla recept
 
+Od tego miejsca szczegółowy inwentarz rodzin i numery linii opisują audyt bazowy, nie bieżącą trasę Docker DEV. Aktualna trasa jest opisana wyżej; historyczne wiersze Docker dev i Docker dev Compose niżej zachowują dowód wcześniejszych writerów i nie są instrukcją uruchamiania.
+
 `justfile:1-6` ustawia `bash scripts/just_storage_shell.sh` jako shell. Wrapper ma jawne dispatch dla bootstrapu/Docker dev (`scripts/just_storage_shell.sh:115-160`), legacy runtime (`187-201`), Windows (`228-247`), Control Room/OpenAPI (`249-280`), runnera/benchmarków (`409-470`) oraz helperów (`474-802`). Wyjątki od inicjalizacji storage są ograniczone do odczytów/list (`386-399`).
 
 Każda inna recepta przechodzi przez fallback (`scripts/just_storage_shell.sh:825-849`): wrapper uruchamia `fullmag_storage.py prepare-links --compat` (oraz `--frontend` dla ścieżek frontendowych), a następnie `fullmag_storage.py run` wokół ciała recepty. To samo dotyczy recept pozornie read-only, więc sam brak `mkdir` w ciele nie dowodzi braku zapisu hostowego. Guard blokuje tylko literalne prefiksy `/tmp/fullmag-`, `/tmp/fullmag/` i `native/build` (`815-823`); nie blokuje ogólnie `.fullmag/reports`, `apps/control-room/.next/dev`, `/mnt` ani arbitralnych ścieżek Compose.
@@ -58,8 +66,8 @@ Każda inna recepta przechodzi przez fallback (`scripts/just_storage_shell.sh:82
 
 | rodzina | recepty i źródło | trasa wejściowa | zapisy / ryzyko |
 |---|---|---|---|
-| Docker dev | `justfile:27-46`; `scripts/docker_dev.py` | `docker-dev-toolchain`, `docker-dev`, `docker-dev-recreate`, `docker-dev-recover-orphan`, `docker-dev-build` | Bootstrap tworzy hostowy kontekst/receipt (`bootstrap_docker_toolchain.py:223-332`). Docker dev tworzy hostowe `development-base-context` (`docker_dev.py:442-469`), image receipt/log (`729-806`, `1195-1231`), run root (`877-887`, `1918-2001`, `2094-2108`) oraz state/provenance/input binds. `docker-dev-build` wywołuje `up` (`2146-2160`), więc nie jest build-only. Bezpośrednie cache backendu są named volumes, ale overlay maintenance i receipty są hostowe (`1235-1320`).
-| Docker dev Compose | `compose.dev.yaml:15-50,81-116,130-194`; `frontend_dev.py:61-78,736-746,867-885,1117-1185` | backend/frontend stałej grupy | Backend ma named volumes `backend-cache-build` i `backend-cache-package`, lecz provenance (`compose.dev.yaml:93-100`) i frontend state/cache/log (`155-168`; `frontend_dev.py:1117-1185`) są bind-mountami hostowymi. To jest znany gap względem skillowego kontraktu Docker-volume-only.
+| Docker dev (historyczny stan bazowy) | `justfile:27-46`; `scripts/docker_dev.py` | `docker-dev-toolchain`, `docker-dev`, `docker-dev-recreate`, `docker-dev-recover-orphan`, `docker-dev-build` | Bootstrap tworzy hostowy kontekst/receipt (`bootstrap_docker_toolchain.py:223-332`). Docker dev tworzy hostowe `development-base-context` (`docker_dev.py:442-469`), image receipt/log (`729-806`, `1195-1231`), run root (`877-887`, `1918-2001`, `2094-2108`) oraz state/provenance/input binds. `docker-dev-build` wywołuje `up` (`2146-2160`), więc nie jest build-only. Bezpośrednie cache backendu są named volumes, ale overlay maintenance i receipty są hostowe (`1235-1320`).
+| Docker dev Compose (historyczny stan bazowy) | `compose.dev.yaml:15-50,81-116,130-194`; `frontend_dev.py:61-78,736-746,867-885,1117-1185` | backend/frontend stałej grupy | Backend ma named volumes `backend-cache-build` i `backend-cache-package`, lecz w historycznym stanie provenance (`compose.dev.yaml:93-100`) i frontend state/cache/log (`155-168`; `frontend_dev.py:1117-1185`) były bind-mountami hostowymi — był to gap względem kontraktu Docker-volume-only.
 | legacy all-Docker | `justfile:50-79`; `scripts/fullmag_docker_runtime.py:791-1036` | `docker-all-build`, `docker-all-image`, `docker-all-start`, `docker-all-dev`, `docker-all-dev-backend-build`, `docker-all-dev-image`, `docker-all-verify`, `docker-all-toolchain-bootstrap` | Osobna ścieżka kopiuje source capsule do `runs_root/<capture>/source`, tworzy kontekst, stage, provenance, image-id, logi i receipty (`791-957`, `961-1036`). Dubluje dzisiejszy `docker-dev`, ma odrębne project/group semantics i używa bezpośrednich operacji Docker.
 | runner/obrazy | `justfile:137-290`; wrapper `409-470` | `runner-image`, `runner-build-image`, `runner-coordinator-image`, `runner-coordinator-base`, `runner-coordinator-context`, frozen/BORIS image/build, `runner-*` lifecycle | `runner-image:137` i `runner-build-image:140` uruchamiają raw `docker build`; koordynator ma własne context/image/cache/log/retention. Nie jest to gwarantowana grupa `fullmag-master`/`fullmag-worktree-*`. Stop/cancel/retention/reconcile są operacjami cleanup lub state mutation.
 | Windows/native | `justfile:301-408`; `scripts/windows/run_fullmag.ps1:231-233,393-430,800-874,924-944` | setup/doctor/UI/workspace build/recover/backend-dev/archive/windows-build/windows-test-fem i Windows verify | Hostowe rooty build/cache/target, frontend staging i CARGO/FFM; odrębna ścieżka względem Compose volumes. Wymaga jawnego oznaczenia jako Windows-host route, nie dowodzi Docker dev.

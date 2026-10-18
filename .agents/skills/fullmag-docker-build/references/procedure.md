@@ -1,4 +1,4 @@
-# Procedura od zera — build bez hostowego storage
+# Procedura od zera — build-data w wolumenach Docker
 
 ## Spis
 
@@ -6,7 +6,8 @@
 2. Mapa danych i warunki zgodności
 3. Toolchain, aplikacja i iteracje
 4. Miejsce i retencja
-5. Odbiór i obecne przeszkody
+5. Minimalny odbiór
+6. Aktualne granice i dowody
 
 ## 1. Tożsamość i przygotowanie hosta
 
@@ -15,6 +16,23 @@ z silnikiem Linux. Pełny obraz zawiera realizacje FDM/FEM CPU/GPU; GPU wymaga
 potwierdzonego dostępu urządzenia z kontenera. Wymuszonego GPU nie zamieniaj
 na CPU. Nie instaluj CUDA, MFEM, hypre, libCEED ani kompilatorów Fullmaga na
 Windows jako obejścia trasy kontenerowej.
+
+Na nowym klonie skonfiguruj lokalny .env głównego checkoutu w natywnym
+Windows PowerShell:
+
+```powershell
+Set-Location "<główny-checkout>"
+python -B scripts/setup_docker.py
+python -B scripts/setup_docker.py --check
+```
+
+Kreator zapisuje FULLMAG_PROJECT_STORAGE_ROOT i ustawienia operatora. Wybierz
+storage dla sesji, wyników, projektów i ustawień; cache, pakiety, logi oraz
+receipty buildu zostają w Docker volumes/BuildKit. Sprawdzenie --check niczego
+nie zapisuje. Na tym samym hoście worktree dziedziczą konfigurację przez
+resolver; nie twórz osobnego .env dla każdego worktree. Nie nadpisuj
+istniejących ustawień. Te polecenia konfigurują hosta, ale nie budują, nie
+uruchamiają ani nie usuwają kontenerów.
 
 Odczytaj branch, pełny HEAD, dirty status, rejestr checkoutu i główny checkout
 przez Git. Użyj istniejącego worktree zadania. Źródła mogą być dirty, ale manifest
@@ -59,13 +77,14 @@ podkatalogu development z readonly bindami `app/src/public/scripts`, jeżeli
 wszystkie efektywne ścieżki zapisu nadal leżą w wolumenie. Sprawdzaj mount o
 najdłuższym pasującym prefiksie; bind potomny może przykryć prawidłowy volume.
 
-Provenance nie może być writable plikiem z hostowego storage. Przenieś jego
-zapis i odczyt konsumentów do kontrolnego katalogu w wolumenie, zachowując
-walidację hashy i trwałość publikacji. Ścieżki Cargo/Make `/workspace` mogą
-być aliasem `/build/workspace`; potwierdź alias w obrazie i rzeczywiste targety.
-Preferuj np. `FULLMAG_PACKAGE_PROVENANCE=/build/control/provenance.json`;
-nie przykrywaj całego `/opt/fullmag` mutowalnym wolumenem tylko po to, aby
-zmieścić jeden plik. Auditor uwzględnia tę zmienną oraz obecny fallback obrazu.
+Aktywny Compose zapisuje build provenance do
+/opt/fullmag/control/backend/runtime-provenance.json w grupowym control
+volume. Zachowaj producenta i konsumentów po tej samej stronie wolumenu;
+nie zmieniaj tego na writable host bind. Frontend dostaje wyłącznie swój
+ograniczony podkatalog control volume. Ścieżki Cargo/Make /workspace mogą
+być aliasem /build/workspace; potwierdź alias w obrazie i rzeczywiste targety.
+Nie przykrywaj całego /opt/fullmag mutowalnym wolumenem tylko po to, aby
+zmieścić jeden plik provenance.
 
 Nie utożsamiaj named volume z warstwą kontenera. Odtworzenie kontenera ma
 zachować cache. Volume oznacz rolą, grupą/checkoutem, profilem i tożsamością
@@ -93,55 +112,57 @@ niezależnie; skrypt nie interpretuje dowolnych programów powłoki.
 
 ## 3. Toolchain, aplikacja i iteracje
 
-Istniejące nazwy wejść operacyjnych to:
+W natywnym Windows PowerShell przejdź do wybranego checkoutu. Użyj tego samego
+checkoutu dla toolchaina i aplikacji; recepta toolchaina wybiera źródło z
+bieżącego justfile.
 
 ```powershell
 Set-Location $source
+python -B scripts/setup_docker.py --check
 just docker-dev-toolchain
 just docker-dev "$source" $port
-# Opcjonalny skrypt z tego samego checkoutu:
+# Opcjonalnie aktywny model ze skryptu w tym samym checkoutcie:
 just docker-dev "$source" $port "examples/fem_relax_gpu_smoke.py"
 ```
 
-Uwaga: w bazowej implementacji `just docker-dev-build` wywołuje ścieżkę `up`
-i może uruchomić usługi. Nie traktuj nazwy jako gwarancji build-only. Pozostałe
-trasy i pośrednie zapisy wrappera opisuje [audyt recept](recipe-audit.md).
+docker-dev-toolchain przygotowuje przypięty obraz zależności przez Compose i
+BuildKit dla projektu wybranego checkoutu. To nie jest kontener aplikacyjny i
+nie kompiluje backendu. Postęp widać w terminalu oraz Docker Desktop Builds.
+Uruchomienie właściwych usług wykonuje docker-dev: stałe serwisy grupy to
+backend i frontend; nie uruchamiaj osobnego backend-build ani dawnego
+runnera. docker-dev-build jest aliasem zgodności, który uruchamia
+usługi, a nie bezpiecznym poleceniem build-only.
 
-**Nie wykonuj tej sekwencji jako volume-only, dopóki kontrola kodu nie wykaże
-usunięcia zapisów builda w hostowym storage.** Te nazwy nie oznaczają, że migracja
-jest ukończona. Nie dodawaj fikcyjnego `--volume-only` lub nieistniejącej recepty.
+Źródła wybranego checkoutu są readonly bindami. Przy każdym starcie backend
+sprawdza ich aktualną tożsamość. Jeżeli wejścia się nie zmieniły, używa
+zweryfikowanego pakietu z named volume; w przeciwnym razie uruchamia
+przyrostowy Cargo/Make w /build, publikuje pakiet do /opt/fullmag/package i
+zapisuje build-provenance/logi w control volume. API oraz native runtime
+startują w tym samym stałym kontenerze backend. Zmienione zależności mogą
+wymagać przebudowy większego fragmentu; nie obiecuj, że każda edycja dotknie
+dokładnie jeden crate.
 
-1. Toolchain przygotuj na nowym hoście lub po zmianie jego pinów. Recepta
-   przekazuje `--direct-development`; bez tej flagi bootstrap używa projektu
-   `fullmag-toolchain`. Samo późniejsze podanie `$source` do `docker-dev` nie
-   zmienia wcześniej wybranego projektu bootstrapu.
-2. Compose/BuildKit buduje obraz zależności oraz brakujące zgodne base/helper
-   images. Postęp jest w terminalu / Docker Desktop Builds. Zasoby BuildKit
-   nie są trzecią stałą usługą aplikacji.
-3. Stały `backend` pod własną blokadą przechwytuje spójny manifest readonly
-   źródeł. Synchronizuje jeden ext4 workspace, zachowując metadane identycznych
-   plików; nie archiwizuje całego checkoutu per restart.
-4. Zgodny pakiet daje `phase=start state=cache-hit`; w przeciwnym razie
-   uruchamia się przyrostowy Cargo/Make. Zmienione zależne moduły mogą wymagać
-   kompilacji. Zmiana ABI/flag/pinów może poszerzyć zakres. Mierz to zamiast
-   obiecywać build w kilka sekund.
-5. Kandydat powstaje w wolumenie. Zweryfikuj pełne pliki/hash/provenance,
-   opublikuj trwale, zachowaj poprzedni rollback i dopiero uruchom API/native
-   runtime w tym samym kontenerze. Kompilacja i API są w logu `backend`.
-6. `frontend` używa tego samego checkoutu i HMR. Zależności instaluje frozen
-   z repozytoryjnego lockfile do wolumenu; hostowe node_modules nie są wejściem.
-7. Po zmianie backendu zapisz projekt, zakończ symulacje i restartuj wyłącznie
-   backend swojej grupy. Restart nie powtarza Solve. Zmiana obrazu/mountów może
-   wymagać kontrolowanego recreate, nie usunięcia cache.
-8. Skrypt `.py` rozwiąż w wybranych źródłach, zweryfikuj hash i wczytaj jako
-   aktywny model Workspace. Zwykły skrypt uruchamia Solve; `wait_for_solve`
-   pozostawia model gotowy do Compute. Nie ponawiaj automatycznie przyjętego
-   lub niepotwierdzonego uruchomienia.
+Frontend czyta ten sam readonly checkout i zapisuje pnpm, node_modules, Next.js,
+wygenerowane pliki oraz next.log w named volume. Zmiany frontendowe są
+wykrywane przez HMR. To wymaga żywego frontendu i nie dowodzi jeszcze, że Home
+jest poprawnie widoczny — potrzebny jest test przeglądarkowy.
 
-Pełny source digest i native source identity to odrębne kontrakty. W bazowej
-implementacji także edycja frontendu może ominąć pakietowy fast path, choć nie
-zmienia natywnego dirty digestu. Nie osłabiaj provenance dla szybszego startu;
-oddzielną optymalizację uzasadnij pomiarem i testem.
+Po zmianie backendu zapisz projekt, zakończ symulacje i uruchom ponownie
+backend swojej grupy. Zwykły restart nie usuwa cache i sam nie ponawia Solve.
+Zmiana obrazu albo mountów może wymagać kontrolowanego recreate. Nie kasuj
+wolumenów, aby wymusić rebuild.
+
+Skrypt .py rozwiąż względem wybranego checkoutu, np. examples/...py.
+Launcher waliduje ścieżkę i hash, a backend wczytuje model jako aktywny w
+Workspace. Zwykły skrypt uruchamia Solve; wait_for_solve pozostawia model
+gotowy do Compute. Nie ponawiaj automatycznie uruchomienia o nieznanym wyniku.
+
+Dane symulacji i ustawienia zachowują swój Windows storage. Małe handoffy
+operacyjne runtime, certyfikaty przyjęcia storage i wskaźnik uruchomienia również
+pozostają po stronie hosta; nie są cache, logami ani receiptami buildu.
+Tymczasowe metadane Compose mogą przejść przez systemowy temp i są usuwane po
+zakończeniu launchera. Sprawdź ten wyjątek po awarii launchera, ale nie umieszczaj
+tam źródeł, archiwów, pakietów ani logów.
 
 ## 4. Miejsce i retencja
 
@@ -185,7 +206,7 @@ można dowieść jego zbędności. Przed autoryzowanym cleanupem ponów kontrol�
 konsumentów; zachowaj plan, receipt i pomiar faktycznie odzyskanych bajtów.
 Nie wolno zastąpić tej procedury wyłączaniem blokad ani usuwaniem provenance.
 
-## 5. Odbiór i obecne przeszkody
+## 5. Minimalny odbiór
 
 Minimalny dowód wykonania:
 
@@ -200,16 +221,20 @@ Minimalny dowód wykonania:
   brak narastających niepotrzebnych binariów/stagingu;
 - osobno, gdy zlecone: realne FDM/FEM CPU/GPU oraz skrypt auto/wait.
 
-Stan bazowy z audytu 18.10.2026 — sprawdź, czy aktualny kod już to naprawił:
+## 6. Aktualne granice i dowody
 
-| Przeszkoda | Miejsce kontroli |
-| --- | --- |
-| Toolchain context/logi/receipty powstają na hoście | `scripts/bootstrap_docker_toolchain.py::build`, `capture_inputs` |
-| Base/wrapper contexts i receipty w hostowych builds/runs | `scripts/docker_dev.py::_development_base_context`, `_ensure_development_base`, `_runtime_image_reference` |
-| Writable host bind provenance | `compose.dev.yaml`, `docker/all-in-one/backend_dev.py::_publish_runtime_provenance` |
-| Frontend ext4 backing i next.log na Windows | `scripts/docker_frontend_cache.py`, `docker/all-in-one/frontend_dev.py`, `compose.dev.yaml` |
-| Brak GC wszystkich starych generacji i orphan staging | `docker_backend_volume_cache.py`, `backend_dev.py`, aktualny przewodnik retencji |
+Bieżąca ścieżka live-shadow-v1 ma named volumes na backend /build,
+/opt/fullmag/package, frontend /state/development i techniczne receipty.
+Szczegóły oraz wyjątki hostowe są w bieżącej sekcji inwentarza writerów.
+Historyczne tabele audytu zachowują stan sprzed migracji i nie opisują
+automatycznie aktualnego HEAD. Przy zmianie kodu ponownie sprawdź mounty,
+launchery i wszystkie writery; nie cofaj się do starej oceny bez nowych dowodów.
 
-Przy tych przeszkodach raportuj: „obecne recepty nie spełniają volume-only”,
-z dokładnym zapisem/mountem do migracji. Nie uruchamiaj zgodnego tylko z dawną
-architekturą buildu i nie przedstawiaj go jako realizacji tej procedury.
+Znane ograniczenia, które trzeba raportować w każdym odbiorze:
+
+- wolumeny nazwane, obrazy i BuildKit przeżywają usunięcie kontenera;
+- brak ogólnego GC/quota dla named volumes, BuildKit oraz cache Cargo/CMake;
+  nie twierdź, że całe zużycie Docker jest ograniczone;
+- Docker Desktop cold build/start, rzeczywisty inspect, restart cache-hit,
+  incremental rebuild, frontend HMR, uruchomienie .py i GPU pozostają
+  NOT VERIFIED, dopóki nie ma dowodu z tej grupy na docelowym hoście.
