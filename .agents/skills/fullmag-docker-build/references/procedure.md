@@ -112,9 +112,10 @@ usunięcia zapisów builda w hostowym storage.** Te nazwy nie oznaczają, że mi
 jest ukończona. Nie dodawaj fikcyjnego `--volume-only` lub nieistniejącej recepty.
 
 1. Toolchain przygotuj na nowym hoście lub po zmianie jego pinów. Recepta
-   przekazuje `--direct-development`; bez tej flagi bootstrap używa projektu
-   `fullmag-toolchain`. Samo późniejsze podanie `$source` do `docker-dev` nie
-   zmienia wcześniej wybranego projektu bootstrapu.
+   przekazuje `--direct-development` i wybiera projekt bieżącego checkoutu.
+   Tę samą grupę zachowaj dla startu aplikacji. Samo późniejsze podanie `$source`
+   do `docker-dev` nie zmienia wcześniej wybranego checkoutu bootstrapu.
+   Bootstrap bez tej flagi nie jest ścieżką codziennego DEV.
 2. Compose/BuildKit buduje obraz zależności oraz brakujące zgodne base/helper
    images. Postęp jest w terminalu / Docker Desktop Builds. Zasoby BuildKit
    nie są trzecią stałą usługą aplikacji.
