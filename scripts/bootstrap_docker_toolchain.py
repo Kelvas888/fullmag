@@ -356,6 +356,47 @@ def _compose_environment(repo, project):
 
 
 
+def _validate_manifest_probe_policy(configured):
+    """Validate the rendered no-GPU policy before reading the image manifest."""
+    services = configured.get("services")
+    service = services.get(SERVICE) if isinstance(services, dict) else None
+    if not isinstance(service, dict):
+        raise BootstrapError("Dependency manifest probe service is missing")
+    if service.get("network_mode") != "none":
+        raise BootstrapError("Dependency manifest probe must use network_mode=none")
+    if service.get("read_only") is not True:
+        raise BootstrapError("Dependency manifest probe must use a read-only root")
+    if service.get("cap_drop") != ["ALL"]:
+        raise BootstrapError("Dependency manifest probe must drop all capabilities")
+    if service.get("security_opt") != ["no-new-privileges:true"]:
+        raise BootstrapError("Dependency manifest probe must disable privilege gain")
+    if str(service.get("user")) != "65532:65532":
+        raise BootstrapError("Dependency manifest probe must run as uid/gid 65532")
+    if service.get("pids_limit") != 16:
+        raise BootstrapError("Dependency manifest probe must use pids_limit=16")
+    memory = service.get("mem_limit")
+    if str(memory).lower() not in {"64m", "67108864"}:
+        raise BootstrapError("Dependency manifest probe must use a 64 MiB memory limit")
+    cpus = service.get("cpus")
+    try:
+        cpus_value = float(cpus)
+    except (TypeError, ValueError) as error:
+        raise BootstrapError("Dependency manifest probe must use cpus=0.25") from error
+    if isinstance(cpus, bool) or cpus_value != 0.25:
+        raise BootstrapError("Dependency manifest probe must use cpus=0.25")
+    environment = service.get("environment")
+    if not isinstance(environment, dict) or environment.get("NVIDIA_VISIBLE_DEVICES") != "void":
+        raise BootstrapError("Dependency manifest probe must hide NVIDIA devices")
+    if "gpus" in service:
+        raise BootstrapError("Dependency manifest probe must not request GPU devices")
+    deploy = service.get("deploy")
+    if isinstance(deploy, dict):
+        resources = deploy.get("resources")
+        reservations = resources.get("reservations") if isinstance(resources, dict) else None
+        if isinstance(reservations, dict) and reservations.get("devices"):
+            raise BootstrapError("Dependency manifest probe must not reserve GPU devices")
+
+
 def _validate_control_mount(configured, expected_volume):
     declared = configured.get("volumes", {}).get("toolchain-control", {})
     if declared.get("name") != expected_volume or declared.get("external") is not True:
@@ -507,6 +548,7 @@ def build(repo, *, direct_development=False):
         if set(configured.get("services", {})) != {SERVICE, "toolchain-control"}:
             raise BootstrapError("Unexpected dependency Compose services")
         _validate_control_mount(configured, control_volume)
+        _validate_manifest_probe_policy(configured)
         service = configured["services"][SERVICE]
         build_definition = service.get("build", {})
         build_context = Path(build_definition.get("context", "")).resolve()
@@ -573,12 +615,9 @@ def build(repo, *, direct_development=False):
             write_control(repo, project_name, CONTROL_RECEIPT,
                           (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode())
             raw_manifest = docker(
-                *definitions, "run", "--rm", "--no-deps", "-T",
-                "--network", "none", "--read-only", "--cap-drop", "ALL",
-                "--security-opt", "no-new-privileges:true", "--user", "65532:65532",
-                "--pids-limit", "16", "--memory", "64m", "--cpus", "0.25",
-                "--env", "NVIDIA_VISIBLE_DEVICES=void", "--entrypoint", "/bin/cat",
-                SERVICE, DEPENDENCY_MANIFEST, environment=compose_environment,
+                *definitions, "run", "--rm", "--no-deps", "-T", "--pull", "never",
+                "--entrypoint", "/bin/cat", SERVICE, DEPENDENCY_MANIFEST,
+                environment=compose_environment,
             )
             manifest_bytes = raw_manifest.encode("utf-8")
             if len(manifest_bytes) > 2 * 1024 * 1024:

@@ -162,6 +162,56 @@ class ToolchainBootstrapTests(unittest.TestCase):
         self.assertNotIn("FULLMAG_COMPOSE_PROJECT:-", compose)
         self.assertNotIn("FULLMAG_TOOLCHAIN_CONTEXT:-", compose)
 
+    def test_manifest_probe_policy_is_rendered_without_gpu_access(self):
+        policy = {
+            "network_mode": "none",
+            "read_only": True,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "user": "65532:65532",
+            "pids_limit": 16,
+            "mem_limit": "64m",
+            "cpus": 0.25,
+            "environment": {"NVIDIA_VISIBLE_DEVICES": "void"},
+        }
+        bootstrap._validate_manifest_probe_policy({
+            "services": {"fem-gpu-toolchain": policy},
+        })
+
+    def test_manifest_probe_policy_rejects_unsafe_rendered_config(self):
+        policy = {
+            "network_mode": "none",
+            "read_only": True,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "user": "65532:65532",
+            "pids_limit": 16,
+            "mem_limit": "64m",
+            "cpus": 0.25,
+            "environment": {"NVIDIA_VISIBLE_DEVICES": "void"},
+        }
+        for field, value in (("network_mode", "default"), ("read_only", False),
+                             ("cap_drop", []), ("security_opt", []),
+                             ("user", "0:0"), ("pids_limit", 17),
+                             ("mem_limit", "1g"), ("cpus", 1.0),
+                             ("environment", {"NVIDIA_VISIBLE_DEVICES": "all"}),
+                             ("gpus", "all")):
+            invalid = copy.deepcopy(policy)
+            invalid[field] = value
+            with self.subTest(field=field), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._validate_manifest_probe_policy({
+                    "services": {"fem-gpu-toolchain": invalid},
+                })
+
+    def test_toolchain_compose_declares_no_gpu_manifest_probe_policy(self):
+        compose = (Path(__file__).resolve().parents[1] / "compose.toolchain.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("network_mode: none", compose)
+        self.assertIn("read_only: true", compose)
+        self.assertIn("NVIDIA_VISIBLE_DEVICES: void", compose)
+        self.assertNotIn("    gpus: all", compose)
+
     def test_toolchain_dockerignore_has_no_recursive_untracked_allowlist(self):
         repository = Path(__file__).resolve().parents[1]
         ignore = (repository / "docker/fem-gpu/Dockerfile.dockerignore").read_text(
