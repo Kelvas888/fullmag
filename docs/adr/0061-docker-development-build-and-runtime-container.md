@@ -54,6 +54,43 @@ Niepotwierdzony owner wymaga kanonicznego recovery przy ponownym użyciu jego
 store. Świeży start tworzy osobny namespace; zachowuje dawny store i nie resetuje
 jego ownera. Nadal wymaga kanonicznej walidacji wspólnego ledgeru i release proofs.
 
+### Fizyczne miejsce cache DEV
+
+Odczyt działającego backendu wykazał, że dotychczasowy profil cache v1 używa
+ext4 na loop device, którego plik backing znajduje się na Windows przez 9p.
+Sam typ ext4 nie usuwa więc kosztu tego transportu. Dla nowego trybu DEV
+przyjmujemy profil `backend-build-cache-v2` z dwiema jawnymi, prywatnymi
+named volumes sterownika Docker `local`, bez driver options mapujących hosta:
+`/build` oraz `/opt/fullmag/package`. Inicjalizacja wyłącza automatyczne
+kopiowanie zawartości obrazu (`nocopy`). Nie tworzy dodatkowego buildera;
+kompilacja i API pozostają w stałej usłudze `backend`.
+
+Para jest jedną jednostką cache, z identycznym kluczem i owner tokenem.
+Klucz zależy od checkoutu, profilu i toolchaina; UUID runu, snapshot edytowanych
+źródeł i sama zmiana wrappera runtime nie tworzą nowego Cargo/CMake cache.
+Etykiety wolumenów, markery i hostowy receipt w kanonicznym storage wiążą
+jednostkę z Docker Engine, grupą oraz tożsamością toolchaina. Host sprawdza
+rzeczywiste wolumeny i mounty; nazwa lub prefix nie stanowią dowodu własności.
+Obcy volume, niezgodna para albo niepotwierdzony konsument blokują użycie.
+Kontener aplikacji nie otrzymuje Docker socketa ani uprawnień do zarządzania
+wolumenami. Ograniczone narzędzie inicjalizacji działa w tej samej grupie.
+
+Zmiana dotyczy wyłącznie pochodnych danych buildu i pakietu. Nie zmienia
+profili session storage Windows, `/user-data`, wspólnego host ledgeru ani
+kontraktów Python/ProblemIR, solverów i API. Adapter v1 pozostaje do obsługi
+istniejących zasobów i rollbacku; nie przełączamy profilu działającego backendu.
+Nie kopiujemy ani nie usuwamy starego cache automatycznie. Nowy start z v2
+wymaga wolnego miejsca, braku aktywnego właściciela grupy oraz istniejących
+bramek recovery, provenance i storage. Niedostatek miejsca blokuje tę operację,
+bez fallbacku na 9p i bez kasowania Cargo target.
+
+Wdrożenie v2 jest **w toku, runtime NOT VERIFIED**. Wymaga spięcia adaptera,
+Compose, launchera, runtime preflight i administracyjnego recovery oraz
+regresji obcych/niepełnych wolumenów i restartu wrappera. Odbiór obejmuje
+rzeczywisty typ i tożsamość mountów, cold build, restart bez zmian, przyrostową
+edycję modułu, izolację grup i zachowanie danych Windows. Stary cache może
+zostać wycofany dopiero po osobnej kontroli użycia, referencji i rollbacku.
+
 Kompilację chroni blokada per trwały cache wewnątrz backendu, także bez launchera
 na hoście. Odrębne grupy z własnymi cache mogą budować równolegle; nie współdzielą
 mutowalnych katalogów Cargo/CMake. Hostowy heavy lock obejmuje przygotowanie

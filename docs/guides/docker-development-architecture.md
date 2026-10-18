@@ -50,6 +50,13 @@ kontenerem budującym a runtime. Przygotowanie przypiętego obrazu toolchaina
 oraz krótkie narzędzia sprawdzające storage są osobnymi operacjami utrzymania,
 a nie dodatkowymi usługami aplikacji.
 
+Obecny adapter cache v1 używa pliku ext4 na Windows dostępnym przez 9p;
+nie jest to jeszcze docelowy storage dla szybkich iteracji. Profil v2 opisany
+w ADR 0061 wprowadza jawną parę prywatnych wolumenów Linux Dockera pod `/build`
+i `/opt/fullmag/package`. Integracja i pomiary v2 pozostają **NOT VERIFIED**.
+Sesje, wyniki i ustawienia grupy zachowują opisane niżej katalogi Windows.
+Nie usuwaj ani nie przenoś aktywnego cache v1 ręcznie.
+
 Cache Cargo i osobne katalogi CMake FDM/FEM leżą na trwałym ext4 przypisanym do
 checkoutu/profilu. Nie zależą od UUID kolejnego uruchomienia. Niezmienione pliki
 cienia zachowują zawartość i metadane potrzebne kompilacji przyrostowej.
@@ -368,6 +375,22 @@ zapisać `mapping_detached: true` w manifeście i atestacji zakończenia.
 Istniejące niezmienne piny starszej wersji z tym polem wolno odczytać
 wyłącznie podczas replayu już zakończonego namespace i zachowanej atestacji;
 nie uprawniają one do rozpoczęcia nowej procedury zatrzymania.
+
+Jeśli administracyjne prepare nie powiodło się przed potwierdzeniem prepare
+lub zatrzymaniem kontenera, po diagnozie operator może jawnie wznowić tę samą
+próbę. Ostatni parametr recepty włącza wyłącznie tę ścieżkę:
+
+```sh
+just docker-dev-recover-orphan PINS_JSON CONTAINER_ID COMPOSE_PROJECT DIAGNOSTICS_ROOT true
+```
+
+Request i pins muszą pozostać identyczne. Nowe dowody prób trafiają do
+`pre-stop-resume/<attempt-uuid>` obok wcześniejszych rekordów. Dla Windows
+każdy kontener administracyjny uzyskuje świeży grant swojego namespace przez
+pełne próby storage; nie przejmuje grantu poprzedniego kontenera. Brak dowodu
+wyłącznego dostępu lub Failed ownera blokuje rotację. Procedura nie wykonuje
+Solve ani nie usuwa zapisanej historii. Rzeczywista kwalifikacja tej ścieżki
+pozostaje **NOT VERIFIED** do zakończenia testu na Dockerze.
 
 Nie zmieniaj UUID requestu ani pliku pins przy ponowieniu po przerwaniu.
 Wynik `unknown` wymaga uzgodnienia z zachowanymi dowodami; nie wolno usuwać

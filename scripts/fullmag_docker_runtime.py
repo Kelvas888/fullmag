@@ -93,6 +93,137 @@ sys.stdout.buffer.write(chunks)
 '''
 
 
+def _backend_cache_kind(value):
+    """Return the explicit backend cache generation and its adapter.
+
+    The v1 ext4/bind profile remains a supported archived-input contract.
+    A missing or unknown schema is never treated as either generation.
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError("Backend cache profile must be an object")
+    try:
+        import docker_backend_cache as legacy_cache
+        import docker_backend_volume_cache as volume_cache
+    except ImportError as error:  # pragma: no cover - packaging error
+        raise ValueError("Backend cache adapters are unavailable") from error
+    schema = value.get("schema")
+    if schema == volume_cache.SCHEMA:
+        return "v2", volume_cache
+    if schema == legacy_cache.SCHEMA:
+        return "v1", legacy_cache
+    raise ValueError("Backend cache profile has an unsupported schema")
+
+
+def _read_backend_cache_document(path_value, digest_value, label, *, expected=None,
+                                 maximum=4 * 1024 * 1024):
+    """Read one host-published cache record and bind it to stable bytes."""
+
+    if not isinstance(path_value, str):
+        raise ValueError(f"Backend cache {label} path is missing")
+    path = Path(path_value)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise ValueError(f"Backend cache {label} is not an immutable regular file")
+    if digest_value is not None and (
+            not isinstance(digest_value, str)
+            or _CONFIG_SHA256_RE.fullmatch(digest_value) is None):
+        raise ValueError(f"Backend cache {label} digest is invalid")
+    try:
+        first = path.read_bytes()
+        second = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"Backend cache {label} cannot be read") from error
+    if first != second or not first or len(first) > maximum:
+        raise ValueError(f"Backend cache {label} changed or exceeds its bound")
+    if digest_value is not None and hashlib.sha256(first).hexdigest() != digest_value:
+        raise ValueError(f"Backend cache {label} digest differs from its receipt")
+    try:
+        value = json.loads(first)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"Backend cache {label} is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"Backend cache {label} must contain an object")
+    if expected is not None and value != expected:
+        raise ValueError(f"Backend cache {label} differs from its published descriptor")
+    return value
+
+
+def _validate_backend_volume_cache(value, *, expected_package=None):
+    """Validate the v2 named-volume descriptor before Compose or attestation."""
+
+    kind, adapter = _backend_cache_kind(value)
+    if kind != "v2":
+        return None
+    if value.get("profile") != adapter.PROFILE or value.get("state") != "ready":
+        raise ValueError("Backend volume cache profile is not ready")
+    if value.get("build_root") != adapter.BUILD_TARGET or value.get("mount_root") != adapter.BUILD_TARGET:
+        raise ValueError("Backend volume cache build root is not the canonical daemon target")
+    if value.get("package_root") != adapter.PACKAGE_TARGET:
+        raise ValueError("Backend volume cache package root is not the canonical daemon target")
+    if expected_package is not None and expected_package != adapter.PACKAGE_TARGET:
+        raise ValueError("Backend start package root differs from the v2 cache target")
+    environment = value.get("environment")
+    if (not isinstance(environment, dict)
+            or environment.get("FULLMAG_BACKEND_PACKAGE") != adapter.PACKAGE_TARGET):
+        raise ValueError("Backend volume cache package environment is not typed")
+    volume_names = value.get("volume_names")
+    if (not isinstance(volume_names, dict)
+            or set(volume_names) != {adapter.BUILD_VOLUME_ROLE, adapter.PACKAGE_VOLUME_ROLE}
+            or any(not isinstance(name, str) or adapter._VOLUME_NAME.fullmatch(name) is None
+                   for name in volume_names.values())):
+        raise ValueError("Backend volume cache volume names are invalid")
+    if value.get("mounts") != adapter.mount_specs(value):
+        raise ValueError("Backend volume cache mounts are not the canonical named-volume pair")
+    receipt_expected = value.get("receipt")
+    if not isinstance(receipt_expected, dict):
+        raise ValueError("Backend volume cache ready receipt is missing")
+    receipt = _read_backend_cache_document(
+        value.get("receipt_path"), value.get("receipt_sha256"), "ready receipt",
+        expected=receipt_expected, maximum=16 * 1024 * 1024,
+    )
+    if receipt.get("schema") != adapter.SCHEMA or receipt.get("profile") != adapter.PROFILE:
+        raise ValueError("Backend volume cache ready receipt schema differs")
+    if (receipt.get("volume_names") != volume_names
+            or receipt.get("build_root") != adapter.BUILD_TARGET
+            or receipt.get("package_root") != adapter.PACKAGE_TARGET
+            or receipt.get("mounts") != value["mounts"]):
+        raise ValueError("Backend volume cache ready receipt volume identity differs")
+    try:
+        adapter._validate_volume_documents(value["volume_documents"], value)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Backend volume cache volume receipt is invalid: {error}") from error
+    if environment != adapter._cache_environment(value):
+        raise ValueError("Backend volume cache environment is not canonical")
+    overlay_expected = value.get("overlay")
+    if not isinstance(overlay_expected, dict):
+        raise ValueError("Backend volume cache Compose overlay descriptor is missing")
+    overlay = _read_backend_cache_document(
+        value.get("compose_overlay"), value.get("compose_overlay_sha256"),
+        "Compose overlay", expected=overlay_expected,
+    )
+    maintenance_expected = value.get("maintenance_overlay")
+    if not isinstance(maintenance_expected, dict):
+        raise ValueError("Backend volume cache maintenance overlay descriptor is missing")
+    maintenance_path = value.get("maintenance_compose_overlay")
+    if maintenance_path is None:
+        # Keep the field name explicit for callers that materialize the path
+        # before the host wrapper adds its compatibility alias.
+        maintenance_path = value.get("maintenance_overlay_path")
+    maintenance_overlay = _read_backend_cache_document(
+        maintenance_path,
+        value.get("maintenance_compose_overlay_sha256", value.get("maintenance_overlay_sha256")),
+        "maintenance overlay", expected=maintenance_expected,
+    )
+    try:
+        if overlay != adapter.overlay(value) or maintenance_overlay != adapter.maintenance_overlay(value):
+            raise ValueError("cache overlay differs from the canonical adapter output")
+        adapter.validate_overlay(overlay, value)
+        adapter.validate_maintenance_overlay(maintenance_overlay, value)
+    except Exception as error:
+        raise ValueError(f"Backend volume cache overlay validation failed: {error}") from error
+    return adapter
+
+
 def validate_runtime_artifacts(package, *, development=False):
     web = () if development else ("web/index.html",)
     for relative in (*("bin/" + name for name in REQUIRED_BINARIES),
@@ -566,6 +697,11 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         backend_cache = backend_start.get("backend_cache")
         if not isinstance(backend_cache, dict) or backend_cache.get("state") != "ready":
             raise ValueError("Backend start has no ready backend cache profile")
+        cache_kind, _cache_adapter = _backend_cache_kind(backend_cache)
+        if cache_kind == "v2":
+            _validate_backend_volume_cache(
+                backend_cache, expected_package=backend_start.get("package_root")
+            )
         cache_overlay = backend_cache.get("compose_overlay")
         cache_environment = backend_cache.get("environment")
         if (not isinstance(cache_overlay, str) or not Path(cache_overlay).is_file()
@@ -1834,16 +1970,22 @@ def _validate_backend_start_inputs(value, layout):
             or cache_package != value.get("package_root")
             or cache_environment.get("FULLMAG_BACKEND_PACKAGE") != cache_package):
         raise ValueError("Backend start package is not the cache helper's typed package root")
-    try:
-        cache_package_path = PurePosixPath(cache_package)
-        cache_mount_path = PurePosixPath(cache_mount)
-        relative = cache_package_path.relative_to(cache_mount_path)
-    except ValueError as error:
-        raise ValueError("Backend start package escapes the attested backend cache mount") from error
-    if (not cache_package_path.is_absolute() or not cache_mount_path.is_absolute()
-            or relative != PurePosixPath("package")
-            or cache_package_path != package_daemon_path):
-        raise ValueError("Backend start package is not the attested daemon package child")
+    cache_kind, _cache_adapter = _backend_cache_kind(cache)
+    if cache_kind == "v2":
+        _validate_backend_volume_cache(cache, expected_package=cache_package)
+        if package_daemon_path != PurePosixPath(_cache_adapter.PACKAGE_TARGET):
+            raise ValueError("Backend start v2 package root is not the canonical daemon target")
+    else:
+        try:
+            cache_package_path = PurePosixPath(cache_package)
+            cache_mount_path = PurePosixPath(cache_mount)
+            relative = cache_package_path.relative_to(cache_mount_path)
+        except ValueError as error:
+            raise ValueError("Backend start package escapes the attested backend cache mount") from error
+        if (not cache_package_path.is_absolute() or not cache_mount_path.is_absolute()
+                or relative != PurePosixPath("package")
+                or cache_package_path != package_daemon_path):
+            raise ValueError("Backend start package is not the attested daemon package child")
     previous_receipt = value.get("previous_backend_build_receipt_sha256")
     if previous_receipt is not None and (
         not isinstance(previous_receipt, str) or _CONFIG_SHA256_RE.fullmatch(previous_receipt) is None
@@ -1953,8 +2095,10 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 def _read_backend_binary_hashes(inputs, container_id):
     """Hash published binaries inside the daemon package mount."""
 
-    package_path = Path(str(inputs["package_root"]))
-    if package_path.is_dir():
+    cache = inputs.get("backend_cache") if isinstance(inputs, Mapping) else None
+    cache_kind = _backend_cache_kind(cache)[0] if isinstance(cache, dict) else None
+    package_path = None if cache_kind == "v2" else Path(str(inputs["package_root"]))
+    if package_path is not None and package_path.is_dir():
         return {
             name: digest(package_path / "bin" / name)
             for name in REQUIRED_BINARIES
@@ -1982,8 +2126,10 @@ def _read_backend_binary_hashes(inputs, container_id):
 def _read_backend_build_documents(inputs, container_id):
     """Read package/provenance from the daemon mount or local test fixture."""
 
-    package_path = Path(str(inputs["package_root"]))
-    if package_path.is_dir():
+    cache = inputs.get("backend_cache") if isinstance(inputs, Mapping) else None
+    cache_kind = _backend_cache_kind(cache)[0] if isinstance(cache, dict) else None
+    package_path = None if cache_kind == "v2" else Path(str(inputs["package_root"]))
+    if package_path is not None and package_path.is_dir():
         receipt_path = package_path / "backend-build-receipt.json"
         provenance_path = Path(inputs["provenance_path"])
         if not receipt_path.exists() or receipt_path.is_symlink():
@@ -2985,21 +3131,32 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         if actual["Image"] != image or (host.get("PortBindings") or {}) != bindings:
             raise ValueError("Runtime image or loopback port attestation mismatch")
         if backend_start is not None:
+            backend_cache = backend_start.get("backend_cache")
+            backend_cache_kind, _cache_adapter = _backend_cache_kind(backend_cache)
             expected_readonly = {
                 "/opt/fullmag/source": Path(backend_start["source_root"]).resolve(),
                 "/opt/fullmag/source-git": Path(backend_start["git_common_dir"]).resolve(),
             }
-            expected_readwrite = {
-                # The cache helper returns the package root in the Docker
-                # daemon namespace (for example /mnt/fullmag-cache/package).
-                # Native Windows Python must compare that lexical POSIX path
-                # with Docker inspect output; Path.resolve()/stat would
-                # reinterpret it in the host namespace.
-                "/opt/fullmag/package": _daemon_mount_path(
-                    backend_start["package_root"], "Backend package root"
-                ),
-                "/opt/fullmag/provenance.json": Path(backend_start["provenance_path"]).resolve(),
-            }
+            if backend_cache_kind == "v2":
+                _validate_backend_volume_cache(
+                    backend_cache, expected_package=backend_start["package_root"]
+                )
+                from docker_backend_volume_cache import validate_container as validate_backend_cache
+                receipt["backend_cache_attestation"] = validate_backend_cache(actual, backend_cache)
+                # The v2 adapter owns both named-volume destinations.  Only
+                # the provenance handoff remains in the generic bind check.
+                expected_readwrite = {
+                    "/opt/fullmag/provenance.json": Path(backend_start["provenance_path"]).resolve(),
+                }
+            else:
+                expected_readwrite = {
+                    # v1 keeps its daemon bind path contract.  Do not apply
+                    # this host-path interpretation to the v2 named volumes.
+                    "/opt/fullmag/package": _daemon_mount_path(
+                        backend_start["package_root"], "Backend package root"
+                    ),
+                    "/opt/fullmag/provenance.json": Path(backend_start["provenance_path"]).resolve(),
+                }
         elif inputs is not None:
             expected_readonly = {"/opt/fullmag/source": Path(inputs["source_root"]).resolve()}
             expected_readwrite = {

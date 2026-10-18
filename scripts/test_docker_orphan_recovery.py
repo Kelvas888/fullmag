@@ -14,6 +14,7 @@ from unittest.mock import patch
 import uuid
 
 import docker_orphan_recovery as recovery
+import docker_backend_volume_cache as volume_cache
 
 from docker_orphan_recovery import (
     ORPHAN_REQUEST_SCHEMA,
@@ -34,6 +35,120 @@ from docker_orphan_recovery import (
 
 def _raw_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _v2_cache_fixture(root: Path) -> dict[str, object]:
+    profile: dict[str, object] = {
+        "schema": volume_cache.SCHEMA,
+        "profile": volume_cache.PROFILE,
+        "state": "ready",
+        "project_id": "fullmag",
+        "worktree_id": "worktree-test",
+        "cache_key": "c" * 64,
+        "unit_key": "d" * 64,
+        "owner_id": "e" * 64,
+        "cargo_profile": "backend-dev",
+        "runtime_image_id": "sha256:" + "a" * 64,
+        "toolchain_image_id": "sha256:" + "b" * 64,
+        "volume_names": {
+            volume_cache.BUILD_VOLUME_ROLE: "fullmag-cache-build-test",
+            volume_cache.PACKAGE_VOLUME_ROLE: "fullmag-cache-package-test",
+        },
+        "build_root": volume_cache.BUILD_TARGET,
+        "mount_root": volume_cache.BUILD_TARGET,
+        "package_root": volume_cache.PACKAGE_TARGET,
+    }
+    profile["environment"] = volume_cache._cache_environment(profile)
+    profile["mounts"] = volume_cache.mount_specs(profile)
+    documents: dict[str, dict[str, object]] = {}
+    for role in (volume_cache.BUILD_VOLUME_ROLE, volume_cache.PACKAGE_VOLUME_ROLE):
+        documents[role] = {
+            "Name": profile["volume_names"][role],
+            "Driver": "local",
+            "Options": {},
+            "Scope": "local",
+            "Mountpoint": "/var/lib/docker/volumes/" + str(profile["volume_names"][role]) + "/_data",
+            "Labels": volume_cache.volume_labels(profile, role),
+        }
+    profile["volume_documents"] = documents
+    maintenance = {
+        "schema": volume_cache.MAINTENANCE_RECEIPT_SCHEMA,
+        "profile": volume_cache.PROFILE,
+        "state": "ready",
+        "project_id": profile["project_id"],
+        "cache_key": profile["cache_key"],
+        "unit_key": profile["unit_key"],
+        "owner_id": profile["owner_id"],
+        "cargo_profile": profile["cargo_profile"],
+        "runtime_image_id": profile["runtime_image_id"],
+        "toolchain_image_id": profile["toolchain_image_id"],
+        "volume_names": dict(profile["volume_names"]),
+        "markers": {
+            role: {
+                "schema": volume_cache.OWNER_SCHEMA,
+                "state": "owned",
+                "unit_key": profile["unit_key"],
+                "owner_id": profile["owner_id"],
+                "role": role,
+                "volume_name": profile["volume_names"][role],
+                "uid": 65532,
+                "gid": 65532,
+            }
+            for role in (volume_cache.BUILD_VOLUME_ROLE, volume_cache.PACKAGE_VOLUME_ROLE)
+        },
+        "probe": {
+            "schema": volume_cache.PROBE_SCHEMA,
+            "state": "passed",
+            "owner_uid": 65532,
+            "owner_gid": 65532,
+            "volumes": {
+                role: {
+                    "regular_marker": True,
+                    "writable": True,
+                    "readonly_reopen": True,
+                    "no_reparse": True,
+                }
+                for role in (volume_cache.BUILD_VOLUME_ROLE, volume_cache.PACKAGE_VOLUME_ROLE)
+            },
+        },
+    }
+    profile["maintenance_receipt"] = maintenance
+    receipt_path = root / "backend-volume-cache-receipt.json"
+    receipt = {
+        "schema": volume_cache.SCHEMA,
+        "profile": volume_cache.PROFILE,
+        "state": "ready",
+        "project_id": profile["project_id"],
+        "worktree_id": profile["worktree_id"],
+        "cache_key": profile["cache_key"],
+        "unit_key": profile["unit_key"],
+        "owner_id": profile["owner_id"],
+        "cargo_profile": profile["cargo_profile"],
+        "runtime_image_id": profile["runtime_image_id"],
+        "toolchain_image_id": profile["toolchain_image_id"],
+        "volume_names": dict(profile["volume_names"]),
+        "mounts": list(profile["mounts"]),
+        "package_root": volume_cache.PACKAGE_TARGET,
+        "build_root": volume_cache.BUILD_TARGET,
+        "volume_documents": documents,
+        "maintenance_receipt": maintenance,
+        "host_receipt_path": str(receipt_path),
+    }
+    receipt_path.write_bytes(_raw_json(receipt))
+    profile["receipt"] = receipt
+    profile["receipt_path"] = str(receipt_path)
+    overlay_path = root / "compose.backend-cache-v2.json"
+    overlay = volume_cache.overlay(profile)
+    overlay_path.write_bytes(_raw_json(overlay))
+    profile["overlay"] = overlay
+    profile["compose_overlay"] = str(overlay_path)
+    profile["compose_overlay_sha256"] = hashlib.sha256(overlay_path.read_bytes()).hexdigest()
+    maintenance_path = root / "compose.backend-cache-v2-maintenance.json"
+    maintenance_overlay = volume_cache.maintenance_overlay(profile)
+    maintenance_path.write_bytes(_raw_json(maintenance_overlay))
+    profile["maintenance_overlay"] = maintenance_overlay
+    profile["maintenance_compose_overlay"] = str(maintenance_path)
+    return profile
 
 
 class OrphanRecoveryContractTests(unittest.TestCase):
@@ -501,6 +616,164 @@ class OrphanRecoveryContractTests(unittest.TestCase):
                 expected_container_id=self.container_id,
                 expected_image_id=self.image_id,
             )
+
+    def _v2_request_inputs(self) -> tuple[dict[str, object], dict[str, object], dict[str, object], dict[str, object]]:
+        cache_root = self.root / "v2-cache"
+        cache_root.mkdir()
+        cache = _v2_cache_fixture(cache_root)
+        before = deepcopy(self.before)
+        volume_mounts = [
+            {
+                "Type": "volume",
+                "Name": cache["volume_names"][volume_cache.BUILD_VOLUME_ROLE],
+                "Source": "/var/lib/docker/volumes/build/_data",
+                "Destination": volume_cache.BUILD_TARGET,
+                "RW": True,
+            },
+            {
+                "Type": "volume",
+                "Name": cache["volume_names"][volume_cache.PACKAGE_VOLUME_ROLE],
+                "Source": "/var/lib/docker/volumes/package/_data",
+                "Destination": volume_cache.PACKAGE_TARGET,
+                "RW": True,
+            },
+        ]
+        before["Mounts"] = [self.state_bind, *volume_mounts]
+        pins = deepcopy(self.pins)
+        pins["backend"] = {
+            **pins["backend"],
+            "package_bind": volume_mounts[1],
+        }
+        pins["backend_cache"] = cache
+        artifacts = [{
+            "path": "bin/fullmag-runtime-service",
+            "size": 1,
+            "sha256": "6" * 64,
+            "mode": "100755",
+        }]
+        package_receipt = {
+            "schema": "fullmag.direct-compose.backend-build-receipt.v1",
+            "state": "succeeded",
+            "execution_lanes": {
+                lane: {"status": "compiled"}
+                for lane in ("fdm-cpu", "fdm-gpu", "fem-cpu", "fem-gpu")
+            },
+            "artifacts": artifacts,
+        }
+        pins["cached_package"] = {
+            "root": volume_cache.PACKAGE_TARGET,
+            "receipt_path": volume_cache.PACKAGE_TARGET + "/backend-build-receipt.json",
+            "receipt_sha256": "7" * 64,
+            "package_sha256": "8" * 64,
+            "read_only": True,
+            "state": "succeeded",
+            "schema": "fullmag.direct-compose.backend-build-receipt.v1",
+            "package_probe": {
+                "schema": PACKAGE_PROBE_SCHEMA,
+                "container_id": self.container_id,
+                "image_id": self.image_id,
+                "package_root": volume_cache.PACKAGE_TARGET,
+                "receipt_path": volume_cache.PACKAGE_TARGET + "/backend-build-receipt.json",
+                "receipt_sha256": "7" * 64,
+                "package_sha256": "8" * 64,
+                "read_only_mount": True,
+                "state": "succeeded",
+                "receipt": package_receipt,
+                "artifacts": artifacts,
+            },
+        }
+        return pins, self.engine, before, cache
+
+    def test_v2_request_binds_exact_named_volume_pair_and_package_probe(self) -> None:
+        pins, engine, before, cache = self._v2_request_inputs()
+        request = build_orphan_request(pins, engine, before)
+        self.assertEqual(request["containers"][0]["container_id"], self.container_id)
+        self.assertEqual(cache["package_root"], volume_cache.PACKAGE_TARGET)
+        self.assertNotIn("state_bind", request["containers"][0])
+        after = deepcopy(before)
+        after["State"] = {
+            "Status": "exited",
+            "Running": False,
+            "Pid": 0,
+            "FinishedAt": "2026-10-17T23:00:00Z",
+        }
+        device_requests = before["HostConfig"]["DeviceRequests"]
+        manifest_value = {
+            "schema": "docker-teardown-manifest.v1",
+            "before": {
+                "container_id": self.container_id,
+                "image_id": self.image_id,
+                "service": "backend",
+                "role": "backend",
+                "user": "65532:65532",
+                "state": "running",
+                "pid": before["State"]["Pid"],
+                "private_pid_namespace": True,
+                "host_pid": False,
+                "device_requests": device_requests,
+            },
+            "after": {
+                "container_id": self.container_id,
+                "image_id": self.image_id,
+                "service": "backend",
+                "role": "backend",
+                "user": "65532:65532",
+                "state": "exited",
+                "pid": 0,
+                "finished_at": after["State"]["FinishedAt"],
+                "descendant_count": 0,
+                "private_pid_namespace": True,
+                "host_pid": False,
+                "device_requests": device_requests,
+            },
+            "device_release": {
+                "resource_id": "gpu-orphan",
+                "mapping_sha256": "6" * 64,
+                "mapping_detached": True,
+            },
+        }
+        manifest_path = self.root / "v2-teardown-manifest.json"
+        manifest_path.write_bytes(_raw_json(manifest_value))
+        manifest = {
+            "path": str(manifest_path),
+            "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        }
+        attestation = build_teardown_attestation(
+            request, engine, engine, before, after, manifest
+        )
+        self.assertEqual(
+            validate_teardown_attestation(request, attestation)["result"],
+            "authoritative_teardown",
+        )
+
+    def test_v2_request_rejects_foreign_volume_or_unknown_cache_or_nocopy(self) -> None:
+        pins, engine, before, cache = self._v2_request_inputs()
+        foreign = deepcopy(pins)
+        foreign["backend"]["package_bind"]["Name"] = "foreign-package-volume"
+        with self.assertRaises(OrphanRecoveryError):
+            build_orphan_request(foreign, engine, before)
+
+        unknown = deepcopy(pins)
+        unknown["backend_cache"]["schema"] = "fullmag.backend-build-cache.unknown"
+        with self.assertRaises(OrphanRecoveryError):
+            build_orphan_request(unknown, engine, before)
+
+        nocopy = deepcopy(pins)
+        nocopy["backend_cache"]["mounts"][0]["volume"]["nocopy"] = False
+        with self.assertRaises(OrphanRecoveryError):
+            build_orphan_request(nocopy, engine, before)
+
+        overlay = deepcopy(pins)
+        overlay["backend_cache"]["compose_overlay_sha256"] = "9" * 64
+        with self.assertRaises(OrphanRecoveryError):
+            build_orphan_request(overlay, engine, before)
+
+        labels = deepcopy(pins)
+        labels["backend_cache"]["volume_documents"][
+            volume_cache.PACKAGE_VOLUME_ROLE
+        ]["Labels"][volume_cache.LABEL_ROLE] = volume_cache.BUILD_VOLUME_ROLE
+        with self.assertRaises(OrphanRecoveryError):
+            build_orphan_request(labels, engine, before)
 
 
 if __name__ == "__main__":

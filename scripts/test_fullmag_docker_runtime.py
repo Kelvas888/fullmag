@@ -14,9 +14,135 @@ from contextlib import nullcontext
 
 import fullmag_docker_runtime as runtime
 import run_managed_browser as managed
+import docker_backend_volume_cache as volume_cache
+
+
+def _v2_cache_fixture(root):
+    profile = {
+        "schema": volume_cache.SCHEMA,
+        "profile": volume_cache.PROFILE,
+        "state": "ready",
+        "project_id": "fullmag",
+        "worktree_id": "worktree-test",
+        "cache_key": "c" * 64,
+        "unit_key": "d" * 64,
+        "owner_id": "e" * 64,
+        "cargo_profile": "backend-dev",
+        "runtime_image_id": "sha256:" + "a" * 64,
+        "toolchain_image_id": "sha256:" + "b" * 64,
+        "volume_names": {
+            volume_cache.BUILD_VOLUME_ROLE: "fullmag-cache-build-test",
+            volume_cache.PACKAGE_VOLUME_ROLE: "fullmag-cache-package-test",
+        },
+        "build_root": volume_cache.BUILD_TARGET,
+        "mount_root": volume_cache.BUILD_TARGET,
+        "package_root": volume_cache.PACKAGE_TARGET,
+    }
+    profile["environment"] = volume_cache._cache_environment(profile)
+    profile["mounts"] = volume_cache.mount_specs(profile)
+    documents = {}
+    for role in (volume_cache.BUILD_VOLUME_ROLE, volume_cache.PACKAGE_VOLUME_ROLE):
+        documents[role] = {
+            "Name": profile["volume_names"][role],
+            "Driver": "local",
+            "Options": {},
+            "Scope": "local",
+            "Mountpoint": "/var/lib/docker/volumes/" + profile["volume_names"][role] + "/_data",
+            "Labels": volume_cache.volume_labels(profile, role),
+        }
+    profile["volume_documents"] = documents
+    profile["receipt"] = {
+        "schema": volume_cache.SCHEMA,
+        "profile": volume_cache.PROFILE,
+        "state": "ready",
+        "volume_names": dict(profile["volume_names"]),
+        "build_root": volume_cache.BUILD_TARGET,
+        "package_root": volume_cache.PACKAGE_TARGET,
+        "mounts": list(profile["mounts"]),
+    }
+    receipt_path = root / "backend-volume-cache-receipt.json"
+    overlay_path = root / "compose.backend-cache-v2.json"
+    maintenance_path = root / "compose.backend-cache-v2-maintenance.json"
+    profile["receipt_path"] = str(receipt_path)
+    records = (
+        (receipt_path, profile["receipt"]),
+        (overlay_path, volume_cache.overlay(profile)),
+        (maintenance_path, volume_cache.maintenance_overlay(profile)),
+    )
+    for path, record in records:
+        raw = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        path.write_bytes(raw)
+        if path is receipt_path:
+            # The v2 producer binds the ready receipt to its path and the
+            # published descriptor; it does not add a second receipt digest.
+            profile["receipt"] = record
+        elif path is overlay_path:
+            profile["overlay"] = record
+            profile["compose_overlay"] = str(path)
+            profile["compose_overlay_sha256"] = hashlib.sha256(raw).hexdigest()
+        else:
+            profile["maintenance_overlay"] = record
+            profile["maintenance_compose_overlay"] = str(path)
+    return profile
 
 
 class DockerRuntimeContract(unittest.TestCase):
+    def test_v2_cache_accepts_independent_named_volume_targets_and_exact_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = _v2_cache_fixture(root)
+            adapter = runtime._validate_backend_volume_cache(
+                cache, expected_package=volume_cache.PACKAGE_TARGET
+            )
+            self.assertIs(adapter, volume_cache)
+            self.assertEqual(cache["mount_root"], volume_cache.BUILD_TARGET)
+            self.assertEqual(cache["package_root"], volume_cache.PACKAGE_TARGET)
+            tampered = dict(cache)
+            tampered["mount_root"] = volume_cache.PACKAGE_TARGET
+            with self.assertRaisesRegex(ValueError, "build root"):
+                runtime._validate_backend_volume_cache(tampered)
+
+    def test_backend_start_v2_does_not_apply_v1_child_path_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = _v2_cache_fixture(root)
+            provenance = root / "provenance.json"
+            receipt = root / "backend-start-receipt.json"
+            provenance.write_text("{}\n", encoding="utf-8")
+            receipt.write_text("{}\n", encoding="utf-8")
+            inputs = {
+                "schema": "fullmag.direct-compose.backend-start-inputs.v1",
+                "state": "ready",
+                "source_mode": "live-shadow-v1",
+                "image_id": "sha256:" + "a" * 64,
+                "toolchain_image_id": "sha256:" + "b" * 64,
+                "toolchain_manifest_sha256": "c" * 64,
+                "cargo_profile": "backend-dev",
+                "build_profile": "dev",
+                "source_project_id": "project-test",
+                "source_worktree_id": "worktree-test",
+                "source_checkout_kind": "worktree",
+                "source_root": "/checkout",
+                "git_common_dir": "/git-common",
+                "provenance_path": str(provenance),
+                "helper_context": "/run/helper-context",
+                "backend_start_receipt": str(receipt),
+                "startup_helper_hashes": {
+                    "docker_startup_script.py": "1" * 64,
+                    "fullmag_storage.py": "2" * 64,
+                },
+                "package_root": volume_cache.PACKAGE_TARGET,
+                "backend_cache": cache,
+            }
+            self.assertIs(runtime._validate_backend_start_inputs(inputs, {}), inputs)
+
+    def test_unknown_backend_cache_schema_is_not_treated_as_v1_or_v2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = _v2_cache_fixture(Path(directory))
+            cache["schema"] = "fullmag.backend-build-cache.unknown"
+            with self.assertRaisesRegex(ValueError, "unsupported schema"):
+                runtime._validate_backend_volume_cache(cache)
+
     def test_live_compose_rejects_non_mapping_start_inputs_before_docker(self):
         with patch.object(runtime, "docker") as docker_call:
             with self.assertRaisesRegex(ValueError, "Backend start inputs must be an object"):
