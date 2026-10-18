@@ -27,6 +27,7 @@ const GRANT_NAME: &str = ".fullmag-windows-folder-grant.json";
 const DEVELOPMENT_PACKAGE_ROOT: &str = "/opt/fullmag/package";
 const DEVELOPMENT_PROVENANCE_PATH: &str = "/opt/fullmag/provenance.json";
 const DEVELOPMENT_VOLUME_PROVENANCE_PATH: &str = "/build/provenance.json";
+const DEVELOPMENT_CONTROL_PROVENANCE_PATH: &str = "/opt/fullmag/control/backend/runtime-provenance.json";
 const DEVELOPMENT_RECEIPT_PATH: &str = "/opt/fullmag/package/backend-build-receipt.json";
 const DEVELOPMENT_BUILD_SCHEMA: &str = "fullmag.windows-folder-development-build.v1";
 #[cfg(windows)]
@@ -272,7 +273,7 @@ fn validate_development_build(delegation: &DevelopmentBuildDelegation) -> Result
         || delegation.package_root != DEVELOPMENT_PACKAGE_ROOT
         || !matches!(
             delegation.provenance_path.as_str(),
-            DEVELOPMENT_PROVENANCE_PATH | DEVELOPMENT_VOLUME_PROVENANCE_PATH
+            DEVELOPMENT_PROVENANCE_PATH | DEVELOPMENT_VOLUME_PROVENANCE_PATH | DEVELOPMENT_CONTROL_PROVENANCE_PATH
         )
     {
         bail!("Windows-folder development delegation scope is invalid");

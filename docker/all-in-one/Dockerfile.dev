@@ -4,6 +4,8 @@ ARG RUNTIME_BASE
 FROM ${RUNTIME_BASE} AS fullmag-dev
 
 ARG FULLMAG_TOOLCHAIN_IMAGE_ID
+ARG FULLMAG_DIRECT_DEVELOPMENT_CONTEXT_SCHEMA
+ARG FULLMAG_DIRECT_DEVELOPMENT_CONTEXT_SHA256
 ENV FULLMAG_TOOLCHAIN_IMAGE_ID=${FULLMAG_TOOLCHAIN_IMAGE_ID}
 
 USER root
@@ -36,9 +38,9 @@ RUN mkdir -p /opt/fullmag/tooling/pnpm && \
 
 # These are image-owned mount points. Runtime bind mounts replace source,
 # package, provenance, state, and the Windows host certificate.
-RUN mkdir -p /opt/fullmag/source /opt/fullmag/package /state /run/fullmag && \
+RUN mkdir -p /opt/fullmag/source /opt/fullmag/package /opt/fullmag/control /state/development /run/fullmag && \
     touch /opt/fullmag/provenance.json && \
-    chown 65532:65532 /state /run/fullmag && \
+    chown 65532:65532 /state /state/development /run/fullmag && \
     chown root:root /opt/fullmag /opt/fullmag/docker_startup_script.py /opt/fullmag/fullmag_storage.py && \
     chmod 0755 /opt/fullmag /opt/fullmag/source /opt/fullmag/package /state /run/fullmag && \
     chmod 0644 /opt/fullmag/provenance.json && \
@@ -47,6 +49,8 @@ RUN mkdir -p /opt/fullmag/source /opt/fullmag/package /state /run/fullmag && \
 LABEL org.fullmag.runtime="docker-all-gpu-v1" \
       org.fullmag.development="source-bind-v1" \
       org.fullmag.toolchain.image-id="${FULLMAG_TOOLCHAIN_IMAGE_ID}" \
+      org.fullmag.direct-development.context-sha256="${FULLMAG_DIRECT_DEVELOPMENT_CONTEXT_SHA256}" \
+      org.fullmag.direct-development.context-schema="${FULLMAG_DIRECT_DEVELOPMENT_CONTEXT_SCHEMA}" \
       org.fullmag.toolchain.dependencies="/opt/fullmag-deps/share/fullmag/dependency-versions.json"
 
 ENV FULLMAG_REPO_ROOT=/opt/fullmag/source \

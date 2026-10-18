@@ -61,7 +61,7 @@ def _frontend(control, operation, selected, state, port, image):
     files = []
     inputs = seed(selected, state, port, write_file=lambda relative, data: files.append({
         "relative": relative, "data": base64.b64encode(data).decode("ascii")}))
-    previous_inputs = control.read("development-inputs.json", optional=True)
+    previous_inputs = control.read("frontend/development-inputs.json", optional=True)
     if (isinstance(previous_inputs, dict)
             and all(previous_inputs.get(key) == inputs.get(key) for key in
                 ("source_root", "worktree_id", "dependency_seed_sha256", "toolpins_sha256", "host_port", "files", "live_directories"))):
@@ -116,7 +116,7 @@ print(json.dumps({'state':'seeded','files':len(request['files'])}))
     if result.returncode:
         raise BuildControlError(result.stderr.decode("utf-8", "replace"))
     control.write(operation["root"] + "/frontend-seed.json", json.loads(result.stdout))
-    control.write("development-inputs.json", inputs)
+    control.write("frontend/development-inputs.json", inputs)
     return inputs, volume
 
 
@@ -130,16 +130,18 @@ def _backend_cache(control, operation, layout, selected, image, toolchain):
             raise BuildControlError(result.stderr.decode())
         return result.stdout.decode()
     relative = operation["root"] + "/backend-cache.json"
+    layout = {**layout, "compose_project": control.project}
     profile = cache.prepare(layout, selected, image, layout["storage_root"], volume_docker,
         source_root=selected, toolchain_image=toolchain, active_consumers=consumers,
-        volume_receipt="docker-volume://" + control.volume + "/" + relative)
+        control_volume_name=control.volume)
     overlay = cache.maintenance_overlay(profile)
     overlay["name"] = control.project
     control.write(operation["root"] + "/cache-maintenance-compose.json", overlay)
     output = compose_capture(overlay, "run", "--rm", "--no-deps", cache.MAINTENANCE_SERVICE, timeout=180)
     receipt = cache._read_json_output(output.decode())
-    return cache.validate(profile, profile["volume_documents"], receipt, consumers,
-                          receipt_writer=lambda value: control.write(relative, value))
+    result = cache.validate(profile, profile["volume_documents"], receipt, consumers)
+    control.write(relative, result)
+    return result
 
 
 def _host_ledger(control, operation, layout, selected, image):
@@ -255,10 +257,14 @@ def start(args, *, reuse_state=None):
         raise BuildControlError("Volume DEV supports backend-dev; release uses its explicit managed recipe")
     if args.image or args.toolchain_image or args.source_manifest or args.include_untracked:
         raise BuildControlError("Volume DEV requires its attested dependency/image route; explicit overrides are not qualified")
+    from docker_dev import _resolve_gpu_access, _verify_docker_gpu_access
+    policy = getattr(args, "gpu_access", None) or "auto"
+    device_access = _resolve_gpu_access(policy)
     toolchain = build_volume_toolchain(selected)
     control = BuildControl(identity, toolchain["inputs"]["build_args"]["FULLMAG_CUDA_BASE_IMAGE"])
     images = build_volume_runtime_images(selected, control, toolchain)
     image = images["backend"]["image_id"]
+    device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
     _assert_no_running_fullmag(control.project, identity)
     with control.operation("development", {"source_root": str(selected), "image_id": image}) as operation:
         token = operation["receipt"]["attempt"]
@@ -278,7 +284,7 @@ def start(args, *, reuse_state=None):
         frontend_inputs, frontend_volume = _frontend(control, operation, selected, state, args.port, image)
         ledger_backend, ledger_profile = _host_ledger(control, operation, layout, selected, image)
         inputs = {"image_id": image, "toolchain_image_id": toolchain["image_id"],
-                  "guest_provenance_path": "/build/provenance.json"}
+                  "guest_provenance_path": "/opt/fullmag/control/backend/runtime-provenance.json"}
         provisional, hashes, delegation = runtime._provisional_development_certificate(inputs, identity)
         provisional["binary_hashes"] = hashes
         engine_id = docker_text("info", "--format", "{{.ID}}").strip()
@@ -301,8 +307,13 @@ def start(args, *, reuse_state=None):
         git_common = _source_git_common_directory(selected)
         environment = {**os.environ, "FULLMAG_COMPOSE_PROJECT": control.project,
             "FULLMAG_COMPOSE_NETWORK": identity["network_name"],
+            "FULLMAG_DOCKER_DEVICE_ACCESS": device_access,
+            "FULLMAG_BUILD_CONTROL_VOLUME": control.volume,
+            "FULLMAG_SOURCE_COMMIT": storage.git(selected, "rev-parse", "HEAD"),
+            "FULLMAG_DEVELOPMENT_INPUTS_PATH": "/opt/fullmag/control/frontend/development-inputs.json",
             "FULLMAG_SOURCE_ROOT": str(selected), "FULLMAG_SOURCE_GIT_COMMON": str(git_common),
             "FULLMAG_DEV_IMAGE": image, "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain["image_id"],
+            "FULLMAG_TOOLCHAIN_IMAGE": toolchain["image_id"],
             "FULLMAG_BACKEND_HOSTNAME": "fullmag-direct-backend-" + token[:12],
             "FULLMAG_STATE_ROOT": str(state), "FULLMAG_HOST_CERTIFICATE": str(certificate_path),
             "FULLMAG_PACKAGE_PROVENANCE": str(certificate_path),
@@ -317,11 +328,14 @@ def start(args, *, reuse_state=None):
         if configured.returncode or len(configured.stdout) > 1024 * 1024:
             raise BuildControlError("DEV Compose render failed: " + configured.stderr.decode("utf-8", "replace"))
         document = json.loads(configured.stdout)
+        if device_access == "gpu":
+            document["services"]["backend"]["gpus"] = [{"count": "all"}]
         backend, frontend = (document["services"][name] for name in ("backend", "frontend"))
         backend.pop("build", None)
         backend["environment"].update(cache["environment"])
         backend["environment"].update(ledger_backend["environment"])
-        backend["environment"]["FULLMAG_PACKAGE_PROVENANCE"] = "/build/provenance.json"
+        backend["environment"]["FULLMAG_PACKAGE_PROVENANCE"] = runtime.BACKEND_PROVENANCE_PATH
+        backend["environment"]["FULLMAG_RUNTIME_PROVENANCE"] = runtime.BACKEND_PROVENANCE_PATH
         backend["environment"]["CUDA_CACHE_PATH"] = "/build/cuda-cache"
         if startup is not None:
             backend["environment"].update(FULLMAG_STARTUP_ENABLED="1",
@@ -335,13 +349,13 @@ def start(args, *, reuse_state=None):
                 "bind": {"create_host_path": False}})
         backend["labels"].update(cache["overlay"]["services"]["backend"]["labels"])
         backend["volumes"] = [m for m in backend["volumes"]
-                              if m["target"] not in {"/opt/fullmag/provenance.json", "/build", "/opt/fullmag/package"}]
+                              if m["target"] not in {"/opt/fullmag/provenance.json", "/build", "/opt/fullmag/package", "/opt/fullmag/control"}]
         backend["volumes"] += cache["overlay"]["services"]["backend"]["volumes"] + ledger_backend["volumes"]
         frontend["volumes"] = [m for m in frontend["volumes"]
                                if m["target"] not in {"/state/development", "/run/fullmag/development-inputs.json"}]
         frontend["volumes"] += [
             {"type": "volume", "source": "frontend-build", "target": "/state/development", "volume": {"nocopy": True}},
-            {"type": "volume", "source": "build-control", "target": "/run/fullmag", "read_only": True, "volume": {"nocopy": True}}]
+            {"type": "volume", "source": "build-control", "target": "/opt/fullmag/control", "read_only": True, "volume": {"nocopy": True}}]
         document["volumes"] = {**cache["overlay"]["volumes"],
             "frontend-build": {"name": frontend_volume, "external": True},
             "build-control": {"name": control.volume, "external": True}}
@@ -396,7 +410,7 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
                 control.write(operation["root"] + "/handoff-log.json", {"started_at": started_at, "log": logs})
         if handoff_seen:
             raw = docker_capture("exec", backend_id, "/usr/local/bin/python3", "-c",
-                runtime._BACKEND_BUILD_DOCUMENTS_SCRIPT.replace("/opt/fullmag/provenance.json", "/build/provenance.json"))
+                runtime._BACKEND_BUILD_DOCUMENTS_SCRIPT)
             observed = json.loads(raw.stdout)
             receipt, provenance = observed["receipt"]["value"], observed["provenance"]["value"]
             if (receipt.get("state") != "succeeded" or provenance.get("state") != "succeeded"
@@ -415,14 +429,15 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     import fullmag_docker_runtime as runtime
     token = operation["receipt"]["attempt"]
     inputs = {"image_id": image, "toolchain_image_id": toolchain["image_id"],
-              "guest_provenance_path": "/build/provenance.json"}
+              "guest_provenance_path": "/opt/fullmag/control/backend/runtime-provenance.json"}
     receipt, provenance = _wait_for_publication(control, operation, backend_id)
     control.write(operation["root"] + "/backend-build-receipt.json", receipt)
     control.write(operation["root"] + "/provenance.json", provenance)
     operation["receipt"]["config_sha256"] = hashlib.sha256(canonical(document)).hexdigest()
     operation["receipt"]["windows_storage_delegation_reused"] = certificate.get("restart_verified") is True
     # Use the existing source/binary validation before rotating Windows admission.
-    inputs.update(backend_cache=cache, package_root="/opt/fullmag/package", run_id=token,
+    inputs.update(device_access=document["services"]["backend"]["environment"]["FULLMAG_DOCKER_DEVICE_ACCESS"],
+        backend_cache=cache, package_root="/opt/fullmag/package", run_id=token,
         source_root=str(selected), git_common_dir=str(git_common), build_profile="dev",
         startup_helper_hashes={}, backend_start_receipt="docker-volume://" + control.volume + "/" + operation["root"] + "/receipt.json",
         helper_context="image-owned")
@@ -584,8 +599,8 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False):
     _require_native_windows()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root)
     identity = _compose_identity(layout)
-    configured = json.loads(docker_capture("compose", "--project-name", identity["project_name"],
-        "-f", str(selected / "compose.toolchain.yaml"), "--profile", "toolchain", "config", "--format", "json").stdout)
+    from docker_build_control import toolchain_configuration
+    configured = toolchain_configuration(selected, identity)
     control = BuildControl(identity, configured["services"]["fem-gpu-toolchain"]["build"]["args"]["FULLMAG_CUDA_BASE_IMAGE"])
     control.prepare()
     if not re.fullmatch(r"[0-9a-f]{32}", args.attempt):

@@ -12,7 +12,7 @@ from docker_build_control import BuildControl, BuildControlError, ControlOutcome
 
 
 class VolumeReceiptTests(unittest.TestCase):
-    def test_runtime_supervisor_accepts_only_the_two_fixed_provenance_locations(self):
+    def test_runtime_supervisor_accepts_only_fixed_provenance_locations(self):
         path = Path(__file__).resolve().parents[1] / 'docker/all-in-one/runtime_service.py'
         spec = importlib.util.spec_from_file_location('volume_runtime_paths_test', path)
         module = importlib.util.module_from_spec(spec)
@@ -21,6 +21,9 @@ class VolumeReceiptTests(unittest.TestCase):
         self.assertEqual(module.canonical_paths({}).provenance, Path('/opt/fullmag/provenance.json'))
         self.assertEqual(module.canonical_paths({'FULLMAG_PACKAGE_PROVENANCE':'/build/provenance.json'}).provenance,
                          Path('/build/provenance.json'))
+        control_provenance = '/opt/fullmag/control/backend/runtime-provenance.json'
+        self.assertEqual(module.canonical_paths({'FULLMAG_PACKAGE_PROVENANCE': control_provenance}).provenance,
+                         Path(control_provenance))
         with self.assertRaises(module.RuntimeServiceError):
             module.canonical_paths({'FULLMAG_PACKAGE_PROVENANCE':'/state/user-data.json'})
 
@@ -109,31 +112,36 @@ class VolumeReceiptTests(unittest.TestCase):
     def test_admitted_volume_receipt_never_uses_a_host_writer(self):
         with tempfile.TemporaryDirectory() as temporary:
             profile, layout, source, repo, runroot = _profile(temporary)
-            location = 'docker-volume://fullmag-control-test/development/attempts/test/cache.json'
             profile = cache.prepare(layout, repo, profile['runtime_image_id'], runroot,
-                source_root=source, toolchain_image=profile['toolchain_image_id'], volume_receipt=location)
-            volumes = DockerVolumeFixture(profile, roles=(cache.BUILD_VOLUME_ROLE, cache.PACKAGE_VOLUME_ROLE))
-            published = []
-            with mock.patch.object(cache, '_write_json', side_effect=AssertionError('host receipt write')):
-                ready = cache.validate(profile, volumes.documents, _maintenance_receipt(profile),
-                                       receipt_writer=published.append)
+                source_root=source, toolchain_image=profile['toolchain_image_id'],
+                control_volume_name=profile['volume_names'][cache.CONTROL_VOLUME_ROLE])
+            volumes = DockerVolumeFixture(profile, roles=cache.VOLUME_ROLES)
+            before = sorted(Path(temporary).rglob('*'))
+            with mock.patch.object(Path, 'write_text', side_effect=AssertionError('host receipt write')), \
+                 mock.patch.object(Path, 'write_bytes', side_effect=AssertionError('host receipt write')):
+                ready = cache.validate(profile, volumes.documents, _maintenance_receipt(profile))
             self.assertEqual(ready['state'], 'ready')
-            self.assertEqual(ready['receipt_path'], location)
-            self.assertEqual(len(published), 1)
+            self.assertEqual(ready['receipt_path'], cache.RECEIPT_TARGET)
+            self.assertEqual(ready['receipt']['receipt_path'], cache.RECEIPT_TARGET)
+            self.assertEqual(ready['receipt']['receipt_storage'], 'docker-named-volume')
+            self.assertIsNone(ready['receipt']['host_receipt_path'])
+            self.assertEqual(sorted(Path(temporary).rglob('*')), before)
             self.assertFalse((Path(runroot)/cache.RECEIPT_NAME).exists())
-            with self.assertRaisesRegex(cache.BackendVolumeCacheError, 'storage contract'):
-                cache.validate(profile, volumes.documents, _maintenance_receipt(profile))
 
     def test_volume_receipt_cannot_escape_or_redirect_its_declared_location(self):
         with tempfile.TemporaryDirectory() as temporary:
-            profile, layout, source, repo, runroot = _profile(temporary)
-            for location in ('docker-volume://owned/../../other/cache.json', 'C:/host/receipt.json'):
-                with self.assertRaises(cache.BackendVolumeCacheError):
-                    cache.prepare(layout, repo, profile['runtime_image_id'], runroot,
-                        source_root=source, toolchain_image=profile['toolchain_image_id'], volume_receipt=location)
+            profile, *_ = _profile(temporary)
+            volumes = DockerVolumeFixture(profile, roles=cache.VOLUME_ROLES)
+            for location in ('docker-volume://owned/../../other/cache.json', 'C:/host/receipt.json',
+                             '/opt/fullmag/control/backend/../other.json',
+                             '/opt/fullmag/control/other.json'):
+                with self.subTest(location=location):
+                    with self.assertRaises(cache.BackendVolumeCacheError):
+                        cache.validate(profile, volumes.documents, _maintenance_receipt(profile),
+                                       receipt_path=location)
 
     def test_control_paths_cannot_address_host_or_parent_files(self):
-        for path in ('../active', '/control/active', 'a/../../active', 'C:/host/data', "a'; touch /bad"):
+        for path in ('../active', '/control/active', '/opt/fullmag/control/active', 'a/../../active', 'C:/host/data', "a'; touch /bad"):
             with self.assertRaises(BuildControlError):
                 BuildControl.path(path)
 

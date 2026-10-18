@@ -94,8 +94,8 @@ def bounded_capture(command, *, data=None, timeout=90, env=None, maximum=MAX_DOC
     return subprocess.CompletedProcess(command, process.returncode, bytes(buffers["stdout"]), bytes(buffers["stderr"]))
 
 
-def docker_capture(*args, data=None, timeout=90, allow_failure=False):
-    result = bounded_capture(["docker", "--context", "desktop-linux", *args], data=data, timeout=timeout)
+def docker_capture(*args, data=None, timeout=90, allow_failure=False, env=None):
+    result = bounded_capture(["docker", "--context", "desktop-linux", *args], data=data, timeout=timeout, env=env)
     if result.returncode and not allow_failure:
         raise BuildControlError(result.stderr.decode("utf-8", "replace").strip()
                                 or result.stdout.decode("utf-8", "replace").strip())
@@ -107,6 +107,15 @@ def compose_capture(document, *args, timeout=90):
                           *args, data=canonical(document), timeout=timeout).stdout
 
 
+def toolchain_configuration(repo, identity):
+    from bootstrap_docker_toolchain import _control_environment, toolchain_image_reference
+    environment = {**os.environ, **_control_environment(identity["project_name"]),
+                   "FULLMAG_TOOLCHAIN_IMAGE": toolchain_image_reference(identity["project_name"])}
+    return json.loads(docker_capture("compose", "--project-name", identity["project_name"],
+        "--project-directory", str(repo), "-f", str(Path(repo)/"compose.toolchain.yaml"),
+        "--profile", "toolchain", "config", "--format", "json", env=environment).stdout)
+
+
 class BuildControl:
     def __init__(self, identity, helper_image):
         self.identity = dict(identity)
@@ -116,13 +125,17 @@ class BuildControl:
         if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64}", helper_image):
             raise BuildControlError("Build control requires an immutable helper image")
         self.image = helper_image
-        key = hashlib.sha256(self.project.encode()).hexdigest()[:24]
-        self.volume = "fullmag-build-control-v1-" + key
+        from bootstrap_docker_toolchain import control_volume_name
+        self.volume = control_volume_name(self.project)
         self.labels = {
             "org.fullmag.build-control.schema": LABEL_SCHEMA,
             "org.fullmag.compose.project": self.project,
             "org.fullmag.source.worktree-id": identity["worktree_id"],
             "org.fullmag.build.role": "control",
+            "com.fullmag.compose.project": self.project,
+            "com.fullmag.toolchain.control.schema": "fullmag.docker-toolchain-control.v1",
+            "com.fullmag.toolchain.control.project": self.project,
+            "com.fullmag.toolchain.control.mount": "/opt/fullmag/control",
         }
 
     def prepare(self):
@@ -386,9 +399,7 @@ def build_volume_toolchain(repo):
     layout = storage.resolve_layout(repo, "docker-all-gpu")
     identity = compose_project_identity(layout)
     local_volume(repo)
-    configured = json.loads(docker_capture("compose", "--project-name", identity["project_name"],
-                         "--project-directory", str(repo), "-f", str(repo / "compose.toolchain.yaml"),
-                         "--profile", "toolchain", "config", "--format", "json").stdout)
+    configured = toolchain_configuration(repo, identity)
     service = configured["services"]["fem-gpu-toolchain"]
     build = service["build"]
     if (configured.get("name") != identity["project_name"]

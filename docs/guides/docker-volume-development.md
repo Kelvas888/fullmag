@@ -63,10 +63,10 @@ pakietu a gotowością API również przerywa obserwację.
 
 | Dane | Miejsce |
 | --- | --- |
-| Cargo/CMake, cień źródeł, log Make, CUDA cache, provenance | backend build named volume |
+| Cargo/CMake, cień źródeł, log Make, CUDA cache | backend build named volume |
 | Pakiet, kandydat, zweryfikowany rollback, archiwum metadanych | backend package named volume |
 | pnpm, Next, metadata workspace, next.log | frontend named volume |
-| Konfiguracje, receipty, manifesty, logi BuildKit i dowody kontroli | build-control named volume |
+| Konfiguracje, provenance, receipty, manifesty, logi BuildKit i dowody kontroli | build-control named volume |
 | Warstwy zależności/helperów | Docker image store / BuildKit |
 | Sesje, wyniki, ustawienia, historia, ledger | dotychczasowy Windows storage |
 

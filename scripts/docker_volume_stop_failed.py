@@ -49,7 +49,8 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
             or not isinstance(receipt.get('api_exit_code'),int) or receipt.get('runtime_pid') is not None
             or not receipt.get('error','').startswith('API binding did not become ready:')):
         raise BuildControlError('Failed admission is not proven; no process will be stopped')
-    config=json.loads(docker_capture('compose','--project-name',identity['project_name'],'-f',str(selected/'compose.toolchain.yaml'),'--profile','toolchain','config','--format','json').stdout)
+    from docker_build_control import toolchain_configuration
+    config=toolchain_configuration(selected,identity)
     control=BuildControl(identity,config['services']['fem-gpu-toolchain']['build']['args']['FULLMAG_CUDA_BASE_IMAGE'])
     journal={'schema':'fullmag.stop-failed-admission.v1','state':'stopping-confirmed-failed-supervisor',
              'container_id':args.container_id,'image_id':args.image_id,'failure_receipt':observed}

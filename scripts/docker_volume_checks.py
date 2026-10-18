@@ -15,10 +15,11 @@ def main():
     args = parser.parse_args()
     selected = args.source_root.resolve(strict=True)
     identity = compose_project_identity(storage.resolve_layout(selected, 'docker-all-gpu'))
-    raw = docker_capture('compose', '--project-name', identity['project_name'], '-f',
-        str(selected/'compose.toolchain.yaml'), '--profile', 'toolchain', 'config', '--format', 'json')
-    helper = json.loads(raw.stdout)['services']['fem-gpu-toolchain']['build']['args']['FULLMAG_CUDA_BASE_IMAGE']
+    from docker_build_control import toolchain_configuration
+    configured = toolchain_configuration(selected, identity)
+    helper = configured["services"]["fem-gpu-toolchain"]["build"]["args"]["FULLMAG_CUDA_BASE_IMAGE"]
     control = BuildControl(identity, helper)
+    control.prepare()
     ids = docker_capture('ps', '--quiet', '--no-trunc', '--filter', 'label=com.docker.compose.project='+control.project,
                          '--filter', 'label=com.docker.compose.service=backend').stdout.decode().split()
     if len(ids) != 1:
@@ -33,9 +34,9 @@ def main():
     script = '''import os, pathlib, subprocess, sys
 pathlib.Path('/build/verification-tmp').mkdir(exist_ok=True)
 environment = {key:value for key,value in os.environ.items() if not key.startswith('FULLMAG_')}
-environment.update(TMPDIR='/build/verification-tmp', PYTHONDONTWRITEBYTECODE='1', HOME='/build/verification-tmp/home')
+environment.update(TMPDIR='/build/verification-tmp', PYTHONDONTWRITEBYTECODE='1', HOME='/build/verification-tmp/home', USER='fullmag-checks', LOGNAME='fullmag-checks')
 pathlib.Path(environment['HOME']).mkdir(exist_ok=True)
-command=[sys.executable,'-B','-m','unittest','test_docker_backend_volume_cache','test_bootstrap_docker_toolchain','test_docker_compose_identity','test_docker_volume_receipts','test_docker_frontend_dev','test_docker_backend_dev','test_docker_startup_script']
+command=[sys.executable,'-B','-m','unittest','test_docker_backend_volume_cache','test_bootstrap_docker_toolchain','test_docker_compose_identity','test_docker_volume_receipts','test_docker_frontend_dev','test_docker_backend_dev','test_docker_startup_script','test_backend_volume_cache_maintenance','test_docker_cpu_access','test_docker_dev_storage','test_docker_dev_image_context','test_docker_dev_recreate','test_docker_frontend_cache','test_docker_frontend_cache_named_volume','test_fullmag_docker_runtime','test_docker_orphan_recovery','test_recover_docker_orphan']
 sys.exit(subprocess.call(command,cwd='/opt/fullmag/source/scripts',env=environment))
 '''
     result = docker_capture('exec', '--workdir', '/opt/fullmag/source/scripts', ids[0],

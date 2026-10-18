@@ -648,10 +648,10 @@ class DockerDevRecreateContract(unittest.TestCase):
             with patch.object(development_inputs, "select_checkout", return_value=source), \
                     patch.object(
                         development_inputs,
-                        "seed",
-                        side_effect=ValueError("Persistent frontend seed metadata was changed"),
+                        "describe",
+                        side_effect=ValueError("Frontend dependency identity could not be read"),
                     ):
-                with self.assertRaisesRegex(ValueError, "Persistent frontend seed metadata"):
+                with self.assertRaisesRegex(ValueError, "Frontend dependency identity"):
                     runtime._preflight_reuse_frontend_inputs(
                         Path("/repo"), reuse, source, 3197,
                     )
@@ -744,9 +744,9 @@ class DockerDevRecreateContract(unittest.TestCase):
                 "checkout_kind": "worktree",
             }
             source_bundle = {
-                "source_mode": "archive",
-                "manifest_path": str(source_manifest),
-                "archive_path": str(source_archive),
+                "source_mode": "live-shadow-v1",
+                "git_common_dir": str(root / "git-common"),
+                "source_commit": "a" * 40,
             }
             with patch.object(docker_dev, "_compose_identity", return_value=identity):
                 environment = docker_dev._environment(
@@ -757,18 +757,10 @@ class DockerDevRecreateContract(unittest.TestCase):
                     "fullmag/development-base:local", "backend-dev",
                 )
             expected_user_data = storage_root / "user-data" / identity["project_name"]
-            expected_scratch = run_root / "backend-build-state"
             self.assertEqual(Path(environment["FULLMAG_WORKSPACE_STATE_ROOT"]), expected_user_data)
-            self.assertEqual(Path(environment["FULLMAG_BACKEND_BUILD_STATE_ROOT"]), expected_scratch)
+            self.assertEqual(environment["FULLMAG_BACKEND_BUILD_STATE_ROOT"], "/build/.fullmag-build-state")
             self.assertTrue(expected_user_data.is_dir())
-            self.assertTrue(expected_scratch.is_dir())
-            for filename in ("compose.backend-build.yaml", "compose.backend-build-live.yaml"):
-                overlay = (Path(__file__).resolve().parents[1] / filename).read_text(encoding="utf-8")
-                self.assertIn("FULLMAG_WORKSPACE_STATE_ROOT", overlay)
-                self.assertIn("target: /user-data", overlay)
-                self.assertIn("read_only: true", overlay)
-                self.assertIn("FULLMAG_BACKEND_BUILD_STATE_ROOT", overlay)
-                self.assertIn("target: /state", overlay)
+            self.assertFalse((run_root / "backend-build-state").exists())
 
     def test_live_backend_environment_leaves_source_capture_to_guest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -819,8 +811,12 @@ class DockerDevRecreateContract(unittest.TestCase):
             run_root = root / "run"
             for path in (repo, selected, run_root):
                 path.mkdir()
+            (selected / "compose.dev.gpu.yaml").write_text(
+                "services:\n  backend:\n    gpus: all\n", encoding="utf-8"
+            )
             git_common_path = selected / ".git-common"
-            layout = {"repo_root": str(repo)}
+            layout = {"repo_root": str(repo), "storage_root": str(root / "storage")}
+            (root / "storage").mkdir()
             identity = {
                 "project_name": "fullmag-worktree-early-env",
                 "project_id": "project-test",
@@ -874,13 +870,16 @@ class DockerDevRecreateContract(unittest.TestCase):
                     patch.object(docker_dev, "_workspace_state_root", return_value=root / "user-data"), \
                     patch.object(docker_dev, "_backend_build_state_root", return_value=root / "build-state"), \
                     patch.object(docker_dev, "_source_git_common_directory", side_effect=resolve_git_common), \
+                    patch.object(storage, "git", return_value="a" * 40), \
                     patch.object(docker_dev, "_ensure_development_base", return_value=base_info) as base_mock, \
                     patch.object(docker_dev, "_runtime_image_reference", side_effect=runtime_image), \
                     patch.object(docker_dev, "_image_helper_inventory", return_value={}), \
                     patch.object(docker_dev, "_prepare_backend_cache", return_value=cache) as cache_mock, \
                     patch.object(docker_dev, "_backend_cache_package_root", return_value=Path("/mnt/fullmag-cache/package")), \
                     patch.object(docker_dev, "_environment", return_value={}), \
-                    patch.object(docker_dev, "_compose_config", return_value=compose_config) as compose_mock:
+                    patch.object(docker_dev, "_compose_config", return_value=compose_config) as compose_mock, \
+                    patch.object(docker_dev, "_write_control_json", return_value="/opt/fullmag/control/test.json"), \
+                    patch.object(docker_dev, "_write_control", return_value="/opt/fullmag/control/test.json"):
                 docker_dev._backend_start_inputs(args, run_root=run_root, run_id="e" * 32,
                                                  heavy_lock_held=True)
 
@@ -937,66 +936,17 @@ class DockerDevRecreateContract(unittest.TestCase):
             with self.assertRaisesRegex(docker_dev.DirectDockerError, "source labels"):
                 docker_dev._assert_no_running_fullmag(project, identity)
 
-    def test_up_passes_resolved_source_identity_to_both_network_fences(self):
-        repo = Path(__file__).resolve().parents[1]
-        selected = repo / "apps"
-        layout = {"repo_root": str(repo)}
-        identity = {
-            "project_name": "fullmag-worktree-network-test",
-            "network_name": "fullmag-worktree-network-test_fullmag",
-            "project_id": "project-test",
-            "worktree_id": "worktree-test",
-            "checkout_kind": "worktree",
-        }
-        args = types.SimpleNamespace(
-            repo_root=repo,
-            source_root=None,
-            port=3197,
-            script=None,
-        )
-        calls = []
-        events = []
-        backend_start = {"source_root": str(selected)}
-
-        class RecordingLease:
-            def __enter__(self):
-                events.append("lease-enter")
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                events.append("lease-exit")
-                return False
-
-        def prepare_backend(*_args, **kwargs):
-            events.append(("prepare", kwargs.get("heavy_lock_held")))
-            return backend_start, repo
-
-        def start_runtime(*_args, **_kwargs):
-            events.append("runtime-start")
-
-        with patch.object(docker_dev, "_require_native_windows"), \
-                patch.object(docker_dev, "_select_source", return_value=(selected, layout)), \
-                patch.object(docker_dev, "_compose_identity", return_value=identity), \
-                patch.object(docker_dev, "_assert_no_running_fullmag", side_effect=lambda *value: calls.append(value)), \
-                patch.object(docker_dev, "_direct_heavy_lock", return_value=RecordingLease()), \
-                patch.object(docker_dev, "_backend_start_inputs", side_effect=prepare_backend), \
-                patch.object(runtime, "assert_loopback_port_available"), \
-                patch.object(runtime, "start", side_effect=start_runtime) as start_mock:
+    def test_up_delegates_selected_arguments_to_volume_route(self):
+        args = types.SimpleNamespace(source_root=Path('/owned/checkout'), port=3197)
+        fake_volume = types.ModuleType('docker_volume_dev')
+        fake_volume.start = Mock()
+        with patch.dict(sys.modules, {'docker_volume_dev': fake_volume}), \
+                patch.object(docker_dev, '_backend_start_inputs') as prepare, \
+                patch.object(runtime, 'start') as legacy_start:
             docker_dev.up(args)
-        self.assertEqual(events, ["lease-enter", ("prepare", True), "lease-exit", "runtime-start"])
-        self.assertEqual(calls, [(identity["project_name"], identity),
-                                 (identity["project_name"], identity)])
-        start_mock.assert_called_once_with(
-            selected,
-            None,
-            args.port,
-            frontend="dev",
-            source_root=selected,
-            startup_script=None,
-            project_name=identity["project_name"],
-            compose_template=selected / docker_dev.COMPOSE_RUNTIME_FILE,
-            backend_start=backend_start,
-        )
+        fake_volume.start.assert_called_once_with(args)
+        prepare.assert_not_called()
+        legacy_start.assert_not_called()
 
     def test_backend_wait_does_not_accept_retained_receipt_on_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1098,21 +1048,20 @@ class DockerDevRecreateContract(unittest.TestCase):
 
     def test_backend_cache_package_root_is_the_attested_mount_child(self):
         with tempfile.TemporaryDirectory() as directory:
-            mount = Path(directory) / "ext4-cache"
-            package = mount / "package"
-            package.mkdir(parents=True)
+            mount = Path("/build")
+            package = Path("/opt/fullmag/package")
             cache = {
                 "mount_root": str(mount),
                 "package_root": str(package),
                 "environment": {"FULLMAG_BACKEND_PACKAGE": str(package)},
             }
             self.assertEqual(docker_dev._backend_cache_package_root(cache), package)
-            cache["environment"]["FULLMAG_BACKEND_PACKAGE"] = str(Path(directory) / "other")
+            cache["environment"]["FULLMAG_BACKEND_PACKAGE"] = "/opt/fullmag/other"
             with self.assertRaisesRegex(docker_dev.DirectDockerError, "package environment"):
                 docker_dev._backend_cache_package_root(cache)
-            cache["package_root"] = str(Path(directory) / "escape")
-            cache["environment"]["FULLMAG_BACKEND_PACKAGE"] = str(Path(directory) / "escape")
-            with self.assertRaisesRegex(docker_dev.DirectDockerError, "escapes"):
+            cache["package_root"] = "/opt/fullmag/escape"
+            cache["environment"]["FULLMAG_BACKEND_PACKAGE"] = "/opt/fullmag/escape"
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "v2 daemon package target"):
                 docker_dev._backend_cache_package_root(cache)
 
     def test_frontend_workspace_reuse_checks_dependency_bytes_without_reseeding(self):
@@ -1371,44 +1320,16 @@ class DockerDevRecreateContract(unittest.TestCase):
         )
         guard.assert_not_called()
 
-    def test_direct_recreate_passes_backend_start_without_legacy_assembly(self):
-        fake_runtime = types.ModuleType("fullmag_docker_runtime")
-        fake_runtime.start = Mock()
-        repo = Path(__file__).resolve().parents[1]
-        source = Path("/owned/checkout")
-        backend_start = {"schema": "backend-start-v1"}
-        args = types.SimpleNamespace(
-            repo_root=repo,
-            run_receipt=Path("/owned/receipt.json"),
-            assembly_receipt=None,
-            direct_development=True,
-            previous_config_sha256="e" * 64,
-            source_root=source,
-            port=3197,
-            script=None,
-            migrate_compose_project=False,
-            recover_idle_failure=None,
-        )
-        with patch.object(docker_dev, "_require_native_windows"), \
-                patch.object(docker_dev, "_assert_no_running_fullmag") as guard, \
-                patch.object(docker_dev, "_prepare_direct_recreate_backend_start",
-                             return_value=(source, backend_start)), \
-                patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
-            docker_dev.recreate(args)
-        fake_runtime.start.assert_called_once_with(
-            repo.resolve(),
-            None,
-            3197,
-            frontend="dev",
-            source_root=source,
-            startup_script=None,
-            project_name=None,
-            compose_template=repo.resolve() / docker_dev.COMPOSE_RUNTIME_FILE,
-            run_receipt=args.run_receipt,
-            previous_config_sha256=args.previous_config_sha256,
-            migrate_compose_project=False,
-            backend_start=backend_start,
-        )
+    def test_direct_recreate_rejects_host_receipt_before_preparing_or_starting(self):
+        args = types.SimpleNamespace(repo_root=Path(__file__).resolve().parents[1], direct_development=True)
+        with patch.object(docker_dev, '_require_native_windows'), \
+                patch.object(docker_dev, '_prepare_direct_recreate_backend_start') as prepare, \
+                patch.object(runtime, 'start') as start, \
+                patch.object(docker_dev, '_assert_no_running_fullmag') as guard:
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, 'Host-receipt DEV recreation is retired'):
+                docker_dev.recreate(args)
+        prepare.assert_not_called()
+        start.assert_not_called()
         guard.assert_not_called()
 
     def test_direct_recreate_rejects_legacy_assembly(self):
@@ -1432,7 +1353,7 @@ class DockerDevRecreateContract(unittest.TestCase):
                 patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
             with self.assertRaisesRegex(
                 docker_dev.DirectDockerError,
-                r"cannot be combined with --assembly-receipt",
+                r"Host-receipt DEV recreation is retired",
             ):
                 docker_dev.recreate(args)
         prepare.assert_not_called()
@@ -1459,7 +1380,7 @@ class DockerDevRecreateContract(unittest.TestCase):
                 patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
             with self.assertRaisesRegex(
                 docker_dev.DirectDockerError,
-                r"cannot be combined with --script",
+                r"Host-receipt DEV recreation is retired",
             ):
                 docker_dev.recreate(args)
         prepare.assert_not_called()
