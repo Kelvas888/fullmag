@@ -81,3 +81,22 @@ Nie uruchamiano buildów, cleanupu ani pomiaru daemona w ramach tego audytu.
 Pełne nazwy plików backend/frontend w tabeli są pod `docker/all-in-one/`;
 pozostałe launchery pod `scripts/`. Bieżące zasady retencji opisuje
 [kontrakt danych](artifact-policy.md).
+
+## Delta wdrożenia DEV
+
+Stan bazowy powyżej pozostaje historyczny. Bieżące writery zarządzanej trasy:
+
+| Writer | Zapisy po migracji |
+| --- | --- |
+| `docker_build_control.py::build_volume_toolchain`, `build_volume_runtime_images` | Kontekst allowlist bez hostowego stagingu; warstwy w BuildKit; logi, manifesty i receipty w build-control volume. |
+| `docker_volume_dev.py::start`, `_backend_cache`, `_frontend` | Overlaye i metadata w wolumenie kontrolnym; backend/cache/pakiety oraz frontend/pnpm/Next w named volumes. |
+| `backend_dev.py::_publish_runtime_provenance`, `_run_canonical_make` | `/build/provenance.json` i ograniczony log Make w build volume. |
+| `frontend_dev.py::_BoundedLog` | Ograniczony next.log w frontend volume; nadmiar w pierścieniu Docker local. |
+| `docker_volume_dev.py::_host_ledger`, `_finish` | Kopia helpera i logi/receipty utrzymania w control volume. Właściwy ledger oraz certyfikaty storage pozostają danymi runtime Windows. |
+| `setup_docker.py`, rejestr zadania `fullmag_storage.py::register` | Konfiguracja operatora i metadane własności worktree na hoście; nie są receiptem ani cache buildu. |
+
+Źródła i Git common pozostają readonly. Dozwolone writable binds aplikacji to
+`/state`, `/user-data`, `/host-ledger`. Kod launchera odrzuca pozostałe writable
+bindy, a obserwacja sprawdza także faktyczne typy, źródła i dostęp mountów.
+Odrębne recepty release/CI/naukowe z mapy bazowej nie zostały tą zmianą
+przekwalifikowane jako volume-only DEV.

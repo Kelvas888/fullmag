@@ -446,6 +446,20 @@ class FrontendDevContractTests(TestCase):
                     tailer.stop()
                 log_stream.close()
 
+    def test_child_log_is_bounded_and_full_log_blocks_next_start(self):
+        with isolated(self.module) as (root, _workspace, _inputs):
+            overflow = io.StringIO()
+            with patch.object(self.module, "MAX_LOG_BYTES", 128), redirect_stdout(overflow):
+                log = self.module._log_stream()
+                result = subprocess.run([sys.executable, "-B", "-c", "import sys;sys.stdout.buffer.write(b'q'*4096)"],
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=5)
+                log.close()
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(self.module.LOG_PATH.read_bytes(), b'q'*128)
+                self.assertIn('q'*128, overflow.getvalue())
+                with self.assertRaisesRegex(self.module.FrontendDevError, "log budget exhausted"):
+                    self.module._log_stream()
+
     @skipIf(os.name == "nt", "FIFO no-follow regression uses the Linux container filesystem")
     def test_log_tailer_rejects_fifo_without_blocking(self):
         with tempfile.TemporaryDirectory(prefix="fullmag-frontend-log-fifo-") as raw:

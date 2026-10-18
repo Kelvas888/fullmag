@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PosixPath
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +10,11 @@ import docker_compose_identity as identity
 import docker_dev
 import fullmag_docker_runtime as runtime
 import fullmag_storage as storage
+
+
+def _guard_identity(project):
+    return {"project_name": project, "network_name": identity.compose_network_name(project),
+            "project_id": "fullmag-test", "worktree_id": "wt", "checkout_kind": "worktree"}
 
 
 class ComposeProjectIdentityTests(unittest.TestCase):
@@ -189,7 +194,7 @@ class ComposeProjectIdentityTests(unittest.TestCase):
 
         with patch.object(docker_dev, "_docker_capture", side_effect=capture):
             with self.assertRaisesRegex(docker_dev.DirectDockerError, "running or stopped"):
-                runtime._assert_compose_project_absent(target)
+                runtime._assert_compose_project_absent(target, _guard_identity(target))
 
     def test_reuse_rejects_unrecognized_noncanonical_project(self):
         source = {
@@ -251,7 +256,9 @@ class ComposeProjectIdentityTests(unittest.TestCase):
             "State": "Listen",
         }
         result = type("Completed", (), {"returncode": 0, "stdout": json.dumps(listener), "stderr": ""})()
-        with patch.object(runtime.os, "name", "nt"), \
+        with patch.dict(runtime.os.environ, {"SystemRoot": "/windows"}), \
+                patch.object(runtime, "Path", PosixPath), \
+                patch.object(runtime.os, "name", "nt"), \
                 patch.object(runtime.subprocess, "run", return_value=result) as probe, \
                 patch.object(runtime, "docker") as docker:
             with self.assertRaisesRegex(ValueError, "native Windows"):
@@ -262,7 +269,9 @@ class ComposeProjectIdentityTests(unittest.TestCase):
 
     def test_native_windows_probe_failure_is_fail_closed(self):
         result = type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "probe unavailable"})()
-        with patch.object(runtime.os, "name", "nt"), \
+        with patch.dict(runtime.os.environ, {"SystemRoot": "/windows"}), \
+                patch.object(runtime, "Path", PosixPath), \
+                patch.object(runtime.os, "name", "nt"), \
                 patch.object(runtime.subprocess, "run", return_value=result), \
                 patch.object(runtime, "docker") as docker:
             with self.assertRaisesRegex(ValueError, "Could not inspect native Windows"):
@@ -293,7 +302,7 @@ class ComposeProjectIdentityTests(unittest.TestCase):
             raise AssertionError(args)
 
         with patch.object(docker_dev, "_docker_capture", side_effect=empty_capture) as capture:
-            docker_dev._assert_no_running_fullmag("fullmag-worktree-wt")
+            docker_dev._assert_no_running_fullmag("fullmag-worktree-wt", _guard_identity("fullmag-worktree-wt"))
         calls = [call.args for call in capture.call_args_list]
         self.assertIn(
             ("ps", "--all", "--quiet", "--filter",
@@ -316,12 +325,12 @@ class ComposeProjectIdentityTests(unittest.TestCase):
 
         with patch.object(docker_dev, "_docker_capture", side_effect=capture):
             with self.assertRaisesRegex(docker_dev.DirectDockerError, "running or stopped"):
-                docker_dev._assert_no_running_fullmag("fullmag-worktree-wt")
+                docker_dev._assert_no_running_fullmag("fullmag-worktree-wt", _guard_identity("fullmag-worktree-wt"))
 
     def test_guard_rejects_orphaned_project_network_identity(self):
         network = {
             "Name": "fullmag-worktree-wt_fullmag",
-            "Id": "network-id",
+            "Id": "network-id", "Driver": "bridge", "Scope": "local", "Containers": {},
             "Labels": {"org.fullmag.compose.project": "fullmag-worktree-wt"},
         }
 
@@ -335,13 +344,13 @@ class ComposeProjectIdentityTests(unittest.TestCase):
             raise AssertionError(args)
 
         with patch.object(docker_dev, "_docker_capture", side_effect=capture):
-            with self.assertRaisesRegex(docker_dev.DirectDockerError, "project network identity"):
-                docker_dev._assert_no_running_fullmag("fullmag-worktree-wt")
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "source labels"):
+                docker_dev._assert_no_running_fullmag("fullmag-worktree-wt", _guard_identity("fullmag-worktree-wt"))
 
     def test_guard_rejects_deterministic_network_name_without_labels(self):
         network = {
             "Name": "fullmag-worktree-wt_fullmag",
-            "Id": "network-id",
+            "Id": "network-id", "Driver": "bridge", "Scope": "local", "Containers": {},
             "Labels": {},
         }
 
@@ -355,8 +364,8 @@ class ComposeProjectIdentityTests(unittest.TestCase):
             raise AssertionError(args)
 
         with patch.object(docker_dev, "_docker_capture", side_effect=capture):
-            with self.assertRaisesRegex(docker_dev.DirectDockerError, "identity labels"):
-                docker_dev._assert_no_running_fullmag("fullmag-worktree-wt")
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "source labels"):
+                docker_dev._assert_no_running_fullmag("fullmag-worktree-wt", _guard_identity("fullmag-worktree-wt"))
 
     def test_compose_templates_keep_identity_labels_and_automatic_ipam(self):
         root = Path(__file__).resolve().parents[1]
@@ -366,7 +375,9 @@ class ComposeProjectIdentityTests(unittest.TestCase):
             self.assertIn("org.fullmag.source.worktree-id", text)
             self.assertIn("ipam:", text)
             self.assertIn("driver: default", text)
-            self.assertNotIn("external: true", text)
+            # Managed cache volumes are external; the isolated bridge is not.
+            networks = text.split("\nnetworks:\n", 1)[1].split("\nvolumes:\n", 1)[0]
+            self.assertNotIn("external: true", networks)
 
 
 if __name__ == "__main__":

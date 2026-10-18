@@ -64,6 +64,7 @@ class ToolchainBootstrapTests(unittest.TestCase):
             "FULLMAG_COMPOSE_PROJECT": project,
             "FULLMAG_BUILD_CONTROL_VOLUME": volume,
             "FULLMAG_CONTROL_ROOT": "/opt/fullmag/control",
+            "FULLMAG_TOOLCHAIN_IMAGE": bootstrap.toolchain_image_reference(project),
         })
         self.assertNotEqual(volume, bootstrap.control_volume_name("fullmag-master"))
 

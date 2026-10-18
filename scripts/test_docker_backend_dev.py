@@ -1,5 +1,5 @@
 """Interpreted package publication regressions; no native compilation."""
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
@@ -218,6 +218,16 @@ class BackendPackageTests(unittest.TestCase):
             "build": backend._expected_backend_build_identity("backend-dev"),
             "artifacts": records,
         }
+
+    def test_control_volume_provenance_can_be_published_without_a_host_bind(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            control = Path(temporary) / "backend"
+            with patch.object(backend, "BACKEND_CONTROL_ROOT", control):
+                path = control / "runtime-provenance.json"
+                backend._write_bound_json(path, {"state": "succeeded"}, "runtime provenance")
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"state": "succeeded"})
+                backend._write_bound_json(path, {"state": "replaced"}, "runtime provenance")
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"state": "replaced"})
 
     def test_live_source_copy_performs_one_verified_read(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -774,6 +784,32 @@ class BackendPackageTests(unittest.TestCase):
             finally:
                 backend.PACKAGE_ROOT = original_package_root
                 backend.PROVENANCE_PATH = original_provenance_path
+
+    def test_make_output_log_is_bounded_without_changing_command_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log_path = root / "build.log"
+            with patch.object(backend, "MAX_BUILD_LOG_BYTES", 128), redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                result = backend._run_canonical_make(
+                    [sys.executable, "-B", "-c", "import sys;sys.stdout.buffer.write(b'x'*4096)"],
+                    root, dict(os.environ), log_path)
+            self.assertEqual(result, 0)
+            self.assertEqual(log_path.read_bytes(), b'x'*128)
+
+    def test_retention_metadata_limit_preserves_all_existing_packages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package, control, _toolchain = self._rotated_package_fixture(Path(temporary), versions=3)
+            current = backend._validated_package(package, "current", exclude_development_control=True)
+            backups = control / backend.PACKAGE_BACKUPS_DIRNAME
+            before = {str(path.relative_to(backups)): path.read_bytes()
+                      for path in backups.rglob('*') if path.is_file()}
+            with patch.object(backend, "MAX_RETENTION_ARCHIVES", 0):
+                with self.assertRaisesRegex(backend.BackendBuildError, "metadata budget exhausted"):
+                    backend._retain_package_backups(package, control, current[0], current[1])
+            after = {str(path.relative_to(backups)): path.read_bytes()
+                     for path in backups.rglob('*') if path.is_file()}
+            self.assertEqual(before, after)
+            self.assertEqual(current[1], backend._validated_package(package, "current", exclude_development_control=True)[1])
 
     def test_retention_keeps_direct_rollback_and_archives_verified_obsolete_chain(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -81,6 +81,8 @@ PACKAGE_DEVELOPMENT_OWNER = "owner.json"
 PACKAGE_CANDIDATES_DIRNAME = "candidates"
 PACKAGE_BACKUPS_DIRNAME = "backups"
 PACKAGE_RETENTION_ARCHIVE_DIRNAME = "retired"
+MAX_RETENTION_ARCHIVES = 64
+MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
 PACKAGE_CACHE_CONTROL_DIRNAME = "cache-maintenance"
 PACKAGE_CACHE_MARKER_NAME = ".fullmag-backend-cache-owner.json"
 PACKAGE_CACHE_READBACK_NAME = ".fullmag-backend-cache-readback"
@@ -2412,6 +2414,8 @@ def _archive_retired_backup(
             if digest != record.get("sha256") or metadata.st_size != record.get("size"):
                 _fail(f"backend package retention archive source differs: {backup.name}")
         return
+    if sum(1 for _ in archive_root.iterdir()) >= MAX_RETENTION_ARCHIVES:
+        _fail("backend retention metadata budget exhausted; preserve archives for explicit review")
     temporary = Path(
         tempfile.mkdtemp(prefix=f".{backup.name}.retention-", dir=archive_root)
     )
@@ -2644,6 +2648,8 @@ def _run_canonical_make(command: list[str], workspace: Path, environment: Mappin
     _log_phase("make", "start", target=command[-1])
     try:
         with log_path.open("wb") as log:
+            remaining_log_bytes = MAX_BUILD_LOG_BYTES
+            log_truncated = False
             process = subprocess.Popen(
                 command,
                 cwd=workspace,
@@ -2659,8 +2665,13 @@ def _run_canonical_make(command: list[str], workspace: Path, environment: Mappin
                     chunk = process.stdout.read(1024 * 1024)
                     if not chunk:
                         break
-                    log.write(chunk)
+                    log.write(chunk[:remaining_log_bytes])
+                    remaining_log_bytes -= min(len(chunk), remaining_log_bytes)
                     log.flush()
+                    if not remaining_log_bytes and not log_truncated:
+                        _log_phase("make-log", "bounded", byte_limit=MAX_BUILD_LOG_BYTES,
+                                   overflow="docker-local-log-ring")
+                        log_truncated = True
                     _write_console_chunk(chunk)
             return_code = process.wait()
             _log_phase(
@@ -2904,6 +2915,9 @@ def _write_bound_bytes(path: Path, data: bytes, name: str) -> None:
     _assert_no_links(path.parent, f"{name} parent")
     if path.is_symlink():
         _fail(f"{name} must not be a symlink")
+    if path in {Path("/build/provenance.json"), BACKEND_CONTROL_ROOT / "runtime-provenance.json"}:
+        _write_json(path, json.loads(data), name)
+        return
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         descriptor = os.open(path, flags)
