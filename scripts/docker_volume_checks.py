@@ -36,7 +36,7 @@ pathlib.Path('/build/verification-tmp').mkdir(exist_ok=True)
 environment = {key:value for key,value in os.environ.items() if not key.startswith('FULLMAG_')}
 environment.update(TMPDIR='/build/verification-tmp', PYTHONDONTWRITEBYTECODE='1', HOME='/build/verification-tmp/home', USER='fullmag-checks', LOGNAME='fullmag-checks')
 pathlib.Path(environment['HOME']).mkdir(exist_ok=True)
-command=[sys.executable,'-B','-m','unittest','test_docker_backend_volume_cache','test_bootstrap_docker_toolchain','test_docker_compose_identity','test_docker_volume_receipts','test_docker_frontend_dev','test_docker_backend_dev','test_docker_startup_script','test_backend_volume_cache_maintenance','test_docker_cpu_access','test_docker_dev_storage','test_docker_dev_image_context','test_docker_dev_recreate','test_docker_frontend_cache','test_docker_frontend_cache_named_volume','test_fullmag_docker_runtime','test_docker_orphan_recovery','test_recover_docker_orphan']
+command=[sys.executable,'-B','-m','unittest','test_docker_backend_volume_cache','test_bootstrap_docker_toolchain','test_docker_compose_identity','test_docker_volume_receipts','test_docker_frontend_dev','test_docker_backend_dev','test_docker_startup_script','test_backend_volume_cache_maintenance','test_docker_cpu_access','test_docker_dev_storage','test_docker_dev_image_context','test_docker_dev_recreate','test_docker_frontend_cache','test_docker_frontend_cache_named_volume','test_fullmag_docker_runtime','test_docker_orphan_recovery','test_recover_docker_orphan','test_just_orphan_recovery_shell']
 sys.exit(subprocess.call(command,cwd='/opt/fullmag/source/scripts',env=environment))
 '''
     result = docker_capture('exec', '--workdir', '/opt/fullmag/source/scripts', ids[0],

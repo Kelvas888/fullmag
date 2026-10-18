@@ -72,6 +72,9 @@ pakietu a gotowością API również przerywa obserwację.
 
 Źródła są readonly. Krótkie helpery utrzymania należą do tej samej grupy;
 nie budują ani nie uruchamiają aplikacji i nie mają Docker socketu.
+Helper utrzymania cache ma wyłącznie `CHOWN` i `DAC_OVERRIDE`, aby inicjalizować
+markery również w katalogach należących do UID backendu; widzi tylko trzy
+zweryfikowane named volumes, bez sieci, writable rootfs ani bindów hosta.
 
 Przed operacją launcher mierzy wolne miejsce w VM oraz na fizycznym wolumenie
 Windows pod rozwiązanym katalogiem danych Docker Desktop. Obecny próg odmowy

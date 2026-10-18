@@ -102,6 +102,22 @@ class VolumeReceiptTests(unittest.TestCase):
                 dev._assert_private_restart_network(actual, ids, 'owned')
         inspect.assert_not_called()
 
+    def test_build_control_accepts_canonical_bootstrap_labels_and_rejects_foreign_project(self):
+        identity = {'project_name': 'fullmag-master', 'worktree_id': 'test-worktree'}
+        control = BuildControl(identity, 'sha256:' + 'a' * 64)
+        volume = {'Name': control.volume, 'Driver': 'local', 'Options': None,
+                  'Labels': dict(control.shared_labels)}
+        import json
+        from subprocess import CompletedProcess
+        with mock.patch('docker_build_control.docker_capture', return_value=CompletedProcess([], 0, json.dumps([volume]).encode(), b'')), \
+             mock.patch('docker_build_control.bounded_capture', return_value=CompletedProcess([], 0, b'', b'')), \
+             mock.patch.object(control, 'space', return_value={'available_bytes': 100 * 1024**3}):
+            self.assertEqual(control.prepare(), volume)
+            volume['Labels']['com.fullmag.compose.project'] = 'fullmag-other'
+        with mock.patch('docker_build_control.docker_capture', return_value=CompletedProcess([], 0, json.dumps([volume]).encode(), b'')):
+            with self.assertRaisesRegex(BuildControlError, 'ownership'):
+                control.prepare()
+
     def test_control_output_and_input_are_bounded_without_host_files(self):
         result = bounded_capture([sys.executable, '-B', '-c', 'import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())'], data=b'expected', maximum=128)
         self.assertEqual(result.stdout, b'expected')

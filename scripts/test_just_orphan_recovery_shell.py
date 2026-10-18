@@ -98,17 +98,13 @@ class DockerDevelopmentShellBoundaryTests(unittest.TestCase):
                 f"--previous-config-sha256 '{'a' * 64}'{optional_source} --port '3197'"
                 f'{suffix}')
 
-    def test_dispatches_controlled_recreate_recipe(self):
+    def test_rejects_retired_host_receipt_recreate_recipe(self):
         for recipe in (self.recipe(), self.recipe(source_root='/selected/worktree')):
             with self.subTest(recipe=recipe):
                 result = self.dispatch(recipe)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                arguments = json.loads(result.stdout)
-                self.assertEqual(arguments[:10], [
-                    'run', '--repo-root', '/registered/checkout', '--profile',
-                    'docker-all-gpu', '--', '/bin/bash', '-euo', 'pipefail', '-c',
-                ])
-                self.assertEqual(arguments[10], recipe)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('host-receipt DEV recreation is retired', result.stderr)
+                self.assertFalse(result.stdout.strip())
 
     def test_rejects_unbound_recreate_variants(self):
         for recipe in (

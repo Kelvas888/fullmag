@@ -358,7 +358,7 @@ class BackendVolumeCacheTests(unittest.TestCase):
             maintenance = maintenance_overlay["services"][cache.MAINTENANCE_SERVICE]
             self.assertEqual(maintenance["network_mode"], "none")
             self.assertEqual(maintenance["cap_drop"], ["ALL"])
-            self.assertEqual(maintenance["cap_add"], ["CHOWN"])
+            self.assertEqual(maintenance["cap_add"], ["CHOWN", "DAC_OVERRIDE"])
             self.assertNotIn("gpus", maintenance)
             self.assertEqual(maintenance["volumes"], cache.mount_specs(profile))
             bad = json.loads(json.dumps(maintenance_overlay))

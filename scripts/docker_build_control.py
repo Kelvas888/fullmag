@@ -138,6 +138,12 @@ class BuildControl:
             "com.fullmag.toolchain.control.mount": "/opt/fullmag/control",
         }
 
+    @property
+    def shared_labels(self):
+        # Master bootstrap owns this shared volume; optional launcher labels
+        # must not invalidate an existing canonical volume.
+        return {key: value for key, value in self.labels.items() if key.startswith("com.fullmag.")}
+
     def prepare(self):
         observed = docker_capture("volume", "inspect", self.volume, allow_failure=True)
         if observed.returncode:
@@ -157,7 +163,7 @@ class BuildControl:
         volume = documents[0]
         if (volume.get("Name") != self.volume or volume.get("Driver") != "local"
                 or volume.get("Options") or any((volume.get("Labels") or {}).get(k) != v
-                                                for k, v in self.labels.items())):
+                                                for k, v in self.shared_labels.items())):
             raise BuildControlError("Control volume ownership/driver differs; existing data retained")
         initialize = "test $(stat -c %u /control) = 0 -o $(stat -c %u /control) = 65532; chown 65532:65532 /control; chmod 0750 /control"
         result = bounded_capture(self.helper_args(initialize, initialize=True), data=b"", timeout=90)
@@ -201,7 +207,8 @@ class BuildControl:
             raise BuildControlError("Measurement requires an exact local named volume")
         labels = observed[0].get("Labels") or {}
         if (labels.get("org.fullmag.compose.project") != self.project
-                and labels.get("com.fullmag.backend-cache.worktree-id") != self.identity["worktree_id"]):
+                and labels.get("com.fullmag.backend-cache.worktree-id") != self.identity["worktree_id"]
+                and not (name == self.volume and all(labels.get(k) == v for k, v in self.shared_labels.items()))):
             raise BuildControlError("Measurement volume belongs to another source group")
         args = self.helper_args("du -x -sk /measure")
         args[args.index("--entrypoint"):args.index("--entrypoint")] = ["--mount",
