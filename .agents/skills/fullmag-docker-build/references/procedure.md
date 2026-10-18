@@ -143,6 +143,11 @@ implementacji także edycja frontendu może ominąć pakietowy fast path, choć 
 zmienia natywnego dirty digestu. Nie osłabiaj provenance dla szybszego startu;
 oddzielną optymalizację uzasadnij pomiarem i testem.
 
+Bieżące recepty volume DEV oraz dokładny format restartu i odtworzenia opisuje
+[przewodnik operacyjny](../../../../docs/guides/docker-volume-development.md).
+Nie używaj wycofanej komendy `docker-dev-recreate` z hostowym receiptem dla tej
+trasy. Nowa próba przechowuje konfigurację i wynik w wolumenie kontrolnym.
+
 ## 4. Miejsce i retencja
 
 Stosuj [kontrakt danych builda](artifact-policy.md): mapa writerów, ograniczenie

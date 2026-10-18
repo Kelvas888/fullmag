@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import sys
+import importlib.util
 from unittest import mock
 
 import docker_backend_volume_cache as cache
@@ -11,6 +12,87 @@ from docker_build_control import BuildControl, BuildControlError, ControlOutcome
 
 
 class VolumeReceiptTests(unittest.TestCase):
+    def test_runtime_supervisor_accepts_only_the_two_fixed_provenance_locations(self):
+        path = Path(__file__).resolve().parents[1] / 'docker/all-in-one/runtime_service.py'
+        spec = importlib.util.spec_from_file_location('volume_runtime_paths_test', path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        self.assertEqual(module.canonical_paths({}).provenance, Path('/opt/fullmag/provenance.json'))
+        self.assertEqual(module.canonical_paths({'FULLMAG_PACKAGE_PROVENANCE':'/build/provenance.json'}).provenance,
+                         Path('/build/provenance.json'))
+        with self.assertRaises(module.RuntimeServiceError):
+            module.canonical_paths({'FULLMAG_PACKAGE_PROVENANCE':'/state/user-data.json'})
+
+    def test_previous_package_is_ignored_until_current_start_handoff(self):
+        import json
+        import subprocess
+        import docker_volume_dev as dev
+        operation = {'receipt': {}, 'root': 'test'}
+        control = mock.Mock()
+        started = json.dumps([{'State': {'Running': True, 'StartedAt': 'current'}}])
+        observations = iter([started, 'building', started, 'phase=start state=cache-hit phase=start state=handoff'])
+        documents = {'receipt': {'value': {'state': 'succeeded'}, 'sha256': 'digest'},
+                     'provenance': {'value': {'state': 'succeeded', 'build_receipt_sha256': 'digest'}}}
+        with mock.patch.object(dev, 'docker_text', side_effect=lambda *a, **k: next(observations)), \
+             mock.patch.object(dev, 'docker_capture', return_value=subprocess.CompletedProcess([], 0, json.dumps(documents).encode(), b'')) as capture, \
+             mock.patch.object(dev.time, 'sleep', side_effect=lambda *_: self.assertEqual(capture.call_count, 0)):
+            receipt, provenance = dev._wait_for_publication(control, operation, 'backend')
+        self.assertEqual(capture.call_count, 1)
+        self.assertTrue(operation['receipt']['backend_package_cache_hit'])
+        self.assertEqual(provenance['build_receipt_sha256'], 'digest')
+
+    def test_publication_refuses_a_changed_backend_incarnation(self):
+        import json
+        import docker_volume_dev as dev
+        observations = iter([json.dumps([{'State': {'Running': True, 'StartedAt': 'first'}}]), 'building',
+                             json.dumps([{'State': {'Running': True, 'StartedAt': 'second'}}])])
+        with mock.patch.object(dev, 'docker_text', side_effect=lambda *a, **k: next(observations)), \
+             mock.patch.object(dev, 'docker_capture') as capture, mock.patch.object(dev.time, 'sleep'):
+            with self.assertRaisesRegex(BuildControlError, 'incarnation changed'):
+                dev._wait_for_publication(mock.Mock(), {'receipt': {}, 'root': 'test'}, 'backend')
+        capture.assert_not_called()
+
+    def test_retained_service_rejects_volume_or_command_drift_before_mutation(self):
+        import copy
+        import docker_volume_dev as dev
+        expected = {'environment': {'SOURCE': 'selected'}, 'labels': {'owner': 'task'},
+                    'volumes': [{'type': 'volume', 'source': 'build', 'target': '/build'}]}
+        document = {'services': {'backend': expected}, 'volumes': {'build': {'name': 'owned-build'}}}
+        image = {'Entrypoint': ['trusted-helper'], 'Cmd': ['serve']}
+        actual = {'Config': {'Env': ['SOURCE=selected'], 'Labels': {'owner': 'task'}, **image},
+                  'HostConfig': {'ReadonlyRootfs': True, 'Privileged': False, 'Tmpfs': {}},
+                  'Mounts': [{'Destination': '/build', 'Type': 'volume', 'RW': True, 'Name': 'owned-build'}]}
+        dev._validate_retained_service(document, actual, 'backend', image)
+        changed = copy.deepcopy(actual)
+        changed['Mounts'][0]['Name'] = 'foreign-build'
+        with self.assertRaisesRegex(BuildControlError, 'named-volume identity'):
+            dev._validate_retained_service(document, changed, 'backend', image)
+        changed = copy.deepcopy(actual)
+        changed['Config']['Entrypoint'] = ['foreign-command']
+        with self.assertRaisesRegex(BuildControlError, 'image command'):
+            dev._validate_retained_service(document, changed, 'backend', image)
+
+    def test_restart_refuses_public_backend_or_foreign_bridge_consumers(self):
+        import json
+        import docker_volume_dev as dev
+        ids = {'backend': 'backend-id', 'frontend': 'frontend-id'}
+        actual = {'backend': {'HostConfig': {'PortBindings': {}},
+                             'NetworkSettings': {'Networks': {'private': {}}}}}
+        network = [{'Driver': 'bridge', 'Labels': {'com.docker.compose.project': 'owned'},
+                    'Containers': {'backend-id': {}, 'frontend-id': {}}}]
+        with mock.patch.object(dev, 'docker_text', return_value=json.dumps(network)):
+            dev._assert_private_restart_network(actual, ids, 'owned')
+        network[0]['Containers']['foreign-id'] = {}
+        with mock.patch.object(dev, 'docker_text', return_value=json.dumps(network)):
+            with self.assertRaisesRegex(BuildControlError, 'unknown consumers'):
+                dev._assert_private_restart_network(actual, ids, 'owned')
+        actual['backend']['HostConfig']['PortBindings'] = {'8081/tcp': [{}]}
+        with mock.patch.object(dev, 'docker_text') as inspect:
+            with self.assertRaisesRegex(BuildControlError, 'unpublished private backend'):
+                dev._assert_private_restart_network(actual, ids, 'owned')
+        inspect.assert_not_called()
+
     def test_control_output_and_input_are_bounded_without_host_files(self):
         result = bounded_capture([sys.executable, '-B', '-c', 'import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())'], data=b'expected', maximum=128)
         self.assertEqual(result.stdout, b'expected')

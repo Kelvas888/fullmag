@@ -78,3 +78,30 @@ Manifest obejmuje 612 aktywnych deklaracji głównego pliku, jedną Windows-only
 i dwie deklaracje dodatkowego pliku (615 łącznie). Klasyfikacja rodzin jest
 orientacyjna; nie stanowi dowodu efektów wszystkich zależnych programów.
 Zmiana wrappera/resolvera może zmienić zapisy każdej recepty bez zmiany jej ciała.
+
+## Delta wdrożenia volume DEV
+
+Powyższy manifest i numery linii opisują stan bazowy. Po wdrożeniu migracji
+aktualny dump `just --dump --dump-format json` zawiera **619** aktywnych recept.
+Nie wykonano wszystkich recept; kwalifikacja runtime dotyczy jawnie opisanych
+prób DEV. Nie przenoś wyniku na release, CI, benchmarki ani kwalifikację naukową.
+
+Wejścia po zmianie:
+
+- `justfile`: `4d6b20206f98c0fc79915c811899febe7c70da608ba88c83e71a6d94e26a39c0`;
+- `scripts/just_storage_shell.sh`: `2aaef57f7cded6b4d293212cc313cc35b703dc6b1174d0eefa7b546decad9395`.
+
+Nowe/zmienione wejścia DEV: `docker-dev-toolchain`, `docker-dev-images`,
+`docker-dev`, `docker-dev-build`, `docker-dev-control-checks`, `docker-dev-resume`,
+`docker-dev-recreate-volume`, `docker-dev-restart-idle`, `docker-dev-stop-failed`.
+Bootstrap uruchamia `docker_build_control`; aplikacja używa `docker_volume_dev`.
+Wrapper przekazuje te ścisłe wzorce bez hostowego `storage.run`. Starszy
+`docker-dev-recreate` odmawia przed inicjalizacją hostowego logu/kontekstu.
+
+Przegląd diffu wrappera: nowe gałęzie dotyczą tylko wskazanych wejść; istniejący
+fallback i gałęzie innych rodzin nie zmieniły zachowania. Zmiana wspólnego pliku
+nie kwalifikuje pozostałych recept jako volume-only. Ich ograniczenia z audytu
+bazowego pozostają aktualne do osobnej weryfikacji.
+
+Dokładny format operacji i granic zapisu opisuje
+[przewodnik DEV](../../../../docs/guides/docker-volume-development.md).

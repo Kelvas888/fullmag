@@ -169,7 +169,7 @@ def _validate_reused_workspace(destination, inputs, old_inputs, *, generated_sou
         raise ValueError(f"Persistent frontend seed metadata was changed: {relative}")
 
 
-def seed(source, state, port, *, reuse_from=None):
+def seed(source, state, port, *, reuse_from=None, write_file=None):
     if os.name != "nt":
         raise ValueError("Live Docker development sources require native Windows preflight")
     source = source.resolve(strict=True)
@@ -214,10 +214,12 @@ def seed(source, state, port, *, reuse_from=None):
     dependency_entries = {}
     destination = storage.validate_path(state / "development/workspace", state,
                                         "isolated Docker frontend workspace")
+    if write_file is not None and reuse_from is not None:
+        raise ValueError("Volume seeding and host workspace reuse are separate contracts")
     if reuse_from is not None:
         if not destination.is_dir() or destination.is_symlink():
             raise ValueError("Persistent frontend workspace is missing or a reparse point")
-    else:
+    elif write_file is None:
         destination.mkdir(parents=True, exist_ok=False)
     for relative in sorted(relative_files, key=str):
         try:
@@ -230,7 +232,9 @@ def seed(source, state, port, *, reuse_from=None):
                 ) from error
             raise
         target = storage.validate_path(destination / relative, destination, "frontend metadata")
-        if reuse_from is None:
+        if write_file is not None:
+            write_file(relative.as_posix(), data)
+        elif reuse_from is None:
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("xb") as stream:
                 stream.write(data)

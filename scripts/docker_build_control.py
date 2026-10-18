@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -150,7 +151,7 @@ class BuildControl:
         if result.returncode:
             raise BuildControlError("Control-volume permission initialization failed: " + result.stderr.decode("utf-8", "replace"))
         space = self.space()
-        if space["available_bytes"] < MIN_FREE_BUILD_BYTES:
+        if min(space["available_bytes"], space.get("windows_backing_volume", {}).get("available_bytes", space["available_bytes"])) < MIN_FREE_BUILD_BYTES:
             raise BuildControlError("Docker build filesystem has less than 32 GiB free; existing data retained")
         return volume
 
@@ -161,11 +162,23 @@ class BuildControl:
         fields = result.stdout.decode("utf-8").strip().splitlines()[-1].split()
         if len(fields) < 6:
             raise BuildControlError("Docker filesystem measurement is incomplete")
-        return {"capacity_bytes": int(fields[-5]) * 1024,
-                "used_bytes": int(fields[-4]) * 1024,
-                "available_bytes": int(fields[-3]) * 1024,
-                "minimum_free_bytes": MIN_FREE_BUILD_BYTES,
-                "scope": "Docker VM filesystem; not a per-volume quota or Windows VHDX allocation"}
+        measurement = {"capacity_bytes": int(fields[-5]) * 1024,
+                       "used_bytes": int(fields[-4]) * 1024,
+                       "available_bytes": int(fields[-3]) * 1024,
+                       "minimum_free_bytes": MIN_FREE_BUILD_BYTES,
+                       "scope": "Docker VM filesystem; not a per-volume quota or Windows VHDX allocation"}
+        if os.name == "nt":
+            # Docker Desktop exposes its actual data disk here, including an
+            # operator-configured junction. Resolve it before measuring the
+            # backing Windows volume; sparse VHDX capacity is not host space.
+            data_disk = (Path(os.environ["LOCALAPPDATA"]) / "Docker/wsl/disk").resolve(strict=True)
+            from windows_folder_host import local_volume
+            native = local_volume(data_disk)
+            usage = shutil.disk_usage(data_disk)
+            measurement["windows_backing_volume"] = {"data_disk_root": str(data_disk),
+                "capacity_bytes": usage.total, "used_bytes": usage.used, "available_bytes": usage.free,
+                "filesystem": native["host_filesystem"], "volume_serial": native["host_volume_serial"]}
+        return measurement
 
     def volume_usage(self, name):
         if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", name):
@@ -284,7 +297,7 @@ class BuildControl:
                   f"until test -f '{path}/terminal.json'; do sleep 1; done; "
                   "rm /control/active; sync /control")
         space_before = self.space()
-        if space_before["available_bytes"] < MIN_FREE_BUILD_BYTES:
+        if min(space_before["available_bytes"], space_before.get("windows_backing_volume", {}).get("available_bytes", space_before["available_bytes"])) < MIN_FREE_BUILD_BYTES:
             raise BuildControlError("Docker build filesystem has less than 32 GiB free; admission refused")
         logger = subprocess.Popen(self.helper_args(script, name=name), stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -330,7 +343,7 @@ class BuildControl:
                 if logger.wait(timeout=30) != 0:
                     raise BuildControlError("Control lease finalization failed")
             summary = {key: receipt[key] for key in ("phase", "state", "attempt", "compose_project",
-                       "control_volume", "image_id", "cache_hit", "error") if key in receipt}
+                       "control_volume", "image_id", "cache_hit", "backend_package_cache_hit", "config_sha256", "url", "error") if key in receipt}
             print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
 
     def build(self, operation, document, service):

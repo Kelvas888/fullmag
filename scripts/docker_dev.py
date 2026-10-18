@@ -21,6 +21,7 @@ the live readonly source and rebuilds incrementally without a host ``up`` or
 from __future__ import annotations
 
 import argparse
+from docker_build_control import BuildControlError
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 import hashlib
@@ -2064,39 +2065,14 @@ def build(args: argparse.Namespace) -> None:
 
 
 def up(args: argparse.Namespace) -> None:
-    _require_native_windows()
-    repo = Path(args.repo_root).resolve(strict=True)
-    selected, layout = _select_source(repo, args.source_root)
-    source_identity = _compose_identity(layout)
-    compose_project = source_identity["project_name"]
-    _assert_no_running_fullmag(compose_project, source_identity)
-    from fullmag_docker_runtime import assert_loopback_port_available, start
-    assert_loopback_port_available(args.port, compose_project)
-    # The Windows heavy-build lease is intentionally limited to preparation of
-    # the image, toolchain, cache, and start receipt.  The fixed backend service
-    # compiles from its live readonly source after this context exits; its
-    # per-cache lease and terminal receipt govern that operation.  If Docker
-    # later reports an unknown result, leave the owned containers and receipt
-    # for explicit inspection instead of holding a host lease or retrying.
-    with _direct_heavy_lock(layout):
-        backend_start, _backend_input_root = _backend_start_inputs(
-            args, heavy_lock_held=True
-        )
-    _assert_no_running_fullmag(compose_project, source_identity)
-    # Keep startup_script opaque to this launcher.  The existing startup helper
-    # performs path admission, source containment, hash, and wait_for_solve
-    # policy checks against the same checkout.
-    start(
-        selected,
-        None,
-        args.port,
-        frontend="dev",
-        source_root=selected,
-        startup_script=args.script,
-        project_name=compose_project,
-        compose_template=selected / COMPOSE_RUNTIME_FILE,
-        backend_start=backend_start,
-    )
+    import fullmag_storage as storage
+    from docker_volume_dev import start
+    from docker_build_control import BuildControlError
+    try:
+        start(args)
+    except (BuildControlError, storage.StorageError, ValueError, OSError, subprocess.SubprocessError) as error:
+        raise _fail(str(error)) from error
+
 
 
 def recreate(args: argparse.Namespace) -> None:
@@ -2107,35 +2083,7 @@ def recreate(args: argparse.Namespace) -> None:
 
     direct_development = bool(getattr(args, "direct_development", False))
     if direct_development:
-        if args.assembly_receipt is not None:
-            raise _fail(
-                "--direct-development cannot be combined with --assembly-receipt"
-            )
-        if getattr(args, "script", None) is not None:
-            raise _fail(
-                "--direct-development cannot be combined with --script; "
-                "the existing startup activation is preserved"
-            )
-        if getattr(args, "recover_idle_failure", None) is not None:
-            raise _fail(
-                "--direct-development cannot be combined with --recover-idle-failure"
-            )
-        selected, backend_start = _prepare_direct_recreate_backend_start(args, repo)
-        start(
-            repo,
-            None,
-            args.port,
-            frontend="dev",
-            source_root=selected,
-            startup_script=None,
-            project_name=None,
-            compose_template=repo / COMPOSE_RUNTIME_FILE,
-            run_receipt=args.run_receipt,
-            previous_config_sha256=args.previous_config_sha256,
-            migrate_compose_project=getattr(args, "migrate_compose_project", False),
-            backend_start=backend_start,
-        )
-        return
+        raise _fail("Host-receipt DEV recreation is retired; use a Docker-volume attempt and docker-dev-resume")
     if args.assembly_receipt is None:
         raise _fail(
             "recreate requires --assembly-receipt unless --direct-development is selected"
@@ -2165,6 +2113,26 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=_repo_default(),
                         help="main Fullmag checkout used for storage and Compose definitions")
     subparsers = parser.add_subparsers(dest="action", required=True)
+    resume_parser = subparsers.add_parser("resume-volume", help="Observe one exact retained volume DEV start without restarting backend")
+    resume_parser.add_argument("--attempt", required=True)
+    resume_parser.add_argument("--config-sha256", required=True)
+    resume_parser.add_argument("--source-root", type=Path, required=True)
+    resume_parser.add_argument("--port", type=int, required=True)
+    resume_parser.add_argument("--restart-backend", action="store_true", help="Start the retained stopped backend; never stop an active service")
+    idle_restart = subparsers.add_parser("restart-idle-volume", help="Restart the pinned healthy backend only while no session is active")
+    idle_restart.add_argument("--attempt", required=True)
+    idle_restart.add_argument("--config-sha256", required=True)
+    idle_restart.add_argument("--source-root", type=Path, required=True)
+    idle_restart.add_argument("--port", type=int, required=True)
+    recreate_volume = subparsers.add_parser("recreate-volume", help="Replace exact stopped-backend DEV services while retaining Docker caches")
+    recreate_volume.add_argument("--attempt", required=True)
+    recreate_volume.add_argument("--config-sha256", required=True)
+    recreate_volume.add_argument("--source-root", type=Path, required=True)
+    recreate_volume.add_argument("--port", type=int, required=True)
+    recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the old Windows root and create a fresh one")
+    recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
+                                 include_untracked=[], script=None)
+
     for name in ("build", "up"):
         command = subparsers.add_parser(name, help=(
             "start the fixed backend and frontend services; backend builds in-place"
@@ -2252,6 +2220,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.action == "build":
             build(args)
+        elif args.action == "restart-idle-volume":
+            from docker_volume_dev import restart_idle
+            restart_idle(args)
+        elif args.action == "recreate-volume":
+            from docker_volume_dev import recreate as recreate_volume
+            recreate_volume(args)
+        elif args.action == "resume-volume":
+            from docker_volume_dev import resume
+            resume(args)
         elif args.action == "up":
             up(args)
         elif args.action == "recreate":
@@ -2259,7 +2236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             raise _fail(f"unsupported action: {args.action}")
         return 0
-    except DirectDockerError as error:
+    except (DirectDockerError, BuildControlError) as error:
         print(f"docker-dev: {error}", file=sys.stderr)
         return 2
 
