@@ -2,8 +2,10 @@
 """Interpreted admission and frozen-context regressions; no Docker build."""
 from pathlib import Path
 import io
+import copy
 import os
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -69,6 +71,47 @@ class ToolchainBootstrapTests(unittest.TestCase):
             "FULLMAG_CONTROL_ROOT": "/opt/fullmag/control",
         })
         self.assertNotEqual(volume, bootstrap.control_volume_name("fullmag-master"))
+
+    def test_control_io_supplies_all_required_compose_interpolation_inputs(self):
+        project = "fullmag-worktree-feature-abc123"
+        compose = (Path(__file__).resolve().parents[1] / "compose.toolchain.yaml").read_text()
+        required = set(re.findall(r"\$\{([A-Z_]+):\?", compose))
+        self.assertTrue(required)
+        with mock.patch.object(bootstrap, "docker", return_value="{}") as command:
+            bootstrap.read_control(self.repo, project, bootstrap.CONTROL_RECEIPT)
+            bootstrap.write_control(self.repo, project, bootstrap.CONTROL_RECEIPT, b"{}")
+        self.assertEqual(command.call_count, 2)
+        for call in command.call_args_list:
+            environment = call.kwargs["environment"]
+            self.assertFalse(required - environment.keys(),
+                             f"Compose helper lacks required inputs: {required - environment.keys()}")
+            self.assertEqual(environment["FULLMAG_COMPOSE_PROJECT"], project)
+            self.assertEqual(Path(environment["FULLMAG_TOOLCHAIN_CONTEXT"]), self.repo)
+            self.assertEqual(environment["FULLMAG_TOOLCHAIN_IMAGE"],
+                             bootstrap.toolchain_image_reference(project))
+
+    def test_normalized_compose_control_mount_resolves_logical_volume_key(self):
+        volume = bootstrap.control_volume_name("fullmag-worktree-feature-abc123")
+        configured = {
+            "volumes": {"toolchain-control": {"name": volume, "external": True}},
+            "services": {"toolchain-control": {"volumes": [{
+                "type": "volume", "source": "toolchain-control",
+                "target": "/opt/fullmag/control", "volume": {"nocopy": True},
+            }]}},
+        }
+        bootstrap._validate_control_mount(configured, volume)
+        for field, wrong in (("type", "bind"), ("source", volume),
+                             ("target", "/wrong"), ("read_only", True),
+                             ("volume", {"nocopy": False})):
+            invalid = copy.deepcopy(configured)
+            invalid["services"]["toolchain-control"]["volumes"][0][field] = wrong
+            with self.subTest(field=field), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._validate_control_mount(invalid, volume)
+        for field, wrong in (("name", "another-group"), ("external", False)):
+            invalid = copy.deepcopy(configured)
+            invalid["volumes"]["toolchain-control"][field] = wrong
+            with self.subTest(field=field), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._validate_control_mount(invalid, volume)
 
     def test_control_volume_rejects_local_driver_options_and_host_mountpoints(self):
         project = "fullmag-worktree-feature-abc123"

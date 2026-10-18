@@ -345,6 +345,33 @@ def _control_environment(project):
     }
 
 
+def _compose_environment(repo, project):
+    # Compose interpolates every service, including inactive profiles, before
+    # running the control helper. Receipt I/O needs the build inputs as well.
+    return {
+        **_control_environment(project),
+        "FULLMAG_TOOLCHAIN_CONTEXT": str(Path(repo).resolve(strict=True)),
+        "FULLMAG_TOOLCHAIN_IMAGE": toolchain_image_reference(project),
+    }
+
+
+
+def _validate_control_mount(configured, expected_volume):
+    declared = configured.get("volumes", {}).get("toolchain-control", {})
+    if declared.get("name") != expected_volume or declared.get("external") is not True:
+        raise BootstrapError("Toolchain control volume is not the selected external group volume")
+    mounts = configured.get("services", {}).get("toolchain-control", {}).get("volumes", [])
+    # Compose config retains the logical source key here. The engine volume
+    # name is resolved through the top-level declaration checked above.
+    if (len(mounts) != 1 or not isinstance(mounts[0], dict)
+            or mounts[0].get("type") != "volume"
+            or mounts[0].get("source") != "toolchain-control"
+            or mounts[0].get("target") != CONTROL_ROOT
+            or mounts[0].get("read_only", False)
+            or mounts[0].get("volume", {}).get("nocopy") is not True):
+        raise BootstrapError("Toolchain control helper lost its group volume mount")
+
+
 def ensure_control_volume(project):
     volume = control_volume_name(project)
     try:
@@ -406,7 +433,7 @@ def _control_command(repo, project, relative, *, read=False):
 def write_control(repo, project, relative, data):
     docker(
         *_control_command(repo, project, relative),
-        environment=_control_environment(project),
+        environment=_compose_environment(repo, project),
         input_data=data,
     )
 
@@ -414,7 +441,7 @@ def write_control(repo, project, relative, data):
 def read_control(repo, project, relative):
     return docker(
         *_control_command(repo, project, relative, read=True),
-        environment=_control_environment(project),
+        environment=_compose_environment(repo, project),
     ).encode("utf-8")
 
 
@@ -449,7 +476,6 @@ def build(repo, *, direct_development=False):
     initialize_host_storage(layout, local_volume)
     root = Path(layout["storage_root"])
     control_volume = ensure_control_volume(project_name)
-    control_environment = _control_environment(project_name)
     previous = None
     try:
         previous = json.loads(read_control(repo, project_name, CONTROL_RECEIPT))
@@ -472,11 +498,7 @@ def build(repo, *, direct_development=False):
             "--profile", "toolchain",
             "--profile", "toolchain-control",
         ]
-        compose_environment = {
-            **control_environment,
-            "FULLMAG_TOOLCHAIN_CONTEXT": str(repo),
-            "FULLMAG_TOOLCHAIN_IMAGE": toolchain_image_reference(project_name),
-        }
+        compose_environment = _compose_environment(repo, project_name)
         configured = json.loads(docker(
             *definitions, "config", "--format", "json", environment=compose_environment
         ))
@@ -484,17 +506,7 @@ def build(repo, *, direct_development=False):
             raise BootstrapError("Dependency Compose lost the selected checkout project")
         if set(configured.get("services", {})) != {SERVICE, "toolchain-control"}:
             raise BootstrapError("Unexpected dependency Compose services")
-        configured_volume = configured.get("volumes", {}).get("toolchain-control", {})
-        if (configured_volume.get("name") != control_volume
-                or configured_volume.get("external") is not True):
-            raise BootstrapError("Toolchain control volume is not the selected external group volume")
-        control_service = configured["services"]["toolchain-control"]
-        mounts = control_service.get("volumes", [])
-        if not any(isinstance(mount, dict)
-                   and mount.get("source") == control_volume
-                   and mount.get("target") == CONTROL_ROOT
-                   for mount in mounts):
-            raise BootstrapError("Toolchain control helper lost its group volume mount")
+        _validate_control_mount(configured, control_volume)
         service = configured["services"][SERVICE]
         build_definition = service.get("build", {})
         build_context = Path(build_definition.get("context", "")).resolve()
