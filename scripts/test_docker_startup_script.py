@@ -494,6 +494,7 @@ class StartupRejectionTests(unittest.TestCase):
                 recover_idle_failure=mock.Mock(return_value=None),
                 ensure_configuration=mock.Mock(return_value={}),
                 process_environment=mock.Mock(return_value={}),
+                process_receipt_path=mock.Mock(return_value=Path(directory) / "process-tree.json"),
                 start=mock.Mock(return_value=handle),
                 stop=mock.Mock(return_value={"state": "drained"}),
                 _atomic_json=lambda _path, value, _label: receipts.append(copy.deepcopy(value)),
