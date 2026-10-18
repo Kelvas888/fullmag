@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 import sys
 
@@ -182,6 +183,39 @@ class BackendVolumeCacheMaintenanceTests(unittest.TestCase):
                 ),
                 {},
             )
+
+    def test_control_children_are_created_before_parent_ownership_handoff(self):
+        # Emulate the missing DAC_OVERRIDE capability even on a test host
+        # where root has broader privileges or the test runs unprivileged.
+        opened = helper._open_child_directory
+        finalize = helper._finalize_guest_root
+        handed_off = set()
+
+        def identity(fd):
+            info = os.fstat(fd)
+            return info.st_dev, info.st_ino
+
+        def open_child(parent, name, uid, gid, label):
+            if identity(parent) in handed_off:
+                raise helper.MaintenanceError("parent was handed off before child creation")
+            descriptor = opened(parent, name, uid, gid, label)
+            handed_off.discard(identity(descriptor))
+            return descriptor
+
+        def handoff(directory, uid, gid):
+            finalize(directory, uid, gid)
+            handed_off.add(identity(directory))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            control = Path(temporary) / "control"
+            control.mkdir()
+            uid, gid = self._test_owner()
+            with mock.patch.object(helper, "_open_child_directory", side_effect=open_child), mock.patch.object(
+                helper, "_finalize_guest_root", side_effect=handoff
+            ):
+                for _ in range(2):
+                    helper._ensure_control_namespace(control, "control-test", uid, gid)
+            self.assertTrue((control / "runtime-control" / "runtime-services").is_dir())
 
     def test_legacy_package_pair_moves_without_copy_or_user_file_loss(self):
         with tempfile.TemporaryDirectory() as temporary:

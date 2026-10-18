@@ -655,8 +655,10 @@ def _ensure_control_subnamespace(
     control_volume_name: str,
     uid: int,
     gid: int,
+    *,
+    child_directories: tuple[tuple[str, str], ...] = (),
 ) -> tuple[bytes, int]:
-    """Provision one persistent control-volume subpath without replacing data."""
+    """Provision children before handing their parent to the backend owner."""
 
     directory = _open_child_directory(
         parent, name, uid, gid, f"{role} control namespace"
@@ -686,6 +688,15 @@ def _ensure_control_subnamespace(
         _probe_readback(
             directory, marker_raw, uid, gid, marker_name=CONTROL_MARKER_NAME
         )
+        # CAP_CHOWN does not bypass DAC. Once this parent belongs to the
+        # backend, root can no longer create children in its 0755 directory.
+        # Complete the fixed subtree while we still own the parent.
+        for child_name, child_label in child_directories:
+            child = _open_child_directory(directory, child_name, uid, gid, child_label)
+            try:
+                _finalize_guest_root(child, uid, gid)
+            finally:
+                os.close(child)
         _finalize_guest_root(directory, uid, gid)
         _fsync_directory_fd(parent, f"{role} control parent")
         return marker_raw, directory
@@ -749,19 +760,10 @@ def _ensure_control_namespace(
         os.close(frontend)
         runtime_marker_raw, runtime = _ensure_control_subnamespace(
             root, "runtime-control", "runtime-control", "runtime-control",
-            control_volume_name, uid, gid
+            control_volume_name, uid, gid,
+            child_directories=(("runtime-services", "native runtime-services store"),),
         )
-        try:
-            runtime_services = _open_child_directory(
-                runtime, "runtime-services", uid, gid, "native runtime-services store"
-            )
-            try:
-                _finalize_guest_root(runtime_services, uid, gid)
-                _fsync_directory_fd(runtime, "runtime-control namespace")
-            finally:
-                os.close(runtime_services)
-        finally:
-            os.close(runtime)
+        os.close(runtime)
         _fsync_directory_fd(root, "shared control root")
         return root_marker_raw, namespace_marker_raw
     finally:
