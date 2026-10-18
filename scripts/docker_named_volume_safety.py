@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import PurePosixPath
 from typing import Any, Mapping
 
@@ -51,7 +52,7 @@ def validate_local_named_volume(
     lowered = mountpoint_value.lower()
     if (
         "/run/desktop/mnt/host" in lowered
-        or "/mnt/" in lowered
+        or re.search(r"/mnt/[a-z](?:/|$)", lowered)
         or "/host_mnt/" in lowered
     ):
         raise DockerNamedVolumeSafetyError(

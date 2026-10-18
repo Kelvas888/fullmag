@@ -193,6 +193,29 @@ class FrontendNamedVolumeTests(unittest.TestCase):
                         docker, name=state_name, project_id=project_id, key=key
                     )
 
+    def test_prepare_accepts_docker_volume_root_under_non_windows_mnt_path(self) -> None:
+        project_id = "fullmag-worktree-demo"
+        key = "a" * 64
+        name = cache._v2_volume_name(project_id, key)
+        docker = FakeDocker()
+        docker.volumes[name] = {
+            "Name": name,
+            "Driver": "local",
+            "Scope": "local",
+            "Options": {},
+            "Mountpoint": f"/mnt/docker-data/volumes/{name}/_data",
+            "Labels": {
+                cache.VOLUME_SCHEMA_LABEL: cache.SCHEMA,
+                cache.VOLUME_PROFILE_LABEL: cache.PROFILE,
+                cache.VOLUME_PROJECT_LABEL: project_id,
+                cache.VOLUME_KEY_LABEL: key,
+            },
+        }
+        validated = cache._v2_ensure_volume(
+            docker, name=name, project_id=project_id, key=key
+        )
+        self.assertEqual(validated["name"], name)
+
     def test_prepare_rejects_control_volume_redirected_to_host_storage(self) -> None:
         name = "fullmag-worktree-demo-build-control-v1"
         for record in (
