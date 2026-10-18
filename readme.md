@@ -315,15 +315,40 @@ checkout uses Compose project `fullmag-master`; a registered worktree uses
 frontend reaches it as `backend:8081` over the private bridge network for the
 selected Compose project. Project name, network, port, workspace settings, and
 user data are derived per registered checkout, so a worktree does not share a
-frontend port or `workspace.db` with the main checkout. The launcher persists sessions,
-results, logs, receipts, and build/cache state under the configured storage
-resolver; group user data includes `storage/user-data/<compose-project>/workspace.db`.
+frontend port or `workspace.db` with the main checkout. Sessions, results,
+projects and settings remain in the configured Windows storage; group settings
+include `storage/user-data/<compose-project>/workspace.db`. Build cache,
+packages, build logs and technical receipts belong to Docker named volumes
+and BuildKit. Small runtime admission records and host-ledger evidence retain
+their explicit host-storage contract.
 
 Do not run a plain `docker compose up` for this workspace. The managed launcher
 attests the source bind, package and dependency identities, Windows storage,
 host ledger, owner record, startup response, and resolved Compose configuration
 before it starts the services. Keep the exact receipts and stop evidence when a
 start or build fails.
+
+### OpenAPI and TypeScript generation in development
+
+After both services are running with the current backend sources, use the
+selected checkout in native PowerShell:
+
+```powershell
+Set-Location $worktree
+just docker-dev-codegen "$worktree"
+# Equivalent daily-development recipe:
+just generate-api-openapi "$worktree"
+```
+
+The command uses the existing `backend` and `frontend` containers. Backend
+OpenAPI export, frontend generators and staging stay in their Docker volumes;
+only the four versioned API source artifacts are published to the checkout.
+It verifies source, container, image and volume identities before publication.
+Receipts stay in the group's control volume. It does not start services or
+rebuild stale backend sources: restart that group's backend first. The separate
+`generate-api-openapi-legacy` recipe is reserved for explicitly documented
+release/CI gates. This development route still requires runtime verification
+in addition to its source tests.
 
 ### Development and release inputs
 

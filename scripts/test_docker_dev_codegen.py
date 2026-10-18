@@ -233,29 +233,47 @@ class DockerDevCodegenTests(unittest.TestCase):
         }
         backend = {
             "Mounts": [
-                {"Destination": "/build", "Type": "volume", "RW": True, "Name": names["build"]},
-                {"Destination": "/opt/fullmag/package", "Type": "volume", "RW": True, "Name": names["package"]},
-                {"Destination": "/opt/fullmag/control", "Type": "volume", "RW": True, "Name": control},
-            ]
+                {"Destination": "/build", "Type": "volume", "RW": True, "Name": names["build"],
+                 "Source": f"/var/lib/docker/volumes/{names['build']}/_data"},
+                {"Destination": "/opt/fullmag/package", "Type": "volume", "RW": True, "Name": names["package"],
+                 "Source": f"/var/lib/docker/volumes/{names['package']}/_data"},
+                {"Destination": "/opt/fullmag/control", "Type": "volume", "RW": True, "Name": control,
+                 "Source": f"/var/lib/docker/volumes/{control}/_data"},
+            ],
+            "HostConfig": {"Mounts": [
+                {"Type": "volume", "Source": names["build"], "Target": "/build",
+                 "VolumeOptions": {"NoCopy": True}},
+                {"Type": "volume", "Source": names["package"], "Target": "/opt/fullmag/package",
+                 "VolumeOptions": {"NoCopy": True}},
+                {"Type": "volume", "Source": control, "Target": "/opt/fullmag/control",
+                 "VolumeOptions": {"NoCopy": True}},
+            ]},
         }
         frontend = {
             "Mounts": [
-                {"Destination": "/state/development", "Type": "volume", "RW": True, "Name": names["state"]},
+                {"Destination": "/state/development", "Type": "volume", "RW": True, "Name": names["state"],
+                 "Source": f"/var/lib/docker/volumes/{names['state']}/_data"},
                 {
                     "Destination": "/opt/fullmag/control",
                     "Type": "volume",
                     "RW": True,
                     "Name": control,
-                    "Subpath": "frontend",
+                    "Source": f"/var/lib/docker/volumes/{control}/_data",
                 },
-            ]
+            ],
+            "HostConfig": {"Mounts": [
+                {"Type": "volume", "Source": names["state"], "Target": "/state/development",
+                 "VolumeOptions": {"NoCopy": True}},
+                {"Type": "volume", "Source": control, "Target": "/opt/fullmag/control",
+                 "VolumeOptions": {"NoCopy": True, "Subpath": "frontend"}},
+            ]},
         }
         with mock.patch.object(codegen, "_inspect_named_volume", side_effect=lambda name: documents[name]):
             inspected = codegen._inspect_technical_volumes(project, backend, frontend)
         self.assertEqual(inspected["control_volume_name"], control)
         self.assertEqual(inspected["mounts"]["frontend"]["/opt/fullmag/control"]["subpath"], "frontend")
 
-        frontend["Mounts"][1].pop("Subpath")
+        frontend["HostConfig"]["Mounts"][1]["VolumeOptions"].pop("Subpath")
         with mock.patch.object(codegen, "_inspect_named_volume", side_effect=lambda name: documents[name]):
             with self.assertRaises(codegen.CodegenError):
                 codegen._inspect_technical_volumes(project, backend, frontend)

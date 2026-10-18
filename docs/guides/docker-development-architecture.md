@@ -468,6 +468,33 @@ Regresje kontraktu i adaptera nie zastępują wykonania tej procedury na żywo.
 Kwalifikacja runtime pozostaje **NOT VERIFIED**, dopóki nie ma dowodu
 zakończenia, zwolnienia dokładnej rezerwacji i poprawnego nowego startu.
 
+## Generowanie OpenAPI i klienta TypeScript
+
+Dla codziennego developmentu użyj w natywnym PowerShellu z wybranego checkoutu:
+
+```powershell
+just docker-dev-codegen "<wybrany-checkout>"
+# Równoważna recepta:
+just generate-api-openapi "<wybrany-checkout>"
+```
+
+Obie usługi tej grupy muszą już działać, a backend musi odpowiadać bieżącym
+źródłom. Polecenie nie buduje i nie uruchamia nowych kontenerów: eksportuje
+OpenAPI istniejącą binarką `backend`, a generatory uruchamia w `frontend`.
+Staging jest efemeryczny w jego wolumenie development; sukces zapisuje receipt
+pod `/opt/fullmag/control/backend/codegen/openapi-v2/`. Powtórzenie tych samych
+wejść używa tego samego klucza receiptu. Do checkoutu wracają wyłącznie cztery
+wersjonowane pliki API. Przed publikacją ponownie sprawdzane są źródła,
+kontenery, obrazy i backing wolumenów.
+
+Zmiana źródeł wymaga najpierw zwykłego restartu backendu tej grupy. Timeout
+klienta Docker nie dowodzi zakończenia zdalnego procesu generatora; receipt
+awarii zachowuje identyfikator stagingu i potrzebę uzgodnienia stanu zamiast
+usuwać potencjalnie używane dane. `generate-api-openapi-legacy` zachowuje
+odrębną trasę wyłącznie dla jawnych bramek release/CI. Nowa trasa ma regresje
+źródeł; jej rzeczywiste wykonanie w usługach pozostaje **NOT VERIFIED** do
+zakończenia odbioru runtime.
+
 ## Warunki odbioru
 
 Nowy wariant wymaga rzeczywistego potwierdzenia:

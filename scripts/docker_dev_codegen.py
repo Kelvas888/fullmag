@@ -552,7 +552,16 @@ def _service_identity(container: str, document: Mapping[str, Any]) -> dict[str, 
     return {"container_id": container, "image_id": image, "config_image": config_image}
 
 
-def _mount_subpath(mount: Mapping[str, Any]) -> str | None:
+def _mount_subpath(
+    document: Mapping[str, Any], mount: Mapping[str, Any], target: str
+) -> str | None:
+    """Read a volume subpath from either inspect representation.
+
+    Docker's top-level ``.Mounts`` normalizes a volume mount to its root
+    mountpoint and omits ``VolumeOptions.Subpath``.  The authoritative
+    subpath is retained in ``.HostConfig.Mounts`` and must be correlated to
+    the same target and named volume before it is accepted.
+    """
     for key in ("Subpath", "subpath"):
         value = mount.get(key)
         if value is not None:
@@ -563,7 +572,25 @@ def _mount_subpath(mount: Mapping[str, Any]) -> str | None:
             for nested in ("Subpath", "subpath"):
                 if value.get(nested) is not None:
                     return str(value[nested])
-    return None
+
+    host_config = document.get("HostConfig")
+    host_mounts = host_config.get("Mounts") if isinstance(host_config, Mapping) else None
+    if not isinstance(host_mounts, list):
+        return None
+    matches = [
+        item for item in host_mounts
+        if isinstance(item, Mapping) and item.get("Target") == target
+    ]
+    if len(matches) != 1:
+        return None
+    host_mount = matches[0]
+    if host_mount.get("Type") != "volume" or host_mount.get("Source") != mount.get("Name"):
+        return None
+    volume_options = host_mount.get("VolumeOptions")
+    if not isinstance(volume_options, Mapping):
+        return None
+    value = volume_options.get("Subpath")
+    return str(value) if isinstance(value, str) and value else None
 
 
 def _volume_name(mount: Mapping[str, Any], service: str, target: str) -> str:
@@ -610,7 +637,7 @@ def _inspect_technical_volumes(
             if name not in volume_documents:
                 volume_documents[name] = _inspect_named_volume(name)
             descriptor = volume_documents[name]
-            subpath = _mount_subpath(mount)
+            subpath = _mount_subpath(document, mount, target)
             if service == "frontend" and target == "/opt/fullmag/control":
                 source = mount.get("Source")
                 mountpoint = descriptor.get("Mountpoint")
