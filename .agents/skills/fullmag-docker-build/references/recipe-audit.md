@@ -11,6 +11,34 @@ Data audytu: 2026-10-18. Zakres: tylko odczyt worktree wybranego worktree zadani
 - Próbka bazowej gałęzi `codex/docker-cpu-startup-20261018` wskazuje commit `dc2bc2698e2c72d254bc8b3edd709c32441825cf`; blob bazowego `justfile` ma SHA256 `04591409a5439a39f47f415557b29cd096380d56ee9db173899da2aa9d658014`. Różnica względem bieżącego pliku ogranicza się do dopisania `gpu_access="auto"` oraz `--gpu-access` w receptach `docker-dev` (linia 32), `docker-dev-recreate` (37) i `docker-dev-build` (46). Obecne argumenty CPU w `windows-build` (389), `windows-test-fem` (403), `build` (440), `run-topological-charge-skyrmion-smoke` (790), receptach relaksacji (1026, 1372), oraz kwalifikacji FEM (1526, 3002) są obecne również w bazowym blobie i nie powinny być przypisywane temu dirty diffowi.
 - Tożsamość i dirty status potwierdził agent nadrzędny natywnym Git dla Windows. Odczyt WSL Git nie interpretuje Windowsowego wskaźnika worktree.
 
+## Aktualizacja aktywnej trasy Docker DEV — źródło `69bfd1c44`
+
+Powyższy inwentarz justfile jest audytem bazowym z 18.10.2026. Jego wiersze
+`Docker dev` i `Docker dev Compose` opisują stan sprzed migracji i nie są opisem
+bieżącego HEAD. Dla codziennego `live-shadow-v1` aktualny przegląd źródeł daje:
+
+- jedynym wejściem developerskim pozostaje `just docker-dev-toolchain`, a potem
+  `just docker-dev <checkout> <port>`; `just docker-dev-build` jest aliasem
+  startu usług (`up`), nie osobnym build-only;
+- backend i frontend należą do grupy Compose wybranego checkoutu. Źródła są
+  readonly bindami; backend build/package, frontend state/cache oraz control
+  receipts/logs mają przypięte wolumeny nazwane; BuildKit/obrazy pozostają po
+  stronie Docker Engine;
+- hostowy `storage` nadal obsługuje rejestr projektu/worktree, blokady, małe
+  wskaźniki/operatorowe receipty, run evidence i host-ledger oraz dane
+  użytkownika. To nie jest miejsce na Cargo/CMake/pnpm/Next, staging, konteksty,
+  pakiety ani logi buildu;
+- `docker-all-*`, runner/frozen/release oraz natywne `just`-recepty są osobnymi
+  trasami, nie domyślnym DEV i nie fallbackiem dla tej grupy;
+- brak automatycznego GC wolumenów i BuildKit oraz brak quota pozostają luką
+  retencji. Usunięcie kontenera nie usuwa nazwanych wolumenów ani warstw/cache.
+  Cold build, start, inspect mountów, cache-hit po restarcie i HMR pozostają
+  `NOT VERIFIED` bez dowodu z Docker Desktop.
+
+Tabela i hash justfile poniżej zachowują odtwarzalność pierwotnego audytu
+wszystkich 612 aktywnych recept. Przed użyciem innych rodzin niż codzienny DEV
+sprawdź ich bieżące źródła i platformową trasę; to PR nie migruje ich writerów.
+
 ## Granica wspólna dla recept
 
 `justfile:1-6` ustawia `bash scripts/just_storage_shell.sh` jako shell. Wrapper ma jawne dispatch dla bootstrapu/Docker dev (`scripts/just_storage_shell.sh:115-160`), legacy runtime (`187-201`), Windows (`228-247`), Control Room/OpenAPI (`249-280`), runnera/benchmarków (`409-470`) oraz helperów (`474-802`). Wyjątki od inicjalizacji storage są ograniczone do odczytów/list (`386-399`).

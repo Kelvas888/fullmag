@@ -46,6 +46,8 @@ docker-dev-recover-orphan pins target_container project diagnostics_root resume_
 docker-dev-build source_root="" gpu_access="auto":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" build --gpu-access {{quote(gpu_access)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
 
+# Legacy/frozen managed-runtime and release/qualification routes below.
+# They are separate from daily docker-dev and must never be its fallback.
 # Submit a clean commit to the shared runner using independent source copies.
 docker-all-build commit:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" submit --commit {{quote(commit)}}

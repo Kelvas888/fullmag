@@ -6,9 +6,35 @@ sprawdzono natywnym Git dla Windows; WSL Git nie interpretuje jego Windowsowego
 wskaźnika `.git`. Numery linii odnoszą się do tego odczytu. To mapa do ponownej
 weryfikacji przy zmianie kodu, nie dowód uruchomienia wszystkich tras.
 
-## Wynik
+## Aktualny daily `live-shadow-v1` — odczyt źródeł HEAD `69bfd1c44`
 
-Obecna ścieżka nie spełnia granicy „wszystkie dane budowania wyłącznie w Docker
+To źródłowy przegląd delty po migracji, a nie dowód runtime. W aktywnej grupie
+DEV backend `/build` i `/opt/fullmag/package`, frontend `/state/development`
+oraz control namespace używają nazwanych wolumenów. Buildujące konteksty,
+logi, receipt’y techniczne, provenance assembly i staging daily DEV zapisują
+się przez Docker control/package volumes albo BuildKit. Checkout pozostaje
+readonly dla kontenerów. Backend-volume helper i frontend cache v2 przypinają
+nazwy/labels do grupy i cache identity; normalny restart nie usuwa cache.
+
+Hostowy `storage` nadal ma operacyjne/runtime zapisy: marker projektu, worktree
+index i link registry, locki/owner oraz wymagane admission records; mały
+`runs/docker-dev/<run-id>` dla stanu i pointera operatora; certyfikat hosta,
+startup/recovery evidence oraz host-ledger; a także `user-data/<compose-project>`
+z sesjami, projektami, wynikami i ustawieniami. Te pliki wspierają ownership,
+przekazanie runtime lub dane użytkownika; nie są cache kompilacji. Weryfikuj
+rzeczywiste nazwy i mounty przy zmianie launchera.
+
+Migracja **nie implementuje** automatycznego usuwania starych wersji named
+volumes, obrazów ani BuildKit cache i nie ustala quota. Wolumeny `external`
+przeżywają odtworzenie/usunięcie kontenera. Nie używaj `compose down -v` jako
+zamiennika bezpiecznego cleanupu. Kontrolowana retencja grupy to osobny zakres;
+bez niej nie twierdź, że całe zużycie dysku jest ograniczone. Aktywny Docker
+Desktop cold build/start, inspect, incremental cache-hit, HMR, run `.py` i GC
+pozostają `NOT VERIFIED`.
+
+## Wynik bazowego odczytu
+
+Wersja źródeł z tego bazowego odczytu nie spełniała granicy „wszystkie dane budowania wyłącznie w Docker
 named volumes/BuildKit, dane użytkownika runtime na Windows”. Backend v2 ma
 prawidłową parę named volumes dla `/build` i `/opt/fullmag/package`, a właściwy
 `backend_dev.py` zapisuje cień źródeł, Cargo/CMake, staging i pakiet w tych
@@ -32,7 +58,7 @@ BuildKit, więc sam PASS takiego audytu jest tylko częściowy.
 
 ## Mapa writerów i trwałości
 
-| Artefakt | Writer i dowód w źródle | Obecna lokalizacja | Trwałość, duplikacja, ocena |
+| Artefakt | Writer i dowód w źródle | Lokalizacja w bazowym odczycie | Trwałość, duplikacja, ocena |
 |---|---|---|---|
 | Checkout/Git | `compose.dev.yaml:67-80` montuje wybrany checkout i Git common readonly | Windows checkout → `/opt/fullmag/source`, `/opt/fullmag/source-git` | To wejście, nie artefakt buildu. Jedna kopia źródła jest prawidłowa. |
 | Cień backendu | `backend_dev.py:921-1024` synchronizuje `/build/workspace` i usuwa wyłącznie nieaktualne pliki źródłowe | Named volume `/build` | Prawidłowa lokalizacja. Cache `.fullmag-build`, `.fullmag-cargo`, `.fullmag-rustup`, Cargo/CMake i `TMPDIR` są ustawiane pod `/build` (`backend_dev.py:1636-1705`). |
