@@ -74,6 +74,9 @@ PACKAGE_DEVELOPMENT_OWNER = "owner.json"
 PACKAGE_CANDIDATES_DIRNAME = "candidates"
 PACKAGE_BACKUPS_DIRNAME = "backups"
 PACKAGE_RETENTION_ARCHIVE_DIRNAME = "retired"
+PACKAGE_CACHE_CONTROL_DIRNAME = "cache-maintenance"
+PACKAGE_CACHE_MARKER_NAME = ".fullmag-backend-cache-owner.json"
+PACKAGE_CACHE_READBACK_NAME = ".fullmag-backend-cache-readback"
 PACKAGE_RETENTION_SCHEMA = "fullmag.direct-compose.package-retention.v1"
 OWNER_MARKER = ".fullmag-direct-backend-owner.json"
 WORKSPACE_INVENTORY_SCHEMA = "fullmag.direct-compose.workspace-inventory.v1"
@@ -446,11 +449,13 @@ def _ensure_package_development_root(output: Path) -> Path:
     candidates = control / PACKAGE_CANDIDATES_DIRNAME
     backups = control / PACKAGE_BACKUPS_DIRNAME
     retired = control / PACKAGE_RETENTION_ARCHIVE_DIRNAME
+    cache_control = control / PACKAGE_CACHE_CONTROL_DIRNAME
     allowed = {
         PACKAGE_DEVELOPMENT_OWNER,
         PACKAGE_CANDIDATES_DIRNAME,
         PACKAGE_BACKUPS_DIRNAME,
         PACKAGE_RETENTION_ARCHIVE_DIRNAME,
+        PACKAGE_CACHE_CONTROL_DIRNAME,
     }
     try:
         entries = tuple(control.iterdir())
@@ -462,6 +467,26 @@ def _ensure_package_development_root(output: Path) -> Path:
         metadata = entry.lstat()
         if stat.S_ISLNK(metadata.st_mode):
             _fail(f"backend package development control contains a symlink: {entry.name}")
+    _ensure_directory(cache_control, "backend cache maintenance control directory")
+    try:
+        cache_entries = tuple(cache_control.iterdir())
+    except OSError as error:
+        _fail(f"cannot inspect backend cache maintenance control directory: {error}")
+    cache_allowed = {PACKAGE_CACHE_MARKER_NAME, PACKAGE_CACHE_READBACK_NAME}
+    cache_names = {entry.name for entry in cache_entries}
+    if not cache_names.issubset(cache_allowed) or cache_names not in (
+        set(),
+        cache_allowed,
+    ):
+        _fail("backend cache maintenance control has an incomplete or unknown record pair")
+    for entry in cache_entries:
+        metadata = entry.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            _fail("backend cache maintenance control contains an unsafe record")
     if owner.exists():
         metadata = owner.lstat()
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
@@ -476,7 +501,7 @@ def _ensure_package_development_root(output: Path) -> Path:
         ):
             _fail("backend package development owner marker does not match this mount")
     else:
-        if entries:
+        if entries and set(entry.name for entry in entries) != {PACKAGE_CACHE_CONTROL_DIRNAME}:
             _fail("backend package development owner marker is missing")
         _write_json(
             owner,
