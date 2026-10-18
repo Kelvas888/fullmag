@@ -50,12 +50,14 @@ kontenerem budującym a runtime. Przygotowanie przypiętego obrazu toolchaina
 oraz krótkie narzędzia sprawdzające storage są osobnymi operacjami utrzymania,
 a nie dodatkowymi usługami aplikacji.
 
-Obecny adapter cache v1 używa pliku ext4 na Windows dostępnym przez 9p;
-nie jest to jeszcze docelowy storage dla szybkich iteracji. Profil v2 opisany
-w ADR 0061 wprowadza jawną parę prywatnych wolumenów Linux Dockera pod `/build`
-i `/opt/fullmag/package`. Integracja i pomiary v2 pozostają **NOT VERIFIED**.
+Backend DEV używa profilu v2 opisanego w ADR 0061: jawnej pary prywatnych
+wolumenów Linux Dockera pod `/build` i `/opt/fullmag/package`. Przygotowanie
+wolumenów i migracja technicznych markerów mają dowód wykonania; cold build,
+API oraz pomiary restartu i kompilacji przyrostowej pozostają **NOT VERIFIED**.
+Stary backendowy cache v1 zachowujemy do osobnej kontroli użycia i rollbacku.
+Frontend nadal używa własnego cache v1: pliku ext4 o rozmiarze 8 GiB na Windows.
 Sesje, wyniki i ustawienia grupy zachowują opisane niżej katalogi Windows.
-Nie usuwaj ani nie przenoś aktywnego cache v1 ręcznie.
+Nie usuwaj ani nie przenoś aktywnego cache ręcznie.
 
 Cache Cargo i osobne katalogi CMake FDM/FEM leżą na trwałym ext4 przypisanym do
 checkoutu/profilu. Nie zależą od UUID kolejnego uruchomienia. Niezmienione pliki
@@ -113,6 +115,14 @@ Toolchain przygotowuje się przy pierwszym użyciu lub zmianie przypiętych
 zależności. Start uruchamia dwie stałe usługi; backend wykonuje swój build
 przed API. Otwórz `http://127.0.0.1:3197/workspace`. Brak `--script` oznacza Home,
 a nie automatyczny wybór dawnej sesji.
+
+Na Windows utworzenie nowego cache frontendu wymaga co najmniej 16 GiB wolnego
+miejsca na dysku storage: 8 GiB na plik cache i 8 GiB pozostawione dla backendu.
+Istniejący cache nie jest alokowany ponownie, ale start nadal wymaga 8 GiB
+wolnego miejsca. Launcher sprawdza je także po przygotowaniu cache, przed
+uruchomieniem usług. Są to dolne progi bezpieczeństwa, nie oszacowanie całego
+pierwszego buildu; świeży cache Cargo i toolchain mogą potrzebować więcej.
+Brak miejsca przerywa start i zachowuje dotychczasowe cache oraz wyniki.
 
 Odpowiednik bez `just`:
 

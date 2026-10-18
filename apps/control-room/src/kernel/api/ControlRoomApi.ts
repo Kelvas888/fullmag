@@ -4778,17 +4778,24 @@ export class ControlRoomApi {
           method,
         });
 
-        if (this.apiInstanceMismatch || (this.expectedApiInstance && response.headers.get(API_INSTANCE_HEADER) !== this.expectedApiInstance)) {
+        const transportUnavailable = isTransportUnavailableResponse(
+          response,
+          this.expectedApiInstance,
+        );
+        if (!transportUnavailable && (this.apiInstanceMismatch || (this.expectedApiInstance && response.headers.get(API_INSTANCE_HEADER) !== this.expectedApiInstance))) {
           this.apiInstanceMismatch = true;
           throw new ControlRoomApiError("API instance changed; reopen Fullmag", 409, response.headers.get("x-request-id"), "API_INSTANCE_MISMATCH");
         }
 
-        const contractVersionError = resolveContractVersionError(response, {
-          allowMissing: allowMissingContractVersion,
-        });
+        const contractVersionError = transportUnavailable
+          ? null
+          : resolveContractVersionError(response, {
+              allowMissing: allowMissingContractVersion,
+            });
         const accepted =
           (response.ok || acceptedStatuses.has(response.status)) &&
-          !contractVersionError;
+          !contractVersionError &&
+          !transportUnavailable;
         const responseDetail = await resolveResponseDiagnosticDetail({
           attempt,
           method,
@@ -4821,6 +4828,15 @@ export class ControlRoomApi {
           throw contractVersionError;
         }
 
+        if (transportUnavailable) {
+          throw new ControlRoomApiError(
+            API_UNAVAILABLE_MESSAGE,
+            response.status,
+            response.headers.get("x-request-id") ?? requestId,
+            API_UNAVAILABLE_CODE,
+          );
+        }
+
         return response;
       } catch (error) {
         if (error instanceof ControlRoomApiError) {
@@ -4828,13 +4844,11 @@ export class ControlRoomApi {
         }
 
         lastError = error;
-        if (
-          attempt < maxAttempts &&
-          !(error instanceof DOMException && error.name === "AbortError")
-        ) {
+        if (attempt < maxAttempts && !isAbortError(error)) {
           await delayRetry(this.retryDelayMs, init.signal);
           continue;
         }
+        break;
       }
     }
 
@@ -4847,18 +4861,47 @@ export class ControlRoomApi {
       durationMs: Date.now() - started,
       etag: null,
       method,
-      outcome:
-        lastError instanceof DOMException && lastError.name === "AbortError"
-          ? "aborted"
-          : "network-error",
+      outcome: isAbortError(lastError) ? "aborted" : "network-error",
       path,
       requestId,
       resourceKey: path,
       status: null,
     });
 
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    if (isAbortError(lastError)) {
+      throw lastError;
+    }
+    throw new ControlRoomApiError(
+      API_UNAVAILABLE_MESSAGE,
+      0,
+      requestId,
+      API_UNAVAILABLE_CODE,
+    );
   }
+}
+
+const API_UNAVAILABLE_CODE = "API_UNAVAILABLE";
+const API_UNAVAILABLE_MESSAGE = "Fullmag API unavailable";
+
+function isTransportUnavailableResponse(
+  response: Response,
+  expectedApiInstance: string | null,
+): boolean {
+  return (
+    !response.ok &&
+    response.status >= 500 &&
+    response.headers.get(API_CONTRACT_VERSION_HEADER) == null &&
+    (expectedApiInstance == null ||
+      response.headers.get(API_INSTANCE_HEADER) == null ||
+      response.headers.get(API_INSTANCE_HEADER) === expectedApiInstance)
+  );
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError")
+  );
 }
 
 function retryableGetStatus(method: string, status: number): boolean {
