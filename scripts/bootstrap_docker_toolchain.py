@@ -305,6 +305,7 @@ def _control_environment(project):
         "FULLMAG_COMPOSE_PROJECT": project,
         CONTROL_VOLUME_ENV: control_volume_name(project),
         "FULLMAG_CONTROL_ROOT": CONTROL_ROOT,
+        "FULLMAG_TOOLCHAIN_IMAGE": toolchain_image_reference(project),
     }
 
 
@@ -353,7 +354,7 @@ def _control_command(repo, project, relative, *, read=False):
     )
     return [
         *_compose_prefix(repo, project), "--profile", "toolchain-control",
-        "run", "--rm", "--no-deps", "-T", "--entrypoint", "/bin/sh",
+        "run", "--rm", "--no-deps", "-T", "--cap-add", "DAC_OVERRIDE", "--entrypoint", "/bin/sh",
         "toolchain-control", "-c", script, "--", str(relative),
     ]
 

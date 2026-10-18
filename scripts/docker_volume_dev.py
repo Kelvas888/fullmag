@@ -76,9 +76,28 @@ def _frontend(control, operation, selected, state, port, image):
         raise BuildControlError("Frontend metadata exceeds transfer budget")
     # Metadata only: the four application directories stay live readonly binds.
     script = r'''
-import base64, hashlib, json, os, pathlib, sys
+import base64, hashlib, json, os, pathlib, stat, sys
 root=pathlib.Path('/data/workspace')
 request=json.load(sys.stdin)
+freeze=pathlib.Path('/data/inputs-freeze.json')
+if freeze.exists() or freeze.is_symlink():
+    descriptor=os.open(freeze, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as stream:
+        metadata=os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink!=1 or metadata.st_size>8*1024*1024:
+            raise RuntimeError('Frozen frontend inputs are not one bounded regular file')
+        frozen=json.loads(stream.read(8*1024*1024+1))
+    original=frozen.get('manifest')
+    if not isinstance(original,dict): raise RuntimeError('Frozen frontend manifest is missing')
+    digest=hashlib.sha256((json.dumps(original,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
+    without_commit=lambda value:{k:v for k,v in value.items() if k!='source_commit'}
+    if (frozen.get('schema')!='fullmag.docker-development-inputs-freeze.v1'
+            or frozen.get('frozen_root')!='/state/development/frozen-inputs'
+            or frozen.get('manifest_digest')!=digest
+            or frozen.get('files')!=original.get('files')
+            or without_commit(original)!=without_commit(request['inputs'])):
+        raise RuntimeError('Frozen frontend configuration changed; cache retained')
+    request['inputs']=original
 root.mkdir(parents=True,exist_ok=True)
 cache=pathlib.Path('/data/cache')
 if cache.is_symlink(): raise RuntimeError('Frontend cache is a link')
@@ -108,7 +127,7 @@ for name in ('app','src','public','scripts'):
     target=root/'apps/control-room'/name
     if target.is_symlink(): raise RuntimeError('Live directory is a link')
     target.mkdir(exist_ok=True)
-print(json.dumps({'state':'seeded','files':len(request['files'])}))
+print(json.dumps({'state':'seeded','files':len(request['files']),'inputs':request['inputs']}))
 '''
     args = control.helper_args("exec /usr/local/bin/python3 -I -c " + __import__('shlex').quote(script))
     args[args.index("--entrypoint"):args.index("--entrypoint")] = ["--mount", "type=volume,src=" + volume + ",dst=/data,volume-nocopy"]
@@ -116,7 +135,9 @@ print(json.dumps({'state':'seeded','files':len(request['files'])}))
     result = bounded_capture(args, data=request, timeout=120)
     if result.returncode:
         raise BuildControlError(result.stderr.decode("utf-8", "replace"))
-    control.write(operation["root"] + "/frontend-seed.json", json.loads(result.stdout))
+    seeded = json.loads(result.stdout)
+    inputs = seeded.pop("inputs")
+    control.write(operation["root"] + "/frontend-seed.json", seeded)
     control.write("frontend/development-inputs.json", inputs)
     return inputs, volume
 
@@ -267,7 +288,9 @@ def start(args, *, reuse_state=None):
     image = images["backend"]["image_id"]
     device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
     _assert_no_running_fullmag(control.project, identity)
-    with control.operation("development", {"source_root": str(selected), "image_id": image}) as operation:
+    with control.operation("development", {"source_root": str(selected), "image_id": image,
+            "gpu_access_requested": policy, "device_access": device_access,
+            "gpu_preflight": "PASS" if device_access == "gpu" else "NOT_REQUIRED"}) as operation:
         token = operation["receipt"]["attempt"]
         if reuse_state is None:
             state = storage.validate_path(Path(layout["runtime_root"]) / "docker-volume-dev" / token,
@@ -438,6 +461,7 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     operation["receipt"]["windows_storage_delegation_reused"] = certificate.get("restart_verified") is True
     # Use the existing source/binary validation before rotating Windows admission.
     inputs.update(device_access=document["services"]["backend"]["environment"]["FULLMAG_DOCKER_DEVICE_ACCESS"],
+        gpu_preflight="PASS" if document["services"]["backend"]["environment"]["FULLMAG_DOCKER_DEVICE_ACCESS"] == "gpu" else "NOT_REQUIRED",
         backend_cache=cache, package_root="/opt/fullmag/package", run_id=token,
         source_root=str(selected), git_common_dir=str(git_common), build_profile="dev",
         startup_helper_hashes={}, backend_start_receipt="docker-volume://" + control.volume + "/" + operation["root"] + "/receipt.json",

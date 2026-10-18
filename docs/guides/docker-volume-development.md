@@ -75,6 +75,10 @@ nie budują ani nie uruchamiają aplikacji i nie mają Docker socketu.
 Helper utrzymania cache ma wyłącznie `CHOWN` i `DAC_OVERRIDE`, aby inicjalizować
 markery również w katalogach należących do UID backendu; widzi tylko trzy
 zweryfikowane named volumes, bez sieci, writable rootfs ani bindów hosta.
+Inicjalizator control-volume ma dodatkowo `FOWNER`; przejmuje wyłącznie znane
+katalogi metadanych, bez rekurencyjnej zmiany właścicieli. Kanoniczny helper
+bootstrap otrzymuje `DAC_OVERRIDE` tylko dla operacji na tym samym wolumenie,
+aby zachować odczyt i atomowy zapis rekordów należących do UID backendu.
 
 Przed operacją launcher mierzy wolne miejsce w VM oraz na fizycznym wolumenie
 Windows pod rozwiązanym katalogiem danych Docker Desktop. Obecny próg odmowy

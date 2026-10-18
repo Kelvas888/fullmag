@@ -165,7 +165,13 @@ class BuildControl:
                 or volume.get("Options") or any((volume.get("Labels") or {}).get(k) != v
                                                 for k, v in self.shared_labels.items())):
             raise BuildControlError("Control volume ownership/driver differs; existing data retained")
-        initialize = "test $(stat -c %u /control) = 0 -o $(stat -c %u /control) = 65532; chown 65532:65532 /control; chmod 0750 /control"
+        initialize = ("test $(stat -c %u /control) = 0 -o $(stat -c %u /control) = 65532; "
+            "chown 65532:65532 /control; chmod 0750 /control; "
+            "for namespace in toolchain image-dev image-backend development iteration recreate-services resume verification frontend; do "
+            "p=/control/$namespace; test ! -L \"$p\"; "
+            "if test -e \"$p\"; then test -d \"$p\"; "
+            "test $(stat -c %u \"$p\") = 0 -o $(stat -c %u \"$p\") = 65532; "
+            "chown 65532:65532 \"$p\"; chmod 0750 \"$p\"; fi; done")
         result = bounded_capture(self.helper_args(initialize, initialize=True), data=b"", timeout=90)
         if result.returncode:
             raise BuildControlError("Control-volume permission initialization failed: " + result.stderr.decode("utf-8", "replace"))
@@ -230,7 +236,7 @@ class BuildControl:
                 "--label", "com.docker.compose.service=build-control"]
         args.extend(["--user", "0:0" if initialize else "65532:65532"])
         if initialize:
-            args.extend(["--cap-add", "CHOWN", "--cap-add", "FOWNER"])
+            args.extend(["--cap-add", "CHOWN", "--cap-add", "FOWNER", "--cap-add", "DAC_OVERRIDE"])
         for key, value in self.labels.items():
             args.extend(["--label", key + "=" + value])
         if name:
