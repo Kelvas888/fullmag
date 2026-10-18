@@ -78,6 +78,48 @@ class FrontendNamedVolumeTests(unittest.TestCase):
         self.assertIn("apps/control-room/next.config.ts", description["dependency_seed_files"])
         self.assertEqual(description["configuration_changes"], "describe_only")
 
+    def test_interrupted_guest_seed_can_resume_only_matching_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            (workspace / "apps/control-room/app").mkdir(parents=True)
+            expected = {
+                Path("package.json"): b"package\n",
+                Path("patches/fix.patch"): b"patch\n",
+            }
+            (workspace / "package.json").write_bytes(expected[Path("package.json")])
+            development_inputs._validate_guest_workspace(workspace, expected)
+
+            (workspace / "unexpected.txt").write_bytes(b"foreign\n")
+            with self.assertRaisesRegex(ValueError, "unexpected file"):
+                development_inputs._validate_guest_workspace(workspace, expected)
+            (workspace / "unexpected.txt").unlink()
+
+            (workspace / "package.json").write_bytes(b"different\n")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                development_inputs._validate_guest_workspace(workspace, expected)
+
+    def test_interrupted_guest_seed_prunes_live_source_mount_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            for name in development_inputs.DIRECTORIES:
+                (workspace / "apps/control-room" / name / "nested").mkdir(
+                    parents=True
+                )
+                (workspace / "apps/control-room" / name / "nested" / "source.ts").write_bytes(
+                    b"live source\n"
+                )
+            expected = {
+                Path("package.json"): b"package\n",
+                Path("patches/fix.patch"): b"patch\n",
+            }
+            (workspace / "package.json").write_bytes(expected[Path("package.json")])
+            development_inputs._validate_guest_workspace(workspace, expected)
+
+            (workspace / "apps/control-room/foreign").mkdir()
+            with self.assertRaisesRegex(ValueError, "unexpected directory"):
+                development_inputs._validate_guest_workspace(workspace, expected)
+
     def test_cache_key_does_not_change_when_only_port_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)
