@@ -19,6 +19,9 @@ just docker-dev-toolchain
 just docker-dev $source 3197
 ```
 
+Zakończ edycje i staging przed startem; nie zmieniaj źródeł do zakończenia
+próby. Migawka odczytuje checkout dwukrotnie i odrzuca niespójne wejście.
+
 Port musi być wolny. Wybierz wolny port, jeśli inna instancja już działa.
 `docker-dev-images` przygotowuje wyłącznie obrazy helperów; `docker-dev-build`
 ma tę samą semantykę startu usług co `docker-dev`.
@@ -35,7 +38,9 @@ Nie kopiuj tych plików do hostowego `storage/builds`.
 sprawdza dokładny kontener, obraz, polecenie, etykiety i mounty oraz wymaga
 zdrowego API bez aktywnej sesji. Na czas kontroli zamyka jedyne wejście HTTP przez zatrzymanie własnego frontendu,
 sprawdza prywatną sieć bez obcych konsumentów, restartuje backend i ponownie
-uruchamia ten sam frontend. Zachowuje cache oraz Windows storage. Nie jest komendą do przerywania obliczeń.
+uruchamia ten sam frontend. Zachowuje cache oraz Windows storage. Nie jest komendą do przerywania obliczeń. Wymaga wyłącznego okna operatorskiego,
+bez równoległych klientów wysyłających polecenia do tej grupy; odczyt health
+nie jest dowodem opróżnienia wszystkich kolejek aplikacji.
 Frontend obserwuje katalogi `app`, `src`, `public`, `scripts` i aktualizuje UI
 przez HMR. Zmiana helperów obrazu wymaga przygotowania nowego obrazu i jawnego
 odtworzenia usług; sam restart zachowuje przypięty obraz.
@@ -51,7 +56,8 @@ Nieznany wynik operacji zachowuje zasoby i blokadę do jawnego rozstrzygnięcia.
 Nie usuwaj ręcznie `active`, pakietu ani lease, aby wymusić kolejny build.
 Launcher przyjmuje wynik dopiero po zdarzeniu `handoff` z bieżącego uruchomienia
 kontenera i zgodnym hashu receipt/provenance. Stary udany pakiet nie dowodzi
-zakończenia nowego startu.
+zakończenia nowego startu. Nieoczekiwany restart kontenera między publikacją
+pakietu a gotowością API również przerywa obserwację.
 
 ## Granica zapisu i retencja
 

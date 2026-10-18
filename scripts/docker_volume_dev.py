@@ -470,7 +470,8 @@ else:
     while time.monotonic() < readiness_deadline:
         services = json.loads(docker_text("inspect", backend_id, frontend_id))
         for service, observed in zip(("backend", "frontend"), services):
-            _validate_retained_service(document, observed, service, image_config)
+            _validate_retained_service(document, observed, service, image_config,
+                expected_started_at=operation["receipt"]["backend_started_at"] if service == "backend" else None)
             if not observed.get("State", {}).get("Running"):
                 raise BuildControlError("DEV service exited before readiness: " + service)
         process_receipt = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", process_script))
@@ -505,8 +506,10 @@ else:
 
 
 
-def _validate_retained_service(document, actual, service, image_config):
-    """Reject configuration/mount drift before any recorded service mutation."""
+def _validate_retained_service(document, actual, service, image_config, *, expected_started_at=None):
+    """Reject configuration/mount drift and a replaced observed incarnation."""
+    if expected_started_at is not None and actual.get("State", {}).get("StartedAt") != expected_started_at:
+        raise BuildControlError("Backend incarnation changed during readiness observation")
     from run_managed_browser import host_path
     expected = document["services"][service]
     config, host = actual.get("Config", {}), actual.get("HostConfig", {})

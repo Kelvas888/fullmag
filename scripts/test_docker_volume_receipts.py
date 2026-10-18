@@ -63,7 +63,12 @@ class VolumeReceiptTests(unittest.TestCase):
         actual = {'Config': {'Env': ['SOURCE=selected'], 'Labels': {'owner': 'task'}, **image},
                   'HostConfig': {'ReadonlyRootfs': True, 'Privileged': False, 'Tmpfs': {}},
                   'Mounts': [{'Destination': '/build', 'Type': 'volume', 'RW': True, 'Name': 'owned-build'}]}
-        dev._validate_retained_service(document, actual, 'backend', image)
+        actual['State'] = {'StartedAt': 'first-start'}
+        dev._validate_retained_service(document, actual, 'backend', image, expected_started_at='first-start')
+        changed = copy.deepcopy(actual)
+        changed['State']['StartedAt'] = 'replacement-start'
+        with self.assertRaisesRegex(BuildControlError, 'incarnation changed'):
+            dev._validate_retained_service(document, changed, 'backend', image, expected_started_at='first-start')
         changed = copy.deepcopy(actual)
         changed['Mounts'][0]['Name'] = 'foreign-build'
         with self.assertRaisesRegex(BuildControlError, 'named-volume identity'):
