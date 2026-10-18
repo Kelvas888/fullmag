@@ -76,6 +76,135 @@ def _v2_cache_fixture(root):
 
 
 class DockerRuntimeContract(unittest.TestCase):
+    def test_runtime_process_receipt_reader_uses_compose_control_volume(self):
+        raw = (
+            b'{"schema":"fullmag.docker-process-tree.v1",'
+            b'"state":"ready"}'
+        )
+        with patch("bootstrap_docker_toolchain.ensure_control_volume") as ensure, \
+                patch("bootstrap_docker_toolchain.read_control", return_value=raw) as read:
+            reader = runtime._runtime_control_record_reader(
+                Path("C:/git/fullmag/fullmag"),
+                "fullmag-worktree-receipt",
+                runtime._runtime_control_process_receipt_relative_path(),
+            )
+            self.assertEqual(reader(), (json.loads(raw), raw))
+        ensure.assert_called_once_with("fullmag-worktree-receipt")
+        read.assert_called_once_with(
+            Path("C:/git/fullmag/fullmag"),
+            "fullmag-worktree-receipt",
+            "runtime-control/runtime-service/process-tree.json",
+        )
+
+    def test_wait_for_startup_ready_can_observe_named_volume_receipt(self):
+        receipt = {
+            "schema": "fullmag.docker-process-tree.v1",
+            "state": "ready",
+        }
+        raw = json.dumps(receipt, separators=(",", ":")).encode("utf-8")
+        records = [None, (receipt, raw)]
+
+        def read_record():
+            return records.pop(0)
+
+        with patch.object(runtime.time, "sleep"):
+            observed, observed_raw = runtime._wait_for_startup_ready(
+                Path("C:/state"),
+                receipt_reader=read_record,
+                timeout=1,
+                return_raw=True,
+            )
+        self.assertEqual(observed, receipt)
+        self.assertEqual(observed_raw, raw)
+
+    def test_live_start_uses_runtime_only_host_initialization(self):
+        layout = {"storage_root": "C:/storage"}
+        with patch.object(runtime.storage, "initialize_runtime") as runtime_init, \
+                patch.object(runtime.storage, "initialize") as full_init:
+            runtime._initialize_start_storage(layout, live_development=True)
+            runtime._initialize_start_storage(layout, live_development=False)
+        runtime_init.assert_called_once_with(layout)
+        full_init.assert_called_once_with(layout)
+
+    def test_volume_only_operator_pointer_excludes_build_metadata(self):
+        pointer = runtime._operator_pointer(
+            {
+                "state": "running",
+                "compose_project": "fullmag-worktree-test",
+                "frontend_mode": "dev",
+                "state_root": "C:/storage/runs/worktree/state",
+                "host_certificate": "C:/storage/runs/worktree/windows-folder-host.json",
+                "technical_receipt": "/opt/fullmag/control/docker-runtime/runs/id/receipt.json",
+                "technical_receipt_sha256": "a" * 64,
+                "assembly_receipt": "/opt/fullmag/control/docker-runtime/runs/id/backend-assembly.json",
+                "compose_source": "C:/tmp/compose.source.yaml",
+                "backend_start_inputs": "/opt/fullmag/control/backend-start.json",
+            },
+            Path("C:/storage/runs/worktree"),
+        )
+        self.assertEqual(pointer["schema"], "fullmag.docker-all-run-pointer.v1")
+        self.assertEqual(pointer["technical_receipt"],
+                         "/opt/fullmag/control/docker-runtime/runs/id/receipt.json")
+        self.assertNotIn("assembly_receipt", pointer)
+        self.assertNotIn("compose_source", pointer)
+        self.assertNotIn("backend_start_inputs", pointer)
+
+    def test_volume_reuse_preserves_only_recovery_evidence_on_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            root.mkdir()
+            host_certificate = root / "windows-folder-host.json"
+            host_certificate.write_text('{"schema":"certificate"}\n', encoding="utf-8")
+            mount_receipt = root / "host-ledger" / "host-ledger-adapter-receipt.json"
+            mount_receipt.parent.mkdir()
+            mount_receipt.write_text('{"schema":"mount"}\n', encoding="utf-8")
+            pointer = root / "receipt.json"
+            pointer.write_text('{"schema":"pointer"}\n', encoding="utf-8")
+            writes = {}
+
+            def writer_factory(_repo, _project, relative):
+                def write(value):
+                    raw = (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode()
+                    writes[str(relative)] = raw
+                    return hashlib.sha256(raw).hexdigest()
+                return write
+
+            reuse = {
+                "root": root,
+                "receipt_path": pointer,
+                "receipt_sha256": runtime.digest(pointer),
+                "receipt": {
+                    "schema": "fullmag.docker-all-run.v1",
+                    "host_ledger": {"receipt": str(mount_receipt)},
+                },
+                "host_certificate": host_certificate,
+                "control_repo": Path(directory),
+                "control_project": "fullmag-worktree-test",
+                "reuse_token": "a" * 32,
+            }
+            with patch.object(runtime, "_runtime_control_json_writer", side_effect=writer_factory):
+                result = runtime._preserve_volume_reuse_evidence(reuse)
+
+            history = result["history_root"]
+            self.assertEqual(
+                (history / "windows-folder-host.json").read_bytes(),
+                host_certificate.read_bytes(),
+            )
+            self.assertEqual(
+                (history / "host-ledger/host-ledger-adapter-receipt.json").read_bytes(),
+                mount_receipt.read_bytes(),
+            )
+            manifest = json.loads((history / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                {item["relative"] for item in manifest["files"]},
+                {"windows-folder-host.json", "host-ledger/host-ledger-adapter-receipt.json"},
+            )
+            self.assertTrue(any(
+                path.endswith("/receipt-history/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/receipt.json")
+                for path in writes
+            ))
+            self.assertNotIn("compose.json", writes)
+
     def test_prepare_ready_profile_passes_runtime_cache_validator(self):
         with tempfile.TemporaryDirectory() as directory:
             profile, layout, source, repo, runroot = _profile(directory)
