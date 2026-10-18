@@ -156,6 +156,8 @@ are defined in [`compose.dev.yaml`](compose.dev.yaml). See the
 for the detailed architecture and lifecycle contract and
 [ADR 0061](docs/adr/0061-docker-development-build-and-runtime-container.md)
 for the same-container build and runtime decision.
+For storage locations, automatic retention, known cleanup gaps and the
+verification procedure, see [Docker build and storage lifecycle](docs/guides/docker-build-storage-lifecycle.md).
 
 Each checkout group has two persistent application services: `frontend` and
 `backend`. The backend container compiles the selected source using its durable
@@ -223,6 +225,12 @@ just docker-dev-toolchain
 just docker-dev "$worktree" 3197
 ```
 
+The toolchain command uses the checkout containing the invoked `justfile`;
+run both commands from the selected worktree. It builds a dependency image
+through Compose/BuildKit, whose progress appears in the command output or
+Docker Desktop Builds. Application compilation and runtime stay in the same
+permanent backend container. No separate application builder is started.
+
 The development frontend enables the Node Inspector on container loopback,
 without publishing a host debug port or waiting for a debugger to attach. The
 frontend log reports the Inspector address. Release processes keep it disabled;
@@ -231,7 +239,7 @@ see the [development debugger guide](docs/guides/docker-development-architecture
 The equivalent native Python commands are useful when `just` is unavailable:
 
 ```powershell
-python -B "$main\scripts\bootstrap_docker_toolchain.py" --repo-root $main --direct-development
+python -B "$worktree\scripts\bootstrap_docker_toolchain.py" --repo-root $worktree --direct-development
 # Start without a startup script:
 python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $worktree --port 3197
 # Or start with a startup script:
