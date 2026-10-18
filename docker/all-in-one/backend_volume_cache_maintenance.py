@@ -594,13 +594,14 @@ def _write_new_record(directory: int, name: str, value: Mapping[str, Any], uid: 
 
 
 def _ensure_marker(
-    directory: int, marker: Mapping[str, Any], uid: int, gid: int
+    directory: int, marker: Mapping[str, Any], uid: int, gid: int, *,
+    marker_name: str = MARKER_NAME,
 ) -> bytes:
     try:
-        existing, metadata = _read_record(directory, MARKER_NAME, MAX_MARKER_BYTES)
+        existing, metadata = _read_record(directory, marker_name, MAX_MARKER_BYTES)
     except FileNotFoundError:
-        _write_new_record(directory, MARKER_NAME, marker, uid, gid)
-        existing, metadata = _read_record(directory, MARKER_NAME, MAX_MARKER_BYTES)
+        _write_new_record(directory, marker_name, marker, uid, gid)
+        existing, metadata = _read_record(directory, marker_name, MAX_MARKER_BYTES)
     if existing != dict(marker):
         raise MaintenanceError("cache maintenance marker is foreign or incomplete")
     if (metadata.st_uid, metadata.st_gid) != (uid, gid):
@@ -608,8 +609,8 @@ def _ensure_marker(
             raise MaintenanceError("cache maintenance marker owner is not exact")
         # Recover an interrupted ownership handoff without changing content.
         original_metadata = metadata
-        _chown_record(directory, MARKER_NAME, uid, gid)
-        recovered = os.stat(MARKER_NAME, dir_fd=directory, follow_symlinks=False)
+        _chown_record(directory, marker_name, uid, gid)
+        recovered = os.stat(marker_name, dir_fd=directory, follow_symlinks=False)
         if (recovered.st_dev, recovered.st_ino) != (
             original_metadata.st_dev,
             original_metadata.st_ino,
@@ -644,6 +645,53 @@ def _ensure_shared_marker(
     if len(raw) > MAX_MARKER_BYTES:
         raise MaintenanceError("shared control marker is too large")
     return raw
+
+
+def _ensure_control_subnamespace(
+    parent: int,
+    name: str,
+    subpath: str,
+    role: str,
+    control_volume_name: str,
+    uid: int,
+    gid: int,
+) -> tuple[bytes, int]:
+    """Provision one persistent control-volume subpath without replacing data."""
+
+    directory = _open_child_directory(
+        parent, name, uid, gid, f"{role} control namespace"
+    )
+    try:
+        if not _entry_present(directory, CONTROL_MARKER_NAME):
+            try:
+                entries = os.listdir(directory)
+            except OSError as error:
+                raise MaintenanceError(f"cannot inspect {role} control namespace") from error
+            if entries:
+                raise MaintenanceError(
+                    f"{role} control namespace is nonempty without its owner marker"
+                )
+        marker = {
+            "schema": CONTROL_NAMESPACE_SCHEMA,
+            "state": "owned",
+            "role": role,
+            "volume_name": control_volume_name,
+            "mount": CONTROL_ROOT,
+            "namespace": f"{CONTROL_ROOT}/{subpath}",
+        }
+        marker_raw = _ensure_marker(
+            directory, marker, uid, gid, marker_name=CONTROL_MARKER_NAME
+        )
+        _prepare_readback(directory, uid, gid)
+        _probe_readback(
+            directory, marker_raw, uid, gid, marker_name=CONTROL_MARKER_NAME
+        )
+        _finalize_guest_root(directory, uid, gid)
+        _fsync_directory_fd(parent, f"{role} control parent")
+        return marker_raw, directory
+    except BaseException:
+        os.close(directory)
+        raise
 
 
 def _ensure_control_namespace(
@@ -694,6 +742,26 @@ def _ensure_control_namespace(
             _finalize_guest_root(namespace, uid, gid)
         finally:
             os.close(namespace)
+
+        frontend_marker_raw, frontend = _ensure_control_subnamespace(
+            root, "frontend", "frontend", "frontend", control_volume_name, uid, gid
+        )
+        os.close(frontend)
+        runtime_marker_raw, runtime = _ensure_control_subnamespace(
+            root, "runtime-control", "runtime-control", "runtime-control",
+            control_volume_name, uid, gid
+        )
+        try:
+            runtime_services = _open_child_directory(
+                runtime, "runtime-services", uid, gid, "native runtime-services store"
+            )
+            try:
+                _finalize_guest_root(runtime_services, uid, gid)
+                _fsync_directory_fd(runtime, "runtime-control namespace")
+            finally:
+                os.close(runtime_services)
+        finally:
+            os.close(runtime)
         _fsync_directory_fd(root, "shared control root")
         return root_marker_raw, namespace_marker_raw
     finally:
@@ -742,7 +810,8 @@ def _prepare_readback(directory: int, uid: int, gid: int) -> None:
 
 
 def _probe_readback(
-    directory: int, marker_raw: bytes, uid: int, gid: int
+    directory: int, marker_raw: bytes, uid: int, gid: int, *,
+    marker_name: str = MARKER_NAME,
 ) -> None:
     """Write/read a bounded probe through the CAP_CHOWN record handoff.
 
@@ -773,7 +842,7 @@ def _probe_readback(
         with _open_maintenance_record(directory, READBACK_NAME, os.O_RDONLY) as (descriptor, _):
             if _read_bounded(descriptor, MAX_READBACK_BYTES) != token:
                 raise MaintenanceError("cache maintenance readback changed during reopen")
-        with _open_maintenance_record(directory, MARKER_NAME, os.O_RDONLY) as (descriptor, _):
+        with _open_maintenance_record(directory, marker_name, os.O_RDONLY) as (descriptor, _):
             if _read_bounded(descriptor, MAX_MARKER_BYTES).rstrip(b"\n") != marker_raw:
                 raise MaintenanceError("cache maintenance marker failed user readback")
 

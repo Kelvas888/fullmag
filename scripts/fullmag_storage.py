@@ -557,7 +557,7 @@ def atomic_json(path, data, *, retry_windows_replace=False):
             temporary.unlink()  # Only our own uncommitted metadata, never user data.
 
 
-def initialize(layout):
+def _initialize(layout, *, create_technical_roots):
     root = absolute(layout["storage_root"], "storage root")
     build_storage = absolute(layout["build_storage_root"], "build storage root")
     validate_managed_view(layout)
@@ -586,8 +586,30 @@ def initialize(layout):
             atomic_json(marker, expected)
     for directory in ("index", "locks"):
         (root / directory).mkdir(exist_ok=True)
-    for field in ("build_root", "cache_root", "temp_root", "runtime_root", "frontend_root", "runs_root"):
+    fields = ("build_root", "cache_root", "temp_root", "runtime_root", "frontend_root", "runs_root")
+    if not create_technical_roots:
+        fields = ("runs_root",)
+    for field in fields:
         Path(layout[field]).mkdir(parents=True, exist_ok=True)
+
+
+def initialize(layout):
+    """Initialize the complete host storage layout for managed builds."""
+
+    _initialize(layout, create_technical_roots=True)
+
+
+def initialize_runtime(layout):
+    """Initialize only host state needed by a Docker runtime handoff.
+
+    Docker DEV keeps compiler state, dependency caches, package staging and
+    build provenance in Docker named volumes. The host still owns the small
+    runtime namespace and coordination roots used for Windows sessions,
+    receipts and locks, but it must not materialize unused legacy build roots.
+    Other managed profiles continue to use :func:`initialize` above.
+    """
+
+    _initialize(layout, create_technical_roots=False)
 
 
 def is_link(path):

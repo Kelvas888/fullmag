@@ -18,6 +18,7 @@ import fullmag_storage as storage
 from windows_folder_host import local_volume, read_owned_regular
 
 DIRECTORIES = ("app", "src", "public", "scripts")
+NEXT_CONFIG_RELATIVE = Path("apps/control-room/next.config.ts")
 WORKSPACE = "/state/development/workspace"
 FRONTEND = "/state/development/cache"
 CONFIG_TARGET = "/run/fullmag/development-inputs.json"
@@ -193,6 +194,10 @@ def describe(source, port):
     }
     relative_files.update(patch_relatives)
     dependency_files = set(relative_files)
+    # Next reads this file before the dev server starts.  It is therefore a
+    # cache identity input even though it is outside the live HMR directories.
+    relative_files.add(NEXT_CONFIG_RELATIVE)
+    dependency_files.add(NEXT_CONFIG_RELATIVE)
     from windows.stage_workspace_frontend import (
         _direct_app_package_manifests,
         _parse_lock_importers,
@@ -343,6 +348,8 @@ def seed(source, state, port, *, reuse_from=None):
     }
     relative_files.update(patch_relatives)
     dependency_files = set(relative_files)
+    relative_files.add(NEXT_CONFIG_RELATIVE)
+    dependency_files.add(NEXT_CONFIG_RELATIVE)
     # Pnpm patch files are frozen dependency inputs, while app dirs remain live
     # readonly mounts.  The complete patches/ tree is captured so pnpm's
     # authoritative registration format stays responsible for declaration and
@@ -457,6 +464,7 @@ def seed_guest(
     worktree_id,
     source_commit,
     manifest_path=None,
+    frontend_cache_key=None,
 ):
     """Seed frontend dependency metadata into a Docker named volume.
 
@@ -504,6 +512,20 @@ def seed_guest(
         raise ValueError("source_commit must be a lowercase full Git commit")
     if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
         raise ValueError("port must be an integer in 1024..65535")
+    if frontend_cache_key is not None and not isinstance(frontend_cache_key, str):
+        raise ValueError("frontend_cache_key must be a lowercase SHA-256")
+    if frontend_cache_key is not None and not re.fullmatch(r"[a-f0-9]{64}", frontend_cache_key):
+        raise ValueError("frontend_cache_key must be a lowercase SHA-256")
+    if frontend_cache_key is not None:
+        expected_manifest = (
+            Path("/opt/fullmag/control")
+            / frontend_cache_key
+            / "development-inputs.json"
+        )
+        if manifest_path is None or Path(manifest_path) != expected_manifest:
+            raise ValueError(
+                "frontend input manifest must use the cache-key control namespace"
+            )
 
     app = source / "apps" / "control-room"
     directories = []
@@ -529,6 +551,8 @@ def seed_guest(
     }
     relative_files.update(patch_relatives)
     dependency_files = set(relative_files)
+    relative_files.add(NEXT_CONFIG_RELATIVE)
+    dependency_files.add(NEXT_CONFIG_RELATIVE)
     from windows.stage_workspace_frontend import (
         _direct_app_package_manifests,
         _parse_lock_importers,
@@ -600,6 +624,7 @@ def seed_guest(
         "source_volume": str(source),
         "host_port": port,
         "worktree_id": worktree_id,
+        **({"frontend_cache_key": frontend_cache_key} if frontend_cache_key is not None else {}),
         "dependency_seed_files": sorted(dependency_entries),
         "dependency_seed_sha256": dependency_seed_digest(dependency_entries),
         "toolpins": toolpins,

@@ -1,6 +1,6 @@
 # Canonical FEM/GPU dependency image. Application source and runtime packages
 # are intentionally absent from this build context's allow-list.
-name: ${FULLMAG_COMPOSE_PROJECT:-fullmag-master}
+name: ${FULLMAG_COMPOSE_PROJECT:?FULLMAG_COMPOSE_PROJECT must be set by the selected Compose-group launcher}
 
 services:
   fem-gpu-toolchain:
@@ -8,7 +8,7 @@ services:
     pull_policy: never
     platform: linux/amd64
     build:
-      context: ${FULLMAG_TOOLCHAIN_CONTEXT:-.}
+      context: ${FULLMAG_TOOLCHAIN_CONTEXT:?FULLMAG_TOOLCHAIN_CONTEXT must be set by the selected Compose-group launcher}
       dockerfile: docker/fem-gpu/Dockerfile
       target: fem-gpu-dev
       args:

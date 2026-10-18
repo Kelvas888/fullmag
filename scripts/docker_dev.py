@@ -866,13 +866,13 @@ def _ensure_development_base(args: argparse.Namespace, repo: Path,
 
 def _select_source(repo: Path, source_root: Path | None) -> tuple[Path, dict[str, object]]:
     from docker_development_inputs import select_checkout
-    from fullmag_storage import initialize, resolve_layout
+    from fullmag_storage import initialize_runtime, resolve_layout
 
     selected = select_checkout(repo, source_root).resolve(strict=True)
     if not selected.is_dir() or selected.is_symlink():
         raise _fail(f"selected source is not a real checkout: {selected}")
     layout = resolve_layout(selected, STORAGE_PROFILE)
-    initialize(layout)
+    initialize_runtime(layout)
     return selected, layout
 
 

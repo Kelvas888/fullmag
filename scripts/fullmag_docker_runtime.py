@@ -74,6 +74,47 @@ def _validate_device_access(value: object) -> str:
     if value not in DEVICE_ACCESS_CHOICES:
         raise ValueError("resolved device access must be cpu or gpu")
     return str(value)
+
+
+def _frontend_control_volume_name(project: str, backend_start=None) -> str:
+    """Resolve the frontend's control volume from its Compose-group owner."""
+
+    from bootstrap_docker_toolchain import control_volume_name
+
+    expected = control_volume_name(project)
+    if backend_start is not None:
+        if not isinstance(backend_start, Mapping):
+            raise ValueError("Backend start inputs must be an object")
+        cache = backend_start.get("backend_cache")
+        if not isinstance(cache, Mapping):
+            raise ValueError("Backend start has no shared control-volume identity")
+        names = cache.get("volume_names")
+        environment = cache.get("environment")
+        observed = names.get("control") if isinstance(names, Mapping) else None
+        if observed is None and isinstance(environment, Mapping):
+            observed = environment.get("FULLMAG_BUILD_CONTROL_VOLUME")
+        if observed != expected:
+            raise ValueError(
+                "Frontend and backend cache profiles do not share this Compose group's control volume"
+            )
+    return expected
+
+
+def _frontend_cache_control_paths(frontend_cache: Mapping[str, object]) -> tuple[str, str]:
+    """Validate cache-key-scoped paths under the frontend's restricted subpath."""
+
+    key = frontend_cache.get("cache_key")
+    if not isinstance(key, str) or _CONFIG_SHA256_RE.fullmatch(key) is None:
+        raise ValueError("Frontend cache key is missing or malformed")
+    root = PurePosixPath("/opt/fullmag/control") / key
+    inputs = root / "development-inputs.json"
+    control_value = frontend_cache.get("control_root")
+    inputs_value = frontend_cache.get("inputs_path")
+    if (control_value != str(root) or inputs_value != str(inputs)
+            or not isinstance(frontend_cache.get("control_volume_name"), str)
+            or not isinstance(frontend_cache.get("volume_name"), str)):
+        raise ValueError("Frontend cache paths or named-volume identities are not cache-key scoped")
+    return str(root), str(inputs)
 _TOOLCHAIN_MANIFEST_PROBE = r'''
 import os
 import stat
@@ -697,9 +738,16 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
             raise ValueError("Frontend cache Compose overlay is missing")
         if not isinstance(cache_environment, dict):
             raise ValueError("Frontend cache has no resolved Compose environment")
+        control_root, cache_inputs_path = _frontend_cache_control_paths(frontend_cache)
+        if str(inputs_path) != cache_inputs_path:
+            raise ValueError("Frontend cache input path differs from the selected cache-key namespace")
+        if (cache_environment.get("FULLMAG_FRONTEND_CONTROL_ROOT") != control_root
+                or cache_environment.get("FULLMAG_DEVELOPMENT_INPUTS_PATH") != cache_inputs_path):
+            raise ValueError("Frontend cache environment is outside its cache-key namespace")
         environment.update(cache_environment)
-        environment["FULLMAG_DEVELOPMENT_INPUTS_PATH"] = FRONTEND_INPUTS_PATH
-        environment["FULLMAG_FRONTEND_CONTROL_ROOT"] = "/opt/fullmag/control/frontend"
+        environment["FULLMAG_DEVELOPMENT_INPUTS"] = cache_inputs_path
+        environment["FULLMAG_DEVELOPMENT_INPUTS_PATH"] = cache_inputs_path
+        environment["FULLMAG_FRONTEND_CONTROL_ROOT"] = control_root
         definitions.extend(["-f", overlay])
     if backend_start is not None:
         backend_cache = backend_start.get("backend_cache")
@@ -1537,9 +1585,13 @@ def _load_reuse_run(layout, run_receipt, *, project_name, frontend,
         if not isinstance(source_root, str) or not Path(source_root).is_dir() or Path(source_root).is_symlink():
             raise ValueError("Reused development run has no valid live source checkout")
         if receipt.get("frontend_inputs_storage") == "docker-named-volume":
-            if guest_inputs_value != FRONTEND_INPUTS_PATH:
-                raise ValueError("Reused frontend manifest is outside the Compose-group control volume")
-            guest_inputs = FRONTEND_INPUTS_PATH
+            cache_receipt = receipt.get("frontend_cache")
+            if not isinstance(cache_receipt, Mapping):
+                raise ValueError("Reused development run has no frontend cache identity")
+            _control_root, expected_inputs_path = _frontend_cache_control_paths(cache_receipt)
+            if guest_inputs_value != expected_inputs_path:
+                raise ValueError("Reused frontend manifest is outside its Compose-group cache namespace")
+            guest_inputs = expected_inputs_path
         else:
             if not isinstance(host_inputs_value, str) or not isinstance(guest_inputs_value, str):
                 raise ValueError("Reused development run has no complete frontend input manifests")
@@ -2818,7 +2870,6 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 inputs = describe(selected_checkout, port)
             inputs_path = FRONTEND_INPUTS_PATH
             receipt["frontend_inputs_storage"] = "docker-named-volume"
-            receipt["frontend_inputs"] = FRONTEND_INPUTS_PATH
             receipt["frontend_inputs_reused"] = bool(reuse is not None)
             from local_runner.build_source import native_identity
             receipt["mounted_source_identity_at_start"] = native_identity(selected_checkout, "snapshot")
@@ -2986,6 +3037,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         if inputs is not None:
             from docker_frontend_cache import prepare as prepare_frontend_cache
 
+            control_volume_name = _frontend_control_volume_name(project, backend_start)
             frontend_cache = prepare_frontend_cache(
                 layout,
                 repo,
@@ -2997,19 +3049,27 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 host_port=inputs["host_port"],
                 dependency_seed_sha256=inputs["dependency_seed_sha256"],
                 toolpins=inputs["toolpins"],
+                compose_project=project,
+                control_volume_name=control_volume_name,
             )
+            _control_root, inputs_path = _frontend_cache_control_paths(frontend_cache)
+            receipt["frontend_inputs"] = inputs_path
             receipt["frontend_cache"] = {
                 "schema": frontend_cache["schema"],
                 "profile": frontend_cache["profile"],
                 "cache_key": frontend_cache["cache_key"],
                 "project_id": frontend_cache["project_id"],
-                "filesystem_uuid": frontend_cache["filesystem_uuid"],
-                "mount_root": frontend_cache["mount_root"],
-                "children": frontend_cache["children"],
-                "guest_targets": frontend_cache["guest_targets"],
-                "helper_sha256": frontend_cache["helper_sha256"],
+                "compose_project": frontend_cache["compose_project"],
+                "volume_name": frontend_cache["volume_name"],
+                "control_volume_name": frontend_cache["control_volume_name"],
+                "mount_target": frontend_cache["mount_target"],
+                "control_target": frontend_cache["control_target"],
+                "control_root": frontend_cache["control_root"],
+                "inputs_path": frontend_cache["inputs_path"],
+                "control_owner": frontend_cache["control_owner"],
                 "compose_overlay_sha256": frontend_cache["compose_overlay_sha256"],
                 "receipt_path": frontend_cache["receipt_path"],
+                "receipt_storage": frontend_cache["receipt_storage"],
             }
             storage.atomic_json(root / "receipt.json", receipt)
         if certificate is None and backend_start is None:

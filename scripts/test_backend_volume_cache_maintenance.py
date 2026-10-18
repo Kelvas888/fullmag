@@ -159,6 +159,23 @@ class BackendVolumeCacheMaintenanceTests(unittest.TestCase):
                 self.assertTrue(readback.read_bytes().startswith(b"fullmag-cache-readback:"))
             self.assertFalse((package / helper.MARKER_NAME).exists())
             self.assertFalse((package / helper.READBACK_NAME).exists())
+            control_root = root / "control"
+            expected_namespaces = {
+                "frontend": "frontend",
+                "runtime-control": "runtime-control",
+            }
+            for name, relative in expected_namespaces.items():
+                namespace = control_root / name
+                marker_path = namespace / helper.CONTROL_MARKER_NAME
+                marker_document = json.loads(marker_path.read_text(encoding="utf-8"))
+                self.assertEqual(marker_document["state"], "owned")
+                self.assertEqual(marker_document["volume_name"], self._environment()["FULLMAG_BUILD_CONTROL_VOLUME"])
+                self.assertEqual(marker_document["namespace"], f"{helper.CONTROL_ROOT}/{relative}")
+                self.assertEqual((namespace.stat().st_uid, namespace.stat().st_gid), (uid, gid))
+            runtime_services = control_root / "runtime-control" / "runtime-services"
+            self.assertTrue(runtime_services.is_dir())
+            self.assertEqual((runtime_services.stat().st_uid, runtime_services.stat().st_gid), (uid, gid))
+            self.assertFalse((runtime_services / helper.CONTROL_MARKER_NAME).exists())
             self.assertEqual(
                 backend._package_children(
                     package, "empty backend package", exclude_development_control=True

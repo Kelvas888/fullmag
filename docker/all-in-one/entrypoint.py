@@ -16,6 +16,42 @@ STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA = "fullmag.startup-activation-diagnostic.v1
 DEVICE_ACCESS_CPU = "cpu"
 DEVICE_ACCESS_GPU = "gpu"
 CUDA_COMPATIBILITY_ROOT = Path("/usr/local/cuda/compat")
+RUNTIME_CONTROL_ROOT = Path("/opt/fullmag/runtime-control")
+FEM_MESH_CACHE_ROOT = Path("/build/cache/fem-mesh")
+CUDA_CACHE_ROOT = Path("/build/cache/cuda-compute")
+
+
+def _technical_path(name, default):
+    """Resolve one container-owned technical path without traversal."""
+
+    path = Path(os.environ.get(name, str(default)))
+    if not path.is_absolute() or any(part == ".." for part in path.parts):
+        raise RuntimeError(f"{name} must be an absolute path without parent traversal")
+    return path
+
+
+def technical_paths():
+    """Return the control and compiler-cache paths expected on named volumes.
+
+    ``/state`` is reserved for the Windows-backed user namespace.  A runtime
+    control path may be a nested named-volume mount below the native store
+    compatibility path, but compiler caches must never fall back there.
+    """
+
+    control = _technical_path("FULLMAG_RUNTIME_CONTROL_ROOT", RUNTIME_CONTROL_ROOT)
+    fem_mesh = _technical_path("FULLMAG_FEM_MESH_CACHE_DIR", FEM_MESH_CACHE_ROOT)
+    cuda_cache = _technical_path("CUDA_CACHE_PATH", CUDA_CACHE_ROOT)
+    state_root = Path("/state")
+    for path, name in ((fem_mesh, "FULLMAG_FEM_MESH_CACHE_DIR"),
+                       (cuda_cache, "CUDA_CACHE_PATH")):
+        try:
+            path.relative_to(state_root)
+        except ValueError:
+            continue
+        raise RuntimeError(f"{name} must remain outside the Windows /state bind")
+    if control == state_root:
+        raise RuntimeError("FULLMAG_RUNTIME_CONTROL_ROOT must not be the user /state root")
+    return control, fem_mesh, cuda_cache
 
 
 def _configure_device_access():
@@ -72,9 +108,10 @@ def preflight():
         count = ctypes.c_int()
         if driver.cuDeviceGetCount(ctypes.byref(count)) != 0 or count.value < 1:
             raise RuntimeError("No NVIDIA CUDA GPU available")
-    for directory in ("/state/.fullmag", "/state/cuda-cache", "/state/.fullmag/mesh-cache"):
-        Path(directory).mkdir(parents=True, exist_ok=True)
-    probe = Path("/state/.fullmag") / (".write-probe-" + uuid.uuid4().hex)
+    control_root, fem_mesh_cache, cuda_cache = technical_paths()
+    for directory in (control_root, fem_mesh_cache, cuda_cache):
+        directory.mkdir(parents=True, exist_ok=True)
+    probe = control_root / (".write-probe-" + uuid.uuid4().hex)
     with probe.open("xb") as stream:
         stream.write(b"fullmag-state-preflight\n")
         stream.flush()
@@ -215,7 +252,7 @@ def serve():
                "bootstrap": bootstrap, "qualification": "NOT VERIFIED"}
     if runtime_recovery is not None:
         receipt["runtime_recovery"] = runtime_recovery
-    receipt_path = paths.state_root / "runtime-service/process-tree.json"
+    receipt_path = service.process_receipt_path(paths)
     result = 1
     last_full_api_probe = 0.0
     degraded_since = None

@@ -603,11 +603,17 @@ STATE_TARGET = "/state/development"
 CONTROL_TARGET = "/opt/fullmag/control"
 ENV_VOLUME_NAME = "FULLMAG_FRONTEND_CACHE_VOLUME"
 ENV_CONTROL_VOLUME = "FULLMAG_BUILD_CONTROL_VOLUME"
+ENV_CONTROL_ROOT = "FULLMAG_FRONTEND_CONTROL_ROOT"
+ENV_INPUTS_PATH = "FULLMAG_DEVELOPMENT_INPUTS_PATH"
 VOLUME_SCHEMA_LABEL = "com.fullmag.frontend-cache.schema"
 VOLUME_PROFILE_LABEL = "com.fullmag.frontend-cache.profile"
 VOLUME_PROJECT_LABEL = "com.fullmag.frontend-cache.project"
 VOLUME_KEY_LABEL = "com.fullmag.frontend-cache.key"
 _V2_VOLUME_PREFIX = "fullmag-frontend-dev-v2"
+_FRONTEND_CONTROL_NAMESPACE = "frontend"
+FRONTEND_CONTROL_UID = 65532
+FRONTEND_CONTROL_GID = 65532
+FRONTEND_CONTROL_MODE = "0700"
 
 
 def _v2_key(
@@ -684,6 +690,28 @@ def _v2_volume_name(project_id: str, key: str) -> str:
     return f"fullmag-fe-v2-{digest}-{key[:32]}"
 
 
+def _v2_control_paths(key: str) -> dict[str, str]:
+    """Return the cache-key namespace in the shared control volume.
+
+    The control volume is shared by the two application services, while the
+    frontend state volume is keyed by dependency identity.  A fixed manifest
+    path would therefore let a newer state volume consume metadata belonging
+    to an older one.  Keep the namespace deterministic and guest-only; the
+    Compose-group helper provisions this directory for UID 65532 before the
+    unprivileged frontend starts.
+    """
+
+    key = _require_sha(key, "cache_key")
+    # The frontend receives only the `frontend` subpath of the shared
+    # control volume mounted at CONTROL_TARGET. Keep each dependency identity
+    # in its own directory within that restricted namespace.
+    root = f"{CONTROL_TARGET}/{key}"
+    return {
+        "control_root": root,
+        "inputs_path": f"{root}/development-inputs.json",
+    }
+
+
 def _v2_cache_paths(
     layout: Mapping[str, Any], key: str, *, compose_project: str | None = None,
     control_volume_name: str | None = None,
@@ -695,11 +723,13 @@ def _v2_cache_paths(
         )
     control = control_volume_name
     _require_identifier(control, "control_volume_name")
+    control_paths = _v2_control_paths(key)
     return {
         "project_id": project_id,
         "volume_name": _v2_volume_name(project_id, key),
         "control_volume_name": control,
         "mount_target": STATE_TARGET,
+        **control_paths,
     }
 
 
@@ -856,6 +886,8 @@ def _v2_prepare(
         ENV_KEY: identity["key"],
         ENV_VOLUME_NAME: paths["volume_name"],
         ENV_CONTROL_VOLUME: paths["control_volume_name"],
+        ENV_CONTROL_ROOT: paths["control_root"],
+        ENV_INPUTS_PATH: paths["inputs_path"],
         ENV_MOUNT_TARGET: STATE_TARGET,
         ENV_RUNTIME_IMAGE_ID: image_id,
         ENV_SOURCE_ROOT: identity["inputs"]["source_root"],
@@ -875,6 +907,13 @@ def _v2_prepare(
         "control_volume_name": paths["control_volume_name"],
         "mount_target": STATE_TARGET,
         "control_target": CONTROL_TARGET,
+        "control_root": paths["control_root"],
+        "inputs_path": paths["inputs_path"],
+        "control_owner": {
+            "uid": FRONTEND_CONTROL_UID,
+            "gid": FRONTEND_CONTROL_GID,
+            "mode": FRONTEND_CONTROL_MODE,
+        },
         "runtime_image_id": image_id,
         "volume": state_volume,
         "control_volume": control_volume,
@@ -888,14 +927,13 @@ def _v2_prepare(
         **receipt,
         "image": image,
         "image_id": image_id,
-        "filesystem_uuid": None,
-        "mount_root": None,
         "children": {
             "state": paths["volume_name"],
             "control": paths["control_volume_name"],
         },
         "guest_targets": {"state": STATE_TARGET, "control": CONTROL_TARGET},
         "maintenance_compose": None,
+        "receipt_storage": "docker-named-volume",
         # A guest path inside the named state volume.  It must not be passed to
         # host-side receipt validators as a host filesystem path.
         "receipt_path": f"{STATE_TARGET}/frontend-cache-receipt.json",
@@ -927,6 +965,11 @@ def _v2_validate_container(
     expected = profile.get("environment")
     if not isinstance(expected, Mapping):
         raise FrontendCacheError("frontend cache profile has no environment")
+    control_paths = _v2_control_paths(str(profile.get("cache_key", "")))
+    if expected.get(ENV_CONTROL_ROOT) != control_paths["control_root"]:
+        raise FrontendCacheError("frontend control namespace is not cache-key scoped")
+    if expected.get(ENV_INPUTS_PATH) != control_paths["inputs_path"]:
+        raise FrontendCacheError("frontend input manifest is not cache-key scoped")
     env = _v2_container_env(document)
     for name in (
         ENV_SCHEMA,
@@ -935,6 +978,8 @@ def _v2_validate_container(
         ENV_KEY,
         ENV_VOLUME_NAME,
         ENV_CONTROL_VOLUME,
+        ENV_CONTROL_ROOT,
+        ENV_INPUTS_PATH,
         ENV_MOUNT_TARGET,
         ENV_RUNTIME_IMAGE_ID,
     ):
@@ -991,6 +1036,8 @@ def _v2_validate_container(
         "cache_key": profile["cache_key"],
         "volume_name": str(source),
         "control_volume_name": str(control_source),
+        "control_root": str(expected[ENV_CONTROL_ROOT]),
+        "inputs_path": str(expected[ENV_INPUTS_PATH]),
         "target": STATE_TARGET,
     }
 

@@ -11,9 +11,24 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import docker_dev
+import fullmag_storage
 
 
 class DockerDevStorageTests(unittest.TestCase):
+    def test_select_source_uses_runtime_only_storage_initialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            layout = {"profile": "docker-all-gpu"}
+            with patch("docker_development_inputs.select_checkout", return_value=repo), \
+                    patch.object(fullmag_storage, "resolve_layout", return_value=layout), \
+                    patch.object(fullmag_storage, "initialize_runtime") as initialize_runtime:
+                selected, observed = docker_dev._select_source(repo, None)
+
+            self.assertEqual(selected, repo.resolve())
+            self.assertIs(observed, layout)
+            initialize_runtime.assert_called_once_with(layout)
+
     def test_project_image_and_control_volume_are_stable_per_group(self):
         project = "fullmag-worktree-example"
         first_image = docker_dev._stable_project_image_reference(project, "runtime")

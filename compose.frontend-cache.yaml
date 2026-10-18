@@ -5,8 +5,9 @@
 # generated workspace/dependency/cache state.  No host storage path, ext4
 # image, loop mount, or maintenance container is part of the active route.
 # Docker seeds a new empty state volume from the image-owned
-# /state/development directory. The shared control volume is initialized by the
-# root-only toolchain helper before the frontend starts.
+# /state/development directory. The root-only backend cache maintenance step
+# provisions the `frontend` subpath before Compose mounts it here. The frontend
+# cannot see backend build provenance through this restricted volume mount.
 services:
   frontend:
     image: "${FULLMAG_FRONTEND_CACHE_RUNTIME_IMAGE_ID:?Attested image identity is required}"
@@ -21,8 +22,11 @@ services:
       FULLMAG_FRONTEND_CACHE_KEY: "${FULLMAG_FRONTEND_CACHE_KEY:?Resolved cache key is required}"
       FULLMAG_FRONTEND_CACHE_VOLUME: "${FULLMAG_FRONTEND_CACHE_VOLUME:?Resolved frontend state volume is required}"
       FULLMAG_BUILD_CONTROL_VOLUME: "${FULLMAG_BUILD_CONTROL_VOLUME:?Resolved shared control volume is required}"
-      FULLMAG_FRONTEND_CONTROL_ROOT: "${FULLMAG_FRONTEND_CONTROL_ROOT:-/opt/fullmag/control/frontend}"
-      FULLMAG_DEVELOPMENT_INPUTS_PATH: "${FULLMAG_DEVELOPMENT_INPUTS_PATH:-/opt/fullmag/control/frontend/development-inputs.json}"
+      # The launcher derives both paths from the v2 cache key.  Do not fall
+      # back to a shared manifest: the control volume is shared by services,
+      # while each frontend state volume owns one cache-key namespace.
+      FULLMAG_FRONTEND_CONTROL_ROOT: "${FULLMAG_FRONTEND_CONTROL_ROOT:?Resolved frontend control namespace is required}"
+      FULLMAG_DEVELOPMENT_INPUTS_PATH: "${FULLMAG_DEVELOPMENT_INPUTS_PATH:?Resolved frontend inputs path is required}"
       FULLMAG_FRONTEND_CACHE_RUNTIME_IMAGE_ID: "${FULLMAG_FRONTEND_CACHE_RUNTIME_IMAGE_ID:?Attested image identity is required}"
     volumes:
       - type: volume
@@ -33,7 +37,7 @@ services:
         source: fullmag-build-control
         target: /opt/fullmag/control
         read_only: false
-        volume: {nocopy: true}
+        volume: {nocopy: true, subpath: frontend}
 
 volumes:
   frontend-development-state:

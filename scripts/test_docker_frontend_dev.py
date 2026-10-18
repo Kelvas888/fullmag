@@ -165,6 +165,7 @@ class BackendHealthcheckContractTests(TestCase):
                         health._check_backend_readiness(receipt)
                 request.assert_not_called()
 
+
     def test_confirmed_supervisor_still_requires_live_native_readiness(self):
         health = load_healthcheck_module()
         with tempfile.TemporaryDirectory(prefix="fullmag-backend-health-") as raw:
@@ -187,6 +188,26 @@ class BackendHealthcheckContractTests(TestCase):
                             health._check_backend_readiness(receipt)
                 self.assertGreater(request.call_args.kwargs["timeout"], 3)
 
+
+class FrontendControlVolumeContractTests(TestCase):
+    def test_cache_key_uses_a_private_control_namespace(self):
+        module = load_module()
+        key = "a" * 64
+        expected_root = Path("/opt/fullmag/control") / key
+        expected_inputs = expected_root / "development-inputs.json"
+        with patch.object(module, "FRONTEND_CACHE_KEY", key), patch.object(
+            module, "FRONTEND_CONTROL_ROOT", expected_root
+        ), patch.object(module, "INPUTS_PATH", expected_inputs):
+            module._validate_control_volume_contract()
+            with patch.object(module, "INPUTS_PATH", expected_root / "other.json"):
+                with self.assertRaisesRegex(module.FrontendDevError, "cache-key manifest"):
+                    module._validate_control_volume_contract()
+
+    def test_invalid_cache_key_is_rejected_before_manifest_access(self):
+        module = load_module()
+        with patch.object(module, "FRONTEND_CACHE_KEY", "wrong"):
+            with self.assertRaisesRegex(module.FrontendDevError, "lowercase SHA-256"):
+                module._validate_control_volume_contract()
 
 class FrontendDevContractTests(TestCase):
     def setUp(self):

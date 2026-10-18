@@ -97,8 +97,12 @@ def tracked_input_files(repo):
                           "compose.toolchain.yaml", "docker/fem-gpu")
     names = sorted((Path(name) for name in tracked.split("\0") if name),
                    key=lambda path: path.as_posix())
-    required = {Path(".dockerignore"), Path("compose.toolchain.yaml"),
-                Path("docker/fem-gpu/Dockerfile")}
+    required = {
+        Path(".dockerignore"),
+        Path("compose.toolchain.yaml"),
+        Path("docker/fem-gpu/Dockerfile"),
+        Path("docker/fem-gpu/Dockerfile.dockerignore"),
+    }
     if not required.issubset(names) or any(name not in eligible for name in names):
         raise BootstrapError("Dependency context requires present Git-tracked canonical inputs")
     return names
@@ -238,8 +242,13 @@ def docker(*args, environment=None, input_data=None):
 
 
 def docker_live(command, *, environment=None, timeout=4 * 60 * 60,
-                maximum=8 * 1024 * 1024):
-    """Stream a BuildKit command without creating a host-side build log."""
+                maximum=8 * 1024 * 1024, output_sink=None):
+    """Stream BuildKit output and optionally persist its bounded observation.
+
+    ``output_sink`` is called from the finalizer, including when the Docker
+    client is interrupted.  The sink must write only to Docker-managed
+    storage; this function never creates a host-side build log.
+    """
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -249,13 +258,20 @@ def docker_live(command, *, environment=None, timeout=4 * 60 * 60,
         bufsize=0,
     )
     output = bytearray()
+    truncated = False
     warned = False
+    code = None
     deadline = time.monotonic() + timeout
     try:
         assert process.stdout is not None
         for line in iter(process.stdout.readline, b""):
             if len(output) < maximum:
-                output.extend(line[: maximum - len(output)])
+                remaining = maximum - len(output)
+                output.extend(line[:remaining])
+                if len(line) > remaining:
+                    truncated = True
+            else:
+                truncated = True
             sys.stdout.buffer.write(line)
             sys.stdout.buffer.flush()
             if not warned and time.monotonic() >= deadline:
@@ -270,6 +286,24 @@ def docker_live(command, *, environment=None, timeout=4 * 60 * 60,
     except KeyboardInterrupt:
         process.wait()
         raise
+    finally:
+        if output_sink is not None:
+            active_error = sys.exc_info()[1]
+            try:
+                output_sink(
+                    bytes(output),
+                    exit_code=code,
+                    truncated=truncated,
+                    interrupted=active_error is not None or code in (130, 143),
+                    observation_budget_exceeded=warned,
+                )
+            except BaseException as sink_error:
+                if active_error is None:
+                    raise
+                print(
+                    f"Docker bootstrap: could not persist partial BuildKit log: {sink_error}",
+                    file=sys.stderr,
+                )
     return code, bytes(output)
 
 
@@ -413,6 +447,8 @@ def build(repo, *, direct_development=False):
             raise
     admission_check = assert_bootstrap_reconciled if direct_development else assert_fresh_host
     admission_check(root, previous)
+    # This small host file is coordination metadata only. Build contexts,
+    # caches, logs, receipts, and manifests remain in Docker-managed storage.
     lock = storage.validate_path(root / "locks/fullmag-heavy.lock", root)
     # Hold the same durable host slot through capture, Docker and inspection.
     with storage.file_lock(lock, "Docker dependency toolchain build"):
@@ -477,12 +513,28 @@ def build(repo, *, direct_development=False):
             receipt["state"] = "building"
             write_control(repo, project_name, CONTROL_RECEIPT,
                           (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode())
+
+            def persist_build_log(data, *, exit_code, truncated, interrupted,
+                                  observation_budget_exceeded):
+                receipt["build_log"] = {
+                    "path": f"{CONTROL_ROOT}/{CONTROL_BUILD_LOG}",
+                    "bytes": len(data),
+                    "exit_code": exit_code,
+                    "truncated": truncated,
+                    "interrupted": interrupted,
+                    "observation_budget_exceeded": observation_budget_exceeded,
+                }
+                write_control(repo, project_name, CONTROL_BUILD_LOG, data)
+
             build_command = [
                 "docker", "--context", "desktop-linux", *definitions,
                 "build", "--pull=false", "--progress=plain", SERVICE,
             ]
-            code, build_output = docker_live(build_command, environment=compose_environment)
-            write_control(repo, project_name, CONTROL_BUILD_LOG, build_output)
+            code, _build_output = docker_live(
+                build_command,
+                environment=compose_environment,
+                output_sink=persist_build_log,
+            )
             receipt["exit_code"] = code
             if code:
                 raise BootstrapError(f"Toolchain build failed (exit {code}); cache and context retained")

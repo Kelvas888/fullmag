@@ -68,6 +68,7 @@ class FrontendNamedVolumeTests(unittest.TestCase):
         self.assertRegex(description["source_commit"], r"^[0-9a-f]{40}$")
         self.assertRegex(description["dependency_seed_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(description["toolpins_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("apps/control-room/next.config.ts", description["dependency_seed_files"])
         self.assertEqual(description["configuration_changes"], "describe_only")
 
     def test_cache_key_does_not_change_when_only_port_changes(self) -> None:
@@ -115,6 +116,26 @@ class FrontendNamedVolumeTests(unittest.TestCase):
                 profile["control_volume_name"],
                 "fullmag-worktree-demo-build-control-v1",
             )
+            self.assertEqual(
+                profile["control_root"],
+                "/opt/fullmag/control/" + profile["cache_key"],
+            )
+            self.assertEqual(
+                profile["inputs_path"], profile["control_root"] + "/development-inputs.json"
+            )
+            self.assertEqual(
+                profile["environment"][cache.ENV_CONTROL_ROOT], profile["control_root"]
+            )
+            self.assertEqual(
+                profile["environment"][cache.ENV_INPUTS_PATH], profile["inputs_path"]
+            )
+            self.assertEqual(
+                profile["control_owner"], {"uid": 65532, "gid": 65532, "mode": "0700"}
+            )
+            self.assertEqual(profile["receipt_storage"], "docker-named-volume")
+            self.assertNotIn("filesystem_uuid", profile)
+            self.assertNotIn("mount_root", profile)
+            self.assertNotIn("helper_sha256", profile)
             self.assertNotIn("storage_root", profile)
             self.assertNotIn("backing_image", profile)
             self.assertEqual(set(docker.volumes), {
@@ -174,6 +195,8 @@ class FrontendNamedVolumeTests(unittest.TestCase):
                 cache.ENV_KEY: "a" * 64,
                 cache.ENV_VOLUME_NAME: "fullmag-worktree-demo-frontend-dev-v2-" + "a" * 32,
                 cache.ENV_CONTROL_VOLUME: "fullmag-worktree-demo-build-control-v1",
+                cache.ENV_CONTROL_ROOT: "/opt/fullmag/control/" + "a" * 64,
+                cache.ENV_INPUTS_PATH: "/opt/fullmag/control/" + "a" * 64 + "/development-inputs.json",
                 cache.ENV_MOUNT_TARGET: "/state/development",
                 cache.ENV_RUNTIME_IMAGE_ID: IMAGE,
             },
@@ -199,6 +222,14 @@ class FrontendNamedVolumeTests(unittest.TestCase):
         }
         self.assertEqual(
             cache.validate_container(document, profile)["volume_name"], expected_volume
+        )
+        profile["environment"][cache.ENV_INPUTS_PATH] = (
+            "/opt/fullmag/control/" + "b" * 64 + "/development-inputs.json"
+        )
+        with self.assertRaisesRegex(cache.FrontendCacheError, "cache-key scoped"):
+            cache.validate_container(document, profile)
+        profile["environment"][cache.ENV_INPUTS_PATH] = (
+            "/opt/fullmag/control/" + "a" * 64 + "/development-inputs.json"
         )
         document["Mounts"][0] = {
             "Type": "bind", "Source": "C:/host-storage", "Destination": "/state/development", "RW": True

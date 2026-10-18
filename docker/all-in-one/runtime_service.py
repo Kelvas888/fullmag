@@ -47,7 +47,18 @@ HOST_LEDGER_PROFILE = "host-ledger-v1"
 HOST_RESOURCE_LEDGER_FILE = "HOST_RESOURCE_LEDGER.json"
 LEGACY_DOCKER_HOST_ID = "docker-all-host"
 MAX_HOST_LEDGER_BYTES = 8 * 1024 * 1024
-CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
+# The accepted store remains the Windows-backed user-data namespace.  Every
+# lifecycle receipt/configuration file is rooted in the separately mounted
+# runtime-control volume.  ``FULLMAG_RUNTIME_SERVICES_ROOT`` is a second view
+# of that same volume at the native SessionStore compatibility path; the Rust
+# service still receives the unchanged accepted-store root and therefore keeps
+# its session/result layout intact.
+RUNTIME_CONTROL_ROOT = Path("/opt/fullmag/runtime-control")
+RUNTIME_SERVICES_RELATIVE = Path("runtime-services")
+CONFIG_RELATIVE = Path("runtime-service/docker-all.json")
+PROCESS_RECEIPT_RELATIVE = Path("runtime-service/process-tree.json")
+FEM_MESH_CACHE_ROOT = Path("/build/cache/fem-mesh")
+CUDA_CACHE_ROOT = Path("/build/cache/cuda-compute")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
 # The native control probe is bounded at three seconds.  Keep the Python
@@ -161,10 +172,15 @@ class RuntimePaths:
     storage: Path = STATE_ROOT
     runs: Path = STATE_ROOT / "runs" / WORKTREE_ID
     store: Path = STATE_ROOT / "runs" / WORKTREE_ID / "session-store"
+    # ``state_root`` is the technical runtime-control root for paths returned
+    # by ``canonical_paths``.  The legacy default remains for source-only
+    # callers that construct RuntimePaths() directly; Docker always supplies
+    # the explicit volume path through the environment below.
     state_root: Path = STATE_ROOT / ".fullmag"
+    runtime_services: Path | None = None
     source: Path = SOURCE_ROOT
     package: Path = PACKAGE_ROOT
-    config: Path = STATE_ROOT / CONFIG_RELATIVE
+    config: Path = STATE_ROOT / ".fullmag" / CONFIG_RELATIVE
     provenance: Path = IMAGE_ROOT / "provenance.json"
     host_certificate: Path = HOST_CERTIFICATE
 
@@ -291,7 +307,7 @@ def _read_recovery_authorization(paths: RuntimePaths, authorization_path: Path) 
     request_id = authorization.get("request_id")
     if (
         not isinstance(request_path_value, str)
-        or not request_path_value.startswith("/state/")
+        or not request_path_value.startswith("/")
         or "/../" in request_path_value
         or not isinstance(request_sha256, str)
         or HEX64.fullmatch(request_sha256) is None
@@ -300,12 +316,17 @@ def _read_recovery_authorization(paths: RuntimePaths, authorization_path: Path) 
     ):
         _fail("runtime recovery authorization has an invalid native request pin")
     request_path = _absolute(Path(request_path_value), "native recovery request")
-    try:
-        request_relative = request_path.relative_to(paths.state)
-    except ValueError:
-        _fail("native recovery request is outside the fixed /state root")
-    if request_path != paths.state / request_relative:
-        _fail("native recovery request is outside the fixed /state root")
+    request_root = None
+    for candidate in (paths.state_root, paths.state):
+        try:
+            request_relative = request_path.relative_to(candidate)
+        except ValueError:
+            continue
+        if request_path == candidate / request_relative:
+            request_root = candidate
+            break
+    if request_root is None:
+        _fail("native recovery request is outside the accepted or runtime-control root")
     request_raw = _bounded_regular(
         request_path, "native recovery request", MAX_RECOVERY_AUTHORIZATION_BYTES
     )
@@ -326,12 +347,12 @@ def _read_recovery_authorization(paths: RuntimePaths, authorization_path: Path) 
     if _sha256_bytes(config_raw) != config_sha256 or request.get("config_sha256") != config_sha256:
         _fail("runtime recovery configuration changed after host authorization")
     owner_raw = _bounded_regular(
-        paths.store / "runtime-services" / "OWNER.json",
+        runtime_services_root(paths) / "OWNER.json",
         "runtime service owner",
         MAX_RECOVERY_AUTHORIZATION_BYTES,
     )
     launch_raw = _bounded_regular(
-        paths.store / "runtime-services" / "LAUNCH.json",
+        runtime_services_root(paths) / "LAUNCH.json",
         "runtime service launch record",
         MAX_RECOVERY_AUTHORIZATION_BYTES,
     )
@@ -467,21 +488,57 @@ def _env_path(environment: Mapping[str, str], name: str, default: Path) -> Path:
     return _absolute(environment.get(name, str(default)), name)
 
 
+def runtime_services_root(paths: RuntimePaths) -> Path:
+    """Return the technical runtime-services view backed by named storage.
+
+    Native Fullmag keeps the relative ``runtime-services`` layout below the
+    accepted SessionStore.  Docker mounts the runtime-control named volume at
+    that compatibility path as well as at ``runtime_services``.  Keeping this
+    lookup in one helper prevents Python lifecycle checks from accidentally
+    returning to the Windows session bind.
+    """
+
+    return paths.runtime_services or (paths.store / RUNTIME_SERVICES_RELATIVE)
+
+
+def process_receipt_path(paths: RuntimePaths) -> Path:
+    """Return the authenticated PID-1 receipt in technical runtime storage."""
+
+    return paths.state_root / PROCESS_RECEIPT_RELATIVE
+
+
+def _store_relative_path(paths: RuntimePaths, relative: PurePosixPath) -> Path:
+    """Map native store-relative evidence to its volume-backed runtime view."""
+
+    parts = relative.parts
+    if parts and parts[0] == RUNTIME_SERVICES_RELATIVE.name:
+        return runtime_services_root(paths).joinpath(*parts[1:])
+    return paths.store.joinpath(*parts)
+
+
 def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePaths:
     environment = os.environ if environment is None else environment
     state = _env_path(environment, "FULLMAG_CONTAINER_STATE_ROOT", STATE_ROOT)
     storage = _env_path(environment, "FULLMAG_PROJECT_STORAGE_ROOT", state)
     runs = _env_path(environment, "FULLMAG_RUNS_ROOT", storage / "runs" / WORKTREE_ID)
-    state_root = _env_path(environment, "FULLMAG_STATE_ROOT", state / ".fullmag")
+    runtime_control = _env_path(
+        environment, "FULLMAG_RUNTIME_CONTROL_ROOT", RUNTIME_CONTROL_ROOT
+    )
+    state_root = _env_path(environment, "FULLMAG_STATE_ROOT", runtime_control)
+    runtime_services = _env_path(
+        environment,
+        "FULLMAG_RUNTIME_SERVICES_ROOT",
+        runtime_control / RUNTIME_SERVICES_RELATIVE,
+    )
     source = _env_path(environment, "FULLMAG_REPO_ROOT", SOURCE_ROOT)
     package = _env_path(environment, "FULLMAG_RUNTIME_ROOT", PACKAGE_ROOT)
-    config = state / CONFIG_RELATIVE
+    config = runtime_control / CONFIG_RELATIVE
     if state != STATE_ROOT or storage != STATE_ROOT:
         _fail("all-in-Docker accepted storage is fixed to /state")
     if runs != STATE_ROOT / "runs" / WORKTREE_ID:
         _fail("FULLMAG_RUNS_ROOT must be /state/runs/docker-all")
-    if state_root != STATE_ROOT / ".fullmag":
-        _fail("FULLMAG_STATE_ROOT must be /state/.fullmag")
+    if state_root != runtime_control:
+        _fail("FULLMAG_STATE_ROOT must equal FULLMAG_RUNTIME_CONTROL_ROOT")
     if source != SOURCE_ROOT or package != PACKAGE_ROOT:
         _fail("all-in-Docker source and package roots are immutable")
     if environment.get("FULLMAG_WORKTREE_ID", WORKTREE_ID) != WORKTREE_ID:
@@ -489,7 +546,7 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
     if "FULLMAG_STATE_DIR" in environment and _absolute(
         environment["FULLMAG_STATE_DIR"], "FULLMAG_STATE_DIR"
     ) != state_root:
-        _fail("FULLMAG_STATE_DIR must be /state/.fullmag")
+        _fail("FULLMAG_STATE_DIR must equal FULLMAG_RUNTIME_CONTROL_ROOT")
     if "FULLMAG_RUNTIME_SERVICE_CONFIG" in environment and _absolute(
         environment["FULLMAG_RUNTIME_SERVICE_CONFIG"], "FULLMAG_RUNTIME_SERVICE_CONFIG"
     ) != config:
@@ -500,6 +557,7 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
         runs=runs,
         store=runs / "session-store",
         state_root=state_root,
+        runtime_services=runtime_services,
         source=source,
         package=package,
         config=config,
@@ -515,7 +573,8 @@ def prepare_storage(paths: RuntimePaths | None = None) -> RuntimePaths:
     if os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") != WINDOWS_STORAGE_PROFILE:
         _fail("all-in-Docker storage requires explicit windows-folder-v1 admission")
     _ensure_directory(paths.state, "container state")
-    _ensure_directory(paths.state_root, "Fullmag state")
+    _ensure_directory(paths.state_root, "runtime control volume")
+    _ensure_directory(runtime_services_root(paths), "runtime services volume view")
     _ensure_directory(
         paths.state_root / "local-live" / "current",
         "current live workspace",
@@ -539,14 +598,23 @@ def api_environment(paths: RuntimePaths, config_path: Path | None = None) -> dic
     if config_path != paths.config:
         _fail("runtime service config path is not canonical")
     values = {
-        "HOME": str(paths.state),
+        # HOME is technical process state in the container.  User projects,
+        # sessions and results remain addressed through the explicit /state
+        # project and runs roots below.
+        "HOME": str(paths.state_root),
         "FULLMAG_PROJECT_STORAGE_ROOT": str(paths.storage),
         "FULLMAG_RUNS_ROOT": str(paths.runs),
         "FULLMAG_WORKTREE_ID": WORKTREE_ID,
         "FULLMAG_STATE_ROOT": str(paths.state_root),
         "FULLMAG_STATE_DIR": str(paths.state_root),
+        "FULLMAG_RUNTIME_CONTROL_ROOT": str(paths.state_root),
+        "FULLMAG_RUNTIME_SERVICES_ROOT": str(runtime_services_root(paths)),
         "FULLMAG_REPO_ROOT": str(paths.source),
         "FULLMAG_RUNTIME_ROOT": str(paths.package),
+        "FULLMAG_FEM_MESH_CACHE_DIR": os.environ.get(
+            "FULLMAG_FEM_MESH_CACHE_DIR", str(FEM_MESH_CACHE_ROOT)
+        ),
+        "CUDA_CACHE_PATH": os.environ.get("CUDA_CACHE_PATH", str(CUDA_CACHE_ROOT)),
         "FULLMAG_SESSION_STORAGE_PROFILE": WINDOWS_STORAGE_PROFILE,
         "FULLMAG_RUNTIME_SERVICE_CONFIG": str(config_path),
     }
@@ -1089,7 +1157,7 @@ def _recovery_log_sources(owner: Mapping[str, Any]) -> set[str]:
 
 def _observe_recovery_log_sources(paths: RuntimePaths, owner: Mapping[str, Any]) -> set[str]:
     owner_token = _recovery_store_id(owner.get("owner_token"), "runtime recovery owner token")
-    log_dir = paths.store / "runtime-services" / owner_token
+    log_dir = runtime_services_root(paths) / owner_token
     _assert_no_links(log_dir, "native recovery scheduler evidence")
     if not log_dir.is_dir() or log_dir.is_symlink():
         _fail("native recovery scheduler evidence directory is missing")
@@ -1182,7 +1250,7 @@ def _validate_native_recovery_result(
         _fail("native runtime recovery archive manifest inventory differs from the receipt")
     if manifest.get("absent_sources", {}) != absent:
         _fail("native runtime recovery absent-source inventory differs from the receipt")
-    current_owner_path = paths.store / "runtime-services" / "OWNER.json"
+    current_owner_path = runtime_services_root(paths) / "OWNER.json"
     current_owner_raw = _bounded_regular(
         current_owner_path, "native recovery current owner", MAX_JSON_BYTES
     )
@@ -1237,7 +1305,7 @@ def _validate_native_recovery_result(
             if expected_digest != authorization.get("config_sha256"):
                 _fail("native recovery raw configuration archive digest is not pinned")
             continue
-        source_path = paths.store.joinpath(*source_relative.parts)
+        source_path = _store_relative_path(paths, source_relative)
         source_bytes = _bounded_regular(source_path, "native recovery source evidence", maximum)
         if source_value == "runtime-services/OWNER.json":
             if _sha256_bytes(source_bytes) != after:
@@ -1249,7 +1317,7 @@ def _validate_native_recovery_result(
                 _fail(f"native recovery archive evidence differs: {source_relative}")
     for source_value in absent_sources:
         source_relative = _recovery_relative_path(source_value, "native absent source path")
-        source_path = paths.store.joinpath(*source_relative.parts)
+        source_path = _store_relative_path(paths, source_relative)
         _assert_no_links(source_path.parent, "native absent source parent")
         if os.path.lexists(source_path):
             _fail(f"native recovery absent source exists: {source_relative}")
@@ -1627,7 +1695,7 @@ def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str)
 def _read_authenticated_terminal_drain(paths: RuntimePaths) -> dict[str, Any]:
     """Validate the previous entrypoint's authenticated terminal drain proof."""
 
-    receipt_path = paths.state_root / "runtime-service/process-tree.json"
+    receipt_path = process_receipt_path(paths)
     receipt = _read_json(receipt_path, "previous runtime service process receipt")
     if (receipt.get("schema") != "fullmag.docker-process-tree.v1"
             or receipt.get("state") != "drained"):
@@ -1643,7 +1711,7 @@ def _read_authenticated_terminal_drain(paths: RuntimePaths) -> dict[str, Any]:
     if service_owner_present:
         _validate_terminal_owner(service_owner, state="ready", name="previous service owner")
 
-    owner_path = paths.store / "runtime-services" / "OWNER.json"
+    owner_path = runtime_services_root(paths) / "OWNER.json"
     owner = _read_json(owner_path, "terminal runtime service owner")
     _validate_terminal_owner(owner, state="drained", name="persisted terminal owner")
     if (_owner_identity(owner) != _owner_identity(terminal_owner)
@@ -1692,7 +1760,7 @@ def _assert_owner_lock_identity(
 def _authenticated_terminal_drain(paths: RuntimePaths):
     """Hold the native owner lock while validating and rotating generations."""
 
-    lock_path = paths.store / "runtime-services" / "OWNER.lock"
+    lock_path = runtime_services_root(paths) / "OWNER.lock"
     _assert_no_links(lock_path, "runtime service owner lock")
     try:
         import fcntl
@@ -1789,7 +1857,7 @@ def _service_status(paths: RuntimePaths) -> dict[str, Any]:
 def _read_ready_owner(paths: RuntimePaths) -> dict[str, Any]:
     """Read the already-published owner without starting another native CLI."""
 
-    owner_path = paths.store / "runtime-services" / "OWNER.json"
+    owner_path = runtime_services_root(paths) / "OWNER.json"
     deadline = time.monotonic() + READY_OWNER_MISSING_RETRY_SECONDS
     while True:
         try:
@@ -1812,7 +1880,7 @@ def _owner_pin_path(paths: RuntimePaths, owner: Mapping[str, Any]) -> Path:
     token = owner.get("owner_token")
     if not isinstance(token, str) or not OWNER_TOKEN_RE.fullmatch(token):
         _fail("canonical runtime service owner has an invalid owner token")
-    return paths.store / "runtime-services" / f"docker-client-{token}.json"
+    return runtime_services_root(paths) / f"docker-client-{token}.json"
 
 
 def _pin_owner(paths: RuntimePaths, owner: Mapping[str, Any]) -> Path:
