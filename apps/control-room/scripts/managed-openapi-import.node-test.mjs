@@ -415,3 +415,42 @@ test("native receipt requires absolute matching paths and an explicit input", ()
   });
   assertPreserved(item, noInput, /requires --input/);
 });
+
+test("direct Compose proof admits a running-service export without Cargo fallback", () => {
+  const item = fixture("dirty", "raw.json");
+  const proof = join(item.root, "direct-proof.json");
+  const raw = readFileSync(item.input);
+  writeFileSync(proof, JSON.stringify({
+    schema: "fullmag.direct-compose-openapi-codegen.v1",
+    state: "succeeded",
+    exit_code: 0,
+    compose_project: "fullmag-worktree-fixture",
+    backend_container_id: "backend-fixture",
+    frontend_container_id: "frontend-fixture",
+    source_commit: commit,
+    source_snapshot_sha256: snapshot,
+    source_digest: sourceDigest,
+    source_identity: {
+      git_commit: commit,
+      source_snapshot_sha256: snapshot,
+      source_digest: sourceDigest,
+      worktree_state: "dirty",
+      native_source_identity_sha256: "e".repeat(64),
+    },
+    backend_build_receipt_sha256: "f".repeat(64),
+    backend_provenance_sha256: "1".repeat(64),
+    api_binary_sha256: "2".repeat(64),
+    raw_openapi_sha256: sha256(raw),
+    raw_openapi_bytes: raw.length,
+    stderr_sha256: "3".repeat(64),
+    stderr_bytes: 0,
+    source_probe_live_manifest_sha256: "4".repeat(64),
+  }));
+  const result = invoke(item, item.input, [
+    "--expected-source-digest", sourceDigest,
+    "--direct-compose-receipt", proof,
+  ]);
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(readFileSync(item.output, "utf8"))["x-fullmag-build-identity"].git_commit, "generated-artifact");
+});

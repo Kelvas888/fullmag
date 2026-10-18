@@ -32,6 +32,10 @@ docker-dev-toolchain:
 docker-dev source_root="" port="3197" script="" gpu_access="auto":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" up --port {{quote(port)}} --gpu-access {{quote(gpu_access)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if script == "" { "" } else { "--script " + quote(script) }}}
 
+# Codegen through the already-running services; no Compose lifecycle operation.
+docker-dev-codegen source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" codegen-openapi {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
+
 # Controlled recreation of one terminal failed direct-development run.  The
 # receipt and config digest are mandatory; this is not unknown-owner recovery.
 docker-dev-recreate run_receipt previous_config_sha256 source_root="" port="3197" gpu_access="auto":
@@ -601,9 +605,12 @@ verify-authoring-contracts:
 verify-authoring-scene-adapter:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route authoring-scene-adapter-tests --repo-root "{{repo_root}}"
 
-# Managed OpenAPI source generation; the emitted JSON remains a versioned
-# frontend artifact, while all Cargo output stays under canonical storage.
-generate-api-openapi:
+# Daily OpenAPI source generation uses the already-running fixed DEV services.
+generate-api-openapi source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" codegen-openapi {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
+
+# Explicit legacy release/CI route. It is never the daily Docker DEV path.
+generate-api-openapi-legacy:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-openapi-codegen --repo-root "{{repo_root}}"
 
 # Read-only diagnostic export from a terminal, verified BuildRunner package.

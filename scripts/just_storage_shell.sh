@@ -152,9 +152,15 @@ case "${recipe}" in
   *"scripts/docker_dev.py"*)
     docker_dev_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" build --gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?[[:space:]]*$"
     docker_dev_up_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" up --port '([0-9]{4,5})' --gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?( --script '([^']+)')?[[:space:]]*$"
+    docker_dev_codegen_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" codegen-openapi( --source-root '([^']+)')?[[:space:]]*$"
     docker_dev_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate --direct-development --run-receipt '([^']+)' --previous-config-sha256 '([0-9a-f]{64})' --gpu-access '(auto|required|disabled)'[ ]+(--source-root '([^']+)'[ ]+)?--port '([0-9]{4,5})'[[:space:]]*$"
     docker_dev_args=(--repo-root "${repo_root}")
-    if [[ "${recipe}" =~ ${docker_dev_build_pattern} ]]; then
+    if [[ "${recipe}" =~ ${docker_dev_codegen_pattern} ]]; then
+      docker_dev_args+=(codegen-openapi)
+      if [[ -n "${BASH_REMATCH[1]:-}" ]]; then
+        docker_dev_args+=(--source-root "${BASH_REMATCH[1]}")
+      fi
+    elif [[ "${recipe}" =~ ${docker_dev_build_pattern} ]]; then
       docker_dev_args+=(build --gpu-access "${BASH_REMATCH[1]}")
       if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
         docker_dev_args+=(--source-root "${BASH_REMATCH[3]}")

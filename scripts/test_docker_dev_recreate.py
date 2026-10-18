@@ -260,6 +260,7 @@ class DockerDevRecreateContract(unittest.TestCase):
             self.assertEqual(
                 sorted(unreferenced_inputs["dependency_seed_files"]),
                 sorted({
+                    "apps/control-room/next.config.ts",
                     "apps/control-room/package.json", "package.json", "pnpm-lock.yaml",
                     "pnpm-workspace.yaml",
                     "patches/next@16.3.8.patch", "patches/unregistered.patch",
@@ -803,6 +804,34 @@ class DockerDevRecreateContract(unittest.TestCase):
             self.assertEqual(environment["FULLMAG_SOURCE_GIT_COMMON"], "/opt/fullmag/source-git")
             self.assertNotIn("FULLMAG_BACKEND_SOURCE_MANIFEST", environment)
 
+    def test_cache_maintenance_inherits_complete_compose_interpolation_environment(self):
+        import docker_backend_volume_cache
+        environment = {
+            "FULLMAG_SOURCE_ROOT": "C:/checkout",
+            "FULLMAG_SOURCE_GIT_COMMON": "C:/main/.git",
+            "FULLMAG_SOURCE_COMMIT": "a" * 40,
+            "FULLMAG_TOOLCHAIN_IMAGE_ID": "sha256:" + "b" * 64,
+            "FULLMAG_WORKSPACE_STATE_ROOT": "C:/storage/user-data/group",
+        }
+        image = "sha256:" + "c" * 64
+        identity = {"project_name": "fullmag-worktree-test", "project_id": "fullmag",
+                    "worktree_id": "test", "checkout_kind": "worktree"}
+        def prepare(_layout, _repo, _image, _run, _docker, maintenance, **_kwargs):
+            profile = {"state": "ready", "environment": {}}
+            maintenance(profile, {"services": {"backend-cache-volume-maintenance": {"environment": {}}}})
+            return profile
+        with patch.object(docker_dev, "_compose_identity", return_value=identity), \
+                patch.object(docker_dev, "_compose_identity_environment", return_value={}), \
+                patch.object(docker_backend_volume_cache, "prepare_ready", side_effect=prepare), \
+                patch.object(docker_dev, "_docker_capture", return_value="{}") as capture:
+            docker_dev._prepare_backend_cache({}, Path("repo"), image, Path("run"), Path("source"),
+                                              "sha256:" + "b" * 64, compose_environment=environment)
+        observed = capture.call_args.kwargs["environment"]
+        for name, value in environment.items():
+            self.assertEqual(observed[name], value)
+        self.assertEqual(observed["FULLMAG_RUNTIME_IMAGE_ID"], image)
+        self.assertEqual(observed["FULLMAG_DEV_IMAGE"], image)
+
     def test_backend_image_build_receives_git_common_before_first_compose_call(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -853,6 +882,7 @@ class DockerDevRecreateContract(unittest.TestCase):
 
             def runtime_image(_args, _repo, environment, *_rest):
                 self.assertEqual(_repo, selected)
+                self.assertEqual(environment.get("FULLMAG_SOURCE_COMMIT"), "a" * 40)
                 events.append(("image-build", environment.get("FULLMAG_SOURCE_GIT_COMMON")))
                 return "fullmag/fullmag-dev:local", "sha256:" + "d" * 64, {}, False
 

@@ -1291,7 +1291,8 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
 
 
 def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: str,
-                           run_root: Path, selected: Path, toolchain_id: str) -> dict[str, object]:
+                           run_root: Path, selected: Path, toolchain_id: str, *,
+                           compose_environment: Mapping[str, str]) -> dict[str, object]:
     """Prepare the v2 Docker-VM named-volume pair and its fixed helper.
 
     The legacy loop-image adapter remains available to its existing callers.
@@ -1353,11 +1354,17 @@ def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: s
         if not isinstance(cache_environment, Mapping) or not isinstance(service_environment, Mapping):
             raise _fail("backend cache did not return canonical runtime and maintenance environments")
         maintenance_environment = {
+            # Compose interpolates unrelated application services as well as
+            # this helper. Preserve the complete selected-checkout environment.
+            **dict(compose_environment),
             **_compose_identity_environment(layout),
             **{str(key): str(value) for key, value in cache_environment.items()},
             **{str(key): str(value) for key, value in service_environment.items()},
             "FULLMAG_BUILD_CONTROL_VOLUME": control_volume,
             "FULLMAG_BACKEND_CACHE_CONTROL_VOLUME": control_volume,
+            "FULLMAG_RUNTIME_IMAGE_ID": image_id,
+            "FULLMAG_DEV_IMAGE": image_id,
+            "FULLMAG_RELEASE_IMAGE": image_id,
         }
         output = _docker_capture(
             *_compose_prefix(repo, [repo / COMPOSE_RUNTIME_FILE], project),
@@ -2088,6 +2095,11 @@ def _backend_start_inputs(
         # Compose interpolation.  The image build context validates this
         # source bind before the long-lived backend service starts.
         git_common = _source_git_common_directory(selected)
+        from fullmag_storage import git as storage_git
+
+        build_source_commit = storage_git(selected, "rev-parse", "HEAD")
+        if COMMIT_RE.fullmatch(build_source_commit) is None:
+            raise _fail("selected checkout has no canonical HEAD commit before image build")
         placeholder_environment = {
             **_compose_identity_environment(layout),
             "FULLMAG_DEV_IMAGE": getattr(args, "image", None)
@@ -2109,6 +2121,7 @@ def _backend_start_inputs(
             ),
             "FULLMAG_SOURCE_ROOT": str(selected),
             "FULLMAG_SOURCE_GIT_COMMON": str(git_common),
+            "FULLMAG_SOURCE_COMMIT": build_source_commit,
             "FULLMAG_BACKEND_PACKAGE": "/opt/fullmag/package",
             "FULLMAG_STATE_ROOT": str(resolved_root / "state"),
             "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
@@ -2155,8 +2168,6 @@ def _backend_start_inputs(
             device_access, gpu_access_policy, image_id, compose_project
         )
 
-        from fullmag_storage import git as storage_git
-
         source_commit = storage_git(selected, "rev-parse", "HEAD")
         if COMMIT_RE.fullmatch(source_commit) is None:
             raise _fail("selected checkout has no canonical HEAD commit")
@@ -2165,7 +2176,10 @@ def _backend_start_inputs(
             "source_commit": source_commit,
             "git_common_dir": str(git_common),
         }
-        cache = _prepare_backend_cache(layout, selected, image_id, resolved_root, selected, toolchain_id)
+        cache = _prepare_backend_cache(
+            layout, selected, image_id, resolved_root, selected, toolchain_id,
+            compose_environment=placeholder_environment,
+        )
         package = _backend_cache_package_root(cache)
         # ``package`` is a daemon-side /mnt path supplied by the cache helper;
         # native Windows Python cannot inspect it.  The fixed backend service
@@ -2470,6 +2484,17 @@ def _parser() -> argparse.ArgumentParser:
                              help="optional simulation script, relative to the selected checkout or absolute inside it (up only)")
         if name == "build":
             command.set_defaults(script=None)
+    codegen_parser = subparsers.add_parser(
+        "codegen-openapi",
+        help=(
+            "run OpenAPI and TypeScript codegen through the already-running "
+            "backend/frontend services of the selected Compose group"
+        ),
+    )
+    codegen_parser.add_argument(
+        "--source-root", type=Path,
+        help="registered checkout/worktree mounted by the running services",
+    )
     recreate_parser = subparsers.add_parser(
         "recreate",
         help="recreate the named development run while retaining its state and session store",
@@ -2542,6 +2567,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             up(args)
         elif args.action == "recreate":
             recreate(args)
+        elif args.action == "codegen-openapi":
+            from docker_dev_codegen import run as run_codegen
+
+            return run_codegen(args.repo_root.resolve(strict=True), args.source_root)
         else:
             raise _fail(f"unsupported action: {args.action}")
         return 0
