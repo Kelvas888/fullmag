@@ -11,7 +11,7 @@ Data audytu: 2026-10-18. Zakres: tylko odczyt worktree wybranego worktree zadani
 - Próbka bazowej gałęzi `codex/docker-cpu-startup-20261018` wskazuje commit `dc2bc2698e2c72d254bc8b3edd709c32441825cf`; blob bazowego `justfile` ma SHA256 `04591409a5439a39f47f415557b29cd096380d56ee9db173899da2aa9d658014`. Różnica względem bieżącego pliku ogranicza się do dopisania `gpu_access="auto"` oraz `--gpu-access` w receptach `docker-dev` (linia 32), `docker-dev-recreate` (37) i `docker-dev-build` (46). Obecne argumenty CPU w `windows-build` (389), `windows-test-fem` (403), `build` (440), `run-topological-charge-skyrmion-smoke` (790), receptach relaksacji (1026, 1372), oraz kwalifikacji FEM (1526, 3002) są obecne również w bazowym blobie i nie powinny być przypisywane temu dirty diffowi.
 - Tożsamość i dirty status potwierdził agent nadrzędny natywnym Git dla Windows. Odczyt WSL Git nie interpretuje Windowsowego wskaźnika worktree.
 
-## Aktualizacja aktywnej trasy Docker DEV — źródło `69bfd1c44`
+## Aktualizacja aktywnej trasy Docker DEV — źródło `9a798d280`
 
 Powyższy inwentarz justfile jest audytem bazowym z 18.10.2026. Jego wiersze
 `Docker dev` i `Docker dev Compose` opisują stan sprzed migracji i nie są opisem
@@ -34,6 +34,13 @@ bieżącego HEAD. Dla codziennego `live-shadow-v1` aktualny przegląd źródeł 
   retencji. Usunięcie kontenera nie usuwa nazwanych wolumenów ani warstw/cache.
   Cold build, start, inspect mountów, cache-hit po restarcie i HMR pozostają
   `NOT VERIFIED` bez dowodu z Docker Desktop.
+
+Aktualny `justfile` ma 7516 linii, 717145 bajtów i SHA256
+`d52763ba8ac9e8e0daa63d3c4c61ed8fe53794866195044b863454495c44ee2d`.
+Zapisany wyżej hash `5d0c021a…` i rozmiar 7514/716999 opisują bazowy odczyt,
+nie obecny plik. Od źródła `69bfd1c44` doszły dwie linie komentarza
+oznaczające `docker-all-*` jako legacy; nie zmieniły recept. Bieżący dump
+`just --dump --dump-format json` nadal wykazuje 612 aktywnych recept.
 
 Tabela i hash justfile poniżej zachowują odtwarzalność pierwotnego audytu
 wszystkich 612 aktywnych recept. Przed użyciem innych rodzin niż codzienny DEV

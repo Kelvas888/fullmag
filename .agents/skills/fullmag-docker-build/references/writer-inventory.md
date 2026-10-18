@@ -6,7 +6,7 @@ sprawdzono natywnym Git dla Windows; WSL Git nie interpretuje jego Windowsowego
 wskaźnika `.git`. Numery linii odnoszą się do tego odczytu. To mapa do ponownej
 weryfikacji przy zmianie kodu, nie dowód uruchomienia wszystkich tras.
 
-## Aktualny daily `live-shadow-v1` — odczyt źródeł HEAD `69bfd1c44`
+## Aktualny daily `live-shadow-v1` — odczyt źródeł HEAD `9a798d280`
 
 To źródłowy przegląd delty po migracji, a nie dowód runtime. W aktywnej grupie
 DEV backend `/build` i `/opt/fullmag/package`, frontend `/state/development`
@@ -17,12 +17,38 @@ readonly dla kontenerów. Backend-volume helper i frontend cache v2 przypinają
 nazwy/labels do grupy i cache identity; normalny restart nie usuwa cache.
 
 Hostowy `storage` nadal ma operacyjne/runtime zapisy: marker projektu, worktree
-index i link registry, locki/owner oraz wymagane admission records; mały
-`runs/docker-dev/<run-id>` dla stanu i pointera operatora; certyfikat hosta,
-startup/recovery evidence oraz host-ledger; a także `user-data/<compose-project>`
-z sesjami, projektami, wynikami i ustawieniami. Te pliki wspierają ownership,
-przekazanie runtime lub dane użytkownika; nie są cache kompilacji. Weryfikuj
-rzeczywiste nazwy i mounty przy zmianie launchera.
+index i link registry, locki/owner oraz wymagane admission records; małe
+`runs/docker-dev/<run-id>` i `runs/docker-all/<run-id>` dla stanu i pointera
+operatora; certyfikat hosta, startup/storage-probe evidence oraz host-ledger;
+a także `user-data/<compose-project>` z sesjami, projektami, wynikami i
+ustawieniami. Te pliki wspierają ownership, przekazanie runtime, kontrolę
+storage lub dane użytkownika; nie są cache kompilacji.
+
+Dokładna granica codziennej trasy:
+
+- `scripts/docker_dev.py::_new_run_root` tworzy mały
+  `storage/runs/docker-dev/<run-id>/state`; przygotowanie backendu zapisuje tam
+  marker `host-certificate.json`. To Windowsowy handoff i wymagany dowód
+  storage, nie workspace, cache ani pakiet buildu.
+- `scripts/fullmag_docker_runtime.py::_runtime_run_root_path` tworzy
+  `storage/runs/docker-all/<run-id>`. Szczegółowy receipt/assembly i backend
+  inputs są publikowane do control volume; hostowy `receipt.json` jest tylko
+  wskaźnikiem operatora. Startup provenance i opcjonalny storage-probe log są
+  małymi dowodami runu. Sesje/wyniki nadal używają Windows storage.
+- Gdy trwa `backend_start`, Compose JSON i source/GPU/startup/recovery overlaye
+  są tymczasowo tworzone w katalogu systemowego temp przez `tempfile.mkdtemp`,
+  poza projektem `storage`; launcher usuwa go w `finally`. To małe wejście
+  klienta Compose, a nie Docker build context ani wynik kompilacji. Nagłe
+  zakończenie procesu może pozostawić taki katalog tymczasowy; bieżąca ścieżka
+  nie ma jego osobnego GC.
+- BuildKit otrzymuje kontekst z readonly checkoutu. Nie znaleziono stagingu
+  kontekstu obrazu w `storage`. Backend `/build`, pakiet `/opt/fullmag/package`,
+  frontend `/state/development` i techniczne receipts/logi są w nazwanych
+  wolumenach grupy; warstwy obrazu i cache BuildKit należą do Docker Engine.
+
+Weryfikuj rzeczywiste nazwy i mounty przy zmianie launchera. Systemowy temp
+jest wyjątkiem dla krótkich metadanych Compose, nie miejscem na źródła, cache,
+pakiety, logi buildu ani trwałe receipty.
 
 Migracja **nie implementuje** automatycznego usuwania starych wersji named
 volumes, obrazów ani BuildKit cache i nie ustala quota. Wolumeny `external`
