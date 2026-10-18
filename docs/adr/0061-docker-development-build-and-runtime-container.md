@@ -84,9 +84,10 @@ wymaga wolnego miejsca, braku aktywnego właściciela grupy oraz istniejących
 bramek recovery, provenance i storage. Niedostatek miejsca blokuje tę operację,
 bez fallbacku na 9p i bez kasowania Cargo target.
 
-Wdrożenie v2 jest **w toku, runtime NOT VERIFIED**. Wymaga spięcia adaptera,
-Compose, launchera, runtime preflight i administracyjnego recovery oraz
-regresji obcych/niepełnych wolumenów i restartu wrappera. Odbiór obejmuje
+Wdrożenie v2 jest **w toku, runtime NOT VERIFIED**. Adapter, Compose i launcher
+przechodzą kontrakty źródłowe; przygotowanie pary oraz migracja markerów mają
+dowód rzeczywistego wykonania. Pozostają runtime preflight, administracyjne
+recovery i restart wrappera w pełnym cyklu aplikacji. Odbiór obejmuje
 rzeczywisty typ i tożsamość mountów, cold build, restart bez zmian, przyrostową
 edycję modułu, izolację grup i zachowanie danych Windows. Stary cache może
 zostać wycofany dopiero po osobnej kontroli użycia, referencji i rollbacku.
