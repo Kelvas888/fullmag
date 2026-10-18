@@ -82,11 +82,11 @@ Zmiana wrappera/resolvera może zmienić zapisy każdej recepty bez zmiany jej c
 ## Delta wdrożenia volume DEV
 
 Powyższy manifest i numery linii opisują stan bazowy. Po wdrożeniu migracji
-aktualny dump `just --dump --dump-format json` zawiera **619** aktywnych recept.
+dump checkpointu `e56d6828d59c216225245808a0c03f081f56b4c3` zawiera **619** aktywnych recept.
 Nie wykonano wszystkich recept; kwalifikacja runtime dotyczy jawnie opisanych
 prób DEV. Nie przenoś wyniku na release, CI, benchmarki ani kwalifikację naukową.
 
-Wejścia po zmianie:
+Wejścia tego checkpointu, sprzed integracji mastera `fc50a43efa6a19ed10e03e1f9a0060809014605f`:
 
 - `justfile`: `4d6b20206f98c0fc79915c811899febe7c70da608ba88c83e71a6d94e26a39c0`;
 - `scripts/just_storage_shell.sh`: `2aaef57f7cded6b4d293212cc313cc35b703dc6b1174d0eefa7b546decad9395`.

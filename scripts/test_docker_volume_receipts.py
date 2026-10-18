@@ -102,6 +102,22 @@ class VolumeReceiptTests(unittest.TestCase):
                 dev._assert_private_restart_network(actual, ids, 'owned')
         inspect.assert_not_called()
 
+    def test_frontend_volume_keeps_its_existing_ownership_labels(self):
+        import json
+        from subprocess import CompletedProcess
+        import docker_volume_dev as dev
+        control = BuildControl({'project_name': 'fullmag-master', 'worktree_id': 'owned'}, 'sha256:' + 'a' * 64)
+        key = 'b' * 64
+        name = 'fullmag-dev-frontend-v1-' + key[:24]
+        labels = {k: v for k, v in control.labels.items() if k.startswith('org.fullmag.')}
+        labels.update({'org.fullmag.build.role': 'frontend', 'org.fullmag.build.cache-key': key})
+        volume = {'Name': name, 'Driver': 'local', 'Options': None, 'Labels': labels}
+        with mock.patch.object(dev, 'docker_capture', return_value=CompletedProcess([], 0, json.dumps([volume]).encode(), b'')) as docker, \
+             mock.patch.object(dev, 'consumers', return_value=[]), \
+             mock.patch.object(dev, 'bounded_capture', return_value=CompletedProcess([], 0, b'', b'')):
+            self.assertEqual(dev._owned_volume(control, 'frontend', key), name)
+            docker.assert_called_once_with('volume', 'inspect', name, allow_failure=True)
+
     def test_build_control_accepts_canonical_bootstrap_labels_and_rejects_foreign_project(self):
         identity = {'project_name': 'fullmag-master', 'worktree_id': 'test-worktree'}
         control = BuildControl(identity, 'sha256:' + 'a' * 64)

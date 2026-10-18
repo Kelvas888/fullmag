@@ -26,7 +26,8 @@ def consumers():
 
 def _owned_volume(control, role, key):
     name = "fullmag-dev-" + role + "-v1-" + key[:24]
-    labels = {**control.labels, "org.fullmag.build.role": role, "org.fullmag.build.cache-key": key}
+    labels = {**{k: v for k, v in control.labels.items() if k.startswith("org.fullmag.")},
+              "org.fullmag.build.role": role, "org.fullmag.build.cache-key": key}
     found = docker_capture("volume", "inspect", name, allow_failure=True)
     if found.returncode:
         names = docker_text("volume", "ls", "--format", "{{.Name}}").splitlines()
