@@ -5,10 +5,14 @@ ograniczenia. Instrukcja startu: [architektura Docker DEV](docker-development-ar
 Polityka nadrzędna: [build-storage governance](fullmag-build-storage-governance.md).
 
 Aktualizacja celu 18.10.2026: użytkownik wymaga przeniesienia wszystkich danych
-budowania do Docker named volumes / BuildKit; sesje, wyniki i ustawienia
-pozostają na Windows. [Skill budowania](../../.agents/skills/fullmag-docker-build/SKILL.md)
-opisuje ten kontrakt i kontrolę zgodności. Poniższy audyt opisuje stan bazowy;
-nie jest deklaracją, że migracja zapisów hostowych została wykonana.
+budowania do Docker named volumes / BuildKit; sesje, wyniki, projekty, ustawienia
+i historia pozostają na Windows. [Skill budowania](../../.agents/skills/fullmag-docker-build/SKILL.md)
+opisuje ten kontrakt i kontrolę zgodności. Bieżąca ścieżka daily live-shadow DEV
+prowadzi assembly, receipty buildu, manifesty i bieżące technical records przez
+named control/package volumes grupy Compose. Frozen/static/release oraz legacy
+zachowują odrębne hostowe metadata/logi zgodnie ze swoimi receptami; nie są luką
+w ścieżce daily DEV. Brak rzeczywistego Docker build/restart/HMR proof pozostaje
+**NOT VERIFIED**.
 
 **Nie mamy jeszcze kompletnego automatycznego sprzątania storage.** Kod usuwa
 zweryfikowane starsze pakiety backendu i nieosiągalne techniczne snapshoty
@@ -24,8 +28,8 @@ poniżej ma to być ta sama grupa, ustalona przez resolver.
 
 | Etap | Polecenie | Co faktycznie buduje | Gdzie obserwować |
 | --- | --- | --- | --- |
-| Przygotowanie zależności | `just docker-dev-toolchain` | Obraz toolchaina z CUDA, MFEM, hypre, libCEED i pozostałymi przypiętymi zależnościami; bez aplikacyjnego źródła Fullmaga | Wyjście polecenia / Docker Desktop Builds; receipt bootstrapu |
-| Codzienna praca | `just docker-dev ...` | Stały `backend` sprawdza źródła, kompiluje aplikację przyrostowo i uruchamia API/runtime. Stały `frontend` instaluje przypięte zależności JS w swoim cache i uruchamia Next/HMR | Docker Desktop → wybrana grupa → Logs właściwej usługi |
+| Przygotowanie zależności | `just docker-dev-toolchain` | Obraz toolchaina z CUDA, MFEM, hypre, libCEED i pozostałymi przypiętymi zależnościami; bez aplikacyjnego źródła Fullmaga | Wyjście polecenia / Docker Desktop Builds; BuildKit i technical receipt grupy (**NOT VERIFIED** runtime) |
+| Codzienna praca | `just docker-dev ...` | Stały `backend` sprawdza źródła, kompiluje aplikację przyrostowo i uruchamia API/runtime. Stały `frontend` instaluje przypięte zależności JS w swoim named cache i uruchamia Next/HMR | Docker Desktop → wybrana grupa → Logs właściwej usługi |
 
 Toolchain jest obrazem budowanym przez **Docker Compose build / BuildKit**.
 Nie jest trzecią stałą usługą aplikacji ani osobnym `backend-build`.
@@ -64,15 +68,21 @@ Git/resolvera; `<run-id>` jest tożsamością uruchomienia, nie kluczem cache.
 | Rust/CMake | `/build/workspace/.fullmag-build/cargo-targets/direct/<cargo-profile>`; osobne `fullmag-fdm-sys-stable/out/native-build` i `fullmag-fem-sys-stable/out/native-build` pod `build/`; `CARGO_HOME=/build/cargo` | Zachowany cache. W komendach Cargo `/workspace` jest aliasem workspace; nie osobną kopią na hoście |
 | Zainstalowany wynik kompilacji | `/build/workspace/.fullmag/local` | Techniczne wyjście Make; odrębne od zweryfikowanego pakietu runtime |
 | Backend: pakiet v2 | Named volume `fullmag-backend-v2-<24hex>-package` → `/opt/fullmag/package` | Bieżący zweryfikowany pakiet, kontrola publikacji i rollback; bez transferu przez Windows |
-| Frontend: zależności i Next | `<storage>/build-volumes/fullmag-frontend-cache-v1-<key>.ext4`; po zamontowaniu cztery podkatalogi cache/pnpm/node_modules | Plik ext4 o pojemności logicznej 8 GiB. Nie jest named volume backendu v2 |
+| Frontend: zależności, Next i HMR state | Named volume `<compose-project>-fullmag-frontend-dev-v2-<key>` → `/state/development`; control namespace → `/opt/fullmag/control` | Named volume grupy Compose dla pnpm, `node_modules`, Next cache, logów i receiptów; brak zapisu do Windows storage w ścieżce v2 (**NOT VERIFIED** runtime) |
 | Frontend: live kod | `app`, `src`, `public`, `scripts` z checkoutu → readonly pod `/state/development/workspace/apps/control-room` | HMR czyta pliki Windows. Wygenerowane pliki i Linux `node_modules` nie trafiają do checkoutu |
-| Uruchomienie, sesje i wyniki | `<storage>/runs/<worktree-id>/docker-all/<run-id>/state` → `/state` backendu; frontend dostaje jego `development` | Fizyczne pliki Windows. Restart istniejącego kontenera zachowuje mount; nowy run ma własny namespace |
+| Uruchomienie, sesje i wyniki daily DEV | `<storage>/runs/<worktree-id>/docker-dev/<run-id>/state` → `/state` backendu; frontend dostaje jego `development` | Fizyczne pliki Windows. Restart istniejącego kontenera zachowuje mount; nowy run ma własny namespace |
 | Ustawienia i ostatnie projekty | `<storage>/user-data/<compose-project>/workspace.db` → `/user-data` | Trwałe, osobne dla mastera i każdego worktree |
-| Fizyczne rezerwacje CPU/GPU | Zarządzany ext4 `host-ledger-v1` → `/host-ledger` wyłącznie backendu | Wspólny ledger hosta. Izolacja grup nie tworzy dodatkowego fizycznego GPU |
-| Wejścia launchera/provenance | `<storage>/builds/<worktree-id>/docker-all-gpu/direct-compose/<id>` i katalog runu | Małe manifesty, przypięte obrazy, wygenerowany Compose, certyfikaty i receipty. To nie Cargo target |
-| Bootstrap zależności | Katalog runu `toolchain-bootstrap-<id>` z kontekstem Dockerfile i receipt | Techniczne wejścia obrazu, nie archiwum pełnych źródeł aplikacji DEV |
+| Fizyczne rezerwacje CPU/GPU | Windows-backed, zarządzany ext4 `host-ledger-v1` → `/host-ledger` wyłącznie backendu; receipt/mount evidence w run root | Wspólny ledger hosta i operacyjny wyjątek dla storage; nie jest cachem ani stagingiem buildu. Izolacja grup nie tworzy dodatkowego fizycznego GPU |
+| Assembly, provenance i receipty buildu daily live-shadow | Named control/package volumes grupy Compose oraz magazyn BuildKit | Manifesty wejścia, staging, receipty buildu i live technical records pozostają w danych technicznych Compose; brak rzeczywistego Docker proof pozostaje **NOT VERIFIED** |
+| Runtime handoff i dane operacyjne | `<storage>/runs/<worktree-id>/docker-dev/<run-id>` oraz `/state` (legacy/frozen może używać `docker-all`) | Mały namespace na uruchomienie, sesje, wyniki i operacyjne dowody per-run, w tym `startup-provenance` i `runtime-recovery-consumed`; nie jest miejscem cache/stagingu buildu |
+| Legacy/release build metadata | `<storage>/builds/...`, `<storage>/runtimes/...` według właściwej recepty | Dozwolone wyłącznie dla legacy, frozen, release lub native-managed profili; nie używać jako ścieżki codziennego Docker DEV |
 | Obrazy i BuildKit | Wewnętrzny magazyn Docker Desktop | CUDA/FEM, wrapper i warstwy budowania współdzielą fizyczną pojemność hosta; poza katalogiem sesji |
 | Bufory tymczasowe | `/tmp` tmpfs usług, do 512 MiB każda | Ulotne; nie są miejscem trwałego cache ani pakietów |
+
+Certyfikat przyjęcia Windows storage, który służy wyłącznie do autoryzacji
+mountu danych użytkownika, jest jawną operacyjną infrastrukturą i może pozostać
+w run namespace. Nie jest to certyfikat ani receipt procesu budowania i nie
+otwiera wyjątku dla zapisu cache, stagingu lub provenance buildu na hoście.
 
 `fullmag.backend-build-cache.v2` wylicza parę wolumenów z checkoutu/worktree,
 toolchaina i profilu Cargo. Zmiana wrapper image sama nie zmienia tej pary.
@@ -83,15 +93,18 @@ receipcie. Pełna ścieżka każdego native cache to
 `/build/workspace/.fullmag-build/cargo-targets/direct/<profile>/build/<crate>/out/native-build`,
 gdzie `<crate>` oznacza `fullmag-fdm-sys-stable` lub `fullmag-fem-sys-stable`.
 
-Cache frontendu zależy od checkoutu, worktree, **portu**, manifestów zależności
-i pinów narzędzi. Edycja TS/CSS nie tworzy nowego pliku ext4; zmiana portu lub
-lockfile może go utworzyć. Zmiana interwału Watchpack nie rotuje tego cache.
+Cache frontendu v2 zależy od checkoutu/worktree, manifestów zależności i pinów
+narzędzi. Port jest zachowany w receipcie i konfiguracji endpointu, ale nie
+powinien tworzyć nowego named volume. Edycja TS/CSS nie tworzy nowej generacji
+cache; zmiana lockfile, dependency seed lub profilu może ją utworzyć. Zmiana
+interwału Watchpack nie rotuje tego cache.
 
-Stary backend v1 używał pliku ext4 w `build-volumes`. Nie należy utożsamiać go
-z aktywną parą v2 ani usuwać jako efektu migracji. Starsze/frozen ścieżki mogą
-mieć source capsules pod `runs/<worktree-id>/<capture-id>/source` i staging
-obrazów pod `builds/.../images` / `runtimes/.../docker-all-images`. Nie są to
-nowe archiwa źródeł wykonywane przy każdym restarcie bezpośredniego DEV.
+Stary backend v1 oraz historyczny frontend cache v1 używały plików ext4 w
+`build-volumes`. Są to adaptery legacy i nie należy utożsamiać ich z aktywną
+parą named volumes v2 ani usuwać ich jako skutku migracji. Starsze/frozen/release
+ścieżki mogą mieć source capsules pod `runs/<worktree-id>/<capture-id>/source`
+i staging obrazów pod `builds/.../images` / `runtimes/.../docker-all-images`.
+Nie są to nowe archiwa źródeł wykonywane przy każdym restarcie bezpośredniego DEV.
 
 ## 3. Procedura startu i kolejnej iteracji
 
@@ -111,24 +124,35 @@ nowe archiwa źródeł wykonywane przy każdym restarcie bezpośredniego DEV.
    Nie wykonuj pierwszego polecenia w masterze, jeżeli drugim wybierasz inny
    worktree. Odpowiednik bez `just` musi przekazać `$source` jako `--repo-root`
    bootstrapu; to ten argument ustala grupę toolchaina.
-3. Launcher rozwiązuje grupę, port, sieć, storage i przypięte obrazy; sprawdza
-   istniejących konsumentów, przygotowuje/reużywa cache i zapisuje receipty.
-   Nie przejmuje obcej grupy. Backend ma wewnętrzne `8081`; tylko frontend
-   wystawia wybrany port loopback.
+3. Launcher rozwiązuje grupę, port, sieć, hostowy storage danych użytkownika,
+   techniczne named volumes i przypięte obrazy; sprawdza istniejących
+   konsumentów i przygotowuje/reużywa cache. W daily live-shadow assembly,
+   provenance, receipty buildu i live technical records trafiają do control/
+   package volumes; hostowy run root zachowuje wyłącznie pointery i dowody
+   operacyjne uruchomienia. Frozen/static/release oraz legacy mogą zapisywać
+   własne metadata/logi hostowe według odrębnych recept. Brak rzeczywistego
+   Docker proof pozostaje **NOT VERIFIED**. Nie przejmuje obcej grupy. Backend ma
+   wewnętrzne `8081`; tylko frontend wystawia wybrany port loopback.
 4. Przy każdym starcie backend pod blokadą cache odczytuje aktualny readonly
-   checkout i tworzy spójny manifest. Przy zgodnym pakiecie przechodzi ścieżką
-   `phase=start state=cache-hit` do API. Przy zmianie uzgadnia cień ext4,
-   zachowuje metadane niezmienionych plików i uruchamia przyrostowy Make/Cargo.
+   checkout i tworzy spójny manifest w technicznym wolumenie. Przy zgodnym
+   pakiecie przechodzi ścieżką `phase=start state=cache-hit` do API. Przy zmianie
+   uzgadnia cień named volume, zachowuje metadane niezmienionych plików i
+   uruchamia przyrostowy Make/Cargo. Zgodność tej ścieżki z rzeczywistym
+   uruchomieniem Docker pozostaje **NOT VERIFIED**; hostowe metadata/logi
+   frozen/static/release nie zmieniają kontraktu daily live-shadow.
 5. Zmieniony kod oraz rzeczywiści zależni konsumenci mogą wymagać kompilacji.
    Nie obiecujemy przebudowy wyłącznie jednego crate ani czasu kilku sekund.
    Zmiana wspólnych typów, build-info, flag czy kompilatora poszerza zakres.
    Pełny digest źródeł obejmuje też frontend: jego edycja może ominąć szybkie
    użycie pakietu i wejść ponownie w Make/publikację, mimo zachowanego cache
    kompilacji natywnej. To znana granica obecnej optymalizacji.
-6. Nowy pakiet powstaje w prywatnym kandydacie. Po walidacji i trwałej
-   publikacji poprzedni staje się rollbackiem. Dopiero potem wykonuje się
-   retencja starszych pakietów. Błąd kompilacji nie uruchamia nowego API;
-   poprzedni zweryfikowany pakiet zostaje zachowany.
+6. Nowy pakiet powstaje w prywatnym kandydacie named package volume. Po
+   walidacji i trwałej publikacji poprzedni staje się rollbackiem. Dopiero
+   potem wykonuje się retencja starszych pakietów. Błąd kompilacji nie uruchamia
+   nowego API; poprzedni zweryfikowany pakiet zostaje zachowany. W daily
+   live-shadow assembly/provenance i receipty pozostają w control/package
+   volumes, a `startup-provenance`, `runtime-recovery-consumed`, host-ledger i
+   certyfikat mountu są per-run operacyjnymi dowodami w Windows run root.
 7. Frontend reaguje przez HMR. Zmiany backendu stosujemy przez restart
    **backendu tej grupy**, po zapisaniu projektu i zakończeniu symulacji.
    Restart nie tworzy z założenia nowego cache ani nie powtarza Solve skryptu.
@@ -146,15 +170,16 @@ nie jest etapem codziennego startu DEV.
 
 | Klasa danych | Obecny mechanizm | Granica / ryzyko wzrostu |
 | --- | --- | --- |
-| Binarne pakiety backendu | Po udanej publikacji: bieżący + jeden bezpośredni rollback; starsze potwierdzone backupy usuwane od najstarszego | Tylko poprawny łańcuch receiptów/rotacji pod blokadą. Nieznane/uszkodzone dane pozostają; `retention skipped` wymaga sprawdzenia |
-| Dowody usuniętych pakietów | Receipt, rotacja i log archiwizowane w `/opt/fullmag/package/.development/retired` przed usunięciem binariów | Brak limitu wieku/rozmiaru archiwum; małe metadane i logi nadal narastają |
-| Normalny staging kandydata/kopii | `finally` usuwa własne tymczasowe drzewa po powrocie operacji | Przerwanie procesu/zasilania może pozostawić `.backend-package-candidate-*`, `.backend-capsule-*`, `.manifest.*.tmp`; brak ogólnego sweepu. Przy niepewnym rollbacku zachowujemy dowody |
-| Cień źródeł | Uzgodnienie jednego workspace, usunięcie usuniętych plików źródłowych | Nie kasuje używanego cache Cargo/CMake. Jeden aktualny manifest zamiast historii snapshotów źródeł |
+| Binarne pakiety backendu | Po udanej publikacji w named package volume: bieżący + jeden bezpośredni rollback; starsze potwierdzone backupy usuwane od najstarszego | Tylko poprawny łańcuch receiptów/rotacji pod blokadą. Nieznane/uszkodzone dane pozostają; `retention skipped` wymaga sprawdzenia |
+| Dowody usuniętych pakietów | Receipt, rotacja i log archiwizowane w `/opt/fullmag/package/.development/retired` w tym samym wolumenie przed usunięciem binariów | Brak limitu wieku/rozmiaru archiwum; małe metadane i logi nadal narastają |
+| Normalny staging kandydata/kopii daily live-shadow | Technical build/control/package volumes; `finally` usuwa własne tymczasowe drzewa po powrocie operacji | Przerwanie procesu/zasilania może pozostawić kandydatów lub manifesty w wolumenie; brak ogólnego sweepu. Przy niepewnym rollbacku zachowujemy dowody |
+| Cień źródeł | Uzgodnienie jednego workspace w `/build`, usunięcie usuniętych plików źródłowych | Nie kasuje używanego cache Cargo/CMake. Jeden aktualny manifest zamiast historii snapshotów źródeł |
 | Snapshoty host-ledgera | Ograniczony GC pod blokadą po publikacji/operacjach ledgera | Usuwa wyłącznie bezpieczne nieosiągalne CAS `snapshot` i `snapshot-order-v2`; zachowuje bieżący digest. Limit inspekcji 256 wpisów na katalog/wywołanie |
 | Rezerwacje, readiness i recovery | Zachowanie historii i dowodów | Powyższy GC nie usuwa historii rezerwacji, CAS readiness ani sesji |
 | Cargo/CMake/pnpm/Next | Ponowne użycie trwałego cache | Brak ogólnego limitu ani GC starych generacji. Cargo target może rosnąć wraz z wariantami grafu/flag |
-| Backend v1/v2 i frontend ext4 | Jawne przygotowanie/reuse dokładnej tożsamości | Adaptery nie usuwają starych wolumenów/backing files. Nowa generacja nie dowodzi zbędności poprzedniej |
-| Runy, logi, receipty, failed/unknown | Zachowanie do diagnozy i provenance | Brak pełnej automatycznej retencji tej ścieżki; kolejne uruchomienia zwiększają liczbę katalogów |
+| Backend v1/v2 i historyczny frontend ext4 | Jawne przygotowanie/reuse dokładnej tożsamości | Legacy adaptery nie usuwają starych wolumenów/backing files. Nowa generacja named volume nie dowodzi zbędności poprzedniej |
+| Build logs, receipty i provenance daily live-shadow | Control/package volumes grupy Compose oraz BuildKit; runtime proof **NOT VERIFIED** | Brak pełnej automatycznej retencji; nie dodawaj kolejnych hostowych kopii. Hostowe metadata/logi frozen/static/release należą do osobnych recept |
+| Runy, logi sesji, failed/unknown i per-run evidence | Zachowanie w Windows `/state`/run root, w tym `startup-provenance`, `runtime-recovery-consumed`, host-ledger i certyfikat mountu | To operacyjne dowody sesji/runtime, nie dane buildu; brak pełnej automatycznej retencji tej ścieżki |
 | Sesje, projekty, wyniki, `workspace.db` | Trwałe dane użytkownika | Wyłączone ze sprzątania technicznego |
 | Obrazy / BuildKit / stare grupy | Brak automatycznego globalnego czyszczenia Fullmaga | Zatrzymany kontener nadal może referencjonować obraz/cache; inna grupa może go używać |
 
@@ -171,21 +196,23 @@ zwykłego restartu DEV.
 
 ## 5. Miejsce na dysku i bezpieczne utrzymanie
 
-Sprawdzamy osobno fizyczny wolny dysk hosta, wolne miejsce wewnątrz ext4/
-Docker VM oraz rozmiary należących do zadania artefaktów. Duży limit wirtualnego
-dysku Dockera nie dostarcza wolnego miejsca na pełnym dysku Windows.
-Pojemność logiczna `.ext4`/VHDX, faktycznie zaalokowane bajty i bajty możliwe
-do odzyskania to trzy różne pomiary. Nie sumuj rozmiarów logicznych jako
-„tyle można skasować”. Usunięcie plików wewnątrz VM nie dowodzi automatycznego
-zmniejszenia hostowego pliku dysku.
+Sprawdzamy osobno fizyczny wolny dysk hosta, wolne miejsce na dysku danych
+Docker Desktop, zajętość named volumes/BuildKit oraz rozmiary należących do
+zadania artefaktów. Duży limit wirtualnego dysku Dockera nie dostarcza wolnego
+miejsca na pełnym dysku Windows. Pojemność logiczna wolumenu lub legacy VHDX,
+faktycznie zaalokowane bajty i bajty możliwe do odzyskania to trzy różne pomiary.
+Nie sumuj rozmiarów logicznych jako „tyle można skasować”. Usunięcie danych z
+wolumenu nie dowodzi automatycznego zmniejszenia hostowego pliku dysku.
 
-Obecny preflight frontendu na Windows wymaga minimum 16 GiB wolnego przy nowym
-cache (8 GiB pliku + 8 GiB headroom), a 8 GiB przy istniejącym. Sprawdza miejsce
-przed i po przygotowaniu. To dolny próg, **nie estymacja zimnego builda**.
-Adapter backendu v2 waliduje wolumeny/receipty, ale nie estymuje całego Cargo
-targetu. Backend przed kandydatem może oszacować miejsce na podstawie poprzedniego
-pakietu; pierwszy build nie ma takiego odniesienia. Storage probe sprawdza
-semantykę zapisu/locków/SQLite, nie zastępuje pomiaru pojemności.
+Historyczny frontend v1 miał preflight 16 GiB dla nowego pliku ext4 (8 GiB
+cache + 8 GiB headroom) i 8 GiB dla istniejącego. Te wartości dotyczą wyłącznie
+legacy adaptera. Dla aktywnego v2 wymagane miejsce powinno być mierzone na
+dysku danych Docker Desktop; zgodność launchera z tym rozróżnieniem pozostaje
+**NOT VERIFIED**. Adapter backendu v2 waliduje named volumes/receipty, ale nie
+estymuje całego Cargo targetu. Backend przed kandydatem może oszacować miejsce
+na podstawie poprzedniego pakietu; pierwszy build nie ma takiego odniesienia.
+Storage probe sprawdza semantykę zapisu/locków/SQLite, nie zastępuje pomiaru
+pojemności Docker Desktop.
 
 Procedura sprzątania wymaga:
 
@@ -206,14 +233,16 @@ reguły retencji z build-storage governance, bez usuwania danych użytkownika.
 ## 6. Wynik weryfikacji 18.10.2026
 
 Źródła audytu: baza `f57b9e59346edf18eda4a38d671cb8361e3a1512`; równoległe
-zmiany CPU są WIP i nie stanowią dowodu gotowego backendu.
+zmiany CPU są WIP i nie stanowią dowodu gotowego backendu. Poniższe obserwacje
+opisują historyczny baseline z 18.10, a nie kwalifikację obecnej ścieżki v2.
 
-- Docker inspect potwierdził frontend działający/healthy, readonly źródła,
-  cztery bindy cache ext4 i backend **exited** z parą named volumes v2,
-  `/state` Windows, `/user-data` grupy oraz wspólnym `/host-ledger`.
+- Historyczny Docker inspect potwierdził frontend działający/healthy, readonly
+  źródła, cztery bindy legacy cache ext4 i backend **exited** z parą backendowych
+  named volumes v2, `/state` Windows, `/user-data` grupy oraz wspólnym
+  `/host-ledger`. Te bindy ext4 nie opisują aktywnego kontraktu frontend v2.
 - Na hoście było około **68,84 GiB wolnego na C:** w chwili pomiaru. W
-  `build-volumes` wykryto stary backend 50 GiB, cztery frontendowe pliki po
-  8 GiB i ledger 128 MiB — **rozmiary logiczne, nie miejsce do odzyskania**.
+  `build-volumes` wykryto stary backend 50 GiB, cztery legacy frontendowe pliki
+  po 8 GiB i ledger 128 MiB — **rozmiary logiczne, nie miejsce do odzyskania**.
 - 15 celowanych testów Python retencji, błędów publikacji i reuse workspace
   przeszło w istniejącym kontenerze, na tymczasowych fixture'ach ext4.
   Pierwsza próba w `/tmp` została odrzucona przez `noexec`; zachowano oba
@@ -249,7 +278,8 @@ raport nie jest deklaracją zajętości/retencji na innym komputerze.
   `_start`, `_build_environment`, `_retain_package_backups` — build, publikacja,
   rollback i retencja;
 - [`docker_frontend_cache.py`](../../scripts/docker_frontend_cache.py)
-  `cache_key`, `_require_cache_capacity`, `prepare` — frontend ext4;
+  `cache_key`, `prepare`, `validate_container` — frontend v2 named volume;
+  historyczny ext4 adapter pozostaje poniżej jako compatibility-only;
 - [`host_resource_ledger.rs`](../../crates/fullmag-session/src/host_resource_ledger.rs)
   — ograniczone sprzątanie technicznych CAS, bez kasowania rezerwacji;
 - [`test_docker_backend_dev.py`](../../scripts/test_docker_backend_dev.py)
