@@ -266,11 +266,17 @@ recipe is a route to fix, not permission for a fallback.
 
 The persistent `backend` service owns compilation and runtime. On every start,
 including an ordinary Docker Desktop restart, it checks current mounted sources
-and dependencies, prepares consistent build inputs, compiles only what is needed
-with the durable ext4 cache, validates the result, and starts API/native runtime
-in that same container. Unchanged inputs reuse the existing result. No separate
-host manifest-refresh command is required. The persistent `frontend` service
-keeps Next.js HMR running. Preserve native drain, recovery, data, and receipts.
+and dependencies, prepares consistent build inputs in the Compose group's named
+Docker volumes, compiles only what is needed using the persistent volume/BuildKit
+cache, validates the result, and starts API/native runtime in that same container.
+Unchanged inputs reuse the existing result. Build staging, packages, build logs,
+receipts, and provenance must stay in those technical volumes; host `storage` is
+reserved for user sessions, simulation results, projects, settings, history, and
+explicit operational infrastructure. No separate host manifest-refresh command
+is required. The persistent `frontend` service keeps Next.js HMR running. Preserve
+native drain, recovery, user data, and receipts. The code/runtime compliance of
+this volume-only boundary is **NOT VERIFIED** until mounts and a live restart are
+observed.
 See [ADR 0061](../../docs/adr/0061-docker-development-build-and-runtime-container.md).
 
 For managed/container build tasks outside that daily Docker workspace, the
@@ -300,9 +306,12 @@ the build path.
 
 ### Canonical daily Docker development recipes
 
-- `python -B scripts/setup_docker.py` — configure host storage, sources and port.
-- `just docker-dev-toolchain` — prepare pinned dependencies in the selected group.
-- `just docker-dev "<checkout>" <port> ["<script.py>"]` — start backend and frontend.
+- `python -B scripts/setup_docker.py` — configure user storage, sources and port;
+  it does not place build cache or staging in that host storage.
+- `just docker-dev-toolchain` — prepare pinned dependencies through BuildKit and
+  the selected group's technical volumes; it must not stage them in host storage.
+- `just docker-dev "<checkout>" <port> ["<script.py>"]` — start frontend and the
+  single backend service, which builds and then runs API/native runtime in place.
 - Restart the selected backend after saving the project and finishing active
   simulations; it checks current sources and builds as needed by itself.
 
