@@ -348,6 +348,274 @@ class BackendVolumeCacheTests(unittest.TestCase):
             with self.assertRaises(cache.BackendVolumeCacheError):
                 cache.validate_overlay({"services": {"backend": {}, cache.MAINTENANCE_SERVICE: []}}, profile)
 
+    def test_foreign_cache_and_shared_guest_targets_are_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, *_ = _profile(tmp)
+            foreign = {
+                cache.LABEL_PROFILE: "backend-build-cache-v1",
+                cache.LABEL_CACHE_KEY: "f" * 64,
+            }
+            consumer = {
+                "State": {"Running": True},
+                "Config": {"Labels": foreign},
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": "/workspace/independent/build",
+                        "Destination": cache.BUILD_TARGET,
+                    },
+                    {
+                        "Type": "bind",
+                        "Source": "/workspace/independent/package",
+                        "Destination": cache.PACKAGE_TARGET,
+                    },
+                ],
+            }
+            foreign_v2 = cache._container_labels(profile)
+            foreign_v2.update({
+                cache.LABEL_SCHEMA: cache.SCHEMA,
+                cache.LABEL_PROFILE: cache.PROFILE,
+                cache.LABEL_CACHE_KEY: "e" * 64,
+                cache.LABEL_UNIT: "foreign-unit",
+                cache.LABEL_OWNER: "foreign-owner",
+            })
+            v2_consumer = {
+                "State": {"Running": True},
+                "Config": {"Labels": foreign_v2},
+                "Mounts": list(consumer["Mounts"]),
+            }
+            cache._assert_no_active_consumers(profile, [consumer, v2_consumer])
+
+            for source in (
+                r"C:\\git\\fullmag\\storage\\other-cache",
+                r"\\\\docker-desktop\\data\\other-cache",
+            ):
+                windows_consumer = {
+                    "State": {"Running": True},
+                    "Config": {"Labels": {}},
+                    "Mounts": [
+                        {
+                            "Type": "bind",
+                            "Source": source,
+                            "Destination": cache.BUILD_TARGET,
+                        }
+                    ],
+                }
+                cache._assert_no_active_consumers(profile, [windows_consumer])
+
+            posix_backslash = {
+                "State": {"Running": True},
+                "Config": {"Labels": {}},
+                "Mounts": [{
+                    "Type": "bind",
+                    "Source": (
+                        f"/var/lib/docker/volumes/"
+                        f"{profile['volume_names'][cache.BUILD_VOLUME_ROLE]}/_data\\child"
+                    ),
+                    "Destination": cache.BUILD_TARGET,
+                }],
+            }
+            with self.assertRaises(cache.BackendVolumeCacheError):
+                inspected_profile = dict(profile)
+                inspected_profile["volume_documents"] = DockerVolumeFixture(
+                    profile,
+                    roles=(cache.BUILD_VOLUME_ROLE, cache.PACKAGE_VOLUME_ROLE),
+                ).documents
+                cache._assert_no_active_consumers(inspected_profile, [posix_backslash])
+
+            posix_double_slash = {
+                "State": {"Running": True},
+                "Config": {"Labels": {}},
+                "Mounts": [{
+                    "Type": "bind",
+                    "Source": (
+                        f"//var/lib/docker/volumes/"
+                        f"{profile['volume_names'][cache.BUILD_VOLUME_ROLE]}/_data/child"
+                    ),
+                    "Destination": cache.BUILD_TARGET,
+                }],
+            }
+            with self.assertRaises(cache.BackendVolumeCacheError):
+                cache._assert_no_active_consumers(inspected_profile, [posix_double_slash])
+
+    def test_exact_owner_unit_and_cache_key_block_without_mounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, *_ = _profile(tmp)
+            labels = cache._container_labels(profile)
+            consumer = {
+                "State": {"Running": True},
+                "Config": {
+                    "Labels": {
+                        key: labels[key]
+                        for key in (
+                            cache.LABEL_OWNER,
+                            cache.LABEL_UNIT,
+                            cache.LABEL_CACHE_KEY,
+                        )
+                    }
+                },
+                "Mounts": [],
+            }
+            with self.assertRaisesRegex(cache.BackendVolumeCacheError, "active owned"):
+                cache._assert_no_active_consumers(profile, [consumer])
+
+    def test_selected_volume_blocks_under_any_guest_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, *_ = _profile(tmp)
+            consumer = {
+                "State": {"Running": True},
+                "Config": {"Labels": {}},
+                "Mounts": [
+                    {
+                        "Type": "volume",
+                        "Name": profile["volume_names"][cache.BUILD_VOLUME_ROLE],
+                        "Destination": "/independent/target",
+                    }
+                ],
+            }
+            with self.assertRaisesRegex(cache.BackendVolumeCacheError, "mounts backend cache volume"):
+                cache._assert_no_active_consumers(profile, [consumer])
+
+    def test_unknown_active_mount_type_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, *_ = _profile(tmp)
+            consumer = {
+                "State": {"Running": True},
+                "Config": {"Labels": {}},
+                "Mounts": [{"Type": "future-daemon-mount"}],
+            }
+            with self.assertRaisesRegex(cache.BackendVolumeCacheError, "unsupported"):
+                cache._assert_no_active_consumers(profile, [consumer])
+
+    def test_selected_volume_backing_alias_blocks_before_reusing_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, *_ = _profile(tmp)
+            docker = DockerVolumeFixture(
+                profile,
+                roles=(cache.BUILD_VOLUME_ROLE, cache.PACKAGE_VOLUME_ROLE),
+            )
+            mountpoint = docker.documents[cache.BUILD_VOLUME_ROLE]["Mountpoint"]
+            for source in (
+                mountpoint,
+                mountpoint + "/nested",
+                mountpoint.rsplit("/", 1)[0],
+            ):
+                consumer = {
+                    "State": {"Running": True},
+                    "Config": {"Labels": {}},
+                    "Mounts": [
+                        {
+                            "Type": "bind",
+                            "Source": source,
+                            "Destination": "/unrelated",
+                        }
+                    ],
+                }
+                with self.assertRaisesRegex(cache.BackendVolumeCacheError, "aliases backend cache volume"):
+                    cache.ensure_volume_pair(
+                        docker,
+                        profile,
+                        active_consumers=[consumer],
+                    )
+
+            unrelated = {
+                "State": {"Running": True},
+                "Config": {"Labels": {}},
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": "/var/lib/docker/volumes/other/_data",
+                        "Destination": "/unrelated",
+                    }
+                ],
+            }
+            cache.ensure_volume_pair(
+                docker,
+                profile,
+                active_consumers=[unrelated],
+            )
+
+            fresh = DockerVolumeFixture(profile)
+            future_mountpoint = (
+                f"/var/lib/docker/volumes/"
+                f"{profile['volume_names'][cache.BUILD_VOLUME_ROLE]}/_data/alias"
+            )
+            alias_before_create = {
+                "State": {"Running": True},
+                "Config": {"Labels": {}},
+                "Mounts": [{
+                    "Type": "bind",
+                    "Source": future_mountpoint,
+                    "Destination": "/unrelated",
+                }],
+            }
+            with self.assertRaisesRegex(cache.BackendVolumeCacheError, "aliases backend cache volume"):
+                cache.ensure_volume_pair(
+                    fresh,
+                    profile,
+                    active_consumers=[alias_before_create],
+                )
+
+            foreign_name_source_alias = {
+                "State": {"Running": True},
+                "Config": {"Labels": {}},
+                "Mounts": [{
+                    "Type": "volume",
+                    "Name": "independent-volume",
+                    "Source": mountpoint,
+                    "Destination": "/unrelated",
+                }],
+            }
+            with self.assertRaisesRegex(cache.BackendVolumeCacheError, "aliases backend cache volume"):
+                cache.ensure_volume_pair(
+                    docker,
+                    profile,
+                    active_consumers=[foreign_name_source_alias],
+                )
+
+    def test_active_consumer_provider_refreshes_before_maintenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, layout, source, repo, runroot = _profile(tmp)
+            docker = DockerVolumeFixture(profile)
+            snapshots = [
+                (),
+                ({
+                    "State": {"Running": True},
+                    "Config": {"Labels": {}},
+                    "Mounts": [{
+                        "Type": "volume",
+                        "Name": profile["volume_names"][cache.BUILD_VOLUME_ROLE],
+                        "Destination": "/unrelated",
+                    }],
+                },),
+            ]
+            calls = []
+
+            def inventory():
+                calls.append(True)
+                return snapshots.pop(0)
+
+            maintenance_calls = []
+
+            def maintenance(prepared, maintenance_overlay):
+                maintenance_calls.append(True)
+                return _maintenance_receipt(prepared)
+
+            with self.assertRaisesRegex(cache.BackendVolumeCacheError, "mounts backend cache volume"):
+                cache.prepare_ready(
+                    layout,
+                    repo,
+                    IMAGE,
+                    runroot,
+                    docker,
+                    maintenance,
+                    source_root=source,
+                    toolchain_image=TOOLCHAIN,
+                    active_consumers=inventory,
+                )
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(maintenance_calls, [])
+
     def test_windows_mount_and_symlink_receipt_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             profile, *_ = _profile(tmp)

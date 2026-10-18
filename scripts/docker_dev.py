@@ -1235,7 +1235,7 @@ def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: s
             maintenance,
             source_root=selected,
             toolchain_image=toolchain_id,
-            active_consumers=running_consumers(),
+            active_consumers=running_consumers,
         )
     except BackendVolumeCacheError as error:
         raise _fail(f"backend named-volume cache was not admitted: {error}") from error
