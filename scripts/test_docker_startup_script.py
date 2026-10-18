@@ -285,9 +285,14 @@ class DockerStartupScriptTests(unittest.TestCase):
             "container_script_path": "/opt/fullmag/source/examples/start.py",
         }
         with tempfile.TemporaryDirectory() as temporary:
-            overlay = Path(temporary) / "compose.startup.json"
+            root = Path(temporary)
+            overlay = root / "compose.startup.json"
+            provenance = root / "run" / "startup-provenance.json"
+            provenance.parent.mkdir()
+            provenance.write_text("{}\n", encoding="utf-8")
             docker_runtime._write_startup_overlay(
                 overlay, authorization, include_source=True,
+                provenance_path=provenance,
                 provenance_sha256="a" * 64, helper_sha256="b" * 64,
             )
             document = json.loads(overlay.read_text(encoding="utf-8"))
@@ -304,7 +309,14 @@ class DockerStartupScriptTests(unittest.TestCase):
                 {"/opt/fullmag/source", "/run/fullmag/startup-provenance.json"},
             )
             self.assertTrue(all(mount["read_only"] for mount in service["volumes"]))
-            docker_runtime._write_startup_overlay(overlay, authorization, include_source=False)
+            self.assertEqual(
+                next(mount["source"] for mount in service["volumes"]
+                     if mount["target"] == "/run/fullmag/startup-provenance.json"),
+                str(provenance.resolve()),
+            )
+            docker_runtime._write_startup_overlay(
+                overlay, authorization, include_source=False, provenance_path=provenance
+            )
             document = json.loads(overlay.read_text(encoding="utf-8"))
             self.assertEqual(
                 [mount["target"] for mount in document["services"]["backend"]["volumes"]],

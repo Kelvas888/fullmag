@@ -357,6 +357,18 @@ def _startup_process_receipt_path(state):
     return Path(state) / ".fullmag/runtime-service/process-tree.json"
 
 
+def _runtime_run_root_path(layout, run_id):
+    """Resolve durable per-run user state under storage, never build storage."""
+
+    if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise ValueError("Docker runtime run id must be a lowercase UUID hex value")
+    return storage.validate_path(
+        Path(layout["runs_root"]) / "docker-all" / run_id,
+        Path(layout["storage_root"]),
+        "Docker runtime run",
+    )
+
+
 def _runtime_control_process_receipt_relative_path():
     """Return the control-volume path for the backend process receipt.
 
@@ -1108,7 +1120,7 @@ def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha
             print(json.dumps(receipt, indent=2))
 
 
-def _write_startup_overlay(path, authorization, *, include_source,
+def _write_startup_overlay(path, authorization, *, include_source, provenance_path,
                            provenance_sha256=None, helper_sha256=None):
     """Create a JSON Compose overlay for one already-admitted script.
 
@@ -1117,7 +1129,11 @@ def _write_startup_overlay(path, authorization, *, include_source,
     ordinary runtime has exactly the old mounts and environment.
     """
     source_root = Path(authorization["source_root"])
-    provenance = Path(path).with_name("startup-provenance.json")
+    provenance = Path(provenance_path)
+    if (not provenance.is_absolute() or provenance.is_symlink()
+            or not provenance.is_file()):
+        raise ValueError("Startup provenance must be an absolute run-owned regular file")
+    provenance = provenance.resolve(strict=True)
     volumes = [
         {
             "type": "bind",
@@ -3110,8 +3126,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         )
         selected_checkout = preflight_inputs["selected_checkout"]
     if reuse is None:
-        root = storage.validate_path(Path(layout["runs_root"]) / "docker-all" / uuid.uuid4().hex,
-                                     Path(layout["build_storage_root"]))
+        root = _runtime_run_root_path(layout, uuid.uuid4().hex)
         root.mkdir(parents=True, exist_ok=False, mode=0o700)
         state = root / "state"
         state.mkdir(mode=0o777)
@@ -3333,10 +3348,12 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 startup_overlay,
                 authorization,
                 include_source=inputs is None,
+                provenance_path=startup_provenance,
                 provenance_sha256=provenance_sha256,
                 helper_sha256=helper_sha256,
             )
             startup = {"authorization": authorization, "compose_overlay": str(startup_overlay),
+                       "provenance_path": str(startup_provenance.resolve(strict=True)),
                        "provenance_sha256": provenance_sha256, "helper_sha256": helper_sha256}
             receipt["startup_script"] = {
                 "source_relative": authorization["source_relative"],
@@ -3738,7 +3755,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                               if m["Destination"] == "/run/fullmag/startup-provenance.json"]
             if (len(startup_mounts) != 1 or startup_mounts[0]["Type"] != "bind"
                     or startup_mounts[0]["RW"]
-                    or host_path(startup_mounts[0]["Source"]) != (metadata_root / "startup-provenance.json").resolve()):
+                    or host_path(startup_mounts[0]["Source"])
+                    != Path(startup["provenance_path"]).resolve()):
                 raise ValueError("Startup provenance must be a readonly run-owned bind")
             environment = dict(
                 value.split("=", 1)

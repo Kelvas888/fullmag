@@ -126,6 +126,27 @@ class DockerRuntimeContract(unittest.TestCase):
         runtime_init.assert_called_once_with(layout)
         full_init.assert_called_once_with(layout)
 
+    def test_runtime_run_root_is_validated_under_user_storage_not_build_storage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            storage_root = root / "storage"
+            build_storage_root = root / "builds"
+            storage_root.mkdir()
+            build_storage_root.mkdir()
+            runs_root = storage_root / "runs" / "worktree-test"
+
+            run_root = runtime._runtime_run_root_path(
+                {
+                    "storage_root": str(storage_root),
+                    "build_storage_root": str(build_storage_root),
+                    "runs_root": str(runs_root),
+                },
+                "a" * 32,
+            )
+
+            self.assertTrue(runtime.storage.inside(run_root, storage_root.resolve()))
+            self.assertFalse(runtime.storage.inside(run_root, build_storage_root.resolve()))
+
     def test_volume_only_operator_pointer_excludes_build_metadata(self):
         pointer = runtime._operator_pointer(
             {
