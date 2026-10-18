@@ -84,18 +84,64 @@ class FrontendCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = {"storage_root": root, "backing_image": root / "cache.ext4"}
-            with mock.patch.object(cache.shutil, "disk_usage", return_value=type("Usage", (), {"free": 1})()):
+            required = cache.CACHE_SIZE_BYTES + cache.BACKEND_HEADROOM_BYTES
+            with mock.patch.object(
+                cache.shutil,
+                "disk_usage",
+                return_value=type("Usage", (), {"free": required - 1})(),
+            ):
                 with self.assertRaisesRegex(cache.FrontendCacheError, "free bytes"):
                     cache._require_cache_capacity(paths, windows=True)
             self.assertFalse(paths["backing_image"].exists())
 
-    def test_existing_windows_cache_does_not_reserve_its_size_again(self):
+    def test_existing_windows_cache_preserves_backend_headroom_without_reallocation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = {"storage_root": root, "backing_image": root / "cache.ext4"}
             paths["backing_image"].touch()
-            with mock.patch.object(cache.shutil, "disk_usage", side_effect=AssertionError("unexpected reservation")):
+            with mock.patch.object(
+                cache.shutil,
+                "disk_usage",
+                return_value=type("Usage", (), {"free": cache.BACKEND_HEADROOM_BYTES - 1})(),
+            ):
+                with self.assertRaisesRegex(cache.FrontendCacheError, "headroom"):
+                    cache._require_cache_capacity(paths, windows=True)
+            with mock.patch.object(
+                cache.shutil,
+                "disk_usage",
+                return_value=type("Usage", (), {"free": cache.BACKEND_HEADROOM_BYTES + 1024})(),
+            ):
                 cache._require_cache_capacity(paths, windows=True)
+
+    def test_prepare_rechecks_capacity_after_cache_maintenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "repo"
+            (repo / "scripts" / "lib").mkdir(parents=True)
+            (repo / "scripts" / "lib" / "docker_frontend_cache.sh").write_text(
+                "#!/bin/sh\n", encoding="utf-8"
+            )
+            (repo / "compose.frontend-cache.yaml").write_text("services: {}\n", encoding="utf-8")
+            source = root / "checkout"
+            source.mkdir()
+            phases = []
+
+            def capacity_check(paths, *, windows=None, phase):
+                phases.append(phase)
+
+            with mock.patch.object(cache, "_require_cache_capacity", side_effect=capacity_check):
+                cache.prepare(
+                    {"project_id": "fullmag-test", "storage_root": str(root / "storage")},
+                    repo,
+                    IMAGE,
+                    root / "run",
+                    FakeDocker(),
+                    source_root=source,
+                    worktree_id="worktree-abc",
+                    host_port=32871,
+                    dependency_seed_sha256="a" * 64,
+                )
+            self.assertEqual(phases, ["before allocation", "after allocation"])
 
     def test_guest_v1_preserves_seed_contract_without_host_cache_metadata(self):
         from docker_development_inputs import guest_manifest, HOST_CACHE_METADATA_KEYS

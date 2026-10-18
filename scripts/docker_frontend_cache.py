@@ -28,6 +28,7 @@ CONSUMER_KEY_LABEL = "com.fullmag.frontend-cache.key"
 # ext4 labels are limited to sixteen bytes.
 IMAGE_LABEL = "fm-fe-cache-v1"
 CACHE_SIZE_BYTES = 8 * 1024 * 1024 * 1024
+BACKEND_HEADROOM_BYTES = CACHE_SIZE_BYTES
 MAX_COPY_BYTES = 2 * 1024 * 1024
 DAEMON_HOST_PREFIX = "/run/desktop/mnt/host"
 
@@ -567,18 +568,22 @@ def _validate_host_receipt(receipt: Mapping[str, Any], values: Mapping[str, Any]
         raise FrontendCacheError("frontend cache size or image attestation mismatch")
 
 
-def _require_cache_capacity(paths: Mapping[str, Any], *, windows: bool | None = None) -> None:
+def _require_cache_capacity(
+    paths: Mapping[str, Any], *, windows: bool | None = None, phase: str = "before allocation"
+) -> None:
     """Windows 9p may allocate the entire backing despite Linux truncate."""
     if windows is None:
         windows = os.name == "nt"
-    if not windows or Path(paths["backing_image"]).exists():
+    if not windows:
         return
-    required = CACHE_SIZE_BYTES + 2 * 1024 * 1024 * 1024
+    existing = Path(paths["backing_image"]).exists()
+    required = BACKEND_HEADROOM_BYTES if existing else CACHE_SIZE_BYTES + BACKEND_HEADROOM_BYTES
     free = shutil.disk_usage(paths["storage_root"]).free
     if free < required:
+        kind = "existing cache headroom" if existing else "new cache allocation"
         raise FrontendCacheError(
-            f"New frontend cache needs at least {required} free bytes on Windows; "
-            f"available: {free}. Existing caches and results were retained."
+            f"Frontend cache {kind} requires at least {required} free bytes on Windows "
+            f"during {phase}; available: {free}. Existing caches and results were retained."
         )
 
 
@@ -605,7 +610,7 @@ def prepare(
         toolpins,
     )
     paths = _cache_paths(layout, identity["key"])
-    _require_cache_capacity(paths)
+    _require_cache_capacity(paths, phase="before allocation")
     repo_path = Path(repo).resolve(strict=True)
     run_path = Path(run_root)
     if not run_path.is_absolute() or run_path.is_symlink():
@@ -689,6 +694,7 @@ def prepare(
     if not isinstance(receipt, Mapping):
         raise FrontendCacheError("frontend cache maintenance returned no receipt")
     _validate_host_receipt(receipt, values, image_id)
+    _require_cache_capacity(paths, phase="after allocation")
     environment[ENV_FILESYSTEM_UUID] = str(receipt["filesystem_uuid"])
     receipt_path = run_path / "frontend-cache-receipt.json"
     _atomic_json(
