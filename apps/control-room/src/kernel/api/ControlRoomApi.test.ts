@@ -3240,6 +3240,134 @@ describe("ControlRoomApi", () => {
     });
   });
 
+  it("classifies proxy 5xx responses without a contract header as unavailable", async () => {
+    for (const status of [500, 503]) {
+      const requestId = `req-proxy-${status}`;
+      const api = new ControlRoomApi({
+        maxGetRetries: 0,
+        requestIdFactory: () => requestId,
+        fetchImpl: async () =>
+          new Response("proxy unavailable", {
+            headers: { "x-request-id": `response-${status}` },
+            status,
+          }),
+      });
+
+      await expect(api.sessions.current.status()).rejects.toMatchObject({
+        code: "API_UNAVAILABLE",
+        message: "Fullmag API unavailable",
+        requestId: `response-${status}`,
+        status,
+      });
+    }
+  });
+
+  it("does not poison a pinned client on an unpinned proxy 5xx", async () => {
+    const pin = "12345678-1234-4234-8234-123456789abc";
+    let calls = 0;
+    const api = new ControlRoomApi({
+      expectedApiInstance: pin,
+      maxGetRetries: 0,
+      fetchImpl: async () => {
+        calls += 1;
+        return calls === 1
+          ? new Response("proxy unavailable", { status: 503 })
+          : jsonResponse(liveStatusFixture(), {
+              headers: { "x-fullmag-api-instance": pin },
+            });
+      },
+    });
+
+    await expect(api.sessions.current.status()).rejects.toMatchObject({
+      code: "API_UNAVAILABLE",
+      status: 503,
+    });
+    await expect(api.sessions.current.status()).resolves.toMatchObject({
+      api_contract_version: "1.0.0",
+    });
+    expect(calls).toBe(2);
+  });
+
+  it("keeps an explicit replacement instance as a hard fence on a 5xx", async () => {
+    const api = new ControlRoomApi({
+      expectedApiInstance: "12345678-1234-4234-8234-123456789abc",
+      maxGetRetries: 0,
+      fetchImpl: async () =>
+        new Response("replacement unavailable", {
+          headers: { "x-fullmag-api-instance": "87654321-1234-4234-8234-123456789abc" },
+          status: 503,
+        }),
+    });
+
+    await expect(api.sessions.current.status()).rejects.toMatchObject({
+      code: "API_INSTANCE_MISMATCH",
+      status: 409,
+    });
+  });
+
+  it("preserves contract mismatch for wrong-version 5xx responses", async () => {
+    const api = new ControlRoomApi({
+      maxGetRetries: 0,
+      fetchImpl: async () =>
+        new Response("backend failure", {
+          headers: {
+            "x-api-contract-version": "0.9.0",
+            "x-request-id": "wrong-version-request",
+          },
+          status: 503,
+        }),
+    });
+
+    await expect(api.sessions.current.status()).rejects.toMatchObject({
+      status: 0,
+      message: "API contract version mismatch: expected 1.0.0, got 0.9.0",
+    });
+  });
+
+  it("preserves contract mismatch for missing-version 4xx responses", async () => {
+    const api = new ControlRoomApi({
+      fetchImpl: async () => new Response("client failure", { status: 404 }),
+    });
+
+    await expect(api.sessions.current.status()).rejects.toMatchObject({
+      status: 0,
+      message: "API contract version mismatch: expected 1.0.0, got missing",
+    });
+  });
+
+  it("classifies exhausted network failures as unavailable with the request id", async () => {
+    const api = new ControlRoomApi({
+      maxGetRetries: 0,
+      requestIdFactory: () => "req-network-unavailable",
+      fetchImpl: async () => {
+        throw new TypeError("fetch failed");
+      },
+    });
+
+    await expect(api.sessions.current.status()).rejects.toMatchObject({
+      code: "API_UNAVAILABLE",
+      message: "Fullmag API unavailable",
+      requestId: "req-network-unavailable",
+      status: 0,
+    });
+  });
+
+  it("preserves an Error-shaped AbortError without retry or reclassification", async () => {
+    const abortError = new Error("aborted");
+    abortError.name = "AbortError";
+    const fetchImpl = vi.fn(async () => {
+      throw abortError;
+    });
+    const api = new ControlRoomApi({
+      fetchImpl,
+      maxGetRetries: 2,
+      requestIdFactory: () => "req-aborted",
+    });
+
+    await expect(api.sessions.current.status()).rejects.toBe(abortError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("reports non-ok status responses as API errors", async () => {
     const api = new ControlRoomApi({
       fetchImpl: async () =>
