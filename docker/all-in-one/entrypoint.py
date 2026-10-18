@@ -1,4 +1,4 @@
-"""Fail before API startup when GPU or durable state storage is unavailable."""
+"""Fail before API startup when device access or durable state is unavailable."""
 import ctypes
 import hashlib
 import os
@@ -13,6 +13,38 @@ from pathlib import Path
 
 
 STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA = "fullmag.startup-activation-diagnostic.v1"
+DEVICE_ACCESS_CPU = "cpu"
+DEVICE_ACCESS_GPU = "gpu"
+CUDA_COMPATIBILITY_ROOT = Path("/usr/local/cuda/compat")
+
+
+def _configure_device_access():
+    """Validate the minted device mode and prepare the CPU CUDA ABI path.
+
+    The full image contains the real user-mode CUDA driver compatibility
+    package under the fixed, image-owned path.  CPU access may use that
+    package for native components compiled with CUDA support.  The entrypoint
+    skips only its hardware-specific CUDA preflight in CPU mode; the native
+    runtime may perform its own ABI/readiness checks.  GPU access retains the
+    image's existing loader environment and is checked by ``preflight`` below.
+    """
+
+    access = os.environ.get("FULLMAG_DOCKER_DEVICE_ACCESS", DEVICE_ACCESS_GPU)
+    if access not in {DEVICE_ACCESS_CPU, DEVICE_ACCESS_GPU}:
+        raise RuntimeError("FULLMAG_DOCKER_DEVICE_ACCESS must be cpu or gpu")
+    if access == DEVICE_ACCESS_CPU:
+        compatibility_library = CUDA_COMPATIBILITY_ROOT / "libcuda.so.1"
+        if (not CUDA_COMPATIBILITY_ROOT.is_dir()
+                or not compatibility_library.is_file()):
+            raise RuntimeError(
+                "CPU device access requires the image-owned CUDA compatibility library"
+            )
+        current = [item for item in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+                   if item]
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+            dict.fromkeys([*current, str(CUDA_COMPATIBILITY_ROOT)])
+        )
+    return access
 
 
 class StartupActivationOutcome(Exception):
@@ -24,6 +56,7 @@ class StartupActivationOutcome(Exception):
 
 
 def preflight():
+    device_access = _configure_device_access()
     kind = subprocess.check_output(["stat", "-f", "-c", "%t", "/state"], text=True).strip()
     # Same supported writer filesystem types as the managed browser route.
     if kind.lower().lstrip("0") == "1021997" and os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == "windows-folder-v1":
@@ -32,12 +65,13 @@ def preflight():
     elif kind.lower().lstrip("0") not in {"ef53", "58465342", "9123683e", "1021994", "794c7630"}:
         raise RuntimeError(f"Unsupported durable session filesystem 0x{kind}; "
                            "configure supported project storage; no ephemeral fallback")
-    driver = ctypes.CDLL("libcuda.so.1")
-    if driver.cuInit(0) != 0:
-        raise RuntimeError("NVIDIA CUDA driver initialization failed")
-    count = ctypes.c_int()
-    if driver.cuDeviceGetCount(ctypes.byref(count)) != 0 or count.value < 1:
-        raise RuntimeError("No NVIDIA CUDA GPU available")
+    if device_access == DEVICE_ACCESS_GPU:
+        driver = ctypes.CDLL("libcuda.so.1")
+        if driver.cuInit(0) != 0:
+            raise RuntimeError("NVIDIA CUDA driver initialization failed")
+        count = ctypes.c_int()
+        if driver.cuDeviceGetCount(ctypes.byref(count)) != 0 or count.value < 1:
+            raise RuntimeError("No NVIDIA CUDA GPU available")
     for directory in ("/state/.fullmag", "/state/cuda-cache", "/state/.fullmag/mesh-cache"):
         Path(directory).mkdir(parents=True, exist_ok=True)
     probe = Path("/state/.fullmag") / (".write-probe-" + uuid.uuid4().hex)
