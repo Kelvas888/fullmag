@@ -901,6 +901,36 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
         other["Mounts"][0]["RW"] = False
         recovery.assert_shared_clients_quiescent(backend, [backend, other])
 
+    def test_overlapping_ledger_writers_block_recovery(self):
+        backend = target()
+        for source in ("/existing", "/", "/existing/host-ledger/ledger",
+                       "/existing//host-ledger/ledger/"):
+            with self.subTest(source=source):
+                other = {"Id": "c" * 64,
+                         "Mounts": [{"Type": "bind", "Source": source, "RW": True}]}
+                with self.assertRaisesRegex(ValueError, "another running client"):
+                    recovery.assert_shared_clients_quiescent(backend, [backend, other])
+
+    def test_sibling_writers_and_readonly_overlaps_do_not_block_recovery(self):
+        backend = target()
+        for source, writable in (("/existing/host-ledger-extra", True),
+                                 ("/existing/host-ledger/../separate", True),
+                                 ("/existing", False),
+                                 ("/existing/host-ledger/ledger", False)):
+            with self.subTest(source=source, writable=writable):
+                other = {"Id": "c" * 64,
+                         "Mounts": [{"Type": "bind", "Source": source, "RW": writable}]}
+                recovery.assert_shared_clients_quiescent(backend, [backend, other])
+
+    def test_unverifiable_writable_host_mount_blocks_recovery(self):
+        backend = target()
+        other = {"Id": "c" * 64,
+                 "Mounts": [{"Type": "bind", "Source": "relative/unknown", "RW": True}]}
+        with self.assertRaisesRegex(ValueError, "host mount source"):
+            recovery.assert_shared_clients_quiescent(backend, [backend, other])
+        other["Mounts"][0] = {"Type": "tmpfs", "Source": "", "RW": True}
+        recovery.assert_shared_clients_quiescent(backend, [backend, other])
+
     def test_running_inventory_requests_full_container_ids(self):
         docker = FakeDocker(target())
         recovery._running_containers(docker)

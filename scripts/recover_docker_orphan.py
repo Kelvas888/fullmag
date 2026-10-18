@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path
 import re
 import stat
@@ -273,15 +274,26 @@ def noncompute_command(command: Sequence[str], stub_sha256: str,
 
 def assert_shared_clients_quiescent(target: Mapping[str, Any],
                                     running: Sequence[Mapping[str, Any]]) -> None:
-    ledger_mount = next(item["Source"] for item in target["Mounts"]
-                        if item["Destination"] == "/host-ledger")
+    def normalized_source(source: Any) -> str:
+        require(isinstance(source, str) and source.startswith("/"),
+                "running client host mount source cannot be verified")
+        # These are Linux daemon paths, not paths on the Windows CLI host.
+        return posixpath.normpath("/" + source.lstrip("/"))
+
+    ledger_mount = normalized_source(next(item["Source"] for item in target["Mounts"]
+                                         if item["Destination"] == "/host-ledger"))
     for container in running:
         if container["Id"] == target["Id"]:
             continue
-        shared = any(item.get("Source") == ledger_mount and item.get("RW")
-                     for item in container.get("Mounts", []))
-        require(not shared, "another running client can write this host ledger; "
-                "stop and upgrade it before publishing the new release proof")
+        for item in container.get("Mounts", []):
+            if not item.get("RW") or item.get("Type") == "tmpfs":
+                continue
+            source = normalized_source(item.get("Source"))
+            shared = (source == ledger_mount
+                      or source.startswith(ledger_mount.rstrip("/") + "/")
+                      or ledger_mount.startswith(source.rstrip("/") + "/"))
+            require(not shared, "another running client can write this host ledger; "
+                    "stop and upgrade it before publishing the new release proof")
 
 
 class RecoveryUnknown(RuntimeError):
