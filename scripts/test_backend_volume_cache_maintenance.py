@@ -290,6 +290,43 @@ class BackendVolumeCacheMaintenanceTests(unittest.TestCase):
             with self.assertRaisesRegex(backend.BackendBuildError, "incomplete or unknown"):
                 backend._ensure_package_development_root(package)
 
+    def test_hardlinked_package_records_fail_before_truncating_target(self):
+        for record_name in (helper.MARKER_NAME, helper.READBACK_NAME):
+            with self.subTest(record_name=record_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                build = root / "build"
+                package = root / "package"
+                build.mkdir()
+                package.mkdir()
+                uid, gid = self._test_owner()
+                helper.ensure(
+                    build,
+                    package,
+                    environment=self._environment(),
+                    owner_uid=uid,
+                    owner_gid=gid,
+                )
+                control = (
+                    package
+                    / backend.PACKAGE_DEVELOPMENT_DIRNAME
+                    / backend.PACKAGE_CACHE_CONTROL_DIRNAME
+                )
+                record = control / record_name
+                target = root / "outside-record"
+                os.link(record, target)
+                before = target.read_bytes()
+                with self.assertRaisesRegex(helper.MaintenanceError, "unexpected link count"):
+                    helper.ensure(
+                        build,
+                        package,
+                        environment=self._environment(),
+                        owner_uid=uid,
+                        owner_gid=gid,
+                    )
+                self.assertEqual(target.read_bytes(), before)
+                self.assertEqual(record.read_bytes(), before)
+                self.assertEqual(record.stat().st_nlink, 2)
+
     def test_legacy_package_symlink_is_rejected_without_following(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -77,7 +77,11 @@ def _chown_record(directory: int, name: str, uid: int, gid: int) -> None:
 
 @contextmanager
 def _open_maintenance_record(
-    directory: int, name: str, flags: int
+    directory: int,
+    name: str,
+    flags: int,
+    *,
+    expected_nlink: int | None = 1,
 ) -> Iterator[tuple[int, os.stat_result]]:
     """Open a record while retaining access with CAP_CHOWN only.
 
@@ -97,6 +101,8 @@ def _open_maintenance_record(
         raise MaintenanceError(f"cannot inspect cache maintenance record: {name}") from error
     if stat.S_ISLNK(original.st_mode) or not stat.S_ISREG(original.st_mode):
         raise MaintenanceError(f"cache maintenance record is not regular: {name}")
+    if expected_nlink is not None and original.st_nlink != expected_nlink:
+        raise MaintenanceError(f"cache maintenance record has an unexpected link count: {name}")
 
     original_owner = (original.st_uid, original.st_gid)
     changed_owner = False
@@ -106,8 +112,10 @@ def _open_maintenance_record(
         if os.geteuid() == 0 and original_owner != (0, 0):
             _chown_record(directory, name, 0, 0)
             changed_owner = True
+        truncate = bool(flags & os.O_TRUNC)
+        open_flags = flags & ~os.O_TRUNC if truncate else flags
         try:
-            descriptor = os.open(name, flags | _O_NOFOLLOW, dir_fd=directory)
+            descriptor = os.open(name, open_flags | _O_NOFOLLOW, dir_fd=directory)
         except OSError as error:
             raise MaintenanceError(f"cannot open cache maintenance record: {name}") from error
         metadata = os.fstat(descriptor)
@@ -115,6 +123,13 @@ def _open_maintenance_record(
                 or (metadata.st_dev, metadata.st_ino)
                 != (original.st_dev, original.st_ino)):
             raise MaintenanceError(f"cache maintenance record changed during open: {name}")
+        if expected_nlink is not None and metadata.st_nlink != expected_nlink:
+            raise MaintenanceError(f"cache maintenance record has an unexpected link count: {name}")
+        if truncate:
+            try:
+                os.ftruncate(descriptor, 0)
+            except OSError as error:
+                raise MaintenanceError(f"cache maintenance record truncate failed: {name}") from error
         yield descriptor, original
     finally:
         if changed_owner:
@@ -137,9 +152,20 @@ def _open_maintenance_record(
             raise restoration_error
 
 
-def _read_record_bytes(directory: int, name: str, limit: int) -> tuple[bytes, os.stat_result]:
+def _read_record_bytes(
+    directory: int,
+    name: str,
+    limit: int,
+    *,
+    expected_nlink: int | None = 1,
+) -> tuple[bytes, os.stat_result]:
     try:
-        with _open_maintenance_record(directory, name, os.O_RDONLY) as (descriptor, metadata):
+        with _open_maintenance_record(
+            directory,
+            name,
+            os.O_RDONLY,
+            expected_nlink=expected_nlink,
+        ) as (descriptor, metadata):
             raw = _read_bounded(descriptor, limit)
     except FileNotFoundError:
         raise
@@ -279,7 +305,12 @@ def _validate_migration_record(
     allow_root_owner: bool = False,
 ) -> os.stat_result:
     try:
-        raw, metadata = _read_record_bytes(directory, name, max(MAX_MARKER_BYTES, MAX_READBACK_BYTES))
+        raw, metadata = _read_record_bytes(
+            directory,
+            name,
+            max(MAX_MARKER_BYTES, MAX_READBACK_BYTES),
+            expected_nlink=expected_nlink,
+        )
     except FileNotFoundError as error:
         raise MaintenanceError(f"{label} is missing") from error
     if expected_nlink is not None and metadata.st_nlink != expected_nlink:
