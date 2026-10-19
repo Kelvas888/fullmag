@@ -264,6 +264,13 @@ impl HostRuntimeState {
 }
 
 impl HostRuntimeReadiness {
+    /// Compare shared host admission facts, independently of the binary that
+    /// produced their attestation. Every joining binary must separately prove
+    /// its own native ABI; this is not a replacement for local validation.
+    pub fn has_same_host_abi(&self, other: &Self) -> bool {
+        runtime_readiness_abi_compatible(self, other)
+    }
+
     pub fn is_cpu_only_profile(&self) -> bool {
         self.schema_version == HOST_RUNTIME_READINESS_SCHEMA_V2
             && self.source_kind == "native_fem_cpu_abi"
@@ -2390,9 +2397,15 @@ impl HostResourceLedger {
             if marker_exists && document_exists {
                 let ledger = Self::open(&canonical_root, policy)?;
                 let existing = ledger.read_runtime_readiness()?;
-                if ledger.runtime_generation_sha256()?.is_none() || existing != readiness {
+                if !existing.has_same_host_abi(&readiness) {
+                    bail!("runtime readiness initialization changes the persisted host ABI facts");
+                }
+                if ledger.runtime_generation_sha256()?.is_none() {
                     ledger.upgrade_runtime_readiness(readiness)?;
                 } else {
+                    // Compatible worktrees share one host generation. A new
+                    // producer identity alone must not rotate it or disturb
+                    // the active inventory owner and reservations.
                     ledger.gc_unreachable_snapshot_cas()?;
                 }
                 return Ok(ledger);
@@ -11039,6 +11052,52 @@ mod tests {
             ledger.read_runtime_generation_sha256().unwrap(),
             next_generation
         );
+    }
+
+    #[test]
+    fn compatible_worktree_joins_v4_without_rotating_active_owner_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = ledger_root(directory.path());
+        let mut policy = policy();
+        policy.schema_version = HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2.into();
+        let original = v4_readiness(&policy, &"1".repeat(64), &"2".repeat(64));
+        let ledger = HostResourceLedger::initialize_with_readiness(
+            &root, policy.clone(), original.clone(),
+        ).unwrap();
+        let generation = ledger.read_runtime_generation_sha256().unwrap();
+        let owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        let before = fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap();
+        let mut joining = original.clone();
+        joining.source_snapshot_sha256 = "4".repeat(64);
+        joining.runtime_identity_sha256 = "5".repeat(64);
+        let reopened = HostResourceLedger::initialize_or_upgrade_with_readiness(
+            &root, policy, joining,
+        ).unwrap();
+        assert_eq!(reopened.read_runtime_generation_sha256().unwrap(), generation);
+        assert_eq!(reopened.read_runtime_readiness().unwrap(), original);
+        assert_eq!(reopened.active_inventory_owner().unwrap().as_ref(), Some(owner.descriptor()));
+        assert_eq!(fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap(), before);
+    }
+
+    #[test]
+    fn worktree_join_rejects_changed_host_abi_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = ledger_root(directory.path());
+        let mut policy = policy();
+        policy.schema_version = HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2.into();
+        let original = v4_readiness(&policy, &"1".repeat(64), &"2".repeat(64));
+        let ledger = HostResourceLedger::initialize_with_readiness(
+            &root, policy.clone(), original.clone(),
+        ).unwrap();
+        let _owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        let before = fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap();
+        let mut joining = original;
+        joining.capabilities = vec!["fdm.cpu".into(), "fem.gpu".into()];
+        let error = HostResourceLedger::initialize_or_upgrade_with_readiness(
+            &root, policy, joining,
+        ).err().expect("changed host ABI must fail");
+        assert!(error.to_string().contains("persisted host ABI facts"));
+        assert_eq!(fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap(), before);
     }
 
     #[test]

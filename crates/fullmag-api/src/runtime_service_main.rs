@@ -96,7 +96,7 @@ async fn publish_compute_node_sample(
             let readiness = fullmag_runtime_control::retry_store_writer_busy(|| {
                 ledger.read_runtime_readiness()
             })?;
-            fullmag_runtime_control::compute_node_probe::validate_native_runtime_readiness(
+            fullmag_runtime_control::compute_node_probe::validate_native_runtime_readiness_for_host(
                 &readiness,
             )?;
             fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner_with_readiness(
@@ -1190,6 +1190,14 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     let runtime_generation_sha256 = fullmag_runtime_control::retry_store_writer_busy(|| {
         ledger.read_runtime_generation_sha256()
     })?;
+    let canonical_readiness = fullmag_runtime_control::retry_store_writer_busy(|| {
+        ledger.read_runtime_readiness()
+    })?;
+    if !persisted_readiness.has_same_host_abi(&canonical_readiness) {
+        bail!("Docker host readiness changed while joining the shared generation");
+    }
+    ledger.validate_runtime_generation(&runtime_generation_sha256)?;
+    persisted_readiness = canonical_readiness;
     let snapshot = if let Some(active_owner) = ledger.active_inventory_owner()? {
         let snapshot = ledger
             .read_compute_node_snapshot()?

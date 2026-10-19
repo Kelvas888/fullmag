@@ -424,6 +424,41 @@ pub fn validate_native_fem_gpu_readiness(readiness: &HostRuntimeReadiness) -> Re
     Ok(())
 }
 
+/// Validate this binary's native runtime independently of the producer of a
+/// shared host generation. Sampling still checks actual topology/capability
+/// digests before publishing: copying those digests here does not attest them.
+pub fn validate_native_runtime_readiness_for_host(host: &HostRuntimeReadiness) -> Result<()> {
+    host.validate_probe()?;
+    // Do not run a second nvidia-smi/NVML probe here. The sampler below owns
+    // live hardware observations and their bounded warm-recovery policy.
+    let build = fullmag_build_info::identity();
+    let status = fullmag_runner::native_fem_gpu_status();
+    let mut local = host.clone();
+    local.source_snapshot_sha256 = build.source_snapshot_sha256.to_owned();
+    if host.is_cpu_only_profile() {
+        local.runtime_identity_sha256 = native_fem_cpu_runtime_identity(
+            build.git_commit, build.source_snapshot_sha256, &status,
+        );
+        local.capabilities = vec!["fem.cpu".to_owned()];
+        local.gpu_runtime_compatibility.clear();
+        local.gpu_visibility = EnforcementStatus::Unavailable;
+    } else {
+        local.runtime_identity_sha256 = native_fem_gpu_runtime_identity(
+            build.git_commit, build.source_snapshot_sha256, &status,
+        );
+        local.capabilities = vec!["fem.gpu".to_owned()];
+        local.gpu_runtime_compatibility = host.gpu_runtime_compatibility.keys()
+            .map(|uuid| (uuid.clone(), vec!["fem.gpu".to_owned()]))
+            .collect();
+        local.gpu_visibility = EnforcementStatus::Supported;
+    }
+    validate_native_runtime_readiness(&local)?;
+    if !local.has_same_host_abi(host) {
+        bail!("local native runtime differs from the persisted host ABI facts");
+    }
+    Ok(())
+}
+
 /// Probe the CPU lane of the full native FEM build when no CUDA device is
 /// visible. This profile is deliberately separate from the GPU readiness
 /// contract: it never manufactures a GPU inventory or a GPU capability.
