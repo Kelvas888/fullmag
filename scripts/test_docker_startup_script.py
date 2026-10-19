@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
 import importlib.util
 import json
 import os
@@ -570,6 +571,10 @@ class StartupRejectionTests(unittest.TestCase):
             service = SimpleNamespace(
                 prepare_storage=mock.Mock(return_value=paths),
                 initialize_accepted_store=mock.Mock(return_value={"binding": "test"}),
+                recover_container_namespace=mock.Mock(return_value=None),
+                container_recovery_configuration_override=mock.Mock(
+                    side_effect=lambda _paths, _recovery: nullcontext()
+                ),
                 recover_idle_failure=mock.Mock(return_value=None),
                 ensure_configuration=mock.Mock(return_value={}),
                 process_environment=mock.Mock(return_value={}),
