@@ -165,15 +165,13 @@ class AcceptedReattachProducerTests(unittest.TestCase):
             "api_exit_code": -15,
             "runtime_pid": None,
         }
-        owner_raw = _raw(failed_owner)
+        owner_raw = (json.dumps(failed_owner, indent=2, ensure_ascii=False) + "\n").encode()
         terminal_raw = _raw(terminal)
         probe = {
             "schema": "fullmag.docker-native-start-failure-stop-probe.v1",
             "process_receipt_sha256": process_receipt_sha256,
             "process_receipt": process_receipt,
-            "failed_owner_sha256": hashlib.sha256(
-                producer.canonical(failed_owner) + b"\n"
-            ).hexdigest(),
+            "failed_owner_sha256": hashlib.sha256(owner_raw).hexdigest(),
             "failed_owner": failed_owner,
             "api_pid_exists": False,
             "owner_pid_exists": False,
@@ -482,6 +480,12 @@ class AcceptedReattachProducerTests(unittest.TestCase):
         owner = json.loads(self.records[owner_path])
         owner["pid"] += 1
         self.records[owner_path] = _raw(owner)
+        with self.assertRaises(producer.BuildControlError):
+            self.build()
+
+    def test_terminal_owner_raw_digest_drift_is_rejected(self) -> None:
+        owner_path = "runtime-control/runtime-services/OWNER.json"
+        self.records[owner_path] += b" "
         with self.assertRaises(producer.BuildControlError):
             self.build()
 

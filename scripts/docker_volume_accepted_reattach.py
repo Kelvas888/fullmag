@@ -611,20 +611,16 @@ def _validate_stop_journal(
         raise _fail("stopped-backend native failure evidence is not authoritative") from error
     failed_owner = native["failed_owner"]
     failed_owner_sha = probe.get("failed_owner_sha256")
-    accepted_owner_digests = {
-        hashlib.sha256(canonical(failed_owner)).hexdigest(),
-        hashlib.sha256(canonical(failed_owner) + b"\n").hexdigest(),
-    }
-    if (not isinstance(failed_owner_sha, str) or SHA256_RE.fullmatch(failed_owner_sha) is None
-            or failed_owner_sha not in accepted_owner_digests):
-        raise _fail("stopped-backend failed owner digest differs from its probe")
+    # The native probe hashes raw OWNER.json bytes, which may be pretty JSON.
+    # The separate control-record validator compares those exact bytes with
+    # both digest pins; re-encoding this parsed object would change the hash.
+    if not isinstance(failed_owner_sha, str) or SHA256_RE.fullmatch(failed_owner_sha) is None:
+        raise _fail("stopped-backend failed owner digest is missing or invalid")
     if record.get("terminal_failed_owner") != failed_owner:
         raise _fail("stopped-backend terminal failed owner differs from its probe")
     terminal_failed_owner_sha = record.get("terminal_failed_owner_sha256")
     if not isinstance(terminal_failed_owner_sha, str) or SHA256_RE.fullmatch(terminal_failed_owner_sha) is None:
         raise _fail("stopped-backend terminal failed owner digest is missing")
-    if terminal_failed_owner_sha not in accepted_owner_digests:
-        raise _fail("stopped-backend terminal failed owner digest differs")
     if terminal_failed_owner_sha != failed_owner_sha:
         raise _fail("stopped-backend failed owner digest changed during terminalization")
     terminal = record.get("terminal_process_receipt")
