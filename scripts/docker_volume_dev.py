@@ -27,6 +27,9 @@ _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES = (
 _RECOVERY_ENVIRONMENT_NAME = re.compile(r"FULLMAG_CONTAINER_RECOVERY_[A-Z0-9_]+\Z")
 _RECOVERY_ATTEMPT = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_RECOVERY_METADATA_BYTES = 256 * 1024
+_MAX_CANCELLED_ACTIVATION_RECORD_BYTES = 8 * 1024 * 1024
+_CANCELLED_ACTIVATION_SCHEMA = "fullmag.docker-activation-accepted-then-cancelled.v1"
+_CANCELLED_ACTIVATION_ATTEMPT = re.compile(r"[0-9a-f]{32}\Z")
 
 
 def _validate_recovery_environment(values):
@@ -1066,6 +1069,506 @@ def _assert_private_restart_network(actual, ids, project):
         raise BuildControlError("Idle restart bridge has unknown consumers; no backend will be stopped")
 
 
+def _read_cancelled_activation_bytes(control, relative, *, optional=False):
+    """Read one bounded, immutable control-volume file with its raw bytes."""
+    path = control.path(relative)
+    parent = str(PurePosixPath(path).parent)
+    script = (
+        f"test -e '{path}' || exit 44; "
+        f"test \"$(readlink -f '{parent}')\" = '{parent}'; "
+        f"test -f '{path}'; test ! -L '{path}'; test $(stat -c %h '{path}') = 1; "
+        f"head -c {_MAX_CANCELLED_ACTIVATION_RECORD_BYTES + 1} '{path}'"
+    )
+    result = bounded_capture(control.helper_args(script), data=b"", timeout=90)
+    if optional and result.returncode == 44:
+        return None
+    if result.returncode:
+        raise BuildControlError(
+            f"Cannot read cancelled activation record {relative}: "
+            + result.stderr.decode("utf-8", "replace")[-2048:]
+        )
+    raw = bytes(result.stdout)
+    if len(raw) > _MAX_CANCELLED_ACTIVATION_RECORD_BYTES:
+        raise BuildControlError(f"Cancelled activation record {relative} exceeds its size bound")
+    return raw
+
+
+def _read_cancelled_activation_record(control, relative, *, optional=False):
+    """Read one bounded, immutable control-volume JSON record with its bytes."""
+    raw = _read_cancelled_activation_bytes(control, relative, optional=optional)
+    if raw is None:
+        return None, None
+
+    def reject_duplicate_keys(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise BuildControlError(f"Cancelled activation record {relative} contains a duplicate key")
+            value[key] = item
+        return value
+
+    try:
+        document = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BuildControlError(f"Cancelled activation record {relative} is invalid JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise BuildControlError(f"Cancelled activation record {relative} is not an object")
+    return document, raw
+
+
+def _cancelled_activation_probe_script() -> str:
+    # This script is passed as Python argv to the already pinned backend. It
+    # only reads bounded regular files while holding both writer locks. It does
+    # not import application code and cannot publish a cancellation itself.
+    return r'''import fcntl, hashlib, json, os, pathlib, stat, sys, time, urllib.error, urllib.request
+
+MAX=8*1024*1024
+run_id, task_id, request_id, source_sha, marker_path, store_root, ledger_root, expected_scene_revision = sys.argv[1:]
+
+def fail(message): raise RuntimeError(message)
+def regular(path, label, maximum=MAX):
+    path=pathlib.Path(path)
+    if not path.is_absolute() or ".." in path.parts or path.is_symlink(): fail(label+" path is unsafe")
+    try: fd=os.open(path, os.O_RDONLY|getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error: raise RuntimeError(label+" cannot be opened") from error
+    try:
+        meta=os.fstat(fd)
+        if not stat.S_ISREG(meta.st_mode) or meta.st_size>maximum: fail(label+" is not bounded regular")
+        chunks=[]; total=0
+        while total<=maximum:
+            chunk=os.read(fd, min(65536, maximum+1-total))
+            if not chunk: break
+            chunks.append(chunk); total+=len(chunk)
+        if total>maximum: fail(label+" exceeds size bound")
+        return b"".join(chunks)
+    finally: os.close(fd)
+def obj(path, label):
+    try: value=json.loads(regular(path,label).decode("utf-8"))
+    except (UnicodeDecodeError,json.JSONDecodeError) as error: raise RuntimeError(label+" is invalid JSON") from error
+    if not isinstance(value,dict): fail(label+" is not an object")
+    return value
+def digest(raw): return hashlib.sha256(raw).hexdigest()
+def canon(value): return json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+def lock(path,label):
+    path=pathlib.Path(path)
+    if not path.is_file() or path.is_symlink(): fail(label+" is missing")
+    fd=os.open(path,os.O_RDWR|getattr(os,"O_NOFOLLOW",0))
+    deadline=time.monotonic()+5
+    while True:
+        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); return fd
+        except BlockingIOError as error:
+            if time.monotonic()>=deadline: os.close(fd); raise RuntimeError(label+" remained busy") from error
+            time.sleep(0.05)
+        except OSError as error: os.close(fd); raise RuntimeError(label+" lock outcome is unknown") from error
+def matching_json(root, label, predicate):
+    root=pathlib.Path(root)
+    if not root.exists(): return []
+    if root.is_symlink() or not root.is_dir(): fail(label+" is not a directory")
+    found=[]
+    for current, dirs, files in os.walk(root,topdown=True,followlinks=False):
+        current=pathlib.Path(current)
+        for name in list(dirs):
+            if (current/name).is_symlink(): fail(label+" contains a symlink")
+        for name in files:
+            path=current/name
+            if path.is_symlink() or not path.is_file(): fail(label+" contains an invalid file")
+            value=obj(path,label+" record")
+            if predicate(value): found.append(str(path))
+    return found
+def ensure_empty_tree(root,label):
+    root=pathlib.Path(root)
+    if not root.exists(): return
+    if root.is_symlink() or not root.is_dir(): fail(label+" is not a directory")
+    for current, dirs, files in os.walk(root,topdown=True,followlinks=False):
+        current=pathlib.Path(current)
+        for name in list(dirs):
+            if (current/name).is_symlink(): fail(label+" contains a symlink")
+        for name in files:
+            path=current/name
+            if path.is_symlink() or not path.is_file(): fail(label+" contains an invalid file")
+            fail(label+" contains a durable record")
+def api_get(path,label):
+    request=urllib.request.Request("http://127.0.0.1:8081"+path,headers={"Accept":"application/json","Host":"localhost"})
+    try:
+        with urllib.request.urlopen(request,timeout=5) as response:
+            data=response.read(MAX+1)
+            if len(data)>MAX: fail(label+" response exceeds size bound")
+            if response.status!=200: fail(label+" returned HTTP "+str(response.status))
+            value=json.loads(data.decode("utf-8"))
+            if not isinstance(value,dict): fail(label+" response is not an object")
+            return value,response.headers.get("x-fullmag-api-instance"),digest(data)
+    except urllib.error.HTTPError as error:
+        try: error.read(MAX+1)
+        except OSError: pass
+        fail(label+" returned HTTP "+str(error.code))
+    except (OSError,urllib.error.URLError,UnicodeDecodeError,json.JSONDecodeError) as error:
+        raise RuntimeError(label+" cannot be read") from error
+
+store=pathlib.Path(store_root)
+ledger=pathlib.Path(ledger_root)
+if (not store.is_absolute() or ".." in store.parts or store.is_symlink()
+        or not ledger.is_absolute() or ".." in ledger.parts or ledger.is_symlink()): fail("probe roots are unsafe")
+ledger_fd=None
+try:
+    ledger_fd=lock(ledger/"WRITER.lock","host ledger writer lock")
+    store_fd=lock(store/"WRITER.lock","accepted store writer lock")
+    run=store/"runs"/run_id
+    intent_path=run/"run_intent.json"
+    catalog_path=run/"run_catalog.json"
+    cancellation_path=run/"task_cancellation_intents"/(task_id+".json")
+    intent_raw=regular(intent_path,"accepted RunIntent")
+    catalog_raw=regular(catalog_path,"run catalog")
+    cancellation_raw=regular(cancellation_path,"cancellation intent")
+    intent=obj(intent_path,"accepted RunIntent")
+    catalog=obj(catalog_path,"run catalog")
+    cancellation=obj(cancellation_path,"cancellation intent")
+    if intent.get("schema_version")!="run_intent.v1" or intent.get("run_id")!=run_id: fail("RunIntent identity/schema differs")
+    expected_intent_key="live-http-"+digest(request_id.encode("utf-8"))
+    if intent.get("idempotency_key")!=expected_intent_key: fail("RunIntent idempotency identity is not bound to the startup request")
+    if not isinstance(intent.get("payload_sha256"),str) or intent.get("payload_sha256")!=digest(canon(intent.get("specification"))): fail("RunIntent payload digest differs")
+    specification=intent.get("specification")
+    if not isinstance(specification,dict): fail("RunIntent specification is not an object")
+    parameters=specification.get("parameters")
+    if not isinstance(parameters,dict): fail("RunIntent parameters are missing")
+    live=parameters.get("live_workspace")
+    if not isinstance(live,dict): fail("RunIntent live workspace binding is missing")
+    api_instance_id=live.get("api_instance_id")
+    session_id=live.get("session_id")
+    session_epoch=live.get("session_epoch")
+    scene_revision=live.get("scene_revision")
+    if (not isinstance(api_instance_id,str) or not api_instance_id
+            or not isinstance(session_id,str) or not session_id
+            or not isinstance(session_epoch,int) or isinstance(session_epoch,bool) or session_epoch<0
+            or not isinstance(scene_revision,int) or isinstance(scene_revision,bool) or scene_revision<0):
+        fail("RunIntent live workspace identity is malformed")
+    if (live.get("command_id")!=request_id
+            or live.get("request_idempotency_key")!=request_id
+            or live.get("startup_source_sha256")!=source_sha):
+        fail("RunIntent live workspace request/source binding differs")
+    command=live.get("command")
+    if (not isinstance(command,dict) or command.get("kind")!="startup_script"
+            or command.get("request_id")!=request_id or command.get("source_sha256")!=source_sha):
+        fail("RunIntent live workspace startup command differs")
+    policy=parameters.get("fullmag.accepted_run_start")
+    if (not isinstance(policy,dict) or policy.get("schema_version")!="accepted_run_start_policy.v1"
+            or policy.get("mode")!="manual"):
+        fail("RunIntent accepted start policy is not manual")
+    if catalog.get("schema_version")!="run_catalog.v1" or catalog.get("run_id")!=run_id or not isinstance(catalog.get("revision"),int) or catalog.get("revision",0)<=0: fail("run catalog identity/schema differs")
+    tasks=catalog.get("tasks")
+    if not isinstance(tasks,list) or not tasks: fail("run catalog has no tasks")
+    target=None
+    task_ids=set()
+    for task in tasks:
+        if not isinstance(task,dict) or not isinstance(task.get("task_id"),str): fail("run catalog task is malformed")
+        if task.get("task_id") in task_ids: fail("run catalog contains duplicate task identity")
+        task_ids.add(task.get("task_id"))
+        if task.get("lifecycle")!="cancelled": fail("run catalog still has a non-cancelled task")
+        for key in ("attempt_id","resource_id","resolved_input_fingerprint","coordinator_watermark","coordinator_genesis"):
+            if task.get(key) is not None: fail("run catalog retains an owner on a cancelled task")
+        if task.get("task_id")==task_id: target=task
+    if target is None: fail("target task is missing from the run catalog")
+    if cancellation.get("schema_version")!="task_cancellation_intent.v1" or cancellation.get("run_id")!=run_id: fail("cancellation intent identity/schema differs")
+    if cancellation.get("task",{}).get("task_id")!=task_id: fail("cancellation intent task differs")
+    if cancellation.get("task",{}).get("lifecycle") not in {"accepted","queued"}: fail("cancellation intent was not pre-claim")
+    if cancellation.get("task",{}).get("input_fingerprint")!=target.get("input_fingerprint"): fail("cancellation intent input scope differs")
+    if cancellation.get("expected_catalog_revision",0)>catalog.get("revision",0): fail("cancellation intent revision is ahead of catalog")
+    semantic={k:cancellation.get(k) for k in ("schema_version","cancellation_id","run_id","expected_catalog_revision","task","reason")}
+    if cancellation.get("request_sha256")!=digest(canon(semantic)): fail("cancellation intent digest differs")
+    if cancellation.get("cancellation_id") is None: fail("cancellation identity is missing")
+
+    ensure_empty_tree(run/"task_admissions","cancelled run task admissions")
+    for name in ("task_preparation_receipts", "accepted_stage_preparation_receipts"):
+        paths=run/name
+        ensure_empty_tree(paths, "task preparation receipts")
+    for name in ("preparation_process_launches", "preparation_process_exit_receipts"):
+        matches=matching_json(run/name,"preparation process records",lambda value: value.get("run_id")==run_id and value.get("task_id") in task_ids)
+        if matches: fail("task has durable preparation process records")
+    prep_matches=matching_json(run/"preparation_resource_leases","preparation resource leases",lambda value: value.get("run_id")==run_id and value.get("task_id") in task_ids)
+    if prep_matches: fail("task has a durable preparation lease")
+    solver_matches=matching_json(run/"resource_leases","solver resource leases",lambda value: value.get("run_id")==run_id and value.get("task_id") in task_ids and value.get("state")!="released")
+    if solver_matches: fail("task has an active or uncertain solver lease")
+
+    ledger_raw=regular(ledger/"HOST_RESOURCE_LEDGER.json","host resource ledger")
+    ledger_doc=json.loads(ledger_raw)
+    reservations=ledger_doc.get("reservations")
+    if not isinstance(reservations,list): fail("host resource ledger reservations are missing")
+    matching=[]
+    for row in reservations:
+        if not isinstance(row,dict): fail("host resource ledger reservation is malformed")
+        identity=row.get("identity")
+        if isinstance(identity,dict) and identity.get("run_id")==run_id and identity.get("task_id") in task_ids:
+            matching.append(row)
+            if row.get("state")!="released": fail("host resource ledger still holds the cancelled task")
+
+    expected_scene_revision=int(expected_scene_revision)
+    marker_raw=regular(marker_path,"startup activation marker")
+    marker=obj(marker_path,"startup activation marker")
+    expected_key=hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    expected_path="/opt/fullmag/control/backend/script-activation-"+expected_key+"/activation.json"
+    if marker_path!=expected_path: fail("startup activation marker path differs from request")
+    if marker.get("schema")!="fullmag.docker-startup-activation-receipt.v1" or marker.get("state")!="started": fail("startup activation marker is not the unchanged started marker")
+    if marker.get("request_id")!=request_id or marker.get("source_sha256")!=source_sha: fail("startup activation marker request/source fence differs")
+    auth=marker.get("authorization")
+    if not isinstance(auth,dict) or auth.get("request_id")!=request_id or auth.get("source_sha256")!=source_sha: fail("startup activation authorization fence differs")
+    # The cancellation is terminal. Release writer leases before asking the
+    # API for liveness: its native observer also needs those same writers.
+    fcntl.flock(store_fd,fcntl.LOCK_UN); os.close(store_fd); store_fd=None
+    fcntl.flock(ledger_fd,fcntl.LOCK_UN); os.close(ledger_fd); ledger_fd=None
+    current_status,current_api_instance,current_status_sha256=api_get("/v2/sessions/current/status","current live session status")
+    current_session=current_status.get("session")
+    if not isinstance(current_session,dict): fail("current live session status has no session")
+    if (current_session.get("session_id")!=session_id
+            or not isinstance(current_session.get("created_at"),str)
+            or not current_session["created_at"].isdigit()
+            or current_session.get("session_epoch")!=session_id+"@"+current_session["created_at"]
+            or current_session.get("request_scope_epoch")!=api_instance_id+":"+str(session_epoch)):
+        fail("current live session identity differs from RunIntent")
+    if current_api_instance!=api_instance_id: fail("current API instance differs from RunIntent")
+    current_document, current_document_instance, _ = api_get("/v2/sessions/current", "current session")
+    if (current_document.get("current") is not True
+            or current_document.get("session_id") != session_id
+            or current_document.get("script", {}).get("sha256") != source_sha
+            or current_document_instance != api_instance_id):
+        fail("current session script identity differs from the cancelled activation")
+    run_request=urllib.request.Request("http://127.0.0.1:8081/v2/sessions/current/simulation/runs/current",headers={"Accept":"application/json","Host":"localhost"})
+    try:
+        with urllib.request.urlopen(run_request,timeout=5) as response:
+            fail("current session still has an in-memory run")
+    except urllib.error.HTTPError as error:
+        if error.code != 404: fail("current run absence is not confirmed")
+        if error.headers.get("x-fullmag-api-instance") != api_instance_id:
+            fail("current run API instance differs")
+        error.read(MAX+1)
+    except (OSError,urllib.error.URLError) as error:
+        raise RuntimeError("current run absence cannot be read") from error
+    scene, _, _ = api_get("/v2/sessions/current/model/scene", "current live scene")
+    observed_scene_revision=scene.get("revision")
+    if observed_scene_revision is None: observed_scene_revision=scene.get("scene_revision")
+    if observed_scene_revision!=expected_scene_revision or observed_scene_revision!=scene_revision:
+        fail("current API scene revision differs from the accepted scene")
+    queue, _, _ = api_get("/v2/platform/compute/queue", "compute queue")
+    if queue.get("schema_version")!="compute_queue.v1" or queue.get("items")!=[]:
+        fail("compute queue is not empty")
+    runtime, _, _ = api_get("/v2/platform/runtime-service", "native runtime service")
+    reason=runtime.get("reason")
+    if (runtime.get("configured") is not True or runtime.get("state")!="ready"
+            or not isinstance(reason,dict) or reason.get("code")!="service_ready"):
+        fail("native runtime service is not ready")
+    health, _, _ = api_get("/v2/platform/health", "platform health")
+    if health.get("status")!="ok" or health.get("active_session") is not True:
+        fail("cancelled activation requires the pinned stale active session")
+    if matching: fail("host resource ledger retains a cancelled task reservation")
+    print(json.dumps({"schema":"fullmag.docker-activation-cancel-probe.v1","run_id":run_id,"task_id":task_id,"request_id":request_id,"source_sha256":source_sha,"catalog_revision":catalog["revision"],"cancellation_id":cancellation["cancellation_id"],"run_intent_sha256":digest(intent_raw),"run_catalog_sha256":digest(catalog_raw),"cancellation_intent_sha256":digest(cancellation_raw),"activation_marker_sha256":digest(marker_raw),"host_ledger_sha256":digest(ledger_raw),"matching_reservations":len(matching),"task_count":len(tasks),"live_api_instance_id":api_instance_id,"live_session_id":session_id,"live_session_epoch":session_epoch,"live_scene_revision":scene_revision,"live_workspace_sha256":digest(canon(live)),"current_session_sha256":current_status_sha256,"scene":scene,"compute_queue":queue,"runtime_service":runtime,"health":health},sort_keys=True))
+finally:
+    if ledger_fd is not None: fcntl.flock(ledger_fd,fcntl.LOCK_UN); os.close(ledger_fd)
+    if "store_fd" in locals() and store_fd is not None: fcntl.flock(store_fd,fcntl.LOCK_UN); os.close(store_fd)
+'''
+
+
+
+def _cancelled_activation_store_probe(
+    backend_id, *, run_id, task_id, request_id, source_sha256, marker_path,
+    expected_scene_revision, environment,
+):
+    """Recheck cancelled store ownership and the live API from the image.
+
+    Writer locks protect the bounded durable snapshot and are released before
+    HTTP liveness checks. Cancelled tasks cannot acquire new native owners.
+    The caller repeats this check after stopping the private frontend.
+    """
+    store_root = environment.get("FULLMAG_RUNS_ROOT", "/state/runs/docker-all") + "/session-store"
+    ledger_root = environment.get("FULLMAG_HOST_LEDGER_ROOT", "/host-ledger/ledger")
+    result = docker_capture(
+        "exec", backend_id, "/usr/local/bin/python3", "-B", "-c",
+        _cancelled_activation_probe_script(),
+        run_id, task_id, request_id, source_sha256, marker_path,
+        store_root, ledger_root, str(expected_scene_revision),
+        timeout=90, allow_failure=True,
+    )
+    if result.returncode:
+        raise BuildControlError(
+            "Cancelled activation store preflight failed: "
+            + result.stderr.decode("utf-8", "replace")[-4096:]
+        )
+    try:
+        value = json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BuildControlError("Cancelled activation store preflight returned invalid JSON") from error
+    if not isinstance(value, dict) or value.get("schema") != "fullmag.docker-activation-cancel-probe.v1":
+        raise BuildControlError("Cancelled activation store preflight returned an invalid schema")
+    return value
+
+
+
+def _cancelled_activation_sha(value, label):
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise BuildControlError(f"Cancelled activation {label} is not a SHA-256 digest")
+    return value
+
+
+def _cancelled_activation_id(value, label, *, request=False):
+    pattern = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}" if request else r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}"
+    if not isinstance(value, str) or re.fullmatch(pattern, value) is None or value in {".", ".."}:
+        raise BuildControlError(f"Cancelled activation {label} is not a portable identifier")
+    if not request and value.endswith("."):
+        raise BuildControlError(f"Cancelled activation {label} is not a portable identifier")
+    return value
+
+
+def _validate_cancelled_activation_preflight(
+    control, previous_root, previous, document, selected, config_sha256, backend_id, environment,
+    *, require_quiesced_activation=True,
+):
+    """Accept the stale active-session exception only for one immutable proof."""
+    current, current_raw = _read_cancelled_activation_record(control, "activation/current.json")
+    if current is None or current_raw is None:
+        raise BuildControlError("Restart has no accepted-then-cancelled activation proof")
+    if (current.get("schema") != "fullmag.docker-build-operation.v1"
+            or current.get("phase") != "activation"
+            or current.get("compose_project") != control.project
+            or current.get("control_volume") != control.volume
+            or current.get("state") != "failed-confirmed"
+            or current.get("activation_state") != "accepted-then-cancelled"):
+        raise BuildControlError("Current activation is not a failed accepted-then-cancelled terminal")
+    activation_attempt = current.get("attempt")
+    if (not isinstance(activation_attempt, str)
+            or _CANCELLED_ACTIVATION_ATTEMPT.fullmatch(activation_attempt) is None):
+        raise BuildControlError("Current cancelled activation attempt is invalid")
+    terminal, terminal_raw = _read_cancelled_activation_record(
+        control, f"activation/attempts/{activation_attempt}/terminal.json"
+    )
+    if terminal_raw != current_raw or terminal != current:
+        raise BuildControlError("Current activation pointer differs from its immutable terminal")
+    proof, proof_raw = _read_cancelled_activation_record(
+        control, f"activation/attempts/{activation_attempt}/accepted-then-cancelled.json"
+    )
+    if proof is None or proof_raw is None:
+        raise BuildControlError("Accepted-then-cancelled activation proof is missing")
+    if (proof.get("schema") != _CANCELLED_ACTIVATION_SCHEMA
+            or proof.get("state") != "accepted-then-cancelled"):
+        raise BuildControlError("Accepted-then-cancelled activation proof schema/state differs")
+    proof_sha256 = hashlib.sha256(proof_raw).hexdigest()
+    if current.get("cancellation_proof_sha256") != proof_sha256:
+        raise BuildControlError("Current activation proof digest differs")
+
+    inputs = current.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise BuildControlError("Cancelled activation inputs are missing")
+    previous_inputs = previous.get("inputs")
+    image_id = previous_inputs.get("image_id") if isinstance(previous_inputs, Mapping) else None
+    development_attempt = previous_root.rsplit("/", 1)[-1]
+    expected = {
+        "activation_attempt": activation_attempt,
+        "development_attempt": development_attempt,
+        "compose_project": control.project,
+        "config_sha256": config_sha256,
+        "source_root": str(selected),
+        "image_id": image_id,
+        "backend_container": backend_id,
+    }
+    for key, value in expected.items():
+        if proof.get(key) != value:
+            raise BuildControlError(f"Cancelled activation proof {key} differs")
+    for key, value in {
+        "development_attempt": development_attempt,
+        "config_sha256": config_sha256,
+        "source_root": str(selected),
+        "backend_container": backend_id,
+        "image_id": image_id,
+    }.items():
+        if inputs.get(key) != value:
+            raise BuildControlError(f"Cancelled activation input/{key} differs")
+
+    request_id = proof.get("request_id")
+    source_sha256 = proof.get("source_sha256")
+    run_id = proof.get("run_id")
+    task_id = proof.get("task_id")
+    cancellation_id = proof.get("cancellation_id")
+    _cancelled_activation_id(request_id, "request_id", request=True)
+    _cancelled_activation_sha(source_sha256, "source_sha256")
+    _cancelled_activation_id(run_id, "run_id")
+    _cancelled_activation_id(task_id, "task_id")
+    _cancelled_activation_id(cancellation_id, "cancellation_id")
+    if inputs.get("request_id") != request_id or inputs.get("source_sha256") != source_sha256:
+        raise BuildControlError("Cancelled activation input request/source differs")
+    for key, value in {"run_id": run_id, "task_id": task_id, "cancellation_id": cancellation_id}.items():
+        if current.get(key) != value:
+            raise BuildControlError(f"Current activation {key} differs")
+
+    expected_key = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    expected_marker = "/opt/fullmag/control/backend/script-activation-" + expected_key + "/activation.json"
+    if (inputs.get("activation_receipt_path") != expected_marker
+            or inputs.get("activation_receipt_key") != expected_key):
+        raise BuildControlError("Cancelled activation marker path is not request-bound")
+    # The service may not carry the wrapper's receipt key.  The immutable
+    # activation input and image-side marker are the authorization boundary.
+
+    for key in (
+        "config_sha256", "source_sha256", "unknown_receipt_sha256",
+        "activation_marker_sha256", "run_intent_sha256", "run_catalog_sha256",
+        "cancellation_intent_sha256", "host_ledger_sha256", "live_workspace_sha256",
+        "current_session_sha256", "probe_sha256",
+    ):
+        _cancelled_activation_sha(proof.get(key), "proof " + key)
+    for key in ("live_api_instance_id", "live_session_id"):
+        if not isinstance(proof.get(key), str) or not proof[key]:
+            raise BuildControlError(f"Cancelled activation proof {key} is missing")
+    for key in ("live_session_epoch", "live_scene_revision", "catalog_revision"):
+        value = proof.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise BuildControlError(f"Cancelled activation proof {key} is invalid")
+    if proof["catalog_revision"] <= 0:
+        raise BuildControlError("Cancelled activation proof catalog_revision is invalid")
+    helper_name = proof.get("helper_container")
+    if not isinstance(helper_name, str) or helper_name != "fullmag-control-" + activation_attempt:
+        raise BuildControlError("Cancelled activation proof helper identity differs")
+    helper_id = proof.get("helper_container_id")
+    if not isinstance(helper_id, str) or re.fullmatch(r"[0-9a-f]{64}", helper_id) is None:
+        raise BuildControlError("Cancelled activation proof helper container id is invalid")
+
+    if require_quiesced_activation and _read_cancelled_activation_bytes(control, "active", optional=True) is not None:
+        raise BuildControlError("Original accepted activation helper still holds the control lease")
+    fresh_probe = _cancelled_activation_store_probe(
+        backend_id, run_id=run_id, task_id=task_id, request_id=request_id,
+        source_sha256=source_sha256, marker_path=expected_marker,
+        expected_scene_revision=proof["live_scene_revision"], environment=environment,
+    )
+    for key, value in {
+        "run_id": run_id, "task_id": task_id, "request_id": request_id,
+        "source_sha256": source_sha256,
+        "catalog_revision": proof["catalog_revision"],
+        "cancellation_id": cancellation_id,
+        "run_intent_sha256": proof["run_intent_sha256"],
+        "run_catalog_sha256": proof["run_catalog_sha256"],
+        "cancellation_intent_sha256": proof["cancellation_intent_sha256"],
+        "activation_marker_sha256": proof["activation_marker_sha256"],
+        "live_api_instance_id": proof["live_api_instance_id"],
+        "live_session_id": proof["live_session_id"],
+        "live_session_epoch": proof["live_session_epoch"],
+        "live_scene_revision": proof["live_scene_revision"],
+        "live_workspace_sha256": proof["live_workspace_sha256"],
+        "matching_reservations": 0,
+    }.items():
+        if fresh_probe.get(key) != value:
+            raise BuildControlError(f"Fresh cancelled activation probe {key} differs")
+    if fresh_probe.get("schema") != "fullmag.docker-activation-cancel-probe.v1":
+        raise BuildControlError("Fresh cancelled activation probe schema differs")
+    # Heartbeats and other worktrees legitimately change these snapshots.
+    # Immutable run/catalog/cancellation/marker identity was checked above.
+    for key in ("host_ledger_sha256", "current_session_sha256"):
+        _cancelled_activation_sha(fresh_probe.get(key), "fresh probe " + key)
+    if fresh_probe.get("compute_queue", {}).get("items") != []:
+        raise BuildControlError("Fresh cancelled activation probe found queued compute")
+    runtime = fresh_probe.get("runtime_service")
+    if (not isinstance(runtime, Mapping) or runtime.get("configured") is not True
+            or runtime.get("state") != "ready"):
+        raise BuildControlError("Fresh cancelled activation probe found an unready runtime")
+    health = fresh_probe.get("health")
+    if not isinstance(health, Mapping) or health.get("status") != "ok" or health.get("active_session") is not True:
+        raise BuildControlError("Fresh cancelled activation probe lost the pinned active session")
+    return {"proof_sha256": proof_sha256, "probe": fresh_probe, "runtime": fresh_probe}
+
+
 def restart_idle(args):
     return _retained_operation(args, recreate_services=False, restart_idle_service=True)
 
@@ -1187,6 +1690,9 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False):
         environment = document["services"]["backend"]["environment"]
         if environment.get("FULLMAG_STARTUP_ENABLED") == "1":
             raise BuildControlError("Startup activation requires dedicated recovery; idle restart will not repeat Solve")
+        if (environment.get("FULLMAG_STARTUP_ENABLED") == "0"
+                and _read_cancelled_activation_bytes(control, "active", optional=True) is not None):
+            raise BuildControlError("Original accepted activation helper still holds the control lease")
         cache = control.read(previous_root + "/backend-cache.json")
         import docker_backend_volume_cache as cache_adapter
         cache_adapter.validate_container(actual["backend"], cache)
@@ -1204,17 +1710,43 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False):
             operation["daemon_pending"] = True
             docker_capture("stop", "--time", "60", ids["frontend"], timeout=90)
             operation["daemon_pending"] = False
-            _assert_private_restart_network(actual, ids, control.project)
-            probe = """import json,urllib.request
+            try:
+                fresh = {service: json.loads(docker_text("inspect", identifier))[0]
+                         for service, identifier in ids.items()}
+                for service in ids:
+                    if (fresh[service].get("Id") != actual[service].get("Id")
+                            or fresh[service].get("State", {}).get("StartedAt")
+                            != actual[service].get("State", {}).get("StartedAt")):
+                        raise BuildControlError("Service incarnation changed during idle restart preflight")
+                if (fresh["frontend"]["State"].get("Running") is not False
+                        or fresh["backend"]["State"].get("Running") is not True):
+                    raise BuildControlError("Frontend is not quiesced or backend is no longer running")
+                _assert_private_restart_network(fresh, ids, control.project)
+                probe = """import json,urllib.request
 with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5) as response:
  document=json.load(response)
- if response.status!=200 or document.get('status')!='ok' or document.get('active_session') is not False:
-  raise RuntimeError('Backend has an active or unknown session; restart refused')
+ if (response.status!=200 or document.get('status')!='ok'
+         or (document.get('active_session') is not False
+             and document.get('active_session') is not True)):
+  raise RuntimeError('Backend health is unknown; restart refused')
  print(json.dumps(document))
 """
-            try:
                 health = json.loads(docker_text("exec", ids["backend"], "/usr/local/bin/python3", "-B", "-c", probe))
-                if health.get("status") != "ok" or health.get("active_session") is not False:
+                if health.get("status") != "ok":
+                    raise BuildControlError("Backend health is not ready; idle restart refused")
+                active_session = health.get("active_session")
+                if active_session is True:
+                    if environment.get("FULLMAG_STARTUP_ENABLED") != "0":
+                        raise BuildControlError("Backend has an active session; idle restart refused")
+                    cancelled_activation = _validate_cancelled_activation_preflight(
+                        control, previous_root, previous, document, selected, args.config_sha256,
+                        ids["backend"], environment, require_quiesced_activation=False,
+                    )
+                    health = cancelled_activation["probe"]["health"]
+                    operation["receipt"]["accepted_then_cancelled_proof_sha256"] = (
+                        cancelled_activation["proof_sha256"]
+                    )
+                elif active_session is not False:
                     raise BuildControlError("Backend has an active or unknown session; idle restart refused")
             except Exception:
                 operation["daemon_pending"] = True
@@ -1227,6 +1759,22 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 backend_volumes=previous["backend_volumes"], frontend_volume=previous["frontend_volume"])
             operation["daemon_pending"] = True
             docker_capture("stop", "--time", "60", ids["backend"], timeout=90)
+            stopped = json.loads(docker_text("inspect", ids["backend"]))[0]
+            if (stopped.get("Id") != actual["backend"].get("Id")
+                    or stopped.get("State", {}).get("StartedAt")
+                    != actual["backend"].get("State", {}).get("StartedAt")
+                    or stopped["State"].get("Running") is not False
+                    or stopped["State"].get("OOMKilled") is not False
+                    or stopped["State"].get("ExitCode") != 0):
+                raise BuildControlError("Backend termination is not confirmed graceful; restart withheld")
+            from docker_volume_stop_unadmitted import _read_terminal_process_receipt
+            drained_raw, drained = _read_terminal_process_receipt(stopped, control)
+            control.write(operation["root"] + "/backend-drain.json", {
+                "schema": "fullmag.docker-idle-restart-drain.v1",
+                "backend_container_id": ids["backend"],
+                "process_receipt_sha256": hashlib.sha256(drained_raw).hexdigest(),
+                "process_receipt": drained,
+            })
             docker_capture("start", ids["backend"], timeout=90)
             docker_capture("start", ids["frontend"], timeout=90)
             operation["daemon_pending"] = False

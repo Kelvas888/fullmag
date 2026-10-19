@@ -53,6 +53,13 @@ sprawdza prywatną sieć bez obcych konsumentów, restartuje backend i ponownie
 uruchamia ten sam frontend. Zachowuje cache oraz Windows storage. Nie jest komendą do przerywania obliczeń. Wymaga wyłącznego okna operatorskiego,
 bez równoległych klientów wysyłających polecenia do tej grupy; odczyt health
 nie jest dowodem opróżnienia wszystkich kolejek aplikacji.
+Wyjątkiem od braku aktywnej sesji jest dokładnie przypięty model nieudanej
+aktywacji, którego przyjęte zadanie zostało jawnie anulowane przed rozpoczęciem
+przygotowania. Wymagany jest trwały dowód anulowania, brak rezerwacji i bieżącego
+runu, pusta kolejka oraz zgodność skryptu i rewizji sceny. Kontrola odbywa się
+ponownie po zatrzymaniu frontendu. Po zatrzymaniu backendu launcher weryfikuje
+autentykowany drain właściciela runtime przed ponownym startem; nieznany wynik
+zatrzymania pozostawia usługi zatrzymane i wymaga odzyskiwania.
 Frontend obserwuje katalogi `app`, `src`, `public`, `scripts` i aktualizuje UI
 przez HMR. Zmiana helperów obrazu wymaga przygotowania nowego obrazu i jawnego
 odtworzenia usług; sam restart zachowuje przypięty obraz.
