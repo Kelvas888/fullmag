@@ -382,6 +382,17 @@ def _reassert_operator_probe_environment(document, record):
     )
 
 
+def _start_compose_services(control, operation, document):
+    # Reject invalid declarations before crossing the daemon-mutation boundary.
+    configured = json.loads(compose_capture(document, "config", "--format", "json", timeout=60))
+    if configured.get("name") != control.project or set(configured.get("services", {})) != {"backend", "frontend"}:
+        raise BuildControlError("DEV Compose preflight changed the selected group or services")
+    operation["receipt"]["compose_preflight"] = "PASS"
+    operation["daemon_pending"] = True
+    compose_capture(document, "up", "--detach", "--no-build", "--pull", "never", timeout=180)
+    operation["daemon_pending"] = False
+
+
 def start(args, *, reuse_state=None):
     from docker_dev import (_require_native_windows, _select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
@@ -517,7 +528,7 @@ def start(args, *, reuse_state=None):
             {"type": "volume", "source": "frontend-build", "target": "/state/development", "volume": {"nocopy": True}},
             {"type": "volume", "source": "build-control", "target": "/opt/fullmag/control", "read_only": True,
              "volume": {"nocopy": True, "subpath": "frontend"}}]
-        document["volumes"] = {**cache["overlay"]["volumes"],
+        document["volumes"] = {**document.get("volumes", {}), **cache["overlay"]["volumes"],
             "frontend-build": {"name": frontend_volume, "external": True},
             "build-control": {"name": control.volume, "external": True}}
         _reassert_operator_probe_environment(document, operator_probe_record)
@@ -531,9 +542,7 @@ def start(args, *, reuse_state=None):
         control.write(operation["root"] + "/compose.json", document)
         operation["receipt"].update(state="starting-services", state_root=str(state),
             frontend_volume=frontend_volume, backend_volumes=cache["volume_names"])
-        operation["daemon_pending"] = True
-        compose_capture(document, "up", "--detach", "--no-build", "--pull", "never", timeout=180)
-        operation["daemon_pending"] = False
+        _start_compose_services(control, operation, document)
         backend_id = compose_capture(document, "ps", "--all", "--quiet", "backend").decode().strip()
         frontend_id = compose_capture(document, "ps", "--all", "--quiet", "frontend").decode().strip()
         if not backend_id or not frontend_id:

@@ -28,6 +28,31 @@ class VolumeReceiptTests(unittest.TestCase):
         with self.assertRaises(module.RuntimeServiceError):
             module.canonical_paths({'FULLMAG_PACKAGE_PROVENANCE':'/state/user-data.json'})
 
+    def test_invalid_compose_stops_before_daemon_mutation_boundary(self):
+        import docker_volume_dev as dev
+        operation = {'receipt': {}, 'daemon_pending': False}
+        control = mock.Mock(project='fullmag-master')
+        with mock.patch.object(dev, 'compose_capture', side_effect=BuildControlError('undefined volume')) as capture:
+            with self.assertRaisesRegex(BuildControlError, 'undefined volume'):
+                dev._start_compose_services(control, operation, {'name': control.project})
+        self.assertFalse(operation['daemon_pending'])
+        self.assertEqual(capture.call_args.args[1:], ('config', '--format', 'json'))
+
+    def test_toolchain_config_binds_context_before_compose_interpolation(self):
+        import json
+        import os
+        from subprocess import CompletedProcess
+        import docker_build_control as control
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            with mock.patch.dict(os.environ, {'FULLMAG_TOOLCHAIN_CONTEXT': '/wrong/checkout'}), \
+                 mock.patch.object(control, 'docker_capture', return_value=CompletedProcess([], 0, b'{}', b'')) as capture:
+                self.assertEqual(control.toolchain_configuration(repo, {'project_name': 'fullmag-master'}), {})
+            environment = capture.call_args.kwargs['env']
+            self.assertEqual(environment['FULLMAG_TOOLCHAIN_CONTEXT'], str(repo))
+            self.assertEqual(environment['FULLMAG_COMPOSE_PROJECT'], 'fullmag-master')
+            self.assertTrue(environment['FULLMAG_BUILD_CONTROL_VOLUME'])
+
     def test_retained_operator_controls_ignore_host_changes_and_reject_overlay_drift(self):
         import copy
         import os

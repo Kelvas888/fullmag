@@ -108,9 +108,8 @@ def compose_capture(document, *args, timeout=90):
 
 
 def toolchain_configuration(repo, identity):
-    from bootstrap_docker_toolchain import _control_environment, toolchain_image_reference
-    environment = {**os.environ, **_control_environment(identity["project_name"]),
-                   "FULLMAG_TOOLCHAIN_IMAGE": toolchain_image_reference(identity["project_name"])}
+    from bootstrap_docker_toolchain import _compose_environment
+    environment = {**os.environ, **_compose_environment(repo, identity["project_name"])}
     return json.loads(docker_capture("compose", "--project-name", identity["project_name"],
         "--project-directory", str(repo), "-f", str(Path(repo)/"compose.toolchain.yaml"),
         "--profile", "toolchain", "config", "--format", "json", env=environment).stdout)
