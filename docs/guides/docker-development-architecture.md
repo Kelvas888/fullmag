@@ -330,9 +330,11 @@ wykonania symulacji. Nie wolno usuwać markera ani powtarzać nieznanej aktywacj
 Niezgodność źródeł, provenance, polityki, tożsamości lub kontraktu odpowiedzi
 pozostaje błędem startupu. Nie jest traktowana jako zwykłe odrzucenie modelu.
 
-`examples/permalloy_layer_cofeb_rings_relax_300nm.py` pozostaje odrzucony kodem
-`material_count_not_one`: obecna ścieżka nie obsługuje tego dwumateriałowego
-przykładu. Udany smoke jednego materiału nie jest dowodem wykonania rings.
+`examples/permalloy_layer_cofeb_rings_relax_300nm.py` korzysta z zaimplementowanej
+ścieżki source-contract v2: jeden swept `prism6` i jedno odłączone ciało `tet4`
+z własnymi materiałami. Managed FEM runtime, wykonanie native operatorów,
+parytet CPU/GPU i kwalifikacja fizyczna tego workloadu pozostają **NOT VERIFIED**.
+Udany smoke jednego materiału nie jest dowodem wykonania rings.
 
 ## Dane i wersje
 
