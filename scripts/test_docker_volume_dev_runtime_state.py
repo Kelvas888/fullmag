@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import json
+import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -14,6 +17,27 @@ import docker_volume_dev
 
 
 class DockerVolumeDevRuntimeStateTests(unittest.TestCase):
+    def test_actual_process_probe_reads_runtime_control_receipt_and_missing_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory) / "runtime-control"
+            receipt = control / "runtime-service" / "process-tree.json"
+            receipt.parent.mkdir(parents=True)
+            expected = {"state": "failed-confirmed", "error": "admission closed"}
+            receipt.write_text(json.dumps(expected))
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "docker/all-in-one"),
+                "FULLMAG_RUNTIME_CONTROL_ROOT": str(control),
+            }
+            for present in (True, False):
+                if not present:
+                    receipt.unlink()
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", docker_volume_dev.BACKEND_PROCESS_RECEIPT_SCRIPT],
+                    env=environment, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected if present else {"state": "not-published"})
+
     @staticmethod
     def _development_context():
         identity = {

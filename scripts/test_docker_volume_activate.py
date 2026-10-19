@@ -281,7 +281,8 @@ class DockerVolumeActivationTests(unittest.TestCase):
             "services": {
                 "backend": {
                     "image": backend_image,
-                    "environment": {"FULLMAG_SOURCE_HOST_ROOT": "C:/git/fullmag"},
+                    "environment": {"FULLMAG_SOURCE_HOST_ROOT": "C:/git/fullmag",
+                                    "FULLMAG_SESSION_STORAGE_PROFILE": "windows-folder-v1"},
                     "volumes": [{
                         "type": "bind",
                         "source": "C:/git/fullmag",
@@ -454,6 +455,37 @@ class DockerVolumeActivationTests(unittest.TestCase):
                 source_root="C:/git/fullmag",
             )
         self.assertEqual(result, ("c" * 64, "d" * 64))
+
+    def test_linux_activation_preserves_pinned_daemon_bind_and_client_source(self) -> None:
+        fixture = self._retained_group_fixture()
+        control, identity, document, terminal, image, compose, docker_text = fixture
+        backend = document["services"]["backend"]
+        backend["environment"].update(FULLMAG_SOURCE_HOST_ROOT="/home/operator/fullmag",
+                                      FULLMAG_SESSION_STORAGE_PROFILE="linux-native-v1")
+        backend["volumes"][0]["source"] = "/home/operator/fullmag"
+        backend["x-fullmag-daemon-binds"] = {
+            "/opt/fullmag/source": "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/source"}
+        with (patch.object(activate, "compose_capture", side_effect=compose),
+              patch.object(activate, "_docker_text", side_effect=docker_text),
+              patch("docker_volume_dev._validate_retained_service") as validator):
+            self.assertEqual(activate._validate_running_group(
+                control, identity, document, terminal, image, source_root="/home/operator/fullmag"),
+                ("c" * 64, "d" * 64))
+            self.assertEqual(validator.call_args_list[0].args[0]["services"]["backend"]["x-fullmag-daemon-binds"],
+                             backend["x-fullmag-daemon-binds"])
+            with self.assertRaisesRegex(BuildControlError, "selected source"):
+                activate._validate_running_group(control, identity, document, terminal, image,
+                                                  source_root="/home/another/fullmag")
+            backend["environment"]["FULLMAG_SESSION_STORAGE_PROFILE"] = "unverified"
+            with self.assertRaisesRegex(BuildControlError, "storage profile"):
+                activate._validate_running_group(control, identity, document, terminal, image)
+
+    def test_activation_accepts_linux_host_before_validating_attempt(self) -> None:
+        arguments = SimpleNamespace(attempt="invalid")
+        with patch("docker_dev_host.require_host") as require_host:
+            with self.assertRaisesRegex(BuildControlError, "exact attempt"):
+                activate.activate(arguments)
+        require_host.assert_called_once_with()
 
     def test_retained_group_rejects_source_identity_mount_drift(self) -> None:
         fixture = self._retained_group_fixture()

@@ -19,6 +19,11 @@ services:
         FULLMAG_CUDA_ARCHITECTURES: "${FULLMAG_CUDA_ARCHITECTURES:-80-real;89-real;90-real;90-virtual}"
         FULLMAG_HYPRE_GPU_ARCHITECTURES: "${FULLMAG_HYPRE_GPU_ARCHITECTURES:-60 70 80 89 90}"
         FULLMAG_HYPRE_MEMORY_VARIANT: "${FULLMAG_HYPRE_MEMORY_VARIANT:-baseline}"
+        # CUDA template compilation can require tens of GiB per process.
+        FULLMAG_MFEM_BUILD_JOBS: "${FULLMAG_MFEM_BUILD_JOBS:-1}"
+        # Explicit DEV optimization tradeoff; 0 preserves the normal CUDA policy.
+        FULLMAG_MFEM_CUDA_FAST_COMPILE: "${FULLMAG_MFEM_CUDA_FAST_COMPILE:-0}"
+        FULLMAG_PETSC_CUDA_ARCHITECTURES: "${FULLMAG_PETSC_CUDA_ARCHITECTURES:-80,89,90}"
     profiles: [toolchain]
     # The toolchain service is also used for a bounded dependency-manifest
     # probe. Keep its runtime policy declarative so the probe does not depend

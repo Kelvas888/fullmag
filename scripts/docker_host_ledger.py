@@ -1008,6 +1008,235 @@ def _env_map(config: Mapping[str, Any]) -> dict[str, str]:
     return values
 
 
+HOST_VOLUME_PROBE_FUNCTIONS = r'''
+import ctypes, json, os, re, stat, uuid
+
+def _ledger_statfs_type(root):
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.statfs.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+    libc.statfs.restype = ctypes.c_int
+    result = ctypes.create_string_buffer(256)
+    if libc.statfs(os.fsencode(root), result) != 0:
+        raise OSError(ctypes.get_errno(), 'cannot inspect ledger filesystem')
+    return ctypes.c_long.from_buffer(result).value
+
+def _ledger_loop_device(loop):
+    if not isinstance(loop, str) or not re.fullmatch(r'/dev/loop[0-9]+', loop):
+        raise ValueError('ledger loop device is invalid')
+    # One exact known sysfs attribute, never a device/host directory scan.
+    with open('/sys/block/' + loop.rsplit('/', 1)[1] + '/dev', 'rb') as stream:
+        value = stream.read(65)
+    if len(value) > 64 or not re.fullmatch(rb'[0-9]+:[0-9]+\n?', value):
+        raise ValueError('ledger loop sysfs identity is invalid')
+    return tuple(int(part) for part in value.strip().split(b':'))
+
+def _ledger_nofollow_stat(path):
+    if not path.startswith('/') or path.startswith('//') or any(part in {'.', '..'} for part in path.split('/')):
+        raise ValueError('ledger probe path is unsafe')
+    current = '/'
+    for component in path.strip('/').split('/'):
+        current = current.rstrip('/') + '/' + component
+        value = os.lstat(current)
+        if stat.S_ISLNK(value.st_mode):
+            raise ValueError('ledger probe path traverses a symlink')
+    return value
+
+def _ledger_marker(path):
+    before = _ledger_nofollow_stat(path)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        opened = os.fstat(descriptor)
+        if ((before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or opened.st_gid != 0
+                or stat.S_IMODE(opened.st_mode) != 0o444 or opened.st_nlink != 1
+                or not 0 < opened.st_size <= 16384):
+            raise ValueError('ledger owner marker ownership/type/size differs')
+        data = os.read(descriptor, 16385)
+        after = os.fstat(descriptor)
+        if (len(data) != opened.st_size or (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError('ledger owner marker changed during read')
+    finally:
+        os.close(descriptor)
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('ledger owner marker repeats a key')
+            result[key] = value
+        return result
+    return json.loads(data, object_pairs_hook=pairs), opened
+
+def probe(descriptor, root='/host-ledger'):
+    if os.geteuid() != 65532 or os.getegid() != 65532:
+        raise ValueError('ledger probe must run as the fixed unprivileged runtime identity')
+    if not os.statvfs(root).f_flag & os.ST_RDONLY:
+        raise ValueError('ledger probe requires a read-only consumer mount')
+    if not isinstance(descriptor, dict) or descriptor.get('schema') != 'fullmag.host-ledger-volume.v2':
+        raise ValueError('ledger probe requires the exact v2 descriptor')
+    expected = descriptor['host_receipt']
+    loop = descriptor['loop_device']
+    alias = descriptor['device_alias']
+    if descriptor.get('options') != {'type': 'ext4', 'o': 'rw', 'device': alias}:
+        raise ValueError('ledger probe driver options differ')
+    if any(expected.get(key) != descriptor.get(key)
+           for key in ('project_id', 'mount_root', 'backing_image', 'filesystem_uuid', 'loop_device')):
+        raise ValueError('ledger probe receipt identity differs')
+    if alias != '/dev/disk/by-uuid/' + descriptor['filesystem_uuid']:
+        raise ValueError('ledger probe requires the stable UUID device')
+    if expected.get('image_size_bytes') != 134217728 or expected.get('filesystem') != 'ext4':
+        raise ValueError('ledger probe filesystem contract differs')
+    root_info = _ledger_nofollow_stat(root)
+    ledger_info = _ledger_nofollow_stat(root + '/ledger')
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0 or root_info.st_gid != 0
+            or stat.S_IMODE(root_info.st_mode) != 0o755):
+        raise ValueError('ledger volume root ownership/mode differs')
+    if (not stat.S_ISDIR(ledger_info.st_mode) or ledger_info.st_uid != 65532 or ledger_info.st_gid != 65532
+            or stat.S_IMODE(ledger_info.st_mode) != 0o770 or ledger_info.st_dev != root_info.st_dev):
+        raise ValueError('ledger runtime directory ownership/device/mode differs')
+    device = (os.major(root_info.st_dev), os.minor(root_info.st_dev))
+    if device != _ledger_loop_device(loop) or _ledger_statfs_type(root) != 0xef53:
+        raise ValueError('ledger volume is not the exact loop ext4 filesystem')
+    marker, marker_info = _ledger_marker(root + '/.fullmag-host-ledger-owner.json')
+    fields = {'schema', 'profile', 'project_id', 'backing_image', 'mount_root', 'filesystem_uuid',
+              'image_size_bytes', 'mount_target', 'runtime_uid', 'runtime_gid', 'owner_token'}
+    checks = {'schema': 'fullmag.host-ledger-owner.v1', 'profile': 'host-ledger-v1',
+              'project_id': descriptor['project_id'], 'backing_image': descriptor['backing_image'],
+              'mount_root': descriptor['mount_root'], 'filesystem_uuid': descriptor['filesystem_uuid'],
+              'image_size_bytes': 134217728, 'mount_target': '/host-ledger',
+              'runtime_uid': 65532, 'runtime_gid': 65532}
+    if (not isinstance(marker, dict) or set(marker) != fields or marker_info.st_dev != root_info.st_dev
+            or any(type(marker.get(key)) is not type(value) or marker.get(key) != value for key, value in checks.items())):
+        raise ValueError('ledger owner marker canonical identity differs')
+    token = uuid.UUID(marker['owner_token'])
+    if token.int == 0 or str(token) != marker['owner_token']:
+        raise ValueError('ledger owner token is not canonical')
+    return {'schema': 'fullmag.host-ledger-volume-probe.v1', 'state': 'verified',
+            'volume_name': descriptor['name'], 'project_id': descriptor['project_id'],
+            'backing_image': descriptor['backing_image'], 'mount_root': descriptor['mount_root'],
+            'filesystem_uuid': descriptor['filesystem_uuid'], 'loop_device': loop, 'device_alias': alias,
+            'device_major': device[0], 'device_minor': device[1],
+            'root_inode': root_info.st_ino, 'ledger_inode': ledger_info.st_ino,
+            'owner_token': marker['owner_token'], 'read_only': True}
+'''
+
+HOST_VOLUME_PROBE = HOST_VOLUME_PROBE_FUNCTIONS + "\nimport signal, sys\nsignal.alarm(45)\nprint(json.dumps(probe(json.loads(sys.argv[1])), sort_keys=True))\n"
+
+
+def host_volume_probe_spec(descriptor: Mapping[str, Any], image: str) -> dict[str, Any]:
+    """Return a bounded read-only consumer; the caller owns its lifecycle/logs."""
+    image = _safe_image_id(image)
+    if not isinstance(descriptor, Mapping):
+        raise HostLedgerError("ledger volume probe requires a canonical descriptor")
+    expected = host_volume_descriptor(descriptor.get("compose_project"), descriptor.get("project_id"),
+        descriptor.get("mount_root"), descriptor.get("host_receipt"))
+    if descriptor != expected:
+        raise HostLedgerError("ledger volume probe descriptor identity differs")
+    mount = {**descriptor["mount"], "read_only": True}
+    service = {"image": image, "pull_policy": "never", "user": "65532:65532",
+        "network_mode": "none", "privileged": False, "read_only": True,
+        "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
+        "pids_limit": 32, "mem_limit": "128m", "cpus": 0.25, "restart": "no",
+        "environment": {"NVIDIA_VISIBLE_DEVICES": "void", "PYTHONDONTWRITEBYTECODE": "1"},
+        "entrypoint": ["/usr/local/bin/python3", "-B", "-c"],
+        "command": [HOST_VOLUME_PROBE, json.dumps(descriptor, sort_keys=True, separators=(",", ":"))],
+        "volumes": [mount]}
+    return {"name": descriptor["compose_project"], "services": {"host-ledger-volume-probe": service},
+        "volumes": {"host-ledger": dict(descriptor["compose_volume"])}}
+
+
+def host_volume_descriptor(compose_project: str, project_id: str, mount_root: str,
+                           host_receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe a local-driver mount of the exact already-owned ext4 UUID.
+
+    Docker Desktop mount namespaces need not expose the maintenance mountpoint.
+    Its stable UUID path prevents a reused raw loop number mounting foreign data.
+    The immutable descriptor retains its original receipt; later verification
+    compares stable device/filesystem identity without rewriting that receipt.
+    """
+    project = _text(compose_project, "Compose project")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
+        raise HostLedgerError("host-ledger volume requires a valid Compose project")
+    project_id = _safe_project_id(project_id)
+    if mount_root != "/mnt/fullmag-host-ledger-" + project_id:
+        raise HostLedgerError("host-ledger volume device differs from the canonical project mount")
+    if not isinstance(host_receipt, Mapping):
+        raise HostLedgerError("host-ledger volume requires its canonical maintenance receipt")
+    _validate_host_receipt(host_receipt, {"project_id": project_id, "mount_root": mount_root,
+        "backing_image": host_receipt.get("backing_image")})
+    backing = _daemon_path(host_receipt["backing_image"], "host-ledger backing image")
+    if (backing != host_receipt["backing_image"]
+            or not backing.endswith("/build-volumes/" + IMAGE_NAME)):
+        raise HostLedgerError("host-ledger volume backing image is not canonical")
+    filesystem_uuid, loop = host_receipt["filesystem_uuid"], host_receipt["loop_device"]
+    alias = "/dev/disk/by-uuid/" + filesystem_uuid
+    if host_receipt.get("device_alias", alias) != alias:
+        raise HostLedgerError("host-ledger volume requires the canonical UUID device alias")
+    identity = json.dumps([project, project_id, mount_root, backing, filesystem_uuid, alias], separators=(",", ":")).encode()
+    name = "fullmag-host-ledger-ext4-v2-" + hashlib.sha256(identity).hexdigest()[:24]
+    labels = {"org.fullmag.host-ledger.volume.schema": "fullmag.host-ledger-volume.v2",
+        "org.fullmag.host-ledger.project-id": project_id,
+        "org.fullmag.host-ledger.mount-root": mount_root,
+        "org.fullmag.host-ledger.backing-image": backing,
+        "org.fullmag.host-ledger.filesystem-uuid": filesystem_uuid,
+        "org.fullmag.host-ledger.device-alias": alias,
+        "com.docker.compose.project": project,
+        "com.docker.compose.volume": "host-ledger"}
+    return {"schema": "fullmag.host-ledger-volume.v2", "name": name,
+        "compose_project": project, "project_id": project_id, "mount_root": mount_root,
+        "host_receipt": dict(host_receipt), "backing_image": backing,
+        "filesystem_uuid": filesystem_uuid, "loop_device": loop, "device_alias": alias,
+        "driver": "local", "options": {"type": "ext4", "o": "rw", "device": alias},
+        "labels": labels,
+        "compose_volume": {"name": name, "external": True},
+        "mount": {"type": "volume", "source": "host-ledger", "target": MOUNT_TARGET,
+                  "volume": {"nocopy": True}}}
+
+
+def _validate_host_volume(document: Any, descriptor: Mapping[str, Any]) -> Mapping[str, Any]:
+    if isinstance(document, list):
+        if len(document) != 1:
+            raise HostLedgerError("host-ledger volume inspect is ambiguous; existing data retained")
+        document = document[0]
+    if not isinstance(document, Mapping):
+        raise HostLedgerError("host-ledger volume inspect is not an object; existing data retained")
+    labels = document.get("Labels")
+    if (document.get("Name") != descriptor["name"]
+            or document.get("Driver") != "local" or document.get("Scope") != "local"
+            or document.get("Options") != descriptor["options"]
+            or not isinstance(labels, Mapping)
+            or any(labels.get(key) != value
+                   for key, value in descriptor["labels"].items())):
+        raise HostLedgerError("host-ledger volume ownership/driver/device differs; existing data retained")
+    mountpoint = document.get("Mountpoint")
+    if (not isinstance(mountpoint, str) or not mountpoint.startswith("/") or mountpoint == "/"
+            or any(ord(char) < 32 or ord(char) == 127 for char in mountpoint)
+            or _daemon_path(mountpoint, "host-ledger volume mountpoint") != mountpoint):
+        raise HostLedgerError("host-ledger volume mountpoint is invalid; existing data retained")
+    return document
+
+
+def prepare_host_volume(profile: Mapping[str, Any], compose_project: str,
+                        docker_callable: Callable[..., Any]) -> dict[str, Any]:
+    """Admit/create only the exact descriptor after the daemon mount is ensured."""
+    _validate_host_receipt(profile.get("host_receipt"), {"project_id": profile.get("project_id"),
+        "mount_root": profile.get("mount_root"), "backing_image": profile.get("backing_image")})
+    descriptor = host_volume_descriptor(compose_project, profile.get("project_id"),
+        profile.get("mount_root"), profile["host_receipt"])
+    output, _, combined = _invoke(docker_callable, "volume", "ls", "--format", "{{.Name}}", timeout=30)
+    names = (output or combined).splitlines()
+    if descriptor["name"] not in names:
+        arguments = ["volume", "create", "--driver", "local"]
+        for key, value in descriptor["options"].items():
+            arguments.extend(["--opt", key + "=" + value])
+        for key, value in descriptor["labels"].items():
+            arguments.extend(["--label", key + "=" + value])
+        _invoke(docker_callable, *arguments, descriptor["name"], timeout=60)
+    output, _, combined = _invoke(docker_callable, "volume", "inspect", descriptor["name"], timeout=30)
+    _validate_host_volume(json.loads(output or combined), descriptor)
+    return descriptor
+
+
 def validate_container(document: Mapping[str, Any] | list[Mapping[str, Any]], profile: Mapping[str, Any] | str,
                        docker_callable: Callable[..., Any]) -> dict[str, Any]:
     """Attest backend binds and perform a live guest + host filesystem check."""
@@ -1044,9 +1273,33 @@ def validate_container(document: Mapping[str, Any] | list[Mapping[str, Any]], pr
             raise HostLedgerError(f"backend host-ledger environment differs for {key}")
     expected_mount = profile_values.get("mount_root")
     mounts = [m for m in actual.get("Mounts", []) or [] if isinstance(m, Mapping) and m.get("Destination") == MOUNT_TARGET]
-    if len(mounts) != 1 or mounts[0].get("Type") != "bind" or not mounts[0].get("RW"):
-        raise HostLedgerError("backend must have exactly one writable /host-ledger bind")
-    if expected_mount is not None and not _same_daemon_path(mounts[0].get("Source"), expected_mount):
+    if len(mounts) != 1 or not mounts[0].get("RW"):
+        raise HostLedgerError("backend must have exactly one writable /host-ledger mount")
+    if "daemon_volume" in profile_values:
+        project = (config.get("Labels") or {}).get("com.docker.compose.project")
+        frozen = profile_values["daemon_volume"]
+        if not isinstance(frozen, Mapping):
+            raise HostLedgerError("backend host-ledger volume descriptor is missing")
+        fresh = profile_values.get("host_receipt")
+        _validate_host_receipt(fresh, {"project_id": profile_values.get("project_id"),
+            "mount_root": expected_mount, "backing_image": profile_values.get("backing_image")})
+        descriptor = host_volume_descriptor(project, profile_values.get("project_id"), expected_mount,
+            frozen.get("host_receipt"))
+        if any(fresh.get(key) != descriptor[key] for key in ("loop_device", "filesystem_uuid", "backing_image")):
+            raise HostLedgerError("backend host-ledger device identity differs from fresh maintenance receipt")
+        if profile_values["daemon_volume"] != descriptor:
+            raise HostLedgerError("backend host-ledger volume descriptor differs from canonical identity")
+        mounted = mounts[0]
+        if (mounted.get("Type") != "volume" or mounted.get("Name") != descriptor["name"]
+                or mounted.get("Driver") != "local"):
+            raise HostLedgerError("backend host-ledger must use the exact managed local-driver volume")
+        output, _, combined = _invoke(docker_callable, "volume", "inspect", descriptor["name"], timeout=30)
+        volume = _validate_host_volume(json.loads(output or combined), descriptor)
+        if mounted.get("Source") != volume["Mountpoint"]:
+            raise HostLedgerError("backend host-ledger source differs from the inspected volume mountpoint")
+    elif mounts[0].get("Type") != "bind":
+        raise HostLedgerError("backend must use a managed /host-ledger bind or volume descriptor")
+    elif expected_mount is not None and not _same_daemon_path(mounts[0].get("Source"), expected_mount):
         raise HostLedgerError("backend /host-ledger source differs from the managed mount root")
     host_config = actual.get("HostConfig") or {}
     if host_config.get("Privileged") or config.get("User") != "65532:65532":

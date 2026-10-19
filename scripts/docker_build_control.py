@@ -1,6 +1,6 @@
 """Docker-managed build control: no build files or logs are written on the host.
 
-The Windows process only observes Git/configuration and invokes Docker. Short
+The host process only observes Git/configuration and invokes Docker. Short
 image-owned helpers belong to the selected Compose project; they have no
 network, Docker socket, host writes, or application execution responsibility.
 """
@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 import uuid
+
+from docker_dev_host import docker_argv, local_volume, require_host, validate_host_path
 
 
 MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
@@ -95,7 +97,7 @@ def bounded_capture(command, *, data=None, timeout=90, env=None, maximum=MAX_DOC
 
 
 def docker_capture(*args, data=None, timeout=90, allow_failure=False, env=None):
-    result = bounded_capture(["docker", "--context", "desktop-linux", *args], data=data, timeout=timeout, env=env)
+    result = bounded_capture(docker_argv(*args), data=data, timeout=timeout, env=env)
     if result.returncode and not allow_failure:
         raise BuildControlError(result.stderr.decode("utf-8", "replace").strip()
                                 or result.stdout.decode("utf-8", "replace").strip())
@@ -225,7 +227,7 @@ class BuildControl:
                 "driver": observed[0]["Driver"], "labels": labels, "measured_at": time.time()}
 
     def helper_args(self, script, *, name=None, initialize=False):
-        args = ["docker", "--context", "desktop-linux", "run", "--rm", "-i",
+        args = [*docker_argv("run"), "--rm", "-i",
                 "--pull", "never", "--network", "none", "--runtime", "runc",
                 "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                 "--pids-limit", "32", "--memory", "64m", "--cpus", "0.25",
@@ -376,7 +378,7 @@ class BuildControl:
             print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
 
     def build(self, operation, document, service):
-        command = ["docker", "--context", "desktop-linux", "compose", "--project-name",
+        command = [*docker_argv("compose"), "--project-name",
                    self.project, "-f", "-", "build", service]
         operation["daemon_pending"] = True
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -407,11 +409,8 @@ def build_volume_toolchain(repo):
     import fullmag_storage as storage
     from bootstrap_docker_toolchain import tracked_input_files, read_input, DEPENDENCY_MANIFEST
     from docker_compose_identity import compose_project_identity
-    from windows_folder_host import local_volume
-
-    if os.name != "nt":
-        raise BuildControlError("Docker development requires native Windows PowerShell")
-    repo = Path(repo).resolve(strict=True)
+    require_host()
+    repo = validate_host_path(Path(repo).absolute(), "source checkout").resolve(strict=True)
     layout = storage.resolve_layout(repo, "docker-all-gpu")
     identity = compose_project_identity(layout)
     local_volume(repo)
@@ -492,7 +491,8 @@ def build_volume_runtime_images(repo, control, toolchain):
     """Prepare trusted wrapper layers through this project's BuildKit only."""
     from docker_dev import BASE_CONTEXT_FILES, RUNTIME_IMAGE_CONTEXT_FILES
     from bootstrap_docker_toolchain import read_input
-    repo = Path(repo).resolve(strict=True)
+    require_host()
+    repo = validate_host_path(Path(repo).absolute(), "source checkout").resolve(strict=True)
     parent = toolchain["image_id"]
     results = {}
     for kind, inventory in (("dev", BASE_CONTEXT_FILES), ("backend", RUNTIME_IMAGE_CONTEXT_FILES)):

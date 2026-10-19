@@ -15,6 +15,47 @@ import time
 import fullmag_storage as storage
 from docker_build_control import (BuildControl, BuildControlError, canonical, docker_capture,
                                   compose_capture, build_volume_toolchain, build_volume_runtime_images, bounded_capture)
+from docker_dev_host import docker_argv, require_host, local_volume, validate_host_path
+
+
+BACKEND_PROCESS_RECEIPT_SCRIPT = """import json,sys
+sys.path.insert(0,'/opt/fullmag')
+import runtime_service
+try:
+ paths=runtime_service.canonical_paths()
+ raw=runtime_service._bounded_regular(runtime_service.process_receipt_path(paths),'process receipt')
+except FileNotFoundError:
+ print(json.dumps({'state':'not-published'}))
+else:
+ print(raw.decode('utf-8'))
+"""
+
+
+def _session_host():
+    if os.name == "nt":
+        import windows_folder_host as host
+    else:
+        import linux_native_host as host
+    return host
+
+
+def _certificate_path(state):
+    return Path(state) / Path(_session_host().HOST_CERT_PATH).name
+
+
+def _retained_certificate(state, document):
+    host = _session_host()
+    certificate = json.loads(host.read_owned_regular(_certificate_path(state)))
+    if (certificate.get("schema") != host.HOST_SCHEMA
+            or certificate.get("storage_profile") != document["services"]["backend"]["environment"]["FULLMAG_SESSION_STORAGE_PROFILE"]
+            or certificate != json.loads(host.read_owned_regular(Path(state) / host.OWNER_NAME))):
+        raise BuildControlError("Retained session storage profile/ownership differs")
+    if os.name != "nt":
+        if (certificate.get("host_inode") != Path(state).stat().st_ino
+                or certificate.get("engine_id") != docker_text("info", "--format", "{{.ID}}").strip()
+                or any(certificate.get(key) != value for key, value in local_volume(state).items())):
+            raise BuildControlError("Retained Linux host directory/engine identity differs")
+    return certificate
 
 
 _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES = (
@@ -309,24 +350,66 @@ def _backend_cache(control, operation, layout, selected, image, toolchain):
     return result
 
 
+def _verify_host_ledger_volume(control, operation, descriptor, image):
+    import docker_host_ledger as ledger
+    spec = ledger.host_volume_probe_spec(descriptor, image)
+    service = "host-ledger-volume-probe"
+    name = "fullmag-ledger-volume-" + operation["receipt"]["attempt"]
+    control.write(operation["root"] + "/host-ledger-volume-probe-compose.json", spec)
+    operation["receipt"]["ledger_volume_probe_container"] = name
+    output = compose_capture(spec, "run", "--name", name, "--no-deps", service, timeout=90)
+    observed = json.loads(docker_text("inspect", name))
+    if len(observed) != 1:
+        raise BuildControlError("Ledger volume probe identity is ambiguous; retained")
+    actual = observed[0]
+    config, isolation = actual.get("Config", {}), actual.get("HostConfig", {})
+    labels = config.get("Labels", {})
+    mounts = [mount for mount in actual.get("Mounts", []) if mount.get("Destination") == "/host-ledger"]
+    if (actual.get("Image") != image or actual.get("State", {}).get("Running")
+            or actual.get("State", {}).get("ExitCode") != 0
+            or labels.get("com.docker.compose.project") != control.project
+            or labels.get("com.docker.compose.service") != service
+            or config.get("User") != "65532:65532" or isolation.get("Privileged")
+            or not isolation.get("ReadonlyRootfs") or isolation.get("NetworkMode") != "none"
+            or isolation.get("PidMode") not in {None, "", "private"}
+            or len(mounts) != 1 or mounts[0].get("Type") != "volume"
+            or mounts[0].get("Name") != descriptor["name"] or mounts[0].get("RW")):
+        raise BuildControlError("Ledger volume probe isolation/identity/outcome differs; retained")
+    proof = json.loads(output.decode().strip())
+    if (proof.get("schema") != "fullmag.host-ledger-volume-probe.v1"
+            or proof.get("state") != "verified" or proof.get("volume_name") != descriptor["name"]
+            or proof.get("filesystem_uuid") != descriptor["filesystem_uuid"]):
+        raise BuildControlError("Ledger volume probe did not verify the selected filesystem; retained")
+    control.write(operation["root"] + "/host-ledger-volume-probe.json",
+                  {**proof, "container_id": actual["Id"], "image_id": image,
+                   "descriptor_sha256": hashlib.sha256(canonical(descriptor)).hexdigest()})
+    control.write(operation["root"] + "/host-ledger-volume-probe-log.json",
+                  {"log": docker_text("logs", name, combined=True)})
+    docker_capture("rm", actual["Id"])
+
+
 def _host_ledger(control, operation, layout, selected, image):
     import docker_host_ledger as ledger
     values = ledger._resolve_values(layout)
     daemon = ledger._daemon_info(docker_text)
     ledger._image_attestation(image, docker_text)
     helper = selected / "scripts/lib/docker_host_ledger.sh"
-    from windows_folder_host import read_owned_regular
-    helper_bytes = read_owned_regular(helper, maximum=ledger.MAX_HELPER_BYTES)
+    helper_bytes = _session_host().read_owned_regular(helper, maximum=ledger.MAX_HELPER_BYTES)
     helper_hash = hashlib.sha256(helper_bytes).hexdigest()
     helper_relative = operation["root"] + "/docker_host_ledger.sh"
     control.write_bytes(helper_relative, helper_bytes)
+    daemon_storage = ledger._daemon_path(values["storage_root"], "storage root")
+    if os.name != "nt":
+        from docker_wsl_bind import resolve_daemon_bind
+        daemon_storage = resolve_daemon_bind(control, operation, Path(values["storage_root"]), image)
+    backing = daemon_storage + "/build-volumes/" + ledger.IMAGE_NAME
     env = {
         "FULLMAG_HOST_LEDGER_PROFILE": ledger.PROFILE,
         "FULLMAG_HOST_LEDGER_PROJECT_ID": values["project_id"],
-        "FULLMAG_HOST_LEDGER_STORAGE_ROOT": ledger._daemon_path(values["storage_root"], "storage root"),
-        "FULLMAG_HOST_LEDGER_BACKING_IMAGE": ledger._daemon_path(values["backing_image"], "backing image"),
+        "FULLMAG_HOST_LEDGER_STORAGE_ROOT": daemon_storage,
+        "FULLMAG_HOST_LEDGER_BACKING_IMAGE": backing,
         "FULLMAG_HOST_LEDGER_MOUNT_ROOT": values["mount_root"],
-        "FULLMAG_HOST_LEDGER_LOCK_PATH": ledger._daemon_path(values["lock_path"], "lock path"),
+        "FULLMAG_HOST_LEDGER_LOCK_PATH": backing + ".lock",
         "FULLMAG_HOST_LEDGER_OWNER_MARKER": values["owner_marker"],
         "FULLMAG_HOST_LEDGER_SIZE_BYTES": str(ledger.IMAGE_SIZE_BYTES),
         "FULLMAG_HOST_LEDGER_MOUNT_TARGET": ledger.MOUNT_TARGET,
@@ -338,8 +421,8 @@ def _host_ledger(control, operation, layout, selected, image):
         "FULLMAG_HOST_LEDGER_RUNTIME_UID": "65532", "FULLMAG_HOST_LEDGER_RUNTIME_GID": "65532",
         "FULLMAG_HOST_LEDGER_LOCK_WAIT_SECONDS": "120", "FULLMAG_DOCKER_HOST_ID": daemon["id_sha256"],
     }
-    command = ["docker", "--context", "desktop-linux", "compose", "--project-name", control.project,
-               "-f", "-", "-f", str(selected / "compose.host-ledger.yaml"), "--profile", "host-ledger-maintenance", "config", "--format", "json"]
+    command = docker_argv("compose", "--project-name", control.project,
+               "-f", "-", "-f", str(selected / "compose.host-ledger.yaml"), "--profile", "host-ledger-maintenance", "config", "--format", "json")
     result = bounded_capture(command, data=canonical({"name": control.project,
         "services": {"backend": {"image": image}}}),
         env={**os.environ, **env}, timeout=90)
@@ -363,7 +446,7 @@ def _host_ledger(control, operation, layout, selected, image):
             or observed[0].get("State", {}).get("Running")
             or observed[0].get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != control.project):
         raise BuildControlError("Host-ledger helper identity/outcome differs; resources retained")
-    if hashlib.sha256(read_owned_regular(helper, maximum=ledger.MAX_HELPER_BYTES)).hexdigest() != helper_hash:
+    if hashlib.sha256(_session_host().read_owned_regular(helper, maximum=ledger.MAX_HELPER_BYTES)).hexdigest() != helper_hash:
         raise BuildControlError("Host-ledger helper changed during maintenance")
     host_receipt = ledger._parse_json_lines(output.decode(), ledger.HOST_RECEIPT_SCHEMA)
     ledger._validate_host_receipt(host_receipt, {"project_id": values["project_id"],
@@ -373,10 +456,19 @@ def _host_ledger(control, operation, layout, selected, image):
                   {"log": docker_text("logs", name, combined=True)})
     docker_capture("rm", observed[0]["Id"])
     backend = rendered["services"]["backend"]
-    return backend, {"profile": ledger.PROFILE, "image_id": image, "environment": env,
+    profile = {"profile": ledger.PROFILE, "image_id": image, "environment": env,
         "mount_root": values["mount_root"], "project_id": values["project_id"],
         "backing_image": env["FULLMAG_HOST_LEDGER_BACKING_IMAGE"], "host_receipt": host_receipt,
         "maintenance_document": spec}
+    if os.name != "nt":
+        descriptor = ledger.prepare_host_volume(profile, control.project, docker_text)
+        _verify_host_ledger_volume(control, operation, descriptor, image)
+        profile["daemon_volume"] = descriptor
+        backend["volumes"] = [mount for mount in backend["volumes"]
+                              if mount["target"] != ledger.MOUNT_TARGET] + [descriptor["mount"]]
+        backend["x-fullmag-host-ledger-volume"] = descriptor
+        control.write(operation["root"] + "/host-ledger-volume.json", descriptor)
+    return backend, profile
 
 
 
@@ -637,19 +729,21 @@ def _precreate_new_windows_runtime_state(state):
 
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
           recovery_environment=None, recovery_metadata=None):
-    from docker_dev import (_require_native_windows, _select_source, _compose_identity,
+    from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
     import fullmag_docker_runtime as runtime
-    from windows_folder_host import attest, publish_evidence, local_volume
     provided_control = control
     provided_operation = operation
     if (provided_control is None) != (provided_operation is None):
         raise BuildControlError("Recovery start requires both control and operation")
     validated_recovery_environment = _validate_recovery_environment(recovery_environment)
     validated_recovery_metadata = _validate_recovery_metadata(recovery_metadata)
-    _require_native_windows()
+    require_host()
+    host = _session_host()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root or args.repo_root)
+    validate_host_path(selected, "source checkout")
+    local_volume(Path(layout["storage_root"]))
     identity = _compose_identity(layout)
     admission_context = {}
     if provided_operation is not None:
@@ -712,13 +806,18 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         token = operation["receipt"]["attempt"]
         if reuse_state is None:
             state = storage.validate_path(Path(layout["runtime_root"]) / "docker-volume-dev" / token,
-                                          layout["storage_root"], "Windows session storage")
+                                          layout["storage_root"], "session storage")
             state.mkdir(parents=True, exist_ok=False)
-            operation["receipt"]["windows_runtime_directories"] = list(
-                _precreate_new_windows_runtime_state(state)
-            )
-            operation["receipt"]["windows_runtime_write_probe"] = "PASS"
-            certificate_path = state / "windows-folder-host.json"
+            if os.name == "nt":
+                operation["receipt"]["windows_runtime_directories"] = list(
+                    _precreate_new_windows_runtime_state(state)
+                )
+                operation["receipt"]["windows_runtime_write_probe"] = "PASS"
+            else:
+                operation["receipt"]["linux_runtime_directories"] = list(
+                    host.prepare_runtime_directories(state)
+                )
+            certificate_path = _certificate_path(state)
             certificate_path.touch(exist_ok=False)
         else:
             try:
@@ -757,10 +856,11 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         provisional["binary_hashes"] = hashes
         engine_id = docker_text("info", "--format", "{{.ID}}").strip()
         if reuse_state is None:
-            certificate = attest(state, provisional, engine_id, hashes, development_build=delegation)
-            publish_evidence(certificate_path, certificate)
+            certificate = host.attest(state, provisional, engine_id, hashes, development_build=delegation)
+            host.publish_evidence(certificate_path, certificate)
         else:
-            certificate = runtime._reuse_host_certificate(reuse_state, provisional, engine_id,
+            reuse_certificate = runtime._reuse_host_certificate if os.name == "nt" else host.reuse_certificate
+            certificate = reuse_certificate(reuse_state, provisional, engine_id,
                                                          development_build=delegation)
         startup = None
         if args.script is not None:
@@ -772,6 +872,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             startup = {"authorization": authorization.as_dict(), "path": str(startup_path),
                        "provenance_sha256": startup_digest, "helper_hashes": startup_hashes}
         user_data = _workspace_state_root(layout, control.project)
+        if os.name != "nt":
+            host.admit_runtime_uid(user_data)
         git_common = _source_git_common_directory(selected)
         environment = {**os.environ, "FULLMAG_COMPOSE_PROJECT": control.project,
             "FULLMAG_COMPOSE_NETWORK": identity["network_name"],
@@ -797,15 +899,19 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         environment["FULLMAG_OPERATOR_PROBE_ENVIRONMENT_SHA256"] = operator_probe_record[
             "operator_probe_environment_sha256"
         ]
-        configured = bounded_capture(["docker", "--context", "desktop-linux", "compose",
+        configured = bounded_capture(docker_argv("compose",
             "--project-name", control.project, "-f", str(selected / "compose.dev.yaml"),
-            "config", "--format", "json"], env=environment, timeout=90)
+            "config", "--format", "json"), env=environment, timeout=90)
         if configured.returncode or len(configured.stdout) > 1024 * 1024:
             raise BuildControlError("DEV Compose render failed: " + configured.stderr.decode("utf-8", "replace"))
         document = json.loads(configured.stdout)
         if device_access == "gpu":
             document["services"]["backend"]["gpus"] = [{"count": "all"}]
         backend, frontend = (document["services"][name] for name in ("backend", "frontend"))
+        backend["environment"]["FULLMAG_SESSION_STORAGE_PROFILE"] = certificate["storage_profile"]
+        for mount in backend["volumes"]:
+            if mount["target"] == "/run/fullmag/windows-folder-host.json":
+                mount["target"] = host.HOST_CERT_PATH
         backend.pop("build", None)
         backend["environment"].update(cache["environment"])
         backend["environment"].update(ledger_backend["environment"])
@@ -836,6 +942,10 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         document["volumes"] = {**document.get("volumes", {}), **cache["overlay"]["volumes"],
             "frontend-build": {"name": frontend_volume, "external": True},
             "build-control": {"name": control.volume, "external": True}}
+        if "x-fullmag-host-ledger-volume" in ledger_backend:
+            descriptor = ledger_backend["x-fullmag-host-ledger-volume"]
+            backend["x-fullmag-host-ledger-volume"] = descriptor
+            document["volumes"]["host-ledger"] = descriptor["compose_volume"]
         _reassert_operator_probe_environment(document, operator_probe_record)
         for service in (backend, frontend):
             service["logging"] = {"driver": "local", "options": {"max-size": "10m", "max-file": "3"}}
@@ -854,6 +964,18 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             raise BuildControlError("Compose did not return both fixed services")
         import docker_backend_volume_cache as backend_cache
         backend_cache.validate_container(json.loads(docker_text("inspect", backend_id))[0], cache)
+        if os.name != "nt":
+            # Desktop translates WSL client paths. Pin inspect's daemon paths
+            # after creation so later resumes compare the same namespace.
+            for service, identifier in (("backend", backend_id), ("frontend", frontend_id)):
+                actual = json.loads(docker_text("inspect", identifier))[0]
+                if (actual.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != control.project
+                        or actual.get("Config", {}).get("Labels", {}).get("com.docker.compose.service") != service):
+                    raise BuildControlError("Cannot pin binds of a foreign service")
+                document["services"][service]["x-fullmag-daemon-binds"] = {
+                    mount["Destination"]: mount["Source"] for mount in actual.get("Mounts", [])
+                    if mount["Type"] == "bind"}
+            control.write(operation["root"] + "/compose.json", document)
         _finish(control, operation, document, backend_id, frontend_id, selected, state,
                 certificate_path, certificate, cache, toolchain, image, git_common, ledger_profile, args.port)
 
@@ -912,7 +1034,8 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     control.write(operation["root"] + "/backend-build-receipt.json", receipt)
     control.write(operation["root"] + "/provenance.json", provenance)
     operation["receipt"]["config_sha256"] = hashlib.sha256(canonical(document)).hexdigest()
-    operation["receipt"]["windows_storage_delegation_reused"] = certificate.get("restart_verified") is True
+    operation["receipt"]["storage_profile"] = certificate["storage_profile"]
+    operation["receipt"]["storage_delegation_reused"] = certificate.get("restart_verified") is True
     # Use the existing source/binary validation before rotating Windows admission.
     inputs.update(device_access=document["services"]["backend"]["environment"]["FULLMAG_DOCKER_DEVICE_ACCESS"],
         gpu_preflight="PASS" if document["services"]["backend"]["environment"]["FULLMAG_DOCKER_DEVICE_ACCESS"] == "gpu" else "NOT_REQUIRED",
@@ -928,9 +1051,16 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     # Rotating it back to unverified after handoff races the serving process.
     if certificate.get("restart_verified") is not True:
         certificate = runtime._refresh_development_certificate(certificate, assembly, inputs)
-        runtime._publish_bound_development_certificate(certificate_path, state / ".fullmag-windows-folder-owner.json", certificate)
-    runtime._complete_backend_storage_preflight(docker_text, backend_id, state, certificate_path, certificate, None,
-        log_writer=lambda output: control.write(operation["root"] + "/storage-probe-log.json", {"log": output}))
+        host = _session_host()
+        host.write_bound_evidence(certificate_path, certificate)
+        host.publish_evidence(state / host.OWNER_NAME, certificate)
+    log_writer = lambda output: control.write(operation["root"] + "/storage-probe-log.json", {"log": output})
+    if os.name == "nt":
+        runtime._complete_backend_storage_preflight(docker_text, backend_id, state, certificate_path, certificate, None,
+                                                   log_writer=log_writer)
+    else:
+        _session_host().complete_preflight(docker_text, backend_id, state, certificate_path, certificate,
+                                           log_writer=log_writer)
     import docker_host_ledger as ledger
     verify_spec = ledger_profile["maintenance_document"]
     verify_name = "fullmag-ledger-verify-" + token
@@ -952,20 +1082,13 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     control.write(operation["root"] + "/ledger-verify-log.json",
                   {"log": docker_text("logs", verify_name, combined=True)})
     docker_capture("rm", actual_verify[0]["Id"])
+    backend_service = document["services"]["backend"]
+    if "x-fullmag-host-ledger-volume" in backend_service:
+        ledger_profile = {**ledger_profile, "daemon_volume": backend_service["x-fullmag-host-ledger-volume"]}
     ledger_attestation = ledger.validate_container(json.loads(docker_text("inspect", backend_id))[0], ledger_profile, docker_text)
     control.write(operation["root"] + "/host-ledger-attestation.json", ledger_attestation)
     # Observe the existing incarnations; a readiness check must never run up
     # again or wait an hour after the supervisor has already closed admission.
-    process_script = """import json,pathlib,sys
-sys.path.insert(0,'/opt/fullmag')
-import runtime_service
-try:
- raw=runtime_service._bounded_regular(pathlib.Path('/state/.fullmag/runtime-service/process-tree.json'),'process receipt')
-except FileNotFoundError:
- print(json.dumps({'state':'not-published'}))
-else:
- print(raw.decode('utf-8'))
-"""
     image_config = json.loads(docker_text("image", "inspect", image))[0]["Config"]
     readiness_deadline = time.monotonic() + 3900
     while time.monotonic() < readiness_deadline:
@@ -975,7 +1098,7 @@ else:
                 expected_started_at=operation["receipt"]["backend_started_at"] if service == "backend" else None)
             if not observed.get("State", {}).get("Running"):
                 raise BuildControlError("DEV service exited before readiness: " + service)
-        process_receipt = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", process_script))
+        process_receipt = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", BACKEND_PROCESS_RECEIPT_SCRIPT))
         if str(process_receipt.get("state", "")).startswith("failed"):
             logs = docker_text("logs", "--since", operation["receipt"]["backend_started_at"],
                                "--tail", "100", backend_id, combined=True)
@@ -989,9 +1112,8 @@ else:
         raise BuildControlError("API/frontend readiness timed out; services and Docker data retained")
     startup_environment = document["services"]["backend"]["environment"]
     if startup_environment.get("FULLMAG_STARTUP_ENABLED") == "1":
-        from windows_folder_host import read_owned_regular
         startup_path = state / "startup-provenance.json"
-        data = read_owned_regular(startup_path, maximum=256 * 1024)
+        data = _session_host().read_owned_regular(startup_path, maximum=256 * 1024)
         if hashlib.sha256(data).hexdigest() != startup_environment["FULLMAG_STARTUP_PROVENANCE_SHA256"]:
             raise BuildControlError("Startup authorization changed after admission")
         authorization = json.loads(data)
@@ -1047,8 +1169,12 @@ def _validate_retained_service(document, actual, service, image_config, *, expec
             name = document["volumes"][mount["source"]]["name"]
             if observed.get("Name") != name:
                 raise BuildControlError("Retained named-volume identity differs: " + mount["target"])
-        elif mount["type"] == "bind" and host_path(observed["Source"]) != Path(mount["source"]).resolve():
-            raise BuildControlError("Retained source/runtime bind differs: " + mount["target"])
+        elif mount["type"] == "bind":
+            pinned = expected.get("x-fullmag-daemon-binds", {}).get(mount["target"])
+            matches = (observed["Source"] == pinned if pinned is not None else
+                       host_path(observed["Source"]) == Path(mount["source"]).resolve())
+            if not matches:
+                raise BuildControlError("Retained source/runtime bind differs: " + mount["target"])
 
 
 def _assert_private_restart_network(actual, ids, project):
@@ -1080,9 +1206,8 @@ def resume(args):
 
 def _retained_operation(args, *, recreate_services, restart_idle_service=False):
     """Resume observation/admission of one exact failed start; never restart the backend."""
-    from docker_dev import _require_native_windows, _select_source, _compose_identity
-    from windows_folder_host import read_owned_regular
-    _require_native_windows()
+    from docker_dev import _select_source, _compose_identity
+    require_host()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root)
     identity = _compose_identity(layout)
     from docker_build_control import toolchain_configuration
@@ -1103,6 +1228,11 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False):
     image = previous["inputs"]["image_id"]
     if previous["inputs"]["source_root"] != str(selected):
         raise BuildControlError("Resume source selection differs")
+    if recreate_services:
+        policy = previous["inputs"].get("gpu_access_requested")
+        if policy not in {"auto", "required", "disabled"}:
+            raise BuildControlError("Recreation requires the retained GPU access intent")
+        args.gpu_access = policy
     ids = {service: compose_capture(document, "ps", "--all", "--quiet", service).decode().strip()
            for service in ("backend", "frontend")}
     actual = {}
@@ -1126,10 +1256,8 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False):
                 or actual["backend"]["State"].get("Health", {}).get("Status") != "healthy"):
             raise BuildControlError("Idle restart requires a healthy backend; an active build is never interrupted")
         state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Windows sessions")
-        certificate_path = state / "windows-folder-host.json"
-        certificate = json.loads(read_owned_regular(certificate_path))
-        if json.loads(read_owned_regular(state / ".fullmag-windows-folder-owner.json")) != certificate:
-            raise BuildControlError("Retained Windows owner/certificate differs")
+        certificate_path = _certificate_path(state)
+        certificate = _retained_certificate(state, document)
         environment = document["services"]["backend"]["environment"]
         if environment.get("FULLMAG_STARTUP_ENABLED") == "1":
             raise BuildControlError("Startup activation requires dedicated recovery; idle restart will not repeat Solve")
@@ -1188,11 +1316,11 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         if document["services"]["backend"]["environment"].get("FULLMAG_STARTUP_ENABLED") == "1":
             raise BuildControlError("Retained startup activation requires its dedicated recovery; recreation will not repeat Solve")
         state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Windows sessions")
-        certificate_path = state / "windows-folder-host.json"
-        certificate = json.loads(read_owned_regular(certificate_path))
-        owner_path = state / ".fullmag-windows-folder-owner.json"
-        if json.loads(read_owned_regular(owner_path)) != certificate or certificate.get("image_id") != image:
-            raise BuildControlError("Retained Windows storage owner/certificate differs")
+        certificate_path = _certificate_path(state)
+        certificate = _retained_certificate(state, document)
+        owner_path = state / _session_host().OWNER_NAME
+        if certificate.get("image_id") != image:
+            raise BuildControlError("Retained storage image differs")
         fresh_state = bool(getattr(args, "fresh_state", False))
         if not fresh_state and not certificate.get("restart_verified"):
             raise BuildControlError("Unadmitted storage cannot rotate as an admitted runtime; use explicit --fresh-state to preserve the old root")
@@ -1237,8 +1365,8 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
     elif not actual["backend"]["State"]["Running"] or actual["frontend"]["State"]["Running"]:
         raise BuildControlError("Resume requires the retained backend running and frontend stopped")
     state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Windows sessions")
-    certificate_path = state / "windows-folder-host.json"
-    certificate = json.loads(read_owned_regular(certificate_path))
+    certificate_path = _certificate_path(state)
+    certificate = _retained_certificate(state, document)
     cache = control.read(previous_root + "/backend-cache.json")
     import docker_backend_volume_cache as cache_adapter
     cache_adapter.validate_container(actual["backend"], cache)

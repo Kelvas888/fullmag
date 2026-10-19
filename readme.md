@@ -159,7 +159,7 @@ for the same-container build and runtime decision.
 The [Fullmag Docker build skill](.agents/skills/fullmag-docker-build/SKILL.md)
 defines the requested volume-only build-data boundary and its preflight.
 The current launchers still need migration; user sessions, results and settings
-remain on Windows. The skill does not claim this migration is complete.
+remain in the configured host storage. The skill does not claim this migration is complete.
 
 For storage locations, automatic retention, known cleanup gaps and the
 verification procedure, see [Docker build and storage lifecycle](docs/guides/docker-build-storage-lifecycle.md).
@@ -172,15 +172,18 @@ does not use a separate one-shot backend-build container or transfer the built
 package through Windows storage. This lifecycle is being integrated; the new
 end-to-end startup and controlled restart remain **NOT VERIFIED**.
 
-Daily FullMag development uses the direct Docker Compose workspace. Run the
-launcher from native Windows PowerShell with Docker Desktop using Linux
-containers and NVIDIA support. WSL is suitable for reading and editing the
-checkout, but `scripts/setup_docker.py` and `scripts/docker_dev.py` reject WSL
-as the development start path.
+Daily FullMag development uses the direct Docker Compose workspace from
+Windows PowerShell or Linux/WSL. Windows uses Docker Desktop's `desktop-linux`
+context and the `windows-folder-v1` storage profile on local NTFS/ReFS.
+Linux/WSL uses the configured Docker endpoint and the independent
+`linux-native-v1` profile on local ext4/xfs/btrfs. WSL checkouts under `~/git`
+are supported; enable Docker Desktop integration for the distribution.
+See [Linux/WSL setup](docs/guides/docker-setup-linux-wsl.md) and
+[ADR 0064](docs/adr/0064-docker-development-linux-wsl-host.md).
 
-Git and a native Windows Python are required. Docker Desktop must use the
-Linux engine and Compose; NVIDIA support is required for GPU lanes. `just` is
-optional when invoking the native Python CLI directly, but is required by the
+Git and a host Python are required. Docker must use the Linux engine and
+Compose; NVIDIA support is required for GPU lanes. `just` is optional when
+invoking the Python CLI directly, but is required by the
 `just` recipes and by the complete `setup_docker.py --check` preflight. The
 host Python only runs the managed launcher; backend code is compiled inside the
 Docker Compose backend service, so host Cargo and CMake are not development
@@ -191,6 +194,18 @@ prerequisites.
 The resolver identifies the project from Git. Keep the main checkout and any
 worktrees under one project parent, and keep durable storage outside every
 checkout. Replace the placeholder values below with paths on the host:
+
+For Linux/WSL, configure the selected checkout with Linux paths:
+
+```bash
+cd "<selected-checkout>"
+python3 -B scripts/setup_docker.py
+python3 -B scripts/setup_docker.py --check
+just docker-dev-toolchain
+just docker-dev "$PWD" 3197
+```
+
+Windows PowerShell example:
 
 ```powershell
 $projectRoot = "C:\path\to\fullmag-project"
@@ -337,14 +352,14 @@ frontend reaches it as `backend:8081` over the private bridge network for the
 selected Compose project. Project name, network, port, workspace settings, and
 user data are derived per registered checkout, so a worktree does not share a
 frontend port or `workspace.db` with the main checkout. Sessions, results,
-projects and settings remain in the configured Windows storage; group settings
+projects and settings remain in the configured host storage; group settings
 include `storage/user-data/<compose-project>/workspace.db`. Build cache,
 packages, build logs and technical receipts belong to Docker named volumes
 and BuildKit. Small runtime admission records and host-ledger evidence retain
 their explicit host-storage contract.
 
 Do not run a plain `docker compose up` for this workspace. The managed launcher
-attests the source bind, package and dependency identities, Windows storage,
+attests the source bind, package and dependency identities, host storage,
 host ledger, owner record, startup response, and resolved Compose configuration
 before it starts the services. Keep the exact receipts and stop evidence when a
 start or build fails.
@@ -352,7 +367,7 @@ start or build fails.
 ### OpenAPI and TypeScript generation in development
 
 After both services are running with the current backend sources, use the
-selected checkout in native PowerShell:
+selected checkout in PowerShell or Linux/WSL:
 
 ```powershell
 Set-Location $worktree

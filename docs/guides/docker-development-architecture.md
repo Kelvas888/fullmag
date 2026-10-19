@@ -78,9 +78,14 @@ operacyjną infrastrukturą zasobów, a nie cache'em buildu ani danymi sesji.
 
 ## Polecenia trybu developerskiego
 
-Uruchamiaj je z natywnego PowerShella Windows, z Git, natywnym Pythonem i Docker
-Desktop w trybie kontenerów Linux. GPU wymaga obsługi NVIDIA w Docker Desktop.
-WSL może edytować źródła; obecny launcher odrzuca WSL jako ścieżkę startową.
+Uruchamiaj je z PowerShella Windows albo Linux/WSL, z Git, Pythonem hosta i
+silnikiem Docker Linux. GPU wymaga dostępu NVIDIA z kontenera. Windows używa
+contextu `desktop-linux` oraz profilu `windows-folder-v1` na NTFS/ReFS.
+Linux/WSL używa bieżącego endpointu Docker i osobnego profilu `linux-native-v1`
+na lokalnym ext4/xfs/btrfs; WSL wymaga integracji dystrybucji w Docker Desktop.
+Checkout w katalogu domowym WSL jest obsługiwany. Szczegóły:
+[konfiguracja Linux/WSL](docker-setup-linux-wsl.md) oraz
+[ADR 0064](../adr/0064-docker-development-linux-wsl-host.md).
 Host nie potrzebuje Cargo ani CMake. `just` jest potrzebny dla recept i pełnego
 `setup_docker.py --check`; launcher Pythona można wywołać bez niego.
 
@@ -494,7 +499,7 @@ zakończenia, zwolnienia dokładnej rezerwacji i poprawnego nowego startu.
 
 ## Generowanie OpenAPI i klienta TypeScript
 
-Dla codziennego developmentu użyj w natywnym PowerShellu z wybranego checkoutu:
+Dla codziennego developmentu użyj PowerShella albo Linux/WSL z wybranego checkoutu:
 
 ```powershell
 just docker-dev-codegen "<wybrany-checkout>"

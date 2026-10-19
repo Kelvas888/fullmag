@@ -53,7 +53,7 @@ receipty/index, profile debuggera i core dumpy). Szybki `--help` lub dry-run mo�
 wykonać setup przed parsowaniem argumentów — najpierw czytaj implementację.
 
 Technical CUDA JIT/cache, frontend `/state/development` i build receipts nie
-są wynikami użytkownika tylko dlatego, że leżą pod `/state`. Zachowaj Windows
+są wynikami użytkownika tylko dlatego, że leżą pod `/state`. Zachowaj na hoście
 wyłącznie provenance wymagane przez runtime konkretnej symulacji. Techniczne
 provenance builda (w tym obecny hostowy handoff) należy do volume. Przenoś techniczne dane
 builda/cache. Uprzywilejowane maintenance `nsenter` i host ledger mają osobny
@@ -106,7 +106,7 @@ Nie podawaj `docker compose down -v` jako uniwersalnego cleanupu: usuwa także
 inne zadeklarowane wolumeny i nie usuwa wszystkich danych BuildKit/external.
 Utwórz preview dokładnych celów, potwierdź role i własność, następnie wykonaj
 wyłącznie zatwierdzone cele. Brak bezpiecznej komendy w launcherze to luka do
-wdrożenia, nie powód do wymyślenia działającej recepty. Dane Windows użytkownika
+wdrożenia, nie powód do wymyślenia działającej recepty. Dane użytkownika na hoście
 oraz ledger pozostają poza zakresem tej operacji.
 
 Przed usunięciem volume zawierającego receipt zachowaj minimalny dowód operacji
@@ -117,7 +117,7 @@ muszą od razu zmniejszyć fizycznego VHDX na Windows. Raportuj oba pomiary osob
 
 ## Próby odbiorcze dla mechanizmu, nie wyłącznie instrukcji
 
-1. Zimny start: spis wszystkich zapisów i peak zajętości, runtime dane Windows
+1. Zimny start: spis wszystkich zapisów i peak zajętości, runtime dane hosta
    oddzielnie. Nie wystarczy `docker inspect` po buildzie.
 2. Kilka restartów identycznych wejść: stałe volume IDs, brak nowych pełnych
    źródeł/pakietów i brak wzrostu poza zadeklarowanym budżetem małych rekordów.

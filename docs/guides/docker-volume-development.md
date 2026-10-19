@@ -7,7 +7,11 @@ Nie powstaje trzecia usługa aplikacyjna ani hostowy katalog kompilacji.
 
 ## Uruchomienie
 
-Użyj natywnego PowerShell, Pythona oraz Docker Desktop z silnikiem Linux.
+Użyj Pythona z Windows PowerShell albo Linux/WSL oraz silnika Docker Linux.
+WSL wymaga włączonej integracji dystrybucji w Docker Desktop. Linux/WSL
+używa lokalnego ext4/xfs/btrfs i bieżącego endpointu Docker; Windows zachowuje
+NTFS/ReFS oraz context `desktop-linux`. Szczegóły:
+[konfiguracja Linux/WSL](docker-setup-linux-wsl.md).
 Najpierw skonfiguruj `.env` głównego checkoutu przez `scripts/setup_docker.py`.
 Worktree korzysta z konfiguracji przez resolver; nie kopiuj do niego `.env`.
 Przeczytaj skill `.agents/skills/fullmag-docker-build/SKILL.md`.
@@ -46,7 +50,7 @@ Nie kopiuj tych plików do hostowego `storage/builds`.
 sprawdza dokładny kontener, obraz, polecenie, etykiety i mounty oraz wymaga
 zdrowego API bez aktywnej sesji. Na czas kontroli zamyka jedyne wejście HTTP przez zatrzymanie własnego frontendu,
 sprawdza prywatną sieć bez obcych konsumentów, restartuje backend i ponownie
-uruchamia ten sam frontend. Zachowuje cache oraz Windows storage. Nie jest komendą do przerywania obliczeń. Wymaga wyłącznego okna operatorskiego,
+uruchamia ten sam frontend. Zachowuje cache oraz storage hosta. Nie jest komendą do przerywania obliczeń. Wymaga wyłącznego okna operatorskiego,
 bez równoległych klientów wysyłających polecenia do tej grupy; odczyt health
 nie jest dowodem opróżnienia wszystkich kolejek aplikacji.
 Frontend obserwuje katalogi `app`, `src`, `public`, `scripts` i aktualizuje UI
@@ -138,7 +142,7 @@ pakietu a gotowością API również przerywa obserwację.
 | pnpm, Next, metadata workspace, next.log | frontend named volume |
 | Konfiguracje, provenance, receipty, manifesty, logi BuildKit i dowody kontroli | build-control named volume |
 | Warstwy zależności/helperów | Docker image store / BuildKit |
-| Sesje, wyniki, ustawienia, historia, ledger | dotychczasowy Windows storage |
+| Sesje, wyniki, ustawienia, historia, ledger | skonfigurowany storage hosta Windows albo Linux/WSL |
 
 Źródła są readonly. Krótkie helpery utrzymania należą do tej samej grupy;
 nie budują ani nie uruchamiają aplikacji i nie mają Docker socketu.

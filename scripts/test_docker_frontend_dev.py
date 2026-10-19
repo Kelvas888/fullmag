@@ -796,6 +796,24 @@ else:
             with self.assertRaisesRegex(self.module.FrontendDevError, "configuration or source identity changed"):
                 self.module._freeze_inputs(changed_inputs, allow_generated=False)
 
+    def test_linux_live_manifest_is_accepted_and_frozen_with_explicit_provenance(self):
+        with isolated(self.module) as (_, _, inputs):
+            manifest = {**inputs.manifest, "source_root": "/home/user/fullmag",
+                        "source_selection": "live_linux_selected_checkout"}
+            self.module.INPUTS_PATH.write_text(json.dumps(manifest))
+            parsed = self.module.read_inputs(self.module.INPUTS_PATH)
+            self.assertEqual(parsed.source_root, manifest["source_root"])
+            self.module._freeze_inputs(parsed, allow_generated=False)
+            for root in ("relative/repo", "/", "//host/repo", "/home/../repo", "/home/./repo",
+                         "/home//repo", "/home/repo/", "/home/rep\\o", "/home/repo\n", "C:\\repo"):
+                with self.subTest(root=root):
+                    self.module.INPUTS_PATH.write_text(json.dumps({**manifest, "source_root": root}))
+                    with self.assertRaises(self.module.FrontendDevError):
+                        self.module.read_inputs(self.module.INPUTS_PATH)
+            self.module.INPUTS_PATH.write_text(json.dumps({**manifest, "source_selection": "live_windows_selected_checkout"}))
+            with self.assertRaisesRegex(self.module.FrontendDevError, "Windows"):
+                self.module.read_inputs(self.module.INPUTS_PATH)
+
     def test_host_mount_descriptors_are_bound_to_the_fixed_workspace_targets(self):
         with isolated(self.module) as (root, workspace, inputs):
             manifest = json.loads(self.module.INPUTS_PATH.read_text(encoding="utf-8"))

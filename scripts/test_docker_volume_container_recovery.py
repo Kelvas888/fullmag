@@ -7,9 +7,12 @@ starting Compose, or touching a runtime volume.
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -114,6 +117,174 @@ class ContainerRecoveryTests(unittest.TestCase):
         self.assertIn("type=bind,src=/windows/ledger,dst=/host-ledger,readonly", argv)
         self.assertIn("deadline=time.monotonic()+5", " ".join(argv))
         self.assertNotIn("bind-nonrecursive", " ".join(argv))
+
+    def test_storage_probe_uses_selected_host_docker_adapter(self):
+        backend = {"Image": "sha256:" + "f" * 64, "Mounts": [
+            {"Destination": "/state", "Type": "bind", "Source": "/state/source", "RW": True},
+            {"Destination": "/host-ledger", "Type": "bind", "Source": "/ledger/source", "RW": True}]}
+        output = json.dumps({"store_root_sha256": "1" * 64,
+            "ledger_root_sha256": "2" * 64, "ledger_snapshot_sha256": "3" * 64,
+            "run_records": []}).encode()
+        result = SimpleNamespace(returncode=0, stdout=output, stderr=b"")
+        with patch.object(recovery, "docker_argv", return_value=["docker", "run"]) as adapter, \
+             patch.object(recovery, "bounded_capture", return_value=result) as capture:
+            recovery._ledger_and_store_snapshot(SimpleNamespace(project="fullmag-test"), backend)
+        adapter.assert_called_once_with("run")
+        self.assertEqual(capture.call_args.args[0][:2], ["docker", "run"])
+        self.assertNotIn("desktop-linux", capture.call_args.args[0])
+
+    @staticmethod
+    def ledger_volume_fixture():
+        import docker_host_ledger as ledger
+        project = "fullmag-test"
+        mount_root = "/mnt/fullmag-host-ledger-project-test"
+        receipt = {"schema": ledger.HOST_RECEIPT_SCHEMA, "profile": ledger.PROFILE,
+            "state": "ready", "project_id": "project-test", "mount_root": mount_root,
+            "backing_image": "/canonical/storage/build-volumes/" + ledger.IMAGE_NAME,
+            "ledger_root": mount_root + "/ledger", "mount_target": "/host-ledger",
+            "filesystem": "ext4", "filesystem_uuid": "11111111-1111-4111-8111-111111111111",
+            "loop_device": "/dev/loop7", "image_size_bytes": ledger.IMAGE_SIZE_BYTES,
+            "mount_active": True}
+        descriptor = ledger.host_volume_descriptor(project, "project-test", mount_root, receipt)
+        mountpoint = "/var/lib/docker/volumes/" + descriptor["name"] + "/_data"
+        volume = {"Name": descriptor["name"], "Driver": "local", "Scope": "local",
+                  "Options": descriptor["options"], "Labels": descriptor["labels"], "Mountpoint": mountpoint}
+        compose = {"name": project, "volumes": {"host-ledger": descriptor["compose_volume"]},
+                   "services": {"backend": {"x-fullmag-host-ledger-volume": descriptor,
+                       "volumes": [descriptor["mount"]], "environment": {
+                           "FULLMAG_HOST_LEDGER_PROJECT_ID": descriptor["project_id"],
+                           "FULLMAG_HOST_LEDGER_MOUNT_ROOT": descriptor["mount_root"],
+                           "FULLMAG_HOST_LEDGER_BACKING_IMAGE": receipt["backing_image"]}}}}
+        backend = {"Image": "sha256:" + "a" * 64, "Mounts": [
+            {"Destination": "/state", "Type": "bind", "Source": "/host/state", "RW": True},
+            {"Destination": "/host-ledger", "Type": "volume", "Name": descriptor["name"],
+             "Driver": "local", "Source": mountpoint, "RW": True}]}
+        return compose, backend, volume
+
+    def test_storage_probe_mounts_exact_inspected_ledger_volume_readonly(self):
+        compose, backend, volume = self.ledger_volume_fixture()
+        output = json.dumps({"store_root_sha256": "1" * 64, "ledger_root_sha256": "2" * 64,
+                             "ledger_snapshot_sha256": "3" * 64, "run_records": []}).encode()
+        with patch.object(recovery, "docker_capture", return_value=SimpleNamespace(stdout=json.dumps([volume]).encode())) as inspect, \
+                patch.object(recovery, "bounded_capture", return_value=SimpleNamespace(returncode=0, stdout=output, stderr=b"")) as helper:
+            recovery._ledger_and_store_snapshot(SimpleNamespace(project=compose["name"]), backend, compose=compose)
+        inspect.assert_called_once_with("volume", "inspect", volume["Name"], timeout=30)
+        argv = helper.call_args.args[0]
+        self.assertIn("type=volume,src=" + volume["Name"] + ",dst=/host-ledger,readonly,volume-nocopy", argv)
+        self.assertFalse(any(volume["Mountpoint"] in argument for argument in argv))
+        self.assertEqual(json.loads(argv[-1]), compose["services"]["backend"]["x-fullmag-host-ledger-volume"])
+        self.assertEqual(volume["Options"]["device"],
+                         compose["services"]["backend"]["x-fullmag-host-ledger-volume"]["device_alias"])
+
+    def test_volume_proof_refusal_stops_helper_before_storage_snapshot(self):
+        import docker_host_ledger as ledger
+        compose, backend, volume = self.ledger_volume_fixture()
+        output = json.dumps({"store_root_sha256": "1" * 64, "ledger_root_sha256": "2" * 64,
+                             "ledger_snapshot_sha256": "3" * 64, "run_records": []}).encode()
+        refusal = "def probe(descriptor):\n raise RuntimeError('volume-proof-refusal')\n"
+        with patch.object(recovery, "docker_capture", return_value=SimpleNamespace(stdout=json.dumps([volume]).encode())), \
+                patch.object(ledger, "HOST_VOLUME_PROBE_FUNCTIONS", refusal), \
+                patch.object(recovery, "bounded_capture", return_value=SimpleNamespace(returncode=0, stdout=output, stderr=b"")) as helper:
+            recovery._ledger_and_store_snapshot(SimpleNamespace(project=compose["name"]), backend, compose=compose)
+        argv = helper.call_args.args[0]
+        result = subprocess.run([sys.executable, "-B", "-c", argv[-2], argv[-1]], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("volume-proof-refusal", result.stderr)
+
+    def test_ledger_volume_requires_canonical_cas_and_inspected_ownership(self):
+        mutations = {
+            "missing-descriptor": lambda c, b, v: c["services"]["backend"].pop("x-fullmag-host-ledger-volume"),
+            "wrong-project": lambda c, b, v: c.update(name="another-project"),
+            "nonexternal": lambda c, b, v: c["volumes"]["host-ledger"].update(external=False),
+            "wrong-device": lambda c, b, v: v.update(Options={"type": "none", "o": "bind", "device": "/wrong-root"}),
+            "wrong-label": lambda c, b, v: v.update(Labels={}),
+            "wrong-driver": lambda c, b, v: v.update(Driver="nfs"),
+            "wrong-scope": lambda c, b, v: v.update(Scope="global"),
+            "wrong-name": lambda c, b, v: b["Mounts"][1].update(Name="foreign-volume"),
+            "wrong-mountpoint": lambda c, b, v: b["Mounts"][1].update(Source="/foreign/_data"),
+            "unexpected-bind": lambda c, b, v: b["Mounts"][1].update(Type="bind"),
+            "readonly-owner": lambda c, b, v: b["Mounts"][1].update(RW=False),
+            "wrong-descriptor": lambda c, b, v: c["services"]["backend"].update(**{"x-fullmag-host-ledger-volume": {}}),
+            "wrong-backing": lambda c, b, v: c["services"]["backend"]["environment"].update(FULLMAG_HOST_LEDGER_BACKING_IMAGE="/wrong/backing.ext4"),
+            "missing-receipt": lambda c, b, v: c["services"]["backend"]["x-fullmag-host-ledger-volume"].pop("host_receipt"),
+            "raw-loop-alias": lambda c, b, v: c["services"]["backend"]["x-fullmag-host-ledger-volume"]["host_receipt"].update(device_alias="/dev/loop7"),
+            "missing-nocopy": lambda c, b, v: c["services"]["backend"].update(volumes=[{
+                "type": "volume", "source": "host-ledger", "target": "/host-ledger"}]),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                compose, backend, volume = copy.deepcopy(self.ledger_volume_fixture())
+                mutate(compose, backend, volume)
+                with patch.object(recovery, "docker_capture", return_value=SimpleNamespace(stdout=json.dumps([volume]).encode())), \
+                        patch.object(recovery, "bounded_capture") as helper:
+                    with self.assertRaises(recovery.ContainerRecoveryError):
+                        recovery._ledger_and_store_snapshot(SimpleNamespace(project="fullmag-test"), backend, compose=compose)
+                    helper.assert_not_called()
+
+    def test_retained_storage_checks_both_explicit_host_profiles(self):
+        import linux_native_host
+        for windows in (False, True):
+            with self.subTest(windows=windows), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory) / "session"
+                state.mkdir()
+                native = {"host_root": str(state), "host_filesystem": "NTFS" if windows else "ext4",
+                          "host_root_no_reparse": True}
+                native.update({"host_drive_type": "fixed", "host_volume_serial": "ABCD"} if windows
+                              else {"host_device": state.stat().st_dev, "host_platform": "linux"})
+                host = SimpleNamespace(
+                    HOST_SCHEMA="fullmag.windows-folder-host.v1" if windows else linux_native_host.HOST_SCHEMA,
+                    HOST_CERT_PATH="/run/fullmag/windows-folder-host.json" if windows else linux_native_host.HOST_CERT_PATH,
+                    OWNER_NAME=".fullmag-windows-folder-owner.json" if windows else linux_native_host.OWNER_NAME,
+                    local_volume=lambda path: native,
+                    # Exercise real bounded nofollow reads for both fixtures.
+                    read_owned_regular=linux_native_host.read_owned_regular)
+                certificate = {"schema": host.HOST_SCHEMA, "storage_profile": "windows-folder-v1" if windows else "linux-native-v1",
+                    "role": "session", "owner_scope": "docker-desktop-linux" if windows else "docker-linux",
+                    "owner_token": "1eccf696-733d-4506-bbd7-9fd79ea602fa" if windows else "1eccf696733d4506bbd79fd79ea602fa",
+                    "engine_id": "selected-engine", "image_id": "sha256:" + "a" * 64,
+                    **native}
+                if not windows:
+                    certificate["host_inode"] = state.stat().st_ino
+                certificate_path = state / Path(host.HOST_CERT_PATH).name
+                owner_marker = state / host.OWNER_NAME
+                def save(value):
+                    data = json.dumps(value)
+                    certificate_path.write_text(data)
+                    owner_marker.write_text(data)
+                save(certificate)
+                layout = {"runtime_root": directory}
+                with patch.object(recovery, "_reused_session_host", return_value=host):
+                    proof = recovery._validate_reused_session_before_removal(
+                        layout, str(state), certificate["image_id"], "selected-engine")
+                    self.assertEqual(proof["host_certificate"], certificate_path)
+                    changes = {"engine_id": "other-engine", "image_id": "sha256:" + "b" * 64,
+                        "owner_scope": "foreign", "owner_token": "0" * 32,
+                        "host_root": str(state / "other"), "host_filesystem": "foreign"}
+                    if not windows:
+                        changes.update(host_inode=state.stat().st_ino + 1, host_device=state.stat().st_dev + 1)
+                    for key, value in changes.items():
+                        with self.subTest(changed=key):
+                            save({**certificate, key: value})
+                            with self.assertRaises(recovery.ContainerRecoveryError):
+                                recovery._validate_reused_session_before_removal(
+                                    layout, state, certificate["image_id"], "selected-engine")
+                    save(certificate)
+                    owner_marker.write_text("{}")
+                    with self.assertRaisesRegex(recovery.ContainerRecoveryError, "owner marker differ"):
+                        recovery._validate_reused_session_before_removal(layout, state, certificate["image_id"], "selected-engine")
+
+    def test_retained_linux_symlink_evidence_is_rejected(self):
+        import linux_native_host
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "session"
+            state.mkdir()
+            actual = state / "actual"
+            actual.write_text("{}")
+            (state / linux_native_host.CERTIFICATE_NAME).symlink_to(actual)
+            with patch.object(recovery, "_reused_session_host", return_value=linux_native_host), \
+                 self.assertRaisesRegex(recovery.ContainerRecoveryError, "proof is unavailable"):
+                recovery._validate_reused_session_before_removal(
+                    {"runtime_root": directory}, state, "sha256:" + "a" * 64, "engine")
 
     def test_container_pin_normalizes_docker_null_device_requests(self):
         container = {

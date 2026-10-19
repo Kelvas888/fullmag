@@ -3448,6 +3448,34 @@ def _validate_windows_folder_attestation(
     return "ready"
 
 
+def _validate_linux_native_build(host, provenance, receipt_sha256):
+    """Bind Linux host delegation to the verified live package and Compose group."""
+    delegation = host.get("development_build")
+    if not isinstance(delegation, dict):
+        _fail("Linux native DEV requires a development build delegation")
+    expected = {
+        "cargo_profile": BACKEND_CARGO_PROFILE,
+        "toolchain_image_id": os.environ.get("FULLMAG_TOOLCHAIN_IMAGE_ID"),
+        "package_root": str(PACKAGE_ROOT),
+        "provenance_path": str(PROVENANCE_PATH),
+        "group_identity": os.environ.get("FULLMAG_COMPOSE_PROJECT"),
+    }
+    if (delegation.get("schema") != WINDOWS_FOLDER_DEVELOPMENT_SCHEMA
+            or not expected["group_identity"]
+            or not IMAGE_RE.fullmatch(expected["toolchain_image_id"] or "")
+            or any(delegation.get(key) != value for key, value in expected.items())
+            or set(delegation) != {"schema", "source_identity", *expected}):
+        _fail("Linux native development delegation differs from package/toolchain/group")
+    _validate_development_source_identity(delegation["source_identity"])
+    if (provenance.get("schema") != "fullmag.docker-all-image.v1"
+            or provenance.get("state") != "succeeded"
+            or provenance.get("cargo_profile") != BACKEND_CARGO_PROFILE
+            or provenance.get("toolchain_image_id") != expected["toolchain_image_id"]
+            or provenance.get("package_root") != str(PACKAGE_ROOT)
+            or provenance.get("build_receipt_sha256") != receipt_sha256):
+        _fail("Linux native runtime provenance differs from the verified package")
+
+
 def _wait_for_windows_folder_attestation(
     provenance: Mapping[str, Any], receipt_sha256: str
 ) -> None:
@@ -3510,6 +3538,21 @@ def _serve(extra: list[str]) -> int:
             _log_phase("gate", "failed", error=type(error).__name__)
             raise
         _log_phase("gate", "complete", profile=WINDOWS_FOLDER_STORAGE_PROFILE)
+    elif os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == "linux-native-v1":
+        from linux_native_probe import validate_host
+        _log_phase("gate", "start", profile="linux-native-v1")
+        deadline = time.monotonic() + 240
+        while True:
+            try:
+                host, _, _ = validate_host()
+                provenance, _ = _read_json(PROVENANCE_PATH, "runtime provenance", 8 * 1024 * 1024)
+                _validate_linux_native_build(host, provenance, receipt_sha256)
+                break
+            except (RuntimeError, OSError, json.JSONDecodeError) as error:
+                if time.monotonic() >= deadline:
+                    raise BackendBuildError("Linux native host admission did not become ready") from error
+                time.sleep(0.2)
+        _log_phase("gate", "complete", profile="linux-native-v1")
     else:
         _log_phase("gate", "skipped", reason="storage-profile")
     environment = dict(os.environ)

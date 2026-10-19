@@ -1,4 +1,4 @@
-//! Scoped admission for a Docker Desktop Windows-folder session store.
+//! Scoped admission for Docker Windows-folder and native Linux session stores.
 //!
 //! Docker Desktop exposes a Windows bind mount as Linux 9p.  The native
 //! writer therefore keeps 9p outside its normal filesystem allow-list and
@@ -6,6 +6,8 @@
 //! `windows-folder-v1` profile and supplied both host evidence and a
 //! container-specific grant.  This module only admits that evidence; all
 //! writer leases, path checks, and publication barriers remain unchanged.
+//! The independent `linux-native-v1` profile validates its own host certificate
+//! and current mount evidence before using the ordinary Linux writer.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1069,8 +1071,10 @@ pub(crate) fn admit(root: &Path) -> Result<()> {
 fn is_managed_runtime_services_scaffold(root: &Path) -> Result<bool> {
     const RUNTIME_SERVICES_ROOT: &str = "/opt/fullmag/runtime-control/runtime-services";
 
-    if env::var("FULLMAG_SESSION_STORAGE_PROFILE").as_deref() != Ok("windows-folder-v1")
-        || env::var("FULLMAG_RUNTIME_CONTROL_ROOT").as_deref()
+    if !matches!(
+        env::var("FULLMAG_SESSION_STORAGE_PROFILE").as_deref(),
+        Ok("windows-folder-v1" | "linux-native-v1")
+    ) || env::var("FULLMAG_RUNTIME_CONTROL_ROOT").as_deref()
             != Ok("/opt/fullmag/runtime-control")
         || env::var("FULLMAG_RUNTIME_SERVICES_ROOT").as_deref() != Ok(RUNTIME_SERVICES_ROOT)
     {
@@ -1174,19 +1178,143 @@ fn initialize_store_under(parent: &Path, relative: &str) -> Result<(PathBuf, boo
     Ok((root, created))
 }
 
-/// Bootstrap only the fixed Docker accepted store after full Windows-folder
-/// admission. This is internal launcher plumbing, not a general initializer.
+/// Validate the independent Linux bind profile against current host and mount evidence.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_native_store_identity(root: &Path) -> Result<serde_json::Value> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    if env::var("FULLMAG_SESSION_STORAGE_PROFILE").ok().as_deref() != Some("linux-native-v1") {
+        bail!("Linux native admission requires its explicit storage profile");
+    }
+    let state = Path::new(CONTAINER_ROOT);
+    let pinned = canonical_candidate(root, state)?;
+    let metadata = pinned.state_file.metadata()?;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(pinned.state_file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("checking Linux native state filesystem");
+    }
+    if !matches!(
+        unsafe { filesystem.assume_init() }.f_type as u64,
+        0xef53 | 0x5846_5342 | 0x9123_683e
+    ) || pinned.existing_file.metadata()?.dev() != metadata.dev()
+    {
+        bail!("Linux native storage must remain on its ext4/xfs/btrfs mount");
+    }
+    let raw = read_bounded_regular_file(
+        Path::new("/run/fullmag/linux-native-host.json"),
+        MAX_EVIDENCE_BYTES,
+    )?;
+    let host: serde_json::Value = serde_json::from_slice(&raw)?;
+    let owner: serde_json::Value = serde_json::from_slice(&read_bounded_regular_file(
+        &state.join(".fullmag-linux-native-owner.json"),
+        MAX_EVIDENCE_BYTES,
+    )?)?;
+    if host != owner
+        || host["schema"] != "fullmag.linux-native-host.v1"
+        || host["storage_profile"] != "linux-native-v1"
+        || host["role"] != "session"
+        || host["owner_scope"] != "docker-linux"
+        || host["restart_verified"] != true
+    {
+        bail!("Linux native host owner/profile/restart evidence differs");
+    }
+    let token = host["owner_token"]
+        .as_str()
+        .context("Linux native owner token missing")?;
+    validate_hex(token, 32, "Linux native owner token")?;
+    let engine = host["engine_id"]
+        .as_str()
+        .context("Linux native engine missing")?;
+    validate_scalar(engine, "Linux native engine", 256)?;
+    let engine_digest = sha256_hex(engine.as_bytes());
+    if env::var("FULLMAG_DOCKER_HOST_ID").ok().as_deref() != Some(engine_digest.as_str()) {
+        bail!("Linux native Docker engine differs from runtime admission");
+    }
+    let image = host["image_id"]
+        .as_str()
+        .context("Linux native image missing")?;
+    validate_image_id(image, "Linux native image")?;
+    if env::var("FULLMAG_RUNTIME_IMAGE_ID").ok().as_deref() != Some(image) {
+        bail!("Linux native runtime image differs from host admission");
+    }
+    let delegation: DevelopmentBuildDelegation = serde_json::from_value(
+        host.get("development_build")
+            .cloned()
+            .context("Linux native DEV delegation is missing")?,
+    )?;
+    validate_development_build(&delegation)?;
+    let expected_commit = option_env!("FULLMAG_SOURCE_GIT_COMMIT")
+        .context("managed source commit identity is missing at compile time")?;
+    validate_development_runtime_identity(&delegation, expected_commit)?;
+    let payload = format!("{token}:{image}");
+    if host["restart_expected_sha256"] != sha256_hex(payload.as_bytes())
+        || read_bounded_regular_file(&state.join(".linux-native-sentinel"), MAX_EVIDENCE_BYTES)?
+            != payload.as_bytes()
+        || read_bounded_regular_file(&state.join(".linux-native-restart"), MAX_EVIDENCE_BYTES)?
+            != payload.as_bytes()
+    {
+        bail!("Linux native restart sentinel differs");
+    }
+    let probe: serde_json::Value = serde_json::from_slice(&read_bounded_regular_file(
+        &state.join(".linux-native-probe.json"),
+        MAX_EVIDENCE_BYTES,
+    )?)?;
+    if probe["schema"] != "fullmag.linux-native-probe.v1"
+        || probe["storage_profile"] != "linux-native-v1"
+        || probe["owner_token"] != token
+        || probe["host_attestation_sha256"] != sha256_hex(&raw)
+        || probe["root_device"].as_u64() != Some(metadata.dev())
+        || probe["root_inode"].as_u64() != Some(metadata.ino())
+        || probe["mount_namespace_inode"].as_u64() != Some(fs::metadata("/proc/self/ns/mnt")?.ino())
+    {
+        bail!("Linux native probe is not bound to this owner/mount/namespace");
+    }
+    let checks = probe["checks"]
+        .as_object()
+        .context("Linux native probe checks missing")?;
+    let expected = [
+        "file_sync",
+        "directory_sync",
+        "atomic_replace",
+        "process_lock",
+        "no_follow_symlink",
+        "sqlite_transactions",
+        "restart_readback",
+    ];
+    if checks.len() != expected.len()
+        || expected
+            .iter()
+            .any(|key| checks.get(*key).and_then(|value| value.as_bool()) != Some(true))
+    {
+        bail!("Linux native storage probe checks are incomplete");
+    }
+    // Device/inode and namespace are admission evidence; the owner scope survives recreation.
+    Ok(
+        serde_json::json!({"schema": "fullmag.linux-native-store-identity.v1",
+        "engine_id": engine, "owner_token": token, "relative_state_path": relative_state_path(root)?}),
+    )
+}
+
+/// Bootstrap only the fixed Docker accepted store after host-profile admission.
+/// This is internal launcher plumbing, not a general initializer.
 #[doc(hidden)]
 pub fn initialize_attested_docker_accepted_store() -> Result<(PathBuf, bool)> {
     #[cfg(target_os = "linux")]
     {
         let parent = Path::new("/state/runs/docker-all");
-        admit(parent)?;
+        match env::var("FULLMAG_SESSION_STORAGE_PROFILE").ok().as_deref() {
+            Some("windows-folder-v1") => admit(parent)?,
+            Some("linux-native-v1") => {
+                linux_native_store_identity(parent)?;
+            }
+            _ => bail!("Docker accepted store requires an explicit supported storage profile"),
+        }
         initialize_store_under(parent, "session-store")
     }
     #[cfg(not(target_os = "linux"))]
     {
-        bail!("Docker Windows-folder bootstrap requires the attested Linux container");
+        bail!("Docker accepted-store bootstrap requires its attested Linux container");
     }
 }
 

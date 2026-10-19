@@ -30,6 +30,8 @@ WORKTREE_ID = TARGET_ID = "docker-all"
 COMPUTE_POOL_ID = "docker-all.compute"
 PREPARATION_POOL_ID = "docker-all.preparation"
 WINDOWS_STORAGE_PROFILE = "windows-folder-v1"
+LINUX_STORAGE_PROFILE = "linux-native-v1"
+
 STORAGE_SCHEMA = "fullmag_storage_v1"
 RUNTIME_CONFIG_SCHEMA = "runtime_service_config.v1"
 HOST_PROFILE_SCHEMA = "fullmag.docker-host-profile.v1"
@@ -47,7 +49,7 @@ HOST_LEDGER_PROFILE = "host-ledger-v1"
 HOST_RESOURCE_LEDGER_FILE = "HOST_RESOURCE_LEDGER.json"
 LEGACY_DOCKER_HOST_ID = "docker-all-host"
 MAX_HOST_LEDGER_BYTES = 8 * 1024 * 1024
-# The accepted store remains the Windows-backed user-data namespace.  Every
+# The accepted store remains in the host-backed user-data namespace. Every
 # lifecycle receipt/configuration file is rooted in the separately mounted
 # runtime-control volume.  ``FULLMAG_RUNTIME_SERVICES_ROOT`` is a second view
 # of that same volume at the native SessionStore compatibility path; the Rust
@@ -530,7 +532,7 @@ def runtime_services_root(paths: RuntimePaths) -> Path:
     accepted SessionStore.  Docker mounts the runtime-control named volume at
     that compatibility path as well as at ``runtime_services``.  Keeping this
     lookup in one helper prevents Python lifecycle checks from accidentally
-    returning to the Windows session bind.
+    returning to the host session bind.
     """
 
     return paths.runtime_services or (paths.store / RUNTIME_SERVICES_RELATIVE)
@@ -594,7 +596,7 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
         environment["FULLMAG_RUNTIME_SERVICE_CONFIG"], "FULLMAG_RUNTIME_SERVICE_CONFIG"
     ) != config:
         _fail("FULLMAG_RUNTIME_SERVICE_CONFIG is outside the fixed config path")
-    provenance = _env_path(environment, "FULLMAG_PACKAGE_PROVENANCE", IMAGE_ROOT / "provenance.json")
+    provenance = _env_path(environment, "FULLMAG_PACKAGE_PROVENANCE", provenance)
     if provenance not in {IMAGE_ROOT / "provenance.json", Path("/build/provenance.json"), Path("/opt/fullmag/control/backend/runtime-provenance.json")}:
         _fail("runtime provenance is outside the two fixed package/volume locations")
     return RuntimePaths(
@@ -608,16 +610,24 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
         package=package,
         config=config,
         provenance=provenance,
-        host_certificate=HOST_CERTIFICATE,
+        host_certificate=(Path("/run/fullmag/linux-native-host.json")
+                          if environment.get("FULLMAG_SESSION_STORAGE_PROFILE") == LINUX_STORAGE_PROFILE
+                          else HOST_CERTIFICATE),
     )
+
+
+def storage_profile() -> str:
+    profile = os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE")
+    if profile not in {WINDOWS_STORAGE_PROFILE, LINUX_STORAGE_PROFILE}:
+        _fail("all-in-Docker storage requires explicit windows-folder-v1 or linux-native-v1 admission")
+    return profile
 
 
 def prepare_storage(paths: RuntimePaths | None = None) -> RuntimePaths:
     """Prepare mapped directories and the fixed project marker only."""
 
     paths = paths or canonical_paths()
-    if os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") != WINDOWS_STORAGE_PROFILE:
-        _fail("all-in-Docker storage requires explicit windows-folder-v1 admission")
+    storage_profile()
     _ensure_directory(paths.state, "container state")
     _ensure_directory(paths.state_root, "runtime control volume")
     _ensure_directory(runtime_services_root(paths), "runtime services volume view")
@@ -661,7 +671,7 @@ def api_environment(paths: RuntimePaths, config_path: Path | None = None) -> dic
             "FULLMAG_FEM_MESH_CACHE_DIR", str(FEM_MESH_CACHE_ROOT)
         ),
         "CUDA_CACHE_PATH": os.environ.get("CUDA_CACHE_PATH", str(CUDA_CACHE_ROOT)),
-        "FULLMAG_SESSION_STORAGE_PROFILE": WINDOWS_STORAGE_PROFILE,
+        "FULLMAG_SESSION_STORAGE_PROFILE": storage_profile(),
         "FULLMAG_RUNTIME_SERVICE_CONFIG": str(config_path),
     }
     image_id = os.environ.get("FULLMAG_RUNTIME_IMAGE_ID")
