@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::error::ApiError;
 use crate::schemas::commands::RuntimeCommandTarget;
@@ -119,7 +119,7 @@ pub(crate) async fn submit_live_command_with_transition(
     context: &CurrentLiveRequestContext,
     request_idempotency_key: Option<String>,
 ) -> Result<Option<AcceptedLiveExecution>, ApiError> {
-    let scene = {
+    let (scene, source_script_path) = {
         let current = state.current_live_state.read().await;
         let snapshot = current
             .as_ref()
@@ -134,7 +134,9 @@ pub(crate) async fn submit_live_command_with_transition(
         if let Some(error) = accepted_preparation_recovery_error(snapshot) {
             return Err(error);
         }
-        snapshot.scene_document.clone()
+        let source_script_path = (!snapshot.session.script_path.is_empty())
+            .then(|| PathBuf::from(snapshot.session.script_path.clone()));
+        (snapshot.scene_document.clone(), source_script_path)
     };
 
     let scene = match scene {
@@ -278,6 +280,7 @@ pub(crate) async fn submit_live_command_with_transition(
             &api_instance_id,
             &captured_context,
             &scene,
+            source_script_path,
             LiveAcceptedSubmission::Command {
                 command,
                 request_idempotency_key,
@@ -679,6 +682,21 @@ pub(crate) async fn submit_live_study_with_transition_with_asset_root(
     auto_run: bool,
     asset_root: Option<PathBuf>,
 ) -> Result<AcceptedLiveStudyExecution, ApiError> {
+    let source_script_path = {
+        let current = state.current_live_state.read().await;
+        let snapshot = current
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        crate::ensure_current_live_request_context(
+            snapshot,
+            context,
+            state
+                .current_live_session_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )?;
+        (!snapshot.session.script_path.is_empty())
+            .then(|| PathBuf::from(snapshot.session.script_path.clone()))
+    };
     let prepared = prepare_live_study_with_asset_root(
         state,
         context,
@@ -687,6 +705,7 @@ pub(crate) async fn submit_live_study_with_transition_with_asset_root(
         source_sha256,
         auto_run,
         asset_root,
+        source_script_path,
     )
     .await?;
     // The existing command path already owns the transition fence. The
@@ -710,6 +729,7 @@ pub(crate) async fn prepare_live_study_with_asset_root(
     source_sha256: String,
     auto_run: bool,
     asset_root: Option<PathBuf>,
+    source_script_path: Option<PathBuf>,
 ) -> Result<PreparedLiveAcceptedStudy, ApiError> {
     validate_live_scene_for_context(state, context, &scene).await?;
     let Some(store_root) = state.submit_store_root.clone() else {
@@ -734,6 +754,7 @@ pub(crate) async fn prepare_live_study_with_asset_root(
             &api_instance_id,
             &captured_context,
             &scene,
+            source_script_path,
             LiveAcceptedSubmission::Startup {
                 request_id,
                 source_sha256,
@@ -1206,6 +1227,7 @@ fn materialize_live_accepted(
     api_instance_id: &str,
     context: &CurrentLiveRequestContext,
     scene: &fullmag_authoring::SceneDocument,
+    source_script_path: Option<PathBuf>,
     submission: LiveAcceptedSubmission,
 ) -> Result<AcceptedLiveStudyExecution, ApiError> {
     let prepared = prepare_live_accepted(
@@ -1217,9 +1239,97 @@ fn materialize_live_accepted(
         api_instance_id,
         context,
         scene,
+        source_script_path,
         submission,
     )?;
     commit_prepared_live_accepted(&prepared)
+}
+
+/// Apply the Docker output binding only to the lowered execution inputs for an
+/// admitted source script.  The authored SceneDocument and the Python export
+/// remain unchanged; ordinary UI/managed sources outside the Docker source
+/// prefix retain their existing output policy.
+fn apply_docker_output_storage_binding(
+    inputs: &mut [fullmag_application::StudyStepExecutionInput],
+    scene: &fullmag_authoring::SceneDocument,
+    source_script_path: Option<&Path>,
+) -> Result<(), ApiError> {
+    let Some(source_script_path) = source_script_path else {
+        return Ok(());
+    };
+    if source_script_path
+        .strip_prefix(Path::new(crate::docker_startup::CONTAINER_SOURCE_ROOT))
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let binding = crate::docker_startup::bind_docker_output_storage_for_source(
+        scene,
+        source_script_path,
+    )?;
+    apply_resolved_docker_output_storage_binding(inputs, &binding, source_script_path)
+}
+
+fn apply_resolved_docker_output_storage_binding(
+    inputs: &mut [fullmag_application::StudyStepExecutionInput],
+    binding: &Value,
+    source_script_path: &Path,
+) -> Result<(), ApiError> {
+    let output_storage = binding
+        .get("output_storage")
+        .cloned()
+        .ok_or_else(|| ApiError::internal("Docker output binding has no resolved OutputStorage"))?;
+    let source_dir = binding
+        .get("source_dir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::internal("Docker output binding has no resolved source directory"))?
+        .to_string();
+    let source_stem = source_script_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("Docker startup source path has no valid script stem"))?
+        .to_string();
+
+    for input in inputs {
+        let runtime_metadata = &mut input.problem.problem_meta.runtime_metadata;
+        runtime_metadata.insert("output_storage".to_string(), output_storage.clone());
+        runtime_metadata.insert(
+            "output_storage_source_dir".to_string(),
+            Value::String(source_dir.clone()),
+        );
+        runtime_metadata.insert(
+            "output_storage_source_stem".to_string(),
+            Value::String(source_stem.clone()),
+        );
+
+        if let Some(model_builder) = runtime_metadata
+            .get_mut("model_builder")
+            .and_then(Value::as_object_mut)
+        {
+            if let Some(builder_runtime) = model_builder
+                .get_mut("problem")
+                .and_then(Value::as_object_mut)
+                .and_then(|problem| problem.get_mut("runtime"))
+                .and_then(Value::as_object_mut)
+            {
+                builder_runtime.insert(
+                    "output_storage".to_string(),
+                    output_storage.clone(),
+                );
+                builder_runtime.insert(
+                    "output_storage_source_dir".to_string(),
+                    Value::String(source_dir.clone()),
+                );
+                builder_runtime.insert(
+                    "output_storage_source_stem".to_string(),
+                    Value::String(source_stem.clone()),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Expensive preparation with no accepted durable-state publication. It may
@@ -1235,6 +1345,7 @@ fn prepare_live_accepted(
     api_instance_id: &str,
     context: &CurrentLiveRequestContext,
     scene: &fullmag_authoring::SceneDocument,
+    source_script_path: Option<PathBuf>,
     submission: LiveAcceptedSubmission,
 ) -> Result<PreparedLiveAcceptedStudy, ApiError> {
     let queue_tasks = match &submission {
@@ -1392,6 +1503,11 @@ fn prepare_live_accepted(
         &effective_scene,
         &requested_execution,
         &study,
+    )?;
+    apply_docker_output_storage_binding(
+        &mut inputs,
+        &effective_scene,
+        source_script_path.as_deref(),
     )?;
     let migrated_profile = if needs_legacy_profile_migration {
         // Migrate every authored Study step independently.  A whole startup
@@ -2032,11 +2148,14 @@ fn profile_catalog_error(message: String) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{
-        accepted_frontier_preparation_is_ready, bounded_gpu_relaxation_algorithm,
-        bounded_recovery_error, request_accepted_stop_for_catalog,
-        validate_scene_revision_and_content, AcceptedLiveStudyExecution,
-        AcceptedLiveStudyPreparationError, MAX_RECOVERY_ERROR_CHARS,
+        accepted_frontier_preparation_is_ready, apply_docker_output_storage_binding,
+        apply_resolved_docker_output_storage_binding, bounded_gpu_relaxation_algorithm,
+        bounded_recovery_error,
+        request_accepted_stop_for_catalog, validate_scene_revision_and_content,
+        AcceptedLiveStudyExecution, AcceptedLiveStudyPreparationError, MAX_RECOVERY_ERROR_CHARS,
     };
 
     #[test]
@@ -2054,6 +2173,76 @@ mod tests {
         let error = validate_scene_revision_and_content(9, 9, &current, &prepared).unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
         assert_eq!(error.message, "startup_scene_revision_or_content_changed");
+    }
+
+    #[test]
+    fn docker_output_binding_skips_managed_ui_source_outside_container_prefix() {
+        let mut inputs = Vec::new();
+        let scene = fullmag_authoring::SceneDocument::default();
+        apply_docker_output_storage_binding(
+            &mut inputs,
+            &scene,
+            Some(Path::new("/workspace/ui/scene.py")),
+        )
+        .expect("managed UI sources must retain their existing output policy");
+    }
+
+    #[test]
+    fn docker_output_binding_applies_resolved_policy_to_each_study_step() {
+        let output_storage = fullmag_ir::OutputStorageIR {
+            output_dir: Some("/opt/fullmag/script-output/authored_filename.zarr".into()),
+            temp_dir: Some("/opt/fullmag/script-output/.fullmag-tmp".into()),
+            ..Default::default()
+        };
+        let binding = serde_json::json!({
+            "source_dir": "/opt/fullmag/script-output",
+            "output_storage": serde_json::to_value(output_storage).unwrap(),
+        });
+        let mut inputs = vec![
+            fullmag_application::StudyStepExecutionInput {
+                step_id: "step-a".into(),
+                problem: fullmag_ir::ProblemIR::bootstrap_example(),
+                layers: Vec::new(),
+            },
+            fullmag_application::StudyStepExecutionInput {
+                step_id: "step-b".into(),
+                problem: fullmag_ir::ProblemIR::bootstrap_example(),
+                layers: Vec::new(),
+            },
+        ];
+        inputs[0].problem.problem_meta.runtime_metadata.insert(
+            "model_builder".into(),
+            serde_json::json!({"problem": {"runtime": {}}}),
+        );
+
+        apply_resolved_docker_output_storage_binding(
+            &mut inputs,
+            &binding,
+            Path::new("/opt/fullmag/source/examples/authored_filename.py"),
+        )
+        .expect("resolved Docker output policy should bind to every study step");
+
+        for input in &inputs {
+            let metadata = &input.problem.problem_meta.runtime_metadata;
+            assert_eq!(
+                metadata["output_storage"]["output_dir"],
+                "/opt/fullmag/script-output/authored_filename.zarr"
+            );
+            assert_eq!(
+                metadata["output_storage"]["temp_dir"],
+                "/opt/fullmag/script-output/.fullmag-tmp"
+            );
+            assert_eq!(
+                metadata["output_storage_source_dir"],
+                "/opt/fullmag/script-output"
+            );
+            assert_eq!(metadata["output_storage_source_stem"], "authored_filename");
+        }
+        assert_eq!(
+            inputs[0].problem.problem_meta.runtime_metadata["model_builder"]["problem"]
+                ["runtime"]["output_storage"]["output_dir"],
+            "/opt/fullmag/script-output/authored_filename.zarr"
+        );
     }
 
     #[test]
