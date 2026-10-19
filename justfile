@@ -43,6 +43,11 @@ docker-dev-codegen source_root="":
 docker-dev-stop-failed source_root container_id image_id process_receipt_sha256:
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_stop_failed.py" --source-root {{quote(source_root)}} --container-id {{quote(container_id)}} --image-id {{quote(image_id)}} --process-receipt-sha256 {{quote(process_receipt_sha256)}}
 
+# Stop one rejected startup before any RunIntent or host reservation was admitted.
+# Every identity and proof is explicit; the helper never retries the script or clears state.
+docker-dev-stop-unadmitted attempt config_sha256 source_root backend_container_id frontend_container_id image_id failure_marker_sha256 process_receipt_sha256 source_sha256 request_id session_id:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" stop-unadmitted --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --backend-container-id {{quote(backend_container_id)}} --frontend-container-id {{quote(frontend_container_id)}} --image-id {{quote(image_id)}} --failure-marker-sha256 {{quote(failure_marker_sha256)}} --process-receipt-sha256 {{quote(process_receipt_sha256)}} --source-sha256 {{quote(source_sha256)}} --request-id {{quote(request_id)}} --session-id {{quote(session_id)}}
+
 # Interpreted launcher/cache regressions run inside the selected fixed backend.
 docker-dev-control-checks source_root:
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_checks.py" --source-root {{quote(source_root)}}
@@ -60,8 +65,14 @@ docker-dev-restart-idle attempt config_sha256 source_root port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" restart-idle-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}
 
 # Replace exact retained volume DEV services, preserving caches and Windows state.
-docker-dev-recreate-volume attempt config_sha256 source_root port="3197" fresh_state="false":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if fresh_state == "true" { "--fresh-state" } else if fresh_state == "false" { "" } else { error("fresh_state must be true or false") }}}
+docker-dev-recreate-volume attempt config_sha256 source_root port="3197" fresh_state="false" recovery_authorization="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if recovery_authorization == "" { "" } else { "--recovery-authorization " + quote(recovery_authorization) }}} {{if fresh_state == "true" { "--fresh-state" } else if fresh_state == "false" { "" } else { error("fresh_state must be true or false") }}}
+
+# Explicit managed recovery of one stopped Docker namespace. The old attempt,
+# Compose config digest, source checkout, frontend port, and control-volume
+# authorization are all required; no ordinary recreation fallback is allowed.
+docker-dev-recover-container old_attempt config_sha256 source_root port recovery_authorization:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate-volume --attempt {{quote(old_attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} --recovery-authorization {{quote(recovery_authorization)}}
 
 # Controlled recreation of one terminal failed direct-development run.  The
 # receipt and config digest are mandatory; this is not unknown-owner recovery.

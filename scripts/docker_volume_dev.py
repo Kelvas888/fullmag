@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -22,6 +23,138 @@ _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES = (
     Path("runs/docker-all/session-store"),
     Path("runs/docker-all/session-store/runtime-services"),
 )
+
+_RECOVERY_ENVIRONMENT_NAME = re.compile(r"FULLMAG_CONTAINER_RECOVERY_[A-Z0-9_]+\Z")
+_RECOVERY_ATTEMPT = re.compile(r"[0-9a-f]{32}\Z")
+_MAX_RECOVERY_METADATA_BYTES = 256 * 1024
+
+
+def _validate_recovery_environment(values):
+    """Validate recovery-only environment injected from the control volume.
+
+    Recovery callers must construct this mapping from authenticated control
+    volume data.  Restricting names to the recovery namespace prevents a
+    caller from replacing the source, storage, GPU, or Compose identity that
+    ``start`` derives from the selected checkout.
+    """
+
+    if values is None:
+        return {}
+    if not isinstance(values, Mapping):
+        raise BuildControlError("Recovery environment must be a mapping")
+    result = {}
+    for name, value in values.items():
+        if not isinstance(name, str) or not _RECOVERY_ENVIRONMENT_NAME.fullmatch(name):
+            raise BuildControlError("Recovery environment contains an unsupported variable name")
+        if not isinstance(value, str) or "\x00" in value or len(value) > 8192:
+            raise BuildControlError("Recovery environment contains an invalid value")
+        result[name] = value
+    if len(canonical(result)) > _MAX_RECOVERY_METADATA_BYTES:
+        raise BuildControlError("Recovery environment exceeds the metadata budget")
+    return result
+
+
+def _validate_recovery_metadata(value):
+    """Accept only bounded JSON metadata already authenticated by the caller."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise BuildControlError("Recovery metadata must be a mapping")
+    try:
+        encoded = canonical(value)
+    except (TypeError, ValueError) as error:
+        raise BuildControlError("Recovery metadata is not canonical JSON") from error
+    if len(encoded) > _MAX_RECOVERY_METADATA_BYTES:
+        raise BuildControlError("Recovery metadata exceeds the metadata budget")
+    return dict(value)
+
+
+def _validate_existing_development_operation(control, operation, selected, identity):
+    """Validate an already-held development lease before reusing it.
+
+    The recovery path must never open a second BuildControl operation.  This
+    check binds the supplied operation to the selected source and Compose
+    group, and rejects an operation from another phase or attempt root.
+    """
+
+    if not isinstance(control, BuildControl):
+        raise BuildControlError("Existing development context has no BuildControl")
+    if not isinstance(operation, Mapping) or operation.get("lease_ready") is not True:
+        raise BuildControlError("Existing development context has no active lease")
+    receipt = operation.get("receipt")
+    if not isinstance(receipt, Mapping):
+        raise BuildControlError("Existing development context has no operation receipt")
+    if receipt.get("phase") != "development":
+        raise BuildControlError("Recovery operation must use the development phase")
+    attempt = receipt.get("attempt")
+    expected_root = "development/attempts/" + str(attempt)
+    if not isinstance(attempt, str) or not _RECOVERY_ATTEMPT.fullmatch(attempt):
+        raise BuildControlError("Recovery operation has an invalid attempt token")
+    if operation.get("root") != expected_root:
+        raise BuildControlError("Recovery operation root does not match its attempt")
+    if receipt.get("compose_project") != control.project:
+        raise BuildControlError("Recovery operation belongs to another Compose project")
+    if identity.get("project_name") != control.project:
+        raise BuildControlError("Selected checkout belongs to another Compose project")
+    control_identity = control.identity
+    for key in ("project_id", "worktree_id", "checkout_kind"):
+        if control_identity.get(key) != identity.get(key):
+            raise BuildControlError("Recovery operation identity differs from selected checkout")
+    inputs = receipt.get("inputs")
+    if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
+        raise BuildControlError("Recovery operation source differs from selected checkout")
+    for key in ("source_project_id", "source_worktree_id", "source_checkout_kind"):
+        expected = {"source_project_id": "project_id", "source_worktree_id": "worktree_id",
+                    "source_checkout_kind": "checkout_kind"}[key]
+        if key in inputs and inputs.get(key) != identity.get(expected):
+            raise BuildControlError("Recovery operation source identity differs from selected checkout")
+    return dict(receipt)
+
+
+def _validate_existing_operation_inputs(receipt, expected):
+    """Keep the ordinary DEV input contract immutable on a reused lease.
+
+    Recovery owns one already-open ``BuildControl.operation``.  ``start`` may
+    add recovery-only metadata, but it must not silently replace the standard
+    source/image/device/operator inputs that later activate/resume commands
+    use as their terminal proof.
+    """
+
+    actual = receipt.get("inputs") if isinstance(receipt, Mapping) else None
+    if not isinstance(actual, Mapping):
+        raise BuildControlError("Existing development operation has no standard inputs")
+    required = (
+        "source_root", "image_id", "source_project_id", "source_worktree_id",
+        "source_checkout_kind", "gpu_access_requested", "device_access",
+        "gpu_preflight", "operator_probe_environment_schema",
+        "operator_probe_environment", "operator_probe_environment_sha256",
+    )
+    for key in required:
+        if actual.get(key) != expected.get(key):
+            raise BuildControlError(
+                "Existing development operation input differs: " + key
+            )
+
+
+def _validate_prepared_start_context(prepared):
+    """Validate toolchain/runtime receipts supplied by a recovery caller."""
+
+    if not isinstance(prepared, Mapping):
+        raise BuildControlError("Recovery start requires a prepared Docker context")
+    toolchain = prepared.get("toolchain")
+    images = prepared.get("images")
+    if not isinstance(toolchain, Mapping) or not isinstance(images, Mapping):
+        raise BuildControlError("Recovery start has incomplete prepared Docker context")
+    toolchain_image = toolchain.get("image_id")
+    backend = images.get("backend")
+    image = backend.get("image_id") if isinstance(backend, Mapping) else None
+    for label, value in (("toolchain", toolchain_image), ("backend", image)):
+        if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise BuildControlError(f"Recovery {label} image is not pinned by digest")
+    if not isinstance(toolchain.get("inputs"), Mapping):
+        raise BuildControlError("Recovery toolchain receipt has no inputs")
+    return toolchain, images
 
 
 def docker_text(*args, timeout=90, combined=False):
@@ -502,15 +635,24 @@ def _precreate_new_windows_runtime_state(state):
     return tuple(relative.as_posix() for relative in _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES)
 
 
-def start(args, *, reuse_state=None):
+def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
+          recovery_environment=None, recovery_metadata=None):
     from docker_dev import (_require_native_windows, _select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
     import fullmag_docker_runtime as runtime
     from windows_folder_host import attest, publish_evidence, local_volume
+    provided_control = control
+    provided_operation = operation
+    if (provided_control is None) != (provided_operation is None):
+        raise BuildControlError("Recovery start requires both control and operation")
+    validated_recovery_environment = _validate_recovery_environment(recovery_environment)
+    validated_recovery_metadata = _validate_recovery_metadata(recovery_metadata)
     _require_native_windows()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root or args.repo_root)
     identity = _compose_identity(layout)
+    if provided_operation is not None:
+        _validate_existing_development_operation(provided_control, provided_operation, selected, identity)
     _assert_no_running_fullmag(identity["project_name"], identity)
     runtime.assert_loopback_port_available(args.port, identity["project_name"])
     if args.profile != "dev":
@@ -529,17 +671,36 @@ def start(args, *, reuse_state=None):
     from docker_dev import _resolve_gpu_access, _verify_docker_gpu_access
     policy = getattr(args, "gpu_access", None) or "auto"
     device_access = _resolve_gpu_access(policy)
-    toolchain = build_volume_toolchain(selected)
-    control = BuildControl(identity, toolchain["inputs"]["build_args"]["FULLMAG_CUDA_BASE_IMAGE"])
-    images = build_volume_runtime_images(selected, control, toolchain)
+    if provided_operation is None:
+        toolchain = build_volume_toolchain(selected)
+        control = BuildControl(identity, toolchain["inputs"]["build_args"]["FULLMAG_CUDA_BASE_IMAGE"])
+        images = build_volume_runtime_images(selected, control, toolchain)
+    else:
+        control = provided_control
+        toolchain, images = _validate_prepared_start_context(prepared)
     image = images["backend"]["image_id"]
     device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
     _assert_no_running_fullmag(control.project, identity)
-    with control.operation("development", {"source_root": str(selected), "image_id": image,
-            "gpu_access_requested": policy, "device_access": device_access,
-            "gpu_preflight": "PASS" if device_access == "gpu" else "NOT_REQUIRED",
-            **operator_probe_record}) as operation:
+    operation_inputs = {"source_root": str(selected), "image_id": image,
+        "source_project_id": identity["project_id"],
+        "source_worktree_id": identity["worktree_id"],
+        "source_checkout_kind": identity["checkout_kind"],
+        "gpu_access_requested": policy, "device_access": device_access,
+        "gpu_preflight": "PASS" if device_access == "gpu" else "NOT_REQUIRED",
+        **operator_probe_record}
+    if provided_operation is not None:
+        _validate_existing_operation_inputs(provided_operation.get("receipt", {}), operation_inputs)
+    operation_context = (control.operation("development", operation_inputs)
+                         if provided_operation is None
+                         else nullcontext(provided_operation))
+    with operation_context as operation:
         operation["receipt"].update(operator_probe_record)
+        if validated_recovery_metadata is not None:
+            operation["receipt"]["container_recovery"] = validated_recovery_metadata
+        if validated_recovery_environment:
+            operation["receipt"]["container_recovery_environment"] = sorted(
+                validated_recovery_environment
+            )
         token = operation["receipt"]["attempt"]
         if reuse_state is None:
             state = storage.validate_path(Path(layout["runtime_root"]) / "docker-volume-dev" / token,
@@ -552,8 +713,30 @@ def start(args, *, reuse_state=None):
             certificate_path = state / "windows-folder-host.json"
             certificate_path.touch(exist_ok=False)
         else:
-            state = reuse_state["state"]
-            certificate_path = reuse_state["host_certificate"]
+            try:
+                state = storage.validate_path(
+                    Path(reuse_state["state"]),
+                    Path(layout["runtime_root"]),
+                    "retained Windows sessions",
+                )
+                certificate_path = storage.validate_path(
+                    Path(reuse_state["host_certificate"]),
+                    state,
+                    "retained Windows session certificate",
+                )
+                owner_marker = storage.validate_path(
+                    Path(reuse_state["owner_marker"]),
+                    state,
+                    "retained Windows session owner marker",
+                )
+            except (KeyError, TypeError, ValueError, storage.StorageError) as error:
+                raise BuildControlError(
+                    "Retained Windows session paths are outside the selected runtime root"
+                ) from error
+            reuse_state = dict(reuse_state)
+            reuse_state["state"] = state
+            reuse_state["host_certificate"] = certificate_path
+            reuse_state["owner_marker"] = owner_marker
         operation["receipt"]["state_root"] = str(state)
         local_volume(state)
         cache = _backend_cache(control, operation, layout, selected, image, toolchain["image_id"])
@@ -621,6 +804,7 @@ def start(args, *, reuse_state=None):
         backend["environment"]["FULLMAG_PACKAGE_PROVENANCE"] = runtime.BACKEND_PROVENANCE_PATH
         backend["environment"]["FULLMAG_RUNTIME_PROVENANCE"] = runtime.BACKEND_PROVENANCE_PATH
         backend["environment"]["CUDA_CACHE_PATH"] = "/build/cuda-cache"
+        backend["environment"].update(validated_recovery_environment)
         if startup is not None:
             backend["environment"].update(FULLMAG_STARTUP_ENABLED="1",
                 FULLMAG_STARTUP_SCRIPT=startup["authorization"]["container_script_path"],

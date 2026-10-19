@@ -2489,11 +2489,39 @@ def _parser() -> argparse.ArgumentParser:
     idle_restart.add_argument("--config-sha256", required=True)
     idle_restart.add_argument("--source-root", type=Path, required=True)
     idle_restart.add_argument("--port", type=int, required=True)
+    stop_unadmitted = subparsers.add_parser(
+        "stop-unadmitted",
+        help=(
+            "stop one pinned pre-admission startup rejection after proving that "
+            "no run or host reservation was admitted"
+        ),
+    )
+    stop_unadmitted.add_argument("--attempt", required=True)
+    stop_unadmitted.add_argument("--config-sha256", required=True)
+    stop_unadmitted.add_argument("--source-root", type=Path, required=True)
+    stop_unadmitted.add_argument("--backend-container-id", required=True)
+    stop_unadmitted.add_argument("--frontend-container-id", required=True)
+    stop_unadmitted.add_argument("--image-id", required=True)
+    stop_unadmitted.add_argument("--failure-marker-sha256", required=True)
+    stop_unadmitted.add_argument("--process-receipt-sha256", required=True)
+    stop_unadmitted.add_argument("--source-sha256", required=True)
+    stop_unadmitted.add_argument("--request-id", required=True)
+    stop_unadmitted.add_argument("--session-id", required=True)
     recreate_volume = subparsers.add_parser("recreate-volume", help="Replace exact stopped-backend DEV services while retaining Docker caches")
     recreate_volume.add_argument("--attempt", required=True)
     recreate_volume.add_argument("--config-sha256", required=True)
     recreate_volume.add_argument("--source-root", type=Path, required=True)
     recreate_volume.add_argument("--port", type=int, required=True)
+    recreate_volume.add_argument(
+        "--recovery-authorization",
+        type=str,
+        help=(
+            "opaque POSIX reference to the explicit managed control-volume "
+            "authorization for one stopped container namespace recovery; the "
+            "reference is passed unchanged to the volume-only recovery wrapper "
+            "and is never resolved as a host path"
+        ),
+    )
     recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the old Windows root and create a fresh one")
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
                                  include_untracked=[], script=None)
@@ -2609,9 +2637,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "restart-idle-volume":
             from docker_volume_dev import restart_idle
             restart_idle(args)
+        elif args.action == "stop-unadmitted":
+            from docker_volume_stop_unadmitted import stop
+            stop(args)
         elif args.action == "recreate-volume":
-            from docker_volume_dev import recreate as recreate_volume
-            recreate_volume(args)
+            if args.recovery_authorization is not None:
+                if args.fresh_state:
+                    raise _fail(
+                        "container recovery cannot combine --recovery-authorization with --fresh-state"
+                    )
+                from docker_volume_container_recovery import recover as recover_container
+                recover_container(args)
+            else:
+                from docker_volume_dev import recreate as recreate_volume
+                recreate_volume(args)
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)

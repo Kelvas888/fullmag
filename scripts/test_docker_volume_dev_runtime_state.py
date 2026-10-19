@@ -14,6 +14,75 @@ import docker_volume_dev
 
 
 class DockerVolumeDevRuntimeStateTests(unittest.TestCase):
+    @staticmethod
+    def _development_context():
+        identity = {
+            "project_name": "fullmag-worktree-test",
+            "project_id": "fullmag",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        control = docker_volume_dev.BuildControl.__new__(docker_volume_dev.BuildControl)
+        control.identity = dict(identity)
+        control.project = identity["project_name"]
+        operation = {
+            "root": "development/attempts/" + "a" * 32,
+            "lease_ready": True,
+            "receipt": {
+                "phase": "development",
+                "attempt": "a" * 32,
+                "compose_project": identity["project_name"],
+                "inputs": {
+                    "source_root": "/checkout",
+                    "source_project_id": identity["project_id"],
+                    "source_worktree_id": identity["worktree_id"],
+                    "source_checkout_kind": identity["checkout_kind"],
+                },
+            },
+        }
+        return identity, control, operation
+
+    def test_recovery_reuses_only_matching_development_operation(self):
+        identity, control, operation = self._development_context()
+        receipt = docker_volume_dev._validate_existing_development_operation(
+            control, operation, Path("/checkout"), identity
+        )
+        self.assertEqual(receipt["phase"], "development")
+        self.assertEqual(
+            docker_volume_dev._validate_prepared_start_context(
+                {
+                    "toolchain": {
+                        "image_id": "sha256:" + "b" * 64,
+                        "inputs": {"build_args": {}},
+                    },
+                    "images": {"backend": {"image_id": "sha256:" + "c" * 64}},
+                }
+            )[0]["image_id"],
+            "sha256:" + "b" * 64,
+        )
+        operation["receipt"]["phase"] = "resume"
+        with self.assertRaisesRegex(docker_volume_dev.BuildControlError, "development phase"):
+            docker_volume_dev._validate_existing_development_operation(
+                control, operation, Path("/checkout"), identity
+            )
+
+    def test_recovery_context_rejects_identity_and_environment_override(self):
+        identity, control, operation = self._development_context()
+        operation["receipt"]["inputs"]["source_root"] = "/other-checkout"
+        with self.assertRaisesRegex(docker_volume_dev.BuildControlError, "source differs"):
+            docker_volume_dev._validate_existing_development_operation(
+                control, operation, Path("/checkout"), identity
+            )
+        self.assertEqual(
+            docker_volume_dev._validate_recovery_environment(
+                {"FULLMAG_CONTAINER_RECOVERY_REQUEST": "request-1"}
+            ),
+            {"FULLMAG_CONTAINER_RECOVERY_REQUEST": "request-1"},
+        )
+        for name in ("FULLMAG_SOURCE_ROOT", "PATH"):
+            with self.assertRaisesRegex(docker_volume_dev.BuildControlError, "unsupported"):
+                docker_volume_dev._validate_recovery_environment({name: "value"})
+
     def test_precreate_uses_real_write_probe_and_exact_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"

@@ -210,6 +210,13 @@ Wejścia tego checkpointu, sprzed integracji mastera `fc50a43efa6a19ed10e03e1f9a
 Nowe/zmienione wejścia DEV: `docker-dev-toolchain`, `docker-dev-images`,
 `docker-dev`, `docker-dev-build`, `docker-dev-control-checks`, `docker-dev-resume`,
 `docker-dev-recreate-volume`, `docker-dev-restart-idle`, `docker-dev-stop-failed`.
+
+W zadaniu mixed-P1 dodano `docker-dev-stop-unadmitted`: wąskie zatrzymanie
+zewnętrznie odrzuconego startupu przed przyjęciem RunIntent. Wrapper przekazuje
+wyłącznie jawnie przypięte identyfikatory do `docker_dev.py stop-unadmitted`,
+bez hostowego `storage.run`. Dowody i journal trafiają do control volume;
+cache i dane użytkownika pozostają zachowane. Nowa recepta wymaga oddzielnego
+dowodu rzeczywistego graceful stopu; samo dodanie wpisu jej nie kwalifikuje.
 Bootstrap uruchamia `docker_build_control`; aplikacja używa `docker_volume_dev`.
 Wrapper przekazuje te ścisłe wzorce bez hostowego `storage.run`. Starszy
 `docker-dev-recreate` odmawia przed inicjalizacją hostowego logu/kontekstu.
