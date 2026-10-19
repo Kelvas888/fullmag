@@ -5490,7 +5490,7 @@ mod container_recovery_contract_tests {
                         storage_bytes: 8192,
                     },
                     gpu_vram_bytes_by_uuid: std::collections::BTreeMap::new(),
-                    allowed_cpu_ids: [0].into_iter().collect(),
+                    allowed_cpu_ids: [0, 1, 2, 3].into_iter().collect(),
                 },
                 runtime_generation_sha256: None,
                 compute_max_concurrency: 1,

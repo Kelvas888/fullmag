@@ -9441,7 +9441,11 @@ mod tests {
         ledger
             .with_container_runtime_recovery_quiescence(|snapshot| {
                 assert_eq!(snapshot, &before);
-                assert!(ledger.writer.acquire().is_err());
+                let writer = Arc::clone(&ledger.writer);
+                let blocked = std::thread::spawn(move || writer.acquire().is_err())
+                    .join()
+                    .unwrap();
+                assert!(blocked, "host writer must fence the callback");
                 Ok(())
             })
             .unwrap();

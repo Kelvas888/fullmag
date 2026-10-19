@@ -1225,6 +1225,8 @@ class DockerRuntimeContract(unittest.TestCase):
             RuntimeHandle=service_module.RuntimeHandle,
             prepare_storage=lambda: paths,
             initialize_accepted_store=lambda _paths: {"binding": "test"},
+            recover_container_namespace=lambda _paths: None,
+            container_recovery_configuration_override=lambda _paths, _recovery: nullcontext(),
             recover_idle_failure=lambda _paths: None,
             ensure_configuration=lambda _paths: {},
             process_environment=lambda _paths: {},
@@ -1287,6 +1289,10 @@ class DockerRuntimeContract(unittest.TestCase):
             RuntimeServiceTransient=service_module.RuntimeServiceTransient,
             prepare_storage=mock.Mock(return_value=paths),
             initialize_accepted_store=mock.Mock(return_value={"binding": "test"}),
+            recover_container_namespace=mock.Mock(return_value=None),
+            container_recovery_configuration_override=mock.Mock(
+                side_effect=lambda _paths, _recovery: nullcontext()
+            ),
             recover_idle_failure=mock.Mock(return_value=None),
             ensure_configuration=mock.Mock(return_value={}),
             process_environment=mock.Mock(return_value={}),
