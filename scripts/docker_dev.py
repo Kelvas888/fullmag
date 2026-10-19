@@ -1792,69 +1792,6 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
     return receipt_path
 
 
-def _compose_stop_hint(container_ids: Sequence[str]) -> str:
-    """Return a stop command for the exact Compose file that owns the run."""
-
-    try:
-        documents = _read_json_output(
-            _docker_capture("inspect", *container_ids, timeout=60),
-            "running Fullmag container inspection",
-        )
-    except DirectDockerError:
-        documents = None
-    if isinstance(documents, list) and documents:
-        configs: tuple[str, ...] | None = None
-        working_dir: str | None = None
-        compose_project: str | None = None
-        valid = True
-        for document in documents:
-            if not isinstance(document, dict):
-                valid = False
-                break
-            config = document.get("Config")
-            labels = config.get("Labels") if isinstance(config, dict) else None
-            if not isinstance(labels, dict):
-                valid = False
-                break
-            raw_files = labels.get("com.docker.compose.project.config_files")
-            raw_working = labels.get("com.docker.compose.project.working_dir")
-            raw_project = labels.get("com.docker.compose.project")
-            if (not isinstance(raw_files, str) or not raw_files.strip()
-                    or not isinstance(raw_working, str)
-                    or not isinstance(raw_project, str)
-                    or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", raw_project)):
-                valid = False
-                break
-            # Compose records multiple files as a platform-separated or
-            # comma-separated label.  The runtime launcher records its fully
-            # resolved compose.json here, so this command needs no shell env.
-            files = tuple(item for item in re.split(r"[;,]", raw_files) if item)
-            if not files:
-                valid = False
-                break
-            if configs is None:
-                configs = files
-                working_dir = raw_working
-                compose_project = raw_project
-            elif configs != files or working_dir != raw_working or compose_project != raw_project:
-                valid = False
-                break
-        if (valid and configs and working_dir and compose_project
-                and all(Path(compose_file).suffix.lower() == ".json" for compose_file in configs)):
-            parts = [
-                "docker", "compose", "--project-name", compose_project,
-                "--project-directory", working_dir,
-            ]
-            for compose_file in configs:
-                parts.extend(("-f", compose_file))
-            parts.append("down")
-            return " ".join(f'"{part}"' if any(character.isspace() for character in part) else part
-                            for part in parts)
-    # If a foreign/manual container has no trustworthy Compose provenance,
-    # stopping only the inspected IDs remains an exact, bounded operation.
-    return "docker stop " + " ".join(container_ids)
-
-
 def _assert_no_running_fullmag(
     project: str,
     source_identity: Mapping[str, object],
@@ -1919,9 +1856,9 @@ def _assert_no_running_fullmag(
             raise _fail(
                 "Fullmag Docker containers already exist for project " + project
                 + " (running or stopped): " + ", ".join(ordered)
-                + "; remove them explicitly with the recorded command: `"
-                + _compose_stop_hint(ordered)
-                + "` before `up`"
+                + "; use managed resume/recovery for this existing group. "
+                + "Stopping containers does not remove them or make a fresh up admissible. "
+                + "Services, volumes and user data were retained."
             )
         documents = _read_json_output(
             _docker_capture("inspect", *ordered, timeout=60),

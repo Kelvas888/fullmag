@@ -44,6 +44,24 @@ pub(crate) struct AcceptedLiveStudyPreparationError {
     pub message: String,
 }
 
+/// Return the immutable project identity captured by one accepted RunIntent.
+///
+/// Live API process identity is intentionally absent here: a restart gets a
+/// new `request_scope_instance_id`, while the accepted definition and every
+/// later catalog/preparation operation remain bound to this snapshot.
+pub(crate) fn accepted_project_id_from_intent(
+    intent: &fullmag_session::FmsRunIntent,
+    run_id: &fullmag_application::RunId,
+) -> anyhow::Result<fullmag_application::ProjectId> {
+    intent.validate()?;
+    let specification: fullmag_application::RunSpecification =
+        serde_json::from_value(intent.specification.clone())?;
+    if intent.run_id != run_id.as_str() || specification.run_id != *run_id {
+        anyhow::bail!("accepted RunIntent identity differs from the requested run");
+    }
+    Ok(specification.snapshot.project_id)
+}
+
 /// Immutable result of the expensive accepted-study preparation phase.
 ///
 /// This value contains no durable RunIntent publication. Python/Gmsh may have
@@ -552,13 +570,6 @@ pub(crate) async fn release_accepted_live_study_with_transition(
             "durable accepted live execution storage is not configured",
         ));
     };
-    let project_id = fullmag_application::ProjectId::parse(format!(
-        "project-live-{}",
-        fullmag_session::hex_sha256(
-            format!("{}\0{}", state.request_scope_instance_id, context.session_id).as_bytes()
-        )
-    ))
-    .map_err(|error| ApiError::internal(format!("live project identity is invalid: {error}")))?;
     let typed_run_id = fullmag_application::RunId::parse(run_id.clone())
         .map_err(|error| ApiError::internal(format!("live run identity is invalid: {error}")))?;
     // The public startup/command request id is retained in the live request,
@@ -584,6 +595,16 @@ pub(crate) async fn release_accepted_live_study_with_transition(
                     "accepted startup run has no durable RunIntent",
                 )
             })?;
+        let project_id = crate::live_accepted_execution::accepted_project_id_from_intent(
+            &intent,
+            &typed_run_id,
+        )
+        .map_err(|error| {
+            ApiError::conflict_with_code(
+                "accepted_run_snapshot_unavailable",
+                format!("accepted startup RunIntent is not typed: {error:#}"),
+            )
+        })?;
         let accepted = fullmag_runtime_control::load_accepted_study_snapshot(
             &store,
             &typed_run_id,
@@ -599,12 +620,13 @@ pub(crate) async fn release_accepted_live_study_with_transition(
         // opening the start gate. A malformed accepted run must remain held
         // for recovery instead of becoming runnable and only then surfacing
         // an API error.
-        store
-            .release_accepted_run_start(
+        retry_accepted_start_writer_operation(|| {
+            store.release_accepted_run_start(
                 typed_run_id.as_str(),
                 &intent.payload_sha256,
                 &release_request_id,
             )
+        })
             .map_err(|error| {
                 ApiError::conflict_with_code(
                     "accepted_run_start_release_conflict",
@@ -866,13 +888,6 @@ pub(crate) async fn ensure_live_accepted_study_with_transition(
             "durable accepted live execution storage is not configured",
         ));
     };
-    let project_id = fullmag_application::ProjectId::parse(format!(
-        "project-live-{}",
-        fullmag_session::hex_sha256(
-            format!("{}\0{}", state.request_scope_instance_id, context.session_id).as_bytes(),
-        )
-    ))
-    .map_err(|error| ApiError::internal(format!("live project identity is invalid: {error}")))?;
     let run_id_for_lookup = current_run_id.clone();
     let existing_accepted = tokio::task::spawn_blocking(move || {
         let store = open_submit_store(&store_root)?;
@@ -892,6 +907,16 @@ pub(crate) async fn ensure_live_accepted_study_with_transition(
         }
         let typed_run_id = fullmag_application::RunId::parse(run_id_for_lookup.clone())
             .map_err(|error| ApiError::conflict(format!("durable live run id is invalid: {error}")))?;
+        let project_id = crate::live_accepted_execution::accepted_project_id_from_intent(
+            &intent,
+            &typed_run_id,
+        )
+        .map_err(|error| {
+            ApiError::conflict_with_code(
+                "accepted_execution_run_invalid",
+                format!("accepted live RunIntent is not typed: {error:#}"),
+            )
+        })?;
         fullmag_runtime_control::load_accepted_study_snapshot(&store, &typed_run_id, &project_id)
             .map_err(|error| {
                 ApiError::conflict_with_code(
@@ -2055,6 +2080,16 @@ fn open_submit_store(
     })
 }
 
+/// Release is an idempotent durable gate operation: the first successful
+/// publication is retained and later calls replay its original grant.  Retry
+/// only the typed native writer collision around this exact operation; no
+/// RunIntent, preparation, or solver work is repeated here.
+fn retry_accepted_start_writer_operation<T>(
+    operation: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    fullmag_runtime_control::retry_store_writer_busy(operation)
+}
+
 fn exact_catalog_profile(
     catalog: &fullmag_session::execution_profiles::ExecutionProfileCatalog,
     reference: &fullmag_ir::ExecutionProfileIR,
@@ -2344,6 +2379,63 @@ mod tests {
         assert!(store
             .accepted_run_start_permitted(run_id)
             .expect("gate read"));
+    }
+
+    #[test]
+    fn accepted_start_release_retries_real_native_writer_contention() {
+        let directory = tempfile::tempdir().expect("temporary accepted store");
+        let store_root = directory.path().join("store");
+        let store = fullmag_session::SessionStore::open(&store_root).expect("accepted store");
+        let run_id = "run-held-retry";
+        let intent = fullmag_session::FmsRunIntent::new(
+            run_id,
+            "intent-held-retry",
+            serde_json::json!({
+                "run_id": run_id,
+                "parameters": {
+                    (fullmag_session::ACCEPTED_RUN_START_POLICY_KEY): {
+                        "schema_version": "accepted_run_start_policy.v1",
+                        "mode": "manual"
+                    }
+                }
+            }),
+        );
+        store.commit_run_intent(&intent).expect("accepted intent");
+
+        // Separate SessionStore handles do not share the in-process Writer;
+        // this therefore exercises the same native WRITER.lock conflict that
+        // the API sees when a runtime-control process is publishing.
+        let holder_store = fullmag_session::SessionStore::open_existing(&store_root)
+            .expect("holder store");
+        let probe_store = fullmag_session::SessionStore::open_existing(&store_root)
+            .expect("probe store");
+        let mut held = Some(holder_store.write_transaction().expect("held writer"));
+        let mut first_attempt = true;
+        let release = super::retry_accepted_start_writer_operation(|| {
+            let result = probe_store.release_accepted_run_start(
+                run_id,
+                &intent.payload_sha256,
+                "compute-retry",
+            );
+            if first_attempt {
+                first_attempt = false;
+                let native_busy = result.as_ref().err().is_some_and(|error| {
+                    error
+                        .chain()
+                        .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
+                });
+                assert!(native_busy, "first release must observe native writer contention");
+                drop(held.take());
+            }
+            result
+        })
+        .expect("bounded retry must release the accepted gate after the writer drops");
+
+        assert!(!first_attempt, "the test must exercise the initial busy attempt");
+        assert_eq!(release.run_id, run_id);
+        assert!(probe_store
+            .accepted_run_start_permitted(run_id)
+            .expect("released gate read"));
     }
 
     #[test]

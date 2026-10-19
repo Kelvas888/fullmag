@@ -27,6 +27,7 @@ from docker_build_control import (
     ControlOutcomeUnknown,
     bounded_capture,
     canonical,
+    control_read_script,
     docker_capture,
     toolchain_configuration,
 )
@@ -142,13 +143,7 @@ def _validate_frontend_stopped(actual: Mapping[str, object]) -> None:
 
 def _control_bytes(control: BuildControl, relative: str, *, optional: bool = False) -> bytes | None:
     path = control.path(relative)
-    parent = str(PurePosixPath(path).parent)
-    script = (
-        f"test -e '{path}' || exit 44; "
-        f"test \"$(readlink -f '{parent}')\" = '{parent}'; "
-        f"test -f '{path}'; test ! -L '{path}'; test $(stat -c %h '{path}') = 1; "
-        f"head -c {MAX_PROBE_BYTES + 1} '{path}'"
-    )
+    script = control_read_script(path, MAX_PROBE_BYTES)
     result = bounded_capture(control.helper_args(script), data=b"", timeout=90)
     if optional and result.returncode == 44:
         return None

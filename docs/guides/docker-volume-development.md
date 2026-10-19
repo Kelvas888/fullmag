@@ -117,7 +117,7 @@ restartu są oddzielone od autoryzacji recovery. Nie powstaje nowy request recov
 nie zmienia się historia i nie jest ponawiane Solve. Zachowywany jest oryginalny
 storage sesji; `fresh_state=true` pozostaje odrzucane.
 Nadzór startu odczytuje receipt PID 1 przez kanoniczne `runtime_service.process_receipt_path(canonical_paths())`, z technicznego wolumenu runtime-control. Potwierdzony `failed_outcome_retained` przerywa oczekiwanie na gotowość; nie czeka na pełny timeout i nie ponawia Solve.
-`just docker-dev-stop-failed <source> <container-id> <image-id> <process-receipt-sha256>` może zatrzymać również nadzorcę po nieudanym starcie native runtime. Wymaga zakończonego API, właściciela `failed`, obu schedulerów zakończonych poprawnie, braku żywych procesów i aktywnych lease’ów oraz zwolnionych rezerwacji hosta. Zapisuje dowód przed zatrzymaniem i weryfikuje niezmienionego właściciela po nim. Nie odzyskuje GPU, nie zmienia ownera i nie powtarza skryptu. Obserwacja nieznana lub aktywne zasoby blokują tę komendę.
+`just docker-dev-stop-failed <source> <container-id> <image-id> <process-receipt-sha256>` może zatrzymać również nadzorcę po nieudanym starcie native runtime. Obsługuje dwa jawne dowody: pierwotny błąd startu, gdzie oba schedulery muszą zakończyć się poprawnie, oraz błąd po wcześniejszym `READY`, gdzie retained `service_owner` pozostaje wyłącznie pinem tożsamości, a dziecko zakończone błędem jest dopuszczalne po potwierdzeniu jego braku. W obu wariantach wymagane są zakończone API, brak żywych procesów i aktywnych lease’ów oraz zwolnione rezerwacje hosta. Zapisuje dowód przed zatrzymaniem i weryfikuje niezmienionego ownera po nim. Nie odzyskuje GPU, nie zmienia ownera i nie powtarza skryptu. Obserwacja nieznana lub aktywne zasoby blokują tę komendę.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
 
 ### Aktywacja skryptu w już działającym Workspace
@@ -187,6 +187,21 @@ którego receipt ma stan `unknown`.
 
 Nieznany wynik operacji zachowuje zasoby i blokadę do jawnego rozstrzygnięcia.
 Nie usuwaj ręcznie `active`, pakietu ani lease, aby wymusić kolejny build.
+Jeżeli host utraci obserwację już po `READY`, a zarządzany stop potwierdzi
+zatrzymanie tego samego backendu po nieudanym native runtime, odtworzenie grupy
+może wykonać wyłącznie przypiętą reconciliację aktywacji. Sprawdza ona UUID
+aktywnej operacji, niezmieniony receipt `outcome-unknown-resources-retained`,
+source/config/image/backend, etykiety i polecenie oryginalnego helpera oraz
+`READY`/`LOGGED`. Helper dostaje techniczny terminal i sam usuwa `active` oraz
+zwalnia blokadę. Oryginalny receipt i marker pozostają nienaruszone, a
+`activation/unresolved.json` w control volume trwale blokuje nowe aktywacje i
+Solve; nie jest to dowód wyniku symulacji ani zgoda na ponowienie skryptu.
+Jeżeli oryginalny helper został już usunięty przez demona, ten wariant nie
+przejmuje go na podstawie timeoutu: wymaga osobnego dowodu `inspect`/`ps`, że
+jego dokładna nazwa jest nieobecna, a nowy krótkotrwały helper wykonuje pod
+`operation.lock` transakcję CAS na `active` i pierwotnym receipcie. Zmieniony
+marker, obca zajęta nazwa, cudzy lock lub niezgodny receipt pozostawiają
+quarantine i zasoby bez ręcznego czyszczenia.
 Launcher przyjmuje wynik dopiero po zdarzeniu `handoff` z bieżącego uruchomienia
 kontenera i zgodnym hashu receipt/provenance. Stary udany pakiet nie dowodzi
 zakończenia nowego startu. Nieoczekiwany restart kontenera między publikacją
