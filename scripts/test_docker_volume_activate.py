@@ -5,7 +5,7 @@ import json
 import hashlib
 import copy
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import tempfile
@@ -85,6 +85,51 @@ class DockerVolumeActivationTests(unittest.TestCase):
             (77.0, "/state/selected/activation.json"),
         )
 
+    def test_activation_contract_normalizes_windows_path_and_rejects_host_paths(self) -> None:
+        helper = SimpleNamespace(
+            STARTUP_ACTIVATION_TIMEOUT_SECONDS=17.0,
+            ACTIVATION_RECEIPT_PATH=PureWindowsPath(r"\state\selected\activation.json"),
+        )
+        self.assertEqual(
+            activate._activation_contract(helper),
+            (77.0, "/state/selected/activation.json"),
+        )
+        for marker in (
+            PureWindowsPath(r"C:\state\selected\activation.json"),
+            PureWindowsPath(r"\\server\share\activation.json"),
+            PureWindowsPath(r"\state\..\escape.json"),
+        ):
+            with self.subTest(marker=marker), self.assertRaises(BuildControlError):
+                activate._activation_contract(
+                    SimpleNamespace(
+                        STARTUP_ACTIVATION_TIMEOUT_SECONDS=17.0,
+                        ACTIVATION_RECEIPT_PATH=marker,
+                    )
+                )
+
+    def test_managed_receipt_contract_is_keyed_to_request_and_pinned_to_control(self) -> None:
+        def path_for_key(key):
+            return Path(
+                "/opt/fullmag/control/backend/script-activation-"
+                + key
+                + "/activation.json"
+            )
+
+        helper = SimpleNamespace(activation_receipt_path_for_key=path_for_key)
+        key, path = activate._managed_activation_receipt_contract(helper, "new-run")
+        self.assertEqual(key, hashlib.sha256(b"new-run").hexdigest())
+        self.assertEqual(
+            path,
+            "/opt/fullmag/control/backend/script-activation-"
+            + key
+            + "/activation.json",
+        )
+        invalid_helper = SimpleNamespace(
+            activation_receipt_path_for_key=lambda _key: Path("/tmp/activation.json")
+        )
+        with self.assertRaises(BuildControlError):
+            activate._managed_activation_receipt_contract(invalid_helper, "new-run")
+
     def test_non_object_receipts_fail_closed(self) -> None:
         control = SimpleNamespace(project="fullmag-worktree-demo")
         with self.assertRaises(BuildControlError):
@@ -101,6 +146,65 @@ class DockerVolumeActivationTests(unittest.TestCase):
         payload = b"diagnostic\n" + json.dumps({"state": "activated"}).encode() + b"\n"
         self.assertEqual(activate._json_result(payload)["state"], "activated")
         self.assertIsNone(activate._json_result(b"wrapper failed\n"))
+
+    def test_activation_inputs_keep_development_attempt_separate(self) -> None:
+        inputs = activate._activation_operation_inputs(
+            development_attempt="d" * 32,
+            config_sha256="c" * 64,
+            source_root="C:/git/fullmag",
+            image="sha256:" + "a" * 64,
+            source_relative="examples/model.py",
+            source_sha256="b" * 64,
+            request_id="request-1",
+            provenance_sha256="e" * 64,
+            backend_container="f" * 64,
+            activation_receipt_key="1" * 64,
+            activation_receipt_path="/opt/fullmag/control/backend/script-activation-"
+            + "1" * 64
+            + "/activation.json",
+        )
+        self.assertEqual(inputs["development_attempt"], "d" * 32)
+        self.assertNotIn("attempt", inputs)
+
+    def test_rejected_activation_is_terminal_failure_with_own_attempt(self) -> None:
+        operation = {
+            "daemon_pending": True,
+            "receipt": {"attempt": "a" * 32},
+        }
+        with self.assertRaisesRegex(BuildControlError, "activation was rejected"):
+            activate._record_activation_result(
+                operation,
+                {
+                    "state": "rejected",
+                    "rejection": {
+                        "http_status": 422,
+                        "code": "workspace_not_empty",
+                        "message": "workspace is not empty",
+                    },
+                },
+            )
+        self.assertFalse(operation["daemon_pending"])
+        self.assertEqual(operation["receipt"]["attempt"], "a" * 32)
+        self.assertEqual(operation["receipt"]["state"], "failed-confirmed")
+        self.assertEqual(operation["receipt"]["activation_state"], "rejected")
+
+    def test_activated_result_is_success(self) -> None:
+        operation = {
+            "daemon_pending": True,
+            "receipt": {"attempt": "a" * 32},
+        }
+        activate._record_activation_result(
+            operation,
+            {
+                "state": "activated",
+                "response": {"session_id": "session-1", "run_id": "run-1"},
+            },
+        )
+        self.assertFalse(operation["daemon_pending"])
+        self.assertEqual(operation["receipt"]["attempt"], "a" * 32)
+        self.assertEqual(operation["receipt"]["state"], "succeeded")
+        self.assertEqual(operation["receipt"]["activation_state"], "activated")
+        self.assertEqual(operation["receipt"]["session_id"], "session-1")
 
     def _linked_receipt_fixture(self, phase: str = "resume"):
         original_attempt = "a" * 32
@@ -177,7 +281,7 @@ class DockerVolumeActivationTests(unittest.TestCase):
             "services": {
                 "backend": {
                     "image": backend_image,
-                    "environment": {"FULLMAG_SOURCE_ROOT": "C:/git/fullmag"},
+                    "environment": {"FULLMAG_SOURCE_HOST_ROOT": "C:/git/fullmag"},
                     "volumes": [{
                         "type": "bind",
                         "source": "C:/git/fullmag",
@@ -338,6 +442,44 @@ class DockerVolumeActivationTests(unittest.TestCase):
         self.assertEqual(validator.call_args_list[1].args[2], "frontend")
         self.assertEqual(validator.call_args_list[1].args[3]["Cmd"], ["frontend-image"])
 
+    def test_retained_group_accepts_docker_desktop_host_mount_spelling(self) -> None:
+        fixture = self._retained_group_fixture()
+        control, identity, document, terminal, backend_image, compose, docker_text = fixture
+        document["services"]["backend"]["volumes"][0]["source"] = "/host_mnt/c/git/fullmag"
+        with patch.object(activate, "compose_capture", side_effect=compose), \
+                patch.object(activate, "_docker_text", side_effect=docker_text), \
+                patch("docker_volume_dev._validate_retained_service"):
+            result = activate._validate_running_group(
+                control, identity, document, terminal, backend_image,
+                source_root="C:/git/fullmag",
+            )
+        self.assertEqual(result, ("c" * 64, "d" * 64))
+
+    def test_retained_group_rejects_source_identity_mount_drift(self) -> None:
+        fixture = self._retained_group_fixture()
+        control, identity, document, terminal, backend_image, compose, docker_text = fixture
+        document["services"]["backend"]["environment"]["FULLMAG_SOURCE_HOST_ROOT"] = "C:/git/other"
+        with patch.object(activate, "compose_capture", side_effect=compose), \
+                patch.object(activate, "_docker_text", side_effect=docker_text), \
+                patch("docker_volume_dev._validate_retained_service"):
+            with self.assertRaisesRegex(BuildControlError, "differs from its readonly bind"):
+                activate._validate_running_group(
+                    control, identity, document, terminal, backend_image,
+                    source_root="C:/git/fullmag",
+                )
+
+    def test_retained_group_rejects_selected_source_drift(self) -> None:
+        fixture = self._retained_group_fixture()
+        control, identity, document, terminal, backend_image, compose, docker_text = fixture
+        with patch.object(activate, "compose_capture", side_effect=compose), \
+                patch.object(activate, "_docker_text", side_effect=docker_text), \
+                patch("docker_volume_dev._validate_retained_service"):
+            with self.assertRaisesRegex(BuildControlError, "differs from the selected source"):
+                activate._validate_running_group(
+                    control, identity, document, terminal, backend_image,
+                    source_root="C:/git/other",
+                )
+
     def test_retained_group_rejects_frontend_image_drift(self) -> None:
         wrong_frontend = "sha256:" + "e" * 64
         fixture = self._retained_group_fixture(frontend_image=wrong_frontend)
@@ -362,21 +504,26 @@ class DockerVolumeActivationTests(unittest.TestCase):
     def test_fixed_wrapper_loads_dataclass_helper_from_temp_image_path(self) -> None:
         helper = (
             "from dataclasses import dataclass\n"
+            "from pathlib import PurePosixPath\n"
+            "ACTIVATION_RECEIPT_PATH = PurePosixPath('/state/original/activation.json')\n"
+            "def activation_receipt_path_for_key(key):\n"
+            "    return PurePosixPath('/opt/fullmag/control/backend/script-activation-' + key + '/activation.json')\n"
             "@dataclass\n"
             "class Marker:\n"
             "    value: str\n"
             "def run_from_environment():\n"
-            "    return {'state': 'activated', 'marker': Marker('loaded').value}\n"
+            "    return {'state': 'activated', 'marker': Marker(str(ACTIVATION_RECEIPT_PATH)).value}\n"
         ).encode()
         with tempfile.TemporaryDirectory() as directory:
             helper_path = Path(directory) / "docker_startup_script.py"
             helper_path.write_bytes(helper)
             script = activate.FIXED_ACTIVATION_SCRIPT.replace(
                 "/opt/fullmag/docker_startup_script.py",
-                str(helper_path),
+                helper_path.as_posix(),
             )
             environment = {
                 "FULLMAG_STARTUP_HELPER_SHA256": hashlib.sha256(helper).hexdigest(),
+                "FULLMAG_STARTUP_RECEIPT_KEY": "a" * 64,
             }
             result = subprocess.run(
                 [sys.executable, "-I", "-B", "-c", script],
@@ -385,11 +532,26 @@ class DockerVolumeActivationTests(unittest.TestCase):
                 text=True,
                 check=False,
             )
+            invalid_environment = {**environment, "FULLMAG_STARTUP_RECEIPT_KEY": "A" * 64}
+            invalid = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", script],
+                env={**os.environ, **invalid_environment},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             json.loads(result.stdout),
-            {"state": "activated", "marker": "loaded"},
+            {
+                "state": "activated",
+                "marker": "/opt/fullmag/control/backend/script-activation-"
+                + "a" * 64
+                + "/activation.json",
+            },
         )
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("receipt key is missing or invalid", invalid.stderr)
 
 
 if __name__ == "__main__":

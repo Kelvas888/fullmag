@@ -62,6 +62,14 @@ just docker-dev-script `
   <attempt> <config-sha256> `
   <absolutny-checkout> `
   examples/fem_relax_gpu_smoke.py
+
+# Ten sam plik po potwierdzonym przejściu Workspace do pustego stanu:
+# jawne nowe żądanie
+just docker-dev-script `
+  <attempt> <config-sha256> `
+  <absolutny-checkout> `
+  examples/fem_relax_gpu_smoke.py `
+  run-20261019-02
 ```
 
 `attempt` i `config-sha256` muszą pochodzić z tego samego
@@ -80,10 +88,33 @@ kontenerze `backend`; kod wrappera jest częścią zarządzanej recepty i nie za
 a wrapper weryfikuje hash obrazu `docker_startup_script.py`, ładuje go i wywołuje
 `docker_startup_script.run_from_environment()`, które korzysta z wewnętrznego
 API live. API dopuszcza pusty bieżący Workspace albo dokładny replay
-tego samego `request_id` i hashów. `activation.json` pozostaje trwałym markerem:
-wynik `unknown` blokuje automatyczną próbę ponowienia. Domyślny `request_id` jest
-deterministyczny na podstawie próby i hasha pliku; dla replayu starego startupu
-można jawnie przekazać `request_id` jako piąty argument recepty.
+tego samego `request_id` i hashów. Dla nowego żądania helper najpierw odpytuje
+`GET /v2/platform/health` w tym samym backendzie i wymaga `status="ok"` oraz
+`active_session=false`; przy aktywnej albo nieznanej sesji nie tworzy markera i
+nie wysyła POST. Dokładny replay terminalnego receipt'u omija ten preflight,
+natomiast receipt ze stanem `started` nadal oznacza nieznany wynik i blokuje
+każdą próbę ponowienia.
+
+Każde żądanie ma własny trwały receipt w control volume:
+`/opt/fullmag/control/backend/script-activation-<sha256(request_id)>/activation.json`.
+Oryginalny entrypoint bez aktywacji zarządzanej zachowuje swój marker
+`/state/.fullmag/docker-startup/activation.json`; wrapper aktywacji ustawia
+per-request ścieżkę dopiero po zweryfikowaniu klucza 64 znaków hex. Receiptów
+nie kopiuje się do Windows storage i nie archiwizuje automatycznie.
+
+Odrzucenie skryptu jest wynikiem `failed-confirmed` operacji i kończy polecenie
+kodem 2; nie oznacza wykonania symulacji. Raport zachowuje osobno identyfikator
+operacji oraz `development_attempt`. Długi komunikat błędu pozostaje ograniczony
+do 2048 znaków, lecz zachowuje początek i końcową przyczynę tracebacku.
+
+Domyślny `request_id` jest deterministyczny na podstawie próby i hasha pliku:
+ten sam skrypt z tym samym domyślnym ID odtwarza terminalny wynik, a inny hash
+otrzymuje odrębny receipt. Nowe żądanie nadal przechodzi przez istniejącą
+walidację Workspace: musi być pusty według kontraktu API. Zamknięcie runu nie
+retiruje bieżącego Workspace, więc samo podanie nowego `request_id` jako piątego
+argumentu nie wystarcza; potrzebne jest istniejące, jawne przejście do pustego
+Workspace. Ten draft nie dodaje mechanizmu retire/reset. Nie używaj ponownie ID,
+którego receipt ma stan `unknown`.
 
 Nieznany wynik operacji zachowuje zasoby i blokadę do jawnego rozstrzygnięcia.
 Nie usuwaj ręcznie `active`, pakietu ani lease, aby wymusić kolejny build.

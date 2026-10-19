@@ -46,6 +46,53 @@ class DockerStartupScriptTests(unittest.TestCase):
             self.assertTrue(startup.STARTUP_ENDPOINT.startswith("/v1/internal/live/current/"))
             self.assertEqual(startup.MAX_SCRIPT_BYTES, 1024 * 1024)
 
+    def test_managed_receipt_path_is_deterministic_and_bounded(self) -> None:
+        key = "a" * 64
+        expected = Path("/opt/fullmag/control/backend/script-activation-" + key + "/activation.json")
+        self.assertEqual(startup.activation_receipt_path_for_key(key), expected)
+        for invalid in ("", "A" * 64, "../" + "a" * 61, "a" * 63):
+            with self.subTest(invalid=invalid), self.assertRaises(startup.StartupScriptError):
+                startup.activation_receipt_path_for_key(invalid)
+
+    def test_health_gate_accepts_only_a_definitive_empty_workspace(self) -> None:
+        class Response:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _maximum):
+                return json.dumps(self.payload).encode("utf-8")
+
+        for payload, accepted in (
+            ({"status": "ok", "active_session": False}, True),
+            ({"status": "ok", "active_session": True}, False),
+            ({"status": "ok", "active_session": None}, False),
+            ({"status": "degraded", "active_session": False}, False),
+        ):
+            opener = mock.Mock()
+            opener.open.return_value = Response(payload)
+            with self.subTest(payload=payload), mock.patch.object(
+                startup.urllib.request, "build_opener", return_value=opener
+            ):
+                if accepted:
+                    self.assertEqual(
+                        startup._assert_no_active_session("http://127.0.0.1:8081"),
+                        payload,
+                    )
+                else:
+                    with self.assertRaises(startup.StartupScriptError):
+                        startup._assert_no_active_session("http://127.0.0.1:8081")
+            request = opener.open.call_args.args[0]
+            self.assertEqual(request.full_url, "http://127.0.0.1:8081/v2/platform/health")
+            self.assertEqual(request.get_method(), "GET")
+
     def test_prepare_rejects_symlink_and_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -355,8 +402,12 @@ class StartupRejectionTests(unittest.TestCase):
         self.receipt_path = Path(self.receipt_directory.name) / "activation.json"
         self.receipt_patch = mock.patch.object(startup, "ACTIVATION_RECEIPT_PATH", self.receipt_path)
         self.receipt_patch.start()
+        self.health_patch = mock.patch.object(startup, "_assert_no_active_session")
+        self.health_check = self.health_patch.start()
+        self.health_check.return_value = {"status": "ok", "active_session": False}
 
     def tearDown(self):
+        self.health_patch.stop()
         self.receipt_patch.stop()
         self.receipt_directory.cleanup()
 
@@ -465,6 +516,22 @@ class StartupRejectionTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(startup.StartupScriptError):
                 startup.validate_rejection_receipt(altered, authorization)
 
+    def test_long_rejection_preserves_traceback_start_and_final_cause(self):
+        short = "unsupported mixed-P1 configuration"
+        self.assertEqual(startup.StartupScriptRejected(422, "validation_error", short).message, short)
+
+        prefix = 'Traceback (most recent call last):\n  File "/opt/fullmag/runner.py", line 42, in solve\n'
+        final_cause = "RuntimeError: final native solver cause"
+        rejection = startup.StartupScriptRejected(
+            422,
+            "validation_error",
+            prefix + ("detail from an intermediate frame\n" * 200) + final_cause,
+        )
+        self.assertLessEqual(len(rejection.message), startup.MAX_STARTUP_REJECTION_MESSAGE_CHARS)
+        self.assertTrue(rejection.message.startswith(prefix))
+        self.assertIn(startup.STARTUP_REJECTION_TRUNCATION_MARKER, rejection.message)
+        self.assertTrue(rejection.message.endswith(final_cause))
+
     def test_infrastructure_and_provenance_failures_remain_fatal(self):
         authorization = self.authorization()
         with self.run_environment(), mock.patch.object(
@@ -537,6 +604,9 @@ class ActivationReceiptTests(unittest.TestCase):
         self.receipt_path = Path(self.receipt_directory.name) / "activation.json"
         self.receipt_patch = mock.patch.object(startup, "ACTIVATION_RECEIPT_PATH", self.receipt_path)
         self.receipt_patch.start()
+        self.health_patch = mock.patch.object(startup, "_assert_no_active_session")
+        self.health_check = self.health_patch.start()
+        self.health_check.return_value = {"status": "ok", "active_session": False}
         self.source_bytes = b"script"
         self.authorization = {
             "schema": startup.AUTHORIZATION_SCHEMA,
@@ -551,6 +621,7 @@ class ActivationReceiptTests(unittest.TestCase):
         self.provenance_sha256 = "a" * 64
 
     def tearDown(self):
+        self.health_patch.stop()
         self.receipt_patch.stop()
         self.receipt_directory.cleanup()
 
@@ -570,11 +641,14 @@ class ActivationReceiptTests(unittest.TestCase):
         raise AssertionError(f"unexpected bounded read: {label}")
 
     def response(self):
+        return self.response_for(self.authorization)
+
+    def response_for(self, authorization):
         return {
             "schema": startup.RESPONSE_SCHEMA,
             "authorization": startup.AUTHORIZATION_KIND,
-            "request_id": self.authorization["request_id"],
-            "source_sha256": self.authorization["source_sha256"],
+            "request_id": authorization["request_id"],
+            "source_sha256": authorization["source_sha256"],
             "status": "accepted",
             "session_id": "session-startup-receipt-test",
             "run_id": "run-startup-receipt-test",
@@ -606,6 +680,9 @@ class ActivationReceiptTests(unittest.TestCase):
         self.assertEqual(durable["provenance_sha256"], self.provenance_sha256)
         self.assertEqual(durable["source_sha256"], self.authorization["source_sha256"])
         self.source_bytes = b"changed-script"
+        self.health_check.side_effect = startup.StartupScriptError(
+            "active session should not be consulted for a terminal replay"
+        )
         def no_script_read(path, _maximum, label):
             if label == "startup activation receipt":
                 return self.receipt_path.read_bytes()
@@ -617,6 +694,83 @@ class ActivationReceiptTests(unittest.TestCase):
         ) as activate:
             replay = startup.run_from_environment()
         self.assertEqual(replay, first)
+        activate.assert_not_called()
+
+    def test_two_distinct_requests_use_distinct_receipts_when_health_reports_no_active_session(self):
+        root = Path(self.receipt_directory.name) / "control" / "backend"
+        root.mkdir(parents=True)
+        authorization_one = self.authorization
+        authorization_two = {
+            **authorization_one,
+            "request_id": "startup-receipt-test-two",
+            "source_sha256": hashlib.sha256(b"script-two").hexdigest(),
+            "source_size_bytes": len(b"script-two"),
+        }
+        provenance_one = "a" * 64
+        provenance_two = "b" * 64
+        requests = (
+            (authorization_one, b"script", provenance_one),
+            (authorization_two, b"script-two", provenance_two),
+        )
+        with mock.patch.object(startup, "STARTUP_RECEIPT_ROOT", root):
+            paths = [
+                startup.activation_receipt_path_for_key(
+                    hashlib.sha256(authorization["request_id"].encode()).hexdigest()
+                )
+                for authorization, _source, _provenance in requests
+            ]
+            for authorization, source_bytes, provenance_sha256 in requests:
+                receipt_path = startup.activation_receipt_path_for_key(
+                    hashlib.sha256(authorization["request_id"].encode()).hexdigest()
+                )
+                self.health_check.reset_mock()
+                with mock.patch.object(startup, "ACTIVATION_RECEIPT_PATH", receipt_path), \
+                        self.environment_for(authorization, provenance_sha256), \
+                        mock.patch.object(
+                            startup, "_load_provenance_with_digest",
+                            return_value=(authorization, provenance_sha256),
+                        ), \
+                        mock.patch.object(
+                            startup, "_bounded_regular",
+                            side_effect=lambda path, _maximum, label: (
+                                Path(path).read_bytes()
+                                if label == "startup activation receipt"
+                                else source_bytes
+                                if label == "mounted startup script"
+                                else (_ for _ in ()).throw(AssertionError(label))
+                            ),
+                        ), \
+                        mock.patch.object(
+                            startup, "activate", side_effect=lambda auth, **_: self.response_for(auth)
+                        ) as activate:
+                    result = startup.run_from_environment()
+                self.assertEqual(result["state"], "activated")
+                self.assertEqual(activate.call_count, 1)
+                self.health_check.assert_called_once_with("http://127.0.0.1:8081")
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertTrue(paths[0].exists())
+        self.assertTrue(paths[1].exists())
+
+    def environment_for(self, authorization, provenance_sha256):
+        return mock.patch.dict(os.environ, {
+            "FULLMAG_STARTUP_ENABLED": "1",
+            "FULLMAG_STARTUP_SCRIPT": authorization["container_script_path"],
+            "FULLMAG_STARTUP_PROVENANCE": "/run/fullmag/startup-provenance.json",
+            startup.PROVENANCE_SHA256_ENV: provenance_sha256,
+        }, clear=True)
+
+    def test_active_session_refuses_new_request_before_started_marker(self):
+        self.health_check.side_effect = startup.StartupScriptError(
+            "backend has an active or unknown session"
+        )
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup, "activate",
+        ) as activate:
+            with self.assertRaisesRegex(startup.StartupScriptError, "active or unknown"):
+                startup.run_from_environment()
+        self.assertFalse(self.receipt_path.exists())
         activate.assert_not_called()
 
     def test_started_receipt_blocks_unknown_post_retry(self):
@@ -631,6 +785,7 @@ class ActivationReceiptTests(unittest.TestCase):
         self.assertEqual(caught.exception.diagnostic["durable_state"], "started")
         self.assertEqual(caught.exception.diagnostic["request_id"], self.authorization["request_id"])
         activate.assert_called_once()
+        self.health_check.reset_mock()
         with self.environment(), mock.patch.object(
             startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
         ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
@@ -640,6 +795,7 @@ class ActivationReceiptTests(unittest.TestCase):
                 startup.run_from_environment()
         self.assertIn("prevents a retry", replay.exception.diagnostic["error"])
         activate.assert_not_called()
+        self.health_check.assert_not_called()
 
     def test_marker_fsync_failure_is_fatal_without_post_or_unknown(self):
         with self.environment(), mock.patch.object(

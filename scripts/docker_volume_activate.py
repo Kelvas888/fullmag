@@ -12,8 +12,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 import re
 import sys
 
@@ -67,6 +68,14 @@ if spec is None or spec.loader is None:
 helper = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = helper
 spec.loader.exec_module(helper)
+receipt_key = os.environ.get("FULLMAG_STARTUP_RECEIPT_KEY")
+if receipt_key is not None:
+    if len(receipt_key) != 64 or any(character not in "0123456789abcdef" for character in receipt_key):
+        raise RuntimeError("startup receipt key is missing or invalid")
+    path_for_key = getattr(helper, "activation_receipt_path_for_key", None)
+    if not callable(path_for_key):
+        raise RuntimeError("startup helper has no managed receipt-path contract")
+    helper.ACTIVATION_RECEIPT_PATH = path_for_key(receipt_key)
 try:
     result = helper.run_from_environment()
 except Exception as error:
@@ -130,17 +139,51 @@ def _authorization_bytes(startup_helper, authorization: Mapping[str, object]) ->
     return payload
 
 
+def _posix_container_path(value: object, *, label: str) -> str:
+    """Render an image path with POSIX separators and reject host paths."""
+    if not isinstance(value, (str, PurePath)):
+        raise BuildControlError(f"{label} is not a valid path object")
+    try:
+        path = value if isinstance(value, PurePath) else PurePath(value)
+        rendered = path.as_posix()
+    except (OSError, TypeError, ValueError) as error:
+        raise BuildControlError(f"{label} is not a valid path") from error
+    if (
+        not rendered.startswith("/")
+        or rendered.startswith("//")
+        or "\x00" in rendered
+        or len(rendered) > 1024
+        or any(part == ".." for part in PurePosixPath(rendered).parts)
+    ):
+        raise BuildControlError(f"{label} is not a valid POSIX container path")
+    return rendered
+
+
 def _activation_contract(startup_helper) -> tuple[float, str]:
     timeout = getattr(startup_helper, "STARTUP_ACTIVATION_TIMEOUT_SECONDS", None)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3600:
         raise BuildControlError("Selected startup helper has an invalid activation timeout")
     marker = getattr(startup_helper, "ACTIVATION_RECEIPT_PATH", None)
-    if not isinstance(marker, (str, Path)):
+    if not isinstance(marker, (str, PurePath)):
         raise BuildControlError("Selected startup helper has no activation receipt path")
-    marker = str(marker)
-    if not marker.startswith("/") or "\x00" in marker or len(marker) > 1024:
-        raise BuildControlError("Selected startup helper has an invalid activation receipt path")
+    marker = _posix_container_path(marker, label="Selected startup helper activation receipt path")
     return float(timeout) + 60, marker
+
+
+def _managed_activation_receipt_contract(startup_helper, request_id: str) -> tuple[str, str]:
+    key = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    path_for_key = getattr(startup_helper, "activation_receipt_path_for_key", None)
+    if not callable(path_for_key):
+        raise BuildControlError("Selected startup helper has no managed receipt-path contract")
+    try:
+        candidate = path_for_key(key)
+    except Exception as error:
+        raise BuildControlError(f"Selected startup helper rejected the receipt key: {error}") from error
+    rendered = _posix_container_path(candidate, label="Selected startup helper receipt path")
+    expected = "/opt/fullmag/control/backend/script-activation-" + key + "/activation.json"
+    if rendered != expected:
+        raise BuildControlError("Selected startup helper receipt path differs from the managed namespace")
+    return key, rendered
 
 
 def _one_container(document: Mapping[str, object], service: str) -> str:
@@ -151,12 +194,34 @@ def _one_container(document: Mapping[str, object], service: str) -> str:
     return identifiers[0]
 
 
+def _canonical_host_path(value: object) -> str:
+    """Normalize the two host-side spellings used by Compose and Docker."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    normalized = value.strip().replace("\\", "/")
+    for prefix in ("/host_mnt/", "/run/desktop/mnt/host/"):
+        if normalized.casefold().startswith(prefix) and len(normalized) > len(prefix):
+            drive = normalized[len(prefix)]
+            if drive.isalpha() and normalized[len(prefix) + 1 : len(prefix) + 2] == "/":
+                normalized = drive.upper() + ":" + normalized[len(prefix) + 1 :]
+                break
+    return os.path.normcase(os.path.normpath(normalized)).replace("\\", "/")
+
+
+def _same_host_path(left: object, right: object) -> bool:
+    left_key = _canonical_host_path(left)
+    right_key = _canonical_host_path(right)
+    return bool(left_key and right_key and left_key == right_key)
+
+
 def _validate_running_group(
     control: BuildControl,
     identity: Mapping[str, str],
     document: Mapping[str, object],
     terminal: Mapping[str, object],
     image: str,
+    *,
+    source_root: str | None = None,
 ) -> tuple[str, str]:
     if not isinstance(document, Mapping):
         raise BuildControlError("Retained Compose configuration is not an object")
@@ -223,8 +288,15 @@ def _validate_running_group(
     if not isinstance(source_mount, Mapping) or source_mount.get("type") != "bind" or not source_mount.get("read_only"):
         raise BuildControlError("Retained backend source is not a readonly bind")
     environment = backend_document.get("environment", {})
-    if not isinstance(environment, Mapping) or environment.get("FULLMAG_SOURCE_ROOT") is None:
+    if not isinstance(environment, Mapping):
         raise BuildControlError("Retained backend source identity is missing")
+    source_identity = environment.get("FULLMAG_SOURCE_HOST_ROOT")
+    if not isinstance(source_identity, str) or not source_identity.strip():
+        raise BuildControlError("Retained backend source identity is missing")
+    if not _same_host_path(source_mount.get("source"), source_identity):
+        raise BuildControlError("Retained backend source identity differs from its readonly bind")
+    if source_root is not None and not _same_host_path(source_identity, source_root):
+        raise BuildControlError("Retained backend source differs from the selected source")
     if (
         json.loads(_docker_text("inspect", ids["backend"]))[0]
         .get("State", {})
@@ -377,6 +449,7 @@ def _run_fixed_activation(
     helper_sha256: str,
     activation_timeout_seconds: float,
     activation_receipt_path: str,
+    activation_receipt_key: str,
 ) -> dict[str, object]:
     environment = (
         "FULLMAG_STARTUP_ENABLED=1",
@@ -384,6 +457,7 @@ def _run_fixed_activation(
         "FULLMAG_STARTUP_PROVENANCE=" + provenance_path,
         "FULLMAG_STARTUP_PROVENANCE_SHA256=" + provenance_sha256,
         "FULLMAG_STARTUP_HELPER_SHA256=" + helper_sha256,
+        "FULLMAG_STARTUP_RECEIPT_KEY=" + activation_receipt_key,
         "FULLMAG_STARTUP_API=http://127.0.0.1:8081",
     )
     result = docker_capture(
@@ -423,6 +497,57 @@ def _run_fixed_activation(
         )
     detail = output.decode("utf-8", "replace")[-4096:]
     raise BuildControlError(f"Backend activation wrapper failed: {detail}")
+
+
+def _activation_operation_inputs(
+    *,
+    development_attempt: str,
+    config_sha256: str,
+    source_root: str,
+    image: str,
+    source_relative: str,
+    source_sha256: str,
+    request_id: str,
+    provenance_sha256: str,
+    backend_container: str,
+    activation_receipt_key: str,
+    activation_receipt_path: str,
+) -> dict[str, str]:
+    """Build activation inputs without colliding with operation.attempt."""
+    return {
+        "development_attempt": development_attempt,
+        "config_sha256": config_sha256,
+        "source_root": source_root,
+        "image_id": image,
+        "source_relative": source_relative,
+        "source_sha256": source_sha256,
+        "request_id": request_id,
+        "provenance_sha256": provenance_sha256,
+        "backend_container": backend_container,
+        "activation_receipt_key": activation_receipt_key,
+        "activation_receipt_path": activation_receipt_path,
+    }
+
+
+def _record_activation_result(operation: dict[str, object], result: Mapping[str, object]) -> None:
+    """Commit a known activation result and fail the host command on rejection."""
+    if not isinstance(result, Mapping) or result.get("state") not in {"activated", "rejected"}:
+        raise BuildControlError("Backend activation wrapper returned an invalid terminal result")
+    receipt = operation.get("receipt")
+    if not isinstance(receipt, dict):
+        raise BuildControlError("Activation operation receipt is missing")
+    operation["daemon_pending"] = False
+    response = result.get("response")
+    receipt.update(
+        state="succeeded" if result["state"] == "activated" else "failed-confirmed",
+        activation_state=result["state"],
+        session_id=response.get("session_id") if isinstance(response, Mapping) else None,
+        run_id=response.get("run_id") if isinstance(response, Mapping) else None,
+    )
+    if result["state"] == "rejected":
+        raise BuildControlError(
+            "Backend activation was rejected; terminal activation receipt retained and retry is forbidden"
+        )
 
 
 def activate(args: argparse.Namespace) -> None:
@@ -473,7 +598,8 @@ def activate(args: argparse.Namespace) -> None:
     for runtime_terminal in runtime_terminals:
         try:
             backend_id, frontend_id = _validate_running_group(
-                control, identity, document, runtime_terminal, image
+                control, identity, document, runtime_terminal, image,
+                source_root=str(selected),
             )
             break
         except BuildControlError as error:
@@ -485,7 +611,7 @@ def activate(args: argparse.Namespace) -> None:
     from docker_volume_dev import _startup_helper
 
     startup_helper, helper_hashes = _startup_helper(control, selected, image)
-    activation_timeout_seconds, activation_receipt_path = _activation_contract(startup_helper)
+    activation_timeout_seconds, _original_activation_receipt_path = _activation_contract(startup_helper)
     source_commit = storage.git(selected, "rev-parse", "HEAD")
     probe_request_id = args.request_id or f"docker-volume-{args.attempt}-probe"
     authorization = startup_helper.prepare(
@@ -502,21 +628,26 @@ def activate(args: argparse.Namespace) -> None:
             request_id=request_id,
             source_commit=source_commit,
         )
+    activation_receipt_key, activation_receipt_path = _managed_activation_receipt_contract(
+        startup_helper, authorization.request_id
+    )
     authorization_document = authorization.as_dict()
     provenance = _authorization_bytes(startup_helper, authorization_document)
     provenance_sha256 = hashlib.sha256(provenance).hexdigest()
 
-    inputs = {
-        "attempt": args.attempt,
-        "config_sha256": args.config_sha256,
-        "source_root": str(selected),
-        "image_id": image,
-        "source_relative": authorization.source_relative,
-        "source_sha256": authorization.source_sha256,
-        "request_id": authorization.request_id,
-        "provenance_sha256": provenance_sha256,
-        "backend_container": backend_id,
-    }
+    inputs = _activation_operation_inputs(
+        development_attempt=args.attempt,
+        config_sha256=args.config_sha256,
+        source_root=str(selected),
+        image=image,
+        source_relative=authorization.source_relative,
+        source_sha256=authorization.source_sha256,
+        request_id=authorization.request_id,
+        provenance_sha256=provenance_sha256,
+        backend_container=backend_id,
+        activation_receipt_key=activation_receipt_key,
+        activation_receipt_path=activation_receipt_path,
+    )
     with control.operation("activation", inputs) as operation:
         operation["receipt"].update(inputs, state="preparing")
         provenance_relative = operation["root"] + "/startup-provenance.json"
@@ -537,6 +668,7 @@ def activate(args: argparse.Namespace) -> None:
                 helper_sha256=helper_hashes["docker_startup_script.py"],
                 activation_timeout_seconds=activation_timeout_seconds,
                 activation_receipt_path=activation_receipt_path,
+                activation_receipt_key=activation_receipt_key,
             )
         except ControlOutcomeUnknown:
             raise
@@ -547,13 +679,7 @@ def activate(args: argparse.Namespace) -> None:
         # Keep the lease pending until the terminal technical receipt is
         # durable.  A committed API result with a failed receipt publication
         # must not look like a safe retry.
-        operation["daemon_pending"] = False
-        operation["receipt"].update(
-            state="succeeded",
-            activation_state=result["state"],
-            session_id=result.get("response", {}).get("session_id") if isinstance(result.get("response"), dict) else None,
-            run_id=result.get("response", {}).get("run_id") if isinstance(result.get("response"), dict) else None,
-        )
+        _record_activation_result(operation, result)
 
 
 def _parser() -> argparse.ArgumentParser:
