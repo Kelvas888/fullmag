@@ -14,7 +14,12 @@ from docker_build_control import (
 from docker_compose_identity import compose_project_identity, validate_source_labels
 
 
-def _validate_offline_result(value, modules):
+BASE_IMPLEMENTATIONS = ('docker_build_control', 'docker_volume_dev', 'docker_volume_activate',
+                        'docker_volume_stop_failed', 'docker_volume_checks')
+OPTIONAL_IMPLEMENTATIONS = ('docker_volume_activation_reconcile',)
+
+
+def _validate_offline_result(value, modules, *, implementations=BASE_IMPLEMENTATIONS):
     expected = {'exit_code', 'source_inputs_stable', 'source_files',
                 'source_mount_readonly', 'control_mount_writable', 'tmpdir', 'stdout', 'stderr'}
     if not isinstance(value, dict) or set(value) != expected:
@@ -40,9 +45,7 @@ def _validate_offline_result(value, modules):
                 or '..' in path.parts or path.suffix != '.py'
                 or not isinstance(digest, str) or re.fullmatch(r'[0-9a-f]{64}', digest) is None):
             raise BuildControlError('Offline check source hash is invalid')
-    required = set(modules) | {'docker_build_control', 'docker_volume_dev', 'docker_volume_activate',
-                               'docker_volume_activation_reconcile', 'docker_volume_stop_failed',
-                               'docker_volume_checks'}
+    required = set(modules) | set(implementations)
     if any('/opt/fullmag/source/scripts/' + name + '.py' not in files for name in required):
         raise BuildControlError('Offline check source hashes omit required modules')
     return value
@@ -68,6 +71,9 @@ def _offline_checks(control, selected, observed, modules):
     # executable image, not the project, source identity, or control volume.
     if probe.volume != control.volume:
         raise BuildControlError('Offline checks changed the control volume')
+    implementations = list(BASE_IMPLEMENTATIONS)
+    implementations += [name for name in OPTIONAL_IMPLEMENTATIONS
+                        if (selected / 'scripts' / (name + '.py')).is_file()]
     code = r'''import hashlib,json,os,pathlib,subprocess,sys
 root=pathlib.Path('/control/verification/offline-check-tmp')
 root.mkdir(parents=True,exist_ok=True)
@@ -81,7 +87,7 @@ environment.update(TMPDIR=str(root),PYTHONDONTWRITEBYTECODE='1',HOME=str(root/'h
 pathlib.Path(environment['HOME']).mkdir(exist_ok=True)
 modules=json.loads(sys.argv[1])
 paths=[pathlib.Path('/opt/fullmag/source/scripts')/(name+'.py') for name in modules]
-paths += [pathlib.Path('/opt/fullmag/source/scripts')/name for name in ('docker_build_control.py','docker_volume_dev.py','docker_volume_activate.py','docker_volume_activation_reconcile.py','docker_volume_stop_failed.py','docker_volume_checks.py')]
+paths += [pathlib.Path('/opt/fullmag/source/scripts')/(name+'.py') for name in json.loads(sys.argv[2])]
 def hashes():
     return {str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 before=hashes()
@@ -89,7 +95,8 @@ result=subprocess.run([sys.executable,'-B','-m','unittest',*modules],cwd='/opt/f
 after=hashes()
 print(json.dumps({'exit_code':result.returncode if before==after else 2,'source_inputs_stable':before==after,'source_files':before,'source_mount_readonly':source_ro,'control_mount_writable':control_rw,'tmpdir':str(root),'stdout':result.stdout.decode('utf8','replace'),'stderr':result.stderr.decode('utf8','replace')}))
 '''
-    command = '/usr/local/bin/python3 -B -c ' + shlex.quote(code) + ' ' + shlex.quote(json.dumps(modules))
+    command = ('/usr/local/bin/python3 -B -c ' + shlex.quote(code) + ' ' + shlex.quote(json.dumps(modules))
+               + ' ' + shlex.quote(json.dumps(implementations)))
     helper_name = 'fullmag-checks-' + uuid.uuid4().hex
     arguments = probe.helper_args(command, name=helper_name)
     # Windows Docker accepts the native drive path as a single argv value.
@@ -116,7 +123,7 @@ print(json.dumps({'exit_code':result.returncode if before==after else 2,'source_
                        stderr=result.stderr.decode('utf8','replace')[-4096:])
     else:
         try:
-            receipt.update(_validate_offline_result(json.loads(result.stdout), modules))
+            receipt.update(_validate_offline_result(json.loads(result.stdout), modules, implementations=implementations))
         except (ValueError, UnicodeError, BuildControlError) as error:
             receipt.update(exit_code=2, error=str(error),
                            helper_stdout=result.stdout.decode('utf8','replace')[-4096:],
