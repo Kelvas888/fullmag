@@ -231,7 +231,7 @@ class DockerDevDefaultsTests(unittest.TestCase):
         for body, expected in (
             ("up  --gpu-access 'auto'", ["up", "--gpu-access", "auto"]),
             ("up --port '32900' --gpu-access 'required' --source-root '/selected source' --script 'examples/a.py'",
-             ["up", "--gpu-access", "required", "--port", "32900", "--source-root", "/selected source", "--script", "examples/a.py"]),
+             ["up", "--port", "32900", "--gpu-access", "required", "--source-root", "/selected source", "--script", "examples/a.py"]),
             ("script --script 'examples/a.py'", ["script", "--script", "examples/a.py"]),
         ):
             result = subprocess.run(["bash", str(root / "scripts/just_storage_shell.sh"), prefix + body],

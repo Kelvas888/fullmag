@@ -202,8 +202,9 @@ case "${recipe}" in
         docker_dev_args+=(--source-root "${BASH_REMATCH[3]}")
       fi
     elif [[ "${recipe}" =~ ${docker_dev_up_pattern} ]]; then
-      docker_dev_args+=(up --gpu-access "${BASH_REMATCH[3]}")
+      docker_dev_args+=(up)
       if [[ -n "${BASH_REMATCH[2]:-}" ]]; then docker_dev_args+=(--port "${BASH_REMATCH[2]}"); fi
+      docker_dev_args+=(--gpu-access "${BASH_REMATCH[3]}")
       if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
         docker_dev_args+=(--source-root "${BASH_REMATCH[5]}")
       fi

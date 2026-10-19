@@ -8,8 +8,10 @@ import tempfile
 import os
 import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import docker_dev_defaults as defaults
 import setup_docker as setup
 
 
@@ -108,7 +110,7 @@ class SetupDockerChecks(unittest.TestCase):
             (main / ".env").write_bytes(original)
             context = {"repo": main, "main": main, "project": base, "checkouts": [main]}
             checks = {"platform": "windows", "docker_os": {"value": "linux"}}
-            with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "host_checks", return_value=checks), patch.object(setup, "show_checks"), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "host_checks", return_value=checks), patch.object(setup, "show_checks"), patch.object(setup, "runtime_defaults", return_value=SimpleNamespace(source_root=main, port=3197)), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(setup.main(["--check"]), 2)
             self.assertEqual((main / ".env").read_bytes(), original)
             self.assertEqual(sorted(p.name for p in main.iterdir()), [".env"])
@@ -168,9 +170,97 @@ class SetupDockerChecks(unittest.TestCase):
     def test_cancel_is_readonly(self):
         context = {"repo": Path("/repo"), "main": Path("/repo")}
         checks = {"platform": "windows"}
-        with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "host_checks", return_value=checks), patch.object(setup, "show_checks"), patch.object(setup.sys.stdin, "isatty", return_value=True), patch.object(setup, "plan", return_value={"env_path": "/repo/.env", "storage_root": "/storage", "source_root": "/repo", "port": 3197}), patch("builtins.input", side_effect=["/storage", "", "", "n"]), patch.object(setup, "apply_configuration") as apply, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "host_checks", return_value=checks), patch.object(setup, "show_checks"), patch.object(setup, "runtime_defaults", return_value=SimpleNamespace(source_root=Path("/repo"), port=3197)), patch.object(setup.sys.stdin, "isatty", return_value=True), patch.object(setup, "plan", return_value={"env_path": "/repo/.env", "storage_root": "/storage", "source_root": "/repo", "port": 3197}), patch("builtins.input", side_effect=["/storage", "", "", "n"]), patch.object(setup, "apply_configuration") as apply, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(setup.main([]), 0)
             apply.assert_not_called()
+
+    def test_runtime_defaults_uses_shared_source_and_port_resolver(self):
+        expected = SimpleNamespace(source_root=Path("/worktree"), port=4321)
+        with patch.object(defaults, "resolve_defaults", return_value=expected) as resolver:
+            self.assertIs(
+                setup.runtime_defaults(Path("/repo"), source_root="/worktree", port=4321),
+                expected,
+            )
+        resolver.assert_called_once_with(
+            Path("/repo"), source_root="/worktree", port=4321,
+        )
+
+    def test_runtime_defaults_preserves_dotenv_then_legacy_host_settings_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main, worktree = root / "main", root / "worktree"
+            main.mkdir()
+            worktree.mkdir()
+            known = (main, worktree)
+            with patch.object(defaults, "_known_checkouts", return_value=known), \
+                    patch.object(defaults, "_read_dotenv", return_value={
+                        "FULLMAG_SOURCE_ROOT": str(worktree), "FULLMAG_HTTP_PORT": "4321",
+                    }), \
+                    patch.object(defaults, "_read_host_settings", return_value={
+                        "source_root": str(main), "http_port": 4999,
+                    }):
+                selected = setup.runtime_defaults(main)
+            self.assertEqual(selected.source_root, worktree)
+            self.assertEqual(selected.port, 4321)
+
+            with patch.object(defaults, "_known_checkouts", return_value=known), \
+                    patch.object(defaults, "_read_dotenv", return_value={}), \
+                    patch.object(defaults, "_read_host_settings", return_value={
+                        "source_root": str(worktree), "http_port": 4999,
+                    }):
+                fallback = setup.runtime_defaults(main)
+            self.assertEqual(fallback.source_root, worktree)
+            self.assertEqual(fallback.port, 4999)
+
+            for invalid in (
+                {"FULLMAG_SOURCE_ROOT": str(root / "missing")},
+                {"FULLMAG_HTTP_PORT": "80"},
+            ):
+                with self.subTest(invalid=invalid), \
+                        patch.object(defaults, "_known_checkouts", return_value=known), \
+                        patch.object(defaults, "_read_dotenv", return_value=invalid), \
+                        patch.object(defaults, "_read_host_settings", return_value={}):
+                    with self.assertRaises(setup.SetupError):
+                        setup.runtime_defaults(main)
+
+    def test_second_configuration_preserves_resolved_source_and_port_defaults(self):
+        context = {
+            "repo": Path("/repo"), "main": Path("/repo"),
+            "project": Path("/"), "checkouts": [Path("/repo"), Path("/worktree")],
+        }
+        checks = {"platform": "windows"}
+        resolved = SimpleNamespace(source_root=Path("/worktree"), port=4321)
+        prepared = {
+            "env_path": "/repo/.env", "storage_root": "/storage",
+            "source_root": "/worktree", "port": 4321,
+        }
+        with patch.object(setup, "checkout_context", return_value=context), \
+                patch.object(setup, "host_checks", return_value=checks), \
+                patch.object(setup, "show_checks"), \
+                patch.object(setup, "runtime_defaults", return_value=resolved), \
+                patch.object(setup.sys.stdin, "isatty", return_value=True), \
+                patch.object(setup, "plan", return_value=prepared) as plan, \
+                patch("builtins.input", side_effect=["/storage", "", "", "n"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(setup.main([]), 0)
+        self.assertEqual(
+            plan.call_args.args,
+            (Path("/repo"), "/storage", "/worktree", 4321),
+        )
+
+    def test_check_rejects_invalid_source_or_port_from_shared_resolver(self):
+        context = {"repo": Path("/repo"), "main": Path("/repo")}
+        checks = {"platform": "windows"}
+        for option in (("--source-root", "/missing"), ("--port", "80")):
+            with self.subTest(option=option), \
+                    patch.object(setup, "checkout_context", return_value=context), \
+                    patch.object(setup, "host_checks", return_value=checks), \
+                    patch.object(setup, "show_checks"), \
+                    patch.object(setup, "runtime_defaults", side_effect=setup.SetupError("invalid source/port")) as resolver, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(setup.main(["--check", *option]), 2)
+                resolver.assert_called_once()
 
 
 if __name__ == "__main__":

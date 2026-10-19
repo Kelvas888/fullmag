@@ -190,6 +190,16 @@ def validate_port(value: str | int) -> int:
     return port
 
 
+def runtime_defaults(repo: Path, *, source_root: str | None = None,
+                     port: int | None = None):
+    """Resolve the same source/port defaults used by the Docker launcher."""
+    try:
+        from docker_dev_defaults import resolve_defaults
+        return resolve_defaults(repo, source_root=source_root, port=port)
+    except Exception as error:
+        raise SetupError(f"Nieprawidłowe domyślne źródło lub port: {error}") from error
+
+
 def probe(command: list[str], timeout: int = 15) -> dict:
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
@@ -318,8 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--check", action="store_true", help="Tylko odczyt; bez zapisu i pytań")
     parser.add_argument("--storage-root", help="Jawny, bezwzględny storage tego hosta")
-    parser.add_argument("--source-root", help="Zarejestrowany checkout źródeł; domyślnie główny")
-    parser.add_argument("--port", type=int, default=3197)
+    parser.add_argument("--source-root", help="Zarejestrowany checkout źródeł; domyślnie resolver Docker DEV")
+    parser.add_argument("--port", type=int, help="Port frontendu; domyślnie resolver Docker DEV")
     parser.add_argument(
         "--gpu-access", choices=sorted(GPU_ACCESS_CHOICES),
         default=os.environ.get("FULLMAG_GPU_ACCESS", "auto"),
@@ -334,6 +344,9 @@ def main(argv: list[str] | None = None) -> int:
         print("  compose.dev.yaml: " + ("obecny" if compose.is_file() else "brak w tym checkoutcie"))
         env_path = context["main"] / ".env"
         configured = dotenv_values(bounded_file(env_path)) if env_path.exists() else {}
+        defaults = runtime_defaults(
+            context["repo"], source_root=args.source_root, port=args.port,
+        )
         if args.check:
             root_value = configured.get("FULLMAG_PROJECT_STORAGE_ROOT")
             if not root_value:
@@ -366,9 +379,11 @@ def main(argv: list[str] | None = None) -> int:
         chosen_storage = args.storage_root or input(prompt).strip() or default_storage
         if not chosen_storage:
             raise SetupError("Wybór storage jest wymagany")
-        source = args.source_root or str(context["main"])
+        source = str(defaults.source_root)
         chosen_source = input(f"Checkout źródeł [{source}]: ").strip() or source
-        chosen_port = validate_port(input(f"Port frontendu [{args.port}]: ").strip() or args.port)
+        chosen_port = validate_port(
+            input(f"Port frontendu [{defaults.port}]: ").strip() or defaults.port
+        )
         prepared = plan(context["repo"], chosen_storage, chosen_source, chosen_port,
                         gpu_access=args.gpu_access)
         print("\nDo zapisania:")
