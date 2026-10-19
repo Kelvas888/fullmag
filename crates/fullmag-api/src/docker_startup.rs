@@ -750,7 +750,11 @@ fn bind_docker_output_storage_with_alias(
                     ),
                 )
             })?;
-        mapped_source_dir = alias_root.join(output_relative_parent);
+        mapped_source_dir = if output_relative_parent.as_os_str().is_empty() {
+            alias_root.to_path_buf()
+        } else {
+            alias_root.join(output_relative_parent)
+        };
         ensure_output_alias_child(&mapped_source_dir, alias_root)?;
 
         output_dir = Some(match requested_output_dir.as_deref() {
@@ -2062,19 +2066,19 @@ mod tests {
         .expect("relative explicit paths should map below the selected alias");
         assert_eq!(
             binding["output_dir"],
-            json!("/opt/fullmag/script-output/custom.zarr")
+            json!("/opt/fullmag/script-output/sub/custom.zarr")
         );
         assert_eq!(
             binding["temp_dir"],
-            json!("/opt/fullmag/script-output/scratch")
+            json!("/opt/fullmag/script-output/sub/scratch")
         );
         assert_eq!(
             binding["output_storage"]["output_dir"],
-            json!("/opt/fullmag/script-output/custom.zarr")
+            json!("/opt/fullmag/script-output/sub/custom.zarr")
         );
         assert_eq!(
             binding["output_storage"]["temp_dir"],
-            json!("/opt/fullmag/script-output/scratch")
+            json!("/opt/fullmag/script-output/sub/scratch")
         );
         let storage = scene.study.output_storage.as_ref().unwrap();
         assert_eq!(
