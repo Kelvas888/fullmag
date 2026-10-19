@@ -1,4 +1,4 @@
-"""Seed isolated Linux frontend metadata and bind live Windows source folders.
+"""Seed isolated Linux frontend metadata and bind live host source folders.
 
 The selected checkout's root package manifest and its ``patches/**/*.patch``
 files are immutable dependency inputs.  The application source directories
@@ -9,13 +9,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import uuid
 
 import fullmag_storage as storage
-from windows_folder_host import local_volume, read_owned_regular
+from docker_dev_host import local_volume, require_host
+
+
+def read_owned_regular(path, maximum=1024 * 1024):
+    """Use the host's no-follow reader without issuing Windows proof on Linux."""
+    if os.name == "nt":
+        from windows_folder_host import read_owned_regular as reader
+    else:
+        from linux_native_host import read_owned_regular as reader
+    return reader(path, maximum=maximum)
 
 DIRECTORIES = ("app", "src", "public", "scripts")
 NEXT_CONFIG_RELATIVE = Path("apps/control-room/next.config.ts")
@@ -65,7 +74,8 @@ def main_checkout(repo):
 def select_checkout(repo, source_root=None):
     """Choose one Git-registered checkout of this project, never an inferred path."""
     source_root = source_root or os.environ.get("FULLMAG_SOURCE_ROOT")
-    selected = Path(source_root).resolve(strict=True) if source_root else main_checkout(repo)
+    selected = (storage.absolute(source_root, "development source checkout").resolve(strict=True)
+                if source_root else main_checkout(repo))
     known = {Path(record["worktree"]).resolve() for record in storage.worktree_records(repo)}
     if selected not in known:
         raise ValueError("Development sources must be a registered checkout of this project")
@@ -249,7 +259,8 @@ def describe(source, port):
         "schema": "fullmag.docker-development-inputs.v1",
         "source_root": str(source),
         "source_commit": commit,
-        "source_selection": "live_windows_selected_checkout",
+        "source_selection": ("live_windows_selected_checkout" if os.name == "nt"
+                             else "live_linux_selected_checkout"),
         "host_port": port,
         "worktree_id": worktree_id,
         "dependency_seed_files": sorted(dependency_entries),
@@ -326,9 +337,9 @@ def _validate_reused_workspace(destination, inputs, old_inputs, *, generated_sou
 
 
 def seed(source, state, port, *, reuse_from=None, write_file=None):
-    if os.name != "nt":
-        raise ValueError("Live Docker development sources require native Windows preflight")
-    source = source.resolve(strict=True)
+    require_host()
+    # Check lexical input before resolving so a checkout alias cannot hide a link.
+    source = storage.absolute(source, "live source checkout").resolve(strict=True)
     source_volume = local_volume(source)
     initial_commit = storage.git(source, "rev-parse", "HEAD")
     app = source / "apps/control-room"
@@ -445,7 +456,8 @@ def seed(source, state, port, *, reuse_from=None, write_file=None):
         # recording the current checkout identity in the outer run receipt.
         return old_inputs
     return {"schema": "fullmag.docker-development-inputs.v1", "source_root": str(source),
-            "source_commit": commit, "source_selection": "live_windows_selected_checkout",
+            "source_commit": commit, "source_selection": ("live_windows_selected_checkout" if os.name == "nt"
+                                                          else "live_linux_selected_checkout"),
             "source_volume": source_volume, "host_port": port,
             "worktree_id": storage.identifier(source),
             "dependency_seed_files": sorted(dependency_entries),
@@ -610,10 +622,16 @@ def seed_guest(
     state = Path(state)
     if not state.is_absolute() or state.is_symlink():
         raise ValueError("Docker frontend state root must be an absolute named-volume path")
-    if not isinstance(host_source_root, str) or not re.fullmatch(
+    windows_source = isinstance(host_source_root, str) and re.fullmatch(
         r"(?:[A-Za-z]:[\\/].*|\\\\.*)", host_source_root
-    ):
-        raise ValueError("host_source_root must be a diagnostic Windows path")
+    )
+    linux_source = (isinstance(host_source_root, str) and host_source_root.startswith("/")
+                    and not host_source_root.startswith("//") and host_source_root != "/"
+                    and "\\" not in host_source_root and ".." not in host_source_root.split("/")
+                    and str(PurePosixPath(host_source_root)) == host_source_root
+                    and not any(ord(char) < 32 or ord(char) == 127 for char in host_source_root))
+    if not windows_source and not linux_source:
+        raise ValueError("host_source_root must be an absolute diagnostic Windows or canonical Linux path")
     if not isinstance(worktree_id, str) or not re.fullmatch(
         r"[a-z0-9][a-z0-9._-]{0,127}", worktree_id
     ):
@@ -746,7 +764,8 @@ def seed_guest(
         "schema": "fullmag.docker-development-inputs.v1",
         "source_root": host_source_root,
         "source_commit": source_commit,
-        "source_selection": "live_windows_selected_checkout",
+        "source_selection": ("live_windows_selected_checkout" if windows_source
+                             else "live_linux_selected_checkout"),
         "source_volume": str(source),
         "host_port": port,
         "worktree_id": worktree_id,

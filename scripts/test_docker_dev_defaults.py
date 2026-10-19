@@ -185,7 +185,7 @@ class DockerDevDefaultsTests(unittest.TestCase):
         )
         with patch.object(defaults, "resolve_defaults", return_value=defaults.ScriptDefaults(self.worktree, 3197)), \
                 patch.object(defaults, "_discover_pins", return_value=pins), \
-                patch("docker_dev._require_native_windows"), \
+                patch("docker_dev._require_native_windows", side_effect=AssertionError("legacy Windows gate")), \
                 patch("docker_volume_activate.activate") as activate:
             defaults.activate_discovered(args)
         forwarded = activate.call_args.args[0]
@@ -254,7 +254,7 @@ class DockerDevDefaultsTests(unittest.TestCase):
                 "development/attempts/" + attempt + "/compose.json": document}
         control = SimpleNamespace(project=project, volume="owned-control", shared_labels={"owner": "selected"}, read=Mock(side_effect=lambda path, **kw: docs[path]))
         config = {"services": {"fem-gpu-toolchain": {"build": {"args": {"FULLMAG_CUDA_BASE_IMAGE": image}}}}}
-        with patch("docker_dev._require_native_windows"), \
+        with patch("docker_dev._require_native_windows", side_effect=AssertionError("legacy Windows gate")), \
                 patch("docker_development_inputs.select_checkout", return_value=self.worktree), \
                 patch("fullmag_storage.resolve_layout", return_value={}), \
                 patch("docker_dev._compose_identity", return_value={"worktree_id": "demo"}), \

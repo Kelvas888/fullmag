@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Start Fullmag's direct, fixed two-container Docker development workspace.
 
-``up`` prepares one registered Windows checkout, starts the persistent backend
+``up`` prepares one registered host checkout, starts the persistent backend
 service and frontend service, and waits for the backend service to publish its
 receipt-validated package and runtime provenance.  The backend compiles inside
 that same long-lived service; no host package transfer or one-shot backend
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 from docker_build_control import BuildControlError
+from fullmag_storage import StorageError
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 import hashlib
@@ -64,6 +65,7 @@ BASE_CONTEXT_FILES = (
     ("Dockerfile.dev.dockerignore", "docker/all-in-one/Dockerfile.dev.dockerignore"),
     ("entrypoint.py", "docker/all-in-one/entrypoint.py"),
     ("windows_folder_probe.py", "docker/all-in-one/windows_folder_probe.py"),
+    ("linux_native_probe.py", "docker/all-in-one/linux_native_probe.py"),
     ("runtime_service.py", "docker/all-in-one/runtime_service.py"),
     ("frontend_dev.py", "docker/all-in-one/frontend_dev.py"),
     ("healthcheck.py", "docker/all-in-one/healthcheck.py"),
@@ -356,10 +358,8 @@ def _verify_docker_gpu_access(
 
 
 def _docker_argv(arguments: Sequence[object]) -> list[str]:
-    command = ["docker"]
-    if os.name == "nt":
-        command.extend(("--context", "desktop-linux"))
-    return command + [str(value) for value in arguments]
+    from docker_dev_host import docker_argv
+    return docker_argv(*(str(value) for value in arguments))
 
 
 def _docker_capture(*arguments: object, timeout: int = 60,
@@ -2557,7 +2557,7 @@ def _parser() -> argparse.ArgumentParser:
             "and is never resolved as a host path"
         ),
     )
-    recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the old Windows root and create a fresh one")
+    recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the old host storage root and create a fresh one")
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
                                  include_untracked=[], script=None)
 
@@ -2668,7 +2668,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.action in {"up", "build"}:
-            _require_native_windows()
+            from docker_dev_host import require_host
+            require_host()
             from docker_dev_defaults import resolve_defaults
             selected = resolve_defaults(args.repo_root, source_root=args.source_root, port=getattr(args, "port", None))
             args.source_root = selected.source_root
@@ -2712,7 +2713,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             raise _fail(f"unsupported action: {args.action}")
         return 0
-    except (DirectDockerError, BuildControlError) as error:
+    except (DirectDockerError, BuildControlError, StorageError, ValueError, OSError,
+            subprocess.SubprocessError) as error:
         print(f"docker-dev: {error}", file=sys.stderr)
         return 2
 

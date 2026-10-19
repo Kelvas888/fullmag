@@ -2539,6 +2539,8 @@ impl HostResourceLedger {
     /// host root, volume serial, engine, owner token, and the state-relative
     /// path are stable across container restarts, while Linux device/inode and
     /// mount-namespace values remain admission evidence and never enter the ID.
+    /// Linux native Docker uses its separately validated engine/owner/relative
+    /// scope, with mount identity retained as current admission evidence.
     pub fn store_id(store_root: &Path) -> Result<String> {
         if !store_root.is_absolute() {
             bail!("store root must be an explicit absolute path");
@@ -2556,6 +2558,21 @@ impl HostResourceLedger {
             #[cfg(not(target_os = "linux"))]
             {
                 bail!("Docker Windows-folder store identity requires the attested Linux container");
+            }
+        }
+        if std::env::var("FULLMAG_SESSION_STORAGE_PROFILE")
+            .ok()
+            .as_deref()
+            == Some("linux-native-v1")
+        {
+            #[cfg(target_os = "linux")]
+            {
+                let value = crate::docker_desktop_storage::linux_native_store_identity(store_root)?;
+                return Ok(format!("sha256:{}", crate::canonical_json_sha256(&value)));
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("Linux native Docker identity requires its Linux container");
             }
         }
         crate::writer::require_local_filesystem(store_root)?;

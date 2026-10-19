@@ -32,10 +32,11 @@ uruchamia kontenerów**; te etapy opisano poniżej. Checkout i port zapisuje w
 `index/docker-host-settings.json` rozwiązanego storage; przy starcie przekazuj je
 jako jawne argumenty poleceń z sekcji 4.
 
-W WSL można uruchomić diagnostykę przez `python3 -B scripts/setup_docker.py --check`.
-Dla obecnej trasy zwróci ona informację o wymaganiu natywnego Windows i kod
-wyjścia `2`. Nie zapisuj ścieżki `~/git` jako ścieżki Windows: otwórz PowerShell
-w klonie na lokalnym NTFS/ReFS. Sam kreator nie przenosi klona ani danych.
+Kreator obsługuje również konfigurację z Linux/WSL, w tym checkout w katalogu
+domowym WSL. Użyj `python3 -B scripts/setup_docker.py`, a do kontroli bez zapisu
+dodaj `--check`; szczegóły: [konfiguracja Linux/WSL](docker-setup-linux-wsl.md).
+Launcher aplikacji nadal ma osobne wymagania Windows opisane poniżej.
+Sam kreator nie przenosi klona ani danych i nie kwalifikuje startu z WSL.
 
 ## 1. System i narzędzia hosta
 
@@ -220,8 +221,11 @@ sukcesem przed Compose; `eval` nie może maskować jego błędu. Ten krok usuwa
 błąd konfiguracji starego kontenera narzędziowego, nie buduje ani nie uruchamia
 nowej aplikacji. Ostrzeżenia MinIO/PostgreSQL wynikają z braku `.env`.
 
-Aktualny launcher `docker-all-dev` wykonuje native Windows attestation i
-wymaga checkoutu/storage na lokalnym Windows NTFS/ReFS. Repo pod `~/git` w WSL
-nie jest tym samym typem mountu; adapter Windows odrzuca UNC i ścieżki Linux.
-Równoważny start z Linux/WSL wymaga osobnej kwalifikacji, zamiast obchodzenia
-preflight przez ręczne wpisanie zmiennych.
+Codzienny development uruchamiaj przez `just docker-dev-toolchain` i
+`just docker-dev`, zgodnie z [procedurą volume DEV](docker-volume-development.md).
+Adapter Windows wymaga lokalnego NTFS/ReFS i odrzuca UNC oraz ścieżki Linux.
+Launcher uruchomiony w Linux/WSL wybiera osobny profil `linux-native-v1`
+na lokalnym ext4/xfs/btrfs; może korzystać z checkoutu pod `~/git`.
+Użyj [konfiguracji Linux/WSL](docker-setup-linux-wsl.md), aby zachować kontrolę
+storage, mapowania mountów i receiptów. Ręczne eksportowanie zmiennych starego
+Compose nie zastępuje tych kontroli ani nie dowodzi startu aplikacji.

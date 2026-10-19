@@ -47,7 +47,7 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 
 - Każdy build podczas pracy nad `master` lub worktree musi należeć do grupy Docker Compose wybranego checkoutu: `fullmag-master` albo `fullmag-worktree-<worktree_id>`. Ustal tę grupę przed rozpoczęciem budowania. Wszystkie buildy backendu, frontendu i ich zależności wykonuj wyłącznie w jej ramach — nigdy na hoście, w innej grupie, w niezależnym kontenerze ani przez dawny runner. Backend kompiluje i następnie uruchamia API/native runtime w tym samym stałym kontenerze `backend`; frontend używa swojej usługi `frontend` i HMR. Nie twórz osobnego kontenera `backend-build`. Recepta musi jawnie zachowywać projekt Compose, źródła, techniczne wolumeny Docker/BuildKit, dane użytkownika, blokady i receipty tej grupy w odpowiednich granicach. W Docker DEV `storage` hosta nie może być miejscem dla cache, stagingu, pakietów, kontekstów, logów buildu, receiptów ani provenance. Brak zgodnej recepty oznacza konieczność naprawy tej ścieżki, nie zgodę na build poza grupą.
 - Tymczasowo nie buduj testów jednostkowych ani nie uruchamiaj zadań, których celem jest ich kompilacja; zakaz obowiązuje do odwołania przez użytkownika.
-- Codzienny development Fullmaga wykonuj wyłącznie przez bezpośrednią ścieżkę Docker Compose w grupie wybranego checkoutu: `python -B scripts/setup_docker.py`, `just docker-dev-toolchain` i `just docker-dev`. Ta ścieżka używa natywnego Windows Python/PowerShell, Docker Desktop z silnikiem Linux i zarejestrowanego checkoutu jako bind mountu. Nie kieruj developmentu do `Fullmag_build_runner`, hostowego `cargo`/`cmake`, natywnego launchera Windows ani ręcznego Docker; wybór, storage, lock, provenance i końcowy receipt muszą przejść przez istniejący launcher oraz resolver. Jawne bramki release, GitHub CI/self-hosted i kwalifikacja naukowa zachowują własne, osobno udokumentowane zarządzane recepty.
+- Codzienny development Fullmaga wykonuj wyłącznie przez bezpośrednią ścieżkę Docker Compose w grupie wybranego checkoutu: `python -B scripts/setup_docker.py`, `just docker-dev-toolchain` i `just docker-dev`. Ta ścieżka obsługuje natywny Windows Python/PowerShell oraz Linux/WSL z Pythonem Linux i silnikiem Docker Linux; zarejestrowany checkout pozostaje bind mountem. Windows używa contextu `desktop-linux`, Linux/WSL bieżącego endpointu Docker. Nie kieruj developmentu do `Fullmag_build_runner`, hostowego `cargo`/`cmake`, natywnego launchera Windows ani ręcznego Docker; wybór, storage, lock, provenance i końcowy receipt muszą przejść przez istniejący launcher oraz resolver. Jawne bramki release, GitHub CI/self-hosted i kwalifikacja naukowa zachowują własne, osobno udokumentowane zarządzane recepty.
 - Dla Docker dev jawnie wybierz zarejestrowany checkout/worktree przez `--source-root` lub argument `just docker-dev`; launcher wyprowadza źródła i storage przez resolver, bez cichego fallbacku. Dla osobnych bramek release/CI/naukowych jawnie przypnij `snapshot` albo pełny SHA commita i użyj właściwej udokumentowanej recepty. Nie zamieniaj żądanego GPU na CPU. Testy lekkie i odrębne bramki runtime/nauki zachowują swoje recepty; sukces buildu nie zastępuje ich dowodów.
 
 - Nowy worktree na tym samym hoście nie potrzebuje własnego `.env`: resolver ustala główny checkout przez Git i czyta jego plik. Instrukcja i `.env.example` są wersjonowane; wartości hosta pozostają lokalne. Dla nowego klona na innym hoście przed pierwszym buildem skonfiguruj `.env` głównego checkoutu według `.env.example`, zachowując istniejące ustawienia. Jeśli lokalizacja storage nie została określona, uzyskaj ją od użytkownika; nie kopiuj ścieżki z innego hosta ani nie traktuj fallbacku resolvera jako konfiguracji operatora.
@@ -55,7 +55,7 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 - Fizyczną lokalizację storage hosta deklaruj przez `FULLMAG_PROJECT_STORAGE_ROOT` w lokalnym `.env` głównego checkoutu (szablon: `.env.example`). Worktree korzystają z tej samej konfiguracji przez resolver. Nie wpisuj stałych ścieżek Windows/Linux do instrukcji ani skilli i nie kopiuj całego `.env` do worktree. W Docker DEV rozwiązanemu storage wolno zawierać tylko sesje, wyniki, projekty, ustawienia, historię i wymagane rejestry użytkownika; dane buildu są w nazwanych wolumenach Docker/BuildKit. Jawne zmienne procesu, w tym mapowanie kontenera, mają pierwszeństwo i podlegają tej samej walidacji.
 
 - Przed wyborem polecenia builda czytaj `justfile`. Docker dev używa recept grupy `just docker-dev-toolchain` i `just docker-dev`; natywne FEM/MFEM/CUDA/hypre/libCEED pozostają container-backed i używają właściwej zarządzanej recepty wyłącznie dla jawnych bramek release/naukowych. Hostowe `cargo`, `cmake`, bezpośrednie binaria i ręczny Docker nie są ścieżką kwalifikacji.
-- Docker dev uruchamiaj z natywnego Windows PowerShell przez Docker Desktop w trybie kontenerów Linux; WSL może czytać i edytować checkout, ale nie uruchamia `scripts/docker_dev.py` ani `scripts/setup_docker.py` jako ścieżki startu. Dane użytkownika kieruj do kanonicznego `storage` projektu, a dane techniczne buildu do nazwanych wolumenów Docker/BuildKit. `FULLMAG_WINDOWS_*_ROOT` pozostaje wyłącznie zwalidowanym adapterem zgodności danych użytkownika i nie może tworzyć alternatywnych rootów ani miejsc zapisu buildu poza konfiguracją.
+- Docker dev uruchamiaj z Windows PowerShell albo Linux/WSL przez silnik Docker Linux. WSL wymaga integracji Docker Desktop i lokalnego checkoutu/storage ext4, xfs albo btrfs; Windows zachowuje NTFS/ReFS. Profile sesji `linux-native-v1` oraz `windows-folder-v1` mają oddzielne dowody admission; nie zastępuj jednego drugim. Kontrakt rozszerzenia: [ADR 0064](docs/adr/0064-docker-development-linux-wsl-host.md). Dane użytkownika kieruj do kanonicznego `storage` projektu, a dane techniczne buildu do nazwanych wolumenów Docker/BuildKit. `FULLMAG_WINDOWS_*_ROOT` pozostaje wyłącznie zwalidowanym adapterem zgodności danych użytkownika i nie może tworzyć alternatywnych rootów ani miejsc zapisu buildu poza konfiguracją.
 - Przed buildem, uruchomieniem lub porządkowaniem storage przeczytaj [reguły backendu i wykonania](.agents/instructions/backend.md), w tym dokładne ścieżki Linux/Windows. Linuxowy runner nigdy nie buduje bezpośrednio na CIFS. Prune jest domyślnie tylko dry-run przez `FULLMAG_RUNTIME_DRY_RUN=1`; usunięcie wymaga autoryzacji.
 - Obowiązująca polityka worktree, profili buildów, `justfile`, cache, runów i sprzątania znajduje się w [Fullmag build-storage governance](docs/guides/fullmag-build-storage-governance.md). Resolver wyprowadza project root ze wspólnego katalogu Git głównego checkoutu; `storage` i `worktrees` są jego rodzeństwem. Przed utworzeniem worktree sprawdź rejestr i użyj istniejącej izolacji; bez automatycznego `fetch`/`pull`/bootstrapu.
 - Każdy build/run z `justfile`, również ręczny, musi wykonać preflight ścieżek i zarejestrować stan końcowy przed zgłoszeniem zgodności. Instrukcje dokumentują kontrakt, lecz wrapper, preflight i sandbox są właściwą granicą techniczną; brak podpięcia danej recepty oznacz `NOT VERIFIED`.
@@ -69,7 +69,7 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 Decyzja użytkownika z 18.10.2026: dane **budowania** (zależności, cache,
 staging, pakiety, konteksty, provenance, logi i receipty builda) mają pozostawać
 w Docker named volumes / BuildKit, bez zapisu w hostowym `storage`. Sesje,
-wyniki, projekty i ustawienia pozostają w storage Windows. Użyj
+wyniki, projekty i ustawienia pozostają w skonfigurowanym storage hosta. Użyj
 [fullmag-docker-build](.agents/skills/fullmag-docker-build/SKILL.md).
 Codzienny DEV używa launchera `docker_volume_dev` i kontrolera
 `docker_build_control`; sprawdzaj ich kod, mounty oraz konkretny receipt przed
@@ -111,16 +111,16 @@ Grupa ma dokładnie dwie stałe usługi aplikacji:
 
 Kompilacja i start backendu są widoczne w jego logu Docker Desktop. Nie twórz
 osobnego `backend-build` i nie przenoś dużego pakietu między kontenerami przez
-storage Windows. Kontrakt: [ADR 0061](docs/adr/0061-docker-development-build-and-runtime-container.md).
+storage hosta. Kontrakt: [ADR 0061](docs/adr/0061-docker-development-build-and-runtime-container.md).
 
-Na nowym hoście uruchom z natywnego PowerShella `python -B scripts/setup_docker.py`.
+Na nowym hoście uruchom `python -B scripts/setup_docker.py` w PowerShell albo `python3 -B scripts/setup_docker.py` w Linux/WSL.
 Kreator zapisuje wybrany `FULLMAG_PROJECT_STORAGE_ROOT`, checkout źródeł i port
 frontendu do lokalnego `.env` głównego checkoutu; nie buduje, nie uruchamia i nie
 usuwa kontenerów. Sprawdzenie bez zapisu: `python -B scripts/setup_docker.py --check`.
 
 Zarejestrowany checkout jest readonly bind mountem obu usług. Backend buduje
 zweryfikowany cień źródeł i zachowuje cache Cargo/CMake w nazwanych wolumenach
-Docker/BuildKit; frontend reaguje przez HMR na zapis plików Windows. Przy KAŻDYM
+Docker/BuildKit; frontend reaguje przez HMR na zapis źródeł wybranego checkoutu. Przy KAŻDYM
 starcie, również po zwykłym
 restarcie w Docker Desktop, backend sam sprawdza aktualne zamontowane źródła,
 przygotowuje ich spójne wejście do kompilacji i przebudowuje tylko zmienione elementy
@@ -149,7 +149,7 @@ uruchamia Solve automatycznie. Restart backendu nie oznacza ponownego Solve.
 
 Frontend publikuje jeden jawnie wybrany, unikalny port loopback. Backend pozostaje
 prywatny pod `backend:8081`. Sieć, ustawienia i `workspace.db` są odrębne per grupa;
-sesje i wyniki pozostają w fizycznym storage Windows. Nie resetuj ownera, nie
+sesje i wyniki pozostają w fizycznym storage hosta wybranego profilu. Nie resetuj ownera, nie
 przejmuj obcej grupy i nie usuwaj cache, sesji ani wyników jako skutku restartu.
 
 Profil dev (`backend-dev`, `live-shadow-v1`) jest odrębny od release/frozen.

@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import os
 import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +17,95 @@ import setup_docker as setup
 
 
 class SetupDockerChecks(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux filesystem validation")
+    def test_linux_volume_accepts_local_filesystem_and_rejects_network_storage(self):
+        with patch.object(setup.storage, "filesystem_type", return_value="ext4"):
+            setup.validate_host_volume(Path("/home/operator/project-data"))
+        with patch.object(setup.storage, "filesystem_type", return_value="cifs"):
+            with self.assertRaisesRegex(setup.SetupError, "cifs"):
+                setup.validate_host_volume(Path("/home/operator/project-data"))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux filesystem validation")
+    def test_linux_configuration_rejects_volatile_paths(self):
+        with self.assertRaisesRegex(setup.SetupError, "trwałego"):
+            setup.validate_host_volume(Path("/tmp/fullmag-config"))
+
+    def test_windows_volume_admission_is_preserved(self):
+        root = Path.cwd()
+        with patch.object(setup.os, "name", "nt"), \
+             patch.object(setup, "validate_windows_volume") as admit:
+            setup.validate_host_volume(root)
+        admit.assert_called_once_with(root)
+
+    def test_wsl_wizard_can_save_configuration_without_windows_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            main = project / "repo"
+            main.mkdir()
+            subprocess.run(["git", "init", "--quiet", str(main)], check=True)
+            original = b"POSTGRES_PASSWORD=keep\nMINIO_ROOT_USER=keep\nMINIO_ROOT_PASSWORD=keep\nEXTRA=preserved\n"
+            (main / ".env").write_bytes(original)
+            checks = {"platform": "wsl"}
+            output = io.StringIO()
+            with patch.object(setup, "host_checks", return_value=checks), \
+                 patch.object(setup, "show_checks"), \
+                 patch.object(setup, "validate_host_volume"), \
+                 patch.object(setup.sys.stdin, "isatty", return_value=True), \
+                 patch("builtins.input", side_effect=[str(project / "data"), "", "", "t"]), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(setup.main(["--repo-root", str(main)]), 0)
+            settings = json.loads((project / "data/index/docker-host-settings.json").read_text())
+            self.assertEqual(settings["source_root"], str(main))
+            self.assertFalse(settings["application_ready"])
+            self.assertIn(b"EXTRA=preserved", (main / ".env").read_bytes())
+            self.assertEqual(setup.dotenv_values((main / ".env").read_bytes())["POSTGRES_PASSWORD"], "keep")
+            self.assertIn("just docker-dev ", output.getvalue())
+            self.assertIn("just docker-dev-toolchain", output.getvalue())
+
+    def test_linux_check_accepts_configured_host_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            main = project / "repo"
+            main.mkdir()
+            subprocess.run(["git", "init", "--quiet", str(main)], check=True)
+            (main / "compose.dev.yaml").touch()
+            (main / ".env.example").write_text("POSTGRES_PASSWORD=\nMINIO_ROOT_USER=\nMINIO_ROOT_PASSWORD=\n")
+            checks = {name: {"state": "available"} for name in ("git", "just", "docker", "compose")}
+            checks.update(platform="wsl", docker_os={"value": "linux"})
+            isolated = {key: value for key, value in os.environ.items()
+                        if key not in setup.storage.MANAGED_VARIABLES and key not in {"GIT_DIR", "GIT_WORK_TREE"}}
+            with patch.dict(os.environ, isolated, clear=True), patch.object(setup, "validate_host_volume"):
+                setup.apply_configuration(setup.plan(main, str(project / "data"), str(main), 3197))
+                original = (main / ".env").read_bytes()
+                saved = (project / "data/index/docker-host-settings.json").read_bytes()
+                with patch.object(setup, "host_checks", return_value=checks), \
+                     patch.object(setup, "show_checks"), contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(setup.main(["--repo-root", str(main), "--check"]), 0)
+                    self.assertEqual(setup.main(["--repo-root", str(main), "--check",
+                                                "--source-root", str(project / "foreign")]), 2)
+            self.assertEqual((main / ".env").read_bytes(), original)
+            self.assertEqual((project / "data/index/docker-host-settings.json").read_bytes(), saved)
+
+    def test_apply_rechecks_source_before_writing_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            main = project / "repo"
+            main.mkdir()
+            source = project / "source"
+            source.mkdir()
+            original = b"POSTGRES_PASSWORD=keep\n"
+            (main / ".env").write_bytes(original)
+            context = {"repo": main, "main": main, "project": project, "checkouts": [main, source]}
+            with patch.object(setup, "checkout_context", return_value=context), \
+                 patch.object(setup, "validate_host_volume"):
+                prepared = setup.plan(main, str(project / "data"), str(source), 3197)
+                source.rmdir()
+                with self.assertRaisesRegex(setup.SetupError, "zarejestrowanym checkoutem"):
+                    setup.apply_configuration(prepared)
+            self.assertEqual((main / ".env").read_bytes(), original)
+            self.assertFalse((project / "data").exists())
+
     def test_literal_paths_roundtrip_through_storage_parser(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -44,7 +134,7 @@ class SetupDockerChecks(unittest.TestCase):
             original = b"# operator\nPOSTGRES_PASSWORD='keep-this'\nMINIO_ROOT_PASSWORD=\nEXTRA=keep\n"
             (main / ".env").write_bytes(original)
             context = {"repo": main, "main": main, "project": base, "checkouts": [main]}
-            with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "validate_windows_volume"):
+            with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "validate_host_volume"):
                 prepared = setup.plan(main, str(base / "storage"), str(main), 3197)
             values = setup.dotenv_values(prepared["configured"])
             self.assertEqual(values["POSTGRES_PASSWORD"], "keep-this")
@@ -124,7 +214,7 @@ class SetupDockerChecks(unittest.TestCase):
             def admit(path):
                 if path == main:
                     raise setup.SetupError("source volume is not local Windows")
-            with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "validate_windows_volume", side_effect=admit):
+            with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "validate_host_volume", side_effect=admit):
                 with self.assertRaisesRegex(setup.SetupError, "source volume"):
                     setup.plan(main, str(project / "storage"), str(main), 3197)
             self.assertFalse((main / ".env").exists())
@@ -139,7 +229,7 @@ class SetupDockerChecks(unittest.TestCase):
             (main / ".env.example").write_text("POSTGRES_PASSWORD=change-me\nMINIO_ROOT_USER=fullmag\nMINIO_ROOT_PASSWORD=change-me\nFULLMAG_PROJECT_STORAGE_ROOT=\n")
             isolated = {key: value for key, value in os.environ.items()
                         if key not in setup.storage.MANAGED_VARIABLES and key not in {"GIT_DIR", "GIT_WORK_TREE"}}
-            with patch.dict(os.environ, isolated, clear=True), patch.object(setup, "validate_windows_volume"):
+            with patch.dict(os.environ, isolated, clear=True), patch.object(setup, "validate_host_volume"):
                 prepared = setup.plan(main, str(project / "chosen-storage"), str(main), 3297)
                 result = setup.apply_configuration(prepared)
                 layout = setup.storage.resolve_layout(main, "docker-all-gpu", environ={})
@@ -159,7 +249,7 @@ class SetupDockerChecks(unittest.TestCase):
             original = b"POSTGRES_PASSWORD=keep\n"
             (main / ".env").write_bytes(original)
             context = {"repo": main, "main": main, "project": project, "checkouts": [main]}
-            with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "validate_windows_volume"):
+            with patch.object(setup, "checkout_context", return_value=context), patch.object(setup, "validate_host_volume"):
                 prepared = setup.plan(main, str(project / "storage"), str(main), 3197)
                 with patch.object(setup.storage, "resolve_layout", side_effect=setup.storage.StorageError("invalid override")):
                     with self.assertRaises(setup.storage.StorageError):

@@ -136,7 +136,8 @@ class DockerDevelopmentShellBoundaryTests(unittest.TestCase):
             source = '/selected/$(printf literal);worktree'
             recipe = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
                       f"{command} --attempt '{'b' * 32}' --config-sha256 '{'a' * 64}' "
-                      f"--source-root '{source}' --port '3198'" + (' ' + flag if flag else ''))
+                      f"--source-root '{source}' --port '3198'"
+                      + ((('  ' if command == 'recreate-volume' else ' ') + flag) if flag else ''))
             result = self.dispatch(recipe)
             self.assertEqual(result.returncode, 0, result.stderr)
             expected = ['--repo-root', '/registered/checkout', command, '--attempt', 'b' * 32,

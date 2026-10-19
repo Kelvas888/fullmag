@@ -1068,7 +1068,7 @@ class DockerRuntimeContract(unittest.TestCase):
             root = Path(directory)
             helpers = root / "capsule/tree/docker/all-in-one"
             helpers.mkdir(parents=True)
-            for name in ("Dockerfile", "Dockerfile.dev", "entrypoint.py", "windows_folder_probe.py",
+            for name in ("Dockerfile", "Dockerfile.dev", "entrypoint.py", "windows_folder_probe.py", "linux_native_probe.py",
                          "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
                 (helpers / name).write_text(name)
             scripts = root / "capsule/tree/scripts"
@@ -1145,6 +1145,7 @@ class DockerRuntimeContract(unittest.TestCase):
                 "FULLMAG_RUNTIME_PACKAGE_ROOT": "/foreign/package",
                 "FULLMAG_RUNTIME_ROOT": "/foreign/legacy-package",
                 "FULLMAG_REPO_ROOT": "/foreign/source",
+                "FULLMAG_SESSION_STORAGE_PROFILE": service.WINDOWS_STORAGE_PROFILE,
             },
             clear=True,
         ):
@@ -1158,6 +1159,7 @@ class DockerRuntimeContract(unittest.TestCase):
             {
                 "FULLMAG_RUNTIME_ROOT": "/foreign/legacy-package",
                 "FULLMAG_REPO_ROOT": "/foreign/source",
+                "FULLMAG_SESSION_STORAGE_PROFILE": service.WINDOWS_STORAGE_PROFILE,
             },
             clear=True,
         ):
@@ -1165,6 +1167,16 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertNotIn("FULLMAG_RUNTIME_PACKAGE_ROOT", legacy_environment)
         self.assertEqual(legacy_environment["FULLMAG_RUNTIME_ROOT"], str(paths.package))
         self.assertEqual(legacy_environment["FULLMAG_REPO_ROOT"], str(paths.source))
+
+    def test_linux_session_profile_is_preserved_at_api_boundary(self):
+        service = self.load_service()
+        with patch.dict(os.environ, {"FULLMAG_SESSION_STORAGE_PROFILE": "linux-native-v1"}, clear=True):
+            paths = service.canonical_paths()
+            self.assertEqual(paths.host_certificate, Path("/run/fullmag/linux-native-host.json"))
+            self.assertEqual(service.api_environment(paths)["FULLMAG_SESSION_STORAGE_PROFILE"], "linux-native-v1")
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(service.RuntimeServiceError):
+                service.storage_profile()
 
     def test_prepare_storage_creates_current_live_workspace(self):
         from dataclasses import replace
@@ -1466,6 +1478,7 @@ class DockerRuntimeContract(unittest.TestCase):
             daemon_host_id = "a" * 64
             environment = {
                 "FULLMAG_DOCKER_HOST_EXECUTION": "1",
+                "FULLMAG_SESSION_STORAGE_PROFILE": service.WINDOWS_STORAGE_PROFILE,
                 "FULLMAG_HOST_LEDGER_PROFILE": service.HOST_LEDGER_PROFILE,
                 "FULLMAG_DOCKER_HOST_ID": daemon_host_id,
             }

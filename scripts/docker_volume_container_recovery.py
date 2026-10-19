@@ -23,6 +23,7 @@ import re
 import uuid
 
 import fullmag_storage as storage
+from docker_dev_host import docker_argv
 from docker_build_control import (
     BuildControl,
     BuildControlError,
@@ -715,13 +716,57 @@ def _bind_source(container: Mapping[str, object], destination: str) -> str:
     return source
 
 
+def _ledger_snapshot_mount(control, backend, compose):
+    """Admit the CAS-pinned daemon volume or preserve the legacy host bind."""
+    import docker_host_ledger as ledger
+
+    service = compose.get("services", {}).get("backend", {}) if isinstance(compose, Mapping) else {}
+    retained = service.get("x-fullmag-host-ledger-volume")
+    mounts = [mount for mount in backend.get("Mounts", []) if isinstance(mount, Mapping)
+              and mount.get("Destination") == "/host-ledger"]
+    if len(mounts) != 1:
+        _fail("stopped backend must have exactly one host-ledger mount")
+    mounted = mounts[0]
+    if retained is None and mounted.get("Type") == "bind":
+        source = _bind_source(backend, "/host-ledger")
+        return f"type=bind,src={source},dst=/host-ledger,readonly", None
+    if not isinstance(retained, Mapping) or not isinstance(compose, Mapping):
+        _fail("host-ledger volume requires its retained Compose descriptor")
+    try:
+        environment = service.get("environment", {})
+        receipt = retained.get("host_receipt")
+        ledger._validate_host_receipt(receipt, {
+            "project_id": environment.get("FULLMAG_HOST_LEDGER_PROJECT_ID"),
+            "mount_root": environment.get("FULLMAG_HOST_LEDGER_MOUNT_ROOT"),
+            "backing_image": environment.get("FULLMAG_HOST_LEDGER_BACKING_IMAGE"),
+        })
+        descriptor = ledger.host_volume_descriptor(control.project,
+            environment.get("FULLMAG_HOST_LEDGER_PROJECT_ID"),
+            environment.get("FULLMAG_HOST_LEDGER_MOUNT_ROOT"), receipt)
+        expected_mounts = [mount for mount in service.get("volumes", [])
+                           if mount.get("target") == "/host-ledger"]
+        if (compose.get("name") != control.project or retained != descriptor
+                or compose.get("volumes", {}).get("host-ledger") != descriptor["compose_volume"]
+                or expected_mounts != [descriptor["mount"]]
+                or mounted.get("Type") != "volume" or mounted.get("Name") != descriptor["name"]
+                or mounted.get("Driver") != "local" or mounted.get("RW") is not True):
+            _fail("host-ledger mount differs from its canonical retained volume descriptor")
+        observed = json.loads(docker_capture("volume", "inspect", descriptor["name"], timeout=30).stdout)
+        volume = ledger._validate_host_volume(observed, descriptor)
+        if mounted.get("Source") != volume["Mountpoint"]:
+            _fail("host-ledger source differs from the inspected volume mountpoint")
+    except (ledger.HostLedgerError, TypeError, ValueError, KeyError) as error:
+        _fail(f"host-ledger volume proof is unavailable: {error}")
+    return f"type=volume,src={descriptor['name']},dst=/host-ledger,readonly,volume-nocopy", descriptor
+
+
 def _ledger_and_store_snapshot(
-    control: BuildControl, backend: Mapping[str, object]
+    control: BuildControl, backend: Mapping[str, object], *, compose=None
 ) -> dict[str, str]:
     """Read the exact accepted store and shared ledger through an isolated helper."""
 
     state_source = _bind_source(backend, "/state")
-    ledger_source = _bind_source(backend, "/host-ledger")
+    ledger_mount, ledger_descriptor = _ledger_snapshot_mount(control, backend, compose)
     script = r'''import fcntl, hashlib, json, os, pathlib, time
 MAX_ENTRIES=8192
 def regular(path, label, maximum=8*1024*1024):
@@ -772,8 +817,16 @@ for current, directories, files in os.walk(store, topdown=True, followlinks=Fals
         if path.is_symlink() or not path.is_file(): raise RuntimeError('accepted store contains an invalid file')
         if name in {'run_intent.json','run_catalog.json'}: records.append(str(path.relative_to(store)))
 if records: raise RuntimeError('accepted store contains admitted run records')
-print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_root_sha256':hashlib.sha256(b'/state/runs/docker-all/session-store').hexdigest(),'ledger_root_sha256':hashlib.sha256(b'/host-ledger/ledger').hexdigest(),'ledger_snapshot_sha256':ledger_digest,'store_file_count':count,'run_directories':sorted(run_dirs),'run_records':records},sort_keys=True))
+print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_root_sha256':hashlib.sha256(b'/state/runs/docker-all/session-store').hexdigest(),'ledger_root_sha256':hashlib.sha256(b'/host-ledger/ledger').hexdigest(),'ledger_snapshot_sha256':ledger_digest,'store_file_count':count,'run_directories':sorted(run_dirs),'run_records':records,**({'host_ledger_volume_probe':volume_proof} if volume_proof is not None else {})},sort_keys=True))
 '''
+    if ledger_descriptor is not None:
+        import docker_host_ledger as ledger
+        # Reuse the bounded unprivileged mount/marker proof in this same helper.
+        # Descriptor data travels as argv, never as executable Python source.
+        script = (ledger.HOST_VOLUME_PROBE_FUNCTIONS + "\nimport json,signal,sys\nsignal.alarm(45)\n"
+                  + "volume_proof=probe(json.loads(sys.argv[1]))\n" + script)
+    else:
+        script = "volume_proof=None\n" + script
     image = backend.get("Image")
     if not isinstance(image, str) or IMAGE_RE.fullmatch(image) is None:
         _fail("stopped backend image is unavailable for accepted-store proof")
@@ -782,7 +835,7 @@ print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_
     # the store/ledger readers.  The script is passed as Python argv, never as
     # a shell program, so the probe cannot accidentally execute through bash.
     args = [
-        "docker", "--context", "desktop-linux", "run", "--rm", "-i",
+        *docker_argv("run"), "--rm", "-i",
         "--pull", "never", "--network", "none", "--runtime", "runc",
         "--read-only", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges:true", "--pids-limit", "32",
@@ -792,10 +845,12 @@ print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_
         "--label", "com.docker.compose.service=host-runtime-maintenance",
         "--label", f"org.fullmag.compose.project={control.project}",
         "--mount", f"type=bind,src={state_source},dst=/state,readonly",
-        "--mount", f"type=bind,src={ledger_source},dst=/host-ledger,readonly",
+        "--mount", ledger_mount,
         "--user", "65532:65532", "--entrypoint", "/usr/local/bin/python3",
         image, "-B", "-c", script,
     ]
+    if ledger_descriptor is not None:
+        args.append(canonical(ledger_descriptor).decode("utf-8"))
     result = bounded_capture(args, data=b"", timeout=90)
     if result.returncode:
         _fail("accepted store/ledger proof failed: " + result.stderr.decode("utf-8", "replace")[-4096:])
@@ -1182,55 +1237,71 @@ def _validate_owner_host(owner: Mapping[str, object], backend: Mapping[str, obje
         _fail("backend hostname does not bind the native owner host")
 
 
+def _reused_session_host():
+    from docker_volume_dev import _session_host
+    return _session_host()
+
+
 def _validate_reused_session_before_removal(
     layout: Mapping[str, object], state_root: object, old_image_id: str, engine_id: str
 ) -> dict[str, object]:
-    """Validate the existing Windows session before any old container removal."""
+    """Validate the selected host profile before any old container removal."""
 
     try:
         state = storage.validate_path(
             Path(state_root),
             Path(layout["runtime_root"]),
-            "retained Windows sessions",
+            "retained session storage",
         )
     except (KeyError, TypeError, ValueError, storage.StorageError) as error:
-        _fail("retained Windows session state is outside the selected runtime root")
-    from fullmag_docker_runtime import _read_reuse_json
-    from windows_folder_host import HOST_SCHEMA, local_volume
-
-    certificate_path = state / "windows-folder-host.json"
-    owner_marker = state / ".fullmag-windows-folder-owner.json"
+        _fail("retained session state is outside the selected runtime root")
+    host = _reused_session_host()
+    windows = host.HOST_SCHEMA == "fullmag.windows-folder-host.v1"
+    if not windows and host.HOST_SCHEMA != "fullmag.linux-native-host.v1":
+        _fail("retained session host profile is unsupported")
+    label = "Windows" if windows else "Linux"
+    profile = "windows-folder-v1" if windows else "linux-native-v1"
+    scope = "docker-desktop-linux" if windows else "docker-linux"
+    certificate_path = state / Path(host.HOST_CERT_PATH).name
+    owner_marker = state / host.OWNER_NAME
     try:
-        certificate = _read_reuse_json(certificate_path, "Windows host certificate")
-        marker = _read_reuse_json(owner_marker, "Windows storage owner marker")
-        native = local_volume(state)
+        certificate = json.loads(host.read_owned_regular(certificate_path))
+        marker = json.loads(host.read_owned_regular(owner_marker))
+        native = host.local_volume(state)
     except (OSError, ValueError, RuntimeError) as error:
-        _fail(f"retained Windows storage proof is unavailable before removal: {error}")
-    if certificate != marker or certificate.get("schema") != HOST_SCHEMA:
-        _fail("retained Windows storage certificate and owner marker differ")
+        _fail(f"retained {label} storage proof is unavailable before removal: {error}")
+    if (not isinstance(certificate, Mapping) or certificate != marker
+            or certificate.get("schema") != host.HOST_SCHEMA):
+        _fail(f"retained {label} storage certificate and owner marker differ")
     if (
-        certificate.get("storage_profile") != "windows-folder-v1"
+        certificate.get("storage_profile") != profile
         or certificate.get("role") != "session"
-        or certificate.get("owner_scope") != "docker-desktop-linux"
+        or certificate.get("owner_scope") != scope
     ):
-        _fail("retained Windows storage certificate has the wrong ownership scope")
+        _fail(f"retained {label} storage certificate has the wrong ownership scope")
     owner_token = certificate.get("owner_token")
     try:
         parsed = uuid.UUID(str(owner_token))
     except (ValueError, TypeError, AttributeError) as error:
-        _fail("retained Windows storage owner token is invalid")
-    if parsed.int == 0 or str(parsed) != owner_token:
-        _fail("retained Windows storage owner token is not canonical")
-    for field in (
+        _fail(f"retained {label} storage owner token is invalid")
+    canonical_token = str(parsed) if windows else parsed.hex
+    if parsed.int == 0 or canonical_token != owner_token:
+        _fail(f"retained {label} storage owner token is not canonical")
+    identity_fields = (
         "host_root", "host_filesystem", "host_drive_type", "host_volume_serial",
         "host_root_no_reparse",
-    ):
+    ) if windows else (
+        "host_root", "host_filesystem", "host_platform", "host_device", "host_root_no_reparse",
+    )
+    for field in identity_fields:
         if certificate.get(field) != native.get(field):
-            _fail("retained Windows storage identity changed: " + field)
+            _fail(f"retained {label} storage identity changed: " + field)
+    if not windows and certificate.get("host_inode") != state.stat().st_ino:
+        _fail("retained Linux storage directory inode changed")
     if certificate.get("image_id") != old_image_id:
-        _fail("retained Windows storage certificate does not belong to the old image")
+        _fail(f"retained {label} storage certificate does not belong to the old image")
     if certificate.get("engine_id") != engine_id:
-        _fail("retained Windows storage certificate belongs to another Docker engine")
+        _fail(f"retained {label} storage certificate belongs to another Docker engine")
     return {
         "state": state,
         "host_certificate": certificate_path,
@@ -1369,7 +1440,7 @@ def _revalidate_recovery_boundary(
         _fail("Docker container images changed before the destructive boundary")
     if backend.get("Id") != expected_backend.get("Id") or frontend.get("Id") != expected_frontend.get("Id"):
         _fail("Docker inspection identities changed before the destructive boundary")
-    storage_proof = _ledger_and_store_snapshot(control, pinned_backend)
+    storage_proof = _ledger_and_store_snapshot(control, pinned_backend, compose=compose)
     for key in ("store_root_sha256", "ledger_root_sha256", "ledger_snapshot_sha256"):
         if storage_proof.get(key) != expected_storage.get(key):
             _fail(f"storage proof {key} changed before the destructive boundary")
@@ -1609,7 +1680,7 @@ def recover(args: argparse.Namespace) -> None:
         or pins[1]["image_id"] != authorization["old_image_id"]
     ):
         _fail("Docker container pins changed since authorization")
-    storage_proof = _ledger_and_store_snapshot(control, backend)
+    storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose)
     manifest = transition["manifest"] if transition is not None else _manifest(
         authorization, engine_sha, backend, frontend, pins, device_release, device_mapping
     )

@@ -94,6 +94,9 @@ class StartupActivationOutcome(Exception):
 def preflight():
     device_access = _configure_device_access()
     kind = subprocess.check_output(["stat", "-f", "-c", "%t", "/state"], text=True).strip()
+    if os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == "linux-native-v1":
+        from linux_native_probe import run
+        run(require_restart="--storage-probe" not in sys.argv)
     # Same supported writer filesystem types as the managed browser route.
     if kind.lower().lstrip("0") == "1021997" and os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == "windows-folder-v1":
         from windows_folder_probe import run

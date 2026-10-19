@@ -1063,7 +1063,7 @@ def submit_build(repo, commit=None, *, development=False, source_root=None):
     if development:
         from docker_development_inputs import select_checkout
         source_repo = select_checkout(repo, source_root)
-        required_helpers = ("Dockerfile", "Dockerfile.dev", "entrypoint.py", "windows_folder_probe.py",
+        required_helpers = ("Dockerfile", "Dockerfile.dev", "entrypoint.py", "windows_folder_probe.py", "linux_native_probe.py",
                             "runtime_service.py", "frontend_dev.py", "healthcheck.py")
         for name in required_helpers:
             relative = "docker/all-in-one/" + name
@@ -1140,7 +1140,7 @@ def stage_image_context(capsule, package, stage, *, development):
     if not development:
         shutil.copytree(capsule / "tree", stage / "source", symlinks=False)
         shutil.copytree(package, stage / "package", symlinks=False)
-    for name in ("entrypoint.py", "windows_folder_probe.py", "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
+    for name in ("entrypoint.py", "windows_folder_probe.py", "linux_native_probe.py", "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
         shutil.copyfile(capsule / "tree/docker/all-in-one" / name, stage / name)
     for name in ("docker_startup_script.py", "fullmag_storage.py"):
         source = capsule / "tree/scripts" / name

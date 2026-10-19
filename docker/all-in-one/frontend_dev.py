@@ -650,8 +650,15 @@ def read_inputs(path: Path | None = None) -> DevelopmentInputs:
         or not source_root
         or len(source_root.encode()) > 2048
         or "\x00" in source_root
-        or not WINDOWS_PATH.match(source_root)
     ):
+        _fail("source_root must be a bounded diagnostic host path")
+    if manifest.get("source_selection") == "live_linux_selected_checkout":
+        if (not source_root.startswith("/") or source_root.startswith("//") or source_root == "/"
+                or "\\" in source_root or ".." in source_root.split("/")
+                or str(PurePosixPath(source_root)) != source_root
+                or any(ord(char) < 32 or ord(char) == 127 for char in source_root)):
+            _fail("source_root must be a canonical absolute Linux diagnostic path")
+    elif not WINDOWS_PATH.match(source_root):
         _fail("source_root must be a diagnostic Windows path")
     source_commit = manifest.get("source_commit")
     if not isinstance(source_commit, str) or not HEX40.fullmatch(source_commit):
