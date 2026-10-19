@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import docker_dev_defaults as defaults
+from docker_build_control import BuildControlError
 
 
 class DockerDevDefaultsTests(unittest.TestCase):
@@ -148,10 +149,12 @@ class DockerDevDefaultsTests(unittest.TestCase):
         backend_id, frontend_id = "b" * 64, "f" * 64
         inspect = {
             backend_id: {
+                "State": {"Running": True, "Health": {"Status": "healthy"}},
                 "HostConfig": {"PortBindings": {}, "NetworkMode": "fullmag-net"},
                 "NetworkSettings": {"Networks": {"fullmag-net": {}}},
             },
             frontend_id: {
+                "State": {"Running": True, "Health": {"Status": "healthy"}},
                 "HostConfig": {
                     "PortBindings": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3197"}]},
                 },
@@ -172,6 +175,17 @@ class DockerDevDefaultsTests(unittest.TestCase):
 
         with patch("docker_volume_activate._docker_text", side_effect=docker_text):
             defaults._validate_live_network(backend_id, frontend_id, "fullmag-master", 3197)
+        for status in ("starting", "unhealthy"):
+            with self.subTest(frontend_health=status):
+                inspect[frontend_id]["State"]["Health"]["Status"] = status
+                with patch("docker_volume_activate._docker_text", side_effect=docker_text), \
+                        self.assertRaisesRegex(defaults.DiscoveryError, "frontend health is not healthy"):
+                    defaults._validate_live_network(backend_id, frontend_id, "fullmag-master", 3197)
+        inspect[frontend_id]["State"].pop("Health")
+        with patch("docker_volume_activate._docker_text", side_effect=docker_text), \
+                self.assertRaisesRegex(defaults.DiscoveryError, "frontend health is not healthy"):
+            defaults._validate_live_network(backend_id, frontend_id, "fullmag-master", 3197)
+        inspect[frontend_id]["State"]["Health"] = {"Status": "healthy"}
         inspect[frontend_id]["HostConfig"]["PortBindings"]["8080/tcp"][0]["HostIp"] = "0.0.0.0"
         with patch("docker_volume_activate._docker_text", side_effect=docker_text), \
                 self.assertRaisesRegex(defaults.DiscoveryError, "loopback"):
@@ -193,6 +207,86 @@ class DockerDevDefaultsTests(unittest.TestCase):
         self.assertEqual(forwarded.config_sha256, "b" * 64)
         self.assertEqual(forwarded.request_id, "stable-request")
         self.assertEqual(forwarded.script, Path("examples/model.py"))
+
+    def _up_args(self, *, script=None):
+        return argparse.Namespace(
+            repo_root=self.main,
+            source_root=self.worktree,
+            port=3197,
+            gpu_access="auto",
+            profile="dev",
+            image=None,
+            toolchain_image=None,
+            source_manifest=None,
+            include_untracked=[],
+            script=script,
+        )
+
+    def test_reuse_existing_is_a_noop_for_one_healthy_pair(self):
+        pins = defaults.ScriptPins("a" * 32, "b" * 64, self.worktree, 3197)
+        with patch.object(defaults, "require_host"), \
+                patch.object(defaults, "_discover_pins", return_value=pins), \
+                patch("builtins.print") as output:
+            self.assertTrue(defaults.reuse_existing(self._up_args()))
+        output.assert_called_once_with(
+            "docker-dev: reused healthy running group " + "a" * 32 + " on port 3197"
+        )
+
+    def test_reuse_existing_uses_existing_activation_lifecycle_for_script(self):
+        pins = defaults.ScriptPins("a" * 32, "b" * 64, self.worktree, 3197)
+        args = self._up_args(script=Path("examples/model.py"))
+        with patch.object(defaults, "require_host"), \
+                patch.object(defaults, "_discover_pins", return_value=pins) as discover, \
+                patch.object(defaults, "activate_discovered") as activate:
+            self.assertTrue(defaults.reuse_existing(args))
+        discover.assert_called_once_with(
+            self.main,
+            defaults.ScriptDefaults(self.worktree, 3197),
+            requested_port=3197,
+            requested_gpu_access="auto",
+            allow_missing_control=True,
+        )
+        activate.assert_called_once_with(args, pins=pins)
+
+    def test_reuse_existing_does_not_bypass_explicit_nondefault_inputs(self):
+        for name, value in (
+            ("profile", "release"),
+            ("image", "sha256:" + "a" * 64),
+            ("toolchain_image", "sha256:" + "b" * 64),
+            ("source_manifest", Path("manifest.json")),
+            ("include_untracked", ["new.py"]),
+        ):
+            with self.subTest(name=name):
+                args = self._up_args()
+                setattr(args, name, value)
+                with patch.object(defaults, "require_host"), \
+                        patch.object(defaults, "_discover_pins") as discover:
+                    self.assertFalse(defaults.reuse_existing(args))
+                discover.assert_not_called()
+
+    def test_reuse_existing_allows_only_the_initial_no_namespace_case(self):
+        with patch.object(defaults, "require_host"), \
+                patch.object(defaults, "_discover_pins", return_value=None):
+            self.assertFalse(defaults.reuse_existing(self._up_args()))
+
+    def test_reuse_existing_fails_closed_with_recovery_for_stale_or_ambiguous_state(self):
+        for detail in (
+            "stopped backend",
+            "unhealthy backend",
+            "multiple validated healthy running DEV groups",
+            "foreign control volume",
+            "config mismatch",
+        ):
+            with self.subTest(detail=detail), \
+                    patch.object(defaults, "require_host"), \
+                    patch.object(defaults, "_discover_pins",
+                                  side_effect=defaults.DiscoveryError(detail)):
+                with self.assertRaisesRegex(
+                    defaults.DiscoveryError,
+                    r"docker-dev-resume|docker-dev-recreate-volume",
+                ) as raised:
+                    defaults.reuse_existing(self._up_args())
+                self.assertIn(detail, str(raised.exception))
 
     def test_just_keeps_discovery_and_pinned_activation_as_distinct_routes(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -242,13 +336,113 @@ class DockerDevDefaultsTests(unittest.TestCase):
             self.assertEqual(actual[3:], expected)
             self.assertNotIn("fullmag_storage.py", actual[0])
 
+    def _discovery_control(self, current):
+        project = "fullmag-worktree-demo"
+        image = "sha256:" + "c" * 64
+        control = SimpleNamespace(
+            project=project,
+            volume="owned-control",
+            shared_labels={"owner": "selected"},
+            read=Mock(return_value=current),
+        )
+        config = {"services": {"fem-gpu-toolchain": {"build": {"args": {
+            "FULLMAG_CUDA_BASE_IMAGE": image
+        }}}}}
+        return control, config
+
+    def test_discovery_missing_control_volume_requires_exact_error_and_bounded_listing(self):
+        control, config = self._discovery_control(None)
+        calls = []
+
+        def docker_text(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ("volume", "inspect"):
+                raise BuildControlError(
+                    "Error response from daemon: get " + control.volume + ": no such volume"
+                )
+            if args[:2] == ("volume", "ls"):
+                self.assertEqual(kwargs.get("timeout"), 60)
+                return "x" * (defaults._MAX_VOLUME_LIST_BYTES + 1)
+            raise AssertionError(args)
+
+        with patch.object(defaults, "require_host"), \
+                patch("docker_development_inputs.select_checkout", return_value=self.worktree), \
+                patch("fullmag_storage.resolve_layout", return_value={}), \
+                patch("docker_dev._compose_identity", return_value={"worktree_id": "demo"}), \
+                patch.object(defaults, "toolchain_configuration", return_value=config), \
+                patch.object(defaults, "BuildControl", return_value=control), \
+                patch("docker_volume_activate._docker_text", side_effect=docker_text):
+            with self.assertRaisesRegex(defaults.DiscoveryError, "bounded size"):
+                defaults._discover_pins(
+                    self.main, defaults.ScriptDefaults(self.worktree, 3197),
+                    allow_missing_control=True,
+                )
+        self.assertEqual([item[0][:2] for item in calls], [("volume", "inspect"), ("volume", "ls")])
+
+    def test_discovery_missing_control_volume_returns_none_only_after_listing_confirms_absence(self):
+        control, config = self._discovery_control(None)
+        calls = []
+
+        def docker_text(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("volume", "inspect"):
+                raise BuildControlError(
+                    "Error response from daemon: get " + control.volume + ": no such volume"
+                )
+            if args[:2] == ("volume", "ls"):
+                self.assertEqual(kwargs.get("timeout"), 60)
+                return "other-volume\n"
+            raise AssertionError(args)
+
+        with patch.object(defaults, "require_host"), \
+                patch("docker_development_inputs.select_checkout", return_value=self.worktree), \
+                patch("fullmag_storage.resolve_layout", return_value={}), \
+                patch("docker_dev._compose_identity", return_value={"worktree_id": "demo"}), \
+                patch.object(defaults, "toolchain_configuration", return_value=config), \
+                patch.object(defaults, "BuildControl", return_value=control), \
+                patch("docker_volume_activate._docker_text", side_effect=docker_text):
+            result = defaults._discover_pins(
+                self.main, defaults.ScriptDefaults(self.worktree, 3197),
+                allow_missing_control=True,
+            )
+        self.assertIsNone(result)
+        self.assertEqual(calls, [
+            ("volume", "inspect", control.volume),
+            ("volume", "ls", "--format", "{{.Name}}"),
+        ])
+
+    def test_discovery_missing_current_is_initial_start_but_malformed_current_is_not(self):
+        control, config = self._discovery_control(None)
+        valid_volume = json.dumps([{
+            "Name": control.volume, "Driver": "local", "Options": None,
+            "Labels": {"owner": "selected"},
+        }])
+        with patch.object(defaults, "require_host"), \
+                patch("docker_development_inputs.select_checkout", return_value=self.worktree), \
+                patch("fullmag_storage.resolve_layout", return_value={}), \
+                patch("docker_dev._compose_identity", return_value={"worktree_id": "demo"}), \
+                patch.object(defaults, "toolchain_configuration", return_value=config), \
+                patch.object(defaults, "BuildControl", return_value=control), \
+                patch("docker_volume_activate._docker_text", return_value=valid_volume):
+            self.assertIsNone(defaults._discover_pins(
+                self.main, defaults.ScriptDefaults(self.worktree, 3197),
+                allow_missing_control=True,
+            ))
+            control.read.return_value = {"state": "succeeded"}
+            with self.assertRaisesRegex(defaults.DiscoveryError, "valid attempt fence"):
+                defaults._discover_pins(
+                    self.main, defaults.ScriptDefaults(self.worktree, 3197),
+                    allow_missing_control=True,
+                )
+
     def test_discovery_deduplicates_one_live_pair_and_uses_its_overridden_port(self):
         attempt = "a" * 32
         project = "fullmag-worktree-demo"
         image = "sha256:" + "c" * 64
         document = {"name": project, "services": {"frontend": {"ports": [{"published": "32900"}]}}}
         terminal = {"compose_project": project, "inputs": {
-            "source_root": str(self.worktree), "image_id": image}}
+            "source_root": str(self.worktree), "image_id": image,
+            "gpu_access_requested": "auto"}}
         docs = {"development/current.json": {"attempt": attempt},
                 "development/attempts/" + attempt + "/terminal.json": terminal,
                 "development/attempts/" + attempt + "/compose.json": document}
@@ -269,6 +463,16 @@ class DockerDevDefaultsTests(unittest.TestCase):
             self.assertEqual(result.port, 32900)
             self.assertEqual(result.attempt, attempt)
             self.assertEqual(network.call_args.args[-1], 32900)
+            result = defaults._discover_pins(
+                self.main, defaults.ScriptDefaults(self.worktree, 32900),
+                requested_gpu_access="auto",
+            )
+            self.assertEqual(result.attempt, attempt)
+            with self.assertRaisesRegex(defaults.DiscoveryError, "no exactly validated"):
+                defaults._discover_pins(
+                    self.main, defaults.ScriptDefaults(self.worktree, 32900),
+                    requested_gpu_access="disabled",
+                )
             with self.assertRaises(defaults.DiscoveryError):
                 defaults._discover_pins(self.main, defaults.ScriptDefaults(self.worktree, 3197), requested_port=3197)
             control.read.reset_mock()

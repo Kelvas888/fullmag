@@ -127,6 +127,13 @@ lub narzędziem diagnostycznym. Start uruchamia dwie stałe usługi; backend wyk
 przed API. Otwórz `http://127.0.0.1:3197/workspace`. Brak `--script` oznacza Home,
 a nie automatyczny wybór dawnej sesji.
 
+Ponowne `just docker-dev` używa już działającej grupy, jeśli oba serwisy są
+zdrowe i zgadzają się checkout, konfiguracja, polityka GPU oraz port. Bez skryptu
+kończy się bez restartu i kompilacji; z `--script` aktywuje plik istniejącą
+ścieżką w tej grupie. Zatrzymane, niezdrowe lub niejednoznaczne serwisy wymagają
+jawnego recovery zamiast automatycznego odtworzenia. Zmiany backendu nadal
+wymagają jego kontrolowanego restartu opisanego poniżej.
+
 Po uruchomieniu tej grupy skrypt można aktywować bez ręcznego przepisywania
 attemptu i digestu konfiguracji:
 

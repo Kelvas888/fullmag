@@ -2437,7 +2437,10 @@ def up(args: argparse.Namespace) -> None:
     import fullmag_storage as storage
     from docker_volume_dev import start
     from docker_build_control import BuildControlError
+    from docker_dev_defaults import reuse_existing
     try:
+        if getattr(args, "repo_root", None) is not None and reuse_existing(args):
+            return
         start(args)
     except (BuildControlError, storage.StorageError, ValueError, OSError, subprocess.SubprocessError) as error:
         raise _fail(str(error)) from error

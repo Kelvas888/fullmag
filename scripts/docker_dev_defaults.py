@@ -37,6 +37,7 @@ _VERIFIED_RECEIPTS = (
 )
 _MAX_DOTENV_BYTES = 256 * 1024
 _MAX_SETTINGS_BYTES = 256 * 1024
+_MAX_VOLUME_LIST_BYTES = 256 * 1024
 
 
 class DiscoveryError(BuildControlError):
@@ -330,6 +331,13 @@ def _validate_live_network(backend_id: str, frontend_id: str, project: str, port
         if not isinstance(observed, list) or len(observed) != 1 or not isinstance(observed[0], Mapping):
             raise DiscoveryError(f"running {service} identity is ambiguous")
         records[service] = observed[0]
+    for service, record in records.items():
+        state = record.get("State")
+        health = state.get("Health") if isinstance(state, Mapping) else None
+        if not isinstance(state, Mapping) or state.get("Running") is not True:
+            raise DiscoveryError(f"running {service} is not running")
+        if not isinstance(health, Mapping) or health.get("Status") != "healthy":
+            raise DiscoveryError(f"running {service} health is not healthy")
     backend = records["backend"]
     backend_host = backend.get("HostConfig", {})
     if not isinstance(backend_host, Mapping):
@@ -376,12 +384,43 @@ def _validate_live_network(backend_id: str, frontend_id: str, project: str, port
         raise DiscoveryError("running frontend does not publish exactly the requested loopback port")
 
 
+def _is_missing_control_volume_diagnostic(error: BaseException, volume: str) -> bool:
+    """Accept only Docker's exact missing-volume diagnostic for this name."""
+    message = " ".join(str(error).split()).casefold()
+    name = re.escape(volume.casefold())
+    return re.search(
+        rf"(?:^|[\s:])get\s+{name}:\s+no\s+such\s+volume(?:$|[\s:.])",
+        message,
+    ) is not None
+
+
+def _confirm_missing_control_volume(activate, volume: str) -> None:
+    """Confirm absence through a bounded independent Docker volume listing."""
+    try:
+        listed = activate._docker_text(
+            "volume", "ls", "--format", "{{.Name}}", timeout=60
+        )
+    except BuildControlError as error:
+        raise DiscoveryError(
+            "cannot confirm missing DEV control volume: " + str(error)
+        ) from error
+    if len(listed.encode("utf-8")) > _MAX_VOLUME_LIST_BYTES:
+        raise DiscoveryError("DEV control volume listing exceeds its bounded size")
+    if volume in {line.strip() for line in listed.splitlines() if line.strip()}:
+        raise DiscoveryError(
+            "Docker volume inspect reported a missing DEV control volume, "
+            "but the independent volume listing found it"
+        )
+
+
 def _discover_pins(
     repo: Path,
     defaults: ScriptDefaults,
     *,
     requested_port: int | None = None,
-) -> ScriptPins:
+    requested_gpu_access: str | None = None,
+    allow_missing_control: bool = False,
+) -> ScriptPins | None:
     from docker_dev import _compose_identity, STORAGE_PROFILE
     from docker_development_inputs import select_checkout
     from fullmag_storage import resolve_layout
@@ -401,6 +440,15 @@ def _discover_pins(
     # its existing ownership before invoking any control-volume reader.
     try:
         volumes = json.loads(activate._docker_text("volume", "inspect", control.volume))
+    except BuildControlError as error:
+        if allow_missing_control and _is_missing_control_volume_diagnostic(
+            error, control.volume
+        ):
+            _confirm_missing_control_volume(activate, control.volume)
+            return None
+        raise DiscoveryError(
+            "existing DEV control volume inspection failed: " + str(error)
+        ) from error
     except (TypeError, ValueError) as error:
         raise DiscoveryError("existing DEV control volume inspection is invalid") from error
     if (not isinstance(volumes, list) or len(volumes) != 1
@@ -413,6 +461,8 @@ def _discover_pins(
             or any(labels.get(key) != value for key, value in control.shared_labels.items())):
         raise DiscoveryError("existing DEV control volume belongs to another group")
     current = control.read("development/current.json", optional=True)
+    if current is None and allow_missing_control:
+        return None
     if not isinstance(current, Mapping):
         raise DiscoveryError("development/current.json is missing or is not an object")
     candidates: dict[tuple[str, str, str, str], int] = {}
@@ -431,6 +481,9 @@ def _discover_pins(
         if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
             continue
         if inputs.get("source_worktree_id") not in (None, identity["worktree_id"]):
+            continue
+        if (requested_gpu_access is not None
+                and inputs.get("gpu_access_requested") != requested_gpu_access):
             continue
         image = inputs.get("image_id")
         if not isinstance(image, str) or not IMAGE_ID_RE.fullmatch(image):
@@ -457,24 +510,27 @@ def _discover_pins(
             candidates[(attempt, config_sha256, backend_id, frontend_id)] = actual_port
     if len(candidates) != 1:
         if not candidates:
-            raise DiscoveryError("no exactly validated running DEV group matches the selected source")
-        raise DiscoveryError("multiple validated running DEV groups match the selected source")
+            raise DiscoveryError("no exactly validated healthy running DEV group matches the selected source")
+        raise DiscoveryError("multiple validated healthy running DEV groups match the selected source")
     (attempt, config_sha256, _backend_id, _frontend_id), actual_port = next(iter(candidates.items()))
     return ScriptPins(attempt=attempt, config_sha256=config_sha256,
                       source_root=selected, port=actual_port)
 
 
-def activate_discovered(args) -> None:
+def activate_discovered(args, *, pins: ScriptPins | None = None) -> None:
     """Resolve pins, then invoke the unchanged explicit activation operation."""
     require_host()
     repo = Path(args.repo_root).resolve(strict=True)
-    defaults = resolve_defaults(repo, source_root=getattr(args, "source_root", None),
-                                port=getattr(args, "port", None))
-    pins = _discover_pins(
-        repo,
-        defaults,
-        requested_port=(defaults.port if getattr(args, "port", None) is not None else None),
-    )
+    if pins is None:
+        defaults = resolve_defaults(repo, source_root=getattr(args, "source_root", None),
+                                    port=getattr(args, "port", None))
+        pins = _discover_pins(
+            repo,
+            defaults,
+            requested_port=(defaults.port if getattr(args, "port", None) is not None else None),
+        )
+    if pins is None:
+        raise DiscoveryError("running DEV group disappeared before script activation")
     from docker_volume_activate import activate
     activate(argparse.Namespace(
         repo_root=repo,
@@ -484,3 +540,59 @@ def activate_discovered(args) -> None:
         script=args.script,
         request_id=getattr(args, "request_id", None),
     ))
+
+
+def reuse_existing(args) -> bool:
+    """Reuse one exact healthy DEV pair, or report that ordinary startup is needed.
+
+    The read-only discovery is deliberately performed before ``start``.  A
+    missing control volume or an uninitialized control volume is the first-run
+    case and returns ``False``.  Any existing namespace that cannot prove one
+    healthy source/config/port/GPU-matched pair raises a recovery-directed
+    error; it is never stopped, removed, reset, or rebuilt here.
+    """
+    if (getattr(args, "profile", "dev") != "dev"
+            or any(getattr(args, name, None) for name in (
+                "image", "toolchain_image", "source_manifest", "include_untracked"
+            ))):
+        return False
+    require_host()
+    repo = Path(args.repo_root).resolve(strict=True)
+    if getattr(args, "source_root", None) is None or getattr(args, "port", None) is None:
+        defaults = resolve_defaults(
+            repo,
+            source_root=getattr(args, "source_root", None),
+            port=getattr(args, "port", None),
+        )
+    else:
+        defaults = ScriptDefaults(
+            source_root=Path(args.source_root),
+            port=_port(args.port, "resolved port"),
+        )
+    try:
+        pins = _discover_pins(
+            repo,
+            defaults,
+            requested_port=defaults.port,
+            requested_gpu_access=getattr(args, "gpu_access", None),
+            allow_missing_control=True,
+        )
+    except BuildControlError as error:
+        raise DiscoveryError(
+            "Existing Docker DEV namespace cannot be reused safely; use "
+            "`just docker-dev-resume` or `just docker-dev-recreate-volume` "
+            "with its pinned attempt/config/source/port. No containers, "
+            "volumes, or networks were changed. Discovery detail: " + str(error)
+        ) from error
+    if pins is None:
+        return False
+    if getattr(args, "script", None) is not None:
+        activate_discovered(args, pins=pins)
+    else:
+        print(
+            "docker-dev: reused healthy running group "
+            + pins.attempt
+            + " on port "
+            + str(pins.port)
+        )
+    return True
