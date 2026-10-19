@@ -27,13 +27,14 @@ class OfflineCertificateTests(unittest.TestCase):
         self.assertEqual(checks._validate_offline_result(result, ['test_fixture'])['exit_code'], 1)
 
     def test_selected_optional_implementation_cannot_be_omitted(self):
-        result = valid_result()
-        optional = 'docker_volume_activation_reconcile'
-        required = (*checks.BASE_IMPLEMENTATIONS, optional)
-        with self.assertRaises(checks.BuildControlError):
-            checks._validate_offline_result(result, ['test_fixture'], implementations=required)
-        result['source_files']['/opt/fullmag/source/scripts/' + optional + '.py'] = 'b' * 64
-        self.assertIs(checks._validate_offline_result(result, ['test_fixture'], implementations=required), result)
+        for optional in checks.OPTIONAL_IMPLEMENTATIONS:
+            result = valid_result()
+            required = (*checks.BASE_IMPLEMENTATIONS, optional)
+            with self.subTest(implementation=optional):
+                with self.assertRaises(checks.BuildControlError):
+                    checks._validate_offline_result(result, ['test_fixture'], implementations=required)
+                result['source_files']['/opt/fullmag/source/scripts/' + optional + '.py'] = 'b' * 64
+                self.assertIs(checks._validate_offline_result(result, ['test_fixture'], implementations=required), result)
 
     def test_partial_malformed_or_false_certificate_cannot_pass(self):
         variants = [None, [], {'exit_code': 0}]

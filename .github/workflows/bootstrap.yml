@@ -126,6 +126,8 @@ jobs:
           cargo test -p fullmag-plan --lib preparation::tests::fdm_
           cargo test -p fullmag-api --bin fullmag-api docker_startup::tests
           cargo test -p fullmag-api --bin fullmag-api live_accepted_execution::tests
+          cargo test -p fullmag-api --bin fullmag-api development_accepted_restore::tests
+          cargo test -p fullmag-runtime-control --lib scheduler::accepted_start_tests
           cargo test -p fullmag-api --bin fullmag-api live_accepted_projection::tests
           cargo test -p fullmag-api --bin fullmag-api accepted_fem_study_worker::source_contract_tests
           cargo test -p fullmag-api --bin fullmag-api-accepted-worker accepted_fem_study_worker::source_contract_tests
@@ -783,6 +785,7 @@ jobs:
           python -B scripts/test_docker_volume_dev_cancelled_activation.py -v
           python -B scripts/test_docker_volume_readiness_receipt.py -v
           python -B scripts/test_docker_volume_stop_failed.py -v
+          python -B scripts/test_docker_volume_activation_reconcile.py -v
           python -B scripts/test_docker_native_failed_recreate.py -v
           python -B scripts/test_docker_retained_recovery_context.py -v
           python -B scripts/test_runtime_service_successor.py -v
@@ -790,6 +793,8 @@ jobs:
           python -B scripts/test_docker_dev_owned_control.py -v
           python -B scripts/test_docker_volume_receipts.py -v
           python -B scripts/test_docker_volume_checks.py -v
+          python -B scripts/test_docker_accepted_reattach.py -v
+          python -B scripts/test_docker_volume_accepted_reattach.py -v
           python -B scripts/test_docker_console_progress.py -v
           python -B scripts/test_docker_volume_stop_unadmitted.py -v
           python -B scripts/test_docker_startup_script.py -v

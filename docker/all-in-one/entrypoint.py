@@ -238,6 +238,7 @@ def serve():
         signal.signal(number, lambda *_: stopping.set())
     paths = service.prepare_storage()
     bootstrap = service.initialize_accepted_store(paths)
+    accepted_preflight = service.accepted_reattach_preflight(paths)
     container_recovery = service.recover_container_namespace(paths)
     # An explicit host authorization is the only route that may transition a
     # stale failed owner.  It must complete before configuration generation
@@ -246,7 +247,7 @@ def serve():
     with service.container_recovery_configuration_override(paths, container_recovery):
         configuration = service.ensure_configuration(paths)
     print("[fullmag-backend] Starting API and runtime service", flush=True)
-    with service.accepted_reattach_api_input(paths) as (api_environment, restore_input):
+    with service.accepted_reattach_api_input(paths, preflight=accepted_preflight) as (api_environment, restore_input):
         api = subprocess.Popen(["/opt/fullmag/package/bin/fullmag-api"],
                                env=api_environment, stdin=restore_input)
     handle = None

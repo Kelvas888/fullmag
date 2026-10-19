@@ -6,11 +6,13 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from subprocess import CompletedProcess
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import docker_volume_dev as dev
+import docker_volume_activation_reconcile as reconcile
 import docker_volume_stop_failed as stop_failed
 import docker_volume_stop_unadmitted as stop_unadmitted
 
@@ -122,7 +124,16 @@ def terminal_receipt() -> dict[str, object]:
 class NativeFailedRecreateTests(unittest.TestCase):
     def setUp(self):
         self.control = Mock()
+        self.control.project = "fullmag-worktree-test"
+        self.control.volume = "fullmag-worktree-test-control"
+        self.control.identity = {
+            "project_name": self.control.project,
+            "project_id": "fullmag-project",
+            "worktree_id": "test",
+            "checkout_kind": "worktree",
+        }
         self.control.read.side_effect = self.read_control
+        self.namespace_raw = None
         self.terminal = terminal_receipt()
         self.owner = failed_owner()
         self.terminal_raw = json.dumps(self.terminal, sort_keys=True).encode()
@@ -142,8 +153,52 @@ class NativeFailedRecreateTests(unittest.TestCase):
             "terminal_process_receipt": self.terminal,
             "terminal_failed_owner": self.owner,
             "terminal_failed_owner_sha256": hashlib.sha256(self.owner_raw).hexdigest(),
+            "container_state": self.container_state(),
         }
         self.journal_raw = json.dumps(self.journal, sort_keys=True).encode()
+        self.inspect_patch = patch.object(
+            reconcile, "docker_capture", return_value=self.stopped_backend_inspect()
+        )
+        self.inspect_patch.start()
+        self.addCleanup(self.inspect_patch.stop)
+
+    @staticmethod
+    def container_state() -> dict[str, object]:
+        return {
+            "id": BACKEND_ID,
+            "image": IMAGE_ID,
+            "started_at": "2026-10-19T10:00:00.000000000Z",
+            "finished_at": "2026-10-19T10:00:10.000000000Z",
+            "exit_code": 1,
+        }
+
+    def stopped_backend_inspect(self) -> CompletedProcess:
+        state = self.container_state()
+        document = {
+            "Id": BACKEND_ID,
+            "Image": IMAGE_ID,
+            "State": {
+                "Running": False,
+                "Status": "exited",
+                "StartedAt": state["started_at"],
+                "FinishedAt": state["finished_at"],
+                "ExitCode": state["exit_code"],
+            },
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": self.control.project,
+                    "com.docker.compose.service": "backend",
+                    "org.fullmag.source.project-id": "fullmag-project",
+                    "org.fullmag.source.worktree-id": "test",
+                    "org.fullmag.source.checkout-kind": "worktree",
+                    "org.fullmag.compose.project": self.control.project,
+                }
+            },
+        }
+        return CompletedProcess(
+            ["docker", "inspect"], 0,
+            json.dumps([document]).encode(), b"",
+        )
 
     def read_control(self, relative, *, optional=False):
         if relative == "verification/stop-failed-" + BACKEND_ID + ".json":
@@ -153,6 +208,8 @@ class NativeFailedRecreateTests(unittest.TestCase):
     def control_bytes(self, _control, relative, *, optional=False):
         if relative == "verification/stop-failed-" + BACKEND_ID + ".json":
             return self.journal_raw
+        if relative == "verification/stopped-namespace-attestation-" + BACKEND_ID + ".json":
+            return self.namespace_raw
         if relative.endswith("process-tree.json"):
             return self.terminal_raw
         if relative.endswith("OWNER.json"):
@@ -160,7 +217,7 @@ class NativeFailedRecreateTests(unittest.TestCase):
         raise AssertionError(relative)
 
     def previous(self):
-        return {"inputs": {"image_id": IMAGE_ID}}
+        return {"inputs": {"image_id": IMAGE_ID, "source_root": "C:/git/fullmag"}}
 
     def configure_after_ready_journal(self):
         probe = after_ready_native_probe()
@@ -186,8 +243,39 @@ class NativeFailedRecreateTests(unittest.TestCase):
             "terminal_retained_ready_owner": ready,
             "terminal_failed_owner": self.owner,
             "terminal_failed_owner_sha256": hashlib.sha256(self.owner_raw).hexdigest(),
+            "container_state": self.container_state(),
         }
         self.journal_raw = json.dumps(self.journal, sort_keys=True).encode()
+
+    def make_namespace_attestation(self) -> None:
+        probe = self.journal["native_failure_probe"]
+        attestation = {
+            "schema": reconcile.NAMESPACE_ATTESTATION_SCHEMA,
+            "state": "stopped-confirmed",
+            "compose_project": self.control.project,
+            "control_volume": self.control.volume,
+            "backend_container": BACKEND_ID,
+            "image_id": IMAGE_ID,
+            "source_root": "C:/git/fullmag",
+            "container_state": self.container_state(),
+            "stop_journal_path": "verification/stop-failed-" + BACKEND_ID + ".json",
+            "stop_journal_sha256": hashlib.sha256(self.journal_raw).hexdigest(),
+            "terminal_process_receipt_path": "runtime-control/runtime-service/process-tree.json",
+            "terminal_process_receipt_sha256": hashlib.sha256(self.terminal_raw).hexdigest(),
+            "terminal_process_receipt": self.terminal,
+            "terminal_failed_owner_path": "runtime-control/runtime-services/OWNER.json",
+            "terminal_failed_owner_sha256": hashlib.sha256(self.owner_raw).hexdigest(),
+            "terminal_failed_owner": self.owner,
+            "failure_kind": self.journal["failure_kind"],
+            "native_failure_probe_sha256": hashlib.sha256(
+                reconcile.canonical(probe) + b"\n"
+            ).hexdigest(),
+            "native_failure_probe": probe,
+            "created_at": 1_729_000_000.0,
+        }
+        if self.journal["failure_kind"] == "native-after-ready-failure":
+            attestation["retained_ready_owner"] = self.journal["retained_ready_owner"]
+        self.namespace_raw = reconcile.canonical(attestation) + b"\n"
 
     def test_native_stop_journal_pins_owner_and_current_config(self):
         with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
@@ -225,7 +313,18 @@ class NativeFailedRecreateTests(unittest.TestCase):
                     self.control, self.previous(), backend_id=BACKEND_ID, fresh_state=False
                 )
 
-    def test_legacy_stop_journal_uses_probe_owner_digest(self):
+    def test_legacy_stop_journal_requires_fresh_namespace_attestation(self):
+        self.journal.pop("container_state")
+        self.journal.pop("terminal_failed_owner_sha256")
+        self.journal_raw = json.dumps(self.journal, sort_keys=True).encode()
+        with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
+                patch.object(dev, "_read_runtime_config_digest", return_value="c" * 64):
+            with self.assertRaisesRegex(dev.BuildControlError, "fresh namespace attestation"):
+                dev._native_failed_stop_recovery_context(
+                    self.control, self.previous(), backend_id=BACKEND_ID, fresh_state=False
+                )
+
+    def test_inline_stop_journal_uses_probe_owner_digest(self):
         self.journal.pop("terminal_failed_owner_sha256")
         self.journal_raw = json.dumps(self.journal, sort_keys=True).encode()
         with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
@@ -236,6 +335,21 @@ class NativeFailedRecreateTests(unittest.TestCase):
         self.assertEqual(
             context["native_restart_metadata"]["terminal_failed_owner_sha256"],
             hashlib.sha256(self.owner_raw).hexdigest(),
+        )
+
+    def test_legacy_stop_journal_accepts_matching_fresh_namespace_attestation(self):
+        self.journal.pop("container_state")
+        self.journal.pop("terminal_failed_owner_sha256")
+        self.journal_raw = json.dumps(self.journal, sort_keys=True).encode()
+        self.make_namespace_attestation()
+        with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
+                patch.object(dev, "_read_runtime_config_digest", return_value="c" * 64):
+            context = dev._native_failed_stop_recovery_context(
+                self.control, self.previous(), backend_id=BACKEND_ID, fresh_state=False
+            )
+        self.assertEqual(
+            context["native_restart_metadata"]["namespace_attestation_sha256"],
+            hashlib.sha256(self.namespace_raw).hexdigest(),
         )
 
     def test_fresh_state_does_not_consume_native_stop_proof(self):

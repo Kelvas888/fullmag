@@ -265,3 +265,48 @@ Nie kompilujemy lokalnie testów Rust w czasie obowiązywania zakazu użytkownik
 Udany build nie zastępuje dowodu browser/runtime ani wymaganych kontroli PR.
 Wycofanie wymaga potwierdzonego zatrzymania własnej grupy i jawnego wskazania
 zachowanego, zweryfikowanego pakietu; nie kasuje cache, sesji ani wyników.
+
+## Odzyskanie przerwanej aktywacji i modelu accepted
+
+Doprecyzowanie 20.10.2026: zatrzymanie kontenerów nie dowodzi wyniku
+wcześniejszej aktywacji skryptu. Zachowany marker `started` i niepotwierdzony
+wynik nie pozwalają ponownie wysłać skryptu ani Solve. Operacyjne zwolnienie
+blokady kontrolera oraz odtworzenie aktywnego modelu są odrębnymi czynnościami;
+żadna nie oznacza zakończenia symulacji ani zwolnienia rezerwacji sprzętu.
+
+Zarządzane odzyskanie kontrolera wymaga dokładnej tożsamości grupy, źródeł,
+kontenera i jego zatrzymanej inkarnacji oraz trwałych dowodów native drain.
+Nieobecność wcześniejszego helpera musi być potwierdzona w Dockerze.
+Pod blokadą operacji porównujemy niezmienione wejścia i dowody, zachowujemy
+pierwotny receipt oraz historię, zapisujemy trwałe oznaczenie nierozstrzygniętej
+aktywacji i dopiero wtedy kończymy techniczną operację kontrolera. Przerwanie
+w dowolnym miejscu wymaga idempotentnego dokończenia z tych samych dowodów.
+Nowa aktywacja pozostaje blokowana do kanonicznego rozstrzygnięcia poprzedniej.
+
+API może przed rozpoczęciem nasłuchu jawnie odtworzyć istniejący, nadal
+zablokowany run `accepted`. Prywatne wejście zawiera identyfikatory tego runu,
+projektu i pierwotnego żądania, hashe skryptu i autoryzacji oraz przypięty dowód
+odzyskania. API sprawdza również rzeczywiste receipty, nie tylko poprawny format
+hashy. Model, niezmienny snapshot, przygotowanie i frontier pochodzą z kanonicznego
+store; obowiązują te same reguły gotowości co w schedulerze. Zachowujemy
+logiczny identyfikator sesji i jej epokę, a nowy proces API otrzymuje nową
+identyfikację procesu. Nie uruchamiamy ponownie Pythona, przygotowania ani Solve
+i nie tworzymy nowego RunIntent.
+
+PID 1 przed odzyskaniem ownera i uruchomieniem API porównuje bieżące terminalne
+rekordy z niezmiennymi kopiami ich surowych bajtów w katalogu dowodu.
+Późniejsza legalna rotacja plików ownera i procesu nie unieważnia tych kopii;
+Rust niezależnie sprawdza ich hashe oraz zgodność z journalem zatrzymania.
+
+PID 1 odczytuje ograniczone, przypięte wejście z wolumenu runtime-control.
+Tożsamość docelowego buildu pochodzi z opublikowanego w kontenerze provenance:
+pełnego commita i hasha snapshotu źródeł. Rust porównuje je z tożsamością
+wkompilowaną w bieżące binarium. To odtworzenie nie korzysta z dawnego watchera
+Windows. Wejście jest przekazane przez prywatny deskryptor stdin z EOF;
+nie tworzy hostowego pakietu, nie publikuje endpointu odzyskiwania i nie wymaga
+udostępnienia Docker socketa aplikacji.
+
+Status: kontrakt wdrażany. Testy transportu i kontrolera są dowodami odrębnych
+warstw. Pełny producent i walidacja dowodów, restart, odtworzony model w UI
+oraz wykonanie tego samego runu wymagają osobnej kwalifikacji runtime;
+pozostają **NOT VERIFIED** do jej rzeczywistego zakończenia.

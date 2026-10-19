@@ -16,7 +16,7 @@ from docker_compose_identity import compose_project_identity, validate_source_la
 
 BASE_IMPLEMENTATIONS = ('docker_build_control', 'docker_volume_dev', 'docker_volume_activate',
                         'docker_volume_stop_failed', 'docker_volume_checks')
-OPTIONAL_IMPLEMENTATIONS = ('docker_volume_activation_reconcile',)
+OPTIONAL_IMPLEMENTATIONS = ('docker_volume_activation_reconcile', 'docker_volume_accepted_reattach')
 
 
 def _validate_offline_result(value, modules, *, implementations=BASE_IMPLEMENTATIONS):

@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,47 @@ class BuildControlError(RuntimeError):
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def control_read_script(path, maximum=MAX_DOCUMENT_BYTES):
+    """Return the image-owned, bounded read probe for one control record.
+
+    The parent chain is authenticated before the target is tested for
+    existence.  This matters for optional reads: a dangling or replaced
+    ``/control/<parent>`` must be an integrity failure, never an ordinary
+    missing record (and therefore never a reason to continue a recovery
+    transaction).  Only a genuinely absent, non-symlink target returns 44.
+    """
+
+    if (not isinstance(path, str) or not path.startswith("/control/")
+            or not re.fullmatch(r"/control/[A-Za-z0-9_./-]+", path)):
+        raise BuildControlError("Invalid control-volume absolute path")
+    parsed = PurePosixPath(path)
+    if (str(parsed) != path or ".." in parsed.parts
+            or any(part in {"", "."} for part in parsed.parts[1:])):
+        raise BuildControlError("Invalid control-volume absolute path")
+    if type(maximum) is not int or maximum <= 0 or maximum > MAX_DOCUMENT_BYTES:
+        raise BuildControlError("Invalid control-document byte budget")
+
+    components = parsed.parts[2:]  # omit the root slash and ``control``
+    checks = [
+        "check_parent() { local p=\"$1\"; test ! -L \"$p\"; "
+        "if test -e \"$p\"; then test -d \"$p\"; "
+        "test \"$(readlink -f \"$p\")\" = \"$p\"; "
+        "else exit 44; fi; }; "
+        "check_parent /control;"
+    ]
+    parent = "/control"
+    for component in components[:-1]:
+        parent += "/" + component
+        checks.append(f"check_parent {shlex.quote(parent)};")
+    quoted = shlex.quote(path)
+    checks.append(
+        f"test ! -L {quoted}; test -e {quoted} || exit 44; "
+        f"test -f {quoted}; test $(stat -c %h {quoted}) = 1; "
+        f"head -c {maximum + 1} {quoted}"
+    )
+    return " ".join(checks)
 
 
 _CONSOLE_DISCONNECT_ERRNOS = frozenset((errno.EBADF, errno.EINVAL))
@@ -314,11 +356,7 @@ class BuildControl:
 
     def read(self, relative, *, optional=False):
         path = self.path(relative)
-        parent = str(PurePosixPath(path).parent)
-        script = (f"test -e '{path}' || exit 44; "
-                  f"test \"$(readlink -f '{parent}')\" = '{parent}'; "
-                  f"test -f '{path}'; test ! -L '{path}'; test $(stat -c %h '{path}') = 1; "
-                  f"head -c {MAX_DOCUMENT_BYTES + 1} '{path}'")
+        script = control_read_script(path)
         result = bounded_capture(self.helper_args(script), data=b"", timeout=90)
         if optional and result.returncode == 44:
             return None
@@ -342,6 +380,30 @@ class BuildControl:
             raise BuildControlError("Control helper exited before acknowledging its durable lease")
         return line.decode("utf-8", "replace").strip()
 
+    def operation_script(self, phase, token):
+        """Return the image-owned lease protocol for one admitted operation.
+
+        Keep this in one place so recovery can authenticate an already-running
+        helper's command instead of reproducing a similar shell script.  The
+        helper remains the only writer allowed to remove ``/control/active``.
+        """
+        if not re.fullmatch(r"[a-z][a-z0-9-]+", phase):
+            raise BuildControlError("Invalid build phase")
+        if not re.fullmatch(r"[0-9a-f]{32}", token):
+            raise BuildControlError("Invalid operation token")
+        path = self.path(f"{phase}/attempts/{token}")
+        return ("umask 027; exec 9>/control/operation.lock; flock -n 9; "
+                "test ! -e /control/active; "
+                f"mkdir -p /control/{phase}/attempts; "
+                f"test \"$(readlink -f /control/{phase}/attempts)\" = '/control/{phase}/attempts'; "
+                f"test $(find /control/{phase}/attempts -mindepth 1 -maxdepth 1 -type d | wc -l) -lt {MAX_ATTEMPTS}; "
+                f"mkdir '{path}'; printf '%s\\n' '{token}' > /control/active; "
+                "sync /control; printf 'READY\\n'; "
+                f"{{ head -c {MAX_LOG_BYTES}; cat > /dev/null; }} > '{path}/build.log'; "
+                f"sync '{path}/build.log'; printf 'LOGGED\\n'; "
+                f"until test -f '{path}/terminal.json'; do sleep 1; done; "
+                "rm /control/active; sync /control")
+
     @contextmanager
     def operation(self, phase, inputs):
         if not re.fullmatch(r"[a-z][a-z0-9-]+", phase):
@@ -352,17 +414,7 @@ class BuildControl:
         name = "fullmag-control-" + token
         # The advisory lease and durable active marker cover the entire daemon
         # operation. An interrupted host cannot silently free an unknown build.
-        script = ("umask 027; exec 9>/control/operation.lock; flock -n 9; "
-                  "test ! -e /control/active; "
-                  f"mkdir -p /control/{phase}/attempts; "
-                  f"test \"$(readlink -f /control/{phase}/attempts)\" = '/control/{phase}/attempts'; "
-                  f"test $(find /control/{phase}/attempts -mindepth 1 -maxdepth 1 -type d | wc -l) -lt {MAX_ATTEMPTS}; "
-                  f"mkdir '{path}'; printf '%s\\n' '{token}' > /control/active; "
-                  "sync /control; printf 'READY\\n'; "
-                  f"{{ head -c {MAX_LOG_BYTES}; cat > /dev/null; }} > '{path}/build.log'; "
-                  f"sync '{path}/build.log'; printf 'LOGGED\\n'; "
-                  f"until test -f '{path}/terminal.json'; do sleep 1; done; "
-                  "rm /control/active; sync /control")
+        script = self.operation_script(phase, token)
         space_before = self.space()
         if min(space_before["available_bytes"], space_before.get("windows_backing_volume", {}).get("available_bytes", space_before["available_bytes"])) < MIN_FREE_BUILD_BYTES:
             raise BuildControlError("Docker build filesystem has less than 32 GiB free; admission refused")

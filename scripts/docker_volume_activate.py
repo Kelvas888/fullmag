@@ -611,6 +611,20 @@ def activate(args: argparse.Namespace) -> None:
         detail = f": {validation_error}" if validation_error else ""
         raise BuildControlError("No linked runtime terminal matches the running Compose group" + detail)
 
+    # An earlier startup activation may have reached the backend before the
+    # host lost observation.  Its image-owned marker is deliberately retained
+    # and fences every later POST/RunIntent until a canonical recovery route
+    # proves the outcome; a new request must never bypass that quarantine.
+    from docker_volume_activation_reconcile import assert_no_unresolved_activation
+    assert_no_unresolved_activation(
+        control,
+        development_attempt=args.attempt,
+        config_sha256=args.config_sha256,
+        source_root=str(selected),
+        image_id=image,
+        backend_container=backend_id,
+    )
+
     from docker_volume_dev import _startup_helper
 
     startup_helper, helper_hashes = _startup_helper(control, selected, image)

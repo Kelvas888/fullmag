@@ -44,6 +44,24 @@ pub(crate) struct AcceptedLiveStudyPreparationError {
     pub message: String,
 }
 
+/// Return the immutable project identity captured by one accepted RunIntent.
+///
+/// Live API process identity is intentionally absent here: a restart gets a
+/// new `request_scope_instance_id`, while the accepted definition and every
+/// later catalog/preparation operation remain bound to this snapshot.
+pub(crate) fn accepted_project_id_from_intent(
+    intent: &fullmag_session::FmsRunIntent,
+    run_id: &fullmag_application::RunId,
+) -> anyhow::Result<fullmag_application::ProjectId> {
+    intent.validate()?;
+    let specification: fullmag_application::RunSpecification =
+        serde_json::from_value(intent.specification.clone())?;
+    if intent.run_id != run_id.as_str() || specification.run_id != *run_id {
+        anyhow::bail!("accepted RunIntent identity differs from the requested run");
+    }
+    Ok(specification.snapshot.project_id)
+}
+
 /// Immutable result of the expensive accepted-study preparation phase.
 ///
 /// This value contains no durable RunIntent publication. Python/Gmsh may have
@@ -549,13 +567,6 @@ pub(crate) async fn release_accepted_live_study_with_transition(
             "durable accepted live execution storage is not configured",
         ));
     };
-    let project_id = fullmag_application::ProjectId::parse(format!(
-        "project-live-{}",
-        fullmag_session::hex_sha256(
-            format!("{}\0{}", state.request_scope_instance_id, context.session_id).as_bytes()
-        )
-    ))
-    .map_err(|error| ApiError::internal(format!("live project identity is invalid: {error}")))?;
     let typed_run_id = fullmag_application::RunId::parse(run_id.clone())
         .map_err(|error| ApiError::internal(format!("live run identity is invalid: {error}")))?;
     // The public startup/command request id is retained in the live request,
@@ -581,6 +592,16 @@ pub(crate) async fn release_accepted_live_study_with_transition(
                     "accepted startup run has no durable RunIntent",
                 )
             })?;
+        let project_id = crate::live_accepted_execution::accepted_project_id_from_intent(
+            &intent,
+            &typed_run_id,
+        )
+        .map_err(|error| {
+            ApiError::conflict_with_code(
+                "accepted_run_snapshot_unavailable",
+                format!("accepted startup RunIntent is not typed: {error:#}"),
+            )
+        })?;
         let accepted = fullmag_runtime_control::load_accepted_study_snapshot(
             &store,
             &typed_run_id,
@@ -846,13 +867,6 @@ pub(crate) async fn ensure_live_accepted_study_with_transition(
             "durable accepted live execution storage is not configured",
         ));
     };
-    let project_id = fullmag_application::ProjectId::parse(format!(
-        "project-live-{}",
-        fullmag_session::hex_sha256(
-            format!("{}\0{}", state.request_scope_instance_id, context.session_id).as_bytes(),
-        )
-    ))
-    .map_err(|error| ApiError::internal(format!("live project identity is invalid: {error}")))?;
     let run_id_for_lookup = current_run_id.clone();
     let existing_accepted = tokio::task::spawn_blocking(move || {
         let store = open_submit_store(&store_root)?;
@@ -872,6 +886,16 @@ pub(crate) async fn ensure_live_accepted_study_with_transition(
         }
         let typed_run_id = fullmag_application::RunId::parse(run_id_for_lookup.clone())
             .map_err(|error| ApiError::conflict(format!("durable live run id is invalid: {error}")))?;
+        let project_id = crate::live_accepted_execution::accepted_project_id_from_intent(
+            &intent,
+            &typed_run_id,
+        )
+        .map_err(|error| {
+            ApiError::conflict_with_code(
+                "accepted_execution_run_invalid",
+                format!("accepted live RunIntent is not typed: {error:#}"),
+            )
+        })?;
         fullmag_runtime_control::load_accepted_study_snapshot(&store, &typed_run_id, &project_id)
             .map_err(|error| {
                 ApiError::conflict_with_code(

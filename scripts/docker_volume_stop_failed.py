@@ -660,7 +660,21 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
         journal['terminal_failed_owner_sha256'] = hashlib.sha256(terminal_owner_raw).hexdigest()
         if native_failure_kind == 'native-after-ready-failure':
             journal['terminal_retained_ready_owner'] = terminal_ready_owner
-    journal.update(state='stopped-confirmed',exit_code=after['State']['ExitCode'])
+    after_state = after.get('State', {})
+    exit_code = after_state.get('ExitCode')
+    if type(exit_code) is not int:
+        raise BuildControlError('Stopped supervisor has no canonical Docker exit code')
+    journal.update(
+        state='stopped-confirmed',
+        exit_code=exit_code,
+        container_state={
+            'id': after.get('Id'),
+            'image': after.get('Image'),
+            'started_at': after_state.get('StartedAt'),
+            'finished_at': after_state.get('FinishedAt'),
+            'exit_code': exit_code,
+        },
+    )
     control.write(path,journal)
     print(json.dumps({'state':journal['state'],'container_id':args.container_id}))
     return 0
