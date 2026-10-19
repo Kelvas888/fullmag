@@ -109,7 +109,7 @@ class RuntimeServiceRecoveryBusyRetryTests(unittest.TestCase):
 
         self.assertIs(caught.exception, busy)
         self.assertEqual(clock.now, runtime_service.CONTAINER_RECOVERY_WRITER_BUSY_RETRY_SECONDS)
-        self.assertEqual(sum(clock.sleeps), runtime_service.CONTAINER_RECOVERY_WRITER_BUSY_RETRY_SECONDS)
+        self.assertAlmostEqual(sum(clock.sleeps), runtime_service.CONTAINER_RECOVERY_WRITER_BUSY_RETRY_SECONDS, places=12)
         self.assertGreater(run_cli.call_count, 1)
 
 

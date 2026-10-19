@@ -245,7 +245,7 @@ class SetupDockerChecks(unittest.TestCase):
             self.assertEqual(setup.main([]), 0)
         self.assertEqual(
             plan.call_args.args,
-            (Path("/repo"), "/storage", "/worktree", 4321),
+            (Path("/repo"), "/storage", str(Path("/worktree")), 4321),
         )
 
     def test_check_rejects_invalid_source_or_port_from_shared_resolver(self):
