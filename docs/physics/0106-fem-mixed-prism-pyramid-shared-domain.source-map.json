@@ -980,8 +980,8 @@
         "default": "required",
         "si_unit": "\\mathrm{A\\,m^{-1}}",
         "validation": "finite and strictly positive; owned by one magnetic body",
-        "meaning": "body saturation magnetization for the planned disconnected-body P1 field",
-        "backend_support": "planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields",
+        "meaning": "body saturation magnetization for the disconnected-body P1 field",
+        "backend_support": "implemented source-contract FEM CPU/GPU v2; current v1 rejects multi-body fields",
         "problem_ir": "geometry.entries[].material.Ms"
       },
       {
@@ -991,7 +991,7 @@
         "si_unit": "\\mathrm{J\\,m^{-1}}",
         "validation": "finite and strictly positive; no interpolation through air",
         "meaning": "body exchange stiffness for the body-local weak form",
-        "backend_support": "planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields",
+        "backend_support": "implemented source-contract FEM CPU/GPU v2; current v1 rejects multi-body fields",
         "problem_ir": "geometry.entries[].material.Aex"
       },
       {
@@ -1001,7 +1001,7 @@
         "si_unit": "1",
         "validation": "finite and non-negative; evaluated only in the owning body",
         "meaning": "body Gilbert damping coefficient",
-        "backend_support": "planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields",
+        "backend_support": "implemented source-contract FEM CPU/GPU v2; current v1 rejects multi-body fields",
         "problem_ir": "geometry.entries[].material.alpha"
       },
       {
@@ -1011,7 +1011,7 @@
         "si_unit": "\\mathrm{J\\,m^{-3}}",
         "validation": "finite when present; body-owned local coefficient",
         "meaning": "body first-order uniaxial anisotropy coefficient",
-        "backend_support": "planned FEM CPU/GPU mixed-P1 v2",
+        "backend_support": "implemented source-contract FEM CPU/GPU v2",
         "problem_ir": "geometry.entries[].physics_stack[].params.ku1"
       },
       {
@@ -1021,7 +1021,7 @@
         "si_unit": "1",
         "validation": "finite nonzero vector, normalized during canonical lowering",
         "meaning": "body uniaxial anisotropy axis",
-        "backend_support": "planned FEM CPU/GPU mixed-P1 v2",
+        "backend_support": "implemented source-contract FEM CPU/GPU v2",
         "problem_ir": "geometry.entries[].physics_stack[].params.axis"
       }
     ]

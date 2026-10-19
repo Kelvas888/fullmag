@@ -308,18 +308,20 @@ visualization must follow region ownership rather than node membership alone,
 because an air node can be shared with a magnetic boundary while the
 magnetization field is not defined in the air.
 
-### 3.2.2 Planned multi-material extension for separated magnetic bodies
+### 3.2.2 Implemented mixed-material source contract for separated magnetic bodies
 
 The exact source workload
-`examples/permalloy_layer_cofeb_rings_relax_300nm.py` is a future extension of
-this page, not evidence that the current single-Box certificate already
-supports it. It contains one swept `prism6` magnetic Box and one disconnected
-annular magnetic body with the default `tet4` mesh. The body-to-body gap is
-part of the physical model. The commented lower ring is not part of the
-current workload. The existing certificate v1 remains single-body and
-prism-only; it must reject this topology rather than reinterpret it. The
-extension requires a new certificate version, described below, and old v1
-readers must fail closed on it.
+`examples/permalloy_layer_cofeb_rings_relax_300nm.py` is the canonical fixture
+for the implemented v2 source path. Python meshing, the typed v2 certificate,
+IR validation, planner admission, native ABI lowering, and body-local operator
+source paths are present and covered by source/contract evidence. The managed
+FEM runtime, native operator execution, CPU/GPU parity, and physics
+qualification for this workload remain **NOT VERIFIED**. The fixture contains
+one swept `prism6` magnetic Box and one disconnected annular magnetic body with
+the default `tet4` mesh; the commented lower ring is not part of the workload.
+The existing certificate v1 remains single-body and prism-only and must reject
+this topology. The additive v2 certificate is the only source-contract path
+for it, and old v1 readers must fail closed on v2.
 
 Let the magnetic bodies be a finite set of pairwise disjoint open domains
 separated by a resolved air gap:
@@ -366,7 +368,7 @@ the shell thickness, while zero or multiple `exact_sweep` owners fail closed.
 The native v2 validator recomputes both bounds from the received mesh before
 accepting the certificate.
 
-The candidate v2 mesher must preserve requested algorithm intent separately
+The implemented v2 mesher preserves requested algorithm intent separately
 from the resolved per-domain realization. Gmsh 4.15.2 HXT (algorithm 10)
 accepts triangular boundaries only; it cannot generate the quad-to-pyramid
 transition directly. The bounded hybrid policy records
@@ -376,9 +378,9 @@ are generated separately from the HXT tetrahedral ring and far-air volumes in
 one conforming Gmsh model. Scoped visibility, exact sweep planes, shared node
 identity and per-family quality are verified after both stages. A requested
 `Gmsh` optimization and its iteration count remain explicit resolved inputs.
-This is not evidence of a whole-domain HXT mesh or permission to replace prisms
-with tetrahedra. This policy remains under implementation and is not runtime
-qualified.
+This is not evidence of a whole-domain HXT algorithm or permission to replace
+prisms with tetrahedra. It is source/contract evidence; managed runtime and
+physics qualification remain **NOT VERIFIED**.
 
 For curved bodies, `expected_magnetic_volume_m3` in the candidate v2 integrity
 proof means an independent integral over the closed, realized faceted body
@@ -437,17 +439,19 @@ demagnetization across the air gap, while exchange is confined to each body.
 The mass/damping realization uses the same body-local $M_{s,h}$ and
 $\alpha_h$ at quadrature; it must not replace them with a global mean.
 
-The first future implementation may use body-owned nodal-P1 coefficients for
+The implemented source contract uses body-owned nodal-P1 coefficients for
 disconnected bodies because no magnetic node is shared by two bodies. A
 touching or overlapping pair is a different problem. At a sharp magnetic
 interface a single shared nodal value cannot represent two independent limits;
 the planner must reject it until a conforming interface law or a DG0/material
-operator defines the exchange, trace and energy semantics. The extension must
-never hide this case with coefficient smoothing, node averaging, or a CPU
-fallback. An explicit interlayer-exchange interaction, if requested later,
-must be a separate coupling with its own units, provenance and validation.
+operator defines the exchange, trace and energy semantics. The source path never
+hides this case with coefficient smoothing, node averaging, or a CPU fallback.
+An explicit interlayer-exchange interaction, if requested later, must be a
+separate coupling with its own units, provenance and validation. Runtime and
+physics evidence for the implemented disconnected-body path remains
+**NOT VERIFIED**.
 
-The planned certificate schema is `mixed_layer_topology_certificate.v2`. It
+The implemented source-contract certificate schema is `mixed_layer_topology_certificate.v2`. It
 does not change the bytes or meaning of v1. A v1 reader must reject v2 as an
 unknown certificate version. The following is the selected interface; field
 names and units are part of the contract, while the implementation may use
@@ -469,12 +473,14 @@ language-specific structs for the same wire shape:
 | `fallbacks_triggered` | array of strings | must be empty for strict v2 acceptance |
 
 `CellFamily`, `MagneticRegionV2`, `ExactSweepEvidenceV2`,
-`BodySeparationPairV2` and `BodyMaterialFieldV2` are contract names, not a
-claim that these types already exist in the code. The v2 producer must sort
-regions by stable `object_id` and separation pairs by `(body_a, body_b)` before
-hashing. The native planner and both FEM lanes consume the same canonical
-shape; they must reject missing body records, duplicate ownership, non-positive
-`min_gap_m`, digest mismatch, and a non-empty fallback list.
+`BodySeparationPairV2` and `BodyMaterialFieldV2` are contract names with
+implementations in the Python meshing types and `fullmag-ir` v2 validator. The
+v2 producer must sort regions by stable `object_id` and separation pairs by
+`(body_a, body_b)` before hashing. The native planner and both FEM lanes
+consume the same canonical shape; they must reject missing body records,
+duplicate ownership, non-positive `min_gap_m`, digest mismatch, and a
+non-empty fallback list. This implementation status is source/contract only;
+managed runtime and operator/physics qualification remain **NOT VERIFIED**.
 
 `exact_sweep` is a typed regional object, never a free-form JSON blob. Its
 `topology_fingerprint` must equal the accepted mesh fingerprint for the
@@ -496,14 +502,14 @@ inputs, realization strategy and fallback list. `magnetic_regions[]`,
 separation evidence; they do not replace, weaken or summarize away the shared
 quality, manifold, facet-marker or fingerprint proof.
 
-| Planned realization | FEM CPU | FEM GPU | FDM CPU/GPU |
+| Realization status | FEM CPU | FEM GPU | FDM CPU/GPU |
 |---|---|---|---|
-| Disconnected bodies, `prism6` layer plus `tet4` ring, body-owned P1 `Ms/A/alpha/Ku1/u`, global Poisson demag | Planned; MFEM/hypre weak-form and body-marker evidence required | Planned; CUDA/libCEED parity and device-resident operator evidence required, with no CPU fallback | Not applicable; mixed FEM topology is not an FDM capability |
+| Disconnected bodies, `prism6` layer plus `tet4` ring, body-owned P1 `Ms/A/alpha/Ku1/u`, global Poisson demag | Implemented source/contract only: Python/IR certificate, planner/native lowering, body-local exchange and shared-domain Poisson source paths exist; managed CPU runtime and physics evidence are **NOT VERIFIED** | Implemented source/contract only: typed ABI/device ingress and body-marker/material paths exist; managed GPU runtime, device residency, CPU/GPU parity and physics evidence are **NOT VERIFIED**; no CPU fallback | Not applicable; mixed FEM topology is not an FDM capability |
 | Touching sharp material interface or explicit interlayer exchange | Fail closed until a dedicated interface operator is implemented and validated | Fail closed until the same operator has a native GPU realization and parity evidence | Not applicable |
 
 Both FEM lanes remain double precision and preserve requested versus resolved
 execution. Source presence, planner acceptance, or a successful build cannot
-promote this future row to `production_executable` or `validated`.
+promote this source-contract row to `production_executable` or `validated`.
 
 ### 3.3 FEM CPU and GPU
 
@@ -1146,13 +1152,15 @@ example below are:
 | `GeometryMeshHandle.thin_film.transition` | `"pyramid_to_tetrahedra" \| "reject" \| None` | `None` | $1$ | mixed shared-domain execution requires `"pyramid_to_tetrahedra"` | conforming air transition policy | FEM CPU/GPU only | `problem_meta.runtime_metadata.mesh_workflow.per_geometry[].transition_policy` |
 | `GeometryMeshHandle.thin_film.order` | `int \| None` | `None` | $1$ | prismatic execution accepts only `None` or `1` and resolves to P1 | finite-element order | FEM CPU/GPU only | `problem_meta.runtime_metadata.mesh_workflow.per_geometry[].order` |
 
-#### 4.1.1 Exact multi-material source mapping (planned)
+#### 4.1.1 Exact multi-material source mapping (implemented source-contract; runtime unverified)
 
-The tracked source is the acceptance fixture for the future extension. Its
-values are fixture inputs, not a new global material preset and not a reason to
-special-case a geometry name in the planner.
+The tracked source is the canonical fixture for the implemented v2 source
+path. Its values are fixture inputs, not a new global material preset and not a
+reason to special-case a geometry name in the planner. The source mapping and
+lowering are implemented; managed runtime, operator execution, and physics
+qualification remain **NOT VERIFIED**.
 
-| Source role | Authoring in `examples/permalloy_layer_cofeb_rings_relax_300nm.py` | Required future lowering |
+| Source role | Authoring in `examples/permalloy_layer_cofeb_rings_relax_300nm.py` | Implemented source lowering; managed qualification |
 |---|---|---|
 | Swept body | `study.geometry(fm.Box(...), name="permalloy_layer")` with `LAYER_SIZE=(2000\,\mathrm{nm},600\,\mathrm{nm},1.6\,\mathrm{nm})`, `through_thickness_elements=1`, `topology="prismatic"`, `exact_layer_count=True` | one magnetic body marker, `prism6`, exact one-layer certificate entry |
 | Disconnected body | `ring_geometry("cofeb_top_ring", RING_CENTER_Z)` built from a Boolean annulus of two cylinders and assigned to `top_ring` | one distinct magnetic body marker, default `tet4` P1 cells, measured positive gap to the swept body |
@@ -1163,26 +1171,28 @@ special-case a geometry name in the planner.
 
 The lower ring code is commented out in the fixture and is not part of this
 acceptance scope. The public object attributes used by this fixture already
-exist in the Python authoring surface, but their multi-body mixed-P1 execution
-is a planned capability and currently must fail closed:
+exist in the Python authoring surface. Their v2 source lowering and validation
+are implemented; invalid, missing, stale, touching, overlapping, or bridged
+records still fail closed. Managed runtime, operator execution, and physics
+qualification remain **NOT VERIFIED**:
 
-| Python object/parameter | Type and unit | Required validation for the planned scope | Planned `ProblemIR` destination |
+| Python object/parameter | Type and unit | Required validation for the v2 source-contract scope | `ProblemIR` destination |
 |---|---|---|---|
 | Python parameter | Type | Default | SI unit | Validation domain | Meaning | Backend support | ProblemIR destination |
 |---|---|---|---|---|---|---|---|
-| `MagnetHandle.Ms` | `float` | required | $\mathrm{A\,m^{-1}}$ | finite and strictly positive; owned by one magnetic body | body saturation magnetization for the planned disconnected-body P1 field | planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields | `geometry.entries[].material.Ms` and `mixed_certificate_v2.magnetic_regions[].material` |
-| `MagnetHandle.Aex` | `float` | required | $\mathrm{J\,m^{-1}}$ | finite and strictly positive; no interpolation through air | body exchange stiffness for the body-local weak form | planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields | `geometry.entries[].material.Aex` and `mixed_certificate_v2.magnetic_regions[].material` |
-| `MagnetHandle.alpha` | `float` | `0.01` | $1$ | finite and non-negative; evaluated only in the owning body | body Gilbert damping coefficient | planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields | `geometry.entries[].material.alpha` and `mixed_certificate_v2.magnetic_regions[].material` |
-| `MagnetHandle.Ku1` | `float \| None` | `None` | $\mathrm{J\,m^{-3}}$ | finite when present; body-owned local coefficient | body first-order uniaxial anisotropy coefficient | planned FEM CPU/GPU mixed-P1 v2 | `geometry.entries[].physics_stack[].params.ku1` |
-| `MagnetHandle.anisU` | `tuple[float, float, float] \| None` | `None` | $1$ | finite nonzero vector, normalized during canonical lowering | body uniaxial anisotropy axis | planned FEM CPU/GPU mixed-P1 v2 | `geometry.entries[].physics_stack[].params.axis` |
+| `MagnetHandle.Ms` | `float` | required | $\mathrm{A\,m^{-1}}$ | finite and strictly positive; owned by one magnetic body | body saturation magnetization for the disconnected-body P1 field | implemented source-contract FEM CPU/GPU v2; current v1 rejects multi-body fields | `geometry.entries[].material.Ms` and `mixed_certificate_v2.magnetic_regions[].material` |
+| `MagnetHandle.Aex` | `float` | required | $\mathrm{J\,m^{-1}}$ | finite and strictly positive; no interpolation through air | body exchange stiffness for the body-local weak form | implemented source-contract FEM CPU/GPU v2; current v1 rejects multi-body fields | `geometry.entries[].material.Aex` and `mixed_certificate_v2.magnetic_regions[].material` |
+| `MagnetHandle.alpha` | `float` | `0.01` | $1$ | finite and non-negative; evaluated only in the owning body | body Gilbert damping coefficient | implemented source-contract FEM CPU/GPU v2; current v1 rejects multi-body fields | `geometry.entries[].material.alpha` and `mixed_certificate_v2.magnetic_regions[].material` |
+| `MagnetHandle.Ku1` | `float \| None` | `None` | $\mathrm{J\,m^{-3}}$ | finite when present; body-owned local coefficient | body first-order uniaxial anisotropy coefficient | implemented source-contract FEM CPU/GPU v2 | `geometry.entries[].physics_stack[].params.ku1` |
+| `MagnetHandle.anisU` | `tuple[float, float, float] \| None` | `None` | $1$ | finite nonzero vector, normalized during canonical lowering | body uniaxial anisotropy axis | implemented source-contract FEM CPU/GPU v2 | `geometry.entries[].physics_stack[].params.axis` |
 
-The future normalized IR must retain stable `object_id`, body/material marker,
-cell-family membership, requested material values, realized coefficient
-representation, and the measured gap/contact result. The canonical realized
-form is not yet emitted by current lowering: it is a required implementation
-output for certificate v2, not a hand-shaped JSON fixture. Until that output,
-the exact source is expected to receive a stable unsupported-capability error
-before native operator allocation.
+The implemented normalized IR retains stable `object_id`, body/material
+markers, cell-family membership, requested material values, realized
+coefficient representation, and the measured gap/contact result. The canonical
+realized form is emitted through the v2 certificate/build-report path and is
+validated before native operator allocation. This is source/contract evidence;
+managed runtime, operator execution, and physics qualification remain
+**NOT VERIFIED**.
 
 ```python
 # %% Author one strict mixed-P1 film.
@@ -1351,8 +1361,8 @@ startup. Unsupported combinations—including `time_evolution`, FEM/BEM,
 PBC/Floquet, GPU DMI, STT, thermal, magnetoelastic, regional projection,
 frequency-domain/eigen studies, DG0 interfaces, high order, multiple bodies,
 and physical multilayers—retain their existing rejection in certificate v1.
-The planned disconnected-body extension uses certificate v2 and admits only
-positive-gap bodies with body-owned P1 material fields; it still rejects
+The implemented v2 source contract admits only positive-gap bodies with
+body-owned P1 material fields; it still rejects
 touching sharp interfaces and explicit interlayer exchange until their
 operators are defined. CPU DMI is admitted by the lane-specific source
 contract. A free-tetrahedral
@@ -1375,8 +1385,13 @@ fem.gpu.exchange_demag.mixed_p1.disconnected_bodies
 ```
 
 The four mesh capabilities, both bounded CPU/GPU operator capabilities, and the
-local-interaction extension are `implemented`; evidence for the extension is
-source/contract only. Neither operator lane is `production_executable` or `validated`. The
+local-interaction extension are `implemented`; evidence for these source paths
+is source/contract only. Neither operator lane is `production_executable` or
+`validated`. The three disconnected-body v2 IDs below also have implemented
+source/contract paths across Python, IR, planner, runner/native ABI, and
+body-local/shared-domain operator lowering. Their managed runtime, CPU/GPU
+operator execution, device residency, parity, and physics qualification are
+**NOT VERIFIED** and are not advertised as public executable capabilities. The
 legal implementation target is strict FEM, explicit CPU or GPU, double
 precision, the narrow workload in Section 1, and no fallback. `auto` remains
 rejecting. Authored device intent, a managed-launcher override, the plan-bound
@@ -1387,32 +1402,35 @@ are admitted. On GPU, uniform or nodal-P1 uniaxial/cubic anisotropy is admitted,
 but DMI remains fail-closed with `gpu_dmi_kernel_not_mixed_p1`. This paragraph
 is source-contract status only and makes no runtime qualification claim.
 
-The exact CoFeB-ring source is a separate `planned` extension. Its source
-contract requires one shared-domain Poisson mesh containing `prism6` magnetic
-cells for the swept layer and `tet4` magnetic cells for the disconnected ring,
+The exact CoFeB-ring source is the v2 source-contract fixture. Its mapping
+requires one shared-domain Poisson mesh containing `prism6` magnetic cells for
+the swept layer and `tet4` magnetic cells for the disconnected ring,
 body-owned `Ms/Aex/alpha/Ku1/anisU` fields, and a v2 certificate with explicit
 gap evidence. Demag couples the bodies through the air; exchange does not cross
-the gap. CPU and GPU must implement the same body marker and quadrature policy,
-while a forced GPU request fails if the native GPU realization is unavailable.
-No status in the current rows is promoted by this planned contract.
+the gap. CPU and GPU source paths carry the same body marker and quadrature
+policy, while a forced GPU request fails if the native GPU realization is
+unavailable. Managed runtime, operator parity, and physics qualification remain
+**NOT VERIFIED**; no current row is promoted by source presence alone.
 
 Until separately qualified, planning rejects FEM/BEM demag, PBC/Floquet,
 GPU DMI, STT/thermal/magnetoelastic terms, regional projections, eigen/frequency-
 domain studies, DG0/material interfaces, order greater than one, arbitrary OCC
 shapes, touching multiple bodies, and multilayers. Disconnected multiple
-bodies remain rejected by v1 and are admitted only through the future v2 rows.
+bodies remain rejected by v1 and are admitted at source/contract level only through the implemented v2 rows; managed runtime and physics qualification remain **NOT VERIFIED**.
 
 (implementation-mapping)=
 ### 4.5 Runtime, ABI, and native implementation mapping
 
 Production topology import, basis/quadrature, exchange, Poisson RHS/solve/
 recovery, relaxation, and final execution preflight belong under
-`backends/fem`. The implemented and unit-qualified language-neutral certificate
-computation and validation owner is
-`crates/fullmag-ir/src/mixed_certificate.rs`, as frozen by Section 3.4.3. The
-current meshing producer remains Python. Artifact-v2 persistence now invokes
-the native language-neutral validator with explicit native-required production
-semantics, while managed FEM runtime integration remains not verified. Rust
+`backends/fem`. The implemented language-neutral certificate
+computation and validation source owners are `crates/fullmag-ir/src/mixed_certificate.rs`
+and `crates/fullmag-ir/src/mixed_certificate_v2.rs`, as frozen by Section 3.4.3.
+The existing v1 unit evidence does not qualify the v2 source implementation.
+The current meshing producer remains Python. Artifact-v2 persistence and v2
+planner/native preflight invoke the typed validators with explicit
+native-required production semantics, while managed FEM runtime integration,
+operator execution, and physics qualification remain **NOT VERIFIED**. Rust
 runner code owns orchestration, typed ABI lowering, requested/resolved
 provenance, artifacts, and rejection before startup; neither `fullmag-ir` nor
 the runner may implement a second FEM solver or hidden element conversion.
@@ -1642,8 +1660,9 @@ No lower level implies a higher one.
   variants remain outside it.
 - Arbitrary OCC shapes, cylinders, imported CAD/STL, and physical multilayers
   are deferred. Certificate v1 still rejects multiple magnetic bodies; the
-  positive-gap disconnected-body extension is planned under certificate v2
-  and is not implemented or qualified.
+  positive-gap disconnected-body extension is implemented at source/contract
+  level under certificate v2; managed runtime, operators, CPU/GPU parity and
+  physics qualification remain **NOT VERIFIED**.
 - PBC/Floquet, FEM/BEM/FMM, frequency-domain/eigen, GPU DMI, STT, thermal,
   magnetoelasticity, regional projections, DG0/material-interface publication,
   and order greater than one are deferred.
@@ -1689,9 +1708,9 @@ No lower level implies a higher one.
 | Canonical typed certificate schema | `crates/fullmag-ir/src/mesh_assets.rs` | `MixedLayerTopologyCertificateV1IR` | owns the complete certificate field set and rejects unknown fields before a certificate can contribute to the bridge digest or canonical validation | backend-neutral `fullmag-ir`; consumed by FEM CPU/GPU | full `fullmag-ir` suite: 372 passing tests; production caller/runtime not verified |
 | Language-neutral certificate evidence computation | `crates/fullmag-ir/src/mixed_certificate.rs` | `compute_mixed_certificate_evidence` | computes deterministic mixed-certificate evidence from typed `MeshIR` with immutable Rayon records and canonical ordered reductions | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented and unit-qualified: 8 parallel/determinism tests plus 21 `mesh_assets` tests; bridge and artifact caller host-tested; managed runtime not verified |
 | Language-neutral certificate validation | `crates/fullmag-ir/src/mixed_certificate.rs` | `validate_mixed_layer_topology_certificate_against_mesh` | validates `(mesh, certificate)` against exact topology fingerprint, counts, metrics, ownership, and canonical tolerances | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented and unit-qualified: 8 parallel/determinism tests plus 21 `mesh_assets` tests; managed FEM runtime not verified |
-| Mixed-body v2 volume reduction | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `CompensatedSum` | accumulates shared-domain, per-body magnetic, and closed-faceted volume evidence with fixed-order Neumaier-compensated binary64 arithmetic | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | source implementation under review; runtime not verified |
-| Mixed-body v2 shell owner | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `exact_swept_body_bounds` | selects the unique `exact_sweep` region for transition-shell bounds while preserving the union of all magnetic bodies for the top-level bounds proof | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | source implementation under review; runtime not verified |
-| Mixed-body v2 certificate validation | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `validate_mixed_layer_topology_certificate_v2_against_mesh` | recomputes v2 topology, body ownership, regional shell, quality, and volume evidence from the received typed mesh with fail-closed exact-sweep ownership | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | source implementation under review; runtime not verified |
+| Mixed-body v2 volume reduction | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `CompensatedSum` | accumulates shared-domain, per-body magnetic, and closed-faceted volume evidence with fixed-order Neumaier-compensated binary64 arithmetic | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented source/contract; managed runtime not verified |
+| Mixed-body v2 shell owner | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `exact_swept_body_bounds` | selects the unique `exact_sweep` region for transition-shell bounds while preserving the union of all magnetic bodies for the top-level bounds proof | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented source/contract; managed runtime not verified |
+| Mixed-body v2 certificate validation | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `validate_mixed_layer_topology_certificate_v2_against_mesh` | recomputes v2 topology, body ownership, regional shell, quality, and volume evidence from the received typed mesh with fail-closed exact-sweep ownership | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented source/contract; managed runtime not verified |
 | Typed PyO3 certificate entry | `crates/fullmag-py-core/src/mixed_certificate.rs` | `certify_mixed_mesh_arrays` | enforces the 1 MiB pre-parse cap, rejects unknown certificate fields, and builds owned typed `MeshIR` plus the Python-canonical typed certificate projection under the GIL, then hashes and computes/validates through `fullmag-ir` while detached | backend-neutral bridge intended for FEM CPU/GPU | implemented and host-extension qualified: 11 Rust core tests and 17 real-extension Python tests with no skips; artifact caller host-tested, managed runtime not verified |
 | Typed PyO3 structural preflight | `crates/fullmag-py-core/src/mixed_certificate.rs` | `preflight_mixed_mesh_arrays` | accepts an exact separated metadata/expected envelope and validates structure plus counts/fingerprint without invoking certificate evidence or adjacency | backend-neutral bridge intended for FEM CPU/GPU | implemented and host-extension qualified; override regressions and production-seam probe prove metadata isolation and zero certificate-engine calls |
 | Python certificate adapter | `packages/fullmag-py/src/fullmag/_core.py` | `certify_mixed_mesh_arrays` | exposes the exact mandatory keyword-only `MeshData` adapter and strict native-selection boundary without `.tolist()` topology conversion | Python bridge for FEM CPU/GPU | implemented and real-extension tested; artifact v2 requires native on save and records explicit non-production Python fallback on public full audit |
@@ -1725,7 +1744,7 @@ No lower level implies a higher one.
 | Demag field recovery | `backends/fem/cpu/mfem/interactions/demag_poisson_recovery.cpp` | `recover_demag_poisson_field` | recovers $\mathbf H_{\mathrm{demag}}$ on magnetic cells | FEM CPU | manufactured/operator contracts; managed proof pending |
 | Demag energy | `backends/fem/cpu/mfem/interactions/demag_poisson_energy.cpp` | `demag_poisson_energy_from_field` | evaluates the existing demag-energy sign contract | FEM CPU | energy contracts; managed proof pending |
 | Magnetic nodal weights | `backends/fem/core/fem_mesh.cpp` | `compute_node_volumes` | synchronizes mixed P1 mass-row-sum volume weights | FEM CPU/GPU shared contract | native material/metric contracts |
-| Native disconnected-body certificate scope | `backends/fem/core/fem_mesh.cpp` | `validate_mixed_body_certificate_v2` | checks realized body ownership and positive AABB separation while keeping air-gap coupling outside the magnetic exchange ownership proof | FEM CPU/GPU | source implementation under review; runtime not verified |
+| Native disconnected-body certificate scope | `backends/fem/core/fem_mesh.cpp` | `validate_mixed_body_certificate_v2` | checks realized body ownership and positive AABB separation while keeping air-gap coupling outside the magnetic exchange ownership proof | FEM CPU/GPU | implemented source/contract; managed runtime and physics not verified |
 | CPU magnetic-node RHS mask | `backends/fem/cpu/mfem/integrators/llg_rhs.cpp` | `llg_rhs_aos` | zeros the LLG RHS outside the magnetic-node mask and excludes inactive nodes from RHS maxima | FEM CPU | source implementation under review; managed trajectory not verified |
 | GPU magnetic-node RHS mask | `backends/fem/gpu/cuda/integrators/llg/llg_rhs_kernels.cu` | `llg_rhs_fused_kernel` | zeros the LLG RHS outside the magnetic-node mask and excludes inactive nodes from RHS maxima | FEM GPU | source implementation under review; managed trajectory not verified |
 | Uniform/nodal uniaxial CPU field/energy | `backends/fem/cpu/mfem/interactions/anisotropy_uniaxial.cpp` | `compute_uniaxial_anisotropy_field` | evaluates local `Ku1`/`Ku2` fields and mass-lumped energy without cell-connectivity assumptions | FEM CPU | source/contract evidence |
@@ -1734,11 +1753,11 @@ No lower level implies a higher one.
 | Uniform/nodal cubic GPU field/energy | `backends/fem/gpu/cuda/interactions/anisotropy/anisotropy_kernels.cu` | `fullmag_cuda_cubic_anisotropy_field_energy_blocks` | evaluates the same cubic nodal contract on device | FEM GPU | source/contract evidence |
 | CPU interfacial/bulk DMI | `backends/fem/cpu/mfem/interactions/dmi_interfacial.cpp`; `backends/fem/cpu/mfem/interactions/dmi_bulk.cpp` | `compute_interfacial_dmi_field`; `compute_bulk_dmi_field` | evaluates DMI fields and energies on magnetic prism6 elements | FEM CPU | source/contract evidence |
 | GPU mixed-P1 DMI rejection | `backends/fem/core/fem_mesh.cpp` | `validate_supported_physics_topology` | rejects mixed-P1 GPU DMI with `gpu_dmi_kernel_not_mixed_p1` before unsupported startup | FEM GPU | fail-closed source/contract evidence |
-| Exact multi-material source fixture | `examples/permalloy_layer_cofeb_rings_relax_300nm.py` | `study` | maps one swept prism layer, one disconnected tetrahedral ring, body-specific material/initial state, shared Poisson demag and GPU/double request; current v1 scope rejects it | FEM CPU/GPU planned v2 | source fixture only; no lowering, runtime or physics qualification |
-| Body-owned material lowering boundary | `packages/fullmag-py/src/fullmag/world.py` | `MagnetHandle._to_ferromagnet` | preserves one material and initial state per named magnetic body for the planned v2 lowering | FEM CPU/GPU planned v2 | authoring source exists; mixed-body execution pending |
-| Body material ProblemIR export | `packages/fullmag-py/src/fullmag/runtime/script_builder.py` | `_export_geometry_entry` | exports per-body material and physics-stack fields into the planned v2 geometry lowering | FEM CPU/GPU planned v2 | export boundary exists; mixed-body execution pending |
-| Planned certificate-v2 contract | `docs/adr/0021-native-mixed-p1-fem-topology.md` | `DOC-ANCHOR:mixed-p1-v2-disconnected-bodies` | binds per-body markers, magnetic cell families, exact sweep evidence, positive gaps and body-local material realization without changing v1 | FEM CPU/GPU planned v2 | documentation contract; implementation and validation pending |
-| Planned body-local exchange/demag operators | `backends/fem/cpu/mfem/interactions/exchange_operator.cpp`; `backends/fem/cpu/mfem/interactions/demag_poisson_rhs.cpp` | `initialize_exchange_operator_mfem`; `assemble_demag_poisson_rhs` | future implementation must sum exchange over bodies and sum body sources into shared Poisson demag without cross-gap exchange | FEM CPU/GPU planned v2 | no source/runtime evidence for this extension |
+| Exact multi-material source fixture | `examples/permalloy_layer_cofeb_rings_relax_300nm.py` | `study` | maps one swept prism layer, one disconnected tetrahedral ring, body-specific material/initial state, shared Poisson demag and GPU/double request into the v2 source contract; v1 remains rejecting | FEM CPU/GPU v2 source/contract | source/contract only; managed runtime, operator execution and physics qualification **NOT VERIFIED** |
+| Body-owned material lowering boundary | `packages/fullmag-py/src/fullmag/world.py` | `MagnetHandle._to_ferromagnet` | preserves one material and initial state per named magnetic body for implemented v2 source lowering | FEM CPU/GPU v2 source/contract | source/contract only; managed runtime and physics qualification **NOT VERIFIED** |
+| Body material ProblemIR export | `packages/fullmag-py/src/fullmag/runtime/script_builder.py` | `_export_geometry_entry` | exports per-body material and physics-stack fields into implemented v2 geometry lowering | FEM CPU/GPU v2 source/contract | source/contract only; managed runtime and physics qualification **NOT VERIFIED** |
+| Certificate-v2 source contract | `docs/adr/0021-native-mixed-p1-fem-topology.md` | `DOC-ANCHOR:mixed-p1-v2-disconnected-bodies` | binds per-body markers, magnetic cell families, exact sweep evidence, positive gaps and body-local material realization without changing v1 | FEM CPU/GPU v2 source/contract | implemented source/contract; managed runtime and physics qualification **NOT VERIFIED** |
+| Body-local exchange/shared-domain demag source paths | `backends/fem/cpu/mfem/interactions/exchange_operator.cpp`; `backends/fem/cpu/mfem/interactions/demag_poisson_rhs.cpp` | `initialize_exchange_operator_mfem`; `assemble_demag_poisson_rhs` | source paths preserve body-local exchange and sum body sources into shared Poisson demag without cross-gap exchange | FEM CPU/GPU v2 source/contract | source/operator contract only; managed CPU/GPU runtime, parity and physics qualification **NOT VERIFIED** |
 | FMMQ v1 writer | `packages/fullmag-py/src/fullmag/meshing/remesh_cli.py` | `_write_quality_data_artifact_if_available` | zapisuje bieżące równoległe tablice FMMQ v1 bez tożsamości topologii; może zapisać tablice z mixed mesh, ale payload nie kwalifikuje mixed | writer: current; qualification: tetra-only limit | current source contract |
 | FMMQ v1 decoder | `apps/control-room/src/kernel/api/codecs/meshQualityDataCodec.ts` | `decodeMeshQualityData` | dekoduje bieżący układ FMMQ v1 | Control room | current codec tests |
 | FMMQ v2 contract | `docs/adr/0027-canonical-fem-mesh-policy-and-quality-evidence.md` | `DOC-ANCHOR:fmmq-v2-contract` | definiuje planowany topology-aware v2 i v1 exit | Cross-layer contract | planned contract |

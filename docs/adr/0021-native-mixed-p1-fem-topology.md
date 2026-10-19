@@ -40,11 +40,13 @@ numeric element IDs. The target vocabulary includes
 `mesh.topology.mixed_p1`, `mesh.swept.prism`,
 `mesh.transition.pyramid_tet`, `mesh.exact_layer_count`,
 `fem.cpu.exchange_demag.mixed_p1`, and
-`fem.gpu.exchange_demag.mixed_p1`. The planned extension adds
-`mesh.topology.mixed_p1.v2.disconnected_bodies`,
+`fem.gpu.exchange_demag.mixed_p1`. The implemented source-contract extension
+also defines `mesh.topology.mixed_p1.v2.disconnected_bodies`,
 `fem.cpu.exchange_demag.mixed_p1.disconnected_bodies`, and
 `fem.gpu.exchange_demag.mixed_p1.disconnected_bodies` without changing the
-meaning of the v1 IDs.
+meaning of the v1 IDs. These v2 IDs are not public executable or validated
+capabilities until managed runtime, operator, parity, and physics evidence is
+available.
 
 The bounded relaxation implementation accepts exact `layers` in `{1, 2, 3}`.
 For any accepted count `L`, requested and realized counts are both `L` and the
@@ -55,12 +57,13 @@ these meshes is a shell, 2.5D, or thickness-averaged model.
 (mixed-p1-v2-disconnected-bodies)=
 <!-- DOC-ANCHOR:mixed-p1-v2-disconnected-bodies -->
 The existing `mixed_layer_topology_certificate.v1` keeps its single magnetic
-prism meaning. A future `v2` certificate may describe multiple magnetic body
-regions and mixed magnetic cell families (`prism6` for the swept body and
-`tet4` for a disconnected body). It must bind body/material markers, apply
-exact-layer evidence only to the swept region, and carry a measured positive
-gap/contact result. v1 readers reject v2; v2 must never be encoded as a v1
-single-marker certificate.
+prism meaning. The implemented source-contract `v2` certificate describes
+multiple magnetic body regions and mixed magnetic cell families (`prism6` for
+the swept body and `tet4` for a disconnected body). It binds body/material
+markers, applies exact-layer evidence only to the swept region, and carries a
+measured positive gap/contact result. v1 readers reject v2; v2 must never be
+encoded as a v1 single-marker certificate. Managed runtime, operator execution,
+CPU/GPU parity, and physics qualification remain **NOT VERIFIED**.
 
 For a positive-gap pair, body-owned nodal-P1 `Ms`, `Aex`, `alpha`, anisotropy
 coefficients and axes are sufficient. Their interpolation is evaluated only
@@ -77,12 +80,12 @@ could be disjoint. Air cells incident to two body boundaries remain legal:
 only magnetic cells/shared magnetic node ownership create an exchange bridge.
 This bound does not add a narrow-phase contact solver or a new interaction.
 
-For the HXT request, the candidate realization records the requested algorithm
-separately from algorithm 1 for quad/pyramid transition volumes and algorithm
-10 for the remaining tetrahedral volumes. Note 0106 owns this bounded hybrid
-meshing policy and the independent faceted-boundary volume-integrity proof;
-neither changes the requested exact prism layers or claims CAD convergence.
-Runtime qualification remains pending.
+For the HXT request, the implemented source realization records the requested
+algorithm separately from algorithm 1 for quad/pyramid transition volumes and
+algorithm 10 for the remaining tetrahedral volumes. Note 0106 owns this bounded
+hybrid meshing policy and the independent faceted-boundary volume-integrity
+proof; neither changes the requested exact prism layers or claims CAD
+convergence. Managed runtime and physics qualification remain **NOT VERIFIED**.
 
 The v2 wire shape is owned by canonical note 0106. Its required top-level
 fields are `schema_version`, `certificate_status`, `magnetic_regions[]`,
@@ -145,16 +148,20 @@ Remaining costs and risks:
    rejects FEM/BEM, PBC/Floquet, DMI/STT/thermal/magnetoelastic, regional
    projections, eigen/frequency-domain, DG0/material interfaces, order greater
    than one, arbitrary OCC shapes, multiple bodies, and multilayers. The
-   planned certificate-v2 path may admit only positive-gap disconnected
+   implemented certificate-v2 source path admits only positive-gap disconnected
    bodies under the dedicated body-marker and material-field contract; all
    contact, overlap and explicit interlayer-exchange cases remain rejected.
+   Managed runtime, operator execution, CPU/GPU parity, and physics
+   qualification for this v2 path remain **NOT VERIFIED**.
 3. Keep production element import, H1 spaces, basis/quadrature, exchange,
    Poisson, relaxation, and final execution preflight under `backends/fem`.
    Keep language-neutral certificate evidence computation and validation in
-   `fullmag-ir`, with the implemented, host-unit-qualified owner
-   `crates/fullmag-ir/src/mixed_certificate.rs`; it consumes typed realized
-   topology and does not own meshing, MFEM assembly, or solver execution. Its
-   typed PyO3 bridge is implemented and host-extension qualified. Artifact v2
+   `fullmag-ir`, with the implemented source owners
+   `crates/fullmag-ir/src/mixed_certificate.rs` and
+   `crates/fullmag-ir/src/mixed_certificate_v2.rs`; they consume typed realized
+   topology and do not own meshing, MFEM assembly, or solver execution. The v1
+   owner and its typed PyO3 bridge retain their existing host-unit/extension
+   qualification; that evidence does not qualify the v2 source implementation. Artifact v2
    persistence calls that validator with explicit native-required save
    semantics and binds its result in a deterministic receipt; public full audit
    records a Python fallback as non-production, and private fast trust requires
@@ -216,8 +223,9 @@ operator slices are deliberately separate:
 4. add CPU mixed-P1 operators and managed validation;
 5. add GPU double operators and same-mesh parity;
 6. enable the narrow qualified workload only after all layer gates pass;
-7. add the additive v2 certificate and disconnected-body planner/native
-   contracts without changing v1 readers;
+7. complete the additive v2 certificate and disconnected-body planner/native
+   source contracts without changing v1 readers; this implementation status is
+   source/contract only and is not runtime qualification;
 8. qualify the exact CoFeB-ring CPU/GPU workload only after gap, marker,
    operator, and physics gates pass;
 9. retire the v1-only reader under the criterion above.

@@ -366,11 +366,12 @@ Własność pozostaje backends-first:
 
 - typowany import topologii, bazisy, kwadratura, Jacobiany, exchange, Poisson,
   recovery, energia, relaksacja i finalny preflight wykonawczy należą do
-  `backends/fem`; zaimplementowany i zakwalifikowany testami jednostkowymi
-  językowo neutralny silnik rekalkulacji i walidacji certyfikatu należy do
-  `crates/fullmag-ir/src/mixed_certificate.rs` i nie przejmuje generowania
-  mesha, MFEM ani solvera; jego typowany bridge PyO3 jest zaimplementowany i
-  zakwalifikowany na hostowym rozszerzeniu, natomiast produkcyjny caller,
+  `backends/fem`; zaimplementowane językowo
+  neutralne silniki rekalkulacji i walidacji certyfikatu należą do
+  `crates/fullmag-ir/src/mixed_certificate.rs` oraz
+  `crates/fullmag-ir/src/mixed_certificate_v2.rs` i nie przejmują generowania
+  mesha, MFEM ani solvera; istniejąca kwalifikacja hostowa i bridge PyO3
+  dotyczą v1 i nie kwalifikują v2. V2 ma dowód source/contract only; produkcyjny caller,
   integracja provenance z oracle Python, artifact receipt i użycie w managed
   FEM runtime pozostają niezweryfikowane;
 - runner posiada wyłącznie walidację planu przed startem, lowering typowanego
@@ -390,14 +391,15 @@ uniaxial i cubic anisotropy, ale DMI odrzuca fail-closed z tokenem
 twierdzenia o kwalifikacji runtime. FEM/BEM, PBC/Floquet, STT/thermal/
 magnetoelastic, regional projections, eigen/frequency-domain, DG0/material
 interfaces, order>1, arbitrary OCC, multi-body i multilayer pozostają
-fail-closed w bieżącym certyfikacie v1. Osobny, planowany certyfikat v2
-obejmie wyłącznie rozłączne ciała z dodatnią szczeliną: swept `prism6` dla
+fail-closed w bieżącym certyfikacie v1. Implementowany source-contract v2
+obejmuje wyłącznie rozłączne ciała z dodatnią szczeliną: swept `prism6` dla
 warstwy oraz `tet4` dla odłączonego ciała, z body-owned nodal `Ms/Aex/alpha`
 i osobnymi markerami materiału. Demag pozostaje globalnym operatorem
 shared-domain, a exchange jest sumą operatorów body-local i nie przekracza
 szczeliny. Stykające lub nakładające się materiały oraz jawne interlayer
 exchange nadal pozostają fail-closed do czasu zdefiniowania operatora
-interfejsu.
+interfejsu. Managed runtime, operator execution, CPU/GPU parity i physics
+qualification v2 pozostają **NOT VERIFIED**.
 
 Obecny stan topologii, operatorów i rozszerzenia lokalnych interakcji jest
 `implemented`; dostępny dowód pozostaje wyłącznie source/contract. CPU obejmuje uniform/nodal
@@ -417,13 +419,13 @@ fallbacków zarówno w certyfikacie, jak i nadrzędnym build reporcie oraz
 Tetrahedralny FMMT v1 pozostaje wyłącznie readerem kompatybilności i nie może
 maskować ani obcinać komórek mieszanych.
 
-### 7.0.2 Planowany multi-material mixed-P1 v2
+### 7.0.2 Multi-material mixed-P1 v2 — implemented source contract, runtime unverified
 
-Dokładny zakres `examples/permalloy_layer_cofeb_rings_relax_300nm.py` wymaga
-rozszerzenia v2, ponieważ obecny certyfikat v1 zakłada jeden magnetic marker i
-magnetic `prism6`. Nowy certyfikat musi zachować per-body `object_id`,
-`material_id`, cell family, exact-sweep record i wynik pomiaru gap/contact.
-Stare czytniki v1 mają odrzucać v2 przed alokacją operatorów.
+Dokładny zakres `examples/permalloy_layer_cofeb_rings_relax_300nm.py` jest
+obsługiwany przez zaimplementowany source-contract v2, ponieważ certyfikat v1
+nadal zakłada jeden magnetic marker i magnetic `prism6`. V2 zachowuje per-body
+`object_id`, `material_id`, cell family, exact-sweep record i wynik pomiaru
+gap/contact. Stare czytniki v1 odrzucają v2 przed alokacją operatorów.
 Regionalne rekordy v2 rozszerzają wspólny proof v1: cell/facet marker counts,
 Jacobian i scaled-quality evidence, manifold/interface counters, shared-domain
 volume checks oraz topology fingerprint i node-order binding pozostają
@@ -439,7 +441,7 @@ MFEM/libCEED/CUDA mają zachować ten sam weak form, markery, kwadraturę, znaki
 jednostki i requested/resolved/executed provenance; forced GPU nie może spaść
 na CPU.
 
-Planowane capability IDs to:
+Source-contract capability IDs to:
 
 ```text
 mesh.topology.mixed_p1.v2.disconnected_bodies
@@ -447,7 +449,10 @@ fem.cpu.exchange_demag.mixed_p1.disconnected_bodies
 fem.gpu.exchange_demag.mixed_p1.disconnected_bodies
 ```
 
-Są to statusy `planned`, bez dowodu executable/runtime/physics validation.
+Są to źródłowe kontrakty `implemented` bez dowodu executable/runtime/physics
+validation. Nie są promowane do `production_executable` ani `validated`, a
+managed runtime, operator execution, CPU/GPU parity i physics qualification
+pozostają **NOT VERIFIED**.
 
 ## 7.1 Architektura FEM Frequency-Domain I Eigenmodes
 

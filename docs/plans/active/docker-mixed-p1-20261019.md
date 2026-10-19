@@ -443,3 +443,24 @@ Nie uznawać samego istnienia named volumes za dowód ograniczonego wzrostu dysk
 - Stan źródeł/grupy: istniejący worktree zadania, PR #197; nie przenoszono cache,
   nie usuwano wolumenów ani wyników. Integracja na master i kwalifikacja runtime
   pozostają niedokończone.
+
+## Decyzja integracyjna użytkownika — 19.10.2026
+
+Użytkownik jawnie polecił „to zrob merge mimio to” po informacji, że PR #197
+nie jest scalony i CI nie jest zielone. Integracja ma użyć normalnego merge PR
+bez obchodzenia ochrony brancha; ta decyzja nie jest kwalifikacją runtime ani
+fizyki. Wszystkie przygotowane poprawki są dołączane przed merge.
+
+Dodatkowe checkpointy: `9cd4654be4ddea228c30e0e52886bd7bed5eed9f` (fixture’y CI),
+`05ef8fcfae2055541b99edf31926f363a85375cc` (bounded writer retry),
+`9a6393c9cf1b558b7181eaa57b40ebbc7818f2a8` (P1 konfiguratora),
+`9b185c4479d2b795fe0ed4f28c3651967f8b7abc` (ostatni mock startup-script), `da1ba3a72c9c8caed113030da34b2415cd8975d8` (przenośne testy),
+`38430ecc936c72510059ce5054be7092f846f229` (wymagany katalog fixture’u Rust). Ostatnie 50 testów Windows oraz 20 zmienionych testów Linux: PASS;
+30 testów startup-script: PASS. Walidator noty 0106 i 41 testów kontraktu
+dokumentacji: PASS. Poprzednie CI 9a639 miało 397/398 testów session PASS;
+pozostały fixture poprawiono, bez lokalnej kompilacji testów Rust.
+
+Review nie ma już Required/P1 w nowych defaults/setup. Istniejące ograniczenie
+apostrofów w jawnych argumentach ścisłej powłoki pozostaje P2. NOT VERIFIED:
+aktualny live start API po bounded retry, aktywacja nowego skrótu, exact rings
+i operator/parity CPU/GPU. Nie usuwano cache, wolumenów ani wyników.
