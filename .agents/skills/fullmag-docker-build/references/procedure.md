@@ -11,11 +11,12 @@
 
 ## 1. Tożsamość i przygotowanie hosta
 
-Na nowym komputerze sprawdź dostępność Git, natywnego Pythona i Docker Desktop
-z silnikiem Linux. Pełny obraz zawiera realizacje FDM/FEM CPU/GPU; GPU wymaga
+Na nowym komputerze sprawdź dostępność Git, Pythona właściwego dla hosta
+i silnika Docker Linux. Windows używa Docker Desktop; WSL wymaga włączonej
+integracji dystrybucji. Linux/WSL używa bieżącego endpointu Docker. Pełny obraz zawiera realizacje FDM/FEM CPU/GPU; GPU wymaga
 potwierdzonego dostępu urządzenia z kontenera. Wymuszonego GPU nie zamieniaj
 na CPU. Nie instaluj CUDA, MFEM, hypre, libCEED ani kompilatorów Fullmaga na
-Windows jako obejścia trasy kontenerowej.
+hoście jako obejścia trasy kontenerowej.
 
 Na nowym klonie skonfiguruj lokalny .env głównego checkoutu w natywnym
 Windows PowerShell:
@@ -46,7 +47,10 @@ $port = 3197
 Set-Location $source
 ```
 
-Konfiguracja sesji/wyników na Windows nadal wymaga jawnego storage użytkownika.
+W Linux/WSL przejdź do tego samego wybranego checkoutu przez `cd`, a kreator
+uruchom przez `python3 -B scripts/setup_docker.py`. Sesje/wyniki wymagają jawnego
+storage użytkownika: Windows NTFS/ReFS albo Linux/WSL ext4/xfs/btrfs.
+Szczegóły: [konfiguracja Linux/WSL](../../../../docs/guides/docker-setup-linux-wsl.md).
 Kreator `.env` jest konfiguracją operatora; nie daje zgody na składowanie tam
 cache, kontekstów, binariów lub logów builda. Nie kopiuj `.env` z innego hosta.
 
@@ -68,10 +72,10 @@ rozmiary. Ustal dokładne nazwy i labels w zarządzanym launcherze.
 | Pakiet backendu | Prywatny named volume → `/opt/fullmag/package` | Bieżący pakiet, kandydat, rollback, archiwum receiptów |
 | Frontend development | Named volume na cały katalog roboczy Next | pnpm store, node_modules, Next cache, wygenerowane konfiguracje i next.log |
 | Kontrola buildu | Named volume, ewentualnie podkatalog build/package | Provenance, wejścia/receipty, staging kontekstów, diagnostyka buildu |
-| Dane użytkownika | Dotychczasowe jawne bindy Windows | Sesje, wyniki, projekty i per-group ustawienia; bez technicznego cache |
+| Dane użytkownika | Jawne bindy skonfigurowanego storage hosta | Sesje, wyniki, projekty i per-group ustawienia; bez technicznego cache |
 | Ledger hosta | Dotychczasowy zarządzany kontrakt runtime | Rezerwacje fizycznego hosta, zachowana historia; nie cache kompilacji |
 
-Przy zachowanym `/state` Windows frontend nie może zapisywać workspace,
+Przy zachowanym hostowym `/state` frontend nie może zapisywać workspace,
 cache ani logu budowania do tego bindu. Dopuszczalny jest named volume na
 podkatalogu development z readonly bindami `app/src/public/scripts`, jeżeli
 wszystkie efektywne ścieżki zapisu nadal leżą w wolumenie. Sprawdzaj mount o
@@ -245,11 +249,11 @@ Minimalny dowód wykonania:
 
 - od zera: obrazy i pełny backend/frontend zbudowane w wybranej grupie;
 - inspect: źródła readonly, build/logi/cache/provenance w Docker volumes,
-  runtime dane nadal we właściwym Windows storage;
+  runtime dane nadal we właściwym storage hosta;
 - API gotowe i Home widoczne; sam status kontenera `Running` nie wystarcza;
 - restart bez zmian: ten sam cache, brak nowej generacji i dowód cache-hit;
 - mała zmiana backendu: lista rzeczywiście kompilowanych modułów i czas;
-- HMR po edycji na Windows: treść widoczna bez reloadu dokumentu;
+- HMR po edycji w wybranym checkoutcie hosta: treść widoczna bez reloadu dokumentu;
 - wielokrotny build: bieżący + rollback, kontrolowany przyrost metadanych,
   brak narastających niepotrzebnych binariów/stagingu;
 - osobno, gdy zlecone: realne FDM/FEM CPU/GPU oraz skrypt auto/wait.

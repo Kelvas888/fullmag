@@ -1081,7 +1081,7 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
                     missing_control, PROJECT, REQUEST, ["true"], backend_cache=cache)
 
     def test_v2_descriptor_rejection_precedes_any_maintenance_runner(self):
-        for mutation in ("overlay", "receipt", "none", "absent"):
+        for mutation in ("overlay", "receipt", "volume-only", "none", "absent"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 cache = v2_backend_cache(Path(temporary))
                 if mutation == "overlay":
@@ -1094,6 +1094,12 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
                         json.dumps(receipt, sort_keys=True, separators=(",", ":")),
                         encoding="utf-8",
                     )
+                elif mutation == "volume-only":
+                    # Current DEV publishes control documents in Docker, not
+                    # in the host files consumed by this legacy pins protocol.
+                    cache["receipt_path"] = volume_cache.RECEIPT_TARGET
+                    cache["receipt_storage"] = "docker-named-volume"
+                    cache["host_receipt_path"] = None
                 document = target()
                 if mutation != "none":
                     mount_v2_cache(document, cache)

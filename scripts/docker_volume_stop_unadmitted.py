@@ -34,6 +34,7 @@ from docker_dev import _compose_identity, _select_source
 from docker_volume_activate import _same_host_path, _validate_running_group
 from docker_volume_dev import _assert_private_restart_network, _validate_retained_service
 from docker_compose_identity import validate_source_labels
+from docker_dev_host import docker_argv
 
 
 ATTEMPT_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -217,7 +218,8 @@ def _validate_container(
     _validate_retained_service(compose, actual, service, image_config)
 
 
-def _validate_source_bind(actual: Mapping[str, object], expected_source: Path) -> None:
+def _validate_source_bind(actual: Mapping[str, object], expected_source: Path,
+                          daemon_binds: Mapping[str, object] | None = None) -> None:
     mounts = actual.get("Mounts")
     if not isinstance(mounts, list):
         raise _fail("backend mounts cannot be inspected")
@@ -228,7 +230,12 @@ def _validate_source_bind(actual: Mapping[str, object], expected_source: Path) -
     mount = candidates[0]
     if mount.get("Type") != "bind" or mount.get("RW") is not False:
         raise _fail("backend source mount is not readonly")
-    if not _same_host_path(mount.get("Source"), str(expected_source)):
+    if daemon_binds is not None:
+        pinned = daemon_binds.get("/opt/fullmag/source") if isinstance(daemon_binds, Mapping) else None
+        matches = isinstance(pinned, str) and bool(pinned) and mount.get("Source") == pinned
+    else:
+        matches = _same_host_path(mount.get("Source"), str(expected_source))
+    if not matches:
         raise _fail("backend source mount differs from the selected checkout")
 
 
@@ -558,13 +565,15 @@ def _validate_preflight(args: argparse.Namespace, selected: Path, identity: Mapp
     actual = {"backend": by_id[args.backend_container_id], "frontend": by_id[args.frontend_container_id]}
     for service, container_id in (("backend", args.backend_container_id), ("frontend", args.frontend_container_id)):
         _validate_container(actual[service], service, container_id, args.image_id, identity, compose, image_config)
-    _validate_source_bind(actual["backend"], selected)
+    _validate_source_bind(actual["backend"], selected,
+                          compose["services"]["backend"].get("x-fullmag-daemon-binds"))
     _validate_network(actual, {"backend": args.backend_container_id, "frontend": args.frontend_container_id}, control.project)
     env = _env_map(actual["backend"])
     _validate_runtime_process_receipt_override(env)
     if env.get("FULLMAG_SOURCE_HOST_ROOT") != str(selected):
         raise _fail("backend source identity does not match the selected checkout")
-    _validate_source_bind(actual["frontend"], selected)
+    _validate_source_bind(actual["frontend"], selected,
+                          compose["services"]["frontend"].get("x-fullmag-daemon-binds"))
     probe = _probe(args.backend_container_id, args.request_id, args.session_id, args.source_sha256, args.failure_marker_sha256)
     _validate_probe_document(probe, args)
     return retained, dict(actual), probe
@@ -666,7 +675,7 @@ if len(data) > 8 * 1024 * 1024:
 sys.stdout.buffer.write(data)
 '''
     args = [
-        "docker", "--context", "desktop-linux", "run", "--rm", "-i", "--pull", "never",
+        *docker_argv("run"), "--rm", "-i", "--pull", "never",
         "--network", "none", "--runtime", "runc", "--read-only", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges:true", "--pids-limit", "32", "--memory", "64m",
         "--cpus", "0.25", "--env", "NVIDIA_VISIBLE_DEVICES=void",
@@ -802,7 +811,8 @@ def stop(args: argparse.Namespace) -> None:
                 raise _fail("backend stopped before the second proof")
             image_config = json.loads(docker_capture("image", "inspect", args.image_id).stdout)[0]["Config"]
             _validate_container(by_id[args.backend_container_id], "backend", args.backend_container_id, args.image_id, identity, compose, image_config)
-            _validate_source_bind(by_id[args.backend_container_id], selected)
+            _validate_source_bind(by_id[args.backend_container_id], selected,
+                                  compose["services"]["backend"].get("x-fullmag-daemon-binds"))
             _validate_network(
                 {"backend": by_id[args.backend_container_id], "frontend": by_id[args.frontend_container_id]},
                 {"backend": args.backend_container_id, "frontend": args.frontend_container_id},

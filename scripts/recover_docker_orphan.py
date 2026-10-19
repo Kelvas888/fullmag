@@ -2,6 +2,11 @@
 
 All process effects belong to the host adapter; only the native CLI changes
 SessionStore or the host ledger. No build, API start, or Solve is performed.
+
+This explicit pins protocol still requires host-published cache receipts and
+overlays. Current volume-only DEV keeps those documents inside build-control;
+orphan recovery for that route is NOT VERIFIED and fails closed. Its separate
+pre-admission container recovery does not use this legacy pins adapter.
 """
 from __future__ import annotations
 

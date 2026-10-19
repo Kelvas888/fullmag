@@ -251,6 +251,35 @@ class StopUnadmittedTests(unittest.TestCase):
         with self.assertRaises(stop.StopUnadmittedError):
             stop._validate_source_bind(actual, source)
 
+    def test_source_mount_uses_exact_pinned_daemon_path_without_client_fallback(self):
+        source = Path("/home/fullmag")
+        daemon = "/run/desktop/mnt/host/wsl/checkout-token"
+        actual = {"Mounts": [{"Destination": "/opt/fullmag/source", "Type": "bind",
+                              "RW": False, "Source": daemon}]}
+        pins = {"/opt/fullmag/source": daemon}
+        stop._validate_source_bind(actual, source, pins)
+        for changed in (daemon + "-other", str(source)):
+            with self.subTest(changed=changed):
+                actual["Mounts"][0]["Source"] = changed
+                with self.assertRaises(stop.StopUnadmittedError):
+                    stop._validate_source_bind(actual, source, pins)
+        for invalid in ({}, {"/opt/fullmag/source": ""}, "invalid-pins"):
+            with self.subTest(pins=invalid), self.assertRaises(stop.StopUnadmittedError):
+                stop._validate_source_bind(actual, source, invalid)
+
+    def test_runtime_validation_helper_uses_host_adapter_and_preserves_isolation(self):
+        backend = {"Image": "sha256:" + "a" * 64}
+        control = SimpleNamespace(project="fullmag-master")
+        with patch.object(stop, "_runtime_control_volume_mount", return_value=("owned-volume", "runtime-control")), \
+                patch.object(stop, "docker_argv", return_value=["docker", "run"]) as adapter:
+            args = stop._runtime_control_validation_helper(backend, control)
+        adapter.assert_called_once_with("run")
+        self.assertEqual(args[:2], ["docker", "run"])
+        self.assertNotIn("desktop-linux", args)
+        self.assertIn("--read-only", args)
+        self.assertIn("com.docker.compose.project=fullmag-master", args)
+        self.assertIn("type=volume,src=owned-volume,dst=/opt/fullmag/runtime-control,readonly,volume-subpath=runtime-control,volume-nocopy", args)
+
     def test_runtime_process_receipt_uses_image_default_when_override_is_absent(self):
         stop._validate_runtime_process_receipt_override({})
         stop._validate_runtime_process_receipt_override({
