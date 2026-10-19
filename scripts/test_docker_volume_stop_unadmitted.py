@@ -64,7 +64,7 @@ class StopUnadmittedTests(unittest.TestCase):
         ) as capture:
             self.assertEqual(stop._control_bytes(Control(), 'development/attempts/a/terminal.json'), b'{}')
         command = capture.call_args.args[0][0]
-        self.assertIn("readlink -f '/control/development/attempts/a'", command)
+        self.assertIn("/control/development/attempts/a/terminal.json", command)
         self.assertNotIn('\\', command)
 
     @staticmethod
