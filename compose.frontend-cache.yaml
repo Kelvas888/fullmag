@@ -3,12 +3,44 @@
 # The selected Compose group owns these external volumes.  The source checkout
 # remains mounted readonly by compose.dev.yaml; this overlay owns only the
 # generated workspace/dependency/cache state.  No host storage path, ext4
-# image, loop mount, or maintenance container is part of the active route.
+# image, or loop mount is part of the active route.
 # Docker seeds a new empty state volume from the image-owned
-# /state/development directory. The root-only backend cache maintenance step
-# provisions the `frontend` subpath before Compose mounts it here. The frontend
-# cannot see backend build provenance through this restricted volume mount.
+# /state/development directory. The short-lived root-only maintenance service
+# repairs only the fixed parent directories before the unprivileged frontend is
+# created. The frontend cannot see backend build provenance through this
+# restricted volume mount.
 services:
+  frontend-cache-maintenance:
+    profiles: [frontend-cache-maintenance]
+    image: "${FULLMAG_FRONTEND_CACHE_RUNTIME_IMAGE_ID:?Attested image identity is required}"
+    pull_policy: never
+    user: "0:0"
+    read_only: true
+    privileged: false
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: ["no-new-privileges:true"]
+    network_mode: none
+    restart: "no"
+    entrypoint: ["/usr/local/bin/python3", "/opt/fullmag/backend_volume_cache_maintenance.py"]
+    command: ["ensure-frontend-state"]
+    environment:
+      FULLMAG_FRONTEND_STATE_SCHEMA: "fullmag.frontend-development-state-owner.v1"
+      FULLMAG_FRONTEND_STATE_PROFILE: "fullmag-frontend-cache-v2"
+      FULLMAG_FRONTEND_STATE_MAINTENANCE_PROFILE: "fullmag-frontend-state-maintenance-v1"
+      FULLMAG_FRONTEND_STATE_MAINTENANCE_ACTION: ensure
+      FULLMAG_FRONTEND_STATE_ROOT: /state/development
+      FULLMAG_FRONTEND_STATE_PROJECT_ID: "${FULLMAG_FRONTEND_CACHE_PROJECT_ID:?Resolved frontend cache project id is required}"
+      FULLMAG_FRONTEND_STATE_CACHE_KEY: "${FULLMAG_FRONTEND_CACHE_KEY:?Resolved frontend cache key is required}"
+      FULLMAG_FRONTEND_STATE_VOLUME: "${FULLMAG_FRONTEND_CACHE_VOLUME:?Resolved frontend state volume is required}"
+      FULLMAG_FRONTEND_STATE_OWNER_UID: "65532"
+      FULLMAG_FRONTEND_STATE_OWNER_GID: "65532"
+    volumes:
+      - type: volume
+        source: frontend-development-state
+        target: /state/development
+        volume: {nocopy: true}
+
   frontend:
     image: "${FULLMAG_FRONTEND_CACHE_RUNTIME_IMAGE_ID:?Attested image identity is required}"
     pull_policy: never

@@ -35,11 +35,35 @@ RUN mkdir -p /opt/fullmag/tooling/pnpm && \
 # These are image-owned mount points. Runtime bind mounts replace source,
 # package, provenance, state, and the Windows host certificate.
 RUN mkdir -p /opt/fullmag/source /opt/fullmag/package /opt/fullmag/control \
-    /opt/fullmag/runtime-control /state/development /run/fullmag && \
+    /opt/fullmag/runtime-control \
+    /state/development/workspace/apps/control-room/app \
+    /state/development/workspace/apps/control-room/src \
+    /state/development/workspace/apps/control-room/public \
+    /state/development/workspace/apps/control-room/scripts \
+    /run/fullmag && \
     touch /opt/fullmag/provenance.json && \
-    chown 65532:65532 /state /state/development /run/fullmag /opt/fullmag/runtime-control && \
+    chown 65532:65532 \
+        /state \
+        /state/development \
+        /state/development/workspace \
+        /state/development/workspace/apps \
+        /state/development/workspace/apps/control-room \
+        /state/development/workspace/apps/control-room/app \
+        /state/development/workspace/apps/control-room/src \
+        /state/development/workspace/apps/control-room/public \
+        /state/development/workspace/apps/control-room/scripts \
+        /run/fullmag /opt/fullmag/runtime-control && \
     chown root:root /opt/fullmag /opt/fullmag/docker_startup_script.py /opt/fullmag/fullmag_storage.py && \
-    chmod 0755 /opt/fullmag /opt/fullmag/source /opt/fullmag/package /state /run/fullmag && \
+    chmod 0755 \
+        /opt/fullmag /opt/fullmag/source /opt/fullmag/package \
+        /state /state/development /state/development/workspace \
+        /state/development/workspace/apps \
+        /state/development/workspace/apps/control-room \
+        /state/development/workspace/apps/control-room/app \
+        /state/development/workspace/apps/control-room/src \
+        /state/development/workspace/apps/control-room/public \
+        /state/development/workspace/apps/control-room/scripts \
+        /run/fullmag && \
     chmod 0644 /opt/fullmag/provenance.json && \
     chmod -R a+rX /opt/fullmag
 

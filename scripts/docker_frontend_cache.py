@@ -30,6 +30,8 @@ KEY_SCHEMA = "fullmag.frontend-cache-key.v2"
 PROFILE = "fullmag-frontend-cache-v2"
 MAINTENANCE_PROFILE = "fullmag-frontend-cache-maintenance-v1"
 MAINTENANCE_SERVICE = "frontend-cache-maintenance"
+STATE_MAINTENANCE_PROFILE = "frontend-cache-maintenance"
+STATE_MAINTENANCE_SERVICE = "frontend-cache-maintenance"
 CONSUMER_PROFILE_LABEL = "com.fullmag.frontend-cache.profile"
 CONSUMER_KEY_LABEL = "com.fullmag.frontend-cache.key"
 # ext4 labels are limited to sixteen bytes.
@@ -87,6 +89,17 @@ ENV_CACHE_SOURCE = "FULLMAG_FRONTEND_CACHE_CACHE_SOURCE"
 ENV_PNPM_SOURCE = "FULLMAG_FRONTEND_CACHE_PNPM_STORE_SOURCE"
 ENV_WORKSPACE_NODE_MODULES_SOURCE = "FULLMAG_FRONTEND_CACHE_WORKSPACE_NODE_MODULES_SOURCE"
 ENV_CONTROL_ROOM_NODE_MODULES_SOURCE = "FULLMAG_FRONTEND_CACHE_CONTROL_ROOM_NODE_MODULES_SOURCE"
+
+ENV_STATE_SCHEMA = "FULLMAG_FRONTEND_STATE_SCHEMA"
+ENV_STATE_PROFILE = "FULLMAG_FRONTEND_STATE_PROFILE"
+ENV_STATE_MAINTENANCE_PROFILE = "FULLMAG_FRONTEND_STATE_MAINTENANCE_PROFILE"
+ENV_STATE_MAINTENANCE_ACTION = "FULLMAG_FRONTEND_STATE_MAINTENANCE_ACTION"
+ENV_STATE_ROOT = "FULLMAG_FRONTEND_STATE_ROOT"
+ENV_STATE_PROJECT_ID = "FULLMAG_FRONTEND_STATE_PROJECT_ID"
+ENV_STATE_CACHE_KEY = "FULLMAG_FRONTEND_STATE_CACHE_KEY"
+ENV_STATE_VOLUME = "FULLMAG_FRONTEND_STATE_VOLUME"
+ENV_STATE_OWNER_UID = "FULLMAG_FRONTEND_STATE_OWNER_UID"
+ENV_STATE_OWNER_GID = "FULLMAG_FRONTEND_STATE_OWNER_GID"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -455,6 +468,59 @@ def _assert_no_active_consumers(
                 observed[target] = str(mount.get("Source", ""))
         if observed != expected_sources:
             raise FrontendCacheError("active cache consumer mount identity changed")
+        raise FrontendCacheError(
+            f"frontend cache {cache_key} is already held by container {container_id}"
+        )
+
+
+def _v2_assert_no_active_consumer(
+    docker: Callable[..., Any], *, cache_key: str, volume_name: str
+) -> None:
+    """Do not repair a state volume while its frontend still owns the mount."""
+
+    raw = docker(
+        "ps",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        f"label={CONSUMER_KEY_LABEL}={cache_key}",
+        timeout=60,
+    )
+    if not isinstance(raw, str):
+        raise FrontendCacheError("frontend cache consumer guard returned non-text output")
+    container_ids = [item.strip() for item in raw.splitlines() if item.strip()]
+    for container_id in container_ids:
+        if _CONTAINER_ID.fullmatch(container_id) is None:
+            raise FrontendCacheError("frontend cache consumer guard returned an invalid container ID")
+        inspected = _read_json_output(docker("inspect", container_id, timeout=60))
+        if not isinstance(inspected, list) or len(inspected) != 1:
+            raise FrontendCacheError("frontend cache consumer inspect returned no container")
+        container = inspected[0]
+        if not isinstance(container, Mapping):
+            raise FrontendCacheError("frontend cache consumer inspect is malformed")
+        config = container.get("Config")
+        labels = config.get("Labels") if isinstance(config, Mapping) else None
+        if (
+            not isinstance(labels, Mapping)
+            or labels.get(CONSUMER_PROFILE_LABEL) != PROFILE
+            or labels.get(CONSUMER_KEY_LABEL) != cache_key
+        ):
+            raise FrontendCacheError("active frontend cache consumer identity changed")
+        state = container.get("State")
+        if not isinstance(state, Mapping) or state.get("Running") is not True:
+            raise FrontendCacheError("frontend cache consumer inventory changed during inspection")
+        mounts = container.get("Mounts")
+        if not isinstance(mounts, list):
+            raise FrontendCacheError("active frontend cache consumer has no mount inventory")
+        state_mounts = [
+            mount
+            for mount in mounts
+            if isinstance(mount, Mapping)
+            and mount.get("Destination") == STATE_TARGET
+            and mount.get("Type") == "volume"
+        ]
+        if len(state_mounts) != 1 or state_mounts[0].get("Name") != volume_name:
+            raise FrontendCacheError("active frontend cache consumer volume identity changed")
         raise FrontendCacheError(
             f"frontend cache {cache_key} is already held by container {container_id}"
         )
@@ -864,6 +930,172 @@ def reinspect_volumes(profile: Mapping[str, Any], docker: Callable[..., Any]) ->
             raise FrontendCacheError("frontend volume identity changed since admission")
 
 
+def _v2_validate_state_maintenance_config(
+    document: Mapping[str, Any], environment: Mapping[str, str]
+) -> None:
+    """Validate the bounded root helper before it can mount the state volume."""
+
+    services = document.get("services")
+    if not isinstance(services, Mapping):
+        raise FrontendCacheError("frontend state maintenance Compose config has no services")
+    service = services.get(STATE_MAINTENANCE_SERVICE)
+    if not isinstance(service, Mapping):
+        raise FrontendCacheError("frontend state maintenance service is missing")
+    if service.get("image") != environment[ENV_RUNTIME_IMAGE_ID]:
+        raise FrontendCacheError("frontend state maintenance image identity changed")
+    if (
+        service.get("user") != "0:0"
+        or service.get("read_only") is not True
+        or service.get("privileged") is not False
+        or service.get("cap_drop") != ["ALL"]
+        or service.get("cap_add") != ["CHOWN"]
+        or service.get("security_opt") != ["no-new-privileges:true"]
+        or service.get("network_mode") != "none"
+        or service.get("restart") != "no"
+        or service.get("pull_policy") != "never"
+        or "gpus" in service
+    ):
+        raise FrontendCacheError("frontend state maintenance isolation changed")
+    if service.get("entrypoint") != [
+        "/usr/local/bin/python3",
+        "/opt/fullmag/backend_volume_cache_maintenance.py",
+    ] or service.get("command") != ["ensure-frontend-state"]:
+        raise FrontendCacheError("frontend state maintenance entrypoint changed")
+    expected_environment = {
+        ENV_STATE_SCHEMA: "fullmag.frontend-development-state-owner.v1",
+        ENV_STATE_PROFILE: PROFILE,
+        ENV_STATE_MAINTENANCE_PROFILE: "fullmag-frontend-state-maintenance-v1",
+        ENV_STATE_MAINTENANCE_ACTION: "ensure",
+        ENV_STATE_ROOT: STATE_TARGET,
+        ENV_STATE_PROJECT_ID: environment[ENV_PROJECT_ID],
+        ENV_STATE_CACHE_KEY: environment[ENV_KEY],
+        ENV_STATE_VOLUME: environment[ENV_VOLUME_NAME],
+        ENV_STATE_OWNER_UID: "65532",
+        ENV_STATE_OWNER_GID: "65532",
+    }
+    observed_environment = service.get("environment")
+    if not isinstance(observed_environment, Mapping):
+        raise FrontendCacheError("frontend state maintenance environment is missing")
+    for name, expected in expected_environment.items():
+        if str(observed_environment.get(name)) != str(expected):
+            raise FrontendCacheError(f"frontend state maintenance environment mismatch: {name}")
+    mounts = service.get("volumes")
+    if not isinstance(mounts, list) or len(mounts) != 1:
+        raise FrontendCacheError("frontend state maintenance mount is not exact")
+    mount = mounts[0]
+    if (
+        not isinstance(mount, Mapping)
+        or mount.get("type") != "volume"
+        or mount.get("source") != "frontend-development-state"
+        or mount.get("target") != STATE_TARGET
+        or not isinstance(mount.get("volume"), Mapping)
+        or mount["volume"].get("nocopy") is not True
+        or mount.get("read_only") is True
+    ):
+        raise FrontendCacheError("frontend state maintenance mount is not exact")
+    volumes = document.get("volumes")
+    state_volume = volumes.get("frontend-development-state") if isinstance(volumes, Mapping) else None
+    if (
+        not isinstance(state_volume, Mapping)
+        or state_volume.get("name") != environment[ENV_VOLUME_NAME]
+        or state_volume.get("external") is not True
+    ):
+        raise FrontendCacheError("frontend state maintenance volume declaration is unsafe")
+
+
+def _v2_validate_state_maintenance_receipt(
+    receipt: Mapping[str, Any], environment: Mapping[str, str]
+) -> dict[str, Any]:
+    expected_directories = [
+        STATE_TARGET,
+        f"{STATE_TARGET}/workspace",
+        f"{STATE_TARGET}/workspace/apps",
+        f"{STATE_TARGET}/workspace/apps/control-room",
+        *[
+            f"{STATE_TARGET}/workspace/apps/control-room/{name}"
+            for name in ("app", "src", "public", "scripts")
+        ],
+    ]
+    if (
+        receipt.get("schema") != "fullmag.frontend-development-state-owner.v1"
+        or receipt.get("profile") != PROFILE
+        or receipt.get("maintenance_profile") != "fullmag-frontend-state-maintenance-v1"
+        or receipt.get("state") != "ready"
+        or receipt.get("project_id") != environment[ENV_PROJECT_ID]
+        or receipt.get("cache_key") != environment[ENV_KEY]
+        or receipt.get("volume_name") != environment[ENV_VOLUME_NAME]
+        or receipt.get("root") != STATE_TARGET
+        or receipt.get("owner_uid") != 65532
+        or receipt.get("owner_gid") != 65532
+        or receipt.get("directories") != expected_directories
+    ):
+        raise FrontendCacheError("frontend state maintenance receipt identity is invalid")
+    probe = receipt.get("probe")
+    if (
+        not isinstance(probe, Mapping)
+        or probe.get("state") != "passed"
+        or probe.get("recursive_chown") is not False
+        or probe.get("live_bind_contents") != "untouched"
+        or probe.get("marker_validated") is not True
+    ):
+        raise FrontendCacheError("frontend state maintenance probe is incomplete")
+    return dict(receipt)
+
+
+def _v2_prepare_frontend_state(
+    docker: Callable[..., Any],
+    repo: Path,
+    overlay: Path,
+    project: str,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    """Run the short-lived V2 state handoff before the frontend is mounted."""
+
+    rendered = _read_json_output(
+        docker(
+            "compose",
+            "--project-name",
+            project,
+            "--project-directory",
+            str(repo),
+            "-f",
+            str(overlay),
+            "--profile",
+            STATE_MAINTENANCE_PROFILE,
+            "config",
+            "--format",
+            "json",
+            timeout=60,
+            environment=dict(environment),
+        )
+    )
+    if not isinstance(rendered, Mapping):
+        raise FrontendCacheError("frontend state maintenance Compose config is malformed")
+    _v2_validate_state_maintenance_config(rendered, environment)
+    output = docker(
+        "compose",
+        "--project-name",
+        project,
+        "--project-directory",
+        str(repo),
+        "-f",
+        str(overlay),
+        "--profile",
+        STATE_MAINTENANCE_PROFILE,
+        "run",
+        "--rm",
+        "--no-deps",
+        "-T",
+        STATE_MAINTENANCE_SERVICE,
+        timeout=180,
+        environment=dict(environment),
+    )
+    receipt = _read_json_output(output)
+    if not isinstance(receipt, Mapping):
+        raise FrontendCacheError("frontend state maintenance returned no receipt")
+    return _v2_validate_state_maintenance_receipt(receipt, environment)
+
+
 def _v2_cache_key(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return _v2_key(*args, **kwargs)
 
@@ -932,7 +1164,29 @@ def _v2_prepare(
         ENV_HOST_PORT: str(identity["inputs"]["host_port"]),
         ENV_DEPENDENCY_SEED: identity["inputs"]["dependency_seed_sha256"],
         ENV_TOOLPINS: identity["inputs"]["toolpins_sha256"],
+        ENV_STATE_SCHEMA: "fullmag.frontend-development-state-owner.v1",
+        ENV_STATE_PROFILE: PROFILE,
+        ENV_STATE_MAINTENANCE_PROFILE: "fullmag-frontend-state-maintenance-v1",
+        ENV_STATE_MAINTENANCE_ACTION: "ensure",
+        ENV_STATE_ROOT: STATE_TARGET,
+        ENV_STATE_PROJECT_ID: paths["project_id"],
+        ENV_STATE_CACHE_KEY: identity["key"],
+        ENV_STATE_VOLUME: paths["volume_name"],
+        ENV_STATE_OWNER_UID: "65532",
+        ENV_STATE_OWNER_GID: "65532",
     }
+    _v2_assert_no_active_consumer(
+        docker,
+        cache_key=identity["key"],
+        volume_name=paths["volume_name"],
+    )
+    maintenance_receipt = _v2_prepare_frontend_state(
+        docker,
+        repo_path,
+        overlay,
+        paths["project_id"],
+        environment,
+    )
     receipt = {
         "schema": SCHEMA,
         "profile": PROFILE,
@@ -954,6 +1208,7 @@ def _v2_prepare(
         "runtime_image_id": image_id,
         "volume": state_volume,
         "control_volume": control_volume,
+        "state_maintenance_receipt": maintenance_receipt,
         "identity": identity,
         "environment": environment,
         "compose_overlay": str(overlay),
