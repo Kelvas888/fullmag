@@ -296,14 +296,30 @@ just docker-dev "$worktree" 3197 `
   "examples/fem_relax_gpu_smoke.py"
 ```
 
-The referenced example is tracked in this repository. The requested
-`examples/permalloy_layer_cofeb_rings_relax_300nm.py` is also tracked, but the
-current startup validation rejects this two-material rings example with
-`material_count_not_one`; it is not a current FEM GPU smoke proof. A script
+The referenced example is tracked in this repository. The two-material
+`examples/permalloy_layer_cofeb_rings_relax_300nm.py` additionally requires
+mixed-P1 certificate v2 and disconnected-body material lowering. Its managed
+FEM GPU execution is **NOT VERIFIED** in this development change. A script
 that sets `study.wait_for_solve(True)` (for example,
 `examples/fem_de_smoke_numeric.py`) publishes an interactive activation that
 waits for Compute and does not silently switch from GPU to CPU. A start without
 `--script` opens Home and does not select an arbitrary saved session.
+
+For an already healthy group with an empty Workspace, activate a script
+without restarting or rebuilding either service:
+
+```powershell
+just docker-dev-script <attempt> <config-sha256> "$worktree" `
+  "examples/fem_relax_gpu_smoke.py"
+```
+
+Use the original development attempt and Compose configuration hash from the
+control volume. A successful linked resume is accepted without overwriting the
+failed-start history. The command keeps the current-session and request fences;
+it does not replace an existing active simulation. An unknown activation result
+blocks automatic retry. See the [activation guide](docs/guides/docker-volume-development.md#aktywacja-skryptu-w-już-działającym-workspace)
+for the receipt locations and optional replay request ID. Source-level checks
+pass; this command still requires a real runtime activation test.
 
 ### Ports, isolation, and persistence
 

@@ -51,6 +51,10 @@ docker-dev-control-checks source_root:
 docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend="false":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" resume-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if restart_backend == "true" { "--restart-backend" } else if restart_backend == "false" { "" } else { error("restart_backend must be true or false") }}}
 
+# Activate one script in the existing healthy backend; this never recreates or rebuilds the group.
+docker-dev-script attempt config_sha256 source_root script request_id="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" activate-script --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --script {{quote(script)}} {{if request_id == "" { "" } else { "--request-id " + quote(request_id) }}}
+
 # Restart a pinned healthy backend only when its API confirms no active session.
 docker-dev-restart-idle attempt config_sha256 source_root port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" restart-idle-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}

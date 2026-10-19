@@ -116,6 +116,7 @@ Po integracji PR #198 aktywny `docker_dev.py up` deleguje do
 `docker_volume_dev.py`; `docker_build_control.py` przechowuje operacje w
 wolumenie kontrolnym. Dokładne piny `attempt` i `config_sha256` oraz komendy
 `docker-dev-resume`, `docker-dev-restart-idle`, `docker-dev-recreate-volume`
+oraz aktywację skryptu bez restartu `docker-dev-script`
 opisuje [bieżący przewodnik DEV](../../../../docs/guides/docker-volume-development.md).
 Nie stosuj starego `docker-dev-recreate` z hostowym receiptem dla tej trasy.
 Nie kopiuj konfiguracji ani terminal receipt z wolumenu do hostowego storage.

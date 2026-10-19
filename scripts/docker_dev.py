@@ -2472,6 +2472,18 @@ def _parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--source-root", type=Path, required=True)
     resume_parser.add_argument("--port", type=int, required=True)
     resume_parser.add_argument("--restart-backend", action="store_true", help="Start the retained stopped backend; never stop an active service")
+    activate_parser = subparsers.add_parser(
+        "activate-script",
+        help="activate one Python script in the already-running retained backend",
+    )
+    activate_parser.add_argument("--attempt", required=True)
+    activate_parser.add_argument("--config-sha256", required=True)
+    activate_parser.add_argument("--source-root", type=Path, required=True)
+    activate_parser.add_argument("--script", type=Path, required=True)
+    activate_parser.add_argument(
+        "--request-id",
+        help="optional stable request fence; default is derived from attempt and script hash",
+    )
     idle_restart = subparsers.add_parser("restart-idle-volume", help="Restart the pinned healthy backend only while no session is active")
     idle_restart.add_argument("--attempt", required=True)
     idle_restart.add_argument("--config-sha256", required=True)
@@ -2603,6 +2615,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)
+        elif args.action == "activate-script":
+            from docker_volume_activate import activate
+            activate(args)
         elif args.action == "up":
             up(args)
         elif args.action == "recreate":

@@ -147,6 +147,26 @@ class DockerDevelopmentShellBoundaryTests(unittest.TestCase):
             self.assertEqual(injected.returncode, 2, injected.stderr)
 
 
+    def test_script_activation_dispatches_literal_argv_and_rejects_composite_commands(self):
+        source = '/selected/$(printf literal);worktree'
+        script = 'examples/$(printf literal);study.py'
+        base = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
+                f"activate-script --attempt '{'b' * 32}' --config-sha256 '{'a' * 64}' "
+                f"--source-root '{source}' --script '{script}'")
+        for request_id in (None, 'stable-request-1'):
+            recipe = base + (f" --request-id '{request_id}'" if request_id else '')
+            result = self.dispatch(recipe)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = ['--repo-root', '/registered/checkout', 'activate-script',
+                        '--attempt', 'b' * 32, '--config-sha256', 'a' * 64,
+                        '--source-root', source, '--script', script]
+            if request_id:
+                expected.extend(['--request-id', request_id])
+            self.assertEqual(json.loads(result.stdout), expected)
+            rejected = self.dispatch(recipe + '; printf injected')
+            self.assertEqual(rejected.returncode, 2, rejected.stderr)
+            self.assertNotIn('injected', rejected.stdout)
+
     def test_rejects_unbound_recreate_variants(self):
         for recipe in (
             self.recipe().replace("--gpu-access 'auto'", "--gpu-access 'unknown'"),

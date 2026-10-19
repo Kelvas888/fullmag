@@ -52,6 +52,39 @@ próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy ro
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
 
+### Aktywacja skryptu w już działającym Workspace
+
+Jeżeli grupa ma już zdrowe, działające usługi `backend` i `frontend`, skrypt
+można aktywować bez restartu, odtwarzania ani przebudowy kontenerów:
+
+```powershell
+just docker-dev-script `
+  <attempt> <config-sha256> `
+  <absolutny-checkout> `
+  examples/fem_relax_gpu_smoke.py
+```
+
+`attempt` i `config-sha256` muszą pochodzić z tego samego
+`development/attempts/<attempt>/{terminal,compose}.json` w wolumenie control.
+Jeżeli pierwotny start nie powiódł się, zachowaj jego piny: launcher wymaga
+trwałego, pomyślnego `resume`/`iteration` powiązanego z tą samą próbą,
+konfiguracją i aktualnymi identyfikatorami usług. Nie zmienia historii błędu.
+Launcher ponownie sprawdza grupę Compose, identyfikatory obu kontenerów, obraz,
+readonly bind źródeł i zdrowie backendu. Autoryzacja skryptu oraz techniczne
+receipty trafiają do control volume; skrypt nie jest kopiowany do storage
+Windows ani pakowany do ZIP/TAR.
+
+Polecenie wykonuje wyłącznie stały wrapper `python -I -B -c` w istniejącym
+kontenerze `backend`; kod wrappera jest częścią zarządzanej recepty i nie zawiera
+żadnej wartości użytkownika. Host weryfikuje niezmienny identyfikator obrazu,
+a wrapper weryfikuje hash obrazu `docker_startup_script.py`, ładuje go i wywołuje
+`docker_startup_script.run_from_environment()`, które korzysta z wewnętrznego
+API live. API dopuszcza pusty bieżący Workspace albo dokładny replay
+tego samego `request_id` i hashów. `activation.json` pozostaje trwałym markerem:
+wynik `unknown` blokuje automatyczną próbę ponowienia. Domyślny `request_id` jest
+deterministyczny na podstawie próby i hasha pliku; dla replayu starego startupu
+można jawnie przekazać `request_id` jako piąty argument recepty.
+
 Nieznany wynik operacji zachowuje zasoby i blokadę do jawnego rozstrzygnięcia.
 Nie usuwaj ręcznie `active`, pakietu ani lease, aby wymusić kolejny build.
 Launcher przyjmuje wynik dopiero po zdarzeniu `handoff` z bieżącego uruchomienia

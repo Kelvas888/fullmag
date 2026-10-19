@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+"""Activate one Python study in an already running volume DEV workspace.
+
+This is deliberately an activation operation, not a Compose operation.  The
+host validates the exact retained attempt and writes only bounded provenance to
+the group's control volume.  A fixed image-owned wrapper in the existing
+backend then calls ``docker_startup_script.run_from_environment``.  The live
+API remains the authority for the empty-workspace/current-request fence.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from collections.abc import Mapping
+from pathlib import Path
+import re
+import sys
+
+import docker_startup_script as startup
+import fullmag_storage as storage
+from docker_build_control import (
+    BuildControl,
+    BuildControlError,
+    ControlOutcomeUnknown,
+    canonical,
+    compose_capture,
+    docker_capture,
+    toolchain_configuration,
+)
+
+
+ATTEMPT_RE = re.compile(r"^[0-9a-f]{32}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+CONTROL_ROOT = "/opt/fullmag/control"
+ACTIVATE_TIMEOUT_SECONDS = int(startup.STARTUP_ACTIVATION_TIMEOUT_SECONDS) + 60
+ACTIVATE_EXIT_UNKNOWN = 75
+
+# This is an image-owned, constant wrapper.  User input is supplied only via
+# the bounded environment below; the script path, provenance path and helper
+# digest are never interpolated into Python source or a shell command.  Keep
+# the helper attestation here because this route deliberately does not rebuild
+# or modify the running image's entrypoint.
+FIXED_ACTIVATION_SCRIPT = r'''import hashlib, importlib.util, json, os, stat, sys
+from pathlib import Path
+
+helper_path = Path("/opt/fullmag/docker_startup_script.py")
+expected = os.environ.get("FULLMAG_STARTUP_HELPER_SHA256", "")
+if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+    raise RuntimeError("startup helper hash is missing or invalid")
+descriptor = os.open(helper_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+        raise RuntimeError("startup helper is not a bounded regular file")
+    checksum = hashlib.sha256()
+    for block in iter(lambda: os.read(descriptor, 64 * 1024), b""):
+        checksum.update(block)
+finally:
+    os.close(descriptor)
+if checksum.hexdigest() != expected:
+    raise RuntimeError("startup helper differs from the image-attested bytes")
+if "/opt/fullmag" not in sys.path:
+    sys.path.insert(0, "/opt/fullmag")
+spec = importlib.util.spec_from_file_location("fullmag_image_docker_startup_script", helper_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError("startup helper cannot be loaded from the image")
+helper = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = helper
+spec.loader.exec_module(helper)
+try:
+    result = helper.run_from_environment()
+except Exception as error:
+    unknown_type = getattr(helper, "StartupActivationOutcomeUnknown", None)
+    diagnostic = getattr(error, "diagnostic", None)
+    if (isinstance(unknown_type, type) and isinstance(error, unknown_type)
+            and isinstance(diagnostic, dict)
+            and diagnostic.get("schema") == "fullmag.startup-activation-diagnostic.v1"
+            and diagnostic.get("state") == "unknown"
+            and diagnostic.get("durable_state") == "started"
+            and isinstance(diagnostic.get("request_id"), str)
+            and isinstance(diagnostic.get("source_sha256"), str)
+            and isinstance(diagnostic.get("source_relative"), str)
+            and isinstance(diagnostic.get("error"), str)):
+        print(json.dumps(diagnostic, sort_keys=True), flush=True)
+        raise SystemExit(75)
+    raise
+if result is None:
+    result = {"state": "noop"}
+if not isinstance(result, dict) or not isinstance(result.get("state"), str):
+    raise RuntimeError("startup activation helper returned no state")
+print(json.dumps(result, sort_keys=True), flush=True)
+'''
+
+
+def _docker_text(*args: str, timeout: int = 90, combined: bool = False) -> str:
+    result = docker_capture(*args, timeout=timeout)
+    payload = result.stdout
+    if combined:
+        payload += result.stderr
+    return payload.decode("utf-8", "replace")
+
+
+def _request_id(attempt: str, source_sha256: str, explicit: str | None) -> str:
+    if explicit is not None:
+        try:
+            return startup._validate_request_id(explicit)
+        except startup.StartupScriptError as error:
+            raise BuildControlError(str(error)) from error
+    return f"docker-volume-{attempt}-{source_sha256[:16]}"
+
+
+def _authorization_bytes(authorization: Mapping[str, object]) -> bytes:
+    try:
+        payload = startup._json_payload(
+            authorization,
+            startup.MAX_PROVENANCE_BYTES,
+            "startup provenance",
+        )
+    except (TypeError, ValueError, startup.StartupScriptError) as error:
+        raise BuildControlError(str(error)) from error
+    return payload
+
+
+def _image_helper_hashes(backend_id: str) -> dict[str, str]:
+    names = ("docker_startup_script.py", "fullmag_storage.py")
+    result = docker_capture(
+        "exec",
+        backend_id,
+        "sha256sum",
+        *["/opt/fullmag/" + name for name in names],
+        timeout=90,
+    )
+    hashes: dict[str, str] = {}
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not SHA256_RE.fullmatch(fields[0]):
+            raise BuildControlError("Backend startup-helper attestation is malformed")
+        name = Path(fields[1]).name
+        if fields[1] != "/opt/fullmag/" + name or name not in names:
+            raise BuildControlError("Backend startup-helper inventory differs")
+        hashes[name] = fields[0]
+    if set(hashes) != set(names):
+        raise BuildControlError("Backend startup-helper inventory is incomplete")
+    return hashes
+
+
+def _validate_selected_helpers(selected: Path, hashes: Mapping[str, str]) -> None:
+    import fullmag_docker_runtime as runtime
+
+    for name, expected in hashes.items():
+        source = selected / "scripts" / name
+        _data, matches, observed = runtime._verified_startup_helper(source, expected)
+        if not matches:
+            raise BuildControlError(
+                f"Startup helper changed since the retained image was prepared: {name} ({observed})"
+            )
+
+
+def _one_container(document: Mapping[str, object], service: str) -> str:
+    raw = compose_capture(document, "ps", "--all", "--quiet", service).decode()
+    identifiers = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(identifiers) != 1 or not re.fullmatch(r"[0-9a-f]{64}", identifiers[0]):
+        raise BuildControlError(f"Retained Compose service identity is ambiguous: {service}")
+    return identifiers[0]
+
+
+def _validate_running_group(
+    control: BuildControl,
+    identity: Mapping[str, str],
+    document: Mapping[str, object],
+    terminal: Mapping[str, object],
+    image: str,
+) -> tuple[str, str]:
+    if document.get("name") != control.project:
+        raise BuildControlError("Retained Compose project differs from the selected group")
+    if not IMAGE_ID_RE.fullmatch(image):
+        raise BuildControlError("Retained backend image is not immutable")
+    from docker_volume_dev import _validate_retained_service
+
+    ids: dict[str, str] = {}
+    for service in ("backend", "frontend"):
+        service_document = document.get("services", {}).get(service)
+        service_image = service_document.get("image") if isinstance(service_document, dict) else None
+        if not isinstance(service_image, str) or not IMAGE_ID_RE.fullmatch(service_image):
+            raise BuildControlError(f"Retained {service} image is not immutable")
+        if service == "backend" and service_image != image:
+            raise BuildControlError("Retained backend image differs from the terminal receipt")
+        image_documents = json.loads(_docker_text("image", "inspect", service_image))
+        if len(image_documents) != 1:
+            raise BuildControlError(f"Retained {service} image identity is ambiguous")
+        image_config = image_documents[0].get("Config")
+        if not isinstance(image_config, dict):
+            raise BuildControlError(f"Retained {service} image configuration is missing")
+        identifier = _one_container(document, service)
+        records = json.loads(_docker_text("inspect", identifier))
+        if len(records) != 1:
+            raise BuildControlError(f"Retained {service} identity is ambiguous")
+        observed = records[0]
+        labels = observed.get("Config", {}).get("Labels", {})
+        if (
+            observed.get("Image") != service_image
+            or labels.get("com.docker.compose.project") != control.project
+            or labels.get("com.docker.compose.service") != service
+            or labels.get("org.fullmag.source.worktree-id") != identity["worktree_id"]
+        ):
+            raise BuildControlError(f"Retained {service} ownership differs")
+        recorded = terminal.get(service + "_container")
+        if recorded is not None and recorded != observed.get("Id"):
+            raise BuildControlError(f"Retained {service} incarnation differs")
+        _validate_retained_service(document, observed, service, image_config)
+        if not observed.get("State", {}).get("Running"):
+            raise BuildControlError(f"Retained {service} is not running")
+        ids[service] = identifier
+
+    backend_mounts = document["services"]["backend"].get("volumes", [])
+    source_mount = next(
+        (mount for mount in backend_mounts if mount.get("target") == "/opt/fullmag/source"),
+        None,
+    )
+    if not isinstance(source_mount, dict) or source_mount.get("type") != "bind" or not source_mount.get("read_only"):
+        raise BuildControlError("Retained backend source is not a readonly bind")
+    if document["services"]["backend"].get("environment", {}).get("FULLMAG_SOURCE_ROOT") is None:
+        raise BuildControlError("Retained backend source identity is missing")
+    if (
+        json.loads(_docker_text("inspect", ids["backend"]))[0]
+        .get("State", {})
+        .get("Health", {})
+        .get("Status")
+        != "healthy"
+    ):
+        raise BuildControlError("Retained backend is not healthy")
+    return ids["backend"], ids["frontend"]
+
+
+def _validate_linked_runtime_terminal(
+    terminal: Mapping[str, object],
+    *,
+    phase: str,
+    original_attempt: str,
+    original: Mapping[str, object],
+    source_root: str,
+    image: str,
+    config_sha256: str,
+) -> None:
+    if not isinstance(terminal, Mapping):
+        raise BuildControlError("Linked runtime terminal is not an object")
+    if terminal.get("phase") != phase or terminal.get("state") != "succeeded":
+        raise BuildControlError("Linked runtime terminal is not a succeeded " + phase)
+    if terminal.get("compose_project") != original.get("compose_project"):
+        raise BuildControlError("Linked runtime terminal belongs to another Compose group")
+    linked_attempt = terminal.get("attempt")
+    if (
+        not isinstance(linked_attempt, str)
+        or not ATTEMPT_RE.fullmatch(linked_attempt)
+        or linked_attempt == original_attempt
+    ):
+        raise BuildControlError("Linked runtime terminal has an invalid attempt identity")
+    if terminal.get("config_sha256") != config_sha256:
+        raise BuildControlError("Linked runtime terminal/config pin differs")
+    inputs = terminal.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise BuildControlError("Linked runtime terminal inputs are missing")
+    if inputs.get("attempt") != original_attempt:
+        raise BuildControlError("Linked runtime terminal is not linked to the retained attempt")
+    if inputs.get("config_sha256") != config_sha256:
+        raise BuildControlError("Linked runtime terminal input/config pin differs")
+    if "source_root" in inputs and inputs["source_root"] != source_root:
+        raise BuildControlError("Linked runtime terminal source selection differs")
+    if "image_id" in inputs and inputs["image_id"] != image:
+        raise BuildControlError("Linked runtime terminal image differs")
+
+    for key in ("backend_container", "frontend_container"):
+        value = terminal.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise BuildControlError("Linked runtime terminal has an invalid " + key)
+
+    source_fields = {
+        "source_commit": re.compile(r"^[0-9a-f]{40}$"),
+        "source_digest": SHA256_RE,
+        "source_snapshot_sha256": SHA256_RE,
+        "backend_build_receipt_sha256": SHA256_RE,
+    }
+    for key, pattern in source_fields.items():
+        value = terminal.get(key)
+        if not isinstance(value, str) or not pattern.fullmatch(value):
+            raise BuildControlError("Linked runtime terminal has an invalid " + key)
+        if key in original and value != original.get(key):
+            raise BuildControlError("Linked runtime terminal " + key + " differs")
+
+    for key in ("state_root", "backend_volumes", "frontend_volume"):
+        if key in original and terminal.get(key) != original.get(key):
+            raise BuildControlError("Linked runtime terminal " + key + " differs")
+
+
+def _linked_runtime_terminals(
+    control: BuildControl,
+    original_attempt: str,
+    original: Mapping[str, object],
+    *,
+    source_root: str,
+    image: str,
+    config_sha256: str,
+) -> list[Mapping[str, object]]:
+    state = original.get("state")
+    if state == "succeeded":
+        return [original]
+    if state != "failed-confirmed":
+        raise BuildControlError("Script activation requires a successful retained DEV start or linked recovery")
+    linked: list[Mapping[str, object]] = []
+    for phase in ("resume", "iteration"):
+        verified = control.read(phase + "/verified.json", optional=True)
+        if verified is None:
+            continue
+        if not isinstance(verified, Mapping):
+            raise BuildControlError("Linked " + phase + " verification is not an object")
+        if verified.get("phase") != phase or verified.get("state") != "succeeded":
+            raise BuildControlError("Linked " + phase + " verification is not terminal success")
+        verified_inputs = verified.get("inputs")
+        if not isinstance(verified_inputs, Mapping):
+            raise BuildControlError("Linked " + phase + " verification inputs are missing")
+        if verified_inputs.get("attempt") != original_attempt:
+            continue
+        if verified.get("config_sha256") != config_sha256:
+            raise BuildControlError("Linked " + phase + " verification/config pin differs")
+        if verified_inputs.get("config_sha256") != config_sha256:
+            raise BuildControlError("Linked " + phase + " input/config pin differs")
+        linked_attempt = verified.get("attempt")
+        if not isinstance(linked_attempt, str) or not ATTEMPT_RE.fullmatch(linked_attempt):
+            raise BuildControlError("Linked " + phase + " verification attempt is invalid")
+        terminal = control.read(
+            phase + "/attempts/" + linked_attempt + "/terminal.json"
+        )
+        if not isinstance(terminal, Mapping):
+            raise BuildControlError("Linked " + phase + " terminal is not an object")
+        if canonical(terminal) != canonical(verified):
+            raise BuildControlError("Linked " + phase + " terminal differs from verified receipt")
+        _validate_linked_runtime_terminal(
+            terminal,
+            phase=phase,
+            original_attempt=original_attempt,
+            original=original,
+            source_root=source_root,
+            image=image,
+            config_sha256=config_sha256,
+        )
+        linked.append(terminal)
+    if not linked:
+        raise BuildControlError("No succeeded resume or iteration is linked to the retained DEV attempt")
+    return linked
+
+
+def _json_result(output: bytes) -> dict[str, object] | None:
+    for line in reversed(output.decode("utf-8", "replace").splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("state"), str):
+            return value
+    return None
+
+
+def _run_fixed_activation(
+    backend_id: str,
+    *,
+    script_path: str,
+    provenance_path: str,
+    provenance_sha256: str,
+    helper_sha256: str,
+) -> dict[str, object]:
+    environment = (
+        "FULLMAG_STARTUP_ENABLED=1",
+        "FULLMAG_STARTUP_SCRIPT=" + script_path,
+        "FULLMAG_STARTUP_PROVENANCE=" + provenance_path,
+        "FULLMAG_STARTUP_PROVENANCE_SHA256=" + provenance_sha256,
+        "FULLMAG_STARTUP_HELPER_SHA256=" + helper_sha256,
+        "FULLMAG_STARTUP_API=http://127.0.0.1:8081",
+    )
+    result = docker_capture(
+        "exec",
+        *sum((["--env", value] for value in environment), []),
+        backend_id,
+        "/usr/local/bin/python3",
+        "-I",
+        "-B",
+        "-c",
+        FIXED_ACTIVATION_SCRIPT,
+        timeout=ACTIVATE_TIMEOUT_SECONDS,
+        allow_failure=True,
+    )
+    output = result.stdout + result.stderr
+    value = _json_result(output)
+    if result.returncode == 0:
+        if value is None or value.get("state") not in {"activated", "rejected"}:
+            raise BuildControlError("Backend activation wrapper returned no terminal result")
+        return value
+    if value is not None and value.get("state") == "unknown":
+        raise ControlOutcomeUnknown(
+            "Startup activation outcome is unknown; activation.json prevents retry"
+        )
+    marker = docker_capture(
+        "exec",
+        backend_id,
+        "test",
+        "-f",
+        str(startup.ACTIVATION_RECEIPT_PATH),
+        timeout=30,
+        allow_failure=True,
+    )
+    if marker.returncode == 0:
+        raise ControlOutcomeUnknown(
+            "Backend activation failed after publishing activation.json; retry is forbidden"
+        )
+    detail = output.decode("utf-8", "replace")[-4096:]
+    raise BuildControlError(f"Backend activation wrapper failed: {detail}")
+
+
+def activate(args: argparse.Namespace) -> None:
+    from docker_dev import _compose_identity, _require_native_windows, _select_source
+
+    _require_native_windows()
+    if not ATTEMPT_RE.fullmatch(args.attempt):
+        raise BuildControlError("Script activation requires an exact attempt UUID")
+    if not SHA256_RE.fullmatch(args.config_sha256):
+        raise BuildControlError("Script activation requires a lowercase config SHA-256")
+    repo = Path(args.repo_root).resolve(strict=True)
+    selected, layout = _select_source(repo, args.source_root)
+    identity = _compose_identity(layout)
+    configured = toolchain_configuration(selected, identity)
+    helper_image = configured["services"]["fem-gpu-toolchain"]["build"]["args"]["FULLMAG_CUDA_BASE_IMAGE"]
+    control = BuildControl(identity, helper_image)
+    control.prepare()
+
+    root = "development/attempts/" + args.attempt
+    terminal = control.read(root + "/terminal.json")
+    document = control.read(root + "/compose.json")
+    if terminal.get("compose_project") != control.project:
+        raise BuildControlError("Retained DEV attempt belongs to another Compose group")
+    if hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256:
+        raise BuildControlError("Retained Compose configuration/CAS differs")
+    if terminal.get("config_sha256") not in (None, args.config_sha256):
+        raise BuildControlError("Retained terminal receipt/config pin differs")
+    inputs = terminal.get("inputs")
+    if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
+        raise BuildControlError("Retained source selection differs")
+    image = inputs.get("image_id")
+    if not isinstance(image, str) or not IMAGE_ID_RE.fullmatch(image):
+        raise BuildControlError("Retained backend image is not immutable")
+    runtime_terminals = _linked_runtime_terminals(
+        control,
+        args.attempt,
+        terminal,
+        source_root=str(selected),
+        image=image,
+        config_sha256=args.config_sha256,
+    )
+    backend_id = frontend_id = None
+    validation_error = None
+    for runtime_terminal in runtime_terminals:
+        try:
+            backend_id, frontend_id = _validate_running_group(
+                control, identity, document, runtime_terminal, image
+            )
+            break
+        except BuildControlError as error:
+            validation_error = error
+    if backend_id is None or frontend_id is None:
+        detail = f": {validation_error}" if validation_error else ""
+        raise BuildControlError("No linked runtime terminal matches the running Compose group" + detail)
+
+    helper_hashes = _image_helper_hashes(backend_id)
+    _validate_selected_helpers(selected, helper_hashes)
+    source_commit = storage.git(selected, "rev-parse", "HEAD")
+    probe_request_id = args.request_id or f"docker-volume-{args.attempt}-probe"
+    authorization = startup.prepare(
+        selected,
+        args.script,
+        request_id=probe_request_id,
+        source_commit=source_commit,
+    )
+    request_id = _request_id(args.attempt, authorization.source_sha256, args.request_id)
+    if request_id != authorization.request_id:
+        authorization = startup.prepare(
+            selected,
+            args.script,
+            request_id=request_id,
+            source_commit=source_commit,
+        )
+    authorization_document = authorization.as_dict()
+    provenance = _authorization_bytes(authorization_document)
+    provenance_sha256 = hashlib.sha256(provenance).hexdigest()
+
+    inputs = {
+        "attempt": args.attempt,
+        "config_sha256": args.config_sha256,
+        "source_root": str(selected),
+        "image_id": image,
+        "source_relative": authorization.source_relative,
+        "source_sha256": authorization.source_sha256,
+        "request_id": authorization.request_id,
+        "provenance_sha256": provenance_sha256,
+        "backend_container": backend_id,
+    }
+    with control.operation("activation", inputs) as operation:
+        operation["receipt"].update(inputs, state="preparing")
+        provenance_relative = operation["root"] + "/startup-provenance.json"
+        control.write_bytes(provenance_relative, provenance)
+        control.write(operation["root"] + "/authorization.json", authorization_document)
+        operation["receipt"].update(
+            state="executing",
+            provenance_path=CONTROL_ROOT + "/" + provenance_relative,
+            helper_sha256=helper_hashes["docker_startup_script.py"],
+        )
+        operation["daemon_pending"] = True
+        try:
+            result = _run_fixed_activation(
+                backend_id,
+                script_path=authorization.container_script_path,
+                provenance_path=CONTROL_ROOT + "/" + provenance_relative,
+                provenance_sha256=provenance_sha256,
+                helper_sha256=helper_hashes["docker_startup_script.py"],
+            )
+        except ControlOutcomeUnknown:
+            raise
+        except BuildControlError:
+            operation["daemon_pending"] = False
+            raise
+        control.write(operation["root"] + "/result.json", result)
+        # Keep the lease pending until the terminal technical receipt is
+        # durable.  A committed API result with a failed receipt publication
+        # must not look like a safe retry.
+        operation["daemon_pending"] = False
+        operation["receipt"].update(
+            state="succeeded",
+            activation_state=result["state"],
+            session_id=result.get("response", {}).get("session_id") if isinstance(result.get("response"), dict) else None,
+            run_id=result.get("response", {}).get("run_id") if isinstance(result.get("response"), dict) else None,
+        )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument("--attempt", required=True)
+    parser.add_argument("--config-sha256", required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--script", type=Path, required=True)
+    parser.add_argument("--request-id")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        activate(args)
+    except (BuildControlError, OSError, ValueError) as error:
+        print(f"docker-dev-script: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

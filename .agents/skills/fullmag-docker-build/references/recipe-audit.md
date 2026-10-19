@@ -107,6 +107,22 @@ we wcześniejszych sekcjach jest historią poprzedniego launchera, nie mapą
 writerów nowego `docker_volume_dev.start`. Sam merge i dump nie kwalifikują
 runtime, HMR, restartu ani wykonania solvera.
 
+## Delta aktywacji skryptu — 19.10.2026
+
+Bieżący dump parsera ma **621 aktywnych recept**. Dodatkowa `docker-dev-script`
+wykonuje stały wrapper w istniejącym backendzie, bez Compose lifecycle,
+nowego kontenera aplikacji i przebudowy. Źródła są czytane z readonly bindu;
+autoryzacja i receipty pozostają w control volume. Piny oryginalnej próby
+mogą mieć powiązany, trwale zweryfikowany sukces resume/iteration. Wynik
+unknown nie jest automatycznie ponawiany. Weryfikacja źródeł: 9 lekkich
+regresji aktywacji i 6 granicy argv PASS; runtime **NOT VERIFIED**.
+
+- `justfile`: 7550 linii, 720560 bajtów, SHA256 `c96cc146411e61b4f5fa53399a9f849c76a775e4ccc6ca9b93f8ffaa17bb7f0f`.
+- `scripts/just_storage_shell.sh`: 913 linii, 64054 bajty, SHA256 `49d4ec057e09fb9d0efc9cdcb0939bddeaf12f4aad105b08c5947a67eb2114b2`.
+
+Powyższe wcześniejsze delty pozostają historycznymi checkpointami. Nie
+przekwalifikowują pozostałych recept ani nie zmieniają bazowego manifestu TSV.
+
 ## Granica wspólna dla recept
 
 Od tego miejsca szczegółowy inwentarz rodzin i numery linii opisują audyt bazowy, nie bieżącą trasę Docker DEV. Aktualna trasa jest opisana wyżej; historyczne wiersze Docker dev i Docker dev Compose niżej zachowują dowód wcześniejszych writerów i nie są instrukcją uruchamiania.
