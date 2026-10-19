@@ -80,6 +80,7 @@ Nie tworzy nowej autoryzacji ani nie powtarza Solve; runtime nadal sprawdza
 aktualnego ownera i pełne dowody. Taka próba wymaga zachowania oryginalnego
 storage sesji, więc `fresh_state=true` jest odrzucane.
 Nadzór startu odczytuje receipt PID 1 przez kanoniczne `runtime_service.process_receipt_path(canonical_paths())`, z technicznego wolumenu runtime-control. Potwierdzony `failed_outcome_retained` przerywa oczekiwanie na gotowość; nie czeka na pełny timeout i nie ponawia Solve.
+`just docker-dev-stop-failed <source> <container-id> <image-id> <process-receipt-sha256>` może zatrzymać również nadzorcę po nieudanym starcie native runtime. Wymaga zakończonego API, właściciela `failed`, obu schedulerów zakończonych poprawnie, braku żywych procesów i aktywnych lease’ów oraz zwolnionych rezerwacji hosta. Zapisuje dowód przed zatrzymaniem i weryfikuje niezmienionego właściciela po nim. Nie odzyskuje GPU, nie zmienia ownera i nie powtarza skryptu. Obserwacja nieznana lub aktywne zasoby blokują tę komendę.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
 
 ### Aktywacja skryptu w już działającym Workspace
