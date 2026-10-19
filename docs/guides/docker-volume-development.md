@@ -74,11 +74,17 @@ startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backe
 `docker-dev-recreate-volume` wymaga zatrzymanego backendu i dokładnych pinów
 próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
-Jeżeli poprzednia próba zawiera już autoryzowane recovery, odtworzenie zachowuje
-dokładnie tę samą autoryzację i jej metadane po ponownej walidacji pod blokadą.
-Nie tworzy nowej autoryzacji ani nie powtarza Solve; runtime nadal sprawdza
-aktualnego ownera i pełne dowody. Taka próba wymaga zachowania oryginalnego
-storage sesji, więc `fresh_state=true` jest odrzucane.
+Oczekująca transakcja recovery zachowuje dokładną pierwotną autoryzację po
+ponownej walidacji. Sama publikacja receipt `recovered` nie usuwa uprawnienia
+potrzebnego przy pierwszym starcie po recovery. Jeżeli późniejszy właściciel
+zakończy start błędem, `docker-dev-stop-failed` zapisuje dowód jego kontrolowanego
+zatrzymania. Przy następnym `docker-dev-recreate-volume` launcher sprawdza ten
+dowód oraz zakończoną transakcję recovery, pomija jej zużytą autoryzację i
+przypina SHA bieżącej konfiguracji odczytanej pod `OWNER.lock`. Nowy start może
+zmienić wyłącznie generację przy zachowaniu profilu operatora. Metadane tego
+restartu są oddzielone od autoryzacji recovery. Nie powstaje nowy request recovery,
+nie zmienia się historia i nie jest ponawiane Solve. Zachowywany jest oryginalny
+storage sesji; `fresh_state=true` pozostaje odrzucane.
 Nadzór startu odczytuje receipt PID 1 przez kanoniczne `runtime_service.process_receipt_path(canonical_paths())`, z technicznego wolumenu runtime-control. Potwierdzony `failed_outcome_retained` przerywa oczekiwanie na gotowość; nie czeka na pełny timeout i nie ponawia Solve.
 `just docker-dev-stop-failed <source> <container-id> <image-id> <process-receipt-sha256>` może zatrzymać również nadzorcę po nieudanym starcie native runtime. Wymaga zakończonego API, właściciela `failed`, obu schedulerów zakończonych poprawnie, braku żywych procesów i aktywnych lease’ów oraz zwolnionych rezerwacji hosta. Zapisuje dowód przed zatrzymaniem i weryfikuje niezmienionego właściciela po nim. Nie odzyskuje GPU, nie zmienia ownera i nie powtarza skryptu. Obserwacja nieznana lub aktywne zasoby blokują tę komendę.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.

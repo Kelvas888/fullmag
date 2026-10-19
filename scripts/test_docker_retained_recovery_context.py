@@ -47,7 +47,12 @@ class RetainedRecoveryContextTests(unittest.TestCase):
         self.control = Mock(project='fullmag-worktree-test')
 
     def run_context(self, fresh_state=False):
-        with patch.object(recovery, '_control_bytes', return_value=self.raw):
+        def control_bytes(_control, relative, *, optional=False):
+            if relative.endswith('/receipt.json'):
+                return None
+            return self.raw
+
+        with patch.object(recovery, '_control_bytes', side_effect=control_bytes):
             return dev._retained_recovery_context(self.control, self.previous, self.document, fresh_state=fresh_state)
 
     def test_keeps_exact_capability_and_original_request(self):
@@ -103,6 +108,42 @@ class RetainedRecoveryContextTests(unittest.TestCase):
         self.previous['container_recovery_environment'] = []
         with self.assertRaisesRegex(dev.BuildControlError, 'environment differs'):
             self.run_context()
+
+    def test_completed_recovery_with_failed_successor_drops_old_authority(self):
+        native_context = {'previous_config_sha256': 'c' * 64,
+                          'native_restart_metadata': {'schema': 'native-stop'}}
+        with patch.object(dev, '_validate_completed_recovery_receipt', return_value=True), \
+                patch.object(dev, '_native_failed_stop_recovery_context', return_value=native_context):
+            result = self.run_context()
+        self.assertEqual(result, native_context)
+        self.assertNotIn('recovery_environment', result)
+        self.assertNotIn('recovery_metadata', result)
+
+    def test_first_completed_recovery_without_successor_stop_keeps_authority(self):
+        with patch.object(dev, '_validate_completed_recovery_receipt', return_value=True), \
+                patch.object(dev, '_native_failed_stop_recovery_context', return_value=None):
+            self.assertEqual(self.run_context(), {
+                'recovery_environment': self.env, 'recovery_metadata': self.metadata})
+
+    def test_pending_recovery_receipt_keeps_original_capability(self):
+        pending = recovery._canonical({
+            'schema_version': 'runtime_service_container_recovery.v1',
+            'status': 'pending',
+        })
+        with patch.object(recovery, '_control_bytes', return_value=pending):
+            self.assertFalse(dev._validate_completed_recovery_receipt(
+                self.control, self.auth, recovery
+            ))
+
+    def test_recovered_receipt_with_wrong_outcome_fails_closed(self):
+        recovered = recovery._canonical({
+            'schema_version': 'runtime_service_container_recovery.v1',
+            'status': 'recovered',
+            'outcome': 'failed',
+        })
+        with patch.object(recovery, '_control_bytes', return_value=recovered):
+            with self.assertRaisesRegex(dev.BuildControlError, 'unsupported outcome'):
+                dev._validate_completed_recovery_receipt(self.control, self.auth, recovery)
 
 
 if __name__ == '__main__':

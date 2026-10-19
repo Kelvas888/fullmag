@@ -41,6 +41,10 @@ _MAX_RECOVERY_METADATA_BYTES = 256 * 1024
 _MAX_CANCELLED_ACTIVATION_RECORD_BYTES = 8 * 1024 * 1024
 _CANCELLED_ACTIVATION_SCHEMA = "fullmag.docker-activation-accepted-then-cancelled.v1"
 _CANCELLED_ACTIVATION_ATTEMPT = re.compile(r"[0-9a-f]{32}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_NATIVE_STOP_JOURNAL_SCHEMA = "fullmag.stop-failed-admission.v1"
+_NATIVE_STOP_RECREATE_METADATA_SCHEMA = "fullmag.docker-native-failed-stop-recreate.v1"
+_MAX_RUNTIME_CONFIG_BYTES = 256 * 1024
 
 
 def _validate_recovery_environment(values):
@@ -650,7 +654,8 @@ def _precreate_new_windows_runtime_state(state):
 
 
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
-          recovery_environment=None, recovery_metadata=None):
+          recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
+          native_restart_metadata=None):
     from docker_dev import (_require_native_windows, _select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -662,6 +667,9 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         raise BuildControlError("Recovery start requires both control and operation")
     validated_recovery_environment = _validate_recovery_environment(recovery_environment)
     validated_recovery_metadata = _validate_recovery_metadata(recovery_metadata)
+    validated_native_restart_metadata = _validate_recovery_metadata(native_restart_metadata)
+    if previous_config_sha256 is not None and _SHA256.fullmatch(str(previous_config_sha256)) is None:
+        raise BuildControlError("Previous runtime configuration digest is not a lowercase SHA-256")
     _require_native_windows()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root or args.repo_root)
     identity = _compose_identity(layout)
@@ -710,6 +718,10 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         "gpu_access_requested": policy, "device_access": device_access,
         "gpu_preflight": "PASS" if device_access == "gpu" else "NOT_REQUIRED",
         **operator_probe_record}
+    if previous_config_sha256 is not None:
+        operation_inputs["previous_config_sha256"] = previous_config_sha256
+    if validated_native_restart_metadata is not None:
+        operation_inputs["native_failed_restart"] = validated_native_restart_metadata
     if provided_operation is not None:
         _validate_existing_operation_inputs(provided_operation.get("receipt", {}), operation_inputs)
     operation_context = (control.operation("development", operation_inputs)
@@ -826,6 +838,11 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         backend["environment"]["FULLMAG_PACKAGE_PROVENANCE"] = runtime.BACKEND_PROVENANCE_PATH
         backend["environment"]["FULLMAG_RUNTIME_PROVENANCE"] = runtime.BACKEND_PROVENANCE_PATH
         backend["environment"]["CUDA_CACHE_PATH"] = "/build/cuda-cache"
+        backend["environment"].pop("FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256", None)
+        if previous_config_sha256 is not None:
+            backend["environment"]["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = str(
+                previous_config_sha256
+            )
         backend["environment"].update(validated_recovery_environment)
         if startup is not None:
             backend["environment"].update(FULLMAG_STARTUP_ENABLED="1",
@@ -1591,13 +1608,222 @@ def resume(args):
     return _retained_operation(args, recreate_services=False)
 
 
-def _retained_recovery_context(control, previous, document, *, fresh_state):
-    """Carry the original capability through image replacement, never mint one.
+def _read_runtime_config_digest(control):
+    """Read the current native config while holding the runtime owner lock."""
+
+    config_path = control.path("runtime-control/runtime-service/docker-all.json")
+    lock_path = control.path("runtime-control/runtime-services/OWNER.lock")
+    config_parent = str(PurePosixPath(config_path).parent)
+    lock_parent = str(PurePosixPath(lock_path).parent)
+    script = (
+        f"test -e '{lock_path}'; test ! -L '{lock_path}'; test -f '{lock_path}'; "
+        f"test $(stat -c %h '{lock_path}') = 1; "
+        f"test \"$(readlink -f '{lock_parent}')\" = '{lock_parent}'; "
+        f"exec 9<> '{lock_path}'; flock -n 9; "
+        f"test -e '{config_path}'; test ! -L '{config_path}'; test -f '{config_path}'; "
+        f"test $(stat -c %h '{config_path}') = 1; "
+        f"test \"$(readlink -f '{config_parent}')\" = '{config_parent}'; "
+        f"head -c {_MAX_RUNTIME_CONFIG_BYTES + 1} '{config_path}'"
+    )
+    result = bounded_capture(control.helper_args(script), data=b"", timeout=90)
+    if result.returncode:
+        raise BuildControlError(
+            "Native runtime configuration could not be pinned under OWNER.lock: "
+            + result.stderr.decode("utf-8", "replace")[-2048:]
+        )
+    raw = bytes(result.stdout)
+    if not raw or len(raw) > _MAX_RUNTIME_CONFIG_BYTES:
+        raise BuildControlError("Native runtime configuration exceeds its bounded size")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BuildControlError("Native runtime configuration is not valid JSON") from error
+    if not isinstance(value, Mapping):
+        raise BuildControlError("Native runtime configuration is not an object")
+    digest = hashlib.sha256(raw).hexdigest()
+    if _SHA256.fullmatch(digest) is None:
+        raise BuildControlError("Native runtime configuration digest is invalid")
+    return digest
+
+
+def _validate_completed_recovery_receipt(control, authorization, recovery_module):
+    """Return true only for a complete receipt bound to the old authorization."""
+
+    receipt_relative = (
+        "runtime-control/runtime-services/container-recovery/"
+        + authorization["native_request_sha256"] + "/receipt.json"
+    )
+    receipt_raw = recovery_module._control_bytes(control, receipt_relative, optional=True)
+    if receipt_raw is None:
+        return False
+    receipt = recovery_module._parse_json(receipt_raw, "retained recovery receipt")
+    if receipt.get("schema_version") != "runtime_service_container_recovery.v1":
+        raise BuildControlError("Completed recovery receipt schema is unsupported")
+    if receipt.get("status") != "recovered":
+        # A prepared/pending receipt still owns the original capability.  It
+        # must be carried unchanged so PID 1 can finish its authenticated
+        # recovery protocol on the next start.
+        return False
+    if receipt.get("outcome") != "empty_namespace_recovered":
+        raise BuildControlError("Completed recovery receipt has an unsupported outcome")
+    request_relative = authorization["native_request_path"][len("/opt/fullmag/control/"):]
+    request_raw = recovery_module._control_bytes(control, request_relative)
+    if hashlib.sha256(request_raw).hexdigest() != authorization["native_request_sha256"]:
+        raise BuildControlError("Completed recovery request digest differs from authorization")
+    request = recovery_module.validate_request(
+        recovery_module._parse_json(request_raw, "retained recovery request")
+    )
+    for field in ("request_id", "config_sha256", "owner_sha256"):
+        if request.get(field) != authorization[field]:
+            raise BuildControlError("Completed recovery request differs from authorization")
+    attestation_relative = authorization["attestation_path"][len("/opt/fullmag/control/"):]
+    attestation_raw = recovery_module._control_bytes(control, attestation_relative)
+    attestation = recovery_module.validate_attestation(
+        recovery_module._parse_json(attestation_raw, "retained recovery attestation"),
+        request,
+        authorization["native_request_sha256"],
+    )
+    if hashlib.sha256(canonical(attestation)).hexdigest() != authorization["attestation_sha256"]:
+        raise BuildControlError("Completed recovery attestation digest differs from authorization")
+    manifest_relative = authorization["manifest_path"][len("/opt/fullmag/control/"):]
+    manifest_raw = recovery_module._control_bytes(control, manifest_relative)
+    if hashlib.sha256(manifest_raw).hexdigest() != authorization["manifest_sha256"]:
+        raise BuildControlError("Completed recovery manifest digest differs from authorization")
+    expected = {
+        "request_id": request["request_id"],
+        "request_sha256": authorization["native_request_sha256"],
+        "config_sha256": request["config_sha256"],
+        "target_id": "docker-all",
+        "owner_sha256_before": request["owner_sha256"],
+        "owner_state_before": request["expected_owner"]["state"],
+        "owner_state_after": "failed",
+        "store_root_sha256": request["store_root_sha256"],
+        "application": request["application"],
+        "ledger_root_sha256": request["ledger_root_sha256"],
+        "ledger_snapshot_sha256": request["ledger_snapshot_sha256"],
+        "attestation_sha256": authorization["attestation_sha256"],
+        "docker_manifest_sha256": request["docker_manifest_sha256"],
+        "prior_ready_owner_proof_sha256": request["prior_ready_owner_proof_sha256"],
+        "device_release_mapping_sha256": request["device_release_mapping_sha256"],
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        raise BuildControlError("Completed recovery receipt differs from its authorization")
+    owner_after = receipt.get("owner_sha256_after")
+    if _SHA256.fullmatch(owner_after or "") is None or owner_after == request["owner_sha256"]:
+        raise BuildControlError("Completed recovery receipt has no new failed-owner digest")
+    for field, pattern in (
+        ("historical_build_commit", re.compile(r"[0-9a-f]{40}\Z")),
+        ("executor_build_commit", re.compile(r"[0-9a-f]{40}\Z")),
+        ("historical_build_snapshot", _SHA256),
+        ("executor_build_snapshot", _SHA256),
+        ("archived_evidence_sha256", _SHA256),
+    ):
+        if pattern.fullmatch(receipt.get(field, "")) is None:
+            raise BuildControlError("Completed recovery receipt has invalid " + field)
+    return True
+
+
+def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh_state):
+    """Validate one managed native-start-failure stop journal for recreation."""
+
+    if not isinstance(backend_id, str) or not _SHA256.fullmatch(backend_id):
+        return None
+    journal_path = "verification/stop-failed-" + backend_id + ".json"
+    from docker_volume_stop_unadmitted import _control_bytes, _json
+    journal_raw = _control_bytes(control, journal_path, optional=True)
+    if journal_raw is None:
+        return None
+    journal = _json(journal_raw, "native failed-stop journal")
+    if fresh_state:
+        raise BuildControlError("Native failed-stop recovery requires the retained session storage")
+    previous_inputs = previous.get("inputs")
+    if not isinstance(previous_inputs, Mapping):
+        raise BuildControlError("Native failed-stop recreation has no retained inputs")
+    image_id = previous_inputs.get("image_id")
+    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise BuildControlError("Native failed-stop recreation has no immutable image identity")
+    if (
+        journal.get("schema") != _NATIVE_STOP_JOURNAL_SCHEMA
+        or journal.get("state") != "stopped-confirmed"
+        or journal.get("failure_kind") != "native-start-failure"
+        or journal.get("container_id") != backend_id
+        or journal.get("image_id") != image_id
+        or type(journal.get("exit_code")) is not int
+    ):
+        raise BuildControlError("Native failed-stop journal is not the exact stopped backend proof")
+    failure = journal.get("failure_receipt")
+    if not isinstance(failure, Mapping):
+        raise BuildControlError("Native failed-stop journal has no failed process receipt")
+    process_sha = failure.get("sha256")
+    if not isinstance(process_sha, str) or _SHA256.fullmatch(process_sha) is None:
+        raise BuildControlError("Native failed-stop journal has an invalid failed process digest")
+    failed_receipt = failure.get("receipt")
+    probe = journal.get("native_failure_probe")
+    if not isinstance(failed_receipt, Mapping) or not isinstance(probe, Mapping):
+        raise BuildControlError("Native failed-stop journal has incomplete native failure evidence")
+    if probe.get("process_receipt_sha256") != process_sha or probe.get("process_receipt") != failed_receipt:
+        raise BuildControlError("Native failed-stop journal failed process evidence differs")
+    from docker_volume_stop_failed import _validate_native_failure_probe
+    validated = _validate_native_failure_probe(probe, process_sha)
+
+    terminal_raw = _control_bytes(control, "runtime-control/runtime-service/process-tree.json")
+    terminal = _json(terminal_raw, "native failed-stop terminal process receipt")
+    if terminal != journal.get("terminal_process_receipt"):
+        raise BuildControlError("Native failed-stop terminal process receipt differs")
+    if (
+        terminal.get("schema") != "fullmag.docker-process-tree.v1"
+        or terminal.get("state") != "shutdown_unknown"
+        or "service_owner" in terminal
+        or "terminal_service_owner" in terminal
+        or type(terminal.get("api_exit_code")) is not int
+        or terminal.get("runtime_pid") is not None
+    ):
+        raise BuildControlError("Native failed-stop terminal process receipt is not canonical")
+    terminal_owner_raw = _control_bytes(control, "runtime-control/runtime-services/OWNER.json")
+    terminal_owner = _json(terminal_owner_raw, "native failed-stop terminal owner")
+    expected_owner = journal.get("terminal_failed_owner")
+    owner_sha = hashlib.sha256(terminal_owner_raw).hexdigest()
+    if (
+        terminal_owner != expected_owner
+        or (
+            journal.get("terminal_failed_owner_sha256") is not None
+            and journal.get("terminal_failed_owner_sha256") != owner_sha
+        )
+        or validated["probe"].get("failed_owner_sha256") != owner_sha
+        or terminal_owner != validated["failed_owner"]
+    ):
+        raise BuildControlError("Native failed-stop failed owner changed after the stop proof")
+    previous_config_sha256 = _read_runtime_config_digest(control)
+    recorded_config = journal.get("previous_config_sha256")
+    if recorded_config is not None and recorded_config != previous_config_sha256:
+        raise BuildControlError("Native failed-stop runtime configuration digest differs")
+    metadata = {
+        "schema": _NATIVE_STOP_RECREATE_METADATA_SCHEMA,
+        "journal_sha256": hashlib.sha256(journal_raw).hexdigest(),
+        "container_id": backend_id,
+        "image_id": image_id,
+        "failure_receipt_sha256": process_sha,
+        "terminal_process_receipt_sha256": hashlib.sha256(terminal_raw).hexdigest(),
+        "terminal_failed_owner_sha256": owner_sha,
+        "previous_config_sha256": previous_config_sha256,
+        "claim_pending": False,
+    }
+    return {
+        "previous_config_sha256": previous_config_sha256,
+        "native_restart_metadata": metadata,
+    }
+
+
+def _retained_recovery_context(control, previous, document, *, fresh_state, backend_id=None):
+    """Carry pending recovery authority, or consume a completed proof once.
 
     PID 1 still authenticates the native request and current owner before any
-    recovery or service start. Dropping this capability during recreation
-    strands an interrupted recovery even though its immutable proof survives.
+    recovery or service start. Pending authorization is carried unchanged;
+    a completed recovery receipt is validated before its authority is dropped.
+    A separate native-start-failure journal carries only reduced restart
+    evidence and never mints a recovery authorization.
     """
+    import docker_volume_container_recovery as recovery_module
     from docker_volume_container_recovery import (
         AUTHORIZATION_ENV, AUTHORIZATION_SHA_ENV, CONTROL_ROOT,
         _control_bytes, _parse_json, _relative_control_path,
@@ -1608,7 +1834,10 @@ def _retained_recovery_context(control, previous, document, *, fresh_state):
                if key.startswith("FULLMAG_CONTAINER_RECOVERY_")}
     metadata = previous.get("container_recovery")
     if not carried and metadata is None:
-        return {}
+        return _native_failed_stop_recovery_context(
+            control, previous, backend_id=backend_id or previous.get("backend_container"),
+            fresh_state=fresh_state,
+        ) or {}
     if fresh_state:
         raise BuildControlError("Pending container recovery must retain its original session storage")
     if set(carried) != {AUTHORIZATION_ENV, AUTHORIZATION_SHA_ENV} or not isinstance(metadata, Mapping):
@@ -1641,6 +1870,16 @@ def _retained_recovery_context(control, previous, document, *, fresh_state):
     }
     if metadata != expected:
         raise BuildControlError("Retained container recovery metadata differs from authorization")
+    if _validate_completed_recovery_receipt(control, authorization, recovery_module):
+        native_restart = _native_failed_stop_recovery_context(
+            control, previous, backend_id=backend_id or previous.get("backend_container"),
+            fresh_state=fresh_state,
+        )
+        if native_restart is not None:
+            return native_restart
+        # The first post-recovery Failed owner still needs the original
+        # capability for its authorized configuration-generation rotation.
+        # A completed receipt alone does not prove a later owner existed.
     return {"recovery_environment": _validate_recovery_environment(carried),
             "recovery_metadata": _validate_recovery_metadata(expected)}
 
@@ -1806,7 +2045,10 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         if json.loads(read_owned_regular(owner_path)) != certificate or certificate.get("image_id") != image:
             raise BuildControlError("Retained Windows storage owner/certificate differs")
         fresh_state = bool(getattr(args, "fresh_state", False))
-        recovery_context = _retained_recovery_context(control, previous, document, fresh_state=fresh_state)
+        recovery_context = _retained_recovery_context(
+            control, previous, document, fresh_state=fresh_state,
+            backend_id=actual["backend"].get("Id"),
+        )
         if not fresh_state and not certificate.get("restart_verified"):
             raise BuildControlError("Unadmitted storage cannot rotate as an admitted runtime; use explicit --fresh-state to preserve the old root")
         # Exact recorded helper only; unknown group resources are never deleted.
@@ -1823,7 +2065,10 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 helper_ids.append(helper_document["Id"])
         with control.operation("recreate-services", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                                       **operator_probe_record}) as operation:
-            if recovery_context != _retained_recovery_context(control, previous, document, fresh_state=fresh_state):
+            if recovery_context != _retained_recovery_context(
+                control, previous, document, fresh_state=fresh_state,
+                backend_id=actual["backend"].get("Id"),
+            ):
                 raise BuildControlError("Retained container recovery capability changed before recreation")
             operation["receipt"].update(operator_probe_record)
             control.write(operation["root"] + "/retained-containers.json", actual)
