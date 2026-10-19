@@ -19,7 +19,7 @@ BACKEND_ID = "b" * 64
 IMAGE_ID = "sha256:" + "a" * 64
 
 
-def failed_owner() -> dict[str, object]:
+def failed_owner(*, compute_status: str = "exited_success") -> dict[str, object]:
     return {
         "schema_version": "runtime_service_owner.v1",
         "protocol": "stdin-v1",
@@ -39,10 +39,19 @@ def failed_owner() -> dict[str, object]:
         "compute_pool_generation": 7,
         "preparation_pool_generation": 8,
         "children": [
-            {"role": "compute", "pid": 3250, "status": "exited_success"},
+            {"role": "compute", "pid": 3250, "status": compute_status},
             {"role": "preparation", "pid": 3251, "status": "exited_success"},
         ],
     }
+
+
+def ready_owner() -> dict[str, object]:
+    value = failed_owner()
+    value["state"] = "ready"
+    value["children"] = [
+        {**child, "status": "running"} for child in value["children"]
+    ]
+    return value
 
 
 def native_probe() -> dict[str, object]:
@@ -62,6 +71,36 @@ def native_probe() -> dict[str, object]:
         "failed_owner_sha256": hashlib.sha256(owner_raw).hexdigest(),
         "failed_owner": owner,
         "api_pid_exists": False,
+        "native_processes_live": False,
+        "startup_enabled": None,
+        "legacy_activation_marker_exists": False,
+        "reservation_states": ["released"],
+        "lease_states": ["released"],
+        "active_lease_count": 0,
+    }
+
+
+def after_ready_native_probe() -> dict[str, object]:
+    ready = ready_owner()
+    owner = failed_owner(compute_status="exited_failure")
+    owner_raw = json.dumps(owner, sort_keys=True).encode()
+    receipt = {
+        "schema": "fullmag.docker-process-tree.v1",
+        "state": "failed_outcome_retained",
+        "api_pid": 3227,
+        "api_exit_code": -15,
+        "error": "runtime service owner observation failed during supervision",
+        "service_owner": ready,
+    }
+    return {
+        "schema": stop_failed.NATIVE_AFTER_READY_FAILURE_PROBE_SCHEMA,
+        "process_receipt_sha256": "d" * 64,
+        "process_receipt": receipt,
+        "failed_owner_sha256": hashlib.sha256(owner_raw).hexdigest(),
+        "failed_owner": owner,
+        "api_pid_exists": False,
+        "owner_pid_exists": False,
+        "child_pids_exist": False,
         "native_processes_live": False,
         "startup_enabled": None,
         "legacy_activation_marker_exists": False,
@@ -123,6 +162,33 @@ class NativeFailedRecreateTests(unittest.TestCase):
     def previous(self):
         return {"inputs": {"image_id": IMAGE_ID}}
 
+    def configure_after_ready_journal(self):
+        probe = after_ready_native_probe()
+        ready = probe["process_receipt"]["service_owner"]
+        self.terminal = {**terminal_receipt(), "service_owner": ready}
+        self.owner = probe["failed_owner"]
+        self.terminal_raw = json.dumps(self.terminal, sort_keys=True).encode()
+        self.owner_raw = json.dumps(self.owner, sort_keys=True).encode()
+        self.journal = {
+            "schema": "fullmag.stop-failed-admission.v1",
+            "state": "stopped-confirmed",
+            "failure_kind": "native-after-ready-failure",
+            "container_id": BACKEND_ID,
+            "image_id": IMAGE_ID,
+            "exit_code": 1,
+            "failure_receipt": {
+                "sha256": "d" * 64,
+                "receipt": probe["process_receipt"],
+            },
+            "native_failure_probe": probe,
+            "retained_ready_owner": ready,
+            "terminal_process_receipt": self.terminal,
+            "terminal_retained_ready_owner": ready,
+            "terminal_failed_owner": self.owner,
+            "terminal_failed_owner_sha256": hashlib.sha256(self.owner_raw).hexdigest(),
+        }
+        self.journal_raw = json.dumps(self.journal, sort_keys=True).encode()
+
     def test_native_stop_journal_pins_owner_and_current_config(self):
         with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
                 patch.object(dev, "_read_runtime_config_digest", return_value="c" * 64):
@@ -177,6 +243,31 @@ class NativeFailedRecreateTests(unittest.TestCase):
             with self.assertRaisesRegex(dev.BuildControlError, "retained session storage"):
                 dev._native_failed_stop_recovery_context(
                     self.control, self.previous(), backend_id=BACKEND_ID, fresh_state=True
+                )
+
+    def test_after_ready_stop_journal_consumes_identity_pinned_proof(self):
+        self.configure_after_ready_journal()
+        with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
+                patch.object(dev, "_read_runtime_config_digest", return_value="c" * 64):
+            context = dev._native_failed_stop_recovery_context(
+                self.control, self.previous(), backend_id=BACKEND_ID, fresh_state=False
+            )
+        metadata = context["native_restart_metadata"]
+        self.assertEqual(metadata["failure_kind"], "native-after-ready-failure")
+        self.assertEqual(metadata["retained_ready_owner"], ready_owner())
+        self.assertFalse(metadata["claim_pending"])
+
+    def test_after_ready_stop_requires_terminal_ready_owner_pin(self):
+        self.configure_after_ready_journal()
+        self.terminal.pop("service_owner")
+        self.terminal_raw = json.dumps(self.terminal, sort_keys=True).encode()
+        self.journal["terminal_process_receipt"] = self.terminal
+        self.journal_raw = json.dumps(self.journal, sort_keys=True).encode()
+        with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
+                patch.object(dev, "_read_runtime_config_digest", return_value="c" * 64):
+            with self.assertRaisesRegex(dev.BuildControlError, "terminal ready owner differs"):
+                dev._native_failed_stop_recovery_context(
+                    self.control, self.previous(), backend_id=BACKEND_ID, fresh_state=False
                 )
 
 

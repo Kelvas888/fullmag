@@ -1725,7 +1725,15 @@ def _validate_completed_recovery_receipt(control, authorization, recovery_module
 
 
 def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh_state):
-    """Validate one managed native-start-failure stop journal for recreation."""
+    """Validate one managed native-failure stop journal for recreation.
+
+    The legacy ``native-start-failure`` proof has no retained service owner.
+    ``native-after-ready-failure`` is a separate, stricter proof: it carries
+    the previous READY owner as an identity pin and may only recreate after
+    the terminal receipt preserves that exact pin.  Neither route changes the
+    owner state or releases a resource lease here; the proof is only carried
+    into the next managed start.
+    """
 
     if not isinstance(backend_id, str) or not _SHA256.fullmatch(backend_id):
         return None
@@ -1743,15 +1751,17 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     image_id = previous_inputs.get("image_id")
     if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
         raise BuildControlError("Native failed-stop recreation has no immutable image identity")
+    failure_kind = journal.get("failure_kind")
     if (
         journal.get("schema") != _NATIVE_STOP_JOURNAL_SCHEMA
         or journal.get("state") != "stopped-confirmed"
-        or journal.get("failure_kind") != "native-start-failure"
+        or failure_kind not in {"native-start-failure", "native-after-ready-failure"}
         or journal.get("container_id") != backend_id
         or journal.get("image_id") != image_id
         or type(journal.get("exit_code")) is not int
     ):
         raise BuildControlError("Native failed-stop journal is not the exact stopped backend proof")
+    after_ready = failure_kind == "native-after-ready-failure"
     failure = journal.get("failure_receipt")
     if not isinstance(failure, Mapping):
         raise BuildControlError("Native failed-stop journal has no failed process receipt")
@@ -1764,8 +1774,15 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
         raise BuildControlError("Native failed-stop journal has incomplete native failure evidence")
     if probe.get("process_receipt_sha256") != process_sha or probe.get("process_receipt") != failed_receipt:
         raise BuildControlError("Native failed-stop journal failed process evidence differs")
-    from docker_volume_stop_failed import _validate_native_failure_probe
-    validated = _validate_native_failure_probe(probe, process_sha)
+    from docker_volume_stop_failed import (
+        _validate_native_after_ready_failure_probe,
+        _validate_native_failure_probe,
+    )
+    validated = (
+        _validate_native_after_ready_failure_probe(probe, process_sha)
+        if after_ready
+        else _validate_native_failure_probe(probe, process_sha)
+    )
 
     terminal_raw = _control_bytes(control, "runtime-control/runtime-service/process-tree.json")
     terminal = _json(terminal_raw, "native failed-stop terminal process receipt")
@@ -1774,11 +1791,21 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     if (
         terminal.get("schema") != "fullmag.docker-process-tree.v1"
         or terminal.get("state") != "shutdown_unknown"
-        or "service_owner" in terminal
         or "terminal_service_owner" in terminal
         or type(terminal.get("api_exit_code")) is not int
         or terminal.get("runtime_pid") is not None
     ):
+        raise BuildControlError("Native failed-stop terminal process receipt is not canonical")
+    if after_ready:
+        retained_ready_owner = journal.get("retained_ready_owner")
+        terminal_ready_owner = terminal.get("service_owner")
+        if retained_ready_owner != validated["ready_owner"]:
+            raise BuildControlError("Native failed-stop retained ready owner differs from its probe")
+        if terminal_ready_owner != validated["ready_owner"]:
+            raise BuildControlError("Native failed-stop terminal ready owner differs from its probe")
+        if journal.get("terminal_retained_ready_owner") != terminal_ready_owner:
+            raise BuildControlError("Native failed-stop terminal ready owner evidence differs")
+    elif "service_owner" in terminal:
         raise BuildControlError("Native failed-stop terminal process receipt is not canonical")
     terminal_owner_raw = _control_bytes(control, "runtime-control/runtime-services/OWNER.json")
     terminal_owner = _json(terminal_owner_raw, "native failed-stop terminal owner")
@@ -1800,6 +1827,7 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
         raise BuildControlError("Native failed-stop runtime configuration digest differs")
     metadata = {
         "schema": _NATIVE_STOP_RECREATE_METADATA_SCHEMA,
+        "failure_kind": failure_kind,
         "journal_sha256": hashlib.sha256(journal_raw).hexdigest(),
         "container_id": backend_id,
         "image_id": image_id,
@@ -1809,6 +1837,8 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
         "previous_config_sha256": previous_config_sha256,
         "claim_pending": False,
     }
+    if after_ready:
+        metadata["retained_ready_owner"] = validated["ready_owner"]
     return {
         "previous_config_sha256": previous_config_sha256,
         "native_restart_metadata": metadata,
