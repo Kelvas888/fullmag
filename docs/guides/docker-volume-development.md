@@ -122,9 +122,12 @@ kodem 2; nie oznacza wykonania symulacji. Raport zachowuje osobno identyfikator
 operacji oraz `development_attempt`. Długi komunikat błędu pozostaje ograniczony
 do 2048 znaków, lecz zachowuje początek i końcową przyczynę tracebacku.
 
-Domyślny `request_id` jest deterministyczny na podstawie próby i hasha pliku:
-ten sam skrypt z tym samym domyślnym ID odtwarza terminalny wynik, a inny hash
-otrzymuje odrębny receipt. Nowe żądanie nadal przechodzi przez istniejącą
+Każde jawne wywołanie otrzymuje nowy domyślny `request_id` w postaci
+`docker-volume-<uuid>`, zapisany w receipcie przed wysłaniem żądania. Dzięki temu
+ten sam plik może posłużyć do kolejnej symulacji. Jawny `request_id` pozostaje
+stabilnym kluczem idempotencji i odtwarza wynik tego konkretnego żądania.
+Nieznany wynik wcześniejszej operacji nadal blokuje nowe wywołanie. Nowe żądanie
+przechodzi przez istniejącą
 walidację Workspace: musi być pusty według kontraktu API. Zamknięcie runu nie
 retiruje bieżącego Workspace, więc samo podanie nowego `request_id` jako piątego
 argumentu nie wystarcza; potrzebne jest istniejące, jawne przejście do pustego
