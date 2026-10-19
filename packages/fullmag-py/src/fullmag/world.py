@@ -8505,6 +8505,16 @@ def _build_explicit_mesh_assets(
                 for handle in _state._magnets
             },
         },
+        body_material_fields={
+            handle._resolved_geometry().geometry_name: {
+                "Ms": float(handle.Ms),
+                "Aex": float(handle.Aex),
+                "alpha": float(handle.alpha),
+                "Ku1": float(handle.Ku1 or 0.0),
+                "anisotropy_axis": list(handle.anisU or (0.0, 0.0, 1.0)),
+            }
+            for handle in _state._magnets
+        },
         discretization=DiscretizationHints(**discretization_kwargs),
         study_universe=(
             _state._study_universe.to_ir()

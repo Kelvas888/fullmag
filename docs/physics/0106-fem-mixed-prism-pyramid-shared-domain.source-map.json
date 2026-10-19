@@ -553,6 +553,27 @@
       "evidence_status": "implemented_unit_qualified"
     },
     {
+      "id": "mixed-certificate-v2-volume-reduction",
+      "path": "crates/fullmag-ir/src/mixed_certificate_v2.rs",
+      "symbol": "CompensatedSum",
+      "responsibility": "Accumulate v2 shared-domain, magnetic-body, and closed-faceted volume evidence with fixed-order Neumaier-compensated binary64 arithmetic after global-ordinal ordering.",
+      "evidence_status": "source_implementation_under_review_runtime_not_verified"
+    },
+    {
+      "id": "mixed-certificate-v2-swept-shell-owner",
+      "path": "crates/fullmag-ir/src/mixed_certificate_v2.rs",
+      "symbol": "exact_swept_body_bounds",
+      "responsibility": "Select the unique magnetic region carrying typed exact_sweep evidence and use its realized body bounds for transition-shell verification while retaining union bounds for the complete magnetic domain.",
+      "evidence_status": "source_implementation_under_review_runtime_not_verified"
+    },
+    {
+      "id": "mixed-certificate-v2-validation",
+      "path": "crates/fullmag-ir/src/mixed_certificate_v2.rs",
+      "symbol": "validate_mixed_layer_topology_certificate_v2_against_mesh",
+      "responsibility": "Recompute the complete mixed-body v2 topology, ownership, regional shell, quality, and volume evidence from the received typed mesh with fail-closed exact_sweep ownership.",
+      "evidence_status": "source_implementation_under_review_runtime_not_verified"
+    },
+    {
       "id": "typed-pyo3-certificate-entry",
       "path": "crates/fullmag-py-core/src/mixed_certificate.rs",
       "symbol": "certify_mixed_mesh_arrays",
@@ -849,9 +870,9 @@
     {
       "id": "native-disconnected-body-scope",
       "path": "backends/fem/core/fem_mesh.cpp",
-      "symbol": "validate_supported_physics_topology",
-      "responsibility": "Future native preflight owner for per-body magnetic cell families, gap/contact evidence and topology-aware material masks; contact and smoothing remain rejected.",
-      "evidence_status": "planned_implementation"
+      "symbol": "validate_mixed_body_certificate_v2",
+      "responsibility": "Independently check realized body marker/node ownership and positive AABB separation before MFEM allocation; legal air cells do not create an exchange bridge. Overlapping AABBs are outside this conservative proof.",
+      "evidence_status": "source_implementation_under_review_runtime_not_verified"
     },
     {
       "id": "fmmq-v1-writer",
@@ -871,6 +892,20 @@
       "symbol": "DOC-ANCHOR:fmmq-v2-contract",
       "responsibility": "Define planned topology-aware FMMQ v2 and v1 exit gates.",
       "evidence_status": "planned_contract"
+    },
+    {
+      "id": "cpu-llg-magnetic-mask",
+      "path": "backends/fem/cpu/mfem/integrators/llg_rhs.cpp",
+      "symbol": "llg_rhs_aos",
+      "responsibility": "Zero LLG RHS on nonmagnetic nodes and exclude them from RHS maxima while retaining body-local damping on active nodes.",
+      "evidence_status": "source_implementation_under_review_runtime_not_verified"
+    },
+    {
+      "id": "gpu-llg-magnetic-mask",
+      "path": "backends/fem/gpu/cuda/integrators/llg/llg_rhs_kernels.cu",
+      "symbol": "llg_rhs_fused_kernel",
+      "responsibility": "Zero LLG RHS on nonmagnetic nodes and exclude them from RHS maxima while retaining body-local damping on active nodes.",
+      "evidence_status": "source_implementation_under_review_runtime_not_verified"
     }
   ],
   "public_api": {
@@ -947,7 +982,7 @@
         "validation": "finite and strictly positive; owned by one magnetic body",
         "meaning": "body saturation magnetization for the planned disconnected-body P1 field",
         "backend_support": "planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields",
-      "problem_ir": "geometry.entries[].material.Ms"
+        "problem_ir": "geometry.entries[].material.Ms"
       },
       {
         "python": "MagnetHandle.Aex",
@@ -957,7 +992,7 @@
         "validation": "finite and strictly positive; no interpolation through air",
         "meaning": "body exchange stiffness for the body-local weak form",
         "backend_support": "planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields",
-      "problem_ir": "geometry.entries[].material.Aex"
+        "problem_ir": "geometry.entries[].material.Aex"
       },
       {
         "python": "MagnetHandle.alpha",
@@ -967,7 +1002,7 @@
         "validation": "finite and non-negative; evaluated only in the owning body",
         "meaning": "body Gilbert damping coefficient",
         "backend_support": "planned FEM CPU/GPU mixed-P1 v2; current v1 rejects multi-body fields",
-      "problem_ir": "geometry.entries[].material.alpha"
+        "problem_ir": "geometry.entries[].material.alpha"
       },
       {
         "python": "MagnetHandle.Ku1",

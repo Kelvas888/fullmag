@@ -23104,6 +23104,39 @@
         ],
         "type": "string"
       },
+      "MeshMixedExactSweepSummaryResource": {
+        "properties": {
+          "actual_node_plane_count": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "realized_layer_count": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requested_layer_count": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sweep_direction_requested": {
+            "type": "string"
+          },
+          "sweep_direction_resolved": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sweep_direction_requested",
+          "sweep_direction_resolved",
+          "requested_layer_count",
+          "realized_layer_count",
+          "actual_node_plane_count"
+        ],
+        "type": "object"
+      },
       "MeshMixedLayerTopologyCertificateSummaryResource": {
         "properties": {
           "actual_node_plane_count": {
@@ -23147,6 +23180,37 @@
           "requested_layer_count",
           "realized_layer_count",
           "gmsh_version"
+        ],
+        "type": "object"
+      },
+      "MeshMixedLayerTopologyCertificateV2SummaryResource": {
+        "description": "Thin v2 certificate summary. Numerical coefficients and mesh arrays stay in their owners.",
+        "properties": {
+          "certificate_status": {
+            "type": "string"
+          },
+          "gmsh_version": {
+            "type": "string"
+          },
+          "magnetic_regions": {
+            "items": {
+              "$ref": "#/components/schemas/MeshMixedMagneticRegionSummaryResource"
+            },
+            "type": "array"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "topology_fingerprint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "certificate_status",
+          "topology_fingerprint",
+          "gmsh_version",
+          "magnetic_regions"
         ],
         "type": "object"
       },
@@ -23216,6 +23280,51 @@
           "certificate_status",
           "requested_layer_count",
           "rejection_reason"
+        ],
+        "type": "object"
+      },
+      "MeshMixedMagneticRegionSummaryResource": {
+        "properties": {
+          "body_marker": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cell_family_counts": {
+            "additionalProperties": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "exact_sweep": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MeshMixedExactSweepSummaryResource"
+              }
+            ]
+          },
+          "material_marker": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "object_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "body_marker",
+          "material_marker",
+          "cell_family_counts"
         ],
         "type": "object"
       },
@@ -24582,6 +24691,17 @@
               }
             ]
           },
+          "mixed_layer_topology_certificate_v2": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MeshMixedLayerTopologyCertificateV2SummaryResource",
+                "description": "Region-scoped evidence; never collapse multiple bodies into the v1 layer summary."
+              }
+            ]
+          },
           "mixed_topology_provenance": {
             "oneOf": [
               {
@@ -24803,6 +24923,17 @@
               },
               {
                 "$ref": "#/components/schemas/MeshMixedLayerTopologyCertificateSummaryResource"
+              }
+            ]
+          },
+          "mixed_layer_topology_certificate_v2": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MeshMixedLayerTopologyCertificateV2SummaryResource",
+                "description": "Region-scoped evidence; never collapse multiple bodies into the v1 layer summary."
               }
             ]
           },

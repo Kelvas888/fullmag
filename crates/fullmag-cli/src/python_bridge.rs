@@ -248,6 +248,8 @@ pub(crate) struct RemeshCliResponse {
     pub periodic_node_pairs: Vec<fullmag_ir::MeshPeriodicNodePairIR>,
     pub periodic_mesh_certificate: Option<serde_json::Value>,
     pub mixed_layer_topology_certificate: Option<fullmag_ir::MixedLayerTopologyCertificateV1IR>,
+    pub mixed_layer_topology_certificate_v2:
+        Option<fullmag_ir::MixedLayerTopologyCertificateV2IR>,
     pub shared_domain_build_report: Option<fullmag_ir::FemSharedDomainBuildReportIR>,
     pub quality: Option<RemeshQualitySummary>,
     pub generation_mode: Option<String>,
@@ -385,6 +387,9 @@ struct RemeshCliResponseWire {
     periodic_mesh_certificate: Option<serde_json::Value>,
     #[serde(default)]
     mixed_layer_topology_certificate: Option<fullmag_ir::MixedLayerTopologyCertificateV1IR>,
+    #[serde(default)]
+    mixed_layer_topology_certificate_v2:
+        Option<fullmag_ir::MixedLayerTopologyCertificateV2IR>,
     quality: Option<RemeshQualitySummary>,
     #[serde(default)]
     generation_mode: Option<String>,
@@ -435,6 +440,7 @@ impl<'de> serde::Deserialize<'de> for RemeshCliResponse {
             periodic_node_pairs: wire.periodic_node_pairs,
             periodic_mesh_certificate: wire.periodic_mesh_certificate,
             mixed_layer_topology_certificate: wire.mixed_layer_topology_certificate,
+            mixed_layer_topology_certificate_v2: wire.mixed_layer_topology_certificate_v2,
             shared_domain_build_report,
             quality: wire.quality,
             generation_mode: wire.generation_mode,
@@ -470,6 +476,9 @@ struct RemeshTopologyArtifactPayload {
     periodic_mesh_certificate: Option<serde_json::Value>,
     #[serde(default)]
     mixed_layer_topology_certificate: Option<fullmag_ir::MixedLayerTopologyCertificateV1IR>,
+    #[serde(default)]
+    mixed_layer_topology_certificate_v2:
+        Option<fullmag_ir::MixedLayerTopologyCertificateV2IR>,
 }
 
 impl RemeshCliResponse {
@@ -494,6 +503,12 @@ impl RemeshCliResponse {
             .shared_domain_build_report
             .as_ref()
             .and_then(|report| report.mixed_layer_topology_certificate.as_ref());
+        let report_certificate_v2 = self
+            .shared_domain_build_report
+            .as_ref()
+            .and_then(|report| report.mixed_layer_topology_certificate_v2.as_ref());
+        let artifact_certificate_v1 = topology.mixed_layer_topology_certificate.as_ref();
+        let artifact_certificate_v2 = topology.mixed_layer_topology_certificate_v2.as_ref();
         if let (Some(inline), Some(in_report)) = (
             self.mixed_layer_topology_certificate.as_ref(),
             report_certificate,
@@ -503,13 +518,34 @@ impl RemeshCliResponse {
                 "mixed layer topology certificate differs between inline topology and build report"
             );
         }
+        if let (Some(inline), Some(in_report)) = (
+            self.mixed_layer_topology_certificate_v2.as_ref(),
+            report_certificate_v2,
+        ) {
+            anyhow::ensure!(
+                inline == in_report,
+                "mixed v2 layer topology certificate differs between inline topology and build report"
+            );
+        }
         anyhow::ensure!(
-            topology.mixed_layer_topology_certificate.is_some()
+            !(self.mixed_layer_topology_certificate.is_some()
+                || report_certificate.is_some()
+                || artifact_certificate_v1.is_some())
+                || !(self.mixed_layer_topology_certificate_v2.is_some()
+                    || report_certificate_v2.is_some()
+                    || artifact_certificate_v2.is_some()),
+            "mixed layer topology certificates v1 and v2 cannot be carried together"
+        );
+        anyhow::ensure!(
+            (topology.mixed_layer_topology_certificate.is_some()
+                || topology.mixed_layer_topology_certificate_v2.is_some())
                 || (self.mixed_layer_topology_certificate.is_none()
-                    && report_certificate.is_none()),
+                    && self.mixed_layer_topology_certificate_v2.is_none()
+                    && report_certificate.is_none()
+                    && report_certificate_v2.is_none()),
             "topology artifact is missing a mixed layer topology certificate carried by inline topology or the shared-domain build report"
         );
-        if let Some(in_artifact) = topology.mixed_layer_topology_certificate.as_ref() {
+        if let Some(in_artifact) = artifact_certificate_v1 {
             if let Some(inline) = self.mixed_layer_topology_certificate.as_ref() {
                 anyhow::ensure!(
                     inline == in_artifact,
@@ -523,6 +559,25 @@ impl RemeshCliResponse {
                 );
             }
         }
+        if let Some(in_artifact) = artifact_certificate_v2 {
+            if let Some(inline) = self.mixed_layer_topology_certificate_v2.as_ref() {
+                anyhow::ensure!(
+                    inline == in_artifact,
+                    "mixed v2 layer topology certificate differs between inline topology and artifact"
+                );
+            }
+            if let Some(in_report) = report_certificate_v2 {
+                anyhow::ensure!(
+                    in_report == in_artifact,
+                    "mixed v2 layer topology certificate differs between build report and artifact"
+                );
+            }
+        }
+        anyhow::ensure!(
+            !(topology.mixed_layer_topology_certificate.is_some()
+                && topology.mixed_layer_topology_certificate_v2.is_some()),
+            "topology artifact cannot carry mixed layer topology certificates v1 and v2 together"
+        );
         let (cells, facets) = topology.topology.normalize().map_err(anyhow::Error::msg)?;
         self.nodes = topology.nodes;
         self.cells = cells;
@@ -533,6 +588,7 @@ impl RemeshCliResponse {
         self.periodic_node_pairs = topology.periodic_node_pairs;
         self.periodic_mesh_certificate = topology.periodic_mesh_certificate;
         self.mixed_layer_topology_certificate = topology.mixed_layer_topology_certificate;
+        self.mixed_layer_topology_certificate_v2 = topology.mixed_layer_topology_certificate_v2;
         Ok(self)
     }
 
@@ -549,7 +605,54 @@ impl RemeshCliResponse {
     }
 
     fn retain_mixed_certificate_in_provenance(&mut self) -> Result<()> {
+        let report_certificate = self
+            .shared_domain_build_report
+            .as_ref()
+            .and_then(|report| report.mixed_layer_topology_certificate.as_ref());
+        let report_certificate_v2 = self
+            .shared_domain_build_report
+            .as_ref()
+            .and_then(|report| report.mixed_layer_topology_certificate_v2.as_ref());
+        anyhow::ensure!(
+            !(self.mixed_layer_topology_certificate.is_some()
+                || report_certificate.is_some())
+                || !(self.mixed_layer_topology_certificate_v2.is_some()
+                    || report_certificate_v2.is_some()),
+            "mixed layer topology certificates v1 and v2 cannot be carried together"
+        );
         let Some(certificate) = self.mixed_layer_topology_certificate.clone() else {
+            if let Some(certificate) = self.mixed_layer_topology_certificate_v2.clone() {
+                let typed_report = self.shared_domain_build_report.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mixed v2 layer topology certificate requires a shared-domain build report"
+                    )
+                })?;
+                match typed_report.mixed_layer_topology_certificate_v2.as_ref() {
+                    Some(in_report) => anyhow::ensure!(
+                        in_report == &certificate,
+                        "mixed v2 layer topology certificate differs between topology and build report"
+                    ),
+                    None => {
+                        typed_report.mixed_layer_topology_certificate_v2 =
+                            Some(certificate.clone())
+                    }
+                }
+                let report = self
+                    .mesh_provenance
+                    .as_mut()
+                    .and_then(|value| value.get_mut("shared_domain_build_report"))
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mixed v2 layer topology certificate requires a shared-domain build report in provenance"
+                        )
+                    })?;
+                report.insert(
+                    "mixed_layer_topology_certificate_v2".to_string(),
+                    serde_json::to_value(certificate)
+                        .expect("typed v2 certificate must serialize"),
+                );
+            }
             return Ok(());
         };
         let typed_report = self.shared_domain_build_report.as_mut().ok_or_else(|| {
@@ -586,6 +689,10 @@ impl RemeshCliResponse {
             .shared_domain_build_report
             .as_ref()
             .and_then(|report| report.mixed_layer_topology_certificate.as_ref());
+        let report_certificate_v2 = self
+            .shared_domain_build_report
+            .as_ref()
+            .and_then(|report| report.mixed_layer_topology_certificate_v2.as_ref());
         if let (Some(top_level), Some(in_report)) = (
             self.mixed_layer_topology_certificate.as_ref(),
             report_certificate,
@@ -595,10 +702,31 @@ impl RemeshCliResponse {
                 "mixed layer topology certificate differs between topology and build report"
             );
         }
+        if let (Some(top_level), Some(in_report)) = (
+            self.mixed_layer_topology_certificate_v2.as_ref(),
+            report_certificate_v2,
+        ) {
+            anyhow::ensure!(
+                top_level == in_report,
+                "mixed v2 layer topology certificate differs between topology and build report"
+            );
+        }
+        anyhow::ensure!(
+            !(self.mixed_layer_topology_certificate.is_some()
+                || report_certificate.is_some())
+                || !(self.mixed_layer_topology_certificate_v2.is_some()
+                    || report_certificate_v2.is_some()),
+            "mixed layer topology certificates v1 and v2 cannot be carried together"
+        );
         if self
             .mixed_layer_topology_certificate
             .as_ref()
             .or(report_certificate)
+            .is_none()
+            && self
+                .mixed_layer_topology_certificate_v2
+                .as_ref()
+                .or(report_certificate_v2)
             .is_none()
         {
             return Ok(());
@@ -1765,6 +1893,8 @@ pub(crate) fn invoke_shared_domain_remesh_full(
     geometry_entries: &[fullmag_ir::GeometryEntryIR],
     object_regions: &[serde_json::Value],
     declared_universe: &serde_json::Value,
+    body_material_fields: &serde_json::Value,
+    geometry_object_ids: &serde_json::Value,
     hmax: f64,
     fe_order: u32,
     mesh_options: &serde_json::Value,
@@ -1775,6 +1905,8 @@ pub(crate) fn invoke_shared_domain_remesh_full(
         "geometries": geometry_entries,
         "object_regions": object_regions,
         "declared_universe": declared_universe,
+        "body_material_fields": body_material_fields,
+        "geometry_object_ids": geometry_object_ids,
         "hmax": hmax,
         "order": fe_order,
         "mesh_name": "study_domain",

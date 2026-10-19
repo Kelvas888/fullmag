@@ -878,6 +878,38 @@ pub struct fullmag_fem_plan_desc_v2 {
     pub rotated_interfacial_dmi_constant: f64,
 }
 
+pub const FULLMAG_FEM_MIXED_BODY_CERTIFICATE_V2_ABI_VERSION: u32 = 2;
+pub const FULLMAG_FEM_MIXED_BODY_CONTACT_SEPARATED: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_mixed_body_certificate_v2 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub body_count: u64,
+    pub body_markers: *const u32,
+    pub body_node_offsets: *const u64,
+    pub body_node_offsets_len: u64,
+    pub body_node_indices: *const u32,
+    pub body_node_index_count: u64,
+    pub pair_count: u64,
+    pub pair_body_a: *const u32,
+    pub pair_body_b: *const u32,
+    pub pair_min_gap_m: *const f64,
+    pub pair_contact_state: *const u32,
+}
+
+pub const FULLMAG_FEM_PLAN_DESC_V3_ABI_VERSION: u32 = 3;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_plan_desc_v3 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub base: fullmag_fem_plan_desc_v2,
+    pub mixed_body_certificate_v2: *const fullmag_fem_mixed_body_certificate_v2,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum fullmag_fem_host_thread_policy_reason {
@@ -3453,6 +3485,10 @@ extern "C" {
         plan: *const fullmag_fem_plan_desc_v2,
         adaptive_config: *const fullmag_fem_adaptive_config_v2,
     ) -> *mut fullmag_fem_backend;
+    pub fn fullmag_fem_backend_create_v4(
+        plan: *const fullmag_fem_plan_desc_v3,
+        adaptive_config: *const fullmag_fem_adaptive_config_v2,
+    ) -> *mut fullmag_fem_backend;
     pub fn fullmag_fem_backend_begin_stage(
         handle: *mut fullmag_fem_backend,
         stage_start_time_s: f64,
@@ -4167,6 +4203,13 @@ mod tests {
         assert!(
             std::mem::offset_of!(fullmag_fem_plan_desc_v2, has_rotated_interfacial_dmi)
                 >= 8 + std::mem::size_of::<fullmag_fem_plan_desc>()
+        );
+        assert_eq!(FULLMAG_FEM_MIXED_BODY_CERTIFICATE_V2_ABI_VERSION, 2);
+        assert_eq!(FULLMAG_FEM_PLAN_DESC_V3_ABI_VERSION, 3);
+        assert_eq!(std::mem::offset_of!(fullmag_fem_plan_desc_v3, base), 8);
+        assert_eq!(
+            std::mem::offset_of!(fullmag_fem_plan_desc_v3, mixed_body_certificate_v2),
+            8 + std::mem::size_of::<fullmag_fem_plan_desc_v2>()
         );
     }
 

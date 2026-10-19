@@ -2,7 +2,7 @@
 
 - Status: bounded FEM CPU/GPU double mixed-P1 relaxation lanes `implemented`; evidence is source/contract only, no runtime qualification is asserted, and wider scopes fail closed
 - Owners: Fullmag core
-- Last updated: 2026-08-28
+- Last updated: 2026-10-19
 - Related ADRs: `docs/adr/0021-native-mixed-p1-fem-topology.md`,
   `docs/adr/0027-canonical-fem-mesh-policy-and-quality-evidence.md`
 - Related specs:
@@ -340,7 +340,52 @@ remain part of the same conforming Poisson domain. The v2 certificate must
 record, for every magnetic cell, its owning body marker, material marker and
 cell family, and must bind the exact sweep certificate only to the swept body.
 It must also record the measured gap and reject a mesh that bridges the gap or
-turns a disconnected pair into a contact interface.
+turns a disconnected pair into a contact interface. Here a bridge means a
+magnetic cell or magnetic node ownership that joins distinct bodies. An air
+cell may have boundary nodes incident to both bodies; it remains nonmagnetic
+and is a legal part of the shared Poisson domain. Rejecting that air cell
+would incorrectly remove magnetostatic coupling through a resolved gap.
+
+The first native v2 geometry proof is deliberately conservative: every pair
+must have positively separated realized body axis-aligned bounding boxes.
+The recorded native gap is the exact positive AABB distance and therefore a
+lower bound on physical separation. It must match the independently
+recomputed AABB distance within the documented floating-point tolerance;
+an arbitrary smaller positive number is not the recorded measurement. Disjoint
+curved bodies with overlapping boxes remain unsupported by this bounded
+proof; overlapping boxes alone do not prove physical contact or overlap.
+Such input must fail with an unavailable separation proof until a qualified
+narrow-phase geometry check exists.
+
+The transition shell has a regional owner. Exactly one magnetic region must
+carry `exact_sweep`; its realized body bounds define the six shell offsets and
+the recorded `transition_shell_thickness_m`. The top-level magnetic bounds
+continue to be the union of every disconnected magnetic body and are used for
+the overall mesh bounds proof. A distant second body must therefore not alter
+the shell thickness, while zero or multiple `exact_sweep` owners fail closed.
+The native v2 validator recomputes both bounds from the received mesh before
+accepting the certificate.
+
+The candidate v2 mesher must preserve requested algorithm intent separately
+from the resolved per-domain realization. Gmsh 4.15.2 HXT (algorithm 10)
+accepts triangular boundaries only; it cannot generate the quad-to-pyramid
+transition directly. The bounded hybrid policy records
+`requested_algorithm_3d=10`, `transition_algorithm_3d=1` and
+`tetrahedral_algorithm_3d=10`. The swept Box and partitioned transition volumes
+are generated separately from the HXT tetrahedral ring and far-air volumes in
+one conforming Gmsh model. Scoped visibility, exact sweep planes, shared node
+identity and per-family quality are verified after both stages. A requested
+`Gmsh` optimization and its iteration count remain explicit resolved inputs.
+This is not evidence of a whole-domain HXT mesh or permission to replace prisms
+with tetrahedra. This policy remains under implementation and is not runtime
+qualified.
+
+For curved bodies, `expected_magnetic_volume_m3` in the candidate v2 integrity
+proof means an independent integral over the closed, realized faceted body
+boundary. It must agree with the sum of magnetic cell volumes; it must not be
+assigned from that same sum. The analytic CAD volume and its approximation
+error are separate convergence evidence. A curved boundary approximation must
+not be hidden by weakening the closed-mesh volume-integrity tolerance.
 
 For each body, material coefficients are owned by that body and interpolated
 only inside its magnetic finite-element space:
@@ -513,6 +558,14 @@ synchronizations for field/operator evaluation after setup. Qualification must
 inspect those raw counters, not infer clean residency from a derived status
 boolean.
 
+The LLG right-hand side is zero on every node outside the magnetic-node
+mask, even if that node carries a nonzero initial vector and a nonzero
+shared-domain field. CPU and GPU RHS maxima exclude these inactive nodes;
+RK predictors therefore preserve their state. This mask is distinct from
+body/material identity: active nodes retain their body-local damping and
+other coefficients. Source regressions cover a much larger field in air
+than in the magnetic body; managed trajectory parity remains unverified.
+
 The same assembled operators serve PG-BB, nonlinear CG, and overdamped LLG;
 the relaxators must not inspect fixed-width tetrahedral connectivity. Before
 the GPU capability can move beyond `implemented`, a managed identical-topology
@@ -597,6 +650,15 @@ inherits the `16 * f64::EPSILON` absolute allowance: dimensional Jacobians,
 volumes, and related scalar evidence retain `1e-12` relative plus `1e-30`
 absolute comparison, while bounds, plane coordinates, counts, markers, and
 identities retain their field-specific fail-closed checks.
+
+The v2 native engine uses a fixed-order Neumaier-compensated binary64
+accumulator for shared-domain, per-body magnetic, and closed-faceted volume
+totals after sorting records by global cell ordinal. This is required for
+large meshes where a plain sequential sum can move a near-zero derived volume
+error by many ulps. It improves cross-language reproducibility without
+changing the physical volume limit or widening dimensional evidence checks;
+the small dimensionless allowance above remains the only tolerance for the
+derived relative-error fields.
 
 This certificate rule is distinct from the final-artifact magnetization
 norm-defect rule in Section 4.6. The norm-defect check uses only an absolute
@@ -754,8 +816,8 @@ contract is:
    ordinal, and topology code, then group owners from that sequence without
    depending on `HashMap` iteration order;
 5. accumulate magnetic and shared-domain volumes in ascending global-ordinal
-   order with one fixed-order compensated binary64 sum, never a Rayon tree
-   reduction or atomic floating-point accumulator;
+   order with one fixed-order Neumaier-compensated binary64 sum, never a Rayon
+   tree reduction or atomic floating-point accumulator;
 6. reject non-finite metric samples, sort binary64 samples with `total_cmp`,
    and compute each p05 with the existing linear interpolation rank
    `(n - 1) * 0.05`; and
@@ -1627,6 +1689,9 @@ No lower level implies a higher one.
 | Canonical typed certificate schema | `crates/fullmag-ir/src/mesh_assets.rs` | `MixedLayerTopologyCertificateV1IR` | owns the complete certificate field set and rejects unknown fields before a certificate can contribute to the bridge digest or canonical validation | backend-neutral `fullmag-ir`; consumed by FEM CPU/GPU | full `fullmag-ir` suite: 372 passing tests; production caller/runtime not verified |
 | Language-neutral certificate evidence computation | `crates/fullmag-ir/src/mixed_certificate.rs` | `compute_mixed_certificate_evidence` | computes deterministic mixed-certificate evidence from typed `MeshIR` with immutable Rayon records and canonical ordered reductions | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented and unit-qualified: 8 parallel/determinism tests plus 21 `mesh_assets` tests; bridge and artifact caller host-tested; managed runtime not verified |
 | Language-neutral certificate validation | `crates/fullmag-ir/src/mixed_certificate.rs` | `validate_mixed_layer_topology_certificate_against_mesh` | validates `(mesh, certificate)` against exact topology fingerprint, counts, metrics, ownership, and canonical tolerances | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented and unit-qualified: 8 parallel/determinism tests plus 21 `mesh_assets` tests; managed FEM runtime not verified |
+| Mixed-body v2 volume reduction | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `CompensatedSum` | accumulates shared-domain, per-body magnetic, and closed-faceted volume evidence with fixed-order Neumaier-compensated binary64 arithmetic | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | source implementation under review; runtime not verified |
+| Mixed-body v2 shell owner | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `exact_swept_body_bounds` | selects the unique `exact_sweep` region for transition-shell bounds while preserving the union of all magnetic bodies for the top-level bounds proof | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | source implementation under review; runtime not verified |
+| Mixed-body v2 certificate validation | `crates/fullmag-ir/src/mixed_certificate_v2.rs` | `validate_mixed_layer_topology_certificate_v2_against_mesh` | recomputes v2 topology, body ownership, regional shell, quality, and volume evidence from the received typed mesh with fail-closed exact-sweep ownership | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | source implementation under review; runtime not verified |
 | Typed PyO3 certificate entry | `crates/fullmag-py-core/src/mixed_certificate.rs` | `certify_mixed_mesh_arrays` | enforces the 1 MiB pre-parse cap, rejects unknown certificate fields, and builds owned typed `MeshIR` plus the Python-canonical typed certificate projection under the GIL, then hashes and computes/validates through `fullmag-ir` while detached | backend-neutral bridge intended for FEM CPU/GPU | implemented and host-extension qualified: 11 Rust core tests and 17 real-extension Python tests with no skips; artifact caller host-tested, managed runtime not verified |
 | Typed PyO3 structural preflight | `crates/fullmag-py-core/src/mixed_certificate.rs` | `preflight_mixed_mesh_arrays` | accepts an exact separated metadata/expected envelope and validates structure plus counts/fingerprint without invoking certificate evidence or adjacency | backend-neutral bridge intended for FEM CPU/GPU | implemented and host-extension qualified; override regressions and production-seam probe prove metadata isolation and zero certificate-engine calls |
 | Python certificate adapter | `packages/fullmag-py/src/fullmag/_core.py` | `certify_mixed_mesh_arrays` | exposes the exact mandatory keyword-only `MeshData` adapter and strict native-selection boundary without `.tolist()` topology conversion | Python bridge for FEM CPU/GPU | implemented and real-extension tested; artifact v2 requires native on save and records explicit non-production Python fallback on public full audit |
@@ -1660,6 +1725,9 @@ No lower level implies a higher one.
 | Demag field recovery | `backends/fem/cpu/mfem/interactions/demag_poisson_recovery.cpp` | `recover_demag_poisson_field` | recovers $\mathbf H_{\mathrm{demag}}$ on magnetic cells | FEM CPU | manufactured/operator contracts; managed proof pending |
 | Demag energy | `backends/fem/cpu/mfem/interactions/demag_poisson_energy.cpp` | `demag_poisson_energy_from_field` | evaluates the existing demag-energy sign contract | FEM CPU | energy contracts; managed proof pending |
 | Magnetic nodal weights | `backends/fem/core/fem_mesh.cpp` | `compute_node_volumes` | synchronizes mixed P1 mass-row-sum volume weights | FEM CPU/GPU shared contract | native material/metric contracts |
+| Native disconnected-body certificate scope | `backends/fem/core/fem_mesh.cpp` | `validate_mixed_body_certificate_v2` | checks realized body ownership and positive AABB separation while keeping air-gap coupling outside the magnetic exchange ownership proof | FEM CPU/GPU | source implementation under review; runtime not verified |
+| CPU magnetic-node RHS mask | `backends/fem/cpu/mfem/integrators/llg_rhs.cpp` | `llg_rhs_aos` | zeros the LLG RHS outside the magnetic-node mask and excludes inactive nodes from RHS maxima | FEM CPU | source implementation under review; managed trajectory not verified |
+| GPU magnetic-node RHS mask | `backends/fem/gpu/cuda/integrators/llg/llg_rhs_kernels.cu` | `llg_rhs_fused_kernel` | zeros the LLG RHS outside the magnetic-node mask and excludes inactive nodes from RHS maxima | FEM GPU | source implementation under review; managed trajectory not verified |
 | Uniform/nodal uniaxial CPU field/energy | `backends/fem/cpu/mfem/interactions/anisotropy_uniaxial.cpp` | `compute_uniaxial_anisotropy_field` | evaluates local `Ku1`/`Ku2` fields and mass-lumped energy without cell-connectivity assumptions | FEM CPU | source/contract evidence |
 | Uniform/nodal uniaxial GPU field/energy | `backends/fem/gpu/cuda/interactions/anisotropy/anisotropy_kernels.cu` | `fullmag_cuda_uniaxial_anisotropy_field_energy_blocks` | evaluates the same local nodal contract on device | FEM GPU | source/contract evidence |
 | Uniform/nodal cubic CPU field/energy | `backends/fem/cpu/mfem/interactions/anisotropy_cubic.cpp` | `compute_cubic_anisotropy_field` | evaluates local `Kc1`/`Kc2`/`Kc3` fields and energy on magnetic P1 nodes | FEM CPU | source/contract evidence |

@@ -19,6 +19,7 @@ pub mod mesh_assets;
 pub mod mesh_hints;
 pub mod mesh_policy;
 pub mod mixed_certificate;
+pub mod mixed_certificate_v2;
 pub mod native_indexed_geometry;
 pub mod model;
 pub mod output_storage;
@@ -69,6 +70,9 @@ pub use mesh_assets::*;
 pub use mesh_hints::*;
 pub use mesh_policy::*;
 pub use mixed_certificate::*;
+pub use mixed_certificate_v2::{
+    mixed_v2_body_material_field_digest, mixed_v2_node_order_digest,
+};
 pub use model::*;
 pub use output_storage::*;
 pub use object_binding::*;

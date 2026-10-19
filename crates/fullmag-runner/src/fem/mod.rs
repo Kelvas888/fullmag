@@ -69,6 +69,7 @@ pub(crate) fn real_bounded_k0_problem(
 }
 pub(crate) mod eigen_types;
 pub mod engine;
+pub(crate) mod marker_policy;
 pub(crate) mod equilibrium_identity;
 pub(crate) mod execution_receipt;
 pub mod integrators;

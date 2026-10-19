@@ -3467,6 +3467,86 @@ fn shared_domain_object_region_mesh_specs(problem: &ProblemIR) -> Result<Vec<ser
         .collect()
 }
 
+fn shared_domain_body_material_payload(
+    problem: &ProblemIR,
+) -> Result<(serde_json::Value, serde_json::Value)> {
+    let mut body_material_fields = serde_json::Map::new();
+    let mut geometry_object_ids = serde_json::Map::new();
+
+    for magnet in &problem.magnets {
+        let geometry_name = problem
+            .regions
+            .iter()
+            .find(|region| region.name == magnet.region)
+            .map(|region| region.geometry.as_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "shared-domain remesh cannot resolve magnet '{}' region '{}'",
+                    magnet.name,
+                    magnet.region
+                )
+            })?;
+        if body_material_fields.contains_key(geometry_name) {
+            bail!(
+                "shared-domain remesh has multiple magnetic bodies for geometry '{}'",
+                geometry_name
+            );
+        }
+        let material = problem
+            .materials
+            .iter()
+            .find(|material| material.name == magnet.material)
+            .ok_or_else(|| {
+                anyhow!(
+                    "shared-domain remesh cannot resolve material '{}' for magnet '{}'",
+                    magnet.material,
+                    magnet.name
+                )
+            })?;
+        let object_id = magnet.object_id.as_deref().unwrap_or(&magnet.name);
+        let axis = material.anisotropy_axis.unwrap_or([0.0, 0.0, 1.0]);
+        for (label, value) in [
+            ("Ms", material.saturation_magnetisation),
+            ("Aex", material.exchange_stiffness),
+            ("alpha", material.damping),
+            ("Ku1", material.uniaxial_anisotropy.unwrap_or(0.0)),
+        ] {
+            if !value.is_finite() {
+                bail!(
+                    "shared-domain remesh material field '{}' for magnet '{}' is not finite",
+                    label,
+                    magnet.name
+                );
+            }
+        }
+        if axis.iter().any(|value| !value.is_finite()) {
+            bail!(
+                "shared-domain remesh anisotropy_axis for magnet '{}' is not finite",
+                magnet.name
+            );
+        }
+        body_material_fields.insert(
+            geometry_name.to_string(),
+            serde_json::json!({
+                "Ms": material.saturation_magnetisation,
+                "Aex": material.exchange_stiffness,
+                "alpha": material.damping,
+                "Ku1": material.uniaxial_anisotropy.unwrap_or(0.0),
+                "anisotropy_axis": axis,
+            }),
+        );
+        geometry_object_ids.insert(
+            geometry_name.to_string(),
+            serde_json::Value::String(object_id.to_string()),
+        );
+    }
+
+    Ok((
+        serde_json::Value::Object(body_material_fields),
+        serde_json::Value::Object(geometry_object_ids),
+    ))
+}
+
 fn resolved_shared_domain_object_region_markers(
     problem: &ProblemIR,
     markers: &[fullmag_ir::FemDomainRegionMarkerIR],
@@ -10420,10 +10500,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                 )?;
                             let object_region_mesh_specs =
                                 shared_domain_object_region_mesh_specs(&stages[0].ir)?;
+                            let (body_material_fields, geometry_object_ids) =
+                                shared_domain_body_material_payload(&stages[0].ir)?;
                             invoke_shared_domain_remesh_full(
                                 &stages[0].ir.geometry.entries,
                                 &object_region_mesh_specs,
                                 &declared_universe_value,
+                                &body_material_fields,
+                                &geometry_object_ids,
                                 current_hmax,
                                 fe_order,
                                 &serde_json::json!({"compute_quality": true}),

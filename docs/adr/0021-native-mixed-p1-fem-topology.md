@@ -70,6 +70,20 @@ this decision until a dedicated conforming interface or DG0 exchange/energy
 operator is defined; it must fail closed rather than silently choosing a
 nodal value.
 
+The initial native geometry proof is limited to strictly separated body
+AABBs, with the positive AABB distance used as a conservative lower bound.
+Overlapping boxes return an unavailable proof even when the underlying bodies
+could be disjoint. Air cells incident to two body boundaries remain legal:
+only magnetic cells/shared magnetic node ownership create an exchange bridge.
+This bound does not add a narrow-phase contact solver or a new interaction.
+
+For the HXT request, the candidate realization records the requested algorithm
+separately from algorithm 1 for quad/pyramid transition volumes and algorithm
+10 for the remaining tetrahedral volumes. Note 0106 owns this bounded hybrid
+meshing policy and the independent faceted-boundary volume-integrity proof;
+neither changes the requested exact prism layers or claims CAD convergence.
+Runtime qualification remains pending.
+
 The v2 wire shape is owned by canonical note 0106. Its required top-level
 fields are `schema_version`, `certificate_status`, `magnetic_regions[]`,
 `body_separation_pairs[]`, `body_material_fields[]`, and
