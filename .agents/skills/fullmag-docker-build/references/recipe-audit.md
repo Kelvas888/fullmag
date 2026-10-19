@@ -83,6 +83,30 @@ Dowody tego etapu: 15 lekkich testów Pythona codegen zaliczonych, w tym
 wykonywalny test wrappera z wybraną ścieżką zawierającą spację. Rzeczywiste
 wykonanie codegen w obu usługach pozostaje **NOT VERIFIED** do ich startu.
 
+## Integracja mastera PR #198 — bieżąca delta tras
+
+Po scaleniu źródeł `b48b2934df60b074d00fce7b01ea040180505ad4` odczytowy
+`just --dump --dump-format json` daje **620 aktywnych recept**. Delta 614
+powyżej opisuje stan sprzed tej integracji, a TSV nadal dokumentuje bazę.
+
+- `justfile`: 7546 linii, 720070 bajtów, SHA256 `baffe84779a79109dc6030ebb8ea55137034cd150e96dfbf8996915033ede2be`.
+- `scripts/just_storage_shell.sh`: 908 linii, 63438 bajtów, SHA256 `d034b607528372d6ec881a70837235bb5ef6e7c4e99b240ee1e592e9c31846d3`.
+
+Dołączyły `docker-dev-images`, `docker-dev-stop-failed`,
+`docker-dev-control-checks`, `docker-dev-resume`, `docker-dev-restart-idle`
+i `docker-dev-recreate-volume`. `docker_dev.py up` korzysta teraz z
+`docker_volume_dev.py`, a toolchain/helper images z `docker_build_control.py`.
+Receipty, konfiguracje i logi tej trasy są w build-control volume; wejście
+recreate przez hostowy receipt DEV jest wycofane. Wrapper zachowuje fixed-argv
+oraz nowe piny `attempt`/`config_sha256`; nie wykonuje dopasowanego tekstu
+komendy jako dowolnej powłoki. Dziewięć lekkich testów granicy shell PASS.
+
+Stosuj [przewodnik bieżących komend](../../../../docs/guides/docker-volume-development.md).
+Opis `_backend_start_inputs`, hostowego wskaźnika runu i frontend-cache-v2
+we wcześniejszych sekcjach jest historią poprzedniego launchera, nie mapą
+writerów nowego `docker_volume_dev.start`. Sam merge i dump nie kwalifikują
+runtime, HMR, restartu ani wykonania solvera.
+
 ## Granica wspólna dla recept
 
 Od tego miejsca szczegółowy inwentarz rodzin i numery linii opisują audyt bazowy, nie bieżącą trasę Docker DEV. Aktualna trasa jest opisana wyżej; historyczne wiersze Docker dev i Docker dev Compose niżej zachowują dowód wcześniejszych writerów i nie są instrukcją uruchamiania.
@@ -152,3 +176,30 @@ Manifest obejmuje 612 aktywnych deklaracji głównego pliku, jedną Windows-only
 i dwie deklaracje dodatkowego pliku (615 łącznie). Klasyfikacja rodzin jest
 orientacyjna; nie stanowi dowodu efektów wszystkich zależnych programów.
 Zmiana wrappera/resolvera może zmienić zapisy każdej recepty bez zmiany jej ciała.
+
+## Delta wdrożenia volume DEV
+
+Powyższy manifest i numery linii opisują stan bazowy. Po wdrożeniu migracji
+dump checkpointu `e56d6828d59c216225245808a0c03f081f56b4c3` zawiera **619** aktywnych recept.
+Nie wykonano wszystkich recept; kwalifikacja runtime dotyczy jawnie opisanych
+prób DEV. Nie przenoś wyniku na release, CI, benchmarki ani kwalifikację naukową.
+
+Wejścia tego checkpointu, sprzed integracji mastera `fc50a43efa6a19ed10e03e1f9a0060809014605f`:
+
+- `justfile`: `4d6b20206f98c0fc79915c811899febe7c70da608ba88c83e71a6d94e26a39c0`;
+- `scripts/just_storage_shell.sh`: `2aaef57f7cded6b4d293212cc313cc35b703dc6b1174d0eefa7b546decad9395`.
+
+Nowe/zmienione wejścia DEV: `docker-dev-toolchain`, `docker-dev-images`,
+`docker-dev`, `docker-dev-build`, `docker-dev-control-checks`, `docker-dev-resume`,
+`docker-dev-recreate-volume`, `docker-dev-restart-idle`, `docker-dev-stop-failed`.
+Bootstrap uruchamia `docker_build_control`; aplikacja używa `docker_volume_dev`.
+Wrapper przekazuje te ścisłe wzorce bez hostowego `storage.run`. Starszy
+`docker-dev-recreate` odmawia przed inicjalizacją hostowego logu/kontekstu.
+
+Przegląd diffu wrappera: nowe gałęzie dotyczą tylko wskazanych wejść; istniejący
+fallback i gałęzie innych rodzin nie zmieniły zachowania. Zmiana wspólnego pliku
+nie kwalifikuje pozostałych recept jako volume-only. Ich ograniczenia z audytu
+bazowego pozostają aktualne do osobnej weryfikacji.
+
+Dokładny format operacji i granic zapisu opisuje
+[przewodnik DEV](../../../../docs/guides/docker-volume-development.md).

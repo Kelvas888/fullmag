@@ -1,0 +1,102 @@
+# Development Fullmaga z danymi builda w Dockerze
+
+Codzienny build używa grupy Compose wybranego checkoutu. Stały `backend`
+kompiluje aplikację i uruchamia API oraz runtime; `frontend` obsługuje Next/HMR.
+Obrazy zależności i helperów przygotowuje BuildKit w tym samym projekcie.
+Nie powstaje trzecia usługa aplikacyjna ani hostowy katalog kompilacji.
+
+## Uruchomienie
+
+Użyj natywnego PowerShell, Pythona oraz Docker Desktop z silnikiem Linux.
+Najpierw skonfiguruj `.env` głównego checkoutu przez `scripts/setup_docker.py`.
+Worktree korzysta z konfiguracji przez resolver; nie kopiuj do niego `.env`.
+Przeczytaj skill `.agents/skills/fullmag-docker-build/SKILL.md`.
+
+```powershell
+$source = "<absolutny-zarejestrowany-checkout>"
+Set-Location $source
+just docker-dev-toolchain
+just docker-dev $source 3197
+```
+
+Zakończ edycje i staging przed startem; nie zmieniaj źródeł do zakończenia
+próby. Migawka odczytuje checkout dwukrotnie i odrzuca niespójne wejście.
+
+Port musi być wolny. Wybierz wolny port, jeśli inna instancja już działa.
+`docker-dev-images` przygotowuje wyłącznie obrazy helperów; `docker-dev-build`
+ma tę samą semantykę startu usług co `docker-dev`.
+
+Receipt wypisuje projekt, nazwę wolumenu kontrolnego i identyfikator próby.
+Konfiguracja JSON jest w `development/attempts/<attempt>/compose.json`,
+a wynik w `terminal.json` w tym samym katalogu wolumenu. SHA konfiguracji to
+SHA256 kanonicznego JSON (`docker_build_control.canonical`), nie pliku z newline.
+Nie kopiuj tych plików do hostowego `storage/builds`.
+
+## Iteracje i awarie
+
+`just docker-dev-restart-idle <attempt> <config-sha256> <source> <port>`
+sprawdza dokładny kontener, obraz, polecenie, etykiety i mounty oraz wymaga
+zdrowego API bez aktywnej sesji. Na czas kontroli zamyka jedyne wejście HTTP przez zatrzymanie własnego frontendu,
+sprawdza prywatną sieć bez obcych konsumentów, restartuje backend i ponownie
+uruchamia ten sam frontend. Zachowuje cache oraz Windows storage. Nie jest komendą do przerywania obliczeń. Wymaga wyłącznego okna operatorskiego,
+bez równoległych klientów wysyłających polecenia do tej grupy; odczyt health
+nie jest dowodem opróżnienia wszystkich kolejek aplikacji.
+Frontend obserwuje katalogi `app`, `src`, `public`, `scripts` i aktualizuje UI
+przez HMR. Zmiana helperów obrazu wymaga przygotowania nowego obrazu i jawnego
+odtworzenia usług; sam restart zachowuje przypięty obraz.
+
+`docker-dev-resume` wznawia obserwację konkretnego potwierdzonego nieudanego
+startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backend, również po wcześniej udanym starcie.
+`docker-dev-recreate-volume` wymaga zatrzymanego backendu i dokładnych pinów
+próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
+sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
+Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
+
+Nieznany wynik operacji zachowuje zasoby i blokadę do jawnego rozstrzygnięcia.
+Nie usuwaj ręcznie `active`, pakietu ani lease, aby wymusić kolejny build.
+Launcher przyjmuje wynik dopiero po zdarzeniu `handoff` z bieżącego uruchomienia
+kontenera i zgodnym hashu receipt/provenance. Stary udany pakiet nie dowodzi
+zakończenia nowego startu. Nieoczekiwany restart kontenera między publikacją
+pakietu a gotowością API również przerywa obserwację.
+
+## Granica zapisu i retencja
+
+| Dane | Miejsce |
+| --- | --- |
+| Cargo/CMake, cień źródeł, log Make, CUDA cache | backend build named volume |
+| Pakiet, kandydat, zweryfikowany rollback, archiwum metadanych | backend package named volume |
+| pnpm, Next, metadata workspace, next.log | frontend named volume |
+| Konfiguracje, provenance, receipty, manifesty, logi BuildKit i dowody kontroli | build-control named volume |
+| Warstwy zależności/helperów | Docker image store / BuildKit |
+| Sesje, wyniki, ustawienia, historia, ledger | dotychczasowy Windows storage |
+
+Źródła są readonly. Krótkie helpery utrzymania należą do tej samej grupy;
+nie budują ani nie uruchamiają aplikacji i nie mają Docker socketu.
+Helper utrzymania cache ma wyłącznie `CHOWN` i `DAC_OVERRIDE`, aby inicjalizować
+markery również w katalogach należących do UID backendu; widzi tylko trzy
+zweryfikowane named volumes, bez sieci, writable rootfs ani bindów hosta.
+Inicjalizator control-volume ma dodatkowo `FOWNER`; przejmuje wyłącznie znane
+katalogi metadanych, bez rekurencyjnej zmiany właścicieli. Kanoniczny helper
+bootstrap otrzymuje `DAC_OVERRIDE` tylko dla operacji na tym samym wolumenie,
+aby zachować odczyt i atomowy zapis rekordów należących do UID backendu.
+
+Przed operacją launcher mierzy wolne miejsce w VM oraz na fizycznym wolumenie
+Windows pod rozwiązanym katalogiem danych Docker Desktop. Obecny próg odmowy
+wynosi 32 GiB; jest rezerwą operacyjną, nie quota ani gwarancją rozmiaru zimnego
+buildu. Pakietowy preflight dodatkowo szacuje miejsce na kandydata i rollback.
+
+Log Make i next.log mają limit 64 MiB; nadmiar trafia do ograniczonego drivera
+Docker `local` (3 pliki po 10 MB na usługę). Pełny next.log wymaga jawnego
+przeglądu przed następnym startem. Log operacji ma limit 32 MiB, dokument 8 MiB,
+liczba prób jednej fazy i archiwów metadanych pakietu jest ograniczona do 64.
+Wyczerpanie budżetu zatrzymuje dalszy zapis, zachowując dowody.
+
+Retencja binariów zachowuje pakiet bieżący i zweryfikowany rollback. Aktywnego
+cache nie usuwa. Nie ma automatycznego globalnego GC BuildKit, starych obrazów
+ani nieaktywnych grup. Ich usunięcie wymaga osobnego planu właścicieli/referencji
+i zgody. Samo usunięcie kontenera nie odzyskuje wolumenów ani fizycznego VHDX.
+
+`just docker-dev-control-checks <source>` uruchamia interpretowane regresje
+launcherów w istniejącym backendzie; nie kompiluje natywnych testów jednostkowych.
+Sukces buildu nie stanowi kwalifikacji FDM/FEM/BORIS. Release, CI i kwalifikacja
+naukowa zachowują własne jawne zarządzane recepty zgodnie z AGENTS.md.

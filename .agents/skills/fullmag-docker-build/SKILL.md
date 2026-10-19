@@ -64,6 +64,16 @@ zapisu, ale same nie gwarantują ograniczonego zużycia dysku. Nie deklaruj
 pełnej kontroli retencji, dopóki brakujący mechanizm nie zostanie wdrożony i
 zweryfikowany. Nie używaj globalnego prune ani compose down -v.
 
+## Wdrożona trasa DEV
+
+`docker-dev-toolchain`, `docker-dev-images`, `docker-dev` i `docker-dev-build`
+korzystają z `scripts/docker_build_control.py` oraz `scripts/docker_volume_dev.py`.
+Opis uruchomienia, pinów restartu/odtwarzania i budżetów znajduje się w
+[przewodniku DEV](../../../docs/guides/docker-volume-development.md).
+Historyczny audyt powyżej pozostaje dowodem stanu bazowego, a nie opisem
+bieżących zapisów tej trasy. Wyników release/CI/nauki nie przenoś na DEV ani
+odwrotnie. Sprawdź bieżące źródła i wynik konkretnej próby.
+
 ## Wykonanie i dowody
 
 1. Ustal checkout, grupę, profil, wolumeny i stan istniejących konsumentów.

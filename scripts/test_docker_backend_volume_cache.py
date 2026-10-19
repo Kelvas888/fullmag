@@ -309,7 +309,7 @@ class BackendVolumeCacheTests(unittest.TestCase):
 
     def test_validate_returns_control_volume_receipt_without_host_file(self):
         with tempfile.TemporaryDirectory() as tmp:
-            profile, *_ = _profile(tmp)
+            profile, _, _, _, runroot = _profile(tmp)
             docker = DockerVolumeFixture(profile, roles=cache.VOLUME_ROLES)
             result = cache.validate(
                 profile,
@@ -318,7 +318,8 @@ class BackendVolumeCacheTests(unittest.TestCase):
             )
             receipt_path = Path(result["receipt_path"])
             self.assertEqual(receipt_path, Path(cache.RECEIPT_TARGET))
-            self.assertFalse(receipt_path.exists())
+            # The canonical guest path may already exist in the running backend.
+            self.assertFalse((runroot / cache.RECEIPT_NAME).exists())
             self.assertEqual(result["receipt_storage"], "docker-named-volume")
             self.assertIsNone(result["host_receipt_path"])
             stored = result["receipt"]
@@ -357,7 +358,7 @@ class BackendVolumeCacheTests(unittest.TestCase):
             maintenance = maintenance_overlay["services"][cache.MAINTENANCE_SERVICE]
             self.assertEqual(maintenance["network_mode"], "none")
             self.assertEqual(maintenance["cap_drop"], ["ALL"])
-            self.assertEqual(maintenance["cap_add"], ["CHOWN"])
+            self.assertEqual(maintenance["cap_add"], ["CHOWN", "DAC_OVERRIDE"])
             self.assertNotIn("gpus", maintenance)
             self.assertEqual(maintenance["volumes"], cache.mount_specs(profile))
             bad = json.loads(json.dumps(maintenance_overlay))

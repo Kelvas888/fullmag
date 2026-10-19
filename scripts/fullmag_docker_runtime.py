@@ -2919,7 +2919,8 @@ def _publish_bound_development_certificate(host_certificate, owner_marker, certi
 
 
 def _complete_backend_storage_preflight(docker_client, container_id, state, host_certificate,
-                                        certificate, root, *, persist_host_log=True):
+                                        certificate, root, *, persist_host_log=True,
+                                        log_writer=None):
     """Run the two guest storage observations without creating a third service."""
 
     logs = []
@@ -2929,7 +2930,9 @@ def _complete_backend_storage_preflight(docker_client, container_id, state, host
             "--storage-probe", timeout=120, combined=True,
         )
         logs.append(output)
-    if persist_host_log:
+    if log_writer is not None:
+        log_writer("\n".join(logs))
+    elif persist_host_log:
         (Path(root) / "storage-probe.log").write_text("\n".join(logs), encoding="utf-8")
     from windows_folder_host import local_volume, publish_evidence, read_owned_regular, write_bound_evidence
 

@@ -112,6 +112,15 @@ niezależnie; skrypt nie interpretuje dowolnych programów powłoki.
 
 ## 3. Toolchain, aplikacja i iteracje
 
+Po integracji PR #198 aktywny `docker_dev.py up` deleguje do
+`docker_volume_dev.py`; `docker_build_control.py` przechowuje operacje w
+wolumenie kontrolnym. Dokładne piny `attempt` i `config_sha256` oraz komendy
+`docker-dev-resume`, `docker-dev-restart-idle`, `docker-dev-recreate-volume`
+opisuje [bieżący przewodnik DEV](../../../../docs/guides/docker-volume-development.md).
+Nie stosuj starego `docker-dev-recreate` z hostowym receiptem dla tej trasy.
+Nie kopiuj konfiguracji ani terminal receipt z wolumenu do hostowego storage.
+
+
 W natywnym Windows PowerShell przejdź do wybranego checkoutu. Użyj tego samego
 checkoutu dla toolchaina i aplikacji; recepta toolchaina wybiera źródło z
 bieżącego justfile.
@@ -181,6 +190,11 @@ przechodź do hostowego Cargo ani `generate-api-openapi-legacy`. Staging,
 zależności i receipt pozostają w wolumenach. Cztery wygenerowane źródła
 OpenAPI/TypeScript są celowo publikowane w checkoutcie i wymagają przeglądu
 oraz commita. Test źródeł helpera nie zastępuje rzeczywistego wykonania codegen.
+
+Bieżące recepty volume DEV oraz dokładny format restartu i odtworzenia opisuje
+[przewodnik operacyjny](../../../../docs/guides/docker-volume-development.md).
+Nie używaj wycofanej komendy `docker-dev-recreate` z hostowym receiptem dla tej
+trasy. Nowa próba przechowuje konfigurację i wynik w wolumenie kontrolnym.
 
 ## 4. Miejsce i retencja
 

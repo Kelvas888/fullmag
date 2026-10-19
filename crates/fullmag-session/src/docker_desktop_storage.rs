@@ -659,7 +659,7 @@ fn validate_development_runtime_identity(
         bail!("development delegation group identity differs from the Compose project");
     }
 
-    let provenance = read_json_document(DEVELOPMENT_PROVENANCE_PATH, "runtime provenance")?;
+    let provenance = read_json_document(&delegation.provenance_path, "runtime provenance")?;
     if required_json_string(&provenance, "schema", "runtime provenance")?
         != "fullmag.docker-all-image.v1"
         || required_json_string(&provenance, "state", "runtime provenance")? != "succeeded"

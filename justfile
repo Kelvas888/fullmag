@@ -27,6 +27,10 @@ storage-info:
 docker-dev-toolchain:
     @{{storage_python}} "{{repo_root}}/scripts/bootstrap_docker_toolchain.py" --repo-root "{{repo_root}}" --direct-development
 
+# Prepare image-owned DEV helpers through BuildKit without host contexts.
+docker-dev-images:
+    @{{storage_python}} "{{repo_root}}/scripts/bootstrap_docker_toolchain.py" --repo-root "{{repo_root}}" --direct-development --prepare-development-images
+
 # Direct two-service development: the persistent backend checks/builds source at every start.
 # The source parameter selects the main checkout or a registered worktree.
 docker-dev source_root="" port="3197" script="" gpu_access="auto":
@@ -35,6 +39,25 @@ docker-dev source_root="" port="3197" script="" gpu_access="auto":
 # Codegen through the already-running services; no Compose lifecycle operation.
 docker-dev-codegen source_root="":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" codegen-openapi {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
+# Stop only a pinned supervisor whose failed admission already reaped the API.
+docker-dev-stop-failed source_root container_id image_id process_receipt_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_stop_failed.py" --source-root {{quote(source_root)}} --container-id {{quote(container_id)}} --image-id {{quote(image_id)}} --process-receipt-sha256 {{quote(process_receipt_sha256)}}
+
+# Interpreted launcher/cache regressions run inside the selected fixed backend.
+docker-dev-control-checks source_root:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_checks.py" --source-root {{quote(source_root)}}
+
+# Resume observation of one retained volume DEV start without restarting backend.
+docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend="false":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" resume-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if restart_backend == "true" { "--restart-backend" } else if restart_backend == "false" { "" } else { error("restart_backend must be true or false") }}}
+
+# Restart a pinned healthy backend only when its API confirms no active session.
+docker-dev-restart-idle attempt config_sha256 source_root port="3197":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" restart-idle-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}
+
+# Replace exact retained volume DEV services, preserving caches and Windows state.
+docker-dev-recreate-volume attempt config_sha256 source_root port="3197" fresh_state="false":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if fresh_state == "true" { "--fresh-state" } else if fresh_state == "false" { "" } else { error("fresh_state must be true or false") }}}
 
 # Controlled recreation of one terminal failed direct-development run.  The
 # receipt and config digest are mandatory; this is not unknown-owner recovery.

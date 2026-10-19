@@ -71,10 +71,12 @@ staging, pakiety, konteksty, provenance, logi i receipty builda) mają pozostawa
 w Docker named volumes / BuildKit, bez zapisu w hostowym `storage`. Sesje,
 wyniki, projekty i ustawienia pozostają w storage Windows. Użyj
 [fullmag-docker-build](.agents/skills/fullmag-docker-build/SKILL.md).
-Obecne launchery nie spełniają jeszcze całego tego kontraktu; sprawdź kod
-i mounty przed kwalifikacją. Nie opisuj starej ścieżki jako volume-only i nie
-usuwaj starych cache w ramach jej migracji. Poniższe recepty określają wejścia
-operacyjne, nie dowodzą ukończenia tej migracji.
+Codzienny DEV używa launchera `docker_volume_dev` i kontrolera
+`docker_build_control`; sprawdzaj ich kod, mounty oraz konkretny receipt przed
+kwalifikacją. Starszy hostowy receipt DEV nie jest ścieżką wznowienia; używaj
+przypiętej próby i recept wolumenowych. Nie usuwaj starych cache w ramach
+migracji. Sam opis recepty lub audyt mountów nie dowodzi kwalifikacji runtime,
+release, CI ani nauki.
 
 Obowiązuje grupa Docker Compose przypisana do wybranego checkoutu: `fullmag-master`
 lub `fullmag-worktree-<worktree_id>`. Przed jakimkolwiek buildem ustal źródła i tę

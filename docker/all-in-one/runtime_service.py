@@ -562,6 +562,9 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
         environment["FULLMAG_RUNTIME_SERVICE_CONFIG"], "FULLMAG_RUNTIME_SERVICE_CONFIG"
     ) != config:
         _fail("FULLMAG_RUNTIME_SERVICE_CONFIG is outside the fixed config path")
+    provenance = _env_path(environment, "FULLMAG_PACKAGE_PROVENANCE", IMAGE_ROOT / "provenance.json")
+    if provenance not in {IMAGE_ROOT / "provenance.json", Path("/build/provenance.json"), Path("/opt/fullmag/control/backend/runtime-provenance.json")}:
+        _fail("runtime provenance is outside the two fixed package/volume locations")
     return RuntimePaths(
         state=state,
         storage=storage,

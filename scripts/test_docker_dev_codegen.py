@@ -36,6 +36,17 @@ class DockerDevCodegenTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(result.stdout)[-3:], ["codegen-openapi", "--source-root", source])
 
+    def test_frontend_requires_readonly_control_but_writable_build_state(self) -> None:
+        document = {"Mounts": [
+            {"Destination": "/opt/fullmag/source", "Type": "bind", "RW": False},
+            {"Destination": "/state/development", "Type": "volume", "RW": True},
+            {"Destination": "/opt/fullmag/control", "Type": "volume", "RW": False},
+        ]}
+        codegen._validate_mounts(document, "frontend")
+        document["Mounts"][-1]["RW"] = True
+        with self.assertRaisesRegex(codegen.CodegenError, "readonly"):
+            codegen._validate_mounts(document, "frontend")
+
     def test_path_identity_normalizes_windows_and_wsl_forms(self) -> None:
         expected = codegen._path_identity(r"C:\git\fullmag\fullmag")
         for alias in (

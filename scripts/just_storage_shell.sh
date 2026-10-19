@@ -116,7 +116,7 @@ esac
 # composite command cannot use a diagnostic marker to bypass its argument check.
 case "${recipe}" in
   *"scripts/bootstrap_docker_toolchain.py"*)
-    toolchain_bootstrap_pattern='^[^[:space:]]+ "[^"]+/scripts/bootstrap_docker_toolchain.py" --repo-root "[^"]+"( --direct-development)?$'
+    toolchain_bootstrap_pattern='^[^[:space:]]+ "[^"]+/scripts/bootstrap_docker_toolchain.py" --repo-root "[^"]+"( --direct-development( --prepare-development-images)?)?$'
     if [[ ! "${recipe}" =~ ${toolchain_bootstrap_pattern} ]]; then
       echo "[fullmag just] invalid Docker toolchain bootstrap recipe" >&2
       exit 2
@@ -125,7 +125,8 @@ case "${recipe}" in
     # heavy lock, and enrolled-runner admission. Do not run prepare-links or
     # the generic runner around it.
     toolchain_mode=()
-    if [[ "${recipe}" == *" --direct-development" ]]; then toolchain_mode+=(--direct-development); fi
+    if [[ "${recipe}" == *" --direct-development"* ]]; then toolchain_mode+=(--direct-development); fi
+    if [[ "${recipe}" == *" --prepare-development-images" ]]; then toolchain_mode+=(--prepare-development-images); fi
     exec "${python_cmd}" "${script_dir}/bootstrap_docker_toolchain.py" --repo-root "${repo_root}" "${toolchain_mode[@]}"
     ;;
   *"scripts/recover_docker_orphan.py"*)
@@ -149,11 +150,30 @@ case "${recipe}" in
       --target-container "${orphan_container}" --project "${orphan_project}" \
       --diagnostics-root "${orphan_diagnostics}" "${orphan_resume[@]}"
     ;;
+  *"scripts/docker_volume_stop_failed.py"*)
+    volume_stop_failed_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_stop_failed.py\" --source-root '[^']+' --container-id '[0-9a-f]{64}' --image-id 'sha256:[0-9a-f]{64}' --process-receipt-sha256 '[0-9a-f]{64}'[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${volume_stop_failed_pattern} ]]; then
+      echo "[fullmag just] invalid failed DEV supervisor stop recipe" >&2
+      exit 2
+    fi
+    exec "${bash_executable}" -euo pipefail -c "${recipe}"
+    ;;
+  *"scripts/docker_volume_checks.py"*)
+    volume_checks_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_checks.py\" --source-root '[^']+'[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${volume_checks_pattern} ]]; then
+      echo "[fullmag just] invalid volume DEV checks recipe" >&2
+      exit 2
+    fi
+    exec "${bash_executable}" -euo pipefail -c "${recipe}"
+    ;;
   *"scripts/docker_dev.py"*)
     docker_dev_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" build --gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?[[:space:]]*$"
     docker_dev_up_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" up --port '([0-9]{4,5})' --gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?( --script '([^']+)')?[[:space:]]*$"
     docker_dev_codegen_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" codegen-openapi( --source-root '([^']+)')?[[:space:]]*$"
     docker_dev_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate --direct-development --run-receipt '([^']+)' --previous-config-sha256 '([0-9a-f]{64})' --gpu-access '(auto|required|disabled)'[ ]+(--source-root '([^']+)'[ ]+)?--port '([0-9]{4,5})'[[:space:]]*$"
+    docker_dev_resume_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" resume-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --restart-backend)?[[:space:]]*$"
+    docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --fresh-state)?[[:space:]]*$"
+    docker_dev_idle_restart_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" restart-idle-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'[[:space:]]*$"
     docker_dev_args=(--repo-root "${repo_root}")
     if [[ "${recipe}" =~ ${docker_dev_codegen_pattern} ]]; then
       docker_dev_args+=(codegen-openapi)
@@ -174,14 +194,19 @@ case "${recipe}" in
         docker_dev_args+=(--script "${BASH_REMATCH[6]}")
       fi
     elif [[ "${recipe}" =~ ${docker_dev_recreate_pattern} ]]; then
-      docker_dev_args+=(recreate --direct-development
-        --run-receipt "${BASH_REMATCH[1]}"
-        --previous-config-sha256 "${BASH_REMATCH[2]}"
-        --gpu-access "${BASH_REMATCH[3]}")
-      if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
-        docker_dev_args+=(--source-root "${BASH_REMATCH[5]}")
-      fi
-      docker_dev_args+=(--port "${BASH_REMATCH[6]}")
+      echo "[fullmag just] host-receipt DEV recreation is retired; use docker-dev-resume with a Docker-volume attempt" >&2
+      exit 2
+    elif [[ "${recipe}" =~ ${docker_dev_resume_pattern} ]]; then
+      docker_dev_args+=(resume-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
+      if [[ -n "${BASH_REMATCH[5]:-}" ]]; then docker_dev_args+=(--restart-backend); fi
+    elif [[ "${recipe}" =~ ${docker_dev_volume_recreate_pattern} ]]; then
+      docker_dev_args+=(recreate-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
+      if [[ -n "${BASH_REMATCH[5]:-}" ]]; then docker_dev_args+=(--fresh-state); fi
+    elif [[ "${recipe}" =~ ${docker_dev_idle_restart_pattern} ]]; then
+      docker_dev_args+=(restart-idle-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
     else
       echo "[fullmag just] invalid direct Docker development recipe" >&2
       exit 2

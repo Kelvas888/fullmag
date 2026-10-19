@@ -492,8 +492,10 @@ def _validate_mounts(document: Mapping[str, Any], service: str) -> None:
     )
     for target in volume_targets:
         mount = mount_for(target)
-        if mount.get("Type") != "volume" or mount.get("RW") is not True:
-            raise CodegenError(f"{service} technical mount is not a writable named volume: {target}")
+        writable = not (service == "frontend" and target == "/opt/fullmag/control")
+        if mount.get("Type") != "volume" or mount.get("RW") is not writable:
+            access = "writable" if writable else "readonly"
+            raise CodegenError(f"{service} technical mount is not a {access} named volume: {target}")
 
 
 def _running_service(project: str, service: str, identity: Mapping[str, str], selected: Path) -> tuple[str, dict[str, Any]]:

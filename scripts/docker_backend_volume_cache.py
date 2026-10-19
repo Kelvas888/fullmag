@@ -371,7 +371,7 @@ def _maintenance_service(profile: Mapping[str, Any]) -> dict[str, Any]:
         "read_only": True,
         "privileged": False,
         "cap_drop": ["ALL"],
-        "cap_add": ["CHOWN"],
+        "cap_add": ["CHOWN", "DAC_OVERRIDE"],
         "security_opt": ["no-new-privileges:true"],
         "network_mode": "none",
         "restart": "no",
@@ -1119,7 +1119,7 @@ def validate_maintenance_overlay(document: Mapping[str, Any], profile: Mapping[s
             or maintenance.get("network_mode") != "none"
             or maintenance.get("user") != "0:0"
             or maintenance.get("cap_drop") != ["ALL"]
-            or maintenance.get("cap_add") != ["CHOWN"]
+            or maintenance.get("cap_add") != ["CHOWN", "DAC_OVERRIDE"]
             or maintenance.get("security_opt") != ["no-new-privileges:true"]
             or "gpus" in maintenance
             or (isinstance(maintenance_pid, str)

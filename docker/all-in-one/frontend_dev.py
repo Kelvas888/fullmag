@@ -88,6 +88,7 @@ FREEZE_ROOT = DEVELOPMENT_ROOT / "frozen-inputs"
 FREEZE_PATH = DEVELOPMENT_ROOT / "inputs-freeze.json"
 RECEIPT_PATH = DEVELOPMENT_ROOT / "frontend-dev-receipt.json"
 LOG_PATH = DEVELOPMENT_ROOT / "next.log"
+MAX_LOG_BYTES = 64 * 1024 * 1024
 RUNTIME_LOCK_PATH = FRONTEND_ROOT / ".fullmag-frontend-runtime.lock"
 
 NODE_BINARY = Path("/usr/local/bin/node")
@@ -1264,6 +1265,79 @@ def _release_runtime_lock(lock: Any | None) -> None:
         pass
 
 
+class _BoundedLog:
+    """Pipe child output into a bounded retained file; overflow uses Docker's ring."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._read_fd, self._write_fd = os.pipe()
+        self._closed = False
+        self._condition = threading.Condition()
+        self._queued = 0
+        self._consumed = 0
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._drain, name="fullmag-frontend-log-writer", daemon=True)
+        self._thread.start()
+
+    def fileno(self) -> int:
+        return self._write_fd
+
+    def log_fileno(self) -> int:
+        return self._stream.fileno()
+
+    def write(self, data: bytes) -> int:
+        view = memoryview(data)
+        while view:
+            count = os.write(self._write_fd, view)
+            with self._condition:
+                self._queued += count
+            view = view[count:]
+        return len(data)
+
+    def flush(self) -> None:
+        with self._condition:
+            complete = self._condition.wait_for(lambda: self._consumed >= self._queued or self._error is not None, timeout=5)
+            if not complete or self._error is not None:
+                raise OSError("frontend log writer did not acknowledge bounded output")
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            os.close(self._write_fd)
+            self._thread.join(timeout=5)
+
+    def _drain(self) -> None:
+        remaining = MAX_LOG_BYTES - os.fstat(self._stream.fileno()).st_size
+        overflow_reported = False
+        try:
+            while chunk := os.read(self._read_fd, 65536):
+                retained = min(len(chunk), remaining)
+                if retained:
+                    self._stream.write(chunk[:retained])
+                    self._stream.flush()
+                    remaining -= retained
+                if retained < len(chunk):
+                    if not overflow_reported:
+                        _write_lifecycle_log("log_budget", status="bounded", byte_limit=MAX_LOG_BYTES,
+                                             overflow="docker-local-log-ring")
+                        overflow_reported = True
+                    binary = getattr(sys.stdout, "buffer", None)
+                    if binary is not None:
+                        binary.write(chunk[retained:]); binary.flush()
+                    else:
+                        sys.stdout.write(chunk[retained:].decode("utf-8", "replace")); sys.stdout.flush()
+                with self._condition:
+                    self._consumed += len(chunk)
+                    self._condition.notify_all()
+        except BaseException as error:
+            with self._condition:
+                self._error = error
+                self._condition.notify_all()
+        finally:
+            os.close(self._read_fd)
+            self._stream.close()
+
+
 def _log_stream() -> Any:
     _ensure_directory(DEVELOPMENT_ROOT, "development root")
     descriptor: int | None = None
@@ -1272,12 +1346,22 @@ def _log_stream() -> Any:
         descriptor = os.open(
             LOG_PATH,
             os.O_WRONLY
-            | os.O_TRUNC
+            | os.O_APPEND
             | os.O_CREAT
+            | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_NOFOLLOW", 0),
             0o660,
         )
-        return os.fdopen(descriptor, "wb")
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            os.close(descriptor)
+            descriptor = None
+            _fail("frontend retained log is not one regular file")
+        if metadata.st_size >= MAX_LOG_BYTES:
+            os.close(descriptor)
+            descriptor = None
+            _fail("frontend retained log budget exhausted; preserve logs for explicit review")
+        return _BoundedLog(os.fdopen(descriptor, "ab"))
     except OSError as error:
         if descriptor is not None:
             os.close(descriptor)
@@ -1288,7 +1372,7 @@ def _log_file_offset(log_stream: Any) -> int | None:
     """Return the append-log boundary before a new Next child is spawned."""
 
     try:
-        return int(os.fstat(log_stream.fileno()).st_size)
+        return int(os.fstat(getattr(log_stream, "log_fileno", log_stream.fileno)()).st_size)
     except (AttributeError, OSError, ValueError):
         return None
 

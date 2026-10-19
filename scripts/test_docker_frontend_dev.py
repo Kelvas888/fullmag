@@ -441,7 +441,7 @@ class FrontendDevContractTests(TestCase):
             log_stream = self.module._log_stream()
             tailer = None
             try:
-                self.assertEqual(self.module.LOG_PATH.read_bytes(), b"")
+                self.assertEqual(self.module.LOG_PATH.read_bytes(), b"previous frontend process log\n")
                 log_stream.write(
                     b"frontend tool probe result name=pnpm status=ok\n"
                     b"old install progress 1/758\n"
@@ -468,6 +468,20 @@ class FrontendDevContractTests(TestCase):
                 if tailer is not None:
                     tailer.stop()
                 log_stream.close()
+
+    def test_child_log_is_bounded_and_full_log_blocks_next_start(self):
+        with isolated(self.module) as (root, _workspace, _inputs):
+            overflow = io.StringIO()
+            with patch.object(self.module, "MAX_LOG_BYTES", 128), redirect_stdout(overflow):
+                log = self.module._log_stream()
+                result = subprocess.run([sys.executable, "-B", "-c", "import sys;sys.stdout.buffer.write(b'q'*4096)"],
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=5)
+                log.close()
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(self.module.LOG_PATH.read_bytes(), b'q'*128)
+                self.assertIn('q'*128, overflow.getvalue())
+                with self.assertRaisesRegex(self.module.FrontendDevError, "log budget exhausted"):
+                    self.module._log_stream()
 
     @skipIf(os.name == "nt", "FIFO no-follow regression uses the Linux container filesystem")
     def test_log_tailer_rejects_fifo_without_blocking(self):

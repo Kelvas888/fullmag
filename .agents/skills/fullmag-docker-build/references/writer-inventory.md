@@ -6,6 +6,26 @@ sprawdzono natywnym Git dla Windows; WSL Git nie interpretuje jego Windowsowego
 wskaźnika `.git`. Numery linii odnoszą się do tego odczytu. To mapa do ponownej
 weryfikacji przy zmianie kodu, nie dowód uruchomienia wszystkich tras.
 
+## Aktywna trasa po integracji PR #198
+
+`docker_dev.py up` wywołuje `docker_volume_dev.start`. Toolchain, obrazy helperów,
+konfiguracje, techniczne receipty, logi operacji i pomiary zapisuje
+`docker_build_control.py` w named volume grupy. `development/attempts/<attempt>`
+zawiera konfigurację i wynik konkretnego startu. Cache backendu zachowuje
+parę named volumes; frontend używa `fullmag-dev-frontend-v1-<key>` z metadanymi,
+pnpm i Next. Nie utożsamiaj tej nazwy ze starszym adapterem ext4 frontend-v1.
+Nowa ścieżka nie używa hostowego wskaźnika `runs/docker-all` jako buildu.
+Log Make i `next.log` mają budżet 64 MiB; pełny log frontendu blokuje kolejny
+start do jawnego przeglądu, bez automatycznego tracenia poprzedniej diagnostyki.
+Wcześniejsze generacje wolumenów są zachowane, bez automatycznej migracji lub
+usuwania; przed ich cleanupem sprawdź właścicieli i referencje.
+
+Windows zachowuje storage użytkownika i runtime: sesje, wyniki, ustawienia,
+historię oraz host-ledger i wymagany certyfikat przyjęcia storage. Role zapisów
+oraz budżety są w [przewodniku DEV](../../../../docs/guides/docker-volume-development.md).
+Poniższa sekcja daily `9a798d280` dokumentuje wcześniejszy launcher, nie bieżący
+producer/consumer. Nowa trasa wymaga osobnego rzeczywistego inspect i runu.
+
 ## Aktualny daily `live-shadow-v1` — odczyt źródeł HEAD `9a798d280`
 
 To źródłowy przegląd delty po migracji, a nie dowód runtime. W aktywnej grupie
@@ -172,3 +192,22 @@ Nie uruchamiano buildów, cleanupu ani pomiaru daemona w ramach tego audytu.
 Pełne nazwy plików backend/frontend w tabeli są pod `docker/all-in-one/`;
 pozostałe launchery pod `scripts/`. Bieżące zasady retencji opisuje
 [kontrakt danych](artifact-policy.md).
+
+## Delta wdrożenia DEV
+
+Stan bazowy powyżej pozostaje historyczny. Bieżące writery zarządzanej trasy:
+
+| Writer | Zapisy po migracji |
+| --- | --- |
+| `docker_build_control.py::build_volume_toolchain`, `build_volume_runtime_images` | Kontekst allowlist bez hostowego stagingu; warstwy w BuildKit; logi, manifesty i receipty w build-control volume. |
+| `docker_volume_dev.py::start`, `_backend_cache`, `_frontend` | Overlaye i metadata w wolumenie kontrolnym; backend/cache/pakiety oraz frontend/pnpm/Next w named volumes. |
+| `backend_dev.py::_publish_runtime_provenance`, `_run_canonical_make` | `/build/provenance.json` i ograniczony log Make w build volume. |
+| `frontend_dev.py::_BoundedLog` | Ograniczony next.log w frontend volume; nadmiar w pierścieniu Docker local. |
+| `docker_volume_dev.py::_host_ledger`, `_finish` | Kopia helpera i logi/receipty utrzymania w control volume. Właściwy ledger oraz certyfikaty storage pozostają danymi runtime Windows. |
+| `setup_docker.py`, rejestr zadania `fullmag_storage.py::register` | Konfiguracja operatora i metadane własności worktree na hoście; nie są receiptem ani cache buildu. |
+
+Źródła i Git common pozostają readonly. Dozwolone writable binds aplikacji to
+`/state`, `/user-data`, `/host-ledger`. Kod launchera odrzuca pozostałe writable
+bindy, a obserwacja sprawdza także faktyczne typy, źródła i dostęp mountów.
+Odrębne recepty release/CI/naukowe z mapy bazowej nie zostały tą zmianą
+przekwalifikowane jako volume-only DEV.

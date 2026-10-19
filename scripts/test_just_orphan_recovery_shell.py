@@ -111,25 +111,41 @@ class DockerDevelopmentShellBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)
 
-    def test_dispatches_build_and_controlled_recreate_as_fixed_argv(self):
-        build = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
-                 "build --gpu-access 'disabled' --source-root '/selected/worktree'")
-        recreate = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
-                    "recreate --direct-development --run-receipt '/storage/runs/failed.json' "
-                    f"--previous-config-sha256 '{'a' * 64}' --gpu-access 'required' "
-                    "--source-root '/selected/worktree' --port '3198'")
-        for recipe, expected in (
-            (build, ['--repo-root', '/registered/checkout', 'build', '--gpu-access', 'disabled',
-                     '--source-root', '/selected/worktree']),
-            (recreate, ['--repo-root', '/registered/checkout', 'recreate', '--direct-development',
-                        '--run-receipt', '/storage/runs/failed.json', '--previous-config-sha256',
-                        'a' * 64, '--gpu-access', 'required', '--source-root', '/selected/worktree',
-                        '--port', '3198']),
-        ):
-            with self.subTest(recipe=recipe):
-                result = self.dispatch(recipe)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout), expected)
+    def test_dispatches_build_as_fixed_argv(self):
+        recipe = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
+                  "build --gpu-access 'disabled' --source-root '/selected/worktree'")
+        result = self.dispatch(recipe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ['--repo-root', '/registered/checkout', 'build',
+            '--gpu-access', 'disabled', '--source-root', '/selected/worktree'])
+
+    def test_rejects_retired_host_receipt_recreate_recipe(self):
+        recipe = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
+                  "recreate --direct-development --run-receipt '/storage/runs/failed.json' "
+                  f"--previous-config-sha256 '{'a' * 64}' --gpu-access 'required' "
+                  "--source-root '/selected/worktree' --port '3198'")
+        result = self.dispatch(recipe)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('host-receipt DEV recreation is retired', result.stderr)
+        self.assertFalse(result.stdout.strip())
+
+    def test_volume_lifecycle_commands_dispatch_fixed_argv(self):
+        for command, flag in [('resume-volume', '--restart-backend'),
+                              ('recreate-volume', '--fresh-state'),
+                              ('restart-idle-volume', '')]:
+            source = '/selected/$(printf literal);worktree'
+            recipe = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
+                      f"{command} --attempt '{'b' * 32}' --config-sha256 '{'a' * 64}' "
+                      f"--source-root '{source}' --port '3198'" + (' ' + flag if flag else ''))
+            result = self.dispatch(recipe)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = ['--repo-root', '/registered/checkout', command, '--attempt', 'b' * 32,
+                        '--config-sha256', 'a' * 64, '--source-root', source, '--port', '3198']
+            if flag: expected.append(flag)
+            self.assertEqual(json.loads(result.stdout), expected)
+            injected = self.dispatch(recipe + '; printf injected')
+            self.assertEqual(injected.returncode, 2, injected.stderr)
+
 
     def test_rejects_unbound_recreate_variants(self):
         for recipe in (
