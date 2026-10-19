@@ -780,6 +780,9 @@ jobs:
           python -B scripts/test_docker_container_runtime_recovery.py -v
           python -B scripts/test_docker_volume_container_recovery.py -v
           python -B scripts/test_docker_volume_dev_runtime_state.py -v
+          python -B scripts/test_docker_volume_dev_cancelled_activation.py -v
+          python -B scripts/test_runtime_service_successor.py -v
+          python -B scripts/test_runtime_service_recovery_busy_retry.py -v
           python -B scripts/test_docker_dev_owned_control.py -v
           python -B scripts/test_docker_volume_receipts.py -v
           python -B scripts/test_docker_volume_stop_unadmitted.py -v

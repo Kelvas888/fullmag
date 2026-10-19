@@ -9,11 +9,10 @@ import tempfile
 import unittest
 
 
-SPEC = importlib.util.spec_from_file_location(
-    "runtime_service_successor", "/tmp/runtime_service.successor.py"
-)
+RUNTIME_PATH = Path(__file__).resolve().parents[1] / "docker" / "all-in-one" / "runtime_service.py"
+SPEC = importlib.util.spec_from_file_location("runtime_service_successor", RUNTIME_PATH)
+assert SPEC is not None and SPEC.loader is not None
 runtime_service = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
 sys.modules[SPEC.name] = runtime_service
 SPEC.loader.exec_module(runtime_service)
 
