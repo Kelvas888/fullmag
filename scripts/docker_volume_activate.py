@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from pathlib import Path, PurePath, PurePosixPath
 import re
 import sys
+import uuid
 
 import fullmag_storage as storage
 from docker_build_control import (
@@ -122,7 +123,7 @@ def _request_id(startup_helper, attempt: str, source_sha256: str, explicit: str 
             return startup_helper._validate_request_id(explicit)
         except _helper_error_type(startup_helper) as error:
             raise BuildControlError(str(error)) from error
-    return f"docker-volume-{attempt}-{source_sha256[:16]}"
+    return "docker-volume-" + uuid.uuid4().hex
 
 
 def _authorization_bytes(startup_helper, authorization: Mapping[str, object]) -> bytes:

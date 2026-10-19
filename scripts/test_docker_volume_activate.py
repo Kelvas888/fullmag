@@ -18,14 +18,30 @@ from docker_build_control import BuildControlError
 
 
 class DockerVolumeActivationTests(unittest.TestCase):
-    def test_default_request_fence_is_stable_and_bounded(self) -> None:
+    def test_default_request_fence_is_fresh_and_namespaced(self) -> None:
         attempt = "a" * 32
         digest = "b" * 64
         helper = SimpleNamespace(StartupScriptError=ValueError)
         first = activate._request_id(helper, attempt, digest, None)
-        self.assertEqual(first, activate._request_id(helper, attempt, digest, None))
-        self.assertLessEqual(len(first), 128)
-        self.assertEqual(first, "docker-volume-" + attempt + "-" + digest[:16])
+        second = activate._request_id(helper, attempt, digest, None)
+        self.assertNotEqual(first, second)
+        self.assertRegex(first, r"^docker-volume-[0-9a-f]{32}$")
+        self.assertRegex(second, r"^docker-volume-[0-9a-f]{32}$")
+
+    def test_explicit_request_fence_is_validated_and_preserved(self) -> None:
+        explicit = "operator-request-42"
+        validated = []
+
+        def validate(value):
+            validated.append(value)
+            return value
+
+        helper = SimpleNamespace(StartupScriptError=ValueError, _validate_request_id=validate)
+        self.assertEqual(
+            activate._request_id(helper, "a" * 32, "b" * 64, explicit),
+            explicit,
+        )
+        self.assertEqual(validated, [explicit])
 
     def test_selected_helper_loader_uses_selected_prepare_contract(self) -> None:
         """The worktree helper must supply prepare, even if the main helper differs."""
