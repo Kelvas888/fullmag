@@ -1062,10 +1062,90 @@ pub(crate) fn admit(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recognize only the Docker-created parent of the nested runtime-services
+/// volume. An arbitrary directory with missing store entries remains a partial
+/// store and is rejected below.
+#[cfg(target_os = "linux")]
+fn is_managed_runtime_services_scaffold(root: &Path) -> Result<bool> {
+    const RUNTIME_SERVICES_ROOT: &str = "/opt/fullmag/runtime-control/runtime-services";
+
+    if env::var("FULLMAG_SESSION_STORAGE_PROFILE").as_deref() != Ok("windows-folder-v1")
+        || env::var("FULLMAG_RUNTIME_CONTROL_ROOT").as_deref()
+            != Ok("/opt/fullmag/runtime-control")
+        || env::var("FULLMAG_RUNTIME_SERVICES_ROOT").as_deref() != Ok(RUNTIME_SERVICES_ROOT)
+    {
+        return Ok(false);
+    }
+
+    let root_metadata = fs::symlink_metadata(root)?;
+    if !root_metadata.is_dir() {
+        return Ok(false);
+    }
+    let mounted = crate::repository_path::checked_path(root, "runtime-services")?;
+    let mounted_metadata = match fs::symlink_metadata(&mounted) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("inspecting Docker runtime-services scaffold"),
+    };
+    let alias = Path::new(RUNTIME_SERVICES_ROOT);
+    let alias_metadata = match fs::symlink_metadata(alias) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("inspecting runtime-services volume alias"),
+    };
+    if !mounted_metadata.is_dir()
+        || mounted_metadata.file_type().is_symlink()
+        || !alias_metadata.is_dir()
+        || alias_metadata.file_type().is_symlink()
+    {
+        return Ok(false);
+    }
+
+    use std::os::unix::fs::MetadataExt;
+    if (mounted_metadata.dev(), mounted_metadata.ino())
+        != (alias_metadata.dev(), alias_metadata.ino())
+        || mounted_metadata.dev() == root_metadata.dev()
+    {
+        return Ok(false);
+    }
+
+    runtime_services_scaffold_inventory(root, &mounted)
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_services_scaffold_inventory(root: &Path, mounted: &Path) -> Result<bool> {
+    let mounted_metadata = fs::symlink_metadata(mounted)?;
+    if !mounted_metadata.is_dir() || mounted_metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+
+    let mut entries = fs::read_dir(root)?;
+    let Some(entry) = entries.next().transpose()? else {
+        return Ok(false);
+    };
+    if entry.file_name().to_str() != Some("runtime-services")
+        || entries.next().transpose()?.is_some()
+    {
+        return Ok(false);
+    }
+    if fs::read_dir(mounted)?.next().transpose()?.is_some() {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn initialize_store_under(parent: &Path, relative: &str) -> Result<(PathBuf, bool)> {
     let root = crate::repository_path::checked_path(parent, relative)?;
     let created = match fs::symlink_metadata(&root) {
         Ok(_) => {
+            #[cfg(target_os = "linux")]
+            if parent == Path::new("/state/runs/docker-all")
+                && relative == "session-store"
+                && is_managed_runtime_services_scaffold(&root)?
+            {
+                drop(crate::SessionStore::open(&root)?);
+                return Ok((root, true));
+            }
             // Existing or partial data never grants initialization or takeover.
             for relative in [
                 "manifests",
@@ -1294,6 +1374,34 @@ mod tests {
             fs::read(partial.join("evidence")).unwrap(),
             b"retain partial failure"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn docker_scaffold_inventory_requires_only_an_empty_runtime_services_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session-store");
+        let mounted = root.join("runtime-services");
+        fs::create_dir_all(&mounted).unwrap();
+
+        assert!(runtime_services_scaffold_inventory(&root, &mounted).unwrap());
+
+        fs::write(root.join("evidence"), b"partial store").unwrap();
+        assert!(!runtime_services_scaffold_inventory(&root, &mounted).unwrap());
+        fs::remove_file(root.join("evidence")).unwrap();
+
+        fs::write(mounted.join("evidence"), b"runtime state").unwrap();
+        assert!(!runtime_services_scaffold_inventory(&root, &mounted).unwrap());
+        fs::remove_file(mounted.join("evidence")).unwrap();
+
+        #[cfg(unix)]
+        {
+            let replacement = directory.path().join("replacement");
+            fs::create_dir(&replacement).unwrap();
+            fs::remove_dir(&mounted).unwrap();
+            std::os::unix::fs::symlink(&replacement, &mounted).unwrap();
+            assert!(!runtime_services_scaffold_inventory(&root, &mounted).unwrap());
+        }
     }
 
     #[cfg(unix)]

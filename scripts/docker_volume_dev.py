@@ -8,11 +8,20 @@ import os
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 import re
+import sys
 import time
 
 import fullmag_storage as storage
 from docker_build_control import (BuildControl, BuildControlError, canonical, docker_capture,
                                   compose_capture, build_volume_toolchain, build_volume_runtime_images, bounded_capture)
+
+
+_NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES = (
+    Path("runs"),
+    Path("runs/docker-all"),
+    Path("runs/docker-all/session-store"),
+    Path("runs/docker-all/session-store/runtime-services"),
+)
 
 
 def docker_text(*args, timeout=90, combined=False):
@@ -393,6 +402,106 @@ def _start_compose_services(control, operation, document):
     operation["daemon_pending"] = False
 
 
+def _assert_new_windows_runtime_path(path, state):
+    """Reject reparse points while inspecting a fresh Windows state tree."""
+
+    path = Path(path)
+    state = Path(state)
+    current = path
+    while True:
+        if os.path.lexists(current) and storage.is_link(current):
+            raise BuildControlError(
+                "New Windows runtime state traverses a reparse point: " + str(current)
+            )
+        if current == state:
+            return
+        if current.parent == current or state not in current.parents:
+            raise BuildControlError("Windows runtime state path escaped its new state root")
+        current = current.parent
+
+
+def _probe_new_windows_runtime_directory(directory):
+    """Prove that the native Windows user can write the final runtime directory."""
+
+    directory = Path(directory)
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise BuildControlError("New Windows runtime directory is not writable: " + str(directory))
+    probe = directory / (
+        ".fullmag-runtime-state-write-probe-"
+        + str(os.getpid())
+        + "-"
+        + str(time.monotonic_ns())
+    )
+    descriptor = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(probe, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(b"fullmag-runtime-state-preflight\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if storage.is_link(probe):
+            raise BuildControlError("Runtime write probe became a reparse point")
+        probe.unlink()
+    except BuildControlError:
+        raise
+    except (OSError, ValueError) as error:
+        raise BuildControlError(
+            "New Windows runtime directory failed the write probe: " + str(directory)
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.lexists(probe) and not storage.is_link(probe):
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+    if os.path.lexists(probe):
+        raise BuildControlError("Runtime write probe was not removed safely")
+
+
+def _precreate_new_windows_runtime_state(state):
+    """Prepare the exact runtime namespace before Docker can create it as root.
+
+    This is intentionally limited to a freshly-created state root. Existing
+    entries are rejected rather than adopted, repaired, or recursively
+    permission-changed. Build data remains in Docker volumes.
+    """
+
+    if sys.platform != "win32":
+        raise BuildControlError("Windows runtime state must be prepared by native Windows")
+    state = Path(state)
+    if storage.is_link(state) or not state.is_dir():
+        raise BuildControlError("New Windows runtime state root is missing or a reparse point")
+
+    for relative in _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES:
+        target = state / relative
+        _assert_new_windows_runtime_path(target, state)
+        if os.path.lexists(target):
+            raise BuildControlError(
+                "New Windows runtime state already contains " + relative.as_posix()
+            )
+
+    for relative in _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES:
+        target = state / relative
+        try:
+            target.mkdir()
+        except OSError as error:
+            raise BuildControlError(
+                "New Windows runtime state directory could not be created: " + str(target)
+            ) from error
+        _assert_new_windows_runtime_path(target, state)
+        if not target.is_dir():
+            raise BuildControlError("Windows runtime state entry is not a directory: " + str(target))
+
+    _probe_new_windows_runtime_directory(
+        state / _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES[-1]
+    )
+    return tuple(relative.as_posix() for relative in _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES)
+
+
 def start(args, *, reuse_state=None):
     from docker_dev import (_require_native_windows, _select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
@@ -436,6 +545,10 @@ def start(args, *, reuse_state=None):
             state = storage.validate_path(Path(layout["runtime_root"]) / "docker-volume-dev" / token,
                                           layout["storage_root"], "Windows session storage")
             state.mkdir(parents=True, exist_ok=False)
+            operation["receipt"]["windows_runtime_directories"] = list(
+                _precreate_new_windows_runtime_state(state)
+            )
+            operation["receipt"]["windows_runtime_write_probe"] = "PASS"
             certificate_path = state / "windows-folder-host.json"
             certificate_path.touch(exist_ok=False)
         else:

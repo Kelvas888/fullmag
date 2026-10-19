@@ -275,6 +275,15 @@ receipt/provenance i hash binarki; sam zapis zmiany kodu nie wymaga nowej zgody
 hosta dla niezmienionego storage. Ścieżka release zachowuje dokładne hostowe piny.
 Szczegóły i zakres delegacji określa ADR 0061; wdrożenie pozostaje **NOT VERIFIED**.
 
+Przed pierwszym montowaniem nowego katalogu `/state` natywny launcher Windows
+tworzy dokładnie `runs/docker-all/session-store/runtime-services` oraz wykonuje
+rzeczywistą próbę zapisu i usunięcia pliku w końcowym katalogu. Odrzuca wpisy
+istniejące i punkty reparse; nie przejmuje danych, nie wykonuje rekursywnego
+`chown` ani migracji starego stanu. Dzięki temu Docker nie tworzy tych katalogów
+jako `root:root` `0755`, a UID usługi może utworzyć `WRITER.lock`. Są to katalogi
+danych runtime sesji na Windows; cache, staging, pakiet i logi buildu nadal
+pozostają w nazwanych wolumenach Docker.
+
 ## Skrypt symulacji jako parametr startu
 
 Trzeci argument recepty `just docker-dev` wybiera plik w tym samym checkoutcie:
