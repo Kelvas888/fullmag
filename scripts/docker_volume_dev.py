@@ -1728,6 +1728,11 @@ def restart_idle(args):
     return _retained_operation(args, recreate_services=False, restart_idle_service=True)
 
 
+def stop_idle(args):
+    """Drain the exact idle backend before managed service recreation."""
+    return _retained_operation(args, recreate_services=False, restart_idle_service=True, stop_after_drain=True)
+
+
 def recreate(args):
     return _retained_operation(args, recreate_services=True)
 
@@ -2012,7 +2017,7 @@ def _retained_recovery_context(control, previous, document, *, fresh_state, back
             "recovery_metadata": _validate_recovery_metadata(expected)}
 
 
-def _retained_operation(args, *, recreate_services, restart_idle_service=False):
+def _retained_operation(args, *, recreate_services, restart_idle_service=False, stop_after_drain=False):
     """Resume observation/admission of one exact failed start; never restart the backend."""
     from docker_dev import _select_source, _compose_identity
     require_host()
@@ -2154,6 +2159,14 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 "process_receipt_sha256": hashlib.sha256(drained_raw).hexdigest(),
                 "process_receipt": drained,
             })
+            if stop_after_drain:
+                operation["daemon_pending"] = False
+                operation["receipt"].update(
+                    state="succeeded", idle_backend_stopped=True,
+                    backend_container=ids["backend"], frontend_container=ids["frontend"],
+                    config_sha256=args.config_sha256,
+                )
+                return
             docker_capture("start", ids["backend"], timeout=90)
             docker_capture("start", ids["frontend"], timeout=90)
             operation["daemon_pending"] = False

@@ -27,6 +27,17 @@ i obrazy helperów. Osobne `just docker-dev-toolchain` jest opcjonalne: pozwala
 przygotować zależności wcześniej albo diagnozować ten etap bez startu aplikacji.
 Nie kompiluje aplikacji; ta buduje się w stałym `backend`.
 
+`just docker-dev` obsługuje również grupę istniejącą dla wybranego checkoutu.
+Działający backend z pasującymi wejściami jest używany ponownie. Zmiana źródeł
+uruchamia kontrolowany restart bez aktywnych obliczeń; backend sprawdza istniejący
+pakiet i wykonuje przyrostowy build tylko wtedy, gdy jego wejścia się zmieniły.
+Zatrzymana grupa jest wznawiana z przypiętej konfiguracji. Domyślnie pozostaje
+jej zapisany port; jawna zmiana portu wymaga odtworzenia konfiguracji.
+Cache i dane użytkownika pozostają zachowane. Nieznany wynik wcześniejszej
+aktywacji lub obcy właściciel blokuje automatyczny restart; launcher nie kasuje
+blokad i nie powtarza historycznego Solve. Kolejny skrypt jest aktywowany dopiero
+w gotowej grupie przez tę samą ścieżkę co `docker-dev-script`.
+
 Kreator zapisuje `FULLMAG_SOURCE_ROOT` i `FULLMAG_HTTP_PORT` do `.env` głównego
 checkoutu. Domyślne źródła: jawny argument → zmienna procesu → bieżący worktree
 → `.env` → zapis konfiguratora → główny checkout. Port startu: jawny argument →
@@ -47,6 +58,22 @@ Konfiguracja JSON jest w `development/attempts/<attempt>/compose.json`,
 a wynik w `terminal.json` w tym samym katalogu wolumenu. SHA konfiguracji to
 SHA256 kanonicznego JSON (`docker_build_control.canonical`), nie pliku z newline.
 Nie kopiuj tych plików do hostowego `storage/builds`.
+
+## Wyniki obok skryptu
+
+Po jawnej zgodzie na zapis wybranego podkatalogu ustaw w `.env` głównego
+checkoutu `FULLMAG_SCRIPT_OUTPUT_DIRECTORY=examples` (albo inny istniejący
+podkatalog źródeł). Backend dostaje osobny alias tylko tego katalogu.
+Może technicznie zmieniać również inne jego pliki. Główny checkout nie może
+zostać wybrany jako writable alias. Zmiana grantu wymaga odtworzenia usług;
+`docker-dev` wybiera kontrolowaną ścieżkę odtworzenia i zachowuje wolumeny.
+
+Skrypt `examples/model.py` używa domyślnie sąsiedniego `model.zarr`.
+HDF5 zachowuje obecny kontener `model.results` z plikami `.h5`.
+Jawna OutputStorage jest nadrzędna. Zapis sesji wskazuje `model.fms`,
+a kolizja tworzy nową nazwę. Export nadal pobiera archiwum przez przeglądarkę.
+Wyniki i sesje nie są danymi buildu. Pliki wynikowe bez wpisu w indeksie Git
+nie zmieniają source identity; świadomie śledzone fixtures nadal są sprawdzane.
 
 ## Iteracje i awarie
 
