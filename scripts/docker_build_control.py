@@ -236,7 +236,11 @@ class BuildControl:
         args.extend(["--user", "0:0" if initialize else "65532:65532"])
         if initialize:
             args.extend(["--cap-add", "CHOWN", "--cap-add", "FOWNER", "--cap-add", "DAC_OVERRIDE"])
-        for key, value in self.labels.items():
+        # Source labels authenticate this short-lived helper as part of the
+        # selected group. Keep them separate from volume labels: adding a new
+        # container proof must not invalidate an existing persistent cache.
+        from docker_compose_identity import source_labels
+        for key, value in {**self.labels, **source_labels(self.identity)}.items():
             args.extend(["--label", key + "=" + value])
         if name:
             args.extend(["--name", name])

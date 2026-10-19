@@ -210,7 +210,7 @@ class VolumeReceiptTests(unittest.TestCase):
         import json
         from subprocess import CompletedProcess
         import docker_volume_dev as dev
-        control = BuildControl({'project_name': 'fullmag-master', 'worktree_id': 'owned'}, 'sha256:' + 'a' * 64)
+        control = BuildControl({'project_name': 'fullmag-master', 'worktree_id': 'owned', 'project_id': 'test-project', 'checkout_kind': 'master'}, 'sha256:' + 'a' * 64)
         key = 'b' * 64
         name = 'fullmag-dev-frontend-v1-' + key[:24]
         labels = {k: v for k, v in control.labels.items() if k.startswith('org.fullmag.')}
@@ -223,7 +223,7 @@ class VolumeReceiptTests(unittest.TestCase):
             docker.assert_called_once_with('volume', 'inspect', name, allow_failure=True)
 
     def test_build_control_accepts_canonical_bootstrap_labels_and_rejects_foreign_project(self):
-        identity = {'project_name': 'fullmag-master', 'worktree_id': 'test-worktree'}
+        identity = {'project_name': 'fullmag-master', 'worktree_id': 'test-worktree', 'project_id': 'test-project', 'checkout_kind': 'master'}
         control = BuildControl(identity, 'sha256:' + 'a' * 64)
         volume = {'Name': control.volume, 'Driver': 'local', 'Options': None,
                   'Labels': dict(control.shared_labels)}

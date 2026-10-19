@@ -413,3 +413,11 @@ Nie uznawać samego istnienia named volumes za dowód ograniczonego wzrostu dysk
 - Poprawka dopuszcza wyłącznie konkretny zweryfikowany helper trzymanej
   operacji; wszystkie inne kontenery i obce sieci nadal blokują start.
   Rzeczywisty build/API/Solve pozostają NOT VERIFIED do kolejnej próby.
+
+- Próba `0ce695d030f54b6892187f8fe2830476` wykazała brak source project-id
+  i checkout-kind w etykietach helpera. Dodano je wyłącznie do kontenerów
+  pomocniczych, bez zmiany etykiet/tożsamości istniejących wolumenów.
+  Regresje receipts: 16/16 PASS; guard: 5/5 PASS. Rzeczywisty guard pod lease
+  przeszedł (`guard-inspection/attempts/ed109e6d99614653b151f172592af713`).
+  Owner, dane aplikacji i cache pozostały bez zmian; build aplikacji nadal
+  nie rozpoczął się w tych próbach.
