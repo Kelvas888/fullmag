@@ -2015,7 +2015,9 @@ fn profile_catalog_error(message: String) -> ApiError {
 mod tests {
     use super::{
         accepted_frontier_preparation_is_ready, bounded_gpu_relaxation_algorithm,
-        request_accepted_stop_for_catalog, validate_scene_revision_and_content,
+        bounded_recovery_error, request_accepted_stop_for_catalog,
+        validate_scene_revision_and_content, AcceptedLiveStudyExecution,
+        AcceptedLiveStudyPreparationError, MAX_RECOVERY_ERROR_CHARS,
     };
 
     #[test]
