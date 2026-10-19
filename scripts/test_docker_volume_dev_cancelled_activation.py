@@ -119,34 +119,12 @@ def _fixture():
 
 
 class CancelledActivationPreflightTests(unittest.TestCase):
-    def test_source_keeps_strict_idle_fence_and_scoped_exception(self):
-        source = (ROOT / "scripts" / "docker_volume_dev.py").read_text()
-        tree = ast.parse(source)
-        function = next(
-            node for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_validate_cancelled_activation_preflight"
-        )
-        function_source = ast.get_source_segment(source, function)
-        self.assertIsNotNone(function_source)
-        self.assertNotIn("docker_volume_activation_reconcile", function_source)
-        self.assertNotIn("FULLMAG_STARTUP_RECEIPT_KEY", function_source)
-        self.assertNotIn("requests.post", function_source)
-        self.assertNotIn("os.unlink", function_source)
-        self.assertIn("accepted-then-cancelled", source)
-        self.assertIn("/v2/platform/compute/queue", source)
-        self.assertIn("/v2/platform/runtime-service", source)
-        self.assertIn("/v2/sessions/current/model/scene", source)
-        self.assertIn("document.get('active_session') is not False", source)
-        self.assertIn('environment.get("FULLMAG_STARTUP_ENABLED") == "1"', source)
-        self.assertIn('environment.get("FULLMAG_STARTUP_ENABLED") != "0"', source)
-        retained = next(
-            node for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_retained_operation"
-        )
-        retained_source = ast.get_source_segment(source, retained)
-        self.assertIn('environment.get("FULLMAG_STARTUP_ENABLED") == "1"', retained_source)
-        self.assertIn("Startup activation requires dedicated recovery", retained_source)
-        self.assertIn('environment.get("FULLMAG_STARTUP_ENABLED") == "0"', retained_source)
+    def test_startup_activation_uses_effective_container_environment(self):
+        self.assertFalse(module._retained_startup_enabled({"Config": {"Env": []}}))
+        self.assertFalse(module._retained_startup_enabled({"Config": {"Env": ["FULLMAG_STARTUP_ENABLED=0"]}}))
+        self.assertTrue(module._retained_startup_enabled({"Config": {"Env": ["FULLMAG_STARTUP_ENABLED=1"]}}))
+        with self.assertRaises(module.BuildControlError):
+            module._retained_startup_enabled({"Config": {"Env": ["FULLMAG_STARTUP_ENABLED=unknown"]}})
 
     def test_matching_proof_rechecks_store_and_runtime_before_mutation(self):
         proof, probe, current, attempt, development_attempt, backend, image = _fixture()

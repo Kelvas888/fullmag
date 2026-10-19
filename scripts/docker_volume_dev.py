@@ -1569,6 +1569,15 @@ def _validate_cancelled_activation_preflight(
     return {"proof_sha256": proof_sha256, "probe": fresh_probe, "runtime": fresh_probe}
 
 
+def _retained_startup_enabled(container):
+    """Match the image entrypoint's opt-in startup rule using effective env."""
+    environment = dict(item.split("=", 1) for item in container.get("Config", {}).get("Env", []) if "=" in item)
+    value = environment.get("FULLMAG_STARTUP_ENABLED", "0")
+    if value not in {"0", "1"}:
+        raise BuildControlError("Retained startup activation setting is invalid")
+    return value == "1"
+
+
 def restart_idle(args):
     return _retained_operation(args, recreate_services=False, restart_idle_service=True)
 
@@ -1688,10 +1697,10 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False):
         if json.loads(read_owned_regular(state / ".fullmag-windows-folder-owner.json")) != certificate:
             raise BuildControlError("Retained Windows owner/certificate differs")
         environment = document["services"]["backend"]["environment"]
-        if environment.get("FULLMAG_STARTUP_ENABLED") == "1":
+        startup_enabled = _retained_startup_enabled(actual["backend"])
+        if startup_enabled:
             raise BuildControlError("Startup activation requires dedicated recovery; idle restart will not repeat Solve")
-        if (environment.get("FULLMAG_STARTUP_ENABLED") == "0"
-                and _read_cancelled_activation_bytes(control, "active", optional=True) is not None):
+        if _read_cancelled_activation_bytes(control, "active", optional=True) is not None:
             raise BuildControlError("Original accepted activation helper still holds the control lease")
         cache = control.read(previous_root + "/backend-cache.json")
         import docker_backend_volume_cache as cache_adapter
@@ -1736,7 +1745,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     raise BuildControlError("Backend health is not ready; idle restart refused")
                 active_session = health.get("active_session")
                 if active_session is True:
-                    if environment.get("FULLMAG_STARTUP_ENABLED") != "0":
+                    if startup_enabled:
                         raise BuildControlError("Backend has an active session; idle restart refused")
                     cancelled_activation = _validate_cancelled_activation_preflight(
                         control, previous_root, previous, document, selected, args.config_sha256,
