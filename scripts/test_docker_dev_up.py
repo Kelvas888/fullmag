@@ -266,6 +266,75 @@ class DockerDevUpReconciliationTests(unittest.TestCase):
             with self.assertRaisesRegex(docker_dev_up.BuildInputDrift, "image-backend"):
                 self._build_input_match_impl(group)
 
+    def test_toolchain_receipt_updated_before_up_recreates_old_authenticated_chain(self):
+        group = _group()
+        old_toolchain_image = "sha256:" + "4" * 64
+        current_toolchain_image = "sha256:" + "5" * 64
+        development_image = "sha256:" + "6" * 64
+        backend_image = "sha256:" + "7" * 64
+        toolchain_inputs = {
+            "source_inputs": [{"path": "docker/fem-gpu/Dockerfile", "sha256": "a" * 64}],
+            "build_args": {"FULLMAG_CUDA_BASE_IMAGE": "cuda@sha256:" + "8" * 64},
+            "target": "fem-gpu-dev",
+        }
+        development_inputs = {
+            "parent_image_id": old_toolchain_image,
+            "files": [{"path": "docker/all-in-one/Dockerfile.dev", "sha256": "b" * 64}],
+        }
+        backend_inputs = {
+            "parent_image_id": development_image,
+            "files": [{"path": "docker/all-in-one/Dockerfile.backend", "sha256": "c" * 64}],
+        }
+
+        def receipt(phase, image, inputs):
+            return {
+                "phase": phase,
+                "state": "succeeded",
+                "compose_project": "fullmag-master",
+                "image_id": image,
+                "source_digest": hashlib.sha256(
+                    docker_dev_up.canonical(inputs)
+                ).hexdigest(),
+                "inputs": inputs,
+            }
+
+        records = {
+            "toolchain/verified.json": receipt(
+                "toolchain", current_toolchain_image, toolchain_inputs
+            ),
+            "image-dev/verified.json": receipt(
+                "image-dev", development_image, development_inputs
+            ),
+            "image-backend/verified.json": receipt(
+                "image-backend", backend_image, backend_inputs
+            ),
+        }
+        group = docker_dev_up.RetainedGroup(
+            **{
+                **vars(group),
+                "backend": {
+                    **group.backend,
+                    "Image": backend_image,
+                    "Config": {
+                        "Env": [
+                            "FULLMAG_TOOLCHAIN_IMAGE_ID=" + old_toolchain_image,
+                            "FULLMAG_RUNTIME_IMAGE_ID=" + backend_image,
+                        ]
+                    },
+                },
+                "control": Mock(),
+            }
+        )
+        group.control.read.side_effect = lambda path, optional=False: records.get(path)
+        with patch.object(docker_dev_up, "_toolchain_identity", return_value=toolchain_inputs), \
+                patch.object(
+                    docker_dev_up,
+                    "_image_input_manifest",
+                    side_effect=[development_inputs["files"], backend_inputs["files"]],
+                ):
+            with self.assertRaisesRegex(docker_dev_up.BuildInputDrift, "toolchain"):
+                self._build_input_match_impl(group)
+
     def test_missing_build_receipt_blocks_reuse_instead_of_guessing(self):
         group = _group()
         group.control.read.return_value = None

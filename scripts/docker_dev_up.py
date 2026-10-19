@@ -859,7 +859,8 @@ def _build_inputs_match(group: RetainedGroup) -> bool:
         not isinstance(toolchain_inputs.get("source_inputs"), list)
         or not isinstance(development_inputs.get("files"), list)
         or not isinstance(backend_inputs.get("files"), list)
-        or development_inputs.get("parent_image_id") != toolchain_image
+        or not IMAGE_ID_RE.fullmatch(str(development_inputs.get("parent_image_id", "")))
+        or not IMAGE_ID_RE.fullmatch(str(backend_inputs.get("parent_image_id", "")))
         or backend_inputs.get("parent_image_id") != development_image
     ):
         raise BuildInputUnknown("Retained Docker build receipt lineage is not authenticated")
@@ -869,8 +870,9 @@ def _build_inputs_match(group: RetainedGroup) -> bool:
             "Retained backend image is not bound to image-backend/verified.json"
         )
     environment = _backend_environment(group.backend)
+    retained_toolchain_image = development_inputs.get("parent_image_id")
     if (
-        environment.get("FULLMAG_TOOLCHAIN_IMAGE_ID") != toolchain_image
+        environment.get("FULLMAG_TOOLCHAIN_IMAGE_ID") != retained_toolchain_image
         or environment.get("FULLMAG_RUNTIME_IMAGE_ID") != backend_image
     ):
         raise BuildInputUnknown(
@@ -878,9 +880,15 @@ def _build_inputs_match(group: RetainedGroup) -> bool:
         )
 
     changed: list[str] = []
+    if retained_toolchain_image != toolchain_image:
+        # The latest toolchain receipt is the desired build input, while the
+        # retained dev/backend receipts may still form a valid older chain.
+        # That is an authenticated rebuild requirement, not an unknown receipt.
+        changed.append("toolchain")
     current_toolchain = _toolchain_identity(group)
     if hashlib.sha256(canonical(current_toolchain)).hexdigest() != toolchain["source_digest"]:
-        changed.append("toolchain")
+        if "toolchain" not in changed:
+            changed.append("toolchain")
     from docker_dev import BASE_CONTEXT_FILES, RUNTIME_IMAGE_CONTEXT_FILES
 
     current_development = {
