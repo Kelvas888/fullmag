@@ -399,9 +399,10 @@ class DockerDevUpReconciliationTests(unittest.TestCase):
 
     def test_stopped_helper_drift_recreates_managed_group_before_activation(self):
         group = _group(backend_running=False, frontend_running=False)
+        refreshed = _group()
         args = _args(script=Path("examples/model.py"))
         drift = docker_dev_up.ImageHelperDrift(["backend_dev.py"])
-        with patch.object(docker_dev_up, "_discover_group", return_value=group), \
+        with patch.object(docker_dev_up, "_discover_group", side_effect=[group, refreshed]), \
                 patch.object(docker_dev_up, "_script_output_mapping_matches", return_value=True), \
                 patch.object(docker_dev_up, "_image_helpers_match", side_effect=drift), \
                 patch("docker_volume_dev.recreate") as recreate, \
@@ -415,6 +416,67 @@ class DockerDevUpReconciliationTests(unittest.TestCase):
         self.assertEqual(recreate_args.attempt, group.attempt)
         self.assertEqual(recreate_args.config_sha256, group.config_sha256)
         activate.assert_called_once()
+
+    def test_recreated_group_uses_new_pins_for_repeated_activation_fence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "model.py").write_text("VALUE = 1\n", encoding="utf-8")
+            group = docker_dev_up.RetainedGroup(
+                **{
+                    **vars(_group(backend_running=False, frontend_running=False)),
+                    "repo_root": source,
+                    "source_root": source,
+                }
+            )
+            refreshed = docker_dev_up.RetainedGroup(
+                **{
+                    **vars(_group()),
+                    "repo_root": source,
+                    "source_root": source,
+                    "attempt": "e" * 32,
+                    "config_sha256": "f" * 64,
+                }
+            )
+            args = _args(script=Path("model.py"), request_id=None)
+            with patch("fullmag_storage.git", return_value="a" * 40), \
+                    patch.object(
+                        docker_dev_up,
+                        "_discover_group",
+                        side_effect=[group, refreshed, refreshed],
+                    ), \
+                    patch.object(docker_dev_up, "_script_output_mapping_matches", return_value=True), \
+                    patch.object(
+                        docker_dev_up,
+                        "_image_helpers_match",
+                        side_effect=[docker_dev_up.ImageHelperDrift(["backend_dev.py"]), True],
+                    ), \
+                    patch.object(docker_dev_up, "_source_matches", return_value=True), \
+                    patch("docker_volume_dev.recreate"), \
+                    patch("docker_volume_dev.resume"), \
+                    patch("docker_dev_defaults.activate_discovered") as activate:
+                docker_dev_up.ensure_up(args)
+                docker_dev_up.ensure_up(args)
+                expected_request_id = docker_dev_up._stable_activation_request_id(refreshed, args)
+                stale_request_id = docker_dev_up._stable_activation_request_id(group, args)
+            request_ids = [call.args[0].request_id for call in activate.call_args_list]
+            self.assertEqual(len(request_ids), 2)
+            self.assertEqual(request_ids[0], request_ids[1])
+            self.assertEqual(request_ids[0], expected_request_id)
+            self.assertNotEqual(request_ids[0], stale_request_id)
+
+    def test_recreate_disappeared_group_withholds_activation(self):
+        group = _group()
+        drift = docker_dev_up.ScriptOutputMappingDrift("output directory changed")
+        with patch.object(docker_dev_up, "_discover_group", side_effect=[group, None]), \
+                patch.object(docker_dev_up, "_script_output_mapping_matches", side_effect=drift), \
+                patch("docker_volume_dev.stop_idle", create=True) as stop_idle, \
+                patch("docker_volume_dev.recreate") as recreate, \
+                patch("docker_dev_defaults.activate_discovered") as activate:
+            with self.assertRaisesRegex(docker_dev_up.DockerDevUpError, "disappeared"):
+                docker_dev_up.ensure_up(_args(script=Path("examples/model.py")))
+        stop_idle.assert_called_once()
+        recreate.assert_called_once()
+        activate.assert_not_called()
 
     def test_running_helper_drift_drains_then_recreates_managed_group(self):
         group = _group()
@@ -467,8 +529,9 @@ class DockerDevUpReconciliationTests(unittest.TestCase):
 
     def test_stopped_script_output_mapping_drift_recreates_without_resume(self):
         group = _group(backend_running=False, frontend_running=False)
+        refreshed = _group()
         drift = docker_dev_up.ScriptOutputMappingDrift("output directory changed")
-        with patch.object(docker_dev_up, "_discover_group", return_value=group), \
+        with patch.object(docker_dev_up, "_discover_group", side_effect=[group, refreshed]), \
                 patch.object(docker_dev_up, "_script_output_mapping_matches", side_effect=drift), \
                 patch.object(docker_dev_up, "_image_helpers_match") as image_helpers, \
                 patch("docker_volume_dev.recreate") as recreate, \

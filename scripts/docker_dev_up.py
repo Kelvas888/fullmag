@@ -1110,7 +1110,18 @@ def _recreate_after_drift(group: RetainedGroup, args: argparse.Namespace, *, dra
 
         stop_idle(_lifecycle_args(group, args, script=None))
     recreate(_lifecycle_args(group, args, script=None))
-    _activate_if_requested(group, args)
+    refreshed = _discover_group(args)
+    if refreshed is None:
+        raise DockerDevUpError(
+            "DEV group disappeared after managed recreate; activation outcome is unknown"
+        )
+    if _service_mode(refreshed) != "running-healthy":
+        raise DockerDevUpError(
+            "Managed recreate did not leave a healthy backend/frontend group; "
+            "activation is withheld"
+        )
+    _qualify_running_runtime(refreshed)
+    _activate_if_requested(refreshed, args)
 
 
 def _reconcile_group(group: RetainedGroup, args: argparse.Namespace) -> None:
