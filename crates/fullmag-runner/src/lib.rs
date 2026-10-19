@@ -1970,7 +1970,7 @@ fn require_supported_mixed_v2_runtime_scope(
     if problem
         .field_drives
         .iter()
-        .any(|drive| crate::util::field_drive_is_active(drive, problem))
+        .any(|drive| crate::time_events::resolved_field_drive_is_active(drive, &fem.time_stage))
     {
         failed_predicates.push("v2_regional_field_drive_not_bound_by_certificate");
     }
