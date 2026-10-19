@@ -79,6 +79,7 @@ dokładnie tę samą autoryzację i jej metadane po ponownej walidacji pod bloka
 Nie tworzy nowej autoryzacji ani nie powtarza Solve; runtime nadal sprawdza
 aktualnego ownera i pełne dowody. Taka próba wymaga zachowania oryginalnego
 storage sesji, więc `fresh_state=true` jest odrzucane.
+Nadzór startu odczytuje receipt PID 1 przez kanoniczne `runtime_service.process_receipt_path(canonical_paths())`, z technicznego wolumenu runtime-control. Potwierdzony `failed_outcome_retained` przerywa oczekiwanie na gotowość; nie czeka na pełny timeout i nie ponawia Solve.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
 
 ### Aktywacja skryptu w już działającym Workspace

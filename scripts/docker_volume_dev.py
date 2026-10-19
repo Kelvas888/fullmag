@@ -17,6 +17,17 @@ from docker_build_control import (BuildControl, BuildControlError, canonical, do
                                   compose_capture, build_volume_toolchain, build_volume_runtime_images, bounded_capture)
 
 
+_PROCESS_RECEIPT_PROBE = """import json,pathlib,sys
+sys.path.insert(0,'/opt/fullmag')
+import runtime_service
+try:
+ raw=runtime_service._bounded_regular(runtime_service.process_receipt_path(runtime_service.canonical_paths()),'process receipt')
+except FileNotFoundError:
+ print(json.dumps({'state':'not-published'}))
+else:
+ print(raw.decode('utf-8'))
+"""
+
 _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES = (
     Path("runs"),
     Path("runs/docker-all"),
@@ -959,16 +970,6 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     control.write(operation["root"] + "/host-ledger-attestation.json", ledger_attestation)
     # Observe the existing incarnations; a readiness check must never run up
     # again or wait an hour after the supervisor has already closed admission.
-    process_script = """import json,pathlib,sys
-sys.path.insert(0,'/opt/fullmag')
-import runtime_service
-try:
- raw=runtime_service._bounded_regular(pathlib.Path('/state/.fullmag/runtime-service/process-tree.json'),'process receipt')
-except FileNotFoundError:
- print(json.dumps({'state':'not-published'}))
-else:
- print(raw.decode('utf-8'))
-"""
     image_config = json.loads(docker_text("image", "inspect", image))[0]["Config"]
     readiness_deadline = time.monotonic() + 3900
     while time.monotonic() < readiness_deadline:
@@ -978,7 +979,7 @@ else:
                 expected_started_at=operation["receipt"]["backend_started_at"] if service == "backend" else None)
             if not observed.get("State", {}).get("Running"):
                 raise BuildControlError("DEV service exited before readiness: " + service)
-        process_receipt = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", process_script))
+        process_receipt = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", _PROCESS_RECEIPT_PROBE))
         if str(process_receipt.get("state", "")).startswith("failed"):
             logs = docker_text("logs", "--since", operation["receipt"]["backend_started_at"],
                                "--tail", "100", backend_id, combined=True)
