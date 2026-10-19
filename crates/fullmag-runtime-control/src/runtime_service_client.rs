@@ -4,8 +4,10 @@ use anyhow::{bail, Context, Result};
 use crate::process_environment::remove_local_compute_operator_token;
 use fullmag_session::{
     repository_path::checked_path,
+    host_resource_ledger::DockerNamespaceTeardownAttestation,
     runtime_service::{
-        validate_descriptor, RuntimeServiceConfig, RuntimeServiceLaunchGuard,
+        validate_descriptor, RuntimeServiceConfig, RuntimeServiceContainerRecoveryReceipt,
+        RuntimeServiceContainerRecoveryRequest, RuntimeServiceLaunchGuard,
         RuntimeServiceOwnerDescriptor, RuntimeServiceRecoveryReceipt,
         RuntimeServiceRecoveryRequest, RuntimeServiceState,
         RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH,
@@ -112,6 +114,141 @@ pub fn recover_unknown_empty(
         executor.git_commit,
         executor.source_snapshot_sha256,
     )
+}
+
+/// Execute the explicitly authorized recovery of one pinned stopped Docker
+/// namespace. The request and teardown attestation are read through bounded
+/// regular-file guards, reread unchanged, and passed to the native recovery
+/// method without starting an API or retrying Solve.
+pub fn recover_container_empty(
+    configuration_path: &Path,
+    request_path: &Path,
+    expected_request_sha256: &str,
+    attestation_path: &Path,
+    expected_attestation_sha256: &str,
+) -> Result<RuntimeServiceContainerRecoveryReceipt> {
+    if expected_request_sha256.len() != 64
+        || !expected_request_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("container recovery requires a lowercase request SHA-256");
+    }
+    if expected_attestation_sha256.len() != 64
+        || !expected_attestation_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("container recovery requires a lowercase attestation SHA-256");
+    }
+    let (configuration_bytes, configuration_sha256) =
+        read_stable_container_recovery_document(
+            configuration_path,
+            64 * 1024,
+            "container recovery configuration",
+        )?;
+    let (request_bytes, request_sha256) = read_stable_container_recovery_document(
+        request_path,
+        256 * 1024,
+        "container recovery request",
+    )?;
+    let (attestation_bytes, _) = read_stable_container_recovery_document(
+        attestation_path,
+        256 * 1024,
+        "container recovery attestation",
+    )?;
+    if request_sha256 != expected_request_sha256 {
+        bail!("container recovery request differs from the operator SHA-256 pin");
+    }
+    let candidate: RuntimeServiceConfig = serde_json::from_slice(&configuration_bytes)
+        .context("parse container recovery configuration")?;
+    candidate.validate()?;
+    let request: RuntimeServiceContainerRecoveryRequest =
+        serde_json::from_slice(&request_bytes).context("parse container recovery request")?;
+    request.validate()?;
+    if request.config_sha256 != configuration_sha256 {
+        bail!("container recovery configuration differs from the request pin");
+    }
+    let attestation: DockerNamespaceTeardownAttestation =
+        serde_json::from_slice(&attestation_bytes).context("parse container recovery attestation")?;
+    attestation.validate_without_request()?;
+    let attestation_sha256 = attestation.sha256()?;
+    if attestation_sha256 != expected_attestation_sha256 {
+        bail!("container recovery attestation differs from the operator SHA-256 pin");
+    }
+
+    let (stable_configuration_bytes, stable_configuration_sha256) =
+        read_stable_container_recovery_document(
+            configuration_path,
+            64 * 1024,
+            "container recovery configuration",
+        )?;
+    let (stable_request_bytes, stable_request_sha256) = read_stable_container_recovery_document(
+        request_path,
+        256 * 1024,
+        "container recovery request",
+    )?;
+    let (stable_attestation_bytes, _) = read_stable_container_recovery_document(
+        attestation_path,
+        256 * 1024,
+        "container recovery attestation",
+    )?;
+    if stable_configuration_bytes != configuration_bytes
+        || stable_configuration_sha256 != configuration_sha256
+        || stable_request_bytes != request_bytes
+        || stable_request_sha256 != request_sha256
+        || stable_attestation_bytes != attestation_bytes
+    {
+        bail!("container recovery authorization changed during admission");
+    }
+
+    let store = fullmag_session::SessionStore::open_existing(candidate.store_root.clone())?;
+    let executor = fullmag_build_info::identity();
+    RuntimeServiceConfig::recover_container_empty(
+        &store,
+        &candidate,
+        &configuration_bytes,
+        &request,
+        &request_sha256,
+        &attestation,
+        executor.git_commit,
+        executor.source_snapshot_sha256,
+    )
+}
+
+fn read_stable_container_recovery_document(
+    path: &Path,
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<(Vec<u8>, String)> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("{label} path must be absolute without parent traversal");
+    }
+    let parent = path.parent().context("container recovery document has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("container recovery document name is not UTF-8")?;
+    let first = fullmag_session::repository_path::read_bounded_regular_file(
+        parent,
+        name,
+        maximum_bytes,
+    )
+    .with_context(|| format!("read {label}"))?;
+    let second = fullmag_session::repository_path::read_bounded_regular_file(
+        parent,
+        name,
+        maximum_bytes,
+    )
+    .with_context(|| format!("re-read {label}"))?;
+    if first != second {
+        bail!("{label} changed during admission");
+    }
+    Ok((first.clone(), fullmag_session::hex_sha256(&first)))
 }
 
 fn read_recovery_request(
