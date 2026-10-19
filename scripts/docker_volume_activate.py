@@ -17,7 +17,6 @@ from pathlib import Path
 import re
 import sys
 
-import docker_startup_script as startup
 import fullmag_storage as storage
 from docker_build_control import (
     BuildControl,
@@ -34,7 +33,6 @@ ATTEMPT_RE = re.compile(r"^[0-9a-f]{32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 CONTROL_ROOT = "/opt/fullmag/control"
-ACTIVATE_TIMEOUT_SECONDS = int(startup.STARTUP_ACTIVATION_TIMEOUT_SECONDS) + 60
 ACTIVATE_EXIT_UNKNOWN = 75
 
 # This is an image-owned, constant wrapper.  User input is supplied only via
@@ -102,60 +100,47 @@ def _docker_text(*args: str, timeout: int = 90, combined: bool = False) -> str:
     return payload.decode("utf-8", "replace")
 
 
-def _request_id(attempt: str, source_sha256: str, explicit: str | None) -> str:
+def _helper_error_type(startup_helper):
+    error_type = getattr(startup_helper, "StartupScriptError", None)
+    if not isinstance(error_type, type) or not issubclass(error_type, Exception):
+        raise BuildControlError("Selected startup helper has no valid error contract")
+    return error_type
+
+
+def _request_id(startup_helper, attempt: str, source_sha256: str, explicit: str | None) -> str:
     if explicit is not None:
         try:
-            return startup._validate_request_id(explicit)
-        except startup.StartupScriptError as error:
+            return startup_helper._validate_request_id(explicit)
+        except _helper_error_type(startup_helper) as error:
             raise BuildControlError(str(error)) from error
     return f"docker-volume-{attempt}-{source_sha256[:16]}"
 
 
-def _authorization_bytes(authorization: Mapping[str, object]) -> bytes:
+def _authorization_bytes(startup_helper, authorization: Mapping[str, object]) -> bytes:
     try:
-        payload = startup._json_payload(
+        payload = startup_helper._json_payload(
             authorization,
-            startup.MAX_PROVENANCE_BYTES,
+            startup_helper.MAX_PROVENANCE_BYTES,
             "startup provenance",
         )
-    except (TypeError, ValueError, startup.StartupScriptError) as error:
+    except (TypeError, ValueError) as error:
+        raise BuildControlError(str(error)) from error
+    except _helper_error_type(startup_helper) as error:
         raise BuildControlError(str(error)) from error
     return payload
 
 
-def _image_helper_hashes(backend_id: str) -> dict[str, str]:
-    names = ("docker_startup_script.py", "fullmag_storage.py")
-    result = docker_capture(
-        "exec",
-        backend_id,
-        "sha256sum",
-        *["/opt/fullmag/" + name for name in names],
-        timeout=90,
-    )
-    hashes: dict[str, str] = {}
-    for line in result.stdout.decode("utf-8", "replace").splitlines():
-        fields = line.split()
-        if len(fields) != 2 or not SHA256_RE.fullmatch(fields[0]):
-            raise BuildControlError("Backend startup-helper attestation is malformed")
-        name = Path(fields[1]).name
-        if fields[1] != "/opt/fullmag/" + name or name not in names:
-            raise BuildControlError("Backend startup-helper inventory differs")
-        hashes[name] = fields[0]
-    if set(hashes) != set(names):
-        raise BuildControlError("Backend startup-helper inventory is incomplete")
-    return hashes
-
-
-def _validate_selected_helpers(selected: Path, hashes: Mapping[str, str]) -> None:
-    import fullmag_docker_runtime as runtime
-
-    for name, expected in hashes.items():
-        source = selected / "scripts" / name
-        _data, matches, observed = runtime._verified_startup_helper(source, expected)
-        if not matches:
-            raise BuildControlError(
-                f"Startup helper changed since the retained image was prepared: {name} ({observed})"
-            )
+def _activation_contract(startup_helper) -> tuple[float, str]:
+    timeout = getattr(startup_helper, "STARTUP_ACTIVATION_TIMEOUT_SECONDS", None)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3600:
+        raise BuildControlError("Selected startup helper has an invalid activation timeout")
+    marker = getattr(startup_helper, "ACTIVATION_RECEIPT_PATH", None)
+    if not isinstance(marker, (str, Path)):
+        raise BuildControlError("Selected startup helper has no activation receipt path")
+    marker = str(marker)
+    if not marker.startswith("/") or "\x00" in marker or len(marker) > 1024:
+        raise BuildControlError("Selected startup helper has an invalid activation receipt path")
+    return float(timeout) + 60, marker
 
 
 def _one_container(document: Mapping[str, object], service: str) -> str:
@@ -173,16 +158,25 @@ def _validate_running_group(
     terminal: Mapping[str, object],
     image: str,
 ) -> tuple[str, str]:
+    if not isinstance(document, Mapping):
+        raise BuildControlError("Retained Compose configuration is not an object")
+    if not isinstance(terminal, Mapping):
+        raise BuildControlError("Retained runtime terminal is not an object")
     if document.get("name") != control.project:
         raise BuildControlError("Retained Compose project differs from the selected group")
     if not IMAGE_ID_RE.fullmatch(image):
         raise BuildControlError("Retained backend image is not immutable")
     from docker_volume_dev import _validate_retained_service
 
+    services = document.get("services")
+    if not isinstance(services, Mapping):
+        raise BuildControlError("Retained Compose services are not an object")
     ids: dict[str, str] = {}
     for service in ("backend", "frontend"):
-        service_document = document.get("services", {}).get(service)
-        service_image = service_document.get("image") if isinstance(service_document, dict) else None
+        service_document = services.get(service)
+        if not isinstance(service_document, Mapping):
+            raise BuildControlError(f"Retained {service} service configuration is not an object")
+        service_image = service_document.get("image")
         if not isinstance(service_image, str) or not IMAGE_ID_RE.fullmatch(service_image):
             raise BuildControlError(f"Retained {service} image is not immutable")
         if service == "backend" and service_image != image:
@@ -214,14 +208,22 @@ def _validate_running_group(
             raise BuildControlError(f"Retained {service} is not running")
         ids[service] = identifier
 
-    backend_mounts = document["services"]["backend"].get("volumes", [])
+    backend_document = services.get("backend")
+    if not isinstance(backend_document, Mapping):
+        raise BuildControlError("Retained backend service configuration is not an object")
+    backend_mounts = backend_document.get("volumes", [])
+    if not isinstance(backend_mounts, list) or any(
+        not isinstance(mount, Mapping) for mount in backend_mounts
+    ):
+        raise BuildControlError("Retained backend volume declarations are not objects")
     source_mount = next(
         (mount for mount in backend_mounts if mount.get("target") == "/opt/fullmag/source"),
         None,
     )
-    if not isinstance(source_mount, dict) or source_mount.get("type") != "bind" or not source_mount.get("read_only"):
+    if not isinstance(source_mount, Mapping) or source_mount.get("type") != "bind" or not source_mount.get("read_only"):
         raise BuildControlError("Retained backend source is not a readonly bind")
-    if document["services"]["backend"].get("environment", {}).get("FULLMAG_SOURCE_ROOT") is None:
+    environment = backend_document.get("environment", {})
+    if not isinstance(environment, Mapping) or environment.get("FULLMAG_SOURCE_ROOT") is None:
         raise BuildControlError("Retained backend source identity is missing")
     if (
         json.loads(_docker_text("inspect", ids["backend"]))[0]
@@ -246,6 +248,8 @@ def _validate_linked_runtime_terminal(
 ) -> None:
     if not isinstance(terminal, Mapping):
         raise BuildControlError("Linked runtime terminal is not an object")
+    if not isinstance(original, Mapping):
+        raise BuildControlError("Original runtime terminal is not an object")
     if terminal.get("phase") != phase or terminal.get("state") != "succeeded":
         raise BuildControlError("Linked runtime terminal is not a succeeded " + phase)
     if terminal.get("compose_project") != original.get("compose_project"):
@@ -303,6 +307,8 @@ def _linked_runtime_terminals(
     image: str,
     config_sha256: str,
 ) -> list[Mapping[str, object]]:
+    if not isinstance(original, Mapping):
+        raise BuildControlError("Original DEV terminal is not an object")
     state = original.get("state")
     if state == "succeeded":
         return [original]
@@ -369,6 +375,8 @@ def _run_fixed_activation(
     provenance_path: str,
     provenance_sha256: str,
     helper_sha256: str,
+    activation_timeout_seconds: float,
+    activation_receipt_path: str,
 ) -> dict[str, object]:
     environment = (
         "FULLMAG_STARTUP_ENABLED=1",
@@ -387,7 +395,7 @@ def _run_fixed_activation(
         "-B",
         "-c",
         FIXED_ACTIVATION_SCRIPT,
-        timeout=ACTIVATE_TIMEOUT_SECONDS,
+        timeout=activation_timeout_seconds,
         allow_failure=True,
     )
     output = result.stdout + result.stderr
@@ -405,7 +413,7 @@ def _run_fixed_activation(
         backend_id,
         "test",
         "-f",
-        str(startup.ACTIVATION_RECEIPT_PATH),
+        activation_receipt_path,
         timeout=30,
         allow_failure=True,
     )
@@ -436,6 +444,10 @@ def activate(args: argparse.Namespace) -> None:
     root = "development/attempts/" + args.attempt
     terminal = control.read(root + "/terminal.json")
     document = control.read(root + "/compose.json")
+    if not isinstance(terminal, Mapping):
+        raise BuildControlError("Retained DEV terminal is not an object")
+    if not isinstance(document, Mapping):
+        raise BuildControlError("Retained Compose configuration is not an object")
     if terminal.get("compose_project") != control.project:
         raise BuildControlError("Retained DEV attempt belongs to another Compose group")
     if hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256:
@@ -470,26 +482,28 @@ def activate(args: argparse.Namespace) -> None:
         detail = f": {validation_error}" if validation_error else ""
         raise BuildControlError("No linked runtime terminal matches the running Compose group" + detail)
 
-    helper_hashes = _image_helper_hashes(backend_id)
-    _validate_selected_helpers(selected, helper_hashes)
+    from docker_volume_dev import _startup_helper
+
+    startup_helper, helper_hashes = _startup_helper(control, selected, image)
+    activation_timeout_seconds, activation_receipt_path = _activation_contract(startup_helper)
     source_commit = storage.git(selected, "rev-parse", "HEAD")
     probe_request_id = args.request_id or f"docker-volume-{args.attempt}-probe"
-    authorization = startup.prepare(
+    authorization = startup_helper.prepare(
         selected,
         args.script,
         request_id=probe_request_id,
         source_commit=source_commit,
     )
-    request_id = _request_id(args.attempt, authorization.source_sha256, args.request_id)
+    request_id = _request_id(startup_helper, args.attempt, authorization.source_sha256, args.request_id)
     if request_id != authorization.request_id:
-        authorization = startup.prepare(
+        authorization = startup_helper.prepare(
             selected,
             args.script,
             request_id=request_id,
             source_commit=source_commit,
         )
     authorization_document = authorization.as_dict()
-    provenance = _authorization_bytes(authorization_document)
+    provenance = _authorization_bytes(startup_helper, authorization_document)
     provenance_sha256 = hashlib.sha256(provenance).hexdigest()
 
     inputs = {
@@ -521,6 +535,8 @@ def activate(args: argparse.Namespace) -> None:
                 provenance_path=CONTROL_ROOT + "/" + provenance_relative,
                 provenance_sha256=provenance_sha256,
                 helper_sha256=helper_hashes["docker_startup_script.py"],
+                activation_timeout_seconds=activation_timeout_seconds,
+                activation_receipt_path=activation_receipt_path,
             )
         except ControlOutcomeUnknown:
             raise

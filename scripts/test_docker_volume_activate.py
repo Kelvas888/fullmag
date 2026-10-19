@@ -21,10 +21,81 @@ class DockerVolumeActivationTests(unittest.TestCase):
     def test_default_request_fence_is_stable_and_bounded(self) -> None:
         attempt = "a" * 32
         digest = "b" * 64
-        first = activate._request_id(attempt, digest, None)
-        self.assertEqual(first, activate._request_id(attempt, digest, None))
+        helper = SimpleNamespace(StartupScriptError=ValueError)
+        first = activate._request_id(helper, attempt, digest, None)
+        self.assertEqual(first, activate._request_id(helper, attempt, digest, None))
         self.assertLessEqual(len(first), 128)
         self.assertEqual(first, "docker-volume-" + attempt + "-" + digest[:16])
+
+    def test_selected_helper_loader_uses_selected_prepare_contract(self) -> None:
+        """The worktree helper must supply prepare, even if the main helper differs."""
+        from docker_volume_dev import _startup_helper
+
+        selected_helper = (
+            "from pathlib import Path\n"
+            "class StartupScriptError(Exception):\n"
+            "    pass\n"
+            "MAX_PROVENANCE_BYTES = 1024\n"
+            "STARTUP_ACTIVATION_TIMEOUT_SECONDS = 17.0\n"
+            "ACTIVATION_RECEIPT_PATH = Path('/state/selected/activation.json')\n"
+            "def prepare(*args, **kwargs):\n"
+            "    return 'selected-helper'\n"
+        ).encode()
+        selected_storage = b"SELECTED_STORAGE = True\n"
+        with tempfile.TemporaryDirectory() as directory:
+            selected = Path(directory)
+            scripts = selected / "scripts"
+            scripts.mkdir()
+            (scripts / "docker_startup_script.py").write_bytes(selected_helper)
+            (scripts / "fullmag_storage.py").write_bytes(selected_storage)
+            startup_digest = hashlib.sha256(selected_helper).hexdigest()
+            storage_digest = hashlib.sha256(selected_storage).hexdigest()
+
+            class Control:
+                image = "helper-image"
+
+                def helper_args(self, command):
+                    return ["helper-image", command]
+
+            result = subprocess.CompletedProcess(
+                [], 0,
+                stdout=(
+                    f"{startup_digest}  /opt/fullmag/docker_startup_script.py\n"
+                    f"{storage_digest}  /opt/fullmag/fullmag_storage.py\n"
+                ).encode(),
+                stderr=b"",
+            )
+            with patch("docker_volume_dev.bounded_capture", return_value=result):
+                helper, hashes = _startup_helper(
+                    Control(), selected, "sha256:" + "a" * 64
+                )
+
+        main_helper = SimpleNamespace(prepare=lambda *args, **kwargs: "main-helper")
+        self.assertEqual(main_helper.prepare(), "main-helper")
+        self.assertEqual(helper.prepare(), "selected-helper")
+        self.assertEqual(hashes["docker_startup_script.py"], startup_digest)
+
+    def test_activation_contract_comes_from_selected_helper(self) -> None:
+        helper = SimpleNamespace(
+            STARTUP_ACTIVATION_TIMEOUT_SECONDS=17.0,
+            ACTIVATION_RECEIPT_PATH=Path("/state/selected/activation.json"),
+        )
+        self.assertEqual(
+            activate._activation_contract(helper),
+            (77.0, "/state/selected/activation.json"),
+        )
+
+    def test_non_object_receipts_fail_closed(self) -> None:
+        control = SimpleNamespace(project="fullmag-worktree-demo")
+        with self.assertRaises(BuildControlError):
+            activate._validate_running_group(
+                control, {}, [], {}, "sha256:" + "a" * 64
+            )
+        with self.assertRaises(BuildControlError):
+            activate._linked_runtime_terminals(
+                control, "a" * 32, [], source_root="C:/git/fullmag",
+                image="sha256:" + "a" * 64, config_sha256="b" * 64,
+            )
 
     def test_activation_output_accepts_only_terminal_json_state(self) -> None:
         payload = b"diagnostic\n" + json.dumps({"state": "activated"}).encode() + b"\n"

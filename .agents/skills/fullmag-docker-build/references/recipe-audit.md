@@ -114,8 +114,10 @@ wykonuje stały wrapper w istniejącym backendzie, bez Compose lifecycle,
 nowego kontenera aplikacji i przebudowy. Źródła są czytane z readonly bindu;
 autoryzacja i receipty pozostają w control volume. Piny oryginalnej próby
 mogą mieć powiązany, trwale zweryfikowany sukces resume/iteration. Wynik
-unknown nie jest automatycznie ponawiany. Weryfikacja źródeł: 9 lekkich
-regresji aktywacji i 6 granicy argv PASS; runtime **NOT VERIFIED**.
+unknown nie jest automatycznie ponawiany. Aktywacja ładuje zweryfikowane
+bajty helpera wybranego worktree, również gdy launcher pochodzi z głównego
+checkoutu. Weryfikacja źródeł: 12 lekkich regresji aktywacji i 6 granicy argv
+PASS; runtime **NOT VERIFIED**.
 
 - `justfile`: 7550 linii, 720560 bajtów, SHA256 `c96cc146411e61b4f5fa53399a9f849c76a775e4ccc6ca9b93f8ffaa17bb7f0f`.
 - `scripts/just_storage_shell.sh`: 913 linii, 64054 bajty, SHA256 `49d4ec057e09fb9d0efc9cdcb0939bddeaf12f4aad105b08c5947a67eb2114b2`.
