@@ -1180,6 +1180,34 @@ def _live_parse_status(raw: bytes) -> list[dict[str, object]]:
     return records
 
 
+def _live_untracked_script_output(relative: str) -> bool:
+    """Exclude only untracked result files in the operator-approved output directory.
+
+    Tracked fixtures never pass through this function and remain bound to the
+    package identity. New source code in the same directory is still dirty.
+    """
+    if os.environ.get("FULLMAG_SCRIPT_OUTPUT_ROOT") != "/opt/fullmag/script-output":
+        return False
+    configured = PurePosixPath(os.environ.get("FULLMAG_SCRIPT_OUTPUT_SOURCE_DIR", ""))
+    try:
+        directory = configured.relative_to(PurePosixPath("/opt/fullmag/source"))
+        if not directory.parts or ".." in directory.parts:
+            return False
+        child = PurePosixPath(relative).relative_to(directory)
+    except ValueError:
+        return False
+    parts = child.parts
+    if not parts:
+        return False
+    name = parts[-1].casefold()
+    return (
+        name.endswith((".fms", ".h5"))
+        or bool(re.fullmatch(r"\..+\.[0-9a-f-]{36}\.fms\.part", name))
+        or any(part.casefold().endswith((".zarr", ".results")) for part in parts[:-1])
+        or any(part == ".fullmag-tmp" for part in parts[:-1])
+    )
+
+
 def _live_untracked_records(raw: bytes) -> tuple[list[str], list[dict[str, object]]]:
     paths: list[str] = []
     records: list[dict[str, object]] = []
@@ -1190,6 +1218,8 @@ def _live_untracked_records(raw: bytes) -> tuple[list[str], list[dict[str, objec
             relative = _live_safe_relative(item.decode("utf-8"), "untracked source")
         except UnicodeDecodeError as error:
             raise BackendSourceError("cannot decode untracked source path") from error
+        if _live_untracked_script_output(relative):
+            continue
         paths.append(relative)
         records.append({"status": "??", "paths": [relative]})
     return paths, records

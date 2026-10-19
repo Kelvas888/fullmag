@@ -969,10 +969,13 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         _reassert_operator_probe_environment(document, operator_probe_record)
         for service in (backend, frontend):
             service["logging"] = {"driver": "local", "options": {"max-size": "10m", "max-file": "3"}}
+        from docker_script_output_mounts import configure as configure_script_output, validate as validate_script_output
+        configure_script_output(document, selected)
+        validate_script_output(document)
         # All writable bind destinations are runtime/user stores, never build data.
         for service in (backend, frontend):
             for mount in service["volumes"]:
-                if mount["type"] == "bind" and not mount.get("read_only") and mount["target"] not in {"/state", "/user-data", "/host-ledger"}:
+                if mount["type"] == "bind" and not mount.get("read_only") and mount["target"] not in ({"/state", "/user-data", "/host-ledger"} | ({"/opt/fullmag/script-output"} if service is backend else set())):
                     raise BuildControlError("Unexpected writable host bind: " + mount["target"])
         control.write(operation["root"] + "/compose.json", document)
         operation["receipt"].update(state="starting-services", state_root=str(state),
