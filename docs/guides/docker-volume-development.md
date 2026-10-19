@@ -15,9 +15,13 @@ Przeczytaj skill `.agents/skills/fullmag-docker-build/SKILL.md`.
 ```powershell
 $source = "<absolutny-zarejestrowany-checkout>"
 Set-Location $source
-just docker-dev-toolchain
 just docker-dev
 ```
+
+`just docker-dev` sam przygotowuje lub ponownie wykorzystuje zgodny toolchain
+i obrazy helperów. Osobne `just docker-dev-toolchain` jest opcjonalne: pozwala
+przygotować zależności wcześniej albo diagnozować ten etap bez startu aplikacji.
+Nie kompiluje aplikacji; ta buduje się w stałym `backend`.
 
 Kreator zapisuje `FULLMAG_SOURCE_ROOT` i `FULLMAG_HTTP_PORT` do `.env` głównego
 checkoutu. Domyślne źródła: jawny argument → zmienna procesu → bieżący worktree
@@ -58,6 +62,11 @@ startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backe
 `docker-dev-recreate-volume` wymaga zatrzymanego backendu i dokładnych pinów
 próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
+Jeżeli poprzednia próba zawiera już autoryzowane recovery, odtworzenie zachowuje
+dokładnie tę samą autoryzację i jej metadane po ponownej walidacji pod blokadą.
+Nie tworzy nowej autoryzacji ani nie powtarza Solve; runtime nadal sprawdza
+aktualnego ownera i pełne dowody. Taka próba wymaga zachowania oryginalnego
+storage sesji, więc `fresh_state=true` jest odrzucane.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
 
 ### Aktywacja skryptu w już działającym Workspace

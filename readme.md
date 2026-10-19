@@ -220,24 +220,24 @@ checking the displayed paths.
 
 ### Start and iterate
 
-Run the commands from the selected checkout. The first command prepares the
-pinned toolchain image; the second builds the complete backend in its Compose
-service and starts the `backend` and `frontend` services:
+Run from the selected checkout. One command prepares or reuses the pinned
+dependency images, builds the complete backend in its Compose service, and
+starts the `backend` and `frontend` services:
 
 ```powershell
 Set-Location $worktree
-just docker-dev-toolchain
 just docker-dev
 ```
 
-The commands share the same source selection. Explicit source arguments and
+Startup and explicit image preparation share the same source selection. Explicit source arguments and
 process settings take precedence; a selected worktree takes precedence over
 main-checkout defaults. The wizard writes `FULLMAG_SOURCE_ROOT` and
 `FULLMAG_HTTP_PORT` to the main `.env`; older host-settings records remain
-readable. An omitted port uses those settings, then `3197`. Run both commands
-from the selected worktree. The toolchain command builds a dependency image
-through Compose/BuildKit, whose progress appears in the command output or
-Docker Desktop Builds. Application compilation and runtime stay in the same
+readable. An omitted port uses those settings, then `3197`.
+`just docker-dev-toolchain` is optional: use it to prepare or diagnose dependency
+images separately, without starting the application. `docker-dev` already performs
+that preparation automatically and reuses matching images. Dependency-image
+progress appears in the command output or Docker Desktop Builds. Application compilation and runtime stay in the same
 permanent backend container. No separate application builder is started.
 
 The development frontend enables the Node Inspector on container loopback,
@@ -386,7 +386,8 @@ libCEED, and the native toolchain are pinned in
 Cargo manifests, and the repository-root `Cargo.lock`; Python uses
 `packages/fullmag-py/pyproject.toml`; and the Control Room uses
 `apps/control-room/package.json` plus the repository-root `pnpm-lock.yaml`.
-`just docker-dev-toolchain` consumes these declarations inside Docker. Do not
+`just docker-dev` consumes these declarations inside Docker; the optional
+`just docker-dev-toolchain` prepares only the dependency image. Do not
 install a second host toolchain or edit a runtime image by hand for daily dev.
 
 <details>

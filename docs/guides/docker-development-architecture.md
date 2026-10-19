@@ -112,12 +112,13 @@ korzystają z tej konfiguracji przez resolver, bez kopiowania `.env`.
 ```powershell
 Set-Location $source
 just --list
-just docker-dev-toolchain
 just docker-dev "$source" 3197
 ```
 
-Toolchain przygotowuje się przy pierwszym użyciu lub zmianie przypiętych
-zależności. Start uruchamia dwie stałe usługi; backend wykonuje swój build
+Start sam przygotowuje toolchain przy pierwszym użyciu lub zmianie przypiętych
+zależności, a zgodne obrazy wykorzystuje ponownie. Osobne
+`just docker-dev-toolchain` pozostaje opcjonalnym przygotowaniem zależności
+lub narzędziem diagnostycznym. Start uruchamia dwie stałe usługi; backend wykonuje swój build
 przed API. Otwórz `http://127.0.0.1:3197/workspace`. Brak `--script` oznacza Home,
 a nie automatyczny wybór dawnej sesji.
 
@@ -147,7 +148,6 @@ sesje oraz wyniki.
 Odpowiednik bez `just`:
 
 ```powershell
-python -B "$source\scripts\bootstrap_docker_toolchain.py" --repo-root $source --direct-development
 python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $source --port 3197
 ```
 
