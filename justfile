@@ -33,8 +33,8 @@ docker-dev-images:
 
 # Direct two-service development: the persistent backend checks/builds source at every start.
 # The source parameter selects the main checkout or a registered worktree.
-docker-dev source_root="" port="3197" script="" gpu_access="auto":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" up --port {{quote(port)}} --gpu-access {{quote(gpu_access)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if script == "" { "" } else { "--script " + quote(script) }}}
+docker-dev source_root="" port="" script="" gpu_access="auto":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" up {{if port == "" { "" } else { "--port " + quote(port) }}} --gpu-access {{quote(gpu_access)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if script == "" { "" } else { "--script " + quote(script) }}}
 
 # Codegen through the already-running services; no Compose lifecycle operation.
 docker-dev-codegen source_root="":
@@ -56,8 +56,14 @@ docker-dev-control-checks source_root:
 docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend="false":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" resume-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if restart_backend == "true" { "--restart-backend" } else if restart_backend == "false" { "" } else { error("restart_backend must be true or false") }}}
 
-# Activate one script in the existing healthy backend; this never recreates or rebuilds the group.
-docker-dev-script attempt config_sha256 source_root script request_id="":
+# Activate one script in the exact currently running group. The control-volume
+# verified receipts supply attempt/configuration pins; ambiguity fails closed.
+docker-dev-script script source_root="" port="" request_id="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" script --script {{quote(script)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if port == "" { "" } else { "--port " + quote(port) }}} {{if request_id == "" { "" } else { "--request-id " + quote(request_id) }}}
+
+# Pinned activation for recovery, audits, and callers that already hold the
+# exact attempt/config/source identity.
+docker-dev-script-pinned attempt config_sha256 source_root script request_id="":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" activate-script --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --script {{quote(script)}} {{if request_id == "" { "" } else { "--request-id " + quote(request_id) }}}
 
 # Restart a pinned healthy backend only when its API confirms no active session.

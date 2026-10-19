@@ -676,6 +676,11 @@ def main(argv=None):
     try:
         if args.prepare_development_images and not args.direct_development:
             raise BootstrapError("Development wrappers require --direct-development")
+        if args.direct_development:
+            from docker_dev import _require_native_windows
+            from docker_dev_defaults import resolve_defaults
+            _require_native_windows()
+            args.repo_root = resolve_defaults(args.repo_root).source_root
         receipt = build(args.repo_root, direct_development=args.direct_development)
         if args.prepare_development_images:
             from docker_build_control import BuildControl, build_volume_runtime_images

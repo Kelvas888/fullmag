@@ -2565,6 +2565,23 @@ def _parser() -> argparse.ArgumentParser:
         "--request-id",
         help="optional stable request fence; default is derived from attempt and script hash",
     )
+    script_parser = subparsers.add_parser(
+        "script",
+        help=(
+            "activate one script in the exactly validated running DEV group; "
+            "attempt and configuration pins are discovered from control receipts"
+        ),
+    )
+    script_parser.add_argument("--script", type=Path, required=True)
+    script_parser.add_argument(
+        "--source-root", type=Path,
+        help="optional registered checkout override; otherwise use the current selected worktree",
+    )
+    script_parser.add_argument(
+        "--port", type=int,
+        help="optional frontend port override; conflicting defaults fail closed",
+    )
+    script_parser.add_argument("--request-id", help="optional stable request fence")
     idle_restart = subparsers.add_parser("restart-idle-volume", help="Restart the pinned healthy backend only while no session is active")
     idle_restart.add_argument("--attempt", required=True)
     idle_restart.add_argument("--config-sha256", required=True)
@@ -2630,7 +2647,7 @@ def _parser() -> argparse.ArgumentParser:
                              help="unsupported compatibility flag: live docker-dev does not consume frozen source manifests")
         command.add_argument("--include-untracked", action="append", default=[],
                              help="unsupported compatibility flag: add new source files to the selected Git index instead")
-        command.add_argument("--port", type=int, default=3197,
+        command.add_argument("--port", type=int, default=None,
                              help="loopback frontend port (up only)")
         command.add_argument("--script", "--startup-script", dest="script", type=Path,
                              help="optional simulation script, relative to the selected checkout or absolute inside it (up only)")
@@ -2713,6 +2730,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.action in {"up", "build"}:
+            _require_native_windows()
+            from docker_dev_defaults import resolve_defaults
+            selected = resolve_defaults(args.repo_root, source_root=args.source_root, port=getattr(args, "port", None))
+            args.source_root = selected.source_root
+            args.port = selected.port
         if args.action == "build":
             build(args)
         elif args.action == "restart-idle-volume":
@@ -2738,6 +2761,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "activate-script":
             from docker_volume_activate import activate
             activate(args)
+        elif args.action == "script":
+            from docker_dev_defaults import activate_discovered
+            activate_discovered(args)
         elif args.action == "up":
             up(args)
         elif args.action == "recreate":

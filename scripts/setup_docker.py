@@ -248,6 +248,8 @@ def plan(repo: Path, storage_root: str, source_root: str, port: int,
     updates = {
         "FULLMAG_PROJECT_STORAGE_ROOT": root.as_posix(),
         "FULLMAG_GPU_ACCESS": gpu_access,
+        "FULLMAG_SOURCE_ROOT": source.as_posix(),
+        "FULLMAG_HTTP_PORT": str(validate_port(port)),
     }
     existing = dotenv_values(base)
     defaults = {"POSTGRES_PASSWORD": lambda: secrets.token_urlsafe(24),
@@ -384,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
         print("Uruchom wybrane źródła poleceniem:")
         print("  just docker-dev " + source_argument + " " + str(prepared["port"]))
         print("Opcjonalny trzeci argument docker-dev wskazuje skrypt symulacji w tym checkoutcie.")
+        print("Skrypt w już działającej grupie: just docker-dev-script 'examples/x.py'")
+        print("Jawne piny zachowuje recepta: just docker-dev-script-pinned <attempt> <config_sha256> <source_root> <script>")
         return 0
     except (SetupError, storage.StorageError, OSError, ValueError, EOFError) as error:
         print(f"Konfiguracja Docker: {error}", file=sys.stderr)

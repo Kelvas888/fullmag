@@ -227,11 +227,15 @@ service and starts the `backend` and `frontend` services:
 ```powershell
 Set-Location $worktree
 just docker-dev-toolchain
-just docker-dev "$worktree" 3197
+just docker-dev
 ```
 
-The toolchain command uses the checkout containing the invoked `justfile`;
-run both commands from the selected worktree. It builds a dependency image
+The commands share the same source selection. Explicit source arguments and
+process settings take precedence; a selected worktree takes precedence over
+main-checkout defaults. The wizard writes `FULLMAG_SOURCE_ROOT` and
+`FULLMAG_HTTP_PORT` to the main `.env`; older host-settings records remain
+readable. An omitted port uses those settings, then `3197`. Run both commands
+from the selected worktree. The toolchain command builds a dependency image
 through Compose/BuildKit, whose progress appears in the command output or
 Docker Desktop Builds. Application compilation and runtime stay in the same
 permanent backend container. No separate application builder is started.
@@ -309,12 +313,13 @@ For an already healthy group with an empty Workspace, activate a script
 without restarting or rebuilding either service:
 
 ```powershell
-just docker-dev-script <attempt> <config-sha256> "$worktree" `
-  "examples/fem_relax_gpu_smoke.py"
+just docker-dev-script "examples/fem_relax_gpu_smoke.py"
 ```
 
-Use the original development attempt and Compose configuration hash from the
-control volume. A successful linked resume is accepted without overwriting the
+The launcher discovers the exact attempt, configuration hash, and live pair
+from the group control volume. It retains the running frontend port, including
+an explicit override used at startup. Manual pins remain available through
+`docker-dev-script-pinned`. A successful linked resume is accepted without overwriting the
 failed-start history. The command keeps the current-session and request fences;
 it does not replace an existing active simulation. An unknown activation result
 blocks automatic retry. See the [activation guide](docs/guides/docker-volume-development.md#aktywacja-skryptu-w-już-działającym-workspace)

@@ -121,6 +121,21 @@ zależności. Start uruchamia dwie stałe usługi; backend wykonuje swój build
 przed API. Otwórz `http://127.0.0.1:3197/workspace`. Brak `--script` oznacza Home,
 a nie automatyczny wybór dawnej sesji.
 
+Po uruchomieniu tej grupy skrypt można aktywować bez ręcznego przepisywania
+attemptu i digestu konfiguracji:
+
+```powershell
+just docker-dev-script "examples/x.py"
+```
+
+Launcher czyta tylko bieżący `development/current.json` oraz trzy zweryfikowane
+wskaźniki faz z control volume, wiąże je z dokładnymi kontenerami backendu i
+frontendu, sprawdza immutable image, źródło, config digest, prywatną sieć
+backendu i loopbackowy port frontendu. Brak jednej pary lub więcej niż jedna
+zgodna para kończy się błędem. Jawne `source_root`, `port` i `request_id` można
+przekazać jako opcjonalne argumenty recepty, a istniejące ręczne piny pozostają
+pod `just docker-dev-script-pinned`.
+
 Na Windows wolne miejsce dla danych technicznych sprawdzaj na dysku danych
 Docker Desktop: tam znajdują się named volumes i BuildKit. `FULLMAG_PROJECT_STORAGE_ROOT`
 zawiera dane użytkownika i nie powinien być używany jako rezerwuar cache buildu.

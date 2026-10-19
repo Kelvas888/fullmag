@@ -421,3 +421,25 @@ Nie uznawać samego istnienia named volumes za dowód ograniczonego wzrostu dysk
   przeszedł (`guard-inspection/attempts/ed109e6d99614653b151f172592af713`).
   Owner, dane aplikacji i cache pozostały bez zmian; build aplikacji nadal
   nie rozpoczął się w tych próbach.
+
+
+## Uproszczone komendy DEV — 19.10.2026
+
+- `just docker-dev` rozwiązuje źródła i port z argumentów, środowiska, wybranego
+  worktree oraz ustawień operatora; toolchain i obrazy stosują ten sam wybór.
+- Kreator zapisuje `FULLMAG_SOURCE_ROOT` i `FULLMAG_HTTP_PORT` w głównym `.env`;
+  zachowany jest odczyt starszego `index/docker-host-settings.json`.
+- `just docker-dev-script "examples/model.py"` odkrywa dokładne piny aktualnej,
+  zweryfikowanej pary backend/frontend. Nie buduje, nie restartuje i nie odtwarza
+  usług. Stare jawne argumenty zachowuje `docker-dev-script-pinned`.
+- Weryfikacja: 81 interpreted Python checks (defaults, setup, activation,
+  bootstrap); nowe przypadki obejmują forwarding ścisłej powłoki, zgodność grupy
+  etapów, deduplikację tej samej pary i jawnie nadpisany port. `bash -n`: PASS.
+  Nie kompilowano lokalnych testów Rust.
+- Żywa aktywacja nowego skrótu: NOT VERIFIED, backend nie jest zdrowy.
+  Restart istniejącej grupy na d739 potwierdził `backend_package_cache_hit=true`,
+  ale ponownie zakończył się `StoreWriterBusy` w odzyskiwaniu host ledger;
+  nie stanowi to dowodu wykonania skryptu ani gotowego backendu.
+- Stan źródeł/grupy: istniejący worktree zadania, PR #197; nie przenoszono cache,
+  nie usuwano wolumenów ani wyników. Integracja na master i kwalifikacja runtime
+  pozostają niedokończone.

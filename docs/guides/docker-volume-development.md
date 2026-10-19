@@ -16,8 +16,16 @@ Przeczytaj skill `.agents/skills/fullmag-docker-build/SKILL.md`.
 $source = "<absolutny-zarejestrowany-checkout>"
 Set-Location $source
 just docker-dev-toolchain
-just docker-dev $source 3197
+just docker-dev
 ```
+
+Kreator zapisuje `FULLMAG_SOURCE_ROOT` i `FULLMAG_HTTP_PORT` do `.env` głównego
+checkoutu. Domyślne źródła: jawny argument → zmienna procesu → bieżący worktree
+→ `.env` → zapis konfiguratora → główny checkout. Port startu: jawny argument →
+zmienna procesu → `.env` → zapis konfiguratora → `3197`. Zajęty port kończy start
+błędem. Toolchain, obrazy pomocnicze i aplikacja stosują ten sam wybór źródeł.
+Aktywacja kolejnego skryptu odczytuje rzeczywisty port działającej grupy, więc
+nie wymaga ponownego podawania wcześniejszego nadpisania portu.
 
 Zakończ edycje i staging przed startem; nie zmieniaj źródeł do zakończenia
 próby. Migawka odczytuje checkout dwukrotnie i odrzuca niespójne wejście.
@@ -58,21 +66,19 @@ Jeżeli grupa ma już zdrowe, działające usługi `backend` i `frontend`, skryp
 można aktywować bez restartu, odtwarzania ani przebudowy kontenerów:
 
 ```powershell
-just docker-dev-script `
-  <attempt> <config-sha256> `
-  <absolutny-checkout> `
-  examples/fem_relax_gpu_smoke.py
+just docker-dev-script "examples/fem_relax_gpu_smoke.py"
 
-# Ten sam plik po potwierdzonym przejściu Workspace do pustego stanu:
-# jawne nowe żądanie
-just docker-dev-script `
-  <attempt> <config-sha256> `
-  <absolutny-checkout> `
-  examples/fem_relax_gpu_smoke.py `
-  run-20261019-02
+# Explicit pins remain available for operator recovery and diagnostics:
+just docker-dev-script-pinned <attempt> <config-sha256> <checkout> <script>
 ```
 
-`attempt` i `config-sha256` muszą pochodzić z tego samego
+Zwykła komenda ustala `attempt` i `config-sha256` automatycznie z bieżącej
+grupy i zweryfikowanych receiptów; wymaga dokładnie jednej zgodnej, zdrowej
+pary usług. Nie uruchamia kontenerów, nie buduje i nie wybiera historycznej
+próby według daty. Przy aktywnej sesji trzeba najpierw zamknąć bieżący projekt
+w Workspace; samo zakończenie Solve nie oznacza pustego Workspace.
+
+W jawnej komendzie `docker-dev-script-pinned` wartości muszą pochodzić z tego samego
 `development/attempts/<attempt>/{terminal,compose}.json` w wolumenie control.
 Jeżeli pierwotny start nie powiódł się, zachowaj jego piny: launcher wymaga
 trwałego, pomyślnego `resume`/`iteration` powiązanego z tą samą próbą,
