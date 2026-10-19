@@ -38198,6 +38198,20 @@
             "$ref": "#/components/schemas/SaveProfile",
             "description": "Save profile: \"compact\", \"solved\", \"resume\", \"archive\"."
           },
+          "save_to_source": {
+            "description": "Persist the archive beside the admitted source script instead of only\nreturning its base64 representation.  Omitted requests preserve the\nhistorical export/download behavior.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "target_path": {
+            "description": "Explicit `.fms` output path.  It is used only when `save_to_source` is\ntrue and must resolve inside the configured output mapping.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ui_state": {
             "description": "Optional UI workspace snapshot provided by frontend."
           }
@@ -38209,12 +38223,26 @@
       },
       "SessionExportResponse": {
         "properties": {
+          "filename": {
+            "description": "File name written when `save_to_source` was enabled.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "fms_base64": {
-            "description": "Base64-encoded `.fms` file content.",
+            "description": "Base64-encoded `.fms` file content for browser exports.  This remains\na required compatibility field and is empty when `saved_path` is\npresent; source-save consumers should use the persisted path instead.",
             "type": "string"
           },
           "profile": {
             "$ref": "#/components/schemas/SaveProfile"
+          },
+          "saved_path": {
+            "description": "Path written when `save_to_source` was enabled.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "session_id": {
             "type": "string"
