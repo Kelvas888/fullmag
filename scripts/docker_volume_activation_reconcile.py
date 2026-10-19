@@ -592,7 +592,7 @@ def _probe_helper_absence(helper_name: str) -> str | None:
     detail = (inspected.stdout + inspected.stderr).decode("utf-8", "replace")
     lines = [line.strip() for line in detail.splitlines() if line.strip()]
     expected_error = re.compile(
-        r"^(?:Error(?:: response from daemon)?: )?No such (?:object|container): "
+        r"^(?i:(?:Error(?:: response from daemon| response from daemon)?: )?No such (?:object|container): )"
         + re.escape(helper_name) + r"$"
     )
     if inspected.returncode != 1 or not lines or expected_error.fullmatch(lines[-1]) is None:
@@ -1858,6 +1858,7 @@ def reconcile_unknown_activation(
             native=native,
             terminal_process_sha256=terminal_process_sha256,
             receipt=receipt,
+            receipt_raw=receipt_raw,
             activation_inputs=activation_inputs,
             helper_name=helper_name,
             helper_absence_probe_sha256=helper_absence_probe_sha256,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 module = importlib.import_module("docker_volume_activation_reconcile")
-from docker_build_control import BuildControl, BuildControlError, control_read_script
+from docker_build_control import BuildControl, BuildControlError, canonical, control_read_script
 
 
 PROJECT = "fullmag-worktree-demo"
@@ -195,6 +196,26 @@ class UnknownActivationTests(unittest.TestCase):
             with self.subTest(changed=changed), self.assertRaises(BuildControlError):
                 module._validate_unresolved_activation(Control(), {**absent, **changed})
 
+    def test_helper_absence_accepts_known_docker_diagnostics_with_exact_identity(self) -> None:
+        helper = "fullmag-control-" + ATTEMPT
+        expected = hashlib.sha256(canonical({
+            "schema": "fullmag.docker-helper-absence-probe.v1", "state": "absent",
+            "helper_name": helper, "containers": [],
+        })).hexdigest()
+        for diagnostic in (
+                "error: no such object: ", "Error: No such object: ",
+                "Error response from daemon: No such container: "):
+            missing = CompletedProcess([], 1, b"[]\n", (diagnostic + helper + "\n").encode())
+            empty = CompletedProcess([], 0, b"", b"")
+            with self.subTest(diagnostic=diagnostic), patch.object(
+                    module, "docker_capture", side_effect=[missing, empty]):
+                self.assertEqual(module._probe_helper_absence(helper), expected)
+        for diagnostic in ("error: no such object: other-helper", "permission denied"):
+            failed = CompletedProcess([], 1, b"[]\n", diagnostic.encode())
+            with self.subTest(diagnostic=diagnostic), patch.object(
+                    module, "docker_capture", return_value=failed), self.assertRaises(BuildControlError):
+                module._probe_helper_absence(helper)
+
     def test_helper_absence_probe_rejects_live_and_foreign_names(self) -> None:
         live = CompletedProcess([], 0, b"[]", b"")
         with patch.object(module, "docker_capture", return_value=live):
@@ -234,6 +255,44 @@ class UnknownActivationTests(unittest.TestCase):
             direct.index("assert_no_unresolved_activation(control)"),
             direct.index("authorization = startup_helper.prepare("),
         )
+
+    def test_absent_helper_dispatch_preserves_original_raw_receipt(self) -> None:
+        document = {"name": PROJECT}
+        config = hashlib.sha256(canonical(document)).hexdigest()
+        journal = canonical({"schema": "fullmag.stop-failed-admission.v1",
+                             "state": "stopped-confirmed", "container_id": BACKEND,
+                             "image_id": IMAGE, "container_state": {}})
+        terminal = b'{"state":"shutdown_unknown"}\n'
+        original = b'{ "original": "receipt with exact bytes" }\n'
+        native = {"journal_sha256": hashlib.sha256(journal).hexdigest(),
+                  "terminal_process_receipt_sha256": hashlib.sha256(terminal).hexdigest()}
+
+        def read(_control, relative, *, optional=False):
+            if relative == "active":
+                return (ATTEMPT + "\n").encode()
+            if relative.startswith("verification/stop-failed-"):
+                return journal
+            if relative == "runtime-control/runtime-service/process-tree.json":
+                return terminal
+            if relative.startswith("verification/stopped-namespace-attestation-"):
+                return None
+            raise AssertionError(relative)
+
+        expected = {"state": "failed-confirmed"}
+        with patch.object(module, "_control_bytes", side_effect=read), \
+                patch.object(module, "_read_json", return_value=None), \
+                patch.object(module, "_validate_native_restart_metadata", return_value=native), \
+                patch.object(module, "_validate_stopped_backend"), \
+                patch.object(module, "_validate_activation_receipt", return_value=({}, original, {})), \
+                patch.object(module, "_probe_helper_absence", return_value="7" * 64), \
+                patch.object(module, "_reconcile_absent_helper", autospec=True, return_value=expected) as commit:
+            result = module.reconcile_unknown_activation(
+                Control(), previous={"attempt": DEV_ATTEMPT,
+                    "inputs": {"source_root": SOURCE, "image_id": IMAGE}}, document=document,
+                selected_source=SOURCE, config_sha256=config, image_id=IMAGE,
+                backend_id=BACKEND, native_restart_metadata=native)
+        self.assertIs(result, expected)
+        self.assertEqual(commit.call_args.kwargs["receipt_raw"], original)
 
     def test_replay_of_completed_reconciliation_does_not_touch_helper(self) -> None:
         absence = "7" * 64
