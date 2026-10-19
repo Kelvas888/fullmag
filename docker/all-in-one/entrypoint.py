@@ -238,11 +238,13 @@ def serve():
         signal.signal(number, lambda *_: stopping.set())
     paths = service.prepare_storage()
     bootstrap = service.initialize_accepted_store(paths)
+    container_recovery = service.recover_container_namespace(paths)
     # An explicit host authorization is the only route that may transition a
     # stale failed owner.  It must complete before configuration generation
     # rotation; ordinary startup never invokes this path.
     runtime_recovery = service.recover_idle_failure(paths)
-    configuration = service.ensure_configuration(paths)
+    with service.container_recovery_configuration_override(paths, container_recovery):
+        configuration = service.ensure_configuration(paths)
     print("[fullmag-backend] Starting API and runtime service", flush=True)
     api = subprocess.Popen(["/opt/fullmag/package/bin/fullmag-api"],
                            env=service.process_environment(paths))
@@ -252,6 +254,11 @@ def serve():
                "bootstrap": bootstrap, "qualification": "NOT VERIFIED"}
     if runtime_recovery is not None:
         receipt["runtime_recovery"] = runtime_recovery
+    if container_recovery is not None:
+        receipt["container_recovery"] = container_recovery
+        receipt["container_recovery_authorization"] = (
+            service.container_recovery_authorization_metadata(paths, container_recovery)
+        )
     receipt_path = service.process_receipt_path(paths)
     result = 1
     last_full_api_probe = 0.0
