@@ -60,6 +60,11 @@ runu, pusta kolejka oraz zgodność skryptu i rewizji sceny. Kontrola odbywa si�
 ponownie po zatrzymaniu frontendu. Po zatrzymaniu backendu launcher weryfikuje
 autentykowany drain właściciela runtime przed ponownym startem; nieznany wynik
 zatrzymania pozostawia usługi zatrzymane i wymaga odzyskiwania.
+Po wcześniejszym odzyskaniu namespace kolejne zwykłe restarty weryfikują
+uwierzytelniony drain późniejszego właściciela. Historyczne archiwum recovery
+pozostaje niezmienne; nowszy `LAUNCH.json`, generacje pul i checkpointy są
+sprawdzane względem tego właściciela i konfiguracji, zamiast porównywania ich
+bajtów ze starym archiwum. Istniejące runy i ich historia pozostają zachowane.
 Frontend obserwuje katalogi `app`, `src`, `public`, `scripts` i aktualizuje UI
 przez HMR. Zmiana helperów obrazu wymaga przygotowania nowego obrazu i jawnego
 odtworzenia usług; sam restart zachowuje przypięty obraz.
