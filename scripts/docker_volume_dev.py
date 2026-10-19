@@ -14,7 +14,8 @@ import time
 
 import fullmag_storage as storage
 from docker_build_control import (BuildControl, BuildControlError, canonical, docker_capture,
-                                  compose_capture, build_volume_toolchain, build_volume_runtime_images, bounded_capture)
+                                  compose_capture, build_volume_toolchain, build_volume_runtime_images, bounded_capture,
+                                  mirror_console)
 
 
 _PROCESS_RECEIPT_PROBE = """import json,pathlib,sys
@@ -925,7 +926,7 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
                 raise BuildControlError("Current handoff has no matching succeeded package/provenance")
             return receipt, provenance
         if time.monotonic() - last_report > 45:
-            print("Backend is building in its persistent Compose service; Docker data retained.", flush=True)
+            mirror_console("Backend is building in its persistent Compose service; Docker data retained.\n")
             last_report = time.monotonic()
         time.sleep(3)
     raise BuildControlError("Backend publication observation timed out; services and volumes retained")

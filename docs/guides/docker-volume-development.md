@@ -161,6 +161,12 @@ kontenera i zgodnym hashu receipt/provenance. Stary udany pakiet nie dowodzi
 zakończenia nowego startu. Nieoczekiwany restart kontenera między publikacją
 pakietu a gotowością API również przerywa obserwację.
 
+Kopia postępu w konsoli jest diagnostyczna. Rozłączenie stdout (`BrokenPipeError`,
+`EINVAL` lub `EBADF`) wyłącza tę kopię i nie przerywa kontrolera ani potwierdzenia
+storage Windows. Log w wolumenie kontrolnym i trwałe receipty pozostają wymagane;
+błąd ich zapisu nadal przerywa operację. Zakończenie samego procesu kontrolera
+pozostaje odrębną utratą obserwacji i wymaga rozstrzygnięcia stanu.
+
 ## Granica zapisu i retencja
 
 | Dane | Miejsce |
