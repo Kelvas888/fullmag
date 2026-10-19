@@ -789,6 +789,7 @@ jobs:
           python -B scripts/test_runtime_service_recovery_busy_retry.py -v
           python -B scripts/test_docker_dev_owned_control.py -v
           python -B scripts/test_docker_volume_receipts.py -v
+          python -B scripts/test_docker_console_progress.py -v
           python -B scripts/test_docker_volume_stop_unadmitted.py -v
           python -B scripts/test_docker_startup_script.py -v
           python -B scripts/test_docker_entrypoint_device_access.py -v

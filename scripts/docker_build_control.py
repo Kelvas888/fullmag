@@ -7,6 +7,7 @@ network, Docker socket, host writes, or application execution responsibility.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -34,6 +35,43 @@ class BuildControlError(RuntimeError):
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+_CONSOLE_DISCONNECT_ERRNOS = frozenset((errno.EBADF, errno.EINVAL))
+
+
+def _quarantine_console(stream):
+    """Keep interpreter shutdown from flushing a known-dead diagnostic stream."""
+
+    sink = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = sink
+    if getattr(sys, "__stdout__", None) is stream:
+        sys.__stdout__ = sink
+
+
+def mirror_console(data):
+    """Best-effort diagnostic output; durable control records stay authoritative."""
+
+    stream = sys.stdout
+    binary = getattr(stream, "buffer", None)
+    if binary is None:
+        target = stream
+        payload = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+    else:
+        target = binary
+        payload = data if isinstance(data, bytes) else data.encode("utf-8")
+    try:
+        target.write(payload)
+        target.flush()
+    except BrokenPipeError:
+        _quarantine_console(stream)
+        return False
+    except OSError as error:
+        if error.errno in _CONSOLE_DISCONNECT_ERRNOS:
+            _quarantine_console(stream)
+            return False
+        raise
+    return True
 
 
 class ControlOutcomeUnknown(BuildControlError):
@@ -373,7 +411,7 @@ class BuildControl:
                     raise BuildControlError("Control lease finalization failed")
             summary = {key: receipt[key] for key in ("phase", "state", "attempt", "compose_project",
                        "control_volume", "image_id", "cache_hit", "backend_package_cache_hit", "config_sha256", "url", "error") if key in receipt}
-            print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
+            mirror_console(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
 
     def build(self, operation, document, service):
         command = ["docker", "--context", "desktop-linux", "compose", "--project-name",
@@ -383,12 +421,13 @@ class BuildControl:
                                    stderr=subprocess.STDOUT)
         process.stdin.write(canonical(document))
         process.stdin.close()
+        console_open = True
         try:
             while chunk := process.stdout.read1(65536):
                 operation["logger"].stdin.write(chunk)
                 operation["logger"].stdin.flush()
-                sys.stdout.buffer.write(chunk)
-                sys.stdout.buffer.flush()
+                if console_open:
+                    console_open = mirror_console(chunk)
             code = process.wait()
         except BaseException:
             # Terminating this client would not prove BuildKit stopped. Retain

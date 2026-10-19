@@ -558,7 +558,13 @@ pub(crate) async fn release_accepted_live_study_with_transition(
     .map_err(|error| ApiError::internal(format!("live project identity is invalid: {error}")))?;
     let typed_run_id = fullmag_application::RunId::parse(run_id.clone())
         .map_err(|error| ApiError::internal(format!("live run identity is invalid: {error}")))?;
-    let release_request_id = request_id.to_string();
+    // The public startup/command request id is retained in the live request,
+    // provenance and idempotency records, but it is not necessarily a portable
+    // repository component (`:` and reserved Windows names are valid at that
+    // public boundary). The accepted-start gate stores its request id as a
+    // repository component, so pass a deterministic private binding scoped to
+    // this exact run and public request instead of changing the public contract.
+    let release_request_id = accepted_start_release_request_id(&run_id, request_id);
     let released_steps = tokio::task::spawn_blocking(move || {
         let store = open_submit_store(&store_root)?;
         let intent = store
@@ -1729,6 +1735,19 @@ pub(crate) fn commit_prepared_live_accepted(
 }
 
 const MAX_RECOVERY_ERROR_CHARS: usize = 1024;
+const ACCEPTED_START_RELEASE_ID_DOMAIN: &str = "fullmag.accepted_run_start_release.v1";
+
+/// Derive the private repository-safe request identity used by the durable
+/// accepted-start gate. The public request id remains in the startup/command
+/// provenance; this digest only binds the one release record to its run and
+/// request without imposing repository-name rules on the public API.
+fn accepted_start_release_request_id(run_id: &str, public_request_id: &str) -> String {
+    let identity = format!("{ACCEPTED_START_RELEASE_ID_DOMAIN}\0{run_id}\0{public_request_id}");
+    format!(
+        "accepted-start-{}",
+        fullmag_session::hex_sha256(identity.as_bytes())
+    )
+}
 
 fn bounded_recovery_error(message: String) -> String {
     let mut bounded = message.chars().take(MAX_RECOVERY_ERROR_CHARS).collect::<String>();
@@ -2074,6 +2093,68 @@ mod tests {
             coordinator_watermark: None,
             coordinator_genesis: None,
         }
+    }
+
+    #[test]
+    fn accepted_start_release_binding_is_portable_scoped_and_gate_usable() {
+        let run_id = "run-held-portable";
+        let public_request_ids = ["run:gpu", "CON", "request.", "request.with.dots"];
+        assert!(fullmag_session::repository_path::validate_store_id("run:gpu").is_err());
+        assert!(fullmag_session::repository_path::validate_store_id("CON").is_err());
+        assert!(fullmag_session::repository_path::validate_store_id("request.").is_err());
+        assert!(fullmag_session::repository_path::validate_store_id("request.with.dots").is_ok());
+        let bindings = public_request_ids
+            .iter()
+            .map(|public_request_id| {
+                let binding = super::accepted_start_release_request_id(run_id, public_request_id);
+                fullmag_session::repository_path::validate_store_id(&binding)
+                    .expect("private gate binding must be a portable store id");
+                assert_ne!(binding, *public_request_id);
+                binding
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(bindings[0], bindings[1]);
+        assert_ne!(bindings[1], bindings[2]);
+        assert_ne!(bindings[2], bindings[3]);
+        assert_eq!(
+            bindings[0],
+            super::accepted_start_release_request_id(run_id, public_request_ids[0])
+        );
+        assert_ne!(
+            bindings[0],
+            super::accepted_start_release_request_id("run-other", public_request_ids[0])
+        );
+
+        let directory = tempfile::tempdir().expect("temporary accepted store");
+        let store = fullmag_session::SessionStore::open(directory.path()).expect("accepted store");
+        let intent = fullmag_session::FmsRunIntent::new(
+            run_id,
+            "intent-held-portable",
+            serde_json::json!({
+                "run_id": run_id,
+                "parameters": {
+                    (fullmag_session::ACCEPTED_RUN_START_POLICY_KEY): {
+                        "schema_version": "accepted_run_start_policy.v1",
+                        "mode": "manual"
+                    }
+                }
+            }),
+        );
+        store.commit_run_intent(&intent).expect("accepted intent");
+        assert!(!store
+            .accepted_run_start_permitted(run_id)
+            .expect("held gate read"));
+        let release = store
+            .release_accepted_run_start(run_id, &intent.payload_sha256, &bindings[0])
+            .expect("portable binding releases the accepted gate");
+        assert_eq!(release.request_id, bindings[0]);
+        let replay = store
+            .release_accepted_run_start(run_id, &intent.payload_sha256, &bindings[2])
+            .expect("replayed portable binding");
+        assert_eq!(replay, release);
+        assert!(store
+            .accepted_run_start_permitted(run_id)
+            .expect("gate read"));
     }
 
     #[test]
