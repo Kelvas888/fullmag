@@ -5517,10 +5517,12 @@ mod container_recovery_contract_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::open(directory.path().join("store")).unwrap();
         let config = executable_config(&store);
+        let application_state_root = store.root().join("application-state");
+        std::fs::create_dir_all(&application_state_root).unwrap();
         RuntimeServiceConfig::initialize_host_application(
             &store,
             &config,
-            &store.root().join("application-state"),
+            &application_state_root,
         )
         .unwrap();
         store
