@@ -5343,6 +5343,7 @@ mod container_recovery_contract_tests {
         DockerContainerAfterObservation, DockerContainerBeforeObservation,
         DockerContainerTeardownObservation, DockerDeviceReleaseObservation,
         DockerNamespaceTeardownResult, HostResourceLedger, HostResourceLedgerPolicy,
+        DOCKER_NAMESPACE_TEARDOWN_ATTESTATION_SCHEMA,
         HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V1,
     };
     use crate::runtime_service_host::{
