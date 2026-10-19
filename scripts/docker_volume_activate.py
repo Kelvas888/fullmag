@@ -480,7 +480,8 @@ def _run_fixed_activation(
         return value
     if value is not None and value.get("state") == "unknown":
         raise ControlOutcomeUnknown(
-            "Startup activation outcome is unknown; activation.json prevents retry"
+            "Startup activation outcome is unknown; activation.json prevents retry: "
+            + str(value.get("error", "No diagnostic supplied"))[-4096:]
         )
     marker = docker_capture(
         "exec",
@@ -493,7 +494,8 @@ def _run_fixed_activation(
     )
     if marker.returncode == 0:
         raise ControlOutcomeUnknown(
-            "Backend activation failed after publishing activation.json; retry is forbidden"
+            "Backend activation failed after publishing activation.json; retry is forbidden: "
+            + output.decode("utf-8", "replace")[-4096:]
         )
     detail = output.decode("utf-8", "replace")[-4096:]
     raise BuildControlError(f"Backend activation wrapper failed: {detail}")
