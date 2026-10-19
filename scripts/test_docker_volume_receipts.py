@@ -13,6 +13,42 @@ from docker_build_control import BuildControl, BuildControlError, ControlOutcome
 
 
 class VolumeReceiptTests(unittest.TestCase):
+    def test_recreation_preserves_gpu_intent_before_observing_services(self):
+        import hashlib
+        from types import SimpleNamespace
+        import docker_volume_dev as dev
+        import docker_dev
+        import docker_build_control
+        document = {"name": "fullmag-master"}
+        digest = hashlib.sha256(dev.canonical(document)).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory).resolve()
+            for policy in ("auto", "required", "disabled", None, "unknown"):
+                with self.subTest(policy=policy):
+                    args = SimpleNamespace(repo_root=source, source_root=source,
+                                           attempt="a" * 32, config_sha256=digest)
+                    previous = {"state": "failed-confirmed", "compose_project": document["name"],
+                                "inputs": {"source_root": str(source), "gpu_access_requested": policy,
+                                           "image_id": "sha256:" + "b" * 64}}
+                    control = mock.Mock(project=document["name"])
+                    control.read.side_effect = [previous, document]
+                    configuration = {"services": {"fem-gpu-toolchain": {"build": {"args": {
+                        "FULLMAG_CUDA_BASE_IMAGE": "unused"}}}}}
+                    with mock.patch.object(docker_dev, "_select_source", return_value=(source, {})), \
+                         mock.patch.object(docker_dev, "_compose_identity", return_value={}), \
+                         mock.patch.object(docker_build_control, "toolchain_configuration", return_value=configuration), \
+                         mock.patch.object(dev, "BuildControl", return_value=control), \
+                         mock.patch.object(dev, "_operator_probe_record_from_retained", return_value={}), \
+                         mock.patch.object(dev, "compose_capture", side_effect=RuntimeError("observing services")) as capture:
+                        if policy in {"auto", "required", "disabled"}:
+                            with self.assertRaisesRegex(RuntimeError, "observing services"):
+                                dev._retained_operation(args, recreate_services=True)
+                            self.assertEqual(args.gpu_access, policy)
+                        else:
+                            with self.assertRaisesRegex(BuildControlError, "retained GPU access intent"):
+                                dev._retained_operation(args, recreate_services=True)
+                            capture.assert_not_called()
+
     def test_runtime_supervisor_accepts_only_fixed_provenance_locations(self):
         path = Path(__file__).resolve().parents[1] / 'docker/all-in-one/runtime_service.py'
         spec = importlib.util.spec_from_file_location('volume_runtime_paths_test', path)
@@ -30,6 +66,7 @@ class VolumeReceiptTests(unittest.TestCase):
 
     def test_successful_ledger_probe_is_archived_and_retired_before_backend_observation(self):
         import json
+        import os
         import docker_volume_dev as dev
         import docker_host_ledger as ledger
         import fullmag_docker_runtime as runtime
@@ -68,6 +105,7 @@ class VolumeReceiptTests(unittest.TestCase):
              mock.patch.object(dev, 'docker_capture', side_effect=retire), \
              mock.patch.object(runtime, '_assembly_from_backend_start', return_value={}), \
              mock.patch.object(runtime, '_complete_backend_storage_preflight'), \
+             mock.patch.object(dev, '_session_host'), \
              mock.patch.object(ledger, '_parse_json_lines', return_value={'schema': 'verified'}), \
              mock.patch.object(ledger, '_validate_host_receipt'), \
              mock.patch.object(ledger, 'validate_container', side_effect=failed_backend):
@@ -75,7 +113,9 @@ class VolumeReceiptTests(unittest.TestCase):
                 dev._finish(control, operation,
                     {'services': {'backend': {'environment': {'FULLMAG_DOCKER_DEVICE_ACCESS': 'gpu'}}}},
                     'backend-id', 'frontend-id', Path('/source'), Path('/state'), Path('/certificate'),
-                    {'restart_verified': True}, {}, {'image_id': image}, image, Path('/git'),
+                    {'restart_verified': True, 'storage_profile':
+                     'windows-folder-v1' if os.name == 'nt' else 'linux-native-v1'},
+                    {}, {'image_id': image}, image, Path('/git'),
                     {'maintenance_document': {}, 'project_id': 'project',
                      'mount_root': '/ledger', 'backing_image': '/ledger.ext4'}, 3197)
         self.assertEqual(events, ['retired', 'backend-observation'])

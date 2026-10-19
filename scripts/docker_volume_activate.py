@@ -291,9 +291,13 @@ def _validate_running_group(
     environment = backend_document.get("environment", {})
     if not isinstance(environment, Mapping):
         raise BuildControlError("Retained backend source identity is missing")
+    if environment.get("FULLMAG_SESSION_STORAGE_PROFILE") not in {"windows-folder-v1", "linux-native-v1"}:
+        raise BuildControlError("Retained backend has no supported explicit storage profile")
     source_identity = environment.get("FULLMAG_SOURCE_HOST_ROOT")
     if not isinstance(source_identity, str) or not source_identity.strip():
         raise BuildControlError("Retained backend source identity is missing")
+    # Compare selected/client paths here. Daemon namespace aliases are pinned
+    # separately in x-fullmag-daemon-binds by _validate_retained_service above.
     if not _same_host_path(source_mount.get("source"), source_identity):
         raise BuildControlError("Retained backend source identity differs from its readonly bind")
     if source_root is not None and not _same_host_path(source_identity, source_root):
@@ -554,9 +558,10 @@ def _record_activation_result(operation: dict[str, object], result: Mapping[str,
 
 
 def activate(args: argparse.Namespace) -> None:
-    from docker_dev import _compose_identity, _require_native_windows, _select_source
+    from docker_dev import _compose_identity, _select_source
+    from docker_dev_host import require_host
 
-    _require_native_windows()
+    require_host()
     if not ATTEMPT_RE.fullmatch(args.attempt):
         raise BuildControlError("Script activation requires an exact attempt UUID")
     if not SHA256_RE.fullmatch(args.config_sha256):

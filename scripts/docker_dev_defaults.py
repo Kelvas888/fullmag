@@ -19,6 +19,7 @@ import stat
 
 import fullmag_storage as storage
 from docker_build_control import BuildControl, BuildControlError, canonical, toolchain_configuration
+from docker_dev_host import require_host
 
 
 DEFAULT_PORT = 3197
@@ -381,12 +382,12 @@ def _discover_pins(
     *,
     requested_port: int | None = None,
 ) -> ScriptPins:
-    from docker_dev import _compose_identity, _require_native_windows, STORAGE_PROFILE
+    from docker_dev import _compose_identity, STORAGE_PROFILE
     from docker_development_inputs import select_checkout
     from fullmag_storage import resolve_layout
     import docker_volume_activate as activate
 
-    _require_native_windows()
+    require_host()
     selected = select_checkout(repo, defaults.source_root)
     layout = resolve_layout(selected, STORAGE_PROFILE)
     identity = _compose_identity(layout)
@@ -465,9 +466,7 @@ def _discover_pins(
 
 def activate_discovered(args) -> None:
     """Resolve pins, then invoke the unchanged explicit activation operation."""
-    from docker_dev import _require_native_windows
-
-    _require_native_windows()
+    require_host()
     repo = Path(args.repo_root).resolve(strict=True)
     defaults = resolve_defaults(repo, source_root=getattr(args, "source_root", None),
                                 port=getattr(args, "port", None))

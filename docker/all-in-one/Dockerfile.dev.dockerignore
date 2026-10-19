@@ -9,6 +9,7 @@
 !scripts/fullmag_storage.py
 !docker/all-in-one/entrypoint.py
 !docker/all-in-one/windows_folder_probe.py
+!docker/all-in-one/linux_native_probe.py
 !docker/all-in-one/runtime_service.py
 !docker/all-in-one/frontend_dev.py
 !docker/all-in-one/healthcheck.py
@@ -18,6 +19,7 @@
 !Dockerfile.dev.dockerignore
 !entrypoint.py
 !windows_folder_probe.py
+!linux_native_probe.py
 !runtime_service.py
 !frontend_dev.py
 !healthcheck.py

@@ -5,10 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import docker_host_ledger as ledger
 import fullmag_storage as storage
@@ -141,6 +145,195 @@ class TypeErrorDocker:
 
 
 class HostLedgerTests(unittest.TestCase):
+    @staticmethod
+    def _volume_ledger_fixture():
+        backend, profile, docker = HostLedgerTests._pinned_ledger_fixture()
+        profile["host_receipt"]["device_alias"] = "/dev/disk/by-uuid/" + profile["host_receipt"]["filesystem_uuid"]
+        descriptor = ledger.host_volume_descriptor("fullmag-master", profile["project_id"], profile["mount_root"], profile["host_receipt"])
+        volume = {"Name": descriptor["name"], "Driver": "local", "Scope": "local",
+            "Options": dict(descriptor["options"]), "Labels": dict(descriptor["labels"]),
+            "Mountpoint": "/var/lib/docker/volumes/" + descriptor["name"] + "/_data"}
+        profile["daemon_volume"] = descriptor
+        backend["Config"]["Labels"] = {"com.docker.compose.project": "fullmag-master"}
+        backend["Mounts"][0].update(Type="volume", Name=descriptor["name"], Driver="local", Source=volume["Mountpoint"])
+        calls = []
+        def invoke(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("volume", "inspect"):
+                return json.dumps([volume])
+            if args[:2] == ("volume", "ls"):
+                return descriptor["name"] + "\n"
+            return docker(*args, **kwargs)
+        return backend, profile, volume, invoke, calls
+
+    def test_volume_descriptor_preserves_daemon_mount_and_never_creates_new_storage(self):
+        _, profile, volume, docker, calls = self._volume_ledger_fixture()
+        descriptor = ledger.prepare_host_volume(profile, "fullmag-master", docker)
+        self.assertEqual(descriptor["options"], {"type": "ext4", "o": "rw", "device": profile["host_receipt"]["device_alias"]})
+        self.assertEqual(descriptor["compose_volume"], {"name": volume["Name"], "external": True})
+        self.assertTrue(descriptor["mount"]["volume"]["nocopy"])
+        self.assertEqual([args[:2] for args in calls], [("volume", "ls"), ("volume", "inspect")])
+
+    def test_v2_volume_rejects_raw_loop_and_v1_and_keeps_uuid_bound_name_across_loop_reallocation(self):
+        _, profile, _, _, _ = self._volume_ledger_fixture()
+        original = profile["daemon_volume"]
+        self.assertTrue(original["name"].startswith("fullmag-host-ledger-ext4-v2-"))
+        changed = {**profile["host_receipt"], "loop_device": "/dev/loop99"}
+        recreated = ledger.host_volume_descriptor("fullmag-master", "test", profile["mount_root"], changed)
+        self.assertEqual(recreated["name"], original["name"])
+        self.assertEqual(recreated["labels"], original["labels"])
+        self.assertNotEqual(recreated["host_receipt"]["loop_device"], original["host_receipt"]["loop_device"])
+        for alias in (None, "/dev/loop7", "/dev/fullmag-host-ledger-foreign-token"):
+            with self.subTest(alias=alias), self.assertRaises(ledger.HostLedgerError):
+                ledger.host_volume_descriptor("fullmag-master", "test", profile["mount_root"],
+                    {**profile["host_receipt"], "device_alias": alias})
+        backend, profile, _, docker, _ = self._volume_ledger_fixture()
+        profile["daemon_volume"]["schema"] = "fullmag.host-ledger-volume.v1"
+        with self.assertRaises(ledger.HostLedgerError):
+            ledger.validate_container(backend, profile, docker)
+
+    def test_fresh_receipt_loop_mismatch_is_rejected_before_volume_inspection(self):
+        backend, profile, _, docker, calls = self._volume_ledger_fixture()
+        profile["host_receipt"] = {**profile["host_receipt"], "loop_device": "/dev/loop99"}
+        with self.assertRaisesRegex(ledger.HostLedgerError, "fresh maintenance"):
+            ledger.validate_container(backend, profile, docker)
+        self.assertEqual(calls, [])
+
+    def test_probe_spec_is_isolated_readonly_and_uses_existing_exact_volume(self):
+        _, profile, _, _, _ = self._volume_ledger_fixture()
+        descriptor = profile["daemon_volume"]
+        document = ledger.host_volume_probe_spec(descriptor, IMAGE)
+        service = document["services"]["host-ledger-volume-probe"]
+        self.assertEqual(service["user"], "65532:65532")
+        self.assertEqual(service["network_mode"], "none")
+        self.assertNotIn("pid", service)
+        self.assertFalse(service["privileged"])
+        self.assertTrue(service["read_only"])
+        self.assertEqual(service["cap_drop"], ["ALL"])
+        self.assertEqual(service["volumes"], [{**descriptor["mount"], "read_only": True}])
+        self.assertTrue(document["volumes"]["host-ledger"]["external"])
+        self.assertIn("signal.alarm(45)", service["command"][0])
+        self.assertEqual(json.loads(service["command"][1]), descriptor)
+
+    def test_prepare_creates_only_absent_owned_local_bind_descriptor(self):
+        _, profile, _, docker, calls = self._volume_ledger_fixture()
+        mutations = []
+        def absent(*args, **kwargs):
+            if args[:2] == ("volume", "ls"):
+                return "unrelated-existing-volume\n"
+            if args[:2] == ("volume", "create"):
+                mutations.append(args)
+                return args[-1]
+            return docker(*args, **kwargs)
+        descriptor = ledger.prepare_host_volume(profile, "fullmag-master", absent)
+        self.assertEqual(len(mutations), 1)
+        self.assertIn("device=" + profile["host_receipt"]["device_alias"], mutations[0])
+        self.assertIn("type=ext4", mutations[0])
+        self.assertIn("o=rw", mutations[0])
+        self.assertEqual(mutations[0][-1], descriptor["name"])
+
+    def test_prepare_requires_canonical_host_receipt_before_docker(self):
+        _, profile, _, docker, calls = self._volume_ledger_fixture()
+        profile["host_receipt"]["mount_root"] = "/some/unverified/root"
+        with self.assertRaises(ledger.HostLedgerError):
+            ledger.prepare_host_volume(profile, "fullmag-master", docker)
+        self.assertEqual(calls, [])
+
+    def test_managed_local_volume_is_attested_against_actual_volume_metadata(self):
+        backend, profile, _, docker, calls = self._volume_ledger_fixture()
+        result = ledger.validate_container(backend, profile, docker)
+        self.assertEqual(result["host_receipt"]["mount_root"], profile["mount_root"])
+        self.assertEqual(result["host_verification"], "PASS")
+        self.assertEqual(calls[0][:2], ("volume", "inspect"))
+
+    def test_volume_driver_device_or_owner_drift_is_never_adopted(self):
+        for changed in ("Driver", "Options", "Labels", "Scope"):
+            with self.subTest(changed=changed):
+                backend, profile, volume, docker, calls = self._volume_ledger_fixture()
+                volume[changed] = {"type": "none", "o": "bind", "device": "/wsl/rewritten/root"} if changed == "Options" else {} if changed == "Labels" else "foreign"
+                with self.assertRaises(ledger.HostLedgerError):
+                    ledger.prepare_host_volume(profile, "fullmag-master", docker)
+                self.assertFalse(any(args[:2] in {("volume", "create"), ("volume", "rm")} for args in calls))
+                with self.assertRaises(ledger.HostLedgerError):
+                    ledger.validate_container(backend, profile, docker)
+
+    def test_backend_cannot_substitute_arbitrary_volume_bind_or_source(self):
+        for changed, value in (("Name", "arbitrary-volume"), ("Source", "/other/_data"),
+                               ("Type", "bind"), ("RW", False), ("Driver", "foreign")):
+            with self.subTest(changed=changed):
+                backend, profile, _, docker, _ = self._volume_ledger_fixture()
+                backend["Mounts"][0][changed] = value
+                with self.assertRaises(ledger.HostLedgerError):
+                    ledger.validate_container(backend, profile, docker)
+
+    def test_unmanaged_volume_or_changed_descriptor_has_no_bind_pin_fallback(self):
+        backend, profile, _, docker, _ = self._volume_ledger_fixture()
+        del profile["daemon_volume"]
+        with self.assertRaises(ledger.HostLedgerError):
+            ledger.validate_container(backend, profile, docker)
+        backend, profile, _, docker, _ = self._volume_ledger_fixture()
+        profile["daemon_volume"]["options"]["device"] = "/other"
+        with self.assertRaises(ledger.HostLedgerError):
+            ledger.validate_container(backend, profile, docker)
+
+    @staticmethod
+    def _pinned_ledger_fixture():
+        canonical = "/mnt/fullmag-host-ledger-test"
+        alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/ledger-token"
+        environment = {"FULLMAG_DOCKER_HOST_EXECUTION": "1",
+            "FULLMAG_HOST_LEDGER_PROFILE": ledger.PROFILE,
+            "FULLMAG_HOST_LEDGER_ROOT": ledger.LEDGER_ROOT,
+            "FULLMAG_HOST_LEDGER_MOUNT_ROOT": canonical,
+            "FULLMAG_HOST_LEDGER_PROJECT_ID": "test", "FULLMAG_DOCKER_HOST_ID": "engine"}
+        values = {"project_id": "test", "mount_root": canonical,
+                  "backing_image": "/storage/build-volumes/" + ledger.IMAGE_NAME}
+        docker = FakeDocker(values)
+        profile = {"profile": ledger.PROFILE, "image_id": IMAGE, **values,
+            "environment": environment, "daemon_binds": {ledger.MOUNT_TARGET: alias},
+            "host_receipt": docker._receipt("verify")}
+        backend = {"Id": "backend-id", "Image": IMAGE,
+            "Config": {"User": "65532:65532", "Env": [key + "=" + value for key, value in environment.items()]},
+            "HostConfig": {"Privileged": False},
+            "Mounts": [{"Destination": ledger.MOUNT_TARGET, "Type": "bind", "RW": True, "Source": alias}]}
+        return backend, profile, docker
+
+    def test_pinned_client_alias_cannot_replace_the_canonical_host_ledger_mount(self):
+        backend, profile, docker = self._pinned_ledger_fixture()
+        with self.assertRaisesRegex(ledger.HostLedgerError, "managed mount root"):
+            ledger.validate_container(backend, profile, docker)
+        self.assertEqual(docker.calls, [])
+        backend["Mounts"][0]["Source"] = profile["mount_root"]
+        self.assertEqual(ledger.validate_container(backend, profile, docker)["host_verification"], "PASS")
+
+    def test_bind_rejects_noncanonical_root_despite_matching_client_pin(self):
+        for changed in ("/other/ledger", "/run/desktop/client/ledger"):
+            with self.subTest(source=changed):
+                backend, profile, docker = self._pinned_ledger_fixture()
+                backend["Mounts"][0]["Source"] = changed
+                profile["daemon_binds"][ledger.MOUNT_TARGET] = changed
+                with self.assertRaisesRegex(ledger.HostLedgerError, "managed mount root"):
+                    ledger.validate_container(backend, profile, docker)
+                self.assertEqual(docker.calls, [])
+
+    def test_obsolete_client_pins_never_admit_a_noncanonical_bind(self):
+        for pins in ({}, {ledger.MOUNT_TARGET: ""}, "invalid", None,
+                     {ledger.MOUNT_TARGET: "/run/../other"}, {ledger.MOUNT_TARGET: "//host/ledger"},
+                     {ledger.MOUNT_TARGET: "/"}, {ledger.MOUNT_TARGET: "/run/ledger\tbad"}):
+            with self.subTest(pins=pins):
+                backend, profile, docker = self._pinned_ledger_fixture()
+                profile["daemon_binds"] = pins
+                with self.assertRaises(ledger.HostLedgerError):
+                    ledger.validate_container(backend, profile, docker)
+                self.assertEqual(docker.calls, [])
+
+    def test_daemon_alias_does_not_replace_canonical_receipt_validation(self):
+        for field in ("mount_root", "backing_image", "project_id"):
+            with self.subTest(field=field):
+                backend, profile, _, docker, _ = self._volume_ledger_fixture()
+                profile["host_receipt"][field] = backend["Mounts"][0]["Source"]
+                with self.assertRaises(ledger.HostLedgerError):
+                    ledger.validate_container(backend, profile, docker)
+
     @staticmethod
     def _compose_repo(root: Path) -> Path:
         repo = root / "repo"
@@ -466,6 +659,112 @@ class HostLedgerTests(unittest.TestCase):
             backend["Mounts"][0]["RW"] = False
             with self.assertRaises(ledger.HostLedgerError):
                 ledger.validate_container(backend, profile, fake)
+
+
+class HostVolumeProbeTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "host-ledger"
+        self.root.mkdir(mode=0o755)
+        (self.root / "ledger").mkdir(mode=0o770)
+        (self.root / "ledger").chmod(0o770)
+        self.namespace = {}
+        exec(ledger.HOST_VOLUME_PROBE_FUNCTIONS, self.namespace)
+        _, profile, _, _, _ = HostLedgerTests._volume_ledger_fixture()
+        self.descriptor = profile["daemon_volume"]
+        self.marker = {"schema": "fullmag.host-ledger-owner.v1", "profile": ledger.PROFILE,
+            "project_id": "test", "backing_image": profile["backing_image"],
+            "mount_root": profile["mount_root"], "filesystem_uuid": self.descriptor["filesystem_uuid"],
+            "image_size_bytes": ledger.IMAGE_SIZE_BYTES, "mount_target": ledger.MOUNT_TARGET,
+            "runtime_uid": 65532, "runtime_gid": 65532,
+            "owner_token": "11111111-1111-4111-8111-111111111111"}
+        self.marker_path = self.root / ".fullmag-host-ledger-owner.json"
+        self.save_marker()
+
+    def save_marker(self):
+        if self.marker_path.exists():
+            self.marker_path.chmod(0o644)
+        self.marker_path.write_text(json.dumps(self.marker))
+        self.marker_path.chmod(0o444)
+
+    def execute_probe(self, *, device=(7, 7), filesystem=0xef53, incorrect_owner=None):
+        # Real files, nofollow descriptors and JSON parsing; only kernel-owned
+        # metadata/device observations are substituted for this host-only test.
+        lstat, fstat = os.lstat, os.fstat
+        def metadata(value, path):
+            path = Path(path)
+            if path not in {self.root, self.root / "ledger", self.marker_path}:
+                return value
+            result = SimpleNamespace(**{key: getattr(value, key) for key in (
+                "st_mode", "st_dev", "st_uid", "st_gid", "st_ino", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")})
+            result.st_dev = os.makedev(7, 7)
+            result.st_uid = result.st_gid = 65532 if path == self.root / "ledger" else 0
+            if incorrect_owner == path.name:
+                result.st_uid = 1000
+            return result
+        def observed_lstat(path):
+            return metadata(lstat(path), path)
+        def observed_fstat(fd):
+            return metadata(fstat(fd), os.readlink("/proc/self/fd/" + str(fd)))
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(os, "lstat", side_effect=observed_lstat))
+            stack.enter_context(patch.object(os, "fstat", side_effect=observed_fstat))
+            stack.enter_context(patch.object(os, "geteuid", return_value=65532))
+            stack.enter_context(patch.object(os, "getegid", return_value=65532))
+            stack.enter_context(patch.object(os, "statvfs", return_value=SimpleNamespace(f_flag=os.ST_RDONLY)))
+            stack.enter_context(patch.dict(self.namespace, {
+                "_ledger_loop_device": lambda loop: device,
+                "_ledger_statfs_type": lambda root: filesystem}))
+            return self.namespace["probe"](self.descriptor, str(self.root))
+
+    def test_probe_reads_exact_owner_marker_and_current_loop_device(self):
+        result = self.execute_probe()
+        self.assertEqual(result["filesystem_uuid"], self.descriptor["filesystem_uuid"])
+        self.assertEqual(result["loop_device"], "/dev/loop7")
+        self.assertEqual(result["device_alias"], "/dev/disk/by-uuid/" + self.descriptor["filesystem_uuid"])
+        self.assertEqual(result["state"], "verified")
+
+    def test_marker_uuid_backing_and_scope_cannot_be_substituted(self):
+        for field, wrong in (("filesystem_uuid", "22222222-2222-2222-2222-222222222222"),
+                             ("backing_image", "/foreign/image"), ("project_id", "foreign"),
+                             ("owner_token", "00000000-0000-0000-0000-000000000000"),
+                             ("runtime_uid", 1000), ("image_size_bytes", True)):
+            with self.subTest(field=field):
+                original = self.marker[field]
+                self.marker[field] = wrong
+                self.save_marker()
+                with self.assertRaises(ValueError):
+                    self.execute_probe()
+                self.marker[field] = original
+        self.save_marker()
+
+    def test_foreign_loop_or_nonext4_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "exact loop ext4"):
+            self.execute_probe(device=(7, 99))
+        with self.assertRaisesRegex(ValueError, "exact loop ext4"):
+            self.execute_probe(filesystem=0x1234)
+
+    def test_marker_symlink_and_bad_permissions_are_rejected(self):
+        self.marker_path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "owner marker ownership"):
+            self.execute_probe()
+        self.marker_path.chmod(0o444)
+        with self.assertRaises(ValueError):
+            self.execute_probe(incorrect_owner=self.marker_path.name)
+        actual = self.root / "real-marker"
+        self.marker_path.rename(actual)
+        self.marker_path.symlink_to(actual)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.execute_probe()
+
+    def test_runtime_directory_mode_and_owner_are_enforced(self):
+        (self.root / "ledger").chmod(0o777)
+        with self.assertRaisesRegex(ValueError, "runtime directory ownership"):
+            self.execute_probe()
+        (self.root / "ledger").chmod(0o770)
+        with self.assertRaisesRegex(ValueError, "runtime directory ownership"):
+            self.execute_probe(incorrect_owner="ledger")
 
 
 if __name__ == "__main__":

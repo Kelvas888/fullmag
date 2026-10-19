@@ -1497,6 +1497,27 @@ class BackendPackageTests(unittest.TestCase):
             },
         )
 
+    def test_linux_development_gate_binds_source_package_group_and_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package, _, _, host, provenance, digest, environment = self._windows_folder_development_gate_fixture(root)
+            provenance["build_receipt_sha256"] = digest
+            with (patch.dict(os.environ, environment, clear=True),
+                  patch.object(backend, "PACKAGE_ROOT", package),
+                  patch.object(backend, "PROVENANCE_PATH", root / "provenance.json")):
+                backend._validate_linux_native_build(host, provenance, digest)
+                for field, value in (("group_identity", "other-group"),
+                                     ("toolchain_image_id", "sha256:" + "9" * 64),
+                                     ("source_identity", {"commit": "bad"})):
+                    altered = json.loads(json.dumps(host))
+                    altered["development_build"][field] = value
+                    with self.subTest(field=field), self.assertRaises(backend.BackendBuildError):
+                        backend._validate_linux_native_build(altered, provenance, digest)
+                with self.assertRaises(backend.BackendBuildError):
+                    backend._validate_linux_native_build(host, provenance, "0" * 64)
+                with self.assertRaises(backend.BackendBuildError):
+                    backend._validate_linux_native_build({}, provenance, digest)
+
     def test_windows_folder_development_gate_accepts_matching_certificate(self):
         with tempfile.TemporaryDirectory() as directory:
             (

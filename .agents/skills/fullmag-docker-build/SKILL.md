@@ -17,9 +17,13 @@ cache. Aplikację buduje i uruchamia ten sam `backend`; Next/HMR działa w
   builda. Używaj jawnych trwałych named volumes oraz magazynu obrazów/BuildKit.
   Hostowe `storage`, checkout i duże hostowe katalogi tymczasowe nie są
   alternatywnym miejscem zapisu tych danych.
-- **Dane użytkownika nadal na Windows:** sesje, wyniki, projekty, ustawienia i
+- **Dane użytkownika nadal na hoście:** sesje, wyniki, projekty, ustawienia i
   historia ostatnich projektów. Zachowaj ich dotychczasowy kontrakt/mounty;
   polecenie dotyczące builda nie autoryzuje przeniesienia ich do Dockera.
+  Windows używa `windows-folder-v1`, Linux/WSL `linux-native-v1` na lokalnym
+  ext4/xfs/btrfs; oba profile mają osobne dowody storage. WSL używa bieżącego
+  endpointu Docker, a Windows contextu `desktop-linux`. Szczegóły i granice:
+  [ADR 0064](../../../docs/adr/0064-docker-development-linux-wsl-host.md).
 - Cache ma przetrwać restart i zmianę źródeł. Nie usuwaj go dla zwykłego buildu.
   Usunięcie kontenera nie usuwa named volumes ani obrazów/BuildKit.
   Wycofanie build-data grupy wymaga osobnej, precyzyjnej operacji.

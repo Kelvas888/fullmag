@@ -40,6 +40,7 @@ healthcheck = _load(
 
 def _docker_environment() -> dict[str, str]:
     return {
+        "FULLMAG_SESSION_STORAGE_PROFILE": "windows-folder-v1",
         "FULLMAG_CONTAINER_STATE_ROOT": "/state",
         "FULLMAG_PROJECT_STORAGE_ROOT": "/state",
         "FULLMAG_RUNS_ROOT": "/state/runs/docker-all",
@@ -91,6 +92,20 @@ class RuntimeControlVolumeTests(unittest.TestCase):
             Path("/state/runs/docker-all/session-store/runs/run.json"),
         )
 
+    def test_linux_profile_preserves_runtime_volume_and_recovery_views(self):
+        environment = _docker_environment()
+        environment["FULLMAG_SESSION_STORAGE_PROFILE"] = "linux-native-v1"
+        with patch.dict(os.environ, environment, clear=True):
+            paths = runtime_service.canonical_paths()
+            api = runtime_service.api_environment(paths)
+        self.assertEqual(paths.host_certificate, Path("/run/fullmag/linux-native-host.json"))
+        self.assertEqual(api["FULLMAG_SESSION_STORAGE_PROFILE"], "linux-native-v1")
+        self.assertEqual(api["FULLMAG_RUNTIME_CONTROL_ROOT"], "/opt/fullmag/runtime-control")
+        self.assertEqual(api["FULLMAG_RUNTIME_SERVICES_ROOT"], "/opt/fullmag/runtime-control/runtime-services")
+        self.assertEqual(runtime_service._store_relative_path(paths, PurePosixPath("runtime-services/OWNER.json")),
+                         Path("/opt/fullmag/runtime-control/runtime-services/OWNER.json"))
+        self.assertEqual(paths.provenance, Path("/opt/fullmag/control/backend/runtime-provenance.json"))
+
     def test_canonical_paths_rejects_unmanaged_runtime_provenance_location(self):
         environment = _docker_environment()
         environment["FULLMAG_RUNTIME_PROVENANCE"] = "/state/provenance.json"
@@ -114,6 +129,7 @@ class RuntimeControlVolumeTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "FULLMAG_SESSION_STORAGE_PROFILE": "windows-folder-v1",
                 "FULLMAG_FEM_MESH_CACHE_DIR": "/build/cache/fem-mesh",
                 "CUDA_CACHE_PATH": "/build/cache/cuda-compute",
             },
