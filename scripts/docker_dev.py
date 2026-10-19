@@ -49,6 +49,15 @@ DEVELOPMENT_BASE_CONTEXT_SCHEMA = "fullmag.direct-compose.development-base-conte
 DEVELOPMENT_IMAGE_SCHEMA = "fullmag.direct-compose.development-image.v1"
 RUNTIME_IMAGE_CONTEXT_SCHEMA = "fullmag.direct-compose.runtime-image-context.v1"
 BACKEND_START_INPUTS_SCHEMA = "fullmag.direct-compose.backend-start-inputs.v1"
+OPERATOR_PROBE_ENVIRONMENT_SCHEMA = "fullmag.operator-probe-environment.v1"
+OPERATOR_PROBE_ENVIRONMENT_DEFAULTS = {
+    "FULLMAG_MIXED_P1_DEVICE": "gpu",
+    "FULLMAG_ARTIFACT_FIELD_STORAGE": "json",
+}
+OPERATOR_PROBE_ENVIRONMENT_ALLOWED = {
+    "FULLMAG_MIXED_P1_DEVICE": frozenset({"cpu", "gpu"}),
+    "FULLMAG_ARTIFACT_FIELD_STORAGE": frozenset({"json", "zarr"}),
+}
 BASE_CONTEXT_FILES = (
     ("Dockerfile.dev", "docker/all-in-one/Dockerfile.dev"),
     ("Dockerfile.dev.dockerignore", "docker/all-in-one/Dockerfile.dev.dockerignore"),
@@ -108,6 +117,50 @@ class DirectDockerError(RuntimeError):
 
 class DirectDockerOutcomeUnknown(DirectDockerError):
     """The Docker client timed out while the daemon may still own resources."""
+
+
+def _normalize_operator_probe_environment(value: Mapping[str, object]) -> dict[str, str]:
+    """Validate the bounded operator-probe environment without ambient passthrough."""
+
+    if not isinstance(value, Mapping) or set(value) != set(OPERATOR_PROBE_ENVIRONMENT_ALLOWED):
+        raise _fail(
+            "operator_probe_environment must contain exactly the bounded probe controls"
+        )
+    normalized: dict[str, str] = {}
+    for name, allowed in OPERATOR_PROBE_ENVIRONMENT_ALLOWED.items():
+        raw = value[name]
+        if not isinstance(raw, str):
+            raise _fail(f"{name} must be a string")
+        candidate = raw.strip().lower()
+        if candidate not in allowed:
+            choices = ", ".join(sorted(allowed))
+            raise _fail(f"{name} must be one of: {choices}")
+        normalized[name] = candidate
+    return normalized
+
+
+def _operator_probe_environment_from_host() -> dict[str, str]:
+    """Capture the two allowed host controls once for one backend start."""
+
+    return _normalize_operator_probe_environment({
+        name: os.environ.get(name, default)
+        for name, default in OPERATOR_PROBE_ENVIRONMENT_DEFAULTS.items()
+    })
+
+
+def _operator_probe_environment_sha256(value: Mapping[str, object]) -> str:
+    """Hash the canonical schema-tagged operator control document."""
+
+    normalized = _normalize_operator_probe_environment(value)
+    document = {
+        "schema": OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+        "values": normalized,
+    }
+    encoded = (
+        json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    return _sha256_bytes(encoded)
 
 
 def _bootstrap_module():
@@ -1450,7 +1503,8 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
                  image_ref: str,
                  image_id: str, toolchain_id: str, cache: Mapping[str, object],
                  base_reference: str, cargo_profile: str,
-                 device_access: str = "gpu") -> dict[str, str]:
+                 device_access: str = "gpu",
+                 operator_probe_environment: Mapping[str, object] | None = None) -> dict[str, str]:
     if device_access not in DEVICE_ACCESS_CHOICES:
         raise _fail("resolved device access must be cpu or gpu")
     cargo_profile = _validate_cargo_profile(cargo_profile)
@@ -1517,6 +1571,20 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
         "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
         "FULLMAG_BACKEND_BUILD_STATE_ROOT": str(build_state_root),
     })
+    # Only these two workload controls may cross the host -> Compose boundary.
+    # The caller captures them once before image/cache preparation.  Never
+    # reread the mutable ambient host environment here and never let a cache
+    # profile smuggle a stale workload choice into a new run.
+    operator_values = _normalize_operator_probe_environment(
+        operator_probe_environment
+        if operator_probe_environment is not None
+        else OPERATOR_PROBE_ENVIRONMENT_DEFAULTS
+    )
+    for name, value in operator_values.items():
+        environment[name] = value
+    environment["FULLMAG_OPERATOR_PROBE_ENVIRONMENT_SHA256"] = (
+        _operator_probe_environment_sha256(operator_values)
+    )
     if manifest is not None:
         environment["FULLMAG_BACKEND_SOURCE_MANIFEST"] = str(manifest)
     git_common = source_bundle.get("git_common_dir")
@@ -2045,6 +2113,14 @@ def _backend_start_inputs(
     compose_identity = _compose_identity(layout)
     compose_project = compose_identity["project_name"]
     control_volume = _control_volume_name(compose_project)
+    # Freeze the bounded operator controls before any image, toolchain, cache
+    # or Compose preparation.  Every later record and rendered configuration
+    # is derived from this exact snapshot; no later host-environment fallback
+    # is allowed to change a run's semantics.
+    operator_probe_environment = _operator_probe_environment_from_host()
+    operator_probe_environment_sha256 = _operator_probe_environment_sha256(
+        operator_probe_environment
+    )
     control_root = _bootstrap_module().CONTROL_ROOT
     if run_root is None:
         resolved_run_id, resolved_root = _new_run_root(layout)
@@ -2066,6 +2142,9 @@ def _backend_start_inputs(
         "build_profile": build_profile,
         "cargo_profile": cargo_profile,
         "compose_project": compose_project,
+        "operator_probe_environment_schema": OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+        "operator_probe_environment": dict(operator_probe_environment),
+        "operator_probe_environment_sha256": operator_probe_environment_sha256,
     }
     terminal_relative = f"{CONTROL_NAMESPACE}/backend-start/{resolved_run_id}.json"
     terminal_path = _control_guest_path(terminal_relative)
@@ -2137,6 +2216,9 @@ def _backend_start_inputs(
             "FULLMAG_DEVELOPMENT_INPUTS_PATH": f"{control_root}/frontend/development-inputs.json",
             "FULLMAG_BUILD_CONTROL_VOLUME": control_volume,
             "FULLMAG_BACKEND_HOSTNAME": "fullmag-direct-backend-" + resolved_run_id[:12],
+            "FULLMAG_MIXED_P1_DEVICE": operator_probe_environment["FULLMAG_MIXED_P1_DEVICE"],
+            "FULLMAG_ARTIFACT_FIELD_STORAGE": operator_probe_environment["FULLMAG_ARTIFACT_FIELD_STORAGE"],
+            "FULLMAG_OPERATOR_PROBE_ENVIRONMENT_SHA256": operator_probe_environment_sha256,
         }
 
         base_info = _ensure_development_base(args, selected, layout, resolved_root)
@@ -2190,6 +2272,7 @@ def _backend_start_inputs(
             layout, selected, resolved_root, source_for_environment,
             package, image_ref, image_id, toolchain_id, cache,
             str(base_info["reference"]), cargo_profile, device_access,
+            operator_probe_environment=operator_probe_environment,
         )
         # No backend package or source snapshot is built/captured in this host
         # preparation phase.  The service observes the live readonly mounts on
@@ -2244,6 +2327,9 @@ def _backend_start_inputs(
             "runtime_image_built": image_built,
             "backend_start_receipt": str(terminal_path),
             "previous_backend_build_receipt_sha256": previous_receipt_sha256,
+            "operator_probe_environment_schema": OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+            "operator_probe_environment": dict(operator_probe_environment),
+            "operator_probe_environment_sha256": operator_probe_environment_sha256,
             "backend_start_inputs": "pending",
         }
         inputs_relative = f"{CONTROL_NAMESPACE}/backend-start/{resolved_run_id}-inputs.json"
@@ -2269,6 +2355,9 @@ def _backend_start_inputs(
             toolchain_image_id=toolchain_id,
             runtime_image_built=image_built,
             backend_cache_receipt=cache.get("receipt_path"),
+            operator_probe_environment_schema=OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+            operator_probe_environment=dict(operator_probe_environment),
+            operator_probe_environment_sha256=operator_probe_environment_sha256,
         )
         _write_control_json(selected, compose_project, terminal_relative, terminal)
         return inputs, resolved_root

@@ -353,7 +353,7 @@ class DockerDevRecreateContract(unittest.TestCase):
             "cargo_profile": "backend-dev",
             "toolchain_image_id": "sha256:" + "3" * 64,
             "package_root": "/opt/fullmag/package",
-            "provenance_path": "/opt/fullmag/provenance.json",
+            "provenance_path": runtime.BACKEND_PROVENANCE_PATH,
             "group_identity": "fullmag",
             "source_identity": {
                 "commit": "0" * 40,

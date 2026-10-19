@@ -77,12 +77,55 @@ _SOURCE_IDENTITY_FIELDS = (
 _SOURCE_LABEL_VALUE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 _MAX_RETAINED_CONTAINER_IDS = 16
 _MAX_RETAINED_CONTAINER_LIST_BYTES = 16 * 1024
+OPERATOR_PROBE_ENVIRONMENT_SCHEMA = "fullmag.operator-probe-environment.v1"
+OPERATOR_PROBE_ENVIRONMENT_DEFAULTS = {
+    "FULLMAG_MIXED_P1_DEVICE": "gpu",
+    "FULLMAG_ARTIFACT_FIELD_STORAGE": "json",
+}
+OPERATOR_PROBE_ENVIRONMENT_ALLOWED = {
+    "FULLMAG_MIXED_P1_DEVICE": frozenset({"cpu", "gpu"}),
+    "FULLMAG_ARTIFACT_FIELD_STORAGE": frozenset({"json", "zarr"}),
+}
 
 
 def _validate_device_access(value: object) -> str:
     if value not in DEVICE_ACCESS_CHOICES:
         raise ValueError("resolved device access must be cpu or gpu")
     return str(value)
+
+
+def _normalize_operator_probe_environment(value: Mapping[str, object]) -> dict[str, str]:
+    """Validate the exact two-key operator-probe boundary."""
+
+    if not isinstance(value, Mapping) or set(value) != set(OPERATOR_PROBE_ENVIRONMENT_ALLOWED):
+        raise ValueError(
+            "operator_probe_environment must contain exactly the bounded probe controls"
+        )
+    normalized: dict[str, str] = {}
+    for name, allowed in OPERATOR_PROBE_ENVIRONMENT_ALLOWED.items():
+        raw = value[name]
+        if not isinstance(raw, str):
+            raise ValueError(f"{name} must be a string")
+        candidate = raw.strip().lower()
+        if candidate not in allowed:
+            choices = ", ".join(sorted(allowed))
+            raise ValueError(f"{name} must be one of: {choices}")
+        normalized[name] = candidate
+    return normalized
+
+
+def _operator_probe_environment_sha256(value: Mapping[str, object]) -> str:
+    """Return the hash shared by backend-start inputs and runtime receipts."""
+
+    document = {
+        "schema": OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+        "values": _normalize_operator_probe_environment(value),
+    }
+    encoded = (
+        json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _frontend_control_volume_name(project: str, backend_start=None) -> str:
@@ -810,6 +853,33 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         "FULLMAG_HOST_CERTIFICATE": str(host_certificate),
         "FULLMAG_BACKEND_HOSTNAME": "fullmag-" + state.parent.name,
     }
+    operator_probe_values = None
+    operator_probe_sha256 = None
+    if inputs is not None or backend_start is not None:
+        # Keep the workload boundary explicit.  The direct development
+        # service may receive only the two controls used by the mixed-P1
+        # operator probe; arbitrary host environment variables are never
+        # copied into Compose.  A direct backend_start receipt must carry the
+        # already validated mapping and hash so the rendered Compose stays
+        # bound to the exact build-start inputs.  The defaults are used only
+        # for the legacy inputs-only config inspection path, which has no
+        # mutable host snapshot to consume.
+        operator_values = (
+            backend_start.get("operator_probe_environment")
+            if isinstance(backend_start, Mapping)
+            else None
+        )
+        if operator_values is None:
+            operator_values = OPERATOR_PROBE_ENVIRONMENT_DEFAULTS
+        operator_probe_values = _normalize_operator_probe_environment(operator_values)
+        operator_probe_sha256 = _operator_probe_environment_sha256(operator_probe_values)
+        if isinstance(backend_start, Mapping):
+            if backend_start.get("operator_probe_environment_schema") != OPERATOR_PROBE_ENVIRONMENT_SCHEMA:
+                raise ValueError("Backend start operator-probe environment schema is unsupported")
+            if backend_start.get("operator_probe_environment_sha256") != operator_probe_sha256:
+                raise ValueError("Backend start operator-probe environment hash differs")
+        environment.update(operator_probe_values)
+        environment["FULLMAG_OPERATOR_PROBE_ENVIRONMENT_SHA256"] = operator_probe_sha256
     if previous_config_sha256 is not None:
         if _CONFIG_SHA256_RE.fullmatch(str(previous_config_sha256)) is None:
             raise ValueError("Previous runtime configuration digest must be a lowercase SHA-256")
@@ -931,6 +1001,11 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         if not isinstance(overlay, str) or not Path(overlay).is_file():
             raise ValueError("Runtime recovery Compose overlay is missing")
         definitions.extend(["-f", overlay])
+    if operator_probe_values is not None:
+        # Reassert the frozen values after cache/overlay interpolation so a
+        # stale cache environment cannot change the operator-probe contract.
+        environment.update(operator_probe_values)
+        environment["FULLMAG_OPERATOR_PROBE_ENVIRONMENT_SHA256"] = operator_probe_sha256
     configured = json.loads(docker("compose", "--project-name", project,
                                    "--project-directory", str(repo), *definitions,
                                    "config", "--format", "json", environment=environment))
@@ -2292,6 +2367,23 @@ def _validate_backend_start_inputs(value, layout):
         raise ValueError("Backend start inputs have no pinned toolchain manifest")
     if value.get("cargo_profile") != "backend-dev" or value.get("build_profile") != "dev":
         raise ValueError("Backend start inputs are not the supported development profile")
+    operator_schema = value.get("operator_probe_environment_schema")
+    if operator_schema != OPERATOR_PROBE_ENVIRONMENT_SCHEMA:
+        raise ValueError("Backend start operator-probe environment schema is unsupported")
+    operator_values = _normalize_operator_probe_environment(
+        value.get("operator_probe_environment")
+        if isinstance(value.get("operator_probe_environment"), Mapping)
+        else {}
+    )
+    operator_hash = value.get("operator_probe_environment_sha256")
+    if not isinstance(operator_hash, str) or _CONFIG_SHA256_RE.fullmatch(operator_hash) is None:
+        raise ValueError("Backend start operator-probe environment hash is missing or malformed")
+    if operator_hash != _operator_probe_environment_sha256(operator_values):
+        raise ValueError("Backend start operator-probe environment hash differs")
+    # Keep the validated descriptor and every downstream receipt canonical;
+    # whitespace/case variants are accepted at the boundary but never become
+    # a second representation of the same run.
+    value["operator_probe_environment"] = operator_values
     device_access = value.get("device_access", "gpu")
     _validate_device_access(device_access)
     gpu_preflight = value.get("gpu_preflight")
@@ -3277,6 +3369,15 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         receipt["backend_start_inputs"] = backend_start.get("backend_start_inputs")
         receipt["backend_start_inputs_storage"] = "docker-named-volume"
         receipt["backend_start_inputs_sha256"] = backend_start.get("backend_start_inputs_sha256")
+        receipt["operator_probe_environment_schema"] = backend_start.get(
+            "operator_probe_environment_schema"
+        )
+        receipt["operator_probe_environment"] = dict(
+            backend_start["operator_probe_environment"]
+        )
+        receipt["operator_probe_environment_sha256"] = backend_start.get(
+            "operator_probe_environment_sha256"
+        )
         # Keep the selected checkout identity in the host pointer so a later
         # reuse can address the same Compose group's control volume even when
         # the frontend is not enabled for this invocation.

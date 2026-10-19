@@ -311,6 +311,11 @@ class DockerRuntimeContract(unittest.TestCase):
                 "toolchain_manifest_sha256": "c" * 64,
                 "cargo_profile": "backend-dev",
                 "build_profile": "dev",
+                "operator_probe_environment_schema": runtime.OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+                "operator_probe_environment": dict(runtime.OPERATOR_PROBE_ENVIRONMENT_DEFAULTS),
+                "operator_probe_environment_sha256": runtime._operator_probe_environment_sha256(
+                    runtime.OPERATOR_PROBE_ENVIRONMENT_DEFAULTS
+                ),
                 "source_project_id": "project-test",
                 "source_worktree_id": "worktree-test",
                 "source_checkout_kind": "worktree",

@@ -143,6 +143,11 @@ services:
       FULLMAG_TOOLCHAIN_IMAGE_ID: ${FULLMAG_TOOLCHAIN_IMAGE_ID:?Pin the toolchain identity}
       FULLMAG_BACKEND_CARGO_PROFILE: ${FULLMAG_BACKEND_CARGO_PROFILE:-backend-dev}
       FULLMAG_DOCKER_DEVICE_ACCESS: ${FULLMAG_DOCKER_DEVICE_ACCESS:?Resolved device access is required}
+      # Bounded operator-probe controls.  These are the only workload
+      # variables admitted from the host environment; do not replace this
+      # allowlist with an ambient environment passthrough.
+      FULLMAG_MIXED_P1_DEVICE: ${FULLMAG_MIXED_P1_DEVICE:-gpu}
+      FULLMAG_ARTIFACT_FIELD_STORAGE: ${FULLMAG_ARTIFACT_FIELD_STORAGE:-json}
       FULLMAG_REPO_ROOT: /opt/fullmag/source
       FULLMAG_RUNTIME_PACKAGE_ROOT: /opt/fullmag/package
       FULLMAG_PACKAGE_PROVENANCE: /opt/fullmag/control/backend/runtime-provenance.json
