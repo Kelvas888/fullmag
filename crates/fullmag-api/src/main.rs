@@ -47,6 +47,7 @@ mod assets;
 mod build_info;
 mod coordinator_persistence;
 pub(crate) mod compute_operator_env;
+mod development_accepted_restore;
 mod development_handoff_validation;
 mod development_owner_control;
 mod development_consumer_readiness;
@@ -2476,6 +2477,7 @@ async fn main() {
         current_command_journal_store_root: Some(current_command_journal_store_root),
         current_command_journal_revision: Arc::new(AtomicU64::new(0)),
         current_live_state: Arc::new(RwLock::new(None)),
+        accepted_run_reattach_identity: Arc::new(RwLock::new(None)),
         current_live_session_transition: Arc::new(Mutex::new(())),
         request_scope_instance_id: router_v2::middleware::version::instance_id().to_string(),
         current_live_session_epoch: Arc::new(AtomicU64::new(0)),
@@ -2513,6 +2515,10 @@ async fn main() {
         quantity_data_plane: Arc::new(crate::quantity_data_plane::QuantityDataPlaneStore::new()),
         frozen_spins_previews: Arc::new(RwLock::new(Default::default())),
     });
+
+    development_accepted_restore::restore_before_listen(&state)
+        .await
+        .expect("private accepted-run reattach must succeed before API startup");
 
     router_v2::handlers::platform::development_restore_input::restore_before_listen(state.as_ref())
         .await

@@ -13,7 +13,7 @@ import sys
 import time
 
 import fullmag_storage as storage
-from docker_build_control import (BuildControl, BuildControlError, canonical, docker_capture,
+from docker_build_control import (BuildControl, BuildControlError, canonical, control_read_script, docker_capture,
                                   compose_capture, build_volume_toolchain, build_volume_runtime_images, bounded_capture,
                                   mirror_console)
 from docker_dev_host import docker_argv, require_host, local_volume, validate_host_path
@@ -46,6 +46,7 @@ def _retained_certificate(state, document):
     return certificate
 
 
+
 _PROCESS_RECEIPT_PROBE = """import json,pathlib,sys
 sys.path.insert(0,'/opt/fullmag')
 import runtime_service
@@ -75,6 +76,10 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _NATIVE_STOP_JOURNAL_SCHEMA = "fullmag.stop-failed-admission.v1"
 _NATIVE_STOP_RECREATE_METADATA_SCHEMA = "fullmag.docker-native-failed-stop-recreate.v1"
 _MAX_RUNTIME_CONFIG_BYTES = 256 * 1024
+_ACCEPTED_REATTACH_ENVIRONMENT_KEYS = frozenset({
+    "FULLMAG_ACCEPTED_REATTACH_REQUEST",
+    "FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256",
+})
 
 
 def _validate_recovery_environment(values):
@@ -116,6 +121,58 @@ def _validate_recovery_metadata(value):
     if len(encoded) > _MAX_RECOVERY_METADATA_BYTES:
         raise BuildControlError("Recovery metadata exceeds the metadata budget")
     return dict(value)
+
+
+def _validate_accepted_reattach_environment(value):
+    """Validate the two private controls passed to the API reattach bridge."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or set(value) != _ACCEPTED_REATTACH_ENVIRONMENT_KEYS:
+        raise BuildControlError(
+            "Accepted-run reattach requires exactly its request path and digest controls"
+        )
+    relative = value["FULLMAG_ACCEPTED_REATTACH_REQUEST"]
+    if (not isinstance(relative, str) or not relative
+            or len(relative) > 1024 or relative.startswith("/")
+            or "\\" in relative or ":" in relative):
+        raise BuildControlError("Accepted-run reattach request path is not relative")
+    path = PurePosixPath(relative)
+    if (str(path) != relative or path.is_absolute() or ".." in path.parts
+            or any(part in {"", "."} for part in path.parts)
+            or not relative.startswith("accepted-run-reattach/")):
+        raise BuildControlError("Accepted-run reattach request path escapes runtime control")
+    digest = value["FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256"]
+    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+        raise BuildControlError("Accepted-run reattach request digest is invalid")
+    return {key: str(item) for key, item in value.items()}
+
+
+def _validate_accepted_reattach_metadata(value, environment):
+    """Keep the producer's immutable pins in the next development receipt."""
+
+    if value is None:
+        if environment:
+            raise BuildControlError("Accepted-run reattach pins are missing")
+        return None
+    validated = _validate_recovery_metadata(value)
+    if not environment:
+        raise BuildControlError("Accepted-run reattach pins have no environment controls")
+    if validated.get("schema") != "fullmag.docker-accepted-run-reattach-producer.v1":
+        raise BuildControlError("Accepted-run reattach pins have an unsupported schema")
+    if validated.get("state") != "prepared":
+        raise BuildControlError("Accepted-run reattach pins are not prepared")
+    request_sha = validated.get("request_sha256")
+    proof_sha = validated.get("proof_sha256")
+    if (_SHA256.fullmatch(request_sha or "") is None
+            or _SHA256.fullmatch(proof_sha or "") is None):
+        raise BuildControlError("Accepted-run reattach pins have invalid record digests")
+    if environment["FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256"] != request_sha:
+        raise BuildControlError("Accepted-run reattach environment differs from its pins")
+    for key, item in validated.items():
+        if key.endswith("_sha256") and _SHA256.fullmatch(item or "") is None:
+            raise BuildControlError("Accepted-run reattach pin has an invalid " + key)
+    return validated
 
 
 def _validate_existing_development_operation(control, operation, selected, identity):
@@ -736,7 +793,8 @@ def _precreate_new_windows_runtime_state(state):
 
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
           recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
-          native_restart_metadata=None):
+          native_restart_metadata=None, accepted_reattach_environment=None,
+          accepted_reattach_metadata=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -748,6 +806,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     validated_recovery_environment = _validate_recovery_environment(recovery_environment)
     validated_recovery_metadata = _validate_recovery_metadata(recovery_metadata)
     validated_native_restart_metadata = _validate_recovery_metadata(native_restart_metadata)
+    validated_accepted_reattach_environment = _validate_accepted_reattach_environment(
+        accepted_reattach_environment
+    )
+    validated_accepted_reattach_metadata = _validate_accepted_reattach_metadata(
+        accepted_reattach_metadata, validated_accepted_reattach_environment
+    )
     if previous_config_sha256 is not None and _SHA256.fullmatch(str(previous_config_sha256)) is None:
         raise BuildControlError("Previous runtime configuration digest is not a lowercase SHA-256")
     require_host()
@@ -794,6 +858,17 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     image = images["backend"]["image_id"]
     device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
     _assert_no_running_fullmag(control.project, identity, **admission_context)
+    if args.script is not None:
+        if validated_accepted_reattach_environment:
+            raise BuildControlError(
+                "Accepted-run reattach cannot be combined with a new startup script"
+            )
+        # ``start --script`` enables the image entrypoint's startup POST after
+        # Compose starts.  Apply the same durable unknown-activation quarantine
+        # used by the explicit activation command before creating provenance
+        # or admitting a new RunIntent.
+        from docker_volume_activation_reconcile import assert_no_unresolved_activation
+        assert_no_unresolved_activation(control)
     operation_inputs = {"source_root": str(selected), "image_id": image,
         "source_project_id": identity["project_id"],
         "source_worktree_id": identity["worktree_id"],
@@ -805,6 +880,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         operation_inputs["previous_config_sha256"] = previous_config_sha256
     if validated_native_restart_metadata is not None:
         operation_inputs["native_failed_restart"] = validated_native_restart_metadata
+    if validated_accepted_reattach_metadata is not None:
+        operation_inputs["accepted_reattach"] = validated_accepted_reattach_metadata
     if provided_operation is not None:
         _validate_existing_operation_inputs(provided_operation.get("receipt", {}), operation_inputs)
     operation_context = (control.operation("development", operation_inputs)
@@ -818,6 +895,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             operation["receipt"]["container_recovery_environment"] = sorted(
                 validated_recovery_environment
             )
+        if validated_accepted_reattach_metadata is not None:
+            operation["receipt"]["accepted_reattach"] = validated_accepted_reattach_metadata
         token = operation["receipt"]["attempt"]
         if reuse_state is None:
             state = storage.validate_path(Path(layout["runtime_root"]) / "docker-volume-dev" / token,
@@ -939,6 +1018,9 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                 previous_config_sha256
             )
         backend["environment"].update(validated_recovery_environment)
+        backend["environment"].pop("FULLMAG_ACCEPTED_REATTACH_REQUEST", None)
+        backend["environment"].pop("FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256", None)
+        backend["environment"].update(validated_accepted_reattach_environment)
         if startup is not None:
             backend["environment"].update(FULLMAG_STARTUP_ENABLED="1",
                 FULLMAG_STARTUP_SCRIPT=startup["authorization"]["container_script_path"],
@@ -1215,13 +1297,7 @@ def _assert_private_restart_network(actual, ids, project):
 def _read_cancelled_activation_bytes(control, relative, *, optional=False):
     """Read one bounded, immutable control-volume file with its raw bytes."""
     path = control.path(relative)
-    parent = str(PurePosixPath(path).parent)
-    script = (
-        f"test -e '{path}' || exit 44; "
-        f"test \"$(readlink -f '{parent}')\" = '{parent}'; "
-        f"test -f '{path}'; test ! -L '{path}'; test $(stat -c %h '{path}') = 1; "
-        f"head -c {_MAX_CANCELLED_ACTIVATION_RECORD_BYTES + 1} '{path}'"
-    )
+    script = control_read_script(path, _MAX_CANCELLED_ACTIVATION_RECORD_BYTES)
     result = bounded_capture(control.helper_args(script), data=b"", timeout=90)
     if optional and result.returncode == 44:
         return None
@@ -1849,7 +1925,15 @@ def _validate_completed_recovery_receipt(control, authorization, recovery_module
 
 
 def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh_state):
-    """Validate one managed native-start-failure stop journal for recreation."""
+    """Validate one managed native-failure stop journal for recreation.
+
+    The legacy ``native-start-failure`` proof has no retained service owner.
+    ``native-after-ready-failure`` is a separate, stricter proof: it carries
+    the previous READY owner as an identity pin and may only recreate after
+    the terminal receipt preserves that exact pin.  Neither route changes the
+    owner state or releases a resource lease here; the proof is only carried
+    into the next managed start.
+    """
 
     if not isinstance(backend_id, str) or not _SHA256.fullmatch(backend_id):
         return None
@@ -1867,15 +1951,17 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     image_id = previous_inputs.get("image_id")
     if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
         raise BuildControlError("Native failed-stop recreation has no immutable image identity")
+    failure_kind = journal.get("failure_kind")
     if (
         journal.get("schema") != _NATIVE_STOP_JOURNAL_SCHEMA
         or journal.get("state") != "stopped-confirmed"
-        or journal.get("failure_kind") != "native-start-failure"
+        or failure_kind not in {"native-start-failure", "native-after-ready-failure"}
         or journal.get("container_id") != backend_id
         or journal.get("image_id") != image_id
         or type(journal.get("exit_code")) is not int
     ):
         raise BuildControlError("Native failed-stop journal is not the exact stopped backend proof")
+    after_ready = failure_kind == "native-after-ready-failure"
     failure = journal.get("failure_receipt")
     if not isinstance(failure, Mapping):
         raise BuildControlError("Native failed-stop journal has no failed process receipt")
@@ -1888,8 +1974,15 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
         raise BuildControlError("Native failed-stop journal has incomplete native failure evidence")
     if probe.get("process_receipt_sha256") != process_sha or probe.get("process_receipt") != failed_receipt:
         raise BuildControlError("Native failed-stop journal failed process evidence differs")
-    from docker_volume_stop_failed import _validate_native_failure_probe
-    validated = _validate_native_failure_probe(probe, process_sha)
+    from docker_volume_stop_failed import (
+        _validate_native_after_ready_failure_probe,
+        _validate_native_failure_probe,
+    )
+    validated = (
+        _validate_native_after_ready_failure_probe(probe, process_sha)
+        if after_ready
+        else _validate_native_failure_probe(probe, process_sha)
+    )
 
     terminal_raw = _control_bytes(control, "runtime-control/runtime-service/process-tree.json")
     terminal = _json(terminal_raw, "native failed-stop terminal process receipt")
@@ -1898,11 +1991,21 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     if (
         terminal.get("schema") != "fullmag.docker-process-tree.v1"
         or terminal.get("state") != "shutdown_unknown"
-        or "service_owner" in terminal
         or "terminal_service_owner" in terminal
         or type(terminal.get("api_exit_code")) is not int
         or terminal.get("runtime_pid") is not None
     ):
+        raise BuildControlError("Native failed-stop terminal process receipt is not canonical")
+    if after_ready:
+        retained_ready_owner = journal.get("retained_ready_owner")
+        terminal_ready_owner = terminal.get("service_owner")
+        if retained_ready_owner != validated["ready_owner"]:
+            raise BuildControlError("Native failed-stop retained ready owner differs from its probe")
+        if terminal_ready_owner != validated["ready_owner"]:
+            raise BuildControlError("Native failed-stop terminal ready owner differs from its probe")
+        if journal.get("terminal_retained_ready_owner") != terminal_ready_owner:
+            raise BuildControlError("Native failed-stop terminal ready owner evidence differs")
+    elif "service_owner" in terminal:
         raise BuildControlError("Native failed-stop terminal process receipt is not canonical")
     terminal_owner_raw = _control_bytes(control, "runtime-control/runtime-services/OWNER.json")
     terminal_owner = _json(terminal_owner_raw, "native failed-stop terminal owner")
@@ -1918,12 +2021,39 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
         or terminal_owner != validated["failed_owner"]
     ):
         raise BuildControlError("Native failed-stop failed owner changed after the stop proof")
+    from docker_volume_activation_reconcile import (
+        _namespace_attestation_path,
+        _validate_namespace_attestation,
+        _validate_stopped_backend,
+    )
+    namespace_relative = _namespace_attestation_path(backend_id)
+    namespace_raw = _control_bytes(control, namespace_relative, optional=True)
+    namespace_attestation = None
+    if namespace_raw is not None:
+        namespace_attestation = _validate_namespace_attestation(
+            control,
+            _json(namespace_raw, "stopped namespace attestation"),
+            backend_id=backend_id,
+            image_id=image_id,
+            journal_raw=journal_raw,
+            journal=journal,
+            terminal_raw=terminal_raw,
+            terminal=terminal,
+            owner_raw=terminal_owner_raw,
+            owner=terminal_owner,
+            selected_source=previous_inputs["source_root"],
+        )
+    if isinstance(journal.get("container_state"), Mapping):
+        _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+    elif namespace_attestation is None:
+        raise BuildControlError("Legacy native stop journal requires a fresh namespace attestation")
     previous_config_sha256 = _read_runtime_config_digest(control)
     recorded_config = journal.get("previous_config_sha256")
     if recorded_config is not None and recorded_config != previous_config_sha256:
         raise BuildControlError("Native failed-stop runtime configuration digest differs")
     metadata = {
         "schema": _NATIVE_STOP_RECREATE_METADATA_SCHEMA,
+        "failure_kind": failure_kind,
         "journal_sha256": hashlib.sha256(journal_raw).hexdigest(),
         "container_id": backend_id,
         "image_id": image_id,
@@ -1933,6 +2063,11 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
         "previous_config_sha256": previous_config_sha256,
         "claim_pending": False,
     }
+    if after_ready:
+        metadata["retained_ready_owner"] = validated["ready_owner"]
+    if namespace_attestation is not None:
+        metadata["namespace_attestation_path"] = namespace_relative
+        metadata["namespace_attestation_sha256"] = hashlib.sha256(namespace_raw).hexdigest()
     return {
         "previous_config_sha256": previous_config_sha256,
         "native_restart_metadata": metadata,
@@ -2176,6 +2311,48 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             control, previous, document, fresh_state=fresh_state,
             backend_id=actual["backend"].get("Id"),
         )
+        # Reconcile only the exact activation helper that still owns the
+        # control lease.  The native failed-stop proof above authenticates the
+        # stopped backend; the reconciler preserves the unknown activation
+        # marker and only lets that helper release its own technical lease.
+        from docker_volume_activation_reconcile import reconcile_unknown_activation
+        reconciliation = reconcile_unknown_activation(
+            control,
+            previous=previous,
+            document=document,
+            selected_source=str(selected),
+            config_sha256=args.config_sha256,
+            image_id=image,
+            backend_id=actual["backend"].get("Id"),
+            native_restart_metadata=recovery_context.get("native_restart_metadata"),
+            fresh_state=fresh_state,
+        )
+        accepted_reattach_context = {}
+        if reconciliation is not None:
+            if args.script is not None:
+                raise BuildControlError(
+                    "A retained accepted run cannot be recreated together with a new startup script"
+                )
+            from docker_volume_accepted_reattach import produce_accepted_reattach
+            accepted_store_root = storage.validate_path(
+                state / "runs" / "docker-all" / "session-store",
+                state,
+                "retained accepted session store",
+            )
+            produced = produce_accepted_reattach(
+                control,
+                store_root=accepted_store_root,
+            )
+            accepted_environment = _validate_accepted_reattach_environment(
+                produced.get("environment")
+            )
+            accepted_pins = _validate_accepted_reattach_metadata(
+                produced.get("pins"), accepted_environment
+            )
+            accepted_reattach_context = {
+                "accepted_reattach_environment": accepted_environment,
+                "accepted_reattach_metadata": accepted_pins,
+            }
         if not fresh_state and not certificate.get("restart_verified"):
             raise BuildControlError("Unadmitted storage cannot rotate as an admitted runtime; use explicit --fresh-state to preserve the old root")
         # Exact recorded helper only; unknown group resources are never deleted.
@@ -2198,6 +2375,19 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             ):
                 raise BuildControlError("Retained container recovery capability changed before recreation")
             operation["receipt"].update(operator_probe_record)
+            if reconciliation is not None:
+                operation["receipt"]["activation_reconciliation"] = {
+                    key: reconciliation[key]
+                    for key in (
+                        "attempt", "activation_receipt_sha256", "native_stop_journal_sha256",
+                        "namespace_attestation_path", "namespace_attestation_sha256",
+                    )
+                    if key in reconciliation
+                }
+            if accepted_reattach_context:
+                operation["receipt"]["accepted_reattach"] = accepted_reattach_context[
+                    "accepted_reattach_metadata"
+                ]
             control.write(operation["root"] + "/retained-containers.json", actual)
             operation["receipt"].update(state="stopping-owned-frontend", previous_state_root=str(state),
                                         fresh_state=fresh_state)
@@ -2216,6 +2406,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         reuse = None if fresh_state else {"state": state, "host_certificate": certificate_path,
             "owner_marker": owner_path, "receipt": {"image_id": image},
             "operator_probe_environment_record": operator_probe_record}
+        recovery_context.update(accepted_reattach_context)
         return start(args, reuse_state=reuse, **recovery_context)
     restart_backend = bool(getattr(args, "restart_backend", False))
     if restart_backend:

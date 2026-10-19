@@ -24,6 +24,7 @@ struct ProjectionContext {
     session_epoch: u64,
     scene_revision: u64,
     api_instance_id: String,
+    allow_api_instance_rebind: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,27 +141,40 @@ async fn poll_once(
 }
 
 async fn capture_context(state: &AppState) -> Result<Option<ProjectionContext>, ApiError> {
-    let current = state.current_live_state.read().await;
-    let Some(snapshot) = current.as_ref() else {
-        return Ok(None);
+    let (session_id, run_id, scene_revision) = {
+        let current = state.current_live_state.read().await;
+        let Some(snapshot) = current.as_ref() else {
+            return Ok(None);
+        };
+        let Some(run) = snapshot.run.as_ref() else {
+            return Ok(None);
+        };
+        let Some(scene) = snapshot.scene_document.as_ref() else {
+            return Ok(None);
+        };
+        if run.run_id.trim().is_empty() || snapshot.session.session_id.trim().is_empty() {
+            return Ok(None);
+        }
+        (
+            snapshot.session.session_id.clone(),
+            run.run_id.clone(),
+            scene.revision,
+        )
     };
-    let Some(run) = snapshot.run.as_ref() else {
-        return Ok(None);
-    };
-    let Some(scene) = snapshot.scene_document.as_ref() else {
-        return Ok(None);
-    };
-    if run.run_id.trim().is_empty() || snapshot.session.session_id.trim().is_empty() {
-        return Ok(None);
-    }
+    let reattach = state.accepted_run_reattach_identity.read().await;
+    let session_epoch = state
+        .current_live_session_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
+    let allow_api_instance_rebind = reattach.as_ref().is_some_and(|identity| {
+        identity.matches(&run_id, &session_id, session_epoch, scene_revision)
+    });
     Ok(Some(ProjectionContext {
-        session_id: snapshot.session.session_id.clone(),
-        run_id: run.run_id.clone(),
-        session_epoch: state
-            .current_live_session_epoch
-            .load(std::sync::atomic::Ordering::Acquire),
-        scene_revision: scene.revision,
+        session_id,
+        run_id,
+        session_epoch,
+        scene_revision,
         api_instance_id: state.request_scope_instance_id.clone(),
+        allow_api_instance_rebind,
     }))
 }
 
@@ -358,7 +372,9 @@ fn validate_live_intent(
         .pointer("/parameters/live_workspace")
         .and_then(Value::as_object)
         .ok_or_else(|| ApiError::conflict("accepted RunIntent has no live workspace binding"))?;
-    if live.get("api_instance_id").and_then(Value::as_str) != Some(context.api_instance_id.as_str())
+    if (!context.allow_api_instance_rebind
+        && live.get("api_instance_id").and_then(Value::as_str)
+            != Some(context.api_instance_id.as_str()))
         || live.get("session_id").and_then(Value::as_str) != Some(context.session_id.as_str())
         || live.get("session_epoch").and_then(Value::as_u64) != Some(context.session_epoch)
         || live.get("scene_revision").and_then(Value::as_u64) != Some(context.scene_revision)
@@ -1308,6 +1324,7 @@ mod tests {
             session_epoch: 4,
             scene_revision: 9,
             run_id: "run".into(),
+            allow_api_instance_rebind: false,
         };
         let specification = json!({
             "parameters": {
@@ -1326,6 +1343,31 @@ mod tests {
     }
 
     #[test]
+    fn live_binding_rebinds_api_instance_only_for_process_local_reattach() {
+        let mut context = ProjectionContext {
+            api_instance_id: "new-api".into(),
+            session_id: "session".into(),
+            session_epoch: 1,
+            scene_revision: 4,
+            run_id: "run".into(),
+            allow_api_instance_rebind: true,
+        };
+        let specification = json!({
+            "parameters": {
+                "live_workspace": {
+                    "api_instance_id": "old-api",
+                    "session_id": "session",
+                    "session_epoch": 1,
+                    "scene_revision": 4
+                }
+            }
+        });
+        assert!(validate_live_intent(&context, &specification).is_ok());
+        context.allow_api_instance_rebind = false;
+        assert!(validate_live_intent(&context, &specification).is_err());
+    }
+
+    #[test]
     fn projection_cursor_cannot_skip_a_new_live_run_with_reused_revisions() {
         let context = ProjectionContext {
             api_instance_id: "instance".into(),
@@ -1333,6 +1375,7 @@ mod tests {
             session_epoch: 2,
             scene_revision: 7,
             run_id: "run-b".into(),
+            allow_api_instance_rebind: false,
         };
         let previous = ProjectionCursor {
             api_instance_id: "instance".into(),

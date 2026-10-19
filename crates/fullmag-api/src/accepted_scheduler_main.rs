@@ -484,132 +484,230 @@ fn run_scheduler(
         // resume leases, or create new admissions until the complete fence
         // succeeds in a later iteration.
         if !reconciliation_deferred {
-            if args.discover_resources {
-                let pool_id = args
-                    .pool_id
-                    .as_deref()
-                    .context("dynamic resource discovery requires a scheduler pool id")?;
-                if let Some(discovered) = store.read_scheduler_resource_pool(pool_id)? {
-                    if let Some(host_admission) = host_admission.as_ref() {
-                        host_admission.validate_compute_pool(&discovered)?;
-                    }
-                    if let Some(previous) = &resource_pool {
-                        if discovered.generation < previous.generation {
-                            bail!("scheduler resource pool generation regressed");
+            'scheduling_pass: {
+                if args.discover_resources {
+                    let pool_id = args
+                        .pool_id
+                        .as_deref()
+                        .context("dynamic resource discovery requires a scheduler pool id")?;
+                    if let Some(discovered) = store.read_scheduler_resource_pool(pool_id)? {
+                        if let Some(host_admission) = host_admission.as_ref() {
+                            host_admission.validate_compute_pool(&discovered)?;
                         }
-                        if discovered.generation == previous.generation && discovered != *previous {
-                            bail!("scheduler resource pool changed without a new generation");
+                        if let Some(previous) = &resource_pool {
+                            if discovered.generation < previous.generation {
+                                bail!("scheduler resource pool generation regressed");
+                            }
+                            if discovered.generation == previous.generation
+                                && discovered != *previous
+                            {
+                                bail!("scheduler resource pool changed without a new generation");
+                            }
+                        }
+                        if resource_pool.as_ref() != Some(&discovered) {
+                            let resources = discovered
+                                .resources
+                                .clone()
+                                .into_iter()
+                                .map(SchedulerResourceOffer::try_from)
+                                .collect::<Result<Vec<_>>>()?;
+                            for resource in &resources {
+                                if let Some(active) = active_workers.get(&resource.resource_id) {
+                                    if active.resource != *resource {
+                                        bail!(
+                                            "active scheduler resource `{}` changed kind or budget",
+                                            resource.resource_id
+                                        );
+                                    }
+                                }
+                                observed_resource_ids.insert(resource.resource_id.clone());
+                            }
+                            if args.owner_control && resource_pool.is_none() {
+                                scheduler_owner_control::announce(
+                                    "ready",
+                                    "compute",
+                                    Some(pool_id),
+                                    Some(discovered.generation),
+                                )?;
+                            }
+                            current_resources = resources;
+                            resource_pool = Some(discovered);
+                        }
+                    } else if resource_pool.is_some() {
+                        bail!("scheduler resource pool disappeared after publication");
+                    }
+                }
+
+                let checkpoint_run_ids = if args.discover_runs {
+                    let backlog_limit = run_intent_persistence::configured_submit_backlog_limit()?;
+                    match defer_scheduler_writer_busy(
+                        || {
+                            run_intent_persistence::expand_pending_batch_children(
+                                &store,
+                                32,
+                                backlog_limit,
+                            )
+                        },
+                        || "compute scheduler: expand pending batch children".to_owned(),
+                    )? {
+                        SchedulerOperation::Completed(_) => {}
+                        SchedulerOperation::Deferred => {
+                            scheduling_deferred = true;
+                            break 'scheduling_pass;
                         }
                     }
-                    if resource_pool.as_ref() != Some(&discovered) {
-                        let resources = discovered
-                            .resources
-                            .clone()
-                            .into_iter()
-                            .map(SchedulerResourceOffer::try_from)
-                            .collect::<Result<Vec<_>>>()?;
-                        for resource in &resources {
-                            if let Some(active) = active_workers.get(&resource.resource_id) {
-                                if active.resource != *resource {
-                                    bail!(
-                                        "active scheduler resource `{}` changed kind or budget",
+                    let mut discovered = store
+                        .list_run_intents()?
+                        .into_iter()
+                        .map(|intent| {
+                            RunId::parse(intent.run_id)
+                                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    discovered.sort();
+                    for run_id in &discovered {
+                        if !observed_run_ids
+                            .iter()
+                            .any(|value| value == run_id.as_str())
+                        {
+                            observed_run_ids.push(run_id.as_str().to_owned());
+                        }
+                    }
+                    discovered
+                } else {
+                    run_ids.clone()
+                };
+                // Readiness validation may hold the store writer while it
+                // checks an exact completion checkpoint. A competing native
+                // writer defers this whole admission pass; it must not be
+                // converted into a false "not ready" result.
+                let queue = match defer_scheduler_queue_operation(|| {
+                    build_run_queue_snapshot(
+                        &store,
+                        &checkpoint_run_ids,
+                        next_run_id.as_ref(),
+                        args.max_queued_runs,
+                    )
+                })? {
+                    SchedulerOperation::Completed(queue) => queue,
+                    SchedulerOperation::Deferred => {
+                        scheduling_deferred = true;
+                        break 'scheduling_pass;
+                    }
+                };
+                peak_queued_run_count = peak_queued_run_count.max(queue.queued_run_count);
+                peak_backpressured_run_count =
+                    peak_backpressured_run_count.max(queue.backpressured_run_count);
+                let mut pending_workers = Vec::<PendingWorker>::new();
+                for resource in &current_resources {
+                    if draining || shutdown_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if active_workers.len() + pending_workers.len() >= args.max_concurrency
+                        || args.max_tasks.is_some_and(|max_tasks| {
+                            executed.len() + active_workers.len() + pending_workers.len()
+                                >= max_tasks
+                        })
+                    {
+                        break;
+                    }
+                    if active_workers.contains_key(&resource.resource_id)
+                        || pending_workers
+                            .iter()
+                            .any(|pending| pending.resource.resource_id == resource.resource_id)
+                    {
+                        continue;
+                    }
+                    if let Some(host) = host_admission.as_ref() {
+                        let mut resumed = None;
+                        for run_id in &checkpoint_run_ids {
+                            match defer_scheduler_writer_busy(
+                                || {
+                                    fullmag_runtime_control::resume_next_admitted_accepted_task_with_host(
+                                        &store,
+                                        run_id,
+                                        &resource.resource_id,
+                                        host,
+                                    )
+                                },
+                                || {
+                                    format!(
+                                        "compute scheduler: resume admitted task on resource `{}`",
                                         resource.resource_id
-                                    );
+                                    )
+                                },
+                            )? {
+                                SchedulerOperation::Completed(Some(scheduled)) => {
+                                    resumed = Some((run_id.clone(), scheduled));
+                                    break;
+                                }
+                                SchedulerOperation::Completed(None) => {}
+                                SchedulerOperation::Deferred => {
+                                    scheduling_deferred = true;
+                                    break;
                                 }
                             }
-                            observed_resource_ids.insert(resource.resource_id.clone());
                         }
-                        if args.owner_control && resource_pool.is_none() {
-                            scheduler_owner_control::announce(
-                                "ready",
-                                "compute",
-                                Some(pool_id),
-                                Some(discovered.generation),
-                            )?;
+                        if scheduling_deferred {
+                            break;
                         }
-                        current_resources = resources;
-                        resource_pool = Some(discovered);
+                        if let Some((run_id, scheduled)) = resumed {
+                            scheduled_any = true;
+                            consecutive_idle_polls = 0;
+                            pending_workers.push(PendingWorker {
+                                resource: resource.clone(),
+                                run_id,
+                                scheduled,
+                            });
+                            continue;
+                        }
                     }
-                } else if resource_pool.is_some() {
-                    bail!("scheduler resource pool disappeared after publication");
-                }
-            }
-            let checkpoint_run_ids = if args.discover_runs {
-                run_intent_persistence::expand_pending_batch_children(
-                    &store,
-                    32,
-                    run_intent_persistence::configured_submit_backlog_limit()?,
-                )?;
-                let mut discovered = store
-                    .list_run_intents()?
-                    .into_iter()
-                    .map(|intent| {
-                        RunId::parse(intent.run_id)
-                            .map_err(|error| anyhow::anyhow!(error.to_string()))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                discovered.sort();
-                for run_id in &discovered {
-                    if !observed_run_ids
-                        .iter()
-                        .any(|value| value == run_id.as_str())
-                    {
-                        observed_run_ids.push(run_id.as_str().to_owned());
-                    }
-                }
-                discovered
-            } else {
-                run_ids.clone()
-            };
-            let queue = build_run_queue_snapshot(
-                &store,
-                &checkpoint_run_ids,
-                next_run_id.as_ref(),
-                args.max_queued_runs,
-            )?;
-            peak_queued_run_count = peak_queued_run_count.max(queue.queued_run_count);
-            peak_backpressured_run_count =
-                peak_backpressured_run_count.max(queue.backpressured_run_count);
-            let mut pending_workers = Vec::<PendingWorker>::new();
-            for resource in &current_resources {
-                if draining || shutdown_requested.load(Ordering::Acquire) {
-                    break;
-                }
-                if active_workers.len() + pending_workers.len() >= args.max_concurrency
-                    || args.max_tasks.is_some_and(|max_tasks| {
-                        executed.len() + active_workers.len() + pending_workers.len() >= max_tasks
-                    })
-                {
-                    break;
-                }
-                if active_workers.contains_key(&resource.resource_id)
-                    || pending_workers
-                        .iter()
-                        .any(|pending| pending.resource.resource_id == resource.resource_id)
-                {
-                    continue;
-                }
-                if let Some(host) = host_admission.as_ref() {
-                    let mut resumed = None;
-                    for run_id in &checkpoint_run_ids {
-                        match defer_scheduler_writer_busy(
-                            || {
-                                fullmag_runtime_control::resume_next_admitted_accepted_task_with_host(
-                                    &store,
-                                    run_id,
-                                    &resource.resource_id,
-                                    host,
-                                )
-                            },
-                            || {
-                                format!(
-                                    "compute scheduler: resume admitted task on resource `{}`",
-                                    resource.resource_id
-                                )
-                            },
-                        )? {
+                    let mut selected = None;
+                    for (run_index, candidate) in queue.ordered.iter().enumerate() {
+                        let offer = ResourceLease::new(
+                            resource.resource_id.clone(),
+                            resource.kind.clone(),
+                            resource.budget.clone(),
+                        )
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                        let scheduled = if let Some(host_admission) = host_admission.as_ref() {
+                            defer_scheduler_writer_busy(
+                                || {
+                                    fullmag_runtime_control::schedule_next_ready_accepted_task_with_host(
+                                        &store,
+                                        &candidate.run_id,
+                                        offer.clone(),
+                                        host_admission,
+                                    )
+                                },
+                                || {
+                                    format!(
+                                        "compute scheduler: admit run `{}` on resource `{}`",
+                                        candidate.run_id.as_str(),
+                                        resource.resource_id
+                                    )
+                                },
+                            )?
+                        } else {
+                            defer_scheduler_writer_busy(
+                                || {
+                                    fullmag_runtime_control::schedule_next_ready_accepted_task(
+                                        &store,
+                                        &candidate.run_id,
+                                        offer.clone(),
+                                    )
+                                },
+                                || {
+                                    format!(
+                                        "compute scheduler: admit run `{}` on resource `{}`",
+                                        candidate.run_id.as_str(), resource.resource_id
+                                    )
+                                },
+                            )?
+                        };
+                        match scheduled {
                             SchedulerOperation::Completed(Some(scheduled)) => {
-                                resumed = Some((run_id.clone(), scheduled));
+                                selected = Some((run_index, scheduled));
                                 break;
                             }
                             SchedulerOperation::Completed(None) => {}
@@ -622,109 +720,42 @@ fn run_scheduler(
                     if scheduling_deferred {
                         break;
                     }
-                    if let Some((run_id, scheduled)) = resumed {
-                        scheduled_any = true;
-                        consecutive_idle_polls = 0;
-                        pending_workers.push(PendingWorker {
-                            resource: resource.clone(),
-                            run_id,
-                            scheduled,
-                        });
+                    let Some((run_index, scheduled)) = selected else {
                         continue;
-                    }
-                }
-                let mut selected = None;
-                for (run_index, candidate) in queue.ordered.iter().enumerate() {
-                    let offer = ResourceLease::new(
-                        resource.resource_id.clone(),
-                        resource.kind.clone(),
-                        resource.budget.clone(),
-                    )
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                    let scheduled = if let Some(host_admission) = host_admission.as_ref() {
-                        defer_scheduler_writer_busy(
-                            || {
-                                fullmag_runtime_control::schedule_next_ready_accepted_task_with_host(
-                                    &store,
-                                    &candidate.run_id,
-                                    offer.clone(),
-                                    host_admission,
-                                )
-                            },
-                            || {
-                                format!(
-                                    "compute scheduler: admit run `{}` on resource `{}`",
-                                    candidate.run_id.as_str(), resource.resource_id
-                                )
-                            },
-                        )?
-                    } else {
-                        defer_scheduler_writer_busy(
-                            || {
-                                fullmag_runtime_control::schedule_next_ready_accepted_task(
-                                    &store,
-                                    &candidate.run_id,
-                                    offer.clone(),
-                                )
-                            },
-                            || {
-                                format!(
-                                    "compute scheduler: admit run `{}` on resource `{}`",
-                                    candidate.run_id.as_str(), resource.resource_id
-                                )
-                            },
-                        )?
                     };
-                    match scheduled {
-                        SchedulerOperation::Completed(Some(scheduled)) => {
-                            selected = Some((run_index, scheduled));
-                            break;
-                        }
-                        SchedulerOperation::Completed(None) => {}
-                        SchedulerOperation::Deferred => {
-                            scheduling_deferred = true;
-                            break;
-                        }
-                    }
+                    scheduled_any = true;
+                    consecutive_idle_polls = 0;
+                    let run_id = queue.ordered[run_index].run_id.clone();
+                    next_run_id = queue.next_equal_priority_run(run_index);
+                    pending_workers.push(PendingWorker {
+                        resource: resource.clone(),
+                        run_id,
+                        scheduled,
+                    });
                 }
-                if scheduling_deferred {
-                    break;
+                for pending in pending_workers {
+                    let resource_id = pending.resource.resource_id.clone();
+                    let handle = spawn_supervised_worker(
+                        args.store_root.clone(),
+                        resource_id.clone(),
+                        pending.run_id,
+                        pending.scheduled,
+                        checkpoint_run_ids.clone(),
+                        worker_executable.clone(),
+                        args.max_concurrency,
+                        args.worker_timeout,
+                        args.heartbeat_interval,
+                        args.max_automatic_retries,
+                        host_admission.clone(),
+                    );
+                    active_workers.insert(
+                        resource_id,
+                        ActiveWorker {
+                            resource: pending.resource,
+                            handle,
+                        },
+                    );
                 }
-                let Some((run_index, scheduled)) = selected else {
-                    continue;
-                };
-                scheduled_any = true;
-                consecutive_idle_polls = 0;
-                let run_id = queue.ordered[run_index].run_id.clone();
-                next_run_id = queue.next_equal_priority_run(run_index);
-                pending_workers.push(PendingWorker {
-                    resource: resource.clone(),
-                    run_id,
-                    scheduled,
-                });
-            }
-            for pending in pending_workers {
-                let resource_id = pending.resource.resource_id.clone();
-                let handle = spawn_supervised_worker(
-                    args.store_root.clone(),
-                    resource_id.clone(),
-                    pending.run_id,
-                    pending.scheduled,
-                    checkpoint_run_ids.clone(),
-                    worker_executable.clone(),
-                    args.max_concurrency,
-                    args.worker_timeout,
-                    args.heartbeat_interval,
-                    args.max_automatic_retries,
-                    host_admission.clone(),
-                );
-                active_workers.insert(
-                    resource_id,
-                    ActiveWorker {
-                        resource: pending.resource,
-                        handle,
-                    },
-                );
             }
         }
         if active_workers.is_empty() {
@@ -967,6 +998,14 @@ fn defer_scheduler_writer_busy<T>(
     // Start publication reports its final typed collision. Defer that pass so
     // the next iteration enters the durable recovery path first.
     classify_scheduler_operation(operation().with_context(context))
+}
+
+fn defer_scheduler_queue_operation<T>(
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<SchedulerOperation<T>> {
+    defer_scheduler_writer_busy(operation, || {
+        "compute scheduler: build accepted run queue".to_owned()
+    })
 }
 
 fn classify_scheduler_operation<T>(result: Result<T>) -> Result<SchedulerOperation<T>> {
@@ -1349,7 +1388,10 @@ mod host_service_binding_tests {
 
 #[cfg(test)]
 mod scheduler_writer_busy_tests {
-    use super::{classify_scheduler_operation, defer_scheduler_writer_busy, SchedulerOperation};
+    use super::{
+        SchedulerOperation, classify_scheduler_operation, defer_scheduler_queue_operation,
+        defer_scheduler_writer_busy,
+    };
     use anyhow::Context;
 
     #[test]
@@ -1389,5 +1431,39 @@ mod scheduler_writer_busy_tests {
         )))
         .unwrap_err();
         assert_eq!(text_only.to_string(), "session store writer is busy");
+    }
+
+    #[test]
+    fn queue_snapshot_defers_real_store_contention_but_keeps_other_errors_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = fullmag_session::SessionStore::open(directory.path().join("store")).unwrap();
+        let rival = fullmag_session::SessionStore::open_existing(store.root()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let lease = rival.write_transaction().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            drop(lease);
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let busy =
+            defer_scheduler_queue_operation(|| store.write_transaction().map(|_| ())).unwrap();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(matches!(busy, SchedulerOperation::Deferred));
+
+        let ordinary = defer_scheduler_queue_operation(|| {
+            Err::<(), _>(anyhow::anyhow!("queue snapshot is corrupt"))
+        })
+        .unwrap_err();
+        let ordinary = format!("{ordinary:#}");
+        assert!(ordinary.contains("compute scheduler: build accepted run queue"));
+        assert!(ordinary.contains("queue snapshot is corrupt"));
     }
 }

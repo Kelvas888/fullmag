@@ -6,6 +6,7 @@
 //! blocking SceneDocument -> ProblemIR -> PreparationReceipt work. Durable
 //! publication remains the caller's responsibility.
 
+use anyhow::Context;
 use fullmag_application::{
     AcceptedRunPreparationSource, PreparationBinding, PreparationReceipt, RequestedExecution,
 };
@@ -706,18 +707,8 @@ pub(crate) async fn publish_accepted_frontier_preparation(
             "accepted preparation requires the configured durable run store",
         ));
     };
-    let project_id = fullmag_application::ProjectId::parse(format!(
-        "project-live-{}",
-        fullmag_session::hex_sha256(
-            format!(
-                "{}\0{}",
-                state.request_scope_instance_id, context.session_id
-            )
-            .as_bytes(),
-        )
-    ))
-    .map_err(|error| ApiError::internal(format!("live project identity is invalid: {error}")))?;
     let run_id_for_worker = run_id.clone();
+    let command_kind_for_worker = command_kind.to_owned();
     let (run_id, step_id) = tokio::task::spawn_blocking(move || {
         let store = fullmag_session::SessionStore::open_existing(&store_root).map_err(|error| {
             ApiError::with_status_and_code(
@@ -728,6 +719,25 @@ pub(crate) async fn publish_accepted_frontier_preparation(
         })?;
         let typed_run_id = fullmag_application::RunId::parse(run_id_for_worker.clone())
             .map_err(|error| ApiError::bad_request(format!("accepted run id is invalid: {error}")))?;
+        let intent = store
+            .read_run_intent(typed_run_id.as_str())
+            .map_err(|error| {
+                ApiError::conflict(format!(
+                    "accepted preparation RunIntent read failed: {error}"
+                ))
+            })?
+            .context("accepted preparation RunIntent is missing")
+            .map_err(|error| ApiError::conflict(error.to_string()))?;
+        let project_id = crate::live_accepted_execution::accepted_project_id_from_intent(
+            &intent,
+            &typed_run_id,
+        )
+        .map_err(|error| {
+            ApiError::conflict_with_code(
+                "accepted_preparation_snapshot_invalid",
+                format!("accepted preparation RunIntent is not typed: {error:#}"),
+            )
+        })?;
         let accepted = fullmag_runtime_control::load_accepted_study_snapshot(
             &store,
             &typed_run_id,
@@ -739,38 +749,106 @@ pub(crate) async fn publish_accepted_frontier_preparation(
                 format!("accepted preparation snapshot validation failed: {error:#}"),
             )
         })?;
-        let step_id = accepted
-            .lowered
-            .steps
-            .iter()
-            .filter(|step| matches!(step.status, fullmag_plan::StudyStepLoweringStatus::Planned))
-            .find(|step| {
-                accepted
-                    .study
-                    .steps
-                    .iter()
-                    .find(|authored| authored.step_id == step.step_id)
-                    .is_some_and(|authored| {
-                        authored.enabled
-                            && !authored.inputs.iter().any(|input| {
-                                if !input.required {
-                                    return false;
-                                }
-                                matches!(
-                                    &input.source,
-                                    fullmag_authoring::StudyInputSource::StepOutput { .. }
-                                        | fullmag_authoring::StudyInputSource::ExplicitContinuation { .. }
-                                )
-                            })
-                    })
-            })
-            .map(|step| step.step_id.clone())
-            .ok_or_else(|| {
+        let step_id = if command_kind_for_worker == "accepted_run_reattach" {
+            let anchor = store
+                .read_preparation_receipt(typed_run_id.as_str())
+                .map_err(|error| {
+                    ApiError::conflict(format!(
+                        "accepted preparation anchor read failed: {error}"
+                    ))
+                })?
+                .context("accepted preparation anchor is missing")
+                .map_err(|error| ApiError::conflict(error.to_string()))?;
+            anchor
+                .validate()
+                .map_err(|error| ApiError::conflict(format!("accepted preparation anchor is invalid: {error}")))?;
+            let application: fullmag_application::PreparationReceipt =
+                serde_json::from_value(anchor.payload.clone()).map_err(|error| {
+                    ApiError::conflict(format!(
+                        "accepted preparation anchor is not an application receipt: {error}"
+                    ))
+                })?;
+            application.validate().map_err(|error| {
+                ApiError::conflict(format!("accepted preparation anchor is invalid: {error}"))
+            })?;
+            let source = application
+                .accepted_run_source
+                .as_ref()
+                .ok_or_else(|| {
+                    ApiError::conflict(
+                        "accepted preparation anchor has no accepted-run source",
+                    )
+                })?;
+            if source.run_id != typed_run_id {
+                return Err(ApiError::conflict(
+                    "accepted preparation anchor source run differs from current run",
+                ));
+            }
+            let step = accepted
+                .lowered
+                .steps
+                .iter()
+                .find(|step| step.step_id == source.step_id)
+                .ok_or_else(|| {
+                    ApiError::conflict(
+                        "accepted preparation anchor references an unknown study step",
+                    )
+                })?;
+            if !matches!(
+                step.status,
+                fullmag_plan::StudyStepLoweringStatus::Planned
+            ) {
+                return Err(ApiError::conflict(
+                    "accepted preparation anchor references a non-planned study step",
+                ));
+            }
+            let ready = fullmag_runtime_control::accepted_run_step_is_scheduler_ready(
+                &store,
+                &typed_run_id,
+                &source.step_id,
+            )
+            .map_err(|error| {
+                ApiError::conflict(format!(
+                    "accepted preparation anchor readiness validation failed: {error}"
+                ))
+            })?;
+            if !ready {
+                return Err(ApiError::conflict(
+                    "accepted preparation anchor is not scheduler-ready",
+                ));
+            }
+            source.step_id.clone()
+        } else {
+            let mut selected = None;
+            for step in accepted
+                .lowered
+                .steps
+                .iter()
+                .filter(|step| {
+                    matches!(step.status, fullmag_plan::StudyStepLoweringStatus::Planned)
+                })
+            {
+                if fullmag_runtime_control::accepted_run_step_is_scheduler_ready(
+                    &store,
+                    &typed_run_id,
+                    &step.step_id,
+                )
+                .map_err(|error| {
+                    ApiError::conflict(format!(
+                        "accepted preparation readiness validation failed: {error}"
+                    ))
+                })? {
+                    selected = Some(step.step_id.clone());
+                    break;
+                }
+            }
+            selected.ok_or_else(|| {
                 ApiError::unprocessable_with_code(
                     "accepted_preparation_frontier_missing",
                     "accepted Study has no dependency-ready preparation frontier",
                 )
-            })?;
+            })?
+        };
         Ok::<_, ApiError>((run_id_for_worker, step_id))
     })
     .await

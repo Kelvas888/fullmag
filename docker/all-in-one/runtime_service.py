@@ -17,6 +17,7 @@ import re
 import socket
 import stat
 import subprocess
+import tempfile
 import time
 import uuid
 from typing import Any, Mapping, NoReturn, Sequence
@@ -692,6 +693,131 @@ def process_environment(
         for name in SERVICE_MODE_VARIABLES:
             environment.pop(name, None)
     return environment
+
+
+ACCEPTED_REATTACH_REQUEST_ENV = "FULLMAG_ACCEPTED_REATTACH_REQUEST"
+ACCEPTED_REATTACH_DIGEST_ENV = "FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256"
+ACCEPTED_REATTACH_STDIN_ENV = "FULLMAG_DEVELOPMENT_ACCEPTED_REATTACH_STDIN"
+ACCEPTED_REATTACH_PROVENANCE = Path("/opt/fullmag/control/backend/runtime-provenance.json")
+ACCEPTED_REATTACH_REQUEST_SCHEMA = "fullmag.docker-accepted-run-reattach-request.v1"
+ACCEPTED_REATTACH_INPUT_SCHEMA = "fullmag.development-accepted-run-reattach.v1"
+ACCEPTED_REATTACH_FIELDS = frozenset({
+    "schema", "run_id", "project_id", "source_request_id", "source_sha256",
+    "startup_provenance_sha256", "config_sha256", "proof_path", "proof_sha256",
+})
+
+
+def _reattach_relative(root: Path, relative: str, name: str) -> Path:
+    if not isinstance(relative, str) or not relative or len(relative) > 1024:
+        _fail(f"{name} is not a bounded relative path")
+    path = PurePosixPath(relative)
+    if (path.is_absolute() or str(path) != relative or ".." in path.parts
+            or "\\" in relative or ":" in relative):
+        _fail(f"{name} must stay inside runtime control")
+    return root.joinpath(*path.parts)
+
+
+def _accepted_reattach_documents(paths: RuntimePaths):
+    """Read the explicit request and its digest-bound proof without mutation."""
+    environment = process_environment(paths)
+    relative = environment.get(ACCEPTED_REATTACH_REQUEST_ENV)
+    digest = environment.get(ACCEPTED_REATTACH_DIGEST_ENV)
+    if ACCEPTED_REATTACH_STDIN_ENV in environment:
+        _fail("accepted-run stdin switch is owned by PID 1")
+    if relative is None and digest is None:
+        return environment, None, None
+    if not relative or not digest or not HEX64.fullmatch(digest):
+        _fail("accepted-run reattach requires both request and digest")
+    if (environment.get("FULLMAG_STARTUP_ENABLED") == "1"
+            or "FULLMAG_DEVELOPMENT_RESTORE_STDIN" in environment):
+        _fail("accepted-run reattach cannot repeat startup or authoring restore")
+    request_path = _reattach_relative(paths.state_root, relative, "accepted-run request")
+    raw = _bounded_regular(request_path, "accepted-run request", 64 * 1024)
+    if _sha256_bytes(raw) != digest:
+        _fail("accepted-run request digest differs")
+    try:
+        request = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"accepted-run request is not valid JSON: {error}")
+    if (not isinstance(request, dict) or set(request) != ACCEPTED_REATTACH_FIELDS
+            or request.get("schema") != ACCEPTED_REATTACH_REQUEST_SCHEMA):
+        _fail("accepted-run request fields/schema differ")
+    for field in ("source_sha256", "startup_provenance_sha256", "config_sha256", "proof_sha256"):
+        if not isinstance(request[field], str) or not HEX64.fullmatch(request[field]):
+            _fail("accepted-run request has invalid " + field)
+    for field in ("run_id", "project_id", "source_request_id"):
+        value = request[field]
+        if (not isinstance(value, str) or not value or len(value) > 256
+                or any(ord(char) < 32 for char in value)):
+            _fail("accepted-run request has invalid " + field)
+    proof_path = _reattach_relative(paths.state_root, request["proof_path"], "accepted-run proof")
+    proof = _bounded_regular(proof_path, "accepted-run proof", 256 * 1024)
+    if _sha256_bytes(proof) != request["proof_sha256"]:
+        _fail("accepted-run proof digest differs")
+    return environment, request, proof
+
+
+def accepted_reattach_preflight(paths: RuntimePaths):
+    """Pin old terminal records before recovery rotates owner/process files."""
+    environment, request, proof_raw = _accepted_reattach_documents(paths)
+    if request is None:
+        return None
+    try:
+        proof = json.loads(proof_raw, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"accepted-run backing proof is not valid JSON: {error}")
+    if (not isinstance(proof, dict)
+            or proof.get("schema") != "fullmag.development-accepted-run-reattach-proof.v1"):
+        _fail("accepted-run backing proof schema differs")
+    proof_path = _reattach_relative(paths.state_root, request["proof_path"], "accepted-run proof")
+    for prefix, filename, current in (
+            ("terminal_owner_record", "terminal-owner.json", runtime_services_root(paths) / "OWNER.json"),
+            ("terminal_process_record", "terminal-process.json", process_receipt_path(paths))):
+        relative, expected = proof.get(prefix + "_path"), proof.get(prefix + "_sha256")
+        if not isinstance(expected, str) or not HEX64.fullmatch(expected):
+            _fail("accepted-run backing record digest is missing or invalid")
+        archived = _reattach_relative(paths.state_root, relative, "accepted-run backing record")
+        if archived.parent != proof_path.parent or archived.name != filename:
+            _fail("accepted-run backing record is outside its proof directory")
+        archive_raw = _bounded_regular(archived, "accepted-run immutable terminal record", 256 * 1024)
+        current_raw = _bounded_regular(current, "accepted-run current terminal record", 256 * 1024)
+        if _sha256_bytes(archive_raw) != expected or current_raw != archive_raw:
+            _fail("accepted-run current terminal record differs from immutable backing evidence")
+    return {"request_sha256": environment[ACCEPTED_REATTACH_DIGEST_ENV],
+            "proof_sha256": request["proof_sha256"]}
+
+
+@contextmanager
+def accepted_reattach_api_input(paths: RuntimePaths, *, preflight=None):
+    """Pass a verified same-run request privately after legitimate recovery.
+
+    PID 1 validates old mutable records before recovery. Rust independently
+    verifies their immutable raw backing records after owner/process rotation.
+    """
+    environment, request, proof_raw = _accepted_reattach_documents(paths)
+    if request is None:
+        yield environment, None
+        return
+    if preflight != {"request_sha256": environment[ACCEPTED_REATTACH_DIGEST_ENV],
+                     "proof_sha256": request["proof_sha256"]}:
+        _fail("accepted-run API input requires the matching early terminal preflight")
+    if environment.get("FULLMAG_RUNTIME_PROVENANCE") != str(ACCEPTED_REATTACH_PROVENANCE):
+        _fail("accepted-run reattach requires fixed Docker runtime provenance")
+    provenance = _read_json(ACCEPTED_REATTACH_PROVENANCE, "accepted-run build provenance")
+    commit, snapshot = provenance.get("commit"), provenance.get("source_snapshot_sha256")
+    if (provenance.get("schema") != "fullmag.docker-all-image.v1"
+            or provenance.get("state") != "succeeded"
+            or not isinstance(commit, str) or not HEX40.fullmatch(commit)
+            or not isinstance(snapshot, str) or not HEX64.fullmatch(snapshot)):
+        _fail("accepted-run reattach requires succeeded pinned build provenance")
+    payload = dict(request, schema=ACCEPTED_REATTACH_INPUT_SCHEMA,
+                   target_build_id=commit, target_source_sha256=snapshot)
+    _ensure_directory(paths.state_root, "accepted-run runtime control")
+    with tempfile.TemporaryFile(mode="w+b", dir=paths.state_root) as stream:
+        stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf8"))
+        stream.seek(0)
+        environment[ACCEPTED_REATTACH_STDIN_ENV] = "1"
+        yield environment, stream
 
 
 def _positive(environment: Mapping[str, str], name: str, default: int) -> int:

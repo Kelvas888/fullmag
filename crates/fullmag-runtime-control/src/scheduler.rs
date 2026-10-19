@@ -77,46 +77,117 @@ pub fn accepted_run_has_scheduler_ready_task(store: &SessionStore, run_id: &RunI
         {
             continue;
         }
-        let task_id =
-            fullmag_session::task_id_for_study_step(run_id.as_str(), &study_step.step_id)?;
-        let durable_task = catalog
-            .tasks
-            .iter()
-            .find(|task| task.task_id == task_id)
-            .with_context(|| {
-                format!(
-                    "accepted scheduler step `{}` has no durable task",
-                    study_step.step_id
-                )
-            })?;
-        let scheduler_owned_accepted = durable_task.lifecycle == FmsTaskLifecycle::Accepted
-            && matches!(
-                &durable_task.readiness,
-                FmsTaskReadiness::Blocked { reason }
-                    if reason == crate::ACCEPTED_TASK_AWAITING_DEPENDENCY_RESOLUTION
-            )
-            && durable_task.attempt_id.is_none()
-            && durable_task.resource_id.is_none();
-        let unclaimed_queue = durable_task.lifecycle == FmsTaskLifecycle::Queued
-            && durable_task.readiness == FmsTaskReadiness::Ready
-            && durable_task.attempt_id.is_none()
-            && durable_task.resource_id.is_none();
-        if !scheduler_owned_accepted && !unclaimed_queue {
-            continue;
-        }
-        if scheduler_owned_accepted
-            && store
-                .read_task_preparation_receipt(run_id.as_str(), task_id.as_str())?
-                .is_none()
-        {
-            continue;
-        }
-        if crate::study_completion::dependencies_ready(store, &accepted, study_step)?
-            && inputs_are_automatically_resolvable(run_id.as_str(), &study_step.inputs, &catalog)? {
+        if scheduler_step_is_ready(store, run_id, &accepted, &catalog, study_step, execution_step)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Report readiness for one exact durable preparation anchor.  Callers that
+/// already possess an immutable anchor must not rediscover a different first
+/// planned step; this applies the same dependency and input checks as the
+/// scheduler's ordinary readiness scan.
+pub fn accepted_run_step_is_scheduler_ready(
+    store: &SessionStore,
+    run_id: &RunId,
+    step_id: &str,
+) -> Result<bool> {
+    let intent = store
+        .read_run_intent(run_id.as_str())?
+        .context("accepted scheduler requires an immutable run intent")?;
+    let specification: fullmag_application::RunSpecification =
+        serde_json::from_value(intent.specification.clone())
+            .context("accepted scheduler run specification is not typed")?;
+    if specification.run_id != *run_id {
+        bail!("accepted scheduler run id differs from the immutable RunSpec");
+    }
+    let Some(catalog) = store.read_run_catalog(run_id.as_str())? else {
+        return Ok(false);
+    };
+    if catalog.tasks.iter().all(|task| {
+        matches!(
+            task.lifecycle,
+            FmsTaskLifecycle::Succeeded
+                | FmsTaskLifecycle::Failed
+                | FmsTaskLifecycle::Cancelled
+                | FmsTaskLifecycle::Interrupted
+        )
+    }) {
+        return Ok(false);
+    }
+    let accepted = crate::load_accepted_study_snapshot(
+        store,
+        run_id,
+        &specification.snapshot.project_id,
+    )?;
+    let study_step = accepted
+        .study
+        .steps
+        .iter()
+        .find(|step| step.step_id == step_id)
+        .with_context(|| format!("accepted scheduler step `{step_id}` is missing"))?;
+    let execution_step = accepted
+        .lowered
+        .steps
+        .iter()
+        .find(|step| step.step_id == step_id)
+        .with_context(|| format!("accepted scheduler lowered step `{step_id}` is missing"))?;
+    scheduler_step_is_ready(store, run_id, &accepted, &catalog, study_step, execution_step)
+}
+
+fn scheduler_step_is_ready(
+    store: &SessionStore,
+    run_id: &RunId,
+    accepted: &crate::study::AcceptedStudySnapshot,
+    catalog: &fullmag_session::FmsRunCatalog,
+    study_step: &fullmag_authoring::StudyStep,
+    execution_step: &fullmag_plan::StudyStepExecutionPlan,
+) -> Result<bool> {
+    if !study_step.enabled
+        || !execution_step.enabled
+        || !matches!(
+            &execution_step.status,
+            fullmag_plan::StudyStepLoweringStatus::Planned
+        )
+    {
+        return Ok(false);
+    }
+    let task_id = fullmag_session::task_id_for_study_step(run_id.as_str(), &study_step.step_id)?;
+    let durable_task = catalog
+        .tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .with_context(|| {
+            format!(
+                "accepted scheduler step `{}` has no durable task",
+                study_step.step_id
+            )
+        })?;
+    let scheduler_owned_accepted = durable_task.lifecycle == FmsTaskLifecycle::Accepted
+        && matches!(
+            &durable_task.readiness,
+            FmsTaskReadiness::Blocked { reason }
+                if reason == crate::ACCEPTED_TASK_AWAITING_DEPENDENCY_RESOLUTION
+        )
+        && durable_task.attempt_id.is_none()
+        && durable_task.resource_id.is_none();
+    let unclaimed_queue = durable_task.lifecycle == FmsTaskLifecycle::Queued
+        && durable_task.readiness == FmsTaskReadiness::Ready
+        && durable_task.attempt_id.is_none()
+        && durable_task.resource_id.is_none();
+    if !scheduler_owned_accepted && !unclaimed_queue {
+        return Ok(false);
+    }
+    if scheduler_owned_accepted
+        && store
+            .read_task_preparation_receipt(run_id.as_str(), task_id.as_str())?
+            .is_none()
+    {
+        return Ok(false);
+    }
+    Ok(crate::study_completion::dependencies_ready(store, accepted, study_step)?
+        && inputs_are_automatically_resolvable(run_id.as_str(), &study_step.inputs, catalog)?)
 }
 
 /// Select and durably dispatch one accepted task for the supplied resource.
@@ -778,42 +849,14 @@ fn schedule_next_ready_accepted_task_with_admission(
         let catalog = store
             .read_run_catalog(run_id.as_str())?
             .context("accepted scheduler requires a durable run catalog")?;
-        let task_id =
-            fullmag_session::task_id_for_study_step(run_id.as_str(), &study_step.step_id)?;
-        let durable_task = catalog
-            .tasks
-            .iter()
-            .find(|task| task.task_id == task_id)
-            .with_context(|| {
-                format!(
-                    "accepted scheduler step `{}` has no durable task",
-                    study_step.step_id
-                )
-            })?;
-        let scheduler_owned_accepted = durable_task.lifecycle == FmsTaskLifecycle::Accepted
-            && matches!(
-                &durable_task.readiness,
-                FmsTaskReadiness::Blocked { reason }
-                    if reason == crate::ACCEPTED_TASK_AWAITING_DEPENDENCY_RESOLUTION
-            )
-            && durable_task.attempt_id.is_none()
-            && durable_task.resource_id.is_none();
-        let unclaimed_queue = durable_task.lifecycle == FmsTaskLifecycle::Queued
-            && durable_task.readiness == FmsTaskReadiness::Ready
-            && durable_task.attempt_id.is_none()
-            && durable_task.resource_id.is_none();
-        if !scheduler_owned_accepted && !unclaimed_queue {
-            continue;
-        }
-        if scheduler_owned_accepted
-            && store
-                .read_task_preparation_receipt(run_id.as_str(), task_id.as_str())?
-                .is_none()
-        {
-            continue;
-        }
-        if !crate::study_completion::dependencies_ready(store, &accepted, study_step)?
-            || !inputs_are_automatically_resolvable(run_id.as_str(), &study_step.inputs, &catalog)? {
+        if !scheduler_step_is_ready(
+            store,
+            run_id,
+            &accepted,
+            &catalog,
+            study_step,
+            execution_step,
+        )? {
             continue;
         }
 
