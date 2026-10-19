@@ -636,6 +636,13 @@ fn validate_path_components(path: &Path, label: &str) -> Result<(), ApiError> {
             )));
         }
         current.push(component.as_os_str());
+        #[cfg(windows)]
+        if matches!(component, Component::Prefix(_)) {
+            // A Windows volume/UNC prefix is not a filesystem component.
+            // Inspecting it as a standalone path can return ERROR_INVALID_FUNCTION;
+            // the following RootDir and normal components are still checked.
+            continue;
+        }
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -799,7 +806,7 @@ mod session_output_target_tests {
         let output_root = root.path().join("output");
         let script_directory = source_root.join("examples");
         std::fs::create_dir_all(&script_directory).expect("script directory");
-        std::fs::create_dir_all(&output_root).expect("output directory");
+        std::fs::create_dir_all(output_root.join("examples")).expect("output directory");
         let script = script_directory.join("model.py");
         std::fs::write(&script, b"study = None\n").expect("source script");
 
@@ -810,7 +817,10 @@ mod session_output_target_tests {
         )
         .expect("mapped target");
 
-        assert_eq!(target, output_root.join("examples/model.fms"));
+        let expected = std::fs::canonicalize(&output_root)
+            .expect("canonical output directory")
+            .join("examples/model.fms");
+        assert_eq!(target, expected);
     }
 
     #[test]
