@@ -1965,15 +1965,51 @@ class DockerRuntimeContract(unittest.TestCase):
         handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081)
         with patch.object(service, "_wait_api_closed"), \
                 patch.object(service, "_read_ready_owner", return_value=owner), \
-                patch.object(service, "_pin_owner", return_value=Path("/state/pinned-owner.json")), \
+                patch.object(service, "_pin_owner", return_value=Path("/opt/fullmag/runtime-control/runtime-services/pinned-owner.json")), \
+                patch.object(service, "_accepted_store_owner_pin_path", return_value=Path("/state/runs/docker-all/session-store/runtime-services/pinned-owner.json")) as alias, \
                 patch.object(service, "_run_cli", return_value={"schema_version": "runtime_service_discovery.v1",
                              "status": "drained", "owner": terminal}) as cli:
             self.assertEqual(service.stop(handle), terminal)
             self.assertIn("service-drain-confirmed", cli.call_args.args[1])
+            self.assertEqual(
+                cli.call_args.args[1][cli.call_args.args[1].index("--expected-owner") + 1],
+                "/state/runs/docker-all/session-store/runtime-services/pinned-owner.json",
+            )
+            alias.assert_called_once_with(
+                handle.paths,
+                Path("/opt/fullmag/runtime-control/runtime-services/pinned-owner.json"),
+            )
             cli.side_effect = service.RuntimeServiceUnknown("unconfirmed outcome")
             with self.assertRaises(service.RuntimeServiceUnknown):
                 service.stop(handle)
             self.assertEqual(cli.call_count, 2)
+
+    def test_accepted_store_owner_pin_requires_identical_volume_view_bytes(self):
+        service = self.load_service()
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            technical = root / "runtime-control" / "runtime-services"
+            accepted = root / "runs" / service.WORKTREE_ID / "session-store" / "runtime-services"
+            technical.mkdir(parents=True)
+            accepted.mkdir(parents=True)
+            pin = technical / "docker-client-known.json"
+            alias = accepted / pin.name
+            payload = b'{"owner_token":"known"}\n'
+            pin.write_bytes(payload)
+            alias.write_bytes(payload)
+            paths = replace(
+                service.RuntimePaths(),
+                store=accepted.parent,
+                runtime_services=technical,
+            )
+            self.assertEqual(
+                service._accepted_store_owner_pin_path(paths, pin), alias
+            )
+            alias.write_bytes(b'{"owner_token":"tampered"}\n')
+            with self.assertRaisesRegex(service.RuntimeServiceError, "pin bytes differ"):
+                service._accepted_store_owner_pin_path(paths, pin)
 
     def test_start_retains_confirmed_owner_when_later_observation_fails(self):
         service = self.load_service()

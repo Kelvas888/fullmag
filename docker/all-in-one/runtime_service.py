@@ -1912,6 +1912,38 @@ def _pin_owner(paths: RuntimePaths, owner: Mapping[str, Any]) -> Path:
     return path
 
 
+def _accepted_store_owner_pin_path(paths: RuntimePaths, technical_path: Path) -> Path:
+    """Return the native store alias after proving both volume views agree.
+
+    Docker mounts ``runtime-control/runtime-services`` at both the technical
+    runtime-control path and the accepted SessionStore compatibility path.
+    Python writes the pin through the technical view.  Rust deliberately only
+    accepts an owner path below its configured accepted store, so pass the
+    second view to the CLI only after comparing the exact persisted bytes.
+    """
+
+    technical_root = runtime_services_root(paths)
+    try:
+        relative = technical_path.relative_to(technical_root)
+    except ValueError:
+        _fail("pinned runtime service owner is outside the technical runtime-services root")
+    if len(relative.parts) != 1:
+        _fail("pinned runtime service owner path is not canonical")
+    accepted_path = paths.store / RUNTIME_SERVICES_RELATIVE / relative
+    try:
+        technical_bytes = _bounded_regular(
+            technical_path, "technical pinned runtime service owner"
+        )
+        accepted_bytes = _bounded_regular(
+            accepted_path, "accepted-store pinned runtime service owner"
+        )
+    except OSError as error:
+        _fail(f"cannot verify the accepted-store owner pin alias: {error}")
+    if technical_bytes != accepted_bytes:
+        _fail("technical and accepted-store owner pin bytes differ")
+    return accepted_path
+
+
 def _attach_pinned_handle(
     error: Exception, handle: RuntimeHandle, *, owner_pin_durable: bool
 ) -> None:
@@ -2029,7 +2061,8 @@ def stop(handle: RuntimeHandle, *, timeout: float = 30.0) -> dict[str, Any]:
         )
     if not 1 <= timeout <= 30:
         _fail("terminal drain timeout must be 1..30 seconds")
-    expected_path = _pin_owner(handle.paths, observed)
+    technical_path = _pin_owner(handle.paths, observed)
+    expected_path = _accepted_store_owner_pin_path(handle.paths, technical_path)
     result = _run_cli(handle.paths, ("runtime", "service-drain-confirmed",
                       "--config", str(handle.paths.config), "--expected-owner", str(expected_path),
                       "--timeout-seconds", str(int(timeout))), timeout=timeout + 10)
