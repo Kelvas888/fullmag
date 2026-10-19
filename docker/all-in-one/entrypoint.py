@@ -246,8 +246,9 @@ def serve():
     with service.container_recovery_configuration_override(paths, container_recovery):
         configuration = service.ensure_configuration(paths)
     print("[fullmag-backend] Starting API and runtime service", flush=True)
-    api = subprocess.Popen(["/opt/fullmag/package/bin/fullmag-api"],
-                           env=service.process_environment(paths))
+    with service.accepted_reattach_api_input(paths) as (api_environment, restore_input):
+        api = subprocess.Popen(["/opt/fullmag/package/bin/fullmag-api"],
+                               env=api_environment, stdin=restore_input)
     handle = None
     receipt = {"schema": "fullmag.docker-process-tree.v1", "state": "starting",
                "api_pid": api.pid, "accepted_store": str(paths.store),
