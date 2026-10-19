@@ -640,11 +640,15 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     ledger._validate_host_receipt(host_receipt, {"project_id": ledger_profile["project_id"],
         "mount_root": ledger_profile["mount_root"], "backing_image": ledger_profile["backing_image"]})
     ledger_profile["host_receipt"] = host_receipt
-    ledger_attestation = ledger.validate_container(json.loads(docker_text("inspect", backend_id))[0], ledger_profile, docker_text)
-    control.write(operation["root"] + "/host-ledger-attestation.json", ledger_attestation)
+    # Preserve the successful probe before observing the application. A backend
+    # exit during its attestation must not leave this known stopped helper
+    # blocking the next managed start of the same Compose project.
+    control.write(operation["root"] + "/ledger-verify-receipt.json", host_receipt)
     control.write(operation["root"] + "/ledger-verify-log.json",
                   {"log": docker_text("logs", verify_name, combined=True)})
     docker_capture("rm", actual_verify[0]["Id"])
+    ledger_attestation = ledger.validate_container(json.loads(docker_text("inspect", backend_id))[0], ledger_profile, docker_text)
+    control.write(operation["root"] + "/host-ledger-attestation.json", ledger_attestation)
     # Observe the existing incarnations; a readiness check must never run up
     # again or wait an hour after the supervisor has already closed admission.
     process_script = """import json,pathlib,sys

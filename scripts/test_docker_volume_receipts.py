@@ -28,6 +28,58 @@ class VolumeReceiptTests(unittest.TestCase):
         with self.assertRaises(module.RuntimeServiceError):
             module.canonical_paths({'FULLMAG_PACKAGE_PROVENANCE':'/state/user-data.json'})
 
+    def test_successful_ledger_probe_is_archived_and_retired_before_backend_observation(self):
+        import json
+        import docker_volume_dev as dev
+        import docker_host_ledger as ledger
+        import fullmag_docker_runtime as runtime
+        from subprocess import CompletedProcess
+        control = mock.Mock(project='fullmag-master', volume='fullmag-control-test')
+        operation = {'root': 'resume/attempts/check', 'receipt': {'attempt': 'a' * 32}}
+        written = {}
+        events = []
+        control.write.side_effect = lambda path, value: written.__setitem__(path, value)
+        image = 'sha256:' + 'b' * 64
+        probe_id = 'c' * 64
+        probe_name = 'fullmag-ledger-verify-' + 'a' * 32
+        def text(*arguments, **kwargs):
+            if arguments == ('inspect', probe_name):
+                return json.dumps([{'Id': probe_id, 'Image': image,
+                    'State': {'Running': False, 'ExitCode': 0},
+                    'Config': {'Labels': {'com.docker.compose.project': control.project}}}])
+            if arguments == ('logs', probe_name):
+                return 'successful verify log'
+            if arguments == ('inspect', 'backend-id'):
+                return json.dumps([{'Id': 'backend-id'}])
+            raise AssertionError(arguments)
+        def retire(*arguments, **kwargs):
+            self.assertEqual(arguments, ('rm', probe_id))
+            self.assertIn(operation['root'] + '/ledger-verify-log.json', written)
+            self.assertIn(operation['root'] + '/ledger-verify-receipt.json', written)
+            events.append('retired')
+            return CompletedProcess([], 0, b'', b'')
+        def failed_backend(*arguments):
+            events.append('backend-observation')
+            raise BuildControlError('backend exited')
+        with mock.patch.object(dev, '_operator_probe_record_from_retained', return_value={}), \
+             mock.patch.object(dev, '_wait_for_publication', return_value=({}, {})), \
+             mock.patch.object(dev, 'compose_capture', return_value=b''), \
+             mock.patch.object(dev, 'docker_text', side_effect=text), \
+             mock.patch.object(dev, 'docker_capture', side_effect=retire), \
+             mock.patch.object(runtime, '_assembly_from_backend_start', return_value={}), \
+             mock.patch.object(runtime, '_complete_backend_storage_preflight'), \
+             mock.patch.object(ledger, '_parse_json_lines', return_value={'schema': 'verified'}), \
+             mock.patch.object(ledger, '_validate_host_receipt'), \
+             mock.patch.object(ledger, 'validate_container', side_effect=failed_backend):
+            with self.assertRaisesRegex(BuildControlError, 'backend exited'):
+                dev._finish(control, operation,
+                    {'services': {'backend': {'environment': {'FULLMAG_DOCKER_DEVICE_ACCESS': 'gpu'}}}},
+                    'backend-id', 'frontend-id', Path('/source'), Path('/state'), Path('/certificate'),
+                    {'restart_verified': True}, {}, {'image_id': image}, image, Path('/git'),
+                    {'maintenance_document': {}, 'project_id': 'project',
+                     'mount_root': '/ledger', 'backing_image': '/ledger.ext4'}, 3197)
+        self.assertEqual(events, ['retired', 'backend-observation'])
+
     def test_invalid_compose_stops_before_daemon_mutation_boundary(self):
         import docker_volume_dev as dev
         operation = {'receipt': {}, 'daemon_pending': False}
