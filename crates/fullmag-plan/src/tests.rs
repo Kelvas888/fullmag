@@ -15329,6 +15329,7 @@ fn fem_domain_mesh_asset_accepts_optional_build_report() {
             orphan_entities: Vec::new(),
             rejected_element_types: Vec::new(),
             mixed_layer_topology_certificate: None,
+            mixed_layer_topology_certificate_v2: None,
             mixed_topology_provenance: None,
         }),
     };
@@ -16790,6 +16791,7 @@ fn valid_mixed_certificate_asset_for_version(
             authored_regions_count: Some(1),
             realized_regions_count: Some(1),
             mixed_layer_topology_certificate: Some(certificate),
+            mixed_layer_topology_certificate_v2: None,
             mixed_topology_provenance: None,
         }),
     }
@@ -16847,6 +16849,7 @@ fn python_mixed_certificate_asset_for_layers(layer_count: u32) -> fullmag_ir::Fe
             authored_regions_count: Some(1),
             realized_regions_count: Some(1),
             mixed_layer_topology_certificate: Some(certificate),
+            mixed_layer_topology_certificate_v2: None,
             mixed_topology_provenance: None,
         }),
     }

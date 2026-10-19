@@ -33,12 +33,20 @@ docker-dev-images:
 
 # Direct two-service development: the persistent backend checks/builds source at every start.
 # The source parameter selects the main checkout or a registered worktree.
-docker-dev source_root="" port="3197" script="" gpu_access="auto":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" up --port {{quote(port)}} --gpu-access {{quote(gpu_access)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if script == "" { "" } else { "--script " + quote(script) }}}
+docker-dev source_root="" port="" script="" gpu_access="auto":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" up {{if port == "" { "" } else { "--port " + quote(port) }}} --gpu-access {{quote(gpu_access)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if script == "" { "" } else { "--script " + quote(script) }}}
 
+# Codegen through the already-running services; no Compose lifecycle operation.
+docker-dev-codegen source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" codegen-openapi {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
 # Stop only a pinned supervisor whose failed admission already reaped the API.
 docker-dev-stop-failed source_root container_id image_id process_receipt_sha256:
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_stop_failed.py" --source-root {{quote(source_root)}} --container-id {{quote(container_id)}} --image-id {{quote(image_id)}} --process-receipt-sha256 {{quote(process_receipt_sha256)}}
+
+# Stop one rejected startup before any RunIntent or host reservation was admitted.
+# Every identity and proof is explicit; the helper never retries the script or clears state.
+docker-dev-stop-unadmitted attempt config_sha256 source_root backend_container_id frontend_container_id image_id failure_marker_sha256 process_receipt_sha256 source_sha256 request_id session_id:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" stop-unadmitted --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --backend-container-id {{quote(backend_container_id)}} --frontend-container-id {{quote(frontend_container_id)}} --image-id {{quote(image_id)}} --failure-marker-sha256 {{quote(failure_marker_sha256)}} --process-receipt-sha256 {{quote(process_receipt_sha256)}} --source-sha256 {{quote(source_sha256)}} --request-id {{quote(request_id)}} --session-id {{quote(session_id)}}
 
 # Interpreted launcher/cache regressions run inside the selected fixed backend.
 docker-dev-control-checks source_root:
@@ -48,13 +56,29 @@ docker-dev-control-checks source_root:
 docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend="false":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" resume-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if restart_backend == "true" { "--restart-backend" } else if restart_backend == "false" { "" } else { error("restart_backend must be true or false") }}}
 
+# Activate one script in the exact currently running group. The control-volume
+# verified receipts supply attempt/configuration pins; ambiguity fails closed.
+docker-dev-script script source_root="" port="" request_id="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" script --script {{quote(script)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if port == "" { "" } else { "--port " + quote(port) }}} {{if request_id == "" { "" } else { "--request-id " + quote(request_id) }}}
+
+# Pinned activation for recovery, audits, and callers that already hold the
+# exact attempt/config/source identity.
+docker-dev-script-pinned attempt config_sha256 source_root script request_id="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" activate-script --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --script {{quote(script)}} {{if request_id == "" { "" } else { "--request-id " + quote(request_id) }}}
+
 # Restart a pinned healthy backend only when its API confirms no active session.
 docker-dev-restart-idle attempt config_sha256 source_root port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" restart-idle-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}
 
 # Replace exact retained volume DEV services, preserving caches and Windows state.
-docker-dev-recreate-volume attempt config_sha256 source_root port="3197" fresh_state="false":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if fresh_state == "true" { "--fresh-state" } else if fresh_state == "false" { "" } else { error("fresh_state must be true or false") }}}
+docker-dev-recreate-volume attempt config_sha256 source_root port="3197" fresh_state="false" recovery_authorization="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if recovery_authorization == "" { "" } else { "--recovery-authorization " + quote(recovery_authorization) }}} {{if fresh_state == "true" { "--fresh-state" } else if fresh_state == "false" { "" } else { error("fresh_state must be true or false") }}}
+
+# Explicit managed recovery of one stopped Docker namespace. The old attempt,
+# Compose config digest, source checkout, frontend port, and control-volume
+# authorization are all required; no ordinary recreation fallback is allowed.
+docker-dev-recover-container old_attempt config_sha256 source_root port recovery_authorization:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" recreate-volume --attempt {{quote(old_attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} --recovery-authorization {{quote(recovery_authorization)}}
 
 # Controlled recreation of one terminal failed direct-development run.  The
 # receipt and config digest are mandatory; this is not unknown-owner recovery.
@@ -70,6 +94,8 @@ docker-dev-recover-orphan pins target_container project diagnostics_root resume_
 docker-dev-build source_root="" gpu_access="auto":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" build --gpu-access {{quote(gpu_access)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
 
+# Legacy/frozen managed-runtime and release/qualification routes below.
+# They are separate from daily docker-dev and must never be its fallback.
 # Submit a clean commit to the shared runner using independent source copies.
 docker-all-build commit:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" submit --commit {{quote(commit)}}
@@ -623,9 +649,12 @@ verify-authoring-contracts:
 verify-authoring-scene-adapter:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route authoring-scene-adapter-tests --repo-root "{{repo_root}}"
 
-# Managed OpenAPI source generation; the emitted JSON remains a versioned
-# frontend artifact, while all Cargo output stays under canonical storage.
-generate-api-openapi:
+# Daily OpenAPI source generation uses the already-running fixed DEV services.
+generate-api-openapi source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" codegen-openapi {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
+
+# Explicit legacy release/CI route. It is never the daily Docker DEV path.
+generate-api-openapi-legacy:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-openapi-codegen --repo-root "{{repo_root}}"
 
 # Read-only diagnostic export from a terminal, verified BuildRunner package.

@@ -42,9 +42,13 @@ MAX_PROVENANCE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_ACTIVATION_RECEIPT_BYTES = 2 * MAX_RESPONSE_BYTES
 STARTUP_ACTIVATION_TIMEOUT_SECONDS = 2100.0
+MAX_STARTUP_REJECTION_MESSAGE_CHARS = 2048
+STARTUP_REJECTION_TRUNCATION_MARKER = "\n...[message middle truncated]...\n"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+STARTUP_RECEIPT_KEY_ENV = "FULLMAG_STARTUP_RECEIPT_KEY"
+STARTUP_RECEIPT_ROOT = Path("/opt/fullmag/control/backend")
 PROVENANCE_SHA256_ENV = "FULLMAG_STARTUP_PROVENANCE_SHA256"
 ACTIVATION_RECEIPT_PATH = Path("/state/.fullmag/docker-startup/activation.json")
 # Script authoring/capability failures are command outcomes. A rejected
@@ -64,13 +68,25 @@ class StartupScriptError(ValueError):
     """Fail-closed source or activation admission error."""
 
 
+def _bounded_rejection_message(message: str) -> str:
+    """Keep the start and final cause of a long bounded API rejection."""
+
+    if len(message) <= MAX_STARTUP_REJECTION_MESSAGE_CHARS:
+        return message
+    marker = STARTUP_REJECTION_TRUNCATION_MARKER
+    available = MAX_STARTUP_REJECTION_MESSAGE_CHARS - len(marker)
+    head_length = (available + 1) // 2
+    tail_length = available - head_length
+    return message[:head_length] + marker + message[-tail_length:]
+
+
 class StartupScriptRejected(StartupScriptError):
     """An authoritative script validation rejection, before solver admission."""
 
     def __init__(self, http_status: int, code: str, message: str):
         self.http_status = http_status
         self.code = code
-        self.message = message[:2048]
+        self.message = _bounded_rejection_message(message)
         super().__init__(f"startup script rejected (HTTP {http_status}, {code}): {self.message}")
 
 
@@ -410,6 +426,14 @@ def _ensure_activation_receipt_parent(path: Path) -> Path:
     return result
 
 
+def activation_receipt_path_for_key(key: str) -> Path:
+    """Return the managed receipt path for one request-key digest."""
+
+    if not isinstance(key, str) or not SHA256_RE.fullmatch(key):
+        raise StartupScriptError("startup activation receipt key is invalid")
+    return STARTUP_RECEIPT_ROOT / ("script-activation-" + key) / "activation.json"
+
+
 def _replace_json(
     path: Path,
     value: Mapping[str, Any],
@@ -546,6 +570,50 @@ def build_activation_request(authorization: Mapping[str, Any]) -> dict[str, Any]
             "legacy_cli": False,
         },
     }
+
+
+def _assert_no_active_session(
+    api_base: str, *, timeout: float = 5.0
+) -> dict[str, Any]:
+    """Require a definitive empty workspace before creating a new marker."""
+
+    parsed = urllib.parse.urlparse(api_base)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise StartupScriptError("startup health API must be the local backend")
+    request = urllib.request.Request(
+        api_base.rstrip("/") + "/v2/platform/health",
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(request, timeout=timeout) as result:
+            if result.status != 200:
+                raise StartupScriptError(
+                    f"startup health returned HTTP {result.status}"
+                )
+            body = result.read(MAX_RESPONSE_BYTES + 1)
+    except StartupScriptError:
+        raise
+    except (OSError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+        raise StartupScriptError(
+            f"cannot confirm an empty workspace before startup activation: {error}"
+        ) from error
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise StartupScriptError("startup health response exceeds its size bound")
+    try:
+        document = json.loads(body.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StartupScriptError("startup health response is not valid JSON") from error
+    if (not isinstance(document, dict)
+            or document.get("status") != "ok"
+            or type(document.get("active_session")) is not bool):
+        raise StartupScriptError("startup health response is incomplete")
+    if document["active_session"] is not False:
+        raise StartupScriptError(
+            "backend has an active or unknown session; startup activation refused"
+        )
+    return document
 
 
 def validate_activation_response(
@@ -870,6 +938,7 @@ def run_from_environment() -> dict[str, Any] | None:
         raise StartupScriptError("mounted startup script differs from host-attested bytes")
     if len(script_data) != authorization.get("source_size_bytes"):
         raise StartupScriptError("mounted startup script size differs from host-attested bytes")
+    _assert_no_active_session(values["api"])
     started = _activation_receipt_started(authorization, provenance_sha256)
     try:
         _exclusive_json(
@@ -947,6 +1016,7 @@ __all__ = [
     "AUTHORIZATION_SCHEMA",
     "ACTIVATION_RECEIPT_PATH",
     "ACTIVATION_RECEIPT_SCHEMA",
+    "STARTUP_RECEIPT_KEY_ENV",
     "REQUEST_SCHEMA",
     "RESPONSE_SCHEMA",
     "StartupScriptAuthorization",
@@ -956,6 +1026,7 @@ __all__ = [
     "STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA",
     "STARTUP_ACTIVATION_TIMEOUT_SECONDS",
     "activate",
+    "activation_receipt_path_for_key",
     "build_activation_request",
     "prepare",
     "run_from_environment",

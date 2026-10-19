@@ -691,6 +691,17 @@ fn validate_runtime_command_contract(
     ledger: &std::collections::VecDeque<TrackedCommandRecord>,
     command: &SessionCommand,
 ) -> Result<(), ApiError> {
+    if matches!(
+        command.kind.as_str(),
+        "run" | "relax" | "solve" | "compute_fields" | "compute_energies"
+    )
+        && snapshot.session.status == "activating"
+    {
+        return Err(ApiError::conflict_with_code(
+            "startup_activation_in_progress",
+            "Compute commands are unavailable while startup activation is preparing the study",
+        ));
+    }
     validate_runtime_command_preconditions(snapshot, ledger, command)?;
 
     if is_stage_control_command(command.kind.as_str()) {
@@ -2153,17 +2164,22 @@ async fn publish_accepted_session_command_impl_with_context_under_transition_val
     Ok(response)
 }
 
-/// Publish a whole-study accepted run created by the Docker startup adapter.
-/// The verifier has already captured the source, loaded the canonical scene,
-/// and materialized preparation; this function only binds that immutable run
-/// to the fenced current-live read model. No command queue or second viewport
-/// is created.
-pub(crate) async fn publish_accepted_live_study_under_transition(
-    state: &Arc<AppState>,
+/// Apply the minimum accepted Study read model synchronously.
+///
+/// This helper performs no async work and no durable store write. Callers that
+/// commit a prepared RunIntent must build the candidate snapshot before the
+/// commit, then assign it immediately after the synchronous commit while the
+/// transition fence and current-live write guard are still held. That removes
+/// the cancellation window in which a durable run could exist without a
+/// current-live run/metadata binding.
+pub(crate) fn apply_accepted_live_study_snapshot(
+    snapshot: &mut SessionStateResponse,
     context: &crate::types::CurrentLiveRequestContext,
+    session_epoch: u64,
     run_id: &str,
     step_ids: &[String],
     status: &str,
+    metadata: Option<serde_json::Value>,
 ) -> Result<(), ApiError> {
     if step_ids.is_empty() {
         return Err(ApiError::internal(
@@ -2175,17 +2191,7 @@ pub(crate) async fn publish_accepted_live_study_under_transition(
             "accepted startup study publication has an invalid live status",
         ));
     }
-    let mut current = state.current_live_state.write().await;
-    let snapshot = current
-        .as_mut()
-        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
-    crate::ensure_current_live_request_context(
-        snapshot,
-        context,
-        state
-            .current_live_session_epoch
-            .load(std::sync::atomic::Ordering::Acquire),
-    )?;
+    crate::ensure_current_live_request_context(snapshot, context, session_epoch)?;
     if snapshot
         .run
         .as_ref()
@@ -2202,7 +2208,7 @@ pub(crate) async fn publish_accepted_live_study_under_transition(
             session_id: context.session_id.clone(),
             session: None,
             session_status: Some(status.to_string()),
-            metadata: None,
+            metadata,
             mesh_workspace: None,
             stage_execution: None,
             simulation_preparation: None,
@@ -2235,20 +2241,48 @@ pub(crate) async fn publish_accepted_live_study_under_transition(
             fem_mesh: None,
         },
     )?;
+    Ok(())
+}
+
+/// Publish a whole-study accepted run created by the Docker startup adapter.
+/// The verifier has already captured the source, loaded the canonical scene,
+/// and materialized preparation; this function only binds that immutable run
+/// to the fenced current-live read model. No command queue or second viewport
+/// is created.
+pub(crate) async fn publish_accepted_live_study_under_transition(
+    state: &Arc<AppState>,
+    context: &crate::types::CurrentLiveRequestContext,
+    run_id: &str,
+    step_ids: &[String],
+    status: &str,
+) -> Result<(), ApiError> {
+    let mut current = state.current_live_state.write().await;
+    let snapshot = current
+        .as_mut()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    apply_accepted_live_study_snapshot(
+        snapshot,
+        context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+        run_id,
+        step_ids,
+        status,
+        None,
+    )?;
+    let realtime_snapshot = snapshot.clone();
     drop(current);
-    // The accepted run becomes the new current run as part of this publication,
-    // so the caller's pre-activation context (which is fenced to the temporary
-    // startup/session run) is intentionally stale after the write.  The
-    // transition guard remains held by the caller; subsequent startup steps
-    // must capture/rebind a context carrying `run_id` before reading receipts.
-    if let Some(snapshot) = state.current_live_state.read().await.as_ref().cloned() {
-        let display_revision = state.current_display_selection.read().await.revision;
-        let realtime_state =
-            crate::current_live_realtime_state_from_snapshot(state, &snapshot, display_revision)
-                .await;
-        crate::publish_current_live_realtime_batch_changed(state, &realtime_state, false, 0)
-            .await?;
-    }
+    // The accepted run becomes the new current run as part of this
+    // publication. The caller's pre-activation context is intentionally stale
+    // after the write; its transition fence remains responsible for the
+    // subsequent context rebind.
+    let display_revision = state.current_display_selection.read().await.revision;
+    let realtime_state =
+        crate::current_live_realtime_state_from_snapshot(state, &realtime_snapshot, display_revision)
+            .await;
+    crate::publish_current_live_realtime_batch_changed(state, &realtime_state, false, 0)
+        .await?;
     Ok(())
 }
 
@@ -3099,6 +3133,73 @@ mod tests {
         assert_eq!(replacement.status, CommandLifecycleState::Accepted);
         assert!(replacement.completion_status.is_none());
         assert!(replacement.error.is_none());
+    }
+
+    #[test]
+    fn startup_activation_rejects_compute_commands_before_run_publication() {
+        let request: CurrentLiveSnapshotRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "startup-activating"
+        }))
+        .expect("minimal startup snapshot request should deserialize");
+        let mut snapshot = default_current_live_state(&request);
+        snapshot.session.status = "activating".to_string();
+        snapshot.runtime_status = crate::session::build_runtime_status_view("activating");
+        let ledger = std::collections::VecDeque::new();
+
+        for kind in ["run", "relax", "solve", "compute_fields", "compute_energies"] {
+            let command = journal_command(kind, kind);
+            let error = validate_accepted_command_admission_against_snapshot(
+                &snapshot,
+                &ledger,
+                &command,
+            )
+            .expect_err("compute command must be blocked during startup activation");
+            assert_eq!(error.code.as_deref(), Some("startup_activation_in_progress"));
+        }
+    }
+
+    #[test]
+    fn accepted_live_study_snapshot_binds_run_metadata_and_step_ids() {
+        let request: CurrentLiveSnapshotRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "startup-binding"
+        }))
+        .expect("minimal startup snapshot request should deserialize");
+        let mut snapshot = default_current_live_state(&request);
+        snapshot.session.status = "activating".to_string();
+        snapshot.runtime_status = crate::session::build_runtime_status_view("activating");
+        let context = crate::types::CurrentLiveRequestContext {
+            session_id: snapshot.session.session_id.clone(),
+            run_id: Some(snapshot.session.run_id.clone()),
+            session_epoch: 17,
+            request_scope_epoch: "scope:17".to_string(),
+        };
+        let metadata = serde_json::json!({
+            "docker_startup": {
+                "status": "waiting_for_compute",
+                "run_id": "accepted-run",
+                "step_ids": ["step-000", "step-001"]
+            }
+        });
+        let step_ids = vec!["step-000".to_string(), "step-001".to_string()];
+
+        apply_accepted_live_study_snapshot(
+            &mut snapshot,
+            &context,
+            17,
+            "accepted-run",
+            &step_ids,
+            "waiting_for_compute",
+            Some(metadata.clone()),
+        )
+        .expect("accepted publication should synchronously bind its read model");
+
+        assert_eq!(snapshot.session.run_id, "accepted-run");
+        assert_eq!(snapshot.session.status, "waiting_for_compute");
+        assert_eq!(snapshot.runtime_status.code, "waiting_for_compute");
+        let run = snapshot.run.as_ref().expect("accepted run manifest");
+        assert_eq!(run.run_id, "accepted-run");
+        assert_eq!(run.total_steps, 2);
+        assert_eq!(snapshot.metadata.as_ref(), Some(&metadata));
     }
 
     #[test]

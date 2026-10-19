@@ -2,7 +2,10 @@
 
 Decyzja użytkownika z 17.10.2026: [ADR 0061](../adr/0061-docker-development-build-and-runtime-container.md).
 Kontrakt: dwa stałe kontenery aplikacji; backend buduje i uruchamia kod w tej
-samej instancji. Wdrożenie i dowody tego wariantu: **NOT VERIFIED**.
+samej instancji. Dane techniczne procesu budowania są izolowane w nazwanych
+wolumenach Docker/BuildKit przypisanych do grupy Compose. Sesje, projekty,
+ustawienia i wyniki symulacji pozostają w fizycznym storage Windows. Wdrożenie
+i dowody tego wariantu: **NOT VERIFIED**.
 
 ## Źródła i usługi
 
@@ -36,12 +39,14 @@ przejęcia portu lub zatrzymania innej grupy.
 
 ### Kontrakt wejść developerskich
 
-Launcher rozwiązuje storage i tożsamość checkoutu oraz przekazuje readonly źródła
-i Git common directory. Przy każdym starcie backend sam sprawdza aktualne pliki
-i zależności i przygotowuje zweryfikowany manifest oraz prywatny cień ext4.
-Kompilator pracuje na spójnym wejściu danego buildu; zapis kolejnej zmiany
-w Windows nie miesza plików trwającej kompilacji. Provenance opisuje rzeczywiste
-wejście tego buildu, także po restarcie bez procesu launchera na hoście.
+Launcher rozwiązuje tożsamość checkoutu, grupę Compose i storage danych użytkownika
+oraz przekazuje readonly źródła i Git common directory. Przy każdym starcie backend
+sam sprawdza aktualne pliki i zależności i przygotowuje zweryfikowany manifest oraz
+prywatny cień źródeł w technicznym wolumenie Docker. Kompilator pracuje na spójnym
+wejściu danego buildu; zapis kolejnej zmiany w Windows nie miesza plików trwającej
+kompilacji. Provenance, logi i receipty buildu również trafiają do wolumenu
+technicznego, a nie do hostowego storage sesji. Ten podział po restarcie bez procesu
+launchera na hoście pozostaje **NOT VERIFIED**.
 
 Ten sam kontener `backend` wykonuje build i następnie uruchamia aplikację.
 Nie powstaje oddzielny kontener `backend-build` dla iteracji dev; nie ma też
@@ -51,25 +56,25 @@ oraz krótkie narzędzia sprawdzające storage są osobnymi operacjami utrzymani
 a nie dodatkowymi usługami aplikacji.
 
 Backend DEV używa profilu v2 opisanego w ADR 0061: jawnej pary prywatnych
-wolumenów Linux Dockera pod `/build` i `/opt/fullmag/package`. Przygotowanie
-wolumenów i migracja technicznych markerów mają dowód wykonania; cold build,
-API oraz pomiary restartu i kompilacji przyrostowej pozostają **NOT VERIFIED**.
-Stary backendowy cache v1 zachowujemy do osobnej kontroli użycia i rollbacku.
-Frontend nadal używa własnego cache v1: pliku ext4 o rozmiarze 8 GiB na Windows.
-Sesje, wyniki i ustawienia grupy zachowują opisane niżej katalogi Windows.
-Nie usuwaj ani nie przenoś aktywnego cache ręcznie.
+wolumenów Docker pod `/build` i `/opt/fullmag/package`. Cache Cargo, CMake,
+CUDA, MFEM, hypre, libCEED, zależności pnpm, staging, pakiety, logi, receipty
+i provenance należą do technicznych wolumenów grupy; Docker Desktop przechowuje
+je w swoim wewnętrznym dysku danych, a nie w Windows `storage` projektu.
+Frontend ma analogiczny nazwany wolumen cache/control. Przygotowanie wolumenów
+i migracja technicznych markerów mają dowód częściowy; cold build, API, mounty,
+brak zapisu buildu do hosta oraz pomiary restartu i kompilacji przyrostowej
+pozostają **NOT VERIFIED**. Stare cache zachowujemy do osobnej kontroli użycia
+i rollbacku. Nie usuwaj ani nie przenoś aktywnego cache ręcznie.
 
-Cache Cargo i osobne katalogi CMake FDM/FEM leżą na trwałym ext4 przypisanym do
-checkoutu/profilu. Nie zależą od UUID kolejnego uruchomienia. Niezmienione pliki
-cienia zachowują zawartość i metadane potrzebne kompilacji przyrostowej.
-Zmiana modułu przebudowuje go oraz rzeczywistych zależnych konsumentów;
+Niezmienione pliki cienia zachowują zawartość i metadane potrzebne kompilacji
+przyrostowej. Zmiana modułu przebudowuje go oraz rzeczywistych zależnych konsumentów;
 zmiana wspólnego typu może wymagać więcej pracy niż zmiana pliku wykonawczego.
 Zmiana kodu aplikacji nie przebudowuje automatycznie CUDA, MFEM, hypre ani
 libCEED. Zmiana zależności, kompilatora lub flag może unieważnić szerszy cache.
-Blokada backendu chroni konkretny trwały cache; odrębne grupy mogą kompilować
-równolegle. Hostowy heavy lock służy przygotowaniu obrazów i receiptów, nie
-obejmuje kompilacji w uruchomionej usłudze. Przydział fizycznego GPU nadal
-przechodzi przez wspólny host ledger.
+Blokada backendu chroni konkretny trwały wolumen; odrębne grupy mogą kompilować
+równolegle. Blokady i rejestry techniczne buildu pozostają w granicy grupy Compose.
+Przydział fizycznego GPU nadal przechodzi przez wspólny host ledger, który jest
+operacyjną infrastrukturą zasobów, a nie cache'em buildu ani danymi sesji.
 
 ## Polecenia trybu developerskiego
 
@@ -116,13 +121,28 @@ zależności. Start uruchamia dwie stałe usługi; backend wykonuje swój build
 przed API. Otwórz `http://127.0.0.1:3197/workspace`. Brak `--script` oznacza Home,
 a nie automatyczny wybór dawnej sesji.
 
-Na Windows utworzenie nowego cache frontendu wymaga co najmniej 16 GiB wolnego
-miejsca na dysku storage: 8 GiB na plik cache i 8 GiB pozostawione dla backendu.
-Istniejący cache nie jest alokowany ponownie, ale start nadal wymaga 8 GiB
-wolnego miejsca. Launcher sprawdza je także po przygotowaniu cache, przed
-uruchomieniem usług. Są to dolne progi bezpieczeństwa, nie oszacowanie całego
-pierwszego buildu; świeży cache Cargo i toolchain mogą potrzebować więcej.
-Brak miejsca przerywa start i zachowuje dotychczasowe cache oraz wyniki.
+Po uruchomieniu tej grupy skrypt można aktywować bez ręcznego przepisywania
+attemptu i digestu konfiguracji:
+
+```powershell
+just docker-dev-script "examples/x.py"
+```
+
+Launcher czyta tylko bieżący `development/current.json` oraz trzy zweryfikowane
+wskaźniki faz z control volume, wiąże je z dokładnymi kontenerami backendu i
+frontendu, sprawdza immutable image, źródło, config digest, prywatną sieć
+backendu i loopbackowy port frontendu. Brak jednej pary lub więcej niż jedna
+zgodna para kończy się błędem. Jawne `source_root`, `port` i `request_id` można
+przekazać jako opcjonalne argumenty recepty, a istniejące ręczne piny pozostają
+pod `just docker-dev-script-pinned`.
+
+Na Windows wolne miejsce dla danych technicznych sprawdzaj na dysku danych
+Docker Desktop: tam znajdują się named volumes i BuildKit. `FULLMAG_PROJECT_STORAGE_ROOT`
+zawiera dane użytkownika i nie powinien być używany jako rezerwuar cache buildu.
+Dokładne progi dla cache frontendu, Cargo i toolchaina muszą być sprawdzane przez
+launcher; ich zgodność z tym podziałem pozostaje **NOT VERIFIED**. Brak miejsca
+powinien przerwać start przed kosztownym buildem i zachować dotychczasowy cache,
+sesje oraz wyniki.
 
 Odpowiednik bez `just`:
 
@@ -138,8 +158,8 @@ pollingu `5000` ms; lokalne `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza
 `250`–`10000` ms. Wykrycie edycji może więc poczekać do następnego skanu,
 po którym Next przebudowuje zmienione moduły. Docker DEV pomija wygenerowane
 katalogi `.fullmag-frontend`, `.next*` i `node_modules`; `app`, `src`, `public`
-i `scripts` pozostają obserwowane. Zależności pnpm i cache Next zostają na
-ext4; HMR nie buduje backendu ani toolchaina.
+i `scripts` pozostają obserwowane. Zależności pnpm i cache Next zostają w
+nazwanym wolumenie frontendowym; HMR nie buduje backendu ani toolchaina.
 
 Tailwind używa jawnych wzorców plików w `app/globals.css`, ograniczonych do
 `app` i `src`. Nowe pasujące pliki i klasy pozostają wykrywane przez HMR.
@@ -155,6 +175,14 @@ docker ps --filter "label=com.docker.compose.project=<compose-project>" --filter
 docker restart <backend-container-id>
 docker logs -f <backend-container-id>
 ```
+
+Usługi Compose DEV ustawiają Docker `json-file` logging z rotacją `10m × 3`
+na każdy kontener. Frontend zapisuje szczegóły Next w stałym
+`/state/development/next.log` z named volume; plik jest zerowany przy każdym
+nowym starcie frontendu, więc restarty nie dopisują kolejnych kopii. To nie
+ogranicza rozmiaru `next.log` podczas jednej długiej sesji ani archiwów starych
+pakietów backendu. Pełna retencja tych technicznych plików nadal wymaga pracy;
+limit logów Docker nie jest quota dla wolumenów ani BuildKit.
 
 Każdy start sam sprawdza aktualne zamontowane źródła. Bez zmian używa istniejącego
 wyniku; po edycji kompiluje zmienione moduły oraz ich zależnych konsumentów,
@@ -262,6 +290,15 @@ receipt/provenance i hash binarki; sam zapis zmiany kodu nie wymaga nowej zgody
 hosta dla niezmienionego storage. Ścieżka release zachowuje dokładne hostowe piny.
 Szczegóły i zakres delegacji określa ADR 0061; wdrożenie pozostaje **NOT VERIFIED**.
 
+Przed pierwszym montowaniem nowego katalogu `/state` natywny launcher Windows
+tworzy dokładnie `runs/docker-all/session-store/runtime-services` oraz wykonuje
+rzeczywistą próbę zapisu i usunięcia pliku w końcowym katalogu. Odrzuca wpisy
+istniejące i punkty reparse; nie przejmuje danych, nie wykonuje rekursywnego
+`chown` ani migracji starego stanu. Dzięki temu Docker nie tworzy tych katalogów
+jako `root:root` `0755`, a UID usługi może utworzyć `WRITER.lock`. Są to katalogi
+danych runtime sesji na Windows; cache, staging, pakiet i logi buildu nadal
+pozostają w nazwanych wolumenach Docker.
+
 ## Skrypt symulacji jako parametr startu
 
 Trzeci argument recepty `just docker-dev` wybiera plik w tym samym checkoutcie:
@@ -306,10 +343,38 @@ i rzeczywiste granice automatycznego sprzątania:
 | Dane | Trwałe miejsce |
 | --- | --- |
 | Źródła | Wybrany checkout Windows, readonly bind; frontend HMR |
-| Build, zależności i pakiet dev | Prywatny trwały ext4 cache w zarządzanym backing storage |
-| Sesje, modele, wyniki, logi i receipty | Fizyczny storage Windows, mount `/state` |
-| Ustawienia i ostatnie projekty | `storage/user-data/<compose-project>/workspace.db`, mount `/user-data` |
-| Przydziały fizycznego CPU/GPU | Wspólny `host-ledger-v1` na zarządzanym ext4; nie osobny ledger per grupa |
+| Toolchain, zależności, cache kompilatorów, staging i pakiet dev | Nazwane wolumeny Docker grupy Compose oraz BuildKit; nie hostowy `storage` |
+| Manifesty wejściowe, konteksty, logi buildu, receipty i provenance | Techniczne wolumeny Docker grupy Compose; nie Windows storage |
+| Kontrola runtime i metadata usług technicznych | Wydzielony podwolumen Docker grupy Compose; nie katalog sesji użytkownika |
+| Sesje, modele, wyniki i logi symulacji | Fizyczny storage Windows, mount `/state` |
+| Ustawienia, ostatnie projekty i historia grupy | `storage/user-data/<compose-project>/workspace.db`, mount `/user-data` |
+| Przydziały fizycznego CPU/GPU | Wspólny `host-ledger-v1` zarządzany osobnym kontraktem; nie cache buildu ani ledger per grupa |
+
+### Granica zapisu i kontrola wzrostu danych technicznych
+
+Launcher powinien tworzyć oraz przypinać do jednej grupy Compose osobne
+przestrzenie techniczne dla backendowego `/build`, opublikowanego pakietu
+`/opt/fullmag/package`, wspólnego control/provenance, runtime-control oraz
+frontendowego cache i stanu developmentu. Ich nazwy, klucze profilu i marker
+właściciela wynikają z projektu Compose oraz worktree; operator nie wskazuje
+drugiego hostowego katalogu jako zamiennika. `subpath` może izolować frontend od
+backendowych receiptów, ale nie zmienia własności ani trwałości wolumenu.
+
+BuildKit przechowuje warstwy obrazu i cache zależności na dysku danych Docker
+Desktop. Named volumes przechowują wynik przyrostowego buildu, staging, pakiet,
+logi, receipty i provenance do czasu kontrolowanej retencji. Samo zatrzymanie
+lub usunięcie kontenera nie powinno usuwać tych danych; ich usunięcie wymaga
+jawnej operacji lifecycle dla dokładnej grupy, po sprawdzeniu aktywnych runów,
+mountów, lease i możliwości rollbacku. `docker compose down --volumes`, globalny
+prune oraz ręczne kasowanie katalogów nie są procedurą codziennego restartu.
+
+Każdy nowy build używa klucza wejścia i istniejącego cache. Zastąpiony pakiet
+można usunąć dopiero po trwałym zapisaniu nowego pakietu, receiptów rotacji i
+dowodu, że żaden run, sesja, rollback ani proces go nie referuje. Cache
+kompilatorów i zależności pozostaje, bo jego ponowne pobranie lub przebudowa
+generuje duplikaty i wydłuża następny start. Automatyczna retencja technicznych
+wolumenów, jej pomiar rozmiaru oraz bezpieczne odtworzenie pozostają
+**NOT VERIFIED** w obecnym wariancie.
 
 Backend nie udostępnia frontendowi host ledgeru, GPU ani accepted store.
 Osobne grupy nie oznaczają osobnych fizycznych GPU. Zmiana generacji nadal
@@ -333,8 +398,12 @@ poprzedni pakiet do rollbacku pozostają. Wiek lub nazwa katalogu nie stanowią
 dowodu zbędności: wymagane są zgodne receipty i łańcuch zakończonych rotacji.
 
 Sprzątanie odbywa się wewnątrz backendu pod blokadą jego cache, po trwałej,
-zweryfikowanej publikacji nowego pakietu. Przed usunięciem kopii zachowuje
-log buildu, receipt, zapis rotacji i raport wykonania. Nieznane, niespójne lub
+zweryfikowanej publikacji nowego pakietu. Retired zachowuje tylko receipt i
+rotację, bez kolejnych kopii pełnego build logu. Zostawia najwyżej 8 archiwów
+i 64 MiB łącznego rozmiaru plików; zachowuje najnowsze według zapisanego
+`retired_at_ns` (dla starszych wpisów kolejność wyznacza czas pliku manifestu).
+Archiwa legacy z logiem są usuwane, jeśli przekraczają ten limit; log jest
+sprawdzany hashem, gdy pozostaje w zachowanym archiwum. Nieznane, niespójne lub
 używane dane pozostają z diagnostyką. Niepowodzenie sprzątania nie unieważnia
 poprawnie opublikowanego pakietu.
 
@@ -422,6 +491,33 @@ Narzędzie odzyskiwania nie wykonuje tej operacji automatycznie.
 Regresje kontraktu i adaptera nie zastępują wykonania tej procedury na żywo.
 Kwalifikacja runtime pozostaje **NOT VERIFIED**, dopóki nie ma dowodu
 zakończenia, zwolnienia dokładnej rezerwacji i poprawnego nowego startu.
+
+## Generowanie OpenAPI i klienta TypeScript
+
+Dla codziennego developmentu użyj w natywnym PowerShellu z wybranego checkoutu:
+
+```powershell
+just docker-dev-codegen "<wybrany-checkout>"
+# Równoważna recepta:
+just generate-api-openapi "<wybrany-checkout>"
+```
+
+Obie usługi tej grupy muszą już działać, a backend musi odpowiadać bieżącym
+źródłom. Polecenie nie buduje i nie uruchamia nowych kontenerów: eksportuje
+OpenAPI istniejącą binarką `backend`, a generatory uruchamia w `frontend`.
+Staging jest efemeryczny w jego wolumenie development; sukces zapisuje receipt
+pod `/opt/fullmag/control/backend/codegen/openapi-v2/`. Powtórzenie tych samych
+wejść używa tego samego klucza receiptu. Do checkoutu wracają wyłącznie cztery
+wersjonowane pliki API. Przed publikacją ponownie sprawdzane są źródła,
+kontenery, obrazy i backing wolumenów.
+
+Zmiana źródeł wymaga najpierw zwykłego restartu backendu tej grupy. Timeout
+klienta Docker nie dowodzi zakończenia zdalnego procesu generatora; receipt
+awarii zachowuje identyfikator stagingu i potrzebę uzgodnienia stanu zamiast
+usuwać potencjalnie używane dane. `generate-api-openapi-legacy` zachowuje
+odrębną trasę wyłącznie dla jawnych bramek release/CI. Nowa trasa ma regresje
+źródeł; jej rzeczywiste wykonanie w usługach pozostaje **NOT VERIFIED** do
+zakończenia odbioru runtime.
 
 ## Warunki odbioru
 

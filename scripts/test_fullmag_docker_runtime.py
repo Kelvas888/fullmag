@@ -76,6 +76,156 @@ def _v2_cache_fixture(root):
 
 
 class DockerRuntimeContract(unittest.TestCase):
+    def test_runtime_process_receipt_reader_uses_compose_control_volume(self):
+        raw = (
+            b'{"schema":"fullmag.docker-process-tree.v1",'
+            b'"state":"ready"}'
+        )
+        with patch("bootstrap_docker_toolchain.ensure_control_volume") as ensure, \
+                patch("bootstrap_docker_toolchain.read_control", return_value=raw) as read:
+            reader = runtime._runtime_control_record_reader(
+                Path("C:/git/fullmag/fullmag"),
+                "fullmag-worktree-receipt",
+                runtime._runtime_control_process_receipt_relative_path(),
+            )
+            self.assertEqual(reader(), (json.loads(raw), raw))
+        ensure.assert_called_once_with("fullmag-worktree-receipt")
+        read.assert_called_once_with(
+            Path("C:/git/fullmag/fullmag"),
+            "fullmag-worktree-receipt",
+            "runtime-control/runtime-service/process-tree.json",
+        )
+
+    def test_wait_for_startup_ready_can_observe_named_volume_receipt(self):
+        receipt = {
+            "schema": "fullmag.docker-process-tree.v1",
+            "state": "ready",
+        }
+        raw = json.dumps(receipt, separators=(",", ":")).encode("utf-8")
+        records = [None, (receipt, raw)]
+
+        def read_record():
+            return records.pop(0)
+
+        with patch.object(runtime.time, "sleep"):
+            observed, observed_raw = runtime._wait_for_startup_ready(
+                Path("C:/state"),
+                receipt_reader=read_record,
+                timeout=1,
+                return_raw=True,
+            )
+        self.assertEqual(observed, receipt)
+        self.assertEqual(observed_raw, raw)
+
+    def test_live_start_uses_runtime_only_host_initialization(self):
+        layout = {"storage_root": "C:/storage"}
+        with patch.object(runtime.storage, "initialize_runtime") as runtime_init, \
+                patch.object(runtime.storage, "initialize") as full_init:
+            runtime._initialize_start_storage(layout, live_development=True)
+            runtime._initialize_start_storage(layout, live_development=False)
+        runtime_init.assert_called_once_with(layout)
+        full_init.assert_called_once_with(layout)
+
+    def test_runtime_run_root_is_validated_under_user_storage_not_build_storage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            storage_root = root / "storage"
+            build_storage_root = root / "builds"
+            storage_root.mkdir()
+            build_storage_root.mkdir()
+            runs_root = storage_root / "runs" / "worktree-test"
+
+            run_root = runtime._runtime_run_root_path(
+                {
+                    "storage_root": str(storage_root),
+                    "build_storage_root": str(build_storage_root),
+                    "runs_root": str(runs_root),
+                },
+                "a" * 32,
+            )
+
+            self.assertTrue(runtime.storage.inside(run_root, storage_root.resolve()))
+            self.assertFalse(runtime.storage.inside(run_root, build_storage_root.resolve()))
+
+    def test_volume_only_operator_pointer_excludes_build_metadata(self):
+        pointer = runtime._operator_pointer(
+            {
+                "state": "running",
+                "compose_project": "fullmag-worktree-test",
+                "frontend_mode": "dev",
+                "state_root": "C:/storage/runs/worktree/state",
+                "host_certificate": "C:/storage/runs/worktree/windows-folder-host.json",
+                "technical_receipt": "/opt/fullmag/control/docker-runtime/runs/id/receipt.json",
+                "technical_receipt_sha256": "a" * 64,
+                "assembly_receipt": "/opt/fullmag/control/docker-runtime/runs/id/backend-assembly.json",
+                "compose_source": "C:/tmp/compose.source.yaml",
+                "backend_start_inputs": "/opt/fullmag/control/backend-start.json",
+            },
+            Path("C:/storage/runs/worktree"),
+        )
+        self.assertEqual(pointer["schema"], "fullmag.docker-all-run-pointer.v1")
+        self.assertEqual(pointer["technical_receipt"],
+                         "/opt/fullmag/control/docker-runtime/runs/id/receipt.json")
+        self.assertNotIn("assembly_receipt", pointer)
+        self.assertNotIn("compose_source", pointer)
+        self.assertNotIn("backend_start_inputs", pointer)
+
+    def test_volume_reuse_preserves_only_recovery_evidence_on_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            root.mkdir()
+            host_certificate = root / "windows-folder-host.json"
+            host_certificate.write_text('{"schema":"certificate"}\n', encoding="utf-8")
+            mount_receipt = root / "host-ledger" / "host-ledger-adapter-receipt.json"
+            mount_receipt.parent.mkdir()
+            mount_receipt.write_text('{"schema":"mount"}\n', encoding="utf-8")
+            pointer = root / "receipt.json"
+            pointer.write_text('{"schema":"pointer"}\n', encoding="utf-8")
+            writes = {}
+
+            def writer_factory(_repo, _project, relative):
+                def write(value):
+                    raw = (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode()
+                    writes[str(relative)] = raw
+                    return hashlib.sha256(raw).hexdigest()
+                return write
+
+            reuse = {
+                "root": root,
+                "receipt_path": pointer,
+                "receipt_sha256": runtime.digest(pointer),
+                "receipt": {
+                    "schema": "fullmag.docker-all-run.v1",
+                    "host_ledger": {"receipt": str(mount_receipt)},
+                },
+                "host_certificate": host_certificate,
+                "control_repo": Path(directory),
+                "control_project": "fullmag-worktree-test",
+                "reuse_token": "a" * 32,
+            }
+            with patch.object(runtime, "_runtime_control_json_writer", side_effect=writer_factory):
+                result = runtime._preserve_volume_reuse_evidence(reuse)
+
+            history = result["history_root"]
+            self.assertEqual(
+                (history / "windows-folder-host.json").read_bytes(),
+                host_certificate.read_bytes(),
+            )
+            self.assertEqual(
+                (history / "host-ledger/host-ledger-adapter-receipt.json").read_bytes(),
+                mount_receipt.read_bytes(),
+            )
+            manifest = json.loads((history / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                {item["relative"] for item in manifest["files"]},
+                {"windows-folder-host.json", "host-ledger/host-ledger-adapter-receipt.json"},
+            )
+            self.assertTrue(any(
+                path.endswith("/receipt-history/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/receipt.json")
+                for path in writes
+            ))
+            self.assertNotIn("compose.json", writes)
+
     def test_prepare_ready_profile_passes_runtime_cache_validator(self):
         with tempfile.TemporaryDirectory() as directory:
             profile, layout, source, repo, runroot = _profile(directory)
@@ -118,6 +268,32 @@ class DockerRuntimeContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "build root"):
                 runtime._validate_backend_volume_cache(tampered)
 
+    def test_v2_cache_reinspection_reads_all_current_volume_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = _v2_cache_fixture(Path(directory))
+            by_name = {item["Name"]: item for item in cache["volume_documents"].values()}
+            def inspect(*args):
+                self.assertEqual(args[:2], ("volume", "inspect"))
+                return json.dumps([by_name[args[2]]])
+            with patch.object(runtime, "docker", side_effect=inspect) as command:
+                self.assertIs(runtime._reinspect_backend_volume_cache(cache), volume_cache)
+            self.assertEqual(command.call_count, 3)
+
+    def test_v2_cache_reinspection_rejects_recreated_or_redirected_volume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = _v2_cache_fixture(Path(directory))
+            for role in volume_cache.VOLUME_ROLES:
+                for field, changed in (("CreatedAt", "2026-10-19T00:00:00Z"),
+                                       ("Mountpoint", "/mnt/e/redirected"),
+                                       ("Options", {"device": "/host_mnt/e/build", "o": "bind"})):
+                    records = json.loads(json.dumps(cache["volume_documents"]))
+                    records[role][field] = changed
+                    by_name = {item["Name"]: item for item in records.values()}
+                    with self.subTest(role=role, field=field), patch.object(
+                            runtime, "docker", side_effect=lambda *args: json.dumps([by_name[args[2]]])):
+                        with self.assertRaisesRegex(ValueError, "volume"):
+                            runtime._reinspect_backend_volume_cache(cache)
+
     def test_backend_start_v2_does_not_apply_v1_child_path_rule(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -135,6 +311,11 @@ class DockerRuntimeContract(unittest.TestCase):
                 "toolchain_manifest_sha256": "c" * 64,
                 "cargo_profile": "backend-dev",
                 "build_profile": "dev",
+                "operator_probe_environment_schema": runtime.OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+                "operator_probe_environment": dict(runtime.OPERATOR_PROBE_ENVIRONMENT_DEFAULTS),
+                "operator_probe_environment_sha256": runtime._operator_probe_environment_sha256(
+                    runtime.OPERATOR_PROBE_ENVIRONMENT_DEFAULTS
+                ),
                 "source_project_id": "project-test",
                 "source_worktree_id": "worktree-test",
                 "source_checkout_kind": "worktree",
@@ -349,6 +530,67 @@ class DockerRuntimeContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exactly one valid running container ID"):
                     runtime._compose_service_container_id(compose_args, "backend")
 
+    def test_retained_container_discovery_is_readonly_and_project_source_bound(self):
+        identity = {
+            "project_name": "fullmag-worktree-test",
+            "project_id": "project-test",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        container_id = "a" * 64
+        document = {
+            "Id": container_id,
+            "Config": {"Labels": {
+                "com.docker.compose.project": identity["project_name"],
+                "org.fullmag.source.project-id": identity["project_id"],
+                "org.fullmag.source.worktree-id": identity["worktree_id"],
+                "org.fullmag.source.checkout-kind": identity["checkout_kind"],
+                "org.fullmag.compose.project": identity["project_name"],
+            }},
+        }
+
+        def read_only_docker(*args, **_kwargs):
+            if args[:2] == ("ps", "--all"):
+                return container_id + "\n"
+            if args[:2] == ("inspect", container_id):
+                return json.dumps([document])
+            raise AssertionError(f"unexpected lifecycle command: {args!r}")
+
+        with patch.object(runtime, "docker", side_effect=read_only_docker) as docker_call:
+            self.assertEqual(
+                runtime._discover_retained_project_containers(
+                    identity["project_name"], identity
+                ),
+                [container_id],
+            )
+        self.assertEqual(docker_call.call_args_list[0].args[:2], ("ps", "--all"))
+        self.assertNotIn("compose", docker_call.call_args_list[0].args)
+
+        foreign = json.loads(json.dumps(document))
+        foreign["Config"]["Labels"]["org.fullmag.source.worktree-id"] = "foreign-worktree"
+        with patch.object(runtime, "docker", side_effect=lambda *args, **_kwargs: (
+                container_id + "\n" if args[:2] == ("ps", "--all")
+                else json.dumps([foreign])
+        )):
+            with self.assertRaisesRegex(ValueError, "source labels"):
+                runtime._discover_retained_project_containers(
+                    identity["project_name"], identity
+                )
+
+    def test_retained_container_discovery_has_bounded_id_list(self):
+        identity = {
+            "project_name": "fullmag-worktree-test",
+            "project_id": "project-test",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        raw = "\n".join("a" * 63 + str(index % 10) for index in range(runtime._MAX_RETAINED_CONTAINER_IDS + 1))
+        with patch.object(runtime, "docker", return_value=raw):
+            with self.assertRaisesRegex(ValueError, "too many container IDs"):
+                runtime._discover_retained_project_containers(
+                    identity["project_name"], identity
+                )
+
     def test_workspace_user_data_is_stable_and_scoped_to_compose_group(self):
         with tempfile.TemporaryDirectory() as directory:
             layout = {"storage_root": directory}
@@ -453,6 +695,33 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertEqual(int(health.group("seconds")), runtime.FRONTEND_DEV_READY_TIMEOUT_SECONDS)
         static_compose = (repository / "compose.static.yaml").read_text(encoding="utf-8")
         self.assertNotIn("\n  frontend:", static_compose)
+
+    def test_dev_compose_bounds_engine_logs_for_each_service(self):
+        repository = Path(__file__).resolve().parents[1]
+        source = (repository / "compose.dev.yaml").read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r"(?ms)^x-fullmag-bounded-logging: &fullmag-bounded-logging\n"
+            r"  driver: json-file\n"
+            r"  options:\n"
+            r"    max-size: \"10m\"\n"
+            r"    max-file: \"3\"$",
+        )
+        services = (
+            "development-base",
+            "backend-cache-volume-maintenance",
+            "backend",
+            "frontend",
+        )
+        for index, service in enumerate(services):
+            marker = f"\n  {service}:\n"
+            self.assertIn(marker, source)
+            block = source.split(marker, 1)[1]
+            if index + 1 < len(services):
+                block = block.split(f"\n  {services[index + 1]}:\n", 1)[0]
+            else:
+                block = block.split("\n# A separate project-scoped bridge", 1)[0]
+            self.assertIn("    logging: *fullmag-bounded-logging", block)
 
     def test_startup_receipt_requires_ready_matching_activation(self):
         authorization = {
@@ -956,9 +1225,12 @@ class DockerRuntimeContract(unittest.TestCase):
             RuntimeHandle=service_module.RuntimeHandle,
             prepare_storage=lambda: paths,
             initialize_accepted_store=lambda _paths: {"binding": "test"},
+            recover_container_namespace=lambda _paths: None,
+            container_recovery_configuration_override=lambda _paths, _recovery: nullcontext(),
             recover_idle_failure=lambda _paths: None,
             ensure_configuration=lambda _paths: {},
             process_environment=lambda _paths: {},
+            process_receipt_path=service_module.process_receipt_path,
             start=lambda _paths, **_kwargs: handle,
             stop=lambda _handle, timeout: terminal,
             _atomic_json=lambda _path, value, _label: receipts.append(copy.deepcopy(value)),
@@ -1017,9 +1289,14 @@ class DockerRuntimeContract(unittest.TestCase):
             RuntimeServiceTransient=service_module.RuntimeServiceTransient,
             prepare_storage=mock.Mock(return_value=paths),
             initialize_accepted_store=mock.Mock(return_value={"binding": "test"}),
+            recover_container_namespace=mock.Mock(return_value=None),
+            container_recovery_configuration_override=mock.Mock(
+                side_effect=lambda _paths, _recovery: nullcontext()
+            ),
             recover_idle_failure=mock.Mock(return_value=None),
             ensure_configuration=mock.Mock(return_value={}),
             process_environment=mock.Mock(return_value={}),
+            process_receipt_path=service_module.process_receipt_path,
             start=mock.Mock(return_value=handle),
             check=mock.Mock(return_value=None),
             stop=mock.Mock(return_value=terminal),
@@ -1694,15 +1971,51 @@ class DockerRuntimeContract(unittest.TestCase):
         handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081)
         with patch.object(service, "_wait_api_closed"), \
                 patch.object(service, "_read_ready_owner", return_value=owner), \
-                patch.object(service, "_pin_owner", return_value=Path("/state/pinned-owner.json")), \
+                patch.object(service, "_pin_owner", return_value=Path("/opt/fullmag/runtime-control/runtime-services/pinned-owner.json")), \
+                patch.object(service, "_accepted_store_owner_pin_path", return_value=Path("/state/runs/docker-all/session-store/runtime-services/pinned-owner.json")) as alias, \
                 patch.object(service, "_run_cli", return_value={"schema_version": "runtime_service_discovery.v1",
                              "status": "drained", "owner": terminal}) as cli:
             self.assertEqual(service.stop(handle), terminal)
             self.assertIn("service-drain-confirmed", cli.call_args.args[1])
+            self.assertEqual(
+                cli.call_args.args[1][cli.call_args.args[1].index("--expected-owner") + 1],
+                "/state/runs/docker-all/session-store/runtime-services/pinned-owner.json",
+            )
+            alias.assert_called_once_with(
+                handle.paths,
+                Path("/opt/fullmag/runtime-control/runtime-services/pinned-owner.json"),
+            )
             cli.side_effect = service.RuntimeServiceUnknown("unconfirmed outcome")
             with self.assertRaises(service.RuntimeServiceUnknown):
                 service.stop(handle)
             self.assertEqual(cli.call_count, 2)
+
+    def test_accepted_store_owner_pin_requires_identical_volume_view_bytes(self):
+        service = self.load_service()
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            technical = root / "runtime-control" / "runtime-services"
+            accepted = root / "runs" / service.WORKTREE_ID / "session-store" / "runtime-services"
+            technical.mkdir(parents=True)
+            accepted.mkdir(parents=True)
+            pin = technical / "docker-client-known.json"
+            alias = accepted / pin.name
+            payload = b'{"owner_token":"known"}\n'
+            pin.write_bytes(payload)
+            alias.write_bytes(payload)
+            paths = replace(
+                service.RuntimePaths(),
+                store=accepted.parent,
+                runtime_services=technical,
+            )
+            self.assertEqual(
+                service._accepted_store_owner_pin_path(paths, pin), alias
+            )
+            alias.write_bytes(b'{"owner_token":"tampered"}\n')
+            with self.assertRaisesRegex(service.RuntimeServiceError, "pin bytes differ"):
+                service._accepted_store_owner_pin_path(paths, pin)
 
     def test_start_retains_confirmed_owner_when_later_observation_fails(self):
         service = self.load_service()

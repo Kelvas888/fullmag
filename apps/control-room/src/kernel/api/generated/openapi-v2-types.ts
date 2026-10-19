@@ -10617,6 +10617,16 @@ export interface components {
         };
         /** @enum {string} */
         MeshMixedCertificateQualityEvidenceStatus: "valid" | "stale" | "rejected" | "unavailable";
+        MeshMixedExactSweepSummaryResource: {
+            /** Format: int32 */
+            actual_node_plane_count: number;
+            /** Format: int32 */
+            realized_layer_count: number;
+            /** Format: int32 */
+            requested_layer_count: number;
+            sweep_direction_requested: string;
+            sweep_direction_resolved: string;
+        };
         MeshMixedLayerTopologyCertificateSummaryResource: {
             /** Format: int32 */
             actual_node_plane_count?: number;
@@ -10627,6 +10637,14 @@ export interface components {
             rejection_reason?: string | null;
             /** Format: int32 */
             requested_layer_count: number;
+            schema_version: string;
+            topology_fingerprint: string;
+        };
+        /** @description Thin v2 certificate summary. Numerical coefficients and mesh arrays stay in their owners. */
+        MeshMixedLayerTopologyCertificateV2SummaryResource: {
+            certificate_status: string;
+            gmsh_version: string;
+            magnetic_regions: components["schemas"]["MeshMixedMagneticRegionSummaryResource"][];
             schema_version: string;
             topology_fingerprint: string;
         };
@@ -10642,6 +10660,17 @@ export interface components {
             requested_layer_count: number;
             resolved_execution?: null | components["schemas"]["MeshMixedP1ExecutionResource"];
             schema_version: string;
+        };
+        MeshMixedMagneticRegionSummaryResource: {
+            /** Format: int32 */
+            body_marker: number;
+            cell_family_counts: {
+                [key: string]: number;
+            };
+            exact_sweep?: null | components["schemas"]["MeshMixedExactSweepSummaryResource"];
+            /** Format: int32 */
+            material_marker: number;
+            object_id: string;
         };
         MeshMixedP1ExecutionResource: {
             backend?: string | null;
@@ -10991,6 +11020,7 @@ export interface components {
             fallbacks_triggered?: string[] | null;
             gmsh_version?: string | null;
             mixed_layer_topology_certificate?: null | components["schemas"]["MeshMixedLayerTopologyCertificateSummaryResource"];
+            mixed_layer_topology_certificate_v2?: null | components["schemas"]["MeshMixedLayerTopologyCertificateV2SummaryResource"];
             mixed_topology_provenance?: null | components["schemas"]["MeshMixedTopologyProvenanceResource"];
             object_region_markers?: Record<string, unknown>[];
             operation_statuses?: components["schemas"]["MeshOperationStatusResource"][];
@@ -11039,6 +11069,7 @@ export interface components {
             /** @description Scoped mesh parts for object/airbox/selection fetches. Heavy topology remains in binary topology endpoints. */
             mesh_parts?: components["schemas"]["MeshPartResource"][];
             mixed_layer_topology_certificate?: null | components["schemas"]["MeshMixedLayerTopologyCertificateSummaryResource"];
+            mixed_layer_topology_certificate_v2?: null | components["schemas"]["MeshMixedLayerTopologyCertificateV2SummaryResource"];
             mixed_topology_provenance?: null | components["schemas"]["MeshMixedTopologyProvenanceResource"];
             object_segments?: components["schemas"]["MeshObjectSegmentResource"][];
             regions?: components["schemas"]["MeshRegionResource"][];

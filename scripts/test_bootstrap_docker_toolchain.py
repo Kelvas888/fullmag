@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Interpreted admission and frozen-context regressions; no Docker build."""
 from pathlib import Path
+import io
+import copy
 import os
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -20,10 +23,12 @@ class ToolchainBootstrapTests(unittest.TestCase):
         self.repo.mkdir()
         (self.repo / "docker/fem-gpu/nvidia-entrypoint").mkdir(parents=True)
         (self.repo / "docker/fem-gpu/Dockerfile").write_text("FROM scratch\n")
+        (self.repo / "docker/fem-gpu/Dockerfile.dockerignore").write_text("**\n")
         (self.repo / "docker/fem-gpu/nvidia-entrypoint/run.sh").write_text("true\n")
         (self.repo / ".dockerignore").write_text("**\n!docker/\n!docker/**\n")
         (self.repo / "compose.toolchain.yaml").write_text("services: {}\n")
         self.tracked = [".dockerignore", "compose.toolchain.yaml", "docker/fem-gpu/Dockerfile",
+                        "docker/fem-gpu/Dockerfile.dockerignore",
                         "docker/fem-gpu/nvidia-entrypoint/run.sh"]
         git = mock.patch.object(bootstrap.storage, "git",
                                 side_effect=lambda *_: "\0".join(self.tracked) + "\0")
@@ -68,6 +73,74 @@ class ToolchainBootstrapTests(unittest.TestCase):
         })
         self.assertNotEqual(volume, bootstrap.control_volume_name("fullmag-master"))
 
+    def test_control_io_supplies_all_required_compose_interpolation_inputs(self):
+        project = "fullmag-worktree-feature-abc123"
+        compose = (Path(__file__).resolve().parents[1] / "compose.toolchain.yaml").read_text()
+        required = set(re.findall(r"\$\{([A-Z_]+):\?", compose))
+        self.assertTrue(required)
+        with mock.patch.object(bootstrap, "docker", return_value="{}") as command:
+            bootstrap.read_control(self.repo, project, bootstrap.CONTROL_RECEIPT)
+            bootstrap.write_control(self.repo, project, bootstrap.CONTROL_RECEIPT, b"{}")
+        self.assertEqual(command.call_count, 2)
+        for call in command.call_args_list:
+            environment = call.kwargs["environment"]
+            self.assertFalse(required - environment.keys(),
+                             f"Compose helper lacks required inputs: {required - environment.keys()}")
+            self.assertEqual(environment["FULLMAG_COMPOSE_PROJECT"], project)
+            self.assertEqual(Path(environment["FULLMAG_TOOLCHAIN_CONTEXT"]), self.repo)
+            self.assertEqual(environment["FULLMAG_TOOLCHAIN_IMAGE"],
+                             bootstrap.toolchain_image_reference(project))
+
+    def test_normalized_compose_control_mount_resolves_logical_volume_key(self):
+        volume = bootstrap.control_volume_name("fullmag-worktree-feature-abc123")
+        configured = {
+            "volumes": {"toolchain-control": {"name": volume, "external": True}},
+            "services": {"toolchain-control": {"volumes": [{
+                "type": "volume", "source": "toolchain-control",
+                "target": "/opt/fullmag/control", "volume": {"nocopy": True},
+            }]}},
+        }
+        bootstrap._validate_control_mount(configured, volume)
+        for field, wrong in (("type", "bind"), ("source", volume),
+                             ("target", "/wrong"), ("read_only", True),
+                             ("volume", {"nocopy": False})):
+            invalid = copy.deepcopy(configured)
+            invalid["services"]["toolchain-control"]["volumes"][0][field] = wrong
+            with self.subTest(field=field), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._validate_control_mount(invalid, volume)
+        for field, wrong in (("name", "another-group"), ("external", False)):
+            invalid = copy.deepcopy(configured)
+            invalid["volumes"]["toolchain-control"][field] = wrong
+            with self.subTest(field=field), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._validate_control_mount(invalid, volume)
+
+    def test_control_volume_rejects_local_driver_options_and_host_mountpoints(self):
+        project = "fullmag-worktree-feature-abc123"
+        volume = bootstrap.control_volume_name(project)
+        labels = {
+            "com.fullmag.compose.project": project,
+            "com.fullmag.toolchain.control.schema": bootstrap.CONTROL_VOLUME_SCHEMA,
+            "com.fullmag.toolchain.control.project": project,
+            "com.fullmag.toolchain.control.mount": bootstrap.CONTROL_ROOT,
+        }
+        hostile_records = (
+            {
+                "Name": volume, "Driver": "local", "Scope": "local",
+                "Options": {"type": "none", "device": "C:/fullmag/storage", "o": "bind"},
+                "Mountpoint": f"/var/lib/docker/volumes/{volume}/_data", "Labels": labels,
+            },
+            {
+                "Name": volume, "Driver": "local", "Scope": "local", "Options": {},
+                "Mountpoint": "/run/desktop/mnt/host/c/fullmag/storage", "Labels": labels,
+            },
+        )
+        for record in hostile_records:
+            with self.subTest(record=record), mock.patch.object(
+                bootstrap, "docker", return_value=json.dumps([record])
+            ):
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.ensure_control_volume(project)
+
     def test_toolchain_image_is_stable_and_group_scoped(self):
         project = "fullmag-worktree-feature-abc123"
         image = bootstrap.toolchain_image_reference(project)
@@ -75,6 +148,91 @@ class ToolchainBootstrapTests(unittest.TestCase):
         self.assertEqual(image.split(":", 1)[1], "cuda12.6.3")
         self.assertTrue(image.startswith("fullmag/fullmag-worktree-feature-abc123-"))
         self.assertNotEqual(image, bootstrap.toolchain_image_reference("fullmag-master"))
+
+    def test_toolchain_compose_requires_launcher_project_and_context(self):
+        repository = Path(__file__).resolve().parents[1]
+        compose = (repository / "compose.toolchain.yaml").read_text(encoding="utf-8")
+        self.assertIn(
+            "name: ${FULLMAG_COMPOSE_PROJECT:?FULLMAG_COMPOSE_PROJECT must be set",
+            compose,
+        )
+        self.assertIn(
+            "context: ${FULLMAG_TOOLCHAIN_CONTEXT:?FULLMAG_TOOLCHAIN_CONTEXT must be set",
+            compose,
+        )
+        self.assertNotIn("FULLMAG_COMPOSE_PROJECT:-", compose)
+        self.assertNotIn("FULLMAG_TOOLCHAIN_CONTEXT:-", compose)
+
+    def test_manifest_probe_policy_is_rendered_without_gpu_access(self):
+        policy = {
+            "network_mode": "none",
+            "read_only": True,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "user": "65532:65532",
+            "pids_limit": 16,
+            "mem_limit": "64m",
+            "cpus": 0.25,
+            "environment": {"NVIDIA_VISIBLE_DEVICES": "void"},
+        }
+        bootstrap._validate_manifest_probe_policy({
+            "services": {"fem-gpu-toolchain": policy},
+        })
+
+    def test_manifest_probe_policy_rejects_unsafe_rendered_config(self):
+        policy = {
+            "network_mode": "none",
+            "read_only": True,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "user": "65532:65532",
+            "pids_limit": 16,
+            "mem_limit": "64m",
+            "cpus": 0.25,
+            "environment": {"NVIDIA_VISIBLE_DEVICES": "void"},
+        }
+        for field, value in (("network_mode", "default"), ("read_only", False),
+                             ("cap_drop", []), ("security_opt", []),
+                             ("user", "0:0"), ("pids_limit", 17),
+                             ("mem_limit", "1g"), ("cpus", 1.0),
+                             ("environment", {"NVIDIA_VISIBLE_DEVICES": "all"}),
+                             ("gpus", "all")):
+            invalid = copy.deepcopy(policy)
+            invalid[field] = value
+            with self.subTest(field=field), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._validate_manifest_probe_policy({
+                    "services": {"fem-gpu-toolchain": invalid},
+                })
+
+    def test_toolchain_compose_declares_no_gpu_manifest_probe_policy(self):
+        compose = (Path(__file__).resolve().parents[1] / "compose.toolchain.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("network_mode: none", compose)
+        self.assertIn("read_only: true", compose)
+        self.assertIn("NVIDIA_VISIBLE_DEVICES: void", compose)
+        self.assertNotIn("    gpus: all", compose)
+
+    def test_toolchain_dockerignore_has_no_recursive_untracked_allowlist(self):
+        repository = Path(__file__).resolve().parents[1]
+        ignore = (repository / "docker/fem-gpu/Dockerfile.dockerignore").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertNotIn("!docker/fem-gpu/nvidia-entrypoint/**", ignore)
+        self.assertNotIn("!docker/fem-gpu/patches/**", ignore)
+        for path in (
+            "docker/fem-gpu/nvidia-entrypoint/SOURCE.md",
+            "docker/fem-gpu/nvidia-entrypoint/nvidia_entrypoint.sh",
+            "docker/fem-gpu/nvidia-entrypoint/entrypoint.d/10-banner.sh",
+            "docker/fem-gpu/nvidia-entrypoint/entrypoint.d/12-banner.sh",
+            "docker/fem-gpu/nvidia-entrypoint/entrypoint.d/15-container-copyright.txt",
+            "docker/fem-gpu/nvidia-entrypoint/entrypoint.d/30-container-license.txt",
+            "docker/fem-gpu/nvidia-entrypoint/entrypoint.d/50-gpu-driver-check.sh",
+            "docker/fem-gpu/nvidia-entrypoint/entrypoint.d/80-internal-image.sh",
+            "docker/fem-gpu/nvidia-entrypoint/entrypoint.d/90-deprecated-image.sh",
+            "docker/fem-gpu/patches/petsc-3.24.6-multiarch-nvcc.diff",
+        ):
+            self.assertIn("!" + path, ignore)
 
     def test_existing_storage_is_admitted_without_creating_build_data(self):
         target = self.root / "storage"
@@ -110,6 +268,63 @@ class ToolchainBootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(bootstrap.BootstrapError, "timed out"):
             bootstrap.bounded_command([sys.executable, "-c", "import time; time.sleep(30)"],
                                       maximum=128, timeout=0.1)
+
+    def test_docker_live_persists_bounded_truncated_output_metadata(self):
+        process = mock.Mock()
+        process.stdout = io.BytesIO(b"123456\n")
+        process.wait.return_value = 0
+        console = mock.Mock()
+        console.buffer = io.BytesIO()
+        captured = {}
+
+        def sink(data, **metadata):
+            captured["data"] = data
+            captured.update(metadata)
+
+        with mock.patch.object(bootstrap.subprocess, "Popen", return_value=process), \
+                mock.patch.object(bootstrap.sys, "stdout", console):
+            code, output = bootstrap.docker_live(
+                ["docker", "build"], maximum=4, output_sink=sink
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, b"1234")
+        self.assertEqual(captured["data"], b"1234")
+        self.assertTrue(captured["truncated"])
+        self.assertFalse(captured["interrupted"])
+        self.assertFalse(captured["observation_budget_exceeded"])
+
+    def test_docker_live_persists_partial_output_before_interrupt(self):
+        class InterruptedStream:
+            def __init__(self):
+                self.first = True
+
+            def readline(self):
+                if self.first:
+                    self.first = False
+                    return b"partial-build-output\n"
+                raise KeyboardInterrupt
+
+        process = mock.Mock()
+        process.stdout = InterruptedStream()
+        process.wait.return_value = 130
+        console = mock.Mock()
+        console.buffer = io.BytesIO()
+        captured = {}
+
+        def sink(data, **metadata):
+            captured["data"] = data
+            captured.update(metadata)
+
+        with mock.patch.object(bootstrap.subprocess, "Popen", return_value=process), \
+                mock.patch.object(bootstrap.sys, "stdout", console):
+            with self.assertRaises(KeyboardInterrupt):
+                bootstrap.docker_live(["docker", "build"], output_sink=sink)
+
+        self.assertEqual(captured["data"], b"partial-build-output\n")
+        self.assertIsNone(captured["exit_code"])
+        self.assertTrue(captured["interrupted"])
+        process.wait.assert_called_once_with()
 
     def test_direct_mode_admission_allows_enrolled_host(self):
         (self.storage / "index/local-runner-container.json").write_text("{}")
@@ -170,6 +385,7 @@ class ToolchainBootstrapTests(unittest.TestCase):
         manifest = bootstrap.capture_inputs(self.repo)
         self.assertEqual({item["path"] for item in manifest}, {
             ".dockerignore", "compose.toolchain.yaml", "docker/fem-gpu/Dockerfile",
+            "docker/fem-gpu/Dockerfile.dockerignore",
             "docker/fem-gpu/nvidia-entrypoint/run.sh",
         })
         bootstrap.verify_capture(self.repo, manifest)
@@ -184,6 +400,11 @@ class ToolchainBootstrapTests(unittest.TestCase):
 
     def test_missing_tracked_canonical_input_is_rejected(self):
         self.tracked.remove("docker/fem-gpu/Dockerfile")
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "Git-tracked"):
+            bootstrap.capture_inputs(self.repo)
+
+    def test_missing_dockerfile_specific_ignore_is_rejected(self):
+        self.tracked.remove("docker/fem-gpu/Dockerfile.dockerignore")
         with self.assertRaisesRegex(bootstrap.BootstrapError, "Git-tracked"):
             bootstrap.capture_inputs(self.repo)
 

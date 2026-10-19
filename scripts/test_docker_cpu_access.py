@@ -147,6 +147,164 @@ class DockerCpuAccessContract(unittest.TestCase):
             self.assertIn(str(overlay), observed["args"])
             self.assertEqual(configured["services"]["backend"], {})
 
+    def test_compose_passes_only_normalized_mixed_probe_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            compose = repo / "compose.dev.yaml"
+            compose.write_text(
+                "services:\n  backend:\n    environment:\n"
+                "      FULLMAG_MIXED_P1_DEVICE: ${FULLMAG_MIXED_P1_DEVICE:-gpu}\n"
+                "      FULLMAG_ARTIFACT_FIELD_STORAGE: ${FULLMAG_ARTIFACT_FIELD_STORAGE:-json}\n"
+                "  frontend:\n",
+                encoding="utf-8",
+            )
+            observed = {}
+
+            def fake_docker(*args, **kwargs):
+                observed["environment"] = kwargs["environment"]
+                return json.dumps({"services": {"backend": {}, "frontend": {}}})
+
+            # Inputs-only config inspection has no backend-start snapshot and
+            # therefore uses the fixed Compose defaults. Ambient host values
+            # must never be reread by the runtime layer.
+            with patch.dict(
+                docker_dev.os.environ,
+                {
+                    "FULLMAG_MIXED_P1_DEVICE": " CPU ",
+                    "FULLMAG_ARTIFACT_FIELD_STORAGE": "ZARR",
+                    "FULLMAG_UNRELATED_SECRET": "must-not-cross",
+                },
+                clear=True,
+            ), patch.object(runtime, "docker", fake_docker):
+                runtime.compose_spec(
+                    "sha256:" + "a" * 64,
+                    Path("/state"),
+                    3197,
+                    Path("/host.json"),
+                    repo=repo,
+                    template=compose,
+                    inputs={
+                        "source_root": "/checkout",
+                        "worktree_id": "worktree-test",
+                        "source_commit": "a" * 40,
+                    },
+                    inputs_path=Path("/inputs.json"),
+                    package=Path("/package"),
+                    provenance=Path("/provenance.json"),
+                    workspace_state_root=Path("/user-data"),
+                    device_access="cpu",
+                )
+
+            self.assertEqual(observed["environment"]["FULLMAG_MIXED_P1_DEVICE"], "gpu")
+            self.assertEqual(observed["environment"]["FULLMAG_ARTIFACT_FIELD_STORAGE"], "json")
+            self.assertNotIn("FULLMAG_UNRELATED_SECRET", observed["environment"])
+
+    def test_inputs_only_compose_ignores_invalid_ambient_probe_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            compose = repo / "compose.dev.yaml"
+            compose.write_text(
+                "services:\n  backend:\n    environment:\n"
+                "      FULLMAG_MIXED_P1_DEVICE: ${FULLMAG_MIXED_P1_DEVICE:-gpu}\n"
+                "      FULLMAG_ARTIFACT_FIELD_STORAGE: ${FULLMAG_ARTIFACT_FIELD_STORAGE:-json}\n"
+                "  frontend:\n",
+                encoding="utf-8",
+            )
+            observed = {}
+
+            def fake_docker(*args, **kwargs):
+                observed["environment"] = kwargs["environment"]
+                return json.dumps({"services": {"backend": {}, "frontend": {}}})
+
+            with patch.dict(
+                docker_dev.os.environ,
+                {"FULLMAG_MIXED_P1_DEVICE": "cuda"},
+                clear=True,
+            ), patch.object(runtime, "docker", fake_docker):
+                # The runtime does not consume ambient host settings in the
+                # inputs-only path, so an invalid unused host value cannot
+                # mutate or block this config inspection.
+                runtime.compose_spec(
+                    "sha256:" + "a" * 64,
+                    Path("/state"),
+                    3197,
+                    Path("/host.json"),
+                    repo=repo,
+                    template=compose,
+                    inputs={
+                        "source_root": "/checkout",
+                        "worktree_id": "worktree-test",
+                        "source_commit": "a" * 40,
+                    },
+                    inputs_path=Path("/inputs.json"),
+                    package=Path("/package"),
+                    provenance=Path("/provenance.json"),
+                    workspace_state_root=Path("/user-data"),
+                    device_access="cpu",
+                )
+            self.assertEqual(observed["environment"]["FULLMAG_MIXED_P1_DEVICE"], "gpu")
+
+    def test_operator_probe_snapshot_normalizes_and_hashes_exactly(self):
+        values = docker_dev._normalize_operator_probe_environment({
+            "FULLMAG_MIXED_P1_DEVICE": " CPU ",
+            "FULLMAG_ARTIFACT_FIELD_STORAGE": " ZARR ",
+        })
+        self.assertEqual(values, {
+            "FULLMAG_MIXED_P1_DEVICE": "cpu",
+            "FULLMAG_ARTIFACT_FIELD_STORAGE": "zarr",
+        })
+        digest = docker_dev._operator_probe_environment_sha256(values)
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(digest, docker_dev._operator_probe_environment_sha256(values))
+        with self.assertRaisesRegex(docker_dev.DirectDockerError, "exactly"):
+            docker_dev._normalize_operator_probe_environment({
+                "FULLMAG_MIXED_P1_DEVICE": "cpu",
+                "FULLMAG_ARTIFACT_FIELD_STORAGE": "json",
+                "UNRELATED": "secret",
+            })
+
+    def test_compose_operator_controls_default_without_host_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            compose = repo / "compose.dev.yaml"
+            compose.write_text(
+                "services:\n  backend:\n    environment:\n"
+                "      FULLMAG_MIXED_P1_DEVICE: ${FULLMAG_MIXED_P1_DEVICE:-gpu}\n"
+                "      FULLMAG_ARTIFACT_FIELD_STORAGE: ${FULLMAG_ARTIFACT_FIELD_STORAGE:-json}\n"
+                "  frontend:\n",
+                encoding="utf-8",
+            )
+            observed = {}
+
+            def fake_docker(*args, **kwargs):
+                observed["environment"] = kwargs["environment"]
+                return json.dumps({"services": {"backend": {}, "frontend": {}}})
+
+            with patch.dict(docker_dev.os.environ, {}, clear=True), patch.object(
+                runtime, "docker", fake_docker
+            ):
+                runtime.compose_spec(
+                    "sha256:" + "a" * 64,
+                    Path("/state"),
+                    3197,
+                    Path("/host.json"),
+                    repo=repo,
+                    template=compose,
+                    inputs={
+                        "source_root": "/checkout",
+                        "worktree_id": "worktree-test",
+                        "source_commit": "a" * 40,
+                    },
+                    inputs_path=Path("/inputs.json"),
+                    package=Path("/package"),
+                    provenance=Path("/provenance.json"),
+                    workspace_state_root=Path("/user-data"),
+                    device_access="cpu",
+                )
+
+            self.assertEqual(observed["environment"]["FULLMAG_MIXED_P1_DEVICE"], "gpu")
+            self.assertEqual(observed["environment"]["FULLMAG_ARTIFACT_FIELD_STORAGE"], "json")
+
     def test_cpu_profile_requires_v2_readiness_and_empty_gpu_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = runtime_service.RuntimePaths(store=Path(directory) / "store")

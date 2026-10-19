@@ -50,6 +50,15 @@ DEVELOPMENT_BASE_CONTEXT_SCHEMA = "fullmag.direct-compose.development-base-conte
 DEVELOPMENT_IMAGE_SCHEMA = "fullmag.direct-compose.development-image.v1"
 RUNTIME_IMAGE_CONTEXT_SCHEMA = "fullmag.direct-compose.runtime-image-context.v1"
 BACKEND_START_INPUTS_SCHEMA = "fullmag.direct-compose.backend-start-inputs.v1"
+OPERATOR_PROBE_ENVIRONMENT_SCHEMA = "fullmag.operator-probe-environment.v1"
+OPERATOR_PROBE_ENVIRONMENT_DEFAULTS = {
+    "FULLMAG_MIXED_P1_DEVICE": "gpu",
+    "FULLMAG_ARTIFACT_FIELD_STORAGE": "json",
+}
+OPERATOR_PROBE_ENVIRONMENT_ALLOWED = {
+    "FULLMAG_MIXED_P1_DEVICE": frozenset({"cpu", "gpu"}),
+    "FULLMAG_ARTIFACT_FIELD_STORAGE": frozenset({"json", "zarr"}),
+}
 BASE_CONTEXT_FILES = (
     ("Dockerfile.dev", "docker/all-in-one/Dockerfile.dev"),
     ("Dockerfile.dev.dockerignore", "docker/all-in-one/Dockerfile.dev.dockerignore"),
@@ -109,6 +118,50 @@ class DirectDockerError(RuntimeError):
 
 class DirectDockerOutcomeUnknown(DirectDockerError):
     """The Docker client timed out while the daemon may still own resources."""
+
+
+def _normalize_operator_probe_environment(value: Mapping[str, object]) -> dict[str, str]:
+    """Validate the bounded operator-probe environment without ambient passthrough."""
+
+    if not isinstance(value, Mapping) or set(value) != set(OPERATOR_PROBE_ENVIRONMENT_ALLOWED):
+        raise _fail(
+            "operator_probe_environment must contain exactly the bounded probe controls"
+        )
+    normalized: dict[str, str] = {}
+    for name, allowed in OPERATOR_PROBE_ENVIRONMENT_ALLOWED.items():
+        raw = value[name]
+        if not isinstance(raw, str):
+            raise _fail(f"{name} must be a string")
+        candidate = raw.strip().lower()
+        if candidate not in allowed:
+            choices = ", ".join(sorted(allowed))
+            raise _fail(f"{name} must be one of: {choices}")
+        normalized[name] = candidate
+    return normalized
+
+
+def _operator_probe_environment_from_host() -> dict[str, str]:
+    """Capture the two allowed host controls once for one backend start."""
+
+    return _normalize_operator_probe_environment({
+        name: os.environ.get(name, default)
+        for name, default in OPERATOR_PROBE_ENVIRONMENT_DEFAULTS.items()
+    })
+
+
+def _operator_probe_environment_sha256(value: Mapping[str, object]) -> str:
+    """Hash the canonical schema-tagged operator control document."""
+
+    normalized = _normalize_operator_probe_environment(value)
+    document = {
+        "schema": OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+        "values": normalized,
+    }
+    encoded = (
+        json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    return _sha256_bytes(encoded)
 
 
 def _bootstrap_module():
@@ -867,13 +920,13 @@ def _ensure_development_base(args: argparse.Namespace, repo: Path,
 
 def _select_source(repo: Path, source_root: Path | None) -> tuple[Path, dict[str, object]]:
     from docker_development_inputs import select_checkout
-    from fullmag_storage import initialize, resolve_layout
+    from fullmag_storage import initialize_runtime, resolve_layout
 
     selected = select_checkout(repo, source_root).resolve(strict=True)
     if not selected.is_dir() or selected.is_symlink():
         raise _fail(f"selected source is not a real checkout: {selected}")
     layout = resolve_layout(selected, STORAGE_PROFILE)
-    initialize(layout)
+    initialize_runtime(layout)
     return selected, layout
 
 
@@ -1292,7 +1345,8 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
 
 
 def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: str,
-                           run_root: Path, selected: Path, toolchain_id: str) -> dict[str, object]:
+                           run_root: Path, selected: Path, toolchain_id: str, *,
+                           compose_environment: Mapping[str, str]) -> dict[str, object]:
     """Prepare the v2 Docker-VM named-volume pair and its fixed helper.
 
     The legacy loop-image adapter remains available to its existing callers.
@@ -1354,11 +1408,17 @@ def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: s
         if not isinstance(cache_environment, Mapping) or not isinstance(service_environment, Mapping):
             raise _fail("backend cache did not return canonical runtime and maintenance environments")
         maintenance_environment = {
+            # Compose interpolates unrelated application services as well as
+            # this helper. Preserve the complete selected-checkout environment.
+            **dict(compose_environment),
             **_compose_identity_environment(layout),
             **{str(key): str(value) for key, value in cache_environment.items()},
             **{str(key): str(value) for key, value in service_environment.items()},
             "FULLMAG_BUILD_CONTROL_VOLUME": control_volume,
             "FULLMAG_BACKEND_CACHE_CONTROL_VOLUME": control_volume,
+            "FULLMAG_RUNTIME_IMAGE_ID": image_id,
+            "FULLMAG_DEV_IMAGE": image_id,
+            "FULLMAG_RELEASE_IMAGE": image_id,
         }
         output = _docker_capture(
             *_compose_prefix(repo, [repo / COMPOSE_RUNTIME_FILE], project),
@@ -1444,7 +1504,8 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
                  image_ref: str,
                  image_id: str, toolchain_id: str, cache: Mapping[str, object],
                  base_reference: str, cargo_profile: str,
-                 device_access: str = "gpu") -> dict[str, str]:
+                 device_access: str = "gpu",
+                 operator_probe_environment: Mapping[str, object] | None = None) -> dict[str, str]:
     if device_access not in DEVICE_ACCESS_CHOICES:
         raise _fail("resolved device access must be cpu or gpu")
     cargo_profile = _validate_cargo_profile(cargo_profile)
@@ -1511,6 +1572,20 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
         "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
         "FULLMAG_BACKEND_BUILD_STATE_ROOT": str(build_state_root),
     })
+    # Only these two workload controls may cross the host -> Compose boundary.
+    # The caller captures them once before image/cache preparation.  Never
+    # reread the mutable ambient host environment here and never let a cache
+    # profile smuggle a stale workload choice into a new run.
+    operator_values = _normalize_operator_probe_environment(
+        operator_probe_environment
+        if operator_probe_environment is not None
+        else OPERATOR_PROBE_ENVIRONMENT_DEFAULTS
+    )
+    for name, value in operator_values.items():
+        environment[name] = value
+    environment["FULLMAG_OPERATOR_PROBE_ENVIRONMENT_SHA256"] = (
+        _operator_probe_environment_sha256(operator_values)
+    )
     if manifest is not None:
         environment["FULLMAG_BACKEND_SOURCE_MANIFEST"] = str(manifest)
     git_common = source_bundle.get("git_common_dir")
@@ -1579,11 +1654,13 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
               image_id: str, toolchain_id: str, prepare_receipt: Mapping[str, object],
               prepare_receipt_bytes: bytes, base_info: Mapping[str, object],
               build_profile: str, expected_cargo_profile: str) -> Path:
+    source_mode = str(source_bundle.get("source_mode", "snapshot"))
+    live_source = source_mode == "live-shadow-v1"
     expected_cargo_profile = _validate_cargo_profile(expected_cargo_profile)
     if _cargo_profile_for_build(build_profile) != expected_cargo_profile:
         raise _fail("assembly build profile does not match its Cargo profile")
     from fullmag_docker_runtime import REQUIRED_BINARIES
-    from fullmag_storage import atomic_json, validate_path
+    from fullmag_storage import validate_path
 
     # Startup helpers are already owned by the immutable runtime image. Keep
     # only their hashes in provenance; copying them to host staging would
@@ -1594,23 +1671,50 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
     if observed_image_id != image_id:
         raise _fail("runtime image changed while assembling provenance")
     runtime_labels = _image_labels(runtime_document)
-    binary_hashes: dict[str, str] = {}
-    for name in REQUIRED_BINARIES:
-        binary_hashes[name] = _sha256_file(package / "bin" / name, f"backend binary {name}")
-    if not (package / "_fullmag_core.so").is_file():
-        raise _fail("backend package has no _fullmag_core.so")
+    if live_source:
+        # The live package is a Docker named-volume path.  Native Windows
+        # Python cannot inspect it and must not materialize a host-side copy
+        # merely to assemble provenance.  The backend service already
+        # attests every published binary in its receipt.
+        artifacts = prepare_receipt.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise _fail("live backend build receipt has no artifact inventory")
+        binary_hashes = {
+            str(record["path"])[len("bin/"):]: record["sha256"]
+            for record in artifacts
+            if isinstance(record, Mapping)
+            and isinstance(record.get("path"), str)
+            and record["path"].startswith("bin/")
+            and isinstance(record.get("sha256"), str)
+        }
+        if set(binary_hashes) != set(REQUIRED_BINARIES):
+            raise _fail("live backend build receipt has an incomplete binary inventory")
+        package_root = str(package)
+        backend_build_receipt = "/opt/fullmag/package/backend-build-receipt.json"
+    else:
+        binary_hashes = {
+            name: _sha256_file(package / "bin" / name, f"backend binary {name}")
+            for name in REQUIRED_BINARIES
+        }
+        if not (package / "_fullmag_core.so").is_file():
+            raise _fail("backend package has no _fullmag_core.so")
+        package_root = str(validate_path(
+            package, Path(str(layout["build_storage_root"])), "backend package"
+        ))
+        backend_build_receipt = str(package / "backend-build-receipt.json")
     source_commit = str(source_bundle.get("resolved_commit", ""))
     if not COMMIT_RE.fullmatch(source_commit):
-        raise _fail("direct source archive has no canonical commit")
-    build_receipt = package / "backend-build-receipt.json"
-    if _sha256_bytes(prepare_receipt_bytes) != _sha256_file(build_receipt, "backend build receipt"):
-        raise _fail("backend build receipt changed while assembling provenance")
+        raise _fail("direct source has no canonical commit")
+    if not live_source:
+        build_receipt = package / "backend-build-receipt.json"
+        if _sha256_bytes(prepare_receipt_bytes) != _sha256_file(
+                build_receipt, "backend build receipt"):
+            raise _fail("backend build receipt changed while assembling provenance")
     build = prepare_receipt.get("build")
     if (not isinstance(build, dict)
             or build.get("cargo_profile") != expected_cargo_profile
             or build.get("cargo_target_profile_dir") != expected_cargo_profile):
         raise _fail("backend build receipt profile changed while assembling provenance")
-    source_mode = str(source_bundle.get("source_mode", "snapshot"))
     assembly = {
         "schema": "fullmag.docker-all-image.v1",
         "state": "succeeded",
@@ -1629,7 +1733,6 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
         "source_digest": str(source_bundle["source_digest"]),
         "source_snapshot_sha256": str(source_bundle["source_snapshot_sha256"]),
         "native_source_identity": source_bundle["native_source_identity"],
-        "source_manifest": str(source_bundle["manifest_path"]),
         # Keep the final runtime image separate from the immutable toolchain
         # base.  The runtime launcher consumes image_id; base_image is the
         # provenance identity passed as the toolchain image to Compose.
@@ -1648,11 +1751,11 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
         "build_profile": build_profile,
         "cargo_profile": build["cargo_profile"],
         "cargo_target_profile_dir": build["cargo_target_profile_dir"],
-        "package_root": str(validate_path(package, Path(str(layout["build_storage_root"])), "backend package")),
+        "package_root": package_root,
         "binary_hashes": binary_hashes,
         "startup_helper_hashes": helper_hashes,
         "build_receipt_sha256": _sha256_bytes(prepare_receipt_bytes),
-        "backend_build_receipt": str(build_receipt),
+        "backend_build_receipt": backend_build_receipt,
         "backend_build_receipt_schema": prepare_receipt.get("schema"),
         "output": str(run_root),
         "context": context,
@@ -1661,13 +1764,28 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
         assembly["live_manifest_sha256"] = str(source_bundle["live_manifest_sha256"])
         assembly["source_git_common_dir"] = str(source_bundle["git_common_dir"])
     else:
+        assembly["source_manifest"] = str(source_bundle["manifest_path"])
         assembly["source_archive"] = {
             "path": str(source_bundle["archive_path"]),
             "manifest_path": str(source_bundle["manifest_path"]),
             "sha256": str(source_bundle["archive_sha256"]),
             "bytes": source_bundle["archive_bytes"],
         }
-    receipt_path = validate_path(run_root / "assembly.json", Path(str(layout["build_storage_root"])), "direct assembly receipt")
+    if live_source:
+        # Keep technical assembly/provenance in the Compose group's control
+        # volume.  The host run root remains runtime handoff state only.
+        compose_project = _compose_identity(layout)["project_name"]
+        control_guest = _control_record_path("live-assembly", compose_project, run_id)
+        control_relative = _control_relative_from_guest(control_guest)
+        assembly["output"] = control_guest
+        _write_control_json(selected, compose_project, control_relative, assembly)
+        return Path(control_guest)
+
+    from fullmag_storage import atomic_json
+    receipt_path = validate_path(
+        run_root / "assembly.json", Path(str(layout["build_storage_root"])),
+        "direct assembly receipt",
+    )
     atomic_json(receipt_path, assembly)
     # The runtime binds this exact receipt as /opt/fullmag/provenance.json.
     _write_json(run_root / "provenance.json", assembly)
@@ -1737,7 +1855,12 @@ def _compose_stop_hint(container_ids: Sequence[str]) -> str:
     return "docker stop " + " ".join(container_ids)
 
 
-def _assert_no_running_fullmag(project: str, source_identity: Mapping[str, object]) -> None:
+def _assert_no_running_fullmag(
+    project: str,
+    source_identity: Mapping[str, object],
+    *,
+    owned_control: Mapping[str, object] | None = None,
+) -> None:
     """Reject all stale containers/networks for the selected Compose group.
 
     The historical helper name is retained for callers, but the admission
@@ -1748,6 +1871,25 @@ def _assert_no_running_fullmag(project: str, source_identity: Mapping[str, objec
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
         raise _fail("Invalid Compose project name")
     from docker_compose_identity import compose_network_name, source_labels
+
+    if owned_control is not None:
+        required_control_fields = {"name", "image", "volume", "attempt"}
+        if (not isinstance(owned_control, Mapping)
+                or set(owned_control) != required_control_fields):
+            raise _fail("Owned build-control identity must contain exactly name, image, volume, and attempt")
+        control_name = owned_control["name"]
+        control_image = owned_control["image"]
+        control_volume = owned_control["volume"]
+        control_attempt = owned_control["attempt"]
+        if (not isinstance(control_attempt, str)
+                or re.fullmatch(r"[0-9a-f]{32}", control_attempt) is None
+                or not isinstance(control_name, str)
+                or control_name != "fullmag-control-" + control_attempt
+                or not isinstance(control_image, str)
+                or re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64}", control_image) is None
+                or not isinstance(control_volume, str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", control_volume) is None):
+            raise _fail("Owned build-control identity is not immutable")
 
     if not isinstance(source_identity, Mapping):
         raise _fail("Resolved Compose source identity is required for network admission")
@@ -1769,15 +1911,72 @@ def _assert_no_running_fullmag(project: str, source_identity: Mapping[str, objec
             timeout=60,
         )
         container_ids.update(line.strip() for line in raw.splitlines() if line.strip())
+    if owned_control is not None and not container_ids:
+        raise _fail("Owned build-control helper is no longer present")
     if container_ids:
         ordered = sorted(container_ids)
-        raise _fail(
-            "Fullmag Docker containers already exist for project " + project
-            + " (running or stopped): " + ", ".join(ordered)
-            + "; remove them explicitly with the recorded command: `"
-            + _compose_stop_hint(ordered)
-            + "` before `up`"
+        if owned_control is None:
+            raise _fail(
+                "Fullmag Docker containers already exist for project " + project
+                + " (running or stopped): " + ", ".join(ordered)
+                + "; remove them explicitly with the recorded command: `"
+                + _compose_stop_hint(ordered)
+                + "` before `up`"
+            )
+        documents = _read_json_output(
+            _docker_capture("inspect", *ordered, timeout=60),
+            "owned build-control container inspection",
         )
+        if not isinstance(documents, list) or len(documents) != len(ordered):
+            raise _fail("Owned build-control inspection returned an incomplete document")
+        try:
+            inspected_ids = {
+                document["Id"] for document in documents
+                if isinstance(document, Mapping)
+                and isinstance(document.get("Id"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", document["Id"])
+            }
+        except (KeyError, TypeError):
+            inspected_ids = set()
+        if len(inspected_ids) != len(documents):
+            raise _fail("Owned build-control inspection did not return full container identities")
+
+        def is_owned_control(document: Mapping[str, object]) -> bool:
+            config = document.get("Config")
+            state = document.get("State")
+            host_config = document.get("HostConfig")
+            labels = config.get("Labels") if isinstance(config, Mapping) else None
+            mounts = document.get("Mounts")
+            if (document.get("Name") not in (control_name, "/" + control_name)
+                    or not isinstance(config, Mapping)
+                    or config.get("Image") != control_image
+                    or not isinstance(state, Mapping)
+                    or state.get("Running") is not True
+                    or not isinstance(host_config, Mapping)
+                    or host_config.get("Runtime") != "runc"
+                    or host_config.get("NetworkMode") != "none"
+                    or host_config.get("DeviceRequests") not in (None, [])
+                    or host_config.get("ReadonlyRootfs") is not True
+                    or not isinstance(labels, Mapping)
+                    or labels.get("com.docker.compose.project") != project
+                    or labels.get("com.docker.compose.service") != "build-control"
+                    or any(labels.get(key) != value for key, value in expected_labels.items())
+                    or not isinstance(mounts, list)
+                    or len(mounts) != 1):
+                return False
+            mount = mounts[0]
+            return (isinstance(mount, Mapping)
+                    and mount.get("Type") == "volume"
+                    and mount.get("Name") == control_volume
+                    and mount.get("Destination") == "/control")
+
+        matches = [document for document in documents
+                   if isinstance(document, Mapping) and is_owned_control(document)]
+        if len(matches) != 1 or len(documents) != 1:
+            raise _fail(
+                "Fullmag project containers include an unadmitted container; "
+                "only the exact active build-control helper may be retained"
+            )
 
     network_ids: set[str] = set()
     network_filters = (
@@ -1996,6 +2195,14 @@ def _backend_start_inputs(
     compose_identity = _compose_identity(layout)
     compose_project = compose_identity["project_name"]
     control_volume = _control_volume_name(compose_project)
+    # Freeze the bounded operator controls before any image, toolchain, cache
+    # or Compose preparation.  Every later record and rendered configuration
+    # is derived from this exact snapshot; no later host-environment fallback
+    # is allowed to change a run's semantics.
+    operator_probe_environment = _operator_probe_environment_from_host()
+    operator_probe_environment_sha256 = _operator_probe_environment_sha256(
+        operator_probe_environment
+    )
     control_root = _bootstrap_module().CONTROL_ROOT
     if run_root is None:
         resolved_run_id, resolved_root = _new_run_root(layout)
@@ -2017,6 +2224,9 @@ def _backend_start_inputs(
         "build_profile": build_profile,
         "cargo_profile": cargo_profile,
         "compose_project": compose_project,
+        "operator_probe_environment_schema": OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+        "operator_probe_environment": dict(operator_probe_environment),
+        "operator_probe_environment_sha256": operator_probe_environment_sha256,
     }
     terminal_relative = f"{CONTROL_NAMESPACE}/backend-start/{resolved_run_id}.json"
     terminal_path = _control_guest_path(terminal_relative)
@@ -2046,6 +2256,11 @@ def _backend_start_inputs(
         # Compose interpolation.  The image build context validates this
         # source bind before the long-lived backend service starts.
         git_common = _source_git_common_directory(selected)
+        from fullmag_storage import git as storage_git
+
+        build_source_commit = storage_git(selected, "rev-parse", "HEAD")
+        if COMMIT_RE.fullmatch(build_source_commit) is None:
+            raise _fail("selected checkout has no canonical HEAD commit before image build")
         placeholder_environment = {
             **_compose_identity_environment(layout),
             "FULLMAG_DEV_IMAGE": getattr(args, "image", None)
@@ -2067,6 +2282,7 @@ def _backend_start_inputs(
             ),
             "FULLMAG_SOURCE_ROOT": str(selected),
             "FULLMAG_SOURCE_GIT_COMMON": str(git_common),
+            "FULLMAG_SOURCE_COMMIT": build_source_commit,
             "FULLMAG_BACKEND_PACKAGE": "/opt/fullmag/package",
             "FULLMAG_STATE_ROOT": str(resolved_root / "state"),
             "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
@@ -2082,6 +2298,9 @@ def _backend_start_inputs(
             "FULLMAG_DEVELOPMENT_INPUTS_PATH": f"{control_root}/frontend/development-inputs.json",
             "FULLMAG_BUILD_CONTROL_VOLUME": control_volume,
             "FULLMAG_BACKEND_HOSTNAME": "fullmag-direct-backend-" + resolved_run_id[:12],
+            "FULLMAG_MIXED_P1_DEVICE": operator_probe_environment["FULLMAG_MIXED_P1_DEVICE"],
+            "FULLMAG_ARTIFACT_FIELD_STORAGE": operator_probe_environment["FULLMAG_ARTIFACT_FIELD_STORAGE"],
+            "FULLMAG_OPERATOR_PROBE_ENVIRONMENT_SHA256": operator_probe_environment_sha256,
         }
 
         base_info = _ensure_development_base(args, selected, layout, resolved_root)
@@ -2113,8 +2332,6 @@ def _backend_start_inputs(
             device_access, gpu_access_policy, image_id, compose_project
         )
 
-        from fullmag_storage import git as storage_git
-
         source_commit = storage_git(selected, "rev-parse", "HEAD")
         if COMMIT_RE.fullmatch(source_commit) is None:
             raise _fail("selected checkout has no canonical HEAD commit")
@@ -2123,7 +2340,10 @@ def _backend_start_inputs(
             "source_commit": source_commit,
             "git_common_dir": str(git_common),
         }
-        cache = _prepare_backend_cache(layout, selected, image_id, resolved_root, selected, toolchain_id)
+        cache = _prepare_backend_cache(
+            layout, selected, image_id, resolved_root, selected, toolchain_id,
+            compose_environment=placeholder_environment,
+        )
         package = _backend_cache_package_root(cache)
         # ``package`` is a daemon-side /mnt path supplied by the cache helper;
         # native Windows Python cannot inspect it.  The fixed backend service
@@ -2134,6 +2354,7 @@ def _backend_start_inputs(
             layout, selected, resolved_root, source_for_environment,
             package, image_ref, image_id, toolchain_id, cache,
             str(base_info["reference"]), cargo_profile, device_access,
+            operator_probe_environment=operator_probe_environment,
         )
         # No backend package or source snapshot is built/captured in this host
         # preparation phase.  The service observes the live readonly mounts on
@@ -2188,6 +2409,9 @@ def _backend_start_inputs(
             "runtime_image_built": image_built,
             "backend_start_receipt": str(terminal_path),
             "previous_backend_build_receipt_sha256": previous_receipt_sha256,
+            "operator_probe_environment_schema": OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+            "operator_probe_environment": dict(operator_probe_environment),
+            "operator_probe_environment_sha256": operator_probe_environment_sha256,
             "backend_start_inputs": "pending",
         }
         inputs_relative = f"{CONTROL_NAMESPACE}/backend-start/{resolved_run_id}-inputs.json"
@@ -2213,6 +2437,9 @@ def _backend_start_inputs(
             toolchain_image_id=toolchain_id,
             runtime_image_built=image_built,
             backend_cache_receipt=cache.get("receipt_path"),
+            operator_probe_environment_schema=OPERATOR_PROBE_ENVIRONMENT_SCHEMA,
+            operator_probe_environment=dict(operator_probe_environment),
+            operator_probe_environment_sha256=operator_probe_environment_sha256,
         )
         _write_control_json(selected, compose_project, terminal_relative, terminal)
         return inputs, resolved_root
@@ -2326,16 +2553,73 @@ def _parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--source-root", type=Path, required=True)
     resume_parser.add_argument("--port", type=int, required=True)
     resume_parser.add_argument("--restart-backend", action="store_true", help="Start the retained stopped backend; never stop an active service")
+    activate_parser = subparsers.add_parser(
+        "activate-script",
+        help="activate one Python script in the already-running retained backend",
+    )
+    activate_parser.add_argument("--attempt", required=True)
+    activate_parser.add_argument("--config-sha256", required=True)
+    activate_parser.add_argument("--source-root", type=Path, required=True)
+    activate_parser.add_argument("--script", type=Path, required=True)
+    activate_parser.add_argument(
+        "--request-id",
+        help="optional stable request fence; default is derived from attempt and script hash",
+    )
+    script_parser = subparsers.add_parser(
+        "script",
+        help=(
+            "activate one script in the exactly validated running DEV group; "
+            "attempt and configuration pins are discovered from control receipts"
+        ),
+    )
+    script_parser.add_argument("--script", type=Path, required=True)
+    script_parser.add_argument(
+        "--source-root", type=Path,
+        help="optional registered checkout override; otherwise use the current selected worktree",
+    )
+    script_parser.add_argument(
+        "--port", type=int,
+        help="optional frontend port override; conflicting defaults fail closed",
+    )
+    script_parser.add_argument("--request-id", help="optional stable request fence")
     idle_restart = subparsers.add_parser("restart-idle-volume", help="Restart the pinned healthy backend only while no session is active")
     idle_restart.add_argument("--attempt", required=True)
     idle_restart.add_argument("--config-sha256", required=True)
     idle_restart.add_argument("--source-root", type=Path, required=True)
     idle_restart.add_argument("--port", type=int, required=True)
+    stop_unadmitted = subparsers.add_parser(
+        "stop-unadmitted",
+        help=(
+            "stop one pinned pre-admission startup rejection after proving that "
+            "no run or host reservation was admitted"
+        ),
+    )
+    stop_unadmitted.add_argument("--attempt", required=True)
+    stop_unadmitted.add_argument("--config-sha256", required=True)
+    stop_unadmitted.add_argument("--source-root", type=Path, required=True)
+    stop_unadmitted.add_argument("--backend-container-id", required=True)
+    stop_unadmitted.add_argument("--frontend-container-id", required=True)
+    stop_unadmitted.add_argument("--image-id", required=True)
+    stop_unadmitted.add_argument("--failure-marker-sha256", required=True)
+    stop_unadmitted.add_argument("--process-receipt-sha256", required=True)
+    stop_unadmitted.add_argument("--source-sha256", required=True)
+    stop_unadmitted.add_argument("--request-id", required=True)
+    stop_unadmitted.add_argument("--session-id", required=True)
     recreate_volume = subparsers.add_parser("recreate-volume", help="Replace exact stopped-backend DEV services while retaining Docker caches")
     recreate_volume.add_argument("--attempt", required=True)
     recreate_volume.add_argument("--config-sha256", required=True)
     recreate_volume.add_argument("--source-root", type=Path, required=True)
     recreate_volume.add_argument("--port", type=int, required=True)
+    recreate_volume.add_argument(
+        "--recovery-authorization",
+        type=str,
+        help=(
+            "opaque POSIX reference to the explicit managed control-volume "
+            "authorization for one stopped container namespace recovery; the "
+            "reference is passed unchanged to the volume-only recovery wrapper "
+            "and is never resolved as a host path"
+        ),
+    )
     recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the old Windows root and create a fresh one")
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
                                  include_untracked=[], script=None)
@@ -2363,12 +2647,23 @@ def _parser() -> argparse.ArgumentParser:
                              help="unsupported compatibility flag: live docker-dev does not consume frozen source manifests")
         command.add_argument("--include-untracked", action="append", default=[],
                              help="unsupported compatibility flag: add new source files to the selected Git index instead")
-        command.add_argument("--port", type=int, default=3197,
+        command.add_argument("--port", type=int, default=None,
                              help="loopback frontend port (up only)")
         command.add_argument("--script", "--startup-script", dest="script", type=Path,
                              help="optional simulation script, relative to the selected checkout or absolute inside it (up only)")
         if name == "build":
             command.set_defaults(script=None)
+    codegen_parser = subparsers.add_parser(
+        "codegen-openapi",
+        help=(
+            "run OpenAPI and TypeScript codegen through the already-running "
+            "backend/frontend services of the selected Compose group"
+        ),
+    )
+    codegen_parser.add_argument(
+        "--source-root", type=Path,
+        help="registered checkout/worktree mounted by the running services",
+    )
     recreate_parser = subparsers.add_parser(
         "recreate",
         help="recreate the named development run while retaining its state and session store",
@@ -2435,21 +2730,48 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.action in {"up", "build"}:
+            _require_native_windows()
+            from docker_dev_defaults import resolve_defaults
+            selected = resolve_defaults(args.repo_root, source_root=args.source_root, port=getattr(args, "port", None))
+            args.source_root = selected.source_root
+            args.port = selected.port
         if args.action == "build":
             build(args)
         elif args.action == "restart-idle-volume":
             from docker_volume_dev import restart_idle
             restart_idle(args)
+        elif args.action == "stop-unadmitted":
+            from docker_volume_stop_unadmitted import stop
+            stop(args)
         elif args.action == "recreate-volume":
-            from docker_volume_dev import recreate as recreate_volume
-            recreate_volume(args)
+            if args.recovery_authorization is not None:
+                if args.fresh_state:
+                    raise _fail(
+                        "container recovery cannot combine --recovery-authorization with --fresh-state"
+                    )
+                from docker_volume_container_recovery import recover as recover_container
+                recover_container(args)
+            else:
+                from docker_volume_dev import recreate as recreate_volume
+                recreate_volume(args)
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)
+        elif args.action == "activate-script":
+            from docker_volume_activate import activate
+            activate(args)
+        elif args.action == "script":
+            from docker_dev_defaults import activate_discovered
+            activate_discovered(args)
         elif args.action == "up":
             up(args)
         elif args.action == "recreate":
             recreate(args)
+        elif args.action == "codegen-openapi":
+            from docker_dev_codegen import run as run_codegen
+
+            return run_codegen(args.repo_root.resolve(strict=True), args.source_root)
         else:
             raise _fail(f"unsupported action: {args.action}")
         return 0

@@ -5,6 +5,12 @@
 # keeps direct config inspection deterministic; selected worktrees override it.
 name: ${FULLMAG_COMPOSE_PROJECT:-fullmag-master}
 
+x-fullmag-bounded-logging: &fullmag-bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-fullmag-source-labels: &fullmag-source-labels
   org.fullmag.source.project-id: ${FULLMAG_SOURCE_PROJECT_ID:-unknown}
   org.fullmag.source.worktree-id: ${FULLMAG_SOURCE_WORKTREE_ID:-unknown}
@@ -15,6 +21,7 @@ services:
   development-base:
     profiles: ["image-build"]
     labels: *fullmag-source-labels
+    logging: *fullmag-bounded-logging
     image: ${FULLMAG_DEVELOPMENT_BASE_IMAGE:-fullmag/development-base:local}
     pull_policy: never
     build:
@@ -29,6 +36,7 @@ services:
 
   backend-cache-volume-maintenance:
     profiles: ["backend-cache-maintenance"]
+    logging: *fullmag-bounded-logging
     labels:
       com.fullmag.source.project-id: ${FULLMAG_SOURCE_PROJECT_ID:-unknown}
       com.fullmag.source.worktree-id: ${FULLMAG_SOURCE_WORKTREE_ID:-unknown}
@@ -86,6 +94,7 @@ services:
 
   backend:
     labels: *fullmag-source-labels
+    logging: *fullmag-bounded-logging
     image: ${FULLMAG_DEV_IMAGE:?Prepare the development toolchain image}
     build:
       context: ./docker/all-in-one
@@ -134,6 +143,11 @@ services:
       FULLMAG_TOOLCHAIN_IMAGE_ID: ${FULLMAG_TOOLCHAIN_IMAGE_ID:?Pin the toolchain identity}
       FULLMAG_BACKEND_CARGO_PROFILE: ${FULLMAG_BACKEND_CARGO_PROFILE:-backend-dev}
       FULLMAG_DOCKER_DEVICE_ACCESS: ${FULLMAG_DOCKER_DEVICE_ACCESS:?Resolved device access is required}
+      # Bounded operator-probe controls.  These are the only workload
+      # variables admitted from the host environment; do not replace this
+      # allowlist with an ambient environment passthrough.
+      FULLMAG_MIXED_P1_DEVICE: ${FULLMAG_MIXED_P1_DEVICE:-gpu}
+      FULLMAG_ARTIFACT_FIELD_STORAGE: ${FULLMAG_ARTIFACT_FIELD_STORAGE:-json}
       FULLMAG_REPO_ROOT: /opt/fullmag/source
       FULLMAG_RUNTIME_PACKAGE_ROOT: /opt/fullmag/package
       FULLMAG_PACKAGE_PROVENANCE: /opt/fullmag/control/backend/runtime-provenance.json
@@ -141,6 +155,13 @@ services:
       PYTHONPATH: /build/workspace/packages/fullmag-py/src:/opt/fullmag/package
       # Durable workspace metadata is isolated per Compose source group.
       FULLMAG_WORKSPACE_STATE_DIR: /user-data
+      FULLMAG_RUNTIME_CONTROL_ROOT: /opt/fullmag/runtime-control
+      FULLMAG_RUNTIME_SERVICES_ROOT: /opt/fullmag/runtime-control/runtime-services
+      FULLMAG_STATE_ROOT: /opt/fullmag/runtime-control
+      FULLMAG_STATE_DIR: /opt/fullmag/runtime-control
+      FULLMAG_RUNTIME_SERVICE_CONFIG: /opt/fullmag/runtime-control/runtime-service/docker-all.json
+      FULLMAG_RUNTIME_PROCESS_RECEIPT: /opt/fullmag/runtime-control/runtime-service/process-tree.json
+      FULLMAG_FEM_MESH_CACHE_DIR: /build/cache/fem-mesh
       CUDA_CACHE_PATH: /build/cache/cuda-compute
     expose: ["8081"]
     volumes:
@@ -171,13 +192,26 @@ services:
         source: fullmag-build-control
         target: /opt/fullmag/control
         volume: {nocopy: true}
+      # Runtime ownership, recovery, and process receipts stay in the group's
+      # control volume. The same runtime-services subpath is mounted over its
+      # native SessionStore compatibility location so sessions/results remain
+      # in the Windows-backed /state tree.
+      - type: volume
+        source: fullmag-build-control
+        target: /opt/fullmag/runtime-control
+        volume: {nocopy: true, subpath: runtime-control}
+      - type: volume
+        source: fullmag-build-control
+        target: /state/runs/docker-all/session-store/runtime-services
+        volume: {nocopy: true, subpath: runtime-control/runtime-services}
       # Per-group durable user data: workspace.db and related settings only.
       # Runtime sessions/results remain in the per-run /state bind below.
       - type: bind
         source: ${FULLMAG_WORKSPACE_STATE_ROOT:?Managed group user-data namespace is required}
         target: /user-data
         bind: {create_host_path: false}
-      # Real Windows storage: sessions, results, logs and the CUDA disk cache.
+      # Real Windows storage: sessions and simulation results. Build logs,
+      # runtime ownership records, compiler caches and provenance live in Docker volumes.
       - type: bind
         source: ${FULLMAG_STATE_ROOT:?Managed Windows storage namespace is required}
         target: /state
@@ -202,6 +236,7 @@ services:
 
   frontend:
     labels: *fullmag-source-labels
+    logging: *fullmag-bounded-logging
     image: ${FULLMAG_DEV_IMAGE}
     pull_policy: never
     init: true

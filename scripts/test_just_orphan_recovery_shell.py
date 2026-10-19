@@ -76,40 +76,100 @@ class DockerDevelopmentShellBoundaryTests(unittest.TestCase):
         start = source.index(marker) + len(marker)
         body = source[start:source.index('\n  *"scripts/run_managed_boris_nf_v2.py"*)', start)]
         with tempfile.TemporaryDirectory(prefix='fullmag-docker-dev-shell-') as directory:
-            resolver = Path(directory) / 'resolver.py'
-            resolver.write_text('import json,sys; print(json.dumps(sys.argv[1:]))\n', encoding='utf8')
+            script_dir = Path(directory) / 'scripts'
+            script_dir.mkdir()
+            (script_dir / 'docker_dev.py').write_text(
+                'import json,sys; print(json.dumps(sys.argv[1:]))\n', encoding='utf8')
             program = ('set -euo pipefail\nrecipe="$RECIPE_LITERAL"\n'
-                       'python_cmd="$FIXED_PYTHON"\nresolver="$FIXED_RESOLVER"\n'
+                       'python_cmd="$FIXED_PYTHON"\n'
                        'repo_root="/registered/checkout"\n'
-                       'script_dir="/registered/checkout/scripts"\n'
-                       'bash_executable="/bin/bash"\n' + body)
+                       f'script_dir="{script_dir}"\n' + body)
             bash = '/bin/bash' if os.name == 'posix' else (shutil.which('bash') or 'bash')
             return subprocess.run([bash, '--noprofile', '--norc', '-c', program],
                                   env={**os.environ, 'RECIPE_LITERAL': recipe,
-                                       'FIXED_PYTHON': sys.executable,
-                                       'FIXED_RESOLVER': str(resolver)},
+                                       'FIXED_PYTHON': sys.executable},
                                   capture_output=True, text=True, timeout=15)
 
-    def recipe(self, *, source_root=None, suffix=''):
-        optional_source = ' ' if source_root is None else f" --source-root '{source_root}'"
+    def recipe(self, *, source_root=None, script=None, suffix=''):
+        optional_source = '' if source_root is None else f" --source-root '{source_root}'"
+        optional_script = '' if script is None else f" --script '{script}'"
         return (f'python "/ignored/checkout/scripts/docker_dev.py" '
-                '--repo-root "/ignored/checkout" recreate --direct-development '
-                "--run-receipt '/storage/runs/failed.json' "
-                f"--previous-config-sha256 '{'a' * 64}'{optional_source} --port '3197'"
-                f'{suffix}')
+                '--repo-root "/ignored/checkout" up --port \'3197\' --gpu-access \'auto\''
+                f'{optional_source}{optional_script}{suffix}')
 
-    def test_rejects_retired_host_receipt_recreate_recipe(self):
-        for recipe in (self.recipe(), self.recipe(source_root='/selected/worktree')):
+    def test_dispatches_docker_dev_without_legacy_storage_build_runner(self):
+        cases = (
+            (self.recipe(), ['--repo-root', '/registered/checkout', 'up', '--port', '3197',
+                             '--gpu-access', 'auto']),
+            (self.recipe(source_root='/selected/worktree', script='examples/run.py'),
+             ['--repo-root', '/registered/checkout', 'up', '--port', '3197', '--gpu-access',
+              'auto', '--source-root', '/selected/worktree', '--script', 'examples/run.py']),
+        )
+        for recipe, expected in cases:
             with self.subTest(recipe=recipe):
                 result = self.dispatch(recipe)
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn('host-receipt DEV recreation is retired', result.stderr)
-                self.assertFalse(result.stdout.strip())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+
+    def test_dispatches_build_as_fixed_argv(self):
+        recipe = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
+                  "build --gpu-access 'disabled' --source-root '/selected/worktree'")
+        result = self.dispatch(recipe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ['--repo-root', '/registered/checkout', 'build',
+            '--gpu-access', 'disabled', '--source-root', '/selected/worktree'])
+
+    def test_rejects_retired_host_receipt_recreate_recipe(self):
+        recipe = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
+                  "recreate --direct-development --run-receipt '/storage/runs/failed.json' "
+                  f"--previous-config-sha256 '{'a' * 64}' --gpu-access 'required' "
+                  "--source-root '/selected/worktree' --port '3198'")
+        result = self.dispatch(recipe)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('host-receipt DEV recreation is retired', result.stderr)
+        self.assertFalse(result.stdout.strip())
+
+    def test_volume_lifecycle_commands_dispatch_fixed_argv(self):
+        for command, flag in [('resume-volume', '--restart-backend'),
+                              ('recreate-volume', '--fresh-state'),
+                              ('restart-idle-volume', '')]:
+            source = '/selected/$(printf literal);worktree'
+            recipe = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
+                      f"{command} --attempt '{'b' * 32}' --config-sha256 '{'a' * 64}' "
+                      f"--source-root '{source}' --port '3198'" + (' ' + flag if flag else ''))
+            result = self.dispatch(recipe)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = ['--repo-root', '/registered/checkout', command, '--attempt', 'b' * 32,
+                        '--config-sha256', 'a' * 64, '--source-root', source, '--port', '3198']
+            if flag: expected.append(flag)
+            self.assertEqual(json.loads(result.stdout), expected)
+            injected = self.dispatch(recipe + '; printf injected')
+            self.assertEqual(injected.returncode, 2, injected.stderr)
+
+
+    def test_script_activation_dispatches_literal_argv_and_rejects_composite_commands(self):
+        source = '/selected/$(printf literal);worktree'
+        script = 'examples/$(printf literal);study.py'
+        base = ('python "/ignored/checkout/scripts/docker_dev.py" --repo-root "/ignored/checkout" '
+                f"activate-script --attempt '{'b' * 32}' --config-sha256 '{'a' * 64}' "
+                f"--source-root '{source}' --script '{script}'")
+        for request_id in (None, 'stable-request-1'):
+            recipe = base + (f" --request-id '{request_id}'" if request_id else '')
+            result = self.dispatch(recipe)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = ['--repo-root', '/registered/checkout', 'activate-script',
+                        '--attempt', 'b' * 32, '--config-sha256', 'a' * 64,
+                        '--source-root', source, '--script', script]
+            if request_id:
+                expected.extend(['--request-id', request_id])
+            self.assertEqual(json.loads(result.stdout), expected)
+            rejected = self.dispatch(recipe + '; printf injected')
+            self.assertEqual(rejected.returncode, 2, rejected.stderr)
+            self.assertNotIn('injected', rejected.stdout)
 
     def test_rejects_unbound_recreate_variants(self):
         for recipe in (
-            self.recipe().replace('--direct-development ', ''),
-            self.recipe().replace("'" + 'a' * 64 + "'", "'short'"),
+            self.recipe().replace("--gpu-access 'auto'", "--gpu-access 'unknown'"),
             self.recipe(suffix='; printf injected'),
         ):
             with self.subTest(recipe=recipe):

@@ -166,23 +166,86 @@ case "${recipe}" in
     fi
     exec "${bash_executable}" -euo pipefail -c "${recipe}"
     ;;
+  *"scripts/docker_dev.py"*" stop-unadmitted "*)
+    volume_stop_unadmitted_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" stop-unadmitted --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --frontend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --failure-marker-sha256 '([0-9a-f]{64})' --process-receipt-sha256 '([0-9a-f]{64})' --source-sha256 '([0-9a-f]{64})' --request-id '([^']+)' --session-id '([^']+)'[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${volume_stop_unadmitted_pattern} ]]; then
+      echo "[fullmag just] invalid unadmitted startup stop recipe" >&2
+      exit 2
+    fi
+    exec "${python_cmd}" "${script_dir}/docker_dev.py" --repo-root "${repo_root}" stop-unadmitted \
+      --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}" \
+      --source-root "${BASH_REMATCH[3]}" --backend-container-id "${BASH_REMATCH[4]}" \
+      --frontend-container-id "${BASH_REMATCH[5]}" --image-id "${BASH_REMATCH[6]}" \
+      --failure-marker-sha256 "${BASH_REMATCH[7]}" --process-receipt-sha256 "${BASH_REMATCH[8]}" \
+      --source-sha256 "${BASH_REMATCH[9]}" --request-id "${BASH_REMATCH[10]}" \
+      --session-id "${BASH_REMATCH[11]}"
+    ;;
   *"scripts/docker_dev.py"*)
-    docker_dev_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" (build|up --port '[0-9]{4,5}')( --gpu-access '(auto|required|disabled)')?( --source-root '[^']+')?( --script '[^']+')?[[:space:]]*$"
-    docker_dev_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate --direct-development --run-receipt '[^']+' --previous-config-sha256 '[0-9a-f]{64}'[ ]+(--source-root '[^']+'[ ]+)?--port '[0-9]{4,5}'[[:space:]]*$"
-    docker_dev_resume_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" resume-volume --attempt '[0-9a-f]{32}' --config-sha256 '[0-9a-f]{64}' --source-root '[^']+' --port '[0-9]{4,5}'( --restart-backend)?[[:space:]]*$"
-    docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '[0-9a-f]{32}' --config-sha256 '[0-9a-f]{64}' --source-root '[^']+' --port '[0-9]{4,5}'( --fresh-state)?[[:space:]]*$"
-    docker_dev_idle_restart_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" restart-idle-volume --attempt '[0-9a-f]{32}' --config-sha256 '[0-9a-f]{64}' --source-root '[^']+' --port '[0-9]{4,5}'[[:space:]]*$"
-    if [[ ! "${recipe}" =~ ${docker_dev_pattern} && ! "${recipe}" =~ ${docker_dev_recreate_pattern} && ! "${recipe}" =~ ${docker_dev_resume_pattern} && ! "${recipe}" =~ ${docker_dev_volume_recreate_pattern} && ! "${recipe}" =~ ${docker_dev_idle_restart_pattern} ]]; then
+    docker_dev_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" build --gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?[[:space:]]*$"
+    docker_dev_up_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" up[ ]+(--port '([0-9]{4,5})'[ ]+)?--gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?( --script '([^']+)')?[[:space:]]*$"
+    docker_dev_codegen_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" codegen-openapi( --source-root '([^']+)')?[[:space:]]*$"
+    docker_dev_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate --direct-development --run-receipt '([^']+)' --previous-config-sha256 '([0-9a-f]{64})' --gpu-access '(auto|required|disabled)'[ ]+(--source-root '([^']+)'[ ]+)?--port '([0-9]{4,5})'[[:space:]]*$"
+    docker_dev_resume_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" resume-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --restart-backend)?[[:space:]]*$"
+    docker_dev_discover_script_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" script --script '([^']+)'( --source-root '([^']+)')?( --port '([0-9]{4,5})')?( --request-id '([^']+)')?[[:space:]]*$"
+    docker_dev_activate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" activate-script --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --script '([^']+)'( --request-id '([^']+)')?[[:space:]]*$"
+    docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --recovery-authorization '([^']+)')?( --fresh-state)?[[:space:]]*$"
+    docker_dev_idle_restart_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" restart-idle-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'[[:space:]]*$"
+    docker_dev_args=(--repo-root "${repo_root}")
+    if [[ "${recipe}" =~ ${docker_dev_codegen_pattern} ]]; then
+      docker_dev_args+=(codegen-openapi)
+      if [[ -n "${BASH_REMATCH[2]:-}" ]]; then
+        docker_dev_args+=(--source-root "${BASH_REMATCH[2]}")
+      fi
+    elif [[ "${recipe}" =~ ${docker_dev_build_pattern} ]]; then
+      docker_dev_args+=(build --gpu-access "${BASH_REMATCH[1]}")
+      if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+        docker_dev_args+=(--source-root "${BASH_REMATCH[3]}")
+      fi
+    elif [[ "${recipe}" =~ ${docker_dev_up_pattern} ]]; then
+      docker_dev_args+=(up)
+      if [[ -n "${BASH_REMATCH[2]:-}" ]]; then docker_dev_args+=(--port "${BASH_REMATCH[2]}"); fi
+      docker_dev_args+=(--gpu-access "${BASH_REMATCH[3]}")
+      if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
+        docker_dev_args+=(--source-root "${BASH_REMATCH[5]}")
+      fi
+      if [[ -n "${BASH_REMATCH[7]:-}" ]]; then
+        docker_dev_args+=(--script "${BASH_REMATCH[7]}")
+      fi
+    elif [[ "${recipe}" =~ ${docker_dev_recreate_pattern} ]]; then
+      echo "[fullmag just] host-receipt DEV recreation is retired; use docker-dev-resume with a Docker-volume attempt" >&2
+      exit 2
+    elif [[ "${recipe}" =~ ${docker_dev_discover_script_pattern} ]]; then
+      docker_dev_args+=(script --script "${BASH_REMATCH[1]}")
+      if [[ -n "${BASH_REMATCH[3]:-}" ]]; then docker_dev_args+=(--source-root "${BASH_REMATCH[3]}"); fi
+      if [[ -n "${BASH_REMATCH[5]:-}" ]]; then docker_dev_args+=(--port "${BASH_REMATCH[5]}"); fi
+      if [[ -n "${BASH_REMATCH[7]:-}" ]]; then docker_dev_args+=(--request-id "${BASH_REMATCH[7]}"); fi
+    elif [[ "${recipe}" =~ ${docker_dev_activate_pattern} ]]; then
+      docker_dev_args+=(activate-script --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}" --script "${BASH_REMATCH[4]}")
+      if [[ -n "${BASH_REMATCH[6]:-}" ]]; then docker_dev_args+=(--request-id "${BASH_REMATCH[6]}"); fi
+    elif [[ "${recipe}" =~ ${docker_dev_resume_pattern} ]]; then
+      docker_dev_args+=(resume-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
+      if [[ -n "${BASH_REMATCH[5]:-}" ]]; then docker_dev_args+=(--restart-backend); fi
+    elif [[ "${recipe}" =~ ${docker_dev_volume_recreate_pattern} ]]; then
+      docker_dev_args+=(recreate-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
+      if [[ -n "${BASH_REMATCH[6]:-}" ]]; then
+        docker_dev_args+=(--recovery-authorization "${BASH_REMATCH[6]}")
+      fi
+      if [[ -n "${BASH_REMATCH[7]:-}" ]]; then docker_dev_args+=(--fresh-state); fi
+    elif [[ "${recipe}" =~ ${docker_dev_idle_restart_pattern} ]]; then
+      docker_dev_args+=(restart-idle-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
+    else
       echo "[fullmag just] invalid direct Docker development recipe" >&2
       exit 2
     fi
-    if [[ "${recipe}" =~ ${docker_dev_recreate_pattern} ]]; then
-      echo "[fullmag just] host-receipt DEV recreation is retired; use docker-dev-resume with a Docker-volume attempt" >&2
-      exit 2
-    fi
-    # DEV owns its Docker-volume receipt/log boundary; the generic host run
-    # wrapper would create prohibited host-side build data before admission.
-    exec "${bash_executable}" -euo pipefail -c "${recipe}"
+    # docker_dev.py owns its storage preflight, lifecycle receipt, and host
+    # heavy-lock admission. Do not wrap this path in the legacy generic build
+    # runner, which would create host storage/build-status.json and compatibility
+    # target/cache directories before the Docker-only build starts.
+    exec "${python_cmd}" "${script_dir}/docker_dev.py" "${docker_dev_args[@]}"
     ;;
   *"scripts/run_managed_boris_nf_v2.py"*)
     # Match just's quoted arguments, including escaped checkout apostrophes.

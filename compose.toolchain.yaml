@@ -1,6 +1,6 @@
 # Canonical FEM/GPU dependency image. Application source and runtime packages
 # are intentionally absent from this build context's allow-list.
-name: ${FULLMAG_COMPOSE_PROJECT:-fullmag-master}
+name: ${FULLMAG_COMPOSE_PROJECT:?FULLMAG_COMPOSE_PROJECT must be set by the selected Compose-group launcher}
 
 services:
   fem-gpu-toolchain:
@@ -8,7 +8,7 @@ services:
     pull_policy: never
     platform: linux/amd64
     build:
-      context: ${FULLMAG_TOOLCHAIN_CONTEXT:-.}
+      context: ${FULLMAG_TOOLCHAIN_CONTEXT:?FULLMAG_TOOLCHAIN_CONTEXT must be set by the selected Compose-group launcher}
       dockerfile: docker/fem-gpu/Dockerfile
       target: fem-gpu-dev
       args:
@@ -19,8 +19,20 @@ services:
         FULLMAG_CUDA_ARCHITECTURES: "${FULLMAG_CUDA_ARCHITECTURES:-80-real;89-real;90-real;90-virtual}"
         FULLMAG_HYPRE_GPU_ARCHITECTURES: "${FULLMAG_HYPRE_GPU_ARCHITECTURES:-60 70 80 89 90}"
         FULLMAG_HYPRE_MEMORY_VARIANT: "${FULLMAG_HYPRE_MEMORY_VARIANT:-baseline}"
-    gpus: all
     profiles: [toolchain]
+    # The toolchain service is also used for a bounded dependency-manifest
+    # probe. Keep its runtime policy declarative so the probe does not depend
+    # on Compose run flags that vary between Docker Compose versions.
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    user: "65532:65532"
+    pids_limit: 16
+    mem_limit: 64m
+    cpus: 0.25
+    environment:
+      NVIDIA_VISIBLE_DEVICES: void
     command: ["sleep", "infinity"]
 
   # This is an ephemeral Compose helper for bootstrap receipts and bounded

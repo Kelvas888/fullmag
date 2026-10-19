@@ -385,6 +385,21 @@ pub(crate) enum RuntimeCommand {
         #[arg(long)]
         request_sha256: String,
     },
+    /// Recover one exactly pinned stopped Docker service container namespace
+    /// after an authoritative managed teardown attestation.
+    #[command(name = "service-recover-container", hide = true)]
+    ServiceRecoverContainer {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        request_sha256: String,
+        #[arg(long)]
+        attestation: PathBuf,
+        #[arg(long)]
+        attestation_sha256: String,
+    },
     /// Internal managed proof of one-shot durable handoff acceptance.
     #[command(hide = true)]
     VerifyDevelopmentHandoffCommit {

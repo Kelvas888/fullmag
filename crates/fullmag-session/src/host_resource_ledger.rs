@@ -264,6 +264,13 @@ impl HostRuntimeState {
 }
 
 impl HostRuntimeReadiness {
+    /// Compare shared host admission facts, independently of the binary that
+    /// produced their attestation. Every joining binary must separately prove
+    /// its own native ABI; this is not a replacement for local validation.
+    pub fn has_same_host_abi(&self, other: &Self) -> bool {
+        runtime_readiness_abi_compatible(self, other)
+    }
+
     pub fn is_cpu_only_profile(&self) -> bool {
         self.schema_version == HOST_RUNTIME_READINESS_SCHEMA_V2
             && self.source_kind == "native_fem_cpu_abi"
@@ -910,6 +917,19 @@ impl HostResourceLedgerSnapshot {
             .as_ref()
             .map(|policy| policy.status(&self.policy, &self.reservations))
             .transpose()
+    }
+
+    /// Stable digest of the complete read-only ledger snapshot used by a
+    /// controlled runtime recovery admission. The digest includes policy,
+    /// reservation history, and node policy; it never includes a heartbeat or
+    /// a transient inventory-owner lock.
+    pub fn stable_sha256(&self) -> Result<String> {
+        let value = serde_json::json!({
+            "policy": &self.policy,
+            "reservations": &self.reservations,
+            "node_policy": &self.node_policy,
+        });
+        Ok(crate::canonical_json_sha256(&value))
     }
 }
 
@@ -2390,9 +2410,15 @@ impl HostResourceLedger {
             if marker_exists && document_exists {
                 let ledger = Self::open(&canonical_root, policy)?;
                 let existing = ledger.read_runtime_readiness()?;
-                if ledger.runtime_generation_sha256()?.is_none() || existing != readiness {
+                if !existing.has_same_host_abi(&readiness) {
+                    bail!("runtime readiness initialization changes the persisted host ABI facts");
+                }
+                if ledger.runtime_generation_sha256()?.is_none() {
                     ledger.upgrade_runtime_readiness(readiness)?;
                 } else {
+                    // Compatible worktrees share one host generation. A new
+                    // producer identity alone must not rotate it or disturb
+                    // the active inventory owner and reservations.
                     ledger.gc_unreachable_snapshot_cas()?;
                 }
                 return Ok(ledger);
@@ -3660,6 +3686,38 @@ impl HostResourceLedger {
         if self.active_inventory_owner_locked()?.is_some() {
             bail!(
                 "runtime service recovery requires the host inventory owner to be absent"
+            );
+        }
+        let snapshot = HostResourceLedgerSnapshot {
+            policy: document.policy,
+            reservations: document.reservations,
+            node_policy: document.node_policy,
+        };
+        operation(&snapshot)
+    }
+
+    /// Run a controlled recovery of a stopped runtime container while the
+    /// ledger is serialized and no admission reservation is live.
+    ///
+    /// Unlike [`with_runtime_recovery_quiescence`], this deliberately does
+    /// not require the host inventory producer to be absent. A healthy
+    /// producer may belong to another Compose worktree and remains outside
+    /// the stopped container's PID/device namespace. The callback is limited
+    /// to local runtime-store evidence; it must not publish inventory,
+    /// readiness, or reservations.
+    pub fn with_container_runtime_recovery_quiescence<T>(
+        &self,
+        operation: impl FnOnce(&HostResourceLedgerSnapshot) -> Result<T>,
+    ) -> Result<T> {
+        let _host_writer = self.writer.acquire()?;
+        let document = self.read_document_locked()?;
+        if document
+            .reservations
+            .iter()
+            .any(|reservation| reservation.state != HostResourceReservationState::Released)
+        {
+            bail!(
+                "container runtime recovery requires a host ledger with no nonreleased reservations"
             );
         }
         let snapshot = HostResourceLedgerSnapshot {
@@ -9374,6 +9432,27 @@ mod tests {
     }
 
     #[test]
+    fn container_runtime_recovery_allows_foreign_inventory_owner_but_fences_writer() {
+        let (policy, _request, _released, _receipt, _lease) = worker_release_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = HostResourceLedger::initialize(directory.path(), policy).unwrap();
+        let inventory_owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        let before = ledger.read().unwrap();
+        ledger
+            .with_container_runtime_recovery_quiescence(|snapshot| {
+                assert_eq!(snapshot, &before);
+                let writer = Arc::clone(&ledger.writer);
+                let blocked = std::thread::spawn(move || writer.acquire().is_err())
+                    .join()
+                    .unwrap();
+                assert!(blocked, "host writer must fence the callback");
+                Ok(())
+            })
+            .unwrap();
+        drop(inventory_owner);
+    }
+
+    #[test]
     fn released_reservation_requires_untampered_proof_before_capacity_is_freed() {
         let (policy, _request, mut released, receipt, lease) = worker_release_fixture();
         let directory = tempfile::tempdir().unwrap();
@@ -11039,6 +11118,52 @@ mod tests {
             ledger.read_runtime_generation_sha256().unwrap(),
             next_generation
         );
+    }
+
+    #[test]
+    fn compatible_worktree_joins_v4_without_rotating_active_owner_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = ledger_root(directory.path());
+        let mut policy = policy();
+        policy.schema_version = HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2.into();
+        let original = v4_readiness(&policy, &"1".repeat(64), &"2".repeat(64));
+        let ledger = HostResourceLedger::initialize_with_readiness(
+            &root, policy.clone(), original.clone(),
+        ).unwrap();
+        let generation = ledger.read_runtime_generation_sha256().unwrap();
+        let owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        let before = fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap();
+        let mut joining = original.clone();
+        joining.source_snapshot_sha256 = "4".repeat(64);
+        joining.runtime_identity_sha256 = "5".repeat(64);
+        let reopened = HostResourceLedger::initialize_or_upgrade_with_readiness(
+            &root, policy, joining,
+        ).unwrap();
+        assert_eq!(reopened.read_runtime_generation_sha256().unwrap(), generation);
+        assert_eq!(reopened.read_runtime_readiness().unwrap(), original);
+        assert_eq!(reopened.active_inventory_owner().unwrap().as_ref(), Some(owner.descriptor()));
+        assert_eq!(fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap(), before);
+    }
+
+    #[test]
+    fn worktree_join_rejects_changed_host_abi_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = ledger_root(directory.path());
+        let mut policy = policy();
+        policy.schema_version = HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2.into();
+        let original = v4_readiness(&policy, &"1".repeat(64), &"2".repeat(64));
+        let ledger = HostResourceLedger::initialize_with_readiness(
+            &root, policy.clone(), original.clone(),
+        ).unwrap();
+        let _owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        let before = fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap();
+        let mut joining = original;
+        joining.capabilities = vec!["fdm.cpu".into(), "fem.gpu".into()];
+        let error = HostResourceLedger::initialize_or_upgrade_with_readiness(
+            &root, policy, joining,
+        ).err().expect("changed host ABI must fail");
+        assert!(error.to_string().contains("persisted host ABI facts"));
+        assert_eq!(fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap(), before);
     }
 
     #[test]

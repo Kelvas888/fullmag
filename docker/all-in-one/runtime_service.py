@@ -47,7 +47,21 @@ HOST_LEDGER_PROFILE = "host-ledger-v1"
 HOST_RESOURCE_LEDGER_FILE = "HOST_RESOURCE_LEDGER.json"
 LEGACY_DOCKER_HOST_ID = "docker-all-host"
 MAX_HOST_LEDGER_BYTES = 8 * 1024 * 1024
-CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
+# The accepted store remains the Windows-backed user-data namespace.  Every
+# lifecycle receipt/configuration file is rooted in the separately mounted
+# runtime-control volume.  ``FULLMAG_RUNTIME_SERVICES_ROOT`` is a second view
+# of that same volume at the native SessionStore compatibility path; the Rust
+# service still receives the unchanged accepted-store root and therefore keeps
+# its session/result layout intact.
+RUNTIME_CONTROL_ROOT = Path("/opt/fullmag/runtime-control")
+BUILD_CONTROL_ROOT = Path("/opt/fullmag/control")
+RUNTIME_PROVENANCE_RELATIVE = Path("backend/runtime-provenance.json")
+RUNTIME_PROVENANCE_PATH = BUILD_CONTROL_ROOT / RUNTIME_PROVENANCE_RELATIVE
+RUNTIME_SERVICES_RELATIVE = Path("runtime-services")
+CONFIG_RELATIVE = Path("runtime-service/docker-all.json")
+PROCESS_RECEIPT_RELATIVE = Path("runtime-service/process-tree.json")
+FEM_MESH_CACHE_ROOT = Path("/build/cache/fem-mesh")
+CUDA_CACHE_ROOT = Path("/build/cache/cuda-compute")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
 # The native control probe is bounded at three seconds.  Keep the Python
@@ -86,6 +100,38 @@ MAX_RECOVERY_ARCHIVED_FILES = 32
 RECOVERY_MANDATORY_ARCHIVED_FILES = 12
 RECOVERY_ARCHIVED_CONFIGURATION_KEY = "configuration.json"
 RECOVERY_ABSENT_SOURCE_REASON = "scheduler_checkpoint_not_published"
+# Container namespace recovery is a separate protocol from the legacy
+# unknown-owner recovery above.  The authorization document is written to the
+# Docker named control volume and is exposed to PID 1 only through these two
+# allowlisted variables.  A host path is never accepted at this boundary.
+CONTAINER_RECOVERY_AUTHORIZATION_ENV = "FULLMAG_CONTAINER_RECOVERY_AUTHORIZATION"
+CONTAINER_RECOVERY_AUTHORIZATION_SHA256_ENV = (
+    "FULLMAG_CONTAINER_RECOVERY_AUTHORIZATION_SHA256"
+)
+CONTAINER_RECOVERY_AUTHORIZATION_SCHEMA = (
+    "fullmag.docker-container-recovery-authorization.v1"
+)
+CONTAINER_RECOVERY_AUTHORIZATION_SCHEMAS = frozenset({CONTAINER_RECOVERY_AUTHORIZATION_SCHEMA})
+CONTAINER_RECOVERY_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v1"
+CONTAINER_RECOVERY_ATTESTATION_SCHEMA = "docker_namespace_teardown_attestation.v1"
+CONTAINER_RECOVERY_RECEIPT_SCHEMA = "runtime_service_container_recovery.v1"
+CONTAINER_RECOVERY_ARCHIVE_SCHEMA = "runtime_service_container_recovery_archive.v1"
+CONTAINER_RECOVERY_RELATIVE = PurePosixPath("runtime-services/container-recovery")
+MAX_CONTAINER_RECOVERY_AUTHORIZATION_BYTES = 512 * 1024
+MAX_CONTAINER_RECOVERY_REQUEST_BYTES = 256 * 1024
+MAX_CONTAINER_RECOVERY_RECEIPT_BYTES = 512 * 1024
+MAX_CONTAINER_RECOVERY_LOG_BYTES = 4 * 1024 * 1024
+CONTAINER_RECOVERY_WRITER_BUSY_MESSAGE = (
+    "session store writer is busy root=/host-ledger/ledger "
+    "conflict=native descriptor"
+)
+CONTAINER_RECOVERY_WRITER_BUSY_NATIVE_MESSAGE = (
+    "session store writer is busy: root=`/host-ledger/ledger`, "
+    "conflict=native descriptor"
+)
+CONTAINER_RECOVERY_WRITER_BUSY_RETRY_SECONDS = 5.0
+CONTAINER_RECOVERY_WRITER_BUSY_SLEEP_SECONDS = 0.1
+CONTAINER_RECOVERY_CONTROL_ROOT = Path("/opt/fullmag/control")
 GIB = 1024**3
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -161,10 +207,15 @@ class RuntimePaths:
     storage: Path = STATE_ROOT
     runs: Path = STATE_ROOT / "runs" / WORKTREE_ID
     store: Path = STATE_ROOT / "runs" / WORKTREE_ID / "session-store"
+    # ``state_root`` is the technical runtime-control root for paths returned
+    # by ``canonical_paths``.  The legacy default remains for source-only
+    # callers that construct RuntimePaths() directly; Docker always supplies
+    # the explicit volume path through the environment below.
     state_root: Path = STATE_ROOT / ".fullmag"
+    runtime_services: Path | None = None
     source: Path = SOURCE_ROOT
     package: Path = PACKAGE_ROOT
-    config: Path = STATE_ROOT / CONFIG_RELATIVE
+    config: Path = STATE_ROOT / ".fullmag" / CONFIG_RELATIVE
     provenance: Path = IMAGE_ROOT / "provenance.json"
     host_certificate: Path = HOST_CERTIFICATE
 
@@ -291,7 +342,7 @@ def _read_recovery_authorization(paths: RuntimePaths, authorization_path: Path) 
     request_id = authorization.get("request_id")
     if (
         not isinstance(request_path_value, str)
-        or not request_path_value.startswith("/state/")
+        or not request_path_value.startswith("/")
         or "/../" in request_path_value
         or not isinstance(request_sha256, str)
         or HEX64.fullmatch(request_sha256) is None
@@ -300,12 +351,17 @@ def _read_recovery_authorization(paths: RuntimePaths, authorization_path: Path) 
     ):
         _fail("runtime recovery authorization has an invalid native request pin")
     request_path = _absolute(Path(request_path_value), "native recovery request")
-    try:
-        request_relative = request_path.relative_to(paths.state)
-    except ValueError:
-        _fail("native recovery request is outside the fixed /state root")
-    if request_path != paths.state / request_relative:
-        _fail("native recovery request is outside the fixed /state root")
+    request_root = None
+    for candidate in (paths.state_root, paths.state):
+        try:
+            request_relative = request_path.relative_to(candidate)
+        except ValueError:
+            continue
+        if request_path == candidate / request_relative:
+            request_root = candidate
+            break
+    if request_root is None:
+        _fail("native recovery request is outside the accepted or runtime-control root")
     request_raw = _bounded_regular(
         request_path, "native recovery request", MAX_RECOVERY_AUTHORIZATION_BYTES
     )
@@ -326,12 +382,12 @@ def _read_recovery_authorization(paths: RuntimePaths, authorization_path: Path) 
     if _sha256_bytes(config_raw) != config_sha256 or request.get("config_sha256") != config_sha256:
         _fail("runtime recovery configuration changed after host authorization")
     owner_raw = _bounded_regular(
-        paths.store / "runtime-services" / "OWNER.json",
+        runtime_services_root(paths) / "OWNER.json",
         "runtime service owner",
         MAX_RECOVERY_AUTHORIZATION_BYTES,
     )
     launch_raw = _bounded_regular(
-        paths.store / "runtime-services" / "LAUNCH.json",
+        runtime_services_root(paths) / "LAUNCH.json",
         "runtime service launch record",
         MAX_RECOVERY_AUTHORIZATION_BYTES,
     )
@@ -467,21 +523,65 @@ def _env_path(environment: Mapping[str, str], name: str, default: Path) -> Path:
     return _absolute(environment.get(name, str(default)), name)
 
 
+def runtime_services_root(paths: RuntimePaths) -> Path:
+    """Return the technical runtime-services view backed by named storage.
+
+    Native Fullmag keeps the relative ``runtime-services`` layout below the
+    accepted SessionStore.  Docker mounts the runtime-control named volume at
+    that compatibility path as well as at ``runtime_services``.  Keeping this
+    lookup in one helper prevents Python lifecycle checks from accidentally
+    returning to the Windows session bind.
+    """
+
+    return paths.runtime_services or (paths.store / RUNTIME_SERVICES_RELATIVE)
+
+
+def process_receipt_path(paths: RuntimePaths) -> Path:
+    """Return the authenticated PID-1 receipt in technical runtime storage."""
+
+    return paths.state_root / PROCESS_RECEIPT_RELATIVE
+
+
+def _store_relative_path(paths: RuntimePaths, relative: PurePosixPath) -> Path:
+    """Map native store-relative evidence to its volume-backed runtime view."""
+
+    parts = relative.parts
+    if parts and parts[0] == RUNTIME_SERVICES_RELATIVE.name:
+        return runtime_services_root(paths).joinpath(*parts[1:])
+    return paths.store.joinpath(*parts)
+
+
 def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePaths:
     environment = os.environ if environment is None else environment
     state = _env_path(environment, "FULLMAG_CONTAINER_STATE_ROOT", STATE_ROOT)
     storage = _env_path(environment, "FULLMAG_PROJECT_STORAGE_ROOT", state)
     runs = _env_path(environment, "FULLMAG_RUNS_ROOT", storage / "runs" / WORKTREE_ID)
-    state_root = _env_path(environment, "FULLMAG_STATE_ROOT", state / ".fullmag")
+    runtime_control = _env_path(
+        environment, "FULLMAG_RUNTIME_CONTROL_ROOT", RUNTIME_CONTROL_ROOT
+    )
+    state_root = _env_path(environment, "FULLMAG_STATE_ROOT", runtime_control)
+    runtime_services = _env_path(
+        environment,
+        "FULLMAG_RUNTIME_SERVICES_ROOT",
+        runtime_control / RUNTIME_SERVICES_RELATIVE,
+    )
     source = _env_path(environment, "FULLMAG_REPO_ROOT", SOURCE_ROOT)
     package = _env_path(environment, "FULLMAG_RUNTIME_ROOT", PACKAGE_ROOT)
-    config = state / CONFIG_RELATIVE
+    config = runtime_control / CONFIG_RELATIVE
+    provenance = _env_path(
+        environment, "FULLMAG_RUNTIME_PROVENANCE", IMAGE_ROOT / "provenance.json"
+    )
+    if (
+        "FULLMAG_RUNTIME_PROVENANCE" in environment
+        and provenance != RUNTIME_PROVENANCE_PATH
+    ):
+        _fail("FULLMAG_RUNTIME_PROVENANCE must use the fixed build-control provenance path")
     if state != STATE_ROOT or storage != STATE_ROOT:
         _fail("all-in-Docker accepted storage is fixed to /state")
     if runs != STATE_ROOT / "runs" / WORKTREE_ID:
         _fail("FULLMAG_RUNS_ROOT must be /state/runs/docker-all")
-    if state_root != STATE_ROOT / ".fullmag":
-        _fail("FULLMAG_STATE_ROOT must be /state/.fullmag")
+    if state_root != runtime_control:
+        _fail("FULLMAG_STATE_ROOT must equal FULLMAG_RUNTIME_CONTROL_ROOT")
     if source != SOURCE_ROOT or package != PACKAGE_ROOT:
         _fail("all-in-Docker source and package roots are immutable")
     if environment.get("FULLMAG_WORKTREE_ID", WORKTREE_ID) != WORKTREE_ID:
@@ -489,7 +589,7 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
     if "FULLMAG_STATE_DIR" in environment and _absolute(
         environment["FULLMAG_STATE_DIR"], "FULLMAG_STATE_DIR"
     ) != state_root:
-        _fail("FULLMAG_STATE_DIR must be /state/.fullmag")
+        _fail("FULLMAG_STATE_DIR must equal FULLMAG_RUNTIME_CONTROL_ROOT")
     if "FULLMAG_RUNTIME_SERVICE_CONFIG" in environment and _absolute(
         environment["FULLMAG_RUNTIME_SERVICE_CONFIG"], "FULLMAG_RUNTIME_SERVICE_CONFIG"
     ) != config:
@@ -503,6 +603,7 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
         runs=runs,
         store=runs / "session-store",
         state_root=state_root,
+        runtime_services=runtime_services,
         source=source,
         package=package,
         config=config,
@@ -518,7 +619,8 @@ def prepare_storage(paths: RuntimePaths | None = None) -> RuntimePaths:
     if os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") != WINDOWS_STORAGE_PROFILE:
         _fail("all-in-Docker storage requires explicit windows-folder-v1 admission")
     _ensure_directory(paths.state, "container state")
-    _ensure_directory(paths.state_root, "Fullmag state")
+    _ensure_directory(paths.state_root, "runtime control volume")
+    _ensure_directory(runtime_services_root(paths), "runtime services volume view")
     _ensure_directory(
         paths.state_root / "local-live" / "current",
         "current live workspace",
@@ -542,14 +644,23 @@ def api_environment(paths: RuntimePaths, config_path: Path | None = None) -> dic
     if config_path != paths.config:
         _fail("runtime service config path is not canonical")
     values = {
-        "HOME": str(paths.state),
+        # HOME is technical process state in the container.  User projects,
+        # sessions and results remain addressed through the explicit /state
+        # project and runs roots below.
+        "HOME": str(paths.state_root),
         "FULLMAG_PROJECT_STORAGE_ROOT": str(paths.storage),
         "FULLMAG_RUNS_ROOT": str(paths.runs),
         "FULLMAG_WORKTREE_ID": WORKTREE_ID,
         "FULLMAG_STATE_ROOT": str(paths.state_root),
         "FULLMAG_STATE_DIR": str(paths.state_root),
+        "FULLMAG_RUNTIME_CONTROL_ROOT": str(paths.state_root),
+        "FULLMAG_RUNTIME_SERVICES_ROOT": str(runtime_services_root(paths)),
         "FULLMAG_REPO_ROOT": str(paths.source),
         "FULLMAG_RUNTIME_ROOT": str(paths.package),
+        "FULLMAG_FEM_MESH_CACHE_DIR": os.environ.get(
+            "FULLMAG_FEM_MESH_CACHE_DIR", str(FEM_MESH_CACHE_ROOT)
+        ),
+        "CUDA_CACHE_PATH": os.environ.get("CUDA_CACHE_PATH", str(CUDA_CACHE_ROOT)),
         "FULLMAG_SESSION_STORAGE_PROFILE": WINDOWS_STORAGE_PROFILE,
         "FULLMAG_RUNTIME_SERVICE_CONFIG": str(config_path),
     }
@@ -1092,7 +1203,7 @@ def _recovery_log_sources(owner: Mapping[str, Any]) -> set[str]:
 
 def _observe_recovery_log_sources(paths: RuntimePaths, owner: Mapping[str, Any]) -> set[str]:
     owner_token = _recovery_store_id(owner.get("owner_token"), "runtime recovery owner token")
-    log_dir = paths.store / "runtime-services" / owner_token
+    log_dir = runtime_services_root(paths) / owner_token
     _assert_no_links(log_dir, "native recovery scheduler evidence")
     if not log_dir.is_dir() or log_dir.is_symlink():
         _fail("native recovery scheduler evidence directory is missing")
@@ -1185,7 +1296,7 @@ def _validate_native_recovery_result(
         _fail("native runtime recovery archive manifest inventory differs from the receipt")
     if manifest.get("absent_sources", {}) != absent:
         _fail("native runtime recovery absent-source inventory differs from the receipt")
-    current_owner_path = paths.store / "runtime-services" / "OWNER.json"
+    current_owner_path = runtime_services_root(paths) / "OWNER.json"
     current_owner_raw = _bounded_regular(
         current_owner_path, "native recovery current owner", MAX_JSON_BYTES
     )
@@ -1240,7 +1351,7 @@ def _validate_native_recovery_result(
             if expected_digest != authorization.get("config_sha256"):
                 _fail("native recovery raw configuration archive digest is not pinned")
             continue
-        source_path = paths.store.joinpath(*source_relative.parts)
+        source_path = _store_relative_path(paths, source_relative)
         source_bytes = _bounded_regular(source_path, "native recovery source evidence", maximum)
         if source_value == "runtime-services/OWNER.json":
             if _sha256_bytes(source_bytes) != after:
@@ -1252,11 +1363,818 @@ def _validate_native_recovery_result(
                 _fail(f"native recovery archive evidence differs: {source_relative}")
     for source_value in absent_sources:
         source_relative = _recovery_relative_path(source_value, "native absent source path")
-        source_path = paths.store.joinpath(*source_relative.parts)
+        source_path = _store_relative_path(paths, source_relative)
         _assert_no_links(source_path.parent, "native absent source parent")
         if os.path.lexists(source_path):
             _fail(f"native recovery absent source exists: {source_relative}")
     return dict(result)
+
+
+def _canonical_container_recovery_json(value: Any) -> bytes:
+    """Mirror Rust's sorted, compact canonical JSON used for attestations."""
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        _fail(f"container recovery document is not canonical JSON: {error}")
+
+
+def _read_stable_container_recovery_file(
+    path: Path, name: str, maximum: int
+) -> bytes:
+    """Read a named-volume document twice before using its digest."""
+
+    first = _bounded_regular(path, name, maximum)
+    second = _bounded_regular(path, name, maximum)
+    if first != second:
+        _fail(f"{name} changed during bounded admission")
+    return first
+
+
+def _read_stable_container_recovery_json(
+    path: Path, name: str, maximum: int
+) -> tuple[dict[str, Any], bytes]:
+    raw = _read_stable_container_recovery_file(path, name, maximum)
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"{name} is not valid JSON: {error}")
+    if not isinstance(value, dict):
+        _fail(f"{name} must contain a JSON object")
+    return value, raw
+
+
+def _container_recovery_hex(value: Any, name: str) -> str:
+    if not isinstance(value, str) or HEX64.fullmatch(value) is None:
+        _fail(f"{name} must be a lowercase SHA-256")
+    return value
+
+
+def _container_recovery_text(value: Any, name: str, maximum: int = 4096) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        _fail(f"{name} must be non-empty text")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        _fail(f"{name} contains a control character")
+    if len(value.encode("utf-8")) > maximum:
+        _fail(f"{name} exceeds its bounded text size")
+    return value
+
+
+def _container_recovery_control_path(value: Any, name: str) -> Path:
+    """Accept only an opaque guest path below the read-only control volume."""
+
+    if not isinstance(value, str) or not value.startswith("/") or "\\" in value:
+        _fail(f"{name} must be an absolute POSIX control-volume path")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        _fail(f"{name} contains a control character")
+    path = _absolute(Path(value), name)
+    try:
+        relative = path.relative_to(CONTAINER_RECOVERY_CONTROL_ROOT)
+    except ValueError:
+        _fail(f"{name} is outside the Docker named control volume")
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        _fail(f"{name} contains an unsafe control-volume component")
+    _assert_no_links(path.parent, f"{name} parent")
+    return path
+
+
+def _container_recovery_owner_digest(paths: RuntimePaths) -> tuple[dict[str, Any], bytes, str]:
+    owner_path = runtime_services_root(paths) / "OWNER.json"
+    owner, raw = _read_stable_container_recovery_json(
+        owner_path, "container recovery runtime owner", MAX_CONTAINER_RECOVERY_REQUEST_BYTES
+    )
+    return owner, raw, _sha256_bytes(raw)
+
+
+def _container_recovery_request_sources(
+    request: Mapping[str, Any], name: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    expected_owner = request.get("expected_owner")
+    if not isinstance(expected_owner, dict):
+        _fail(f"{name} has no typed expected owner")
+    if request.get("schema_version") != CONTAINER_RECOVERY_REQUEST_SCHEMA:
+        _fail(f"{name} schema is unsupported")
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or UUID_RE.fullmatch(request_id) is None:
+        _fail(f"{name} has an invalid request id")
+    state = expected_owner.get("state")
+    if state not in {"ready", "unknown"}:
+        _fail(f"{name} expected owner must be Ready or Unknown")
+    if expected_owner.get("target_id") != TARGET_ID:
+        _fail(f"{name} expected owner targets another runtime service")
+    for field in (
+        "config_sha256",
+        "owner_sha256",
+        "launch_sha256",
+        "store_root_sha256",
+        "ledger_root_sha256",
+        "ledger_snapshot_sha256",
+        "docker_engine_id_sha256",
+        "docker_manifest_sha256",
+        "prior_ready_owner_proof_sha256",
+        "device_release_mapping_sha256",
+    ):
+        _container_recovery_hex(request.get(field), f"{name} {field}")
+    application = request.get("application")
+    if not isinstance(application, dict):
+        _fail(f"{name} has no application pin")
+    if application.get("mode") not in {"external_only", "persisted"}:
+        _fail(f"{name} has an invalid application pin")
+    _container_recovery_hex(application.get("raw_sha256"), f"{name} application raw SHA-256")
+    _container_recovery_text(
+        request.get("device_release_resource_id"),
+        f"{name} device resource id",
+        255,
+    )
+    containers = request.get("containers")
+    if not isinstance(containers, list) or len(containers) != 2:
+        _fail(f"{name} must pin exactly two containers")
+    by_service: dict[str, dict[str, Any]] = {}
+    for container in containers:
+        if not isinstance(container, dict):
+            _fail(f"{name} has an invalid container pin")
+        service = container.get("service")
+        if service in by_service or service not in {"backend", "frontend"}:
+            _fail(f"{name} must pin one backend and one frontend")
+        for field in ("container_id", "config_sha256", "device_requests_sha256"):
+            _container_recovery_hex(container.get(field), f"{name} container {field}")
+        image = container.get("image_id")
+        if (
+            not isinstance(image, str)
+            or not image.startswith("sha256:")
+            or HEX64.fullmatch(image[7:]) is None
+        ):
+            _fail(f"{name} container image identity is invalid")
+        _container_recovery_text(container.get("compose_project"), f"{name} Compose project", 255)
+        if container.get("private_pid_namespace") is not True or container.get("host_pid") is not False:
+            _fail(f"{name} container PID namespace is unsafe")
+        by_service[service] = container
+    return by_service, expected_owner
+
+
+def _validate_container_recovery_attestation_document(
+    request: Mapping[str, Any],
+    request_sha256: str,
+    attestation: Mapping[str, Any],
+    attestation_sha256: str,
+) -> None:
+    if attestation.get("schema_version") != CONTAINER_RECOVERY_ATTESTATION_SCHEMA:
+        _fail("container recovery teardown attestation schema is unsupported")
+    if attestation.get("request_sha256") != request_sha256:
+        _fail("container recovery teardown attestation targets another request")
+    if attestation.get("docker_engine_id_sha256") != request.get("docker_engine_id_sha256"):
+        _fail("container recovery teardown attestation engine differs from request")
+    if attestation.get("manifest_sha256") != request.get("docker_manifest_sha256"):
+        _fail("container recovery teardown attestation manifest differs from request")
+    if attestation.get("result") != "authoritative_teardown":
+        _fail("container recovery teardown is not authoritative")
+    containers = attestation.get("containers")
+    requested, _ = _container_recovery_request_sources(request, "container recovery request")
+    if not isinstance(containers, list) or len(containers) != len(requested):
+        _fail("container recovery teardown container count differs from request")
+    seen: set[str] = set()
+    for observed in containers:
+        if not isinstance(observed, dict):
+            _fail("container recovery teardown has an invalid observation")
+        container_id = observed.get("container_id")
+        if not isinstance(container_id, str) or container_id in seen:
+            _fail("container recovery teardown repeats a container")
+        seen.add(container_id)
+        requested_container = next(
+            (item for item in requested.values() if item.get("container_id") == container_id), None
+        )
+        if requested_container is None:
+            _fail("container recovery teardown contains an unknown container")
+        if any(
+            observed.get(field) != requested_container.get(field)
+            for field in ("image_id", "config_sha256")
+        ):
+            _fail("container recovery teardown container identity differs from request")
+        before = observed.get("before")
+        after = observed.get("after")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            _fail("container recovery teardown lacks before/after observations")
+        if (
+            before.get("private_pid_namespace") is not True
+            or before.get("host_pid") is not False
+            or after.get("state") != "exited"
+            or after.get("pid") != 0
+            or not isinstance(after.get("finished_at"), str)
+            or not after["finished_at"].strip()
+            or after.get("descendant_count") != 0
+            or after.get("private_pid_namespace") is not True
+            or after.get("host_pid") is not False
+            or before.get("device_requests_sha256") != requested_container.get("device_requests_sha256")
+            or after.get("device_requests_sha256") != requested_container.get("device_requests_sha256")
+        ):
+            _fail("container recovery teardown has unsafe after-state evidence")
+    if len(seen) != len(requested):
+        _fail("container recovery teardown omitted a requested container")
+    release = attestation.get("device_release")
+    if not isinstance(release, dict):
+        _fail("container recovery teardown has no device release proof")
+    if (
+        release.get("resource_id") != request.get("device_release_resource_id")
+        or release.get("gpu_uuid") != request.get("device_release_gpu_uuid")
+        or release.get("mapping_sha256") != request.get("device_release_mapping_sha256")
+        or release.get("mapping_detached") is not True
+    ):
+        _fail("container recovery teardown device release differs from request")
+    _container_recovery_hex(attestation_sha256, "container recovery attestation SHA-256")
+
+
+def _read_container_recovery_authorization(
+    paths: RuntimePaths, authorization_path: Path | None = None
+) -> dict[str, Any]:
+    configured = os.environ.get(CONTAINER_RECOVERY_AUTHORIZATION_ENV) or None
+    if authorization_path is None:
+        if not configured:
+            _fail("container recovery authorization is not present")
+        authorization_path = Path(configured)
+    elif configured is not None and Path(configured) != Path(authorization_path):
+        _fail("container recovery authorization path differs from the process environment")
+    authorization_path = _container_recovery_control_path(
+        str(authorization_path), "container recovery authorization"
+    )
+    expected_auth_sha = os.environ.get(CONTAINER_RECOVERY_AUTHORIZATION_SHA256_ENV) or None
+    if expected_auth_sha is None:
+        _fail("container recovery authorization SHA-256 is not present")
+    expected_auth_sha = _container_recovery_hex(
+        expected_auth_sha, "container recovery authorization SHA-256"
+    )
+    auth_raw = _read_stable_container_recovery_file(
+        authorization_path,
+        "container recovery authorization",
+        MAX_CONTAINER_RECOVERY_AUTHORIZATION_BYTES,
+    )
+    auth_sha = _sha256_bytes(auth_raw)
+    if auth_sha != expected_auth_sha:
+        _fail("container recovery authorization changed after host admission")
+    try:
+        authorization = json.loads(
+            auth_raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"container recovery authorization is not valid JSON: {error}")
+    if not isinstance(authorization, dict):
+        _fail("container recovery authorization must contain an object")
+    if authorization.get("schema_version") not in CONTAINER_RECOVERY_AUTHORIZATION_SCHEMAS:
+        _fail("container recovery authorization schema is unsupported")
+    request_id = authorization.get("request_id")
+    if not isinstance(request_id, str) or UUID_RE.fullmatch(request_id) is None:
+        _fail("container recovery authorization has an invalid request id")
+    for field in (
+        "config_sha256",
+        "owner_sha256",
+        "launch_sha256",
+        "operator_authorization_sha256",
+        "attestation_sha256",
+        "manifest_sha256",
+        "prior_stop_journal_sha256",
+        "native_request_sha256",
+    ):
+        _container_recovery_hex(authorization.get(field), f"container recovery authorization {field}")
+    for field in ("source_root", "compose_project", "backend_container_id", "frontend_container_id", "old_image_id"):
+        _container_recovery_text(authorization.get(field), f"container recovery authorization {field}")
+    request_path = _container_recovery_control_path(
+        authorization.get("native_request_path"), "container recovery native request"
+    )
+    attestation_path = _container_recovery_control_path(
+        authorization.get("attestation_path"), "container recovery attestation"
+    )
+    manifest_path = _container_recovery_control_path(
+        authorization.get("manifest_path"), "container recovery Docker manifest"
+    )
+    request, request_raw = _read_stable_container_recovery_json(
+        request_path,
+        "container recovery native request",
+        MAX_CONTAINER_RECOVERY_REQUEST_BYTES,
+    )
+    request_sha256 = _sha256_bytes(request_raw)
+    if request_sha256 != authorization.get("native_request_sha256"):
+        _fail("container recovery native request changed after authorization")
+    if request.get("request_id") != request_id:
+        _fail("container recovery native request identity differs from authorization")
+    containers, expected_owner = _container_recovery_request_sources(
+        request, "container recovery native request"
+    )
+    for field in ("config_sha256", "owner_sha256", "launch_sha256"):
+        if request.get(field) != authorization.get(field):
+            _fail(f"container recovery request {field} differs from authorization")
+    if request.get("prior_ready_owner_proof_sha256") != authorization.get("prior_stop_journal_sha256"):
+        _fail("container recovery prior-stop proof differs from native request")
+    attestation, attestation_raw = _read_stable_container_recovery_json(
+        attestation_path,
+        "container recovery teardown attestation",
+        MAX_CONTAINER_RECOVERY_REQUEST_BYTES,
+    )
+    # The attestation SHA is canonical JSON, whereas its file is intentionally
+    # allowed to use a different stable formatting.
+    attestation_sha256 = _sha256_bytes(_canonical_container_recovery_json(attestation))
+    if attestation_sha256 != authorization.get("attestation_sha256"):
+        _fail("container recovery teardown attestation changed after authorization")
+    _validate_container_recovery_attestation_document(
+        request, request_sha256, attestation, attestation_sha256
+    )
+    manifest_raw = _read_stable_container_recovery_file(
+        manifest_path,
+        "container recovery Docker inspection manifest",
+        MAX_CONTAINER_RECOVERY_REQUEST_BYTES,
+    )
+    if _sha256_bytes(manifest_raw) != authorization.get("manifest_sha256"):
+        _fail("container recovery Docker inspection manifest changed after authorization")
+    if request.get("docker_manifest_sha256") != authorization.get("manifest_sha256"):
+        _fail("container recovery Docker manifest differs from native request")
+    if attestation.get("manifest_sha256") != authorization.get("manifest_sha256"):
+        _fail("container recovery Docker manifest differs from teardown attestation")
+    for service, auth_field in (
+        ("backend", "backend_container_id"),
+        ("frontend", "frontend_container_id"),
+    ):
+        if containers[service].get("container_id") != authorization.get(auth_field):
+            _fail(f"container recovery {service} container differs from authorization")
+    return {
+        "authorization": authorization,
+        "authorization_raw": auth_raw,
+        "authorization_sha256": auth_sha,
+        "authorization_path": authorization_path,
+        "request": request,
+        "request_raw": request_raw,
+        "request_sha256": request_sha256,
+        "request_path": request_path,
+        "attestation": attestation,
+        "attestation_raw": attestation_raw,
+        "attestation_sha256": attestation_sha256,
+        "attestation_path": attestation_path,
+        "manifest_path": manifest_path,
+        "manifest_raw": manifest_raw,
+        "expected_owner": expected_owner,
+        "config_sha256": authorization["config_sha256"],
+    }
+
+
+def _container_recovery_expected_sources(owner: Mapping[str, Any]) -> set[str]:
+    """Return the native archive's fixed inventory for one old owner."""
+
+    owner_token = _recovery_store_id(owner.get("owner_token"), "container recovery owner token")
+    compute_pool = _recovery_store_id(owner.get("compute_pool_id"), "container recovery compute pool id")
+    preparation_pool = _recovery_store_id(
+        owner.get("preparation_pool_id"), "container recovery preparation pool id"
+    )
+    return {
+        "runtime-services/OWNER.json",
+        "runtime-services/OWNER.lock",
+        "runtime-services/LAUNCH.json",
+        "runtime-services/LAUNCH.lock",
+        "runtime-services/STARTUP-GATE.lock",
+        f"runtime-services/{owner_token}/compute.stdout.jsonl",
+        f"runtime-services/{owner_token}/preparation.stdout.jsonl",
+        f"scheduler_pools/{compute_pool}.resources.json",
+        f"scheduler_pools/{preparation_pool}.preparation-resources.json",
+        f"scheduler_pools/{compute_pool}.json",
+        f"scheduler_pools/{preparation_pool}.preparation.json",
+        "configuration.json",
+    }
+
+
+def _validate_container_recovery_archive(
+    paths: RuntimePaths,
+    context: Mapping[str, Any],
+    result: Mapping[str, Any],
+    *,
+    authenticated_drained_owner_sha256: str | None = None,
+) -> None:
+    request = context["request"]
+    authorization = context["authorization"]
+    request_sha256 = context["request_sha256"]
+    archive_value = result.get("archived_evidence_path")
+    expected_archive = (
+        paths.store
+        / "runtime-services"
+        / "container-recovery"
+        / request_sha256
+        / "archive"
+        / "manifest.json"
+    )
+    if not isinstance(archive_value, str) or _absolute(Path(archive_value), "container recovery archive") != expected_archive:
+        _fail("container recovery archive is not request-scoped")
+    manifest_path = expected_archive
+    manifest_raw = _read_stable_container_recovery_file(
+        manifest_path,
+        "container recovery archive manifest",
+        MAX_CONTAINER_RECOVERY_RECEIPT_BYTES,
+    )
+    if _sha256_bytes(manifest_raw) != result.get("archived_evidence_sha256"):
+        _fail("container recovery archive manifest digest changed")
+    try:
+        manifest = json.loads(manifest_raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"container recovery archive manifest is not valid JSON: {error}")
+    if not isinstance(manifest, dict):
+        _fail("container recovery archive manifest must contain an object")
+    for field, expected in (
+        ("schema_version", CONTAINER_RECOVERY_ARCHIVE_SCHEMA),
+        ("request_sha256", request_sha256),
+        ("config_sha256", request["config_sha256"]),
+        ("attestation_sha256", context["attestation_sha256"]),
+        ("ledger_snapshot_sha256", request["ledger_snapshot_sha256"]),
+        ("prior_ready_owner_proof_sha256", request["prior_ready_owner_proof_sha256"]),
+        ("application", request["application"]),
+    ):
+        if manifest.get(field) != expected:
+            _fail(f"container recovery archive manifest {field} differs from request")
+    archived = result.get("archived_files")
+    absent = result.get("archived_absent_sources", {})
+    if not isinstance(archived, dict) or not isinstance(absent, dict):
+        _fail("container recovery archive inventory is not an object")
+    if manifest.get("files") != archived or manifest.get("absent_sources", {}) != absent:
+        _fail("container recovery archive inventory differs from its manifest")
+    if len(archived) + len(absent) < 12 or len(archived) + len(absent) > 32:
+        _fail("container recovery archive inventory is outside its bounded size")
+    mandatory = _container_recovery_expected_sources(context["expected_owner"])
+    absent_names = set(absent)
+    if any(value != "scheduler_checkpoint_not_published" for value in absent.values()):
+        _fail("container recovery absent-source reason is invalid")
+    checkpoint = {
+        source
+        for source in mandatory
+        if source.startswith("scheduler_pools/")
+        and not source.endswith((".resources.json", ".preparation-resources.json"))
+    }
+    if not absent_names.issubset(checkpoint) or set(archived).intersection(absent_names):
+        _fail("container recovery archive has an invalid absent-source inventory")
+    coverage = set(archived) | absent_names
+    if not mandatory.issubset(coverage):
+        _fail("container recovery archive is missing mandatory evidence")
+    allowed = mandatory | _recovery_log_sources(context["expected_owner"])
+    if not coverage.issubset(allowed):
+        _fail("container recovery archive contains unexpected evidence")
+    observed_logs = _observe_recovery_log_sources(paths, context["expected_owner"])
+    if observed_logs - set(archived):
+        _fail("container recovery archive omitted a live scheduler journal")
+    if set(archived) - mandatory != observed_logs - mandatory:
+        _fail("container recovery archive journal inventory changed")
+    owner_source = archived.get("runtime-services/OWNER.json")
+    if owner_source != authorization.get("owner_sha256"):
+        _fail("container recovery archive does not pin the original owner")
+    archive_root = manifest_path.parent
+    _assert_no_links(archive_root, "container recovery archive")
+    if not archive_root.is_dir() or archive_root.is_symlink():
+        _fail("container recovery archive is not a directory")
+    for source, expected_digest in archived.items():
+        relative = _recovery_relative_path(source, "container recovery archived source")
+        expected_digest = _container_recovery_hex(
+            expected_digest, "container recovery archived source digest"
+        )
+        archive_file = archive_root / relative.name
+        maximum = (
+            MAX_CONTAINER_RECOVERY_LOG_BYTES
+            if str(relative).endswith((".jsonl", ".log"))
+            else MAX_CONTAINER_RECOVERY_REQUEST_BYTES
+        )
+        archive_bytes = _read_stable_container_recovery_file(
+            archive_file, "container recovery archived evidence", maximum
+        )
+        if _sha256_bytes(archive_bytes) != expected_digest:
+            _fail(f"container recovery archived evidence changed: {source}")
+        if source == "configuration.json":
+            if expected_digest != authorization.get("config_sha256"):
+                _fail("container recovery configuration archive is not pinned")
+            continue
+        live_path = _store_relative_path(paths, relative)
+        live_bytes = _read_stable_container_recovery_file(
+            live_path, "container recovery live evidence", maximum
+        )
+        if source == "runtime-services/OWNER.json":
+            # Native recovery archives the pre-recovery owner, then publishes
+            # its canonical Failed owner.  A later authenticated terminal
+            # drain may publish a Drained owner before the same one-shot
+            # Compose authorization is consumed on restart.  Accept that
+            # third endpoint only when the caller supplied the digest from
+            # the authenticated terminal-drain proof; every other live owner
+            # digest means the receipt no longer describes this store.
+            allowed_owner_sha256 = {
+                request["owner_sha256"],
+                result["owner_sha256_after"],
+            }
+            if authenticated_drained_owner_sha256 is not None:
+                allowed_owner_sha256.add(authenticated_drained_owner_sha256)
+            live_owner_sha256 = _sha256_bytes(live_bytes)
+            if live_owner_sha256 not in allowed_owner_sha256:
+                _fail("container recovery live owner changed outside its pinned transition")
+            continue
+        if live_bytes != archive_bytes:
+            _fail(f"container recovery archived evidence differs from live store: {source}")
+    for source in absent_names:
+        relative = _recovery_relative_path(source, "container recovery absent source")
+        live_path = _store_relative_path(paths, relative)
+        _assert_no_links(live_path.parent, "container recovery absent-source parent")
+        if os.path.lexists(live_path):
+            _fail(f"container recovery absent source was published: {source}")
+
+
+def _validate_container_recovery_receipt(
+    paths: RuntimePaths,
+    context: Mapping[str, Any],
+    result: Mapping[str, Any],
+    *,
+    authenticated_drained_owner_sha256: str | None = None,
+) -> dict[str, Any]:
+    request = context["request"]
+    authorization = context["authorization"]
+    if not isinstance(result, dict):
+        _fail("native container recovery returned a non-object")
+    if result.get("schema_version") != CONTAINER_RECOVERY_RECEIPT_SCHEMA:
+        _fail("native container recovery receipt schema is unsupported")
+    if result.get("status") != "recovered" or result.get("outcome") != "empty_namespace_recovered":
+        _fail("native container recovery did not return a completed recovery")
+    for field, expected in (
+        ("request_id", request["request_id"]),
+        ("request_sha256", context["request_sha256"]),
+        ("config_sha256", request["config_sha256"]),
+        ("target_id", TARGET_ID),
+        ("owner_sha256_before", request["owner_sha256"]),
+        ("owner_state_before", request["expected_owner"]["state"]),
+        ("owner_state_after", "failed"),
+        ("store_root_sha256", request["store_root_sha256"]),
+        ("application", request["application"]),
+        ("ledger_root_sha256", request["ledger_root_sha256"]),
+        ("ledger_snapshot_sha256", request["ledger_snapshot_sha256"]),
+        ("attestation_sha256", context["attestation_sha256"]),
+        ("docker_manifest_sha256", request["docker_manifest_sha256"]),
+        ("prior_ready_owner_proof_sha256", request["prior_ready_owner_proof_sha256"]),
+        ("device_release_mapping_sha256", request["device_release_mapping_sha256"]),
+    ):
+        if result.get(field) != expected:
+            _fail(f"native container recovery receipt {field} differs from request")
+    owner_after = result.get("owner_sha256_after")
+    if HEX64.fullmatch(owner_after or "") is None or owner_after == request["owner_sha256"]:
+        _fail("native container recovery did not publish a new failed owner")
+    for field, pattern in (("historical_build_commit", HEX40), ("executor_build_commit", HEX40),
+                           ("historical_build_snapshot", HEX64), ("executor_build_snapshot", HEX64)):
+        if not isinstance(result.get(field), str) or pattern.fullmatch(result[field]) is None:
+            _fail(f"native container recovery receipt has invalid {field}")
+    if not isinstance(result.get("archived_evidence_sha256"), str):
+        _fail("native container recovery receipt has no archive digest")
+    _validate_container_recovery_archive(
+        paths,
+        context,
+        result,
+        authenticated_drained_owner_sha256=authenticated_drained_owner_sha256,
+    )
+    return dict(result)
+
+
+def _container_recovery_pending_markers(paths: RuntimePaths) -> list[Path]:
+    root = paths.store / "runtime-services" / "container-recovery"
+    _assert_no_links(root, "container recovery marker root")
+    try:
+        entries = list(root.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        _fail(f"cannot inspect container recovery markers: {error}")
+    pending: list[Path] = []
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir() or HEX64.fullmatch(entry.name) is None:
+            _fail("container recovery marker directory is invalid")
+        receipt_path = entry / "receipt.json"
+        try:
+            receipt, _ = _read_stable_container_recovery_json(
+                receipt_path,
+                "container recovery marker",
+                MAX_CONTAINER_RECOVERY_RECEIPT_BYTES,
+            )
+        except FileNotFoundError:
+            continue
+        if receipt.get("status") != "recovered":
+            pending.append(receipt_path)
+    return pending
+
+
+def _container_recovery_process_metadata(
+    context: Mapping[str, Any], result: Mapping[str, Any]
+) -> dict[str, Any]:
+    authorization = context["authorization"]
+    request = context["request"]
+    return {
+        "schema_version": CONTAINER_RECOVERY_AUTHORIZATION_SCHEMA,
+        "authorization_sha256": context["authorization_sha256"],
+        "operator_authorization_sha256": authorization["operator_authorization_sha256"],
+        "request_id": request["request_id"],
+        "request_sha256": context["request_sha256"],
+        "attestation_sha256": context["attestation_sha256"],
+        "config_sha256": request["config_sha256"],
+        "owner_sha256": request["owner_sha256"],
+        "launch_sha256": request["launch_sha256"],
+        "prior_stop_journal_sha256": request["prior_ready_owner_proof_sha256"],
+        "owner_sha256_after": result.get("owner_sha256_after"),
+    }
+
+
+def container_recovery_authorization_metadata(
+    paths: RuntimePaths, recovery: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Return the bounded proof copied into the PID-1 process receipt."""
+
+    context = _read_container_recovery_authorization(paths)
+    if (
+        recovery.get("schema_version") != CONTAINER_RECOVERY_RECEIPT_SCHEMA
+        or recovery.get("request_sha256") != context["request_sha256"]
+        or recovery.get("attestation_sha256") != context["attestation_sha256"]
+    ):
+        _fail("container recovery receipt differs from the current authorization")
+    return _container_recovery_process_metadata(context, recovery)
+
+
+def _validate_container_recovery_drained_proof(
+    paths: RuntimePaths, context: Mapping[str, Any]
+) -> dict[str, Any]:
+    drain = _read_authenticated_terminal_drain(paths)
+    receipt = drain["receipt"]
+    metadata = receipt.get("container_recovery_authorization")
+    recovered = receipt.get("container_recovery")
+    if not isinstance(metadata, dict) or not isinstance(recovered, dict):
+        _fail("persistent container recovery authorization has no drained process proof")
+    expected_metadata = _container_recovery_process_metadata(context, recovered)
+    if metadata != expected_metadata:
+        _fail("drained process proof differs from container recovery authorization")
+    current_owner, _, current_owner_sha256 = _container_recovery_owner_digest(paths)
+    if current_owner != drain["owner"]:
+        _fail("persisted drained owner changed after terminal drain authentication")
+    recovered = _validate_container_recovery_receipt(
+        paths,
+        context,
+        recovered,
+        authenticated_drained_owner_sha256=current_owner_sha256,
+    )
+    expected_owner = context["expected_owner"]
+    if _owner_identity(current_owner) == _owner_identity(expected_owner):
+        _fail("container recovery authorization points to the old owner after drain")
+    return recovered
+
+
+@contextmanager
+def container_recovery_configuration_override(
+    paths: RuntimePaths, recovery: Mapping[str, Any] | None
+):
+    """Allow one config generation rotation only after native recovery proof."""
+
+    if recovery is None:
+        yield
+        return
+    owner, _, _ = _container_recovery_owner_digest(paths)
+    previous = os.environ.get("FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256")
+    if owner.get("state") == "failed":
+        config_sha256 = recovery.get("config_sha256")
+        _container_recovery_hex(config_sha256, "validated container recovery config SHA-256")
+        os.environ["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = config_sha256
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256", None)
+        else:
+            os.environ["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = previous
+
+
+def _run_container_recovery_cli(
+    paths: RuntimePaths,
+    arguments: Sequence[str],
+    *,
+    timeout: float,
+    cli: Path | None,
+) -> dict[str, Any]:
+    """Retry only the transient native descriptor conflict for this recovery."""
+
+    deadline = time.monotonic() + CONTAINER_RECOVERY_WRITER_BUSY_RETRY_SECONDS
+    while True:
+        try:
+            return _run_cli(paths, arguments, timeout=timeout, cli=cli)
+        except RuntimeServiceError as error:
+            message = str(error).removeprefix("runtime CLI failed: ").strip()
+            lines = [line.strip() for line in message.splitlines() if line.strip()]
+            if lines and lines[0].startswith("[fullmag] version: "):
+                lines.pop(0)
+            if not lines:
+                raise
+            native_message = lines.pop(0).removeprefix("Error: ")
+            if (native_message not in {
+                    CONTAINER_RECOVERY_WRITER_BUSY_MESSAGE,
+                    CONTAINER_RECOVERY_WRITER_BUSY_NATIVE_MESSAGE,
+                } or lines not in ([], ["Caused by:", "session store writer is busy"])):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(CONTAINER_RECOVERY_WRITER_BUSY_SLEEP_SECONDS, remaining))
+
+
+def recover_container_namespace(
+    paths: RuntimePaths | None = None,
+    *,
+    authorization_path: Path | None = None,
+    cli: Path | None = None,
+    timeout: float = 90.0,
+) -> dict[str, Any] | None:
+    """Recover one explicitly authorized, already stopped Docker namespace."""
+
+    paths = paths or canonical_paths()
+    configured = os.environ.get(CONTAINER_RECOVERY_AUTHORIZATION_ENV) or None
+    configured_sha = os.environ.get(CONTAINER_RECOVERY_AUTHORIZATION_SHA256_ENV) or None
+    if configured is None and configured_sha is None and authorization_path is None:
+        pending = _container_recovery_pending_markers(paths)
+        if pending:
+            _fail("pending container recovery requires a new explicit authorization")
+        return None
+    if configured is None or configured_sha is None:
+        _fail("container recovery authorization path and SHA-256 must be supplied together")
+    if os.environ.get(RECOVERY_AUTHORIZATION_ENV):
+        _fail("legacy runtime recovery and container recovery are mutually exclusive")
+    context = _read_container_recovery_authorization(paths, authorization_path)
+    current_owner, current_owner_raw, current_owner_sha256 = _container_recovery_owner_digest(paths)
+    state = current_owner.get("state")
+    request = context["request"]
+    if state == "drained":
+        return _validate_container_recovery_drained_proof(paths, context)
+    receipt_path = (
+        paths.store
+        / "runtime-services"
+        / "container-recovery"
+        / context["request_sha256"]
+        / "receipt.json"
+    )
+    try:
+        existing, _ = _read_stable_container_recovery_json(
+            receipt_path,
+            "container recovery receipt",
+            MAX_CONTAINER_RECOVERY_RECEIPT_BYTES,
+        )
+    except FileNotFoundError:
+        existing = None
+    if state == "failed" and existing is not None and existing.get("status") == "recovered":
+        # A receipt-backed Failed owner is an immutable first-recovery replay;
+        # never invoke the native mutator a second time.
+        validated = _validate_container_recovery_receipt(paths, context, existing)
+        if current_owner_sha256 != validated.get("owner_sha256_after"):
+            _fail("container recovery failed owner differs from its immutable receipt")
+        return validated
+    if existing is not None and existing.get("status") == "recovered":
+        _fail("container recovery receipt is complete but the current owner is not its failed owner")
+    prepared_failed_owner = state == "failed" and isinstance(existing, dict) and existing.get("status") == "prepared"
+    if (
+        not prepared_failed_owner
+        and (
+            current_owner_sha256 != context["authorization"]["owner_sha256"]
+            or current_owner != request["expected_owner"]
+        )
+    ):
+        _fail("container recovery authorization does not match the current owner; a new request is required")
+    if state not in {"ready", "unknown", "failed"}:
+        _fail(f"container recovery cannot run from owner state {state!r}")
+    config_raw = _read_stable_container_recovery_file(
+        paths.config, "container recovery runtime configuration", MAX_CONTAINER_RECOVERY_REQUEST_BYTES
+    )
+    if _sha256_bytes(config_raw) != context["config_sha256"]:
+        _fail("container recovery runtime configuration changed after authorization")
+    launch_raw = _read_stable_container_recovery_file(
+        runtime_services_root(paths) / "LAUNCH.json",
+        "container recovery runtime launch record",
+        MAX_CONTAINER_RECOVERY_REQUEST_BYTES,
+    )
+    if _sha256_bytes(launch_raw) != context["authorization"]["launch_sha256"]:
+        _fail("container recovery runtime launch record changed after authorization")
+    recovery_arguments = (
+        "runtime",
+        "service-recover-container",
+        "--config",
+        str(paths.config),
+        "--request",
+        str(context["request_path"]),
+        "--request-sha256",
+        context["request_sha256"],
+        "--attestation",
+        str(context["attestation_path"]),
+        "--attestation-sha256",
+        context["attestation_sha256"],
+    )
+    result = _run_container_recovery_cli(
+        paths,
+        recovery_arguments,
+        timeout=timeout,
+        cli=cli,
+    )
+    validated = _validate_container_recovery_receipt(paths, context, result)
+    _, _, published_owner_sha256 = _container_recovery_owner_digest(paths)
+    if published_owner_sha256 != validated.get("owner_sha256_after"):
+        _fail("native container recovery failed owner changed after publication")
+    return validated
 
 
 def initialize_accepted_store(
@@ -1630,7 +2548,7 @@ def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str)
 def _read_authenticated_terminal_drain(paths: RuntimePaths) -> dict[str, Any]:
     """Validate the previous entrypoint's authenticated terminal drain proof."""
 
-    receipt_path = paths.state_root / "runtime-service/process-tree.json"
+    receipt_path = process_receipt_path(paths)
     receipt = _read_json(receipt_path, "previous runtime service process receipt")
     if (receipt.get("schema") != "fullmag.docker-process-tree.v1"
             or receipt.get("state") != "drained"):
@@ -1646,7 +2564,7 @@ def _read_authenticated_terminal_drain(paths: RuntimePaths) -> dict[str, Any]:
     if service_owner_present:
         _validate_terminal_owner(service_owner, state="ready", name="previous service owner")
 
-    owner_path = paths.store / "runtime-services" / "OWNER.json"
+    owner_path = runtime_services_root(paths) / "OWNER.json"
     owner = _read_json(owner_path, "terminal runtime service owner")
     _validate_terminal_owner(owner, state="drained", name="persisted terminal owner")
     if (_owner_identity(owner) != _owner_identity(terminal_owner)
@@ -1695,7 +2613,7 @@ def _assert_owner_lock_identity(
 def _authenticated_terminal_drain(paths: RuntimePaths):
     """Hold the native owner lock while validating and rotating generations."""
 
-    lock_path = paths.store / "runtime-services" / "OWNER.lock"
+    lock_path = runtime_services_root(paths) / "OWNER.lock"
     _assert_no_links(lock_path, "runtime service owner lock")
     try:
         import fcntl
@@ -1792,7 +2710,7 @@ def _service_status(paths: RuntimePaths) -> dict[str, Any]:
 def _read_ready_owner(paths: RuntimePaths) -> dict[str, Any]:
     """Read the already-published owner without starting another native CLI."""
 
-    owner_path = paths.store / "runtime-services" / "OWNER.json"
+    owner_path = runtime_services_root(paths) / "OWNER.json"
     deadline = time.monotonic() + READY_OWNER_MISSING_RETRY_SECONDS
     while True:
         try:
@@ -1815,7 +2733,7 @@ def _owner_pin_path(paths: RuntimePaths, owner: Mapping[str, Any]) -> Path:
     token = owner.get("owner_token")
     if not isinstance(token, str) or not OWNER_TOKEN_RE.fullmatch(token):
         _fail("canonical runtime service owner has an invalid owner token")
-    return paths.store / "runtime-services" / f"docker-client-{token}.json"
+    return runtime_services_root(paths) / f"docker-client-{token}.json"
 
 
 def _pin_owner(paths: RuntimePaths, owner: Mapping[str, Any]) -> Path:
@@ -1831,6 +2749,38 @@ def _pin_owner(paths: RuntimePaths, owner: Mapping[str, Any]) -> Path:
             _fail("pinned runtime service owner differs from the confirmed owner")
     _atomic_json(path, owner, "pinned runtime service owner")
     return path
+
+
+def _accepted_store_owner_pin_path(paths: RuntimePaths, technical_path: Path) -> Path:
+    """Return the native store alias after proving both volume views agree.
+
+    Docker mounts ``runtime-control/runtime-services`` at both the technical
+    runtime-control path and the accepted SessionStore compatibility path.
+    Python writes the pin through the technical view.  Rust deliberately only
+    accepts an owner path below its configured accepted store, so pass the
+    second view to the CLI only after comparing the exact persisted bytes.
+    """
+
+    technical_root = runtime_services_root(paths)
+    try:
+        relative = technical_path.relative_to(technical_root)
+    except ValueError:
+        _fail("pinned runtime service owner is outside the technical runtime-services root")
+    if len(relative.parts) != 1:
+        _fail("pinned runtime service owner path is not canonical")
+    accepted_path = paths.store / RUNTIME_SERVICES_RELATIVE / relative
+    try:
+        technical_bytes = _bounded_regular(
+            technical_path, "technical pinned runtime service owner"
+        )
+        accepted_bytes = _bounded_regular(
+            accepted_path, "accepted-store pinned runtime service owner"
+        )
+    except OSError as error:
+        _fail(f"cannot verify the accepted-store owner pin alias: {error}")
+    if technical_bytes != accepted_bytes:
+        _fail("technical and accepted-store owner pin bytes differ")
+    return accepted_path
 
 
 def _attach_pinned_handle(
@@ -1950,7 +2900,8 @@ def stop(handle: RuntimeHandle, *, timeout: float = 30.0) -> dict[str, Any]:
         )
     if not 1 <= timeout <= 30:
         _fail("terminal drain timeout must be 1..30 seconds")
-    expected_path = _pin_owner(handle.paths, observed)
+    technical_path = _pin_owner(handle.paths, observed)
+    expected_path = _accepted_store_owner_pin_path(handle.paths, technical_path)
     result = _run_cli(handle.paths, ("runtime", "service-drain-confirmed",
                       "--config", str(handle.paths.config), "--expected-owner", str(expected_path),
                       "--timeout-seconds", str(int(timeout))), timeout=timeout + 10)

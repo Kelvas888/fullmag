@@ -20,6 +20,10 @@ HOST_SCHEMA = "fullmag.windows-folder-host.v1"
 OWNER_NAME = ".fullmag-windows-folder-owner.json"
 HOST_CERT_PATH = "/run/fullmag/windows-folder-host.json"
 DEVELOPMENT_BUILD_SCHEMA = "fullmag.windows-folder-development-build.v1"
+# Development provenance is owned by the backend's Compose-group control
+# named volume.  A host-visible or image-root path would bypass the volume
+# identity checks and is therefore never admissible here.
+DEVELOPMENT_PROVENANCE_PATH = "/opt/fullmag/control/backend/runtime-provenance.json"
 BOUND_EVIDENCE_MAX_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
@@ -402,7 +406,7 @@ def _validate_development_build(development_build):
         raise ValueError("Development build delegation toolchain image is invalid")
     if development_build.get("package_root") != "/opt/fullmag/package":
         raise ValueError("Development build delegation package root is invalid")
-    if development_build.get("provenance_path") not in {"/opt/fullmag/provenance.json", "/build/provenance.json", "/opt/fullmag/control/backend/runtime-provenance.json"}:
+    if development_build.get("provenance_path") != DEVELOPMENT_PROVENANCE_PATH:
         raise ValueError("Development build delegation provenance path is invalid")
     group_identity = development_build.get("group_identity")
     if (not isinstance(group_identity, str) or not group_identity or len(group_identity) > 256

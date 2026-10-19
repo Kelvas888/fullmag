@@ -18,6 +18,7 @@ import fullmag_storage as storage
 from windows_folder_host import local_volume, read_owned_regular
 
 DIRECTORIES = ("app", "src", "public", "scripts")
+NEXT_CONFIG_RELATIVE = Path("apps/control-room/next.config.ts")
 WORKSPACE = "/state/development/workspace"
 FRONTEND = "/state/development/cache"
 CONFIG_TARGET = "/run/fullmag/development-inputs.json"
@@ -193,6 +194,10 @@ def describe(source, port):
     }
     relative_files.update(patch_relatives)
     dependency_files = set(relative_files)
+    # Next reads this file before the dev server starts.  It is therefore a
+    # cache identity input even though it is outside the live HMR directories.
+    relative_files.add(NEXT_CONFIG_RELATIVE)
+    dependency_files.add(NEXT_CONFIG_RELATIVE)
     from windows.stage_workspace_frontend import (
         _direct_app_package_manifests,
         _parse_lock_importers,
@@ -343,6 +348,8 @@ def seed(source, state, port, *, reuse_from=None, write_file=None):
     }
     relative_files.update(patch_relatives)
     dependency_files = set(relative_files)
+    relative_files.add(NEXT_CONFIG_RELATIVE)
+    dependency_files.add(NEXT_CONFIG_RELATIVE)
     # Pnpm patch files are frozen dependency inputs, while app dirs remain live
     # readonly mounts.  The complete patches/ tree is captured so pnpm's
     # authoritative registration format stays responsible for declaration and
@@ -452,6 +459,112 @@ def seed(source, state, port, *, reuse_from=None, write_file=None):
             "backend_build": "explicit_request_only"}
 
 
+
+def _validate_guest_workspace(workspace, expected_files, *, maximum=16 * 1024 * 1024):
+    """Validate a possibly interrupted guest seed without deleting its state.
+
+    A seed may be interrupted after the workspace directory is created but
+    before its control-volume manifest is published.  Existing files are
+    admitted only when they are the exact bytes expected from the current
+    readonly checkout; unknown files, links and mismatches remain fail-closed.
+    The four application directories are live readonly bind-mount targets,
+    so their contents are validated by the mount attestation and must not be
+    mistaken for persistent seed metadata here.
+    """
+    workspace = Path(workspace)
+    if workspace.is_symlink() or not workspace.is_dir():
+        raise ValueError("Persistent frontend workspace is missing or a reparse point")
+    expected = {Path(relative): (bytes(data) if data is not None else None)
+                for relative, data in expected_files.items()}
+    allowed_files = {relative.as_posix() for relative in expected}
+    allowed_directories = set()
+    for relative in expected:
+        for index in range(1, len(relative.parts)):
+            allowed_directories.add(Path(*relative.parts[:index]).as_posix())
+    for name in DIRECTORIES:
+        allowed_directories.add(Path("apps", "control-room", name).as_posix())
+        allowed_directories.add(Path("apps", "control-room").as_posix())
+        allowed_directories.add(Path("apps").as_posix())
+
+    live_mount_targets = {
+        Path("apps") / "control-room" / name for name in DIRECTORIES
+    }
+    for root, directories, filenames in os.walk(workspace, topdown=True, followlinks=False):
+        root_path = Path(root)
+        for name in list(directories):
+            candidate = root_path / name
+            relative = candidate.relative_to(workspace).as_posix()
+            if candidate.is_symlink() or relative not in allowed_directories:
+                raise ValueError(
+                    "Persistent frontend workspace contains an unexpected directory or link: "
+                    + relative
+                )
+            if Path(relative) in live_mount_targets:
+                # The actual source tree is mounted at this exact target by
+                # Compose.  Do not descend into live source files while
+                # validating the named-volume seed; mount attestation checks
+                # the source, target and readonly boundary separately.
+                directories.remove(name)
+        for name in filenames:
+            candidate = root_path / name
+            relative_path = candidate.relative_to(workspace)
+            relative = relative_path.as_posix()
+            if candidate.is_symlink() or relative not in allowed_files:
+                raise ValueError(
+                    "Persistent frontend workspace contains an unexpected file or link: "
+                    + relative
+                )
+            try:
+                metadata = candidate.lstat()
+            except OSError as error:
+                raise ValueError(
+                    f"Cannot inspect persistent frontend seed file: {relative}"
+                ) from error
+            if not stat.S_ISREG(metadata.st_mode) or candidate.is_symlink():
+                raise ValueError(
+                    f"Persistent frontend seed file is not a regular file: {relative}"
+                )
+            if metadata.st_size > maximum:
+                raise ValueError(
+                    f"Persistent frontend seed file is too large: {relative}"
+                )
+            try:
+                data = candidate.read_bytes()
+            except OSError as error:
+                raise ValueError(
+                    f"Cannot read persistent frontend seed file: {relative}"
+                ) from error
+            if len(data) != metadata.st_size:
+                raise ValueError(
+                    f"Persistent frontend seed file changed while being read: {relative}"
+                )
+            expected_data = expected[relative_path]
+            if expected_data is not None and data != expected_data:
+                raise ValueError(
+                    "Persistent frontend seed metadata does not match the selected checkout: "
+                    + relative
+                )
+
+
+def _ensure_guest_directory(path, root):
+    """Create one guest directory tree without traversing a link."""
+    path = Path(path)
+    root = Path(root)
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"Frontend workspace path escapes its named volume: {path}") from error
+    current = root
+    if current.is_symlink() or (current.exists() and not current.is_dir()):
+        raise ValueError(f"Frontend workspace root is not a real directory: {root}")
+    current.mkdir(parents=True, exist_ok=True)
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink() or (current.exists() and not current.is_dir()):
+            raise ValueError(f"Frontend workspace path is not a real directory: {current}")
+        current.mkdir(exist_ok=True)
+    return current
+
 def seed_guest(
     source,
     state,
@@ -461,6 +574,7 @@ def seed_guest(
     worktree_id,
     source_commit,
     manifest_path=None,
+    frontend_cache_key=None,
 ):
     """Seed frontend dependency metadata into a Docker named volume.
 
@@ -508,6 +622,20 @@ def seed_guest(
         raise ValueError("source_commit must be a lowercase full Git commit")
     if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
         raise ValueError("port must be an integer in 1024..65535")
+    if frontend_cache_key is not None and not isinstance(frontend_cache_key, str):
+        raise ValueError("frontend_cache_key must be a lowercase SHA-256")
+    if frontend_cache_key is not None and not re.fullmatch(r"[a-f0-9]{64}", frontend_cache_key):
+        raise ValueError("frontend_cache_key must be a lowercase SHA-256")
+    if frontend_cache_key is not None:
+        expected_manifest = (
+            Path("/opt/fullmag/control")
+            / frontend_cache_key
+            / "development-inputs.json"
+        )
+        if manifest_path is None or Path(manifest_path) != expected_manifest:
+            raise ValueError(
+                "frontend input manifest must use the cache-key control namespace"
+            )
 
     app = source / "apps" / "control-room"
     directories = []
@@ -533,6 +661,8 @@ def seed_guest(
     }
     relative_files.update(patch_relatives)
     dependency_files = set(relative_files)
+    relative_files.add(NEXT_CONFIG_RELATIVE)
+    dependency_files.add(NEXT_CONFIG_RELATIVE)
     from windows.stage_workspace_frontend import (
         _direct_app_package_manifests,
         _parse_lock_importers,
@@ -548,23 +678,29 @@ def seed_guest(
             relative_files.add(path.relative_to(source))
 
     workspace = state / "workspace"
-    if workspace.exists() or workspace.is_symlink():
-        raise ValueError(
-            "Named frontend state already contains workspace metadata; preserve the matching manifest"
+    workspace_present = workspace.exists() or workspace.is_symlink()
+    if workspace.is_symlink() or (workspace_present and not workspace.is_dir()):
+        raise ValueError("Persistent frontend workspace is missing or a reparse point")
+    if workspace_present:
+        _validate_guest_workspace(
+            workspace, {relative: None for relative in relative_files}
         )
-    try:
-        workspace.mkdir(parents=True, exist_ok=False)
-    except PermissionError as error:
-        raise _named_volume_permission_error(workspace, error) from error
+    else:
+        try:
+            workspace.mkdir(parents=True, exist_ok=False)
+        except PermissionError as error:
+            raise _named_volume_permission_error(workspace, error) from error
+
     # Compose attaches the four readonly Windows source mounts below these
     # targets.  Create their empty mountpoints in the named volume before the
     # service is created; ``create_host_path: false`` then remains fail-closed.
     for name in DIRECTORIES:
         mountpoint = workspace / "apps" / "control-room" / name
         try:
-            mountpoint.mkdir(parents=True, exist_ok=True)
+            _ensure_guest_directory(mountpoint, workspace)
         except PermissionError as error:
             raise _named_volume_permission_error(mountpoint, error) from error
+
     files = []
     dependency_entries = {}
     for relative in sorted(relative_files, key=str):
@@ -580,11 +716,21 @@ def seed_guest(
             raise
         target = workspace / relative
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("xb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
+            _ensure_guest_directory(target.parent, workspace)
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                raise ValueError(f"Frontend workspace seed target is not a regular file: {relative}")
+            if target.exists():
+                existing = guest_read_regular(target, maximum=16 * 1024 * 1024)
+                if existing != data:
+                    raise ValueError(
+                        "Persistent frontend seed metadata does not match the selected checkout: "
+                        + relative.as_posix()
+                    )
+            else:
+                with target.open("xb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
         except PermissionError as error:
             raise _named_volume_permission_error(target, error) from error
         digest = hashlib.sha256(data).hexdigest()
@@ -604,6 +750,7 @@ def seed_guest(
         "source_volume": str(source),
         "host_port": port,
         "worktree_id": worktree_id,
+        **({"frontend_cache_key": frontend_cache_key} if frontend_cache_key is not None else {}),
         "dependency_seed_files": sorted(dependency_entries),
         "dependency_seed_sha256": dependency_seed_digest(dependency_entries),
         "toolpins": toolpins,
@@ -618,17 +765,27 @@ def seed_guest(
     destination = Path(manifest_path) if manifest_path is not None else state / "development-inputs.json"
     if not destination.is_absolute() or destination.is_symlink():
         raise ValueError("Frontend input manifest must be an absolute regular volume path")
+    for ancestor in (destination.parent, *destination.parent.parents):
+        if ancestor.is_symlink():
+            raise ValueError(f"Frontend input manifest traverses a reparse point: {ancestor}")
+        if ancestor == Path(ancestor.anchor):
+            break
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
     except PermissionError as error:
         raise _named_volume_permission_error(destination.parent, error) from error
+    if destination.exists() and not destination.is_file():
+        raise ValueError("Frontend input manifest is not a regular file")
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
         try:
-            temporary.write_bytes(
-                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                + b"\n"
-            )
+            with temporary.open("xb") as stream:
+                stream.write(
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    + b"\n"
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(temporary, destination)
         except PermissionError as error:
             raise _named_volume_permission_error(destination, error) from error

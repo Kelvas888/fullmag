@@ -69,6 +69,7 @@ RECEIPT_SCHEMA = "fullmag.docker-frontend-development-receipt.v1"
 FRONTEND_CONTROL_ROOT = Path(
     os.environ.get("FULLMAG_FRONTEND_CONTROL_ROOT", "/opt/fullmag/control/frontend")
 )
+FRONTEND_CACHE_KEY = os.environ.get("FULLMAG_FRONTEND_CACHE_KEY")
 INPUTS_PATH = Path(
     os.environ.get(
         "FULLMAG_DEVELOPMENT_INPUTS_PATH",
@@ -130,6 +131,7 @@ OPTIONAL_MANIFEST_KEYS = frozenset(
         "source_selection", "source_volume", "configuration_changes", "backend_build",
         "worktree_id", "dependency_seed_files", "dependency_seed_sha256",
         "toolpins", "toolpins_sha256",
+        "frontend_cache_key",
     }
 )
 GENERATED_RELATIVES = frozenset(
@@ -400,6 +402,31 @@ def _canonical_live_directory(value: Any, name: str) -> str:
     return normalized
 
 
+def _validate_control_volume_contract() -> None:
+    """Require the launcher-provided cache-key namespace when v2 is active."""
+
+    if FRONTEND_CACHE_KEY is None:
+        # Unit tests and the legacy direct Python adapter do not have the
+        # Compose resolver's identity environment.  The production Compose
+        # overlay requires it, so keeping this compatibility path does not
+        # create a shared manifest in the active v2 route.
+        return
+    if not HEX64.fullmatch(FRONTEND_CACHE_KEY):
+        _fail("FULLMAG_FRONTEND_CACHE_KEY must be a lowercase SHA-256")
+    expected_root = Path("/opt/fullmag/control") / FRONTEND_CACHE_KEY
+    expected_inputs = expected_root / "development-inputs.json"
+    if FRONTEND_CONTROL_ROOT != expected_root:
+        _fail(
+            "FULLMAG_FRONTEND_CONTROL_ROOT must be the cache-key namespace "
+            f"{expected_root}"
+        )
+    if INPUTS_PATH != expected_inputs:
+        _fail(
+            "FULLMAG_DEVELOPMENT_INPUTS_PATH must be the cache-key manifest "
+            f"{expected_inputs}"
+        )
+
+
 def _ensure_inputs_manifest() -> None:
     """Create the guest manifest once, inside named volumes, when absent.
 
@@ -410,6 +437,7 @@ def _ensure_inputs_manifest() -> None:
     Existing manifests are never rewritten during a restart.
     """
 
+    _validate_control_volume_contract()
     if INPUTS_PATH.exists():
         return
     source = Path(
@@ -443,6 +471,7 @@ def _ensure_inputs_manifest() -> None:
             worktree_id=worktree_id,
             source_commit=source_commit,
             manifest_path=INPUTS_PATH,
+            frontend_cache_key=FRONTEND_CACHE_KEY,
         )
     except Exception as error:
         if isinstance(error, FrontendDevError):
@@ -458,11 +487,19 @@ def read_inputs(path: Path | None = None) -> DevelopmentInputs:
     if path != INPUTS_PATH:
         _fail("development input manifest path is fixed to the named control volume")
     manifest = _read_json(path, "Docker development input manifest")
+    _validate_control_volume_contract()
     unexpected_keys = set(manifest) - REQUIRED_MANIFEST_KEYS - OPTIONAL_MANIFEST_KEYS
     if not REQUIRED_MANIFEST_KEYS <= set(manifest) or unexpected_keys:
         _fail("Docker development input manifest has an unexpected field set")
     if manifest.get("schema") != INPUTS_SCHEMA:
         _fail("Docker development input manifest has an unsupported schema")
+    manifest_cache_key = manifest.get("frontend_cache_key")
+    if manifest_cache_key is not None and (
+        not isinstance(manifest_cache_key, str) or not HEX64.fullmatch(manifest_cache_key)
+    ):
+        _fail("frontend_cache_key must be a lowercase SHA-256")
+    if FRONTEND_CACHE_KEY is not None and manifest_cache_key != FRONTEND_CACHE_KEY:
+        _fail("Docker development input manifest belongs to a different cache volume")
     source_root = manifest.get("source_root")
     if (
         not isinstance(source_root, str)

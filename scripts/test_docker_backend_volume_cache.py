@@ -673,9 +673,14 @@ class BackendVolumeCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             profile, *_ = _profile(tmp)
             document = DockerVolumeFixture(profile)._document(cache.BUILD_VOLUME_ROLE)
-            document["Mountpoint"] = "/run/desktop/mnt/host/c/fullmag"
-            with self.assertRaisesRegex(cache.BackendVolumeCacheError, "Windows host bind"):
-                cache._validate_volume_document(document, profile, cache.BUILD_VOLUME_ROLE)
+            for mountpoint in ("/run/desktop/mnt/host/c/fullmag", "/mnt/e/fullmag",
+                               "/mnt/z/fullmag", "/host_mnt/e/fullmag"):
+                document["Mountpoint"] = mountpoint
+                with self.subTest(mountpoint=mountpoint), self.assertRaisesRegex(
+                        cache.BackendVolumeCacheError, "Windows host bind"):
+                    cache._validate_volume_document(document, profile, cache.BUILD_VOLUME_ROLE)
+            document["Mountpoint"] = "/mnt/docker-data/volumes/cache/_data"
+            cache._validate_volume_document(document, profile, cache.BUILD_VOLUME_ROLE)
             profile_without_runroot = cache.prepare(
                 {"project_id": "fullmag", "worktree_id": profile["worktree_id"], "compose_project": profile["control_project"]},
                 Path(tmp) / "repo",

@@ -7,6 +7,7 @@ import { parseArgs } from "node:util";
 import {
   normalizeOpenApiBuildIdentity,
   validateDockerOpenApiReceipt,
+  validateDirectComposeOpenApiReceipt,
   validateManagedOpenApiIdentity,
   validateManagedSnapshotOpenApiReceipt,
   validateNativeOpenApiReceipt,
@@ -23,6 +24,8 @@ const { values } = parseArgs({
     "docker-assembly": { type: "string" },
     "docker-export-receipt": { type: "string" },
     "expected-source-digest": { type: "string" },
+    "direct-compose-receipt": { type: "string" },
+    output: { type: "string" },
   },
   allowPositionals: false,
 });
@@ -30,6 +33,7 @@ let document;
 const snapshotReceipt = values["managed-snapshot-receipt"];
 const dockerAssembly = values["docker-assembly"];
 const dockerExportReceipt = values["docker-export-receipt"];
+const directComposeReceipt = values["direct-compose-receipt"];
 if ((dockerAssembly === undefined) !== (dockerExportReceipt === undefined)) {
   throw new Error("Docker assembly and export receipt are mutually required");
 }
@@ -37,9 +41,16 @@ const receiptModeCount = [
   values["native-receipt"] !== undefined,
   snapshotReceipt !== undefined,
   dockerAssembly !== undefined,
+  directComposeReceipt !== undefined,
 ].filter(Boolean).length;
 if (receiptModeCount > 1) {
-  throw new Error("Native, managed snapshot, and Docker export receipts are mutually exclusive");
+  throw new Error("Native, managed snapshot, Docker export, and direct Compose receipts are mutually exclusive");
+}
+if (directComposeReceipt !== undefined && values.input === undefined) {
+  throw new Error("A direct Compose receipt requires --input; Cargo fallback is not allowed");
+}
+if (directComposeReceipt !== undefined && values["expected-source-digest"] === undefined) {
+  throw new Error("A direct Compose receipt requires an expected source digest");
 }
 if (snapshotReceipt !== undefined && values.input === undefined) {
   throw new Error("A managed snapshot receipt requires --input; Cargo fallback is not allowed");
@@ -51,7 +62,7 @@ if (dockerAssembly !== undefined && values["expected-source-digest"] === undefin
   throw new Error("A Docker export receipt requires an expected source digest");
 }
 if (values["expected-source-digest"] !== undefined &&
-    snapshotReceipt === undefined && dockerAssembly === undefined) {
+    snapshotReceipt === undefined && dockerAssembly === undefined && directComposeReceipt === undefined) {
   throw new Error("An expected source digest requires a managed snapshot receipt; no Cargo fallback");
 }
 if (values["native-receipt"] !== undefined && values.input === undefined) {
@@ -71,7 +82,27 @@ if (values.input !== undefined) {
   );
   document = JSON.parse(bytes.toString("utf8"));
   const inputSha256 = createHash("sha256").update(bytes).digest("hex");
-  if (dockerAssembly !== undefined) {
+  if (directComposeReceipt !== undefined) {
+    if (!isAbsolute(directComposeReceipt)) {
+      throw new Error("Direct Compose receipt path must be absolute");
+    }
+    const proofBytes = readBoundedRegularFile(
+      resolve(directComposeReceipt),
+      16 * 1024 * 1024,
+      "Direct Compose codegen receipt",
+    );
+    validateDirectComposeOpenApiReceipt(
+      document,
+      JSON.parse(proofBytes.toString("utf8")),
+      {
+        expectedCommit: values["expected-commit"],
+        expectedSnapshot: values["expected-snapshot"],
+        expectedSourceDigest: values["expected-source-digest"],
+        inputSha256,
+        inputByteLength: bytes.length,
+      },
+    );
+  } else if (dockerAssembly !== undefined) {
     if (!isAbsolute(dockerAssembly) || !isAbsolute(dockerExportReceipt)) {
       throw new Error("Docker assembly and export receipt paths must be absolute");
     }
@@ -186,7 +217,12 @@ if (!document.paths?.["/v2/sessions/current/status"]) {
   throw new Error("OpenAPI generator omitted the canonical session status resource");
 }
 normalizeOpenApiBuildIdentity(document);
-const output = join(appRoot, "src/kernel/api/generated/openapi-v2.json");
+const output = values.output === undefined
+  ? join(appRoot, "src/kernel/api/generated/openapi-v2.json")
+  : values.output;
+if (!isAbsolute(output)) {
+  throw new Error("OpenAPI output path must be absolute");
+}
 const temporary = `${output}.${process.pid}.tmp`;
 writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`);
 renameSync(temporary, output);

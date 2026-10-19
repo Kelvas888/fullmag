@@ -16,8 +16,16 @@ Przeczytaj skill `.agents/skills/fullmag-docker-build/SKILL.md`.
 $source = "<absolutny-zarejestrowany-checkout>"
 Set-Location $source
 just docker-dev-toolchain
-just docker-dev $source 3197
+just docker-dev
 ```
+
+Kreator zapisuje `FULLMAG_SOURCE_ROOT` i `FULLMAG_HTTP_PORT` do `.env` głównego
+checkoutu. Domyślne źródła: jawny argument → zmienna procesu → bieżący worktree
+→ `.env` → zapis konfiguratora → główny checkout. Port startu: jawny argument →
+zmienna procesu → `.env` → zapis konfiguratora → `3197`. Zajęty port kończy start
+błędem. Toolchain, obrazy pomocnicze i aplikacja stosują ten sam wybór źródeł.
+Aktywacja kolejnego skryptu odczytuje rzeczywisty port działającej grupy, więc
+nie wymaga ponownego podawania wcześniejszego nadpisania portu.
 
 Zakończ edycje i staging przed startem; nie zmieniaj źródeł do zakończenia
 próby. Migawka odczytuje checkout dwukrotnie i odrzuca niespójne wejście.
@@ -51,6 +59,68 @@ startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backe
 próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
+
+### Aktywacja skryptu w już działającym Workspace
+
+Jeżeli grupa ma już zdrowe, działające usługi `backend` i `frontend`, skrypt
+można aktywować bez restartu, odtwarzania ani przebudowy kontenerów:
+
+```powershell
+just docker-dev-script "examples/fem_relax_gpu_smoke.py"
+
+# Explicit pins remain available for operator recovery and diagnostics:
+just docker-dev-script-pinned <attempt> <config-sha256> <checkout> <script>
+```
+
+Zwykła komenda ustala `attempt` i `config-sha256` automatycznie z bieżącej
+grupy i zweryfikowanych receiptów; wymaga dokładnie jednej zgodnej, zdrowej
+pary usług. Nie uruchamia kontenerów, nie buduje i nie wybiera historycznej
+próby według daty. Przy aktywnej sesji trzeba najpierw zamknąć bieżący projekt
+w Workspace; samo zakończenie Solve nie oznacza pustego Workspace.
+
+W jawnej komendzie `docker-dev-script-pinned` wartości muszą pochodzić z tego samego
+`development/attempts/<attempt>/{terminal,compose}.json` w wolumenie control.
+Jeżeli pierwotny start nie powiódł się, zachowaj jego piny: launcher wymaga
+trwałego, pomyślnego `resume`/`iteration` powiązanego z tą samą próbą,
+konfiguracją i aktualnymi identyfikatorami usług. Nie zmienia historii błędu.
+Launcher ponownie sprawdza grupę Compose, identyfikatory obu kontenerów, obraz,
+readonly bind źródeł i zdrowie backendu. Autoryzacja skryptu oraz techniczne
+receipty trafiają do control volume; skrypt nie jest kopiowany do storage
+Windows ani pakowany do ZIP/TAR.
+
+Polecenie wykonuje wyłącznie stały wrapper `python -I -B -c` w istniejącym
+kontenerze `backend`; kod wrappera jest częścią zarządzanej recepty i nie zawiera
+żadnej wartości użytkownika. Host weryfikuje niezmienny identyfikator obrazu,
+a wrapper weryfikuje hash obrazu `docker_startup_script.py`, ładuje go i wywołuje
+`docker_startup_script.run_from_environment()`, które korzysta z wewnętrznego
+API live. API dopuszcza pusty bieżący Workspace albo dokładny replay
+tego samego `request_id` i hashów. Dla nowego żądania helper najpierw odpytuje
+`GET /v2/platform/health` w tym samym backendzie i wymaga `status="ok"` oraz
+`active_session=false`; przy aktywnej albo nieznanej sesji nie tworzy markera i
+nie wysyła POST. Dokładny replay terminalnego receipt'u omija ten preflight,
+natomiast receipt ze stanem `started` nadal oznacza nieznany wynik i blokuje
+każdą próbę ponowienia.
+
+Każde żądanie ma własny trwały receipt w control volume:
+`/opt/fullmag/control/backend/script-activation-<sha256(request_id)>/activation.json`.
+Oryginalny entrypoint bez aktywacji zarządzanej zachowuje swój marker
+`/state/.fullmag/docker-startup/activation.json`; wrapper aktywacji ustawia
+per-request ścieżkę dopiero po zweryfikowaniu klucza 64 znaków hex. Receiptów
+nie kopiuje się do Windows storage i nie archiwizuje automatycznie.
+
+Odrzucenie skryptu jest wynikiem `failed-confirmed` operacji i kończy polecenie
+kodem 2; nie oznacza wykonania symulacji. Raport zachowuje osobno identyfikator
+operacji oraz `development_attempt`. Długi komunikat błędu pozostaje ograniczony
+do 2048 znaków, lecz zachowuje początek i końcową przyczynę tracebacku.
+
+Domyślny `request_id` jest deterministyczny na podstawie próby i hasha pliku:
+ten sam skrypt z tym samym domyślnym ID odtwarza terminalny wynik, a inny hash
+otrzymuje odrębny receipt. Nowe żądanie nadal przechodzi przez istniejącą
+walidację Workspace: musi być pusty według kontraktu API. Zamknięcie runu nie
+retiruje bieżącego Workspace, więc samo podanie nowego `request_id` jako piątego
+argumentu nie wystarcza; potrzebne jest istniejące, jawne przejście do pustego
+Workspace. Ten draft nie dodaje mechanizmu retire/reset. Nie używaj ponownie ID,
+którego receipt ma stan `unknown`.
 
 Nieznany wynik operacji zachowuje zasoby i blokadę do jawnego rozstrzygnięcia.
 Nie usuwaj ręcznie `active`, pakietu ani lease, aby wymusić kolejny build.

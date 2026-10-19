@@ -425,3 +425,35 @@ owner record. Reconciliation musi pozostać oparte na exact digestach i
 immutable blobach. Do czasu spełnienia tych bramek V4 i Docker ABI upgrade są
 planowane, a obecne runtime/HMR oraz kwalifikacja GPU pozostają poza zakresem
 tej decyzji.
+
+### Zgodne worktree i wspólna generacja hosta (19.10.2026)
+
+Inicjalizacja drugiego worktree nie rotuje generacji V4 wyłącznie dlatego, że
+`source_snapshot_sha256` lub `runtime_identity_sha256` producenta jest inne.
+Wspólny ledger nadal ma jeden kanoniczny readiness CAS i jeden inventory owner.
+Dołączenie wymaga identycznych faktów ABI: schema, status, source kind,
+capabilities, mapa GPU UUID/compatibility, visibility oraz oba digesty
+inventory/capabilities. Niezgodność kończy inicjalizację bez mutacji.
+Jawna rotacja pozostaje osobną operacją z dotychczasowymi blokadami ownera
+i niezakończonych rezerwacji; nie usuwa się ani nie retaguje starego CAS.
+
+Każdy publisher sprawdza niezależnie natywny ABI swojej bieżącej binarki:
+lokalny odczyt ABI i dokładna walidacja source/runtime identity, a następnie
+porównanie faktów ABI z kanoniczną gotowością hosta. Świeży snapshot nadal
+musi przejść kontrole rzeczywistej topologii, GPU UUID i digestów. Walidacja
+lokalnego ABI nie uruchamia drugiego `nvidia-smi` i zachowuje istniejący
+mechanizm warm recovery próbkowania. Zapisany
+readiness z innego worktree sam nie atestuje lokalnego obrazu. Profil Docker
+przypina kanoniczny readiness i jego generację; lokalna tożsamość binarki
+pozostaje w provenance buildu/ownera. Nie zmienia to GPU admission, requested
+device, release proofs, freshness, polityki ani konfiguracji innej usługi.
+
+Regresje źródłowe: zgodny nowy producent przy aktywnym ownerze zachowuje
+dokument, owner i generację; zmienione fakty ABI są odrzucane bez mutacji.
+Lokalne kompilowanie testów pozostaje zabronione; wykonanie regresji w CI
+oraz przekazanie roli publishera między wersjami są **NOT VERIFIED**. Build
+aplikacji i rzeczywiste dołączenie drugiego worktree przeszły w próbie
+`0350aefc4a034f0f82ccb7eaa51fe319`: API/native runtime ready, health i compute
+nodes HTTP 200, poprzedni backend nadal działa i publikuje aktualny snapshot.
+Rollback kodu zachowuje format dokumentów, ale przywraca ograniczenie startu
+różnych producentów; nie wymaga migracji danych.

@@ -103,7 +103,7 @@ class BackendPackageTests(unittest.TestCase):
             candidate_records = backend._hash_package(candidate)
             _, manifest = self._live_manifest(
                 root,
-                commit=(chr(ord("a") + index) * 40),
+                commit=f"{index + 1:040x}",
                 capture_id=f"retention-{index}",
             )
             backend._write_json(
@@ -842,7 +842,6 @@ class BackendPackageTests(unittest.TestCase):
                     {
                         "backend-build-receipt.json",
                         "rotation.json",
-                        "direct-backend-build.log",
                         "retention.json",
                     },
                 )
@@ -852,6 +851,126 @@ class BackendPackageTests(unittest.TestCase):
             backend._validated_package(
                 package, "retention fixture current after cleanup", exclude_development_control=True
             )
+
+    def test_retention_bounds_archive_history_without_copying_retired_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(
+                Path(directory), versions=10
+            )
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+
+            backend._retain_package_backups(package, control, current[0], current[1])
+
+            backups_root = control / backend.PACKAGE_BACKUPS_DIRNAME
+            archive_root = control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME
+            backups = sorted(backups_root.glob(".backend-package-backup-*"))
+            archives = sorted(archive_root.glob(".backend-package-backup-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertLessEqual(len(archives), 8)
+            self.assertLessEqual(
+                sum(path.stat().st_size for archive in archives for path in archive.iterdir()),
+                64 * 1024 * 1024,
+            )
+            for archive in archives:
+                self.assertNotIn(
+                    "direct-backend-build.log",
+                    {item.name for item in archive.iterdir()},
+                )
+
+            backend._validated_package(
+                backups[0], "retention fixture rollback after cleanup"
+            )
+            backend._validate_retention_archives(archive_root)
+            backend._validated_package(
+                package,
+                "retention fixture current after cleanup",
+                exclude_development_control=True,
+            )
+
+    def test_retention_discards_oversized_legacy_log_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(
+                Path(directory), versions=2
+            )
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            backend._retain_package_backups(package, control, current[0], current[1])
+
+            archive_root = control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME
+            archive = next(archive_root.glob(".backend-package-backup-*"))
+            legacy_log = archive / "direct-backend-build.log"
+            legacy_log_size = 64 * 1024 * 1024 + 1
+            with legacy_log.open("wb") as stream:
+                stream.truncate(legacy_log_size)
+            digest = hashlib.sha256()
+            zeroes = bytes(1024 * 1024)
+            for _ in range(legacy_log_size // len(zeroes)):
+                digest.update(zeroes)
+            digest.update(zeroes[: legacy_log_size % len(zeroes)])
+            log_digest = digest.hexdigest()
+
+            manifest, _ = backend._read_json(
+                archive / "retention.json", "legacy retention manifest"
+            )
+            manifest["metadata"] = [
+                record
+                for record in manifest["metadata"]
+                if record.get("path") != "direct-backend-build.log"
+            ]
+            manifest["metadata"].append(
+                {
+                    "path": "direct-backend-build.log",
+                    "size": legacy_log_size,
+                    "sha256": log_digest,
+                }
+            )
+            backend._write_json(archive / "retention.json", manifest, "legacy retention manifest")
+
+            backend._retain_package_backups(package, control, current[0], current[1])
+
+            self.assertFalse(archive.exists())
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                            ".backend-package-backup-*"
+                        )
+                    )
+                ),
+                1,
+            )
+
+    def test_retention_preserves_archives_and_rollback_when_archive_is_corrupt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, _toolchain = self._rotated_package_fixture(
+                Path(directory), versions=3
+            )
+            current = backend._validated_package(
+                package, "retention fixture current", exclude_development_control=True
+            )
+            backend._retain_package_backups(package, control, current[0], current[1])
+
+            backups_root = control / backend.PACKAGE_BACKUPS_DIRNAME
+            archive_root = control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME
+            before_backups = {path.name for path in backups_root.iterdir()}
+            before_archives = {path.name for path in archive_root.iterdir()}
+            archive = next(archive_root.glob(".backend-package-backup-*"))
+            manifest, _ = backend._read_json(
+                archive / "retention.json", "retention manifest"
+            )
+            manifest["receipt_sha256"] = "0" * 64
+            backend._write_json(
+                archive / "retention.json", manifest, "tampered retention manifest"
+            )
+
+            with self.assertRaises(backend.BackendBuildError):
+                backend._retain_package_backups(package, control, current[0], current[1])
+
+            self.assertEqual({path.name for path in backups_root.iterdir()}, before_backups)
+            self.assertEqual({path.name for path in archive_root.iterdir()}, before_archives)
 
     def test_retention_retries_after_archive_commit_without_losing_backup_metadata(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1324,6 +1324,21 @@ the unsupported request at the same mesh revision.
 | `/v2/sessions/current/meshing/meshes/objects/{object_id}/quality` | `GET` | Read object mesh quality diagnostics; when the object marker is known, `quality.global` is the object's mesh-quality scope. |
 | `/v2/sessions/current/meshing/meshes/objects/{object_id}/size-field` | `GET` | Read object realized size-field projection. |
 
+Certyfikat rozłącznych ciał mixed-P1 v2 jest addytywnym, opcjonalnym polem
+`mixed_layer_topology_certificate_v2` w raporcie i manifeście shared-domain.
+Podsumowanie zawiera wersję, status, fingerprint, wersję Gmsh oraz
+`magnetic_regions`: `object_id`, body/material marker, liczniki rodzin komórek
+i opcjonalny `exact_sweep` z żądaną/zrealizowaną osią, liczbą warstw i liczbą
+płaszczyzn węzłów. Dowód warstw dotyczy wyłącznie wskazanego regionu; API nie
+promuje go do globalnego `requested_layered_policy` ani nie przypisuje go
+niesweptemu pierścieniowi. Tablice współczynników materiałowych, współrzędne
+płaszczyzn oraz topologia nie należą do tego podsumowania. Wersja v1 zachowuje
+dotychczasową semantykę. Dwie wersje certyfikatu w jednym raporcie są konfliktem.
+Jakość v2 korzysta z tego samego zasobu quality-gates i wymaga pełnego wspólnego
+dowodu jakości oraz walidacji certyfikatu względem bieżącej siatki; brakujące
+dowody nie są odtwarzane ze statystyk ogólnych. Zmiana pozostaje NOT VERIFIED
+na poziomie runtime do wykonania aktualnego buildu i HTTP.
+
 The shared-domain quality-gates resource retains its generic `gates`
 projection for compatibility and separately owns a typed `mixed_certificate`
 sidecar. That sidecar is derived only from the accepted mixed-layer topology

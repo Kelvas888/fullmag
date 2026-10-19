@@ -166,7 +166,11 @@ from fullmag.meshing._gmsh_selectors import (
     resolve_entity_selectors,
 )
 from fullmag.meshing import remesh_cli as remesh_cli_module
-from fullmag.meshing._gmsh_swept import _compute_swept_quality, classify_sweepability
+from fullmag.meshing._gmsh_swept import (
+    _compute_swept_quality,
+    _configure_disconnected_mixed_v2_mesh_size_fields,
+    classify_sweepability,
+)
 from fullmag.meshing.quality import validate_mesh
 from fullmag.meshing.surface_assets import (
     _geometry_to_trimesh,
@@ -13039,6 +13043,81 @@ class RegionMeshPolicyTests(unittest.TestCase):
             and fields.numbers.get((field_id, "FieldsList")) == [1.0, float(lower_max)]
         )
         self.assertEqual(fields.background, final_max)
+
+    def test_mixed_v2_airbox_grading_scopes_far_air_and_body_targets(self) -> None:
+        gmsh = _RecordingGmsh()
+        h_inner, h_outer = _configure_disconnected_mixed_v2_mesh_size_fields(
+            gmsh,
+            interface_surface_tags=[101, 102],
+            air_volume_tags=[30, 31],
+            body_volume_targets={
+                "box": ([11], 20e-9),
+                "ring": ([22], 25e-9),
+            },
+            object_bounds_min_m=(-1e-6, -0.3e-6, 0.0),
+            object_bounds_max_m=(1e-6, 0.3e-6, 0.31e-6),
+            airbox_bounds_min_m=(-1.4e-6, -1.05e-6, -0.6e-6),
+            airbox_bounds_max_m=(1.4e-6, 1.05e-6, 0.6e-6),
+            box_hmax_m=20e-9,
+            ring_hmax_m=25e-9,
+            airbox=AirboxOptions(
+                minimum_element_size=10e-9,
+                maximum_element_size=500e-9,
+            ),
+            options=MeshOptions(),
+            scale=1e6,
+        )
+
+        self.assertEqual(h_inner, 10e-9)
+        self.assertEqual(h_outer, 500e-9)
+        self.assertEqual(
+            gmsh.option_values["Mesh.CharacteristicLengthMax"],
+            0.5,
+        )
+        self.assertEqual(gmsh.option_values["Mesh.MeshSizeFromPoints"], 0.0)
+        self.assertEqual(gmsh.option_values["Mesh.MeshSizeExtendFromBoundary"], 0.0)
+
+        body_constants = {
+            tuple(gmsh.field.numbers[(field_id, "VolumesList")]): field_id
+            for field_id, kind in gmsh.field.kinds.items()
+            if kind == "Constant"
+            and gmsh.field.numbers.get((field_id, "VolumesList")) in ([11.0], [22.0])
+        }
+        self.assertEqual(
+            gmsh.field.numbers[(body_constants[(11.0,)], "VIn")],
+            0.02,
+        )
+        self.assertAlmostEqual(
+            gmsh.field.numbers[(body_constants[(22.0,)], "VIn")],
+            0.025,
+        )
+        self.assertEqual(
+            gmsh.field.numbers[(body_constants[(11.0,)], "VOut")],
+            0.5,
+        )
+        self.assertEqual(
+            gmsh.field.numbers[(body_constants[(22.0,)], "VOut")],
+            0.5,
+        )
+
+        air_restricts = [
+            field_id
+            for field_id, kind in gmsh.field.kinds.items()
+            if kind == "Restrict"
+            and gmsh.field.numbers.get((field_id, "VolumesList")) == [30.0, 31.0]
+        ]
+        self.assertEqual(len(air_restricts), 1)
+        distance_fields = [
+            field_id
+            for field_id, kind in gmsh.field.kinds.items()
+            if kind == "Distance"
+        ]
+        self.assertEqual(len(distance_fields), 1)
+        self.assertEqual(
+            gmsh.field.numbers[(distance_fields[0], "SurfacesList")],
+            [101.0, 102.0],
+        )
+        self.assertIsNotNone(gmsh.field.background)
 
     def test_swept_airbox_hmax_is_scaled_with_body_hmax(self) -> None:
         scale = 1e6

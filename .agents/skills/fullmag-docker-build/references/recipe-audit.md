@@ -4,6 +4,8 @@ Data audytu: 2026-10-18. Zakres: tylko odczyt worktree wybranego worktree zadani
 
 ## Dowód kompletności
 
+Hashe w tym rozdziale zapisują wejścia odczytu bazowego z 18.10.2026; nie są hashami bieżącego HEAD.
+
 - `justfile` ma 7514 linii, 716999 bajtów, SHA256 `5d0c021a54207c282aecfebf0ff663997441f11787400b9ddf77f1af28dace32`.
 - Wejścia route wrapperów: `scripts/just_storage_shell.sh` SHA256 `5855ef72b187eb812cb1c8bda9f7c75a2d663a0357b803ad7f54c6e2bbc6cb76`; `scripts/new-problem-verification.just` SHA256 `c4f9b4fb284608cf6043ddf1832151ce91f79dc0c65a3963bad5df60ed98ecda`.
 - `just --justfile .../justfile --dump --dump-format json` zakończył się kodem 0; dump zawiera 612 aktywnych recept. Parser źródła wykrywa dodatkowo 1 deklarację platformową `[windows]` (`verify-boris-fullmag-she-nf-windows`, linie 1217–1219), więc 613 deklaracji jest widocznych w pliku, a 612 jest aktywnych w bieżącym środowisku. Pełna lista deklaracji znajduje się w [manifeście TSV](recipe-inventory.tsv).
@@ -11,7 +13,121 @@ Data audytu: 2026-10-18. Zakres: tylko odczyt worktree wybranego worktree zadani
 - Próbka bazowej gałęzi `codex/docker-cpu-startup-20261018` wskazuje commit `dc2bc2698e2c72d254bc8b3edd709c32441825cf`; blob bazowego `justfile` ma SHA256 `04591409a5439a39f47f415557b29cd096380d56ee9db173899da2aa9d658014`. Różnica względem bieżącego pliku ogranicza się do dopisania `gpu_access="auto"` oraz `--gpu-access` w receptach `docker-dev` (linia 32), `docker-dev-recreate` (37) i `docker-dev-build` (46). Obecne argumenty CPU w `windows-build` (389), `windows-test-fem` (403), `build` (440), `run-topological-charge-skyrmion-smoke` (790), receptach relaksacji (1026, 1372), oraz kwalifikacji FEM (1526, 3002) są obecne również w bazowym blobie i nie powinny być przypisywane temu dirty diffowi.
 - Tożsamość i dirty status potwierdził agent nadrzędny natywnym Git dla Windows. Odczyt WSL Git nie interpretuje Windowsowego wskaźnika worktree.
 
+## Aktualizacja aktywnej trasy Docker DEV — źródło `9a798d280`
+
+Aktualny hash wrappera scripts/just_storage_shell.sh to
+1617d8746b330e01c3ad4fb6fb3f16e71a2ef5450aaf2ca79f42e1656bfe6e1e.
+Wartość 5855ef… powyżej należy do historycznego odczytu bazowego.
+
+Powyższy inwentarz justfile jest audytem bazowym z 18.10.2026. Jego wiersze
+`Docker dev` i `Docker dev Compose` opisują stan sprzed migracji i nie są opisem
+bieżącego HEAD. Dla codziennego `live-shadow-v1` aktualny przegląd źródeł daje:
+
+- jedynym wejściem developerskim pozostaje `just docker-dev-toolchain`, a potem
+  `just docker-dev <checkout> <port>`; `just docker-dev-build` jest aliasem
+  startu usług (`up`), nie osobnym build-only;
+- backend i frontend należą do grupy Compose wybranego checkoutu. Źródła są
+  readonly bindami; backend build/package, frontend state/cache oraz control
+  receipts/logs mają przypięte wolumeny nazwane; BuildKit/obrazy pozostają po
+  stronie Docker Engine;
+- hostowy `storage` nadal obsługuje rejestr projektu/worktree, blokady, małe
+  wskaźniki/operatorowe receipty, run evidence i host-ledger oraz dane
+  użytkownika. To nie jest miejsce na Cargo/CMake/pnpm/Next, staging, konteksty,
+  pakiety ani logi buildu;
+- `docker-all-*`, runner/frozen/release oraz natywne `just`-recepty są osobnymi
+  trasami, nie domyślnym DEV i nie fallbackiem dla tej grupy;
+- brak automatycznego GC wolumenów i BuildKit oraz brak quota pozostają luką
+  retencji. Usunięcie kontenera nie usuwa nazwanych wolumenów ani warstw/cache.
+  Cold build, start, inspect mountów, cache-hit po restarcie i HMR pozostają
+  `NOT VERIFIED` bez dowodu z Docker Desktop.
+
+Aktualny `justfile` ma 7516 linii, 717145 bajtów i SHA256
+`d52763ba8ac9e8e0daa63d3c4c61ed8fe53794866195044b863454495c44ee2d`.
+Zapisany wyżej hash `5d0c021a…` i rozmiar 7514/716999 opisują bazowy odczyt,
+nie obecny plik. Od źródła `69bfd1c44` doszły dwie linie komentarza
+oznaczające `docker-all-*` jako legacy; nie zmieniły recept. Bieżący dump
+`just --dump --dump-format json` nadal wykazuje 612 aktywnych recept.
+
+Tabela i hash justfile poniżej zachowują odtwarzalność pierwotnego audytu
+wszystkich 612 aktywnych recept. Przed użyciem innych rodzin niż codzienny DEV
+sprawdź ich bieżące źródła i platformową trasę; to PR nie migruje ich writerów.
+
+## Delta tras codegen — odczyt 19.10.2026
+
+Odczytowy `just --justfile justfile --dump --dump-format json` zwrócił kod 0
+oraz **614 aktywnych recept**. Nie uruchamiał ich ciał. Historyczny manifest TSV
+powyżej pozostaje bazą z 18.10; nie przedstawiaj jego 612 nazw jako bieżącego dumpa.
+
+- `justfile`: 7523 linie, 717681 bajtów, SHA256
+  `4d09df29dc01e54cd48130fb7f152155378a23b0b497c73f6ef3fc6b866b54e8`.
+- `scripts/just_storage_shell.sh`: 883 linie, 60947 bajtów, SHA256
+  `090a3cefec756f03fbf72548feec8d2b9f846161f94af8bde23c51abbf277e9c`.
+- Doszły `docker-dev-codegen` i `generate-api-openapi-legacy`;
+  `generate-api-openapi` zmienił trasę. Ta delta nie kwalifikuje pozostałych rodzin.
+
+| Recepta | Trasa i granica zapisu |
+| --- | --- |
+| `docker-dev-codegen <source>` | `docker_dev.py codegen-openapi` → `docker_dev_codegen.py`; wymaga już działających stałych usług wybranej grupy. Eksportuje OpenAPI z istniejącej binarki backendu i uruchamia generatory w istniejącym frontendzie. Nie buduje, nie restartuje ani nie tworzy kontenerów. |
+| `generate-api-openapi <source>` | Alias tej samej trasy codziennego DEV, z jawnym checkoutem. Wrapper przekazuje samo `source_root`, bez prefiksu argumentu. |
+| `generate-api-openapi-legacy` | Zachowana odrębna trasa release/CI przez `verify_session_persistence.py`; nie jest fallbackiem DEV ani trasą volume-only. |
+
+Codegen zapisuje staging w wolumenie frontendu, a techniczny receipt pod
+`/opt/fullmag/control/backend/codegen/openapi-v2/`. Na hoście publikuje tylko
+cztery wersjonowane źródła w `apps/control-room/src/kernel/api/generated/`:
+`openapi-v2.json`, `openapi-v2-types.ts`, `openapi-v2-client.ts` i
+`openapi-v2-paths.ts`. To zamierzona zmiana kodu, bez hostowego cache/logu buildu.
+Sprawdza obraz, mounty, provenance binarki i zmianę źródeł przed publikacją;
+zmiana checkoutu lub niedostępna usługa zamyka trasę zamiast uruchamiać inną.
+
+Dowody tego etapu: 15 lekkich testów Pythona codegen zaliczonych, w tym
+wykonywalny test wrappera z wybraną ścieżką zawierającą spację. Rzeczywiste
+wykonanie codegen w obu usługach pozostaje **NOT VERIFIED** do ich startu.
+
+## Integracja mastera PR #198 — bieżąca delta tras
+
+Po scaleniu źródeł `b48b2934df60b074d00fce7b01ea040180505ad4` odczytowy
+`just --dump --dump-format json` daje **620 aktywnych recept**. Delta 614
+powyżej opisuje stan sprzed tej integracji, a TSV nadal dokumentuje bazę.
+
+- `justfile`: 7546 linii, 720070 bajtów, SHA256 `baffe84779a79109dc6030ebb8ea55137034cd150e96dfbf8996915033ede2be`.
+- `scripts/just_storage_shell.sh`: 908 linii, 63438 bajtów, SHA256 `d034b607528372d6ec881a70837235bb5ef6e7c4e99b240ee1e592e9c31846d3`.
+
+Dołączyły `docker-dev-images`, `docker-dev-stop-failed`,
+`docker-dev-control-checks`, `docker-dev-resume`, `docker-dev-restart-idle`
+i `docker-dev-recreate-volume`. `docker_dev.py up` korzysta teraz z
+`docker_volume_dev.py`, a toolchain/helper images z `docker_build_control.py`.
+Receipty, konfiguracje i logi tej trasy są w build-control volume; wejście
+recreate przez hostowy receipt DEV jest wycofane. Wrapper zachowuje fixed-argv
+oraz nowe piny `attempt`/`config_sha256`; nie wykonuje dopasowanego tekstu
+komendy jako dowolnej powłoki. Dziewięć lekkich testów granicy shell PASS.
+
+Stosuj [przewodnik bieżących komend](../../../../docs/guides/docker-volume-development.md).
+Opis `_backend_start_inputs`, hostowego wskaźnika runu i frontend-cache-v2
+we wcześniejszych sekcjach jest historią poprzedniego launchera, nie mapą
+writerów nowego `docker_volume_dev.start`. Sam merge i dump nie kwalifikują
+runtime, HMR, restartu ani wykonania solvera.
+
+## Delta aktywacji skryptu — 19.10.2026
+
+Bieżący dump parsera ma **621 aktywnych recept**. Dodatkowa `docker-dev-script`
+wykonuje stały wrapper w istniejącym backendzie, bez Compose lifecycle,
+nowego kontenera aplikacji i przebudowy. Źródła są czytane z readonly bindu;
+autoryzacja i receipty pozostają w control volume. Piny oryginalnej próby
+mogą mieć powiązany, trwale zweryfikowany sukces resume/iteration. Wynik
+unknown nie jest automatycznie ponawiany. Aktywacja ładuje zweryfikowane
+bajty helpera wybranego worktree, również gdy launcher pochodzi z głównego
+checkoutu. Weryfikacja źródeł: 12 lekkich regresji aktywacji i 6 granicy argv
+PASS; runtime **NOT VERIFIED**.
+
+- `justfile`: 7550 linii, 720560 bajtów, SHA256 `c96cc146411e61b4f5fa53399a9f849c76a775e4ccc6ca9b93f8ffaa17bb7f0f`.
+- `scripts/just_storage_shell.sh`: 913 linii, 64054 bajty, SHA256 `49d4ec057e09fb9d0efc9cdcb0939bddeaf12f4aad105b08c5947a67eb2114b2`.
+
+Powyższe wcześniejsze delty pozostają historycznymi checkpointami. Nie
+przekwalifikowują pozostałych recept ani nie zmieniają bazowego manifestu TSV.
+
 ## Granica wspólna dla recept
+
+Od tego miejsca szczegółowy inwentarz rodzin i numery linii opisują audyt bazowy, nie bieżącą trasę Docker DEV. Aktualna trasa jest opisana wyżej; historyczne wiersze Docker dev i Docker dev Compose niżej zachowują dowód wcześniejszych writerów i nie są instrukcją uruchamiania.
 
 `justfile:1-6` ustawia `bash scripts/just_storage_shell.sh` jako shell. Wrapper ma jawne dispatch dla bootstrapu/Docker dev (`scripts/just_storage_shell.sh:115-160`), legacy runtime (`187-201`), Windows (`228-247`), Control Room/OpenAPI (`249-280`), runnera/benchmarków (`409-470`) oraz helperów (`474-802`). Wyjątki od inicjalizacji storage są ograniczone do odczytów/list (`386-399`).
 
@@ -23,8 +139,8 @@ Każda inna recepta przechodzi przez fallback (`scripts/just_storage_shell.sh:82
 
 | rodzina | recepty i źródło | trasa wejściowa | zapisy / ryzyko |
 |---|---|---|---|
-| Docker dev | `justfile:27-46`; `scripts/docker_dev.py` | `docker-dev-toolchain`, `docker-dev`, `docker-dev-recreate`, `docker-dev-recover-orphan`, `docker-dev-build` | Bootstrap tworzy hostowy kontekst/receipt (`bootstrap_docker_toolchain.py:223-332`). Docker dev tworzy hostowe `development-base-context` (`docker_dev.py:442-469`), image receipt/log (`729-806`, `1195-1231`), run root (`877-887`, `1918-2001`, `2094-2108`) oraz state/provenance/input binds. `docker-dev-build` wywołuje `up` (`2146-2160`), więc nie jest build-only. Bezpośrednie cache backendu są named volumes, ale overlay maintenance i receipty są hostowe (`1235-1320`).
-| Docker dev Compose | `compose.dev.yaml:15-50,81-116,130-194`; `frontend_dev.py:61-78,736-746,867-885,1117-1185` | backend/frontend stałej grupy | Backend ma named volumes `backend-cache-build` i `backend-cache-package`, lecz provenance (`compose.dev.yaml:93-100`) i frontend state/cache/log (`155-168`; `frontend_dev.py:1117-1185`) są bind-mountami hostowymi. To jest znany gap względem skillowego kontraktu Docker-volume-only.
+| Docker dev (historyczny stan bazowy) | `justfile:27-46`; `scripts/docker_dev.py` | `docker-dev-toolchain`, `docker-dev`, `docker-dev-recreate`, `docker-dev-recover-orphan`, `docker-dev-build` | Bootstrap tworzy hostowy kontekst/receipt (`bootstrap_docker_toolchain.py:223-332`). Docker dev tworzy hostowe `development-base-context` (`docker_dev.py:442-469`), image receipt/log (`729-806`, `1195-1231`), run root (`877-887`, `1918-2001`, `2094-2108`) oraz state/provenance/input binds. `docker-dev-build` wywołuje `up` (`2146-2160`), więc nie jest build-only. Bezpośrednie cache backendu są named volumes, ale overlay maintenance i receipty są hostowe (`1235-1320`).
+| Docker dev Compose (historyczny stan bazowy) | `compose.dev.yaml:15-50,81-116,130-194`; `frontend_dev.py:61-78,736-746,867-885,1117-1185` | backend/frontend stałej grupy | Backend ma named volumes `backend-cache-build` i `backend-cache-package`, lecz w historycznym stanie provenance (`compose.dev.yaml:93-100`) i frontend state/cache/log (`155-168`; `frontend_dev.py:1117-1185`) były bind-mountami hostowymi — był to gap względem kontraktu Docker-volume-only.
 | legacy all-Docker | `justfile:50-79`; `scripts/fullmag_docker_runtime.py:791-1036` | `docker-all-build`, `docker-all-image`, `docker-all-start`, `docker-all-dev`, `docker-all-dev-backend-build`, `docker-all-dev-image`, `docker-all-verify`, `docker-all-toolchain-bootstrap` | Osobna ścieżka kopiuje source capsule do `runs_root/<capture>/source`, tworzy kontekst, stage, provenance, image-id, logi i receipty (`791-957`, `961-1036`). Dubluje dzisiejszy `docker-dev`, ma odrębne project/group semantics i używa bezpośrednich operacji Docker.
 | runner/obrazy | `justfile:137-290`; wrapper `409-470` | `runner-image`, `runner-build-image`, `runner-coordinator-image`, `runner-coordinator-base`, `runner-coordinator-context`, frozen/BORIS image/build, `runner-*` lifecycle | `runner-image:137` i `runner-build-image:140` uruchamiają raw `docker build`; koordynator ma własne context/image/cache/log/retention. Nie jest to gwarantowana grupa `fullmag-master`/`fullmag-worktree-*`. Stop/cancel/retention/reconcile są operacjami cleanup lub state mutation.
 | Windows/native | `justfile:301-408`; `scripts/windows/run_fullmag.ps1:231-233,393-430,800-874,924-944` | setup/doctor/UI/workspace build/recover/backend-dev/archive/windows-build/windows-test-fem i Windows verify | Hostowe rooty build/cache/target, frontend staging i CARGO/FFM; odrębna ścieżka względem Compose volumes. Wymaga jawnego oznaczenia jako Windows-host route, nie dowodzi Docker dev.
@@ -94,6 +210,13 @@ Wejścia tego checkpointu, sprzed integracji mastera `fc50a43efa6a19ed10e03e1f9a
 Nowe/zmienione wejścia DEV: `docker-dev-toolchain`, `docker-dev-images`,
 `docker-dev`, `docker-dev-build`, `docker-dev-control-checks`, `docker-dev-resume`,
 `docker-dev-recreate-volume`, `docker-dev-restart-idle`, `docker-dev-stop-failed`.
+
+W zadaniu mixed-P1 dodano `docker-dev-stop-unadmitted`: wąskie zatrzymanie
+zewnętrznie odrzuconego startupu przed przyjęciem RunIntent. Wrapper przekazuje
+wyłącznie jawnie przypięte identyfikatory do `docker_dev.py stop-unadmitted`,
+bez hostowego `storage.run`. Dowody i journal trafiają do control volume;
+cache i dane użytkownika pozostają zachowane. Nowa recepta wymaga oddzielnego
+dowodu rzeczywistego graceful stopu; samo dodanie wpisu jej nie kwalifikuje.
 Bootstrap uruchamia `docker_build_control`; aplikacja używa `docker_volume_dev`.
 Wrapper przekazuje te ścisłe wzorce bez hostowego `storage.run`. Starszy
 `docker-dev-recreate` odmawia przed inicjalizacją hostowego logu/kontekstu.

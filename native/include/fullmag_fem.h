@@ -777,6 +777,43 @@ typedef struct {
 } fullmag_fem_plan_desc_v2;
 
 /*
+ * Native ownership/separation attestation for disconnected mixed-P1 magnetic
+ * bodies.  The runner derives node ownership from the realized cell markers;
+ * native validation recomputes ownership, magnetic bridge cells, and the
+ * exact positive AABB separation recorded by the producer before accepting
+ * the mixed operator route.  Air cells may join boundary nodes from multiple
+ * bodies because they remain part of the shared Poisson domain.
+ */
+#define FULLMAG_FEM_MIXED_BODY_CERTIFICATE_V2_ABI_VERSION 2u
+#define FULLMAG_FEM_MIXED_BODY_CONTACT_SEPARATED 1u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint64_t body_count;
+    const uint32_t *body_markers;
+    const uint64_t *body_node_offsets;
+    uint64_t body_node_offsets_len;
+    const uint32_t *body_node_indices;
+    uint64_t body_node_index_count;
+    uint64_t pair_count;
+    const uint32_t *pair_body_a;
+    const uint32_t *pair_body_b;
+    /* Exact positive distance between the realized body AABBs, in metres. */
+    const double *pair_min_gap_m;
+    const uint32_t *pair_contact_state;
+} fullmag_fem_mixed_body_certificate_v2;
+
+/* Versioned wrapper for the mixed-body ownership extension.  The v2 prefix is
+   retained byte-for-byte so existing v3 clients remain source/binary stable. */
+#define FULLMAG_FEM_PLAN_DESC_V3_ABI_VERSION 3u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    fullmag_fem_plan_desc_v2 base;
+    const fullmag_fem_mixed_body_certificate_v2 *mixed_body_certificate_v2;
+} fullmag_fem_plan_desc_v3;
+
+/*
  * Standalone M1 steady charge/spin transport ABI.
  *
  * This is intentionally separate from fullmag_fem_plan_desc and Context: the
@@ -3732,6 +3769,11 @@ FULLMAG_FEM_API fullmag_fem_backend *fullmag_fem_backend_create_v2(
 
 FULLMAG_FEM_API fullmag_fem_backend *fullmag_fem_backend_create_v3(
     const fullmag_fem_plan_desc_v2 *plan,
+    const fullmag_fem_adaptive_config_v2 *adaptive_config
+);
+
+FULLMAG_FEM_API fullmag_fem_backend *fullmag_fem_backend_create_v4(
+    const fullmag_fem_plan_desc_v3 *plan,
     const fullmag_fem_adaptive_config_v2 *adaptive_config
 );
 

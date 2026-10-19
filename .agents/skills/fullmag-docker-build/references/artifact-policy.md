@@ -60,10 +60,19 @@ builda/cache. Uprzywilejowane maintenance `nsenter` i host ledger mają osobny
 kontrakt. Migracja nie uprawnia do montowania Docker socketu w aplikacji.
 
 Rotacja logu w aplikacji nie ogranicza kopii utrzymywanej przez Docker logging
-driver. Sprawdź efektywny driver i jego limit bajtów/plików. Nie zapisuj tego
-samego pełnego strumienia równolegle w kilku miejscach bez uzasadnienia.
-Sekrety nie mogą trafić do manifestu, logu, image layer lub renderu zapisanego
-jako dowód. Hostowy `.env` to konfiguracja operatora, nie produkt buildu.
+driver. Daily Compose DEV przypina `json-file` z `max-size=10m` i `max-file=3`
+na usługę; traktuj to jako limit kopii stdout/stderr per kontener, nie limit
+named volumes ani BuildKit. Frontend trzyma jeden `next.log` w named volume i
+zeruje go przy starcie nowego procesu, ale pojedyncza długa sesja nadal może go
+powiększać. Archiwum `/opt/fullmag/package/.development/retired` przechowuje
+receipt i rotację, nie kopiuje pełnych logów, i ma limit 8 wpisów oraz 64 MiB
+payloadu. Stare archiwa z logiem są kandydatami do usunięcia po walidacji
+manifestu i drzewa; pełny hash legacy logu licz tylko dla wpisu, który mieści
+się w pozostawianym budżecie. Raportuj pozostałe granice jawnie i nie opisuj
+całego zużycia dysku jako bounded.
+Nie zapisuj tego samego pełnego strumienia równolegle w wielu miejscach bez
+uzasadnienia. Sekrety nie mogą trafić do manifestu, logu, image layer lub renderu
+zapisanego jako dowód. Hostowy `.env` to konfiguracja operatora, nie produkt buildu.
 
 ## Retencja jest częścią operacji, a nie późniejszym globalnym prune
 

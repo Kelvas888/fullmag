@@ -138,6 +138,9 @@ jobs:
       - name: Run runtime service sampler and control contracts
         run: cargo test -p fullmag-api --bin fullmag-runtime-service --no-fail-fast
 
+      - name: Run disconnected mixed-P1 v2 API summary contracts
+        run: cargo test -p fullmag-api --bin fullmag-api mixed_v2_summary_tests --no-fail-fast
+
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast
 
@@ -773,6 +776,12 @@ jobs:
       - name: Verify Docker storage probes and runtime lifecycle contracts
         run: |
           python -B scripts/test_fullmag_docker_runtime.py -v
+          python -B scripts/test_docker_container_runtime_recovery.py -v
+          python -B scripts/test_docker_volume_container_recovery.py -v
+          python -B scripts/test_docker_volume_dev_runtime_state.py -v
+          python -B scripts/test_docker_dev_owned_control.py -v
+          python -B scripts/test_docker_volume_receipts.py -v
+          python -B scripts/test_docker_volume_stop_unadmitted.py -v
           python -B scripts/test_docker_startup_script.py -v
           python -B scripts/test_docker_entrypoint_device_access.py -v
           python -B scripts/test_windows_folder_evidence.py -v

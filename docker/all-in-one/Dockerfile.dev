@@ -38,11 +38,36 @@ RUN mkdir -p /opt/fullmag/tooling/pnpm && \
 
 # These are image-owned mount points. Runtime bind mounts replace source,
 # package, provenance, state, and the Windows host certificate.
-RUN mkdir -p /opt/fullmag/source /opt/fullmag/package /opt/fullmag/control /state/development /run/fullmag && \
+RUN mkdir -p /opt/fullmag/source /opt/fullmag/package /opt/fullmag/control \
+    /opt/fullmag/runtime-control \
+    /state/development/workspace/apps/control-room/app \
+    /state/development/workspace/apps/control-room/src \
+    /state/development/workspace/apps/control-room/public \
+    /state/development/workspace/apps/control-room/scripts \
+    /run/fullmag && \
     touch /opt/fullmag/provenance.json && \
-    chown 65532:65532 /state /state/development /run/fullmag && \
+    chown 65532:65532 \
+        /state \
+        /state/development \
+        /state/development/workspace \
+        /state/development/workspace/apps \
+        /state/development/workspace/apps/control-room \
+        /state/development/workspace/apps/control-room/app \
+        /state/development/workspace/apps/control-room/src \
+        /state/development/workspace/apps/control-room/public \
+        /state/development/workspace/apps/control-room/scripts \
+        /run/fullmag /opt/fullmag/runtime-control && \
     chown root:root /opt/fullmag /opt/fullmag/docker_startup_script.py /opt/fullmag/fullmag_storage.py && \
-    chmod 0755 /opt/fullmag /opt/fullmag/source /opt/fullmag/package /state /run/fullmag && \
+    chmod 0755 \
+        /opt/fullmag /opt/fullmag/source /opt/fullmag/package \
+        /state /state/development /state/development/workspace \
+        /state/development/workspace/apps \
+        /state/development/workspace/apps/control-room \
+        /state/development/workspace/apps/control-room/app \
+        /state/development/workspace/apps/control-room/src \
+        /state/development/workspace/apps/control-room/public \
+        /state/development/workspace/apps/control-room/scripts \
+        /run/fullmag && \
     chmod 0644 /opt/fullmag/provenance.json && \
     chmod -R a+rX /opt/fullmag
 
@@ -54,13 +79,15 @@ LABEL org.fullmag.runtime="docker-all-gpu-v1" \
       org.fullmag.toolchain.dependencies="/opt/fullmag-deps/share/fullmag/dependency-versions.json"
 
 ENV FULLMAG_REPO_ROOT=/opt/fullmag/source \
-    FULLMAG_STATE_ROOT=/state/.fullmag \
-    FULLMAG_STATE_DIR=/state/.fullmag \
-    HOME=/state \
+    FULLMAG_RUNTIME_CONTROL_ROOT=/opt/fullmag/runtime-control \
+    FULLMAG_RUNTIME_SERVICES_ROOT=/opt/fullmag/runtime-control/runtime-services \
+    FULLMAG_STATE_ROOT=/opt/fullmag/runtime-control \
+    FULLMAG_STATE_DIR=/opt/fullmag/runtime-control \
+    HOME=/opt/fullmag/runtime-control \
     FULLMAG_PROJECT_STORAGE_ROOT=/state \
     FULLMAG_RUNS_ROOT=/state/runs/docker-all \
     FULLMAG_WORKTREE_ID=docker-all \
-    FULLMAG_RUNTIME_SERVICE_CONFIG=/state/.fullmag/runtime-service/docker-all.json \
+    FULLMAG_RUNTIME_SERVICE_CONFIG=/opt/fullmag/runtime-control/runtime-service/docker-all.json \
     FULLMAG_RUNTIME_ROOT=/opt/fullmag/package \
     FULLMAG_WEB_STATIC_DIR=/opt/fullmag/package/web \
     FULLMAG_API_PORT=8081 \
@@ -73,8 +100,8 @@ ENV FULLMAG_REPO_ROOT=/opt/fullmag/source \
     FULLMAG_FEM_REQUIRE_GPU=0 \
     FULLMAG_FEM_REQUIRE_CEED=1 \
     FULLMAG_FEM_MFEM_DEVICE="" \
-    FULLMAG_FEM_MESH_CACHE_DIR=/state/.fullmag/mesh-cache \
-    CUDA_CACHE_PATH=/state/cuda-cache \
+    FULLMAG_FEM_MESH_CACHE_DIR=/build/cache/fem-mesh \
+    CUDA_CACHE_PATH=/build/cache/cuda-compute \
     OMP_NUM_THREADS=4 \
     FULLMAG_CPU_THREADS=4
 ENV PATH=/opt/fullmag/package/bin:/opt/fullmag-deps/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin

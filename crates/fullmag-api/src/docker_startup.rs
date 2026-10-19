@@ -147,12 +147,20 @@ pub(crate) async fn activate_current_live_startup(
         request_scope_epoch: format!("{}:{session_epoch}", state.request_scope_instance_id),
     };
 
-    // Commit the complete Study with the immutable manual gate first.  The
-    // accepted preparation scheduler can only produce native FEM evidence for
-    // a durable RunIntent; direct current-scene materialization would either
-    // fabricate that evidence or reject FEM before the accepted run exists.
-    let accepted =
-        match crate::live_accepted_execution::submit_live_study_with_transition_with_asset_root(
+    // Publish the temporary owner before doing any expensive Python/Gmsh
+    // preparation.  Status and current-run reads can now observe `activating`
+    // while the transition fence is available to other requests.
+    publish_startup_placeholder(&state, &context).await?;
+    drop(transition);
+
+    // Preparation is side-effect free with respect to accepted durable state:
+    // it does not publish RunIntent, CAS, or the run catalog. Python/Gmsh may
+    // still create bounded mesh/cache/staging artifacts in the workspace; the
+    // temporary source snapshot is RAII-cleaned and those assets are not an
+    // accepted execution by themselves. If this HTTP future is cancelled, the
+    // blocking task cannot create a durable run behind the caller's back.
+    let prepared =
+        crate::live_accepted_execution::prepare_live_study_with_asset_root(
             &state,
             &context,
             loaded.scene.clone(),
@@ -161,38 +169,98 @@ pub(crate) async fn activate_current_live_startup(
             false,
             Some(source_root),
         )
-        .await
-        {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                // Preserve the failed owner record and its source identity.  A
-                // later request must not silently replace a possibly partially
-                // committed accepted run after an unknown failure.
-                mark_startup_failure(&state, &context, &request, &loaded, &error).await;
-                return Err(error);
-            }
-        };
+        .await;
 
-    if let Err(error) =
-        crate::router_v2::handlers::simulation::commands::publish_accepted_live_study_under_transition(
+    // Reacquire the fence only after preparation.  The exact placeholder
+    // session/run/epoch and full SceneDocument content must still match before
+    // any durable accepted RunIntent is created.
+    let transition = state.current_live_session_transition.lock().await;
+    if let Err(error) = crate::live_accepted_execution::validate_live_scene_for_context(
         &state,
         &context,
-        &accepted.run_id,
-        &accepted.step_ids,
-        "waiting_for_compute",
+        &loaded.scene,
     )
     .await
     {
-        // The accepted run is durable, but it has not yet been rebound to the
-        // live read model.  Keep the temporary startup owner fenced so a retry
-        // cannot publish a second RunIntent after an unknown failure.
+        // A replacement or scene edit won the fence.  Do not mark the new
+        // scene failed and do not create a RunIntent for the stale preparation.
+        return Err(error);
+    }
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            mark_startup_failure(&state, &context, &request, &loaded, &error).await;
+            return Err(error);
+        }
+    };
+
+    // Acquire the current-live write guard before the synchronous durable
+    // commit. Prepare the complete in-memory candidate first; after the
+    // commit succeeds, assigning this already validated value is infallible
+    // and happens before any further await.
+    let mut current = state.current_live_state.write().await;
+    let snapshot = current
+        .as_mut()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    let session_epoch = state.current_live_session_epoch.load(Ordering::Acquire);
+    crate::ensure_current_live_request_context(snapshot, &context, session_epoch)?;
+    let startup_metadata = json!({
+        STARTUP_METADATA_KEY: {
+            "request": request,
+            "request_id": request.request_id,
+            "source_sha256": loaded.source.sha256,
+            "source_size_bytes": loaded.source.size_bytes,
+            "status": "waiting_for_compute",
+            "run_id": &prepared.run_id,
+            "step_ids": &prepared.step_ids,
+            "scene_revision": loaded.scene.revision,
+            "runtime_metadata": loaded.runtime,
+        }
+    });
+    let mut accepted_snapshot = snapshot.clone();
+    if let Err(error) =
+        crate::router_v2::handlers::simulation::commands::apply_accepted_live_study_snapshot(
+            &mut accepted_snapshot,
+            &context,
+            session_epoch,
+            &prepared.run_id,
+            &prepared.step_ids,
+            "waiting_for_compute",
+            Some(startup_metadata),
+        )
+    {
+        drop(current);
         mark_startup_failure(&state, &context, &request, &loaded, &error).await;
         return Err(error);
     }
 
-    // Publication changes the live run identity from the temporary startup
-    // placeholder to the accepted durable run.  Every subsequent read and
-    // write must carry that new identity through the same transition fence.
+    let accepted = match crate::live_accepted_execution::commit_prepared_live_accepted(&prepared)
+    {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            // The write guard remains held, and no state mutation follows a
+            // failed commit. There is no detached writer after this branch.
+            drop(current);
+            mark_startup_failure(&state, &context, &request, &loaded, &error).await;
+            return Err(error);
+        }
+    };
+    *snapshot = accepted_snapshot;
+    let realtime_snapshot = snapshot.clone();
+    drop(current);
+
+    // Realtime publication is deliberately after the synchronous state bind:
+    // a cancelled websocket publication cannot leave a durable accepted run
+    // without the minimum current-live run/metadata/step_ids view.
+    // Preserve event order against session replacement. The helper owns the
+    // transition guard through the accepted event publication and releases it
+    // only after the event has entered the realtime stream.
+    publish_accepted_startup_realtime(&state, &realtime_snapshot, transition).await?;
+
+    // The synchronous publication above changes the live run identity from
+    // the temporary startup placeholder to the accepted durable run. Every
+    // subsequent read and write carries that new identity through the same
+    // transition fence.
     let accepted_context = CurrentLiveRequestContext {
         session_id: context.session_id.clone(),
         run_id: Some(accepted.run_id.clone()),
@@ -207,7 +275,6 @@ pub(crate) async fn activate_current_live_startup(
     // transition while waiting: Stop, replacement, and recovery must be able
     // to acquire the same owner fence.  The preparation helper takes that
     // fence only around each bounded publication attempt.
-    drop(transition);
     let preparation =
         crate::live_scene_preparation::publish_accepted_frontier_preparation(
             &state,
@@ -864,6 +931,47 @@ fn replay_or_reject(
     }))
 }
 
+/// Make the temporary startup owner visible before Python/Gmsh preparation.
+/// This keeps the browser on a truthful `activating` state while the
+/// transition mutex is free for status and replacement/recovery context checks.
+/// Startup activation has no accepted run yet, so command admission remains
+/// bounded until the accepted snapshot is published.
+async fn publish_startup_placeholder(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+) -> Result<(), ApiError> {
+    let snapshot = state
+        .current_live_state
+        .read()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        &snapshot,
+        context,
+        state.current_live_session_epoch.load(Ordering::Acquire),
+    )?;
+    let display_revision = state.current_display_selection.read().await.revision;
+    let realtime =
+        crate::current_live_realtime_state_from_snapshot(state, &snapshot, display_revision).await;
+    crate::publish_current_live_realtime_batch_changed(state, &realtime, false, 0).await
+}
+
+async fn publish_accepted_startup_realtime(
+    state: &Arc<AppState>,
+    snapshot: &crate::types::SessionStateResponse,
+    transition: tokio::sync::MutexGuard<'_, ()>,
+) -> Result<(), ApiError> {
+    let display_revision = state.current_display_selection.read().await.revision;
+    let realtime_state =
+        crate::current_live_realtime_state_from_snapshot(state, snapshot, display_revision).await;
+    let result =
+        crate::publish_current_live_realtime_batch_changed(state, &realtime_state, false, 0).await;
+    drop(transition);
+    result
+}
+
 async fn publish_startup_result(
     state: &Arc<AppState>,
     context: &CurrentLiveRequestContext,
@@ -1065,5 +1173,120 @@ mod tests {
                 wait_for_solve: true
             }
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_startup_realtime_publication_blocks_replacement_until_send() {
+        let state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        let mut accepted_snapshot = state
+            .current_live_state
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("accepted startup fixture must have a current snapshot");
+        let accepted_run_id = "accepted-startup-run".to_string();
+        accepted_snapshot.session.run_id = accepted_run_id.clone();
+        accepted_snapshot.session.status = "awaiting_command".to_string();
+        accepted_snapshot.run = Some(RunManifest {
+            run_id: accepted_run_id.clone(),
+            session_id: accepted_snapshot.session.session_id.clone(),
+            status: "waiting_for_compute".to_string(),
+            total_steps: 1,
+            final_time: None,
+            final_e_ex: None,
+            final_e_demag: None,
+            final_e_ext: None,
+            final_e_ani: None,
+            final_e_dmi: None,
+            final_e_rotated_dmi: None,
+            final_e_total: None,
+            artifact_dir: ".".to_string(),
+        });
+        accepted_snapshot.state_version = accepted_snapshot.state_version.saturating_add(1);
+        *state.current_live_state.write().await = Some(accepted_snapshot.clone());
+
+        let hook = crate::types::CurrentLiveRealtimeBeforeSendHook {
+            admitted: Arc::new(tokio::sync::Notify::new()),
+            resume: Arc::new(tokio::sync::Notify::new()),
+        };
+        *state.current_live_realtime_before_send_hook.lock().await = Some(hook.clone());
+        let mut events = state.current_live_realtime_events.subscribe();
+
+        // This is the same transition guard held by startup while it binds
+        // the accepted snapshot and publishes its first realtime event.
+        let transition = state.current_live_session_transition.lock().await;
+        let mut publication = Box::pin(publish_accepted_startup_realtime(
+            &state,
+            &accepted_snapshot,
+            transition,
+        ));
+        tokio::select! {
+            _ = hook.admitted.notified() => {}
+            result = &mut publication => {
+                panic!("accepted startup publication must pause before sending: {result:?}");
+            }
+        }
+        assert!(
+            state.current_live_session_transition.try_lock().is_err(),
+            "startup transition must remain held until the accepted event is sent"
+        );
+
+        let replacement_state = state.clone();
+        let replacement_started = Arc::new(tokio::sync::Notify::new());
+        let replacement_started_signal = replacement_started.clone();
+        let replacement = tokio::spawn(async move {
+            replacement_started_signal.notify_one();
+            crate::router_v2::handlers::sessions::create(
+                axum::extract::State(replacement_state),
+                axum::Json(crate::schemas::sessions::CreateSessionRequest {
+                    name: "Replacement".to_string(),
+                    backend: "fem".to_string(),
+                    device: "cpu".to_string(),
+                    precision: "double".to_string(),
+                    replace_current: true,
+                    output_storage: None,
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            replacement_started.notified(),
+        )
+        .await
+        .expect("replacement must start while accepted publication is paused");
+
+        hook.resume.notify_one();
+        publication
+            .await
+            .expect("accepted startup realtime publication must succeed");
+
+        let accepted_event =
+            tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                .await
+                .expect("accepted startup event must be published")
+                .expect("realtime channel must remain open");
+        let accepted_event: crate::schemas::realtime::LiveRealtimeServerEvent =
+            serde_json::from_str(&accepted_event.json)
+                .expect("accepted startup event must serialize");
+        match accepted_event {
+            crate::schemas::realtime::LiveRealtimeServerEvent::ResourceBatchChanged {
+                session_id,
+                run_id,
+                ..
+            } => {
+                assert_eq!(session_id, accepted_snapshot.session.session_id);
+                assert_eq!(run_id.as_deref(), Some(accepted_run_id.as_str()));
+            }
+            other => panic!("expected accepted startup resource event, got {other:?}"),
+        }
+
+        let replacement = tokio::time::timeout(std::time::Duration::from_millis(100), replacement)
+            .await
+            .expect("replacement must proceed after accepted startup publication")
+            .expect("replacement task must complete")
+            .expect("replacement must be admitted");
+        assert_eq!(replacement.0, axum::http::StatusCode::CREATED);
     }
 }

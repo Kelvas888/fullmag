@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   normalizeOpenApiBuildIdentity,
   validateDockerOpenApiReceipt,
+  validateDirectComposeOpenApiReceipt,
   validateManagedOpenApiIdentity,
   validateNativeOpenApiReceipt,
 } from "./normalize-openapi-build-identity.mjs";
@@ -247,5 +248,60 @@ test("Docker receipt binds source, image, package hashes and successful terminal
       ),
       /Docker (assembly|export proof)/,
     );
+  }
+});
+
+
+function directEvidence() {
+  const document = nativeDocument("dirty");
+  const expected = {
+    expectedCommit: "a".repeat(40),
+    expectedSnapshot: "b".repeat(64),
+    expectedSourceDigest: "c".repeat(64),
+    inputSha256: "d".repeat(64),
+    inputByteLength: 321,
+  };
+  const proof = {
+    schema: "fullmag.direct-compose-openapi-codegen.v1",
+    state: "succeeded",
+    exit_code: 0,
+    compose_project: "fullmag-worktree-example",
+    backend_container_id: "backend-container-id",
+    frontend_container_id: "frontend-container-id",
+    source_commit: expected.expectedCommit,
+    source_snapshot_sha256: expected.expectedSnapshot,
+    source_digest: expected.expectedSourceDigest,
+    source_identity: {
+      git_commit: expected.expectedCommit,
+      source_snapshot_sha256: expected.expectedSnapshot,
+      source_digest: expected.expectedSourceDigest,
+      worktree_state: "dirty",
+      native_source_identity_sha256: "e".repeat(64),
+    },
+    backend_build_receipt_sha256: "f".repeat(64),
+    backend_provenance_sha256: "1".repeat(64),
+    api_binary_sha256: "2".repeat(64),
+    raw_openapi_sha256: expected.inputSha256,
+    raw_openapi_bytes: expected.inputByteLength,
+    stderr_sha256: "3".repeat(64),
+    stderr_bytes: 0,
+    source_probe_live_manifest_sha256: "4".repeat(64),
+  };
+  return { document, proof, expected };
+}
+
+test("accepts direct Compose codegen proof and rejects source or raw-byte drift", () => {
+  const evidence = directEvidence();
+  validateDirectComposeOpenApiReceipt(evidence.document, evidence.proof, evidence.expected);
+  for (const mutate of [
+    (item) => { item.raw_openapi_sha256 = "5".repeat(64); },
+    (item) => { item.source_identity.worktree_state = "clean"; },
+    (item) => { item.source_digest = "7".repeat(64); },
+  ]) {
+    const changed = structuredClone(evidence.proof);
+    mutate(changed);
+    assert.throws(() => validateDirectComposeOpenApiReceipt(
+      evidence.document, changed, evidence.expected,
+    ), /Direct Compose codegen proof/);
   }
 });

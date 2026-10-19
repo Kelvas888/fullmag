@@ -287,6 +287,28 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(storage.StorageError):
             storage.initialize(layout)
 
+    def test_docker_runtime_initialization_omits_host_build_roots(self):
+        layout = self.resolve(profile="docker-all-gpu")
+
+        storage.initialize_runtime(layout)
+
+        root = Path(layout["storage_root"])
+        self.assertTrue((root / "index").is_dir())
+        self.assertTrue((root / "locks").is_dir())
+        self.assertTrue(Path(layout["runs_root"]).is_dir())
+        for field in ("build_root", "cache_root", "temp_root", "runtime_root", "frontend_root"):
+            with self.subTest(field=field):
+                self.assertFalse(Path(layout[field]).exists())
+
+    def test_complete_initialization_still_creates_managed_build_roots(self):
+        layout = self.resolve(profile="windows-native-fdm-cpu-dev")
+
+        storage.initialize(layout)
+
+        for field in ("build_root", "cache_root", "temp_root", "runtime_root", "frontend_root", "runs_root"):
+            with self.subTest(field=field):
+                self.assertTrue(Path(layout[field]).is_dir())
+
     def test_same_build_lock_rejects_concurrent_writer(self):
         layout = self.resolve()
         storage.initialize(layout)

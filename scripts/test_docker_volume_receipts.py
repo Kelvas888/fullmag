@@ -28,6 +28,110 @@ class VolumeReceiptTests(unittest.TestCase):
         with self.assertRaises(module.RuntimeServiceError):
             module.canonical_paths({'FULLMAG_PACKAGE_PROVENANCE':'/state/user-data.json'})
 
+    def test_successful_ledger_probe_is_archived_and_retired_before_backend_observation(self):
+        import json
+        import docker_volume_dev as dev
+        import docker_host_ledger as ledger
+        import fullmag_docker_runtime as runtime
+        from subprocess import CompletedProcess
+        control = mock.Mock(project='fullmag-master', volume='fullmag-control-test')
+        operation = {'root': 'resume/attempts/check', 'receipt': {'attempt': 'a' * 32}}
+        written = {}
+        events = []
+        control.write.side_effect = lambda path, value: written.__setitem__(path, value)
+        image = 'sha256:' + 'b' * 64
+        probe_id = 'c' * 64
+        probe_name = 'fullmag-ledger-verify-' + 'a' * 32
+        def text(*arguments, **kwargs):
+            if arguments == ('inspect', probe_name):
+                return json.dumps([{'Id': probe_id, 'Image': image,
+                    'State': {'Running': False, 'ExitCode': 0},
+                    'Config': {'Labels': {'com.docker.compose.project': control.project}}}])
+            if arguments == ('logs', probe_name):
+                return 'successful verify log'
+            if arguments == ('inspect', 'backend-id'):
+                return json.dumps([{'Id': 'backend-id'}])
+            raise AssertionError(arguments)
+        def retire(*arguments, **kwargs):
+            self.assertEqual(arguments, ('rm', probe_id))
+            self.assertIn(operation['root'] + '/ledger-verify-log.json', written)
+            self.assertIn(operation['root'] + '/ledger-verify-receipt.json', written)
+            events.append('retired')
+            return CompletedProcess([], 0, b'', b'')
+        def failed_backend(*arguments):
+            events.append('backend-observation')
+            raise BuildControlError('backend exited')
+        with mock.patch.object(dev, '_operator_probe_record_from_retained', return_value={}), \
+             mock.patch.object(dev, '_wait_for_publication', return_value=({}, {})), \
+             mock.patch.object(dev, 'compose_capture', return_value=b''), \
+             mock.patch.object(dev, 'docker_text', side_effect=text), \
+             mock.patch.object(dev, 'docker_capture', side_effect=retire), \
+             mock.patch.object(runtime, '_assembly_from_backend_start', return_value={}), \
+             mock.patch.object(runtime, '_complete_backend_storage_preflight'), \
+             mock.patch.object(ledger, '_parse_json_lines', return_value={'schema': 'verified'}), \
+             mock.patch.object(ledger, '_validate_host_receipt'), \
+             mock.patch.object(ledger, 'validate_container', side_effect=failed_backend):
+            with self.assertRaisesRegex(BuildControlError, 'backend exited'):
+                dev._finish(control, operation,
+                    {'services': {'backend': {'environment': {'FULLMAG_DOCKER_DEVICE_ACCESS': 'gpu'}}}},
+                    'backend-id', 'frontend-id', Path('/source'), Path('/state'), Path('/certificate'),
+                    {'restart_verified': True}, {}, {'image_id': image}, image, Path('/git'),
+                    {'maintenance_document': {}, 'project_id': 'project',
+                     'mount_root': '/ledger', 'backing_image': '/ledger.ext4'}, 3197)
+        self.assertEqual(events, ['retired', 'backend-observation'])
+
+    def test_invalid_compose_stops_before_daemon_mutation_boundary(self):
+        import docker_volume_dev as dev
+        operation = {'receipt': {}, 'daemon_pending': False}
+        control = mock.Mock(project='fullmag-master')
+        with mock.patch.object(dev, 'compose_capture', side_effect=BuildControlError('undefined volume')) as capture:
+            with self.assertRaisesRegex(BuildControlError, 'undefined volume'):
+                dev._start_compose_services(control, operation, {'name': control.project})
+        self.assertFalse(operation['daemon_pending'])
+        self.assertEqual(capture.call_args.args[1:], ('config', '--format', 'json'))
+
+    def test_toolchain_config_binds_context_before_compose_interpolation(self):
+        import json
+        import os
+        from subprocess import CompletedProcess
+        import docker_build_control as control
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            with mock.patch.dict(os.environ, {'FULLMAG_TOOLCHAIN_CONTEXT': '/wrong/checkout'}), \
+                 mock.patch.object(control, 'docker_capture', return_value=CompletedProcess([], 0, b'{}', b'')) as capture:
+                self.assertEqual(control.toolchain_configuration(repo, {'project_name': 'fullmag-master'}), {})
+            environment = capture.call_args.kwargs['env']
+            self.assertEqual(environment['FULLMAG_TOOLCHAIN_CONTEXT'], str(repo))
+            self.assertEqual(environment['FULLMAG_COMPOSE_PROJECT'], 'fullmag-master')
+            self.assertTrue(environment['FULLMAG_BUILD_CONTROL_VOLUME'])
+
+    def test_retained_operator_controls_ignore_host_changes_and_reject_overlay_drift(self):
+        import copy
+        import os
+        import docker_volume_dev as dev
+        values = {'FULLMAG_MIXED_P1_DEVICE': 'cpu', 'FULLMAG_ARTIFACT_FIELD_STORAGE': 'zarr'}
+        record = dev._operator_probe_record(values)
+        document = {'services': {
+            'backend': {'environment': {'FULLMAG_MIXED_P1_DEVICE': 'gpu',
+                                        'FULLMAG_ARTIFACT_FIELD_STORAGE': 'json'}},
+            'frontend': {'environment': {}, 'volumes': [{
+                'source': 'build-control', 'target': '/opt/fullmag/control',
+                'read_only': True, 'volume': {'subpath': 'frontend'}}]},
+        }}
+        dev._reassert_operator_probe_environment(document, record)
+        with mock.patch.dict(os.environ, {'FULLMAG_MIXED_P1_DEVICE': 'gpu'}):
+            self.assertEqual(dev._operator_probe_record_from_retained(record, document), record)
+        changed = copy.deepcopy(document)
+        changed['services']['backend']['environment']['FULLMAG_MIXED_P1_DEVICE'] = 'gpu'
+        with self.assertRaisesRegex(BuildControlError, 'differs from its receipt'):
+            dev._operator_probe_record_from_retained(record, changed)
+        changed = copy.deepcopy(document)
+        changed['services']['frontend']['volumes'][0]['volume'].pop('subpath')
+        with self.assertRaisesRegex(BuildControlError, 'restricted control-volume subpath'):
+            dev._operator_probe_record_from_retained(record, changed)
+        with self.assertRaisesRegex(BuildControlError, 'digest'):
+            dev._operator_probe_record_from_fields({**record, 'operator_probe_environment_sha256': '0'*64}, label='test')
+
     def test_previous_package_is_ignored_until_current_start_handoff(self):
         import json
         import subprocess
@@ -106,7 +210,7 @@ class VolumeReceiptTests(unittest.TestCase):
         import json
         from subprocess import CompletedProcess
         import docker_volume_dev as dev
-        control = BuildControl({'project_name': 'fullmag-master', 'worktree_id': 'owned'}, 'sha256:' + 'a' * 64)
+        control = BuildControl({'project_name': 'fullmag-master', 'worktree_id': 'owned', 'project_id': 'test-project', 'checkout_kind': 'master'}, 'sha256:' + 'a' * 64)
         key = 'b' * 64
         name = 'fullmag-dev-frontend-v1-' + key[:24]
         labels = {k: v for k, v in control.labels.items() if k.startswith('org.fullmag.')}
@@ -119,7 +223,7 @@ class VolumeReceiptTests(unittest.TestCase):
             docker.assert_called_once_with('volume', 'inspect', name, allow_failure=True)
 
     def test_build_control_accepts_canonical_bootstrap_labels_and_rejects_foreign_project(self):
-        identity = {'project_name': 'fullmag-master', 'worktree_id': 'test-worktree'}
+        identity = {'project_name': 'fullmag-master', 'worktree_id': 'test-worktree', 'project_id': 'test-project', 'checkout_kind': 'master'}
         control = BuildControl(identity, 'sha256:' + 'a' * 64)
         volume = {'Name': control.volume, 'Driver': 'local', 'Options': None,
                   'Labels': dict(control.shared_labels)}
@@ -174,17 +278,17 @@ class VolumeReceiptTests(unittest.TestCase):
                                        receipt_path=location)
 
     def test_just_guard_admits_device_policy_without_shell_tail(self):
-        wrapper = (Path(__file__).resolve().parents[1] / 'scripts/just_storage_shell.sh').read_text(encoding='utf-8')
-        assignment = next(line.strip() for line in wrapper.splitlines() if line.strip().startswith('docker_dev_pattern='))
+        from test_just_orphan_recovery_shell import DockerDevelopmentShellBoundaryTests
+        guard = DockerDevelopmentShellBoundaryTests()
         base = 'python "D:/repo/scripts/docker_dev.py" --repo-root "D:/repo" '
         for action in ('build', "up --port '3202'"):
             for policy in ('auto', 'required', 'disabled'):
                 recipe = base + action + " --gpu-access '" + policy + "' --source-root 'D:/owned/worktree' "
-                for suffix, expected in (('', 0), ('; echo injected', 1)):
+                for suffix, expected in (('', 0), ('; echo injected', 2)):
                     with self.subTest(action=action, policy=policy, suffix=suffix):
-                        result = subprocess.run(['bash', '-c', assignment + '\n[[ "$1" =~ ${docker_dev_pattern} ]]',
-                                                 'recipe-guard', recipe + suffix], capture_output=True)
+                        result = guard.dispatch(recipe + suffix)
                         self.assertEqual(result.returncode, expected, result.stderr)
+                        self.assertNotIn('injected', result.stdout)
 
     def test_control_paths_cannot_address_host_or_parent_files(self):
         for path in ('../active', '/control/active', '/opt/fullmag/control/active', 'a/../../active', 'C:/host/data', "a'; touch /bad"):

@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 import sys
 
@@ -159,12 +160,62 @@ class BackendVolumeCacheMaintenanceTests(unittest.TestCase):
                 self.assertTrue(readback.read_bytes().startswith(b"fullmag-cache-readback:"))
             self.assertFalse((package / helper.MARKER_NAME).exists())
             self.assertFalse((package / helper.READBACK_NAME).exists())
+            control_root = root / "control"
+            expected_namespaces = {
+                "frontend": "frontend",
+                "runtime-control": "runtime-control",
+            }
+            for name, relative in expected_namespaces.items():
+                namespace = control_root / name
+                marker_path = namespace / helper.CONTROL_MARKER_NAME
+                marker_document = json.loads(marker_path.read_text(encoding="utf-8"))
+                self.assertEqual(marker_document["state"], "owned")
+                self.assertEqual(marker_document["volume_name"], self._environment()["FULLMAG_BUILD_CONTROL_VOLUME"])
+                self.assertEqual(marker_document["namespace"], f"{helper.CONTROL_ROOT}/{relative}")
+                self.assertEqual((namespace.stat().st_uid, namespace.stat().st_gid), (uid, gid))
+            runtime_services = control_root / "runtime-control" / "runtime-services"
+            self.assertTrue(runtime_services.is_dir())
+            self.assertEqual((runtime_services.stat().st_uid, runtime_services.stat().st_gid), (uid, gid))
+            self.assertFalse((runtime_services / helper.CONTROL_MARKER_NAME).exists())
             self.assertEqual(
                 backend._package_children(
                     package, "empty backend package", exclude_development_control=True
                 ),
                 {},
             )
+
+    def test_control_children_are_created_before_parent_ownership_handoff(self):
+        # Emulate the missing DAC_OVERRIDE capability even on a test host
+        # where root has broader privileges or the test runs unprivileged.
+        opened = helper._open_child_directory
+        finalize = helper._finalize_guest_root
+        handed_off = set()
+
+        def identity(fd):
+            info = os.fstat(fd)
+            return info.st_dev, info.st_ino
+
+        def open_child(parent, name, uid, gid, label):
+            if identity(parent) in handed_off:
+                raise helper.MaintenanceError("parent was handed off before child creation")
+            descriptor = opened(parent, name, uid, gid, label)
+            handed_off.discard(identity(descriptor))
+            return descriptor
+
+        def handoff(directory, uid, gid):
+            finalize(directory, uid, gid)
+            handed_off.add(identity(directory))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            control = Path(temporary) / "control"
+            control.mkdir()
+            uid, gid = self._test_owner()
+            with mock.patch.object(helper, "_open_child_directory", side_effect=open_child), mock.patch.object(
+                helper, "_finalize_guest_root", side_effect=handoff
+            ):
+                for _ in range(2):
+                    helper._ensure_control_namespace(control, "control-test", uid, gid)
+            self.assertTrue((control / "runtime-control" / "runtime-services").is_dir())
 
     def test_legacy_package_pair_moves_without_copy_or_user_file_loss(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -482,6 +533,124 @@ class BackendVolumeCacheMaintenanceTests(unittest.TestCase):
                         (marker_root / helper.READBACK_NAME).stat().st_uid,
                         uid,
                     )
+
+    @staticmethod
+    def _frontend_identity(uid: int | None = None, gid: int | None = None) -> dict[str, object]:
+        return {
+            "project_id": "fullmag-worktree-demo",
+            "cache_key": "a" * 64,
+            "volume_name": "fullmag-worktree-demo-frontend-dev-v2-" + "a" * 32,
+            "uid": os.getuid() if uid is None else uid,
+            "gid": os.getgid() if gid is None else gid,
+        }
+
+    def test_frontend_state_provisions_exact_parents_without_recursing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            state.mkdir()
+            state.chmod(0o755)
+            control_room = state / "workspace/apps/control-room"
+            for name in ("app", "src", "public", "scripts"):
+                (control_room / name / "nested").mkdir(parents=True)
+                (control_room / name / "nested/source.ts").write_text(
+                    "live source\n", encoding="utf-8"
+                )
+            user_file = control_room / "components.json"
+            user_file.write_bytes(b"keep\n")
+            identity = self._frontend_identity()
+
+            first = helper._ensure_frontend_state_subtree(state, identity)
+            second = helper._ensure_frontend_state_subtree(state, identity)
+
+            self.assertEqual(first, second)
+            self.assertEqual(
+                first["directories"],
+                [
+                    helper.FRONTEND_STATE_ROOT,
+                    helper.FRONTEND_WORKSPACE_ROOT,
+                    helper.FRONTEND_APPS_ROOT,
+                    helper.FRONTEND_APP_ROOT,
+                    *[
+                        f"{helper.FRONTEND_APP_ROOT}/{name}"
+                        for name in helper.FRONTEND_LIVE_DIRECTORY_NAMES
+                    ],
+                ],
+            )
+            self.assertEqual(user_file.read_bytes(), b"keep\n")
+            self.assertEqual(
+                (control_room / "app/nested/source.ts").read_text(encoding="utf-8"),
+                "live source\n",
+            )
+            for relative in (
+                Path("workspace"),
+                Path("workspace/apps"),
+                Path("workspace/apps/control-room"),
+                *(Path("workspace/apps/control-room") / name for name in helper.FRONTEND_LIVE_DIRECTORY_NAMES),
+            ):
+                directory = state / relative
+                self.assertEqual((directory.stat().st_uid, directory.stat().st_gid),
+                                 (identity["uid"], identity["gid"]))
+
+    def test_frontend_state_foreign_marker_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            state.mkdir()
+            state.chmod(0o755)
+            marker = state / helper.FRONTEND_STATE_MARKER_NAME
+            marker.write_bytes(b'{"foreign":true}\n')
+            before = marker.read_bytes()
+            with self.assertRaises(helper.MaintenanceError):
+                helper._ensure_frontend_state_subtree(state, self._frontend_identity())
+            self.assertEqual(marker.read_bytes(), before)
+
+    def test_frontend_state_recovers_root_parents_without_changing_live_files(self):
+        if os.geteuid() != 0:
+            self.skipTest("root ownership recovery requires CAP_CHOWN")
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            control_room = state / "workspace/apps/control-room"
+            for name in helper.FRONTEND_LIVE_DIRECTORY_NAMES:
+                (control_room / name).mkdir(parents=True)
+            live_file = control_room / "app/source.ts"
+            live_file.write_bytes(b"source\n")
+            identity = self._frontend_identity(helper.DEFAULT_OWNER_UID, helper.DEFAULT_OWNER_GID)
+
+            helper._ensure_frontend_state_subtree(state, identity)
+
+            for relative in (
+                Path("."),
+                Path("workspace"),
+                Path("workspace/apps"),
+                Path("workspace/apps/control-room"),
+                *(Path("workspace/apps/control-room") / name for name in helper.FRONTEND_LIVE_DIRECTORY_NAMES),
+            ):
+                directory = state / relative
+                self.assertEqual(
+                    (directory.stat().st_uid, directory.stat().st_gid),
+                    (helper.DEFAULT_OWNER_UID, helper.DEFAULT_OWNER_GID),
+                )
+            self.assertEqual(live_file.read_bytes(), b"source\n")
+            self.assertEqual((live_file.stat().st_uid, live_file.stat().st_gid), (0, 0))
+
+    def test_frontend_environment_requires_fixed_production_owner(self):
+        environment = {
+            "FULLMAG_FRONTEND_STATE_SCHEMA": helper.FRONTEND_STATE_SCHEMA,
+            "FULLMAG_FRONTEND_STATE_PROFILE": helper.FRONTEND_STATE_PROFILE,
+            "FULLMAG_FRONTEND_STATE_MAINTENANCE_PROFILE": helper.FRONTEND_STATE_MAINTENANCE_PROFILE,
+            "FULLMAG_FRONTEND_STATE_MAINTENANCE_ACTION": "ensure",
+            "FULLMAG_FRONTEND_STATE_ROOT": helper.FRONTEND_STATE_ROOT,
+            "FULLMAG_FRONTEND_STATE_PROJECT_ID": "fullmag-worktree-demo",
+            "FULLMAG_FRONTEND_STATE_CACHE_KEY": "a" * 64,
+            "FULLMAG_FRONTEND_STATE_VOLUME": "fullmag-worktree-demo-frontend-dev-v2-" + "a" * 32,
+            "FULLMAG_FRONTEND_STATE_OWNER_UID": "65532",
+            "FULLMAG_FRONTEND_STATE_OWNER_GID": "65532",
+        }
+        identity = helper._frontend_environment(environment)
+        self.assertEqual(identity["uid"], helper.DEFAULT_OWNER_UID)
+        environment["FULLMAG_FRONTEND_STATE_OWNER_UID"] = str(os.getuid())
+        if os.getuid() != helper.DEFAULT_OWNER_UID:
+            with self.assertRaises(helper.MaintenanceError):
+                helper._frontend_environment(environment)
 
     def test_production_contract_keeps_uid_and_fixed_guest_roots(self):
         self.assertEqual(helper.DEFAULT_OWNER_UID, 65532)

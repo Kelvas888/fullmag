@@ -10,7 +10,26 @@ import urllib.request
 from typing import Any, Mapping
 
 
-BACKEND_RECEIPT_PATH = Path("/state/.fullmag/runtime-service/process-tree.json")
+RUNTIME_CONTROL_ROOT = Path("/opt/fullmag/runtime-control")
+
+
+def backend_receipt_path(environment: Mapping[str, str] | None = None) -> Path:
+    """Resolve the PID-1 receipt from the technical runtime volume."""
+
+    environment = os.environ if environment is None else environment
+    root = Path(environment.get("FULLMAG_RUNTIME_CONTROL_ROOT", str(RUNTIME_CONTROL_ROOT)))
+    value = Path(
+        environment.get(
+            "FULLMAG_RUNTIME_PROCESS_RECEIPT",
+            str(root / "runtime-service/process-tree.json"),
+        )
+    )
+    if not value.is_absolute() or any(part == ".." for part in value.parts):
+        raise RuntimeError("FULLMAG_RUNTIME_PROCESS_RECEIPT must be absolute without traversal")
+    return value
+
+
+BACKEND_RECEIPT_PATH = backend_receipt_path()
 MAX_BACKEND_RECEIPT_BYTES = 512 * 1024
 # The native control probe may use three seconds before Windows-folder I/O.
 BACKEND_LIVENESS_TIMEOUT_SECONDS = 5.0

@@ -161,6 +161,63 @@ export function validateManagedSnapshotOpenApiReceipt(document, receipt, proof, 
   }
 }
 
+// Direct DEV codegen binds the raw export to the already-running Compose
+// services and to the backend source identity observed in that service.  It is
+// intentionally a separate contract from frozen/release package exports.
+export function validateDirectComposeOpenApiReceipt(document, proof, expected) {
+  const {
+    expectedCommit,
+    expectedSnapshot,
+    expectedSourceDigest,
+    inputSha256,
+    inputByteLength,
+  } = expected ?? {};
+  if (!isCommit(expectedCommit) ||
+      ![expectedSnapshot, expectedSourceDigest, inputSha256].every(isSha256) ||
+      !Number.isSafeInteger(inputByteLength) || inputByteLength <= 0) {
+    throw new TypeError("Direct Compose codegen requires complete source and raw-byte hashes");
+  }
+
+  const identity = document?.["x-fullmag-build-identity"];
+  if (!identity || typeof identity !== "object" || Array.isArray(identity) ||
+      identity.git_commit !== expectedCommit ||
+      identity.source_snapshot_sha256 !== expectedSnapshot ||
+      !["clean", "dirty"].includes(identity.worktree_state) ||
+      !isBuildTimestamp(identity.built_at_utc)) {
+    throw new TypeError("Direct Compose OpenAPI export does not match the backend source identity");
+  }
+
+  if (!proof || typeof proof !== "object" || Array.isArray(proof) ||
+      proof.schema !== "fullmag.direct-compose-openapi-codegen.v1" ||
+      proof.state !== "succeeded" || proof.exit_code !== 0 ||
+      !isNonEmptyString(proof.compose_project) ||
+      !isNonEmptyString(proof.backend_container_id) ||
+      !isNonEmptyString(proof.frontend_container_id) ||
+      proof.source_commit !== expectedCommit ||
+      proof.source_snapshot_sha256 !== expectedSnapshot ||
+      proof.source_digest !== expectedSourceDigest ||
+      proof.raw_openapi_sha256 !== inputSha256 ||
+      proof.raw_openapi_bytes !== inputByteLength ||
+      !isSha256(proof.backend_build_receipt_sha256) ||
+      !isSha256(proof.backend_provenance_sha256) ||
+      !isSha256(proof.api_binary_sha256) ||
+      !isSha256(proof.stderr_sha256) ||
+      !Number.isSafeInteger(proof.stderr_bytes) || proof.stderr_bytes < 0 ||
+      !isSha256(proof.source_probe_live_manifest_sha256)) {
+    throw new TypeError("Direct Compose codegen proof is incomplete or does not bind the raw export");
+  }
+
+  const sourceIdentity = proof.source_identity;
+  if (!sourceIdentity || typeof sourceIdentity !== "object" || Array.isArray(sourceIdentity) ||
+      sourceIdentity.git_commit !== expectedCommit ||
+      sourceIdentity.source_snapshot_sha256 !== expectedSnapshot ||
+      sourceIdentity.source_digest !== expectedSourceDigest ||
+      sourceIdentity.worktree_state !== identity.worktree_state ||
+      !isSha256(sourceIdentity.native_source_identity_sha256)) {
+    throw new TypeError("Direct Compose codegen proof has an invalid source identity");
+  }
+}
+
 // Docker exports are admitted only when the raw bytes, source pins, package
 // hashes, image identity and successful export terminal state agree. The
 // caller supplies hashes obtained from the bounded files it actually read.

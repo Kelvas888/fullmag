@@ -227,11 +227,15 @@ service and starts the `backend` and `frontend` services:
 ```powershell
 Set-Location $worktree
 just docker-dev-toolchain
-just docker-dev "$worktree" 3197
+just docker-dev
 ```
 
-The toolchain command uses the checkout containing the invoked `justfile`;
-run both commands from the selected worktree. It builds a dependency image
+The commands share the same source selection. Explicit source arguments and
+process settings take precedence; a selected worktree takes precedence over
+main-checkout defaults. The wizard writes `FULLMAG_SOURCE_ROOT` and
+`FULLMAG_HTTP_PORT` to the main `.env`; older host-settings records remain
+readable. An omitted port uses those settings, then `3197`. Run both commands
+from the selected worktree. The toolchain command builds a dependency image
 through Compose/BuildKit, whose progress appears in the command output or
 Docker Desktop Builds. Application compilation and runtime stay in the same
 permanent backend container. No separate application builder is started.
@@ -296,14 +300,31 @@ just docker-dev "$worktree" 3197 `
   "examples/fem_relax_gpu_smoke.py"
 ```
 
-The referenced example is tracked in this repository. The requested
-`examples/permalloy_layer_cofeb_rings_relax_300nm.py` is also tracked, but the
-current startup validation rejects this two-material rings example with
-`material_count_not_one`; it is not a current FEM GPU smoke proof. A script
+The referenced example is tracked in this repository. The two-material
+`examples/permalloy_layer_cofeb_rings_relax_300nm.py` additionally requires
+mixed-P1 certificate v2 and disconnected-body material lowering. Its managed
+FEM GPU execution is **NOT VERIFIED** in this development change. A script
 that sets `study.wait_for_solve(True)` (for example,
 `examples/fem_de_smoke_numeric.py`) publishes an interactive activation that
 waits for Compute and does not silently switch from GPU to CPU. A start without
 `--script` opens Home and does not select an arbitrary saved session.
+
+For an already healthy group with an empty Workspace, activate a script
+without restarting or rebuilding either service:
+
+```powershell
+just docker-dev-script "examples/fem_relax_gpu_smoke.py"
+```
+
+The launcher discovers the exact attempt, configuration hash, and live pair
+from the group control volume. It retains the running frontend port, including
+an explicit override used at startup. Manual pins remain available through
+`docker-dev-script-pinned`. A successful linked resume is accepted without overwriting the
+failed-start history. The command keeps the current-session and request fences;
+it does not replace an existing active simulation. An unknown activation result
+blocks automatic retry. See the [activation guide](docs/guides/docker-volume-development.md#aktywacja-skryptu-w-już-działającym-workspace)
+for the receipt locations and optional replay request ID. Source-level checks
+pass; this command still requires a real runtime activation test.
 
 ### Ports, isolation, and persistence
 
@@ -315,15 +336,40 @@ checkout uses Compose project `fullmag-master`; a registered worktree uses
 frontend reaches it as `backend:8081` over the private bridge network for the
 selected Compose project. Project name, network, port, workspace settings, and
 user data are derived per registered checkout, so a worktree does not share a
-frontend port or `workspace.db` with the main checkout. The launcher persists sessions,
-results, logs, receipts, and build/cache state under the configured storage
-resolver; group user data includes `storage/user-data/<compose-project>/workspace.db`.
+frontend port or `workspace.db` with the main checkout. Sessions, results,
+projects and settings remain in the configured Windows storage; group settings
+include `storage/user-data/<compose-project>/workspace.db`. Build cache,
+packages, build logs and technical receipts belong to Docker named volumes
+and BuildKit. Small runtime admission records and host-ledger evidence retain
+their explicit host-storage contract.
 
 Do not run a plain `docker compose up` for this workspace. The managed launcher
 attests the source bind, package and dependency identities, Windows storage,
 host ledger, owner record, startup response, and resolved Compose configuration
 before it starts the services. Keep the exact receipts and stop evidence when a
 start or build fails.
+
+### OpenAPI and TypeScript generation in development
+
+After both services are running with the current backend sources, use the
+selected checkout in native PowerShell:
+
+```powershell
+Set-Location $worktree
+just docker-dev-codegen "$worktree"
+# Equivalent daily-development recipe:
+just generate-api-openapi "$worktree"
+```
+
+The command uses the existing `backend` and `frontend` containers. Backend
+OpenAPI export, frontend generators and staging stay in their Docker volumes;
+only the four versioned API source artifacts are published to the checkout.
+It verifies source, container, image and volume identities before publication.
+Receipts stay in the group's control volume. It does not start services or
+rebuild stale backend sources: restart that group's backend first. The separate
+`generate-api-openapi-legacy` recipe is reserved for explicitly documented
+release/CI gates. This development route still requires runtime verification
+in addition to its source tests.
 
 ### Development and release inputs
 

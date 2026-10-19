@@ -219,6 +219,34 @@ odświeżania certyfikatu dla każdej zmiany kodu. Cofnięcie delegacji wymaga
 potwierdzonego zatrzymania i jawnego wdrożenia zgodnego pakietu z dokładnym
 certyfikatem; zachowuje sesje, wyniki i dotychczasowe dowody.
 
+## Faza przygotowania startupu poza blokadą sesji
+
+Aktywacja pliku `.py` rozdziela przygotowanie sceny od trwałego przyjęcia runu.
+Eksport sceny, kompilacja planu oraz materializacja geometrii/Gmsh działają poza
+`current_live_session_transition`. W tym czasie read model publikuje tymczasowego
+właściciela `activating`, więc status i bieżący run nie czekają na Gmsh.
+
+Przygotowanie nie publikuje żadnego accepted durable state: anulowanie żądania
+albo zmiana sesji nie może zapisać RunIntent, CAS ani katalogu runu. Samo
+przygotowanie może jednak wygenerować ograniczone pliki siatki, cache lub stagingu
+w workspace; są one artefaktami przygotowania, a nie zaakceptowanym wykonaniem,
+i podlegają istniejącej retencji. Tymczasowy snapshot źródła jest usuwany przez
+RAII. Po zakończeniu backend ponownie przejmuje blokadę i sprawdza dokładną sesję,
+placeholder run, epoch, revision oraz serializowaną treść SceneDocument. Dopiero
+po tej bramce, z write guardem `current_live_state` już przejętym, wykonuje
+synchronizowany, ograniczony commit RunIntent/katalogu i natychmiast przypisuje
+wcześniej zweryfikowany snapshot zawierający run, startup metadata i step IDs.
+Dopiero potem może nastąpić await publikacji realtime. Niezgodność sceny kończy
+starą aktywację bez oznaczania nowej sceny jako uszkodzonej.
+
+To rozdzielenie jest wymagane dla responsywnego Control Room; samo przeniesienie
+`drop(transition)` za funkcję, która już zapisuje RunIntent, jest błędem, ponieważ
+anulowany `spawn_blocking` mógłby dokończyć zapis po zwolnieniu blokady. Regresja
+powinna sprawdzać zmianę revision, zmianę treści przy tej samej revision oraz
+brak trwałego zapisu przed ponowną bramką kontekstu. Pełne sprawdzenie wymaga
+CI/backend runtime z rzeczywistą materializacją Gmsh; patch źródłowy nie jest
+dowodem kwalifikacji GPU ani kompletnego startu aplikacji.
+
 ## Wdrożenie i weryfikacja
 
 1. Dodać typowane `build-then-serve` w `backend_dev.py`: istniejący lock, Make,

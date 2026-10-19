@@ -26,6 +26,9 @@ PROBE_SCHEMA = "fullmag.backend-build-cache-probe.v2"
 RECEIPT_SCHEMA = "fullmag.backend-build-cache-maintenance.v2"
 PROFILE = "backend-build-cache-v2"
 MAINTENANCE_PROFILE = "backend-build-cache-v2-maintenance"
+FRONTEND_STATE_SCHEMA = "fullmag.frontend-development-state-owner.v1"
+FRONTEND_STATE_PROFILE = "fullmag-frontend-cache-v2"
+FRONTEND_STATE_MAINTENANCE_PROFILE = "fullmag-frontend-state-maintenance-v1"
 BUILD_ROLE = "build"
 PACKAGE_ROLE = "package"
 CONTROL_ROLE = "control"
@@ -33,6 +36,13 @@ BUILD_ROOT = "/build"
 PACKAGE_ROOT = "/opt/fullmag/package"
 CONTROL_ROOT = "/opt/fullmag/control"
 CONTROL_BACKEND_ROOT = "/opt/fullmag/control/backend"
+FRONTEND_STATE_ROOT = "/state/development"
+FRONTEND_WORKSPACE_ROOT = "/state/development/workspace"
+FRONTEND_APPS_ROOT = "/state/development/workspace/apps"
+FRONTEND_APP_ROOT = "/state/development/workspace/apps/control-room"
+FRONTEND_LIVE_DIRECTORY_NAMES = ("app", "src", "public", "scripts")
+FRONTEND_STATE_MARKER_NAME = ".fullmag-frontend-state-owner.json"
+FRONTEND_STATE_READBACK_NAME = ".fullmag-frontend-state-readback"
 PACKAGE_DEVELOPMENT_DIRNAME = ".development"
 PACKAGE_CACHE_CONTROL_DIRNAME = "cache-maintenance"
 MARKER_NAME = ".fullmag-backend-cache-owner.json"
@@ -594,13 +604,14 @@ def _write_new_record(directory: int, name: str, value: Mapping[str, Any], uid: 
 
 
 def _ensure_marker(
-    directory: int, marker: Mapping[str, Any], uid: int, gid: int
+    directory: int, marker: Mapping[str, Any], uid: int, gid: int, *,
+    marker_name: str = MARKER_NAME,
 ) -> bytes:
     try:
-        existing, metadata = _read_record(directory, MARKER_NAME, MAX_MARKER_BYTES)
+        existing, metadata = _read_record(directory, marker_name, MAX_MARKER_BYTES)
     except FileNotFoundError:
-        _write_new_record(directory, MARKER_NAME, marker, uid, gid)
-        existing, metadata = _read_record(directory, MARKER_NAME, MAX_MARKER_BYTES)
+        _write_new_record(directory, marker_name, marker, uid, gid)
+        existing, metadata = _read_record(directory, marker_name, MAX_MARKER_BYTES)
     if existing != dict(marker):
         raise MaintenanceError("cache maintenance marker is foreign or incomplete")
     if (metadata.st_uid, metadata.st_gid) != (uid, gid):
@@ -608,8 +619,8 @@ def _ensure_marker(
             raise MaintenanceError("cache maintenance marker owner is not exact")
         # Recover an interrupted ownership handoff without changing content.
         original_metadata = metadata
-        _chown_record(directory, MARKER_NAME, uid, gid)
-        recovered = os.stat(MARKER_NAME, dir_fd=directory, follow_symlinks=False)
+        _chown_record(directory, marker_name, uid, gid)
+        recovered = os.stat(marker_name, dir_fd=directory, follow_symlinks=False)
         if (recovered.st_dev, recovered.st_ino) != (
             original_metadata.st_dev,
             original_metadata.st_ino,
@@ -622,6 +633,20 @@ def _ensure_marker(
     if len(raw) > MAX_MARKER_BYTES:
         raise MaintenanceError("cache maintenance marker is too large")
     return raw
+
+
+def _ensure_frontend_marker(
+    directory: int, marker: Mapping[str, Any], uid: int, gid: int
+) -> bytes:
+    """Validate the frontend state marker without following or replacing it."""
+
+    return _ensure_marker(
+        directory,
+        marker,
+        uid,
+        gid,
+        marker_name=FRONTEND_STATE_MARKER_NAME,
+    )
 
 
 def _ensure_shared_marker(
@@ -644,6 +669,64 @@ def _ensure_shared_marker(
     if len(raw) > MAX_MARKER_BYTES:
         raise MaintenanceError("shared control marker is too large")
     return raw
+
+
+def _ensure_control_subnamespace(
+    parent: int,
+    name: str,
+    subpath: str,
+    role: str,
+    control_volume_name: str,
+    uid: int,
+    gid: int,
+    *,
+    child_directories: tuple[tuple[str, str], ...] = (),
+) -> tuple[bytes, int]:
+    """Provision children before handing their parent to the backend owner."""
+
+    directory = _open_child_directory(
+        parent, name, uid, gid, f"{role} control namespace"
+    )
+    try:
+        if not _entry_present(directory, CONTROL_MARKER_NAME):
+            try:
+                entries = os.listdir(directory)
+            except OSError as error:
+                raise MaintenanceError(f"cannot inspect {role} control namespace") from error
+            if entries:
+                raise MaintenanceError(
+                    f"{role} control namespace is nonempty without its owner marker"
+                )
+        marker = {
+            "schema": CONTROL_NAMESPACE_SCHEMA,
+            "state": "owned",
+            "role": role,
+            "volume_name": control_volume_name,
+            "mount": CONTROL_ROOT,
+            "namespace": f"{CONTROL_ROOT}/{subpath}",
+        }
+        marker_raw = _ensure_marker(
+            directory, marker, uid, gid, marker_name=CONTROL_MARKER_NAME
+        )
+        _prepare_readback(directory, uid, gid)
+        _probe_readback(
+            directory, marker_raw, uid, gid, marker_name=CONTROL_MARKER_NAME
+        )
+        # CAP_CHOWN does not bypass DAC. Once this parent belongs to the
+        # backend, root can no longer create children in its 0755 directory.
+        # Complete the fixed subtree while we still own the parent.
+        for child_name, child_label in child_directories:
+            child = _open_child_directory(directory, child_name, uid, gid, child_label)
+            try:
+                _finalize_guest_root(child, uid, gid)
+            finally:
+                os.close(child)
+        _finalize_guest_root(directory, uid, gid)
+        _fsync_directory_fd(parent, f"{role} control parent")
+        return marker_raw, directory
+    except BaseException:
+        os.close(directory)
+        raise
 
 
 def _ensure_control_namespace(
@@ -694,15 +777,32 @@ def _ensure_control_namespace(
             _finalize_guest_root(namespace, uid, gid)
         finally:
             os.close(namespace)
+
+        frontend_marker_raw, frontend = _ensure_control_subnamespace(
+            root, "frontend", "frontend", "frontend", control_volume_name, uid, gid
+        )
+        os.close(frontend)
+        runtime_marker_raw, runtime = _ensure_control_subnamespace(
+            root, "runtime-control", "runtime-control", "runtime-control",
+            control_volume_name, uid, gid,
+            child_directories=(("runtime-services", "native runtime-services store"),),
+        )
+        os.close(runtime)
         _fsync_directory_fd(root, "shared control root")
         return root_marker_raw, namespace_marker_raw
     finally:
         os.close(root)
 
 
-def _prepare_readback(directory: int, uid: int, gid: int) -> None:
+def _prepare_readback(
+    directory: int,
+    uid: int,
+    gid: int,
+    *,
+    readback_name: str = READBACK_NAME,
+) -> None:
     try:
-        with _open_maintenance_record(directory, READBACK_NAME, os.O_RDONLY) as (
+        with _open_maintenance_record(directory, readback_name, os.O_RDONLY) as (
             descriptor,
             metadata,
         ):
@@ -711,7 +811,7 @@ def _prepare_readback(directory: int, uid: int, gid: int) -> None:
     except FileNotFoundError:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
         try:
-            descriptor = os.open(READBACK_NAME, flags, 0o600, dir_fd=directory)
+            descriptor = os.open(readback_name, flags, 0o600, dir_fd=directory)
         except OSError as error:
             raise MaintenanceError("cannot create cache maintenance readback") from error
         try:
@@ -729,8 +829,8 @@ def _prepare_readback(directory: int, uid: int, gid: int) -> None:
         if (metadata.st_uid, metadata.st_gid) != (0, 0) or os.geteuid() != 0:
             raise MaintenanceError("cache maintenance readback owner is foreign")
         original_metadata = metadata
-        _chown_record(directory, READBACK_NAME, uid, gid)
-        recovered = os.stat(READBACK_NAME, dir_fd=directory, follow_symlinks=False)
+        _chown_record(directory, readback_name, uid, gid)
+        recovered = os.stat(readback_name, dir_fd=directory, follow_symlinks=False)
         if (recovered.st_dev, recovered.st_ino) != (
             original_metadata.st_dev,
             original_metadata.st_ino,
@@ -742,7 +842,9 @@ def _prepare_readback(directory: int, uid: int, gid: int) -> None:
 
 
 def _probe_readback(
-    directory: int, marker_raw: bytes, uid: int, gid: int
+    directory: int, marker_raw: bytes, uid: int, gid: int, *,
+    marker_name: str = MARKER_NAME,
+    readback_name: str = READBACK_NAME,
 ) -> None:
     """Write/read a bounded probe through the CAP_CHOWN record handoff.
 
@@ -762,7 +864,7 @@ def _probe_readback(
 
     def run() -> None:
         flags = os.O_WRONLY | os.O_TRUNC
-        with _open_maintenance_record(directory, READBACK_NAME, flags) as (descriptor, _):
+        with _open_maintenance_record(directory, readback_name, flags) as (descriptor, _):
             offset = 0
             while offset < len(token):
                 written = os.write(descriptor, token[offset:])
@@ -770,14 +872,200 @@ def _probe_readback(
                     raise MaintenanceError("short write during cache maintenance readback")
                 offset += written
             os.fsync(descriptor)
-        with _open_maintenance_record(directory, READBACK_NAME, os.O_RDONLY) as (descriptor, _):
+        with _open_maintenance_record(directory, readback_name, os.O_RDONLY) as (descriptor, _):
             if _read_bounded(descriptor, MAX_READBACK_BYTES) != token:
                 raise MaintenanceError("cache maintenance readback changed during reopen")
-        with _open_maintenance_record(directory, MARKER_NAME, os.O_RDONLY) as (descriptor, _):
+        with _open_maintenance_record(directory, marker_name, os.O_RDONLY) as (descriptor, _):
             if _read_bounded(descriptor, MAX_MARKER_BYTES).rstrip(b"\n") != marker_raw:
                 raise MaintenanceError("cache maintenance marker failed user readback")
 
     run()
+
+
+def _frontend_required(environment: Mapping[str, str], name: str) -> str:
+    value = environment.get(name)
+    if not isinstance(value, str) or not value:
+        raise MaintenanceError(f"frontend state maintenance environment is missing {name}")
+    return value
+
+
+def _frontend_identifier(environment: Mapping[str, str], name: str) -> str:
+    value = _frontend_required(environment, name)
+    if (
+        len(value) > 255
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for character in value)
+        or value[0] in ".-_"
+    ):
+        raise MaintenanceError(f"frontend state maintenance identifier is invalid: {name}")
+    return value
+
+
+def _frontend_digest(environment: Mapping[str, str], name: str) -> str:
+    value = _frontend_required(environment, name)
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise MaintenanceError(f"frontend state maintenance digest is invalid: {name}")
+    return value
+
+
+def _frontend_owner(environment: Mapping[str, str]) -> tuple[int, int]:
+    values: list[int] = []
+    for name in (
+        "FULLMAG_FRONTEND_STATE_OWNER_UID",
+        "FULLMAG_FRONTEND_STATE_OWNER_GID",
+    ):
+        value = _frontend_required(environment, name)
+        try:
+            parsed = int(value, 10)
+        except ValueError as error:
+            raise MaintenanceError(f"frontend state maintenance owner id is invalid: {name}") from error
+        if parsed < 0 or parsed > 65535:
+            raise MaintenanceError(f"frontend state maintenance owner id is invalid: {name}")
+        values.append(parsed)
+    if tuple(values) != (DEFAULT_OWNER_UID, DEFAULT_OWNER_GID):
+        raise MaintenanceError("frontend state maintenance must target uid/gid 65532")
+    return values[0], values[1]
+
+
+def _frontend_environment(environment: Mapping[str, str]) -> dict[str, Any]:
+    if _frontend_required(environment, "FULLMAG_FRONTEND_STATE_SCHEMA") != FRONTEND_STATE_SCHEMA:
+        raise MaintenanceError("frontend state maintenance schema mismatch")
+    if _frontend_required(environment, "FULLMAG_FRONTEND_STATE_PROFILE") != FRONTEND_STATE_PROFILE:
+        raise MaintenanceError("frontend state maintenance profile mismatch")
+    if _frontend_required(environment, "FULLMAG_FRONTEND_STATE_MAINTENANCE_PROFILE") != FRONTEND_STATE_MAINTENANCE_PROFILE:
+        raise MaintenanceError("frontend state maintenance action profile mismatch")
+    if _frontend_required(environment, "FULLMAG_FRONTEND_STATE_MAINTENANCE_ACTION") != "ensure":
+        raise MaintenanceError("frontend state maintenance action mismatch")
+    if _frontend_required(environment, "FULLMAG_FRONTEND_STATE_ROOT") != FRONTEND_STATE_ROOT:
+        raise MaintenanceError("frontend state maintenance root mismatch")
+    uid, gid = _frontend_owner(environment)
+    return {
+        "project_id": _frontend_identifier(environment, "FULLMAG_FRONTEND_STATE_PROJECT_ID"),
+        "cache_key": _frontend_digest(environment, "FULLMAG_FRONTEND_STATE_CACHE_KEY"),
+        "volume_name": _frontend_identifier(environment, "FULLMAG_FRONTEND_STATE_VOLUME"),
+        "uid": uid,
+        "gid": gid,
+    }
+
+
+def _ensure_frontend_state_subtree(
+    state_root: str | os.PathLike[str],
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Provision only the fixed parents below the frontend state volume.
+
+    Docker creates the parent directories for nested source bind mounts before
+    it starts the unprivileged frontend.  A root-owned 0755 ``control-room``
+    directory then prevents the frontend from writing its generated manifest
+    and dependency links.  This function deliberately opens only the known
+    path components and never walks or chowns their children.  The four live
+    source directories are mount points, so their contents remain untouched.
+    """
+
+    uid = int(identity["uid"])
+    gid = int(identity["gid"])
+    root = _open_guest_root(state_root, uid, gid)
+    opened: list[int] = []
+    marker: dict[str, Any] = {
+        "schema": FRONTEND_STATE_SCHEMA,
+        "state": "owned",
+        "profile": FRONTEND_STATE_PROFILE,
+        "project_id": identity["project_id"],
+        "cache_key": identity["cache_key"],
+        "volume_name": identity["volume_name"],
+        "root": FRONTEND_STATE_ROOT,
+        "workspace": FRONTEND_WORKSPACE_ROOT,
+        "apps": FRONTEND_APPS_ROOT,
+        "control_room": FRONTEND_APP_ROOT,
+        "live_directories": list(FRONTEND_LIVE_DIRECTORY_NAMES),
+        "uid": uid,
+        "gid": gid,
+    }
+    try:
+        marker_raw = _ensure_frontend_marker(root, marker, uid, gid)
+        _prepare_readback(root, uid, gid, readback_name=FRONTEND_STATE_READBACK_NAME)
+        _probe_readback(
+            root,
+            marker_raw,
+            uid,
+            gid,
+            marker_name=FRONTEND_STATE_MARKER_NAME,
+            readback_name=FRONTEND_STATE_READBACK_NAME,
+        )
+
+        parent = root
+        for name, label in (
+            ("workspace", "frontend workspace parent"),
+            ("apps", "frontend apps parent"),
+            ("control-room", "frontend Control Room parent"),
+        ):
+            child = _open_child_directory(parent, name, uid, gid, label)
+            opened.append(child)
+            parent = child
+
+        for name in FRONTEND_LIVE_DIRECTORY_NAMES:
+            live = _open_child_directory(
+                parent,
+                name,
+                uid,
+                gid,
+                f"frontend live bind target {name}",
+            )
+            try:
+                # The target itself is handed to the backend owner.  No
+                # recursive operation is allowed: source files are supplied
+                # by a separate readonly bind when the frontend is created.
+                _finalize_guest_root(live, uid, gid)
+            finally:
+                os.close(live)
+
+        for directory in reversed(opened):
+            _finalize_guest_root(directory, uid, gid)
+        _finalize_guest_root(root, uid, gid)
+        _fsync_directory_fd(root, "frontend state root")
+        return {
+            "marker": marker,
+            "directories": [
+                FRONTEND_STATE_ROOT,
+                FRONTEND_WORKSPACE_ROOT,
+                FRONTEND_APPS_ROOT,
+                FRONTEND_APP_ROOT,
+                *[f"{FRONTEND_APP_ROOT}/{name}" for name in FRONTEND_LIVE_DIRECTORY_NAMES],
+            ],
+        }
+    finally:
+        for directory in reversed(opened):
+            os.close(directory)
+        os.close(root)
+
+
+def ensure_frontend_state(
+    state_root: str | os.PathLike[str] = FRONTEND_STATE_ROOT,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Recover the exact frontend state parents with CAP_CHOWN only."""
+
+    identity = _frontend_environment(os.environ if environment is None else environment)
+    layout = _ensure_frontend_state_subtree(state_root, identity)
+    return {
+        "schema": FRONTEND_STATE_SCHEMA,
+        "profile": FRONTEND_STATE_PROFILE,
+        "maintenance_profile": FRONTEND_STATE_MAINTENANCE_PROFILE,
+        "state": "ready",
+        "project_id": identity["project_id"],
+        "cache_key": identity["cache_key"],
+        "volume_name": identity["volume_name"],
+        "root": FRONTEND_STATE_ROOT,
+        "owner_uid": identity["uid"],
+        "owner_gid": identity["gid"],
+        "directories": layout["directories"],
+        "probe": {
+            "state": "passed",
+            "recursive_chown": False,
+            "live_bind_contents": "untouched",
+            "marker_validated": True,
+        },
+    }
 
 
 def _finalize_guest_root(directory: int, uid: int, gid: int) -> None:
@@ -999,12 +1287,12 @@ def ensure(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("ensure",))
+    parser.add_argument("action", choices=("ensure", "ensure-frontend-state"))
     args = parser.parse_args(argv)
     try:
-        receipt = ensure()
+        receipt = ensure() if args.action == "ensure" else ensure_frontend_state()
     except MaintenanceError as error:
-        print(f"backend volume cache maintenance rejected: {error}", file=sys.stderr)
+        print(f"volume cache maintenance rejected: {error}", file=sys.stderr)
         return 2
     print(json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
     return 0
