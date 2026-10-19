@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from pathlib import Path, PurePath, PurePosixPath
 import re
 import sys
+import uuid
 
 import fullmag_storage as storage
 from docker_build_control import (
@@ -122,7 +123,7 @@ def _request_id(startup_helper, attempt: str, source_sha256: str, explicit: str 
             return startup_helper._validate_request_id(explicit)
         except _helper_error_type(startup_helper) as error:
             raise BuildControlError(str(error)) from error
-    return f"docker-volume-{attempt}-{source_sha256[:16]}"
+    return "docker-volume-" + uuid.uuid4().hex
 
 
 def _authorization_bytes(startup_helper, authorization: Mapping[str, object]) -> bytes:
@@ -480,7 +481,8 @@ def _run_fixed_activation(
         return value
     if value is not None and value.get("state") == "unknown":
         raise ControlOutcomeUnknown(
-            "Startup activation outcome is unknown; activation.json prevents retry"
+            "Startup activation outcome is unknown; activation.json prevents retry: "
+            + str(value.get("error", "No diagnostic supplied"))[-4096:]
         )
     marker = docker_capture(
         "exec",
@@ -493,7 +495,8 @@ def _run_fixed_activation(
     )
     if marker.returncode == 0:
         raise ControlOutcomeUnknown(
-            "Backend activation failed after publishing activation.json; retry is forbidden"
+            "Backend activation failed after publishing activation.json; retry is forbidden: "
+            + output.decode("utf-8", "replace")[-4096:]
         )
     detail = output.decode("utf-8", "replace")[-4096:]
     raise BuildControlError(f"Backend activation wrapper failed: {detail}")
