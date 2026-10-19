@@ -1078,6 +1078,60 @@ def resume(args):
     return _retained_operation(args, recreate_services=False)
 
 
+def _retained_recovery_context(control, previous, document, *, fresh_state):
+    """Carry the original capability through image replacement, never mint one.
+
+    PID 1 still authenticates the native request and current owner before any
+    recovery or service start. Dropping this capability during recreation
+    strands an interrupted recovery even though its immutable proof survives.
+    """
+    from docker_volume_container_recovery import (
+        AUTHORIZATION_ENV, AUTHORIZATION_SHA_ENV, CONTROL_ROOT,
+        _control_bytes, _parse_json, _relative_control_path,
+        validate_runtime_authorization,
+    )
+    environment = document["services"]["backend"]["environment"]
+    carried = {key: value for key, value in environment.items()
+               if key.startswith("FULLMAG_CONTAINER_RECOVERY_")}
+    metadata = previous.get("container_recovery")
+    if not carried and metadata is None:
+        return {}
+    if fresh_state:
+        raise BuildControlError("Pending container recovery must retain its original session storage")
+    if set(carried) != {AUTHORIZATION_ENV, AUTHORIZATION_SHA_ENV} or not isinstance(metadata, Mapping):
+        raise BuildControlError("Retained container recovery capability is incomplete")
+    if previous.get("container_recovery_environment") != sorted(carried):
+        raise BuildControlError("Retained container recovery environment differs from its receipt")
+    path = carried[AUTHORIZATION_ENV]
+    if not isinstance(path, str) or not path.startswith(CONTROL_ROOT + "/"):
+        raise BuildControlError("Retained container recovery authorization escapes control volume")
+    relative = _relative_control_path(path[len(CONTROL_ROOT) + 1:])
+    raw = _control_bytes(control, relative)
+    if raw is None:
+        raise BuildControlError("Retained container recovery authorization is missing")
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != carried[AUTHORIZATION_SHA_ENV] or digest != metadata.get("authorization_sha256"):
+        raise BuildControlError("Retained container recovery authorization digest differs")
+    authorization = validate_runtime_authorization(_parse_json(raw, "retained runtime authorization"))
+    if (authorization["compose_project"] != control.project
+            or authorization["source_root"] != previous["inputs"]["source_root"]):
+        raise BuildControlError("Retained container recovery source or project differs")
+    expected = {
+        "schema": "fullmag.container-recovery.v1",
+        "request_id": authorization["request_id"],
+        "request_sha256": authorization["native_request_sha256"],
+        "attestation_sha256": authorization["attestation_sha256"],
+        "manifest_sha256": authorization["manifest_sha256"],
+        "authorization_sha256": digest,
+        "stop_journal_sha256": authorization["prior_stop_journal_sha256"],
+        "removed_container_ids": [authorization["backend_container_id"], authorization["frontend_container_id"]],
+    }
+    if metadata != expected:
+        raise BuildControlError("Retained container recovery metadata differs from authorization")
+    return {"recovery_environment": _validate_recovery_environment(carried),
+            "recovery_metadata": _validate_recovery_metadata(expected)}
+
+
 def _retained_operation(args, *, recreate_services, restart_idle_service=False):
     """Resume observation/admission of one exact failed start; never restart the backend."""
     from docker_dev import _require_native_windows, _select_source, _compose_identity
@@ -1194,6 +1248,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         if json.loads(read_owned_regular(owner_path)) != certificate or certificate.get("image_id") != image:
             raise BuildControlError("Retained Windows storage owner/certificate differs")
         fresh_state = bool(getattr(args, "fresh_state", False))
+        recovery_context = _retained_recovery_context(control, previous, document, fresh_state=fresh_state)
         if not fresh_state and not certificate.get("restart_verified"):
             raise BuildControlError("Unadmitted storage cannot rotate as an admitted runtime; use explicit --fresh-state to preserve the old root")
         # Exact recorded helper only; unknown group resources are never deleted.
@@ -1210,6 +1265,8 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 helper_ids.append(helper_document["Id"])
         with control.operation("recreate-services", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                                       **operator_probe_record}) as operation:
+            if recovery_context != _retained_recovery_context(control, previous, document, fresh_state=fresh_state):
+                raise BuildControlError("Retained container recovery capability changed before recreation")
             operation["receipt"].update(operator_probe_record)
             control.write(operation["root"] + "/retained-containers.json", actual)
             operation["receipt"].update(state="stopping-owned-frontend", previous_state_root=str(state),
@@ -1229,7 +1286,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         reuse = None if fresh_state else {"state": state, "host_certificate": certificate_path,
             "owner_marker": owner_path, "receipt": {"image_id": image},
             "operator_probe_environment_record": operator_probe_record}
-        return start(args, reuse_state=reuse)
+        return start(args, reuse_state=reuse, **recovery_context)
     restart_backend = bool(getattr(args, "restart_backend", False))
     if restart_backend:
         if actual["backend"]["State"]["Running"]:
