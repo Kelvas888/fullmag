@@ -121,6 +121,16 @@ MAX_CONTAINER_RECOVERY_AUTHORIZATION_BYTES = 512 * 1024
 MAX_CONTAINER_RECOVERY_REQUEST_BYTES = 256 * 1024
 MAX_CONTAINER_RECOVERY_RECEIPT_BYTES = 512 * 1024
 MAX_CONTAINER_RECOVERY_LOG_BYTES = 4 * 1024 * 1024
+CONTAINER_RECOVERY_WRITER_BUSY_MESSAGE = (
+    "session store writer is busy root=/host-ledger/ledger "
+    "conflict=native descriptor"
+)
+CONTAINER_RECOVERY_WRITER_BUSY_NATIVE_MESSAGE = (
+    "session store writer is busy: root=`/host-ledger/ledger`, "
+    "conflict=native descriptor"
+)
+CONTAINER_RECOVERY_WRITER_BUSY_RETRY_SECONDS = 5.0
+CONTAINER_RECOVERY_WRITER_BUSY_SLEEP_SECONDS = 0.1
 CONTAINER_RECOVERY_CONTROL_ROOT = Path("/opt/fullmag/control")
 GIB = 1024**3
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -2034,6 +2044,38 @@ def container_recovery_configuration_override(
             os.environ["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = previous
 
 
+def _run_container_recovery_cli(
+    paths: RuntimePaths,
+    arguments: Sequence[str],
+    *,
+    timeout: float,
+    cli: Path | None,
+) -> dict[str, Any]:
+    """Retry only the transient native descriptor conflict for this recovery."""
+
+    deadline = time.monotonic() + CONTAINER_RECOVERY_WRITER_BUSY_RETRY_SECONDS
+    while True:
+        try:
+            return _run_cli(paths, arguments, timeout=timeout, cli=cli)
+        except RuntimeServiceError as error:
+            message = str(error).removeprefix("runtime CLI failed: ").strip()
+            lines = [line.strip() for line in message.splitlines() if line.strip()]
+            if lines and lines[0].startswith("[fullmag] version: "):
+                lines.pop(0)
+            if not lines:
+                raise
+            native_message = lines.pop(0).removeprefix("Error: ")
+            if (native_message not in {
+                    CONTAINER_RECOVERY_WRITER_BUSY_MESSAGE,
+                    CONTAINER_RECOVERY_WRITER_BUSY_NATIVE_MESSAGE,
+                } or lines not in ([], ["Caused by:", "session store writer is busy"])):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(CONTAINER_RECOVERY_WRITER_BUSY_SLEEP_SECONDS, remaining))
+
+
 def recover_container_namespace(
     paths: RuntimePaths | None = None,
     *,
@@ -2108,22 +2150,23 @@ def recover_container_namespace(
     )
     if _sha256_bytes(launch_raw) != context["authorization"]["launch_sha256"]:
         _fail("container recovery runtime launch record changed after authorization")
-    result = _run_cli(
+    recovery_arguments = (
+        "runtime",
+        "service-recover-container",
+        "--config",
+        str(paths.config),
+        "--request",
+        str(context["request_path"]),
+        "--request-sha256",
+        context["request_sha256"],
+        "--attestation",
+        str(context["attestation_path"]),
+        "--attestation-sha256",
+        context["attestation_sha256"],
+    )
+    result = _run_container_recovery_cli(
         paths,
-        (
-            "runtime",
-            "service-recover-container",
-            "--config",
-            str(paths.config),
-            "--request",
-            str(context["request_path"]),
-            "--request-sha256",
-            context["request_sha256"],
-            "--attestation",
-            str(context["attestation_path"]),
-            "--attestation-sha256",
-            context["attestation_sha256"],
-        ),
+        recovery_arguments,
         timeout=timeout,
         cli=cli,
     )
