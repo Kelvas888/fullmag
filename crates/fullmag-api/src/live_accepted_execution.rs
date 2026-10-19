@@ -34,6 +34,28 @@ pub(crate) struct AcceptedLiveStudyExecution {
     pub step_ids: Vec<String>,
 }
 
+/// Immutable result of the expensive accepted-study preparation phase.
+///
+/// This value contains no durable RunIntent publication. Python/Gmsh may have
+/// created bounded workspace mesh/cache/staging artifacts, but those artifacts
+/// are not an accepted execution and the value can be discarded when the HTTP
+/// future is cancelled or the current live session changes. The caller must revalidate
+/// its live context under `current_live_session_transition` before passing it
+/// to `commit_prepared_live_accepted`.
+pub(crate) struct PreparedLiveAcceptedStudy {
+    store_root: PathBuf,
+    backlog_limit: NonZeroUsize,
+    scene: fullmag_authoring::SceneDocument,
+    pub(crate) run_id: String,
+    project_id: fullmag_application::ProjectId,
+    definition: fullmag_application::ProjectEnvelope,
+    study: fullmag_authoring::StudyPlan,
+    catalog: fullmag_plan::StudyProblemCatalog,
+    intent: fullmag_application::RunIntent,
+    pub(crate) step_ids: Vec<String>,
+    migrated_profile_to_publish: Option<fullmag_ir::ExecutionProfileIR>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AcceptedLiveControlExecution {
     pub run_id: String,
@@ -194,8 +216,8 @@ pub(crate) async fn submit_live_command_with_transition(
     let captured_context = context.clone();
     let command = command.clone();
 
-    let accepted = tokio::task::spawn_blocking(move || {
-        materialize_live_accepted(
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_live_accepted(
             &repo_root,
             &workspace_root,
             None,
@@ -211,13 +233,16 @@ pub(crate) async fn submit_live_command_with_transition(
         )
     })
     .await
-    .map_err(|error| ApiError::internal(format!("accepted live execution task failed: {error}")))??;
+    .map_err(|error| {
+        ApiError::internal(format!("accepted live execution preparation task failed: {error}"))
+    })??;
 
     // The durable identity carries the captured API/session/epoch/scene and
     // command fence. Recheck the mutable current pointer before the caller
-    // publishes the command journal/read model so a replaced workspace cannot
-    // expose this accepted run as its own live execution.
-    crate::validate_current_live_request_context(state, context).await?;
+    // commits RunIntent/CAS so a replaced workspace cannot publish a detached
+    // accepted run after an HTTP cancellation.
+    validate_live_scene_for_context(state, context, &prepared.scene).await?;
+    let accepted = commit_prepared_live_accepted(&prepared)?;
 
     let step_id = accepted
         .step_ids
@@ -413,30 +438,39 @@ pub(crate) async fn submit_live_study_with_transition_with_asset_root(
     auto_run: bool,
     asset_root: Option<PathBuf>,
 ) -> Result<AcceptedLiveStudyExecution, ApiError> {
-    {
-        let current = state.current_live_state.read().await;
-        let snapshot = current
-            .as_ref()
-            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
-        crate::ensure_current_live_request_context(
-            snapshot,
-            context,
-            state
-                .current_live_session_epoch
-                .load(std::sync::atomic::Ordering::Acquire),
-        )?;
-        let current_scene = snapshot
-            .scene_document
-            .as_ref()
-            .ok_or_else(|| ApiError::not_found("no scene document available for startup"))?;
-        if current_scene.revision != scene.revision
-            || serde_json::to_value(current_scene).ok() != serde_json::to_value(&scene).ok()
-        {
-            return Err(ApiError::conflict(
-                "startup_scene_revision_or_content_changed",
-            ));
-        }
-    }
+    let prepared = prepare_live_study_with_asset_root(
+        state,
+        context,
+        scene,
+        request_id,
+        source_sha256,
+        auto_run,
+        asset_root,
+    )
+    .await?;
+    // The existing command path already owns the transition fence. The
+    // preparation above writes no accepted durable state; its bounded mesh/cache
+    // artifacts are not a RunIntent. Revalidate before the synchronous commit.
+    validate_live_scene_for_context(state, context, &prepared.scene).await?;
+    commit_prepared_live_accepted(&prepared)
+}
+
+/// Prepare a startup or live Study without publishing a durable RunIntent.
+///
+/// The caller may run this without the live transition fence.  It must invoke
+/// `validate_live_scene_for_context` and then commit the returned value while
+/// holding that fence.  This is the boundary that keeps Python/Gmsh and other
+/// preparation work out of the status/read-model critical section.
+pub(crate) async fn prepare_live_study_with_asset_root(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+    scene: fullmag_authoring::SceneDocument,
+    request_id: String,
+    source_sha256: String,
+    auto_run: bool,
+    asset_root: Option<PathBuf>,
+) -> Result<PreparedLiveAcceptedStudy, ApiError> {
+    validate_live_scene_for_context(state, context, &scene).await?;
     let Some(store_root) = state.submit_store_root.clone() else {
         return Err(ApiError::with_status_and_code(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -449,8 +483,8 @@ pub(crate) async fn submit_live_study_with_transition_with_asset_root(
     let api_instance_id = state.request_scope_instance_id.clone();
     let backlog_limit = state.submit_backlog_limit;
     let captured_context = context.clone();
-    let accepted = tokio::task::spawn_blocking(move || {
-        materialize_live_accepted(
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_live_accepted(
             &repo_root,
             &workspace_root,
             asset_root.as_deref(),
@@ -468,9 +502,60 @@ pub(crate) async fn submit_live_study_with_transition_with_asset_root(
     })
     .await
     .map_err(|error| ApiError::internal(format!("accepted startup execution task failed: {error}")))??;
-    crate::validate_current_live_request_context(state, context).await?;
-    Ok(accepted)
+    Ok(prepared)
 }
+
+/// Check the immutable scene captured before preparation against the current
+/// live session.  This is intentionally a separate guard so startup can run
+/// it again after reacquiring the transition fence immediately before commit.
+pub(crate) async fn validate_live_scene_for_context(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+    scene: &fullmag_authoring::SceneDocument,
+) -> Result<(), ApiError> {
+    let current = state.current_live_state.read().await;
+    let snapshot = current
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        snapshot,
+        context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
+    let current_scene = snapshot
+        .scene_document
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("no scene document available for startup"))?;
+    let current_value = serde_json::to_value(current_scene).map_err(|error| {
+        ApiError::internal(format!("failed to encode current live scene guard: {error}"))
+    })?;
+    let expected_value = serde_json::to_value(scene).map_err(|error| {
+        ApiError::internal(format!("failed to encode prepared live scene guard: {error}"))
+    })?;
+    validate_scene_revision_and_content(
+        current_scene.revision,
+        scene.revision,
+        &current_value,
+        &expected_value,
+    )
+}
+
+fn validate_scene_revision_and_content(
+    current_revision: u64,
+    expected_revision: u64,
+    current: &serde_json::Value,
+    expected: &serde_json::Value,
+) -> Result<(), ApiError> {
+    if current_revision != expected_revision || current != expected {
+        return Err(ApiError::conflict(
+            "startup_scene_revision_or_content_changed",
+        ));
+    }
+    Ok(())
+}
+
 
 /// Ensure that a Docker-only preparation command has one durable accepted
 /// Study to read from. Legacy live sessions can reach MeshBuild before an
@@ -785,6 +870,10 @@ fn request_accepted_stop_for_catalog(
     Ok(affected)
 }
 
+/// Compatibility wrapper for existing live-command callers.  Those callers
+/// already own the transition fence, so the preparation and the synchronous
+/// commit retain their previous ordering without exposing a second pipeline.
+#[allow(dead_code)]
 fn materialize_live_accepted(
     repo_root: &Path,
     workspace_root: &Path,
@@ -796,6 +885,35 @@ fn materialize_live_accepted(
     scene: &fullmag_authoring::SceneDocument,
     submission: LiveAcceptedSubmission,
 ) -> Result<AcceptedLiveStudyExecution, ApiError> {
+    let prepared = prepare_live_accepted(
+        repo_root,
+        workspace_root,
+        asset_root,
+        store_root,
+        backlog_limit,
+        api_instance_id,
+        context,
+        scene,
+        submission,
+    )?;
+    commit_prepared_live_accepted(&prepared)
+}
+
+/// Expensive preparation with no accepted durable-state publication. It may
+/// materialize bounded geometry/cache/staging assets in the workspace and reads
+/// immutable profile data; RunIntent/CAS and run catalog publication happen in
+/// `commit_prepared_live_accepted`.
+fn prepare_live_accepted(
+    repo_root: &Path,
+    workspace_root: &Path,
+    asset_root: Option<&Path>,
+    store_root: &Path,
+    backlog_limit: NonZeroUsize,
+    api_instance_id: &str,
+    context: &CurrentLiveRequestContext,
+    scene: &fullmag_authoring::SceneDocument,
+    submission: LiveAcceptedSubmission,
+) -> Result<PreparedLiveAcceptedStudy, ApiError> {
     let queue_tasks = match &submission {
         LiveAcceptedSubmission::Command { .. } => true,
         LiveAcceptedSubmission::Startup { auto_run, .. } => *auto_run,
@@ -987,23 +1105,44 @@ fn materialize_live_accepted(
     let profile_catalog = store
         .read_execution_profile_catalog()
         .map_err(|error| profile_catalog_error(error.to_string()))?;
-    let published_profile_entry = if let Some(migrated_profile) = migrated_profile.as_ref() {
-        ensure_migrated_profile_published(&store, &profile_catalog, migrated_profile)?
-    } else {
-        exact_catalog_profile(&profile_catalog, &profile)?
-    };
-    let published_profile = published_profile_entry.profile.clone();
+    let (published_profile, migrated_profile_to_publish) =
+        if let Some(migrated_profile) = migrated_profile.as_ref() {
+            if profile_catalog.entries.iter().any(|entry| {
+                entry.profile.profile_id == migrated_profile.profile_id
+                    && entry.profile.version == migrated_profile.version
+            }) {
+                let entry = exact_catalog_profile(&profile_catalog, migrated_profile)?;
+                (entry.profile, None)
+            } else {
+                // Legacy profile publication is deferred until the bounded
+                // commit phase.  Preparation must not mutate the accepted
+                // store while the transition fence is absent.
+                (migrated_profile.clone(), Some(migrated_profile.clone()))
+            }
+        } else {
+            (exact_catalog_profile(&profile_catalog, &profile)?.profile, None)
+        };
     let published_profile_sha256 = published_profile
         .canonical_sha256()
         .map_err(|error| profile_catalog_error(error.to_string()))?;
-    if published_profile_entry.profile_sha256 != published_profile_sha256 {
-        return Err(ApiError::conflict_with_code(
-            "execution_profile_hash_conflict",
-            format!(
-                "published execution profile `{}/{}` has a catalogue hash that does not match its canonical content",
-                published_profile.profile_id, published_profile.version
-            ),
-        ));
+    let published_profile_entry_sha256 = profile_catalog
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.profile.profile_id == published_profile.profile_id
+                && entry.profile.version == published_profile.version
+        })
+        .map(|entry| entry.profile_sha256.as_str());
+    if let Some(entry_sha256) = published_profile_entry_sha256 {
+        if entry_sha256 != published_profile_sha256.as_str() {
+            return Err(ApiError::conflict_with_code(
+                "execution_profile_hash_conflict",
+                format!(
+                    "published execution profile `{}/{}` has a catalogue hash that does not match its canonical content",
+                    published_profile.profile_id, published_profile.version
+                ),
+            ));
+        }
     }
 
     let catalog = fullmag_application::materialize_study_execution(
@@ -1184,14 +1323,52 @@ fn materialize_live_accepted(
             format!("typed live RunIntent materialization failed: {error:#}"),
         )
     })?;
+    Ok(PreparedLiveAcceptedStudy {
+        store_root: store_root.to_path_buf(),
+        backlog_limit,
+        scene: scene.clone(),
+        run_id,
+        project_id,
+        definition,
+        study,
+        catalog,
+        intent,
+        step_ids,
+        migrated_profile_to_publish,
+    })
+}
+
+/// Commit one already prepared accepted Study.  This function is deliberately
+/// synchronous: callers invoke it only after acquiring the live transition
+/// fence, so cancellation cannot abandon a `spawn_blocking` future while its
+/// closure continues writing RunIntent/CAS in the background.
+pub(crate) fn commit_prepared_live_accepted(
+    prepared: &PreparedLiveAcceptedStudy,
+) -> Result<AcceptedLiveStudyExecution, ApiError> {
+    let store = open_submit_store(&prepared.store_root)?;
+    if let Some(profile) = prepared.migrated_profile_to_publish.as_ref() {
+        let profile_catalog = store
+            .read_execution_profile_catalog()
+            .map_err(|error| profile_catalog_error(error.to_string()))?;
+        let published = ensure_migrated_profile_published(&store, &profile_catalog, profile)?;
+        let expected_sha256 = profile
+            .canonical_sha256()
+            .map_err(|error| profile_catalog_error(error.to_string()))?;
+        if published.profile != *profile || published.profile_sha256 != expected_sha256 {
+            return Err(ApiError::conflict_with_code(
+                "execution_profile_hash_conflict",
+                "legacy execution profile publication did not preserve the prepared profile",
+            ));
+        }
+    }
     crate::run_intent_persistence::commit_validated_run_intent_with_backlog_limit(
         &store,
-        &intent,
-        &definition,
-        &study,
-        &catalog,
+        &prepared.intent,
+        &prepared.definition,
+        &prepared.study,
+        &prepared.catalog,
         &BTreeMap::new(),
-        backlog_limit,
+        prepared.backlog_limit,
     )
     .map_err(|error| {
         ApiError::unprocessable_with_code(
@@ -1202,8 +1379,8 @@ fn materialize_live_accepted(
 
     crate::run_intent_persistence::materialize_accepted_run_catalog(
         &store,
-        &run_id,
-        &project_id,
+        &prepared.run_id,
+        &prepared.project_id,
     )
     .map_err(|error| {
         ApiError::unprocessable_with_code(
@@ -1213,8 +1390,8 @@ fn materialize_live_accepted(
     })?;
 
     Ok(AcceptedLiveStudyExecution {
-        run_id,
-        step_ids,
+        run_id: prepared.run_id.clone(),
+        step_ids: prepared.step_ids.clone(),
     })
 }
 
@@ -1493,7 +1670,27 @@ fn profile_catalog_error(message: String) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_gpu_relaxation_algorithm, request_accepted_stop_for_catalog};
+    use super::{
+        bounded_gpu_relaxation_algorithm, request_accepted_stop_for_catalog,
+        validate_scene_revision_and_content,
+    };
+
+    #[test]
+    fn startup_commit_guard_rejects_changed_scene_revision() {
+        let scene = serde_json::json!({"scene": "same"});
+        let error = validate_scene_revision_and_content(8, 9, &scene, &scene).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(error.message, "startup_scene_revision_or_content_changed");
+    }
+
+    #[test]
+    fn startup_commit_guard_rejects_changed_scene_content_at_same_revision() {
+        let current = serde_json::json!({"scene": "old"});
+        let prepared = serde_json::json!({"scene": "new"});
+        let error = validate_scene_revision_and_content(9, 9, &current, &prepared).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(error.message, "startup_scene_revision_or_content_changed");
+    }
 
     #[test]
     fn accepted_gpu_scope_allows_only_explicit_fem_projected_gradient_bb() {
