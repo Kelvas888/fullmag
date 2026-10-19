@@ -651,9 +651,17 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     _require_native_windows()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root or args.repo_root)
     identity = _compose_identity(layout)
+    admission_context = {}
     if provided_operation is not None:
         _validate_existing_development_operation(provided_control, provided_operation, selected, identity)
-    _assert_no_running_fullmag(identity["project_name"], identity)
+        held = provided_operation["receipt"]
+        admission_context["owned_control"] = {
+            "name": held["helper_container"],
+            "attempt": held["attempt"],
+            "image": provided_control.image,
+            "volume": provided_control.volume,
+        }
+    _assert_no_running_fullmag(identity["project_name"], identity, **admission_context)
     runtime.assert_loopback_port_available(args.port, identity["project_name"])
     if args.profile != "dev":
         raise BuildControlError("Volume DEV supports backend-dev; release uses its explicit managed recipe")
@@ -680,7 +688,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         toolchain, images = _validate_prepared_start_context(prepared)
     image = images["backend"]["image_id"]
     device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
-    _assert_no_running_fullmag(control.project, identity)
+    _assert_no_running_fullmag(control.project, identity, **admission_context)
     operation_inputs = {"source_root": str(selected), "image_id": image,
         "source_project_id": identity["project_id"],
         "source_worktree_id": identity["worktree_id"],

@@ -1855,7 +1855,12 @@ def _compose_stop_hint(container_ids: Sequence[str]) -> str:
     return "docker stop " + " ".join(container_ids)
 
 
-def _assert_no_running_fullmag(project: str, source_identity: Mapping[str, object]) -> None:
+def _assert_no_running_fullmag(
+    project: str,
+    source_identity: Mapping[str, object],
+    *,
+    owned_control: Mapping[str, object] | None = None,
+) -> None:
     """Reject all stale containers/networks for the selected Compose group.
 
     The historical helper name is retained for callers, but the admission
@@ -1866,6 +1871,25 @@ def _assert_no_running_fullmag(project: str, source_identity: Mapping[str, objec
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
         raise _fail("Invalid Compose project name")
     from docker_compose_identity import compose_network_name, source_labels
+
+    if owned_control is not None:
+        required_control_fields = {"name", "image", "volume", "attempt"}
+        if (not isinstance(owned_control, Mapping)
+                or set(owned_control) != required_control_fields):
+            raise _fail("Owned build-control identity must contain exactly name, image, volume, and attempt")
+        control_name = owned_control["name"]
+        control_image = owned_control["image"]
+        control_volume = owned_control["volume"]
+        control_attempt = owned_control["attempt"]
+        if (not isinstance(control_attempt, str)
+                or re.fullmatch(r"[0-9a-f]{32}", control_attempt) is None
+                or not isinstance(control_name, str)
+                or control_name != "fullmag-control-" + control_attempt
+                or not isinstance(control_image, str)
+                or re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64}", control_image) is None
+                or not isinstance(control_volume, str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", control_volume) is None):
+            raise _fail("Owned build-control identity is not immutable")
 
     if not isinstance(source_identity, Mapping):
         raise _fail("Resolved Compose source identity is required for network admission")
@@ -1887,15 +1911,72 @@ def _assert_no_running_fullmag(project: str, source_identity: Mapping[str, objec
             timeout=60,
         )
         container_ids.update(line.strip() for line in raw.splitlines() if line.strip())
+    if owned_control is not None and not container_ids:
+        raise _fail("Owned build-control helper is no longer present")
     if container_ids:
         ordered = sorted(container_ids)
-        raise _fail(
-            "Fullmag Docker containers already exist for project " + project
-            + " (running or stopped): " + ", ".join(ordered)
-            + "; remove them explicitly with the recorded command: `"
-            + _compose_stop_hint(ordered)
-            + "` before `up`"
+        if owned_control is None:
+            raise _fail(
+                "Fullmag Docker containers already exist for project " + project
+                + " (running or stopped): " + ", ".join(ordered)
+                + "; remove them explicitly with the recorded command: `"
+                + _compose_stop_hint(ordered)
+                + "` before `up`"
+            )
+        documents = _read_json_output(
+            _docker_capture("inspect", *ordered, timeout=60),
+            "owned build-control container inspection",
         )
+        if not isinstance(documents, list) or len(documents) != len(ordered):
+            raise _fail("Owned build-control inspection returned an incomplete document")
+        try:
+            inspected_ids = {
+                document["Id"] for document in documents
+                if isinstance(document, Mapping)
+                and isinstance(document.get("Id"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", document["Id"])
+            }
+        except (KeyError, TypeError):
+            inspected_ids = set()
+        if len(inspected_ids) != len(documents):
+            raise _fail("Owned build-control inspection did not return full container identities")
+
+        def is_owned_control(document: Mapping[str, object]) -> bool:
+            config = document.get("Config")
+            state = document.get("State")
+            host_config = document.get("HostConfig")
+            labels = config.get("Labels") if isinstance(config, Mapping) else None
+            mounts = document.get("Mounts")
+            if (document.get("Name") not in (control_name, "/" + control_name)
+                    or not isinstance(config, Mapping)
+                    or config.get("Image") != control_image
+                    or not isinstance(state, Mapping)
+                    or state.get("Running") is not True
+                    or not isinstance(host_config, Mapping)
+                    or host_config.get("Runtime") != "runc"
+                    or host_config.get("NetworkMode") != "none"
+                    or host_config.get("DeviceRequests") not in (None, [])
+                    or host_config.get("ReadonlyRootfs") is not True
+                    or not isinstance(labels, Mapping)
+                    or labels.get("com.docker.compose.project") != project
+                    or labels.get("com.docker.compose.service") != "build-control"
+                    or any(labels.get(key) != value for key, value in expected_labels.items())
+                    or not isinstance(mounts, list)
+                    or len(mounts) != 1):
+                return False
+            mount = mounts[0]
+            return (isinstance(mount, Mapping)
+                    and mount.get("Type") == "volume"
+                    and mount.get("Name") == control_volume
+                    and mount.get("Destination") == "/control")
+
+        matches = [document for document in documents
+                   if isinstance(document, Mapping) and is_owned_control(document)]
+        if len(matches) != 1 or len(documents) != 1:
+            raise _fail(
+                "Fullmag project containers include an unadmitted container; "
+                "only the exact active build-control helper may be retained"
+            )
 
     network_ids: set[str] = set()
     network_filters = (

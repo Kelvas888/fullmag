@@ -398,3 +398,18 @@ Nie uznawać samego istnienia named volumes za dowód ograniczonego wzrostu dysk
 - Po przygotowaniu obrazów C: 48,01 GiB wolnego. Żadnych wolumenów, cache,
   wyników ani obcej grupy nie usuwano. Następny krok: rzeczywista recepta
   recovery → build aplikacji w backendzie → API/UI → dokładny skrypt GPU.
+
+## Checkpoint: pierwsza rzeczywista próba recovery i wznowienie
+
+- Attempt `71856466c94945a5afb1da11624b51ef` przeszedł kontrole, zachował
+  request/manifest/prepared/absence i usunął dokładnie stare dwa zatrzymane
+  kontenery. Nie usunięto żadnego wolumenu ani danych Windows.
+- Start zatrzymała kontrola grupy: uznała własny aktywny helper `build-control`
+  (trzymający lifecycle lease) za konflikt aplikacji. Aplikacja nie rozpoczęła
+  kompilacji ani nowego native recovery. Stan operacji: failed-confirmed.
+- Wznowienie tego samego requestu sprawdzono na rzeczywistych zachowanych
+  sidecarach: odczytowy preflight przeszedł do celowego przerwania przed
+  buildem. Nie trzeba odtwarzać starych kontenerów ani zmieniać ownera.
+- Poprawka dopuszcza wyłącznie konkretny zweryfikowany helper trzymanej
+  operacji; wszystkie inne kontenery i obce sieci nadal blokują start.
+  Rzeczywisty build/API/Solve pozostają NOT VERIFIED do kolejnej próby.
