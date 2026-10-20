@@ -62,9 +62,11 @@ kontrakt. Migracja nie uprawnia do montowania Docker socketu w aplikacji.
 Rotacja logu w aplikacji nie ogranicza kopii utrzymywanej przez Docker logging
 driver. Daily Compose DEV przypina `json-file` z `max-size=10m` i `max-file=3`
 na usługę; traktuj to jako limit kopii stdout/stderr per kontener, nie limit
-named volumes ani BuildKit. Frontend trzyma jeden `next.log` w named volume i
-zeruje go przy starcie nowego procesu, ale pojedyncza długa sesja nadal może go
-powiększać. Archiwum `/opt/fullmag/package/.development/retired` przechowuje
+named volumes ani BuildKit. Frontend ogranicza `next.log` do 64 MiB; nadmiar
+trafia do logu Docker. Przy kolejnym starcie pełny log jest atomowo obracany
+pod runtime lockiem do jednej kopii `next.log.rollback`, również do 64 MiB.
+Niepełny log jest nadal dopisywany. Nieznane ścieżki, dowiązania i pliki
+ponadlimitowe pozostają do jawnej oceny. Archiwum `/opt/fullmag/package/.development/retired` przechowuje
 receipt i rotację, nie kopiuje pełnych logów, i ma limit 8 wpisów oraz 64 MiB
 payloadu. Stare archiwa z logiem są kandydatami do usunięcia po walidacji
 manifestu i drzewa; pełny hash legacy logu licz tylko dla wpisu, który mieści

@@ -88,6 +88,7 @@ FREEZE_ROOT = DEVELOPMENT_ROOT / "frozen-inputs"
 FREEZE_PATH = DEVELOPMENT_ROOT / "inputs-freeze.json"
 RECEIPT_PATH = DEVELOPMENT_ROOT / "frontend-dev-receipt.json"
 LOG_PATH = DEVELOPMENT_ROOT / "next.log"
+LOG_ROLLBACK_PATH = DEVELOPMENT_ROOT / "next.log.rollback"
 MAX_LOG_BYTES = 64 * 1024 * 1024
 RUNTIME_LOCK_PATH = FRONTEND_ROOT / ".fullmag-frontend-runtime.lock"
 
@@ -1422,6 +1423,114 @@ def _release_runtime_lock(lock: Any | None) -> None:
         pass
 
 
+def _assert_runtime_lock_for_log_rotation(runtime_lock: Any) -> None:
+    """Require the already-acquired frontend runtime lock for log rotation."""
+
+    if fcntl is None:
+        _fail("frontend log rotation requires the existing runtime lock")
+    _assert_no_links(RUNTIME_LOCK_PATH.parent, "frontend runtime lock parent")
+    try:
+        descriptor = runtime_lock.fileno()
+        lock_metadata = os.fstat(descriptor)
+        path_metadata = os.lstat(RUNTIME_LOCK_PATH)
+    except (AttributeError, OSError, ValueError) as error:
+        _fail(f"frontend log rotation requires the existing runtime lock: {error}")
+    if (
+        not stat.S_ISREG(lock_metadata.st_mode)
+        or lock_metadata.st_nlink != 1
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_nlink != 1
+        or (lock_metadata.st_dev, lock_metadata.st_ino)
+        != (path_metadata.st_dev, path_metadata.st_ino)
+    ):
+        _fail("frontend log rotation requires the existing runtime lock")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        _fail("frontend log rotation requires the existing runtime lock")
+    except OSError as error:
+        _fail(f"frontend log rotation cannot verify the existing runtime lock: {error}")
+
+
+def _regular_log_metadata(path: Path, name: str) -> os.stat_result:
+    """Inspect one exact log path without following links or opening a FIFO."""
+
+    _path_without_parent(path, name)
+    _assert_no_links(path.parent, f"{name} parent")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            _fail(f"{name} is not one regular file")
+        if metadata.st_size > MAX_LOG_BYTES:
+            _fail(f"{name} exceeds its retained size limit; preserve it for explicit review")
+        return metadata
+    except FileNotFoundError:
+        raise
+    except FrontendDevError:
+        raise
+    except OSError as error:
+        _fail(f"cannot inspect {name}: {error}")
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _sync_log_directory(path: Path) -> None:
+    """Make the directory entry for a completed log rename durable."""
+
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(descriptor)
+    except OSError as error:
+        _fail(f"durable frontend log rotation is unknown: {error}")
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _rotate_log_if_needed(runtime_lock: Any) -> None:
+    """Keep one verified previous generation when the current log is full."""
+
+    _assert_runtime_lock_for_log_rotation(runtime_lock)
+    if LOG_PATH.name != "next.log" or LOG_ROLLBACK_PATH.name != "next.log.rollback":
+        _fail("frontend log rotation paths are not canonical")
+    if LOG_PATH.parent != LOG_ROLLBACK_PATH.parent:
+        _fail("frontend log rotation paths must share one parent")
+    try:
+        current = _regular_log_metadata(LOG_PATH, "frontend retained log")
+    except FileNotFoundError:
+        return
+    if current.st_size < MAX_LOG_BYTES:
+        return
+    try:
+        _regular_log_metadata(LOG_ROLLBACK_PATH, "frontend retained log rollback")
+    except FileNotFoundError:
+        pass
+    try:
+        os.replace(LOG_PATH, LOG_ROLLBACK_PATH)
+        _sync_log_directory(LOG_PATH.parent)
+        _write_lifecycle_log("log_rotate", status="complete", bytes=current.st_size,
+                             rollback=str(LOG_ROLLBACK_PATH))
+    except FrontendDevError:
+        raise
+    except OSError as error:
+        _fail(f"durable frontend log rotation is unknown: {error}")
+
+
 class _BoundedLog:
     """Pipe child output into a bounded retained file; overflow uses Docker's ring."""
 
@@ -2242,6 +2351,7 @@ def start(stopping_event: Any) -> FrontendHandle:
     watchpack_polling_ms = _watchpack_polling_ms()
     runtime_lock = _acquire_runtime_lock()
     try:
+        _rotate_log_if_needed(runtime_lock)
         node_modules_target = _prepare_managed_frontend(inputs)
         tool_environment = _safe_environment(
             inputs, watchpack_polling_ms=watchpack_polling_ms
