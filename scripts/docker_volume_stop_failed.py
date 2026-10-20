@@ -597,7 +597,11 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
         and 'startup_activation' not in receipt
         and isinstance(receipt.get('service_owner'), dict)
     )
-    if receipt.get('state') == 'failed_outcome_retained':
+    # A pre-marker startup failure is proven by its own drained-owner receipt
+    # after stop; its post-stop evidence (terminal_service_owner present)
+    # contradicts the native shutdown_unknown receipt, so the routes are
+    # mutually exclusive.
+    if receipt.get('state') == 'failed_outcome_retained' and not pre_marker_failure:
         native_result = docker_capture(
             'exec', args.container_id, '/usr/local/bin/python3', '-B', '-c',
             _native_failure_probe_script(), timeout=90,
@@ -615,7 +619,6 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
             native_failure = _validate_native_after_ready_failure_probe(
                 native_probe,
                 args.process_receipt_sha256,
-                allow_startup_failure_marker=pre_marker_failure,
             )
             native_failure_kind = 'native-after-ready-failure'
         else:

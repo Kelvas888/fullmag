@@ -218,6 +218,16 @@ class BuildControl:
             "com.fullmag.toolchain.control.project": self.project,
             "com.fullmag.toolchain.control.mount": "/opt/fullmag/control",
         }
+        self.namespace = ""
+        self.namespace_registry = None
+        self.namespace_registry_sha256 = None
+        from docker_control_namespace import resolve_namespace
+        resolve_namespace(self)
+
+    def subpath(self, relative=""):
+        if relative:
+            self.path(relative)
+        return "/".join(value for value in (self.namespace, relative) if value)
 
     @property
     def shared_labels(self):
@@ -307,14 +317,22 @@ class BuildControl:
                 "driver": observed[0]["Driver"], "labels": labels, "measured_at": time.time()}
 
     def helper_args(self, script, *, name=None, initialize=False):
+        mount = "type=volume,src=" + self.volume + ",dst=/control,volume-nocopy"
+        if self.namespace:
+            mount += ",volume-subpath=" + self.namespace
+            script = ("test \"$(sha256sum /registry/namespaces/current.json | cut -d' ' -f1)\" = '"
+                      + self.namespace_registry_sha256 + "'; " + script)
         args = [*docker_argv("run"), "--rm", "-i",
                 "--pull", "never", "--network", "none", "--runtime", "runc",
                 "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                 "--pids-limit", "32", "--memory", "64m", "--cpus", "0.25",
                 "--env", "NVIDIA_VISIBLE_DEVICES=void",
-                "--mount", "type=volume,src=" + self.volume + ",dst=/control,volume-nocopy",
+                "--mount", mount,
                 "--label", "com.docker.compose.project=" + self.project,
                 "--label", "com.docker.compose.service=build-control"]
+        if self.namespace:
+            args.extend(["--mount", "type=volume,src=" + self.volume
+                         + ",dst=/registry,readonly,volume-nocopy"])
         args.extend(["--user", "0:0" if initialize else "65532:65532"])
         if initialize:
             args.extend(["--cap-add", "CHOWN", "--cap-add", "FOWNER", "--cap-add", "DAC_OVERRIDE"])
@@ -394,7 +412,14 @@ class BuildControl:
         if not re.fullmatch(r"[0-9a-f]{32}", token):
             raise BuildControlError("Invalid operation token")
         path = self.path(f"{phase}/attempts/{token}")
-        return ("umask 027; exec 9>/control/operation.lock; flock -n 9; "
+        admission = "umask 027; exec 9>/control/operation.lock; flock -n 9; "
+        if self.namespace:
+            admission = ("umask 027; exec 9</registry/operation.lock; flock -n 9; "
+                         "test \"$(stat -c '%d:%i' /control/operation.lock)\" = "
+                         "\"$(stat -c '%d:%i' /registry/operation.lock)\"; "
+                         "test \"$(sha256sum /registry/namespaces/current.json | cut -d' ' -f1)\" = '"
+                         + self.namespace_registry_sha256 + "'; ")
+        return (admission +
                 "test ! -e /control/active; "
                 f"mkdir -p /control/{phase}/attempts; "
                 f"test \"$(readlink -f /control/{phase}/attempts)\" = '/control/{phase}/attempts'; "
@@ -429,6 +454,9 @@ class BuildControl:
                    "log_byte_limit": MAX_LOG_BYTES, "attempt_limit": MAX_ATTEMPTS,
                    "build_data_qualification": "NOT VERIFIED",
                    "filesystem_before": space_before}
+        if self.namespace:
+            receipt.update(control_namespace=self.namespace,
+                           namespace_registry_sha256=self.namespace_registry_sha256)
         operation = {"receipt": receipt, "root": root, "logger": logger, "daemon_pending": False, "lease_ready": False}
         try:
             first = self._line(logger)
