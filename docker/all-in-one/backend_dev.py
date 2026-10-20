@@ -2973,6 +2973,9 @@ def _publish_runtime_provenance(output: Path) -> None:
         _fail("backend build receipt has incomplete source provenance")
     if not isinstance(toolchain, dict) or not isinstance(build, dict):
         _fail("backend build receipt has incomplete build provenance")
+    runtime_image_id = os.environ.get("FULLMAG_RUNTIME_IMAGE_ID", "")
+    if not IMAGE_RE.fullmatch(runtime_image_id):
+        _fail("FULLMAG_RUNTIME_IMAGE_ID must be an immutable sha256 image ID")
     commit = source.get("resolved_commit")
     snapshot = native.get("source_snapshot_sha256")
     if not isinstance(commit, str) or not GIT_OBJECT_RE.fullmatch(commit):
@@ -2995,6 +2998,7 @@ def _publish_runtime_provenance(output: Path) -> None:
     provenance: dict[str, Any] = {
         "schema": "fullmag.docker-all-image.v1",
         "state": "succeeded",
+        "image_id": runtime_image_id,
         "qualification": "NOT VERIFIED",
         "build_kind": "direct-compose",
         "direct_source_provenance": (

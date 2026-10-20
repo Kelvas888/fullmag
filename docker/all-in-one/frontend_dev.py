@@ -16,9 +16,10 @@ the backend::
         check(frontend)
         stop(frontend)
 
-All mutable frontend state, logs, receipts, frozen input bytes, and Linux
-dependencies stay below ``/state/development``.  There is no cache pruning or
-unbounded operator supplied path.
+Persistent frontend state, logs, diagnostic receipts, frozen input bytes, and
+Linux dependencies stay below ``/state/development``.  The current process
+owner receipt is deliberately ephemeral at ``/run/fullmag/frontend-owner``;
+there is no cache pruning or unbounded operator supplied path.
 """
 from __future__ import annotations
 
@@ -77,6 +78,7 @@ INPUTS_PATH = Path(
     )
 )
 DEVELOPMENT_ROOT = Path("/state/development")
+OWNER_ROOT = Path("/run/fullmag/frontend-owner")
 WORKSPACE_ROOT = DEVELOPMENT_ROOT / "workspace"
 FRONTEND_ROOT = DEVELOPMENT_ROOT / "cache"
 PNPM_STORE_ROOT = DEVELOPMENT_ROOT / "pnpm-store"
@@ -86,7 +88,11 @@ HOME_ROOT = DEVELOPMENT_ROOT / "home"
 TEMP_ROOT = DEVELOPMENT_ROOT / "tmp"
 FREEZE_ROOT = DEVELOPMENT_ROOT / "frozen-inputs"
 FREEZE_PATH = DEVELOPMENT_ROOT / "inputs-freeze.json"
-RECEIPT_PATH = DEVELOPMENT_ROOT / "frontend-dev-receipt.json"
+# The process-owner receipt is ephemeral per Docker container incarnation. The
+# named-volume copy remains diagnostic/history input only and never authorizes a
+# new process owner after the container has been recreated.
+RECEIPT_PATH = OWNER_ROOT / "receipt.json"
+DIAGNOSTIC_RECEIPT_PATH = DEVELOPMENT_ROOT / "frontend-dev-receipt.json"
 LOG_PATH = DEVELOPMENT_ROOT / "next.log"
 LOG_ROLLBACK_PATH = DEVELOPMENT_ROOT / "next.log.rollback"
 MAX_LOG_BYTES = 64 * 1024 * 1024
@@ -805,6 +811,23 @@ def _load_receipt() -> dict[str, Any] | None:
     return receipt
 
 
+def _load_diagnostic_receipt() -> dict[str, Any] | None:
+    """Read the named-volume receipt only as cache/failure history.
+
+    A stale ``unknown`` record in this path is deliberately not an owner
+    authority: the owner path lives on the per-container tmpfs and is empty
+    after a new Docker incarnation.
+    """
+
+    try:
+        receipt = _read_json(DIAGNOSTIC_RECEIPT_PATH, "frontend diagnostic receipt")
+    except FileNotFoundError:
+        return None
+    if receipt.get("schema") != RECEIPT_SCHEMA:
+        _fail("frontend diagnostic receipt has an unsupported schema")
+    return receipt
+
+
 def _generated_gate(receipt: Mapping[str, Any] | None) -> bool:
     return bool(receipt and receipt.get("generated_files_gate") == "next-started-v1")
 
@@ -988,6 +1011,7 @@ def _reject_existing_owner(receipt: Mapping[str, Any] | None) -> None:
 def _prepare_state_directories() -> None:
     for path, name in (
         (DEVELOPMENT_ROOT, "development root"),
+        (OWNER_ROOT, "ephemeral frontend owner root"),
         (FRONTEND_ROOT, "frontend cache root"),
         (PNPM_STORE_ROOT, "pnpm store"),
         (PNPM_HOME, "pnpm home"),
@@ -1373,7 +1397,11 @@ def _receipt_base(
 
 
 def _publish_receipt(receipt: Mapping[str, Any]) -> None:
-    _atomic_json(RECEIPT_PATH, dict(receipt), "frontend development receipt")
+    value = dict(receipt)
+    _atomic_json(RECEIPT_PATH, value, "ephemeral frontend owner receipt")
+    # Keep the last observed lifecycle bytes for generated-file/freeze gates and
+    # diagnostics. This copy is never consulted by _reject_existing_owner.
+    _atomic_json(DIAGNOSTIC_RECEIPT_PATH, value, "frontend diagnostic receipt")
 
 
 def _acquire_runtime_lock() -> Any:
@@ -2343,8 +2371,10 @@ def start(stopping_event: Any) -> FrontendHandle:
     _ensure_inputs_manifest()
     inputs = read_inputs()
     previous = _load_receipt()
+    diagnostic_previous = _load_diagnostic_receipt()
     _reject_existing_owner(previous)
-    allow_generated = _generated_gate(previous)
+    history = previous or diagnostic_previous
+    allow_generated = _generated_gate(history)
     _prepare_state_directories()
     _validate_live_directories(inputs)
     _freeze_inputs(inputs, allow_generated=allow_generated)
@@ -2357,7 +2387,7 @@ def start(stopping_event: Any) -> FrontendHandle:
             inputs, watchpack_polling_ms=watchpack_polling_ms
         )
         receipt = _receipt_base(
-            inputs, previous, watchpack_polling_ms=watchpack_polling_ms
+            inputs, history, watchpack_polling_ms=watchpack_polling_ms
         )
         receipt.update(
             state="starting",
@@ -2419,7 +2449,11 @@ def start(stopping_event: Any) -> FrontendHandle:
     log_tailer = _start_log_tailer()
     handle: FrontendHandle | None = None
     try:
-        needs_install = previous is None or previous.get("dependency_install") != "ready"
+        # A fresh Docker incarnation has no owner receipt, but the named-volume
+        # diagnostic copy still records whether this cache was prepared. Use
+        # that history only to avoid reinstalling dependencies; ownership
+        # authorization remains exclusively on the ephemeral receipt above.
+        needs_install = history is None or history.get("dependency_install") != "ready"
         if not needs_install and not _dependency_tree_ready(inputs):
             needs_install = True
             _write_lifecycle_log(
