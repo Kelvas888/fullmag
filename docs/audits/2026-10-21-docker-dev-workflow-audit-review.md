@@ -98,3 +98,17 @@ Miara powodzenia to czas edycja→API oraz skuteczny restart z zachowanymi
 wynikami i cache, nie sama redukcja liczby linii. Na ten moment nowy
 build/API/mesh/Solve pozostają **NOT VERIFIED**. Nie wykonano testów,
 resetu danych, globalnego prune ani migracji storage.
+
+
+## Bieżący pomiar po przeglądzie
+
+Nowy backend wystartował 23:14:06 UTC. Odczyt działającego Cargo potwierdził
+16 jobów; Docker 128 GiB / 16 CPU. Capture 295448 ms, sync 17199 ms,
+9183 pliki. Git status zajmował 109175 i 91096 ms. Kompilacja w toku,
+więc zysku czasowego, końcowego buildu ani gotowości API nie potwierdzono.
+Przerwa zapisów została zwolniona dopiero po przygotowaniu kopii ext4.
+
+Wynik nowej próby: Make exit0 / 218431 ms, pakiet i gates PASS. Następnie
+`runtime initialize-docker-accepted-store` przekroczył180s przed bindowaniemAPI.
+Backend exited1/non-OOM, frontend healthy3198. To świeża awaria rozruchu
+runtime po poprawnym buildzie. Nie ponowiono operacji o nieznanym wyniku.

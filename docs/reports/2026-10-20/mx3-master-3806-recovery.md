@@ -1,25 +1,23 @@
 # Fullmag master — recovery 3806 i poprawki primitive, 20.10.2026
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 21.10.2026, 01:10 CEST
+## Aktualny status wdrożenia — 21.10.2026, 01:30 CEST
 
-Poprzedni build i pakiet d2a4bdfb przeszedł. Ręczny restart o 22:28 UTC
-zakończył się błędem capture, exit 2, przed nowym buildem i API.
-Pierwotny kontroler 53e zamknął się jako failed-confirmed po zmianie inkarnacji.
-Backend jest zatrzymany; frontend healthy na **3198**. Budżet backendu:
-**128 GiB RAM / 16 CPU + 8 GiB swapu**. Wykryto niezależny domyślny limit
-Cargo wynoszący 2 joby. Poprawka źródłowa wiąże go z budżetem CPU (16);
-nie została jeszcze uruchomiona w nowym kontenerze.
+Build źródeł `6c5a9792f` zakończony **exit 0, 218431 ms**; pakiet 24 plików
+opublikowany i zweryfikowany, retencja odroczona poza start. Bramy storage
+oraz worker-cgroup przeszły. Nowy backend miał **128 GiB RAM / 16 CPU /
+CARGO_BUILD_JOBS=16**, potwierdzone także z działającego Cargo.
 
-Checkpoint capture c16da16d zakończył się sukcesem: stopped-confirmed,
-action observe-capture-failure, signal_issued=false, receipt SHA-256
-`dedd093a0b7dd0f6e5f8caee7df844e84eb51b48d09895a80c8bfab593c6d137`.
-Odtworzenie z 72cd5efcd odmówiło przed zmianą usług: konflikt wyboru
-pre-admission/native recovery. Poprawka dispatch i analogicznego guardu resume
-pozostaje źródłowa, po kontroli parsera; nie zastępuje dowodu runtime.
-Dane 3806 i held04 zachowane. Nie wykonano replay, preparation retry, Solve ani testów.
-API/native i ten sam run04, nowy mesh oraz pola/energie/Airbox w UI pozostają
-**NOT VERIFIED**. Pełny F0–F12 pozostaje otwarty.
+**Nowa blokada:** przed startem API komenda `runtime initialize-docker-accepted-store`
+przekroczyła 180 sekund. Backend `f7c035fd` zakończył się exit 1, non-OOM,
+o 23:28:02 UTC; development `8bad15a8` ma terminal failed-confirmed.
+Frontend nadal healthy na **3198**, API nie nasłuchuje. Nie ponowiono bootstrapu.
+
+Capture 9183 plików PASS 295448 ms, sync ext4 PASS 17199 ms; przerwa zapisów
+zwolniona. Oryginalne dane 3806 i held04 zachowane; stary writer metadata
+pozostaje bez zmian, nie jest dowodem żywego writera. Nie wykonano replay,
+preparation retry, Compute/Solve ani testów. **Native runtime, mesh oraz
+pola/energie/Airbox w UI: NOT VERIFIED**. F0–F12 otwarte.
 <!-- mx3-current-status:end -->
 
 
@@ -1746,3 +1744,59 @@ recovery context mimo uwierzytelnionego PreApiContext. Poprawiono warunek
 wyboru oraz analogiczny guard resume po usunięciu kontenerów; istniejąca
 walidacja obrazów, checkpointu, released leases i held04 pozostaje wymagana.
 AST/diff-check source-only; nowy build/API/mesh nadal NOT VERIFIED.
+
+
+## 63. Rzeczywisty start z Cargo 16 — 21.10.2026
+
+Po source review naprawy dispatch/resume zapisano commit
+`6c5a9792f6046bfb7b7cff85dbea7252760c3ea2`.
+Zarządzana operacja odtworzenia `9a6105d011224c309a97b56e9423595f`
+zakończyła się succeeded. Toolchain `0b654a4639304b7984253d4b7de046c5`
+był cache hit (image `9ceb0d68`). Obrazy helperów dev/backend przebudowano;
+backend image `sha256:f9484c9f16bb956580fd589463265a245f0fcce615753b6df7e9fa33c031e33f`.
+Nowa development attempt: `8bad15a80b074dc1ac771433000bfb3b`.
+
+Stały backend `f7c035fd8bbc54ea022f1bd22137e69165bb6e31fe1f9bbfbd0c9f510033dae5`
+StartedAt `2026-10-20T23:14:06.702506548Z`. Docker HostConfig potwierdza
+137438953472 B RAM i NanoCpus 16000000000. Odczyt środowiska działającego
+Cargo potwierdza `CARGO_BUILD_JOBS=16`; top-level Make ma tę samą wartość.
+W chwili odczytu nie było aktywnego CMake, więc współdzielenie tokenów
+przez natywny proces CMake pozostaje NOT VERIFIED bezpośrednim odczytem.
+
+Capture: PASS 9183 pliki; pass1 156822 ms, pass2 138434 ms,
+łączna faza 295448 ms. `git status` trwał odpowiednio 109175 i 91096 ms.
+Sync do ext4: 17199 ms. Przerwa źródeł RELEASE wysłana czterem czatom
+po zakończeniu sync i rozpoczęciu Make. Podczas Git status chwilowy odczyt
+CPU wynosił 21,31% jednego CPU, RAM 77,32 MiB. Podczas kompilacji Rust
+odczyt pokazał 112,80% CPU i 702,6 MiB RAM; są to próbki, nie benchmark.
+Cargo 16 nie gwarantuje 16 równoległych zadań na każdym etapie zależności.
+
+Make działa; ostatnio kompilował fullmag-py-core po fullmag-runner.
+Ostrzeżenia unused/dead_code nie są błędem kompilacji. Brak końcowego
+exit code oraz dowodu API/native/meshu/Solve. Frontend healthy3198.
+Nie uruchomiono testów, nowej aktywacji, preparation retry ani Solve.
+
+Drobna poprawka źródłowa logowania: `_log_phase` pomijał nowe pola budżetu,
+ponieważ nie dodano ich do jego allowlisty. Uzupełniono trzy nazwy; AST PASS.
+Ta lokalna zmiana nie jest obecna w działającym obrazie f9484c9f i nie powoduje
+restartu rozpoczętego buildu. Potwierdzenie Cargo 16 pochodzi z procesu,
+a nie z pominiętych pól logu.
+
+
+### Wynik próby 8bad15a8
+
+Make: exit 0 / 218431 ms. Package: complete, 24 pliki / 4028 ms;
+verify-complete / 1607 ms. Retention deferred outside-startup, obie bramki
+complete. Proces entrypoint przed bindowaniem API uruchomił
+`/opt/fullmag/package/bin/fullmag-bin runtime initialize-docker-accepted-store`.
+Komenda przekroczyła STORE_BOOTSTRAP_CLI_TIMEOUT_SECONDS=180. Backend
+exited1, OOM=false, FinishedAt `2026-10-20T23:28:02.157894447Z`.
+Development operation `8bad15a80b074dc1ac771433000bfb3b`: failed-confirmed;
+config SHA `7107acdd778f04edf3682eb39f6673fff2fa9d9698674744a70bca54e247eed6`.
+Nie wykonano ponownego bootstrapu, nowej aktywacji ani retry04/Solve.
+Stary process receipt (api_pid3467, exit-15) i writer owner metadata z18:46UTC
+są zachowane; nie kwalifikujemy ich jako nowej awarii ani żywego writera.
+Analiza przyczyny trwa w handlerze Rust inicjalizacji accepted store.
+To kolejny potwierdzony problem orkiestracji, nie błąd kompilacji i nie OOM.
+Porównanie 218431 ms z wcześniejszym217249 ms nie jest benchmarkiem zmiany
+jobów: zmieniły się źródła i warunki cache.

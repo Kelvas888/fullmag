@@ -220,6 +220,9 @@ def _log_phase(phase: str, state: str, **fields: object) -> None:
             "reason",
             "sparse",
             "target",
+            "cargo_jobs",
+            "native_parallelism",
+            "native_fallback_jobs",
         }
     )
     parts = [f"phase={phase}", f"state={state}"]

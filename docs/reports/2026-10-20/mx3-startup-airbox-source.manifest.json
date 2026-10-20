@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-20T23:04:59.520830+00:00",
-  "verification": "Source review PASS, Python AST7 plus3 resource helpers PASS, diff-check PASS; Rust parser unavailable (access denied). Capture-only checkpoint c16da16d succeeded, exit0, stopped-confirmed, no signal, receipt SHA256 dedd093a0b7dd0f6e5f8caee7df844e84eb51b48d09895a80c8bfab593c6d137. Cargo jobs source fix 2->approved16, GNU Make shares jobserver. Backend stopped; new build/CPU timing/API/native/mesh/Solve NOT VERIFIED. No tests. Managed recreate from72cd5efcd failed pre-mutation (pre-admission/native dispatch conflict); scoped dispatch/resume fix source-only. No new build, no signal, no replay.",
+  "observed_at": "2026-10-20T23:30:24.319225+00:00",
+  "verification": "Local49 source manifest; logger allowlist fix not in runtimeimage. Actual Cargo16,128GiB/16CPU confirmed. Capture9183files295448ms+sync17199ms PASS. Makeexit0/218431ms,package24files/gatesPASS. Development8bad15a8 failed-confirmed after accepted-store bootstrap180s timeout BEFORE API; backendexited1 non-OOM23:28:02UTC, frontendhealthy3198. No retry/replay/Solve/tests; native/mesh/UI NOT VERIFIED. Freeze RELEASED.",
   "files": [
     {
       "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
@@ -120,7 +120,7 @@
     },
     {
       "path": "docker/all-in-one/backend_dev.py",
-      "sha256": "ea39c1722cd4d1fb53aa977e3a95bbb739e7e4a081506cf8271e72e6b300f943"
+      "sha256": "c8c90bbb1cb44c3ce6e5259c18404d47b36b1363eb2074c0145bff51bc348fa2"
     },
     {
       "path": "docker/all-in-one/backend_source.py",
