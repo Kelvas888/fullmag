@@ -2898,6 +2898,12 @@ function analysisStatusFixture({
     },
     domain: { cell_count: 0, discretization: "unknown", generation_id: 0 },
     energies: {},
+    lifecycle: {
+      commandability: "allowed",
+      connectivity: "connected",
+      session_resource: "active",
+      solver: "idle",
+    },
     metrics: { steps_per_second: null, total_steps: 0, uptime_seconds: 0 },
     resources: {
       artifact_revision: frequencyDomainPublished ? 17 : 0,
@@ -2914,6 +2920,7 @@ function analysisStatusFixture({
       mesh_revision: 0,
       scalars_revision: 17,
       scene_revision: 0,
+      simulation_preparation_revision: 0,
       slice_revision: 0,
       stages_revision: frequencyDomainPublished ? 17 : 0,
       topology_revision: 0,

@@ -110,6 +110,17 @@ nie zmieniają source identity; świadomie śledzone fixtures nadal są sprawdza
 
 ## Iteracje i awarie
 
+Gotowy kandydat pakietu po nieudanej publikacji jest odrębny od działającego
+pakietu. Backend najpierw sprawdza jego kompletność i dowody Make oraz
+zachowuje oryginalny manifest przed następnym capture źródeł. Dopiero świeże
+wejścia pozwalają wybrać istniejącą rotację pasującego pakietu albo retirement
+zbędnego stagingu. Przygotowane archiwum bez trwałego intentu niczego nie
+usuwa. Logi, receipty i manifesty pozostają w ograniczonym namespace
+`backend/candidate-retirements` control volume; bieżący pakiet, rollback,
+cache i storage użytkownika zostają zachowane. Nie usuwaj kandydata ręcznie
+i nie twórz nowych wolumenów jako obejścia blokady. Kontrakt i stan dowodu:
+[ADR 0061](../adr/0061-docker-development-build-and-runtime-container.md#rozszerzenie-20102026--gotowy-nieopublikowany-staging).
+
 `just docker-dev-restart-idle <attempt> <config-sha256> <source> <port>`
 sprawdza dokładny kontener, obraz, polecenie, etykiety i mounty oraz wymaga
 zdrowego API bez aktywnej sesji. Na czas kontroli zamyka jedyne wejście HTTP przez zatrzymanie własnego frontendu,
@@ -138,6 +149,8 @@ startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backe
 `docker-dev-recreate-volume` wymaga zatrzymanego backendu i dokładnych pinów
 próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
+Przed pierwszym admission awaria samego buildu może zachować ten sam root sesji. Wymaga to dokładnego bootstrap certyfikatu, jednej potwierdzonej awarii przypiętej do bieżącego `Docker StartedAt` oraz braku handoff, publikacji pakietu i storage probe. Dowód wskazuje bezpośredni terminal tej próby development albo związany terminal resume; bieżąca inkarnacja kontenera musi być zgodna. Launcher ponawia cały dowód pod blokadą przed odtworzeniem usług. Nie ustawia `restart_verified`, nie zmienia ownera i nie powtarza Solve; nowe API nadal wymaga zwykłego admission. Brak lub zmiana dowodu blokuje tę ścieżkę.
+
 Bezpośredni CLI `recreate-volume` obsługuje również powtarzane
 `--include-untracked`. Jawne opcje przypinają kompletną listę plików nowej
 konfiguracji; brak opcji zachowuje listę poprzedniej próby. Obowiązują te same
@@ -349,3 +362,13 @@ i zgody. Samo usunięcie kontenera nie odzyskuje wolumenów ani fizycznego VHDX.
 launcherów w istniejącym backendzie; nie kompiluje natywnych testów jednostkowych.
 Sukces buildu nie stanowi kwalifikacji FDM/FEM/BORIS. Release, CI i kwalifikacja
 naukowa zachowują własne jawne zarządzane recepty zgodnie z AGENTS.md.
+
+
+### Nieudany start API podczas odzyskiwania oczekującego runu
+
+Awaria API przed przypięciem native ownera może pozostawić nowszy process-tree
+niż archiwum pierwotnej awarii. Start rozpoznaje wyłącznie ściśle określony
+legacy błąd loopback z zakończonym API, niezmienionym bootstrapem i ownerem.
+Archiwa, request i natywna walidacja runu nadal są obowiązkowe. Ten wyjątek
+nie powtarza Solve, nie resetuje ownera i nie zastępuje recovery. Inny błąd,
+zmiana ownera lub brak dowodów nadal blokują start; nie usuwaj ręcznie receiptów.

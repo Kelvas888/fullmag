@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-20T20:10:00.736314+00:00",
-  "verification": "Source review/parser checks PASS for recovery fixes. Real readonly preview PASS SHA 9f034e18174293e144160489eb49a0937e9891da2e67df4a95d34062a79d6020; create-only proof publication succeeded, operation5ffebfcaeb4140f3854cf1fa7b8d0a50, record SHA ab4b8fcaa19777a1ae73228422e457e3cc521a3387c9274134ae6a11c2e5c04e. No new build/restart/retry/Solve/tests. Parallel StudyInspectorPanel WIP has undeclared owner and is outside verified source subset.",
+  "observed_at": "2026-10-20T20:17:15.713957+00:00",
+  "verification": "Merge candidate: checkpoint5c072bd16628354060ff5b1c2345e24013e1039c plus origind0031ce6d220738609b9fa055d90e52eb6e94213. Conflict resolution Python AST24PASS and source markers absent; focused merge review PASS, no blocker. Previous recovery source review and real readonly preview/publication PASS. No new build/runtime/tests. Known undeclared owner in parallel StudyInspectorPanel WIP remains outside qualified source subset.",
   "files": [
     {
       "path": "crates/fullmag-runtime-control/src/scheduler.rs",
@@ -72,11 +72,11 @@
     },
     {
       "path": "scripts/docker_dev.py",
-      "sha256": "16175bb84f6700c0e3a6eeea25ee352663e01432c30c5ce641d962f940a33a9b"
+      "sha256": "23b2f4f74cdddb6dc575032dc3fdcf535c45b07e4577d996dcee05f5c4902171"
     },
     {
       "path": "scripts/docker_volume_dev.py",
-      "sha256": "27168c1ba9c60d669486396b7a4b641a041a809388570e27d1b3e059f8252bcd"
+      "sha256": "ca2ea1b7c67b5790a793fc8f0a630cc89826f217b2fbf2e7f9a37b45581b0802"
     },
     {
       "path": "crates/fullmag-api/src/accepted_scheduler_main.rs",
@@ -136,7 +136,7 @@
     },
     {
       "path": "docker/all-in-one/runtime_service.py",
-      "sha256": "758ee1b78de0919ede8d4f9bf71c6e8bd09d46df736b9ee60c56dcd5bdbba307"
+      "sha256": "6725af5b7137e3b36f9160d656275f80993321dbc1e7848bf61398ce9bccb338"
     },
     {
       "path": "docker/all-in-one/entrypoint.py",

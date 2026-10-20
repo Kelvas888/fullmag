@@ -124,6 +124,51 @@ Launcher nie uznaje takiej aktywacji za udaną kwalifikację. Błędy integralno
 provenance, polityki i kontraktu odpowiedzi pozostają fatalne. Zmiana nie
 poszerza listy znanych odrzuceń fizyki i nie resetuje ownera ani historii.
 
+## Rozszerzenie 20.10.2026 — gotowy, nieopublikowany staging
+
+Po awarii pomiędzy ukończeniem Make a rotacją może pozostać pełny kandydat
+`ready`. Make z kodem 0 nie uprawnia do uruchomienia go ani do usunięcia jego
+payloadu. Backend pod blokadą cache weryfikuje marker, kompletny pakiet,
+inventory, terminalny receipt Make i log oraz brak journalu rotacji. Bieżący
+pakiet i jego provenance muszą być zgodne; kandydat nie może być pakietem
+wskazanym przez aktywną publikację. Nieznane i niekompletne stany pozostają
+zachowane i blokują start.
+
+Przed kolejnym capture zachowujemy dokładny oryginalny manifest źródeł:
+capture zapisuje następny manifest pod tą samą ścieżką. Niezmienny zapis
+przygotowania w technicznym control volume nie autoryzuje usuwania. Dopiero
+porównanie ze świeżymi źródłami, toolchainem i profilem pozwala sklasyfikować
+kandydata. Pasujący pakiet może przejść przez istniejącą journalowaną rotację;
+nie powstaje drugi mechanizm publikacji. Pakiet niepasujący albo dokładny
+duplikat wymaga osobnej transakcji retirementu.
+
+Namespace `backend/candidate-retirements` w control volume ma własny,
+ograniczony schemat (64 archiwa, 64 MiB łącznie). Wyczerpanie limitu
+zatrzymuje nowy retirement przed alokacją; nie uruchamia ogólnego GC.
+Przed usunięciem zbędnego payloadu zapisuje i odczytuje
+kontrolnie receipt, marker, pełne inventory, manifesty, provenance i logi.
+Trwały intent wiąże dokładny cel i decyzję ze źródłami; sam katalog archiwum,
+data ani rozmiar nie są dowodem zbędności. Po przerwaniu usuwania wznowienie
+sprawdza niezmienne archiwum i każdy pozostały plik. Obcy plik lub rozbieżność
+zatrzymują cleanup. Marker znika na końcu. Bieżący pakiet, rollback, cache,
+sesje, wyniki oraz owner/lease/rezerwacje pozostają poza tą operacją.
+
+Ukończona promocja zamyka przygotowanie jako `historical`. Po przerwaniu
+tego kroku recovery potwierdza dokładny current receipt, provenance i brak
+journalu, zanim domknie sam zapis historii. Przygotowanie archiwum używa
+osobnego namespace `backend/candidate-retirement-staging`, ograniczonego
+do 4 wpisów i 64 MiB. Przerwany staging pozostaje zachowany i liczony
+do limitu; nie jest odczytywany jako finalne archiwum. Budżet danych
+sprawdzamy przed kopiowaniem plików i generowaniem JSON.
+
+Brak automatycznego GC historii jest zamierzony: wyczerpanie budżetu blokuje
+nowy retirement, a zwykły start zweryfikowanego pakietu nie tworzy kolejnych
+archiwów. Archiwum dowodów nie zawiera ponownej kopii binariów.
+
+To rozszerzenie opisuje kontrakt implementowanej ścieżki. Weryfikacja
+rzeczywistego odzyskania, ograniczeń zapisu i odporności na przerwanie
+pozostaje **NOT VERIFIED** do uzyskania konkretnych receiptów.
+
 ## Rozszerzenie 18.10.2026 — wszystkie dane builda w Dockerze
 
 Użytkownik przyjął docelową granicę: zależności, cache, cień źródeł, pakiety,
@@ -520,6 +565,55 @@ Zmiana dotyczy orkiestracji, nie semantyki Python/ProblemIR ani wyboru CPU/GPU.
 Regresje transportu nie zastępują kwalifikacji kolejnych skryptów w Dockerze;
 start, replay po restarcie i odczyt zachowanych danych pozostają **NOT VERIFIED**.
 
+## Uzupełnienie — odtworzenie po awarii przed pierwszym startem API
+
+Niedopuszczony bootstrap storage (`restart_verified=false`) nie daje prawa do
+uruchomienia runtime. Może jednak zachować sesję i cache po błędzie samego
+buildu. Zarządzane odtworzenie usług dopuszcza ten przypadek wyłącznie po
+przypięciu dokładnych kontenerów, obrazu, konfiguracji, niezmienionego certyfikatu
+i owner markera z wartościami bootstrap oraz jednej potwierdzonej awarii buildu
+odpowiadającej bieżącemu `Docker StartedAt` backendu. Dowodem może być bezpośredni terminal wybranej próby `development` albo terminal `resume` związany z jej pinami. Bezpośredni terminal musi być kanonicznie identyczny z terminalem rodzica odczytanym przez launcher; nie wymaga pól wejściowych występujących wyłącznie w `resume`. Obecność dowodu handoff,
+publikacji pakietu lub storage probe wyklucza ten wyjątek.
+
+Selektor odczytuje wyłącznie terminale prób `resume` i `development` w readonly
+control volume tej grupy, bez `latest`, z limitem liczby wpisów i bajtów oraz
+odczytem względem deskryptorów katalogów bez podążania za symlinkami. Przed
+`stop/rm`, pod istniejącą blokadą `recreate-services`, launcher ponawia inspect,
+odczyt certyfikatu i całego dowodu. Zmiana lub niejednoznaczność blokuje operację.
+Jeżeli istnieje przyjęty run, ponownie waliduje jego niezmienne archiwum i nadal
+oczekujący stan przez readonly bundle producenta; nie powtarza aktywacji.
+
+Wyjątek odtwarza usługi z tym samym storage, nie ustawia `restart_verified`, nie
+resetuje ownera ani nie zwalnia zasobów. Nowy backend nadal przechodzi zwykły
+build i admission przed startem API. Recovery natywnego procesu pozostaje
+odrębnym uprawnieniem; pending recovery wyklucza tę ścieżkę. Kod i regresje:
+`scripts/docker_volume_pre_admission_recreate.py`,
+`scripts/docker_volume_pre_admission_selector.py` oraz ich testy i integracja w
+`scripts/docker_volume_dev.py`. Wdrożenie do obrazu i rzeczywisty start wymagają
+oddzielnego dowodu; regresje fixture nie kwalifikują runtime.
+
+
+## Uzupełnienie — nieudany start API przed odtworzeniem przyjętego runu
+
+Pierwsze odtworzenie nadal przypina dokładne bajty historycznego ownera oraz
+hashe obu niezmiennych archiwów. Późniejsza awaria samego API może jednak
+zastąpić bieżący process-tree, zanim zostanie przypięty native owner. Dla
+legacy `fullmag.docker-process-tree.v1` dopuszczamy wyłącznie rozpoznany
+terminal `shutdown_unknown`: dokładny zestaw dziewięciu pól, zakończone API
+z kodem 101, kanoniczny błąd połączenia loopback i brak ownera oraz ACK.
+Binding storage, bootstrap i qualification muszą pozostać niezmienione.
+Historyczny READY owner i FAILED owner zachowują tożsamość; zapis awarii
+native przed READY nie może zawierać retained ownera.
+
+Ten legacy receipt nie identyfikuje samodzielnie requestu ani proofu. Nie jest
+uprawnieniem recovery lub Solve: Rust niezależnie waliduje przypięty request,
+niezmienny proof, katalog runu, historię i lease. Gałąź restartu po ACK nadal
+wymaga uwierzytelnionego successor drain. Nie przepisujemy bieżących ani
+historycznych rekordów dla uzyskania zgodności. Jest to most zgodności dla
+receiptu v1; nowy typ receiptu musi wiązać awarię z requestem i proofem,
+zanim zastąpi ten wyjątek. Zmiana dotyczy `runtime_service.py` i regresji
+`test_fullmag_docker_runtime.py`; nie zmienia OpenAPI, fizyki ani wyboru GPU.
+
 ## Uzupełnienie 20.10.2026 — przerwane odtworzenie przed pierwszym ACK
 
 Odtworzenie accepted run może zakończyć się przed publikacją pierwszego
@@ -546,8 +640,8 @@ aktualną konfigurację oraz brak późniejszego API/native w osobnej inkarnacji
 preflight. Zwykłe `ensure_configuration` zachowuje wszystkie kontrole; sam hash
 poprzedniej konfiguracji nie stanowi nowej autoryzacji ownera.
 
-PID 1 może zaakceptować różnicę current terminal wyłącznie przez ten jawnie
-przypięty wariant; kod Rust niezależnie weryfikuje te same surowe bajty i pełne
+Dla opisanej awarii API z SIGTERM (`api_exit_code=-15`) PID 1 akceptuje
+różnicę current terminal wyłącznie przez ten jawnie przypięty wariant; kod Rust niezależnie weryfikuje te same surowe bajty i pełne
 pierwotne backing records. Wejście nadal odtwarza ten sam model i nie autoryzuje
 ponownego skryptu, przygotowania, Solve, zwolnienia lease ani zmiany ownera.
 Requested/resolved execution i granice FDM/FEM CPU/GPU pozostają bez zmian.
@@ -562,3 +656,9 @@ Status: decyzja i implementacja w toku. Wymagane są review producenta i obu
 walidatorów, spójny managed build, start i odtworzenie tego samego runu oraz
 oddzielny dowód braku automatycznej nowej próby. Runtime pozostaje
 **NOT VERIFIED**; testów nie uruchamiamy na wyraźne polecenie użytkownika.
+
+Integracja 20.10.2026 zachowuje oba rozróżnione przypadki. Most legacy exit101
+nie wymaga nowego certyfikatu i zachowuje swój dokładny zestaw pól oraz błędy.
+Gdy istnieje `pre-ack-retry.json`, walidowany jest pełny przypięty dowód, bez
+fallbacku do legacy po błędzie lub nieznanym stanie. Żaden wariant nie zmienia
+niezmiennych archiwów, aktualnego ownera ani uprawnień Solve.

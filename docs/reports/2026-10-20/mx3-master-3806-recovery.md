@@ -1,10 +1,10 @@
 # Fullmag master — recovery 3806 i poprawki primitive, 20.10.2026
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 20.10.2026, 20:10 UTC
+## Aktualny status wdrożenia — 20.10.2026, 20:17 UTC
 
-Pracujemy w głównym checkoutcie na `master` (`42d92610312871d591db16a5b60a8f7a6d6339b5`),
-bez nowego worktree i bez testów. Równoległe zmiany oraz dane są zachowane.
+Na `master` integrujemy checkpoint `5c072bd16628354060ff5b1c2345e24013e1039c`
+z remote `d0031ce6d220738609b9fa055d90e52eb6e94213`, bez nowego worktree i bez testów. Równoległe zmiany oraz dane są zachowane.
 Przerwa w zapisach mastera obejmuje obecnie checkpoint Git i integrację remote na polecenie użytkownika.
 
 - **Build:** ostatnia kompilacja `cuda-fem-gpu` i walidacja pakietu przeszły,
@@ -1539,3 +1539,25 @@ Uzgodniono przerwę zapisów mastera z pozostałymi zadaniami. Aktualny checkpoi
 obejmuje równoległe zmiany; niespójny WIP StudyInspectorPanel.tsx (3 odwołania
 do niezdefiniowanego owner) jest zachowywany i zgłoszony potencjalnemu autorowi.
 Nie jest to deklaracja gotowości tego pliku ani nowego buildu.
+
+
+## 57. Integracja remote na polecenie użytkownika — 20.10.2026, 20:17 UTC
+
+Zapisano checkpoint całego mastera: `5c072bd16628354060ff5b1c2345e24013e1039c`
+(56 plików, w tym wcześniej ignorowane mx3.md i raporty recovery). Fetch origin
+potwierdził target `d0031ce6d220738609b9fa055d90e52eb6e94213` oraz 17 commitów
+nieobecnych lokalnie. Merge zachowuje checkpoint i pełną historię remote.
+
+Dwa konflikty dotyczyły runtime_service.py i ADR0061. Zachowano odrębny ścisły
+remote wariant legacy API exit101 oraz nasz wariant SIGTERM(-15) z przypiętym
+certyfikatem pre-ACK. Istniejący certyfikat wymusza walidację; wyłącznie brak
+dokładnego pliku dopuszcza legacy case. Wspólne owner/archive fences pozostają.
+ADR zawiera oba kontrakty i ich rozróżnienie. Automerge launchera zachowuje
+remote pre-admission recreation i lokalny pre-ACK carry-forward.
+
+Parser AST 24 połączonych plików Python przeszedł; konflikt markerów brak.
+Niezależny celowany review resolution: PASS, bez blockera. Nie wykonano testów, buildu ani
+lifecycle. Automatyczny nieblokujący hook commita wykonał lokalny static scan
+React Doctor: 3 ostrzeżenia w StudyInspectorPanel (2 performance, 1 index key);
+nie traktujemy tego jako typecheck ani dowodu gotowości. Znany niezdefiniowany
+owner w równoległym WIP pozostaje zachowany i zgłoszony potencjalnemu autorowi.

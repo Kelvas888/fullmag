@@ -732,6 +732,18 @@ ACCEPTED_REATTACH_FIELDS = frozenset({
     "schema", "run_id", "project_id", "source_request_id", "source_sha256",
     "startup_provenance_sha256", "config_sha256", "proof_path", "proof_sha256",
 })
+_ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS = frozenset({
+    "schema", "state", "api_pid", "api_exit_code", "accepted_store",
+    "bootstrap", "qualification", "error", "shutdown_error",
+})
+_ACCEPTED_REATTACH_PRE_RESTORE_API_EXIT_CODE = 101
+_ACCEPTED_REATTACH_PRE_RESTORE_API_ERROR = (
+    "API binding did not become ready: API loopback probe failed for "
+    "/v2/platform/openapi.json: [Errno 111] Connection refused"
+)
+_ACCEPTED_REATTACH_PRE_RESTORE_SHUTDOWN_ERROR = (
+    "no pinned runtime service owner was available for authenticated drain"
+)
 
 
 def _reattach_relative(root: Path, relative: str, name: str) -> Path:
@@ -1224,6 +1236,76 @@ def _validate_pre_ack_retry_record(record, raw, request, proof, request_sha, rea
     return record
 
 
+def _validate_initial_pre_restore_process_delta(
+    archive_raw: bytes, current_raw: bytes, owner_raw: bytes
+) -> None:
+    """Accept only the known API-before-owner terminal receipt transition."""
+
+    archive = _accepted_reattach_json(
+        archive_raw, "accepted-run immutable terminal process record"
+    )
+    current = _accepted_reattach_json(
+        current_raw, "accepted-run current terminal process record"
+    )
+    owner = _accepted_reattach_json(owner_raw, "accepted-run terminal owner record")
+    if set(current) != _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS:
+        _fail("accepted-run current terminal process record shape differs")
+    if set(archive) not in (
+        _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS,
+        _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS | {"service_owner"},
+    ):
+        _fail("accepted-run immutable terminal process record shape differs")
+    for field in ("schema", "state", "accepted_store", "bootstrap", "qualification"):
+        if current.get(field) != archive.get(field):
+            _fail("accepted-run terminal process immutable field differs: " + field)
+    if (
+        current.get("schema") != "fullmag.docker-process-tree.v1"
+        or current.get("state") != "shutdown_unknown"
+    ):
+        _fail("accepted-run current terminal process is not the known pre-restore failure")
+    if (
+        archive.get("schema") != "fullmag.docker-process-tree.v1"
+        or archive.get("state") != "shutdown_unknown"
+    ):
+        _fail("accepted-run immutable terminal process is not shutdown_unknown")
+    if type(current.get("api_pid")) is not int or current["api_pid"] <= 0:
+        _fail("accepted-run current terminal process API PID is invalid")
+    if (type(current.get("api_exit_code")) is not int
+            or current["api_exit_code"] != _ACCEPTED_REATTACH_PRE_RESTORE_API_EXIT_CODE):
+        _fail("accepted-run current terminal process API exit code is invalid")
+    if current.get("error") != _ACCEPTED_REATTACH_PRE_RESTORE_API_ERROR:
+        _fail("accepted-run current terminal process API error differs")
+    if (
+        current.get("shutdown_error")
+        != _ACCEPTED_REATTACH_PRE_RESTORE_SHUTDOWN_ERROR
+    ):
+        _fail("accepted-run current terminal process shutdown reason differs")
+    _validate_terminal_owner(
+        owner,
+        state="failed",
+        name="accepted-run terminal failed owner",
+        allowed_child_statuses=(
+            ("exited_success", "exited_failure")
+            if "service_owner" in archive else ("exited_success",)
+        ),
+    )
+    if "service_owner" in archive:
+        retained_ready_owner = archive["service_owner"]
+        if not isinstance(retained_ready_owner, dict):
+            _fail("accepted-run retained ready owner is not an object")
+        _validate_terminal_owner(
+            retained_ready_owner,
+            state="ready",
+            name="accepted-run retained ready owner",
+        )
+        if (
+            _owner_identity(retained_ready_owner) != _owner_identity(owner)
+            or _owner_child_identity(retained_ready_owner)
+            != _owner_child_identity(owner)
+        ):
+            _fail("accepted-run retained ready owner differs from failed owner identity")
+
+
 def accepted_reattach_preflight(paths: RuntimePaths):
     """Pin old records or an authenticated successor drain before rotation.
 
@@ -1242,9 +1324,10 @@ def accepted_reattach_preflight(paths: RuntimePaths):
     proof_path = _reattach_relative(paths.state_root, request["proof_path"], "accepted-run proof")
 
     # The first entrypoint invocation has no native ack yet.  It is admitted
-    # only while both mutable records are byte-identical to the archived
-    # terminal records.  A later invocation may never infer this phase from a
-    # state string or marker: it needs the exact drained successor metadata.
+    # from the immutable archive and may accept only the explicitly typed
+    # API-before-owner failure receipt below.  A later invocation may never
+    # infer its phase from a state string or marker: it needs exact drained
+    # successor metadata.
     current_receipt_path = process_receipt_path(paths)
     metadata = None
     try:
@@ -1359,27 +1442,69 @@ def accepted_reattach_preflight(paths: RuntimePaths):
     # The API-specific acknowledgement filename is not knowable until the
     # native successor receives its new API instance identity.  No mutable
     # marker is accepted as a substitute for that first native acknowledgement.
+    owner_relative, owner_expected = (
+        proof.get("terminal_owner_record_path"),
+        proof.get("terminal_owner_record_sha256"),
+    )
+    if not isinstance(owner_expected, str) or not HEX64.fullmatch(owner_expected):
+        _fail("accepted-run backing record digest is missing or invalid")
+    archived_owner = _reattach_relative(
+        paths.state_root, owner_relative, "accepted-run backing owner record"
+    )
+    if (
+        archived_owner.parent != proof_path.parent
+        or archived_owner.name != "terminal-owner.json"
+    ):
+        _fail("accepted-run backing owner record is outside its proof directory")
+    archive_owner_raw = _bounded_regular(
+        archived_owner, "accepted-run immutable terminal owner", 256 * 1024
+    )
+    current_owner_path = runtime_services_root(paths) / "OWNER.json"
+    current_owner_raw = _bounded_regular(
+        current_owner_path, "accepted-run current terminal owner", 256 * 1024
+    )
+    if (
+        _sha256_bytes(archive_owner_raw) != owner_expected
+        or current_owner_raw != archive_owner_raw
+    ):
+        _fail("accepted-run current terminal owner differs from immutable backing evidence")
+
+    process_relative, process_expected = (
+        proof.get("terminal_process_record_path"),
+        proof.get("terminal_process_record_sha256"),
+    )
+    if not isinstance(process_expected, str) or not HEX64.fullmatch(process_expected):
+        _fail("accepted-run backing record digest is missing or invalid")
+    archived_process = _reattach_relative(
+        paths.state_root, process_relative, "accepted-run backing process record"
+    )
+    if (
+        archived_process.parent != proof_path.parent
+        or archived_process.name != "terminal-process.json"
+    ):
+        _fail("accepted-run backing process record is outside its proof directory")
+    archive_process_raw = _bounded_regular(
+        archived_process, "accepted-run immutable terminal process", 256 * 1024
+    )
+    if _sha256_bytes(archive_process_raw) != process_expected:
+        _fail("accepted-run immutable terminal process digest differs")
+    current_process_raw = _bounded_regular(
+        process_receipt_path(paths), "accepted-run current terminal process", 256 * 1024
+    )
     retry = None
-    for prefix, filename, current in (
-            ("terminal_owner_record", "terminal-owner.json", runtime_services_root(paths) / "OWNER.json"),
-            ("terminal_process_record", "terminal-process.json", process_receipt_path(paths))):
-        relative, expected = proof.get(prefix + "_path"), proof.get(prefix + "_sha256")
-        if not isinstance(expected, str) or not HEX64.fullmatch(expected):
-            _fail("accepted-run backing record digest is missing or invalid")
-        archived = _reattach_relative(paths.state_root, relative, "accepted-run backing record")
-        if archived.parent != proof_path.parent or archived.name != filename:
-            _fail("accepted-run backing record is outside its proof directory")
-        archive_raw = _bounded_regular(archived, "accepted-run immutable terminal record", 256 * 1024)
-        current_raw = _bounded_regular(current, "accepted-run current terminal record", 256 * 1024)
-        if _sha256_bytes(archive_raw) != expected:
-            _fail("accepted-run current terminal record differs from immutable backing evidence")
-        if current_raw != archive_raw:
-            if prefix != "terminal_process_record":
-                _fail("accepted-run current terminal record differs from immutable backing evidence")
-            retry_relative = _accepted_reattach_record_relative(request, "pre-ack-retry.json")
-            retry_path = _reattach_relative(paths.state_root, retry_relative, "pre-ACK retry")
-            retry_raw = _bounded_regular(retry_path, "pre-ACK retry", MAX_JSON_BYTES)
-            retry_record = _accepted_reattach_json(retry_raw, "pre-ACK retry")
+    if current_process_raw != archive_process_raw:
+        retry_relative = _accepted_reattach_record_relative(request, "pre-ack-retry.json")
+        retry_path = _reattach_relative(paths.state_root, retry_relative, "pre-ACK retry")
+        retry_observation = _read_optional_accepted_reattach_record(retry_path, "pre-ACK retry")
+        if retry_observation is None:
+            # Retain the remote's exact legacy exit-101 compatibility case.
+            _validate_initial_pre_restore_process_delta(
+                archive_process_raw, current_process_raw, archive_owner_raw
+            )
+        else:
+            # An existing certificate must validate; never fall back from an
+            # invalid or uncertain certificate to the legacy receipt case.
+            retry_raw, retry_record = retry_observation
             def read_retry_record(relative, label):
                 maximum = 8 * 1024 * 1024 if relative.endswith("/preflight-log.json") else MAX_JSON_BYTES
                 data = _bounded_regular(_reattach_relative(BUILD_CONTROL_ROOT, relative, label), label, maximum)
@@ -1387,7 +1512,7 @@ def accepted_reattach_preflight(paths: RuntimePaths):
             _validate_pre_ack_retry_record(
                 retry_record, retry_raw, request, proof, request_sha256, read_retry_record
             )
-            if _sha256_bytes(current_raw) != retry_record["current_process_sha256"]:
+            if _sha256_bytes(current_process_raw) != retry_record["current_process_sha256"]:
                 _fail("pre-ACK retry cannot authorize another API incarnation")
             _assert_pre_ack_unconsumed(retry_path.parent)
             retry = {"pre_ack_retry_path": retry_relative, "pre_ack_retry_sha256": _sha256_bytes(retry_raw)}
@@ -3908,7 +4033,13 @@ def _owner_child_identity(owner: Mapping[str, Any]) -> list[tuple[Any, Any]]:
     return sorted(identity, key=lambda item: (str(item[0]), str(item[1])))
 
 
-def _terminal_owner_children(owner: Mapping[str, Any], *, state: str, name: str) -> None:
+def _terminal_owner_children(
+    owner: Mapping[str, Any],
+    *,
+    state: str,
+    name: str,
+    allowed_child_statuses: Sequence[str] | None = None,
+) -> None:
     """Require the two native scheduler children for one terminal proof."""
 
     children = owner.get("children")
@@ -3929,12 +4060,23 @@ def _terminal_owner_children(owner: Mapping[str, Any], *, state: str, name: str)
         pids.add(pid)
     if set(by_role) != {"compute", "preparation"}:
         _fail(f"{name} has an unexpected scheduler child set")
-    expected_status = "running" if state == "ready" else "exited_success"
-    if any(child.get("status") != expected_status for child in by_role.values()):
-        _fail(f"{name} child status is not {expected_status}")
+    if allowed_child_statuses is None:
+        expected_status = "running" if state == "ready" else "exited_success"
+        if any(child.get("status") != expected_status for child in by_role.values()):
+            _fail(f"{name} child status is not {expected_status}")
+    else:
+        expected_statuses = tuple(allowed_child_statuses)
+        if any(child.get("status") not in expected_statuses for child in by_role.values()):
+            _fail(f"{name} child status is not one of {expected_statuses!r}")
 
 
-def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str) -> None:
+def _validate_terminal_owner(
+    owner: Mapping[str, Any],
+    *,
+    state: str,
+    name: str,
+    allowed_child_statuses: Sequence[str] | None = None,
+) -> None:
     if owner.get("schema_version") != "runtime_service_owner.v1":
         _fail(f"{name} schema is unsupported")
     if owner.get("state") != state:
@@ -3968,7 +4110,12 @@ def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str)
         _fail(f"{name} has invalid scheduler pool identity")
     if not isinstance(owner.get("control_address"), str) or not owner["control_address"]:
         _fail(f"{name} has no control address")
-    _terminal_owner_children(owner, state=state, name=name)
+    _terminal_owner_children(
+        owner,
+        state=state,
+        name=name,
+        allowed_child_statuses=allowed_child_statuses,
+    )
     _owner_fingerprint(owner)
 
 
