@@ -5764,6 +5764,24 @@
       "path": "scripts/test_reference_sushruth_2020_gsg_current.py",
       "symbol": "test_gsg_matches_adaptive_reference_and_refines",
       "responsibility": "Niezależna kwadratura i symetrie oraz zgodność parametrów przykładu."
+    },
+    {
+      "id": "antenna-gsg-comparison-samples",
+      "path": "scripts/compare_sushruth_2020_gsg.py",
+      "symbol": "compare_samples",
+      "responsibility": "Metryki V/J/H z progami przed solve; bez kwalifikacji naukowej."
+    },
+    {
+      "id": "antenna-gsg-comparison-http",
+      "path": "scripts/compare_sushruth_2020_gsg.py",
+      "symbol": "compare",
+      "responsibility": "Binding źródła, receiptu, session/run/stage i niezmiennych payloadów."
+    },
+    {
+      "id": "antenna-gsg-comparison-tests",
+      "path": "scripts/test_compare_sushruth_2020_gsg.py",
+      "symbol": "test_gauge_offsets_are_not_fitted_slopes",
+      "responsibility": "Regresje metryki, geometrii, znaków, gauges i odmów; sztuczne dane nie są solve."
     }
   ],
   "public_api": {
@@ -6607,6 +6625,46 @@
         "meaning": "podziały kwadratury każdego paska",
         "backend_support": "niezależny Python CPU; bez backendu Fullmaga",
         "problem_ir": "brak serializacji do ProblemIR"
+      },
+      {
+        "python": "compare.origin",
+        "type": "str",
+        "default": "required",
+        "si_unit": "$1$",
+        "validation": "tylko origin loopback, bez przekierowań i proxy",
+        "meaning": "istniejące API wyników",
+        "backend_support": "odczyt FEM CPU double; inne lanes niekwalifikowane",
+        "problem_ir": "bez zmiany IR"
+      },
+      {
+        "python": "compare.stage_id",
+        "type": "str",
+        "default": "required",
+        "si_unit": "$1$",
+        "validation": "dokładny runtime stage; authored stage inspect_gsg",
+        "meaning": "właściciel wyniku GSG",
+        "backend_support": "odczyt FEM CPU double",
+        "problem_ir": "istniejący stage"
+      },
+      {
+        "python": "compare.activation_receipt",
+        "type": "Path",
+        "default": "required",
+        "si_unit": "$1$",
+        "validation": "bounded regular JSON, stan activated, zgodne źródło/session/run",
+        "meaning": "pochodzenie wykonanego skryptu",
+        "backend_support": "istniejący Docker DEV",
+        "problem_ir": "bez zmiany IR"
+      },
+      {
+        "python": "compare_samples.data",
+        "type": "dict[str, tuple[list[tuple[float, float, float]], list[float]]]",
+        "default": "required",
+        "si_unit": "współrzędne $\\mathrm{m}$; V $\\mathrm{V}$, J $\\mathrm{A/m^2}$, H $\\mathrm{A/m}$",
+        "validation": "V_electric/J_charge/H_ant, skończone wartości, zgodna liczba komponentów i zakres geometrii; do 4096 punktów H",
+        "meaning": "surowe próbki w układzie świata; helper metryki bez dowodu pochodzenia HTTP",
+        "backend_support": "diagnostyka nominalnego FEM CPU double; bez wykonania backendu",
+        "problem_ir": "bez zmiany IR"
       }
     ]
   }

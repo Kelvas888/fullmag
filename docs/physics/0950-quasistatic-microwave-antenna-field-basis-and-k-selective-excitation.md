@@ -8324,6 +8324,61 @@ nie jest artefaktem zaakceptowanego runu.
 | Regresje | scripts/test_reference_sushruth_2020_gsg_current.py + test_gsg_matches_adaptive_reference_and_refines | zgodność przykładu, niezależna kwadratura i symetrie; nie native qualification |
 
 
+(antenna-sushruth-gsg-http-comparison)=
+### Porównanie rzeczywistego GSG z wzorcem — progi przed pierwszym wynikiem
+
+scripts/compare_sushruth_2020_gsg.py porównuje wyniki wyłącznie nominalnego
+przykładu przypiętego SHA256
+2510d8ed87f00437ca7c0d37fd5f416895ed884f83579354cbf15f2f9d99d5bd.
+Wymaga zakończonego receiptu aktywacji tego skryptu, zgodnych session/run/stage,
+surowych jednostek V, A/m² i A/m oraz payloadów o sprawdzonych hashach.
+Korzysta z istniejącego API i smoke_antenna_artifact_fields.verify; nie uruchamia
+solvera ani nie tworzy dodatkowego modelu lub endpointu. Początkowy status
+rzeczywistego porównania: NOT RUN. Regresje metryki i odmów: 11 PASS
+w interpretowanym Pythonie istniejącego backendu Compose; mock HTTP nie jest
+dowodem odczytu rzeczywistych wyników.
+
+Dla każdej gałęzi J porównuje się normę błędu wektora względem modułu jej
+niezerowego prądu referencyjnego. V porównuje się z linią o znanym nachyleniu,
+usuwając osobną stałą potencjału każdej rozłącznej gałęzi; nachylenie nie jest
+dopasowywane. H porównuje się w rzeczywistych współrzędnych próbkowania ze
+skończonym wzorcem gsg_field, z 128 podziałami przekroju.
+
+Progi diagnostyczne ustalone przed solve: maksymalny względny błąd J 1e-6,
+maksymalny błąd V po usunięciu stałej 1e-8 V oraz błąd normy wektora H
+nie większy niż 0.01 A/m + 1e-5 razy norma pola referencyjnego. Próg absolutny H
+przewyższa sprawdzony błąd kwadratury wzorca; osobna zbieżność w każdym nowym
+zestawie punktów pozostaje wymagana przed kwalifikacją naukową. Są to bramki
+tego nominalnego benchmarku, nie oszacowania błędu solvera ani certyfikaty.
+Nie rozluźniać ich po obejrzeniu wyniku bez nowej, jawnie uzasadnionej wersji.
+
+Sprawdzane są zakresy współrzędnych wszystkich trzech pasków i domeny H.
+Niezgodna geometria, brak gałęzi, niewłaściwa liczba/skład próbek, NaN/Inf,
+obcy receipt lub zmiana wyniku podczas odczytu kończą porównanie błędem.
+Sukces nie dowodzi poprawności całej connectivity, pominiętego obwodu,
+zbieżności siatki, basis/FFT/LLG ani odpowiedzi magnetyzacji z publikacji.
+physics_qualified i omitted_feed_qualified pozostają false.
+
+| Python / CLI | Typ | Domyślnie | SI | Walidacja | Znaczenie | Backend | ProblemIR |
+|---|---|---|---|---|---|---|---|
+| compare.origin / --origin | str | required | $1$ | tylko origin loopback, bez przekierowań i proxy | istniejące API wyników | odczyt FEM CPU double; inne lanes niekwalifikowane | bez zmiany IR |
+| compare.stage_id / --stage-id | str | required | $1$ | dokładny runtime stage; authored stage inspect_gsg | właściciel wyniku GSG | odczyt FEM CPU double | istniejący stage |
+| compare.activation_receipt / --activation-receipt | Path | required | $1$ | bounded regular JSON, stan activated, zgodne źródło/session/run | pochodzenie wykonanego skryptu | istniejący Docker DEV | bez zmiany IR |
+| compare_samples.data | dict[str, tuple[list[tuple[float, float, float]], list[float]]] | required | współrzędne $\mathrm{m}$; V $\mathrm{V}$, J $\mathrm{A/m^2}$, H $\mathrm{A/m}$ | V_electric/J_charge/H_ant, skończone wartości, zgodna liczba komponentów i zakres geometrii; do 4096 punktów H | surowe próbki w układzie świata; helper metryki bez dowodu pochodzenia HTTP | diagnostyka nominalnego FEM CPU double; bez wykonania backendu | bez zmiany IR |
+
+Polecenie wykonuje się w istniejącym backendzie grupy Compose; jego JSON i log
+trafiają do wolumenu technicznego. Kod wyjścia 0 oznacza przejście wymienionych
+porównań i kontroli HTTP, 1 — odmowę albo przekroczony próg. Wynik zachowuje
+identyfikatory, hashe danych, progi i błędy; nie nadpisuje artefaktów solvera.
+Dla FDM CPU, FDM GPU i FEM GPU ten benchmark pozostaje niezakwalifikowany.
+Przepływy publicznego DSL/ProblemIR, planera, archiwum i UI nie są zmieniane.
+
+| Kontrakt | Ścieżka + symbol | Dowód / zakres |
+|---|---|---|
+| Porównanie V/J/H | scripts/compare_sushruth_2020_gsg.py + compare_samples | diagnostyczny nominalny benchmark, bez promocji kwalifikacji |
+| Binding wykonania i HTTP | scripts/compare_sushruth_2020_gsg.py + compare | receipt → sesja/run/stage → niezmienne payloady |
+| Regresje porównania | scripts/test_compare_sushruth_2020_gsg.py + test_gauge_offsets_are_not_fitted_slopes | sztuczne dane sprawdzają metrykę i odmowy; nie są solve Fullmaga |
+
 (antenna-scientific-bibliography)=
 ## 14. References
 
