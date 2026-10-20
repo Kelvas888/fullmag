@@ -2904,7 +2904,11 @@ mod tests {
         input.previous_ack_sha256 = Some("9".repeat(64));
         assert!(validate_input_digests(&input).is_err());
         input.restore_mode = Some(RESTORE_MODE_SUCCESSOR_AUTO.into());
-        input.previous_ack_path = Some("bad".into());
+        input.previous_ack_path = Some("previous-ack.json".into());
+        assert!(validate_input_digests(&input).is_err());
+        input.previous_drain_path = Some("previous-drain.json".into());
+        assert!(validate_input_digests(&input).is_err());
+        input.previous_drain_sha256 = Some("a".repeat(64));
         assert!(validate_input_digests(&input).is_ok());
         input.previous_ack_path = None;
         assert!(validate_input_digests(&input).is_err());
