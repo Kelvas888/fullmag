@@ -195,6 +195,43 @@ const QUANTITY_UNITS: Record<string, string> = {
   torque: "T",
 };
 
+const QUANTITY_DISPLAY_NAMES: Record<string, string> = {
+  B_drive: "Drive flux density",
+  E_ani: "Anisotropy energy",
+  E_demag: "Demagnetization energy",
+  E_dmi: "DMI energy",
+  E_ex: "Exchange energy",
+  E_ext: "Zeeman energy",
+  E_total: "Total energy",
+  H_ani: "Anisotropy field",
+  H_demag: "Demagnetizing field",
+  H_dmi: "DMI field",
+  H_drive: "Drive field",
+  H_eff: "Effective field",
+  H_ex: "Exchange field",
+  H_ext: "External field",
+  H_oe: "Oersted field",
+  H_therm: "Thermal field",
+  dm_dt: "Magnetization rate dm/dt",
+  eden_ani: "Anisotropy energy density",
+  eden_demag: "Demagnetization energy density",
+  eden_dmi: "DMI energy density",
+  eden_ex: "Exchange energy density",
+  eden_ext: "Zeeman energy density",
+  eden_total: "Total energy density",
+  m: "Magnetization m",
+};
+
+/**
+ * Human-readable quantity name for legends and tooltips. Unknown ids fall
+ * back to the id itself, so diagnostics never lose the exact identifier.
+ */
+export function quantityDisplayName(quantityId: string): string {
+  const canonicalQuantityId = resolveCanonicalQuantityId(quantityId);
+  const name = QUANTITY_DISPLAY_NAMES[canonicalQuantityId];
+  return name ? `${name} (${canonicalQuantityId})` : canonicalQuantityId;
+}
+
 export const VACUUM_PERMEABILITY_H_PER_M = 4e-7 * Math.PI;
 
 export function storedFieldQuantityId(quantityId: string): string {

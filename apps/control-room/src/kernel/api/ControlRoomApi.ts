@@ -4622,7 +4622,7 @@ export class ControlRoomApi {
         }
 
         if (!response.ok || result.error) {
-          const apiError = parseOpenApiError(result.error);
+          const apiError = parseOpenApiError(result.error, response.status);
           throw new ControlRoomApiError(
             apiError.message === "Request failed"
               ? await formatResponseError(response)
@@ -5357,7 +5357,7 @@ function readOpenApiResult<T>(result: {
   }
 
   if (!response.ok) {
-    const apiError = parseOpenApiError(result.error);
+    const apiError = parseOpenApiError(result.error, response.status);
     throw new ControlRoomApiError(
       apiError.message,
       response.status,
@@ -5374,7 +5374,7 @@ interface ParsedOpenApiError {
   message: string;
 }
 
-function parseOpenApiError(error: unknown): ParsedOpenApiError {
+function parseOpenApiError(error: unknown, status?: number): ParsedOpenApiError {
   if (error == null) {
     return { code: null, message: "Request failed" };
   }
@@ -5385,14 +5385,14 @@ function parseOpenApiError(error: unknown): ParsedOpenApiError {
       return { code: null, message: "Request failed" };
     }
     try {
-      return parseOpenApiError(JSON.parse(text));
+      return parseOpenApiError(JSON.parse(text), status);
     } catch {
-      return { code: null, message: text };
+      return { code: null, message: formatPlainErrorBody(status ?? 0, text) };
     }
   }
 
   if (typeof error === "string") {
-    return { code: null, message: error };
+    return { code: null, message: formatPlainErrorBody(status ?? 0, error) };
   }
 
   if (typeof error === "object") {
@@ -5424,9 +5424,31 @@ async function formatResponseError(response: Response): Promise<string> {
     try {
       return formatOpenApiError(JSON.parse(text));
     } catch {
-      return text;
+      return formatPlainErrorBody(response.status, text);
     }
   } catch {
     return `Request failed with status ${response.status}`;
   }
+}
+
+const MAX_PLAIN_ERROR_CHARS = 240;
+
+/**
+ * Gateways and proxies may answer with HTML or long plain text. Present a
+ * short, markup-free summary with the HTTP status instead of the raw body.
+ */
+function formatPlainErrorBody(status: number, text: string): string {
+  const looksLikeMarkup = /<\s*(?:!doctype|html|head|body)\b/i.test(text);
+  const titleMatch = looksLikeMarkup ? /<title[^>]*>([^<]*)<\/title>/i.exec(text) : null;
+  const plain = (titleMatch?.[1] ?? (looksLikeMarkup ? "" : text))
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!plain) {
+    return `Request failed with status ${status} (non-JSON response)`;
+  }
+  const bounded = plain.length > MAX_PLAIN_ERROR_CHARS
+    ? `${plain.slice(0, MAX_PLAIN_ERROR_CHARS)}…`
+    : plain;
+  return looksLikeMarkup ? `Request failed with status ${status}: ${bounded}` : bounded;
 }

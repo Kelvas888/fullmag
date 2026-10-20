@@ -204,6 +204,7 @@ import {
 } from "../model/viewport3DTargetFieldBuffer";
 import {
   resolveTrustedViewport3DResponseDomainGenerationId,
+  describeViewport3DFieldDomainMismatch,
   resolveViewport3DFieldDomainCompatibility,
   resolveViewport3DFieldVectorForDomain,
   safeViewport3DDomainGenerationId,
@@ -2143,6 +2144,37 @@ export function applyViewport3DFieldLayerDiagnosticOverrides(
           scalarColorsVisible: false,
         }),
   };
+}
+
+export type Viewport3DFieldPresentationFreshness =
+  | "current"
+  | "stale"
+  | "materializing"
+  | "loading"
+  | "unsupported";
+
+/**
+ * Presentation freshness of the primary field. It is deliberately separate
+ * from the frame state: a retained last-good payload keeps its frame key,
+ * while the user still sees that it is previous data or being materialized.
+ */
+export function resolveViewport3DFieldPresentationFreshness({
+  dataAvailable,
+  error,
+  materializationState,
+  status,
+}: Pick<
+  Viewport3DResourceFrameInput,
+  "dataAvailable" | "error" | "materializationState" | "status"
+>): Viewport3DFieldPresentationFreshness | null {
+  // Errors are presented by the field-data issue banner.
+  if (error || status === "error") return null;
+  if (materializationState === "unsupported") return "unsupported";
+  if (materializationState === "pending") return "materializing";
+  if (status === "stale" || status === "loading" || materializationState === "stale_complete") {
+    return dataAvailable ? "stale" : "loading";
+  }
+  return dataAvailable ? "current" : null;
 }
 
 export function resolveViewport3DResourceFrameState({
@@ -4393,9 +4425,10 @@ export function useViewport3DSceneModel({
         ? buildFdmMultilayerAirboxFieldRequest(
             fdmMultilayerAirboxDomain,
             fdmMultilayerAirboxMaxSamples,
+            airboxSettings.activeQuantityId === "H_eff" ? "H_eff" : "H_demag",
           )
         : EMPTY_FDM_MULTILAYER_AIRBOX_FIELD_REQUEST,
-    [fdmMultilayerAirboxDomain, fdmMultilayerAirboxMaxSamples],
+    [fdmMultilayerAirboxDomain, fdmMultilayerAirboxMaxSamples, airboxSettings.activeQuantityId],
   );
   const fdmMultilayerAirboxField = useViewport3DFieldVectorRequest(
     fdmMultilayerAirboxFieldRequest,
@@ -4403,7 +4436,7 @@ export function useViewport3DSceneModel({
       Boolean(
         fdmLaneActive &&
         fdmMultilayerAirboxDomain &&
-        shouldRequestFdmMultilayerAirboxField(airboxSettings),
+        shouldRequestFdmMultilayerAirboxField(airboxSettings, airboxSettings.activeQuantityId),
       ),
   );
   const magneticPartFieldVectors = useViewport3DPartFieldVectors(
@@ -5560,11 +5593,12 @@ export function useViewport3DSceneModel({
               "carrier=" + fdmAirboxVectorCarrierSampleLimit,
               `max=${fdmAirboxMaxVectorGlyphs}`,
               `geometry=${fdmSingleGridAirboxSettings?.geometryScope ?? "full"}`,
+              `lengthScale=${fdmSingleGridAirboxSettings?.vectorLengthScale ?? 1}`,
               `scale=${fdmAirboxVectorScale}`,
               `anchor=${fdmAirboxVectorAnchorMode}`,
               `offset=${fdmSingleGridAirboxSettings?.vectorSurfaceOffsetEnabled ?? false}:${fdmSingleGridAirboxSettings?.vectorSurfaceOffsetScale ?? 0}`,
             ].join("|")
-          : `fill=${visualProfile.voxelFillRatio}|airbox=true|scale=${fdmAirboxVectorScale}`,
+          : `fill=${visualProfile.voxelFillRatio}|airbox=true|lengthScale=${fdmSingleGridAirboxSettings?.vectorLengthScale ?? 1}|scale=${fdmAirboxVectorScale}`,
         topologyRevision: fdmBuildTopologyRevision,
       })
     : null;
@@ -5584,6 +5618,11 @@ export function useViewport3DSceneModel({
     vectorAnchorMode: fdmAirboxVectorAnchorMode,
     vectorField: fdmAirboxVectorsVisible ? fdmAirboxFieldVector : null,
     vectorGeometryScope: fdmSingleGridAirboxSettings?.geometryScope ?? "full",
+    vectorLengthScale: fdmSingleGridAirboxSettings
+      ? resolveViewport3DAirboxVectorLengthScale(
+          fdmSingleGridAirboxSettings.vectorLengthScale,
+        )
+      : 0,
     vectorOnly: fdmAirboxVectorOnlyBuildInput,
     vectorScale: fdmAirboxVectorScale,
     vectorSurfaceOffsetEnabled:
@@ -5734,11 +5773,23 @@ export function useViewport3DSceneModel({
             colorKey: surfaceColorKey,
             view,
           });
+          const requestedMaxVectors = clampViewport3DInteractiveVectorBudget(
+            settings.vectorBudget,
+            maxInteractiveVectorGlyphs,
+          );
+          const maxVectors =
+            fdmTargetVectorAllocations.get(`fdm-target:${view.target.id}`)?.effective ??
+            requestedMaxVectors;
+          const vectorInstanceOrdinals =
+            settings.geometryScope === "surface"
+              ? view.surfaceInstanceOrdinals
+              : view.instanceOrdinals;
           const renderKey = [
             targetSourceFieldBufferId,
             targetFieldRevision ?? "none",
             targetFieldResourceKey ?? "none",
             maxInteractiveVectorGlyphs,
+            maxVectors,
             vectorScale,
             JSON.stringify(settings),
           ].join("|");
@@ -5771,17 +5822,6 @@ export function useViewport3DSceneModel({
                       fdmDomain.shape,
                     )
                   : null;
-                const requestedMaxVectors = clampViewport3DInteractiveVectorBudget(
-                  settings.vectorBudget,
-                  maxInteractiveVectorGlyphs,
-                );
-                const maxVectors =
-                  fdmTargetVectorAllocations.get(`fdm-target:${view.target.id}`)?.effective ??
-                  requestedMaxVectors;
-                const vectorInstanceOrdinals =
-                  settings.geometryScope === "surface"
-                    ? view.surfaceInstanceOrdinals
-                    : view.instanceOrdinals;
                 const vectorCellIndices = vectorsVisible
                   ? buildFdmVectorSampledCellIndices(
                       view.sourceModel,
@@ -5815,13 +5855,7 @@ export function useViewport3DSceneModel({
                   ? buildFdmVectorSegments(
                       view.sourceModel,
                       targetFieldVector,
-                      resolveViewport3DFdmGridVectorScale(
-                        fdmDomain.shape,
-                        fdmDomain.spacing,
-                        settings.vectorLengthScale,
-                        maxVectors,
-                        settings.geometryScope,
-                      ),
+                      vectorScale,
                       maxVectors,
                       {
                         anchorMode: settings.vectorCenteringEnabled
@@ -5829,6 +5863,7 @@ export function useViewport3DSceneModel({
                           : "tail",
                         geometryScope: settings.geometryScope,
                         instanceOrdinals: vectorInstanceOrdinals,
+                        vectorLengthScale: settings.vectorLengthScale,
                         surfaceOffsetEnabled:
                           settings.vectorSurfaceOffsetEnabled,
                         surfaceOffsetScale:
@@ -5987,6 +6022,7 @@ export function useViewport3DSceneModel({
           vectorAnchorMode: settings.vectorCenteringEnabled ? "center" : "tail",
           vectorField: vectorsVisible ? fieldVector : null,
           vectorGeometryScope: settings.geometryScope,
+          vectorLengthScale: settings.vectorLengthScale,
           vectorOnly:
             vectorsVisible &&
             !settings.pointsVisible &&
@@ -6020,6 +6056,7 @@ export function useViewport3DSceneModel({
       const fieldVector = resolveFdmMultilayerAirboxFieldVector(
         fdmMultilayerAirboxDomain,
         fdmMultilayerAirboxField.data,
+        airboxSettings.activeQuantityId,
       );
       const vectorsVisible = Boolean(
         airboxSettings.vectorsVisible && fieldVector,
@@ -6079,6 +6116,7 @@ export function useViewport3DSceneModel({
         vectorAnchorMode: airboxSettings.vectorCenteringEnabled ? "center" : "tail",
         vectorField: vectorsVisible ? fieldVector : null,
         vectorGeometryScope: airboxSettings.geometryScope,
+        vectorLengthScale: airboxSettings.vectorLengthScale,
         vectorOnly: airboxVectorsOnlyEnabled
           ? createFdmVectorOnlyBuildInput({
               cellSelection: "all",
@@ -6251,6 +6289,7 @@ export function useViewport3DSceneModel({
     const compatibleField = resolveFdmMultilayerAirboxFieldVector(
       fdmMultilayerAirboxDomain,
       fdmMultilayerAirboxField.data,
+      airboxSettings.activeQuantityId,
     );
     const requestedField =
       compatibleField &&
@@ -7104,6 +7143,45 @@ export function useViewport3DSceneModel({
           : String(renderingState.revision),
     webglSharedByteLength: null,
   };
+  // A buffer blocked by the domain gate is never drawn; surface why instead
+  // of leaving geometry without a field. FDM and FEM keep separate gates.
+  const femPartTargetFieldBuffers =
+    globalFieldRenderOptionsWithPrimaryTargetBuffers.partTargetFieldBuffers;
+  const fieldPresentationFreshness = resolveViewport3DFieldPresentationFreshness({
+    dataAvailable: Boolean(fieldVector.data),
+    error: fieldVector.error?.message,
+    materializationState: primaryMagnitudeFieldMeta.data?.state ?? null,
+    status: fieldVector.status,
+  });
+  const fieldDomainIssue = useMemo<Viewport3DFieldDataIssue | null>(() => {
+    let reason: Parameters<typeof describeViewport3DFieldDomainMismatch>[0] | null = null;
+    if (fdmLaneActive && fdmFieldCompatibility?.status === "mismatch") {
+      reason = fdmFieldCompatibility.reason;
+    } else if (femLaneActive && femPartTargetFieldBuffers) {
+      for (const buffer of femPartTargetFieldBuffers.values()) {
+        if (buffer.domainCompatibility.status === "mismatch") {
+          reason = buffer.domainCompatibility.reason;
+          break;
+        }
+      }
+    }
+    if (!reason) return null;
+    return {
+      key: `${fieldVectorResourceKey}:domain-mismatch:${reason}`,
+      message: describeViewport3DFieldDomainMismatch(reason),
+      quantityId: primaryFieldQuantityId,
+      resourceKey: fieldVectorResourceKey,
+      retry: fieldVector.refetch,
+    };
+  }, [
+    fdmFieldCompatibility,
+    fdmLaneActive,
+    femLaneActive,
+    femPartTargetFieldBuffers,
+    fieldVector.refetch,
+    fieldVectorResourceKey,
+    primaryFieldQuantityId,
+  ]);
 
   return {
     artifactInspectionDefinitions: !savedSelectionActive && scene.status === "ready" ? scene.data?.antenna_field_solve_stages ?? [] : [],
@@ -7178,7 +7256,9 @@ export function useViewport3DSceneModel({
     fdmAirboxVectorColors: savedSelectionActive ? null : fdmAirboxVectorColors,
     fdmVectorSegments: savedSelectionActive ? null : fdmVectorSegments,
     femDomain: effectiveViewportFemDomain,
-    fieldDataIssue: savedSelectionActive ? null : fieldDataIssue,
+    fieldDataIssue: savedSelectionActive ? null : (fieldDataIssue ?? fieldDomainIssue),
+    fieldPresentationFreshness:
+      savedSelectionActive || !fieldVectorEnabled ? null : fieldPresentationFreshness,
     fieldRefresh: savedSelectionActive
       ? {
           enabled: false,

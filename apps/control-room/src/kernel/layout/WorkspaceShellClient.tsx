@@ -9,6 +9,7 @@ import {
 import { useSessionCollection } from "../resources/useSessionCollection";
 import { useSessionBootstrapStatus } from "../resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
+import { CommandFeedbackPresenter } from "./CommandFeedbackPresenter";
 import { WorkspaceRenderProfiler } from "../performance/reactRenderProfiler";
 import { SlotHost } from "./SlotHost";
 import { WorkspaceDockLayout } from "./WorkspaceDockLayout";
@@ -147,6 +148,7 @@ function ProjectWorkspaceShell({
         <WorkspaceDockLayout />
       </WorkspaceRenderProfiler>
       {homeOpen ? <HomeOverlay /> : null}
+      <CommandFeedbackPresenter />
     </WorkspaceContentScopeProvider>
   );
 }
@@ -187,6 +189,7 @@ function HomeShell({
       <div className="fm-workspace-overlay-host">
         <SlotHost slotId="overlay" />
       </div>
+      <CommandFeedbackPresenter />
     </div>
   );
 }
@@ -230,6 +233,7 @@ function ActiveWorkspaceShell() {
         <SlotHost slotId="overlay" />
         <SimulationStartupOverlayView state={startupState} />
       </div>
+      <CommandFeedbackPresenter />
     </>
   );
 }
