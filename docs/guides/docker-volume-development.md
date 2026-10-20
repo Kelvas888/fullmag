@@ -127,6 +127,18 @@ startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backe
 `docker-dev-recreate-volume` wymaga zatrzymanego backendu i dokładnych pinów
 próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
+Jeżeli prywatny request odzyskania przyjętego runu został już opublikowany,
+launcher ponownie sprawdza jego niezmienne archiwum procesu i właściciela,
+pierwotną aktywację, reconciliation, stop journal oraz nadal oczekujący run.
+Odtworzony proof i request muszą mieć dokładnie te same bajty. Bieżące pliki
+procesu mogą pochodzić z późniejszego kontenera i nie zastępują historii;
+jego własny dowód zatrzymania nadal przechodzi oddzielną kontrolę przed
+odtworzeniem usług. Brak lub niezgodność części opublikowanego archiwum
+blokuje start, bez powtarzania Solve i bez modyfikacji danych runu.
+Przerwana publikacja bez końcowego requestu może zostać dokończona wyłącznie
+po walidacji bieżących rekordów procesu i właściciela oraz zgodności każdego
+istniejącego fragmentu z odtworzonymi bajtami. Częściowe archiwum samo nie
+uprawnia do odzyskania historii.
 Oczekująca transakcja recovery zachowuje dokładną pierwotną autoryzację po
 ponownej walidacji. Sama publikacja receipt `recovered` nie usuwa uprawnienia
 potrzebnego przy pierwszym starcie po recovery. Jeżeli późniejszy właściciel
