@@ -53,6 +53,8 @@ class MixedP1CapabilityContractTest(unittest.TestCase):
             "mesh.transition.pyramid_tet",
             "mesh.exact_layer_count",
             "fem.cpu.exchange_demag.mixed_p1",
+            "mesh.topology.mixed_p1.v2.disconnected_bodies",
+            "fem.cpu.exchange_demag.mixed_p1.disconnected_bodies",
         ):
             self.assertEqual(
                 by_id[capability_id]["lanes"]["fem_cpu_public"],
@@ -73,6 +75,8 @@ class MixedP1CapabilityContractTest(unittest.TestCase):
             "mesh.transition.pyramid_tet",
             "mesh.exact_layer_count",
             "fem.gpu.exchange_demag.mixed_p1",
+            "mesh.topology.mixed_p1.v2.disconnected_bodies",
+            "fem.gpu.exchange_demag.mixed_p1.disconnected_bodies",
         ):
             self.assertEqual(
                 by_id[capability_id]["lanes"]["fem_gpu_public"],
@@ -80,7 +84,25 @@ class MixedP1CapabilityContractTest(unittest.TestCase):
                 capability_id,
             )
 
-    def test_repository_publication_source_map_has_complete_thin_film_ir_paths(self) -> None:
+    def test_repository_v2_rows_remain_unvalidated_source_contract_only(self) -> None:
+        matrix = json.loads(
+            (REPO_ROOT / "docs/specs/capability-matrix-v0.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        by_id = {feature["id"]: feature for feature in matrix["features"]}
+        for capability_id in (
+            "mesh.topology.mixed_p1.v2.disconnected_bodies",
+            "fem.cpu.exchange_demag.mixed_p1.disconnected_bodies",
+            "fem.gpu.exchange_demag.mixed_p1.disconnected_bodies",
+        ):
+            feature = by_id[capability_id]
+            self.assertEqual(feature["validation_state"], "unvalidated", capability_id)
+            self.assertEqual(feature["validated_workloads"], [], capability_id)
+            self.assertIn("not verified", feature["notes"].lower(), capability_id)
+            self.assertNotIn("production_executable", feature["notes"], capability_id)
+
+    def test_repository_publication_source_map_has_complete_mesh_and_material_ir_paths(self) -> None:
         source_map = json.loads(
             (
                 REPO_ROOT
@@ -100,6 +122,11 @@ class MixedP1CapabilityContractTest(unittest.TestCase):
                 "GeometryMeshHandle.thin_film.exact_layers": f"{prefix}.exact_layer_count",
                 "GeometryMeshHandle.thin_film.transition": f"{prefix}.transition_policy",
                 "GeometryMeshHandle.thin_film.order": f"{prefix}.order",
+                "MagnetHandle.Ms": "geometry.entries[].material.Ms",
+                "MagnetHandle.Aex": "geometry.entries[].material.Aex",
+                "MagnetHandle.alpha": "geometry.entries[].material.alpha",
+                "MagnetHandle.Ku1": "geometry.entries[].physics_stack[].params.ku1",
+                "MagnetHandle.anisU": "geometry.entries[].physics_stack[].params.axis",
             },
             {
                 parameter: details["problem_ir"]
@@ -169,6 +196,25 @@ class MixedP1CapabilityContractTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("duplicate feature IDs", result.stderr)
+
+    def test_rejects_duplicate_json_object_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._copy_contract(root)
+            matrix_path = root / "docs/specs/capability-matrix-v0.json"
+            matrix = matrix_path.read_text(encoding="utf-8")
+            duplicate_key = matrix.replace(
+                '  "schema_version": "capability_matrix.v0",\n',
+                '  "schema_version": "capability_matrix.v0",\n'
+                '  "schema_version": "duplicate",\n',
+                1,
+            )
+            matrix_path.write_text(duplicate_key, encoding="utf-8")
+
+            result = self._run(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate JSON key: schema_version", result.stderr)
 
     def test_rejects_duplicate_markdown_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

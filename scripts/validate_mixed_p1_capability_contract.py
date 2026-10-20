@@ -14,12 +14,17 @@ MESH_CAPABILITIES = {
     "mesh.swept.prism",
     "mesh.transition.pyramid_tet",
     "mesh.exact_layer_count",
+    "mesh.topology.mixed_p1.v2.disconnected_bodies",
 }
 CPU_OPERATOR_CAPABILITY = "fem.cpu.exchange_demag.mixed_p1"
 GPU_OPERATOR_CAPABILITY = "fem.gpu.exchange_demag.mixed_p1"
+V2_CPU_OPERATOR_CAPABILITY = "fem.cpu.exchange_demag.mixed_p1.disconnected_bodies"
+V2_GPU_OPERATOR_CAPABILITY = "fem.gpu.exchange_demag.mixed_p1.disconnected_bodies"
 ALL_CAPABILITIES = MESH_CAPABILITIES | {
     CPU_OPERATOR_CAPABILITY,
     GPU_OPERATOR_CAPABILITY,
+    V2_CPU_OPERATOR_CAPABILITY,
+    V2_GPU_OPERATOR_CAPABILITY,
 }
 LANES = {
     "fdm_cpu_reference",
@@ -49,7 +54,36 @@ MARKDOWN_STATUS = {
         "implemented",
     ),
     "fem.gpu.exchange_demag.mixed_p1": ("`implemented`", "implemented"),
+    "mesh.topology.mixed_p1.v2.disconnected_bodies": (
+        "CPU/GPU source-contract `implemented`; FDM `unsupported`",
+        "implemented",
+    ),
+    "fem.cpu.exchange_demag.mixed_p1.disconnected_bodies": (
+        "source-contract `implemented`",
+        "implemented",
+    ),
+    "fem.gpu.exchange_demag.mixed_p1.disconnected_bodies": (
+        "source-contract `implemented`",
+        "implemented",
+    ),
 }
+
+
+class DuplicateJsonKeyError(ValueError):
+    """Raised when a JSON object repeats a key instead of replacing it."""
+
+
+def reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKeyError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 STATUS_VOCABULARY = {
     "unsupported",
     "source_visible",
@@ -68,9 +102,9 @@ def expected_lanes(capability_id: str) -> dict[str, str]:
     if capability_id in MESH_CAPABILITIES:
         lanes["fem_cpu_public"] = "implemented"
         lanes["fem_gpu_public"] = "implemented"
-    elif capability_id == CPU_OPERATOR_CAPABILITY:
+    elif capability_id in {CPU_OPERATOR_CAPABILITY, V2_CPU_OPERATOR_CAPABILITY}:
         lanes["fem_cpu_public"] = "implemented"
-    elif capability_id == GPU_OPERATOR_CAPABILITY:
+    elif capability_id in {GPU_OPERATOR_CAPABILITY, V2_GPU_OPERATOR_CAPABILITY}:
         lanes["fem_gpu_public"] = "implemented"
     return lanes
 
@@ -83,9 +117,12 @@ def validate(root: Path) -> list[str]:
     runner_path = root / "crates/fullmag-runner/src/capabilities.rs"
     try:
         markdown = markdown_path.read_text(encoding="utf-8")
-        matrix = json.loads(json_path.read_text(encoding="utf-8"))
+        matrix = json.loads(
+            json_path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_json_keys,
+        )
         runner = runner_path.read_text(encoding="utf-8")
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, json.JSONDecodeError, DuplicateJsonKeyError) as error:
         return [str(error)]
 
     features = matrix.get("features")
@@ -117,15 +154,15 @@ def validate(root: Path) -> list[str]:
         errors.append("Markdown status vocabulary must match the canonical product vocabulary")
 
     runner_match = re.search(
-        r"MIXED_P1_FEATURE_CAPABILITY_IDS:\s*\[&str;\s*6\]\s*=\s*\[(.*?)\];",
+        r"MIXED_P1_FEATURE_CAPABILITY_IDS:\s*\[&str;\s*9\]\s*=\s*\[(.*?)\];",
         runner,
         re.DOTALL,
     )
     runner_ids = set(re.findall(r'"([^"]+)"', runner_match.group(1))) if runner_match else set()
     if runner_ids != ALL_CAPABILITIES:
-        errors.append("runner mixed-P1 capability IDs do not match the canonical six-ID set")
+        errors.append("runner mixed-P1 capability IDs do not match the canonical nine-ID set")
     runner_mesh_match = re.search(
-        r"MIXED_P1_MESH_FEATURE_CAPABILITY_IDS:\s*\[&str;\s*4\]\s*=\s*\[(.*?)\];",
+        r"MIXED_P1_MESH_FEATURE_CAPABILITY_IDS:\s*\[&str;\s*5\]\s*=\s*\[(.*?)\];",
         runner,
         re.DOTALL,
     )
@@ -136,7 +173,7 @@ def validate(root: Path) -> list[str]:
     )
     if runner_mesh_ids != MESH_CAPABILITIES:
         errors.append(
-            "runner mixed-P1 mesh capability IDs do not match the canonical four-ID set"
+            "runner mixed-P1 mesh capability IDs do not match the canonical five-ID set"
         )
 
     mixed_rows = re.findall(
