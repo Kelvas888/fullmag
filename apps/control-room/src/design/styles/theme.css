@@ -8,6 +8,8 @@
   --fm-bg-panel: #1e1e2e;
   --fm-bg-panel-raised: #313244;
   --fm-bg-viewport: #11111b;
+  --fm-bg-viewport-top: #181825;
+  --fm-bg-viewport-bottom: #45475a;
   --fm-bg-overlay: #313244;
   --fm-bg-selected: #264069;
   --fm-bg-canvas: #11111b;
@@ -120,6 +122,8 @@
   --fm-bg-panel: #eff1f5;
   --fm-bg-panel-raised: #e6e9ef;
   --fm-bg-viewport: #dce0e8;
+  --fm-bg-viewport-top: #ccd0da;
+  --fm-bg-viewport-bottom: #eff1f5;
   --fm-bg-overlay: #e6e9ef;
   --fm-bg-selected: #c4d7f5;
   --fm-bg-canvas: #dce0e8;

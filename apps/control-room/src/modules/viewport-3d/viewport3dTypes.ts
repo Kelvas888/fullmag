@@ -5,6 +5,8 @@ export interface Viewport3DColors {
   antenna?: ColorRepresentation;
   accentStrong?: ColorRepresentation;
   background: ColorRepresentation;
+  backgroundTop?: ColorRepresentation;
+  backgroundBottom?: ColorRepresentation;
   danger?: ColorRepresentation;
   field: ColorRepresentation;
   mesh: ColorRepresentation;

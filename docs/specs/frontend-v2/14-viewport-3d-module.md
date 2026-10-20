@@ -199,6 +199,39 @@ to the procedural antenna loft.
 
 ## 10. Tests and Profiling
 
+### Appearance and capture contract (2026-10-20)
+
+Appearance is private, versioned browser UI preference state. The default new
+view uses a theme-token gradient and studio lighting for uniform geometry.
+Solid background and flat geometry remain explicit alternatives. Quality profiles
+control budgets and capture resolution; they do not decide whether quantitative
+colors receive shading. Camera ownership remains in the session camera registry;
+saved-dataset inspection retains its separate camera cache.
+
+Reference frames have explicit continuous baselines, grids, ticks, labels and
+overall dimensions. Baselines survive hiding labels. Tick coordinates explicitly
+select `frame-center` (compatibility default) or `world`; geometry remains in SI
+and is never stretched to simulate depth. Text layout uses projected bounds and
+reserved HUD rectangles. Orientation widgets and reference text use a dedicated
+render layer within the same scene and renderer, composited after geometry
+effects. Picking must continue to include interactive orientation widgets.
+
+Quantitative field colors are unlit and un-tonemapped by default. Optional field
+shape shading is an explicit appearance choice with a visible qualification.
+Global AO/Bloom are suppressed while scientific field buffers are displayed;
+requested and effective states and the protection reason remain visible. AO
+radius is a fraction of the scene span, not a fixed number of meters. No effect
+may silently change the color legend or trigger a topology rebuild/field fetch.
+
+Image capture selects the viewport or transparent background and whether to
+include annotations. Canvas pixels alone do not include DOM legends: export
+must explicitly compose the displayed units, values and color ramp. Capture
+must restore renderer and profile state and release offscreen resources on both
+success and failure. A transparent pass must state any effect limitations.
+
+Source implementation is not runtime qualification. The execution checkpoint
+records current browser, color fidelity, idle/resource and integration evidence.
+
 Required verification:
 
 - one canvas mounts for `viewport-3d`;

@@ -1,8 +1,18 @@
 import type { MeshBasicMaterialParameters } from "three";
 
+import {
+  DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES,
+  type Viewport3DAppearancePreferences,
+} from "../viewport3dAppearancePreferences";
 import type { Viewport3DVisualProfile } from "../viewport3dVisualProfile";
 
+type Viewport3DMaterialAppearance = Pick<
+  Viewport3DAppearancePreferences,
+  "fieldShading" | "lightingIntensity" | "lightingMode"
+>;
+
 export interface Viewport3DMaterialProfile {
+  fieldColorShading: boolean;
   airSurface: Pick<
     MeshBasicMaterialParameters,
     | "toneMapped"
@@ -17,6 +27,9 @@ export interface Viewport3DMaterialProfile {
     MeshBasicMaterialParameters,
     | "toneMapped"
   >;
+  uniformGeometry: {
+    lit: boolean;
+  };
   featureEdges: {
     opacity: number;
   };
@@ -49,21 +62,30 @@ export interface Viewport3DMaterialProfile {
 
 export function resolveViewport3DMaterialProfile(
   visualProfile: Viewport3DVisualProfile,
+  appearance: Viewport3DMaterialAppearance =
+    DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES,
 ): Viewport3DMaterialProfile {
   const figureBoost = visualProfile.lighting === "figure" ? 1 : 0;
+  const fieldColorShading = appearance.fieldShading;
+  const lightingIntensity = Number.isFinite(appearance.lightingIntensity)
+    ? Math.min(2, Math.max(0, appearance.lightingIntensity))
+    : 1;
   return {
+    fieldColorShading,
     airSurface: {
       toneMapped: visualProfile.toneMapping !== "none",
     },
     magneticSurface: {
-      shadeStrength:
-        visualProfile.id === "figure" || visualProfile.id === "capture"
-          ? 0
-          : 0.45,
-      toneMapped: visualProfile.toneMapping !== "none",
+      // Quantitative colors stay unmodulated unless shape shading is explicitly
+      // requested. Keep tone mapping out of data colors across quality profiles.
+      shadeStrength: fieldColorShading ? 0.45 * lightingIntensity : 0,
+      toneMapped: false,
     },
     primitivePreview: {
       toneMapped: visualProfile.toneMapping !== "none",
+    },
+    uniformGeometry: {
+      lit: appearance.lightingMode === "studio",
     },
     featureEdges: {
       opacity: Math.max(
@@ -88,10 +110,10 @@ export function resolveViewport3DMaterialProfile(
       toneMapped: false,
     },
     dimensionFrame: {
-      labelOpacity: visualProfile.lighting === "minimal" ? 0.76 : 0.9,
-      majorOpacity: visualProfile.lighting === "minimal" ? 0.26 : 0.38 + figureBoost * 0.06,
+      labelOpacity: 0.95,
+      majorOpacity: visualProfile.lighting === "minimal" ? 0.34 : 0.38 + figureBoost * 0.06,
       minorOpacity: visualProfile.lighting === "minimal" ? 0.14 : 0.22 + figureBoost * 0.04,
-      tickOpacity: visualProfile.lighting === "minimal" ? 0.4 : 0.58 + figureBoost * 0.08,
+      tickOpacity: visualProfile.lighting === "minimal" ? 0.68 : 0.7 + figureBoost * 0.08,
     },
     selectionShell: {
       opacity: visualProfile.lighting === "figure" ? 0.82 : 0.72,

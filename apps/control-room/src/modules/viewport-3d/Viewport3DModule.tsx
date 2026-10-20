@@ -12,6 +12,7 @@ import { useThree } from "@react-three/fiber";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useReducer,
   useRef,
   useState,
@@ -146,6 +147,7 @@ import {
 } from "./regionOverlayMode";
 import { Viewport3DCameraDialog } from "./components/Viewport3DCameraDialog";
 import { Viewport3DSettingsDialog } from "./components/Viewport3DSettingsDialog";
+import { Viewport3DAppearanceHud } from "./components/Viewport3DAppearanceHud";
 import { Viewport3DCanvas } from "./Viewport3DCanvas";
 import { Viewport3DErrorBoundary } from "./Viewport3DErrorBoundary";
 import { type Viewport3DPartSelection } from "./viewport3dDomainAdapter";
@@ -233,6 +235,7 @@ import {
   type Viewport3DThumbnailColouring,
 } from "./viewport3dThumbnail";
 import { registerViewport3DThumbnailCapture } from "./viewport3dThumbnailRegistry";
+import { captureViewport3DImage } from "./viewport3dImageExport";
 
 export function resolveViewport3DVisualizationAckDataIdentity({
   adoptionRegistry,
@@ -1358,11 +1361,11 @@ export function resolveViewport3DVectorSegmentLengthRange(
   return Number.isFinite(min) ? { max, min } : null;
 }
 
-function completePendingViewport3DCapture(
+async function completePendingViewport3DCapture(
   canvasRef: { current: HTMLCanvasElement | null },
   pendingCaptureRevisionRef: { current: number | null },
   captureRevision: number,
-): void {
+): Promise<void> {
   if (
     captureRevision <= 0 ||
     pendingCaptureRevisionRef.current !== captureRevision
@@ -1371,12 +1374,25 @@ function completePendingViewport3DCapture(
   }
   const canvas = canvasRef.current;
   if (!canvas) return;
-  const link = document.createElement("a");
-  link.download = "fullmag-viewport-3d.png";
-  link.href = canvas.toDataURL("image/png");
-  link.click();
   pendingCaptureRevisionRef.current = null;
-  viewport3dStore.completeCapture();
+  const { appearance } = viewport3dStore.getSnapshot();
+  let url: string | null = null;
+  try {
+    const blob = await captureViewport3DImage(canvas, {
+      background: appearance.exportBackground,
+      annotations: appearance.exportAnnotations,
+    });
+    url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.download = "fullmag-viewport-3d.png";
+    link.href = url;
+    link.click();
+  } catch (error) {
+    viewport3dStore.setCaptureError(error instanceof Error ? error.message : "Viewport PNG export failed.");
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+    viewport3dStore.completeCapture();
+  }
 }
 
 function useMeshSizeHistogramHighlight(
@@ -1419,6 +1435,7 @@ interface Viewport3DFrameProps
   colors: Viewport3DSceneProps["colors"] | null;
   colorsUnavailable: boolean;
   captureRevision: number;
+  canvasContextProfileId: Viewport3DSceneProps["visualProfileId"];
   diagnostics: string;
   domainSummary: string;
   effectAntialias: boolean;
@@ -1870,6 +1887,7 @@ export default function Viewport3DModule({
       onCameraInteractionEnd={endCameraInteraction}
       onCameraInteractionStart={beginCameraInteraction}
       captureRevision={commandState.captureRevision}
+      canvasContextProfileId={commandState.captureReturnProfileId ?? commandState.visualProfileId}
       inspectEnabled={commandState.widgets.inspectEnabled}
       inspectRevision={commandState.widgets.inspectRevision}
       requestDiagnostics={kernel.diagnostics}
@@ -2048,6 +2066,7 @@ function useViewport3DSelectionHandlers({
 const Viewport3DFrame = memo(function Viewport3DFrame({
   artifactInspectionDefinitions,
   captureRevision,
+  canvasContextProfileId,
   cameraDialogOpen,
   cameraDialogState,
   cameraResource,
@@ -2130,7 +2149,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     profile: visualProfile,
   });
   const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(
-    visualProfile,
+    getViewport3DVisualProfile(canvasContextProfileId),
     effectAntialias,
   );
   const canvasContextKey = `viewport-3d-canvas-aa:${canvasGlOptions.antialias ? "1" : "0"}-preserve:${canvasGlOptions.preserveDrawingBuffer ? "1" : "0"}`;
@@ -2506,13 +2525,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       meshRevision: sceneProps.renderedMeshRevision,
       rendererId: slotId,
     });
-    completePendingViewport3DCapture(
-      canvasRef,
-      pendingCaptureRevisionRef,
-      captureRevision,
-    );
   }, [
-    captureRevision,
     clientReady,
     kernel.bus,
     sceneProps.renderedMeshRevision,
@@ -2592,9 +2605,12 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     },
     [fieldDataIssue?.key, setOpenedResourceIssueKey],
   );
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (captureRevision <= 0) return;
     pendingCaptureRevisionRef.current = captureRevision;
+  }, [captureRevision]);
+  const onCaptureFrameReady = useCallback(() => {
+    void completePendingViewport3DCapture(canvasRef, pendingCaptureRevisionRef, captureRevision);
   }, [captureRevision]);
   const syncOrbitDebugAngles = useCallback(
     (angles: Viewport3DOrbitDebugAngles) => {
@@ -2769,6 +2785,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       onPointerDown={() => kernel.layout.setFocusedSlot(slotId)}
     >
       <div className="fm-viewport-3d__hud">
+        <Viewport3DAppearanceHud onOpenSettings={() => { void kernel.commands.execute("viewport-3d.open-settings", { source: "menu", layout: kernel.layout, selection: kernel.selection }); }} />
         {fieldDataIssue ? (
           <div className="fm-viewport-3d__issue-banner" role="status">
             <span className="fm-viewport-3d__issue-banner-text">
@@ -3033,6 +3050,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             moveToolObjectId={moveInteraction.moveToolObjectId}
             moveDraftResetRevision={moveInteraction.moveDraftResetRevision}
             onVisualizationFrameCommitted={onVisualizationFrameCommitted}
+            onCaptureFrameReady={onCaptureFrameReady}
             visualProfileId={visualProfile.id}
           />
         </Viewport3DCanvas>
@@ -3085,7 +3103,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         onOpenChange={(open) => viewport3dStore.setCameraDialogOpen(open)}
         open={cameraDialogOpen}
       />
-      <Viewport3DSettingsDialog />
+      <Viewport3DSettingsDialog onCommand={(id) => { void kernel.commands.execute(id, { source: "menu", layout: kernel.layout, selection: kernel.selection }); }} />
       <Viewport3DResourceIssueDialog
         issue={fieldDataIssue}
         open={Boolean(fieldDataIssue && resourceIssueOpen)}

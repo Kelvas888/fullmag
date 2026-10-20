@@ -1,7 +1,7 @@
 "use client";
 
 import type { ThreeEvent } from "@react-three/fiber";
-import { useEffect, useMemo } from "react";
+import { useEffect, useLayoutEffect, useMemo } from "react";
 import { BufferAttribute, BufferGeometry, SphereGeometry } from "three";
 import {
   RENDER_POLICIES,
@@ -184,6 +184,13 @@ function RenderablePrimitiveObject({
     [object, tracker],
   );
 
+  useLayoutEffect(() => {
+    if (!materialProfile.uniformGeometry.lit || geometry.getAttribute("normal")) {
+      return;
+    }
+    geometry.computeVertexNormals();
+  }, [geometry, materialProfile.uniformGeometry.lit]);
+
   useEffect(
     () => () => releasePrimitiveObjectGeometry(tracker, geometry),
     [geometry, tracker],
@@ -244,12 +251,21 @@ function RenderablePrimitiveObject({
           }}
         >
           <primitive attach="geometry" object={geometry} />
-          <meshBasicMaterial
-            color={shaderColor}
-            opacity={opacity}
-            {...materialProfile.primitivePreview}
-            {...surfaceMaterialPolicyProps(opacity)}
-          />
+          {materialProfile.uniformGeometry.lit ? (
+            <meshLambertMaterial
+              color={shaderColor}
+              opacity={opacity}
+              toneMapped={materialProfile.primitivePreview.toneMapped}
+              {...surfaceMaterialPolicyProps(opacity)}
+            />
+          ) : (
+            <meshBasicMaterial
+              color={shaderColor}
+              opacity={opacity}
+              {...materialProfile.primitivePreview}
+              {...surfaceMaterialPolicyProps(opacity)}
+            />
+          )}
         </mesh>
       ) : null}
       {renderPlan.wireframe.visible && edgeGeometry ? (

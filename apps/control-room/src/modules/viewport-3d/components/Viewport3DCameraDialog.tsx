@@ -263,14 +263,14 @@ export function Viewport3DCameraDialog({
 
           <div className="fm-viewport-camera-dialog__form">
             <CameraVectorInputs
-              label="Position"
+              label="Position (m)"
               values={draft.position}
               onChange={(index, value) =>
                 updateVectorDraft("position", index, value)
               }
             />
             <CameraVectorInputs
-              label="Target"
+              label="Target (m)"
               values={draft.target}
               onChange={(index, value) =>
                 updateVectorDraft("target", index, value)

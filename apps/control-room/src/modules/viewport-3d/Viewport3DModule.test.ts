@@ -2023,7 +2023,7 @@ describe("Viewport3DModule scene wiring", () => {
     expect(source).toContain("VIEWPORT_3D_CANVAS_GL_CAPTURE_NO_ANTIALIAS");
     expect(source).toContain("resolveStableViewport3DCanvasGlOptions");
     expect(source.replace(/\r\n/g, "\n")).toContain(
-      "const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(\n    visualProfile,\n    effectAntialias,\n  );",
+      "const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(\n    getViewport3DVisualProfile(canvasContextProfileId),\n    effectAntialias,\n  );",
     );
     expect(source).toContain("const handleCanvasCreated = useCallback");
     expect(source).toContain("const handleCanvasContextMenu = useCallback");

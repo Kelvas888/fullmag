@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { chromium } from "playwright";
+import { runViewportAppearanceBrowserQa } from "./lib/viewport-appearance-browser-qa.mjs";
 
 const require = createRequire(import.meta.url);
 const playwrightPackage = require("playwright/package.json");
@@ -109,10 +110,16 @@ const main = async () => {
       await home.waitFor({ state: "hidden", timeout });
     }
     await page.locator("#fm-main-content.fm-workspace-body").waitFor({ state: "visible", timeout });
+    const sessionBefore = await sessionIdentity(page);
+    const appearanceQa = await runViewportAppearanceBrowserQa(page, {
+      assertCanvas: (label) => assertCanvas(page, label),
+      expectedSession: sessionBefore,
+      getSessionIdentity: () => sessionIdentity(page),
+      timeout,
+    });
     const before = await assertCanvas(page, "before Home");
     const canvasHandle = await page.locator(".fm-viewport-3d canvas").first().elementHandle();
     if (!canvasHandle) throw new Error("before Home: could not retain the workspace canvas element");
-    const sessionBefore = await sessionIdentity(page);
 
     const start = page.getByRole("button", { name: "Start", exact: true });
     await start.waitFor({ state: "visible", timeout });
@@ -144,6 +151,7 @@ const main = async () => {
       final_url: page.url(),
       playwright_version: playwrightPackage.version,
       browser_gpu_mode: browserGpuMode,
+      viewport_appearance: appearanceQa,
       home_round_trip: true,
       home: { section: "home", visible: true, session_label: homeText.match(/Simulation open:[^\n]*/)?.[0] ?? "Simulation open:" },
       session: sessionAfter,
