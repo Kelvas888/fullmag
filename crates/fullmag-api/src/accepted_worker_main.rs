@@ -5,14 +5,13 @@ mod accepted_fem_gpu_state;
 #[path = "accepted_fem_study_worker.rs"]
 mod accepted_fem_study_worker;
 mod accepted_antenna_inspection_worker;
+mod accepted_field_binary;
+mod accepted_field_materialization_worker;
+mod accepted_observation_spool;
+mod error;
 #[path = "accepted_study_worker.rs"]
 mod accepted_study_worker;
 mod accepted_project_storage;
-mod error;
-mod accepted_field_binary;
-mod accepted_observation_spool;
-#[path = "accepted_field_materialization_worker.rs"]
-mod accepted_field_materialization;
 
 mod worker_startup_gate;
 

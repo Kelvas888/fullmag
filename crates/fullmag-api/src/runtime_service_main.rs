@@ -1195,6 +1195,8 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
             std::env::var_os("FULLMAG_STATE_ROOT").map(PathBuf::from),
         )?
         .context("Docker host initialization requires explicit FULLMAG_STATE_ROOT")?;
+    let policy_diagnostic = serde_json::to_string(&policy)
+        .context("serialize probed Docker host policy")?;
     let ledger = fullmag_runtime_control::retry_store_writer_busy(|| {
         HostResourceLedger::initialize_or_upgrade_with_readiness_for_application(
             &application_state_root,
@@ -1202,7 +1204,8 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
             policy.clone(),
             persisted_readiness.clone(),
         )
-    })?;
+    })
+    .with_context(|| format!("Docker host ledger rejected probed_policy={policy_diagnostic}"))?;
     let runtime_generation_sha256 = fullmag_runtime_control::retry_store_writer_busy(|| {
         ledger.read_runtime_generation_sha256()
     })?;

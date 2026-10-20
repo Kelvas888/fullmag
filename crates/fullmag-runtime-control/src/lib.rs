@@ -118,11 +118,26 @@ fn commit_transition_with_catalog_revision(
     store: &SessionStore,
     transition: &CoordinatorTransition,
 ) -> Result<(CoordinatorJournalCommitDisposition, u64)> {
-    let _writer = store.write_transaction()?;
-    if let CoordinatorMessage::Command(envelope) = &transition.message {
-        if matches!(&envelope.command, fullmag_application::WorkerCommand::Prepare { .. } | fullmag_application::WorkerCommand::Start) {
-            study_completion::require_task_dependencies_locked(store, &transition.checkpoint.claim.run_id, transition.checkpoint.claim.task_id.as_str())?;
+    let dependencies = if let CoordinatorMessage::Command(envelope) = &transition.message {
+        if matches!(
+            &envelope.command,
+            fullmag_application::WorkerCommand::Prepare { .. }
+                | fullmag_application::WorkerCommand::Start
+        ) {
+            Some(study_completion::prepare_task_dependencies(
+                store,
+                &transition.checkpoint.claim.run_id,
+                transition.checkpoint.claim.task_id.as_str(),
+            )?)
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    let _writer = store.write_transaction()?;
+    if let Some(dependencies) = dependencies.as_ref() {
+        dependencies.require_locked(store)?;
     }
     if let CoordinatorMessage::Event(envelope) = &transition.message {
         if matches!(&envelope.event, WorkerEvent::Completed { .. }) {
@@ -643,7 +658,8 @@ pub use claim::{
 
 mod scheduler;
 pub use scheduler::{
-    accepted_run_has_scheduler_ready_task, accepted_run_step_is_scheduler_ready,
+    accepted_run_has_scheduler_ready_task, accepted_run_step_is_preparation_frontier,
+    accepted_run_step_is_scheduler_ready,
     resume_next_admitted_accepted_task_with_host,
     schedule_next_ready_accepted_task, schedule_next_ready_accepted_task_with_host,
     ScheduledAcceptedTask,

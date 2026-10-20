@@ -629,7 +629,120 @@ def _host_ledger(control, operation, layout, selected, image):
             "volumes": {"build-control": {"name": control.volume, "external": True}}}
     control.write(operation["root"] + "/ledger-maintenance-compose.json", spec)
     name = "fullmag-ledger-" + operation["receipt"]["attempt"]
-    output = compose_capture(spec, "run", "--name", name, "--no-deps", "host-ledger-maintenance", "ensure", timeout=360)
+    operation["daemon_pending"] = True
+    try:
+        output = compose_capture(
+            spec, "run", "--name", name, "--no-deps",
+            "host-ledger-maintenance", "ensure", timeout=360,
+        )
+    except BaseException as capture_error:
+        proof_path = operation["root"] + "/ledger-helper-failure-observation.json"
+        log_path = operation["root"] + "/ledger-helper-failure-log.json"
+        proof = {
+            "schema": "fullmag.host-ledger-helper-failure-observation.v1",
+            "container_name": name,
+            "image_id": image,
+            "compose_project": control.project,
+            "compose_service": "host-ledger-maintenance",
+            "capture_error": str(capture_error)[:4096],
+        }
+        try:
+            inspected = bounded_capture(
+                docker_argv("inspect", name), timeout=30, maximum=1024 * 1024,
+            )
+            proof["inspect_exit_code"] = inspected.returncode
+            initial = None
+            if inspected.returncode == 0:
+                records = json.loads(inspected.stdout)
+                if isinstance(records, list) and len(records) == 1 and isinstance(records[0], dict):
+                    initial = records[0]
+                    proof["inspect"] = initial
+                else:
+                    proof["inspect_error"] = "inspect result is not exactly one container"
+            else:
+                proof["inspect_error"] = (inspected.stderr or inspected.stdout).decode(
+                    "utf-8", "replace"
+                )[:4096]
+
+            logs = bounded_capture(
+                docker_argv("logs", "--tail", "200", name), timeout=30, maximum=1024 * 1024,
+            )
+            log_bytes = logs.stdout + logs.stderr
+            control.write(log_path, {
+                "schema": "fullmag.host-ledger-helper-failure-log.v1",
+                "container_name": name,
+                "exit_code": logs.returncode,
+                "truncated": len(log_bytes) > 512 * 1024,
+                "log": log_bytes[-(512 * 1024):].decode("utf-8", "replace"),
+            })
+            proof["log_path"] = log_path
+            proof["logs_exit_code"] = logs.returncode
+
+            state = initial.get("State") if isinstance(initial, Mapping) else None
+            config = initial.get("Config") if isinstance(initial, Mapping) else None
+            labels = config.get("Labels") if isinstance(config, Mapping) else None
+            first_id = initial.get("Id") if isinstance(initial, Mapping) else None
+            initially_owned = (
+                isinstance(initial, Mapping)
+                and initial.get("Name") == "/" + name
+                and initial.get("Image") == image
+                and isinstance(config, Mapping) and config.get("Image") == image
+                and isinstance(labels, Mapping)
+                and labels.get("com.docker.compose.project") == control.project
+                and labels.get("com.docker.compose.service") == "host-ledger-maintenance"
+                and isinstance(first_id, str) and re.fullmatch(r"[0-9a-f]{64}", first_id)
+            )
+            if initially_owned and logs.returncode == 0:
+                checked = bounded_capture(
+                    docker_argv("inspect", name), timeout=30, maximum=1024 * 1024,
+                )
+                proof["recheck_exit_code"] = checked.returncode
+                current = None
+                if checked.returncode == 0:
+                    records = json.loads(checked.stdout)
+                    if isinstance(records, list) and len(records) == 1 and isinstance(records[0], dict):
+                        current = records[0]
+                        proof["recheck"] = current
+                final_state = current.get("State") if isinstance(current, Mapping) else None
+                final_config = current.get("Config") if isinstance(current, Mapping) else None
+                final_labels = final_config.get("Labels") if isinstance(final_config, Mapping) else None
+                safe_to_remove = (
+                    isinstance(current, Mapping)
+                    and current.get("Id") == first_id
+                    and current.get("Name") == "/" + name
+                    and current.get("Image") == image
+                    and isinstance(final_config, Mapping) and final_config.get("Image") == image
+                    and isinstance(final_labels, Mapping)
+                    and final_labels.get("com.docker.compose.project") == control.project
+                    and final_labels.get("com.docker.compose.service") == "host-ledger-maintenance"
+                    and isinstance(final_state, Mapping)
+                    and final_state.get("Running") is False
+                    and final_state.get("Status") == "exited"
+                    and type(final_state.get("Pid")) is int and final_state.get("Pid") == 0
+                )
+                proof["cleanup"] = "eligible" if safe_to_remove else "retained-unverified-or-running"
+                control.write(proof_path, proof)
+                operation["receipt"]["ledger_helper_failure_observation"] = proof_path
+                if safe_to_remove:
+                    # Remove only the verified ephemeral container. No -v or
+                    # force flag is used, so named volumes remain untouched.
+                    docker_capture("rm", first_id, timeout=30)
+                    operation["daemon_pending"] = False
+                    proof["cleanup"] = "removed"
+                    control.write(proof_path, proof)
+            else:
+                proof["cleanup"] = "retained-unverified-or-logs-unavailable"
+                control.write(proof_path, proof)
+                operation["receipt"]["ledger_helper_failure_observation"] = proof_path
+        except BaseException as observation_error:
+            proof["observation_error"] = str(observation_error)[:4096]
+            try:
+                control.write(proof_path, proof)
+                operation["receipt"]["ledger_helper_failure_observation"] = proof_path
+            except BaseException:
+                pass
+        raise
+    operation["daemon_pending"] = False
     observed = json.loads(docker_text("inspect", name))
     if (len(observed) != 1 or observed[0].get("Image") != image
             or observed[0].get("State", {}).get("ExitCode") != 0
@@ -980,7 +1093,7 @@ def _precreate_new_windows_runtime_state(state):
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
           recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
           native_restart_metadata=None, accepted_reattach_environment=None,
-          accepted_reattach_metadata=None):
+          accepted_reattach_metadata=None, recreation_resume_proof=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -989,6 +1102,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     provided_operation = operation
     if (provided_control is None) != (provided_operation is None):
         raise BuildControlError("Recovery start requires both control and operation")
+    if recreation_resume_proof is not None and (reuse_state is None or provided_operation is not None):
+        raise BuildControlError("Recreation resume requires the retained state and a new managed start")
     validated_recovery_environment = _validate_recovery_environment(recovery_environment)
     validated_recovery_metadata = _validate_recovery_metadata(recovery_metadata)
     validated_native_restart_metadata = _validate_recovery_metadata(native_restart_metadata)
@@ -1047,6 +1162,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     image = images["backend"]["image_id"]
     device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
     _assert_no_running_fullmag(control.project, identity, **admission_context)
+    if recreation_resume_proof is not None:
+        if args.script is not None or getattr(args, "fresh_state", False):
+            raise BuildControlError("Recreation resume cannot change startup-script or session-state intent")
+        _validate_recreation_resume_records(
+            args, control, selected, identity, expected_proof=recreation_resume_proof
+        )
     if args.script is not None:
         if validated_accepted_reattach_environment:
             raise BuildControlError(
@@ -1071,6 +1192,17 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         operation_inputs["native_failed_restart"] = validated_native_restart_metadata
     if validated_accepted_reattach_metadata is not None:
         operation_inputs["accepted_reattach"] = validated_accepted_reattach_metadata
+    if recreation_resume_proof is not None:
+        operation_inputs["recreation_resume"] = {
+            key: recreation_resume_proof[key]
+            for key in (
+                "recreation_operation_id", "recreation_terminal_sha256",
+                "retained_snapshot_sha256", "prior_terminal_sha256", "prior_compose_sha256",
+            )
+        }
+        operation_inputs["recreation_resume"]["proof_sha256"] = hashlib.sha256(
+            canonical(recreation_resume_proof)
+        ).hexdigest()
     if provided_operation is not None:
         _validate_existing_operation_inputs(provided_operation.get("receipt", {}), operation_inputs)
     operation_context = (control.operation("development", operation_inputs)
@@ -1381,8 +1513,6 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
         host = _session_host()
         host.write_bound_evidence(certificate_path, certificate)
         host.publish_evidence(state / host.OWNER_NAME, certificate)
-    import docker_worker_cgroup
-    docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
     log_writer = lambda output: control.write(operation["root"] + "/storage-probe-log.json", {"log": output})
     if os.name == "nt":
         runtime._complete_backend_storage_preflight(docker_text, backend_id, state, certificate_path, certificate, None,
@@ -1390,6 +1520,10 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     else:
         _session_host().complete_preflight(docker_text, backend_id, state, certificate_path, certificate,
                                            log_writer=log_writer)
+    # The backend publishes its cgroup request only after storage admission.
+    # Complete the independent guest probes first to avoid a circular wait.
+    import docker_worker_cgroup
+    docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
     import docker_host_ledger as ledger
     verify_spec = ledger_profile["maintenance_document"]
     verify_name = "fullmag-ledger-verify-" + token
@@ -1595,12 +1729,14 @@ def _read_cancelled_activation_record(control, relative, *, optional=False):
 
 
 def _cancelled_activation_probe_script() -> str:
-    # This script is passed as Python argv to the already pinned backend. It
+    # This script is passed on stdin to the already pinned backend. It
     # only reads bounded regular files while holding both writer locks. It does
     # not import application code and cannot publish a cancellation itself.
-    return r'''import fcntl, hashlib, json, os, pathlib, stat, sys, time, urllib.error, urllib.request
+    return r'''import fcntl, hashlib, json, os, pathlib, stat, sys, time, urllib.error, urllib.request, uuid
 
 MAX=8*1024*1024
+MAX_PREPARATION_EVIDENCE_RECORDS=6
+preparation_evidence_budget={"records":0,"bytes":0}
 run_id, task_id, request_id, source_sha, marker_path, store_root, ledger_root, expected_scene_revision = sys.argv[1:]
 
 def fail(message): raise RuntimeError(message)
@@ -1625,8 +1761,97 @@ def obj(path, label):
     except (UnicodeDecodeError,json.JSONDecodeError) as error: raise RuntimeError(label+" is invalid JSON") from error
     if not isinstance(value,dict): fail(label+" is not an object")
     return value
+def strict_obj(raw, label):
+    def unique(pairs):
+        value={}
+        for key,item in pairs:
+            if key in value: fail(label+" contains a duplicate key")
+            value[key]=item
+        return value
+    try: value=json.loads(raw.decode("utf-8"),object_pairs_hook=unique)
+    except (UnicodeDecodeError,json.JSONDecodeError) as error: raise RuntimeError(label+" is invalid JSON") from error
+    if not isinstance(value,dict): fail(label+" is not an object")
+    return value
+def read_records(root, label, max_depth=0):
+    root=pathlib.Path(root)
+    if root.is_symlink(): fail(label+" is a symbolic link")
+    if not root.exists(): return []
+    if not root.is_dir(): fail(label+" is not a directory")
+    found=[]
+    def walk_error(error): fail(label+" cannot be inspected")
+    for current,dirs,files in os.walk(root,topdown=True,onerror=walk_error,followlinks=False):
+        current=pathlib.Path(current)
+        depth=len(current.relative_to(root).parts)
+        for name in list(dirs):
+            path=current/name
+            if path.is_symlink() or not path.is_dir() or depth>=max_depth: fail(label+" contains an invalid directory")
+        for name in files:
+            path=current/name
+            if path.is_symlink() or not path.is_file() or path.suffix!=".json": fail(label+" contains an invalid file")
+            raw=regular(path,label+" record")
+            preparation_evidence_budget["records"]+=1
+            preparation_evidence_budget["bytes"]+=len(raw)
+            if (preparation_evidence_budget["records"]>MAX_PREPARATION_EVIDENCE_RECORDS
+                    or preparation_evidence_budget["bytes"]>MAX): fail("preparation evidence exceeds its bound")
+            found.append({"path":path.relative_to(run).as_posix(),"value":strict_obj(raw,label+" record"),"raw":raw})
+    found.sort(key=lambda record:record["path"])
+    return found
 def digest(raw): return hashlib.sha256(raw).hexdigest()
+def is_sha(value): return isinstance(value,str) and len(value)==64 and all(char in "0123456789abcdef" for char in value)
+def is_prefixed_sha(value): return isinstance(value,str) and len(value)==71 and value.startswith("sha256:") and is_sha(value[7:])
 def canon(value): return json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+def ordered_json(value): return json.dumps(value,ensure_ascii=False,sort_keys=False,separators=(",",":"),allow_nan=False).encode("utf-8")
+def preparation_plan_v2_bytes(plan):
+    plan_fields={"schema_version","problem_fingerprint","source","requested_backend","resolved_backend",
+                 "geometry","display","grid","mesh","space"}
+    if not isinstance(plan,dict) or set(plan)!=plan_fields or plan.get("schema_version")!="preparation_plan.v2":
+        fail("accepted preparation plan is not the closed typed v2 schema")
+    if not is_prefixed_sha(plan.get("problem_fingerprint")):
+        fail("accepted preparation plan problem fingerprint is invalid")
+    source=plan.get("source")
+    source_fields={"kind","run_id","specification_fingerprint","step_id"}
+    if (not isinstance(source,dict) or set(source)!=source_fields
+            or source.get("kind")!="accepted_run_step"
+            or not all(isinstance(source.get(key),str) and source.get(key)
+                       for key in ("run_id","specification_fingerprint","step_id"))
+            or not is_prefixed_sha(source.get("specification_fingerprint"))):
+        fail("accepted preparation plan source is not the closed typed v2 schema")
+    requested=plan.get("requested_backend")
+    resolved=plan.get("resolved_backend")
+    if requested not in {"auto","fdm","fem"} or resolved not in {"fdm","fem"}:
+        fail("accepted preparation plan backend is invalid")
+    ordered={
+        "schema_version":plan["schema_version"],
+        "problem_fingerprint":plan["problem_fingerprint"],
+        "source":{
+            "kind":source["kind"],
+            "run_id":source["run_id"],
+            "specification_fingerprint":source["specification_fingerprint"],
+            "step_id":source["step_id"],
+        },
+        "requested_backend":requested,
+        "resolved_backend":resolved,
+    }
+    producer_fields={"kind","producer_id","schema_version","producer_version",
+                     "input_fingerprint","output_fingerprint"}
+    for kind in ("geometry","display","grid","mesh","space"):
+        producer=plan.get(kind)
+        if (not isinstance(producer,dict) or set(producer)!=producer_fields
+                or producer.get("kind")!=kind
+                or any(not isinstance(producer.get(key),str) or not producer.get(key)
+                       for key in ("producer_id","schema_version","producer_version"))
+                or not is_prefixed_sha(producer.get("input_fingerprint"))
+                or not is_prefixed_sha(producer.get("output_fingerprint"))):
+            fail("accepted preparation plan producer is not the closed typed v2 schema")
+        ordered[kind]={
+            "kind":producer["kind"],
+            "producer_id":producer["producer_id"],
+            "schema_version":producer["schema_version"],
+            "producer_version":producer["producer_version"],
+            "input_fingerprint":producer["input_fingerprint"],
+            "output_fingerprint":producer["output_fingerprint"],
+        }
+    return ordered_json(ordered)
 def lock(path,label):
     path=pathlib.Path(path)
     if not path.is_file() or path.is_symlink(): fail(label+" is missing")
@@ -1690,7 +1915,10 @@ ledger_fd=None
 try:
     ledger_fd=lock(ledger/"WRITER.lock","host ledger writer lock")
     store_fd=lock(store/"WRITER.lock","accepted store writer lock")
+    runs=store/"runs"
+    if runs.is_symlink() or not runs.is_dir(): fail("accepted run root is not a real directory")
     run=store/"runs"/run_id
+    if run.is_symlink() or not run.is_dir(): fail("accepted run directory is not a real directory")
     intent_path=run/"run_intent.json"
     catalog_path=run/"run_catalog.json"
     cancellation_path=run/"task_cancellation_intents"/(task_id+".json")
@@ -1706,6 +1934,7 @@ try:
     if not isinstance(intent.get("payload_sha256"),str) or intent.get("payload_sha256")!=digest(canon(intent.get("specification"))): fail("RunIntent payload digest differs")
     specification=intent.get("specification")
     if not isinstance(specification,dict): fail("RunIntent specification is not an object")
+    accepted_spec_fingerprint="sha256:"+digest(canon(specification))
     parameters=specification.get("parameters")
     if not isinstance(parameters,dict): fail("RunIntent parameters are missing")
     live=parameters.get("live_workspace")
@@ -1743,6 +1972,7 @@ try:
         if task.get("lifecycle")!="cancelled": fail("run catalog still has a non-cancelled task")
         for key in ("attempt_id","resource_id","resolved_input_fingerprint","coordinator_watermark","coordinator_genesis"):
             if task.get(key) is not None: fail("run catalog retains an owner on a cancelled task")
+        if task.get("artifact_ids",[])!=[]: fail("cancelled task retains output artifacts")
         if task.get("task_id")==task_id: target=task
     if target is None: fail("target task is missing from the run catalog")
     if cancellation.get("schema_version")!="task_cancellation_intent.v1" or cancellation.get("run_id")!=run_id: fail("cancellation intent identity/schema differs")
@@ -1755,28 +1985,290 @@ try:
     if cancellation.get("cancellation_id") is None: fail("cancellation identity is missing")
 
     ensure_empty_tree(run/"task_admissions","cancelled run task admissions")
-    for name in ("task_preparation_receipts", "accepted_stage_preparation_receipts"):
-        paths=run/name
-        ensure_empty_tree(paths, "task preparation receipts")
-    for name in ("preparation_process_launches", "preparation_process_exit_receipts"):
-        matches=matching_json(run/name,"preparation process records",lambda value: value.get("run_id")==run_id and value.get("task_id") in task_ids)
-        if matches: fail("task has durable preparation process records")
-    prep_matches=matching_json(run/"preparation_resource_leases","preparation resource leases",lambda value: value.get("run_id")==run_id and value.get("task_id") in task_ids)
-    if prep_matches: fail("task has a durable preparation lease")
+    task_receipts=read_records(run/"task_preparation_receipts","task preparation receipts")
+    stage_receipts=read_records(run/"accepted_stage_preparation_receipts","accepted stage preparation receipts")
+    prep_launches=read_records(run/"preparation_process_launches","preparation process launches")
+    prep_exits=read_records(run/"preparation_process_exit_receipts","preparation process exits")
+    prep_leases=read_records(run/"preparation_resource_leases","preparation resource leases",1)
+    preparation_records=task_receipts+stage_receipts+prep_launches+prep_exits+prep_leases
+    preparation_evidence=[]
+    if not task_receipts:
+        if preparation_records: fail("preparation evidence is orphaned from its task receipt")
+    else:
+        if (len(task_receipts)!=1 or task_receipts[0]["path"]!="task_preparation_receipts/"+task_id+".json"
+                or len(stage_receipts)>1 or len(prep_launches)!=1 or len(prep_exits)!=1 or len(prep_leases)!=1):
+            fail("cancelled task preparation evidence is not unique")
+        receipt_record=task_receipts[0]
+        receipt=receipt_record["value"]
+        step_id=receipt.get("step_id")
+        input_fingerprint=target.get("input_fingerprint")
+        if (set(receipt)!={"schema_version","run_id","task_id","step_id","input_fingerprint",
+                           "preparation_id","plan_fingerprint","payload_sha256","payload","created_at"}
+                or not isinstance(receipt.get("created_at"),str)
+                or not isinstance(step_id,str) or not step_id or len(step_id.encode("utf-8"))>256
+                or any(ord(char)<32 or 127<=ord(char)<=159 or char in "/\\" for char in step_id)):
+            fail("task preparation receipt step identity is invalid")
+        expected_task_id="task-"+digest((run_id+"\0"+step_id).encode("utf-8"))
+        if (receipt.get("schema_version")!="task_preparation_receipt.v1"
+                or receipt.get("run_id")!=run_id or receipt.get("task_id")!=task_id
+                or expected_task_id!=task_id or not is_sha(input_fingerprint)
+                or receipt.get("input_fingerprint")!=input_fingerprint
+                or receipt.get("preparation_id")!="prep-"+task_id):
+            fail("task preparation receipt run/task/step/fingerprint differs")
+        payload=receipt.get("payload")
+        plan_fingerprint=receipt.get("plan_fingerprint")
+        payload_sha=receipt.get("payload_sha256")
+        if (not isinstance(payload,dict) or not is_prefixed_sha(plan_fingerprint)
+                or payload_sha!=digest(canon(payload))):
+            fail("task preparation receipt payload digest differs")
+        payload_schema=payload.get("schema_version")
+        plan=payload.get("plan")
+        if (payload_schema not in {"preparation_receipt.v1","closed_loop_preparation_receipt.v1"}
+                or payload.get("preparation_id")!="prep-"+task_id
+                or payload.get("plan_fingerprint")!=plan_fingerprint or not isinstance(plan,dict)):
+            fail("task preparation receipt plan identity differs")
+        plan_bytes=(preparation_plan_v2_bytes(plan) if payload_schema=="preparation_receipt.v1"
+                    else canon(plan))
+        if "sha256:"+digest(plan_bytes)!=plan_fingerprint:
+            fail("task preparation receipt plan fingerprint differs")
+        source=plan.get("source")
+        if not isinstance(source,dict) or source.get("run_id")!=run_id or source.get("step_id")!=step_id:
+            fail("task preparation receipt source run/step differs")
+        if payload_schema=="preparation_receipt.v1":
+            accepted_source=payload.get("accepted_run_source")
+            if (source.get("kind")!="accepted_run_step" or not isinstance(accepted_source,dict)
+                    or accepted_source.get("schema_version")!="accepted_run_preparation_source.v1"
+                    or accepted_source.get("run_id")!=run_id or accepted_source.get("step_id")!=step_id
+                    or accepted_source.get("specification_fingerprint")!=accepted_spec_fingerprint
+                    or source.get("specification_fingerprint")!=accepted_source.get("specification_fingerprint")
+                    or plan.get("problem_fingerprint")!=accepted_source.get("problem_fingerprint")
+                    or not is_prefixed_sha(accepted_source.get("problem_fingerprint"))):
+                fail("task preparation receipt accepted source differs")
+        elif (plan.get("schema_version")!="closed_loop_preparation_plan.v1"
+                or source.get("schema_version")!="accepted_run_preparation_source.v1"
+                or source.get("specification_fingerprint")!=accepted_spec_fingerprint
+                or plan.get("problem_fingerprint")!=source.get("problem_fingerprint")
+                or any(not is_prefixed_sha(plan.get(field)) for field in
+                       ("problem_fingerprint","carrier_fingerprint","operation_fingerprint","source_mesh_fingerprint"))):
+            fail("task preparation receipt closed-loop source differs")
+        if stage_receipts:
+            stage_record=stage_receipts[0]
+            stage=stage_record["value"]
+            if (set(stage)!={"schema_version","run_id","step_id","task_id","input_fingerprint",
+                             "preparation_id","plan_fingerprint","task_receipt_payload_sha256"}
+                    or stage_record["path"]!="accepted_stage_preparation_receipts/"+task_id+".json"
+                    or stage.get("schema_version")!="accepted_stage_preparation_receipt.v1"
+                    or stage.get("run_id")!=run_id or stage.get("task_id")!=task_id
+                    or stage.get("step_id")!=step_id
+                    or stage.get("input_fingerprint")!=receipt.get("input_fingerprint")
+                    or stage.get("preparation_id")!=receipt.get("preparation_id")
+                    or stage.get("plan_fingerprint")!=plan_fingerprint
+                    or stage.get("task_receipt_payload_sha256")!=payload_sha):
+                fail("accepted stage preparation receipt differs from its task receipt")
+        launch_record=prep_launches[0]; launch=launch_record["value"]
+        exit_record=prep_exits[0]; process_exit=exit_record["value"]
+        lease_record=prep_leases[0]; prep_lease=lease_record["value"]
+        launch_id=launch.get("launch_id"); exit_id=process_exit.get("receipt_id")
+        preparation_attempt=launch.get("preparation_attempt_id")
+        resource_id=launch.get("resource_id"); lease_token=launch.get("lease_token")
+        launch_heartbeat=launch.get("lease_heartbeat_sequence")
+        exit_heartbeat=process_exit.get("lease_heartbeat_sequence")
+        lease_heartbeat=prep_lease.get("heartbeat_sequence")
+        launch_required={"schema_version","launch_id","run_id","task_id","preparation_attempt_id",
+                         "resource_id","lease_token","lease_heartbeat_sequence","supervisor_process_id","created_at"}
+        exit_required={"schema_version","receipt_id","run_id","task_id","preparation_attempt_id",
+                       "resource_id","lease_token","lease_heartbeat_sequence","process_id",
+                       "status_success","exit_code","timed_out","observed_at"}
+        lease_required={"schema_version","resource_id","budget","run_id","task_id","preparation_attempt_id",
+                        "lease_token","state","acquired_at","heartbeat_at","heartbeat_sequence","released_at"}
+        if (not all(isinstance(value,str) and value and len(value)<=200
+                    and value[0] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    and all(char in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for char in value)
+                    and not value.endswith(".") for value in (launch_id,exit_id,preparation_attempt,resource_id,lease_token))
+                or not isinstance(launch_heartbeat,int) or isinstance(launch_heartbeat,bool) or launch_heartbeat<0
+                or not isinstance(exit_heartbeat,int) or isinstance(exit_heartbeat,bool) or exit_heartbeat<0
+                or not isinstance(lease_heartbeat,int) or isinstance(lease_heartbeat,bool) or lease_heartbeat<0
+                or exit_heartbeat<launch_heartbeat or exit_heartbeat!=lease_heartbeat):
+            fail("preparation process identity is invalid")
+        identity={"run_id":run_id,"task_id":task_id,"preparation_attempt_id":preparation_attempt,
+                  "resource_id":resource_id,"lease_token":lease_token}
+        if (launch_record["path"]!="preparation_process_launches/"+launch_id+".json"
+                or not launch_required.issubset(launch) or not set(launch).issubset(launch_required|{"supervisor_start_token"})
+                or launch.get("schema_version")!="preparation_process_launch.v1"
+                or exit_id!="prep-exit-"+launch_id
+                or not isinstance(launch.get("supervisor_process_id"),int)
+                or isinstance(launch.get("supervisor_process_id"),bool) or launch.get("supervisor_process_id",0)<=0
+                or not isinstance(launch.get("created_at"),str)
+                or any(launch.get(key)!=value for key,value in identity.items())
+                or exit_record["path"]!="preparation_process_exit_receipts/"+exit_id+".json"
+                or not exit_required.issubset(process_exit)
+                or not set(process_exit).issubset(exit_required|{"process_start_token","failure_reason"})
+                or process_exit.get("schema_version")!="preparation_process_exit_receipt.v1"
+                or any(process_exit.get(key)!=value for key,value in identity.items())
+                or process_exit.get("lease_heartbeat_sequence")!=exit_heartbeat
+                or process_exit.get("status_success") is not True
+                or not isinstance(process_exit.get("exit_code"),int)
+                or isinstance(process_exit.get("exit_code"),bool) or process_exit.get("exit_code")!=0
+                or process_exit.get("timed_out") is not False or process_exit.get("failure_reason") is not None
+                or not isinstance(process_exit.get("process_id"),int) or isinstance(process_exit.get("process_id"),bool)
+                or process_exit.get("process_id",0)<=0 or not isinstance(process_exit.get("observed_at"),str)):
+            fail("preparation process does not have one successful exact exit proof")
+        if (lease_record["path"]!="preparation_resource_leases/"+resource_id+"/"+lease_token+".json"
+                or not lease_required.issubset(prep_lease)
+                or not set(prep_lease).issubset(lease_required|{"host_launch_binding"})
+                or prep_lease.get("schema_version")!="preparation_resource_lease.v1"
+                or any(prep_lease.get(key)!=value for key,value in identity.items())
+                or prep_lease.get("heartbeat_sequence")!=exit_heartbeat
+                or prep_lease.get("state")!="released"
+                or not isinstance(prep_lease.get("released_at"),str) or not prep_lease.get("released_at")
+                or not isinstance(prep_lease.get("budget"),dict)
+                or any(not isinstance(prep_lease.get(key),str) for key in ("acquired_at","heartbeat_at"))):
+            fail("preparation resource lease is not released for the exact process")
+        preparation_evidence=sorted(
+            ({"path":record["path"],"sha256":digest(record["raw"])} for record in preparation_records),
+            key=lambda item:item["path"],
+        )
     solver_matches=matching_json(run/"resource_leases","solver resource leases",lambda value: value.get("run_id")==run_id and value.get("task_id") in task_ids and value.get("state")!="released")
     if solver_matches: fail("task has an active or uncertain solver lease")
 
     ledger_raw=regular(ledger/"HOST_RESOURCE_LEDGER.json","host resource ledger")
-    ledger_doc=json.loads(ledger_raw)
+    ledger_doc=strict_obj(ledger_raw,"host resource ledger")
     reservations=ledger_doc.get("reservations")
     if not isinstance(reservations,list): fail("host resource ledger reservations are missing")
+    ledger_policy=ledger_doc.get("policy")
+    if not isinstance(ledger_policy,dict): fail("host resource ledger policy is missing")
     matching=[]
+    preparation_host_reservations=[]
+    reservation_required={"identity","request_sha256","host_id","policy_revision","host_owner_epoch",
+                          "topology_sha256","budget","release_proof_sha256","state",
+                          "preparation_launch_gate","preparation_launch_owner"}
+    reservation_allowed=reservation_required|{"runtime_generation_sha256","compute_node_owner_id",
+                          "compute_node_owner_epoch","exclusive_gpu_uuids","gpu_vram_bytes_by_uuid",
+                          "cpu_ids","node_policy_revision","scheduling_priority","parallelism"}
     for row in reservations:
         if not isinstance(row,dict): fail("host resource ledger reservation is malformed")
         identity=row.get("identity")
         if isinstance(identity,dict) and identity.get("run_id")==run_id and identity.get("task_id") in task_ids:
-            matching.append(row)
-            if row.get("state")!="released": fail("host resource ledger still holds the cancelled task")
+            if row.get("state")!="released":
+                matching.append(row)
+                continue
+            if not task_receipts or preparation_host_reservations:
+                fail("host resource ledger retains an unexpected released task reservation")
+            if (not reservation_required.issubset(row)
+                    or not set(row).issubset(reservation_allowed)
+                    or "worker_launch_gate" in row):
+                fail("released preparation reservation fields are invalid")
+            owner_identity=identity.get("owner")
+            if (set(identity)!={"store_id","run_id","task_id","resource_id","owner","lease_token"}
+                    or not isinstance(owner_identity,dict)
+                    or set(owner_identity)!={"kind","preparation_attempt_id"}
+                    or owner_identity.get("kind")!="preparation"
+                    or identity.get("run_id")!=run_id or identity.get("task_id")!=task_id
+                    or identity.get("resource_id")!=resource_id
+                    or identity.get("lease_token")!=lease_token
+                    or owner_identity.get("preparation_attempt_id")!=preparation_attempt
+                    or not is_prefixed_sha(identity.get("store_id"))):
+                fail("released preparation reservation identity differs from its exact process")
+            request_sha=row.get("request_sha256")
+            proof_sha=row.get("release_proof_sha256")
+            if not is_sha(request_sha) or not is_sha(proof_sha):
+                fail("released preparation reservation proof digests are invalid")
+            binding=prep_lease.get("host_launch_binding")
+            if not isinstance(binding,dict):
+                fail("released preparation reservation has no host launch binding")
+            binding_required={"schema_version","ledger_root","policy"}
+            binding_allowed=binding_required|{"runtime_generation_sha256"}
+            if (not binding_required.issubset(binding) or not set(binding).issubset(binding_allowed)
+                    or binding.get("schema_version")!="host_launch_binding.v1"
+                    or not isinstance(binding.get("ledger_root"),str)
+                    or pathlib.Path(binding["ledger_root"])!=ledger
+                    or binding.get("policy")!=ledger_policy):
+                fail("preparation lease host binding differs from the pinned ledger")
+            binding_policy=binding["policy"]
+            for key in ("revision","owner_epoch"):
+                value=binding_policy.get(key)
+                if not isinstance(value,int) or isinstance(value,bool) or value<=0:
+                    fail("preparation host policy identity is invalid")
+            if (not isinstance(binding_policy.get("host_id"),str) or not binding_policy["host_id"]
+                    or not is_sha(binding_policy.get("topology_sha256"))):
+                fail("preparation host policy identity is invalid")
+            for key in ("policy_revision","host_owner_epoch"):
+                value=row.get(key)
+                if not isinstance(value,int) or isinstance(value,bool) or value<=0:
+                    fail("released preparation reservation policy fence is invalid")
+            if (row.get("host_id")!=binding_policy.get("host_id")
+                    or row.get("policy_revision")!=binding_policy.get("revision")
+                    or row.get("host_owner_epoch")!=binding_policy.get("owner_epoch")
+                    or row.get("topology_sha256")!=binding_policy.get("topology_sha256")):
+                fail("released preparation reservation differs from its bound host policy")
+            generation=binding.get("runtime_generation_sha256")
+            policy_schema=binding_policy.get("schema_version")
+            if policy_schema not in {"host_resource_ledger_policy.v1","host_resource_ledger_policy.v2","host_resource_ledger_policy.v3"}:
+                fail("preparation host binding policy schema is unsupported")
+            if ((policy_schema in {"host_resource_ledger_policy.v2","host_resource_ledger_policy.v3"} and generation is None)
+                    or (generation is not None and not is_sha(generation))):
+                fail("preparation host binding runtime generation is invalid")
+            if row.get("runtime_generation_sha256")!=generation:
+                fail("released preparation reservation runtime generation differs")
+            owner=row.get("preparation_launch_owner")
+            owner_required={"schema_version","launch_id","launch_sha256","supervisor_process_id","supervisor_start_token"}
+            if (not isinstance(owner,dict) or set(owner)!=owner_required
+                    or owner.get("schema_version")!="host_preparation_launch_owner.v1"
+                    or owner.get("launch_id")!=launch_id
+                    or owner.get("launch_sha256")!=digest(canon(launch))
+                    or not isinstance(owner.get("supervisor_process_id"),int)
+                    or isinstance(owner.get("supervisor_process_id"),bool)
+                    or owner.get("supervisor_process_id",0)<=0
+                    or owner.get("supervisor_process_id")!=launch.get("supervisor_process_id")
+                    or owner.get("supervisor_start_token")!=launch.get("supervisor_start_token")
+                    or not isinstance(owner.get("supervisor_start_token"),str)
+                    or not owner["supervisor_start_token"]):
+                fail("released preparation reservation is not bound to the exact launch owner")
+            gate=row.get("preparation_launch_gate")
+            if (not isinstance(gate,dict) or set(gate)!={"state","token"}
+                    or gate.get("state")!="consumed" or not isinstance(gate.get("token"),str)):
+                fail("released preparation reservation has no consumed launch gate")
+            try:
+                if str(uuid.UUID(gate["token"]))!=gate["token"]:
+                    fail("released preparation launch gate token is not canonical")
+            except (ValueError, AttributeError):
+                fail("released preparation launch gate token is invalid")
+            budget=row.get("budget")
+            budget_fields={"cpu_millis","memory_bytes","gpu_memory_bytes","storage_bytes"}
+            if (not isinstance(budget,dict) or set(budget)!=budget_fields
+                    or budget!=prep_lease.get("budget")
+                    or any(not isinstance(budget[key],int) or isinstance(budget[key],bool) or budget[key]<0
+                           for key in budget_fields)
+                    or any(budget[key]<=0 for key in ("cpu_millis","memory_bytes","storage_bytes"))
+                    or budget["gpu_memory_bytes"]!=0):
+                fail("released preparation reservation budget differs from its exact lease")
+            proof_dir=ledger/"proofs"
+            if proof_dir.is_symlink() or not proof_dir.is_dir():
+                fail("released preparation proof directory is missing or unsafe")
+            proof_raw=regular(proof_dir/(proof_sha+".json"),"preparation host release proof")
+            preparation_evidence_budget["records"]+=1
+            preparation_evidence_budget["bytes"]+=len(proof_raw)
+            if (preparation_evidence_budget["records"]>MAX_PREPARATION_EVIDENCE_RECORDS
+                    or preparation_evidence_budget["bytes"]>MAX):
+                fail("preparation evidence exceeds its bound")
+            release_proof=strict_obj(proof_raw,"preparation host release proof")
+            proof_fields={"schema_version","kind","host_id","store_id","request_sha256",
+                          "preparation_receipt","released_preparation_lease","preparation_launch_owner"}
+            if (digest(proof_raw)!=proof_sha or set(release_proof)!=proof_fields
+                    or release_proof.get("schema_version")!="host_resource_release_proof.v1"
+                    or release_proof.get("kind")!="preparation"
+                    or release_proof.get("host_id")!=row.get("host_id")
+                    or release_proof.get("store_id")!=identity.get("store_id")
+                    or release_proof.get("request_sha256")!=request_sha
+                    or canon(release_proof.get("preparation_receipt"))!=canon(process_exit)
+                    or canon(release_proof.get("released_preparation_lease"))!=canon(prep_lease)
+                    or canon(release_proof.get("preparation_launch_owner"))!=canon(owner)):
+                fail("released preparation reservation lacks its exact immutable release proof")
+            preparation_host_reservations.append({"identity":identity,"sha256":digest(canon(row))})
+    if (task_receipts and isinstance(prep_lease.get("host_launch_binding"),dict)
+            and len(preparation_host_reservations)!=1):
+        fail("host-bound preparation evidence has no exact released reservation")
+    preparation_host_reservations.sort(key=lambda item:canon(item["identity"]))
 
     expected_scene_revision=int(expected_scene_revision)
     marker_raw=regular(marker_path,"startup activation marker")
@@ -1809,9 +2301,26 @@ try:
             or current_document_instance != api_instance_id):
         fail("current session script identity differs from the cancelled activation")
     run_request=urllib.request.Request("http://127.0.0.1:8081/v2/sessions/current/simulation/runs/current",headers={"Accept":"application/json","Host":"localhost"})
+    retained_current_run_sha256=None
     try:
         with urllib.request.urlopen(run_request,timeout=5) as response:
-            fail("current session still has an in-memory run")
+            run_raw=response.read(MAX+1)
+            if (response.status!=200 or len(run_raw)>MAX
+                    or response.headers.get("x-fullmag-api-instance")!=api_instance_id):
+                fail("retained current run response identity is invalid")
+            retained_run=strict_obj(run_raw,"retained current run")
+            # Stop retains a read-model record with status stopping even when
+            # every durable task is cancelled before claim. This is history,
+            # not a process owner: the native proofs above remain mandatory.
+            if (retained_run.get("run_id")!=run_id
+                    or retained_run.get("session_id")!=session_id
+                    or retained_run.get("started_at")!=current_session["created_at"]
+                    or retained_run.get("status") not in {"stopping","stopped","cancelled"}
+                    or current_status.get("solver",{}).get("state") not in {"breaking","stopped","cancelled","idle"}
+                    or any(value is not None for key,value in retained_run.items()
+                           if key=="solver_time_seconds" or key.startswith("final_"))):
+                fail("retained current run is not the exact pre-Compute cancelled read model")
+            retained_current_run_sha256=digest(run_raw)
     except urllib.error.HTTPError as error:
         if error.code != 404: fail("current run absence is not confirmed")
         if error.headers.get("x-fullmag-api-instance") != api_instance_id:
@@ -1836,7 +2345,11 @@ try:
     if health.get("status")!="ok" or health.get("active_session") is not True:
         fail("cancelled activation requires the pinned stale active session")
     if matching: fail("host resource ledger retains a cancelled task reservation")
-    print(json.dumps({"schema":"fullmag.docker-activation-cancel-probe.v1","run_id":run_id,"task_id":task_id,"request_id":request_id,"source_sha256":source_sha,"catalog_revision":catalog["revision"],"cancellation_id":cancellation["cancellation_id"],"run_intent_sha256":digest(intent_raw),"run_catalog_sha256":digest(catalog_raw),"cancellation_intent_sha256":digest(cancellation_raw),"activation_marker_sha256":digest(marker_raw),"host_ledger_sha256":digest(ledger_raw),"matching_reservations":len(matching),"task_count":len(tasks),"live_api_instance_id":api_instance_id,"live_session_id":session_id,"live_session_epoch":session_epoch,"live_scene_revision":scene_revision,"live_workspace_sha256":digest(canon(live)),"current_session_sha256":current_status_sha256,"scene":scene,"compute_queue":queue,"runtime_service":runtime,"health":health},sort_keys=True))
+    probe={"schema":"fullmag.docker-activation-cancel-probe.v1","run_id":run_id,"task_id":task_id,"request_id":request_id,"source_sha256":source_sha,"catalog_revision":catalog["revision"],"cancellation_id":cancellation["cancellation_id"],"run_intent_sha256":digest(intent_raw),"run_catalog_sha256":digest(catalog_raw),"cancellation_intent_sha256":digest(cancellation_raw),"activation_marker_sha256":digest(marker_raw),"host_ledger_sha256":digest(ledger_raw),"matching_reservations":len(matching),"task_count":len(tasks),"live_api_instance_id":api_instance_id,"live_session_id":session_id,"live_session_epoch":session_epoch,"live_scene_revision":scene_revision,"live_workspace_sha256":digest(canon(live)),"current_session_sha256":current_status_sha256,"scene":scene,"compute_queue":queue,"runtime_service":runtime,"health":health}
+    if retained_current_run_sha256 is not None: probe["retained_current_run_sha256"]=retained_current_run_sha256
+    if preparation_evidence: probe["preparation_evidence"]=preparation_evidence
+    if preparation_host_reservations: probe["preparation_host_reservations"]=preparation_host_reservations
+    print(json.dumps(probe,sort_keys=True))
 finally:
     if ledger_fd is not None: fcntl.flock(ledger_fd,fcntl.LOCK_UN); os.close(ledger_fd)
     if "store_fd" in locals() and store_fd is not None: fcntl.flock(store_fd,fcntl.LOCK_UN); os.close(store_fd)
@@ -1857,10 +2370,10 @@ def _cancelled_activation_store_probe(
     store_root = environment.get("FULLMAG_RUNS_ROOT", "/state/runs/docker-all") + "/session-store"
     ledger_root = environment.get("FULLMAG_HOST_LEDGER_ROOT", "/host-ledger/ledger")
     result = docker_capture(
-        "exec", backend_id, "/usr/local/bin/python3", "-B", "-c",
-        _cancelled_activation_probe_script(),
+        "exec", "-i", backend_id, "/usr/local/bin/python3", "-B", "-",
         run_id, task_id, request_id, source_sha256, marker_path,
         store_root, ledger_root, str(expected_scene_revision),
+        data=_cancelled_activation_probe_script().encode("utf-8"),
         timeout=90, allow_failure=True,
     )
     if result.returncode:
@@ -1874,6 +2387,14 @@ def _cancelled_activation_store_probe(
         raise BuildControlError("Cancelled activation store preflight returned invalid JSON") from error
     if not isinstance(value, dict) or value.get("schema") != "fullmag.docker-activation-cancel-probe.v1":
         raise BuildControlError("Cancelled activation store preflight returned an invalid schema")
+    if "preparation_evidence" in value:
+        value["preparation_evidence"] = _cancelled_activation_preparation_evidence(
+            value["preparation_evidence"], "store probe preparation evidence",
+        )
+    if "preparation_host_reservations" in value:
+        value["preparation_host_reservations"] = _cancelled_activation_preparation_host_reservations(
+            value["preparation_host_reservations"], "store probe preparation host reservations",
+        )
     return value
 
 
@@ -1882,6 +2403,79 @@ def _cancelled_activation_sha(value, label):
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise BuildControlError(f"Cancelled activation {label} is not a SHA-256 digest")
     return value
+
+
+def _cancelled_activation_preparation_evidence(value, label):
+    if not isinstance(value, list) or len(value) > 5:
+        raise BuildControlError(f"Cancelled activation {label} is not a bounded manifest")
+    path_pattern = re.compile(
+        r"(?:task_preparation_receipts|accepted_stage_preparation_receipts|"
+        r"preparation_process_launches|preparation_process_exit_receipts)/"
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json|"
+        r"preparation_resource_leases/[A-Za-z0-9][A-Za-z0-9._-]{0,199}/"
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json"
+    )
+    result = []
+    previous = None
+    for entry in value:
+        if not isinstance(entry, Mapping) or set(entry) != {"path", "sha256"}:
+            raise BuildControlError(f"Cancelled activation {label} entry is invalid")
+        path = entry.get("path")
+        if not isinstance(path, str) or path_pattern.fullmatch(path) is None:
+            raise BuildControlError(f"Cancelled activation {label} path is invalid")
+        if previous is not None and path <= previous:
+            raise BuildControlError(f"Cancelled activation {label} is not strictly ordered")
+        previous = path
+        result.append({
+            "path": path,
+            "sha256": _cancelled_activation_sha(entry.get("sha256"), label + " digest"),
+        })
+    return result
+
+
+def _cancelled_activation_preparation_host_reservations(value, label):
+    if not isinstance(value, list) or len(value) > 1:
+        raise BuildControlError(f"Cancelled activation {label} is not a bounded manifest")
+    result = []
+    previous = None
+    identity_fields = {"store_id", "run_id", "task_id", "resource_id", "owner", "lease_token"}
+    for entry in value:
+        if not isinstance(entry, Mapping) or set(entry) != {"identity", "sha256"}:
+            raise BuildControlError(f"Cancelled activation {label} entry is invalid")
+        identity = entry.get("identity")
+        if not isinstance(identity, Mapping) or set(identity) != identity_fields:
+            raise BuildControlError(f"Cancelled activation {label} identity is invalid")
+        store_id = identity.get("store_id")
+        if not isinstance(store_id, str) or not store_id.startswith("sha256:"):
+            raise BuildControlError(f"Cancelled activation {label} store identity is invalid")
+        _cancelled_activation_sha(store_id[7:], label + " store identity")
+        for key in ("run_id", "task_id", "resource_id", "lease_token"):
+            _cancelled_activation_id(identity.get(key), label + " " + key)
+        owner = identity.get("owner")
+        if (not isinstance(owner, Mapping)
+                or set(owner) != {"kind", "preparation_attempt_id"}
+                or owner.get("kind") != "preparation"):
+            raise BuildControlError(f"Cancelled activation {label} owner is invalid")
+        _cancelled_activation_id(owner.get("preparation_attempt_id"), label + " preparation attempt")
+        sort_key = json.dumps(dict(identity), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if previous is not None and sort_key <= previous:
+            raise BuildControlError(f"Cancelled activation {label} is not strictly ordered")
+        previous = sort_key
+        result.append({
+            "identity": {
+                "store_id": store_id,
+                "run_id": identity["run_id"],
+                "task_id": identity["task_id"],
+                "resource_id": identity["resource_id"],
+                "owner": {
+                    "kind": "preparation",
+                    "preparation_attempt_id": owner["preparation_attempt_id"],
+                },
+                "lease_token": identity["lease_token"],
+            },
+            "sha256": _cancelled_activation_sha(entry.get("sha256"), label + " row digest"),
+        })
+    return result
 
 
 def _cancelled_activation_id(value, label, *, request=False):
@@ -2031,6 +2625,29 @@ def _validate_cancelled_activation_preflight(
             raise BuildControlError(f"Fresh cancelled activation probe {key} differs")
     if fresh_probe.get("schema") != "fullmag.docker-activation-cancel-probe.v1":
         raise BuildControlError("Fresh cancelled activation probe schema differs")
+    fresh_preparation_evidence = _cancelled_activation_preparation_evidence(
+        fresh_probe.get("preparation_evidence", []), "fresh probe preparation evidence",
+    )
+    if "preparation_evidence" not in proof:
+        if fresh_preparation_evidence:
+            raise BuildControlError("Historical cancelled activation proof omits preparation evidence")
+    elif _cancelled_activation_preparation_evidence(
+            proof["preparation_evidence"], "proof preparation evidence") != fresh_preparation_evidence:
+        raise BuildControlError("Fresh cancelled activation preparation evidence differs from proof")
+    fresh_preparation_host_reservations = _cancelled_activation_preparation_host_reservations(
+        fresh_probe.get("preparation_host_reservations", []), "fresh probe preparation host reservations",
+    )
+    if "preparation_host_reservations" not in proof:
+        if fresh_preparation_host_reservations:
+            raise BuildControlError("Historical cancelled activation proof omits preparation host reservations")
+    elif _cancelled_activation_preparation_host_reservations(
+            proof["preparation_host_reservations"], "proof preparation host reservations") != fresh_preparation_host_reservations:
+        raise BuildControlError("Fresh cancelled activation preparation host reservations differ from proof")
+    retained_current_run_sha256 = fresh_probe.get("retained_current_run_sha256")
+    if retained_current_run_sha256 is not None:
+        _cancelled_activation_sha(retained_current_run_sha256, "fresh retained current run")
+    if proof.get("retained_current_run_sha256") != retained_current_run_sha256:
+        raise BuildControlError("Fresh cancelled activation retained current run differs from proof")
     # Heartbeats and other worktrees legitimately change these snapshots.
     # Immutable run/catalog/cancellation/marker identity was checked above.
     for key in ("host_ledger_sha256", "current_session_sha256"):
@@ -2067,6 +2684,28 @@ def stop_idle(args):
 
 def recreate(args):
     return _retained_operation(args, recreate_services=True)
+
+
+def resume_recreation(args):
+    """Resume only the exact successful recreation whose app IDs are absent."""
+    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "resume_recreation", ""))):
+        raise BuildControlError("--resume-recreation requires one exact operation UUID")
+    if (
+        getattr(args, "fresh_state", False)
+        or getattr(args, "script", None) is not None
+        or getattr(args, "recovery_authorization", None) is not None
+        or getattr(args, "include_untracked", None) is not None
+        or getattr(args, "image", None) is not None
+        or getattr(args, "toolchain_image", None) is not None
+        or getattr(args, "source_manifest", None) is not None
+        or getattr(args, "profile", "dev") != "dev"
+    ):
+        raise BuildControlError(
+            "--resume-recreation cannot combine with fresh state, a script, recovery authorization, or source/image overrides"
+        )
+    return _retained_operation(
+        args, recreate_services=False, resume_recreation_id=args.resume_recreation
+    )
 
 
 def resume(args):
@@ -2188,7 +2827,9 @@ def _validate_completed_recovery_receipt(control, authorization, recovery_module
     return True
 
 
-def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh_state):
+def _native_failed_stop_recovery_context(
+    control, previous, *, backend_id, fresh_state, removed_container_proof=None,
+):
     """Validate one managed native-failure stop journal for recreation.
 
     The legacy ``native-start-failure`` proof has no retained service owner.
@@ -2299,6 +2940,10 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     namespace_relative = _namespace_attestation_path(backend_id)
     namespace_raw = _control_bytes(control, namespace_relative, optional=True)
     namespace_attestation = None
+    if namespace_raw is not None and removed_container_proof is not None:
+        raise BuildControlError(
+            "Removed-container recreation cannot substitute for a fresh namespace-attestation observation"
+        )
     if namespace_raw is not None:
         namespace_attestation = _validate_namespace_attestation(
             control,
@@ -2314,9 +2959,41 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
             selected_source=previous_inputs["source_root"],
         )
     if isinstance(journal.get("container_state"), Mapping):
-        _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+        if removed_container_proof is None:
+            _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+        else:
+            if not isinstance(removed_container_proof, Mapping):
+                raise BuildControlError("Removed-container recreation proof is malformed")
+            retained_state = removed_container_proof.get("container_state")
+            journal_state = journal["container_state"]
+            if (
+                removed_container_proof.get("schema") != "fullmag.docker-removed-recreation-container.v1"
+                or not re.fullmatch(
+                    r"[0-9a-f]{32}", removed_container_proof.get("recreation_operation_id", "")
+                )
+                or removed_container_proof.get("container_id") != backend_id
+                or removed_container_proof.get("image_id") != image_id
+                or not isinstance(retained_state, Mapping)
+                or dict(retained_state) != dict(journal_state)
+                or type(journal.get("exit_code")) is not int
+                or journal.get("exit_code") != retained_state.get("exit_code")
+                or any(
+                    _SHA256.fullmatch(removed_container_proof.get(key, "")) is None
+                    for key in (
+                        "recreation_terminal_sha256", "retained_snapshot_sha256",
+                        "prior_terminal_sha256", "prior_compose_sha256",
+                    )
+                )
+            ):
+                raise BuildControlError(
+                    "Removed-container proof does not match the exact native stop journal incarnation"
+                )
     elif namespace_attestation is None:
         raise BuildControlError("Legacy native stop journal requires a fresh namespace attestation")
+    elif removed_container_proof is not None:
+        raise BuildControlError(
+            "Removed-container recreation cannot replace the legacy namespace attestation"
+        )
     previous_config_sha256 = _read_runtime_config_digest(control)
     recorded_config = journal.get("previous_config_sha256")
     if recorded_config is not None and recorded_config != previous_config_sha256:
@@ -2346,7 +3023,9 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     }
 
 
-def _retained_recovery_context(control, previous, document, *, fresh_state, backend_id=None):
+def _retained_recovery_context(
+    control, previous, document, *, fresh_state, backend_id=None, removed_container_proof=None,
+):
     """Carry pending recovery authority, or consume a completed proof once.
 
     PID 1 still authenticates the native request and current owner before any
@@ -2368,7 +3047,7 @@ def _retained_recovery_context(control, previous, document, *, fresh_state, back
     if not carried and metadata is None:
         return _native_failed_stop_recovery_context(
             control, previous, backend_id=backend_id or previous.get("backend_container"),
-            fresh_state=fresh_state,
+            fresh_state=fresh_state, removed_container_proof=removed_container_proof,
         ) or {}
     if fresh_state:
         raise BuildControlError("Pending container recovery must retain its original session storage")
@@ -2405,7 +3084,7 @@ def _retained_recovery_context(control, previous, document, *, fresh_state, back
     if _validate_completed_recovery_receipt(control, authorization, recovery_module):
         native_restart = _native_failed_stop_recovery_context(
             control, previous, backend_id=backend_id or previous.get("backend_container"),
-            fresh_state=fresh_state,
+            fresh_state=fresh_state, removed_container_proof=removed_container_proof,
         )
         if native_restart is not None:
             return native_restart
@@ -2416,7 +3095,364 @@ def _retained_recovery_context(control, previous, document, *, fresh_state, back
             "recovery_metadata": _validate_recovery_metadata(expected)}
 
 
-def _retained_operation(args, *, recreate_services, restart_idle_service=False, stop_after_drain=False):
+def _read_canonical_control_record(control, relative, label):
+    from docker_volume_stop_unadmitted import _control_bytes, _json
+
+    raw = _control_bytes(control, relative)
+    value = _json(raw, label)
+    if not isinstance(value, Mapping) or raw != canonical(value) + b"\n":
+        raise BuildControlError(label + " is not a canonical control-volume record")
+    return raw, dict(value)
+
+
+def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None):
+    """Revalidate one completed recreation and prove its old app IDs are absent."""
+
+    from docker_volume_stop_unadmitted import _control_bytes
+
+    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "resume_recreation", ""))):
+        raise BuildControlError("Recreation resume requires one exact operation UUID")
+    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "attempt", ""))):
+        raise BuildControlError("Recreation resume requires the exact prior start attempt UUID")
+    if not isinstance(args.config_sha256, str) or _SHA256.fullmatch(args.config_sha256) is None:
+        raise BuildControlError("Recreation resume requires the exact prior configuration digest")
+
+    previous_root = "development/attempts/" + args.attempt
+    previous_raw, previous = _read_canonical_control_record(
+        control, previous_root + "/terminal.json", "prior development terminal receipt"
+    )
+    current_raw = _control_bytes(control, "development/current.json", optional=True)
+    if current_raw is None:
+        raise BuildControlError("Recreation resume has no current development receipt")
+    current = json.loads(current_raw)
+    if current_raw != canonical(current) + b"\n" or current != previous:
+        raise BuildControlError(
+            "A later or unknown development attempt exists; recreation resume will not create another start"
+        )
+    if previous.get("state") not in {"failed-confirmed", "succeeded"}:
+        raise BuildControlError("Recreation resume has no admissible prior development outcome")
+    if previous.get("compose_project") != control.project:
+        raise BuildControlError("Recreation resume belongs to another Compose project")
+    inputs = previous.get("inputs")
+    if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
+        raise BuildControlError("Recreation resume source selection differs from the prior start")
+    for source_key, identity_key in (
+        ("source_project_id", "project_id"),
+        ("source_worktree_id", "worktree_id"),
+        ("source_checkout_kind", "checkout_kind"),
+    ):
+        if inputs.get(source_key) != identity.get(identity_key):
+            raise BuildControlError("Recreation resume source identity differs from the prior start")
+    image = inputs.get("image_id")
+    if not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+        raise BuildControlError("Recreation resume has no immutable prior image identity")
+
+    document_raw, document = _read_canonical_control_record(
+        control, previous_root + "/compose.json", "prior development Compose document"
+    )
+    if (
+        hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256
+        or document.get("name") != control.project
+    ):
+        raise BuildControlError("Recreation resume prior Compose identity/configuration pin differs")
+    services = document.get("services")
+    frontend = services.get("frontend") if isinstance(services, Mapping) else None
+    frontend_ports = frontend.get("ports") if isinstance(frontend, Mapping) else None
+    if not isinstance(frontend_ports, list) or len(frontend_ports) != 1:
+        raise BuildControlError("Recreation resume prior Compose frontend port is ambiguous")
+    frontend_port = frontend_ports[0]
+    if (
+        not isinstance(frontend_port, Mapping)
+        or frontend_port.get("host_ip") != "127.0.0.1"
+        or frontend_port.get("mode") != "ingress"
+        or frontend_port.get("protocol") != "tcp"
+        or frontend_port.get("target") != 8080
+        or not isinstance(frontend_port.get("published"), str)
+        or re.fullmatch(r"[1-9][0-9]{0,4}", frontend_port["published"]) is None
+        or int(frontend_port["published"]) > 65535
+        or int(frontend_port["published"]) != args.port
+    ):
+        raise BuildControlError("Recreation resume frontend port differs from the prior start")
+    url = previous.get("url")
+    if url is not None:
+        match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})", url) if isinstance(url, str) else None
+        if match is None or int(match.group(1)) != args.port:
+            raise BuildControlError("Recreation resume prior frontend URL differs from its Compose port")
+    policy = inputs.get("gpu_access_requested")
+    if policy not in {"auto", "required", "disabled"} or getattr(args, "gpu_access", None) != policy:
+        raise BuildControlError("Recreation resume GPU access intent differs from the prior start")
+    allowlist = include_untracked_from_compose(document)
+    if normalize_include_untracked_paths(getattr(args, "include_untracked", None)) != allowlist:
+        raise BuildControlError("Recreation resume source allowlist differs from the retained Compose document")
+    operator_probe_record = _operator_probe_record_from_retained(previous, document)
+
+    active_raw = _control_bytes(control, "active", optional=True)
+    if active_raw is not None:
+        raise BuildControlError("A managed operation lease is still active; recreation resume is refused")
+
+    operation_id = args.resume_recreation
+    operation_root = "recreate-services/attempts/" + operation_id
+    operation_raw, operation_terminal = _read_canonical_control_record(
+        control, operation_root + "/terminal.json", "recreation operation terminal receipt"
+    )
+    retained_raw, retained = _read_canonical_control_record(
+        control, operation_root + "/retained-containers.json", "recreation retained-container snapshot"
+    )
+    expected_operation_inputs = {
+        "attempt": args.attempt,
+        "config_sha256": args.config_sha256,
+        **operator_probe_record,
+    }
+    if (
+        operation_terminal.get("schema") != "fullmag.docker-build-operation.v1"
+        or operation_terminal.get("phase") != "recreate-services"
+        or operation_terminal.get("state") != "succeeded"
+        or operation_terminal.get("attempt") != operation_id
+        or operation_terminal.get("compose_project") != control.project
+        or operation_terminal.get("control_volume") != control.volume
+        or operation_terminal.get("inputs") != expected_operation_inputs
+        or operation_terminal.get("previous_state_root") != previous.get("state_root")
+        or operation_terminal.get("retained_volumes") != previous.get("backend_volumes")
+        or operation_terminal.get("retained_frontend_volume") != previous.get("frontend_volume")
+        or operation_terminal.get("fresh_state") is not False
+    ):
+        raise BuildControlError("Recreation operation receipt does not prove this exact completed replacement")
+    namespace = getattr(control, "namespace", None)
+    if namespace:
+        if (operation_terminal.get("control_namespace") != namespace
+                or operation_terminal.get("namespace_registry_sha256")
+                != control.namespace_registry_sha256):
+            raise BuildControlError("Recreation operation control namespace differs")
+    elif ("control_namespace" in operation_terminal
+          or "namespace_registry_sha256" in operation_terminal):
+        raise BuildControlError("Recreation operation carries a foreign control namespace")
+
+    if not isinstance(retained, Mapping) or set(retained) != {"backend", "frontend"}:
+        raise BuildControlError("Recreation receipt has no exact retained backend/frontend snapshot")
+    snapshot = {service: retained[service] for service in ("backend", "frontend")}
+    ids = {}
+    image_config_records = json.loads(docker_text("image", "inspect", image))
+    if (
+        len(image_config_records) != 1
+        or not isinstance(image_config_records[0], Mapping)
+        or not isinstance(image_config_records[0].get("Config"), Mapping)
+    ):
+        raise BuildControlError("Retained recreation image configuration is ambiguous")
+    image_config = image_config_records[0]["Config"]
+    for service in ("backend", "frontend"):
+        observed = snapshot[service]
+        if not isinstance(observed, Mapping):
+            raise BuildControlError("Retained recreation container snapshot is malformed: " + service)
+        identifier = observed.get("Id")
+        if not isinstance(identifier, str) or re.fullmatch(r"[0-9a-f]{64}", identifier) is None:
+            raise BuildControlError("Retained recreation container ID is invalid: " + service)
+        ids[service] = identifier
+        config = observed.get("Config")
+        labels = config.get("Labels") if isinstance(config, Mapping) else None
+        if (
+            not isinstance(labels, Mapping)
+            or observed.get("Image") != image
+            or labels.get("com.docker.compose.project") != control.project
+            or labels.get("com.docker.compose.service") != service
+            or labels.get("org.fullmag.source.worktree-id") != identity.get("worktree_id")
+        ):
+            raise BuildControlError("Retained recreation container ownership/incarnation differs: " + service)
+        previous_id = previous.get(service + "_container")
+        if previous_id is not None and previous_id != identifier:
+            raise BuildControlError("Retained recreation container differs from the prior recorded incarnation: " + service)
+        _validate_retained_service(
+            document, observed, service, image_config, allow_legacy_frontend=True
+        )
+    removed_ids = operation_terminal.get("removed_containers")
+    if removed_ids != [ids["backend"], ids["frontend"]] or ids["backend"] == ids["frontend"]:
+        raise BuildControlError("Recreation terminal receipt does not name the exact retained app containers")
+
+    backend_state = snapshot["backend"].get("State")
+    if not isinstance(backend_state, Mapping) or backend_state.get("Running") is not False:
+        raise BuildControlError("Retained backend snapshot does not prove a stopped service")
+    exit_code = backend_state.get("ExitCode")
+    if type(exit_code) is not int:
+        raise BuildControlError("Retained backend stop snapshot has no exact exit code")
+    container_state = {
+        "id": ids["backend"],
+        "image": image,
+        "started_at": backend_state.get("StartedAt"),
+        "finished_at": backend_state.get("FinishedAt"),
+        "exit_code": exit_code,
+    }
+
+    # Inspect and list the exact IDs after the terminal receipt; the ordinary
+    # start guard below still rejects every remaining group container.
+    for service in ("backend", "frontend"):
+        inspected = docker_capture("inspect", ids[service], allow_failure=True, timeout=60)
+        if inspected.returncode == 0:
+            raise BuildControlError("A retained app-container ID is still inspectable in Docker")
+        detail = (inspected.stderr + inspected.stdout).decode("utf-8", "replace")
+        not_found = re.search(
+            r"(?:no such object|no such container):\s*" + re.escape(ids[service]) + r"(?:\s|$)",
+            detail,
+            re.IGNORECASE,
+        )
+        if not_found is None:
+            raise BuildControlError("Docker inspect did not authoritatively confirm removed app-container absence")
+        absence = docker_capture(
+            "ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + ids[service], timeout=60
+        )
+        if absence.returncode:
+            raise BuildControlError("Cannot verify removed app-container absence")
+        if absence.stdout.decode("utf-8", "replace").split():
+            raise BuildControlError("A retained app-container ID is still present in Docker")
+
+    proof = {
+        "schema": "fullmag.docker-removed-recreation-container.v1",
+        "recreation_operation_id": operation_id,
+        "recreation_terminal_sha256": hashlib.sha256(operation_raw).hexdigest(),
+        "retained_snapshot_sha256": hashlib.sha256(retained_raw).hexdigest(),
+        "prior_terminal_sha256": hashlib.sha256(previous_raw).hexdigest(),
+        "prior_compose_sha256": hashlib.sha256(document_raw).hexdigest(),
+        "container_id": ids["backend"],
+        "image_id": image,
+        "container_state": container_state,
+    }
+    native_recovery_context = _retained_recovery_context(
+        control,
+        previous,
+        document,
+        fresh_state=False,
+        backend_id=ids["backend"],
+        removed_container_proof=proof,
+    )
+    proof["native_recovery_context"] = native_recovery_context
+    if expected_proof is not None and proof != expected_proof:
+        raise BuildControlError("Recreation resume evidence changed before the new start admission")
+    return {
+        "previous": previous,
+        "document": document,
+        "operation_terminal": operation_terminal,
+        "snapshot": snapshot,
+        "image_id": image,
+        "operator_probe_record": operator_probe_record,
+        "proof": proof,
+        "native_recovery_context": native_recovery_context,
+    }
+
+
+def _resume_recreated_operation(args, control, selected, layout, identity):
+    records = _validate_recreation_resume_records(args, control, selected, identity)
+    previous = records["previous"]
+    document = records["document"]
+    operation_terminal = records["operation_terminal"]
+    snapshot = records["snapshot"]
+    image = records["image_id"]
+    proof = records["proof"]
+    operator_probe_record = records["operator_probe_record"]
+    backend_id = proof["container_id"]
+
+    if _retained_startup_enabled(snapshot["backend"]):
+        stop_path = "verification/stop-failed-" + backend_id + ".json"
+        stop = control.read(stop_path)
+        failure = stop.get("failure_receipt", {}).get("receipt", {})
+        drained = control.read("runtime-control/runtime-service/process-tree.json")
+        if (
+            operation_terminal.get("pre_activation_stop_receipt") != stop_path
+            or stop.get("state") != "stopped-confirmed"
+            or stop.get("container_id") != backend_id
+            or stop.get("image_id") != image
+            or failure.get("error") != "startup activation state parent is unavailable: /state/.fullmag"
+            or drained.get("state") != "drained"
+            or drained != stop.get("drained_process_receipt")
+            or "startup_activation" in drained
+        ):
+            raise BuildControlError("Retained startup activation is not an exact pre-activation failure")
+    elif "pre_activation_stop_receipt" in operation_terminal:
+        raise BuildControlError("Recreation receipt has an unexpected pre-activation failure pin")
+
+    state = storage.validate_path(
+        Path(previous["state_root"]), layout["runtime_root"], "retained Windows sessions"
+    )
+    certificate_path = _certificate_path(state)
+    certificate = _retained_certificate(state, document)
+    if certificate.get("image_id") != image or not certificate.get("restart_verified"):
+        raise BuildControlError("Retained storage certificate does not authorize recreation resume")
+    owner_path = state / _session_host().OWNER_NAME
+    recovery_context = dict(records["native_recovery_context"])
+
+    from docker_volume_activation_reconcile import reconcile_unknown_activation
+    unresolved = control.read("activation/unresolved.json", optional=True)
+    recorded_reconciliation = operation_terminal.get("activation_reconciliation")
+    reconciliation = None
+    if unresolved is not None:
+        if not isinstance(recorded_reconciliation, Mapping):
+            raise BuildControlError("Completed recreation did not record its activation reconciliation proof")
+        reconciliation = reconcile_unknown_activation(
+            control,
+            previous=previous,
+            document=document,
+            selected_source=str(selected),
+            config_sha256=args.config_sha256,
+            image_id=image,
+            backend_id=backend_id,
+            native_restart_metadata=recovery_context.get("native_restart_metadata"),
+            fresh_state=False,
+        )
+        if reconciliation is None:
+            raise BuildControlError("Recorded activation reconciliation is no longer present")
+        reconciliation_summary = {
+            key: reconciliation[key]
+            for key in (
+                "attempt", "activation_receipt_sha256", "native_stop_journal_sha256",
+                "namespace_attestation_path", "namespace_attestation_sha256",
+            )
+            if key in reconciliation
+        }
+        if reconciliation_summary != dict(recorded_reconciliation):
+            raise BuildControlError("Activation reconciliation differs from the completed recreation receipt")
+    elif recorded_reconciliation is not None:
+        raise BuildControlError("Completed recreation records an activation reconciliation without its quarantine")
+
+    accepted_reattach_context = {}
+    accepted_record = operation_terminal.get("accepted_reattach")
+    if reconciliation is not None:
+        from docker_volume_accepted_reattach import produce_accepted_reattach
+        accepted_store_root = storage.validate_path(
+            state / "runs" / "docker-all" / "session-store",
+            state,
+            "retained accepted session store",
+        )
+        produced = produce_accepted_reattach(control, store_root=accepted_store_root)
+        accepted_environment = _validate_accepted_reattach_environment(produced.get("environment"))
+        accepted_pins = _validate_accepted_reattach_metadata(produced.get("pins"), accepted_environment)
+        if accepted_record != accepted_pins:
+            raise BuildControlError("Accepted-run reattach differs from the completed recreation receipt")
+        accepted_reattach_context = {
+            "accepted_reattach_environment": accepted_environment,
+            "accepted_reattach_metadata": accepted_pins,
+        }
+    elif accepted_record is not None:
+        raise BuildControlError("Completed recreation records an unexpected accepted-run reattach")
+
+    reuse = {
+        "state": state,
+        "host_certificate": certificate_path,
+        "owner_marker": owner_path,
+        "receipt": {"image_id": image},
+        "operator_probe_environment_record": operator_probe_record,
+    }
+    recovery_context.update(accepted_reattach_context)
+    args.include_untracked = include_untracked_from_compose(document)
+    args.gpu_access = previous["inputs"]["gpu_access_requested"]
+    return start(
+        args,
+        reuse_state=reuse,
+        recreation_resume_proof=proof,
+        **recovery_context,
+    )
+
+
+def _retained_operation(
+    args, *, recreate_services, restart_idle_service=False, stop_after_drain=False,
+    resume_recreation_id=None,
+):
     """Resume observation/admission of one exact failed start; never restart the backend."""
     from docker_dev import _select_source, _compose_identity
     require_host()
@@ -2430,7 +3466,10 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False, 
         raise BuildControlError("Resume requires an exact attempt UUID")
     previous_root = "development/attempts/" + args.attempt
     previous = control.read(previous_root + "/terminal.json")
-    allowed = {"failed-confirmed", "succeeded"} if recreate_services or restart_idle_service or getattr(args, "restart_backend", False) else {"failed-confirmed"}
+    allowed = {"failed-confirmed", "succeeded"} if (
+        recreate_services or resume_recreation_id is not None
+        or restart_idle_service or getattr(args, "restart_backend", False)
+    ) else {"failed-confirmed"}
     if previous.get("state") not in allowed or previous.get("compose_project") != control.project:
         raise BuildControlError("Retained start has no admissible terminal outcome")
     document = control.read(previous_root + "/compose.json")
@@ -2440,6 +3479,15 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False, 
     image = previous["inputs"]["image_id"]
     if previous["inputs"]["source_root"] != str(selected):
         raise BuildControlError("Resume source selection differs")
+    if resume_recreation_id is not None:
+        if recreate_services or restart_idle_service or stop_after_drain:
+            raise BuildControlError("Recreation resume cannot combine with another retained lifecycle operation")
+        policy = previous["inputs"].get("gpu_access_requested")
+        if policy not in {"auto", "required", "disabled"}:
+            raise BuildControlError("Recreation resume requires the retained GPU access intent")
+        args.gpu_access = policy
+        args.include_untracked = include_untracked_from_compose(document)
+        return _resume_recreated_operation(args, control, selected, layout, identity)
     if recreate_services:
         requested_allowlist = getattr(args, "include_untracked", None)
         args.include_untracked = (

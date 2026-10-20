@@ -589,9 +589,12 @@ def _restore_frontend(frontend_id: str) -> None:
 
 
 def _runtime_control_volume_mount(
-    actual_backend: Mapping[str, object], project: str
+    actual_backend: Mapping[str, object], project: str, *, namespace: str | None = None,
 ) -> tuple[str, str]:
-    """Return the exact named volume and Compose subpath for runtime-control."""
+    """Return the exact named volume and selected namespace subpath."""
+    if namespace is not None and re.fullmatch(r"namespaces/[0-9a-f]{32}", namespace) is None:
+        raise _fail("runtime-control namespace is invalid")
+    expected_subpath = f"{namespace}/{RUNTIME_CONTROL_SUBPATH}" if namespace else RUNTIME_CONTROL_SUBPATH
     mounts = actual_backend.get("Mounts")
     if not isinstance(mounts, list):
         raise _fail("backend runtime-control mounts cannot be inspected")
@@ -627,7 +630,7 @@ def _runtime_control_volume_mount(
         host_mount.get("Type") != "volume"
         or host_mount.get("Source") != name
         or not isinstance(options, Mapping)
-        or options.get("Subpath") != RUNTIME_CONTROL_SUBPATH
+        or options.get("Subpath") != expected_subpath
         or host_mount.get("ReadOnly") is True
     ):
         raise _fail("backend runtime-control mount does not prove the canonical subpath")
@@ -644,7 +647,7 @@ def _runtime_control_volume_mount(
         or labels.get("com.fullmag.compose.project") != project
     ):
         raise _fail("runtime-control volume ownership differs from the selected group")
-    return name, RUNTIME_CONTROL_SUBPATH
+    return name, expected_subpath
 
 
 def _runtime_control_validation_helper(
@@ -654,7 +657,11 @@ def _runtime_control_validation_helper(
     image = actual_backend.get("Image")
     if not isinstance(image, str) or not IMAGE_ID_RE.fullmatch(image):
         raise _fail("backend image identity is unavailable for terminal validation")
-    volume, subpath = _runtime_control_volume_mount(actual_backend, control.project)
+    volume, subpath = _runtime_control_volume_mount(
+        actual_backend, control.project, namespace=control.namespace,
+    )
+    if volume != control.volume:
+        raise _fail("runtime-control volume differs from the selected controller")
     script = r'''
 import json, sys
 sys.path.insert(0, '/opt/fullmag')

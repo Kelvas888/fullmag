@@ -1,18 +1,12 @@
-//! API adoption of immutable accepted observation bundles.
-
-#[path = "accepted_field_materialization_worker.rs"]
-mod worker;
-
-pub(crate) use self::worker::prepare_and_publish;
+//! API adoption of immutable worker-published accepted observables.
 
 use std::{collections::BTreeSet, sync::Arc};
 use anyhow::Result;
 use serde_json::{json, Value};
 use crate::accepted_field_binary::AcceptedFieldReader;
+use crate::accepted_field_materialization_worker::{field_key, load_latest_bundle, SCHEMA};
 use crate::error::ApiError;
 use crate::types::{AppState, CurrentLiveFieldFrameRequest};
-use self::worker::{field_key, load_latest_bundle, MaterializationRecord, SCHEMA};
-
 /// Caller owns the transition fence. This path only reads CAS; it cannot solve,
 /// allocate devices, or reinterpret a bundle belonging to an older scene.
 pub(crate) async fn adopt_current_bundle(

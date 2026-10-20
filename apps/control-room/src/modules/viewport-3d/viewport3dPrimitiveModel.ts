@@ -130,7 +130,7 @@ function asVec3(value: unknown): [number, number, number] | null {
   return null;
 }
 
-function cardinalAxisIndex(axis: readonly [number, number, number]): 0 | 1 | 2 | null {
+export function cardinalAxisIndex(axis: readonly [number, number, number]): 0 | 1 | 2 | null {
   const abs = axis.map((value) => Math.abs(value)) as [number, number, number];
   const max = Math.max(...abs);
   if (max <= 1e-12) return null;
@@ -143,7 +143,7 @@ function cardinalAxisIndex(axis: readonly [number, number, number]): 0 | 1 | 2 |
   return index;
 }
 
-function planeAxesForCardinalAxis(axisIndex: 0 | 1 | 2): [0 | 1 | 2, 0 | 1 | 2] {
+export function planeAxesForCardinalAxis(axisIndex: 0 | 1 | 2): [0 | 1 | 2, 0 | 1 | 2] {
   if (axisIndex === 0) return [1, 2];
   if (axisIndex === 1) return [0, 2];
   return [0, 1];

@@ -431,6 +431,114 @@ Budowa obrazu, start/restart usługi, Docker inspect oraz browser/runtime proof
 pozostają **NOT VERIFIED**.
 
 
+## Decyzja uzupełniająca 20.10.2026 — pierwsza kompletna publikacja pakietu
+
+Pod runtime build lock wolno dokończyć pierwszą publikację jednego kompletnego
+kandydata `ready`, gdy kanoniczny output nie zawiera jeszcze pakietu. Wymagane
+są: dokładny owner marker, udany receipt Make związany ze ścieżką kandydata,
+zgodny target Make, zgodne SHA i rozmiar kopii logu, zamknięty inventory oraz
+zgodność artefaktów z receipt i hashem inventory w markerze. Przeniesienie
+używa istniejącej journalowanej rotacji i fsync; receipt oraz kopie logów
+pozostają zachowane. Nie wybiera się między wieloma kandydatami. Niekompletny,
+nieznany lub niespójny stan nadal zatrzymuje start i zachowuje dane.
+
+Odzyskany pakiet staje się wyłącznie poprzednim zweryfikowanym buildem. Przed
+jakimkolwiek startem API obowiązuje nowy spójny capture wybranych źródeł oraz
+porównanie ich z provenance pakietu, toolchainem i profilem. Różnica powoduje
+zwykły przyrostowy build i zachowanie odzyskanego pakietu jako rollbacku.
+Recovery nie wznawia symulacji, nie pomija native owner ani admission hosta.
+
+Źródłowo wdrożono; wykonanie recovery i uruchomienie API pozostają
+**NOT VERIFIED** do uzyskania dowodu z zarządzanej recepty. Bez testów na
+wyraźne polecenie użytkownika; kontrola AST i diff nie zastępuje runtime.
+
+
+## Decyzja uzupełniająca 20.10.2026 — kolejność i namespace delegacji CPU
+
+Managed finish wykonuje niezależny guest storage preflight i publikuje host
+attestation przed oczekiwaniem na worker cgroup request. Zwykły backend
+przechodzi storage gate przed publikacją tego request; odwrotna kolejność
+launchera powoduje cykl oczekiwania. Obie bramki pozostają obowiązkowe.
+
+Krótki helper delegacji CPU używa host PID i host cgroup namespace. Przed
+pierwszą mutacją porównuje tożsamości cgroup namespace z host PID 1, a launcher
+potwierdza wynikową konfigurację Docker inspect. Backend pozostaje uid/gid
+65532, bez capabilities i bez privileged, z prywatnym cgroup namespace.
+Helper zapisuje wyłącznie w cgroup wskazanego pełnym container ID backendu,
+z pinami image, procesu, nonce i boot ID oraz niezmiennymi zewnętrznymi
+cpu.max/memory.max. Nie przejmuje istniejących poddrzew ani ich nie usuwa.
+
+[Kernel: containment delegacji](https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
+wymaga osiągalności źródła i celu migracji z namespace procesu; naruszenie
+zwraca ENOENT także przy widocznym pliku cgroup.procs. [Compose cgroup](https://docs.docker.com/reference/compose-file/services/#cgroup)
+określa osobno host/private namespace helpera. Zmiana nie przyznaje aplikacji
+dostępu do nadrzędnego quota ani hierarchii hosta. Pełna delegacja i start API
+pozostają NOT VERIFIED do zakończenia zarządzanego uruchomienia; bez testów.
+
+
+## Decyzja uzupełniająca 20.10.2026 — generacja enforcement po delegacji
+
+Digest capabilities snapshotu wiąże native capabilities, mapę GPU/runtime,
+widoczność GPU oraz raport egzekwowania limitów OS. Zmiana dostępności
+cpu_quota po delegacji nie oznacza zmiany native ABI. Przy niezmienionej
+polityce i inventory initializer może skierować taką różnicę wyłącznie do
+istniejącej rotacji generacji readiness pod host writer lock. Rotacja nadal
+wymaga wszystkich rezerwacji Released, braku inventory ownera oraz ponownego
+porównania schema/status/source kind, capabilities, mapy GPU, GPU visibility
+i inventory SHA. Inna różnica blokuje start. Publiczne porównanie pełnego
+readiness pozostaje ścisłe; nie wolno podmienić generacji pod aktywnym ownerem.
+
+Publikacja pozostaje CAS-first, potem pojedynczy dokument pointera. Marker,
+polityka, node policy, rezerwacje i legacy evidence pozostają zachowane.
+Stary readiness CAS pozostaje; istniejący GC snapshot/sample-order może
+usunąć nieosiągalne obserwacje, dlatego recovery wymagające zachowania
+poprzednich dowodów archiwizuje ich dokładne bajty przed uruchomieniem.
+Nie jest to zmiana fizyki, solverów, planner capability ani publicznego API.
+Nie dodaje fallbacku GPU→CPU. Implementacja źródłowa poddana review;
+wykonanie rotacji oraz API/runtime pozostają NOT VERIFIED do managed resume.
+Bez testów na jawne polecenie użytkownika.
+
+
+## Decyzja uzupełniająca 20.10.2026 — frontier przygotowania i retencja po Stop
+
+Wybranie początkowego frontieru przygotowania wymaga zależności i wejść
+możliwych do rozwiązania oraz braku claimu zadania; nie może wymagać receiptu,
+którego publikacji ta ścieżka dopiero oczekuje. Gotowość solvera pozostaje
+oddzielna i nadal wymaga receiptu przed queue/claim/dispatch. Rozróżnienie
+obejmuje wspólną orkiestrację FDM/FEM, bez zmiany solverów ani GPU intent.
+
+Po nieudanej publikacji przed Compute można zakończyć dokładny accepted task
+przez istniejący typowany Stop, zachowując mesh, receipty, launch/exit i released
+lease. Wyjątek stale-active-session dla managed idle restart nie może wymagać
+usunięcia poprawnych dowodów przygotowania. Dopuszcza wyłącznie jedno dokładnie
+związane, zakończone native preparation: receipt run/task/step/input/plan/payload,
+launch, exit 0 bez timeoutu, released lease i odpowiadającą released rezerwację
+hosta z dowodem zwolnienia. Sekwencja końcowego heartbeat jest zgodna z released
+lease i nie mniejsza niż początkowa sekwencja immutable launch. Wciąż brak task
+admission, solver owner/lease, artefaktów wyjściowych i compute w kolejce.
+
+Pierwotny unknown receipt i marker started pozostają archiwizowane; technical
+lease może zwolnić wyłącznie jego uwierzytelniony helper po trwałym terminal.
+Manifesty surowych SHA zachowanych preparation records i zwolnionej rezerwacji
+wiążą cancellation proof i świeży preflight, powtórzony po quiesce frontendu.
+Historyczny proof bez manifestu jest zgodny tylko przy pustych dowodach tego
+typu. Nie jest to ponowienie starego startup request ani ręczne zwolnienie
+zasobów. Nowa aktywacja jest możliwa dopiero po terminalnym anulowaniu starego
+zadania i natywnym drain/restart. Bez usuwania danych, cache lub wyników.
+Implementacja i wykonanie tej rozszerzonej ścieżki wymagają oddzielnych dowodów;
+opis nie oznacza zakończenia recovery ani Solve. Testów nie uruchamiano.
+
+
+Guard weryfikuje fingerprint PreparationPlan v2 według kolejności pól typowanych
+struktur Rust (`canonical_json_bytes`), a hash canonical JSON Value stosuje tylko
+do kontraktów, które go definiują. Runtime generation jest surowym SHA64. Duży
+readonly probe trafia do Pythona przez stdin, aby nie przekroczyć limitu argv
+Windows. Read-model current-run może pozostać po Stop w stanie stopping; wyjątek
+wymaga native cancelled-before-claim, dokładnego run/session/start, braku final
+results i przypięcia raw SHA tego rekordu między kolejnymi preflightami. Obecność
+rekordu read-model nie zastępuje dowodu procesu ani zwolnienia lease. Publikacja
+terminala nadal wymaga zgodnego, uwierzytelnionego protokołu kontrolera.
+
 ## Uzupełnienie — kolejne skrypty w tej samej instancji backendu
 
 `docker-dev-script` po zakończonej symulacji zachowuje oba kontenery i cache.
