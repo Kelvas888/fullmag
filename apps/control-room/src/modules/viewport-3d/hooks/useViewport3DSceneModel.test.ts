@@ -538,7 +538,7 @@ describe("FDM Airbox mesh demand", () => {
       'field=${fdmAirboxFieldVector ? "ready" : "pending"}',
     );
     expect(keyBlock).toContain(
-      "`fill=${visualProfile.voxelFillRatio}|airbox=true|scale=${fdmAirboxVectorScale}`",
+      "`fill=${visualProfile.voxelFillRatio}|airbox=true|lengthScale=${fdmSingleGridAirboxSettings?.vectorLengthScale ?? 1}|scale=${fdmAirboxVectorScale}`",
     );
   });
 
@@ -1567,6 +1567,7 @@ describe("useViewport3DSceneModel", () => {
         currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
         component: "full",
+        carrierRevision: "top-1",
         domainGenerationId: "gen-1",
         encoding: "FMVP;version=2",
         fieldIndexing: null,
@@ -1759,6 +1760,7 @@ describe("useViewport3DSceneModel", () => {
         currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
         component: "full",
+        carrierRevision: "top-1",
         domainGenerationId: "gen-1",
         encoding: "FMVP;version=2",
         fieldIndexing: null,
@@ -2021,6 +2023,7 @@ describe("useViewport3DSceneModel", () => {
         currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
         component: "full",
+        carrierRevision: "top-1",
         domainGenerationId: "gen-1",
         encoding: "FMVP;version=2",
         fieldIndexing: null,
@@ -5478,7 +5481,7 @@ describe("useViewport3DSceneModel", () => {
       'domainMeta.data?.discretization === "fem"',
     );
     expect(source).toContain(
-      "const availableQuantityIdsForPlanning = fdmLaneActive",
+      "const availableQuantityIdsForPlanning = useMemo(",
     );
     expect(source).toContain(
       "availableQuantityIds: availableQuantityIdsForPlanning",

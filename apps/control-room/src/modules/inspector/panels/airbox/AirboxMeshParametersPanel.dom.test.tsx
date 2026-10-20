@@ -138,7 +138,7 @@ describe("AirboxMeshParametersPanel session fencing", () => {
       });
 
       expect(mocks.replace).toHaveBeenCalledWith(
-        { config: { airbox_hmax: 2e-9 } },
+        { config: { airbox_hmax: 2e-9 }, expected_revision: 1 },
         { sessionScopeKey: "session=A&epoch=4&request_scope_epoch=4" },
       );
       expect(mocks.invalidate).toHaveBeenCalled();

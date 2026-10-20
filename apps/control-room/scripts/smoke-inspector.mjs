@@ -157,6 +157,48 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+async function writeResizeDomSnapshot(page, outputDir, label) {
+  const snapshot = await page.evaluate(() => {
+    const describe = (element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        ariaDisabled: element.getAttribute("aria-disabled"),
+        ariaLabel: element.getAttribute("aria-label"),
+        dataPanel: element.getAttribute("data-panel"),
+        dataSeparator: element.getAttribute("data-separator"),
+        dataTestId: element.getAttribute("data-testid"),
+        id: element.id,
+        role: element.getAttribute("role"),
+        rect: { height: rect.height, width: rect.width, x: rect.x, y: rect.y },
+      };
+    };
+    return {
+      inspectorPanel: (() => {
+        const element = document.querySelector('[data-testid="panel-right"]');
+        return element ? describe(element) : null;
+      })(),
+      roleSeparators: Array.from(document.querySelectorAll('[role="separator"]'), describe),
+      dataSeparators: Array.from(document.querySelectorAll('[data-separator]'), describe),
+      groups: Array.from(document.querySelectorAll('[data-group]'), (group) => ({
+        childNodes: Array.from(group.children, (child) => ({
+          dataPanel: child.getAttribute("data-panel"),
+          dataSeparator: child.getAttribute("data-separator"),
+          dataTestId: child.getAttribute("data-testid"),
+          id: child.id,
+          role: child.getAttribute("role"),
+        })),
+        dataTestId: group.getAttribute("data-testid"),
+        id: group.id,
+      })),
+    };
+  });
+  console.log(`[inspector-resize:${label}] ${JSON.stringify(snapshot)}`);
+  await writeFile(
+    resolve(outputDir, `inspector-resize-${label}.json`),
+    JSON.stringify(snapshot, null, 2),
+  );
+}
+
 function isExactOptionalResponseAbsence(response) {
   const body = response.body;
   if (
@@ -550,6 +592,7 @@ try {
 
   const panel = page.getByTestId("panel-right");
   const resizeHandle = page.getByRole("separator", { name: /Inspector/ }).last();
+  await writeResizeDomSnapshot(page, outputDir, "before-hide");
   const visibleToggle = overview.getByRole("button", {
     name: "Toggle target visibility",
     exact: true,
@@ -577,6 +620,7 @@ try {
     !(await panel.isVisible()),
     "Hide Inspector did not remove the right panel from the workspace.",
   );
+  await writeResizeDomSnapshot(page, outputDir, "after-hide");
   const viewportAfterPanelHide = await page
     .locator('[data-slot-id="viewport-main"]')
     .boundingBox();
@@ -601,6 +645,7 @@ try {
   await inspectorMenuItem.click();
   await page.waitForTimeout(150);
   assert(await panel.isVisible(), "Ribbon Panel menu did not restore Inspector.");
+  await writeResizeDomSnapshot(page, outputDir, "after-restore");
   assert(
     (await page.getByRole("dialog", { name: "Airbox visualization diagnostic" }).count()) === 0,
     "Visible must not open the removed Airbox diagnostic dialog.",
