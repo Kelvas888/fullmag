@@ -190,6 +190,24 @@ const main = async () => {
     }
     await page.locator("#fm-main-content.fm-workspace-body").waitFor({ state: "visible", timeout });
     const sessionBefore = await sessionIdentity(page);
+    const sceneResponse = await page.request.get(`${loopbackProxy.origin}/v2/sessions/current/model/scene`, { timeout });
+    if (!sceneResponse.ok()) throw new Error(`Viewport model readiness returned HTTP ${sceneResponse.status()}`);
+    const sceneSnapshot = await sceneResponse.json();
+    if (!Array.isArray(sceneSnapshot.objects)) throw new Error("Viewport model readiness omitted canonical objects");
+    const fixtureObjectId = "qa-offset-film-mvgw65uf";
+    partialProof.viewport_model_readiness = {
+      scene_revision: sceneSnapshot.revision,
+      object_count: sceneSnapshot.objects.length,
+      fixture_adoption: "not-required-for-this-scene",
+    };
+    if (sceneSnapshot.objects.some((object) => object.id === fixtureObjectId)) {
+      await page.waitForFunction((id) => {
+        const viewport = document.querySelector(".fm-viewport-3d");
+        return Number(viewport?.getAttribute("data-primitive-object-count")) > 0 &&
+          viewport?.getAttribute("data-primitive-object-ids")?.split(" ").includes(id);
+      }, fixtureObjectId, { timeout });
+      partialProof.viewport_model_readiness.fixture_adoption = "primitive-model-adopted";
+    }
     if (process.env.CONTROL_ROOM_PREPARE_VIEWPORT_FIXTURE === "1") {
       partialProof.fixture_preparation = await runViewportQaFixtureBrowser(page, {
         expectedSession: sessionBefore, getSessionIdentity: () => sessionIdentity(page), timeout,

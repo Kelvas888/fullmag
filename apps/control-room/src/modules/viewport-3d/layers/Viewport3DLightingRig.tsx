@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useRef } from "react";
-import { useFrame } from "@react-three/fiber";
+import { useEffect, useMemo, useRef } from "react";
+import { useFrame, useThree } from "@react-three/fiber";
 import {
   DirectionalLight,
   Quaternion,
@@ -18,6 +18,16 @@ import {
   type Viewport3DVisualProfile,
   type Viewport3DVisualProfileId,
 } from "../viewport3dVisualProfile";
+import {
+  readViewport3DLightingAudit,
+  type Viewport3DLightingAudit,
+} from "../viewport3dLightingAudit";
+
+declare global {
+  interface Window {
+    __FULLMAG_READ_VIEWPORT_3D_LIGHTING__?: () => Viewport3DLightingAudit;
+  }
+}
 
 export type Viewport3DLightingAppearance = Pick<
   Viewport3DAppearancePreferences,
@@ -125,6 +135,20 @@ export function Viewport3DLightingRig({
   appearance?: Viewport3DLightingAppearance;
   profileId: Viewport3DVisualProfileId;
 }) {
+  const getThree = useThree((state) => state.get);
+  useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
+    const readAudit = () => {
+      const { scene, camera } = getThree();
+      return readViewport3DLightingAudit(scene, camera);
+    };
+    window.__FULLMAG_READ_VIEWPORT_3D_LIGHTING__ = readAudit;
+    return () => {
+      if (window.__FULLMAG_READ_VIEWPORT_3D_LIGHTING__ === readAudit) {
+        delete window.__FULLMAG_READ_VIEWPORT_3D_LIGHTING__;
+      }
+    };
+  }, [getThree]);
   const profile = getViewport3DVisualProfile(profileId);
   const rig = resolveViewport3DLightingRig(profile, appearance);
   const keyLightRef = useRef<DirectionalLight>(null);

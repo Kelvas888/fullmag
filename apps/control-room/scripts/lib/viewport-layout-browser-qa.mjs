@@ -228,8 +228,18 @@ async function captureCanvasAtSize(page, {
 
   await waitForLayoutFrame(page);
   await assertCanvas(`${theme.palette} ${target.id} canvas layout`);
-  const [state, hudDom] = await Promise.all([
+  const [state, hudDom, viewIdentity] = await Promise.all([
     readCanvasState(canvas), readAndAssertHudDomLayout(page),
+    page.locator(VIEWPORT_SELECTOR).evaluate((node) => ({
+      coordinate_unit: "m",
+      camera_position: node.getAttribute("data-camera-position"),
+      camera_target: node.getAttribute("data-camera-target"),
+      camera_up: node.getAttribute("data-camera-up"),
+      camera_projection: node.getAttribute("data-camera-projection"),
+      viewport_bounds: node.getAttribute("data-viewport-bounds"),
+      primitive_object_count: node.getAttribute("data-primitive-object-count"),
+      primitive_object_ids: node.getAttribute("data-primitive-object-ids"),
+    })),
   ]);
   assertCanvasState(state, target, expectedDpr, `${theme.palette} ${target.id}`);
 
@@ -296,6 +306,7 @@ async function captureCanvasAtSize(page, {
     },
     png: image,
     public_hud_dom: hudDom,
+    view_identity: viewIdentity,
   };
 }
 

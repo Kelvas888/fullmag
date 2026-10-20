@@ -93,6 +93,42 @@ export async function runViewportAppearanceBrowserQa(page, {
     }
     clearPixelSnapshots(pixelSnapshots, ["frame-center", "world"]);
 
+    let studioDifference = null;
+    let flatDifference = null;
+    await choose(page, "Geometry appearance", "Studio", "fm-view-lighting", timeout);
+    await waitForRenderedFrame(page);
+    const lightingAudit = await page.evaluate(() =>
+      window.__FULLMAG_READ_VIEWPORT_3D_LIGHTING__?.() ?? null);
+    if (lightingAudit?.litPrimitiveMeshCount > 0 && lightingAudit.otherSurfaceMeshCount === 0) {
+      await setSwitch(page, "Ambient occlusion", false, timeout);
+      await setSwitch(page, "Bloom (Glow)", false, timeout);
+      await choose(page, "Geometry appearance", "Studio", "fm-view-lighting", timeout);
+      await setRangeValue(page, "#fm-view-light-strength", 0);
+      await readCanvasPixels(page, dialog, "studio-zero", pixelSnapshots, pngDecoder, assertCanvas, timeout);
+      await choose(page, "Geometry appearance", "Flat", "fm-view-lighting", timeout);
+      if (!await page.locator("#fm-view-light-strength").isDisabled()) {
+        throw new Error("Flat geometry must explain its inactive studio light controls");
+      }
+      await readCanvasPixels(page, dialog, "flat-zero", pixelSnapshots, pngDecoder, assertCanvas, timeout);
+      await choose(page, "Geometry appearance", "Studio", "fm-view-lighting", timeout);
+      await setRangeValue(page, "#fm-view-light-strength", 2);
+      await readCanvasPixels(page, dialog, "studio-two", pixelSnapshots, pngDecoder, assertCanvas, timeout);
+      await choose(page, "Geometry appearance", "Flat", "fm-view-lighting", timeout);
+      await readCanvasPixels(page, dialog, "flat-two", pixelSnapshots, pngDecoder, assertCanvas, timeout);
+      studioDifference = comparePixelSnapshots(pixelSnapshots, "studio-zero", "studio-two");
+      flatDifference = comparePixelSnapshots(pixelSnapshots, "flat-zero", "flat-two");
+      if (studioDifference.changed_pixels < 8) {
+        throw new Error("Studio light intensity did not change the rendered geometry");
+      }
+      if (flatDifference.changed_pixels !== 0) {
+        throw new Error("Flat geometry changed when only stored studio intensity differed");
+      }
+      clearPixelSnapshots(pixelSnapshots, ["studio-zero", "studio-two", "flat-zero", "flat-two"]);
+      await choose(page, "Geometry appearance", "Studio", "fm-view-lighting", timeout);
+      await setRangeValue(page, "#fm-view-light-strength", originalControls.lightingIntensity);
+    }
+    await choose(page, "Geometry appearance", originalControls.lightingMode, "fm-view-lighting", timeout);
+
     await setSwitch(page, "Ambient occlusion", true, timeout);
     await setSwitch(page, "Bloom (Glow)", true, timeout);
     await page.waitForTimeout(100);
@@ -163,6 +199,16 @@ export async function runViewportAppearanceBrowserQa(page, {
         frame_center_hash: frameCenterPixels.hash,
         world_hash: worldPixels.hash,
       },
+      geometry_lighting: studioDifference && flatDifference ? {
+        state: "passed",
+        renderable_candidate_audit: lightingAudit,
+        studio_intensities: [0, 2],
+        studio_changed_pixels: studioDifference.changed_pixels,
+        flat_changed_pixels: flatDifference.changed_pixels,
+        flat_controls_disabled: true,
+        limitation: "Geometry preview only; quantitative fields and FEM are not established by this check.",
+      } : { state: "NOT VERIFIED", renderable_candidate_audit: lightingAudit,
+        reason: "No isolated in-frustum Lambert primitive candidate was established; quantitative field colors must not be required to change with studio light." },
       quantitative_effects: {
         requested: ["Ambient occlusion", "Bloom (Glow)"],
         protection_reason: protectedEffects.length === 2 ? protectedReason : null,
@@ -248,6 +294,8 @@ async function readControls(page, dialog) {
   const strength = Number(await page.locator("#fm-view-background-strength").inputValue());
   const ambientOcclusion = await dialog.getByRole("switch", { name: "Ambient occlusion", exact: true }).isChecked();
   const bloom = await dialog.getByRole("switch", { name: "Bloom (Glow)", exact: true }).isChecked();
+  const lightingMode = await readChoice(page, "Geometry appearance");
+  const lightingIntensity = Number(await page.locator("#fm-view-light-strength").inputValue());
   const backgroundMode = background === BACKGROUND_OPTIONS.gradient
     ? "gradient"
     : background === BACKGROUND_OPTIONS.solid
@@ -259,10 +307,12 @@ async function readControls(page, dialog) {
       ? "frame-center"
       : null;
   const frameMode = Object.entries(FRAME_OPTIONS).find(([, label]) => label === frame)?.[0] ?? null;
-  if (!backgroundMode || !originMode || !frameMode || !Number.isFinite(strength)) {
+  if (!backgroundMode || !originMode || !frameMode || !Number.isFinite(strength) ||
+      !["Studio", "Flat"].includes(lightingMode) || !Number.isFinite(lightingIntensity)) {
     throw new Error("Viewport appearance controls do not expose the expected selected values");
   }
-  return { ambientOcclusion, backgroundMode, bloom, frameMode, originMode, strength };
+  return { ambientOcclusion, backgroundMode, bloom, frameMode, originMode, strength,
+    lightingMode, lightingIntensity };
 }
 
 async function readChoice(page, label) {
@@ -534,6 +584,9 @@ async function verifyPreferenceReload(page, {
 }
 
 async function restoreControls(page, dialog, original, timeout) {
+  await choose(page, "Geometry appearance", "Studio", "fm-view-lighting", timeout);
+  await setRangeValue(page, "#fm-view-light-strength", original.lightingIntensity);
+  await choose(page, "Geometry appearance", original.lightingMode, "fm-view-lighting", timeout);
   await choose(page, "Background", BACKGROUND_OPTIONS.gradient, "fm-view-background", timeout);
   await setRangeValue(page, "#fm-view-background-strength", original.strength);
   await choose(page, "Scale coordinates", ORIGIN_OPTIONS[original.originMode], "fm-view-origin", timeout);

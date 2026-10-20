@@ -1,6 +1,6 @@
 # Plan refaktoryzacji wyglądu viewportu 3D
 
-Data: 20.10.2026. Status: **W REALIZACJI — R7, 85%; R8 nie rozpoczęto**. Aktualne commity, wyniki i otwarte bramki: [checkpoint implementacji](2026-10-20-viewport-visual-quality-checkpoint.md). Poniższe wymagania zachowują pełny pierwotny zakres.
+Data: 20.10.2026. Status: **W REALIZACJI — R7, 86%; R8 nie rozpoczęto**. Aktualne commity, wyniki i otwarte bramki: [checkpoint implementacji](2026-10-20-viewport-visual-quality-checkpoint.md). Poniższe wymagania zachowują pełny pierwotny zakres.
 
 Podstawa: [audyt jakości wizualnej](../../audits/2026-10-20-viewport-3d-visual-quality-audit.md), zapisany i ponownie przeczytany przed przygotowaniem tego planu.
 

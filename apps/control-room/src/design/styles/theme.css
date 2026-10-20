@@ -212,11 +212,12 @@
   --fm-shadow-control-pressed: inset 0 1px 3px rgb(76 79 105 / 20%);
   --fm-shadow-control-inset: inset 0 1px 3px rgb(76 79 105 / 13%);
 
-  --fm-hud-axis-x: #d20f39;
-  --fm-hud-axis-y: #40a02b;
-  --fm-hud-axis-z: #1e66f5;
-  --fm-hud-label: var(--fm-text-primary);
-  --fm-hud-tick: var(--fm-text-secondary);
+  /* Stronger HUD foregrounds retain axis hues over the light viewport gradient. */
+  --fm-hud-axis-x: #a80c2e;
+  --fm-hud-axis-y: #1e4d15;
+  --fm-hud-axis-z: #1443a0;
+  --fm-hud-label: #3c3f54;
+  --fm-hud-tick: var(--fm-text-primary);
   --fm-hud-halo: var(--fm-bg-viewport);
   --fm-hud-grid: #5c5f77;
   --fm-hud-chip: #eff1f5;
