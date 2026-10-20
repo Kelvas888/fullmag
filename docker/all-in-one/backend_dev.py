@@ -2104,7 +2104,7 @@ def _assert_exact_backup_inventory(
     artifacts = receipt.get("artifacts")
     if not isinstance(artifacts, list):
         _fail(f"{name} receipt artifact inventory is invalid")
-    allowed_files = {"backend-build-receipt.json", "rotation.json", "bin/fullmag"}
+    allowed_files = {"backend-build-receipt.json", "rotation.json"}
     for index, artifact in enumerate(artifacts):
         if not isinstance(artifact, Mapping) or not isinstance(artifact.get("path"), str):
             _fail(f"{name} receipt artifact {index} has no safe path")
@@ -2112,7 +2112,9 @@ def _assert_exact_backup_inventory(
     build_log = root / "direct-backend-build.log"
     if build_log.exists() or build_log.is_symlink():
         allowed_files.add("direct-backend-build.log")
-    optional_files = PACKAGE_CANDIDATE_OPTIONAL_FILES - {PACKAGE_CANDIDATE_MARKER}
+    optional_files = (
+        PACKAGE_CANDIDATE_OPTIONAL_FILES - {PACKAGE_CANDIDATE_MARKER}
+    ) | {"bin/fullmag"}
     actual_files, actual_directories = _stage_tree_inventory(root)
     allowed_directories: set[str] = set()
     for relative in allowed_files:

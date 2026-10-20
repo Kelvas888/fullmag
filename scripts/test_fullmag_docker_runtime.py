@@ -1373,6 +1373,243 @@ class DockerRuntimeContract(unittest.TestCase):
             initial_metadata, request=request, request_sha256=initial_metadata["request_sha256"]
         )
 
+    def test_accepted_reattach_initial_preflight_accepts_only_known_api_failure(self):
+        """Admit the observed API probe delta with a canonical owner chain."""
+        from dataclasses import replace
+
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths = replace(
+                service.RuntimePaths(),
+                state=root,
+                storage=root,
+                runs=root / "runs" / "worktree-test",
+                store=root / "runs" / "worktree-test" / "session-store",
+                state_root=root / ".fullmag",
+                runtime_services=root / "runtime-services",
+                config=root / "runtime.json",
+            )
+            proof_dir = paths.state_root / "accepted-run-reattach" / "proof"
+            proof_dir.mkdir(parents=True)
+            runtime_services = service.runtime_services_root(paths)
+            runtime_services.mkdir(parents=True)
+            process_path = service.process_receipt_path(paths)
+            process_path.parent.mkdir(parents=True)
+
+            def raw(value):
+                return (
+                    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode()
+
+            def owner(state, child_status):
+                return {
+                    "schema_version": "runtime_service_owner.v1",
+                    "owner_token": "11111111-1111-4111-8111-111111111111",
+                    "process_start_token": "22222222-2222-4222-8222-222222222222",
+                    "pid": 3217,
+                    "host": "fullmag-test-host",
+                    "target_id": service.TARGET_ID,
+                    "protocol": "stdin-v1",
+                    "state": state,
+                    "acquired_at": "2026-10-17T10:00:00Z",
+                    "heartbeat_at": "2026-10-17T10:00:01Z",
+                    "compute_pool_generation": 7,
+                    "preparation_pool_generation": 8,
+                    "control_address": "127.0.0.1:43123",
+                    "build_commit": "a" * 40,
+                    "build_snapshot": "b" * 64,
+                    "compute_pool_id": service.COMPUTE_POOL_ID,
+                    "preparation_pool_id": service.PREPARATION_POOL_ID,
+                    "children": [
+                        {"role": "compute", "pid": 3218, "status": child_status},
+                        {"role": "preparation", "pid": 3219, "status": child_status},
+                    ],
+                }
+
+            ready_owner = owner("ready", "running")
+            failed_owner = owner("failed", "exited_failure")
+            owner_raw = raw(failed_owner)
+            owner_path = runtime_services / "OWNER.json"
+            owner_path.write_bytes(owner_raw)
+            archived_owner_path = proof_dir / "terminal-owner.json"
+            archived_owner_path.write_bytes(owner_raw)
+
+            bootstrap = {
+                "schema": "fullmag.docker-accepted-store-bootstrap.v1",
+                "binding": "a" * 64,
+            }
+            common = {
+                "schema": "fullmag.docker-process-tree.v1",
+                "state": "shutdown_unknown",
+                "accepted_store": str(paths.store),
+                "bootstrap": bootstrap,
+                "qualification": "NOT VERIFIED",
+            }
+            current_process = dict(
+                common,
+                api_pid=3206,
+                api_exit_code=service._ACCEPTED_REATTACH_PRE_RESTORE_API_EXIT_CODE,
+                error=service._ACCEPTED_REATTACH_PRE_RESTORE_API_ERROR,
+                shutdown_error=service._ACCEPTED_REATTACH_PRE_RESTORE_SHUTDOWN_ERROR,
+            )
+            current_process_raw = raw(current_process)
+            process_path.write_bytes(current_process_raw)
+            archived_process_path = proof_dir / "terminal-process.json"
+            proof_path = proof_dir / "proof.json"
+            request_path = proof_dir / "request.json"
+            environment = {
+                service.ACCEPTED_REATTACH_REQUEST_ENV:
+                "accepted-run-reattach/proof/request.json",
+                service.ACCEPTED_REATTACH_DIGEST_ENV: "",
+            }
+            request = {}
+            archived_process = {}
+            archived_process_raw = b""
+
+            def write_bundle(process):
+                nonlocal archived_process, archived_process_raw, request
+                archived_process = dict(process)
+                archived_process_raw = raw(archived_process)
+                archived_process_path.write_bytes(archived_process_raw)
+                proof = {
+                    "schema": "fullmag.development-accepted-run-reattach-proof.v1",
+                    "activation_attempt": "a" * 32,
+                    "reconciliation_attempt": "b" * 32,
+                    "logical_session_id": "accepted-session",
+                    "session_epoch": 7,
+                    "terminal_owner_record_path":
+                    "accepted-run-reattach/proof/terminal-owner.json",
+                    "terminal_owner_record_sha256": hashlib.sha256(
+                        owner_raw
+                    ).hexdigest(),
+                    "terminal_process_record_path":
+                    "accepted-run-reattach/proof/terminal-process.json",
+                    "terminal_process_record_sha256": hashlib.sha256(
+                        archived_process_raw
+                    ).hexdigest(),
+                }
+                proof_raw = raw(proof)
+                proof_path.write_bytes(proof_raw)
+                request = {
+                    "schema": service.ACCEPTED_REATTACH_REQUEST_SCHEMA,
+                    "run_id": "run-held",
+                    "project_id": "project-held",
+                    "source_request_id": "request-held",
+                    "source_sha256": "c" * 64,
+                    "startup_provenance_sha256": "d" * 64,
+                    "config_sha256": "e" * 64,
+                    "proof_path": "accepted-run-reattach/proof/proof.json",
+                    "proof_sha256": hashlib.sha256(proof_raw).hexdigest(),
+                }
+                request_raw = raw(request)
+                request_path.write_bytes(request_raw)
+                environment[service.ACCEPTED_REATTACH_DIGEST_ENV] = hashlib.sha256(
+                    request_raw
+                ).hexdigest()
+                process_path.write_bytes(current_process_raw)
+                return proof, request
+
+            archived_process_template = dict(
+                common,
+                api_pid=3209,
+                api_exit_code=-15,
+                error="old native startup observation",
+                shutdown_error="old shutdown observation",
+                service_owner=ready_owner,
+            )
+            proof, request = write_bundle(archived_process_template)
+
+            with patch.object(service, "process_environment", return_value=environment):
+                preflight = service.accepted_reattach_preflight(paths)
+                self.assertEqual(
+                    preflight,
+                    {
+                        "request_sha256": environment[
+                            service.ACCEPTED_REATTACH_DIGEST_ENV
+                        ],
+                        "proof_sha256": request["proof_sha256"],
+                        "restore_mode": service.ACCEPTED_REATTACH_INITIAL_MODE,
+                        "previous_ack_relative": None,
+                        "previous_ack_sha256": None,
+                        "previous_drain_relative": None,
+                        "previous_drain_sha256": None,
+                    },
+                )
+
+                def reject_current(mutated):
+                    process_path.write_bytes(raw(mutated))
+                    try:
+                        with self.assertRaises(service.RuntimeServiceError):
+                            service.accepted_reattach_preflight(paths)
+                    finally:
+                        process_path.write_bytes(current_process_raw)
+
+                reject_current(dict(current_process, api_exit_code=100))
+                reject_current(dict(current_process, api_exit_code=101.0))
+                reject_current(dict(current_process, api_exit_code=True))
+                reject_current(dict(current_process, error="different API error"))
+                reject_current(dict(current_process, shutdown_error="different shutdown"))
+                reject_current(dict(current_process, service_owner=ready_owner))
+                reject_current(dict(current_process, state="ready"))
+                reject_current(dict(current_process, accepted_store="different-store"))
+                reject_current(dict(current_process, unexpected=True))
+
+                owner_path.write_bytes(raw(dict(failed_owner, owner_token="33333333-3333-4333-8333-333333333333")))
+                try:
+                    with self.assertRaises(service.RuntimeServiceError):
+                        service.accepted_reattach_preflight(paths)
+                finally:
+                    owner_path.write_bytes(owner_raw)
+
+                bad_ready_owner = dict(
+                    ready_owner,
+                    owner_token="44444444-4444-4444-8444-444444444444",
+                )
+                write_bundle(dict(archived_process_template, service_owner=bad_ready_owner))
+                with self.assertRaises(service.RuntimeServiceError):
+                    service.accepted_reattach_preflight(paths)
+                write_bundle(archived_process_template)
+
+                write_bundle(dict(archived_process_template, service_owner=failed_owner))
+                with self.assertRaises(service.RuntimeServiceError):
+                    service.accepted_reattach_preflight(paths)
+                write_bundle(archived_process_template)
+
+                archived_process_path.write_bytes(archived_process_raw + b" ")
+                try:
+                    with self.assertRaises(service.RuntimeServiceError):
+                        service.accepted_reattach_preflight(paths)
+                finally:
+                    archived_process_path.write_bytes(archived_process_raw)
+
+                archived_owner_path.write_bytes(owner_raw + b" ")
+                try:
+                    with self.assertRaises(service.RuntimeServiceError):
+                        service.accepted_reattach_preflight(paths)
+                finally:
+                    archived_owner_path.write_bytes(owner_raw)
+
+                # Rust also accepts the native-start-failure archive shape,
+                # where no ready owner was ever retained in the process receipt.
+                start_failure = dict(archived_process_template)
+                start_failure.pop("service_owner")
+                write_bundle(start_failure)
+                with self.assertRaises(service.RuntimeServiceError):
+                    service.accepted_reattach_preflight(paths)
+                owner_raw = raw(owner("failed", "exited_success"))
+                owner_path.write_bytes(owner_raw)
+                archived_owner_path.write_bytes(owner_raw)
+                write_bundle(start_failure)
+                preflight = service.accepted_reattach_preflight(paths)
+                self.assertEqual(
+                    preflight["restore_mode"], service.ACCEPTED_REATTACH_INITIAL_MODE
+                )
+
+                write_bundle(dict(start_failure, service_owner=None))
+                with self.assertRaises(service.RuntimeServiceError):
+                    service.accepted_reattach_preflight(paths)
+
     def test_accepted_reattach_held_generations_replay_raw_drains_before_terminal_ack(self):
         """Exercise three held successors before the native terminal decision.
 
