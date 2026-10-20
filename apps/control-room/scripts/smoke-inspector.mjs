@@ -643,6 +643,12 @@ try {
     "Ribbon Panel menu did not report Inspector as hidden.",
   );
   await inspectorMenuItem.click();
+  assert(
+    (await inspectorMenuItem.getAttribute("aria-checked")) === "true",
+    "Ribbon Panel menu did not report Inspector as restored.",
+  );
+  await page.keyboard.press("Escape");
+  await page.getByRole("menu").waitFor({ state: "hidden" });
   await page.waitForTimeout(150);
   assert(await panel.isVisible(), "Ribbon Panel menu did not restore Inspector.");
   await writeResizeDomSnapshot(page, outputDir, "after-restore");
