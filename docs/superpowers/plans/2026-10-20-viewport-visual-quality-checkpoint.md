@@ -4,6 +4,8 @@
 
 Poniższe sekcje historyczne opisują kolejne próby; ten blok określa aktualny stan. HEAD przed bieżącym fragmentem: `1bfb26078b40dc13d0667d81ce6e5fd9bb11ce61`. R8 pozostaje nierozpoczęte. Nie ma zgody na uznanie częściowych dowodów za ukończenie macierzy R7.
 
+Fragment zapisano jako `f946bf577123c472dad91ccf9eda92feb68bdc73` — `Strengthen viewport contrast and lighting verification`. Rejestr worktree aktualny dla tego commita, state=active. Commit hook zakończył się exit 0; React Doctor zgłosił 10 ostrzeżeń w helperze QA, nie w produkcyjnym rig: osiem o sekwencyjnych odczytach DOM (prawdziwa, niskiego wpływu możliwość skrócenia harnessu) oraz dwa o await w pętli. W pętli kroków klawiatury zakresu i kolejnych scrollIntoView odczyty zależą od poprzedniej mutacji; równoległe wykonanie zmieniłoby scenariusz. Nie wyłączono reguł i nie potraktowano wyniku Doctor jako pełnego odbioru React.
+
 - Próba browser `b426e8b189134cbe94d977bd8017d6a3`: wszystkie osiem wpisów partial proof zachowane, w tym model readiness, appearance, camera, export, layout DPR1/2, export DPR2 i lifecycle. Kamera przywrócona przez widoczny dialog; zachowany canvas/kontekst. Studio 0→2: 45 918 zmienionych pikseli; Flat: 0. To dowód zastępczej bryły, nie pola FDM/FEM.
 - Cały przebieg: `failed-confirmed`, exit 1; 6 odpowiedzi HTTP 404 frequency response oraz 19 odpowiedzi 422 planar-default, brak page errors i request failures. Błędy pozostają w wyniku i nie są filtrowane.
 - Layout obu motywów w 480×320: identyczne position `[9.308214556237385e-8,4.261914480490918e-8,8.058214556237386e-8]`, target `[2e-8,-1e-8,7.500000000000001e-9]`, up `[0,0,1]`, perspective; bounds center=target, size `[4e-8,3e-8,1.5000000000000002e-8]` m. Model count=1 dowodzi adopcji modelu, nie widoczności mesha.
@@ -19,6 +21,18 @@ Poniższe sekcje historyczne opisują kolejne próby; ten blok określa aktualny
 `kernel/resources/studyRuntimeResources.ts` hooki response sweep/progress używają ogólnych rewizji artifact/artifacts/stages; brak tam pozytywnego warunku publikacji danego podproduktu. Konsumenci obejmują FooterTelemetry, ResultsNavigator, Explorer oraz Inspector. Źródła nie identyfikują konkretnego nadawcy żądania z tej próby. W viewport-3d nie ma callsite tych hooków.
 
 Spec `frequency-domain-results-product-projection-v1.md:74` wymaga dla sweep gotowego result_manifest oraz deklaracji response_sweep_v1_path/v2 lub response_sweep_resource_key. Spec `frequency-domain-artifacts-v2.md:2250,2322` rozdziela opublikowany progress/checkpoint i aktywne stage execution. Proponowana korekta to publication gate zgodny z manifestem; zadeklarowane zasoby nadal muszą ujawniać rzeczywisty 404. Nie wprowadzono catch/ignoreMissingResource ani zmiany wspólnych hooków. To osobna nierozwiązana przyczyna czerwonego QA; nie rozszerza wyjątku testowego na ogólne API.
+
+### Rozpoznanie planar 422 — granice ustaleń
+
+Callsite `usePlanarFieldMetaResource` są poza viewport-3d: FieldMapModule, PlanarVisualizationSection i PlanarMonitorInspectorPanel; fasada wybiera `planar-default/meta` dla source=default. FieldMap używa warunków active/visible/scope; PlanarVisualizationSection coverage/state, bez pozytywnego warunku materializacji descriptoru. Kontrakt `resource-first-control-room-api-v2.md:236` rozdziela możliwości ilości (data/quantities) od gotowych danych (data/fields). Pusty katalog nie oznacza automatycznie braku preview capability. Dlatego nie dodano prostego `catalog.length > 0` ani pobocznego compute_fields. Minimalna dalsza diagnoza wymaga initiatora i snapshotu aktywnego widoku/materializacji z chwili 422; źródła same nie przypisują tej konkretnej odpowiedzi do komponentu ani nie dowodzą jej przyczyny. Nie ukrywano 422.
+
+### Koordynacja i retencja
+
+Jednorazowe przekazanie diagnozy cancelled/missing artifact catalog wykonano zgodnie ze zgodą użytkownika. Dalsze krótkie READY dla freeze/sync mastera oparto na odczytanej bezpośredniej instrukcji użytkownika „Skoordynuj przerwę z agentami” w czacie „Przywróć wizualizacje FEM i FDM”, user message `01a15a5b-66cd-7b72-89f2-cbd8394b2271`; nie na samym żądaniu innego agenta. Nie zmieniamy mastera ani jego indeksu. Trwa uzgodnione okno bez zapisów mastera do RELEASE.
+
+Po terminalnych próbach zachowano receipty, runner-output, obrazy, cache przyrostowy i dane użytkownika. Launcher usunął własne terminalne helpery QA; żadnego ręcznego prune ani usuwania danych. Worktree i dwie stałe usługi pozostają potrzebne do brakujących scen R7; ponowna ocena ich zbędności dopiero po integracji i sprawdzeniu aktywnych mountów/procesów. Blokada cancelled run pozostaje nierozwiązana w tym runtime; nie powtórzono Stop, nie resetowano ownera i nie tworzono katalogu artefaktów zastępczo.
+
+Pomiar po etapie: C: wolne `110905458688` B; filesystem control volume 548 GiB dostępne (43% zajęte). Docker ps tej grupy potwierdził tylko backend/frontend, oba healthy, bez helperów QA. To pomiar miejsca i stanu, nie kwalifikacja danych do usunięcia.
 
 Brakujące dowody nadal obejmują pełną macierz scen (pusta, otwór, skrajnie cienka, live FDM/FEM), RGB danych ilościowych, rzeczywiste AO, kontrast wszystkich linii, performance dużej sceny, nową sesję/dataset, stare ACK oraz błąd capture. Nie wykonano push/PR/merge ani cleanup aktywnego worktree.
 
