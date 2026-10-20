@@ -19,6 +19,12 @@ const CAMERA_POSES = Object.freeze([
   { name: "oblique-xy-negative", direction: [-1, -1, 1] },
   { name: "oblique-y-negative", direction: [1, -1, 1] },
   { name: "under-floor", direction: [1, 1, -1] },
+  { name: "axis-x-positive", direction: [1, 0, 0] },
+  { name: "axis-x-negative", direction: [-1, 0, 0] },
+  { name: "axis-y-positive", direction: [0, 1, 0] },
+  { name: "axis-y-negative", direction: [0, -1, 0] },
+  { name: "axis-z-positive", direction: [0, 0, 1] },
+  { name: "axis-z-negative", direction: [0, 0, -1] },
 ]);
 
 /**
@@ -203,7 +209,7 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
         preserveDialogOpen: true,
         timeout,
         snapshots,
-        embedPng: pose.name === "under-floor",
+        embedPng: pose.name === "under-floor" || pose.name === "axis-z-positive",
       });
       captures.push(capture);
       poses.push({

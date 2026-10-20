@@ -1,6 +1,6 @@
 # Plan refaktoryzacji wyglądu viewportu 3D
 
-Data: 20.10.2026. Status: **PLAN — implementacja nie została rozpoczęta**.
+Data: 20.10.2026. Status: **W REALIZACJI — R7, 85%; R8 nie rozpoczęto**. Aktualne commity, wyniki i otwarte bramki: [checkpoint implementacji](2026-10-20-viewport-visual-quality-checkpoint.md). Poniższe wymagania zachowują pełny pierwotny zakres.
 
 Podstawa: [audyt jakości wizualnej](../../audits/2026-10-20-viewport-3d-visual-quality-audit.md), zapisany i ponownie przeczytany przed przygotowaniem tego planu.
 
@@ -90,7 +90,7 @@ Zmiany mieszczące się w istniejącej architekturze wymagają aktualizacji spec
 | R7 | Dowody jakości, wydajności i regresji | V01–V15 | Wszystkie wcześniejsze |
 | R8 | Integracja i zamknięcie | Cały zakres | Zielone wymagane bramki R7 |
 
-Wszystkie poniższe zadania są **DO WYKONANIA**.
+Poniższe zadania definiują kryteria realizacji. Obecność kodu R1–R6 nie oznacza zaliczenia całego zakresu; aktualne wyniki R0/R7 i ograniczenia odbioru są zapisane w checkpointcie.
 
 ## 5. Zadania wykonawcze
 
@@ -253,11 +253,11 @@ Każdy etap powinien zachowywać bezpieczny preset: Solid, dotychczasowy tryb fr
 
 Po podstawowym wdrożeniu można osobno rozważyć: cienie kontaktowe, lepszą prezentację clipping/cutaway, trwałe zapisane ujęcia projektu i bardziej rozbudowany eksport publikacyjny. Te rozszerzenia nie mogą stać się warunkiem uzyskania prostego gradientu i czytelnych osi.
 
-## 9. Status przekazania
+## 9. Status pierwotnego przekazania dokumentacji
 
 - [x] Audyt bieżących źródeł `master` i dwóch obrazów użytkownika.
 - [x] Ponowny odczyt zapisanego audytu i sprawdzenie wniosków przed planem.
 - [x] Plan z plikami, zależnościami, właścicielami stanu i kryteriami odbioru.
 - [ ] R0–R8: implementacja, dowody runtime i integracja.
 
-Obecne zadanie dostarcza dokumenty. Stan aplikacji i wszystkie przyszłe bramki implementacyjne pozostają **NOT VERIFIED**.
+Pierwotny etap dostarczył dokumenty. Użytkownik następnie zlecił implementację; aktualny stan aplikacji, dowody i niezaliczone bramki określa checkpoint, bez zmiany kryteriów tego planu.
