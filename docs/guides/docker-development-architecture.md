@@ -191,11 +191,13 @@ docker logs -f <backend-container-id>
 
 Usługi Compose DEV ustawiają Docker `json-file` logging z rotacją `10m × 3`
 na każdy kontener. Frontend zapisuje szczegóły Next w stałym
-`/state/development/next.log` z named volume; plik jest zerowany przy każdym
-nowym starcie frontendu, więc restarty nie dopisują kolejnych kopii. To nie
-ogranicza rozmiaru `next.log` podczas jednej długiej sesji ani archiwów starych
-pakietów backendu. Pełna retencja tych technicznych plików nadal wymaga pracy;
-limit logów Docker nie jest quota dla wolumenów ani BuildKit.
+`/state/development/next.log` z named volume, z limitem 64 MiB. Nadmiar trafia
+do rotowanego logu Docker. Przy następnym starcie, pod blokadą procesu,
+pełny log jest atomowo przenoszony do jednej poprzedniej kopii
+`next.log.rollback`; niepełny log pozostaje do dalszego dopisywania.
+Szczegóły i pozostałe ograniczenia retencji opisuje
+[cykl danych](docker-build-storage-lifecycle.md#4-co-sprzątamy-automatycznie-a-co-pozostaje).
+Limity logów nie są quota dla cache, wolumenów ani BuildKit.
 
 Każdy start sam sprawdza aktualne zamontowane źródła. Bez zmian używa istniejącego
 wyniku; po edycji kompiluje zmienione moduły oraz ich zależnych konsumentów,

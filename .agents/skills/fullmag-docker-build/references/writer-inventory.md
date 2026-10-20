@@ -34,8 +34,10 @@ zawiera konfigurację i wynik konkretnego startu. Cache backendu zachowuje
 parę named volumes; frontend używa `fullmag-dev-frontend-v1-<key>` z metadanymi,
 pnpm i Next. Nie utożsamiaj tej nazwy ze starszym adapterem ext4 frontend-v1.
 Nowa ścieżka nie używa hostowego wskaźnika `runs/docker-all` jako buildu.
-Log Make i `next.log` mają budżet 64 MiB; pełny log frontendu blokuje kolejny
-start do jawnego przeglądu, bez automatycznego tracenia poprzedniej diagnostyki.
+Log Make i `next.log` mają budżet 64 MiB. Przy następnym starcie frontend
+obraca pełny regularny log pod runtime lockiem do jednej poprzedniej kopii;
+niepełny log jest dopisywany, nadmiar trafia do rotowanego logu Docker.
+Dowiązania, hardlinki, pliki nieregularne i ponadlimitowe są zachowywane.
 Wcześniejsze generacje wolumenów są zachowane, bez automatycznej migracji lub
 usuwania; przed ich cleanupem sprawdź właścicieli i referencje.
 
@@ -95,14 +97,15 @@ W Compose DEV każda z czterech usług (`development-base`, maintenance,
 `backend`, `frontend`) ma `json-file` z `max-size=10m`, `max-file=3`. To
 ogranicza stdout/stderr zarządzane przez Docker Engine do nominalnych 3 × 10 MiB
 na kontener; nie ogranicza plików w wolumenach ani BuildKit. Frontend otwiera
-`/state/development/next.log` przez `O_TRUNC` po przejęciu blokady, więc log nie
-narasta między restartami. Nie ma jeszcze limitu pliku w trakcie długiej sesji.
+`/state/development/next.log` przez `O_APPEND`, z limitem 64 MiB i nadmiarem
+kierowanym do stdout Docker. Przy starcie pełny regularny log jest atomowo
+obracany do jednej `next.log.rollback` pod runtime lockiem; katalog jest
+synchronizowany przed utworzeniem nowego pliku. Niepełny log pozostaje.
 
 Backend zapisuje `direct-backend-build.log` do bieżącego pakietu; bezpośredni
 rollback zachowuje poprzedni pakiet. Starsze pakiety archiwizują receipt i
 rotację, ale nie pełny log. Retired ma limit 8 wpisów i 64 MiB payloadu.
-Logi Next w pojedynczej długiej sesji, Cargo/CMake, BuildKit i stare wolumeny
-nadal nie mają ogólnego limitu. Pełny runtime Docker i pomiary wzrostu
+Cargo/CMake, BuildKit i stare wolumeny nadal nie mają ogólnego limitu. Pełny runtime Docker i pomiary wzrostu
 pozostają `NOT VERIFIED`.
 
 Migracja **nie implementuje** automatycznego usuwania starych wersji named
