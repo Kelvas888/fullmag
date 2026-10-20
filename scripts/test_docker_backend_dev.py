@@ -2293,26 +2293,88 @@ class BackendPackageTests(unittest.TestCase):
             self.assertFalse((target / "lib/libfullmag_fdm.so").is_symlink())
 
     def test_make_default_and_direct_install_roots_are_distinct(self):
-        makefile = Path(__file__).resolve().with_name("Makefile")
-        if not makefile.is_file():
-            makefile = Path(__file__).resolve().parents[1] / "Makefile"
-        source = makefile.read_text(encoding="utf-8")
-        self.assertIn("FULLMAG_INTERNAL_INSTALL_ROOT ?= .fullmag/local", source)
-        self.assertIn('mkdir -p "$(FULLMAG_INTERNAL_INSTALL_ROOT)"', source)
-        self.assertIn('$(FULLMAG_INTERNAL_INSTALL_ROOT)/bin/fullmag-bin', source)
-        self.assertIn('$(FULLMAG_INTERNAL_INSTALL_ROOT)/lib/', source)
-        self.assertIn(
-            'rm -f "$(FULLMAG_INTERNAL_INSTALL_ROOT)/lib/"libfullmag_fdm.so*',
-            source,
-        )
-        self.assertNotIn(
-            'rm -f "$(FULLMAG_INTERNAL_INSTALL_ROOT)/lib/libfullmag_fdm.so*"',
-            source,
-        )
-        self.assertIn('source_identity_file="$(FULLMAG_INTERNAL_INSTALL_ROOT)/source-identity.json"', source)
-        self.assertIn('FULLMAG_FEM_MESH_CACHE_DIR="$$REPO_ROOT/.fullmag/local/cache/fem_mesh_assets"', source)
-        self.assertIn('show-cli-path:', source)
-        self.assertIn('$(PWD)/.fullmag/local/bin/fullmag', source)
+        """Exercise the installer with fake build outputs, without compiling."""
+        makefile = Path(__file__).resolve().parents[1] / "Makefile"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / "tools"
+            tools.mkdir()
+            for tool in ("cargo", "patchelf"):
+                executable = tools / tool
+                executable.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' " + tool
+                    + ' >> "$FULLMAG_INSTALL_TRACE"\n',
+                    encoding="utf-8",
+                )
+                executable.chmod(0o755)
+            target = root / "target" / "backend-dev"
+            target.mkdir(parents=True)
+            binaries = {
+                Path(relative).name
+                for relative in backend.REQUIRED_PACKAGE_PATHS
+                if relative.startswith("bin/")
+            }
+            for binary in binaries:
+                cargo_name = "fullmag" if binary == "fullmag-bin" else binary
+                (target / cargo_name).write_bytes(("fixture:" + binary).encode())
+            (target / "lib_fullmag_core.so").write_bytes(b"python-core-fixture")
+            native = root / "native" / "backends" / "fdm"
+            native.mkdir(parents=True)
+            (native / "libfullmag_fdm.so.1").write_bytes(b"fdm-library-fixture")
+            (native / "libfullmag_fdm.so").symlink_to("libfullmag_fdm.so.1")
+            trace = root / "tools.log"
+            for custom in (False, True):
+                with self.subTest(custom=custom):
+                    workspace = root / ("custom" if custom else "default")
+                    workspace.mkdir()
+                    legacy = workspace / ".fullmag" / "local"
+                    legacy.mkdir(parents=True)
+                    (legacy / "keep.txt").write_bytes(b"retain legacy data")
+                    destination = root / "candidate" if custom else legacy
+                    library_directory = destination / "lib"
+                    library_directory.mkdir(parents=True)
+                    stale = library_directory / "libfullmag_fdm.so.obsolete"
+                    stale.write_bytes(b"obsolete-library")
+                    environment = {
+                        key: value for key, value in os.environ.items()
+                        if not key.startswith("FULLMAG_")
+                    }
+                    environment.update(
+                        PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                        FULLMAG_INSTALL_TRACE=str(trace),
+                        FULLMAG_DIRECT_COMPOSE="1",
+                        FULLMAG_BUILD_CPU_ONLY="1",
+                        FULLMAG_BACKEND_CARGO_PROFILE="backend-dev",
+                        FULLMAG_CARGO_TARGET_DIR=str(target.parent),
+                        FULLMAG_FDM_NATIVE_BUILD_ROOT=str(root / "native"),
+                        FULLMAG_SOURCE_GIT_COMMIT="a" * 40,
+                        FULLMAG_SOURCE_WORKTREE_STATE="clean",
+                        FULLMAG_SOURCE_SNAPSHOT_SHA256="b" * 64,
+                    )
+                    if custom:
+                        environment["FULLMAG_INTERNAL_INSTALL_ROOT"] = str(destination)
+                    result = subprocess.run(
+                        # This fixture exercises the installer body with fake outputs;
+                        # the managed storage shell is qualified by separate checks.
+                        ["/usr/bin/make", "--no-print-directory", ".SHELLFLAGS=-e -c",
+                         "-f", str(makefile), "install-cli-dev"],
+                        cwd=workspace, env=environment, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+                    for binary in binaries:
+                        self.assertEqual(
+                            (destination / "bin" / binary).read_bytes(),
+                            ("fixture:" + binary).encode(),
+                        )
+                    self.assertEqual((destination / "_fullmag_core.so").read_bytes(), b"python-core-fixture")
+                    self.assertEqual((library_directory / "libfullmag_fdm.so").read_bytes(), b"fdm-library-fixture")
+                    self.assertEqual((destination / "launcher-build-mode").read_text().strip(), "cpu")
+                    self.assertFalse(stale.exists())
+                    self.assertEqual((legacy / "keep.txt").read_bytes(), b"retain legacy data")
+                    if custom:
+                        self.assertEqual({path.name for path in legacy.iterdir()}, {"keep.txt"})
+            self.assertEqual(trace.read_text().splitlines().count("cargo"), 4)
 
 
     def test_package_alias_cannot_escape_library_directory(self):
