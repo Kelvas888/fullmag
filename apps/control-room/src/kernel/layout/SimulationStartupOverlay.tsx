@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Minus, PanelTopOpen, X } from "lucide-react";
 
 import {
   Accordion,
@@ -9,6 +10,7 @@ import {
   AccordionTrigger,
 } from "@/shared/ui/Accordion";
 import { Button } from "@/shared/ui/Button";
+import { DraggablePanel } from "@/shared/ui/DraggablePanel";
 import { Progress } from "@/shared/ui/Progress";
 import {
   Tooltip,
@@ -120,15 +122,86 @@ export function SimulationStartupOverlayView({
 }) {
   if (!state.isVisible) return null;
 
+  return (
+    <SimulationPreparationWindow
+      key={state.preparation?.preparation_id ?? "pending"}
+      state={state}
+    />
+  );
+}
+
+function SimulationPreparationWindow({ state }: { state: SimulationStartupOverlayState }) {
+  const [mode, setMode] = useState<"open" | "minimized" | "closed">("open");
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const hostRef = useRef<HTMLElement>(null);
+  const restoreRef = useRef<HTMLButtonElement>(null);
+  const previousMode = useRef(mode);
+  useEffect(() => {
+    if (previousMode.current === mode) return;
+    previousMode.current = mode;
+    if (mode === "open") {
+      hostRef.current?.querySelector<HTMLButtonElement>(".fm-draggable-panel__move:not(:disabled), .fm-draggable-panel__actions button")?.focus();
+    } else {
+      restoreRef.current?.focus();
+    }
+  }, [mode]);
   const progressValue =
     state.progress.kind === "determinate" ? state.progress.value : undefined;
 
   return (
     <aside
+      ref={hostRef}
       aria-label="Simulation preparation status"
       className="fm-simulation-startup"
       data-state={state.kind}
     >
+      {mode !== "open" ? (
+        <div className="fm-simulation-startup__restore" data-mode={mode}>
+          <Button
+            ref={restoreRef}
+            aria-label="Show simulation preparation"
+            title={state.title}
+            onClick={() => setMode("open")}
+            variant="secondary"
+            type="button"
+          >
+            <PanelTopOpen size={16} aria-hidden="true" />
+            {mode === "minimized" ? state.title : "Preparation"}
+            {state.failure || state.kind === "resource-error" ? (
+              <span className="fm-simulation-startup__restore-status">Failed</span>
+            ) : progressValue !== undefined ? (
+              <span className="fm-simulation-startup__restore-status">{progressValue}%</span>
+            ) : null}
+          </Button>
+          {mode === "minimized" ? (
+            <Button aria-label="Hide preparation summary" title="Hide summary" size="icon" variant="ghost" type="button" onClick={() => setMode("closed")}>
+              <X size={14} aria-hidden="true" />
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+      <div aria-live="polite" className="fm-visually-hidden" role="status">
+        {state.liveSummary}
+      </div>
+      <DraggablePanel
+        open={mode === "open"}
+        onOpenChange={(open) => setMode(open ? "open" : "closed")}
+        title={state.eyebrow}
+        ariaLabel="Simulation preparation window"
+        role="region"
+        keepMounted
+        closeLabel="Close simulation preparation"
+        className={`fm-simulation-startup__window${detailsOpen ? " fm-simulation-startup__window--expanded" : ""}`}
+        defaultPosition={{ x: 96, y: 144 }}
+        resizable={detailsOpen}
+        maximizable
+        onMaximize={() => setDetailsOpen(true)}
+        headerActions={
+          <Button aria-label="Minimize simulation preparation" title="Minimize" size="icon" variant="ghost" type="button" onClick={() => setMode("minimized")}>
+            <Minus size={16} aria-hidden="true" />
+          </Button>
+        }
+      >
       <section
         aria-labelledby="fm-simulation-startup-title"
         className="fm-simulation-startup__panel"
@@ -136,7 +209,6 @@ export function SimulationStartupOverlayView({
         <header className="fm-simulation-startup__summary">
           <div className="fm-simulation-startup__heading-row">
             <div className="fm-simulation-startup__heading-copy">
-              <p className="fm-simulation-startup__eyebrow">{state.eyebrow}</p>
               <h2
                 className="fm-simulation-startup__title"
                 id="fm-simulation-startup-title"
@@ -171,23 +243,19 @@ export function SimulationStartupOverlayView({
                 ? `${state.progress.value}%`
                 : state.progress.kind === "terminal"
                   ? "Failed"
-                  : state.activeStage?.stateLabel ?? "Connecting"}
+                  : state.activeStage?.stateLabel ??
+                    state.progressLabel ??
+                    "Connecting"}
             </span>
           </div>
         </header>
-
-        <div
-          aria-live="polite"
-          className="fm-visually-hidden"
-          role="status"
-        >
-          {state.liveSummary}
-        </div>
 
         <Accordion
           className="fm-simulation-startup__accordion"
           collapsible
           type="single"
+          value={detailsOpen ? "details" : ""}
+          onValueChange={(value) => setDetailsOpen(value === "details")}
         >
           <AccordionItem value="details">
             <AccordionTrigger className="fm-simulation-startup__details-trigger">
@@ -199,6 +267,13 @@ export function SimulationStartupOverlayView({
               className="fm-simulation-startup__details"
               forceMount
             >
+              <div className="fm-simulation-startup__body">
+                <PreparationStageList stages={state.stages} />
+                <SimulationPreparationLog entries={state.logEntries} />
+              </div>
+
+              <details className="fm-simulation-startup__technical">
+                <summary>Execution and provenance</summary>
               {state.totalElapsedLabel ? (
                 <div className="fm-simulation-startup__elapsed">
                   <span>Total elapsed</span>
@@ -268,16 +343,15 @@ export function SimulationStartupOverlayView({
                   {state.progressLabel}
                 </p>
               ) : null}
-
-              <div className="fm-simulation-startup__body">
-                <PreparationStageList stages={state.stages} />
-                <SimulationPreparationLog entries={state.logEntries} />
-              </div>
+              </details>
 
               <footer className="fm-simulation-startup__footer">
                 <p>
-                  Preparation continues in the background while you work in the
-                  workspace.
+                  {state.failure
+                    ? "Preparation failed. Review the diagnostics before starting again."
+                    : state.kind === "resource-error"
+                      ? "Preparation status is unavailable. Check the backend connection."
+                      : "Preparation continues in the background, even when this window is closed."}
                 </p>
                 {(state.failure && state.preparation) ||
                 state.kind === "resource-error" ? (
@@ -288,6 +362,7 @@ export function SimulationStartupOverlayView({
           </AccordionItem>
         </Accordion>
       </section>
+      </DraggablePanel>
     </aside>
   );
 }
@@ -385,9 +460,8 @@ function resolveProgressValueText(
       ? `${state.progress.value} percent, ${state.progressLabel}`
       : `${state.progress.value} percent`;
   }
-  return state.activeStage
-    ? `${state.activeStage.label} in progress`
-    : "Connecting to the simulation backend";
+  if (state.activeStage) return `${state.activeStage.label} in progress`;
+  return state.progressLabel ?? "Connecting to the simulation backend";
 }
 
 type SimulationPreparationDiagnosticsNavigation = {
@@ -536,7 +610,28 @@ export function simulationStartupOverlayResourceStateEquals(
     previous.status.status === next.status.status &&
     previous.status.error === next.status.error &&
     previous.status.revision === next.status.revision &&
+    previous.status.data?.session.session_id ===
+      next.status.data?.session.session_id &&
+    previous.status.data?.session.session_epoch ===
+      next.status.data?.session.session_epoch &&
+    previous.status.data?.session.request_scope_epoch ===
+      next.status.data?.session.request_scope_epoch &&
+    previous.status.data?.lifecycle.session_resource ===
+      next.status.data?.lifecycle.session_resource &&
+    previous.status.data?.lifecycle.solver ===
+      next.status.data?.lifecycle.solver &&
     previous.status.data?.solver.state === next.status.data?.solver.state &&
+    previous.status.data?.run?.run_id === next.status.data?.run?.run_id &&
+    previous.status.data?.domain.discretization ===
+      next.status.data?.domain.discretization &&
+    previous.status.data?.domain.generation_id ===
+      next.status.data?.domain.generation_id &&
+    previous.status.data?.domain.cell_count ===
+      next.status.data?.domain.cell_count &&
+    previous.status.data?.resources.domain_generation_id ===
+      next.status.data?.resources.domain_generation_id &&
+    previous.status.data?.resources.mesh_revision ===
+      next.status.data?.resources.mesh_revision &&
     previous.status.data?.resources.simulation_preparation_revision ===
       next.status.data?.resources.simulation_preparation_revision
   );

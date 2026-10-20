@@ -545,7 +545,7 @@ pub(crate) fn finalize_native_fem_relaxation(
                                 .as_ref()
                                 .map(|accepted| crate::dispatch::flatten_vectors(&accepted.magnetization))
                         })
-                        .or_else(|| match backend.copy_m(node_count) {
+                        .or_else(|| match copy_native_fem_field_snapshot(backend, "m", node_count) {
                             Ok(values) => Some(crate::dispatch::flatten_vectors(&values)),
                             Err(error) => {
                                 eprintln!(
@@ -839,7 +839,10 @@ pub(crate) fn finalize_native_fem_relaxation(
                 "state_role": "time_domain_observation_only",
             })).map_err(|error| RunError { message: format!("encode FEM certification availability: {error}") })?,
         });
-        (backend.copy_m(node_count)?, backend.representation_receipt()?)
+        (
+            copy_native_fem_field_snapshot(backend, "m", node_count)?,
+            backend.representation_receipt()?,
+        )
     };
     let final_node_map = backend.local_node_index_map()?;
     final_node_map

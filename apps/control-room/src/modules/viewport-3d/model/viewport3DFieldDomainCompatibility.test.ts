@@ -147,6 +147,7 @@ describe("resolveViewport3DFieldDomainCompatibility", () => {
           domainGenerationId: "43",
           formatVersion: 3,
           indexing: "sampled_node_indices",
+          nodeIndices: Uint32Array.from([0, 1, 2, 3]),
           meshTopologyHash: digest,
           meshTopologyRevision: "7",
           pointCount: 4,

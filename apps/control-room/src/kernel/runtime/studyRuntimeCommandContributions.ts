@@ -1600,7 +1600,14 @@ async function submitRuntimeCommand(
     commandRevision(response, `study:${refreshedCommand.kind}`),
   );
 
-  return { message: successMessage, status: "completed" };
+  // The POST acknowledges admission. The session command ledger owns the
+  // terminal result, including failures after native worker startup.
+  return {
+    commandId: response.command_id,
+    message: successMessage,
+    observation: "waiting",
+    status: "pending",
+  };
 }
 
 async function refreshRuntimeCommandPrecondition(

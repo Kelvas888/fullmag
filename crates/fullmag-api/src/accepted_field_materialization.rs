@@ -1,129 +1,12 @@
 //! API adoption of immutable worker-published accepted observables.
 
 use std::{collections::BTreeSet, sync::Arc};
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
-use fullmag_session::{FmsArtifactStatus, SessionStore};
-use crate::{error::ApiError, types::{AppState, CurrentLiveFieldFrameRequest}};
 use crate::accepted_field_binary::AcceptedFieldReader;
-use crate::accepted_field_materialization_worker::{
-    field_key, read_record, MaterializationRecord, ARTIFACT_TYPE, MAX_BUNDLE_BYTES, SCHEMA,
-};
-struct LoadedBundle {
-    record: MaterializationRecord,
-    state_fingerprint: String,
-    specification: Value,
-}
-
-fn load_latest_bundle(store_root: &std::path::Path, run_id: &str) -> Result<LoadedBundle> {
-    let store = SessionStore::open_existing(store_root)?;
-    let intent = store.read_run_intent(run_id)?.context("accepted run intent missing")?;
-    intent.validate()?;
-    let project_id = serde_json::from_value::<fullmag_application::RunSpecification>(intent.specification.clone())?
-        .snapshot.project_id;
-    let accepted = fullmag_runtime_control::load_accepted_study_snapshot(&store,
-        &fullmag_application::RunId::parse(run_id)?, &project_id)?;
-    let run = store.read_run_catalog(run_id)?.context("accepted run catalog missing")?;
-    let catalog = store.read_artifact_catalog(run_id)?.context("accepted artifact catalog missing")?;
-    run.validate()?; catalog.validate()?;
-    // Choose the latest state-producing step, never an older available bundle.
-    let mut selected = None;
-    for step in &accepted.lowered.steps {
-        let task_id = fullmag_session::task_id_for_study_step(run_id, &step.step_id)?;
-        let Some(task) = run.tasks.iter().find(|task| task.task_id == task_id
-            && task.lifecycle == fullmag_session::FmsTaskLifecycle::Succeeded) else { continue; };
-        let entries = catalog.entries.iter().filter(|entry| entry.task_id == task.task_id
-            && Some(entry.attempt_id.as_str()) == task.attempt_id.as_deref()
-            && Some(entry.ownership_epoch) == task.ownership_epoch
-            && entry.status == FmsArtifactStatus::Published
-            && task.artifact_ids.contains(&entry.artifact_id)).collect::<Vec<_>>();
-        let mut manifests = entries.iter().filter(|entry| entry.artifact_type == "study_output_manifest");
-        let Some(manifest_entry) = manifests.next() else { continue; };
-        if manifests.next().is_some() { bail!("accepted output manifest is ambiguous"); }
-        let manifest_ref = manifest_entry.object_ref.as_deref().context("manifest CAS reference missing")?;
-        if manifest_ref != manifest_entry.content_sha256 { bail!("manifest CAS digest differs"); }
-        let bytes = store.cas().get_bounded(manifest_ref, crate::accepted_observation_spool::MAX_MANIFEST_BYTES)?
-            .context("accepted manifest missing from CAS")?;
-        if fullmag_application::study_artifact_content_sha256(&bytes) != manifest_ref {
-            bail!("accepted manifest content digest differs");
-        }
-        let manifest: fullmag_session::FmsStudyOutputManifest = serde_json::from_slice(&bytes)?;
-        manifest.validate()?;
-        if manifest.run_id != run_id || manifest.task_id != task_id
-            || manifest.step_id != step.step_id || Some(manifest.attempt_id.as_str()) != task.attempt_id.as_deref()
-            || Some(manifest.ownership_epoch) != task.ownership_epoch { bail!("manifest ownership differs"); }
-        let mut states = manifest.outputs.iter().filter(|output| output.data_kind == "state");
-        let Some(state_output) = states.next() else { continue; };
-        if states.next().is_some() { bail!("accepted state output is ambiguous"); }
-        let state_entry = entries.iter().find(|entry| entry.artifact_id == state_output.artifact_id
-            && entry.object_ref.as_deref() == Some(state_output.object_ref.as_str())
-            && entry.content_sha256 == state_output.content_sha256).context("accepted state catalog binding missing")?;
-        let admission = store.read_task_admission(run_id, &task.task_id, &manifest.attempt_id)?
-            .context("accepted state admission budget missing")?;
-        admission.validate()?;
-        if admission.lease.ownership_epoch != manifest.ownership_epoch
-            || admission.lease.run_id != run_id || admission.lease.task_id != task.task_id {
-            bail!("accepted state admission ownership differs");
-        }
-        let state_budget = (admission.lease.budget.memory_bytes / 4)
-            .min(admission.lease.budget.storage_bytes);
-        let state_bytes = store.cas().get_bounded(&state_entry.content_sha256, state_budget)?
-            .context("accepted state CAS bytes missing")?;
-        if fullmag_application::study_artifact_content_sha256(&state_bytes) != state_output.object_ref {
-            bail!("accepted state content digest differs");
-        }
-        let fullmag_application::DecodedStudyArtifact::MagnetizationState(state) =
-            fullmag_application::decode_study_artifact_bytes("state", &state_output.codec_id,
-                &state_output.codec_version, &state_bytes)? else { bail!("invalid state output"); };
-        drop(state_bytes);
-        let mut bundles = entries.iter().filter(|entry| entry.artifact_type == ARTIFACT_TYPE);
-        let record = match bundles.next() {
-            Some(entry) => {
-                if bundles.next().is_some() { bail!("accepted quantity bundle is ambiguous"); }
-                let record = read_record(&store, entry)?;
-                if Some(&record.source) != manifest.accepted_state_ref.as_ref()
-                    || record.state_object_ref != state_output.object_ref
-                    || record.source.id.accepted_step != state.step {
-                    bail!("accepted quantity bundle differs from final state manifest");
-                }
-                if let Some(batch) = record.batch.as_ref() {
-                    for field in &batch.fields {
-                        if let Some(reference) = record.binary_fields.get(&field_key(field)) {
-                            if reference.max_read_bytes > admission.lease.budget.memory_bytes / 16 {
-                                bail!("binary quantity read budget exceeds its producing admission");
-                            }
-                            let samples = if field.role == "airbox" {
-                                let count = field.layout.pointer("/grid/cells").and_then(Value::as_array)
-                                    .filter(|axes| axes.len() == 3)
-                                    .and_then(|axes| axes.iter().try_fold(1_u64,
-                                        |count, axis| count.checked_mul(axis.as_u64()?)))
-                                    .context("binary Airbox grid missing")?;
-                                usize::try_from(count)?
-                            } else { state.values.len() };
-                            if samples.checked_mul(field.n_comp) != Some(reference.value_count) {
-                                bail!("binary quantity count differs from its accepted carrier");
-                            }
-                            let mut objects = reference.chunks.iter().map(|chunk| chunk.object_ref.as_str()).collect::<Vec<_>>();
-                            if let Some(hash) = field.layout.get("field_artifact_object_ref").and_then(Value::as_str) { objects.push(hash); }
-                            for hash in objects {
-                                if !entries.iter().any(|entry| entry.artifact_type == "accepted_quantity_payload"
-                                    && entry.content_sha256 == hash && entry.object_ref.as_deref() == Some(hash)) {
-                                    bail!("binary quantity object lacks its exact task/attempt/epoch catalog binding");
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(LoadedBundle { record, state_fingerprint: state.space_fingerprint,
-                    specification: intent.specification.clone() })
-            }
-            None => None,
-        };
-        selected = Some(record);
-    }
-    selected.flatten().context("latest accepted state has no quantity bundle; rerun with this worker version")
-}
-
+use crate::accepted_field_materialization_worker::{field_key, load_latest_bundle, SCHEMA};
+use crate::error::ApiError;
+use crate::types::{AppState, CurrentLiveFieldFrameRequest};
 /// Caller owns the transition fence. This path only reads CAS; it cannot solve,
 /// allocate devices, or reinterpret a bundle belonging to an older scene.
 pub(crate) async fn adopt_current_bundle(
@@ -408,7 +291,7 @@ pub(crate) fn current_energy_observation(
         values[0].as_f64().filter(|value| value.is_finite())
     };
     Some(crate::schemas::runtime::SolverEnergyCurrentResource {
-        revision: current.scalar_revision.saturating_add(current.field_samples_revision),
+        revision: current.scalar_revision.saturating_add(crate::router_v2::handlers::sessions::status::field_revision(current)),
         step: raw.get("source_step")?.as_u64()?,
         time_seconds: raw.get("source_time_seconds")?.as_f64()?,
         exchange: component("E_ex")?, demag: component("E_demag")?,

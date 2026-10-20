@@ -1553,7 +1553,14 @@ export default function Viewport3DModule({
     }),
     [],
   );
-  const runtimeFrozenSpinsFieldEnabled = Boolean(solverStatus.data?.run_id);
+  const runtimeFrozenSpinsFieldEnabled = Boolean(
+    !sceneModel.savedViewportActive &&
+      frozenSpinsOverlayVisible &&
+      solverStatus.data?.run_id &&
+      runtimeFrozenSpins?.mask_sha256 &&
+      runtimeFrozenSpins.topology_fingerprint &&
+      runtimeFrozenSpins.frozen_site_count > 0,
+  );
   const runtimeFrozenSpinsFieldResource = useViewport3DFieldVectorRequest(
     runtimeFrozenSpinsFieldRequest,
     runtimeFrozenSpinsFieldEnabled,

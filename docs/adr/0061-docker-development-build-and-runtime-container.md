@@ -493,3 +493,29 @@ wymaga native cancelled-before-claim, dokładnego run/session/start, braku final
 results i przypięcia raw SHA tego rekordu między kolejnymi preflightami. Obecność
 rekordu read-model nie zastępuje dowodu procesu ani zwolnienia lease. Publikacja
 terminala nadal wymaga zgodnego, uwierzytelnionego protokołu kontrolera.
+
+## Uzupełnienie — kolejne skrypty w tej samej instancji backendu
+
+`docker-dev-script` po zakończonej symulacji zachowuje oba kontenery i cache.
+Prywatne, uwierzytelnione API archiwizuje bieżący model dopiero po potwierdzeniu
+terminalnego katalogu runu, dowodów wykonania, zakończenia przygotowania oraz
+zwolnienia dokładnych lease i rezerwacji hosta. Freeze mutacji obejmuje capture,
+publikację archiwum i CAS bieżącego Workspace. Błąd ponownie otwiera admission;
+nie pozostawia nieodzyskiwalnego freeze. Archiwum nie upoważnia do resetu ownera,
+zwolnienia zasobów ani powtórzenia Solve.
+
+Archiwum w session store zawiera kanoniczny SceneDocument, wygenerowany
+edytowalny `main.py`, typowany stan UI i odwołania do istniejących artefaktów.
+Ciężkie wyniki nie są kopiowane. Publikacja jest create-only i związana z jedną
+operacją. Replay wymaga zgodnego archiwum, aktualnych dowodów terminalnych i
+niezmienionego bieżącego modelu wraz z katalogiem artefaktów.
+
+Intent i receipty transportu pozostają w control volume grupy. Host zapisuje
+potwierdzenie retirement przed startupowym POST. Nieznany wynik tego POST
+zachowuje istniejącą kwarantannę; retirement nie daje zgody na jego ponowienie.
+Prywatny token per instancja API odczytuje wyłącznie obrazowy helper backendu.
+Przeglądarka, publiczne OpenAPI i solver lanes nie otrzymują nowej authority.
+
+Zmiana dotyczy orkiestracji, nie semantyki Python/ProblemIR ani wyboru CPU/GPU.
+Regresje transportu nie zastępują kwalifikacji kolejnych skryptów w Dockerze;
+start, replay po restarcie i odczyt zachowanych danych pozostają **NOT VERIFIED**.

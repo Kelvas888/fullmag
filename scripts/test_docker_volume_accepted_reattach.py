@@ -440,6 +440,99 @@ class AcceptedReattachProducerTests(unittest.TestCase):
             proof["namespace_attestation_sha256"],
         )
 
+    def _commit_bundle(self) -> dict[str, object]:
+        bundle = self.build()
+        for name in ("proof", "request", "terminal_process", "terminal_owner"):
+            self.records[str(bundle["control_" + name + "_relative"])] = bytes(
+                bundle[name + "_raw"]
+            )
+        return bundle
+
+    def _replace_live_incarnation(self) -> None:
+        # A later, independently stopped container has overwritten PID 1's
+        # mutable receipts. It cannot replace the original activation proof.
+        self.records["runtime-control/runtime-service/process-tree.json"] = _raw({
+            "schema": "fullmag.docker-process-tree.v1",
+            "state": "shutdown_unknown", "api_pid": 4201, "api_exit_code": 101,
+        })
+        self.records["runtime-control/runtime-services/OWNER.json"] = _raw({
+            "owner_token": "later-owner", "pid": 4202, "state": "failed",
+        })
+
+    def test_committed_reattach_reuses_original_archive_after_later_stop(self) -> None:
+        original = self._commit_bundle()
+        self._replace_live_incarnation()
+        store_before = {str(p): p.read_bytes() for p in self.store.rglob("*") if p.is_file()}
+        replay = self.build()
+        for name in ("proof", "request", "terminal_process", "terminal_owner"):
+            self.assertEqual(replay[name + "_raw"], original[name + "_raw"])
+        self.assertEqual(replay["pins"]["backend_container"], self.backend)
+        self.assertEqual(replay["pins"]["run_id"], self.run_id)
+        self.assertEqual(
+            replay["pins"]["terminal_process_receipt_relative"],
+            original["control_terminal_process_relative"],
+        )
+        producer.produce_accepted_reattach(self.control, store_root=self.store)
+        self.assertEqual(self.control.published[1], original["proof_raw"])
+        self.assertEqual(store_before, {
+            str(p): p.read_bytes() for p in self.store.rglob("*") if p.is_file()
+        })
+
+    def test_committed_archive_drift_or_missing_record_is_rejected(self) -> None:
+        original = self._commit_bundle()
+        self._replace_live_incarnation()
+        for name in ("proof", "request", "terminal_process", "terminal_owner"):
+            path = str(original["control_" + name + "_relative"])
+            saved = self.records[path]
+            with self.subTest(record=name, mutation="raw-drift"):
+                self.records[path] = saved + b" "
+                with self.assertRaises(producer.BuildControlError):
+                    self.build()
+            self.records[path] = saved
+            with self.subTest(record=name, mutation="missing"):
+                del self.records[path]
+                with self.assertRaises(producer.BuildControlError):
+                    self.build()
+            self.records[path] = saved
+
+    def test_partial_publication_can_finish_only_from_matching_live_records(self) -> None:
+        original = self._commit_bundle()
+        del self.records[str(original["control_request_relative"])]
+        rebuilt = self.build()
+        self.assertEqual(rebuilt["proof_raw"], original["proof_raw"])
+        self.assertEqual(rebuilt["request_raw"], original["request_raw"])
+        self.assertEqual(
+            rebuilt["pins"]["terminal_process_receipt_relative"],
+            "runtime-control/runtime-service/process-tree.json",
+        )
+        producer.produce_accepted_reattach(self.control, store_root=self.store)
+        self.assertEqual(self.control.published[3], original["request_raw"])
+        self._replace_live_incarnation()
+        with self.assertRaises(producer.BuildControlError):
+            self.build()
+
+    def test_partial_publication_cannot_replace_reconstructed_bytes(self) -> None:
+        original = self._commit_bundle()
+        del self.records[str(original["control_request_relative"])]
+        for name in ("proof", "terminal_process", "terminal_owner"):
+            path = str(original["control_" + name + "_relative"])
+            saved = self.records[path]
+            with self.subTest(record=name):
+                self.records[path] = saved + b" "
+                with self.assertRaises(producer.BuildControlError):
+                    self.build()
+            self.records[path] = saved
+
+    def test_committed_archive_does_not_bypass_current_held_run_validation(self) -> None:
+        self._commit_bundle()
+        self._replace_live_incarnation()
+        catalog_path = self.store / "runs" / self.run_id / "run_catalog.json"
+        catalog = json.loads(catalog_path.read_bytes())
+        catalog["tasks"][0]["lifecycle"] = "running"
+        catalog_path.write_bytes(_raw(catalog))
+        with self.assertRaises(producer.BuildControlError):
+            self.build()
+
     def test_api_binding_failure_mode_survives_stop_journal_validation(self) -> None:
         journal = json.loads(self.records["verification/stop-failed-" + self.backend + ".json"])
         journal["failure_mode"] = "api-start-failure"

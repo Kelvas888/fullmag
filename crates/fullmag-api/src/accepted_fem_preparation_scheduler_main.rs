@@ -253,6 +253,7 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
     let mut owner_ready = false;
     let mut idle_poll_count = 0usize;
     let mut consecutive_idle_polls = 0usize;
+    let mut reconciliation_deferred_detail = None::<String>;
 
     loop {
         reap_finished(
@@ -285,12 +286,25 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                 Ok(())
             })();
             match reconciliation {
-                Ok(()) => {}
+                Ok(()) => {
+                    reconciliation_deferred_detail = None;
+                }
                 Err(error) if is_store_writer_busy(&error) => {
                     tracing::warn!(
                         error = ?error,
                         "preparation scheduler deferred host reconciliation while the session store writer is busy"
                     );
+                    let detail = format!("{error:#}");
+                    if reconciliation_deferred_detail.as_deref() != Some(detail.as_str()) {
+                        // Native scheduler stderr remains observable even
+                        // when no tracing subscriber has been installed.
+                        eprintln!("{}", serde_json::json!({
+                            "schema_version": "scheduler_reconciliation_deferred.v1",
+                            "component": "accepted_preparation_scheduler",
+                            "detail": &detail,
+                        }));
+                        reconciliation_deferred_detail = Some(detail);
+                    }
                     reconciliation_deferred = true;
                 }
                 Err(error) => return Err(error),

@@ -37,7 +37,10 @@ export function resolveFdmMultilayerAirboxTargetInspectorModel(
   layout: FdmMultilayerLayoutResource | null | undefined,
 ): FdmMultilayerAirboxTargetInspectorModel {
   const target = resolveFdmMultilayerAirboxTarget(layout);
-  if (!target || !layout) {
+  // This panel is the target-only H_demag carrier view. A carrier that
+  // advertises H_eff belongs to a different capability contract; fail closed
+  // instead of presenting it with the hard-coded unavailable H_eff row below.
+  if (!target || !layout || layout.airbox.h_eff_available !== false) {
     return {
       notice: layout?.airbox.unavailable_reason ?? "Target-only Airbox carrier is not published or failed validation.",
       status: "unavailable",

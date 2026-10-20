@@ -945,7 +945,10 @@ describe("useViewport3DSceneModel", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain(
-      'const fdmLaneActive = sessionDiscretization === "fdm";',
+      'const fdmLaneActive = viewportDataDiscretization === "fdm";',
+    );
+    expect(source).toContain(
+      "const viewportDataDiscretization = useSessionStatusSelector((status) =>\n    resolveSessionTopologyDiscretization(status.data),\n  );",
     );
     expect(source).toContain(
       "const topologyFreshnessStatus = femLaneActive\n    ? resolveViewport3DTopologyFreshnessLabel(topologyFreshness)\n    : null;",

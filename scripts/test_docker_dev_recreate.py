@@ -279,7 +279,7 @@ class DockerDevRecreateContract(unittest.TestCase):
                 docker_dev._backend_start_inputs(base)
             base.source_manifest = None
             base.include_untracked = ["new/example.py"]
-            with self.assertRaisesRegex(docker_dev.DirectDockerError, "include-untracked.*unsupported.*Git index"):
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, r"include-untracked.*unsupported.*retired host-receipt direct-development route"):
                 docker_dev._backend_start_inputs(base)
 
     def _run_fixture(self):

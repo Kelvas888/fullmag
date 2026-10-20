@@ -1,6 +1,6 @@
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
-import type { ComponentPropsWithoutRef } from "react";
+import type { ComponentPropsWithRef } from "react";
 
 import { cn } from "@/shared/utils/className";
 
@@ -42,7 +42,7 @@ const buttonVariants = cva(
 );
 
 export interface ButtonProps
-  extends ComponentPropsWithoutRef<"button">,
+  extends ComponentPropsWithRef<"button">,
     VariantProps<typeof buttonVariants> {
   asChild?: boolean;
   /**
