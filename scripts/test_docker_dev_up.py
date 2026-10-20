@@ -35,6 +35,8 @@ def _group(*, backend_running=True, frontend_running=True, healthy=True):
         "Running": backend_running,
         "Health": {"Status": "healthy" if healthy else "unhealthy"},
     }
+    backend_image_id = "sha256:" + "e" * 64
+    toolchain_image_id = "sha256:" + "f" * 64
     return docker_dev_up.RetainedGroup(
         repo_root=Path("/repo"),
         source_root=Path("/repo"),
@@ -58,7 +60,18 @@ def _group(*, backend_running=True, frontend_running=True, healthy=True):
         },
         backend_id="c" * 64,
         frontend_id="d" * 64,
-        backend={"State": backend_state},
+        backend={
+            "Image": backend_image_id,
+            "Config": {
+                "Env": [
+                    "FULLMAG_TOOLCHAIN_IMAGE_ID=" + toolchain_image_id,
+                    "FULLMAG_RUNTIME_IMAGE_ID=" + backend_image_id,
+                    "FULLMAG_PACKAGE_PROVENANCE=/opt/fullmag/control/backend/runtime-provenance.json",
+                    "FULLMAG_RUNTIME_PROVENANCE=/opt/fullmag/control/backend/runtime-provenance.json",
+                ],
+            },
+            "State": backend_state,
+        },
         frontend={"State": {"Running": frontend_running}},
     )
 
