@@ -396,6 +396,7 @@ def _validate_candidate(
     expected_image: str,
     project: str,
     worktree_id: str,
+    previous_terminal: object | None = None,
 ) -> dict[str, object]:
     if not isinstance(candidate, Mapping):
         _fail("pre-admission selector candidate is not an object")
@@ -403,7 +404,8 @@ def _validate_candidate(
     if not isinstance(phase, str) or PHASE_RE.fullmatch(phase) is None:
         _fail("pre-admission selector candidate phase is unsupported")
     token = _attempt(candidate.get("attempt"), "pre-admission selector candidate attempt")
-    if token == parent_attempt:
+    direct = phase == "development" and token == parent_attempt
+    if token == parent_attempt and not direct:
         _fail("pre-admission selector selected the parent attempt itself")
     root = f"{phase}/attempts/{token}"
     terminal_path = candidate.get("terminal_path")
@@ -420,11 +422,26 @@ def _validate_candidate(
     )
     if terminal.get("phase") != phase or terminal.get("state") != "failed-confirmed":
         _fail("pre-admission terminal is not a failed confirmation")
+    if ("config_sha256" in terminal
+            and terminal.get("config_sha256") != config_sha256):
+        _fail("pre-admission terminal config pin differs")
     inputs = terminal.get("inputs")
-    if not isinstance(inputs, Mapping) or inputs.get("attempt") != parent_attempt:
-        _fail("pre-admission terminal is not linked to the parent attempt")
-    if inputs.get("config_sha256") != config_sha256:
-        _fail("pre-admission terminal config differs")
+    if not isinstance(inputs, Mapping):
+        _fail("pre-admission terminal inputs are missing")
+    if direct:
+        if not isinstance(previous_terminal, Mapping):
+            _fail("direct development terminal has no retained parent terminal")
+        if _canonical(terminal) != _canonical(previous_terminal):
+            _fail("direct development terminal differs from retained parent terminal")
+        if (inputs.get("attempt", parent_attempt) != parent_attempt
+                or ("config_sha256" in inputs
+                    and inputs.get("config_sha256") != config_sha256)):
+            _fail("direct development terminal pins differ")
+    else:
+        if inputs.get("attempt") != parent_attempt:
+            _fail("pre-admission terminal is not linked to the parent attempt")
+        if inputs.get("config_sha256") != config_sha256:
+            _fail("pre-admission terminal config differs")
     for key in (
         "source_root", "source_project_id", "source_worktree_id",
         "source_checkout_kind", "image_id", "toolchain_image_id",
@@ -508,7 +525,8 @@ def validate_pre_admission_recreate(
     selected_identity = _identity(identity)
     project = _project(control, selected_identity)
     compose = _compose_document(document, project, config_sha256)
-    parent_attempt, inputs = _parent_inputs(previous, config_sha256)
+    previous_terminal = _bounded_copy(previous, "parent development terminal", MAX_RECORD_BYTES)
+    parent_attempt, inputs = _parent_inputs(previous_terminal, config_sha256)
     image_id = _image(inputs.get("image_id"), "parent development image")
     if inputs.get("source_project_id") != selected_identity["project_id"]:
         _fail("parent development project identity differs")
@@ -535,7 +553,7 @@ def validate_pre_admission_recreate(
     selector = _read_selector(control, parent_attempt, config_sha256, started_at, image_id)
     candidate = _validate_candidate(
         selector["candidates"][0], parent_attempt, config_sha256, inputs, started_at,
-        actual, image_id, project, selected_identity["worktree_id"],
+        actual, image_id, project, selected_identity["worktree_id"], previous_terminal,
     )
     if candidate["backend"] != backend:
         _fail("pre-admission backend identity changed during validation")

@@ -442,6 +442,34 @@ class RetainedPreAdmissionIntegrationTests(unittest.TestCase):
         self.assertNotIn("lease-enter", harness.events)
         self.assertNotIn("rm", harness.events)
 
+    def test_retained_accepted_bootstrap_cannot_silently_drop_reattach_context(self) -> None:
+        for kind in ("metadata", "empty-metadata", "malformed-metadata", "compose-env", "container-env"):
+            with self.subTest(kind=kind):
+                harness = _Harness()
+                self.addCleanup(harness.close)
+                if kind == "metadata":
+                    harness.previous["accepted_reattach"] = deepcopy(harness.accepted_pins)
+                elif kind == "empty-metadata":
+                    harness.previous["accepted_reattach"] = {}
+                elif kind == "malformed-metadata":
+                    harness.previous["accepted_reattach"] = None
+                elif kind == "compose-env":
+                    harness.document["services"]["backend"]["environment"][
+                        "FULLMAG_ACCEPTED_REATTACH_REQUEST"
+                    ] = "accepted-run-reattach/retained.json"
+                else:
+                    harness.actual["backend"]["Config"]["Env"] = [
+                        "FULLMAG_ACCEPTED_REATTACH_REQUEST=accepted-run-reattach/retained.json"
+                    ]
+                harness.config_sha256 = hashlib.sha256(harness._canonical(harness.document)).hexdigest()
+                harness.args.config_sha256 = harness.config_sha256
+                helper = _helper_module(harness)
+                with self.assertRaisesRegex(BuildControlError, "no authenticated reattach context"):
+                    self._run(harness, helper=helper)
+                self.assertNotIn("lease-enter", harness.events)
+                self.assertNotIn("rm", harness.events)
+                self.assertEqual(helper.calls["count"], 0)
+
     def test_fresh_state_remains_explicit_and_does_not_use_the_exception(self) -> None:
         harness = _Harness()
         self.addCleanup(harness.close)

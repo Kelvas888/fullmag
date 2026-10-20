@@ -59,6 +59,42 @@ def _set_candidate_config(fixture: _Fixture) -> None:
     candidate["terminal_raw"] = _control_raw(candidate["terminal"])
 
 
+def _set_direct_candidate(fixture: _Fixture) -> None:
+    fixture.previous = deepcopy(fixture.previous)
+    fixture.previous.update({
+        "backend_started_at": STARTED_AT,
+        "error": "Backend exited during build; logs and volumes retained: "
+        + fixture.failure["log"][-4000:],
+        "daemon_pending": False,
+    })
+    terminal = deepcopy(fixture.previous)
+    terminal_path = f"development/attempts/{PARENT_ATTEMPT}/terminal.json"
+    failure_path = (
+        f"development/attempts/{PARENT_ATTEMPT}/backend-failure-log.json"
+    )
+    fixture.selector = {
+        "schema": pre_admission.SELECTOR_SCHEMA,
+        "max_entries": 1,
+        "scanned_entries": 1,
+        "candidate_count": 1,
+        "candidates": [{
+            "phase": "development",
+            "attempt": PARENT_ATTEMPT,
+            "terminal_path": terminal_path,
+            "failure_log_path": failure_path,
+            "terminal": terminal,
+            "terminal_raw": _control_raw(terminal),
+            "failure_log": deepcopy(fixture.failure),
+            "failure_log_raw": _control_raw(fixture.failure),
+            "published_paths": {
+                name: False for name in pre_admission.PUBLICATION_PATHS
+            },
+        }],
+    }
+    if hasattr(fixture, "control"):
+        fixture.control.selector = fixture.selector
+
+
 def _service(service: str, identifier: str, *, started_at: str = STARTED_AT) -> dict[str, object]:
     state: dict[str, object] = {
         "Running": False,
@@ -374,6 +410,51 @@ class PreAdmissionRecreateValidatorTests(unittest.TestCase):
 
         accepted["accepted_reattach_metadata"]["state"] = "changed-after-proof"
         self.assertEqual(proof["accepted_reattach"]["accepted_reattach_metadata"]["state"], "prepared")
+
+    def test_direct_parent_development_failure_is_accepted(self) -> None:
+        fixture = self.fixture()
+        _set_direct_candidate(fixture)
+        proof = fixture.call()
+
+        self.assertIsInstance(proof, dict)
+        assert proof is not None
+        self.assertEqual(proof["parent_attempt"], PARENT_ATTEMPT)
+        self.assertEqual(proof["failure"]["phase"], "development")
+        self.assertEqual(proof["failure"]["attempt"], PARENT_ATTEMPT)
+        self.assertEqual(proof["failure"]["backend_started_at"], STARTED_AT)
+        self.assertNotIn("attempt", fixture.previous["inputs"])
+        self.assertNotIn("config_sha256", fixture.previous["inputs"])
+
+    def test_direct_candidate_with_different_parent_attempt_is_rejected(self) -> None:
+        fixture = self.fixture()
+        _set_direct_candidate(fixture)
+        candidate = fixture.selector["candidates"][0]
+        candidate["attempt"] = RESUME_ATTEMPT
+        candidate["terminal_path"] = (
+            f"development/attempts/{RESUME_ATTEMPT}/terminal.json"
+        )
+        candidate["failure_log_path"] = (
+            f"development/attempts/{RESUME_ATTEMPT}/backend-failure-log.json"
+        )
+        self.assert_rejected(fixture)
+
+    def test_direct_candidate_with_old_started_at_is_rejected(self) -> None:
+        fixture = self.fixture()
+        _set_direct_candidate(fixture)
+        old_started_at = "2026-10-20T18:14:20.891152886Z"
+        fixture.previous["backend_started_at"] = old_started_at
+        candidate = fixture.selector["candidates"][0]
+        candidate["terminal"] = deepcopy(fixture.previous)
+        candidate["terminal_raw"] = _control_raw(candidate["terminal"])
+        self.assert_rejected(fixture)
+
+    def test_direct_candidate_terminal_must_equal_retained_parent(self) -> None:
+        fixture = self.fixture()
+        _set_direct_candidate(fixture)
+        candidate = fixture.selector["candidates"][0]
+        candidate["terminal"]["error"] = "retained terminal was changed"
+        candidate["terminal_raw"] = _control_raw(candidate["terminal"])
+        self.assert_rejected(fixture)
 
     def test_validator_does_not_promote_already_admitted_certificate(self) -> None:
         fixture = self.fixture()

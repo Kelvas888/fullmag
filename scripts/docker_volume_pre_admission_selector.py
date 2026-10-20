@@ -496,11 +496,33 @@ def inspect_attempt(
         if terminal.get('phase') != phase or terminal.get('attempt') != attempt:
             fail(phase + ' terminal is not bound to its canonical path')
         inputs = terminal.get('inputs')
-        if isinstance(inputs, dict) and (
-            inputs.get('attempt') == parent
-            and inputs.get('config_sha256') == config
-            and terminal.get('backend_started_at') == started
-        ):
+        direct = phase == 'development' and attempt == parent
+        if direct:
+            if not isinstance(inputs, dict):
+                fail('direct development terminal inputs are missing')
+            if inputs.get('attempt', parent) != parent:
+                fail('direct development terminal attempt input differs')
+            if (
+                'config_sha256' in inputs
+                and inputs.get('config_sha256') != config
+            ):
+                fail('direct development terminal config input differs')
+            selected = (
+                terminal.get('state') == 'failed-confirmed'
+                and terminal.get('backend_started_at') == started
+            )
+        else:
+            selected = isinstance(inputs, dict) and (
+                inputs.get('attempt') == parent
+                and inputs.get('config_sha256') == config
+                and terminal.get('backend_started_at') == started
+            )
+        if selected:
+            if (
+                'config_sha256' in terminal
+                and terminal.get('config_sha256') != config
+            ):
+                fail(phase + ' terminal config pin differs')
             if matches:
                 fail('pre-admission selector found more than one pinned terminal')
             matches.append((phase, attempt, expected, terminal_raw, terminal))
@@ -568,7 +590,7 @@ def main():
         if len(matches) != 1:
             fail('pre-admission selector did not find exactly one pinned terminal')
         phase, attempt, expected, terminal_raw, terminal = matches[0]
-        if attempt == parent:
+        if attempt == parent and phase != 'development':
             fail('pre-admission selector matched the parent attempt')
         if terminal.get('state') != 'failed-confirmed':
             fail('pre-admission selector terminal is not a confirmed failure')
@@ -703,7 +725,11 @@ def read_pinned_resume_evidence(
     attempt = candidate.get("attempt")
     if not isinstance(phase, str) or phase not in PHASES:
         raise BuildControlError("Pre-admission selector candidate phase is invalid")
-    if not isinstance(attempt, str) or ATTEMPT_RE.fullmatch(attempt) is None or attempt == parent_attempt:
+    if (
+        not isinstance(attempt, str)
+        or ATTEMPT_RE.fullmatch(attempt) is None
+        or (attempt == parent_attempt and phase != "development")
+    ):
         raise BuildControlError("Pre-admission selector candidate attempt is invalid")
     terminal_path = _path_pin(candidate.get("terminal_path"), phase, attempt, "terminal.json")
     failure_path = _path_pin(
@@ -723,14 +749,29 @@ def read_pinned_resume_evidence(
     terminal = _strict_document(terminal_raw, "Pre-admission terminal")
     failure = _strict_document(failure_raw, "Pre-admission failure log")
     inputs = terminal.get("inputs")
+    direct = phase == "development" and attempt == parent_attempt
     if (
         terminal.get("phase") != phase
         or terminal.get("attempt") != attempt
         or terminal.get("state") != "failed-confirmed"
         or not isinstance(inputs, Mapping)
-        or inputs.get("attempt") != parent_attempt
-        or inputs.get("config_sha256") != config_sha256
         or terminal.get("backend_started_at") != started
+    ):
+        raise BuildControlError("Pre-admission terminal pins differ")
+    if (
+        "config_sha256" in terminal
+        and terminal.get("config_sha256") != config_sha256
+    ):
+        raise BuildControlError("Pre-admission terminal config pin differs")
+    if direct:
+        if (
+            inputs.get("attempt", parent_attempt) != parent_attempt
+            or ("config_sha256" in inputs and inputs.get("config_sha256") != config_sha256)
+        ):
+            raise BuildControlError("Pre-admission direct terminal pins differ")
+    elif (
+        inputs.get("attempt") != parent_attempt
+        or inputs.get("config_sha256") != config_sha256
     ):
         raise BuildControlError("Pre-admission terminal pins differ")
     if not isinstance(failure.get("log"), str):

@@ -54,6 +54,29 @@ def terminal_document(
     }
 
 
+def direct_terminal_document(
+    *,
+    attempt: str = PARENT,
+    started: str = STARTED,
+) -> dict[str, object]:
+    return {
+        "attempt": attempt,
+        "backend_started_at": started,
+        "inputs": {
+            "source_root": "/tmp/fullmag-source",
+            "source_project_id": "fullmag-project",
+            "source_worktree_id": "pre-admission",
+            "source_checkout_kind": "worktree",
+            "image_id": "sha256:" + "d" * 64,
+            "toolchain_image_id": "sha256:" + "e" * 64,
+            "gpu_access_requested": "auto",
+            "device_access": "gpu",
+        },
+        "phase": "development",
+        "state": "failed-confirmed",
+    }
+
+
 def response_for(terminal_raw: bytes, failure_raw: bytes, *, published=None) -> bytes:
     candidate = {
         "phase": "resume",
@@ -73,14 +96,43 @@ def response_for(terminal_raw: bytes, failure_raw: bytes, *, published=None) -> 
     })
 
 
+def direct_response_for(
+    terminal_raw: bytes,
+    failure_raw: bytes,
+    *,
+    published=None,
+) -> bytes:
+    candidate = {
+        "phase": "development",
+        "attempt": PARENT,
+        "terminal_path": f"development/attempts/{PARENT}/terminal.json",
+        "terminal_raw_b64": base64.b64encode(terminal_raw).decode("ascii"),
+        "failure_log_path": (
+            f"development/attempts/{PARENT}/backend-failure-log.json"
+        ),
+        "failure_log_raw_b64": base64.b64encode(failure_raw).decode("ascii"),
+        "published_paths": published or {
+            name: False for name in selector.PUBLICATION_PATHS
+        },
+    }
+    return canonical({
+        "schema": selector.SELECTOR_SCHEMA,
+        "max_entries": selector.MAX_SELECTOR_ENTRIES,
+        "scanned_entries": 1,
+        "candidate_count": 1,
+        "candidates": [candidate],
+    })
+
+
 def write_attempt(
     control_root: Path,
     attempt: str,
     *,
+    phase: str = "resume",
     terminal: dict[str, object] | None = None,
     failure: dict[str, object] | None = None,
 ) -> Path:
-    path = control_root / "resume" / "attempts" / attempt
+    path = control_root / phase / "attempts" / attempt
     path.mkdir(parents=True)
     if terminal is not None:
         (path / "terminal.json").write_bytes(canonical(terminal))
@@ -201,6 +253,24 @@ class SelectorTests(unittest.TestCase):
         with self.assertRaises(BuildControlError):
             self.call(response_for(self.terminal_raw, self.failure_raw, published=published))
 
+    def test_host_decoder_accepts_direct_parent_development_terminal(self):
+        terminal = direct_terminal_document()
+        output = direct_response_for(canonical(terminal), self.failure_raw)
+        result, calls = self.call(output)
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["phase"], "development")
+        self.assertEqual(candidate["attempt"], PARENT)
+        self.assertEqual(candidate["terminal"], terminal)
+        self.assertEqual(candidate["terminal_raw"], canonical(terminal))
+        self.assertEqual(calls[0][2:], (90, selector.MAX_SELECTOR_OUTPUT_BYTES))
+
+    def test_host_decoder_rejects_direct_terminal_with_wrong_top_level_config(self):
+        terminal = direct_terminal_document()
+        terminal["config_sha256"] = "f" * 64
+        output = direct_response_for(canonical(terminal), self.failure_raw)
+        with self.assertRaisesRegex(BuildControlError, "config pin differs"):
+            self.call(output)
+
     def test_rejects_unpinned_selected_image_before_capture(self):
         with self.assertRaisesRegex(BuildControlError, "immutable retained backend image"):
             self.call(helper_image="fullmag/backend:dev")
@@ -262,6 +332,96 @@ class SelectorTests(unittest.TestCase):
             self.assertEqual(candidate["published_paths"], {
                 name: False for name in selector.PUBLICATION_PATHS
             })
+
+    def test_helper_accepts_direct_parent_development_terminal(self):
+        terminal = direct_terminal_document()
+        failure = {"log": "direct development backend failed before publication"}
+        with tempfile.TemporaryDirectory() as value:
+            control_root = Path(value) / "control"
+            write_attempt(
+                control_root,
+                PARENT,
+                phase="development",
+                terminal=terminal,
+                failure=failure,
+            )
+            result = run_helper(control_root)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            response = json.loads(result.stdout)
+            self.assertEqual(response["candidate_count"], 1)
+            candidate = response["candidates"][0]
+            self.assertEqual(candidate["phase"], "development")
+            self.assertEqual(candidate["attempt"], PARENT)
+            self.assertEqual(
+                base64.b64decode(candidate["terminal_raw_b64"]),
+                canonical(terminal),
+            )
+
+    def test_unrelated_terminal_config_does_not_poison_the_selected_failure(self):
+        with tempfile.TemporaryDirectory() as value:
+            control_root = Path(value) / "control"
+            write_attempt(control_root, ATTEMPT, terminal=self.terminal, failure=self.failure)
+            unrelated = direct_terminal_document(attempt=OTHER_ATTEMPT)
+            unrelated["config_sha256"] = "f" * 64
+            unrelated["state"] = "succeeded"
+            write_attempt(control_root, OTHER_ATTEMPT, phase="development", terminal=unrelated)
+            result = run_helper(control_root)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(json.loads(result.stdout)["candidates"][0]["attempt"], ATTEMPT)
+
+    def test_helper_rejects_direct_parent_terminal_with_changed_started_at(self):
+        terminal = direct_terminal_document(
+            started="2026-10-20T18:14:20.891152886Z",
+        )
+        with tempfile.TemporaryDirectory() as value:
+            control_root = Path(value) / "control"
+            write_attempt(
+                control_root,
+                PARENT,
+                phase="development",
+                terminal=terminal,
+                failure=self.failure,
+            )
+            result = run_helper(control_root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exactly one pinned terminal", result.stderr.decode())
+
+    def test_helper_rejects_direct_parent_terminal_with_changed_config(self):
+        terminal = direct_terminal_document()
+        terminal["inputs"]["config_sha256"] = "f" * 64
+        with tempfile.TemporaryDirectory() as value:
+            control_root = Path(value) / "control"
+            write_attempt(
+                control_root,
+                PARENT,
+                phase="development",
+                terminal=terminal,
+                failure=self.failure,
+            )
+            result = run_helper(control_root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("config input differs", result.stderr.decode())
+
+    def test_helper_rejects_direct_and_linked_terminals_as_ambiguous(self):
+        direct = direct_terminal_document()
+        with tempfile.TemporaryDirectory() as value:
+            control_root = Path(value) / "control"
+            write_attempt(
+                control_root,
+                PARENT,
+                phase="development",
+                terminal=direct,
+                failure=self.failure,
+            )
+            write_attempt(
+                control_root,
+                ATTEMPT,
+                terminal=self.terminal,
+                failure=self.failure,
+            )
+            result = run_helper(control_root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("more than one pinned terminal", result.stderr.decode())
 
     def test_helper_rejects_symlinked_ancestor(self):
         with tempfile.TemporaryDirectory() as value:

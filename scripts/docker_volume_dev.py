@@ -3712,6 +3712,21 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             }
         pre_admission_recreate_proof = None
         if not fresh_state and not certificate.get("restart_verified"):
+            retained_environment = document["services"]["backend"]["environment"]
+            observed_environment = actual["backend"].get("Config", {}).get("Env") or []
+            retained_reattach_declared = (
+                "accepted_reattach" in previous
+                or any(name.startswith("FULLMAG_ACCEPTED_REATTACH_") for name in retained_environment)
+                or any(
+                    isinstance(value, str)
+                    and value.split("=", 1)[0].startswith("FULLMAG_ACCEPTED_REATTACH_")
+                    for value in observed_environment
+                )
+            )
+            if retained_reattach_declared and not accepted_reattach_context:
+                raise BuildControlError(
+                    "Retained accepted run has no authenticated reattach context"
+                )
             from docker_volume_pre_admission_recreate import (
                 PreAdmissionRecreateError,
                 validate_pre_admission_recreate,

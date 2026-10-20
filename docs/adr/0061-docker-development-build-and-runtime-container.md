@@ -572,7 +572,7 @@ uruchomienia runtime. Może jednak zachować sesję i cache po błędzie samego
 buildu. Zarządzane odtworzenie usług dopuszcza ten przypadek wyłącznie po
 przypięciu dokładnych kontenerów, obrazu, konfiguracji, niezmienionego certyfikatu
 i owner markera z wartościami bootstrap oraz jednej potwierdzonej awarii buildu
-odpowiadającej bieżącemu `Docker StartedAt` backendu. Obecność dowodu handoff,
+odpowiadającej bieżącemu `Docker StartedAt` backendu. Dowodem może być bezpośredni terminal wybranej próby `development` albo terminal `resume` związany z jej pinami. Bezpośredni terminal musi być kanonicznie identyczny z terminalem rodzica odczytanym przez launcher; nie wymaga pól wejściowych występujących wyłącznie w `resume`. Obecność dowodu handoff,
 publikacji pakietu lub storage probe wyklucza ten wyjątek.
 
 Selektor odczytuje wyłącznie terminale prób `resume` i `development` w readonly
