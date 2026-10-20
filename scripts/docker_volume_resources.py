@@ -66,6 +66,9 @@ def apply_saved_budget(control, document):
             or memory > capacity["MemTotal"] or cpus > capacity["NCPU"]):
         raise BuildControlError("Saved backend budget is below the Compose baseline or above Docker capacity")
     backend.update(cpus=cpus, mem_limit=memory, memswap_limit=swap)
+    # The container quota and Cargo must use the same approved CPU budget.
+    # Native CMake builds share Cargo's jobserver in the build scripts.
+    backend.setdefault("environment", {})["CARGO_BUILD_JOBS"] = str(min(cpus, 64))
 
 
 def _assert_no_unresolved_increases(control, root):
@@ -125,7 +128,7 @@ try:
   value=json.loads(request.read_bytes())
   if value.get('pid')==pid and value.get('process_start_token')==token: raise RuntimeError('worker gate already started')
  print('PAUSED',flush=True)
- while select.select([sys.stdin],[],[],30)[0]:
+ while select.select([sys.stdin],[],[],float(sys.argv[3]))[0]:
   command=sys.stdin.readline().strip()
   if command=='ARM':
    armed=True; print('ARMED',flush=True)
@@ -157,11 +160,13 @@ finally: os.close(fd)
 
 
 @contextmanager
-def _pause_start(backend_id, probe):
+def _pause_start(backend_id, probe, *, pause_seconds=30):
     from docker_dev_host import docker_argv
+    if not 30 <= pause_seconds <= 600:
+        raise BuildControlError("Startup pause exceeds its bounded observation window")
     process = subprocess.Popen(docker_argv("exec", "-i", backend_id, "/usr/local/bin/python3",
                                "-I", "-B", "-u", "-c", _PAUSE_START,
-                               str(probe["pid"]), probe["start_token"]),
+                               str(probe["pid"]), probe["start_token"], str(pause_seconds)),
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     state = {"process": process, "issued": False, "resolved": False}
     try:

@@ -1,19 +1,22 @@
 # Fullmag master — recovery 3806 i poprawki primitive, 20.10.2026
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 21.10.2026, 00:03 CEST
+## Aktualny status wdrożenia — 21.10.2026, 00:55 CEST
 
-Build i publikacja pakietu `d2a4bdfb` przeszły. Frontend działa na **3198**,
-backend nadal sprawdza stare pakiety rollback przed API. Na żądanie zwiększono
-i potwierdzono jego limit **128 GiB RAM / 16 CPU + 8 GiB swapu**, zachowując
-ten sam kontener i dane. Profil kolejnych startów zapisany w control volume.
+Poprzedni build i pakiet d2a4bdfb przeszedł. Ręczny restart o 22:28 UTC
+zakończył się błędem capture, exit 2, przed nowym buildem i API.
+Pierwotny kontroler 53e zamknął się jako failed-confirmed po zmianie inkarnacji.
+Backend jest zatrzymany; frontend healthy na **3198**. Budżet backendu:
+**128 GiB RAM / 16 CPU + 8 GiB swapu**. Wykryto niezależny domyślny limit
+Cargo wynoszący 2 joby. Poprawka źródłowa wiąże go z budżetem CPU (16);
+nie została jeszcze uruchomiona w nowym kontenerze.
 
-Usunięcie opcjonalnej retencji z krytycznej ścieżki jest w źródłach
-`01cb8ed197e066fd25d2d9db26c52d6bf9d3d154`; działający stary proces tej poprawki
-jeszcze nie używa. Obowiązkowa walidacja bieżącego pakietu pozostaje wymagana.
-Nie uruchomiono replay skryptu, nowego preparation retry, Solve ani testów.
-API/native i ten sam run04, nowy mesh oraz pola/energie/Airbox w UI nadal
-wymagają odbioru. Pełny plan F0–F12 pozostaje otwarty.
+Checkpoint capture c16da16d zakończył się sukcesem: stopped-confirmed,
+action observe-capture-failure, signal_issued=false, receipt SHA-256
+`dedd093a0b7dd0f6e5f8caee7df844e84eb51b48d09895a80c8bfab593c6d137`.
+Dane 3806 i held04 zachowane. Nie wykonano replay, preparation retry, Solve ani testów.
+API/native i ten sam run04, nowy mesh oraz pola/energie/Airbox w UI pozostają
+**NOT VERIFIED**. Pełny F0–F12 pozostaje otwarty.
 <!-- mx3-current-status:end -->
 
 
@@ -1635,3 +1638,95 @@ Backend nadal sprawdza historyczne pakiety rollback w starej, już załadowanej
 wersji startu. Odczyt 22:03 UTC: pakiet 6 z 14, zmieniający się offset pliku.
 Zwiększenie limitu nie dowodzi przyspieszenia tej operacji. API/native,
 preparation retry, nowy mesh, Solve i wizualizacja pól pozostają NOT VERIFIED.
+
+
+## 61. Restart użytkownika i checkpoint capture — 21.10.2026
+
+Użytkownik potwierdził ręczny restart Docker Desktop. Ta sama usługa
+`c007e2f1e113b82deaf205cc9cf1e2a97d45ed63d5a454e57d911ceb16935d26`
+ma nową inkarnację: StartedAt `2026-10-20T22:28:23.685193183Z`, FinishedAt
+`2026-10-20T22:36:58.657335216Z`, exited2/PID0/non-OOM. Źródła zmieniały się
+podczas capture; drugi zamknięty manifest różnił się od pierwszego. Root
+edytował wtedy launcher, a równolegle weszły merge8a290d6e i7c16297b.
+Nie zastosowano przygotowanej komendy stop-pre-api-start ani żadnego sygnału.
+
+Pierwotna zarządzana obserwacja53e zakończyła się rzeczywistym
+failed-confirmed: `Backend incarnation changed during build observation`.
+Zwykłe resume-volume52070 odmówiło bez mutacji: wymagany running backend
+oraz stopped frontend. Backend jest obecnie zatrzymany, frontendhealthy3198;
+API i nowy mesh nadal NOT VERIFIED. Przerwę źródeł zwolniono po faktycznym
+końcu capture, przed następnym spójnym capture będzie uzgodniona ponownie.
+
+Odczytowy istniejący validator potwierdził exact capture-only tej nowej
+inkarnacji, bez build/package/handoff/gate/API/runtime. Stdout0B SHA
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+stderr4194B SHA
+`aaa7bb37c47df10296b7bcc52d2cf5e76be60228c0379ff19e8c496e3e466920`.
+Nie jest to dowód successful drain ani nowej awarii API.
+
+Dodano wąski create-only checkpoint pre-API z osobnymi action:
+`cancel-retention` wymaga jednego readonly rollback-reader i exact exit143;
+`observe-capture-failure` tylko obserwuje już martwe exit2 i archiwizuje
+ściśle timestampowane logi. Source review obu przypadków PASS; AST6plików
+Python i5embedded helpers oraz scoped diff-check PASS. Żadnych testów ani
+nowego buildu. Podgląd starego rollback-reader5291 przeszedł exit0; stop,
+resume-unissued i finalize nie zostały wykonane. Tych ścieżek nie uznaje się
+za odebrane runtime. Checkpoint capture zakończył się exit 0:
+operacja `c16da16dbfd54429a5cd4305795ca057`, state succeeded;
+wynik stopped-confirmed, action observe-capture-failure, signal_issued=false.
+Receipt `development/attempts/53e4c556247a4ef382e25b96467e4916/pre-api-stop/receipt.json`
+ma SHA-256 `dedd093a0b7dd0f6e5f8caee7df844e84eb51b48d09895a80c8bfab593c6d137`.
+Ten dowód obserwacji zakończonego capture nie jest dowodem uruchomienia API.
+
+Kontekst zachowuje pierwszy pre-ACK proof, exact Failed owner/process/native
+config, held04 bez start_release oraz dowody released zasobów. Nie mintuje
+drugiego certyfikatu pre-ACK, nie resetuje ownera ani nie powtarza Solve.
+Brak nowego preparation retry, replay skryptu i Solve.
+
+Odczyt ograniczeń buildu: DockerHostConfig zachowuje128GiB/16CPU, lecz Cmd
+nie podaje --jobs, CARGO_BUILD_JOBS nie ma w środowisku, a parser domyślnie
+wybiera2. CMAKE_BUILD_PARALLEL_LEVEL dziedziczy ten jobs w build environment.
+OMP_NUM_THREADS=4 jest odrębne od limitu zadań Cargo. Trwa wąska analiza
+pozostałych konsumentów budżetu; nie zwiększono jeszcze jobs kompilacji.
+
+
+## 62. Limity CPU podczas budowania — 21.10.2026
+
+Analiza dotyczy aktywnej trasy Docker DEV grupy `fullmag-master`.
+Zapisany i już zastosowany budżet wynosi 128 GiB RAM oraz 16 CPU.
+Nie oznaczał on 16 jobów: uruchomienie `backend_dev.py start` nie zawierało
+`--jobs`, środowisko nie miało `CARGO_BUILD_JOBS`, a parser wybierał 2.
+To rzeczywiste, zbędne ograniczenie kompilacji aplikacji.
+
+| Warstwa | Stan odczytany przed poprawką | Poprawka lub decyzja |
+|---|---|---|
+| Backend — quota | 16 CPU, 128 GiB RAM, 8 GiB swapu | Zachować zatwierdzony budżet |
+| Cargo | 2 joby mimo dostępnych 16 CPU | Renderowany Compose wyprowadza `CARGO_BUILD_JOBS=16` ze zweryfikowanego budżetu; bazowa konfiguracja bez profilu używa 4, zgodnie z quota 4 CPU |
+| CMake FDM/FEM w Cargo | Niezależna pula z `CMAKE_BUILD_PARALLEL_LEVEL`; FEM dodatkowo `--parallel NUM_JOBS` | W Docker DEV dla Unix Makefiles przekazywać `CARGO_MAKEFLAGS` jako `MAKEFLAGS`, bez osobnego `--parallel`; Rust i C++ dzielą tokeny Cargo. Inny generator lub brak jobservera: jawna, sygnalizowana serializacja |
+| Pozostałe natywne subprocessy | Mogły dziedziczyć pełny limit Cargo i tworzyć kolejne pule | Konserwatywne `CMAKE_BUILD_PARALLEL_LEVEL=1`; właściwy FDM/FEM usuwa je z childenv przy wspólnym jobserverze |
+| Capture manifestu źródeł | `LIVE_HASH_WORKERS=8` w `backend_source.py` | To osobna pula odczytu/hashowania plików; brak pomiaru wskazującego CPU jako wąskie gardło, bez zmiany |
+| OpenMP | `OMP_NUM_THREADS=4` w obrazie | To osobne ustawienie runtime, nie limit jobów Cargo; pozostaje bez zmiany w tej poprawce buildu |
+| Obraz zależności BuildKit | MFEM domyślnie `FULLMAG_MFEM_BUILD_JOBS=1`; część innych bibliotek używa `nproc` | To osobny build zależności, poza quota backendu. Obecny cache zachowany; nie przebudowywać MFEM tylko w celu zmiany tej wartości |
+| Frontend | 4 CPU / 16 GiB RAM | Brak dowodu, że to wąskie gardło obecnej awarii backendu; bez zmiany |
+| Liczba procesów backendu | `pids_limit=512` | Brak dowodu osiągnięcia limitu; bez zmiany |
+
+Powiązanie Cargo z zapisanym budżetem jest w
+`scripts/docker_volume_resources.py::apply_saved_budget`; wejście w
+`compose.dev.yaml`. Ustawienia i log `phase=make state=start` są w
+`docker/all-in-one/backend_dev.py`. Wspólną pulę konsumują
+`crates/fullmag-fem-sys/build.rs` i `crates/fullmag-fdm-sys/build.rs`.
+
+Przekazanie flag jobservera opisuje oficjalny
+[Cargo Book](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts).
+`NUM_JOBS` jest rozmiarem całej puli, a nie osobnym przydziałem dla każdego
+build scriptu. Dlatego nie ustawiamy niezależnego `-j16` w każdym podprocesie.
+
+Stan: poprawka źródłowa gotowa po review; kontrola Python AST i diff-check PASS.
+Parser Rust nie został potwierdzony: rustfmt odmówił dostępu do ścieżki.
+Pomiar CPU i czasu nowego buildu pozostaje
+**NOT VERIFIED**. Nie deklarujemy przyspieszenia 8×. Bez testów.
+Przed kolejnym buildem odczytano 95,1 GiB wolnego miejsca na C:.
+Zgodnie z `fullmag-build-stage-cleanup` zachowano cache Cargo/CMake, ostatni
+pakiet d2a4bdfb i wszystkie pakiety przypięte przez stare runy oraz rollback.
+Nie wykazano ich zbędności; ponowna ocena dopiero po weryfikacji następcy.
+Nie usunięto danych i nie wykonano prune.

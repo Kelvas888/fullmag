@@ -2534,6 +2534,22 @@ def _parser() -> argparse.ArgumentParser:
     resources.add_argument("--backend-memory-gib", type=int, required=True)
     resources.add_argument("--backend-cpus", type=int, required=True)
     resources.add_argument("--apply", action="store_true", help="apply the displayed increase; default previews without changing limits")
+    pre_api_stop = subparsers.add_parser(
+        "stop-pre-api-start", help="checkpoint and stop an owned historical rollback reader before API"
+    )
+    pre_api_stop.add_argument("--source-root", type=Path, required=True)
+    pre_api_stop.add_argument("--attempt", required=True)
+    pre_api_stop.add_argument("--backend-container-id", required=True)
+    pre_api_mode = pre_api_stop.add_mutually_exclusive_group()
+    pre_api_mode.add_argument("--apply", action="store_true")
+    pre_api_mode.add_argument("--finalize", action="store_true", help="observe and finalize an existing stopped intent; never repeat the signal")
+    pre_api_mode.add_argument("--resume-unissued", action="store_true", help="resume a held pre-API start only after proving there is no intent or publisher")
+    capture_checkpoint = subparsers.add_parser(
+        "checkpoint-pre-api-failure", help="record an already stopped capture-only backend without replaying its held run"
+    )
+    capture_checkpoint.add_argument("--source-root", type=Path, required=True)
+    capture_checkpoint.add_argument("--attempt", required=True)
+    capture_checkpoint.add_argument("--backend-container-id", required=True)
     stop_unadmitted = subparsers.add_parser(
         "stop-unadmitted",
         help=(
@@ -2711,6 +2727,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "increase-resources":
             from docker_volume_resources import increase
             increase(args)
+        elif args.action == "stop-pre-api-start":
+            from docker_volume_pre_api_stop import stop
+            stop(args)
+        elif args.action == "checkpoint-pre-api-failure":
+            from docker_volume_pre_api_stop import checkpoint_capture
+            checkpoint_capture(args)
         elif args.action == "stop-unadmitted":
             from docker_volume_stop_unadmitted import stop
             stop(args)

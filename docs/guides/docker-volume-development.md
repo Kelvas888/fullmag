@@ -344,6 +344,51 @@ automatycznie ponawiać `docker update`. Limit 200 GiB wymaga VM większej niż
 200 GiB z zapasem dla innych usług; komenda nie restartuje Docker/WSL ani innych grup.
 Odbiór uruchomienia API, meshu i solvera jest osobnym dowodem.
 
+## Zatrzymanie zbędnej kontroli rollbacków przed API
+
+Gdy opublikowany pakiet jest gotowy, lecz stary helper nadal sprawdza rollbacki,
+`stop-pre-api-start` może utworzyć checkpoint i zakończyć wyłącznie własny start
+przed API, zachowując przyjęty model i istniejący kontekst pierwszego pre-ACK:
+
+```powershell
+python -B scripts/docker_dev.py --repo-root <main> stop-pre-api-start `
+  --source-root <main> --attempt <development-uuid> --backend-container-id <full-id>
+# Odczytowy podgląd powyżej; zastosowanie: dodaj --apply.
+```
+
+Nie służy do zatrzymywania API, solvera ani aktywnego builda. Wymaga jednego
+czytanego artefaktu starego backupu, zakończonej publikacji pakietu, niezmienionego
+owner/process/config i held runu bez start_release. Nie zmienia historycznych
+receiptów, ownera, konfiguracji, katalogu ani limitów. Zachowuje intent i wynik
+w `development/attempts/<uuid>/pre-api-stop`; pierwotny kontroler kończy własną
+operację po faktycznym wyjściu backendu. Dopiero terminal `failed-confirmed` i
+potwierdzony stop pozwalają właściwemu launcherowi odtworzyć usługę z nowym
+helperem, bez nowego `--script`. Nieznany wynik wymaga obserwacji istniejącego
+intentu; komendy nie należy ponawiać. Szczegóły i granice: ADR0066.
+Jeżeli proces już zakończył się dokładnym exit143, lecz publikacja końcowego
+receipt została przerwana, `--finalize` zamiast `--apply` ponownie obserwuje
+ten sam zapisany intent pod nowym lease i może dokończyć wyłącznie receipt.
+Nie wysyła sygnału i wymaga terminalnego `failed-confirmed` pierwotnej próby.
+`--resume-unissued` służy wyłącznie do zwolnienia pauzy po przerwaniu polecenia
+przed intentem: wymaga braku nazwanego publishera i samego intentu, oryginalnego
+kontrolera oraz świeżych dowodów. Nie wznawia nieznanego lub wydanego stopu.
+
+Jeżeli ręczny restart zakończył się już błędem zamykania manifestu źródeł
+przed build/API, zamiast wysyłać stop użyj odrębnego checkpointu:
+
+```powershell
+python -B scripts/docker_dev.py --repo-root <main> checkpoint-pre-api-failure `
+  --source-root <main> --attempt <failed-development-uuid> --backend-container-id <full-id>
+```
+
+Ta komenda zapisuje jedynie dowód istniejącego exit2 i dokładne logi capture-only,
+sprawdzając niezmieniony pierwszy kontekst pre-ACK i held run. Nie powtarza
+skryptu. W razie przerwanej publikacji `stop-pre-api-start --finalize` rozpoznaje
+ten odrębny wariant i domyka receipt również bez sygnału. Następnie zwykła
+`recreate-volume` zachowuje model, cache i dane. Przed capture wstrzymaj zapisy
+źródeł do czasu potwierdzenia spójnego cienia; restart z Docker Desktop może
+zbiec się z edycją hosta i nie jest dowodem ukończonego buildu ani API.
+
 ## Granica zapisu i retencja
 
 | Dane | Miejsce |

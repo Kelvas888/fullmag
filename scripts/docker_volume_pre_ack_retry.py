@@ -41,7 +41,7 @@ def _record(control, relative, label):
     return raw, _decode_json(raw, label)
 
 
-def _publish_raw(control, relative, raw):
+def _publish_raw(control, relative, raw, *, helper_name=None):
     from docker_build_control import bounded_capture
     path = control.path(relative)
     parent = str(PurePosixPath(path).parent)
@@ -49,7 +49,7 @@ def _publish_raw(control, relative, raw):
               f"test ! -e '{path}'; test ! -L '{path}'; tmp=$(mktemp '{parent}/.pre-ack.XXXXXXXX'); "
               "trap 'rm -f -- \"$tmp\"' EXIT; cat > \"$tmp\"; sync \"$tmp\"; "
               f"ln -T -- \"$tmp\" '{path}'; rm -- \"$tmp\"; sync '{parent}'")
-    result = bounded_capture(control.helper_args(script), data=raw, timeout=90)
+    result = bounded_capture(control.helper_args(script, name=helper_name), data=raw, timeout=90)
     if result.returncode or _control_bytes(control, relative) != raw:
         raise BuildControlError("Create-only pre-ACK raw archive was not confirmed")
 

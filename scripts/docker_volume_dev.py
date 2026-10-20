@@ -3245,6 +3245,13 @@ def _retained_recovery_context(
         )
         if native is not None:
             return native
+        from docker_volume_pre_api_stop import retained_context as retained_pre_api_context
+        pre_api = retained_pre_api_context(
+            control, previous, document, backend_id or previous.get("backend_container"),
+            fresh_state=fresh_state, removed_container_proof=removed_container_proof,
+        )
+        if pre_api is not None:
+            return pre_api
         if removed_container_proof is None:
             from docker_volume_pre_ack_retry import retained_pre_ack_context
             retry = retained_pre_ack_context(
@@ -4259,7 +4266,12 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             }
         native_recovery_context = dict(recovery_context)
         post_build_generation = None
-        if not fresh_state and pre_activation_stop is None and certificate.get("restart_verified") is True:
+        # A validated pre-API cancellation pins byte-identical native config;
+        # it carries the existing first pre-ACK context, not a new generation proof.
+        from docker_volume_pre_api_stop import PreApiContext
+        pre_api_stopped = isinstance(recovery_context, PreApiContext)
+        if (not fresh_state and pre_activation_stop is None and not pre_api_stopped
+                and certificate.get("restart_verified") is True):
             retained_environment = document["services"]["backend"]["environment"]
             retained_reattach_declared = (
                 "accepted_reattach" in previous

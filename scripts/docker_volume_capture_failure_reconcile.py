@@ -734,6 +734,13 @@ def _capture_logs(backend_id: str, state: Mapping[str, object]) -> dict[str, byt
     if result.returncode:
         _fail("Cannot archive exact current backend logs: " + result.stderr.decode("utf-8", "replace")[-1024:])
     streams = {"stdout": bytes(result.stdout), "stderr": bytes(result.stderr)}
+    return validate_capture_log_streams(streams, state)
+
+
+def validate_capture_log_streams(streams: Mapping[str, bytes], state: Mapping[str, object]) -> dict[str, bytes]:
+    """Validate archived bytes with the same incarnation rules as live logs."""
+    if set(streams) != {"stdout", "stderr"} or any(not isinstance(value, bytes) for value in streams.values()):
+        _fail("Capture-only log archive has an invalid stream set")
     total_bytes = len(streams["stdout"]) + len(streams["stderr"])
     if not total_bytes or total_bytes > MAX_LOG_BYTES:
         _fail("Current backend logs are empty or exceed the retention bound")
@@ -766,7 +773,7 @@ def _capture_logs(backend_id: str, state: Mapping[str, object]) -> dict[str, byt
     )
     if any(re.search(pattern, text, re.IGNORECASE) for pattern in forbidden):
         _fail("Current backend logs show work beyond the capture-only failure")
-    return streams
+    return dict(streams)
 
 
 def _resume_failure_log(control, resume_attempt: str, expected_started_at: str):

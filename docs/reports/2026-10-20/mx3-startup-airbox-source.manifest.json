@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-20T22:04:10.395222+00:00",
-  "verification": "Managed live increase succeeded: same backend container 8->128 GiB, 4->16 CPU, extra swap 8 GiB preserved; Docker inspect and cgroup confirmed. Receipt 174138824a3d4777a9834b165f500b53 SHA256 169022d3c9ab4cfd46c9150522a2b8c549306160adf896a95c5822385f207e42. Saved next-start profile source reviewed only. Python AST 4 plus 3 embedded helpers and scoped diff check PASS. No tests/new build. Prior package d2a4bdfb built; live old helper still verifies historical backups, API/native/mesh/Solve NOT VERIFIED.",
+  "observed_at": "2026-10-20T22:56:35.234989+00:00",
+  "verification": "Source review PASS, Python AST7 plus3 resource helpers PASS, diff-check PASS; Rust parser unavailable (access denied). Capture-only checkpoint c16da16d succeeded, exit0, stopped-confirmed, no signal, receipt SHA256 dedd093a0b7dd0f6e5f8caee7df844e84eb51b48d09895a80c8bfab593c6d137. Cargo jobs source fix 2->approved16, GNU Make shares jobserver. Backend stopped; new build/CPU timing/API/native/mesh/Solve NOT VERIFIED. No tests.",
   "files": [
     {
       "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
@@ -52,7 +52,7 @@
     },
     {
       "path": "compose.dev.yaml",
-      "sha256": "f16181de0dd7ffecea18ac5b5e2f8e823d940b25eb3a16ded9a0e25f1722bf6e"
+      "sha256": "0e92f05388c2f6adeeee5ea78f21d857a9d314d3a5a66ec667afd7a1e5d5c9f9"
     },
     {
       "path": "crates/fullmag-api/src/accepted_fem_preparation_scheduler_main.rs",
@@ -120,7 +120,7 @@
     },
     {
       "path": "docker/all-in-one/backend_dev.py",
-      "sha256": "c5fff506c13fefd3d99528bf96e85a10d091e0bf06fd43ee1121de72743a3505"
+      "sha256": "ea39c1722cd4d1fb53aa977e3a95bbb739e7e4a081506cf8271e72e6b300f943"
     },
     {
       "path": "docker/all-in-one/backend_source.py",
@@ -128,7 +128,7 @@
     },
     {
       "path": "docker/all-in-one/entrypoint.py",
-      "sha256": "806d5b8b9e702dc590ac4bf4877597c5f7d6d09f50ee3963de79898cc53befb1"
+      "sha256": "d4e6777171d5b0273cfd9542095450498fba95a0682393ddfae708b697ed3ef5"
     },
     {
       "path": "docker/all-in-one/frontend_dev.py",
@@ -136,11 +136,15 @@
     },
     {
       "path": "docker/all-in-one/runtime_service.py",
-      "sha256": "6725af5b7137e3b36f9160d656275f80993321dbc1e7848bf61398ce9bccb338"
+      "sha256": "9600359de19c522498ba64b1c6767db962a5c66e7995798f92a96fe78951fa35"
     },
     {
       "path": "docs/adr/0061-docker-development-build-and-runtime-container.md",
       "sha256": "a091a05cf038be6c631b82f204883770a25b00da7154322ab10c271ce98f57e1"
+    },
+    {
+      "path": "docs/adr/0066-docker-post-build-generation-continuation.md",
+      "sha256": "e87344d6624971a6132e03db8fd4ecb7760a8dd74ecb6d59e6b1a72664ba5478"
     },
     {
       "path": "docs/guides/docker-build-storage-lifecycle.md",
@@ -152,11 +156,11 @@
     },
     {
       "path": "docs/guides/docker-volume-development.md",
-      "sha256": "7a63c38bebef4b7f897b109948f7d0e750ffdca46dd203d4b57743ec2724877a"
+      "sha256": "08ea035fc85157328a65c07e06c6f3fa8485e8b7e0b908349f5dd5832c35e0bd"
     },
     {
       "path": "scripts/docker_dev.py",
-      "sha256": "d1c6c33b23189b8b37671e56e69d4a124369c3bfa3747257957ab021e43e729c"
+      "sha256": "ad9ee6212b5dcf8ea0003ff3ebdbb5278092ca83d11aeec73be2b85e9a0f5050"
     },
     {
       "path": "scripts/docker_volume_accepted_reattach.py",
@@ -168,19 +172,31 @@
     },
     {
       "path": "scripts/docker_volume_capture_failure_reconcile.py",
-      "sha256": "940e37eb857031d7aaa7cec47baad6d9b76064a500750e6b744ad64f83de9266"
+      "sha256": "0af968adc771c572cab657cfeadb8c8efe5716342bce747e63070c61ff3cb620"
     },
     {
       "path": "scripts/docker_volume_dev.py",
-      "sha256": "89a6cc788c52cca3a4f440e9af75beea25251474587f43a059456794f8ecb831"
+      "sha256": "bb5b06a418a08dc398c93aec1d491f7632df57e121924b42462128d6b250d0ad"
     },
     {
       "path": "scripts/docker_volume_pre_ack_retry.py",
-      "sha256": "133cf01938d0b1aecb3d261fea8ae66b82e1699f4236e492c17a5d2efb9bc048"
+      "sha256": "6e873799bd21374a738d92059dd05680748ab775d271042af79f65dc81be0d61"
+    },
+    {
+      "path": "scripts/docker_volume_pre_api_stop.py",
+      "sha256": "2add926af28b91803fa124a7d05014a499509acd86805d5706931ac3ea7df180"
     },
     {
       "path": "scripts/docker_volume_resources.py",
-      "sha256": "6cfbd228d3dbeb2fb08454cbb689f85f2d5ef8c2706c8d7cfe01eea7874498a0"
+      "sha256": "eed5839d6bda393b93bb60e5a884d34dc54d6aba2705f4be72677a548c3a9249"
+    },
+    {
+      "path": "crates/fullmag-fdm-sys/build.rs",
+      "sha256": "a109cb16b8b9283aa87f29cdc9f1fd22b013376c7b910c247437fbb43fb35ba0"
+    },
+    {
+      "path": "crates/fullmag-fem-sys/build.rs",
+      "sha256": "de5c575c3274b8f7c09817968d09e22ab26580825fea5f3282b7122d36975818"
     }
   ]
 }

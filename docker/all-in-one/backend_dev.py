@@ -1984,7 +1984,9 @@ def _build_environment(
             "FULLMAG_SOURCE_SNAPSHOT_SHA256": str(native["source_snapshot_sha256"]),
             **{name: str(path) for name, path in native_build_roots.items()},
             "CARGO_BUILD_JOBS": str(jobs),
-            "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs),
+            # FDM/FEM build scripts share Cargo's jobserver. Other native
+            # subprocesses must not each create another `jobs`-wide pool.
+            "CMAKE_BUILD_PARALLEL_LEVEL": "1",
             "CARGO_INCREMENTAL": "1",
             "HOME": str(build_root / "home"),
             "TMPDIR": str(build_root / "tmp"),
@@ -4451,7 +4453,12 @@ def _write_console_chunk(chunk: bytes) -> None:
 
 def _run_canonical_make(command: list[str], workspace: Path, environment: Mapping[str, str], log_path: Path) -> int:
     started = time.monotonic()
-    _log_phase("make", "start", target=command[-1])
+    _log_phase(
+        "make", "start", target=command[-1],
+        cargo_jobs=environment.get("CARGO_BUILD_JOBS", "unset"),
+        native_parallelism="shared-or-serial",
+        native_fallback_jobs=environment.get("CMAKE_BUILD_PARALLEL_LEVEL", "unset"),
+    )
     try:
         with log_path.open("wb") as log:
             remaining_log_bytes = MAX_BUILD_LOG_BYTES
