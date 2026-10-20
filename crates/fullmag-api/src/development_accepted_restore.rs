@@ -56,6 +56,8 @@ const MAX_CONTROL_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const ACTIVATION_OPERATION_SCHEMA: &str = "fullmag.docker-build-operation.v1";
 const STOP_VERIFICATION_SCHEMA: &str = "fullmag.stop-failed-admission.v1";
 const NAMESPACE_ATTESTATION_SCHEMA: &str = "fullmag.docker-stopped-namespace-attestation.v1";
+const API_START_FAILURE_MODE: &str = "api-start-failure";
+const API_START_FAILURE_ERROR_PREFIX: &str = "API binding did not become ready:";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1674,6 +1676,12 @@ fn validate_backing_records(
         "native-after-ready-failure" => true,
         _ => bail!("stopped-backend journal has an unsupported native failure kind"),
     };
+    let api_start_failure = match verification.get("failure_mode") {
+        None => false,
+        Some(value) if value.is_null() => false,
+        Some(value) if !after_ready && value.as_str() == Some(API_START_FAILURE_MODE) => true,
+        Some(_) => bail!("stopped-backend journal has an unsupported failure mode"),
+    };
     let failure_envelope = verification
         .get("failure_receipt")
         .and_then(Value::as_object)
@@ -1690,17 +1698,18 @@ fn validate_backing_records(
     let failure_receipt = failure_envelope
         .get("receipt")
         .context("stopped-backend journal has no wrapped process receipt")?;
-    validate_native_process_receipt(failure_receipt, after_ready)?;
+    validate_native_process_receipt_mode(failure_receipt, after_ready, api_start_failure)?;
     let probe = verification
         .get("native_failure_probe")
         .and_then(Value::as_object)
         .context("stopped-backend journal has no native failure probe")?;
     let probe = Value::Object(probe.clone());
-    let failed_owner = validate_native_failure_probe(
+    let failed_owner = validate_native_failure_probe_mode(
         &probe,
         process_receipt_sha256,
         failure_receipt,
         after_ready,
+        api_start_failure,
     )?;
     require_all_released(&probe, "reservation_states")?;
     require_all_released(&probe, "lease_states")?;
@@ -1839,6 +1848,29 @@ fn validate_namespace_attestation(
     failed_owner: &Value,
     after_ready: bool,
 ) -> Result<()> {
+    let api_start_failure = match verification.get("failure_mode") {
+        None => false,
+        Some(value) if value.is_null() => false,
+        Some(value) if !after_ready && value.as_str() == Some(API_START_FAILURE_MODE) => true,
+        Some(_) => bail!("stopped-backend journal has an unsupported failure mode"),
+    };
+    validate_namespace_attestation_mode(
+        attestation, proof, verification, terminal_process, terminal_failed_owner,
+        probe, failed_owner, after_ready, api_start_failure,
+    )
+}
+
+fn validate_namespace_attestation_mode(
+    attestation: &Value,
+    proof: &AcceptedRestoreProof,
+    verification: &Value,
+    terminal_process: &Value,
+    terminal_failed_owner: &Value,
+    probe: &Value,
+    failed_owner: &Value,
+    after_ready: bool,
+    api_start_failure: bool,
+) -> Result<()> {
     let expected_stop_path = format!(
         "verification/stop-failed-{}.json",
         proof.backend_container
@@ -1865,6 +1897,12 @@ fn validate_namespace_attestation(
     }
     let failure_kind = require_string(verification, "failure_kind")?;
     require_equal_string(attestation, "failure_kind", failure_kind)?;
+    if attestation.get("failure_mode") != verification.get("failure_mode") {
+        bail!("stopped namespace attestation failure mode differs from journal");
+    }
+    if api_start_failure && failure_kind != "native-start-failure" {
+        bail!("API-start failure mode is attached to an after-ready journal");
+    }
 
     let container_state = attestation
         .get("container_state")
@@ -2072,10 +2110,21 @@ fn validate_startup_provenance_record(
 }
 
 fn validate_native_process_receipt(receipt: &Value, after_ready: bool) -> Result<()> {
+    validate_native_process_receipt_mode(receipt, after_ready, false)
+}
+
+fn validate_native_process_receipt_mode(
+    receipt: &Value,
+    after_ready: bool,
+    api_start_failure: bool,
+) -> Result<()> {
     require_equal_string(receipt, "schema", "fullmag.docker-process-tree.v1")?;
     require_equal_string(receipt, "state", "failed_outcome_retained")?;
     require_json_integer(receipt, "api_exit_code", "failed process receipt")?;
-    require_string(receipt, "error")?;
+    let error = require_string(receipt, "error")?;
+    if api_start_failure && !error.starts_with(API_START_FAILURE_ERROR_PREFIX) {
+        bail!("API-start failure receipt has no API binding error prefix");
+    }
     if receipt.get("runtime_pid").is_some_and(|value| !value.is_null()) {
         bail!("failed process receipt retains a runtime pid");
     }
@@ -2108,6 +2157,18 @@ fn validate_native_failure_probe(
     process_receipt: &Value,
     after_ready: bool,
 ) -> Result<Value> {
+    validate_native_failure_probe_mode(
+        probe, process_receipt_sha256, process_receipt, after_ready, false,
+    )
+}
+
+fn validate_native_failure_probe_mode(
+    probe: &Value,
+    process_receipt_sha256: &str,
+    process_receipt: &Value,
+    after_ready: bool,
+    api_start_failure: bool,
+) -> Result<Value> {
     let expected_schema = if after_ready {
         "fullmag.docker-native-after-ready-failure-stop-probe.v1"
     } else {
@@ -2115,6 +2176,11 @@ fn validate_native_failure_probe(
     };
     require_equal_string(probe, "schema", expected_schema)?;
     require_equal_string(probe, "process_receipt_sha256", process_receipt_sha256)?;
+    if api_start_failure {
+        require_equal_string(probe, "failure_mode", API_START_FAILURE_MODE)?;
+    } else if probe.get("failure_mode").is_some_and(|value| !value.is_null()) {
+        bail!("native failure probe has an unexpected failure mode");
+    }
     if probe.get("process_receipt") != Some(process_receipt) {
         bail!("native failure probe process receipt differs from its journal");
     }
@@ -2148,7 +2214,7 @@ fn validate_native_failure_probe(
         failed_owner,
         "failed owner",
         RuntimeServiceState::Failed,
-        if after_ready {
+        if after_ready || api_start_failure {
             &["exited_success", "exited_failure"]
         } else {
             &["exited_success"]
@@ -3507,6 +3573,65 @@ mod tests {
             false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn api_start_failure_requires_exact_api_error_and_drained_terminal_state() {
+        let mut process_receipt = process_receipt_fixture(None);
+        process_receipt["error"] = json!("API binding did not become ready: API loopback probe failed");
+        let failed_owner = owner_fixture("failed", "exited_failure");
+        let process_sha = "a".repeat(64);
+        let mut probe = serde_json::json!({
+            "schema": "fullmag.docker-native-start-failure-stop-probe.v1",
+            "failure_mode": API_START_FAILURE_MODE,
+            "process_receipt_sha256": process_sha,
+            "process_receipt": process_receipt,
+            "failed_owner_sha256": "b".repeat(64),
+            "failed_owner": failed_owner,
+            "api_pid_exists": false,
+            "owner_pid_exists": false,
+            "child_pids_exist": false,
+            "native_processes_live": false,
+            "startup_enabled": null,
+            "legacy_activation_marker_exists": false,
+            "active_lease_count": 0,
+        });
+        assert!(validate_native_process_receipt_mode(
+            probe.get("process_receipt").unwrap(), false, true
+        )
+        .is_ok());
+        assert!(validate_native_failure_probe_mode(
+            &probe,
+            &process_sha,
+            probe.get("process_receipt").unwrap(),
+            false,
+            true,
+        )
+        .is_ok());
+
+        probe["process_receipt"]["error"] = json!(
+            "private accepted-run reattach must succeed before API startup"
+        );
+        assert!(validate_native_process_receipt_mode(
+            probe.get("process_receipt").unwrap(), false, true
+        )
+        .is_err());
+
+        probe["process_receipt"]["error"] = json!(
+            "API binding did not become ready: API loopback probe failed"
+        );
+        probe["failed_owner"]["children"][0]["status"] = json!("running");
+        assert!(validate_native_failure_probe_mode(
+            &probe,
+            &process_sha,
+            probe.get("process_receipt").unwrap(),
+            false,
+            true,
+        )
+        .is_err());
+        probe["failed_owner"]["children"][0]["status"] = json!("exited_failure");
+        probe["reservation_states"] = json!(["unknown"]);
+        assert!(require_all_released(&probe, "reservation_states").is_err());
     }
 
     #[test]

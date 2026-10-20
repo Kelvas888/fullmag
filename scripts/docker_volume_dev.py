@@ -2055,6 +2055,10 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     ):
         raise BuildControlError("Native failed-stop journal is not the exact stopped backend proof")
     after_ready = failure_kind == "native-after-ready-failure"
+    failure_mode = journal.get("failure_mode")
+    api_start_failure = failure_mode == "api-start-failure"
+    if failure_mode is not None and (failure_kind != "native-start-failure" or not api_start_failure):
+        raise BuildControlError("Native failed-stop journal has an unsupported failure mode")
     failure = journal.get("failure_receipt")
     if not isinstance(failure, Mapping):
         raise BuildControlError("Native failed-stop journal has no failed process receipt")
@@ -2074,7 +2078,9 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     validated = (
         _validate_native_after_ready_failure_probe(probe, process_sha)
         if after_ready
-        else _validate_native_failure_probe(probe, process_sha)
+        else _validate_native_failure_probe(
+            probe, process_sha, api_start_failure=api_start_failure
+        )
     )
 
     terminal_raw = _control_bytes(control, "runtime-control/runtime-service/process-tree.json")
@@ -2156,6 +2162,8 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
         "previous_config_sha256": previous_config_sha256,
         "claim_pending": False,
     }
+    if api_start_failure:
+        metadata["failure_mode"] = failure_mode
     if after_ready:
         metadata["retained_ready_owner"] = validated["ready_owner"]
     if namespace_attestation is not None:
