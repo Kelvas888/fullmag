@@ -10731,7 +10731,7 @@ mod admission_tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("no matching immutable task admission"));
+            .contains("has 0 matching immutable task admissions"));
     }
 
     #[test]

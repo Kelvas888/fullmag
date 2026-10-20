@@ -203,7 +203,7 @@ async fn acquire_workspace_for_restart_inner(
                             &snapshot.session.run_id,
                             &snapshot.session.session_id,
                             session_epoch,
-                            scene_document.scene.revision,
+                            scene_document.revision,
                         )
                     });
             let run_id = if is_scratch {

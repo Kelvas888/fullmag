@@ -57,7 +57,7 @@ pub(crate) struct RetirementPredecessor {
     pub request_scope_epoch: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct DocumentPin {
     pub object_ref: String,
