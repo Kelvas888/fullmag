@@ -1498,3 +1498,17 @@ mod tests {
             fullmag_session::host_resource_ledger::HostResourceReservationState::Released,
         );
         assert_eq!(
+            collect_released_host_reservations(&[released], "store-a", "run")
+                .unwrap()
+                .len(),
+            1
+        );
+        let foreign = host_reservation(
+            "store-b",
+            fullmag_session::host_resource_ledger::HostResourceReservationState::Released,
+        );
+        assert!(collect_released_host_reservations(&[foreign], "store-a", "run")
+            .unwrap()
+            .is_empty());
+    }
+}

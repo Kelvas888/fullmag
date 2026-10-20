@@ -4908,7 +4908,7 @@ impl SessionStore {
         let preparation_receipt = self.read_preparation_receipt(run_id)?;
         let preparation_receipt_reference = preparation_receipt
             .as_ref()
-            .map(|receipt| {
+            .map(|receipt| -> Result<serde_json::Value> {
                 Ok(serde_json::json!({
                     "preparation_id": receipt.preparation_id,
                     "receipt_sha256": canonical_json_sha256(&serde_json::to_value(receipt)?),
@@ -4919,7 +4919,7 @@ impl SessionStore {
         let artifact_catalog = self.read_artifact_catalog(run_id)?;
         let artifact_catalog_reference = artifact_catalog
             .as_ref()
-            .map(|catalog| {
+            .map(|catalog| -> Result<serde_json::Value> {
                 let entries = catalog
                     .entries
                     .iter()
@@ -8798,7 +8798,7 @@ mod tests {
         );
     }
 
-    fn accepted_task_preparation_payload(
+    pub(super) fn accepted_task_preparation_payload(
         run_id: &str,
         step_id: &str,
         preparation_id: &str,
@@ -9869,7 +9869,7 @@ mod tests {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
-    use super::tests::test_resource_lease;
+    use super::tests::{accepted_task_preparation_payload, test_resource_lease};
     use chrono::Utc;
 
     fn queued_task(task_id: &str) -> FmsTaskCatalogEntry {
