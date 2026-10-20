@@ -56,6 +56,7 @@ import {
 } from "./simulationPreparationTestDom.test-support";
 import { footerManifest } from "../../modules/footer/manifest";
 import { SlotHost } from "./SlotHost";
+import { DraggablePanel } from "@/shared/ui/DraggablePanel";
 
 vi.mock("@/shared/ui/Dialog", async () => {
   const React = await import("react");
@@ -136,6 +137,38 @@ afterEach(() => {
 });
 
 describe("mounted simulation preparation UI", () => {
+  it("reflects draggable panel data attributes through the test DOM dataset", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    dom.document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+
+    await act(async () => {
+      root.render(
+        <DraggablePanel
+          open
+          maximizable
+          onOpenChange={vi.fn()}
+          title="Layout probe"
+        >
+          Probe
+        </DraggablePanel>,
+      );
+    });
+    const panel = findElement(
+      container,
+      (element) => hasClass(element, "fm-draggable-panel"),
+      "draggable panel",
+    );
+    expect(panel.dataset.maximized).toBe("false");
+
+    await act(async () => findButton(container, "Maximize window").click());
+    expect(panel.dataset.maximized).toBe("true");
+
+    await act(async () => root.unmount());
+    dom.restore();
+  });
+
   it("mounts the editable workspace while the first preparation resources are loading", async () => {
     const dom = installSimulationPreparationTestDom();
     const pendingStatus = deferred<LiveStatusResource>();

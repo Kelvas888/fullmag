@@ -63,7 +63,9 @@ class RetainedRecoveryContextTests(unittest.TestCase):
     def test_ordinary_recreation_does_not_acquire_recovery(self):
         self.previous.pop('container_recovery')
         self.document['services']['backend']['environment'] = {}
-        self.assertEqual(self.run_context(), {})
+        with patch('docker_volume_pre_ack_retry.storage.resolve_layout') as resolve:
+            self.assertEqual(self.run_context(), {})
+        resolve.assert_not_called()
 
     def test_fresh_state_cannot_retarget_original_recovery(self):
         with self.assertRaisesRegex(dev.BuildControlError, 'original session'):

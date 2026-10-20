@@ -245,15 +245,15 @@ def _collect(control, selected, args, operation_id):
 
 def retained_pre_ack_context(control, previous, document, backend_id, *, fresh_state=False):
     """Carry only the already-authorized, byte-pinned API predecessor context."""
+    pins = previous.get("inputs", {}).get("accepted_reattach")
+    if not isinstance(pins, dict):
+        return None
     selected = Path(previous["inputs"]["source_root"]).resolve(strict=True)
     layout = storage.resolve_layout(selected, "docker-all-gpu")
     identity = compose_project_identity(layout)
     if identity.get("checkout_kind") != "main-checkout" or identity.get("project_name") != "fullmag-master":
         return None
     _require_main(identity, control)
-    pins = previous.get("inputs", {}).get("accepted_reattach")
-    if not isinstance(pins, dict):
-        return None
     relative = str(PurePosixPath(pins.get("proof_relative", "")).parent / "pre-ack-retry.json")
     raw = _control_bytes(control, "runtime-control/" + relative, optional=True)
     if raw is None:

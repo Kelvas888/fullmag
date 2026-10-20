@@ -190,6 +190,8 @@ class TestNamedNodeMap extends Map<string, string> {
 
 export class TestElement extends TestNode {
   readonly attributes = new TestNamedNodeMap();
+  /** Reflect data-* attributes for components that read HTMLElement.dataset. */
+  readonly dataset: Record<string, string> = Object.create(null) as Record<string, string>;
   clientHeight = 0;
   clientWidth = 0;
   readonly namespaceURI: string;
@@ -390,6 +392,8 @@ export class TestElement extends TestNode {
   removeAttribute(name: string): void {
     const normalizedName = this.normalizeAttributeName(name);
     this.attributes.delete(normalizedName);
+    const dataKey = datasetKey(normalizedName);
+    if (dataKey !== null) delete this.dataset[dataKey];
     if (normalizedName === "inputmode") this.inputMode = "";
   }
 
@@ -397,6 +401,8 @@ export class TestElement extends TestNode {
     const normalizedName = this.normalizeAttributeName(name);
     const normalizedValue = String(value);
     this.attributes.set(normalizedName, normalizedValue);
+    const dataKey = datasetKey(normalizedName);
+    if (dataKey !== null) this.dataset[dataKey] = normalizedValue;
     if (normalizedName === "inputmode") this.inputMode = normalizedValue;
   }
 
@@ -413,6 +419,11 @@ class TestDocumentFragment extends TestNode {
 
 const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+
+function datasetKey(attributeName: string): string | null {
+  if (!attributeName.startsWith("data-") || attributeName.length === 5) return null;
+  return attributeName.slice(5).replace(/-([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
 
 const VOID_HTML_ELEMENTS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
 
