@@ -793,6 +793,7 @@ jobs:
           python -B scripts/test_docker_dev_owned_control.py -v
           python -B scripts/test_docker_dev_defaults.py -v
           python -B scripts/test_docker_dev_recreate.py -v
+          python -B scripts/test_docker_dev_browser_qa.py -v
           python -B scripts/test_docker_volume_receipts.py -v
           python -B scripts/test_docker_volume_checks.py -v
           python -B scripts/test_docker_accepted_reattach.py -v
