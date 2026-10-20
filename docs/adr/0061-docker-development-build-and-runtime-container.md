@@ -298,6 +298,23 @@ rekordy z niezmiennymi kopiami ich surowych bajtów w katalogu dowodu.
 Późniejsza legalna rotacja plików ownera i procesu nie unieważnia tych kopii;
 Rust niezależnie sprawdza ich hashe oraz zgodność z journalem zatrzymania.
 
+Każde udane odtworzenie publikuje prywatne, niezmienne potwierdzenie natywnego
+API (`restore-ack-<api_instance_id>.json`). Potwierdzenie wiąże pierwotne
+żądanie, dowód, run, projekt, konfigurację, logiczną sesję i nową instancję API.
+PID 1 zapisuje ten sam identyfikator i hash w receipcie procesu. Dopiero po
+uwierzytelnionym zamknięciu natywnego ownera archiwizuje surowe rekordy ready
+ownera, terminalnego ownera i procesu, a następnie publikuje przypięty do nich
+rekord `successor-drain-<api_instance_id>.json`.
+
+Kolejny restart sprawdza te bajty i łańcuch potwierdzeń zamiast ponownie
+porównywać nowego ownera z historycznym ownerem pierwszej awarii. Wejście
+`successor_auto` nie wybiera wyniku: kod natywny odczytuje aktualny katalog
+runu, zgodę startu i lease. Odtwarza nadal zablokowany model albo terminalny
+model bez ponownego Solve. Kolejne restarty nadal oczekującego modelu są
+legalne. Brak potwierdzonego drain lub niezgodny rekord zatrzymuje odzyskanie.
+Te prywatne potwierdzenia nie zwalniają rezerwacji hosta i nie zastępują
+kanonicznych dowodów ledgera ani rozstrzygnięcia nieznanej aktywacji.
+
 PID 1 odczytuje ograniczone, przypięte wejście z wolumenu runtime-control.
 Tożsamość docelowego buildu pochodzi z opublikowanego w kontenerze provenance:
 pełnego commita i hasha snapshotu źródeł. Rust porównuje je z tożsamością
