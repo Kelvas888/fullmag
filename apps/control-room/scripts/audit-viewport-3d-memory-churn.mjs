@@ -1391,6 +1391,12 @@ function fdmStatusFixture(fixture) {
       generation_id: 1,
     },
     energies: {},
+    lifecycle: {
+      commandability: "writable",
+      connectivity: "connected",
+      session_resource: "active",
+      solver: "idle",
+    },
     metrics: {
       steps_per_second: null,
       total_steps: 0,
@@ -1411,6 +1417,7 @@ function fdmStatusFixture(fixture) {
       mesh_revision: 0,
       scalars_revision: 0,
       scene_revision: 0,
+      simulation_preparation_revision: 0,
       slice_revision: 0,
       stages_revision: 0,
       topology_revision: 0,
