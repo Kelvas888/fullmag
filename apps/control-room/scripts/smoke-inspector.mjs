@@ -4826,6 +4826,12 @@ function inspectorSessionStatus(fixture) {
       generation_id: 1,
     },
     energies: {},
+    lifecycle: {
+      commandability: "allowed",
+      connectivity: "connected",
+      session_resource: "active",
+      solver: "idle",
+    },
     metrics: { steps_per_second: null, total: { steps: 0, time_seconds: 0 }, total_steps: 0, uptime_seconds: 0 },
     resources: {
       artifact_revision: 0,
