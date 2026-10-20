@@ -5188,8 +5188,9 @@ Te dowody dotyczą authoringu i odmowy nieobsługiwanej ścieżki, nie pola H.
 
 Publiczny kontrakt `ExternalLeadPreparation` przechowuje intencję,
 nie gotową siatkę: `revision`, `extensions` i `drives`. `TerminalLeadExtension`
-ma parametry i ograniczenia opisane w tabeli poniżej; wybór rzeczywistych
-markerów nie może zostać zastąpiony nazwą terminala. Serializacja używa
+ma parametry i ograniczenia opisane w tabeli poniżej; semantyczna fabryka
+terminala wyprowadza te same markery, których istnienie sprawdza rzeczywista
+siatka. Serializacja używa
 `schema_version='antenna_external_lead_preparation.v1'` oraz
 `kind='isolated_branch_straight_stubs'`. Pole
 `CurrentTransport.external_lead_preparation` jest wyłączne względem
@@ -5231,6 +5232,114 @@ Po przygotowaniu transport musi zostać jawnie skonstruowany z
 `conservative_current_source=prepared.source` zamiast deklaracji. Docelowy
 execution-only materializer wykonuje tę zmianę w kopii wykonawczej, nie scenie;
 native runtime tego przyrostu pozostaje NOT VERIFIED.
+
+(antenna-semantic-terminal-extension)=
+##### Semantyczny wybór końca przewodnika anteny
+
+`fullmag.TerminalLeadExtension.from_antenna_terminal(...)` przyjmuje wyłącznie
+argumenty nazwane. Zwraca istniejący `TerminalLeadExtension`: nie dodaje rodzaju
+źródła, pól sceny, endpointu API ani wersji `ProblemIR`. Identyfikatory obiektu
+oraz części przewodnika są zachowane dosłownie (łącznie ze spacjami);
+`selector` jest normalizowany przez `strip().lower()` do `local_u_min` albo
+`local_u_max`. Wszystkie pięć tekstowych argumentów jest sprawdzane przed
+wyliczeniem markera; naruszenie ich domeny lub ograniczeń liczbowych zgłasza
+`ValueError`. Fabryka nie wnioskuje fizyki z typu obiektu.
+
+| Parametr publiczny | Typ | Domyślnie | SI | Walidacja | Znaczenie | Obsługa backendów | Python → ProblemIR |
+|---|---|---|---|---|---|---|---|
+| TerminalLeadExtension.from_antenna_terminal.id | str | wymagany; tylko nazwany | $1$ | niepusty UTF-8 bez NUL, do 4096 bajtów | ID elektrody | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].id |
+| TerminalLeadExtension.from_antenna_terminal.observation_id | str | wymagany; tylko nazwany | $1$ | niepusty UTF-8 bez NUL, do 4096 bajtów | ID pasywnej obserwacji | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].observation_id |
+| TerminalLeadExtension.from_antenna_terminal.object_id | str | wymagany; tylko nazwany | $1$ | niepusty UTF-8 bez NUL, do 4096 bajtów; rzeczywisty właściciel sprawdzany po siatce | niezmienny właściciel i wejście markera | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].object_id |
+| TerminalLeadExtension.from_antenna_terminal.conductor_part_id | str | wymagany; tylko nazwany | $1$ | niepusty UTF-8 bez NUL, do 4096 bajtów; istnienie markera sprawdzane po siatce | ID części przewodnika; bez geometrycznego fallbacku | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].boundary_markers[0] |
+| TerminalLeadExtension.from_antenna_terminal.selector | str | wymagany; tylko nazwany | $1$ | niepusty UTF-8 bez NUL, do 4096 bajtów; po strip/lower tylko local_u_min lub local_u_max | semantyczny koniec części przewodnika | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].boundary_markers[0] |
+| TerminalLeadExtension.from_antenna_terminal.length_m | float | wymagany; tylko nazwany | $\mathrm m$ | skończony dodatni, bez bool | długość doprowadzenia | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].length_m |
+| TerminalLeadExtension.from_antenna_terminal.outward_direction_xyz | tuple[float,float,float] | wymagany; tylko nazwany | $1$ | trzy skończone liczby bez bool; tolerancja normy 1e-12; bez automatycznej normalizacji | jawny jednostkowy kierunek na zewnątrz | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].outward_direction_xyz |
+| TerminalLeadExtension.from_antenna_terminal.conductivity_spm | float | wymagany; tylko nazwany | $\mathrm{S\,m^{-1}}$ | skończona dodatnia, bez bool | jawna przewodność doprowadzenia | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].conductivity_spm |
+| TerminalLeadExtension.from_antenna_terminal.layers | int | 2; tylko nazwany | $1$ | dokładny int bez bool, 2–1048576; budżet łączny sprawdzany po siatce | liczba przedziałów ekstrudowania | authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED | current_modules[].external_lead_preparation.extensions[].layers |
+
+Obsługa wszystkich argumentów jest backend-neutral na etapie authoringu.
+Materializacja pozostaje istniejącą ścieżką FEM CPU/double; fabryka nie daje
+nowej obsługi FEM GPU, FDM CPU ani FDM GPU i nie kwalifikuje wykonania.
+Tabela podaje pełne ścieżki płaskiego `current_modules[]` w kanonicznym IR.
+`conductor_part_id` i `selector` nie tworzą dodatkowych pól IR.
+
+Jedynym właścicielem bajtowego kontraktu `fullmag.antenna-terminal-marker.v1`
+jest `packages/fullmag-py/src/fullmag/model/_antenna_terminal.py::antenna_terminal_marker`;
+mesher importuje tę samą funkcję z zachowaniem starej ścieżki importu.
+Fabryka oblicza dokładnie dotychczasowy marker, nie wyszukuje najbliższej ściany.
+Nieznana część może być zadeklarowana przed siatką, lecz brak jej markera
+powoduje odmowę podczas przygotowania. Sprawdzenie pełnego rzeczywistego capu,
+jego normalnych, właściciela i topologii nadal należy do
+`packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py::_cap`.
+Kierunek zewnętrzny pozostaje jawny także dla obróconej anteny.
+
+Eksport sceny do Python zachowuje równoważny konstruktor z `boundary_markers`,
+nie odtwarza utraconych z hasha `conductor_part_id` i `selector`. Dekoder odczytuje
+niezmienioną deklarację markerową. Regresje w
+`packages/fullmag-py/tests/test_antenna_terminal_authoring.py::AntennaTerminalAuthoringTests`
+obejmują znany marker 117762299, wspólnego właściciela z mesherem, odmowę
+niepoprawnych argumentów przed hashowaniem, brak fallbacku oraz round-trip
+renderera i dekodera. Sześć testów interpretowanych przeszło w istniejącym
+backendzie Docker (unittest, 0.059 s, exit 0); receipt
+`verification/sushruth-2020-reference/terminal-authoring-checks.json` przypina
+hashe kodu. Nie kompilowano testów Rust ani kodu native; ten wynik nie jest
+kwalifikacją meshingu, solvera ani walidacją całej noty.
+
+(antenna-sushruth-2020-gsg-source-contract)=
+##### Prerejestracja źródła GSG z pracy Sushruth i in. (2020)
+
+Przykład `examples/fem_antenna_sushruth_2020_gsg.py` deklaruje
+inspekcję źródła GSG według nominalnych wymiarów z sekcji IV i rysunku 6
+pracy [Sushruth i in., Physical Review Research 2, 043203 (2020)](https://doi.org/10.1103/PhysRevResearch.2.043203).
+Ten etap dotyczy rozkładu prądu i pola anteny. Nie odtwarza jeszcze warstwy
+Co/Ni, wzbudzenia fal spinowych ani eksperymentalnej transmisji.
+
+| Parametr przykładu | Typ i wartość | SI | Pochodzenie / ograniczenia | Docelowe mapowanie |
+|---|---|---|---|---|
+| Szerokość przewodników GSG (`conductor_width_m`) | float, 200 nm | $\mathrm m$ | nominalna szerokość $L$ z pracy; dodatnia | geometria `CPWAntennaLayout`, signal/return widths |
+| Szczelina signal–ground (`gap_m`) | float, 250 nm | $\mathrm m$ | nominalna szczelina z pracy; dodatnia | geometria `CPWAntennaLayout` |
+| Grubość metalu Al (`metal_thickness_m`) | float, 90 nm | $\mathrm m$ | nominalna grubość z pracy; dodatnia | wysokość brył przewodzących |
+| Separacja przez SiO2 (`insulator_thickness_m`) | float, 30 nm | $\mathrm m$ | nominalna separacja z pracy; spodnia powierzchnia metalu przy $z=30$ nm | położenie brył przewodzących |
+| Amplituda normalizacyjna $I$ (`signal_current_a`) | float, 1 mA | $\mathrm A$ | nasze wejście obliczeń; nie odczyt prądu eksperymentalnego | `CurrentSourceDrive.outer_terminal_currents_a` |
+| Prądy gałęzi signal, ground-left, ground-right | tuple[float,float,float], $(I,-I/2,-I/2)$ | $\mathrm A$ | jawne przeciwne kierunki powrotu; każda gałąź ma bilans terminali | pary zewnętrznych elektrod w `ExternalLeadPreparation` |
+| Długość przewodników (`source_length_m`) | float, 20 µm | $\mathrm m$ | nasze skończone okno źródła; podane w pracy 20 µm oznacza szerokość falowodu, nie ustaloną długość przewodników | geometria 3D anteny |
+| Długość każdego doprowadzenia (`lead_length_m`) | float, 2 µm | $\mathrm m$ | nasze jawne rozszerzenie terminala; nie zamknięcie obwodu | `TerminalLeadExtension.length_m` |
+| Liczba przedziałów doprowadzenia (`lead_layers`) | int, 20 | $1$ | nasze wejście; 2 µm / 20 = 100 nm na przedział, bez kwalifikacji zbieżności | `TerminalLeadExtension.layers` |
+| Przewodność jednorodnego metalu (`conductivity_s_per_m`) | float, $3.5\mathbin{\cdot}10^7$ | $\mathrm{S\,m^{-1}}$ | nasze założenie; brak dopasowania do pomiaru | materiał transportu i `TerminalLeadExtension.conductivity_spm` |
+| Obrót geometrii | jawna transformacja | $1$ | local $u$ w world $+y$, local $v$ w world $-x$; kierunki doprowadzeń zgodne z transformacją | transformacja obiektu i `outward_direction_xyz` |
+| Nośnik próbek pola (`sampling_length_m`, `sampling_width_m`, `sampling_depth_m`) | Box, 4 µm × 100 nm × 10 nm; środek (0,0,−5 nm) | $\mathrm m$ | niemagnetyczny nośnik $H$; nie model warstwy Co/Ni | geometria sampling target |
+| Rozmiar siatki wejściowej (`mesh_size_m`) | float, 100 nm | $\mathrm m$ | zgrubny preflight wejść; wymagane zagęszczanie i zbieżność | żądany rozmiar siatki FEM |
+
+Współrzędna $z=0$ oznacza górną powierzchnię nominalnej warstwy magnetycznej;
+środek 90-nanometrowego metalu leży przy $z=75$ nm. SiO2 określa tu wyłącznie
+odstęp; elektrostatyczny lub pełnofalowy model dielektryka nie jest aktywowany.
+Przewodzące doprowadzenia kończą się na zewnętrznych terminalach. Ten przykład
+nie określa pełnego powrotu poza nimi i nie dostarcza ograniczenia wkładu
+pominiętego obwodu do pola. Dlatego dopuszczalny status wyników to wyłącznie
+`inspection_only`: bez kwalifikowanej bazy do ponownego użycia, FFT wzbudzenia,
+LLG ani transmisji. Jest to oddzielny model od wcześniej zatwierdzonej pełnej
+pętli mikrostripowej i nie zastępuje jej geometrii ani źródła.
+
+Żądany backend przykładu to FEM CPU/double. Przed rzeczywistym wykonaniem
+zarówno wynik, jak i kwalifikacja tego przypadku pozostają NOT VERIFIED.
+FEM GPU, FDM CPU i FDM GPU nie są realizacjami tego prerejestrowanego etapu.
+Warunki przyjęcia wejścia obejmują rzeczywiste capy wszystkich sześciu
+terminali, jawne materiały, zachowanie kierunków i bilans prądów. Przyjęcie
+siatki nie dowodzi obliczenia $J$ lub $H$. Porównanie z pracą wymaga później
+oddzielnego uzgodnienia pola próbkowania, normalizacji, siatki i wpływu
+skończonego okna źródła; sam rysunek analityczny nie kwalifikuje tego modelu 3D.
+
+Kontrola wejścia 20.10.2026 przeszła przez publiczny loader oraz rzeczywisty
+Gmsh w istniejącym backendzie Docker: 4848 węzłów / 11357 Tet4 urządzenia,
+1008 węzłów / 2880 Tet4 doprowadzeń i 252 węzły / 520 Tet4 nośnika pola.
+Każdy z sześciu terminali ma osiem rzeczywistych ścian interfejsu; sprawdzono
+ich współrzędne, zbieżność wierzchołków po obu stronach i bilans zadanych
+prądów każdej gałęzi. Dwa interpretowane testy przykładu potwierdziły również
+zachowanie authoringu przy eksporcie Python/sceny, bez dodania magnetyzmu.
+Receipt `verification/sushruth-2020-reference/gsg-input-mesh-observation.json`
+i `gsg-example-checks.json` zapisano w wolumenie kontrolnym grupy.
+To wynik `input-mesh-prepared-not-solved`, nie rozwiązanie prądu ani pola;
+solver, zbieżność oraz porównanie z publikacją pozostają NOT VERIFIED.
 
 (antenna-execution-lead-materialization)=
 #### Materializacja kopii wykonawczej
@@ -7707,6 +7816,11 @@ Uzupełnienie E9b (mapping implementacji; build Windows i API50 nie stanowią kw
 | `apps/control-room/src/modules/viewport-3d/layers/antennaCurrentSurfaceMaterial.ts` | `createAntennaCurrentSurfaceMaterial`, `updateAntennaCurrentSurfaceMaterial` | wektor interpolowany przed normą, aktualizacja LUT/uniforms bez zmiany zasobów; kontrolowany browser/GPU PASS |
 | `apps/control-room/src/modules/viewport-3d/layers/AntennaFieldLayer.tsx` | `AntennaFieldLayer` | wspólne passy i śledzone zasoby GPU, stabilne UUID oraz owner cleanup; kontrolowany browser PASS |
 | `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-straight-lead-preparation` | planned private straight-stub input, explicit currents i conservative refusal; nie closed circuit |
+| `examples/fem_antenna_sushruth_2020_gsg.py` | `study` | deklaracja GSG FEM CPU/double; nie dowód wykonania |
+| `examples/fem_antenna_sushruth_2020_gsg.py` | `lead_layers` | 20 przedziałów doprowadzenia; jawne założenie źródła |
+| `packages/fullmag-py/src/fullmag/model/current_transport.py` | `TerminalLeadExtension.from_antenna_terminal` | semantyczna fabryka → istniejące markery; bez zmiany IR, runtime NOT VERIFIED |
+| `packages/fullmag-py/src/fullmag/model/_antenna_terminal.py` | `antenna_terminal_marker` | wspólny bajtowy kontrakt markera dla authoringu i meshera |
+| `packages/fullmag-py/tests/test_antenna_terminal_authoring.py` | `AntennaTerminalAuthoringTests` | regresje markera, walidacji i Python/scene round-trip; 6 interpretowanych testów PASS w Dockerze; bez native solve |
 | `packages/fullmag-py/src/fullmag/model/current_transport.py` | `TerminalLeadExtension`, `ExternalLeadPreparation` | publiczna SI-clean deklaracja, strict intent i jawne prepare na actual mesh; nie solved source |
 | `packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py` | `prepare_antenna_external_lead_source` | prywatna jawna preparacja actual cap → Tet4 leads i strict source MeshIR; bez solve |
 | `packages/fullmag-py/src/fullmag/runtime/scene_document.py` | `_decode_external_lead_preparation` | ścisły decoder sceny z default layers=2; brak unknown-field fallbacku |

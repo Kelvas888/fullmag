@@ -1834,6 +1834,48 @@
   ],
   "sources": [
     {
+      "id": "antenna-sushruth-2020-gsg-study",
+      "path": "examples/fem_antenna_sushruth_2020_gsg.py",
+      "symbol": "study",
+      "responsibility": "Jawna deklaracja GSG FEM CPU/double, źródła prądowego i niemagnetycznego nośnika pola.",
+      "evidence_status": "input_prepared_not_solved"
+    },
+    {
+      "id": "antenna-sushruth-2020-gsg-lead-layers",
+      "path": "examples/fem_antenna_sushruth_2020_gsg.py",
+      "symbol": "lead_layers",
+      "responsibility": "Jawne 20 przedziałów na doprowadzeniu długości 2 mikrometrów; brak kwalifikacji zbieżności.",
+      "evidence_status": "input_prepared_not_solved"
+    },
+    {
+      "id": "antenna-sushruth-2020-gsg-source-contract",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-sushruth-2020-gsg-source-contract",
+      "responsibility": "Prerejestrowane wejścia GSG: nominalne dane Sec IV/Fig6 oddzielone od własnego skończonego okna źródła i normalizacji; inspection only, no closure or transmission claim.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-semantic-terminal-factory",
+      "path": "packages/fullmag-py/src/fullmag/model/current_transport.py",
+      "symbol": "from_antenna_terminal",
+      "responsibility": "Keyword-only public semantic factory preserves existing marker IR and explicit direction.",
+      "evidence_status": "interpreted_checks_passed"
+    },
+    {
+      "id": "antenna-semantic-terminal-marker",
+      "path": "packages/fullmag-py/src/fullmag/model/_antenna_terminal.py",
+      "symbol": "antenna_terminal_marker",
+      "responsibility": "Single byte-identical marker owner reused by mesher and public factory.",
+      "evidence_status": "interpreted_checks_passed"
+    },
+    {
+      "id": "antenna-semantic-terminal-tests",
+      "path": "packages/fullmag-py/tests/test_antenna_terminal_authoring.py",
+      "symbol": "class AntennaTerminalAuthoringTests",
+      "responsibility": "Known marker, invalid semantics, actual cap missing-marker guard and scene/Python roundtrip regressions.",
+      "evidence_status": "interpreted_checks_passed"
+    },
+    {
       "id": "finite-k-shift-helper",
       "path": "crates/fullmag-runner/src/spin_wave_sampling.rs",
       "symbol": "dynamic_structure_factor_1d_with_axes",
@@ -5640,6 +5682,96 @@
   ],
   "public_api": {
     "parameters": [
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.id",
+        "type": "str",
+        "default": "wymagany; tylko nazwany",
+        "si_unit": "$1$",
+        "validation": "niepusty UTF-8 bez NUL, do 4096 bajtów",
+        "meaning": "ID elektrody",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].id"
+      },
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.observation_id",
+        "type": "str",
+        "default": "wymagany; tylko nazwany",
+        "si_unit": "$1$",
+        "validation": "niepusty UTF-8 bez NUL, do 4096 bajtów",
+        "meaning": "ID pasywnej obserwacji",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].observation_id"
+      },
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.object_id",
+        "type": "str",
+        "default": "wymagany; tylko nazwany",
+        "si_unit": "$1$",
+        "validation": "niepusty UTF-8 bez NUL, do 4096 bajtów; rzeczywisty właściciel sprawdzany po siatce",
+        "meaning": "niezmienny właściciel i wejście markera",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].object_id"
+      },
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.conductor_part_id",
+        "type": "str",
+        "default": "wymagany; tylko nazwany",
+        "si_unit": "$1$",
+        "validation": "niepusty UTF-8 bez NUL, do 4096 bajtów; istnienie markera sprawdzane po siatce",
+        "meaning": "ID części przewodnika; bez geometrycznego fallbacku",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].boundary_markers[0]"
+      },
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.selector",
+        "type": "str",
+        "default": "wymagany; tylko nazwany",
+        "si_unit": "$1$",
+        "validation": "niepusty UTF-8 bez NUL, do 4096 bajtów; po strip/lower tylko local_u_min lub local_u_max",
+        "meaning": "semantyczny koniec części przewodnika",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].boundary_markers[0]"
+      },
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.length_m",
+        "type": "float",
+        "default": "wymagany; tylko nazwany",
+        "si_unit": "$\\mathrm m$",
+        "validation": "skończony dodatni, bez bool",
+        "meaning": "długość doprowadzenia",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].length_m"
+      },
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.outward_direction_xyz",
+        "type": "tuple[float,float,float]",
+        "default": "wymagany; tylko nazwany",
+        "si_unit": "$1$",
+        "validation": "trzy skończone liczby bez bool; tolerancja normy 1e-12; bez automatycznej normalizacji",
+        "meaning": "jawny jednostkowy kierunek na zewnątrz",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].outward_direction_xyz"
+      },
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.conductivity_spm",
+        "type": "float",
+        "default": "wymagany; tylko nazwany",
+        "si_unit": "$\\mathrm{S\\,m^{-1}}$",
+        "validation": "skończona dodatnia, bez bool",
+        "meaning": "jawna przewodność doprowadzenia",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].conductivity_spm"
+      },
+      {
+        "python": "TerminalLeadExtension.from_antenna_terminal.layers",
+        "type": "int",
+        "default": "2; tylko nazwany",
+        "si_unit": "$1$",
+        "validation": "dokładny int bez bool, 2–1048576; budżet łączny sprawdzany po siatce",
+        "meaning": "liczba przedziałów ekstrudowania",
+        "backend_support": "authoring niezależny od backendu; przygotowanie FEM CPU/double; wykonanie NOT VERIFIED",
+        "problem_ir": "current_modules[].external_lead_preparation.extensions[].layers"
+      },
       {
         "python": "ExternalLeadPreparation.revision",
         "type": "str",
