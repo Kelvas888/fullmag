@@ -42,20 +42,24 @@ pub struct FeatureCapability {
     pub supported_layer_counts: Vec<u32>,
 }
 
-pub const MIXED_P1_MESH_FEATURE_CAPABILITY_IDS: [&str; 4] = [
+pub const MIXED_P1_MESH_FEATURE_CAPABILITY_IDS: [&str; 5] = [
     "mesh.topology.mixed_p1",
     "mesh.swept.prism",
     "mesh.transition.pyramid_tet",
     "mesh.exact_layer_count",
+    "mesh.topology.mixed_p1.v2.disconnected_bodies",
 ];
 
-pub const MIXED_P1_FEATURE_CAPABILITY_IDS: [&str; 6] = [
+pub const MIXED_P1_FEATURE_CAPABILITY_IDS: [&str; 9] = [
     "mesh.topology.mixed_p1",
     "mesh.swept.prism",
     "mesh.transition.pyramid_tet",
     "mesh.exact_layer_count",
     "fem.cpu.exchange_demag.mixed_p1",
     "fem.gpu.exchange_demag.mixed_p1",
+    "mesh.topology.mixed_p1.v2.disconnected_bodies",
+    "fem.cpu.exchange_demag.mixed_p1.disconnected_bodies",
+    "fem.gpu.exchange_demag.mixed_p1.disconnected_bodies",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,6 +581,10 @@ fn mixed_p1_feature_capabilities(
         "Mixed-P1 shared-domain topology is FEM-only; FDM retains Cartesian cells.";
     const OPERATOR_SCOPE: &str =
         "double; one axis-aligned P1 Box; one conforming shared-domain airbox; requested_layers=realized_layers={1,2,3}; magnetic_node_planes=requested_layers+1; uniform Ms/Aex/Ku1/Ku2 and one anisotropy axis; exchange; uniform Zeeman; Poisson Robin|Dirichlet; PG-BB|NCG|overdamped LLG; no fallback";
+    const V2_MESH_SCOPE: &str =
+        "positive-gap disconnected bodies; body-owned P1 material fields; prism6/tet4 magnetic regions; no contact or bridge";
+    const V2_OPERATOR_SCOPE: &str =
+        "double; positive-gap disconnected bodies; body-owned Ms/Aex/alpha/Ku1/anisU; exchange remains body-local; shared-domain Poisson demag; strict; no fallback";
 
     let mesh_status = match fem_engine {
         Some(FemEngine::CpuNative | FemEngine::NativeGpu) => FeatureCapabilityStatus::Implemented,
@@ -585,6 +593,12 @@ fn mixed_p1_feature_capabilities(
     let mesh_reason = match fem_engine {
         Some(FemEngine::CpuNative | FemEngine::NativeGpu) => {
             "Implemented for the certificate-bound explicit CPU/GPU double strict relaxation scope; managed public runtime proof is still pending."
+        }
+        None => FDM_REASON,
+    };
+    let v2_mesh_reason = match fem_engine {
+        Some(FemEngine::CpuNative | FemEngine::NativeGpu) => {
+            "Implemented for the certificate-bound positive-gap disconnected-body source contract; managed public runtime, parity and physics proof are still pending."
         }
         None => FDM_REASON,
     };
@@ -621,6 +635,10 @@ fn mixed_p1_feature_capabilities(
                 "requested_layers=realized_layers={1,2,3}; magnetic_node_planes=requested_layers+1; accepted topology-bound certificate required",
             ),
         ),
+        (
+            "mesh.topology.mixed_p1.v2.disconnected_bodies".to_string(),
+            feature_capability(mesh_status, v2_mesh_reason, V2_MESH_SCOPE),
+        ),
     ]);
     for id in MIXED_P1_MESH_FEATURE_CAPABILITY_IDS {
         features
@@ -629,9 +647,31 @@ fn mixed_p1_feature_capabilities(
             .supported_layer_counts = vec![1, 2, 3];
     }
 
-    for (id, owner) in [
-        ("fem.cpu.exchange_demag.mixed_p1", FemEngine::CpuNative),
-        ("fem.gpu.exchange_demag.mixed_p1", FemEngine::NativeGpu),
+    for (id, owner, scope, implemented_reason) in [
+        (
+            "fem.cpu.exchange_demag.mixed_p1",
+            FemEngine::CpuNative,
+            OPERATOR_SCOPE,
+            "Implemented for the bounded certified mixed-P1 relaxation lane on this device; not production executable until managed public runtime proof is stored.",
+        ),
+        (
+            "fem.gpu.exchange_demag.mixed_p1",
+            FemEngine::NativeGpu,
+            OPERATOR_SCOPE,
+            "Implemented for the bounded certified mixed-P1 relaxation lane on this device; not production executable until managed public runtime proof is stored.",
+        ),
+        (
+            "fem.cpu.exchange_demag.mixed_p1.disconnected_bodies",
+            FemEngine::CpuNative,
+            V2_OPERATOR_SCOPE,
+            "Implemented for the positive-gap disconnected-body source contract; managed CPU runtime, operator execution, parity and physics proof are still pending and no public executable capability is claimed.",
+        ),
+        (
+            "fem.gpu.exchange_demag.mixed_p1.disconnected_bodies",
+            FemEngine::NativeGpu,
+            V2_OPERATOR_SCOPE,
+            "Implemented for the positive-gap disconnected-body source contract; managed GPU runtime, device residency, parity and physics proof are still pending and no public executable capability is claimed.",
+        ),
     ] {
         let status = if fem_engine == Some(owner) {
             FeatureCapabilityStatus::Implemented
@@ -639,16 +679,11 @@ fn mixed_p1_feature_capabilities(
             FeatureCapabilityStatus::Unsupported
         };
         let reason = match fem_engine {
-            Some(engine) if engine == owner => {
-                "Implemented for the bounded certified mixed-P1 relaxation lane on this device; not production executable until managed public runtime proof is stored."
-            }
+            Some(engine) if engine == owner => implemented_reason,
             Some(_) => "The capability belongs to the other FEM device lane.",
             None => FDM_REASON,
         };
-        features.insert(
-            id.to_string(),
-            feature_capability(status, reason, OPERATOR_SCOPE),
-        );
+        features.insert(id.to_string(), feature_capability(status, reason, scope));
     }
 
     features
@@ -1173,11 +1208,23 @@ mod tests {
                     FeatureCapabilityStatus::Implemented,
                 ),
                 (
+                    "mesh.topology.mixed_p1.v2.disconnected_bodies",
+                    FeatureCapabilityStatus::Implemented,
+                ),
+                (
                     "fem.cpu.exchange_demag.mixed_p1",
                     FeatureCapabilityStatus::Implemented,
                 ),
                 (
                     "fem.gpu.exchange_demag.mixed_p1",
+                    FeatureCapabilityStatus::Unsupported,
+                ),
+                (
+                    "fem.cpu.exchange_demag.mixed_p1.disconnected_bodies",
+                    FeatureCapabilityStatus::Implemented,
+                ),
+                (
+                    "fem.gpu.exchange_demag.mixed_p1.disconnected_bodies",
                     FeatureCapabilityStatus::Unsupported,
                 ),
             ]),
@@ -1215,6 +1262,13 @@ mod tests {
         assert!(cpu_operator
             .scope
             .contains("uniform Ms/Aex/Ku1/Ku2 and one anisotropy axis"));
+        let cpu_v2_operator =
+            &capabilities.feature_capabilities["fem.cpu.exchange_demag.mixed_p1.disconnected_bodies"];
+        assert_eq!(cpu_v2_operator.status, FeatureCapabilityStatus::Implemented);
+        assert!(cpu_v2_operator.scope.contains("positive-gap disconnected bodies"));
+        assert!(cpu_v2_operator
+            .reason
+            .contains("managed CPU runtime, operator execution, parity and physics proof"));
     }
 
     #[test]
@@ -1227,6 +1281,16 @@ mod tests {
         );
         assert_eq!(
             mixed_p1_statuses(&capabilities).get("fem.gpu.exchange_demag.mixed_p1"),
+            Some(&FeatureCapabilityStatus::Implemented),
+        );
+        assert_eq!(
+            mixed_p1_statuses(&capabilities)
+                .get("fem.cpu.exchange_demag.mixed_p1.disconnected_bodies"),
+            Some(&FeatureCapabilityStatus::Unsupported),
+        );
+        assert_eq!(
+            mixed_p1_statuses(&capabilities)
+                .get("fem.gpu.exchange_demag.mixed_p1.disconnected_bodies"),
             Some(&FeatureCapabilityStatus::Implemented),
         );
         for id in &MIXED_P1_MESH_FEATURE_CAPABILITY_IDS {
@@ -1257,6 +1321,13 @@ mod tests {
         assert!(gpu_operator
             .scope
             .contains("uniform Ms/Aex/Ku1/Ku2 and one anisotropy axis"));
+        let gpu_v2_operator =
+            &capabilities.feature_capabilities["fem.gpu.exchange_demag.mixed_p1.disconnected_bodies"];
+        assert_eq!(gpu_v2_operator.status, FeatureCapabilityStatus::Implemented);
+        assert!(gpu_v2_operator.scope.contains("positive-gap disconnected bodies"));
+        assert!(gpu_v2_operator
+            .reason
+            .contains("managed GPU runtime, device residency, parity and physics proof"));
     }
 
     #[test]
@@ -1265,7 +1336,7 @@ mod tests {
             let capabilities =
                 capabilities_for_fdm_engine(engine, FdmCapabilityProfile::SingleGrid);
 
-            assert_eq!(capabilities.feature_capabilities.len(), 7);
+            assert_eq!(capabilities.feature_capabilities.len(), 10);
             assert!(MIXED_P1_FEATURE_CAPABILITY_IDS.iter().all(|id| {
                 capabilities.feature_capabilities[*id].status
                     == FeatureCapabilityStatus::Unsupported
@@ -1299,13 +1370,13 @@ mod tests {
             (FemEngine::NativeGpu, "fem.gpu.exchange_demag.mixed_p1"),
         ] {
             let capabilities = capabilities_for_fem_engine(engine);
-            assert_eq!(capabilities.feature_capabilities.len(), 7);
+            assert_eq!(capabilities.feature_capabilities.len(), 10);
 
             let encoded = serde_json::to_value(capabilities).expect("serialize capabilities");
             let features = encoded["feature_capabilities"]
                 .as_object()
                 .expect("feature capabilities serialize as an object");
-            assert_eq!(features.len(), 7);
+            assert_eq!(features.len(), 10);
             assert_eq!(features["mesh.topology.mixed_p1"]["status"], "implemented");
             assert_eq!(features[operator_id]["status"], "implemented");
             for id in MIXED_P1_FEATURE_CAPABILITY_IDS {
