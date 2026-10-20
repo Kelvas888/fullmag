@@ -854,6 +854,8 @@ describe("Viewport3DScene scale helpers", () => {
     expect(postProcessingSource).toContain(
       "viewport3DPostProcessingEnabledFromBrowserConfig",
     );
+    expect(postProcessingSource).toContain("return enableViewport3DHudRaycasting(raycaster);");
+    expect(postProcessingSource).not.toContain("raycaster.layers.mask = previousMask");
     expect(source).toContain(
       "viewport3DSceneLayersEnabledFromBrowserConfig",
     );

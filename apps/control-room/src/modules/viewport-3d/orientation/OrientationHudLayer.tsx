@@ -15,7 +15,7 @@ import {
 } from "three";
 
 import { viewport3dStore } from "../viewport3dStore";
-import { enableViewport3DHudRaycasting, VIEWPORT_3D_HUD_LAYER } from "../viewport3dHudLayer";
+import { VIEWPORT_3D_HUD_LAYER } from "../viewport3dHudLayer";
 import {
   markViewport3DCameraGestureChanged,
   settleViewport3DCameraGesture,
@@ -87,11 +87,6 @@ export const OrientationHudLayer = memo(function OrientationHudLayer({
   viewCubeVisible,
 }: OrientationHudLayerProps) {
   const camera = useThree((state) => state.camera);
-  const raycaster = useThree((state) => state.raycaster);
-  useEffect(() => {
-    if (!viewCubeVisible) return;
-    return enableViewport3DHudRaycasting(raycaster);
-  }, [raycaster, viewCubeVisible]);
   const invalidate = useBatchedInvalidate("camera");
   const controls = useThree((state) =>
     "controls" in state

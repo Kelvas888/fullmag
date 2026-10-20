@@ -7,7 +7,7 @@ import { useEffect } from "react";
 import { viewport3DPostProcessingEnabledFromBrowserConfig } from "@/kernel/browserFullmagConfig";
 import { useViewport3DCommandState, viewport3dStore } from "../viewport3dStore";
 import { useBatchedInvalidate } from "../viewport3dBatchedInvalidate";
-import { VIEWPORT_3D_HUD_LAYER } from "../viewport3dHudLayer";
+import { enableViewport3DHudRaycasting, VIEWPORT_3D_HUD_LAYER } from "../viewport3dHudLayer";
 
 /** Owns render ordering even when effects are off. Never schedules continuous frames. */
 export function PostProcessingLayer({ quantitativeDataVisible = false, sceneSpan = 1 }: {
@@ -30,9 +30,7 @@ export function PostProcessingLayer({ quantitativeDataVisible = false, sceneSpan
     return () => { gl.info.autoReset = previous; };
   }, [getThree]);
   useEffect(() => {
-    const previousMask = raycaster.layers.mask;
-    raycaster.layers.enable(VIEWPORT_3D_HUD_LAYER);
-    return () => { raycaster.layers.mask = previousMask; };
+    return enableViewport3DHudRaycasting(raycaster);
   }, [raycaster]);
   useEffect(() => {
     viewport3dStore.setPostProcessingDataProtection(quantitativeDataVisible);
