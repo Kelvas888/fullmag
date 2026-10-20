@@ -21,7 +21,6 @@ import {
 
 export type Viewport3DLightingAppearance = Pick<
   Viewport3DAppearancePreferences,
-  | "fieldShading"
   | "lightingAzimuth"
   | "lightingElevation"
   | "lightingIntensity"
@@ -79,7 +78,7 @@ export function resolveViewport3DLightingRig(
     DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES,
 ): Viewport3DLightingRigModel {
   const studioEnabled = appearance.lightingMode === "studio";
-  const rigEnabled = studioEnabled || appearance.fieldShading;
+  const rigEnabled = studioEnabled;
   const intensity = clampLightingIntensity(appearance.lightingIntensity);
   const keyDirection = directionFromAngles(
     appearance.lightingAzimuth,

@@ -79,7 +79,8 @@ export function Viewport3DSettingsDialog({ onCommand }: { onCommand: (id: string
         <div className="fm-viewport-3d__settings-body">
           <SettingsSection title="Background" onReset={() => onCommand("viewport-3d.reset-appearance-background")}>
             <Choice id="fm-view-background" label="Background" value={a.backgroundMode} options={[["gradient", "Subtle gradient"], ["solid", "Solid"]]} onChange={(v) => viewport3dStore.setAppearance({ backgroundMode: v as typeof a.backgroundMode })} />
-            <Range id="fm-view-background-strength" label="Gradient strength" value={a.backgroundStrength} min={0} max={1} step={0.05} onChange={(backgroundStrength) => viewport3dStore.setAppearance({ backgroundStrength })} />
+            <Range id="fm-view-background-strength" label="Gradient strength" value={a.backgroundStrength} min={0} max={1} step={0.05} disabled={a.backgroundMode === "solid"} onChange={(backgroundStrength) => viewport3dStore.setAppearance({ backgroundStrength })} />
+            {a.backgroundMode === "solid" ? <p>Gradient strength applies only with a gradient background.</p> : null}
           </SettingsSection>
           <SettingsSection title="Grid and scale" onReset={() => onCommand("viewport-3d.reset-appearance-frame")}>
             <Choice id="fm-view-frame" label="Reference frame" value={state.widgets.dimensionFrameMode} options={[["floor", "Floor"], ["cage", "Floor and vertical planes"], ["off", "Off"]]} onChange={(v) => viewport3dStore.setDimensionFrameMode(v as typeof state.widgets.dimensionFrameMode)} />
@@ -92,11 +93,11 @@ export function Viewport3DSettingsDialog({ onCommand }: { onCommand: (id: string
           </SettingsSection>
           <SettingsSection title="Geometry lighting" onReset={() => onCommand("viewport-3d.reset-appearance-lighting")}>
             <Choice id="fm-view-lighting" label="Geometry appearance" value={a.lightingMode} options={[["studio", "Studio"], ["flat", "Flat"]]} onChange={(v) => viewport3dStore.setAppearance({ lightingMode: v as typeof a.lightingMode })} />
-            <Choice id="fm-view-light-space" label="Lighting reference" value={a.lightingSpace} options={[["camera", "Follow camera"], ["world", "Lock to world"]]} onChange={(v) => viewport3dStore.setAppearance({ lightingSpace: v as typeof a.lightingSpace })} />
-            <Range id="fm-view-light-strength" label="Light intensity" value={a.lightingIntensity} min={0} max={2} step={0.05} onChange={(lightingIntensity) => viewport3dStore.setAppearance({ lightingIntensity })} />
-            <Range id="fm-view-light-azimuth" label="Light azimuth (deg)" value={a.lightingAzimuth} min={-180} max={180} step={1} onChange={(lightingAzimuth) => viewport3dStore.setAppearance({ lightingAzimuth })} />
-            <Range id="fm-view-light-elevation" label="Light elevation (deg)" value={a.lightingElevation} min={-85} max={85} step={1} onChange={(lightingElevation) => viewport3dStore.setAppearance({ lightingElevation })} />
-            <EffectToggle id="fm-view-field-shading" label="Shade field surfaces" description="Optional shape cue. Shaded brightness no longer matches the numerical color legend exactly." enabled={a.fieldShading} onToggle={(fieldShading) => viewport3dStore.setAppearance({ fieldShading })} />
+            <Choice id="fm-view-light-space" label="Lighting reference" value={a.lightingSpace} options={[["camera", "Follow camera"], ["world", "Lock to world"]]} disabled={a.lightingMode === "flat"} onChange={(v) => viewport3dStore.setAppearance({ lightingSpace: v as typeof a.lightingSpace })} />
+            <Range id="fm-view-light-strength" label="Light intensity" value={a.lightingIntensity} min={0} max={2} step={0.05} disabled={a.lightingMode === "flat"} onChange={(lightingIntensity) => viewport3dStore.setAppearance({ lightingIntensity })} />
+            <Range id="fm-view-light-azimuth" label="Light azimuth (deg)" value={a.lightingAzimuth} min={-180} max={180} step={1} disabled={a.lightingMode === "flat"} onChange={(lightingAzimuth) => viewport3dStore.setAppearance({ lightingAzimuth })} />
+            <Range id="fm-view-light-elevation" label="Light elevation (deg)" value={a.lightingElevation} min={-85} max={85} step={1} disabled={a.lightingMode === "flat"} onChange={(lightingElevation) => viewport3dStore.setAppearance({ lightingElevation })} />
+            {a.lightingMode === "flat" ? <p>Flat geometry uses unlit materials; studio light controls are inactive.</p> : null}
           </SettingsSection>
           <SettingsSection title="Camera">
             <p>Camera position and target use meters (SI). Camera state belongs to the current session or inspected dataset.</p>
@@ -152,10 +153,10 @@ function SettingsSection({ title, onReset, children }: { title: string; onReset?
   return <fieldset className="fm-viewport-3d__settings-section"><legend>{title}</legend>{children}{onReset ? <Button size="sm" variant="secondary" onClick={onReset}>Reset {title.toLowerCase()}</Button> : null}</fieldset>;
 }
 
-function Choice({ id, label, value, options, onChange }: { id: string; label: string; value: string; options: readonly (readonly [string, string])[]; onChange: (value: string) => void }) {
-  return <div className="fm-viewport-3d__settings-field"><label htmlFor={id}>{label}</label><Select value={value} onValueChange={onChange}><SelectTrigger id={id}><SelectValue /></SelectTrigger><SelectContent>{options.map(([key, text]) => <SelectItem key={key} value={key}>{text}</SelectItem>)}</SelectContent></Select></div>;
+function Choice({ id, label, value, options, disabled = false, onChange }: { id: string; label: string; value: string; options: readonly (readonly [string, string])[]; disabled?: boolean; onChange: (value: string) => void }) {
+  return <div className="fm-viewport-3d__settings-field"><label htmlFor={id}>{label}</label><Select value={value} disabled={disabled} onValueChange={onChange}><SelectTrigger id={id}><SelectValue /></SelectTrigger><SelectContent>{options.map(([key, text]) => <SelectItem key={key} value={key}>{text}</SelectItem>)}</SelectContent></Select></div>;
 }
 
-function Range({ id, label, value, min, max, step, onChange }: { id: string; label: string; value: number; min: number; max: number; step: number; onChange: (value: number) => void }) {
-  return <div className="fm-viewport-3d__settings-field"><label htmlFor={id}>{label} <output htmlFor={id}>{Number(value.toFixed(3))}</output></label><input id={id} type="range" value={value} min={min} max={max} step={step} onChange={(event) => onChange(event.currentTarget.valueAsNumber)} /></div>;
+function Range({ id, label, value, min, max, step, disabled = false, onChange }: { id: string; label: string; value: number; min: number; max: number; step: number; disabled?: boolean; onChange: (value: number) => void }) {
+  return <div className="fm-viewport-3d__settings-field"><label htmlFor={id}>{label} <output htmlFor={id}>{Number(value.toFixed(3))}</output></label><input id={id} type="range" value={value} min={min} max={max} step={step} disabled={disabled} onChange={(event) => onChange(event.currentTarget.valueAsNumber)} /></div>;
 }

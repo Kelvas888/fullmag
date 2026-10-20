@@ -22,20 +22,20 @@ describe("viewport3D material profile", () => {
     expect(capture.magneticSurface.toneMapped).toBe(false);
   });
 
-  it("enables field color shading only when appearance explicitly requests it", () => {
-    const interactive = resolveViewport3DMaterialProfile(
+  it("keeps quantitative field colors unshaded in both geometry lighting modes", () => {
+    const studio = resolveViewport3DMaterialProfile(
       getViewport3DVisualProfile("interactive"),
-      { fieldShading: true, lightingIntensity: 1, lightingMode: "studio" },
+      { lightingMode: "studio" },
     );
-    const capture = resolveViewport3DMaterialProfile(
+    const flat = resolveViewport3DMaterialProfile(
       getViewport3DVisualProfile("capture"),
-      { fieldShading: true, lightingIntensity: 1, lightingMode: "studio" },
+      { lightingMode: "flat" },
     );
 
-    expect(interactive.magneticSurface.shadeStrength).toBe(0.45);
-    expect(capture.magneticSurface.shadeStrength).toBe(0.45);
-    expect(interactive.fieldColorShading).toBe(true);
-    expect(capture.fieldColorShading).toBe(true);
+    expect(studio.magneticSurface.shadeStrength).toBe(0);
+    expect(flat.magneticSurface.shadeStrength).toBe(0);
+    expect(studio).not.toHaveProperty("fieldColorShading");
+    expect(flat).not.toHaveProperty("fieldColorShading");
   });
 
   it("keeps lite materials un-tonemapped", () => {
@@ -58,7 +58,6 @@ describe("viewport3D material profile", () => {
     });
     expect(interactive.primitivePreview).toEqual({ toneMapped: false });
     expect(interactive.uniformGeometry.lit).toBe(true);
-    expect(interactive.fieldColorShading).toBe(false);
     expect(interactive.magneticSurface).not.toHaveProperty("metalness");
     expect(interactive.magneticSurface).not.toHaveProperty("roughness");
     expect(interactive.primitivePreview).not.toHaveProperty("emissiveIntensity");
@@ -79,11 +78,10 @@ describe("viewport3D material profile", () => {
   it("supports flat uniform geometry without changing quantitative shading", () => {
     const flat = resolveViewport3DMaterialProfile(
       getViewport3DVisualProfile("interactive"),
-      { fieldShading: false, lightingIntensity: 1, lightingMode: "flat" },
+      { lightingMode: "flat" },
     );
 
     expect(flat.uniformGeometry.lit).toBe(false);
-    expect(flat.fieldColorShading).toBe(false);
     expect(flat.magneticSurface.shadeStrength).toBe(0);
   });
 

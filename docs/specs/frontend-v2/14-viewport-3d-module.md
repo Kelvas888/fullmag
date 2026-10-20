@@ -216,8 +216,9 @@ reserved HUD rectangles. Orientation widgets and reference text use a dedicated
 render layer within the same scene and renderer, composited after geometry
 effects. Picking must continue to include interactive orientation widgets.
 
-Quantitative field colors are unlit and un-tonemapped by default. Optional field
-shape shading is an explicit appearance choice with a visible qualification.
+Quantitative field colors are always unlit and un-tonemapped. Studio lighting
+controls apply only to uniform solid geometry; no appearance or quality-profile
+choice may modulate scientific field colors.
 Global AO/Bloom are suppressed while scientific field buffers are displayed;
 requested and effective states and the protection reason remain visible. AO
 radius is a fraction of the scene span, not a fixed number of meters. No effect

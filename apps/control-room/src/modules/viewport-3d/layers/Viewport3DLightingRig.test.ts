@@ -44,17 +44,4 @@ describe("Viewport3DLightingRig", () => {
     expect(figure.hemisphere).toBe(interactive.hemisphere);
     expect(figure.ambient.intensity).toBe(interactive.ambient.intensity);
   });
-
-  it("enables the rig when explicit field shading is used in flat geometry mode", () => {
-    const rig = resolveViewport3DLightingRig(
-      getViewport3DVisualProfile("interactive"),
-      {
-        ...DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES,
-        lightingMode: "flat",
-        fieldShading: true,
-      },
-    );
-
-    expect(rig.directional).toHaveLength(2);
-  });
 });

@@ -12,7 +12,6 @@ export interface Viewport3DAppearancePreferences {
   lightingAzimuth: number;
   lightingElevation: number;
   lightingSpace: Viewport3DLightingSpace;
-  fieldShading: boolean;
   dimensionOrigin: Viewport3DDimensionOrigin;
   gridOpacity: number;
   aoIntensity: number;
@@ -36,7 +35,6 @@ export const DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES = Object.freeze({
   lightingAzimuth: -35,
   lightingElevation: 45,
   lightingSpace: "camera",
-  fieldShading: false,
   dimensionOrigin: "frame-center",
   gridOpacity: 1,
   aoIntensity: 1,
@@ -135,7 +133,6 @@ export function normalizeViewport3DAppearancePreferences(
     lightingAzimuth: numericValue(record.lightingAzimuth, APPEARANCE_NUMERIC_BOUNDS.lightingAzimuth, defaults.lightingAzimuth),
     lightingElevation: numericValue(record.lightingElevation, APPEARANCE_NUMERIC_BOUNDS.lightingElevation, defaults.lightingElevation),
     lightingSpace: enumValue(record.lightingSpace, APPEARANCE_ENUMS.lightingSpace, defaults.lightingSpace),
-    fieldShading: booleanValue(record.fieldShading, defaults.fieldShading),
     dimensionOrigin: enumValue(record.dimensionOrigin, APPEARANCE_ENUMS.dimensionOrigin, defaults.dimensionOrigin),
     gridOpacity: numericValue(record.gridOpacity, APPEARANCE_NUMERIC_BOUNDS.gridOpacity, defaults.gridOpacity),
     aoIntensity: numericValue(record.aoIntensity, APPEARANCE_NUMERIC_BOUNDS.aoIntensity, defaults.aoIntensity),
@@ -159,7 +156,6 @@ export function applyViewport3DAppearancePatch(
   if (isFiniteNumber(record.lightingAzimuth)) next.lightingAzimuth = clamp(record.lightingAzimuth, APPEARANCE_NUMERIC_BOUNDS.lightingAzimuth);
   if (isFiniteNumber(record.lightingElevation)) next.lightingElevation = clamp(record.lightingElevation, APPEARANCE_NUMERIC_BOUNDS.lightingElevation);
   if (isEnumValue(record.lightingSpace, APPEARANCE_ENUMS.lightingSpace)) next.lightingSpace = record.lightingSpace;
-  if (typeof record.fieldShading === "boolean") next.fieldShading = record.fieldShading;
   if (isEnumValue(record.dimensionOrigin, APPEARANCE_ENUMS.dimensionOrigin)) next.dimensionOrigin = record.dimensionOrigin;
   if (isFiniteNumber(record.gridOpacity)) next.gridOpacity = clamp(record.gridOpacity, APPEARANCE_NUMERIC_BOUNDS.gridOpacity);
   if (isFiniteNumber(record.aoIntensity)) next.aoIntensity = clamp(record.aoIntensity, APPEARANCE_NUMERIC_BOUNDS.aoIntensity);

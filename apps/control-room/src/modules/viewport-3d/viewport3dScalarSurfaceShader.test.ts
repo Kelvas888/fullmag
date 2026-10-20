@@ -386,10 +386,28 @@ describe("viewport3dScalarSurfaceShader", () => {
       material.dispose();
     });
 
-    it("defines vNormalView and computes shaded color in fragment shaders", () => {
+    it("defaults quantitative field shading to zero", () => {
+      const material = createScalarSurfaceShaderMaterial(scalarBuffer([1, 2]), {
+        depthTest: true,
+        depthWrite: true,
+        opacity: 1,
+        polygonOffset: false,
+        polygonOffsetFactor: 0,
+        polygonOffsetUnits: 0,
+        side: 0,
+        transparent: false,
+      });
+
+      expect(material.uniforms.fmShadeStrength.value).toBe(0);
+      material.dispose();
+    });
+
+    it("skips normal and light calculations unless nonzero shape shading is requested", () => {
       expect(source).toContain("varying vec3 vNormalView;");
       expect(source).toContain("vNormalView = normalize(normalMatrix * normal);");
-      expect(source).toContain("vec3 shaded = base * mix(1.0, 0.55 + 0.75 * ndl, fmShadeStrength);");
+      const guardedLighting =
+        /if \(fmShadeStrength > 0\.0\) \{\s*vec3 n = normalize\(vNormalView\)[\s\S]*?shaded = base \* mix\(1\.0, 0\.55 \+ 0\.75 \* ndl, fmShadeStrength\);\s*\}/g;
+      expect(source.match(guardedLighting)).toHaveLength(2);
     });
   });
 

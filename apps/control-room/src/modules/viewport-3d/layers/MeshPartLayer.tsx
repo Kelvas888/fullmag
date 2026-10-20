@@ -988,9 +988,8 @@ export const MeshPartLayer = memo(function MeshPartLayer({
   );
   const surfacePolicy = surfacePassPolicies.back;
   const surfacePolicyFront = surfacePassPolicies.front;
-  const litSurfaceMaterial = hasUploadedVertexScalarColors
-    ? materialProfile.fieldColorShading
-    : materialProfile.uniformGeometry.lit;
+  const litSurfaceMaterial =
+    !hasUploadedVertexScalarColors && materialProfile.uniformGeometry.lit;
   const scalarShaderBuffer = committedScalarColorState.buffer;
   // Stable "program shape" key: null when there is no buffer, otherwise one of 4 strings
   // (scalar/orientation × real/complex). Deliberately does NOT depend on scalarShaderBuffer's
@@ -1032,16 +1031,16 @@ export const MeshPartLayer = memo(function MeshPartLayer({
     // Add normals only for an explicitly lit pass; keep the same geometry and
     // shared topology position buffer when appearance settings change.
     if (!geometry || geometry.getAttribute("normal")) return;
-    // The existing shader still normalizes vNormalView even at zero strength.
-    // Keep that input valid so a zero normal cannot poison an unlit data color.
-    const shaderNeedsNormals = Boolean(scalarShaderMaterial);
-    const vertexColorNeedsNormals =
-      hasUploadedVertexScalarColors && materialProfile.fieldColorShading;
+    // Quantitative scalar shaders skip lighting when strength is zero, so they
+    // do not need generated normals. Keep normals for explicitly lit geometry.
+    const shaderNeedsNormals =
+      Boolean(scalarShaderMaterial) &&
+      materialProfile.magneticSurface.shadeStrength > 0;
     const uniformSurfaceNeedsNormals =
       !hasUploadedVertexScalarColors &&
       !scalarShaderMaterial &&
       materialProfile.uniformGeometry.lit;
-    if (!shaderNeedsNormals && !vertexColorNeedsNormals && !uniformSurfaceNeedsNormals) {
+    if (!shaderNeedsNormals && !uniformSurfaceNeedsNormals) {
       return;
     }
     geometry.computeVertexNormals();
@@ -1050,7 +1049,6 @@ export const MeshPartLayer = memo(function MeshPartLayer({
     geometry,
     hasUploadedVertexScalarColors,
     invalidate,
-    materialProfile.fieldColorShading,
     materialProfile.magneticSurface.shadeStrength,
     materialProfile.uniformGeometry.lit,
     scalarShaderMaterial,

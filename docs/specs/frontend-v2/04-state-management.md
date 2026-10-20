@@ -143,6 +143,10 @@ bounded: background strength 0–1, lighting intensity 0–2, azimuth −180–1
 elevation −90–90°, grid opacity 0.25–2, AO intensity 0–3, and AO radius 0–1 of
 the domain size.
 
+Geometry-lighting preferences affect uniform solid geometry only. Quantitative
+field colors remain unlit and un-tonemapped; a legacy `fieldShading` key is
+ignored as an unknown appearance field.
+
 `appearanceDiagnostics` separates requested and effective AO, Bloom, and
 antialias flags. A requested effect suppressed by protected quantitative field
 colors, browser post-processing disablement, or a technical profile limit

@@ -1118,9 +1118,7 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     colors.mesh,
     usesInstanceColors,
   );
-  const litSurface = usesInstanceColors
-    ? materialProfile.fieldColorShading
-    : materialProfile.uniformGeometry.lit;
+  const litSurface = !usesInstanceColors && materialProfile.uniformGeometry.lit;
   const surfaceMaterial = useMemo(
     () => {
       const MaterialConstructor = litSurface

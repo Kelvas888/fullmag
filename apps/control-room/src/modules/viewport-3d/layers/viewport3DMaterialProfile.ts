@@ -8,11 +8,10 @@ import type { Viewport3DVisualProfile } from "../viewport3dVisualProfile";
 
 type Viewport3DMaterialAppearance = Pick<
   Viewport3DAppearancePreferences,
-  "fieldShading" | "lightingIntensity" | "lightingMode"
+  "lightingMode"
 >;
 
 export interface Viewport3DMaterialProfile {
-  fieldColorShading: boolean;
   airSurface: Pick<
     MeshBasicMaterialParameters,
     | "toneMapped"
@@ -66,19 +65,14 @@ export function resolveViewport3DMaterialProfile(
     DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES,
 ): Viewport3DMaterialProfile {
   const figureBoost = visualProfile.lighting === "figure" ? 1 : 0;
-  const fieldColorShading = appearance.fieldShading;
-  const lightingIntensity = Number.isFinite(appearance.lightingIntensity)
-    ? Math.min(2, Math.max(0, appearance.lightingIntensity))
-    : 1;
   return {
-    fieldColorShading,
     airSurface: {
       toneMapped: visualProfile.toneMapping !== "none",
     },
     magneticSurface: {
-      // Quantitative colors stay unmodulated unless shape shading is explicitly
-      // requested. Keep tone mapping out of data colors across quality profiles.
-      shadeStrength: fieldColorShading ? 0.45 * lightingIntensity : 0,
+      // Quantitative field colors are always kept independent of geometry light.
+      // Keep tone mapping out of data colors across quality profiles as well.
+      shadeStrength: 0,
       toneMapped: false,
     },
     primitivePreview: {

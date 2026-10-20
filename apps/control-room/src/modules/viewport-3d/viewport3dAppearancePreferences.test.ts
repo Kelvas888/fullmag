@@ -20,7 +20,6 @@ describe("viewport3dAppearancePreferences", () => {
       lightingAzimuth: -35,
       lightingElevation: 45,
       lightingSpace: "camera",
-      fieldShading: false,
       dimensionOrigin: "frame-center",
       gridOpacity: 1,
       aoIntensity: 1,
@@ -39,7 +38,7 @@ describe("viewport3dAppearancePreferences", () => {
       aoIntensity: -1,
       aoRadius: 2,
       lightingMode: "invalid",
-      fieldShading: "yes",
+      fieldShading: true,
     });
     expect(normalized).toMatchObject({
       backgroundStrength: 1,
@@ -49,8 +48,8 @@ describe("viewport3dAppearancePreferences", () => {
       aoIntensity: 0,
       aoRadius: 1,
       lightingMode: "studio",
-      fieldShading: false,
     });
+    expect(normalized).not.toHaveProperty("fieldShading");
 
     const patched = applyViewport3DAppearancePatch(normalized, {
       backgroundStrength: Number.NaN,
@@ -59,13 +58,17 @@ describe("viewport3dAppearancePreferences", () => {
     });
     expect(patched.backgroundStrength).toBe(1);
     expect(patched.lightingMode).toBe("studio");
-    expect(patched.fieldShading).toBe(true);
+    expect(patched).not.toHaveProperty("fieldShading");
   });
 
   it("ignores unknown fields and rejects malformed or unsupported records", () => {
     const parsed = parseViewport3DPersistedPreferences(JSON.stringify({
       schemaVersion: 1,
-      appearance: { backgroundMode: "gradient", futurePreference: 7 },
+      appearance: {
+        backgroundMode: "gradient",
+        fieldShading: true,
+        futurePreference: 7,
+      },
       widgets: { viewCubeVisible: false, futureWidget: true },
       visualProfileId: "figure",
       camera: { position: [1, 2, 3] },
@@ -75,6 +78,7 @@ describe("viewport3dAppearancePreferences", () => {
       widgets: { viewCubeVisible: false },
       visualProfileId: "figure",
     });
+    expect(parsed?.appearance).not.toHaveProperty("fieldShading");
     expect(parsed && "camera" in parsed).toBe(false);
     expect(parseViewport3DPersistedPreferences("{broken")).toBeNull();
     expect(parseViewport3DPersistedPreferences(JSON.stringify({

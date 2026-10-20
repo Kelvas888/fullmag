@@ -356,7 +356,6 @@ class Viewport3DStore {
         lightingAzimuth: DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES.lightingAzimuth,
         lightingElevation: DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES.lightingElevation,
         lightingSpace: DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES.lightingSpace,
-        fieldShading: DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES.fieldShading,
       };
     }
     if (resetAll || section === "effects") {
@@ -1052,7 +1051,6 @@ function sameViewport3DAppearancePreferences(
     left.lightingAzimuth === right.lightingAzimuth &&
     left.lightingElevation === right.lightingElevation &&
     left.lightingSpace === right.lightingSpace &&
-    left.fieldShading === right.fieldShading &&
     left.dimensionOrigin === right.dimensionOrigin &&
     left.gridOpacity === right.gridOpacity &&
     left.aoIntensity === right.aoIntensity &&
