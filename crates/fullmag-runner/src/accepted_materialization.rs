@@ -971,4 +971,3 @@ fn product3(values: [u32; 3]) -> Result<u64, String> {
 fn product3_usize(values: [u32; 3]) -> Result<usize, String> {
     usize::try_from(product3(values)?).map_err(|_| "accepted field grid exceeds addressable memory".into())
 }
-
