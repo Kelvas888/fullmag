@@ -124,6 +124,66 @@ def _retained_certificate(state, document):
     return certificate
 
 
+def _post_build_certificate_evidence(state, certificate):
+    """Pin pre-rotation bytes plus the closed identity for continuation.
+
+    ``reuse_host_certificate`` intentionally rotates image/source/binary and
+    artifact fields.  The raw hashes here therefore describe the historical
+    certificate observed before Compose recreation; the stable identity is the
+    part that must match the newly admitted certificate.
+    """
+    from docker_volume_post_build_generation import certificate_stable_identity
+
+    host = _session_host()
+    certificate_path = _certificate_path(state)
+    owner_path = Path(state) / host.OWNER_NAME
+    certificate_raw = host.read_owned_regular(certificate_path)
+    owner_raw = host.read_owned_regular(owner_path)
+    try:
+        certificate_value = json.loads(certificate_raw.decode("utf-8"))
+        owner_value = json.loads(owner_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BuildControlError("Retained certificate evidence is not valid JSON") from error
+    if certificate_value != certificate or owner_value != certificate_value:
+        raise BuildControlError("Retained certificate/owner bytes differ from the admitted certificate")
+    return {
+        "historical_certificate_sha256": hashlib.sha256(certificate_raw).hexdigest(),
+        "historical_owner_marker_sha256": hashlib.sha256(owner_raw).hexdigest(),
+        "stable_identity": certificate_stable_identity(certificate),
+        "storage_profile": certificate.get("storage_profile"),
+        "restart_verified": certificate.get("restart_verified"),
+    }
+
+
+def _assert_post_build_removed_namespace_absent(metadata):
+    """Recheck exact removed IDs after the new development lease opens."""
+    recreate = metadata.get("recreate_operation") if isinstance(metadata, Mapping) else None
+    absence = recreate.get("absence") if isinstance(recreate, Mapping) else None
+    if not isinstance(recreate, Mapping) or not isinstance(absence, Mapping):
+        raise BuildControlError("Post-build continuation has no completed recreation absence proof")
+    for service in ("backend", "frontend"):
+        item = absence.get(service)
+        identifier = item.get("container_id") if isinstance(item, Mapping) else None
+        if not isinstance(identifier, str):
+            raise BuildControlError("Post-build continuation absence proof has no " + service + " ID")
+        inspected = docker_capture("inspect", identifier, allow_failure=True, timeout=60)
+        if inspected.returncode == 0:
+            raise BuildControlError("A removed post-build service ID is inspectable under the new lease")
+        detail = (inspected.stderr + inspected.stdout).decode("utf-8", "replace")
+        if re.search(
+            r"(?:no such object|no such container):\s*" + re.escape(identifier) + r"(?:\s|$)",
+            detail,
+            re.IGNORECASE,
+        ) is None:
+            raise BuildControlError("Docker did not confirm removed " + service + " absence under the new lease")
+        listed = docker_capture(
+            "ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + identifier,
+            timeout=60,
+        )
+        if listed.returncode or listed.stdout.decode("utf-8", "replace").split():
+            raise BuildControlError("Removed " + service + " ID is present under the new lease")
+
+
 
 _PROCESS_RECEIPT_PROBE = """import json,pathlib,sys
 sys.path.insert(0,'/opt/fullmag')
@@ -362,6 +422,10 @@ def _validate_existing_operation_inputs(receipt, expected):
             raise BuildControlError(
                 "Existing development operation input differs: " + key
             )
+    if "post_build_generation" in expected and actual.get("post_build_generation") != expected.get(
+        "post_build_generation"
+    ):
+        raise BuildControlError("Existing development operation input differs: post_build_generation")
 
 
 def _validate_prepared_start_context(prepared):
@@ -1093,7 +1157,8 @@ def _precreate_new_windows_runtime_state(state):
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
           recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
           native_restart_metadata=None, accepted_reattach_environment=None,
-          accepted_reattach_metadata=None, recreation_resume_proof=None):
+          accepted_reattach_metadata=None, recreation_resume_proof=None,
+          post_build_generation=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -1107,6 +1172,15 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     validated_recovery_environment = _validate_recovery_environment(recovery_environment)
     validated_recovery_metadata = _validate_recovery_metadata(recovery_metadata)
     validated_native_restart_metadata = _validate_recovery_metadata(native_restart_metadata)
+    validated_post_build_generation = None
+    if post_build_generation is not None:
+        from docker_volume_post_build_generation import validate_continuation_metadata
+        try:
+            validated_post_build_generation = validate_continuation_metadata(post_build_generation)
+        except BuildControlError as error:
+            raise BuildControlError("Post-build continuation metadata is invalid: " + str(error)) from error
+        if reuse_state is None:
+            raise BuildControlError("Post-build continuation requires retained session storage")
     validated_accepted_reattach_environment = _validate_accepted_reattach_environment(
         accepted_reattach_environment
     )
@@ -1121,6 +1195,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     validate_host_path(selected, "source checkout")
     local_volume(Path(layout["storage_root"]))
     identity = _compose_identity(layout)
+    if validated_post_build_generation is not None:
+        if (validated_post_build_generation["compose_project"] != identity["project_name"]
+                or validated_post_build_generation["source_root"] != str(selected)):
+            raise BuildControlError("Post-build continuation source or Compose identity differs")
+        if previous_config_sha256 != validated_post_build_generation["runtime_config"]["sha256"]:
+            raise BuildControlError("Post-build continuation config digest differs from its start pin")
     admission_context = {}
     if provided_operation is not None:
         _validate_existing_development_operation(provided_control, provided_operation, selected, identity)
@@ -1192,6 +1272,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         operation_inputs["native_failed_restart"] = validated_native_restart_metadata
     if validated_accepted_reattach_metadata is not None:
         operation_inputs["accepted_reattach"] = validated_accepted_reattach_metadata
+    if validated_post_build_generation is not None:
+        operation_inputs["post_build_generation"] = validated_post_build_generation
     if recreation_resume_proof is not None:
         operation_inputs["recreation_resume"] = {
             key: recreation_resume_proof[key]
@@ -1218,7 +1300,26 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             )
         if validated_accepted_reattach_metadata is not None:
             operation["receipt"]["accepted_reattach"] = validated_accepted_reattach_metadata
+        if validated_post_build_generation is not None:
+            operation["receipt"]["post_build_generation"] = validated_post_build_generation
         token = operation["receipt"]["attempt"]
+        post_build_start_binding = None
+        if validated_post_build_generation is not None:
+            from docker_volume_post_build_generation import prepare_start_binding
+            try:
+                post_build_start_binding = prepare_start_binding(
+                    validated_post_build_generation, operation
+                )
+            except BuildControlError as error:
+                raise BuildControlError("Post-build continuation start binding is invalid: " + str(error)) from error
+            control.write(
+                post_build_start_binding["relative"],
+                post_build_start_binding["record"],
+            )
+            operation["receipt"]["post_build_start"] = post_build_start_binding["receipt"]
+            # The runtime guard authenticates the active marker and this exact
+            # receipt before it consumes the old configuration digest.
+            control.write(operation["root"] + "/receipt.json", operation["receipt"])
         if reuse_state is None:
             state = storage.validate_path(Path(layout["runtime_root"]) / "docker-volume-dev" / token,
                                           layout["storage_root"], "session storage")
@@ -1260,6 +1361,40 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             reuse_state["host_certificate"] = certificate_path
             reuse_state["owner_marker"] = owner_marker
         operation["receipt"]["state_root"] = str(state)
+        if validated_post_build_generation is not None:
+            # BuildKit has already completed and the new development lease is
+            # held.  Re-read the durable failed-owner/recreation proof and the
+            # mutable runtime controls before certificate rotation or cache/
+            # ledger allocation.  A stale proof must leave retained admission
+            # evidence untouched.  A prior controlled start may already have
+            # rotated image/source fields; compare the closed host identity.
+            from docker_volume_post_build_generation import (
+                certificate_stable_identity,
+                validate_post_build_lease_evidence,
+            )
+            accepted_context_for_post_build = None
+            if validated_accepted_reattach_metadata is not None:
+                accepted_context_for_post_build = {
+                    "accepted_reattach_metadata": validated_accepted_reattach_metadata,
+                    "accepted_reattach_environment": validated_accepted_reattach_environment,
+                }
+            current_certificate = json.loads(host.read_owned_regular(certificate_path))
+            current_certificate_evidence = _post_build_certificate_evidence(
+                state, current_certificate
+            )
+            try:
+                _assert_post_build_removed_namespace_absent(validated_post_build_generation)
+                validate_post_build_lease_evidence(
+                    control,
+                    validated_post_build_generation,
+                    certificate_evidence=current_certificate_evidence,
+                    accepted_context=accepted_context_for_post_build,
+                    runtime_config_sha256=_read_runtime_config_digest(control),
+                )
+            except BuildControlError as error:
+                raise BuildControlError(
+                    "Post-build continuation changed under the new development lease: " + str(error)
+                ) from error
         local_volume(state)
         cache = _backend_cache(control, operation, layout, selected, image, toolchain["image_id"])
         operation["receipt"]["backend_volumes"] = cache["volume_names"]
@@ -1277,6 +1412,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             reuse_certificate = runtime._reuse_host_certificate if os.name == "nt" else host.reuse_certificate
             certificate = reuse_certificate(reuse_state, provisional, engine_id,
                                                          development_build=delegation)
+        if validated_post_build_generation is not None:
+            # Reuse may rotate image/source fields and clear readiness, but
+            # cannot change the host identity authenticated under this lease.
+            if (certificate_stable_identity(certificate) !=
+                    validated_post_build_generation["certificate"]["stable_identity"]):
+                raise BuildControlError("Post-build continuation certificate stable identity changed")
         startup = None
         if args.script is not None:
             from docker_volume_activate import _managed_activation_receipt_contract
@@ -1355,6 +1496,10 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                 previous_config_sha256
             )
         backend["environment"].update(validated_recovery_environment)
+        backend["environment"].pop("FULLMAG_DOCKER_POST_BUILD_CONTINUATION", None)
+        backend["environment"].pop("FULLMAG_DOCKER_POST_BUILD_CONTINUATION_SHA256", None)
+        if post_build_start_binding is not None:
+            backend["environment"].update(post_build_start_binding["environment"])
         backend["environment"].pop("FULLMAG_ACCEPTED_REATTACH_REQUEST", None)
         backend["environment"].pop("FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256", None)
         backend["environment"].update(validated_accepted_reattach_environment)
@@ -1587,6 +1732,15 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
         operation["receipt"]["startup"] = runtime._wait_for_startup_ready(
             state, authorization, startup_helper=helper,
             receipt_reader=lambda: (read_process_receipt(), None))
+    post_build_start = operation["receipt"].get("post_build_start")
+    if isinstance(post_build_start, Mapping) and post_build_start.get("state") == "pending":
+        # A successful, fully qualified start durably consumes the one-shot
+        # host binding.  The immutable binding bytes remain available for
+        # receipt comparison; subsequent Docker restarts use normal drain.
+        operation["receipt"]["post_build_start"] = {
+            **post_build_start,
+            "state": "consumed",
+        }
     operation["receipt"].update(state="succeeded", backend_container=backend_id,
         frontend_container=frontend_id, url="http://127.0.0.1:" + str(port),
         source_commit=provenance["commit"], source_digest=provenance["source_digest"],
@@ -3331,6 +3485,7 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
 
     # Inspect and list the exact IDs after the terminal receipt; the ordinary
     # start guard below still rejects every remaining group container.
+    absence_proof = {}
     for service in ("backend", "frontend"):
         inspected = docker_capture("inspect", ids[service], allow_failure=True, timeout=60)
         if inspected.returncode == 0:
@@ -3343,13 +3498,22 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
         )
         if not_found is None:
             raise BuildControlError("Docker inspect did not authoritatively confirm removed app-container absence")
-        absence = docker_capture(
+        absence_result = docker_capture(
             "ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + ids[service], timeout=60
         )
-        if absence.returncode:
+        if absence_result.returncode:
             raise BuildControlError("Cannot verify removed app-container absence")
-        if absence.stdout.decode("utf-8", "replace").split():
+        if absence_result.stdout.decode("utf-8", "replace").split():
             raise BuildControlError("A retained app-container ID is still present in Docker")
+        absence_proof[service] = {
+            "container_id": ids[service],
+            "inspect_returncode": inspected.returncode,
+            "inspect_output_sha256": hashlib.sha256(
+                inspected.stderr + inspected.stdout
+            ).hexdigest(),
+            "ps_returncode": absence_result.returncode,
+            "ps_output_sha256": hashlib.sha256(absence_result.stdout).hexdigest(),
+        }
 
     proof = {
         "schema": "fullmag.docker-removed-recreation-container.v1",
@@ -3359,8 +3523,10 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
         "prior_terminal_sha256": hashlib.sha256(previous_raw).hexdigest(),
         "prior_compose_sha256": hashlib.sha256(document_raw).hexdigest(),
         "container_id": ids["backend"],
+        "frontend_container": ids["frontend"],
         "image_id": image,
         "container_state": container_state,
+        "absence": absence_proof,
     }
     native_recovery_context = _retained_recovery_context(
         control,
@@ -3478,6 +3644,41 @@ def _resume_recreated_operation(args, control, selected, layout, identity):
         }
     elif accepted_record is not None:
         raise BuildControlError("Completed recreation records an unexpected accepted-run reattach")
+
+    post_build_generation = operation_terminal.get("post_build_generation")
+    if post_build_generation is not None:
+        from docker_volume_post_build_generation import (
+            bind_recreate_operation,
+            validate_resume_continuation,
+        )
+        try:
+            # The recreate receipt was written before its lease closed, so its
+            # nested start proof may still be unbound.  Bind it to the exact
+            # completed terminal/snapshot/absence evidence before entering the
+            # new development start lease.  The historical development
+            # operation_id remains the old attempt identity.
+            post_build_generation = bind_recreate_operation(
+                post_build_generation, proof
+            )
+            validated_post_build_generation = validate_resume_continuation(
+                control,
+                post_build_generation,
+                operation_id=previous.get("attempt"),
+                expected_project=control.project,
+                expected_source_root=str(selected),
+                previous=previous,
+                document=document,
+                accepted_context=accepted_reattach_context,
+            )
+        except BuildControlError as error:
+            raise BuildControlError("Completed post-build continuation changed: " + str(error)) from error
+        accepted_record = validated_post_build_generation.get("accepted_run")
+        if accepted_record and not accepted_reattach_context:
+            raise BuildControlError("Completed post-build continuation lost its accepted-run proof")
+        recovery_context["previous_config_sha256"] = validated_post_build_generation[
+            "runtime_config"
+        ]["sha256"]
+        recovery_context["post_build_generation"] = validated_post_build_generation
 
     reuse = {
         "state": state,
@@ -3758,6 +3959,55 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 "accepted_reattach_environment": accepted_environment,
                 "accepted_reattach_metadata": accepted_pins,
             }
+        native_recovery_context = dict(recovery_context)
+        post_build_generation = None
+        if not fresh_state and pre_activation_stop is None and certificate.get("restart_verified") is True:
+            retained_environment = document["services"]["backend"]["environment"]
+            retained_reattach_declared = (
+                "accepted_reattach" in previous
+                or any(name.startswith("FULLMAG_ACCEPTED_REATTACH_") for name in retained_environment)
+            )
+            if accepted_reattach_context:
+                accepted_pins = accepted_reattach_context.get("accepted_reattach_metadata")
+                original_stop_path = accepted_pins.get("stop_verification_relative") if isinstance(
+                    accepted_pins, Mapping
+                ) else None
+                if not isinstance(original_stop_path, str):
+                    raise BuildControlError("Post-build continuation accepted proof has no stop archive path")
+                # The accepted producer already authenticated this path and its
+                # raw digest.  A missing archive is therefore an unavailable
+                # proof, never a reason to fall back to the newer namespace.
+                original_stop = control.read(original_stop_path)
+            else:
+                original_stop_path = "verification/stop-failed-" + ids["backend"] + ".json"
+                original_stop = control.read(original_stop_path, optional=True)
+            if original_stop is not None:
+                if retained_reattach_declared and not accepted_reattach_context:
+                    raise BuildControlError("Post-build continuation has no held accepted-run proof")
+                from docker_volume_post_build_generation import build_failed_owner_continuation
+                try:
+                    post_build_generation = build_failed_owner_continuation(
+                        control,
+                        operation_id=previous["attempt"],
+                        previous=previous,
+                        document=document,
+                        actual_backend=actual["backend"],
+                        source_identity={
+                            "source_root": str(selected),
+                            "project_id": identity["project_id"],
+                            "worktree_id": identity["worktree_id"],
+                            "checkout_kind": identity["checkout_kind"],
+                        },
+                        certificate_evidence=_post_build_certificate_evidence(state, certificate),
+                        accepted_context=accepted_reattach_context,
+                        runtime_config_sha256=_read_runtime_config_digest(control),
+                    )
+                except BuildControlError as error:
+                    raise BuildControlError("Post-build continuation proof is unavailable: " + str(error)) from error
+                recovery_context["previous_config_sha256"] = post_build_generation[
+                    "runtime_config"
+                ]["sha256"]
+                recovery_context["post_build_generation"] = post_build_generation
         pre_admission_recreate_proof = None
         if not fresh_state and not certificate.get("restart_verified"):
             retained_environment = document["services"]["backend"]["environment"]
@@ -3813,7 +4063,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 helper_ids.append(helper_document["Id"])
         with control.operation("recreate-services", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                                       **operator_probe_record}) as operation:
-            if recovery_context != _retained_recovery_context(
+            if native_recovery_context != _retained_recovery_context(
                 control, previous, document, fresh_state=fresh_state,
                 backend_id=actual["backend"].get("Id"),
             ):
@@ -3832,6 +4082,43 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 operation["receipt"]["accepted_reattach"] = accepted_reattach_context[
                     "accepted_reattach_metadata"
                 ]
+            if post_build_generation is not None:
+                operation["receipt"]["post_build_generation"] = post_build_generation
+            if post_build_generation is not None:
+                # The retained snapshot was observed before this lease. Pin
+                # both application services again under the recreate lease;
+                # the post-build proof must never authorize stop/rm from a
+                # stale backend-only observation.
+                leased_actual = {}
+                for service, identifier in ids.items():
+                    observed = json.loads(docker_text("inspect", identifier))
+                    if len(observed) != 1:
+                        raise BuildControlError(
+                            "Post-build continuation has an ambiguous leased service: "
+                            + service
+                        )
+                    observed = observed[0]
+                    before = actual[service]
+                    if (
+                        observed.get("Id") != before.get("Id")
+                        or observed.get("Image") != before.get("Image")
+                        or observed.get("State", {}).get("StartedAt")
+                        != before.get("State", {}).get("StartedAt")
+                    ):
+                        raise BuildControlError(
+                            "Post-build continuation service incarnation changed under lease: "
+                            + service
+                        )
+                    _validate_retained_service(
+                        document,
+                        observed,
+                        service,
+                        image_config,
+                        allow_legacy_frontend=True,
+                    )
+                    leased_actual[service] = observed
+                _retained_certificate(state, document)
+                actual = leased_actual
             if pre_admission_recreate_proof is not None:
                 # Re-pin both app containers after the durable recreate lease is
                 # held.  This closes the gap between the retained observation
@@ -3912,6 +4199,54 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     raise BuildControlError(
                         "Accepted-run reattach changed before recreation"
                     )
+            if post_build_generation is not None:
+                from docker_volume_post_build_generation import validate_failed_owner_continuation
+                leased_backend = json.loads(docker_text("inspect", ids["backend"]))
+                if len(leased_backend) != 1:
+                    raise BuildControlError("Post-build continuation has an ambiguous leased backend")
+                leased_backend = leased_backend[0]
+                before = actual["backend"]
+                if (
+                    leased_backend.get("Id") != before.get("Id")
+                    or leased_backend.get("Image") != before.get("Image")
+                    or leased_backend.get("State", {}).get("StartedAt")
+                    != before.get("State", {}).get("StartedAt")
+                ):
+                    raise BuildControlError("Post-build continuation backend incarnation changed under lease")
+                _validate_retained_service(
+                    document,
+                    leased_backend,
+                    "backend",
+                    image_config,
+                    allow_legacy_frontend=True,
+                )
+                try:
+                    leased_post_build = validate_failed_owner_continuation(
+                        control,
+                        post_build_generation,
+                        operation_id=previous["attempt"],
+                        expected_project=control.project,
+                        expected_source_root=str(selected),
+                        previous=previous,
+                        document=document,
+                        actual_backend=leased_backend,
+                        source_identity={
+                            "source_root": str(selected),
+                            "project_id": identity["project_id"],
+                            "worktree_id": identity["worktree_id"],
+                            "checkout_kind": identity["checkout_kind"],
+                        },
+                        certificate_evidence=_post_build_certificate_evidence(
+                            state, _retained_certificate(state, document)
+                        ),
+                        accepted_context=accepted_reattach_context,
+                        runtime_config_sha256=_read_runtime_config_digest(control),
+                    )
+                except BuildControlError as error:
+                    raise BuildControlError("Post-build continuation changed under recreate lease: " + str(error)) from error
+                if leased_post_build != post_build_generation:
+                    raise BuildControlError("Post-build continuation differs under recreate lease")
+                actual["backend"] = leased_backend
             control.write(operation["root"] + "/retained-containers.json", actual)
             if pre_activation_stop is not None:
                 operation["receipt"]["pre_activation_stop_receipt"] = pre_activation_stop
@@ -3929,6 +4264,27 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             operation["daemon_pending"] = False
             operation["receipt"].update(state="succeeded", removed_containers=list(ids.values()),
                                         retained_volumes=previous["backend_volumes"], retained_frontend_volume=previous["frontend_volume"])
+        if post_build_generation is not None:
+            # The old namespace is now intentionally gone.  Reuse the same
+            # terminal/snapshot/authoritative-Docker-absence validator used by
+            # recreation resume, rather than inspecting either removed ID or
+            # pretending that the old development attempt is this operation.
+            from copy import copy
+            from docker_volume_post_build_generation import bind_recreate_operation
+            proof_args = copy(args)
+            proof_args.resume_recreation = operation["receipt"]["attempt"]
+            try:
+                completed_recreation = _validate_recreation_resume_records(
+                    proof_args, control, selected, identity
+                )
+                post_build_generation = bind_recreate_operation(
+                    post_build_generation, completed_recreation["proof"]
+                )
+            except BuildControlError as error:
+                raise BuildControlError(
+                    "Post-build continuation could not bind the completed recreation: " + str(error)
+                ) from error
+            recovery_context["post_build_generation"] = post_build_generation
         reuse = None if fresh_state else {"state": state, "host_certificate": certificate_path,
             "owner_marker": owner_path, "receipt": {"image_id": image},
             "operator_probe_environment_record": operator_probe_record}

@@ -2004,6 +2004,8 @@ class DockerRuntimeContract(unittest.TestCase):
             wait=lambda timeout: 0,
         )
         service = SimpleNamespace(
+            POST_BUILD_START_ENV=service_module.POST_BUILD_START_ENV,
+            POST_BUILD_START_SHA_ENV=service_module.POST_BUILD_START_SHA_ENV,
             RuntimeHandle=service_module.RuntimeHandle,
             prepare_storage=lambda: paths,
             initialize_accepted_store=lambda _paths: {"binding": "test"},
@@ -2069,6 +2071,8 @@ class DockerRuntimeContract(unittest.TestCase):
         api.poll.return_value = None
         api.wait.return_value = 0
         service = SimpleNamespace(
+            POST_BUILD_START_ENV=service_module.POST_BUILD_START_ENV,
+            POST_BUILD_START_SHA_ENV=service_module.POST_BUILD_START_SHA_ENV,
             RuntimeHandle=service_module.RuntimeHandle,
             RuntimeServiceTransient=service_module.RuntimeServiceTransient,
             prepare_storage=mock.Mock(return_value=paths),
@@ -2157,6 +2161,518 @@ class DockerRuntimeContract(unittest.TestCase):
             "readiness": {"schema_version": service.HOST_READINESS_GPU_SCHEMA},
             "runtime_generation_sha256": "a" * 64,
         }
+
+    def _post_build_fixture(self, service, root):
+        import copy
+        from dataclasses import replace
+
+        control = root / "control"
+        runtime_control = root / "runtime-control"
+        runtime_services = runtime_control / "runtime-services"
+        runtime_services.mkdir(parents=True)
+        (runtime_control / "runtime-service").mkdir(parents=True)
+        certificate_path = root / "run" / "windows-folder-host.json"
+        certificate_path.parent.mkdir(parents=True)
+        paths = replace(
+            service.RuntimePaths(),
+            state=root,
+            storage=root,
+            runs=root / "runs" / service.WORKTREE_ID,
+            store=root / "runs" / service.WORKTREE_ID / "session-store",
+            state_root=runtime_control,
+            runtime_services=runtime_services,
+            config=runtime_control / "runtime-service/docker-all.json",
+            host_certificate=certificate_path,
+        )
+        old = self.host_profile_fixture(service)["configuration"]
+        expected = copy.deepcopy(old)
+        expected["host_execution"]["runtime_generation_sha256"] = "b" * 64
+        service._atomic_json(paths.config, old, "post-build fixture config")
+        old_raw = paths.config.read_bytes()
+        old_sha = hashlib.sha256(old_raw).hexdigest()
+
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "owner_token": "11111111-1111-4111-8111-111111111111",
+            "process_start_token": "22222222-2222-4222-8222-222222222222",
+            "pid": 1234,
+            "host": "fullmag-test-host",
+            "target_id": service.TARGET_ID,
+            "protocol": "stdin-v1",
+            "state": "failed",
+            "acquired_at": "2026-10-20T10:00:00Z",
+            "heartbeat_at": "2026-10-20T10:00:01Z",
+            "compute_pool_generation": 7,
+            "preparation_pool_generation": 8,
+            "control_address": "127.0.0.1:43123",
+            "build_commit": "a" * 40,
+            "build_snapshot": "b" * 64,
+            "compute_pool_id": service.COMPUTE_POOL_ID,
+            "preparation_pool_id": service.PREPARATION_POOL_ID,
+            "children": [
+                {"role": "compute", "pid": 17, "status": "exited_success"},
+                {"role": "preparation", "pid": 18, "status": "exited_success"},
+            ],
+        }
+        owner_path = runtime_services / "OWNER.json"
+        service._atomic_json(owner_path, owner, "post-build fixture owner")
+        owner_raw = owner_path.read_bytes()
+        process = {
+            "schema": "fullmag.docker-process-tree.v1",
+            "state": "shutdown_unknown",
+            "api_pid": 4321,
+            "api_exit_code": 101,
+            "accepted_store": str(paths.store),
+            "bootstrap": {"binding": "b" * 64},
+            "qualification": "NOT VERIFIED",
+            "error": service.POST_BUILD_PROCESS_ERROR,
+            "shutdown_error": service.POST_BUILD_PROCESS_SHUTDOWN_ERROR,
+        }
+        process_path = runtime_control / "runtime-service/process-tree.json"
+        service._atomic_json(process_path, process, "post-build fixture process")
+        process_raw = process_path.read_bytes()
+        certificate = {
+            "schema": "fullmag.windows-folder-host.v1",
+            "storage_profile": service.WINDOWS_STORAGE_PROFILE,
+            "role": "session",
+            "owner_scope": "docker-desktop-linux",
+            "host_root": "C:\\fullmag\\storage",
+            "host_filesystem": "NTFS",
+            "host_drive_type": 3,
+            "host_volume_serial": 12345,
+            "host_root_no_reparse": True,
+            "owner_token": "c0ffee00-0000-4000-8000-000000000001",
+            "engine_id": "engine-test",
+            "image_id": "sha256:" + "7" * 64,
+            "source_commit": "a" * 40,
+            "binary_hashes": {},
+            "artifact_receipt_sha256": "5" * 64,
+            "restart_expected_sha256": "6" * 64,
+            "restart_verified": True,
+        }
+        service._atomic_json(certificate_path, certificate, "post-build fixture certificate")
+        marker_path = root / ".fullmag-windows-folder-owner.json"
+        service._atomic_json(marker_path, certificate, "post-build fixture owner marker")
+        certificate_raw = certificate_path.read_bytes()
+
+        metadata = {
+            "schema": service.POST_BUILD_METADATA_SCHEMA,
+            "state": "authorized",
+            "operation_id": "d" * 32,
+            "compose_project": "fullmag-worktree-test",
+            "source_root": "/tmp/source",
+            "source_identity": {
+                "project_id": "fullmag",
+                "worktree_id": "worktree-test",
+                "checkout_kind": "worktree",
+            },
+            "original_stop": {
+                "relative": "verification/stop-failed-" + "1" * 64 + ".json",
+                "sha256": "1" * 64,
+                "container_id": "1" * 64,
+                "image_id": "sha256:" + "3" * 64,
+                "failure_kind": "native-start-failure",
+                "native_failure_probe_sha256": "2" * 64,
+                "terminal_process_sha256": "3" * 64,
+                "terminal_owner_sha256": "4" * 64,
+            },
+            "current_namespace": {
+                "container_id": "2" * 64,
+                "image_id": "sha256:" + "7" * 64,
+                "started_at": "2026-10-20T10:01:00Z",
+                "finished_at": "2026-10-20T10:02:00Z",
+                "exit_code": 2,
+            },
+            "failed_owner": {
+                "relative": "runtime-control/runtime-services/OWNER.json",
+                "sha256": hashlib.sha256(owner_raw).hexdigest(),
+                "identity": service._owner_identity(owner),
+            },
+            "current_process": {
+                "relative": "runtime-control/runtime-service/process-tree.json",
+                "sha256": hashlib.sha256(process_raw).hexdigest(),
+                "immutable_keys": list(service.POST_BUILD_PROCESS_KEYS),
+                "api_pid": process["api_pid"],
+                "api_exit_code": process["api_exit_code"],
+                "error_sha256": hashlib.sha256(process["error"].encode()).hexdigest(),
+                "shutdown_error_sha256": hashlib.sha256(process["shutdown_error"].encode()).hexdigest(),
+            },
+            "runtime_config": {
+                "relative": "runtime-control/runtime-service/docker-all.json",
+                "sha256": old_sha,
+            },
+            "certificate": {
+                "historical_certificate_sha256": hashlib.sha256(certificate_raw).hexdigest(),
+                "historical_owner_marker_sha256": hashlib.sha256(certificate_raw).hexdigest(),
+                "stable_identity": {
+                    key: certificate[key]
+                    for key in (
+                        "schema", "storage_profile", "role", "owner_scope", "owner_token",
+                        "engine_id", "host_root", "host_filesystem", "host_drive_type",
+                        "host_volume_serial", "host_root_no_reparse",
+                    )
+                },
+                "storage_profile": service.WINDOWS_STORAGE_PROFILE,
+                "restart_verified": True,
+            },
+            "accepted_run": {},
+        }
+        recreation_token = "e" * 32
+        recreation_root = control / "recreate-services/attempts" / recreation_token
+        recreation_root.mkdir(parents=True)
+        terminal = {
+            "schema": "fullmag.docker-build-operation.v1", "phase": "recreate-services",
+            "state": "succeeded", "attempt": recreation_token,
+            "compose_project": metadata["compose_project"],
+            "removed_containers": ["2" * 64, "6" * 64],
+        }
+        terminal_raw = service._post_build_canonical(terminal)
+        retained_raw = service._post_build_canonical({"backend": {"Id": "2" * 64}})
+        (recreation_root / "terminal.json").write_bytes(terminal_raw)
+        (recreation_root / "retained-containers.json").write_bytes(retained_raw)
+        prefix = "recreate-services/attempts/" + recreation_token
+        metadata["recreate_operation"] = {
+            "schema": "fullmag.docker-removed-recreation-container.v1",
+            "operation_id": recreation_token,
+            "terminal_relative": prefix + "/terminal.json",
+            "terminal_sha256": hashlib.sha256(terminal_raw).hexdigest(),
+            "retained_relative": prefix + "/retained-containers.json",
+            "retained_sha256": hashlib.sha256(retained_raw).hexdigest(),
+            "prior_terminal_sha256": "9" * 64,
+            "prior_compose_sha256": "8" * 64,
+            "backend_container": "2" * 64, "frontend_container": "6" * 64,
+            "image_id": metadata["current_namespace"]["image_id"],
+            "absence": {
+                name: {"container_id": identifier, "inspect_returncode": 1,
+                       "inspect_output_sha256": "a" * 64, "ps_returncode": 0,
+                       "ps_output_sha256": hashlib.sha256(b"").hexdigest()}
+                for name, identifier in (("backend", "2" * 64), ("frontend", "6" * 64))
+            },
+        }
+        token = "a" * 32
+        relative_root = "development/attempts/" + token
+        metadata_raw = service._post_build_canonical(metadata)
+        binding = {
+            "schema": service.POST_BUILD_START_SCHEMA,
+            "state": "pending",
+            "attempt": token,
+            "receipt_relative": relative_root + "/receipt.json",
+            "active_relative": "active",
+            "active_token": token,
+            "continuation_relative": relative_root + "/post-build-continuation.json",
+            "continuation_sha256": hashlib.sha256(metadata_raw).hexdigest(),
+            "previous_config_sha256": old_sha,
+            "continuation": metadata,
+        }
+        binding_raw = service._post_build_canonical(binding)
+        attempt_root = control / relative_root
+        attempt_root.mkdir(parents=True)
+        (attempt_root / "post-build-continuation.json").write_bytes(binding_raw)
+        binding_path = attempt_root / "post-build-continuation.json"
+        receipt = {
+            "schema": "fullmag.docker-build-operation.v1",
+            "phase": "development",
+            "state": "starting-services",
+            "attempt": token,
+            "compose_project": metadata["compose_project"],
+            "control_volume": "fullmag-build-control-worktree-test",
+            "inputs": {
+                "source_root": metadata["source_root"],
+                "image_id": "sha256:" + "8" * 64,
+                "source_project_id": metadata["source_identity"]["project_id"],
+                "source_worktree_id": metadata["source_identity"]["worktree_id"],
+                "source_checkout_kind": metadata["source_identity"]["checkout_kind"],
+                "post_build_generation": metadata,
+            },
+            "post_build_generation": metadata,
+            "post_build_start": {
+                "schema": service.POST_BUILD_START_SCHEMA,
+                "state": "pending",
+                "path": str(binding_path),
+                "sha256": hashlib.sha256(binding_raw).hexdigest(),
+                "continuation_sha256": binding["continuation_sha256"],
+            },
+        }
+        (attempt_root / "receipt.json").write_bytes(service._post_build_canonical(receipt))
+        (control / "active").write_bytes((token + "\n").encode("ascii"))
+        lock_path = control / "operation.lock"
+        lock_path.write_bytes(b"operation-lock\n")
+        (runtime_services / "OWNER.lock").write_bytes(b"owner-lock\n")
+        environment = {
+            "FULLMAG_DOCKER_HOST_EXECUTION": "1",
+            "FULLMAG_DOCKER_DEVICE_ACCESS": "gpu",
+            "FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256": old_sha,
+            "FULLMAG_COMPOSE_PROJECT": metadata["compose_project"],
+            "FULLMAG_RUNTIME_IMAGE_ID": "sha256:" + "8" * 64,
+            "FULLMAG_SOURCE_HOST_ROOT": metadata["source_root"],
+            "FULLMAG_SOURCE_PROJECT_ID": metadata["source_identity"]["project_id"],
+            "FULLMAG_SOURCE_WORKTREE_ID": metadata["source_identity"]["worktree_id"],
+            "FULLMAG_SOURCE_CHECKOUT_KIND": metadata["source_identity"]["checkout_kind"],
+            "FULLMAG_SESSION_STORAGE_PROFILE": service.WINDOWS_STORAGE_PROFILE,
+            service.POST_BUILD_START_ENV: str(binding_path),
+            service.POST_BUILD_START_SHA_ENV: hashlib.sha256(binding_raw).hexdigest(),
+        }
+        # Canonical certificate reuse updates image/build fields before API.
+        incoming_certificate = dict(certificate, image_id="sha256:" + "8" * 64,
+                                    source_commit="b" * 40)
+        service._atomic_json(certificate_path, incoming_certificate, "incoming certificate")
+        service._atomic_json(marker_path, incoming_certificate, "incoming owner marker")
+        return paths, expected, old_raw, control, lock_path, environment
+
+    def _hold_post_build_operation_lock(self, lock_path):
+        holder = subprocess.Popen(
+            [
+                sys.executable, "-c",
+                (
+                    "import fcntl, sys; "
+                    "stream = open(sys.argv[1], 'r+b'); "
+                    "fcntl.flock(stream.fileno(), fcntl.LOCK_EX); "
+                    "print('locked', flush=True); sys.stdin.read()"
+                ),
+                str(lock_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+        return holder
+
+    @unittest.skipIf(os.name == "nt", "Guest fd-relative control walk is qualified on Linux")
+    def test_post_build_pending_binding_rotates_and_publishes_consumed_record(self):
+        from dataclasses import replace
+
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths, expected, old_raw, control, lock_path, environment = (
+                self._post_build_fixture(service, root)
+            )
+            rotated_certificate = service._post_build_json(
+                paths.host_certificate.read_bytes(), "fixture certificate"
+            )
+            rotated_certificate.update(
+                image_id="sha256:" + "8" * 64, source_commit="b" * 40
+            )
+            service._atomic_json(
+                paths.host_certificate, rotated_certificate, "rotated fixture certificate"
+            )
+            service._atomic_json(
+                paths.state / ".fullmag-windows-folder-owner.json",
+                rotated_certificate, "rotated fixture owner marker"
+            )
+            holder = self._hold_post_build_operation_lock(lock_path)
+            try:
+                with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                        patch.dict(os.environ, environment, clear=True), \
+                        patch.object(service, "initialize_host_configuration", return_value=expected):
+                    self.assertEqual(service.ensure_configuration(paths), expected)
+            finally:
+                holder.stdin.close()
+                holder.wait(timeout=3)
+                holder.stdout.close()
+            self.assertEqual(paths.config.read_bytes(), service._post_build_canonical(expected))
+            self.assertEqual(
+                (root / "runtime-control/runtime-services/post-build-continuation"
+                 / ("a" * 32) / "consumed.json").is_file(),
+                True,
+            )
+            backup = root / (
+                "runtime-control/runtime-service/docker-all.previous-"
+                + hashlib.sha256(old_raw).hexdigest() + ".json"
+            )
+            self.assertEqual(backup.read_bytes(), old_raw)
+
+    @unittest.skipIf(os.name == "nt", "Guest fd-relative control walk is qualified on Linux")
+    def test_post_build_rejects_symlinked_ancestor_and_dead_operation(self):
+        service = self.load_service()
+        for scenario in ("symlink", "dead", "released-lease", "terminal"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                paths, expected, old_raw, control, lock_path, environment = (
+                    self._post_build_fixture(service, root)
+                )
+                if scenario == "symlink":
+                    real = control / "development-real"
+                    (control / "development").rename(real)
+                    (control / "development").symlink_to(real, target_is_directory=True)
+                elif scenario == "dead":
+                    (control / "active").unlink()
+                elif scenario == "terminal":
+                    (control / "development/attempts" / ("a" * 32) / "terminal.json").write_text("{}")
+                with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                        patch.dict(os.environ, environment, clear=True), \
+                        patch.object(service, "initialize_host_configuration", return_value=expected):
+                    with self.assertRaises(service.RuntimeServiceError):
+                        service.ensure_configuration(paths)
+                self.assertEqual(paths.config.read_bytes(), old_raw)
+
+    @unittest.skipIf(os.name == "nt", "Guest owner evidence is qualified on Linux")
+    def test_post_build_rejects_drifted_failed_owner_before_rotation(self):
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths, expected, old_raw, control, lock_path, environment = (
+                self._post_build_fixture(service, root)
+            )
+            owner_path = paths.runtime_services / "OWNER.json"
+            owner = service._post_build_json(owner_path.read_bytes(), "fixture owner")
+            owner["heartbeat_at"] = "2026-10-20T11:00:00Z"
+            service._atomic_json(owner_path, owner, "drifted fixture owner")
+            holder = self._hold_post_build_operation_lock(lock_path)
+            try:
+                with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                        patch.dict(os.environ, environment, clear=True), \
+                        patch.object(service, "initialize_host_configuration", return_value=expected):
+                    with self.assertRaisesRegex(service.RuntimeServiceError, "OWNER.json changed"):
+                        service.ensure_configuration(paths)
+            finally:
+                holder.stdin.close()
+                holder.wait(timeout=3)
+                holder.stdout.close()
+            self.assertEqual(paths.config.read_bytes(), old_raw)
+
+    @unittest.skipIf(os.name == "nt", "Guest operation lease is qualified on Linux")
+    def test_post_build_replays_after_config_publication_before_consumption(self):
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths, expected, old_raw, control, lock_path, environment = (
+                self._post_build_fixture(service, root)
+            )
+            holder = self._hold_post_build_operation_lock(lock_path)
+            original_publish = service._post_build_publish_consumed
+            calls = 0
+
+            def publish_once_then_interrupt(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise service.RuntimeServiceError(
+                        "simulated interruption after config publication"
+                    )
+                return original_publish(*args, **kwargs)
+
+            try:
+                with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                        patch.dict(os.environ, environment, clear=True), \
+                        patch.object(service, "initialize_host_configuration", return_value=expected), \
+                        patch.object(
+                            service, "_post_build_publish_consumed",
+                            side_effect=publish_once_then_interrupt,
+                        ), patch.object(
+                            service, "_rotate_configuration_generation",
+                            wraps=service._rotate_configuration_generation,
+                        ) as rotate:
+                    with self.assertRaisesRegex(
+                            service.RuntimeServiceError, "config publication"
+                    ):
+                        service.ensure_configuration(paths)
+                    self.assertEqual(service.ensure_configuration(paths), expected)
+                    self.assertEqual(rotate.call_count, 1)
+            finally:
+                holder.stdin.close()
+                holder.wait(timeout=3)
+                holder.stdout.close()
+            self.assertEqual(calls, 2)
+            self.assertEqual(
+                paths.config.read_bytes(), service._post_build_canonical(expected)
+            )
+
+    @unittest.skipIf(os.name == "nt", "Guest owner lock is qualified on Linux")
+    def test_post_build_consumed_record_allows_later_generation_with_same_stale_environment(self):
+        import copy
+        from dataclasses import replace
+
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths, expected, old_raw, control, lock_path, environment = (
+                self._post_build_fixture(service, root)
+            )
+            holder = self._hold_post_build_operation_lock(lock_path)
+            try:
+                with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                        patch.dict(os.environ, environment, clear=True), \
+                        patch.object(service, "initialize_host_configuration", return_value=expected):
+                    self.assertEqual(service.ensure_configuration(paths), expected)
+            finally:
+                holder.stdin.close()
+                holder.wait(timeout=3)
+                holder.stdout.close()
+
+            expected_next = copy.deepcopy(expected)
+            expected_next["host_execution"]["runtime_generation_sha256"] = "c" * 64
+            with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                    patch.dict(os.environ, environment, clear=True), \
+                    patch.object(service, "initialize_host_configuration", return_value=expected_next), \
+                    patch.object(service, "_authenticated_terminal_drain", return_value=nullcontext(lambda: None)):
+                self.assertEqual(service.ensure_configuration(paths), expected_next)
+            self.assertEqual(json.loads(paths.config.read_bytes()), expected_next)
+            expected_third = copy.deepcopy(expected_next)
+            expected_third["host_execution"]["runtime_generation_sha256"] = "d" * 64
+            with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                    patch.dict(os.environ, environment, clear=True), \
+                    patch.object(service, "initialize_host_configuration", return_value=expected_third), \
+                    patch.object(service, "_authenticated_terminal_drain", return_value=nullcontext(lambda: None)):
+                self.assertEqual(service.ensure_configuration(paths), expected_third)
+
+    @unittest.skipIf(os.name == "nt", "Guest operation lease is qualified on Linux")
+    def test_post_build_rechecks_operation_under_owner_lock_before_publication(self):
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            paths, expected, old_raw, control, lock_path, environment = self._post_build_fixture(
+                service, Path(directory).resolve()
+            )
+            holder = self._hold_post_build_operation_lock(lock_path)
+            original = service._post_build_validate_current_evidence
+            def end_operation_after_evidence(*args, **kwargs):
+                original(*args, **kwargs)
+                (control / "development/attempts" / ("a" * 32) / "terminal.json").write_text("{}")
+            try:
+                with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                        patch.dict(os.environ, environment, clear=True), \
+                        patch.object(service, "initialize_host_configuration", return_value=expected), \
+                        patch.object(service, "_post_build_validate_current_evidence", side_effect=end_operation_after_evidence):
+                    with self.assertRaisesRegex(service.RuntimeServiceError, "terminal"):
+                        service.ensure_configuration(paths)
+            finally:
+                holder.stdin.close()
+                holder.wait(timeout=3)
+                holder.stdout.close()
+            self.assertEqual(paths.config.read_bytes(), old_raw)
+
+    @unittest.skipIf(os.name == "nt", "Guest owner proof is qualified on Linux")
+    def test_post_build_forged_consumed_digest_cannot_authorize_failed_owner(self):
+        import copy
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            paths, expected, old_raw, control, lock_path, environment = self._post_build_fixture(
+                service, Path(directory).resolve()
+            )
+            holder = self._hold_post_build_operation_lock(lock_path)
+            try:
+                with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                        patch.dict(os.environ, environment, clear=True), \
+                        patch.object(service, "initialize_host_configuration", return_value=expected):
+                    service.ensure_configuration(paths)
+            finally:
+                holder.stdin.close()
+                holder.wait(timeout=3)
+                holder.stdout.close()
+            consumed_path = service._post_build_consumed_path(paths, "a" * 32)
+            consumed = json.loads(consumed_path.read_bytes())
+            consumed["new_config_sha256"] = "e" * 64
+            consumed_path.write_bytes(service._post_build_canonical(consumed))
+            before = paths.config.read_bytes()
+            next_config = copy.deepcopy(expected)
+            next_config["host_execution"]["runtime_generation_sha256"] = "c" * 64
+            with patch.object(service, "BUILD_CONTROL_ROOT", control), \
+                    patch.dict(os.environ, environment, clear=True), \
+                    patch.object(service, "initialize_host_configuration", return_value=next_config):
+                with self.assertRaises(service.RuntimeServiceError):
+                    service.ensure_configuration(paths)
+            self.assertEqual(paths.config.read_bytes(), before)
 
     def _write_authenticated_drain_fixture(self, service, paths, *, include_service_owner=True):
         import copy

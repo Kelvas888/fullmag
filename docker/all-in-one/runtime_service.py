@@ -2262,7 +2262,817 @@ def _rotate_configuration_generation(
         _fail("runtime configuration generation publication did not retain the expected profile")
 
 
-def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
+POST_BUILD_START_SCHEMA = "fullmag.docker-post-build-failed-owner-start.v1"
+POST_BUILD_METADATA_SCHEMA = "fullmag.docker-post-build-failed-owner-continuation.v1"
+POST_BUILD_START_ENV = "FULLMAG_DOCKER_POST_BUILD_CONTINUATION"
+POST_BUILD_START_SHA_ENV = "FULLMAG_DOCKER_POST_BUILD_CONTINUATION_SHA256"
+POST_BUILD_CONSUMED_SCHEMA = "fullmag.docker-post-build-failed-owner-consumed.v1"
+POST_BUILD_CONSUMED_RELATIVE = PurePosixPath("post-build-continuation")
+POST_BUILD_MAX_BYTES = 512 * 1024
+POST_BUILD_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+POST_BUILD_IMAGE = re.compile(r"^sha256:[0-9a-f]{64}$")
+POST_BUILD_CONTAINER = re.compile(r"^[0-9a-f]{64}$")
+POST_BUILD_PROCESS_KEYS = (
+    "schema", "state", "api_pid", "api_exit_code", "accepted_store",
+    "bootstrap", "qualification", "error", "shutdown_error",
+)
+POST_BUILD_PROCESS_ERROR = (
+    "API binding did not become ready: API loopback probe failed for "
+    "/v2/platform/openapi.json: [Errno 111] Connection refused"
+)
+POST_BUILD_PROCESS_SHUTDOWN_ERROR = (
+    "no pinned runtime service owner was available for authenticated drain"
+)
+POST_BUILD_LIVE_OPERATION_STATES = frozenset(
+    {"starting", "starting-services", "running", "recreating-services", "resuming-observation"}
+)
+
+
+def _post_build_canonical(value: Mapping[str, Any]) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
+
+
+def _post_build_open_fd(path: Path, name: str, flags: int) -> int:
+    """Open one control-volume path with an fd-relative no-follow walk."""
+
+    path = _absolute(path, name)
+    if os.open not in getattr(os, "supports_dir_fd", set()):
+        _fail(f"{name} requires fd-relative path support")
+    parts = path.parts
+    if len(parts) < 2:
+        _fail(f"{name} is not a regular file path")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    parent = None
+    descriptor = None
+    try:
+        parent = os.open(path.anchor, directory_flags)
+        for component in parts[1:-1]:
+            child = os.open(component, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        descriptor = os.open(
+            parts[-1], flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+    except FileNotFoundError:
+        raise
+    except TypeError as error:
+        _fail(f"{name} cannot use fd-relative path resolution: {error}")
+    except OSError as error:
+        _fail(f"{name} cannot be opened safely: {error}")
+    finally:
+        if parent is not None:
+            os.close(parent)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        _fail(f"{name} is not a single-link regular file")
+    return descriptor
+
+
+def _post_build_read_bytes(path: Path, name: str, maximum: int = POST_BUILD_MAX_BYTES) -> bytes:
+    descriptor = _post_build_open_fd(path, name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_size > maximum:
+            _fail(f"{name} exceeds its size bound")
+        data = bytearray()
+        while len(data) <= maximum:
+            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > maximum:
+            _fail(f"{name} exceeds its size bound")
+        return bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def _post_build_read_optional_bytes(
+    path: Path, name: str, maximum: int = POST_BUILD_MAX_BYTES
+) -> bytes | None:
+    try:
+        return _post_build_read_bytes(path, name, maximum)
+    except FileNotFoundError:
+        return None
+
+
+def _post_build_json(raw: bytes, name: str, *, canonical: bool = False) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {constant}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        _fail(f"{name} is not valid JSON: {error}")
+    if not isinstance(value, dict):
+        _fail(f"{name} must contain a JSON object")
+    if canonical and raw != _post_build_canonical(value):
+        _fail(f"{name} is not canonical JSON")
+    return value
+
+
+def _post_build_read_json(path: Path, name: str, *, canonical: bool = False) -> tuple[bytes, dict[str, Any]]:
+    raw = _post_build_read_bytes(path, name)
+    return raw, _post_build_json(raw, name, canonical=canonical)
+
+
+def _post_build_digest(value: Any, name: str) -> str:
+    if not isinstance(value, str) or HEX64.fullmatch(value) is None or set(value) == {"0"}:
+        _fail(f"{name} is not a non-zero lowercase SHA-256")
+    return value
+
+
+def _post_build_token(value: Any, name: str) -> str:
+    if not isinstance(value, str) or POST_BUILD_TOKEN.fullmatch(value) is None:
+        _fail(f"{name} is not a lowercase operation token")
+    return value
+
+
+def _post_build_text(value: Any, name: str, maximum: int = 4096) -> str:
+    if (not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value
+            or any(ord(character) < 32 for character in value)):
+        _fail(f"{name} is not bounded text")
+    return value
+
+
+def _post_build_relative(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        _fail(f"{name} is not a bounded relative path")
+    parsed = PurePosixPath(value)
+    if (parsed.is_absolute() or str(parsed) != value or "\\" in value or ":" in value
+            or any(part in {"", ".", ".."} for part in parsed.parts)):
+        _fail(f"{name} escapes its control root")
+    return value
+
+
+def _post_build_control_path(value: Any, name: str) -> Path:
+    if not isinstance(value, str) or not value:
+        _fail(f"{name} is missing")
+    path = _absolute(Path(value), name)
+    try:
+        relative = path.relative_to(BUILD_CONTROL_ROOT)
+    except ValueError:
+        _fail(f"{name} is outside the build-control volume")
+    if str(path) != value or any(part in {"", ".", ".."} for part in relative.parts):
+        _fail(f"{name} is not a canonical build-control path")
+    return path
+
+
+
+def _post_build_validate_stable_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        _fail("post-build certificate stable identity is not an object")
+    profile = value.get("storage_profile")
+    if profile == WINDOWS_STORAGE_PROFILE:
+        required = {
+            "schema", "storage_profile", "role", "owner_scope", "owner_token", "engine_id",
+            "host_root", "host_filesystem", "host_drive_type", "host_volume_serial",
+            "host_root_no_reparse",
+        }
+        expected_schema = "fullmag.windows-folder-host.v1"
+        expected_scope = "docker-desktop-linux"
+    elif profile == LINUX_STORAGE_PROFILE:
+        required = {
+            "schema", "storage_profile", "role", "owner_scope", "owner_token", "engine_id",
+            "host_root", "host_filesystem", "host_platform", "host_device",
+            "host_root_no_reparse", "host_inode",
+        }
+        expected_schema = "fullmag.linux-native-host.v1"
+        expected_scope = "docker-linux"
+    else:
+        _fail("post-build certificate stable identity has an unsupported storage profile")
+    if set(value) != required or value.get("schema") != expected_schema \
+            or value.get("role") != "session" or value.get("owner_scope") != expected_scope:
+        _fail("post-build certificate stable identity fields differ")
+    owner_token = value.get("owner_token")
+    if profile == WINDOWS_STORAGE_PROFILE:
+        if not isinstance(owner_token, str) or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                owner_token,
+        ) is None or set(owner_token.replace("-", "")) == {"0"}:
+            _fail("post-build Windows stable owner token is invalid")
+    elif (not isinstance(owner_token, str) or re.fullmatch(r"[0-9a-f]{32}", owner_token) is None
+          or set(owner_token) == {"0"}):
+        _fail("post-build Linux stable owner token is invalid")
+    for field, maximum in (("engine_id", 256), ("host_root", 4096), ("host_filesystem", 64)):
+        _post_build_text(value.get(field), "post-build stable " + field, maximum)
+    if value.get("host_root_no_reparse") is not True:
+        _fail("post-build stable identity permits reparse roots")
+    if profile == WINDOWS_STORAGE_PROFILE:
+        if (type(value.get("host_drive_type")) is not int
+                or value["host_drive_type"] != 3
+                or type(value.get("host_volume_serial")) is not int
+                or value["host_volume_serial"] < 0):
+            _fail("post-build Windows stable volume identity is invalid")
+    else:
+        _post_build_text(value.get("host_platform"), "post-build stable host platform", 64)
+        if (type(value.get("host_device")) is not int or value["host_device"] <= 0
+                or type(value.get("host_inode")) is not int or value["host_inode"] <= 0):
+            _fail("post-build Linux stable volume identity is invalid")
+    return dict(value)
+
+
+def _post_build_certificate_stable_identity(certificate: Mapping[str, Any]) -> dict[str, Any]:
+    profile = certificate.get("storage_profile") if isinstance(certificate, Mapping) else None
+    fields = (
+        {
+            "schema", "storage_profile", "role", "owner_scope", "owner_token", "engine_id",
+            "host_root", "host_filesystem", "host_drive_type", "host_volume_serial",
+            "host_root_no_reparse",
+        }
+        if profile == WINDOWS_STORAGE_PROFILE else {
+            "schema", "storage_profile", "role", "owner_scope", "owner_token", "engine_id",
+            "host_root", "host_filesystem", "host_platform", "host_device",
+            "host_root_no_reparse", "host_inode",
+        }
+        if profile == LINUX_STORAGE_PROFILE else set()
+    )
+    if not fields:
+        _fail("post-build host certificate has an unsupported storage profile")
+    return _post_build_validate_stable_identity({key: certificate.get(key) for key in fields})
+
+def _post_build_validate_recreate(metadata: Mapping[str, Any]) -> None:
+    """Validate the host's completed recreation reference, not Docker semantics."""
+    record = metadata.get("recreate_operation")
+    fields = {
+        "schema", "operation_id", "terminal_relative", "terminal_sha256",
+        "retained_relative", "retained_sha256", "prior_terminal_sha256",
+        "prior_compose_sha256", "backend_container", "frontend_container", "image_id", "absence",
+    }
+    if (not isinstance(record, dict) or set(record) != fields
+            or record.get("schema") != "fullmag.docker-removed-recreation-container.v1"):
+        _fail("post-build recreation reference schema or fields differ")
+    token = _post_build_token(record["operation_id"], "post-build recreation attempt")
+    prefix = "recreate-services/attempts/" + token
+    if (record["terminal_relative"] != prefix + "/terminal.json"
+            or record["retained_relative"] != prefix + "/retained-containers.json"):
+        _fail("post-build recreation reference paths differ")
+    for field in ("terminal_sha256", "retained_sha256", "prior_terminal_sha256", "prior_compose_sha256"):
+        _post_build_digest(record[field], "post-build recreation " + field)
+    for field in ("backend_container", "frontend_container"):
+        if not isinstance(record[field], str) or POST_BUILD_CONTAINER.fullmatch(record[field]) is None:
+            _fail("post-build recreation container identity is invalid")
+    namespace = metadata["current_namespace"]
+    if (record["backend_container"] != namespace["container_id"]
+            or record["image_id"] != namespace["image_id"]
+            or record["backend_container"] == record["frontend_container"]):
+        _fail("post-build recreation does not bind the outgoing namespace")
+    absence = record["absence"]
+    if not isinstance(absence, dict) or set(absence) != {"backend", "frontend"}:
+        _fail("post-build recreation absence fields differ")
+    for service in ("backend", "frontend"):
+        item = absence[service]
+        if (not isinstance(item, dict) or set(item) != {
+                "container_id", "inspect_returncode", "inspect_output_sha256",
+                "ps_returncode", "ps_output_sha256"}
+                or item["container_id"] != record[service + "_container"]
+                or type(item["inspect_returncode"]) is not int or item["inspect_returncode"] == 0
+                or type(item["ps_returncode"]) is not int or item["ps_returncode"] != 0):
+            _fail("post-build recreation absence identity or outcome differs")
+        _post_build_digest(item["inspect_output_sha256"], "post-build Docker inspect absence")
+        _post_build_digest(item["ps_output_sha256"], "post-build Docker ps absence")
+
+
+def _post_build_read_recreate(metadata: Mapping[str, Any]) -> None:
+    record = metadata["recreate_operation"]
+    for path_field, digest_field in (("terminal_relative", "terminal_sha256"), ("retained_relative", "retained_sha256")):
+        path = BUILD_CONTROL_ROOT / record[path_field]
+        raw = _post_build_read_bytes(path, "post-build recreation evidence")
+        if _sha256_bytes(raw) != record[digest_field]:
+            _fail("post-build recreation evidence changed after host proof")
+        value = _post_build_json(raw, "post-build recreation evidence", canonical=True)
+        if path_field == "terminal_relative":
+            if (value.get("schema") != "fullmag.docker-build-operation.v1"
+                    or value.get("phase") != "recreate-services" or value.get("state") != "succeeded"
+                    or value.get("attempt") != record["operation_id"]
+                    or value.get("compose_project") != metadata["compose_project"]
+                    or value.get("removed_containers") != [record["backend_container"], record["frontend_container"]]):
+                _fail("post-build recreation terminal does not confirm the exact removed services")
+
+
+def _post_build_validate_metadata(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        _fail("post-build continuation metadata is not an object")
+    required = {
+        "schema", "state", "operation_id", "compose_project", "source_root", "source_identity",
+        "original_stop", "current_namespace", "failed_owner", "current_process",
+        "runtime_config", "certificate", "accepted_run", "recreate_operation",
+    }
+    if set(metadata) != required or metadata.get("schema") != POST_BUILD_METADATA_SCHEMA \
+            or metadata.get("state") != "authorized":
+        _fail("post-build continuation metadata schema or fields differ")
+    _post_build_token(metadata.get("operation_id"), "continuation operation")
+    _post_build_text(metadata.get("compose_project"), "continuation Compose project")
+    _post_build_text(metadata.get("source_root"), "continuation source root")
+    source = metadata["source_identity"]
+    if not isinstance(source, dict) or set(source) != {"project_id", "worktree_id", "checkout_kind"}:
+        _fail("continuation source identity is incomplete")
+    for field in source:
+        _post_build_text(source[field], "continuation source " + field, 256)
+
+    original = metadata["original_stop"]
+    original_fields = {
+        "relative", "sha256", "container_id", "image_id", "failure_kind",
+        "native_failure_probe_sha256", "terminal_process_sha256", "terminal_owner_sha256",
+    }
+    if not isinstance(original, dict) or set(original) != original_fields:
+        _fail("continuation original stop record is incomplete")
+    _post_build_relative(original["relative"], "continuation original stop path")
+    for field in ("sha256", "native_failure_probe_sha256", "terminal_process_sha256", "terminal_owner_sha256"):
+        _post_build_digest(original[field], "continuation original stop " + field)
+    if (not isinstance(original["container_id"], str)
+            or POST_BUILD_CONTAINER.fullmatch(original["container_id"]) is None
+            or set(original["container_id"]) == {"0"}):
+        _fail("continuation original container is invalid")
+    if (not isinstance(original["image_id"], str)
+            or POST_BUILD_IMAGE.fullmatch(original["image_id"]) is None
+            or set(original["image_id"][7:]) == {"0"}):
+        _fail("continuation original image is invalid")
+    _post_build_text(original["failure_kind"], "continuation failure kind", 64)
+
+    namespace = metadata["current_namespace"]
+    namespace_fields = {"container_id", "image_id", "started_at", "finished_at", "exit_code"}
+    if not isinstance(namespace, dict) or set(namespace) != namespace_fields:
+        _fail("continuation current namespace is incomplete")
+    if (not isinstance(namespace["container_id"], str)
+            or POST_BUILD_CONTAINER.fullmatch(namespace["container_id"]) is None
+            or set(namespace["container_id"]) == {"0"}):
+        _fail("continuation current container is invalid")
+    if (not isinstance(namespace["image_id"], str)
+            or POST_BUILD_IMAGE.fullmatch(namespace["image_id"]) is None
+            or set(namespace["image_id"][7:]) == {"0"}):
+        _fail("continuation current image is invalid")
+    _post_build_text(namespace["started_at"], "continuation current StartedAt")
+    _post_build_text(namespace["finished_at"], "continuation current FinishedAt")
+    if type(namespace["exit_code"]) is not int:
+        _fail("continuation current exit code is invalid")
+
+    owner = metadata["failed_owner"]
+    if not isinstance(owner, dict) or set(owner) != {"relative", "sha256", "identity"}:
+        _fail("continuation Failed owner record is incomplete")
+    if owner["relative"] != "runtime-control/runtime-services/OWNER.json":
+        _fail("continuation Failed owner path differs")
+    _post_build_digest(owner["sha256"], "continuation Failed owner")
+    identity_fields = {
+        "owner_token", "process_start_token", "pid", "host", "target_id", "control_address",
+        "build_commit", "build_snapshot", "compute_pool_id", "preparation_pool_id",
+        "compute_pool_generation", "preparation_pool_generation",
+    }
+    if not isinstance(owner["identity"], dict) or set(owner["identity"]) != identity_fields:
+        _fail("continuation Failed owner identity differs")
+
+    process = metadata["current_process"]
+    process_fields = {
+        "relative", "sha256", "immutable_keys", "api_pid", "api_exit_code",
+        "error_sha256", "shutdown_error_sha256",
+    }
+    if not isinstance(process, dict) or set(process) != process_fields:
+        _fail("continuation process record is incomplete")
+    if process["relative"] != "runtime-control/runtime-service/process-tree.json":
+        _fail("continuation process path differs")
+    _post_build_digest(process["sha256"], "continuation process")
+    if process["immutable_keys"] != list(POST_BUILD_PROCESS_KEYS):
+        _fail("continuation process immutable keys differ")
+    if (type(process["api_pid"]) is not int or process["api_pid"] <= 0
+            or type(process["api_exit_code"]) is not int
+            or process["api_exit_code"] != 101):
+        _fail("continuation process identity differs")
+    for field in ("error_sha256", "shutdown_error_sha256"):
+        _post_build_digest(process[field], "continuation process " + field)
+
+    config = metadata["runtime_config"]
+    if not isinstance(config, dict) or set(config) != {"relative", "sha256"}:
+        _fail("continuation runtime config record is incomplete")
+    if config["relative"] != "runtime-control/runtime-service/docker-all.json":
+        _fail("continuation runtime config path differs")
+    _post_build_digest(config["sha256"], "continuation runtime config")
+
+    certificate = metadata["certificate"]
+    certificate_fields = {
+        "historical_certificate_sha256", "historical_owner_marker_sha256",
+        "stable_identity", "storage_profile", "restart_verified",
+    }
+    if not isinstance(certificate, dict) or set(certificate) != certificate_fields:
+        _fail("continuation certificate is incomplete")
+    _post_build_digest(
+        certificate["historical_certificate_sha256"], "continuation historical certificate"
+    )
+    _post_build_digest(
+        certificate["historical_owner_marker_sha256"], "continuation historical owner marker"
+    )
+    stable_identity = _post_build_validate_stable_identity(certificate["stable_identity"])
+    if certificate["storage_profile"] != stable_identity["storage_profile"]:
+        _fail("continuation certificate profile differs from stable identity")
+    if certificate["restart_verified"] is not True:
+        _fail("continuation certificate is not restart_verified")
+
+    _post_build_validate_recreate(metadata)
+    accepted = metadata["accepted_run"]
+    if accepted != {}:
+        accepted_fields = {
+            "schema", "state", "run_id", "project_id", "store_run_relative", "request_relative",
+            "proof_relative", "source_root", "source_relative", "compose_project", "control_volume",
+            "logical_session_id", "session_epoch", "stop_verification_relative",
+            "terminal_process_record_relative", "terminal_owner_record_relative", "development_attempt",
+            "activation_attempt", "reconciliation_attempt", "backend_container", "image_id",
+            "request_sha256", "proof_sha256", "terminal_process_record_sha256",
+            "terminal_owner_record_sha256", "stop_reconcile_proof_sha256", "stop_verification_sha256",
+            "catalog_revision", "task_count",
+        }
+        if not isinstance(accepted, dict) or set(accepted) != accepted_fields:
+            _fail("continuation accepted-run record is incomplete")
+        if (accepted["schema"] != "fullmag.docker-accepted-run-reattach-producer.v1"
+                or accepted["state"] != "prepared"):
+            _fail("continuation accepted-run record is not prepared")
+        for field in (
+            "request_sha256", "proof_sha256", "terminal_process_record_sha256",
+            "terminal_owner_record_sha256", "stop_reconcile_proof_sha256", "stop_verification_sha256",
+        ):
+            _post_build_digest(accepted[field], "continuation accepted-run " + field)
+        for field in (
+            "run_id", "project_id", "store_run_relative", "request_relative", "proof_relative",
+            "source_root", "source_relative", "compose_project", "control_volume",
+            "logical_session_id", "stop_verification_relative",
+            "terminal_process_record_relative", "terminal_owner_record_relative",
+            "development_attempt", "activation_attempt", "reconciliation_attempt",
+        ):
+            _post_build_text(accepted[field], "continuation accepted-run " + field)
+        for field in (
+            "source_relative", "stop_verification_relative", "terminal_process_record_relative",
+            "terminal_owner_record_relative",
+        ):
+            _post_build_relative(accepted[field], "continuation accepted-run " + field)
+        accepted_backend = accepted["backend_container"]
+        if (not isinstance(accepted_backend, str)
+                or POST_BUILD_CONTAINER.fullmatch(accepted_backend) is None):
+            _fail("continuation accepted-run backend container is invalid")
+        accepted_image = accepted["image_id"]
+        if (not isinstance(accepted_image, str)
+                or POST_BUILD_IMAGE.fullmatch(accepted_image) is None):
+            _fail("continuation accepted-run image is invalid")
+        if accepted["stop_verification_relative"] != (
+                "verification/stop-failed-" + accepted_backend + ".json"):
+            _fail("continuation accepted-run stop path is not bound to its backend")
+        if (type(accepted["session_epoch"]) is not int or accepted["session_epoch"] <= 0
+                or type(accepted["catalog_revision"]) is not int
+                or accepted["catalog_revision"] <= 0
+                or type(accepted["task_count"]) is not int
+                or accepted["task_count"] <= 0):
+            _fail("continuation accepted-run catalog pin is invalid")
+    return dict(metadata)
+
+
+def _post_build_validate_binding_document(binding: Any) -> dict[str, Any]:
+    if not isinstance(binding, dict):
+        _fail("post-build start binding is not an object")
+    required = {
+        "schema", "state", "attempt", "receipt_relative", "active_relative", "active_token",
+        "continuation_relative", "continuation_sha256", "previous_config_sha256", "continuation",
+    }
+    if set(binding) != required or binding.get("schema") != POST_BUILD_START_SCHEMA:
+        _fail("post-build start binding schema or fields differ")
+    if binding.get("state") not in {"pending", "consumed"}:
+        _fail("post-build start binding state is unsupported")
+    token = _post_build_token(binding.get("attempt"), "post-build start attempt")
+    if binding.get("active_relative") != "active" or binding.get("active_token") != token:
+        _fail("post-build start binding active marker differs")
+    expected_root = f"development/attempts/{token}"
+    if binding.get("receipt_relative") != expected_root + "/receipt.json":
+        _fail("post-build start binding receipt path differs")
+    expected_relative = expected_root + "/post-build-continuation.json"
+    if binding.get("continuation_relative") != expected_relative:
+        _fail("post-build start binding continuation path differs")
+    metadata = _post_build_validate_metadata(binding.get("continuation"))
+    metadata_sha = _sha256_bytes(_post_build_canonical(metadata))
+    if binding.get("continuation_sha256") != metadata_sha:
+        _fail("post-build continuation digest differs")
+    previous_sha = _post_build_digest(binding.get("previous_config_sha256"), "post-build previous config")
+    if previous_sha != metadata["runtime_config"]["sha256"]:
+        _fail("post-build previous config differs from continuation proof")
+    return dict(binding)
+
+
+def _post_build_validate_operation_lock() -> None:
+    """Require the host helper's operation lease to remain genuinely held."""
+
+    try:
+        import fcntl
+    except ImportError as error:
+        _fail(f"post-build operation lease cannot be checked: {error}")
+    descriptor = _post_build_open_fd(
+        BUILD_CONTROL_ROOT / "operation.lock", "post-build operation lock", os.O_RDWR
+    )
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        except OSError as error:
+            if getattr(error, "errno", None) == 11:
+                return
+            _fail(f"post-build operation lease cannot be checked: {error}")
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _fail("post-build operation lease is not held")
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _post_build_failed_owner_lock(paths: RuntimePaths):
+    """Hold OWNER.lock while rechecking failed-owner evidence and publishing."""
+
+    lock_path = runtime_services_root(paths) / "OWNER.lock"
+    _assert_no_links(lock_path, "post-build runtime service owner lock")
+    try:
+        import fcntl
+    except ImportError as error:
+        _fail(f"post-build runtime service owner lock cannot be checked: {error}")
+    descriptor = _post_build_open_fd(
+        lock_path, "post-build runtime service owner lock", os.O_RDWR
+    )
+    try:
+        identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        _assert_owner_lock_identity(lock_path, descriptor, identity)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _fail("post-build runtime service owner is still active")
+        except OSError as error:
+            if getattr(error, "errno", None) == 11:
+                _fail("post-build runtime service owner is still active")
+            _fail(f"post-build runtime service owner lock cannot be checked: {error}")
+        try:
+            _assert_owner_lock_identity(lock_path, descriptor, identity)
+            yield lambda: _assert_owner_lock_identity(lock_path, descriptor, identity)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _post_build_validate_process(raw: bytes, process: Mapping[str, Any], proof: Mapping[str, Any]) -> None:
+    if set(process) != set(POST_BUILD_PROCESS_KEYS):
+        _fail("post-build current process receipt is not the exact nine-key receipt")
+    if process.get("schema") != "fullmag.docker-process-tree.v1" or process.get("state") != "shutdown_unknown":
+        _fail("post-build current process receipt is not shutdown_unknown")
+    if (type(process.get("api_pid")) is not int or process["api_pid"] <= 0
+            or type(process.get("api_exit_code")) is not int
+            or process.get("api_exit_code") != 101):
+        _fail("post-build current process receipt API identity differs")
+    store = _post_build_text(process.get("accepted_store"), "post-build accepted store")
+    if (not PurePosixPath(store).is_absolute() or ".." in PurePosixPath(store).parts
+            or not isinstance(process.get("bootstrap"), dict)
+            or process.get("qualification") != "NOT VERIFIED"):
+        _fail("post-build current process receipt has invalid store/bootstrap/qualification fields")
+    if process.get("error") != POST_BUILD_PROCESS_ERROR \
+            or process.get("shutdown_error") != POST_BUILD_PROCESS_SHUTDOWN_ERROR:
+        _fail("post-build current process receipt failure text differs")
+    process_proof = proof["current_process"]
+    if (_sha256_bytes(raw) != process_proof["sha256"]
+            or _sha256_bytes(process["error"].encode()) != process_proof["error_sha256"]
+            or _sha256_bytes(process["shutdown_error"].encode()) != process_proof["shutdown_error_sha256"]):
+        _fail("post-build current process receipt changed after host proof")
+
+
+def _post_build_validate_current_evidence(
+    paths: RuntimePaths, metadata: Mapping[str, Any], accepted_preflight: Mapping[str, Any] | None
+) -> None:
+    _post_build_read_recreate(metadata)
+    expected_project = metadata["compose_project"]
+    current_project = os.environ.get("FULLMAG_COMPOSE_PROJECT")
+    if current_project is not None and current_project != expected_project:
+        _fail("post-build Compose project differs from host proof")
+    expected_source = metadata["source_root"]
+    current_source = os.environ.get("FULLMAG_SOURCE_HOST_ROOT")
+    if current_source is not None and current_source != expected_source:
+        _fail("post-build source root differs from host proof")
+    for field, environment_name in (
+        ("project_id", "FULLMAG_SOURCE_PROJECT_ID"),
+        ("worktree_id", "FULLMAG_SOURCE_WORKTREE_ID"),
+        ("checkout_kind", "FULLMAG_SOURCE_CHECKOUT_KIND"),
+    ):
+        observed = os.environ.get(environment_name)
+        if observed is not None and observed != metadata["source_identity"][field]:
+            _fail("post-build source identity differs from host proof")
+
+    owner_proof = metadata["failed_owner"]
+    owner_raw = _post_build_read_bytes(
+        runtime_services_root(paths) / "OWNER.json", "post-build current Failed OWNER.json"
+    )
+    if _sha256_bytes(owner_raw) != owner_proof["sha256"]:
+        _fail("post-build current Failed OWNER.json changed after host proof")
+    owner = _post_build_json(owner_raw, "post-build current Failed OWNER.json")
+    if owner.get("schema_version") != "runtime_service_owner.v1" or owner.get("state") != "failed":
+        _fail("post-build current owner is not the retained Failed owner")
+    if _owner_identity(owner) != owner_proof["identity"]:
+        _fail("post-build current owner identity differs from host proof")
+
+    process_raw, process = _post_build_read_json(
+        process_receipt_path(paths), "post-build current process receipt"
+    )
+    _post_build_validate_process(process_raw, process, metadata)
+
+    certificate_proof = metadata["certificate"]
+    certificate_raw = _post_build_read_bytes(paths.host_certificate, "post-build host certificate")
+    certificate = _post_build_json(certificate_raw, "post-build host certificate")
+    profile = certificate_proof["storage_profile"]
+    stable_identity = _post_build_certificate_stable_identity(certificate)
+    if (stable_identity != certificate_proof["stable_identity"]
+            or certificate.get("restart_verified") is not True):
+        _fail("post-build host certificate stable identity differs from host proof")
+    # The historical namespace belongs to the outgoing image. The existing
+    # storage gates attest the incoming certificate; bind it to this runtime.
+    runtime_image = os.environ.get("FULLMAG_RUNTIME_IMAGE_ID")
+    if (not isinstance(runtime_image, str) or POST_BUILD_IMAGE.fullmatch(runtime_image) is None
+            or runtime_image != certificate.get("image_id")):
+        _fail("post-build runtime image differs from the retained host certificate")
+    marker_name = (
+        ".fullmag-windows-folder-owner.json"
+        if profile == WINDOWS_STORAGE_PROFILE else ".fullmag-linux-native-owner.json"
+    )
+    marker_raw = _post_build_read_bytes(
+        paths.state / marker_name, "post-build host owner marker"
+    )
+    marker = _post_build_json(marker_raw, "post-build host owner marker")
+    if marker != certificate:
+        _fail("post-build host certificate and owner marker differ")
+    profile_env = os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE")
+    if profile_env is not None and profile_env != profile:
+        _fail("post-build host storage profile differs from host proof")
+
+    accepted = metadata["accepted_run"]
+    request = os.environ.get(ACCEPTED_REATTACH_REQUEST_ENV)
+    request_sha = os.environ.get(ACCEPTED_REATTACH_DIGEST_ENV)
+    if accepted == {}:
+        if accepted_preflight is not None or request is not None or request_sha is not None:
+            _fail("post-build accepted-run environment was added after host proof")
+    else:
+        if not isinstance(accepted_preflight, Mapping):
+            _fail("post-build accepted-run preflight is unavailable")
+        if (request_sha != accepted["request_sha256"]
+                or accepted_preflight.get("request_sha256") != accepted["request_sha256"]
+                or accepted_preflight.get("proof_sha256") != accepted["proof_sha256"]):
+            _fail("post-build accepted-run pins differ from host proof")
+
+
+def _post_build_consumed_path(paths: RuntimePaths, token: str) -> Path:
+    return runtime_services_root(paths) / POST_BUILD_CONSUMED_RELATIVE / token / "consumed.json"
+
+
+def _post_build_read_consumed(
+    paths: RuntimePaths, binding: Mapping[str, Any]
+) -> bool:
+    token = binding["attempt"]
+    raw = _post_build_read_optional_bytes(
+        _post_build_consumed_path(paths, token), "post-build consumed record"
+    )
+    if raw is None:
+        return False
+    record = _post_build_json(raw, "post-build consumed record", canonical=True)
+    required = {
+        "schema", "state", "attempt", "binding_sha256", "continuation_sha256",
+        "previous_config_sha256", "new_config_sha256",
+    }
+    if (set(record) != required or record.get("schema") != POST_BUILD_CONSUMED_SCHEMA
+            or record.get("state") != "consumed" or record.get("attempt") != token):
+        _fail("post-build consumed record schema or fields differ")
+    binding_path = _post_build_control_path(
+        os.environ[POST_BUILD_START_ENV], "post-build continuation path"
+    )
+    binding_raw = _post_build_read_bytes(binding_path, "post-build continuation binding")
+    _post_build_digest(record.get("new_config_sha256"), "post-build consumed configuration")
+    if (record.get("binding_sha256") != _sha256_bytes(binding_raw)
+            or record.get("continuation_sha256") != binding["continuation_sha256"]
+            or record.get("previous_config_sha256") != binding["previous_config_sha256"]
+            or not HEX64.fullmatch(record.get("new_config_sha256", ""))):
+        _fail("post-build consumed record pin differs")
+    return True
+
+
+def _post_build_publish_consumed(
+    paths: RuntimePaths, binding: Mapping[str, Any], new_config_sha256: str
+) -> None:
+    binding_path = _post_build_control_path(
+        os.environ[POST_BUILD_START_ENV], "post-build continuation path"
+    )
+    binding_raw = _post_build_read_bytes(binding_path, "post-build continuation binding")
+    record = {
+        "schema": POST_BUILD_CONSUMED_SCHEMA,
+        "state": "consumed",
+        "attempt": binding["attempt"],
+        "binding_sha256": _sha256_bytes(binding_raw),
+        "continuation_sha256": binding["continuation_sha256"],
+        "previous_config_sha256": binding["previous_config_sha256"],
+        "new_config_sha256": _post_build_digest(new_config_sha256, "post-build new config"),
+    }
+    _publish_accepted_reattach_record(
+        _post_build_consumed_path(paths, binding["attempt"]), record,
+        "post-build consumed record",
+    )
+    current_raw = _post_build_read_bytes(paths.config, "runtime configuration after consumed publication")
+    if _sha256_bytes(current_raw) != new_config_sha256:
+        _fail("post-build consumed record does not match the published configuration")
+    if not _post_build_read_consumed(paths, binding):
+        _fail("post-build consumed record publication could not be verified")
+
+
+def _post_build_binding_state(
+    paths: RuntimePaths,
+    current_raw: bytes,
+    *,
+    accepted_preflight: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    configured_path = os.environ.get(POST_BUILD_START_ENV)
+    configured_sha = os.environ.get(POST_BUILD_START_SHA_ENV)
+    if configured_path is None and configured_sha is None:
+        return None
+    if not configured_path or not configured_sha:
+        _fail("post-build continuation requires both private controls")
+    _post_build_digest(configured_sha, "post-build continuation binding digest")
+    binding_path = _post_build_control_path(configured_path, "post-build continuation path")
+    binding_raw, binding = _post_build_read_json(
+        binding_path, "post-build continuation binding", canonical=True
+    )
+    if _sha256_bytes(binding_raw) != configured_sha:
+        _fail("post-build continuation binding digest differs")
+    binding = _post_build_validate_binding_document(binding)
+    expected_path = BUILD_CONTROL_ROOT / binding["continuation_relative"]
+    if binding_path != expected_path:
+        _fail("post-build continuation binding path differs")
+    receipt_path = _post_build_control_path(
+        str(BUILD_CONTROL_ROOT / binding["receipt_relative"]),
+        "post-build operation receipt",
+    )
+    _, receipt = _post_build_read_json(
+        receipt_path, "post-build development operation receipt", canonical=True
+    )
+    metadata = binding["continuation"]
+    if (receipt.get("schema") != "fullmag.docker-build-operation.v1"
+            or receipt.get("phase") != "development"
+            or receipt.get("attempt") != binding["attempt"]
+            or receipt.get("compose_project") != metadata["compose_project"]):
+        _fail("post-build operation receipt identity differs")
+    inputs = receipt.get("inputs")
+    if (not isinstance(inputs, dict) or inputs.get("source_root") != metadata["source_root"]
+            or inputs.get("source_project_id") != metadata["source_identity"]["project_id"]
+            or inputs.get("source_worktree_id") != metadata["source_identity"]["worktree_id"]
+            or inputs.get("source_checkout_kind") != metadata["source_identity"]["checkout_kind"]
+            or inputs.get("image_id") != os.environ.get("FULLMAG_RUNTIME_IMAGE_ID")
+            or receipt.get("post_build_generation") != metadata
+            or inputs.get("post_build_generation") != metadata):
+        _fail("post-build operation receipt source or continuation differs")
+    reference = receipt.get("post_build_start")
+    reference_fields = {"schema", "state", "path", "sha256", "continuation_sha256"}
+    if (not isinstance(reference, dict) or set(reference) != reference_fields
+            or reference.get("schema") != POST_BUILD_START_SCHEMA
+            or reference.get("path") != configured_path
+            or reference.get("sha256") != configured_sha
+            or reference.get("continuation_sha256") != binding["continuation_sha256"]):
+        _fail("post-build operation receipt binding reference differs")
+    if reference.get("state") not in {"pending", "consumed"}:
+        _fail("post-build operation receipt binding state is unsupported")
+    if reference["state"] == "consumed" and binding["state"] != "pending":
+        _fail("post-build consumed reference has an unexpected binding state")
+    if reference["state"] == "pending" and binding["state"] == "consumed":
+        _fail("post-build pending reference has a consumed binding")
+
+    if _post_build_read_consumed(paths, binding):
+        return {"state": "consumed", "binding": binding}
+    if reference["state"] == "consumed":
+        _fail("post-build operation marked consumed without an immutable consumed record")
+
+    active_path = _post_build_control_path(
+        str(BUILD_CONTROL_ROOT / binding["active_relative"]), "post-build active marker path"
+    )
+    active_raw = _post_build_read_optional_bytes(active_path, "post-build active marker", 128)
+    if active_raw != (binding["active_token"] + "\n").encode("ascii"):
+        _fail("post-build active marker differs from the bound attempt")
+    terminal_path = receipt_path.with_name("terminal.json")
+    if _post_build_read_optional_bytes(terminal_path, "post-build operation terminal") is not None:
+        _fail("post-build operation already has a terminal record")
+    if receipt.get("state") not in POST_BUILD_LIVE_OPERATION_STATES:
+        _fail("post-build operation is not live")
+    _post_build_validate_operation_lock()
+    return {
+        "state": "pending",
+        "binding": binding,
+        "previous_config_sha256": binding["previous_config_sha256"],
+    }
+
+def ensure_configuration(
+    paths: RuntimePaths | None = None,
+    *,
+    accepted_preflight: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     paths = paths or canonical_paths()
     host_mode = os.environ.get("FULLMAG_DOCKER_HOST_EXECUTION", "1")
     if host_mode != "1":
@@ -2277,18 +3087,87 @@ def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
         _fail("FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256 requires native host mode and a lowercase SHA-256")
     expected = initialize_host_configuration(paths, device_access)
     try:
-        current = _read_json(paths.config, "runtime service configuration")
+        current_raw = _bounded_regular(paths.config, "runtime service configuration")
+        current = _post_build_json(current_raw, "runtime service configuration")
     except FileNotFoundError:
-        if previous_sha256 is not None:
+        if previous_sha256 is not None or (
+            os.environ.get(POST_BUILD_START_ENV) is not None
+            or os.environ.get(POST_BUILD_START_SHA_ENV) is not None
+        ):
             _fail("authorized recreate runtime configuration is missing")
         _atomic_json(paths.config, expected, "runtime service configuration")
         return expected
+
+    post_build = _post_build_binding_state(
+        paths, current_raw, accepted_preflight=accepted_preflight
+    )
+    if post_build is not None and post_build["state"] == "consumed":
+        # A consumed record is a permanent fence for the old host pin, but it
+        # does not pin the current generation forever.  Continue through the
+        # ordinary authenticated-drain path if the expected generation changed.
+        previous_sha256 = None
+    elif post_build is not None:
+        bound_previous = post_build["previous_config_sha256"]
+        if previous_sha256 != bound_previous:
+            _fail("post-build continuation does not match the previous config pin")
+        expected_raw = (
+            json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        expected_sha256 = _sha256_bytes(expected_raw)
+        current_sha256 = _sha256_bytes(current_raw)
+        if current_sha256 not in {bound_previous, expected_sha256}:
+            _fail("post-build runtime configuration differs from both pinned generations")
+        with _post_build_failed_owner_lock(paths) as assert_owner_lock:
+            # Re-read the immutable acknowledgement and all mutable evidence
+            # under OWNER.lock.  The initial scan may have raced publication.
+            if _post_build_read_consumed(paths, post_build["binding"]):
+                previous_sha256 = None
+            else:
+                _post_build_validate_current_evidence(
+                    paths, post_build["binding"]["continuation"], accepted_preflight
+                )
+                assert_owner_lock()
+                current_raw = _post_build_read_bytes(
+                    paths.config, "runtime service configuration under owner lock"
+                )
+                current = _post_build_json(
+                    current_raw, "runtime service configuration under owner lock"
+                )
+                current_sha256 = _sha256_bytes(current_raw)
+                if current_sha256 not in {bound_previous, expected_sha256}:
+                    _fail("post-build runtime configuration changed under owner lock")
+                # Recheck the exact operation while holding OWNER.lock, after
+                # all evidence reads and immediately before publication.
+                refreshed = _post_build_binding_state(
+                    paths, current_raw, accepted_preflight=accepted_preflight
+                )
+                if refreshed != post_build:
+                    _fail("post-build operation changed before configuration publication")
+                if current_sha256 == expected_sha256:
+                    assert_owner_lock()
+                    _post_build_publish_consumed(
+                        paths, post_build["binding"], expected_sha256
+                    )
+                    return expected
+                _rotate_configuration_generation(
+                    paths, current, expected, bound_previous
+                )
+                published_raw = _post_build_read_bytes(
+                    paths.config, "runtime configuration after post-build rotation"
+                )
+                if _sha256_bytes(published_raw) != expected_sha256:
+                    _fail("post-build runtime configuration publication differs")
+                assert_owner_lock()
+                _post_build_publish_consumed(
+                    paths, post_build["binding"], expected_sha256
+                )
+                return expected
+
     if current != expected:
         if previous_sha256 is None:
             # A normal Docker restart has no host-side config digest.  Derive
             # it from the exact current bytes only after the previous native
-            # owner has published an authenticated, successful drain.  The
-            # lock and all owner/pin/receipt checks remain inside this fence.
+            # owner has published an authenticated, successful drain.
             with _authenticated_terminal_drain(paths) as assert_owner_lock:
                 previous_sha256 = hashlib.sha256(
                     _bounded_regular(paths.config, "runtime configuration before automatic rotation")
@@ -2296,13 +3175,8 @@ def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
                 assert_owner_lock()
                 _rotate_configuration_generation(paths, current, expected, previous_sha256)
         else:
-            # A direct recreate pin is one-shot.  After its first successful
-            # rotation, the same Compose environment can survive a later
-            # restart while still carrying the old digest.  Do not treat a
-            # stale pin as authorization for the new current bytes: require
-            # the same authenticated terminal drain used by an ordinary
-            # restart, then derive the exact digest while holding its owner
-            # lock.  Failed/unknown owners cannot satisfy that fence.
+            # A direct recreate pin is one-shot.  A stale pin can authorize a
+            # second generation only after the normal authenticated drain.
             current_raw = _bounded_regular(
                 paths.config, "runtime configuration before stale-pin check"
             )
