@@ -223,6 +223,13 @@ def docker_capture(*args, data=None, timeout=90, allow_failure=False, env=None):
     return result
 
 
+def docker_text(*args, timeout=90, combined=False):
+    """Run one bounded Docker observation and decode its output."""
+
+    result = docker_capture(*args, timeout=timeout)
+    return (result.stdout + (result.stderr if combined else b"")).decode("utf-8", "replace")
+
+
 def compose_capture(document, *args, timeout=90):
     return docker_capture("compose", "--project-name", document["name"], "-f", "-",
                           *args, data=canonical(document), timeout=timeout).stdout

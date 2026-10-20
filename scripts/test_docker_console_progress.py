@@ -146,6 +146,9 @@ assert docker_build_control.mirror_console(b"progress\\n") is False
         control = build_control.BuildControl.__new__(build_control.BuildControl)
         control.project = "fullmag-test"
         control.volume = "fullmag-build-control-test"
+        control.namespace = ""
+        control.namespace_registry = None
+        control.namespace_registry_sha256 = None
         control.helper_args = lambda *args, **kwargs: ["fake-control-helper"]
         control.space = lambda: {"available_bytes": 64 * 1024**3}
         control._line = Mock(side_effect=("READY", "LOGGED"))

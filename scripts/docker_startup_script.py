@@ -37,10 +37,22 @@ AUTHORIZATION_KIND = "explicit_startup_script"
 # this beside the existing `/v1/internal/live/current/*` runner bridge and
 # applies the normal current-session/epoch owner fence there.
 STARTUP_ENDPOINT = "/v1/internal/live/current/startup"
+RETIREMENT_ENDPOINT = "/v1/internal/live/current/retire"
+RETIREMENT_REQUEST_SCHEMA = "fullmag.live-workspace-retirement-request.v1"
+RETIREMENT_RESPONSE_SCHEMA = "fullmag.live-workspace-retirement-response.v1"
+RETIREMENT_DIAGNOSTIC_SCHEMA = "fullmag.live-retirement-diagnostic.v1"
+RETIREMENT_TIMEOUT_SECONDS = 30.0
+# These canonical codes are emitted before archive publication or pointer
+# mutation. Unknown codes stay quarantined after a POST.
+RETIREMENT_NO_MUTATION_CODES = frozenset({
+    "live_retirement_invalid_request", "live_retirement_current_mismatch",
+    "live_retirement_runtime_not_terminal", "live_retirement_busy",
+})
 MAX_SCRIPT_BYTES = 1024 * 1024
 MAX_PROVENANCE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_ACTIVATION_RECEIPT_BYTES = 2 * MAX_RESPONSE_BYTES
+MAX_RETIREMENT_MANIFEST_BYTES = 512 * 1024
 STARTUP_ACTIVATION_TIMEOUT_SECONDS = 2100.0
 MAX_STARTUP_REJECTION_MESSAGE_CHARS = 2048
 STARTUP_REJECTION_TRUNCATION_MARKER = "\n...[message middle truncated]...\n"
@@ -116,6 +128,44 @@ class StartupActivationOutcomeUnknown(StartupScriptError):
             "durable_state": "started",
             "error": str(message)[-4096:],
         }
+        super().__init__(self.diagnostic["error"])
+
+
+class RetirementRefused(StartupScriptError):
+    """A verified refusal before this operation could mutate the workspace."""
+
+    def __init__(self, operation_id: str, code: str):
+        if code not in RETIREMENT_NO_MUTATION_CODES | {"preflight_failed"}:
+            raise StartupScriptError("retirement refusal code is invalid")
+        self.diagnostic = {
+            "schema": "fullmag.live-retirement-refusal.v1",
+            "state": "refused",
+            "operation_id": _validate_request_id(operation_id),
+            "code": code,
+        }
+        super().__init__("workspace retirement refused before mutation: " + code)
+
+
+class RetirementOutcomeUnknown(StartupScriptError):
+    """The retirement POST may have committed without a visible response."""
+
+    def __init__(
+        self,
+        operation_id: str,
+        phase: str,
+        message: str,
+        *,
+        retirement: Mapping[str, Any] | None = None,
+    ):
+        self.diagnostic = {
+            "schema": RETIREMENT_DIAGNOSTIC_SCHEMA,
+            "state": "unknown",
+            "operation_id": operation_id,
+            "phase": phase,
+            "error": str(message)[-4096:],
+        }
+        if retirement is not None:
+            self.diagnostic["retirement"] = dict(retirement)
         super().__init__(self.diagnostic["error"])
 
 
@@ -390,6 +440,64 @@ def _exclusive_json(
     return hashlib.sha256(payload).hexdigest()
 
 
+def _exclusive_retirement_intent(path: Path, value: Mapping[str, Any]) -> None:
+    """Publish complete flushed bytes atomically without replacing a racer.
+
+    Linking the completed same-directory temp is an exclusive publication;
+    a crash before linking leaves no final marker, and a crash afterwards
+    leaves a complete intent. No retirement POST precedes parent fsync.
+    """
+    parent = _no_reparse_path(path.parent, "retirement intent parent", require_directory=True)
+    payload = _json_payload(value, MAX_RETIREMENT_RECEIPT_BYTES, "retirement intent")
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    temporary = parent / temporary_name
+    descriptor = parent_fd = None
+    created = False
+    try:
+        with _pinned_parent(parent):
+            if os.name != "nt":
+                parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+            descriptor = os.open(temporary_name if parent_fd is not None else temporary,
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                                 | getattr(os, "O_BINARY", 0), 0o660, dir_fd=parent_fd)
+            created = True
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("short retirement intent write")
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            try:
+                if parent_fd is not None:
+                    os.link(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+                else:
+                    os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError as error:
+                raise _StartupActivationReceiptExists("retirement intent destination already exists") from error
+            if parent_fd is not None:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+                created = False
+                os.fsync(parent_fd)
+            else:
+                os.unlink(temporary)
+                created = False
+    except OSError as error:
+        raise StartupScriptError(f"cannot publish retirement intent: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                os.unlink(temporary_name if parent_fd is not None else temporary, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
 def _ensure_activation_receipt_parent(path: Path) -> Path:
     """Create the one missing receipt directory under an already owned state root."""
 
@@ -614,6 +722,582 @@ def _assert_no_active_session(
             "backend has an active or unknown session; startup activation refused"
         )
     return document
+
+
+def _retirement_api_base(api_base: str) -> str:
+    parsed = urllib.parse.urlsplit(api_base)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise StartupScriptError("workspace retirement API port is invalid") from error
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or port != 8081 or parsed.username is not None or parsed.password is not None
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+        raise StartupScriptError("workspace retirement requires the fixed local backend API")
+    return "http://" + parsed.hostname + ":8081"
+
+
+def _retirement_operator_token() -> str:
+    """Read the image-private DEV capability; never accept host credentials."""
+    if "FULLMAG_LOCAL_COMPUTE_OPERATOR_TOKEN" in os.environ:
+        raise StartupScriptError("workspace retirement does not accept ambient credentials")
+    try:
+        from entrypoint import read_operator_capability
+        token = read_operator_capability()
+    except (ImportError, OSError, RuntimeError) as error:
+        raise StartupScriptError("private backend operator capability is unavailable") from error
+    if (not isinstance(token, str) or len(token) != 32
+            or any(character not in "0123456789abcdef" for character in token)):
+        raise StartupScriptError("private backend operator capability is unavailable")
+    return token
+
+
+def _retirement_json_body(response: Any, label: str) -> dict[str, Any]:
+    body = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise StartupScriptError(f"{label} response exceeds its size bound")
+    try:
+        value = json.loads(body.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StartupScriptError(f"{label} response is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise StartupScriptError(f"{label} response is not an object")
+    return value
+
+
+def _retirement_scope(value: Any) -> str:
+    if (not isinstance(value, str) or len(value) > 256 or ":" not in value
+            or any(character.isspace() or ord(character) < 32 for character in value)):
+        raise StartupScriptError("workspace retirement scope is invalid")
+    incarnation, epoch = value.rsplit(":", 1)
+    if not incarnation or not epoch.isascii() or not epoch.isdecimal() or str(int(epoch)) != epoch:
+        raise StartupScriptError("workspace retirement scope is invalid")
+    return value
+
+
+def _retirement_context(api_base: str, token: str, *, timeout: float) -> dict[str, Any]:
+    """Observe the API-owned scope before any mutating request is sent."""
+    request = urllib.request.Request(
+        _retirement_api_base(api_base) + RETIREMENT_ENDPOINT,
+        headers={"Accept": "application/json", "Authorization": "Bearer " + token},
+        method="GET",
+    )
+    try:
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(request, timeout=timeout) as response:
+            if response.status != 200:
+                raise StartupScriptError(f"workspace retirement context returned HTTP {response.status}")
+            value = _retirement_json_body(response, "workspace retirement context")
+    except urllib.error.HTTPError as error:
+        raise StartupScriptError(f"workspace retirement context returned HTTP {error.code}") from error
+    except (OSError, urllib.error.URLError, TimeoutError) as error:
+        raise StartupScriptError("workspace retirement context is unavailable; no retirement was sent") from error
+    if value.get("schema") != "fullmag.live-workspace-retirement-context.v1":
+        raise StartupScriptError("workspace retirement context schema differs")
+    scope = _retirement_scope(value.get("request_scope_epoch"))
+    if value.get("api_instance_id") != scope.rsplit(":", 1)[0]:
+        raise StartupScriptError("workspace retirement context incarnation differs")
+    session_id, run_id = value.get("session_id"), value.get("run_id")
+    if (session_id is None) != (run_id is None):
+        raise StartupScriptError("workspace retirement context identity is incomplete")
+    if session_id is not None:
+        _validate_request_id(session_id)
+        _validate_request_id(run_id)
+    return value
+
+
+def _validate_retirement_response(
+    response: Mapping[str, Any],
+    *,
+    operation_id: str,
+    session_id: str,
+    run_id: str,
+    request_scope_epoch: str,
+    api_request_scope_epoch: str,
+) -> dict[str, Any]:
+    if response.get("schema") != RETIREMENT_RESPONSE_SCHEMA:
+        raise StartupScriptError("workspace retirement response schema mismatch")
+    if response.get("state") not in {"retired", "replayed"}:
+        raise StartupScriptError("workspace retirement response state is invalid")
+    for field, expected in (
+        ("operation_id", operation_id),
+        ("session_id", session_id),
+        ("run_id", run_id),
+        ("request_scope_epoch", request_scope_epoch),
+        ("api_request_scope_epoch", api_request_scope_epoch),
+    ):
+        if response.get(field) != expected:
+            raise StartupScriptError(f"workspace retirement response {field} fence differs")
+    for field in ("session_epoch", "scene_revision", "state_version"):
+        if type(response.get(field)) is not int or response[field] < 0:
+            raise StartupScriptError(f"workspace retirement response {field} is invalid")
+    if response.get("terminal_outcome") not in {"completed", "failed", "cancelled"}:
+        raise StartupScriptError("workspace retirement response outcome is invalid")
+    if response.get("ui_state_scope") != "backend_typed_workspace":
+        raise StartupScriptError("workspace retirement response UI scope is invalid")
+    if type(response.get("script_available")) is not bool:
+        raise StartupScriptError("workspace retirement response script flag is invalid")
+    archive_path = response.get("archive_manifest_path")
+    if (
+        not isinstance(archive_path, str)
+        or not archive_path
+        or archive_path.startswith("/")
+        or "\\" in archive_path
+        or any(part in {"", ".", ".."} for part in archive_path.split("/"))
+    ):
+        raise StartupScriptError("workspace retirement archive path is invalid")
+    if archive_path != f"retirements/{operation_id}/project/retirement-manifest.json":
+        raise StartupScriptError("workspace retirement archive belongs to another operation")
+    for field in ("archive_sha256", "terminal_evidence_sha256"):
+        value = response.get(field)
+        if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+            raise StartupScriptError(f"workspace retirement response {field} is invalid")
+    return dict(response)
+
+
+def _retirement_preflight_rejection(response: Any) -> str | None:
+    try:
+        value = _retirement_json_body(response, "workspace retirement rejection")
+    except (StartupScriptError, OSError, ValueError):
+        return None
+    code = value.get("code")
+    status = getattr(response, "status", getattr(response, "code", None))
+    expected_status = 400 if code == "live_retirement_invalid_request" else 409
+    return code if (isinstance(code, str) and code in RETIREMENT_NO_MUTATION_CODES
+                    and status == expected_status) else None
+
+
+def _retirement_archive_receipt(
+    operation_id: str,
+    *,
+    session_id: str,
+    run_id: str,
+    api_request_scope_epoch: str,
+) -> dict[str, str] | None:
+    """Return the managed predecessor pins when an archive is already durable.
+
+    This is only an observation of the exact operation's immutable manifest.
+    The API remains the authority for replay and rechecks the manifest bytes;
+    an absent manifest deliberately provides no predecessor capability.
+    """
+
+    runs_root_value = os.environ.get("FULLMAG_RUNS_ROOT", "/state/runs/docker-all")
+    runs_root = Path(runs_root_value)
+    if not runs_root.is_absolute() or ".." in runs_root.parts:
+        raise StartupScriptError("retirement store root is invalid")
+    manifest = (
+        runs_root
+        / "session-store"
+        / "retirements"
+        / operation_id
+        / "project"
+        / "retirement-manifest.json"
+    )
+    try:
+        os.lstat(manifest)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise StartupScriptError("retirement archive cannot be inspected") from error
+    raw = _bounded_regular(
+        manifest,
+        MAX_RETIREMENT_MANIFEST_BYTES,
+        "retirement archive manifest",
+    )
+    try:
+        proof = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StartupScriptError("retirement archive manifest is not valid JSON") from error
+    if (
+        not isinstance(proof, dict)
+        or proof.get("schema") != "fullmag.live-workspace-retirement-proof.v2"
+        or proof.get("state") != "retired"
+        or proof.get("operation_id") != operation_id
+        or proof.get("session_id") != session_id
+        or proof.get("run_id") != run_id
+    ):
+        raise StartupScriptError("retirement archive manifest identity differs")
+    proof_scope = proof.get("request_scope_epoch")
+    if not isinstance(proof_scope, str) or not proof_scope.strip() or ":" not in proof_scope:
+        raise StartupScriptError("retirement archive manifest scope is invalid")
+    if not isinstance(api_request_scope_epoch, str) or not api_request_scope_epoch.strip():
+        raise StartupScriptError("retirement API scope is missing")
+    digest = hashlib.sha256(raw).hexdigest()
+    return {
+        "operation_id": operation_id,
+        "archive_sha256": digest,
+        "request_scope_epoch": proof_scope,
+        "session_id": session_id,
+        "run_id": run_id,
+        "api_request_scope_epoch": api_request_scope_epoch,
+    }
+
+
+def _retirement_archive_receipt_or_none(
+    operation_id: str,
+    *,
+    session_id: str,
+    run_id: str,
+    api_request_scope_epoch: str,
+) -> dict[str, str] | None:
+    """Keep an uncertain operation leased when archive inspection fails."""
+
+    try:
+        return _retirement_archive_receipt(
+            operation_id,
+            session_id=session_id,
+            run_id=run_id,
+            api_request_scope_epoch=api_request_scope_epoch,
+        )
+    except StartupScriptError:
+        return None
+
+
+RETIREMENT_RECEIPT_SCHEMA = "fullmag.docker-workspace-retirement-receipt.v1"
+MAX_RETIREMENT_RECEIPT_BYTES = 64 * 1024
+
+
+def _retirement_receipt_path(operation_id: str) -> Path:
+    operation_id = _validate_request_id(operation_id)
+    return STARTUP_RECEIPT_ROOT / ("workspace-retirement-" + operation_id) / "retirement.json"
+
+
+def _read_retirement_receipt_bytes(operation_id: str, operation_inputs_sha256: str) -> tuple[dict[str, Any], bytes] | None:
+    if not isinstance(operation_inputs_sha256, str) or not SHA256_RE.fullmatch(operation_inputs_sha256):
+        raise StartupScriptError("retirement operation input digest is invalid")
+    path = _retirement_receipt_path(operation_id)
+    if not os.path.lexists(path):
+        return None
+    raw = _bounded_regular(path, MAX_RETIREMENT_RECEIPT_BYTES, "retirement receipt")
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StartupScriptError("retirement receipt is not valid JSON") from error
+    if (not isinstance(value, dict) or value.get("schema") != RETIREMENT_RECEIPT_SCHEMA
+            or value.get("operation_id") != operation_id
+            or value.get("operation_inputs_sha256") != operation_inputs_sha256
+            or value.get("state") not in {"started", "retired", "rejected"}):
+        raise StartupScriptError("retirement receipt identity or state differs")
+    _validate_request_id(value.get("session_id"))
+    _validate_request_id(value.get("run_id"))
+    _retirement_scope(value.get("request_scope_epoch"))
+    return value, raw
+
+
+def read_retirement_receipt(operation_id: str, operation_inputs_sha256: str) -> dict[str, Any] | None:
+    record = _read_retirement_receipt_bytes(operation_id, operation_inputs_sha256)
+    return record[0] if record is not None else None
+
+
+def retirement_receipt_evidence(operation_id: str, operation_inputs_sha256: str) -> dict[str, Any] | None:
+    """Project only bounded identity pins from the exact image-owned record."""
+    record = _read_retirement_receipt_bytes(operation_id, operation_inputs_sha256)
+    if record is None:
+        return None
+    value, raw = record
+    marker_sha256 = hashlib.sha256(raw).hexdigest()
+    if value["state"] == "retired":
+        response = value.get("response")
+        if not isinstance(response, dict):
+            raise StartupScriptError("retired image receipt has no response")
+        result = _validate_retirement_response(
+            response, operation_id=operation_id, session_id=value["session_id"], run_id=value["run_id"],
+            request_scope_epoch=_retirement_scope(response.get("request_scope_epoch")),
+            api_request_scope_epoch=_retirement_scope(response.get("api_request_scope_epoch")),
+        )
+        return dict(result, marker_sha256=marker_sha256)
+    return {
+        "state": "pending" if value["state"] == "started" else "rejected",
+        "operation_id": operation_id, "session_id": value["session_id"], "run_id": value["run_id"],
+        "request_scope_epoch": value["request_scope_epoch"],
+        "api_request_scope_epoch": value["request_scope_epoch"],
+        "marker_sha256": marker_sha256,
+    }
+
+
+def retire_current_workspace(
+    operation_id: str,
+    *,
+    operation_inputs_sha256: str,
+    api_base: str = "http://127.0.0.1:8081",
+    timeout: float = RETIREMENT_TIMEOUT_SECONDS,
+    predecessor: Mapping[str, Any] | None = None,
+    retained_identity: Mapping[str, Any] | None = None,
+    require_existing_intent: bool = False,
+) -> dict[str, Any] | None:
+    """Retire one exact workspace with a durable intent before the POST.
+
+    Retrying this operation never sends a startup/Solve command. A durable
+    archive supplies its own predecessor; an interrupted pre-publication
+    operation may continue only while the API still owns its exact session/run.
+    """
+    operation_id = _validate_request_id(operation_id)
+    if not 0 < timeout <= RETIREMENT_TIMEOUT_SECONDS:
+        raise StartupScriptError("workspace retirement timeout is outside its bound")
+    _retirement_api_base(api_base)
+    existing = read_retirement_receipt(operation_id, operation_inputs_sha256)
+    if require_existing_intent and existing is None:
+        # Absence alone does not prove that an earlier Docker exec has ended.
+        # Never bind a retained, unobserved operation to a new current model.
+        raise RetirementOutcomeUnknown(operation_id, "retirement", "retained retirement has no image-owned intent yet")
+    fresh_intent = False
+    try:
+        token = _retirement_operator_token()
+        context = _retirement_context(api_base, token, timeout=timeout)
+    except StartupScriptError as error:
+        if existing is None and retained_identity is None and predecessor is None:
+            raise RetirementRefused(operation_id, "preflight_failed") from error
+        raise
+    if existing is None:
+        if retained_identity is not None or predecessor is not None:
+            raise StartupScriptError("retained retirement has no image-owned intent")
+        if context["session_id"] is None:
+            return None
+        started = {
+            "schema": RETIREMENT_RECEIPT_SCHEMA, "state": "started",
+            "operation_id": operation_id, "operation_inputs_sha256": operation_inputs_sha256,
+            "session_id": context["session_id"], "run_id": context["run_id"],
+            "request_scope_epoch": context["request_scope_epoch"],
+        }
+        path = _retirement_receipt_path(operation_id)
+        _ensure_activation_receipt_parent(path)
+        try:
+            _exclusive_retirement_intent(path, started)
+        except _StartupActivationReceiptExists:
+            existing = read_retirement_receipt(operation_id, operation_inputs_sha256)
+            if existing is None:
+                raise StartupScriptError("retirement intent disappeared after exclusive creation")
+        else:
+            existing = started
+            fresh_intent = True
+    if existing["state"] == "rejected":
+        code = existing.get("refusal_code")
+        if code not in RETIREMENT_NO_MUTATION_CODES:
+            raise StartupScriptError("retirement rejection has no canonical refusal code")
+        raise RetirementRefused(operation_id, code)
+    session_id, run_id = existing["session_id"], existing["run_id"]
+    if retained_identity is not None and dict(retained_identity) != {"session_id": session_id, "run_id": run_id}:
+        raise StartupScriptError("retained retirement identity differs from its image-owned intent")
+    if context["session_id"] is not None and (context["session_id"], context["run_id"]) != (session_id, run_id):
+        raise StartupScriptError("current workspace differs from the recorded retirement intent")
+    archive = _retirement_archive_receipt(
+        operation_id, session_id=session_id, run_id=run_id,
+        api_request_scope_epoch=context["request_scope_epoch"],
+    )
+    if predecessor is not None:
+        expected = {"proof_sha256": archive["archive_sha256"], "request_scope_epoch": archive["request_scope_epoch"]} if archive else None
+        if dict(predecessor) != expected:
+            raise StartupScriptError("retirement predecessor differs from the immutable archive")
+    prior_response = existing.get("response")
+    if existing["state"] == "retired":
+        if (not isinstance(prior_response, dict) or archive is None
+                or prior_response.get("archive_sha256") != archive["archive_sha256"]
+                or prior_response.get("request_scope_epoch") != archive["request_scope_epoch"]):
+            raise StartupScriptError("retired receipt has no matching immutable archive")
+    if context["session_id"] is None and archive is None:
+        raise RetirementOutcomeUnknown(operation_id, "retirement", "recorded workspace is absent without an archive")
+    try:
+        result = _retire_current_workspace_transport(
+            operation_id, api_base=api_base, timeout=timeout,
+            predecessor=({"proof_sha256": archive["archive_sha256"], "request_scope_epoch": archive["request_scope_epoch"]} if archive else None),
+            retained_identity={"session_id": session_id, "run_id": run_id},
+            observed_context=context, operator_token=token,
+        )
+    except RetirementOutcomeUnknown:
+        raise
+    except RetirementRefused as error:
+        # Only the first POST of an intent can be closed by a no-mutation
+        # response. A retry must preserve any earlier unknown POST outcome.
+        if fresh_intent and archive is None:
+            rejected = dict(existing, state="rejected", refusal_code=error.diagnostic["code"])
+            try:
+                _replace_json(_retirement_receipt_path(operation_id), rejected, label="retirement rejection", maximum=MAX_RETIREMENT_RECEIPT_BYTES)
+            except StartupScriptError as publication_error:
+                raise RetirementOutcomeUnknown(operation_id, "retirement", "retirement rejection receipt could not be published") from publication_error
+            raise
+        raise RetirementOutcomeUnknown(operation_id, "retirement", "retirement retry was refused but its earlier POST remains unresolved") from error
+    if result is None:
+        raise RetirementOutcomeUnknown(operation_id, "retirement", "recorded retirement returned no result")
+    current = read_retirement_receipt(operation_id, operation_inputs_sha256)
+    if current != existing:
+        raise RetirementOutcomeUnknown(operation_id, "retirement", "retirement receipt changed before terminal publication", retirement=result)
+    try:
+        _replace_json(_retirement_receipt_path(operation_id), dict(existing, state="retired", response=result), label="retirement terminal receipt", maximum=MAX_RETIREMENT_RECEIPT_BYTES)
+    except StartupScriptError as error:
+        raise RetirementOutcomeUnknown(operation_id, "retirement", "retirement result is not durably recorded", retirement=result) from error
+    return result
+
+
+def _retire_current_workspace_transport(
+    operation_id: str,
+    *,
+    api_base: str = "http://127.0.0.1:8081",
+    timeout: float = RETIREMENT_TIMEOUT_SECONDS,
+    predecessor: Mapping[str, Any] | None = None,
+    retained_identity: Mapping[str, Any] | None = None,
+    observed_context: Mapping[str, Any] | None = None,
+    operator_token: str | None = None,
+) -> dict[str, Any] | None:
+    """Archive one terminal current workspace before the next script POST.
+
+    An unpinned missing current workspace is a safe no-op. A retained
+    operation instead supplies its exact session/run identity and replays the
+    immutable archive against the current API incarnation. Any uncertain
+    status or POST outcome is surfaced as a durable-operation failure so the
+    activation route cannot silently continue with a second RunIntent.
+    """
+    operation_id = _validate_request_id(operation_id)
+    if not 0 < timeout <= RETIREMENT_TIMEOUT_SECONDS:
+        raise StartupScriptError("workspace retirement timeout is outside its bound")
+    _retirement_api_base(api_base)
+    if retained_identity is not None:
+        if (
+            set(retained_identity) != {"session_id", "run_id"}
+            or any(
+                not isinstance(retained_identity.get(field), str)
+                or not retained_identity[field].strip()
+                for field in ("session_id", "run_id")
+            )
+        ):
+            raise StartupScriptError("managed retirement identity is incomplete")
+    token = operator_token if operator_token is not None else _retirement_operator_token()
+    context = dict(observed_context) if observed_context is not None else _retirement_context(api_base, token, timeout=timeout)
+    request_scope_epoch = context["request_scope_epoch"]
+    if context["session_id"] is None:
+        if retained_identity is None:
+            return None
+        session_id, run_id = retained_identity["session_id"], retained_identity["run_id"]
+    else:
+        session_id, run_id = context["session_id"], context["run_id"]
+    predecessor_scope = predecessor.get("request_scope_epoch") if predecessor is not None else None
+    if retained_identity is not None and (
+        session_id != retained_identity["session_id"]
+        or run_id != retained_identity["run_id"]
+    ):
+        raise StartupScriptError("current workspace identity differs from retained retirement")
+    body: dict[str, Any] = {
+        "schema": RETIREMENT_REQUEST_SCHEMA,
+        "operation_id": operation_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "request_scope_epoch": request_scope_epoch,
+    }
+    if predecessor is not None:
+        proof_sha256 = predecessor.get("proof_sha256")
+        predecessor_scope = predecessor.get("request_scope_epoch")
+        if (
+            set(predecessor) != {"proof_sha256", "request_scope_epoch"}
+            or
+            not isinstance(proof_sha256, str) or not SHA256_RE.fullmatch(proof_sha256)
+            or not isinstance(predecessor_scope, str) or not predecessor_scope.strip()
+        ):
+            raise StartupScriptError("workspace retirement predecessor is invalid")
+        if predecessor_scope != request_scope_epoch:
+            body["predecessor"] = {
+                "proof_sha256": proof_sha256,
+                "request_scope_epoch": predecessor_scope,
+            }
+    headers = {
+        "Content-Type": "application/json", "Accept": "application/json",
+        "Authorization": "Bearer " + token,
+    }
+    request = urllib.request.Request(
+        _retirement_api_base(api_base) + RETIREMENT_ENDPOINT,
+        data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(request, timeout=timeout) as response:
+            if response.status < 200 or response.status >= 300:
+                code = _retirement_preflight_rejection(response)
+                if predecessor is None and code is not None:
+                    raise RetirementRefused(operation_id, code)
+                if response.status == 409 or response.status >= 500:
+                    raise RetirementOutcomeUnknown(
+                        operation_id,
+                        "retirement",
+                        f"workspace retirement returned HTTP {response.status}",
+                        retirement=_retirement_archive_receipt_or_none(
+                            operation_id,
+                            session_id=session_id,
+                            run_id=run_id,
+                            api_request_scope_epoch=request_scope_epoch,
+                        ),
+                    )
+                raise StartupScriptError(
+                    f"workspace retirement returned HTTP {response.status}"
+                )
+            try:
+                document = _retirement_json_body(response, "workspace retirement")
+            except StartupScriptError as error:
+                raise RetirementOutcomeUnknown(
+                    operation_id,
+                    "retirement",
+                    str(error),
+                    retirement=_retirement_archive_receipt_or_none(
+                        operation_id,
+                        session_id=session_id,
+                        run_id=run_id,
+                        api_request_scope_epoch=request_scope_epoch,
+                    ),
+                ) from error
+    except RetirementOutcomeUnknown:
+        raise
+    except urllib.error.HTTPError as error:
+        code = _retirement_preflight_rejection(error)
+        if predecessor is None and code is not None:
+            raise RetirementRefused(operation_id, code) from error
+        if error.code == 409 or error.code >= 500:
+            raise RetirementOutcomeUnknown(
+                operation_id,
+                "retirement",
+                f"workspace retirement returned HTTP {error.code}",
+                retirement=_retirement_archive_receipt_or_none(
+                    operation_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    api_request_scope_epoch=request_scope_epoch,
+                ),
+            ) from error
+        raise StartupScriptError(
+            f"workspace retirement returned HTTP {error.code}"
+        ) from error
+    except (OSError, urllib.error.URLError, TimeoutError) as error:
+        raise RetirementOutcomeUnknown(
+            operation_id,
+            "retirement",
+            f"workspace retirement outcome is unknown: {error}",
+            retirement=_retirement_archive_receipt_or_none(
+                operation_id,
+                session_id=session_id,
+                run_id=run_id,
+                api_request_scope_epoch=request_scope_epoch,
+            ),
+        ) from error
+    try:
+        result = _validate_retirement_response(
+            document,
+            operation_id=operation_id,
+            session_id=session_id,
+            run_id=run_id,
+            request_scope_epoch=predecessor_scope or request_scope_epoch,
+            api_request_scope_epoch=request_scope_epoch,
+        )
+        return result
+    except StartupScriptError as error:
+        raise RetirementOutcomeUnknown(
+            operation_id,
+            "retirement",
+            str(error),
+            retirement=_retirement_archive_receipt_or_none(
+                operation_id,
+                session_id=session_id,
+                run_id=run_id,
+                api_request_scope_epoch=request_scope_epoch,
+            ),
+        ) from error
 
 
 def validate_activation_response(
@@ -1016,6 +1700,11 @@ __all__ = [
     "AUTHORIZATION_SCHEMA",
     "ACTIVATION_RECEIPT_PATH",
     "ACTIVATION_RECEIPT_SCHEMA",
+    "RETIREMENT_ENDPOINT",
+    "RETIREMENT_REQUEST_SCHEMA",
+    "RETIREMENT_RESPONSE_SCHEMA",
+    "RETIREMENT_DIAGNOSTIC_SCHEMA",
+    "RETIREMENT_TIMEOUT_SECONDS",
     "STARTUP_RECEIPT_KEY_ENV",
     "REQUEST_SCHEMA",
     "RESPONSE_SCHEMA",
@@ -1023,6 +1712,8 @@ __all__ = [
     "StartupScriptError",
     "StartupScriptRejected",
     "StartupActivationOutcomeUnknown",
+    "RetirementOutcomeUnknown",
+    "RetirementRefused",
     "STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA",
     "STARTUP_ACTIVATION_TIMEOUT_SECONDS",
     "activate",
@@ -1030,6 +1721,9 @@ __all__ = [
     "build_activation_request",
     "prepare",
     "run_from_environment",
+    "retire_current_workspace",
+    "read_retirement_receipt",
+    "retirement_receipt_evidence",
     "validate_activation_response",
     "validate_rejection_receipt",
     "write_provenance",

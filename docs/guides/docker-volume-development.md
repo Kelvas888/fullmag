@@ -159,8 +159,11 @@ just docker-dev-script-pinned <attempt> <config-sha256> <checkout> <script>
 Zwykła komenda ustala `attempt` i `config-sha256` automatycznie z bieżącej
 grupy i zweryfikowanych receiptów; wymaga dokładnie jednej zgodnej, zdrowej
 pary usług. Nie uruchamia kontenerów, nie buduje i nie wybiera historycznej
-próby według daty. Przy aktywnej sesji trzeba najpierw zamknąć bieżący projekt
-w Workspace; samo zakończenie Solve nie oznacza pustego Workspace.
+próby według daty. Jeżeli poprzedni model jest terminalny, archiwizuje jego
+kanoniczny model, edytowalny skrypt i typowany stan UI, zachowując odwołania do
+wyników bez kopiowania ciężkich artefaktów. Dopiero potem aktywuje nowy skrypt.
+Trwająca symulacja lub niepotwierdzone zwolnienie zasobów blokuje przejście;
+polecenie nie anuluje symulacji ani nie zwalnia GPU.
 
 W jawnej komendzie `docker-dev-script-pinned` wartości muszą pochodzić z tego samego
 `development/attempts/<attempt>/{terminal,compose}.json` w wolumenie control.
@@ -202,12 +205,19 @@ Każde jawne wywołanie otrzymuje nowy domyślny `request_id` w postaci
 ten sam plik może posłużyć do kolejnej symulacji. Jawny `request_id` pozostaje
 stabilnym kluczem idempotencji i odtwarza wynik tego konkretnego żądania.
 Nieznany wynik wcześniejszej operacji nadal blokuje nowe wywołanie. Nowe żądanie
-przechodzi przez istniejącą
-walidację Workspace: musi być pusty według kontraktu API. Zamknięcie runu nie
-retiruje bieżącego Workspace, więc samo podanie nowego `request_id` jako piątego
-argumentu nie wystarcza; potrzebne jest istniejące, jawne przejście do pustego
-Workspace. Ten draft nie dodaje mechanizmu retire/reset. Nie używaj ponownie ID,
-którego receipt ma stan `unknown`.
+przechodzi przez istniejącą walidację pustego Workspace po potwierdzonym
+archiwizowaniu poprzedniego modelu. Prywatna operacja retirement nie tworzy
+RunIntent i nie wywołuje Solve. Jej trwały intent w control volume wiąże dokładne
+session/run oraz wejścia operacji; niezmienne archiwum projektu trafia do
+session store, obok danych użytkownika. Ponowienie tej samej operacji kończy
+wyłącznie archiwizowanie. Nie ponawia startupowego POST ani Solve po nieznanym
+wyniku. Nie używaj ponownie ID, którego receipt ma stan `unknown`.
+
+Potwierdzona odmowa przy aktywnej symulacji zamyka własną operację bez mutacji
+modelu. Utrata odpowiedzi po wysłaniu retirement zachowuje blokadę i dokładne
+piny do reconciliacji. Nowa instancja API wymaga bieżącego zakresu żądania oraz
+hasza i oryginalnego zakresu niezmiennego archiwum. Nie usuwaj markerów ręcznie.
+Ta ścieżka wymaga jeszcze kwalifikacji runtime: **NOT VERIFIED**.
 
 Nieznany wynik operacji zachowuje zasoby i blokadę do jawnego rozstrzygnięcia.
 Nie usuwaj ręcznie `active`, pakietu ani lease, aby wymusić kolejny build.

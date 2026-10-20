@@ -38,6 +38,9 @@ KEY = "2" * 64
 class Control:
     project = PROJECT
     volume = VOLUME
+    namespace = ""
+    namespace_registry = None
+    namespace_registry_sha256 = None
     identity = {
         "project_name": PROJECT,
         "project_id": "fullmag-project",
@@ -360,6 +363,9 @@ class UnknownActivationTests(unittest.TestCase):
 
     def test_lease_protocol_is_single_sourced_for_recovery_authentication(self) -> None:
         control = object.__new__(BuildControl)
+        control.namespace = ""
+        control.namespace_registry = None
+        control.namespace_registry_sha256 = None
         script = control.operation_script("activation", ATTEMPT)
         self.assertIn("printf 'READY\\n'", script)
         self.assertIn("printf 'LOGGED\\n'", script)

@@ -6148,11 +6148,10 @@ async fn field_vector_returns_pending_metadata_for_active_compute_fields_quantit
     dispatch_compute_fields_command(&state, &command_id).await;
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
-                .uri(
-                    "/v2/sessions/current/data/fields/H_demag/samples/vector?scope_kind=airbox&scope_id=airbox",
-                )
+                .uri("/v2/sessions/current/data/fields/H_demag/samples/vector")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6166,11 +6165,27 @@ async fn field_vector_returns_pending_metadata_for_active_compute_fields_quantit
     assert_eq!(pending["retry_after_ms"], 250);
     assert_eq!(pending["command_id"], command_id);
     assert_eq!(pending["quantity_id"], "H_demag");
-    assert_eq!(pending["scope_kind"], "airbox");
-    assert_eq!(pending["scope_id"], "airbox");
+    assert_eq!(pending["scope_kind"], "full");
+    assert!(pending["scope_id"].is_null());
     assert!(pending["generation_id"]
         .as_str()
         .is_some_and(|generation| !generation.is_empty()));
+
+    // A missing optional Airbox carrier has no active Airbox requirement and
+    // must remain an ordinary no-content resource until that carrier exists.
+    let airbox = app
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/v2/sessions/current/data/fields/H_demag/samples/vector?scope_kind=airbox&scope_id=airbox",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(airbox.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(airbox).await.is_empty());
 
     let _ = fs::remove_dir_all(&artifact_dir);
 }
@@ -23275,6 +23290,15 @@ async fn compute_fields_command_contract_resolves_multilayer_full_and_airbox_req
                     [1.0, 1.0, 0.0]
                 ],
                 "layout": { "grid_cells": [4, 1, 1] }
+            },
+            "H_demag": {
+                "values": [
+                    [0.1, 0.0, 0.0],
+                    [0.0, 0.1, 0.0],
+                    [0.0, 0.0, 0.1],
+                    [0.1, 0.1, 0.0]
+                ],
+                "layout": { "grid_cells": [4, 1, 1] }
             }
         }))
         .expect("multilayer field fixture should deserialize");
@@ -23303,7 +23327,10 @@ async fn compute_fields_command_contract_resolves_multilayer_full_and_airbox_req
         .as_array()
         .expect("multilayer requirements should be an array");
     assert_eq!(requirements.len(), 2);
-    assert_eq!(requirements[0]["quantity_ids"], serde_json::json!(["m"]));
+    assert_eq!(
+        requirements[0]["quantity_ids"],
+        serde_json::json!(["m", "H_demag"])
+    );
     assert_eq!(requirements[0]["scope_kind"], "full");
     assert_eq!(
         requirements[1]["quantity_ids"],
@@ -23392,6 +23419,15 @@ async fn compute_fields_completion_requires_exact_quantity_scope_generation_and_
                     [1.0, 1.0, 0.0]
                 ],
                 "layout": { "grid_cells": [4, 1, 1] }
+            },
+            "H_demag": {
+                "values": [
+                    [0.1, 0.0, 0.0],
+                    [0.0, 0.1, 0.0],
+                    [0.0, 0.0, 0.1],
+                    [0.1, 0.1, 0.0]
+                ],
+                "layout": { "grid_cells": [4, 1, 1] }
             }
         }))
         .expect("multilayer field fixture should deserialize");
@@ -23433,6 +23469,14 @@ async fn compute_fields_completion_requires_exact_quantity_scope_generation_and_
         .and_then(|snapshot| snapshot.latest_fields.get("m"))
         .cloned()
         .expect("full magnetization field should be present");
+    let saved_h_demag = state
+        .current_live_state
+        .read()
+        .await
+        .as_ref()
+        .and_then(|snapshot| snapshot.latest_fields.get("H_demag"))
+        .cloned()
+        .expect("full demagnetization field should be present");
     let saved_live_magnetization = state
         .current_live_state
         .read()
@@ -23465,6 +23509,9 @@ async fn compute_fields_completion_requires_exact_quantity_scope_generation_and_
         let mut guard = state.current_live_state.write().await;
         let snapshot = guard.as_mut().expect("live session should exist");
         snapshot.latest_fields.insert("m".into(), saved_m);
+        snapshot
+            .latest_fields
+            .insert("H_demag".into(), saved_h_demag);
         snapshot
             .live_state
             .as_mut()
@@ -23537,7 +23584,7 @@ async fn compute_fields_completion_requires_exact_quantity_scope_generation_and_
 }
 
 #[tokio::test]
-async fn compute_fields_command_stays_dispatched_until_airbox_carrier_is_readable() {
+async fn compute_fields_command_stays_dispatched_until_native_multilayer_fields_are_readable() {
     let (app, state, artifact_dir) = test_router_with_session_state_and_artifact_dir().await;
     set_test_fdm_multilayer_layout(&state, [4, 1, 1]).await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
@@ -23579,9 +23626,9 @@ async fn compute_fields_command_stays_dispatched_until_airbox_carrier_is_readabl
     let requirements = detail["field_materialization_requirements"]
         .as_array()
         .expect("multilayer requirements should be an array");
-    assert_eq!(requirements.len(), 2);
-    assert_eq!(requirements[1]["scope_kind"], "airbox");
-    assert!(requirements[1]["carrier_fingerprint"].is_null());
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(requirements[0]["quantity_ids"], serde_json::json!(["m", "H_demag"]));
+    assert_eq!(requirements[0]["scope_kind"], "full");
 
     let availability = app
         .clone()
@@ -23607,6 +23654,65 @@ async fn compute_fields_command_stays_dispatched_until_airbox_carrier_is_readabl
     let still_dispatched = get_command_detail(&app, command_id).await;
     assert_eq!(still_dispatched["status"], "dispatched");
     assert!(still_dispatched["completion_status"].is_null());
+
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard.as_mut().expect("test live session");
+        let latest_fields = serde_json::from_value(serde_json::json!({
+            "m": {
+                "values": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [1.0, 1.0, 0.0]
+                ],
+                "layout": { "grid_cells": [4, 1, 1] }
+            },
+            "H_demag": {
+                "values": [
+                    [0.1, 0.0, 0.0],
+                    [0.0, 0.1, 0.0],
+                    [0.0, 0.0, 0.1],
+                    [0.1, 0.1, 0.0]
+                ],
+                "layout": { "grid_cells": [4, 1, 1] }
+            }
+        }))
+        .expect("native multilayer field fixture should deserialize");
+        publish_test_fields_from_physical_step(
+            snapshot,
+            physical_test_live_state(
+                2,
+                2.0e-12,
+                [4, 1, 1],
+                Some(vec![
+                    1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0,
+                ]),
+            ),
+            latest_fields,
+        )
+        .expect("native multilayer fields should be published from an admitted physical step");
+        assert!(snapshot
+            .field_quantity_revisions
+            .get("m")
+            .copied()
+            .unwrap_or_default()
+            > 1);
+        assert!(snapshot
+            .field_quantity_revisions
+            .get("H_demag")
+            .copied()
+            .unwrap_or_default()
+            > 0);
+    }
+
+    assert!(
+        reconcile_compute_fields_command(&state).await,
+        "native full m and H_demag should complete without an Airbox carrier"
+    );
+    let completed = get_command_detail(&app, command_id).await;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["completion_status"], "completed");
 
     let _ = fs::remove_dir_all(&artifact_dir);
 }

@@ -3588,11 +3588,67 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         .flat_map(|member| member.artifacts.iter())
         .map(|artifact| artifact.artifact_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(solution_artifact_ids.len(), output_catalog.entries.len());
-    assert!(output_catalog
+    let reserved_entries = output_catalog
         .entries
         .iter()
-        .all(|entry| solution_artifact_ids.contains(entry.artifact_id.as_str())));
+        .filter(|entry| entry.artifact_type == "accepted_quantity_bundle")
+        .collect::<Vec<_>>();
+    assert_eq!(reserved_entries.len(), 1);
+    let accepted_quantity_bundle = reserved_entries[0];
+    let expected_solution_artifact_ids = output_catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.artifact_id != accepted_quantity_bundle.artifact_id)
+        .map(|entry| entry.artifact_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(solution_artifact_ids, expected_solution_artifact_ids);
+    assert_eq!(accepted_quantity_bundle.artifact_type, "accepted_quantity_bundle");
+    assert_eq!(accepted_quantity_bundle.task_id, claim.task_id.as_str());
+    assert_eq!(accepted_quantity_bundle.attempt_id, claim.attempt_id.as_str());
+    assert_eq!(
+        accepted_quantity_bundle.ownership_epoch,
+        claim.ownership_epoch.value()
+    );
+    assert_eq!(
+        accepted_quantity_bundle.status,
+        fullmag_session::FmsArtifactStatus::Published
+    );
+    assert!(accepted_quantity_bundle.study_output.is_none());
+    let accepted_quantity_bundle_ref = accepted_quantity_bundle
+        .object_ref
+        .as_deref()
+        .expect("accepted quantity bundle keeps its CAS identity");
+    assert_eq!(
+        accepted_quantity_bundle_ref,
+        accepted_quantity_bundle.content_sha256.as_str()
+    );
+    let accepted_quantity_bundle_bytes = store
+        .cas()
+        .get(accepted_quantity_bundle_ref)
+        .unwrap()
+        .expect("accepted quantity bundle bytes are durable in CAS");
+    assert_eq!(
+        fullmag_application::study_artifact_content_sha256(&accepted_quantity_bundle_bytes),
+        accepted_quantity_bundle.content_sha256
+    );
+    let accepted_quantity_bundle_record: serde_json::Value =
+        serde_json::from_slice(&accepted_quantity_bundle_bytes).unwrap();
+    assert_eq!(
+        accepted_quantity_bundle_record["schema_version"].as_str(),
+        Some("accepted_quantity_bundle.v1")
+    );
+    assert_eq!(
+        accepted_quantity_bundle_record["state_object_ref"].as_str(),
+        Some(output_entry.content_sha256.as_str())
+    );
+    let accepted_quantity_source: fullmag_quantities::AcceptedStateRef = serde_json::from_value(
+        accepted_quantity_bundle_record
+            .get("source")
+            .cloned()
+            .expect("accepted quantity bundle pins its source state"),
+    )
+    .unwrap();
+    assert_eq!(&accepted_quantity_source, accepted_state_ref);
     assert!(solution.provenance.run_spec_digest.starts_with("sha256:"));
     assert!(solution.provenance.model_digest.starts_with("sha256:"));
     assert!(solution.provenance.physics_digest.starts_with("sha256:"));

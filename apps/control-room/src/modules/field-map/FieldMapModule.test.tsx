@@ -529,7 +529,9 @@ describe("FieldMapModule planar state ownership", () => {
     const html = renderToStaticMarkup(<FieldMapModule />);
 
     expect(html).toContain('class="fm-field-map__colorbar"');
-    expect(html).toContain("Rendered range");
+    // Static SSR has no PlanarSurface raster evidence yet; preserve the range
+    // while exposing its truthful stale-compatible status.
+    expect(html).toContain("Previous compatible range");
     expect(html).toContain("-1 kA/m");
     expect(html).toContain("2 kA/m");
     expect(html).toContain('class="fm-field-map__colorbar-ramp" data-colormap="viridis"');

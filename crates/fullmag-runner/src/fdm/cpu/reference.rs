@@ -987,7 +987,7 @@ fn accepted_cpu_thermal_capture_context(
     coupled_transport: bool,
     is_direct_minimization: bool,
 ) -> Result<Option<(u64, f64)>, RunError> {
-    if is_direct_minimization {
+    if is_direct_minimization || problem.temperature <= 0.0 {
         return Ok(None);
     }
     let accepted_thermal_step = problem.thermal_step().checked_sub(1).ok_or_else(|| RunError {
@@ -4393,6 +4393,30 @@ mod tests {
     }
 
     #[test]
+    fn accepted_cpu_thermal_capture_context_distinguishes_nonthermal_from_forced_thermal() {
+        let plan = make_test_plan();
+        let (mut nonthermal, _) =
+            build_snapshot_problem_and_state(&plan).expect("nonthermal test problem");
+        assert_eq!(nonthermal.temperature, 0.0);
+        assert_eq!(nonthermal.thermal_step(), 0);
+        assert_eq!(
+            accepted_cpu_thermal_capture_context(&nonthermal, 1.0e-14, false, false)
+                .expect("nonthermal capture context should be optional"),
+            None
+        );
+
+        nonthermal.temperature = 300.0;
+        assert_eq!(nonthermal.thermal_step(), 0);
+        let error = accepted_cpu_thermal_capture_context(&nonthermal, 1.0e-14, false, false)
+            .expect_err("forced thermal capture cannot invent a preceding interval");
+        assert!(
+            error.message.contains("no preceding thermal interval"),
+            "unexpected forced-thermal error: {}",
+            error.message
+        );
+    }
+
+    #[test]
     fn fdm_cpu_accepted_state_snapshot_is_content_bound_and_strictly_scoped() {
         let plan = make_test_plan();
         let first = fdm_cpu_accepted_state_snapshot(
@@ -6310,7 +6334,10 @@ mod tests {
             ..make_test_plan()
         };
         let mut magnetization_updates = 0usize;
-        let mut terminal_cache_updates = 0usize;
+        let mut terminal_fragment_updates = 0usize;
+        let mut terminal_quantities = std::collections::BTreeSet::new();
+        let mut terminal_field_clocks = Vec::new();
+        let mut terminal_m_digests = Vec::new();
         let mut expected_live_payload_count = 0u64;
         let mut expected_live_copy_bytes = 0u64;
         let mut on_step = |update: StepUpdate| -> StepAction {
@@ -6326,9 +6353,22 @@ mod tests {
                     (field.vector_field_values.len() * std::mem::size_of::<f64>()) as u64;
             }
             assert!(update.preview_field.is_none());
-            if update.cached_preview_fields.is_some() {
-                terminal_cache_updates += 1;
+            if update.terminal_field_snapshot {
+                terminal_fragment_updates += 1;
                 assert!(update.magnetization.is_some());
+                let fields = update
+                    .cached_preview_fields
+                    .as_ref()
+                    .expect("terminal fragment should carry one field");
+                assert_eq!(fields.len(), 1, "terminal fragments are quantity scoped");
+                assert!(terminal_quantities.insert(fields[0].quantity.clone()));
+                terminal_field_clocks.push((
+                    fields[0].source_step,
+                    fields[0].source_time_seconds.map(f64::to_bits),
+                ));
+                terminal_m_digests.push(crate::live_preview_values_sha256(
+                    update.magnetization.as_ref().expect("checked above"),
+                ));
             }
             for field in update.cached_preview_fields.as_deref().unwrap_or_default() {
                 expected_live_payload_count += 1;
@@ -6359,10 +6399,31 @@ mod tests {
             magnetization_updates >= 2,
             "expected repeated live magnetization payloads"
         );
-        assert_eq!(
-            terminal_cache_updates, 1,
-            "only the terminal live update should materialize cached vector fields"
-        );
+        let expected_terminal_quantities = crate::quantities::active_fdm_preview_quantities(
+            crate::dispatch::FdmEngine::CpuReference,
+            &plan,
+            &crate::quantities::field_materialization_quantity_ids(),
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(terminal_quantities, expected_terminal_quantities);
+        assert_eq!(terminal_fragment_updates, terminal_quantities.len());
+        assert!(terminal_field_clocks.iter().all(|(step, time_bits)| {
+            *step == executed.result.steps.last().expect("final step").step
+                && *time_bits
+                    == Some(executed.result.steps.last().expect("final step").time.to_bits())
+        }));
+        let expected_final_m = executed
+            .result
+            .final_magnetization
+            .iter()
+            .flat_map(|value| value.iter().copied())
+            .collect::<Vec<_>>();
+        let expected_m_digest = crate::live_preview_values_sha256(&expected_final_m);
+        assert!(terminal_m_digests
+            .iter()
+            .all(|digest| digest == &expected_m_digest));
         let observe_calls = observe_state_call_count();
         assert!(
             observe_calls <= 2,
@@ -6398,15 +6459,15 @@ mod tests {
             state.selection.every_n = 1;
             state
         };
-        let mut terminal_update = None;
+        let mut terminal_updates = Vec::new();
         let mut on_step = |update: StepUpdate| -> StepAction {
-            if update.magnetization.is_some() {
-                terminal_update = Some(update);
+            if update.terminal_field_snapshot {
+                terminal_updates.push(update);
             }
             StepAction::Continue
         };
 
-        execute_reference_fdm(
+        let executed = execute_reference_fdm(
             &plan,
             1e-12,
             &[],
@@ -6422,21 +6483,44 @@ mod tests {
         )
         .expect("direct minimizer should emit a terminal live update");
 
-        let update = terminal_update.expect("terminal update should carry final magnetization");
-        assert_eq!(
-            update.magnetization.as_ref().map(Vec::len),
-            Some(plan.initial_magnetization.len() * 3)
-        );
-        let cached_quantities = update
-            .cached_preview_fields
-            .as_ref()
-            .expect("terminal update should materialize cached vector fields")
+        assert!(!terminal_updates.is_empty(), "terminal fragments should be emitted");
+        let expected_final_m = executed
+            .result
+            .final_magnetization
             .iter()
-            .map(|field| field.quantity.as_str())
+            .flat_map(|value| value.iter().copied())
             .collect::<Vec<_>>();
-        assert!(cached_quantities.contains(&"H_demag"));
-        assert!(cached_quantities.contains(&"H_eff"));
-        for field in update.cached_preview_fields.as_ref().unwrap() {
+        let expected_m_digest = crate::live_preview_values_sha256(&expected_final_m);
+        let final_stats = executed
+            .result
+            .steps
+            .last()
+            .expect("completed run should report final stats");
+        let final_step = final_stats.step;
+        let final_time = final_stats.time;
+        let mut cached_quantities = std::collections::BTreeSet::new();
+        let mut fragment_count = 0usize;
+        for update in &terminal_updates {
+            assert_eq!(update.magnetization.as_deref(), Some(expected_final_m.as_slice()));
+            assert_eq!(
+                crate::live_preview_values_sha256(
+                    update.magnetization.as_ref().expect("checked above")
+                ),
+                expected_m_digest
+            );
+            assert_eq!(update.stats.step, final_step);
+            assert_eq!(update.stats.time.to_bits(), final_time.to_bits());
+            let fields = update
+                .cached_preview_fields
+                .as_ref()
+                .expect("terminal fragment should materialize one field");
+            assert_eq!(fields.len(), 1, "terminal fragments are quantity scoped");
+            let field = &fields[0];
+            assert!(cached_quantities.insert(field.quantity.clone()));
+            fragment_count += 1;
+            assert_eq!(field.source_step, final_step);
+            assert_eq!(field.source_time_seconds.map(f64::to_bits), Some(final_time.to_bits()));
+            assert_eq!(field.source_revision, field.config_revision);
             assert_eq!(field.preview_grid, plan.grid.cells);
             assert_eq!(field.original_grid, plan.grid.cells);
             let expected_components =
@@ -6453,6 +6537,18 @@ mod tests {
             );
             assert!(!field.auto_downscaled);
         }
+        let expected_quantities = crate::quantities::active_fdm_preview_quantities(
+            crate::dispatch::FdmEngine::CpuReference,
+            &plan,
+            &crate::quantities::field_materialization_quantity_ids(),
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(cached_quantities, expected_quantities);
+        assert_eq!(fragment_count, cached_quantities.len());
+        assert!(cached_quantities.contains("H_demag"));
+        assert!(cached_quantities.contains("H_eff"));
     }
 
     #[test]
@@ -6468,15 +6564,15 @@ mod tests {
             state.selection.every_n = 1;
             state
         };
-        let mut terminal_update = None;
+        let mut terminal_updates = Vec::new();
         let mut on_step = |update: StepUpdate| -> StepAction {
-            if update.cached_preview_fields.is_some() {
-                terminal_update = Some(update);
+            if update.terminal_field_snapshot {
+                terminal_updates.push(update);
             }
             StepAction::Continue
         };
 
-        execute_reference_fdm(
+        let executed = execute_reference_fdm(
             &plan,
             2e-14,
             &[],
@@ -6492,38 +6588,63 @@ mod tests {
         )
         .expect("LLG should emit a terminal live update");
 
-        let update = terminal_update.expect("terminal update should materialize cached fields");
-        assert!(update.magnetization.is_some());
-        let cached_quantities = update
-            .cached_preview_fields
-            .as_ref()
-            .expect("terminal update should materialize cached vector fields")
+        assert!(!terminal_updates.is_empty(), "terminal fragments should be emitted");
+        let expected_final_m = executed
+            .result
+            .final_magnetization
             .iter()
-            .map(|field| field.quantity.as_str())
+            .flat_map(|value| value.iter().copied())
             .collect::<Vec<_>>();
-        assert!(cached_quantities.contains(&"H_demag"));
-        assert!(cached_quantities.contains(&"H_eff"));
-        assert!(cached_quantities.contains(&"H_ext"));
-        for quantity in ["eden_ex", "eden_demag", "eden_ext", "eden_total"] {
-            let field = update
+        let expected_m_digest = crate::live_preview_values_sha256(&expected_final_m);
+        let final_stats = executed
+            .result
+            .steps
+            .last()
+            .expect("completed run should report final stats");
+        let final_step = final_stats.step;
+        let final_time = final_stats.time;
+        let mut cached_quantities = std::collections::BTreeSet::new();
+        for update in &terminal_updates {
+            assert_eq!(update.magnetization.as_deref(), Some(expected_final_m.as_slice()));
+            assert_eq!(
+                crate::live_preview_values_sha256(
+                    update.magnetization.as_ref().expect("terminal m")
+                ),
+                expected_m_digest
+            );
+            assert_eq!(update.stats.step, final_step);
+            assert_eq!(update.stats.time.to_bits(), final_time.to_bits());
+            let fields = update
                 .cached_preview_fields
                 .as_ref()
-                .unwrap()
-                .iter()
-                .find(|field| field.quantity == quantity)
-                .unwrap_or_else(|| panic!("terminal cache must contain {quantity}"));
-            assert_eq!(field.unit, "J/m³");
-            assert_eq!(
-                field.vector_field_values.len(),
-                plan.initial_magnetization.len()
-            );
-        }
-        for field in update.cached_preview_fields.as_ref().unwrap() {
-            assert_eq!(field.source_step, update.stats.step);
-            assert_eq!(field.source_time_seconds, Some(update.stats.time));
-            assert_eq!(field.source_revision, update.stats.step);
+                .expect("terminal fragment should materialize one field");
+            assert_eq!(fields.len(), 1, "terminal fragments are quantity scoped");
+            let field = &fields[0];
+            assert!(cached_quantities.insert(field.quantity.clone()));
+            assert_eq!(field.source_step, final_step);
+            assert_eq!(field.source_time_seconds.map(f64::to_bits), Some(final_time.to_bits()));
+            assert_eq!(field.source_revision, field.config_revision);
             assert!(field.materialized_at_unix_ms > 0);
+            if field.quantity.starts_with("eden_") {
+                assert_eq!(field.unit, "J/m³");
+                assert_eq!(
+                    field.vector_field_values.len(),
+                    plan.initial_magnetization.len()
+                );
+            }
         }
+        let expected_quantities = crate::quantities::active_fdm_preview_quantities(
+            crate::dispatch::FdmEngine::CpuReference,
+            &plan,
+            &crate::quantities::field_materialization_quantity_ids(),
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(cached_quantities, expected_quantities);
+        assert!(cached_quantities.contains("H_demag"));
+        assert!(cached_quantities.contains("H_eff"));
+        assert!(cached_quantities.contains("H_ext"));
     }
 
     #[test]
