@@ -249,7 +249,7 @@ def _browser_qa_reconciliation_fixture(
                 else:
                     value = self.active_values[0] if self.active_values else None
                 self.active_observations.append(value)
-                return value
+                return value.encode("utf-8") if isinstance(value, str) else value
             if relative not in self.documents:
                 if optional:
                     return None

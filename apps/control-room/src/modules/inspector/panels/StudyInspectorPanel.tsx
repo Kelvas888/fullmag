@@ -1015,7 +1015,7 @@ export function useStudyInspectorPanelController(
       ? null
       : kernel.commands.get(commandId)?.disabledReason?.(commandContext) ??
         "Command is unavailable.";
-  const commitStageDrafts = async () => {
+  const commitStageDraftsImpl = async () => {
     const currentScene = await readAuthoritativeScene();
     if (!currentScene) {
       dispatch({
@@ -1146,7 +1146,7 @@ export function useStudyInspectorPanelController(
       dispatch({ type: "setAuthoringBusy", busy: false });
     }
   };
-  const commitGlobalDraft = async () => {
+  const commitGlobalDraftImpl = async () => {
     const currentScene = await readAuthoritativeScene();
     if (currentScene === null) {
       dispatch({
@@ -1295,7 +1295,7 @@ export function useStudyInspectorPanelController(
     }
   };
 
-  const commitExecutionProfile = async (
+  const commitExecutionProfileImpl = async (
     assignment: StudyExecutionProfileAssignment,
     baseRevision: number,
   ) => {
@@ -1396,6 +1396,16 @@ export function useStudyInspectorPanelController(
     }
   };
 
+  // Keep the existing revision-fenced transactions available until the
+  // retained draft owner is integrated with all of its supporting modules.
+  const owner = {
+    commitStageDrafts: commitStageDraftsImpl,
+    commitGlobalDraft: commitGlobalDraftImpl,
+    commitExecutionProfile: commitExecutionProfileImpl,
+  };
+  const commitStageDrafts = owner.commitStageDrafts;
+  const commitGlobalDraft = owner.commitGlobalDraft;
+  const commitExecutionProfile = owner.commitExecutionProfile;
   return {
     activeStageIndex,
     checkpointCatalog,

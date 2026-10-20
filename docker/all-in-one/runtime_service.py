@@ -71,6 +71,12 @@ MAX_HTTP_BYTES = 4 * 1024 * 1024
 # request budget above that limit so Windows-folder I/O cannot turn a healthy
 # native probe into a transport timeout at the API boundary.
 API_LIVENESS_TIMEOUT_SECONDS = 5.0
+API_BINDING_STARTUP_TIMEOUT_SECONDS = 60.0
+# A pinned accepted-run restore validates immutable Study/CAS and historical
+# proofs before listening. Windows-folder I/O can exceed ordinary API startup.
+# This only extends the pre-listen budget; admission and identity checks stay
+# unchanged and the native service is not launched before the API is pinned.
+ACCEPTED_REATTACH_API_STARTUP_TIMEOUT_SECONDS = 300.0
 STARTUP_LIVENESS_GRACE_SECONDS = 30.0
 # Process limits for lifecycle calls whose work includes Windows-folder (9p)
 # I/O.  The accepted-store bootstrap and diagnostic service-status call can
@@ -726,6 +732,18 @@ ACCEPTED_REATTACH_FIELDS = frozenset({
     "schema", "run_id", "project_id", "source_request_id", "source_sha256",
     "startup_provenance_sha256", "config_sha256", "proof_path", "proof_sha256",
 })
+_ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS = frozenset({
+    "schema", "state", "api_pid", "api_exit_code", "accepted_store",
+    "bootstrap", "qualification", "error", "shutdown_error",
+})
+_ACCEPTED_REATTACH_PRE_RESTORE_API_EXIT_CODE = 101
+_ACCEPTED_REATTACH_PRE_RESTORE_API_ERROR = (
+    "API binding did not become ready: API loopback probe failed for "
+    "/v2/platform/openapi.json: [Errno 111] Connection refused"
+)
+_ACCEPTED_REATTACH_PRE_RESTORE_SHUTDOWN_ERROR = (
+    "no pinned runtime service owner was available for authenticated drain"
+)
 
 
 def _reattach_relative(root: Path, relative: str, name: str) -> Path:
@@ -1014,6 +1032,280 @@ def _read_optional_accepted_reattach_record(path: Path, name: str) -> tuple[byte
     return raw, _accepted_reattach_json(raw, name)
 
 
+PRE_ACK_RETRY_SCHEMA = "fullmag.docker-accepted-pre-ack-retry.v1"
+
+
+def _pre_ack_attempt_container(terminal, attempt, project, expected_image):
+    """Read the explicit historical container binding from the same operation."""
+    if not isinstance(expected_image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_image):
+        _fail("pre-ACK operation has an invalid historical image identity")
+    ready = terminal.get("worker_cgroup")
+    helper = terminal.get("worker_cgroup_helper")
+    if (not isinstance(ready, dict) or not isinstance(helper, dict)
+            or ready.get("schema") != "fullmag.worker-cgroup-ready.v1"
+            or ready.get("state") != "ready"
+            or ready.get("compose_project") != project
+            or ready.get("image_id") != expected_image
+            or helper.get("state") != "succeeded"
+            or helper.get("name") != "fullmag-cgroup-" + attempt
+            or not isinstance(helper.get("sha256"), str)
+            or not HEX64.fullmatch(helper["sha256"])):
+        _fail("pre-ACK operation has no matching canonical container binding")
+    container = ready.get("container_id")
+    if (not isinstance(container, str) or not HEX64.fullmatch(container)
+            or ready.get("container_cgroup") != "/docker/" + container):
+        _fail("pre-ACK operation has an invalid historical cgroup container identity")
+    if "backend_container" in terminal and terminal["backend_container"] != container:
+        _fail("pre-ACK operation backend and cgroup container identities differ")
+    return container
+
+
+def _pre_ack_utc_timestamp_ns(value):
+    # Python 3.10's ISO parser does not define support for arbitrary fractional
+    # seconds. Validate the UTC calendar separately and retain all nine digits.
+    from datetime import datetime
+    import calendar
+    match = re.fullmatch(
+        r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?Z",
+        value if isinstance(value, str) else "",
+    )
+    if match is None:
+        _fail("pre-ACK incarnation timestamp is not bounded UTC RFC3339")
+    try:
+        base = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        _fail("pre-ACK incarnation timestamp has an invalid UTC calendar")
+    if base.year < 1970:
+        _fail("pre-ACK incarnation timestamp predates the Unix epoch")
+    fraction = int((match.group(2) or "").ljust(9, "0"))
+    return calendar.timegm(base.timetuple()) * 1_000_000_000 + fraction
+
+
+def _assert_pre_ack_unconsumed(directory: Path) -> None:
+    allowed = {"request.json", "proof.json", "terminal-owner.json", "terminal-process.json",
+               "pre-ack-retry.json", "pre-ack-api-terminal.json"}
+    entries = list(directory.iterdir())
+    if len(entries) > 64:
+        _fail("pre-ACK retry record inventory exceeds its bound")
+    for entry in entries:
+        if (entry.name not in allowed or entry.is_symlink() or not entry.is_file()
+                or entry.name.startswith((ACCEPTED_REATTACH_ACK_PREFIX, ACCEPTED_REATTACH_DRAIN_PREFIX))
+                or entry.name.endswith((".part", ".tmp"))):
+            _fail("pre-ACK retry has consumed or uncertain acknowledgement evidence")
+
+
+def _validate_pre_ack_retry_record(record, raw, request, proof, request_sha, read_record,
+                                  *, require_operation=True):
+    """Validate one first retry; never authorize another retry or a Solve."""
+    expected = {
+        "schema": PRE_ACK_RETRY_SCHEMA, "parent": None,
+        "request_sha256": request_sha, "proof_sha256": request["proof_sha256"],
+        "run_id": request["run_id"], "project_id": request["project_id"],
+        "compose_project": proof["compose_project"], "control_volume": proof["control_volume"],
+        "original_process_sha256": proof["terminal_process_record_sha256"],
+        "owner_sha256": proof["terminal_owner_record_sha256"],
+    }
+    if "parent" not in record or any(record.get(k) != v for k, v in expected.items()):
+        _fail("pre-ACK retry identity or first-retry scope differs")
+    for key in ("api_attempt", "preflight_attempt", "operation_attempt"):
+        if not isinstance(record.get(key), str) or not re.fullmatch(r"[0-9a-f]{32}", record[key]):
+            _fail("pre-ACK retry has an invalid " + key)
+    for key in ("api_container", "preflight_container"):
+        if not isinstance(record.get(key), str) or not HEX64.fullmatch(record[key]):
+            _fail("pre-ACK retry has an invalid " + key)
+    if (record["api_attempt"] == record["preflight_attempt"]
+            or record["api_container"] == record["preflight_container"]):
+        _fail("pre-ACK retry must bind two distinct attempts and container incarnations")
+    for kind in ("api", "preflight"):
+        terminal_raw, terminal = read_record(
+            "development/attempts/" + record[kind + "_attempt"] + "/terminal.json", kind + " attempt"
+        )
+        if (_sha256_bytes(terminal_raw) != record.get(kind + "_attempt_sha256")
+                or terminal.get("state") != "failed-confirmed"
+                or terminal.get("compose_project") != proof["compose_project"]
+                or terminal.get("control_volume") != proof["control_volume"]
+                or terminal.get("inputs", {}).get("image_id") != record.get(kind + "_image")
+                or terminal.get("inputs", {}).get("source_root") != proof["source_root"]):
+            _fail("pre-ACK retry development attempt differs: " + kind)
+        if _pre_ack_attempt_container(
+                terminal, record[kind + "_attempt"], proof["compose_project"],
+                record[kind + "_image"]) != record[kind + "_container"]:
+            _fail("pre-ACK retry recorded container differs: " + kind)
+        if kind == "api" and terminal.get("backend_started_at") != record.get("api_incarnation", {}).get("started_at"):
+            _fail("pre-ACK retry API attempt start time differs from its journal")
+        if kind == "preflight":
+            restart = terminal.get("inputs", {}).get("native_failed_restart", {})
+            if (restart.get("container_id") != record["api_container"]
+                    or restart.get("image_id") != record["api_image"]
+                    or restart.get("journal_sha256") != record["api_stop_sha256"]):
+                _fail("pre-ACK retry preflight attempt does not bind the stopped API predecessor")
+            encoded = json.dumps(restart, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            if _sha256_bytes(encoded) != record.get("native_restart_sha256"):
+                _fail("pre-ACK retry native restart metadata payload differs")
+    journal_raw, journal = read_record(
+        "verification/stop-failed-" + record["api_container"] + ".json", "pre-ACK API stop journal"
+    )
+    if (_sha256_bytes(journal_raw) != record.get("api_stop_sha256")
+            or journal.get("schema") != "fullmag.stop-failed-admission.v1"
+            or journal.get("state") != "stopped-confirmed"
+            or journal.get("failure_kind") != "native-start-failure"
+            or journal.get("failure_mode") != "api-start-failure"
+            or journal.get("container_id") != record["api_container"]
+            or journal.get("image_id") != record["api_image"]
+            or journal.get("container_state") != record.get("api_incarnation")):
+        _fail("pre-ACK retry is not bound to the exact API-start stop journal")
+    process_raw, process = read_record(
+        "runtime-control/" + str(PurePosixPath(request["proof_path"]).parent / "pre-ack-api-terminal.json"),
+        "pre-ACK stopped API terminal",
+    )
+    if (_sha256_bytes(process_raw) != record.get("current_process_sha256")
+            or process != journal.get("terminal_process_receipt")
+            or process.get("schema") != "fullmag.docker-process-tree.v1"
+            or process.get("state") != "shutdown_unknown"
+            or type(process.get("api_pid")) is not int or process["api_pid"] <= 0
+            or type(process.get("api_exit_code")) is not int or process["api_exit_code"] != -15
+            or process.get("runtime_pid") is not None
+            or any(k in process for k in ("service_owner", "terminal_service_owner", "accepted_reattach"))):
+        _fail("pre-ACK retry stopped API terminal differs")
+    probe = journal.get("native_failure_probe", {})
+    if (probe.get("api_pid_exists") is not False or probe.get("owner_pid_exists") is not False
+            or probe.get("child_pids_exist") is not False or probe.get("native_processes_live") is not False
+            or type(probe.get("active_lease_count")) is not int or probe["active_lease_count"] != 0
+            or probe.get("failed_owner_sha256") != record["owner_sha256"]
+            or any(not isinstance(probe.get(k), list) or any(s != "released" for s in probe[k])
+                   for k in ("lease_states", "reservation_states"))):
+        _fail("pre-ACK retry has no exact stopped and released native proof")
+    if journal.get("terminal_failed_owner_sha256") != record["owner_sha256"]:
+        _fail("pre-ACK retry stop journal owner differs from original owner")
+    incarnation = record.get("preflight_incarnation", {})
+    if (incarnation.get("id") != record["preflight_container"]
+            or incarnation.get("image") != record["preflight_image"]
+            or type(incarnation.get("pid")) is not int or incarnation["pid"] != 0
+            or type(incarnation.get("exit_code")) is not int or incarnation["exit_code"] != 1
+            or incarnation.get("status") != "exited" or incarnation.get("oom_killed") is not False):
+        _fail("pre-ACK retry preflight incarnation differs")
+    try:
+        api_end = _pre_ack_utc_timestamp_ns(record["api_incarnation"]["finished_at"])
+        pre_start = _pre_ack_utc_timestamp_ns(incarnation["started_at"])
+        pre_end = _pre_ack_utc_timestamp_ns(incarnation["finished_at"])
+        if not api_end < pre_start <= pre_end:
+            _fail("pre-ACK retry incarnation order differs")
+    except (KeyError, TypeError, ValueError):
+        _fail("pre-ACK retry has invalid incarnation timestamps")
+    safety_raw, safety = read_record(
+        "pre-ack-retry/attempts/" + record["operation_attempt"] + "/released-observation.json", "pre-ACK released observation"
+    )
+    if (_sha256_bytes(safety_raw) != record.get("released_observation_sha256")
+            or safety.get("schema") != "fullmag.pre-ack-released-observation.v1"
+            or type(safety.get("active_count")) is not int or safety["active_count"] != 0
+            or not isinstance(safety.get("reservations"), list) or not isinstance(safety.get("leases"), list)):
+        _fail("pre-ACK retry released observation differs")
+    compose_raw, compose = read_record(
+        "development/attempts/" + record["preflight_attempt"] + "/compose.json", "pre-ACK Compose"
+    )
+    if _sha256_bytes(compose_raw) != record.get("preflight_compose_sha256") or compose.get("name") != proof["compose_project"]:
+        _fail("pre-ACK retry Compose identity differs")
+    provenance_raw, provenance = read_record(
+        "pre-ack-retry/attempts/" + record["operation_attempt"] + "/preflight-provenance.json", "pre-ACK build provenance"
+    )
+    if (_sha256_bytes(provenance_raw) != record.get("preflight_provenance_sha256")
+            or provenance.get("schema") != "fullmag.docker-all-image.v1"
+            or provenance.get("state") != "succeeded"
+            or provenance.get("source_snapshot_sha256") != record.get("preflight_source_snapshot")):
+        _fail("pre-ACK retry immutable build provenance differs")
+    log_raw, log_record = read_record(
+        "pre-ack-retry/attempts/" + record["operation_attempt"] + "/preflight-log.json", "pre-ACK preflight log"
+    )
+    log = log_record.get("log")
+    if (_sha256_bytes(log_raw) != record.get("preflight_log_sha256")
+            or log_record.get("incarnation") != incarnation or not isinstance(log, str)
+            or "accepted_reattach_preflight" not in log
+            or "current terminal record differs from immutable backing evidence" not in log
+            or "[fullmag-backend] Starting API and runtime service" in log
+            or "starting fullmag-api" in log):
+        _fail("pre-ACK retry does not prove a failure before API spawn")
+    if require_operation:
+        operation_raw, operation = read_record(
+            "pre-ack-retry/attempts/" + record["operation_attempt"] + "/terminal.json", "pre-ACK retry operation"
+        )
+        if (operation.get("state") != "succeeded" or operation.get("phase") != "pre-ack-retry"
+                or operation.get("compose_project") != proof["compose_project"]
+                or operation.get("control_volume") != proof["control_volume"]
+                or operation.get("retry_record_sha256") != _sha256_bytes(raw)):
+            _fail("pre-ACK retry operation is not a bound succeeded publication")
+    return record
+
+
+def _validate_initial_pre_restore_process_delta(
+    archive_raw: bytes, current_raw: bytes, owner_raw: bytes
+) -> None:
+    """Accept only the known API-before-owner terminal receipt transition."""
+
+    archive = _accepted_reattach_json(
+        archive_raw, "accepted-run immutable terminal process record"
+    )
+    current = _accepted_reattach_json(
+        current_raw, "accepted-run current terminal process record"
+    )
+    owner = _accepted_reattach_json(owner_raw, "accepted-run terminal owner record")
+    if set(current) != _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS:
+        _fail("accepted-run current terminal process record shape differs")
+    if set(archive) not in (
+        _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS,
+        _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS | {"service_owner"},
+    ):
+        _fail("accepted-run immutable terminal process record shape differs")
+    for field in ("schema", "state", "accepted_store", "bootstrap", "qualification"):
+        if current.get(field) != archive.get(field):
+            _fail("accepted-run terminal process immutable field differs: " + field)
+    if (
+        current.get("schema") != "fullmag.docker-process-tree.v1"
+        or current.get("state") != "shutdown_unknown"
+    ):
+        _fail("accepted-run current terminal process is not the known pre-restore failure")
+    if (
+        archive.get("schema") != "fullmag.docker-process-tree.v1"
+        or archive.get("state") != "shutdown_unknown"
+    ):
+        _fail("accepted-run immutable terminal process is not shutdown_unknown")
+    if type(current.get("api_pid")) is not int or current["api_pid"] <= 0:
+        _fail("accepted-run current terminal process API PID is invalid")
+    if (type(current.get("api_exit_code")) is not int
+            or current["api_exit_code"] != _ACCEPTED_REATTACH_PRE_RESTORE_API_EXIT_CODE):
+        _fail("accepted-run current terminal process API exit code is invalid")
+    if current.get("error") != _ACCEPTED_REATTACH_PRE_RESTORE_API_ERROR:
+        _fail("accepted-run current terminal process API error differs")
+    if (
+        current.get("shutdown_error")
+        != _ACCEPTED_REATTACH_PRE_RESTORE_SHUTDOWN_ERROR
+    ):
+        _fail("accepted-run current terminal process shutdown reason differs")
+    _validate_terminal_owner(
+        owner,
+        state="failed",
+        name="accepted-run terminal failed owner",
+        allowed_child_statuses=(
+            ("exited_success", "exited_failure")
+            if "service_owner" in archive else ("exited_success",)
+        ),
+    )
+    if "service_owner" in archive:
+        retained_ready_owner = archive["service_owner"]
+        if not isinstance(retained_ready_owner, dict):
+            _fail("accepted-run retained ready owner is not an object")
+        _validate_terminal_owner(
+            retained_ready_owner,
+            state="ready",
+            name="accepted-run retained ready owner",
+        )
+        if (
+            _owner_identity(retained_ready_owner) != _owner_identity(owner)
+            or _owner_child_identity(retained_ready_owner)
+            != _owner_child_identity(owner)
+        ):
+            _fail("accepted-run retained ready owner differs from failed owner identity")
+
+
 def accepted_reattach_preflight(paths: RuntimePaths):
     """Pin old records or an authenticated successor drain before rotation.
 
@@ -1032,9 +1324,10 @@ def accepted_reattach_preflight(paths: RuntimePaths):
     proof_path = _reattach_relative(paths.state_root, request["proof_path"], "accepted-run proof")
 
     # The first entrypoint invocation has no native ack yet.  It is admitted
-    # only while both mutable records are byte-identical to the archived
-    # terminal records.  A later invocation may never infer this phase from a
-    # state string or marker: it needs the exact drained successor metadata.
+    # from the immutable archive and may accept only the explicitly typed
+    # API-before-owner failure receipt below.  A later invocation may never
+    # infer its phase from a state string or marker: it needs exact drained
+    # successor metadata.
     current_receipt_path = process_receipt_path(paths)
     metadata = None
     try:
@@ -1149,20 +1442,81 @@ def accepted_reattach_preflight(paths: RuntimePaths):
     # The API-specific acknowledgement filename is not knowable until the
     # native successor receives its new API instance identity.  No mutable
     # marker is accepted as a substitute for that first native acknowledgement.
-    for prefix, filename, current in (
-            ("terminal_owner_record", "terminal-owner.json", runtime_services_root(paths) / "OWNER.json"),
-            ("terminal_process_record", "terminal-process.json", process_receipt_path(paths))):
-        relative, expected = proof.get(prefix + "_path"), proof.get(prefix + "_sha256")
-        if not isinstance(expected, str) or not HEX64.fullmatch(expected):
-            _fail("accepted-run backing record digest is missing or invalid")
-        archived = _reattach_relative(paths.state_root, relative, "accepted-run backing record")
-        if archived.parent != proof_path.parent or archived.name != filename:
-            _fail("accepted-run backing record is outside its proof directory")
-        archive_raw = _bounded_regular(archived, "accepted-run immutable terminal record", 256 * 1024)
-        current_raw = _bounded_regular(current, "accepted-run current terminal record", 256 * 1024)
-        if _sha256_bytes(archive_raw) != expected or current_raw != archive_raw:
-            _fail("accepted-run current terminal record differs from immutable backing evidence")
-    return {
+    owner_relative, owner_expected = (
+        proof.get("terminal_owner_record_path"),
+        proof.get("terminal_owner_record_sha256"),
+    )
+    if not isinstance(owner_expected, str) or not HEX64.fullmatch(owner_expected):
+        _fail("accepted-run backing record digest is missing or invalid")
+    archived_owner = _reattach_relative(
+        paths.state_root, owner_relative, "accepted-run backing owner record"
+    )
+    if (
+        archived_owner.parent != proof_path.parent
+        or archived_owner.name != "terminal-owner.json"
+    ):
+        _fail("accepted-run backing owner record is outside its proof directory")
+    archive_owner_raw = _bounded_regular(
+        archived_owner, "accepted-run immutable terminal owner", 256 * 1024
+    )
+    current_owner_path = runtime_services_root(paths) / "OWNER.json"
+    current_owner_raw = _bounded_regular(
+        current_owner_path, "accepted-run current terminal owner", 256 * 1024
+    )
+    if (
+        _sha256_bytes(archive_owner_raw) != owner_expected
+        or current_owner_raw != archive_owner_raw
+    ):
+        _fail("accepted-run current terminal owner differs from immutable backing evidence")
+
+    process_relative, process_expected = (
+        proof.get("terminal_process_record_path"),
+        proof.get("terminal_process_record_sha256"),
+    )
+    if not isinstance(process_expected, str) or not HEX64.fullmatch(process_expected):
+        _fail("accepted-run backing record digest is missing or invalid")
+    archived_process = _reattach_relative(
+        paths.state_root, process_relative, "accepted-run backing process record"
+    )
+    if (
+        archived_process.parent != proof_path.parent
+        or archived_process.name != "terminal-process.json"
+    ):
+        _fail("accepted-run backing process record is outside its proof directory")
+    archive_process_raw = _bounded_regular(
+        archived_process, "accepted-run immutable terminal process", 256 * 1024
+    )
+    if _sha256_bytes(archive_process_raw) != process_expected:
+        _fail("accepted-run immutable terminal process digest differs")
+    current_process_raw = _bounded_regular(
+        process_receipt_path(paths), "accepted-run current terminal process", 256 * 1024
+    )
+    retry = None
+    if current_process_raw != archive_process_raw:
+        retry_relative = _accepted_reattach_record_relative(request, "pre-ack-retry.json")
+        retry_path = _reattach_relative(paths.state_root, retry_relative, "pre-ACK retry")
+        retry_observation = _read_optional_accepted_reattach_record(retry_path, "pre-ACK retry")
+        if retry_observation is None:
+            # Retain the remote's exact legacy exit-101 compatibility case.
+            _validate_initial_pre_restore_process_delta(
+                archive_process_raw, current_process_raw, archive_owner_raw
+            )
+        else:
+            # An existing certificate must validate; never fall back from an
+            # invalid or uncertain certificate to the legacy receipt case.
+            retry_raw, retry_record = retry_observation
+            def read_retry_record(relative, label):
+                maximum = 8 * 1024 * 1024 if relative.endswith("/preflight-log.json") else MAX_JSON_BYTES
+                data = _bounded_regular(_reattach_relative(BUILD_CONTROL_ROOT, relative, label), label, maximum)
+                return data, _accepted_reattach_json(data, label)
+            _validate_pre_ack_retry_record(
+                retry_record, retry_raw, request, proof, request_sha256, read_retry_record
+            )
+            if _sha256_bytes(current_process_raw) != retry_record["current_process_sha256"]:
+                _fail("pre-ACK retry cannot authorize another API incarnation")
+            _assert_pre_ack_unconsumed(retry_path.parent)
+            retry = {"pre_ack_retry_path": retry_relative, "pre_ack_retry_sha256": _sha256_bytes(retry_raw)}
+    result = {
         "request_sha256": request_sha256,
         "proof_sha256": request["proof_sha256"],
         "restore_mode": ACCEPTED_REATTACH_INITIAL_MODE,
@@ -1171,6 +1525,9 @@ def accepted_reattach_preflight(paths: RuntimePaths):
         "previous_drain_relative": None,
         "previous_drain_sha256": None,
     }
+    if retry is not None:
+        result.update(retry)
+    return result
 
 
 @contextmanager
@@ -1193,6 +1550,8 @@ def accepted_reattach_api_input(paths: RuntimePaths, *, preflight=None):
         "previous_drain_relative": preflight.get("previous_drain_relative") if isinstance(preflight, dict) else None,
         "previous_drain_sha256": preflight.get("previous_drain_sha256") if isinstance(preflight, dict) else None,
     }
+    if isinstance(preflight, dict) and "pre_ack_retry_path" in preflight:
+        expected_preflight.update({key: preflight.get(key) for key in ("pre_ack_retry_path", "pre_ack_retry_sha256")})
     if preflight != expected_preflight:
         _fail("accepted-run API input requires the matching early terminal preflight")
     _accepted_reattach_preflight_shape(environment, request, preflight)
@@ -1217,6 +1576,8 @@ def accepted_reattach_api_input(paths: RuntimePaths, *, preflight=None):
         previous_drain_path=preflight["previous_drain_relative"],
         previous_drain_sha256=preflight["previous_drain_sha256"],
     )
+    if "pre_ack_retry_path" in preflight:
+        payload.update({key: preflight[key] for key in ("pre_ack_retry_path", "pre_ack_retry_sha256")})
     _ensure_directory(paths.state_root, "accepted-run runtime control")
     with tempfile.TemporaryFile(mode="w+b", dir=paths.state_root) as stream:
         stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf8"))
@@ -1288,6 +1649,8 @@ def _accepted_reattach_preflight_shape(
         "previous_drain_relative": preflight.get("previous_drain_relative"),
         "previous_drain_sha256": preflight.get("previous_drain_sha256"),
     }
+    if "pre_ack_retry_path" in preflight:
+        expected.update({key: preflight.get(key) for key in ("pre_ack_retry_path", "pre_ack_retry_sha256")})
     if dict(preflight) != expected:
         _fail("accepted-run API input requires the matching early terminal preflight")
     restore_mode = preflight.get("restore_mode")
@@ -1300,7 +1663,14 @@ def _accepted_reattach_preflight_shape(
     if restore_mode == ACCEPTED_REATTACH_INITIAL_MODE:
         if any(preflight.get(field) is not None for field in previous_fields):
             _fail("initial accepted-run restore cannot reference successor records")
+        if "pre_ack_retry_path" in preflight:
+            if (preflight["pre_ack_retry_path"] != _accepted_reattach_record_relative(request, "pre-ack-retry.json")
+                    or not isinstance(preflight.get("pre_ack_retry_sha256"), str)
+                    or not HEX64.fullmatch(preflight["pre_ack_retry_sha256"])):
+                _fail("pre-ACK retry transport path or digest differs")
         return
+    if "pre_ack_retry_path" in preflight:
+        _fail("successor transport cannot carry a pre-ACK retry")
     for field in ("previous_ack_relative", "previous_drain_relative"):
         value = preflight.get(field)
         try:
@@ -3401,7 +3771,8 @@ def _source_identity(paths: RuntimePaths) -> tuple[str, str]:
 
 
 def _probe_api_identity(
-    paths: RuntimePaths, port: int, expected_binding: str, *, timeout: float = 5.0
+    paths: RuntimePaths, port: int, expected_binding: str, *, timeout: float = 5.0,
+    deadline: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate one complete API identity and return it with the profile document."""
 
@@ -3409,9 +3780,18 @@ def _probe_api_identity(
         _fail("API probe timeout must be positive")
     if not HEX64.fullmatch(expected_binding):
         _fail("API accepted-store binding must be a lowercase SHA-256")
+
+    def request_timeout() -> float:
+        if deadline is None:
+            return timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeServiceTransportError("API identity probe deadline expired")
+        return min(timeout, remaining)
+
     commit, snapshot = _source_identity(paths)
     status, headers, document = _http_json(
-        port, "/v2/platform/openapi.json", timeout=timeout
+        port, "/v2/platform/openapi.json", timeout=request_timeout()
     )
     contract_version = _single_header(headers, "x-api-contract-version")
     if status != 200 or contract_version != "1.0.0":
@@ -3439,7 +3819,7 @@ def _probe_api_identity(
     ):
         _fail("API accepted-store binding differs from /state")
     profile_status, _, profile = _http_json(
-        port, "/v2/platform/compute/profiles?limit=100", timeout=timeout
+        port, "/v2/platform/compute/profiles?limit=100", timeout=request_timeout()
     )
     if profile_status != 200:
         _fail("API compute profile route is unavailable")
@@ -3567,23 +3947,41 @@ def _wait_for_api_liveness(
 
 
 def wait_for_api(
-    paths: RuntimePaths, port: int, expected_binding: str, timeout: float = 60.0
+    paths: RuntimePaths, port: int, expected_binding: str,
+    timeout: float = API_BINDING_STARTUP_TIMEOUT_SECONDS,
 ) -> Mapping[str, Any]:
     """Pin API source, instance, accepted store, and the v2 profile route."""
 
-    if timeout <= 0:
-        _fail("API startup timeout must be positive")
-    deadline = time.monotonic() + timeout
+    if (type(timeout) not in (int, float)
+            or not 0 < timeout <= ACCEPTED_REATTACH_API_STARTUP_TIMEOUT_SECONDS):
+        _fail("API startup timeout must be positive and at most 300 seconds")
+    started = time.monotonic()
+    deadline = started + timeout
+    next_progress = started + 10.0
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
             identity, profile = _probe_api_identity(
-                paths, port, expected_binding, timeout=5.0
+                paths, port, expected_binding,
+                timeout=min(5.0, max(0.001, deadline - time.monotonic())),
+                deadline=deadline,
             )
+            if time.monotonic() >= deadline:
+                raise RuntimeServiceTransportError(
+                    "API identity validation exceeded startup deadline"
+                )
             return {**identity, "profiles": profile}
         except (RuntimeServiceError, OSError) as error:
             last_error = error
-        time.sleep(0.2)
+        now = time.monotonic()
+        if now >= next_progress:
+            print(
+                "[fullmag-backend] Waiting for API binding: "
+                f"elapsed_seconds={now - started:.0f} budget_seconds={timeout:.0f}",
+                flush=True,
+            )
+            next_progress = now + 10.0
+        time.sleep(min(0.2, max(0.0, deadline - now)))
     raise RuntimeServiceUnknown(f"API binding did not become ready: {last_error}")
 
 
@@ -3635,7 +4033,13 @@ def _owner_child_identity(owner: Mapping[str, Any]) -> list[tuple[Any, Any]]:
     return sorted(identity, key=lambda item: (str(item[0]), str(item[1])))
 
 
-def _terminal_owner_children(owner: Mapping[str, Any], *, state: str, name: str) -> None:
+def _terminal_owner_children(
+    owner: Mapping[str, Any],
+    *,
+    state: str,
+    name: str,
+    allowed_child_statuses: Sequence[str] | None = None,
+) -> None:
     """Require the two native scheduler children for one terminal proof."""
 
     children = owner.get("children")
@@ -3656,12 +4060,23 @@ def _terminal_owner_children(owner: Mapping[str, Any], *, state: str, name: str)
         pids.add(pid)
     if set(by_role) != {"compute", "preparation"}:
         _fail(f"{name} has an unexpected scheduler child set")
-    expected_status = "running" if state == "ready" else "exited_success"
-    if any(child.get("status") != expected_status for child in by_role.values()):
-        _fail(f"{name} child status is not {expected_status}")
+    if allowed_child_statuses is None:
+        expected_status = "running" if state == "ready" else "exited_success"
+        if any(child.get("status") != expected_status for child in by_role.values()):
+            _fail(f"{name} child status is not {expected_status}")
+    else:
+        expected_statuses = tuple(allowed_child_statuses)
+        if any(child.get("status") not in expected_statuses for child in by_role.values()):
+            _fail(f"{name} child status is not one of {expected_statuses!r}")
 
 
-def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str) -> None:
+def _validate_terminal_owner(
+    owner: Mapping[str, Any],
+    *,
+    state: str,
+    name: str,
+    allowed_child_statuses: Sequence[str] | None = None,
+) -> None:
     if owner.get("schema_version") != "runtime_service_owner.v1":
         _fail(f"{name} schema is unsupported")
     if owner.get("state") != state:
@@ -3695,7 +4110,12 @@ def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str)
         _fail(f"{name} has invalid scheduler pool identity")
     if not isinstance(owner.get("control_address"), str) or not owner["control_address"]:
         _fail(f"{name} has no control address")
-    _terminal_owner_children(owner, state=state, name=name)
+    _terminal_owner_children(
+        owner,
+        state=state,
+        name=name,
+        allowed_child_statuses=allowed_child_statuses,
+    )
     _owner_fingerprint(owner)
 
 
@@ -3950,6 +4370,7 @@ def start(
     api_port: int | None = None,
     cli: Path | None = None,
     timeout: float = 90.0,
+    api_startup_timeout: float | None = None,
     expected_binding: str,
     configuration: Mapping[str, Any] | None = None,
 ) -> RuntimeHandle:
@@ -3967,7 +4388,11 @@ def start(
     port = api_port or int(os.environ.get("FULLMAG_API_PORT", "8081"))
     if not 1 <= port <= 65535:
         _fail("API port is outside the valid range")
-    api_probe = wait_for_api(paths, port, expected_binding, timeout=min(timeout, 60.0))
+    api_probe = wait_for_api(
+        paths, port, expected_binding,
+        timeout=(min(timeout, API_BINDING_STARTUP_TIMEOUT_SECONDS)
+                 if api_startup_timeout is None else api_startup_timeout),
+    )
     api_identity = {
         key: api_probe[key]
         for key in (

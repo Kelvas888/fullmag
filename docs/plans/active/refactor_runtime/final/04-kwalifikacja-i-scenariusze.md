@@ -1,6 +1,8 @@
 # Kwalifikacja produkcyjna i scalone scenariusze odbioru
 
-Status: **specyfikacja bramek z aktualizacją checkpointu 21.09.2026**. W momencie tworzenia audytu testy aplikacji i runtime były `NOT_RUN`; późniejsze autoryzowane wyniki są przypięte w [P0](p0/03-implementation-status.md) i [P1](p1/README.md). Brak receiptu dla konkretnego przypadku nadal oznacza `NOT VERIFIED`, a sama lista scenariuszy nie jest wykonawczym unified gate.
+Status: **specyfikacja bramek, aktualizacja 20.10.2026** dla lokalnego `master@42d92610312871d591db16a5b60a8f7a6d6339b5`. Scenariusze pozostają wymaganiami odbioru, a nie listą zaliczonych testów. Aktualny rozdział implementacji i wyników wykonania zawiera [tabela statusu](06-status-realizacji.md); historyczny checkpoint z 21.09 pozostaje w §10. Brak receiptu dla konkretnego przypadku nadal oznacza `NOT VERIFIED`, a sama lista scenariuszy nie jest wykonawczym unified gate.
+
+Aktualizacja z 20.10 obejmuje kontrolę źródeł i dokumentacji. **Nie uruchomiono w jej ramach nowych testów aplikacji, buildów, runtime, przeglądarki ani kwalifikacji naukowej.** Wyniki dawnego wykonania są opisane z zakresem i datą; ich przytoczenie nie jest ponowną walidacją receiptów. Sprawdzenie tej aktualizacji: [09](09-weryfikacja-aktualizacji.md).
 
 ## 1. Rejestr wyników wymagany w P0
 
@@ -22,7 +24,9 @@ Wpis zawiera również test owner, oczekiwany rezultat i tolerancję, aktualnie 
 | Scientific qualification | Metryki, konwergencję, reference/analytical comparison | Całego wydania poza zakresem macierzy. |
 | Release | Złożenie wymaganych dowodów, packaging, migracja i rollback | Dowolnej nieprzetestowanej kombinacji. |
 
-Wersja audytowa z 20.09 zawierała zakaz kompilacji testów jednostkowych i dlatego oznaczała zależne bramki jako `BLOCKED`. Użytkownik później jawnie autoryzował testowanie; wykonano ograniczone regresje P0/P1, managed smoke API/WebSocket/active-run, testy wejść CLI/Python oraz browser smoke. Nie wykonano pełnej macierzy solverów, power-loss, operacji GC na danych użytkownika ani kwalifikacji naukowej/release. Doc-only diff/link/coverage checks nadal potwierdzają wyłącznie dokumentację.
+Wersja audytowa z 20.09 zawierała zakaz kompilacji testów jednostkowych i dlatego oznaczała zależne bramki jako `BLOCKED`. Późniejsze checkpointy odnotowują autoryzowane ograniczone regresje P0/P1, managed smoke API/WebSocket/active-run, testy wejść CLI/Python oraz browser smoke. Nie stanowią pełnej macierzy solverów, power-loss ani kwalifikacji naukowej/release. Obecne uprawnienia wynikają z aktualnego `AGENTS.md` i jawnych wyjątków użytkownika, w tym wyjątku CI dla wskazanych napraw integracji; historyczna zgoda nie znosi automatycznie obecnego zakazu lokalnej kompilacji testów jednostkowych. Doc-only diff/link/coverage checks potwierdzają wyłącznie dokumentację.
+
+Każdy wpis postępu musi mieć oddzielne pola: **implementacja źródłowa**, **wynik wykonania**, **tożsamość sprawdzonego źródła**, **poziom dowodu**, **pozostała bramka**. Historyczny PASS można zachować dla niezmienionego zakresu i warunków; przed użyciem go do odbioru nowego HEAD trzeba wykazać tę zgodność. `NOT VERIFIED` nie oznacza automatycznie FAIL ani braku implementacji. Nie wyznaczamy procentu ukończenia przez liczenie plików, symboli lub zielonych testów z różnych zakresów.
 
 ## 3. Zachowane CAE-01–60 i przypisanie do etapów
 
@@ -162,7 +166,7 @@ Zachować oddzielność canonical µMAG/SP4 oraz istniejącego benchmarku warstw
 
 ## 7. Istniejące punkty wejścia do weryfikacji
 
-Poniższe nazwy odczytano z bieżącego `justfile` oraz `apps/control-room/package.json`. W audycie wejściowym **nie uruchomiono ich**; aktualny wykonany podzbiór i jego receipty są opisane w P0/P1. Pozostałe trasy są kandydatami do reuse, nie obietnicą że wszystkie mają obecnie działający preflight/harness. Przed wykonaniem sprawdzić args, zależności, source/runtime identity i zakres testów.
+Poniższe nazwy pochodzą z historycznego przeglądu `justfile` oraz `apps/control-room/package.json`. W audycie wejściowym **nie uruchomiono ich**; później wykonane podzbiory są opisane w checkpointach wskazanych przez [06](06-status-realizacji.md). To kandydaci do reuse, nie potwierdzona aktualna lista zgodnych recept. Przed wykonaniem sprawdzić aktualny `justfile`, args, zależności, source/runtime identity i zakres uprawnień. Codzienny DEV podlega grupie Compose wybranego checkoutu; jawne bramki CI/release/naukowe mają własne zarządzane recepty.
 
 | Warstwa | Istniejące punkty wejścia | Zastosowanie |
 |---|---|---|
@@ -187,7 +191,7 @@ Soak obejmuje wielokrotne Open/Close, A↔B, quantity changes, 3D↔plots, recon
 
 Wymagany raport wymienia wykonane scenariusze i lane’y, wszystkie FAIL/BLOCKED/NOT_RUN, zgodność source/ABI, migrację starych danych, rollback, build/packaging, runtime, browser i science. Właściciele application/storage, solverów i frontendu dokonują przeglądu swoich bramek. Brak krytycznego dowodu blokuje odpowiedni rollout; nie jest usuwany z raportu przez ogólny badge „production”.
 
-## 10. Aktualny checkpoint wykonawczy
+## 10. Historyczny checkpoint wykonawczy — 21.09.2026
 
 Poniższe wyniki są późniejsze od audytu bazowego i nie zmieniają normatywnego zakresu scenariuszy:
 

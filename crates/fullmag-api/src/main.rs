@@ -2590,11 +2590,17 @@ async fn main() {
 
     tracing_subscriber::fmt().with_env_filter("info").init();
 
+    let bootstrap_started = std::time::Instant::now();
+    eprintln!("[fullmag-api] bootstrap phase=runtime_state state=start elapsed_ms=0");
     let repo_root = repo_root();
     let runtime_state_root = crate::script::state_root(&repo_root).unwrap_or_else(|error| {
         tracing::error!("Cannot initialize runtime state: {error}");
         std::process::exit(1);
     });
+    eprintln!(
+        "[fullmag-api] bootstrap phase=runtime_state state=complete elapsed_ms={}",
+        bootstrap_started.elapsed().as_millis()
+    );
     let current_workspace_root = runtime_state_root.join("local-live").join("current");
     let current_command_journal_store_root =
         runtime_state_root.join("local-live").join("session-store");
@@ -2608,6 +2614,10 @@ async fn main() {
         );
     }
 
+    eprintln!(
+        "[fullmag-api] bootstrap phase=app_state state=start elapsed_ms={}",
+        bootstrap_started.elapsed().as_millis()
+    );
     let state = Arc::new(AppState {
         development_admission: Default::default(),
         development_restored_authoring: Default::default(),
@@ -2665,6 +2675,10 @@ async fn main() {
         frozen_spins_previews: Arc::new(RwLock::new(Default::default())),
     });
 
+    eprintln!(
+        "[fullmag-api] bootstrap phase=app_state state=complete elapsed_ms={}",
+        bootstrap_started.elapsed().as_millis()
+    );
     development_accepted_restore::restore_before_listen(&state)
         .await
         .expect("private accepted-run reattach must succeed before API startup");

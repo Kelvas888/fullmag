@@ -786,6 +786,7 @@ jobs:
         run: |
           python -B scripts/test_fullmag_docker_runtime.py -v
           python -B scripts/test_docker_backend_dev.py -v
+          python -B scripts/test_docker_candidate_retirement.py -v
           python -B scripts/test_docker_operator_capability.py -v
           python -B scripts/test_docker_build_control_cache_admission.py -v
           python -B scripts/test_docker_container_runtime_recovery.py -v
@@ -806,6 +807,9 @@ jobs:
           python -B scripts/test_docker_volume_idle_stop.py -v
           python -B scripts/test_docker_dev_defaults.py -v
           python -B scripts/test_docker_dev_recreate.py -v
+          python -B scripts/test_docker_volume_pre_admission_recreate.py -v
+          python -B scripts/test_docker_volume_pre_admission_selector.py -v
+          python -B scripts/test_docker_volume_pre_admission_integration.py -v
           python -B scripts/test_docker_dev_browser_qa.py -v
           python -B scripts/test_docker_volume_receipts.py -v
           python -B scripts/test_docker_volume_checks.py -v

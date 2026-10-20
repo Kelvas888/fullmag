@@ -9,7 +9,7 @@ use fullmag_session::{
 };
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
@@ -24,6 +24,54 @@ use owned_worker_process::OwnedWorkerProcess;
 const STORE_WRITER_RETRY_LIMIT: Duration = Duration::from_secs(5);
 const STORE_WRITER_RETRY_DELAY: Duration = Duration::from_millis(10);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PROCESS_DIAGNOSTIC_TAIL_LIMIT: usize = 64 * 1024;
+
+/// Only an observed, reaped exit may enter this retry path. It has no spawn
+/// capability: transient contention delays proof publication/release, not work.
+#[derive(Debug)]
+pub(crate) struct TerminalPreparationFinalizationPending {
+    receipt: FmsPreparationProcessExitReceipt,
+    exit_persisted: bool,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for TerminalPreparationFinalizationPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("observed preparation exit awaits persistence or finalization")
+    }
+}
+
+impl std::error::Error for TerminalPreparationFinalizationPending {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl TerminalPreparationFinalizationPending {
+    pub(crate) fn resume(
+        self,
+        store_root: &Path,
+        host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
+    ) -> Result<SupervisedPreparationResult> {
+        let result = (|| {
+            let store = retry_store_writer_busy(|| SessionStore::open_existing(store_root))?;
+            if !self.exit_persisted {
+                persist_observed_preparation_exit(&store, &self.receipt)?;
+            }
+            let finalization = finalize_preparation_exit(&store, &self.receipt, host)?;
+            Ok(SupervisedPreparationResult {
+                recovered: true,
+                timed_out: self.receipt.timed_out,
+                status_success: self.receipt.status_success,
+                exit_code: self.receipt.exit_code,
+                finalization,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        })();
+        defer_terminal_writer_contention(&self.receipt, self.exit_persisted, result)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct SupervisedPreparationResult {
@@ -258,12 +306,7 @@ pub(crate) fn run_supervised_accepted_fem_preparation_with_host(
     let failure_reason = if status_success {
         None
     } else {
-        Some(bounded_failure_reason(
-            observed
-                .failure_reason
-                .clone()
-                .unwrap_or_else(|| preparation_failure_reason(&observed)),
-        ))
+        Some(preparation_failure_details(&observed, lease_token))
     };
     let receipt = FmsPreparationProcessExitReceipt {
         schema_version: FMS_PREPARATION_PROCESS_EXIT_RECEIPT_SCHEMA.into(),
@@ -282,7 +325,10 @@ pub(crate) fn run_supervised_accepted_fem_preparation_with_host(
         failure_reason,
         observed_at: chrono::Utc::now(),
     };
-    retry_store_writer_busy(|| store.commit_preparation_process_exit_receipt(&receipt))?;
+    // The resident scheduler may never reach its final summary. Publish the
+    // observed output before any fallible persistence or finalization step.
+    publish_process_observation(&receipt, &observed);
+    persist_observed_preparation_exit(store, &receipt)?;
     let finalization = finalize_preparation_exit(store, &receipt, host)?;
     Ok(SupervisedPreparationResult {
         recovered: recovered_launch,
@@ -295,12 +341,34 @@ pub(crate) fn run_supervised_accepted_fem_preparation_with_host(
     })
 }
 
+fn persist_observed_preparation_exit(
+    store: &SessionStore,
+    receipt: &FmsPreparationProcessExitReceipt,
+) -> Result<()> {
+    let result = retry_store_writer_busy(|| {
+        let _transaction = store.write_transaction()?;
+        // A previous publication may already be durable. Validate exact bytes'
+        // meaning before replay, including when another reconciler finalized it.
+        if let Some(existing) =
+            store.read_preparation_process_exit_receipt(&receipt.run_id, &receipt.receipt_id)?
+        {
+            if existing != *receipt {
+                bail!("observed preparation exit differs from its durable receipt");
+            }
+            return Ok(());
+        }
+        store.commit_preparation_process_exit_receipt(receipt)?;
+        Ok(())
+    });
+    defer_terminal_writer_contention(receipt, false, result)
+}
+
 fn finalize_preparation_exit(
     store: &SessionStore,
     receipt: &FmsPreparationProcessExitReceipt,
     host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
 ) -> Result<PreparationProcessFinalizationDisposition> {
-    retry_store_writer_busy(|| match host {
+    let result = retry_store_writer_busy(|| match host {
         Some(host) => host
             .ledger()
             .release_preparation_after_exit_with_finalization(
@@ -310,6 +378,120 @@ fn finalize_preparation_exit(
             )
             .map(|(_, disposition)| disposition),
         None => store.finalize_preparation_process_exit(receipt),
+    });
+    defer_terminal_writer_contention(receipt, true, result)
+}
+
+fn defer_terminal_writer_contention<T>(
+    receipt: &FmsPreparationProcessExitReceipt,
+    exit_persisted: bool,
+    result: Result<T>,
+) -> Result<T> {
+    result.map_err(|error| {
+        // Do not classify arbitrary strings, missing proof, or malformed data
+        // as retryable. The scheduler retains this exact resource while busy.
+        if error
+            .downcast_ref::<TerminalPreparationFinalizationPending>()
+            .is_some()
+        {
+            return error;
+        }
+        if error
+            .chain()
+            .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
+        {
+            anyhow::Error::new(TerminalPreparationFinalizationPending {
+                receipt: receipt.clone(),
+                exit_persisted,
+                source: error,
+            })
+        } else {
+            error
+        }
+    })
+}
+
+fn publish_process_observation(
+    receipt: &FmsPreparationProcessExitReceipt,
+    observed: &ObservedPreparationProcess,
+) {
+    let event = serde_json::json!({
+        "schema_version": "preparation_process_observed.v1",
+        "run_id": receipt.run_id,
+        "task_id": receipt.task_id,
+        "preparation_attempt_id": receipt.preparation_attempt_id,
+        "resource_id": receipt.resource_id,
+        "process_id": receipt.process_id,
+        "status_success": receipt.status_success,
+        "exit_code": receipt.exit_code,
+        "timed_out": receipt.timed_out,
+        "failure_reason": receipt.failure_reason,
+        "stdout": process_output_diagnostic(&observed.stdout, &receipt.lease_token),
+        "stderr": process_output_diagnostic(&observed.stderr, &receipt.lease_token),
+    });
+    // Runtime service connects stderr directly to its persistent log file.
+    // Keep stdout's single JSON response unchanged for the one-shot CLI.
+    // A diagnostic sink failure must not prevent publishing the exit proof.
+    let output = (|| -> Result<()> {
+        let mut stderr = std::io::stderr().lock();
+        serde_json::to_writer(&mut stderr, &event)?;
+        stderr.write_all(b"\n")?;
+        stderr.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = output {
+        eprintln!("could not publish preparation process diagnostic: {error:#}");
+    }
+}
+
+fn process_output_diagnostic(bytes: &[u8], lease_token: &str) -> serde_json::Value {
+    let mut tail_start = bytes.len().saturating_sub(PROCESS_DIAGNOSTIC_TAIL_LIMIT);
+    let mut truncated = tail_start > 0;
+
+    // If the byte cap cuts through the lease token, omit its remaining suffix
+    // before decoding so a partial credential cannot escape at the tail edge.
+    let token = lease_token.as_bytes();
+    if !token.is_empty() {
+        loop {
+            let previous_start = tail_start;
+            let first_candidate = tail_start.saturating_sub(token.len().saturating_sub(1));
+            for candidate_start in first_candidate..tail_start {
+                let token_end = candidate_start.saturating_add(token.len());
+                if token_end > tail_start
+                    && token_end <= bytes.len()
+                    && bytes.get(candidate_start..token_end) == Some(token)
+                {
+                    tail_start = token_end;
+                    truncated = true;
+                    break;
+                }
+            }
+            if tail_start == previous_start {
+                break;
+            }
+        }
+    }
+
+    // Decode and redact only the bounded slice; never copy the full child output
+    // into the persistent diagnostic event.
+    let decoded = String::from_utf8_lossy(&bytes[tail_start..]);
+    let redacted = if lease_token.is_empty() {
+        decoded.into_owned()
+    } else {
+        decoded.replace(lease_token, "[redacted lease token]")
+    };
+    let mut output_start = redacted
+        .len()
+        .saturating_sub(PROCESS_DIAGNOSTIC_TAIL_LIMIT);
+    while !redacted.is_char_boundary(output_start) {
+        output_start += 1;
+    }
+    truncated |= output_start > 0;
+
+    serde_json::json!({
+        "tail": &redacted[output_start..],
+        "total_bytes": bytes.len(),
+        "truncated": truncated,
     })
 }
 
@@ -775,6 +957,143 @@ fn bounded_failure_reason(mut reason: String) -> String {
         reason.pop();
     }
     reason
+}
+
+fn preparation_failure_details(observed: &ObservedPreparationProcess, lease_token: &str) -> String {
+    let summary = observed
+        .failure_reason
+        .clone()
+        .unwrap_or_else(|| preparation_failure_reason(observed))
+        .replace(lease_token, "[redacted lease token]");
+    failure_details_with_stderr(&summary, &observed.stderr, lease_token)
+}
+
+fn failure_details_with_stderr(summary: &str, stderr: &[u8], lease_token: &str) -> String {
+    let stderr = String::from_utf8_lossy(stderr).replace(lease_token, "[redacted lease token]");
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return bounded_failure_reason(summary.to_owned());
+    }
+    // Keep a bounded summary and the diagnostic tail, where the causal chain
+    // normally ends. Slice only at UTF-8 boundaries; the receipt limit is bytes.
+    let mut summary_end = summary.len().min(1024);
+    while !summary.is_char_boundary(summary_end) {
+        summary_end -= 1;
+    }
+    let marker = "\npreparer stderr (tail):\n";
+    let budget = 4096 - summary_end - marker.len();
+    let mut start = stderr.len().saturating_sub(budget);
+    while !stderr.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{}{marker}{}", &summary[..summary_end], &stderr[start..])
+}
+
+#[cfg(test)]
+mod terminal_recovery_tests {
+    use super::*;
+
+    fn exit_receipt() -> FmsPreparationProcessExitReceipt {
+        FmsPreparationProcessExitReceipt {
+            schema_version: FMS_PREPARATION_PROCESS_EXIT_RECEIPT_SCHEMA.into(),
+            receipt_id: "prep-exit-test".into(),
+            run_id: "run-test".into(),
+            task_id: "task-test".into(),
+            preparation_attempt_id: "attempt-test".into(),
+            resource_id: "prep.cpu".into(),
+            lease_token: "lease-secret".into(),
+            lease_heartbeat_sequence: 7,
+            process_id: 42,
+            process_start_token: Some("process-start-test".into()),
+            status_success: false,
+            exit_code: Some(1),
+            timed_out: false,
+            failure_reason: Some("preparer failed".into()),
+            observed_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn finalization_defers_only_typed_writer_contention_with_exact_exit_identity() {
+        let receipt = exit_receipt();
+        let error = defer_terminal_writer_contention::<()>(
+            &receipt,
+            true,
+            Err(anyhow::Error::new(fullmag_session::StoreWriterBusy).context("release")),
+        )
+        .unwrap_err();
+        let pending = error
+            .downcast::<TerminalPreparationFinalizationPending>()
+            .unwrap();
+        assert_eq!(pending.receipt, receipt);
+        assert!(pending.exit_persisted);
+        let unpublished = defer_terminal_writer_contention::<()>(
+            &receipt,
+            false,
+            Err(anyhow::Error::new(fullmag_session::StoreWriterBusy)),
+        ).unwrap_err().downcast::<TerminalPreparationFinalizationPending>().unwrap();
+        assert_eq!(unpublished.receipt, receipt);
+        assert!(!unpublished.exit_persisted);
+        for error in [
+            anyhow::anyhow!("session store writer is busy"),
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            anyhow::anyhow!("exit proof differs from its lease"),
+        ] {
+            let error = defer_terminal_writer_contention::<()>(&receipt, true, Err(error)).unwrap_err();
+            assert!(error
+                .downcast_ref::<TerminalPreparationFinalizationPending>()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn failure_details_keep_cause_with_utf8_byte_bound_and_redacted_lease() {
+        let stderr = format!("{} lease-secret: last cause", "ą".repeat(5000));
+        let details = failure_details_with_stderr(
+            &"ź".repeat(1000),
+            stderr.as_bytes(),
+            "lease-secret",
+        );
+        assert!(details.len() <= 4096);
+        assert!(details.ends_with("[redacted lease token]: last cause"));
+        assert!(!details.contains("lease-secret"));
+        assert_eq!(failure_details_with_stderr("exit 1", b"", "secret"), "exit 1");
+    }
+
+    #[test]
+    fn process_output_diagnostic_bounds_utf8_tail_and_reports_original_size() {
+        let lease_token = "prep-lease-secret";
+        let mut output = vec![b'x'; PROCESS_DIAGNOSTIC_TAIL_LIMIT + 128];
+        output.extend_from_slice(" μ".as_bytes());
+        output.extend_from_slice(lease_token.as_bytes());
+
+        let diagnostic = process_output_diagnostic(&output, lease_token);
+        let tail = diagnostic["tail"].as_str().unwrap();
+        assert!(tail.len() <= PROCESS_DIAGNOSTIC_TAIL_LIMIT);
+        assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+        assert!(!tail.contains(lease_token));
+        assert_eq!(
+            diagnostic["total_bytes"].as_u64(),
+            Some(output.len() as u64)
+        );
+        assert_eq!(diagnostic["truncated"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn process_output_diagnostic_does_not_leak_token_cut_by_tail_boundary() {
+        let lease_token = "lease-secret";
+        let mut output = vec![b'x'; PROCESS_DIAGNOSTIC_TAIL_LIMIT + 32];
+        let tail_start = output.len() - PROCESS_DIAGNOSTIC_TAIL_LIMIT;
+        let token_start = tail_start - 4;
+        output[token_start..token_start + lease_token.len()]
+            .copy_from_slice(lease_token.as_bytes());
+
+        let diagnostic = process_output_diagnostic(&output, lease_token);
+        let tail = diagnostic["tail"].as_str().unwrap();
+        assert!(!tail.contains(lease_token));
+        assert!(!tail.starts_with(&lease_token[4..]));
+        assert_eq!(diagnostic["truncated"].as_bool(), Some(true));
+    }
 }
 
 fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {

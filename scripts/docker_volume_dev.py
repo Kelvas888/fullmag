@@ -1456,8 +1456,9 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
         elif current_start != started_at:
             raise BuildControlError("Backend incarnation changed during build observation")
         if not actual["State"]["Running"]:
-            logs = docker_text("logs", "--tail", "200", backend_id, combined=True)
-            control.write(operation["root"] + "/backend-failure-log.json", {"log": logs})
+            logs = docker_text("logs", "--since", started_at, "--tail", "200", backend_id, combined=True)
+            control.write(operation["root"] + "/backend-failure-log.json",
+                          {"started_at": started_at, "log": logs})
             raise BuildControlError("Backend exited during build; logs and volumes retained: " + logs[-4000:])
         if not handoff_seen:
             logs = docker_text("logs", "--since", started_at, "--tail", "200", backend_id, combined=True)
@@ -2958,9 +2959,28 @@ def _native_failed_stop_recovery_context(
             owner=terminal_owner,
             selected_source=previous_inputs["source_root"],
         )
+    capture_failure_sidecar = None
     if isinstance(journal.get("container_state"), Mapping):
         if removed_container_proof is None:
-            _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+            try:
+                _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+            except BuildControlError as stopped_error:
+                if namespace_attestation is not None:
+                    raise
+                from docker_volume_capture_failure_reconcile import validate_capture_failure_sidecar
+
+                try:
+                    capture_failure_sidecar = validate_capture_failure_sidecar(
+                        control,
+                        previous,
+                        backend_id=backend_id,
+                        image_id=image_id,
+                    )
+                except BuildControlError as sidecar_error:
+                    raise BuildControlError(
+                        "Stopped backend differs from the native stop journal and has no valid "
+                        "capture-only incarnation sidecar: " + str(sidecar_error)
+                    ) from stopped_error
         else:
             if not isinstance(removed_container_proof, Mapping):
                 raise BuildControlError("Removed-container recreation proof is malformed")
@@ -3017,6 +3037,24 @@ def _native_failed_stop_recovery_context(
     if namespace_attestation is not None:
         metadata["namespace_attestation_path"] = namespace_relative
         metadata["namespace_attestation_sha256"] = hashlib.sha256(namespace_raw).hexdigest()
+    if capture_failure_sidecar is not None:
+        metadata["capture_failure_sidecar_path"] = capture_failure_sidecar["path"]
+        metadata["capture_failure_sidecar_sha256"] = capture_failure_sidecar["sha256"]
+        metadata["capture_failure_operation_attempt"] = capture_failure_sidecar["operation_attempt"]
+        metadata["capture_failure_operation_terminal_sha256"] = (
+            capture_failure_sidecar["operation_terminal_sha256"]
+        )
+        metadata["capture_failure_store_probe_sha256"] = capture_failure_sidecar["store_probe_sha256"]
+        metadata["capture_failure_origin"] = capture_failure_sidecar["origin"]
+        metadata["capture_failure_launch_origin"] = capture_failure_sidecar["launch_origin"]
+        metadata["capture_failure_backend_started_at"] = capture_failure_sidecar["backend_started_at"]
+        metadata["capture_failure_backend_finished_at"] = capture_failure_sidecar["backend_finished_at"]
+        metadata["capture_failure_historical_resume_attempt"] = (
+            capture_failure_sidecar["historical_resume_attempt"]
+        )
+        metadata["capture_failure_host_ledger_raw_sha256_observations"] = (
+            capture_failure_sidecar["host_ledger_raw_sha256_observations"]
+        )
     return {
         "previous_config_sha256": previous_config_sha256,
         "native_restart_metadata": metadata,
@@ -3045,10 +3083,20 @@ def _retained_recovery_context(
                if key.startswith("FULLMAG_CONTAINER_RECOVERY_")}
     metadata = previous.get("container_recovery")
     if not carried and metadata is None:
-        return _native_failed_stop_recovery_context(
+        native = _native_failed_stop_recovery_context(
             control, previous, backend_id=backend_id or previous.get("backend_container"),
             fresh_state=fresh_state, removed_container_proof=removed_container_proof,
-        ) or {}
+        )
+        if native is not None:
+            return native
+        if removed_container_proof is None:
+            from docker_volume_pre_ack_retry import retained_pre_ack_context
+            retry = retained_pre_ack_context(
+                control, previous, document, backend_id or previous.get("backend_container"), fresh_state=fresh_state
+            )
+            if retry is not None:
+                return retry
+        return {}
     if fresh_state:
         raise BuildControlError("Pending container recovery must retain its original session storage")
     if set(carried) != {AUTHORIZATION_ENV, AUTHORIZATION_SHA_ENV} or not isinstance(metadata, Mapping):
@@ -3684,6 +3732,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             fresh_state=fresh_state,
         )
         accepted_reattach_context = {}
+        accepted_store_root = None
         if reconciliation is not None:
             if args.script is not None:
                 raise BuildControlError(
@@ -3709,8 +3758,47 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 "accepted_reattach_environment": accepted_environment,
                 "accepted_reattach_metadata": accepted_pins,
             }
+        pre_admission_recreate_proof = None
         if not fresh_state and not certificate.get("restart_verified"):
-            raise BuildControlError("Unadmitted storage cannot rotate as an admitted runtime; use explicit --fresh-state to preserve the old root")
+            retained_environment = document["services"]["backend"]["environment"]
+            observed_environment = actual["backend"].get("Config", {}).get("Env") or []
+            retained_reattach_declared = (
+                "accepted_reattach" in previous
+                or any(name.startswith("FULLMAG_ACCEPTED_REATTACH_") for name in retained_environment)
+                or any(
+                    isinstance(value, str)
+                    and value.split("=", 1)[0].startswith("FULLMAG_ACCEPTED_REATTACH_")
+                    for value in observed_environment
+                )
+            )
+            if retained_reattach_declared and not accepted_reattach_context:
+                raise BuildControlError(
+                    "Retained accepted run has no authenticated reattach context"
+                )
+            from docker_volume_pre_admission_recreate import (
+                PreAdmissionRecreateError,
+                validate_pre_admission_recreate,
+            )
+            try:
+                pre_admission_recreate_proof = validate_pre_admission_recreate(
+                    control,
+                    previous,
+                    document,
+                    actual,
+                    state,
+                    certificate,
+                    identity,
+                    args.config_sha256,
+                    accepted_reattach_context,
+                    recovery_context,
+                )
+            except PreAdmissionRecreateError as error:
+                raise BuildControlError(str(error)) from error
+            if not pre_admission_recreate_proof:
+                raise BuildControlError(
+                    "Unadmitted storage cannot rotate as an admitted runtime; "
+                    "use explicit --fresh-state to preserve the old root"
+                )
         # Exact recorded helper only; unknown group resources are never deleted.
         helper_ids = []
         for helper_name in ("fullmag-ledger-" + previous["attempt"], "fullmag-ledger-verify-" + previous["attempt"]):
@@ -3744,6 +3832,86 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 operation["receipt"]["accepted_reattach"] = accepted_reattach_context[
                     "accepted_reattach_metadata"
                 ]
+            if pre_admission_recreate_proof is not None:
+                # Re-pin both app containers after the durable recreate lease is
+                # held.  This closes the gap between the retained observation
+                # above and the stop/rm boundary below.
+                leased_actual = {}
+                for service, identifier in ids.items():
+                    observed = json.loads(docker_text("inspect", identifier))
+                    if len(observed) != 1:
+                        raise BuildControlError(
+                            "Pre-admission recreation has an ambiguous leased service: "
+                            + service
+                        )
+                    observed = observed[0]
+                    before = actual[service]
+                    if (
+                        observed.get("Id") != before.get("Id")
+                        or observed.get("Image") != before.get("Image")
+                        or observed.get("State", {}).get("StartedAt")
+                        != before.get("State", {}).get("StartedAt")
+                    ):
+                        raise BuildControlError(
+                            "Pre-admission recreation service incarnation changed under lease: "
+                            + service
+                        )
+                    _validate_retained_service(
+                        document,
+                        observed,
+                        service,
+                        image_config,
+                        allow_legacy_frontend=True,
+                    )
+                    leased_actual[service] = observed
+                leased_certificate = _retained_certificate(state, document)
+                try:
+                    leased_proof = validate_pre_admission_recreate(
+                        control,
+                        previous,
+                        document,
+                        leased_actual,
+                        state,
+                        leased_certificate,
+                        identity,
+                        args.config_sha256,
+                        accepted_reattach_context,
+                        recovery_context,
+                    )
+                except PreAdmissionRecreateError as error:
+                    raise BuildControlError(str(error)) from error
+                if leased_proof != pre_admission_recreate_proof:
+                    raise BuildControlError(
+                        "Pre-admission recreation proof changed before stop/rm"
+                    )
+                actual = leased_actual
+                operation["receipt"]["pre_admission_recreate"] = pre_admission_recreate_proof
+            if accepted_reattach_context:
+                # The publishing producer cannot run while /control/active is
+                # held.  Its read-only bundle path performs the same archive,
+                # proof and held-Run validation without publishing anything.
+                if accepted_store_root is None:
+                    raise BuildControlError("Accepted-run reattach store was not retained")
+                from docker_volume_accepted_reattach import build_accepted_reattach_bundle
+                produced_again = build_accepted_reattach_bundle(
+                    control,
+                    store_root=accepted_store_root,
+                )
+                environment_again = _validate_accepted_reattach_environment(
+                    produced_again.get("environment")
+                )
+                metadata_again = _validate_accepted_reattach_metadata(
+                    produced_again.get("pins"), environment_again
+                )
+                if (
+                    environment_again
+                    != accepted_reattach_context["accepted_reattach_environment"]
+                    or metadata_again
+                    != accepted_reattach_context["accepted_reattach_metadata"]
+                ):
+                    raise BuildControlError(
+                        "Accepted-run reattach changed before recreation"
+                    )
             control.write(operation["root"] + "/retained-containers.json", actual)
             if pre_activation_stop is not None:
                 operation["receipt"]["pre_activation_stop_receipt"] = pre_activation_stop

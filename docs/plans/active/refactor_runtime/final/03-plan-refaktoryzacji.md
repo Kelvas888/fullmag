@@ -1,6 +1,22 @@
 # Produkcyjny plan refaktoryzacji całego Fullmaga
 
-Data planu: 20.09.2026. Status normatywnego zakresu: **PLANNED**; bieżące wykonanie etapów jest w [tabeli statusu](06-status-realizacji.md). Baza audytu: `14c8e73a6f3c55f4fc080835a6156f2a4db8f111`. Docelowe zachowanie: [architektura i kontrakty](02-architektura-i-kontrakty.md); wymagane dowody: [kwalifikacja](04-kwalifikacja-i-scenariusze.md).
+Plan ustanowiony 20.09.2026; aktualizacja wykonawcza: **20.10.2026**, lokalny `master` na `42d92610312871d591db16a5b60a8f7a6d6339b5`. Status: **IN PROGRESS** — część wymagań ma już implementację, pełny odbiór pozostaje otwarty. Pierwotna baza `14c8e73a6f3c55f4fc080835a6156f2a4db8f111` jest historyczna. Aktualny stan: [tabela statusu](06-status-realizacji.md) i [reaudyt](08-reaudyt-master-2026-10-20.md). Docelowe zachowanie: [architektura i kontrakty](02-architektura-i-kontrakty.md); wymagane dowody: [kwalifikacja](04-kwalifikacja-i-scenariusze.md).
+
+## Rebaseline — co wykonywać dalej
+
+Identyfikatory P0–P8 i B oraz ich kryteria odbioru pozostają stabilne. Tabele pakietów poniżej określają wymagania całego etapu, a nie listę funkcji nieobecnych w kodzie. Przed kolejną implementacją należy wykorzystać istniejące elementy wskazane w statusie, a następnie zamknąć konkretną lukę wraz z dowodem.
+
+| Kolejność / zakres | Obecna podstawa źródłowa | Następny przyrost | Odbiór |
+|---|---|---|---|
+| 1 — P0-A / P3a | 371 operacji OpenAPI ma mapowanie handlerów; istnieje scope middleware i resource layer. | Przejrzeć owner/scope bieżących operacji, zaktualizować dowody i rozliczyć różnicę wobec historycznych 304. | Aktualna macierz bez niejawnego ownera; testy kontraktowe i HTTP według zakresu. Sam mapper nie zalicza bramki. |
+| 2 — M1 / P1 / P2 | `fullmag-application`, use cases projektu, trwały zapis i shell istnieją. | Domknąć edytowalny niekompletny projekt New/Edit/Save/Close/Open bez zależności od RuntimeSession i bez solve. Obecne UI tworzy sesję, a projekt bez niej ma ograniczony tryb wyników. | Wykonany M1 i właściwe CAE-01–04/roundtrip; osobno dowód braku solve i braku tworzenia runtime. |
+| 3 — P3 / P5 | RunSpec, trwały Submit, coordinator i adaptery accepted state FEM są obecne. | Zakwalifikować przypięty run, cancel/recovery/steering i izolację edycji per lane; zamknąć zależne ścieżki legacy. | Process E2E z identyfikacją źródeł i accepted state; wymagane bramki każdego lane’u. |
+| 4 — P4 | Preparation receipts oraz native FEM supervisor istnieją. | Domknąć pełny pipeline native, walidację jakości i zachowanie ostatniego poprawnego wyniku. | Runtime preparation oraz browser/Live z przypiętym mesh/space evidence. |
+| 5 — P6 | Publiczny odczyt materialized datasets/slices i saved-results UI istnieją. | Domknąć brakujące derived analysis, projectors, wykresy i trwałe powiązania archiwalne. | Reopen bez solvera, binary field path, zgodność selection/provenance i limity pamięci. |
+| 6 — P7 | Trwałe independent batches i API przypadków są częściowo zaimplementowane. | Najpierw odebrać Independent; następnie Continuation/DependencyGraph, wiele projektów, targety i raporty. | Przypadki deterministyczne, cancel/recovery, zależności i izolacja zasobów. |
+| Równolegle — B / P8 | Ekstrakcje modułów i dwie usługi Docker DEV są podstawą dalszej pracy. | Zakończyć granice ownership/ABI i kwalifikację per lane; osobno migrację, cutover i produkt Windows. | Dowody naukowe i wydaniowe; uruchomienie DEV nie zastępuje odbioru produktu. |
+
+Minimalne zabezpieczenia P0 są obecne w źródłach; nie należy odtwarzać ich od początku. Nadal trzeba rozliczyć pełną macierz durability, recovery i baseline z P0. Szczegółowa kolejność zamykania: [07](07-domkniecie-etapow.md). Aktualizacja dokumentacji nie wykonuje powyższych bramek.
 
 ## 1. Wynik i granice wykonania
 
@@ -46,7 +62,7 @@ Spójne zweryfikowane przyrosty commitować na branchu zadania według reguł pr
 
 Użytkownik autoryzował implementację i testowanie oraz pracę na `masterze`. Bieżące `AGENTS.md` ponownie wprowadza tymczasowy zakaz kompilowania testów jednostkowych i zadań służących ich kompilacji; obowiązuje do odwołania przez użytkownika. Lekkie kontrole skryptów, kompilacja źródeł produkcyjnych i odrębne bramki przeglądarkowe/runtime zachowują swoje zarządzane trasy. Źródła regresji bez wykonania pozostają `NOT RUN`. Każdy etap rozdziela dowody źródłowe, managed, browserowe, runtime i naukowe; brakujący wymagany dowód pozostaje `NOT VERIFIED`.
 
-Pełne buildy na hoście z Fullmag_build_runner idą przez istniejącą kolejkę, z jawnym źródłem i profilem. Build runner nie jest nowym schedulerem naukowych RunId. Nowy execution coordinator współpracuje z istniejącym zarządzaniem zasobami; nie zastępuje kolejki buildów. Brak zdrowej trasy lub profilu oznacza blokadę, nie ręczny ciężki fallback. Recepty i ich zależności sprawdzać przed uruchomieniem, również pod kątem zakazu testów.
+Codzienny DEV korzysta z grupy Compose wybranego checkoutu: `fullmag-master` albo `fullmag-worktree-<worktree_id>`. Recepty `just docker-dev-toolchain` oraz `just docker-dev "<source-root>" <port>` muszą wskazywać ten sam checkout i projekt. Backend buduje aplikację i uruchamia runtime w tej samej stałej usłudze `backend`; `frontend` zapewnia HMR. Dane techniczne buildu pozostają w named volumes / BuildKit, dane użytkownika w skonfigurowanym storage hosta. Natywny launcher Windows i dawny runner nie są fallbackiem codziennego DEV. Jawne bramki CI, release i naukowe zachowują własne zarządzane recepty. Obowiązują aktualne `AGENTS.md`, ADR-0061 i ADR-0064 oraz reguły ownera aktywnych zasobów. Build coordinator nie jest schedulerem naukowych RunId. Brak zgodnej recepty wymaga naprawy tej ścieżki; nie uprawnia do obejścia jej na hoście.
 
 ## 4. P0 — baza, ryzyka i kontrakty blokujące
 
@@ -71,7 +87,7 @@ Zależności: P0-B/C/D. Właściciele: application + persistence + shell.
 
 | Pakiet | Pliki/punkty wejścia | Zmiana | Odbiór |
 |---|---|---|---|
-| P1-A | Nowy `crates/fullmag-application`; `fullmag-authoring/src/scene.rs`, `adapters.rs`; `fullmag-session` | Create/Open/Save/Save As/Close, ProjectDefinition, ProjectRepository i single-writer transactions. scene.v2 jako adapter wejściowy. | Create/Save/Reopen bez RuntimeSession i bez wywołania meshera/solvera. |
+| P1-A | Istniejący `crates/fullmag-application`; `fullmag-authoring/src/scene.rs`, `adapters.rs`; `fullmag-session` | Domknąć integrację Create/Open/Save/Save As/Close, ProjectDefinition, ProjectRepository i single-writer transactions. scene.v2 jako adapter wejściowy. | Create/Save/Reopen bez RuntimeSession i bez wywołania meshera/solvera. |
 | P1-B | `fullmag-session/src/types.rs`, `fms.rs`; persistence handlers | Versioned project root, adapter legacy, raport migracji, preserved unknown fields/assets; oryginał immutable. Rozdzielić Open projektu od jawnego Restore runtime. | CAE-02/03/04/50/51/57/58/60; obrót i skala nie znikają; nieznany schema nie trafia do starego writera. |
 | P1-C | `WorkspaceShellClient.tsx`, `EmptyWorkspace.tsx`, `SimulationStartupOverlay.tsx`, KernelProvider, persistence facade | Stała powłoka z New/Open/Save, lokalnymi błędami i statusem zapisu. Zachować ograniczenie niebezpiecznych mutacji starego runtime. | CAE-01/02/41; brak globalnego unmount od preparation/disconnect. Nie zmieniać ADR-0016 dla nieaktywnego 3D. |
 | P1-D | `apps/desktop`, CLI file-open, Python binding entry points | Ten sam use case Open i jawna polityka zamknięcia przy aktywnym wykonaniu. | Desktop/browser/CLI odczytują tę samą kopię; Open bez kodu i solve; drugi writer read-only/odmowa. |
@@ -141,11 +157,14 @@ requested execution i display projection z aktualnego, fenced kontekstu Live.
 Control Room udostępnia tę operację jako session-scoped `study.prepare-live`,
 wiąże ją z zasobem Preparation i invaliduje go identyfikatorem durable receipt.
 Endpoint publiczny i historyczny adapter wewnętrzny delegują do tego samego
-use case'u; żadna z tych ścieżek nie tworzy `ProjectRun`. Zarządzana bramka
-`just verify-api-preparation` wykonała **5 testów**, w tym żądanie przez router
+use case'u; żadna z tych ścieżek nie tworzy `ProjectRun`.
+
+**Historyczny dowód P4**, zachowany w [checkpointach](p4/README.md):
+zarządzana bramka `just verify-api-preparation` wykonała **5 testów**, w tym żądanie przez router
 HTTP z publikacją receipt; `source_changed_during_run=false`. OpenAPI oraz
 generowane typy i klient Control Room zostały odświeżone, a typecheck i
-ukierunkowane testy UI przeszły. Browser, pełny Live runtime, automatyczny
+ukierunkowane testy UI przeszły. Nie wykonano ponownie tych prób na bazie
+reaudytu 20.10. Pełny Live runtime, automatyczny
 producer pipeline, FEM mesh/space i kwalifikacja fizyczna pozostają
 `NOT VERIFIED`.
 
@@ -220,13 +239,15 @@ Rollback P7 ogranicza admission nowych kampanii/targetów; nie porzuca działaj�
 
 Wydanie może promować wyłącznie zakres wskazany w macierzy kwalifikacji. Jeżeli refaktor zmienia wszystkie cztery lane’y, każda potrzebuje dowodu; sukces CPU lub frontend smoke nie zastępuje GPU/FEM. Zamknięcie planu nie następuje przez przemianowanie brakującego lane’u na „poza zakresem”.
 
-Doprecyzowanie operatora 02.10.2026: niezależność Windows obejmuje także
+Wymaganie operatora z 02.10.2026, nadal obowiązujące dla produktu: niezależność Windows obejmuje także
 magazyn sesji, checkpointy i odtwarzanie. Kontenery użyte przez zespół do
 buildów i testów Linux nie są zależnością instalacji Windows ani dowodem
-kwalifikacji Windows. Obecny `scripts/windows/run_fullmag.ps1` wspiera FDM;
-`run_fullmag_fem.ps1` nadal korzysta z Linux/Docker. Pełne natywne FEM oraz
-trwały zapis Windows pozostają NOT VERIFIED i wymagają implementacji oraz
-własnych bramek. Propozycja wolumenu Docker w P1/11 nie realizuje tego celu.
+kwalifikacji Windows. Historyczny opis launcherów Windows z 02.10 nie jest
+dzisiejszą instrukcją DEV. Obowiązująca ścieżka Docker Compose jest opisana
+w §3; nie zamyka niezależnego produktu Windows z P8-C. Pełne natywne FEM
+oraz trwały zapis produktu Windows pozostają w tym reaudycie NOT VERIFIED
+i wymagają własnych bramek. Propozycja wolumenu Docker w P1/11 nie realizuje
+tego celu.
 
 ## 14. Rejestr decyzji empirycznych i reguły awarii
 

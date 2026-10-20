@@ -145,6 +145,9 @@ właściwego wolumenu. Nie tworzono osobnego kontenera do odczytu ani buildu.
 
 ## Pozostały odbiór
 
+Poniższa lista opisuje stan po pierwszej, przerwanej sesji. Wyniki wznowienia
+odbioru na bieżącym `masterze` znajdują się na końcu dokumentu.
+
 Po zakończeniu równoległej operacji i przywróceniu grupy wybranego checkoutu:
 
 1. Potwierdzić ID usług, mounty i port; ponownie uruchomić końcowy typecheck,
@@ -169,3 +172,166 @@ częściowego typecheck za ukończenie odbioru.
 | `DraggablePanel.tsx` | `469403e0bee50a6e5d16e5f450e3f84733e7baaafbcc499da1a9b5703a3c5f44` |
 | `dialog-simulation-startup.css` | `d5944303854bf6f8db4b82a0f800d0a6b436e71f5fa61671be082697b056d65e` |
 | `simulation-preparation-log.css` | `d6d9195dd75d925f51fdcc1864f46624ba78fe91bb0821d9de84f1b10cddfebe` |
+
+## Wznowienie odbioru na masterze — 20.10.2026
+
+Baza: `42d92610312871d591db16a5b60a8f7a6d6339b5`, checkout
+`C:\git\fullmag\fullmag`, branch `master`. Wcześniejsza refaktoryzacja jest
+już w tej bazie. Zachowano niezwiązane zmiany
+`scripts/docker_volume_dev.py` i
+`scripts/docker_volume_capture_failure_reconcile.py`; nie wykonywano stagingu,
+commita ani operacji integracji.
+
+Kontener frontendu:
+`da708d4161677eb7e3b11a0bbf9a9e07e90a84b2753d34d4840a789a206a550f`,
+grupa `fullmag-master`, port `3198`, źródła readonly z tego checkoutu.
+Kontener backendu był zatrzymany (`Exited (2)`). Sprawdzenia UI przeprowadzono
+na `/dev/simulation-preparation`: produkcyjne komponenty, kontrolowane dane,
+bez wywołania solvera. Nie jest to dowód działania żywej sesji ani backendu.
+
+### Dodatkowe znalezione usterki i poprawki
+
+1. **Ref przy przycisku przywracania:** pełny typecheck wykazał TS2322,
+   ponieważ wspólny `ButtonProps` nie zawiera `ref`. Zamiast rozszerzać API
+   wszystkich przycisków, okno wyszukuje swój przycisk przez
+   `hostRef` i `data-preparation-restore`. Browser potwierdził fokus po
+   minimalizacji, zamknięciu i Escape oraz powrót fokusu do uchwytu okna.
+2. **Pozycja po maksymalizacji:** browser wykazał zmianę zapisanej pozycji
+   na `(8, 8)` po przywróceniu, mimo zachowania rozmiaru. Dodano oddzielny
+   zapis pozycji sprzed maksymalizacji oraz zabezpieczenie ograniczania
+   pozycji przed wymiarami zmaksymalizowanego panelu. Pomiary granic są
+   przechwytywane przed aktualizatorem stanu; obsługa geometrii korzysta
+   z efektu layoutu. Końcowe sprawdzenie na świeżo uruchomionym frontendzie
+   ujawniło dodatkowo wariant bez ręcznej zmiany rozmiaru. Globalna reguła
+   `prefers-reduced-motion` nadawała wszystkim elementom przejście 1 ms,
+   przez co pomiar widział jeszcze zmaksymalizowane wymiary. Panel otrzymał
+   `transitionProperty: "none"`: geometria zmienia się synchronicznie.
+   Scenariusz regresji obejmuje teraz osobno rozmiar CSS i rozmiar ręczny.
+3. **Za mały log w wąskim układzie:** przy szerokości 390 px kontrolki
+   pozostawiały około 36 px treści logu. Minimalna wysokość sekcji logu
+   wzrosła do 360 px, a stosu etapów i logu do 540 px. Browser potwierdził
+   156 px przewijanego logu. Całe szczegóły można przewijać wewnątrz okna.
+
+Scenariusz `scripts/smoke-preparation-window.mjs` uzupełniono o:
+kontrolę fokusu, rzeczywistą treść schowka i zgodność TXT z kopią,
+minimalną czytelną wysokość logu, niski viewport oraz zrzut przy błędzie.
+Nie kompilowano ani nie uruchamiano testów jednostkowych.
+
+### Wyniki sprawdzeń przy wznowieniu
+
+| Kontrola | Wynik i zakres |
+| --- | --- |
+| Pełny `pnpm typecheck` po poprawce przycisku | PASS, exit 0 |
+| `pnpm lint` dla całego Control Room | FAIL środowiskowy: sterta Node około 2 GiB, `JavaScript heap out of memory`, exit 134 wewnętrznego procesu |
+| ESLint sześciu plików okna i podglądu | PASS, exit 0 |
+| Końcowy pełny typecheck, składnia smoke i ESLint DraggablePanel/smoke | PASS, exit 0 po poprawce przejścia geometrii i rozszerzeniu regresji |
+| React Doctor, zakres plików zmienionych względem HEAD | 0 błędów; 6 ostrzeżeń `only-export-components` w istniejących eksportach `SimulationStartupOverlay.tsx`; bez zmiany publicznych eksportów |
+| Przenoszenie klawiaturą i myszą | PASS: `(96,144)` → `(106,144)` → `(166,174)` |
+| Zmiana rozmiaru klawiaturą i myszą | PASS: `960×680` → `950×680` → `890×640` |
+| Przywrócenie pozycji po końcowej poprawce | PASS: rozmiar CSS `(96,32), 960×680` i ręczny `(106,32), 950×680` pozostają identyczne przed i po maximize/restore; brak błędów konsoli |
+| Filtr tekstowy i poziom błędów | PASS: `Entry 14:` daje jeden wpis; Errors daje 5 wpisów, bez innych poziomów |
+| Kopia do schowka | PASS: odczytano pełny wpis 14 z metadanymi i zachowaną drugą linią, bez sąsiednich wpisów |
+| Pusty wynik filtra | PASS: zero wpisów, kopiowanie wyłączone |
+| Eksport TXT | PASS: pomimo timeoutu narzędzia download plik rzeczywiście trafił do Downloads; odczyt UTF-8 i porównanie z zaobserwowaną treścią schowka dały dokładną zgodność |
+| Czytanie starszych wpisów i dopisanie nowego | PASS: `scrollTop=1586` przed i po dopisaniu 61. wpisu, także przez ukrycie/przywrócenie |
+| Powrót do końca logu | PASS: odstęp od końca 0 px |
+| Minimize/close/Escape oraz fokus | PASS; aktualizacja failed/stale nie otwiera ukrytego okna |
+| Nowe preparation ID i formularz w tle | PASS: okno otwiera się, tekst roboczy pozostaje niezmieniony |
+| Zakończenie (`ready`) | PASS: panel i przycisk przywracania znikają; nowe przygotowanie otwiera panel ponownie |
+| Viewport 390×844 i 1280×500 | PASS dla granic okna i dostępności zamknięcia; 156 px treści logu w poprawionym układzie wąskim |
+| Pełny skrypt smoke i żywa sesja backendu | NOT VERIFIED; powyższe dowody pochodzą z interakcji CUA z produkcyjnym komponentem w podglądzie |
+
+Pierwszy React Doctor w cieniu źródeł nie wykrył kontekstu Git i rozpoczął
+pełny skan; zatrzymano wyłącznie własny proces. Wąski skan wykonano z
+readonly źródeł `/opt/fullmag/source/apps/control-room`, używając
+zainstalowanego narzędzia w wolumenie frontendu, `--scope files --base HEAD`,
+bez telemetrii, bez supply-chain i bez instalacji zależności.
+
+### Pamięć i artefakty
+
+`compose.dev.yaml:246` ustawia frontendowi `mem_limit: 6g`; `cpus: 2`
+jest w linii 245. Docker inspect potwierdził 6 442 450 944 bajtów
+i 2 000 000 000 NanoCPUs. Pomiar cgroup wyniósł 6 263 447 552 bajtów,
+a RSS procesu Next 5 431 536 KiB. To mały zapas dla równoległych kontroli.
+Nie zmieniano limitów. OOM procesu lint i limit całego kontenera to
+odrębne ograniczenia; podniesienie jednego nie dowodzi usunięcia drugiego.
+
+Logi kontroli: `/state/development/preparation-ui-verification/`
+w istniejącym wolumenie frontendu. Zachowano logi i cache; nie usuwano
+kontenerów, wolumenów ani danych użytkownika. Zrzuty odbiorowe są w katalogu
+wizualizacji bieżącego zadania. Pozostają materiałem UI, nie receiptami
+runtime ani kwalifikacją fizyki.
+
+Pobrany plik `C:\Users\Mateusz\Downloads\simulation-preparation-log.txt`
+ma 182 bajty i SHA-256
+`856c3b1cb918e335873d589f85f84b7ddd102fc687b7dbd70b0cb8368f86e337`.
+Nie zawiera wpisów sąsiednich ani obcięcia diagnostyki.
+Zrzut wąskiego układu:
+`C:\Users\Mateusz\.codex\visualizations\2026\10\20\01a1598d-f866-7f41-b21a-f79aa0e7eb0f\preparation-narrow.png`.
+
+Podczas ostatniego powtórzenia kontroli grupa `fullmag-master` ponownie
+zniknęła (`No such container`; pusty odczyt kontenerów z etykietą projektu).
+Odczyt statusu czatu „Przywróć wizualizacje FEM i FDM” potwierdził trwające
+zarządzane odtworzenie usług i obrazu po recovery. Nie uruchomiono
+konkurencyjnej operacji. Po odtworzeniu frontend
+`084b594d7f1cf36aadb95b627cdac257b349673ac26725d65a5ba57a885358dc`
+udostępnił ten sam checkout na porcie 3198. Końcowy typecheck, lint poprawionych
+plików, składnia smoke, stan ready i oba warianty maximize/restore zakończyły
+się sukcesem. Pełny samodzielny smoke, żywa sesja backendu, jasny motyw oraz
+browser regression Data Preview pozostają NOT VERIFIED. Konsument Data Preview
+został przejrzany źródłowo; nie włącza opcji resize/maximize.
+Niezależne review poprzedzające końcową poprawkę przejścia nie wykazało regresji;
+końcową poprawkę sprawdzono źródłowo, typecheckiem, lintem i w przeglądarce.
+
+Końcowy zrzut desktopowy:
+`C:\Users\Mateusz\.codex\visualizations\2026\10\20\01a1598d-f866-7f41-b21a-f79aa0e7eb0f\preparation-desktop.png`.
+
+### SHA-256 źródeł po dodatkowych poprawkach
+
+| Plik | SHA-256 |
+| --- | --- |
+| `SimulationStartupOverlay.tsx` | `9d05abaf152dc14a8b3f35ac2a03cdc6c995eb3891b8daf5a4776d73143f157d` |
+| `DraggablePanel.tsx` | `6a7a3c179fc8b231419f5441c9735799b10452a91044f802a8d767688fabe326` |
+| `dialog-simulation-startup.css` | `622efa7b8caa74fe09826196b08bc930bcf5a94232d9e6280d614089185a0e5a` |
+| `smoke-preparation-window.mjs` | `3ca64cfe93932ec86ee82c4b643ef4c7a32a54730cc262de91c257227f594597` |
+
+## Korekta limitów frontendu — wdrożenie zweryfikowane
+
+Na polecenie użytkownika ustawiono w źródłach `mastera` limit frontendu
+16 GiB RAM, 4 CPU oraz `--max-old-space-size=6144` dla narzędzi Node i
+sanityzowanego środowiska launchera Next. Receipt frontendu zapisuje
+`node_max_old_space_size_mib: 6144`. Zmiana nie obejmuje limitów backendu.
+
+Odczyt Compose potwierdził nowe wartości; parser Python i kontrola diff
+zakończyły się poprawnie, review statyczny nie wykazał regresji.
+Testy helpera nie zostały uruchomione: automatyczna kontrola uprawnień
+odrzuciła je jako objęte tymczasowym zakazem testów jednostkowych.
+
+Odczyt przed wdrożeniem wykazał nadal `memory.max=6442450944` i
+`cpu.max=200000 100000`. Proces `next-server` miał
+`NODE_OPTIONS=--max-old-space-size=100642 --enable-source-maps --inspect=127.0.0.1:0`.
+Zainstalowany `next/dist/cli/next-dev.js:274` sprawdza jawny limit i przy
+jego braku przyjmuje połowę `os.totalmem()`. To wyjaśnia niezgodność sterty
+około 98 GiB z limitem kontenera 6 GiB. Jawne 6144 MiB zapobiega temu
+automatycznemu doborowi; sam zapis źródeł nie zmienia działającego procesu.
+
+Po uzgodnionym zarządzanym odtworzeniu grupy wdrożenie limitów ma **PASS**:
+nowy działający frontend
+`a977d68e3b74c60df5dcc5cadd0f4e7791a6bb1eed65bf1672d7c6ab07abc69e`
+używa obrazu
+`sha256:dffb31c9ea100873e08271843cc5ecc00cb101feb59a0fcb7a01483f2e7ac495`.
+Docker inspect: `Memory=17179869184`, `NanoCpus=4000000000`.
+Cgroup: `memory.max=17179869184`, `cpu.max=400000 100000`.
+Proces Next PID 27 ma `--max-old-space-size=6144`, a rzeczywisty
+`next-server` PID 43:
+`--max-old-space-size=6144 --enable-source-maps --inspect=127.0.0.1:0`.
+6144 MiB jest limitem old space; nie oznacza równego mu całkowitego RSS.
+Dowód limitów nie zastępuje gotowości API ani weryfikacji recovery,
+opisanej w `2026-10-20-preparation-recovery.md`. Nie utworzono
+automatyzacji okresowego wznowienia — jej próbę odrzuciła kontrola uprawnień.
+
+Po kolejnej rekreacji wynik limitów ponownie **PASS**: frontend
+`e1a04f452f84c610135ea6b43c1bf641af118eaa48dfcd2fd902c4ad588d2fff`,
+obraz `sha256:e30f3cf928e9b970f4963b41b51faad1a6fe2776832c5bebc102f6fd18dd08f3`.
+W inspect, cgroup i środowisku działających procesów Next PID 27/43
+potwierdzono te same wartości 16 GiB / 4 CPU / 6144 MiB old space.

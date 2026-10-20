@@ -334,7 +334,7 @@ class FrontendDevContractTests(TestCase):
         self.assertFalse(self.module.enabled({}))
         self.assertEqual(self.module.EXPECTED_PNPM_VERSION, "10.8.1")
 
-    def test_dev_next_command_uses_local_ephemeral_inspector_without_node_options(self):
+    def test_dev_next_command_uses_local_ephemeral_inspector_with_pinned_heap(self):
         command = self.module._next_command()
         self.assertIn(self.module.INSPECTOR_FLAG, command)
         self.assertEqual(self.module.INSPECTOR_FLAG, "--inspect=127.0.0.1:0")
@@ -357,7 +357,11 @@ class FrontendDevContractTests(TestCase):
             )
             self.assertNotIn("/opt/fullmag/package", environment["PYTHONPATH"].split(os.pathsep))
             self.assertEqual(environment["FULLMAG_REPO_ROOT"], str(_workspace))
-            self.assertNotIn("NODE_OPTIONS", environment)
+            self.assertEqual(environment["NODE_OPTIONS"], "--max-old-space-size=6144")
+            self.assertEqual(
+                self.module._receipt_base(inputs, None)["node_max_old_space_size_mib"],
+                6144,
+            )
             inspector = self.module._receipt_base(inputs, None)["inspector"]
             self.assertEqual(inspector["profile"], "next-dev")
             self.assertEqual(inspector["bind_host"], "127.0.0.1")
@@ -828,7 +832,7 @@ else:
             ):
                 environment = self.module._safe_environment(inputs)
             self.assertEqual(environment["UV_THREADPOOL_SIZE"], "8")
-            self.assertNotIn("NODE_OPTIONS", environment)
+            self.assertEqual(environment["NODE_OPTIONS"], "--max-old-space-size=6144")
 
     def test_watchpack_polling_rejects_values_outside_bounded_integer_contract(self):
         with isolated(self.module) as (_root, _workspace, inputs):

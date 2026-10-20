@@ -217,6 +217,45 @@
       "validation_state": "unvalidated"
     },
     {
+      "id": "mesh.topology.mixed_p1.v2.disconnected_bodies",
+      "label": "Typed mixed-P1 v2 disconnected-body topology",
+      "lanes": {
+        "fdm_cpu_reference": "unsupported",
+        "fdm_gpu_production": "unsupported",
+        "fem_cpu_public": "implemented",
+        "fem_gpu_public": "implemented"
+      },
+      "validated_workloads": [],
+      "notes": "The Python v2 producer, typed IR certificate, planner/native preflight, per-body markers, and exact-sweep/gap evidence exist as a source contract. Managed runtime and physics evidence are not verified; this row is not a public executable or validated capability.",
+      "validation_state": "unvalidated"
+    },
+    {
+      "id": "fem.cpu.exchange_demag.mixed_p1.disconnected_bodies",
+      "label": "FEM CPU mixed-P1 v2 disconnected-body exchange and demagnetization",
+      "lanes": {
+        "fdm_cpu_reference": "unsupported",
+        "fdm_gpu_production": "unsupported",
+        "fem_cpu_public": "implemented",
+        "fem_gpu_public": "unsupported"
+      },
+      "validated_workloads": [],
+      "notes": "Body-local exchange and shared-domain Poisson demagnetization lowering with body-owned nodal-P1 fields exists as a source contract. Managed CPU runtime, operator execution, parity, and physics evidence are not verified; no public executable or validated capability is claimed.",
+      "validation_state": "unvalidated"
+    },
+    {
+      "id": "fem.gpu.exchange_demag.mixed_p1.disconnected_bodies",
+      "label": "FEM GPU mixed-P1 v2 disconnected-body exchange and demagnetization",
+      "lanes": {
+        "fdm_cpu_reference": "unsupported",
+        "fdm_gpu_production": "unsupported",
+        "fem_cpu_public": "unsupported",
+        "fem_gpu_public": "implemented"
+      },
+      "validated_workloads": [],
+      "notes": "Typed GPU/native ingress preserves the CPU marker, quadrature, weak-form, and provenance contract for positive-gap body-local exchange and shared-domain demagnetization. Managed GPU runtime, device residency, parity, and physics evidence are not verified; forced GPU has no CPU fallback and no public executable or validated capability is claimed.",
+      "validation_state": "unvalidated"
+    },
+    {
       "id": "fdm_periodic_demag_boundary_semantics",
       "label": "FDM periodic demagnetization boundary semantics",
       "lanes": {

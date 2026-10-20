@@ -206,6 +206,7 @@ NODE_FS_THREADS_ENV = "UV_THREADPOOL_SIZE"
 # large libuv pool turns metadata latency into host kernel contention instead
 # of improving cold compilation.
 NODE_FS_THREADS = 8
+NODE_MAX_OLD_SPACE_SIZE_MIB = 6144
 PROCESS_IDENTITY_FIELDS = (
     "pid_namespace",
     "process_start_time_ticks",
@@ -1311,6 +1312,9 @@ def _safe_environment(
         "HOME": str(HOME_ROOT),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "NODE_ENV": "development",
+        # Pin the budget instead of inheriting arbitrary Node flags from the
+        # operator environment (which could preload code or expose debugging).
+        "NODE_OPTIONS": f"--max-old-space-size={NODE_MAX_OLD_SPACE_SIZE_MIB}",
         "FULLMAG_DOCKER_FRONTEND": "dev",
         "FULLMAG_FRONTEND_ROOT": str(FRONTEND_ROOT),
         "FULLMAG_NEXT_DIST_DIR": NEXT_DIST_DIR,
@@ -1382,6 +1386,7 @@ def _receipt_base(
         "tool_probe_timeout_seconds": TOOL_TIMEOUT_SECONDS,
         "watchpack_polling_ms": polling_ms,
         "uv_threadpool_size": NODE_FS_THREADS,
+        "node_max_old_space_size_mib": NODE_MAX_OLD_SPACE_SIZE_MIB,
         "inspector": {
             "schema": INSPECTOR_SCHEMA,
             "profile": INSPECTOR_PROFILE,

@@ -1982,6 +1982,7 @@ def reconcile_unknown_activation(
         "helper_id": helper_id,
         "helper_state": "running",
         "helper_image": control.image,
+        "helper_sha256": receipt["helper_sha256"],
         "backend_container": backend_id,
         "image_id": image_id,
         "development_attempt": development_attempt,

@@ -174,7 +174,19 @@ fn projected_mesh_capabilities(
         swept_prism: feature("mesh.swept.prism"),
         pyramid_tet: feature("mesh.transition.pyramid_tet"),
         exact_layer_count: feature("mesh.exact_layer_count"),
-        additional: projected.into_iter().collect(),
+        additional: {
+            if let Some(v2_disconnected_bodies) =
+                feature("mesh.topology.mixed_p1.v2.disconnected_bodies")
+            {
+                if let Ok(value) = serde_json::to_value(v2_disconnected_bodies) {
+                    projected.insert(
+                        "mesh.topology.mixed_p1.v2.disconnected_bodies".to_string(),
+                        value,
+                    );
+                }
+            }
+            projected.into_iter().collect()
+        },
     };
     (matrix.mixed_p1.is_some()
         || matrix.swept_prism.is_some()
@@ -454,13 +466,18 @@ fn typed_shared_domain_build_report_from_ir(
 ) -> Option<MeshSharedDomainBuildReportResource> {
     let mut resource = MeshSharedDomainBuildReportResource::from_ir(report)?;
     if let Some(provenance) = resource.mixed_topology_provenance.as_mut() {
+        let capability_id = if report.mixed_layer_topology_certificate_v2.is_some() {
+            "mesh.topology.mixed_p1.v2.disconnected_bodies"
+        } else {
+            "mesh.topology.mixed_p1"
+        };
         provenance.capability_reason = snapshot
             .capabilities
             .as_ref()
             .and_then(|capabilities| {
                 capabilities
                     .feature_capabilities
-                    .get("mesh.topology.mixed_p1")
+                    .get(capability_id)
             })
             .map(|capability| capability.reason.clone());
     }
