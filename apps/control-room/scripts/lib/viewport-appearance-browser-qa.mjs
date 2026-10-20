@@ -1,6 +1,5 @@
 const APPEARANCE_STORAGE_KEY =
   "fullmag.control-room.viewport-3d.appearance-preferences";
-const PIXEL_SNAPSHOT_GLOBAL = "__fullmagViewportAppearanceQaV1";
 
 const BACKGROUND_OPTIONS = {
   gradient: "Subtle gradient",
@@ -20,8 +19,12 @@ export async function runViewportAppearanceBrowserQa(page, {
   assertCanvas,
   getSessionIdentity,
   expectedSession,
+  pngDecoder,
   timeout,
 }) {
+  if (typeof pngDecoder?.sync?.read !== "function") {
+    throw new Error("Pinned Playwright utilsBundle does not expose PNG.sync.read");
+  }
   const originalViewport = page.viewportSize();
   if (!originalViewport) throw new Error("Appearance QA requires a fixed browser viewport");
 
@@ -34,6 +37,7 @@ export async function runViewportAppearanceBrowserQa(page, {
   let operationError = null;
   let restorationError = null;
   let preferenceStorageRestored = false;
+  const pixelSnapshots = new Map();
 
   try {
     await viewport.waitFor({ state: "visible", timeout });
@@ -47,12 +51,12 @@ export async function runViewportAppearanceBrowserQa(page, {
     await choose(page, "Background", BACKGROUND_OPTIONS.gradient, "fm-view-background", timeout);
     await setRangeValue(page, "#fm-view-background-strength", 1);
     await waitForRenderedFrame(page);
-    const gradient = await readCanvasPixels(page, "gradient", timeout);
+    const gradient = await readCanvasPixels(page, dialog, "gradient", pixelSnapshots, pngDecoder, assertCanvas, timeout);
 
     await choose(page, "Background", BACKGROUND_OPTIONS.solid, "fm-view-background", timeout);
     await waitForRenderedFrame(page);
-    const solid = await readCanvasPixels(page, "solid", timeout);
-    const backgroundDifference = await comparePixelSnapshots(page, "gradient", "solid");
+    const solid = await readCanvasPixels(page, dialog, "solid", pixelSnapshots, pngDecoder, assertCanvas, timeout);
+    const backgroundDifference = comparePixelSnapshots(pixelSnapshots, "gradient", "solid");
     const upperDifference = colorDistance(gradient.upper_mean, solid.upper_mean);
     const lowerDifference = colorDistance(gradient.lower_mean, solid.lower_mean);
     if (Math.max(upperDifference, lowerDifference) < 4 || backgroundDifference.changed_pixels < 8) {
@@ -61,13 +65,13 @@ export async function runViewportAppearanceBrowserQa(page, {
 
     await choose(page, "Background", BACKGROUND_OPTIONS.gradient, "fm-view-background", timeout);
     await waitForRenderedFrame(page);
-    const gradientRestored = await readCanvasPixels(page, "gradient-restored", timeout);
+    const gradientRestored = await readCanvasPixels(page, dialog, "gradient-restored", pixelSnapshots, pngDecoder, assertCanvas, timeout);
     const restoredUpperDifference = colorDistance(gradient.upper_mean, gradientRestored.upper_mean);
     const restoredLowerDifference = colorDistance(gradient.lower_mean, gradientRestored.lower_mean);
     if (restoredUpperDifference > 3 || restoredLowerDifference > 3) {
       throw new Error("Restoring the gradient did not restore the upper and lower canvas probes");
     }
-    clearPixelSnapshots(page, ["gradient", "solid", "gradient-restored"]);
+    clearPixelSnapshots(pixelSnapshots, ["gradient", "solid", "gradient-restored"]);
 
     if (originalControls.frameMode === "off") {
       await choose(page, "Reference frame", FRAME_OPTIONS.floor, "fm-view-frame", timeout);
@@ -78,16 +82,16 @@ export async function runViewportAppearanceBrowserQa(page, {
       throw new Error("Frame-center coordinate mode did not publish its selected HUD setting text");
     }
     await waitForRenderedFrame(page);
-    const frameCenterPixels = await readCanvasPixels(page, "frame-center", timeout);
+    const frameCenterPixels = await readCanvasPixels(page, dialog, "frame-center", pixelSnapshots, pngDecoder, assertCanvas, timeout);
     await choose(page, "Scale coordinates", ORIGIN_OPTIONS.world, "fm-view-origin", timeout);
     await waitForRenderedFrame(page);
-    const worldPixels = await readCanvasPixels(page, "world", timeout);
-    const originRenderDifference = await comparePixelSnapshots(page, "frame-center", "world");
+    const worldPixels = await readCanvasPixels(page, dialog, "world", pixelSnapshots, pngDecoder, assertCanvas, timeout);
+    const originRenderDifference = comparePixelSnapshots(pixelSnapshots, "frame-center", "world");
     const worldOriginText = await readChoice(page, "Scale coordinates");
     if (worldOriginText !== ORIGIN_OPTIONS.world) {
       throw new Error("World coordinate mode did not publish its selected HUD setting text");
     }
-    clearPixelSnapshots(page, ["frame-center", "world"]);
+    clearPixelSnapshots(pixelSnapshots, ["frame-center", "world"]);
 
     await setSwitch(page, "Ambient occlusion", true, timeout);
     await setSwitch(page, "Bloom (Glow)", true, timeout);
@@ -135,6 +139,10 @@ export async function runViewportAppearanceBrowserQa(page, {
         opened_from_view_settings: true,
         title: "3D View Settings",
       },
+      pixel_capture: {
+        method: "Playwright canvas screenshot decoded by pinned utilsBundle PNG.sync.read",
+        screenshot_written_to_disk: false,
+      },
       background: {
         transition: "gradient-solid-gradient",
         upper_probe_delta: upperDifference,
@@ -181,6 +189,7 @@ export async function runViewportAppearanceBrowserQa(page, {
   } catch (error) {
     operationError = error;
   } finally {
+    pixelSnapshots.clear();
     const cleanupErrors = [];
     const cleanup = async (operation) => {
       try {
@@ -198,7 +207,6 @@ export async function runViewportAppearanceBrowserQa(page, {
     await cleanup(async () => {
       preferenceStorageRestored = await restoreAppearanceStorage(page, storageBefore);
     });
-    await cleanup(() => clearAllPixelSnapshots(page));
     if (originalDialogOpen) {
       await cleanup(() => ensureSettingsOpen(page, dialog, true, timeout));
     } else {
@@ -317,31 +325,39 @@ async function waitForRenderedFrame(page) {
   await page.waitForTimeout(40);
 }
 
-async function readCanvasPixels(page, name, timeout) {
-  const canvas = page.locator(".fm-viewport-3d canvas");
-  await canvas.first().waitFor({ state: "visible", timeout });
-  if (await canvas.count() !== 1) throw new Error("Appearance QA requires exactly one viewport canvas");
-  return canvas.first().evaluate(async (element, parameters) => {
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    const gl = element.getContext("webgl2") ?? element.getContext("webgl");
-    if (!gl || gl.isContextLost()) throw new Error("Viewport WebGL context is unavailable or lost");
-    const width = element.width;
-    const height = element.height;
-    if (width <= 0 || height <= 0) throw new Error("Viewport WebGL drawing buffer is empty");
+async function readCanvasPixels(page, dialog, name, snapshots, pngDecoder, assertCanvas, timeout) {
+  if (!await dialog.isVisible().catch(() => false)) {
+    throw new Error("Appearance pixel capture expects the settings dialog to be open");
+  }
 
-    const pixels = new Uint8Array(width * height * 4);
-    const previousFramebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.finish();
-    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, previousFramebuffer);
+  let capture = null;
+  let captureError = null;
+  let reopenError = null;
+  try {
+    await dialog.getByRole("button", { name: "Close", exact: true }).click({ timeout });
+    await dialog.waitFor({ state: "hidden", timeout });
+    await waitForRenderedFrame(page);
+
+    const canvasState = await assertCanvas(`appearance screenshot ${name}`);
+    const canvas = page.locator(".fm-viewport-3d canvas");
+    await canvas.first().waitFor({ state: "visible", timeout });
+    if (await canvas.count() !== 1) {
+      throw new Error("Appearance QA requires exactly one viewport canvas");
+    }
+    const screenshot = await canvas.first().screenshot({ type: "png" });
+    const decoded = pngDecoder.sync.read(screenshot);
+    const { data, width, height } = decoded;
+    if (!(data instanceof Uint8Array) || width <= 0 || height <= 0 || data.length !== width * height * 4) {
+      throw new Error("Playwright canvas screenshot did not decode to non-empty RGBA pixels");
+    }
+    snapshots.set(name, { data, height, width });
 
     const sampleRow = (fromTop) => {
-      const y = Math.max(0, Math.min(height - 1, height - 1 - Math.round(height * fromTop)));
+      const y = Math.max(0, Math.min(height - 1, Math.round(height * fromTop)));
       const samples = [0.08, 0.5, 0.92].map((fraction) => {
         const x = Math.max(0, Math.min(width - 1, Math.round(width * fraction)));
         const offset = (y * width + x) * 4;
-        return [pixels[offset], pixels[offset + 1], pixels[offset + 2]];
+        return [data[offset], data[offset + 1], data[offset + 2]];
       });
       return {
         mean: [0, 1, 2].map((channel) => Math.round(samples.reduce((sum, sample) => sum + sample[channel], 0) / samples.length)),
@@ -349,55 +365,63 @@ async function readCanvasPixels(page, name, timeout) {
       };
     };
     let hash = 2166136261;
-    for (let offset = 0; offset < pixels.length; offset += 16) {
-      hash = Math.imul(hash ^ pixels[offset], 16777619);
+    for (let offset = 0; offset < data.length; offset += 16) {
+      hash = Math.imul(hash ^ data[offset], 16777619);
     }
-    const state = window[parameters.globalKey] ??= { snapshots: {} };
-    state.snapshots[parameters.name] = pixels;
-    return {
+    capture = {
       height,
       hash: (hash >>> 0).toString(16).padStart(8, "0"),
       lower_mean: sampleRow(0.95).mean,
-      preserve_drawing_buffer: gl.getContextAttributes()?.preserveDrawingBuffer ?? null,
+      preserve_drawing_buffer: canvasState.preserve_drawing_buffer ?? null,
       upper_mean: sampleRow(0.05).mean,
       width,
     };
-  }, { globalKey: PIXEL_SNAPSHOT_GLOBAL, name });
+  } catch (error) {
+    captureError = error;
+  } finally {
+    try {
+      await ensureSettingsOpen(page, dialog, true, timeout);
+    } catch (error) {
+      reopenError = error;
+    }
+  }
+  if (captureError && reopenError) {
+    throw new Error(
+      `Canvas screenshot failed: ${captureError?.message ?? captureError}; ` +
+      `settings dialog restoration failed: ${reopenError?.message ?? reopenError}`,
+    );
+  }
+  if (captureError) throw captureError;
+  if (reopenError) throw reopenError;
+  return capture;
 }
 
-async function comparePixelSnapshots(page, leftName, rightName) {
-  return page.evaluate(({ globalKey, leftName, rightName }) => {
-    const snapshots = window[globalKey]?.snapshots;
-    const left = snapshots?.[leftName];
-    const right = snapshots?.[rightName];
-    if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array) || left.length !== right.length) {
-      throw new Error("Viewport pixel snapshots are missing or have different dimensions");
+function comparePixelSnapshots(snapshots, leftName, rightName) {
+  const leftSnapshot = snapshots.get(leftName);
+  const rightSnapshot = snapshots.get(rightName);
+  if (!leftSnapshot || !rightSnapshot || leftSnapshot.width !== rightSnapshot.width ||
+      leftSnapshot.height !== rightSnapshot.height) {
+    throw new Error("Viewport pixel snapshots are missing or have different dimensions");
+  }
+  const { data: left } = leftSnapshot;
+  const { data: right } = rightSnapshot;
+  let changedPixels = 0;
+  for (let offset = 0; offset < left.length; offset += 4) {
+    if (Math.abs(left[offset] - right[offset]) > 2 ||
+        Math.abs(left[offset + 1] - right[offset + 1]) > 2 ||
+        Math.abs(left[offset + 2] - right[offset + 2]) > 2) {
+      changedPixels += 1;
     }
-    let changedPixels = 0;
-    for (let offset = 0; offset < left.length; offset += 4) {
-      if (Math.abs(left[offset] - right[offset]) > 2 ||
-          Math.abs(left[offset + 1] - right[offset + 1]) > 2 ||
-          Math.abs(left[offset + 2] - right[offset + 2]) > 2) {
-        changedPixels += 1;
-      }
-    }
-    return { changed_pixels: changedPixels, total_pixels: left.length / 4 };
-  }, { globalKey: PIXEL_SNAPSHOT_GLOBAL, leftName, rightName });
+  }
+  return { changed_pixels: changedPixels, total_pixels: left.length / 4 };
 }
 
 function colorDistance(left, right) {
   return left.reduce((sum, value, index) => sum + Math.abs(value - right[index]), 0) / left.length;
 }
 
-async function clearPixelSnapshots(page, names) {
-  await page.evaluate(({ globalKey, names }) => {
-    const snapshots = window[globalKey]?.snapshots;
-    for (const name of names) delete snapshots?.[name];
-  }, { globalKey: PIXEL_SNAPSHOT_GLOBAL, names });
-}
-
-async function clearAllPixelSnapshots(page) {
-  await page.evaluate((globalKey) => { delete window[globalKey]; }, PIXEL_SNAPSHOT_GLOBAL).catch(() => {});
+function clearPixelSnapshots(snapshots, names) {
+  for (const name of names) snapshots.delete(name);
 }
 
 async function checkNarrowViewport(page, dialog, timeout) {
@@ -510,12 +534,13 @@ async function verifyPreferenceReload(page, {
 }
 
 async function restoreControls(page, dialog, original, timeout) {
-  await choose(page, "Background", BACKGROUND_OPTIONS[original.backgroundMode], "fm-view-background", timeout);
+  await choose(page, "Background", BACKGROUND_OPTIONS.gradient, "fm-view-background", timeout);
   await setRangeValue(page, "#fm-view-background-strength", original.strength);
   await choose(page, "Scale coordinates", ORIGIN_OPTIONS[original.originMode], "fm-view-origin", timeout);
   await choose(page, "Reference frame", FRAME_OPTIONS[original.frameMode], "fm-view-frame", timeout);
   await setSwitch(page, "Ambient occlusion", original.ambientOcclusion, timeout);
   await setSwitch(page, "Bloom (Glow)", original.bloom, timeout);
+  await choose(page, "Background", BACKGROUND_OPTIONS[original.backgroundMode], "fm-view-background", timeout);
   const restored = await readControls(page, dialog);
   if (JSON.stringify(restored) !== JSON.stringify(original)) {
     throw new Error("Viewport appearance controls did not return to their original values");

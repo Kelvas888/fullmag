@@ -1,9 +1,16 @@
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { runViewportAppearanceBrowserQa } from "./lib/viewport-appearance-browser-qa.mjs";
 
 const require = createRequire(import.meta.url);
 const playwrightPackage = require("playwright/package.json");
+const playwrightRequire = createRequire(require.resolve("playwright/package.json"));
+const { PNG } = playwrightRequire("playwright-core/lib/utilsBundle");
+const runnerSourcePath = fileURLToPath(import.meta.url);
+const appearanceQaSourcePath = fileURLToPath(new URL("./lib/viewport-appearance-browser-qa.mjs", import.meta.url));
 const expectedVersion = process.env.CONTROL_ROOM_EXPECTED_PLAYWRIGHT_VERSION ?? "1.62.1";
 const timeout = Number.parseInt(process.env.CONTROL_ROOM_BROWSER_QA_TIMEOUT_MS ?? "180000", 10);
 const publicUrl = process.env.CONTROL_ROOM_PUBLIC_URL ?? "";
@@ -14,10 +21,19 @@ const resultSchema = "fullmag.docker-dev-browser-qa-result.v1";
 const pageErrors = [];
 const consoleErrors = [];
 const requestFailures = [];
+let harnessSourceHashes = null;
 const bounded = (value) => String(value).slice(0, 2048);
 const collect = (target, value) => {
   if (target.length < 32) target.push(bounded(value));
 };
+
+const sha256File = async (path) => createHash("sha256").update(await readFile(path)).digest("hex");
+const readHarnessSourceHashes = async () => ({
+  runner: await sha256File(runnerSourcePath),
+  appearance_helper: await sha256File(appearanceQaSourcePath),
+});
+const sameHarnessSourceHashes = (left, right) =>
+  left.runner === right.runner && left.appearance_helper === right.appearance_helper;
 
 const sessionIdentity = async (page) => {
   const endpoint = new URL("/v2/sessions/current/status", page.url()).toString();
@@ -55,6 +71,7 @@ const canvasState = async (page) => page.locator(".fm-viewport-3d canvas").first
     context_lost: context?.isContextLost?.() ?? null,
     drawing_buffer_width: context?.drawingBufferWidth ?? 0,
     drawing_buffer_height: context?.drawingBufferHeight ?? 0,
+    preserve_drawing_buffer: context?.getContextAttributes?.().preserveDrawingBuffer ?? null,
     vendor: debugInfo ? context.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : null,
     renderer: debugInfo ? context.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : null,
   };
@@ -78,19 +95,24 @@ const main = async () => {
   if (playwrightPackage.version !== expectedVersion || expectedVersion !== "1.62.1") {
     throw new Error(`Playwright package ${playwrightPackage.version} does not match ${expectedVersion}`);
   }
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--headless=new",
-      "--disable-dev-shm-usage",
-      "--enable-unsafe-swiftshader",
-      "--ignore-gpu-blocklist",
-      "--no-sandbox",
-      "--use-angle=swiftshader-webgl",
-      "--use-gl=angle",
-    ],
-  });
+  if (typeof PNG?.sync?.read !== "function") {
+    throw new Error("Pinned Playwright utilsBundle does not expose PNG.sync.read");
+  }
+  const sourceHashesBefore = await readHarnessSourceHashes();
+  let browser = null;
   try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--headless=new",
+        "--disable-dev-shm-usage",
+        "--enable-unsafe-swiftshader",
+        "--ignore-gpu-blocklist",
+        "--no-sandbox",
+        "--use-angle=swiftshader-webgl",
+        "--use-gl=angle",
+      ],
+    });
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 1 });
     const page = await context.newPage();
     page.setDefaultTimeout(timeout);
@@ -115,6 +137,7 @@ const main = async () => {
       assertCanvas: (label) => assertCanvas(page, label),
       expectedSession: sessionBefore,
       getSessionIdentity: () => sessionIdentity(page),
+      pngDecoder: PNG,
       timeout,
     });
     const before = await assertCanvas(page, "before Home");
@@ -163,12 +186,28 @@ const main = async () => {
       request_failures: requestFailures.length,
     };
   } finally {
-    await browser.close();
+    try {
+      await browser?.close();
+    } finally {
+      const sourceHashesAfter = await readHarnessSourceHashes();
+      const unchanged = sameHarnessSourceHashes(sourceHashesBefore, sourceHashesAfter);
+      harnessSourceHashes = {
+        algorithm: "sha256",
+        runner_before: sourceHashesBefore.runner,
+        runner_after: sourceHashesAfter.runner,
+        appearance_helper_before: sourceHashesBefore.appearance_helper,
+        appearance_helper_after: sourceHashesAfter.appearance_helper,
+        unchanged,
+      };
+      if (!unchanged) throw new Error("Browser QA harness source changed during the run");
+    }
   }
 };
 
 try {
-  console.log(JSON.stringify(await main()));
+  const payload = await main();
+  payload.harness_source_sha256 = harnessSourceHashes;
+  console.log(JSON.stringify(payload));
 } catch (error) {
   console.log(JSON.stringify({
     schema: resultSchema,
@@ -177,6 +216,7 @@ try {
     probe_url: probeUrl,
     playwright_version: playwrightPackage.version ?? null,
     browser_gpu_mode: browserGpuMode,
+    harness_source_sha256: harnessSourceHashes,
     error: bounded(error?.stack ?? error),
     page_errors: pageErrors,
     console_errors: consoleErrors,

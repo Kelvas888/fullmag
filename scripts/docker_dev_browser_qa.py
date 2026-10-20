@@ -180,6 +180,9 @@ def _read_live_development(
     port: int,
 ) -> tuple[dict[str, object], str, str, str, dict[str, object]]:
     current = control.read("development/current.json")
+    current_fence_sha256 = hashlib.sha256(canonical(current)).hexdigest()
+    if isinstance(current, dict) and current.get("state") == "failed-confirmed":
+        current = _read_recovered_development(control, current, selected, identity)
     if not isinstance(current, dict) or current.get("state") != "succeeded":
         raise BuildControlError("Browser QA requires a succeeded live volume DEV receipt")
     if current.get("compose_project") != control.project:
@@ -218,7 +221,56 @@ def _read_live_development(
         raise BuildControlError("Frontend inputs worktree differs from selected checkout")
     if str(frontend_inputs.get("host_port")) != str(port):
         raise BuildControlError("Frontend inputs port differs from requested public port")
+    current = {**current, "development_fence_sha256": current_fence_sha256}
     return current, backend_id, frontend_id, frontend_volume, frontend_inputs
+
+
+def _read_recovered_development(control, original, selected, identity):
+    """Resolve an authenticated recovery without rewriting the original receipt."""
+    from docker_volume_activate import _linked_runtime_terminals, _validate_running_group
+
+    attempt = original.get("attempt")
+    if not isinstance(attempt, str) or not re.fullmatch(r"[0-9a-f]{32}", attempt):
+        raise BuildControlError("Development receipt has no valid original attempt")
+    root = "development/attempts/" + attempt
+    terminal = control.read(root + "/terminal.json")
+    if canonical(terminal) != canonical(original):
+        raise BuildControlError("Development current differs from its terminal receipt")
+    document = control.read(root + "/compose.json")
+    config_sha256 = hashlib.sha256(canonical(document)).hexdigest()
+    if original.get("config_sha256") not in (None, config_sha256):
+        raise BuildControlError("Development original/config pin differs")
+    inputs = original.get("inputs")
+    if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
+        raise BuildControlError("Development recovery source differs from selected checkout")
+    image = inputs.get("image_id")
+    if not isinstance(image, str) or not IMAGE_ID_RE.fullmatch(image):
+        raise BuildControlError("Development recovery requires an immutable image")
+    linked = _linked_runtime_terminals(
+        control, attempt, original, source_root=str(selected), image=image,
+        config_sha256=config_sha256,
+    )
+    matches = {}
+    for recovered in linked:
+        try:
+            ids = _validate_running_group(
+                control, identity, document, recovered, image, source_root=str(selected),
+            )
+        except BuildControlError:
+            continue
+        matches.setdefault(ids, []).append(recovered)
+    if len(matches) != 1:
+        raise BuildControlError("Development recovery does not identify exactly one live group")
+    recovered = max(next(iter(matches.values())), key=lambda item: item.get("finished_at", 0))
+    # Keep the development attempt and its standard source/image inputs. The
+    # effective runtime has separate provenance, never a fabricated DEV success.
+    return {
+        **original, **recovered, "inputs": inputs, "attempt": attempt,
+        "phase": original.get("phase"), "config_sha256": config_sha256,
+        "runtime_phase": recovered["phase"], "runtime_attempt": recovered["attempt"],
+        "runtime_terminal_sha256": hashlib.sha256(canonical(recovered)).hexdigest(),
+        "development_terminal_state": original["state"],
+    }
 
 
 def _validate_frontend(
@@ -920,6 +972,10 @@ def main(argv: list[str] | None = None) -> int:
         "worktree_id": identity["worktree_id"],
         "development_attempt": current.get("attempt"),
         "development_config_sha256": current.get("config_sha256"),
+        "runtime_phase": current.get("runtime_phase", current.get("phase")),
+        "runtime_attempt": current.get("runtime_attempt", current.get("attempt")),
+        "runtime_terminal_sha256": current.get("runtime_terminal_sha256"),
+        "development_terminal_state": current.get("development_terminal_state", current.get("state")),
         "frontend_container": frontend_id,
         "frontend_volume": frontend_volume,
         "frontend_inputs_sha256": hashlib.sha256(canonical(frontend_inputs)).hexdigest(),
@@ -932,6 +988,9 @@ def main(argv: list[str] | None = None) -> int:
         "browser_image_pull_timeout": args.pull_timeout,
     }
     with control.operation("browser-qa", inputs) as operation:
+        live_fence = control.read("development/current.json")
+        if hashlib.sha256(canonical(live_fence)).hexdigest() != current["development_fence_sha256"]:
+            raise BuildControlError("Development attempt changed before browser QA admission")
         browser_image_id, _ = _ensure_browser_image(
             operation, control, document, args.browser_image, args.pull_timeout
         )

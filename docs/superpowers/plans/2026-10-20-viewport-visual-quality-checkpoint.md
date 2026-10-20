@@ -53,7 +53,7 @@ Poniższe elementy są zaimplementowane w źródłach, ale nie mają jeszcze odb
 | Ścieżka | Jednolita geometria | Kolor danych | Granica dowodu |
 |---|---|---|---|
 | PrimitiveObjectLayer | Lambert w studio, Basic w flat | istniejący podgląd/paleta | odczyt źródeł, obraz NOT VERIFIED |
-| FdmCuboidLayer | instancjonowany Lambert/Basic | Basic lub istniejący shader, shading opt-in | odczyt źródeł, RGB/normalne NOT VERIFIED |
+| FdmCuboidLayer | instancjonowany Lambert/Basic | Basic lub istniejący shader, zawsze unlit | odczyt źródeł, RGB/normalne NOT VERIFIED |
 | MeshPartLayer / TopologyMeshLayer | Lambert/Basic, normale przy wymagającym ich shaderze | Basic/custom scalar shader bez tone mappingu | odczyt źródeł, RGB/normalne NOT VERIFIED |
 | Antenna / artifact / vectors | zachowane materiały naukowe | ochrona przed globalnym AO/Bloom | brak kwalifikacji ich wizualnego runtime |
 
@@ -75,6 +75,21 @@ Poniższe elementy są zaimplementowane w źródłach, ale nie mają jeszcze odb
 - Usługi po tej próbie: backend `bc2c9636ddad` zatrzymany po błędzie, frontend `3afd4865666f` zachowany. Dokładne IDs i stan trzeba ponownie sprawdzić przed operacją.
 
 ## Macierz odbioru R7
+
+### Checkpoint po uruchomieniu runtime i review
+
+- Kandydat R1–R6: commit `722c18e63ac139b4e7e95ae649e2969316d5fdcf`.
+- Resume `b0dfaf3874124dcfb78844b73e921dd1`: **succeeded**, konfiguracja `82a065a154f6977317555b48a44c0ceafe625fc4311a356394fabadcee6dfcd9`. Backend API/runtime ready; wersja `0.1.0-dev.20261020.g722c18e63ac1+9789`, snapshot `faed34783fcdc557977a14b252b3dab34e8ee3914ae6bd6bf1803561c7ec69ec`. Jest to dowód uruchomienia tej kompilacji, nie kwalifikacja solverów ani bieżących późniejszych edycji HMR.
+- Aktualne kontenery zadania: backend `bc2c9636ddadf53604d655f072274146323f15faee55e608969733f249d85a33`, frontend `3afd4865666f`; grupa i port jak wyżej. Oba zdrowe podczas kontroli. Nie zmieniano grupy master.
+- Aktywacja `2636a68de78641079e079fefb30cdc25` przykładu `viewport_2d_default_slice_fdm_smoke.py` odrzucona: runtime nie wykonuje prymitywnego etapu `hysteresis`. Pozostał model geometryczny i status startup_failed. Nie ponawiano tego intentu. Próba innego małego przykładu `230faa4bc11c46db96e1db9c71abeafa` została zatrzymana przed POST przez ochronę aktywnej/nieznanej sesji. Nie resetowano ownera ani bazy.
+- Podgląd Chrome na `127.0.0.1:3218/workspace` pokazuje gradient, oświetloną bryłę, baselines, ticki i HUD. Po przeładowaniu otwarcie panelu View settings działa. To **wyłącznie geometry preview**, nie FDM field ani FEM mesh. Zapis obrazu: `C:/Users/Mateusz/.codex/visualizations/2026/10/20/01a15981-ab31-7ca0-960f-3d1145a8311d/viewport-preview-candidate-722c18e.png`.
+- Późniejsze poprawki źródłowe: usunięto opcjonalne cieniowanie danych; wszystkie kolory ilościowe są unlit, także fallback shader. Obliczenia normalnych są pomijane przy zerowej sile cieniowania. Nieaktywne regulatory gradientu/światła są disabled z wyjaśnieniem. Przegląd ograniczonego diffu nie wykazał potwierdzonej regresji.
+- Te poprawki zapisano commitem `34f05f42bc56e12bd03d8e39723bee796bfe163f`. Hook React Doctor: 14 plików, jedno ostrzeżenie o istniejącym `array.find` w FdmCuboidLayer:781, poza zmienionym fragmentem; bramki frameworkowe wyłączone przez brak rozpoznanego frameworka w korzeniu repo. Nie jest to pełny React proof.
+- Ręcznie sprawdzono przełączenie Mocha → Latte → Mocha na tej samej scenie. Gradient zmienia się razem z motywem. Zapis Latte: `C:/Users/Mateusz/.codex/visualizations/2026/10/20/01a15981-ab31-7ca0-960f-3d1145a8311d/viewport-preview-latte.png`. Bez pomiaru DPR/kontrastu i bez danych pól: tylko częściowy dowód wizualny.
+- Harness odczytuje rzeczywiste piksele canvasu z PNG Playwright, zamyka overlay ustawień na czas zdjęcia, przywraca UI w finally i porównuje hashe własnych źródeł przed/po. Wcześniejszy gl.readPixels po oddaniu bufora nie był wiarygodnym pomiarem; nie jest używany jako dowód.
+- Ostatni ESLint viewportu i runner/helper QA: exit 0. Powtórny produkcyjny TypeScript: te same pięć błędów bazowych, bez błędów w zmienionym viewporcie; całe sprawdzenie nadal exit 1.
+- Pierwsza próba QA zatrzymana przed przeglądarką: wrapper ignorował succeeded resume, wymagając succeeded pierwotnego development/current. Poprawka konsumenta korzysta z istniejących `_linked_runtime_terminals` i `_validate_running_group`, waliduje current/terminal, config CAS, źródła, obraz i aktywne kontenery; nie zmienia historycznych receiptów. Provenance rozdziela development attempt i runtime phase/attempt/hash. Po uzyskaniu lease ponownie sprawdzany jest fence pierwotnej próby.
+- Managed browser QA `faa969d54b3f482f885d01b5b8f97626`: **w toku**, rozpoczęto pobranie oficjalnego przypiętego obrazu Playwright. Wyniku testu nie ma jeszcze w tym checkpointcie. Testy regresyjne wrappera są przygotowywane; nie są wykonywane ani kompilowane.
 
 V01–V15 z planu: **NOT VERIFIED w przeglądarce**. Harness appearance jest podłączony do zarządzanego runnera; jego obecność nie jest dowodem wykonania. Brakuje obrazu/PNG, DPR/motywów, FDM/FEM/primitive, pomiaru kontrastu/RGB, idle/network i churn 20 przełączeń. Nie ma zgody na pominięcie tych bramek.
 
