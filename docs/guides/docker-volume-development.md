@@ -99,6 +99,17 @@ nie zmieniają source identity; świadomie śledzone fixtures nadal są sprawdza
 
 ## Iteracje i awarie
 
+Gotowy kandydat pakietu po nieudanej publikacji jest odrębny od działającego
+pakietu. Backend najpierw sprawdza jego kompletność i dowody Make oraz
+zachowuje oryginalny manifest przed następnym capture źródeł. Dopiero świeże
+wejścia pozwalają wybrać istniejącą rotację pasującego pakietu albo retirement
+zbędnego stagingu. Przygotowane archiwum bez trwałego intentu niczego nie
+usuwa. Logi, receipty i manifesty pozostają w ograniczonym namespace
+`backend/candidate-retirements` control volume; bieżący pakiet, rollback,
+cache i storage użytkownika zostają zachowane. Nie usuwaj kandydata ręcznie
+i nie twórz nowych wolumenów jako obejścia blokady. Kontrakt i stan dowodu:
+[ADR 0061](../adr/0061-docker-development-build-and-runtime-container.md#rozszerzenie-20102026--gotowy-nieopublikowany-staging).
+
 `just docker-dev-restart-idle <attempt> <config-sha256> <source> <port>`
 sprawdza dokładny kontener, obraz, polecenie, etykiety i mounty oraz wymaga
 zdrowego API bez aktywnej sesji. Na czas kontroli zamyka jedyne wejście HTTP przez zatrzymanie własnego frontendu,
