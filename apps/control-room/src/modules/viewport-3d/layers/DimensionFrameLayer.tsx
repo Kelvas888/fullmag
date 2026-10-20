@@ -493,7 +493,7 @@ export function dimensionFrameLabelRuns(
   const axisColor = colors.axis[label.axis];
   if (label.kind === "tick") {
     return {
-      runs: [{ color: colors.tick, text: label.text }],
+      runs: [{ color: colors.label, text: label.text, weight: 700 }],
       style: { font: "mono", fontPx: TICK_LABEL_FONT_PX, halo: colors.halo },
     };
   }

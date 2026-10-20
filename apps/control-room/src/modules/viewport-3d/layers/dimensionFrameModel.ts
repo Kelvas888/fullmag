@@ -165,6 +165,27 @@ export function resolveDimensionFrameStep(
   return niceStep(Math.max(spanMeters, 1e-18) / target);
 }
 
+/** Whether bounds contain a finite, non-degenerate extent worth measuring. */
+export function hasMeaningfulDimensionFrameBounds(
+  bounds: Viewport3DBounds | null,
+): boolean {
+  if (
+    !bounds ||
+    !Array.isArray(bounds.center) ||
+    bounds.center.length !== 3 ||
+    !Array.isArray(bounds.size) ||
+    bounds.size.length !== 3 ||
+    !bounds.center.every(Number.isFinite) ||
+    !bounds.size.every(
+      (span) => Number.isFinite(span) && span >= 0,
+    )
+  ) {
+    return false;
+  }
+
+  return bounds.size.some((span) => span > 0);
+}
+
 export function buildDimensionFrameModel({
   annotation = "ticks",
   bounds,

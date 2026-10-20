@@ -4,6 +4,7 @@ import type { Viewport3DBounds } from "../viewport3dRenderModel";
 import {
   buildDimensionFrameModel,
   formatDimensionFrameTickValue,
+  hasMeaningfulDimensionFrameBounds,
   resolveDimensionFrameEdges,
   resolveDimensionFrameOrientationWithHysteresis,
   resolveDimensionFrameStep,
@@ -21,6 +22,57 @@ const cameraState = {
   target: [0, 0, 0] as [number, number, number],
   up: [0, 0, 1] as [number, number, number],
 };
+
+describe("hasMeaningfulDimensionFrameBounds", () => {
+  const boundsWith = (
+    center: [number, number, number],
+    size: [number, number, number],
+  ): Viewport3DBounds => ({
+    center,
+    radius: 1e-12,
+    size,
+  });
+
+  it("rejects missing, point-degenerate, non-finite, and negative bounds", () => {
+    expect(hasMeaningfulDimensionFrameBounds(null)).toBe(false);
+    expect(
+      hasMeaningfulDimensionFrameBounds(boundsWith([0, 0, 0], [0, 0, 0])),
+    ).toBe(false);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([Number.NaN, 0, 0], [1, 0, 0]),
+      ),
+    ).toBe(false);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [1, Number.POSITIVE_INFINITY, 0]),
+      ),
+    ).toBe(false);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [1, -1, 0]),
+      ),
+    ).toBe(false);
+  });
+
+  it("accepts positive one-dimensional, flat two-dimensional, and thin 3D extents", () => {
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [2e-6, 0, 0]),
+      ),
+    ).toBe(true);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [2e-6, 1e-6, 0]),
+      ),
+    ).toBe(true);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [3e-6, 2e-6, 1e-15]),
+      ),
+    ).toBe(true);
+  });
+});
 
 describe("resolveDimensionFrameUnit", () => {
   it("uses nm for nanoscale magnetic domains", () => {

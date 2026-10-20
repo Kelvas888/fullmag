@@ -95,6 +95,7 @@ import { DEFAULT_VIEWPORT_3D_CAMERA_STATE, useViewport3DAppearance } from "../vi
 import type { Viewport3DColors } from "../viewport3dTypes";
 import type { VectorFieldLayerVectorStyle } from "./VectorFieldLayer";
 import { DimensionFrameLayer } from "./DimensionFrameLayer";
+import { hasMeaningfulDimensionFrameBounds } from "./dimensionFrameModel";
 import { Viewport3DBackground } from "./Viewport3DBackground";
 import { Viewport3DCaptureSource } from "./Viewport3DCaptureSource";
 import { useViewportHudRegions } from "../orientation/useViewportHudRegions";
@@ -1079,7 +1080,8 @@ function Viewport3DOverlayLayerStack({
           />
         </>
       ) : null}
-      {viewport3DDimensionFrameEnabledFromBrowserConfig() ? (
+      {viewport3DDimensionFrameEnabledFromBrowserConfig() &&
+      hasMeaningfulDimensionFrameBounds(bounds) ? (
         <DimensionFrameLayer
           annotation={dimensionFrameAnnotation}
           originMode={appearance.dimensionOrigin}
