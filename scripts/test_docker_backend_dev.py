@@ -2232,9 +2232,38 @@ class BackendPackageTests(unittest.TestCase):
             provenance_path.touch()
             original_provenance_path = backend.PROVENANCE_PATH
             backend.PROVENANCE_PATH = provenance_path
+            runtime_image_id = "sha256:" + "f" * 64
             try:
-                backend._publish_runtime_provenance(output)
+                with patch.dict(
+                    os.environ,
+                    {"FULLMAG_RUNTIME_IMAGE_ID": runtime_image_id},
+                    clear=False,
+                ):
+                    backend._publish_runtime_provenance(output)
                 provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+                published_bytes = provenance_path.read_bytes()
+                self.assertEqual(provenance["image_id"], runtime_image_id)
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("FULLMAG_RUNTIME_IMAGE_ID", None)
+                    with self.assertRaisesRegex(
+                        backend.BackendBuildError, "FULLMAG_RUNTIME_IMAGE_ID"
+                    ):
+                        backend._publish_runtime_provenance(output)
+                for malformed in (
+                    "not-an-image",
+                    "sha256:" + "A" * 64,
+                    "sha256:" + "e" * 63,
+                ):
+                    with self.subTest(malformed=malformed), patch.dict(
+                        os.environ,
+                        {"FULLMAG_RUNTIME_IMAGE_ID": malformed},
+                        clear=False,
+                    ):
+                        with self.assertRaisesRegex(
+                            backend.BackendBuildError, "FULLMAG_RUNTIME_IMAGE_ID"
+                        ):
+                            backend._publish_runtime_provenance(output)
+                self.assertEqual(provenance_path.read_bytes(), published_bytes)
             finally:
                 backend.PROVENANCE_PATH = original_provenance_path
             self.assertEqual(provenance["commit"], "a" * 40)
