@@ -15,8 +15,17 @@ export type SessionDiscretizationCapabilitiesProjection = {
 
 export interface SessionDiscretizationStatus {
   capabilities?: SessionDiscretizationCapabilitiesProjection | null;
-  domain?: { discretization?: unknown } | null;
+  domain?: {
+    cell_count?: unknown;
+    discretization?: unknown;
+    generation_id?: unknown;
+  } | null;
   domainDiscretization?: unknown;
+  resources?: {
+    domain_generation_id?: unknown;
+    mesh_revision?: unknown;
+    topology_revision?: unknown;
+  } | null;
 }
 
 export function projectFlatActiveLaneDiscretization(
@@ -89,6 +98,54 @@ export function resolveSessionDiscretization(
     return normalizeDiscretization(status.domain.discretization);
   }
   return normalizeDiscretization(status?.domainDiscretization);
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isPublishedDomainGeneration(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const generationId = value.trim();
+  return (
+    generationId.length > 0 &&
+    value === generationId &&
+    generationId.toLowerCase() !== "unmaterialized" &&
+    !generationId.toLowerCase().endsWith(":unmaterialized")
+  );
+}
+
+/**
+ * Resolves the discretization used to choose the viewport's binary topology
+ * adapter. A resolved runtime lane remains authoritative; only when it is
+ * unresolved may a fully published domain and its resource identity select a
+ * preview adapter. This does not resolve solver execution or capabilities.
+ */
+export function resolveSessionTopologyDiscretization(
+  status: SessionDiscretizationStatus | null | undefined,
+): SessionDiscretization | null {
+  const runtimeDiscretization = resolveSessionDiscretization(status);
+  if (runtimeDiscretization) return runtimeDiscretization;
+
+  const discretization = normalizeDiscretization(status?.domain?.discretization);
+  const generationId = status?.domain?.generation_id;
+  const resources = status?.resources;
+  if (
+    !discretization ||
+    !isPublishedDomainGeneration(generationId) ||
+    !isPositiveSafeInteger(status?.domain?.cell_count) ||
+    !isPositiveSafeInteger(resources?.topology_revision) ||
+    resources?.domain_generation_id !== generationId
+  ) {
+    return null;
+  }
+  if (
+    discretization === "fem" &&
+    !isPositiveSafeInteger(resources?.mesh_revision)
+  ) {
+    return null;
+  }
+  return discretization;
 }
 
 export function selectSessionDiscretization(status: {

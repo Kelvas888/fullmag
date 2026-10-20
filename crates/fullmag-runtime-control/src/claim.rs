@@ -18,9 +18,9 @@ pub fn commit_claimed_task_admission(
     task: &TaskRecord,
     claim: &TaskClaim,
 ) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
-    commit_claimed_task_admission_with(store, task, claim, |lease| {
+    commit_claimed_task_admission_with(store, task, claim, |lease, dependencies| {
         let _writer = store.write_transaction()?;
-        crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())?;
+        dependencies.require_locked(store)?;
         store.commit_task_admission(lease).map(Some)
     })?
     .context("local task admission unexpectedly returned no disposition")
@@ -39,11 +39,11 @@ pub fn commit_claimed_task_admission_with_host(
     inputs: &std::collections::BTreeMap<String, fullmag_application::ResolvedInput>,
 ) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
     let inputs = capture_admission_inputs(inputs)?;
-    commit_claimed_task_admission_with(store, task, claim, |lease| {
+    commit_claimed_task_admission_with(store, task, claim, |lease, dependencies| {
         let lease = attach_host_launch_binding(ledger, lease)?;
         ledger
             .commit_task_admission_checked(request, store, &lease, &inputs, || {
-                crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())
+                dependencies.require_locked(store)
             })
             .map(Some)
     })?
@@ -61,10 +61,10 @@ pub fn try_commit_claimed_task_admission_with_host(
     inputs: &std::collections::BTreeMap<String, fullmag_application::ResolvedInput>,
 ) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>> {
     let inputs = capture_admission_inputs(inputs)?;
-    commit_claimed_task_admission_with(store, task, claim, |lease| {
+    commit_claimed_task_admission_with(store, task, claim, |lease, dependencies| {
         let lease = attach_host_launch_binding(ledger, lease)?;
         ledger.try_commit_task_admission_checked(request, store, &lease, &inputs, || {
-            crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())
+            dependencies.require_locked(store)
         })
     })
 }
@@ -95,6 +95,7 @@ fn commit_claimed_task_admission_with(
     claim: &TaskClaim,
     admit: impl FnOnce(
         &FmsResourceLease,
+        &crate::study_completion::PreparedTaskDependencies,
     ) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>>,
 ) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>> {
     task.fence(claim)
@@ -122,7 +123,12 @@ fn commit_claimed_task_admission_with(
     {
         bail!("application task differs from the durable ready task");
     }
-    validate_claimed_task_resource(store, claim)?;
+    let dependencies = crate::study_completion::prepare_task_dependencies(
+        store,
+        &claim.run_id,
+        claim.task_id.as_str(),
+    )?;
+    validate_claimed_task_resource(claim, &dependencies)?;
     let retry_queue_epoch = durable_task.ownership_epoch.is_some_and(|prior_epoch| {
         prior_epoch
             .checked_add(1)
@@ -186,7 +192,7 @@ fn commit_claimed_task_admission_with(
         released_at: None,
         host_launch_binding: None,
     };
-    let Some(disposition) = admit(&lease)? else {
+    let Some(disposition) = admit(&lease, &dependencies)? else {
         return Ok(None);
     };
     let persisted_claim = load_current_task_claim(store, &claim.run_id, claim.task_id.as_str())?;
@@ -224,6 +230,17 @@ pub(crate) fn claimed_task_resource_compatibility(
         &claim.run_id,
         &specification.snapshot.project_id,
     )?;
+    claimed_task_resource_compatibility_for_snapshot(claim, &specification, &accepted)
+}
+
+fn claimed_task_resource_compatibility_for_snapshot(
+    claim: &TaskClaim,
+    specification: &fullmag_application::RunSpecification,
+    accepted: &crate::study::AcceptedStudySnapshot,
+) -> Result<ClaimedTaskResourceCompatibility> {
+    if specification.run_id != claim.run_id {
+        bail!("accepted task claim run differs from the immutable RunSpec");
+    }
     let mut matching_step = None;
     for step in &accepted.study.steps {
         if fullmag_session::task_id_for_study_step(claim.run_id.as_str(), &step.step_id)?
@@ -306,8 +323,21 @@ fn resource_budget_meets_requested_minimum(
         && offered.storage_bytes >= required.storage_bytes
 }
 
-fn validate_claimed_task_resource(store: &SessionStore, claim: &TaskClaim) -> Result<()> {
-    match claimed_task_resource_compatibility(store, claim)? {
+fn validate_claimed_task_resource(
+    claim: &TaskClaim,
+    dependencies: &crate::study_completion::PreparedTaskDependencies,
+) -> Result<()> {
+    if !dependencies.has_run_intent() {
+        bail!("accepted task admission requires its immutable run intent");
+    }
+    let accepted = dependencies
+        .accepted_study()
+        .context("accepted run has no immutable study object")?;
+    match claimed_task_resource_compatibility_for_snapshot(
+        claim,
+        &accepted.run.specification,
+        accepted,
+    )? {
         ClaimedTaskResourceCompatibility::Compatible => Ok(()),
         ClaimedTaskResourceCompatibility::Incompatible(reason) => bail!(reason),
     }

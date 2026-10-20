@@ -533,7 +533,10 @@ def _validate_helper(
     control: BuildControl,
     helper_name: str,
     activation_attempt: str,
+    *, phase: str = "activation",
 ) -> tuple[dict[str, object], str]:
+    if phase not in {"activation", "iteration"}:
+        raise _fail("Unsupported recovery helper phase")
     result = docker_capture("inspect", helper_name, timeout=90)
     try:
         documents = json.loads(result.stdout)
@@ -578,7 +581,7 @@ def _validate_helper(
     # script. Authenticate that exact command, including the prefix, rather
     # than only the legacy unnamespaced operation_script body.
     expected_args = control.helper_args(
-        control.operation_script("activation", activation_attempt), name=helper_name,
+        control.operation_script(phase, activation_attempt), name=helper_name,
     )
     entrypoint_index = expected_args.index("--entrypoint")
     expected_cmd = expected_args[entrypoint_index + 3:]

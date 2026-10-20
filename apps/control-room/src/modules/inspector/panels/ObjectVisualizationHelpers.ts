@@ -16,8 +16,15 @@ import {
 export type ObjectVisualizationManifestStatus = {
   capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
     SessionDiscretizationCapabilitiesProjection;
-  domain: Pick<LiveStatusResource["domain"], "discretization">;
-  resources: Pick<LiveStatusResource["resources"], "mesh_revision">;
+  domain: Pick<LiveStatusResource["domain"], "discretization"> &
+    Partial<Pick<LiveStatusResource["domain"], "cell_count" | "generation_id">>;
+  resources: Pick<LiveStatusResource["resources"], "mesh_revision"> &
+    Partial<
+      Pick<
+        LiveStatusResource["resources"],
+        "domain_generation_id" | "topology_revision"
+      >
+    >;
   session: Pick<LiveStatusResource["session"], "session_epoch" | "session_id">;
 };
 
@@ -45,9 +52,21 @@ export function selectObjectVisualizationManifestStatus(status: {
     },
     domain: {
       discretization: status.data.domain?.discretization ?? "",
+      ...(status.data.domain?.cell_count === undefined
+        ? {}
+        : { cell_count: status.data.domain.cell_count }),
+      ...(status.data.domain?.generation_id === undefined
+        ? {}
+        : { generation_id: status.data.domain.generation_id }),
     },
     resources: {
       mesh_revision: status.data.resources?.mesh_revision,
+      ...(status.data.resources?.domain_generation_id === undefined
+        ? {}
+        : { domain_generation_id: status.data.resources.domain_generation_id }),
+      ...(status.data.resources?.topology_revision === undefined
+        ? {}
+        : { topology_revision: status.data.resources.topology_revision }),
     },
     session: {
       session_epoch: status.data.session?.session_epoch ?? "",
@@ -82,9 +101,14 @@ export function objectVisualizationManifestStatusEquals(
     previous.capabilities.active_lane_discretization ===
       next.capabilities.active_lane_discretization &&
     previous.domain.discretization === next.domain.discretization &&
-    previous.resources.mesh_revision === next.resources.mesh_revision
-    && previous.session.session_id === next.session.session_id
-    && previous.session.session_epoch === next.session.session_epoch
+    previous.domain.cell_count === next.domain.cell_count &&
+    previous.domain.generation_id === next.domain.generation_id &&
+    previous.resources.mesh_revision === next.resources.mesh_revision &&
+    previous.resources.domain_generation_id ===
+      next.resources.domain_generation_id &&
+    previous.resources.topology_revision === next.resources.topology_revision &&
+    previous.session.session_id === next.session.session_id &&
+    previous.session.session_epoch === next.session.session_epoch
   );
 }
 

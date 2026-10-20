@@ -40,7 +40,10 @@ MAX_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024
 MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 MAX_MEMBERS = 300_000
-LIVE_GIT_TIMEOUT_SECONDS = 120
+# A full readonly inventory can take longer than two minutes over the Windows
+# bind mount. Keep this as a per-child Git budget; runtime and lease deadlines
+# are independent.
+LIVE_GIT_TIMEOUT_SECONDS = 300
 LIVE_GIT_CHUNK_BYTES = 64 * 1024
 LIVE_GIT_STDERR_BYTES = 64 * 1024
 LIVE_GIT_HEADER_BYTES = 4 * 1024
@@ -369,10 +372,50 @@ def _live_assert_path(path: Path, label: str, *, directory: bool | None = None) 
             _live_fail(f"{label} is not a real directory")
 
 
+def _live_git_query_label(arguments: tuple[str, ...]) -> str:
+    """Return a bounded diagnostic label without exposing Git arguments."""
+    if not arguments:
+        return "git-query"
+    command = arguments[0]
+    if command == "rev-parse":
+        return "rev-parse-head"
+    if command == "ls-tree":
+        return "ls-tree-head"
+    if command == "check-attr":
+        return "check-attr-filter"
+    if command == "status":
+        return "status-runtime"
+    if command == "ls-files":
+        if "--stage" in arguments:
+            return "ls-files-stage"
+        if "--others" in arguments:
+            return "ls-files-untracked"
+        if "-t" in arguments:
+            return "ls-files-tags"
+    return "git-query"
+
+
 class _LiveGitProcess:
     """Run one bounded Git child with one deadline for every pipe operation."""
 
-    def __init__(self, command: tuple[str, ...], environment: Mapping[str, str]):
+    def __init__(
+        self,
+        command: tuple[str, ...],
+        environment: Mapping[str, str],
+        *,
+        query_label: str = "git-query",
+    ):
+        self.query_label = query_label
+        self.query_started = time.monotonic()
+        self.query_logged = False
+        self.stdout_bytes = 0
+        self.stderr_bytes = 0
+        self.returncode: int | None = None
+        print(
+            f"fullmag-live-source git_query={self.query_label} phase=start",
+            file=sys.stderr,
+            flush=True,
+        )
         try:
             self.process = subprocess.Popen(
                 command,
@@ -382,6 +425,7 @@ class _LiveGitProcess:
                 stderr=subprocess.PIPE,
             )
         except OSError as error:
+            self._log_query("failure", error_type=type(error).__name__)
             raise BackendSourceError(f"cannot run read-only Git source query: {error}") from error
         assert self.process.stdin is not None
         assert self.process.stdout is not None
@@ -432,8 +476,24 @@ class _LiveGitProcess:
 
     def _timeout(self) -> BackendSourceError:
         return BackendSourceError(
-            f"Git source query timed out after {LIVE_GIT_TIMEOUT_SECONDS} seconds"
+            f"Git source query {self.query_label} timed out after {LIVE_GIT_TIMEOUT_SECONDS} seconds"
         )
+
+    def _log_query(self, phase: str, *, error_type: str | None = None) -> None:
+        if self.query_logged:
+            return
+        elapsed_ms = int((time.monotonic() - self.query_started) * 1000)
+        fields = (
+            f"fullmag-live-source git_query={self.query_label} phase={phase} "
+            f"elapsed_ms={elapsed_ms} stdout_bytes={self.stdout_bytes} "
+            f"stderr_bytes={self.stderr_bytes}"
+        )
+        if self.returncode is not None:
+            fields += f" returncode={self.returncode}"
+        if error_type is not None:
+            fields += f" error_type={error_type}"
+        print(fields, file=sys.stderr, flush=True)
+        self.query_logged = True
 
     def _read(self, stream, target: bytearray, limit: int, label: str, *, extra: int = 1) -> None:
         capacity = limit + extra
@@ -452,6 +512,10 @@ class _LiveGitProcess:
             else:
                 self._close(stream, attribute="stderr_open")
             return
+        if stream is self.stdout:
+            self.stdout_bytes += len(chunk)
+        else:
+            self.stderr_bytes += len(chunk)
         if len(target) + len(chunk) > capacity:
             raise BackendSourceError(f"Git source query {label} exceeded its size bound")
         target.extend(chunk)
@@ -556,6 +620,7 @@ class _LiveGitProcess:
             returncode = self.process.wait(timeout=max(0.0, self.deadline - time.monotonic()))
         except subprocess.TimeoutExpired as error:
             raise self._timeout() from error
+        self.returncode = returncode
         return bytes(self.stdout_buffer), bytes(self.stderr_buffer), returncode
 
     def finish(self) -> int:
@@ -563,9 +628,11 @@ class _LiveGitProcess:
         while self.stdout_open or self.stderr_open:
             self._pump(stdout_limit=0, stdout_extra=0)
         try:
-            return self.process.wait(timeout=max(0.0, self.deadline - time.monotonic()))
+            returncode = self.process.wait(timeout=max(0.0, self.deadline - time.monotonic()))
         except subprocess.TimeoutExpired as error:
             raise self._timeout() from error
+        self.returncode = returncode
+        return returncode
 
     def __enter__(self) -> "_LiveGitProcess":
         return self
@@ -581,6 +648,15 @@ class _LiveGitProcess:
             if getattr(self, attribute):
                 self._close(stream, attribute=attribute)
         self.selector.close()
+        if exc_type is not None:
+            self._log_query("failure", error_type=exc_type.__name__)
+        elif self.returncode == 0:
+            self._log_query("end", error_type=None)
+        else:
+            self._log_query(
+                "failure",
+                error_type="GitExit" if self.returncode is not None else "MissingReturnCode",
+            )
 
 
 def _live_git_command(source_root: Path, git_dir: Path, *arguments: str) -> tuple[str, ...]:
@@ -611,7 +687,11 @@ def _live_run_git(
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_TERMINAL_PROMPT"] = "0"
     command = _live_git_command(source_root, git_dir, *arguments)
-    with _LiveGitProcess(command, environment) as process:
+    with _LiveGitProcess(
+        command,
+        environment,
+        query_label=_live_git_query_label(arguments),
+    ) as process:
         if input_data is not None:
             if len(input_data) > MAX_MANIFEST_BYTES:
                 raise BackendSourceError("Git source query input exceeds its size bound")
@@ -967,7 +1047,7 @@ def _live_read_blobs(git_dir: Path, object_ids: Mapping[str, str]) -> dict[str, 
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     command = ("git", "--git-dir", str(git_dir), "cat-file", "--batch")
     result: dict[str, bytes] = {}
-    with _LiveGitProcess(command, environment) as process:
+    with _LiveGitProcess(command, environment, query_label="cat-file-batch") as process:
         for relative, object_id in object_ids.items():
             process.write(
                 (object_id + "\n").encode("ascii"),

@@ -1093,7 +1093,7 @@ def _precreate_new_windows_runtime_state(state):
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
           recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
           native_restart_metadata=None, accepted_reattach_environment=None,
-          accepted_reattach_metadata=None):
+          accepted_reattach_metadata=None, recreation_resume_proof=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -1102,6 +1102,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     provided_operation = operation
     if (provided_control is None) != (provided_operation is None):
         raise BuildControlError("Recovery start requires both control and operation")
+    if recreation_resume_proof is not None and (reuse_state is None or provided_operation is not None):
+        raise BuildControlError("Recreation resume requires the retained state and a new managed start")
     validated_recovery_environment = _validate_recovery_environment(recovery_environment)
     validated_recovery_metadata = _validate_recovery_metadata(recovery_metadata)
     validated_native_restart_metadata = _validate_recovery_metadata(native_restart_metadata)
@@ -1160,6 +1162,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     image = images["backend"]["image_id"]
     device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
     _assert_no_running_fullmag(control.project, identity, **admission_context)
+    if recreation_resume_proof is not None:
+        if args.script is not None or getattr(args, "fresh_state", False):
+            raise BuildControlError("Recreation resume cannot change startup-script or session-state intent")
+        _validate_recreation_resume_records(
+            args, control, selected, identity, expected_proof=recreation_resume_proof
+        )
     if args.script is not None:
         if validated_accepted_reattach_environment:
             raise BuildControlError(
@@ -1184,6 +1192,17 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         operation_inputs["native_failed_restart"] = validated_native_restart_metadata
     if validated_accepted_reattach_metadata is not None:
         operation_inputs["accepted_reattach"] = validated_accepted_reattach_metadata
+    if recreation_resume_proof is not None:
+        operation_inputs["recreation_resume"] = {
+            key: recreation_resume_proof[key]
+            for key in (
+                "recreation_operation_id", "recreation_terminal_sha256",
+                "retained_snapshot_sha256", "prior_terminal_sha256", "prior_compose_sha256",
+            )
+        }
+        operation_inputs["recreation_resume"]["proof_sha256"] = hashlib.sha256(
+            canonical(recreation_resume_proof)
+        ).hexdigest()
     if provided_operation is not None:
         _validate_existing_operation_inputs(provided_operation.get("receipt", {}), operation_inputs)
     operation_context = (control.operation("development", operation_inputs)
@@ -2667,6 +2686,28 @@ def recreate(args):
     return _retained_operation(args, recreate_services=True)
 
 
+def resume_recreation(args):
+    """Resume only the exact successful recreation whose app IDs are absent."""
+    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "resume_recreation", ""))):
+        raise BuildControlError("--resume-recreation requires one exact operation UUID")
+    if (
+        getattr(args, "fresh_state", False)
+        or getattr(args, "script", None) is not None
+        or getattr(args, "recovery_authorization", None) is not None
+        or getattr(args, "include_untracked", None) is not None
+        or getattr(args, "image", None) is not None
+        or getattr(args, "toolchain_image", None) is not None
+        or getattr(args, "source_manifest", None) is not None
+        or getattr(args, "profile", "dev") != "dev"
+    ):
+        raise BuildControlError(
+            "--resume-recreation cannot combine with fresh state, a script, recovery authorization, or source/image overrides"
+        )
+    return _retained_operation(
+        args, recreate_services=False, resume_recreation_id=args.resume_recreation
+    )
+
+
 def resume(args):
     return _retained_operation(args, recreate_services=False)
 
@@ -2786,7 +2827,9 @@ def _validate_completed_recovery_receipt(control, authorization, recovery_module
     return True
 
 
-def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh_state):
+def _native_failed_stop_recovery_context(
+    control, previous, *, backend_id, fresh_state, removed_container_proof=None,
+):
     """Validate one managed native-failure stop journal for recreation.
 
     The legacy ``native-start-failure`` proof has no retained service owner.
@@ -2897,6 +2940,10 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     namespace_relative = _namespace_attestation_path(backend_id)
     namespace_raw = _control_bytes(control, namespace_relative, optional=True)
     namespace_attestation = None
+    if namespace_raw is not None and removed_container_proof is not None:
+        raise BuildControlError(
+            "Removed-container recreation cannot substitute for a fresh namespace-attestation observation"
+        )
     if namespace_raw is not None:
         namespace_attestation = _validate_namespace_attestation(
             control,
@@ -2912,9 +2959,41 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
             selected_source=previous_inputs["source_root"],
         )
     if isinstance(journal.get("container_state"), Mapping):
-        _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+        if removed_container_proof is None:
+            _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+        else:
+            if not isinstance(removed_container_proof, Mapping):
+                raise BuildControlError("Removed-container recreation proof is malformed")
+            retained_state = removed_container_proof.get("container_state")
+            journal_state = journal["container_state"]
+            if (
+                removed_container_proof.get("schema") != "fullmag.docker-removed-recreation-container.v1"
+                or not re.fullmatch(
+                    r"[0-9a-f]{32}", removed_container_proof.get("recreation_operation_id", "")
+                )
+                or removed_container_proof.get("container_id") != backend_id
+                or removed_container_proof.get("image_id") != image_id
+                or not isinstance(retained_state, Mapping)
+                or dict(retained_state) != dict(journal_state)
+                or type(journal.get("exit_code")) is not int
+                or journal.get("exit_code") != retained_state.get("exit_code")
+                or any(
+                    _SHA256.fullmatch(removed_container_proof.get(key, "")) is None
+                    for key in (
+                        "recreation_terminal_sha256", "retained_snapshot_sha256",
+                        "prior_terminal_sha256", "prior_compose_sha256",
+                    )
+                )
+            ):
+                raise BuildControlError(
+                    "Removed-container proof does not match the exact native stop journal incarnation"
+                )
     elif namespace_attestation is None:
         raise BuildControlError("Legacy native stop journal requires a fresh namespace attestation")
+    elif removed_container_proof is not None:
+        raise BuildControlError(
+            "Removed-container recreation cannot replace the legacy namespace attestation"
+        )
     previous_config_sha256 = _read_runtime_config_digest(control)
     recorded_config = journal.get("previous_config_sha256")
     if recorded_config is not None and recorded_config != previous_config_sha256:
@@ -2944,7 +3023,9 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
     }
 
 
-def _retained_recovery_context(control, previous, document, *, fresh_state, backend_id=None):
+def _retained_recovery_context(
+    control, previous, document, *, fresh_state, backend_id=None, removed_container_proof=None,
+):
     """Carry pending recovery authority, or consume a completed proof once.
 
     PID 1 still authenticates the native request and current owner before any
@@ -2966,7 +3047,7 @@ def _retained_recovery_context(control, previous, document, *, fresh_state, back
     if not carried and metadata is None:
         return _native_failed_stop_recovery_context(
             control, previous, backend_id=backend_id or previous.get("backend_container"),
-            fresh_state=fresh_state,
+            fresh_state=fresh_state, removed_container_proof=removed_container_proof,
         ) or {}
     if fresh_state:
         raise BuildControlError("Pending container recovery must retain its original session storage")
@@ -3003,7 +3084,7 @@ def _retained_recovery_context(control, previous, document, *, fresh_state, back
     if _validate_completed_recovery_receipt(control, authorization, recovery_module):
         native_restart = _native_failed_stop_recovery_context(
             control, previous, backend_id=backend_id or previous.get("backend_container"),
-            fresh_state=fresh_state,
+            fresh_state=fresh_state, removed_container_proof=removed_container_proof,
         )
         if native_restart is not None:
             return native_restart
@@ -3014,7 +3095,364 @@ def _retained_recovery_context(control, previous, document, *, fresh_state, back
             "recovery_metadata": _validate_recovery_metadata(expected)}
 
 
-def _retained_operation(args, *, recreate_services, restart_idle_service=False, stop_after_drain=False):
+def _read_canonical_control_record(control, relative, label):
+    from docker_volume_stop_unadmitted import _control_bytes, _json
+
+    raw = _control_bytes(control, relative)
+    value = _json(raw, label)
+    if not isinstance(value, Mapping) or raw != canonical(value) + b"\n":
+        raise BuildControlError(label + " is not a canonical control-volume record")
+    return raw, dict(value)
+
+
+def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None):
+    """Revalidate one completed recreation and prove its old app IDs are absent."""
+
+    from docker_volume_stop_unadmitted import _control_bytes
+
+    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "resume_recreation", ""))):
+        raise BuildControlError("Recreation resume requires one exact operation UUID")
+    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "attempt", ""))):
+        raise BuildControlError("Recreation resume requires the exact prior start attempt UUID")
+    if not isinstance(args.config_sha256, str) or _SHA256.fullmatch(args.config_sha256) is None:
+        raise BuildControlError("Recreation resume requires the exact prior configuration digest")
+
+    previous_root = "development/attempts/" + args.attempt
+    previous_raw, previous = _read_canonical_control_record(
+        control, previous_root + "/terminal.json", "prior development terminal receipt"
+    )
+    current_raw = _control_bytes(control, "development/current.json", optional=True)
+    if current_raw is None:
+        raise BuildControlError("Recreation resume has no current development receipt")
+    current = json.loads(current_raw)
+    if current_raw != canonical(current) + b"\n" or current != previous:
+        raise BuildControlError(
+            "A later or unknown development attempt exists; recreation resume will not create another start"
+        )
+    if previous.get("state") not in {"failed-confirmed", "succeeded"}:
+        raise BuildControlError("Recreation resume has no admissible prior development outcome")
+    if previous.get("compose_project") != control.project:
+        raise BuildControlError("Recreation resume belongs to another Compose project")
+    inputs = previous.get("inputs")
+    if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
+        raise BuildControlError("Recreation resume source selection differs from the prior start")
+    for source_key, identity_key in (
+        ("source_project_id", "project_id"),
+        ("source_worktree_id", "worktree_id"),
+        ("source_checkout_kind", "checkout_kind"),
+    ):
+        if inputs.get(source_key) != identity.get(identity_key):
+            raise BuildControlError("Recreation resume source identity differs from the prior start")
+    image = inputs.get("image_id")
+    if not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+        raise BuildControlError("Recreation resume has no immutable prior image identity")
+
+    document_raw, document = _read_canonical_control_record(
+        control, previous_root + "/compose.json", "prior development Compose document"
+    )
+    if (
+        hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256
+        or document.get("name") != control.project
+    ):
+        raise BuildControlError("Recreation resume prior Compose identity/configuration pin differs")
+    services = document.get("services")
+    frontend = services.get("frontend") if isinstance(services, Mapping) else None
+    frontend_ports = frontend.get("ports") if isinstance(frontend, Mapping) else None
+    if not isinstance(frontend_ports, list) or len(frontend_ports) != 1:
+        raise BuildControlError("Recreation resume prior Compose frontend port is ambiguous")
+    frontend_port = frontend_ports[0]
+    if (
+        not isinstance(frontend_port, Mapping)
+        or frontend_port.get("host_ip") != "127.0.0.1"
+        or frontend_port.get("mode") != "ingress"
+        or frontend_port.get("protocol") != "tcp"
+        or frontend_port.get("target") != 8080
+        or not isinstance(frontend_port.get("published"), str)
+        or re.fullmatch(r"[1-9][0-9]{0,4}", frontend_port["published"]) is None
+        or int(frontend_port["published"]) > 65535
+        or int(frontend_port["published"]) != args.port
+    ):
+        raise BuildControlError("Recreation resume frontend port differs from the prior start")
+    url = previous.get("url")
+    if url is not None:
+        match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})", url) if isinstance(url, str) else None
+        if match is None or int(match.group(1)) != args.port:
+            raise BuildControlError("Recreation resume prior frontend URL differs from its Compose port")
+    policy = inputs.get("gpu_access_requested")
+    if policy not in {"auto", "required", "disabled"} or getattr(args, "gpu_access", None) != policy:
+        raise BuildControlError("Recreation resume GPU access intent differs from the prior start")
+    allowlist = include_untracked_from_compose(document)
+    if normalize_include_untracked_paths(getattr(args, "include_untracked", None)) != allowlist:
+        raise BuildControlError("Recreation resume source allowlist differs from the retained Compose document")
+    operator_probe_record = _operator_probe_record_from_retained(previous, document)
+
+    active_raw = _control_bytes(control, "active", optional=True)
+    if active_raw is not None:
+        raise BuildControlError("A managed operation lease is still active; recreation resume is refused")
+
+    operation_id = args.resume_recreation
+    operation_root = "recreate-services/attempts/" + operation_id
+    operation_raw, operation_terminal = _read_canonical_control_record(
+        control, operation_root + "/terminal.json", "recreation operation terminal receipt"
+    )
+    retained_raw, retained = _read_canonical_control_record(
+        control, operation_root + "/retained-containers.json", "recreation retained-container snapshot"
+    )
+    expected_operation_inputs = {
+        "attempt": args.attempt,
+        "config_sha256": args.config_sha256,
+        **operator_probe_record,
+    }
+    if (
+        operation_terminal.get("schema") != "fullmag.docker-build-operation.v1"
+        or operation_terminal.get("phase") != "recreate-services"
+        or operation_terminal.get("state") != "succeeded"
+        or operation_terminal.get("attempt") != operation_id
+        or operation_terminal.get("compose_project") != control.project
+        or operation_terminal.get("control_volume") != control.volume
+        or operation_terminal.get("inputs") != expected_operation_inputs
+        or operation_terminal.get("previous_state_root") != previous.get("state_root")
+        or operation_terminal.get("retained_volumes") != previous.get("backend_volumes")
+        or operation_terminal.get("retained_frontend_volume") != previous.get("frontend_volume")
+        or operation_terminal.get("fresh_state") is not False
+    ):
+        raise BuildControlError("Recreation operation receipt does not prove this exact completed replacement")
+    namespace = getattr(control, "namespace", None)
+    if namespace:
+        if (operation_terminal.get("control_namespace") != namespace
+                or operation_terminal.get("namespace_registry_sha256")
+                != control.namespace_registry_sha256):
+            raise BuildControlError("Recreation operation control namespace differs")
+    elif ("control_namespace" in operation_terminal
+          or "namespace_registry_sha256" in operation_terminal):
+        raise BuildControlError("Recreation operation carries a foreign control namespace")
+
+    if not isinstance(retained, Mapping) or set(retained) != {"backend", "frontend"}:
+        raise BuildControlError("Recreation receipt has no exact retained backend/frontend snapshot")
+    snapshot = {service: retained[service] for service in ("backend", "frontend")}
+    ids = {}
+    image_config_records = json.loads(docker_text("image", "inspect", image))
+    if (
+        len(image_config_records) != 1
+        or not isinstance(image_config_records[0], Mapping)
+        or not isinstance(image_config_records[0].get("Config"), Mapping)
+    ):
+        raise BuildControlError("Retained recreation image configuration is ambiguous")
+    image_config = image_config_records[0]["Config"]
+    for service in ("backend", "frontend"):
+        observed = snapshot[service]
+        if not isinstance(observed, Mapping):
+            raise BuildControlError("Retained recreation container snapshot is malformed: " + service)
+        identifier = observed.get("Id")
+        if not isinstance(identifier, str) or re.fullmatch(r"[0-9a-f]{64}", identifier) is None:
+            raise BuildControlError("Retained recreation container ID is invalid: " + service)
+        ids[service] = identifier
+        config = observed.get("Config")
+        labels = config.get("Labels") if isinstance(config, Mapping) else None
+        if (
+            not isinstance(labels, Mapping)
+            or observed.get("Image") != image
+            or labels.get("com.docker.compose.project") != control.project
+            or labels.get("com.docker.compose.service") != service
+            or labels.get("org.fullmag.source.worktree-id") != identity.get("worktree_id")
+        ):
+            raise BuildControlError("Retained recreation container ownership/incarnation differs: " + service)
+        previous_id = previous.get(service + "_container")
+        if previous_id is not None and previous_id != identifier:
+            raise BuildControlError("Retained recreation container differs from the prior recorded incarnation: " + service)
+        _validate_retained_service(
+            document, observed, service, image_config, allow_legacy_frontend=True
+        )
+    removed_ids = operation_terminal.get("removed_containers")
+    if removed_ids != [ids["backend"], ids["frontend"]] or ids["backend"] == ids["frontend"]:
+        raise BuildControlError("Recreation terminal receipt does not name the exact retained app containers")
+
+    backend_state = snapshot["backend"].get("State")
+    if not isinstance(backend_state, Mapping) or backend_state.get("Running") is not False:
+        raise BuildControlError("Retained backend snapshot does not prove a stopped service")
+    exit_code = backend_state.get("ExitCode")
+    if type(exit_code) is not int:
+        raise BuildControlError("Retained backend stop snapshot has no exact exit code")
+    container_state = {
+        "id": ids["backend"],
+        "image": image,
+        "started_at": backend_state.get("StartedAt"),
+        "finished_at": backend_state.get("FinishedAt"),
+        "exit_code": exit_code,
+    }
+
+    # Inspect and list the exact IDs after the terminal receipt; the ordinary
+    # start guard below still rejects every remaining group container.
+    for service in ("backend", "frontend"):
+        inspected = docker_capture("inspect", ids[service], allow_failure=True, timeout=60)
+        if inspected.returncode == 0:
+            raise BuildControlError("A retained app-container ID is still inspectable in Docker")
+        detail = (inspected.stderr + inspected.stdout).decode("utf-8", "replace")
+        not_found = re.search(
+            r"(?:no such object|no such container):\s*" + re.escape(ids[service]) + r"(?:\s|$)",
+            detail,
+            re.IGNORECASE,
+        )
+        if not_found is None:
+            raise BuildControlError("Docker inspect did not authoritatively confirm removed app-container absence")
+        absence = docker_capture(
+            "ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + ids[service], timeout=60
+        )
+        if absence.returncode:
+            raise BuildControlError("Cannot verify removed app-container absence")
+        if absence.stdout.decode("utf-8", "replace").split():
+            raise BuildControlError("A retained app-container ID is still present in Docker")
+
+    proof = {
+        "schema": "fullmag.docker-removed-recreation-container.v1",
+        "recreation_operation_id": operation_id,
+        "recreation_terminal_sha256": hashlib.sha256(operation_raw).hexdigest(),
+        "retained_snapshot_sha256": hashlib.sha256(retained_raw).hexdigest(),
+        "prior_terminal_sha256": hashlib.sha256(previous_raw).hexdigest(),
+        "prior_compose_sha256": hashlib.sha256(document_raw).hexdigest(),
+        "container_id": ids["backend"],
+        "image_id": image,
+        "container_state": container_state,
+    }
+    native_recovery_context = _retained_recovery_context(
+        control,
+        previous,
+        document,
+        fresh_state=False,
+        backend_id=ids["backend"],
+        removed_container_proof=proof,
+    )
+    proof["native_recovery_context"] = native_recovery_context
+    if expected_proof is not None and proof != expected_proof:
+        raise BuildControlError("Recreation resume evidence changed before the new start admission")
+    return {
+        "previous": previous,
+        "document": document,
+        "operation_terminal": operation_terminal,
+        "snapshot": snapshot,
+        "image_id": image,
+        "operator_probe_record": operator_probe_record,
+        "proof": proof,
+        "native_recovery_context": native_recovery_context,
+    }
+
+
+def _resume_recreated_operation(args, control, selected, layout, identity):
+    records = _validate_recreation_resume_records(args, control, selected, identity)
+    previous = records["previous"]
+    document = records["document"]
+    operation_terminal = records["operation_terminal"]
+    snapshot = records["snapshot"]
+    image = records["image_id"]
+    proof = records["proof"]
+    operator_probe_record = records["operator_probe_record"]
+    backend_id = proof["container_id"]
+
+    if _retained_startup_enabled(snapshot["backend"]):
+        stop_path = "verification/stop-failed-" + backend_id + ".json"
+        stop = control.read(stop_path)
+        failure = stop.get("failure_receipt", {}).get("receipt", {})
+        drained = control.read("runtime-control/runtime-service/process-tree.json")
+        if (
+            operation_terminal.get("pre_activation_stop_receipt") != stop_path
+            or stop.get("state") != "stopped-confirmed"
+            or stop.get("container_id") != backend_id
+            or stop.get("image_id") != image
+            or failure.get("error") != "startup activation state parent is unavailable: /state/.fullmag"
+            or drained.get("state") != "drained"
+            or drained != stop.get("drained_process_receipt")
+            or "startup_activation" in drained
+        ):
+            raise BuildControlError("Retained startup activation is not an exact pre-activation failure")
+    elif "pre_activation_stop_receipt" in operation_terminal:
+        raise BuildControlError("Recreation receipt has an unexpected pre-activation failure pin")
+
+    state = storage.validate_path(
+        Path(previous["state_root"]), layout["runtime_root"], "retained Windows sessions"
+    )
+    certificate_path = _certificate_path(state)
+    certificate = _retained_certificate(state, document)
+    if certificate.get("image_id") != image or not certificate.get("restart_verified"):
+        raise BuildControlError("Retained storage certificate does not authorize recreation resume")
+    owner_path = state / _session_host().OWNER_NAME
+    recovery_context = dict(records["native_recovery_context"])
+
+    from docker_volume_activation_reconcile import reconcile_unknown_activation
+    unresolved = control.read("activation/unresolved.json", optional=True)
+    recorded_reconciliation = operation_terminal.get("activation_reconciliation")
+    reconciliation = None
+    if unresolved is not None:
+        if not isinstance(recorded_reconciliation, Mapping):
+            raise BuildControlError("Completed recreation did not record its activation reconciliation proof")
+        reconciliation = reconcile_unknown_activation(
+            control,
+            previous=previous,
+            document=document,
+            selected_source=str(selected),
+            config_sha256=args.config_sha256,
+            image_id=image,
+            backend_id=backend_id,
+            native_restart_metadata=recovery_context.get("native_restart_metadata"),
+            fresh_state=False,
+        )
+        if reconciliation is None:
+            raise BuildControlError("Recorded activation reconciliation is no longer present")
+        reconciliation_summary = {
+            key: reconciliation[key]
+            for key in (
+                "attempt", "activation_receipt_sha256", "native_stop_journal_sha256",
+                "namespace_attestation_path", "namespace_attestation_sha256",
+            )
+            if key in reconciliation
+        }
+        if reconciliation_summary != dict(recorded_reconciliation):
+            raise BuildControlError("Activation reconciliation differs from the completed recreation receipt")
+    elif recorded_reconciliation is not None:
+        raise BuildControlError("Completed recreation records an activation reconciliation without its quarantine")
+
+    accepted_reattach_context = {}
+    accepted_record = operation_terminal.get("accepted_reattach")
+    if reconciliation is not None:
+        from docker_volume_accepted_reattach import produce_accepted_reattach
+        accepted_store_root = storage.validate_path(
+            state / "runs" / "docker-all" / "session-store",
+            state,
+            "retained accepted session store",
+        )
+        produced = produce_accepted_reattach(control, store_root=accepted_store_root)
+        accepted_environment = _validate_accepted_reattach_environment(produced.get("environment"))
+        accepted_pins = _validate_accepted_reattach_metadata(produced.get("pins"), accepted_environment)
+        if accepted_record != accepted_pins:
+            raise BuildControlError("Accepted-run reattach differs from the completed recreation receipt")
+        accepted_reattach_context = {
+            "accepted_reattach_environment": accepted_environment,
+            "accepted_reattach_metadata": accepted_pins,
+        }
+    elif accepted_record is not None:
+        raise BuildControlError("Completed recreation records an unexpected accepted-run reattach")
+
+    reuse = {
+        "state": state,
+        "host_certificate": certificate_path,
+        "owner_marker": owner_path,
+        "receipt": {"image_id": image},
+        "operator_probe_environment_record": operator_probe_record,
+    }
+    recovery_context.update(accepted_reattach_context)
+    args.include_untracked = include_untracked_from_compose(document)
+    args.gpu_access = previous["inputs"]["gpu_access_requested"]
+    return start(
+        args,
+        reuse_state=reuse,
+        recreation_resume_proof=proof,
+        **recovery_context,
+    )
+
+
+def _retained_operation(
+    args, *, recreate_services, restart_idle_service=False, stop_after_drain=False,
+    resume_recreation_id=None,
+):
     """Resume observation/admission of one exact failed start; never restart the backend."""
     from docker_dev import _select_source, _compose_identity
     require_host()
@@ -3028,7 +3466,10 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False, 
         raise BuildControlError("Resume requires an exact attempt UUID")
     previous_root = "development/attempts/" + args.attempt
     previous = control.read(previous_root + "/terminal.json")
-    allowed = {"failed-confirmed", "succeeded"} if recreate_services or restart_idle_service or getattr(args, "restart_backend", False) else {"failed-confirmed"}
+    allowed = {"failed-confirmed", "succeeded"} if (
+        recreate_services or resume_recreation_id is not None
+        or restart_idle_service or getattr(args, "restart_backend", False)
+    ) else {"failed-confirmed"}
     if previous.get("state") not in allowed or previous.get("compose_project") != control.project:
         raise BuildControlError("Retained start has no admissible terminal outcome")
     document = control.read(previous_root + "/compose.json")
@@ -3038,6 +3479,15 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False, 
     image = previous["inputs"]["image_id"]
     if previous["inputs"]["source_root"] != str(selected):
         raise BuildControlError("Resume source selection differs")
+    if resume_recreation_id is not None:
+        if recreate_services or restart_idle_service or stop_after_drain:
+            raise BuildControlError("Recreation resume cannot combine with another retained lifecycle operation")
+        policy = previous["inputs"].get("gpu_access_requested")
+        if policy not in {"auto", "required", "disabled"}:
+            raise BuildControlError("Recreation resume requires the retained GPU access intent")
+        args.gpu_access = policy
+        args.include_untracked = include_untracked_from_compose(document)
+        return _resume_recreated_operation(args, control, selected, layout, identity)
     if recreate_services:
         requested_allowlist = getattr(args, "include_untracked", None)
         args.include_untracked = (

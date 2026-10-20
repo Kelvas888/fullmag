@@ -46,7 +46,10 @@ import { useCrossSectionResource } from "@/kernel/resources/crossSectionResource
 import { useModeCompositionFieldLayerResources } from "@/kernel/resources/modeCompositionFieldLayerResources";
 import { useModeCompositionControllerResource } from "@/kernel/resources/modeCompositionResources";
 import { useModeFieldOverlayIntentResource } from "@/kernel/resources/modeFieldOverlayResources";
-import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
+import {
+  resolveSessionDiscretization,
+  resolveSessionTopologyDiscretization,
+} from "@/kernel/resources/sessionDiscretization";
 import {
   useFdmRegionMembershipBinaryResource,
   useFdmMultilayerLayerActiveMasksResource,
@@ -3061,8 +3064,14 @@ export function useViewport3DSceneModel({
   const sessionDiscretization = useSessionStatusSelector((status) =>
     resolveSessionDiscretization(status.data),
   );
-  const fdmLaneActive = sessionDiscretization === "fdm";
-  const femLaneActive = sessionDiscretization === "fem";
+  // Published topology may select a binary preview adapter while runtime lane
+  // resolution is pending. Solver-facing state continues to use the strict
+  // sessionDiscretization value above.
+  const viewportDataDiscretization = useSessionStatusSelector((status) =>
+    resolveSessionTopologyDiscretization(status.data),
+  );
+  const fdmLaneActive = viewportDataDiscretization === "fdm";
+  const femLaneActive = viewportDataDiscretization === "fem";
   const sessionIdentity = useSessionResourceIdentity();
   const pinnedObservationSource = useObservationSourceWorkspaceSelector(
     (state) => state.pinned,
@@ -3466,7 +3475,7 @@ export function useViewport3DSceneModel({
     sharedDomainManifest.refetch();
   }, [femLaneActive, scene.data, sharedDomainManifest]);
   const domainRenderLane = resolveViewport3DDomainRenderLane({
-    discretization: sessionDiscretization,
+    discretization: viewportDataDiscretization,
     femDomain,
     topologyFreshness,
   });
@@ -4084,7 +4093,7 @@ export function useViewport3DSceneModel({
   const nativeLayerFieldVectors = useViewport3DQuantityFieldVectors(
     nativeLayerFieldRequests,
     liveViewportResourcesEnabled &&
-      Boolean(fdmLaneActive && nativeLayerFieldRequests.size > 0),
+      sessionDiscretization === "fdm" && nativeLayerFieldRequests.size > 0,
     { selectedTargetId: selectedVisualizationTargetId },
   );
   const fdmTargetSettingsById = useMemo(() => {
@@ -4434,14 +4443,15 @@ export function useViewport3DSceneModel({
     fdmMultilayerAirboxFieldRequest,
     liveViewportResourcesEnabled &&
       Boolean(
-        fdmLaneActive &&
+        sessionDiscretization === "fdm" &&
         fdmMultilayerAirboxDomain &&
         shouldRequestFdmMultilayerAirboxField(airboxSettings, airboxSettings.activeQuantityId),
       ),
   );
   const magneticPartFieldVectors = useViewport3DPartFieldVectors(
     magneticPartFieldQueries,
-    liveViewportResourcesEnabled && magneticPartFieldQueries.size > 0,
+    liveViewportResourcesEnabled &&
+      sessionDiscretization === "fem" && magneticPartFieldQueries.size > 0,
     { selectedTargetId: selectedVisualizationTargetId, tracker },
   );
   const targetQuantityFieldVectors = useViewport3DQuantityFieldVectors(
@@ -4453,6 +4463,7 @@ export function useViewport3DSceneModel({
     airboxSettings.activeQuantityId,
     airboxFieldVectorParts,
     liveViewportResourcesEnabled &&
+      sessionDiscretization === "fem" &&
       airboxFieldVectorEnabled &&
       airboxFieldVectorParts.length > 0,
     airboxFieldVectorRequests,
@@ -4830,6 +4841,7 @@ export function useViewport3DSceneModel({
   );
   const fieldVectorEnabled =
     liveViewportResourcesEnabled &&
+    (sessionDiscretization !== null || Boolean(analysisOverlay) || pinnedObservationActive) &&
     primaryFieldVectorEnabled &&
     hysteresisReplayMeshCompatibility.status !== "mismatch";
   const scalarRangeModeFlags = useMemo(

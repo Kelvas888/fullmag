@@ -757,6 +757,8 @@ export function installSimulationPreparationTestDom({
     HTMLSelectElement: TestHTMLSelectElement,
     HTMLIFrameElement: TestHtmlIFrameElement,
     location: { search: "" },
+    innerWidth: 1280,
+    innerHeight: 900,
     MutationObserver: TestMutationObserver,
     Node: TestNode,
     ResizeObserver: TestResizeObserver,

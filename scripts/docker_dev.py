@@ -2548,6 +2548,11 @@ def _parser() -> argparse.ArgumentParser:
     recreate_volume.add_argument("--source-root", type=Path, required=True)
     recreate_volume.add_argument("--port", type=int, required=True)
     recreate_volume.add_argument(
+        "--resume-recreation",
+        metavar="OPERATION_UUID",
+        help="resume only the exact succeeded recreate-services operation after its app containers were removed",
+    )
+    recreate_volume.add_argument(
         "--include-untracked",
         action="append",
         default=None,
@@ -2697,7 +2702,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             from docker_volume_stop_unadmitted import stop
             stop(args)
         elif args.action == "recreate-volume":
-            if args.recovery_authorization is not None:
+            if args.resume_recreation is not None:
+                from docker_volume_dev import resume_recreation
+                resume_recreation(args)
+            elif args.recovery_authorization is not None:
                 if args.fresh_state:
                     raise _fail(
                         "container recovery cannot combine --recovery-authorization with --fresh-state"

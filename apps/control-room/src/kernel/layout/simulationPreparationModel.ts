@@ -11,6 +11,9 @@ const MAX_FAILURE_PREDICATE_LENGTH = 160;
 const FAILURE_PREDICATE_MARKER = "failed_predicates=[";
 const BOOTSTRAPPING_STATUSES = new Set(["bootstrapping"]);
 const MATERIALIZING_STATUSES = new Set(["materializing_script"]);
+const ACTIVATING_LIFECYCLE = "activating";
+const WAITING_FOR_COMPUTE_STATUS = "waiting_for_compute";
+const UNMATERIALIZED_FEM_GENERATION = "fem:unmaterialized";
 
 const FEM_ORDER_NOT_P1 = {
   action: "Use first-order (P1) elements for the mixed-prism lane.",
@@ -356,14 +359,35 @@ export interface SimulationPreparationViewModel {
   readonly totalElapsedLabel: string | null;
 }
 
+interface PendingActivationNotice {
+  readonly detail: string;
+  readonly progressLabel: string;
+  readonly title: string;
+}
+
 export function resolveSimulationPreparationViewModel(
   preparation: ResourceResult<SimulationPreparationResource | null>,
   sessionStatus: ResourceResult<LiveStatusResource>,
   nowUnixMs: number | null,
 ): SimulationPreparationViewModel {
-  const snapshot = preparation.data;
+  const pendingActivation = resolvePendingActivationNotice(sessionStatus);
+  const hasPublishedPreparation =
+    typeof sessionStatus.data?.resources.simulation_preparation_revision ===
+      "number" &&
+    sessionStatus.data.resources.simulation_preparation_revision > 0;
+  const isUnpublishedActivation =
+    pendingActivation !== null && !hasPublishedPreparation;
+  const effectivePreparation =
+    isUnpublishedActivation && preparation.data
+      ? { ...preparation, data: null }
+      : preparation;
+  const snapshot = effectivePreparation.data;
   if (!snapshot) {
-    return resolveMissingPreparationModel(preparation, sessionStatus);
+    return resolveMissingPreparationModel(
+      effectivePreparation,
+      sessionStatus,
+      pendingActivation,
+    );
   }
 
   const stages = snapshot.stages.map((stage) =>
@@ -541,6 +565,8 @@ export function resolvePreparationFailureCauses(
 function resolveMissingPreparationModel(
   preparation: ResourceResult<SimulationPreparationResource | null>,
   sessionStatus: ResourceResult<LiveStatusResource>,
+  pendingActivation: PendingActivationNotice | null =
+    resolvePendingActivationNotice(sessionStatus),
 ): SimulationPreparationViewModel {
   const solverState = sessionStatus.data?.solver.state?.toLowerCase() ?? "";
   const isMaterializing = MATERIALIZING_STATUSES.has(solverState);
@@ -565,19 +591,24 @@ function resolveMissingPreparationModel(
       sessionStatus.status === "loading" ||
       isBootstrapping ||
       isMaterializing ||
+      pendingActivation !== null ||
       hasPublishedPreparationRevision ||
       ((preparation.status === "idle" || preparation.status === "loading") &&
         sessionStatus.data === null) ||
       (sessionStatus.status === "error" &&
         isTransientStartupError(sessionStatus.error)));
-  const title = isMaterializing ? "Compiling simulation" : "Preparing simulation";
-  const detail = isMaterializing
-    ? "Compiling the model and preparing runtime data."
-    : isBootstrapping
-      ? "Starting the runtime workspace."
-      : sessionStatus.status === "error"
-        ? "Waiting for the runtime workspace to become available."
-        : "Connecting to the local simulation backend.";
+  const title =
+    pendingActivation?.title ??
+    (isMaterializing ? "Compiling simulation" : "Preparing simulation");
+  const detail =
+    pendingActivation?.detail ??
+    (isMaterializing
+      ? "Compiling the model and preparing runtime data."
+      : isBootstrapping
+        ? "Starting the runtime workspace."
+        : sessionStatus.status === "error"
+          ? "Waiting for the runtime workspace to become available."
+          : "Connecting to the local simulation backend.");
 
   return {
     activeStage: null,
@@ -591,7 +622,7 @@ function resolveMissingPreparationModel(
     logEntries: [],
     preparation: null,
     progress: { kind: "indeterminate" },
-    progressLabel: null,
+    progressLabel: pendingActivation?.progressLabel ?? null,
     reconnectingMessage: null,
     reconnectingTitle: null,
     requestedExecutionLabel: null,
@@ -599,6 +630,49 @@ function resolveMissingPreparationModel(
     stages: [],
     title,
     totalElapsedLabel: null,
+  };
+}
+
+function resolvePendingActivationNotice(
+  sessionStatus: ResourceResult<LiveStatusResource>,
+): PendingActivationNotice | null {
+  const status = sessionStatus.data;
+  if (
+    sessionStatus.status !== "ready" ||
+    !status ||
+    status.lifecycle.session_resource !== "active" ||
+    !status.session.session_id ||
+    status.resources.simulation_preparation_revision !== 0
+  ) {
+    return null;
+  }
+
+  if (
+    status.lifecycle.solver.toLowerCase() === ACTIVATING_LIFECYCLE &&
+    status.run == null
+  ) {
+    return {
+      detail:
+        "The backend is activating and materializing the model. Preparation details are pending.",
+      progressLabel: "Activating model",
+      title: "Activating simulation",
+    };
+  }
+
+  const isUnmaterializedFem =
+    status.solver.state.toLowerCase() === WAITING_FOR_COMPUTE_STATUS &&
+    status.domain.discretization.toLowerCase() === "fem" &&
+    status.domain.generation_id === UNMATERIALIZED_FEM_GENERATION &&
+    status.domain.cell_count === 0 &&
+    status.resources.domain_generation_id === UNMATERIALIZED_FEM_GENERATION &&
+    status.resources.mesh_revision === 0;
+  if (!isUnmaterializedFem) return null;
+
+  return {
+    detail:
+      "The FEM mesh has not been published yet. Preparation details are pending.",
+    progressLabel: "Awaiting FEM mesh publication",
+    title: "FEM mesh not published",
   };
 }
 
