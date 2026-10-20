@@ -538,7 +538,7 @@ describe("FDM Airbox mesh demand", () => {
       'field=${fdmAirboxFieldVector ? "ready" : "pending"}',
     );
     expect(keyBlock).toContain(
-      "`fill=${visualProfile.voxelFillRatio}|airbox=true|scale=${fdmAirboxVectorScale}`",
+      "`fill=${visualProfile.voxelFillRatio}|airbox=true|lengthScale=${fdmSingleGridAirboxSettings?.vectorLengthScale ?? 1}|scale=${fdmAirboxVectorScale}`",
     );
   });
 
@@ -1553,6 +1553,7 @@ describe("useViewport3DSceneModel", () => {
         domainGenerationId: "gen-1",
         grid: [1, 1, 1],
         indexing: "full_domain",
+        meshTopologyRevision: "top-1",
         meshTopologyHash: "top-1",
         nComp: 3,
         pointCount: 1,
@@ -1566,6 +1567,7 @@ describe("useViewport3DSceneModel", () => {
       resourceKey:
         currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
+        carrierRevision: "top-1",
         component: "full",
         domainGenerationId: "gen-1",
         encoding: "FMVP;version=2",
@@ -1745,6 +1747,7 @@ describe("useViewport3DSceneModel", () => {
         domainGenerationId: "gen-1",
         grid: [1, 1, 1],
         indexing: "full_domain",
+        meshTopologyRevision: "top-1",
         meshTopologyHash: "top-1",
         nComp: 3,
         pointCount: 1,
@@ -1758,6 +1761,7 @@ describe("useViewport3DSceneModel", () => {
       resourceKey:
         currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
+        carrierRevision: "top-1",
         component: "full",
         domainGenerationId: "gen-1",
         encoding: "FMVP;version=2",
@@ -2007,6 +2011,7 @@ describe("useViewport3DSceneModel", () => {
         domainGenerationId: "gen-1",
         grid: [1, 1, 1],
         indexing: "full_domain",
+        meshTopologyRevision: "top-1",
         meshTopologyHash: "top-1",
         nComp: 3,
         pointCount: 1,
@@ -2020,6 +2025,7 @@ describe("useViewport3DSceneModel", () => {
       resourceKey:
         currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
+        carrierRevision: "top-1",
         component: "full",
         domainGenerationId: "gen-1",
         encoding: "FMVP;version=2",
@@ -5477,9 +5483,14 @@ describe("useViewport3DSceneModel", () => {
     expect(source).not.toContain(
       'domainMeta.data?.discretization === "fem"',
     );
-    expect(source).toContain(
-      "const availableQuantityIdsForPlanning = fdmLaneActive",
+    const planningQuantities = source.slice(
+      source.indexOf("const availableQuantityIdsForPlanning = useMemo("),
+      source.indexOf("const fdmRegionMembership ="),
     );
+    expect(planningQuantities).toContain("mergeViewport3DQuantityCapabilityIds(");
+    expect(planningQuantities).toContain("availableFieldQuantityIds,");
+    expect(planningQuantities).toContain("quantityCatalog.data,");
+    expect(planningQuantities).toContain("?? EMPTY_VIEWPORT_3D_FIELD_QUANTITY_IDS");
     expect(source).toContain(
       "availableQuantityIds: availableQuantityIdsForPlanning",
     );
@@ -5541,6 +5552,18 @@ describe("useViewport3DSceneModel", () => {
       target: registryCamera.target,
       up: registryCamera.up,
     });
+    expect(
+      resolveViewport3DSceneCameraView({
+        cameraRegistryCamera: { ...registryCamera, fov_degrees: 35 },
+        commandState,
+      }).cameraFov,
+    ).toBe(35);
+    expect(
+      resolveViewport3DSceneCameraView({
+        cameraRegistryCamera: { ...registryCamera, fov_degrees: 180 },
+        commandState,
+      }).cameraFov,
+    ).toBe(42);
     expect(
       resolveViewport3DSceneCameraView({
         cameraRegistryCamera: {

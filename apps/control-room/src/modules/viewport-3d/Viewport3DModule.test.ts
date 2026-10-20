@@ -1998,7 +1998,9 @@ describe("Viewport3DModule scene wiring", () => {
       "utf8",
     );
     const canvasStart = source.indexOf("<Viewport3DCanvas");
-    const canvasBlock = source.slice(canvasStart, source.indexOf(">", canvasStart));
+    const canvasBlock = source.slice(
+      canvasStart, source.indexOf("<Viewport3DRendererProfile", canvasStart),
+    );
 
     expect(canvasBlock).toContain("dpr={canvasDpr}");
     expect(source).not.toContain('import { AdaptiveDpr } from "@react-three/drei";');
@@ -2012,7 +2014,9 @@ describe("Viewport3DModule scene wiring", () => {
       "utf8",
     );
     const canvasStart = source.indexOf("<Viewport3DCanvas");
-    const canvasBlock = source.slice(canvasStart, source.indexOf(">", canvasStart));
+    const canvasBlock = source.slice(
+      canvasStart, source.indexOf("<Viewport3DRendererProfile", canvasStart),
+    );
 
     expect(source).toContain("const canvasCamera = useMemo");
     expect(source).toContain('import { Viewport3DCanvas } from "./Viewport3DCanvas";');

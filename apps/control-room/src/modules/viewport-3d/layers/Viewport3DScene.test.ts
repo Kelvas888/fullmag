@@ -404,6 +404,73 @@ describe("Viewport3DScene scale helpers", () => {
     expect(fitted.target).toEqual([0, 0, 0]);
   });
 
+  it("uses FOV and viewport aspect for only the untouched default camera fit", () => {
+    const bounds = {
+      center: [0, 0, 0] as [number, number, number],
+      radius: 2.58e-7,
+      size: [5e-7, 1.25e-7, 3e-9] as [number, number, number],
+    };
+    const cameraState = {
+      position: [2e-6, 1.4e-6, 2e-6] as [number, number, number],
+      target: [0, 0, 0] as [number, number, number],
+      up: [0, 0, 1] as [number, number, number],
+    };
+    const defaultFit = resolveViewport3DEffectiveCameraState({
+      aspect: 1,
+      bounds,
+      cameraState,
+      fovDegrees: 42,
+    });
+    const narrowFit = resolveViewport3DEffectiveCameraState({
+      aspect: 0.5,
+      bounds,
+      cameraState,
+      fovDegrees: 42,
+    });
+    const narrowFovFit = resolveViewport3DEffectiveCameraState({
+      aspect: 1,
+      bounds,
+      cameraState,
+      fovDegrees: 35,
+    });
+    const wideFovFit = resolveViewport3DEffectiveCameraState({
+      aspect: 1,
+      bounds,
+      cameraState,
+      fovDegrees: 70,
+    });
+
+    const distanceFromTarget = (pose: typeof defaultFit) =>
+      new Vector3(...pose.position).distanceTo(new Vector3(...pose.target));
+
+    expect(distanceFromTarget(narrowFit)).toBeGreaterThan(
+      distanceFromTarget(defaultFit),
+    );
+    expect(distanceFromTarget(narrowFovFit)).toBeGreaterThan(
+      distanceFromTarget(wideFovFit),
+    );
+  });
+
+  it("updates perspective FOV without applying a camera pose", () => {
+    const source = readFileSync(
+      new URL("./Viewport3DScene.tsx", import.meta.url),
+      "utf8",
+    );
+    const fovEffectStart = source.indexOf(
+      'if (cameraProjection !== "perspective") return;',
+    );
+    const fovEffect = source.slice(
+      fovEffectStart,
+      source.indexOf("// Bounds/resource changes", fovEffectStart),
+    );
+
+    expect(fovEffect).toContain("activeCamera.fov = resolvedCameraFov");
+    expect(fovEffect).toContain("activeCamera.updateProjectionMatrix()");
+    expect(fovEffect).toContain('tracker.recordDirtyFrame("camera-fov")');
+    expect(fovEffect).not.toContain("activeCamera.position");
+    expect(fovEffect).not.toContain("effectiveCameraState");
+  });
+
   it("preserves an explicit user camera instead of refitting it", () => {
     const cameraState = {
       position: [7e-7, 4e-7, 9e-7] as [number, number, number],
@@ -516,6 +583,42 @@ describe("Viewport3DScene scale helpers", () => {
     );
 
     expect(clip.far).toBeGreaterThan(1.2e-3);
+  });
+
+  it("keeps visible geometry inside the depth range when FOV changes without a fit", () => {
+    const bounds = {
+      center: [0, 0, 0] as [number, number, number],
+      radius: 5e-8,
+      size: [1e-7, 1e-7, 1e-8] as [number, number, number],
+    };
+    const pose = {
+      position: [0, 0, 2.2e-7] as [number, number, number],
+      target: [0, 0, 0] as [number, number, number],
+      up: [0, 1, 0] as [number, number, number],
+    };
+    for (const fovDegrees of [0.1, 42, 179]) {
+      const clip = resolveViewport3DProjectionCameraClip(bounds, pose, {
+        aspect: 0.6,
+        fovDegrees,
+      });
+      const camera = new PerspectiveCamera(fovDegrees, 0.6, clip.near, clip.far);
+      applyViewport3DPerspectiveCameraPose(camera, pose, clip.near, clip.far, fovDegrees);
+      for (const z of [-5e-9, 0, 5e-9]) {
+        const projected = new Vector3(0, 0, z).project(camera);
+        expect(projected.z).toBeGreaterThan(-1);
+        expect(projected.z).toBeLessThan(1);
+      }
+    }
+  });
+
+  it("caps near by geometry depth even when the camera target lies beyond the model", () => {
+    const clip = resolveViewport3DProjectionCameraClip(
+      { center: [0, 0, 0], radius: 5e-8, size: [1e-7, 1e-7, 1e-8] },
+      { position: [0, 0, 2e-7], target: [0, 0, -1], up: [0, 1, 0] },
+      { aspect: 0.6, fovDegrees: 0.1 },
+    );
+    expect(clip.near).toBeGreaterThan(0);
+    expect(clip.near).toBeLessThan(1.5e-7);
   });
 
   it("does not reapply an unchanged projection clip during demand rendering", () => {
@@ -744,7 +847,11 @@ describe("Viewport3DScene scale helpers", () => {
     expect(source).toContain(
       "viewport3DOrientationHudEnabledFromBrowserConfig",
     );
-    expect(source).toContain(
+    expect(source).toContain("<PostProcessingLayer");
+    const postProcessingSource = readFileSync(
+      new URL("./PostProcessingLayer.tsx", import.meta.url), "utf8",
+    );
+    expect(postProcessingSource).toContain(
       "viewport3DPostProcessingEnabledFromBrowserConfig",
     );
     expect(source).toContain(
@@ -761,8 +868,9 @@ describe("Viewport3DScene scale helpers", () => {
       "{viewport3DBoundsLayersEnabledFromBrowserConfig() ? (",
     );
     expect(source).toContain(
-      "{viewport3DDimensionFrameEnabledFromBrowserConfig() ? (",
+      "{viewport3DDimensionFrameEnabledFromBrowserConfig() &&",
     );
+    expect(source).toContain("hasMeaningfulDimensionFrameBounds(bounds) ? (");
     expect(source).toContain(
       "labelsVisible={",
     );
@@ -795,7 +903,9 @@ describe("Viewport3DScene scale helpers", () => {
     expect(source).toContain(
       "viewport3DMeshSizeHighlightLayerEnabledFromBrowserConfig()",
     );
-    expect(source).toContain("{viewport3DPostProcessingEnabledFromBrowserConfig() ? (");
+    expect(postProcessingSource).toContain(
+      "const enabled = available && !quantitativeDataVisible;",
+    );
   });
 
   it("queues a follow-up projection frame for demand-rendered camera swaps", () => {

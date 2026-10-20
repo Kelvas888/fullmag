@@ -302,12 +302,12 @@ async function ensureSettingsOpen(page, dialog, timeout) {
 }
 
 async function readSettings(page, dialog, timeout) {
-  const background = await readChoice(page, "PNG background", timeout);
-  const annotations = await dialog
-    .getByRole("switch", { name: "Include annotations", exact: true })
-    .isChecked({ timeout });
-  const quality = await readChoice(page, "Render quality", timeout);
-  const frame = await readChoice(page, "Reference frame", timeout);
+  const [background, annotations, quality, frame] = await Promise.all([
+    readChoice(page, "PNG background", timeout),
+    dialog.getByRole("switch", { name: "Include annotations", exact: true }).isChecked({ timeout }),
+    readChoice(page, "Render quality", timeout),
+    readChoice(page, "Reference frame", timeout),
+  ]);
   if (!Object.values(BACKGROUND_OPTIONS).includes(background)) {
     throw new Error("PNG background control exposed an unknown option: " + background);
   }

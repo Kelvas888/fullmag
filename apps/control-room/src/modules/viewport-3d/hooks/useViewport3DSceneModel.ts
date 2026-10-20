@@ -314,6 +314,7 @@ import {
   type Viewport3DBounds,
   viewport3DFieldRenderOptionsNeedFieldData,
 } from "../viewport3dRenderModel";
+import { resolveViewport3DCameraFovDegrees } from "../viewport3dCameraFov";
 import { useMaterializedDatasetResource } from "@/kernel/resources/solutionSetResources";
 import { useSavedFieldViewportResources } from "@/kernel/resources/savedFieldViewportResources";
 import { buildSavedFieldViewportSceneModel } from "../savedFieldViewportAdapter";
@@ -2934,6 +2935,7 @@ export function resolveViewport3DSceneCameraView({
 }): {
   cameraOrthographicScale: number | null;
   cameraProjection: Viewport3DCameraProjection;
+  cameraFov: number;
   cameraResource: VisualizationStateResource["camera"];
   cameraState: Viewport3DCameraState;
 } {
@@ -2944,6 +2946,9 @@ export function resolveViewport3DSceneCameraView({
     cameraProjection: resolveViewport3DCameraProjection({
       camera: cameraRegistryCamera,
     }),
+    cameraFov: resolveViewport3DCameraFovDegrees(
+      cameraRegistryCamera?.fov_degrees,
+    ),
     cameraResource: cameraRegistryCamera,
     cameraState: resolveViewport3DCameraState({ camera: cameraRegistryCamera }),
   };
@@ -7190,6 +7195,9 @@ export function useViewport3DSceneModel({
     bounds,
     cameraOrthographicScale: effectiveCameraOrthographicScale,
     cameraProjection: effectiveCameraProjection,
+    cameraFov: resolveViewport3DCameraFovDegrees(
+      cameraResource?.fov_degrees,
+    ),
     cameraResource,
     cameraState: effectiveCameraState,
     clip: renderingState?.clip ?? null,

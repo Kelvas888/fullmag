@@ -51,6 +51,7 @@ export const VIEWPORT_3D_DIRTY_REASONS = [
   "camera-control",
   "camera-control-target",
   "camera-fit",
+  "camera-fov",
   "camera-init",
   "camera-orbit-debug",
   "camera-orbit-debug-commit",

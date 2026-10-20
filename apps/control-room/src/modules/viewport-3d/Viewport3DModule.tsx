@@ -193,6 +193,7 @@ import {
   type Viewport3DPrimitiveObject,
 } from "./viewport3dPrimitiveModel";
 import { toCameraTuple } from "./viewport3dCameraModel";
+import { DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES } from "./viewport3dCameraFov";
 import {
   viewportSelectionForMeshPart,
   viewportSelectionForDomain,
@@ -1429,7 +1430,6 @@ interface Viewport3DFrameProps
   > {
   artifactInspectionDefinitions: ReadonlyArray<{ id?: string; source_object_id?: string }>;
   cameraDialogOpen: boolean;
-  cameraDialogState: Viewport3DSceneProps["cameraState"];
   cameraResource: VisualizationStateResource["camera"] | null;
   clientReady: boolean;
   colors: Viewport3DSceneProps["colors"] | null;
@@ -1858,7 +1858,6 @@ export default function Viewport3DModule({
       colors={colors}
       colorsUnavailable={colorsUnavailable}
       cameraDialogOpen={commandState.widgets.cameraDialogOpen}
-      cameraDialogState={commandState.camera}
       dimensionFrameAnnotation={commandState.widgets.dimensionFrameAnnotation}
       dimensionFrameDensity={commandState.widgets.dimensionFrameDensity}
       dimensionFrameMode={commandState.widgets.dimensionFrameMode}
@@ -2068,7 +2067,6 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   captureRevision,
   canvasContextProfileId,
   cameraDialogOpen,
-  cameraDialogState,
   cameraResource,
   clientReady,
   colors,
@@ -2244,7 +2242,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   const canvasCamera = useMemo(
     () => ({
       far: initialCameraFit.far,
-      fov: 42,
+      fov: DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
       near: initialCameraFit.near,
       position: DEFAULT_VIEWPORT_3D_CAMERA_STATE.position,
       up: VIEWPORT_3D_WORLD_UP,
@@ -3098,7 +3096,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         cameraOrthographicScale={sceneProps.cameraOrthographicScale}
         cameraProjection={sceneProps.cameraProjection}
         cameraResource={cameraResource}
-        cameraState={cameraDialogState}
+        cameraState={sceneProps.cameraState}
         onCameraPatch={onCameraPatch}
         onOpenChange={(open) => viewport3dStore.setCameraDialogOpen(open)}
         open={cameraDialogOpen}

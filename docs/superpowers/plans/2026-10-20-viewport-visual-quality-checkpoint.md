@@ -22,7 +22,7 @@
 
 ## Bramy
 
-- Obowiązuje zakaz budowania testów jednostkowych; nie uruchamiano ich.
+- Użytkownik udzielił wyjątku wyłącznie dla regresji tej refaktoryzacji viewportu w grupie Docker worktree. Najnowsze wyniki dla 26 sprawdzonych plików: 594/594 passed. Pozostałe testy pozostają objęte zakazem.
 - Wszystkie buildy i ciężkie kontrole wymagają właściwej grupy Compose oraz danych technicznych w named volumes.
 - R0 runtime, R1–R8: w toku / NOT VERIFIED. Brak podstaw do deklaracji ukończenia.
 
@@ -89,8 +89,138 @@ Poniższe elementy są zaimplementowane w źródłach, ale nie mają jeszcze odb
 - Harness odczytuje rzeczywiste piksele canvasu z PNG Playwright, zamyka overlay ustawień na czas zdjęcia, przywraca UI w finally i porównuje hashe własnych źródeł przed/po. Wcześniejszy gl.readPixels po oddaniu bufora nie był wiarygodnym pomiarem; nie jest używany jako dowód.
 - Ostatni ESLint viewportu i runner/helper QA: exit 0. Powtórny produkcyjny TypeScript: te same pięć błędów bazowych, bez błędów w zmienionym viewporcie; całe sprawdzenie nadal exit 1.
 - Pierwsza próba QA zatrzymana przed przeglądarką: wrapper ignorował succeeded resume, wymagając succeeded pierwotnego development/current. Poprawka konsumenta korzysta z istniejących `_linked_runtime_terminals` i `_validate_running_group`, waliduje current/terminal, config CAS, źródła, obraz i aktywne kontenery; nie zmienia historycznych receiptów. Provenance rozdziela development attempt i runtime phase/attempt/hash. Po uzyskaniu lease ponownie sprawdzany jest fence pierwotnej próby.
-- Managed browser QA `faa969d54b3f482f885d01b5b8f97626`: **w toku**, rozpoczęto pobranie oficjalnego przypiętego obrazu Playwright. Wyniku testu nie ma jeszcze w tym checkpointcie. Testy regresyjne wrappera są przygotowywane; nie są wykonywane ani kompilowane.
+- Poprawki podstawowego QA zapisano commitem `4a92b5c0619f34ed3ec1df1019cb7982bc406e2e`. Dalsze zmiany opisane poniżej pozostają kandydatem źródłowym.
+- Managed browser QA `faa969d54b3f482f885d01b5b8f97626`: obraz Playwright pobrany, przeglądarka uruchomiona; klient Compose przekroczył limit 300 s, a przeglądarka zakończyła się po około 337 s kodem 1. Output utracony, brak pozytywnego dowodu QA. Zachowano nieznany receipt. Wąska, przypięta reconciliation potwierdziła stopped/exit 1, źródło, obraz, komendę, konfigurację i tożsamość helperów; zapisała evidence przed usunięciem wyłącznie zatrzymanej przeglądarki. Techniczny terminal pozwolił oryginalnemu helperowi zwolnić własny lease: **exit 0, lease_released=true, verification=NOT VERIFIED**. Nie dotykano backendu, ownera ani markerów ręcznie. Powtórzenie po przerwaniu korzysta z trwałego evidence i CAS; obcy aktywny token jest odrzucany.
+- Próby `b83107673048410b9d02d0ea9b2c6a0d`, `27a045f76a8a40d3a0a6a33e300eacaf`, `38c70f330c0841c198a1169b0391b5e6`: terminalne failed-confirmed, zasoby helperów zamknięte normalnie. Ograniczenie akcji do 30 s pozwoliło zachować błąd i diagnostykę: brak widocznego workspace, klient na Home/reconnecting, bezpośredni status API 200 z active/startup_failed, błędy HMR dla originu `frontend`. Nadpisanie runtime API base nie rozwiązało tego przebiegu. Nie wolno przedstawiać samej hipotezy API-base jako potwierdzonej przyczyny.
+- Odczyt mountu QA wymaga normalizacji równoważnych ścieżek Windows i Docker Desktop (`/run/desktop/mnt/host/c/...`). Wrapper używa istniejącego `_canonical_host_path`, nadal porównując dokładną wybraną ścieżkę i readonly bind.
+- Testowy alias `frontend` nie był obecny w zainicjalizowanym next.config zapisanym jako immutable dependency input w named volume. Tymczasową zmianę next.config wycofano; nie resetowano ani nie przepisywano tej konfiguracji w działającym wolumenie.
+- QA loopback proxy w jednorazowym helperze słucha tylko na `127.0.0.1:<wybrany port>` wewnątrz jego namespace i przekazuje HTTP/WS wyłącznie do `frontend:8080` tej samej prywatnej grupy. Przeglądarka używa normalnego originu aplikacji; nie publikuje się dodatkowego portu hosta, nie zmienia auth ani konfiguracji aplikacji. Osobna sonda nadal sprawdza rzeczywisty publiczny loopback hosta. Próba `87116a5b611b4072ad08db7095988c51`: w toku w chwili zapisu.
+- Przygotowano oddzielne helpery pobrania/dekodowania PNG (opaque, transparent, annotations, powrót profilu) i 20 cykli 3D/2D (canvas, zasoby, idle, requesty). Jeszcze nie podłączono ich do runnera: **NOT VERIFIED**. Brak liczników jest raportowany jawnie, nie zastępowany zerem.
+- Regresje wrappera i reconciliation są zapisane jako źródła; AST i diff-check przeszły. Nie uruchamiano ani nie kompilowano testów jednostkowych. ESLint runnera/proxy/nowych helperów: exit 0.
 
-V01–V15 z planu: **NOT VERIFIED w przeglądarce**. Harness appearance jest podłączony do zarządzanego runnera; jego obecność nie jest dowodem wykonania. Brakuje obrazu/PNG, DPR/motywów, FDM/FEM/primitive, pomiaru kontrastu/RGB, idle/network i churn 20 przełączeń. Nie ma zgody na pominięcie tych bramek.
+### Częściowe wyniki wykonanej próby `bdc54a0dfc9a4245a7e75c3a4c59f0ef`
 
-Testy jednostkowe pozostają zablokowane jawnym zakazem użytkownika. Nie wykonywać merge ani cleanup worktree przed wymaganymi dowodami i rozstrzygnięciem tej bramki. R8 integracja: NOT STARTED. Kod nie jest przedstawiany jako ukończona realizacja planu.
+Cała próba: **failed-confirmed**, 18 błędów HTTP 422 w konsoli przy przejściach do 2D na wcześniejszej scenie bez poprawnej siatki. Nie oznaczać jej jako passed. Page errors, błędy transportu i błędy proxy: zero. Pełne dane częściowe są w `browser-qa/attempts/bdc54a0dfc9a4245a7e75c3a4c59f0ef/runner-output.json` w control volume wskazanym wyżej.
+
+- Gradient → solid → gradient: 243137 zmienionych pikseli, różnice próbek górnej/dolnej 6 / 15.333; powrót do początkowych próbek: różnica zero. World/frame-center: 12337 zmienionych pikseli. Są to testy geometry preview, nie dowód niezmienności RGB pola.
+- Eksport opaque: 712×554, wszystkie 394448 pikseli alpha=255. Transparent bez oznaczeń: 339371 pikseli alpha=0, 55077 pikseli widocznej geometrii. Zmiana annotations on/off: 33874 piksele. Profil Interactive i ustawienia wróciły. Przy DPR1 nie dowodzi to przejścia rozdzielczości Interactive 1.25 → Capture 2.
+- Dwadzieścia cykli 3D/2D: po powrocie zdrowy WebGL2 i niezerowy buffer 712×554. Zasoby przed/po: geometries=7, materials=0, renderTargets=0, textures=1, workers=0; wszystkie 20 pomiarów po odmontowaniu: zero. Przyrosty klatek idle: [0,0,0] w trzech odcinkach po 350 ms. To dowód dla tej małej sceny, nie budżet dużego FEM.
+- Zmiana tła nie spowodowała pasujących requestów pól/topologii. Po przeładowaniu preferencje zachowane, tożsamość sesji stabilna. Okno ustawień sprawdzone przy rozmiarze okna 480×320; nie był to jeszcze canvas 480×320.
+- Próba `87116a5b611b4072ad08db7095988c51` również terminalna: workspace dostępny przez proxy, bez błędów strony/proxy/HMR. Ówczesna bramka uznawała anulowanie przestarzałych GET przez resource hooks za awarię; te anulowania są teraz rejestrowane oddzielnie, bez ukrywania błędów HTTP/konsoli.
+
+### Własna scena do dalszego odbioru
+
+Przez zwykły formularz New Problem utworzono własną sesję **Viewport visual quality QA FDM**, zastępując wyłącznie własny nieudany model testowy. CPU/double, początkowo status Awaiting command. Backend zaproponował storage `/state/runs/projects/viewport-visual-quality-qa-fdm_2026-10-20_182016/results.zarr`; opcja zapamiętywania ustawień storage pozostała wyłączona. Nie potwierdzono zapisu projektu. Późniejszy odczyt UI pokazuje **No project**, Save Project disabled: wymagany writable project; sesja nie jest dowodem utworzenia trwałego dokumentu projektu.
+
+Obiekt `qa-offset-film-mvgw65uf`, nazwa `QA offset film`: box [40,30,10] nm, przesunięcie [20,-10,10] nm. Zakresy x=[0,40], y=[-25,5], z=[5,15] nm. Obraz `C:/Users/Mateusz/.codex/visualizations/2026/10/20/01a15981-ab31-7ca0-960f-3d1145a8311d/viewport-offset-geometry-mocha.png` potwierdza podgląd geometrii, gradient, linie skali i oświetlenie; nie potwierdza pól, materiału ani solvera.
+
+Dodano warunek montowania ramki wymiarowej tylko dla skończonych bounds z przynajmniej jednym dodatnim rozmiarem. Brak danych i punkt nie generują pozornej skali; domeny 1D, płaskie 2D i cienkie 3D pozostają obsługiwane. Regresje źródłowe przygotowane, bez wykonania unitów. Helper rzeczywistego canvasu 1200×800/480×320, Mocha/Latte i DPR1/2 jest podłączany do runnera; jego obecność nadal nie jest dowodem wykonania.
+
+V01–V15: **odbiór częściowy, bez pełnego zaliczenia**. Brakuje kompletnej macierzy DPR/motywów i kamer, FDM/FEM, ilościowego kontrastu/RGB oraz poprawnej sceny pól w całym przepływie 2D/3D. Nie ma zgody na pominięcie tych bramek.
+
+### Kolejna macierz layout/eksport — `b5a45fc604634867b1e009fc1abe8bdd`
+
+Próba terminalna **failed-confirmed** z powodu 19 odpowiedzi 422 zasobu `data/fields/m/planar-default/meta` przy przełączaniu do 2D bez gotowych danych. Wszystkie poprzedzające ten końcowy gate scenariusze zwróciły wyniki częściowe. Page errors, request failures i proxy failures: zero; HTTP/konsola pozostają fatal, nie są filtrowane. Źródła harnessu były niezmienione w trakcie próby.
+
+- DPR1: Mocha/Latte, rzeczywisty canvas około 1200×800 i 480×320 CSS px (tolerancja ±3 px); effective buffer scale 1. DPR2: te same cztery warianty, realny `window.devicePixelRatio=2`, Interactive buffer scale 1.25. Widoczny canvas, zdrowy WebGL, niezerowy buffer; widoczne prostokąty DOM HUD bez kolizji. Nie obejmuje to testu kolizji wszystkich sprite'ów i etykiet w WebGL.
+- Eksport DPR2: CSS 456.296875×554.6875, Interactive buffer 570×693, PNG 912×1109, powrót do 570×693; ten sam node canvas, kontekst zdrowy. Wszystkie trzy warianty eksportu potwierdziły ten powrót. Opaque: 1011408 pikseli alpha=255; transparent bez oznaczeń: 797613 pikseli alpha=0 i 213795 widocznych pikseli geometrii. Zmiana oznaczeń: 91082 piksele.
+- PNG z wąskiego canvasa zapisano w katalogu wizualizacji zadania jako `viewport_layout_dpr1-Mocha-480x320.png`, `viewport_layout_dpr1-Latte-480x320.png`, `viewport_layout_dpr2-Mocha-480x320.png`, `viewport_layout_dpr2-Latte-480x320.png`. Po oględzinach jasnego wariantu liczby podziałki otrzymały kolor primary i font weight 700, niezależnie od koloru kresek. Ta późniejsza poprawka wymaga nowego obrazu; powyższe PNG są dowodem stanu sprzed niej.
+- Pierwsza próba tej macierzy `6f57a333bc6f48b2b173e1e33e064cde` zatrzymała się na kalibracji rozmiaru, bez błędów strony/HTTP/WebGL. Korekta kalibracji używa zmierzonego nachylenia rozmiaru canvasa względem okna; nie obniżono docelowych wymiarów ani tolerancji.
+- Ponowny produkcyjny typecheck po warunku pustej ramki: nadal pięć tych samych błędów bazowych, exit 1. ESLint nowych helperów/runnera i poprawki tekstu: exit 0. AST trzech plików wrapper/reconcile/regresje: passed. Testów jednostkowych nie wykonano ani nie skompilowano.
+
+Do opt-in przygotowano helper małej sceny pól, ograniczony do istniejącej sesji z jedynym obiektem `qa-offset-film-mvgw65uf`/`QA offset film`. Source review potwierdził kontrakty scope/revision/ACK/readback i brak replace/reset. Przygotowanie fixture nadal **NOT VERIFIED**; dostępny katalog pól sam w sobie nie będzie dowodem pobrania bajtów ani adopcji w viewporcie.
+
+### Przygotowanie własnego FDM — próby bez solve
+
+- Jawny opt-in `--prepare-viewport-fixture` jest zapisywany w inputs receiptu i środowisku QA; domyślny przebieg pozostaje bez mutacji sceny. Reconciliation korzysta wyłącznie z przypiętej wartości bool; brak pola w historycznych receiptach oznacza false.
+- `a621248dee3444d8814c129e0057fd79`: failed-confirmed przed komendami. Materiał, przypisanie, uniform-Y i exchange/demag: pięć zmian ACK/readback, rewizje 1→6. Study ACK revision 7. Kontrola oczekiwała dawnego `per_magnet`; niezależny GET potwierdził kanoniczne `study.fdm.per_object_grid`, poprawny CPU/double, grid i etap relax. Poprawiono konsumenta i pomijanie już zgodnego study; brak automatycznego ponawiania nieznanych zapisów.
+- `8032b60a784c4ff7b72f58ea4491c3b5`: bez dodatkowych zapisów authoring. POST mesh_build odrzucony HTTP 422 przed ACK: 4 nm nie dzieli wymiarów 30 i 10 nm. Command intent zachowany w runner-output: `viewport-qa-fixture:0cfb06e58d9e157120c987feaf154be580e702b138ae008106aca54295e477d9:mesh-build`; brak command_id i brak uruchomienia solve. Późniejsza wersja helpera jawnie rozróżnia odmowę 422 od nieznanego wyniku transportowego.
+- Fixture dopasowano do istniejącej geometrii przez komórkę [2,2,2] nm, bez zmiany boxa/transform. Identyfikatory komend są deterministyczne z treści fixture, sesji i zachowanej geometrii/transformacji. Kolejna próba wymaga nowego dowodu; nie przedstawiać wcześniejszych odmów jako wykonania mesha/pól.
+- Architecture hygiene po aktualnych zmianach: exit 0. ESLint helpera fixture po korekcie kanonicznego pola i komórki: exit 0. Nie wykonano kompilacji ani uruchomienia unitów.
+
+### Blokada accepted-run i zachowany Stop
+
+- `91452d6cff8743dc8f43d3fe5bc68db3`: study grid 2 nm potwierdzony na revision 8. Mesh POST zwrócił 422 z **durable accepted run**, nie ze zwykłą odmową przed zapisem: `run-live-0cc7302699581e9e1c11d5b210107633b74e674f8874d33d64b883ecac0d9084`. Przygotowanie niekompletne: brak resolved region marker. Backend log `2026-10-20T16:53:22.741523Z` potwierdza zachowanie RunIntent do recovery. Nie rozpoczęto solve ani automatycznego retry.
+- Read-only GET sceny: `region_name=null`, geometria i transform bez zmian. Helper źródłowo uzupełnia brak regionu publicznym PATCH, ale `13a94176c17242929b9e6bc5fd2e804c` otrzymał 409: accepted run blokuje edycję; draft **nie został zastosowany**. Obecna wersja rozróżnia `accepted-preparation-incomplete`, `rejected-before-ack`, `rejected-no-write` i `outcome-unknown`.
+- Publiczny GET `simulation/commands` zezwalał na Stop, chociaż przyciski UI były disabled z komunikatem Runtime is not active. Po ponownym sprawdzeniu dokładnej sesji, runu i readiness wysłano **jeden** Stop z `client_intent_id=viewport-qa-stop:run-live-0cc7302699581e9e1c11d5b210107633b74e674f8874d33d64b883ecac0d9084` i targetem tego runu. ACK: `fm-7824061f-333e-47d5-bf39-d397d5410a1b`, request `fm-c631565e-845d-4316-a145-f1a60479d5b2`.
+- Odczyt `2026-10-20T17:03:04.4126619Z`: komenda **accepted**, run **stopping**, brak terminalnego zakończenia. UI pokazuje Breaking. Obraz: `C:/Users/Mateusz/.codex/visualizations/2026/10/20/01a15981-ab31-7ca0-960f-3d1145a8311d/viewport-qa-stop-pending.png`. Nie zmieniano ownera, bazy ani journalu ręcznie; nie restartowano backendu, nie ponawiano Stop i nie obchodzono blokady edycji.
+- Przygotowanie pól FDM i przejście do FEM pozostają zablokowane do prawidłowego terminalnego rozliczenia tego własnego runu. Wymagany następny krok: obserwacja/naprawa obsługiwanej ścieżki accepted Stop/recovery, z zachowaniem run identity i dzienników. Sam screenshot bryły nie zastępuje tej bramki.
+
+### Zapisane etapy
+
+- `a81ad772749e0f84c658eee9bfdf0885a6ca3482`: ochrona pustej ramki i mocniejsze liczby podziałki; lint/diff passed, regresje źródłowe bez wykonania unitów.
+- `3cae01857b630eb2825e4b22782307bf467034b7`: rozszerzone managed browser QA, diagnostyka i reconciliation. Hook React Doctor: sześć ostrzeżeń o kolejności await w narzędziach QA, framework-neutral only; niezależne odczyty kontrolek poprawiane, fences identity/revision pozostają sekwencyjne. Nie jest to pełny React proof ani zielona kwalifikacja całego planu.
+
+### Kamera — wykryte rozbieżności R5
+
+- `81651d30e804467e97f13e89113765ca`: scenariusz kamery nie rozpoczął mutacji; helper szukał dialogu po `3D camera parameters`, natomiast dostępna nazwa z Radix DialogTitle to **Camera Parameters**. CUA potwierdziło otwarcie przez widoczną command palette. Poprawiono selektor i opis dowodu odtworzenia, aby brak mutacji nie był nazywany odtworzeniem przez dialog.
+- CUA pokazało dodatkowy realny błąd: dialog czytał `commandState.camera` (pozycja [2,1.4,2] µm, cel zero), podczas gdy aktywna scena po Fit miała pozycję około [93.082,42.619,80.582] nm i cel [20,-10,7.5] nm. Module przekazuje teraz do dialogu `sceneProps.cameraState`, zachowując routing zapisu current→cameraRegistry / saved→patchSavedCamera. Review źródłowe tej poprawki: bez potwierdzonej regresji własności.
+- `1b21a88971d642748f23267e9bec502c`: próba zatrzymana przed przeglądarką przez timeout publicznego loopback probe podczas HMR. Kontener frontendu pozostał healthy, OOMKilled=false. Nie jest to wynik scenariusza kamery i nie pominięto probe.
+- Review ujawnił istniejącą niespójność FOV: dialog przechowuje `cameraResource.fov_degrees`, renderer używa stałych 42°. Poprawka połączenia FOV z rendererem/Fit jest w toku. Wymagany dowód: rzeczywista zmiana PNG przy stałym position/target, dwa poprawne FOV, zależny od FOV Fit i odtworzenie parametrów. Sam odczyt formularza nie dowodzi działania FOV.
+- Produkcyjny typecheck po zmianie źródła dialogu: exit 1, te same pięć błędów bazowych poza zmienionym viewportem. ESLint Module/helpera: exit 0.
+
+### Macierz V01–V15 — stan cząstkowy
+
+| ID | Stan | Aktualna granica dowodu |
+|---|---|---|
+| V01 pusta scena | NOT VERIFIED | Warunek pustej ramki w źródłach; brak nowego PNG pustej sceny po poprawce |
+| V02 bryła z otworem | NOT VERIFIED | Referencja użytkownika; brak odtworzonej, przypiętej sceny runtime |
+| V03 przesunięcie i origin | PARTIAL | Offset box, zmiana world/frame-center i obrazu; bez pełnej kontroli Lx/Ly/Lz |
+| V04 cienkie/wydłużone domeny | NOT VERIFIED | Box 40×30×10 nm nie zastępuje skrajnie cienkiego filmu |
+| V05 projekcje i osiowe | PARTIAL | Perspective/ortho, FOV35/70, Fit i restore potwierdzone; pełne widoki osiowe/ViewCube nadal niewykazane |
+| V06 orbit/ćwiartki/spód | NOT VERIFIED | Pozy przez dialog nie są dowodem płynnej orbity ani ViewCube |
+| V07 motywy/DPR | PARTIAL | Mocha/Latte × DPR1/2 wykonane; liczbowy kontrast wszystkich etykiet niezmierzony |
+| V08 rozmiary/HUD | PARTIAL | Canvas 1200×800/480×320 ±3 px; DOM HUD bez kolizji; sprite'y poza tym checkiem |
+| V09 materiały | PARTIAL | Primitive geometry preview; FDM fields i FEM zablokowane |
+| V10 kolory danych | NOT VERIFIED | Źródłowo unlit i ochrona efektów; brak ilościowego RGB na danych runtime |
+| V11 invalidation | PARTIAL | Zmiana tła bez żądań pola/topologii na geometry preview; brak sceny załadowanego pola |
+| V12 idle/interakcje | PARTIAL | Idle [0,0,0] i brak wzrostu zasobów na małej scenie; bez budżetu dużego FEM |
+| V13 churn 20× | PARTIAL | Zasoby i canvas po 20 cyklach sprawdzone; cały flow czerwony przez błędy zasobów 2D |
+| V14 reload/identity | PARTIAL | Preferencje reload i stabilna sesja; nowe dataset/saved identity niekwalifikowane |
+| V15 capture | PARTIAL | Pobrane opaque/transparent/annotations i DPR2 restore; błąd capture nieprzetestowany runtime |
+
+PARTIAL nie oznacza zaliczenia całego kryterium. R8 pozostaje niezrealizowane; worktree i dowody trzeba zachować.
+
+### Retencja po próbach QA
+
+Kontrola `2026-10-20T17:21:28.6806606Z`: host C ma 93605904384 B wolnego miejsca (pomiar hosta, nie wolnego miejsca wewnątrz silnika Docker). W grupie zadania działają tylko zdrowe backend/frontend; jednorazowe helpery zakończonych prób zostały rozliczone przez launcher. Brak autoryzowanego kandydata do usunięcia: zachować control volume z receiptami/logami/runner-output, żywe named volumes i cache, własny projekt oraz accepted run/journal wymagający recovery. Worktree jest aktywnie bind-mountowane, więc cleanup jest niedozwolony. Ponowna ocena po terminalnym rozliczeniu runu i zakończeniu kwalifikacji; żadnego prune ani usuwania wyników.
+
+Zakaz testów został później uchylony wyłącznie w zakresie opisanym niżej. Nie wykonywać merge ani cleanup worktree przed wymaganymi dowodami całej macierzy. R8 integracja: NOT STARTED. Kod nie jest przedstawiany jako ukończona realizacja planu.
+
+### Kontynuacja R7: FOV, clipping i zasoby frontendu
+
+Uzgodnione między zadaniami okno bez zapisów zostało zachowane i jawnie zwolnione po synchronizacji `fullmag-master`. Nie zmieniano głównego checkoutu, jego HEAD/indeksu ani kontenerów. Dalsze zapisy dotyczą wyłącznie worktree tego zadania.
+
+WIP kamery przekazuje FOV właściciela current/saved do renderera i dialogu, normalizuje zakres `0 < FOV < 180`, uwzględnia aspekt viewportu przy perspektywicznym Fit i aktualizuje samą macierz projekcji przy zmianie FOV. Review wykrył dodatkowy błąd: near wyliczany z hipotetycznego fit przy FOV 0.1° odcinał model bez zmiany pozy. Poprawiono near względem rzeczywistej głębokości sfery bounds; far uwzględnia również jej rzeczywistą głębokość. Ortho zachowuje parametry fit 42°/aspect 1. Niezależny przegląd źródeł tego fragmentu nie znalazł dalszego blockera. Dodane regresje projekcji dla FOV 0.1/42/179 i targetu poza modelem pozostają **nieuruchomione i nieskompilowane**.
+
+Ponowiony szeroki lint z limitem heap 4 GiB zatrzymano celowo przez SIGTERM wyłącznie procesu ESLint tego zadania: Next.js zajmował około 4.4 GiB RSS, a łączna pamięć kontenera osiągnęła limit 6 GiB. To nie jest zielony wynik lint. Pierwszy GET workspace przekroczył 45 s, po zwolnieniu pamięci następny zwrócił HTTP 200. Syntax check nowego helpera kamery oraz lint runnera i helpera kamery zakończyły się kodem 0, bez ostrzeżeń. Pełny typecheck nowych zmian FOV nadal **NOT VERIFIED**.
+
+Zarządzana próba `4ea4e1adf2474862ada0b177b6caab5b` zakończyła się `failed-confirmed`: timeout download PNG w scenariuszu eksportu, przed scenariuszem kamery. Canvas pozostał WebGL2/context-lost=false/buffer 712×554; UI zgłaszało `Resource load deadline exceeded`. Zarejestrowano 6 HTTP 400/404 dla frozen_spins i frequency-response, bez page errors i transport failures. Częściowy proof appearance ponownie wykazał gradient (258078 zmienionych pikseli), world/frame-center (9224 piksele), reload preferencji i przywrócenie ustawień. Nie jest to dowód działania FOV ani zaliczenia eksportu. Launcher rozliczył helpery bez ręcznego zwalniania lease.
+
+Scenariusz kamery przeniesiono przed eksport, zachowując wszystkie wymagane sprawdzenia i czerwony wynik całości przy błędzie. Kolejna próba trwa; jej wynik wymaga odczytu receiptu i pełnego runner-output. Nie wykonywano Solve, resetu ownera, restartu backendu ani modyfikacji accepted run/journal.
+
+Próba `6abe8332caeb48feb3e68ed89ae2cb86` została rozliczona jako `failed-confirmed` z powodu błędów HTTP, ale dotarła do końca macierzy. `viewport_camera.state=passed`: rzeczywisty dialog zgadzał się z pozycją/targetem renderera w SI; przełączenia perspective→ortho→perspective, pięć zadanych ujęć (w tym od spodu), FOV 35/70 przy stałej pozycji (84626 zmienionych pikseli), odmienna odległość Fit dla obu FOV oraz końcowe przywrócenie kamery i tego samego canvasa potwierdzone. Ujęcia przez dialog nie dowodzą płynnej orbity ani interakcji ViewCube. FOV 0.1 i 179 pozostają wyłącznie źródłami nieuruchomionych regresji clippingu.
+
+W tej samej próbie ukończono oba eksporty DPR1/DPR2, układy Mocha/Latte DPR1/DPR2 i lifecycle. Nie zaciera to wcześniejszego timeoutu eksportu ani nie dowodzi braku awarii pod obciążeniem. Całość czerwona: 32 zarejestrowane HTTP errors/console errors, page errors=0, transport failures=0. Unikalne ścieżki: frozen_spins (400), frequency-domain response/progress (404), planar-default meta bez danych pola (422). Zrzut `viewport-camera-initial-6abe8332.png` zapisano w katalogu wizualizacji zadania i obejrzano: gradient, bryła, skala i baselines widoczne; brak danych pola.
+
+Produkcyjny typecheck z heap 1 GiB wykrył brak `camera-fov` w typie diagnostyki; po jego uzupełnieniu ponowiony wynik zawiera wyłącznie pięć wcześniej wskazanych błędów bazowych w primitiveSurfaceColor, FieldMapModule i ObjectRegionMagneticParametersPanel. Cały typecheck ma exit 1, nie jest zieloną bramką. Nowe źródła kamery nie generują w tym przebiegu diagnostyk TypeScript. Nie kompilowano testów jednostkowych.
+
+### Ograniczony wyjątek dla regresji viewportu i pierwsze wyniki
+
+Użytkownik odpowiedział jawnie: **„Tak, tylko regresje viewportu”** na pytanie o odwołanie zakazu wyłącznie dla wymaganych regresji tej refaktoryzacji w grupie Docker worktree. Od tej odpowiedzi wolno kompilować/wykonywać ten zakres; wcześniejsze stwierdzenia o zakazie opisują historię. Pozostałe testy pozostają objęte zakazem. Nie zmieniono AGENTS.md ani globalnej konfiguracji.
+
+Wąskie linty Scene/Types/FOV, runnera/helpera oraz dialogu/saved-camera/CameraControls zakończyły się kodem 0 bez ostrzeżeń po poprawieniu zależności memo i Orbit size. Szeroki lint Model+komponenty przy heap 1280 MiB zakończył się OOM; pozostaje otwartą bramką, nie zielonym wynikiem.
+
+Usunięto błędne memo zależne od indeksowanych tuple i pomijanego FOV. Stabilny fallback sceny służy pierwszemu renderowi; Controller i Orbit otrzymują surowy stan właściciela. Dla początkowego domyślnego źródła Controller wykonuje Fit aktualnym FOV/aspect, a Orbit przyjmuje target dopiero gdy pozycja dokładnie odpowiada temu Fit. Nie nadpisuje targetu kamery autorskiej ani pozycji przesuniętej gestem. Review źródeł nie znalazł dalszego defektu w tym bounded fragmencie; ponowny runtime po tej zmianie nadal wymagany.
+
+Pierwsze 5 grup regresji ujawniło 6 failures. Raport v2 po kolejnych zmianach: **250 testów, 243 passed, 7 failed**. Dowody: `/state/development/test-evidence/viewport-visual-quality/camera-regressions-v2.json` i `.log` w technicznym wolumenie tej grupy. Dwa failures dotyczą asercji tekstowych CameraControls/Scene, które nie śledziły rozszerzonego bloku sync i przeniesienia flagi do PostProcessingLayer; skorygowano zakres asercji bez usuwania sprawdzanej ochrony. Pozostałe 5 w SceneModel (Airbox key, retention, render fixed point, catalog gating) jest badane; nie uznano ich za bazowe bez dowodu wykonania. Raport v3 dla 4 grup kamery trwa, szersza bramka nie jest zamknięta.
+
+### Aktualny wynik R7 — 84% realizacji, integracja otwarta
+
+Najnowszy wynik każdego sprawdzonego pliku: **26 plików / 594 testy / 594 passed / 0 failed / 0 pending**. Zestawienie obejmuje raporty `camera-regressions-v3`, `appearance-core-v1`, `capture-primitive-v2`, `scene-model-v3`, `scene-module-manifest-v1`, `module-v2`, `material-hud-v1`, `colors-fdm-v2` w `/state/development/test-evidence/viewport-visual-quality/` (JSON + log, techniczny wolumen frontendu). Późniejszy raport dla danego pliku zastępuje wcześniejszy czerwony wynik; nie sumowano wielokrotnych wykonań jako różnych testów. Nie ponawiano zielonych niezmienionych grup dla samej deklaracji zakończenia.
+
+SceneModel: 158/158 po korekcie dwóch nieaktualnych asercji tekstowych i trzech fixture'ów. Oczekiwana rewizja `top-1` wymaga rzeczywistej `carrierRevision`/`meshTopologyRevision`; hash nie jest rewizją. Nie zmieniono produkcyjnej retencji. Module: 72/72 po korekcie wyszukiwania otwierającego tagu, które urywało blok na `=>` handlera. Capture/primitive: 28/28 po wykorzystaniu istniejącego fake document i uwzględnieniu przypisań koloru. Colors/FDM: 58/58 po uwzględnieniu tokenów gradientu/palety i Basic/Lambert przy zachowaniu asercji własności materiału. Niezależny przegląd źródeł tych zmian nie znalazł blockera ani osłabienia tożsamości/retencji.
+
+Ponowiona po poprawce Orbit próba browser **`67555cc24d794e7e8f9300ae4df32cf2`**: wszystkie siedem części macierzy zapisane; kamera `passed`, FOV35/70 zmienił 84626 pikseli przy stałej pozycji, Fit zależny od FOV i restore tego samego canvasa potwierdzone. Całość **failed-confirmed** przez 32 zarejestrowane błędy HTTP/console (frozen_spins400, frequency response/progress404, planar-default meta422), bez page errors i transport failures. Oryginalne raporty pozostają w control volume. Nie filtrowano tych błędów, nie uznano całego browser QA za zaliczony i nie resetowano zablokowanego accepted runu.
+
+Nadal otwarte: pełny lint dużych plików (OOM), całkowicie zielony typecheck (5 błędów bazowych), API hygiene, pozostała macierz R0/R7 dla pustej sceny/otworu/skrajnie cienkiej geometrii, rzeczywistych pól FDM/FEM i ilościowego koloru, ViewCube/płynnej orbity oraz dużej sceny. Przygotowanie pól blokuje istniejący accepted run w stanie stopping; nie wolno zastąpić recovery resetem ownera ani usunięciem journalu. R8 push/PR/merge/cleanup nie rozpoczęto. Zgłoszenie z równoległego odbioru master3198 o niedostępnych diagnostics przed resolved discretization zapisano do dalszego rozpoznania; nie jest własnym dowodem runtime tego worktree i nie wykonano na tej podstawie zmiany mastera.

@@ -228,9 +228,10 @@ async function captureCanvasAtSize(page, {
 
   await waitForLayoutFrame(page);
   await assertCanvas(`${theme.palette} ${target.id} canvas layout`);
-  const state = await readCanvasState(canvas);
+  const [state, hudDom] = await Promise.all([
+    readCanvasState(canvas), readAndAssertHudDomLayout(page),
+  ]);
   assertCanvasState(state, target, expectedDpr, `${theme.palette} ${target.id}`);
-  const hudDom = await readAndAssertHudDomLayout(page);
 
   const screenshot = await canvas.screenshot({ type: "png", scale: "css" });
   const decoded = pngDecoder.sync.read(screenshot);

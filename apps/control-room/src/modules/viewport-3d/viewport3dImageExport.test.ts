@@ -20,7 +20,7 @@ function register(canvas: HTMLCanvasElement, source: Viewport3DCaptureSource): v
 }
 
 function captureCanvas(width = 16, height = 12): HTMLCanvasElement {
-  const canvas = document.createElement("canvas");
+  const canvas = offscreenCanvas(fakeCanvasDocument().document);
   canvas.width = width;
   canvas.height = height;
   return canvas;

@@ -33,6 +33,10 @@ import type {
   Viewport3DCameraProjection,
   Viewport3DCameraState,
 } from "../viewport3dStore";
+import {
+  isViewport3DCameraFovDegreesValid,
+  resolveViewport3DCameraFovDegrees,
+} from "../viewport3dCameraFov";
 import { VIEWPORT_3D_WORLD_UP } from "../layers/CameraControls";
 
 type CameraPatch = NonNullable<VisualizationStatePatch["camera"]>;
@@ -65,8 +69,6 @@ interface CameraDialogSnapshot {
   target: CameraTuple;
   up: CameraTuple;
 }
-
-const DEFAULT_FOV_DEGREES = 42;
 
 export function Viewport3DCameraDialog({
   cameraResource,
@@ -131,7 +133,7 @@ export function Viewport3DCameraDialog({
   function applyDraft(): void {
     const parsed = parseCameraDraft(draft);
     if (!parsed) {
-      setError("Camera fields must contain finite numbers.");
+      setError("Camera fields must be finite, and FOV must be between 0 and 180 degrees.");
       return;
     }
 
@@ -421,7 +423,9 @@ function buildCameraDialogSnapshot(
   cameraOrthographicScale: number | null,
 ): CameraDialogSnapshot {
   return {
-    fovDegrees: cameraResource?.fov_degrees ?? DEFAULT_FOV_DEGREES,
+    fovDegrees: resolveViewport3DCameraFovDegrees(
+      cameraResource?.fov_degrees,
+    ),
     orthographicScale: cameraOrthographicScale ?? cameraResource?.orthographic_scale ?? null,
     position: cameraState.position,
     projection: cameraProjection,
@@ -483,6 +487,7 @@ function parseCameraDraft(draft: CameraDraft): {
     rollDegrees === null ||
     distance === null ||
     fovDegrees === null ||
+    !isViewport3DCameraFovDegreesValid(fovDegrees) ||
     orthographicScale === null && draft.orthographicScale.trim() !== ""
   ) {
     return null;

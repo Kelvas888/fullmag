@@ -92,6 +92,10 @@ import type {
   Viewport3DScaleUnitMode,
 } from "../viewport3dStore";
 import { DEFAULT_VIEWPORT_3D_CAMERA_STATE, useViewport3DAppearance } from "../viewport3dStore";
+import {
+  DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+  resolveViewport3DCameraFovDegrees,
+} from "../viewport3dCameraFov";
 import type { Viewport3DColors } from "../viewport3dTypes";
 import type { VectorFieldLayerVectorStyle } from "./VectorFieldLayer";
 import { DimensionFrameLayer } from "./DimensionFrameLayer";
@@ -195,6 +199,7 @@ interface Viewport3DSceneProps {
   bounds: Viewport3DBounds | null;
   cameraOrthographicScale: number | null;
   cameraProjection: Viewport3DCameraProjection;
+  cameraFov?: number;
   cameraState: Viewport3DCameraState;
   colors: Viewport3DColors;
   clip: VisualizationStateResource["clip"] | null;
@@ -362,7 +367,6 @@ export function shouldApplyViewport3DProjectionCameraClip({
 }
 
 const FALLBACK_GRID_SIZE = 1e-6;
-const PERSPECTIVE_CAMERA_FOV_DEGREES = 42;
 
 /**
  * Resolve the initial scene camera against the actual domain bounds.
@@ -376,9 +380,13 @@ const PERSPECTIVE_CAMERA_FOV_DEGREES = 42;
 export function resolveViewport3DEffectiveCameraState({
   bounds,
   cameraState,
+  fovDegrees = DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+  aspect = 1,
 }: {
   bounds: Viewport3DBounds | null;
   cameraState: Viewport3DCameraState;
+  fovDegrees?: number;
+  aspect?: number;
 }): Viewport3DCameraState {
   if (
     !bounds ||
@@ -388,7 +396,7 @@ export function resolveViewport3DEffectiveCameraState({
     return cameraState;
   }
 
-  const fit = resolveViewport3DCameraFit(bounds);
+  const fit = resolveViewport3DCameraFit(bounds, { aspect, fovDegrees });
   return {
     position: fit.position,
     target: fit.target,
@@ -399,22 +407,37 @@ export function resolveViewport3DEffectiveCameraState({
 export function resolveViewport3DProjectionCameraClip(
   bounds: Viewport3DBounds | null,
   cameraState?: Viewport3DCameraState,
+  {
+    aspect = 1,
+    fovDegrees = DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+  }: { aspect?: number; fovDegrees?: number } = {},
 ): Viewport3DCameraClip {
-  const fit = resolveViewport3DCameraFit(bounds);
+  const fit = resolveViewport3DCameraFit(bounds, { aspect, fovDegrees });
   if (!cameraState) return { near: fit.near, far: fit.far };
 
-  const distance = new Vector3(...cameraState.position).distanceTo(
-    new Vector3(...cameraState.target),
-  );
+  const position = new Vector3(...cameraState.position);
+  const forward = new Vector3(...cameraState.target).sub(position);
+  const distance = forward.length();
   const radius = Math.max(bounds?.radius ?? FALLBACK_GRID_SIZE / 2, 1e-12);
+  // FOV changes projection without moving the camera. A hypothetical fit must
+  // never push the near plane through geometry visible from the actual pose.
+  const minimumNear = 1e-12;
+  const centerDepth = bounds && Number.isFinite(distance) && distance > 0
+    ? new Vector3(...bounds.center).sub(position).dot(forward.divideScalar(distance))
+    : null;
+  const nearestDepth = centerDepth === null ? null : centerDepth - radius;
+  const poseNearLimit = nearestDepth !== null
+    ? nearestDepth > minimumNear ? nearestDepth * 0.5 : minimumNear
+    : Number.isFinite(distance) && distance > 0 ? distance / 100 : minimumNear;
+  const near = Math.max(minimumNear, Math.min(fit.near, poseNearLimit));
   const orbitFar =
     Number.isFinite(distance) && distance > 0
       ? distance + radius * 4
       : fit.far;
 
   return {
-    near: fit.near,
-    far: Math.max(fit.far, orbitFar, fit.near * 100, 1e-3),
+    near,
+    far: Math.max(fit.far, orbitFar, (centerDepth ?? 0) + radius * 4, near * 100, 1e-3),
   };
 }
 
@@ -876,6 +899,7 @@ export function useViewport3DModelLayerStage({
 
 function Viewport3DProjectionStack({
   bounds,
+  cameraFov = DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
   cameraClip,
   cameraGestureRef,
   cameraState,
@@ -889,6 +913,7 @@ function Viewport3DProjectionStack({
 }: Pick<
   Viewport3DSceneProps,
   | "bounds"
+  | "cameraFov"
   | "cameraState"
   | "fitRevision"
   | "onCameraChange"
@@ -919,7 +944,7 @@ function Viewport3DProjectionStack({
         key="viewport-3d-perspective-camera"
         ref={perspectiveCameraRef}
         far={cameraClip.far}
-        fov={PERSPECTIVE_CAMERA_FOV_DEGREES}
+        fov={cameraFov}
         near={cameraClip.near}
         up={VIEWPORT_3D_WORLD_UP}
       />
@@ -1766,6 +1791,7 @@ export function Viewport3DScene({
   bounds,
   cameraOrthographicScale,
   cameraProjection,
+  cameraFov = DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
   cameraState,
   colors,
   fdmAirboxFieldVector,
@@ -1865,6 +1891,11 @@ export function Viewport3DScene({
   const invalidate = useBatchedInvalidate("camera");
   const setThreeState = useThree((state) => state.set);
   const viewportSize = useThree((state) => state.size);
+  const resolvedCameraFov = resolveViewport3DCameraFovDegrees(cameraFov);
+  const cameraAspect = viewportSize.width / Math.max(viewportSize.height, 1);
+  const fitFov = cameraProjection === "perspective"
+    ? resolvedCameraFov : DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES;
+  const fitAspect = cameraProjection === "perspective" ? cameraAspect : 1;
   const orthographicCameraRef = useRef<ThreeOrthographicCamera>(null);
   const perspectiveCameraRef = useRef<ThreePerspectiveCamera>(null);
   const appliedCameraClipRef = useRef<{
@@ -1909,13 +1940,20 @@ export function Viewport3DScene({
       },
     [inspectClearArbitrator, onInspectSample],
   );
+  // This is only the stable pre-resource fallback. CameraController applies
+  // the actual FOV/aspect-aware fit and persists it through the camera owner.
+  // FOV alone must not generate a new fallback pose.
   const effectiveCameraState = useMemo(
     () => resolveViewport3DEffectiveCameraState({ bounds, cameraState }),
     [bounds, cameraState],
   );
   const cameraClip = useMemo(
-    () => resolveViewport3DProjectionCameraClip(bounds, effectiveCameraState),
-    [bounds, effectiveCameraState],
+    () =>
+      resolveViewport3DProjectionCameraClip(bounds, effectiveCameraState, {
+        aspect: fitAspect,
+        fovDegrees: fitFov,
+      }),
+    [bounds, fitAspect, effectiveCameraState, fitFov],
   );
   const orthographicCameraFrame = useMemo(
     () =>
@@ -2017,7 +2055,7 @@ export function Viewport3DScene({
         effectiveCameraState,
         cameraClip.near,
         cameraClip.far,
-        PERSPECTIVE_CAMERA_FOV_DEGREES,
+        resolvedCameraFov,
       );
     }
     return scheduleViewport3DProjectionRenderFrames({ invalidate, tracker });
@@ -2027,6 +2065,16 @@ export function Viewport3DScene({
     // overwrite the current OrbitControls position and cause visible "rewind".
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cameraProjection, invalidate, setThreeState, tracker]);
+
+  useLayoutEffect(() => {
+    if (cameraProjection !== "perspective") return;
+    const activeCamera = perspectiveCameraRef.current;
+    if (!activeCamera) return;
+    activeCamera.fov = resolvedCameraFov;
+    activeCamera.updateProjectionMatrix();
+    tracker.recordDirtyFrame("camera-fov");
+    invalidate();
+  }, [cameraProjection, invalidate, resolvedCameraFov, tracker]);
 
   // Bounds/resource changes still need to refresh clipping, but updating the
   // clip planes must not re-apply the declarative pose while OrbitControls is
@@ -2110,9 +2158,10 @@ export function Viewport3DScene({
       ) : null}
       <Viewport3DProjectionStack
         bounds={bounds}
+        cameraFov={resolvedCameraFov}
         cameraClip={cameraClip}
         cameraGestureRef={cameraGestureRef}
-        cameraState={effectiveCameraState}
+        cameraState={cameraState}
         fitRevision={fitRevision}
         onCameraChange={onCameraChange}
         orthographicCameraFrame={orthographicCameraFrame}
@@ -2257,7 +2306,7 @@ export function Viewport3DScene({
         cameraGestureRef={cameraGestureRef}
         cameraOrthographicScale={cameraOrthographicScale}
         cameraProjection={cameraProjection}
-        cameraState={effectiveCameraState}
+        cameraState={cameraState}
         colors={colors}
         hslReferenceVisible={hslReferenceVisible}
         orbitDebugAngles={orbitDebugAngles}

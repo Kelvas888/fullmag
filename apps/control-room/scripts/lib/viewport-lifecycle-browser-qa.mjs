@@ -57,11 +57,10 @@ export async function runViewportLifecycleBrowserQa(page, options = {}) {
     throw new Error("Viewport-main did not expose its active module id");
   }
 
-  const originalDialogOpen = await settingsDialog.isVisible().catch(() => false);
-  const originalStorage = await readAppearanceStorage(page);
-  const sessionBefore = typeof getSessionIdentity === "function"
-    ? await getSessionIdentity()
-    : null;
+  const [originalDialogOpen, originalStorage, sessionBefore] = await Promise.all([
+    settingsDialog.isVisible().catch(() => false), readAppearanceStorage(page),
+    typeof getSessionIdentity === "function" ? getSessionIdentity() : null,
+  ]);
   if (typeof getSessionIdentity === "function" && !sessionBefore) {
     throw new Error("The provided session identity reader returned no identity before the QA");
   }

@@ -10,6 +10,7 @@ import { runViewportLifecycleBrowserQa } from "./lib/viewport-lifecycle-browser-
 import { installViewportPerformanceProbe } from "./lib/viewport-performance-proof.mjs";
 import { runViewportLayoutBrowserQa } from "./lib/viewport-layout-browser-qa.mjs";
 import { runViewportQaFixtureBrowser } from "./lib/viewport-qa-fixture-browser.mjs";
+import { runViewportCameraBrowserQa } from "./lib/viewport-camera-browser-qa.mjs";
 
 const require = createRequire(import.meta.url);
 const playwrightPackage = require("playwright/package.json");
@@ -25,6 +26,7 @@ const layoutSourcePath = fileURLToPath(new URL("./lib/viewport-layout-browser-qa
 const fixtureSourcePath = fileURLToPath(new URL("./lib/viewport-qa-fixture-browser.mjs", import.meta.url));
 const scratchSourcePath = fileURLToPath(new URL("./lib/scratch-authoring-browser.mjs", import.meta.url));
 const fixtureDataPath = fileURLToPath(new URL("./fixtures/scratch-authoring/fdm.v1.json", import.meta.url));
+const cameraSourcePath = fileURLToPath(new URL("./lib/viewport-camera-browser-qa.mjs", import.meta.url));
 const expectedVersion = process.env.CONTROL_ROOM_EXPECTED_PLAYWRIGHT_VERSION ?? "1.62.1";
 // Leave room for bounded UI restoration and result publication before the
 // managed outer runtime deadline expires.
@@ -61,6 +63,7 @@ const readHarnessSourceHashes = async () => ({
   fixture_helper: await sha256File(fixtureSourcePath),
   fixture_builders: await sha256File(scratchSourcePath),
   fixture_data: await sha256File(fixtureDataPath),
+  camera_helper: await sha256File(cameraSourcePath),
 });
 const sameHarnessSourceHashes = (left, right) =>
   Object.keys(left).every((key) => left[key] === right[key]);
@@ -203,6 +206,9 @@ const main = async () => {
       timeout,
     });
     partialProof.viewport_appearance = appearanceQa;
+    partialProof.viewport_camera = await runViewportCameraBrowserQa(page, {
+      assertCanvas: (label) => assertCanvas(page, label), pngDecoder: PNG, timeout,
+    });
     const exportQa = await runViewportExportBrowserQa(page, {
       assertCanvas: (label) => assertCanvas(page, label), pngDecoder: PNG, timeout,
     });
@@ -313,6 +319,7 @@ const main = async () => {
       viewport_layout_dpr2: partialProof.viewport_layout_dpr2,
       viewport_export_dpr2: partialProof.viewport_export_dpr2,
       fixture_preparation: partialProof.fixture_preparation ?? { state: "not-requested" },
+      viewport_camera: partialProof.viewport_camera,
     };
   } catch (error) {
     if (error?.partialProof) partialProof.failed_step = error.partialProof;
@@ -362,6 +369,8 @@ const main = async () => {
         fixture_builders_after: sourceHashesAfter.fixture_builders,
         fixture_data_before: sourceHashesBefore.fixture_data,
         fixture_data_after: sourceHashesAfter.fixture_data,
+        camera_helper_before: sourceHashesBefore.camera_helper,
+        camera_helper_after: sourceHashesAfter.camera_helper,
         unchanged,
       };
       if (!unchanged) throw new Error("Browser QA harness source changed during the run");
