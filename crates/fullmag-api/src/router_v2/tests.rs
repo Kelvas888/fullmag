@@ -11586,7 +11586,7 @@ async fn mixed_v2_shared_domain_resources_publish_v2_capability_reason() {
         snapshot.fem_mesh = Some(mesh);
         snapshot.capabilities = Some(
             serde_json::from_value(serde_json::json!({
-                "engine_id": "fem_gpu_native",
+                "engine_id": "fem_native_gpu",
                 "capability_profile_version": "2026-07-28",
                 "supported_terms": [],
                 "feature_capabilities": {
