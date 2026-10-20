@@ -1,11 +1,11 @@
 # Fullmag master — recovery 3806 i poprawki primitive, 20.10.2026
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 20.10.2026, 20:17 UTC
+## Aktualny status wdrożenia — 20.10.2026, 20:28 UTC
 
-Na `master` integrujemy checkpoint `5c072bd16628354060ff5b1c2345e24013e1039c`
-z remote `d0031ce6d220738609b9fa055d90e52eb6e94213`, bez nowego worktree i bez testów. Równoległe zmiany oraz dane są zachowane.
-Przerwa w zapisach mastera obejmuje obecnie checkpoint Git i integrację remote na polecenie użytkownika.
+Na `master` zakończono merge `b724373654c95ea73ea058738a09bd90cc5e7441`;
+lokalny checkpoint i pełny remote zachowane, bez nowego worktree i bez testów. Równoległe zmiany oraz dane są zachowane.
+Przerwa Git jest zwolniona; kolejne okno capture/sync będzie uzgodnione osobno.
 
 - **Build:** ostatnia kompilacja `cuda-fem-gpu` i walidacja pakietu przeszły,
   snapshot `76c8eb727e02bc8dfeebed24cbe124555c3c9a11922a14d5d79bb882321147b0`.
@@ -1561,3 +1561,30 @@ lifecycle. Automatyczny nieblokujący hook commita wykonał lokalny static scan
 React Doctor: 3 ostrzeżenia w StudyInspectorPanel (2 performance, 1 index key);
 nie traktujemy tego jako typecheck ani dowodu gotowości. Znany niezdefiniowany
 owner w równoległym WIP pozostaje zachowany i zgłoszony potencjalnemu autorowi.
+
+
+## 58. Domknięcie Study i gotowość do capture — 20.10.2026, 20:28 UTC
+
+Merge zakończony: `b724373654c95ea73ea058738a09bd90cc5e7441`, rodzice
+`5c072bd16628354060ff5b1c2345e24013e1039c` i
+`d0031ce6d220738609b9fa055d90e52eb6e94213`. Potwierdzono ancestry obu, brak
+MERGE_HEAD i czysty główny checkout po scaleniu (submodules ignore=all).
+Przerwę Git zwolniono wszystkim czterem zadaniom. Nie wykonywano push.
+
+User potwierdził dokładny wcześniejszy skrypt rings. Nie powtarzamy jego
+request04. Najpierw odtworzenie API/native i checkpoint przyjętego runu, potem
+jawny preparation retry i odbiór materializacji/meshu.
+
+Naprawiono niekompletny WIP Study bez transferu szerszej migracji z obcego
+worktree: trzy owner aliases zachowane, brakujące helpers/transakcje odtworzone
+z bazowego42d926... jako3Impl i jawne inline mapowanie owner. Dokładny diff
+do bazowego pliku zawiera wyłącznie3rename deklaracji i mapowanie/aliasy.
+Ciała zachowują scope/history/revision fences. Celowany niezależny review PASS;
+bez testów/nowego buildu. Stan to istniejący draft panelu i serwerowe resource
+hooks; nie dodano store, context ani persisted canonical simulation state.
+
+Przed buildem backend3faec nadal exited/PID0/exit1/non-OOM. C: ma
+104599298048B wolnego. Ocena retencji: zachować wszystkie dane starej3806,
+run03/04, ich logi/receipty/provenance, wciąż przypięte źródła i ostatni cache
+przyrostowy/pakiety. Nie wykazano ich zbędności i niczego nie usunięto. Ponowna
+ocena możliwa po potwierdzeniu nowego runtime i braku referencji/aktywnych lease.

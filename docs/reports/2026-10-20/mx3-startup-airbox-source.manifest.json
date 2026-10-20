@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-20T20:17:15.713957+00:00",
-  "verification": "Merge candidate: checkpoint5c072bd16628354060ff5b1c2345e24013e1039c plus origind0031ce6d220738609b9fa055d90e52eb6e94213. Conflict resolution Python AST24PASS and source markers absent; focused merge review PASS, no blocker. Previous recovery source review and real readonly preview/publication PASS. No new build/runtime/tests. Known undeclared owner in parallel StudyInspectorPanel WIP remains outside qualified source subset.",
+  "observed_at": "2026-10-20T20:28:24.252535+00:00",
+  "verification": "Integrated merge b724373654c95ea73ea058738a09bd90cc5e7441, both parents retained; focused recovery merge review and Python AST24PASS. Study missing owner completed with baseline transaction bodies and preserved aliases; source review PASS. Real pre-ACK preview/publication previously PASS. No new build/runtime/retry/Solve/tests; awaiting managed source capture.",
   "files": [
     {
       "path": "crates/fullmag-runtime-control/src/scheduler.rs",
@@ -153,6 +153,10 @@
     {
       "path": "crates/fullmag-api/src/live_accepted_projection.rs",
       "sha256": "37af132e0ac0010dcf0705e14e4c90f502f246e69509891acb256f822d13e4b5"
+    },
+    {
+      "path": "apps/control-room/src/modules/inspector/panels/StudyInspectorPanel.tsx",
+      "sha256": "12dfe624388270aee6b8365ebb97588f8594c557e0f6c885b104ffbd131a5ac5"
     }
   ]
 }

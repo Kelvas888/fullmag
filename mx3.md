@@ -1,11 +1,11 @@
 # MX3 — audyt frontendu i runtime symulacji Fullmag
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 20.10.2026, 20:17 UTC
+## Aktualny status wdrożenia — 20.10.2026, 20:28 UTC
 
-Na `master` integrujemy checkpoint `5c072bd16628354060ff5b1c2345e24013e1039c`
-z remote `d0031ce6d220738609b9fa055d90e52eb6e94213`, bez nowego worktree i bez testów. Równoległe zmiany oraz dane są zachowane.
-Przerwa w zapisach mastera obejmuje obecnie checkpoint Git i integrację remote na polecenie użytkownika.
+Na `master` zakończono merge `b724373654c95ea73ea058738a09bd90cc5e7441`;
+lokalny checkpoint i pełny remote zachowane, bez nowego worktree i bez testów. Równoległe zmiany oraz dane są zachowane.
+Przerwa Git jest zwolniona; kolejne okno capture/sync będzie uzgodnione osobno.
 
 - **Build:** ostatnia kompilacja `cuda-fem-gpu` i walidacja pakietu przeszły,
   snapshot `76c8eb727e02bc8dfeebed24cbe124555c3c9a11922a14d5d79bb882321147b0`.
@@ -1908,3 +1908,11 @@ Checkpoint `5c072bd16628354060ff5b1c2345e24013e1039c` zachowuje56plików.
 Rozwiązanie merge17commitów przeszło celowany review PASS; target `d0031ce6d220738609b9fa055d90e52eb6e94213`.
 Dwa konflikty rozwiązano z zachowaniem obu dokładnych przypadków recovery.
 Python AST24PASS; bez testów/buildów/restartu. Raport recovery §57.
+
+
+## 50. Zintegrowany master i naprawiony Study — 20.10.2026, 20:28 UTC
+
+Merge `b724373654c95ea73ea058738a09bd90cc5e7441` zachowuje checkpoint i remote.
+Brakujący owner panelu Study domknięty z zachowaniem aliasów i dotychczasowych
+transakcji; review PASS. User potwierdził rings script. Bez nowego runtime,
+retry, Solve i testów. Szczegóły: raport §58.
