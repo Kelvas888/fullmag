@@ -2,9 +2,11 @@
 
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,6 +18,15 @@ import backend_source
 
 @unittest.skipIf(os.name == "nt", "Linux container Git pipe contract")
 class LiveSourceGitTests(unittest.TestCase):
+    @staticmethod
+    def _git(repository: Path, *arguments: str) -> None:
+        subprocess.run(
+            ("git", "-C", str(repository), *arguments),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     @staticmethod
     def _worktree_fixture(root: Path, *, marker_id: str, backref: str):
         source = root / "selected-worktree"
@@ -165,6 +176,124 @@ class LiveSourceGitTests(unittest.TestCase):
         with patch.object(canonical, "_git", return_value=top_level):
             expected = canonical._runtime_status_pathspecs(Path("/unused"))
         self.assertEqual(backend_source._live_runtime_status_pathspecs(tree), expected)
+
+    def test_gitlink_worktree_is_ignored_but_pinned_index_changes_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            self._git(repository, "init", "--quiet")
+            self._git(repository, "config", "user.email", "backend-source@example.invalid")
+            self._git(repository, "config", "user.name", "Backend source test")
+            (repository / "runtime.py").write_text("runtime\n", encoding="utf-8")
+            self._git(repository, "add", "runtime.py")
+            self._git(repository, "commit", "-qm", "initial")
+
+            solver_seed = root / "solver-seed"
+            solver_seed.mkdir()
+            self._git(solver_seed, "init", "--quiet")
+            self._git(solver_seed, "config", "user.email", "solver@example.invalid")
+            self._git(solver_seed, "config", "user.name", "Solver test")
+            (solver_seed / "tracked.txt").write_text("solver\n", encoding="utf-8")
+            self._git(solver_seed, "add", "tracked.txt")
+            self._git(solver_seed, "commit", "-qm", "initial solver")
+            self._git(
+                repository,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(solver_seed),
+                "external_solvers/3",
+            )
+            self._git(repository, "commit", "-qm", "add external solver")
+
+            build_root = root / "build"
+            build_root.mkdir()
+
+            def capture() -> dict[str, object]:
+                manifest_path = backend_source.capture_live_source_manifest(
+                    repository, repository / ".git", build_root
+                )
+                return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            with patch.object(
+                backend_source, "_live_run_git", wraps=backend_source._live_run_git
+            ) as run_git:
+                first = capture()
+            status_calls = [
+                call.args[2:]
+                for call in run_git.call_args_list
+                if len(call.args) >= 3 and call.args[2] == "status"
+            ]
+            self.assertTrue(status_calls)
+            self.assertTrue(
+                all("--ignore-submodules=all" in arguments for arguments in status_calls)
+            )
+
+            first_gitlinks = [
+                item
+                for item in first["source_manifest"]["excluded"]
+                if isinstance(item, dict)
+                and item.get("path") == "external_solvers/3"
+                and item.get("type") == "gitlink"
+            ]
+            self.assertEqual(len(first_gitlinks), 1)
+            first_pin = first_gitlinks[0]["pinned_commit"]
+
+            solver_checkout = repository / "external_solvers" / "3"
+            (solver_checkout / "tracked.txt").write_text(
+                "dirty solver worktree\n", encoding="utf-8"
+            )
+            dirty = capture()
+            self.assertEqual(dirty["source_digest"], first["source_digest"])
+            self.assertFalse(
+                dirty["native_source_identity"]["source_snapshot_dirty"]
+            )
+
+            canonical_path = Path(__file__).resolve().parent / "capture_source_snapshot_identity.py"
+            spec = importlib.util.spec_from_file_location("gitlink_canonical_identity", canonical_path)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            canonical = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(canonical)
+            for ignore_non_runtime_dirty in (False, True):
+                with patch.object(canonical, "_git", wraps=canonical._git) as canonical_git:
+                    identity = canonical.capture(
+                        repository, ignore_non_runtime_dirty=ignore_non_runtime_dirty
+                    )
+                self.assertFalse(identity["source_snapshot_dirty"])
+                self.assertEqual(identity["dirty_path_content"], [])
+                canonical_status = [
+                    call.args[1:] for call in canonical_git.call_args_list
+                    if len(call.args) >= 2 and call.args[1] == "status"
+                ]
+                self.assertTrue(canonical_status)
+                self.assertTrue(all(
+                    "--ignore-submodules=all" in arguments
+                    for arguments in canonical_status
+                ))
+
+            (solver_checkout / "tracked.txt").write_text(
+                "next solver commit\n", encoding="utf-8"
+            )
+            self._git(solver_checkout, "config", "user.email", "solver@example.invalid")
+            self._git(solver_checkout, "config", "user.name", "Solver test")
+            self._git(solver_checkout, "add", "tracked.txt")
+            self._git(solver_checkout, "commit", "-qm", "next solver")
+            self._git(repository, "add", "external_solvers/3")
+            changed_pin = capture()
+            changed_gitlinks = [
+                item
+                for item in changed_pin["source_manifest"]["excluded"]
+                if isinstance(item, dict)
+                and item.get("path") == "external_solvers/3"
+                and item.get("type") == "gitlink"
+            ]
+            self.assertNotEqual(changed_pin["source_digest"], first["source_digest"])
+            self.assertTrue(
+                any(item.get("pinned_commit") != first_pin for item in changed_gitlinks)
+            )
 
     def test_full_untracked_scan_reconstructs_porcelain_records(self):
         paths, records = backend_source._live_untracked_records(
