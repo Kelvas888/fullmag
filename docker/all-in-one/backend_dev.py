@@ -37,6 +37,7 @@ try:
 except ImportError:  # pragma: no cover - direct backend images are Linux
     fcntl = None  # type: ignore[assignment]
 
+import backend_candidate_retirement as candidate_retirement
 from backend_source import (
     BackendSourceError,
     capture_live_source_manifest,
@@ -3378,56 +3379,6 @@ def _write_candidate_marker(
     _fsync_directory(candidate, "backend package candidate directory")
 
 
-def _recover_initial_ready_package(output: Path, control_root: Path, build_root: Path) -> None:
-    """Finish one complete first publication, keeping all original evidence.
-
-    The caller holds the runtime build lock and has proved the current package
-    is empty. A recovered package is only a previous build: start must still
-    compare a fresh source/toolchain capture before it can serve any API.
-    Ambiguous, partial, or unowned candidates remain subject to the ordinary
-    fail-closed candidate guard.
-    """
-
-    candidates = control_root / PACKAGE_CANDIDATES_DIRNAME
-    entries = []
-    for entry in candidates.iterdir():
-        entries.append(entry)
-        if len(entries) > 1:
-            return
-    if not entries:
-        return
-    candidate = entries[0]
-    marker = _validate_candidate_marker(candidate, output, build_root, state=None)
-    if marker.get("state") != "ready":
-        return
-    if not (candidate / "backend-build-receipt.json").exists():
-        return
-    attempt = _read_failed_make_attempt(build_root, candidate)
-    if attempt is None or attempt[0].get("state") != "succeeded":
-        _fail("ready initial backend package has no successful Make receipt")
-    make_receipt = attempt[0]
-    receipt, receipt_bytes, _children = _validated_package(
-        candidate, "recoverable initial backend package", exclude_candidate_marker=True
-    )
-    records = receipt["artifacts"]
-    _assert_direct_candidate_inventory(candidate, records, include_receipt=True)
-    if marker.get("artifact_inventory_sha256") != _sha256_bytes(_canonical(records)):
-        _fail("ready initial backend package inventory differs from its owner marker")
-    command = receipt.get("command")
-    if not isinstance(command, list) or not command or command[-1] != make_receipt["make_target"]:
-        _fail("ready initial backend package Make target differs from its attempt")
-    digest, metadata = _sha256_file(
-        candidate / FAILED_MAKE_LOG_NAME, "recoverable initial Make log", MAX_BUILD_LOG_BYTES
-    )
-    if digest != make_receipt["log_sha256"] or metadata.st_size != make_receipt["log_size"]:
-        _fail("ready initial backend package log differs from its Make attempt")
-    _fsync_owned_tree(candidate, "recoverable initial backend package")
-    rotation = _rotate_package(output, candidate, control_root, {}, None, receipt_bytes)
-    _finalize_published_candidate(candidate, rotation)
-    _clear_rotation_journal(rotation)
-    _log_phase("package", "recovered-initial-publication", receipt_sha256=_sha256_bytes(receipt_bytes))
-
-
 def _reject_partial_package_candidates(
     output: Path,
     control_root: Path,
@@ -3521,6 +3472,141 @@ def _reject_partial_package_candidates(
         except OSError as error:
             _fail(f"cannot retire published backend package candidate {entry.name}: {error}")
 
+
+_CANDIDATE_PAYLOAD_GUARD_PREFIX = (
+    "ready backend package candidate retains payload or unknown entries: "
+)
+
+
+def _candidate_retirement_entries(control_root: Path) -> list[Path]:
+    """List only bounded candidate directories for typed retirement."""
+
+    candidates = control_root / PACKAGE_CANDIDATES_DIRNAME
+    try:
+        iterator = iter(candidates.iterdir())
+        entries: list[Path] = []
+        for _ in range(MAX_PACKAGE_CANDIDATES + 1):
+            try:
+                entries.append(next(iterator))
+            except StopIteration:
+                break
+    except OSError as error:
+        _fail(f"cannot inspect backend package candidate staging: {error}")
+    if len(entries) > MAX_PACKAGE_CANDIDATES:
+        _fail("backend package candidate staging exceeds its bounded entry limit")
+    entries.sort(key=lambda path: path.name)
+    result: list[Path] = []
+    for entry in entries:
+        metadata = entry.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            _fail(
+                "backend package candidate staging contains an unsafe entry: "
+                f"{entry.name}"
+            )
+        if not PACKAGE_CANDIDATE_NAME_RE.fullmatch(entry.name):
+            _fail(
+                "backend package candidate staging contains an unknown entry: "
+                f"{entry.name}"
+            )
+        result.append(entry)
+    return result
+
+
+def _qualify_ready_candidate_retirements(
+    output: Path,
+    control_root: Path,
+    build_root: Path,
+    current_package: tuple[
+        dict[str, Any], bytes, dict[str, tuple[int, int, int, int, int]]
+    ]
+    | None,
+) -> list[Any]:
+    """Keep the old guard fail-closed except for complete ready payloads."""
+
+    try:
+        _reject_partial_package_candidates(
+            output,
+            control_root,
+            build_root,
+            current_package=current_package,
+        )
+    except BackendBuildError as error:
+        # Only the old ready-payload rejection is recoverable by the typed
+        # retirement path.  Building, malformed, unknown, and journal-related
+        # states retain the original early failure behavior.
+        if not str(error).startswith(_CANDIDATE_PAYLOAD_GUARD_PREFIX):
+            raise
+    else:
+        return []
+    return [
+        candidate_retirement.qualify_ready_candidate(
+            sys.modules[__name__],
+            candidate,
+            output,
+            control_root,
+            build_root,
+        )
+        for candidate in _candidate_retirement_entries(control_root)
+    ]
+
+
+def _classify_ready_candidate_retirements(
+    specs: list[Any],
+    fresh_manifest: Path,
+    toolchain: Mapping[str, Any],
+    cargo_profile: str,
+    current_package: tuple[
+        dict[str, Any], bytes, dict[str, tuple[int, int, int, int, int]]
+    ]
+    | None,
+) -> Any | None:
+    """Retire stale/duplicate candidates and return one fresh promotion."""
+
+    if not specs:
+        return None
+    current_artifacts = None
+    if current_package is not None:
+        current_artifacts = current_package[0].get("artifacts")
+        if not isinstance(current_artifacts, list):
+            _fail("verified current backend package has no artifact inventory")
+
+    # Count before mutating any candidate so two fresh non-duplicates fail
+    # closed without partially retiring the rest of the bounded set.
+    promotions = [
+        spec
+        for spec in specs
+        if _package_matches_fresh_live_manifest(
+            spec.receipt,
+            fresh_manifest,
+            toolchain,
+            cargo_profile,
+        )
+        and (current_artifacts is None or list(spec.artifacts) != current_artifacts)
+    ]
+    if len(promotions) > 1:
+        _fail("multiple fresh backend package candidates are eligible for promotion")
+    if current_package is None and len(promotions) != len(specs):
+        _fail("candidate retirement requires a verified current package for stale candidate")
+    promotion = promotions[0] if promotions else None
+    for spec in specs:
+        result = candidate_retirement.retire_candidate(
+            sys.modules[__name__],
+            spec,
+            fresh_manifest,
+            toolchain,
+            cargo_profile,
+            current_package,
+        )
+        if result.action == "promote":
+            if promotion is None or result.candidate != promotion.candidate:
+                _fail("candidate retirement returned an unexpected promotion")
+        elif result.action != "retired":
+            _fail(f"candidate retirement returned an unsupported action: {result.action}")
+    return promotion
 
 def _flatten_package_library_aliases(root: Path) -> None:
     """Materialize only the allowed native SONAME aliases in a direct candidate."""
@@ -4807,6 +4893,7 @@ def _start(args: argparse.Namespace) -> int:
     provenance_before: bytes | None = None
     provenance_publish_started = False
     publication_committed = False
+    promotion_spec: Any | None = None
     # Keep the lock across package verification and the exec handoff.  The
     # descriptor is O_CLOEXEC, so the API process does not inherit a stale
     # build lock after execvpe.  A failed build therefore cannot start API.
@@ -4828,25 +4915,44 @@ def _start(args: argparse.Namespace) -> int:
                 )
             else:
                 previous_receipt = None
-                _recover_initial_ready_package(output, control_root, build_root)
-                if _package_children(output, "recovered backend package", exclude_development_control=True):
-                    previous_receipt = _validated_package(
-                        output, "recovered backend package", exclude_development_control=True
-                    )
-            _reject_partial_package_candidates(
+            _backend_cache_receipt()
+            candidate_retirement.recover_pending_retirements(
+                sys.modules[__name__],
                 output,
                 control_root,
                 build_root,
-                current_package=previous_receipt,
+                previous_receipt,
             )
-            _backend_cache_receipt()
+            ready_retirements = _qualify_ready_candidate_retirements(
+                output,
+                control_root,
+                build_root,
+                previous_receipt,
+            )
             _prune_failed_make_logs(build_root, output)
             _, toolchain = _toolchain_identity()
             start_args = argparse.Namespace(**vars(args))
             start_args.manifest = _capture_start_manifest(args, build_root)
             start_args.source_tar = None
-            if previous_receipt is not None and _package_matches_fresh_live_manifest(
-                previous_receipt[0], start_args.manifest, toolchain, cargo_profile
+            promotion_spec = _classify_ready_candidate_retirements(
+                ready_retirements,
+                start_args.manifest,
+                toolchain,
+                cargo_profile,
+                previous_receipt,
+            )
+            if promotion_spec is None:
+                _reject_partial_package_candidates(
+                    output, control_root, build_root, current_package=previous_receipt
+                )
+            elif _candidate_retirement_entries(control_root) != [promotion_spec.candidate]:
+                _fail("ready candidate staging changed before promotion")
+            if (
+                promotion_spec is None
+                and previous_receipt is not None
+                and _package_matches_fresh_live_manifest(
+                    previous_receipt[0], start_args.manifest, toolchain, cargo_profile
+                )
             ):
                 _log_phase("start", "cache-hit", source="verified-package")
                 provenance_before = _snapshot_bound_provenance()
@@ -4854,51 +4960,60 @@ def _start(args: argparse.Namespace) -> int:
                 _publish_runtime_provenance(output)
                 _log_phase("start", "handoff", cache="hit")
                 return _serve([])
-            if previous_receipt is not None:
-                _preflight_candidate_storage(build_root, previous_receipt[0])
-            candidate = Path(
-                tempfile.mkdtemp(
-                    prefix=".backend-package-candidate-",
-                    dir=control_root / PACKAGE_CANDIDATES_DIRNAME,
+            if promotion_spec is None:
+                if previous_receipt is not None:
+                    _preflight_candidate_storage(build_root, previous_receipt[0])
+                candidate = Path(
+                    tempfile.mkdtemp(
+                        prefix=".backend-package-candidate-",
+                        dir=control_root / PACKAGE_CANDIDATES_DIRNAME,
+                    )
                 )
-            )
-            _write_candidate_marker(
-                candidate,
-                output,
-                build_root,
-                state="building",
-            )
-            try:
-                result = _prepare_locked(
-                    start_args,
+                _write_candidate_marker(
+                    candidate,
+                    output,
                     build_root,
-                    candidate,
-                    jobs,
-                    toolchain,
-                    candidate,
+                    state="building",
                 )
-            except (BackendBuildError, OSError):
-                if _discard_failed_candidate_if_owned(candidate, output, build_root):
-                    candidate = None
-                raise
-            if result != 0:
-                _fail(f"backend preparation failed with exit code {result}")
-            candidate_marker = _validate_candidate_marker(
-                candidate,
-                output,
-                build_root,
-                state="ready",
-            )
-            candidate_inventory = _hash_package(candidate)
-            if candidate_marker.get("artifact_inventory_sha256") != _sha256_bytes(
-                _canonical(candidate_inventory)
-            ):
-                _fail("candidate backend package owner marker inventory proof differs")
-            _candidate_receipt, candidate_receipt_bytes, _candidate_children = _validated_package(
-                candidate,
-                "candidate backend package",
-                exclude_candidate_marker=True,
-            )
+                try:
+                    result = _prepare_locked(
+                        start_args,
+                        build_root,
+                        candidate,
+                        jobs,
+                        toolchain,
+                        candidate,
+                    )
+                except (BackendBuildError, OSError):
+                    if _discard_failed_candidate_if_owned(candidate, output, build_root):
+                        candidate = None
+                    raise
+                if result != 0:
+                    _fail(f"backend preparation failed with exit code {result}")
+                candidate_marker = _validate_candidate_marker(
+                    candidate,
+                    output,
+                    build_root,
+                    state="ready",
+                )
+                candidate_inventory = _hash_package(candidate)
+                if candidate_marker.get("artifact_inventory_sha256") != _sha256_bytes(
+                    _canonical(candidate_inventory)
+                ):
+                    _fail("candidate backend package owner marker inventory proof differs")
+                _candidate_receipt, candidate_receipt_bytes, _candidate_children = _validated_package(
+                    candidate,
+                    "candidate backend package",
+                    exclude_candidate_marker=True,
+                )
+            else:
+                # The typed path has already validated this ready candidate and
+                # sealed its source manifest.  Reuse its payload through the
+                # normal rotation journal; no Make invocation is allowed.
+                candidate = promotion_spec.candidate
+                _candidate_receipt = dict(promotion_spec.receipt)
+                candidate_receipt_bytes = promotion_spec.receipt_bytes
+
             if previous_receipt is not None:
                 _validated_package(
                     output,
@@ -4928,6 +5043,17 @@ def _start(args: argparse.Namespace) -> int:
                 journal_cleared = False
                 _log_phase("package", "rotation-journal-retained", reason=type(error).__name__)
             if journal_cleared:
+                if promotion_spec is not None:
+                    promoted_current = _validated_package(
+                        output,
+                        "promoted backend package",
+                        exclude_development_control=True,
+                    )
+                    candidate_retirement.mark_promoted_archive_historical(
+                        sys.modules[__name__],
+                        promotion_spec,
+                        promoted_current,
+                    )
                 try:
                     _retain_package_backups(
                         output,

@@ -37,6 +37,12 @@ function statusResource(
         simulation_preparation_revision: patch.preparationRevision ?? 7,
       },
       session: { name: "permalloy-relaxation" },
+      lifecycle: {
+        commandability: "allowed",
+        connectivity: "connected",
+        session_resource: "active",
+        solver: "idle",
+      },
       solver: { state: patch.solverState ?? "bootstrapping" },
     } as LiveStatusResource,
     status,

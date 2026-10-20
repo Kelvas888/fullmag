@@ -124,6 +124,51 @@ Launcher nie uznaje takiej aktywacji za udaną kwalifikację. Błędy integralno
 provenance, polityki i kontraktu odpowiedzi pozostają fatalne. Zmiana nie
 poszerza listy znanych odrzuceń fizyki i nie resetuje ownera ani historii.
 
+## Rozszerzenie 20.10.2026 — gotowy, nieopublikowany staging
+
+Po awarii pomiędzy ukończeniem Make a rotacją może pozostać pełny kandydat
+`ready`. Make z kodem 0 nie uprawnia do uruchomienia go ani do usunięcia jego
+payloadu. Backend pod blokadą cache weryfikuje marker, kompletny pakiet,
+inventory, terminalny receipt Make i log oraz brak journalu rotacji. Bieżący
+pakiet i jego provenance muszą być zgodne; kandydat nie może być pakietem
+wskazanym przez aktywną publikację. Nieznane i niekompletne stany pozostają
+zachowane i blokują start.
+
+Przed kolejnym capture zachowujemy dokładny oryginalny manifest źródeł:
+capture zapisuje następny manifest pod tą samą ścieżką. Niezmienny zapis
+przygotowania w technicznym control volume nie autoryzuje usuwania. Dopiero
+porównanie ze świeżymi źródłami, toolchainem i profilem pozwala sklasyfikować
+kandydata. Pasujący pakiet może przejść przez istniejącą journalowaną rotację;
+nie powstaje drugi mechanizm publikacji. Pakiet niepasujący albo dokładny
+duplikat wymaga osobnej transakcji retirementu.
+
+Namespace `backend/candidate-retirements` w control volume ma własny,
+ograniczony schemat (64 archiwa, 64 MiB łącznie). Wyczerpanie limitu
+zatrzymuje nowy retirement przed alokacją; nie uruchamia ogólnego GC.
+Przed usunięciem zbędnego payloadu zapisuje i odczytuje
+kontrolnie receipt, marker, pełne inventory, manifesty, provenance i logi.
+Trwały intent wiąże dokładny cel i decyzję ze źródłami; sam katalog archiwum,
+data ani rozmiar nie są dowodem zbędności. Po przerwaniu usuwania wznowienie
+sprawdza niezmienne archiwum i każdy pozostały plik. Obcy plik lub rozbieżność
+zatrzymują cleanup. Marker znika na końcu. Bieżący pakiet, rollback, cache,
+sesje, wyniki oraz owner/lease/rezerwacje pozostają poza tą operacją.
+
+Ukończona promocja zamyka przygotowanie jako `historical`. Po przerwaniu
+tego kroku recovery potwierdza dokładny current receipt, provenance i brak
+journalu, zanim domknie sam zapis historii. Przygotowanie archiwum używa
+osobnego namespace `backend/candidate-retirement-staging`, ograniczonego
+do 4 wpisów i 64 MiB. Przerwany staging pozostaje zachowany i liczony
+do limitu; nie jest odczytywany jako finalne archiwum. Budżet danych
+sprawdzamy przed kopiowaniem plików i generowaniem JSON.
+
+Brak automatycznego GC historii jest zamierzony: wyczerpanie budżetu blokuje
+nowy retirement, a zwykły start zweryfikowanego pakietu nie tworzy kolejnych
+archiwów. Archiwum dowodów nie zawiera ponownej kopii binariów.
+
+To rozszerzenie opisuje kontrakt implementowanej ścieżki. Weryfikacja
+rzeczywistego odzyskania, ograniczeń zapisu i odporności na przerwanie
+pozostaje **NOT VERIFIED** do uzyskania konkretnych receiptów.
+
 ## Rozszerzenie 18.10.2026 — wszystkie dane builda w Dockerze
 
 Użytkownik przyjął docelową granicę: zależności, cache, cień źródeł, pakiety,

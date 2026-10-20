@@ -65,6 +65,19 @@ function registryWithStudyRuntimeCommands(): CommandRegistry {
   return registry;
 }
 
+function expectPendingAcceptedRuntimeCommand(
+  result: unknown,
+  message: string,
+  commandId: string,
+): void {
+  expect(result).toEqual({
+    commandId,
+    message,
+    observation: "waiting",
+    status: "pending",
+  });
+}
+
 function objectSelection(objectId = "body") {
   return {
     get: () => ({
@@ -1715,10 +1728,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toEqual({
-      message: "Compute fields command accepted.",
-      status: "completed",
-    });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "Compute fields command accepted.",
+      "cmd-fields",
+    );
     expect(submit).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "compute_fields",
@@ -1767,10 +1781,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toEqual({
-      message: "Compute energies command accepted.",
-      status: "completed",
-    });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "Compute energies command accepted.",
+      "cmd-energies",
+    );
     expect(submit).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "compute_energies",
@@ -1817,10 +1832,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toEqual({
-      message: "Study compute command accepted.",
-      status: "completed",
-    });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "Study compute command accepted.",
+      "cmd-solve",
+    );
     expect(submit).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "solve",
@@ -1948,7 +1964,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toMatchObject({ status: "completed" });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "Study compute command accepted.",
+      "cmd-fem-solve",
+    );
     expect(order).toEqual([
       "preparation",
       "scene",
@@ -2485,10 +2505,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toEqual({
-      message: "VTK export command accepted.",
-      status: "completed",
-    });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "VTK export command accepted.",
+      "cmd-vtk",
+    );
     expect(submit).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "save_vtk",
@@ -3525,10 +3546,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toEqual({
-      message: "Paused state discard command accepted.",
-      status: "completed",
-    });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "Paused state discard command accepted.",
+      "cmd-discard",
+    );
     expect(submit).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "stop",
@@ -3574,10 +3596,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toEqual({
-      message: "Pause command accepted.",
-      status: "completed",
-    });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "Pause command accepted.",
+      "cmd-pause",
+    );
     expect(submit).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "pause",
@@ -3656,7 +3679,13 @@ describe("study runtime command contributions", () => {
         source: "test",
       });
 
-      expect(result.status).toBe("completed");
+      const message =
+        kind === "pause"
+          ? "Pause command accepted."
+          : kind === "stop"
+            ? "Stop command accepted."
+            : "Skip stage command accepted.";
+      expectPendingAcceptedRuntimeCommand(result, message, `cmd-${kind}`);
       expect(submit).toHaveBeenCalledWith(
         expect.objectContaining({
           kind,
@@ -3722,10 +3751,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toEqual({
-      message: "Study compute command accepted.",
-      status: "completed",
-    });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "Study compute command accepted.",
+      "cmd-run",
+    );
     expect(submit).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "solve",
@@ -3788,10 +3818,11 @@ describe("study runtime command contributions", () => {
       source: "test",
     });
 
-    expect(result).toEqual({
-      message: "Compute energies command accepted.",
-      status: "completed",
-    });
+    expectPendingAcceptedRuntimeCommand(
+      result,
+      "Compute energies command accepted.",
+      "cmd-energies",
+    );
     expect(submit).toHaveBeenCalledTimes(1);
     const [request] = submit.mock.calls[0] as unknown as [
       { precondition?: Record<string, unknown> },
@@ -4097,8 +4128,11 @@ describe("study runtime command contributions", () => {
       expect(registry.get("study.update-k-path")?.disabledReason?.(context3)).toBe("Update k-Path is not implemented yet.");
 
       const res1 = await registry.get("study.trigger-field-calculation")?.run(context3);
-      expect(res1?.status).toBe("completed");
-      expect(res1?.message).toBe("Field calculation command accepted.");
+      expectPendingAcceptedRuntimeCommand(
+        res1,
+        "Field calculation command accepted.",
+        "cmd-fields",
+      );
       expect(submit).toHaveBeenCalledWith(
         expect.objectContaining({
           kind: "compute_fields",
