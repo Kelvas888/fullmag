@@ -2292,6 +2292,29 @@ class BackendPackageTests(unittest.TestCase):
             self.assertEqual((target / "lib/libfullmag_fdm.so").read_bytes(), b"native-library")
             self.assertFalse((target / "lib/libfullmag_fdm.so").is_symlink())
 
+    def test_make_default_and_direct_install_roots_are_distinct(self):
+        makefile = Path(__file__).resolve().with_name("Makefile")
+        if not makefile.is_file():
+            makefile = Path(__file__).resolve().parents[1] / "Makefile"
+        source = makefile.read_text(encoding="utf-8")
+        self.assertIn("FULLMAG_INTERNAL_INSTALL_ROOT ?= .fullmag/local", source)
+        self.assertIn('mkdir -p "$(FULLMAG_INTERNAL_INSTALL_ROOT)"', source)
+        self.assertIn('$(FULLMAG_INTERNAL_INSTALL_ROOT)/bin/fullmag-bin', source)
+        self.assertIn('$(FULLMAG_INTERNAL_INSTALL_ROOT)/lib/', source)
+        self.assertIn(
+            'rm -f "$(FULLMAG_INTERNAL_INSTALL_ROOT)/lib/"libfullmag_fdm.so*',
+            source,
+        )
+        self.assertNotIn(
+            'rm -f "$(FULLMAG_INTERNAL_INSTALL_ROOT)/lib/libfullmag_fdm.so*"',
+            source,
+        )
+        self.assertIn('source_identity_file="$(FULLMAG_INTERNAL_INSTALL_ROOT)/source-identity.json"', source)
+        self.assertIn('FULLMAG_FEM_MESH_CACHE_DIR="$$REPO_ROOT/.fullmag/local/cache/fem_mesh_assets"', source)
+        self.assertIn('show-cli-path:', source)
+        self.assertIn('$(PWD)/.fullmag/local/bin/fullmag', source)
+
+
     def test_package_alias_cannot_escape_library_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
