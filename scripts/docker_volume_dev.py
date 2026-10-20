@@ -3309,6 +3309,288 @@ def _read_canonical_control_record(control, relative, label):
     return raw, dict(value)
 
 
+def _validate_failed_prestart_successor(
+    args,
+    control,
+    selected,
+    identity,
+    *,
+    current_raw,
+    current,
+    previous_raw,
+    previous,
+    document_raw,
+    operation_raw,
+    operation_terminal,
+    retained_raw,
+    operator_probe_record,
+    native_recovery_context,
+    removed_container_proof,
+):
+    """Admit only the closed start attempt that failed before publication.
+
+    A recreation caller can open a fresh development lease before Compose is
+    rendered.  If that host process fails at that pre-start boundary, the
+    durable current pointer no longer equals the original development
+    attempt.  This narrow bridge authenticates that one successor, then all
+    existing recreation/continuation validators continue to use ``previous``
+    as the historical attempt.  It is deliberately not a general later-
+    attempt recovery path.
+    """
+
+    from docker_volume_post_build_generation import (
+        _accepted_metadata,
+        _validate_metadata_shape,
+        validate_continuation_metadata,
+        validate_start_binding,
+    )
+    from docker_volume_stop_unadmitted import _control_bytes
+
+    if not isinstance(current, Mapping) or current_raw != canonical(current) + b"\n":
+        raise BuildControlError("Pre-start successor terminal is not canonical")
+    successor_attempt = current.get("attempt")
+    if (
+        not isinstance(successor_attempt, str)
+        or _RECOVERY_ATTEMPT.fullmatch(successor_attempt) is None
+        or successor_attempt == args.attempt
+    ):
+        raise BuildControlError("Pre-start successor is not a distinct development attempt")
+    if (
+        current.get("schema") != "fullmag.docker-build-operation.v1"
+        or current.get("phase") != "development"
+        or current.get("state") != "failed-confirmed"
+        or current.get("compose_project") != control.project
+        or current.get("control_volume") != control.volume
+    ):
+        raise BuildControlError("Pre-start successor is not a failed development receipt")
+    error = current.get("error")
+    if not isinstance(error, str) or not error.startswith(
+        "Post-build continuation changed under the new development lease: "
+    ):
+        raise BuildControlError("Pre-start successor did not fail at the unmodified admission gate")
+    if current.get("state_root") != previous.get("state_root"):
+        raise BuildControlError("Pre-start successor changed the retained session state root")
+
+    successor_inputs = current.get("inputs")
+    if not isinstance(successor_inputs, Mapping):
+        raise BuildControlError("Pre-start successor has no operation inputs")
+    if "recreation_resume" in successor_inputs:
+        expected_resume = {
+            key: removed_container_proof[key]
+            for key in (
+                "recreation_operation_id", "recreation_terminal_sha256",
+                "retained_snapshot_sha256", "prior_terminal_sha256", "prior_compose_sha256",
+            )
+        }
+        expected_resume["proof_sha256"] = hashlib.sha256(canonical(removed_container_proof)).hexdigest()
+        if successor_inputs["recreation_resume"] != expected_resume:
+            raise BuildControlError("Pre-start successor recreation resume proof differs")
+    metadata = current.get("post_build_generation")
+    if successor_inputs.get("post_build_generation") != metadata:
+        raise BuildControlError("Pre-start successor continuation metadata is not receipt-bound")
+    if not isinstance(metadata, Mapping):
+        raise BuildControlError("Pre-start successor has no continuation metadata")
+    try:
+        validated_metadata = validate_continuation_metadata(metadata)
+    except BuildControlError as error:
+        raise BuildControlError("Pre-start successor continuation metadata is invalid: " + str(error)) from error
+    if (
+        validated_metadata.get("operation_id") != previous.get("attempt")
+        or validated_metadata.get("compose_project") != control.project
+        or validated_metadata.get("source_root") != str(selected)
+    ):
+        raise BuildControlError("Pre-start successor continuation does not name the retained attempt/source")
+    source_identity = validated_metadata.get("source_identity")
+    if not isinstance(source_identity, Mapping) or any(
+        source_identity.get(key) != identity.get(identity_key)
+        for key, identity_key in (
+            ("project_id", "project_id"),
+            ("worktree_id", "worktree_id"),
+            ("checkout_kind", "checkout_kind"),
+        )
+    ):
+        raise BuildControlError("Pre-start successor continuation source identity differs")
+
+    previous_inputs = previous.get("inputs")
+    if not isinstance(previous_inputs, Mapping):
+        raise BuildControlError("Retained development attempt has no inputs")
+    for key, expected in (
+        ("source_root", str(selected)),
+        ("source_project_id", identity.get("project_id")),
+        ("source_worktree_id", identity.get("worktree_id")),
+        ("source_checkout_kind", identity.get("checkout_kind")),
+        ("gpu_access_requested", previous_inputs.get("gpu_access_requested")),
+        ("device_access", previous_inputs.get("device_access")),
+        ("gpu_preflight", previous_inputs.get("gpu_preflight")),
+    ):
+        if successor_inputs.get(key) != expected:
+            raise BuildControlError("Pre-start successor input differs: " + key)
+    for key, expected in operator_probe_record.items():
+        if successor_inputs.get(key) != expected:
+            raise BuildControlError("Pre-start successor operator control differs: " + key)
+    for key in ("image_id",) + (("toolchain_image_id",) if "toolchain_image_id" in successor_inputs else ()):
+        value = successor_inputs.get(key)
+        if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+            raise BuildControlError("Pre-start successor has no immutable " + key)
+    if successor_inputs.get("previous_config_sha256") != validated_metadata["runtime_config"]["sha256"]:
+        raise BuildControlError("Pre-start successor runtime configuration pin differs")
+    expected_native_restart = native_recovery_context.get("native_restart_metadata")
+    if (("native_failed_restart" in successor_inputs) != (expected_native_restart is not None)
+            or successor_inputs.get("native_failed_restart") != expected_native_restart):
+        raise BuildControlError("Pre-start successor native restart evidence differs")
+    allowed_inputs = {
+        "source_root", "image_id", "source_project_id", "source_worktree_id",
+        "source_checkout_kind", "gpu_access_requested", "device_access", "gpu_preflight",
+        "previous_config_sha256", "post_build_generation", *operator_probe_record,
+    }
+    if "toolchain_image_id" in successor_inputs:
+        allowed_inputs.add("toolchain_image_id")
+    if "recreation_resume" in successor_inputs:
+        allowed_inputs.add("recreation_resume")
+    if expected_native_restart is not None:
+        allowed_inputs.add("native_failed_restart")
+    accepted_run = validated_metadata.get("accepted_run")
+    if accepted_run:
+        allowed_inputs.add("accepted_reattach")
+    if set(successor_inputs) != allowed_inputs:
+        raise BuildControlError("Pre-start successor operation input fields differ")
+    for key, expected in operator_probe_record.items():
+        if current.get(key) != expected:
+            raise BuildControlError("Pre-start successor receipt operator control differs: " + key)
+    if accepted_run:
+        producer = successor_inputs.get("accepted_reattach")
+        if (not isinstance(producer, Mapping)
+                or current.get("accepted_reattach") != producer
+                or operation_terminal.get("accepted_reattach") != producer):
+            raise BuildControlError("Pre-start successor accepted-run producer evidence differs")
+        # The continuation carries the existing closed projection, while the
+        # operation retains the full producer record (including source and
+        # activation provenance). Never compare these different contracts as
+        # though their field sets were identical.
+        accepted_projection = _accepted_metadata({
+            "accepted_reattach_metadata": producer,
+            "accepted_reattach_environment": {
+                "FULLMAG_ACCEPTED_REATTACH_REQUEST": producer.get("request_relative"),
+                "FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256": producer.get("request_sha256"),
+            },
+        })
+        if accepted_projection != accepted_run:
+            raise BuildControlError("Pre-start successor accepted-run projection differs")
+    elif "accepted_reattach" in current or "accepted_reattach" in operation_terminal:
+        raise BuildControlError("Pre-start successor has unexpected accepted-run evidence")
+
+    operation_metadata = operation_terminal.get("post_build_generation")
+    if not isinstance(operation_metadata, Mapping):
+        raise BuildControlError("Completed recreation has no post-build continuation metadata")
+    try:
+        operation_base = _validate_metadata_shape(operation_metadata)
+    except BuildControlError as error:
+        raise BuildControlError("Completed recreation continuation metadata is invalid: " + str(error)) from error
+    current_base = dict(validated_metadata)
+    current_recreate = current_base.pop("recreate_operation", None)
+    operation_base.pop("recreate_operation", None)
+    if current_base != operation_base:
+        raise BuildControlError("Pre-start successor continuation changed the completed recreation proof")
+    if not isinstance(current_recreate, Mapping):
+        raise BuildControlError("Pre-start successor has no recreation binding")
+    recreation_root = "recreate-services/attempts/" + args.resume_recreation
+    if (
+        current_recreate.get("operation_id") != args.resume_recreation
+        or current_recreate.get("terminal_relative") != recreation_root + "/terminal.json"
+        or current_recreate.get("retained_relative") != recreation_root + "/retained-containers.json"
+        or current_recreate.get("terminal_sha256") != hashlib.sha256(operation_raw).hexdigest()
+        or current_recreate.get("retained_sha256") != hashlib.sha256(retained_raw).hexdigest()
+        or current_recreate.get("prior_terminal_sha256") != hashlib.sha256(previous_raw).hexdigest()
+        or current_recreate.get("prior_compose_sha256") != hashlib.sha256(document_raw).hexdigest()
+    ):
+        raise BuildControlError("Pre-start successor recreation binding does not match the retained proof")
+
+    reference = current.get("post_build_start")
+    expected_reference_fields = {"schema", "state", "path", "sha256", "continuation_sha256"}
+    if not isinstance(reference, Mapping) or set(reference) != expected_reference_fields:
+        raise BuildControlError("Pre-start successor has no exact pending start binding")
+    expected_root = "development/attempts/" + successor_attempt
+    expected_guest_path = "/opt/fullmag/control/" + expected_root + "/post-build-continuation.json"
+    metadata_sha = hashlib.sha256(canonical(validated_metadata) + b"\n").hexdigest()
+    binding_sha = reference.get("sha256")
+    if (
+        reference.get("schema") != "fullmag.docker-post-build-failed-owner-start.v1"
+        or reference.get("state") != "pending"
+        or reference.get("path") != expected_guest_path
+        or reference.get("continuation_sha256") != metadata_sha
+        or not isinstance(binding_sha, str)
+        or _SHA256.fullmatch(binding_sha) is None
+        or set(binding_sha) == {"0"}
+    ):
+        raise BuildControlError("Pre-start successor start binding is not the exact pending reference")
+    binding_relative = expected_root + "/post-build-continuation.json"
+    binding_raw = _control_bytes(control, binding_relative, optional=True)
+    if binding_raw is None:
+        raise BuildControlError("Pre-start successor pending start binding is missing")
+    try:
+        binding = json.loads(binding_raw)
+        checked_binding = validate_start_binding(binding)
+    except (BuildControlError, UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+        raise BuildControlError("Pre-start successor pending start binding is invalid: " + str(error)) from error
+    if (
+        binding_raw != canonical(binding) + b"\n"
+        or hashlib.sha256(binding_raw).hexdigest() != reference.get("sha256")
+        or checked_binding.get("state") != "pending"
+        or checked_binding.get("attempt") != successor_attempt
+        or checked_binding.get("continuation") != validated_metadata
+        or checked_binding.get("continuation_sha256") != metadata_sha
+    ):
+        raise BuildControlError("Pre-start successor pending start binding changed")
+
+    successor_terminal_raw = _control_bytes(
+        control, expected_root + "/terminal.json", optional=True
+    )
+    if successor_terminal_raw != current_raw:
+        raise BuildControlError("Pre-start successor current pointer is not its exact terminal bytes")
+    if _control_bytes(control, "active", optional=True) is not None:
+        raise BuildControlError("Pre-start successor still owns an active operation lease")
+
+    consumed_relative = (
+        "runtime-control/runtime-services/post-build-continuation/"
+        + successor_attempt + "/consumed.json"
+    )
+    if _control_bytes(control, consumed_relative, optional=True) is not None:
+        raise BuildControlError("Pre-start successor already consumed its runtime continuation")
+
+    # Accept only receipt metadata and the pending binding at this boundary;
+    # cache, Compose and runtime publication must not have begun.
+    allowed_fields = {
+        "schema", "phase", "state", "attempt", "compose_project", "control_volume",
+        "helper_container", "inputs", "attempt_limit", "log_byte_limit",
+        "minimum_free_bytes", "started_at", "finished_at", "error",
+        "build_data_qualification", "filesystem_before", "filesystem_after",
+        "state_root", "post_build_generation", "post_build_start", *operator_probe_record,
+    }
+    if accepted_run:
+        allowed_fields.add("accepted_reattach")
+    namespace = getattr(control, "namespace", None)
+    if namespace:
+        allowed_fields.update({"control_namespace", "namespace_registry_sha256"})
+        if (current.get("control_namespace") != namespace
+                or current.get("namespace_registry_sha256") != control.namespace_registry_sha256):
+            raise BuildControlError("Pre-start successor control namespace differs")
+    if set(current) - allowed_fields:
+        raise BuildControlError("Pre-start successor contains a published runtime artifact or unknown field")
+    forbidden_files = (
+        "compose.json", "frontend-seed.json", "backend-cache.json",
+        "cache-maintenance-compose.json", "host-ledger-volume-probe-compose.json",
+        "host-ledger-volume-probe.json", "host-ledger-volume-probe-log.json",
+        "ledger-maintenance-compose.json", "ledger-helper-log.json", "host-ledger.json",
+        "host-ledger-volume.json", "backend-failure-log.json", "handoff-log.json",
+        "backend-build-receipt.json", "provenance.json", "storage-probe-log.json",
+        "ledger-verify-receipt.json", "ledger-verify-log.json", "host-ledger-attestation.json",
+        "process-failure.json", "retained-containers.json",
+    )
+    for filename in forbidden_files:
+        if _control_bytes(control, expected_root + "/" + filename, optional=True) is not None:
+            raise BuildControlError("Pre-start successor published an unexpected artifact: " + filename)
+
+
 def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None):
     """Revalidate one completed recreation and prove its old app IDs are absent."""
 
@@ -3329,10 +3611,6 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
     if current_raw is None:
         raise BuildControlError("Recreation resume has no current development receipt")
     current = json.loads(current_raw)
-    if current_raw != canonical(current) + b"\n" or current != previous:
-        raise BuildControlError(
-            "A later or unknown development attempt exists; recreation resume will not create another start"
-        )
     if previous.get("state") not in {"failed-confirmed", "succeeded"}:
         raise BuildControlError("Recreation resume has no admissible prior development outcome")
     if previous.get("compose_project") != control.project:
@@ -3541,6 +3819,24 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
     proof["native_recovery_context"] = native_recovery_context
     if expected_proof is not None and proof != expected_proof:
         raise BuildControlError("Recreation resume evidence changed before the new start admission")
+    if current_raw != canonical(current) + b"\n" or current != previous:
+        _validate_failed_prestart_successor(
+            args,
+            control,
+            selected,
+            identity,
+            current_raw=current_raw,
+            current=current,
+            previous_raw=previous_raw,
+            previous=previous,
+            document_raw=document_raw,
+            operation_raw=operation_raw,
+            operation_terminal=operation_terminal,
+            retained_raw=retained_raw,
+            operator_probe_record=operator_probe_record,
+            native_recovery_context=native_recovery_context,
+            removed_container_proof=proof,
+        )
     return {
         "previous": previous,
         "document": document,

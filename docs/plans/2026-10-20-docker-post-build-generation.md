@@ -121,3 +121,28 @@ Wspólna wersja przeszła 200 testów (3 pominięte), ze stabilnymi źródłami 
 `verification/interpreted-attempts/4a4f45df279f42839b602a9d89d27f78.json`.
 Zakres: runtime, startup scripts, retained recovery, post-build continuation
 oraz pre-admission integration. Nie kompilowano lokalnych testów Rust.
+
+### Wznowienie po odrzuconej próbie pre-start
+
+Launcher zachowuje historyczny attempt jako punkt odniesienia, gdy current
+wskazuje dokładnie powiązany terminal failed-confirmed z bramki przed mutacją.
+Waliduje pełny producer accepted-run osobno od istniejącej projekcji w
+continuation; brak toolchain_image_id w tym receipcie jest poprawnym kształtem
+producenta. Ścieżka odrzuca aktywny lease, consumed, publikację cache/Compose,
+obce dowody, zmieniony profil urządzeń lub konfigurację i dowolną późną awarię.
+Nie cofa current, nie usuwa historii i nie ponawia Solve.
+
+Pełny walidator przeszedł na rzeczywistych danych 3a8/71f/abaf, bez zmiany
+current: `verification/prestart-resume/ee751d2a4e014964acd822f8e4084dc7.json`.
+Po tej kontroli dodano węższy warunek prefiksu błędu pre-start, który odpowiada
+rzeczywistemu błędowi abaf. Niezależny review potwierdził potrzebę tego warunku;
+root go wdrożył, a regresja odrzuca późniejsze awarie.
+
+Pierwszy zestaw wykonał 101 testów: 100 przeszło, jeden wykrył brak schema i
+container_state w oczekiwanym pełnym proofie fixture. Poprawiono wyłącznie
+fixture; 20/20 nowych regresji przeszło w
+`verification/interpreted-attempts/ea4040fdc9a64a6488448fafa7e8b524.json`.
+81 niezmienionych testów istniejących ścieżek pozostało zielonych z
+`verification/interpreted-attempts/9a05c070f26f4c0a80bbc6653f31eda6.json`.
+Źródła były readonly i niezmienne; bez lokalnej kompilacji testów Rust.
+Rzeczywisty start i odbiór pełnej architektury nadal wymagają osobnych dowodów.
