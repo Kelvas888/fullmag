@@ -1136,6 +1136,12 @@ function statusFixture(
       session_epoch: "session-preparation-test@1700000000000",
       request_scope_epoch: "api-instance:preparation-test",
     },
+    lifecycle: {
+      commandability: "allowed",
+      connectivity: "connected",
+      session_resource: "active",
+      solver: "idle",
+    },
     solver: { state: patch.solverState ?? "bootstrapping" },
   } as LiveStatusResource;
 }

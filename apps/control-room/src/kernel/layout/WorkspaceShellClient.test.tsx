@@ -37,6 +37,13 @@ import { StartScreen } from "@/modules/start/StartScreen";
 
 const LAUNCH_TILE_NAMES = ["FDM simulation", "FEM simulation", "From template", "Import"];
 
+const ACTIVE_IDLE_LIFECYCLE = {
+  commandability: "allowed",
+  connectivity: "connected",
+  session_resource: "active",
+  solver: "idle",
+} as const;
+
 // This custom DOM checks shell lifetime; browser layout and gestures need a browser.
 vi.mock("@/shared/ui/Resizable", () => {
   const Container = ({ children, className, id, inert }: {
@@ -200,6 +207,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     }) as LiveStatusResource);
     const list = vi.fn(async () => ({
@@ -275,6 +283,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
     const currentStatus = vi.fn(async () => liveStatus)
@@ -382,6 +391,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
     const list = vi.fn(async () => sessionList);
@@ -498,6 +508,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
     const list = vi.fn(async () => sessionList);
@@ -565,6 +576,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "other-session@1700000000000",
         session_id: "other-session",
       },
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
     const statusForListedSession = {

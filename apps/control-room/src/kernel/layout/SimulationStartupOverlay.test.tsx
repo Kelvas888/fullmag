@@ -134,6 +134,12 @@ function statusResource(
     data: {
       resources: {},
       session: { name: "arch_waveguide_relax_50nm" },
+      lifecycle: {
+        commandability: "allowed",
+        connectivity: "connected",
+        session_resource: "active",
+        solver: "idle",
+      },
       solver: { state: "awaiting_command" },
       ...patch,
     } as LiveStatusResource,

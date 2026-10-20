@@ -1392,7 +1392,7 @@ function fdmStatusFixture(fixture) {
     },
     energies: {},
     lifecycle: {
-      commandability: "writable",
+      commandability: "allowed",
       connectivity: "connected",
       session_resource: "active",
       solver: "idle",
