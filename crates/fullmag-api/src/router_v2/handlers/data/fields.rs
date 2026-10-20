@@ -23,8 +23,8 @@ use super::quantities::{current_field_carriers, resolved_quantity_capability_for
 use super::resolved_spatial_field::{
     full_field_publication_carrier_identity, resolve_current_spatial_field,
     resolve_fdm_object_indices, resolve_fem_node_mapping, resolve_spatial_field_from_values,
-    FdmCellMembership, ResolvedSpatialField, SpatialFieldCarrier, SpatialFieldProvenance,
-    SpatialFieldSourceKind,
+    EntityMapping, FdmCellMembership, ResolvedSpatialField, SpatialFieldCarrier,
+    SpatialFieldProvenance, SpatialFieldSourceKind,
 };
 use crate::artifacts::{read_json_artifact_value, try_resolve_artifact_path};
 use crate::error::ApiError;
@@ -1346,6 +1346,20 @@ fn insert_field_vector_binary_headers(
     if let Some(node_index_count) = node_index_count {
         if let Ok(value) = HeaderValue::from_str(&node_index_count.to_string()) {
             h.insert(HeaderName::from_static(HDR_NODE_INDEX_COUNT), value);
+        }
+    }
+}
+
+fn insert_field_vector_carrier_revision_header(
+    resp: &mut axum::response::Response,
+    carrier_revision: Option<u64>,
+) {
+    if let Some(revision) = carrier_revision {
+        if let Ok(value) = HeaderValue::from_str(&revision.to_string()) {
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-fullmag-carrier-revision"),
+                value,
+            );
         }
     }
 }
@@ -2730,6 +2744,9 @@ fn target_quantity_support(
 ) -> (bool, Option<&'static str>) {
     if !spec.ui_exposed || !spec.supports_preview_3d {
         return (false, Some("quantity_not_spatial"));
+    }
+    if capability_supports_quantity(snapshot, spec.id.as_str()) == Some(false) {
+        return (false, Some("quantity_not_supported"));
     }
     if scope_kind == "airbox" && spec.domain.as_str() == "magnetic_only" {
         return (false, Some("quantity_domain_mismatch"));
@@ -4733,7 +4750,7 @@ fn sample_unscoped_field_values(
             ("x-fullmag-component" = String, description = "Resolved component projection"),
             ("x-fullmag-encoding" = String, description = "FMVP encoding and version, including FMVP;version=6 for immutable artifact inspections"),
             ("x-fullmag-carrier-id" = String, description = "Immutable artifact carrier ID; present for FMVP v6"),
-            ("x-fullmag-carrier-revision" = String, description = "Lossless decimal u64 artifact carrier revision; present for FMVP v6"),
+            ("x-fullmag-carrier-revision" = String, description = "Lossless decimal u64 carrier revision used by expected_carrier_revision; present for live carriers when available and artifact inspection FMVP v6"),
             ("x-fullmag-carrier-digest" = String, description = "Bare lowercase SHA256 artifact carrier digest; present for FMVP v6"),
             ("x-fullmag-point-count" = usize, description = "Decoded point count"),
             ("x-fullmag-value-count" = usize, description = "Scalar value count"),
@@ -5045,10 +5062,9 @@ async fn get_field_vector_unfenced(
         quantity_id,
         resolved_field.as_ref(),
     )?;
-    validate_field_vector_carrier_precondition(
-        &query,
-        field_vector_carrier_revision(snapshot, resolved_scope.as_ref(), airbox_field.as_ref()),
-    )?;
+    let carrier_revision =
+        field_vector_carrier_revision(snapshot, resolved_scope.as_ref(), airbox_field.as_ref());
+    validate_field_vector_carrier_precondition(&query, carrier_revision)?;
     let sample_limit = resolve_field_vector_sample_limit(
         &query,
         resolved_scope.as_ref(),
@@ -5106,6 +5122,17 @@ async fn get_field_vector_unfenced(
     let scoped_node_indices = resolved_scope
         .as_ref()
         .map(|scope| scope.node_indices.clone());
+    let unscoped_node_mapping = if resolved_scope.is_none() {
+        match resolved_field.as_ref().map(|field| &field.carrier) {
+            Some(SpatialFieldCarrier::FemNodes {
+                mapping: EntityMapping::ExplicitLocalToGlobal(indices),
+                ..
+            }) => Some(indices.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     drop(guard);
 
@@ -5155,7 +5182,25 @@ async fn get_field_vector_unfenced(
     } else {
         sample_unscoped_field_values(raw_values, scoped_grid, n_comp, sample_limit)
     };
-    let field_node_indices = scoped_node_indices.or(sampled_node_indices);
+    // Sampling addresses the compact value array. FMVP identities must still
+    // address the global mesh, including when the whole compact field is read.
+    let field_node_indices = match unscoped_node_mapping {
+        Some(mapping) => Some(match sampled_node_indices {
+            Some(indices) => indices
+                .into_iter()
+                .map(|index| {
+                    mapping
+                        .get(index)
+                        .map(|global| *global as usize)
+                        .ok_or_else(|| {
+                            ApiError::conflict("sampled field index exceeds its FEM node mapping")
+                        })
+                })
+                .collect::<Result<Vec<_>, ApiError>>()?,
+            None => mapping.into_iter().map(|index| index as usize).collect(),
+        }),
+        None => scoped_node_indices.or(sampled_node_indices),
+    };
     let field_node_indices_u32 = field_node_indices
         .as_ref()
         .map(|node_indices| {
@@ -5190,7 +5235,7 @@ async fn get_field_vector_unfenced(
         .as_ref()
         .map(|hash| {
             format!(
-                ":topology_hash={hash}:node_indices={}",
+                ":topology_revision={topology_revision}:topology_hash={hash}:node_indices={}",
                 field_node_indices_cache_token(field_node_indices_u32.as_deref())
             )
         })
@@ -5239,6 +5284,7 @@ async fn get_field_vector_unfenced(
                 field_indexing,
                 field_node_indices_u32.as_ref().map(Vec::len),
             );
+            insert_field_vector_carrier_revision_header(&mut resp, carrier_revision);
             insert_scope_headers(&mut resp, resolved_scope.as_ref());
             insert_snapshot_header(&mut resp, requested_snapshot_id);
             return Ok(resp);
@@ -5315,6 +5361,7 @@ async fn get_field_vector_unfenced(
         field_indexing,
         field_node_indices_u32.as_ref().map(Vec::len),
     );
+    insert_field_vector_carrier_revision_header(&mut resp, carrier_revision);
     insert_scope_headers(&mut resp, resolved_scope.as_ref());
     insert_snapshot_header(&mut resp, requested_snapshot_id);
 

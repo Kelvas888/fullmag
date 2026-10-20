@@ -203,7 +203,10 @@ def _validate_native_failure_probe(
 
 
 def _validate_native_after_ready_failure_probe(
-    probe: Mapping[str, object], expected_process_receipt_sha256: str
+    probe: Mapping[str, object],
+    expected_process_receipt_sha256: str,
+    *,
+    allow_startup_failure_marker: bool = False,
 ) -> dict[str, object]:
     """Validate a failed owner observed after a previously ready runtime.
 
@@ -249,7 +252,13 @@ def _validate_native_after_ready_failure_probe(
         raise BuildControlError("after-ready native owner or child process is still live")
     if probe.get("native_processes_live") is not False:
         raise BuildControlError("after-ready native worker process is still live")
-    if probe.get("startup_enabled") == "1" or probe.get("legacy_activation_marker_exists") is True:
+    if (
+        not allow_startup_failure_marker
+        and (
+            probe.get("startup_enabled") == "1"
+            or probe.get("legacy_activation_marker_exists") is True
+        )
+    ):
         raise BuildControlError("internal startup activation is outside the after-ready failure route")
     if type(probe.get("active_lease_count")) is not int or probe.get("active_lease_count") != 0:
         raise BuildControlError("after-ready failure still has an active durable resource lease")
@@ -568,13 +577,26 @@ sys.path.insert(0,'/opt/fullmag')
 import runtime_service
 raw=runtime_service._bounded_regular(runtime_service.process_receipt_path(runtime_service.canonical_paths()),'failed process receipt')
 document=json.loads(raw)
+if isinstance(document.get('service_owner'),dict):
+ runtime_service._validate_terminal_owner(document['service_owner'],state='ready',name='failed admission service owner')
 pid=document.get('api_pid')
-print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'api_pid_exists':bool(pid and os.path.exists('/proc/'+str(pid)))}))
+print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'api_pid_exists':bool(pid and os.path.exists('/proc/'+str(pid))),
+ 'startup_enabled':os.environ.get('FULLMAG_STARTUP_ENABLED'),
+ 'managed_receipt_key':os.environ.get('FULLMAG_STARTUP_RECEIPT_KEY'),
+ 'legacy_activation_marker_exists':os.path.lexists('/state/.fullmag/docker-startup/activation.json')}))
 '''
     observed=json.loads(docker_capture('exec',args.container_id,'/usr/local/bin/python3','-B','-c',script).stdout)
     receipt=observed['receipt']
     native_failure = None
     native_failure_kind = None
+    pre_marker_failure = (
+        receipt.get('error') == 'startup activation state parent is unavailable: /state/.fullmag'
+        and observed.get('startup_enabled') == '1'
+        and observed.get('managed_receipt_key') is None
+        and observed.get('legacy_activation_marker_exists') is False
+        and 'startup_activation' not in receipt
+        and isinstance(receipt.get('service_owner'), dict)
+    )
     if receipt.get('state') == 'failed_outcome_retained':
         native_result = docker_capture(
             'exec', args.container_id, '/usr/local/bin/python3', '-B', '-c',
@@ -591,7 +613,9 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
             raise BuildControlError('native failed-admission proof probe returned invalid JSON') from error
         if 'service_owner' in receipt:
             native_failure = _validate_native_after_ready_failure_probe(
-                native_probe, args.process_receipt_sha256
+                native_probe,
+                args.process_receipt_sha256,
+                allow_startup_failure_marker=pre_marker_failure,
             )
             native_failure_kind = 'native-after-ready-failure'
         else:
@@ -604,7 +628,8 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
             or receipt.get('state')!='failed_outcome_retained'
             or not isinstance(receipt.get('api_exit_code'),int) or receipt.get('runtime_pid') is not None
             or not (receipt.get('error','').startswith('API binding did not become ready:')
-                    or native_failure is not None)):
+                    or native_failure is not None
+                    or pre_marker_failure)):
         raise BuildControlError('Failed admission is not proven; no process will be stopped')
     from docker_build_control import toolchain_configuration
     config=toolchain_configuration(selected,identity)
@@ -660,6 +685,16 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
         journal['terminal_failed_owner_sha256'] = hashlib.sha256(terminal_owner_raw).hexdigest()
         if native_failure_kind == 'native-after-ready-failure':
             journal['terminal_retained_ready_owner'] = terminal_ready_owner
+    if pre_marker_failure:
+        from docker_volume_stop_unadmitted import _read_terminal_process_receipt, _owner_identity_key
+        drained_raw, drained = _read_terminal_process_receipt(after, control)
+        before_owner = receipt['service_owner']
+        terminal_owner = drained.get('terminal_service_owner')
+        if (_owner_identity_key(terminal_owner, 'terminal service owner')
+                != _owner_identity_key(before_owner, 'failed admission service owner')):
+            raise BuildControlError('Stopped startup failure has no matching authenticated drain; resources retained')
+        journal['drained_process_receipt'] = drained
+        journal['drained_process_receipt_sha256'] = hashlib.sha256(drained_raw).hexdigest()
     after_state = after.get('State', {})
     exit_code = after_state.get('ExitCode')
     if type(exit_code) is not int:

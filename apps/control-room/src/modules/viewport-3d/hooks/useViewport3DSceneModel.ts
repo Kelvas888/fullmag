@@ -527,6 +527,9 @@ export function mergeViewport3DQuantityCapabilityIds(
       merged.add(resolveCanonicalQuantityId(quantity.id));
     }
   }
+  if (merged.has("H_drive")) {
+    merged.add("B_drive");
+  }
   return merged;
 }
 
@@ -3157,12 +3160,14 @@ export function useViewport3DSceneModel({
     () => resolveViewport3DAvailableFieldQuantityIds(fieldCatalog.data),
     [fieldCatalog.data],
   );
-  const availableQuantityIdsForPlanning = fdmLaneActive
-    ? mergeViewport3DQuantityCapabilityIds(
+  const availableQuantityIdsForPlanning = useMemo(
+    () =>
+      mergeViewport3DQuantityCapabilityIds(
         availableFieldQuantityIds,
         quantityCatalog.data,
-      ) ?? EMPTY_VIEWPORT_3D_FIELD_QUANTITY_IDS
-    : availableFieldQuantityIds;
+      ) ?? EMPTY_VIEWPORT_3D_FIELD_QUANTITY_IDS,
+    [availableFieldQuantityIds, quantityCatalog.data],
+  );
   const fdmRegionMembership = useFdmRegionMembershipResource({
     enabled: liveViewportResourcesEnabled && fdmLaneActive,
   });

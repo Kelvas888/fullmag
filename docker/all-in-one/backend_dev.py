@@ -3555,6 +3555,10 @@ def _serve(extra: list[str]) -> int:
         _log_phase("gate", "complete", profile="linux-native-v1")
     else:
         _log_phase("gate", "skipped", reason="storage-profile")
+    from worker_cgroup_gate import wait_for_delegation
+    _log_phase("gate", "start", profile="worker-cgroup")
+    wait_for_delegation()
+    _log_phase("gate", "complete", profile="worker-cgroup")
     environment = dict(os.environ)
     environment.update(
         {

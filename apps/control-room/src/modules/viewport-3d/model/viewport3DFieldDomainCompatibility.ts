@@ -131,6 +131,27 @@ export function resolveViewport3DFieldDomainCompatibility({
     return { reason: "duplicate-node-index", status: "mismatch" };
   }
 
+  if (
+    domain.discretization !== "fdm" &&
+    (field.indexing === "explicit_node_indices" ||
+      field.indexing === "sampled_node_indices")
+  ) {
+    if (!field.nodeIndices || field.nodeIndices.length !== field.pointCount) {
+      return { reason: "missing-node-indices", status: "mismatch" };
+    }
+    for (let index = 0; index < field.nodeIndices.length; index += 1) {
+      const nodeIndex = field.nodeIndices[index];
+      if (
+        nodeIndex === undefined ||
+        !Number.isSafeInteger(nodeIndex) ||
+        nodeIndex < 0 ||
+        (domain.pointCount > 0 && nodeIndex >= domain.pointCount)
+      ) {
+        return { reason: "node-index-out-of-range", status: "mismatch" };
+      }
+    }
+  }
+
   if (domain.discretization === "fdm") {
     if (field.formatVersion === 2) {
       if (!responseDomainGenerationId || !domain.domainGenerationId) {

@@ -63,7 +63,7 @@ export function quantityCatalogSupportsQuantity(
   targetKind: "airbox" | "spatial" = "spatial",
 ): boolean | null {
   if (!catalog) return null;
-  const canonicalQuantityId = resolveCanonicalQuantityId(quantityId);
+  const canonicalQuantityId = storedFieldQuantityId(quantityId);
   const entry = catalog.quantities.find(
     (quantity) => resolveCanonicalQuantityId(quantity.id) === canonicalQuantityId,
   );
@@ -93,6 +93,7 @@ const CANONICAL_QUANTITY_IDS: Record<string, string> = {
   eden_ani: "eden_ani",
   eden_demag: "eden_demag",
   eden_dmi: "eden_dmi",
+  eden_drive: "eden_drive",
   eden_rotated_dmi: "eden_rotated_dmi",
   eden_ex: "eden_ex",
   eden_ext: "eden_ext",
@@ -137,6 +138,7 @@ const SCALAR_SPATIAL_QUANTITY_IDS = new Set([
   "eden_ani",
   "eden_demag",
   "eden_dmi",
+  "eden_drive",
   "eden_rotated_dmi",
   "eden_ex",
   "eden_ext",
@@ -178,6 +180,7 @@ const QUANTITY_UNITS: Record<string, string> = {
   eden_ani: "J/m³",
   eden_demag: "J/m³",
   eden_dmi: "J/m³",
+  eden_drive: "J/m³",
   eden_rotated_dmi: "J/m³",
   eden_ex: "J/m³",
   eden_ext: "J/m³",
@@ -247,11 +250,11 @@ export function fieldCatalogQuantitySupportsAirbox(
   fieldCatalog: FieldCatalogResource | null | undefined,
   quantityId: string,
 ): boolean {
-  const canonicalQuantityId = resolveCanonicalQuantityId(quantityId);
+  const canonicalQuantityId = storedFieldQuantityId(quantityId);
   return fieldCatalog?.quantities.some(
     (quantity) =>
       quantity.domain === "full_domain" &&
-      resolveCanonicalQuantityId(quantity.quantity_id) === canonicalQuantityId,
+      storedFieldQuantityId(quantity.quantity_id) === canonicalQuantityId,
   ) ?? false;
 }
 

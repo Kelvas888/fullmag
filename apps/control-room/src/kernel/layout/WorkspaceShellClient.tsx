@@ -47,6 +47,26 @@ export function WorkspaceShellClient() {
   const startOwnsPage = sessionState !== "ready" && project.state !== "ready";
   const refetchSessions = sessions.resource.refetch;
   const refetchStatus = sessionStatus.refetch;
+  const collectionStatus = sessions.resource.status;
+  // Realtime starts only after a session identity is confirmed. While the
+  // collection is empty, discover sessions activated by the local launcher.
+  useEffect(() => {
+    if (
+      sessions.state !== "no-session" ||
+      (collectionStatus !== "ready" && collectionStatus !== "error")
+    ) {
+      return;
+    }
+    const refreshVisibleCollection = () => {
+      if (document.visibilityState === "visible") refetchSessions();
+    };
+    const timer = window.setTimeout(refreshVisibleCollection, 5_000);
+    document.addEventListener("visibilitychange", refreshVisibleCollection);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", refreshVisibleCollection);
+    };
+  }, [collectionStatus, refetchSessions, sessions.state]);
   const retryStatusAndCollection = useCallback(() => {
     refetchSessions();
     refetchStatus();

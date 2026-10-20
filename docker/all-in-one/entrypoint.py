@@ -128,7 +128,7 @@ def activate_startup_script():
         if any(name in os.environ for name in (
                 "FULLMAG_STARTUP_SCRIPT", "FULLMAG_STARTUP_PROVENANCE",
                 "FULLMAG_STARTUP_API", "FULLMAG_STARTUP_PROVENANCE_SHA256",
-                "FULLMAG_STARTUP_HELPER_SHA256")):
+                "FULLMAG_STARTUP_HELPER_SHA256", "FULLMAG_STARTUP_RECEIPT_KEY")):
             raise RuntimeError("startup activation environment is incomplete")
         return None
     helper_path = Path("/opt/fullmag/docker_startup_script.py")
@@ -164,6 +164,11 @@ def activate_startup_script():
         docker_startup_script = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = docker_startup_script
         spec.loader.exec_module(docker_startup_script)
+        receipt_key = os.environ.get("FULLMAG_STARTUP_RECEIPT_KEY")
+        if receipt_key is not None:
+            docker_startup_script.ACTIVATION_RECEIPT_PATH = (
+                docker_startup_script.activation_receipt_path_for_key(receipt_key)
+            )
         try:
             return docker_startup_script.run_from_environment()
         except Exception as error:

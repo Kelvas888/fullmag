@@ -958,13 +958,17 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                                                          development_build=delegation)
         startup = None
         if args.script is not None:
+            from docker_volume_activate import _managed_activation_receipt_contract
             startup_helper, startup_hashes = _startup_helper(control, selected, image)
             authorization = startup_helper.prepare(selected, args.script,
                 request_id="docker-volume-" + token, source_commit=storage.git(selected, "rev-parse", "HEAD"))
+            receipt_key, receipt_path = _managed_activation_receipt_contract(
+                startup_helper, authorization.request_id)
             startup_path = state / "startup-provenance.json"
             startup_digest = startup_helper.write_provenance(startup_path, authorization)
             startup = {"authorization": authorization.as_dict(), "path": str(startup_path),
-                       "provenance_sha256": startup_digest, "helper_hashes": startup_hashes}
+                       "provenance_sha256": startup_digest, "helper_hashes": startup_hashes,
+                       "receipt_key": receipt_key, "receipt_path": receipt_path}
         user_data = _workspace_state_root(layout, control.project)
         if os.name != "nt":
             host.admit_runtime_uid(user_data)
@@ -1027,6 +1031,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                 FULLMAG_STARTUP_PROVENANCE="/run/fullmag/startup-provenance.json",
                 FULLMAG_STARTUP_PROVENANCE_SHA256=startup["provenance_sha256"],
                 FULLMAG_STARTUP_HELPER_SHA256=startup["helper_hashes"]["docker_startup_script.py"],
+                FULLMAG_STARTUP_RECEIPT_KEY=startup["receipt_key"],
                 FULLMAG_STARTUP_API="http://127.0.0.1:8081")
             backend["volumes"].append({"type": "bind", "source": startup["path"],
                 "target": "/run/fullmag/startup-provenance.json", "read_only": True,
@@ -1059,6 +1064,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             for mount in service["volumes"]:
                 if mount["type"] == "bind" and not mount.get("read_only") and mount["target"] not in ({"/state", "/user-data", "/host-ledger"} | ({"/opt/fullmag/script-output"} if service is backend else set())):
                     raise BuildControlError("Unexpected writable host bind: " + mount["target"])
+        import docker_worker_cgroup
+        docker_worker_cgroup.configure_backend(document)
         control.write(operation["root"] + "/compose.json", document)
         operation["receipt"].update(state="starting-services", state_root=str(state),
             frontend_volume=frontend_volume, backend_volumes=cache["volume_names"])
@@ -1159,6 +1166,8 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
         host = _session_host()
         host.write_bound_evidence(certificate_path, certificate)
         host.publish_evidence(state / host.OWNER_NAME, certificate)
+    import docker_worker_cgroup
+    docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
     log_writer = lambda output: control.write(operation["root"] + "/storage-probe-log.json", {"log": output})
     if os.name == "nt":
         runtime._complete_backend_storage_preflight(docker_text, backend_id, state, certificate_path, certificate, None,
@@ -1225,7 +1234,9 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
         helper, hashes = _startup_helper(control, selected, image)
         if hashes["docker_startup_script.py"] != startup_environment["FULLMAG_STARTUP_HELPER_SHA256"]:
             raise BuildControlError("Startup helper differs from retained service")
-        operation["receipt"]["startup"] = runtime._wait_for_startup_ready(state, authorization, startup_helper=helper)
+        operation["receipt"]["startup"] = runtime._wait_for_startup_ready(
+            state, authorization, startup_helper=helper,
+            receipt_reader=lambda: (read_process_receipt(), None))
     operation["receipt"].update(state="succeeded", backend_container=backend_id,
         frontend_container=frontend_id, url="http://127.0.0.1:" + str(port),
         source_commit=provenance["commit"], source_digest=provenance["source_digest"],
@@ -2314,8 +2325,24 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
     if recreate_services:
         if actual["backend"]["State"]["Running"]:
             raise BuildControlError("Recreation requires the backend stopped; an active build/runtime is never interrupted")
+        pre_activation_stop = None
         if document["services"]["backend"]["environment"].get("FULLMAG_STARTUP_ENABLED") == "1":
-            raise BuildControlError("Retained startup activation requires its dedicated recovery; recreation will not repeat Solve")
+            stop_path = "verification/stop-failed-" + ids["backend"] + ".json"
+            stop = control.read(stop_path)
+            failure = stop.get("failure_receipt", {}).get("receipt", {})
+            drained = control.read("runtime-control/runtime-service/process-tree.json")
+            if (stop.get("state") != "stopped-confirmed"
+                    or stop.get("container_id") != ids["backend"]
+                    or stop.get("image_id") != image
+                    or failure.get("error") != "startup activation state parent is unavailable: /state/.fullmag"
+                    or drained.get("state") != "drained"
+                    or drained != stop.get("drained_process_receipt")
+                    or "startup_activation" in drained
+                    or getattr(args, "script", None) is not None):
+                raise BuildControlError("Retained startup activation requires its dedicated recovery; recreation will not repeat Solve")
+            # This authenticated failure preceded the exclusive activation
+            # marker and POST. Recreate an empty workspace; never replay it.
+            pre_activation_stop = stop_path
         state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Windows sessions")
         certificate_path = _certificate_path(state)
         certificate = _retained_certificate(state, document)
@@ -2405,6 +2432,8 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     "accepted_reattach_metadata"
                 ]
             control.write(operation["root"] + "/retained-containers.json", actual)
+            if pre_activation_stop is not None:
+                operation["receipt"]["pre_activation_stop_receipt"] = pre_activation_stop
             operation["receipt"].update(state="stopping-owned-frontend", previous_state_root=str(state),
                                         fresh_state=fresh_state)
             operation["daemon_pending"] = True

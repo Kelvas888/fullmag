@@ -5332,7 +5332,27 @@ impl NativeFemBackend {
                 conservative_dg0_energy,
             ));
         }
-        let values = self.copy_field(fem_preview_observable(&request.quantity)?, node_count)?;
+        let quantity = crate::quantities::normalized_quantity_name(&request.quantity)?;
+        let values = if matches!(quantity, "H_demag" | "H_eff") {
+            // The direct device cache is magnetic-domain data. The snapshot
+            // path recovers full-domain demag and composes H_eff for Airbox.
+            let values = self
+                .begin_field_snapshot(quantity, 0, 0.0, 0.0)?
+                .into_vector_field()?;
+            if values.len() != node_count {
+                return Err(RunError {
+                    message: format!(
+                        "native FEM preview '{}' returned {} nodes, expected {}",
+                        quantity,
+                        values.len(),
+                        node_count
+                    ),
+                });
+            }
+            values
+        } else {
+            self.copy_field(fem_preview_observable(quantity)?, node_count)?
+        };
         let active_mask = (crate::quantities::quantity_spatial_domain(&request.quantity)
             == "magnetic_only")
             .then(|| self.magnetic_node_mask.as_ref().to_vec());

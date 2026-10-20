@@ -268,6 +268,7 @@ import {
 import {
   canonicalFieldVectorQuery,
   canonicalFieldVectorQueryParams,
+  fieldVectorComponentEvidenceIdentity,
   isCanonicalU64Decimal,
 } from "./fieldQueryIdentity";
 import {
@@ -745,7 +746,14 @@ export function transformFieldVectorForDisplay(
 ): BinaryResourceResult<DecodedFieldVector, FieldVectorResponseMetadata> {
   const scale = fieldDisplayScale(requestedQuantityId);
   if (scale === 1 || result.status !== "ready") return result;
-  const values = Float64Array.from(result.data.values, (value) => value * scale);
+  // The backend projects H before this display conversion. A squared norm
+  // therefore needs the squared unit conversion as well.
+  const projectionScale =
+    fieldVectorComponentEvidenceIdentity(result.responseMetadata.component ?? "full") ===
+    "magnitude_squared"
+      ? scale * scale
+      : scale;
+  const values = Float64Array.from(result.data.values, (value) => value * projectionScale);
   return {
     ...result,
     data: {
@@ -755,7 +763,6 @@ export function transformFieldVectorForDisplay(
     },
     responseMetadata: {
       ...result.responseMetadata,
-      identityIssues: [],
       quantityId: requestedQuantityId,
     },
   };
@@ -1945,6 +1952,10 @@ export class ControlRoomApi {
             path: { quantity_id: storedQuantityId },
             query: fieldAvailabilityQueryParams(query),
           },
+        ).then((availability) =>
+          requestedQuantityId === storedQuantityId
+            ? availability
+            : { ...availability, quantity_id: requestedQuantityId },
         );
       },
       meta: (

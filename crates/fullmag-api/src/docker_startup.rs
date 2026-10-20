@@ -1485,14 +1485,17 @@ async fn mark_startup_placeholder_failure(
     if snapshot.session.status != "activating" || snapshot.run.is_some() {
         return;
     }
-    let _ = apply_startup_failure_snapshot(
+    if !apply_startup_failure_snapshot(
         snapshot,
         context,
         state.current_live_session_epoch.load(Ordering::Acquire),
         request,
         loaded,
         error,
-    );
+    ) {
+        return;
+    }
+    publish_startup_failure(state, current).await;
 }
 
 async fn mark_startup_failure(
@@ -1506,14 +1509,40 @@ async fn mark_startup_failure(
     let Some(snapshot) = current.as_mut() else {
         return;
     };
-    let _ = apply_startup_failure_snapshot(
+    if !apply_startup_failure_snapshot(
         snapshot,
         context,
         state.current_live_session_epoch.load(Ordering::Acquire),
         request,
         loaded,
         error,
-    );
+    ) {
+        return;
+    }
+    publish_startup_failure(state, current).await;
+}
+
+/// Publish an applied startup failure to current-session subscribers after
+/// the write lock is released, so the workspace refreshes without polling.
+async fn publish_startup_failure(
+    state: &Arc<AppState>,
+    current: tokio::sync::RwLockWriteGuard<'_, Option<crate::types::SessionStateResponse>>,
+) {
+    let Some(snapshot) = current.as_ref() else {
+        return;
+    };
+    let display_revision = state.current_display_selection.read().await.revision;
+    let realtime =
+        crate::current_live_realtime_state_from_snapshot(state, snapshot, display_revision).await;
+    drop(current);
+    if let Err(publication_error) =
+        crate::publish_current_live_realtime_batch_changed(state, &realtime, false, 0).await
+    {
+        tracing::warn!(
+            error = %publication_error,
+            "failed to publish startup failure to current-session subscribers"
+        );
+    }
 }
 
 fn bounded_startup_error(message: &str) -> String {
