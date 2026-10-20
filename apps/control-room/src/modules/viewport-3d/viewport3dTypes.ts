@@ -5,6 +5,8 @@ export interface Viewport3DColors {
   antenna?: ColorRepresentation;
   accentStrong?: ColorRepresentation;
   background: ColorRepresentation;
+  backgroundTop?: ColorRepresentation;
+  backgroundBottom?: ColorRepresentation;
   danger?: ColorRepresentation;
   field: ColorRepresentation;
   mesh: ColorRepresentation;
@@ -49,6 +51,7 @@ export const VIEWPORT_3D_DIRTY_REASONS = [
   "camera-control",
   "camera-control-target",
   "camera-fit",
+  "camera-fov",
   "camera-init",
   "camera-orbit-debug",
   "camera-orbit-debug-commit",

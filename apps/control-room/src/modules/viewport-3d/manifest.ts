@@ -12,6 +12,7 @@ import type {
   Viewport3DFdmTopographyComponent,
   Viewport3DScaleUnitMode,
 } from "./viewport3dStore";
+import type { Viewport3DAppearanceSection } from "./viewport3dAppearancePreferences";
 import type { Viewport3DVisualProfileId } from "./viewport3dVisualProfile";
 
 function isSavedMaterializedDatasetSelection(context: CommandContext): boolean {
@@ -49,6 +50,37 @@ const VISUAL_PROFILE_COMMANDS: Array<{
     id: "viewport-3d.profile-capture",
     profileId: "capture",
     title: "Use Capture 3D Profile",
+  },
+];
+const APPEARANCE_RESET_COMMANDS: Array<{
+  id: string;
+  section: Viewport3DAppearanceSection;
+  title: string;
+}> = [
+  {
+    id: "viewport-3d.reset-appearance-background",
+    section: "background",
+    title: "Reset 3D Background Preferences",
+  },
+  {
+    id: "viewport-3d.reset-appearance-frame",
+    section: "frame",
+    title: "Reset 3D Frame Preferences",
+  },
+  {
+    id: "viewport-3d.reset-appearance-lighting",
+    section: "lighting",
+    title: "Reset 3D Lighting Preferences",
+  },
+  {
+    id: "viewport-3d.reset-appearance-effects",
+    section: "effects",
+    title: "Reset 3D Effects Preferences",
+  },
+  {
+    id: "viewport-3d.reset-appearance-all",
+    section: "all",
+    title: "Reset All 3D Appearance Preferences",
   },
 ];
 const DIMENSION_FRAME_MODE_COMMANDS: Array<{
@@ -297,6 +329,29 @@ export const viewport3dManifest: ModuleManifest = {
           return { status: "completed" };
         },
       },
+      {
+        id: "viewport-3d.open-settings",
+        title: "Open 3D Viewport Settings",
+        group: "viewport-3d",
+        category: "Viewport",
+        scope: "viewport",
+        isActive: () => viewport3dStore.getSnapshot().widgets.settingsDialogOpen,
+        run: () => {
+          viewport3dStore.setSettingsDialogOpen(true);
+          return { status: "completed" };
+        },
+      },
+      ...APPEARANCE_RESET_COMMANDS.map((command) => ({
+        id: command.id,
+        title: command.title,
+        group: "viewport-3d",
+        category: "Viewport",
+        scope: "viewport" as const,
+        run: () => {
+          viewport3dStore.resetAppearance(command.section);
+          return { status: "completed" as const };
+        },
+      })),
       {
         id: "workspace.visualization-settings",
         title: "Visualization Settings",

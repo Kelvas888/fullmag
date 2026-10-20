@@ -139,8 +139,9 @@ describe("PrimitiveObjectLayer geometry resources", () => {
       source.indexOf("function PrimitiveObjectGizmo"),
     );
 
-    expect(primitiveSurfaceSource).toContain("primitiveObjectSurfaceColor(");
-    expect(primitiveSurfaceSource).toContain("primitiveColorAssignments");
+    expect(primitiveSurfaceSource).toMatch(
+      /primitiveObjectSurfaceColor\(\s*object,\s*renderSettings,\s*colors,\s*primitiveColorAssignments,\s*\)/,
+    );
     expect(primitiveSurfaceSource).toContain("renderPlan.primitive.opacity");
     expect(primitiveSurfaceSource).toContain("renderPlan.points.visible");
     expect(primitiveSurfaceSource).toContain("pointColorFromSettings");

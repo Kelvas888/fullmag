@@ -124,6 +124,38 @@ Only user preferences and layout state persist locally:
 
 Canonical simulation state, session state, field state, mesh state, command state, and provenance do not persist through browser local storage.
 
+### Viewport 3D appearance preferences
+
+`viewport3dStore` owns the viewport's client-side appearance preferences. The
+version 1 local-storage record contains the requested appearance values, the
+selected dimension-frame and scale widgets, ViewCube/HSL visibility, AO/Bloom/
+antialias toggles, and the selected non-capture visual profile. It does not
+contain the camera, projection, orthographic scale, active capture profile,
+session/model resources, or transient dialog and inspection state.
+
+The appearance snapshot is exposed through `useViewport3DAppearance()`. It
+starts with fixed defaults on both the server and the first browser render;
+the store reads local storage only when a browser subscriber attaches, then
+publishes the restored preferences. Unknown fields are ignored, unsupported
+schema versions and malformed JSON use defaults, and unavailable or blocked
+storage leaves the in-memory store usable. Numeric values are finite and
+bounded: background strength 0–1, lighting intensity 0–2, azimuth −180–180°,
+elevation −90–90°, grid opacity 0.25–2, AO intensity 0–3, and AO radius 0–1 of
+the domain size.
+
+Geometry-lighting preferences affect uniform solid geometry only. Quantitative
+field colors remain unlit and un-tonemapped; a legacy `fieldShading` key is
+ignored as an unknown appearance field.
+
+`appearanceDiagnostics` separates requested and effective AO, Bloom, and
+antialias flags. A requested effect suppressed by protected quantitative field
+colors, browser post-processing disablement, or a technical profile limit
+reports the reason; an intentionally disabled effect has no suppression
+reason. Capture failures remain transient and clear on the next capture
+request. Reset commands target background, frame, lighting, effects, or all
+appearance preferences. They update only module-local preferences and never
+reset the canonical camera or touch session/model state.
+
 ## 9. Verification
 
 State changes must be checked with:

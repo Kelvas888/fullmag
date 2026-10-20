@@ -17,6 +17,63 @@
   height: 100%;
 }
 
+.fm-viewport-3d__appearance-dialog {
+  width: min(42rem, calc(100vw - 2rem));
+  max-height: min(90dvh, 60rem);
+  overflow-y: auto;
+}
+
+.fm-viewport-3d__settings-section {
+  display: grid;
+  gap: var(--fm-space-3);
+  min-inline-size: 0;
+  margin: 0;
+  padding: var(--fm-space-3);
+  border: 1px solid var(--fm-border-subtle);
+  border-radius: var(--fm-radius-md);
+}
+
+.fm-viewport-3d__settings-section legend {
+  padding-inline: var(--fm-space-2);
+  color: var(--fm-text-primary);
+  font-weight: 600;
+}
+
+.fm-viewport-3d__settings-section p {
+  margin: 0;
+  color: var(--fm-text-secondary);
+  font-size: var(--fm-font-size-xs);
+}
+
+.fm-viewport-3d__settings-field {
+  display: grid;
+  gap: var(--fm-space-2);
+  min-inline-size: 0;
+}
+
+.fm-viewport-3d__settings-field label {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--fm-space-2);
+  color: var(--fm-text-primary);
+  font-size: var(--fm-font-size-xs);
+}
+
+.fm-viewport-3d__settings-field output {
+  font-variant-numeric: tabular-nums;
+}
+
+.fm-viewport-3d__settings-field input[type="range"] {
+  width: 100%;
+  accent-color: var(--fm-accent);
+}
+
+.fm-viewport-3d__settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--fm-space-2);
+}
+
 .fm-viewport-3d__hud {
   position: absolute;
   z-index: var(--fm-z-base);

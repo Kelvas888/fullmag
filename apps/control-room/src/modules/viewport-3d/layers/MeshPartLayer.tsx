@@ -6,6 +6,7 @@ import {
   BufferAttribute,
   BufferGeometry,
   type MeshBasicMaterial,
+  type MeshLambertMaterial,
   type ShaderMaterial,
 } from "three";
 import {
@@ -964,6 +965,8 @@ export const MeshPartLayer = memo(function MeshPartLayer({
 
   const materialRef = useRef<MeshBasicMaterial>(null);
   const materialFrontRef = useRef<MeshBasicMaterial>(null);
+  const litMaterialRef = useRef<MeshLambertMaterial>(null);
+  const litMaterialFrontRef = useRef<MeshLambertMaterial>(null);
   const { hasScalarColors: hasUploadedVertexScalarColors } =
     resolveMeshPartVisibleScalarColorState({
     effectiveScalarColors,
@@ -985,6 +988,8 @@ export const MeshPartLayer = memo(function MeshPartLayer({
   );
   const surfacePolicy = surfacePassPolicies.back;
   const surfacePolicyFront = surfacePassPolicies.front;
+  const litSurfaceMaterial =
+    !hasUploadedVertexScalarColors && materialProfile.uniformGeometry.lit;
   const scalarShaderBuffer = committedScalarColorState.buffer;
   // Stable "program shape" key: null when there is no buffer, otherwise one of 4 strings
   // (scalar/orientation × real/complex). Deliberately does NOT depend on scalarShaderBuffer's
@@ -1023,13 +1028,31 @@ export const MeshPartLayer = memo(function MeshPartLayer({
   const scalarShaderMaterialFront = scalarShaderMaterials.front;
 
   useLayoutEffect(() => {
-    // Unlit fallback passes never consume normals. Allocate them only when a
-    // scalar shader needs the original per-part smooth shading, before its
-    // first frame; keep the same geometry and shared topology position buffer.
-    if (!geometry || !scalarShaderMaterial || geometry.getAttribute("normal")) return;
+    // Add normals only for an explicitly lit pass; keep the same geometry and
+    // shared topology position buffer when appearance settings change.
+    if (!geometry || geometry.getAttribute("normal")) return;
+    // Quantitative scalar shaders skip lighting when strength is zero, so they
+    // do not need generated normals. Keep normals for explicitly lit geometry.
+    const shaderNeedsNormals =
+      Boolean(scalarShaderMaterial) &&
+      materialProfile.magneticSurface.shadeStrength > 0;
+    const uniformSurfaceNeedsNormals =
+      !hasUploadedVertexScalarColors &&
+      !scalarShaderMaterial &&
+      materialProfile.uniformGeometry.lit;
+    if (!shaderNeedsNormals && !uniformSurfaceNeedsNormals) {
+      return;
+    }
     geometry.computeVertexNormals();
     invalidate();
-  }, [geometry, invalidate, scalarShaderMaterial]);
+  }, [
+    geometry,
+    hasUploadedVertexScalarColors,
+    invalidate,
+    materialProfile.magneticSurface.shadeStrength,
+    materialProfile.uniformGeometry.lit,
+    scalarShaderMaterial,
+  ]);
 
   useEffect(
     () => () => {
@@ -1083,8 +1106,14 @@ export const MeshPartLayer = memo(function MeshPartLayer({
     if (materialRef.current) {
       materialRef.current.needsUpdate = true;
     }
+    if (litMaterialRef.current) {
+      litMaterialRef.current.needsUpdate = true;
+    }
     if (materialFrontRef.current) {
       materialFrontRef.current.needsUpdate = true;
+    }
+    if (litMaterialFrontRef.current) {
+      litMaterialFrontRef.current.needsUpdate = true;
     }
   }, [hasUploadedVertexScalarColors]);
 
@@ -1151,12 +1180,21 @@ export const MeshPartLayer = memo(function MeshPartLayer({
           >
             {scalarShaderMaterial ? (
               <primitive attach="material" object={scalarShaderMaterial} />
+            ) : litSurfaceMaterial ? (
+              <meshLambertMaterial
+                ref={litMaterialRef}
+                color={meshColor}
+                opacity={surfaceOpacity}
+                toneMapped={materialProfile.magneticSurface.toneMapped}
+                vertexColors={hasUploadedVertexScalarColors}
+                {...surfacePolicy}
+              />
             ) : (
               <meshBasicMaterial
                 ref={materialRef}
                 color={meshColor}
                 opacity={surfaceOpacity}
-                {...materialProfile.magneticSurface}
+                toneMapped={materialProfile.magneticSurface.toneMapped}
                 vertexColors={hasUploadedVertexScalarColors}
                 {...surfacePolicy}
               />
@@ -1173,12 +1211,21 @@ export const MeshPartLayer = memo(function MeshPartLayer({
             >
               {scalarShaderMaterialFront ? (
                 <primitive attach="material" object={scalarShaderMaterialFront} />
+              ) : litSurfaceMaterial ? (
+                <meshLambertMaterial
+                  ref={litMaterialFrontRef}
+                  color={meshColor}
+                  opacity={surfaceOpacity}
+                  toneMapped={materialProfile.magneticSurface.toneMapped}
+                  vertexColors={hasUploadedVertexScalarColors}
+                  {...surfacePolicyFront}
+                />
               ) : (
                 <meshBasicMaterial
                   ref={materialFrontRef}
                   color={meshColor}
                   opacity={surfaceOpacity}
-                  {...materialProfile.magneticSurface}
+                  toneMapped={materialProfile.magneticSurface.toneMapped}
                   vertexColors={hasUploadedVertexScalarColors}
                   {...surfacePolicyFront}
                 />

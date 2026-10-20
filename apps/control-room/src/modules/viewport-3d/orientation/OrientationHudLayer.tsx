@@ -15,6 +15,7 @@ import {
 } from "three";
 
 import { viewport3dStore } from "../viewport3dStore";
+import { VIEWPORT_3D_HUD_LAYER } from "../viewport3dHudLayer";
 import {
   markViewport3DCameraGestureChanged,
   settleViewport3DCameraGesture,
@@ -300,6 +301,7 @@ function ScreenAnchoredGroup({
   useFrame(() => {
     const group = ref.current;
     if (!group) return;
+    group.traverse((object) => object.layers.set(VIEWPORT_3D_HUD_LAYER));
     const worldPerPixel = updateScreenAnchor(
       group,
       camera,
@@ -307,7 +309,8 @@ function ScreenAnchoredGroup({
       anchors[anchor],
       vectors,
     );
-    group.scale.setScalar(worldPerPixel * pixelScale);
+    const compactScale = size.width < 640 || size.height < 420 ? 0.68 : 1;
+    group.scale.setScalar(worldPerPixel * pixelScale * compactScale);
     group.visible = true;
   });
 

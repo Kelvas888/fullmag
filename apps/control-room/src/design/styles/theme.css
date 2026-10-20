@@ -8,6 +8,8 @@
   --fm-bg-panel: #1e1e2e;
   --fm-bg-panel-raised: #313244;
   --fm-bg-viewport: #11111b;
+  --fm-bg-viewport-top: #181825;
+  --fm-bg-viewport-bottom: #45475a;
   --fm-bg-overlay: #313244;
   --fm-bg-selected: #264069;
   --fm-bg-canvas: #11111b;
@@ -120,6 +122,8 @@
   --fm-bg-panel: #eff1f5;
   --fm-bg-panel-raised: #e6e9ef;
   --fm-bg-viewport: #dce0e8;
+  --fm-bg-viewport-top: #ccd0da;
+  --fm-bg-viewport-bottom: #eff1f5;
   --fm-bg-overlay: #e6e9ef;
   --fm-bg-selected: #c4d7f5;
   --fm-bg-canvas: #dce0e8;
@@ -208,11 +212,12 @@
   --fm-shadow-control-pressed: inset 0 1px 3px rgb(76 79 105 / 20%);
   --fm-shadow-control-inset: inset 0 1px 3px rgb(76 79 105 / 13%);
 
-  --fm-hud-axis-x: #d20f39;
-  --fm-hud-axis-y: #40a02b;
-  --fm-hud-axis-z: #1e66f5;
-  --fm-hud-label: var(--fm-text-primary);
-  --fm-hud-tick: var(--fm-text-secondary);
+  /* Stronger HUD foregrounds retain axis hues over the light viewport gradient. */
+  --fm-hud-axis-x: #a80c2e;
+  --fm-hud-axis-y: #1e4d15;
+  --fm-hud-axis-z: #1443a0;
+  --fm-hud-label: #3c3f54;
+  --fm-hud-tick: var(--fm-text-primary);
   --fm-hud-halo: var(--fm-bg-viewport);
   --fm-hud-grid: #5c5f77;
   --fm-hud-chip: #eff1f5;

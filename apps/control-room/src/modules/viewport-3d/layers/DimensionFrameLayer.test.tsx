@@ -46,6 +46,7 @@ describe("DimensionFrameLayer resources", () => {
   it("outlines labels with the viewport background instead of a grey", () => {
     expect(resolveDimensionFrameLayerColors(colors)).toEqual({
       axis: { x: "#cdd6f4", y: "#cdd6f4", z: "#89b4fa" },
+      axisLine: "#cdd6f4",
       extent: "#cdd6f4",
       grid: "#bac2de",
       halo: "#11111b",
@@ -98,5 +99,12 @@ describe("DimensionFrameLayer resources", () => {
     expect(tickThinningForSpacing(60)).toBe(1);
     expect(tickThinningForSpacing(20)).toBe(2);
     expect(tickThinningForSpacing(6)).toBe(5);
+  });
+
+  it("uses spacing hysteresis while the camera moves", () => {
+    expect(tickThinningForSpacing(32, 1)).toBe(1);
+    expect(tickThinningForSpacing(29, 1)).toBe(2);
+    expect(tickThinningForSpacing(36, 2)).toBe(2);
+    expect(tickThinningForSpacing(40, 2)).toBe(1);
   });
 });

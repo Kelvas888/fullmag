@@ -1,5 +1,6 @@
 """Contract and pure-validator regressions for the managed Docker DEV browser proof."""
 from copy import deepcopy
+from contextlib import ExitStack, contextmanager
 import hashlib
 import importlib.util
 import json
@@ -25,10 +26,746 @@ def _load_qa_module():
     return module
 
 
+def _recovery_fixture(qa):
+    selected = ROOT.resolve()
+    identity = {
+        "project_id": "fullmag",
+        "worktree_id": "fixture",
+        "checkout_kind": "worktree",
+    }
+    project = "fullmag-worktree-fixture"
+    attempt = "a" * 32
+    runtime_attempt = "b" * 32
+    image = "sha256:" + "c" * 64
+    document = {"name": project, "services": {"backend": {}, "frontend": {}}}
+    config_sha256 = hashlib.sha256(qa.canonical(document)).hexdigest()
+    original_inputs = {
+        "schema": "fullmag.docker-development-inputs.v1",
+        "source_root": str(selected),
+        "source_project_id": identity["project_id"],
+        "source_worktree_id": identity["worktree_id"],
+        "source_checkout_kind": identity["checkout_kind"],
+        "image_id": image,
+        "source_commit": "1" * 40,
+    }
+    original = {
+        "state": "failed-confirmed",
+        "phase": "development",
+        "attempt": attempt,
+        "compose_project": project,
+        "config_sha256": config_sha256,
+        "inputs": original_inputs,
+        "source_commit": original_inputs["source_commit"],
+        "frontend_volume": "fullmag-frontend-state",
+    }
+    recovered = {
+        "state": "succeeded",
+        "phase": "resume",
+        "attempt": runtime_attempt,
+        "compose_project": project,
+        "config_sha256": config_sha256,
+        "inputs": {
+            "attempt": attempt,
+            "config_sha256": config_sha256,
+            "source_root": str(selected),
+            "image_id": image,
+        },
+        "backend_container": "d" * 64,
+        "frontend_container": "e" * 64,
+        "finished_at": 42,
+    }
+
+    class FakeControl:
+        def __init__(self):
+            self.project = project
+            self.documents = {
+                "development/current.json": deepcopy(original),
+                f"development/attempts/{attempt}/terminal.json": deepcopy(original),
+                f"development/attempts/{attempt}/compose.json": deepcopy(document),
+                "frontend/development-inputs.json": {
+                    "source_root": str(selected),
+                    "worktree_id": identity["worktree_id"],
+                    "host_port": "3199",
+                },
+            }
+            self.reads = []
+
+        def read(self, path, optional=False):
+            self.reads.append((path, optional))
+            if path not in self.documents:
+                if optional:
+                    return None
+                raise AssertionError(f"unexpected control-volume read: {path}")
+            return deepcopy(self.documents[path])
+
+    return {
+        "selected": selected,
+        "identity": identity,
+        "project": project,
+        "attempt": attempt,
+        "runtime_attempt": runtime_attempt,
+        "image": image,
+        "document": document,
+        "config_sha256": config_sha256,
+        "original_inputs": original_inputs,
+        "original": original,
+        "recovered": recovered,
+        "control": FakeControl(),
+    }
+
+
+def _browser_qa_reconciliation_fixture(
+    qa,
+    *,
+    active_values=None,
+    browser_running=False,
+    browser_absent=False,
+    retain_evidence=False,
+    retain_terminal=False,
+):
+    selected = ROOT.resolve()
+    identity = {"project_id": "fullmag", "worktree_id": "fixture", "checkout_kind": "worktree"}
+    attempt = "a" * 32
+    helper_id = "b" * 64
+    browser_id = "c" * 64
+    image_id = "sha256:" + "d" * 64
+    project = "fullmag-worktree-fixture"
+    volume = "fullmag-control-fixture"
+    helper_name = "fullmag-control-" + attempt
+    browser_name = "fullmag-browser-qa-" + attempt[:12]
+    browser_image = qa.DEFAULT_BROWSER_IMAGE
+    frontend_volume = "fullmag-frontend-state"
+    receipt = {
+        "schema": "fullmag.docker-build-operation.v1",
+        "phase": "browser-qa",
+        "attempt": attempt,
+        "compose_project": project,
+        "control_volume": volume,
+        "state": "outcome-unknown-resources-retained",
+        "inputs": {
+            "source_root": str(selected),
+            "worktree_id": identity["worktree_id"],
+            "browser_image": browser_image,
+            "frontend_volume": frontend_volume,
+            "browser_runtime_timeout": 180,
+        },
+        "helper_container": helper_name,
+        "browser_container_name": browser_name,
+        "browser_image_id": image_id,
+    }
+    document = {
+        "name": project,
+        "services": {
+            "browser-qa": {
+                "command": ["node", "/qa/run.mjs"],
+            },
+        },
+    }
+    receipt_raw = qa.canonical(receipt)
+    compose_raw = qa.canonical(document)
+    observed = {
+        "Name": "/" + browser_name,
+        "Id": browser_id,
+        "State": {
+            "Status": "running" if browser_running else "exited",
+            "Running": browser_running,
+            "OOMKilled": False,
+            "ExitCode": 0 if browser_running else 23,
+            "FinishedAt": "" if browser_running else "2026-10-20T10:00:00Z",
+        },
+        "RestartCount": 0,
+        "Config": {
+            "Cmd": document["services"]["browser-qa"]["command"],
+            "Entrypoint": ["/bin/sh"],
+        },
+    }
+    image_document = {"Id": image_id, "Config": {"Entrypoint": ["/bin/sh"]}}
+    helper_log = "authenticated control helper log"
+    absence_sha256 = "e" * 64
+    reconciled_at = 1_792_491_600.0
+    retained = None
+    terminal = None
+    if retain_evidence:
+        retained = {
+            "schema": "fullmag.browser-qa-reconciliation.v1",
+            "state": "failed-confirmed",
+            "attempt": attempt,
+            "compose_project": project,
+            "output_lost": True,
+            "observed_exit_code": observed["State"]["ExitCode"],
+            "browser_container_id": browser_id,
+            "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
+            "compose_sha256": hashlib.sha256(compose_raw).hexdigest(),
+            "helper_id": helper_id,
+            "helper_log": helper_log,
+            "browser_inspect": observed,
+            "verification": "NOT VERIFIED",
+            "reconciled_at": reconciled_at,
+        }
+    if retain_terminal:
+        if retained is None:
+            raise AssertionError("a retained terminal requires retained reconciliation evidence")
+        terminal = {
+            **receipt,
+            "state": "failed-confirmed",
+            "output_lost": True,
+            "error": "Browser QA failed; output lost after client timeout",
+            "exit_code": observed["State"]["ExitCode"],
+            "browser_container_id": browser_id,
+            "browser_absence_sha256": absence_sha256,
+            "reconciliation_evidence_sha256": hashlib.sha256(
+                qa.canonical(retained) + b"\n"
+            ).hexdigest(),
+            "finished_at": reconciled_at,
+            "verification": "NOT VERIFIED",
+        }
+
+    class FakeControl:
+        def __init__(self):
+            self.project = project
+            self.volume = volume
+            self.events = []
+            self.writes = []
+            self.active_values = list(active_values or [attempt + "\n"])
+            self.active_observations = []
+            self.byte_reads = []
+            self.helper_scripts = []
+            self.documents = {
+                "browser-qa/attempts/" + attempt + "/receipt.json": receipt_raw,
+                "browser-qa/attempts/" + attempt + "/compose.json": compose_raw,
+            }
+            root = "browser-qa/attempts/" + attempt
+            if retained is not None:
+                self.documents[root + "/reconciliation-evidence.json"] = deepcopy(retained)
+            if terminal is not None:
+                self.documents[root + "/terminal.json"] = deepcopy(terminal)
+
+        def read_control_bytes(self, relative, optional=False):
+            self.byte_reads.append((relative, optional))
+            self.events.append(("control-bytes", relative))
+            if relative == "active":
+                if len(self.active_values) > 1:
+                    value = self.active_values.pop(0)
+                else:
+                    value = self.active_values[0] if self.active_values else None
+                self.active_observations.append(value)
+                return value.encode("utf-8") if isinstance(value, str) else value
+            if relative not in self.documents:
+                if optional:
+                    return None
+                raise AssertionError("unexpected control byte read: " + relative)
+            return self.documents[relative]
+
+        def read(self, relative, optional=False):
+            self.events.append(("read", relative))
+            if relative not in self.documents:
+                if optional:
+                    return None
+                raise AssertionError("unexpected control read: " + relative)
+            return deepcopy(self.documents[relative])
+
+        def write(self, relative, value):
+            snapshot = deepcopy(value)
+            self.events.append(("write", relative, snapshot))
+            self.writes.append((relative, snapshot))
+            self.documents[relative] = snapshot
+
+        @staticmethod
+        def path(relative):
+            return "/control/" + relative
+
+        def helper_args(self, script):
+            self.events.append(("helper-args", script))
+            self.helper_scripts.append(script)
+            return ("mock-control-helper", script)
+
+    control = FakeControl()
+    args = SimpleNamespace(
+        reconcile_attempt=attempt,
+        expected_receipt_sha256=hashlib.sha256(receipt_raw).hexdigest(),
+        expected_compose_sha256=hashlib.sha256(compose_raw).hexdigest(),
+        expected_browser_id=browser_id,
+        expected_helper_id=helper_id,
+        port=3199,
+    )
+    calls = {
+        "probes": [],
+        "docker": [],
+        "inspect": [],
+        "cas": [],
+        "helper_validation": [],
+        "wait": [],
+        "console": [],
+    }
+    return {
+        "selected": selected,
+        "identity": identity,
+        "attempt": attempt,
+        "helper_id": helper_id,
+        "helper_name": helper_name,
+        "browser_id": browser_id,
+        "browser_name": browser_name,
+        "image_id": image_id,
+        "image_document": image_document,
+        "receipt": receipt,
+        "document": document,
+        "observed": observed,
+        "helper_log": helper_log,
+        "absence_sha256": absence_sha256,
+        "retained": retained,
+        "terminal": terminal,
+        "args": args,
+        "control": control,
+        "calls": calls,
+        "browser_absent": browser_absent,
+    }
+
+
+@contextmanager
+def _mock_browser_qa_reconciliation(qa, case):
+    import docker_build_control
+    import docker_volume_activation_reconcile as activation_reconcile
+
+    control = case["control"]
+    calls = case["calls"]
+
+    def probe_absence(identifier):
+        calls["probes"].append(identifier)
+        control.events.append(("probe-absence", identifier))
+        if identifier == case["browser_id"]:
+            if case["browser_absent"] or any(
+                event[0] == "docker-rm" for event in control.events
+            ):
+                return case["absence_sha256"]
+            return None
+        return case["absence_sha256"]
+
+    def inspect_browser(identifier):
+        calls["inspect"].append(identifier)
+        control.events.append(("inspect-browser", identifier))
+        if case["browser_absent"]:
+            raise AssertionError("an absent browser must be replayed from retained evidence")
+        return deepcopy(case["observed"])
+
+    def docker_capture(*args, **kwargs):
+        calls["docker"].append((args, kwargs))
+        control.events.append(("docker", args))
+        if args == ("rm", case["browser_id"]):
+            control.events.append(("docker-rm", case["browser_id"]))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        raise AssertionError("unexpected Docker command in reconciliation test: " + repr(args))
+
+    def bounded_capture(args, *, data, timeout):
+        calls["cas"].append((args, data, timeout))
+        control.events.append(("bounded-capture", args))
+        control.active_values = [None]
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    def validate_helper(*args, **kwargs):
+        calls["helper_validation"].append((args, kwargs))
+        control.events.append(("validate-control-helper", args))
+        return {}, case["helper_id"]
+
+    def validate_browser_helper(*args, **kwargs):
+        control.events.append(("validate-browser-helper", args))
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(activation_reconcile, "_control_bytes",
+                                         side_effect=lambda _control, relative, optional=False:
+                                         control.read_control_bytes(relative, optional)))
+        stack.enter_context(patch.object(activation_reconcile, "_probe_helper_absence",
+                                         side_effect=probe_absence))
+        stack.enter_context(patch.object(activation_reconcile, "_validate_helper",
+                                         side_effect=validate_helper))
+        stack.enter_context(patch.object(activation_reconcile, "_validate_helper_logged",
+                                         return_value=case["helper_log"]))
+        stack.enter_context(patch.object(
+            activation_reconcile, "_wait_for_helper_exit",
+            side_effect=lambda helper_id: calls["wait"].append(helper_id),
+        ))
+        stack.enter_context(patch.object(qa, "_compose_document",
+                                         return_value=case["document"]))
+        stack.enter_context(patch.object(qa, "_inspect", side_effect=inspect_browser))
+        stack.enter_context(patch.object(qa, "_inspect_image",
+                                         return_value=case["image_document"]))
+        stack.enter_context(patch.object(qa, "_validate_browser_image_reference"))
+        stack.enter_context(patch.object(qa, "_validate_browser_image_document",
+                                         return_value=(case["image_id"], "pinned-image-digest")))
+        stack.enter_context(patch.object(qa, "_validate_browser_helper",
+                                         side_effect=validate_browser_helper))
+        stack.enter_context(patch.object(qa, "docker_capture", side_effect=docker_capture))
+        stack.enter_context(patch.object(qa, "mirror_console",
+                                         side_effect=lambda value: calls["console"].append(value)))
+        stack.enter_context(patch.object(docker_build_control, "bounded_capture",
+                                         side_effect=bounded_capture))
+        yield
+
+
 class DockerDevBrowserQaContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.qa = _load_qa_module()
+
+    def test_failed_development_resolves_only_verified_linked_runtime_and_keeps_original_provenance(self):
+        qa = self.qa
+        case = _recovery_fixture(qa)
+        activation = importlib.import_module("docker_volume_activate")
+        original_before = deepcopy(case["original"])
+        resolved_ids = ("backend-runtime", "frontend-runtime")
+        stale_candidate = {**deepcopy(case["recovered"]), "attempt": "f" * 32, "finished_at": 99}
+        with patch.object(
+            activation, "_linked_runtime_terminals", return_value=[stale_candidate, case["recovered"]],
+        ) as linked, \
+             patch.object(
+                 activation,
+                 "_validate_running_group",
+                 side_effect=[qa.BuildControlError("stale candidate is no longer running"), resolved_ids],
+             ) as validate:
+            result = qa._read_live_development(
+                case["control"], case["selected"], case["identity"], 3199,
+            )
+
+        current, backend_id, frontend_id, frontend_volume, frontend_inputs = result
+        self.assertEqual(current["state"], "succeeded")
+        self.assertEqual(current["development_terminal_state"], "failed-confirmed")
+        self.assertEqual(current["attempt"], case["attempt"])
+        self.assertEqual(current["phase"], "development")
+        self.assertEqual(current["inputs"], case["original_inputs"])
+        self.assertEqual(current["runtime_attempt"], case["runtime_attempt"])
+        self.assertEqual(current["runtime_phase"], "resume")
+        self.assertEqual(
+            current["development_fence_sha256"],
+            hashlib.sha256(qa.canonical(original_before)).hexdigest(),
+        )
+        self.assertEqual(
+            current["runtime_terminal_sha256"],
+            hashlib.sha256(qa.canonical(case["recovered"])).hexdigest(),
+        )
+        self.assertEqual(backend_id, case["recovered"]["backend_container"])
+        self.assertEqual(frontend_id, case["recovered"]["frontend_container"])
+        self.assertEqual(frontend_volume, "fullmag-frontend-state")
+        self.assertEqual(frontend_inputs["worktree_id"], case["identity"]["worktree_id"])
+        self.assertEqual(case["original"], original_before)
+        linked.assert_called_once_with(
+            case["control"], case["attempt"], case["original"],
+            source_root=str(case["selected"]), image=case["image"],
+            config_sha256=case["config_sha256"],
+        )
+        self.assertEqual(validate.call_count, 2)
+        self.assertEqual(validate.call_args_list[0].args[3], stale_candidate)
+        self.assertEqual(validate.call_args_list[1].args[3], case["recovered"])
+
+    def test_failed_development_rejects_stale_terminal_config_source_missing_link_and_ambiguous_live_ids(self):
+        qa = self.qa
+        activation = importlib.import_module("docker_volume_activate")
+
+        with self.subTest(reason="current differs from its terminal"), \
+             patch.object(activation, "_linked_runtime_terminals") as linked, \
+             patch.object(activation, "_validate_running_group"):
+            case = _recovery_fixture(qa)
+            case["control"].documents[
+                f"development/attempts/{case['attempt']}/terminal.json"
+            ]["state"] = "failed"
+            with self.assertRaisesRegex(qa.BuildControlError, "differs from its terminal"):
+                qa._read_recovered_development(
+                    case["control"], case["original"], case["selected"], case["identity"],
+                )
+            linked.assert_not_called()
+
+        with self.subTest(reason="configuration pin differs"), \
+             patch.object(activation, "_linked_runtime_terminals") as linked, \
+             patch.object(activation, "_validate_running_group"):
+            case = _recovery_fixture(qa)
+            case["original"]["config_sha256"] = "f" * 64
+            case["control"].documents[
+                f"development/attempts/{case['attempt']}/terminal.json"
+            ] = deepcopy(case["original"])
+            with self.assertRaisesRegex(qa.BuildControlError, "original/config pin differs"):
+                qa._read_recovered_development(
+                    case["control"], case["original"], case["selected"], case["identity"],
+                )
+            linked.assert_not_called()
+
+        with self.subTest(reason="source differs from selected checkout"), \
+             patch.object(activation, "_linked_runtime_terminals") as linked, \
+             patch.object(activation, "_validate_running_group"):
+            case = _recovery_fixture(qa)
+            case["original"]["inputs"]["source_root"] = str(case["selected"].parent)
+            case["control"].documents[
+                f"development/attempts/{case['attempt']}/terminal.json"
+            ] = deepcopy(case["original"])
+            with self.assertRaisesRegex(qa.BuildControlError, "recovery source differs"):
+                qa._read_recovered_development(
+                    case["control"], case["original"], case["selected"], case["identity"],
+                )
+            linked.assert_not_called()
+
+        with self.subTest(reason="no succeeded linked runtime"), \
+             patch.object(activation, "_linked_runtime_terminals", return_value=[]) as linked, \
+             patch.object(activation, "_validate_running_group") as validate:
+            case = _recovery_fixture(qa)
+            with self.assertRaisesRegex(qa.BuildControlError, "exactly one live group"):
+                qa._read_recovered_development(
+                    case["control"], case["original"], case["selected"], case["identity"],
+                )
+            linked.assert_called_once()
+            validate.assert_not_called()
+
+        with self.subTest(reason="linked receipts resolve to distinct live groups"), \
+             patch.object(
+                 activation,
+                 "_linked_runtime_terminals",
+                 side_effect=lambda _control, _attempt, _original, **_kwargs: [
+                     {**_recovery_fixture(qa)["recovered"], "attempt": "b" * 32},
+                     {**_recovery_fixture(qa)["recovered"], "attempt": "c" * 32, "phase": "iteration"},
+                 ],
+             ) as linked, \
+             patch.object(
+                 activation,
+                 "_validate_running_group",
+                 side_effect=[("backend-one", "frontend-one"), ("backend-two", "frontend-two")],
+             ) as validate:
+            case = _recovery_fixture(qa)
+            with self.assertRaisesRegex(qa.BuildControlError, "exactly one live group"):
+                qa._read_recovered_development(
+                    case["control"], case["original"], case["selected"], case["identity"],
+                )
+            linked.assert_called_once()
+            self.assertEqual(validate.call_count, 2)
+
+    def test_succeeded_development_receipt_keeps_direct_read_path(self):
+        qa = self.qa
+        selected = ROOT.resolve()
+        identity = {
+            "project_id": "fullmag",
+            "worktree_id": "fixture",
+            "checkout_kind": "worktree",
+        }
+        current = {
+            "state": "succeeded",
+            "compose_project": "fullmag-worktree-fixture",
+            "inputs": {
+                "source_root": str(selected),
+                "source_project_id": identity["project_id"],
+                "source_worktree_id": identity["worktree_id"],
+                "source_checkout_kind": identity["checkout_kind"],
+            },
+            "backend_container": "backend-current",
+            "frontend_container": "frontend-current",
+            "frontend_volume": "fullmag-frontend-state",
+        }
+        frontend_inputs = {
+            "source_root": str(selected),
+            "worktree_id": identity["worktree_id"],
+            "host_port": "3199",
+        }
+
+        class FakeControl:
+            project = "fullmag-worktree-fixture"
+
+            def read(self, path):
+                if path == "development/current.json":
+                    return current
+                if path == "frontend/development-inputs.json":
+                    return frontend_inputs
+                raise AssertionError(f"unexpected control-volume read: {path}")
+
+        with patch.object(qa, "_read_recovered_development") as recover:
+            result = qa._read_live_development(FakeControl(), selected, identity, 3199)
+
+        self.assertEqual(result[0]["state"], current["state"])
+        self.assertEqual(result[0]["inputs"], current["inputs"])
+        self.assertEqual(
+            result[0]["development_fence_sha256"],
+            hashlib.sha256(qa.canonical(current)).hexdigest(),
+        )
+        self.assertEqual(result[1:], (
+            "backend-current", "frontend-current", "fullmag-frontend-state", frontend_inputs,
+        ))
+        recover.assert_not_called()
+
+    def test_reconcile_browser_qa_refuses_another_active_token_before_destructive_actions(self):
+        qa = self.qa
+        case = _browser_qa_reconciliation_fixture(
+            qa, active_values=["f" * 32 + "\n"],
+        )
+        with _mock_browser_qa_reconciliation(qa, case):
+            with self.assertRaisesRegex(qa.BuildControlError, "active fence differs"):
+                qa.reconcile_browser_qa(
+                    case["control"], case["selected"], case["identity"], case["args"],
+                )
+
+        root = "browser-qa/attempts/" + case["attempt"]
+        byte_paths = [path for path, _optional in case["control"].byte_reads]
+        self.assertEqual(byte_paths, ["active"])
+        self.assertNotIn(root + "/receipt.json", byte_paths)
+        self.assertEqual(case["control"].writes, [])
+        self.assertEqual(case["calls"]["docker"], [])
+        self.assertEqual(case["calls"]["cas"], [])
+        self.assertEqual(case["calls"]["helper_validation"], [])
+
+    def test_reconcile_browser_qa_rejects_bad_receipt_hash_before_helper_or_removal(self):
+        qa = self.qa
+        case = _browser_qa_reconciliation_fixture(qa)
+        case["args"].expected_receipt_sha256 = "f" * 64
+        with _mock_browser_qa_reconciliation(qa, case):
+            with self.assertRaisesRegex(qa.BuildControlError, "evidence CAS differs"):
+                qa.reconcile_browser_qa(
+                    case["control"], case["selected"], case["identity"], case["args"],
+                )
+
+        self.assertIn(
+            "browser-qa/attempts/" + case["attempt"] + "/receipt.json",
+            [path for path, _optional in case["control"].byte_reads],
+        )
+        self.assertEqual(case["control"].writes, [])
+        self.assertEqual(case["calls"]["helper_validation"], [])
+        self.assertEqual(case["calls"]["docker"], [])
+        self.assertEqual(case["calls"]["cas"], [])
+
+    def test_reconcile_browser_qa_refuses_running_browser_without_persisting_or_removing(self):
+        qa = self.qa
+        case = _browser_qa_reconciliation_fixture(qa, browser_running=True)
+        with _mock_browser_qa_reconciliation(qa, case):
+            with self.assertRaisesRegex(qa.BuildControlError, "exact stopped failed browser"):
+                qa.reconcile_browser_qa(
+                    case["control"], case["selected"], case["identity"], case["args"],
+                )
+
+        self.assertEqual(case["calls"]["inspect"], [case["browser_id"]])
+        self.assertEqual(case["control"].writes, [])
+        self.assertEqual(case["calls"]["docker"], [])
+        self.assertEqual(case["calls"]["cas"], [])
+
+    def test_reconcile_browser_qa_persists_evidence_before_remove_and_publishes_terminal_by_cas(self):
+        qa = self.qa
+        case = _browser_qa_reconciliation_fixture(qa)
+        with _mock_browser_qa_reconciliation(qa, case):
+            qa.reconcile_browser_qa(
+                case["control"], case["selected"], case["identity"], case["args"],
+            )
+
+        events = case["control"].events
+        evidence_path = (
+            "browser-qa/attempts/" + case["attempt"] + "/reconciliation-evidence.json"
+        )
+        evidence_write = next(
+            index for index, event in enumerate(events)
+            if event[0] == "write" and event[1] == evidence_path
+        )
+        browser_remove = next(
+            index for index, event in enumerate(events)
+            if event[0] == "docker-rm" and event[1] == case["browser_id"]
+        )
+        cas_publication = next(
+            index for index, event in enumerate(events) if event[0] == "bounded-capture"
+        )
+        self.assertLess(evidence_write, browser_remove)
+        self.assertLess(browser_remove, cas_publication)
+        self.assertEqual(case["calls"]["docker"], [(
+            ("rm", case["browser_id"]), {},
+        )])
+        self.assertEqual(len(case["calls"]["cas"]), 1)
+        helper_args, payload, timeout = case["calls"]["cas"][0]
+        script = case["control"].helper_scripts[0]
+        self.assertEqual(helper_args, ("mock-control-helper", script))
+        self.assertEqual(timeout, 90)
+        self.assertIn(
+            "test \"$(cat /control/active)\" = '" + case["attempt"] + "'",
+            script,
+        )
+        self.assertIn(
+            "sha256sum '/control/browser-qa/attempts/" + case["attempt"] + "/receipt.json'",
+            script,
+        )
+        self.assertIn(
+            "sha256sum '/control/browser-qa/attempts/" + case["attempt"] + "/compose.json'",
+            script,
+        )
+        self.assertIn(
+            "mv -T -- \"$t\" '/control/browser-qa/attempts/"
+            + case["attempt"] + "/terminal.json'",
+            script,
+        )
+        self.assertNotIn("rm -f -- '/control/active'", script)
+        self.assertNotIn("unlink", script.lower())
+        self.assertFalse(any(
+            path.endswith("/terminal.json") for path, _value in case["control"].writes
+        ))
+        published = json.loads(payload)
+        self.assertEqual(published["state"], "failed-confirmed")
+        self.assertEqual(published["output_lost"], True)
+        self.assertEqual(published["browser_container_id"], case["browser_id"])
+        self.assertEqual(case["control"].active_values, [None])
+        self.assertEqual(case["calls"]["wait"], [case["helper_id"]])
+
+    def test_reconcile_browser_qa_released_replay_requires_active_marker_to_stay_absent(self):
+        qa = self.qa
+        case = _browser_qa_reconciliation_fixture(
+            qa,
+            active_values=[None, "a" * 32 + "\n"],
+            browser_absent=True,
+            retain_evidence=True,
+            retain_terminal=True,
+        )
+        with _mock_browser_qa_reconciliation(qa, case):
+            with self.assertRaisesRegex(
+                qa.BuildControlError, "Completed QA reconciliation terminal/fence differs",
+            ):
+                qa.reconcile_browser_qa(
+                    case["control"], case["selected"], case["identity"], case["args"],
+                )
+
+        active_reads = case["control"].active_observations
+        self.assertEqual(active_reads, [None, "a" * 32 + "\n"])
+        self.assertEqual(case["control"].writes, [])
+        self.assertEqual(case["calls"]["docker"], [])
+        self.assertEqual(case["calls"]["cas"], [])
+
+    def test_reconcile_browser_qa_accepts_released_replay_only_with_active_absent(self):
+        qa = self.qa
+        case = _browser_qa_reconciliation_fixture(
+            qa,
+            active_values=[None],
+            browser_absent=True,
+            retain_evidence=True,
+            retain_terminal=True,
+        )
+        with _mock_browser_qa_reconciliation(qa, case):
+            qa.reconcile_browser_qa(
+                case["control"], case["selected"], case["identity"], case["args"],
+            )
+
+        self.assertEqual(case["control"].active_observations, [None, None])
+        self.assertEqual(case["control"].writes, [])
+        self.assertEqual(case["calls"]["docker"], [])
+        self.assertEqual(case["calls"]["cas"], [])
+        self.assertEqual(len(case["calls"]["console"]), 1)
+        self.assertIn('"lease_released": true', case["calls"]["console"][0])
+
+    def test_reconcile_browser_qa_absent_browser_replay_uses_retained_inspect_evidence(self):
+        qa = self.qa
+        case = _browser_qa_reconciliation_fixture(
+            qa, browser_absent=True, retain_evidence=True,
+        )
+        with _mock_browser_qa_reconciliation(qa, case):
+            qa.reconcile_browser_qa(
+                case["control"], case["selected"], case["identity"], case["args"],
+            )
+
+        self.assertEqual(case["calls"]["inspect"], [])
+        self.assertFalse(any(
+            event[0] == "docker-rm" for event in case["control"].events
+        ))
+        self.assertEqual(case["control"].writes, [])
+        self.assertEqual(len(case["calls"]["cas"]), 1)
+        published = json.loads(case["calls"]["cas"][0][1])
+        self.assertEqual(published["state"], "failed-confirmed")
+        self.assertEqual(published["browser_container_id"], case["browser_id"])
+        self.assertEqual(
+            published["reconciliation_evidence_sha256"],
+            hashlib.sha256(qa.canonical(case["retained"]) + b"\n").hexdigest(),
+        )
 
     def test_just_recipe_stays_on_managed_python_route(self):
         text = (ROOT / "justfile").read_text(encoding="utf-8")

@@ -535,8 +535,8 @@ def _validate_helper(
     activation_attempt: str,
     *, phase: str = "activation",
 ) -> tuple[dict[str, object], str]:
-    if phase not in {"activation", "iteration"}:
-        raise _fail("Unsupported recovery helper phase")
+    if phase not in {"activation", "iteration", "browser-qa"}:
+        raise _fail("Unsupported retained helper phase")
     result = docker_capture("inspect", helper_name, timeout=90)
     try:
         documents = json.loads(result.stdout)

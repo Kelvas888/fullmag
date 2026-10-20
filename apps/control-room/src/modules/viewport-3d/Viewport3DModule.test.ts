@@ -1998,7 +1998,7 @@ describe("Viewport3DModule scene wiring", () => {
       "utf8",
     );
     const canvasStart = source.indexOf("<Viewport3DCanvas");
-    const canvasEnd = source.indexOf("\n        >", canvasStart);
+    const canvasEnd = source.indexOf("<Viewport3DRendererProfile", canvasStart);
     expect(canvasEnd).toBeGreaterThan(canvasStart);
     const canvasBlock = source.slice(canvasStart, canvasEnd);
 
@@ -2014,7 +2014,7 @@ describe("Viewport3DModule scene wiring", () => {
       "utf8",
     );
     const canvasStart = source.indexOf("<Viewport3DCanvas");
-    const canvasEnd = source.indexOf("\n        >", canvasStart);
+    const canvasEnd = source.indexOf("<Viewport3DRendererProfile", canvasStart);
     expect(canvasEnd).toBeGreaterThan(canvasStart);
     const canvasBlock = source.slice(canvasStart, canvasEnd);
 
@@ -2027,7 +2027,7 @@ describe("Viewport3DModule scene wiring", () => {
     expect(source).toContain("VIEWPORT_3D_CANVAS_GL_CAPTURE_NO_ANTIALIAS");
     expect(source).toContain("resolveStableViewport3DCanvasGlOptions");
     expect(source.replace(/\r\n/g, "\n")).toContain(
-      "const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(\n    visualProfile,\n    effectAntialias,\n  );",
+      "const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(\n    getViewport3DVisualProfile(canvasContextProfileId),\n    effectAntialias,\n  );",
     );
     expect(source).toContain("const handleCanvasCreated = useCallback");
     expect(source).toContain("const handleCanvasContextMenu = useCallback");

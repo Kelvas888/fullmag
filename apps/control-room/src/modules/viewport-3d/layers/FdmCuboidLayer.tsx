@@ -26,6 +26,7 @@ import {
   InstancedBufferAttribute,
   InstancedMesh,
   MeshBasicMaterial,
+  MeshLambertMaterial,
   Raycaster,
   Vector2,
   Vector3,
@@ -1023,9 +1024,8 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
   const geometry = useMemo(
     () => {
       const next = new BoxGeometry(1, 1, 1);
-      // MeshBasicMaterial enables the regular vertex-color channel together
-      // with InstancedMesh.instanceColor. Keep that channel neutral so the
-      // per-cell instance colors are not multiplied by WebGL's default (0,0,0,1).
+      // Keep the regular vertex-color channel neutral because instance colors
+      // share the material's color path and must not gain an extra multiplier.
       const color = new Float32Array(next.getAttribute("position").count * 3);
       color.fill(1);
       next.setAttribute("color", new BufferAttribute(color, 3));
@@ -1118,27 +1118,35 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     colors.mesh,
     usesInstanceColors,
   );
+  const litSurface = !usesInstanceColors && materialProfile.uniformGeometry.lit;
   const surfaceMaterial = useMemo(
-    () =>
-      tracker.track(
+    () => {
+      const MaterialConstructor = litSurface
+        ? MeshLambertMaterial
+        : MeshBasicMaterial;
+      return tracker.track(
         "material",
-        new MeshBasicMaterial({
+        new MaterialConstructor({
           color: surfaceMaterialColor,
           opacity: surfaceOpacity,
           vertexColors: usesInstanceColors,
           toneMapped: materialProfile.magneticSurface.toneMapped,
           ...surfaceMaterialPolicyProps(surfaceOpacity),
         }),
-      ),
+      );
+    },
     [
-      materialProfile.magneticSurface,
+      litSurface,
+      materialProfile.magneticSurface.toneMapped,
       surfaceMaterialColor,
       surfaceOpacity,
       tracker,
       usesInstanceColors,
     ],
   );
-  const surfaceMaterialRef = useRef<MeshBasicMaterial>(null);
+  const surfaceMaterialRef = useRef<
+    MeshBasicMaterial | MeshLambertMaterial
+  >(null);
   const wireframePolicy = RENDER_POLICIES.featureEdges;
   const wireframeColor = wireframeColorFromSettings(renderSettings, colors.wire);
   const wireframeOpacity = renderPlan.wireframe.opacity;
@@ -1211,7 +1219,8 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
       const mountedSurfaceMaterial = surface.material;
       if (
         mountedSurfaceMaterial === surfaceMaterial &&
-        mountedSurfaceMaterial instanceof MeshBasicMaterial
+        (mountedSurfaceMaterial instanceof MeshBasicMaterial ||
+          mountedSurfaceMaterial instanceof MeshLambertMaterial)
       ) {
         mountedSurfaceMaterial.needsUpdate = true;
       }
