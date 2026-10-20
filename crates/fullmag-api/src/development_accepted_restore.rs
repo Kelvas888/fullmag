@@ -126,7 +126,7 @@ struct AcceptedRestoreRuntimeMetadata {
     previous_ack_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptedRestoreSuccessorDrain {
     schema: String,
