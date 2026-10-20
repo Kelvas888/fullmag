@@ -29,6 +29,15 @@ MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 32 * 1024 * 1024
 MAX_ATTEMPTS = 64
 MIN_FREE_BUILD_BYTES = 32 * 1024**3
+# A cache-only operation can retain one bounded log and up to six bounded
+# control documents per attempt. Keep room for a conservative retry window,
+# while leaving the 32 GiB reserve unchanged for any Docker build or pull.
+CACHE_CONTROL_ATTEMPT_WINDOW = MAX_ATTEMPTS // 4
+CACHE_CONTROL_DOCUMENTS_PER_ATTEMPT = 6
+MIN_FREE_CONTROL_BYTES = CACHE_CONTROL_ATTEMPT_WINDOW * (
+    MAX_LOG_BYTES + CACHE_CONTROL_DOCUMENTS_PER_ATTEMPT * MAX_DOCUMENT_BYTES
+)
+CACHE_ONLY_PHASES = frozenset(("toolchain", "image-dev", "image-backend"))
 LABEL_SCHEMA = "fullmag.build-control.v1"
 
 
@@ -38,6 +47,36 @@ class BuildControlError(RuntimeError):
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _available_space(space):
+    available = space["available_bytes"]
+    backing = space.get("windows_backing_volume")
+    if backing is not None:
+        available = min(available, backing["available_bytes"])
+    return available
+
+
+def _assert_free_space(space, minimum, detail):
+    if _available_space(space) < minimum:
+        if minimum == MIN_FREE_BUILD_BYTES:
+            label = "32 GiB"
+        else:
+            label = f"{minimum // (1024 ** 2)} MiB"
+        raise BuildControlError(
+            f"Docker build filesystem has less than {label} free; {detail}"
+        )
+
+
+def _exact_local_image_id(reference, expected):
+    observed = docker_capture("image", "inspect", reference, allow_failure=True)
+    if observed.returncode:
+        return False
+    try:
+        documents = json.loads(observed.stdout)
+    except (TypeError, ValueError):
+        return False
+    return (len(documents) == 1 and documents[0].get("Id") == expected)
 
 
 def control_read_script(path, maximum=MAX_DOCUMENT_BYTES):
@@ -235,7 +274,9 @@ class BuildControl:
         # must not invalidate an existing canonical volume.
         return {key: value for key, value in self.labels.items() if key.startswith("com.fullmag.")}
 
-    def prepare(self):
+    def prepare(self, *, minimum_free_bytes=MIN_FREE_BUILD_BYTES):
+        if type(minimum_free_bytes) is not int or minimum_free_bytes < MIN_FREE_CONTROL_BYTES:
+            raise BuildControlError("Invalid build-space admission for control preparation")
         observed = docker_capture("volume", "inspect", self.volume, allow_failure=True)
         if observed.returncode:
             # An absent exact volume is the only creation case. A daemon error
@@ -267,9 +308,34 @@ class BuildControl:
         if result.returncode:
             raise BuildControlError("Control-volume permission initialization failed: " + result.stderr.decode("utf-8", "replace"))
         space = self.space()
-        if min(space["available_bytes"], space.get("windows_backing_volume", {}).get("available_bytes", space["available_bytes"])) < MIN_FREE_BUILD_BYTES:
-            raise BuildControlError("Docker build filesystem has less than 32 GiB free; existing data retained")
+        _assert_free_space(space, minimum_free_bytes, "existing data retained")
         return volume
+
+    @staticmethod
+    def _windows_backing_volume():
+        if os.name != "nt":
+            return None
+        # Docker Desktop exposes its actual data disk here, including an
+        # operator-configured junction; sparse VHDX capacity is not host space.
+        data_disk = (Path(os.environ["LOCALAPPDATA"]) / "Docker/wsl/disk").resolve(strict=True)
+        from windows_folder_host import local_volume
+        native = local_volume(data_disk)
+        usage = shutil.disk_usage(data_disk)
+        return {"data_disk_root": str(data_disk),
+                "capacity_bytes": usage.total, "used_bytes": usage.used,
+                "available_bytes": usage.free, "filesystem": native["host_filesystem"],
+                "volume_serial": native["host_volume_serial"]}
+
+    def assert_windows_pre_pull_space(self):
+        """Guard physical Docker Desktop storage before a cold helper pull.
+
+        Linux/WSL cannot observe the Docker VM filesystem before its first
+        helper image exists; the existing cold pull order is retained there.
+        """
+        backing = self._windows_backing_volume()
+        if backing is not None:
+            _assert_free_space({"available_bytes": backing["available_bytes"]},
+                               MIN_FREE_BUILD_BYTES, "cold helper pull admission refused")
 
     def space(self):
         result = bounded_capture(self.helper_args("df -Pk /control"), data=b"", timeout=60)
@@ -283,17 +349,9 @@ class BuildControl:
                        "available_bytes": int(fields[-3]) * 1024,
                        "minimum_free_bytes": MIN_FREE_BUILD_BYTES,
                        "scope": "Docker VM filesystem; not a per-volume quota or Windows VHDX allocation"}
-        if os.name == "nt":
-            # Docker Desktop exposes its actual data disk here, including an
-            # operator-configured junction. Resolve it before measuring the
-            # backing Windows volume; sparse VHDX capacity is not host space.
-            data_disk = (Path(os.environ["LOCALAPPDATA"]) / "Docker/wsl/disk").resolve(strict=True)
-            from windows_folder_host import local_volume
-            native = local_volume(data_disk)
-            usage = shutil.disk_usage(data_disk)
-            measurement["windows_backing_volume"] = {"data_disk_root": str(data_disk),
-                "capacity_bytes": usage.total, "used_bytes": usage.used, "available_bytes": usage.free,
-                "filesystem": native["host_filesystem"], "volume_serial": native["host_volume_serial"]}
+        backing = self._windows_backing_volume()
+        if backing is not None:
+            measurement["windows_backing_volume"] = backing
         return measurement
 
     def volume_usage(self, name):
@@ -431,10 +489,23 @@ class BuildControl:
                 f"until test -f '{path}/terminal.json'; do sleep 1; done; "
                 "rm /control/active; sync /control")
 
+    def require_build_space(self, *, operation=None):
+        """Take a fresh full-reserve measurement immediately before BuildKit."""
+        space = self.space()
+        if operation is not None:
+            operation["receipt"]["filesystem_before_build"] = space
+        _assert_free_space(space, MIN_FREE_BUILD_BYTES, "admission refused")
+        return space
+
     @contextmanager
-    def operation(self, phase, inputs):
+    def operation(self, phase, inputs, *, minimum_free_bytes=MIN_FREE_BUILD_BYTES):
         if not re.fullmatch(r"[a-z][a-z0-9-]+", phase):
             raise BuildControlError("Invalid build phase")
+        if (type(minimum_free_bytes) is not int
+                or minimum_free_bytes < MIN_FREE_CONTROL_BYTES
+                or (minimum_free_bytes < MIN_FREE_BUILD_BYTES
+                    and phase not in CACHE_ONLY_PHASES)):
+            raise BuildControlError("Invalid build-space admission for operation phase")
         token = uuid.uuid4().hex
         root = f"{phase}/attempts/{token}"
         path = self.path(root)
@@ -443,8 +514,7 @@ class BuildControl:
         # operation. An interrupted host cannot silently free an unknown build.
         script = self.operation_script(phase, token)
         space_before = self.space()
-        if min(space_before["available_bytes"], space_before.get("windows_backing_volume", {}).get("available_bytes", space_before["available_bytes"])) < MIN_FREE_BUILD_BYTES:
-            raise BuildControlError("Docker build filesystem has less than 32 GiB free; admission refused")
+        _assert_free_space(space_before, minimum_free_bytes, "admission refused")
         logger = subprocess.Popen(self.helper_args(script, name=name), stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         receipt = {"schema": "fullmag.docker-build-operation.v1", "phase": phase,
@@ -453,6 +523,7 @@ class BuildControl:
                    "inputs": inputs, "started_at": time.time(),
                    "log_byte_limit": MAX_LOG_BYTES, "attempt_limit": MAX_ATTEMPTS,
                    "build_data_qualification": "NOT VERIFIED",
+                   "minimum_free_bytes": minimum_free_bytes,
                    "filesystem_before": space_before}
         if self.namespace:
             receipt.update(control_namespace=self.namespace,
@@ -545,13 +616,20 @@ def build_volume_toolchain(repo):
     helper = build["args"]["FULLMAG_CUDA_BASE_IMAGE"]
     if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", helper):
         raise BuildControlError("CUDA bootstrap image must be pinned by digest")
-    # Pull only the pinned bootstrap image through this checkout's project.
+    control = BuildControl(identity, helper)
+    # The control helper itself is pulled only when it is absent. Do not call
+    # prepare() first: its --pull never helper cannot run on a cold host.
     probe_spec = {"name": identity["project_name"], "services": {"build-control": {
         "image": helper, "runtime": "runc", "environment": {"NVIDIA_VISIBLE_DEVICES": "void"}}}}
-    if docker_capture("image", "inspect", helper, allow_failure=True).returncode:
+    helper_present = not docker_capture("image", "inspect", helper, allow_failure=True).returncode
+    if not helper_present:
+        if os.name == "nt":
+            control.assert_windows_pre_pull_space()
+        # Linux/WSL has no Docker-VM measurement before this image exists; the
+        # established cold ordering is retained and documented as such.
         compose_capture(probe_spec, "pull", "build-control", timeout=1800)
-    control = BuildControl(identity, helper)
-    control.prepare()
+    control.prepare(minimum_free_bytes=(MIN_FREE_CONTROL_BYTES if helper_present
+                                        else MIN_FREE_BUILD_BYTES))
 
     def inputs():
         return [{"path": p.as_posix(), "sha256": hashlib.sha256(read_input(repo, p)).hexdigest()}
@@ -566,7 +644,8 @@ def build_volume_toolchain(repo):
                        "target": build["target"]}
     digest = hashlib.sha256(canonical(source_identity)).hexdigest()
     service["image"] = "fullmag/fem-gpu-toolchain:inputs-" + digest[:24]
-    with control.operation("toolchain", source_identity) as operation:
+    with control.operation("toolchain", source_identity,
+                           minimum_free_bytes=MIN_FREE_CONTROL_BYTES) as operation:
         operation["receipt"].update(state="building", source_commit=storage.git(repo, "rev-parse", "HEAD"),
                                     source_digest=digest)
         control.write(operation["root"] + "/compose.json", configured)
@@ -575,11 +654,13 @@ def build_volume_toolchain(repo):
         cached = (isinstance(previous, dict) and previous.get("state") == "succeeded"
                   and previous.get("source_digest") == digest
                   and previous.get("compose_project") == identity["project_name"]
+                  and previous.get("control_volume") == control.volume
                   and re.fullmatch(r"sha256:[0-9a-f]{64}", previous.get("image_id", "")))
         if cached:
-            cached = not docker_capture("image", "inspect", previous["image_id"], allow_failure=True).returncode
+            cached = _exact_local_image_id(previous["image_id"], previous["image_id"])
         operation["receipt"]["cache_hit"] = bool(cached)
         if not cached:
+            control.require_build_space(operation=operation)
             control.build(operation, configured, "fem-gpu-toolchain")
         if inputs() != manifest:
             raise BuildControlError("Dependency inputs changed during BuildKit build")
@@ -638,12 +719,14 @@ def build_volume_runtime_images(repo, control, toolchain):
             "dockerfile": "docker/all-in-one/Dockerfile." + kind, "args": arguments,
             "labels": {"org.fullmag.compose.project": control.project,
                        "org.fullmag.build.input-digest": digest}}}}}
-        with control.operation("image-" + kind, identity) as operation:
+        with control.operation("image-" + kind, identity,
+                               minimum_free_bytes=MIN_FREE_CONTROL_BYTES) as operation:
             # FROM accepts a named local reference, not Docker's raw image ID.
             # The group lease protects this content-derived alias; attest it
             # before and after BuildKit rather than trusting a mutable tag.
             docker_capture("image", "tag", parent, parent_ref)
-            if json.loads(docker_capture("image", "inspect", parent_ref).stdout)[0]["Id"] != parent:
+            parent_documents = json.loads(docker_capture("image", "inspect", parent_ref).stdout)
+            if (len(parent_documents) != 1 or parent_documents[0].get("Id") != parent):
                 raise BuildControlError("BuildKit parent alias does not match the pinned image")
             control.write(operation["root"] + "/compose.json", document)
             previous = (control.read("image-" + kind + "/verified.json", optional=True)
@@ -651,14 +734,18 @@ def build_volume_runtime_images(repo, control, toolchain):
             cached = (isinstance(previous, dict) and previous.get("state") == "succeeded"
                       and previous.get("source_digest") == digest
                       and previous.get("compose_project") == control.project
+                      and previous.get("control_volume") == control.volume
                       and re.fullmatch(r"sha256:[0-9a-f]{64}", previous.get("image_id", "")))
             if cached:
-                cached = not docker_capture("image", "inspect", previous["image_id"], allow_failure=True).returncode
+                cached = _exact_local_image_id(previous["image_id"], previous["image_id"])
             operation["receipt"].update(state="building", cache_hit=bool(cached))
             if not cached:
+                control.require_build_space(operation=operation)
                 control.build(operation, document, "image-" + kind)
+            parent_documents = json.loads(docker_capture("image", "inspect", parent_ref).stdout)
             if (inputs() != manifest
-                    or json.loads(docker_capture("image", "inspect", parent_ref).stdout)[0]["Id"] != parent):
+                    or len(parent_documents) != 1
+                    or parent_documents[0].get("Id") != parent):
                 raise BuildControlError("Runtime image inputs changed during BuildKit build")
             image = json.loads(docker_capture("image", "inspect", previous["image_id"] if cached else tag).stdout)
             if len(image) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", image[0].get("Id", "")):

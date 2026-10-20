@@ -68,9 +68,11 @@ kompilacja i API pozostają w stałej usłudze `backend`.
 Para jest jedną jednostką cache, z identycznym kluczem i owner tokenem.
 Klucz zależy od checkoutu, profilu i toolchaina; UUID runu, snapshot edytowanych
 źródeł i sama zmiana wrappera runtime nie tworzą nowego Cargo/CMake cache.
-Etykiety wolumenów, markery i hostowy receipt w kanonicznym storage wiążą
-jednostkę z Docker Engine, grupą oraz tożsamością toolchaina. Host sprawdza
-rzeczywiste wolumeny i mounty; nazwa lub prefix nie stanowią dowodu własności.
+Etykiety wolumenów, markery i receipt w control named volume wiążą jednostkę
+z Docker Engine, grupą oraz tożsamością toolchaina. Host sprawdza rzeczywiste
+wolumeny i mounty; nazwa lub prefix nie stanowią dowodu własności. Historyczny
+hostowy receipt v1 jest tylko baseline'em migracji i nie jest autorytetem dla
+bieżącej ścieżki v2.
 Obcy volume, niezgodna para albo niepotwierdzony konsument blokują użycie.
 Kontener aplikacji nie otrzymuje Docker socketa ani uprawnień do zarządzania
 wolumenami. Ograniczone narzędzie inicjalizacji działa w tej samej grupie.
@@ -94,8 +96,9 @@ zostać wycofany dopiero po osobnej kontroli użycia, referencji i rollbacku.
 
 Kompilację chroni blokada per trwały cache wewnątrz backendu, także bez launchera
 na hoście. Odrębne grupy z własnymi cache mogą budować równolegle; nie współdzielą
-mutowalnych katalogów Cargo/CMake. Hostowy heavy lock obejmuje przygotowanie
-obrazów/toolchaina i hostowych receiptów, a kończy się przed uruchomieniem usług.
+mutowalnych katalogów Cargo/CMake. Hostowy heavy-build lease obejmuje przygotowanie
+obrazu, toolchaina, cache i start receipt w control volume, a kończy się przed
+uruchomieniem usług; nie tworzy hostowego receipt buildu.
 Nie traktujemy Win32 lock i Linux flock na bindzie Windows jako wspólnej blokady.
 Wspólny host ledger nadal chroni przydział fizycznych CPU/GPU podczas symulacji.
 
@@ -130,11 +133,19 @@ pozostaje miejscem sesji, wyników, projektów i ustawień. Źródła są nadal
 readonly bindem wybranego checkoutu. Nie zmieniamy ledgeru runtime ani reguł
 rezerwacji GPU z powodu przeniesienia danych kompilacji.
 
-Powyższy opis hostowego receiptu v2 jest opisem etapu bazowego, nie wyjątkiem
-od nowej granicy. Pełne wdrożenie jest **NOT VERIFIED**: bootstrap/launchery
-nadal zapisują konteksty i receipty na hoście, provenance używa writable bind,
-a frontend ma hostowy ext4 backing i log rozwoju. Te miejsca wymagają migracji
-bez osłabienia locków, hashy, storage gates, recovery i provenance.
+Bieżąca ścieżka source-contract v2 rozdziela techniczne namespace'y: `/build`
+przechowuje cień źródeł i cache kompilatorów, control volume przechowuje
+operacje, manifesty, receipty i provenance, package volume przechowuje
+candidate/current/rollback oraz rotację, a BuildKit przechowuje warstwy obrazów.
+Hostowe `storage` nie jest miejscem tych danych. Mały run root na hoście może
+pozostać operacyjnym handoffem sesji; nie stanowi hostowego build stagingu.
+
+Opis hostowego receipt/context, writable provenance bind oraz frontendowego ext4
+backingu/logu dotyczy historycznego baseline'u v1/legacy, a nie aktywnej trasy
+v2. Te profile zachowują własne recepty i nie mogą być używane jako fallback
+daily DEV. Źródłowe kontrakty v2 i migracja markerów mają częściowy dowód,
+ale pełny Docker runtime — cold build, start, restart, HMR, brak hostowego
+zapisu technicznego i retencja po kolejnych buildach — pozostaje **NOT VERIFIED**.
 
 Named volumes nie nakładają automatycznej quota. Odbiór wymaga pomiarów
 fizycznego dysku hosta, systemu plików VM i danych wolumenów oraz dowodów
@@ -247,6 +258,20 @@ brak trwałego zapisu przed ponowną bramką kontekstu. Pełne sprawdzenie wymag
 CI/backend runtime z rzeczywistą materializacją Gmsh; patch źródłowy nie jest
 dowodem kwalifikacji GPU ani kompletnego startu aplikacji.
 
+### Prywatne operacje backendu DEV
+
+Backend DEV generuje przy każdym starcie API losowy token operatora w swoim
+namespace control volume: `backend/operator-capability/token`. Katalog ma
+uprawnienia `0700`, plik `0600`; producent i czytnik odrzucają dowiązania,
+niezgodnego właściciela i nieprawidłowy format. Token otrzymuje wyłącznie
+środowisko procesu API. Nie trafia do frontendu, hostowego `.env`, argumentów,
+logów ani receiptów. Profile frozen/release zachowują dotychczasowe zachowanie.
+
+To przygotowanie mechanizmu autoryzacji dla zarządzanych operacji lokalnych,
+a nie dowód wdrożenia zmiany aktywnej symulacji. Token nie zastępuje kontroli
+konkretnej grupy, runu, receiptów i zakończenia pracy; nie izoluje też procesów
+uruchomionych z tym samym UID wewnątrz zaufanego backendu.
+
 ## Wdrożenie i weryfikacja
 
 1. Dodać typowane `build-then-serve` w `backend_dev.py`: istniejący lock, Make,
@@ -298,6 +323,23 @@ rekordy z niezmiennymi kopiami ich surowych bajtów w katalogu dowodu.
 Późniejsza legalna rotacja plików ownera i procesu nie unieważnia tych kopii;
 Rust niezależnie sprawdza ich hashe oraz zgodność z journalem zatrzymania.
 
+Każde udane odtworzenie publikuje prywatne, niezmienne potwierdzenie natywnego
+API (`restore-ack-<api_instance_id>.json`). Potwierdzenie wiąże pierwotne
+żądanie, dowód, run, projekt, konfigurację, logiczną sesję i nową instancję API.
+PID 1 zapisuje ten sam identyfikator i hash w receipcie procesu. Dopiero po
+uwierzytelnionym zamknięciu natywnego ownera archiwizuje surowe rekordy ready
+ownera, terminalnego ownera i procesu, a następnie publikuje przypięty do nich
+rekord `successor-drain-<api_instance_id>.json`.
+
+Kolejny restart sprawdza te bajty i łańcuch potwierdzeń zamiast ponownie
+porównywać nowego ownera z historycznym ownerem pierwszej awarii. Wejście
+`successor_auto` nie wybiera wyniku: kod natywny odczytuje aktualny katalog
+runu, zgodę startu i lease. Odtwarza nadal zablokowany model albo terminalny
+model bez ponownego Solve. Kolejne restarty nadal oczekującego modelu są
+legalne. Brak potwierdzonego drain lub niezgodny rekord zatrzymuje odzyskanie.
+Te prywatne potwierdzenia nie zwalniają rezerwacji hosta i nie zastępują
+kanonicznych dowodów ledgera ani rozstrzygnięcia nieznanej aktywacji.
+
 PID 1 odczytuje ograniczone, przypięte wejście z wolumenu runtime-control.
 Tożsamość docelowego buildu pochodzi z opublikowanego w kontenerze provenance:
 pełnego commita i hasha snapshotu źródeł. Rust porównuje je z tożsamością
@@ -310,3 +352,35 @@ Status: kontrakt wdrażany. Testy transportu i kontrolera są dowodami odrębnyc
 warstw. Pełny producent i walidacja dowodów, restart, odtworzony model w UI
 oraz wykonanie tego samego runu wymagają osobnej kwalifikacji runtime;
 pozostają **NOT VERIFIED** do jej rzeczywistego zakończenia.
+
+## Decyzja uzupełniająca 20.10.2026 — owner frontendu per incarnacja kontenera
+
+Receipty właściciela procesu Next.js nie są autorytetem przechowywanym w
+named volume. `frontend` otrzymuje prywatny tmpfs
+`/run/fullmag/frontend-owner` o pojemności 1 MiB, z `uid=65532`, `gid=65532`,
+`mode=0700`, `noexec`, `nosuid` i `nodev`. Bieżący owner receipt jest zapisywany
+w tym katalogu, a healthcheck czyta wyłącznie tę ścieżkę. Po utworzeniu nowej
+incarnacji kontenera tmpfs jest pusty, więc stary `unknown` z cache nie może
+zablokować prawidłowego startu ani udawać żywego ownera.
+
+`/state/development/frontend-dev-receipt.json` pozostaje trwałą kopią
+diagnostyczną. Zachowuje ostatni stan, błąd, metadane wygenerowanych plików i
+bramę zamrożonych zależności. Kod używa tej kopii wyłącznie jako historii przy
+wyliczaniu `generated_files_gate`, `previous_failure_evidence` i potrzeby
+instalacji cache; nie wywołuje na jej podstawie przejęcia procesu. W tej samej
+incarnacji obecny owner receipt nadal wymaga pełnej walidacji PID, namespace,
+grupy procesu i flocka. Flock pozostaje w named volume i chroni równoległe
+frontendy przez cały cykl instalacji oraz Next.js.
+
+Walidacja nowo renderowanego Compose przypina tmpfs ownera wraz z obrazem,
+źródłem, labelami i mountami usługi. Opcje są normalizowane i porównywane
+dokładnie; duplikaty oraz konflikty (`rw,ro`, `exec,noexec`, zmieniony `mode`,
+`uid`, `gid` lub `size`) kończą się odmową. Stary zapis Compose bez tego tmpfs
+może zostać odczytany wyłącznie jako wejście kontrolowanej recreacji; zwykły
+resume takiej konfiguracji jest odrzucany, a nowa deklaracja zawsze zawiera
+wymagany tmpfs. Zmiana dotyczy wyłącznie granicy owner frontendu; backendowy
+owner, native drain, ledger i recovery pozostają bez zmian.
+
+Implementację źródłową i testy kontraktowe przygotowano w tym fragmencie.
+Budowa obrazu, start/restart usługi, Docker inspect oraz browser/runtime proof
+pozostają **NOT VERIFIED**.

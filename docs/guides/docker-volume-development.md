@@ -139,7 +139,9 @@ restartu są oddzielone od autoryzacji recovery. Nie powstaje nowy request recov
 nie zmienia się historia i nie jest ponawiane Solve. Zachowywany jest oryginalny
 storage sesji; `fresh_state=true` pozostaje odrzucane.
 Nadzór startu odczytuje receipt PID 1 przez kanoniczne `runtime_service.process_receipt_path(canonical_paths())`, z technicznego wolumenu runtime-control. Potwierdzony `failed_outcome_retained` przerywa oczekiwanie na gotowość; nie czeka na pełny timeout i nie ponawia Solve.
-`just docker-dev-stop-failed <source> <container-id> <image-id> <process-receipt-sha256>` może zatrzymać również nadzorcę po nieudanym starcie native runtime. Obsługuje dwa jawne dowody: pierwotny błąd startu, gdzie oba schedulery muszą zakończyć się poprawnie, oraz błąd po wcześniejszym `READY`, gdzie retained `service_owner` pozostaje wyłącznie pinem tożsamości, a dziecko zakończone błędem jest dopuszczalne po potwierdzeniu jego braku. W obu wariantach wymagane są zakończone API, brak żywych procesów i aktywnych lease’ów oraz zwolnione rezerwacje hosta. Zapisuje dowód przed zatrzymaniem i weryfikuje niezmienionego ownera po nim. Nie odzyskuje GPU, nie zmienia ownera i nie powtarza skryptu. Obserwacja nieznana lub aktywne zasoby blokują tę komendę.
+`just docker-dev-stop-failed <source> <container-id> <image-id> <process-receipt-sha256>` może zatrzymać nadzorcę po potwierdzonej awarii. Pierwotny błąd startu native wymaga poprawnego zakończenia obu schedulerów. Błąd po wcześniejszym `READY` przypina zachowany `service_owner` wyłącznie jako tożsamość. Osobny wariant `api-start-failure` rozpoznaje dokładny prefiks `API binding did not become ready:` w trwałym receipcie procesu, a nie tekst prywatnego stderr; może zachować historycznego ownera `Failed` z terminalnym błędem dziecka. Nie dowodzi, że native runtime nigdy wcześniej nie działał.
+
+Każdy wariant wymaga zakończonego API, braku żywych procesów i aktywnych lease’ów oraz zwolnionych rezerwacji hosta. Bezpośrednio przed zapisem journalu komenda ponownie pobiera dowody i porównuje receipt oraz surowe piny `OWNER`; drift przerywa operację. Po zatrzymaniu weryfikuje niezmienionego ownera. Sam stop nie odzyskuje GPU, nie zmienia ownera i nie powtarza skryptu; dalszy start nadal podlega natywnym bramkom recovery. Obserwacja nieznana lub aktywne zasoby blokują komendę.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
 
 ### Aktywacja skryptu w już działającym Workspace
@@ -235,6 +237,25 @@ storage Windows. Log w wolumenie kontrolnym i trwałe receipty pozostają wymaga
 błąd ich zapisu nadal przerywa operację. Zakończenie samego procesu kontrolera
 pozostaje odrębną utratą obserwacji i wymaga rozstrzygnięcia stanu.
 
+### Browser QA istniejącej grupy
+
+Po uruchomieniu zdrowej grupy można wykonać kontrolę Home, sesji i WebGL przez
+obraz Playwright przypięty do digestu:
+
+```powershell
+just docker-dev-browser-qa "$source" 3197
+```
+
+Kontrola wymaga istniejącego control volume, dokładnie jednej zdrowej pary
+`backend`/`frontend`, zgodnych receiptów źródła i portu oraz przypiętego
+frontend state volume. Nie tworzy brakującego control volume, nie naprawia
+named volume i nie restartuje usług. Domyślny limit pracy przeglądarki wynosi
+180 sekund, a osobny limit pobrania brakującego obrazu wynosi 1800 sekund;
+parametry `timeout` i `pull_timeout` są ostatnimi argumentami pozycyjnymi
+recepty, po `browser_image`. Nieudane lub
+niejednoznaczne kontrole kończą się zachowaniem zasobów i wymagają ręcznego
+przeglądu receiptu operacji.
+
 ## Granica zapisu i retencja
 
 | Dane | Miejsce |
@@ -256,10 +277,24 @@ katalogi metadanych, bez rekurencyjnej zmiany właścicieli. Kanoniczny helper
 bootstrap otrzymuje `DAC_OVERRIDE` tylko dla operacji na tym samym wolumenie,
 aby zachować odczyt i atomowy zapis rekordów należących do UID backendu.
 
-Przed operacją launcher mierzy wolne miejsce w VM oraz na fizycznym wolumenie
-Windows pod rozwiązanym katalogiem danych Docker Desktop. Obecny próg odmowy
-wynosi 32 GiB; jest rezerwą operacyjną, nie quota ani gwarancją rozmiaru zimnego
-buildu. Pakietowy preflight dodatkowo szacuje miejsce na kandydata i rollback.
+Launcher mierzy wolne miejsce w VM oraz na fizycznym wolumenie Windows pod
+rozwiązanym katalogiem danych Docker Desktop. Rzeczywisty BuildKit build
+oraz operacja budowania i startu aplikacji wymagają 32 GiB wolnego miejsca.
+Pakietowy preflight dodatkowo szacuje miejsce na kandydata i rollback.
+To rezerwa operacyjna, nie quota ani gwarancja rozmiaru zimnego buildu.
+
+Sprawdzenie i ponowne użycie istniejących obrazów toolchaina oraz wrapperów
+może użyć niższego budżetu kontrolnego: 1280 MiB, wyprowadzonego z limitów
+logów i dokumentów. Wymaga zgodnego digestu wejść, grupy, control volume oraz
+lokalnego immutable image ID; wrapper sprawdza także przypiętego rodzica
+oraz etykiety obrazu. Brak zgodnego cache powoduje świeży pomiar i wymaga
+pełnych 32 GiB przed BuildKit. Niższy budżet nie dotyczy operacji development.
+
+Na zimnym hoście brakujący obraz helpera jest pobierany przed uruchomieniem
+helpera control volume. Windows sprawdza przed pobraniem fizyczny backing
+volume; Linux/WSL nie ma jeszcze w tym momencie obrazu pozwalającego zmierzyć
+system plików Docker VM. Po pobraniu pełny pomiar poprzedza budowę. Ta granica
+pre-pull pozostaje jawna; nie jest dowodem miejsca w VM przed pierwszym pull.
 
 Log Make i next.log mają limit 64 MiB; nadmiar trafia do ograniczonego drivera
 Docker `local` (3 pliki po 10 MB na usługę). Pełny next.log wymaga jawnego
