@@ -87,6 +87,15 @@ Dokładna granica codziennej trasy:
   frontend `/state/development` i techniczne receipts/logi są w nazwanych
   wolumenach grupy; warstwy obrazu i cache BuildKit należą do Docker Engine.
 
+Bieżący owner Next.js ma osobny ulotny zapis:
+`/run/fullmag/frontend-owner/receipt.json` w prywatnym tmpfs 1 MiB z UID/GID
+65532 i trybem 0700. `frontend_dev.py` publikuje tam autorytet procesu,
+a `healthcheck.py` czyta tę samą ścieżkę. Trwała kopia
+`/state/development/frontend-dev-receipt.json` służy wyłącznie historii,
+diagnostyce i bramce cache; nie upoważnia do uznania starego procesu za żywy.
+Legacy manifest bez tmpfs jest wejściem kontrolowanej recreacji, nie zwykłego
+resume. Implementacja źródłowa nie zastępuje dowodu rzeczywistego restartu.
+
 Weryfikuj rzeczywiste nazwy i mounty przy zmianie launchera. Systemowy temp
 jest wyjątkiem dla krótkich metadanych Compose, nie miejscem na źródła, cache,
 pakiety, logi buildu ani trwałe receipty.
