@@ -813,6 +813,8 @@ jobs:
           python -B scripts/test_docker_volume_pre_admission_integration.py -v
           python -B scripts/test_docker_volume_post_build_generation.py -v
           python -B scripts/test_docker_volume_post_build_integration.py -v
+          python -B scripts/test_docker_volume_pending_continuation.py -v
+          python -B scripts/test_docker_volume_pending_resume.py -v
           python -B scripts/test_docker_prestart_resume.py -v
           python -B scripts/test_docker_dev_browser_qa.py -v
           python -B scripts/test_docker_volume_receipts.py -v

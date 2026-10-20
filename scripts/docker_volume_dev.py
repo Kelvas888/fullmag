@@ -3884,10 +3884,29 @@ def _resume_recreated_operation(args, control, selected, layout, identity):
     )
     certificate_path = _certificate_path(state)
     certificate = _retained_certificate(state, document)
-    if certificate.get("image_id") != image or not certificate.get("restart_verified"):
-        raise BuildControlError("Retained storage certificate does not authorize recreation resume")
+    carry_resume_metadata = operation_terminal.get("post_build_generation")
+    carry_resume_proof = operation_terminal.get("pre_admission_recreate")
+    if certificate.get("image_id") != image:
+        raise BuildControlError("Retained storage certificate image differs from recreation resume")
+    from docker_volume_pending_continuation import _classify_recreate_resume
+    carry_resume = (
+        _classify_recreate_resume(
+            operation_terminal,
+            certificate,
+            records["native_recovery_context"],
+        )
+        == "carry"
+    )
+    if certificate.get("restart_verified") is not True:
+        if not carry_resume or certificate.get("restart_verified") is not False:
+            raise BuildControlError("Retained storage certificate does not authorize recreation resume")
     owner_path = state / _session_host().OWNER_NAME
     recovery_context = dict(records["native_recovery_context"])
+    if carry_resume:
+        if recovery_context != {}:
+            raise BuildControlError(
+                "Capture-only recreation resume has unexpected native recovery authority"
+            )
 
     from docker_volume_activation_reconcile import reconcile_unknown_activation
     unresolved = control.read("activation/unresolved.json", optional=True)
@@ -3943,40 +3962,75 @@ def _resume_recreated_operation(args, control, selected, layout, identity):
     elif accepted_record is not None:
         raise BuildControlError("Completed recreation records an unexpected accepted-run reattach")
 
-    post_build_generation = operation_terminal.get("post_build_generation")
+    post_build_generation = carry_resume_metadata
     if post_build_generation is not None:
-        from docker_volume_post_build_generation import (
-            bind_recreate_operation,
-            validate_resume_continuation,
-        )
-        try:
-            # The recreate receipt was written before its lease closed, so its
-            # nested start proof may still be unbound.  Bind it to the exact
-            # completed terminal/snapshot/absence evidence before entering the
-            # new development start lease.  The historical development
-            # operation_id remains the old attempt identity.
-            post_build_generation = bind_recreate_operation(
-                post_build_generation, proof
+        if carry_resume:
+            from docker_volume_pending_continuation import (
+                validate_carry_recreate_receipt,
+                validate_pending_capture_continuation,
             )
-            validated_post_build_generation = validate_resume_continuation(
-                control,
-                post_build_generation,
-                operation_id=previous.get("attempt"),
-                expected_project=control.project,
-                expected_source_root=str(selected),
-                previous=previous,
-                document=document,
-                accepted_context=accepted_reattach_context,
+            _assert_post_build_removed_namespace_absent(post_build_generation)
+            try:
+                carried = validate_pending_capture_continuation(
+                    control,
+                    previous=previous,
+                    document=document,
+                    expected_attempt=previous["attempt"],
+                    expected_project=control.project,
+                    expected_source_root=previous["inputs"]["source_root"],
+                    expected_config_sha256=carry_resume_proof.get("config_sha256"),
+                    certificate_evidence=_post_build_certificate_evidence(state, certificate),
+                    accepted_context=accepted_reattach_context,
+                    runtime_config_sha256=_read_runtime_config_digest(control),
+                    pre_admission_recreate_proof=carry_resume_proof,
+                )
+                validate_carry_recreate_receipt(
+                    operation_terminal,
+                    metadata=carried["metadata"],
+                    pre_admission_proof=carry_resume_proof,
+                    recreation_attempt=operation_terminal["attempt"],
+                    accepted_producer=operation_terminal.get("accepted_reattach"),
+                )
+            except BuildControlError as error:
+                raise BuildControlError(
+                    "Completed capture-only continuation changed: " + str(error)
+                ) from error
+            post_build_generation = carried["metadata"]
+            recovery_context["previous_config_sha256"] = carried[
+                "previous_config_sha256"
+            ]
+            recovery_context["post_build_generation"] = post_build_generation
+        else:
+            from docker_volume_post_build_generation import (
+                bind_recreate_operation,
+                validate_resume_continuation,
             )
-        except BuildControlError as error:
-            raise BuildControlError("Completed post-build continuation changed: " + str(error)) from error
-        accepted_record = validated_post_build_generation.get("accepted_run")
-        if accepted_record and not accepted_reattach_context:
-            raise BuildControlError("Completed post-build continuation lost its accepted-run proof")
-        recovery_context["previous_config_sha256"] = validated_post_build_generation[
-            "runtime_config"
-        ]["sha256"]
-        recovery_context["post_build_generation"] = validated_post_build_generation
+            try:
+                # Native continuation is bound to the exact completed
+                # terminal/snapshot/absence evidence.  This branch is not
+                # used for a capture-only receipt.
+                post_build_generation = bind_recreate_operation(
+                    post_build_generation, proof
+                )
+                validated_post_build_generation = validate_resume_continuation(
+                    control,
+                    post_build_generation,
+                    operation_id=previous.get("attempt"),
+                    expected_project=control.project,
+                    expected_source_root=str(selected),
+                    previous=previous,
+                    document=document,
+                    accepted_context=accepted_reattach_context,
+                )
+            except BuildControlError as error:
+                raise BuildControlError("Completed post-build continuation changed: " + str(error)) from error
+            accepted_record = validated_post_build_generation.get("accepted_run")
+            if accepted_record and not accepted_reattach_context:
+                raise BuildControlError("Completed post-build continuation lost its accepted-run proof")
+            recovery_context["previous_config_sha256"] = validated_post_build_generation[
+                "runtime_config"
+            ]["sha256"]
+            recovery_context["post_build_generation"] = validated_post_build_generation
 
     reuse = {
         "state": state,
@@ -4347,6 +4401,52 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     "Unadmitted storage cannot rotate as an admitted runtime; "
                     "use explicit --fresh-state to preserve the old root"
                 )
+        carry_existing = None
+        pending_metadata = previous.get("post_build_generation")
+        pending_inputs = previous.get("inputs")
+        if not isinstance(pending_inputs, Mapping):
+            pending_inputs = {}
+        has_pending_metadata = (
+            pending_metadata is not None
+            or "post_build_generation" in pending_inputs
+        )
+        has_pending_binding = "post_build_start" in previous
+        if (not fresh_state and certificate.get("restart_verified") is False
+                and (has_pending_metadata or has_pending_binding)):
+            if not (has_pending_metadata and has_pending_binding):
+                raise BuildControlError(
+                    "Capture-only continuation has a partial pending post-build record"
+                )
+            if pre_activation_stop is not None:
+                raise BuildControlError(
+                    "Capture-only continuation cannot combine startup activation recovery"
+                )
+            if certificate.get("restart_verified") is not False:
+                raise BuildControlError(
+                    "Pending capture continuation requires the provisional certificate"
+                )
+            if pre_admission_recreate_proof is None:
+                raise BuildControlError(
+                    "Pending capture continuation requires an exact pre-admission proof"
+                )
+            from docker_volume_pending_continuation import (
+                validate_pending_capture_continuation,
+            )
+            _assert_post_build_removed_namespace_absent(pending_metadata)
+            carry_existing = validate_pending_capture_continuation(
+                control,
+                previous=previous,
+                document=document,
+                expected_attempt=previous["attempt"],
+                expected_project=control.project,
+                expected_source_root=str(selected),
+                expected_config_sha256=args.config_sha256,
+                certificate_evidence=_post_build_certificate_evidence(state, certificate),
+                accepted_context=accepted_reattach_context,
+                runtime_config_sha256=_read_runtime_config_digest(control),
+                pre_admission_recreate_proof=pre_admission_recreate_proof,
+            )
+            post_build_generation = carry_existing["metadata"]
         # Exact recorded helper only; unknown group resources are never deleted.
         helper_ids = []
         for helper_name in ("fullmag-ledger-" + previous["attempt"], "fullmag-ledger-verify-" + previous["attempt"]):
@@ -4471,6 +4571,29 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     )
                 actual = leased_actual
                 operation["receipt"]["pre_admission_recreate"] = pre_admission_recreate_proof
+                if carry_existing is not None:
+                    _assert_post_build_removed_namespace_absent(
+                        carry_existing["metadata"]
+                    )
+                    leased_carry = validate_pending_capture_continuation(
+                        control,
+                        previous=previous,
+                        document=document,
+                        expected_attempt=previous["attempt"],
+                        expected_project=control.project,
+                        expected_source_root=str(selected),
+                        expected_config_sha256=args.config_sha256,
+                        certificate_evidence=_post_build_certificate_evidence(
+                            state, leased_certificate
+                        ),
+                        accepted_context=accepted_reattach_context,
+                        runtime_config_sha256=_read_runtime_config_digest(control),
+                        pre_admission_recreate_proof=leased_proof,
+                    )
+                    if leased_carry != carry_existing:
+                        raise BuildControlError(
+                            "Capture-only continuation changed under recreate-services lease"
+                        )
             if accepted_reattach_context:
                 # The publishing producer cannot run while /control/active is
                 # held.  Its read-only bundle path performs the same archive,
@@ -4497,7 +4620,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     raise BuildControlError(
                         "Accepted-run reattach changed before recreation"
                     )
-            if post_build_generation is not None:
+            if post_build_generation is not None and carry_existing is None:
                 from docker_volume_post_build_generation import validate_failed_owner_continuation
                 leased_backend = json.loads(docker_text("inspect", ids["backend"]))
                 if len(leased_backend) != 1:
@@ -4568,20 +4691,42 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             # recreation resume, rather than inspecting either removed ID or
             # pretending that the old development attempt is this operation.
             from copy import copy
-            from docker_volume_post_build_generation import bind_recreate_operation
             proof_args = copy(args)
             proof_args.resume_recreation = operation["receipt"]["attempt"]
             try:
                 completed_recreation = _validate_recreation_resume_records(
                     proof_args, control, selected, identity
                 )
-                post_build_generation = bind_recreate_operation(
-                    post_build_generation, completed_recreation["proof"]
-                )
+                if carry_existing is None:
+                    from docker_volume_post_build_generation import bind_recreate_operation
+                    post_build_generation = bind_recreate_operation(
+                        post_build_generation, completed_recreation["proof"]
+                    )
+                else:
+                    from docker_volume_pending_continuation import (
+                        validate_carry_recreate_receipt,
+                    )
+                    if completed_recreation["native_recovery_context"] != native_recovery_context:
+                        raise BuildControlError(
+                            "Capture-only recreation acquired unexpected native recovery authority"
+                        )
+                    _assert_post_build_removed_namespace_absent(post_build_generation)
+                    validate_carry_recreate_receipt(
+                        completed_recreation["operation_terminal"],
+                        metadata=post_build_generation,
+                        pre_admission_proof=pre_admission_recreate_proof,
+                        recreation_attempt=completed_recreation["operation_terminal"]["attempt"],
+                        accepted_producer=completed_recreation["operation_terminal"].get(
+                            "accepted_reattach"
+                        ),
+                    )
             except BuildControlError as error:
                 raise BuildControlError(
-                    "Post-build continuation could not bind the completed recreation: " + str(error)
+                    "Post-build continuation could not validate the completed recreation: " + str(error)
                 ) from error
+            recovery_context["previous_config_sha256"] = post_build_generation[
+                "runtime_config"
+            ]["sha256"]
             recovery_context["post_build_generation"] = post_build_generation
         reuse = None if fresh_state else {"state": state, "host_certificate": certificate_path,
             "owner_marker": owner_path, "receipt": {"image_id": image},

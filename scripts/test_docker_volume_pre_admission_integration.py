@@ -470,10 +470,25 @@ class RetainedPreAdmissionIntegrationTests(unittest.TestCase):
                 self.assertNotIn("rm", harness.events)
                 self.assertEqual(helper.calls["count"], 0)
 
+    def test_admitted_recreate_does_not_reuse_historical_pending_metadata(self) -> None:
+        harness = _Harness()
+        self.addCleanup(harness.close)
+        harness.certificate["restart_verified"] = True
+        harness.previous["post_build_generation"] = {"historical": "consumed"}
+        harness.previous["post_build_start"] = {"state": "pending"}
+        helper = _helper_module(harness, reject=True)
+        result, started = self._run(harness, helper=helper)
+        self.assertEqual(result, {"started": True})
+        self.assertEqual(helper.calls["count"], 0)
+        self.assertNotIn("post_build_generation", started.call_args.kwargs)
+        self.assertIsNotNone(started.call_args.kwargs["reuse_state"])
+
     def test_fresh_state_remains_explicit_and_does_not_use_the_exception(self) -> None:
         harness = _Harness()
         self.addCleanup(harness.close)
         harness.args.fresh_state = True
+        harness.previous["post_build_generation"] = {"historical": "retained"}
+        harness.previous["post_build_start"] = {"state": "pending"}
         helper = _helper_module(harness, reject=True)
         _result, started = self._run(harness, helper=helper)
         self.assertEqual(helper.calls["count"], 0)
