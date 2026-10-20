@@ -48,6 +48,17 @@ def audit(document, expected_project):
     definitions = document.get("volumes") or {}
     if not isinstance(definitions, dict):
         raise ValueError("Compose volume definitions must be an object")
+    output_alias_valid = False
+    backend = services.get("backend", {})
+    if isinstance(backend, dict) and backend.get("x-fullmag-script-output"):
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
+        from docker_script_output_mounts import validate, OUTPUT_ROOT
+        try:
+            validate(document)
+            output_alias_valid = True
+        except (ValueError, RuntimeError, KeyError, TypeError) as error:
+            problems.append("backend: invalid script output mapping: " + str(error))
     sources = []
     for role, paths in BUILD_PATHS.items():
         service = services.get(role)
@@ -98,7 +109,7 @@ def audit(document, expected_project):
                 elif definition.get("driver_opts") or definition.get("driver", "local") != "local":
                     problems.append(f"{role}: volume may map external storage via driver/options: {item['source']}")
             if item.get("type") == "bind" and item.get("read_only") is not True:
-                if target not in RUNTIME_BINDS[role]:
+                if target not in RUNTIME_BINDS[role] and not (role == "backend" and target == "/opt/fullmag/script-output" and output_alias_valid):
                     problems.append(f"{role}: writable host bind at {target}")
             if any(covers(path, target) for path in paths):
                 live_name = target.removeprefix("/state/development/workspace/apps/control-room/")

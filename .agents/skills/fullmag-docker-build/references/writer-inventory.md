@@ -6,6 +6,25 @@ sprawdzono natywnym Git dla Windows; WSL Git nie interpretuje jego Windowsowego
 wskaźnika `.git`. Numery linii odnoszą się do tego odczytu. To mapa do ponownej
 weryfikacji przy zmianie kodu, nie dowód uruchomienia wszystkich tras.
 
+## Doprecyzowanie 20.10.2026 — idempotentny start i jawne wyniki skryptu
+
+Task `docker-dev-up-20261020` dodaje orkiestrator `docker_dev_up.ensure_up`.
+Nowy start deleguje do `docker_volume_dev.start`; istniejąca grupa przechodzi
+walidację zapisanych pinów, potem reuse, resume, idle restart lub kontrolowane
+odtworzenie. Historia i nieznane operacje pozostają bramką recovery.
+Techniczne manifesty, logi, receipty i cache nadal należą do wolumenów grupy.
+
+`FULLMAG_SCRIPT_OUTPUT_DIRECTORY` jest jawnym grantem zapisu user-results
+w pojedynczym podkatalogu wybranego checkoutu. Canonical source mount zostaje
+readonly; backend dostaje odrębny, wąski alias tego podkatalogu. Cały checkout,
+traversal i dowiązania są odrzucane. Frontend nie otrzymuje aliasu. Nie jest
+to lokalizacja buildu. Audyt mountów dopuszcza alias dopiero po sprawdzeniu
+zgodności descriptor/source/env. Przenośne autorstwo zachowuje requested policy;
+resolved alias trafia wyłącznie do runtime metadata.
+
+Interpretowane regresje i probe filesystemu potwierdzają wyłącznie swoje
+zakresy. Full build, API, Save i solver runtime wymagają osobnych dowodów.
+
 ## Aktywna trasa po integracji PR #198
 
 `docker_dev.py up` wywołuje `docker_volume_dev.start`. Toolchain, obrazy helperów,

@@ -4,8 +4,9 @@
 mod antenna_import;
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::fs::{self, OpenOptions};
+use std::io::{Cursor, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -408,15 +409,562 @@ pub(crate) struct SessionExportRequest {
     /// Optional UI workspace snapshot provided by frontend.
     #[serde(default)]
     pub ui_state: Option<serde_json::Value>,
+    /// Explicit `.fms` output path.  It is used only when `save_to_source` is
+    /// true and must resolve inside the configured output mapping.
+    #[serde(default)]
+    pub target_path: Option<String>,
+    /// Persist the archive beside the admitted source script instead of only
+    /// returning its base64 representation.  Omitted requests preserve the
+    /// historical export/download behavior.
+    #[serde(default)]
+    pub save_to_source: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct SessionExportResponse {
     pub session_id: String,
     pub profile: SaveProfile,
-    /// Base64-encoded `.fms` file content.
+    /// Base64-encoded `.fms` file content for browser exports.  This remains
+    /// a required compatibility field and is empty when `saved_path` is
+    /// present; source-save consumers should use the persisted path instead.
     pub fms_base64: String,
     pub size_bytes: usize,
+    /// Path written when `save_to_source` was enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
+    /// File name written when `save_to_source` was enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+const SESSION_OUTPUT_ROOT_ENV: &str = "FULLMAG_SCRIPT_OUTPUT_ROOT";
+const SESSION_OUTPUT_SOURCE_DIR_ENV: &str = "FULLMAG_SCRIPT_OUTPUT_SOURCE_DIR";
+const DEFAULT_CONTAINER_SOURCE_ROOT: &str = "/opt/fullmag/source";
+const MAX_SESSION_OUTPUT_COLLISION_ATTEMPTS: usize = 10_000;
+
+/// Resolve the host-backed output mapping for a source script.  Docker may
+/// expose only a deliberately selected source subtree as a writable alias;
+/// the source checkout itself remains read-only.  With no mapping configured
+/// (the native desktop case), an explicit absolute target is allowed and the
+/// default is beside the admitted script.
+fn resolve_session_output_target(
+    script_path: &Path,
+    requested_target: Option<&str>,
+) -> Result<PathBuf, ApiError> {
+    let output_root = std::env::var_os(SESSION_OUTPUT_ROOT_ENV).map(PathBuf::from);
+    let source_root = output_root.as_ref().map(|_| {
+        std::env::var_os(SESSION_OUTPUT_SOURCE_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTAINER_SOURCE_ROOT))
+    });
+
+    resolve_session_output_target_for_mapping(
+        script_path,
+        requested_target,
+        output_root
+            .as_deref()
+            .zip(source_root.as_deref()),
+    )
+}
+
+fn resolve_session_output_target_for_mapping(
+    script_path: &Path,
+    requested_target: Option<&str>,
+    output_mapping: Option<(&Path, &Path)>,
+) -> Result<PathBuf, ApiError> {
+    let target = if let Some((output_root, source_root)) = output_mapping {
+        require_absolute_path(output_root, SESSION_OUTPUT_ROOT_ENV)?;
+        require_absolute_path(source_root, SESSION_OUTPUT_SOURCE_DIR_ENV)?;
+        let output_root = canonical_directory(output_root, SESSION_OUTPUT_ROOT_ENV)?;
+        let source_root = canonical_directory(source_root, SESSION_OUTPUT_SOURCE_DIR_ENV)?;
+        let script = canonical_regular_file(script_path, "session script")?;
+        let relative = script.strip_prefix(&source_root).map_err(|_| {
+            ApiError::bad_request(format!(
+                "session script `{}` is outside configured source output mapping `{}`",
+                script.display(),
+                source_root.display()
+            ))
+        })?;
+        let default_target = output_root
+            .join(relative.parent().unwrap_or_else(|| Path::new("")))
+            .join(default_session_filename(&script)?);
+        let target = requested_target
+            .map(PathBuf::from)
+            .unwrap_or(default_target);
+        validate_target_within_root(&target, &output_root, SESSION_OUTPUT_ROOT_ENV)?;
+        target
+    } else {
+        let target = requested_target
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                script_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(
+                        script_path
+                            .file_stem()
+                            .map(|stem| format!("{}.fms", stem.to_string_lossy()))
+                            .unwrap_or_else(|| "session.fms".into()),
+                    )
+            });
+        require_absolute_path(&target, "session target path")?;
+        validate_path_components(&target, "session target path")?;
+        target
+    };
+
+    require_fms_extension(&target)?;
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| ApiError::bad_request("session target path has no parent directory"))?;
+    canonical_directory(parent, "session target parent")?;
+    validate_path_components(&target, "session target path")?;
+    Ok(target)
+}
+
+fn validate_session_output_request(
+    requested_target: Option<&str>,
+    save_to_source: bool,
+) -> Result<(), ApiError> {
+    if requested_target.is_some() && !save_to_source {
+        return Err(ApiError::bad_request(
+            "target_path requires save_to_source=true",
+        ));
+    }
+    Ok(())
+}
+
+fn default_session_filename(script_path: &Path) -> Result<String, ApiError> {
+    let stem = script_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("session script has no usable file stem"))?;
+    Ok(format!("{stem}.fms"))
+}
+
+fn session_export_base64(fms_bytes: &[u8], saved_path: Option<&str>) -> String {
+    if saved_path.is_some() {
+        String::new()
+    } else {
+        base64_encode(fms_bytes)
+    }
+}
+
+fn require_absolute_path(path: &Path, label: &str) -> Result<(), ApiError> {
+    if !path.is_absolute() {
+        return Err(ApiError::bad_request(format!(
+            "{label} must be absolute"
+        )));
+    }
+    Ok(())
+}
+
+fn require_fms_extension(path: &Path) -> Result<(), ApiError> {
+    let valid = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("fms"));
+    if !valid {
+        return Err(ApiError::bad_request(format!(
+            "session target must use the .fms extension: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, ApiError> {
+    validate_path_components(path, label)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        ApiError::bad_request(format!("{label} is not available: {error}"))
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "{label} must be a directory: {}",
+            path.display()
+        )));
+    }
+    fs::canonicalize(path)
+        .map_err(|error| ApiError::bad_request(format!("cannot canonicalize {label}: {error}")))
+}
+
+fn canonical_regular_file(path: &Path, label: &str) -> Result<PathBuf, ApiError> {
+    require_absolute_path(path, label)?;
+    validate_path_components(path, label)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| ApiError::bad_request(format!("{label} is not available: {error}")))?;
+    if !metadata.file_type().is_file() {
+        return Err(ApiError::bad_request(format!(
+            "{label} must be a regular file: {}",
+            path.display()
+        )));
+    }
+    fs::canonicalize(path)
+        .map_err(|error| ApiError::bad_request(format!("cannot canonicalize {label}: {error}")))
+}
+
+fn validate_target_within_root(
+    target: &Path,
+    root: &Path,
+    root_label: &str,
+) -> Result<(), ApiError> {
+    require_absolute_path(target, "session target path")?;
+    validate_path_components(target, "session target path")?;
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| ApiError::bad_request("session target path has no parent directory"))?;
+    let canonical_parent = canonical_directory(parent, "session target parent")?;
+    if !canonical_parent.starts_with(root) {
+        return Err(ApiError::bad_request(format!(
+            "session target path must stay inside {root_label}"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject links/reparse points in every existing component.  Canonicalizing
+/// only the final path is insufficient when the final file has not been
+/// created yet, because a parent link could redirect the publication.
+fn validate_path_components(path: &Path, label: &str) -> Result<(), ApiError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(ApiError::bad_request(format!(
+                "{label} may not contain a parent-directory component"
+            )));
+        }
+        current.push(component.as_os_str());
+        #[cfg(windows)]
+        if matches!(component, Component::Prefix(_)) {
+            // A Windows volume/UNC prefix is not a filesystem component.
+            // Inspecting it as a standalone path can return ERROR_INVALID_FUNCTION;
+            // the following RootDir and normal components are still checked.
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ApiError::bad_request(format!(
+                    "cannot inspect {label}: {error}"
+                )))
+            }
+        };
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            return Err(ApiError::bad_request(format!(
+                "{label} may not traverse a symlink or reparse point: {}",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn next_session_output_candidate(base: &Path, suffix: usize) -> PathBuf {
+    if suffix == 0 {
+        return base.to_path_buf();
+    }
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session");
+    base.with_file_name(format!("{stem}-{suffix}.fms"))
+}
+
+/// Publish a new archive without replacing an existing file.  The session
+/// store transaction held by the export handler serializes API writers; the
+/// create-new staging file plus hard-link publication closes the remaining
+/// destination race without relying on rename-overwrite semantics.
+fn publish_session_archive(
+    base: &Path,
+    bytes: &[u8],
+) -> Result<(PathBuf, String), ApiError> {
+    let parent = base
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| ApiError::bad_request("session target path has no parent directory"))?;
+    canonical_directory(parent, "session target parent")?;
+    for suffix in 0..=MAX_SESSION_OUTPUT_COLLISION_ATTEMPTS {
+        let candidate = next_session_output_candidate(base, suffix);
+        validate_path_components(&candidate, "session target path")?;
+        if let Ok(metadata) = fs::symlink_metadata(&candidate) {
+            if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                return Err(ApiError::bad_request(format!(
+                    "session target may not be a symlink or reparse point: {}",
+                    candidate.display()
+                )));
+            }
+            continue;
+        }
+
+        let staging = parent.join(format!(
+            ".{}.{}.fms.part",
+            candidate
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("session"),
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(ApiError::internal(format!(
+                    "cannot stage session archive `{}`: {error}",
+                    staging.display()
+                )))
+            }
+        };
+        let result = (|| -> Result<(), ApiError> {
+            file.write_all(bytes).map_err(|error| {
+                ApiError::internal(format!("cannot write session archive staging file: {error}"))
+            })?;
+            file.sync_all().map_err(|error| {
+                ApiError::internal(format!("cannot sync session archive staging file: {error}"))
+            })?;
+            drop(file);
+            match fs::hard_link(&staging, &candidate) {
+                Ok(()) => {
+                    let published = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&candidate)
+                        .map_err(|error| {
+                            ApiError::internal(format!(
+                                "cannot reopen published session archive: {error}"
+                            ))
+                        })?;
+                    published.sync_all().map_err(|error| {
+                        ApiError::internal(format!(
+                            "cannot sync published session archive: {error}"
+                        ))
+                    })?;
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(ApiError::conflict("session output candidate already exists"))
+                }
+                Err(error) => Err(ApiError::internal(format!(
+                    "cannot publish session archive `{}`: {error}",
+                    candidate.display()
+                ))),
+            }
+        })();
+        let _ = fs::remove_file(&staging);
+        match result {
+            Ok(()) => {
+                let filename = candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| ApiError::internal("published session filename is not UTF-8"))?
+                    .to_owned();
+                return Ok((candidate, filename));
+            }
+            Err(error) if error.status == axum::http::StatusCode::CONFLICT => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ApiError::conflict(
+        "could not reserve a collision-free session output filename",
+    ))
+}
+
+#[cfg(test)]
+mod session_output_target_tests {
+    use super::*;
+
+    #[test]
+    fn default_session_filename_uses_the_script_stem() {
+        assert_eq!(
+            default_session_filename(Path::new("/tmp/permalloy_layer.py")).unwrap(),
+            "permalloy_layer.fms"
+        );
+    }
+
+    #[test]
+    fn mapped_default_target_preserves_the_script_relative_directory() {
+        let root = tempfile::tempdir().expect("temporary mapping root");
+        let source_root = root.path().join("source");
+        let output_root = root.path().join("output");
+        let script_directory = source_root.join("examples");
+        std::fs::create_dir_all(&script_directory).expect("script directory");
+        std::fs::create_dir_all(output_root.join("examples")).expect("output directory");
+        let script = script_directory.join("model.py");
+        std::fs::write(&script, b"study = None\n").expect("source script");
+
+        let target = resolve_session_output_target_for_mapping(
+            &script,
+            None,
+            Some((&output_root, &source_root)),
+        )
+        .expect("mapped target");
+
+        let expected = std::fs::canonicalize(&output_root)
+            .expect("canonical output directory")
+            .join("examples/model.fms");
+        assert_eq!(target, expected);
+    }
+
+    #[test]
+    fn explicit_target_takes_priority_inside_the_output_mapping() {
+        let root = tempfile::tempdir().expect("temporary mapping root");
+        let source_root = root.path().join("source");
+        let output_root = root.path().join("output");
+        let script_directory = source_root.join("examples");
+        std::fs::create_dir_all(&script_directory).expect("script directory");
+        std::fs::create_dir_all(&output_root).expect("output directory");
+        let script = script_directory.join("model.py");
+        std::fs::write(&script, b"study = None\n").expect("source script");
+        let explicit = output_root.join("chosen.fms");
+
+        let target = resolve_session_output_target_for_mapping(
+            &script,
+            Some(explicit.to_str().expect("UTF-8 target")),
+            Some((&output_root, &source_root)),
+        )
+        .expect("explicit mapped target");
+
+        assert_eq!(target, explicit);
+    }
+
+    #[test]
+    fn mapped_target_rejects_a_script_outside_the_source_mapping() {
+        let root = tempfile::tempdir().expect("temporary mapping root");
+        let source_root = root.path().join("source");
+        let output_root = root.path().join("output");
+        std::fs::create_dir_all(&source_root).expect("source directory");
+        std::fs::create_dir_all(&output_root).expect("output directory");
+        let script = root.path().join("outside.py");
+        std::fs::write(&script, b"study = None\n").expect("outside script");
+
+        let error = resolve_session_output_target_for_mapping(
+            &script,
+            None,
+            Some((&output_root, &source_root)),
+        )
+        .expect_err("off-prefix script must be rejected");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_target_rejects_a_symlinked_source_component() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary mapping root");
+        let source_root = root.path().join("source");
+        let real_directory = root.path().join("real-examples");
+        let output_root = root.path().join("output");
+        std::fs::create_dir_all(&source_root).expect("source directory");
+        std::fs::create_dir_all(&real_directory).expect("real script directory");
+        std::fs::create_dir_all(&output_root).expect("output directory");
+        let real_script = real_directory.join("model.py");
+        std::fs::write(&real_script, b"study = None\n").expect("source script");
+        let linked_directory = source_root.join("examples");
+        symlink(&real_directory, &linked_directory).expect("source symlink");
+        let script = linked_directory.join("model.py");
+
+        let error = resolve_session_output_target_for_mapping(
+            &script,
+            None,
+            Some((&output_root, &source_root)),
+        )
+        .expect_err("symlinked source component must be rejected");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn native_target_rejects_parent_directory_components() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let target = root.path().join("nested").join("..").join("model.fms");
+
+        let error = resolve_session_output_target(
+            &root.path().join("model.py"),
+            Some(target.to_str().expect("UTF-8 target")),
+        )
+        .expect_err("parent-directory target must be rejected");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn explicit_target_requires_source_save() {
+        let error = validate_session_output_request(Some("/tmp/model.fms"), false)
+            .expect_err("target path without source save must be rejected");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn source_saved_response_omits_archive_base64_but_export_keeps_it() {
+        assert_eq!(session_export_base64(b"archive", Some("/tmp/model.fms")), "");
+        assert_eq!(
+            session_export_base64(b"archive", None),
+            base64_encode(b"archive")
+        );
+    }
+
+    #[test]
+    fn publication_adds_a_suffix_without_overwriting_an_existing_archive() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let base = root.path().join("model.fms");
+        std::fs::write(&base, b"old archive").expect("existing archive");
+
+        let (published, filename) = publish_session_archive(&base, b"new archive")
+            .expect("collision-free archive publication");
+
+        assert_eq!(filename, "model-1.fms");
+        assert_eq!(published, root.path().join("model-1.fms"));
+        assert_eq!(std::fs::read(&base).unwrap(), b"old archive");
+        assert_eq!(std::fs::read(published).unwrap(), b"new archive");
+    }
+
+    #[test]
+    fn publication_rejects_a_non_fms_target() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let target = root.path().join("model.zip");
+        let error = resolve_session_output_target(
+            &root.path().join("model.py"),
+            Some(target.to_str().expect("UTF-8 target")),
+        )
+        .expect_err("non-FMS target must be rejected");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn publication_reports_a_non_directory_parent_without_partial_output() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let parent = root.path().join("parent");
+        std::fs::write(&parent, b"parent file").expect("parent marker");
+        let target = parent.join("model.fms");
+
+        let error = publish_session_archive(&target, b"archive")
+            .expect_err("a file cannot be used as an output directory");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read(&parent).unwrap(), b"parent file");
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1396,6 +1944,8 @@ mod accepted_fms_persistence_tests {
                 name: Some("accepted FMS fixture".into()),
                 compression: Some(fullmag_session::CompressionProfile::Speed),
                 ui_state: None,
+                target_path: None,
+                save_to_source: None,
             }),
             None,
         )
@@ -1463,6 +2013,8 @@ mod accepted_fms_persistence_tests {
                 name: None,
                 compression: None,
                 ui_state: None,
+                target_path: None,
+                save_to_source: None,
             }),
         )
         .await
@@ -1569,6 +2121,8 @@ mod accepted_fms_persistence_tests {
                 name: None,
                 compression: None,
                 ui_state: None,
+                target_path: None,
+                save_to_source: None,
             }),
             Some(&context),
         )
@@ -1901,6 +2455,9 @@ pub(crate) async fn export_session_with_context(
     if let Some(context) = request_context {
         crate::validate_current_live_request_context(&state, context).await?;
     }
+    let save_to_source = req.save_to_source.unwrap_or(false);
+    let requested_target = req.target_path.as_deref();
+    validate_session_output_request(requested_target, save_to_source)?;
     let session_id = current_session_id(&state).await?;
     let script = read_canonical_script(&state).await?;
 
@@ -1921,6 +2478,14 @@ pub(crate) async fn export_session_with_context(
         .await
         .clone()
         .ok_or_else(|| ApiError::not_found("no active workspace"))?;
+    let save_target = if save_to_source {
+        Some(resolve_session_output_target(
+            Path::new(&snapshot.session.script_path),
+            requested_target,
+        )?)
+    } else {
+        None
+    };
     let mut accepted_capture = accepted_export_capture(&state, &snapshot, &export_profile)?;
     let mut session_manifest = FmsSessionManifest::new(&session_id, &name, req.profile);
 
@@ -2065,13 +2630,21 @@ pub(crate) async fn export_session_with_context(
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let fms_bytes = buf.into_inner();
-    let fms_base64 = base64_encode(&fms_bytes);
+    let (saved_path, filename) = if let Some(target) = save_target {
+        let (saved_path, filename) = publish_session_archive(&target, &fms_bytes)?;
+        (Some(saved_path.display().to_string()), Some(filename))
+    } else {
+        (None, None)
+    };
+    let fms_base64 = session_export_base64(&fms_bytes, saved_path.as_deref());
 
     Ok(Json(SessionExportResponse {
         session_id,
         profile: req.profile,
         fms_base64,
         size_bytes: fms_bytes.len(),
+        saved_path,
+        filename,
     }))
 }
 

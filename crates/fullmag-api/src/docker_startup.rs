@@ -7,6 +7,7 @@
 
 use axum::{extract::State, Json};
 use fullmag_authoring::{normalize_scene_document_magnetization_assets, SceneDocument};
+use fullmag_ir::OutputDataFormatIR;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
@@ -26,6 +27,9 @@ pub(crate) const RESPONSE_SCHEMA: &str = "fullmag.startup-script-activation.v1";
 pub(crate) const AUTHORIZATION_KIND: &str = "explicit_startup_script";
 pub(crate) const CONTAINER_SOURCE_ROOT: &str = "/opt/fullmag/source";
 pub(crate) const MAX_SCRIPT_BYTES: usize = 1024 * 1024;
+const SCRIPT_OUTPUT_ROOT_ENV: &str = "FULLMAG_SCRIPT_OUTPUT_ROOT";
+const SCRIPT_OUTPUT_SOURCE_DIR_ENV: &str = "FULLMAG_SCRIPT_OUTPUT_SOURCE_DIR";
+const CONTAINER_RUNTIME_ROOT: &str = "/opt/fullmag";
 
 const STARTUP_METADATA_KEY: &str = "docker_startup";
 const MAX_REQUEST_ID_BYTES: usize = 128;
@@ -119,6 +123,7 @@ struct LoadedStartupScene {
     source: CapturedSource,
     scene: SceneDocument,
     runtime: DockerStartupRuntimeMetadata,
+    output_storage_binding: Value,
 }
 
 /// Activate one explicit Docker startup script through the current live API.
@@ -187,6 +192,7 @@ pub(crate) async fn activate_current_live_startup(
             loaded.source.sha256.clone(),
             false,
             Some(source_root),
+            Some(loaded.source.path.clone()),
         )
         .await;
 
@@ -237,6 +243,7 @@ pub(crate) async fn activate_current_live_startup(
             "step_ids": &prepared.step_ids,
             "scene_revision": loaded.scene.revision,
             "runtime_metadata": loaded.runtime,
+            "output_storage_binding": loaded.output_storage_binding,
         }
     });
     let mut accepted_snapshot = snapshot.clone();
@@ -598,10 +605,326 @@ async fn load_startup_scene(
     .map_err(|error| ApiError::internal(format!("startup scene helper task failed: {error}")))??;
     drop(source_snapshot);
 
+    let (scene, runtime) = loaded;
+    let output_storage_binding = bind_docker_output_storage_for_source(&scene, &source.path)?;
+
     Ok(LoadedStartupScene {
         source,
-        scene: loaded.0,
-        runtime: loaded.1,
+        scene,
+        runtime,
+        output_storage_binding,
+    })
+}
+
+/// Resolve the Docker output policy for one admitted source path without
+/// mutating the authored SceneDocument.  The accepted execution adapter uses
+/// the same pure calculation after it has lowered the source into ProblemIR.
+/// `FULLMAG_SCRIPT_OUTPUT_ROOT` is only the alias for the one approved writable
+/// source directory selected by the host launcher. This function never creates
+/// or writes that directory or any of its result children.
+pub(crate) fn bind_docker_output_storage_for_source(
+    scene: &SceneDocument,
+    source_path: &Path,
+) -> Result<Value, ApiError> {
+    let alias_required = scene
+        .study
+        .output_storage
+        .as_ref()
+        .map(|storage| {
+            storage
+                .output_dir
+                .as_deref()
+                .map(|path| !Path::new(path).is_absolute())
+                .unwrap_or(true)
+                || storage
+                    .temp_dir
+                    .as_deref()
+                    .is_some_and(|path| !Path::new(path).is_absolute())
+        })
+        .unwrap_or(true);
+    let (alias_root, selected_source_directory) = if alias_required {
+        let value = std::env::var_os(SCRIPT_OUTPUT_ROOT_ENV).ok_or_else(|| {
+            ApiError::unprocessable_with_code(
+                "docker_startup_output_mapping_required",
+                format!(
+                    "{SCRIPT_OUTPUT_ROOT_ENV} is required for default or relative script output paths"
+                ),
+            )
+        })?;
+        let root = PathBuf::from(value);
+        validate_script_output_alias(&root)?;
+        let selected = std::env::var_os(SCRIPT_OUTPUT_SOURCE_DIR_ENV).ok_or_else(|| {
+            ApiError::unprocessable_with_code(
+                "docker_startup_output_mapping_required",
+                format!(
+                    "{SCRIPT_OUTPUT_SOURCE_DIR_ENV} is required when Docker output mapping is active"
+                ),
+            )
+        })?;
+        let selected = PathBuf::from(selected);
+        let selected = selected.strip_prefix(Path::new(CONTAINER_SOURCE_ROOT)).map_err(|_| {
+            ApiError::unprocessable_with_code(
+                "docker_startup_output_mapping_invalid",
+                format!(
+                    "{SCRIPT_OUTPUT_SOURCE_DIR_ENV} must select a child of {CONTAINER_SOURCE_ROOT}"
+                ),
+            )
+        })?;
+        let selected = selected.to_path_buf();
+        validate_script_output_directory(&selected)?;
+        (Some(root), Some(selected))
+    } else {
+        (None, None)
+    };
+
+    bind_docker_output_storage_with_alias(
+        scene,
+        source_path,
+        alias_root.as_deref(),
+        selected_source_directory.as_deref(),
+    )
+}
+
+fn bind_docker_output_storage_with_alias(
+    scene: &SceneDocument,
+    source_path: &Path,
+    alias_root: Option<&Path>,
+    selected_source_directory: Option<&Path>,
+) -> Result<Value, ApiError> {
+    if let Some(alias_root) = alias_root {
+        validate_script_output_alias(alias_root)?;
+    }
+    if let Some(selected_source_directory) = selected_source_directory {
+        validate_script_output_directory(selected_source_directory)?;
+    }
+
+    let mut storage = scene.study.output_storage.clone().unwrap_or_default();
+    storage.validate().map_err(|errors| {
+        ApiError::bad_request(format!(
+            "Docker startup OutputStorage policy is invalid: {}",
+            errors.join("; ")
+        ))
+    })?;
+
+    let source_parent = source_path
+        .parent()
+        .ok_or_else(|| ApiError::bad_request("Docker startup source path has no parent"))?;
+    let source_relative = source_path
+        .strip_prefix(Path::new(CONTAINER_SOURCE_ROOT))
+        .map_err(|_| {
+            ApiError::bad_request(
+                "Docker startup source path cannot be mapped to the output alias",
+            )
+        })?;
+    if source_relative.components().any(|component| {
+        matches!(component, Component::CurDir | Component::ParentDir | Component::Prefix(_))
+    }) {
+        return Err(ApiError::bad_request(
+            "Docker startup source path contains unsafe components",
+        ));
+    }
+
+    let source_original_dir = source_parent.to_string_lossy().into_owned();
+    let requested_output_dir = storage.output_dir.clone();
+    let requested_temp_dir = storage.temp_dir.clone();
+    let mut mapped_source_dir = source_parent.to_path_buf();
+    let mut output_dir = storage.output_dir.clone();
+    let mut temp_dir = storage.temp_dir.clone();
+
+    if let Some(alias_root) = alias_root {
+        let selected_source_directory = selected_source_directory.ok_or_else(|| {
+            ApiError::unprocessable_with_code(
+                "docker_startup_output_mapping_invalid",
+                "Docker output mapping has no selected source directory",
+            )
+        })?;
+        let source_parent_relative = source_relative.parent().unwrap_or(Path::new(""));
+        let output_relative_parent = source_parent_relative
+            .strip_prefix(selected_source_directory)
+            .map_err(|_| {
+                ApiError::unprocessable_with_code(
+                    "docker_startup_output_mapping_required",
+                    format!(
+                        "Docker startup source must be under the selected source directory `{}`",
+                        selected_source_directory.display()
+                    ),
+                )
+            })?;
+        mapped_source_dir = if output_relative_parent.as_os_str().is_empty() {
+            alias_root.to_path_buf()
+        } else {
+            alias_root.join(output_relative_parent)
+        };
+        ensure_output_alias_child(&mapped_source_dir, alias_root)?;
+
+        output_dir = Some(match requested_output_dir.as_deref() {
+            Some(path) if Path::new(path).is_absolute() => {
+                reject_immutable_source_path(Path::new(path), "output_dir")?;
+                reject_output_alias_parent(Path::new(path), alias_root, "output_dir")?;
+                path.to_owned()
+            }
+            Some(path) => {
+                let mapped = mapped_source_dir.join(path);
+                ensure_output_alias_child(&mapped, alias_root)?;
+                reject_output_alias_parent(&mapped, alias_root, "output_dir")?;
+                mapped.to_string_lossy().into_owned()
+            }
+            None => mapped_source_dir
+                .join(default_script_output_name(source_path, storage.data_format)?)
+                .to_string_lossy()
+                .into_owned(),
+        });
+        temp_dir = Some(match requested_temp_dir.as_deref() {
+            Some(path) if Path::new(path).is_absolute() => {
+                reject_immutable_source_path(Path::new(path), "temp_dir")?;
+                reject_output_alias_parent(Path::new(path), alias_root, "temp_dir")?;
+                path.to_owned()
+            }
+            Some(path) => {
+                let mapped = mapped_source_dir.join(path);
+                ensure_output_alias_child(&mapped, alias_root)?;
+                reject_output_alias_parent(&mapped, alias_root, "temp_dir")?;
+                mapped.to_string_lossy().into_owned()
+            }
+            None => mapped_source_dir
+                .join(".fullmag-tmp")
+                .to_string_lossy()
+                .into_owned(),
+        });
+    } else {
+        if let Some(path) = output_dir.as_deref() {
+            reject_immutable_source_path(Path::new(path), "output_dir")?;
+        }
+        if let Some(path) = temp_dir.as_deref() {
+            reject_immutable_source_path(Path::new(path), "temp_dir")?;
+        }
+    }
+
+    storage.output_dir = output_dir.clone();
+    storage.temp_dir = temp_dir.clone();
+    storage.validate().map_err(|errors| {
+        ApiError::unprocessable(format!(
+            "Docker startup resolved OutputStorage policy is invalid: {}",
+            errors.join("; ")
+        ))
+    })?;
+    let resolved_output_storage = serde_json::to_value(&storage).map_err(|error| {
+        ApiError::internal(format!("failed to serialize resolved Docker output policy: {error}"))
+    })?;
+    Ok(json!({
+        "schema": "fullmag.docker_script_output_binding.v1",
+        "binding": if alias_root.is_some() { "docker_script_output_alias" } else { "explicit_output_paths" },
+        "source_path": source_path.to_string_lossy(),
+        "source_original_dir": source_original_dir,
+        "source_dir": mapped_source_dir.to_string_lossy(),
+        "alias_root": alias_root.map(|path| path.to_string_lossy().into_owned()),
+        "selected_source_directory": selected_source_directory
+            .map(|path| path.to_string_lossy().into_owned()),
+        "requested_output_dir": requested_output_dir,
+        "requested_temp_dir": requested_temp_dir,
+        "output_storage": resolved_output_storage,
+        "output_dir": output_dir,
+        "temp_dir": temp_dir,
+        "data_format": storage.data_format,
+    }))
+}
+
+fn validate_script_output_alias(alias_root: &Path) -> Result<(), ApiError> {
+    if !alias_root.is_absolute()
+        || alias_root.as_os_str().to_string_lossy().is_empty()
+        || alias_root
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(ApiError::unprocessable_with_code(
+            "docker_startup_output_mapping_invalid",
+            "FULLMAG_SCRIPT_OUTPUT_ROOT must be an absolute canonical alias path",
+        ));
+    }
+    let runtime_root = Path::new(CONTAINER_RUNTIME_ROOT);
+    if alias_root == runtime_root
+        || alias_root.strip_prefix(runtime_root).is_err()
+        || alias_root == Path::new(CONTAINER_SOURCE_ROOT)
+        || alias_root.starts_with(Path::new(CONTAINER_SOURCE_ROOT))
+    {
+        return Err(ApiError::unprocessable_with_code(
+            "docker_startup_output_mapping_invalid",
+            "FULLMAG_SCRIPT_OUTPUT_ROOT must be under /opt/fullmag and outside the immutable source checkout",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_script_output_directory(directory: &Path) -> Result<(), ApiError> {
+    if directory.as_os_str().to_string_lossy().is_empty()
+        || directory.is_absolute()
+        || directory.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ApiError::unprocessable_with_code(
+            "docker_startup_output_mapping_invalid",
+            format!(
+                "{SCRIPT_OUTPUT_SOURCE_DIR_ENV} must select a nonempty relative source directory"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_output_alias_child(child: &Path, alias_root: &Path) -> Result<(), ApiError> {
+    if child.strip_prefix(alias_root).is_err() {
+        return Err(ApiError::unprocessable_with_code(
+            "docker_startup_output_mapping_invalid",
+            "script output mapping escaped its alias parent",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_output_alias_parent(
+    path: &Path,
+    alias_root: &Path,
+    field: &str,
+) -> Result<(), ApiError> {
+    if path == alias_root {
+        return Err(ApiError::unprocessable_with_code(
+            "docker_startup_output_mapping_invalid",
+            format!(
+                "OutputStorage {field} cannot use the output alias parent as a writable result"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_immutable_source_path(path: &Path, field: &str) -> Result<(), ApiError> {
+    if path == Path::new(CONTAINER_SOURCE_ROOT) || path.starts_with(Path::new(CONTAINER_SOURCE_ROOT)) {
+        return Err(ApiError::unprocessable_with_code(
+            "docker_startup_output_mapping_invalid",
+            format!("OutputStorage {field} cannot target the immutable source checkout"),
+        ));
+    }
+    Ok(())
+}
+
+fn default_script_output_name(source_path: &Path, format: OutputDataFormatIR) -> Result<String, ApiError> {
+    let stem = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("Docker startup source path has no valid script stem"))?;
+    Ok(match format {
+        OutputDataFormatIR::Zarr => format!("{stem}.zarr"),
+        // The existing HDF5 runtime owns the `.results` bundle and writes
+        // `.h5` stage files inside it; preserve that container contract here.
+        OutputDataFormatIR::Hdf5 => format!("{stem}.results"),
     })
 }
 
@@ -884,6 +1207,7 @@ fn build_startup_snapshot(
             "request": request,
             "status": "activating",
             "runtime_metadata": loaded.runtime,
+            "output_storage_binding": loaded.output_storage_binding,
             "source_size_bytes": loaded.source.size_bytes,
         }
     }));
@@ -1116,6 +1440,7 @@ async fn publish_startup_result(
             "step_ids": step_ids,
             "scene_revision": loaded.scene.revision,
             "runtime_metadata": loaded.runtime,
+            "output_storage_binding": loaded.output_storage_binding,
         }
     }));
     snapshot.state_version = snapshot.state_version.saturating_add(1);
@@ -1555,6 +1880,7 @@ fn apply_startup_failure_snapshot(
         "error": bounded_startup_error(&error.message),
         "captured_scene_revision": loaded.scene.revision,
         "current_scene_revision": current_scene_revision,
+        "output_storage_binding": loaded.output_storage_binding,
     });
 
     // Once a RunIntent was accepted, every later failure is recovery-required.
@@ -1606,6 +1932,10 @@ fn apply_startup_failure_snapshot(
             json!(bounded_startup_error(&error.message)),
         );
         startup_object.insert("runtime_metadata".to_string(), json!(loaded.runtime.clone()));
+        startup_object.insert(
+            "output_storage_binding".to_string(),
+            loaded.output_storage_binding.clone(),
+        );
         if let Some(run) = snapshot.run.as_ref() {
             startup_object.insert("accepted_run".to_string(), json!(true));
             startup_object.insert("run_id".to_string(), json!(run.run_id.clone()));
@@ -1671,7 +2001,157 @@ mod tests {
                 interactive: true,
                 wait_for_solve: true,
             },
+            output_storage_binding: json!({
+                "schema": "fullmag.docker_script_output_binding.v1",
+                "binding": "test",
+            }),
         }
+    }
+
+    fn captured_source(path: &str) -> PathBuf {
+        PathBuf::from(path)
+    }
+
+    #[test]
+    fn docker_default_output_maps_to_selected_source_alias_without_parent_write() {
+        let scene = SceneDocument::default();
+        let binding = bind_docker_output_storage_with_alias(
+            &scene,
+            &captured_source("/opt/fullmag/source/examples/model.py"),
+            Some(Path::new("/opt/fullmag/script-output")),
+            Some(Path::new("examples")),
+        )
+        .expect("selected source directory should map to the alias");
+        assert!(scene.study.output_storage.is_none());
+        assert_eq!(binding["output_dir"], json!("/opt/fullmag/script-output/model.zarr"));
+        assert_eq!(
+            binding["temp_dir"],
+            json!("/opt/fullmag/script-output/.fullmag-tmp")
+        );
+        assert_eq!(binding["source_original_dir"], json!("/opt/fullmag/source/examples"));
+        assert_eq!(binding["source_dir"], json!("/opt/fullmag/script-output"));
+        assert_eq!(binding["selected_source_directory"], json!("examples"));
+    }
+
+    #[test]
+    fn docker_default_output_uses_source_filename_not_display_name() {
+        let mut scene = SceneDocument::default();
+        scene.scene.name = "Display name from authoring".to_string();
+        let binding = bind_docker_output_storage_with_alias(
+            &scene,
+            &captured_source("/opt/fullmag/source/examples/authored_filename.py"),
+            Some(Path::new("/opt/fullmag/script-output")),
+            Some(Path::new("examples")),
+        )
+        .expect("source filename should determine the default output name");
+        assert_eq!(binding["output_dir"], json!(
+            "/opt/fullmag/script-output/authored_filename.zarr"
+        ));
+    }
+
+    #[test]
+    fn docker_relative_output_preserves_explicit_policy_under_selected_alias() {
+        let mut scene = SceneDocument::default();
+        scene.study.output_storage = Some(fullmag_ir::OutputStorageIR {
+            output_dir: Some("custom.zarr".to_string()),
+            temp_dir: Some("scratch".to_string()),
+            ..Default::default()
+        });
+        let binding = bind_docker_output_storage_with_alias(
+            &scene,
+            &captured_source("/opt/fullmag/source/examples/sub/model.py"),
+            Some(Path::new("/opt/fullmag/script-output")),
+            Some(Path::new("examples")),
+        )
+        .expect("relative explicit paths should map below the selected alias");
+        assert_eq!(
+            binding["output_dir"],
+            json!("/opt/fullmag/script-output/sub/custom.zarr")
+        );
+        assert_eq!(
+            binding["temp_dir"],
+            json!("/opt/fullmag/script-output/sub/scratch")
+        );
+        assert_eq!(
+            binding["output_storage"]["output_dir"],
+            json!("/opt/fullmag/script-output/sub/custom.zarr")
+        );
+        assert_eq!(
+            binding["output_storage"]["temp_dir"],
+            json!("/opt/fullmag/script-output/sub/scratch")
+        );
+        let storage = scene.study.output_storage.as_ref().unwrap();
+        assert_eq!(
+            storage.output_dir.as_deref(),
+            Some("custom.zarr")
+        );
+        assert_eq!(
+            storage.temp_dir.as_deref(),
+            Some("scratch")
+        );
+    }
+
+    #[test]
+    fn docker_output_mapping_rejects_off_prefix_and_immutable_source_paths() {
+        let source = captured_source("/opt/fullmag/source/examples/model.py");
+        let mut off_prefix = SceneDocument::default();
+        assert!(bind_docker_output_storage_with_alias(
+            &off_prefix,
+            &source,
+            Some(Path::new("/opt/fullmag/script-output")),
+            Some(Path::new("other")),
+        )
+        .is_err());
+
+        let mut immutable = SceneDocument::default();
+        immutable.study.output_storage = Some(fullmag_ir::OutputStorageIR {
+            output_dir: Some("/opt/fullmag/source/model.zarr".to_string()),
+            temp_dir: Some("/opt/fullmag/source/.fullmag-tmp".to_string()),
+            ..Default::default()
+        });
+        assert!(bind_docker_output_storage_with_alias(
+            &immutable,
+            &source,
+            None,
+            None,
+        )
+        .is_err());
+
+        let mut alias_parent_result = SceneDocument::default();
+        alias_parent_result.study.output_storage = Some(fullmag_ir::OutputStorageIR {
+            output_dir: Some(".".to_string()),
+            ..Default::default()
+        });
+        assert!(bind_docker_output_storage_with_alias(
+            &alias_parent_result,
+            &source,
+            Some(Path::new("/opt/fullmag/script-output")),
+            Some(Path::new("examples")),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn docker_explicit_absolute_output_does_not_require_alias() {
+        let mut scene = SceneDocument::default();
+        scene.study.output_storage = Some(fullmag_ir::OutputStorageIR {
+            output_dir: Some("/opt/fullmag/prepared/model.zarr".to_string()),
+            ..Default::default()
+        });
+        let binding = bind_docker_output_storage_with_alias(
+            &scene,
+            &captured_source("/opt/fullmag/source/examples/model.py"),
+            None,
+            None,
+        )
+        .expect("explicit absolute output should remain authoritative");
+        let storage = scene.study.output_storage.as_ref().unwrap();
+        assert_eq!(
+            storage.output_dir.as_deref(),
+            Some("/opt/fullmag/prepared/model.zarr")
+        );
+        assert_eq!(storage.temp_dir, None);
+        assert_eq!(binding["binding"], json!("explicit_output_paths"));
     }
 
     fn placeholder_context(snapshot: &crate::types::SessionStateResponse) -> CurrentLiveRequestContext {

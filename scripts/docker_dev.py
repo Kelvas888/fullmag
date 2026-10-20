@@ -2435,10 +2435,10 @@ def build(args: argparse.Namespace) -> None:
 
 def up(args: argparse.Namespace) -> None:
     import fullmag_storage as storage
-    from docker_volume_dev import start
+    from docker_dev_up import ensure_up
     from docker_build_control import BuildControlError
     try:
-        start(args)
+        ensure_up(args)
     except (BuildControlError, storage.StorageError, ValueError, OSError, subprocess.SubprocessError) as error:
         raise _fail(str(error)) from error
 
@@ -2671,6 +2671,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             from docker_dev_host import require_host
             require_host()
             from docker_dev_defaults import resolve_defaults
+            args.port_explicit = args.port is not None
             selected = resolve_defaults(args.repo_root, source_root=args.source_root, port=getattr(args, "port", None))
             args.source_root = selected.source_root
             args.port = selected.port

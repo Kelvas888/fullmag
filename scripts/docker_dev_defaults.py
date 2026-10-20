@@ -114,7 +114,7 @@ def _read_dotenv(path: Path) -> dict[str, str]:
         if not match:
             continue
         key = match.group(1)
-        if key not in {_SOURCE_ENV, *_PORT_ENVS, "FULLMAG_PROJECT_STORAGE_ROOT"}:
+        if key not in {_SOURCE_ENV, *_PORT_ENVS, "FULLMAG_PROJECT_STORAGE_ROOT", "FULLMAG_SCRIPT_OUTPUT_DIRECTORY"}:
             continue
         if key in values:
             raise DiscoveryError(f"duplicate {key} in main .env at {path}:{number}")
