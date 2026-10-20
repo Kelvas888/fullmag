@@ -1476,7 +1476,7 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
                 raise BuildControlError("Current handoff has no matching succeeded package/provenance")
             return receipt, provenance
         if time.monotonic() - last_report > 45:
-            mirror_console("Backend is building in its persistent Compose service; Docker data retained.\n")
+            mirror_console("Backend startup is in progress (build, package validation or runtime handoff); see backend service logs. Docker data retained.\n")
             last_report = time.monotonic()
         time.sleep(3)
     raise BuildControlError("Backend publication observation timed out; services and volumes retained")

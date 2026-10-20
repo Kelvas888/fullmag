@@ -354,7 +354,11 @@ liczba prób jednej fazy i archiwów metadanych pakietu jest ograniczona do 64.
 Wyczerpanie budżetu zatrzymuje dalszy zapis, zachowując dowody.
 
 Retencja binariów zachowuje pakiet bieżący i zweryfikowany rollback. Aktywnego
-cache nie usuwa. Nie ma automatycznego globalnego GC BuildKit, starych obrazów
+cache nie usuwa. Start backendu zachowuje wszystkie historyczne pakiety i
+raportuje odroczenie retencji; ich pełna walidacja i usuwanie nie blokują API.
+Odrębna operacja retencji nie jest obecnie udostępniona przez ten launcher.
+Przed następnym buildem nadal oceń miejsce i zachowywane dane.
+Nie ma automatycznego globalnego GC BuildKit, starych obrazów
 ani nieaktywnych grup. Ich usunięcie wymaga osobnego planu właścicieli/referencji
 i zgody. Samo usunięcie kontenera nie odzyskuje wolumenów ani fizycznego VHDX.
 

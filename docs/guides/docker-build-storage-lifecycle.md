@@ -149,7 +149,8 @@ Nie są to nowe archiwa źródeł wykonywane przy każdym restarcie bezpośredni
    kompilacji natywnej. To znana granica obecnej optymalizacji.
 6. Nowy pakiet powstaje w prywatnym kandydacie named package volume. Po
    walidacji i trwałej publikacji poprzedni staje się rollbackiem. Dopiero
-   potem wykonuje się retencja starszych pakietów. Błąd kompilacji nie uruchamia
+   potem start przechodzi do sprawdzenia aktualnego pakietu i API. Retencja
+   historycznych kopii jest odroczona; wszystkie backupy pozostają. Błąd kompilacji nie uruchamia
    nowego API; poprzedni zweryfikowany pakiet zostaje zachowany. W daily
    live-shadow assembly/provenance i receipty pozostają w control/package
    volumes, a `startup-provenance`, `runtime-recovery-consumed`, host-ledger i
@@ -201,8 +202,8 @@ nie jest etapem codziennego startu DEV.
 
 | Klasa danych | Obecny mechanizm | Granica / ryzyko wzrostu |
 | --- | --- | --- |
-| Binarne pakiety backendu | Po udanej publikacji w named package volume: bieżący + jeden bezpośredni rollback; starsze potwierdzone backupy usuwane od najstarszego | Tylko poprawny łańcuch receiptów/rotacji pod blokadą. Nieznane/uszkodzone dane pozostają; `retention skipped` wymaga sprawdzenia |
-| Dowody usuniętych pakietów | Receipt i rotacja w `/opt/fullmag/package/.development/retired`; bez kopii pełnego build logu; najwyżej 8 archiwów i 64 MiB payloadu | Najnowsze wpisy zostają; starsze/za duże archiwa z manifestem i bezpiecznym drzewem są usuwane. Pełny legacy log jest hashowany tylko, gdy zachowane archiwum mieści się w budżecie |
+| Binarne pakiety backendu | Bieżący pakiet i wszystkie historyczne rollbacki pozostają w named package volume; start raportuje `retention deferred` | Automatyczna retencja podczas startu jest odroczona. Każda nowa publikacja może dodać pełny backup; brak bieżącego limitu liczby kopii. Istniejący preflight mierzy build/cache volume, nie gwarantuje miejsca w osobnym package volume |
+| Dowody wcześniej usuniętych pakietów | Istniejące receipty i rotacje w `/opt/fullmag/package/.development/retired` pozostają | Odroczenie retencji nie uruchamia archiwizacji ani prune. Limity 8 archiwów / 64 MiB w funkcji retencji nie są obecnie egzekwowane przez ścieżkę startu |
 | Logi stdout/stderr kontenerów DEV | Compose używa `json-file`, `max-size=10m`, `max-file=3` dla usług grupy | Do 30 MiB na kontener dla kopii logów Dockera; nie ogranicza plików logów w named volumes ani BuildKit |
 | Log Next.js | Stały `/state/development/next.log` oraz najwyżej jeden `/state/development/next.log.rollback` w frontend cache volume; po przejęciu istniejącego runtime locka pełny regularny `next.log` jest atomowo obracany i katalog jest synchronizowany przed utworzeniem świeżego pliku | Retencja bieżącej i jednej poprzedniej generacji ma limit 64 MiB na plik; stdout ponad limit pozostaje w rotowanym driverze Docker. Ścieżki nieznane, dowiązania, hardlinki i pliki nieregularne są zachowywane/fail-closed, bez ogólnego GC |
 | Staging kandydata daily live-shadow | Named package volume; usuwanie tylko znanych, oznaczonych kandydatów po potwierdzonym błędzie albo publikacji | Dziennik `rotation.pending.json` pozwala odzyskać dokładną przerwaną rotację przy kolejnym starcie. Nieznane, zmienione lub niekompletne dowody pozostają zachowane; brak ogólnego sweepu |
@@ -216,10 +217,12 @@ nie jest etapem codziennego startu DEV.
 | Sesje, projekty, wyniki, `workspace.db` | Trwałe dane użytkownika | Wyłączone ze sprzątania technicznego |
 | Obrazy / BuildKit / stare grupy | Brak automatycznego globalnego czyszczenia Fullmaga | Zatrzymany kontener nadal może referencjonować obraz/cache; inna grupa może go używać |
 
-Retencja pakietów jest zaimplementowana i ma testy wykonywalne. Jej wykonanie
-na kolejnych **rzeczywistych pakietach obecnej grupy v2** pozostaje
-**NOT VERIFIED**. Nie wolno zamieniać tej informacji na deklarację, że cały
-storage jest już ograniczony automatycznym limitem.
+Funkcja retencji pakietów i jej historyczne regresje pozostają w źródłach,
+ale nie są wywoływane podczas startu; osobna operacja konserwacyjna nie jest
+obecnie udostępniona. Nie uruchamiano testów. Nowa ścieżka bez retencji wymaga
+odbioru runtime (**NOT VERIFIED**). Nie wolno deklarować, że pakiety lub cały
+storage są ograniczone automatycznym limitem. Powód i granice odroczenia:
+[ADR 0061](../adr/0061-docker-development-build-and-runtime-container.md#korekta-20102026--retencja-poza-startem-api).
 
 Osobny `just prune-managed-fem-runtimes apply=0 keep_per_family=2` jest
 dry-runem retencji zarządzanych runtime'ów FEM. Nie czyści automatycznie

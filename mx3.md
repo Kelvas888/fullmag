@@ -1,28 +1,26 @@
 # MX3 — audyt frontendu i runtime symulacji Fullmag
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 20.10.2026, 20:28 UTC
+## Aktualny status wdrożenia — 20.10.2026, 21:09 UTC
 
-Na `master` zakończono merge `b724373654c95ea73ea058738a09bd90cc5e7441`;
-lokalny checkpoint i pełny remote zachowane, bez nowego worktree i bez testów. Równoległe zmiany oraz dane są zachowane.
-Przerwa Git jest zwolniona; kolejne okno capture/sync będzie uzgodnione osobno.
+Build i publikacja pakietu w `fullmag-master` przeszły: źródła
+`d2a4bdfb7a685da587954f1dbb57ea828f8a4e6b`, snapshot
+`fb94f5f75bac756279f92cbdddf5a2561f51f8a1de1dd89406a9a455c10a537a`.
+Backend `c007e2f1e113` pozostaje przed API: synchronicznie sprawdza historyczne
+kopie pakietów podczas retencji. Frontend `31f1035340db` jest healthy na **3198**,
+lecz funkcje wymagające API są niedostępne.
 
-- **Build:** ostatnia kompilacja `cuda-fem-gpu` i walidacja pakietu przeszły,
-  snapshot `76c8eb727e02bc8dfeebed24cbe124555c3c9a11922a14d5d79bb882321147b0`.
-- **Runtime:** backend `3faec05b8835` zakończył się przed spawn API przez odmowę
-  recovery pre-ACK. API/native obecnie niedostępne; frontend działa na porcie **3198**.
-- **Gotowe źródłowo:** projekcja terminalnego runu bez katalogu artefaktów oraz
-  odtworzonego błędu do istniejącego preparation resource. Odbiór runtime pending.
-- **Review i realny podgląd PASS:** producent i walidatory dowodu pre-ACK;
-  dowód opublikowany (exit0); kolejny start czeka na checkpoint Git i integrację remote.
-- **Potwierdzone wcześniej w przeglądarce:** odróżnialne kolory primitive i panel
-  Airbox Visualization. Nie jest to odbiór aktualnego meshu ani pól z Solve.
+W źródłach usunięto opcjonalną retencję z krytycznej ścieżki startu: wszystkie
+rollbacki pozostają, a obowiązkowa walidacja aktualnego pakietu w `_serve`
+pozostaje wymagana. Ta poprawka nie zmienia aktywnego procesu; odbiór nowej
+wersji runtime pozostaje **NOT VERIFIED**. Nie dodano procesu w tle, timeoutu
+ani mechanizmu anulowania. Nie usunięto danych.
 
-Pozostają **3 pilne grupy odbioru**: (1) API/native i odtworzenie tego samego runu,
-(2) nowa siatka, (3) Solve oraz pola/energie/Airbox w UI. Pełny plan F0–F12
-nadal nie jest zamknięty. Nie wysłano replay skryptu, retry preparation ani Solve
-runu04. Szczegóły i granice dowodu: raport recovery §51–54. Poniższy audyt
-z 19.10 i starsze checkpointy pozostają historycznym zapisem swoich źródeł.
+Współdzielony master ma również zintegrowany PR #225 (`551b174c42515b9e897dd9953afec43f5b1eb81f`);
+jego późniejsze źródła nie są częścią powyższego zbudowanego snapshotu.
+Bez replay skryptu, nowego preparation retry, Solve i testów.
+Pozostają trzy grupy odbioru: API/native i ten sam run04; nowa siatka;
+Solve oraz pola/energie/Airbox w UI. Pełny plan F0–F12 pozostaje otwarty.
 <!-- mx3-current-status:end -->
 
 
@@ -1916,3 +1914,25 @@ Merge `b724373654c95ea73ea058738a09bd90cc5e7441` zachowuje checkpoint i remote.
 Brakujący owner panelu Study domknięty z zachowaniem aliasów i dotychczasowych
 transakcji; review PASS. User potwierdził rings script. Bez nowego runtime,
 retry, Solve i testów. Szczegóły: raport §58.
+
+
+## 51. Publikacja pakietu i blokująca retencja — 20.10.2026, 21:09 UTC
+
+Build i publikacja pakietu w `fullmag-master` przeszły: źródła
+`d2a4bdfb7a685da587954f1dbb57ea828f8a4e6b`, snapshot
+`fb94f5f75bac756279f92cbdddf5a2561f51f8a1de1dd89406a9a455c10a537a`.
+Backend `c007e2f1e113` pozostaje przed API: synchronicznie sprawdza historyczne
+kopie pakietów podczas retencji. Frontend `31f1035340db` jest healthy na **3198**,
+lecz funkcje wymagające API są niedostępne.
+
+W źródłach usunięto opcjonalną retencję z krytycznej ścieżki startu: wszystkie
+rollbacki pozostają, a obowiązkowa walidacja aktualnego pakietu w `_serve`
+pozostaje wymagana. Ta poprawka nie zmienia aktywnego procesu; odbiór nowej
+wersji runtime pozostaje **NOT VERIFIED**. Nie dodano procesu w tle, timeoutu
+ani mechanizmu anulowania. Nie usunięto danych.
+
+Współdzielony master ma również zintegrowany PR #225 (`551b174c42515b9e897dd9953afec43f5b1eb81f`);
+jego późniejsze źródła nie są częścią powyższego zbudowanego snapshotu.
+Bez replay skryptu, nowego preparation retry, Solve i testów.
+Pozostają trzy grupy odbioru: API/native i ten sam run04; nowa siatka;
+Solve oraz pola/energie/Airbox w UI. Pełny plan F0–F12 pozostaje otwarty.

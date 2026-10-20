@@ -5056,26 +5056,10 @@ def _start(args: argparse.Namespace) -> int:
                         promotion_spec,
                         promoted_current,
                     )
-                try:
-                    _retain_package_backups(
-                        output,
-                        control_root,
-                        _candidate_receipt,
-                        candidate_receipt_bytes,
-                    )
-                except (BackendBuildError, OSError) as error:
-                    # Publication is already durable.  Unknown or corrupt backup
-                    # state is retained and diagnosed; it must never roll back a
-                    # valid current package or delete a direct rollback.
-                    retention_reason = re.sub(r"[^A-Za-z0-9_.:/-]+", "-", str(error)).strip("-")
-                    if not retention_reason:
-                        retention_reason = type(error).__name__
-                    _log_phase(
-                        "retention",
-                        "skipped",
-                        reason=retention_reason[:64],
-                        error=type(error).__name__,
-                    )
+                # Historical rollback validation is maintenance, not a startup
+                # prerequisite. Preserve every backup here; _serve still verifies
+                # the current package before starting the API.
+                _log_phase("retention", "deferred", reason="outside-startup", backups="retained")
             else:
                 _log_phase("retention", "skipped", reason="pending-rotation-journal")
         except (BackendBuildError, OSError) as error:

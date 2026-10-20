@@ -1,28 +1,26 @@
 # Fullmag master — recovery 3806 i poprawki primitive, 20.10.2026
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 20.10.2026, 20:28 UTC
+## Aktualny status wdrożenia — 20.10.2026, 21:09 UTC
 
-Na `master` zakończono merge `b724373654c95ea73ea058738a09bd90cc5e7441`;
-lokalny checkpoint i pełny remote zachowane, bez nowego worktree i bez testów. Równoległe zmiany oraz dane są zachowane.
-Przerwa Git jest zwolniona; kolejne okno capture/sync będzie uzgodnione osobno.
+Build i publikacja pakietu w `fullmag-master` przeszły: źródła
+`d2a4bdfb7a685da587954f1dbb57ea828f8a4e6b`, snapshot
+`fb94f5f75bac756279f92cbdddf5a2561f51f8a1de1dd89406a9a455c10a537a`.
+Backend `c007e2f1e113` pozostaje przed API: synchronicznie sprawdza historyczne
+kopie pakietów podczas retencji. Frontend `31f1035340db` jest healthy na **3198**,
+lecz funkcje wymagające API są niedostępne.
 
-- **Build:** ostatnia kompilacja `cuda-fem-gpu` i walidacja pakietu przeszły,
-  snapshot `76c8eb727e02bc8dfeebed24cbe124555c3c9a11922a14d5d79bb882321147b0`.
-- **Runtime:** backend `3faec05b8835` zakończył się przed spawn API przez odmowę
-  recovery pre-ACK. API/native obecnie niedostępne; frontend działa na porcie **3198**.
-- **Gotowe źródłowo:** projekcja terminalnego runu bez katalogu artefaktów oraz
-  odtworzonego błędu do istniejącego preparation resource. Odbiór runtime pending.
-- **Review i realny podgląd PASS:** producent i walidatory dowodu pre-ACK;
-  dowód opublikowany (exit0); kolejny start czeka na checkpoint Git i integrację remote.
-- **Potwierdzone wcześniej w przeglądarce:** odróżnialne kolory primitive i panel
-  Airbox Visualization. Nie jest to odbiór aktualnego meshu ani pól z Solve.
+W źródłach usunięto opcjonalną retencję z krytycznej ścieżki startu: wszystkie
+rollbacki pozostają, a obowiązkowa walidacja aktualnego pakietu w `_serve`
+pozostaje wymagana. Ta poprawka nie zmienia aktywnego procesu; odbiór nowej
+wersji runtime pozostaje **NOT VERIFIED**. Nie dodano procesu w tle, timeoutu
+ani mechanizmu anulowania. Nie usunięto danych.
 
-Pozostają **3 pilne grupy odbioru**: (1) API/native i odtworzenie tego samego runu,
-(2) nowa siatka, (3) Solve oraz pola/energie/Airbox w UI. Pełny plan F0–F12
-nadal nie jest zamknięty. Nie wysłano replay skryptu, retry preparation ani Solve
-runu04. Szczegóły i granice dowodu: raport recovery §51–54. Poniższy audyt
-z 19.10 i starsze checkpointy pozostają historycznym zapisem swoich źródeł.
+Współdzielony master ma również zintegrowany PR #225 (`551b174c42515b9e897dd9953afec43f5b1eb81f`);
+jego późniejsze źródła nie są częścią powyższego zbudowanego snapshotu.
+Bez replay skryptu, nowego preparation retry, Solve i testów.
+Pozostają trzy grupy odbioru: API/native i ten sam run04; nowa siatka;
+Solve oraz pola/energie/Airbox w UI. Pełny plan F0–F12 pozostaje otwarty.
 <!-- mx3-current-status:end -->
 
 
@@ -1588,3 +1586,27 @@ Przed buildem backend3faec nadal exited/PID0/exit1/non-OOM. C: ma
 run03/04, ich logi/receipty/provenance, wciąż przypięte źródła i ostatni cache
 przyrostowy/pakiety. Nie wykazano ich zbędności i niczego nie usunięto. Ponowna
 ocena możliwa po potwierdzeniu nowego runtime i braku referencji/aktywnych lease.
+
+
+## 59. Publikacja pakietu i blokująca retencja — 20.10.2026, 21:09 UTC
+
+Build i publikacja pakietu w `fullmag-master` przeszły: źródła
+`d2a4bdfb7a685da587954f1dbb57ea828f8a4e6b`, snapshot
+`fb94f5f75bac756279f92cbdddf5a2561f51f8a1de1dd89406a9a455c10a537a`.
+Backend `c007e2f1e113` pozostaje przed API: synchronicznie sprawdza historyczne
+kopie pakietów podczas retencji. Frontend `31f1035340db` jest healthy na **3198**,
+lecz funkcje wymagające API są niedostępne.
+
+W źródłach usunięto opcjonalną retencję z krytycznej ścieżki startu: wszystkie
+rollbacki pozostają, a obowiązkowa walidacja aktualnego pakietu w `_serve`
+pozostaje wymagana. Ta poprawka nie zmienia aktywnego procesu; odbiór nowej
+wersji runtime pozostaje **NOT VERIFIED**. Nie dodano procesu w tle, timeoutu
+ani mechanizmu anulowania. Nie usunięto danych.
+
+Współdzielony master ma również zintegrowany PR #225 (`551b174c42515b9e897dd9953afec43f5b1eb81f`);
+jego późniejsze źródła nie są częścią powyższego zbudowanego snapshotu.
+Bez replay skryptu, nowego preparation retry, Solve i testów.
+Pozostają trzy grupy odbioru: API/native i ten sam run04; nowa siatka;
+Solve oraz pola/energie/Airbox w UI. Pełny plan F0–F12 pozostaje otwarty.
+
+Dowody: Compose backend `c007e2f1e113b82deaf205cc9cf1e2a97d45ed63d5a454e57d911ceb16935d26`; image `sha256:fec961feca1292383edf6fb4104b36c4eb55ca1c0458b6746b57b140822fb978`; start `2026-10-20T20:35:47.067789531Z`. Capture 9143 pliki, 256106 ms; sync 8607 ms; Make exit0, 217249 ms; pakiet 24 artefakty, 2768842996 B, publikacja provenance succeeded. Obserwator nadal aktywny, development operation `53e4c556247a4ef382e25b96467e4916`. PID7 zmieniał FD między plikami backupu `6hqrpujs`; nie jest to dowód API ani meshu. Host RAM 255.874 GiB; Docker 196.568 GiB; backend 8 GiB/4CPU, frontend 16 GiB/4CPU. Limitów nie zmieniono. Aktualny odczyt procesu RSS około 87 MiB, memory.pressure avg10/60/300=0; wcześniejsze Docker memory usage obejmowało także page cache.

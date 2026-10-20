@@ -429,20 +429,27 @@ Szczegóły: [ADR 0049](../adr/0049-native-runtime-owner-control.md),
 
 ### Retencja pakietów developerskich
 
-Decyzja użytkownika z 17.10.2026: kolejne buildy automatycznie usuwają
-zweryfikowane, zastąpione pakiety techniczne. Bieżący pakiet i bezpośrednio
-poprzedni pakiet do rollbacku pozostają. Wiek lub nazwa katalogu nie stanowią
-dowodu zbędności: wymagane są zgodne receipty i łańcuch zakończonych rotacji.
+Korekta z 20.10.2026 odracza automatyczną retencję z decyzji 17.10.2026:
+start zachowuje bieżący pakiet i wszystkie historyczne rollbacki, raportując
+`phase=retention state=deferred`. Pełne hashowanie starych kopii nie blokuje API.
+Obowiązkowa walidacja aktualnego pakietu pozostaje. Każda nowa publikacja może
+dodać pełny backup; obecnie brak limitu liczby kopii i osobnej udostępnionej
+operacji konserwacyjnej. Istniejący preflight mierzy build/cache volume;
+nie gwarantuje miejsca w osobnym package volume. Przed kolejnym buildem
+należy ocenić również miejsce dla pakietów i rollbacków. Szczegóły:
+[ADR 0061](../adr/0061-docker-development-build-and-runtime-container.md#korekta-20102026--retencja-poza-startem-api).
 
-Sprzątanie odbywa się wewnątrz backendu pod blokadą jego cache, po trwałej,
-zweryfikowanej publikacji nowego pakietu. Retired zachowuje tylko receipt i
+Zachowana w źródłach funkcja retencji wymaga blokady cache i trwałej,
+zweryfikowanej publikacji nowego pakietu, lecz nie jest wywoływana przez start.
+Jej kontrakt archiwum retired zachowuje tylko receipt i
 rotację, bez kolejnych kopii pełnego build logu. Zostawia najwyżej 8 archiwów
 i 64 MiB łącznego rozmiaru plików; zachowuje najnowsze według zapisanego
 `retired_at_ns` (dla starszych wpisów kolejność wyznacza czas pliku manifestu).
 Archiwa legacy z logiem są usuwane, jeśli przekraczają ten limit; log jest
 sprawdzany hashem, gdy pozostaje w zachowanym archiwum. Nieznane, niespójne lub
 używane dane pozostają z diagnostyką. Niepowodzenie sprzątania nie unieważnia
-poprawnie opublikowanego pakietu.
+poprawnie opublikowanego pakietu. Limity tej funkcji nie są obecnie egzekwowane
+przez ścieżkę startu; nie usunięto istniejących archiwów ani backupów.
 
 Retencja nie obejmuje cache Cargo/CMake/CUDA, źródeł, sesji, projektów, wyników,
 bazy grupy ani historii rezerwacji. Restart używający aktualnego pakietu nie

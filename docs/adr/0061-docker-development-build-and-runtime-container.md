@@ -244,6 +244,23 @@ Wymaga dowodu retain-current/rollback, ochrony nieudanej publikacji,
 zachowania nieznanych danych oraz rzeczywistego odzyskania miejsca w kontenerze.
 Do wykonania tych bramek automatyczna ścieżka pozostaje **NOT VERIFIED**.
 
+### Korekta 20.10.2026 — retencja poza startem API
+
+Synchroniczna walidacja wszystkich historycznych rollbacków nie jest warunkiem
+uruchomienia opublikowanego pakietu. Zaobserwowany start `fullmag-master`
+ukończył Make i publikację, lecz pozostał w hashowaniu 14 kopii przed `_serve`.
+Ścieżka `start` zachowuje teraz wszystkie kopie i raportuje
+`phase=retention state=deferred reason=outside-startup backups=retained`.
+Obowiązkowe sprawdzenie aktualnego pakietu w `_serve`, rotacja, provenance,
+admission storage oraz reguły właściciela i ponownego Solve pozostają wymagane.
+
+Automatyczne usuwanie starszych pakietów podczas startu jest odroczone.
+Samo istnienie funkcji retencji nie oznacza wdrożonej osobnej operacji
+konserwacyjnej. Nie dodajemy procesu w tle ani nowego mechanizmu anulowania.
+Nie zwolniono miejsca; aktualny pakiet, rollbacki, cache i dane sesji pozostają
+zachowane. Zmiana wymaga nowego obrazu przez właściwy launcher; nie zmienia
+działającego procesu i przed takim uruchomieniem pozostaje **NOT VERIFIED**.
+
 ## Admission storage Windows po przebudowie dev
 
 ADR 0059 pozostaje kontraktem filesystemu, ownera i grantów. Dla live dev host
