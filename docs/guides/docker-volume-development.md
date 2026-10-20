@@ -46,8 +46,30 @@ błędem. Toolchain, obrazy pomocnicze i aplikacja stosują ten sam wybór źró
 Aktywacja kolejnego skryptu odczytuje rzeczywisty port działającej grupy, więc
 nie wymaga ponownego podawania wcześniejszego nadpisania portu.
 
-Zakończ edycje i staging przed startem; nie zmieniaj źródeł do zakończenia
-próby. Migawka odczytuje checkout dwukrotnie i odrzuca niespójne wejście.
+Zakończ edycje przed startem; nie zmieniaj źródeł do zakończenia próby.
+Migawka odczytuje checkout dwukrotnie i odrzuca niespójne wejście.
+
+Nowe, jeszcze nieśledzone pliki można jawnie dodać do migawki bez `git add`:
+
+```powershell
+python -B scripts/docker_dev.py --repo-root $source up --source-root $source --port 3197 `
+  --include-untracked apps/control-room/src/new-module.ts `
+  --include-untracked examples/new-fixture.json
+```
+
+Każda opcja wskazuje dokładną ścieżkę względną do jednego regularnego pliku,
+który w chwili przechwycenia zwraca `git ls-files --others --exclude-standard`.
+Dozwolone są powtórzone opcje; globs, katalogi, ścieżki absolutne, traversal,
+sekrety i pliki administracyjne są odrzucane. Pozostałe nieśledzone pliki nadal
+pozostają wykluczone. Lista z CLI jest zapisywana jako kanoniczne JSON w
+środowisku backendu i wchodzi do digestu Compose; zmiana listy istniejącej grupy
+przechodzi przez zarządzane odtworzenie z wymaganym bezpiecznym drainem. Brak
+opcji przy uzgadnianiu istniejącej grupy zachowuje przypiętą listę; nowa grupa
+bez opcji zaczyna z pustą listą. Jeżeli wybrany plik zostanie później dodany do
+indeksu Git, capture akceptuje go jako już obecny w `files` i nie dubluje go w
+`included_untracked`.
+Programowe przekazanie `[]` jawnie czyści listę; hostowa zmienna środowiskowa
+`FULLMAG_DEV_INCLUDE_UNTRACKED` nie ustala jej wartości.
 
 Port musi być wolny. Wybierz wolny port, jeśli inna instancja już działa.
 `docker-dev-images` przygotowuje wyłącznie obrazy helperów; `docker-dev-build`

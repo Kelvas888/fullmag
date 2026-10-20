@@ -445,6 +445,7 @@ function useFieldMapModuleController() {
     canonicalPlanar,
     canonicalSampleError,
     evidence,
+    evidenceStatus,
     mask,
     meshOverlay,
     meta,
@@ -467,6 +468,7 @@ export default function FieldMapModule() {
     canonicalPlanar,
     canonicalSampleError,
     evidence,
+    evidenceStatus,
     mask,
     meshOverlay,
     meta,
@@ -605,6 +607,15 @@ export default function FieldMapModule() {
             probeScale={renderModel.display.probeScale}
             quantityId={plan.quantityId}
             range={renderModel.range}
+            rangeState={
+              renderModel.range
+                ? evidenceStatus === "ready"
+                  ? "current"
+                  : "stale-compatible"
+                : evidenceStatus === "loading"
+                  ? "pending"
+                  : "unavailable"
+            }
           />
         ) : null}
       </div>

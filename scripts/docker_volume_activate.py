@@ -1234,6 +1234,7 @@ def _retirement_cas_script(
     result_raw: bytes,
     terminal_raw: bytes,
     current_raw: bytes,
+    namespace_registry_sha256: str | None = None,
 ) -> str:
     """Build the bounded no-logger finalizer used after helper absence proof."""
 
@@ -1248,6 +1249,10 @@ def _retirement_cas_script(
         raise ControlOutcomeUnknown(
             "retained retirement active lease belongs to another operation"
         )
+    if (namespace_registry_sha256 is not None
+            and (not isinstance(namespace_registry_sha256, str)
+                 or SHA256_RE.fullmatch(namespace_registry_sha256) is None)):
+        raise BuildControlError("retirement CAS namespace registry digest is invalid")
     root = "/control/activation/attempts/" + operation_id
     active = "/control/active"
     receipt = root + "/receipt.json"
@@ -1264,11 +1269,24 @@ def _retirement_cas_script(
     # All paths are derived from the validated operation token.  Payloads are
     # base64 literals, so shell metacharacters from a JSON record never enter
     # the helper command.
+    if namespace_registry_sha256 is None:
+        admission = (
+            "test ! -L /control/operation.lock; "
+            "exec 9>/control/operation.lock; flock -n 9; "
+        )
+    else:
+        admission = (
+            "test ! -L /control/operation.lock; "
+            "exec 9</registry/operation.lock; flock -n 9; "
+            "test \"$(stat -c '%d:%i' /control/operation.lock)\" = "
+            "\"$(stat -c '%d:%i' /registry/operation.lock)\"; "
+            "test \"$(sha256sum /registry/namespaces/current.json | cut -d ' ' -f 1)\" = "
+            f"'{namespace_registry_sha256}'; "
+        )
     return (
         "umask 027; set -eu; "
-        "test ! -L /control/operation.lock; "
-        "exec 9>/control/operation.lock; flock -n 9; "
-        "test -d /control; test ! -L /control; "
+        + admission
+        + "test -d /control; test ! -L /control; "
         "test -d /control/activation; test ! -L /control/activation; "
         "test -d /control/activation/attempts; test ! -L /control/activation/attempts; "
         f"test -d {shlex.quote(root)}; test ! -L {shlex.quote(root)}; "
@@ -1385,6 +1403,7 @@ def _finalize_retained_retirement(
             result_raw=result_raw,
             terminal_raw=terminal_raw,
             current_raw=current_raw,
+            namespace_registry_sha256=control.namespace_registry_sha256,
         )
         outcome = bounded_capture(control.helper_args(script), data=b"", timeout=90)
         if outcome.returncode:
@@ -1423,6 +1442,7 @@ def _finalize_retained_retirement(
         result_raw=result_raw,
         terminal_raw=terminal_raw,
         current_raw=current_raw,
+        namespace_registry_sha256=control.namespace_registry_sha256,
     )
     outcome = bounded_capture(control.helper_args(script), data=b"", timeout=90)
     if outcome.returncode or (
@@ -1696,6 +1716,7 @@ def activate(args: argparse.Namespace) -> None:
         source_root=str(selected),
         image_id=image,
         backend_container=backend_id,
+        request_id=args.request_id,
     )
 
     from docker_volume_dev import _startup_helper

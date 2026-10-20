@@ -221,6 +221,9 @@ def retirement_receipt_evidence(operation_id, _inputs_sha256):
         written = []
 
         class _Control:
+            namespace = ""
+            namespace_registry_sha256 = None
+
             def write_bytes(self, relative, payload):
                 written.append((relative, payload))
 

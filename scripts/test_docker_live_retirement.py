@@ -588,7 +588,7 @@ class RetirementFinalizeTests(unittest.TestCase):
             result={"state": "retired"}, terminal={"state": "succeeded"})
 
     def test_live_logger_gets_terminal_only_after_result_and_current(self):
-        control = Mock()
+        control = Mock(namespace="", namespace_registry_sha256=None)
         with patch("docker_volume_activation_reconcile._probe_helper_absence", return_value=None), \
              patch.object(activate, "_ensure_control_record") as publish, \
              patch.object(activate, "_wait_retirement_lease_release", return_value=True), \
@@ -600,7 +600,7 @@ class RetirementFinalizeTests(unittest.TestCase):
         shell.assert_not_called()
 
     def test_current_publication_failure_never_exposes_terminal(self):
-        control = Mock()
+        control = Mock(namespace="", namespace_registry_sha256=None)
         with patch("docker_volume_activation_reconcile._probe_helper_absence", return_value=None), \
              patch.object(activate, "_ensure_control_record", side_effect=[None, activate.ControlOutcomeUnknown("injected")]) as publish, \
              patch.object(activate, "_wait_retirement_lease_release") as wait:
@@ -610,7 +610,7 @@ class RetirementFinalizeTests(unittest.TestCase):
         wait.assert_not_called()
 
     def test_missing_logger_with_changed_receipt_never_executes_cas(self):
-        control = Mock()
+        control = Mock(namespace="", namespace_registry_sha256=None)
         with patch("docker_volume_activation_reconcile._probe_helper_absence", return_value={"state": "absent"}), \
              patch.object(activate, "_read_control_bytes", side_effect=[self.operation.encode(), b"changed"]), \
              patch.object(activate, "bounded_capture") as shell:
@@ -662,6 +662,71 @@ class RetirementCasTests(unittest.TestCase):
         replay = self.run_cas()
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertIn(b"ALREADY_FINALIZED\n", replay.stdout)
+
+    def test_namespaced_cas_requires_registry_lock_and_digest(self):
+        with self.assertRaises(activate.BuildControlError):
+            activate._retirement_cas_script(
+                operation_id=self.operation,
+                namespace_registry_sha256="invalid",
+                **self.payloads,
+            )
+
+        registry = Path(self.temp.name) / "registry"
+        (registry / "namespaces").mkdir(parents=True)
+        registry_bytes = b'{"schema":"fullmag.namespace-registry.v1"}\n'
+        (registry / "namespaces" / "current.json").write_bytes(registry_bytes)
+        control_lock = self.root / "operation.lock"
+        control_lock.touch()
+        os.link(control_lock, registry / "operation.lock")
+        digest = hashlib.sha256(registry_bytes).hexdigest()
+        script = activate._retirement_cas_script(
+            operation_id=self.operation,
+            namespace_registry_sha256=digest,
+            **self.payloads,
+        )
+        script = script.replace("/control", str(self.root)).replace("/registry", str(registry))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_complete()
+
+    def test_namespaced_cas_rejects_foreign_registry_lock(self):
+        registry = Path(self.temp.name) / "registry"
+        (registry / "namespaces").mkdir(parents=True)
+        registry_bytes = b'{"schema":"fullmag.namespace-registry.v1"}\n'
+        (registry / "namespaces" / "current.json").write_bytes(registry_bytes)
+        (self.root / "operation.lock").touch()
+        (registry / "operation.lock").touch()
+        digest = hashlib.sha256(registry_bytes).hexdigest()
+        script = activate._retirement_cas_script(
+            operation_id=self.operation,
+            namespace_registry_sha256=digest,
+            **self.payloads,
+        )
+        script = script.replace("/control", str(self.root)).replace("/registry", str(registry))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.root / "active").exists())
+        self.assertFalse((self.attempt / "terminal.json").exists())
+
+    def test_namespaced_cas_rejects_registry_digest_drift(self):
+        registry = Path(self.temp.name) / "registry"
+        (registry / "namespaces").mkdir(parents=True)
+        expected_registry_bytes = b'{"schema":"fullmag.namespace-registry.v1"}\n'
+        (registry / "namespaces" / "current.json").write_bytes(b"drift\n")
+        control_lock = self.root / "operation.lock"
+        control_lock.touch()
+        os.link(control_lock, registry / "operation.lock")
+        digest = hashlib.sha256(expected_registry_bytes).hexdigest()
+        script = activate._retirement_cas_script(
+            operation_id=self.operation,
+            namespace_registry_sha256=digest,
+            **self.payloads,
+        )
+        script = script.replace("/control", str(self.root)).replace("/registry", str(registry))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.root / "active").exists())
+        self.assertFalse((self.attempt / "terminal.json").exists())
 
     def test_partial_records_resume_before_terminal(self):
         (self.attempt / "result.json").write_bytes(self.payloads["result_raw"])
