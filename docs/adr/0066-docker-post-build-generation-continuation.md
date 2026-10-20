@@ -73,6 +73,20 @@ Po przerwaniu między publikacją configu a zapisem consumed ta sama nadal
 aktywna operacja może dokończyć zapis bez drugiej rotacji. Zakończona operacja
 wymaga świeżego kontrolowanego kontekstu, z weryfikacją backupu i profilu.
 
+Jeżeli host odrzuci nowy start jeszcze przed zmianą certyfikatu i publikacją
+Compose/cache, `development/current.json` może wskazywać tę nieudaną próbę.
+Wznowienie zakończonego odtworzenia zachowuje oryginalny development attempt
+jako punkt odniesienia. Dopuszcza wyłącznie kanoniczny terminal
+`failed-confirmed`, dokładnie powiązany z tym samym dowodem odtworzenia,
+źródłami, profilem urządzeń, konfiguracją i pełnym producentem accepted-run.
+Istniejąca projekcja accepted-run w continuation musi odpowiadać temu
+producentowi. Wymagane są pending binding, brak aktywnego lease, consumed,
+Compose oraz artefaktów cache/runtime. Kolejne takie odrzucenie może być
+wznowione tylko z identycznym przypiętym dowodem; stan unknown lub rozpoczęta
+publikacja wymagają osobnej właściwej procedury. Nie cofamy current ani historii.
+Przed nową operacją i pod jej lease pozostają dotychczasowe rewalidacje ownera,
+konfiguracji, certyfikatu, accepted-run i nieobecności starych kontenerów.
+
 ## Zakres, walidacja i wycofanie
 
 Zmiana obejmuje hostowy helper/launcher, runtime guard i regresje. Nie zmienia solverów
