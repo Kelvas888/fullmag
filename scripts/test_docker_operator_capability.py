@@ -69,7 +69,7 @@ class OperatorCapabilityTests(unittest.TestCase):
             self.assertNotIn(entrypoint.OPERATOR_CAPABILITY_ENV, os.environ)
             self.assertNotIn("host-supplied-token-must-not-pass", supplied.values())
 
-    def test_frozen_or_non_backend_modes_do_not_publish_or_forward(self):
+    def test_frozen_or_non_backend_modes_preserve_environment_without_publishing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._control_root(directory)
             with patch.dict(os.environ, {"FULLMAG_DOCKER_ROLE": "frontend"}, clear=True):
