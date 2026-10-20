@@ -37,6 +37,12 @@ import { StartScreen } from "@/modules/start/StartScreen";
 
 const LAUNCH_TILE_NAMES = ["FDM simulation", "FEM simulation", "From template", "Import"];
 
+const UNMATERIALIZED_DOMAIN = {
+  cell_count: 0,
+  discretization: "fem",
+  generation_id: "fem:unmaterialized",
+} as const;
+
 const ACTIVE_IDLE_LIFECYCLE = {
   commandability: "allowed",
   connectivity: "connected",
@@ -207,6 +213,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
       lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     }) as LiveStatusResource);
@@ -283,6 +290,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
       lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
@@ -391,6 +399,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
       lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
@@ -508,6 +517,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
       lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
@@ -576,6 +586,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "other-session@1700000000000",
         session_id: "other-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
       lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;

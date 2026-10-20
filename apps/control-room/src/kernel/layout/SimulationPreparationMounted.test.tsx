@@ -532,7 +532,9 @@ describe("mounted simulation preparation UI", () => {
     expect(findButton(dom.document.body, "Copy full diagnostic report")).toBeTruthy();
     const fullReport = findElement(
       dom.document.body,
-      (element) => element.tagName === "DETAILS",
+      (element) =>
+        element.tagName === "DETAILS" &&
+        element.textContent.includes("Full diagnostic report"),
       "full diagnostic report",
     );
     expect(fullReport.hasAttribute("open")).toBe(false);
@@ -1127,6 +1129,11 @@ function statusFixture(
   } = {},
 ): LiveStatusResource {
   return {
+    domain: {
+      cell_count: 0,
+      discretization: "fem",
+      generation_id: "fem:unmaterialized",
+    },
     resources: {
       simulation_preparation_revision: patch.preparationRevision ?? 7,
     },
