@@ -726,7 +726,12 @@ fn publish_archive(
 ) -> Result<(LiveRetirementProof, Vec<u8>)> {
     ensure_archive_root(archive_root)?;
     let expected_pins = document_pins_for_archive(&documents)?;
-    let destination = archive_root.join(&proof.operation_id);
+    let archive_directory =
+        fullmag_session::repository_path::checked_path(archive_root, ARCHIVE_ROOT)?;
+    let destination = fullmag_session::repository_path::checked_path(
+        &archive_directory,
+        &proof.operation_id,
+    )?;
     if let Some((existing, bytes)) = read_archive_at(archive_root, &proof.operation_id)? {
         validate_same_proof_identity(&existing, &proof)?;
         if existing.documents != expected_pins {
@@ -734,7 +739,10 @@ fn publish_archive(
         }
         return Ok((existing, bytes));
     }
-    let staging = archive_root.join(format!(".{}.staging", proof.operation_id));
+    let staging = fullmag_session::repository_path::checked_path(
+        &archive_directory,
+        &format!(".{}.staging", proof.operation_id),
+    )?;
     if fs::symlink_metadata(&staging).is_ok() {
         bail!("retirement staging directory already exists; publication outcome is unknown");
     }
