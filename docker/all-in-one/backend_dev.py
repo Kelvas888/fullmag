@@ -2470,14 +2470,20 @@ def _rollback_package_rotation(
         target = candidate / name
         if not source.exists() and not source.is_symlink():
             if tolerate_completed and (target.exists() or target.is_symlink()):
+                try:
+                    _rotation_identity_map(candidate, [name], "completed candidate rollback")
+                except (BackendBuildError, OSError) as error:
+                    errors.append(str(error))
                 continue
+            errors.append(f"candidate rollback source is missing: {name}")
             continue
         if target.exists() or target.is_symlink():
             errors.append(f"candidate rollback destination already exists: {name}")
             continue
         try:
-            os.rename(source, target)
-        except OSError as error:
+            _rotation_identity_map(output, [name], "candidate rollback source")
+            _rename_package_child(output, candidate, name, "candidate rollback")
+        except (BackendBuildError, OSError) as error:
             errors.append(f"candidate rollback failed for {name}: {error}")
     if backup is not None:
         for name in old_names:
@@ -2485,6 +2491,10 @@ def _rollback_package_rotation(
             target = output / name
             if not source.exists() and not source.is_symlink():
                 if tolerate_completed and (target.exists() or target.is_symlink()):
+                    try:
+                        _rotation_identity_map(output, [name], "completed old package rollback")
+                    except (BackendBuildError, OSError) as error:
+                        errors.append(str(error))
                     continue
                 errors.append(f"backup rollback source is missing: {name}")
                 continue
@@ -2492,8 +2502,9 @@ def _rollback_package_rotation(
                 errors.append(f"old package rollback destination already exists: {name}")
                 continue
             try:
-                os.rename(source, target)
-            except OSError as error:
+                _rotation_identity_map(backup, [name], "old package rollback source")
+                _rename_package_child(backup, output, name, "old package rollback")
+            except (BackendBuildError, OSError) as error:
                 errors.append(f"old package rollback failed for {name}: {error}")
     for directory, label in (
         (output, "backend package output directory after rollback"),

@@ -2747,6 +2747,26 @@ class BackendPackageTests(unittest.TestCase):
             self.assertTrue(log_a.is_file())
             self.assertTrue(log_b.is_file())
 
+    def test_rotation_rollback_reports_missing_or_linked_payload(self):
+        for linked in (False, True):
+            with self.subTest(linked=linked), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                package, build_root, control, candidate, previous, candidate_bytes = self._ready_rotation_fixture(
+                    root, ".backend-package-candidate-unsafe-rollback"
+                )
+                rotation = backend._rotate_package(package, candidate, control, previous[2], previous[1], candidate_bytes)
+                retained = root / "detached-bin"
+                (package / "bin").rename(retained)
+                if linked:
+                    (package / "bin").symlink_to(retained, target_is_directory=True)
+                errors = backend._rollback_package_rotation(rotation)
+                self.assertTrue(errors)
+                self.assertTrue(any("bin" in error for error in errors))
+                self.assertTrue((retained / "fullmag-bin").is_file())
+                self.assertTrue((control / backend.PACKAGE_ROTATION_JOURNAL_NAME).is_file())
+                if linked:
+                    self.assertTrue((package / "bin").is_symlink())
+
     def test_rotation_rollback_fsyncs_all_mutated_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             package, build_root, control, candidate, previous, candidate_bytes = self._ready_rotation_fixture(
