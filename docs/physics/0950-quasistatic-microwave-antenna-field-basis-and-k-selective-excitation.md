@@ -8232,6 +8232,98 @@ nieznane analizy lub pola są odrzucane zamiast pomijane. Reader
 w bieżącym stage przez `resolved_solved_antenna_drive_is_active`; nie zastępuje
 to walidacji accepted basis, rzeczywistych monitorów ani kwalifikacji runtime.
 
+(antenna-sushruth-finite-prism-reference)=
+### Wzorzec skończonych przewodników GSG przed pierwszym solve
+
+Niezależny wzorzec dotyczy prostych pasków przykładu
+examples/fem_antenna_sushruth_2020_gsg.py (modułowa konfiguracja study).
+Nie jest solverem Fullmaga ani odtworzeniem odpowiedzi magnetycznej publikacji.
+Przekrój 200 nm × 90 nm, szczelina 250 nm i odsunięcie 30 nm odpowiadają
+nominalnym parametrom wybranego przykładu. Długość urządzenia 20 µm,
+doprowadzenia po 2 µm, przewodność 3.5e7 S/m i prąd signal 1 mA pozostają
+jawnymi założeniami przykładu. Wzorzec obejmuje pełne 24 µm modelowanych
+przewodników, bez zasilania poza elektrodami.
+
+Stały przekrój i przewodność, izolowane ściany boczne oraz ekwipotencjalne
+pełne elektrody z zadanym prądem dają stałe J i liniowe V, osobno w każdej
+rozłącznej gałęzi. Prądy gałęzi to +1, −0.5, −0.5 mA w osi world y.
+Porównuje się gradient i różnicę potencjałów, nie absolutne V różnych gałęzi.
+
+```{math}
+:label: antenna-gsg-uniform-reference
+J_b=\frac{I_b}{wt},\qquad
+\frac{\partial V_b}{\partial y}=-\frac{J_b}{\sigma},\qquad
+V_b(-L/2)-V_b(L/2)=\frac{I_bL}{\sigma wt}.
+```
+
+| Dokładny symbol | Znaczenie | SI |
+|---|---|---|
+| $b$ | indeks gałęzi | $1$ |
+| $I_b$ | podpisany prąd gałęzi | $\mathrm A$ |
+| $J_b$ | gęstość prądu gałęzi | $\mathrm{A\,m^{-2}}$ |
+| $V_b$ | potencjał gałęzi | $\mathrm V$ |
+| $w,t,L$ | szerokość, grubość i pełna długość | $\mathrm m$ |
+| $\sigma$ | jednorodna przewodność | $\mathrm{S\,m^{-1}}$ |
+| $y$ | współrzędna wzdłuż prądu | $\mathrm m$ |
+
+Pole korzysta z wyprowadzenia całki po długości wcześniejszego fixed-fixture
+oracle, lecz granice przekroju i długości są jawne. rectangular_prism_field
+liczy prąd w lokalnej osi x. Dla GSG stosujemy właściwy obrót local x → world y,
+local y → −world x, local z → world z. Punkt lokalny to
+(world y, −world x, world z), a pole wraca jako (−H_local_y, H_local_x, H_local_z).
+Nie stosujemy odbicia osi do pseudowektora pola. Całka po przekroju to
+złożony Simpson; suma obejmuje wszystkie trzy przewodniki.
+Prawo superpozycji i warunek pełnego prądu solenoidalnego:
+[MIT, Electromagnetic Fields and Energy, rozdział 8](https://web.mit.edu/6.013_book/www/chapter8/8.html).
+Ucięta domena daje częściowy wkład, a nie zakwalifikowane pole pełnego obwodu.
+
+| Python | Typ | Domyślnie | SI | Walidacja | Znaczenie | Backend | ProblemIR |
+|---|---|---|---|---|---|---|---|
+| rectangular_prism_field.position_m | Sequence[float] | required | $\mathrm m$ | 3 skończone liczby rzeczywiste; punkt poza zamkniętą warstwą z źródła | punkt lokalny obserwacji | niezależny Python CPU; bez backendu Fullmaga | brak serializacji do ProblemIR |
+| rectangular_prism_field.lower_m | Sequence[float] | required | $\mathrm m$ | 3 skończone liczby rzeczywiste; upper > lower w każdej osi | dolne granice pryzmatu | niezależny Python CPU; bez backendu Fullmaga | brak serializacji do ProblemIR |
+| rectangular_prism_field.upper_m | Sequence[float] | required | $\mathrm m$ | 3 skończone liczby rzeczywiste; upper > lower w każdej osi | górne granice pryzmatu | niezależny Python CPU; bez backendu Fullmaga | brak serializacji do ProblemIR |
+| rectangular_prism_field.current_density_apm2 | float | required | $\mathrm{A\,m^{-2}}$ | skończona liczba ze znakiem; bool odrzucany | stały prąd lokalny x | niezależny Python CPU; bez backendu Fullmaga | brak serializacji do ProblemIR |
+| rectangular_prism_field.subdivisions | int | required | $1$ | dokładny int: 8,16,32,64,128,256; bool odrzucany | podziały Simpsona w obu osiach przekroju | niezależny Python CPU; bez backendu Fullmaga | brak serializacji do ProblemIR |
+| gsg_field.position_m | Sequence[float] | required | $\mathrm m$ | 3 skończone liczby rzeczywiste; z poza warstwą źródła; bool odrzucany | punkt world xyz | niezależny Python CPU; bez backendu Fullmaga | brak serializacji do ProblemIR |
+| gsg_field.subdivisions | int | 128 | $1$ | dokładny int: 8,16,32,64,128,256; bool odrzucany | podziały kwadratury każdego paska | niezależny Python CPU; bez backendu Fullmaga | brak serializacji do ProblemIR |
+
+reference() nie przyjmuje parametrów; zwraca 41 punktów od x=−2 µm do
++2 µm przy y=0 i z=−5 nm, oczekiwane J i gradienty V oraz parametry źródła.
+To własna siatka walidacyjna, nie pomiary publikacji. JSON zachowuje H w A/m,
+bez mnożenia przez μ0.
+
+```python
+# %% Niezależny wzorzec, bez uruchamiania Fullmaga
+import sys
+sys.path.insert(0, "scripts")
+from reference_sushruth_2020_gsg_current import gsg_field
+# %% Pole pod środkiem signal
+h = gsg_field((0.0, 0.0, -5e-9))
+assert h[0] < 0.0 and h[1] == 0.0
+```
+
+Przed odbiorem należy potwierdzić zgodność rzeczywistego wejścia i wykonać
+osobne zbieżności kwadratury oraz siatki. Kontrole wzorca: niezależna
+adaptacyjna całka 2D, znaki i symetria, niezmienność wcześniejszego fixture
+oraz niezależna całka objętościowa 3D. Różnica kolejnych poziomów nie jest
+ścisłym ograniczeniem błędu. Wzorzec nie obejmuje wnętrza/ściany przewodnika,
+taperów, RF, reakcji magnetyzacji ani pominiętego obwodu. Nie daje prawa
+do promocji inspection_only do bazy, FFT źródła lub wymuszenia LLG.
+
+Dla FDM CPU, FDM GPU, FEM CPU i FEM GPU skrypt ma status not-applicable jako
+realizacja backendu: jest niezależnym wzorcem. Przyszłe porównanie przykładu
+dotyczy FEM CPU double; pozostałe lanes nie otrzymują kwalifikacji.
+Publiczny DSL/ProblemIR, planner, sesje i round-trip pozostają bez zmian.
+Wynik techniczny zapisujemy w wolumenie Docker z hashami źródeł;
+nie jest artefaktem zaakceptowanego runu.
+
+| Kontrakt / równanie | Ścieżka + symbol | Dowód / zakres |
+|---|---|---|
+| Wkład pryzmatu | scripts/antenna_current_source_oracle.py + rectangular_prism_field | analityczna całka długości i Simpson przekroju; niezależny wzorzec |
+| GSG i normalizacja J/V | scripts/reference_sushruth_2020_gsg_current.py + reference, gsg_field | stałe przykładu, bez fit i solve Fullmaga |
+| Regresje | scripts/test_reference_sushruth_2020_gsg_current.py + test_gsg_matches_adaptive_reference_and_refines | zgodność przykładu, niezależna kwadratura i symetrie; nie native qualification |
+
+
 (antenna-scientific-bibliography)=
 ## 14. References
 

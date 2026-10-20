@@ -1072,6 +1072,48 @@
       "latex": "$\\widetilde h_{\\perp,b},W_{\\perp},b$",
       "meaning": "zespolona amplituda integral_si, suma jej mocy oraz indeks $b=x,y,z$",
       "si_unit": "odpowiednio $\\mathrm m$, $\\mathrm{m^2}$ i $1$"
+    },
+    {
+      "id": "gsg_branch",
+      "latex": "b",
+      "meaning": "indeks gałęzi",
+      "si_unit": "1"
+    },
+    {
+      "id": "gsg_current",
+      "latex": "I_b",
+      "meaning": "podpisany prąd gałęzi",
+      "si_unit": "\\mathrm A"
+    },
+    {
+      "id": "gsg_density",
+      "latex": "J_b",
+      "meaning": "gęstość prądu gałęzi",
+      "si_unit": "\\mathrm{A\\,m^{-2}}"
+    },
+    {
+      "id": "gsg_potential",
+      "latex": "V_b",
+      "meaning": "potencjał gałęzi",
+      "si_unit": "\\mathrm V"
+    },
+    {
+      "id": "gsg_sizes",
+      "latex": "w,t,L",
+      "meaning": "szerokość, grubość i pełna długość",
+      "si_unit": "\\mathrm m"
+    },
+    {
+      "id": "gsg_conductivity",
+      "latex": "\\sigma",
+      "meaning": "jednorodna przewodność",
+      "si_unit": "\\mathrm{S\\,m^{-1}}"
+    },
+    {
+      "id": "gsg_axial",
+      "latex": "y",
+      "meaning": "współrzędna wzdłuż prądu",
+      "si_unit": "\\mathrm m"
     }
   ],
   "equations": [
@@ -1284,7 +1326,9 @@
       ],
       "sources": [
         "antenna-current-source-fixture-field",
-        "antenna-current-source-fixture-oracle-contract"
+        "antenna-current-source-fixture-oracle-contract",
+        "antenna-finite-prism-field",
+        "antenna-gsg-fixed-field"
       ]
     },
     {
@@ -1299,7 +1343,9 @@
       "sources": [
         "antenna-current-source-fixture-field",
         "antenna-current-source-fixture-oracle-contract",
-        "antenna-current-source-fixture-cubature"
+        "antenna-current-source-fixture-cubature",
+        "antenna-finite-prism-field",
+        "antenna-gsg-fixed-field"
       ]
     },
     {
@@ -1829,6 +1875,22 @@
       "sources": [
         "antenna-transverse-receipt-contract",
         "antenna-transverse-projector"
+      ]
+    },
+    {
+      "id": "antenna-gsg-uniform-reference",
+      "symbols": [
+        "gsg_branch",
+        "gsg_current",
+        "gsg_density",
+        "gsg_potential",
+        "gsg_sizes",
+        "gsg_conductivity",
+        "gsg_axial"
+      ],
+      "sources": [
+        "antenna-gsg-fixed-reference",
+        "antenna-gsg-fixed-reference-tests"
       ]
     }
   ],
@@ -5678,6 +5740,30 @@
       "symbol": "validate_antenna_equilibrium_dependencies",
       "responsibility": "Kontrola rzeczywistej akcji widma, jednoznacznego requestu, accepted_equilibrium i jednego wcześniejszego Relax; nie kwalifikuje targetu, materiałów ani eligibility backendu.",
       "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-prism-field",
+      "path": "scripts/antenna_current_source_oracle.py",
+      "symbol": "rectangular_prism_field",
+      "responsibility": "Niezależne całkowanie skończonego pryzmatu, bez kwalifikacji backendu."
+    },
+    {
+      "id": "antenna-gsg-fixed-reference",
+      "path": "scripts/reference_sushruth_2020_gsg_current.py",
+      "symbol": "reference",
+      "responsibility": "Jawne J, gradient V i profil H skończonego nominalnego GSG; nie wynik Fullmaga."
+    },
+    {
+      "id": "antenna-gsg-fixed-field",
+      "path": "scripts/reference_sushruth_2020_gsg_current.py",
+      "symbol": "gsg_field",
+      "responsibility": "Właściwy obrót i suma trzech modelowanych przewodników wraz z doprowadzeniami."
+    },
+    {
+      "id": "antenna-gsg-fixed-reference-tests",
+      "path": "scripts/test_reference_sushruth_2020_gsg_current.py",
+      "symbol": "test_gsg_matches_adaptive_reference_and_refines",
+      "responsibility": "Niezależna kwadratura i symetrie oraz zgodność parametrów przykładu."
     }
   ],
   "public_api": {
@@ -6451,6 +6537,76 @@
         "meaning": "pin zawartości assetu i receiptu",
         "backend_support": "source-only FEM CPU; other lanes unsupported",
         "problem_ir": "antenna_spectrum_requests[].equilibrium_ref.content_digest"
+      },
+      {
+        "python": "rectangular_prism_field.position_m",
+        "type": "Sequence[float]",
+        "default": "required",
+        "si_unit": "\\mathrm m",
+        "validation": "3 skończone liczby rzeczywiste; punkt poza zamkniętą warstwą z źródła",
+        "meaning": "punkt lokalny obserwacji",
+        "backend_support": "niezależny Python CPU; bez backendu Fullmaga",
+        "problem_ir": "brak serializacji do ProblemIR"
+      },
+      {
+        "python": "rectangular_prism_field.lower_m",
+        "type": "Sequence[float]",
+        "default": "required",
+        "si_unit": "\\mathrm m",
+        "validation": "3 skończone liczby rzeczywiste; upper > lower w każdej osi",
+        "meaning": "dolne granice pryzmatu",
+        "backend_support": "niezależny Python CPU; bez backendu Fullmaga",
+        "problem_ir": "brak serializacji do ProblemIR"
+      },
+      {
+        "python": "rectangular_prism_field.upper_m",
+        "type": "Sequence[float]",
+        "default": "required",
+        "si_unit": "\\mathrm m",
+        "validation": "3 skończone liczby rzeczywiste; upper > lower w każdej osi",
+        "meaning": "górne granice pryzmatu",
+        "backend_support": "niezależny Python CPU; bez backendu Fullmaga",
+        "problem_ir": "brak serializacji do ProblemIR"
+      },
+      {
+        "python": "rectangular_prism_field.current_density_apm2",
+        "type": "float",
+        "default": "required",
+        "si_unit": "\\mathrm{A\\,m^{-2}}",
+        "validation": "skończona liczba ze znakiem; bool odrzucany",
+        "meaning": "stały prąd lokalny x",
+        "backend_support": "niezależny Python CPU; bez backendu Fullmaga",
+        "problem_ir": "brak serializacji do ProblemIR"
+      },
+      {
+        "python": "rectangular_prism_field.subdivisions",
+        "type": "int",
+        "default": "required",
+        "si_unit": "1",
+        "validation": "dokładny int: 8,16,32,64,128,256; bool odrzucany",
+        "meaning": "podziały Simpsona w obu osiach przekroju",
+        "backend_support": "niezależny Python CPU; bez backendu Fullmaga",
+        "problem_ir": "brak serializacji do ProblemIR"
+      },
+      {
+        "python": "gsg_field.position_m",
+        "type": "Sequence[float]",
+        "default": "required",
+        "si_unit": "\\mathrm m",
+        "validation": "3 skończone liczby rzeczywiste; z poza warstwą źródła; bool odrzucany",
+        "meaning": "punkt world xyz",
+        "backend_support": "niezależny Python CPU; bez backendu Fullmaga",
+        "problem_ir": "brak serializacji do ProblemIR"
+      },
+      {
+        "python": "gsg_field.subdivisions",
+        "type": "int",
+        "default": "128",
+        "si_unit": "1",
+        "validation": "dokładny int: 8,16,32,64,128,256; bool odrzucany",
+        "meaning": "podziały kwadratury każdego paska",
+        "backend_support": "niezależny Python CPU; bez backendu Fullmaga",
+        "problem_ir": "brak serializacji do ProblemIR"
       }
     ]
   }
