@@ -1,6 +1,12 @@
 # Architektura i kontrakty finalnego planu Fullmag
 
-Status: **PROPOSED**. To specyfikacja docelowa, nie dokumentacja istniejącego SDK. Nazwy nowych typów i zasobów oznaczają proponowane kontrakty. Rejestr zgodności z istniejącymi ADR: [05](05-dowody-i-adr.md). Niniejszy dokument scala K01–K18 [kontraktów wejściowych](../02-kontrakty.md), zachowując ich zakres i wprowadzając rozstrzygnięcia poniżej.
+Status: **architektura docelowa, częściowo wdrożona**. Dokument opisuje target, a nie kompletną dokumentację istniejącego SDK. Nowe typy i zasoby bez potwierdzonego właściciela pozostają proponowanymi kontraktami. Rejestr bieżących dowodów i relacji z ADR: [05](05-dowody-i-adr.md); aktualny reaudyt źródeł: [08](08-reaudyt-master-2026-10-20.md); status etapów: [06](06-status-realizacji.md). Niniejszy dokument scala pełny zakres K01–K18 [kontraktów wejściowych](../02-kontrakty.md); poniższe kierunki zachowują tę granicę.
+
+### Snapshot źródeł — `master@42d92610312871d591db16a5b60a8f7a6d6339b5`, 20.10.2026
+
+W repo istnieje crate `crates/fullmag-application` z `ProjectApplication` i kolejnymi slice'ami, m.in. lifecycle dokumentu oraz rozwijaniem independent batches. To częściowy postęp w kierunku targetu, nie dowód kompletnego application boundary ani wykonania runtime. Statyczny inventory wygenerowanego OpenAPI wskazuje **307 unikalnych ścieżek / 371 operacji path+method**, w tym **253 ścieżki / 308 operacji `sessions/current`**. `audit_refactor_p0.py --check` rozpoznał 371 handlerów, 0 nierozpoznanych handlerów/konsumentów, 2 router-only i 0 OpenAPI-only; jest to wynik heurystycznego przeglądu źródeł, nie zgodności live API.
+
+Dokumentowe use cases Create/Open bez `RuntimeSession` istnieją źródłowo. Główny flow tworzenia pustej symulacji nadal wiąże authoring z utworzoną sesją; sama sesja nie oznacza uruchomienia solvera. Kontrakt 04 §3 pozostaje: Open/Save/read nie wykonują solve, co samo w sobie nie zakazuje jawnego derived compute. Pełny authoring definicji projektu niezależny od wykonania pozostaje celem, a nie wnioskiem z istnienia crate'a. Reaudyt 20.10 nie uruchamiał buildów, testów, browser smoke, solve ani kwalifikacji naukowej/release.
 
 ## 1. Granice produktu i kodu
 
@@ -23,13 +29,13 @@ flowchart TD
 
 Projekt CAE jest dokumentem użytkownika. Repozytorium źródeł/build storage jest infrastrukturą hosta. `ProjectId` identyfikuje dokument CAE; `worktree_id` identyfikuje źródła builda. Żaden z tych identyfikatorów nie zastępuje drugiego. Nie zmieniamy `FULLMAG_PROJECT_STORAGE_ROOT`; ścieżki wyprowadza istniejący resolver z konfiguracji hosta. Eksport użytkownika jest jawną operacją, nie nowym domyślnym katalogiem buildów.
 
-Powstaje jedna biblioteka `fullmag-application`, bez zależności od HTTP, React i pętli numerycznych. Jej wewnętrzni właściciele to use cases definicji, przyjęcie komend, koordynacja wykonania i publikacja katalogu. Implementacje storage i workerów są podłączane przez porty. Nie przenosimy całego `orchestrator.rs` do `ProjectManager`.
+Docelowo jedna biblioteka `fullmag-application`, bez zależności od HTTP, React i pętli numerycznych, skupia use cases definicji, przyjęcie komend, koordynację wykonania i publikację katalogu. Crate już istnieje, lecz kompletność tych granic i ich konsumentów pozostaje częściowa. Implementacje storage i workerów są podłączane przez porty. Nie przenosimy całego `orchestrator.rs` do `ProjectManager`.
 
 | Właściciel | Zakres | Granica |
 |---|---|---|
 | `fullmag-authoring` | Project/Model/Component, parametry, geometria, selekcje, przypisania, semantic commands | Nie uruchamia solve przy edycji. |
 | `fullmag-ir` / `fullmag-plan` | Problem fizyczny, walidacja, plan, capabilities | Jedna semantyka dla Python i UI; bez stanu docków. |
-| `fullmag-application` — nowy | Create/Open/Save/Submit/Cancel, coordinator, katalog | Jeden writer danego agregatu; trwały ACK. |
+| `fullmag-application` — istniejący, częściowo wdrożony | Create/Open/Save/Submit/Cancel, coordinator, katalog | Jeden writer danego agregatu; trwały ACK. |
 | `fullmag-session` | CAS, working store, manifesty, profile `.fms`, recovery i checkpoint | Ewolucja istniejącego formatu; oryginały zachowane. |
 | `fullmag-runner` | Przypięte wejścia, wywołania backendów, obserwacja, provenance | Nie czyta mutable current jako wejścia runu. |
 | `backends/fem` | MFEM/hypre/libCEED; numeryka CPU/GPU | Właściciele operatorów i workflows poza `Context`/bridge. |
@@ -79,6 +85,10 @@ ParameterContext rozstrzyga scope `project → model/component → study overrid
 Oryginalna jednostka wyrażenia należy do definicji. Preferencja wyświetlania może być zapisana w metadanych prezentacji parametru i nadpisana per ViewId; nie wchodzi do fingerprintu numerycznego. `H` w A/m oraz `B` w T są różnymi wielkościami. Projekcja `μ₀H` wymaga jawnej etykiety i konwersji, nie podmiany jednostki.
 
 Niekompletny model jest zapisywalny. Niedokończony tekst `sin(` jest draftem formularza, nie poprawnym AST. Save zachowuje definicję i osobny recovery draftów. Compute najpierw uzgadnia właściwe drafty, oczekuje ACK i dopiero przypina rewizję. Alternatywne „Compute last committed version” musi pokazać pominięte zmiany. Close dokumentu nie jest Cancel runu.
+
+### Dokument, pusta symulacja i pełny authoring — rozdzielne wyniki
+
+Źródła potwierdzają use cases dokumentu i endpointy Create/Open projektu bez wymogu `RuntimeSession`; istniejący test lifecycle również opisuje roundtrip bez runtime, ale sam test nie był wykonywany w reaudicie 20.10. Osobny UI flow `NewProblemDialog` tworzy najpierw sesję, a potem projekt wiązany z tą sesją; przy takim bindingu `ProjectDocumentController.save` pobiera scenę z sesji. To potwierdza session-bound authoring pustej symulacji, lecz nie dowodzi, że solver został uruchomiony. Z kolei obecność runtime-free document path nie dowodzi pełnego edytora projektu niezależnego od runtime. Kryteria CAE-01/02/03 pozostają w mocy. Szczegółowe granice źródeł i brak nowego runtime dowodu: [reaudyt 08, D05](08-reaudyt-master-2026-10-20.md).
 
 ## 4. Geometria, dyskretyzacja i selektywne unieważnianie
 
@@ -166,7 +176,7 @@ DerivedValueDefinition określa źródło, operator, miarę całkowania/support,
 
 Rozszerzenie projektu jest migracją istniejącego resource-first API. Przed zmianą publicznej powierzchni aktualizujemy ADR-0011, spec i odpowiednie instrukcje wskazujące dziś `/sessions/current`. OpenAPI, generowane typy/transport, fasada, hooks, event envelopes i codecs zmieniają się razem.
 
-Najpierw wprowadzamy wewnętrzny `ResolvedRequestContext`: scope jest przypięty podczas przyjęcia żądania i przekazywany przez wszystkie await/publikacje. Następnie migrujemy rodziny do docelowych IDs. Nie wymagamy kompletnej pośredniej kopii 239 unikalnych ścieżek `sessions/current` pod `/sessions/{id}`: stworzyłaby drugi cutover bez dowodu korzyści. Liczby 293/288 oznaczają wszystkie/current adnotacje handlerów, a 246/239 wszystkie/current unikalne klucze `paths` OpenAPI. Wąski adapter identyfikowanej sesji jest dopuszczalny, jeśli pilotaż wykaże niezbędnego klienta; ma właściciela i kryterium usunięcia.
+Najpierw wprowadzamy wewnętrzny `ResolvedRequestContext`: scope jest przypięty podczas przyjęcia żądania i przekazywany przez wszystkie await/publikacje. Następnie migrujemy rodziny do docelowych IDs. Reaudyt 20.10 policzył w wygenerowanym OpenAPI **307 unikalnych ścieżek / 371 operacji path+method**, z czego **253 ścieżki / 308 operacji** zawierają `sessions/current`. Checker P0 rozpoznał 371 handlerów, 0 nierozpoznanych handlerów/konsumentów, 2 router-only i 0 OpenAPI-only; szczegóły, fingerprint schematu i ograniczenia heurystyki zawiera [rejestr 05](05-dowody-i-adr.md). Nie wymagamy kompletnej pośredniej kopii wszystkich tych ścieżek pod `/sessions/{id}`: stworzyłaby drugi cutover bez dowodu korzyści. Wąski adapter identyfikowanej sesji jest dopuszczalny, jeśli pilotaż wykaże niezbędnego klienta; ma właściciela i kryterium usunięcia.
 
 HTTP jest autorytatywnym źródłem snapshotów/komend/binary data. WS przekazuje invalidacje i lifecycle events; gap/reconnect prowadzi do scoped reconciliation. GET nie uruchamia solve. Zakres odpowiedzi historycznej nie zależy od aktualnego wyboru UI.
 

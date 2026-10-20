@@ -1,5 +1,8 @@
 # P1 — projekt niezależny od runtime
 
+> **Dziennik historycznych przyrostów.** Statusy, wyniki i polecenia poniżej dotyczą źródeł oraz warunków wskazanych w poszczególnych checkpointach. Bieżący obraz mastera z 20.10.2026: [tabela implementacji i testów](../06-status-realizacji.md), [plan dalszych prac](../03-plan-refaktoryzacji.md). Dawny PASS nie jest automatycznie kwalifikacją nowego HEAD; aktualne zasady wykonania określa AGENTS.md.
+
+
 ## Checkpoint odbioru — 21.09.2026
 
 Cel pozostaje nieukończony, ale wcześniejsza blokada testów została usunięta jawną zgodą użytkownika. P1-A i P1-B są zaimplementowane, P1-D ma runtime-free wejścia Open dla CLI, Python binding i desktop, a P1-C ma wspólny lifecycle dokumentu New/Open/Save/Close przez fasadę API, browserowy wybór i pobieranie `.fms`, hostowy adapter Tauri Save, komendowy przycisk ikonowy do chowania Inspektora oraz zarządzany active-run reconnect z rzeczywistym FDM CPU. Produkcyjny shell zachowuje zamontowany workspace po pierwszym przygotowaniu; browserowy smoke potwierdził no-session shell, aktywny canvas WebGL oraz zachowanie tego samego workspace i canvasu po reconnect. Pozostają pełna kwalifikacja runtime/release oraz fizyczny desktopowy smoke. Zmiany pozostają lokalnie na `masterze`, HEAD `14c8e73a6f3c55f4fc080835a6156f2a4db8f111`.

@@ -1601,8 +1601,9 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
         elif current_start != started_at:
             raise BuildControlError("Backend incarnation changed during build observation")
         if not actual["State"]["Running"]:
-            logs = docker_text("logs", "--tail", "200", backend_id, combined=True)
-            control.write(operation["root"] + "/backend-failure-log.json", {"log": logs})
+            logs = docker_text("logs", "--since", started_at, "--tail", "200", backend_id, combined=True)
+            control.write(operation["root"] + "/backend-failure-log.json",
+                          {"started_at": started_at, "log": logs})
             raise BuildControlError("Backend exited during build; logs and volumes retained: " + logs[-4000:])
         if not handoff_seen:
             logs = docker_text("logs", "--since", started_at, "--tail", "200", backend_id, combined=True)
@@ -3112,9 +3113,28 @@ def _native_failed_stop_recovery_context(
             owner=terminal_owner,
             selected_source=previous_inputs["source_root"],
         )
+    capture_failure_sidecar = None
     if isinstance(journal.get("container_state"), Mapping):
         if removed_container_proof is None:
-            _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+            try:
+                _validate_stopped_backend(control, backend_id, image_id, journal=journal)
+            except BuildControlError as stopped_error:
+                if namespace_attestation is not None:
+                    raise
+                from docker_volume_capture_failure_reconcile import validate_capture_failure_sidecar
+
+                try:
+                    capture_failure_sidecar = validate_capture_failure_sidecar(
+                        control,
+                        previous,
+                        backend_id=backend_id,
+                        image_id=image_id,
+                    )
+                except BuildControlError as sidecar_error:
+                    raise BuildControlError(
+                        "Stopped backend differs from the native stop journal and has no valid "
+                        "capture-only incarnation sidecar: " + str(sidecar_error)
+                    ) from stopped_error
         else:
             if not isinstance(removed_container_proof, Mapping):
                 raise BuildControlError("Removed-container recreation proof is malformed")
@@ -3171,6 +3191,24 @@ def _native_failed_stop_recovery_context(
     if namespace_attestation is not None:
         metadata["namespace_attestation_path"] = namespace_relative
         metadata["namespace_attestation_sha256"] = hashlib.sha256(namespace_raw).hexdigest()
+    if capture_failure_sidecar is not None:
+        metadata["capture_failure_sidecar_path"] = capture_failure_sidecar["path"]
+        metadata["capture_failure_sidecar_sha256"] = capture_failure_sidecar["sha256"]
+        metadata["capture_failure_operation_attempt"] = capture_failure_sidecar["operation_attempt"]
+        metadata["capture_failure_operation_terminal_sha256"] = (
+            capture_failure_sidecar["operation_terminal_sha256"]
+        )
+        metadata["capture_failure_store_probe_sha256"] = capture_failure_sidecar["store_probe_sha256"]
+        metadata["capture_failure_origin"] = capture_failure_sidecar["origin"]
+        metadata["capture_failure_launch_origin"] = capture_failure_sidecar["launch_origin"]
+        metadata["capture_failure_backend_started_at"] = capture_failure_sidecar["backend_started_at"]
+        metadata["capture_failure_backend_finished_at"] = capture_failure_sidecar["backend_finished_at"]
+        metadata["capture_failure_historical_resume_attempt"] = (
+            capture_failure_sidecar["historical_resume_attempt"]
+        )
+        metadata["capture_failure_host_ledger_raw_sha256_observations"] = (
+            capture_failure_sidecar["host_ledger_raw_sha256_observations"]
+        )
     return {
         "previous_config_sha256": previous_config_sha256,
         "native_restart_metadata": metadata,
@@ -3199,10 +3237,20 @@ def _retained_recovery_context(
                if key.startswith("FULLMAG_CONTAINER_RECOVERY_")}
     metadata = previous.get("container_recovery")
     if not carried and metadata is None:
-        return _native_failed_stop_recovery_context(
+        native = _native_failed_stop_recovery_context(
             control, previous, backend_id=backend_id or previous.get("backend_container"),
             fresh_state=fresh_state, removed_container_proof=removed_container_proof,
-        ) or {}
+        )
+        if native is not None:
+            return native
+        if removed_container_proof is None:
+            from docker_volume_pre_ack_retry import retained_pre_ack_context
+            retry = retained_pre_ack_context(
+                control, previous, document, backend_id or previous.get("backend_container"), fresh_state=fresh_state
+            )
+            if retry is not None:
+                return retry
+        return {}
     if fresh_state:
         raise BuildControlError("Pending container recovery must retain its original session storage")
     if set(carried) != {AUTHORIZATION_ENV, AUTHORIZATION_SHA_ENV} or not isinstance(metadata, Mapping):

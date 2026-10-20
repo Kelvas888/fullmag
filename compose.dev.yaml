@@ -242,8 +242,9 @@ services:
     init: true
     user: "65532:65532"
     read_only: true
-    cpus: 2
-    mem_limit: 6g
+    cpus: 4
+    # Leave room for Next plus a separate lint/typecheck process and native allocations.
+    mem_limit: 16g
     pids_limit: 512
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -255,6 +256,9 @@ services:
     environment:
       FULLMAG_DOCKER_ROLE: frontend
       FULLMAG_DOCKER_FRONTEND: dev
+      # Also applies to tools invoked through docker exec; the Next launcher
+      # independently pins the same heap budget in its sanitized environment.
+      NODE_OPTIONS: --max-old-space-size=6144
       FULLMAG_API_PROXY_TARGET: http://backend:8081
       FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-5000}
       FULLMAG_SOURCE_ROOT: ${FULLMAG_SOURCE_ROOT:?Select the Windows source checkout}

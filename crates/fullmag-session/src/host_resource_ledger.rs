@@ -3681,6 +3681,41 @@ impl HostResourceLedger {
         })
     }
 
+    /// Observe one validated immutable snapshot without acquiring the writer.
+    ///
+    /// This is candidate-discovery evidence only, not admission, publication
+    /// durability confirmation, or a quiescence certificate. Every mutation
+    /// must acquire its normal guards and revalidate the current document.
+    /// Published ledger references point to already-published immutable CAS
+    /// payloads and release proofs. Reject concurrent pointer/marker changes
+    /// rather than combining observations from different publications.
+    pub fn read_observation_snapshot(&self) -> Result<HostResourceLedgerSnapshot> {
+        let marker = read_bounded_regular_file(
+            &self.root,
+            HOST_RESOURCE_LEDGER_MARKER_FILE,
+            MAX_MARKER_BYTES,
+        )?;
+        let bytes =
+            read_bounded_regular_file(&self.root, HOST_RESOURCE_LEDGER_FILE, MAX_LEDGER_BYTES)?;
+        let document = self.validate_document_snapshot(&marker, &bytes)?;
+        let current_marker = read_bounded_regular_file(
+            &self.root,
+            HOST_RESOURCE_LEDGER_MARKER_FILE,
+            MAX_MARKER_BYTES,
+        )?;
+        let current_bytes =
+            read_bounded_regular_file(&self.root, HOST_RESOURCE_LEDGER_FILE, MAX_LEDGER_BYTES)?;
+        if marker != current_marker || bytes != current_bytes {
+            return Err(anyhow::Error::new(crate::writer::StoreWriterBusy)
+                .context("host ledger observation changed during validation"));
+        }
+        Ok(HostResourceLedgerSnapshot {
+            policy: document.policy,
+            reservations: document.reservations,
+            node_policy: document.node_policy,
+        })
+    }
+
     /// Run a controlled runtime-recovery operation while the complete host
     /// ledger is quiescent.  The host writer remains held through `operation`,
     /// so a direct ledger caller cannot publish a reservation or acquire the
@@ -5036,17 +5071,25 @@ impl HostResourceLedger {
             MAX_MARKER_BYTES,
         )
         .context("host resource ledger initialization marker is missing or invalid")?;
-        let marker: HostResourceLedgerMarker = serde_json::from_slice(&marker_bytes)
+        let bytes =
+            read_bounded_regular_file(&self.root, HOST_RESOURCE_LEDGER_FILE, MAX_LEDGER_BYTES)
+                .context("host resource ledger snapshot is missing or invalid")?;
+        self.validate_document_snapshot(&marker_bytes, &bytes)
+    }
+
+    fn validate_document_snapshot(
+        &self,
+        marker_bytes: &[u8],
+        bytes: &[u8],
+    ) -> Result<HostResourceLedgerDocument> {
+        let marker: HostResourceLedgerMarker = serde_json::from_slice(marker_bytes)
             .context("corrupt host resource ledger initialization marker; refusing admission")?;
         if marker.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V1
             || marker.policy_sha256 != policy_sha256(&self.policy)?
         {
             bail!("host resource ledger initialization marker differs from configured policy");
         }
-        let bytes =
-            read_bounded_regular_file(&self.root, HOST_RESOURCE_LEDGER_FILE, MAX_LEDGER_BYTES)
-                .context("host resource ledger snapshot is missing or invalid")?;
-        let document: HostResourceLedgerDocument = serde_json::from_slice(&bytes)
+        let document: HostResourceLedgerDocument = serde_json::from_slice(bytes)
             .context("corrupt host resource ledger snapshot; refusing admission")?;
         validate_ledger_document(&document, &self.root)?;
         if document.policy != self.policy {

@@ -499,8 +499,14 @@ def serve():
     accepted_runtime = None
     try:
         service._atomic_json(receipt_path, receipt, "process tree receipt")
+        api_startup_timeout = (
+            service.ACCEPTED_REATTACH_API_STARTUP_TIMEOUT_SECONDS
+            if accepted_preflight is not None
+            else None
+        )
         handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"],
-                               configuration=configuration)
+                               configuration=configuration,
+                               api_startup_timeout=api_startup_timeout)
         # Persist the authenticated owner before optional startup activation.
         # Activation may reject or fail after service.start has pinned the
         # native owner; the terminal drain receipt must retain that identity.
