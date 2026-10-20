@@ -612,13 +612,14 @@ pub(crate) async fn prepare_current_live_scene_with_transition(
                 .load(std::sync::atomic::Ordering::Acquire),
         )?;
         let (metadata, fem_mesh) = prepared_domain_publication(snapshot, &read_model)?;
+        let session_status = preparation_session_status(snapshot);
         let mut prepared_snapshot = snapshot.clone();
         crate::session::apply_current_live_snapshot(
             &mut prepared_snapshot,
             CurrentLiveSnapshotRequest {
                 session_id: context.session_id.clone(),
                 session: None,
-                session_status: Some("awaiting_command".into()),
+                session_status,
                 metadata: Some(metadata),
                 mesh_workspace: Some(mesh_workspace),
                 stage_execution: None,
@@ -887,6 +888,30 @@ pub(crate) async fn publish_accepted_frontier_preparation(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+/// Session status published with a preparation receipt. Preparation of a new
+/// stage frontier may be published while the accepted run is executing; it
+/// must not flip that session back to `awaiting_command` (the projector would
+/// only restore `running` on its next tick, causing status/control flicker).
+/// Before execution the established `awaiting_command` publication remains.
+fn preparation_session_status(snapshot: &SessionStateResponse) -> Option<String> {
+    let executing = |status: &str| {
+        matches!(
+            status,
+            "running" | "paused" | "breaking" | "queued" | "dispatched" | "claimed"
+        )
+    };
+    if executing(&snapshot.session.status)
+        || snapshot
+            .run
+            .as_ref()
+            .is_some_and(|run| executing(&run.status))
+    {
+        None
+    } else {
+        Some("awaiting_command".into())
     }
 }
 
@@ -1189,13 +1214,14 @@ pub(crate) async fn publish_accepted_task_preparation_with_transition(
     }
     ensure_preparation_run_is_active(snapshot)?;
     let (metadata, fem_mesh) = prepared_domain_publication(snapshot, &read_model)?;
+    let session_status = preparation_session_status(snapshot);
     let mut prepared_snapshot = snapshot.clone();
     crate::session::apply_current_live_snapshot(
         &mut prepared_snapshot,
         CurrentLiveSnapshotRequest {
             session_id: context.session_id.clone(),
             session: None,
-            session_status: Some("awaiting_command".into()),
+            session_status,
             metadata: Some(metadata),
             mesh_workspace: Some(mesh_workspace),
             stage_execution: None,

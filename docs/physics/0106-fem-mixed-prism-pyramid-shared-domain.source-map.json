@@ -556,7 +556,7 @@
       "id": "mixed-certificate-v2-volume-reduction",
       "path": "crates/fullmag-ir/src/mixed_certificate_v2.rs",
       "symbol": "CompensatedSum",
-      "responsibility": "Accumulate v2 shared-domain, magnetic-body, and closed-faceted volume evidence with fixed-order Neumaier-compensated binary64 arithmetic after global-ordinal ordering.",
+      "responsibility": "Accumulate v2 shared-domain, magnetic-body, and closed-faceted volume evidence with fixed-order Neumaier-compensated binary64 arithmetic after global-ordinal ordering; independently compare SI volumes, claimed-ratio consistency and the mesh-derived 1e-8 physical volume-error limit.",
       "evidence_status": "source_implementation_under_review_runtime_not_verified"
     },
     {

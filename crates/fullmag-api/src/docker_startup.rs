@@ -1203,12 +1203,18 @@ fn build_startup_snapshot(
     };
     snapshot.scene_document = Some(loaded.scene.clone());
     snapshot.metadata = Some(json!({
+        // The placeholder carries the complete request identity from its first
+        // publication so an identical replay during preparation can be
+        // recognised as the same activation instead of a source change.
         STARTUP_METADATA_KEY: {
             "request": request,
+            "request_id": request.request_id,
+            "source_sha256": loaded.source.sha256,
             "status": "activating",
             "runtime_metadata": loaded.runtime,
             "output_storage_binding": loaded.output_storage_binding,
             "source_size_bytes": loaded.source.size_bytes,
+            "scene_revision": loaded.scene.revision,
         }
     }));
     snapshot.runtime_status = build_runtime_status_view("activating");
@@ -1265,6 +1271,27 @@ fn replay_or_reject(
     if stored_size != source.size_bytes as u64 {
         return Err(ApiError::conflict(
             "Docker startup source size changed on replay",
+        ));
+    }
+    if record.get("status").and_then(Value::as_str) == Some("activating") {
+        // The same request still owns the temporary placeholder: preparation
+        // has not committed an accepted RunIntent yet. Report a typed,
+        // retryable in-progress state and never start a second activation.
+        // HTTP 409 keeps the host helper on its outcome-unknown path.
+        if existing.session.session_id != startup_session_id(request, source)
+            || existing.run.is_some()
+        {
+            return Err(ApiError::conflict_with_code(
+                "docker_startup_request_conflict",
+                "the activating Docker startup placeholder does not match this request identity",
+            ));
+        }
+        return Err(ApiError::conflict_with_code(
+            "docker_startup_activation_in_progress",
+            format!(
+                "Docker startup request `{}` is still preparing in session `{}`; no second run was started",
+                request.request_id, existing.session.session_id
+            ),
         ));
     }
     let run_id = record

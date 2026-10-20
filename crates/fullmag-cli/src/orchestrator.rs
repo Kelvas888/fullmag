@@ -1890,6 +1890,7 @@ fn apply_live_step_update_to_workspace_state(
         scalar_row_due: update.scalar_row_due,
         terminal_field_snapshot: update.terminal_field_snapshot,
         finished: update.finished,
+        magnetization_carrier: None,
     };
     state.live_state = live_state_manifest_from_update(update);
     if disable_live_magnetization {
@@ -12117,6 +12118,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     scalar_row_due: true,
                     terminal_field_snapshot: false,
                     finished: is_final_step && is_session_final_stage,
+                    magnetization_carrier: None,
                 };
                 if live_cadence.should_publish(&update) {
                     live_workspace.update(|state| {
@@ -14188,6 +14190,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         scalar_row_due: true,
                         terminal_field_snapshot: false,
                         finished: false,
+                        magnetization_carrier: None,
                     };
                     if live_cadence.should_publish(&update) {
                         live_workspace.update(|state| {
@@ -15749,6 +15752,7 @@ mod tests {
             scalar_row_due: false,
             terminal_field_snapshot: false,
             finished: false,
+            magnetization_carrier: None,
         }
     }
 
@@ -17486,6 +17490,7 @@ mod tests {
             scalar_row_due: false,
             terminal_field_snapshot: false,
             finished: false,
+            magnetization_carrier: None,
         };
 
         let message = format_stage_heartbeat_message(
