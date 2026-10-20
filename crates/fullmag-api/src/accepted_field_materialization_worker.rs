@@ -173,6 +173,7 @@ pub(crate) fn prepare_and_publish(
     })();
     let (batch, error) = match evaluated {
         Ok(batch) => (Some(batch), None),
+        Err(error) if is_store_writer_busy(&error) => return Err(error),
         Err(error) => (None, Some(format!("{error:#}").chars().take(2048).collect())),
     };
     let mut record = MaterializationRecord { schema_version: SCHEMA.into(),
@@ -194,7 +195,7 @@ pub(crate) fn prepare_and_publish(
             "accepted quantity receipt omitted: observation storage budget exhausted");
         return Ok(());
     }
-    let object_ref = store.cas().put(&bytes)?;
+    let object_ref = fullmag_runtime_control::retry_store_writer_busy(|| store.cas().put(&bytes))?;
     let lease = store.read_resource_lease(step.claim.run_id.as_str(),
         step.claim.lease.resource_id.as_str(), step.claim.lease.lease_token.as_str())?
         .context("materialization resource lease missing")?;
@@ -326,7 +327,7 @@ fn publish_observation_object(
 ) -> Result<String> {
     *used = used.checked_add(bytes.len() as u64).context("observation storage size overflow")?;
     if *used > budget { bail!("binary observations exceed the remaining storage lease"); }
-    let hash = store.cas().put(bytes)?;
+    let hash = fullmag_runtime_control::retry_store_writer_busy(|| store.cas().put(bytes))?;
     if !entries.iter().any(|entry| entry.content_sha256 == hash) {
         entries.push(FmsArtifactCatalogEntry {
             artifact_id: format!("accepted-field-{}", fullmag_session::canonical_json_sha256(
@@ -340,6 +341,12 @@ fn publish_observation_object(
         });
     }
     Ok(hash)
+}
+
+fn is_store_writer_busy(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
 }
 
 pub(crate) fn read_record(store: &SessionStore, entry: &FmsArtifactCatalogEntry) -> Result<MaterializationRecord> {
