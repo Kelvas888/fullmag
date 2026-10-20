@@ -1351,95 +1351,23 @@ mod tests {
         let store = fullmag_session::SessionStore::open(directory.path()).unwrap();
         let active = lease(fullmag_session::FmsResourceLeaseState::Active);
         write_solver_lease(&store, &active);
-        let listed = store.list_resource_leases_for_run("run").unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].state, fullmag_session::FmsResourceLeaseState::Active);
+        let listed = store
+            .read_resource_lease("run", "cpu", "lease")
+            .unwrap()
+            .expect("durable resource lease");
+        assert_eq!(listed.state, fullmag_session::FmsResourceLeaseState::Active);
         let mut released = lease(fullmag_session::FmsResourceLeaseState::Released);
         released.released_at = Some(chrono::Utc::now());
         write_solver_lease(&store, &released);
-        let listed = store.list_resource_leases_for_run("run").unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].state, fullmag_session::FmsResourceLeaseState::Released);
+        let listed = store
+            .read_resource_lease("run", "cpu", "lease")
+            .unwrap()
+            .expect("durable resource lease");
+        assert_eq!(listed.state, fullmag_session::FmsResourceLeaseState::Released);
     }
 
-    #[test]
-    fn terminal_evidence_fingerprint_reads_a_real_terminal_store() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = fullmag_session::SessionStore::open(directory.path()).unwrap();
-        store
-            .commit_run_intent(&fullmag_session::FmsRunIntent::new(
-                "run",
-                "intent",
-                serde_json::json!({"run_id": "run"}),
-            ))
-            .unwrap();
-        store
-            .commit_run_catalog(&fullmag_session::FmsRunCatalog {
-                schema_version: fullmag_session::types::FMS_RUN_CATALOG_SCHEMA.to_string(),
-                run_id: "run".to_string(),
-                revision: 1,
-                updated_at: chrono::Utc::now(),
-                tasks: vec![fullmag_session::FmsTaskCatalogEntry {
-                    task_id: "task".to_string(),
-                    input_fingerprint: digest(b'i'),
-                    lifecycle: fullmag_session::FmsTaskLifecycle::Succeeded,
-                    readiness: fullmag_session::FmsTaskReadiness::Ready,
-                    observation: None,
-                    attempt_id: None,
-                    ownership_epoch: None,
-                    resolved_input_fingerprint: None,
-                    artifact_ids: Vec::new(),
-                    resource_id: None,
-                    coordinator_watermark: None,
-                    coordinator_genesis: None,
-                }],
-            })
-            .unwrap();
-        let first = store.terminal_run_evidence_sha256("run").unwrap();
-        let second = store.terminal_run_evidence_sha256("run").unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn terminal_evidence_rejects_a_live_solver_lease_in_the_real_store() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = fullmag_session::SessionStore::open(directory.path()).unwrap();
-        store
-            .commit_run_intent(&fullmag_session::FmsRunIntent::new(
-                "run",
-                "intent",
-                serde_json::json!({"run_id": "run"}),
-            ))
-            .unwrap();
-        store
-            .commit_run_catalog(&fullmag_session::FmsRunCatalog {
-                schema_version: fullmag_session::types::FMS_RUN_CATALOG_SCHEMA.to_string(),
-                run_id: "run".to_string(),
-                revision: 1,
-                updated_at: chrono::Utc::now(),
-                tasks: vec![fullmag_session::FmsTaskCatalogEntry {
-                    task_id: "task".to_string(),
-                    input_fingerprint: digest(b'i'),
-                    lifecycle: fullmag_session::FmsTaskLifecycle::Succeeded,
-                    readiness: fullmag_session::FmsTaskReadiness::Ready,
-                    observation: None,
-                    attempt_id: None,
-                    ownership_epoch: None,
-                    resolved_input_fingerprint: None,
-                    artifact_ids: Vec::new(),
-                    resource_id: None,
-                    coordinator_watermark: None,
-                    coordinator_genesis: None,
-                }],
-            })
-            .unwrap();
-        write_solver_lease(
-            &store,
-            &lease(fullmag_session::FmsResourceLeaseState::Active),
-        );
-        assert!(store.terminal_run_evidence_sha256("run").is_err());
-    }
-
+    // Terminal-evidence admission and lease-history cases are covered by the
+    // fullmag-session store tests through the locked canonical reader.
     fn host_reservation(
         store_id: &str,
         state: fullmag_session::host_resource_ledger::HostResourceReservationState,
