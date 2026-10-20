@@ -40,6 +40,15 @@ class PostBuildContinuationTests(unittest.TestCase):
     source_root = "/workspace/fullmag"
     attempt = "d" * 32
 
+    def _service_labels(self, service: str) -> dict[str, str]:
+        return {
+            "com.docker.compose.project": _Control.project,
+            "com.docker.compose.service": service,
+            "org.fullmag.source.project-id": "fullmag-project",
+            "org.fullmag.source.worktree-id": "continuation",
+            "org.fullmag.source.checkout-kind": "worktree",
+        }
+
     def setUp(self) -> None:
         self.config_raw = _raw({"schema_version": "runtime_service_config.v2",
                                 "host_execution": {"runtime_generation_sha256": "b" * 64}})
@@ -172,7 +181,13 @@ class PostBuildContinuationTests(unittest.TestCase):
             "backend_container": self.current_backend,
             "inputs": {"source_root": self.source_root, "image_id": self.image},
         }
-        self.document = {"name": _Control.project, "services": {"backend": {}}}
+        self.document = {
+            "name": _Control.project,
+            "services": {
+                "backend": {"image": self.image},
+                "frontend": {"image": self.image},
+            },
+        }
         self.actual = {
             "Id": self.current_backend,
             "Image": self.image,
@@ -262,7 +277,8 @@ class PostBuildContinuationTests(unittest.TestCase):
             "backend": self.actual,
             "frontend": {
                 "Id": frontend,
-                "Image": self.image,
+                "Image": self.document["services"]["frontend"]["image"],
+                "Config": {"Labels": self._service_labels("frontend")},
                 "State": {"Running": False},
             },
         }
@@ -641,6 +657,47 @@ class PostBuildContinuationTests(unittest.TestCase):
             runtime_config_sha256=self.config_sha,
         )
         self.assertEqual(checked, metadata)
+
+    def test_new_lease_accepts_live_frontend_with_distinct_pinned_image(self):
+        frontend_image = "sha256:" + "e" * 64
+        self.document["services"]["frontend"]["image"] = frontend_image
+        metadata = self._bound()
+        retained_path = metadata["recreate_operation"]["retained_relative"]
+        retained = json.loads(self.recreation_records[retained_path])
+        retained["frontend"]["Image"] = frontend_image
+        retained["frontend"]["State"]["Running"] = True
+        self.recreation_records[retained_path] = _raw(retained)
+        metadata["recreate_operation"]["retained_sha256"] = hashlib.sha256(
+            self.recreation_records[retained_path]
+        ).hexdigest()
+        control = _Control({**self.records, **self.recreation_records})
+        checked = continuation.validate_post_build_lease_evidence(
+            control,
+            metadata,
+            certificate_evidence=self.certificate,
+            accepted_context=self.accepted_context,
+            runtime_config_sha256=self.config_sha,
+        )
+        self.assertEqual(checked, metadata)
+
+    def test_new_lease_rejects_frontend_source_identity_drift(self):
+        metadata = self._bound()
+        retained_path = metadata["recreate_operation"]["retained_relative"]
+        retained = json.loads(self.recreation_records[retained_path])
+        retained["frontend"]["Config"]["Labels"]["org.fullmag.source.worktree-id"] = "foreign"
+        records = {**self.records, **self.recreation_records}
+        records[retained_path] = _raw(retained)
+        metadata["recreate_operation"]["retained_sha256"] = hashlib.sha256(
+            records[retained_path]
+        ).hexdigest()
+        with self.assertRaises(continuation.PostBuildGenerationError):
+            continuation.validate_post_build_lease_evidence(
+                _Control(records),
+                metadata,
+                certificate_evidence=self.certificate,
+                accepted_context=self.accepted_context,
+                runtime_config_sha256=self.config_sha,
+            )
 
     def test_new_lease_rejects_completed_recreation_terminal_drift(self):
         metadata = self._bound()

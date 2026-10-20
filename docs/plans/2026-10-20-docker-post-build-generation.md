@@ -84,3 +84,26 @@ blokujące fast-forward; własny worktree wskazuje wynikowy commit.
 Pełny odbiór z tabeli powyżej, w tym stabilny backend, nadal pozostaje
 **NOT VERIFIED**. Te wyniki potwierdzają implementację i testy granic odzyskiwania,
 nie wykonanie symulacji ani naprawę całego wdrożenia.
+
+### Próba kontrolowanego odtworzenia i korekta snapshotu
+
+Operacja `71f3f0c690124241807d91fd73ffc0fa` zakończyła stop/rm obu starych
+usług. Nowy start `abaf8645e2ca429584e143d91be3315a` został odrzucony przed
+zmianą certyfikatu, cache i ledgera: walidator błędnie wymagał zatrzymanego
+frontendu w snapshotcie zapisanym jeszcze przed stop/rm. Poprawka wiąże obraz
+każdej usługi z prior Compose i jej labels; frontend może wtedy jeszcze działać.
+Potwierdzenie zakończenia nadal pochodzi z terminal receipt oraz sprawdzenia
+nieobecności obu dokładnych ID. Backend w historycznym snapshotcie musi być
+zatrzymany.
+
+Po korekcie 72/72 testy helpera/startu/pre-admission/skryptu przeszły:
+`verification/interpreted-attempts/75dd2cf98f2a436e8b83042e259714b2.json`.
+Rzeczywiste retained evidence przeszło kontrolę readonly bez utrzymywania lease
+ani mutacji runtime: `verification/post-build-preflight/17eb74135a894337ab6713c216b71a13.json`.
+Nie oznacza to autoryzacji nowego startu. Testowe adaptery katalogu tymczasowego
+i stałych continuation zostały uzupełnione po wynikach CI.
+
+Obecnie ta grupa nie ma uruchomionych usług aplikacji. Standardowy resume
+wymaga analizy późniejszej, odrzuconej przed startem próby `abaf...`; nie wolno
+ręcznie cofać wskaźnika current ani usuwać historii. Sesja, owner, konfiguracja,
+cache i wolumeny pozostały zachowane. Odbiór runtime pozostaje **NOT VERIFIED**.

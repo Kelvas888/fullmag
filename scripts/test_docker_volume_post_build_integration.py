@@ -263,6 +263,9 @@ class PostBuildStartIntegrationTests(unittest.TestCase):
                     "project_id": "fullmag-project", "worktree_id": "continuation",
                     "checkout_kind": "worktree",
                 }),
+                # Host filesystem admission has its own contract suite. This
+                # caller fixture deliberately uses runner-local temporary data.
+                mock.patch.object(dev, "validate_host_path"),
                 mock.patch.object(dev, "BuildControl", return_value=control),
                 mock.patch.object(dev, "build_volume_toolchain", side_effect=lambda *_args: events.append("buildkit") or toolchain),
                 mock.patch.object(dev, "build_volume_runtime_images", return_value={"backend": {"image_id": NEW_IMAGE}}),

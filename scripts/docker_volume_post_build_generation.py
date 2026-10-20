@@ -572,6 +572,14 @@ def _validate_recreate_operation(value: object) -> dict[str, object]:
     return dict(value)
 
 
+def _compose_service_image(document: Mapping[str, object], service: str) -> str:
+    services = document.get("services") if isinstance(document, Mapping) else None
+    config = services.get(service) if isinstance(services, Mapping) else None
+    if not isinstance(config, Mapping):
+        raise _fail("prior development Compose has no " + service + " service")
+    return _image(config.get("image"), "prior development " + service + " image")
+
+
 def _recreate_operation_from_proof(proof: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(proof, Mapping):
         raise _fail("recreation proof is not an object")
@@ -1146,6 +1154,24 @@ def validate_post_build_lease_evidence(
         ]
     ):
         raise _fail("completed recreation terminal changed or is not exact")
+    prior_root = "development/attempts/" + supplied["operation_id"]
+    _prior_terminal, prior_terminal_raw = read_canonical(
+        prior_root + "/terminal.json", "prior development terminal"
+    )
+    prior_compose, prior_compose_raw = read_canonical(
+        prior_root + "/compose.json", "prior development Compose record"
+    )
+    if (
+        hashlib.sha256(prior_terminal_raw).hexdigest() != recreate["prior_terminal_sha256"]
+        or hashlib.sha256(prior_compose_raw).hexdigest() != recreate["prior_compose_sha256"]
+    ):
+        raise _fail("completed recreation prior development pins changed")
+    expected_images = {
+        service: _compose_service_image(prior_compose, service)
+        for service in ("backend", "frontend")
+    }
+    if expected_images["backend"] != recreate["image_id"]:
+        raise _fail("prior development backend image differs from recreation pin")
     snapshot, snapshot_raw = read_canonical(
         recreate["retained_relative"], "completed recreation retained snapshot"
     )
@@ -1158,28 +1184,28 @@ def validate_post_build_lease_evidence(
         ("frontend", recreate["frontend_container"]),
     ):
         observed = snapshot[service]
+        config = observed.get("Config") if isinstance(observed, Mapping) else None
+        labels = config.get("Labels") if isinstance(config, Mapping) else None
         state = observed.get("State") if isinstance(observed, Mapping) else None
+        source_identity = supplied["source_identity"]
         if (
             not isinstance(observed, Mapping)
             or observed.get("Id") != identifier
-            or observed.get("Image") != recreate["image_id"]
+            or observed.get("Image") != expected_images[service]
+            or not isinstance(labels, Mapping)
+            or labels.get("com.docker.compose.project") != supplied["compose_project"]
+            or labels.get("com.docker.compose.service") != service
+            or labels.get("org.fullmag.source.project-id") != source_identity["project_id"]
+            or labels.get("org.fullmag.source.worktree-id") != source_identity["worktree_id"]
+            or labels.get("org.fullmag.source.checkout-kind") != source_identity["checkout_kind"]
             or not isinstance(state, Mapping)
-            or state.get("Running") is not False
+            or type(state.get("Running")) is not bool
         ):
             raise _fail("completed recreation retained snapshot differs: " + service)
-
-    prior_root = "development/attempts/" + supplied["operation_id"]
-    _prior_terminal, prior_terminal_raw = read_canonical(
-        prior_root + "/terminal.json", "prior development terminal"
-    )
-    _prior_compose, prior_compose_raw = read_canonical(
-        prior_root + "/compose.json", "prior development Compose record"
-    )
-    if (
-        hashlib.sha256(prior_terminal_raw).hexdigest() != recreate["prior_terminal_sha256"]
-        or hashlib.sha256(prior_compose_raw).hexdigest() != recreate["prior_compose_sha256"]
-    ):
-        raise _fail("completed recreation prior development pins changed")
+        if service == "backend" and (
+            state.get("Running") is not False or state.get("Status") != "exited"
+        ):
+            raise _fail("completed recreation retained backend is not stopped")
 
     original, original_raw = read_canonical(
         supplied["original_stop"]["relative"], "original stop archive"
