@@ -127,12 +127,13 @@ lub narzędziem diagnostycznym. Start uruchamia dwie stałe usługi; backend wyk
 przed API. Otwórz `http://127.0.0.1:3197/workspace`. Brak `--script` oznacza Home,
 a nie automatyczny wybór dawnej sesji.
 
-Ponowne `just docker-dev` używa już działającej grupy, jeśli oba serwisy są
-zdrowe i zgadzają się checkout, konfiguracja, polityka GPU oraz port. Bez skryptu
-kończy się bez restartu i kompilacji; z `--script` aktywuje plik istniejącą
-ścieżką w tej grupie. Zatrzymane, niezdrowe lub niejednoznaczne serwisy wymagają
-jawnego recovery zamiast automatycznego odtworzenia. Zmiany backendu nadal
-wymagają jego kontrolowanego restartu opisanego poniżej.
+Ponowne `just docker-dev` uzgadnia istniejącą grupę przez `ensure_up`.
+Przy zgodnych źródłach, obrazach i konfiguracji wykorzystuje działające usługi
+bez restartu; podany skrypt aktywuje istniejącą ścieżką w tej grupie. Zmiana
+źródeł uruchamia kontrolowany restart, a zatrzymana grupa jest wznawiana na
+podstawie zachowanych receiptów. Niezdrowy backend, nieznany owner lub
+niejednoznaczne zasoby nie są przerywane ani przejmowane; wymagają rozstrzygnięcia
+stanu. Szczegóły uzgadniania opisuje [przewodnik DEV](docker-volume-development.md).
 
 Po uruchomieniu tej grupy skrypt można aktywować bez ręcznego przepisywania
 attemptu i digestu konfiguracji:

@@ -14508,13 +14508,32 @@ export interface components {
             name?: string | null;
             /** @description Save profile: "compact", "solved", "resume", "archive". */
             profile: components["schemas"]["SaveProfile"];
+            /**
+             * @description Persist the archive beside the admitted source script instead of only
+             *     returning its base64 representation.  Omitted requests preserve the
+             *     historical export/download behavior.
+             */
+            save_to_source?: boolean | null;
+            /**
+             * @description Explicit `.fms` output path.  It is used only when `save_to_source` is
+             *     true and must resolve inside the configured output mapping.
+             */
+            target_path?: string | null;
             /** @description Optional UI workspace snapshot provided by frontend. */
             ui_state?: unknown;
         };
         SessionExportResponse: {
-            /** @description Base64-encoded `.fms` file content. */
+            /** @description File name written when `save_to_source` was enabled. */
+            filename?: string | null;
+            /**
+             * @description Base64-encoded `.fms` file content for browser exports.  This remains
+             *     a required compatibility field and is empty when `saved_path` is
+             *     present; source-save consumers should use the persisted path instead.
+             */
             fms_base64: string;
             profile: components["schemas"]["SaveProfile"];
+            /** @description Path written when `save_to_source` was enabled. */
+            saved_path?: string | null;
             session_id: string;
             size_bytes: number;
         };
