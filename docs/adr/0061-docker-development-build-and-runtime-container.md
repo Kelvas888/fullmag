@@ -261,6 +261,23 @@ Nie zwolniono miejsca; aktualny pakiet, rollbacki, cache i dane sesji pozostają
 zachowane. Zmiana wymaga nowego obrazu przez właściwy launcher; nie zmienia
 działającego procesu i przed takim uruchomieniem pozostaje **NOT VERIFIED**.
 
+### Budżet zasobów aktywnego startu — 20.10.2026
+
+Na jawne polecenie zwiększenia limitów backend może otrzymać większy budżet
+RAM i CPU bez odtwarzania kontenera. Operacja korzysta z aktywnej blokady
+development i własnego podległego mutexu; nie przejmuje ani nie zwalnia
+globalnego ownera. Sprawdza dokładny kontener, obraz, źródła i inkarnację,
+a krótkie zatrzymanie przypiętego procesu startowego zapobiega wyścigowi
+z delegacją cgroup. Request tej bramki dla bieżącego procesu wyklucza zmianę.
+
+Dozwolone są wyłącznie zwiększenia ograniczonych limitów przed API, z zachowaniem
+dotychczasowego zapasu swapu. Nieznany wynik nie jest automatycznie ponawiany;
+zachowywany jest osobny intent i receipt. Profil kolejnych startów jest związany
+z surowym hashem receipt, control namespace i bazowymi limitami Compose.
+Nie zmienia to requested/resolved execution, prawa do Compute, grantów ani
+reguł odzyskiwania sesji. Większy limit kontenera nie stanowi rezerwacji zasobów
+dla solvera. Szczegóły: przewodnik Docker volume development, sekcja budżetu.
+
 ## Admission storage Windows po przebudowie dev
 
 ADR 0059 pozostaje kontraktem filesystemu, ownera i grantów. Dla live dev host

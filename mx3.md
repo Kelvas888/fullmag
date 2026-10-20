@@ -1,26 +1,19 @@
 # MX3 — audyt frontendu i runtime symulacji Fullmag
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 20.10.2026, 21:09 UTC
+## Aktualny status wdrożenia — 21.10.2026, 00:03 CEST
 
-Build i publikacja pakietu w `fullmag-master` przeszły: źródła
-`d2a4bdfb7a685da587954f1dbb57ea828f8a4e6b`, snapshot
-`fb94f5f75bac756279f92cbdddf5a2561f51f8a1de1dd89406a9a455c10a537a`.
-Backend `c007e2f1e113` pozostaje przed API: synchronicznie sprawdza historyczne
-kopie pakietów podczas retencji. Frontend `31f1035340db` jest healthy na **3198**,
-lecz funkcje wymagające API są niedostępne.
+Build i publikacja pakietu `d2a4bdfb` przeszły. Frontend działa na **3198**,
+backend nadal sprawdza stare pakiety rollback przed API. Na żądanie zwiększono
+i potwierdzono jego limit **128 GiB RAM / 16 CPU + 8 GiB swapu**, zachowując
+ten sam kontener i dane. Profil kolejnych startów zapisany w control volume.
 
-W źródłach usunięto opcjonalną retencję z krytycznej ścieżki startu: wszystkie
-rollbacki pozostają, a obowiązkowa walidacja aktualnego pakietu w `_serve`
-pozostaje wymagana. Ta poprawka nie zmienia aktywnego procesu; odbiór nowej
-wersji runtime pozostaje **NOT VERIFIED**. Nie dodano procesu w tle, timeoutu
-ani mechanizmu anulowania. Nie usunięto danych.
-
-Współdzielony master ma również zintegrowany PR #225 (`551b174c42515b9e897dd9953afec43f5b1eb81f`);
-jego późniejsze źródła nie są częścią powyższego zbudowanego snapshotu.
-Bez replay skryptu, nowego preparation retry, Solve i testów.
-Pozostają trzy grupy odbioru: API/native i ten sam run04; nowa siatka;
-Solve oraz pola/energie/Airbox w UI. Pełny plan F0–F12 pozostaje otwarty.
+Usunięcie opcjonalnej retencji z krytycznej ścieżki jest w źródłach
+`01cb8ed197e066fd25d2d9db26c52d6bf9d3d154`; działający stary proces tej poprawki
+jeszcze nie używa. Obowiązkowa walidacja bieżącego pakietu pozostaje wymagana.
+Nie uruchomiono replay skryptu, nowego preparation retry, Solve ani testów.
+API/native i ten sam run04, nowy mesh oraz pola/energie/Airbox w UI nadal
+wymagają odbioru. Pełny plan F0–F12 pozostaje otwarty.
 <!-- mx3-current-status:end -->
 
 
@@ -1936,3 +1929,35 @@ jego późniejsze źródła nie są częścią powyższego zbudowanego snapshotu
 Bez replay skryptu, nowego preparation retry, Solve i testów.
 Pozostają trzy grupy odbioru: API/native i ten sam run04; nowa siatka;
 Solve oraz pola/energie/Airbox w UI. Pełny plan F0–F12 pozostaje otwarty.
+
+
+## 52. Zwiększenie budżetu backendu — 21.10.2026, 00:03 CEST
+
+Limit backendu zwiększony na polecenie użytkownika z **8 do 128 GiB RAM**
+i z **4 do 16 CPU**, bez restartu ani odtwarzania kontenera. Zachowano
+**8 GiB dodatkowego swapu**. Docker inspect oraz odczyt cgroup potwierdziły
+`memory.max=137438953472`, `memory.swap.max=8589934592`,
+`cpu.max=1600000 100000`; PID7 jest ponownie running, inkarnacja i StartedAt
+kontenera pozostały bez zmian.
+
+Zarządzana operacja `174138824a3d4777a9834b165f500b53` zakończyła się
+`succeeded`, receipt SHA256
+`169022d3c9ab4cfd46c9150522a2b8c549306160adf896a95c5822385f207e42`.
+Receipt znajduje się w control volume pod
+`development/attempts/53e4c556247a4ef382e25b96467e4916/resource-increases/174138824a3d4777a9834b165f500b53/receipt.json`.
+Profil `backend/resource-budget.json` przypina ten receipt dla kolejnych
+startów wyłącznie tej samej grupy. Nie zmieniono bazowego budżetu innych grup,
+VM Docker/WSL, pierwotnych receiptów, ownerów ani danych sesji.
+
+Docker VM ma około 196,6 GiB RAM i 40 CPU, host około 255,9 GiB RAM;
+200 GiB dla jednego backendu wymaga osobnego zwiększenia budżetu VM z zapasem
+na frontend i inne grupy. Limit nie jest rezerwacją pamięci solvera.
+
+AST czterech plików Python i trzech embedded helpers oraz scoped diff-check
+PASS; dwie próby podglądu i rzeczywiste apply zakończone exit0. Bez testów i
+nowego buildu. Obsługa zwiększania zasobów została potwierdzona na żywym
+kontenerze; zapisany profil następnego startu ma tylko weryfikację źródłową.
+Backend nadal sprawdza historyczne pakiety rollback w starej, już załadowanej
+wersji startu. Odczyt 22:03 UTC: pakiet 6 z 14, zmieniający się offset pliku.
+Zwiększenie limitu nie dowodzi przyspieszenia tej operacji. API/native,
+preparation retry, nowy mesh, Solve i wizualizacja pól pozostają NOT VERIFIED.

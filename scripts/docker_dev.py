@@ -2525,6 +2525,15 @@ def _parser() -> argparse.ArgumentParser:
     idle_restart.add_argument("--config-sha256", required=True)
     idle_restart.add_argument("--source-root", type=Path, required=True)
     idle_restart.add_argument("--port", type=int, required=True)
+    resources = subparsers.add_parser(
+        "increase-resources", help="increase a pinned pre-API backend's budget without restarting its build"
+    )
+    resources.add_argument("--source-root", type=Path, required=True)
+    resources.add_argument("--attempt", required=True)
+    resources.add_argument("--backend-container-id", required=True)
+    resources.add_argument("--backend-memory-gib", type=int, required=True)
+    resources.add_argument("--backend-cpus", type=int, required=True)
+    resources.add_argument("--apply", action="store_true", help="apply the displayed increase; default previews without changing limits")
     stop_unadmitted = subparsers.add_parser(
         "stop-unadmitted",
         help=(
@@ -2699,6 +2708,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "restart-idle-volume":
             from docker_volume_dev import restart_idle
             restart_idle(args)
+        elif args.action == "increase-resources":
+            from docker_volume_resources import increase
+            increase(args)
         elif args.action == "stop-unadmitted":
             from docker_volume_stop_unadmitted import stop
             stop(args)

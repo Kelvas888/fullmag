@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-20T21:09:42.372456+00:00",
-  "verification": "Source checkpoint: remove optional rollback retention from startup; keep mandatory current package verification and all backups. Python AST and diff checks only; live prior image still validates historical backups before API. Make/package publication d2a4bdfb PASS, API/native/mesh/Solve NOT VERIFIED. No tests. Focused source review PASS; documentation corrected to distinguish cache-volume lower-bound preflight from package-volume capacity.",
+  "observed_at": "2026-10-20T22:04:10.395222+00:00",
+  "verification": "Managed live increase succeeded: same backend container 8->128 GiB, 4->16 CPU, extra swap 8 GiB preserved; Docker inspect and cgroup confirmed. Receipt 174138824a3d4777a9834b165f500b53 SHA256 169022d3c9ab4cfd46c9150522a2b8c549306160adf896a95c5822385f207e42. Saved next-start profile source reviewed only. Python AST 4 plus 3 embedded helpers and scoped diff check PASS. No tests/new build. Prior package d2a4bdfb built; live old helper still verifies historical backups, API/native/mesh/Solve NOT VERIFIED.",
   "files": [
     {
       "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
@@ -139,6 +139,10 @@
       "sha256": "6725af5b7137e3b36f9160d656275f80993321dbc1e7848bf61398ce9bccb338"
     },
     {
+      "path": "docs/adr/0061-docker-development-build-and-runtime-container.md",
+      "sha256": "a091a05cf038be6c631b82f204883770a25b00da7154322ab10c271ce98f57e1"
+    },
+    {
       "path": "docs/guides/docker-build-storage-lifecycle.md",
       "sha256": "18eb9cf48e5a3ab45262fc0eb8b17c557e66e9d72a408b061752e9e664199e2d"
     },
@@ -147,8 +151,12 @@
       "sha256": "b9c48a651c4e20183842a57a155fd376eaf571003a13889705d17bbf83c1df6e"
     },
     {
+      "path": "docs/guides/docker-volume-development.md",
+      "sha256": "7a63c38bebef4b7f897b109948f7d0e750ffdca46dd203d4b57743ec2724877a"
+    },
+    {
       "path": "scripts/docker_dev.py",
-      "sha256": "23b2f4f74cdddb6dc575032dc3fdcf535c45b07e4577d996dcee05f5c4902171"
+      "sha256": "d1c6c33b23189b8b37671e56e69d4a124369c3bfa3747257957ab021e43e729c"
     },
     {
       "path": "scripts/docker_volume_accepted_reattach.py",
@@ -156,7 +164,7 @@
     },
     {
       "path": "scripts/docker_volume_activation_reconcile.py",
-      "sha256": "a01bb5e02351cde7f10bd7c22c6b663c1f977232ad1fb788189767e831658b30"
+      "sha256": "2fe891decdbf67fc6c9d44a8b24eed6a0ae972dc226742025f2a2c72eb271bff"
     },
     {
       "path": "scripts/docker_volume_capture_failure_reconcile.py",
@@ -164,11 +172,15 @@
     },
     {
       "path": "scripts/docker_volume_dev.py",
-      "sha256": "c8282b0f111d688672d6ae65be26ccdc507149afc08a025dea3ff526edc53f29"
+      "sha256": "89a6cc788c52cca3a4f440e9af75beea25251474587f43a059456794f8ecb831"
     },
     {
       "path": "scripts/docker_volume_pre_ack_retry.py",
       "sha256": "133cf01938d0b1aecb3d261fea8ae66b82e1699f4236e492c17a5d2efb9bc048"
+    },
+    {
+      "path": "scripts/docker_volume_resources.py",
+      "sha256": "6cfbd228d3dbeb2fb08454cbb689f85f2d5ef8c2706c8d7cfe01eea7874498a0"
     }
   ]
 }

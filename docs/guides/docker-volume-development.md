@@ -307,6 +307,43 @@ recepty, po `browser_image`. Nieudane lub
 niejednoznaczne kontrole kończą się zachowaniem zasobów i wymagają ręcznego
 przeglądu receiptu operacji.
 
+## Budżet backendu podczas trwającego startu
+
+`increase-resources` zwiększa RAM i CPU dokładnie wskazanego backendu przed
+uruchomieniem API, bez odtwarzania kontenera i bez powtarzania skryptu. Wymaga
+aktywnej próby `development`, jej uwierzytelnionego helpera i tego samego
+zarejestrowanego checkoutu. Domyślnie pokazuje plan bez zmiany limitów:
+
+```powershell
+python -B scripts/docker_dev.py --repo-root <main> increase-resources `
+  --source-root <source> --attempt <development-uuid> `
+  --backend-container-id <full-container-id> --backend-memory-gib 128 --backend-cpus 16
+# Zastosowanie tego samego zakresu: dodaj --apply.
+```
+
+Zmniejszenie limitów ani aktualizacja działającego solvera nie są obsługiwane
+przez tę komendę. Przed zmianą helper krótko wstrzymuje przypięty proces
+startowy; jeśli jego bramka cgroup już opublikowała request, odrzuca zmianę.
+Proces zostaje wznowiony po potwierdzeniu nowych limitów. Przed wysłaniem zmiany
+EOF/watchdog zwalnia pauzę; po uzbrojeniu aktualizacji nieznany wynik zachowuje
+zatrzymany startup i zapisane dowody, blokując wejście do gate. Niezależny
+hostowy finalizer wznawia przypięty proces również po śmierci helpera, jeśli
+aktualizacja jest potwierdzona albo nie została wysłana. Jednoczesna utrata
+hostowego kontrolera i helpera może pozostawić startup zatrzymany; nie jest
+to dowód zakończenia procesu i wymaga obserwacji/reconciliation jego intentu.
+Zapas swapu ponad RAM pozostaje taki sam. Budżet nie może przekraczać pojemności
+Docker VM, a planowana różnica RAM musi pozostawić co najmniej 16 GiB
+aktualnie dostępnej pamięci. Sam limit nie rezerwuje pamięci ani CPU dla runu.
+
+Kontener, obraz, sesje, dane, cache i pierwotne receipty pozostają zachowane.
+Nowy receipt jest zapisywany pod `development/attempts/<uuid>/resource-increases`.
+Profil `backend/resource-budget.json` wskazuje surowy hash tego receipt i jest
+stosowany przy kolejnych startach wyłącznie w tym samym control namespace.
+Nierozstrzygnięty wcześniejszy intent blokuje następne zwiększenie, zamiast
+automatycznie ponawiać `docker update`. Limit 200 GiB wymaga VM większej niż
+200 GiB z zapasem dla innych usług; komenda nie restartuje Docker/WSL ani innych grup.
+Odbiór uruchomienia API, meshu i solvera jest osobnym dowodem.
+
 ## Granica zapisu i retencja
 
 | Dane | Miejsce |
