@@ -68,6 +68,7 @@ mod field_store;
 mod live_command_journal;
 mod live_execution_binding;
 mod accepted_field_materialization;
+mod accepted_field_materialization_worker;
 mod live_accepted_execution;
 mod live_accepted_projection;
 mod live_scene_preparation;

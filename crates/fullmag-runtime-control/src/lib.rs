@@ -643,7 +643,8 @@ pub use claim::{
 
 mod scheduler;
 pub use scheduler::{
-    accepted_run_has_scheduler_ready_task, accepted_run_step_is_scheduler_ready,
+    accepted_run_has_scheduler_ready_task, accepted_run_step_is_preparation_frontier,
+    accepted_run_step_is_scheduler_ready,
     resume_next_admitted_accepted_task_with_host,
     schedule_next_ready_accepted_task, schedule_next_ready_accepted_task_with_host,
     ScheduledAcceptedTask,

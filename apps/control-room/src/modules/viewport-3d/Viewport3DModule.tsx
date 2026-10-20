@@ -1417,6 +1417,7 @@ interface Viewport3DFrameProps
   cameraResource: VisualizationStateResource["camera"] | null;
   clientReady: boolean;
   colors: Viewport3DSceneProps["colors"] | null;
+  colorsUnavailable: boolean;
   captureRevision: number;
   diagnostics: string;
   domainSummary: string;
@@ -1838,6 +1839,7 @@ export default function Viewport3DModule({
       primitiveModel={primitiveModelWithPlacementDraft ?? null}
       clientReady={clientReady}
       colors={colors}
+      colorsUnavailable={colorsUnavailable}
       cameraDialogOpen={commandState.widgets.cameraDialogOpen}
       cameraDialogState={commandState.camera}
       dimensionFrameAnnotation={commandState.widgets.dimensionFrameAnnotation}
@@ -2051,6 +2053,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   cameraResource,
   clientReady,
   colors,
+  colorsUnavailable,
   diagnostics,
   domainSummary,
   effectAntialias,

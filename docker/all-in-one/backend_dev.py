@@ -3378,6 +3378,56 @@ def _write_candidate_marker(
     _fsync_directory(candidate, "backend package candidate directory")
 
 
+def _recover_initial_ready_package(output: Path, control_root: Path, build_root: Path) -> None:
+    """Finish one complete first publication, keeping all original evidence.
+
+    The caller holds the runtime build lock and has proved the current package
+    is empty. A recovered package is only a previous build: start must still
+    compare a fresh source/toolchain capture before it can serve any API.
+    Ambiguous, partial, or unowned candidates remain subject to the ordinary
+    fail-closed candidate guard.
+    """
+
+    candidates = control_root / PACKAGE_CANDIDATES_DIRNAME
+    entries = []
+    for entry in candidates.iterdir():
+        entries.append(entry)
+        if len(entries) > 1:
+            return
+    if not entries:
+        return
+    candidate = entries[0]
+    marker = _validate_candidate_marker(candidate, output, build_root, state=None)
+    if marker.get("state") != "ready":
+        return
+    if not (candidate / "backend-build-receipt.json").exists():
+        return
+    attempt = _read_failed_make_attempt(build_root, candidate)
+    if attempt is None or attempt[0].get("state") != "succeeded":
+        _fail("ready initial backend package has no successful Make receipt")
+    make_receipt = attempt[0]
+    receipt, receipt_bytes, _children = _validated_package(
+        candidate, "recoverable initial backend package", exclude_candidate_marker=True
+    )
+    records = receipt["artifacts"]
+    _assert_direct_candidate_inventory(candidate, records, include_receipt=True)
+    if marker.get("artifact_inventory_sha256") != _sha256_bytes(_canonical(records)):
+        _fail("ready initial backend package inventory differs from its owner marker")
+    command = receipt.get("command")
+    if not isinstance(command, list) or not command or command[-1] != make_receipt["make_target"]:
+        _fail("ready initial backend package Make target differs from its attempt")
+    digest, metadata = _sha256_file(
+        candidate / FAILED_MAKE_LOG_NAME, "recoverable initial Make log", MAX_BUILD_LOG_BYTES
+    )
+    if digest != make_receipt["log_sha256"] or metadata.st_size != make_receipt["log_size"]:
+        _fail("ready initial backend package log differs from its Make attempt")
+    _fsync_owned_tree(candidate, "recoverable initial backend package")
+    rotation = _rotate_package(output, candidate, control_root, {}, None, receipt_bytes)
+    _finalize_published_candidate(candidate, rotation)
+    _clear_rotation_journal(rotation)
+    _log_phase("package", "recovered-initial-publication", receipt_sha256=_sha256_bytes(receipt_bytes))
+
+
 def _reject_partial_package_candidates(
     output: Path,
     control_root: Path,
@@ -4778,6 +4828,11 @@ def _start(args: argparse.Namespace) -> int:
                 )
             else:
                 previous_receipt = None
+                _recover_initial_ready_package(output, control_root, build_root)
+                if _package_children(output, "recovered backend package", exclude_development_control=True):
+                    previous_receipt = _validated_package(
+                        output, "recovered backend package", exclude_development_control=True
+                    )
             _reject_partial_package_candidates(
                 output,
                 control_root,

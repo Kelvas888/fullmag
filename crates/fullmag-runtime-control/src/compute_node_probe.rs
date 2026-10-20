@@ -1251,6 +1251,8 @@ fn observe_cpu_quota() -> Result<CpuQuota> {
         &fs::read_to_string("/proc/self/mountinfo").context("read Linux cgroup mounts")?,
     )?;
 
+    // Prefer the widest visible hierarchy. A more specific delegated bind
+    // mount can hide an ancestor quota even though it matches this process.
     if let Some(membership) = memberships
         .iter()
         .find(|entry| {
@@ -1264,7 +1266,7 @@ fn observe_cpu_quota() -> Result<CpuQuota> {
                     && mount.controllers.contains("cpu")
                     && membership.path.starts_with(&mount.root)
             })
-            .max_by_key(|mount| mount.root.components().count())
+            .min_by_key(|mount| mount.root.components().count())
             .context("Linux cgroup v1 CPU controller mount is unavailable")?;
         let current = linux_cgroup_mount_path(&membership.path, &mount.root, &mount.mount_point)?;
         return read_linux_v1_cpu_quota(&current, &mount.mount_point);
@@ -1279,7 +1281,7 @@ fn observe_cpu_quota() -> Result<CpuQuota> {
         .filter(|mount| {
             mount.version == LinuxCgroupVersion::V2 && membership.path.starts_with(&mount.root)
         })
-        .max_by_key(|mount| mount.root.components().count())
+        .min_by_key(|mount| mount.root.components().count())
         .context("Linux does not expose a matching cgroup v2 mount")?;
     let current = linux_cgroup_mount_path(&membership.path, &mount.root, &mount.mount_point)?;
     read_linux_v2_cpu_quota(&current, &mount.mount_point)

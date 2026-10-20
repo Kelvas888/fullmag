@@ -94,6 +94,26 @@ pub fn accepted_run_step_is_scheduler_ready(
     run_id: &RunId,
     step_id: &str,
 ) -> Result<bool> {
+    accepted_run_step_is_ready(store, run_id, step_id, true)
+}
+
+/// Select a dependency-ready preparation frontier before its receipt exists.
+/// This observes the same unclaimed task and resolvable-input gates as the
+/// solver scheduler; it never queues, claims, or dispatches the task.
+pub fn accepted_run_step_is_preparation_frontier(
+    store: &SessionStore,
+    run_id: &RunId,
+    step_id: &str,
+) -> Result<bool> {
+    accepted_run_step_is_ready(store, run_id, step_id, false)
+}
+
+fn accepted_run_step_is_ready(
+    store: &SessionStore,
+    run_id: &RunId,
+    step_id: &str,
+    require_preparation_receipt: bool,
+) -> Result<bool> {
     let intent = store
         .read_run_intent(run_id.as_str())?
         .context("accepted scheduler requires an immutable run intent")?;
@@ -134,7 +154,10 @@ pub fn accepted_run_step_is_scheduler_ready(
         .iter()
         .find(|step| step.step_id == step_id)
         .with_context(|| format!("accepted scheduler lowered step `{step_id}` is missing"))?;
-    scheduler_step_is_ready(store, run_id, &accepted, &catalog, study_step, execution_step)
+    step_is_ready(
+        store, run_id, &accepted, &catalog, study_step, execution_step,
+        require_preparation_receipt,
+    )
 }
 
 fn scheduler_step_is_ready(
@@ -144,6 +167,18 @@ fn scheduler_step_is_ready(
     catalog: &fullmag_session::FmsRunCatalog,
     study_step: &fullmag_authoring::StudyStep,
     execution_step: &fullmag_plan::StudyStepExecutionPlan,
+) -> Result<bool> {
+    step_is_ready(store, run_id, accepted, catalog, study_step, execution_step, true)
+}
+
+fn step_is_ready(
+    store: &SessionStore,
+    run_id: &RunId,
+    accepted: &crate::study::AcceptedStudySnapshot,
+    catalog: &fullmag_session::FmsRunCatalog,
+    study_step: &fullmag_authoring::StudyStep,
+    execution_step: &fullmag_plan::StudyStepExecutionPlan,
+    require_preparation_receipt: bool,
 ) -> Result<bool> {
     if !study_step.enabled
         || !execution_step.enabled
@@ -170,6 +205,8 @@ fn scheduler_step_is_ready(
             &durable_task.readiness,
             FmsTaskReadiness::Blocked { reason }
                 if reason == crate::ACCEPTED_TASK_AWAITING_DEPENDENCY_RESOLUTION
+                    || (!require_preparation_receipt
+                        && reason == fullmag_session::FMS_TASK_AWAITING_PREPARATION_REASON)
         )
         && durable_task.attempt_id.is_none()
         && durable_task.resource_id.is_none();
@@ -180,7 +217,8 @@ fn scheduler_step_is_ready(
     if !scheduler_owned_accepted && !unclaimed_queue {
         return Ok(false);
     }
-    if scheduler_owned_accepted
+    if require_preparation_receipt
+        && scheduler_owned_accepted
         && store
             .read_task_preparation_receipt(run_id.as_str(), task_id.as_str())?
             .is_none()

@@ -574,22 +574,42 @@ def _validate_helper(
     labels = config.get("Labels")
     if not isinstance(labels, Mapping) or any(labels.get(key) != value for key, value in expected_labels.items()):
         raise _fail("Activation helper labels differ from the selected source group")
-    expected_cmd = [
-        "-euo",
-        "pipefail",
-        "-c",
-        control.operation_script("activation", activation_attempt),
-    ]
+    # helper_args adds the selected namespace registry fence to the lease
+    # script. Authenticate that exact command, including the prefix, rather
+    # than only the legacy unnamespaced operation_script body.
+    expected_args = control.helper_args(
+        control.operation_script("activation", activation_attempt), name=helper_name,
+    )
+    entrypoint_index = expected_args.index("--entrypoint")
+    expected_cmd = expected_args[entrypoint_index + 3:]
     if config.get("Entrypoint") != ["/bin/bash"] or config.get("Cmd") != expected_cmd:
         raise _fail("Activation helper command differs from the pinned lease protocol")
     mounts = document.get("Mounts")
-    if (not isinstance(mounts, list) or len(mounts) != 1
-            or not isinstance(mounts[0], Mapping)):
+    expected_mount_count = 2 if control.namespace else 1
+    if (not isinstance(mounts, list) or len(mounts) != expected_mount_count
+            or not all(isinstance(mount, Mapping) for mount in mounts)):
         raise _fail("Activation helper mounts are not exact")
     mount = mounts[0]
     if (mount.get("Type") != "volume" or mount.get("Name") != control.volume
             or mount.get("Destination") != "/control" or mount.get("RW") is not True):
         raise _fail("Activation helper control volume differs")
+    if control.namespace:
+        registry = mounts[1]
+        if (registry.get("Type") != "volume" or registry.get("Name") != control.volume
+                or registry.get("Destination") != "/registry" or registry.get("RW") is not False):
+            raise _fail("Activation helper namespace registry mount differs")
+        # Docker's normalized Mounts array omits volume-subpath. The daemon
+        # HostConfig is required as well, otherwise a whole-volume mount could
+        # impersonate the exact selected control namespace.
+        host_config = document.get("HostConfig")
+        expected_host_mounts = [
+            {"Type": "volume", "Source": control.volume, "Target": "/control",
+             "VolumeOptions": {"NoCopy": True, "Subpath": control.namespace}},
+            {"Type": "volume", "Source": control.volume, "Target": "/registry",
+             "ReadOnly": True, "VolumeOptions": {"NoCopy": True}},
+        ]
+        if not isinstance(host_config, Mapping) or host_config.get("Mounts") != expected_host_mounts:
+            raise _fail("Activation helper namespace subpath differs")
     return document, helper_id
 
 

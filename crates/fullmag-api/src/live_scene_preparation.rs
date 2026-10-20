@@ -829,7 +829,7 @@ pub(crate) async fn publish_accepted_frontier_preparation(
                     matches!(step.status, fullmag_plan::StudyStepLoweringStatus::Planned)
                 })
             {
-                if fullmag_runtime_control::accepted_run_step_is_scheduler_ready(
+                if fullmag_runtime_control::accepted_run_step_is_preparation_frontier(
                     &store,
                     &typed_run_id,
                     &step.step_id,
@@ -841,6 +841,49 @@ pub(crate) async fn publish_accepted_frontier_preparation(
                 })? {
                     selected = Some(step.step_id.clone());
                     break;
+                }
+            }
+            if selected.is_none() {
+                // Preparation may advance between scans. History identifies
+                // a candidate only; recheck lifecycle, dependencies and inputs
+                // before publishing it as the current live frontier.
+                let launches = store
+                    .list_preparation_process_launches(typed_run_id.as_str())
+                    .map_err(|error| {
+                        ApiError::conflict(format!(
+                            "accepted preparation launches cannot be read: {error}"
+                        ))
+                    })?;
+                for step in accepted.lowered.steps.iter().filter(|step| {
+                    matches!(step.status, fullmag_plan::StudyStepLoweringStatus::Planned)
+                }) {
+                    let task_id = fullmag_session::task_id_for_study_step(
+                        typed_run_id.as_str(),
+                        &step.step_id,
+                    )
+                    .map_err(|error| ApiError::conflict(error.to_string()))?;
+                    let launched = launches
+                        .iter()
+                        .any(|launch| launch.task_id == task_id.as_str());
+                    let prepared = store
+                        .read_task_preparation_receipt(typed_run_id.as_str(), task_id.as_str())
+                        .map_err(|error| ApiError::conflict(error.to_string()))?
+                        .is_some();
+                    if (launched || prepared)
+                        && fullmag_runtime_control::accepted_run_step_is_preparation_frontier(
+                            &store,
+                            &typed_run_id,
+                            &step.step_id,
+                        )
+                        .map_err(|error| {
+                            ApiError::conflict(format!(
+                                "accepted preparation candidate validation failed: {error}"
+                            ))
+                        })?
+                    {
+                        selected = Some(step.step_id.clone());
+                        break;
+                    }
                 }
             }
             selected.ok_or_else(|| {

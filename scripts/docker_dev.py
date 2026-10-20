@@ -2548,6 +2548,12 @@ def _parser() -> argparse.ArgumentParser:
     recreate_volume.add_argument("--source-root", type=Path, required=True)
     recreate_volume.add_argument("--port", type=int, required=True)
     recreate_volume.add_argument(
+        "--include-untracked",
+        action="append",
+        default=None,
+        help="pin the complete exact-file allowlist for the recreated services; repeat for additional files",
+    )
+    recreate_volume.add_argument(
         "--recovery-authorization",
         type=str,
         help=(

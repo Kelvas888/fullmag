@@ -2410,10 +2410,14 @@ impl HostResourceLedger {
             if marker_exists && document_exists {
                 let ledger = Self::open(&canonical_root, policy)?;
                 let existing = ledger.read_runtime_readiness()?;
-                if !existing.has_same_host_abi(&readiness) {
+                if !runtime_readiness_native_abi_compatible(&existing, &readiness) {
                     bail!("runtime readiness initialization changes the persisted host ABI facts");
                 }
-                if ledger.runtime_generation_sha256()?.is_none() {
+                if !existing.has_same_host_abi(&readiness)
+                    || ledger.runtime_generation_sha256()?.is_none()
+                {
+                    // An enforcement change needs a new generation, guarded by
+                    // released reservations and an absent inventory owner.
                     ledger.upgrade_runtime_readiness(readiness)?;
                 } else {
                     // Compatible worktrees share one host generation. A new
@@ -2489,7 +2493,7 @@ impl HostResourceLedger {
             existing.validate_persisted(&self.policy)?;
             existing
         };
-        if !runtime_readiness_abi_compatible(&existing, &readiness) {
+        if !runtime_readiness_native_abi_compatible(&existing, &readiness) {
             bail!("runtime readiness rotation changes the persisted host ABI facts");
         }
 
@@ -5075,6 +5079,17 @@ fn runtime_readiness_abi_compatible(
     previous: &HostRuntimeReadiness,
     next: &HostRuntimeReadiness,
 ) -> bool {
+    runtime_readiness_native_abi_compatible(previous, next)
+        && previous.capabilities_sha256 == next.capabilities_sha256
+}
+
+// The capability digest also binds the current OS enforcement report. It may
+// change after delegation without changing the native ABI or physical policy.
+// Only the guarded generation rotation may accept that change.
+fn runtime_readiness_native_abi_compatible(
+    previous: &HostRuntimeReadiness,
+    next: &HostRuntimeReadiness,
+) -> bool {
     previous.schema_version == next.schema_version
         && previous.status == next.status
         && previous.source_kind == next.source_kind
@@ -5082,7 +5097,6 @@ fn runtime_readiness_abi_compatible(
         && previous.gpu_runtime_compatibility == next.gpu_runtime_compatibility
         && previous.gpu_visibility == next.gpu_visibility
         && previous.inventory_sha256 == next.inventory_sha256
-        && previous.capabilities_sha256 == next.capabilities_sha256
 }
 
 fn runtime_cas_digest(bytes: &[u8]) -> String {
