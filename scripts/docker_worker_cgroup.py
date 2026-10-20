@@ -6,10 +6,15 @@ import json
 from pathlib import Path
 import time
 
-from docker_build_control import BuildControlError, canonical, compose_capture, docker_capture, docker_text
+from docker_build_control import BuildControlError, canonical, compose_capture, docker_capture
 
 PROFILE = "docker-backend-v1"
 ROOT = "/opt/fullmag/worker-cgroup"
+
+def docker_text(*args, timeout=90, combined=False):
+    result = docker_capture(*args, timeout=timeout)
+    return (result.stdout + (result.stderr if combined else b"")).decode("utf-8", "replace")
+
 
 _REQUEST = """import json,os,pathlib,stat
 p=pathlib.Path('/opt/fullmag/runtime-control/worker-cgroup/request.json')

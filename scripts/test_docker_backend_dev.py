@@ -2634,6 +2634,54 @@ class BackendPackageTests(unittest.TestCase):
             )
             self.assertTrue(observed["log_retired"])
 
+    def test_direct_prepare_checks_published_log_before_retiring_external_copy(self):
+        for tamper in (False, True):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                package, build_root, candidate, log_path = self._failed_make_fixture(
+                    root, ".backend-package-candidate-publication", b"success\n"
+                )
+                workspace = build_root / "workspace"
+                workspace.mkdir()
+                args = backend.argparse.Namespace(
+                    source_tar=None, manifest=str(root / "manifest.json"),
+                    source_root=str(root), git_common_root=str(root),
+                )
+
+                def publish(*args, **kwargs):
+                    if tamper:
+                        (candidate / backend.FAILED_MAKE_LOG_NAME).write_bytes(b"changed\n")
+                    return 0
+
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(backend, "PACKAGE_ROOT", package),
+                    patch.object(backend, "_materialize_source", return_value=(
+                        workspace, {}, {}, "a" * 64, "b" * 64, "archive",
+                    )),
+                    patch.object(backend, "_build_environment", return_value={}),
+                    patch.object(backend, "_begin_failed_make_attempt", return_value=log_path),
+                    patch.object(backend, "_run_canonical_make", return_value=0),
+                    patch.object(backend, "_publish_completed_build", side_effect=publish),
+                ):
+                    if tamper:
+                        with self.assertRaisesRegex(
+                            backend.BackendBuildError,
+                            "published Make diagnostic log differs from its attempt receipt",
+                        ):
+                            backend._prepare_locked(args, build_root, candidate, 1, {}, candidate)
+                    else:
+                        self.assertEqual(
+                            backend._prepare_locked(args, build_root, candidate, 1, {}, candidate), 0
+                        )
+                receipt, _ = backend._read_json(
+                    build_root / backend.FAILED_MAKE_DIAGNOSTICS_DIRNAME
+                    / candidate.name / backend.FAILED_MAKE_RECEIPT_NAME,
+                    "Make receipt",
+                )
+                self.assertEqual(receipt["log_retired"], not tamper)
+                self.assertEqual(log_path.exists(), tamper)
+
     def test_failed_make_log_retention_bounds_logs_and_preserves_receipts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
