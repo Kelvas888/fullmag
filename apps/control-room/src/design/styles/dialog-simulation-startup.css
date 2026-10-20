@@ -546,13 +546,13 @@
 
 @container (max-width: 680px) {
   .fm-simulation-startup__details {
-    grid-template-rows: minmax(420px, 1fr) auto auto;
+    grid-template-rows: minmax(540px, 1fr) auto auto;
   }
 
   .fm-simulation-startup__body {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(100px, 160px) minmax(240px, 1fr);
-    min-height: 420px;
+    grid-template-rows: minmax(100px, 160px) minmax(360px, 1fr);
+    min-height: 540px;
   }
 
   .fm-simulation-startup__timeline {

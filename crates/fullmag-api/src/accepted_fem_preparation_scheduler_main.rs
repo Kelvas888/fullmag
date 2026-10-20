@@ -49,6 +49,8 @@ struct PreparationCandidate {
 struct ActivePreparation {
     lease: FmsPreparationResourceLease,
     handle: JoinHandle<Result<CompletedPreparation>>,
+    checkpoint_run_ids: Option<Vec<String>>,
+    next_run_id: Option<String>,
 }
 
 struct CompletedPreparation {
@@ -258,6 +260,7 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
     loop {
         reap_finished(
             &store,
+            host.as_ref(),
             &args.pool_id,
             &mut checkpoint_sequence,
             &mut active,
@@ -392,6 +395,8 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                         host.clone(),
                     ),
                     lease,
+                    checkpoint_run_ids: None,
+                    next_run_id: None,
                 },
             );
             started_any = true;
@@ -445,10 +450,12 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                                 args.process_timeout,
                                 args.heartbeat_interval,
                                 Some(checkpoint_run_ids.clone()),
-                                next_after_admission,
+                                next_after_admission.clone(),
                                 host.clone(),
                             ),
                             lease,
+                            checkpoint_run_ids: Some(checkpoint_run_ids.clone()),
+                            next_run_id: next_after_admission,
                         },
                     );
                     started_any = true;
@@ -746,6 +753,7 @@ fn validate_pool_progress(
 
 fn reap_finished(
     store: &SessionStore,
+    host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
     pool_id: &str,
     checkpoint_sequence: &mut u64,
     active: &mut ActivePreparations,
@@ -755,11 +763,45 @@ fn reap_finished(
         .iter()
         .find_map(|(resource_id, active)| active.handle.is_finished().then(|| resource_id.clone()))
     {
-        let active = active
+        let finished = active
             .remove(&resource_id)
             .context("finished preparation supervisor disappeared")?;
-        let completed_preparation = match active.handle.join() {
-            Ok(result) => result.context("supervise scheduled FEM preparation")?,
+        let completed_preparation = match finished.handle.join() {
+            Ok(Ok(completed)) => completed,
+            Ok(Err(error)) => {
+                let pending = match error.downcast::<
+                    accepted_fem_preparation_supervisor::TerminalPreparationFinalizationPending,
+                >() {
+                    Ok(pending) => pending,
+                    Err(error) => return Err(error).context("supervise scheduled FEM preparation"),
+                };
+                // Keep the resource occupied while publishing/finalizing only
+                // its reaped exit proof. This closure cannot spawn a preparer.
+                let store_root = store.root().to_path_buf();
+                let host = host.cloned();
+                let lease = finished.lease.clone();
+                let checkpoint_run_ids = finished.checkpoint_run_ids.clone();
+                let next_run_id = finished.next_run_id.clone();
+                let handle = std::thread::spawn(move || {
+                    let result = pending.resume(&store_root, host.as_ref())?;
+                    Ok(CompletedPreparation {
+                        lease,
+                        result,
+                        checkpoint_run_ids,
+                        next_run_id,
+                    })
+                });
+                active.insert(
+                    resource_id,
+                    ActivePreparation {
+                        handle,
+                        lease: finished.lease,
+                        checkpoint_run_ids: finished.checkpoint_run_ids,
+                        next_run_id: finished.next_run_id,
+                    },
+                );
+                return Ok(());
+            }
             Err(_) => bail!("scheduled FEM preparation supervisor thread panicked"),
         };
         if let Some(run_ids) = completed_preparation.checkpoint_run_ids.as_ref() {

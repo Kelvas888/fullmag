@@ -134,7 +134,6 @@ function SimulationPreparationWindow({ state }: { state: SimulationStartupOverla
   const [mode, setMode] = useState<"open" | "minimized" | "closed">("open");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const hostRef = useRef<HTMLElement>(null);
-  const restoreRef = useRef<HTMLButtonElement>(null);
   const previousMode = useRef(mode);
   useEffect(() => {
     if (previousMode.current === mode) return;
@@ -142,7 +141,7 @@ function SimulationPreparationWindow({ state }: { state: SimulationStartupOverla
     if (mode === "open") {
       hostRef.current?.querySelector<HTMLButtonElement>(".fm-draggable-panel__move:not(:disabled), .fm-draggable-panel__actions button")?.focus();
     } else {
-      restoreRef.current?.focus();
+      hostRef.current?.querySelector<HTMLButtonElement>("[data-preparation-restore]")?.focus();
     }
   }, [mode]);
   const progressValue =
@@ -158,7 +157,7 @@ function SimulationPreparationWindow({ state }: { state: SimulationStartupOverla
       {mode !== "open" ? (
         <div className="fm-simulation-startup__restore" data-mode={mode}>
           <Button
-            ref={restoreRef}
+            data-preparation-restore
             aria-label="Show simulation preparation"
             title={state.title}
             onClick={() => setMode("open")}

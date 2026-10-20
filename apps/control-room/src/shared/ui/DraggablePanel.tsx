@@ -2,7 +2,7 @@
 
 import { GripHorizontal, Maximize2, Minimize2, MoveDiagonal2, X } from "lucide-react";
 import {
-  useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
@@ -63,10 +63,11 @@ export function DraggablePanel({
   const [position, setPosition] = useState(defaultPosition);
   const [size, setSize] = useState<{ width: number; height: number } | null>(null);
   const [maximized, setMaximized] = useState(false);
+  const restorePositionRef = useRef(defaultPosition);
   const dragRef = useRef<DragState | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
 
     const onPointerMove = (event: PointerEvent) => {
@@ -101,10 +102,14 @@ export function DraggablePanel({
     const constrainPosition = () => {
       if (maximized) return;
       const panel = panelRef.current;
-      if (!panel) return;
+      // ResizeObserver can run after the maximize commit, before this effect
+      // is cleaned up. Never clamp the saved position to maximized dimensions.
+      if (!panel || panel.dataset.maximized === "true") return;
+      const maxX = window.innerWidth - panel.offsetWidth - 8;
+      const maxY = window.innerHeight - panel.offsetHeight - 8;
       setPosition(previous => {
-        const x = clamp(previous.x, 8, window.innerWidth - panel.offsetWidth - 8);
-        const y = clamp(previous.y, 8, window.innerHeight - panel.offsetHeight - 8);
+        const x = clamp(previous.x, 8, maxX);
+        const y = clamp(previous.y, 8, maxY);
         return x === previous.x && y === previous.y ? previous : { x, y };
       });
     };
@@ -184,9 +189,12 @@ export function DraggablePanel({
       role={role}
       data-maximized={maximized}
       data-resizable={resizable}
+      // Geometry must update synchronously: even a reduced-motion 1 ms
+      // transition exposes stale dimensions to the viewport constraint.
       style={{ ...(maximized
         ? { left: 8, top: 8, width: "calc(100vw - 16px)", height: "calc(100dvh - 16px)" }
         : { left: position.x, top: position.y, ...(resizable ? size : {}) }),
+        transitionProperty: "none",
         ...(!open ? { display: "none" } : {}),
       }}
       onKeyDown={(event) => {
@@ -199,7 +207,7 @@ export function DraggablePanel({
       <div className="fm-draggable-panel__handle" onPointerDown={beginDrag}>
         <Button
           aria-label="Move window with arrow keys"
-          title="Drag the title bar or use arrow keys here"
+          title="Drag the title bar or use arrow keys here (Shift for larger steps)"
           className="fm-draggable-panel__move"
           data-window-move
           disabled={maximized}
@@ -227,7 +235,12 @@ export function DraggablePanel({
             title={maximized ? "Restore window size" : "Maximize window"}
             size="icon" variant="ghost" type="button"
             onClick={() => {
-              if (!maximized) onMaximize?.();
+              if (!maximized) {
+                restorePositionRef.current = position;
+                onMaximize?.();
+              } else {
+                setPosition(restorePositionRef.current);
+              }
               setMaximized(previous => !previous);
             }}
             onPointerDown={(event) => event.stopPropagation()}

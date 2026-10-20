@@ -11,7 +11,7 @@ use std::{
     path::Path,
     sync::atomic::Ordering,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
@@ -87,6 +87,10 @@ struct AcceptedRestoreInput {
     previous_drain_path: Option<String>,
     #[serde(default)]
     previous_drain_sha256: Option<String>,
+    #[serde(default)]
+    pre_ack_retry_path: Option<String>,
+    #[serde(default)]
+    pre_ack_retry_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +167,8 @@ struct AcceptedRestoreProof {
     startup_provenance_sha256: String,
     activation_receipt_sha256: String,
     stop_reconcile_proof_sha256: String,
+    #[serde(default)]
+    legacy_helper_witness_sha256: Option<String>,
     stop_verification_sha256: String,
     terminal_owner_record_path: String,
     terminal_owner_record_sha256: String,
@@ -232,12 +238,42 @@ struct LoadedAcceptedRestore {
     reconciliation_attempt: String,
     mode: AcceptedRestoreMode,
     terminal_outcome: Option<String>,
+    preparation_failure: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcceptedRestoreMode {
     Held,
     Consumed,
+}
+
+/// Finite pre-listen checkpoints: static stage names and elapsed time only.
+/// Incomplete stages are also reported on an ordinary early error return.
+struct RestoreCheckpoint {
+    stage: &'static str,
+    started: Instant,
+    completed: bool,
+}
+
+impl RestoreCheckpoint {
+    fn start(stage: &'static str) -> Self {
+        eprintln!("accepted-run-restore: stage={stage} state=start elapsed_ms=0");
+        Self { stage, started: Instant::now(), completed: false }
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for RestoreCheckpoint {
+    fn drop(&mut self) {
+        let state = if self.completed { "complete" } else { "incomplete" };
+        eprintln!(
+            "accepted-run-restore: stage={} state={state} elapsed_ms={}",
+            self.stage, self.started.elapsed().as_millis(),
+        );
+    }
 }
 
 /// Read and install one explicitly pinned accepted run before the API starts
@@ -252,9 +288,16 @@ pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), S
     if std::env::var_os(LEGACY_INPUT_ENV).is_some() {
         return Err("accepted-run reattach cannot be combined with authoring restore".into());
     }
+    let restore_checkpoint = RestoreCheckpoint::start("restore");
+    let checkpoint = RestoreCheckpoint::start("read_input");
     let input = read_input().await?;
+    checkpoint.complete();
+    let checkpoint = RestoreCheckpoint::start("input_digests");
     validate_input_digests(&input).map_err(|error| error.to_string())?;
+    checkpoint.complete();
+    let checkpoint = RestoreCheckpoint::start("current_build");
     validate_current_build(&input).map_err(|error| error.to_string())?;
+    checkpoint.complete();
     let Some(store_root) = state.submit_store_root.clone() else {
         return Err("accepted-run reattach requires the configured accepted store".into());
     };
@@ -262,13 +305,16 @@ pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), S
     let proof_root_for_ack = proof_root.clone();
     let proof_path_for_ack = input.proof_path.clone();
     let api_instance_id = state.request_scope_instance_id.clone();
+    let checkpoint = RestoreCheckpoint::start("load");
     let loaded = tokio::task::spawn_blocking(move || {
         load_accepted_restore(&store_root, &proof_root, &input, &api_instance_id)
     })
     .await
     .map_err(|error| format!("accepted-run reattach validation task failed: {error}"))?
     .map_err(|error| format!("accepted-run reattach validation failed: {error:#}"))?;
+    checkpoint.complete();
 
+    let checkpoint = RestoreCheckpoint::start("build_snapshot");
     let _transition = state.current_live_session_transition.lock().await;
     if state.current_live_state.read().await.is_some()
         || state.current_live_session_epoch.load(Ordering::Acquire) != 0
@@ -281,8 +327,10 @@ pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), S
         .current_live_session_epoch
         .store(loaded.session_epoch, Ordering::Release);
     drop(_transition);
+    checkpoint.complete();
 
-    if loaded.mode == AcceptedRestoreMode::Held {
+    if loaded.mode == AcceptedRestoreMode::Held && loaded.preparation_failure.is_none() {
+        let checkpoint = RestoreCheckpoint::start("frontier_projection");
         // Reuse the existing accepted-frontier read-model path. It reads the
         // already published task/stage receipt and may only replay the exact
         // immutable anchor; it never releases the run or starts a worker.
@@ -302,6 +350,7 @@ pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), S
         )
         .await
         .map_err(|error| format!("accepted-run preparation projection failed: {error}"))?;
+        checkpoint.complete();
     }
 
     // Install the process-local rebind authority only after the immutable
@@ -350,6 +399,7 @@ pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), S
     );
     snapshot.state_version = snapshot.state_version.saturating_add(1);
     if loaded.request_sha256.is_some() {
+        let checkpoint = RestoreCheckpoint::start("ack");
         publish_restore_ack(
             &proof_root_for_ack,
             &proof_path_for_ack,
@@ -357,7 +407,9 @@ pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), S
             &state.request_scope_instance_id,
         )
         .map_err(|error| format!("publish accepted-run restore ack failed: {error:#}"))?;
+        checkpoint.complete();
     }
+    restore_checkpoint.complete();
     Ok(())
 }
 
@@ -481,6 +533,7 @@ fn load_accepted_restore(
     input: &AcceptedRestoreInput,
     current_api_instance_id: &str,
 ) -> Result<LoadedAcceptedRestore> {
+    let checkpoint = RestoreCheckpoint::start("load_proofs");
     let store = fullmag_session::SessionStore::open_existing(store_root)
         .context("open accepted control store")?;
     fullmag_session::repository_path::validate_relative_path(&input.proof_path)
@@ -509,11 +562,14 @@ fn load_accepted_restore(
     } else {
         validate_initial_transport(input)?;
         validate_backing_records(&proof, input, proof_root)?;
+        validate_pre_ack_retry(input, &proof, proof_root)?;
         None
     };
+    checkpoint.complete();
 
     let run_id = RunId::parse(input.run_id.clone()).map_err(anyhow::Error::msg)?;
     let project_id = ProjectId::parse(input.project_id.clone()).map_err(anyhow::Error::msg)?;
+    let checkpoint = RestoreCheckpoint::start("immutable_study");
     let accepted =
         fullmag_runtime_control::load_accepted_study_snapshot(&store, &run_id, &project_id)
             .context("load immutable accepted Study snapshot")?;
@@ -527,6 +583,25 @@ fn load_accepted_restore(
         bail!("accepted SceneDocument revision differs from immutable project snapshot");
     }
 
+    let mut planned_inputs = std::collections::BTreeMap::new();
+    for step in accepted.lowered.steps.iter().filter(|step| {
+        step.enabled && matches!(step.status, fullmag_plan::StudyStepLoweringStatus::Planned)
+    }) {
+        planned_inputs.insert(
+            fullmag_session::task_id_for_study_step(run_id.as_str(), &step.step_id)?,
+            (step.step_id.clone(), fullmag_application::study_task_input_fingerprint(
+                &specification, step,
+            )?),
+        );
+    }
+    checkpoint.complete();
+    // Decode/hash immutable Study data outside the writer. Under the guard,
+    // revalidate its full intent before reading the mutable state/proofs.
+    let checkpoint = RestoreCheckpoint::start("store_snapshot");
+    let _store_snapshot = store.write_transaction()?;
+    if store.read_run_intent(run_id.as_str())?.as_ref() != Some(&accepted.run.intent) {
+        bail!("accepted run intent changed while loading the restore snapshot");
+    }
     let catalog = store
         .read_run_catalog(run_id.as_str())?
         .context("accepted run catalog is missing")?;
@@ -560,7 +635,15 @@ fn load_accepted_restore(
         &catalog,
     )?;
 
-    if mode == AcceptedRestoreMode::Held {
+    let preparation_failure = if mode == AcceptedRestoreMode::Held {
+        load_held_preparation_failure(&store, run_id.as_str(), &planned_inputs, &catalog)?
+    } else {
+        None
+    };
+    drop(_store_snapshot);
+    checkpoint.complete();
+    if mode == AcceptedRestoreMode::Held && preparation_failure.is_none() {
+        let checkpoint = RestoreCheckpoint::start("success_anchor");
         let anchor = store
             .read_preparation_receipt(run_id.as_str())?
             .context("accepted run preparation anchor is missing")?;
@@ -611,6 +694,7 @@ fn load_accepted_restore(
         if !stage.matches_task_receipt(&task_receipt) {
             bail!("accepted frontier stage receipt differs from task receipt");
         }
+        checkpoint.complete();
     }
 
     Ok(LoadedAcceptedRestore {
@@ -634,7 +718,115 @@ fn load_accepted_restore(
         reconciliation_attempt: proof.reconciliation_attempt.clone(),
         mode,
         terminal_outcome,
+        preparation_failure,
     })
+}
+
+/// Read a finalized, un-retried failed attempt from the pinned accepted Study.
+/// No synthetic preparation anchor, task transition or start release is made.
+/// The caller holds the STORE snapshot guard throughout this validation.
+fn load_held_preparation_failure(
+    store: &fullmag_session::SessionStore,
+    run_id: &str,
+    planned_inputs: &std::collections::BTreeMap<String, (String, String)>,
+    catalog: &fullmag_session::FmsRunCatalog,
+) -> Result<Option<Value>> {
+    let exits = store.list_preparation_process_exit_receipts(run_id)?;
+    let decisions = store.list_preparation_retry_decisions(run_id)?;
+    let launches = store.list_preparation_process_launches(run_id)?;
+    let mut failures = Vec::new();
+    for task in &catalog.tasks {
+        if !matches!(&task.readiness, FmsTaskReadiness::Blocked { reason }
+            if reason == fullmag_session::FMS_TASK_AWAITING_PREPARATION_REASON)
+        {
+            continue;
+        }
+        let candidates = exits.iter().filter(|receipt| {
+            receipt.task_id == task.task_id
+                && !receipt.status_success
+                && !decisions.iter().any(|decision| {
+                    decision.task_id == task.task_id
+                        && decision.failed_preparation_attempt_id == receipt.preparation_attempt_id
+                })
+        }).collect::<Vec<_>>();
+        if candidates.is_empty() {
+            continue;
+        }
+        // This validates retry history and excludes an authorized newer retry.
+        if store.preparation_attempt_authorization_sequence(run_id, &task.task_id)?.is_some() {
+            continue;
+        }
+        if candidates.len() != 1 || task.lifecycle != FmsTaskLifecycle::Accepted
+            || task.attempt_id.is_some() || task.ownership_epoch.is_some()
+            || task.resource_id.is_some()
+        {
+            bail!("held preparation failure requires one unclaimed, un-retried failed attempt");
+        }
+        let (step_id, input_fingerprint) = planned_inputs.get(&task.task_id)
+            .context("held failed preparation task is not a planned accepted Study step")?;
+        if task.input_fingerprint != *input_fingerprint
+            || store.read_task_preparation_receipt(run_id, &task.task_id)?.is_some()
+            || store.read_accepted_stage_preparation_receipt(run_id, step_id)?.is_some()
+        {
+            bail!("held failed preparation differs from its immutable task inputs");
+        }
+        let receipt = candidates[0];
+        receipt.validate()?;
+        let lease = store.read_preparation_resource_lease(
+            run_id, &receipt.resource_id, &receipt.lease_token,
+        )?.context("held preparation failure has no exact resource lease")?;
+        lease.validate()?;
+        if receipt.run_id != run_id || lease.run_id != run_id
+            || lease.task_id != receipt.task_id
+            || lease.preparation_attempt_id != receipt.preparation_attempt_id
+            || lease.resource_id != receipt.resource_id || lease.lease_token != receipt.lease_token
+            || lease.state != fullmag_session::FmsResourceLeaseState::Released
+            || lease.heartbeat_sequence != receipt.lease_heartbeat_sequence
+        {
+            bail!("held preparation failure does not match its finalized lease");
+        }
+        let matching = launches.iter().filter(|launch| {
+            launch.task_id == receipt.task_id
+                && launch.preparation_attempt_id == receipt.preparation_attempt_id
+        }).collect::<Vec<_>>();
+        if matching.len() != 1 {
+            bail!("held preparation failure requires exactly one durable launch");
+        }
+        let launch = matching[0];
+        launch.validate()?;
+        if launch.run_id != run_id || launch.resource_id != receipt.resource_id
+            || launch.lease_token != receipt.lease_token
+            || launch.lease_heartbeat_sequence > receipt.lease_heartbeat_sequence
+        {
+            bail!("held preparation failure launch identity differs from its exit proof");
+        }
+        failures.push(json!({
+            "task_id": &task.task_id,
+            "step_id": step_id,
+            "preparation_attempt_id": &receipt.preparation_attempt_id,
+            "exit_receipt_id": &receipt.receipt_id,
+            "exit_code": receipt.exit_code,
+            "timed_out": receipt.timed_out,
+            "started_at_unix_ms": u64::try_from(launch.created_at.timestamp_millis())
+                .context("preparation launch timestamp predates the Unix epoch")?,
+            "completed_at_unix_ms": u64::try_from(receipt.observed_at.timestamp_millis())
+                .context("preparation exit timestamp predates the Unix epoch")?,
+            "error": receipt.failure_reason.as_deref().unwrap_or("preparation failed")
+                .replace(&receipt.lease_token, "[redacted lease token]"),
+        }));
+    }
+    if failures.is_empty() {
+        return Ok(None);
+    }
+    ensure_terminal_run_has_no_active_leases(store, run_id)?;
+    Ok(Some(json!({
+        "status": "failed",
+        "run_id": run_id,
+        "preparation_status": "failed",
+        "preparation_error_code": "accepted_preparation_process_failed",
+        "preparation_error": failures[0]["error"],
+        "failures": failures,
+    })))
 }
 
 /// Publish the process-local success marker only after the immutable snapshot
@@ -836,7 +1028,198 @@ fn validate_successor_transport(
     })
 }
 
+fn read_retry_record(record: &Value, field: &str, path: &str) -> Result<Value> {
+    let (raw, value) = read_control_record(path, "pre-ACK retry backing record")?;
+    let digest = require_digest(record, field, "pre-ACK retry")?;
+    if fullmag_session::hex_sha256(&raw) != digest {
+        bail!("pre-ACK retry backing digest differs: {field}");
+    }
+    Ok(value)
+}
+
+fn pre_ack_utc_timestamp(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+    let bytes = value.as_bytes();
+    let base_valid = bytes.len() >= 20
+        && bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b'T'
+        && bytes[13] == b':' && bytes[16] == b':'
+        && bytes.last() == Some(&b'Z')
+        && bytes[..19].iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit()
+        });
+    let fraction_valid = bytes.len() == 20
+        || ((22..=30).contains(&bytes.len()) && bytes[19] == b'.'
+            && bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit));
+    if !base_valid || !fraction_valid || &value[..4] < "1970" || &value[17..19] > "59" {
+        bail!("pre-ACK timestamp is not supported UTC RFC3339");
+    }
+    Ok(chrono::DateTime::parse_from_rfc3339(value)?)
+}
+
+fn validate_pre_ack_retry(
+    input: &AcceptedRestoreInput,
+    proof: &AcceptedRestoreProof,
+    root: &Path,
+) -> Result<()> {
+    let Some(relative) = input.pre_ack_retry_path.as_deref() else { return Ok(()); };
+    let parent = Path::new(&input.proof_path).parent().context("proof has no parent")?;
+    if Path::new(relative) != parent.join("pre-ack-retry.json") {
+        bail!("pre-ACK retry path differs from its original proof directory");
+    }
+    let (raw, record) = read_proof_record(root, relative, "first pre-ACK retry")?;
+    if Some(fullmag_session::hex_sha256(&raw).as_str()) != input.pre_ack_retry_sha256.as_deref() {
+        bail!("pre-ACK retry raw digest differs from transport");
+    }
+    for (field, expected) in [
+        ("schema", "fullmag.docker-accepted-pre-ack-retry.v1"),
+        ("request_sha256", input.request_sha256.as_deref().context("retry lacks request digest")?),
+        ("proof_sha256", input.proof_sha256.as_str()), ("run_id", input.run_id.as_str()),
+        ("project_id", input.project_id.as_str()), ("compose_project", proof.compose_project.as_str()),
+        ("control_volume", proof.control_volume.as_str()),
+        ("original_process_sha256", proof.terminal_process_record_sha256.as_str()),
+        ("owner_sha256", proof.terminal_owner_record_sha256.as_str()),
+    ] { require_equal_string(&record, field, expected)?; }
+    if !matches!(record.get("parent"), Some(value) if value.is_null()) {
+        bail!("pre-ACK retry cannot have a predecessor retry");
+    }
+    for kind in ["api", "preflight"] {
+        let attempt = require_string(&record, &format!("{kind}_attempt"))?;
+        validate_attempt(attempt, "pre-ACK attempt")?;
+        validate_container_id(require_string(&record, &format!("{kind}_container"))?, "pre-ACK container")?;
+        let terminal = read_retry_record(&record, &format!("{kind}_attempt_sha256"),
+            &format!("development/attempts/{attempt}/terminal.json"))?;
+        require_equal_string(&terminal, "state", "failed-confirmed")?;
+        require_equal_string(&terminal, "compose_project", &proof.compose_project)?;
+        require_equal_string(&terminal, "control_volume", &proof.control_volume)?;
+        let inputs = terminal.get("inputs").context("retry attempt lacks inputs")?;
+        require_equal_string(inputs, "source_root", &proof.source_root)?;
+        let image = require_string(&record, &format!("{kind}_image"))?;
+        validate_image_id(image, "pre-ACK image")?;
+        require_equal_string(inputs, "image_id", image)?;
+        let container = require_string(&record, &format!("{kind}_container"))?;
+        let ready = terminal.get("worker_cgroup").context("pre-ACK attempt lacks cgroup identity")?;
+        require_equal_string(ready, "schema", "fullmag.worker-cgroup-ready.v1")?;
+        require_equal_string(ready, "state", "ready")?;
+        require_equal_string(ready, "compose_project", &proof.compose_project)?;
+        require_equal_string(ready, "container_id", container)?;
+        require_equal_string(ready, "image_id", image)?;
+        require_equal_string(ready, "container_cgroup", &format!("/docker/{container}"))?;
+        let helper = terminal.get("worker_cgroup_helper").context("pre-ACK attempt lacks cgroup helper")?;
+        require_equal_string(helper, "state", "succeeded")?;
+        require_equal_string(helper, "name", &format!("fullmag-cgroup-{attempt}"))?;
+        require_digest(helper, "sha256", "pre-ACK cgroup helper")?;
+        if terminal.get("backend_container").is_some_and(|id| id.as_str() != Some(container)) {
+            bail!("pre-ACK attempt container differs");
+        }
+        if kind == "api" && terminal.get("backend_started_at")
+            != record.get("api_incarnation").and_then(|v| v.get("started_at"))
+        { bail!("pre-ACK API attempt start time differs from its journal"); }
+        if kind == "preflight" {
+            let restart = inputs.get("native_failed_restart").context("preflight lacks its stopped API predecessor")?;
+            require_equal_string(restart, "container_id", require_string(&record, "api_container")?)?;
+            require_equal_string(restart, "image_id", require_string(&record, "api_image")?)?;
+            require_equal_string(restart, "journal_sha256", require_digest(&record, "api_stop_sha256", "pre-ACK stop")?)?;
+            require_equal_string(&record, "native_restart_sha256", &fullmag_session::hex_sha256(&fullmag_session::canonical_json_bytes(restart)))?;
+        }
+    }
+    let api_container = require_string(&record, "api_container")?;
+    if record.get("api_attempt") == record.get("preflight_attempt")
+        || Some(api_container) == record.get("preflight_container").and_then(Value::as_str)
+    { bail!("pre-ACK retry requires distinct attempts and containers"); }
+    let journal = read_retry_record(&record, "api_stop_sha256", &format!("verification/stop-failed-{api_container}.json"))?;
+    for (field, expected) in [
+        ("schema", STOP_VERIFICATION_SCHEMA), ("state", "stopped-confirmed"),
+        ("failure_kind", "native-start-failure"), ("failure_mode", API_START_FAILURE_MODE),
+        ("container_id", api_container), ("image_id", require_string(&record, "api_image")?),
+        ("terminal_failed_owner_sha256", proof.terminal_owner_record_sha256.as_str()),
+    ] { require_equal_string(&journal, field, expected)?; }
+    if journal.get("container_state") != record.get("api_incarnation") {
+        bail!("pre-ACK API stop incarnation differs");
+    }
+    let envelope = journal.get("failure_receipt").context("pre-ACK stop lacks failure envelope")?;
+    let failure = envelope.get("receipt").context("pre-ACK stop lacks failure receipt")?;
+    validate_native_process_receipt_mode(failure, false, true)?;
+    let probe = journal.get("native_failure_probe").context("pre-ACK stop lacks native probe")?;
+    let owner = validate_native_failure_probe_mode(probe, require_digest(envelope, "sha256", "pre-ACK API failure")?, failure, false, true)?;
+    require_all_released(probe, "lease_states")?;
+    require_all_released(probe, "reservation_states")?;
+    let (owner_raw, original_owner) = read_proof_record(root, &proof.terminal_owner_record_path, "original pre-ACK owner")?;
+    if fullmag_session::hex_sha256(&owner_raw) != proof.terminal_owner_record_sha256
+        || owner != original_owner || journal.get("terminal_failed_owner") != Some(&original_owner)
+    { bail!("pre-ACK retry changed the original owner"); }
+    let (process_raw, process) = read_proof_record(root, &parent.join("pre-ack-api-terminal.json").to_string_lossy(), "stopped pre-ACK API")?;
+    if fullmag_session::hex_sha256(&process_raw) != require_digest(&record, "current_process_sha256", "pre-ACK process")?
+        || journal.get("terminal_process_receipt") != Some(&process)
+    { bail!("pre-ACK stopped API terminal differs"); }
+    require_equal_string(&process, "schema", "fullmag.docker-process-tree.v1")?;
+    require_equal_string(&process, "state", "shutdown_unknown")?;
+    if process.get("api_exit_code").and_then(Value::as_i64) != Some(-15)
+        || process.get("api_pid").and_then(Value::as_u64).is_none_or(|v| v == 0)
+        || process.get("runtime_pid").is_some_and(|value| !value.is_null())
+        || ["service_owner", "terminal_service_owner", "accepted_reattach"].iter().any(|k| process.get(*k).is_some())
+    { bail!("pre-ACK retry is not a stopped API-only incarnation"); }
+    let incarnation = record.get("preflight_incarnation").context("retry lacks preflight incarnation")?;
+    for (field, expected) in [
+        ("id", require_string(&record, "preflight_container")?),
+        ("image", require_string(&record, "preflight_image")?), ("status", "exited"),
+    ] { require_equal_string(incarnation, field, expected)?; }
+    if incarnation.get("pid").and_then(Value::as_u64) != Some(0)
+        || incarnation.get("exit_code").and_then(Value::as_i64) != Some(1)
+        || incarnation.get("oom_killed").and_then(Value::as_bool) != Some(false)
+    { bail!("pre-ACK preflight container is not exited/PID0/exit1/non-OOM"); }
+    let api_end = pre_ack_utc_timestamp(require_string(record.get("api_incarnation").context("missing API incarnation")?, "finished_at")?)?;
+    let pre_start = pre_ack_utc_timestamp(require_string(incarnation, "started_at")?)?;
+    let pre_end = pre_ack_utc_timestamp(require_string(incarnation, "finished_at")?)?;
+    if !(api_end < pre_start && pre_start <= pre_end) { bail!("pre-ACK incarnation order differs"); }
+    let operation = require_string(&record, "operation_attempt")?;
+    validate_attempt(operation, "pre-ACK operation")?;
+    let operation_root = format!("pre-ack-retry/attempts/{operation}");
+    let log = read_retry_record(&record, "preflight_log_sha256", &format!("{operation_root}/preflight-log.json"))?;
+    let text = require_string(&log, "log")?;
+    if log.get("incarnation") != Some(incarnation) || !text.contains("accepted_reattach_preflight")
+        || !text.contains("current terminal record differs from immutable backing evidence")
+        || text.contains("[fullmag-backend] Starting API and runtime service") || text.contains("starting fullmag-api")
+    { bail!("pre-ACK log does not prove a failure before API spawn"); }
+    let safety = read_retry_record(&record, "released_observation_sha256", &format!("{operation_root}/released-observation.json"))?;
+    require_equal_string(&safety, "schema", "fullmag.pre-ack-released-observation.v1")?;
+    if safety.get("active_count").and_then(Value::as_u64) != Some(0)
+        || !safety.get("leases").is_some_and(Value::is_array)
+        || !safety.get("reservations").is_some_and(Value::is_array)
+    { bail!("pre-ACK released-state observation differs"); }
+    let preflight_attempt = require_string(&record, "preflight_attempt")?;
+    let compose = read_retry_record(&record, "preflight_compose_sha256", &format!("development/attempts/{preflight_attempt}/compose.json"))?;
+    require_equal_string(&compose, "name", &proof.compose_project)?;
+    let provenance = read_retry_record(&record, "preflight_provenance_sha256", &format!("{operation_root}/preflight-provenance.json"))?;
+    require_equal_string(&provenance, "schema", "fullmag.docker-all-image.v1")?;
+    require_equal_string(&provenance, "state", "succeeded")?;
+    require_equal_string(&provenance, "source_snapshot_sha256", require_digest(&record, "preflight_source_snapshot", "pre-ACK source snapshot")?)?;
+    let (_, terminal) = read_control_record(&format!("{operation_root}/terminal.json"), "pre-ACK publication terminal")?;
+    require_equal_string(&terminal, "state", "succeeded")?;
+    require_equal_string(&terminal, "phase", "pre-ack-retry")?;
+    require_equal_string(&terminal, "compose_project", &proof.compose_project)?;
+    require_equal_string(&terminal, "control_volume", &proof.control_volume)?;
+    require_equal_string(&terminal, "retry_record_sha256", &fullmag_session::hex_sha256(&raw))?;
+    let entries = fs::read_dir(root.join(parent))?.collect::<std::io::Result<Vec<_>>>()?;
+    if entries.len() > 64 { bail!("pre-ACK acknowledgement inventory exceeds its bound"); }
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !matches!(name.as_str(), "request.json" | "proof.json" | "terminal-owner.json" | "terminal-process.json"
+            | "pre-ack-retry.json" | "pre-ack-api-terminal.json")
+            || !entry.file_type()?.is_file() || name.starts_with("restore-ack-") || name.starts_with("successor-drain-")
+            || name.ends_with(".part") || name.ends_with(".tmp")
+        { bail!("pre-ACK retry has consumed or uncertain acknowledgement evidence"); }
+    }
+    Ok(())
+}
+
 fn validate_initial_transport(input: &AcceptedRestoreInput) -> Result<()> {
+    match (&input.pre_ack_retry_path, &input.pre_ack_retry_sha256) {
+        (None, None) => {}
+        (Some(_), Some(digest)) if input.request_sha256.is_some()
+            && input.restore_mode.as_deref() == Some(RESTORE_MODE_HELD) => {
+                validate_digest(digest, "pre_ack_retry_sha256")?;
+            }
+        _ => bail!("pre-ACK retry requires a complete first-restore transport"),
+    }
     match (
         input.request_sha256.as_deref(),
         input.restore_mode.as_deref(),
@@ -858,6 +1241,9 @@ fn validate_initial_transport(input: &AcceptedRestoreInput) -> Result<()> {
 }
 
 fn validate_successor_input(input: &AcceptedRestoreInput) -> Result<()> {
+    if input.pre_ack_retry_path.is_some() || input.pre_ack_retry_sha256.is_some() {
+        bail!("successor transport cannot carry a pre-ACK retry");
+    }
     let request_sha256 = input
         .request_sha256
         .as_deref()
@@ -1570,7 +1956,7 @@ fn validate_backing_records(
     ] {
         require_equal_string(&unresolved, field, expected)?;
     }
-    validate_reconciled_helper(&unresolved, &activation, &proof.activation_attempt)?;
+    validate_reconciled_helper(&unresolved, &activation, &proof.activation_attempt, None)?;
 
     let provenance_relative = format!(
         "activation/attempts/{}/startup-provenance.json",
@@ -1632,7 +2018,20 @@ fn validate_backing_records(
     ] {
         require_equal_string(&reconciliation, field, expected)?;
     }
-    validate_reconciled_helper(&reconciliation, &activation, &proof.activation_attempt)?;
+    let helper_witness = if reconciliation.get("helper_sha256").is_none() {
+        Some(read_legacy_helper_witness(proof, &activation, &unresolved)?)
+    } else {
+        if proof.legacy_helper_witness_sha256.is_some() {
+            bail!("helper witness is only permitted for an omitted reconciliation helper digest");
+        }
+        None
+    };
+    validate_reconciled_helper(
+        &reconciliation,
+        &activation,
+        &proof.activation_attempt,
+        helper_witness.as_deref(),
+    )?;
 
     let (reconciliation_current_raw, reconciliation_current) = read_control_record(
         "activation-reconciliation/current.json",
@@ -2015,10 +2414,83 @@ fn canonical_record_sha256(value: &Value) -> String {
     fullmag_session::hex_sha256(&bytes)
 }
 
+fn read_legacy_helper_witness(
+    proof: &AcceptedRestoreProof,
+    activation: &Value,
+    unresolved: &Value,
+) -> Result<String> {
+    let expected_sha = proof
+        .legacy_helper_witness_sha256
+        .as_deref()
+        .context("omitted reconciliation helper digest requires a technical terminal witness pin")?;
+    validate_digest(expected_sha, "legacy_helper_witness_sha256")?;
+    let relative = format!("activation/attempts/{}/terminal.json", proof.activation_attempt);
+    let (raw, terminal) = read_control_record(&relative, "legacy helper witness technical terminal")?;
+    if fullmag_session::hex_sha256(&raw) != expected_sha {
+        bail!("legacy helper witness raw digest differs from reattach proof");
+    }
+    for (field, expected) in [
+        ("schema", ACTIVATION_OPERATION_SCHEMA),
+        ("phase", "activation"),
+        ("state", "failed-confirmed"),
+        ("attempt", proof.activation_attempt.as_str()),
+        ("compose_project", proof.compose_project.as_str()),
+        ("control_volume", proof.control_volume.as_str()),
+        ("activation_outcome", "unknown-retained"),
+        ("reason", "backend-namespace-stopped"),
+        ("reconciliation_attempt", proof.reconciliation_attempt.as_str()),
+    ] {
+        require_equal_string(&terminal, field, expected)?;
+    }
+    let helper_name = format!("fullmag-control-{}", proof.activation_attempt);
+    require_equal_string(&terminal, "helper_container", &helper_name)?;
+    let helper_sha = require_digest(&terminal, "helper_sha256", "legacy helper witness")?;
+    if helper_sha != require_digest(activation, "helper_sha256", "original activation")?
+        || helper_sha != require_digest(unresolved, "helper_sha256", "activation quarantine")?
+    {
+        bail!("legacy helper witness digest differs from original activation or quarantine");
+    }
+    if terminal.get("inputs") != activation.get("inputs") {
+        bail!("legacy helper witness inputs differ from original activation");
+    }
+    match require_string(&terminal, "helper_state")? {
+        "running" => {
+            let helper_id = require_string(&terminal, "helper_id")?;
+            validate_container_id(helper_id, "legacy helper witness historical container")?;
+            if helper_id.bytes().all(|byte| byte == b'0') {
+                bail!("legacy helper witness container is an all-zero placeholder");
+            }
+        }
+        "absent-confirmed" => {
+            if !matches!(terminal.get("helper_id"), Some(value) if value.is_null()) {
+                bail!("absent legacy helper witness must have a null helper_id");
+            }
+            let absence = json!({
+                "schema": "fullmag.docker-helper-absence-probe.v1", "state": "absent",
+                "helper_name": helper_name, "containers": [],
+            });
+            let absence_sha =
+                fullmag_session::hex_sha256(&fullmag_session::canonical_json_bytes(&absence));
+            require_equal_string(&terminal, "helper_absence_probe_sha256", &absence_sha)?;
+            require_equal_string(unresolved, "helper_absence_probe_sha256", &absence_sha)?;
+        }
+        _ => bail!("legacy helper witness has no supported helper state"),
+    }
+    if !terminal
+        .get("finished_at")
+        .and_then(Value::as_f64)
+        .is_some_and(f64::is_finite)
+    {
+        bail!("legacy helper witness has no completion timestamp");
+    }
+    Ok(helper_sha.to_owned())
+}
+
 fn validate_reconciled_helper(
     record: &Value,
     activation: &Value,
     activation_attempt: &str,
+    helper_witness: Option<&str>,
 ) -> Result<()> {
     let helper_name = format!("fullmag-control-{activation_attempt}");
     require_equal_string(record, "helper_container", &helper_name)?;
@@ -2031,7 +2503,13 @@ fn validate_reconciled_helper(
         "helper_sha256",
         "original activation helper",
     )?;
-    let helper_sha = require_digest(record, "helper_sha256", "reconciled activation helper")?;
+    // Only an omitted key is compatible. Null/empty/mismatched present values
+    // still go through the strict digest validator.
+    let helper_sha = if record.get("helper_sha256").is_none() {
+        helper_witness.context("reconciled activation helper digest is missing")?
+    } else {
+        require_digest(record, "helper_sha256", "reconciled activation helper")?
+    };
     if helper_sha != activation_helper_sha {
         bail!("reconciled activation helper digest differs from original receipt");
     }
@@ -2575,7 +3053,9 @@ fn validate_input_digests(input: &AcceptedRestoreInput) -> Result<()> {
         || input.previous_ack_path.is_some()
         || input.previous_ack_sha256.is_some()
         || input.previous_drain_path.is_some()
-        || input.previous_drain_sha256.is_some();
+        || input.previous_drain_sha256.is_some()
+        || input.pre_ack_retry_path.is_some()
+        || input.pre_ack_retry_sha256.is_some();
     if has_restart_fields {
         let request_sha256 = input
             .request_sha256
@@ -2699,6 +3179,110 @@ fn validate_bounded_text(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+/// Project only a validated terminal process observation. This does not infer
+/// an internal meshing/solver stage, create a success receipt, or release Start.
+fn restored_preparation_failure_snapshot(
+    failure: &Value,
+) -> Result<crate::types::SimulationPreparationSnapshot> {
+    use crate::types::{
+        SimulationPreparationFailureSnapshot, SimulationPreparationLogEntrySnapshot,
+        SimulationPreparationSnapshot, SimulationPreparationStageSnapshot,
+    };
+    let observations = failure["failures"].as_array()
+        .context("restored preparation failures are not an array")?;
+    let observed = observations.first()
+        .context("restored preparation failure has no process observation")?;
+    let preparation_id = observed["preparation_attempt_id"].as_str()
+        .context("restored preparation failure has no attempt identity")?;
+    let receipt_id = observed["exit_receipt_id"].as_str()
+        .context("restored preparation failure has no exit receipt identity")?;
+    let started_at = observed["started_at_unix_ms"].as_u64()
+        .context("restored preparation failure has no launch timestamp")?;
+    let completed_at = observed["completed_at_unix_ms"].as_u64()
+        .context("restored preparation failure has no exit timestamp")?;
+    let reason = observed["error"].as_str()
+        .context("restored preparation failure has no failure reason")?;
+    let summary = if observations.len() == 1 {
+        "The preparation process failed. Simulation was not started.".to_string()
+    } else {
+        format!("Preparation failed for {} tasks. Simulation was not started.", observations.len())
+    };
+    let detail = format!(
+        "The exact internal failure stage is unknown. \
+         This is the recorded process failure, not a new attempt. \
+         Exit receipt: {receipt_id}.\n{reason}"
+    );
+    let log_tail = observations.iter().rev().take(200).rev().map(|observation| {
+        let timestamp = observation["completed_at_unix_ms"].as_u64()
+            .context("restored preparation log has no exit timestamp")?;
+        let task = observation["task_id"].as_str()
+            .context("restored preparation log has no task identity")?;
+        let attempt = observation["preparation_attempt_id"].as_str()
+            .context("restored preparation log has no attempt identity")?;
+        let receipt = observation["exit_receipt_id"].as_str()
+            .context("restored preparation log has no exit receipt identity")?;
+        let error = observation["error"].as_str()
+            .context("restored preparation log has no failure reason")?;
+        Ok(SimulationPreparationLogEntrySnapshot {
+            timestamp_unix_ms: timestamp,
+            level: "error".into(),
+            stage_id: "domain_preparation".into(),
+            message: format!(
+                "Recorded preparation failure; internal stage unknown. \
+                 Task: {task}; attempt: {attempt}; exit receipt: {receipt}. {error}"
+            ),
+        })
+    }).collect::<Result<Vec<_>>>()?;
+    // The existing resource has nine canonical stage IDs. Domain preparation
+    // is the enclosing activity here, not evidence of a specific internal step.
+    let stages = [
+        ("runtime_startup", "Runtime startup"),
+        ("script_materialization", "Script materialization"),
+        ("validation", "Validation"),
+        ("planning", "Planning"),
+        ("domain_preparation", "Preparation process"),
+        ("meshing", "Meshing"),
+        ("mesh_postprocessing", "Mesh postprocessing"),
+        ("solver_initialization", "Solver initialization"),
+        ("ready", "Ready"),
+    ].into_iter().map(|(id, label)| {
+        let failed = id == "domain_preparation";
+        SimulationPreparationStageSnapshot {
+            id: id.into(),
+            label: label.into(),
+            detail: if failed {
+                "The process exited unsuccessfully; its exact internal failure stage is unknown.".into()
+            } else {
+                "No stage timing or completion evidence was recovered.".into()
+            },
+            status: if failed { "failed" } else { "pending" }.into(),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            duration_ms: None,
+            clock_adjustment: None,
+            progress_percent: None,
+            progress_label: None,
+        }
+    }).collect();
+    Ok(SimulationPreparationSnapshot {
+        preparation_id: preparation_id.into(),
+        revision: 1,
+        status: "failed".into(),
+        active_stage_id: None,
+        started_at_unix_ms: started_at,
+        completed_at_unix_ms: Some(completed_at),
+        stages,
+        log_tail,
+        failure: Some(SimulationPreparationFailureSnapshot {
+            error_code: "accepted_preparation_process_failed".into(),
+            summary,
+            detail: Some(detail),
+            stage_id: "domain_preparation".into(),
+            diagnostics_correlation_id: None,
+        }),
+    })
+}
+
 fn build_snapshot(
     state: &AppState,
     loaded: &LoadedAcceptedRestore,
@@ -2709,10 +3293,11 @@ fn build_snapshot(
     let terminal_status = match loaded.terminal_outcome.as_deref() {
         Some("interrupted") => "failed",
         Some(outcome) => outcome,
+        None if loaded.preparation_failure.is_some() => "failed",
         None => "awaiting_command",
     };
     let session_status = terminal_status.to_string();
-    let run_status = if loaded.terminal_outcome.is_some() {
+    let run_status = if loaded.terminal_outcome.is_some() || loaded.preparation_failure.is_some() {
         terminal_status.to_string()
     } else {
         "waiting_for_compute".into()
@@ -2803,7 +3388,8 @@ fn build_snapshot(
         })),
         mesh_workspace: None,
         stage_execution: None,
-        simulation_preparation: None,
+        simulation_preparation: loaded.preparation_failure.as_ref()
+            .map(restored_preparation_failure_snapshot).transpose()?,
         run: Some(RunManifest {
             status: run_status,
             ..run
@@ -2822,6 +3408,12 @@ fn build_snapshot(
         fem_mesh: None,
     });
     snapshot.scene_document = Some(loaded.scene.clone());
+    if let Some(failure) = loaded.preparation_failure.as_ref() {
+        snapshot.metadata.as_mut()
+            .and_then(Value::as_object_mut)
+            .context("restored preparation failure metadata is not an object")?
+            .insert("accepted_preparation".into(), failure.clone());
+    }
     snapshot.runtime_status = crate::session::build_runtime_status_view(&session_status);
     snapshot.state_version = 1;
     Ok(snapshot)
@@ -2830,6 +3422,57 @@ fn build_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_process_failure_preserves_identity_and_durable_times() {
+        let failure = json!({"failures": [{
+            "task_id": "task-1",
+            "preparation_attempt_id": "attempt-1",
+            "exit_receipt_id": "exit-1",
+            "started_at_unix_ms": 100,
+            "completed_at_unix_ms": 250,
+            "error": "process exited with code 1"
+        }]});
+        let snapshot = restored_preparation_failure_snapshot(&failure).unwrap();
+        assert_eq!(snapshot.preparation_id, "attempt-1");
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.status, "failed");
+        assert_eq!(snapshot.started_at_unix_ms, 100);
+        assert_eq!(snapshot.completed_at_unix_ms, Some(250));
+        assert!(snapshot.active_stage_id.is_none());
+        assert_eq!(snapshot.stages.len(), 9);
+        assert!(snapshot.stages.iter().all(|stage|
+            stage.started_at_unix_ms.is_none()
+                && stage.completed_at_unix_ms.is_none()
+                && stage.duration_ms.is_none()
+                && stage.status != "completed"
+        ));
+        let diagnostic = snapshot.failure.unwrap();
+        assert!(diagnostic.diagnostics_correlation_id.is_none());
+        let detail = diagnostic.detail.unwrap();
+        assert!(detail.contains("exact internal failure stage is unknown"));
+        assert!(detail.contains("Exit receipt: exit-1"));
+        assert!(restored_preparation_failure_snapshot(&json!({"failures": []})).is_err());
+    }
+
+    #[test]
+    fn restored_process_failure_reports_multiple_tasks_without_new_attempts() {
+        let failure = json!({"failures": [
+            {"task_id": "task-1", "preparation_attempt_id": "attempt-1",
+             "exit_receipt_id": "exit-1", "started_at_unix_ms": 100,
+             "completed_at_unix_ms": 200, "error": "first failure"},
+            {"task_id": "task-2", "preparation_attempt_id": "attempt-2",
+             "exit_receipt_id": "exit-2", "started_at_unix_ms": 150,
+             "completed_at_unix_ms": 300, "error": "second failure"}
+        ]});
+        let snapshot = restored_preparation_failure_snapshot(&failure).unwrap();
+        assert_eq!(snapshot.preparation_id, "attempt-1");
+        assert!(snapshot.failure.unwrap().summary.contains("2 tasks"));
+        assert_eq!(snapshot.log_tail.len(), 2);
+        assert_eq!(snapshot.log_tail[1].timestamp_unix_ms, 300);
+        assert!(snapshot.log_tail[1].message.contains("attempt-2"));
+        assert!(snapshot.log_tail[1].message.contains("second failure"));
+    }
 
     fn input() -> AcceptedRestoreInput {
         AcceptedRestoreInput {
@@ -2850,6 +3493,8 @@ mod tests {
             previous_ack_sha256: None,
             previous_drain_path: None,
             previous_drain_sha256: None,
+            pre_ack_retry_path: None,
+            pre_ack_retry_sha256: None,
         }
     }
 
@@ -2863,6 +3508,7 @@ mod tests {
             startup_provenance_sha256: input.startup_provenance_sha256.clone(),
             activation_receipt_sha256: "f".repeat(64),
             stop_reconcile_proof_sha256: "1".repeat(64),
+            legacy_helper_witness_sha256: None,
             stop_verification_sha256: "2".repeat(64),
             terminal_owner_record_path: "accepted-run-reattach/proof/terminal-owner.json".into(),
             terminal_owner_record_sha256: "4".repeat(64),
@@ -3317,6 +3963,7 @@ mod tests {
             startup_provenance_sha256: input.startup_provenance_sha256.clone(),
             activation_receipt_sha256: "f".repeat(64),
             stop_reconcile_proof_sha256: "1".repeat(64),
+            legacy_helper_witness_sha256: None,
             stop_verification_sha256: "2".repeat(64),
             terminal_owner_record_path: "accepted-run-reattach/proof/terminal-owner.json".into(),
             terminal_owner_record_sha256: "4".repeat(64),
@@ -3366,6 +4013,7 @@ mod tests {
             startup_provenance_sha256: input.startup_provenance_sha256.clone(),
             activation_receipt_sha256: "f".repeat(64),
             stop_reconcile_proof_sha256: "1".repeat(64),
+            legacy_helper_witness_sha256: None,
             stop_verification_sha256: "2".repeat(64),
             terminal_owner_record_path: "accepted-run-reattach/proof/terminal-owner.json".into(),
             terminal_owner_record_sha256: "4".repeat(64),
@@ -3416,11 +4064,11 @@ mod tests {
                 &fullmag_session::canonical_json_bytes(&absence_probe),
             ),
         });
-        assert!(validate_reconciled_helper(&record, &activation, &attempt).is_ok());
+        assert!(validate_reconciled_helper(&record, &activation, &attempt, None).is_ok());
 
         let mut changed = record;
         changed["helper_container"] = Value::String("fullmag-control-other".into());
-        assert!(validate_reconciled_helper(&changed, &activation, &attempt).is_err());
+        assert!(validate_reconciled_helper(&changed, &activation, &attempt, None).is_err());
     }
 
     #[test]
@@ -3706,6 +4354,7 @@ mod tests {
             startup_provenance_sha256: input.startup_provenance_sha256.clone(),
             activation_receipt_sha256: "f".repeat(64),
             stop_reconcile_proof_sha256: "1".repeat(64),
+            legacy_helper_witness_sha256: None,
             stop_verification_sha256: "2".repeat(64),
             terminal_owner_record_path: "accepted-run-reattach/proof/terminal-owner.json".into(),
             terminal_owner_record_sha256: "4".repeat(64),

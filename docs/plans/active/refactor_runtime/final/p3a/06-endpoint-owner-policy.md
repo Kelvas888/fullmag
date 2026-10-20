@@ -1,5 +1,7 @@
 # P3a — macierz owner/write policy dla endpointów
 
+> **Historyczna macierz 304 operacji.** Nie jest pełną listą na masterze z 20.10.2026. Aktualny rejestr 371 operacji: [10-current-endpoint-review.md](10-current-endpoint-review.md). Generator poniżej czyta zapisane stare inventory; samo jego uruchomienie nie aktualizuje zakresu do dzisiejszego OpenAPI ani nie wykonuje ponownego review.
+
 Ten plik jest generowany przez `scripts/audit_refactor_p3a.py` z
 `final/p0/inventory.json`. Obejmuje każdą operację OpenAPI i zapisuje
 właściciela, politykę odczytu/zapisu, handler oraz status migracji

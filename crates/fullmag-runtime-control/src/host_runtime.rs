@@ -1393,12 +1393,15 @@ impl HostRuntimeAdmission {
         use fullmag_session::FmsResourceLeaseState;
 
         let store_id = HostResourceLedger::store_id(store.root())?;
-        let snapshot = self.ledger.read()?;
+        // Discovery does not authorize a release. Each release rechecks the
+        // exact current reservation and Released local lease under HOST ->
+        // STORE writer guards; prestart repair separately fences launch first.
+        let snapshot = self.ledger.read_observation_snapshot()?;
         let prestart_repaired = self.reconcile_prestart_stopping_store_reservations_from_snapshot(
             store, &store_id, &snapshot,
         )?;
         let snapshot = if prestart_repaired > 0 {
-            self.ledger.read()?
+            self.ledger.read_observation_snapshot()?
         } else {
             snapshot
         };
@@ -1476,16 +1479,29 @@ impl HostRuntimeAdmission {
                 } => {
                     if self
                         .ledger
-                        .release_cancelled_preparation_without_spawn(store, identity)?
+                        .release_cancelled_preparation_without_spawn(store, identity)
+                        .with_context(|| {
+                            format!(
+                                "reconciling cancelled preparation: run_id={}, resource_id={}, lease_token={}",
+                                identity.run_id, identity.resource_id, identity.lease_token,
+                            )
+                        })?
                     {
                         reconciled += 1;
                         continue;
                     }
-                    let Some(lease) = store.read_preparation_resource_lease(
-                        &identity.run_id,
-                        &identity.resource_id,
-                        &identity.lease_token,
-                    )?
+                    let Some(lease) = store
+                        .read_preparation_resource_lease(
+                            &identity.run_id,
+                            &identity.resource_id,
+                            &identity.lease_token,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "reading preparation lease for release reconciliation: run_id={}, resource_id={}, lease_token={}",
+                                identity.run_id, identity.resource_id, identity.lease_token,
+                            )
+                        })?
                     else {
                         continue;
                     };

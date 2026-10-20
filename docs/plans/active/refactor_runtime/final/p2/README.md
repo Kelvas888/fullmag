@@ -1,5 +1,8 @@
 # P2 — authoring, Python i historia edycji
 
+> **Dziennik historycznych przyrostów.** Statusy, wyniki i polecenia poniżej dotyczą źródeł oraz warunków wskazanych w poszczególnych checkpointach. Bieżący obraz mastera z 20.10.2026: [tabela implementacji i testów](../06-status-realizacji.md), [plan dalszych prac](../03-plan-refaktoryzacji.md). Dawny PASS nie jest automatycznie kwalifikacją nowego HEAD; aktualne zasady wykonania określa AGENTS.md.
+
+
 Ten katalog rejestruje wykonane przyrosty P2. P2 nie jest jeszcze ukończone: P2-A ma AST/bibliotekę parametrów, niemutowalny kontrakt `ModelDefinition`/`ComponentDefinition`/`PhysicsConfiguration` po stronie Python, parser wersjonowanego payloadu `authoring_model.v1`, projekcję tego kontraktu po stronie Rust oraz shared canonical digest fixture (Python 12/12 PASS, Rust 104/104 PASS; checkpoint 24.09 w `02-canonical-ir.md`), ale pełne podpięcie display/provenance i GUI/Python/Rust round-trip pozostają otwarte; P2-B ma częściową geometrię/selekcje, P2-C nie ma jeszcze pełnej granicy materializacji, a P2-D ma revision-fenced Undo/Redo, rejestr aktywnego formularza Inspectora, staged history bridge i helper dla wielu immediate mutations. `GeometryObjectPanel` i `ObjectGeneralPanel` są zarejestrowane jako staged formularze; przegląd pozostałych rejestracji i direct handlers nadal pozostaje otwarty.
 
 ## Aktualny checkpoint — 24.09.2026

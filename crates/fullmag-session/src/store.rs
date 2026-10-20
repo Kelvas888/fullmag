@@ -5526,17 +5526,35 @@ impl SessionStore {
         }
         let relative =
             format!("runs/{run_id}/preparation_resource_leases/{resource_id}/{lease_token}.json");
-        let path = checked_path(&self.root, &relative)?;
-        let Some(data) = read_optional_bounded_regular_file(
-            &self.root,
-            &relative,
-            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
-            "preparation resource lease",
-        )? else {
+        let read = || {
+            read_optional_bounded_regular_file(
+                &self.root,
+                &relative,
+                crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+                "preparation resource lease",
+            )
+        };
+        let data = match read() {
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                // Publication can race the metadata/open sequence on a bind
+                // mount. Retry the complete bounded read under the existing
+                // reentrant writer; never manufacture a missing lease.
+                let _transaction = self.write_transaction()?;
+                read()?
+            }
+            result => result?,
+        };
+        let Some(data) = data else {
             return Ok(None);
         };
         let lease: FmsPreparationResourceLease = serde_json::from_slice(&data)
-            .with_context(|| format!("parsing preparation resource lease {}", path.display()))?;
+            .with_context(|| format!("parsing preparation resource lease {relative}"))?;
         if lease.relative_path()? != relative {
             anyhow::bail!("preparation resource lease identity does not match its path");
         }

@@ -519,3 +519,46 @@ Przeglądarka, publiczne OpenAPI i solver lanes nie otrzymują nowej authority.
 Zmiana dotyczy orkiestracji, nie semantyki Python/ProblemIR ani wyboru CPU/GPU.
 Regresje transportu nie zastępują kwalifikacji kolejnych skryptów w Dockerze;
 start, replay po restarcie i odczyt zachowanych danych pozostają **NOT VERIFIED**.
+
+## Uzupełnienie 20.10.2026 — przerwane odtworzenie przed pierwszym ACK
+
+Odtworzenie accepted run może zakończyć się przed publikacją pierwszego
+`restore-ack`. Receipt procesu opisuje wtedy nowszą próbę API, podczas gdy
+pierwotny proof nadal przypina poprzedni terminal. Nie wolno zastępować tych
+historycznych bajtów ani traktować nieudanego startu jako potwierdzonego
+odtworzenia. Zwykłe porównanie current == original i ścieżka successor z ACK
+pozostają obowiązujące w dotychczasowych przypadkach.
+
+Dopuszczamy osobny, wąski prywatny dowód pierwszej próby pre-ACK: jedno
+potwierdzone zatrzymanie po nieudanym starcie API oraz co najwyżej jedną
+późniejszą, zakończoną inkarnację, która odmówiła przed spawn API. Są to dwie
+różne inkarnacje, każda z własnymi pinami kontenera, obrazu i operacji.
+Dowód jest create-only i wiąże surowe SHA pierwotnego request/proof, niezmienionego
+ownera, aktualnego terminala oraz journalu zatrzymania. Publikacja wymaga
+kanonicznych dowodów braku procesów i aktywnych zasobów, świeżego stanu held run
+bez Solve/claim/start_release oraz braku jakiegokolwiek ACK lub successor drain
+w przypiętym katalogu. Niespójny albo nieznany stan zatrzymuje operację.
+
+Przeniesienie wcześniejszego `native_failed_restart` jest dozwolone wyłącznie
+jako ten sam pełny payload z przypiętej operacji, po ponownej walidacji jego
+journalu i całego zestawu pinów. Dowód dodatkowo wiąże hash tego payloadu,
+aktualną konfigurację oraz brak późniejszego API/native w osobnej inkarnacji
+preflight. Zwykłe `ensure_configuration` zachowuje wszystkie kontrole; sam hash
+poprzedniej konfiguracji nie stanowi nowej autoryzacji ownera.
+
+PID 1 może zaakceptować różnicę current terminal wyłącznie przez ten jawnie
+przypięty wariant; kod Rust niezależnie weryfikuje te same surowe bajty i pełne
+pierwotne backing records. Wejście nadal odtwarza ten sam model i nie autoryzuje
+ponownego skryptu, przygotowania, Solve, zwolnienia lease ani zmiany ownera.
+Requested/resolved execution i granice FDM/FEM CPU/GPU pozostają bez zmian.
+Przeglądarka i publiczne OpenAPI nie otrzymują nowego transportu odzyskiwania.
+
+Właścicielem zgodności jest prywatny launcher Docker DEV. Ogólne łańcuchy wielu
+kolejnych porażek pre-ACK nie są częścią tego wariantu; bez osobnego kontraktu
+pozostają blokowane. Wycofanie wariantu wyłącza jego wybór, zachowując oryginały,
+nowy dowód i dane. Nie usuwa się historii w celu powrotu do dawnego porównania.
+
+Status: decyzja i implementacja w toku. Wymagane są review producenta i obu
+walidatorów, spójny managed build, start i odtworzenie tego samego runu oraz
+oddzielny dowód braku automatycznej nowej próby. Runtime pozostaje
+**NOT VERIFIED**; testów nie uruchamiamy na wyraźne polecenie użytkownika.

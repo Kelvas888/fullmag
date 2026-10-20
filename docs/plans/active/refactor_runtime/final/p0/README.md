@@ -1,10 +1,12 @@
 # P0 — wykonanie pierwszego etapu na masterze
 
+> **Checkpoint historyczny.** Poniższe przebiegi i ścieżki opisują ówczesne źródła, nie odbiór mastera z 20.10.2026. Aktualne zestawienie: [status całego planu](../06-status-realizacji.md), [inventory API 20.10](07-current-api-inventory.md). Dawne inventory 304 operacji pozostaje zachowane.
+
 Źródło zadania: [finalny plan refaktoryzacji](../03-plan-refaktoryzacji.md), pakiety P0-A–F. Użytkownik jawnie wybrał pracę bezpośrednio na `masterze`. Audyt wejściowy pozostaje zachowany; ten podfolder rejestruje implementację i dowody.
 
 **Minimalna bramka przejścia do P1 jest zaliczona.** Zarządzany build CLI/API/Pythona/frontendu zakończył się `succeeded`, exit 0; zweryfikowano hashe 109 artefaktów. Autoryzowane regresje P0 na Windows: **70 passed, 0 failed, 0 ignored**, source identity nie zmieniła się podczas wykonania. Nie jest to pełna kwalifikacja P0 ani wydania: power loss, pozostałe platformy, API runtime i pomiary baseline pozostają otwarte. Szczegóły dowodów i ograniczeń zapisano w [statusie implementacji](03-implementation-status.md) oraz [odbiorze minimalnym](05-minimal-gate.md).
 
-### Rewalidacja bieżącego checkoutu
+### Historyczna rewalidacja checkoutu wskazanego poniżej
 
 Po późniejszych poprawkach P0/P1 ponownie wykonano `just verify-session-persistence` na `master@14c8e73a6f3c55f4fc080835a6156f2a4db8f111`, dirty source, bez zmiany źródła podczas runu. Najnowszy run `4315e35f99d74ffdb77159aaee82a9f5` ma stan `passed`, exit 0 i **51 + 7 + 12 = 70 passed, 0 failed, 0 ignored**. Receipt: `storage/builds/fullmag-0950f4dca4ffe38f/windows-session-check/session-persistence/4315e35f99d74ffdb77159aaee82a9f5/receipt.json`; source digest `e2d92e4dc84a05ffe3c733141ae3981fc575bde85bc2d436688346596d7aa4df`, receipt SHA-256 `30F08AC207B7D2110D498CAD5035E004F4430A9FB5CF8F4AE5BFB773EF07D4A5`, log SHA-256 `6D036D9E4D259A9B5609E06B60B2AFAE3D3F4E309E3C7DE471F9D3B6F908A045`.
 

@@ -5,6 +5,17 @@ kompiluje aplikację i uruchamia API oraz runtime; `frontend` obsługuje Next/HM
 Obrazy zależności i helperów przygotowuje BuildKit w tym samym projekcie.
 Nie powstaje trzecia usługa aplikacyjna ani hostowy katalog kompilacji.
 
+Frontend ma limit **16 GiB RAM i 4 CPU**. Launcher Next oraz środowisko
+narzędzi uruchamianych w usłudze frontend przypinają
+`NODE_OPTIONS=--max-old-space-size=6144` (6 GiB starej generacji sterty V8
+na proces). To górne limity, a nie rezerwacja pamięci. Budżet kontenera
+pozostawia miejsce na Next, osobny proces lint/typecheck, pozostałe obszary
+sterty i alokacje natywne. Launcher nie dziedziczy dowolnych flag Node z hosta.
+Zmiana Compose lub helpera wymaga zarządzanego odtworzenia usług z aktualnym
+obrazem; sam restart istniejącego kontenera nie zmienia jego limitów.
+Odbiór wymaga `docker inspect` (Memory/NanoCpus), odczytu cgroup oraz
+potwierdzenia limitu sterty i środowiska procesu Node.
+
 ## Uruchomienie
 
 Użyj Pythona z Windows PowerShell albo Linux/WSL oraz silnika Docker Linux.

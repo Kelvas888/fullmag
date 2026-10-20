@@ -1,5 +1,7 @@
 # P3a — immutable request context i sesyjny data-plane
 
+> **Dziennik historycznych przyrostów.** Aktualne źródła obejmują 371 operacji OpenAPI, podczas gdy dawna macierz obejmuje 304. Zobacz [bieżący rejestr przeglądu](10-current-endpoint-review.md) oraz [status planu](../06-status-realizacji.md). Poniższe PASS zachowują wyłącznie swój opisany zakres; nie kwalifikują automatycznie aktualnego HEAD.
+
 Ten katalog zawiera pilot P3a-A oraz kolejne slice'y migracji klienta P3a-B.
 
 Pilot obejmuje obecnie pięć głównych rodzin przepływu oraz recovery persistence:
