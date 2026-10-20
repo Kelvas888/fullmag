@@ -4451,12 +4451,12 @@ def _prepare_locked(
         if attempt is None or attempt[0].get("state") != "succeeded":
             _fail("successful Make attempt receipt disappeared")
         receipt = attempt[0]
-        digest, size = _sha256_file(
+        digest, metadata = _sha256_file(
             output / FAILED_MAKE_LOG_NAME,
             "published Make diagnostic log",
             MAX_BUILD_LOG_BYTES,
         )
-        if digest != receipt["log_sha256"] or size != receipt["log_size"]:
+        if digest != receipt["log_sha256"] or metadata.st_size != receipt["log_size"]:
             _fail("published Make diagnostic log differs from its attempt receipt")
         _retire_make_log(attempt)
         _prune_failed_make_logs(build_root, PACKAGE_ROOT)

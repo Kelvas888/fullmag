@@ -787,7 +787,7 @@ def _validate_terminal_control_records(
     owner: Mapping[str, object],
     owner_raw: bytes,
 ) -> None:
-    """Bind the live control records to the stop journal's terminal pins.
+    """Bind the selected control records to the stop journal's terminal pins.
 
     A current stop journal carries the complete container incarnation in its
     own immutable bytes, so a namespace sidecar is optional for that route.
@@ -1002,10 +1002,28 @@ def _bundle_from_records(
     stop, stop_raw = _control_json(control, stop_relative)
     assert stop is not None and stop_raw is not None
     _validate_stop_journal(stop, stop_raw, quarantine)
-    terminal_relative = "runtime-control/runtime-service/process-tree.json"
+    key = quarantine["activation_receipt_key"]
+    archive_prefix = f"{CONTROL_RELATIVE_PREFIX}/{key}"
+    # request.json is published last. Once committed, its original terminal
+    # records are immutable history; later containers may overwrite PID 1's
+    # live receipts. Rebuild every pin below, including the current held Run,
+    # and require byte-identical proof/request before permitting replay.
+    published_request = _control_bytes(
+        control, f"{archive_prefix}/request.json", optional=True,
+        maximum=MAX_REQUEST_BYTES,
+    )
+    published_proof = None
+    if published_request is not None:
+        published_proof = _control_bytes(
+            control, f"{archive_prefix}/proof.json", maximum=MAX_PROOF_BYTES,
+        )
+        terminal_relative = f"{archive_prefix}/{TERMINAL_PROCESS_ARCHIVE_NAME}"
+        owner_relative = f"{archive_prefix}/{TERMINAL_OWNER_ARCHIVE_NAME}"
+    else:
+        terminal_relative = "runtime-control/runtime-service/process-tree.json"
+        owner_relative = "runtime-control/runtime-services/OWNER.json"
     terminal, terminal_raw = _control_json(control, terminal_relative)
     assert terminal is not None and terminal_raw is not None
-    owner_relative = "runtime-control/runtime-services/OWNER.json"
     owner, owner_raw = _control_json(control, owner_relative)
     assert owner is not None and owner_raw is not None
     _validate_terminal_control_records(stop, terminal, terminal_raw, owner, owner_raw)
@@ -1113,6 +1131,23 @@ def _bundle_from_records(
     }
     request_raw = _json_bytes(request, MAX_REQUEST_BYTES, "accepted reattach request")
     request_sha = hashlib.sha256(request_raw).hexdigest()
+    if published_request is not None and (
+        published_request != request_raw or published_proof != proof_raw
+    ):
+        raise _fail("committed accepted reattach archive differs from revalidated inputs")
+    if published_request is None:
+        # A crash before the last publication may leave a partial transaction.
+        # Such bytes never authorize historical replay. Live-record validation
+        # above must succeed, and every existing fragment must match the newly
+        # reconstructed bytes before the CAS publisher can finish that commit.
+        for relative, expected, maximum in (
+            (control_proof, proof_raw, MAX_PROOF_BYTES),
+            (control_terminal_process, terminal_raw, MAX_CONTROL_RECORD_BYTES),
+            (control_terminal_owner, owner_raw, MAX_CONTROL_RECORD_BYTES),
+        ):
+            fragment = _control_bytes(control, relative, optional=True, maximum=maximum)
+            if fragment is not None and fragment != expected:
+                raise _fail("partial accepted reattach publication differs from validated inputs")
     pins = {
         "schema": PRODUCER_SCHEMA,
         "state": "prepared",
@@ -1307,7 +1342,7 @@ def produce_accepted_reattach(
     The return mapping is intentionally small and serializable.  ``environment``
     can be overlaid on the selected backend start environment; ``pins`` is the
     caller's record of every immutable source/control/run identity.  The
-    producer itself writes only the two CAS-checked documents in runtime
+    producer itself writes only four CAS-checked documents in runtime
     control.
     """
 
