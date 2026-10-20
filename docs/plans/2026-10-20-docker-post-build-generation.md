@@ -107,3 +107,17 @@ Obecnie ta grupa nie ma uruchomionych usług aplikacji. Standardowy resume
 wymaga analizy późniejszej, odrzuconej przed startem próby `abaf...`; nie wolno
 ręcznie cofać wskaźnika current ani usuwać historii. Sesja, owner, konfiguracja,
 cache i wolumeny pozostały zachowane. Odbiór runtime pozostaje **NOT VERIFIED**.
+
+### Integracja równoległych zmian mastera
+
+W trakcie review master przesunął się do `03b90c82797f976a6237fd910dd8baf81ad193c1`.
+Zmiany połączono bez konfliktów, zachowując oba zestawy recovery. CI ujawnił,
+że nowa opcjonalna ścieżka pre-ACK rozwiązywała ścieżkę źródeł przed sprawdzeniem,
+czy poprzednia próba w ogóle deklaruje accepted lineage. Kontrola braku tych
+pinów odbywa się teraz przed dostępem do systemu plików; regresja zwykłego
+odtwarzania potwierdza brak wywołania resolvera.
+
+Wspólna wersja przeszła 200 testów (3 pominięte), ze stabilnymi źródłami readonly:
+`verification/interpreted-attempts/4a4f45df279f42839b602a9d89d27f78.json`.
+Zakres: runtime, startup scripts, retained recovery, post-build continuation
+oraz pre-admission integration. Nie kompilowano lokalnych testów Rust.
