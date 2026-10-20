@@ -3891,7 +3891,10 @@ def _resume_recreated_operation(args, control, selected, layout, identity):
     )
     certificate_path = _certificate_path(state)
     certificate = _retained_certificate(state, document)
-    if certificate.get("image_id") != image or not certificate.get("restart_verified"):
+    from docker_volume_pre_api_stop import PreApiContext
+    pre_api_stopped = isinstance(records["native_recovery_context"], PreApiContext)
+    if (certificate.get("image_id") != image
+            or (not certificate.get("restart_verified") and not pre_api_stopped)):
         raise BuildControlError("Retained storage certificate does not authorize recreation resume")
     owner_path = state / _session_host().OWNER_NAME
     recovery_context = dict(records["native_recovery_context"])
@@ -4319,7 +4322,10 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 ]["sha256"]
                 recovery_context["post_build_generation"] = post_build_generation
         pre_admission_recreate_proof = None
-        if not fresh_state and not certificate.get("restart_verified"):
+        # This checkpoint already carries authenticated native recovery
+        # authority. It must not enter the mutually exclusive no-native
+        # pre-admission path merely because the old storage probe was limited.
+        if not fresh_state and not pre_api_stopped and not certificate.get("restart_verified"):
             retained_environment = document["services"]["backend"]["environment"]
             observed_environment = actual["backend"].get("Config", {}).get("Env") or []
             retained_reattach_declared = (

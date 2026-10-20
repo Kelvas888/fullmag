@@ -1,7 +1,7 @@
 # Fullmag master — recovery 3806 i poprawki primitive, 20.10.2026
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 21.10.2026, 00:55 CEST
+## Aktualny status wdrożenia — 21.10.2026, 01:10 CEST
 
 Poprzedni build i pakiet d2a4bdfb przeszedł. Ręczny restart o 22:28 UTC
 zakończył się błędem capture, exit 2, przed nowym buildem i API.
@@ -14,6 +14,9 @@ nie została jeszcze uruchomiona w nowym kontenerze.
 Checkpoint capture c16da16d zakończył się sukcesem: stopped-confirmed,
 action observe-capture-failure, signal_issued=false, receipt SHA-256
 `dedd093a0b7dd0f6e5f8caee7df844e84eb51b48d09895a80c8bfab593c6d137`.
+Odtworzenie z 72cd5efcd odmówiło przed zmianą usług: konflikt wyboru
+pre-admission/native recovery. Poprawka dispatch i analogicznego guardu resume
+pozostaje źródłowa, po kontroli parsera; nie zastępuje dowodu runtime.
 Dane 3806 i held04 zachowane. Nie wykonano replay, preparation retry, Solve ani testów.
 API/native i ten sam run04, nowy mesh oraz pola/energie/Airbox w UI pozostają
 **NOT VERIFIED**. Pełny F0–F12 pozostaje otwarty.
@@ -1730,3 +1733,16 @@ Zgodnie z `fullmag-build-stage-cleanup` zachowano cache Cargo/CMake, ostatni
 pakiet d2a4bdfb i wszystkie pakiety przypięte przez stare runy oraz rollback.
 Nie wykazano ich zbędności; ponowna ocena dopiero po weryfikacji następcy.
 Nie usunięto danych i nie wykonano prune.
+
+
+Przegląd audytu workflow zapisano w
+`docs/audits/2026-10-21-docker-dev-workflow-audit-review.md`.
+Potwierdza koszt capture i nadmiar wariantów recovery; rekomenduje zachowanie
+dwóch usług oraz rozdzielenie buildu od stanu symulacji. Uproszczenia nie zostały
+wdrożone jako nowy profil ani reset ownerów. Próba managed recreate z 72cd5efcd
+zakończyła się przed mutacją usług: `pre-admission recreation cannot replace
+native recovery authority`. Przyczyną był wybór ścieżki wymagającej pustego
+recovery context mimo uwierzytelnionego PreApiContext. Poprawiono warunek
+wyboru oraz analogiczny guard resume po usunięciu kontenerów; istniejąca
+walidacja obrazów, checkpointu, released leases i held04 pozostaje wymagana.
+AST/diff-check source-only; nowy build/API/mesh nadal NOT VERIFIED.

@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-20T22:56:35.234989+00:00",
-  "verification": "Source review PASS, Python AST7 plus3 resource helpers PASS, diff-check PASS; Rust parser unavailable (access denied). Capture-only checkpoint c16da16d succeeded, exit0, stopped-confirmed, no signal, receipt SHA256 dedd093a0b7dd0f6e5f8caee7df844e84eb51b48d09895a80c8bfab593c6d137. Cargo jobs source fix 2->approved16, GNU Make shares jobserver. Backend stopped; new build/CPU timing/API/native/mesh/Solve NOT VERIFIED. No tests.",
+  "observed_at": "2026-10-20T23:04:59.520830+00:00",
+  "verification": "Source review PASS, Python AST7 plus3 resource helpers PASS, diff-check PASS; Rust parser unavailable (access denied). Capture-only checkpoint c16da16d succeeded, exit0, stopped-confirmed, no signal, receipt SHA256 dedd093a0b7dd0f6e5f8caee7df844e84eb51b48d09895a80c8bfab593c6d137. Cargo jobs source fix 2->approved16, GNU Make shares jobserver. Backend stopped; new build/CPU timing/API/native/mesh/Solve NOT VERIFIED. No tests. Managed recreate from72cd5efcd failed pre-mutation (pre-admission/native dispatch conflict); scoped dispatch/resume fix source-only. No new build, no signal, no replay.",
   "files": [
     {
       "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
@@ -176,7 +176,7 @@
     },
     {
       "path": "scripts/docker_volume_dev.py",
-      "sha256": "bb5b06a418a08dc398c93aec1d491f7632df57e121924b42462128d6b250d0ad"
+      "sha256": "59c9ac3a0ffec2cc1ddc421a2b523a5a42993c1d562b479d77c8067f11e5c143"
     },
     {
       "path": "scripts/docker_volume_pre_ack_retry.py",
