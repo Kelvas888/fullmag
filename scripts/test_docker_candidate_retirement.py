@@ -46,6 +46,66 @@ backend = fixture_module.backend
 class CandidateRetirementTests(unittest.TestCase):
     """Exercise the retirement boundary with real package and hash fixtures."""
 
+    def test_toolchain_identity_preserves_optional_umpire_for_candidate_contract(self):
+        image_id = "sha256:" + "e" * 64
+        required_commits = {
+            "mfem": "1" * 40,
+            "libceed": "2" * 40,
+            "hypre": "3" * 40,
+            "petsc": "4" * 40,
+            "slepc": "5" * 40,
+        }
+        dependency = {
+            "schema": "fullmag.docker.fem-gpu-dependencies.v1",
+            "declared": {},
+            "actual": {
+                "source_commits": {**required_commits, "umpire": None},
+            },
+            "latest": {},
+        }
+        raw = b'{"dependency":"complete-with-optional-umpire"}\n'
+
+        with (
+            patch.dict(os.environ, {"FULLMAG_TOOLCHAIN_IMAGE_ID": image_id}),
+            patch.object(backend, "_read_json", return_value=(dependency, raw)),
+        ):
+            actual_image_id, toolchain = backend._toolchain_identity()
+
+        self.assertEqual(actual_image_id, image_id)
+        self.assertEqual(
+            toolchain["actual_source_commits"],
+            {**required_commits, "umpire": None},
+        )
+        self.assertEqual(
+            toolchain["dependency_manifest_sha256"],
+            backend._sha256_bytes(raw),
+        )
+        self.assertEqual(
+            retirement._candidate_toolchain(backend, {"toolchain": toolchain}),
+            toolchain,
+        )
+
+    def test_candidate_toolchain_rejects_missing_required_source_commit(self):
+        required_commits = {
+            "mfem": "1" * 40,
+            "libceed": "2" * 40,
+            "hypre": "3" * 40,
+            "petsc": "4" * 40,
+            "slepc": "5" * 40,
+        }
+        for missing in required_commits:
+            with self.subTest(missing=missing):
+                commits = {**required_commits, "umpire": None}
+                commits.pop(missing)
+                toolchain = {
+                    "image_id": "sha256:" + "e" * 64,
+                    "dependency_manifest_sha256": "f" * 64,
+                    "dependency_schema": "fullmag.docker.fem-gpu-dependencies.v1",
+                    "actual_source_commits": commits,
+                }
+                with self.assertRaises(backend.BackendBuildError):
+                    retirement._candidate_toolchain(backend, {"toolchain": toolchain})
+
     @contextmanager
     def _fixture(self, kind: str = "stale"):
         """Create one verified current package and one ready candidate.

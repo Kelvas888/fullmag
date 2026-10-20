@@ -1068,10 +1068,24 @@ def _candidate_toolchain(b: Any, receipt: Mapping[str, Any]) -> dict[str, Any]:
     if toolchain.get("dependency_schema") != "fullmag.docker.fem-gpu-dependencies.v1":
         _fail(b, "ready candidate dependency manifest schema is unsupported")
     commits = toolchain.get("actual_source_commits")
+    required_commits = frozenset(("mfem", "libceed", "hypre", "petsc", "slepc"))
+    allowed_commits = required_commits | {"umpire"}
     if (
         not isinstance(commits, Mapping)
-        or set(commits) != {"mfem", "libceed", "hypre", "petsc", "slepc"}
-        or any(not isinstance(value, str) or not value for value in commits.values())
+        or not required_commits.issubset(commits)
+        or not set(commits).issubset(allowed_commits)
+        or any(
+            not isinstance(commits[key], str) or not commits[key]
+            for key in required_commits
+        )
+        or (
+            "umpire" in commits
+            and commits["umpire"] is not None
+            and (
+                not isinstance(commits["umpire"], str)
+                or not commits["umpire"]
+            )
+        )
     ):
         _fail(b, "ready candidate dependency source commits are invalid")
     return dict(toolchain)
