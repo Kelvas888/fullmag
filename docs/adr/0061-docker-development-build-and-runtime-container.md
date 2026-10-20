@@ -591,3 +591,25 @@ odrębnym uprawnieniem; pending recovery wyklucza tę ścieżkę. Kod i regresje
 `scripts/docker_volume_pre_admission_selector.py` oraz ich testy i integracja w
 `scripts/docker_volume_dev.py`. Wdrożenie do obrazu i rzeczywisty start wymagają
 oddzielnego dowodu; regresje fixture nie kwalifikują runtime.
+
+
+## Uzupełnienie — nieudany start API przed odtworzeniem przyjętego runu
+
+Pierwsze odtworzenie nadal przypina dokładne bajty historycznego ownera oraz
+hashe obu niezmiennych archiwów. Późniejsza awaria samego API może jednak
+zastąpić bieżący process-tree, zanim zostanie przypięty native owner. Dla
+legacy `fullmag.docker-process-tree.v1` dopuszczamy wyłącznie rozpoznany
+terminal `shutdown_unknown`: dokładny zestaw dziewięciu pól, zakończone API
+z kodem 101, kanoniczny błąd połączenia loopback i brak ownera oraz ACK.
+Binding storage, bootstrap i qualification muszą pozostać niezmienione.
+Historyczny READY owner i FAILED owner zachowują tożsamość; zapis awarii
+native przed READY nie może zawierać retained ownera.
+
+Ten legacy receipt nie identyfikuje samodzielnie requestu ani proofu. Nie jest
+uprawnieniem recovery lub Solve: Rust niezależnie waliduje przypięty request,
+niezmienny proof, katalog runu, historię i lease. Gałąź restartu po ACK nadal
+wymaga uwierzytelnionego successor drain. Nie przepisujemy bieżących ani
+historycznych rekordów dla uzyskania zgodności. Jest to most zgodności dla
+receiptu v1; nowy typ receiptu musi wiązać awarię z requestem i proofem,
+zanim zastąpi ten wyjątek. Zmiana dotyczy `runtime_service.py` i regresji
+`test_fullmag_docker_runtime.py`; nie zmienia OpenAPI, fizyki ani wyboru GPU.

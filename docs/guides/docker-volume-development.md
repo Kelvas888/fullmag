@@ -351,3 +351,13 @@ i zgody. Samo usunięcie kontenera nie odzyskuje wolumenów ani fizycznego VHDX.
 launcherów w istniejącym backendzie; nie kompiluje natywnych testów jednostkowych.
 Sukces buildu nie stanowi kwalifikacji FDM/FEM/BORIS. Release, CI i kwalifikacja
 naukowa zachowują własne jawne zarządzane recepty zgodnie z AGENTS.md.
+
+
+### Nieudany start API podczas odzyskiwania oczekującego runu
+
+Awaria API przed przypięciem native ownera może pozostawić nowszy process-tree
+niż archiwum pierwotnej awarii. Start rozpoznaje wyłącznie ściśle określony
+legacy błąd loopback z zakończonym API, niezmienionym bootstrapem i ownerem.
+Archiwa, request i natywna walidacja runu nadal są obowiązkowe. Ten wyjątek
+nie powtarza Solve, nie resetuje ownera i nie zastępuje recovery. Inny błąd,
+zmiana ownera lub brak dowodów nadal blokują start; nie usuwaj ręcznie receiptów.
