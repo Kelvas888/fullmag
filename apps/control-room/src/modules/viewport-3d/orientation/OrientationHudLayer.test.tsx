@@ -5,6 +5,13 @@ import { describe, expect, it } from "vitest";
 const sourceUrl = new URL("./OrientationHudLayer.tsx", import.meta.url);
 
 describe("OrientationHudLayer", () => {
+  it("owns and releases the shared HUD event layer while the cube is visible", () => {
+    const source = readFileSync(sourceUrl, "utf8");
+    expect(source).toContain("if (!viewCubeVisible) return;");
+    expect(source).toContain("return enableViewport3DHudRaycasting(raycaster);");
+    expect(source).toContain("[raycaster, viewCubeVisible]");
+  });
+
   it("commits HUD camera changes through the registry callback without a parallel store write", () => {
     const source = readFileSync(sourceUrl, "utf8");
     const snapStart = source.indexOf("const snapToDirection");

@@ -68,6 +68,7 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
   const fovChecks = [];
   let fovChangedPixels = null;
   let fovFitChangedPosition = null;
+  let pointerGestures = null;
   const snapshots = new Map();
 
   try {
@@ -105,6 +106,19 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
       snapshots,
       embedPng: true,
     }));
+
+    const pointerRadius = distance(originalCamera.position, originalCamera.target);
+    const pointerDirection = normalize([1, 0.1, 0.1]);
+    const pointerPosition = originalCamera.target.map((value, index) =>
+      value + pointerRadius * pointerDirection[index]);
+    await fillVector(cameraDialog, "Position (m)", pointerPosition);
+    mutationStarted = true;
+    await cameraDialog.getByRole("button", { exact: true, name: "Apply" }).click({ timeout });
+    await waitForCamera(page, viewport, { position: pointerPosition }, timeout);
+    await setCameraDialogOpen(page, cameraDialog, false, timeout);
+    pointerGestures = await exercisePointerGestures(page, { viewport, canvas, assertCanvas, timeout });
+    await setCameraDialogOpen(page, cameraDialog, true, timeout);
+    await restoreCamera(page, cameraDialog, originalCamera, originalDialogValues, timeout);
 
     for (let toggleIndex = 0; toggleIndex < 2; toggleIndex += 1) {
       const before = await readCamera(viewport);
@@ -335,10 +349,8 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
     poses,
     fov: { checks: fovChecks, changed_pixels_at_fixed_pose: fovChangedPixels, fit_changed_position: fovFitChangedPosition },
     captures,
-    view_cube: {
-      state: "NOT VERIFIED",
-      reason: "Camera poses were requested through visible camera-dialog coordinates; no ViewCube hit target or click was assumed.",
-    },
+    pointer_gestures: pointerGestures,
+    view_cube: pointerGestures?.view_cube ?? { state: "NOT VERIFIED" },
     restoration: {
       state: restorationVerified ? "verified" : "failed-or-not-attempted",
       camera_attributes: !originalCamera ? "not-available" : mutationStarted
@@ -349,7 +361,7 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
     },
     errors: operationError ? [operationError?.message ?? String(operationError)] : [],
     limitations: [
-      "The test records camera poses set through the visible camera dialog; the ViewCube interaction remains NOT VERIFIED.",
+      "The pointer check covers one ViewCube face and one continuous orbit drag; the remaining axial poses use the visible camera dialog.",
       "Fit is considered observed only when the public camera attributes change after the visible command; no change is reported without being treated as a camera movement.",
       "PNG captures are Playwright screenshots of the canvas element, decoded in memory; no image files are written.",
     ],
@@ -491,6 +503,88 @@ async function executeVisibleCommand(page, palette, title, timeout) {
   }
   await result.click({ timeout });
   await palette.waitFor({ state: "hidden", timeout });
+}
+
+async function exercisePointerGestures(page, { viewport, canvas, assertCanvas, timeout }) {
+  const rect = await canvas.boundingBox();
+  if (!rect || rect.width < 320 || rect.height < 240) {
+    throw new Error("Pointer camera QA requires a visible canvas of at least 320x240 CSS pixels");
+  }
+  const before = await readCamera(viewport);
+  const radius = distance(before.position, before.target);
+  // This is the real screen anchor defined by orientation/hudLayout.ts.
+  // Success additionally requires the observed +X camera pose, not just a click.
+  const margin = rect.width < 640 || rect.height < 420 ? 72 : 104;
+  const hit = { x: rect.x + rect.width - margin, y: rect.y + margin };
+  await page.mouse.click(hit.x, hit.y);
+  const snapped = await waitForCamera(page, viewport, {
+    position: before.target.map((value, index) => value + (index === 0 ? radius : 0)),
+    target: before.target,
+  }, timeout);
+  await assertCanvas("after ViewCube +X face click");
+
+  const samples = [];
+  await page.mouse.move(rect.x + rect.width * 0.25, rect.y + rect.height * 0.45);
+  await page.mouse.down();
+  try {
+    for (const fraction of [0.32, 0.39, 0.46, 0.53, 0.60]) {
+      await page.mouse.move(rect.x + rect.width * fraction, rect.y + rect.height * 0.45, { steps: 4 });
+      await page.waitForTimeout(32);
+      const sample = await page.evaluate(() => {
+        const read = window.__FULLMAG_READ_VIEWPORT_3D_CAMERA_CONTROLS__;
+        if (typeof read !== "function") return null;
+        const value = read();
+        return { position: value.cameraPosition, target: value.controlTarget,
+          enabled: value.controlsEnabled, connected: value.controlsConnectedToCanvas };
+      });
+      if (!sample?.enabled || !sample.connected) {
+        throw new Error("Orbit pointer QA requires enabled controls connected to the visible canvas");
+      }
+      assertCameraFinite({ ...snapped, position: sample.position, target: sample.target }, "during pointer orbit");
+      if (!sameVector(sample.target, snapped.target, sceneCoordinateEpsilon(radius))) {
+        throw new Error("Orbit pointer gesture unexpectedly moved its target");
+      }
+      if (Math.abs(distance(sample.position, sample.target) - radius) > scalarRelativeEpsilon(radius) * 100) {
+        throw new Error("Orbit pointer gesture unexpectedly changed its distance");
+      }
+      samples.push(sample);
+    }
+  } finally {
+    await page.mouse.up();
+  }
+  if (new Set(samples.map((sample) => JSON.stringify(sample.position))).size < 2) {
+    throw new Error("Continuous pointer drag produced no distinct live camera positions");
+  }
+  const deadline = Date.now() + timeout;
+  let after = snapped;
+  let stableSince = null;
+  let previous = null;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(100);
+    after = await readCamera(viewport);
+    if (sameCamera(after, snapped)) {
+      stableSince = null;
+    } else if (previous && sameCamera(after, previous)) {
+      stableSince ??= Date.now();
+      if (Date.now() - stableSince >= 500) break;
+    } else {
+      stableSince = null;
+    }
+    previous = after;
+  }
+  if (stableSince === null || Date.now() - stableSince < 500) {
+    throw new Error("Pointer orbit did not commit a stable changed pose to the camera owner");
+  }
+  assertCameraFinite(after, "committed pointer orbit");
+  if (after.projection !== snapped.projection || !sameVector(after.up, snapped.up, UP_TOLERANCE) ||
+      !sameVector(after.target, snapped.target, sceneCoordinateEpsilon(radius)) ||
+      Math.abs(distance(after.position, after.target) - radius) > scalarRelativeEpsilon(radius) * 100) {
+    throw new Error("Committed pointer orbit changed its projection, up, target, or distance");
+  }
+  await assertCanvas("after continuous pointer orbit");
+  return { state: "passed", view_cube: { state: "passed", face: "+X", hit_css: hit,
+    before, after: snapped }, orbit: { state: "passed", input: "Playwright mouse drag",
+    live_samples: samples, committed_camera: after } };
 }
 
 async function readDialogValues(dialog) {

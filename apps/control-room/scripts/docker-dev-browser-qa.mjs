@@ -206,9 +206,14 @@ const main = async () => {
       timeout,
     });
     partialProof.viewport_appearance = appearanceQa;
-    partialProof.viewport_camera = await runViewportCameraBrowserQa(page, {
-      assertCanvas: (label) => assertCanvas(page, label), pngDecoder: PNG, timeout,
-    });
+    try {
+      partialProof.viewport_camera = await runViewportCameraBrowserQa(page, {
+        assertCanvas: (label) => assertCanvas(page, label), pngDecoder: PNG, timeout,
+      });
+    } catch (error) {
+      if (error?.partialProof) partialProof.viewport_camera = error.partialProof;
+      throw error;
+    }
     const exportQa = await runViewportExportBrowserQa(page, {
       assertCanvas: (label) => assertCanvas(page, label), pngDecoder: PNG, timeout,
     });
