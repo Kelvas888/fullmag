@@ -11150,6 +11150,12 @@ export interface components {
             config: {
                 [key: string]: unknown;
             };
+            /**
+             * Format: int64
+             * @description Resource revision the client edited. A stale value is rejected with
+             *     409 instead of replacing a newer policy.
+             */
+            expected_revision?: number | null;
         };
         MeshUniverseConfigResource: {
             /** @description User-authored universe mesh policy exactly as committed in the scene. */
@@ -14231,6 +14237,12 @@ export interface components {
         ScriptSourceResponse: {
             bytes: number;
             /**
+             * @description True when `source` is the canonical Fullmag rendering (managed script
+             *     or managed export copy). False when a `user_file` session has no
+             *     export copy yet and `source` is the user's original, unmodified file.
+             */
+            canonical?: boolean;
+            /**
              * @description Managed export copy path for `user_file` sessions (the response
              *     carries the copy when it exists, otherwise the read-only original).
              */
@@ -14241,19 +14253,42 @@ export interface components {
             source: string;
         };
         ScriptSyncRequest: {
+            /**
+             * Format: int64
+             * @description SceneDocument revision the caller exported from. When present, the
+             *     sync fails with 409 `scene_revision_mismatch` unless the current scene
+             *     has exactly this revision before and after rendering.
+             */
+            expected_scene_revision?: number | null;
             overrides?: unknown;
         };
         ScriptSyncResponse: {
             bytes_written: number;
             entrypoint_kind: string;
+            /**
+             * @description Round-trip fidelity verdict of the exported source. `not_checked`
+             *     unless the exported script was actually lowered and compared.
+             */
+            fidelity?: string;
             /** @description Managed export copy path for `user_file` sessions. */
             managed_copy_path?: string | null;
+            /**
+             * Format: int64
+             * @description SceneDocument revision the canonical source was rendered from; absent
+             *     when the session has no SceneDocument.
+             */
+            scene_revision?: number | null;
             /**
              * @description Path of the file that received the canonical script. For a
              *     `user_file` session this is the managed export copy, never the
              *     user's own script.
              */
             script_path: string;
+            /**
+             * @description Canonical source text written by this sync, read back under the same
+             *     request so it matches `scene_revision` (no second GET required).
+             */
+            source?: string | null;
             source_kind: string;
             /**
              * @description True only when the session's own source script file was rewritten.
@@ -26900,6 +26935,13 @@ export interface operations {
             };
             /** @description No active workspace */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Universe mesh config changed since the expected revision */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

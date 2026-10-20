@@ -125,6 +125,7 @@ jobs:
         run: |
           cargo test -p fullmag-plan --lib preparation::tests::fdm_
           cargo test -p fullmag-api --bin fullmag-api docker_startup::tests
+          cargo test -p fullmag-api --bin fullmag-api live_retirement --no-fail-fast
           cargo test -p fullmag-api --bin fullmag-api session_output_target_tests --no-fail-fast
           cargo test -p fullmag-api --bin fullmag-api live_accepted_execution::tests
           cargo test -p fullmag-api --bin fullmag-api development_accepted_restore::tests
@@ -813,6 +814,9 @@ jobs:
           python -B scripts/test_docker_console_progress.py -v
           python -B scripts/test_docker_volume_stop_unadmitted.py -v
           python -B scripts/test_docker_startup_script.py -v
+          python -B scripts/test_docker_live_retirement.py -v
+          python -B scripts/test_docker_retirement_refusal.py -v
+          python -B scripts/test_docker_retirement_crash_boundary.py -v
           python -B scripts/test_docker_entrypoint_device_access.py -v
           python -B scripts/test_windows_folder_evidence.py -v
           python -B scripts/test_windows_folder_probe.py -v

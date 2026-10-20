@@ -2606,6 +2606,98 @@ class BackendPackageTests(unittest.TestCase):
             self.assertTrue(candidate.is_dir())
             self.assertTrue(log_path.is_file())
 
+    def test_prepare_locked_verifies_published_make_log_stat_size(self):
+        for mutate_published_log in (False, True):
+            with self.subTest(mutate_published_log=mutate_published_log), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                package = root / "package"
+                package.mkdir()
+                build_root = root / "build"
+                build_root.mkdir()
+                control = backend._ensure_package_development_root(package)
+                candidate = (
+                    control
+                    / backend.PACKAGE_CANDIDATES_DIRNAME
+                    / ".backend-package-candidate-prepare-logstat"
+                )
+                candidate.mkdir()
+                backend._write_candidate_marker(
+                    candidate, package, build_root, state="building"
+                )
+                workspace = root / "workspace"
+                workspace.mkdir()
+                manifest = root / "manifest.json"
+                manifest.write_bytes(b"fixture manifest")
+                args = backend.argparse.Namespace(
+                    source_tar=None,
+                    manifest=manifest,
+                    source_root=root / "source",
+                    git_common_root=root / "git-common",
+                )
+
+                def fake_make(command, actual_workspace, environment, log_path):
+                    self.assertEqual(command[-1], "install-cli-dev")
+                    log_path.write_bytes(b"make completed\\n")
+                    return 0
+
+                def fake_publish(*publish_args, **publish_kwargs):
+                    if mutate_published_log:
+                        with (candidate / backend.FAILED_MAKE_LOG_NAME).open("ab") as stream:
+                            stream.write(b"publisher drift\n")
+                    return 0
+
+                with (
+                    patch.object(backend, "PACKAGE_ROOT", package),
+                    patch.dict(
+                        os.environ,
+                        {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"},
+                        clear=False,
+                    ),
+                    patch.object(
+                        backend,
+                        "_materialize_source",
+                        return_value=(workspace, {}, {}, "a" * 64, None, "snapshot"),
+                    ),
+                    patch.object(backend, "_build_environment", return_value={}),
+                    patch.object(backend, "_run_canonical_make", side_effect=fake_make),
+                    patch.object(
+                        backend,
+                        "_publish_completed_build",
+                        side_effect=fake_publish,
+                    ),
+                ):
+                    if mutate_published_log:
+                        with self.assertRaisesRegex(
+                            backend.BackendBuildError,
+                            "published Make diagnostic log differs",
+                        ):
+                            backend._prepare_locked(
+                                args, build_root, candidate, 2, {}, candidate
+                            )
+                        self.assertTrue(
+                            (
+                                build_root
+                                / backend.FAILED_MAKE_DIAGNOSTICS_DIRNAME
+                                / candidate.name
+                                / backend.FAILED_MAKE_LOG_NAME
+                            ).is_file()
+                        )
+                    else:
+                        self.assertEqual(
+                            backend._prepare_locked(
+                                args, build_root, candidate, 2, {}, candidate
+                            ),
+                            0,
+                        )
+                        self.assertFalse(
+                            (
+                                build_root
+                                / backend.FAILED_MAKE_DIAGNOSTICS_DIRNAME
+                                / candidate.name
+                                / backend.FAILED_MAKE_LOG_NAME
+                            ).exists()
+                        )
+
     def test_successful_make_log_is_copied_then_external_log_is_retired(self):
         with tempfile.TemporaryDirectory() as directory:
             package, build_root, candidate, log_path = self._failed_make_fixture(

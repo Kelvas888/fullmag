@@ -114,6 +114,24 @@ impl<'a> WorkspaceRestartAcquisition<'a> {
 pub(crate) async fn acquire_workspace_for_restart(
     state: &AppState,
 ) -> Result<WorkspaceRestartAcquisition<'_>, ApiError> {
+    acquire_workspace_for_restart_inner(state, false).await
+}
+
+/// Acquire the same restart-safe workspace guards for the private terminal
+/// retirement route. Accepted-run restore can legitimately have no display
+/// completion timestamp after a process restart; its durable terminal store
+/// and runtime projection remain authoritative for this narrowly scoped path.
+#[allow(dead_code)]
+pub(crate) async fn acquire_workspace_for_live_retirement(
+    state: &AppState,
+) -> Result<WorkspaceRestartAcquisition<'_>, ApiError> {
+    acquire_workspace_for_restart_inner(state, true).await
+}
+
+async fn acquire_workspace_for_restart_inner(
+    state: &AppState,
+    allow_restored_terminal_without_display_timestamp: bool,
+) -> Result<WorkspaceRestartAcquisition<'_>, ApiError> {
     let freeze = state.development_admission.begin_freeze().await?;
     let transition = state.current_live_session_transition.lock().await;
     let session_epoch = state
@@ -174,10 +192,28 @@ pub(crate) async fn acquire_workspace_for_restart(
                 trusted_restore,
                 &state.current_workspace_root,
             )?;
+            let trusted_terminal_restore = trusted_restore
+                || state
+                    .accepted_run_reattach_identity
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|identity| {
+                        identity.matches(
+                            &snapshot.session.run_id,
+                            &snapshot.session.session_id,
+                            session_epoch,
+                            scene_document.revision,
+                        )
+                    });
             let run_id = if is_scratch {
                 None
             } else {
-                Some(validate_terminal_run(snapshot, kind)?)
+                Some(validate_terminal_run(
+                    snapshot,
+                    kind,
+                    allow_restored_terminal_without_display_timestamp && trusted_terminal_restore,
+                )?)
             };
             validate_connectivity(state, is_scratch).await?;
 
@@ -269,6 +305,7 @@ fn is_idle_scratch(
 fn validate_terminal_run(
     snapshot: &SessionStateResponse,
     runtime: RuntimeStatus,
+    allow_missing_display_timestamp: bool,
 ) -> Result<String, ApiError> {
     let terminal_status = match runtime {
         RuntimeStatus::Completed => "completed",
@@ -292,7 +329,7 @@ fn validate_terminal_run(
         || run.session_id != snapshot.session.session_id
         || run.status != terminal_status
         || snapshot.session.status != terminal_status
-        || snapshot.session.finished_at_unix_ms == 0
+        || (!allow_missing_display_timestamp && snapshot.session.finished_at_unix_ms == 0)
         || snapshot.runtime_status.is_busy
         || snapshot.runtime_status.can_accept_commands
     {
@@ -1037,6 +1074,39 @@ mod tests {
             scene_document.editor.selected_entity_id.as_deref(),
             Some("entity-42")
         );
+    }
+
+    #[tokio::test]
+    async fn missing_display_timestamp_is_only_allowed_by_the_retirement_gate() {
+        let state = scratch_state().await;
+        let mut snapshot = state
+            .current_live_state
+            .read()
+            .await
+            .clone()
+            .expect("scratch fixture should contain a session");
+        snapshot.session.run_id = "run-retire-without-display-time".to_string();
+        snapshot.session.status = "completed".to_string();
+        snapshot.session.finished_at_unix_ms = 0;
+        snapshot.run = Some(RunManifest {
+            run_id: snapshot.session.run_id.clone(),
+            session_id: snapshot.session.session_id.clone(),
+            status: "completed".to_string(),
+            total_steps: 0,
+            final_time: None,
+            final_e_ex: None,
+            final_e_demag: None,
+            final_e_ext: None,
+            final_e_ani: None,
+            final_e_dmi: None,
+            final_e_rotated_dmi: None,
+            final_e_total: None,
+            artifact_dir: String::new(),
+        });
+        snapshot.runtime_status = crate::session::build_runtime_status_view("completed");
+
+        assert!(validate_terminal_run(&snapshot, RuntimeStatus::Completed, false).is_err());
+        assert!(validate_terminal_run(&snapshot, RuntimeStatus::Completed, true).is_ok());
     }
 
     #[tokio::test]

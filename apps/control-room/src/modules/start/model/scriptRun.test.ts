@@ -135,8 +135,16 @@ describe("host answers are validated", () => {
       exitCode: 0,
       durationSeconds: 12.5,
       error: null,
+      fallback: null,
       requestedDevice: "auto",
+      requestedBackend: null,
+      requestedEffectiveDevice: null,
+      requestedPrecision: null,
       resolvedDevice: "cpu",
+      resolvedBackend: null,
+      resolvedEngineId: null,
+      resolvedKnown: true,
+      resolvedPrecision: null,
       resultsDir: "C:/state/r1/results",
     });
   });

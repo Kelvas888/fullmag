@@ -43,6 +43,7 @@ import {
 } from "./model/viewport3DTargetFieldBuffer";
 import { buildViewport3DTopologyIndexBundle } from "./viewport3dTopologyIndexModel";
 import { magnitudeColorRgb } from "./viewport3dVectorColoring";
+import { resolveViewport3DAdaptiveVectorGlyphLength } from "./model/viewport3DVectorGlyphScale";
 import { resolveViewport3DTargetSurfaceLayerInput } from "./layers/viewport3DLayerPassInputs";
 
 type TargetFieldBufferOptions = Parameters<
@@ -4016,9 +4017,12 @@ describe("viewport3dRenderModel", () => {
     );
 
     const segments = fieldModel?.partVectorSegments.get("airbox");
+    const glyphLength = resolveViewport3DAdaptiveVectorGlyphLength({
+      boundsSize: [1, 1, 1], glyphCount: 4, lengthScale: 1, scope: "full",
+    });
     expect(segments?.length).toBe(28);
-    expect(segments?.[0]).toBeCloseTo(9.75);
-    expect(segments?.[3]).toBeCloseTo(10.25);
+    expect(segments?.[0]).toBeCloseTo(10 - glyphLength / 2);
+    expect(segments?.[3]).toBeCloseTo(10 + glyphLength / 2);
   });
 
   it("builds sampled scoped vector glyphs at the matching global topology positions", () => {
@@ -4088,13 +4092,16 @@ describe("viewport3dRenderModel", () => {
     );
 
     const segments = fieldModel?.partVectorSegments.get("airbox");
+    const glyphLength = resolveViewport3DAdaptiveVectorGlyphLength({
+      boundsSize: [1], glyphCount: 2, lengthScale: 1, scope: "full",
+    });
     expect(segments?.length).toBe(14);
-    expect(segments?.[0]).toBeCloseTo(9.75);
-    expect(segments?.[3]).toBeCloseTo(10.25);
+    expect(segments?.[0]).toBeCloseTo(10 - glyphLength / 2);
+    expect(segments?.[3]).toBeCloseTo(10 + glyphLength / 2);
     expect(segments?.[7]).toBeCloseTo(10);
     expect(segments?.[8]).toBeCloseTo(1);
-    expect(segments?.[9]).toBeCloseTo(-0.25);
-    expect(segments?.[12]).toBeCloseTo(0.25);
+    expect(segments?.[9]).toBeCloseTo(-glyphLength / 2);
+    expect(segments?.[12]).toBeCloseTo(glyphLength / 2);
   });
 
   it("draws sampled airbox vectors after excluding magnetic nodes", () => {
@@ -4161,13 +4168,16 @@ describe("viewport3dRenderModel", () => {
     });
 
     const segments = fieldModel?.partVectorSegments.get("airbox");
+    const glyphLength = resolveViewport3DAdaptiveVectorGlyphLength({
+      boundsSize: [4], glyphCount: 5, lengthScale: 1, scope: "full",
+    });
     expect(segments?.length).toBe(35);
-    expect(segments?.[0]).toBeCloseTo(5.5);
-    expect(segments?.[3]).toBeCloseTo(6.5);
-    expect(segments?.[7]).toBeCloseTo(6.5);
-    expect(segments?.[10]).toBeCloseTo(7.5);
-    expect(segments?.[14]).toBeCloseTo(7.5);
-    expect(segments?.[17]).toBeCloseTo(8.5);
+    expect(segments?.[0]).toBeCloseTo(6 - glyphLength / 2);
+    expect(segments?.[3]).toBeCloseTo(6 + glyphLength / 2);
+    expect(segments?.[7]).toBeCloseTo(7 - glyphLength / 2);
+    expect(segments?.[10]).toBeCloseTo(7 + glyphLength / 2);
+    expect(segments?.[14]).toBeCloseTo(8 - glyphLength / 2);
+    expect(segments?.[17]).toBeCloseTo(8 + glyphLength / 2);
   });
 
   it("keeps sampled airbox vectors visible when backend samples exclude magnetic nodes first", () => {
@@ -4231,11 +4241,14 @@ describe("viewport3dRenderModel", () => {
     });
 
     const segments = fieldModel?.partVectorSegments.get("airbox");
+    const glyphLength = resolveViewport3DAdaptiveVectorGlyphLength({
+      boundsSize: [3], glyphCount: 2, lengthScale: 1, scope: "full",
+    });
     expect(segments?.length).toBe(14);
-    expect(segments?.[0]).toBeCloseTo(5.5);
-    expect(segments?.[3]).toBeCloseTo(6.5);
-    expect(segments?.[7]).toBeCloseTo(8.5);
-    expect(segments?.[10]).toBeCloseTo(9.5);
+    expect(segments?.[0]).toBeCloseTo(6 - glyphLength / 2);
+    expect(segments?.[3]).toBeCloseTo(6 + glyphLength / 2);
+    expect(segments?.[7]).toBeCloseTo(9 - glyphLength / 2);
+    expect(segments?.[10]).toBeCloseTo(9 + glyphLength / 2);
   });
 
   it("renders sampled airbox vectors from the canonical target field buffer", () => {
@@ -4393,13 +4406,16 @@ describe("viewport3dRenderModel", () => {
     );
 
     const segments = fieldModel?.partVectorSegments.get("part-a");
+    const glyphLength = resolveViewport3DAdaptiveVectorGlyphLength({
+      boundsSize: [1], glyphCount: 2, lengthScale: 1, scope: "full",
+    });
     expect(segments?.length).toBe(14);
-    expect(segments?.[0]).toBeCloseTo(9.75);
-    expect(segments?.[3]).toBeCloseTo(10.25);
+    expect(segments?.[0]).toBeCloseTo(10 - glyphLength / 2);
+    expect(segments?.[3]).toBeCloseTo(10 + glyphLength / 2);
     expect(segments?.[7]).toBeCloseTo(10);
     expect(segments?.[8]).toBeCloseTo(1);
-    expect(segments?.[9]).toBeCloseTo(-0.25);
-    expect(segments?.[12]).toBeCloseTo(0.25);
+    expect(segments?.[9]).toBeCloseTo(-glyphLength / 2);
+    expect(segments?.[12]).toBeCloseTo(glyphLength / 2);
   });
 
   it("uses an explicit global vector budget instead of per-part fixed budgets", () => {

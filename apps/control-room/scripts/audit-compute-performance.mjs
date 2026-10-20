@@ -1688,7 +1688,7 @@ function checkFdmVectorSegmentCache() {
     "FdmVectorSegmentCache",
   ]);
   requireTokens(buildSegments, "buildFdmVectorSegments cache lookup", [
-    "const cacheKey = `${scale}:${maxVectors}:${anchorMode}:${options.geometryScope ?? \"full\"}:${options.surfaceOffsetEnabled === true}:${options.surfaceOffsetScale ?? 0}`",
+    "const cacheKey = `${scale}:${maxVectors}:${options.vectorLengthScale ?? \"scale\"}:${anchorMode}:${options.geometryScope ?? \"full\"}:${options.surfaceOffsetEnabled === true}:${options.surfaceOffsetScale ?? 0}`",
     "cachedFdmVectorSegments(model, fieldVector, cacheKey)",
     "if (cachedSegments !== undefined) return cachedSegments",
     "cacheFdmVectorSegments(model, fieldVector, cacheKey",
