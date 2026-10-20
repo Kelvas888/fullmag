@@ -138,6 +138,8 @@ startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backe
 `docker-dev-recreate-volume` wymaga zatrzymanego backendu i dokładnych pinów
 próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
+Przed pierwszym admission awaria samego buildu może zachować ten sam root sesji. Wymaga to dokładnego bootstrap certyfikatu, jednej potwierdzonej awarii przypiętej do bieżącego `Docker StartedAt` oraz braku handoff, publikacji pakietu i storage probe. Launcher ponawia cały dowód pod blokadą przed odtworzeniem usług. Nie ustawia `restart_verified`, nie zmienia ownera i nie powtarza Solve; nowe API nadal wymaga zwykłego admission. Brak lub zmiana dowodu blokuje tę ścieżkę.
+
 Bezpośredni CLI `recreate-volume` obsługuje również powtarzane
 `--include-untracked`. Jawne opcje przypinają kompletną listę plików nowej
 konfiguracji; brak opcji zachowuje listę poprzedniej próby. Obowiązują te same
