@@ -698,6 +698,7 @@ fn publish_session_archive(
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .ok_or_else(|| ApiError::bad_request("session target path has no parent directory"))?;
+    canonical_directory(parent, "session target parent")?;
     for suffix in 0..=MAX_SESSION_OUTPUT_COLLISION_ATTEMPTS {
         let candidate = next_session_output_candidate(base, suffix);
         validate_path_components(&candidate, "session target path")?;
@@ -961,7 +962,7 @@ mod session_output_target_tests {
         let error = publish_session_archive(&target, b"archive")
             .expect_err("a file cannot be used as an output directory");
 
-        assert_eq!(error.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(std::fs::read(&parent).unwrap(), b"parent file");
     }
 }
