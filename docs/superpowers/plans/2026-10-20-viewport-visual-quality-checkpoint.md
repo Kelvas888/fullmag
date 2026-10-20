@@ -36,6 +36,26 @@ Pomiar po etapie: C: wolne `110905458688` B; filesystem control volume 548 GiB d
 
 Brakujące dowody nadal obejmują pełną macierz scen (pusta, otwór, skrajnie cienka, live FDM/FEM), RGB danych ilościowych, rzeczywiste AO, kontrast wszystkich linii, performance dużej sceny, nową sesję/dataset, stare ACK oraz błąd capture. Nie wykonano push/PR/merge ani cleanup aktywnego worktree.
 
+## R7 — grubość ciągłych baselines, kolejny fragment
+
+Na zrzutach `b426e8b1` wyznaczono położenie baselines z bieżącego `buildDimensionFrameModel` oraz zapisanych bounds/kamery/FOV 42°. Dla 480×320 końce CSS: X `(318.61464,163.68673)`→`(242.00360,248.77429)`, Y `(153.45276,198.19070)`→`(242.00360,248.77429)`, Z `(153.45276,198.19070)`→`(145.69532,155.57747)`. Latte ma faktyczne 481×320, więc przy próbkowaniu X skalowano 481/480. Osiem punktów t=.15… .85, najsilniejszy rdzeń w promieniu 1,5 px, mediana tła 3×3 oddalonego o 5 px na zewnątrz. Projekcja źródłowa nie jest maską semantyczną; próbki przecięcia z geometrią lub tickami nie kwalifikują całej osi.
+
+W Latte wiarygodne szare próbki X t=.35 i .85 miały 2,35 i 2,64:1; Y t=.25/.35/.75: 2,57/2,75/2,86:1; Z t=.25/.75: 2,81/2,95:1. Potwierdzono brak wystarczającego kontrastu wybranych rdzeni 1-pikselowej linii, mimo poprawionego kontrastu kolorowych liter. Mocha bez wiarygodnej próbki <3:1; nie jest to dowód dla każdego piksela.
+
+Poprawka źródłowa: tylko trzy ciągłe baselines używają istniejącego Drei Line/LineSegments2 z szerokością 2 CSS px. Końce Float32 SI skopiowane bez przesunięcia; depthTest/LEQUAL zachowany, depthWrite=false, toneMapped=false. Polygon offset dotyczy rasteryzacji. Grids/ticki/extents pozostają dotychczasową ścieżką. Drei zwalnia geometrię i materiał; usunięto zbędną alokację starego axisGeometry. Audyt światła wyklucza liniowe quady `isLineSegments2`, które technicznie dziedziczą po Mesh; nowa regresja używa rzeczywistej klasy Three.js. Pierwsza próba testu nie wystartowała z powodu niebezpośredniej zależności three-stdlib; poprawiony import używa bezpośrednio Three/examples, bez instalowania zależności.
+
+Weryfikacja: 27/27 regresji layer/model, 11/11 lighting audit (agregat 827/827), lint trzech zmienionych plików exit0, produkcyjny typecheck exit0. Focused source review bez actionable findings. Nowy runtime/kontrast i baseline zasobów oczekują na próbę browser; nie uznano starego zrzutu za dowód nowej szerokości.
+
+Lint dużego modelu sceny również pojedynczo przekracza heap 1536 MiB. Próba rozdzielenia plików nie usunęła ograniczenia; nie zmniejszano reguł ani nie restartowano serwisów. Jednorazowe `HeapProfiler.collectGarbage` na istniejącym loopback inspectorze wyłącznie własnego Next (bez Runtime.evaluate) zmniejszyło usedSize 3509924488→3350725616 B i totalSize 3746902016→3524202496 B; po GC grupa miała około 3,99 GiB/6 GiB, lecz lint nadal OOM. Nie deklarujemy optymalizacji aplikacji ani rozwiązania bramki lint.
+
+Świeży GET current run nadal: `run-live-0cc7302699581e9e1c11d5b210107633b74e674f8874d33d64b883ecac0d9084`, stopping, revision8, completed_at=null. Inny czat zakończył okno Git mastera komunikatem RELEASE; nasze worktree i jego źródła nie zostały zintegrowane z nowym masterem. Nie dotykano mastera.
+
+## Nowa blokada admission browser QA — 20.10.2026
+
+Próba nowych baselines zakończyła się przed utworzeniem dopuszczonej przeglądarki: `Development recovery does not identify exactly one live group`. Bieżący backend ma unhealthy, OOMKilled=false, restart0; na liście procesów brak API i native. Receipt PID1: failed_outcome_retained, api_shutdown=unknown, api_exit_code nieobecny. Pierwotna przyczyna to utrata supervision identity probe `/v2/platform/openapi.json` przez31s. SHA receipt `eedfb3d64c4856f87355b7d25b18c8763cf6f12758c03df45bf986825aac30c0`. Owner ma unknown, SHA `b1908cbaf9c9472f2cafa85b16d805b054d14215c06222ed804ad40a6ff0999a`; owner PID i dzieci nie istnieją, dzieci zapisane exited_success. Nie jest to dowód kompletnego drain.
+
+Nie restartowano kontenerów ani nie poprawiano receiptów. Przygotowano [przeglądalną propozycję recovery](2026-10-20-viewport-runtime-recovery-proposal.md) i zadano pytanie o jawną autoryzację odzyskania tylko tej grupy oraz potrzebnych regresji zarządzanej ścieżki. Zależne mutacje czekają na odpowiedź. Kod baselines ma źródłowy review/testy/typecheck/lint, ale runtime pozostaje NOT VERIFIED. Architecture hygiene dla nowych źródeł exit0.
+
 ## Tożsamość
 
 - Zadanie: `viewport-visual-quality-20261020`.

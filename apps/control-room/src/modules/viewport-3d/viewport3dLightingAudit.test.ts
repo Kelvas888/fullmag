@@ -12,15 +12,20 @@ import {
   MeshLambertMaterial,
   PerspectiveCamera,
   Scene,
+  type BufferGeometry,
   type Material,
 } from "three";
+
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
+import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 
 import {
   readViewport3DLightingAudit,
   VIEWPORT_3D_LIGHTING_AUDIT_METHOD,
 } from "./viewport3dLightingAudit";
 
-const geometries: BoxGeometry[] = [];
+const geometries: BufferGeometry[] = [];
 const materials: Material[] = [];
 
 afterEach(() => {
@@ -96,6 +101,22 @@ describe("readViewport3DLightingAudit", () => {
     mesh.layers.set(31);
     mesh.userData = { objectId: "hud-only", primitive: true };
     scene.add(mesh);
+
+    expect(audit(scene, camera)).toMatchObject({
+      litPrimitiveMeshCount: 0,
+      otherSurfaceMeshCount: 0,
+      litPrimitiveObjectIds: [],
+    });
+  });
+
+  it("excludes screen-space annotation line quads from world surfaces", () => {
+    const { scene, camera } = createSceneAndCamera();
+    const geometry = new LineSegmentsGeometry();
+    geometry.setPositions([-1, 0, 0, 1, 0, 0]);
+    const material = new LineMaterial({ linewidth: 2 });
+    geometries.push(geometry);
+    materials.push(material);
+    scene.add(new LineSegments2(geometry, material));
 
     expect(audit(scene, camera)).toMatchObject({
       litPrimitiveMeshCount: 0,

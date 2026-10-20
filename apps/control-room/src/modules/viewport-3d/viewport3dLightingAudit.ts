@@ -39,6 +39,8 @@ export function readViewport3DLightingAudit(
 
   scene.traverseVisible((object) => {
     if (!(object instanceof Mesh) || !object.layers.isEnabled(0)) return;
+    // Screen-space line quads are annotations, not lightable world surfaces.
+    if ("isLineSegments2" in object && object.isLineSegments2 === true) return;
 
     if (isRenderableLitPrimitive(object, frustum)) {
       litPrimitiveMeshCount += 1;

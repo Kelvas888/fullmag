@@ -1,5 +1,6 @@
 "use client";
 
+import { Line } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
 import { useCallback, useEffect, useMemo, useRef, useState, memo } from "react";
 import {
@@ -198,7 +199,13 @@ export const DimensionFrameLayer = memo(function DimensionFrameLayer({
       cameraOrientation,
     ],
   );
-  const axisGeometry = useTrackedLineGeometry(tracker, model.axisLines);
+  const axisPoints = useMemo(() => {
+    const points: [number, number, number][] = [];
+    for (let i = 0; i < model.axisLines.length; i += 3) {
+      points.push([model.axisLines[i], model.axisLines[i + 1], model.axisLines[i + 2]]);
+    }
+    return points;
+  }, [model.axisLines]);
   const minorGeometry = useTrackedLineGeometry(
     tracker,
     minorLinesVisible ? model.minorLines : null,
@@ -256,13 +263,25 @@ export const DimensionFrameLayer = memo(function DimensionFrameLayer({
         opacity={frame.labelOpacity}
         renderOrder={DIMENSION_FRAME_RENDER_ORDER + 2}
       />
-      {/* Later render order plus LEQUAL resolves exact edge ties without moving SI coordinates. */}
-      <FrameLines
-        color={layerColors.axisLine}
-        geometry={axisGeometry}
-        opacity={frame.labelOpacity}
-        renderOrder={DIMENSION_FRAME_RENDER_ORDER + 3}
-      />
+      {/* Screen-width baselines retain SI endpoints; Drei owns their geometry/material cleanup. */}
+      {axisPoints.length > 0 ? (
+        <Line
+          color={layerColors.axisLine}
+          depthFunc={LessEqualDepth}
+          depthTest
+          depthWrite={false}
+          lineWidth={2}
+          opacity={frame.labelOpacity}
+          points={axisPoints}
+          polygonOffset
+          polygonOffsetFactor={-1}
+          polygonOffsetUnits={-1}
+          renderOrder={DIMENSION_FRAME_RENDER_ORDER + 3}
+          segments
+          toneMapped={false}
+          transparent
+        />
+      ) : null}
       {model.labels.length > 0 ? (
         <DimensionFrameLabels
           colors={layerColors}
