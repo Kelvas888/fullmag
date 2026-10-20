@@ -28,13 +28,49 @@ use crate::cas::CasStore;
 use crate::durability::{
     atomic_write, atomic_write_verified_file, confirm_publication, sync_directory,
 };
-use crate::repository_path::{checked_path, create_parent, reject_link, validate_store_id};
+use crate::repository_path::{
+    checked_path, create_parent, read_bounded_regular_file, reject_link, validate_store_id,
+};
 use crate::solution_set_catalog::SolutionSetCatalog;
 use crate::types::*;
 use crate::writer::{WriteTransaction, Writer};
 
 const MAX_TASK_ADMISSION_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_JOB_SUBMISSION_BYTES: usize = 64 * 1024;
+
+fn read_present_directory(root: &Path, relative: &str, label: &str) -> Result<Option<PathBuf>> {
+    let path = checked_path(root, relative)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            reject_link(&path)?;
+            if !metadata.is_dir() {
+                anyhow::bail!("{label} path is not a directory");
+            }
+            Ok(Some(path))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("checking {label} directory")),
+    }
+}
+
+fn read_optional_bounded_regular_file(
+    root: &Path,
+    relative: &str,
+    maximum: usize,
+    label: &str,
+) -> Result<Option<Vec<u8>>> {
+    let path = checked_path(root, relative)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => anyhow::bail!("{label} must be a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("checking {label}")),
+    }
+    Ok(Some(
+        read_bounded_regular_file(root, relative, maximum)
+            .with_context(|| format!("reading {label}"))?,
+    ))
+}
 
 #[path = "accepted_start_gate.rs"]
 mod accepted_start_gate;
@@ -1418,14 +1454,16 @@ impl SessionStore {
     /// Read the immutable preparation receipt for one run, if published.
     pub fn read_preparation_receipt(&self, run_id: &str) -> Result<Option<FmsPreparationReceipt>> {
         validate_store_id(run_id)?;
-        let path = checked_path(
+        let relative = format!("runs/{run_id}/preparation_receipt.json");
+        let path = checked_path(&self.root, &relative)?;
+        let Some(data) = read_optional_bounded_regular_file(
             &self.root,
-            &format!("runs/{run_id}/preparation_receipt.json"),
-        )?;
-        if !path.exists() {
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "preparation receipt",
+        )? else {
             return Ok(None);
-        }
-        let data = fs::read(&path)?;
+        };
         let receipt: FmsPreparationReceipt = serde_json::from_slice(&data)
             .with_context(|| format!("parsing preparation receipt {}", path.display()))?;
         receipt.validate()?;
@@ -1928,14 +1966,16 @@ impl SessionStore {
     ) -> Result<Option<FmsRetryDecision>> {
         validate_store_id(run_id)?;
         validate_store_id(decision_id)?;
-        let path = checked_path(
+        let relative = format!("runs/{run_id}/retry_decisions/{decision_id}.json");
+        let path = checked_path(&self.root, &relative)?;
+        let Some(data) = read_optional_bounded_regular_file(
             &self.root,
-            &format!("runs/{run_id}/retry_decisions/{decision_id}.json"),
-        )?;
-        if !path.exists() {
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "retry decision",
+        )? else {
             return Ok(None);
-        }
-        let data = fs::read(&path)?;
+        };
         let decision: FmsRetryDecision = serde_json::from_slice(&data)?;
         decision.validate()?;
         if decision.run_id != run_id || decision.decision_id != decision_id {
@@ -1947,10 +1987,13 @@ impl SessionStore {
     /// List immutable retry decisions for one run in stable identity order.
     pub fn list_retry_decisions(&self, run_id: &str) -> Result<Vec<FmsRetryDecision>> {
         validate_store_id(run_id)?;
-        let directory = checked_path(&self.root, &format!("runs/{run_id}/retry_decisions"))?;
-        if !directory.exists() {
+        let Some(directory) = read_present_directory(
+            &self.root,
+            &format!("runs/{run_id}/retry_decisions"),
+            "retry decisions",
+        )? else {
             return Ok(Vec::new());
-        }
+        };
         let mut decisions = Vec::new();
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
@@ -2034,10 +2077,14 @@ impl SessionStore {
         validate_store_id(receipt_id)?;
         let relative = format!("runs/{run_id}/worker_process_exit_receipts/{receipt_id}.json");
         let path = checked_path(&self.root, &relative)?;
-        if !path.exists() {
+        let Some(data) = read_optional_bounded_regular_file(
+            &self.root,
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "worker process exit receipt",
+        )? else {
             return Ok(None);
-        }
-        let data = fs::read(&path)?;
+        };
         let receipt: FmsWorkerProcessExitReceipt = serde_json::from_slice(&data)
             .with_context(|| format!("parsing worker process exit receipt {}", path.display()))?;
         if receipt.relative_path()? != relative {
@@ -2052,13 +2099,13 @@ impl SessionStore {
         run_id: &str,
     ) -> Result<Vec<FmsWorkerProcessExitReceipt>> {
         validate_store_id(run_id)?;
-        let directory = checked_path(
+        let Some(directory) = read_present_directory(
             &self.root,
             &format!("runs/{run_id}/worker_process_exit_receipts"),
-        )?;
-        if !directory.exists() {
+            "worker process exit receipts",
+        )? else {
             return Ok(Vec::new());
-        }
+        };
         let mut receipts = Vec::new();
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
@@ -2197,10 +2244,15 @@ impl SessionStore {
         validate_store_id(launch_id)?;
         let relative = format!("runs/{run_id}/preparation_process_launches/{launch_id}.json");
         let path = checked_path(&self.root, &relative)?;
-        if !path.exists() {
+        let Some(data) = read_optional_bounded_regular_file(
+            &self.root,
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "preparation process launch",
+        )? else {
             return Ok(None);
-        }
-        let launch: FmsPreparationProcessLaunch = serde_json::from_slice(&fs::read(&path)?)
+        };
+        let launch: FmsPreparationProcessLaunch = serde_json::from_slice(&data)
             .with_context(|| format!("parsing preparation process launch {}", path.display()))?;
         if launch.relative_path()? != relative {
             anyhow::bail!("preparation process launch identity does not match its path");
@@ -2213,13 +2265,13 @@ impl SessionStore {
         run_id: &str,
     ) -> Result<Vec<FmsPreparationProcessLaunch>> {
         validate_store_id(run_id)?;
-        let directory = checked_path(
+        let Some(directory) = read_present_directory(
             &self.root,
             &format!("runs/{run_id}/preparation_process_launches"),
-        )?;
-        if !directory.exists() {
+            "preparation process launches",
+        )? else {
             return Ok(Vec::new());
-        }
+        };
         let mut launches = Vec::new();
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
@@ -2330,10 +2382,15 @@ impl SessionStore {
         validate_store_id(receipt_id)?;
         let relative = format!("runs/{run_id}/preparation_process_exit_receipts/{receipt_id}.json");
         let path = checked_path(&self.root, &relative)?;
-        if !path.exists() {
+        let Some(data) = read_optional_bounded_regular_file(
+            &self.root,
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "preparation process exit receipt",
+        )? else {
             return Ok(None);
-        }
-        let receipt: FmsPreparationProcessExitReceipt = serde_json::from_slice(&fs::read(&path)?)
+        };
+        let receipt: FmsPreparationProcessExitReceipt = serde_json::from_slice(&data)
             .with_context(|| {
             format!(
                 "parsing preparation process exit receipt {}",
@@ -2351,13 +2408,13 @@ impl SessionStore {
         run_id: &str,
     ) -> Result<Vec<FmsPreparationProcessExitReceipt>> {
         validate_store_id(run_id)?;
-        let directory = checked_path(
+        let Some(directory) = read_present_directory(
             &self.root,
             &format!("runs/{run_id}/preparation_process_exit_receipts"),
-        )?;
-        if !directory.exists() {
+            "preparation process exit receipts",
+        )? else {
             return Ok(Vec::new());
-        }
+        };
         let mut receipts = Vec::new();
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
@@ -2662,11 +2719,15 @@ impl SessionStore {
         validate_store_id(decision_id)?;
         let relative = format!("runs/{run_id}/preparation_retry_decisions/{decision_id}.json");
         let path = checked_path(&self.root, &relative)?;
-        if !path.exists() {
+        let Some(data) = read_optional_bounded_regular_file(
+            &self.root,
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "preparation retry decision",
+        )? else {
             return Ok(None);
-        }
-        reject_link(&path)?;
-        let decision: FmsPreparationRetryDecision = serde_json::from_slice(&fs::read(&path)?)
+        };
+        let decision: FmsPreparationRetryDecision = serde_json::from_slice(&data)
             .with_context(|| format!("parsing preparation retry decision {}", path.display()))?;
         if decision.relative_path()? != relative {
             anyhow::bail!("preparation retry decision identity does not match its path");
@@ -2679,13 +2740,13 @@ impl SessionStore {
         run_id: &str,
     ) -> Result<Vec<FmsPreparationRetryDecision>> {
         validate_store_id(run_id)?;
-        let directory = checked_path(
+        let Some(directory) = read_present_directory(
             &self.root,
             &format!("runs/{run_id}/preparation_retry_decisions"),
-        )?;
-        if !directory.exists() {
+            "preparation retry decisions",
+        )? else {
             return Ok(Vec::new());
-        }
+        };
         let mut decisions = Vec::new();
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
@@ -3077,17 +3138,19 @@ impl SessionStore {
     ) -> Result<Option<FmsCoordinatorJournalEntry>> {
         validate_store_id(run_id)?;
         validate_store_id(entry_id)?;
-        let path = checked_path(
+        let relative = format!(
+            "runs/{run_id}/coordinator_journal/{}/{entry_id}.json",
+            direction.as_str()
+        );
+        let path = checked_path(&self.root, &relative)?;
+        let Some(data) = read_optional_bounded_regular_file(
             &self.root,
-            &format!(
-                "runs/{run_id}/coordinator_journal/{}/{entry_id}.json",
-                direction.as_str()
-            ),
-        )?;
-        if !path.exists() {
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "coordinator journal entry",
+        )? else {
             return Ok(None);
-        }
-        let data = fs::read(&path)?;
+        };
         let entry: FmsCoordinatorJournalEntry = serde_json::from_slice(&data)?;
         entry.validate()?;
         if entry.run_id != run_id || entry.direction != direction || entry.entry_id != entry_id {
@@ -3106,6 +3169,14 @@ impl SessionStore {
     ) -> Result<Vec<FmsCoordinatorJournalEntry>> {
         validate_store_id(run_id)?;
         let _lease = self.write_transaction()?;
+        self.read_coordinator_journal_unlocked(run_id)
+    }
+
+    fn read_coordinator_journal_unlocked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<FmsCoordinatorJournalEntry>> {
+        validate_store_id(run_id)?;
         self.read_run_catalog(run_id)?
             .context("coordinator journal snapshot requires a durable run catalog")?;
         let mut entries = Vec::new();
@@ -3113,13 +3184,13 @@ impl SessionStore {
             FmsCoordinatorJournalDirection::Command,
             FmsCoordinatorJournalDirection::Event,
         ] {
-            let root = checked_path(
+            let Some(root) = read_present_directory(
                 &self.root,
                 &format!("runs/{run_id}/coordinator_journal/{}", direction.as_str()),
-            )?;
-            if !root.exists() {
+                "coordinator journal",
+            )? else {
                 continue;
-            }
+            };
             for file in fs::read_dir(root)? {
                 let file = file?;
                 reject_link(&file.path())?;
@@ -3565,11 +3636,16 @@ impl SessionStore {
     /// Read the durable artifact catalog for one run, if present.
     pub fn read_artifact_catalog(&self, run_id: &str) -> Result<Option<FmsArtifactCatalog>> {
         validate_store_id(run_id)?;
-        let path = checked_path(&self.root, &format!("runs/{run_id}/artifact_catalog.json"))?;
-        if !path.exists() {
+        let relative = format!("runs/{run_id}/artifact_catalog.json");
+        let path = checked_path(&self.root, &relative)?;
+        let Some(data) = read_optional_bounded_regular_file(
+            &self.root,
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "artifact catalog",
+        )? else {
             return Ok(None);
-        }
-        let data = fs::read(&path)?;
+        };
         let catalog: FmsArtifactCatalog = serde_json::from_slice(&data)?;
         catalog.validate()?;
         if catalog.run_id != run_id {
@@ -3772,6 +3848,14 @@ impl SessionStore {
     ) -> Result<Vec<FmsProviderJobSubmission>> {
         validate_store_id(run_id)?;
         let _writer_lease = self.write_transaction()?;
+        self.list_provider_job_submissions_unlocked(run_id)
+    }
+
+    fn list_provider_job_submissions_unlocked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<FmsProviderJobSubmission>> {
+        validate_store_id(run_id)?;
         let root = checked_path(&self.root, &format!("runs/{run_id}/provider_job_submissions"))?;
         reject_link(&root)?;
         if !root.exists() {
@@ -3972,6 +4056,1028 @@ impl SessionStore {
             anyhow::bail!("task admission identity does not match its path");
         }
         Ok(Some(record))
+    }
+
+    /// Enumerate immutable admission records without replaying them. Directory
+    /// and leaf reads use the canonical bounded regular-file reader, so links,
+    /// FIFOs, nonregular leaves, and oversized records fail closed. This is a
+    /// bounded no-follow observation, not an inode-CAS claim against an
+    /// untrusted concurrent writer.
+    fn list_task_admissions_for_run_locked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<FmsTaskAdmissionRecord>> {
+        validate_store_id(run_id)?;
+        let Some(root) = read_present_directory(
+            &self.root,
+            &format!("runs/{run_id}/task_admissions"),
+            "task admissions",
+        )? else {
+            return Ok(Vec::new());
+        };
+        let mut records = Vec::new();
+        for task_entry in fs::read_dir(&root)? {
+            let task_entry = task_entry?;
+            reject_link(&task_entry.path())?;
+            if !task_entry.file_type()?.is_dir() {
+                anyhow::bail!("task admission task entry is not a directory");
+            }
+            let task_id = task_entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 task admission task id"))?;
+            validate_store_id(&task_id)?;
+            for entry in fs::read_dir(task_entry.path())? {
+                let entry = entry?;
+                reject_link(&entry.path())?;
+                if !entry.file_type()?.is_file() {
+                    anyhow::bail!("task admission record is not a regular file");
+                }
+                let file_name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 task admission filename"))?;
+                let attempt_id = file_name
+                    .strip_suffix(".json")
+                    .context("task admission record must be JSON")?;
+                validate_store_id(attempt_id)?;
+                records.push(
+                    self.read_task_admission(run_id, &task_id, attempt_id)?
+                        .context("listed task admission disappeared during read")?,
+                );
+            }
+        }
+        records.sort_by(|left, right| {
+            left.task
+                .task_id
+                .cmp(&right.task.task_id)
+                .then_with(|| left.lease.attempt_id.cmp(&right.lease.attempt_id))
+        });
+        Ok(records)
+    }
+
+    /// Enumerate every immutable solver lease for one run, including released
+    /// history. A terminal proof must retain older retry attempts rather than
+    /// projecting only the current task claim.
+    fn list_resource_leases_for_run_locked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<FmsResourceLease>> {
+        validate_store_id(run_id)?;
+        let Some(root) = read_present_directory(
+            &self.root,
+            &format!("runs/{run_id}/resource_leases"),
+            "resource leases",
+        )? else {
+            return Ok(Vec::new());
+        };
+        let mut leases = Vec::new();
+        for resource_entry in fs::read_dir(&root)? {
+            let resource_entry = resource_entry?;
+            reject_link(&resource_entry.path())?;
+            if !resource_entry.file_type()?.is_dir() {
+                anyhow::bail!("resource lease resource entry is not a directory");
+            }
+            let resource_id = resource_entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 resource id"))?;
+            validate_store_id(&resource_id)?;
+            for entry in fs::read_dir(resource_entry.path())? {
+                let entry = entry?;
+                reject_link(&entry.path())?;
+                if !entry.file_type()?.is_file() {
+                    anyhow::bail!("resource lease entry is not a regular file");
+                }
+                let file_name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 resource lease filename"))?;
+                let token = file_name
+                    .strip_suffix(".json")
+                    .context("resource lease filename must be JSON")?;
+                validate_store_id(token)?;
+                leases.push(
+                    self.read_resource_lease(run_id, &resource_id, token)?
+                        .context("listed resource lease disappeared during read")?,
+                );
+            }
+        }
+        leases.sort_by(|left, right| {
+            left.resource_id
+                .cmp(&right.resource_id)
+                .then_with(|| left.lease_token.cmp(&right.lease_token))
+        });
+        Ok(leases)
+    }
+
+    /// Enumerate every immutable preparation lease for one run, including
+    /// released history. Process absence is never inferred here.
+    fn list_preparation_resource_leases_for_run_locked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<FmsPreparationResourceLease>> {
+        validate_store_id(run_id)?;
+        let Some(root) = read_present_directory(
+            &self.root,
+            &format!("runs/{run_id}/preparation_resource_leases"),
+            "preparation resource leases",
+        )? else {
+            return Ok(Vec::new());
+        };
+        let mut leases = Vec::new();
+        for resource_entry in fs::read_dir(&root)? {
+            let resource_entry = resource_entry?;
+            reject_link(&resource_entry.path())?;
+            if !resource_entry.file_type()?.is_dir() {
+                anyhow::bail!("preparation resource lease entry is not a directory");
+            }
+            let resource_id = resource_entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 preparation resource id"))?;
+            validate_store_id(&resource_id)?;
+            for entry in fs::read_dir(resource_entry.path())? {
+                let entry = entry?;
+                reject_link(&entry.path())?;
+                if !entry.file_type()?.is_file() {
+                    anyhow::bail!("preparation resource lease is not a regular file");
+                }
+                let file_name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 preparation lease filename"))?;
+                let token = file_name
+                    .strip_suffix(".json")
+                    .context("preparation resource lease filename must be JSON")?;
+                validate_store_id(token)?;
+                let lease = self
+                    .read_preparation_resource_lease(run_id, &resource_id, token)?
+                    .context("listed preparation resource lease disappeared during read")?;
+                lease.validate()?;
+                leases.push(lease);
+            }
+        }
+        leases.sort_by(|left, right| {
+            left.resource_id
+                .cmp(&right.resource_id)
+                .then_with(|| left.lease_token.cmp(&right.lease_token))
+        });
+        Ok(leases)
+    }
+
+    /// Enumerate every immutable task preparation receipt for one run. The
+    /// directory is the history authority: an entry for a task absent from
+    /// the current catalog is an error rather than an omitted observation.
+    fn list_task_preparation_receipts_for_run_locked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<FmsTaskPreparationReceipt>> {
+        validate_store_id(run_id)?;
+        let Some(root) = read_present_directory(
+            &self.root,
+            &format!("runs/{run_id}/task_preparation_receipts"),
+            "task preparation receipts",
+        )? else {
+            return Ok(Vec::new());
+        };
+        let mut receipts = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            reject_link(&entry.path())?;
+            if !entry.file_type()?.is_file() {
+                anyhow::bail!("task preparation receipt entry is not a regular file");
+            }
+            let file_name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 task preparation receipt filename"))?;
+            let task_id = file_name
+                .strip_suffix(".json")
+                .context("task preparation receipt filename must be JSON")?;
+            validate_store_id(task_id)?;
+            receipts.push(
+                self.read_task_preparation_receipt(run_id, task_id)?
+                    .with_context(|| {
+                        format!("listed task preparation receipt `{task_id}` disappeared")
+                    })?,
+            );
+        }
+        receipts.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        Ok(receipts)
+    }
+
+    /// Enumerate every immutable accepted-stage receipt for one run. Each
+    /// entry is revalidated against its exact task receipt using bounded
+    /// no-follow reads before it can contribute to terminal evidence.
+    fn list_accepted_stage_preparation_receipts_for_run_locked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<FmsAcceptedStagePreparationReceipt>> {
+        validate_store_id(run_id)?;
+        let Some(root) = read_present_directory(
+            &self.root,
+            &format!("runs/{run_id}/accepted_stage_preparation_receipts"),
+            "accepted stage preparation receipts",
+        )? else {
+            return Ok(Vec::new());
+        };
+        let mut receipts = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            reject_link(&entry.path())?;
+            if !entry.file_type()?.is_file() {
+                anyhow::bail!("accepted stage preparation receipt entry is not a regular file");
+            }
+            let file_name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 accepted stage receipt filename"))?;
+            let expected_task_id = file_name
+                .strip_suffix(".json")
+                .context("accepted stage receipt filename must be JSON")?;
+            validate_store_id(expected_task_id)?;
+            let relative = format!(
+                "runs/{run_id}/accepted_stage_preparation_receipts/{file_name}"
+            );
+            let data = read_bounded_regular_file(
+                &self.root,
+                &relative,
+                crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            )?;
+            let receipt: FmsAcceptedStagePreparationReceipt = serde_json::from_slice(&data)
+                .with_context(|| format!("parsing accepted stage receipt {relative}"))?;
+            if receipt.relative_path()? != relative || receipt.task_id != expected_task_id {
+                anyhow::bail!("accepted stage receipt identity does not match its path");
+            }
+            let task_receipt = self
+                .read_task_preparation_receipt(run_id, expected_task_id)?
+                .context("accepted stage receipt requires its immutable task receipt")?;
+            if !receipt.matches_task_receipt(&task_receipt) {
+                anyhow::bail!(
+                    "accepted stage receipt does not match the immutable task preparation receipt"
+                );
+            }
+            receipts.push(receipt);
+        }
+        receipts.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        Ok(receipts)
+    }
+
+    /// Build terminal evidence while the caller holds the SessionStore writer.
+    /// This is a typed read-only operation: it never reconciles, releases, or
+    /// creates a record. The host callbacks authorize only the two canonical
+    /// no-spawn/provenance cases; an unbound released lease still needs a
+    /// durable process-exit receipt.
+    pub(crate) fn terminal_run_evidence_value_locked<WF, PF>(
+        &self,
+        run_id: &str,
+        worker_proof: WF,
+        preparation_proof: PF,
+    ) -> Result<serde_json::Value>
+    where
+        WF: Fn(&FmsResourceLease, Option<&FmsWorkerProcessExitReceipt>) -> Result<Option<&'static str>>,
+        PF: Fn(
+            &FmsPreparationResourceLease,
+            Option<&FmsPreparationProcessExitReceipt>,
+        ) -> Result<Option<&'static str>>,
+    {
+        validate_store_id(run_id)?;
+        let catalog = self
+            .read_run_catalog(run_id)?
+            .context("terminal evidence requires a durable run catalog")?;
+        catalog.validate()?;
+        if catalog.tasks.is_empty()
+            || catalog
+                .tasks
+                .iter()
+                .any(|task| !matches!(
+                    task.lifecycle,
+                    FmsTaskLifecycle::Succeeded
+                        | FmsTaskLifecycle::Failed
+                        | FmsTaskLifecycle::Cancelled
+                        | FmsTaskLifecycle::Interrupted
+                ))
+        {
+            anyhow::bail!("terminal evidence requires every catalog task to be terminal");
+        }
+
+        let catalog_task_ids = catalog
+            .tasks
+            .iter()
+            .map(|task| task.task_id.as_str())
+            .collect::<HashSet<_>>();
+        let require_catalog_task = |task_id: &str, evidence_kind: &str| -> Result<()> {
+            if !catalog_task_ids.contains(task_id) {
+                anyhow::bail!(
+                    "terminal evidence {evidence_kind} references task `{task_id}` absent from the current run catalog"
+                );
+            }
+            Ok(())
+        };
+        let require_catalog_task_input =
+            |task_id: &str, input_fingerprint: &str, evidence_kind: &str| -> Result<()> {
+                let current = catalog
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == task_id)
+                    .with_context(|| {
+                        format!(
+                            "terminal evidence {evidence_kind} references task `{task_id}` absent from the current run catalog"
+                        )
+                    })?;
+                if current.input_fingerprint != input_fingerprint {
+                    anyhow::bail!(
+                        "terminal evidence {evidence_kind} changed immutable input fingerprint for task `{task_id}`"
+                    );
+                }
+                Ok(())
+            };
+
+        let admissions = self.list_task_admissions_for_run_locked(run_id)?;
+        let leases = self.list_resource_leases_for_run_locked(run_id)?;
+        if leases
+            .iter()
+            .any(|lease| lease.state == FmsResourceLeaseState::Active)
+        {
+            anyhow::bail!("terminal evidence has an active solver lease");
+        }
+        for admission in &admissions {
+            require_catalog_task(&admission.task.task_id, "admission")?;
+            if admission.queued_task.input_fingerprint != admission.task.input_fingerprint {
+                anyhow::bail!(
+                    "task admission has inconsistent immutable input fingerprint for task `{}`",
+                    admission.task.task_id
+                );
+            }
+            require_catalog_task_input(
+                &admission.task.task_id,
+                &admission.queued_task.input_fingerprint,
+                "admission",
+            )?;
+        }
+        for lease in &leases {
+            require_catalog_task(&lease.task_id, "solver lease")?;
+        }
+        let admission_matches_lease = |admission: &FmsTaskAdmissionRecord,
+                                       lease: &FmsResourceLease| {
+            admission.lease.identity_matches(lease)
+                && admission.lease.kind == lease.kind
+                && admission.lease.budget == lease.budget
+        };
+        for lease in &leases {
+            lease.validate()?;
+            let matching_admissions = admissions
+                .iter()
+                .filter(|admission| admission_matches_lease(admission, lease))
+                .count();
+            if matching_admissions != 1 {
+                anyhow::bail!(
+                    "solver lease `{}` has {matching_admissions} matching immutable task admissions",
+                    lease.lease_token
+                );
+            }
+        }
+        for admission in &admissions {
+            let matching_leases = leases
+                .iter()
+                .filter(|lease| admission_matches_lease(admission, lease))
+                .count();
+            if matching_leases != 1 {
+                anyhow::bail!(
+                    "task admission has {matching_leases} matching durable solver leases"
+                );
+            }
+        }
+
+        let worker_exits = self.list_worker_process_exit_receipts(run_id)?;
+        for exit in &worker_exits {
+            exit.validate()?;
+            require_catalog_task(&exit.task_id, "worker exit")?;
+            let matching = leases
+                .iter()
+                .find(|lease| {
+                    lease.run_id == exit.run_id
+                        && lease.task_id == exit.task_id
+                        && lease.attempt_id == exit.attempt_id
+                        && lease.ownership_epoch == exit.ownership_epoch
+                        && lease.resource_id == exit.resource_id
+                        && lease.lease_token == exit.lease_token
+                        && lease.heartbeat_sequence == exit.lease_heartbeat_sequence
+                })
+                .context("worker exit receipt has no matching solver lease")?;
+            if !admissions.iter().any(|admission| {
+                admission_matches_lease(admission, matching)
+            }) {
+                anyhow::bail!("worker exit receipt has no matching task admission");
+            }
+            let matches = worker_exits
+                .iter()
+                .filter(|other| {
+                    other.run_id == matching.run_id
+                        && other.task_id == matching.task_id
+                        && other.attempt_id == matching.attempt_id
+                        && other.ownership_epoch == matching.ownership_epoch
+                        && other.resource_id == matching.resource_id
+                        && other.lease_token == matching.lease_token
+                        && other.lease_heartbeat_sequence == matching.heartbeat_sequence
+                })
+                .count();
+            if matches > 1 {
+                anyhow::bail!("solver lease has duplicate process-exit receipts");
+            }
+        }
+        let mut worker_evidence = Vec::new();
+        let mut solver_evidence_keys = HashSet::new();
+        for lease in &leases {
+            let exits = worker_exits
+                .iter()
+                .filter(|exit| {
+                    exit.run_id == lease.run_id
+                        && exit.task_id == lease.task_id
+                        && exit.attempt_id == lease.attempt_id
+                        && exit.ownership_epoch == lease.ownership_epoch
+                        && exit.resource_id == lease.resource_id
+                        && exit.lease_token == lease.lease_token
+                        && exit.lease_heartbeat_sequence == lease.heartbeat_sequence
+                })
+                .collect::<Vec<_>>();
+            if exits.len() > 1 {
+                anyhow::bail!("solver lease has duplicate process-exit receipts");
+            }
+            let exit = exits.first().copied();
+            let host_kind = worker_proof(lease, exit)?;
+            if exit.is_none() && host_kind.is_none() {
+                anyhow::bail!(
+                    "released solver lease has neither process-exit nor canonical no-spawn proof"
+                );
+            }
+            solver_evidence_keys.insert((
+                lease.task_id.clone(),
+                lease.attempt_id.clone(),
+                lease.ownership_epoch,
+                lease.resource_id.clone(),
+                lease.lease_token.clone(),
+                lease.heartbeat_sequence,
+            ));
+            worker_evidence.push(serde_json::json!({
+                "lease": lease,
+                "exit": exit,
+                "host_proof": host_kind,
+            }));
+        }
+
+        let preparation_leases = self.list_preparation_resource_leases_for_run_locked(run_id)?;
+        if preparation_leases
+            .iter()
+            .any(|lease| lease.state == FmsResourceLeaseState::Active)
+        {
+            anyhow::bail!("terminal evidence has an active preparation lease");
+        }
+        for lease in &preparation_leases {
+            require_catalog_task(&lease.task_id, "preparation lease")?;
+        }
+        let launches = self.list_preparation_process_launches(run_id)?;
+        let preparation_exits = self.list_preparation_process_exit_receipts(run_id)?;
+        for launch in &launches {
+            launch.validate()?;
+            require_catalog_task(&launch.task_id, "preparation launch")?;
+            let lease = preparation_leases
+                .iter()
+                .find(|lease| {
+                    lease.run_id == launch.run_id
+                        && lease.task_id == launch.task_id
+                        && lease.preparation_attempt_id == launch.preparation_attempt_id
+                        && lease.resource_id == launch.resource_id
+                        && lease.lease_token == launch.lease_token
+                        && lease.heartbeat_sequence >= launch.lease_heartbeat_sequence
+                })
+                .context("preparation launch has no matching durable preparation lease")?;
+            let matches = preparation_exits
+                .iter()
+                .filter(|exit| {
+                    exit.run_id == lease.run_id
+                        && exit.task_id == lease.task_id
+                        && exit.preparation_attempt_id == lease.preparation_attempt_id
+                        && exit.resource_id == lease.resource_id
+                        && exit.lease_token == lease.lease_token
+                        && exit.lease_heartbeat_sequence == lease.heartbeat_sequence
+                })
+                .count();
+            if matches != 1 {
+                anyhow::bail!(
+                    "preparation launch `{}` has no unique durable exit receipt",
+                    launch.launch_id
+                );
+            }
+        }
+        for exit in &preparation_exits {
+            exit.validate()?;
+            require_catalog_task(&exit.task_id, "preparation exit")?;
+            if !launches.iter().any(|launch| {
+                launch.run_id == exit.run_id
+                    && launch.task_id == exit.task_id
+                    && launch.preparation_attempt_id == exit.preparation_attempt_id
+                    && launch.resource_id == exit.resource_id
+                    && launch.lease_token == exit.lease_token
+                    && launch.lease_heartbeat_sequence <= exit.lease_heartbeat_sequence
+            }) {
+                anyhow::bail!("preparation exit receipt has no matching launch");
+            }
+        }
+        let mut preparation_evidence = Vec::new();
+        let mut preparation_evidence_keys = HashSet::new();
+        for lease in &preparation_leases {
+            let launches_for_lease = launches
+                .iter()
+                .filter(|launch| {
+                    launch.run_id == lease.run_id
+                        && launch.task_id == lease.task_id
+                        && launch.preparation_attempt_id == lease.preparation_attempt_id
+                        && launch.resource_id == lease.resource_id
+                        && launch.lease_token == lease.lease_token
+                        && launch.lease_heartbeat_sequence <= lease.heartbeat_sequence
+                })
+                .collect::<Vec<_>>();
+            if launches_for_lease.len() > 1 {
+                anyhow::bail!("preparation lease has duplicate launch authorizations");
+            }
+            let exits_for_lease = preparation_exits
+                .iter()
+                .filter(|exit| {
+                    exit.run_id == lease.run_id
+                        && exit.task_id == lease.task_id
+                        && exit.preparation_attempt_id == lease.preparation_attempt_id
+                        && exit.resource_id == lease.resource_id
+                        && exit.lease_token == lease.lease_token
+                        && exit.lease_heartbeat_sequence == lease.heartbeat_sequence
+                })
+                .collect::<Vec<_>>();
+            if exits_for_lease.len() > 1 {
+                anyhow::bail!("preparation lease has duplicate process-exit receipts");
+            }
+            if launches_for_lease.len() == 1 && exits_for_lease.len() != 1 {
+                anyhow::bail!("preparation launch lacks its process-exit receipt");
+            }
+            if launches_for_lease.is_empty() && !exits_for_lease.is_empty() {
+                anyhow::bail!("preparation exit receipt lacks its launch authorization");
+            }
+            let exit = exits_for_lease.first().copied();
+            let host_kind = preparation_proof(lease, exit)?;
+            if exit.is_none() && host_kind.is_none() {
+                anyhow::bail!(
+                    "released preparation lease has neither process-exit nor canonical no-spawn proof"
+                );
+            }
+            preparation_evidence_keys.insert((
+                lease.task_id.clone(),
+                lease.preparation_attempt_id.clone(),
+                lease.resource_id.clone(),
+                lease.lease_token.clone(),
+                lease.heartbeat_sequence,
+            ));
+            preparation_evidence.push(serde_json::json!({
+                "lease": lease,
+                "launch": launches_for_lease.first().copied(),
+                "exit": exit,
+                "host_proof": host_kind,
+            }));
+        }
+
+        // Immutable intent, preparation, artifact, and retry records are part
+        // of the digest, while admissions/leases/exits above provide the
+        // terminal execution fence for every historical attempt.
+        let retry_decisions = self.list_retry_decisions(run_id)?;
+        let preparation_retry_decisions = self.list_preparation_retry_decisions(run_id)?;
+        let mut retry_attempt_keys = HashSet::new();
+        for decision in &retry_decisions {
+            decision.validate()?;
+            if decision.run_id != run_id {
+                anyhow::bail!("retry decision run identity differs from the exact terminal run");
+            }
+            if !retry_attempt_keys.insert((
+                decision.task_id.clone(),
+                decision.attempt_id.clone(),
+                decision.ownership_epoch,
+            )) {
+                anyhow::bail!(
+                    "retry decision history has multiple decisions for one task attempt"
+                );
+            }
+            require_catalog_task(&decision.task_id, "retry decision")?;
+            let matching_admissions = admissions
+                .iter()
+                .filter(|admission| {
+                    admission.lease.run_id == decision.run_id
+                        && admission.lease.task_id == decision.task_id
+                        && admission.lease.attempt_id == decision.attempt_id
+                        && admission.lease.ownership_epoch == decision.ownership_epoch
+                })
+                .collect::<Vec<_>>();
+            if matching_admissions.len() != 1 {
+                anyhow::bail!(
+                    "retry decision `{}` has {} exact admission records",
+                    decision.decision_id,
+                    matching_admissions.len()
+                );
+            }
+            let matching_leases = leases
+                .iter()
+                .filter(|lease| {
+                    lease.run_id == decision.run_id
+                        && lease.task_id == decision.task_id
+                        && lease.attempt_id == decision.attempt_id
+                        && lease.ownership_epoch == decision.ownership_epoch
+                        && admissions.iter().any(|admission| {
+                            admission_matches_lease(admission, lease)
+                                && admission.lease.attempt_id == decision.attempt_id
+                                && admission.lease.ownership_epoch == decision.ownership_epoch
+                        })
+                })
+                .collect::<Vec<_>>();
+            if matching_leases.len() != 1 {
+                anyhow::bail!(
+                    "retry decision `{}` has {} exact released lease records",
+                    decision.decision_id,
+                    matching_leases.len()
+                );
+            }
+            let lease = matching_leases[0];
+            if lease.state != FmsResourceLeaseState::Released {
+                anyhow::bail!(
+                    "retry decision `{}` references a nonreleased lease",
+                    decision.decision_id
+                );
+            }
+            let evidence_key = (
+                lease.task_id.clone(),
+                lease.attempt_id.clone(),
+                lease.ownership_epoch,
+                lease.resource_id.clone(),
+                lease.lease_token.clone(),
+                lease.heartbeat_sequence,
+            );
+            if !solver_evidence_keys.contains(&evidence_key) {
+                anyhow::bail!(
+                    "retry decision `{}` has no exact terminal execution evidence",
+                    decision.decision_id
+                );
+            }
+            if decision.action == FmsRetryAction::Retry {
+                let matching_exits = worker_exits
+                    .iter()
+                    .filter(|exit| {
+                        exit.run_id == lease.run_id
+                            && exit.task_id == lease.task_id
+                            && exit.attempt_id == lease.attempt_id
+                            && exit.ownership_epoch == lease.ownership_epoch
+                            && exit.resource_id == lease.resource_id
+                            && exit.lease_token == lease.lease_token
+                            && exit.lease_heartbeat_sequence == lease.heartbeat_sequence
+                    })
+                    .collect::<Vec<_>>();
+                if matching_exits.len() != 1 || matching_exits[0].status_success {
+                    anyhow::bail!(
+                        "retry decision `{}` does not reference one failed worker exit",
+                        decision.decision_id
+                    );
+                }
+            }
+        }
+        let mut preparation_decisions_by_task = BTreeMap::<
+            String,
+            Vec<&FmsPreparationRetryDecision>,
+        >::new();
+        for decision in &preparation_retry_decisions {
+            decision.validate()?;
+            if decision.run_id != run_id {
+                anyhow::bail!(
+                    "preparation retry decision run identity differs from the exact terminal run"
+                );
+            }
+            require_catalog_task(&decision.task_id, "preparation retry decision")?;
+            preparation_decisions_by_task
+                .entry(decision.task_id.clone())
+                .or_default()
+                .push(decision);
+        }
+        for decisions in preparation_decisions_by_task.values_mut() {
+            decisions.sort_by_key(|decision| decision.retry_sequence);
+            let mut decided_attempts = HashSet::new();
+            let mut max_attempts = None;
+            for (index, decision) in decisions.iter().enumerate() {
+                if decision.retry_sequence != index as u32 + 1
+                    || max_attempts.is_some_and(|value| value != decision.max_attempts)
+                    || !decided_attempts.insert(decision.failed_preparation_attempt_id.clone())
+                {
+                    anyhow::bail!("preparation retry decision history is inconsistent");
+                }
+                max_attempts = Some(decision.max_attempts);
+            }
+        }
+        for decision in &preparation_retry_decisions {
+            let matching_exits = preparation_exits
+                .iter()
+                .filter(|exit| {
+                    exit.run_id == decision.run_id
+                        && exit.task_id == decision.task_id
+                        && exit.preparation_attempt_id
+                            == decision.failed_preparation_attempt_id
+                        && !exit.status_success
+                })
+                .collect::<Vec<_>>();
+            if matching_exits.len() != 1 {
+                anyhow::bail!(
+                    "preparation retry decision `{}` has no unique failed preparation exit",
+                    decision.decision_id
+                );
+            }
+            let exit = matching_exits[0];
+            let matching_leases = preparation_leases
+                .iter()
+                .filter(|lease| {
+                    lease.run_id == exit.run_id
+                        && lease.task_id == exit.task_id
+                        && lease.preparation_attempt_id == exit.preparation_attempt_id
+                        && lease.resource_id == exit.resource_id
+                        && lease.lease_token == exit.lease_token
+                        && lease.heartbeat_sequence == exit.lease_heartbeat_sequence
+                })
+                .collect::<Vec<_>>();
+            if matching_leases.len() != 1 {
+                anyhow::bail!(
+                    "preparation retry decision `{}` has no unique exact preparation lease",
+                    decision.decision_id
+                );
+            }
+            let lease = matching_leases[0];
+            if lease.state != FmsResourceLeaseState::Released {
+                anyhow::bail!(
+                    "preparation retry decision `{}` references a nonreleased preparation lease",
+                    decision.decision_id
+                );
+            }
+            let matching_launches = launches
+                .iter()
+                .filter(|launch| {
+                    launch.run_id == exit.run_id
+                        && launch.task_id == exit.task_id
+                        && launch.preparation_attempt_id == exit.preparation_attempt_id
+                        && launch.resource_id == exit.resource_id
+                        && launch.lease_token == exit.lease_token
+                        && launch.lease_heartbeat_sequence <= exit.lease_heartbeat_sequence
+                })
+                .collect::<Vec<_>>();
+            if matching_launches.len() != 1 {
+                anyhow::bail!(
+                    "preparation retry decision `{}` has no unique exact preparation launch",
+                    decision.decision_id
+                );
+            }
+            let evidence_key = (
+                lease.task_id.clone(),
+                lease.preparation_attempt_id.clone(),
+                lease.resource_id.clone(),
+                lease.lease_token.clone(),
+                lease.heartbeat_sequence,
+            );
+            if !preparation_evidence_keys.contains(&evidence_key) {
+                anyhow::bail!(
+                    "preparation retry decision `{}` has no exact terminal execution evidence",
+                    decision.decision_id
+                );
+            }
+        }
+        let run_intent = self
+            .read_run_intent(run_id)?
+            .context("terminal evidence requires a durable RunIntent")?;
+
+        let cancellation_intents = self.list_task_cancellation_intents(run_id)?;
+        for intent in &cancellation_intents {
+            let current = catalog
+                .tasks
+                .iter()
+                .find(|task| task.task_id == intent.task.task_id)
+                .with_context(|| {
+                    format!(
+                        "task cancellation intent references task `{}` absent from the current run catalog",
+                        intent.task.task_id
+                    )
+                })?;
+            intent.validate_task_scope(self, current, catalog.revision)?;
+        }
+        let cancellation_references = cancellation_intents
+            .iter()
+            .map(|intent| {
+                Ok(serde_json::json!({
+                    "task_id": intent.task.task_id,
+                    "cancellation_id": intent.cancellation_id,
+                    "request_sha256": intent.request_sha256,
+                    "intent_sha256": canonical_json_sha256(&serde_json::to_value(intent)?),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let task_preparation_receipts = self.list_task_preparation_receipts_for_run_locked(run_id)?;
+        let task_preparation_references = task_preparation_receipts
+            .iter()
+            .map(|receipt| {
+                require_catalog_task(&receipt.task_id, "task preparation receipt")?;
+                Ok(serde_json::json!({
+                    "task_id": receipt.task_id,
+                    "receipt_sha256": canonical_json_sha256(&serde_json::to_value(receipt)?),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let accepted_stage_receipts = self
+            .list_accepted_stage_preparation_receipts_for_run_locked(run_id)?;
+        let accepted_stage_references = accepted_stage_receipts
+            .iter()
+            .map(|receipt| {
+                require_catalog_task(&receipt.task_id, "accepted stage preparation receipt")?;
+                Ok(serde_json::json!({
+                    "task_id": receipt.task_id,
+                    "step_id": receipt.step_id,
+                    "preparation_id": receipt.preparation_id,
+                    "receipt_sha256": canonical_json_sha256(&serde_json::to_value(receipt)?),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let preparation_receipt = self.read_preparation_receipt(run_id)?;
+        let preparation_receipt_reference = preparation_receipt
+            .as_ref()
+            .map(|receipt| {
+                Ok(serde_json::json!({
+                    "preparation_id": receipt.preparation_id,
+                    "receipt_sha256": canonical_json_sha256(&serde_json::to_value(receipt)?),
+                }))
+            })
+            .transpose()?;
+
+        let artifact_catalog = self.read_artifact_catalog(run_id)?;
+        let artifact_catalog_reference = artifact_catalog
+            .as_ref()
+            .map(|catalog| {
+                let entries = catalog
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "artifact_id": entry.artifact_id,
+                            "task_id": entry.task_id,
+                            "attempt_id": entry.attempt_id,
+                            "ownership_epoch": entry.ownership_epoch,
+                            "logical_path": entry.logical_path,
+                            "artifact_type": entry.artifact_type,
+                            "content_sha256": entry.content_sha256,
+                            "object_ref": entry.object_ref,
+                            "status": entry.status,
+                            "required": entry.required,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({
+                    "revision": catalog.revision,
+                    "catalog_sha256": canonical_json_sha256(&serde_json::to_value(catalog)?),
+                    "entries": entries,
+                }))
+            })
+            .transpose()?;
+        if let Some(catalog) = &artifact_catalog {
+            for entry in &catalog.entries {
+                require_catalog_task(&entry.task_id, "artifact catalog")?;
+                if !admissions.iter().any(|admission| {
+                    admission.lease.run_id == run_id
+                        && admission.lease.task_id == entry.task_id
+                        && admission.lease.attempt_id == entry.attempt_id
+                        && admission.lease.ownership_epoch == entry.ownership_epoch
+                }) {
+                    anyhow::bail!(
+                        "artifact `{}` has no matching immutable task admission",
+                        entry.artifact_id
+                    );
+                }
+            }
+        }
+        for task in &catalog.tasks {
+            for artifact_id in &task.artifact_ids {
+                let present = artifact_catalog.as_ref().is_some_and(|catalog| {
+                    catalog
+                        .entries
+                        .iter()
+                        .any(|entry| entry.artifact_id == *artifact_id)
+                });
+                if !present {
+                    anyhow::bail!(
+                        "catalog task `{}` references missing artifact `{artifact_id}`",
+                        task.task_id
+                    );
+                }
+            }
+        }
+
+        let provider_submissions = self.list_provider_job_submissions_unlocked(run_id)?;
+        let provider_references = provider_submissions
+            .iter()
+            .map(|submission| {
+                submission.validate()?;
+                require_catalog_task(&submission.task_id, "provider submission")?;
+                let matching_lease = leases
+                    .iter()
+                    .find(|lease| {
+                        lease.run_id == submission.run_id
+                            && lease.task_id == submission.task_id
+                            && lease.attempt_id == submission.attempt_id
+                            && lease.ownership_epoch == submission.ownership_epoch
+                            && lease.resource_id == submission.resource_id
+                    })
+                    .context("provider submission has no matching durable solver lease")?;
+                if !admissions.iter().any(|admission| {
+                    admission_matches_lease(admission, matching_lease)
+                }) {
+                    anyhow::bail!(
+                        "provider submission has no matching immutable task admission"
+                    );
+                }
+                if !submission.status.is_terminal() {
+                    anyhow::bail!(
+                        "terminal evidence has a nonterminal provider submission for task `{}`",
+                        submission.task_id
+                    );
+                }
+                Ok(serde_json::json!({
+                    "task_id": submission.task_id,
+                    "attempt_id": submission.attempt_id,
+                    "ownership_epoch": submission.ownership_epoch,
+                    "provider_id": submission.provider_id,
+                    "target_id": submission.target_id,
+                    "scheduler_id": submission.scheduler_id,
+                    "resource_id": submission.resource_id,
+                    "idempotency_key": submission.idempotency_key,
+                    "request_digest": submission.request_digest,
+                    "status": submission.status,
+                    "provider_job_id": submission.provider_job_id,
+                    "revision": submission.revision,
+                    "submission_sha256": canonical_json_sha256(
+                        &serde_json::to_value(submission)?,
+                    ),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let coordinator_entries = self.read_coordinator_journal_unlocked(run_id)?;
+        let coordinator_references = coordinator_entries
+            .iter()
+            .map(|entry| {
+                require_catalog_task(&entry.task_id, "coordinator journal")?;
+                if !admissions.iter().any(|admission| {
+                    admission.lease.run_id == entry.run_id
+                        && admission.lease.task_id == entry.task_id
+                        && admission.lease.attempt_id == entry.attempt_id
+                        && admission.lease.ownership_epoch == entry.ownership_epoch
+                        && admission.lease.lease_token == entry.lease_token
+                }) {
+                    anyhow::bail!(
+                        "coordinator journal entry `{}` has no matching immutable task admission",
+                        entry.entry_id
+                    );
+                }
+                Ok(serde_json::json!({
+                    "entry_id": entry.entry_id,
+                    "task_id": entry.task_id,
+                    "attempt_id": entry.attempt_id,
+                    "ownership_epoch": entry.ownership_epoch,
+                    "lease_token": entry.lease_token,
+                    "direction": entry.direction,
+                    "sequence": entry.sequence,
+                    "terminal": entry.terminal,
+                    "payload_sha256": entry.payload_sha256,
+                    "entry_sha256": canonical_json_sha256(&serde_json::to_value(entry)?),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(serde_json::json!({
+            "catalog": catalog,
+            "run_intent": run_intent,
+            "admissions": admissions,
+            "leases": leases,
+            "worker_evidence": worker_evidence,
+            "preparation_leases": preparation_leases,
+            "preparation_launches": launches,
+            "preparation_exits": preparation_exits,
+            "preparation_evidence": preparation_evidence,
+            "retry_decisions": retry_decisions,
+            "preparation_retry_decisions": preparation_retry_decisions,
+            "preparation_receipt": preparation_receipt_reference,
+            "task_preparation_receipts": task_preparation_references,
+            "accepted_stage_preparation_receipts": accepted_stage_references,
+            "task_cancellation_intents": cancellation_references,
+            "artifact_catalog": artifact_catalog_reference,
+            "provider_submissions": provider_references,
+            "coordinator_journal": coordinator_references,
+        }))
     }
 
     /// Replay only the requested durable task admission record under the store writer lease.
@@ -4420,10 +5526,15 @@ impl SessionStore {
         let relative =
             format!("runs/{run_id}/preparation_resource_leases/{resource_id}/{lease_token}.json");
         let path = checked_path(&self.root, &relative)?;
-        if !path.exists() {
+        let Some(data) = read_optional_bounded_regular_file(
+            &self.root,
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "preparation resource lease",
+        )? else {
             return Ok(None);
-        }
-        let lease: FmsPreparationResourceLease = serde_json::from_slice(&fs::read(&path)?)
+        };
+        let lease: FmsPreparationResourceLease = serde_json::from_slice(&data)
             .with_context(|| format!("parsing preparation resource lease {}", path.display()))?;
         if lease.relative_path()? != relative {
             anyhow::bail!("preparation resource lease identity does not match its path");
@@ -4795,14 +5906,18 @@ impl SessionStore {
         validate_store_id(run_id)?;
         validate_store_id(resource_id)?;
         validate_store_id(lease_token)?;
-        let path = checked_path(
+        let relative = format!(
+            "runs/{run_id}/resource_leases/{resource_id}/{lease_token}.json"
+        );
+        let path = checked_path(&self.root, &relative)?;
+        let Some(data) = read_optional_bounded_regular_file(
             &self.root,
-            &format!("runs/{run_id}/resource_leases/{resource_id}/{lease_token}.json"),
-        )?;
-        if !path.exists() {
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+            "resource lease",
+        )? else {
             return Ok(None);
-        }
-        let data = fs::read(&path)?;
+        };
         let lease: FmsResourceLease = serde_json::from_slice(&data)
             .with_context(|| format!("parsing resource lease {}", path.display()))?;
         lease.validate()?;
@@ -6036,7 +7151,7 @@ mod tests {
         }));
     }
 
-    fn test_resource_lease(
+    pub(super) fn test_resource_lease(
         run_id: &str,
         task_id: &str,
         attempt_id: &str,
@@ -8754,6 +9869,7 @@ mod tests {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+    use super::tests::test_resource_lease;
     use chrono::Utc;
 
     fn queued_task(task_id: &str) -> FmsTaskCatalogEntry {
@@ -9463,4 +10579,812 @@ mod admission_tests {
         v2_without_ref.accepted_provenance_ref = None;
         assert!(store.commit_session(&v2_without_ref).is_err());
     }
+
+    #[test]
+    fn terminal_evidence_rejects_released_solver_lease_without_exit_or_no_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-terminal-proof";
+        let task_id = "task-terminal-proof";
+        let now = Utc::now();
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-proof",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+        store
+            .commit_run_catalog(&FmsRunCatalog {
+                schema_version: FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.into(),
+                revision: 1,
+                updated_at: now,
+                tasks: vec![FmsTaskCatalogEntry {
+                    task_id: task_id.into(),
+                    input_fingerprint: "a".repeat(64),
+                    lifecycle: FmsTaskLifecycle::Queued,
+                    readiness: FmsTaskReadiness::Ready,
+                    observation: None,
+                    attempt_id: None,
+                    ownership_epoch: None,
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: None,
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+        let lease = test_resource_lease(
+            run_id,
+            task_id,
+            "attempt-terminal-proof",
+            1,
+            "cpu-terminal-proof",
+            "lease-terminal-proof",
+            now,
+        );
+        store.commit_task_admission(&lease).unwrap();
+        store.release_resource_lease(&lease).unwrap();
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = now + chrono::Duration::seconds(1);
+        terminal.tasks[0].lifecycle = FmsTaskLifecycle::Failed;
+        store.commit_run_catalog(&terminal).unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("neither process-exit nor canonical no-spawn proof"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_admission_history_missing_from_current_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-history";
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-history",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+        seed_catalog(&store, vec![queued_task(task_id)]);
+        let claim = lease(
+            task_id,
+            "attempt-terminal-history",
+            "lease-terminal-history",
+        );
+        store.commit_task_admission(&claim).unwrap();
+        store.release_resource_lease(&claim).unwrap();
+
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = Utc::now();
+        let mut replacement = queued_task("task-terminal-history-replacement");
+        replacement.lifecycle = FmsTaskLifecycle::Failed;
+        terminal.tasks = vec![replacement];
+        store.commit_run_catalog(&terminal).unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("absent from the current run catalog"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_immutable_lease_field_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-identity";
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-identity",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+        seed_catalog(&store, vec![queued_task(task_id)]);
+        let claim = lease(
+            task_id,
+            "attempt-terminal-identity",
+            "lease-terminal-identity",
+        );
+        store.commit_task_admission(&claim).unwrap();
+        store.release_resource_lease(&claim).unwrap();
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = Utc::now();
+        terminal.tasks[0].lifecycle = FmsTaskLifecycle::Failed;
+        store.commit_run_catalog(&terminal).unwrap();
+
+        let path = store.resource_lease_path(&claim).unwrap();
+        let mut altered: FmsResourceLease = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        altered.budget.cpu_millis = altered.budget.cpu_millis.saturating_add(1);
+        fs::write(&path, serde_json::to_vec_pretty(&altered).unwrap()).unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no matching immutable task admission"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_active_preparation_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-preparation";
+        let mut task = queued_task(task_id);
+        task.lifecycle = FmsTaskLifecycle::Accepted;
+        task.readiness = FmsTaskReadiness::Blocked {
+            reason: FMS_TASK_AWAITING_PREPARATION_REASON.into(),
+        };
+        seed_catalog(&store, vec![task]);
+        let now = Utc::now();
+        let prep_lease = FmsPreparationResourceLease {
+            schema_version: FMS_PREPARATION_RESOURCE_LEASE_SCHEMA.into(),
+            resource_id: "cpu-terminal-preparation".into(),
+            budget: FmsResourceBudget {
+                cpu_millis: 100,
+                memory_bytes: 1024,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1024,
+            },
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            preparation_attempt_id: "prep-terminal-preparation".into(),
+            lease_token: "prep-lease-terminal-preparation".into(),
+            state: FmsResourceLeaseState::Active,
+            acquired_at: now,
+            heartbeat_at: now,
+            heartbeat_sequence: 0,
+            released_at: None,
+            host_launch_binding: None,
+        };
+        assert_eq!(
+            store
+                .commit_preparation_resource_lease(&prep_lease)
+                .unwrap(),
+            PreparationResourceLeaseCommitDisposition::Acquired
+        );
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = Utc::now();
+        terminal.tasks[0].lifecycle = FmsTaskLifecycle::Cancelled;
+        store.commit_run_catalog(&terminal).unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active preparation lease"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_orphan_task_preparation_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-terminal-orphan-prep";
+        let current_task_id = "task-terminal-current";
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-orphan-prep",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+        store
+            .commit_run_catalog(&FmsRunCatalog {
+                schema_version: FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.into(),
+                revision: 1,
+                updated_at: Utc::now(),
+                tasks: vec![FmsTaskCatalogEntry {
+                    task_id: current_task_id.into(),
+                    input_fingerprint: "a".repeat(64),
+                    lifecycle: FmsTaskLifecycle::Failed,
+                    readiness: FmsTaskReadiness::Ready,
+                    observation: None,
+                    attempt_id: None,
+                    ownership_epoch: None,
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: None,
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+
+        let step_id = "step:orphan";
+        let orphan_task_id = task_id_for_study_step(run_id, step_id).unwrap();
+        let plan_fingerprint = format!("sha256:{}", "a".repeat(64));
+        let specification_fingerprint = format!("sha256:{}", "b".repeat(64));
+        let problem_fingerprint = format!("sha256:{}", "c".repeat(64));
+        let receipt = FmsTaskPreparationReceipt::new(
+            run_id,
+            step_id,
+            "a".repeat(64),
+            format!("prep-{orphan_task_id}"),
+            plan_fingerprint.clone(),
+            accepted_task_preparation_payload(
+                run_id,
+                step_id,
+                &format!("prep-{orphan_task_id}"),
+                &plan_fingerprint,
+                &problem_fingerprint,
+                &specification_fingerprint,
+            ),
+        )
+        .unwrap();
+        let relative = receipt.relative_path().unwrap();
+        let path = create_parent(store.root(), &relative).unwrap();
+        atomic_write(&path, &serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("task preparation receipt task is missing"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_cancellation_scope_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-cancellation-scope";
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-cancellation-scope",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+        seed_catalog(&store, vec![queued_task(task_id)]);
+        store
+            .request_task_cancellation_intent(
+                run_id,
+                task_id,
+                "cancel-terminal-cancellation-scope",
+                1,
+                "operator requested cancellation",
+            )
+            .unwrap();
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = Utc::now();
+        terminal.tasks[0].input_fingerprint = "b".repeat(64);
+        terminal.tasks[0].lifecycle = FmsTaskLifecycle::Failed;
+        store.commit_run_catalog(&terminal).unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("changed input"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_stage_receipt_without_task_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-terminal-stage";
+        let step_id = "step:stage";
+        let task_id = task_id_for_study_step(run_id, step_id).unwrap();
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-stage",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+        store
+            .commit_run_catalog(&FmsRunCatalog {
+                schema_version: FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.into(),
+                revision: 1,
+                updated_at: Utc::now(),
+                tasks: vec![FmsTaskCatalogEntry {
+                    task_id: task_id.clone(),
+                    input_fingerprint: "a".repeat(64),
+                    lifecycle: FmsTaskLifecycle::Failed,
+                    readiness: FmsTaskReadiness::Ready,
+                    observation: None,
+                    attempt_id: None,
+                    ownership_epoch: None,
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: None,
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+
+        let plan_fingerprint = format!("sha256:{}", "a".repeat(64));
+        let task_receipt = FmsTaskPreparationReceipt::new(
+            run_id,
+            step_id,
+            "a".repeat(64),
+            format!("prep-{task_id}"),
+            plan_fingerprint.clone(),
+            accepted_task_preparation_payload(
+                run_id,
+                step_id,
+                &format!("prep-{task_id}"),
+                &plan_fingerprint,
+                &format!("sha256:{}", "c".repeat(64)),
+                &format!("sha256:{}", "b".repeat(64)),
+            ),
+        )
+        .unwrap();
+        let stage = FmsAcceptedStagePreparationReceipt::from_task_receipt(&task_receipt).unwrap();
+        let relative = stage.relative_path().unwrap();
+        let path = create_parent(store.root(), &relative).unwrap();
+        atomic_write(&path, &serde_json::to_vec_pretty(&stage).unwrap()).unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("accepted stage receipt requires its immutable task receipt"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_normal_admission_input_fingerprint_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-input-drift";
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-input-drift",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+        seed_catalog(&store, vec![queued_task(task_id)]);
+        let claim = lease(
+            task_id,
+            "attempt-terminal-input-drift",
+            "lease-terminal-input-drift",
+        );
+        store.commit_task_admission(&claim).unwrap();
+        store.release_resource_lease(&claim).unwrap();
+
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = Utc::now();
+        terminal.tasks[0].input_fingerprint = "b".repeat(64);
+        terminal.tasks[0].lifecycle = FmsTaskLifecycle::Failed;
+        store.commit_run_catalog(&terminal).unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed immutable input fingerprint"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_orphan_solver_retry_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-orphan-retry";
+        let mut task = queued_task(task_id);
+        task.lifecycle = FmsTaskLifecycle::Failed;
+        task.attempt_id = Some("attempt-terminal-orphan-retry".into());
+        task.ownership_epoch = Some(1);
+        task.resource_id = Some("cpu-terminal-orphan-retry".into());
+        seed_catalog(&store, vec![task]);
+        let decision = FmsRetryDecision {
+            schema_version: FMS_RETRY_DECISION_SCHEMA.into(),
+            decision_id: "decision-terminal-orphan-retry".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            attempt_id: "attempt-terminal-orphan-retry".into(),
+            ownership_epoch: 1,
+            trigger: FmsRetryTrigger::WorkerDisconnected,
+            action: FmsRetryAction::Retry,
+            reason: "fixture orphan decision".into(),
+            created_at: Utc::now(),
+        };
+        store.commit_retry_decision(&decision).unwrap();
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-orphan-retry",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("has 0 exact admission records"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_orphan_preparation_retry_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-orphan-prep-retry";
+        let mut task = queued_task(task_id);
+        task.lifecycle = FmsTaskLifecycle::Failed;
+        seed_catalog(&store, vec![task]);
+        let decision = FmsPreparationRetryDecision {
+            schema_version: FMS_PREPARATION_RETRY_DECISION_SCHEMA.into(),
+            decision_id: "decision-terminal-orphan-prep-retry".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            failed_preparation_attempt_id: "prep-terminal-orphan-retry".into(),
+            retry_sequence: 1,
+            max_attempts: 2,
+            reason: "fixture orphan preparation decision".into(),
+            created_at: Utc::now(),
+        };
+        let relative = decision.relative_path().unwrap();
+        let path = create_parent(store.root(), &relative).unwrap();
+        atomic_write(&path, &serde_json::to_vec_pretty(&decision).unwrap()).unwrap();
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-orphan-prep-retry",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let error = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, _exit| Ok(None),
+                |_lease, _exit| Ok(None),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("has no unique failed preparation exit"));
+    }
+
+    #[test]
+    fn terminal_evidence_accepts_historical_solver_retry_with_exact_exit_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-historical-retry";
+        seed_catalog(&store, vec![queued_task(task_id)]);
+        let now = Utc::now();
+        let first = test_resource_lease(
+            run_id,
+            task_id,
+            "attempt-terminal-historical-first",
+            1,
+            "cpu-terminal-historical-retry",
+            "lease-terminal-historical-first",
+            now,
+        );
+        store.commit_task_admission(&first).unwrap();
+        let first_exit = FmsWorkerProcessExitReceipt {
+            schema_version: FMS_WORKER_PROCESS_EXIT_RECEIPT_SCHEMA.into(),
+            receipt_id: "exit-terminal-historical-first".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            attempt_id: first.attempt_id.clone(),
+            ownership_epoch: first.ownership_epoch,
+            resource_id: first.resource_id.clone(),
+            lease_token: first.lease_token.clone(),
+            lease_heartbeat_sequence: first.heartbeat_sequence,
+            process_id: 401,
+            process_start_token: Some("historical-first".into()),
+            status_success: false,
+            exit_code: Some(1),
+            timed_out: false,
+            stop_requested: false,
+            failure_reason: Some("fixture first attempt failure".into()),
+            observed_at: now,
+        };
+        store
+            .commit_worker_process_exit_receipt(&first_exit)
+            .unwrap();
+        store.release_resource_lease(&first).unwrap();
+        let mut failed_first = store.read_run_catalog(run_id).unwrap().unwrap();
+        failed_first.revision += 1;
+        failed_first.updated_at = Utc::now();
+        failed_first.tasks[0].lifecycle = FmsTaskLifecycle::Failed;
+        failed_first.tasks[0].observation = Some(FmsObservationState::Reconciling);
+        store.commit_run_catalog(&failed_first).unwrap();
+
+        let retry = FmsRetryDecision {
+            schema_version: FMS_RETRY_DECISION_SCHEMA.into(),
+            decision_id: "decision-terminal-historical-retry".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            attempt_id: first.attempt_id.clone(),
+            ownership_epoch: first.ownership_epoch,
+            trigger: FmsRetryTrigger::WorkerDisconnected,
+            action: FmsRetryAction::Retry,
+            reason: "fixture retry after first failure".into(),
+            created_at: Utc::now(),
+        };
+        store.commit_retry_decision(&retry).unwrap();
+        store.apply_retry_decision(&retry).unwrap();
+
+        let second = test_resource_lease(
+            run_id,
+            task_id,
+            "attempt-terminal-historical-second",
+            2,
+            "cpu-terminal-historical-retry",
+            "lease-terminal-historical-second",
+            Utc::now(),
+        );
+        store.commit_task_admission(&second).unwrap();
+        let second_exit = FmsWorkerProcessExitReceipt {
+            schema_version: FMS_WORKER_PROCESS_EXIT_RECEIPT_SCHEMA.into(),
+            receipt_id: "exit-terminal-historical-second".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            attempt_id: second.attempt_id.clone(),
+            ownership_epoch: second.ownership_epoch,
+            resource_id: second.resource_id.clone(),
+            lease_token: second.lease_token.clone(),
+            lease_heartbeat_sequence: second.heartbeat_sequence,
+            process_id: 402,
+            process_start_token: Some("historical-second".into()),
+            status_success: false,
+            exit_code: Some(2),
+            timed_out: false,
+            stop_requested: false,
+            failure_reason: Some("fixture terminal second failure".into()),
+            observed_at: Utc::now(),
+        };
+        store
+            .commit_worker_process_exit_receipt(&second_exit)
+            .unwrap();
+        store.release_resource_lease(&second).unwrap();
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = Utc::now();
+        terminal.tasks[0].lifecycle = FmsTaskLifecycle::Failed;
+        store.commit_run_catalog(&terminal).unwrap();
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-historical-retry",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let evidence = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, exit| Ok(exit.map(|_| "worker")),
+                |_lease, exit| Ok(exit.map(|_| "preparation")),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence["retry_decisions"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            evidence["worker_evidence"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn terminal_evidence_accepts_historical_preparation_retry_with_exact_exit_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-historical-prep-retry";
+        let mut task = queued_task(task_id);
+        task.lifecycle = FmsTaskLifecycle::Accepted;
+        task.readiness = FmsTaskReadiness::Blocked {
+            reason: FMS_TASK_AWAITING_PREPARATION_REASON.into(),
+        };
+        seed_catalog(&store, vec![task]);
+        let now = Utc::now();
+        let lease = FmsPreparationResourceLease {
+            schema_version: FMS_PREPARATION_RESOURCE_LEASE_SCHEMA.into(),
+            resource_id: "cpu-terminal-historical-prep".into(),
+            budget: FmsResourceBudget {
+                cpu_millis: 100,
+                memory_bytes: 1024,
+                gpu_memory_bytes: 0,
+                storage_bytes: 4096,
+            },
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            preparation_attempt_id: "prep-terminal-historical-first".into(),
+            lease_token: "prep-lease-terminal-historical-first".into(),
+            state: FmsResourceLeaseState::Active,
+            acquired_at: now,
+            heartbeat_at: now,
+            heartbeat_sequence: 0,
+            released_at: None,
+            host_launch_binding: None,
+        };
+        store.commit_preparation_resource_lease(&lease).unwrap();
+        let launch = FmsPreparationProcessLaunch {
+            schema_version: FMS_PREPARATION_PROCESS_LAUNCH_SCHEMA.into(),
+            launch_id: "prep-launch-terminal-historical-first".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            preparation_attempt_id: lease.preparation_attempt_id.clone(),
+            resource_id: lease.resource_id.clone(),
+            lease_token: lease.lease_token.clone(),
+            lease_heartbeat_sequence: lease.heartbeat_sequence,
+            supervisor_process_id: 501,
+            supervisor_start_token: Some("historical-prep".into()),
+            created_at: now,
+        };
+        store.commit_preparation_process_launch(&launch).unwrap();
+        let exit = FmsPreparationProcessExitReceipt {
+            schema_version: FMS_PREPARATION_PROCESS_EXIT_RECEIPT_SCHEMA.into(),
+            receipt_id: "prep-exit-terminal-historical-first".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            preparation_attempt_id: lease.preparation_attempt_id.clone(),
+            resource_id: lease.resource_id.clone(),
+            lease_token: lease.lease_token.clone(),
+            lease_heartbeat_sequence: lease.heartbeat_sequence,
+            process_id: 502,
+            process_start_token: Some("historical-prep-child".into()),
+            status_success: false,
+            exit_code: Some(1),
+            timed_out: false,
+            failure_reason: Some("fixture preparation failure".into()),
+            observed_at: now,
+        };
+        store.commit_preparation_process_exit_receipt(&exit).unwrap();
+        assert_eq!(
+            store.finalize_preparation_process_exit(&exit).unwrap(),
+            PreparationProcessFinalizationDisposition::Failed
+        );
+        let decision = FmsPreparationRetryDecision {
+            schema_version: FMS_PREPARATION_RETRY_DECISION_SCHEMA.into(),
+            decision_id: "prep-retry-terminal-historical-first".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            failed_preparation_attempt_id: lease.preparation_attempt_id.clone(),
+            retry_sequence: 1,
+            max_attempts: 2,
+            reason: "fixture preparation retry".into(),
+            created_at: Utc::now(),
+        };
+        store.commit_preparation_retry_decision(&decision).unwrap();
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = Utc::now();
+        terminal.tasks[0].lifecycle = FmsTaskLifecycle::Failed;
+        terminal.tasks[0].readiness = FmsTaskReadiness::Ready;
+        store.commit_run_catalog(&terminal).unwrap();
+        store
+            .commit_run_intent(&FmsRunIntent::new(
+                run_id,
+                "submit-terminal-historical-prep-retry",
+                serde_json::json!({"run_id": run_id}),
+            ))
+            .unwrap();
+
+        let _writer = store.write_transaction().unwrap();
+        let evidence = store
+            .terminal_run_evidence_value_locked(
+                run_id,
+                |_lease, exit| Ok(exit.map(|_| "worker")),
+                |_lease, exit| Ok(exit.map(|_| "preparation")),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence["preparation_retry_decisions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            evidence["preparation_evidence"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_run_lease_reader_rejects_dangling_directory_link_as_missing_state() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let parent = store.root().join("runs/run-link");
+        std::fs::create_dir_all(&parent).unwrap();
+        symlink("missing-resource-leases", parent.join("resource_leases")).unwrap();
+        let _writer = store.write_transaction().unwrap();
+        assert!(store
+            .list_resource_leases_for_run_locked("run-link")
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_run_lease_reader_rejects_dangling_leaf_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let parent = store.root().join("runs/run-leaf-link/resource_leases/cpu");
+        std::fs::create_dir_all(&parent).unwrap();
+        symlink("missing-lease.json", parent.join("lease.json")).unwrap();
+        let _writer = store.write_transaction().unwrap();
+        assert!(store
+            .list_resource_leases_for_run_locked("run-leaf-link")
+            .is_err());
+    }
+
 }

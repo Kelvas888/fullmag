@@ -21,7 +21,7 @@ use crate::canonical_json_sha256;
 use crate::compute_node_snapshot::{ComputeNodeSnapshot, EnforcementStatus, GpuPartition, Reported};
 use crate::compute_node_policy::{NodePolicy, NodePolicyStatus};
 use crate::durability::{atomic_write, confirm_publication, sync_directory};
-use crate::repository_path::{checked_path, read_bounded_regular_file, reject_link};
+use crate::repository_path::{checked_path, read_bounded_regular_file, reject_link, validate_store_id};
 use crate::store::SessionStore;
 use crate::types::{
     FmsPreparationProcessExitReceipt, FmsPreparationResourceLease, FmsResourceBudget,
@@ -3745,6 +3745,254 @@ impl HostResourceLedger {
         operation(&snapshot)
     }
 
+    /// Run a synchronous exact-run terminal-evidence read while the host
+    /// writer is held before the target SessionStore writer. Foreign runs and
+    /// stores remain admissible; only the exact run is fenced. The callback
+    /// receives the validated snapshot and digest and must not await or mutate
+    /// either authority.
+    pub fn with_terminal_run_evidence_fence<T>(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+        operation: impl FnOnce(&HostResourceLedgerSnapshot, &str) -> Result<T>,
+    ) -> Result<T> {
+        crate::repository_path::validate_store_id(run_id)?;
+        let store_id = Self::store_id(store.root())?;
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let document = self.read_document_locked()?;
+        let mut exact_rows = Vec::new();
+        for row in document.reservations.iter().filter(|row| {
+            row.identity.store_id == store_id && row.identity.run_id == run_id
+        }) {
+            if row.state != HostResourceReservationState::Released {
+                bail!("exact terminal run has a nonreleased host reservation");
+            }
+            let proof = read_validated_release_proof(&self.root, &document.policy, row)?;
+            if matches!(proof.kind, HostResourceReleaseProofKind::WorkerOrphanTeardown) {
+                bail!("terminal evidence cannot use an orphan-teardown release proof");
+            }
+            exact_rows.push((row.clone(), proof));
+        }
+
+        let catalog = store
+            .read_run_catalog(run_id)?
+            .context("terminal evidence requires a durable run catalog")?;
+        catalog.validate()?;
+
+        // A released host row without a local lease is legal only for the
+        // canonical pre-admission proofs. The immutable proof already carries
+        // the accepted/queued task certificate; this read adds the exact local
+        // absence check under the same store writer.
+        for (row, proof) in &exact_rows {
+            if let Some(task) = proof.unadmitted_task.as_ref() {
+                validate_pre_admission_task_scope(store, &catalog, task)?;
+            }
+            match &row.identity.owner {
+                HostReservationOwner::Solver { attempt_id, .. } => {
+                    let local_lease = store.read_resource_lease(
+                        run_id,
+                        &row.identity.resource_id,
+                        &row.identity.lease_token,
+                    )?;
+                    if local_lease.is_none() {
+                        if proof.kind != HostResourceReleaseProofKind::AdmissionAbsent {
+                            bail!("solver host row without a local lease lacks AdmissionAbsent proof");
+                        }
+                        if store
+                            .read_task_admission(run_id, &row.identity.task_id, attempt_id)?
+                            .is_some()
+                        {
+                            bail!("AdmissionAbsent proof has a durable task admission");
+                        }
+                    }
+                }
+                HostReservationOwner::Preparation { .. } => {
+                    let local_lease = store.read_preparation_resource_lease(
+                        run_id,
+                        &row.identity.resource_id,
+                        &row.identity.lease_token,
+                    )?;
+                    if local_lease.is_none()
+                        && proof.kind != HostResourceReleaseProofKind::PreparationAdmissionAbsent
+                    {
+                        bail!("preparation host row without a local lease lacks its absent-admission proof");
+                    }
+                    if local_lease.is_none()
+                        && proof.kind == HostResourceReleaseProofKind::PreparationAdmissionAbsent
+                        && store
+                            .read_task_preparation_receipt(run_id, &row.identity.task_id)?
+                            .is_some()
+                    {
+                        bail!(
+                            "preparation admission-absent proof has a durable task preparation receipt"
+                        );
+                    }
+                }
+            }
+        }
+
+        let solver_row_for_lease = |lease: &FmsResourceLease| {
+            exact_rows.iter().find(|(row, _)| {
+                row.identity.resource_id == lease.resource_id
+                    && row.identity.task_id == lease.task_id
+                    && row.identity.lease_token == lease.lease_token
+                    && matches!(
+                        &row.identity.owner,
+                        HostReservationOwner::Solver {
+                            attempt_id,
+                            ownership_epoch,
+                        } if attempt_id == &lease.attempt_id
+                            && *ownership_epoch == lease.ownership_epoch
+                    )
+            })
+        };
+        let preparation_row_for_lease = |lease: &FmsPreparationResourceLease| {
+            exact_rows.iter().find(|(row, _)| {
+                row.identity.resource_id == lease.resource_id
+                    && row.identity.task_id == lease.task_id
+                    && row.identity.lease_token == lease.lease_token
+                    && matches!(
+                        &row.identity.owner,
+                        HostReservationOwner::Preparation {
+                            preparation_attempt_id,
+                        } if preparation_attempt_id == &lease.preparation_attempt_id
+                    )
+            })
+        };
+
+        let worker_proof = |lease: &FmsResourceLease,
+                            exit: Option<&FmsWorkerProcessExitReceipt>| {
+            let Some((_, proof)) = solver_row_for_lease(lease) else {
+                if lease.host_launch_binding.is_some() {
+                    bail!("host-bound solver lease has no exact released host row");
+                }
+                return if exit.is_some() {
+                    Ok(None)
+                } else {
+                    bail!("unbound solver lease has no process-exit receipt");
+                };
+            };
+            match proof.kind {
+                HostResourceReleaseProofKind::Worker => {
+                    let released = proof
+                        .released_worker_lease
+                        .as_ref()
+                        .context("worker release proof has no released lease")?;
+                    if released != lease {
+                        bail!("worker proof lease differs from the exact local lease");
+                    }
+                    let receipt = proof
+                        .worker_receipt
+                        .as_ref()
+                        .context("worker release proof has no exit receipt")?;
+                    let Some(exit) = exit else {
+                        bail!("worker release proof lacks the matching local exit receipt");
+                    };
+                    if receipt != exit {
+                        bail!("worker release proof differs from the exact local exit receipt");
+                    }
+                    Ok(Some("worker"))
+                }
+                HostResourceReleaseProofKind::WorkerNoSpawn => {
+                    if exit.is_some() {
+                        bail!("WorkerNoSpawn proof cannot coexist with an exit receipt");
+                    }
+                    let released = proof
+                        .released_worker_lease
+                        .as_ref()
+                        .context("worker no-spawn proof has no released lease")?;
+                    if released != lease {
+                        bail!("worker no-spawn proof differs from the exact local lease");
+                    }
+                    Ok(Some("worker_no_spawn"))
+                }
+                _ => bail!("solver lease has an incompatible host release proof"),
+            }
+        };
+
+        let preparation_proof = |lease: &FmsPreparationResourceLease,
+                                 exit: Option<&FmsPreparationProcessExitReceipt>| {
+            let Some((_, proof)) = preparation_row_for_lease(lease) else {
+                if lease.host_launch_binding.is_some() {
+                    bail!("host-bound preparation lease has no exact released host row");
+                }
+                return if exit.is_some() {
+                    Ok(None)
+                } else {
+                    bail!("unbound preparation lease has no process-exit receipt");
+                };
+            };
+            match proof.kind {
+                HostResourceReleaseProofKind::Preparation => {
+                    let released = proof
+                        .released_preparation_lease
+                        .as_ref()
+                        .context("preparation release proof has no released lease")?;
+                    if released != lease {
+                        bail!("preparation proof lease differs from the exact local lease");
+                    }
+                    let receipt = proof
+                        .preparation_receipt
+                        .as_ref()
+                        .context("preparation release proof has no exit receipt")?;
+                    let Some(exit) = exit else {
+                        bail!("preparation release proof lacks its local exit receipt");
+                    };
+                    if receipt != exit {
+                        bail!("preparation release proof differs from the exact local exit receipt");
+                    }
+                    Ok(Some("preparation"))
+                }
+                HostResourceReleaseProofKind::PreparationNoSpawn => {
+                    if exit.is_some() {
+                        bail!("PreparationNoSpawn proof cannot coexist with an exit receipt");
+                    }
+                    let released = proof
+                        .released_preparation_lease
+                        .as_ref()
+                        .context("preparation no-spawn proof has no released lease")?;
+                    if released != lease {
+                        bail!("preparation no-spawn proof differs from the exact local lease");
+                    }
+                    Ok(Some("preparation_no_spawn"))
+                }
+                _ => bail!("preparation lease has an incompatible host release proof"),
+            }
+        };
+
+        let store_value = store.terminal_run_evidence_value_locked(
+            run_id,
+            worker_proof,
+            preparation_proof,
+        )?;
+        let host_rows = exact_rows
+            .iter()
+            .map(|(row, proof)| {
+                serde_json::json!({
+                    "identity": &row.identity,
+                    "request_sha256": &row.request_sha256,
+                    "state": row.state,
+                    "worker_launch_gate": &row.worker_launch_gate,
+                    "preparation_launch_gate": &row.preparation_launch_gate,
+                    "release_proof_sha256": &row.release_proof_sha256,
+                    "release_proof_kind": proof.kind,
+                })
+            })
+            .collect::<Vec<_>>();
+        let evidence = serde_json::json!({
+            "store": store_value,
+            "exact_host_rows": host_rows,
+        });
+        let evidence_sha256 = canonical_json_sha256(&evidence);
+        let snapshot = HostResourceLedgerSnapshot {
+            policy: document.policy.clone(),
+            reservations: document.reservations.clone(),
+            node_policy: document.node_policy.clone(),
+        };
+        operation(&snapshot, &evidence_sha256)
+    }
+
     /// Reserve capacity tentatively. Exact retries return the existing record;
     /// changed identities or request contents are rejected.
     pub fn reserve(&self, request: &HostReservationRequest) -> Result<HostResourceReservation> {
@@ -6517,6 +6765,50 @@ fn replay_released_preparation_reservation(
     }
     validate_release_proof(root, policy, reservation)?;
     Ok(reservation.clone())
+}
+
+fn validate_pre_admission_task_scope(
+    store: &SessionStore,
+    catalog: &crate::types::FmsRunCatalog,
+    proof_task: &crate::types::FmsTaskCatalogEntry,
+) -> Result<()> {
+    let current = catalog
+        .tasks
+        .iter()
+        .find(|task| task.task_id == proof_task.task_id)
+        .with_context(|| {
+            format!(
+                "host release proof references task `{}` absent from the current run catalog",
+                proof_task.task_id
+            )
+        })?;
+    let intent = store
+        .read_task_cancellation_intent(&catalog.run_id, &proof_task.task_id)?
+        .context("pre-admission terminal proof requires its cancellation intent")?;
+    if intent.task != *proof_task {
+        bail!(
+            "pre-admission proof task differs from its immutable cancellation intent"
+        );
+    }
+    intent.validate_task_scope(store, current, catalog.revision)
+}
+
+fn read_validated_release_proof(
+    root: &Path,
+    policy: &HostResourceLedgerPolicy,
+    reservation: &HostResourceReservation,
+) -> Result<HostResourceReleaseProof> {
+    validate_release_proof(root, policy, reservation)?;
+    let digest = reservation
+        .release_proof_sha256
+        .as_deref()
+        .context("released host reservation has no proof digest")?;
+    let relative = release_proof_relative_path(digest)?;
+    let bytes = read_bounded_regular_file(root, &relative, MAX_RELEASE_PROOF_BYTES)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != digest {
+        bail!("host release proof changed after canonical validation");
+    }
+    serde_json::from_slice(&bytes).context("parsing validated host release proof")
 }
 
 fn validate_release_proof(
