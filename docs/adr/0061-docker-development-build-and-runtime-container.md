@@ -564,3 +564,30 @@ Przeglądarka, publiczne OpenAPI i solver lanes nie otrzymują nowej authority.
 Zmiana dotyczy orkiestracji, nie semantyki Python/ProblemIR ani wyboru CPU/GPU.
 Regresje transportu nie zastępują kwalifikacji kolejnych skryptów w Dockerze;
 start, replay po restarcie i odczyt zachowanych danych pozostają **NOT VERIFIED**.
+
+## Uzupełnienie — odtworzenie po awarii przed pierwszym startem API
+
+Niedopuszczony bootstrap storage (`restart_verified=false`) nie daje prawa do
+uruchomienia runtime. Może jednak zachować sesję i cache po błędzie samego
+buildu. Zarządzane odtworzenie usług dopuszcza ten przypadek wyłącznie po
+przypięciu dokładnych kontenerów, obrazu, konfiguracji, niezmienionego certyfikatu
+i owner markera z wartościami bootstrap oraz jednej potwierdzonej awarii buildu
+odpowiadającej bieżącemu `Docker StartedAt` backendu. Dowodem może być bezpośredni terminal wybranej próby `development` albo terminal `resume` związany z jej pinami. Bezpośredni terminal musi być kanonicznie identyczny z terminalem rodzica odczytanym przez launcher; nie wymaga pól wejściowych występujących wyłącznie w `resume`. Obecność dowodu handoff,
+publikacji pakietu lub storage probe wyklucza ten wyjątek.
+
+Selektor odczytuje wyłącznie terminale prób `resume` i `development` w readonly
+control volume tej grupy, bez `latest`, z limitem liczby wpisów i bajtów oraz
+odczytem względem deskryptorów katalogów bez podążania za symlinkami. Przed
+`stop/rm`, pod istniejącą blokadą `recreate-services`, launcher ponawia inspect,
+odczyt certyfikatu i całego dowodu. Zmiana lub niejednoznaczność blokuje operację.
+Jeżeli istnieje przyjęty run, ponownie waliduje jego niezmienne archiwum i nadal
+oczekujący stan przez readonly bundle producenta; nie powtarza aktywacji.
+
+Wyjątek odtwarza usługi z tym samym storage, nie ustawia `restart_verified`, nie
+resetuje ownera ani nie zwalnia zasobów. Nowy backend nadal przechodzi zwykły
+build i admission przed startem API. Recovery natywnego procesu pozostaje
+odrębnym uprawnieniem; pending recovery wyklucza tę ścieżkę. Kod i regresje:
+`scripts/docker_volume_pre_admission_recreate.py`,
+`scripts/docker_volume_pre_admission_selector.py` oraz ich testy i integracja w
+`scripts/docker_volume_dev.py`. Wdrożenie do obrazu i rzeczywisty start wymagają
+oddzielnego dowodu; regresje fixture nie kwalifikują runtime.
