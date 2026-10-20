@@ -255,10 +255,24 @@ katalogi metadanych, bez rekurencyjnej zmiany właścicieli. Kanoniczny helper
 bootstrap otrzymuje `DAC_OVERRIDE` tylko dla operacji na tym samym wolumenie,
 aby zachować odczyt i atomowy zapis rekordów należących do UID backendu.
 
-Przed operacją launcher mierzy wolne miejsce w VM oraz na fizycznym wolumenie
-Windows pod rozwiązanym katalogiem danych Docker Desktop. Obecny próg odmowy
-wynosi 32 GiB; jest rezerwą operacyjną, nie quota ani gwarancją rozmiaru zimnego
-buildu. Pakietowy preflight dodatkowo szacuje miejsce na kandydata i rollback.
+Launcher mierzy wolne miejsce w VM oraz na fizycznym wolumenie Windows pod
+rozwiązanym katalogiem danych Docker Desktop. Rzeczywisty BuildKit build
+oraz operacja budowania i startu aplikacji wymagają 32 GiB wolnego miejsca.
+Pakietowy preflight dodatkowo szacuje miejsce na kandydata i rollback.
+To rezerwa operacyjna, nie quota ani gwarancja rozmiaru zimnego buildu.
+
+Sprawdzenie i ponowne użycie istniejących obrazów toolchaina oraz wrapperów
+może użyć niższego budżetu kontrolnego: 1280 MiB, wyprowadzonego z limitów
+logów i dokumentów. Wymaga zgodnego digestu wejść, grupy, control volume oraz
+lokalnego immutable image ID; wrapper sprawdza także przypiętego rodzica
+oraz etykiety obrazu. Brak zgodnego cache powoduje świeży pomiar i wymaga
+pełnych 32 GiB przed BuildKit. Niższy budżet nie dotyczy operacji development.
+
+Na zimnym hoście brakujący obraz helpera jest pobierany przed uruchomieniem
+helpera control volume. Windows sprawdza przed pobraniem fizyczny backing
+volume; Linux/WSL nie ma jeszcze w tym momencie obrazu pozwalającego zmierzyć
+system plików Docker VM. Po pobraniu pełny pomiar poprzedza budowę. Ta granica
+pre-pull pozostaje jawna; nie jest dowodem miejsca w VM przed pierwszym pull.
 
 Log Make i next.log mają limit 64 MiB; nadmiar trafia do ograniczonego drivera
 Docker `local` (3 pliki po 10 MB na usługę). Pełny next.log wymaga jawnego
