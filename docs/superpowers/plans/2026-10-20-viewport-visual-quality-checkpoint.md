@@ -56,6 +56,12 @@ Próba nowych baselines zakończyła się przed utworzeniem dopuszczonej przegl�
 
 Nie restartowano kontenerów ani nie poprawiano receiptów. Przygotowano [przeglądalną propozycję recovery](2026-10-20-viewport-runtime-recovery-proposal.md) i zadano pytanie o jawną autoryzację odzyskania tylko tej grupy oraz potrzebnych regresji zarządzanej ścieżki. Zależne mutacje czekają na odpowiedź. Kod baselines ma źródłowy review/testy/typecheck/lint, ale runtime pozostaje NOT VERIFIED. Architecture hygiene dla nowych źródeł exit0.
 
+## Zapis fragmentu i decyzje oczekujące
+
+Kandydat baselines zapisany commitem `0a536ffb78ee05c57a1febedae73b9156760f280`; brak runtime nowej szerokości jest jawny. Pełna [macierz V01–V15](../../audits/2026-10-20-viewport-r7-acceptance-evidence.md) rozdziela historyczne partial proofs od odbioru aktualnego kandydata.
+
+Automatyczna kontrola odrzuciła kolejne outbound READY do czatu „Przywróć wizualizacje FEM i FDM”: wcześniejszą jednorazową zgodę uznała za wykorzystaną. Ta wiadomość nie została wysłana; nie zastosowano obejścia. Zadano osobne pytanie o dalsze krótkie komunikaty koordynujące. Brak odpowiedzi nie stanowi zgody. Przestrzegamy braku zapisów mastera niezależnie od możliwości odpowiedzi.
+
 ## Tożsamość
 
 - Zadanie: `viewport-visual-quality-20261020`.
