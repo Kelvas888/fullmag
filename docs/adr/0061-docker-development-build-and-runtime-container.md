@@ -327,3 +327,35 @@ Status: kontrakt wdrażany. Testy transportu i kontrolera są dowodami odrębnyc
 warstw. Pełny producent i walidacja dowodów, restart, odtworzony model w UI
 oraz wykonanie tego samego runu wymagają osobnej kwalifikacji runtime;
 pozostają **NOT VERIFIED** do jej rzeczywistego zakończenia.
+
+## Decyzja uzupełniająca 20.10.2026 — owner frontendu per incarnacja kontenera
+
+Receipty właściciela procesu Next.js nie są autorytetem przechowywanym w
+named volume. `frontend` otrzymuje prywatny tmpfs
+`/run/fullmag/frontend-owner` o pojemności 1 MiB, z `uid=65532`, `gid=65532`,
+`mode=0700`, `noexec`, `nosuid` i `nodev`. Bieżący owner receipt jest zapisywany
+w tym katalogu, a healthcheck czyta wyłącznie tę ścieżkę. Po utworzeniu nowej
+incarnacji kontenera tmpfs jest pusty, więc stary `unknown` z cache nie może
+zablokować prawidłowego startu ani udawać żywego ownera.
+
+`/state/development/frontend-dev-receipt.json` pozostaje trwałą kopią
+diagnostyczną. Zachowuje ostatni stan, błąd, metadane wygenerowanych plików i
+bramę zamrożonych zależności. Kod używa tej kopii wyłącznie jako historii przy
+wyliczaniu `generated_files_gate`, `previous_failure_evidence` i potrzeby
+instalacji cache; nie wywołuje na jej podstawie przejęcia procesu. W tej samej
+incarnacji obecny owner receipt nadal wymaga pełnej walidacji PID, namespace,
+grupy procesu i flocka. Flock pozostaje w named volume i chroni równoległe
+frontendy przez cały cykl instalacji oraz Next.js.
+
+Walidacja nowo renderowanego Compose przypina tmpfs ownera wraz z obrazem,
+źródłem, labelami i mountami usługi. Opcje są normalizowane i porównywane
+dokładnie; duplikaty oraz konflikty (`rw,ro`, `exec,noexec`, zmieniony `mode`,
+`uid`, `gid` lub `size`) kończą się odmową. Stary zapis Compose bez tego tmpfs
+może zostać odczytany wyłącznie jako wejście kontrolowanej recreacji; zwykły
+resume takiej konfiguracji jest odrzucany, a nowa deklaracja zawsze zawiera
+wymagany tmpfs. Zmiana dotyczy wyłącznie granicy owner frontendu; backendowy
+owner, native drain, ledger i recovery pozostają bez zmian.
+
+Implementację źródłową i testy kontraktowe przygotowano w tym fragmencie.
+Budowa obrazu, start/restart usługi, Docker inspect oraz browser/runtime proof
+pozostają **NOT VERIFIED**.

@@ -137,6 +137,7 @@ def isolated(module):
         names = {
             "INPUTS_PATH": inputs_path,
             "DEVELOPMENT_ROOT": root,
+            "OWNER_ROOT": root / "frontend-owner",
             "WORKSPACE_ROOT": workspace,
             "FRONTEND_ROOT": root / "cache",
             "PNPM_STORE_ROOT": root / "pnpm-store",
@@ -146,13 +147,15 @@ def isolated(module):
             "TEMP_ROOT": root / "tmp",
             "FREEZE_ROOT": root / "frozen-inputs",
             "FREEZE_PATH": root / "inputs-freeze.json",
-            "RECEIPT_PATH": root / "frontend-dev-receipt.json",
+            "RECEIPT_PATH": root / "frontend-owner" / "receipt.json",
+            "DIAGNOSTIC_RECEIPT_PATH": root / "frontend-dev-receipt.json",
             "LOG_PATH": root / "next.log",
             "LOG_ROLLBACK_PATH": root / "next.log.rollback",
             "RUNTIME_LOCK_PATH": root / "cache" / ".fullmag-frontend-runtime.lock",
             "SOURCE_CONTAINER_ROOT": source,
         }
         (root / "cache").mkdir(parents=True, exist_ok=True)
+        (root / "frontend-owner").mkdir(parents=True, exist_ok=True)
         runtime_lock = root / "cache" / ".fullmag-frontend-runtime.lock"
         runtime_lock.write_bytes(b"")
         runtime_lock.chmod(0o660)
@@ -389,6 +392,10 @@ class FrontendDevContractTests(TestCase):
 
     def test_frontend_healthcheck_requires_owned_receipt_process_and_tcp(self):
         healthcheck = load_healthcheck_module()
+        self.assertEqual(
+            healthcheck.FRONTEND_RECEIPT_PATH,
+            Path("/run/fullmag/frontend-owner/receipt.json"),
+        )
         with tempfile.TemporaryDirectory(prefix="fullmag-frontend-health-") as raw:
             root = Path(raw)
             proc_root = root / "proc"
@@ -401,7 +408,8 @@ class FrontendDevContractTests(TestCase):
             (process_root / "stat").write_text(
                 f"{pid} (next-server) {' '.join(stat_fields)}\n", encoding="ascii"
             )
-            receipt_path = root / "frontend-dev-receipt.json"
+            receipt_path = root / "frontend-owner" / "receipt.json"
+            receipt_path.parent.mkdir()
             receipt_path.write_text(
                 json.dumps(
                     {
@@ -962,6 +970,10 @@ else:
             "FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-5000}",
             text,
         )
+        self.assertIn(
+            "/run/fullmag/frontend-owner:rw,nosuid,nodev,noexec,size=1m,uid=65532,gid=65532,mode=0700",
+            text,
+        )
 
     @skipIf(os.name == "nt", "directory fsync is a Linux container filesystem contract")
     def test_start_publishes_starting_receipt_before_tool_probe_failure(self):
@@ -1409,6 +1421,53 @@ else:
                 self.module._reject_existing_owner(
                     {"state": "stop-timeout", "pid": os.getpid()}
                 )
+
+    def test_unknown_owner_is_authoritative_only_within_current_container(self):
+        with isolated(self.module) as (_root, _workspace, _inputs):
+            diagnostic = {
+                "schema": self.module.RECEIPT_SCHEMA,
+                "state": "unknown",
+                "generated_files_gate": "next-started-v1",
+            }
+            self.module.DIAGNOSTIC_RECEIPT_PATH.write_text(
+                json.dumps(diagnostic), encoding="utf-8"
+            )
+            self.assertIsNone(self.module._load_receipt())
+            self.assertEqual(self.module._load_diagnostic_receipt()["state"], "unknown")
+            self.module._reject_existing_owner(None)
+            owner = dict(diagnostic, pid=os.getpid())
+            self.module._atomic_json(self.module.RECEIPT_PATH, owner, "owner receipt")
+            with self.assertRaises(self.module.FrontendDevUnknown):
+                self.module._reject_existing_owner(owner)
+
+    def test_new_container_keeps_generated_gate_from_legacy_diagnostic_receipt(self):
+        with isolated(self.module) as (_root, _workspace, _inputs):
+            self.module.DIAGNOSTIC_RECEIPT_PATH.write_text(
+                json.dumps({
+                    "schema": self.module.RECEIPT_SCHEMA,
+                    "state": "unknown",
+                    "generated_files_gate": "next-started-v1",
+                }),
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                self.module._generated_gate(self.module._load_diagnostic_receipt())
+            )
+            self.assertIsNone(self.module._load_receipt())
+
+    def test_publish_receipt_keeps_owner_and_diagnostic_copies(self):
+        with isolated(self.module) as (_root, _workspace, inputs):
+            receipt = self.module._receipt_base(inputs, None)
+            receipt["state"] = "starting"
+            self.module._publish_receipt(receipt)
+            self.assertEqual(
+                json.loads(self.module.RECEIPT_PATH.read_text(encoding="utf-8")),
+                receipt,
+            )
+            self.assertEqual(
+                json.loads(self.module.DIAGNOSTIC_RECEIPT_PATH.read_text(encoding="utf-8")),
+                receipt,
+            )
 
     @skipIf(os.name == "nt", "Linux process identity probing is a container contract")
     def test_terminal_failed_receipt_without_identity_requires_recovery(self):
