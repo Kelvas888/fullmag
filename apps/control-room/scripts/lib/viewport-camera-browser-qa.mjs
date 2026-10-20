@@ -488,11 +488,13 @@ async function executeVisibleCommand(page, palette, title, timeout) {
 }
 
 async function readDialogValues(dialog) {
-  const position = await readVector(dialog, "Position (m)");
-  const target = await readVector(dialog, "Target (m)");
-  const fov = await getScalarInput(dialog, "FOV").inputValue();
-  const orthoScale = await getScalarInput(dialog, "Ortho scale").inputValue();
-  const projection = await getProjectionInput(dialog).inputValue();
+  const [position, target, fov, orthoScale, projection] = await Promise.all([
+    readVector(dialog, "Position (m)"),
+    readVector(dialog, "Target (m)"),
+    getScalarInput(dialog, "FOV").inputValue(),
+    getScalarInput(dialog, "Ortho scale").inputValue(),
+    getProjectionInput(dialog).inputValue(),
+  ]);
   return {
     position,
     target,
@@ -505,13 +507,11 @@ async function readDialogValues(dialog) {
 async function readVector(dialog, legend) {
   const fieldset = dialog.locator("fieldset").filter({ hasText: legend });
   const inputs = fieldset.locator('input[type="number"]');
-  if (await fieldset.count() !== 1 || await inputs.count() !== 3) {
+  const [fieldsetCount, inputCount] = await Promise.all([fieldset.count(), inputs.count()]);
+  if (fieldsetCount !== 1 || inputCount !== 3) {
     throw new Error(`Camera dialog does not expose exactly three ${legend} inputs`);
   }
-  const values = [];
-  for (let index = 0; index < 3; index += 1) {
-    values.push(await inputs.nth(index).inputValue());
-  }
+  const values = await Promise.all([0, 1, 2].map((index) => inputs.nth(index).inputValue()));
   const parsed = values.map(Number);
   if (parsed.some((value) => !Number.isFinite(value))) {
     throw new Error(`Camera dialog ${legend} inputs are not finite numbers`);
