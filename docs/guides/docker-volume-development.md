@@ -213,6 +213,25 @@ storage Windows. Log w wolumenie kontrolnym i trwałe receipty pozostają wymaga
 błąd ich zapisu nadal przerywa operację. Zakończenie samego procesu kontrolera
 pozostaje odrębną utratą obserwacji i wymaga rozstrzygnięcia stanu.
 
+### Browser QA istniejącej grupy
+
+Po uruchomieniu zdrowej grupy można wykonać kontrolę Home, sesji i WebGL przez
+obraz Playwright przypięty do digestu:
+
+```powershell
+just docker-dev-browser-qa "$source" 3197
+```
+
+Kontrola wymaga istniejącego control volume, dokładnie jednej zdrowej pary
+`backend`/`frontend`, zgodnych receiptów źródła i portu oraz przypiętego
+frontend state volume. Nie tworzy brakującego control volume, nie naprawia
+named volume i nie restartuje usług. Domyślny limit pracy przeglądarki wynosi
+180 sekund, a osobny limit pobrania brakującego obrazu wynosi 1800 sekund;
+parametry `timeout` i `pull_timeout` są ostatnimi argumentami pozycyjnymi
+recepty, po `browser_image`. Nieudane lub
+niejednoznaczne kontrole kończą się zachowaniem zasobów i wymagają ręcznego
+przeglądu receiptu operacji.
+
 ## Granica zapisu i retencja
 
 | Dane | Miejsce |
