@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
 import {
@@ -830,37 +830,39 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
     reportAuxiliaryDraftSession,
   };
 
-  const ObjectRegionSubPanel = resolveObjectRegionSubPanel(selection.kind);
   return (
     <QuantityFieldDraftScope store={fieldDrafts.store}>
-      <ObjectRegionSubPanel {...subProps} />
+      <ObjectRegionSubPanel kind={selection.kind} {...subProps} />
     </QuantityFieldDraftScope>
   );
 }
 
-function resolveObjectRegionSubPanel(
-  kind: InspectorPanelProps["selection"]["kind"],
-): ComponentType<RegionSubPanelProps> {
+function ObjectRegionSubPanel({
+  kind,
+  ...subProps
+}: RegionSubPanelProps & {
+  kind: InspectorPanelProps["selection"]["kind"];
+}) {
   switch (kind) {
     case "object.region.geometry":
     case "object.region.shape":
-      return ObjectRegionGeometryPanelImpl;
+      return <ObjectRegionGeometryPanelImpl {...subProps} />;
     case "object.region.magnetic-parameters":
     case "object.region.material":
-      return ObjectRegionMagneticParametersPanelImpl;
+      return <ObjectRegionMagneticParametersPanelImpl {...subProps} />;
     case "object.region.mesh":
-      return ObjectRegionMeshPanelImpl;
+      return <ObjectRegionMeshPanelImpl {...subProps} />;
     case "object.region.regions":
-      return ObjectRegionNestedRegionsPanelImpl;
+      return <ObjectRegionNestedRegionsPanelImpl {...subProps} />;
     case "object.region.diagnostics":
-      return ObjectRegionDiagnosticsPanelImpl;
+      return <ObjectRegionDiagnosticsPanelImpl {...subProps} />;
     case "object.region.texture":
-      return ObjectRegionTexturePanelImpl;
+      return <ObjectRegionTexturePanelImpl {...subProps} />;
     case "object.region.visualization":
-      return ObjectRegionVisualizationPanelImpl;
+      return <ObjectRegionVisualizationPanelImpl {...subProps} />;
     case "object.region":
     default:
-      return ObjectRegionOverviewPanelImpl;
+      return <ObjectRegionOverviewPanelImpl {...subProps} />;
   }
 }
 
