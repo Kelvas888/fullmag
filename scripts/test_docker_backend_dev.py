@@ -254,6 +254,143 @@ class BackendPackageTests(unittest.TestCase):
             backend._clear_rotation_journal(rotation)
         return package, control, toolchain
 
+    def _direct_retention_fixture(self, root, *, remove_launcher):
+        """Create a full receipt-backed rotation whose new package is direct-installed."""
+
+        package, control, toolchain = self._rotated_package_fixture(root, versions=2)
+        if remove_launcher:
+            (package / "bin/fullmag").unlink()
+        previous = backend._validated_package(
+            package,
+            "direct retention previous package",
+            exclude_development_control=True,
+        )
+        build_root = root / "direct-retention-build"
+        build_root.mkdir()
+        candidate = (
+            control
+            / backend.PACKAGE_CANDIDATES_DIRNAME
+            / ".backend-package-candidate-retention"
+        )
+        self._populate_direct_candidate(package, build_root, candidate)
+        candidate_records = backend._copy_package(
+            root / "direct-retention-workspace",
+            candidate,
+            direct_install=True,
+            package_root=package,
+            build_root=build_root,
+        )
+        _, manifest = self._live_manifest(
+            root, commit="4" * 40, capture_id="retention-direct"
+        )
+        backend._write_json(
+            candidate / "backend-build-receipt.json",
+            self._receipt_for_manifest(candidate_records, manifest, toolchain),
+            "direct retention candidate receipt",
+        )
+        candidate_receipt_bytes = (
+            candidate / "backend-build-receipt.json"
+        ).read_bytes()
+        rotation = backend._rotate_package(
+            package,
+            candidate,
+            control,
+            previous[2],
+            previous[1],
+            candidate_receipt_bytes,
+        )
+        backend._finalize_published_candidate(candidate, rotation)
+        backend._clear_rotation_journal(rotation)
+        current = backend._validated_package(
+            package,
+            "direct retention current package",
+            exclude_development_control=True,
+        )
+        return package, control, current
+
+    @staticmethod
+    def _direct_backup_for_current(control, current_receipt_bytes):
+        expected = backend._sha256_bytes(current_receipt_bytes)
+        backups = sorted(
+            (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                ".backend-package-backup-*"
+            )
+        )
+        matches = []
+        for backup in backups:
+            rotation = json.loads(
+                (backup / "rotation.json").read_text(encoding="utf-8")
+            )
+            if rotation.get("new_receipt_sha256") == expected:
+                matches.append(backup)
+        if len(matches) != 1:
+            raise AssertionError(f"expected one direct rollback, found {matches!r}")
+        return matches[0]
+
+    def test_retention_accepts_current_direct_package_without_legacy_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, current = self._direct_retention_fixture(
+                Path(directory), remove_launcher=True
+            )
+            backend._retain_package_backups(
+                package, control, current[0], current[1]
+            )
+            direct_backup = self._direct_backup_for_current(control, current[1])
+            self.assertFalse((direct_backup / "bin/fullmag").exists())
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                            ".backend-package-backup-*"
+                        )
+                    )
+                ),
+                1,
+            )
+
+    def test_retention_accepts_legacy_launcher_in_verified_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, current = self._direct_retention_fixture(
+                Path(directory), remove_launcher=False
+            )
+            backend._retain_package_backups(
+                package, control, current[0], current[1]
+            )
+            direct_backup = self._direct_backup_for_current(control, current[1])
+            self.assertTrue((direct_backup / "bin/fullmag").is_file())
+            self.assertEqual(
+                (direct_backup / "bin/fullmag").read_text(encoding="utf-8"),
+                "#!/usr/bin/env bash\n",
+            )
+
+    def test_retention_rejects_unrecognized_launcher_prefix_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, current = self._direct_retention_fixture(
+                Path(directory), remove_launcher=True
+            )
+            direct_backup = self._direct_backup_for_current(control, current[1])
+            alien = direct_backup / "bin/fullmag.extra"
+            alien.write_bytes(b"unowned\n")
+            before_backups = sorted(
+                path.name
+                for path in (control / backend.PACKAGE_BACKUPS_DIRNAME).iterdir()
+            )
+            with self.assertRaisesRegex(
+                backend.BackendBuildError,
+                "unrecognized file or directory inventory",
+            ):
+                backend._retain_package_backups(
+                    package, control, current[0], current[1]
+                )
+            self.assertEqual(
+                sorted(
+                    path.name
+                    for path in (control / backend.PACKAGE_BACKUPS_DIRNAME).iterdir()
+                ),
+                before_backups,
+            )
+            self.assertEqual(alien.read_bytes(), b"unowned\n")
+
     @staticmethod
     def _live_manifest(root, *, commit="a" * 40, capture_id="test-capture"):
         capsule = {
