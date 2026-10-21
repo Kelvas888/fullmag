@@ -41,14 +41,20 @@ def validate_rejection(receipt):
 
 def validate_incarnation(observed, not_after, expected=None):
     from datetime import datetime
+    from decimal import Decimal
+    import re
 
     state = observed.get("State", {})
     started = state.get("StartedAt", "")
     try:
-        timestamp = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z", started)
+        if match is None:
+            raise ValueError("Expected a Docker UTC RFC3339 timestamp")
+        seconds = datetime.fromisoformat(match[1] + "+00:00").timestamp()
+        timestamp = Decimal(int(seconds)) + Decimal("0." + (match[2] or "0"))
     except (TypeError, ValueError) as error:
         raise BuildControlError("Invalid container start timestamp") from error
-    if state.get("Running") is not True or timestamp > not_after:
+    if state.get("Running") is not True or timestamp > Decimal(str(not_after)):
         raise BuildControlError("Container restarted after the retained activation")
     if expected is not None and (observed.get("Id") != expected.get("Id")
             or started != expected.get("State", {}).get("StartedAt")):

@@ -33,6 +33,19 @@ class OutputRejectionTests(unittest.TestCase):
             with self.assertRaises(BuildControlError):
                 recovery.validate_incarnation(changed, cutoff, observed)
 
+    def test_docker_nanosecond_timestamp_preserves_exact_incarnation(self):
+        started = "2026-10-21T20:19:03.571379583Z"
+        observed = {"Id": "a", "State": {"Running": True, "StartedAt": started}}
+        recovery.validate_incarnation(observed, 1800000000, observed)
+        changed = {"Id": "a", "State": {"Running": True,
+            "StartedAt": "2026-10-21T20:19:03.571379584Z"}}
+        with self.assertRaisesRegex(BuildControlError, "incarnation changed"):
+            recovery.validate_incarnation(changed, 1800000000, observed)
+        for malformed in (started[:-1], started.replace("Z", "+01:00"), started.replace("583Z", "5830Z")):
+            with self.subTest(malformed=malformed), self.assertRaises(BuildControlError):
+                recovery.validate_incarnation({"Id": "a", "State": {"Running": True,
+                    "StartedAt": malformed}}, 1800000000)
+
     def test_publication_preserves_evidence_and_fails_closed_on_changed_bytes(self):
         for changed in (None, "active", "receipt.json", "marker.json", "terminal", "unlocked"):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
