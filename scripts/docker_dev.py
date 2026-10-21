@@ -2490,6 +2490,21 @@ def _parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--source-root", type=Path, required=True)
     resume_parser.add_argument("--port", type=int, required=True)
     resume_parser.add_argument("--restart-backend", action="store_true", help="Start the retained stopped backend; never stop an active service")
+    migration_parser = subparsers.add_parser(
+        "migrate-worker-cpu-quota-volume", help="Explicitly migrate CPU quota readiness in the pinned stopped backend")
+    migration_parser.add_argument("--attempt", required=True)
+    migration_parser.add_argument("--config-sha256", required=True)
+    migration_parser.add_argument("--source-root", type=Path, required=True)
+    migration_parser.add_argument("--port", type=int, required=True)
+    migration_parser.add_argument("--from-readiness-sha256", required=True)
+    migration_parser.add_argument("--request-id", required=True)
+    check_parser = subparsers.add_parser(
+        "verify-worker-cpu-quota-volume", help="Run the fixed migration regression in the pinned stopped backend")
+    check_parser.add_argument("--attempt", required=True)
+    check_parser.add_argument("--config-sha256", required=True)
+    check_parser.add_argument("--source-root", type=Path, required=True)
+    check_parser.add_argument("--port", type=int, required=True)
+    check_parser.add_argument("--request-id", required=True)
     activate_parser = subparsers.add_parser(
         "activate-script",
         help="activate one Python script in the already-running retained backend",
@@ -2694,6 +2709,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "stop-idle-volume":
             from docker_volume_dev import stop_idle
             stop_idle(args)
+        elif args.action == "migrate-worker-cpu-quota-volume":
+            from docker_volume_dev import migrate_worker_cpu_quota
+            migrate_worker_cpu_quota(args)
+        elif args.action == "verify-worker-cpu-quota-volume":
+            from docker_volume_dev import verify_worker_cpu_quota
+            verify_worker_cpu_quota(args)
         elif args.action == "stop-unadmitted":
             from docker_volume_stop_unadmitted import stop
             stop(args)

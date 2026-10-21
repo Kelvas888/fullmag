@@ -457,3 +457,39 @@ aplikacji i rzeczywiste dołączenie drugiego worktree przeszły w próbie
 nodes HTTP 200, poprzedni backend nadal działa i publikuje aktualny snapshot.
 Rollback kodu zachowuje format dokumentów, ale przywraca ograniczenie startu
 różnych producentów; nie wymaga migracji danych.
+
+
+### Jawna migracja egzekwowania limitu CPU workerów (21.10.2026)
+
+Stan: implementacja i weryfikacja w toku. Migracja rejestru hosta nie została
+wykonana. Zwykły start nadal wymaga zgodnych faktów ABI.
+
+Dopuszczamy osobną operację zmiany `enforcement.cpu_quota` z `unavailable`
+na `supported`. Delegacja należy do konkretnego kontenera. Przed przełączeniem
+wspólnej generacji należy zatrzymać korzystające runtime przez normalny drain;
+każdy ponownie dopuszczony backend musi przejść własny probe delegacji.
+
+Operacja przypina oczekiwaną starą generację. Pod istniejącym writerem wymaga
+braku inventory ownera i niezwolnionych rezerwacji. Porównuje zapisany snapshot
+ze świeżym kandydatem, a nie tylko dwa hashe. Policy, inventory i pozostałe
+capabilities/enforcement muszą pozostać zgodne. Nie rozluźnia ogólnego
+`runtime_readiness_abi_compatible` ani nie zmienia owner epoch.
+
+Przed przełączeniem zapisuje trwały dowód starego i nowego profilu wraz ze
+snapshotami poza katalogiem objętym GC snapshotów. Publikuje nowy readiness
+CAS, następnie atomowo zmienia pointer generacji i ustawia snapshot na `null`.
+Nowe admission wymaga świeżej publikacji dla nowej generacji. Stare permits
+pozostają odrzucone. Powtórzenie ze starą generacją nie wykonuje kolejnej zmiany;
+operator rozstrzyga wynik z dowodu migracji i aktualnego pointera.
+
+Launcher musi wymagać jawnego żądania operatora i zachować wynik nieznany po
+zerwaniu obserwacji. Sam błąd ABI nie upoważnia do migracji. Wycofanie wymaga
+zatrzymanych konsumentów, braku rezerwacji oraz kontroli bieżącej generacji;
+nie wolno nadpisać rejestru starą kopią z pominięciem późniejszych przydziałów.
+
+Właściciele: `fullmag-session/host_resource_ledger.rs` chroni przejście stanu;
+`fullmag-api/runtime_service_main.rs` dostarcza świeży probe natywnego runtime;
+launcher Docker DEV odpowiada za jawne żądanie, drain i receipty. Bramki:
+jedyna dozwolona zmiana, owner/rezerwacje, stale generation, przerwana publikacja,
+ponowienie bez mutacji oraz managed runtime. Regresje Rust wymagają osobnej
+zgody na kompilację zgodnie z aktualnym ograniczeniem użytkownika.
