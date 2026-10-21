@@ -732,3 +732,69 @@ propozycją; nie jest implementowany ani zatwierdzany przez sam ten opis.
 Zmiana nie dotyczy Python/ProblemIR, OpenAPI, fizyki ani wyboru czterech
 realizacji FDM/FEM CPU/GPU. Wymuszone GPU pozostaje bez fallbacku CPU.
 H1: review i kontrola składni źródeł; build/runtime **NOT VERIFIED**, bez testów.
+
+
+### H2 — kontrakt wersjonowanej migracji pojemności (implementacja w toku)
+
+Docelowy dokument v5 zachowuje bieżące reservations oraz listę maksymalnie
+16 historycznych polityk. Każda pozycja wskazuje CAS dokładnych bajtów dokumentu
+sprzed migracji. Pierwotny init marker pozostaje niezmieniony i kotwiczy pierwszą
+politykę; publikacja jednego dokumentu v5 jest punktem zmiany generacji.
+Starsze klienty odrzucają v5. Nie ma automatycznej migracji przy zwykłym up.
+
+Migracja wymaga jawnych SHA poprzedniego markera, dokumentu i polityki oraz
+świeżo zmierzonej docelowej polityki i readiness. Pod host writerem ponownie
+weryfikuje piny, wszystkie proofy Released i brak aktywnego inventory ownera.
+Zachowuje logiczny host_id, owner_epoch, rodzinę GPU/CPU, GPU UUID/VRAM,
+node policy i wszystkie dotychczasowe wiersze. Podnosi policy revision o jeden.
+Nie dopuszcza aktywnego wiersza pod historyczną polityką, zmiany GPU ani resetu.
+
+Czytelnik v5 weryfikuje całą ograniczoną historię: kolejne rewizje, dokładne
+SHA archiwów, prefiksy historii i niezmienność zachowanych Released rows.
+Każdy stary wiersz i jego proof są walidowane pod właściwą dawną polityką;
+nowy admission używa wyłącznie bieżącej. Historyczne snapshoty/CAS są chronione
+przed istniejącym GC. Readiness nowej generacji nie dziedziczy starego snapshotu.
+
+Wdrożenie wymaga wspólnego przełączenia konsumentów; przed zastosowaniem nadal
+potrzebna jest koordynacja innych grup. Rollback przed publikacją zachowuje
+stary dokument i ewentualne nieosiągalne CAS; po publikacji nie uruchamia się
+starego klienta ani nie cofa rewizji. Retry po utracie obserwacji wymaga odczytu
+bieżącej generacji, bez ponownego Solve. To kontrakt źródłowy; protokół i jego
+zastosowanie pozostają NOT VERIFIED do zakończenia odpowiednich etapów.
+
+
+Jawne wejście operatora to `--migrate-host-capacity` istniejącego launchera przy
+renderze nowych usług. Receipt przechowuje intencję; backend otrzymuje wyłącznie
+digest już zwalidowanego descriptoru H1 jako zakres zgody. Native initializer
+sam odkrywa dokładne piny starego dokumentu/markera/polityki pod writerem,
+a migrator ponownie je weryfikuje przy publikacji. Operator nie przepisuje SHA.
+Bez flagi zwykły start nie migruje. Partial resume nie może dodać zgody ani
+zmienić target digestu. Zgodna polityka po wcześniejszej migracji jest odczytywana
+bez nowego podniesienia rewizji; ta obserwacja nie ponawia Solve.
+
+Launcher wykonuje odczytowy preflight konsumentów przed odtworzeniem oraz przed
+startem usług. Działający kontener z mountem `/host-ledger` blokuje operację;
+launcher nie zatrzymuje obcej grupy. Właściwą granicą atomowej migracji nadal są
+native writer, owner lock, Released proofs i compare-and-publish, a nie sam
+Docker inspect. Receipt native jest przekazywany do logu backendu. Snapshot
+recovery w v5 wiąże SHA historii; starsze, puste historie zachowują dawne digesty.
+
+
+Przejście konfiguracji zatrzymanego backendu musi objąć zatwierdzone budżety
+CPU/RAM i CPU masks, nie tylko runtime generation. Istniejący native initializer
+zwraca prywatny dowód `capacity_migration` wyłącznie dla jawnego descriptor SHA:
+pełne, zwalidowane historyczne polityki. Adapter Python używa tego dowodu na
+stosie operacji, bez globalnego stanu ani samodzielnego parsowania ledgera.
+Stara polityka musi należeć do tej historii albo być identyczna z nową; nowa
+jest dokładnie tą z bieżącego native profilu. Pozostałe resource IDs/kinds,
+GPU UUID, ścieżki, concurrency i timeouty muszą pozostać identyczne. Native target
+nadal podlega zatwierdzonemu budżetowi i aktualnym ograniczeniom procesu.
+
+Pozostają wcześniejsze dowody owned stop, dokładny previous-config SHA,
+backup/readback, OWNER.lock i post-build continuation. Zgoda na capacity nie
+zastępuje recovery ownera ani nie zezwala na replay aktywacji/Solve. Migracja
+hosta nie może zmieniać storage policy; H1 nie mierzy fizycznej pojemności storage.
+
+Przy porównaniu konfiguracji tylko cpu_millis i memory_bytes są zmienne
+w budżetach ofert. storage_bytes, gpu_memory_bytes i nieznane dodatkowe pola
+pozostają dokładne; nie wynikają z pomiaru CPU/RAM deskryptora H1.

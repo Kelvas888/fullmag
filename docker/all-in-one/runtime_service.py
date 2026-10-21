@@ -17,6 +17,7 @@ import re
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -2192,7 +2193,10 @@ def _validate_host_profile(
     return config
 
 
-def initialize_host_configuration(paths: RuntimePaths, device_access: str = "gpu") -> dict[str, Any]:
+def initialize_host_configuration(
+    paths: RuntimePaths, device_access: str = "gpu",
+    capacity_authority: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Discover native devices and initialize the exact shared Rust ledger."""
     if device_access not in DEVICE_ACCESS_CHOICES:
         _fail("FULLMAG_DOCKER_DEVICE_ACCESS must be cpu or gpu")
@@ -2217,6 +2221,11 @@ def initialize_host_configuration(paths: RuntimePaths, device_access: str = "gpu
     if result.returncode:
         detail = (result.stderr or result.stdout).decode("utf-8", errors="replace")[-4096:]
         _fail("native Docker host profile initialization failed: " + detail)
+    if os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256") is not None and result.stderr:
+        # The native receipt is diagnostic output; preserve it in the backend
+        # log rather than discarding it with the successful subprocess capture.
+        print(result.stderr[-MAX_JSON_BYTES:].decode("utf-8", errors="replace"),
+              file=sys.stderr, end="", flush=True)
     if len(result.stdout) > MAX_JSON_BYTES:
         _fail("native Docker host profile exceeds its bounded size")
     try:
@@ -2225,7 +2234,27 @@ def initialize_host_configuration(paths: RuntimePaths, device_access: str = "gpu
         raise RuntimeServiceError("native Docker host profile is invalid JSON") from error
     if not isinstance(value, dict):
         _fail("native Docker host profile must contain an object")
-    return _validate_host_profile(value, paths, device_access)
+    config = _validate_host_profile(value, paths, device_access)
+    if capacity_authority is not None:
+        capacity_authority.clear()
+        evidence = value.get("capacity_migration")
+        if evidence is not None:
+            descriptor = os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_SHA256")
+            requested = os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256")
+            if (not isinstance(evidence, dict)
+                    or set(evidence) != {"descriptor_sha256", "historical_policies"}
+                    or not isinstance(requested, str) or not HEX64.fullmatch(requested)
+                    or descriptor != requested or evidence["descriptor_sha256"] != requested
+                    or not isinstance(evidence["historical_policies"], list)
+                    or len(evidence["historical_policies"]) > 16
+                    or any(not isinstance(policy, dict) for policy in evidence["historical_policies"])):
+                _fail("native capacity transition evidence differs from the explicit descriptor")
+            capacity_authority.update(
+                descriptor_sha256=requested,
+                current_policy=config["host_execution"]["policy"],
+                historical_policies=evidence["historical_policies"],
+            )
+    return config
 
 
 def _retain_previous_configuration(path: Path, raw: bytes) -> None:
@@ -2258,10 +2287,77 @@ def _retain_previous_configuration(path: Path, raw: bytes) -> None:
         _fail("previous runtime configuration backup verification failed")
 
 
+def _capacity_profile_transition_allowed(
+    current: dict[str, Any], expected: dict[str, Any], authority: Mapping[str, Any] | None,
+) -> bool:
+    """Constrain an explicit stopped-consumer transition to native-measured capacity.
+
+    Native validates the complete anchored policy history. This adapter only
+    compares that returned evidence and preserves the rest of the profile.
+    """
+    if not isinstance(authority, Mapping):
+        return False
+    descriptor = authority.get("descriptor_sha256")
+    if (not isinstance(descriptor, str) or not HEX64.fullmatch(descriptor)
+            or descriptor != os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_SHA256")
+            or descriptor != os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256")):
+        return False
+    old_host, new_host = current.get("host_execution"), expected.get("host_execution")
+    if not isinstance(old_host, dict) or not isinstance(new_host, dict):
+        return False
+    history = authority.get("historical_policies")
+    if (not isinstance(history, list)
+            or new_host.get("policy") != authority.get("current_policy")
+            or old_host.get("policy") not in [new_host.get("policy"), *history]):
+        return False
+
+    def projection(config):
+        result = dict(config)
+        for name in ("compute_resources", "preparation_resources"):
+            offers = result.get(name)
+            if (not isinstance(offers, list) or not offers
+                    or any(not isinstance(offer, dict) or not isinstance(offer.get("budget"), dict)
+                           for offer in offers)):
+                return None
+            result[name] = [
+                {**offer, "budget": {
+                    key: value for key, value in offer["budget"].items()
+                    if key not in {"cpu_millis", "memory_bytes"}
+                }}
+                for offer in offers
+            ]
+        host = result.get("host_execution")
+        if not isinstance(host, dict):
+            return None
+        host = dict(host)
+        host.pop("policy", None)
+        host.pop("runtime_generation_sha256", None)
+        placements = host.get("compute_placements")
+        preparation = host.get("preparation_cpu_ids")
+        if (not isinstance(placements, dict) or not isinstance(preparation, dict)
+                or any(not isinstance(value, dict) for value in placements.values())
+                or any(not isinstance(value, list) for value in preparation.values())):
+            return None
+        # Resource identities, GPU UUIDs, concurrency, paths and timing remain
+        # exact, including storage and GPU memory. Only CPU/RAM budgets and CPU
+        # masks are permitted to vary.
+        host["compute_placements"] = {
+            key: {field: value for field, value in placement.items() if field != "cpu_ids"}
+            for key, placement in placements.items()
+        }
+        host["preparation_cpu_ids"] = dict.fromkeys(preparation)
+        result["host_execution"] = host
+        return result
+
+    old_projection, new_projection = projection(current), projection(expected)
+    return old_projection is not None and old_projection == new_projection
+
+
 def _rotate_configuration_generation(
-    paths: RuntimePaths, current: dict[str, Any], expected: dict[str, Any], previous_sha256: str
+    paths: RuntimePaths, current: dict[str, Any], expected: dict[str, Any], previous_sha256: str,
+    *, capacity_authority: Mapping[str, Any] | None = None,
 ) -> None:
-    """Change only the generation after the launcher verified an owned stop."""
+    """Change a generation or explicitly measured capacity after an owned stop."""
     old_host, new_host = current.get("host_execution"), expected.get("host_execution")
     if not isinstance(old_host, dict) or not isinstance(new_host, dict):
         _fail("runtime configuration rotation requires the same native host profile")
@@ -2276,7 +2372,8 @@ def _rotate_configuration_generation(
     old_profile.pop("runtime_generation_sha256", None)
     new_profile.pop("runtime_generation_sha256", None)
     if ({**current, "host_execution": old_profile}
-            != {**expected, "host_execution": new_profile}):
+            != {**expected, "host_execution": new_profile}
+            and not _capacity_profile_transition_allowed(current, expected, capacity_authority)):
         _fail("runtime configuration rotation cannot change the operator profile")
     raw = _bounded_regular(paths.config, "runtime configuration before rotation")
     if hashlib.sha256(raw).hexdigest() != previous_sha256:
@@ -3115,7 +3212,8 @@ def ensure_configuration(
         host_mode != "1" or not HEX64.fullmatch(previous_sha256)
     ):
         _fail("FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256 requires native host mode and a lowercase SHA-256")
-    expected = initialize_host_configuration(paths, device_access)
+    capacity_authority: dict[str, Any] = {}
+    expected = initialize_host_configuration(paths, device_access, capacity_authority)
     try:
         current_raw = _bounded_regular(paths.config, "runtime service configuration")
         current = _post_build_json(current_raw, "runtime service configuration")
@@ -3180,7 +3278,7 @@ def ensure_configuration(
                     )
                     return expected
                 _rotate_configuration_generation(
-                    paths, current, expected, bound_previous
+                    paths, current, expected, bound_previous, capacity_authority=capacity_authority,
                 )
                 published_raw = _post_build_read_bytes(
                     paths.config, "runtime configuration after post-build rotation"
@@ -3203,7 +3301,8 @@ def ensure_configuration(
                     _bounded_regular(paths.config, "runtime configuration before automatic rotation")
                 ).hexdigest()
                 assert_owner_lock()
-                _rotate_configuration_generation(paths, current, expected, previous_sha256)
+                _rotate_configuration_generation(paths, current, expected, previous_sha256,
+                                                 capacity_authority=capacity_authority)
         else:
             # A direct recreate pin is one-shot.  A stale pin can authorize a
             # second generation only after the normal authenticated drain.
@@ -3219,9 +3318,11 @@ def ensure_configuration(
                         )
                     ).hexdigest()
                     assert_owner_lock()
-                    _rotate_configuration_generation(paths, current, expected, previous_sha256)
+                    _rotate_configuration_generation(paths, current, expected, previous_sha256,
+                                                 capacity_authority=capacity_authority)
             else:
-                _rotate_configuration_generation(paths, current, expected, previous_sha256)
+                _rotate_configuration_generation(paths, current, expected, previous_sha256,
+                                                 capacity_authority=capacity_authority)
         return expected
     return current
 

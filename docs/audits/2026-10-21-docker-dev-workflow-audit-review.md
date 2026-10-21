@@ -306,3 +306,23 @@ nie zastosowano migracji na podstawie samej listy Released.
 H1: kontrola składni i review źródeł; bez testów, builda i publikacji deskryptora.
 H2: protokół migracji nadal planowany. H3: checkpoint wykonany; recreate/restart
 po zmianie polityki nadal niewykonane. API, mesh i browser/WebGL **NOT VERIFIED**.
+
+
+## H2 — checkpoint źródeł, bez zastosowania do runtime
+
+Przygotowano i poddano review wersjonowaną migrację wspólnej polityki,
+z niezmienionym init markerem, zachowaniem Released proofs i historią CAS.
+Zwykły start nie migruje; istniejący launcher wymaga jawnej intencji.
+Dwie stałe usługi pozostają bez zmian. Nie upraszcza to jeszcze capture,
+kluczy cache ani publicznego lifecycle opisanego wyżej.
+
+Końcowe review poprawiło trzy luki integracji: częściowe wznowienie wiąże
+wszystkie zapisane piny, niepełne Docker Mounts nie oznaczają bezczynności,
+a rotacja profilu może zmienić CPU/RAM i maski CPU przy zachowaniu pozostałych
+przydziałów, identities i uprawnień. AST/parser i review nie są buildem.
+
+Odczytowy preflight wykrył dwie działające grupy korzystające z /host-ledger.
+Ich zatrzymanie i recovery wykraczają poza dotychczasowy zakres mastera;
+pytanie o rozszerzenie zgody pozostaje bez odpowiedzi. Migracji nie zastosowano.
+Szczegóły, identyfikatory i granice dowodów: [raport, §67](../reports/2026-10-20/mx3-master-3806-recovery.md#67-h2--źródłowy-protokół-migracji-i-rzeczywisty-preflight).
+API/mesh/render pozostają NOT VERIFIED; testów i nowego buildu nie uruchamiano.

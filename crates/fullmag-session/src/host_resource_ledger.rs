@@ -42,6 +42,9 @@ pub const HOST_RESOURCE_LEDGER_SCHEMA_V2: &str = "host_resource_ledger.v2";
 pub const HOST_RESOURCE_LEDGER_SCHEMA_V3: &str = "host_resource_ledger.v3";
 /// Pointer-only ledger schema for the runtime-readiness and compute snapshot CAS.
 pub const HOST_RESOURCE_LEDGER_SCHEMA_V4: &str = "host_resource_ledger.v4";
+/// Runtime pointers and immutable prior policy generations. Older clients
+/// reject v5 instead of admitting against a superseded capacity policy.
+pub const HOST_RESOURCE_LEDGER_SCHEMA_V5: &str = "host_resource_ledger.v5";
 pub const HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V1: &str = "host_resource_ledger_policy.v1";
 /// Host policy with a canonical, observed inventory topology and native GPU
 /// readiness binding. V1 remains accepted for legacy hosts.
@@ -65,6 +68,8 @@ const HOST_RESOURCE_LEDGER_MARKER_FILE: &str = "HOST_RESOURCE_LEDGER.init.json";
 const HOST_COMPUTE_NODE_SNAPSHOT_FILE: &str = "COMPUTE_NODE_SNAPSHOT.json";
 const HOST_RUNTIME_READINESS_FILE: &str = "HOST_RUNTIME_READINESS.json";
 const HOST_RUNTIME_READINESS_CAS_DIR: &str = "runtime-state/cas/readiness";
+const HOST_POLICY_HISTORY_CAS_DIR: &str = "runtime-state/cas/policy-history";
+const MAX_HOST_POLICY_HISTORY: usize = 16;
 const HOST_COMPUTE_NODE_SNAPSHOT_CAS_DIR: &str = "runtime-state/cas/snapshot";
 /// Boot-relative ordering of one published snapshot, keyed by its digest.
 /// Kept outside the snapshot bytes so older readers never observe it.
@@ -858,6 +863,75 @@ struct HostResourceLedgerDocument {
     node_policy: Option<NodePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_state: Option<HostRuntimeState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    policy_history: Vec<HostPolicyHistoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HostPolicyHistoryEntry {
+    policy: HostResourceLedgerPolicy,
+    /// Exact previous ledger bytes, including its runtime pointers and rows.
+    document_sha256: String,
+}
+
+impl HostResourceLedgerDocument {
+    fn policy_history_sha256(&self) -> Result<Option<String>> {
+        if self.policy_history.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::canonical_json_sha256(&serde_json::to_value(
+            &self.policy_history,
+        )?)))
+    }
+
+    fn has_runtime_state(&self) -> bool {
+        matches!(
+            self.schema_version.as_str(),
+            HOST_RESOURCE_LEDGER_SCHEMA_V4 | HOST_RESOURCE_LEDGER_SCHEMA_V5
+        )
+    }
+
+    fn policy_for_reservation(
+        &self,
+        reservation: &HostResourceReservation,
+    ) -> Result<&HostResourceLedgerPolicy> {
+        if reservation.policy_revision == self.policy.revision {
+            return Ok(&self.policy);
+        }
+        if reservation.state != HostResourceReservationState::Released {
+            bail!("historical host policy cannot own a nonreleased reservation");
+        }
+        self.policy_history
+            .iter()
+            .find(|entry| entry.policy.revision == reservation.policy_revision)
+            .map(|entry| &entry.policy)
+            .context("released reservation references an unknown historical host policy")
+    }
+}
+
+/// Explicit compare-and-publish pins for a quiescent capacity migration.
+/// The native caller supplies a fresh measured target policy and readiness;
+/// these pins authorize only the exact prior generation, never a reset.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostCapacityMigrationPins {
+    pub expected_marker_sha256: String,
+    pub expected_document_sha256: String,
+    pub expected_policy_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostCapacityMigrationReceipt {
+    pub schema_version: String,
+    pub marker_sha256: String,
+    pub previous_document_sha256: String,
+    pub current_document_sha256: String,
+    pub previous_policy_sha256: String,
+    pub current_policy_sha256: String,
+    pub runtime_generation_sha256: String,
+    pub policy_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -909,6 +983,7 @@ pub struct HostResourceLedgerSnapshot {
     pub policy: HostResourceLedgerPolicy,
     pub reservations: Vec<HostResourceReservation>,
     pub node_policy: Option<NodePolicy>,
+    policy_history_sha256: Option<String>,
 }
 
 impl HostResourceLedgerSnapshot {
@@ -924,11 +999,16 @@ impl HostResourceLedgerSnapshot {
     /// reservation history, and node policy; it never includes a heartbeat or
     /// a transient inventory-owner lock.
     pub fn stable_sha256(&self) -> Result<String> {
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "policy": &self.policy,
             "reservations": &self.reservations,
             "node_policy": &self.node_policy,
         });
+        // Preserve legacy digest bytes; v5 also pins the immutable policy
+        // chain and exact prior documents, without including live inventory.
+        if let Some(digest) = &self.policy_history_sha256 {
+            value["policy_history_sha256"] = serde_json::Value::String(digest.clone());
+        }
         Ok(crate::canonical_json_sha256(&value))
     }
 }
@@ -1052,7 +1132,7 @@ impl HostResourceLedger {
         }
         validate_reservation_matches_worker_lease(
             &document.reservations[index],
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &store_id,
             &record.lease,
         )?;
@@ -1262,7 +1342,7 @@ impl HostResourceLedger {
         self.validate_runtime_generation_request_locked(document, &pinned_request)?;
         validate_reservation_matches_worker_lease(
             &document.reservations[index],
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &store_id,
             &current,
         )?;
@@ -1279,7 +1359,7 @@ impl HostResourceLedger {
         let pinned_request = reservation_request(&document.reservations[index]);
         self.validate_compute_node_request_locked(
             &pinned_request,
-            document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4,
+            document.has_runtime_state(),
         )?;
         Ok(index)
     }
@@ -1451,7 +1531,7 @@ impl HostResourceLedger {
         let store_id = Self::store_id(store.root())?;
         validate_reservation_matches_worker_lease(
             reservation,
-            &document.policy,
+            document.policy_for_reservation(reservation)?,
             &store_id,
             &lease,
         )?;
@@ -1531,7 +1611,7 @@ impl HostResourceLedger {
         self.validate_runtime_generation_request_locked(document, &request)?;
         self.validate_compute_node_request_locked(
             &request,
-            document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4,
+            document.has_runtime_state(),
         )?;
         validate_request_matches_preparation_lease(&request, &current, &store_id)?;
         Ok(index)
@@ -2000,7 +2080,7 @@ impl HostResourceLedger {
         confirm_publication(&checked_path(store.root(), &released.relative_path()?)?)?;
         validate_no_spawn_preparation_lease(
             &self.root,
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &document.reservations[index],
             &store_id,
             &released,
@@ -2246,6 +2326,7 @@ impl HostResourceLedger {
             (false, false) => {
                 ensure_fresh_ledger_root(&ledger.root)?;
                 let document = HostResourceLedgerDocument {
+                    policy_history: Vec::new(),
                     schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V3.to_string(),
                     policy: ledger.policy.clone(),
                     reservations: Vec::new(),
@@ -2351,6 +2432,7 @@ impl HostResourceLedger {
                     "host runtime readiness",
                 )?;
                 let document = HostResourceLedgerDocument {
+                    policy_history: Vec::new(),
                     schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V4.to_string(),
                     policy: ledger.policy.clone(),
                     reservations: Vec::new(),
@@ -2464,7 +2546,7 @@ impl HostResourceLedger {
         let _host_writer = self.writer.acquire()?;
         let mut document = self.read_document_locked()?;
         if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V3
-            && document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4
+            && !document.has_runtime_state()
         {
             bail!("runtime readiness rotation requires a v3 or v4 host ledger");
         }
@@ -2479,7 +2561,7 @@ impl HostResourceLedger {
             bail!("runtime readiness rotation requires the host inventory owner to be absent");
         }
 
-        let existing = if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+        let existing = if document.has_runtime_state() {
             self.read_runtime_readiness_locked()?
         } else {
             let bytes = read_bounded_regular_file(
@@ -2509,7 +2591,9 @@ impl HostResourceLedger {
             MAX_HOST_RUNTIME_READINESS_BYTES,
             "host runtime readiness",
         )?;
-        document.schema_version = HOST_RESOURCE_LEDGER_SCHEMA_V4.to_string();
+        if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V5 {
+            document.schema_version = HOST_RESOURCE_LEDGER_SCHEMA_V4.to_string();
+        }
         document.runtime_state = Some(HostRuntimeState {
             schema_version: HOST_RUNTIME_STATE_SCHEMA_V1.to_string(),
             readiness_sha256: readiness_digest.clone(),
@@ -2519,6 +2603,185 @@ impl HostResourceLedger {
         self.publish_document_locked(&document)?;
         self.gc_unreachable_snapshot_cas_locked(&document)?;
         Ok(readiness_digest)
+    }
+
+    /// Read the persisted policy only through its marker, proofs and local
+    /// application binding. This never adopts unvalidated JSON metadata.
+    pub fn existing_policy_for_application(
+        application_state_root: &Path,
+        root: &Path,
+    ) -> Result<Option<HostResourceLedgerPolicy>> {
+        if !root.try_exists()? {
+            return Ok(None);
+        }
+        let root = canonical_ledger_root(root, false)?;
+        let marker = checked_path(&root, HOST_RESOURCE_LEDGER_MARKER_FILE)?;
+        let document = checked_path(&root, HOST_RESOURCE_LEDGER_FILE)?;
+        match (marker.try_exists()?, document.try_exists()?) {
+            (false, false) => return Ok(None),
+            (true, true) => {}
+            _ => bail!("host capacity policy has partial initialization"),
+        }
+        let bytes = read_bounded_regular_file(&root, HOST_RESOURCE_LEDGER_FILE, MAX_LEDGER_BYTES)?;
+        let candidate: HostResourceLedgerDocument = serde_json::from_slice(&bytes)?;
+        let ledger = Self::open_for_application(application_state_root, &root, candidate.policy)?;
+        Ok(Some(ledger.policy.clone()))
+    }
+
+    /// Preserve a validated persisted revision only when every measured host
+    /// capacity fact still agrees. An actual capacity change needs the explicit
+    /// migration below, never an implicit upgrade during normal initialization.
+    pub fn bind_measured_capacity_policy_for_application(
+        application_state_root: &Path,
+        root: &Path,
+        mut measured: HostResourceLedgerPolicy,
+    ) -> Result<HostResourceLedgerPolicy> {
+        measured.validate()?;
+        // Initialization already owns authority to establish this one binding.
+        // Fresh application state may join an existing shared host ledger.
+        let root = crate::host_ledger_registry::pin_host_ledger_root(
+            application_state_root, root, &measured,
+        )?;
+        if let Some(existing) = Self::existing_policy_for_application(application_state_root, &root)? {
+            measured.revision = existing.revision;
+            if measured != existing {
+                bail!("measured host capacity differs from the persisted policy; explicit quiescent migration is required");
+            }
+        }
+        Ok(measured)
+    }
+
+    /// Validated prior policies for the private Docker configuration adapter.
+    /// This is evidence for a stopped consumer's profile transition, never
+    /// authority to admit work using a historical policy.
+    pub fn capacity_policy_history(&self) -> Result<Vec<HostResourceLedgerPolicy>> {
+        let _host_writer = self.writer.acquire()?;
+        let document = self.read_document_locked()?;
+        Ok(document.policy_history.into_iter().map(|entry| entry.policy).collect())
+    }
+
+    /// Discover exact pins for an explicitly requested capacity transition.
+    /// Pins are produced from validated bytes under the writer, rather than
+    /// requiring an operator to copy hashes from an old observation.
+    pub fn inspect_capacity_migration_for_application(
+        application_state_root: &Path,
+        root: &Path,
+        measured: &HostResourceLedgerPolicy,
+    ) -> Result<(Self, HostCapacityMigrationPins)> {
+        let root = crate::host_ledger_registry::pin_host_ledger_root(
+            application_state_root, root, measured,
+        )?;
+        let policy = Self::existing_policy_for_application(application_state_root, &root)?
+            .context("capacity migration requires an existing initialized host ledger")?;
+        if policy.host_id != measured.host_id {
+            bail!("capacity migration cannot change the logical host identity");
+        }
+        let ledger = Self::open_for_application(application_state_root, &root, policy)?;
+        let pins = {
+            let _host_writer = ledger.writer.acquire()?;
+            let marker = read_bounded_regular_file(
+                &root, HOST_RESOURCE_LEDGER_MARKER_FILE, MAX_MARKER_BYTES,
+            )?;
+            let bytes = read_bounded_regular_file(&root, HOST_RESOURCE_LEDGER_FILE, MAX_LEDGER_BYTES)?;
+            ledger.validate_document_snapshot(&marker, &bytes)?;
+            HostCapacityMigrationPins {
+                expected_marker_sha256: runtime_cas_digest(&marker),
+                expected_document_sha256: runtime_cas_digest(&bytes),
+                expected_policy_sha256: policy_sha256(&ledger.policy)?,
+            }
+        };
+        Ok((ledger, pins))
+    }
+
+    /// Atomically advance capacity while preserving the initial marker, every
+    /// released row and the exact prior document. All clients must be upgraded
+    /// before the operator applies this transition. Old clients reject v5.
+    pub fn migrate_capacity_with_readiness(
+        &self,
+        next_policy: HostResourceLedgerPolicy,
+        readiness: HostRuntimeReadiness,
+        pins: &HostCapacityMigrationPins,
+    ) -> Result<(Self, HostCapacityMigrationReceipt)> {
+        for (value, field) in [
+            (&pins.expected_marker_sha256, "expected_marker_sha256"),
+            (&pins.expected_document_sha256, "expected_document_sha256"),
+            (&pins.expected_policy_sha256, "expected_policy_sha256"),
+        ] {
+            validate_runtime_cas_digest(value, field)?;
+        }
+        validate_policy_transition(&self.policy, &next_policy)?;
+        readiness.validate_persisted(&next_policy)?;
+        let _host_writer = self.writer.acquire()?;
+        let mut document = self.read_document_locked()?;
+        if !document.has_runtime_state() || document.policy_history.len() >= MAX_HOST_POLICY_HISTORY {
+            bail!("host capacity migration requires a v4/v5 ledger with history capacity");
+        }
+        let marker_bytes = read_bounded_regular_file(
+            &self.root, HOST_RESOURCE_LEDGER_MARKER_FILE, MAX_MARKER_BYTES,
+        )?;
+        let previous_bytes = read_bounded_regular_file(
+            &self.root, HOST_RESOURCE_LEDGER_FILE, MAX_LEDGER_BYTES,
+        )?;
+        if self.validate_document_snapshot(&marker_bytes, &previous_bytes)? != document
+            || runtime_cas_digest(&marker_bytes) != pins.expected_marker_sha256
+            || runtime_cas_digest(&previous_bytes) != pins.expected_document_sha256
+            || policy_sha256(&self.policy)? != pins.expected_policy_sha256
+        {
+            bail!("host capacity migration differs from the exact pinned prior generation");
+        }
+        if document.reservations.iter().any(|row| row.state != HostResourceReservationState::Released)
+            || self.active_inventory_owner_locked()?.is_some()
+        {
+            bail!("host capacity migration requires released reservations and no active inventory owner");
+        }
+        let previous_readiness = self.read_runtime_readiness_locked()?;
+        if !runtime_readiness_native_abi_compatible(&previous_readiness, &readiness) {
+            bail!("host capacity migration changes native ABI or GPU compatibility");
+        }
+        if let Some(node_policy) = &document.node_policy {
+            node_policy.validate(&next_policy)?;
+        }
+        let previous_document_sha256 = publish_runtime_cas_bytes(
+            &self.root, HOST_POLICY_HISTORY_CAS_DIR, &previous_bytes,
+            MAX_LEDGER_BYTES, "historical host ledger",
+        )?;
+        let readiness_bytes = bounded_json_bytes(
+            &readiness, MAX_HOST_RUNTIME_READINESS_BYTES, "host runtime readiness",
+        )?;
+        let runtime_generation_sha256 = publish_runtime_cas_bytes(
+            &self.root, HOST_RUNTIME_READINESS_CAS_DIR, &readiness_bytes,
+            MAX_HOST_RUNTIME_READINESS_BYTES, "host runtime readiness",
+        )?;
+        document.policy_history.push(HostPolicyHistoryEntry {
+            policy: self.policy.clone(),
+            document_sha256: previous_document_sha256.clone(),
+        });
+        document.schema_version = HOST_RESOURCE_LEDGER_SCHEMA_V5.into();
+        document.policy = next_policy.clone();
+        document.runtime_state = Some(HostRuntimeState {
+            schema_version: HOST_RUNTIME_STATE_SCHEMA_V1.into(),
+            readiness_sha256: runtime_generation_sha256.clone(),
+            snapshot_sha256: None,
+        });
+        let next = Self::new(self.root.clone(), next_policy);
+        let bytes = bounded_json_bytes(&document, MAX_LEDGER_BYTES, "migrated host ledger")?;
+        next.validate_document_snapshot(&marker_bytes, &bytes)?;
+        next.publish_document_locked(&document)?;
+        // Read back the one authoritative pointer before reporting success.
+        if next.read_document_locked()? != document {
+            bail!("host capacity migration publication differs from its intended generation");
+        }
+        let receipt = HostCapacityMigrationReceipt {
+            schema_version: "host_capacity_migration.v1".into(),
+            marker_sha256: pins.expected_marker_sha256.clone(),
+            previous_document_sha256,
+            current_document_sha256: runtime_cas_digest(&bytes),
+            previous_policy_sha256: pins.expected_policy_sha256.clone(),
+            current_policy_sha256: policy_sha256(&next.policy)?,
+            runtime_generation_sha256,
+            policy_revision: next.policy.revision,
+        };
+        Ok((next, receipt))
     }
 
     /// Open a previously initialized ledger without creating or repairing its
@@ -2625,7 +2888,7 @@ impl HostResourceLedger {
         }
         next.validate(&document.policy)?;
         document.node_policy = Some(next.clone());
-        if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+        if !document.has_runtime_state() {
             document.schema_version = HOST_RESOURCE_LEDGER_SCHEMA_V3.to_string();
         }
         validate_ledger_document(&document, &self.root)?;
@@ -2906,7 +3169,7 @@ impl HostResourceLedger {
         document: &HostResourceLedgerDocument,
         request: &HostReservationRequest,
     ) -> Result<()> {
-        if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+        if !document.has_runtime_state() {
             if self.policy.requires_runtime_readiness() {
                 bail!(
                     "runtime-readiness host admission requires a v4 runtime generation; migrate the host ledger before new admission"
@@ -3164,7 +3427,7 @@ impl HostResourceLedger {
 
     fn read_runtime_readiness_locked(&self) -> Result<HostRuntimeReadiness> {
         let document = self.read_document_locked()?;
-        if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+        if document.has_runtime_state() {
             let state = document
                 .runtime_state
                 .as_ref()
@@ -3198,7 +3461,7 @@ impl HostResourceLedger {
             return Ok(());
         }
         let document = self.read_document_locked()?;
-        if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+        if document.has_runtime_state() {
             let state = document
                 .runtime_state
                 .as_ref()
@@ -3330,7 +3593,7 @@ impl HostResourceLedger {
         document: &HostResourceLedgerDocument,
     ) -> Result<()> {
         let (current_snapshot_digest, is_v4) =
-            if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+            if document.has_runtime_state() {
                 (
                     document
                         .runtime_state
@@ -3357,15 +3620,24 @@ impl HostResourceLedger {
                 let digest = runtime_cas_digest(&bytes);
                 (Some(digest), false)
             };
+        let mut retained_snapshots = BTreeSet::new();
+        for entry in &document.policy_history {
+            let archive = read_policy_history_document(&self.root, entry)?;
+            if let Some(digest) = archive.runtime_state.and_then(|state| state.snapshot_sha256) {
+                retained_snapshots.insert(digest);
+            }
+        }
         if is_v4 {
             self.gc_unreachable_cas_directory_locked(
                 HOST_COMPUTE_NODE_SNAPSHOT_CAS_DIR,
                 current_snapshot_digest.as_deref(),
+                &retained_snapshots,
             )?;
         }
         self.gc_unreachable_cas_directory_locked(
             HOST_COMPUTE_NODE_SAMPLE_ORDER_CAS_DIR,
             current_snapshot_digest.as_deref(),
+            &retained_snapshots,
         )?;
         Ok(())
     }
@@ -3374,6 +3646,7 @@ impl HostResourceLedger {
         &self,
         directory_relative: &str,
         current_snapshot_digest: Option<&str>,
+        retained_snapshots: &BTreeSet<String>,
     ) -> Result<()> {
         let directory = checked_path(&self.root, directory_relative)?;
         let entries = match fs::read_dir(&directory) {
@@ -3411,6 +3684,7 @@ impl HostResourceLedger {
             };
             if validate_runtime_cas_digest(digest, "runtime CAS filename").is_err()
                 || current_snapshot_digest == Some(digest)
+                || retained_snapshots.contains(digest)
             {
                 continue;
             }
@@ -3437,7 +3711,7 @@ impl HostResourceLedger {
     ) -> Result<ComputeNodeSnapshotPublicationDisposition> {
         self.validate_v2_snapshot_locked(snapshot)?;
         let mut document = self.read_document_locked()?;
-        if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+        if document.has_runtime_state() {
             if let Some(previous) = self.read_compute_node_snapshot_locked()? {
                 let previous_bytes = bounded_json_bytes(
                     &previous,
@@ -3625,7 +3899,7 @@ impl HostResourceLedger {
 
     fn read_compute_node_snapshot_locked(&self) -> Result<Option<ComputeNodeSnapshot>> {
         let document = self.read_document_locked()?;
-        if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+        if document.has_runtime_state() {
             let Some(state) = document.runtime_state.as_ref() else {
                 bail!("v4 host resource ledger is missing runtime state");
             };
@@ -3675,6 +3949,7 @@ impl HostResourceLedger {
         let _host_writer = self.writer.acquire()?;
         let document = self.read_document_locked()?;
         Ok(HostResourceLedgerSnapshot {
+            policy_history_sha256: document.policy_history_sha256()?,
             policy: document.policy,
             reservations: document.reservations,
             node_policy: document.node_policy,
@@ -3710,6 +3985,7 @@ impl HostResourceLedger {
                 .context("host ledger observation changed during validation"));
         }
         Ok(HostResourceLedgerSnapshot {
+            policy_history_sha256: document.policy_history_sha256()?,
             policy: document.policy,
             reservations: document.reservations,
             node_policy: document.node_policy,
@@ -3745,6 +4021,7 @@ impl HostResourceLedger {
             );
         }
         let snapshot = HostResourceLedgerSnapshot {
+            policy_history_sha256: document.policy_history_sha256()?,
             policy: document.policy,
             reservations: document.reservations,
             node_policy: document.node_policy,
@@ -3777,6 +4054,7 @@ impl HostResourceLedger {
             );
         }
         let snapshot = HostResourceLedgerSnapshot {
+            policy_history_sha256: document.policy_history_sha256()?,
             policy: document.policy,
             reservations: document.reservations,
             node_policy: document.node_policy,
@@ -3807,7 +4085,7 @@ impl HostResourceLedger {
             if row.state != HostResourceReservationState::Released {
                 bail!("exact terminal run has a nonreleased host reservation");
             }
-            let proof = read_validated_release_proof(&self.root, &document.policy, row)?;
+            let proof = read_validated_release_proof(&self.root, document.policy_for_reservation(row)?, row)?;
             if matches!(proof.kind, HostResourceReleaseProofKind::WorkerOrphanTeardown) {
                 bail!("terminal evidence cannot use an orphan-teardown release proof");
             }
@@ -4025,6 +4303,7 @@ impl HostResourceLedger {
         });
         let evidence_sha256 = canonical_json_sha256(&evidence);
         let snapshot = HostResourceLedgerSnapshot {
+            policy_history_sha256: document.policy_history_sha256()?,
             policy: document.policy.clone(),
             reservations: document.reservations.clone(),
             node_policy: document.node_policy.clone(),
@@ -4041,7 +4320,7 @@ impl HostResourceLedger {
         self.validate_runtime_generation_request_locked(&document, request)?;
         self.validate_compute_node_request_locked(
             request,
-            document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4,
+            document.has_runtime_state(),
         )?;
         let original_len = document.reservations.len();
         let (reservation, changed) = insert_tentative(&mut document, request, &self.root)?;
@@ -4385,7 +4664,7 @@ impl HostResourceLedger {
         let reservation = &document.reservations[index];
         validate_worker_orphan_request_matches_reservation(
             reservation,
-            &document.policy,
+            document.policy_for_reservation(reservation)?,
             &store_id,
             request,
         )?;
@@ -4395,7 +4674,7 @@ impl HostResourceLedger {
                 if intent.is_none() {
                     bail!("released host reservation has no orphan teardown intent");
                 }
-                validate_release_proof(&self.root, &document.policy, reservation)?;
+                validate_release_proof(&self.root, document.policy_for_reservation(reservation)?, reservation)?;
                 let proof_digest = reservation
                     .release_proof_sha256
                     .as_deref()
@@ -4441,7 +4720,7 @@ impl HostResourceLedger {
         validate_worker_orphan_active_lease(request, &lease)?;
         validate_reservation_host_binding(
             &self.root,
-            &document.policy,
+            document.policy_for_reservation(reservation)?,
             reservation,
             lease.host_launch_binding.as_ref(),
             "worker orphan teardown",
@@ -4519,7 +4798,7 @@ impl HostResourceLedger {
                 .context("worker orphan teardown has no exact host reservation")?;
             validate_worker_orphan_request_matches_reservation(
                 reservation,
-                &document.policy,
+                document.policy_for_reservation(reservation)?,
                 &store_id,
                 request,
             )?;
@@ -4527,14 +4806,14 @@ impl HostResourceLedger {
             if reservation.state == HostResourceReservationState::Released {
                 let proof_sha256 = orphan_release_proof_sha256(
                     reservation,
-                    &document.policy,
+                    document.policy_for_reservation(reservation)?,
                     &store_id,
                     &nested_proof,
                 )?;
                 if reservation.release_proof_sha256.as_deref() != Some(proof_sha256.as_str()) {
                     bail!("released orphan reservation replay differs from its proof");
                 }
-                validate_release_proof(&self.root, &document.policy, reservation)?;
+                validate_release_proof(&self.root, document.policy_for_reservation(reservation)?, reservation)?;
                 return Ok(reservation.clone());
             }
             ensure_worker_orphan_quiescence_locked(self, &document, &identity)?;
@@ -4568,7 +4847,7 @@ impl HostResourceLedger {
                     validate_worker_orphan_active_lease(request, &lease)?;
                     validate_reservation_host_binding(
                         &self.root,
-                        &document.policy,
+                        document.policy_for_reservation(reservation)?,
                         reservation,
                         lease.host_launch_binding.as_ref(),
                         "worker orphan teardown",
@@ -4578,7 +4857,7 @@ impl HostResourceLedger {
                     validate_worker_orphan_lease_identity(request, &lease)?;
                     validate_worker_orphan_release_proof_file(
                         &self.root,
-                        &document.policy,
+                        document.policy_for_reservation(reservation)?,
                         reservation,
                         &nested_proof,
                     )?;
@@ -4614,7 +4893,7 @@ impl HostResourceLedger {
             .context("worker orphan teardown reservation disappeared")?;
         validate_worker_orphan_request_matches_reservation(
             &document.reservations[index],
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &store_id,
             request,
         )?;
@@ -4674,7 +4953,7 @@ impl HostResourceLedger {
                     validate_worker_orphan_active_lease(request, &lease)?;
                     validate_reservation_host_binding(
                         &self.root,
-                        &document.policy,
+                        document.policy_for_reservation(&document.reservations[index])?,
                         &document.reservations[index],
                         lease.host_launch_binding.as_ref(),
                         "worker orphan teardown",
@@ -4685,7 +4964,7 @@ impl HostResourceLedger {
                     validate_worker_orphan_lease_identity(request, &lease)?;
                     validate_worker_orphan_release_proof_file(
                         &self.root,
-                        &document.policy,
+                        document.policy_for_reservation(&document.reservations[index])?,
                         &document.reservations[index],
                         &nested_proof,
                     )?;
@@ -4744,14 +5023,14 @@ impl HostResourceLedger {
             .context("worker exit proof has no exact host reservation")?;
         validate_reservation_host_binding(
             &self.root,
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &document.reservations[index],
             lease.host_launch_binding.as_ref(),
             "worker release proof",
         )?;
         validate_reservation_matches_worker_exit(
             &document.reservations[index],
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &store_id,
             &receipt,
             &lease,
@@ -4780,7 +5059,7 @@ impl HostResourceLedger {
             {
                 bail!("released host reservation replay differs from its proof-backed release");
             }
-            validate_release_proof(&self.root, &document.policy, &document.reservations[index])?;
+            validate_release_proof(&self.root, document.policy_for_reservation(&document.reservations[index])?, &document.reservations[index])?;
             return Ok(document.reservations[index].clone());
         }
 
@@ -4827,7 +5106,7 @@ impl HostResourceLedger {
         validate_no_spawn_worker_lease(
             &self.root,
             &document.reservations[index],
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &store_id,
             &lease,
         )?;
@@ -4851,7 +5130,7 @@ impl HostResourceLedger {
             if document.reservations[index].release_proof_sha256.as_deref() != Some(&digest) {
                 bail!("no-spawn replay differs from the durable release proof");
             }
-            validate_release_proof(&self.root, &document.policy, &document.reservations[index])?;
+            validate_release_proof(&self.root, document.policy_for_reservation(&document.reservations[index])?, &document.reservations[index])?;
             return Ok(document.reservations[index].clone());
         }
         let relative = release_proof_relative_path(&digest)?;
@@ -4925,14 +5204,14 @@ impl HostResourceLedger {
             .context("preparation exit proof has no exact host reservation")?;
         validate_reservation_host_binding(
             &self.root,
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &document.reservations[index],
             lease.host_launch_binding.as_ref(),
             "preparation release proof",
         )?;
         validate_preparation_reservation_identity_and_budget(
             &document.reservations[index],
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &store_id,
             &receipt,
             &lease,
@@ -4940,7 +5219,7 @@ impl HostResourceLedger {
         if document.reservations[index].state == HostResourceReservationState::Released {
             return replay_released_preparation_reservation(
                 &self.root,
-                &document.policy,
+                document.policy_for_reservation(&document.reservations[index])?,
                 &document.reservations[index],
                 &store_id,
                 &receipt,
@@ -5013,7 +5292,7 @@ impl HostResourceLedger {
         }
         validate_reservation_matches_preparation_exit(
             &document.reservations[index],
-            &document.policy,
+            document.policy_for_reservation(&document.reservations[index])?,
             &store_id,
             &receipt,
             &released_lease,
@@ -5084,14 +5363,19 @@ impl HostResourceLedger {
     ) -> Result<HostResourceLedgerDocument> {
         let marker: HostResourceLedgerMarker = serde_json::from_slice(marker_bytes)
             .context("corrupt host resource ledger initialization marker; refusing admission")?;
-        if marker.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V1
-            || marker.policy_sha256 != policy_sha256(&self.policy)?
-        {
-            bail!("host resource ledger initialization marker differs from configured policy");
-        }
         let document: HostResourceLedgerDocument = serde_json::from_slice(bytes)
             .context("corrupt host resource ledger snapshot; refusing admission")?;
         validate_ledger_document(&document, &self.root)?;
+        let initial_policy = document
+            .policy_history
+            .first()
+            .map(|entry| &entry.policy)
+            .unwrap_or(&document.policy);
+        if marker.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V1
+            || marker.policy_sha256 != policy_sha256(initial_policy)?
+        {
+            bail!("host resource ledger initialization marker differs from configured policy");
+        }
         if document.policy != self.policy {
             bail!("stored host resource policy differs from explicit ledger configuration");
         }
@@ -5100,7 +5384,7 @@ impl HostResourceLedger {
 
     fn publish_document_locked(&self, document: &HostResourceLedgerDocument) -> Result<()> {
         let mut document = document.clone();
-        if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+        if !document.has_runtime_state() {
             document.schema_version = HOST_RESOURCE_LEDGER_SCHEMA_V3.to_string();
         }
         validate_ledger_document(&document, &self.root)?;
@@ -5569,7 +5853,7 @@ fn insert_tentative(
             request.identity.owner.solver_epoch(),
             existing.identity.owner.solver_epoch(),
         ) {
-            if reservation_consumes_solver_epoch(root, &document.policy, existing)?
+            if reservation_consumes_solver_epoch(root, document.policy_for_reservation(existing)?, existing)?
                 && request_epoch <= existing_epoch
             {
                 bail!("host reservation task ownership epoch is stale");
@@ -5617,7 +5901,7 @@ fn validate_node_policy_admission(
 }
 
 fn validate_v4_runtime_state(document: &HostResourceLedgerDocument, root: &Path) -> Result<()> {
-    if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+    if !document.has_runtime_state() {
         if document.runtime_state.is_some() {
             bail!("runtime state is only valid in a v4 host resource ledger");
         }
@@ -5806,7 +6090,7 @@ fn validate_v2_snapshot_static_against_readiness(
 }
 
 fn validate_v4_reservation_fences(document: &HostResourceLedgerDocument) -> Result<()> {
-    if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+    if !document.has_runtime_state() {
         return Ok(());
     }
     let current_generation = document
@@ -5839,16 +6123,113 @@ fn validate_v4_reservation_fences(document: &HostResourceLedgerDocument) -> Resu
     Ok(())
 }
 
+fn validate_policy_transition(
+    previous: &HostResourceLedgerPolicy,
+    next: &HostResourceLedgerPolicy,
+) -> Result<()> {
+    previous.validate()?;
+    next.validate()?;
+    if previous.host_id != next.host_id
+        || previous.owner_epoch != next.owner_epoch
+        || previous.schema_version != next.schema_version
+        || previous.gpu_vram_bytes_by_uuid != next.gpu_vram_bytes_by_uuid
+        || previous.total_budget.storage_bytes != next.total_budget.storage_bytes
+        || next.revision != previous.revision.checked_add(1).context("host policy revision overflow")?
+    {
+        bail!("host capacity migration must preserve host, owner epoch, GPU family and storage policy and increment revision");
+    }
+    Ok(())
+}
+
+fn read_policy_history_document(
+    root: &Path,
+    entry: &HostPolicyHistoryEntry,
+) -> Result<HostResourceLedgerDocument> {
+    let bytes = read_runtime_cas_bytes(
+        root,
+        HOST_POLICY_HISTORY_CAS_DIR,
+        &entry.document_sha256,
+        MAX_LEDGER_BYTES,
+        "historical host ledger",
+    )?;
+    serde_json::from_slice(&bytes).context("decode historical host ledger")
+}
+
+/// Validate each archive once, without recursively expanding its prefix.
+/// Work is bounded by the generation and row limits, and every old row stays
+/// in the live document so its exact identity remains fenced against replay.
+fn validate_policy_history(document: &HostResourceLedgerDocument, root: &Path) -> Result<()> {
+    if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V5 {
+        if !document.policy_history.is_empty() {
+            bail!("historical host policies require the v5 ledger schema");
+        }
+        return Ok(());
+    }
+    if document.policy_history.is_empty()
+        || document.policy_history.len() > MAX_HOST_POLICY_HISTORY
+    {
+        bail!("v5 host ledger requires bounded nonempty policy history");
+    }
+    let current_rows: BTreeMap<_, _> = document
+        .reservations
+        .iter()
+        .map(|row| (row.identity.clone(), row))
+        .collect();
+    for (index, entry) in document.policy_history.iter().enumerate() {
+        entry.policy.validate()?;
+        let archive = read_policy_history_document(root, entry)?;
+        if archive.policy != entry.policy
+            || archive.policy_history != document.policy_history[..index]
+            || (index == 0 && archive.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4)
+            || (index > 0 && archive.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V5)
+        {
+            bail!("historical host ledger differs from its policy or generation prefix");
+        }
+        validate_ledger_document_body(&archive, root)?;
+        for row in &archive.reservations {
+            if row.state != HostResourceReservationState::Released
+                || current_rows.get(&row.identity).copied() != Some(row)
+            {
+                bail!("host policy migration changed or omitted a historical released row");
+            }
+        }
+        let archived_rows: BTreeMap<_, _> = archive
+            .reservations
+            .iter()
+            .map(|row| (row.identity.clone(), row))
+            .collect();
+        for row in document.reservations.iter().filter(|row| {
+            row.policy_revision == entry.policy.revision
+        }) {
+            if archived_rows.get(&row.identity).copied() != Some(row) {
+                bail!("host ledger added or changed a row under a historical policy");
+            }
+        }
+        let next = document
+            .policy_history
+            .get(index + 1)
+            .map(|entry| &entry.policy)
+            .unwrap_or(&document.policy);
+        validate_policy_transition(&entry.policy, next)?;
+    }
+    Ok(())
+}
+
 fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) -> Result<()> {
+    validate_policy_history(document, root)?;
+    validate_ledger_document_body(document, root)
+}
+
+fn validate_ledger_document_body(document: &HostResourceLedgerDocument, root: &Path) -> Result<()> {
     if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V1
         && document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V2
         && document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V3
-        && document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4
+        && !document.has_runtime_state()
     {
         bail!("unsupported host resource ledger schema");
     }
     if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V3
-        && document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4
+        && !document.has_runtime_state()
         && document.node_policy.is_some()
     {
         bail!("legacy host resource ledger cannot contain a node policy");
@@ -5879,7 +6260,8 @@ fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) 
     let mut cpu_allocation_mode: Option<bool> = None;
 
     for reservation in &document.reservations {
-        reservation.validate(&document.policy)?;
+        let reservation_policy = document.policy_for_reservation(reservation)?;
+        reservation.validate(reservation_policy)?;
         if reservation.node_policy_revision > 0 {
             let current_revision = document
                 .node_policy
@@ -5891,7 +6273,7 @@ fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) 
             }
         }
         if reservation.state == HostResourceReservationState::Released {
-            validate_release_proof(root, &document.policy, reservation)?;
+            validate_release_proof(root, reservation_policy, reservation)?;
         }
         if !identities.insert(reservation.identity.clone()) {
             bail!("host resource ledger contains a duplicate exact reservation identity");
@@ -5910,7 +6292,7 @@ fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) 
                 );
             }
         }
-        if reservation_consumes_solver_epoch(root, &document.policy, reservation)? {
+        if reservation_consumes_solver_epoch(root, reservation_policy, reservation)? {
             if let Some(epoch) = reservation.identity.owner.solver_epoch() {
                 let epochs = task_epochs.entry(task.clone()).or_default();
                 if !epochs.insert(epoch) {
@@ -9870,6 +10252,7 @@ mod tests {
         };
         let active = HostResourceReservation::from_request(&active_request).unwrap();
         let document = HostResourceLedgerDocument {
+            policy_history: Vec::new(),
             schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V1.to_string(),
             policy: policy.clone(),
             reservations: vec![released.clone(), active],
@@ -9904,6 +10287,7 @@ mod tests {
         fs::write(&proof_path, &proof_bytes).unwrap();
         released.release_proof_sha256 = Some("0".repeat(64));
         let missing_digest_document = HostResourceLedgerDocument {
+            policy_history: Vec::new(),
             schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V1.to_string(),
             policy,
             reservations: vec![released, document.reservations[1].clone()],
@@ -10827,6 +11211,7 @@ mod tests {
         };
         let active = HostResourceReservation::from_request(&active_request).unwrap();
         let document = HostResourceLedgerDocument {
+            policy_history: Vec::new(),
             schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V3.to_string(),
             policy: policy.clone(),
             reservations: vec![released.clone(), active],
@@ -10885,6 +11270,7 @@ mod tests {
         fs::write(&proof_path, mismatched_bytes).unwrap();
         released.release_proof_sha256 = Some(mismatched_digest);
         let mismatched_document = HostResourceLedgerDocument {
+            policy_history: Vec::new(),
             schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V1.to_string(),
             policy,
             reservations: vec![released, document.reservations[1].clone()],
@@ -10936,6 +11322,7 @@ mod tests {
         let mut changed_budget = HostResourceReservation::from_request(&request).unwrap();
         changed_budget.budget.memory_bytes += 1;
         let document = HostResourceLedgerDocument {
+            policy_history: Vec::new(),
             schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V3.to_string(),
             policy: policy.clone(),
             reservations: vec![changed_budget],
@@ -10950,6 +11337,7 @@ mod tests {
         let mut changed_digest = HostResourceReservation::from_request(&request).unwrap();
         changed_digest.request_sha256 = "0".repeat(64);
         let document = HostResourceLedgerDocument {
+            policy_history: Vec::new(),
             schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V3.to_string(),
             policy: policy.clone(),
             reservations: vec![changed_digest],
@@ -11744,6 +12132,7 @@ mod tests {
         let mut released = HostResourceReservation::from_request(&released_request).unwrap();
         released.state = HostResourceReservationState::Released;
         let released_document = HostResourceLedgerDocument {
+            policy_history: Vec::new(),
             schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V3.to_string(),
             policy: policy.clone(),
             reservations: vec![released],
@@ -11774,6 +12163,7 @@ mod tests {
             &[],
         );
         let document = HostResourceLedgerDocument {
+            policy_history: Vec::new(),
             schema_version: HOST_RESOURCE_LEDGER_SCHEMA_V3.to_string(),
             policy: policy.clone(),
             reservations: vec![

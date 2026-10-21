@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-21T01:37:12.760378+00:00",
-  "verification": "H0/H1 source only. H1 two-file Rust parser, Python AST including embedded publisher and scoped source review PASS; no tests/build/runtime of H0/H1. H3 actual checkpoint740722f4 state stopped-confirmed exit0, raw receipt SHA a15f43cbe50ab8ce9e25aef97ae81c777f4c1d712f74d7751c63adb1a60a6c5a verified by readback; no signal/restart/retry04/Solve. Last actual build73e Make exit0/121700ms. Parallel inventory changed ledger raw SHA to04630db439fccb9ecad244f73557f076337e581867783ff7941776370e5c3bda; old policy4CPU/7GiB/rev1 and14Released. H2 migration unimplemented; API/mesh/browser NOT VERIFIED. Hashes record current bytes, not build or scientific qualification.",
+  "observed_at": "2026-10-21T02:20:56.522017+00:00",
+  "verification": "H0/H1/H2 source only. H2 library and integration source reviews completed after descriptor-resume, Mounts inventory and CPU/RAM-only budget fixes. Python AST3 and Rust parser2 PASS; no tests or compilation. Actual read-only migration preflight blocked by two running foreign /host-ledger consumers; expanded stop/recovery authorization pending. No migration, foreign stop, new build, retry04 or Solve. Last actual build73e Make exit0/121700ms; H3 checkpoint740722f4 stopped-confirmed receipt SHA a15f43cbe50ab8ce9e25aef97ae81c777f4c1d712f74d7751c63adb1a60a6c5a. API/mesh/browser NOT VERIFIED. Hashes identify current source bytes only.",
   "files": [
     {
       "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
@@ -92,7 +92,7 @@
     },
     {
       "path": "crates/fullmag-api/src/runtime_service_main.rs",
-      "sha256": "1785544c866c2b4dd62ba12edf4be8c908992691d8cfd006667c9794fd73c2b9"
+      "sha256": "0f0033b41680857deece4d7b175958d704e726c29cca825cce9daf81465d550b"
     },
     {
       "path": "crates/fullmag-fdm-sys/build.rs",
@@ -132,7 +132,7 @@
     },
     {
       "path": "crates/fullmag-session/src/host_resource_ledger.rs",
-      "sha256": "2d3568f602ddc963618c5014caa2bd7774b05fae3bfb8e054308367cfb9a6fad"
+      "sha256": "588876980eb63adc5dff89d17a74dd719e9059a2c28a5568548d850a94fc6597"
     },
     {
       "path": "crates/fullmag-session/src/store.rs",
@@ -156,11 +156,11 @@
     },
     {
       "path": "docker/all-in-one/runtime_service.py",
-      "sha256": "d5a4dd44e37f2f0b10b1ca2453d3b8f1cc8a5582d71fcaee84a1353b86cce67f"
+      "sha256": "dcce5023cfe4e4018cf1e2f281dc7a81a0cafa51f58a5236d3c880037707075b"
     },
     {
       "path": "docs/adr/0061-docker-development-build-and-runtime-container.md",
-      "sha256": "c372f229ada6f25360680cdc4ff840368bc57fa69ca2661f759d2a9b12e662ce"
+      "sha256": "e286f50491f60d765a836b64ef1e42499aaf9afaaf939faef3b0fd72205bde4f"
     },
     {
       "path": "docs/adr/0066-docker-post-build-generation-continuation.md",
@@ -180,7 +180,7 @@
     },
     {
       "path": "scripts/docker_dev.py",
-      "sha256": "ae84d763857e645f50006f9b14ec093420702ef03e8c2604e1e31a6a9984d586"
+      "sha256": "e050f6222fa21c4a60114fdb6ce4d0aff6687fa83e68ebb36c2afebf39f8bca9"
     },
     {
       "path": "scripts/docker_host_ledger.py",
@@ -200,7 +200,7 @@
     },
     {
       "path": "scripts/docker_volume_dev.py",
-      "sha256": "92d20a007d06038f217ed51ecf78dc892d8a3ffca7000a335d72802de5730269"
+      "sha256": "49b4949078820b54ac71dfd613150c88f16a1926efbeb3448d4ec5c42ce9e9f4"
     },
     {
       "path": "scripts/docker_volume_pre_ack_retry.py",

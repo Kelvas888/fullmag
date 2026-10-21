@@ -1,7 +1,7 @@
 # Fullmag master — recovery 3806 i poprawki primitive, 20.10.2026
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 21.10.2026, po checkpointcie H3
+## Aktualny status wdrożenia — 21.10.2026, po źródłowym review H2
 
 Ostatni rzeczywisty build pozostaje na `73e275ce1`: Make exit 0 / 121700 ms,
 pakiet 24 plików / 6161 ms, verify 1564 ms. Backend `f7c035fd` ma
@@ -20,17 +20,19 @@ limity procesu przy ofertach CPU/RAM. Rozszerza istniejący krótki helper;
 pozostają dokładnie dwie stałe usługi aplikacji. Nie zmienia wspólnej polityki.
 Parsery Python/Rust i review źródeł nie zastępują builda ani dowodu runtime.
 
-**H2 pozostaje do wdrożenia:** jawna migracja starej, niezmiennej polityki,
+**H2: protokół i integracja przeszły review kodu oraz kontrolę składni; nie zostały zbudowane ani zastosowane.** Pozostaje migracja starej, niezmiennej polityki,
 z zachowaniem historii oraz koordynacją wszystkich korzystających grup.
-Świeży odczyt wykazał równoległą aktualizację snapshotu inventory: ledger ma
-teraz SHA `04630db439fccb9ecad244f73557f076337e581867783ff7941776370e5c3bda`;
+Odczyt opisany w §66 wykazał równoległą aktualizację snapshotu inventory: ledger miał
+wówczas SHA `04630db439fccb9ecad244f73557f076337e581867783ff7941776370e5c3bda`;
 polityka nadal ma revision 1, CPU 4000, RAM 7 GiB, 14 rezerwacji Released.
 Sam rekord inventory ownera ani Released nie dowodzą braku aktywnego writera.
 Nie nadpisano tej równoległej zmiany. Grupa docker-volume-only ma już inny
 kontener niż przy poprzedniej obserwacji; viewport nadal działa jako unhealthy.
 
 3806 i held04 zachowane. Brak retry04/Compute/Solve/testów oraz nowego
-buildu H0/H1. API, materializacja, mesh i widoczny render **NOT VERIFIED**.
+buildu H0/H1/H2. Zastosowanie H2 wymaga rozszerzenia zgody na bezpieczny
+drain/recovery dwóch innych grup; pytanie pozostaje bez odpowiedzi.
+API, materializacja, mesh i widoczny render **NOT VERIFIED**.
 Browser tool nadal wymaga poprawnej karty HTTP; nie obchodzono odmowy.
 <!-- mx3-current-status:end -->
 
@@ -1943,3 +1945,94 @@ a nie wcześniejszy dokument `3112bce5…`.
 H3 checkpoint jest zakończony; H3 właściwy restart po migracji pozostaje
 niewykonany. H2 nie ma jeszcze wdrożonego protokołu. Master backend pozostaje
 exited1/non-OOM, frontend healthy3198. API/mesh/render **NOT VERIFIED**.
+
+
+## 67. H2 — źródłowy protokół migracji i rzeczywisty preflight
+
+Baza: master `bbf3b2f44a02ed2d8b63bca3a5495e62e8b9c138` (H1).
+Przygotowano v5 ledger z ograniczoną historią polityk i CAS dokładnych poprzednich
+dokumentów. Init marker pozostaje niezmieniony. Migracja zachowuje Released rows,
+proofy, host_id, owner_epoch, rodzinę i mapę GPU oraz node policy. Każdy stary
+wiersz korzysta ze swojej polityki; admission używa bieżącej. Historyczne
+snapshot/order CAS są chronione przed istniejącym GC. Digest recovery wiąże
+historię, zachowując dawne digesty dla pustej historii.
+
+Native initializer dostał jawny tryb przypięty do descriptor SHA; zwykły start
+nie migruje. Po wcześniejszym zastosowaniu zgodna polityka jest adoptowana bez
+mutacji i bez kolejnego revision. Launcher przekazuje zgodę przez istniejący
+receipt i render, a częściowe wznowienie nie może jej poszerzyć. Nie dodano stałej
+usługi, nowego modułu recovery ani publicznego endpointu. Biblioteka przeszła
+review kodu; review integracji również zakończono po poprawkach opisanych niżej.
+Kontrola AST Python i parsera Rust PASS; bez testów, buildu i symulacji.
+To checkpoint źródeł, bez dowodu poprawności runtime.
+
+Wykonano sam odczytowy preflight rzeczywistego Dockera: wynik blocked, bez
+mutacji. Działają dwaj konsumenci `/host-ledger`:
+
+- docker-volume-only: `177b9c65e319b09baf1e94712815c20fa88c9bbf8d26576bdd7d8ff6eca37f0e`;
+- viewport: `bc2c9636ddadf53604d655f072274146323f15faee55e608969733f249d85a33`.
+
+Pierwsza grupa ponownie zmieniła kontener w trakcie prac. Nie zatrzymano żadnej
+obcej grupy i nie zastosowano migracji. Do właściciela viewport wysłano prośbę
+o sprawdzenie możliwości managed stop w granicach jego istniejącej autoryzacji;
+nie jest to nadanie nowej zgody. Właściciel docker-volume-only nadal nieustalony.
+Master frontend i dawne dane pozostały nietknięte. API/mesh/render NOT VERIFIED.
+
+
+### Aktualizacja koordynacji H2
+
+Właściciel viewport potwierdził przez własną inspekcję: backend należy do jego
+zadania, native owner ma stan unknown, receipt failed_outcome_retained,
+api_shutdown=unknown. Dawne zakończenie dzieci nie stanowi pełnego drain.
+Użytkownik w tamtym zadaniu polecił pominąć recovery i wykonać merge;
+właściciel nie ma wcześniejszej zgody na tę dodatkową operację i niczego nie
+zatrzymał. To wymaga jawnego rozszerzenia obecnego zakresu przed zastosowaniem.
+
+Kolejny odczyt Docker potwierdził, że docker-volume-only `177b9c65…` jest już
+healthy (StartedAt 2026-10-21T01:39:44.792884801Z), z procesami fullmag-api,
+fullmag-runtime i dwoma fullmag-api-acc. To działający runtime, a nie osierocony
+kontener po buildzie. Jego źródłem jest istniejący worktree
+`docker-volume-only-implementation-20261018`; właściciel sesji nadal nieustalony.
+Nie wnioskowano o bezczynności z nazwy ani starego wpisu rejestru.
+
+Stare klienty nie odczytają v5. Zezwolenie na migrację musi więc obejmować
+skoordynowane zakończenie pracy/drain obu grup i pozostawienie ich zatrzymanych
+do aktualizacji własnego kodu/obrazu. Nie wolno obiecywać automatycznego
+wznowienia starego pakietu po migracji. Nie kasuje to danych ani worktree.
+Dotychczasowa zgoda na master nie jest zgodą na przerwanie tych dwóch runtime.
+
+
+### Domknięcie źródłowej integracji i dodatkowa blokada adaptera
+
+Review integracji wykryło i poprawiło dwa błędy przed runtime: partial resume
+musi porównać już zapisany host-capacity-publication.json także bez compose.json;
+niepełny inspect bez poprawnej listy Mounts nie może oznaczać braku konsumentów.
+
+Bezpośredni odczyt `_rotate_configuration_generation` wykazał kolejną blokadę:
+zezwalał tylko na zmianę runtime generation. Budżety H0 i polityka H2 zostałyby
+odrzucone już po migracji. Native profile emituje teraz wyłącznie w jawnym trybie
+prywatny dowód zwalidowanych historycznych polityk. Python używa go przy
+kontrolowanej zmianie budżetów i CPU masks. Pozostałe identities/kinds, GPU UUID,
+ścieżki, concurrency, timeouty, previous-config SHA i istniejące owner/recovery
+bramki pozostają wymagane. Nie parsuje samodzielnie niezwalidowanego ledgera.
+Review adaptera zakończono po zawężeniu projekcji budżetu do CPU/RAM.
+Storage i GPU memory muszą pozostać dokładnie takie jak poprzednio.
+Nadal nie zastosowano migracji,
+nie przebudowano obrazu ani aplikacji i nie uruchomiono testów.
+
+
+### Checkpoint źródeł po końcowym review
+
+H2: review biblioteki i integracji zakończone. Poprawione ustalenia: związanie
+częściowego wznowienia z opublikowanym descriptor SHA, odrzucenie niepełnego
+inventory Mounts oraz zachowanie storage_bytes/gpu_memory_bytes przy zmianie
+CPU/RAM. Ponowny wąski review ostatniego hunku: PASS. Kontrola AST trzech
+plików Python i parsera dwóch plików Rust oraz scoped diff check: PASS.
+Manifest źródeł rozszerzono do 54 plików; identyfikuje bajty, bez kwalifikacji
+buildu/runtime. Nie uruchomiono testów ani kompilacji.
+
+Wdrożenie pozostaje zablokowane przez dwóch działających konsumentów wspólnego
+ledgera. Złożone pytanie o rozszerzenie zgody obejmuje ich skoordynowany
+drain/recovery i pozostawienie starych klientów zatrzymanych do aktualizacji.
+Bez odpowiedzi nie zatrzymuje się tych grup ani nie publikuje v5. Backend
+mastera nadal nie udostępnia API; materializacja, mesh i browser są NOT VERIFIED.

@@ -875,6 +875,14 @@ struct DockerHostProfile {
     host_identity: DockerHostIdentity,
     readiness: HostRuntimeReadiness,
     runtime_generation_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capacity_migration: Option<DockerHostCapacityTransition>,
+}
+
+#[derive(Debug, Serialize)]
+struct DockerHostCapacityTransition {
+    descriptor_sha256: String,
+    historical_policies: Vec<HostResourceLedgerPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1031,6 +1039,38 @@ fn docker_host_budget_override() -> Result<Option<(u64, u64)>> {
     )))
 }
 
+fn docker_host_capacity_migration_digest(
+    host_capacity_scope: bool,
+) -> Result<Option<String>> {
+    let Some(migration_digest) =
+        std::env::var_os("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256")
+    else {
+        return Ok(None);
+    };
+    if !host_capacity_scope {
+        bail!("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256 requires a validated Docker host capacity descriptor");
+    }
+    let migration_digest = migration_digest
+        .to_str()
+        .context("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256 must be UTF-8")?;
+    if migration_digest.len() != 64
+        || !migration_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256 must be a lowercase SHA-256 digest");
+    }
+    let descriptor_digest = std::env::var_os("FULLMAG_DOCKER_HOST_CAPACITY_SHA256")
+        .context("validated Docker host capacity is missing its descriptor digest")?;
+    let descriptor_digest = descriptor_digest
+        .to_str()
+        .context("FULLMAG_DOCKER_HOST_CAPACITY_SHA256 must be UTF-8")?;
+    if migration_digest != descriptor_digest {
+        bail!("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256 must exactly match FULLMAG_DOCKER_HOST_CAPACITY_SHA256");
+    }
+    Ok(Some(descriptor_digest.to_owned()))
+}
+
 fn docker_host_cpu_placements(
     allowed_cpu_ids: &BTreeSet<u32>,
     total_cpu_millis: u64,
@@ -1082,6 +1122,8 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     let args = parse_docker_host_init_args(args)?;
     let host_capacity_scope =
         fullmag_runtime_control::compute_node_probe::docker_host_capacity_is_configured()?;
+    let capacity_migration_descriptor_sha256 =
+        docker_host_capacity_migration_digest(host_capacity_scope)?;
     if host_capacity_scope && args.ledger_root != PathBuf::from("/host-ledger/ledger") {
         bail!("Docker root capacity requires the canonical shared /host-ledger/ledger");
     }
@@ -1293,6 +1335,49 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
             std::env::var_os("FULLMAG_STATE_ROOT").map(PathBuf::from),
         )?
         .context("Docker host initialization requires explicit FULLMAG_STATE_ROOT")?;
+    let policy = if capacity_migration_descriptor_sha256.is_some() {
+        let (existing, pins) = fullmag_runtime_control::retry_store_writer_busy(|| {
+            HostResourceLedger::inspect_capacity_migration_for_application(
+                &application_state_root,
+                &args.ledger_root,
+                &policy,
+            )
+        })?;
+        let existing_policy = existing.policy().clone();
+        let mut next_policy = policy.clone();
+        next_policy.revision = existing_policy.revision;
+        if next_policy == existing_policy {
+            existing_policy
+        } else {
+            next_policy.revision = existing_policy
+                .revision
+                .checked_add(1)
+                .context("Docker host capacity policy revision overflowed")?;
+            let (_migrated, receipt) = fullmag_runtime_control::retry_store_writer_busy(|| {
+                existing.migrate_capacity_with_readiness(
+                    next_policy.clone(),
+                    persisted_readiness.clone(),
+                    &pins,
+                )
+            })?;
+            eprintln!(
+                "{}",
+                serde_json::to_string(&receipt)
+                    .context("serialize Docker host capacity migration receipt")?
+            );
+            next_policy
+        }
+    } else if host_capacity_scope {
+        fullmag_runtime_control::retry_store_writer_busy(|| {
+            HostResourceLedger::bind_measured_capacity_policy_for_application(
+                &application_state_root,
+                &args.ledger_root,
+                policy.clone(),
+            )
+        })?
+    } else {
+        policy
+    };
     let policy_diagnostic = serde_json::to_string(&policy)
         .context("serialize probed Docker host policy")?;
     let ledger = fullmag_runtime_control::retry_store_writer_busy(|| {
@@ -1476,6 +1561,15 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
             Vec::new()
         }
     };
+    let capacity_migration = match capacity_migration_descriptor_sha256 {
+        Some(descriptor_sha256) => Some(DockerHostCapacityTransition {
+            descriptor_sha256,
+            historical_policies: fullmag_runtime_control::retry_store_writer_busy(|| {
+                ledger.capacity_policy_history()
+            })?,
+        }),
+        None => None,
+    };
     let profile = DockerHostProfile {
         schema_version: match args.device_access {
             DockerHostDeviceAccess::Cpu => "fullmag.docker-host-profile.v2",
@@ -1500,6 +1594,7 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         },
         readiness: persisted_readiness,
         runtime_generation_sha256,
+        capacity_migration,
     };
     let bytes = serde_json::to_vec(&profile)?;
     if bytes.len() > 256 * 1024 {

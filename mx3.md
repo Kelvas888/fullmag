@@ -1,7 +1,7 @@
 # MX3 — audyt frontendu i runtime symulacji Fullmag
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 21.10.2026, po checkpointcie H3
+## Aktualny status wdrożenia — 21.10.2026, po źródłowym review H2
 
 Ostatni rzeczywisty build pozostaje na `73e275ce1`: Make exit 0 / 121700 ms,
 pakiet 24 plików / 6161 ms, verify 1564 ms. Backend `f7c035fd` ma
@@ -20,17 +20,19 @@ limity procesu przy ofertach CPU/RAM. Rozszerza istniejący krótki helper;
 pozostają dokładnie dwie stałe usługi aplikacji. Nie zmienia wspólnej polityki.
 Parsery Python/Rust i review źródeł nie zastępują builda ani dowodu runtime.
 
-**H2 pozostaje do wdrożenia:** jawna migracja starej, niezmiennej polityki,
+**H2: protokół i integracja przeszły review kodu oraz kontrolę składni; nie zostały zbudowane ani zastosowane.** Pozostaje migracja starej, niezmiennej polityki,
 z zachowaniem historii oraz koordynacją wszystkich korzystających grup.
-Świeży odczyt wykazał równoległą aktualizację snapshotu inventory: ledger ma
-teraz SHA `04630db439fccb9ecad244f73557f076337e581867783ff7941776370e5c3bda`;
+Odczyt opisany w §66 wykazał równoległą aktualizację snapshotu inventory: ledger miał
+wówczas SHA `04630db439fccb9ecad244f73557f076337e581867783ff7941776370e5c3bda`;
 polityka nadal ma revision 1, CPU 4000, RAM 7 GiB, 14 rezerwacji Released.
 Sam rekord inventory ownera ani Released nie dowodzą braku aktywnego writera.
 Nie nadpisano tej równoległej zmiany. Grupa docker-volume-only ma już inny
 kontener niż przy poprzedniej obserwacji; viewport nadal działa jako unhealthy.
 
 3806 i held04 zachowane. Brak retry04/Compute/Solve/testów oraz nowego
-buildu H0/H1. API, materializacja, mesh i widoczny render **NOT VERIFIED**.
+buildu H0/H1/H2. Zastosowanie H2 wymaga rozszerzenia zgody na bezpieczny
+drain/recovery dwóch innych grup; pytanie pozostaje bez odpowiedzi.
+API, materializacja, mesh i widoczny render **NOT VERIFIED**.
 Browser tool nadal wymaga poprawnej karty HTTP; nie obchodzono odmowy.
 <!-- mx3-current-status:end -->
 

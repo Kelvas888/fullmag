@@ -638,19 +638,82 @@ def _verify_host_ledger_volume(control, operation, descriptor, image):
     docker_capture("rm", actual["Id"])
 
 
-def _host_ledger(control, operation, layout, selected, image, *, new_render=False):
+def _assert_host_capacity_migration_quiescent():
+    """A shared policy change requires coordinated, stopped ledger consumers.
+
+    This is a read-only preflight. The native writer and owner lock still
+    decide quiescence at publication; a Docker observation is not that proof.
+    """
+    listing = bounded_capture(
+        docker_argv("ps", "--all", "--no-trunc", "--format", "{{.ID}}"),
+        timeout=30, maximum=1024 * 1024,
+    )
+    if listing.returncode:
+        raise BuildControlError("Cannot observe ledger consumers before host capacity migration")
+    identifiers = listing.stdout.decode("ascii").splitlines()
+    if (len(identifiers) > 4096 or len(set(identifiers)) != len(identifiers)
+            or any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in identifiers)):
+        raise BuildControlError("Docker consumer inventory is malformed or exceeds its bound")
+    blockers = []
+    for offset in range(0, len(identifiers), 32):
+        batch = identifiers[offset:offset + 32]
+        result = bounded_capture(
+            docker_argv("inspect", *batch), timeout=30, maximum=8 * 1024 * 1024,
+        )
+        if result.returncode:
+            raise BuildControlError("Docker consumer inventory changed; coordinate and retry observation")
+        records = json.loads(result.stdout)
+        if (not isinstance(records, list) or len(records) != len(batch)
+                or any(not isinstance(item, dict) for item in records)
+                or {item.get("Id") for item in records} != set(batch)):
+            raise BuildControlError("Docker consumer inspection differs from its inventory")
+        for item in records:
+            mounts = item.get("Mounts")
+            if (not isinstance(mounts, list)
+                    or any(not isinstance(mount, dict)
+                           or not isinstance(mount.get("Destination"), str) for mount in mounts)):
+                raise BuildControlError("Docker consumer inspection has an unknown mount inventory")
+            if not any(mount["Destination"] == "/host-ledger" for mount in mounts):
+                continue
+            running = item.get("State", {}).get("Running")
+            if type(running) is not bool:
+                raise BuildControlError("Ledger consumer has an unknown running state")
+            if running:
+                blockers.append(str(item.get("Name", item["Id"])) + " (" + item["Id"] + ")")
+    if blockers:
+        raise BuildControlError(
+            "Host capacity migration requires coordinated stop of ledger consumers: "
+            + ", ".join(blockers)
+        )
+
+
+def _host_ledger(control, operation, layout, selected, image, *, new_render=False,
+                 migrate_capacity=False):
     import docker_host_ledger as ledger
     scope = operation["receipt"].get("host_capacity_scope")
+    migrate = operation["receipt"].get("host_capacity_migration", False)
+    if type(migrate) is not bool or type(migrate_capacity) is not bool:
+        raise BuildControlError("Host capacity migration intent is invalid")
     if scope not in (None, "docker_vm_root"):
         raise BuildControlError("Retained host capacity scope is invalid")
     if new_render:
         # Pin the intent in the existing receipt before any fallible helper or
         # Compose work. An interrupted first render must not resume as legacy.
         scope = operation["receipt"]["host_capacity_scope"] = "docker_vm_root"
+        migrate = operation["receipt"]["host_capacity_migration"] = migrate_capacity
         control.write(operation["root"] + "/receipt.json", operation["receipt"])
+    elif migrate_capacity and not migrate:
+        raise BuildControlError("Partial resume cannot add a new host capacity migration intent")
+    if migrate:
+        if scope != "docker_vm_root":
+            raise BuildControlError("Host capacity migration requires pinned root/VM capacity")
+        _assert_host_capacity_migration_quiescent()
     values = ledger._resolve_values(layout)
     prior_environment = None
     prior_backend_environment = None
+    prior_capacity_publication = control.read(
+        operation["root"] + "/host-capacity-publication.json", optional=True
+    )
     publish_capacity = scope == "docker_vm_root"
     if not new_render:
         prior_spec = control.read(operation["root"] + "/ledger-maintenance-compose.json", optional=True)
@@ -685,6 +748,11 @@ def _host_ledger(control, operation, layout, selected, image, *, new_render=Fals
                     raise BuildControlError("Retained backend capacity binding is invalid")
             if bool(old_sha) != publish_capacity:
                 raise BuildControlError("Retained application and maintenance capacity settings differ")
+            old_migration = prior_backend_environment.get("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256")
+            if bool(old_migration) != migrate or (migrate and old_migration != old_sha):
+                raise BuildControlError("Retained backend host capacity migration intent differs")
+    if prior_capacity_publication is not None and not publish_capacity:
+        raise BuildControlError("Legacy resume cannot retain a host capacity publication")
     fresh_capacity = publish_capacity and (new_render or prior_environment is None)
     daemon = ledger._daemon_info(docker_text, include_capacity=fresh_capacity)
     if publish_capacity and not fresh_capacity:
@@ -949,6 +1017,9 @@ def _host_ledger(control, operation, layout, selected, image, *, new_render=Fals
                 or descriptor.get("docker_memory_total_bytes") != int(env["FULLMAG_HOST_LEDGER_DOCKER_MEMORY_TOTAL_BYTES"])):
             raise BuildControlError("Host capacity publication identity or digest differs")
         capacity_publication = dict(capacity_publication)
+        if (prior_capacity_publication is not None
+                and prior_capacity_publication != capacity_publication):
+            raise BuildControlError("Retained host capacity publication changed during partial resume")
         control.write(operation["root"] + "/host-capacity-publication.json", capacity_publication)
         backend_environment = rendered["services"]["backend"].get("environment")
         if not isinstance(backend_environment, dict):
@@ -959,6 +1030,8 @@ def _host_ledger(control, operation, layout, selected, image, *, new_render=Fals
                 raise BuildControlError("Retained backend capacity binding changed during partial resume")
         backend_environment["FULLMAG_DOCKER_HOST_CAPACITY_PATH"] = expected_capacity_path
         backend_environment["FULLMAG_DOCKER_HOST_CAPACITY_SHA256"] = descriptor_sha
+        if migrate:
+            backend_environment["FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256"] = descriptor_sha
     control.write(operation["root"] + "/ledger-helper-log.json",
                   {"log": docker_text("logs", name, combined=True)})
     docker_capture("rm", observed[0]["Id"])
@@ -1188,6 +1261,8 @@ def _start_compose_services(control, operation, document):
     configured = json.loads(compose_capture(document, "config", "--format", "json", timeout=60))
     if configured.get("name") != control.project or set(configured.get("services", {})) != {"backend", "frontend"}:
         raise BuildControlError("DEV Compose preflight changed the selected group or services")
+    if operation["receipt"].get("host_capacity_migration") is True:
+        _assert_host_capacity_migration_quiescent()
     operation["receipt"]["compose_preflight"] = "PASS"
     operation["daemon_pending"] = True
     compose_capture(document, "up", "--detach", "--no-build", "--pull", "never", timeout=180)
@@ -1352,6 +1427,10 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             "volume": provided_control.volume,
         }
     _assert_no_running_fullmag(identity["project_name"], identity, **admission_context)
+    if (getattr(args, "migrate_host_capacity", False)
+            or (provided_operation is not None
+                and provided_operation["receipt"].get("host_capacity_migration") is True)):
+        _assert_host_capacity_migration_quiescent()
     runtime.assert_loopback_port_available(args.port, identity["project_name"])
     if args.profile != "dev":
         raise BuildControlError("Volume DEV supports backend-dev; release uses its explicit managed recipe")
@@ -1540,7 +1619,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         operation["receipt"]["backend_volumes"] = cache["volume_names"]
         frontend_inputs, frontend_volume = _frontend(control, operation, selected, state, args.port, image)
         ledger_backend, ledger_profile = _host_ledger(
-            control, operation, layout, selected, image, new_render=provided_operation is None
+            control, operation, layout, selected, image, new_render=provided_operation is None,
+            migrate_capacity=bool(getattr(args, "migrate_host_capacity", False)),
         )
         inputs = {"image_id": image, "toolchain_image_id": toolchain["image_id"],
                   "guest_provenance_path": "/opt/fullmag/control/backend/runtime-provenance.json"}
@@ -2982,6 +3062,8 @@ def stop_idle(args):
 
 
 def recreate(args):
+    if getattr(args, "migrate_host_capacity", False):
+        _assert_host_capacity_migration_quiescent()
     return _retained_operation(args, recreate_services=True)
 
 
@@ -2989,6 +3071,8 @@ def resume_recreation(args):
     """Resume only the exact successful recreation whose app IDs are absent."""
     if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "resume_recreation", ""))):
         raise BuildControlError("--resume-recreation requires one exact operation UUID")
+    if getattr(args, "migrate_host_capacity", False):
+        _assert_host_capacity_migration_quiescent()
     if (
         getattr(args, "fresh_state", False)
         or getattr(args, "script", None) is not None

@@ -2576,6 +2576,10 @@ def _parser() -> argparse.ArgumentParser:
     recreate_volume.add_argument("--source-root", type=Path, required=True)
     recreate_volume.add_argument("--port", type=int, required=True)
     recreate_volume.add_argument(
+        "--migrate-host-capacity", action="store_true",
+        help="explicitly migrate quiescent shared host capacity when rendering the replacement services",
+    )
+    recreate_volume.add_argument(
         "--resume-recreation",
         metavar="OPERATION_UUID",
         help="resume only the exact succeeded recreate-services operation after its app containers were removed",
@@ -2634,6 +2638,10 @@ def _parser() -> argparse.ArgumentParser:
                              help="loopback frontend port (up only)")
         command.add_argument("--script", "--startup-script", dest="script", type=Path,
                              help="optional simulation script, relative to the selected checkout or absolute inside it (up only)")
+        command.add_argument(
+            "--migrate-host-capacity", action="store_true",
+            help="explicitly migrate quiescent shared host capacity when rendering new services",
+        )
         if name == "build":
             command.set_defaults(script=None)
     codegen_parser = subparsers.add_parser(
