@@ -52,6 +52,12 @@ urządzenia zatrzymuje start. Wolumen wskazuje ten sam istniejący filesystem,
 nie tworzy nowego ledgeru. Mechanizm sterownika jest opisany w
 [dokumentacji Docker](https://docs.docker.com/engine/storage/volumes/#how-mounting-block-devices-works).
 
+Frontend Linux/WSL obserwuje źródła natywnie (`watch_mode: native`), gdy mount
+`/opt/fullmag/source` leży na ext4, xfs albo btrfs: zdarzenia inotify docierają
+z bind mountu do kontenera, więc Watchpack nie odpytuje drzewa. Windows
+zachowuje polling, bo bind 9p nie dostarcza zdarzeń. Checkout DEV na ext4 w WSL
+usuwa też koszt 9p z capture i synchronizacji źródeł backendu.
+
 ## Obowiązki i weryfikacja
 
 Adapter klienta i host paths: `docker_dev_host.py`; build kontrolny:

@@ -101,9 +101,11 @@ describe("control-room Next dev proxy config", () => {
     expect(webpack).toBeTypeOf("function");
     const originalMode = process.env.FULLMAG_DOCKER_FRONTEND;
     const originalPolling = process.env.WATCHPACK_POLLING;
+    const originalWatchMode = process.env.FULLMAG_WATCHPACK_MODE;
     try {
       process.env.FULLMAG_DOCKER_FRONTEND = "dev";
       delete process.env.WATCHPACK_POLLING;
+      delete process.env.FULLMAG_WATCHPACK_MODE;
       const dockerDevConfig = webpack?.(
         { watchOptions: { ignored: /\.git/ } } as never,
         { dev: true } as never,
@@ -129,7 +131,22 @@ describe("control-room Next dev proxy config", () => {
       } else {
         process.env.WATCHPACK_POLLING = originalPolling;
       }
+      if (originalWatchMode === undefined) {
+        delete process.env.FULLMAG_WATCHPACK_MODE;
+      } else {
+        process.env.FULLMAG_WATCHPACK_MODE = originalWatchMode;
+      }
     }
+  });
+
+  it("watches natively without polling when the launcher selects native mode", () => {
+    const native = resolveDockerDevWatchOptions(/\.git/, "5000", "native");
+    expect(native.poll).toBeUndefined();
+    expect(native.ignored).toBeInstanceOf(RegExp);
+    expect(resolveDockerDevWatchOptions(undefined, "5000", "polling").poll).toBe(5000);
+    expect(() => resolveDockerDevWatchOptions(undefined, "5000", "inotify")).toThrow(
+      /FULLMAG_WATCHPACK_MODE/,
+    );
   });
 
   it("uses the managed export child so Next cleans storage instead of a repo directory", () => {
