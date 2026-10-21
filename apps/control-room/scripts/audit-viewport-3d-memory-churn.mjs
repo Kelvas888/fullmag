@@ -29,6 +29,32 @@ const apiBase =
 // throughput at production field sizes. Keep the fixture dense enough to
 // exercise every pass while bounded enough for 120 rendered transitions in CI.
 const FIELD_GRID = [24, 16, 2];
+const FDM_DOMAIN_ORIGIN = [-6e-7, -4e-7, -1e-7];
+const FDM_DOMAIN_SPACING = [1.25e-8, 1.25e-8, 5e-8];
+const FDM_DOMAIN_BOUNDS_MIN = Object.freeze([...FDM_DOMAIN_ORIGIN]);
+const FDM_DOMAIN_BOUNDS_MAX = Object.freeze(
+  FIELD_GRID.map(
+    (count, axis) =>
+      FDM_DOMAIN_ORIGIN[axis] + count * FDM_DOMAIN_SPACING[axis],
+  ),
+);
+const FDM_GRID_FINGERPRINT = "0".repeat(64);
+const FDM_MEMBERSHIP_ENDPOINT =
+  "/v2/sessions/current/data/fdm-region-membership";
+const FDM_MEMBERSHIP_BINARY_PATH = "mesh/fdm_region_membership.v2.bin";
+const FDM_FMRM_HEADER_BYTES = 64;
+const FDM_FMRM_WORD_BYTES = 4;
+const FDM_MEMORY_OBJECT_ID = "fdm-core";
+const FDM_MEMORY_REGION_ID = "fdm-core:core";
+const FDM_FMRM_INACTIVE_REGION_ID = 0xffff_ffff;
+const FDM_MEMORY_SUPPORT_RANGE = Object.freeze({
+  xStart: 4,
+  xEnd: 20,
+  yStart: 3,
+  yEnd: 13,
+  zStart: 0,
+  zEnd: 2,
+});
 const FDM_PARTIAL_LAYER_ID = "layer:partial";
 const FDM_DENSE_LAYER_ID = "layer:dense";
 const FDM_MULTILAYER_LAYOUT_REVISION = 7;
@@ -46,6 +72,52 @@ const QUANTITY_SEQUENCE = Array.from(
 const WARM_QUANTITIES = ["m", "H_eff", "H_demag", "H_ex"];
 const MAX_HEAP_GROWTH_BYTES = 25 * 1024 * 1024;
 const QUANTITY_SWITCH_TIMEOUT_MS = 20_000;
+const CAPTURE_SETTLE_TIMEOUT_MS = 5_000;
+const UNMOUNT_SETTLE_TIMEOUT_MS = 10_000;
+const UNMOUNT_RESOURCE_STABLE_SAMPLES = 3;
+const VIEWPORT_2D_MOUNT_TIMEOUT_MS = 10_000;
+// Warm every pass combination exercised by QUANTITY_SEQUENCE once per field
+// quantity. The stress loop has three independent binary layer predicates, so
+// these indices are one representative for each of its 2^3 combinations.
+const WARMUP_STYLE_INDICES = [20, 4, 5, 1, 0, 12, 15, 3];
+const WARMUP_STYLES = Object.freeze(
+  WARMUP_STYLE_INDICES.map((index) => ({
+    colorMode: index % 2 === 0 ? "magnitude" : "orientation",
+    fieldComponent: index % 2 === 0 ? "x" : "magnitude",
+    id: `stress-style-${index}`,
+    pointsVisible: index % 3 === 0,
+    vectorsVisible: index % 4 !== 0,
+    wireframeVisible: index % 5 !== 0,
+  })),
+);
+// The three explicit shader checks run after stress index 119, whose layer
+// mask is points=false, vectors=true, wireframe=true.
+const WARMUP_SHADER_STYLES = Object.freeze([
+  {
+    colorMode: "magnitude",
+    fieldComponent: "magnitude",
+    id: "shader-scalar",
+    pointsVisible: false,
+    vectorsVisible: true,
+    wireframeVisible: true,
+  },
+  {
+    colorMode: "orientation",
+    fieldComponent: "magnitude",
+    id: "shader-orientation",
+    pointsVisible: false,
+    vectorsVisible: true,
+    wireframeVisible: true,
+  },
+  {
+    colorMode: "magnitude",
+    fieldComponent: "x",
+    id: "shader-component",
+    pointsVisible: false,
+    vectorsVisible: true,
+    wireframeVisible: true,
+  },
+]);
 const injectDroppedPublication =
   process.env.CONTROL_ROOM_AUDIT_INJECT_DROPPED_PUBLICATION === "1";
 const injectBlankScene = process.env.CONTROL_ROOM_AUDIT_INJECT_BLANK_SCENE === "1";
@@ -94,6 +166,13 @@ const topologyRequests = [];
 const auditedRequests = [];
 const fixture = createFdmFixture();
 let auditActive = false;
+const gpuCheckpoints = [];
+let coldBaseline = null;
+let coldWarmup = null;
+let firstUnmount = null;
+let first2DLayout = null;
+let final2DLayout = null;
+let steadyWarmup = null;
 
 await installFdmFixtureApi(page, fixture, fixtureRequests);
 await installBrowserAuditInstrumentation(page);
@@ -155,34 +234,39 @@ try {
   auditLog("waiting for render diagnostics");
   await waitForDiagnostics(viewport);
 
-  for (const quantity of WARM_QUANTITIES) {
-    auditLog("warming quantity", quantity);
-    await withTimeout(
-      setGlobalQuantity(page, fixture, fixtureRequests, quantity, {
-        allowExistingFieldRequest: true,
-        // The production-like no-session fixture may already have the selected
-        // field in its browser resource cache during bootstrap.
-        requireFieldRequest: false,
-      }),
-      QUANTITY_SWITCH_TIMEOUT_MS,
-      `Timed out warming viewport quantity ${quantity}.`,
-    );
-  }
-  await page.waitForTimeout(500);
+  auditLog("warming cold allocation paths");
+  coldWarmup = await warmViewportForChurn(
+    page,
+    fixture,
+    fixtureRequests,
+    viewport,
+  );
 
-  auditLog("reading baseline diagnostics");
-  const baseline = {
+  auditLog("reading cold allocation baseline diagnostics");
+  coldBaseline = {
     diagnostics: await readDiagnostics(viewport),
     gpu: await readBrowserAuditCounters(page),
     runtime: await readViewportAuditRuntime(page),
     heapBytes: await readJsHeapBytes(cdp),
   };
-  rawPerformanceTrace.push(await captureViewportPerformanceSnapshot(page, "baseline"));
+  gpuCheckpoints.push(makeGpuCheckpoint("cold-baseline", coldBaseline.gpu));
+  rawPerformanceTrace.push(
+    await captureViewportPerformanceSnapshot(page, "cold-baseline"),
+  );
 
   await page.locator('[data-action-id="ws-2d"]').click();
   await page.locator(".fm-viewport-3d canvas").waitFor({ state: "detached", timeout: 10_000 });
-  await page.waitForTimeout(1_000);
-  const unmountedBaselineRuntime = await readViewportAuditRuntime(page);
+  first2DLayout = await waitForComparable2DViewport(
+    page,
+    "cold 2D viewport mount",
+    { expectedCompanionModuleId: null },
+  );
+  firstUnmount = await waitForViewportUnmountSettled(
+    page,
+    "cold viewport unmount",
+  );
+  gpuCheckpoints.push(makeGpuCheckpoint("after-first-unmount", firstUnmount.gpu));
+  const unmountedBaselineRuntime = firstUnmount.runtime;
   const viewport3DMenuItem = page.getByRole("menuitem", { name: "3D viewport" });
   if (await viewport3DMenuItem.isVisible()) {
     await viewport3DMenuItem.click();
@@ -195,6 +279,43 @@ try {
   await canvas.waitFor({ state: "visible", timeout: 10_000 });
   await page.keyboard.press("Escape");
   await waitForDiagnostics(viewport);
+  auditLog("warming steady-state remount paths");
+  steadyWarmup = await warmViewportForChurn(
+    page,
+    fixture,
+    fixtureRequests,
+    viewport,
+  );
+  // The full warmup ends at H_ex/stress-style-3. Normalize the lifecycle
+  // checkpoint to the same m/component-x/layer footprint reached by the final
+  // shader pass before taking the live-buffer baseline.
+  const lifecycleBaselineStyle =
+    WARMUP_SHADER_STYLES[WARMUP_SHADER_STYLES.length - 1];
+  advanceVisualizationState(fixture, "m", lifecycleBaselineStyle);
+  const lifecycleBaselineGpuBefore = await readBrowserAuditCounters(page);
+  await publishVisualizationStateAndWait(
+    page,
+    fixture,
+    viewport,
+    "m",
+    lifecycleBaselineGpuBefore,
+  );
+  auditLog("reading steady-state baseline diagnostics");
+  // Keep coldBaseline and firstUnmount as independent remount evidence. The
+  // lifecycle threshold below uses only this post-remount steady baseline.
+  const baseline = {
+    diagnostics: await readDiagnostics(viewport),
+    gpu: await readBrowserAuditCounters(page),
+    runtime: await readViewportAuditRuntime(page),
+    heapBytes: await readJsHeapBytes(cdp),
+  };
+  const baselineLifecycleState = lifecycleVisualizationState(
+    fixture.visualizationState,
+  );
+  gpuCheckpoints.push(makeGpuCheckpoint("steady-baseline", baseline.gpu));
+  rawPerformanceTrace.push(
+    await captureViewportPerformanceSnapshot(page, "steady-baseline"),
+  );
   if (injectListenerLeak) {
     await page.evaluate(() => window.__FULLMAG_CONTROL_ROOM_AUDIT__?.injectViewportAuditListenerLeak());
   }
@@ -213,32 +334,19 @@ try {
     if (index % 12 === 0) {
       auditLog("switching cached quantity batch", `${index + 1}-${index + 12}`);
     }
-    fixture.visualizationState = applyPatch(fixture.visualizationState, {
-      active_quantity_id: quantity,
-      field_component: index % 2 === 0 ? "x" : "magnitude",
-      layers: {
-        points: { visible: index % 3 === 0 },
-        vectors: { visible: index % 4 !== 0 },
-        wireframe: { visible: index % 5 !== 0 },
-      },
-      quantity: {
-        active_quantity_id: quantity,
-        field_component: index % 2 === 0 ? "x" : "magnitude",
-      },
-      vector_style: {
-        color_mode: index % 2 === 0 ? "magnitude" : "orientation",
-      },
+    advanceVisualizationState(fixture, quantity, {
+      colorMode: index % 2 === 0 ? "magnitude" : "orientation",
+      fieldComponent: index % 2 === 0 ? "x" : "magnitude",
+      pointsVisible: index % 3 === 0,
+      vectorsVisible: index % 4 !== 0,
+      wireframeVisible: index % 5 !== 0,
     });
-    fixture.visualizationState.revision += 1;
-    fixture.status.resources.visualization_state_revision =
-      fixture.visualizationState.revision;
     const beforePublicationGpu = await readBrowserAuditCounters(page);
+    const ackStart = fixture.visualizationAcks.length;
     await page.evaluate(async ({ state, drop }) => {
       const hook = window.__FULLMAG_CONTROL_ROOM_AUDIT__;
       if (!hook) throw new Error("Fullmag browser audit hook is not installed.");
       if (!drop) hook.publishVisualizationState(state);
-      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
-      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
     }, { drop: injectDroppedPublication && index === 0, state: fixture.visualizationState });
     await assertPublicationRendered(
       page,
@@ -247,8 +355,16 @@ try {
       fixture.visualizationState.revision,
       beforePublicationGpu,
     );
+    await waitForCaptureSettled(
+      page,
+      fixture,
+      viewport,
+      quantity,
+      fixture.visualizationState.revision,
+      beforePublicationGpu,
+      { ackStart, ...getVisualizationAckIdentity(fixture) },
+    );
   }
-  await page.waitForTimeout(500);
   const quantitySwitchPerformanceAfter = await captureViewportPerformanceSnapshot(
     page,
     "quantity-switch-after",
@@ -330,12 +446,32 @@ try {
     await clearViewportCanvas(page);
     await assertCanvasHasFidelity(page);
   }
-  const shaderSignatures = await collectStableShaderSignatures(page, fixture, viewport);
+  const shaderRun = await collectStableShaderSignatures(page, fixture, viewport);
+  const shaderSignatures = shaderRun.signatures;
+  await waitForFinalCaptureSettled(
+    page,
+    fixture,
+    viewport,
+    "m",
+    shaderRun.lastRevision,
+  );
+  const afterStressLifecycleState = lifecycleVisualizationState(
+    fixture.visualizationState,
+  );
+  if (
+    JSON.stringify(afterStressLifecycleState) !==
+    JSON.stringify(baselineLifecycleState)
+  ) {
+    throw new Error(
+      `GPU lifecycle checkpoints used different visualization footprints: baseline=${JSON.stringify(baselineLifecycleState)}, afterStress=${JSON.stringify(afterStressLifecycleState)}.`,
+    );
+  }
   await page.screenshot({ path: path.join(auditArtifactsDirectory, "settled-3d.png") });
   if (injectGpuBufferLeak) {
     await injectViewportGpuBufferLeak(page);
   }
   const gpuAfterStress = await readBrowserAuditCounters(page);
+  gpuCheckpoints.push(makeGpuCheckpoint("after-stress", gpuAfterStress));
   const baselineLiveBuffers =
     baseline.gpu.buffersCreated - baseline.gpu.buffersDeleted;
   const stressLiveBuffers =
@@ -354,9 +490,20 @@ try {
   }
   await page.locator('[data-action-id="ws-2d"]').click();
   await page.locator(".fm-viewport-3d canvas").waitFor({ state: "detached", timeout: 10_000 });
-  await page.waitForTimeout(1_000);
-  const afterUnmount = await readBrowserAuditCounters(page);
-  const afterUnmountRuntime = await readViewportAuditRuntime(page);
+  final2DLayout = await waitForComparable2DViewport(
+    page,
+    "final 2D viewport mount",
+    { expectedCompanionModuleId: null },
+  );
+  assertComparable2DViewportLayout(first2DLayout, final2DLayout);
+  const finalUnmount = await waitForViewportUnmountSettled(
+    page,
+    "final viewport unmount",
+    unmountedBaselineRuntime,
+  );
+  const afterUnmount = finalUnmount.gpu;
+  const afterUnmountRuntime = finalUnmount.runtime;
+  gpuCheckpoints.push(makeGpuCheckpoint("after-final-unmount", afterUnmount));
   rawPerformanceTrace.push(await captureViewportPerformanceSnapshot(page, "after-unmount"));
   assertViewportPerformanceTrace(rawPerformanceTrace);
   if (afterUnmount.buffersDeleted < gpuAfterStress.buffersDeleted) {
@@ -383,10 +530,21 @@ try {
     after,
     afterUnmount,
     afterUnmountRuntime,
+    afterStressLifecycleState,
     baseline,
+    baselineLifecycleState,
+    coldBaseline,
+    coldWarmup,
+    firstUnmount,
+    first2DLayout,
+    final2DLayout,
+    gpuCheckpoints,
     unmountedBaselineRuntime,
+    steadyWarmup,
+    visualizationAckIdentity: fixture.visualizationIdentity,
     shaderSignatures,
     fixtureRequests,
+    visualizationAckSummary: summarizeVisualizationAcks(fixture.visualizationAcks),
     gpuAfterStress,
     idle,
     idleRequests,
@@ -416,6 +574,12 @@ try {
     fieldRequests,
     fixtureRequests,
     topologyRequests,
+    gpuCheckpoints,
+    coldBaseline,
+    coldWarmup,
+    steadyWarmup,
+    first2DLayout,
+    final2DLayout,
   });
   throw error;
 } finally {
@@ -426,6 +590,17 @@ try {
 
 async function assertCanvasHasFidelity(page) {
   const canvas = page.locator(".fm-viewport-3d canvas");
+  const drawingBuffer = await canvas.evaluate((element) => {
+    const context = element.getContext("webgl2") ?? element.getContext("webgl");
+    return {
+      contextLost: context?.isContextLost() ?? true,
+      width: context?.drawingBufferWidth ?? 0,
+      height: context?.drawingBufferHeight ?? 0,
+    };
+  });
+  if (drawingBuffer.contextLost || drawingBuffer.width <= 0 || drawingBuffer.height <= 0) {
+    throw new Error("Viewport fidelity gate requires a live WebGL context and nonzero drawing buffer.");
+  }
   const box = await canvas.boundingBox();
   if (!box || box.width <= 0 || box.height <= 0) {
     throw new Error("Viewport fidelity gate could not measure the WebGL canvas.");
@@ -496,6 +671,455 @@ async function assertPublicationRendered(page, viewport, quantityId, revision, b
     2_000,
     `Audit publication r${revision} (${quantityId}) was not observed by the mounted viewport.`,
   );
+}
+
+async function waitForCaptureSettled(
+  page,
+  fixture,
+  viewport,
+  quantityId,
+  revision,
+  beforeGpu,
+  { ackStart, clientId, viewportId } = {},
+) {
+  const knownIdentity = getVisualizationAckIdentity(fixture);
+  const expectedClientId = clientId ?? knownIdentity.clientId;
+  const expectedViewportId = viewportId ?? knownIdentity.viewportId;
+  await waitForCondition(
+    async () => {
+      const matchingAck = [...fixture.visualizationAcks]
+        .slice(ackStart ?? 0)
+        .reverse()
+        .find(
+          (ack) =>
+            Number(ack?.revision) === Number(revision) &&
+            typeof ack?.client_id === "string" &&
+            typeof ack?.viewport_id === "string" &&
+            (expectedClientId === undefined ||
+              ack.client_id === expectedClientId) &&
+            (expectedViewportId === undefined ||
+              ack.viewport_id === expectedViewportId),
+        );
+      if (matchingAck) {
+        pinVisualizationAckIdentity(fixture, matchingAck);
+      }
+      if (matchingAck?.status === "failed") {
+        throw new Error(
+          "Viewport render adoption failed for revision " +
+            revision +
+            ": " +
+            JSON.stringify(matchingAck) +
+            ".",
+        );
+      }
+      const diagnostics = await readDiagnostics(viewport);
+      const runtime = await readViewportAuditRuntime(page);
+      const gpu = await readBrowserAuditCounters(page);
+      return (
+        matchingAck?.status === "rendered" &&
+        !matchingAck.error &&
+        String(runtime.visualizationRevision) === String(revision) &&
+        isCaptureDiagnosticsReady(diagnostics, quantityId) &&
+        Number(runtime.workers?.jobs ?? -1) === 0 &&
+        (gpu.frames > beforeGpu.frames || gpu.drawCalls > beforeGpu.drawCalls)
+      );
+    },
+    CAPTURE_SETTLE_TIMEOUT_MS,
+    `Timed out waiting for rendered ACK, field adoption, and worker settle for visualization revision ${revision}.`,
+  );
+  await waitForFrameBoundary(
+    page,
+    `Timed out waiting for the post-adoption frame boundary for visualization revision ${revision}.`,
+  );
+}
+
+async function waitForFinalCaptureSettled(
+  page,
+  fixture,
+  viewport,
+  quantityId,
+  revision,
+) {
+  const { clientId, viewportId } = requireVisualizationAckIdentity(fixture);
+  await waitForCondition(
+    async () => {
+      const matchingAck = [...fixture.visualizationAcks]
+        .reverse()
+        .find(
+          (ack) =>
+            Number(ack?.revision) === Number(revision) &&
+            ack?.client_id === clientId &&
+            ack?.viewport_id === viewportId,
+        );
+      const diagnostics = await readDiagnostics(viewport);
+      const runtime = await readViewportAuditRuntime(page);
+      return (
+        matchingAck?.status === "rendered" &&
+        !matchingAck.error &&
+        String(runtime.visualizationRevision) === String(revision) &&
+        isCaptureDiagnosticsReady(diagnostics, quantityId) &&
+        Number(runtime.workers?.jobs ?? -1) === 0
+      );
+    },
+    CAPTURE_SETTLE_TIMEOUT_MS,
+    `Timed out waiting for the final rendered ACK and worker settle for visualization revision ${revision}.`,
+  );
+  await waitForFrameBoundary(
+    page,
+    `Timed out waiting for the final post-adoption frame boundary for visualization revision ${revision}.`,
+  );
+}
+
+function getVisualizationAckIdentity(fixture) {
+  const identity = fixture.visualizationIdentity ?? {};
+  return {
+    ...(typeof identity.clientId === "string"
+      ? { clientId: identity.clientId }
+      : {}),
+    ...(typeof identity.viewportId === "string"
+      ? { viewportId: identity.viewportId }
+      : {}),
+  };
+}
+
+function pinVisualizationAckIdentity(fixture, ack) {
+  const clientId = ack?.client_id;
+  const viewportId = ack?.viewport_id;
+  if (typeof clientId !== "string" || typeof viewportId !== "string") {
+    throw new Error(
+      `Rendered ACK for revision ${ack?.revision} did not include client_id and viewport_id.`,
+    );
+  }
+  const knownIdentity = getVisualizationAckIdentity(fixture);
+  if (
+    (knownIdentity.clientId !== undefined &&
+      knownIdentity.clientId !== clientId) ||
+    (knownIdentity.viewportId !== undefined &&
+      knownIdentity.viewportId !== viewportId)
+  ) {
+    throw new Error(
+      `Visualization ACK identity changed from ${JSON.stringify(knownIdentity)} to ${JSON.stringify({ clientId, viewportId })}.`,
+    );
+  }
+  fixture.visualizationIdentity = { clientId, viewportId };
+}
+
+function requireVisualizationAckIdentity(fixture) {
+  const identity = getVisualizationAckIdentity(fixture);
+  if (identity.clientId === undefined || identity.viewportId === undefined) {
+    throw new Error(
+      "Cannot settle the final visualization publication without a pinned client_id and viewport_id.",
+    );
+  }
+  return identity;
+}
+
+function isCaptureDiagnosticsReady(diagnostics, quantityId) {
+  const raw = diagnostics.raw;
+  return (
+    raw.includes(`q:${quantityId}`) &&
+    !/\bfield:none\b/.test(raw) &&
+    /\bsurface:(?:ready|idle)\b/.test(raw) &&
+    /\bfield-demands:\d+\[[^\n]*:complete\b/.test(raw)
+  );
+}
+
+async function waitForFrameBoundary(page, message) {
+  await withTimeout(
+    page.evaluate(
+      () =>
+        new Promise((resolve) =>
+          requestAnimationFrame(() => resolve(undefined)),
+        ),
+    ),
+    1_000,
+    message,
+  );
+}
+
+async function warmViewportForChurn(page, fixture, fixtureRequests, viewport) {
+  let quantitySettles = 0;
+  let stylePublications = 0;
+  const quantityRequestModes = [];
+  for (const quantity of WARM_QUANTITIES) {
+    auditLog("warming quantity", quantity);
+    const previousQuantity = currentFixtureQuantity(fixture);
+    const beforeQuantityGpu = await readBrowserAuditCounters(page);
+    const quantityAckStart = fixture.visualizationAcks.length;
+    const quantityRequest = await withTimeout(
+      setGlobalQuantity(page, fixture, fixtureRequests, quantity, {
+        allowExistingFieldRequest: true,
+        requireFieldRequest: true,
+      }),
+      QUANTITY_SWITCH_TIMEOUT_MS,
+      `Timed out warming viewport quantity ${quantity}.`,
+    );
+    quantityRequestModes.push({ quantity, ...quantityRequest });
+    if (previousQuantity === quantity) {
+      await waitForQuantityDiagnosticsSettled(page, viewport, quantity);
+    } else {
+      await waitForCaptureSettled(
+        page,
+        fixture,
+        viewport,
+        quantity,
+        fixture.visualizationState.revision,
+        beforeQuantityGpu,
+        {
+          ackStart: quantityAckStart,
+          ...getVisualizationAckIdentity(fixture),
+        },
+      );
+    }
+    quantitySettles += 1;
+    const styles =
+      quantity === "m"
+        ? [...WARMUP_STYLES, ...WARMUP_SHADER_STYLES]
+        : WARMUP_STYLES;
+    for (const style of styles) {
+      advanceVisualizationState(fixture, quantity, style);
+      const beforeStyleGpu = await readBrowserAuditCounters(page);
+      await publishVisualizationStateAndWait(
+        page,
+        fixture,
+        viewport,
+        quantity,
+        beforeStyleGpu,
+      );
+      stylePublications += 1;
+    }
+  }
+  const stylePasses = [...WARMUP_STYLES, ...WARMUP_SHADER_STYLES];
+  return {
+    quantities: [...WARM_QUANTITIES],
+    quantitySettles,
+    quantityRequestModes,
+    shaderStyleQuantities: ["m"],
+    styleIds: stylePasses.map(({ id }) => id),
+    stylePublications,
+    stylePasses,
+  };
+}
+
+async function waitForQuantityDiagnosticsSettled(page, viewport, quantityId) {
+  await waitForCondition(
+    async () => {
+      const diagnostics = await readDiagnostics(viewport);
+      const runtime = await readViewportAuditRuntime(page);
+      return (
+        isCaptureDiagnosticsReady(diagnostics, quantityId) &&
+        Number(runtime.workers?.jobs ?? -1) === 0
+      );
+    },
+    CAPTURE_SETTLE_TIMEOUT_MS,
+    `Timed out waiting for diagnostics and workers to settle for quantity ${quantityId}.`,
+  );
+}
+
+function advanceVisualizationState(fixture, quantity, style) {
+  fixture.visualizationState = applyPatch(
+    fixture.visualizationState,
+    makeVisualizationStylePatch(quantity, style),
+  );
+  fixture.visualizationState.revision += 1;
+  fixture.status.resources.visualization_state_revision =
+    fixture.visualizationState.revision;
+}
+
+function makeVisualizationStylePatch(quantity, style) {
+  return {
+    active_quantity_id: quantity,
+    field_component: style.fieldComponent,
+    layers: {
+      points: { visible: style.pointsVisible },
+      vectors: { visible: style.vectorsVisible },
+      wireframe: { visible: style.wireframeVisible },
+    },
+    quantity: {
+      active_quantity_id: quantity,
+      field_component: style.fieldComponent,
+    },
+    vector_style: { color_mode: style.colorMode },
+  };
+}
+
+async function publishVisualizationStateAndWait(
+  page,
+  fixture,
+  viewport,
+  quantityId,
+  beforeGpu,
+  { drop = false } = {},
+) {
+  const revision = fixture.visualizationState.revision;
+  const ackStart = fixture.visualizationAcks.length;
+  await page.evaluate(
+    ({ dropPublication, state }) => {
+      const hook = window.__FULLMAG_CONTROL_ROOM_AUDIT__;
+      if (!hook) throw new Error("Fullmag browser audit hook is not installed.");
+      if (!dropPublication) hook.publishVisualizationState(state);
+    },
+    { dropPublication: drop, state: fixture.visualizationState },
+  );
+  await assertPublicationRendered(
+    page,
+    viewport,
+    quantityId,
+    revision,
+    beforeGpu,
+  );
+  await waitForCaptureSettled(
+    page,
+    fixture,
+    viewport,
+    quantityId,
+    revision,
+    beforeGpu,
+    { ackStart, ...getVisualizationAckIdentity(fixture) },
+  );
+  return { ackStart, revision };
+}
+
+async function waitForViewportUnmountSettled(
+  page,
+  label,
+  expectedRuntime = null,
+) {
+  let settled = null;
+  let previousResourceSignature = null;
+  let stableResourceSamples = 0;
+  let lastSample = null;
+  let lastReason = "no unmount settle sample was observed";
+  const expectedResourceSnapshot = expectedRuntime
+    ? normalizeResourceListenerSnapshot(expectedRuntime)
+    : null;
+  const expectedResourceSignature = expectedResourceSnapshot
+    ? JSON.stringify(expectedResourceSnapshot)
+    : null;
+
+  try {
+    await waitForCondition(
+      async () => {
+        const gpu = await readBrowserAuditCounters(page);
+        const runtime = await readViewportAuditRuntime(page);
+        const workers = runtime.workers ?? {};
+        const liveBuffers = gpu.buffersCreated - gpu.buffersDeleted;
+        const gpuWorkerIdle =
+          liveBuffers <= 4 &&
+          workers.disposed === true &&
+          Number(workers.activeLeases ?? -1) === 0 &&
+          Number(workers.jobs ?? -1) === 0 &&
+          Number(workers.timers ?? -1) === 0 &&
+          Number(workers.workers ?? -1) === 0;
+        const resourceSnapshot = normalizeResourceListenerSnapshot(runtime);
+        const resourceSignature = JSON.stringify(resourceSnapshot);
+        const resourceChanged =
+          previousResourceSignature !== null &&
+          resourceSignature !== previousResourceSignature;
+
+        if (!gpuWorkerIdle) {
+          stableResourceSamples = 0;
+          previousResourceSignature = null;
+          lastReason = "GPU/worker runtime is not idle";
+        } else if (resourceChanged) {
+          stableResourceSamples = 0;
+          previousResourceSignature = resourceSignature;
+          lastReason = "resource listener snapshot changed";
+        } else {
+          stableResourceSamples += 1;
+          previousResourceSignature = resourceSignature;
+          lastReason = `resource listener snapshot stable ${stableResourceSamples}/${UNMOUNT_RESOURCE_STABLE_SAMPLES}`;
+        }
+
+        const matchesExpected =
+          expectedResourceSignature === null ||
+          resourceSignature === expectedResourceSignature;
+        if (gpuWorkerIdle && !matchesExpected) {
+          lastReason = "resource listener snapshot has not returned to the expected baseline";
+        }
+
+        settled = { gpu, runtime };
+        lastSample = {
+          gpu,
+          runtime,
+          liveBuffers,
+          resourceSnapshot,
+          stableResourceSamples,
+        };
+        return (
+          gpuWorkerIdle &&
+          stableResourceSamples >= UNMOUNT_RESOURCE_STABLE_SAMPLES &&
+          matchesExpected
+        );
+      },
+      UNMOUNT_SETTLE_TIMEOUT_MS,
+      `${label} did not release WebGL buffers, worker runtime, and resource subscriptions within the bounded settle window.`,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${message} Last settle reason=${lastReason}; sample=${JSON.stringify({
+        expectedResourceSnapshot,
+        lastSample,
+      })}.`,
+      { cause: error },
+    );
+  }
+  return settled;
+}
+
+function normalizeResourceListenerSnapshot(runtime) {
+  const countsByKey = Object.fromEntries(
+    Object.entries(runtime.listenerCounts ?? {}).sort(([left], [right]) =>
+      left.localeCompare(right),
+    ),
+  );
+  return {
+    total: Number(runtime.resources?.listenerCount ?? -1),
+    countsByKey,
+  };
+}
+
+function makeGpuCheckpoint(label, gpu) {
+  return {
+    label,
+    ...gpu,
+    liveBuffers: gpu.buffersCreated - gpu.buffersDeleted,
+  };
+}
+
+function summarizeVisualizationAcks(acks) {
+  const statuses = {};
+  for (const ack of acks) {
+    statuses[ack?.status ?? "unknown"] =
+      (statuses[ack?.status ?? "unknown"] ?? 0) + 1;
+  }
+  return {
+    count: acks.length,
+    failed: acks
+      .filter((ack) => ack?.status === "failed")
+      .slice(-10)
+      .map(({ client_id, error, revision, status, viewport_id }) => ({
+        client_id,
+        error,
+        revision,
+        status,
+        viewport_id,
+      })),
+    renderedRevisions: acks
+      .filter((ack) => ack?.status === "rendered")
+      .map((ack) => ack.revision),
+    statuses,
+    tail: acks.slice(-20).map(
+      ({ client_id, error, revision, status, viewport_id }) => ({
+        client_id,
+        error,
+        revision,
+        status,
+        viewport_id,
+      }),
+    ),
+  };
 }
 
 async function assertPartialMultilayerNativeMaskRendered(
@@ -626,6 +1250,7 @@ async function collectStableShaderSignatures(page, fixture, viewport) {
     { colorMode: "magnitude", component: "x", id: "component" },
   ];
   const signatures = {};
+  let lastRevision = null;
   for (const mode of modes) {
     fixture.visualizationState = applyPatch(fixture.visualizationState, {
       active_quantity_id: "m",
@@ -638,9 +1263,16 @@ async function collectStableShaderSignatures(page, fixture, viewport) {
     });
     fixture.visualizationState.revision += 1;
     fixture.status.resources.visualization_state_revision = fixture.visualizationState.revision;
+
     const before = await readBrowserAuditCounters(page);
-    await page.evaluate((state) => window.__FULLMAG_CONTROL_ROOM_AUDIT__?.publishVisualizationState(state), fixture.visualizationState);
-    await assertPublicationRendered(page, viewport, "m", fixture.visualizationState.revision, before);
+    const publication = await publishVisualizationStateAndWait(
+      page,
+      fixture,
+      viewport,
+      "m",
+      before,
+    );
+    lastRevision = publication.revision;
     const first = await assertCanvasHasFidelity(page);
     const second = await assertCanvasHasFidelity(page);
     if (first.signature !== second.signature) {
@@ -648,7 +1280,7 @@ async function collectStableShaderSignatures(page, fixture, viewport) {
     }
     signatures[mode.id] = first.signature;
   }
-  return signatures;
+  return { lastRevision, signatures };
 }
 
 function assertViewportRuntimeReleased(afterUnmountRuntime, baselineRuntime) {
@@ -934,6 +1566,21 @@ async function installFdmFixtureApi(page, fixture, requests) {
       await fulfillJson(route, fdmStatusFixture(fixture));
       return;
     }
+    if (
+      path === "/v2/sessions/current/visualization/client-acks" &&
+      request.method() === "POST"
+    ) {
+      const ack = parseJsonBody(request);
+      fixture.visualizationAcks.push(ack);
+      await fulfillJson(route, {
+        client_id: ack.client_id ?? "fixture-client",
+        received_at_unix_ms: Date.now(),
+        revision: ack.revision ?? fixture.visualizationState.revision,
+        status: ack.status ?? "rendered",
+        viewport_id: ack.viewport_id,
+      });
+      return;
+    }
     if (path === "/v2/sessions/current/visualization/state") {
       if (request.method() === "PATCH") {
         const patch = parsePatchBody(request);
@@ -974,6 +1621,21 @@ async function installFdmFixtureApi(page, fixture, requests) {
       await fulfillEmpty(route, 204);
       return;
     }
+    if (path === "/v2/sessions/current/data/fdm-region-memberships") {
+      await fulfillJson(route, fixture.fdmMembership);
+      return;
+    }
+    if (
+      path === FDM_MEMBERSHIP_ENDPOINT ||
+      path.startsWith(FDM_MEMBERSHIP_ENDPOINT + "/")
+    ) {
+      await fulfillBinary(route, fixture.fdmMembershipBinary, 200, {
+        "x-fullmag-grid-fingerprint": fixture.fdmMembership.grid_fingerprint,
+        "x-fullmag-domain-generation-id": fixture.fdmMembership.domain_generation_id,
+        "x-fullmag-region-membership-revision": String(fixture.fdmMembership.region_membership_revision),
+      });
+      return;
+    }
     if (path.startsWith("/v2/sessions/current/data/fields/")) {
       const quantityId = decodeURIComponent(path.split("/")[6] ?? "m");
       const etag = `"fdm-memory-${quantityId}"`;
@@ -983,19 +1645,32 @@ async function installFdmFixtureApi(page, fixture, requests) {
       }
       await fulfillBinary(route, makeFdmFieldVectorBuffer(quantityId), 200, {
         etag,
+        "x-fullmag-domain-generation-id": "1",
+        "x-fullmag-encoding": "FMVP;version=2",
+        "x-fullmag-component": "full",
+        "x-fullmag-payload-state": "legacy_unverified",
+        "x-fullmag-field-revision": "1",
+        "x-fullmag-n-comp": "3",
+        "x-fullmag-point-count": String(FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2]),
+        "x-fullmag-quantity-id": quantityId,
+        "x-fullmag-value-count": String(FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2] * 3),
       });
       return;
     }
     if (path === "/v2/sessions/current/model/scene") {
-      await fulfillJson(route, { objects: [], revision: 0, schema_version: 1 });
+      await fulfillJson(route, fixture.scene);
+      return;
+    }
+    if (path === "/v2/sessions/current/model/regions") {
+      await fulfillJson(route, fixture.regions);
       return;
     }
     if (path === "/v2/sessions/current/model/universe") {
       await fulfillJson(route, {
         mesh_dirty: false,
-        object_bounds_max: [6e-7, 4e-7, 1e-7],
-        object_bounds_min: [-6e-7, -4e-7, -1e-7],
-        scene_revision: 0,
+        object_bounds_max: FDM_DOMAIN_BOUNDS_MAX,
+        object_bounds_min: FDM_DOMAIN_BOUNDS_MIN,
+        scene_revision: 1,
         study_universe_mesh: null,
         universe: null,
       });
@@ -1018,6 +1693,8 @@ async function setGlobalQuantity(
   { allowExistingFieldRequest = false, requireFieldRequest = false } = {},
 ) {
   const previousFieldRequestCount = countFieldRequests(requests, quantityId);
+  const usedExistingFieldRequest =
+    allowExistingFieldRequest && previousFieldRequestCount > 0;
   if (currentFixtureQuantity(fixture) === quantityId) {
     if (requireFieldRequest) {
       await waitForFieldRequest(requests, quantityId, {
@@ -1026,7 +1703,10 @@ async function setGlobalQuantity(
           : previousFieldRequestCount,
       });
     }
-    return;
+    return {
+      fieldRequestCount: countFieldRequests(requests, quantityId),
+      usedExistingFieldRequest,
+    };
   }
 
   await setAuditStep(page, `quantity:${quantityId}:audit-hook`);
@@ -1051,7 +1731,10 @@ async function setGlobalQuantity(
         : previousFieldRequestCount,
     });
   }
-  await page.waitForTimeout(120);
+  return {
+    fieldRequestCount: countFieldRequests(requests, quantityId),
+    usedExistingFieldRequest,
+  };
 }
 
 async function waitForFieldRequest(
@@ -1089,7 +1772,18 @@ function fdmMultilayerActiveMaskPath(layerId) {
 async function reportAuditFailure(
   page,
   fixture,
-  { errors, fieldRequests, fixtureRequests, topologyRequests },
+  {
+    coldBaseline,
+    coldWarmup,
+    first2DLayout,
+    final2DLayout,
+    errors,
+    fieldRequests,
+    fixtureRequests,
+    gpuCheckpoints,
+    steadyWarmup,
+    topologyRequests,
+  },
 ) {
   const snapshot = await page
     .evaluate(() => {
@@ -1152,6 +1846,16 @@ async function reportAuditFailure(
         fieldRequests: fieldRequests.slice(-10),
         fixtureRequests: fixtureRequests.slice(-20),
         topologyRequests: topologyRequests.slice(-10),
+        coldBaseline,
+        coldWarmup,
+        first2DLayout,
+        final2DLayout,
+        gpuCheckpoints,
+        steadyWarmup,
+        visualizationAckIdentity: fixture.visualizationIdentity,
+        visualizationAckSummary: summarizeVisualizationAcks(
+          fixture.visualizationAcks,
+        ),
         visualizationState: fixture.visualizationState,
       },
       null,
@@ -1190,6 +1894,76 @@ async function waitForCanvasReady(canvas) {
       tick();
     }),
   );
+}
+
+async function waitForComparable2DViewport(
+  page,
+  label,
+  { expectedCompanionModuleId = null } = {},
+) {
+  const selector = 'section.fm-viewport-tabs[data-slot-id="viewport-main"]';
+  let lastObservedState = null;
+  try {
+    await waitForCondition(
+      async () => {
+        lastObservedState = await page.evaluate((hostSelector) => {
+          const hosts = document.querySelectorAll(hostSelector);
+          const host = hosts[0];
+          if (!host) return { hostCount: 0 };
+          return {
+            hostCount: hosts.length,
+            activeModuleId: host.getAttribute("data-active-module-id"),
+            companionModuleId: host.getAttribute("data-companion-module-id"),
+            fieldMapCount: host.querySelectorAll(".fm-field-map").length,
+            suspenseFallbackCount: host.querySelectorAll(".fm-slot__loading").length,
+            errorText: [...host.querySelectorAll(".fm-slot__error")]
+              .map((node) => node.textContent ?? "").join(" ").slice(0, 1000),
+            statusText: host.querySelector('.fm-field-map[role="status"], .fm-field-map[role="alert"], .fm-field-map [role="status"], .fm-field-map [role="alert"]')
+              ?.textContent?.slice(0, 500) ?? null,
+          };
+        }, selector);
+        return (
+          lastObservedState.hostCount === 1 &&
+          lastObservedState.activeModuleId === "field-map" &&
+          lastObservedState.companionModuleId === expectedCompanionModuleId &&
+          lastObservedState.fieldMapCount === 1 &&
+          lastObservedState.suspenseFallbackCount === 0 &&
+          lastObservedState.errorText === ""
+        );
+      },
+      VIEWPORT_2D_MOUNT_TIMEOUT_MS,
+      `${label} did not reach the expected mounted field-map layout.`,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${message} Last 2D layout=${JSON.stringify(lastObservedState)}.`,
+      { cause: error },
+    );
+  }
+  return lastObservedState;
+}
+
+function assertComparable2DViewportLayout(first, final) {
+  const comparableKeys = [
+    "hostCount",
+    "activeModuleId",
+    "companionModuleId",
+    "fieldMapCount",
+    "suspenseFallbackCount",
+  ];
+  const changed = Object.fromEntries(
+    comparableKeys
+      .map((key) => [key, { first: first[key], final: final[key] }])
+      .filter(([, values]) => values.first !== values.final),
+  );
+  if (Object.keys(changed).length > 0) {
+    throw new Error(
+      "2D viewport layout changed between unmount baselines: " +
+        JSON.stringify(changed) +
+        ".",
+    );
+  }
 }
 
 async function waitForDiagnostics(viewport) {
@@ -1275,13 +2049,17 @@ function applyPatch(state, patch) {
   return mergeRecords(state, patch ?? {});
 }
 
-function parsePatchBody(request) {
+function parseJsonBody(request) {
   try {
     const value = request.postDataJSON();
     return isPlainObject(value) ? value : {};
   } catch {
     return {};
   }
+}
+
+function parsePatchBody(request) {
+  return parseJsonBody(request);
 }
 
 function mergeRecords(current, patch) {
@@ -1336,7 +2114,8 @@ function fixtureHeaders(extra = {}) {
     "access-control-allow-headers": "*",
     "access-control-allow-methods": "GET,POST,PATCH,PUT,DELETE,OPTIONS",
     "access-control-allow-origin": "*",
-    "access-control-expose-headers": "x-api-contract-version,etag,x-request-id",
+    "access-control-expose-headers":
+      "x-api-contract-version,etag,x-request-id,x-fullmag-grid-fingerprint,x-fullmag-region-membership-revision,x-fullmag-domain-generation-id,x-fullmag-encoding,x-fullmag-component,x-fullmag-payload-state,x-fullmag-field-revision,x-fullmag-n-comp,x-fullmag-point-count,x-fullmag-quantity-id,x-fullmag-value-count",
     "x-api-contract-version": "1.0.0",
     ...extra,
   };
@@ -1344,8 +2123,208 @@ function fixtureHeaders(extra = {}) {
 
 function createFdmFixture() {
   const visualizationState = fdmVisualizationStateFixture();
-  const status = fdmStatusFixture({ visualizationState });
-  return { patchCount: 0, status, visualizationState };
+  const scene = fdmSceneFixture();
+  const regions = fdmRegionsFixture();
+  const fdmMembership = fdmMembershipFixture();
+  const fixture = {
+    fdmMembership,
+    fdmMembershipBinary: fdmMembershipBuffer(),
+    patchCount: 0,
+    regions,
+    scene,
+    status: fdmStatusFixture({ visualizationState }),
+    visualizationIdentity: { clientId: null, viewportId: null },
+    visualizationAcks: [],
+    visualizationState,
+  };
+  validateFdmMemoryFixture(fixture);
+  return fixture;
+}
+
+function fdmMemorySupportBounds() {
+  const { xStart, xEnd, yStart, yEnd, zStart, zEnd } = FDM_MEMORY_SUPPORT_RANGE;
+  const starts = [xStart, yStart, zStart];
+  const ends = [xEnd, yEnd, zEnd];
+  return {
+    max: ends.map(
+      (cell, axis) => FDM_DOMAIN_ORIGIN[axis] + cell * FDM_DOMAIN_SPACING[axis],
+    ),
+    min: starts.map(
+      (cell, axis) => FDM_DOMAIN_ORIGIN[axis] + cell * FDM_DOMAIN_SPACING[axis],
+    ),
+  };
+}
+
+function fdmSceneFixture() {
+  const support = fdmMemorySupportBounds();
+  const size = support.max.map((value, axis) => value - support.min[axis]);
+  const center = support.max.map(
+    (value, axis) => (value + support.min[axis]) / 2,
+  );
+  return {
+    objects: [
+      {
+        geometry: { geometry_params: { size }, kind: "box" },
+        id: FDM_MEMORY_OBJECT_ID,
+        regions: [
+          {
+            enabled: true,
+            frame: "object",
+            name: "Core",
+            region_id: FDM_MEMORY_REGION_ID,
+            shape: { center: [0, 0, 0], kind: "box", size },
+          },
+        ],
+        transform: { translation: center },
+        visible: true,
+      },
+    ],
+    revision: 1,
+    schema_version: 2,
+  };
+}
+
+function fdmRegionsFixture() {
+  const support = fdmMemorySupportBounds();
+  return {
+    geometry_realization_revision: 1,
+    region_membership_revision: 1,
+    region_topology_revision: 1,
+    regions: [
+      {
+        bounds_max: support.max,
+        bounds_min: support.min,
+        enabled: true,
+        frame: "object",
+        interaction_refs: [],
+        material_ref: "fixture-material",
+        mesh_part_ids: [],
+        name: "Core",
+        owner_object_id: FDM_MEMORY_OBJECT_ID,
+        region_id: FDM_MEMORY_REGION_ID,
+        source: "authored_object_region",
+        source_body_ids: [],
+        source_object_ids: [FDM_MEMORY_OBJECT_ID],
+      },
+    ],
+    scene_revision: 1,
+  };
+}
+
+function fdmMembershipFixture() {
+  const support = fdmMemorySupportBounds();
+  const regionLegend = [
+    {
+      numeric_id: 1,
+      object_id: FDM_MEMORY_OBJECT_ID,
+      priority: 0,
+      region_id: FDM_MEMORY_REGION_ID,
+    },
+  ];
+  return {
+    binary_path: FDM_MEMBERSHIP_BINARY_PATH,
+    cell_count: FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2],
+    cell_m: FDM_DOMAIN_SPACING,
+    counts: FIELD_GRID,
+    domain_generation_id: "1",
+    encoding: "FMRM:u32_membership_le",
+    freshness: "current",
+    grid_fingerprint: FDM_GRID_FINGERPRINT,
+    magnetic_support: {
+      active_cell_count:
+        (FDM_MEMORY_SUPPORT_RANGE.xEnd - FDM_MEMORY_SUPPORT_RANGE.xStart) *
+        (FDM_MEMORY_SUPPORT_RANGE.yEnd - FDM_MEMORY_SUPPORT_RANGE.yStart) *
+        (FDM_MEMORY_SUPPORT_RANGE.zEnd - FDM_MEMORY_SUPPORT_RANGE.zStart),
+      active_unassigned_cell_count: 0,
+      bounds_max_m: support.max,
+      bounds_min_m: support.min,
+      grid_fingerprint: FDM_GRID_FINGERPRINT,
+      inactive_cell_count:
+        FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2] -
+        (FDM_MEMORY_SUPPORT_RANGE.xEnd - FDM_MEMORY_SUPPORT_RANGE.xStart) *
+          (FDM_MEMORY_SUPPORT_RANGE.yEnd - FDM_MEMORY_SUPPORT_RANGE.yStart) *
+          (FDM_MEMORY_SUPPORT_RANGE.zEnd - FDM_MEMORY_SUPPORT_RANGE.zStart),
+      semantic_role: "magnetic-support",
+    },
+    mesh_revision: 1,
+    object_ids: [FDM_MEMORY_OBJECT_ID],
+    origin_m: FDM_DOMAIN_ORIGIN,
+    region_legend: regionLegend,
+    region_legend_fingerprint: `sha256:${createHash("sha256")
+      .update(
+        JSON.stringify(
+          regionLegend.map(({ numeric_id, object_id, region_id, priority }) => ({
+            numeric_id,
+            object_id,
+            region_id,
+            priority,
+          })),
+        ),
+      )
+      .digest("hex")}`,
+    region_membership_revision: 1,
+    schema_version: "fdm_region_membership.v2",
+  };
+}
+
+function validateFdmMemoryFixture(fixture) {
+  const descriptor = fixture.fdmMembership;
+  const support = descriptor.magnetic_support;
+  const expectedCellCount = FIELD_GRID.reduce(
+    (product, count) => product * count,
+    1,
+  );
+  const expectedActiveCellCount =
+    (FDM_MEMORY_SUPPORT_RANGE.xEnd - FDM_MEMORY_SUPPORT_RANGE.xStart) *
+    (FDM_MEMORY_SUPPORT_RANGE.yEnd - FDM_MEMORY_SUPPORT_RANGE.yStart) *
+    (FDM_MEMORY_SUPPORT_RANGE.zEnd - FDM_MEMORY_SUPPORT_RANGE.zStart);
+  const expectedInactiveCellCount = expectedCellCount - expectedActiveCellCount;
+  const fingerprint = normalizeFixtureFingerprint(descriptor.grid_fingerprint);
+  if (
+    descriptor.binary_path !== FDM_MEMBERSHIP_BINARY_PATH ||
+    !fingerprint ||
+    !sameNumberArray(descriptor.counts, FIELD_GRID) ||
+    descriptor.cell_count !== expectedCellCount ||
+    descriptor.domain_generation_id !== "1" ||
+    !sameNumberArray(descriptor.origin_m, FDM_DOMAIN_ORIGIN) ||
+    !sameNumberArray(descriptor.cell_m, FDM_DOMAIN_SPACING) ||
+    !support ||
+    support.grid_fingerprint !== descriptor.grid_fingerprint ||
+    support.active_cell_count !== expectedActiveCellCount ||
+    support.inactive_cell_count !== expectedInactiveCellCount ||
+    support.active_unassigned_cell_count !== 0
+  ) {
+    throw new Error("FDM memory fixture descriptor is not coherent with its grid.");
+  }
+  const expectedBinaryLength =
+    FDM_FMRM_HEADER_BYTES + expectedCellCount * FDM_FMRM_WORD_BYTES;
+  if (
+    !(fixture.fdmMembershipBinary instanceof ArrayBuffer) ||
+    fixture.fdmMembershipBinary.byteLength !== expectedBinaryLength
+  ) {
+    throw new Error("FDM memory fixture FMRM length is not coherent with its grid.");
+  }
+  const view = new DataView(fixture.fdmMembershipBinary);
+  const magic = String.fromCharCode(
+    view.getUint8(0),
+    view.getUint8(1),
+    view.getUint8(2),
+    view.getUint8(3),
+  );
+  if (
+    magic !== "FMRM" ||
+    view.getUint8(4) !== 2 ||
+    view.getUint8(5) !== 2 ||
+    !sameNumberArray(
+      [view.getUint32(8, true), view.getUint32(12, true), view.getUint32(16, true)],
+      FIELD_GRID,
+    ) ||
+    view.getUint32(20, true) !== expectedCellCount ||
+    view.getUint32(24, true) !== descriptor.region_legend.length ||
+    readHexBytes(view, 28, 32) !== fingerprint
+  ) {
+    throw new Error("FDM memory fixture FMRM header is not coherent with its descriptor.");
+  }
 }
 
 function fdmStatusFixture(fixture) {
@@ -1388,7 +2367,7 @@ function fdmStatusFixture(fixture) {
     domain: {
       cell_count: FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2],
       discretization: "fdm",
-      generation_id: 1,
+      generation_id: "1",
     },
     energies: {},
     lifecycle: {
@@ -1408,7 +2387,7 @@ function fdmStatusFixture(fixture) {
       command_completion_revision: 0,
       commands_revision: 0,
       display_revision: revision,
-      domain_generation_id: 1,
+      domain_generation_id: "1",
       engine_log_revision: 0,
       field_catalog_revision: 1,
       field_revision: 1,
@@ -1416,7 +2395,7 @@ function fdmStatusFixture(fixture) {
       mesh_build_revision: 0,
       mesh_revision: 0,
       scalars_revision: 0,
-      scene_revision: 0,
+      scene_revision: 1,
       simulation_preparation_revision: 0,
       slice_revision: 0,
       stages_revision: 0,
@@ -1443,22 +2422,63 @@ function fdmStatusFixture(fixture) {
 function fdmDomainMetaFixture() {
   return {
     bounds: {
-      max: [6e-7, 4e-7, 1e-7],
-      min: [-6e-7, -4e-7, -1e-7],
+      max: FDM_DOMAIN_BOUNDS_MAX,
+      min: FDM_DOMAIN_BOUNDS_MIN,
     },
     coordinate_system: "cartesian",
     counts: { cells: FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2] },
     dimension: 3,
     discretization: "fdm",
     domain_id: "fdm-memory-churn-domain",
-    generation_id: 1,
+    generation_id: "1",
     grid: {
-      origin: [-6e-7, -4e-7, -1e-7],
+      origin: FDM_DOMAIN_ORIGIN,
       shape: FIELD_GRID,
-      spacing: [1.25e-8, 1.25e-8, 5e-8],
+      spacing: FDM_DOMAIN_SPACING,
     },
     units: { length: "m" },
   };
+}
+
+function fdmMembershipBuffer() {
+  const [nx, ny, nz] = FIELD_GRID;
+  const cellCount = nx * ny * nz;
+  const buffer = new ArrayBuffer(
+    FDM_FMRM_HEADER_BYTES + cellCount * FDM_FMRM_WORD_BYTES,
+  );
+  const view = new DataView(buffer);
+  for (const [index, code] of [..."FMRM"].entries()) {
+    view.setUint8(index, code.charCodeAt(0));
+  }
+  view.setUint8(4, 2);
+  view.setUint8(5, 2);
+  view.setUint32(8, nx, true);
+  view.setUint32(12, ny, true);
+  view.setUint32(16, nz, true);
+  view.setUint32(20, cellCount, true);
+  view.setUint32(24, 1, true);
+  writeHexBytes(view, 28, FDM_GRID_FINGERPRINT);
+  const { xStart, xEnd, yStart, yEnd, zStart, zEnd } = FDM_MEMORY_SUPPORT_RANGE;
+  for (let z = 0; z < nz; z += 1) {
+    for (let y = 0; y < ny; y += 1) {
+      for (let x = 0; x < nx; x += 1) {
+        const index = x + nx * (y + ny * z);
+        const insideSupport =
+          x >= xStart &&
+          x < xEnd &&
+          y >= yStart &&
+          y < yEnd &&
+          z >= zStart &&
+          z < zEnd;
+        view.setUint32(
+          FDM_FMRM_HEADER_BYTES + index * FDM_FMRM_WORD_BYTES,
+          insideSupport ? 1 : FDM_FMRM_INACTIVE_REGION_ID,
+          true,
+        );
+      }
+    }
+  }
+  return buffer;
 }
 
 function fdmMultilayerLayoutFixture() {
@@ -1572,6 +2592,21 @@ function writeHexBytes(view, offset, hex) {
       Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16),
     );
   }
+}
+
+function readHexBytes(view, offset, byteLength) {
+  let hex = "";
+  for (let index = 0; index < byteLength; index += 1) {
+    hex += view.getUint8(offset + index).toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+function normalizeFixtureFingerprint(value) {
+  const normalized = String(value ?? "").trim().replace(/^sha256:/i, "");
+  return /^[0-9a-f]{64}$/i.test(normalized)
+    ? normalized.toLowerCase()
+    : null;
 }
 
 function fdmFieldCatalogFixture() {
@@ -1736,4 +2771,23 @@ function currentFixtureQuantity(fixture) {
     fixture.visualizationState?.active_quantity_id ??
     "m"
   );
+}
+
+function lifecycleVisualizationState(state) {
+  return {
+    active_quantity_id: state?.active_quantity_id ?? null,
+    field_component: state?.field_component ?? null,
+    layers: {
+      points: state?.layers?.points?.visible ?? null,
+      vectors: state?.layers?.vectors?.visible ?? null,
+      wireframe: state?.layers?.wireframe?.visible ?? null,
+    },
+    quantity: {
+      active_quantity_id: state?.quantity?.active_quantity_id ?? null,
+      field_component: state?.quantity?.field_component ?? null,
+    },
+    vector_style: {
+      color_mode: state?.vector_style?.color_mode ?? null,
+    },
+  };
 }

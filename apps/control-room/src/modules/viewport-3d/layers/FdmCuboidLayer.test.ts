@@ -28,12 +28,19 @@ import {
   prepareFdmCuboidInstanceMatrices,
   estimateFdmCuboidCarrierPeakBytes,
   uploadFdmCuboidAttribute,
+  disposeFdmCuboidInstanceColorBeforeReplace,
   visibleFdmCuboidInspectTargets,
   resolveFdmCuboidColorUploadRevision,
   shouldAttachFdmCuboidInspectListener,
   createFdmInspectClearArbitrator,
 } from "./FdmCuboidLayer";
-import { BoxGeometry, InstancedBufferAttribute, InstancedMesh, MeshBasicMaterial } from "three";
+import {
+  BoxGeometry,
+  InstancedBufferAttribute,
+  InstancedMesh,
+  MeshBasicMaterial,
+} from "three";
+import { WebGLObjects } from "three/src/renderers/webgl/WebGLObjects.js";
 import type { FdmCuboidInstanceModelOptions } from "./fdmCuboidBuildModel";
 import { createViewport3DRenderAdoptionRegistry } from "../model/viewport3DRenderAdoptionRegistry";
 
@@ -1028,8 +1035,88 @@ describe("FdmCuboidLayer model", () => {
 
     expect(surfaceMeshBlock).not.toContain("key=");
     expect(layerSource).toContain(
-      "surface.instanceColor = new InstancedBufferAttribute(",
+      "const nextInstanceColor = new InstancedBufferAttribute(",
     );
+    expect(layerSource).toContain("surface.instanceColor = nextInstanceColor;");
+  });
+
+  it("reuses same-length colors and releases replaced colors through Three.js WebGLObjects", () => {
+    const liveAttributes = new Set<object>();
+    const removedAttributes: object[] = [];
+    const fakeGeometry = { attributes: {} };
+    const renderInfo = { render: { frame: 0 } };
+    const webglObjects = new WebGLObjects(
+      { ARRAY_BUFFER: "array-buffer" } as never,
+      {
+        get: () => fakeGeometry,
+        update: () => undefined,
+      } as never,
+      {
+        update: (attribute: object) => liveAttributes.add(attribute),
+        remove: (attribute: object) => {
+          liveAttributes.delete(attribute);
+          removedAttributes.push(attribute);
+        },
+      } as never,
+      { releaseStatesOfObject: () => undefined } as never,
+      renderInfo as never,
+    );
+    const mesh = new InstancedMesh(
+      new BoxGeometry(1, 1, 1),
+      new MeshBasicMaterial(),
+      2,
+    );
+    const firstColor = new InstancedBufferAttribute(
+      new Float32Array(6),
+      3,
+    );
+    mesh.instanceColor = firstColor;
+    let geometryDisposals = 0;
+    let materialDisposals = 0;
+    mesh.geometry.addEventListener("dispose", () => { geometryDisposals += 1; });
+    (mesh.material as MeshBasicMaterial).addEventListener("dispose", () => { materialDisposals += 1; });
+
+    webglObjects.update(mesh);
+    expect(liveAttributes).toEqual(
+      new Set([mesh.instanceMatrix, firstColor]),
+    );
+
+    disposeFdmCuboidInstanceColorBeforeReplace(mesh, firstColor);
+    uploadFdmCuboidAttribute(firstColor, new Float32Array([1, 0, 0, 0, 1, 0]), "same-length", null);
+    expect(mesh.instanceColor).toBe(firstColor);
+    expect([...firstColor.array]).toEqual([1, 0, 0, 0, 1, 0]);
+    expect(removedAttributes).toHaveLength(0);
+
+    disposeFdmCuboidInstanceColorBeforeReplace(mesh, null);
+    mesh.instanceColor = null;
+    expect(removedAttributes).toEqual(
+      expect.arrayContaining([mesh.instanceMatrix, firstColor]),
+    );
+    renderInfo.render.frame += 1;
+    webglObjects.update(mesh);
+    expect(liveAttributes).toEqual(new Set([mesh.instanceMatrix]));
+
+    for (let cycle = 0; cycle < 120; cycle += 1) {
+      const nextColor = new InstancedBufferAttribute(
+        new Float32Array(cycle % 2 === 0 ? 6 : 9),
+        3,
+      );
+      disposeFdmCuboidInstanceColorBeforeReplace(mesh, nextColor);
+      mesh.instanceColor = nextColor;
+      renderInfo.render.frame += 1;
+      webglObjects.update(mesh);
+      expect(liveAttributes).toEqual(
+        new Set([mesh.instanceMatrix, nextColor]),
+      );
+    }
+
+    mesh.dispose();
+    expect(liveAttributes.size).toBe(0);
+    expect(geometryDisposals).toBe(0);
+    expect(materialDisposals).toBe(0);
+    webglObjects.dispose();
+    mesh.geometry.dispose();
+    (mesh.material as MeshBasicMaterial).dispose();
   });
 
   it("invalidates only the owned material mounted on the Three.js surface", () => {
