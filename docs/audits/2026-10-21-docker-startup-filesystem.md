@@ -126,3 +126,47 @@ błędów i aktywnego przebiegu `Watching`. Kolejny GET `/workspace` zwrócił H
 Home ani pełnego UI; browser QA nadal wymaga zdrowego backendu. Backend tej
 próby pozostaje zakończony kodem 2 do właściwej operacji odtworzenia i nowego
 pełnego capture/build/start.
+
+
+## Nowa inkarnacja i fixture CI
+
+Zarządzane odtworzenie `edbe6a54154345ff94bfdae66e139536` zakończyło się
+poprawnie, zachowując wolumeny build/package i dane użytkownika. Toolchain
+oraz development-base wykorzystano z cache. Nowy backend `ed56b7ba…` i frontend
+`35705f36…` należą do tej samej grupy Compose; wrapper ma obraz `sha256:c9299404…`.
+
+Próba development `43ab21e7c6d349a6922d72ca5d7995b2`, z zamrożonym HEAD
+`08c0c810ab8750399415eda73e7f57ddb3df14fe`, zakończyła oba odczyty capture:
+105,013 s i 110,939 s, łącznie 216,140 s dla 9185 plików. Synchronizacja
+spójnej kopii źródeł trwała 1155,787 s, po czym rozpoczęło się
+`make install-cli-dev` w tym samym kontenerze backendu. Nie jest to dowód
+ukończenia kompilacji ani startu API. Odczyty `/proc` potwierdziły rzeczywisty
+postęp od dokumentacji do skryptów i danych referencyjnych testów; brak OOM,
+swap i presji pamięci. Nie zmieniono limitów ani nie usunięto cache.
+
+Dwie kontrole CI na HEAD `08c0c810…` wymagają naprawy samych fixture:
+
+- `python-contracts`, job `118952520802`: test oczekuje błędu wyjścia poza root,
+  lecz tworzy absolutny symlink, odrzucany wcześniej przez właściwą politykę.
+  Commit `4dc0ffcd012315c165bfa89b26eea5bada4474fe` używa względnego celu
+  `../outside`. Walidacja produkcyjna pozostaje bez zmian. Diff i składnia AST
+  zostały sprawdzone; pełny moduł pytest pozostaje do potwierdzenia w CI.
+- `browser-fixture-smoke`, job `118952520626`: audyt FDM nie podawał sceny
+  ani zasobu membership wymaganego przez renderer. Fixture uzupełniono o
+  zgodne scene/regions, FMRM v2, support 320 aktywnych i 448 nieaktywnych
+  komórek siatki 24×16×2, bounds i nagłówki FMVP v2. Zachowano istniejące
+  bramki podpisów obrazu, pamięci, lifecycle i idle. Nie zmieniono renderera,
+  solvera ani nie zastosowano odrębnego draftu ACK/capture-settle.
+
+Sprawdzenie `node --check` rzeczywistego pliku po zmianie przeszło w zarządzanym
+helperze tej samej grupy Compose, z readonly source i stabilnym SHA
+`3556d2c2bff3753dd387af9d4c6c8b2372bdd01436e0c75360c35f591653151c`.
+Receipt: `verification/syntax-attempts/84a5a64f47804bc5a413417c0611ab5d.json`.
+Wynik dotyczy składni; właściwy browser gate pozostaje NOT VERIFIED.
+
+Zmiany fixture wykonano dopiero po `sync complete`; bieżący Make nadal
+korzysta z niezmienionego shadow HEAD `08c0c810…`. Nowy frontend rozpoczął
+kompilację `/workspace`; probe HTTP przekroczył 30 s. Sam health procesu Next
+nie dowodzi wyrenderowanego Home. Native/API, browser, HMR, cache restart,
+wykonanie skryptów oraz kwalifikacja czterech realizacji pozostają odrębnymi,
+nieukończonymi bramkami. Held run `run-live-9f453e3a…` zachowano bez Solve replay.

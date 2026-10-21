@@ -29,6 +29,32 @@ const apiBase =
 // throughput at production field sizes. Keep the fixture dense enough to
 // exercise every pass while bounded enough for 120 rendered transitions in CI.
 const FIELD_GRID = [24, 16, 2];
+const FDM_DOMAIN_ORIGIN = [-6e-7, -4e-7, -1e-7];
+const FDM_DOMAIN_SPACING = [1.25e-8, 1.25e-8, 5e-8];
+const FDM_DOMAIN_BOUNDS_MIN = Object.freeze([...FDM_DOMAIN_ORIGIN]);
+const FDM_DOMAIN_BOUNDS_MAX = Object.freeze(
+  FIELD_GRID.map(
+    (count, axis) =>
+      FDM_DOMAIN_ORIGIN[axis] + count * FDM_DOMAIN_SPACING[axis],
+  ),
+);
+const FDM_GRID_FINGERPRINT = "0".repeat(64);
+const FDM_MEMBERSHIP_ENDPOINT =
+  "/v2/sessions/current/data/fdm-region-membership";
+const FDM_MEMBERSHIP_BINARY_PATH = "mesh/fdm_region_membership.v2.bin";
+const FDM_FMRM_HEADER_BYTES = 64;
+const FDM_FMRM_WORD_BYTES = 4;
+const FDM_MEMORY_OBJECT_ID = "fdm-core";
+const FDM_MEMORY_REGION_ID = "fdm-core:core";
+const FDM_FMRM_INACTIVE_REGION_ID = 0xffff_ffff;
+const FDM_MEMORY_SUPPORT_RANGE = Object.freeze({
+  xStart: 4,
+  xEnd: 20,
+  yStart: 3,
+  yEnd: 13,
+  zStart: 0,
+  zEnd: 2,
+});
 const FDM_PARTIAL_LAYER_ID = "layer:partial";
 const FDM_DENSE_LAYER_ID = "layer:dense";
 const FDM_MULTILAYER_LAYOUT_REVISION = 7;
@@ -974,6 +1000,21 @@ async function installFdmFixtureApi(page, fixture, requests) {
       await fulfillEmpty(route, 204);
       return;
     }
+    if (path === "/v2/sessions/current/data/fdm-region-memberships") {
+      await fulfillJson(route, fixture.fdmMembership);
+      return;
+    }
+    if (
+      path === FDM_MEMBERSHIP_ENDPOINT ||
+      path.startsWith(FDM_MEMBERSHIP_ENDPOINT + "/")
+    ) {
+      await fulfillBinary(route, fixture.fdmMembershipBinary, 200, {
+        "x-fullmag-grid-fingerprint": fixture.fdmMembership.grid_fingerprint,
+        "x-fullmag-domain-generation-id": fixture.fdmMembership.domain_generation_id,
+        "x-fullmag-region-membership-revision": String(fixture.fdmMembership.region_membership_revision),
+      });
+      return;
+    }
     if (path.startsWith("/v2/sessions/current/data/fields/")) {
       const quantityId = decodeURIComponent(path.split("/")[6] ?? "m");
       const etag = `"fdm-memory-${quantityId}"`;
@@ -983,19 +1024,32 @@ async function installFdmFixtureApi(page, fixture, requests) {
       }
       await fulfillBinary(route, makeFdmFieldVectorBuffer(quantityId), 200, {
         etag,
+        "x-fullmag-domain-generation-id": "1",
+        "x-fullmag-encoding": "FMVP;version=2",
+        "x-fullmag-component": "full",
+        "x-fullmag-payload-state": "legacy_unverified",
+        "x-fullmag-field-revision": "1",
+        "x-fullmag-n-comp": "3",
+        "x-fullmag-point-count": String(FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2]),
+        "x-fullmag-quantity-id": quantityId,
+        "x-fullmag-value-count": String(FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2] * 3),
       });
       return;
     }
     if (path === "/v2/sessions/current/model/scene") {
-      await fulfillJson(route, { objects: [], revision: 0, schema_version: 1 });
+      await fulfillJson(route, fixture.scene);
+      return;
+    }
+    if (path === "/v2/sessions/current/model/regions") {
+      await fulfillJson(route, fixture.regions);
       return;
     }
     if (path === "/v2/sessions/current/model/universe") {
       await fulfillJson(route, {
         mesh_dirty: false,
-        object_bounds_max: [6e-7, 4e-7, 1e-7],
-        object_bounds_min: [-6e-7, -4e-7, -1e-7],
-        scene_revision: 0,
+        object_bounds_max: FDM_DOMAIN_BOUNDS_MAX,
+        object_bounds_min: FDM_DOMAIN_BOUNDS_MIN,
+        scene_revision: 1,
         study_universe_mesh: null,
         universe: null,
       });
@@ -1336,7 +1390,8 @@ function fixtureHeaders(extra = {}) {
     "access-control-allow-headers": "*",
     "access-control-allow-methods": "GET,POST,PATCH,PUT,DELETE,OPTIONS",
     "access-control-allow-origin": "*",
-    "access-control-expose-headers": "x-api-contract-version,etag,x-request-id",
+    "access-control-expose-headers":
+      "x-api-contract-version,etag,x-request-id,x-fullmag-grid-fingerprint,x-fullmag-region-membership-revision,x-fullmag-domain-generation-id,x-fullmag-encoding,x-fullmag-component,x-fullmag-payload-state,x-fullmag-field-revision,x-fullmag-n-comp,x-fullmag-point-count,x-fullmag-quantity-id,x-fullmag-value-count",
     "x-api-contract-version": "1.0.0",
     ...extra,
   };
@@ -1344,8 +1399,206 @@ function fixtureHeaders(extra = {}) {
 
 function createFdmFixture() {
   const visualizationState = fdmVisualizationStateFixture();
-  const status = fdmStatusFixture({ visualizationState });
-  return { patchCount: 0, status, visualizationState };
+  const scene = fdmSceneFixture();
+  const regions = fdmRegionsFixture();
+  const fdmMembership = fdmMembershipFixture();
+  const fixture = {
+    fdmMembership,
+    fdmMembershipBinary: fdmMembershipBuffer(),
+    patchCount: 0,
+    regions,
+    scene,
+    status: fdmStatusFixture({ visualizationState }),
+    visualizationState,
+  };
+  validateFdmMemoryFixture(fixture);
+  return fixture;
+}
+
+function fdmMemorySupportBounds() {
+  const { xStart, xEnd, yStart, yEnd, zStart, zEnd } = FDM_MEMORY_SUPPORT_RANGE;
+  const starts = [xStart, yStart, zStart];
+  const ends = [xEnd, yEnd, zEnd];
+  return {
+    max: ends.map(
+      (cell, axis) => FDM_DOMAIN_ORIGIN[axis] + cell * FDM_DOMAIN_SPACING[axis],
+    ),
+    min: starts.map(
+      (cell, axis) => FDM_DOMAIN_ORIGIN[axis] + cell * FDM_DOMAIN_SPACING[axis],
+    ),
+  };
+}
+
+function fdmSceneFixture() {
+  const support = fdmMemorySupportBounds();
+  const size = support.max.map((value, axis) => value - support.min[axis]);
+  const center = support.max.map(
+    (value, axis) => (value + support.min[axis]) / 2,
+  );
+  return {
+    objects: [
+      {
+        geometry: { geometry_params: { size }, kind: "box" },
+        id: FDM_MEMORY_OBJECT_ID,
+        regions: [
+          {
+            enabled: true,
+            frame: "object",
+            name: "Core",
+            region_id: FDM_MEMORY_REGION_ID,
+            shape: { center: [0, 0, 0], kind: "box", size },
+          },
+        ],
+        transform: { translation: center },
+        visible: true,
+      },
+    ],
+    revision: 1,
+    schema_version: 2,
+  };
+}
+
+function fdmRegionsFixture() {
+  const support = fdmMemorySupportBounds();
+  return {
+    geometry_realization_revision: 1,
+    region_membership_revision: 1,
+    region_topology_revision: 1,
+    regions: [
+      {
+        bounds_max: support.max,
+        bounds_min: support.min,
+        enabled: true,
+        frame: "object",
+        interaction_refs: [],
+        material_ref: "fixture-material",
+        mesh_part_ids: [],
+        name: "Core",
+        owner_object_id: FDM_MEMORY_OBJECT_ID,
+        region_id: FDM_MEMORY_REGION_ID,
+        source: "authored_object_region",
+        source_body_ids: [],
+        source_object_ids: [FDM_MEMORY_OBJECT_ID],
+      },
+    ],
+    scene_revision: 1,
+  };
+}
+
+function fdmMembershipFixture() {
+  const support = fdmMemorySupportBounds();
+  const regionLegend = [
+    {
+      numeric_id: 1,
+      object_id: FDM_MEMORY_OBJECT_ID,
+      priority: 0,
+      region_id: FDM_MEMORY_REGION_ID,
+    },
+  ];
+  return {
+    binary_path: FDM_MEMBERSHIP_BINARY_PATH,
+    cell_count: FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2],
+    cell_m: FDM_DOMAIN_SPACING,
+    counts: FIELD_GRID,
+    domain_generation_id: "1",
+    encoding: "FMRM:u32_membership_le",
+    freshness: "current",
+    grid_fingerprint: FDM_GRID_FINGERPRINT,
+    magnetic_support: {
+      active_cell_count:
+        (FDM_MEMORY_SUPPORT_RANGE.xEnd - FDM_MEMORY_SUPPORT_RANGE.xStart) *
+        (FDM_MEMORY_SUPPORT_RANGE.yEnd - FDM_MEMORY_SUPPORT_RANGE.yStart) *
+        (FDM_MEMORY_SUPPORT_RANGE.zEnd - FDM_MEMORY_SUPPORT_RANGE.zStart),
+      active_unassigned_cell_count: 0,
+      bounds_max_m: support.max,
+      bounds_min_m: support.min,
+      grid_fingerprint: FDM_GRID_FINGERPRINT,
+      inactive_cell_count:
+        FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2] -
+        (FDM_MEMORY_SUPPORT_RANGE.xEnd - FDM_MEMORY_SUPPORT_RANGE.xStart) *
+          (FDM_MEMORY_SUPPORT_RANGE.yEnd - FDM_MEMORY_SUPPORT_RANGE.yStart) *
+          (FDM_MEMORY_SUPPORT_RANGE.zEnd - FDM_MEMORY_SUPPORT_RANGE.zStart),
+      semantic_role: "magnetic-support",
+    },
+    mesh_revision: 1,
+    object_ids: [FDM_MEMORY_OBJECT_ID],
+    origin_m: FDM_DOMAIN_ORIGIN,
+    region_legend: regionLegend,
+    region_legend_fingerprint: `sha256:${createHash("sha256")
+      .update(
+        JSON.stringify(
+          regionLegend.map(({ numeric_id, object_id, region_id, priority }) => ({
+            numeric_id,
+            object_id,
+            region_id,
+            priority,
+          })),
+        ),
+      )
+      .digest("hex")}`,
+    region_membership_revision: 1,
+    schema_version: "fdm_region_membership.v2",
+  };
+}
+
+function validateFdmMemoryFixture(fixture) {
+  const descriptor = fixture.fdmMembership;
+  const support = descriptor.magnetic_support;
+  const expectedCellCount = FIELD_GRID.reduce(
+    (product, count) => product * count,
+    1,
+  );
+  const expectedActiveCellCount =
+    (FDM_MEMORY_SUPPORT_RANGE.xEnd - FDM_MEMORY_SUPPORT_RANGE.xStart) *
+    (FDM_MEMORY_SUPPORT_RANGE.yEnd - FDM_MEMORY_SUPPORT_RANGE.yStart) *
+    (FDM_MEMORY_SUPPORT_RANGE.zEnd - FDM_MEMORY_SUPPORT_RANGE.zStart);
+  const expectedInactiveCellCount = expectedCellCount - expectedActiveCellCount;
+  const fingerprint = normalizeFixtureFingerprint(descriptor.grid_fingerprint);
+  if (
+    descriptor.binary_path !== FDM_MEMBERSHIP_BINARY_PATH ||
+    !fingerprint ||
+    !sameNumberArray(descriptor.counts, FIELD_GRID) ||
+    descriptor.cell_count !== expectedCellCount ||
+    descriptor.domain_generation_id !== "1" ||
+    !sameNumberArray(descriptor.origin_m, FDM_DOMAIN_ORIGIN) ||
+    !sameNumberArray(descriptor.cell_m, FDM_DOMAIN_SPACING) ||
+    !support ||
+    support.grid_fingerprint !== descriptor.grid_fingerprint ||
+    support.active_cell_count !== expectedActiveCellCount ||
+    support.inactive_cell_count !== expectedInactiveCellCount ||
+    support.active_unassigned_cell_count !== 0
+  ) {
+    throw new Error("FDM memory fixture descriptor is not coherent with its grid.");
+  }
+  const expectedBinaryLength =
+    FDM_FMRM_HEADER_BYTES + expectedCellCount * FDM_FMRM_WORD_BYTES;
+  if (
+    !(fixture.fdmMembershipBinary instanceof ArrayBuffer) ||
+    fixture.fdmMembershipBinary.byteLength !== expectedBinaryLength
+  ) {
+    throw new Error("FDM memory fixture FMRM length is not coherent with its grid.");
+  }
+  const view = new DataView(fixture.fdmMembershipBinary);
+  const magic = String.fromCharCode(
+    view.getUint8(0),
+    view.getUint8(1),
+    view.getUint8(2),
+    view.getUint8(3),
+  );
+  if (
+    magic !== "FMRM" ||
+    view.getUint8(4) !== 2 ||
+    view.getUint8(5) !== 2 ||
+    !sameNumberArray(
+      [view.getUint32(8, true), view.getUint32(12, true), view.getUint32(16, true)],
+      FIELD_GRID,
+    ) ||
+    view.getUint32(20, true) !== expectedCellCount ||
+    view.getUint32(24, true) !== descriptor.region_legend.length ||
+    readHexBytes(view, 28, 32) !== fingerprint
+  ) {
+    throw new Error("FDM memory fixture FMRM header is not coherent with its descriptor.");
+  }
 }
 
 function fdmStatusFixture(fixture) {
@@ -1388,7 +1641,7 @@ function fdmStatusFixture(fixture) {
     domain: {
       cell_count: FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2],
       discretization: "fdm",
-      generation_id: 1,
+      generation_id: "1",
     },
     energies: {},
     lifecycle: {
@@ -1408,7 +1661,7 @@ function fdmStatusFixture(fixture) {
       command_completion_revision: 0,
       commands_revision: 0,
       display_revision: revision,
-      domain_generation_id: 1,
+      domain_generation_id: "1",
       engine_log_revision: 0,
       field_catalog_revision: 1,
       field_revision: 1,
@@ -1416,7 +1669,7 @@ function fdmStatusFixture(fixture) {
       mesh_build_revision: 0,
       mesh_revision: 0,
       scalars_revision: 0,
-      scene_revision: 0,
+      scene_revision: 1,
       simulation_preparation_revision: 0,
       slice_revision: 0,
       stages_revision: 0,
@@ -1443,22 +1696,63 @@ function fdmStatusFixture(fixture) {
 function fdmDomainMetaFixture() {
   return {
     bounds: {
-      max: [6e-7, 4e-7, 1e-7],
-      min: [-6e-7, -4e-7, -1e-7],
+      max: FDM_DOMAIN_BOUNDS_MAX,
+      min: FDM_DOMAIN_BOUNDS_MIN,
     },
     coordinate_system: "cartesian",
     counts: { cells: FIELD_GRID[0] * FIELD_GRID[1] * FIELD_GRID[2] },
     dimension: 3,
     discretization: "fdm",
     domain_id: "fdm-memory-churn-domain",
-    generation_id: 1,
+    generation_id: "1",
     grid: {
-      origin: [-6e-7, -4e-7, -1e-7],
+      origin: FDM_DOMAIN_ORIGIN,
       shape: FIELD_GRID,
-      spacing: [1.25e-8, 1.25e-8, 5e-8],
+      spacing: FDM_DOMAIN_SPACING,
     },
     units: { length: "m" },
   };
+}
+
+function fdmMembershipBuffer() {
+  const [nx, ny, nz] = FIELD_GRID;
+  const cellCount = nx * ny * nz;
+  const buffer = new ArrayBuffer(
+    FDM_FMRM_HEADER_BYTES + cellCount * FDM_FMRM_WORD_BYTES,
+  );
+  const view = new DataView(buffer);
+  for (const [index, code] of [..."FMRM"].entries()) {
+    view.setUint8(index, code.charCodeAt(0));
+  }
+  view.setUint8(4, 2);
+  view.setUint8(5, 2);
+  view.setUint32(8, nx, true);
+  view.setUint32(12, ny, true);
+  view.setUint32(16, nz, true);
+  view.setUint32(20, cellCount, true);
+  view.setUint32(24, 1, true);
+  writeHexBytes(view, 28, FDM_GRID_FINGERPRINT);
+  const { xStart, xEnd, yStart, yEnd, zStart, zEnd } = FDM_MEMORY_SUPPORT_RANGE;
+  for (let z = 0; z < nz; z += 1) {
+    for (let y = 0; y < ny; y += 1) {
+      for (let x = 0; x < nx; x += 1) {
+        const index = x + nx * (y + ny * z);
+        const insideSupport =
+          x >= xStart &&
+          x < xEnd &&
+          y >= yStart &&
+          y < yEnd &&
+          z >= zStart &&
+          z < zEnd;
+        view.setUint32(
+          FDM_FMRM_HEADER_BYTES + index * FDM_FMRM_WORD_BYTES,
+          insideSupport ? 1 : FDM_FMRM_INACTIVE_REGION_ID,
+          true,
+        );
+      }
+    }
+  }
+  return buffer;
 }
 
 function fdmMultilayerLayoutFixture() {
@@ -1572,6 +1866,21 @@ function writeHexBytes(view, offset, hex) {
       Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16),
     );
   }
+}
+
+function readHexBytes(view, offset, byteLength) {
+  let hex = "";
+  for (let index = 0; index < byteLength; index += 1) {
+    hex += view.getUint8(offset + index).toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+function normalizeFixtureFingerprint(value) {
+  const normalized = String(value ?? "").trim().replace(/^sha256:/i, "");
+  return /^[0-9a-f]{64}$/i.test(normalized)
+    ? normalized.toLowerCase()
+    : null;
 }
 
 function fdmFieldCatalogFixture() {
