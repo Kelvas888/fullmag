@@ -722,6 +722,43 @@ def _windows_loopback_port_conflicts(port):
     return conflicts
 
 
+def select_loopback_port(preferred, project, *, attempts=64):
+    """Choose the frontend port for a new group when the operator gave none.
+
+    ``preferred`` is tried first.  The fallback order is a stable per-project
+    rotation of the following ports, so parallel worktrees starting together
+    rarely race for the same port and a group keeps its choice across retries.
+    Bindings of stopped containers count as taken: a retained group must be
+    able to restart on the port it already pins.
+    """
+
+    if not 1024 <= preferred <= 65535:
+        raise ValueError("Port must be between 1024 and 65535")
+    if not isinstance(project, str) or re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project) is None:
+        raise ValueError("Invalid Compose project name")
+    span = max(1, min(attempts, 65536 - preferred))
+    offset = int(hashlib.sha256(project.encode("utf-8")).hexdigest(), 16)
+    candidates = [preferred] + [
+        preferred + 1 + (offset + index) % (span - 1) for index in range(span - 1)
+    ] if span > 1 else [preferred]
+    container_ids = [value for value in docker("ps", "--all", "--quiet").splitlines() if value.strip()]
+    try:
+        documents = json.loads(docker("inspect", *container_ids)) if container_ids else []
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("Could not inspect Docker containers for port ownership") from error
+    if not isinstance(documents, list):
+        raise ValueError("Docker container port inspection returned an invalid document")
+    for port in candidates:
+        if any(_published_host_port_conflicts(document, port) for document in documents):
+            continue
+        if _windows_loopback_port_conflicts(port):
+            continue
+        return port
+    raise ValueError(
+        f"No free loopback port among {len(candidates)} candidates from {preferred}; pass an explicit port"
+    )
+
+
 def assert_loopback_port_available(port, project):
     """Reject host listeners before any runtime state mutation."""
 

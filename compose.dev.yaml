@@ -263,7 +263,7 @@ services:
       # independently pins the same heap budget in its sanitized environment.
       NODE_OPTIONS: --max-old-space-size=6144
       FULLMAG_API_PROXY_TARGET: http://backend:8081
-      FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-2000}
+      FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-5000}
       FULLMAG_SOURCE_ROOT: ${FULLMAG_SOURCE_ROOT:?Select the Windows source checkout}
       FULLMAG_SOURCE_WORKTREE_ID: ${FULLMAG_SOURCE_WORKTREE_ID:?Select a registered source worktree}
       FULLMAG_SOURCE_COMMIT: ${FULLMAG_SOURCE_COMMIT:?Resolve the selected checkout commit}

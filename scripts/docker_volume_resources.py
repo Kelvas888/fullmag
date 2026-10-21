@@ -33,6 +33,54 @@ def _inspect(*arguments, timeout=90):
     return records[0]
 
 
+def _docker_capacity():
+    return json.loads(docker_capture("info", "--format", "{{json .}}").stdout)
+
+
+def default_group_budget(capacity):
+    """Per-group defaults sized so three DEV groups fit in one Docker VM.
+
+    Compose limits are caps, not reservations: an idle group costs nothing and
+    a busy one is throttled by its own quota instead of stopping other groups.
+    """
+    cpus, memory_gib = int(capacity["NCPU"]), int(capacity["MemTotal"]) // GIB
+    return {
+        "FULLMAG_DEV_BACKEND_CPUS": max(2, min(8, cpus // 4)),
+        "FULLMAG_DEV_BACKEND_MEMORY_GIB": max(8, min(32, memory_gib // 6)),
+        "FULLMAG_DEV_FRONTEND_CPUS": max(2, min(4, cpus // 10)),
+        "FULLMAG_DEV_FRONTEND_MEMORY_GIB": max(8, min(16, memory_gib // 12)),
+    }
+
+
+def apply_group_budget(document, configured, capacity=None):
+    """Apply the static per-group budget from ``.env`` or the VM defaults.
+
+    The container quota, the native host profile and Cargo use one value, so
+    the group's own ledger never offers more than its container may use.
+    """
+    capacity = _docker_capacity() if capacity is None else capacity
+    budget = {**default_group_budget(capacity), **configured}
+    backend_cpus = budget["FULLMAG_DEV_BACKEND_CPUS"]
+    backend_memory = budget["FULLMAG_DEV_BACKEND_MEMORY_GIB"] * GIB
+    frontend_cpus = budget["FULLMAG_DEV_FRONTEND_CPUS"]
+    frontend_memory = budget["FULLMAG_DEV_FRONTEND_MEMORY_GIB"] * GIB
+    if backend_cpus < 2:
+        raise BuildControlError("FULLMAG_DEV_BACKEND_CPUS must be at least 2 for compute and preparation")
+    if backend_memory < 4 * GIB or frontend_memory < 8 * GIB:
+        raise BuildControlError("DEV budget needs at least 4 GiB for backend and 8 GiB for frontend")
+    if (max(backend_cpus, frontend_cpus) > capacity["NCPU"]
+            or max(backend_memory, frontend_memory) > capacity["MemTotal"]):
+        raise BuildControlError("DEV group budget exceeds Docker capacity "
+                                f"({capacity['NCPU']} CPUs, {capacity['MemTotal'] // GIB} GiB)")
+    backend, frontend = (document["services"][name] for name in ("backend", "frontend"))
+    backend.update(cpus=backend_cpus, mem_limit=backend_memory)
+    frontend.update(cpus=frontend_cpus, mem_limit=frontend_memory)
+    environment = backend.setdefault("environment", {})
+    environment["CARGO_BUILD_JOBS"] = str(min(backend_cpus, 64))
+    environment["FULLMAG_DOCKER_CPU_MILLIS"] = str(backend_cpus * 1000)
+    environment["FULLMAG_DOCKER_MEMORY_BYTES"] = str(backend_memory)
+
+
 def apply_saved_budget(control, document):
     """Apply only this control namespace's explicitly saved backend budget."""
     profile = control.read(PROFILE_PATH, optional=True)
@@ -61,7 +109,7 @@ def apply_saved_budget(control, document):
             or type(swap) is not int or (swap != -1 and swap < memory)):
         raise BuildControlError("Saved backend resource budget is invalid")
     backend = document["services"]["backend"]
-    capacity = json.loads(docker_capture("info", "--format", "{{json .}}").stdout)
+    capacity = _docker_capacity()
     if (memory < int(backend["mem_limit"]) or cpus < float(backend["cpus"])
             or memory > capacity["MemTotal"] or cpus > capacity["NCPU"]):
         raise BuildControlError("Saved backend budget is below the Compose baseline or above Docker capacity")

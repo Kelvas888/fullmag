@@ -173,7 +173,7 @@ python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $sour
 ### Cykl edycji i przebudowy
 
 Frontend reaguje przez HMR na zapis plików Windows. Watchpack domyślnie używa
-pollingu `2000` ms; lokalne `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza
+pollingu `5000` ms; lokalne `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza
 `250`–`10000` ms. Wykrycie edycji może więc poczekać do następnego skanu,
 po którym Next przebudowuje zmienione moduły. Docker DEV pomija wygenerowane
 katalogi `.fullmag-frontend`, `.next*` i `node_modules`; `app`, `src`, `public`
