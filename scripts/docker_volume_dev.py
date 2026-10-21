@@ -1382,7 +1382,6 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
         host.write_bound_evidence(certificate_path, certificate)
         host.publish_evidence(state / host.OWNER_NAME, certificate)
     import docker_worker_cgroup
-    docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
     log_writer = lambda output: control.write(operation["root"] + "/storage-probe-log.json", {"log": output})
     if os.name == "nt":
         runtime._complete_backend_storage_preflight(docker_text, backend_id, state, certificate_path, certificate, None,
@@ -1390,6 +1389,7 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     else:
         _session_host().complete_preflight(docker_text, backend_id, state, certificate_path, certificate,
                                            log_writer=log_writer)
+    docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
     import docker_host_ledger as ledger
     verify_spec = ledger_profile["maintenance_document"]
     verify_name = "fullmag-ledger-verify-" + token

@@ -120,6 +120,43 @@ class VolumeReceiptTests(unittest.TestCase):
                      'mount_root': '/ledger', 'backing_image': '/ledger.ext4'}, 3197)
         self.assertEqual(events, ['retired', 'backend-observation'])
 
+    def test_finish_completes_storage_preflight_before_worker_cgroup_delegation(self):
+        from types import SimpleNamespace
+        import docker_volume_dev as dev
+        import docker_worker_cgroup
+        import fullmag_docker_runtime as runtime
+
+        for host_os in ("posix", "nt"):
+            with self.subTest(host_os=host_os):
+                events = []
+                control = mock.Mock(project="fullmag-master", volume="test-control")
+                operation = {"root": "attempts/test", "receipt": {"attempt": "a" * 32}}
+                host = mock.Mock()
+                host.complete_preflight.side_effect = lambda *a, **kw: events.append("storage")
+
+                def delegate(*args, **kwargs):
+                    self.assertEqual(events, ["storage"])
+                    raise RuntimeError("delegation boundary reached")
+
+                with (
+                    mock.patch.object(dev, "os", SimpleNamespace(name=host_os)),
+                    mock.patch.object(dev, "_operator_probe_record_from_retained", return_value={}),
+                    mock.patch.object(dev, "_wait_for_publication", return_value=({}, {})),
+                    mock.patch.object(runtime, "_assembly_from_backend_start", return_value={}),
+                    mock.patch.object(runtime, "_complete_backend_storage_preflight",
+                                      side_effect=lambda *a, **kw: events.append("storage")),
+                    mock.patch.object(dev, "_session_host", return_value=host),
+                    mock.patch.object(docker_worker_cgroup, "ensure_delegation", side_effect=delegate),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "delegation boundary reached"):
+                        dev._finish(control, operation,
+                            {"services": {"backend": {"environment": {
+                                "FULLMAG_DOCKER_DEVICE_ACCESS": "gpu"}}}},
+                            "backend", "frontend", Path("/source"), Path("/state"), Path("/certificate"),
+                            {"restart_verified": True, "storage_profile":
+                                "windows-folder-v1" if host_os == "nt" else "linux-native-v1"},
+                            {}, {"image_id": "image"}, "image", Path("/git"), {}, 3197)
+
     def test_invalid_compose_stops_before_daemon_mutation_boundary(self):
         import docker_volume_dev as dev
         operation = {'receipt': {}, 'daemon_pending': False}
