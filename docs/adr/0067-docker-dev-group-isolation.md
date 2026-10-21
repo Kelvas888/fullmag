@@ -138,6 +138,10 @@ Dowód punktu 1 (21.10.2026, Windows, Docker Desktop `desktop-linux`, GPU):
   grupy niezrestartowanej zgłaszał w czasie buildu drugiej grupy pojedyncze
   4-sekundowe degradacje obserwacji (wspólne CPU VM) i sam je zamykał;
   admisja nie była zamknięta.
+- Trzecia, świeża grupa `fullmag-worktree-group-ledger-proof-c-…` (commit
+  `61c1612ae`, liść `ledger/` tworzony przez launcher przed admisją)
+  zbudowała się i osiągnęła `Ready` przy działającej B (port 3255); B nie
+  zmieniła `StartedAt` ani stanu.
 - `_assert_host_capacity_migration_quiescent()` na żywo przy obu działających
   grupach: PASS (backendy grup nie są konsumentami globalnego ledgera).
 - Testy interpretowane w kontenerze grupy (`just docker-dev-control-checks`
@@ -147,5 +151,8 @@ Dowód punktu 1 (21.10.2026, Windows, Docker Desktop `desktop-linux`, GPU):
 
 NOT VERIFIED: jednorazowa rotacja istniejącej grupy z ledgera globalnego na
 ledger grupy w runtime (sprawdzona tylko testem kontraktu); ścieżki recovery
-zatrzymanego backendu z wolumenem grupy (namespace, container recovery);
-host Linux/WSL; trzecia równoległa grupa.
+zatrzymanego backendu z wolumenem grupy (namespace, container recovery,
+orphan recovery); host Linux/WSL. Znane ograniczenie (fail-closed): dowody
+runów przyjętych pod ledgerem globalnym (`host_id` daemona) nie pasują do
+host ID grupy, więc capture-failure reconcile i pre-ack retry takich runów po
+przejściu grupy na własny ledger są odrzucane.
