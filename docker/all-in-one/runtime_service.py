@@ -48,6 +48,14 @@ DEVICE_ACCESS_CHOICES = frozenset({"cpu", "gpu"})
 # the serialized CLI/profile value stable across host operating systems.
 HOST_LEDGER_ROOT = PurePosixPath("/host-ledger/ledger")
 HOST_LEDGER_PROFILE = "host-ledger-v1"
+# ADR 0067: a volume DEV group's own ledger volume at the same container path.
+GROUP_LEDGER_PROFILE = "group-ledger-v1"
+GROUP_LEDGER_HOST_ID_ENV = "FULLMAG_GROUP_LEDGER_HOST_ID"
+HOST_CAPACITY_ENVIRONMENT = (
+    "FULLMAG_DOCKER_HOST_CAPACITY_PATH",
+    "FULLMAG_DOCKER_HOST_CAPACITY_SHA256",
+    "FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256",
+)
 HOST_RESOURCE_LEDGER_FILE = "HOST_RESOURCE_LEDGER.json"
 LEGACY_DOCKER_HOST_ID = "docker-all-host"
 MAX_HOST_LEDGER_BYTES = 8 * 1024 * 1024
@@ -466,14 +474,27 @@ def recover_idle_failure(
 
 
 def _validated_docker_host_id() -> str:
-    """Return the daemon attestation required by the canonical host-ledger adapter."""
+    """Return the ledger host ID bound to the verified Docker daemon.
 
-    if os.environ.get("FULLMAG_HOST_LEDGER_PROFILE") != HOST_LEDGER_PROFILE:
-        _fail("Docker host initialization requires the canonical host-ledger-v1 profile")
+    ``host-ledger-v1`` uses the daemon digest itself.  A ``group-ledger-v1``
+    DEV group uses its launcher-derived ID (daemon digest plus Compose
+    project); the daemon digest remains the storage-admission identity.
+    """
+
+    profile = os.environ.get("FULLMAG_HOST_LEDGER_PROFILE")
+    if profile not in {HOST_LEDGER_PROFILE, GROUP_LEDGER_PROFILE}:
+        _fail("Docker host initialization requires the host-ledger-v1 or group-ledger-v1 profile")
     value = os.environ.get("FULLMAG_DOCKER_HOST_ID", "")
     if HEX64.fullmatch(value) is None:
         _fail("FULLMAG_DOCKER_HOST_ID must be the verified lowercase Docker daemon SHA-256")
-    return value
+    if profile == HOST_LEDGER_PROFILE:
+        return value
+    if any(os.environ.get(name) is not None for name in HOST_CAPACITY_ENVIRONMENT):
+        _fail("a group ledger cannot bind the global Docker host capacity descriptor")
+    group_host_id = os.environ.get(GROUP_LEDGER_HOST_ID_ENV, "")
+    if HEX64.fullmatch(group_host_id) is None or group_host_id == value:
+        _fail(GROUP_LEDGER_HOST_ID_ENV + " must be the group's derived lowercase SHA-256")
+    return group_host_id
 
 
 def _initializer_host_id(daemon_host_id: str) -> str:
@@ -501,7 +522,10 @@ def _initializer_host_id(daemon_host_id: str) -> str:
     stored_host_id = policy.get("host_id")
     if not isinstance(stored_host_id, str) or not stored_host_id:
         _fail("existing host resource ledger policy has no host_id")
-    if stored_host_id not in {LEGACY_DOCKER_HOST_ID, daemon_host_id}:
+    accepted = {daemon_host_id}
+    if os.environ.get("FULLMAG_HOST_LEDGER_PROFILE") == HOST_LEDGER_PROFILE:
+        accepted.add(LEGACY_DOCKER_HOST_ID)
+    if stored_host_id not in accepted:
         _fail("existing host resource ledger host_id differs from the verified Docker daemon")
     return stored_host_id
 
@@ -2291,6 +2315,74 @@ def _retain_previous_configuration(path: Path, raw: bytes) -> None:
         _fail("previous runtime configuration backup verification failed")
 
 
+def _capacity_projection(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Project a configuration onto the fields a measured transition keeps."""
+    result = dict(config)
+    for name in ("compute_resources", "preparation_resources"):
+        offers = result.get(name)
+        if (not isinstance(offers, list) or not offers
+                or any(not isinstance(offer, dict) or not isinstance(offer.get("budget"), dict)
+                       for offer in offers)):
+            return None
+        result[name] = [
+            {**offer, "budget": {
+                key: value for key, value in offer["budget"].items()
+                if key not in {"cpu_millis", "memory_bytes"}
+            }}
+            for offer in offers
+        ]
+    host = result.get("host_execution")
+    if not isinstance(host, dict):
+        return None
+    host = dict(host)
+    host.pop("policy", None)
+    host.pop("runtime_generation_sha256", None)
+    placements = host.get("compute_placements")
+    preparation = host.get("preparation_cpu_ids")
+    if (not isinstance(placements, dict) or not isinstance(preparation, dict)
+            or any(not isinstance(value, dict) for value in placements.values())
+            or any(not isinstance(value, list) for value in preparation.values())):
+        return None
+    # Resource identities, GPU UUIDs, concurrency, paths and timing remain
+    # exact, including storage and GPU memory. Only CPU/RAM budgets and CPU
+    # masks are permitted to vary.
+    host["compute_placements"] = {
+        key: {field: value for field, value in placement.items() if field != "cpu_ids"}
+        for key, placement in placements.items()
+    }
+    host["preparation_cpu_ids"] = dict.fromkeys(preparation)
+    result["host_execution"] = host
+    return result
+
+
+def _group_ledger_transition_allowed(current: dict[str, Any], expected: dict[str, Any]) -> bool:
+    """Allow one move of a DEV group from the global ledger to its own ledger.
+
+    The caller holds the authenticated terminal drain of the previous owner.
+    Only the policy (host ID and the group's own budget/topology) and the
+    CPU/RAM budgets and masks may change; paths, pools, resource identities,
+    GPU placement and concurrency stay exact.  Reservations of the global
+    ledger are not carried over (ADR 0067).  A configuration that is already
+    bound to this group's host ID never takes this path again.
+    """
+    if os.environ.get("FULLMAG_HOST_LEDGER_PROFILE") != GROUP_LEDGER_PROFILE:
+        return False
+    group_host_id = os.environ.get(GROUP_LEDGER_HOST_ID_ENV)
+    old_host, new_host = current.get("host_execution"), expected.get("host_execution")
+    if (not isinstance(old_host, dict) or not isinstance(new_host, dict)
+            or not isinstance(old_host.get("policy"), dict)
+            or not isinstance(new_host.get("policy"), dict)
+            or not isinstance(group_host_id, str) or not HEX64.fullmatch(group_host_id)):
+        return False
+    if (new_host["policy"].get("host_id") != group_host_id
+            or old_host["policy"].get("host_id") == group_host_id
+            or old_host.get("ledger_root") != str(HOST_LEDGER_ROOT)
+            or new_host.get("ledger_root") != str(HOST_LEDGER_ROOT)):
+        return False
+    old_projection, new_projection = _capacity_projection(current), _capacity_projection(expected)
+    return old_projection is not None and old_projection == new_projection
+
+
 def _capacity_profile_transition_allowed(
     current: dict[str, Any], expected: dict[str, Any], authority: Mapping[str, Any] | None,
 ) -> bool:
@@ -2315,45 +2407,7 @@ def _capacity_profile_transition_allowed(
             or old_host.get("policy") not in [new_host.get("policy"), *history]):
         return False
 
-    def projection(config):
-        result = dict(config)
-        for name in ("compute_resources", "preparation_resources"):
-            offers = result.get(name)
-            if (not isinstance(offers, list) or not offers
-                    or any(not isinstance(offer, dict) or not isinstance(offer.get("budget"), dict)
-                           for offer in offers)):
-                return None
-            result[name] = [
-                {**offer, "budget": {
-                    key: value for key, value in offer["budget"].items()
-                    if key not in {"cpu_millis", "memory_bytes"}
-                }}
-                for offer in offers
-            ]
-        host = result.get("host_execution")
-        if not isinstance(host, dict):
-            return None
-        host = dict(host)
-        host.pop("policy", None)
-        host.pop("runtime_generation_sha256", None)
-        placements = host.get("compute_placements")
-        preparation = host.get("preparation_cpu_ids")
-        if (not isinstance(placements, dict) or not isinstance(preparation, dict)
-                or any(not isinstance(value, dict) for value in placements.values())
-                or any(not isinstance(value, list) for value in preparation.values())):
-            return None
-        # Resource identities, GPU UUIDs, concurrency, paths and timing remain
-        # exact, including storage and GPU memory. Only CPU/RAM budgets and CPU
-        # masks are permitted to vary.
-        host["compute_placements"] = {
-            key: {field: value for field, value in placement.items() if field != "cpu_ids"}
-            for key, placement in placements.items()
-        }
-        host["preparation_cpu_ids"] = dict.fromkeys(preparation)
-        result["host_execution"] = host
-        return result
-
-    old_projection, new_projection = projection(current), projection(expected)
+    old_projection, new_projection = _capacity_projection(current), _capacity_projection(expected)
     return old_projection is not None and old_projection == new_projection
 
 
@@ -2377,7 +2431,8 @@ def _rotate_configuration_generation(
     new_profile.pop("runtime_generation_sha256", None)
     if ({**current, "host_execution": old_profile}
             != {**expected, "host_execution": new_profile}
-            and not _capacity_profile_transition_allowed(current, expected, capacity_authority)):
+            and not _capacity_profile_transition_allowed(current, expected, capacity_authority)
+            and not _group_ledger_transition_allowed(current, expected)):
         _fail("runtime configuration rotation cannot change the operator profile")
     raw = _bounded_regular(paths.config, "runtime configuration before rotation")
     if hashlib.sha256(raw).hexdigest() != previous_sha256:

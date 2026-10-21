@@ -673,7 +673,11 @@ def _assert_host_capacity_migration_quiescent():
                     or any(not isinstance(mount, dict)
                            or not isinstance(mount.get("Destination"), str) for mount in mounts)):
                 raise BuildControlError("Docker consumer inspection has an unknown mount inventory")
-            if not any(mount["Destination"] == "/host-ledger" for mount in mounts):
+            # A DEV group ledger volume at the same path is private to its
+            # group and never a consumer of the global host ledger.
+            import docker_group_ledger as group_ledger
+            if not any(mount["Destination"] == "/host-ledger"
+                       and not group_ledger.is_group_ledger_mount(mount) for mount in mounts):
                 continue
             running = item.get("State", {}).get("Running")
             if type(running) is not bool:
@@ -685,6 +689,70 @@ def _assert_host_capacity_migration_quiescent():
             "Host capacity migration requires coordinated stop of ledger consumers: "
             + ", ".join(blockers)
         )
+
+
+def _uses_group_ledger(operation, *, new_render):
+    """Select the ledger profile pinned in this operation receipt.
+
+    Every new render uses the per-group ledger (ADR 0067).  A partially
+    resumed operation keeps the profile it was rendered with, so an
+    interrupted global-ledger render is never continued with another ledger.
+    """
+    receipt = operation["receipt"]
+    pinned = receipt.get("ledger_profile")
+    if pinned not in (None, "group-ledger-v1"):
+        raise BuildControlError("Retained ledger profile is invalid")
+    if new_render:
+        return True
+    return pinned == "group-ledger-v1"
+
+
+def _group_ledger(control, operation, image, *, new_render=False):
+    """Prepare the group's own ledger volume; no host or privileged helper."""
+    import docker_group_ledger as group_ledger
+    import docker_host_ledger as ledger
+    if new_render:
+        operation["receipt"]["ledger_profile"] = group_ledger.PROFILE
+        control.write(operation["root"] + "/receipt.json", operation["receipt"])
+    daemon = ledger._daemon_info(docker_text)
+    retained = control.read(operation["root"] + "/group-ledger.json", optional=True)
+    if retained is not None and (
+            not isinstance(retained, Mapping)
+            or retained.get("daemon_id_sha256") != daemon["id_sha256"]
+            or retained.get("compose_project") != control.project):
+        raise BuildControlError("Retained group ledger belongs to another daemon or group")
+    key = group_ledger.volume_key(daemon["id_sha256"], control.project)
+    volume = _owned_volume(control, group_ledger.VOLUME_ROLE, key)
+    profile = group_ledger.profile(daemon["id_sha256"], control.project, volume, image)
+    record = {"schema": "fullmag.docker-group-ledger.v1", "profile": group_ledger.PROFILE,
+              "daemon_id_sha256": daemon["id_sha256"], "compose_project": control.project,
+              "volume_name": volume, "host_id": profile["environment"][group_ledger.HOST_ID_ENV]}
+    if retained is not None and retained != record:
+        raise BuildControlError("Retained group ledger identity changed during partial resume")
+    control.write(operation["root"] + "/group-ledger.json", record)
+    return profile["backend"], profile
+
+
+def _retained_ledger_profile(control, previous_root, document, image):
+    """Rebuild the ledger attestation profile of one retained DEV render."""
+    environment = document["services"]["backend"]["environment"]
+    import docker_group_ledger as group_ledger
+    if group_ledger.is_group_ledger_backend(environment):
+        try:
+            profile = group_ledger.retained_profile(document, image)
+        except group_ledger.GroupLedgerError as error:
+            raise BuildControlError(str(error)) from error
+        record = control.read(previous_root + "/group-ledger.json")
+        if (not isinstance(record, Mapping) or record.get("volume_name") != profile["volume_name"]
+                or record.get("host_id") != profile["environment"][group_ledger.HOST_ID_ENV]):
+            raise BuildControlError("Retained group ledger record differs from its Compose render")
+        return profile
+    return {"profile": "host-ledger-v1", "image_id": image, "environment": environment,
+        "mount_root": environment["FULLMAG_HOST_LEDGER_MOUNT_ROOT"],
+        "project_id": environment["FULLMAG_HOST_LEDGER_PROJECT_ID"],
+        "backing_image": environment["FULLMAG_HOST_LEDGER_BACKING_IMAGE"],
+        "host_receipt": control.read(previous_root + "/host-ledger.json"),
+        "maintenance_document": control.read(previous_root + "/ledger-maintenance-compose.json")}
 
 
 def _host_ledger(control, operation, layout, selected, image, *, new_render=False,
@@ -1626,10 +1694,17 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         cache = _backend_cache(control, operation, layout, selected, image, toolchain["image_id"])
         operation["receipt"]["backend_volumes"] = cache["volume_names"]
         frontend_inputs, frontend_volume = _frontend(control, operation, selected, state, args.port, image)
-        ledger_backend, ledger_profile = _host_ledger(
-            control, operation, layout, selected, image, new_render=provided_operation is None,
-            migrate_capacity=bool(getattr(args, "migrate_host_capacity", False)),
-        )
+        if _uses_group_ledger(operation, new_render=provided_operation is None):
+            if getattr(args, "migrate_host_capacity", False):
+                raise BuildControlError(
+                    "A DEV group ledger has no host capacity migration; its budget is the group's own")
+            ledger_backend, ledger_profile = _group_ledger(
+                control, operation, image, new_render=provided_operation is None)
+        else:
+            ledger_backend, ledger_profile = _host_ledger(
+                control, operation, layout, selected, image, new_render=provided_operation is None,
+                migrate_capacity=bool(getattr(args, "migrate_host_capacity", False)),
+            )
         inputs = {"image_id": image, "toolchain_image_id": toolchain["image_id"],
                   "guest_provenance_path": "/opt/fullmag/control/backend/runtime-provenance.json"}
         provisional, hashes, delegation = runtime._provisional_development_certificate(inputs, identity)
@@ -1776,6 +1851,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             descriptor = ledger_backend["x-fullmag-host-ledger-volume"]
             backend["x-fullmag-host-ledger-volume"] = descriptor
             document["volumes"]["host-ledger"] = descriptor["compose_volume"]
+        if ledger_profile["profile"] == "group-ledger-v1":
+            import docker_group_ledger as group_ledger
+            document["volumes"][group_ledger.COMPOSE_VOLUME] = ledger_profile["compose_volume"]
+            # The group's base render must not retain any global ledger field.
+            for key in group_ledger.GLOBAL_ONLY_ENVIRONMENT:
+                backend["environment"].pop(key, None)
         _reassert_operator_probe_environment(document, operator_probe_record)
         for service in (backend, frontend):
             service["logging"] = {"driver": "local", "options": {"max-size": "10m", "max-file": "3"}}
@@ -1904,32 +1985,38 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     # Complete the independent guest probes first to avoid a circular wait.
     import docker_worker_cgroup
     docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
-    import docker_host_ledger as ledger
-    verify_spec = ledger_profile["maintenance_document"]
-    verify_name = "fullmag-ledger-verify-" + token
-    output = compose_capture(verify_spec, "run", "--name", verify_name, "--no-deps", "host-ledger-maintenance", "verify", timeout=240)
-    actual_verify = json.loads(docker_text("inspect", verify_name))
-    if (len(actual_verify) != 1 or actual_verify[0].get("Image") != image
-            or actual_verify[0].get("State", {}).get("Running")
-            or actual_verify[0].get("State", {}).get("ExitCode") != 0
-            or actual_verify[0].get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != control.project):
-        raise BuildControlError("Fresh host-ledger verification identity/outcome differs")
-    host_receipt = ledger._parse_json_lines(output.decode(), ledger.HOST_RECEIPT_SCHEMA)
-    ledger._validate_host_receipt(host_receipt, {"project_id": ledger_profile["project_id"],
-        "mount_root": ledger_profile["mount_root"], "backing_image": ledger_profile["backing_image"]})
-    ledger_profile["host_receipt"] = host_receipt
-    # Preserve the successful probe before observing the application. A backend
-    # exit during its attestation must not leave this known stopped helper
-    # blocking the next managed start of the same Compose project.
-    control.write(operation["root"] + "/ledger-verify-receipt.json", host_receipt)
-    control.write(operation["root"] + "/ledger-verify-log.json",
-                  {"log": docker_text("logs", verify_name, combined=True)})
-    docker_capture("rm", actual_verify[0]["Id"])
-    backend_service = document["services"]["backend"]
-    if "x-fullmag-host-ledger-volume" in backend_service:
-        ledger_profile = {**ledger_profile, "daemon_volume": backend_service["x-fullmag-host-ledger-volume"]}
-    ledger_attestation = ledger.validate_container(json.loads(docker_text("inspect", backend_id))[0], ledger_profile, docker_text)
-    control.write(operation["root"] + "/host-ledger-attestation.json", ledger_attestation)
+    if ledger_profile["profile"] == "group-ledger-v1":
+        import docker_group_ledger as group_ledger
+        ledger_attestation = group_ledger.validate_container(
+            json.loads(docker_text("inspect", backend_id))[0], ledger_profile, docker_text)
+        control.write(operation["root"] + "/group-ledger-attestation.json", ledger_attestation)
+    else:
+        import docker_host_ledger as ledger
+        verify_spec = ledger_profile["maintenance_document"]
+        verify_name = "fullmag-ledger-verify-" + token
+        output = compose_capture(verify_spec, "run", "--name", verify_name, "--no-deps", "host-ledger-maintenance", "verify", timeout=240)
+        actual_verify = json.loads(docker_text("inspect", verify_name))
+        if (len(actual_verify) != 1 or actual_verify[0].get("Image") != image
+                or actual_verify[0].get("State", {}).get("Running")
+                or actual_verify[0].get("State", {}).get("ExitCode") != 0
+                or actual_verify[0].get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != control.project):
+            raise BuildControlError("Fresh host-ledger verification identity/outcome differs")
+        host_receipt = ledger._parse_json_lines(output.decode(), ledger.HOST_RECEIPT_SCHEMA)
+        ledger._validate_host_receipt(host_receipt, {"project_id": ledger_profile["project_id"],
+            "mount_root": ledger_profile["mount_root"], "backing_image": ledger_profile["backing_image"]})
+        ledger_profile["host_receipt"] = host_receipt
+        # Preserve the successful probe before observing the application. A backend
+        # exit during its attestation must not leave this known stopped helper
+        # blocking the next managed start of the same Compose project.
+        control.write(operation["root"] + "/ledger-verify-receipt.json", host_receipt)
+        control.write(operation["root"] + "/ledger-verify-log.json",
+                      {"log": docker_text("logs", verify_name, combined=True)})
+        docker_capture("rm", actual_verify[0]["Id"])
+        backend_service = document["services"]["backend"]
+        if "x-fullmag-host-ledger-volume" in backend_service:
+            ledger_profile = {**ledger_profile, "daemon_volume": backend_service["x-fullmag-host-ledger-volume"]}
+        ledger_attestation = ledger.validate_container(json.loads(docker_text("inspect", backend_id))[0], ledger_profile, docker_text)
+        control.write(operation["root"] + "/host-ledger-attestation.json", ledger_attestation)
     # Observe the existing incarnations; a readiness check must never run up
     # again or wait an hour after the supervisor has already closed admission.
     image_config = json.loads(docker_text("image", "inspect", image))[0]["Config"]
@@ -3829,6 +3916,7 @@ def _validate_failed_prestart_successor(
         "backend-build-receipt.json", "provenance.json", "storage-probe-log.json",
         "ledger-verify-receipt.json", "ledger-verify-log.json", "host-ledger-attestation.json",
         "process-failure.json", "retained-containers.json",
+        "group-ledger.json", "group-ledger-attestation.json",
     )
     for filename in forbidden_files:
         if _control_bytes(control, expected_root + "/" + filename, optional=True) is not None:
@@ -4386,12 +4474,7 @@ def _retained_operation(
         cache = control.read(previous_root + "/backend-cache.json")
         import docker_backend_volume_cache as cache_adapter
         cache_adapter.validate_container(actual["backend"], cache)
-        ledger_profile = {"profile": "host-ledger-v1", "image_id": image, "environment": environment,
-            "mount_root": environment["FULLMAG_HOST_LEDGER_MOUNT_ROOT"],
-            "project_id": environment["FULLMAG_HOST_LEDGER_PROJECT_ID"],
-            "backing_image": environment["FULLMAG_HOST_LEDGER_BACKING_IMAGE"],
-            "host_receipt": control.read(previous_root + "/host-ledger.json"),
-            "maintenance_document": control.read(previous_root + "/ledger-maintenance-compose.json")}
+        ledger_profile = _retained_ledger_profile(control, previous_root, document, image)
         with control.operation("iteration", {"source_root": str(selected), "image_id": image,
                                             "attempt": args.attempt, "config_sha256": args.config_sha256,
                                             **operator_probe_record}) as operation:
@@ -5000,12 +5083,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
     import docker_backend_volume_cache as cache_adapter
     cache_adapter.validate_container(actual["backend"], cache)
     environment = document["services"]["backend"]["environment"]
-    ledger_receipt = control.read(previous_root + "/host-ledger.json")
-    ledger_profile = {"profile": "host-ledger-v1", "image_id": image, "environment": environment,
-        "mount_root": environment["FULLMAG_HOST_LEDGER_MOUNT_ROOT"],
-        "project_id": environment["FULLMAG_HOST_LEDGER_PROJECT_ID"],
-        "backing_image": environment["FULLMAG_HOST_LEDGER_BACKING_IMAGE"], "host_receipt": ledger_receipt,
-        "maintenance_document": control.read(previous_root + "/ledger-maintenance-compose.json")}
+    ledger_profile = _retained_ledger_profile(control, previous_root, document, image)
     with control.operation("resume", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                        **operator_probe_record}) as operation:
         operation["receipt"].update(operator_probe_record)
