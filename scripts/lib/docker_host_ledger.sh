@@ -627,10 +627,16 @@ descriptor = {
 }
 payload = (json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 descriptor_sha = hashlib.sha256(payload).hexdigest()
-mount = Path(mount_root)
-if (not mount.is_absolute() or ".." in mount.parts or mount.is_symlink() or not mount.is_dir()
-        or mount.lstat().st_uid != 0 or mount.lstat().st_mode & 0o022):
+requested_mount = Path(mount_root)
+if not requested_mount.is_absolute() or ".." in requested_mount.parts:
     raise SystemExit("[docker_host_ledger] host-ledger mount root is unsafe")
+# The ledger image is mounted in the host mount namespace (nsenter). This
+# helper's own bind of the mount root predates a first mount and would show
+# the shadowed directory, so publish through the host's view of the path.
+mount = proc_root / requested_mount.relative_to("/")
+if (mount.is_symlink() or not mount.is_dir() or not os.path.ismount(mount)
+        or mount.lstat().st_uid != 0 or mount.lstat().st_mode & 0o022):
+    raise SystemExit("[docker_host_ledger] host-ledger mount root is unsafe or not mounted")
 capacity_dir = mount / "capacity"
 created_dir = False
 try:
