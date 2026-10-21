@@ -3385,6 +3385,9 @@ class BackendPackageTests(unittest.TestCase):
             candidate.mkdir()
             marker = candidate / backend.PACKAGE_CANDIDATE_MARKER
             backend._write_candidate_marker(candidate, package, build_root, state="building")
+            # A candidate holding only known Make output is discarded as an
+            # interrupted build; unknown content keeps it fail-closed.
+            (candidate / "operator-notes.txt").write_bytes(b"keep")
             with self.assertRaises(backend.BackendBuildError):
                 backend._reject_partial_package_candidates(package, control, build_root)
             self.assertTrue(marker.is_file())
