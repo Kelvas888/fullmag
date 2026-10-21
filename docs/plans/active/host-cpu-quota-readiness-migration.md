@@ -38,12 +38,15 @@ osłabienia admission. Worktree: `scratch-gpu-single`, branch `codex/scratch-gpu
    bez zmian `f9f6051a8b41468e9584c21ed79946be` przeszedł z cache hit.
    Test API: 4 dozwolone kombinacje przyjęte, 6 niedozwolonych odrzuconych,
    bez fallbacku i bez Solve. Limit realnego workera oraz obliczenia GPU
-   pozostają NOT VERIFIED. Generator OpenAPI wymaga aktualnego pakietu;
-   restart wymaga jawnego wskazania naszej pustej sesji probe
+   pozostają NOT VERIFIED. Generator OpenAPI zakończył się poprawnie po przebudowie pakietu.
+   Restart wymagał jawnego wskazania naszej pustej sesji probe
    `session-18e08614dd42eff9000000c6`. Dodano `--empty-scratch-session-id`
    do `restart-idle-volume`: eksport przed stop, ponowna kontrola niezmienionej
    sesji, odmowa zmian modelu i przyjętych obliczeń. To nie jest odtworzenie
-   sesji po restarcie. Wykonanie tej ścieżki pozostaje NOT VERIFIED.
+   sesji po restarcie. Próba `866c86b3ad3f4ea989409b85dc1fcc5c` przeszła; eksport zachowany,
+   API zdrowe, `active_session=false`. Codegen receipt:
+   `backend/codegen/openapi-v2/e279e77feded30dede68089dee488a606cdec4a5789aaa95a6fd346c2a710903.json`
+   w wolumenie kontroli. Schematy i typy zawierają `gpu` oraz `single`.
    Master pozostaje zatrzymany do integracji i zgodnego buildu.
 
 Generacja przed migracją:
@@ -80,3 +83,10 @@ brak launch binding w fixture Released; poprawiono wyłącznie fixture.
 Testy Python nowej recepty i startu: 9 PASS. Drain zatrzymanego legacy
 frontendu oraz zachowanie pozostałych kontroli: 2 testy PASS.
 Wykonanie migracji i zachowanie danych potwierdzono w kroku 5.
+
+## Pozostała weryfikacja
+
+Testy jednostkowe API i Vitest pozostają NOT VERIFIED: brak podłączonej
+zarządzanej recepty dla tych testów w stałych usługach. Live probe sprawdza
+admission; nie zastępuje wykonania GPU. Integracja PR wymaga działającego
+uwierzytelnienia GitHub i zachowania cudzych zmian w main.
