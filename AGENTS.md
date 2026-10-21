@@ -87,10 +87,11 @@ trasy, jeżeli launcher nie realizuje tego kontraktu — popraw właściwą rece
 Grupy DEV mają być niezależne ([ADR 0067](docs/adr/0067-docker-dev-group-isolation.md)):
 każda ma statyczny budżet `FULLMAG_DEV_*` i własny port. Nowa zmiana schematu lub
 polityki stanu DEV jest lokalna dla jednej grupy albo wstecznie zgodna; żadna
-migracja DEV nie zatrzymuje cudzych grup. Wyjątek do czasu wdrożenia ledgera per
-grupa: wszystkie grupy współdzielą globalny host ledger, więc migracja jego
-polityki wymaga skoordynowanego zatrzymania konsumentów `/host-ledger`, a API
-może jednocześnie działać tylko w jednej grupie z danym kodem (rotacja readiness).
+migracja DEV nie zatrzymuje cudzych grup. Każda grupa DEV ma własny ledger
+zasobów (`group-ledger-v1`, wolumen grupy pod `/host-ledger`), więc grupy z różnym
+kodem mogą jednocześnie mieć działające API. Globalny `host-ledger-v1` służy już
+tylko release, kwalifikacji i managed runtime; migracja jego polityki zatrzymuje
+wyłącznie jego konsumentów, nie grupy DEV.
 
 Rozróżniaj dwa etapy: `just docker-dev-toolchain` buduje **obraz zależności**
 przez `docker compose build` / BuildKit, przypięty do projektu tego checkoutu.
