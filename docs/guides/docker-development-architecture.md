@@ -176,10 +176,18 @@ python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $sour
 
 ### Cykl edycji i przebudowy
 
-Frontend reaguje przez HMR na zapis plików Windows. Watchpack domyślnie używa
-pollingu `5000` ms; lokalne `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza
-`250`–`10000` ms. Wykrycie edycji może więc poczekać do następnego skanu,
-po którym Next przebudowuje zmienione moduły. Docker DEV pomija wygenerowane
+Frontend reaguje przez HMR na zapis plików. Tryb obserwacji wynika z mountu
+źródeł `/opt/fullmag/source` i jest zapisany w receipcie jako `watch_mode`:
+
+- `native` — bind z ext4, xfs albo btrfs (checkout w Linux/WSL). Zapis generuje
+  zdarzenia inotify w kontenerze, więc Watchpack nie odpytuje drzewa;
+- `polling` — każdy inny mount, w tym bind z dysku Windows przez 9p, który nie
+  dostarcza zdarzeń. Watchpack domyślnie odpytuje co `5000` ms, a lokalne
+  `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza `250`–`10000` ms. Wykrycie edycji
+  może poczekać do następnego skanu. Każdy działający frontend odpytuje przez
+  ten sam serwer 9p, więc bezczynne grupy obciążają też I/O pozostałych.
+
+Po wykryciu zmiany Next przebudowuje zmienione moduły. Docker DEV pomija wygenerowane
 katalogi `.fullmag-frontend`, `.next*` i `node_modules`; `app`, `src`, `public`
 i `scripts` pozostają obserwowane. Zależności pnpm i cache Next zostają w
 nazwanym wolumenie frontendowym; HMR nie buduje backendu ani toolchaina.
