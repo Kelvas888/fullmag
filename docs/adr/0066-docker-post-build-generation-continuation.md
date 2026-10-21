@@ -51,6 +51,31 @@ certyfikatu zachowuje jego zamkniętą tożsamość hosta; bramka storage ponown
 potwierdza gotowość przed wejściem do API. Istniejący natywny
 `service-ensure` nadal odpowiada za nowy claim po stanie terminalnym.
 
+## Zachowanie pending po błędzie odczytu źródeł
+
+Odtworzenie bieżącego kontenera, który zakończył się podczas source capture,
+może zachować już istniejącą, niezużytą kontynuację. Wymaga oddzielnego dowodu
+`pre_admission_recreate` dla tej inkarnacji, przed `Make`, publikacją i API.
+Kanoniczne current i terminal próby, pending binding, Compose, źródła,
+konfiguracja oraz pełny producent accepted-run muszą wskazywać tę samą próbę.
+Rekord consumed wyklucza tę ścieżkę.
+
+Historyczne `post_build_generation` pozostaje niezmienione i związane ze swoim
+oryginalnym `recreate_operation`. Dowody starego ownera, process-tree,
+konfiguracji i nieobecności starego namespace są sprawdzane przed operacją
+oraz pod lease. Dowód capture nie zastępuje brakującego natywnego receiptu
+bieżącego kontenera. Nowy start tworzy własny binding przez istniejące
+`prepare_start_binding`; nie powtarza Solve.
+
+Wznowienie tak zakończonego odtworzenia wymaga obu zapisanych dowodów, pustego
+native recovery contextu i nadal `restart_verified=false`. Ponawia walidację
+terminalu, failure logu, bindingu oraz historycznej kontynuacji. Nie awansuje
+certyfikatu do `true`. Zwykłe wznowienie natywne zachowuje dotychczasową ścieżkę.
+Błąd Make, rozpoczęta publikacja lub zużyty binding pozostają poza zakresem.
+Implementacja obejmuje `docker_volume_pending_continuation.py`, caller w
+`docker_volume_dev.py` i odpowiadające regresje; odbiór na rzeczywistym storage
+pozostaje **NOT VERIFIED** do udanego startu API/native.
+
 ## Ponowienie i późniejszy restart
 
 Zachowujemy obecne zabezpieczenia rotatora: dokładny backup

@@ -506,7 +506,8 @@ def serve():
         )
         handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"],
                                configuration=configuration,
-                               api_startup_timeout=api_startup_timeout)
+                               api_startup_timeout=api_startup_timeout,
+                               api_process_poll=api.poll)
         # Persist the authenticated owner before optional startup activation.
         # Activation may reject or fail after service.start has pinned the
         # native owner; the terminal drain receipt must retain that identity.

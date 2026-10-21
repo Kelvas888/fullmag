@@ -626,6 +626,21 @@ export function uploadFdmCuboidAttribute(
   return contentRevision;
 }
 
+export function disposeFdmCuboidInstanceColorBeforeReplace(
+  mesh: InstancedMesh,
+  nextInstanceColor: InstancedBufferAttribute | null,
+): void {
+  if (
+    mesh.instanceColor === null ||
+    mesh.instanceColor === nextInstanceColor
+  ) {
+    return;
+  }
+  // Three.js releases instance attributes and their binding states on mesh
+  // disposal. Keep the old color attached until those owners have released it.
+  mesh.dispose();
+}
+
 export function handleFdmCuboidContextLost(
   event: Event,
   invalidateUploadedRevisions: () => void,
@@ -1214,6 +1229,7 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     // Instance colors are enabled by Three.js independently of vertexColors.
     // Drop the previous quantity's attribute when no compatible buffer exists.
     if (!usesInstanceColors && surface.instanceColor !== null) {
+      disposeFdmCuboidInstanceColorBeforeReplace(surface, null);
       surface.instanceColor = null;
       colorRevisionRef.current = null;
       const mountedSurfaceMaterial = surface.material;
@@ -1235,10 +1251,15 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
         !surface.instanceColor ||
         surface.instanceColor.array.length !== surfaceColors.colors.length
       ) {
-        surface.instanceColor = new InstancedBufferAttribute(
+        const nextInstanceColor = new InstancedBufferAttribute(
           new Float32Array(surfaceColors.colors.length),
           3,
         );
+        disposeFdmCuboidInstanceColorBeforeReplace(
+          surface,
+          nextInstanceColor,
+        );
+        surface.instanceColor = nextInstanceColor;
         colorRevisionRef.current = null;
       }
       colorChanged = colorRevisionRef.current !== colorRevision;

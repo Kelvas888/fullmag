@@ -1544,6 +1544,9 @@ def _capture_live_source_once(
                 "sha256": _live_sha256(content),
             }
         )
+    # Gitlink pins are authenticated from the HEAD tree and index and are
+    # disclosed in ``excluded``.  Native identity filters those paths, so
+    # status must not descend into their nested worktrees.
     status_raw = _live_run_git(
         source_root,
         git_dir,
@@ -1552,6 +1555,7 @@ def _capture_live_source_once(
         "-z",
         "--no-renames",
         "--untracked-files=no",
+        "--ignore-submodules=all",
         "--",
         *_live_runtime_status_pathspecs(tree_bytes),
         maximum=MAX_MANIFEST_BYTES,

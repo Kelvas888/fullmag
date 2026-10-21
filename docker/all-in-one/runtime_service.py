@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 import uuid
-from typing import Any, Mapping, NoReturn, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 STATE_ROOT = Path("/state")
 SOURCE_ROOT = Path("/opt/fullmag/source")
@@ -4958,6 +4958,8 @@ def _wait_for_api_liveness(
 def wait_for_api(
     paths: RuntimePaths, port: int, expected_binding: str,
     timeout: float = API_BINDING_STARTUP_TIMEOUT_SECONDS,
+    *,
+    api_process_poll: Callable[[], int | None] | None = None,
 ) -> Mapping[str, Any]:
     """Pin API source, instance, accepted store, and the v2 profile route."""
 
@@ -4982,6 +4984,10 @@ def wait_for_api(
             return {**identity, "profiles": profile}
         except (RuntimeServiceError, OSError) as error:
             last_error = error
+            if api_process_poll is not None and api_process_poll() is not None:
+                raise RuntimeServiceUnknown(
+                    f"API binding did not become ready: {last_error}"
+                ) from error
         now = time.monotonic()
         if now >= next_progress:
             print(
@@ -5380,6 +5386,7 @@ def start(
     cli: Path | None = None,
     timeout: float = 90.0,
     api_startup_timeout: float | None = None,
+    api_process_poll: Callable[[], int | None] | None = None,
     expected_binding: str,
     configuration: Mapping[str, Any] | None = None,
 ) -> RuntimeHandle:
@@ -5401,6 +5408,7 @@ def start(
         paths, port, expected_binding,
         timeout=(min(timeout, API_BINDING_STARTUP_TIMEOUT_SECONDS)
                  if api_startup_timeout is None else api_startup_timeout),
+        api_process_poll=api_process_poll,
     )
     api_identity = {
         key: api_probe[key]

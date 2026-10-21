@@ -1007,9 +1007,9 @@ def reconcile_browser_qa(control, selected, identity, args):
     if (observed.get("Name") != "/" + browser_name or observed.get("Id") != args.expected_browser_id
             or state.get("Status") != "exited" or state.get("Running") is not False
             or state.get("OOMKilled") is not False or type(state.get("ExitCode")) is not int
-            or state["ExitCode"] == 0 or not state.get("FinishedAt")
+            or not state.get("FinishedAt")
             or observed.get("RestartCount") != 0):
-        raise BuildControlError("QA reconciliation requires an exact stopped failed browser")
+        raise BuildControlError("QA reconciliation requires an exact stopped browser")
     _validate_browser_image_reference(inputs["browser_image"])
     image = _inspect_image(inputs["browser_image"])
     if image is None:
