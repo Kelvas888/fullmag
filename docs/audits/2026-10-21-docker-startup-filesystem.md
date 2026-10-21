@@ -170,3 +170,67 @@ kompilację `/workspace`; probe HTTP przekroczył 30 s. Sam health procesu Next
 nie dowodzi wyrenderowanego Home. Native/API, browser, HMR, cache restart,
 wykonanie skryptów oraz kwalifikacja czterech realizacji pozostają odrębnymi,
 nieukończonymi bramkami. Held run `run-live-9f453e3a…` zachowano bez Solve replay.
+
+
+## Odbiór buildu i rozdzielenie locatorów reattach
+
+Make w backendzie `ed56b7ba…` zakończył się kodem 0 po 1971,620 s.
+Pierwsze wywołanie Cargo trwało 21 min 30 s, a budowa modułu Python
+`fullmag-py-core` 10 min 14 s. Publikacja 24 plików pakietu trwała 2,397 s,
+a jego weryfikacja 1,606 s. Bramki `windows-folder-v1` i `worker-cgroup`
+przeszły. API używało spójnego snapshotu HEAD `08c0c810…`.
+
+Start API ujawnił błąd walidatora Rust: porównywał źródłowy locator w
+stopped-namespace attestation z lokalizacją późniejszej kopii archiwalnej
+z reattach proof. Producent attestation zapisuje przed archiwizacją
+`runtime-control/runtime-service/process-tree.json` i
+`runtime-control/runtime-services/OWNER.json`. Reattach proof wskazuje kopie
+`accepted-run-reattach/<key>/terminal-process.json` i `terminal-owner.json`.
+Są to różne role; historycznych bajtów nie należy przepisywać.
+
+Odczyt rzeczywistego wolumenu potwierdził proof SHA
+`6538d8e984c21573c0810dc226341988ed8f512594ff9313cf26b74bf4787d0f`
+i attestation SHA
+`8af2632b7718e0a37bd79e229225e70ede61781c83052e44527b2d5ae0ad7ed5`.
+Wszystkie przypięte hashe archiwum były zgodne; obie zagnieżdżone treści
+attestation były równe archiwom. Dane nie były uszkodzone. Rust sprawdza
+teraz dokładne kanoniczne locatory źródłowe attestation, zachowując osobną
+walidację archiwów, hashy, treści, ownera i inkarnacji kontenera. Regresja
+odrzuca locator archiwalny, obcy i wychodzący poza root dla obu pól.
+Test Rust jest przeznaczony do istniejącego CI; nie kompilowano go lokalnie.
+Ponowny build/start z tą poprawką pozostaje NOT VERIFIED.
+
+## Audyt pamięci frontendu po fixture FDM
+
+Na HEAD `f8345cec…` kontrakty Rust/Python, typecheck/lint/test/build Control
+Room, deterministyczność API, smoke fizyki FDM CPU i Inspector browser przeszły.
+Browser fixture pre-proof job `118965121849` nie przeszedł: po stresie było
+390 żywych buforów wobec baseline 334. Ten pomiar sam nie rozróżnia wycieku
+od zimnych alokacji i przedwczesnego pomiaru.
+
+Poprawka `07d72b02cb4c78c637ed62deaccfb59963e6708c` zwalnia stary atrybut
+`instanceColor` przez publiczne `InstancedMesh.dispose()` przed jego usunięciem
+lub zastąpieniem. Bufor tej samej długości nadal jest aktualizowany w miejscu.
+Rzeczywiste Three.js r186 udostępnia tę metodę; nie dodano ręcznych eventów
+ani redundantnego cleanupu React. Regresja używa rzeczywistego `WebGLObjects`
+z kontrolowanym właścicielem atrybutów i 120 cyklami. Jest przeznaczona do CI.
+
+Audyt rozgrzewa maski warstw przed pomiarem, oddzielnie zapisuje cold baseline,
+unmount oraz steady baseline po remount. Czeka na `rendered` ACK przypięty do
+rewizji, klienta i viewportu, adopcję pola i zakończenie pracy workerów.
+Końcowy pomiar również czeka na adopcję; unmount ma ograniczony czas zamiast
+stałego sleep. Zachowano limity `baseline + 16` i `liveBuffers <= 4`, kanoniczne
+nagłówki FMRM/FMVP oraz niezależny dowód zwolnienia zasobów. Kontrola fidelity
+wymaga aktywnego kontekstu WebGL i niezerowego drawing buffer. Odpowiedź fixture
+ACK zawiera wymagane `received_at_unix_ms`.
+
+Niezależne review potwierdziło zakres i wskazało brak timestampu w odpowiedzi
+fixture; został uzupełniony. Wynik nowego browser gate pozostaje NOT VERIFIED.
+Lokalnego Vitest nie uruchomiono: kontrola uprawnień odrzuciła kompilację testów
+poza wyjątkiem CI. Nie zastosowano obejścia. Hook commita przeskanował zmienione
+pliki React Doctor i zgłosił istniejące wcześniej `array.find()` poza poprawką.
+Nie jest to dowód wykonania testów ani WebGL.
+
+Kontrola składni audytu po zmianie przeszła w helperze grupy; receipt
+`verification/syntax-attempts/e15b169fae07492693f8e05ae002a53c.json`,
+SHA źródła `f992cf146efa6f8d63dc30b08b34a55885517ebff03bde9e2d5e2a5c7734404a`.

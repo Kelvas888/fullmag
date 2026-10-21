@@ -56,6 +56,14 @@ const MAX_CONTROL_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const ACTIVATION_OPERATION_SCHEMA: &str = "fullmag.docker-build-operation.v1";
 const STOP_VERIFICATION_SCHEMA: &str = "fullmag.stop-failed-admission.v1";
 const NAMESPACE_ATTESTATION_SCHEMA: &str = "fullmag.docker-stopped-namespace-attestation.v1";
+// Namespace attestation is emitted before the accepted-run producer copies
+// the live records into its immutable proof directory. These are therefore
+// source locators in the attestation; proof.*_record_path remains the later
+// immutable archive locator and is validated separately.
+const NAMESPACE_TERMINAL_PROCESS_SOURCE_PATH: &str =
+    "runtime-control/runtime-service/process-tree.json";
+const NAMESPACE_TERMINAL_OWNER_SOURCE_PATH: &str =
+    "runtime-control/runtime-services/OWNER.json";
 const API_START_FAILURE_MODE: &str = "api-start-failure";
 const API_START_FAILURE_ERROR_PREFIX: &str = "API binding did not become ready:";
 
@@ -2274,6 +2282,10 @@ fn validate_namespace_attestation_mode(
         "verification/stop-failed-{}.json",
         proof.backend_container
     );
+    // The attestation records where the reconciler observed the mutable
+    // source records. The accepted-run producer archives identical bytes
+    // afterward, so its proof paths must not be substituted into this field.
+    // The archive bytes and hashes are checked independently above.
     for (field, expected) in [
         ("schema", NAMESPACE_ATTESTATION_SCHEMA),
         ("state", "stopped-confirmed"),
@@ -2285,11 +2297,11 @@ fn validate_namespace_attestation_mode(
         ("stop_journal_path", expected_stop_path.as_str()),
         (
             "terminal_process_receipt_path",
-            proof.terminal_process_record_path.as_str(),
+            NAMESPACE_TERMINAL_PROCESS_SOURCE_PATH,
         ),
         (
             "terminal_failed_owner_path",
-            proof.terminal_owner_record_path.as_str(),
+            NAMESPACE_TERMINAL_OWNER_SOURCE_PATH,
         ),
     ] {
         require_equal_string(attestation, field, expected)?;
@@ -4419,10 +4431,10 @@ mod tests {
             "container_state": container_state,
             "stop_journal_path": "verification/stop-failed-".to_string() + &"5".repeat(64) + ".json",
             "stop_journal_sha256": proof.stop_verification_sha256.clone(),
-            "terminal_process_receipt_path": proof.terminal_process_record_path.clone(),
+            "terminal_process_receipt_path": NAMESPACE_TERMINAL_PROCESS_SOURCE_PATH,
             "terminal_process_receipt_sha256": terminal_sha256.clone(),
             "terminal_process_receipt": terminal,
-            "terminal_failed_owner_path": proof.terminal_owner_record_path.clone(),
+            "terminal_failed_owner_path": NAMESPACE_TERMINAL_OWNER_SOURCE_PATH,
             "terminal_failed_owner_sha256": failed_owner_sha256,
             "terminal_failed_owner": failed_owner.clone(),
             "failure_kind": "native-start-failure",
@@ -4441,6 +4453,30 @@ mod tests {
             false,
         )
         .is_ok());
+        for (field, invalid_path) in [
+            ("terminal_process_receipt_path", proof.terminal_process_record_path.as_str()),
+            ("terminal_failed_owner_path", proof.terminal_owner_record_path.as_str()),
+            ("terminal_process_receipt_path", "runtime-control/foreign/process-tree.json"),
+            ("terminal_failed_owner_path", "runtime-control/foreign/OWNER.json"),
+            ("terminal_process_receipt_path", "../runtime-service/process-tree.json"),
+            ("terminal_failed_owner_path", "../runtime-services/OWNER.json"),
+        ] {
+            let original = attestation[field].clone();
+            attestation[field] = Value::String(invalid_path.into());
+            let error = validate_namespace_attestation(
+                &attestation,
+                &proof,
+                &verification,
+                &attestation["terminal_process_receipt"],
+                &attestation["terminal_failed_owner"],
+                &attestation["native_failure_probe"],
+                &attestation["terminal_failed_owner"],
+                false,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(&format!("record {field} differs")));
+            attestation[field] = original;
+        }
         proof.terminal_owner_record_sha256 = "9".repeat(64);
         assert!(validate_namespace_attestation(
             &attestation,
