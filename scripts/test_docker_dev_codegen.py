@@ -124,6 +124,58 @@ class DockerDevCodegenTests(unittest.TestCase):
                         "project", "backend", identity, Path(r"C:\git\fullmag\fullmag")
                     )
 
+    def test_running_service_accepts_only_authenticated_daemon_source_pin(self) -> None:
+        from types import SimpleNamespace
+        import copy
+        import docker_dev_up
+
+        selected = Path("/home/user/fullmag")
+        daemon = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/token"
+        identity = {"project_id": "project-id", "worktree_id": "worktree-id", "checkout_kind": "worktree"}
+        labels = {"com.docker.compose.project": "project", "com.docker.compose.service": "backend",
+                  "org.fullmag.compose.project": "project",
+                  **{"org.fullmag.source." + key.replace("_", "-"): value for key, value in identity.items()}}
+        inspected = {"Id": "a" * 64, "Image": "sha256:" + "b" * 64,
+            "State": {"Running": True, "StartedAt": "incarnation"},
+            "Config": {"Labels": labels, "Env": ["FULLMAG_SOURCE_HOST_ROOT=" + str(selected)]},
+            "Mounts": [{"Destination": "/opt/fullmag/source", "Type": "bind", "RW": False, "Source": daemon},
+                       {"Destination": "/opt/fullmag/source-git", "Type": "bind", "RW": False, "Source": "/git"},
+                       *[{"Destination": target, "Type": "volume", "RW": True}
+                         for target in ("/build", "/opt/fullmag/package", "/opt/fullmag/control")]]}
+        for mismatch in (None, "missing", "pin", "client", "container", "image", "incarnation", "readonly", "discovery"):
+            with self.subTest(mismatch=mismatch):
+                observed = copy.deepcopy(inspected)
+                retained = copy.deepcopy(inspected)
+                expected = {"volumes": [{"type": "bind", "source": str(selected),
+                    "target": "/opt/fullmag/source", "read_only": True}],
+                    "x-fullmag-daemon-binds": {"/opt/fullmag/source": daemon}}
+                if mismatch == "pin":
+                    expected["x-fullmag-daemon-binds"]["/opt/fullmag/source"] = "/other"
+                if mismatch == "client":
+                    expected["volumes"][0]["source"] = "/other"
+                if mismatch == "container":
+                    retained["Id"] = "c" * 64
+                if mismatch == "image":
+                    retained["Image"] = "sha256:" + "c" * 64
+                if mismatch == "incarnation":
+                    retained["State"]["StartedAt"] = "restarted"
+                if mismatch == "readonly":
+                    observed["Mounts"][0]["RW"] = True
+                group = SimpleNamespace(backend=retained, document={"services": {"backend": expected}})
+                with mock.patch.object(codegen, "_capture", return_value=(b"short-id\n", b"")), \
+                        mock.patch.object(codegen, "_inspect", return_value=observed), \
+                        mock.patch.object(docker_dev_up, "_discover_group", return_value=None if mismatch == "missing" else group,
+                            side_effect=docker_dev_up.DockerDevUpError("invalid retained proof") if mismatch == "discovery" else None) as discover:
+                    if mismatch is None:
+                        _, actual = codegen._running_service("project", "backend", identity, selected)
+                        self.assertIs(actual, observed)
+                        self.assertEqual(discover.call_args.args[0].source_root, selected)
+                    else:
+                        with self.assertRaises(codegen.CodegenError):
+                            codegen._running_service("project", "backend", identity, selected)
+                    if mismatch == "readonly":
+                        discover.assert_not_called()
+
     def test_backend_provenance_requires_receipt_and_binary_binding(self) -> None:
         receipt_sha = "a" * 64
         provenance_sha = "b" * 64
