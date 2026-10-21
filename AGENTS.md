@@ -89,7 +89,8 @@ każda ma statyczny budżet `FULLMAG_DEV_*` i własny port. Nowa zmiana schematu
 polityki stanu DEV jest lokalna dla jednej grupy albo wstecznie zgodna; żadna
 migracja DEV nie zatrzymuje cudzych grup. Wyjątek do czasu wdrożenia ledgera per
 grupa: wszystkie grupy współdzielą globalny host ledger, więc migracja jego
-polityki wymaga skoordynowanego zatrzymania konsumentów `/host-ledger`.
+polityki wymaga skoordynowanego zatrzymania konsumentów `/host-ledger`, a API
+może jednocześnie działać tylko w jednej grupie z danym kodem (rotacja readiness).
 
 Rozróżniaj dwa etapy: `just docker-dev-toolchain` buduje **obraz zależności**
 przez `docker compose build` / BuildKit, przypięty do projektu tego checkoutu.

@@ -16,6 +16,15 @@ Dopóki punkt 1 nie zostanie wdrożony, migracja polityki globalnego ledgera
 nadal wymaga skoordynowanego zatrzymania konsumentów `/host-ledger`
 (`--migrate-host-capacity`, ADR 0061).
 
+Pomiar 21.10.2026: globalny ledger przechowuje jedną readiness przypiętą do
+tożsamości builda (`source_snapshot_sha256`, `runtime_identity_sha256`).
+Backend z innym kodem musi ją obrócić, a rotacja wymaga braku aktywnego
+właściciela inwentarza (`host_resource_ledger.rs`, `upgrade_runtime_readiness`).
+Grupa `zen-nobel` przy działającej grupie Fali 0 zakończyła się błędem
+„runtime readiness rotation requires the host inventory owner to be absent”.
+Bez punktu 1 **tylko jedna grupa z danym kodem może mieć jednocześnie działające
+API**; budżety i port pozwalają równolegle budować, nie uruchamiać API.
+
 ## Kontekst
 
 Kilku agentów pracuje równolegle w osobnych worktree, każdy w swojej grupie
@@ -69,8 +78,8 @@ wirtualnej Docker oraz porty loopback frontendu.
 
 ## Konsekwencje
 
-- Trzy grupy mogą jednocześnie budować i uruchamiać runy w swoich budżetach;
-  restart lub recreate jednej nie zatrzymuje pozostałych.
+- Trzy grupy mogą jednocześnie budować w swoich budżetach. Jednoczesne API
+  grup z różnym kodem wymaga punktu 1 (patrz pomiar w stanie implementacji).
 - Po wdrożeniu punktu 1 także migracja jednej grupy nie zatrzymuje
   pozostałych, a grupy DEV przestają korzystać z kontroli cgroup2
   i deskryptora pojemności hosta.
