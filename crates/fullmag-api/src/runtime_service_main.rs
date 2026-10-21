@@ -1080,6 +1080,11 @@ fn docker_host_cpu_placements(
 
 fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     let args = parse_docker_host_init_args(args)?;
+    let host_capacity_scope =
+        fullmag_runtime_control::compute_node_probe::docker_host_capacity_is_configured()?;
+    if host_capacity_scope && args.ledger_root != PathBuf::from("/host-ledger/ledger") {
+        bail!("Docker root capacity requires the canonical shared /host-ledger/ledger");
+    }
     let fixture_readiness = std::env::var("FULLMAG_DOCKER_HOST_READINESS_FIXTURE")
         .ok()
         .is_some_and(|value| value == "1");
@@ -1127,14 +1132,39 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         "OS-allowed CPU IDs",
     )?
     .clone();
-    let measured_cpu_millis = *required_observation(
+    let host_cpu_millis = *required_observation(
         &provisional.cpu.effective_capacity_millis,
-        "effective CPU capacity",
+        "host CPU capacity",
     )?;
+    let process_cpu = fullmag_runtime_control::compute_node_probe::current_process_cpu_capacity()?;
+    let consumer_cpu_ids: BTreeSet<u32> = if host_capacity_scope {
+        process_cpu
+            .allowed_cpu_ids
+            .intersection(&allowed_cpu_ids)
+            .copied()
+            .collect()
+    } else {
+        process_cpu.allowed_cpu_ids.clone()
+    };
+    let measured_cpu_millis = if host_capacity_scope {
+        process_cpu.cpu_millis.min(host_cpu_millis).min(
+            u64::try_from(consumer_cpu_ids.len())?
+                .checked_mul(1000)
+                .context("Docker consumer CPU mask capacity overflowed")?,
+        )
+    } else {
+        process_cpu.cpu_millis
+    };
     let measured_memory_bytes = *required_observation(
         &provisional.memory.total_bytes,
         "total host memory",
     )?;
+    let consumer_memory_bytes = if host_capacity_scope {
+        fullmag_runtime_control::compute_node_probe::current_process_memory_capacity_bytes()?
+            .min(measured_memory_bytes)
+    } else {
+        measured_memory_bytes
+    };
     if measured_cpu_millis == 0 || measured_memory_bytes == 0 {
         bail!("Docker host profile requires positive CPU and memory capacity");
     }
@@ -1152,23 +1182,23 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
                 "FULLMAG_DOCKER_MEMORY_BYTES must exceed 1 GiB of API headroom"
             );
         }
-        if full_memory_bytes > measured_memory_bytes {
+        if full_memory_bytes > consumer_memory_bytes {
             bail!(
-                "approved Docker memory budget {full_memory_bytes} bytes exceeds measured MemTotal {measured_memory_bytes}"
+                "approved Docker memory budget {full_memory_bytes} bytes exceeds measured consumer capacity {consumer_memory_bytes}"
             );
         }
         (cpu_millis, full_memory_bytes - API_MEMORY_HEADROOM_BYTES)
     } else {
         (
             measured_cpu_millis.min(4000),
-            measured_memory_bytes.min(7 * 1024 * 1024 * 1024),
+            consumer_memory_bytes.min(7 * 1024 * 1024 * 1024),
         )
     };
-    let cpu_millis = if approved_budget || allowed_cpu_ids.is_empty() {
+    let cpu_millis = if approved_budget || consumer_cpu_ids.is_empty() {
         cpu_millis
     } else {
         cpu_millis.min(
-            u64::try_from(allowed_cpu_ids.len())
+            u64::try_from(consumer_cpu_ids.len())
                 .unwrap_or(u64::MAX)
                 .saturating_mul(1000),
         )
@@ -1226,8 +1256,16 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         revision: 1,
         owner_epoch: 1,
         total_budget: FmsResourceBudget {
-            cpu_millis,
-            memory_bytes,
+            cpu_millis: if host_capacity_scope {
+                host_cpu_millis
+            } else {
+                cpu_millis
+            },
+            memory_bytes: if host_capacity_scope {
+                measured_memory_bytes
+            } else {
+                memory_bytes
+            },
             gpu_memory_bytes: 0,
             storage_bytes,
         },
@@ -1345,7 +1383,7 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         );
     }
     let (compute_cpu_ids, preparation_cpu_ids) = docker_host_cpu_placements(
-        &policy.allowed_cpu_ids,
+        &consumer_cpu_ids,
         cpu_millis,
         cpu_offer_cpu_millis,
         offer_cpu_millis,

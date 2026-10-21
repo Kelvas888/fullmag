@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-21T00:43:07.459649+00:00",
-  "verification": "Source hashes refreshed after H0 budget patch; two-file Python AST and source review PASS; no tests/build of H0. Actual prior build73e: Make exit0/121700ms, package24files/6161ms, verify1564ms. Resumea001 accepted-store bootstrap PASS, later failed preAPI host-policy initialization. Quota4000->16000 alone exactly reproduces rejected inventory hash. Runtime128GiB/16CPU, backend stopped non-OOM, frontend3198 healthy. No ledger migration/reset, retry04, activation or Solve. API/mesh/UI NOT VERIFIED. H0 source only; global host versus consumer policy remains open.",
+  "observed_at": "2026-10-21T01:37:12.760378+00:00",
+  "verification": "H0/H1 source only. H1 two-file Rust parser, Python AST including embedded publisher and scoped source review PASS; no tests/build/runtime of H0/H1. H3 actual checkpoint740722f4 state stopped-confirmed exit0, raw receipt SHA a15f43cbe50ab8ce9e25aef97ae81c777f4c1d712f74d7751c63adb1a60a6c5a verified by readback; no signal/restart/retry04/Solve. Last actual build73e Make exit0/121700ms. Parallel inventory changed ledger raw SHA to04630db439fccb9ecad244f73557f076337e581867783ff7941776370e5c3bda; old policy4CPU/7GiB/rev1 and14Released. H2 migration unimplemented; API/mesh/browser NOT VERIFIED. Hashes record current bytes, not build or scientific qualification.",
   "files": [
     {
       "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
@@ -55,6 +55,10 @@
       "sha256": "0e92f05388c2f6adeeee5ea78f21d857a9d314d3a5a66ec667afd7a1e5d5c9f9"
     },
     {
+      "path": "compose.host-ledger.yaml",
+      "sha256": "c30a0e074e49c261631a497f752a8d83ab7324960d3d28e257efd60200ac7e3a"
+    },
+    {
       "path": "crates/fullmag-api/src/accepted_fem_preparation_scheduler_main.rs",
       "sha256": "e05f0a6c36f8b5b93a54bf7d0afb23a277b40d1010a2cb80aec9d990a968225a"
     },
@@ -87,8 +91,24 @@
       "sha256": "b3d1cd13efc33ad1da79926eb5b9d17eee31f899c1aa604aece8cd837572b661"
     },
     {
+      "path": "crates/fullmag-api/src/runtime_service_main.rs",
+      "sha256": "1785544c866c2b4dd62ba12edf4be8c908992691d8cfd006667c9794fd73c2b9"
+    },
+    {
+      "path": "crates/fullmag-fdm-sys/build.rs",
+      "sha256": "a109cb16b8b9283aa87f29cdc9f1fd22b013376c7b910c247437fbb43fb35ba0"
+    },
+    {
+      "path": "crates/fullmag-fem-sys/build.rs",
+      "sha256": "de5c575c3274b8f7c09817968d09e22ab26580825fea5f3282b7122d36975818"
+    },
+    {
       "path": "crates/fullmag-runtime-control/src/claim.rs",
       "sha256": "3653e16fa467eef8d47c75d1c0ed2f01e8e13da531779a7c7e0a21480912a5e9"
+    },
+    {
+      "path": "crates/fullmag-runtime-control/src/compute_node_probe.rs",
+      "sha256": "08c4e50b6743158e738bb2b302a48840b2a9492ed7494d0413b97fed1fdeed3a"
     },
     {
       "path": "crates/fullmag-runtime-control/src/host_runtime.rs",
@@ -140,7 +160,7 @@
     },
     {
       "path": "docs/adr/0061-docker-development-build-and-runtime-container.md",
-      "sha256": "a091a05cf038be6c631b82f204883770a25b00da7154322ab10c271ce98f57e1"
+      "sha256": "c372f229ada6f25360680cdc4ff840368bc57fa69ca2661f759d2a9b12e662ce"
     },
     {
       "path": "docs/adr/0066-docker-post-build-generation-continuation.md",
@@ -160,7 +180,11 @@
     },
     {
       "path": "scripts/docker_dev.py",
-      "sha256": "ad9ee6212b5dcf8ea0003ff3ebdbb5278092ca83d11aeec73be2b85e9a0f5050"
+      "sha256": "ae84d763857e645f50006f9b14ec093420702ef03e8c2604e1e31a6a9984d586"
+    },
+    {
+      "path": "scripts/docker_host_ledger.py",
+      "sha256": "110eac4f94e86d68fbc3cf2b3ae547f54b7a9e9963c1e2dd107f2b7be2d4aa68"
     },
     {
       "path": "scripts/docker_volume_accepted_reattach.py",
@@ -172,35 +196,27 @@
     },
     {
       "path": "scripts/docker_volume_capture_failure_reconcile.py",
-      "sha256": "0af968adc771c572cab657cfeadb8c8efe5716342bce747e63070c61ff3cb620"
+      "sha256": "8915c0486a833e0a231d30b647c2512dcc4bc44d3bbc346fab6ba888323c11f1"
     },
     {
       "path": "scripts/docker_volume_dev.py",
-      "sha256": "59c9ac3a0ffec2cc1ddc421a2b523a5a42993c1d562b479d77c8067f11e5c143"
+      "sha256": "92d20a007d06038f217ed51ecf78dc892d8a3ffca7000a335d72802de5730269"
     },
     {
       "path": "scripts/docker_volume_pre_ack_retry.py",
-      "sha256": "6e873799bd21374a738d92059dd05680748ab775d271042af79f65dc81be0d61"
+      "sha256": "5e5cac1135494899ce2d77fc05ab2c6aaa0b74393cde4f5c0c9210970063d2a7"
     },
     {
       "path": "scripts/docker_volume_pre_api_stop.py",
-      "sha256": "2add926af28b91803fa124a7d05014a499509acd86805d5706931ac3ea7df180"
+      "sha256": "b80c387f5c6db763ce5e322f5b1716c231dd9fb35164da1e54845e74b03bc611"
     },
     {
       "path": "scripts/docker_volume_resources.py",
       "sha256": "b8be6b2efc2311dbaf2a79152fa53e1b2579895d85e5e2eeff061a9e6dc7a1b9"
     },
     {
-      "path": "crates/fullmag-fdm-sys/build.rs",
-      "sha256": "a109cb16b8b9283aa87f29cdc9f1fd22b013376c7b910c247437fbb43fb35ba0"
-    },
-    {
-      "path": "crates/fullmag-fem-sys/build.rs",
-      "sha256": "de5c575c3274b8f7c09817968d09e22ab26580825fea5f3282b7122d36975818"
-    },
-    {
-      "path": "crates/fullmag-api/src/runtime_service_main.rs",
-      "sha256": "ceb1a24fd05a974ec73c06976e44ec546173060cf0ff6bb688ac993419bf9e37"
+      "path": "scripts/lib/docker_host_ledger.sh",
+      "sha256": "204dedbcf511f3161566413c288f391c245e761a33722b6d28d574e45e37d1e6"
     }
   ],
   "diagnostic_operations": {

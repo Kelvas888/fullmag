@@ -638,10 +638,65 @@ def _verify_host_ledger_volume(control, operation, descriptor, image):
     docker_capture("rm", actual["Id"])
 
 
-def _host_ledger(control, operation, layout, selected, image):
+def _host_ledger(control, operation, layout, selected, image, *, new_render=False):
     import docker_host_ledger as ledger
+    scope = operation["receipt"].get("host_capacity_scope")
+    if scope not in (None, "docker_vm_root"):
+        raise BuildControlError("Retained host capacity scope is invalid")
+    if new_render:
+        # Pin the intent in the existing receipt before any fallible helper or
+        # Compose work. An interrupted first render must not resume as legacy.
+        scope = operation["receipt"]["host_capacity_scope"] = "docker_vm_root"
+        control.write(operation["root"] + "/receipt.json", operation["receipt"])
     values = ledger._resolve_values(layout)
-    daemon = ledger._daemon_info(docker_text)
+    prior_environment = None
+    prior_backend_environment = None
+    publish_capacity = scope == "docker_vm_root"
+    if not new_render:
+        prior_spec = control.read(operation["root"] + "/ledger-maintenance-compose.json", optional=True)
+        if prior_spec is not None:
+            if not isinstance(prior_spec, Mapping) or not isinstance(prior_spec.get("services"), Mapping):
+                raise BuildControlError("Retained host-ledger Compose is malformed")
+            prior_service = prior_spec["services"].get("host-ledger-maintenance")
+            prior_environment = prior_service.get("environment") if isinstance(prior_service, Mapping) else None
+            if not isinstance(prior_environment, Mapping):
+                raise BuildControlError("Retained host-ledger Compose has no maintenance environment")
+            prior_flag = prior_environment.get("FULLMAG_HOST_LEDGER_PUBLISH_CAPACITY", "0")
+            if scope == "docker_vm_root" and prior_flag != "1":
+                raise BuildControlError("Retained maintenance differs from the pinned host capacity scope")
+            if prior_flag not in {"0", "1"}:
+                raise BuildControlError("Retained host-ledger capacity flag is invalid")
+            publish_capacity = prior_flag == "1"
+        prior_app_spec = control.read(operation["root"] + "/compose.json", optional=True)
+        if prior_app_spec is not None:
+            if not isinstance(prior_app_spec, Mapping) or not isinstance(prior_app_spec.get("services"), Mapping):
+                raise BuildControlError("Retained application Compose is malformed")
+            prior_backend = prior_app_spec["services"].get("backend")
+            prior_backend_environment = prior_backend.get("environment") if isinstance(prior_backend, Mapping) else None
+            if not isinstance(prior_backend_environment, Mapping):
+                raise BuildControlError("Retained application Compose has no backend environment")
+            old_path = prior_backend_environment.get("FULLMAG_DOCKER_HOST_CAPACITY_PATH")
+            old_sha = prior_backend_environment.get("FULLMAG_DOCKER_HOST_CAPACITY_SHA256")
+            if bool(old_path) != bool(old_sha):
+                raise BuildControlError("Retained backend capacity binding is incomplete")
+            if old_sha is not None:
+                if (not isinstance(old_sha, str) or re.fullmatch(r"[0-9a-f]{64}", old_sha) is None
+                        or old_path != f"/host-ledger/capacity/{old_sha}.json"):
+                    raise BuildControlError("Retained backend capacity binding is invalid")
+            if bool(old_sha) != publish_capacity:
+                raise BuildControlError("Retained application and maintenance capacity settings differ")
+    fresh_capacity = publish_capacity and (new_render or prior_environment is None)
+    daemon = ledger._daemon_info(docker_text, include_capacity=fresh_capacity)
+    if publish_capacity and not fresh_capacity:
+        if prior_environment.get("FULLMAG_DOCKER_HOST_ID") != daemon["id_sha256"]:
+            raise BuildControlError("Retained capacity publication belongs to another Docker daemon")
+        for key in (
+            "FULLMAG_HOST_LEDGER_DOCKER_CPU_COUNT",
+            "FULLMAG_HOST_LEDGER_DOCKER_MEMORY_TOTAL_BYTES",
+        ):
+            value = prior_environment.get(key)
+            if not isinstance(value, str) or not value.isdecimal() or int(value) <= 0:
+                raise BuildControlError("Retained host-ledger capacity input is invalid: " + key)
     ledger._image_attestation(image, docker_text)
     helper = selected / "scripts/lib/docker_host_ledger.sh"
     helper_bytes = _session_host().read_owned_regular(helper, maximum=ledger.MAX_HELPER_BYTES)
@@ -670,7 +725,20 @@ def _host_ledger(control, operation, layout, selected, image):
         "FULLMAG_HOST_LEDGER_HOST_PID": "1",
         "FULLMAG_HOST_LEDGER_RUNTIME_UID": "65532", "FULLMAG_HOST_LEDGER_RUNTIME_GID": "65532",
         "FULLMAG_HOST_LEDGER_LOCK_WAIT_SECONDS": "120", "FULLMAG_DOCKER_HOST_ID": daemon["id_sha256"],
+        "FULLMAG_HOST_LEDGER_CGROUP_MODE": "host" if publish_capacity else "private",
     }
+    if publish_capacity:
+        env.update({
+            "FULLMAG_HOST_LEDGER_PUBLISH_CAPACITY": "1",
+            "FULLMAG_HOST_LEDGER_DOCKER_CPU_COUNT": str(
+                daemon["cpu_count"] if fresh_capacity else int(prior_environment["FULLMAG_HOST_LEDGER_DOCKER_CPU_COUNT"])
+            ),
+            "FULLMAG_HOST_LEDGER_DOCKER_MEMORY_TOTAL_BYTES": str(
+                daemon["memory_total_bytes"] if fresh_capacity else int(prior_environment["FULLMAG_HOST_LEDGER_DOCKER_MEMORY_TOTAL_BYTES"])
+            ),
+        })
+    else:
+        env["FULLMAG_HOST_LEDGER_PUBLISH_CAPACITY"] = "0"
     command = docker_argv("compose", "--project-name", control.project,
                "-f", "-", "-f", str(selected / "compose.host-ledger.yaml"), "--profile", "host-ledger-maintenance", "config", "--format", "json")
     result = bounded_capture(command, data=canonical({"name": control.project,
@@ -680,6 +748,25 @@ def _host_ledger(control, operation, layout, selected, image):
         raise BuildControlError("Host-ledger Compose rendering failed: " + result.stderr.decode("utf-8", "replace"))
     rendered = json.loads(result.stdout)
     service = rendered["services"]["host-ledger-maintenance"]
+    if prior_environment is not None:
+        helper_environment = service.get("environment")
+        if not isinstance(helper_environment, dict):
+            raise BuildControlError("Rendered host-ledger maintenance environment is not a mapping")
+        if any(helper_environment.get(key) != value for key, value in prior_environment.items()):
+            raise BuildControlError("Retained host-ledger maintenance environment changed")
+        extra_environment = set(helper_environment) - set(prior_environment)
+        allowed_capacity_fields = {
+            "FULLMAG_DOCKER_HOST_ID",
+            "FULLMAG_HOST_LEDGER_PUBLISH_CAPACITY",
+            "FULLMAG_HOST_LEDGER_DOCKER_CPU_COUNT",
+            "FULLMAG_HOST_LEDGER_DOCKER_MEMORY_TOTAL_BYTES",
+        }
+        if extra_environment - allowed_capacity_fields:
+            raise BuildControlError("Retained host-ledger maintenance environment has new fields")
+        for key in extra_environment:
+            helper_environment.pop(key, None)
+        if set(helper_environment) != set(prior_environment):
+            raise BuildControlError("Retained host-ledger maintenance environment shape changed")
     service["volumes"] = [mount for mount in service["volumes"]
                           if mount["target"] != "/usr/local/sbin/docker_host_ledger.sh"]
     control_options = {"nocopy": True}
@@ -813,12 +900,65 @@ def _host_ledger(control, operation, layout, selected, image):
             or observed[0].get("State", {}).get("Running")
             or observed[0].get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != control.project):
         raise BuildControlError("Host-ledger helper identity/outcome differs; resources retained")
+    if publish_capacity and (
+            observed[0].get("HostConfig", {}).get("CgroupnsMode") != "host"
+            or observed[0].get("HostConfig", {}).get("PidMode") != "host"):
+        raise BuildControlError("Host capacity helper did not use the host PID and cgroup namespaces")
     if hashlib.sha256(_session_host().read_owned_regular(helper, maximum=ledger.MAX_HELPER_BYTES)).hexdigest() != helper_hash:
         raise BuildControlError("Host-ledger helper changed during maintenance")
     host_receipt = ledger._parse_json_lines(output.decode(), ledger.HOST_RECEIPT_SCHEMA)
     ledger._validate_host_receipt(host_receipt, {"project_id": values["project_id"],
         "mount_root": values["mount_root"], "backing_image": env["FULLMAG_HOST_LEDGER_BACKING_IMAGE"]})
     control.write(operation["root"] + "/host-ledger.json", host_receipt)
+    capacity_publication = None
+    if publish_capacity:
+        publication_schema = "fullmag.docker-host-capacity-publication.v1"
+        capacity_publication = ledger._parse_json_lines(output.decode(), publication_schema)
+        required_publication = {
+            "schema", "descriptor_sha256", "descriptor_path", "descriptor",
+            "project_id", "daemon_id_sha256",
+        }
+        descriptor_fields = {
+            "schema", "scope", "project_id", "daemon_id_sha256", "boot_id",
+            "allowed_cpu_ids", "cpu_max", "memory_max_bytes",
+            "kernel_memory_total_bytes", "docker_cpu_count", "docker_memory_total_bytes",
+        }
+        if (not isinstance(capacity_publication, Mapping)
+                or set(capacity_publication) != required_publication
+                or capacity_publication.get("schema") != publication_schema):
+            raise BuildControlError("Host capacity publication receipt is missing or malformed")
+        descriptor = capacity_publication.get("descriptor")
+        descriptor_sha = capacity_publication.get("descriptor_sha256")
+        if (not isinstance(descriptor, Mapping) or set(descriptor) != descriptor_fields
+                or not isinstance(descriptor_sha, str)
+                or re.fullmatch(r"[0-9a-f]{64}", descriptor_sha) is None):
+            raise BuildControlError("Host capacity descriptor fields or digest are invalid")
+        descriptor_bytes = (json.dumps(
+            dict(descriptor), sort_keys=True, separators=(",", ":"), allow_nan=False
+        ) + "\n").encode("utf-8")
+        expected_capacity_path = f"/host-ledger/capacity/{descriptor_sha}.json"
+        if (hashlib.sha256(descriptor_bytes).hexdigest() != descriptor_sha
+                or capacity_publication.get("descriptor_path") != expected_capacity_path
+                or capacity_publication.get("project_id") != values["project_id"]
+                or capacity_publication.get("daemon_id_sha256") != daemon["id_sha256"]
+                or descriptor.get("schema") != "fullmag.docker-host-capacity.v1"
+                or descriptor.get("scope") != "docker_vm_root"
+                or descriptor.get("project_id") != values["project_id"]
+                or descriptor.get("daemon_id_sha256") != daemon["id_sha256"]
+                or descriptor.get("docker_cpu_count") != int(env["FULLMAG_HOST_LEDGER_DOCKER_CPU_COUNT"])
+                or descriptor.get("docker_memory_total_bytes") != int(env["FULLMAG_HOST_LEDGER_DOCKER_MEMORY_TOTAL_BYTES"])):
+            raise BuildControlError("Host capacity publication identity or digest differs")
+        capacity_publication = dict(capacity_publication)
+        control.write(operation["root"] + "/host-capacity-publication.json", capacity_publication)
+        backend_environment = rendered["services"]["backend"].get("environment")
+        if not isinstance(backend_environment, dict):
+            raise BuildControlError("Rendered backend environment is not a mapping")
+        if prior_backend_environment is not None:
+            if (prior_backend_environment.get("FULLMAG_DOCKER_HOST_CAPACITY_PATH") != expected_capacity_path
+                    or prior_backend_environment.get("FULLMAG_DOCKER_HOST_CAPACITY_SHA256") != descriptor_sha):
+                raise BuildControlError("Retained backend capacity binding changed during partial resume")
+        backend_environment["FULLMAG_DOCKER_HOST_CAPACITY_PATH"] = expected_capacity_path
+        backend_environment["FULLMAG_DOCKER_HOST_CAPACITY_SHA256"] = descriptor_sha
     control.write(operation["root"] + "/ledger-helper-log.json",
                   {"log": docker_text("logs", name, combined=True)})
     docker_capture("rm", observed[0]["Id"])
@@ -826,7 +966,7 @@ def _host_ledger(control, operation, layout, selected, image):
     profile = {"profile": ledger.PROFILE, "image_id": image, "environment": env,
         "mount_root": values["mount_root"], "project_id": values["project_id"],
         "backing_image": env["FULLMAG_HOST_LEDGER_BACKING_IMAGE"], "host_receipt": host_receipt,
-        "maintenance_document": spec}
+        "maintenance_document": spec, "capacity_publication": capacity_publication}
     if os.name != "nt":
         descriptor = ledger.prepare_host_volume(profile, control.project, docker_text)
         _verify_host_ledger_volume(control, operation, descriptor, image)
@@ -1399,7 +1539,9 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         cache = _backend_cache(control, operation, layout, selected, image, toolchain["image_id"])
         operation["receipt"]["backend_volumes"] = cache["volume_names"]
         frontend_inputs, frontend_volume = _frontend(control, operation, selected, state, args.port, image)
-        ledger_backend, ledger_profile = _host_ledger(control, operation, layout, selected, image)
+        ledger_backend, ledger_profile = _host_ledger(
+            control, operation, layout, selected, image, new_render=provided_operation is None
+        )
         inputs = {"image_id": image, "toolchain_image_id": toolchain["image_id"],
                   "guest_provenance_path": "/opt/fullmag/control/backend/runtime-provenance.json"}
         provisional, hashes, delegation = runtime._provisional_development_certificate(inputs, identity)
@@ -3588,6 +3730,7 @@ def _validate_failed_prestart_successor(
         "cache-maintenance-compose.json", "host-ledger-volume-probe-compose.json",
         "host-ledger-volume-probe.json", "host-ledger-volume-probe-log.json",
         "ledger-maintenance-compose.json", "ledger-helper-log.json", "host-ledger.json",
+        "host-capacity-publication.json",
         "host-ledger-volume.json", "backend-failure-log.json", "handoff-log.json",
         "backend-build-receipt.json", "provenance.json", "storage-probe-log.json",
         "ledger-verify-receipt.json", "ledger-verify-log.json", "host-ledger-attestation.json",

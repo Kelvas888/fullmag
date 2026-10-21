@@ -273,3 +273,36 @@ sumowania ich capacity nie daje swobody zmiany host/revision/topology.
 Aktualne pliki: `host_resource_ledger.rs:774`, `:5080`, `:5881`, `:6871`;
 registry host→root: `host_ledger_registry.rs:51`. Dokładna historia
 released/proof bytes pozostaje nienaruszona.
+
+
+## Etap po review: H3 wykonane, H1 tylko w źródłach
+
+Checkpoint operacji `740722f4cef14f6fa6ca140205047160` zakończył się exit 0
+jako `stopped-confirmed`, action `observe-native-host-init-failure`.
+Odczyt dokładnych bajtów receiptu potwierdził SHA
+`a15f43cbe50ab8ce9e25aef97ae81c777f4c1d712f74d7751c63adb1a60a6c5a`.
+Nie wysłano sygnału ani nowego Solve. To dowód zakończonego checkpointu,
+nie dowód odblokowania starej polityki czy gotowości API.
+
+H1 rozszerza istniejący maintenance helper o pomiar root/VM. Nie dodaje stałej
+usługi. Globalne inventory dostaje fakty hosta; oferty procesu pozostają
+ograniczone jego quota, affinity i memory.max. Zmiana 4→16 CPU nie powinna
+więc zmieniać fizycznej tożsamości hosta. W źródłach pozostaje konieczność
+osobnej migracji istniejącej polityki; starego ledgera nie zmieniono.
+
+W review poprawiono: format boot ID, minimum i przecięcie ograniczeń CPU,
+brak cpu.max/memory.max w prawdziwym root cgroup, atomową publikację kompletnych
+bajtów oraz wznowienie pierwszego renderu po awarii. PID 1 może należeć do
+`/init.scope`; zakres root jest dowodzony przez host namespace i mountinfo,
+nie jego własną przynależność do grupy. Brak limitów root jest zgodny z
+[dokumentacją jądra cgroup v2](https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+
+Równoległy backend odświeżył inventory. Bieżący dokument ma SHA
+`04630db439fccb9ecad244f73557f076337e581867783ff7941776370e5c3bda`, starą
+politykę revision 1 / 4 CPU / 7 GiB i 14 Released. Historyczny SHA `3112bce5…`
+pozostaje dowodem wcześniejszej obserwacji. Nie zamrożono obcych grup ani
+nie zastosowano migracji na podstawie samej listy Released.
+
+H1: kontrola składni i review źródeł; bez testów, builda i publikacji deskryptora.
+H2: protokół migracji nadal planowany. H3: checkpoint wykonany; recreate/restart
+po zmianie polityki nadal niewykonane. API, mesh i browser/WebGL **NOT VERIFIED**.

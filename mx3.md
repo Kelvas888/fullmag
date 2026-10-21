@@ -1,30 +1,37 @@
 # MX3 — audyt frontendu i runtime symulacji Fullmag
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 21.10.2026, 02:37 CEST
+## Aktualny status wdrożenia — 21.10.2026, po checkpointcie H3
 
-Zarządzany restart `a0019546f54c42dda7ec0024fdebc5d7` wykonał się w tym samym
-kontenerze `f7c035fd`, bez ponownej aktywacji skryptu. Build źródeł `73e275ce1`
-**PASS: Make exit 0 / 121700 ms**, pakiet 24 plików / 6161 ms, verify / 1564 ms.
-Storage gate PASS; receipt potwierdza też świeżą delegację CPU. Kontener miał
-**128 GiB RAM / 16 CPU**. Capture 359812 ms, sync ext4 3665 ms; HOLD RELEASED.
+Ostatni rzeczywisty build pozostaje na `73e275ce1`: Make exit 0 / 121700 ms,
+pakiet 24 plików / 6161 ms, verify 1564 ms. Backend `f7c035fd` ma
+128 GiB / 16 CPU, lecz zakończył się exit 1 przed API z powodu konfliktu
+wspólnej polityki hosta. Frontend pozostaje healthy na porcie 3198.
 
-**Accepted-store bootstrap przeszedł. Nowa blokada jest potwierdzona:** wspólny
-host-ledger zawiera inventory z quota 4000; zmiana tylko tego pola na 16000
-odtwarza dokładnie hash odrzucony przez nowy probe. Ledger wiąże wspólną
-politykę hosta z quota konkretnego kontenera. Native profil dodatkowo nadal
-ogranicza oferty do 4 CPU / 7 GiB. Backend exited1/non-OOM o 00:16:42 UTC;
-frontend healthy3198. API nie wystartowało, materializacja/mesh/UI NOT VERIFIED.
+**H3: wykonano checkpoint `740722f4cef14f6fa6ca140205047160`, exit 0,
+`stopped-confirmed`.** Odczyt kontrolny receiptu potwierdza SHA
+`a15f43cbe50ab8ce9e25aef97ae81c777f4c1d712f74d7751c63adb1a60a6c5a`.
+Obserwowano istniejący stop; nie wysłano sygnału, nie uruchomiono API ani Solve.
+Zachowano pierwotny failed owner, config, released proofs i held04.
 
-Przygotowano opt-in przekazanie zatwierdzonego CPU/RAM do native profilu
-(3 pliki źródłowe, review PASS po korekcie przypięć całych CPU). **Nie zastosowano do runtime; samo to nie
-usuwa konfliktu wspólnej polityki.** Nie resetowano ownera, ledgera ani cache.
-W ledgerze zachowano wszystkie 14 rezerwacji (Released); nie dowodzi to braku
-aktywnego inventory ownera. Dwa inne aktywne backendy używają tego samego mountu.
+**H0 i H1 są zapisane w źródłach; nie zastosowano ich do runtime.**
+H1 oddziela pojemność Docker VM od quota konkretnego backendu, zachowując
+limity procesu przy ofertach CPU/RAM. Rozszerza istniejący krótki helper;
+pozostają dokładnie dwie stałe usługi aplikacji. Nie zmienia wspólnej polityki.
+Parsery Python/Rust i review źródeł nie zastępują builda ani dowodu runtime.
 
-3806 i held04 zachowane; brak retry04/Compute/Solve/testów. Browser tool odrzucił
-odczyt karty protokołem; pending prośba do użytkownika o nową kartę HTTP.
-F0–F12 pozostają otwarte. Szczegóły: §57.
+**H2 pozostaje do wdrożenia:** jawna migracja starej, niezmiennej polityki,
+z zachowaniem historii oraz koordynacją wszystkich korzystających grup.
+Świeży odczyt wykazał równoległą aktualizację snapshotu inventory: ledger ma
+teraz SHA `04630db439fccb9ecad244f73557f076337e581867783ff7941776370e5c3bda`;
+polityka nadal ma revision 1, CPU 4000, RAM 7 GiB, 14 rezerwacji Released.
+Sam rekord inventory ownera ani Released nie dowodzą braku aktywnego writera.
+Nie nadpisano tej równoległej zmiany. Grupa docker-volume-only ma już inny
+kontener niż przy poprzedniej obserwacji; viewport nadal działa jako unhealthy.
+
+3806 i held04 zachowane. Brak retry04/Compute/Solve/testów oraz nowego
+buildu H0/H1. API, materializacja, mesh i widoczny render **NOT VERIFIED**.
+Browser tool nadal wymaga poprawnej karty HTTP; nie obchodzono odmowy.
 <!-- mx3-current-status:end -->
 
 

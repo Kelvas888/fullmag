@@ -696,3 +696,39 @@ nie wymaga nowego certyfikatu i zachowuje swój dokładny zestaw pól oraz błę
 Gdy istnieje `pre-ack-retry.json`, walidowany jest pełny przypięty dowód, bez
 fallbacku do legacy po błędzie lub nieznanym stanie. Żaden wariant nie zmienia
 niezmiennych archiwów, aktualnego ownera ani uprawnień Solve.
+
+
+## Rozdzielenie zasobów hosta i grupy DEV — 21.10.2026
+
+Globalne inventory hosta nie może identyfikować fizycznego hosta przez quota
+pojedynczego kontenera. Przygotowany opt-in H1 wykorzystuje istniejący,
+krótki helper maintenance w host PID/cgroup namespace do publikacji faktów
+root/VM: daemon, boot, CPU mask, limit root i pamięć Docker/kernel. Nie powstaje
+trzecia stała usługa ani nowa droga budowania. Root cgroup v2 może nie mieć
+cpu.max i memory.max; jawne null oznacza udowodniony brak tego limitu, zgodnie
+z [kontraktem jądra](https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+
+Descriptor w `/host-ledger/capacity/<sha>.json` jest przypięty bajtami SHA,
+root-owned i read-only. Publikacja create-only udostępnia wyłącznie kompletny,
+fsynced payload. Backend weryfikuje scope/project/daemon/boot; niepoprawny
+jawny descriptor nie uruchamia fallbacku. Prywatny limit procesu jest mierzony
+osobno: oferta nie przekracza minimum root/VM i procesu, a placement CPU używa
+przecięcia ich masek. Logiczny istniejący host_id może pozostać docker-all-host;
+physical daemon SHA pozostaje osobnym, walidowanym faktem.
+
+Włączenie jest utrwalane w istniejącym receipt przed pierwszym renderem.
+Częściowe wznowienie zachowuje zapisany tryb i przypięty descriptor. Dawne
+operacje bez opt-in pozostają legacy. Zmiana boot/VM wymaga świeżego zarządzanego
+renderu; nie odświeżamy po cichu boot-pinned descriptoru podczas resume.
+Stary obraz/Compose nie nabywa tej funkcji przez sam zapis źródeł.
+
+H1 jest poprawką zakresu pomiaru, nie migracją istniejącego ledgeru. H2 wymaga
+jawnego, wersjonowanego przejścia z zachowaniem starej polityki, released rows,
+proof CAS i jednego atomowego punktu publikacji. Przed zastosowaniem wymagane
+są blokada writera i potwierdzony brak inventory ownera oraz koordynacja grup.
+Zwykły start nie resetuje markera ani historii. Dokładny protokół H2 pozostaje
+propozycją; nie jest implementowany ani zatwierdzany przez sam ten opis.
+
+Zmiana nie dotyczy Python/ProblemIR, OpenAPI, fizyki ani wyboru czterech
+realizacji FDM/FEM CPU/GPU. Wymuszone GPU pozostaje bez fallbacku CPU.
+H1: review i kontrola składni źródeł; build/runtime **NOT VERIFIED**, bez testów.
