@@ -140,6 +140,48 @@ class LiveCaptureRetryTests(unittest.TestCase):
             self.assertEqual(result[0], workspace)
 
 
+class LiveHashCacheTests(unittest.TestCase):
+    def test_unchanged_metadata_reuses_the_digest_without_reading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "src").mkdir()
+            path = root / "src/lib.rs"
+            path.write_bytes(b"fn a() {}\n")
+            first = source._LiveHashCache()
+            expected = first.hash(root, "src/lib.rs")
+            self.assertEqual(first.hits, 0)
+
+            second = source._LiveHashCache(first.observed)
+            with mock.patch.object(source, "_live_hash_regular") as reader:
+                self.assertEqual(second.hash(root, "src/lib.rs"), expected)
+            reader.assert_not_called()
+            self.assertEqual(second.hits, 1)
+
+            path.write_bytes(b"fn b() {}\n")
+            stat = path.stat()
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+            third = source._LiveHashCache(first.observed)
+            changed = third.hash(root, "src/lib.rs")
+            self.assertNotEqual(changed[2], expected[2])
+            self.assertEqual(third.hits, 0)
+
+    def test_cache_round_trip_ignores_foreign_or_malformed_documents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build_root = Path(directory).resolve()
+            (build_root / source.LIVE_MANIFEST_DIRNAME).mkdir()
+            sources = build_root / "src"
+            cache = source._LiveHashCache()
+            cache.observed = {"a.rs": [3, 7, "100644", "f" * 64], "gone.rs": [1, 1, "100644", "e" * 64]}
+            source._save_live_hash_cache(build_root, sources, cache, {"a.rs"})
+            self.assertEqual(
+                source._load_live_hash_cache(build_root, sources).known,
+                {"a.rs": [3, 7, "100644", "f" * 64]},
+            )
+            self.assertEqual(source._load_live_hash_cache(build_root, build_root / "other").known, {})
+            source._live_hash_cache_path(build_root).write_bytes(b"{not json")
+            self.assertEqual(source._load_live_hash_cache(build_root, sources).known, {})
+
+
 class AutoUntrackedTests(unittest.TestCase):
     def test_new_runtime_files_are_selected_and_others_left_out(self):
         with tempfile.TemporaryDirectory() as directory:

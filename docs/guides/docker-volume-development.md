@@ -59,7 +59,10 @@ nie wymaga ponownego podawania wcześniejszego nadpisania portu.
 
 Migawka odczytuje checkout jednym przebiegiem. Git porównuje tylko rozmiar
 i sekundy mtime (`core.checkStat=minimal`), bo indeks hosta nie może być
-odświeżony przez readonly mount; treść wiąże SHA-256 każdego pliku. Zapis pliku
+odświeżony przez readonly mount; treść wiąże SHA-256 każdego pliku. Digest pliku
+o niezmienionym rozmiarze, `mtime` (ns) i trybie jest brany z cache poprzedniej
+migawki (`/build/.fullmag-live-source/hash-cache.json`), więc ponowny start czyta
+tylko zmienione pliki. Zapis pliku
 w trakcie startu (edytor, formatter) nie kończy próby błędem: odczyt w capture
 albo synchronizacja shadow wykrywa zmianę i wykonuje ponowne przechwycenie,
 najwyżej trzy razy. Dopiero ciągłe zmiany przez wszystkie próby zatrzymują start.
