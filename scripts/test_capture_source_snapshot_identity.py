@@ -752,7 +752,7 @@ def test_qualification_input_parent_link_cannot_escape_repository(tmp_path: Path
         module._resolve_contained_path(repo, fixture, "qualification input")
     link = repo / "outside-parent"
     try:
-        link.symlink_to(outside, target_is_directory=True)
+        link.symlink_to(Path("..") / outside.name, target_is_directory=True)
     except OSError:
         return
     with pytest.raises(module.SourceIdentityError, match="escapes snapshot root"):
