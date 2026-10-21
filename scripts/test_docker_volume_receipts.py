@@ -185,8 +185,8 @@ class VolumeReceiptTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            for frontend_running in (False, True):
-                with self.subTest(frontend_running=frontend_running), ExitStack() as stack:
+            for frontend_running, scratch_changed in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(frontend_running=frontend_running, scratch_changed=scratch_changed), ExitStack() as stack:
                     environment = {"FULLMAG_HOST_LEDGER_MOUNT_ROOT": "/ledger",
                         "FULLMAG_HOST_LEDGER_PROJECT_ID": "project",
                         "FULLMAG_HOST_LEDGER_BACKING_IMAGE": "/ledger.ext4"}
@@ -200,6 +200,8 @@ class VolumeReceiptTests(unittest.TestCase):
                     control.operation.return_value = nullcontext(operation)
                     args = SimpleNamespace(repo_root=source, source_root=source, attempt="a" * 32,
                         config_sha256=hashlib.sha256(dev.canonical(document)).hexdigest())
+                    if scratch_changed:
+                        args.empty_scratch_session_id = "session-probe"
                     containers = {service: {"Id": service, "Image": "image", "Config": {
                         "Labels": {"com.docker.compose.project": "fullmag-master",
                                    "com.docker.compose.service": service,
@@ -219,6 +221,8 @@ class VolumeReceiptTests(unittest.TestCase):
                                 observed["State"]["Running"] = False
                             return json.dumps([observed])
                         if arguments[0] == "exec":
+                            if scratch_changed:
+                                return json.dumps({"status": "ok", "active_session": True})
                             raise BuildControlError("health probe refused")
                         self.fail("unexpected Docker observation: " + repr(arguments))
                     patches = [
@@ -242,8 +246,21 @@ class VolumeReceiptTests(unittest.TestCase):
                     for patcher in patches:
                         stack.enter_context(patcher)
                     capture = stack.enter_context(mock.patch.object(dev, "docker_capture"))
-                    with self.assertRaisesRegex(BuildControlError, "health probe refused"):
-                        dev.stop_idle(args)
+                    scratch_capture = stack.enter_context(mock.patch("docker_empty_scratch_restart.capture",
+                        side_effect=[{"fingerprint": "old", "export": {}}, {"fingerprint": "changed", "export": {}}]))
+                    with self.assertRaisesRegex(BuildControlError,
+                            "Pinned empty scratch changed" if scratch_changed else "health probe refused"):
+                        if scratch_changed:
+                            dev.restart_idle(args)
+                        else:
+                            dev.stop_idle(args)
+                    if scratch_changed:
+                        self.assertEqual(scratch_capture.call_count, 2)
+                        control.write.assert_called_once_with("attempts/test/empty-scratch-export.json",
+                                                              {"fingerprint": "old", "export": {}})
+                        self.assertEqual(operation["receipt"]["empty_scratch_export"]["session_id"], "session-probe")
+                    else:
+                        scratch_capture.assert_not_called()
                     commands = [call.args for call in capture.call_args_list]
                     self.assertEqual(commands, [("stop", "--time", "60", "frontend")]
                                      + ([("start", "frontend")] if frontend_running else []))

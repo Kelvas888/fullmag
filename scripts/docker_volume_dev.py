@@ -2556,19 +2556,38 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 if health.get("status") != "ok":
                     raise BuildControlError("Backend health is not ready; idle restart refused")
                 active_session = health.get("active_session")
+                empty_scratch = None
+                empty_scratch_id = getattr(args, "empty_scratch_session_id", None)
+                if empty_scratch_id is not None and active_session is not True:
+                    raise BuildControlError("Pinned empty scratch session is no longer active")
                 if active_session is True:
                     if startup_enabled:
                         raise BuildControlError("Backend has an active session; idle restart refused")
-                    cancelled_activation = _validate_cancelled_activation_preflight(
-                        control, previous_root, previous, document, selected, args.config_sha256,
-                        ids["backend"], environment, require_quiesced_activation=False,
-                    )
-                    health = cancelled_activation["probe"]["health"]
-                    operation["receipt"]["accepted_then_cancelled_proof_sha256"] = (
-                        cancelled_activation["proof_sha256"]
-                    )
+                    if empty_scratch_id is not None:
+                        from docker_empty_scratch_restart import capture
+                        empty_scratch = capture(ids["backend"], empty_scratch_id, environment)
+                        export_path = operation["root"] + "/empty-scratch-export.json"
+                        control.write(export_path, empty_scratch)
+                        operation["receipt"]["empty_scratch_export"] = {
+                            "path": export_path, "sha256": hashlib.sha256(canonical(empty_scratch)).hexdigest(),
+                            "session_id": empty_scratch_id, "fingerprint": empty_scratch["fingerprint"],
+                        }
+                    else:
+                        cancelled_activation = _validate_cancelled_activation_preflight(
+                            control, previous_root, previous, document, selected, args.config_sha256,
+                            ids["backend"], environment, require_quiesced_activation=False,
+                        )
+                        health = cancelled_activation["probe"]["health"]
+                        operation["receipt"]["accepted_then_cancelled_proof_sha256"] = (
+                            cancelled_activation["proof_sha256"]
+                        )
                 elif active_session is not False:
                     raise BuildControlError("Backend has an active or unknown session; idle restart refused")
+                if empty_scratch is not None:
+                    from docker_empty_scratch_restart import capture
+                    fresh_scratch = capture(ids["backend"], empty_scratch_id, environment)
+                    if fresh_scratch["fingerprint"] != empty_scratch["fingerprint"]:
+                        raise BuildControlError("Pinned empty scratch changed before backend drain")
             except Exception:
                 if actual["frontend"]["State"]["Running"]:
                     operation["daemon_pending"] = True

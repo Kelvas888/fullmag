@@ -2543,6 +2543,8 @@ def _parser() -> argparse.ArgumentParser:
         idle.add_argument("--config-sha256", required=True)
         idle.add_argument("--source-root", type=Path, required=True)
         idle.add_argument("--port", type=int, required=True)
+        if name == "restart-idle-volume":
+            idle.add_argument("--empty-scratch-session-id", help="Export this exact untouched scratch session and restart the backend")
     stop_unadmitted = subparsers.add_parser(
         "stop-unadmitted",
         help=(

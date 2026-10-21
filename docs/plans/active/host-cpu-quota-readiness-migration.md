@@ -12,8 +12,8 @@ osłabienia admission. Worktree: `scratch-gpu-single`, branch `codex/scratch-gpu
    wyłącznie `cpu_quota: unavailable -> supported` odtwarza nowy hash capabilities.
    Dowód diagnostyczny: `/tmp/host-readiness-comparison.json`; surowe dane:
    `/tmp/host-readiness-before-migration.json`, `/tmp/host-readiness-candidate.log`.
-2. **Częściowo:** dodano `stop-idle-volume` z kontrolą pierwotnego stanu
-   frontendu; testy interpretowane przechodzą. Przygotować zgodną konfigurację konsumentów.
+2. **Wykonane:** dodano `stop-idle-volume` z kontrolą pierwotnego stanu
+   frontendu; testy interpretowane przechodzą. Master zatrzymany przez managed drain; worktree ma zgodną konfigurację.
    Nie uruchamiać starego master po migracji bez zgodnego profilu delegacji.
 3. **Kod przygotowany:** wąska metoda migracji, jawny argument starej generacji
    i protokół request/claim/result w launcherze. Managed build Rust przeszedł
@@ -21,16 +21,35 @@ osłabienia admission. Worktree: `scratch-gpu-single`, branch `codex/scratch-gpu
    zgodne ze zbudowanymi kopiami. Protokół Python sprawdzony testami;
    nowy helper wdrożony w obrazie worktree, hash pliku zgodny ze źródłem.
    Próba `e0e48ebf417540dcb2344ad43b1d9325`: pakiet 24 pliki zweryfikowany,
-   storage i cgroup PASS, zwykły start odrzuca stary profil. Migracja NOT VERIFIED.
-4. **Częściowo:** testy Python: 9 runtime, 8 host, 7 istniejących testów
+   storage i cgroup PASS, zwykły start odrzuca stary profil. Migracja została następnie zweryfikowana w kroku 5.
+4. **Wykonane:** testy Python: 9 runtime, 8 host, 7 istniejących testów
    inicjalizacji oraz regresje kolejności/drain przechodzą. Natywny test Rust obejmujący 18 przypadków odmów, przerwania, powtórzenia
    i zachowania danych przeszedł w stałym backendzie worktree (exit 0).
    Użytkownik zezwolił na testy tej poprawki w zarządzanej grupie worktree.
-5. **Do wykonania:** dopiero po weryfikacji drain konsumentów, spójna kopia
-   rejestru/CAS, jawna migracja i start zgodnych backendów. Bez ręcznej edycji JSON.
-6. **Do wykonania:** API health, świeża generacja i snapshot, limit realnego
-   workera, restart bez migracji, kontrola zachowania policy i danych. Następnie
-   weryfikacja FDM GPU single i generacja OpenAPI.
+5. **Wykonane:** obaj konsumenci zatrzymani; spójna kopia `ledger.tar`
+   i receipt zachowane w `host-readiness-migration-backups/worker-cpu-quota-973c2f42-30b2-47bc-9941-769bcc5dde4b`
+   pod runtime storage. SHA256 archiwum:
+   `e2b12517d3eaae06bc12f9ec7045dcaaa631329384608bc58749c80fab5583de`.
+   Jawna migracja request `73b09c34-c2a5-4d8a-b198-b8534bc52192`,
+   próba `4d0e2f9cbf9a4e68be5329f1e950d724`: exit 0, succeeded.
+   Zachowano policy, node_policy i rezerwacje. Jedyna zmiana enforcement:
+   `cpu_quota: unavailable -> supported`.
+6. **Częściowo:** API health i nowa generacja potwierdzone; managed restart
+   bez zmian `f9f6051a8b41468e9584c21ed79946be` przeszedł z cache hit.
+   Test API: 4 dozwolone kombinacje przyjęte, 6 niedozwolonych odrzuconych,
+   bez fallbacku i bez Solve. Limit realnego workera oraz obliczenia GPU
+   pozostają NOT VERIFIED. Generator OpenAPI wymaga aktualnego pakietu;
+   restart wymaga jawnego wskazania naszej pustej sesji probe
+   `session-18e08614dd42eff9000000c6`. Dodano `--empty-scratch-session-id`
+   do `restart-idle-volume`: eksport przed stop, ponowna kontrola niezmienionej
+   sesji, odmowa zmian modelu i przyjętych obliczeń. To nie jest odtworzenie
+   sesji po restarcie. Wykonanie tej ścieżki pozostaje NOT VERIFIED.
+   Master pozostaje zatrzymany do integracji i zgodnego buildu.
+
+Generacja przed migracją:
+`ddc5f0dfe4c684828cddb8f31215bb583e5cffd19896c67ac378d162ea3acf42`.
+Generacja po migracji:
+`db34cb25611db7b5ee09f511b8789fc92e089c2c39bd7b9042fa61049650227c`.
 
 ## Warunki przerwania
 
@@ -60,4 +79,4 @@ exit 0. Log i receipt pozostają w wolumenie kontroli. Pierwsza próba wykryła
 brak launch binding w fixture Released; poprawiono wyłącznie fixture.
 Testy Python nowej recepty i startu: 9 PASS. Drain zatrzymanego legacy
 frontendu oraz zachowanie pozostałych kontroli: 2 testy PASS.
-Rejestr runtime pozostaje bez migracji; następny etap to drain i spójna kopia.
+Wykonanie migracji i zachowanie danych potwierdzono w kroku 5.
