@@ -1734,6 +1734,14 @@ def recover(args: argparse.Namespace) -> None:
         },
     }
     with control.operation("development", operation_inputs) as operation:
+        # Recovery keeps the ledger of the stopped backend; its storage proof
+        # was taken from that ledger. A later normal start may switch it.
+        import docker_group_ledger as group_ledger
+        operation["receipt"]["ledger_profile"] = (
+            group_ledger.PROFILE
+            if group_ledger.is_group_ledger_backend(
+                compose.get("services", {}).get("backend", {}).get("environment", {}))
+            else "host-ledger-v1")
         fresh = _revalidate_recovery_boundary(
             control,
             authorization,

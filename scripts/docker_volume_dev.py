@@ -691,20 +691,26 @@ def _assert_host_capacity_migration_quiescent():
         )
 
 
-def _uses_group_ledger(operation, *, new_render):
+def _uses_group_ledger(control, operation, *, new_render):
     """Select the ledger profile pinned in this operation receipt.
 
-    Every new render uses the per-group ledger (ADR 0067).  A partially
-    resumed operation keeps the profile it was rendered with, so an
-    interrupted global-ledger render is never continued with another ledger.
+    Every new render uses the per-group ledger (ADR 0067).  A supplied
+    operation keeps an explicit pin: container recovery pins the profile of
+    the backend it recovers, and a partially resumed global render keeps the
+    global ledger.  An unpinned supplied operation without a global render
+    is a fresh render of this group.
     """
     receipt = operation["receipt"]
     pinned = receipt.get("ledger_profile")
-    if pinned not in (None, "group-ledger-v1"):
+    if pinned not in (None, "group-ledger-v1", "host-ledger-v1"):
         raise BuildControlError("Retained ledger profile is invalid")
     if new_render:
         return True
-    return pinned == "group-ledger-v1"
+    if pinned is not None:
+        return pinned == "group-ledger-v1"
+    global_render = ("host_capacity_scope" in receipt or control.read(
+        operation["root"] + "/ledger-maintenance-compose.json", optional=True) is not None)
+    return not global_render
 
 
 def _group_ledger(control, operation, image, *, new_render=False):
@@ -1694,7 +1700,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         cache = _backend_cache(control, operation, layout, selected, image, toolchain["image_id"])
         operation["receipt"]["backend_volumes"] = cache["volume_names"]
         frontend_inputs, frontend_volume = _frontend(control, operation, selected, state, args.port, image)
-        if _uses_group_ledger(operation, new_render=provided_operation is None):
+        if _uses_group_ledger(control, operation, new_render=provided_operation is None):
             if getattr(args, "migrate_host_capacity", False):
                 raise BuildControlError(
                     "A DEV group ledger has no host capacity migration; its budget is the group's own")

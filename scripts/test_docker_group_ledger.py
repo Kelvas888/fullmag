@@ -120,6 +120,37 @@ class GroupLedgerContainerTest(unittest.TestCase):
             {"Type": "volume", "Name": "fullmag-host-ledger-v1-p", "Destination": "/host-ledger"}))
 
 
+class LedgerProfileSelectionTest(unittest.TestCase):
+    class Control:
+        def __init__(self, records=None):
+            self.records = records or {}
+
+        def read(self, relative, optional=False):
+            return self.records.get(relative)
+
+    def select(self, receipt, *, new_render, records=None):
+        import docker_volume_dev as dev
+        return dev._uses_group_ledger(self.Control(records), {"receipt": receipt, "root": "r"},
+                                      new_render=new_render)
+
+    def test_new_render_and_unpinned_fresh_operation_use_group_ledger(self):
+        self.assertTrue(self.select({}, new_render=True))
+        self.assertTrue(self.select({"ledger_profile": "host-ledger-v1"}, new_render=True))
+        self.assertTrue(self.select({}, new_render=False))
+
+    def test_supplied_operation_keeps_its_pinned_or_rendered_global_ledger(self):
+        self.assertFalse(self.select({"ledger_profile": "host-ledger-v1"}, new_render=False))
+        self.assertTrue(self.select({"ledger_profile": "group-ledger-v1"}, new_render=False))
+        self.assertFalse(self.select({"host_capacity_scope": "docker_vm_root"}, new_render=False))
+        self.assertFalse(self.select({}, new_render=False,
+                                     records={"r/ledger-maintenance-compose.json": {}}))
+
+    def test_unknown_pin_is_rejected(self):
+        import docker_volume_dev as dev
+        with self.assertRaises(dev.BuildControlError):
+            self.select({"ledger_profile": "other"}, new_render=False)
+
+
 class GlobalMigrationQuiescenceTest(unittest.TestCase):
     def run_check(self, records):
         import docker_volume_dev as dev
