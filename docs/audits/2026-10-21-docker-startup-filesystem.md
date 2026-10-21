@@ -419,3 +419,21 @@ HMR po edycji Windows, restart bez zmian, nowa aktywacja skryptu, rzeczywiste
 CPU/GPU Solve, trwałość po restarcie, izolacja dwóch grup i końcowe CI/merge
 nadal wymagają odrębnych dowodów. Retencja pakietów pozostaje odłożona poza
 start API; samo umieszczenie ich w named volume nie ogranicza liczby kopii.
+
+
+## Dokładny pomiar uploadów pozycji FEM
+
+Probe WebGL rozpoznaje aktywny atrybut `position` z programu shaderowego
+i przypisuje uploady do konkretnego WebGLBuffer przy vertexAttribPointer.
+Uwzględnia upload przed pierwszym pointerem oraz kolejne aktualizacje tego
+samego bufora. Całkowite ARRAY_BUFFER pozostaje osobną metryką diagnostyczną;
+normalne nie są zaliczane jako pozycje. Zakres sceny, oświetlenie i dotychczasowy
+próg plateau pozostają bez zmian. Brak rozpoznanych pozycji kończy próbkę błędem.
+
+Poprawiono również zliczanie przeciążeń bufferData/bufferSubData: offset celu
+nie jest rozmiarem uploadu; source offset i length są liczone w elementach,
+a length=0 obejmuje pozostałe elementy źródła. Regresja Node VM jest podpięta
+do istniejącego browser fixture CI. Niezależny przegląd nie wykazał P1.
+Managed Node --check obu plików przeszedł ze stabilnymi wejściami; lokalnie
+nie uruchamiano testu jednostkowego. Rzeczywisty browser gate po tej zmianie
+pozostaje do potwierdzenia w CI.

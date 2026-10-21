@@ -606,6 +606,9 @@ jobs:
           export FULLMAG_RUNNER_CHROMIUM="$(node -p "require('./apps/control-room/node_modules/playwright').chromium.executablePath()")"
           node apps/runner-console/browser-smoke.cjs
 
+      - name: Verify FEM position upload attribution contracts
+        run: node --test apps/control-room/scripts/audit-viewport-3d-fem-topology-uploads-probe.node-test.mjs
+
       - name: Run browser fixture pre-proof gate
         env:
           CONTROL_ROOM_AUDIT_ARTIFACTS_DIR: ${{ runner.temp }}/viewport-3d-browser-audit
