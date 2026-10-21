@@ -278,6 +278,47 @@ class ComposeProjectIdentityTests(unittest.TestCase):
                 runtime.assert_loopback_port_available(3197, "fullmag-master")
         docker.assert_not_called()
 
+    def test_implicit_port_skips_ports_of_running_and_stopped_groups(self):
+        def binding(port):
+            return {"HostConfig": {"PortBindings": {
+                "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]}}}
+
+        taken = {3197, 3198, 3199, 3200}
+
+        def fake_docker(*args, **kwargs):
+            if args[:3] == ("ps", "--all", "--quiet"):
+                return "a\nb\nc\nd\n"
+            if args[:1] == ("inspect",):
+                return json.dumps([binding(port) for port in sorted(taken)])
+            raise AssertionError(args)
+
+        with patch.object(runtime, "docker", side_effect=fake_docker), \
+                patch.object(runtime.os, "name", "posix"):
+            first = runtime.select_loopback_port(3197, "fullmag-worktree-a")
+            again = runtime.select_loopback_port(3197, "fullmag-worktree-a")
+            other = runtime.select_loopback_port(3197, "fullmag-worktree-b")
+            taken.discard(3197)
+            free_preferred = runtime.select_loopback_port(3197, "fullmag-worktree-a")
+        self.assertNotIn(first, taken | {3197})
+        self.assertTrue(3197 < first < 3197 + 64)
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, other)
+        self.assertEqual(free_preferred, 3197)
+
+    def test_implicit_port_fails_when_every_candidate_is_taken(self):
+        def fake_docker(*args, **kwargs):
+            if args[:3] == ("ps", "--all", "--quiet"):
+                return "a\n"
+            if args[:1] == ("inspect",):
+                return json.dumps([{"HostConfig": {"PortBindings": {"8080/tcp": [
+                    {"HostIp": "", "HostPort": str(port)} for port in range(3197, 3201)]}}}])
+            raise AssertionError(args)
+
+        with patch.object(runtime, "docker", side_effect=fake_docker), \
+                patch.object(runtime.os, "name", "posix"):
+            with self.assertRaisesRegex(ValueError, "explicit port"):
+                runtime.select_loopback_port(3197, "fullmag-worktree-a", attempts=4)
+
     def test_unpublished_container_does_not_block_port(self):
         document = {"Config": {"Labels": {}}, "HostConfig": {"PortBindings": None}}
 

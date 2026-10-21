@@ -1431,6 +1431,14 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             or (provided_operation is not None
                 and provided_operation["receipt"].get("host_capacity_migration") is True)):
         _assert_host_capacity_migration_quiescent()
+    if provided_operation is None and reuse_state is None and not getattr(args, "port_explicit", True):
+        # A configured or default port is a preference for a new group.  Every
+        # later start of this group reuses the port its document pins.
+        preferred = args.port
+        args.port = runtime.select_loopback_port(preferred, identity["project_name"])
+        if args.port != preferred:
+            print(f"Port {preferred} is taken; group {identity['project_name']} uses {args.port}",
+                  file=sys.stderr)
     runtime.assert_loopback_port_available(args.port, identity["project_name"])
     if args.profile != "dev":
         raise BuildControlError("Volume DEV supports backend-dev; release uses its explicit managed recipe")
@@ -1690,7 +1698,9 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         if configured.returncode or len(configured.stdout) > 1024 * 1024:
             raise BuildControlError("DEV Compose render failed: " + configured.stderr.decode("utf-8", "replace"))
         document = json.loads(configured.stdout)
-        from docker_volume_resources import apply_saved_budget
+        from docker_dev_defaults import configured_group_budget
+        from docker_volume_resources import apply_group_budget, apply_saved_budget
+        apply_group_budget(document, configured_group_budget(selected))
         apply_saved_budget(control, document)
         if device_access == "gpu":
             document["services"]["backend"]["gpus"] = [{"count": "all"}]
