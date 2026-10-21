@@ -147,6 +147,8 @@ Nadzór startu odczytuje receipt PID 1 przez kanoniczne `runtime_service.process
 Każdy wariant wymaga zakończonego API, braku żywych procesów i aktywnych lease’ów oraz zwolnionych rezerwacji hosta. Bezpośrednio przed zapisem journalu komenda ponownie pobiera dowody i porównuje receipt oraz surowe piny `OWNER`; drift przerywa operację. Po zatrzymaniu weryfikuje niezmienionego ownera. Sam stop nie odzyskuje GPU, nie zmienia ownera i nie powtarza skryptu; dalszy start nadal podlega natywnym bramkom recovery. Obserwacja nieznana lub aktywne zasoby blokują komendę.
 Stara komenda odtwarzania przez hostowy receipt DEV odmawia wykonania.
 
+Jeżeli `recreate-services` zakończył usunięcie usług, ale następny start przerwał się przed utworzeniem nowej grupy, użyj `docker_dev.py resume-recreate-volume --attempt <development-attempt> --config-sha256 <compose-sha> --recreate-attempt <recreate-attempt> --recreate-receipt-sha256 <terminal-sha> --source-root <checkout> --port <port>`. Komenda wymaga pustej grupy, dokładnego receiptu usunięcia i potwierdzonego zatrzymania native runtime. Zachowuje storage oraz wolumeny i ponownie sprawdza dowody pod blokadą startu. Nie ponawia Solve; nie obsługuje oczekującego reattach ani nowego storage.
+
 ### Aktywacja skryptu w już działającym Workspace
 
 Jeżeli grupa ma już zdrowe, działające usługi `backend` i `frontend`, skrypt

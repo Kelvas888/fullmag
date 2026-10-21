@@ -2582,6 +2582,16 @@ def _parser() -> argparse.ArgumentParser:
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
                                  include_untracked=None, script=None)
 
+    resume_recreate = subparsers.add_parser(
+        "resume-recreate-volume", help="Resume one completed service removal with its retained sessions"
+    )
+    for flag in ("--attempt", "--config-sha256", "--recreate-attempt", "--recreate-receipt-sha256"):
+        resume_recreate.add_argument(flag, required=True)
+    resume_recreate.add_argument("--source-root", type=Path, required=True)
+    resume_recreate.add_argument("--port", type=int, required=True)
+    resume_recreate.set_defaults(profile="dev", image=None, toolchain_image=None,
+                                source_manifest=None, include_untracked=None, script=None)
+
     for name in ("build", "up"):
         command = subparsers.add_parser(name, help=(
             "start the fixed backend and frontend services; backend builds in-place"
@@ -2731,6 +2741,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 from docker_volume_dev import recreate as recreate_volume
                 recreate_volume(args)
+        elif args.action == "resume-recreate-volume":
+            from docker_volume_dev import resume_recreate
+            resume_recreate(args)
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)

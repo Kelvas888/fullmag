@@ -235,6 +235,7 @@ def _validate_namespace_attestation(
     owner_raw: bytes,
     owner: Mapping[str, object],
     selected_source: str | None = None,
+    removed_backend: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate a fresh sidecar for a legacy stopped-backend journal.
 
@@ -274,7 +275,10 @@ def _validate_namespace_attestation(
     container_state = attestation.get("container_state")
     if not isinstance(container_state, Mapping):
         raise _fail("Stopped namespace attestation has no container incarnation")
-    document = _inspect_stopped_backend(control, backend_id, image_id)
+    # Only the managed resume-after-removal path supplies the archived inspect,
+    # after validating its succeeded removal receipt and current absence.
+    document = (removed_backend if removed_backend is not None
+                else _inspect_stopped_backend(control, backend_id, image_id))
     state = document["State"]
     for key, observed in (
         ("id", document.get("Id")), ("image", document.get("Image")),

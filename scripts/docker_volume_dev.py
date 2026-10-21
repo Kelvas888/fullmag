@@ -1037,7 +1037,7 @@ def _precreate_new_windows_runtime_state(state):
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
           recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
           native_restart_metadata=None, accepted_reattach_environment=None,
-          accepted_reattach_metadata=None):
+          accepted_reattach_metadata=None, recreate_resume=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -1134,6 +1134,19 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                          if provided_operation is None
                          else nullcontext(provided_operation))
     with operation_context as operation:
+        if recreate_resume is not None:
+            resumed_reuse, resumed_context = _resume_recreate_context(
+                control, recreate_resume, selected, layout
+            )
+            if resumed_reuse != reuse_state or resumed_context != {
+                "previous_config_sha256": previous_config_sha256,
+                "native_restart_metadata": validated_native_restart_metadata,
+            }:
+                raise BuildControlError("Recreate resume proof changed before start")
+            operation["receipt"]["resumed_recreate"] = {
+                "attempt": recreate_resume.recreate_attempt,
+                "receipt_sha256": recreate_resume.recreate_receipt_sha256,
+            }
         operation["receipt"].update(operator_probe_record)
         if validated_recovery_metadata is not None:
             operation["receipt"]["container_recovery"] = validated_recovery_metadata
@@ -2265,7 +2278,8 @@ def _validate_completed_recovery_receipt(control, authorization, recovery_module
     return True
 
 
-def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh_state):
+def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh_state,
+                                         removed_backend=None):
     """Validate one managed native-failure stop journal for recreation.
 
     The legacy ``native-start-failure`` proof has no retained service owner.
@@ -2389,8 +2403,23 @@ def _native_failed_stop_recovery_context(control, previous, *, backend_id, fresh
             owner_raw=terminal_owner_raw,
             owner=terminal_owner,
             selected_source=previous_inputs["source_root"],
+            **({"removed_backend": removed_backend} if removed_backend is not None else {}),
         )
-    if isinstance(journal.get("container_state"), Mapping):
+    if removed_backend is not None:
+        if not isinstance(journal.get("container_state"), Mapping):
+            raise BuildControlError("Removed backend requires its strict native stop incarnation")
+        observed = removed_backend.get("State", {})
+        incarnation = {
+            "id": removed_backend.get("Id"), "image": removed_backend.get("Image"),
+            "started_at": observed.get("StartedAt"),
+            "finished_at": observed.get("FinishedAt"), "exit_code": observed.get("ExitCode"),
+        }
+        if (observed.get("Running") is not False or observed.get("Status") != "exited"
+                or incarnation != journal.get("container_state")
+                or incarnation["id"] != backend_id or incarnation["image"] != image_id
+                or incarnation["exit_code"] != journal.get("exit_code")):
+            raise BuildControlError("Removed backend differs from its native stop incarnation")
+    elif isinstance(journal.get("container_state"), Mapping):
         _validate_stopped_backend(control, backend_id, image_id, journal=journal)
     elif namespace_attestation is None:
         raise BuildControlError("Legacy native stop journal requires a fresh namespace attestation")
@@ -2491,6 +2520,109 @@ def _retained_recovery_context(control, previous, document, *, fresh_state, back
         # A completed receipt alone does not prove a later owner existed.
     return {"recovery_environment": _validate_recovery_environment(carried),
             "recovery_metadata": _validate_recovery_metadata(expected)}
+
+
+def _resume_recreate_context(control, args, selected, layout):
+    from docker_volume_stop_unadmitted import _control_bytes, _json
+    from docker_compose_identity import validate_source_labels
+
+    for value in (args.attempt, args.recreate_attempt):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+            raise BuildControlError("Recreate resume requires exact attempt IDs")
+    for value in (args.config_sha256, args.recreate_receipt_sha256):
+        if not isinstance(value, str) or not _SHA256.fullmatch(value):
+            raise BuildControlError("Recreate resume requires exact receipt/config digests")
+    root = "recreate-services/attempts/" + args.recreate_attempt
+    raw = _control_bytes(control, root + "/terminal.json")
+    if hashlib.sha256(raw).hexdigest() != args.recreate_receipt_sha256:
+        raise BuildControlError("Recreate terminal receipt changed")
+    receipt = _json(raw, "recreate terminal receipt")
+    previous_root = "development/attempts/" + args.attempt
+    previous = control.read(previous_root + "/terminal.json")
+    document = control.read(previous_root + "/compose.json")
+    if (receipt.get("phase") != "recreate-services" or receipt.get("state") != "succeeded"
+            or receipt.get("attempt") != args.recreate_attempt
+            or receipt.get("compose_project") != control.project
+            or receipt.get("control_volume") != control.volume
+            or receipt.get("inputs", {}).get("attempt") != args.attempt
+            or receipt.get("inputs", {}).get("config_sha256") != args.config_sha256
+            or receipt.get("fresh_state") is not False
+            or previous.get("state") not in {"succeeded", "failed-confirmed"}
+            or previous.get("compose_project") != control.project
+            or previous.get("attempt") != args.attempt
+            or previous.get("inputs", {}).get("source_root") != str(selected)
+            or document.get("name") != control.project
+            or hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256
+            or receipt.get("previous_state_root") != previous.get("state_root")
+            or receipt.get("retained_volumes") != previous.get("backend_volumes")
+            or receipt.get("retained_frontend_volume") != previous.get("frontend_volume")):
+        raise BuildControlError("Recreate resume identity or retained storage differs")
+    if receipt.get("accepted_reattach") or previous.get("container_recovery"):
+        raise BuildControlError("Recreate resume does not support pending session/container recovery")
+    for service in ("backend", "frontend"):
+        inventory = docker_text("ps", "--all", "--quiet", "--filter",
+                                "label=com.docker.compose.project=" + control.project,
+                                "--filter", "label=com.docker.compose.service=" + service)
+        if inventory.strip():
+            raise BuildControlError("Recreate resume requires both services absent")
+    retained = control.read(root + "/retained-containers.json")
+    image = previous["inputs"]["image_id"]
+    image_config = json.loads(docker_text("image", "inspect", image))[0]["Config"]
+    removed = []
+    for service in ("backend", "frontend"):
+        observed = retained.get(service, {})
+        identifier = previous.get(service + "_container")
+        if (not isinstance(identifier, str) or not _SHA256.fullmatch(identifier)
+                or observed.get("Id") != identifier or observed.get("Image") != image):
+            raise BuildControlError("Recreate archived container identity differs")
+        validate_source_labels(observed, control.identity)
+        _validate_retained_service(document, observed, service, image_config,
+                                   allow_legacy_frontend=True)
+        # The terminal removal proof must still describe absent exact objects.
+        found = docker_capture("inspect", identifier, allow_failure=True)
+        if found.returncode == 0 or b"no such" not in found.stderr.lower():
+            raise BuildControlError("Recreate removed container absence is unconfirmed")
+        removed.append(identifier)
+    if receipt.get("removed_containers") != removed:
+        raise BuildControlError("Recreate removed container list differs")
+    state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"],
+                                  "retained sessions")
+    certificate = _retained_certificate(state, document)
+    if certificate.get("image_id") != image or not certificate.get("restart_verified"):
+        raise BuildControlError("Recreate resume requires admitted retained storage")
+    operator_record = _operator_probe_record_from_retained(previous, document)
+    if _operator_probe_record_from_fields(receipt, label="recreate resume") != operator_record:
+        raise BuildControlError("Recreate operator environment differs")
+    context = _native_failed_stop_recovery_context(
+        control, previous, backend_id=removed[0], fresh_state=False,
+        removed_backend=retained["backend"],
+    )
+    if context is None:
+        raise BuildControlError("Recreate resume requires the exact native failed-stop proof")
+    reuse = {"state": state, "host_certificate": _certificate_path(state),
+             "owner_marker": state / _session_host().OWNER_NAME,
+             "receipt": {"image_id": image},
+             "operator_probe_environment_record": operator_record}
+    return reuse, context
+
+
+def resume_recreate(args):
+    from docker_dev import _select_source, _compose_identity
+    from docker_build_control import toolchain_configuration
+    require_host()
+    selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root)
+    identity = _compose_identity(layout)
+    configured = toolchain_configuration(selected, identity)
+    control = BuildControl(identity, configured["services"]["fem-gpu-toolchain"]["build"]["args"]["FULLMAG_CUDA_BASE_IMAGE"])
+    control.prepare()
+    reuse, context = _resume_recreate_context(control, args, selected, layout)
+    document = control.read("development/attempts/" + args.attempt + "/compose.json")
+    previous = control.read("development/attempts/" + args.attempt + "/terminal.json")
+    args.gpu_access = previous["inputs"].get("gpu_access_requested")
+    if args.gpu_access not in {"auto", "required", "disabled"}:
+        raise BuildControlError("Recreate resume requires the retained GPU access intent")
+    args.include_untracked = include_untracked_from_compose(document)
+    return start(args, reuse_state=reuse, recreate_resume=args, **context)
 
 
 def _retained_operation(args, *, recreate_services, restart_idle_service=False, stop_after_drain=False):
