@@ -1,7 +1,7 @@
 # MX3 — audyt frontendu i runtime symulacji Fullmag
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 21.10.2026, 01:30 CEST
+## Aktualny status wdrożenia — 21.10.2026, 02:00 CEST
 
 Build źródeł `6c5a9792f` zakończony **exit 0, 218431 ms**; pakiet 24 plików
 opublikowany i zweryfikowany, retencja odroczona poza start. Bramy storage
@@ -12,6 +12,10 @@ CARGO_BUILD_JOBS=16**, potwierdzone także z działającego Cargo.
 przekroczyła 180 sekund. Backend `f7c035fd` zakończył się exit 1, non-OOM,
 o 23:28:02 UTC; development `8bad15a8` ma terminal failed-confirmed.
 Frontend nadal healthy na **3198**, API nie nasłuchuje. Nie ponowiono bootstrapu.
+
+Diagnostyka tego samego pakietu: `--version` najpierw timeout 20 s przed `main`,
+stos w nvJitLink/cublas; później **exit 0 w 4500 ms**. Sumy obu sprawdzonych
+bibliotek są poprawne. Przyczyna timeoutu bootstrapu nadal niepotwierdzona (§56).
 
 Capture 9183 plików PASS 295448 ms, sync ext4 PASS 17199 ms; przerwa zapisów
 zwolniona. Oryginalne dane 3806 i held04 zachowane; stary writer metadata
@@ -2126,3 +2130,29 @@ Analiza przyczyny trwa w handlerze Rust inicjalizacji accepted store.
 To kolejny potwierdzony problem orkiestracji, nie błąd kompilacji i nie OOM.
 Porównanie 218431 ms z wcześniejszym217249 ms nie jest benchmarkiem zmiany
 jobów: zmieniły się źródła i warunki cache.
+
+## 56. Przegląd uproszczenia Docker DEV i diagnostyka loadera — 21.10.2026
+
+Uzupełniono [przegląd audytu](docs/audits/2026-10-21-docker-dev-workflow-audit-review.md).
+Rekomendowany schemat pozostaje dwusługowy: backend z buildem i runtime,
+frontend z HMR. Kolejność: rzeczywiste wejście ext4 i klucz cache backendu,
+spójna migracja tożsamości artefaktu, prosty interfejs lifecycle oraz aktualizacja
+zależności frontendu. Nie wdrożono szerokiej migracji ani automatycznego resetu.
+Samo usunięcie delegacji CPU zablokowałoby obecne launchery workerów:
+obaj supervisorzy wywołują `LinuxWorkerCgroup::prepare` przed startem procesu.
+
+Zarządzana diagnostyka bez mountów SessionStore/wyników:
+`adc1c0bf4bce464797a91538ef54513d` — `--version` z GPU timeout 20 s,
+LD_DEBUG kończył się na init libcublasLt;
+`2207c2dcf5a1409091adc313318dfd05` — stos własnego procesu metadata pod cuda-gdb
+w libnvJitLink/libcublas przed pierwszym build stamp;
+`3d9a7d86cc7447c19512c78af22416ba` — CDLL nvJitLink 20 ms, cublas 88 ms,
+następnie ten sam `--version` **exit 0 / 4500 ms**, commit pakietu `6c5a9792f`.
+MD5 libcublasLt i nvJitLink zgodne z metadanymi CUDA 12.6 (szczegóły w przeglądzie).
+
+Nie wykazano trwałej awarii CUDA, korupcji bibliotek ani przyczyny timeoutu
+bootstrapu. Wcześniejsze expected=null wynikało z szukania metadanych 12.4,
+więc nie było dowodem niezgodnego hasha. Nie reinstalowano bibliotek, nie
+zmieniano timeoutów, ownerów ani konfiguracji. Backend pozostaje stopped,
+frontend healthy3198. Brak bootstrap retry, aktywacji, Compute/Solve i testów.
+API, materializacja, mesh, pola oraz browser/WebGL nadal **NOT VERIFIED**.

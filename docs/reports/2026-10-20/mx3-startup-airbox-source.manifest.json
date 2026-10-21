@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-20T23:30:24.319225+00:00",
-  "verification": "Local49 source manifest; logger allowlist fix not in runtimeimage. Actual Cargo16,128GiB/16CPU confirmed. Capture9183files295448ms+sync17199ms PASS. Makeexit0/218431ms,package24files/gatesPASS. Development8bad15a8 failed-confirmed after accepted-store bootstrap180s timeout BEFORE API; backendexited1 non-OOM23:28:02UTC, frontendhealthy3198. No retry/replay/Solve/tests; native/mesh/UI NOT VERIFIED. Freeze RELEASED.",
+  "observed_at": "2026-10-21T00:00:46.375525+00:00",
+  "verification": "Local49 source hashes confirmed. Built commit6c5a9792f: Make exit0/218431ms; package24files/gates PASS; actual Cargo16,128GiB/16CPU. Development8bad failed-confirmed after accepted-store bootstrap180s timeout before API. Backend stopped non-OOM; frontend3198 healthy. Managed metadata-only diagnostics: --version20s timeout before main; own cuda-gdb stack nvJitLink/cublas; later same binary --version exit0/4500ms. CUDA12.6 libcublasLt and nvJitLink MD5 match package metadata. Persistent CUDA failure/bootstrap root cause NOT VERIFIED. No bootstrap retry, replay, preparation retry, Solve or tests. Mesh/UI NOT VERIFIED. Freeze RELEASED. Logger allowlist fix at8729 is not in imagef948.",
   "files": [
     {
       "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
@@ -198,5 +198,10 @@
       "path": "crates/fullmag-fem-sys/build.rs",
       "sha256": "de5c575c3274b8f7c09817968d09e22ab26580825fea5f3282b7122d36975818"
     }
-  ]
+  ],
+  "diagnostic_operations": {
+    "loader_trace": "adc1c0bf4bce464797a91538ef54513d",
+    "own_inferior_backtrace": "2207c2dcf5a1409091adc313318dfd05",
+    "library_isolation_and_successful_version": "3d9a7d86cc7447c19512c78af22416ba"
+  }
 }
