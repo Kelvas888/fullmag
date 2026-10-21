@@ -1097,28 +1097,45 @@ fn verify_host_worker_launch_for_claim(
         || ledger.validate_worker_launch(store, &lease, &token),
     )?;
     if lease.kind == fullmag_session::FmsResourceKind::Gpu {
-        if reservation.exclusive_gpu_uuids.len() != 1
-            || reservation.gpu_vram_bytes_by_uuid.len() != 1
-        {
-            bail!("host GPU worker has no exact single-device allocation");
-        }
-        let uuid = reservation
-            .exclusive_gpu_uuids
-            .iter()
-            .next()
-            .context("host GPU worker has no physical allocation")?;
-        if reservation.budget.gpu_memory_bytes != lease.budget.gpu_memory_bytes
-            || reservation.gpu_vram_bytes_by_uuid.get(uuid)
-                != Some(&lease.budget.gpu_memory_bytes)
-            || std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref() != Some(uuid.as_str())
-            || std::env::var("FULLMAG_FDM_GPU_INDEX").ok().as_deref() != Some("0")
-            || std::env::var("FULLMAG_FEM_GPU_INDEX").ok().as_deref() != Some("0")
-        {
-            bail!("host GPU worker environment differs from its exact single-device allocation");
-        }
-        return Ok(Some(uuid.clone()));
+        let environment = [
+            std::env::var("CUDA_VISIBLE_DEVICES").ok(),
+            std::env::var("FULLMAG_FDM_GPU_INDEX").ok(),
+            std::env::var("FULLMAG_FEM_GPU_INDEX").ok(),
+        ];
+        return validate_host_gpu_allocation(
+            reservation.budget.gpu_memory_bytes,
+            &reservation.exclusive_gpu_uuids,
+            &reservation.gpu_vram_bytes_by_uuid,
+            lease.budget.gpu_memory_bytes,
+            environment.each_ref().map(|value| value.as_deref()),
+        )
+        .map(Some);
     }
     Ok(None)
+}
+
+fn validate_host_gpu_allocation(
+    shared_gpu_memory_bytes: u64,
+    exclusive_gpu_uuids: &BTreeSet<String>,
+    gpu_vram_bytes_by_uuid: &BTreeMap<String, u64>,
+    lease_gpu_memory_bytes: u64,
+    environment: [Option<&str>; 3],
+) -> Result<String> {
+    if exclusive_gpu_uuids.len() != 1 || gpu_vram_bytes_by_uuid.len() != 1 {
+        bail!("host GPU worker has no exact single-device allocation");
+    }
+    let uuid = exclusive_gpu_uuids
+        .iter()
+        .next()
+        .context("host GPU worker has no physical allocation")?;
+    // Host VRAM is accounted per UUID; the shared resource budget stays zero.
+    if shared_gpu_memory_bytes != 0
+        || gpu_vram_bytes_by_uuid.get(uuid) != Some(&lease_gpu_memory_bytes)
+        || environment != [Some(uuid.as_str()), Some("0"), Some("0")]
+    {
+        bail!("host GPU worker environment differs from its exact single-device allocation");
+    }
+    Ok(uuid.clone())
 }
 
 fn requires_gpu_host_binding(
@@ -4065,6 +4082,39 @@ pub(crate) fn read_explicit_runner_artifact(
         bail!("runner artifact `{file_name}` changed while it was being read");
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod host_gpu_allocation_tests {
+    use super::*;
+
+    #[test]
+    fn per_device_vram_and_exact_worker_mask_must_match_the_lease() {
+        let uuid = "GPU-064eba42-edc8-e984-aff6-d43e0f16791f";
+        let bytes = 8_546_942_976;
+        let exclusive = BTreeSet::from([uuid.to_owned()]);
+        let vram = BTreeMap::from([(uuid.to_owned(), bytes)]);
+        let environment = [Some(uuid), Some("0"), Some("0")];
+        assert_eq!(
+            validate_host_gpu_allocation(0, &exclusive, &vram, bytes, environment).unwrap(),
+            uuid
+        );
+        // A legacy shared-budget value cannot replace per-device accounting.
+        assert!(validate_host_gpu_allocation(bytes, &exclusive, &vram, bytes, environment).is_err());
+        assert!(validate_host_gpu_allocation(0, &exclusive, &vram, bytes - 1, environment).is_err());
+        let wrong_vram = BTreeMap::from([("GPU-other".to_owned(), bytes)]);
+        assert!(validate_host_gpu_allocation(0, &exclusive, &wrong_vram, bytes, environment).is_err());
+        let multiple = BTreeSet::from([uuid.to_owned(), "GPU-other".to_owned()]);
+        assert!(validate_host_gpu_allocation(0, &multiple, &vram, bytes, environment).is_err());
+        for wrong_environment in [
+            [Some("GPU-other"), Some("0"), Some("0")],
+            [None, Some("0"), Some("0")],
+            [Some(uuid), Some("1"), Some("0")],
+            [Some(uuid), Some("0"), None],
+        ] {
+            assert!(validate_host_gpu_allocation(0, &exclusive, &vram, bytes, wrong_environment).is_err());
+        }
+    }
 }
 
 #[cfg(test)]
