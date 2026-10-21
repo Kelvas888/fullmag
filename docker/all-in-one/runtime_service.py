@@ -86,8 +86,12 @@ SERVICE_STATUS_CLI_TIMEOUT_SECONDS = 30
 STORE_BOOTSTRAP_CLI_TIMEOUT_SECONDS = 180
 # A live API observation may be temporarily unprovable while the native
 # service is still running.  The API remains fail-closed in that state; this
-# window only prevents one bounded transport/probe blip from killing PID 1.
-SUPERVISION_GRACE_SECONDS = 30.0
+# window only prevents a busy API (for example a long scene or mesh request on
+# the Windows-folder mount) from being killed as if it had failed.
+SUPERVISION_GRACE_SECONDS = 120.0
+# The complete OpenAPI identity document is large; liveness is still checked
+# every second, the full identity only at this interval.
+SUPERVISION_FULL_API_PROBE_SECONDS = 30.0
 TRANSIENT_LIVENESS_OBSERVATIONS = frozenset(
     {
         ("observation_unknown", "live_probe_failed"),

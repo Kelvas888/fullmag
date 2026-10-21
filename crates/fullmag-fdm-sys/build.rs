@@ -52,6 +52,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FULLMAG_FDM_LIB_DIR");
     println!("cargo:rerun-if-env-changed=FULLMAG_FDM_NATIVE_BUILD_ROOT");
     println!("cargo:rerun-if-env-changed=FULLMAG_DIRECT_COMPOSE");
+    println!("cargo:rerun-if-env-changed=FULLMAG_FDM_CUDA_ARCHITECTURES");
 
     let build_native_cuda = std::env::var_os("CARGO_FEATURE_BUILD_NATIVE").is_some();
     let build_native_cpu = std::env::var_os("CARGO_FEATURE_BUILD_NATIVE_CPU").is_some();
@@ -100,6 +101,14 @@ fn main() {
     if let Some(cuda_compiler) = cuda_compiler {
         configure.arg(format!("-DCMAKE_CUDA_COMPILER={cuda_compiler}"));
     }
+    // Always pass the list so a cached DEV narrowing never outlives its
+    // variable; an empty value selects the portable default in CMake.
+    let fdm_cuda_architectures =
+        std::env::var("FULLMAG_FDM_CUDA_ARCHITECTURES").unwrap_or_default();
+    configure.arg(format!(
+        "-DFULLMAG_FDM_CUDA_ARCHITECTURES={}",
+        fdm_cuda_architectures.trim()
+    ));
     let configure_status = configure
         .status()
         .expect("cmake not found; install cmake, set FULLMAG_CMAKE, or set FULLMAG_FDM_LIB_DIR to a prebuilt native backend");

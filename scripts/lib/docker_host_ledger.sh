@@ -525,18 +525,31 @@ if os.readlink("/proc/self/ns/cgroup") != os.readlink("/proc/1/ns/cgroup"):
 
 # PID 1 may legitimately be in /init.scope. Prove the mounted hierarchy root
 # rather than confusing the init process's own membership with that root.
+# Docker Desktop on WSL2 runs its init in a nested cgroup namespace: the mount
+# root is then reported relative to that namespace as "/.." segments, and the
+# distribution adds a second cgroup2 mount under /parent-distro.  Select the
+# single /sys/fs/cgroup mount and prove the root by its content instead.
 mount_lines = (Path("/proc") / pid / "mountinfo").read_text(encoding="ascii").splitlines()
 cgroup_mounts = []
 for line in mount_lines:
     before, separator, after = line.partition(" - ")
     fields, filesystem = before.split(), after.split()
-    if separator and filesystem and filesystem[0] == "cgroup2":
+    if (separator and filesystem and filesystem[0] == "cgroup2"
+            and len(fields) >= 6 and fields[4] == "/sys/fs/cgroup"):
         cgroup_mounts.append(fields)
-if (len(cgroup_mounts) != 1 or len(cgroup_mounts[0]) < 6
-        or cgroup_mounts[0][3:5] != ["/", "/sys/fs/cgroup"]):
+if (len(cgroup_mounts) != 1
+        or not re.fullmatch(r"/(?:\.\.(?:/\.\.)*)?", cgroup_mounts[0][3])):
     raise SystemExit("[docker_host_ledger] host cgroup mount does not expose the hierarchy root")
 
 cgroup_root = proc_root / "sys/fs/cgroup"
+# Every non-root cgroup v2 directory has cgroup.type; only the true hierarchy
+# root lacks it.  This holds whatever depth the namespace-relative path hides.
+try:
+    (cgroup_root / "cgroup.controllers").read_text(encoding="ascii")
+except OSError as error:
+    raise SystemExit("[docker_host_ledger] host cgroup root is not readable") from error
+if (cgroup_root / "cgroup.type").exists():
+    raise SystemExit("[docker_host_ledger] host cgroup mount does not expose the hierarchy root")
 # The true cgroup v2 root is exempt from cpu.max and memory.max.
 # Only ENOENT after proving the host root has that meaning; other errors fail.
 def root_limit(name):
