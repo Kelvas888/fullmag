@@ -1792,6 +1792,103 @@ def _validate_host_profile(
     return config
 
 
+def _run_worker_cpu_quota_migration(paths: RuntimePaths, command: list[str], environment: dict[str, str]) -> None:
+    directory = RUNTIME_CONTROL_ROOT / "runtime-service"
+    request_path = directory / "worker-cpu-quota-migration.json"
+    if not os.path.lexists(request_path):
+        return
+    request_raw = _bounded_regular(request_path, "worker CPU quota migration request")
+    request = json.loads(request_raw, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(request, dict):
+        _fail("worker CPU quota migration request must be an object")
+    fields = {"schema", "request_id", "expected_generation", "compose_project", "container_id",
+              "image_id", "cgroup_nonce", "boot_id", "pid", "process_start_token", "package_receipt_sha256"}
+    if set(request) != fields or request["schema"] != "fullmag.worker-cpu-quota-migration-request.v1":
+        _fail("invalid worker CPU quota migration request schema")
+    for field in ("request_id", "boot_id"):
+        if not isinstance(request[field], str) or UUID_RE.fullmatch(request[field]) is None:
+            _fail("invalid migration " + field)
+    if uuid.UUID(request["request_id"]).version != 4:
+        _fail("migration request ID must be a UUID4")
+    for field in ("expected_generation", "container_id", "package_receipt_sha256"):
+        if not isinstance(request[field], str) or HEX64.fullmatch(request[field]) is None:
+            _fail("invalid migration " + field)
+    if (not isinstance(request["image_id"], str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", request["image_id"]) is None
+            or not isinstance(request["cgroup_nonce"], str)
+            or re.fullmatch(r"[0-9a-f]{32}", request["cgroup_nonce"]) is None
+            or type(request["pid"]) is not int or request["pid"] < 1
+            or not isinstance(request["process_start_token"], str)
+            or re.fullmatch(r"[0-9]+", request["process_start_token"]) is None
+            or request["compose_project"] != os.environ.get("FULLMAG_COMPOSE_PROJECT")):
+        _fail("invalid worker CPU quota migration identity")
+    request_digest = _sha256_bytes(request_raw)
+    claim_path = directory / "worker-cpu-quota-migration.claim.json"
+    result_path = directory / "worker-cpu-quota-migration.result.json"
+    claim = {"schema": "fullmag.worker-cpu-quota-migration-claim.v1", "request_sha256": request_digest}
+    if os.path.lexists(result_path):
+        result = _read_json(result_path, "worker CPU quota migration result")
+        recorded_claim = _read_json(claim_path, "worker CPU quota migration claim")
+        native = result.get("native_receipt", {})
+        if (recorded_claim != claim or result.get("request_sha256") != request_digest
+                or result.get("schema") != "fullmag.worker-cpu-quota-migration-result.v1"
+                or result.get("state") != "succeeded" or not isinstance(native, dict)
+                or native.get("schema_version") != "host_worker_cpu_quota_migration.v1"
+                or native.get("previous_generation") != request["expected_generation"]
+                or not isinstance(native.get("runtime_generation_sha256"), str)
+                or HEX64.fullmatch(native["runtime_generation_sha256"]) is None
+                or native["runtime_generation_sha256"] == request["expected_generation"]):
+            _fail("worker CPU quota migration requires explicit outcome reconciliation")
+        return
+    if os.path.lexists(claim_path):
+        _fail("worker CPU quota migration outcome is unknown; explicit reconciliation is required")
+    ready = _read_json(RUNTIME_CONTROL_ROOT / "worker-cgroup/ready.json", "worker cgroup readiness")
+    if (ready.get("schema") != "fullmag.worker-cgroup-ready.v1" or ready.get("state") != "ready"
+            or ready.get("nonce") != request["cgroup_nonce"]
+            or any(ready.get(field) != request[field] for field in
+                   ("compose_project", "container_id", "image_id", "boot_id", "pid", "process_start_token"))):
+        _fail("worker CPU quota migration is not bound to the current cgroup gate")
+    process_stat = Path("/proc/self/stat").read_text()
+    start_token = process_stat[process_stat.rfind(")") + 2:].split()[19]
+    if (request["pid"] != os.getpid() or request["process_start_token"] != start_token
+            or request["boot_id"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip()):
+        _fail("worker CPU quota migration belongs to another process incarnation")
+    package_raw = _bounded_regular(
+        paths.package / "backend-build-receipt.json", "backend build receipt", maximum=8 * 1024 * 1024
+    )
+    if _sha256_bytes(package_raw) != request["package_receipt_sha256"]:
+        _fail("worker CPU quota migration package differs from its authorization")
+    _publish_accepted_reattach_record(claim_path, claim, "worker CPU quota migration claim")
+    result = {"schema": "fullmag.worker-cpu-quota-migration-result.v1",
+              "request_sha256": request_digest, "state": "unknown"}
+    try:
+        process = subprocess.run(
+            [*command, "--migrate-worker-cpu-quota-from", request["expected_generation"]],
+            cwd=str(paths.state), env=environment, stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=60,
+        )
+        if len(process.stdout) + len(process.stderr) > 64 * 1024:
+            _fail("worker CPU quota migration output exceeds its size bound")
+        result.update(exit_code=process.returncode,
+                      stdout=process.stdout.decode("utf-8", errors="replace"),
+                      stderr=process.stderr.decode("utf-8", errors="replace"))
+        if process.returncode:
+            result["state"] = "failed"
+            _fail("native worker CPU quota migration failed: " + result["stderr"])
+        native = json.loads(process.stdout, object_pairs_hook=_reject_duplicate_keys)
+        if (not isinstance(native, dict) or set(native) !=
+                {"schema_version", "previous_generation", "runtime_generation_sha256"}
+                or native["schema_version"] != "host_worker_cpu_quota_migration.v1"
+                or native["previous_generation"] != request["expected_generation"]
+                or not isinstance(native["runtime_generation_sha256"], str)
+                or HEX64.fullmatch(native["runtime_generation_sha256"]) is None
+                or native["runtime_generation_sha256"] == request["expected_generation"]):
+            _fail("native worker CPU quota migration returned an invalid receipt")
+        result.update(state="succeeded", native_receipt=native)
+    finally:
+        _publish_accepted_reattach_record(result_path, result, "worker CPU quota migration result")
+
+
 def initialize_host_configuration(paths: RuntimePaths, device_access: str = "gpu") -> dict[str, Any]:
     """Discover native devices and initialize the exact shared Rust ledger."""
     if device_access not in DEVICE_ACCESS_CHOICES:
@@ -1802,12 +1899,15 @@ def initialize_host_configuration(paths: RuntimePaths, device_access: str = "gpu
     _assert_no_links(executable, "runtime service executable")
     if not executable.is_file() or not os.access(executable, os.X_OK):
         _fail("native runtime service executable is unavailable")
+    command = [str(executable), "--initialize-docker-host", "--ledger-root", str(HOST_LEDGER_ROOT),
+               "--store-root", str(paths.store), "--device-access", device_access,
+               "--host-id", logical_host_id]
+    environment = process_environment(paths, service=True)
+    _run_worker_cpu_quota_migration(paths, command, environment)
     try:
         result = subprocess.run(
-            [str(executable), "--initialize-docker-host", "--ledger-root", str(HOST_LEDGER_ROOT),
-             "--store-root", str(paths.store), "--device-access", device_access,
-             "--host-id", logical_host_id],
-            cwd=str(paths.state), env=process_environment(paths, service=True),
+            command,
+            cwd=str(paths.state), env=environment,
             stdin=subprocess.DEVNULL, capture_output=True, timeout=60,
         )
     except subprocess.TimeoutExpired as error:

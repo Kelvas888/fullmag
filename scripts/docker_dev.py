@@ -2490,6 +2490,21 @@ def _parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--source-root", type=Path, required=True)
     resume_parser.add_argument("--port", type=int, required=True)
     resume_parser.add_argument("--restart-backend", action="store_true", help="Start the retained stopped backend; never stop an active service")
+    migration_parser = subparsers.add_parser(
+        "migrate-worker-cpu-quota-volume", help="Explicitly migrate CPU quota readiness in the pinned stopped backend")
+    migration_parser.add_argument("--attempt", required=True)
+    migration_parser.add_argument("--config-sha256", required=True)
+    migration_parser.add_argument("--source-root", type=Path, required=True)
+    migration_parser.add_argument("--port", type=int, required=True)
+    migration_parser.add_argument("--from-readiness-sha256", required=True)
+    migration_parser.add_argument("--request-id", required=True)
+    check_parser = subparsers.add_parser(
+        "verify-worker-cpu-quota-volume", help="Run the fixed migration regression in the pinned stopped backend")
+    check_parser.add_argument("--attempt", required=True)
+    check_parser.add_argument("--config-sha256", required=True)
+    check_parser.add_argument("--source-root", type=Path, required=True)
+    check_parser.add_argument("--port", type=int, required=True)
+    check_parser.add_argument("--request-id", required=True)
     activate_parser = subparsers.add_parser(
         "activate-script",
         help="activate one Python script in the already-running retained backend",
@@ -2519,11 +2534,17 @@ def _parser() -> argparse.ArgumentParser:
         help="optional frontend port override; conflicting defaults fail closed",
     )
     script_parser.add_argument("--request-id", help="optional stable request fence")
-    idle_restart = subparsers.add_parser("restart-idle-volume", help="Restart the pinned healthy backend only while no session is active")
-    idle_restart.add_argument("--attempt", required=True)
-    idle_restart.add_argument("--config-sha256", required=True)
-    idle_restart.add_argument("--source-root", type=Path, required=True)
-    idle_restart.add_argument("--port", type=int, required=True)
+    for name, help_text in (
+        ("restart-idle-volume", "Restart the pinned healthy backend only while no session is active"),
+        ("stop-idle-volume", "Drain and stop the pinned healthy backend only while no session is active"),
+    ):
+        idle = subparsers.add_parser(name, help=help_text)
+        idle.add_argument("--attempt", required=True)
+        idle.add_argument("--config-sha256", required=True)
+        idle.add_argument("--source-root", type=Path, required=True)
+        idle.add_argument("--port", type=int, required=True)
+        if name == "restart-idle-volume":
+            idle.add_argument("--empty-scratch-session-id", help="Export this exact untouched scratch session and restart the backend")
     stop_unadmitted = subparsers.add_parser(
         "stop-unadmitted",
         help=(
@@ -2687,6 +2708,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "restart-idle-volume":
             from docker_volume_dev import restart_idle
             restart_idle(args)
+        elif args.action == "stop-idle-volume":
+            from docker_volume_dev import stop_idle
+            stop_idle(args)
+        elif args.action == "migrate-worker-cpu-quota-volume":
+            from docker_volume_dev import migrate_worker_cpu_quota
+            migrate_worker_cpu_quota(args)
+        elif args.action == "verify-worker-cpu-quota-volume":
+            from docker_volume_dev import verify_worker_cpu_quota
+            verify_worker_cpu_quota(args)
         elif args.action == "stop-unadmitted":
             from docker_volume_stop_unadmitted import stop
             stop(args)

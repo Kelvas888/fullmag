@@ -1439,7 +1439,6 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
         host.write_bound_evidence(certificate_path, certificate)
         host.publish_evidence(state / host.OWNER_NAME, certificate)
     import docker_worker_cgroup
-    docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
     log_writer = lambda output: control.write(operation["root"] + "/storage-probe-log.json", {"log": output})
     if os.name == "nt":
         runtime._complete_backend_storage_preflight(docker_text, backend_id, state, certificate_path, certificate, None,
@@ -1447,6 +1446,15 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     else:
         _session_host().complete_preflight(docker_text, backend_id, state, certificate_path, certificate,
                                            log_writer=log_writer)
+    migration = operation["receipt"].get("worker_cpu_quota_migration_intent")
+    if migration is not None:
+        from docker_host_readiness_migration import publish_request
+        docker_worker_cgroup.ensure_delegation(
+            control, operation, document, backend_id, image, selected,
+            before_ready=lambda request: publish_request(control, operation, migration, request, backend_id, image),
+        )
+    else:
+        docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
     import docker_host_ledger as ledger
     verify_spec = ledger_profile["maintenance_document"]
     verify_name = "fullmag-ledger-verify-" + token
@@ -1576,9 +1584,8 @@ def _validate_retained_service(document, actual, service, image_config, *,
                 raise BuildControlError("Frontend owner tmpfs mount is not private and bounded")
         if not owner_specs and not allow_legacy_frontend:
             raise BuildControlError("Retained frontend is missing the ephemeral owner tmpfs")
-        # A retained compose document from before this migration may be read
-        # only during a controlled recreation that renders the current document;
-        # a normal resume must never restart it without the new owner boundary.
+        # Legacy frontend admission is limited to recreation or draining the
+        # backend while that frontend stays stopped. Normal resume is strict.
     for mount in expected["volumes"]:
         observed = mounts[mount["target"]]
         if observed.get("Type") != mount["type"] or bool(observed.get("RW")) == bool(mount.get("read_only", False)):
@@ -2122,6 +2129,19 @@ def stop_idle(args):
     return _retained_operation(args, recreate_services=False, restart_idle_service=True, stop_after_drain=True)
 
 
+def migrate_worker_cpu_quota(args):
+    from docker_host_readiness_migration import validate_intent
+    args.worker_cpu_quota_migration = validate_intent(args.request_id, args.from_readiness_sha256)
+    args.restart_backend = True
+    return _retained_operation(args, recreate_services=False)
+
+
+def verify_worker_cpu_quota(args):
+    args.verify_worker_cpu_quota = True
+    args.restart_backend = True
+    return _retained_operation(args, recreate_services=False)
+
+
 def recreate(args):
     return _retained_operation(args, recreate_services=True)
 
@@ -2530,8 +2550,14 @@ def _retained_operation(args, *, recreate_services, restart_idle_service=False, 
             observed,
             service,
             image_config,
-            allow_legacy_frontend=recreate_services,
+            allow_legacy_frontend=(recreate_services or (
+                stop_after_drain and service == "frontend"
+                and observed.get("State", {}).get("Running") is False
+            )),
         )
+    if getattr(args, "verify_worker_cpu_quota", False):
+        from docker_worker_cpu_quota_check import run
+        return run(control, args, actual["backend"], image)
     if restart_idle_service:
         if (not actual["backend"]["State"]["Running"]
                 or actual["backend"]["State"].get("Health", {}).get("Status") != "healthy"):
@@ -2587,23 +2613,43 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 if health.get("status") != "ok":
                     raise BuildControlError("Backend health is not ready; idle restart refused")
                 active_session = health.get("active_session")
+                empty_scratch = None
+                empty_scratch_id = getattr(args, "empty_scratch_session_id", None)
+                if empty_scratch_id is not None and active_session is not True:
+                    raise BuildControlError("Pinned empty scratch session is no longer active")
                 if active_session is True:
                     if startup_enabled:
                         raise BuildControlError("Backend has an active session; idle restart refused")
-                    cancelled_activation = _validate_cancelled_activation_preflight(
-                        control, previous_root, previous, document, selected, args.config_sha256,
-                        ids["backend"], environment, require_quiesced_activation=False,
-                    )
-                    health = cancelled_activation["probe"]["health"]
-                    operation["receipt"]["accepted_then_cancelled_proof_sha256"] = (
-                        cancelled_activation["proof_sha256"]
-                    )
+                    if empty_scratch_id is not None:
+                        from docker_empty_scratch_restart import capture
+                        empty_scratch = capture(ids["backend"], empty_scratch_id, environment)
+                        export_path = operation["root"] + "/empty-scratch-export.json"
+                        control.write(export_path, empty_scratch)
+                        operation["receipt"]["empty_scratch_export"] = {
+                            "path": export_path, "sha256": hashlib.sha256(canonical(empty_scratch)).hexdigest(),
+                            "session_id": empty_scratch_id, "fingerprint": empty_scratch["fingerprint"],
+                        }
+                    else:
+                        cancelled_activation = _validate_cancelled_activation_preflight(
+                            control, previous_root, previous, document, selected, args.config_sha256,
+                            ids["backend"], environment, require_quiesced_activation=False,
+                        )
+                        health = cancelled_activation["probe"]["health"]
+                        operation["receipt"]["accepted_then_cancelled_proof_sha256"] = (
+                            cancelled_activation["proof_sha256"]
+                        )
                 elif active_session is not False:
                     raise BuildControlError("Backend has an active or unknown session; idle restart refused")
+                if empty_scratch is not None:
+                    from docker_empty_scratch_restart import capture
+                    fresh_scratch = capture(ids["backend"], empty_scratch_id, environment)
+                    if fresh_scratch["fingerprint"] != empty_scratch["fingerprint"]:
+                        raise BuildControlError("Pinned empty scratch changed before backend drain")
             except Exception:
-                operation["daemon_pending"] = True
-                docker_capture("start", ids["frontend"], timeout=90)
-                operation["daemon_pending"] = False
+                if actual["frontend"]["State"]["Running"]:
+                    operation["daemon_pending"] = True
+                    docker_capture("start", ids["frontend"], timeout=90)
+                    operation["daemon_pending"] = False
                 raise
             control.write(operation["root"] + "/idle-preflight.json", health)
             control.write(operation["root"] + "/compose.json", document)
@@ -2797,6 +2843,9 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
     with control.operation("resume", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                        **operator_probe_record}) as operation:
         operation["receipt"].update(operator_probe_record)
+        migration = getattr(args, "worker_cpu_quota_migration", None)
+        if migration is not None:
+            operation["receipt"]["worker_cpu_quota_migration_intent"] = migration
         operation["receipt"].update(state="resuming-observation", state_root=str(state),
             backend_volumes=previous["backend_volumes"], frontend_volume=previous["frontend_volume"])
         if restart_backend:

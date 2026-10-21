@@ -3393,8 +3393,9 @@ def _reject_partial_package_candidates(
     A rotation moves the package payload before the candidate marker is
     removed.  If the worker stops between those operations, the next start may
     remove that marker only after validating the current package's actual
-    receipt inventory.  Every other candidate state remains an operator-visible
-    failure.  An empty owned candidate directory is also safe to remove: it is
+    receipt inventory. A complete unpublished candidate with a verified Make
+    receipt is retained while a new build proceeds. Other incomplete states
+    remain operator-visible failures. An empty owned directory is safe to remove: it is
     the only state left by a crash after marker unlink and before ``rmdir``.
     """
 
@@ -3443,10 +3444,26 @@ def _reject_partial_package_candidates(
                 f"{entry.name}"
             )
         if len(child_entries) != 1 or child_entries[0].name != PACKAGE_CANDIDATE_MARKER:
-            _fail(
-                "ready backend package candidate retains payload or unknown entries: "
-                f"{entry.name}"
+            receipt, _, _ = _validated_package(
+                entry, "retained backend candidate", exclude_candidate_marker=True,
             )
+            _assert_direct_candidate_inventory(entry, receipt["artifacts"], include_receipt=True)
+            if marker["artifact_inventory_sha256"] != _sha256_bytes(_canonical(receipt["artifacts"])):
+                _fail("retained backend candidate inventory differs from its owner marker")
+            try:
+                attempt = _read_failed_make_attempt(build_root, entry)
+            except OSError as error:
+                _fail(f"cannot read retained backend candidate Make receipt: {error}")
+            if attempt is None or attempt[0]["state"] != "succeeded":
+                _fail("retained backend candidate has no successful Make receipt")
+            digest, log_metadata = _sha256_file(
+                entry / FAILED_MAKE_LOG_NAME, "retained Make diagnostic log", MAX_BUILD_LOG_BYTES,
+            )
+            if digest != attempt[0]["log_sha256"] or log_metadata.st_size != attempt[0]["log_size"]:
+                _fail("retained backend candidate log differs from its Make receipt")
+            _log_phase("package", "candidate-preserved", candidate=entry.name,
+                       reason="verified-unpublished-package")
+            continue
         marker_path = child_entries[0]
         marker_metadata = marker_path.lstat()
         if not stat.S_ISREG(marker_metadata.st_mode) or marker_metadata.st_nlink != 1:
@@ -4451,12 +4468,12 @@ def _prepare_locked(
         if attempt is None or attempt[0].get("state") != "succeeded":
             _fail("successful Make attempt receipt disappeared")
         receipt = attempt[0]
-        digest, size = _sha256_file(
+        digest, metadata = _sha256_file(
             output / FAILED_MAKE_LOG_NAME,
             "published Make diagnostic log",
             MAX_BUILD_LOG_BYTES,
         )
-        if digest != receipt["log_sha256"] or size != receipt["log_size"]:
+        if digest != receipt["log_sha256"] or metadata.st_size != receipt["log_size"]:
             _fail("published Make diagnostic log differs from its attempt receipt")
         _retire_make_log(attempt)
         _prune_failed_make_logs(build_root, PACKAGE_ROOT)
@@ -4736,6 +4753,74 @@ def _restore_bound_provenance(data: bytes) -> None:
     _write_bound_bytes(PROVENANCE_PATH, data, "runtime provenance rollback")
 
 
+def _verify_worker_cpu_quota_requested(args: argparse.Namespace, build_root: Path, jobs: int) -> int | None:
+    root = CONTROL_ROOT / "verification" / "worker-cpu-quota"
+    request_path = root / "request.json"
+    if not request_path.exists() and not request_path.is_symlink():
+        return None
+    request, raw = _read_json(request_path, "scoped verification request", 16384)
+    fields = {"schema", "request_id", "compose_project", "container_id", "image_id"}
+    if (set(request) != fields or request.get("schema") != "fullmag.worker-cpu-quota-check-request.v1"
+            or not isinstance(request.get("request_id"), str)
+            or re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", request["request_id"]) is None):
+        _fail("invalid scoped verification request")
+    attempt = root / request["request_id"]
+    archived, archived_raw = _read_json(attempt / "request.json", "archived verification request", 16384)
+    if archived_raw != raw or archived != request:
+        _fail("scoped verification request archive differs")
+    digest = _sha256_bytes(raw)
+    result_path = attempt / "result.json"
+    if result_path.exists() or result_path.is_symlink():
+        result, _ = _read_json(result_path, "scoped verification result", 16384)
+        if (result.get("schema") != "fullmag.worker-cpu-quota-check-result.v1"
+                or result.get("request_sha256") != digest
+                or result.get("state") not in {"succeeded", "failed"}):
+            _fail("scoped verification outcome is unknown; retain its evidence")
+        return None
+    claim_path = attempt / "claim.json"
+    if claim_path.exists() or claim_path.is_symlink():
+        _fail("scoped verification outcome is unknown; retain its evidence")
+    from worker_cgroup_gate import _container_id_from_mountinfo
+    if (request["container_id"] != _container_id_from_mountinfo()
+            or request["image_id"] != os.environ.get("FULLMAG_RUNTIME_IMAGE_ID")
+            or request["compose_project"] != os.environ.get("FULLMAG_COMPOSE_PROJECT")):
+        _fail("scoped verification belongs to another backend")
+    _write_json(claim_path, {"request_sha256": digest}, "scoped verification claim")
+    result = {"schema": "fullmag.worker-cpu-quota-check-result.v1", "request_sha256": digest,
+              "container_id": request["container_id"], "image_id": request["image_id"], "state": "unknown"}
+    try:
+        workspace, _, native, manifest_hash, _, source_mode = _materialize_source(
+            None, Path(args.manifest), build_root, source_root=Path(args.source_root),
+            git_common_root=Path(args.git_common_root), preserve_legacy_install_stage=True,
+        )
+        environment = _build_environment(workspace, build_root, native, jobs)
+        temporary = build_root / "worker-cpu-quota-check" / request["request_id"]
+        _ensure_directory(temporary, "scoped verification temporary directory")
+        environment["TMPDIR"] = str(temporary)
+        command = ["cargo", "test", "--locked", "--profile", BACKEND_CARGO_PROFILE,
+                   "-p", "fullmag-session", "--lib",
+                   "host_resource_ledger::tests::worker_cpu_quota_readiness_migration_is_narrow_and_fenced",
+                   "--", "--exact"]
+        result.update(command=command, source_manifest_sha256=manifest_hash,
+                      source_snapshot_sha256=native["source_snapshot_sha256"], source_mode=source_mode)
+        log_path = attempt / "cargo-test.log"
+        with log_path.open("xb") as log:
+            process = subprocess.run(command, cwd=workspace, env=environment, stdin=subprocess.DEVNULL,
+                                     stdout=log, stderr=subprocess.STDOUT, timeout=3600)
+            log.flush()
+            os.fsync(log.fileno())
+        log_digest, metadata = _sha256_file(log_path, "scoped verification log")
+        with log_path.open("rb") as log:
+            log.seek(max(0, metadata.st_size - 16384))
+            tail = log.read()
+        passed = process.returncode == 0 and b"test result: ok. 1 passed; 0 failed;" in tail
+        result.update(exit_code=process.returncode, log_sha256=log_digest, log_bytes=metadata.st_size,
+                      state="succeeded" if passed else "failed")
+        return 0 if passed else (process.returncode or 2)
+    finally:
+        _write_json(result_path, result, "scoped verification result")
+
+
 def _start(args: argparse.Namespace) -> int:
     """Build and hand off to the API in this same backend container."""
 
@@ -4790,6 +4875,9 @@ def _start(args: argparse.Namespace) -> int:
             start_args = argparse.Namespace(**vars(args))
             start_args.manifest = _capture_start_manifest(args, build_root)
             start_args.source_tar = None
+            verification = _verify_worker_cpu_quota_requested(start_args, build_root, jobs)
+            if verification is not None:
+                return verification
             if previous_receipt is not None and _package_matches_fresh_live_manifest(
                 previous_receipt[0], start_args.manifest, toolchain, cargo_profile
             ):

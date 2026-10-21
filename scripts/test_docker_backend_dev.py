@@ -2634,6 +2634,54 @@ class BackendPackageTests(unittest.TestCase):
             )
             self.assertTrue(observed["log_retired"])
 
+    def test_direct_prepare_checks_published_log_before_retiring_external_copy(self):
+        for tamper in (False, True):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                package, build_root, candidate, log_path = self._failed_make_fixture(
+                    root, ".backend-package-candidate-publication", b"success\n"
+                )
+                workspace = build_root / "workspace"
+                workspace.mkdir()
+                args = backend.argparse.Namespace(
+                    source_tar=None, manifest=str(root / "manifest.json"),
+                    source_root=str(root), git_common_root=str(root),
+                )
+
+                def publish(*args, **kwargs):
+                    if tamper:
+                        (candidate / backend.FAILED_MAKE_LOG_NAME).write_bytes(b"changed\n")
+                    return 0
+
+                with (
+                    patch.dict(os.environ, {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"}),
+                    patch.object(backend, "PACKAGE_ROOT", package),
+                    patch.object(backend, "_materialize_source", return_value=(
+                        workspace, {}, {}, "a" * 64, "b" * 64, "archive",
+                    )),
+                    patch.object(backend, "_build_environment", return_value={}),
+                    patch.object(backend, "_begin_failed_make_attempt", return_value=log_path),
+                    patch.object(backend, "_run_canonical_make", return_value=0),
+                    patch.object(backend, "_publish_completed_build", side_effect=publish),
+                ):
+                    if tamper:
+                        with self.assertRaisesRegex(
+                            backend.BackendBuildError,
+                            "published Make diagnostic log differs from its attempt receipt",
+                        ):
+                            backend._prepare_locked(args, build_root, candidate, 1, {}, candidate)
+                    else:
+                        self.assertEqual(
+                            backend._prepare_locked(args, build_root, candidate, 1, {}, candidate), 0
+                        )
+                receipt, _ = backend._read_json(
+                    build_root / backend.FAILED_MAKE_DIAGNOSTICS_DIRNAME
+                    / candidate.name / backend.FAILED_MAKE_RECEIPT_NAME,
+                    "Make receipt",
+                )
+                self.assertEqual(receipt["log_retired"], not tamper)
+                self.assertEqual(log_path.exists(), tamper)
+
     def test_failed_make_log_retention_bounds_logs_and_preserves_receipts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3131,6 +3179,47 @@ class BackendPackageTests(unittest.TestCase):
                     before,
                     "mutation probe",
                 )
+
+    def test_ready_candidate_payload_requires_complete_evidence_and_is_preserved(self):
+        for mutation in (None, "payload", "marker", "log", "missing_receipt", "unknown"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                package, build_root, control, candidate, previous, _ = self._ready_rotation_fixture(
+                    Path(directory), ".backend-package-candidate-retained"
+                )
+                log_path = backend._begin_failed_make_attempt(build_root, candidate, "install-cli-dev")
+                log_path.write_bytes((candidate / backend.FAILED_MAKE_LOG_NAME).read_bytes())
+                backend._finish_failed_make_attempt(build_root, candidate, 0)
+                attempt_receipt = (build_root / backend.FAILED_MAKE_DIAGNOSTICS_DIRNAME
+                    / candidate.name / backend.FAILED_MAKE_RECEIPT_NAME)
+                if mutation == "payload":
+                    (candidate / "bin/fullmag-bin").write_bytes(b"tampered\n")
+                elif mutation == "marker":
+                    marker_path = candidate / backend.PACKAGE_CANDIDATE_MARKER
+                    marker, _ = backend._read_json(marker_path, "candidate marker")
+                    marker["artifact_inventory_sha256"] = "0" * 64
+                    backend._write_json(marker_path, marker, "candidate marker")
+                elif mutation == "log":
+                    (candidate / backend.FAILED_MAKE_LOG_NAME).write_bytes(b"tampered\n")
+                elif mutation == "missing_receipt":
+                    attempt_receipt.unlink()
+                elif mutation == "unknown":
+                    (candidate / "unknown.bin").write_bytes(b"preserve\n")
+                before = {path.relative_to(control): path.read_bytes()
+                    for path in control.rglob("*") if path.is_file()}
+                log_before = log_path.read_bytes()
+                if mutation is None:
+                    backend._reject_partial_package_candidates(
+                        package, control, build_root, current_package=previous,
+                    )
+                else:
+                    with self.assertRaises(backend.BackendBuildError):
+                        backend._reject_partial_package_candidates(
+                            package, control, build_root, current_package=previous,
+                        )
+                self.assertEqual(before, {path.relative_to(control): path.read_bytes()
+                    for path in control.rglob("*") if path.is_file()})
+                self.assertEqual(log_path.read_bytes(), log_before)
+                self.assertTrue(candidate.is_dir())
 
     def test_partial_or_foreign_candidate_is_preserved_and_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

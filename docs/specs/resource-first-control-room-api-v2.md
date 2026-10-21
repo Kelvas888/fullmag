@@ -1710,3 +1710,12 @@ liczbą. Częściowego wiersza obiektowego nie uzupełnia się globalnymi energi
 konsument może jawnie pokazać globalne podsumowanie z odrębnym oznaczeniem zakresu.
 `has_solver_sample` opisuje obecność próbki, a nie kompletność wszystkich energii.
 Starsze klienty wymagające wyłącznie liczb muszą zostać zaktualizowane razem z API.
+
+### Precyzja nowej sesji
+
+`POST /v2/sessions` przyjmuje FDM CPU double, FEM CPU double oraz FDM GPU
+single/double. Pozostałe kombinacje są odrzucane przed utworzeniem sesji.
+Podgląd capabilities odpowiada wybranemu urządzeniu i precyzji; nie jest
+dowodem dostępności ani wykonania runtime. Pierwsze przygotowanie obliczeń
+nadal sprawdza dostępność GPU, bez cichego fallbacku CPU. Runtime odczytuje
+urządzenie i precyzję z kanonicznego skryptu sesji.

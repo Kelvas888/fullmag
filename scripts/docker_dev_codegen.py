@@ -579,7 +579,30 @@ def _running_service(
         raise CodegenError(f"{service} service environment is mounted from a different source checkout")
     source_mount = _mount_for(document, "/opt/fullmag/source")
     if _path_identity(source_mount.get("Source")) != _path_identity(str(selected)):
-        raise CodegenError(f"{service} inspected source mount differs from the selected checkout")
+        # Desktop may translate a WSL bind. Authenticate the recorded Compose
+        # pin and current incarnation through the existing retained-group path.
+        from docker_build_control import BuildControlError
+        from docker_dev_up import DockerDevUpError, _discover_group
+        try:
+            group = _discover_group(argparse.Namespace(
+                repo_root=selected, source_root=selected, port=None,
+            ))
+        except (DockerDevUpError, BuildControlError) as error:
+            raise CodegenError("Cannot authenticate translated source bind: " + str(error)) from error
+        if group is None:
+            raise CodegenError("Translated source bind has no authenticated retained group")
+        retained = getattr(group, service)
+        expected = group.document["services"][service]
+        declared = [mount for mount in expected.get("volumes", [])
+                    if mount.get("target") == "/opt/fullmag/source"]
+        if (retained.get("Id") != document.get("Id")
+                or retained.get("Image") != document.get("Image")
+                or retained.get("State", {}).get("StartedAt") != state.get("StartedAt")
+                or len(declared) != 1 or declared[0].get("type") != "bind"
+                or declared[0].get("read_only") is not True
+                or _path_identity(declared[0].get("source")) != _path_identity(str(selected))
+                or expected.get("x-fullmag-daemon-binds", {}).get("/opt/fullmag/source") != source_mount.get("Source")):
+            raise CodegenError(f"{service} translated source bind differs from its authenticated Compose pin")
     return container, document
 
 

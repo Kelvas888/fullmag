@@ -120,6 +120,189 @@ class VolumeReceiptTests(unittest.TestCase):
                      'mount_root': '/ledger', 'backing_image': '/ledger.ext4'}, 3197)
         self.assertEqual(events, ['retired', 'backend-observation'])
 
+    def test_only_idle_stop_accepts_an_already_stopped_legacy_frontend(self):
+        import hashlib
+        import json
+        from types import SimpleNamespace
+        import docker_dev
+        import docker_volume_dev as dev
+        import docker_build_control
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            for stopped, stop_only, drift in ((True, True, False), (False, True, False),
+                                              (True, False, False), (True, True, True)):
+                with self.subTest(stopped=stopped, stop_only=stop_only, drift=drift):
+                    document = {"name": "fullmag-master", "services": {
+                        name: {"environment": {"PIN": "expected"}, "volumes": []}
+                        for name in ("backend", "frontend")}}
+                    previous = {"state": "succeeded", "compose_project": "fullmag-master",
+                        "inputs": {"image_id": "image", "source_root": str(source)},
+                        "state_root": str(source / "state")}
+                    control = mock.Mock(project="fullmag-master")
+                    control.read.side_effect = [previous, document]
+                    args = SimpleNamespace(repo_root=source, source_root=source, attempt="a" * 32,
+                        config_sha256=hashlib.sha256(dev.canonical(document)).hexdigest())
+                    containers = {service: {"Id": service, "Image": "image", "Config": {
+                        "Env": ["PIN=" + ("changed" if drift and service == "frontend" else "expected")],
+                        "Labels": {"com.docker.compose.project": "fullmag-master",
+                                   "com.docker.compose.service": service,
+                                   "org.fullmag.source.worktree-id": "worktree"}},
+                        "HostConfig": {"ReadonlyRootfs": True, "Privileged": False}, "Mounts": [],
+                        "State": {"Running": True if service == "backend" else not stopped,
+                                  "Health": {"Status": "healthy"}}}
+                        for service in ("backend", "frontend")}
+                    def observe(*arguments, **kwargs):
+                        return json.dumps([{"Config": {}}] if arguments[:2] == ("image", "inspect")
+                                          else [containers[arguments[1]]])
+                    with (mock.patch.object(dev, "require_host"),
+                          mock.patch.object(docker_dev, "_select_source", return_value=(source, {"runtime_root": source})),
+                          mock.patch.object(docker_dev, "_compose_identity", return_value={"worktree_id": "worktree"}),
+                          mock.patch.object(docker_build_control, "toolchain_configuration", return_value={
+                              "services": {"fem-gpu-toolchain": {"build": {"args": {"FULLMAG_CUDA_BASE_IMAGE": "base"}}}}}),
+                          mock.patch.object(dev, "BuildControl", return_value=control),
+                          mock.patch.object(dev, "_operator_probe_record_from_retained", return_value={}),
+                          mock.patch.object(dev, "compose_capture", side_effect=lambda *a, **kw: a[-1].encode()),
+                          mock.patch.object(dev, "docker_text", side_effect=observe),
+                          mock.patch.object(dev.storage, "validate_path", side_effect=RuntimeError("validated containers")) as validated,
+                          mock.patch.object(dev, "docker_capture") as mutation):
+                        accepted = stopped and stop_only and not drift
+                        message = "validated containers" if accepted else ("environment differs" if drift else "owner tmpfs")
+                        with self.assertRaisesRegex(RuntimeError if accepted else BuildControlError, message):
+                            dev._retained_operation(args, recreate_services=False,
+                                                    restart_idle_service=True, stop_after_drain=stop_only)
+                        self.assertEqual(validated.called, accepted)
+                        mutation.assert_not_called()
+
+    def test_refused_idle_stop_preserves_original_frontend_state(self):
+        import hashlib
+        import json
+        from contextlib import ExitStack, nullcontext
+        from types import SimpleNamespace
+        import docker_dev
+        import docker_volume_dev as dev
+        import docker_build_control
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            for frontend_running, scratch_changed in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(frontend_running=frontend_running, scratch_changed=scratch_changed), ExitStack() as stack:
+                    environment = {"FULLMAG_HOST_LEDGER_MOUNT_ROOT": "/ledger",
+                        "FULLMAG_HOST_LEDGER_PROJECT_ID": "project",
+                        "FULLMAG_HOST_LEDGER_BACKING_IMAGE": "/ledger.ext4"}
+                    document = {"name": "fullmag-master", "services": {"backend": {"environment": environment}}}
+                    previous = {"state": "succeeded", "compose_project": "fullmag-master",
+                        "inputs": {"image_id": "image", "source_root": str(source)},
+                        "state_root": str(source / "state")}
+                    control = mock.Mock(project="fullmag-master")
+                    control.read.side_effect = [previous, document, {}, {}, {}]
+                    operation = {"root": "attempts/test", "receipt": {"attempt": "a" * 32}}
+                    control.operation.return_value = nullcontext(operation)
+                    args = SimpleNamespace(repo_root=source, source_root=source, attempt="a" * 32,
+                        config_sha256=hashlib.sha256(dev.canonical(document)).hexdigest())
+                    if scratch_changed:
+                        args.empty_scratch_session_id = "session-probe"
+                    containers = {service: {"Id": service, "Image": "image", "Config": {
+                        "Labels": {"com.docker.compose.project": "fullmag-master",
+                                   "com.docker.compose.service": service,
+                                   "org.fullmag.source.worktree-id": "worktree"}},
+                        "State": {"Running": True if service == "backend" else frontend_running,
+                                  "StartedAt": "same-incarnation", "Health": {"Status": "healthy"}}}
+                        for service in ("backend", "frontend")}
+                    inspection_count = {"backend": 0, "frontend": 0}
+                    def observe(*arguments, **kwargs):
+                        if arguments[:2] == ("image", "inspect"):
+                            return json.dumps([{"Config": {}}])
+                        if arguments[0] == "inspect":
+                            service = arguments[1]
+                            inspection_count[service] += 1
+                            observed = json.loads(json.dumps(containers[service]))
+                            if service == "frontend" and inspection_count[service] > 1:
+                                observed["State"]["Running"] = False
+                            return json.dumps([observed])
+                        if arguments[0] == "exec":
+                            if scratch_changed:
+                                return json.dumps({"status": "ok", "active_session": True})
+                            raise BuildControlError("health probe refused")
+                        self.fail("unexpected Docker observation: " + repr(arguments))
+                    patches = [
+                        mock.patch.object(dev, "require_host"),
+                        mock.patch.object(docker_dev, "_select_source", return_value=(source, {"runtime_root": source})),
+                        mock.patch.object(docker_dev, "_compose_identity", return_value={"worktree_id": "worktree"}),
+                        mock.patch.object(docker_build_control, "toolchain_configuration", return_value={
+                            "services": {"fem-gpu-toolchain": {"build": {"args": {"FULLMAG_CUDA_BASE_IMAGE": "base"}}}}}),
+                        mock.patch.object(dev, "BuildControl", return_value=control),
+                        mock.patch.object(dev, "_operator_probe_record_from_retained", return_value={}),
+                        mock.patch.object(dev, "compose_capture", side_effect=lambda *a, **kw: a[-1].encode()),
+                        mock.patch.object(dev, "docker_text", side_effect=observe),
+                        mock.patch.object(dev, "_validate_retained_service"),
+                        mock.patch.object(dev.storage, "validate_path", side_effect=lambda path, *a: path),
+                        mock.patch.object(dev, "_retained_certificate", return_value={}),
+                        mock.patch.object(dev, "_retained_startup_enabled", return_value=False),
+                        mock.patch.object(dev, "_read_cancelled_activation_bytes", return_value=None),
+                        mock.patch.object(cache, "validate_container"),
+                        mock.patch.object(dev, "_assert_private_restart_network"),
+                    ]
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    capture = stack.enter_context(mock.patch.object(dev, "docker_capture"))
+                    scratch_capture = stack.enter_context(mock.patch("docker_empty_scratch_restart.capture",
+                        side_effect=[{"fingerprint": "old", "export": {}}, {"fingerprint": "changed", "export": {}}]))
+                    with self.assertRaisesRegex(BuildControlError,
+                            "Pinned empty scratch changed" if scratch_changed else "health probe refused"):
+                        if scratch_changed:
+                            dev.restart_idle(args)
+                        else:
+                            dev.stop_idle(args)
+                    if scratch_changed:
+                        self.assertEqual(scratch_capture.call_count, 2)
+                        control.write.assert_called_once_with("attempts/test/empty-scratch-export.json",
+                                                              {"fingerprint": "old", "export": {}})
+                        self.assertEqual(operation["receipt"]["empty_scratch_export"]["session_id"], "session-probe")
+                    else:
+                        scratch_capture.assert_not_called()
+                    commands = [call.args for call in capture.call_args_list]
+                    self.assertEqual(commands, [("stop", "--time", "60", "frontend")]
+                                     + ([("start", "frontend")] if frontend_running else []))
+                    self.assertFalse(operation["daemon_pending"])
+
+    def test_finish_completes_storage_preflight_before_worker_cgroup_delegation(self):
+        from types import SimpleNamespace
+        import docker_volume_dev as dev
+        import docker_worker_cgroup
+        import fullmag_docker_runtime as runtime
+
+        for host_os in ("posix", "nt"):
+            with self.subTest(host_os=host_os):
+                events = []
+                control = mock.Mock(project="fullmag-master", volume="test-control")
+                operation = {"root": "attempts/test", "receipt": {"attempt": "a" * 32}}
+                host = mock.Mock()
+                host.complete_preflight.side_effect = lambda *a, **kw: events.append("storage")
+
+                def delegate(*args, **kwargs):
+                    self.assertEqual(events, ["storage"])
+                    raise RuntimeError("delegation boundary reached")
+
+                with (
+                    mock.patch.object(dev, "os", SimpleNamespace(name=host_os)),
+                    mock.patch.object(dev, "_operator_probe_record_from_retained", return_value={}),
+                    mock.patch.object(dev, "_wait_for_publication", return_value=({}, {})),
+                    mock.patch.object(runtime, "_assembly_from_backend_start", return_value={}),
+                    mock.patch.object(runtime, "_complete_backend_storage_preflight",
+                                      side_effect=lambda *a, **kw: events.append("storage")),
+                    mock.patch.object(dev, "_session_host", return_value=host),
+                    mock.patch.object(docker_worker_cgroup, "ensure_delegation", side_effect=delegate),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "delegation boundary reached"):
+                        dev._finish(control, operation,
+                            {"services": {"backend": {"environment": {
+                                "FULLMAG_DOCKER_DEVICE_ACCESS": "gpu"}}}},
+                            "backend", "frontend", Path("/source"), Path("/state"), Path("/certificate"),
+                            {"restart_verified": True, "storage_profile":
+                                "windows-folder-v1" if host_os == "nt" else "linux-native-v1"},
+                            {}, {"image_id": "image"}, "image", Path("/git"), {}, 3197)
+
     def test_invalid_compose_stops_before_daemon_mutation_boundary(self):
         import docker_volume_dev as dev
         operation = {'receipt': {}, 'daemon_pending': False}

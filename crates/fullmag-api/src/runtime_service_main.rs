@@ -898,6 +898,7 @@ struct DockerHostInitArgs {
     readiness_path: Option<PathBuf>,
     device_access: DockerHostDeviceAccess,
     host_id: String,
+    migrate_worker_cpu_quota_from: Option<String>,
 }
 
 fn explicit_absolute_path(value: OsString, field: &str) -> Result<PathBuf> {
@@ -921,6 +922,7 @@ fn parse_docker_host_init_args(
     let mut readiness_path = None;
     let mut device_access = None;
     let mut host_id = None;
+    let mut migrate_worker_cpu_quota_from = None;
     while let Some(flag) = args.next() {
         let name = flag.to_str().context("initializer argument is not UTF-8")?;
         let value = args.next().with_context(|| format!("missing value for {name}"))?;
@@ -948,6 +950,17 @@ fn parse_docker_host_init_args(
                     bail!("initializer received duplicate --host-id");
                 }
             }
+            "--migrate-worker-cpu-quota-from" => {
+                let value = value.to_str().context("runtime generation is not UTF-8")?;
+                if value.len() != 64
+                    || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    bail!("expected runtime generation must be a lowercase SHA256");
+                }
+                if migrate_worker_cpu_quota_from.replace(value.to_owned()).is_some() {
+                    bail!("initializer received duplicate migration generation");
+                }
+            }
             _ => bail!("unsupported Docker host initializer argument `{name}`"),
         }
     }
@@ -970,6 +983,7 @@ fn parse_docker_host_init_args(
         readiness_path,
         device_access,
         host_id,
+        migrate_worker_cpu_quota_from,
     };
     if args.ledger_root == args.store_root
         || args.readiness_path.as_ref().is_some_and(|path| path == &args.ledger_root)
@@ -1051,6 +1065,9 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         bail!(
             "native readiness fixture paths are restricted to FULLMAG_DOCKER_HOST_READINESS_FIXTURE=1"
         );
+    }
+    if args.migrate_worker_cpu_quota_from.is_some() && fixture_readiness {
+        bail!("worker CPU quota migration requires a live native probe, not a readiness fixture");
     }
     let readiness = match (fixture_readiness, args.readiness_path.as_deref()) {
         (true, Some(path)) => {
@@ -1195,12 +1212,36 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
             std::env::var_os("FULLMAG_STATE_ROOT").map(PathBuf::from),
         )?
         .context("Docker host initialization requires explicit FULLMAG_STATE_ROOT")?;
+    if let Some(expected_generation) = args.migrate_worker_cpu_quota_from.as_deref() {
+        let ledger = HostResourceLedger::open_for_application(
+            &application_state_root, &args.ledger_root, policy.clone(),
+        )?;
+        let generation = ledger.migrate_worker_cpu_quota_readiness(
+            expected_generation, persisted_readiness, &provisional,
+        )?;
+        println!("{}", serde_json::json!({
+            "schema_version": "host_worker_cpu_quota_migration.v1",
+            "previous_generation": expected_generation,
+            "runtime_generation_sha256": generation,
+        }));
+        return Ok(());
+    }
     let ledger = fullmag_runtime_control::retry_store_writer_busy(|| {
         HostResourceLedger::initialize_or_upgrade_with_readiness_for_application(
             &application_state_root,
             &args.ledger_root,
             policy.clone(),
             persisted_readiness.clone(),
+        )
+    })
+    .with_context(|| {
+        format!(
+            "Docker host admission candidate: {}",
+            serde_json::json!({
+                "policy": policy,
+                "readiness": persisted_readiness,
+                "enforcement": provisional.enforcement,
+            })
         )
     })?;
     let runtime_generation_sha256 = fullmag_runtime_control::retry_store_writer_busy(|| {
@@ -2334,7 +2375,7 @@ fn run() -> Result<()> {
             }
             run_service(path)
         }
-        _ => bail!("usage: fullmag-runtime-service --config <absolute-json-path> | --cancel-failed-no-spawn --config <absolute-json-path> --request <absolute-json-path> | --prepare-orphan-teardown --config <absolute-json-path> --request <absolute-json-path> | --recover-orphan-after-teardown --config <absolute-json-path> --request <absolute-json-path> --attestation <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--device-access cpu|gpu] [--native-fem-readiness <absolute-json-path>] [--host-id <stable-id>]")
+        _ => bail!("usage: fullmag-runtime-service --config <absolute-json-path> | --cancel-failed-no-spawn --config <absolute-json-path> --request <absolute-json-path> | --prepare-orphan-teardown --config <absolute-json-path> --request <absolute-json-path> | --recover-orphan-after-teardown --config <absolute-json-path> --request <absolute-json-path> --attestation <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--device-access cpu|gpu] [--native-fem-readiness <absolute-json-path>] [--host-id <stable-id>] [--migrate-worker-cpu-quota-from <sha256>]")
     }
 }
 
@@ -2902,6 +2943,25 @@ mod tests {
         assert_eq!(parsed.device_access, DockerHostDeviceAccess::Gpu);
         assert_eq!(parsed.device_access.readiness_schema(), HOST_RUNTIME_READINESS_SCHEMA_V1);
         assert!(parsed.readiness_path.is_some());
+    }
+
+    #[test]
+    fn docker_host_initializer_requires_exact_migration_generation() {
+        let base = docker_host_initializer_arguments();
+        assert!(parse_docker_host_init_args(base.clone().into_iter())
+            .unwrap().migrate_worker_cpu_quota_from.is_none());
+        for value in ["", "latest", &"A".repeat(64), &"a".repeat(63)] {
+            let mut args = base.clone();
+            args.extend(["--migrate-worker-cpu-quota-from".into(), value.into()]);
+            assert!(parse_docker_host_init_args(args.into_iter()).is_err());
+        }
+        let generation = "a".repeat(64);
+        let mut args = base;
+        args.extend(["--migrate-worker-cpu-quota-from".into(), generation.clone().into()]);
+        assert_eq!(parse_docker_host_init_args(args.clone().into_iter()).unwrap()
+            .migrate_worker_cpu_quota_from.as_deref(), Some(generation.as_str()));
+        args.extend(["--migrate-worker-cpu-quota-from".into(), generation.into()]);
+        assert!(parse_docker_host_init_args(args.into_iter()).is_err());
     }
 
     #[test]

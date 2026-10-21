@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sys
 import tempfile
 import types
 import unittest
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -29,6 +30,33 @@ class DockerDevRecreateContract(unittest.TestCase):
         parsed = docker_dev._parser().parse_args(["build", "--port", "4242"])
         self.assertEqual(parsed.port, 4242)
         self.assertIsNone(parsed.script)
+
+    def test_stop_idle_volume_dispatch_preserves_required_pins(self):
+        pins = {
+            "--attempt": "a" * 32,
+            "--config-sha256": "b" * 64,
+            "--source-root": "/owned/checkout",
+            "--port": "3198",
+        }
+        arguments = ["stop-idle-volume", *[value for pair in pins.items() for value in pair]]
+        with patch("docker_volume_dev.stop_idle") as stop, \
+                patch("docker_volume_dev.restart_idle") as restart:
+            self.assertEqual(docker_dev.main(arguments), 0)
+        stop.assert_called_once()
+        restart.assert_not_called()
+        parsed = stop.call_args.args[0]
+        self.assertEqual(parsed.attempt, pins["--attempt"])
+        self.assertEqual(parsed.config_sha256, pins["--config-sha256"])
+        self.assertEqual(parsed.source_root, Path(pins["--source-root"]))
+        self.assertEqual(parsed.port, 3198)
+        for missing in pins:
+            with self.subTest(missing=missing), redirect_stderr(io.StringIO()):
+                incomplete = ["stop-idle-volume", *[
+                    value for pair in pins.items() if pair[0] != missing for value in pair
+                ]]
+                with self.assertRaises(SystemExit) as error:
+                    docker_dev._parser().parse_args(incomplete)
+                self.assertEqual(error.exception.code, 2)
 
     def test_recreate_parser_selects_explicit_direct_development_mode(self):
         parsed = docker_dev._parser().parse_args([
