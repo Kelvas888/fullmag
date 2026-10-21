@@ -57,10 +57,17 @@ błędem. Toolchain, obrazy pomocnicze i aplikacja stosują ten sam wybór źró
 Aktywacja kolejnego skryptu odczytuje rzeczywisty port działającej grupy, więc
 nie wymaga ponownego podawania wcześniejszego nadpisania portu.
 
-Zakończ edycje przed startem; nie zmieniaj źródeł do zakończenia próby.
-Migawka odczytuje checkout dwukrotnie i odrzuca niespójne wejście.
+Migawka odczytuje checkout jednym przebiegiem. Git porównuje tylko rozmiar
+i sekundy mtime (`core.checkStat=minimal`), bo indeks hosta nie może być
+odświeżony przez readonly mount; treść wiąże SHA-256 każdego pliku. Zapis pliku
+w trakcie startu (edytor, formatter) nie kończy próby błędem: odczyt w capture
+albo synchronizacja shadow wykrywa zmianę i wykonuje ponowne przechwycenie,
+najwyżej trzy razy. Dopiero ciągłe zmiany przez wszystkie próby zatrzymują start.
 
-Nowe, jeszcze nieśledzone pliki można jawnie dodać do migawki bez `git add`:
+Nowe, nieśledzone i nieignorowane pliki runtime (poza `docs/`, frontendem,
+testami, katalogami administracyjnymi, plikami sekretów i plikami > 16 MiB)
+trafiają do migawki automatycznie, więc nowy moduł kompiluje się bez `git add`.
+Inne nieśledzone pliki można jawnie dodać do migawki:
 
 ```powershell
 python -B scripts/docker_dev.py --repo-root $source up --source-root $source --port 3197 `
@@ -71,8 +78,8 @@ python -B scripts/docker_dev.py --repo-root $source up --source-root $source --p
 Każda opcja wskazuje dokładną ścieżkę względną do jednego regularnego pliku,
 który w chwili przechwycenia zwraca `git ls-files --others --exclude-standard`.
 Dozwolone są powtórzone opcje; globs, katalogi, ścieżki absolutne, traversal,
-sekrety i pliki administracyjne są odrzucane. Pozostałe nieśledzone pliki nadal
-pozostają wykluczone. Lista z CLI jest zapisywana jako kanoniczne JSON w
+sekrety i pliki administracyjne są odrzucane. Pozostałe nieśledzone pliki spoza
+reguły automatycznej nadal pozostają wykluczone. Lista z CLI jest zapisywana jako kanoniczne JSON w
 środowisku backendu i wchodzi do digestu Compose; zmiana listy istniejącej grupy
 przechodzi przez zarządzane odtworzenie z wymaganym bezpiecznym drainem. Brak
 opcji przy uzgadnianiu istniejącej grupy zachowuje przypiętą listę; nowa grupa
@@ -81,6 +88,19 @@ indeksu Git, capture akceptuje go jako już obecny w `files` i nie dubluje go w
 `included_untracked`.
 Programowe przekazanie `[]` jawnie czyści listę; hostowa zmienna środowiskowa
 `FULLMAG_DEV_INCLUDE_UNTRACKED` nie ustala jej wartości.
+
+Build DEV kompiluje CUDA tylko dla GPU widocznych w kontenerze backendu (FEM
+i FDM, np. `89-real` dla RTX 40xx). Gdy sonda sterownika nie jest dostępna,
+build wraca do przenośnej macierzy obrazu. Wybrana lista jest zapisana
+w `build.cuda_architectures` receiptu. `backend_dev.py` rozumie też
+`FULLMAG_DEV_CUDA_ARCHITECTURES` (`auto`, `all` albo lista CMake), ale launcher
+nie przekazuje jeszcze tej zmiennej do usługi, więc DEV zawsze używa `auto`.
+Pakiet DEV nie jest artefaktem przenośnym ani wydaniem.
+
+Restart backendu po zmianie wyłącznie `docs/`, frontendu lub plików testowych
+wykorzystuje istniejący pakiet: cache-hit porównuje `runtime_source_digest`
+receiptu z plikami runtime świeżej migawki. Commit lub zmiana brancha nadal
+wymaga przebudowy, bo commit jest wkompilowany w tożsamość binariów.
 
 Port musi być wolny. Wybierz wolny port, jeśli inna instancja już działa.
 `docker-dev-images` przygotowuje wyłącznie obrazy helperów; `docker-dev-build`

@@ -553,7 +553,9 @@ def serve():
             if status is not None:
                 raise RuntimeError(f"Fullmag API exited unexpectedly ({status})")
             now = time.monotonic()
-            full_api_probe = now - last_full_api_probe >= 5.0
+            full_api_probe = (
+                now - last_full_api_probe >= service.SUPERVISION_FULL_API_PROBE_SECONDS
+            )
             degraded_since = _supervise_once(
                 service,
                 handle,

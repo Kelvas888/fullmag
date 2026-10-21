@@ -44,6 +44,10 @@ MAX_MEMBERS = 300_000
 # bind mount. Keep this as a per-child Git budget; runtime and lease deadlines
 # are independent.
 LIVE_GIT_TIMEOUT_SECONDS = 300
+# Editors and formatters may save while a start captures the checkout.
+LIVE_CAPTURE_ATTEMPTS = 3
+LIVE_CAPTURE_RETRY_SECONDS = 2.0
+LIVE_AUTO_UNTRACKED_MAX_BYTES = 16 * 1024 * 1024
 LIVE_GIT_CHUNK_BYTES = 64 * 1024
 LIVE_GIT_STDERR_BYTES = 64 * 1024
 LIVE_GIT_HEADER_BYTES = 4 * 1024
@@ -124,6 +128,10 @@ LIVE_RUNTIME_STATUS_EXCLUSIONS = (
 
 class BackendSourceError(RuntimeError):
     """The direct backend source archive is not safe or internally coherent."""
+
+
+class LiveSourceChanged(BackendSourceError):
+    """A live checkout file changed while it was being captured; retry is safe."""
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -660,6 +668,11 @@ class _LiveGitProcess:
 
 
 def _live_git_command(source_root: Path, git_dir: Path, *arguments: str) -> tuple[str, ...]:
+    # The index is written by the host Git and cannot be refreshed through the
+    # read-only mount.  Inode, device, owner and sub-second times differ in the
+    # container view, so the default stat check re-reads every tracked file on
+    # each query.  Size and whole-second mtime survive the bind mount; content
+    # identity is still established by the per-file SHA-256 of the capture.
     return (
         "git",
         "--git-dir",
@@ -672,6 +685,10 @@ def _live_git_command(source_root: Path, git_dir: Path, *arguments: str) -> tupl
         "core.autocrlf=true",
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        "core.checkStat=minimal",
+        "-c",
+        "core.trustctime=false",
         *arguments,
     )
 
@@ -1131,6 +1148,8 @@ def _live_read_regular(source_root: Path, relative: str) -> tuple[str, bytes] | 
         return None
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError as error:
+        raise LiveSourceChanged(f"live source file disappeared while being read: {relative}") from error
     except OSError as error:
         raise BackendSourceError(f"cannot open live source file {relative}") from error
     try:
@@ -1148,10 +1167,10 @@ def _live_read_regular(source_root: Path, relative: str) -> tuple[str, bytes] | 
         raise BackendSourceError(f"cannot read live source file {relative}") from error
     finally:
         os.close(descriptor)
-    if len(content) > MAX_FILE_BYTES or before.st_size != len(content):
-        _live_fail(f"live source file exceeds its size bound or changed: {relative}")
-    if _live_metadata_signature(before) != _live_metadata_signature(after):
-        _live_fail(f"live source file changed while being read: {relative}")
+    if len(content) > MAX_FILE_BYTES:
+        _live_fail(f"live source file exceeds its size bound: {relative}")
+    if before.st_size != len(content) or _live_metadata_signature(before) != _live_metadata_signature(after):
+        raise LiveSourceChanged(f"live source file changed while being read: {relative}")
     if LIVE_LFS_POINTER_RE.match(bytes(content)):
         _live_fail(f"Git-LFS pointer is not materialized: {relative}")
     return ("100755" if before.st_mode & stat.S_IXUSR else "100644", bytes(content))
@@ -1166,6 +1185,8 @@ def _live_hash_regular(source_root: Path, relative: str) -> tuple[str, int, str]
         return None
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError as error:
+        raise LiveSourceChanged(f"live source file disappeared while being read: {relative}") from error
     except OSError as error:
         raise BackendSourceError(f"cannot open live source file {relative}") from error
     digest = hashlib.sha256()
@@ -1191,10 +1212,10 @@ def _live_hash_regular(source_root: Path, relative: str) -> tuple[str, int, str]
         raise BackendSourceError(f"cannot read live source file {relative}") from error
     finally:
         os.close(descriptor)
-    if total > MAX_FILE_BYTES or before.st_size != total:
-        _live_fail(f"live source file exceeds its size bound or changed: {relative}")
-    if _live_metadata_signature(before) != _live_metadata_signature(after):
-        _live_fail(f"live source file changed while being read: {relative}")
+    if total > MAX_FILE_BYTES:
+        _live_fail(f"live source file exceeds its size bound: {relative}")
+    if before.st_size != total or _live_metadata_signature(before) != _live_metadata_signature(after):
+        raise LiveSourceChanged(f"live source file changed while being read: {relative}")
     # Normal Git-LFS pointers are well below the bounded probe.  Keep the
     # probe bounded while preserving the existing exact check for such files.
     if LIVE_LFS_POINTER_RE.match(bytes(prefix)):
@@ -1347,6 +1368,31 @@ def _live_untracked_records(raw: bytes) -> tuple[list[str], list[dict[str, objec
         paths.append(relative)
         records.append({"status": "??", "paths": [relative]})
     return paths, records
+
+
+def _live_auto_untracked(source_root: Path, relative: str) -> bool:
+    """Select a new, non-ignored runtime source file without an explicit allowlist.
+
+    A new module that is not yet staged must compile like a tracked one.
+    Paths that policy would reject, administrative and non-runtime trees, and
+    large files are left out silently; an explicit allowlist still overrides.
+    """
+
+    if _live_admin_path(relative) or _live_non_runtime(relative):
+        return False
+    if any(_live_windows_device_component(part) for part in relative.split("/")):
+        return False
+    try:
+        _live_reject_policy(relative)
+        path = _live_regular_path(source_root, relative)
+    except BackendSourceError:
+        return False
+    if path is None:
+        return False
+    try:
+        return path.lstat().st_size <= LIVE_AUTO_UNTRACKED_MAX_BYTES
+    except OSError:
+        return False
 
 
 def _live_non_runtime(relative: str) -> bool:
@@ -1531,14 +1577,21 @@ def _capture_live_source_once(
             + ", ".join(missing_untracked[:20])
         )
     selected_untracked = tuple(
-        relative for relative in included_untracked if relative in available_untracked
+        sorted(
+            {relative for relative in included_untracked if relative in available_untracked}
+            | {
+                relative
+                for relative in untracked_paths
+                if relative not in included_set and _live_auto_untracked(source_root, relative)
+            }
+        )
     )
+    included_set |= set(selected_untracked)
     selected_files = _live_hash_regular_files(source_root, list(selected_untracked))
     for relative in selected_untracked:
         selected = selected_files[relative]
         if selected is None:
-            _live_fail(f"included untracked source is not a regular file: {relative}")
-            continue
+            raise LiveSourceChanged(f"included untracked source disappeared during capture: {relative}")
         mode, size, digest = selected
         files.append(
             {
@@ -1576,7 +1629,9 @@ def _capture_live_source_once(
             or native_entry.get("mode") != manifest_entry["mode"]
             or native_entry.get("sha256") != manifest_entry["sha256"]
         ):
-            _live_fail(
+            # Both reads come from the same capture pass, so a difference means
+            # the file was saved in between.
+            raise LiveSourceChanged(
                 "native source identity does not bind the included file bytes: "
                 + relative
             )
@@ -1655,17 +1710,26 @@ def capture_live_source_manifest(
     The source and Git mounts are read-only.  Only this helper's manifest is
     written, under the image-owned build root; the existing backend worker then
     performs the normal manifest validation and ext4 shadow reconciliation.
+
+    One pass is enough: the shadow synchronization re-hashes every copied file
+    against this manifest, and a file edited after the capture is detected
+    there and answered with a fresh capture instead of a failed start.
     """
 
     source_root = Path(source_root)
     git_common_root = Path(git_common_root)
     build_root = Path(build_root)
     included_untracked = _live_included_untracked_from_environment()
-    first = _capture_live_source_pass(source_root, git_common_root, 1, included_untracked)
-    second = _capture_live_source_pass(source_root, git_common_root, 2, included_untracked)
-    if second != first:
-        _live_fail("live source changed while creating its closed manifest")
-    capsule, native, git_object_ids = first
+    for attempt in range(1, LIVE_CAPTURE_ATTEMPTS + 1):
+        try:
+            capsule, native, git_object_ids = _capture_live_source_pass(
+                source_root, git_common_root, attempt, included_untracked
+            )
+            break
+        except LiveSourceChanged:
+            if attempt == LIVE_CAPTURE_ATTEMPTS:
+                raise
+            time.sleep(LIVE_CAPTURE_RETRY_SECONDS)
     capture_id = uuid.uuid4().hex
     document: dict[str, Any] = {
         "schema": LIVE_MANIFEST_SCHEMA,
