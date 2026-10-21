@@ -66,6 +66,7 @@ def probe(store_root, ledger_root):
     import os
     from pathlib import Path
     import stat
+    import time
     import urllib.request
     import uuid
 
@@ -96,11 +97,19 @@ def probe(store_root, ledger_root):
         for root in (Path(ledger_root), Path(store_root)):
             if not root.is_absolute() or ".." in root.parts or any(p.is_symlink() for p in (root, *root.parents)):
                 raise RuntimeError("Unsafe store path")
-            fd = os.open(root / "WRITER.lock", os.O_RDWR | os.O_NOFOLLOW)
+            fd = os.open(root / "WRITER.lock", os.O_RDONLY | os.O_NOFOLLOW)
             descriptors.append(fd)
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise RuntimeError("Invalid writer lock")
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as error:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Writer lock remains busy: " + str(root)) from error
+                    time.sleep(0.05)
         for name in ("runs", "live_command_journals", "development"):
             path = Path(store_root) / name
             if path.is_symlink() or (path.exists() and (not path.is_dir() or any(path.iterdir()))):

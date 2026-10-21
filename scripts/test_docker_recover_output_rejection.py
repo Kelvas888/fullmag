@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -85,7 +86,7 @@ class OutputRejectionTests(unittest.TestCase):
                 lock.close()
 
     def test_probe_refuses_session_work_reservations_or_incarnation_change(self):
-        for obstacle in (None, "session", "task", "run", "journal", "reservation", "incarnation"):
+        for obstacle in (None, "session", "task", "run", "journal", "reservation", "incarnation", "locked", "transient"):
             with self.subTest(obstacle=obstacle), tempfile.TemporaryDirectory() as directory:
                 store, ledger = Path(directory) / "store", Path(directory) / "ledger"
                 for root in (store, ledger):
@@ -112,13 +113,25 @@ class OutputRejectionTests(unittest.TestCase):
                     if obstacle == "incarnation" and len(calls) > 3:
                         instance = "22222222-2222-4222-8222-222222222222"
                     return Response(copy.deepcopy(responses[url.split("/v2/platform/")[1]]), instance)
-                with patch("urllib.request.urlopen", side_effect=get):
-                    if obstacle is None:
+                writer = (ledger / "WRITER.lock").open("rb")
+                release = None
+                if obstacle in ("locked", "transient"):
+                    fcntl.flock(writer, fcntl.LOCK_EX)
+                if obstacle == "transient":
+                    release = threading.Timer(0.15, lambda: fcntl.flock(writer, fcntl.LOCK_UN))
+                    release.start()
+                with writer, patch("urllib.request.urlopen", side_effect=get):
+                    if obstacle in (None, "transient"):
                         self.assertEqual(recovery.probe(str(store), str(ledger))["queue"]["items"], [])
                         self.assertEqual(len(calls), 6)
+                    elif obstacle == "locked":
+                        with self.assertRaisesRegex(RuntimeError, "Writer lock remains busy: " + str(ledger)):
+                            recovery.probe(str(store), str(ledger))
                     else:
                         with self.assertRaises(RuntimeError):
                             recovery.probe(str(store), str(ledger))
+                    if release is not None:
+                        release.join()
 
 
 if __name__ == "__main__":
