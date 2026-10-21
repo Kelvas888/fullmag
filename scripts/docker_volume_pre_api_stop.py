@@ -1,4 +1,4 @@
-"""Checkpoint and stop only an owned rollback-reader before its API handoff."""
+"""Preserve an owned pre-API stop or exact startup failure without run replay."""
 from __future__ import annotations
 
 import hashlib
@@ -9,12 +9,22 @@ import re
 import subprocess
 import time
 
-from docker_build_control import BuildControl, BuildControlError, canonical, docker_capture, toolchain_configuration
+from docker_build_control import (
+    MAX_DOCUMENT_BYTES,
+    BuildControl,
+    BuildControlError,
+    canonical,
+    docker_capture,
+    toolchain_configuration,
+)
 from docker_dev_host import require_host
 from docker_volume_resources import _fence, _inspect, _pause_start, _resource_lock, _RESUME_START
 
 SCHEMA = "fullmag.docker-pre-api-stop.v1"
 SUFFIX = "/pre-api-stop/"
+ACTION_CAPTURE_FAILURE = "observe-capture-failure"
+ACTION_NATIVE_INIT_FAILURE = "observe-native-host-init-failure"
+MAX_PRE_API_FAILURE_RECORD_BYTES = MAX_DOCUMENT_BYTES
 
 
 class PreApiContext(dict):
@@ -219,7 +229,7 @@ def stop(args):
 def _resume_unissued(control, root, args, selected, identity, previous, document):
     """Recover a hold before intent publication; never resume an issued stop."""
     from docker_volume_accepted_reattach import _control_bytes
-    from docker_volume_pre_ack_retry import _released_snapshot
+    from docker_volume_pre_ack_retry import _publish_raw, _released_snapshot
     publisher = "fullmag-pre-api-intent-" + args.attempt
 
     def no_publisher_or_intent():
@@ -253,7 +263,7 @@ def _finalize(control, root, args):
     from docker_volume_pre_ack_retry import _publish_raw, _released_snapshot
     from docker_volume_accepted_reattach import _control_bytes
     relative = root + SUFFIX
-    raw = _control_bytes(control, relative + "intent.json")
+    raw = _control_bytes(control, relative + "intent.json", maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
     intent = json.loads(raw)
     if (intent.get("schema") != SCHEMA or intent.get("state") != "planned"
             or intent.get("attempt") != args.attempt or intent.get("compose_project") != control.project
@@ -264,9 +274,47 @@ def _finalize(control, root, args):
     with control.operation("pre-api-finalization", {"attempt": args.attempt, "intent_sha256": _sha(raw)}) as operation:
         previous = control.read(root + "/terminal.json")
         if (previous.get("state") != "failed-confirmed" or previous.get("attempt") != args.attempt
-                or _control_bytes(control, relative + "intent.json") != raw):
+                or _control_bytes(control, relative + "intent.json", maximum=MAX_PRE_API_FAILURE_RECORD_BYTES) != raw):
             raise BuildControlError("Pre-API finalization requires the same terminal development attempt")
+        if intent.get("action") == ACTION_NATIVE_INIT_FAILURE:
+            previous_raw = _control_bytes(control, root + "/terminal.json",
+                                          maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
+            previous = json.loads(previous_raw)
+            inputs = previous.get("inputs")
+            current_raw = _control_bytes(control, "development/current.json",
+                                         maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
+            compose_raw = _control_bytes(control, root + "/compose.json",
+                                         maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
+            compose = json.loads(compose_raw)
+            config_sha256 = _sha(canonical(compose))
+            if (current_raw != previous_raw
+                    or _sha(previous_raw) != intent.get("development_terminal_sha256")
+                    or previous.get("schema") != "fullmag.docker-build-operation.v1"
+                    or previous.get("phase") != "development"
+                    or previous.get("state") != "failed-confirmed"
+                    or previous.get("attempt") != args.attempt
+                    or previous.get("compose_project") != control.project
+                    or not isinstance(inputs, dict)
+                    or inputs.get("source_root") != intent["source_root"]
+                    or inputs.get("image_id") != intent["image_id"]
+                    or (previous.get("backend_container") is not None
+                        and previous.get("backend_container") != intent["container_id"])
+                    or (previous.get("config_sha256") is not None
+                        and previous.get("config_sha256") != config_sha256)
+                    or config_sha256 != intent.get("config_sha256")
+                    or compose.get("name") != control.project
+                    or (control.namespace
+                        and compose.get("x-fullmag-control-namespace") != control.namespace)
+                    or (not control.namespace and "x-fullmag-control-namespace" in compose)):
+                raise BuildControlError("Native-init finalization requires its exact current failed attempt and Compose")
         actual = _inspect("inspect", args.backend_container_id)
+        if intent.get("action") == ACTION_NATIVE_INIT_FAILURE:
+            from docker_volume_dev import _validate_retained_service
+            image_document = _inspect("image", "inspect", actual.get("Image"))
+            if (image_document.get("Id") != intent.get("image_id")
+                    or not isinstance(image_document.get("Config"), dict)):
+                raise BuildControlError("Native-init finalization image is not the exact immutable image")
+            _validate_retained_service(compose, actual, "backend", image_document["Config"])
         state = actual["State"]
         expected_exit = _expected_exit(intent)
         if (actual["Id"] != intent["container_id"] or actual["Image"] != intent["image_id"]
@@ -280,9 +328,11 @@ def _finalize(control, root, args):
             raise BuildControlError("Pre-API finalization authority/resources differ")
         record = dict(intent, state="stopped-confirmed", finished_at=state["FinishedAt"],
                       exit_code=expected_exit, intent_sha256=_sha(raw))
-        existing = _control_bytes(control, relative + "receipt.json", optional=True)
+        existing = _control_bytes(control, relative + "receipt.json", optional=True,
+                                  maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
         if existing is None:
-            _publish_raw(control, relative + "receipt.json", canonical(record) + b"\n")
+            _publish_raw(control, relative + "receipt.json", canonical(record) + b"\n",
+                         maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
         elif existing != canonical(record) + b"\n":
             raise BuildControlError("Pre-API finalization receipt differs from this intent")
         operation["receipt"].update(state="succeeded", parent_attempt=args.attempt,
@@ -294,32 +344,66 @@ def _finalize(control, root, args):
 def _expected_exit(record):
     if record.get("action") == "cancel-retention":
         return 143
-    if record.get("action") == "observe-capture-failure":
+    if record.get("action") == ACTION_CAPTURE_FAILURE:
         return 2
+    if record.get("action") == ACTION_NATIVE_INIT_FAILURE:
+        return 1
     raise BuildControlError("Unknown pre-API checkpoint action")
 
 
 def _validate_capture_evidence(record, actual=None):
-    if record.get("action") != "observe-capture-failure":
+    action = record.get("action")
+    if action not in {ACTION_CAPTURE_FAILURE, ACTION_NATIVE_INIT_FAILURE}:
         return
-    from docker_volume_capture_failure_reconcile import _capture_logs, _container_state, validate_capture_log_streams
+    from docker_volume_capture_failure_reconcile import (
+        MAX_LOG_BYTES,
+        MAX_RECORD_BYTES,
+        _capture_logs,
+        _capture_native_init_failure_logs,
+        _container_state,
+        validate_capture_log_streams,
+        validate_native_init_failure_log_streams,
+    )
     archive = record.get("capture_logs")
     if not isinstance(archive, dict) or set(archive) != {"stdout", "stderr"}:
-        raise BuildControlError("Capture checkpoint has no exact log archive")
+        raise BuildControlError("Pre-API failure checkpoint has no exact log archive")
     streams = {key: base64.b64decode(value, validate=True) for key, value in archive.items()}
-    if sum(map(len, streams.values())) > 128 * 1024:
-        raise BuildControlError("Capture checkpoint log archive exceeds its bound")
+    limit = 128 * 1024 if action == ACTION_CAPTURE_FAILURE else MAX_LOG_BYTES
+    if sum(map(len, streams.values())) > limit:
+        raise BuildControlError("Pre-API failure log archive exceeds its bound")
+    if len(canonical(record)) + 1 > MAX_RECORD_BYTES:
+        raise BuildControlError("Pre-API failure record exceeds its control-volume bound")
     state = {"started_at": record["started_at"], "finished_at": record["capture_finished_at"]}
-    validate_capture_log_streams(streams, state)
-    if actual is not None and _capture_logs(actual["Id"], _container_state(actual)) != streams:
-        raise BuildControlError("Capture checkpoint log archive differs from the stopped namespace")
+    expected_exit = _expected_exit(record)
+    if action == ACTION_CAPTURE_FAILURE:
+        validate_capture_log_streams(streams, state)
+        capture_logs = _capture_logs
+    else:
+        record_state = record.get("state")
+        record_finished_at = record.get("finished_at")
+        if (record_state == "planned" and record_finished_at is not None
+                or record_state == "stopped-confirmed"
+                and record_finished_at != record.get("capture_finished_at")
+                or record_state not in {"planned", "stopped-confirmed"}):
+            raise BuildControlError("Native initialization failure times differ from the exact container exit")
+        validate_native_init_failure_log_streams(streams, state)
+        capture_logs = _capture_native_init_failure_logs
+    if actual is not None:
+        actual_state = _container_state(actual, expected_exit=expected_exit)
+        if (actual_state["started_at"] != record["started_at"]
+                or actual_state["finished_at"] != record["capture_finished_at"]
+                or capture_logs(actual["Id"], actual_state) != streams):
+            raise BuildControlError("Pre-API failure log archive differs from the stopped namespace")
 
 
 def checkpoint_capture(args):
-    """Record an already stopped capture-only restart; do not start or stop it."""
+    """Record an already stopped exact pre-API failure; do not start or stop it."""
     from docker_dev import _select_source, _compose_identity
     from docker_volume_dev import _validate_retained_service
-    from docker_volume_capture_failure_reconcile import _capture_logs, _container_state
+    from docker_volume_capture_failure_reconcile import (
+        _capture_logs,
+        _container_state,
+    )
     from docker_volume_pre_ack_retry import _publish_raw, _released_snapshot
     from docker_volume_accepted_reattach import _control_bytes
     require_host()
@@ -342,6 +426,14 @@ def checkpoint_capture(args):
             raise BuildControlError("Capture checkpoint requires the current exact failed development terminal")
         document = control.read(root + "/compose.json")
         actual = _inspect("inspect", args.backend_container_id)
+        state_document = actual.get("State")
+        if (isinstance(state_document, dict)
+                and type(state_document.get("ExitCode")) is int
+                and state_document.get("ExitCode") == 1):
+            _checkpoint_native_init_failure(
+                args, control, selected, root, previous_raw, previous, document, actual, operation
+            )
+            return
         image_config = _inspect("image", "inspect", actual["Image"])["Config"]
         _validate_retained_service(document, actual, "backend", image_config)
         if actual["Image"] != previous["inputs"]["image_id"]:
@@ -351,7 +443,7 @@ def checkpoint_capture(args):
         if sum(map(len, logs.values())) > 128 * 1024:
             raise BuildControlError("Capture checkpoint logs exceed their bound")
         checkpoint, released = _checkpoint(control, previous), _released_snapshot(control, actual)
-        record = {"schema": SCHEMA, "state": "planned", "action": "observe-capture-failure",
+        record = {"schema": SCHEMA, "state": "planned", "action": ACTION_CAPTURE_FAILURE,
                   "attempt": args.attempt, "compose_project": control.project,
                   "control_namespace": control.namespace, "source_root": str(selected),
                   "config_sha256": _sha(canonical(document)), "container_id": actual["Id"],
@@ -378,6 +470,147 @@ def checkpoint_capture(args):
                           "receipt_sha256": _sha(canonical(record) + b"\n")}, indent=2))
 
 
+def _checkpoint_native_init_failure(args, control, selected, root, previous_raw,
+                                    previous, document, actual, operation):
+    """Checkpoint only the exact stopped host-policy initialization traceback."""
+    from docker_volume_dev import _validate_retained_service
+    from docker_volume_capture_failure_reconcile import (
+        MAX_LOG_BYTES,
+        MAX_RECORD_BYTES,
+        _capture_native_init_failure_logs,
+        _container_state,
+        validate_native_init_failure_log_streams,
+    )
+    from docker_volume_pre_ack_retry import _publish_raw, _released_snapshot
+    from docker_volume_accepted_reattach import _control_bytes
+
+    intent_path, receipt_path = root + SUFFIX + "intent.json", root + SUFFIX + "receipt.json"
+    if (_control_bytes(control, intent_path, optional=True, maximum=MAX_PRE_API_FAILURE_RECORD_BYTES) is not None
+            or _control_bytes(control, receipt_path, optional=True,
+                              maximum=MAX_PRE_API_FAILURE_RECORD_BYTES) is not None):
+        raise BuildControlError("A pre-API failure checkpoint already exists; do not replace it")
+
+    def validate_terminal():
+        current_raw = _control_bytes(control, root + "/terminal.json")
+        current = json.loads(current_raw)
+        if (current_raw != previous_raw
+                or current.get("schema") != "fullmag.docker-build-operation.v1"
+                or current.get("phase") != "development"
+                or current.get("attempt") != args.attempt
+                or current.get("state") != "failed-confirmed"
+                or current.get("compose_project") != control.project
+                or current.get("inputs", {}).get("source_root") != str(selected)
+                or _control_bytes(control, "development/current.json") != current_raw):
+            raise BuildControlError("Native-init checkpoint requires the exact current failed development terminal")
+        inputs = current.get("inputs")
+        if (not isinstance(inputs, dict) or inputs.get("image_id") != actual["Image"]
+                or (current.get("config_sha256") is not None
+                    and current.get("config_sha256") != _sha(canonical(document)))):
+            raise BuildControlError("Native-init checkpoint backend image differs from the failed attempt")
+        return current
+
+    if (actual.get("Id") != args.backend_container_id
+            or actual.get("Image") != previous.get("inputs", {}).get("image_id")):
+        raise BuildControlError("Native-init checkpoint container/image identity differs")
+    if (previous.get("backend_container") is not None
+            and previous.get("backend_container") != actual["Id"]):
+        raise BuildControlError("Native-init checkpoint container differs from the failed attempt")
+    validate_terminal()
+    compose_raw = _control_bytes(control, root + "/compose.json")
+    if json.loads(compose_raw) != document:
+        raise BuildControlError("Native-init checkpoint Compose snapshot changed")
+    namespace_key = "x-fullmag-control-namespace"
+    if (document.get("name") != control.project
+            or (control.namespace and document.get(namespace_key) != control.namespace)
+            or (not control.namespace and namespace_key in document)):
+        raise BuildControlError("Native-init checkpoint Compose namespace differs")
+
+    def observe():
+        current_actual = _inspect("inspect", args.backend_container_id)
+        if (current_actual.get("Id") != actual["Id"]
+                or current_actual.get("Image") != actual["Image"]):
+            raise BuildControlError("Native-init checkpoint container incarnation changed")
+        image_document = _inspect("image", "inspect", current_actual["Image"])
+        if (image_document.get("Id") != current_actual["Image"]
+                or not isinstance(image_document.get("Config"), dict)):
+            raise BuildControlError("Native-init checkpoint image is not the exact immutable image")
+        _validate_retained_service(document, current_actual, "backend", image_document["Config"])
+        current_state = _container_state(current_actual, expected_exit=1)
+        current_logs = _capture_native_init_failure_logs(current_actual["Id"], current_state)
+        validate_native_init_failure_log_streams(current_logs, current_state)
+        if sum(map(len, current_logs.values())) > MAX_LOG_BYTES:
+            raise BuildControlError("Native-init checkpoint logs exceed their raw-byte bound")
+        current_checkpoint = _checkpoint(control, previous)
+        current_released = _released_snapshot(control, current_actual)
+        return current_actual, current_state, current_logs, current_checkpoint, current_released
+
+    first_actual, first_state, first_logs, checkpoint, released = observe()
+    if (first_actual["Image"] != previous["inputs"]["image_id"]
+            or compose_raw != _control_bytes(control, root + "/compose.json")):
+        raise BuildControlError("Native-init checkpoint source/Compose/image identity changed")
+    record = {
+        "schema": SCHEMA,
+        "state": "planned",
+        "action": ACTION_NATIVE_INIT_FAILURE,
+        "attempt": args.attempt,
+        "compose_project": control.project,
+        "control_namespace": control.namespace,
+        "source_root": str(selected),
+        "config_sha256": _sha(canonical(document)),
+        "development_terminal_sha256": _sha(previous_raw),
+        "container_id": first_actual["Id"],
+        "image_id": first_actual["Image"],
+        "started_at": first_state["started_at"],
+        "capture_finished_at": first_state["finished_at"],
+        "capture_logs": {
+            key: base64.b64encode(value).decode("ascii") for key, value in first_logs.items()
+        },
+        "checkpoint": checkpoint,
+        "released": released,
+    }
+    if len(canonical(record)) + 1 > MAX_RECORD_BYTES:
+        raise BuildControlError("Native-init checkpoint exceeds its bounded control record")
+    _validate_capture_evidence(record, first_actual)
+
+    second_previous_raw = _control_bytes(control, root + "/terminal.json")
+    second_document_raw = _control_bytes(control, root + "/compose.json")
+    second_actual, second_state, second_logs, second_checkpoint, second_released = observe()
+    validate_terminal()
+    if (second_previous_raw != previous_raw or second_document_raw != compose_raw
+            or second_state != first_state or second_logs != first_logs
+            or second_checkpoint != checkpoint or second_released != released
+            or second_actual["Id"] != first_actual["Id"]
+            or second_actual["Image"] != first_actual["Image"]):
+        raise BuildControlError("Native-init checkpoint observations changed; no evidence was published")
+    _validate_capture_evidence(record, second_actual)
+    if (_control_bytes(control, intent_path, optional=True,
+                       maximum=MAX_PRE_API_FAILURE_RECORD_BYTES) is not None
+            or _control_bytes(control, receipt_path, optional=True,
+                              maximum=MAX_PRE_API_FAILURE_RECORD_BYTES) is not None):
+        raise BuildControlError("A pre-API failure checkpoint appeared during observation")
+
+    intent_raw = canonical(record) + b"\n"
+    receipt_record = dict(
+        record,
+        state="stopped-confirmed",
+        finished_at=second_state["finished_at"],
+        exit_code=1,
+        intent_sha256=_sha(intent_raw),
+    )
+    receipt_raw = canonical(receipt_record) + b"\n"
+    if len(intent_raw) > MAX_DOCUMENT_BYTES or len(receipt_raw) > MAX_DOCUMENT_BYTES:
+        raise BuildControlError("Native-init checkpoint intent or terminal receipt exceeds the control-document bound")
+    _publish_raw(control, intent_path, intent_raw, maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
+    _publish_raw(control, receipt_path, receipt_raw, maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
+    operation["receipt"].update(
+        state="succeeded", action=ACTION_NATIVE_INIT_FAILURE, signal_issued=False,
+        checkpoint_sha256=_sha(receipt_raw),
+    )
+    print(json.dumps({"state": "stopped-confirmed", "action": ACTION_NATIVE_INIT_FAILURE,
+                      "signal_issued": False, "container_id": first_actual["Id"],
+                      "receipt": receipt_path, "receipt_sha256": _sha(receipt_raw)}, indent=2))
+
+
 def retained_context(control, previous, document, backend_id, *, fresh_state, removed_container_proof=None):
     """Carry the same first pre-ACK authority after one proved pre-API stop."""
     from docker_volume_pre_ack_retry import _released_snapshot
@@ -396,8 +629,17 @@ def retained_context(control, previous, document, backend_id, *, fresh_state, re
             or record.get("config_sha256") != _sha(canonical(document))
             or record.get("container_id") != backend_id):
         raise BuildControlError("Retained pre-API stop identity differs")
+    if record.get("action") == ACTION_NATIVE_INIT_FAILURE:
+        from docker_volume_accepted_reattach import _control_bytes
+        terminal_raw = _control_bytes(control, "development/attempts/" + previous["attempt"] + "/terminal.json",
+                                      maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
+        current_raw = _control_bytes(control, "development/current.json",
+                                     maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
+        if (_sha(terminal_raw) != record.get("development_terminal_sha256")
+                or current_raw != terminal_raw or json.loads(terminal_raw) != previous):
+            raise BuildControlError("Retained native-init failure differs from its exact current development terminal")
     from docker_volume_accepted_reattach import _control_bytes
-    intent_raw = _control_bytes(control, root + "intent.json")
+    intent_raw = _control_bytes(control, root + "intent.json", maximum=MAX_PRE_API_FAILURE_RECORD_BYTES)
     base = {key: value for key, value in record.items() if key not in {"finished_at", "exit_code", "intent_sha256"}}
     base["state"] = "planned"
     expected_exit = _expected_exit(record)
@@ -428,6 +670,14 @@ def retained_context(control, previous, document, backend_id, *, fresh_state, re
                 "finished_at": record["finished_at"], "exit_code": expected_exit}:
             raise BuildControlError("Removed pre-API namespace incarnation differs")
     state = actual["State"]
+    if record.get("action") in {ACTION_CAPTURE_FAILURE, ACTION_NATIVE_INIT_FAILURE}:
+        from docker_volume_capture_failure_reconcile import _container_state
+        archived_state = _container_state(actual, expected_exit=expected_exit)
+        if (archived_state["id"] != backend_id
+                or archived_state["image"] != record["image_id"]
+                or archived_state["started_at"] != record["started_at"]
+                or archived_state["finished_at"] != record["finished_at"]):
+            raise BuildControlError("Retained pre-API archive differs from the exact stopped incarnation")
     if (actual["Id"] != backend_id or actual["Image"] != record["image_id"]
             or state["Running"] is not False or state["Status"] != "exited" or state["Pid"] != 0
             or state["OOMKilled"] is not False or state["ExitCode"] != record["exit_code"]

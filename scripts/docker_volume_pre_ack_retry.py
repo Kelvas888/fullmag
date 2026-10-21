@@ -15,9 +15,9 @@ import re
 import sys
 
 import fullmag_storage as storage
-from docker_build_control import BuildControl, BuildControlError, bounded_capture, canonical, docker_capture, require_host, toolchain_configuration
+from docker_build_control import MAX_DOCUMENT_BYTES, BuildControl, BuildControlError, bounded_capture, canonical, docker_capture, require_host, toolchain_configuration
 from docker_compose_identity import compose_project_identity
-from docker_volume_accepted_reattach import _bundle_from_records, _control_bytes, _decode_json
+from docker_volume_accepted_reattach import MAX_CONTROL_RECORD_BYTES, _bundle_from_records, _control_bytes, _decode_json
 
 
 def _sha(raw):
@@ -41,8 +41,11 @@ def _record(control, relative, label):
     return raw, _decode_json(raw, label)
 
 
-def _publish_raw(control, relative, raw, *, helper_name=None):
+def _publish_raw(control, relative, raw, *, helper_name=None, maximum=MAX_CONTROL_RECORD_BYTES):
     from docker_build_control import bounded_capture
+    if (type(maximum) is not int or not 0 < maximum <= MAX_DOCUMENT_BYTES
+            or not isinstance(raw, bytes) or len(raw) > maximum):
+        raise BuildControlError("Create-only raw archive exceeds its bounded record size")
     path = control.path(relative)
     parent = str(PurePosixPath(path).parent)
     script = (f"umask 027; mkdir -p '{parent}'; test \"$(readlink -f '{parent}')\" = '{parent}'; "
@@ -50,7 +53,7 @@ def _publish_raw(control, relative, raw, *, helper_name=None):
               "trap 'rm -f -- \"$tmp\"' EXIT; cat > \"$tmp\"; sync \"$tmp\"; "
               f"ln -T -- \"$tmp\" '{path}'; rm -- \"$tmp\"; sync '{parent}'")
     result = bounded_capture(control.helper_args(script, name=helper_name), data=raw, timeout=90)
-    if result.returncode or _control_bytes(control, relative) != raw:
+    if result.returncode or _control_bytes(control, relative, maximum=maximum) != raw:
         raise BuildControlError("Create-only pre-ACK raw archive was not confirmed")
 
 

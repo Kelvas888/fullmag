@@ -2545,7 +2545,9 @@ def _parser() -> argparse.ArgumentParser:
     pre_api_mode.add_argument("--finalize", action="store_true", help="observe and finalize an existing stopped intent; never repeat the signal")
     pre_api_mode.add_argument("--resume-unissued", action="store_true", help="resume a held pre-API start only after proving there is no intent or publisher")
     capture_checkpoint = subparsers.add_parser(
-        "checkpoint-pre-api-failure", help="record an already stopped capture-only backend without replaying its held run"
+        "checkpoint-pre-api-failure",
+        help=("record an already stopped capture-only or exact native host-init failure "
+              "without replaying its held run"),
     )
     capture_checkpoint.add_argument("--source-root", type=Path, required=True)
     capture_checkpoint.add_argument("--attempt", required=True)
