@@ -28,7 +28,7 @@ class GroupBudgetTests(unittest.TestCase):
         resources.apply_group_budget(document, {}, VM)
         backend, frontend = document["services"]["backend"], document["services"]["frontend"]
         self.assertEqual((backend["cpus"], backend["mem_limit"]), (8, 32 * GIB))
-        self.assertEqual((frontend["cpus"], frontend["mem_limit"]), (4, 12 * GIB))
+        self.assertEqual((frontend["cpus"], frontend["mem_limit"]), (4, 16 * GIB))
         self.assertLessEqual(3 * (backend["mem_limit"] + frontend["mem_limit"]), VM["MemTotal"])
         self.assertLessEqual(3 * (backend["cpus"] + frontend["cpus"]), VM["NCPU"])
         # Container quota, native profile and Cargo share one value.

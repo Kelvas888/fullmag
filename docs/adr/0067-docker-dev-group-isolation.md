@@ -1,7 +1,20 @@
 # ADR 0067 — niezależne grupy Docker DEV
 
-Status: decyzja użytkownika przyjęta 21.10.2026; implementacja etapami, kwalifikacja runtime w toku.
+Status: decyzja użytkownika przyjęta 21.10.2026; implementacja etapami.
 Data: 2026-10-21.
+
+Stan implementacji:
+
+| Punkt | Stan |
+|---|---|
+| 1. Ledger per grupa | **niezaimplementowany**; grupy DEV nadal współdzielą globalny `host-ledger-v1` (etap R2.9 audytu) |
+| 2. Statyczne budżety `FULLMAG_DEV_*` | zaimplementowane w launcherze |
+| 3. Automatyczny port | zaimplementowany w launcherze |
+| 4. Zasada zmian stanu DEV | obowiązuje dla nowych zmian; jedyny wyjątek to istniejący globalny ledger do czasu punktu 1 |
+
+Dopóki punkt 1 nie zostanie wdrożony, migracja polityki globalnego ledgera
+nadal wymaga skoordynowanego zatrzymania konsumentów `/host-ledger`
+(`--migrate-host-capacity`, ADR 0061).
 
 ## Kontekst
 
@@ -31,7 +44,7 @@ wirtualnej Docker oraz porty loopback frontendu.
    `FULLMAG_DEV_FRONTEND_MEMORY_GIB` (zmienna procesu, potem `.env` głównego
    checkoutu). Wartości domyślne wynikają z pojemności VM, tak aby zmieściły
    się trzy grupy: backend min(8, CPU/4) CPU i min(32, RAM/6) GiB, frontend
-   min(4, CPU/10) CPU i 8–12 GiB. Limity są górnymi granicami, nie
+   min(4, CPU/10) CPU i 8–16 GiB (dotychczasowe 16 GiB frontendu na dużym hoście). Limity są górnymi granicami, nie
    rezerwacjami: przeciążenie spowalnia grupę, nie zatrzymuje innych. Ta sama
    wartość backendu wyznacza kwotę kontenera, profil natywny
    (`FULLMAG_DOCKER_CPU_MILLIS`, `FULLMAG_DOCKER_MEMORY_BYTES`) oraz
@@ -56,9 +69,11 @@ wirtualnej Docker oraz porty loopback frontendu.
 
 ## Konsekwencje
 
-- Trzy grupy mogą jednocześnie budować i uruchamiać runy; restart, recreate
-  lub migracja jednej nie zatrzymuje pozostałych.
-- Grupy DEV nie korzystają z kontroli cgroup2 i deskryptora pojemności hosta.
+- Trzy grupy mogą jednocześnie budować i uruchamiać runy w swoich budżetach;
+  restart lub recreate jednej nie zatrzymuje pozostałych.
+- Po wdrożeniu punktu 1 także migracja jednej grupy nie zatrzymuje
+  pozostałych, a grupy DEV przestają korzystać z kontroli cgroup2
+  i deskryptora pojemności hosta.
 - Suma budżetów może przekroczyć VM przy niestandardowych wartościach `.env`;
   skutkiem jest spowolnienie lub OOM wewnątrz grupy, która przekroczyła swój
   limit, nie zatrzymanie innych.
@@ -71,3 +86,5 @@ wirtualnej Docker oraz porty loopback frontendu.
 Wymagany dowód runtime: trzy grupy z trzech worktree startują i kompilują
 równolegle, a restart jednej nie zmienia stanu pozostałych (`docker ps`, logi
 backendów). Do czasu tego dowodu implementacja ma status NOT VERIFIED.
+Punkt 1 wymaga osobnego dowodu: migracja polityki ledgera jednej grupy przy
+działających pozostałych grupach.

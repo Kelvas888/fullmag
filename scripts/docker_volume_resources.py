@@ -48,7 +48,7 @@ def default_group_budget(capacity):
         "FULLMAG_DEV_BACKEND_CPUS": max(2, min(8, cpus // 4)),
         "FULLMAG_DEV_BACKEND_MEMORY_GIB": max(8, min(32, memory_gib // 6)),
         "FULLMAG_DEV_FRONTEND_CPUS": max(2, min(4, cpus // 10)),
-        "FULLMAG_DEV_FRONTEND_MEMORY_GIB": max(8, min(12, memory_gib // 12)),
+        "FULLMAG_DEV_FRONTEND_MEMORY_GIB": max(8, min(16, memory_gib // 12)),
     }
 
 
