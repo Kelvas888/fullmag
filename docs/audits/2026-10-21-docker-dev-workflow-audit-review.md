@@ -1,11 +1,14 @@
 # Przegląd audytu Docker DEV — uproszczenie ścieżki uruchamiania
 
-Data: 21.10.2026. Aktualizacja: 02:00 CEST. Stan źródeł: master
-`8729dd0700b5992dac35b22f57f46d257d57cd9a`; ostatni wykonany build pochodzi
-z `6c5a9792f6046bfb7b7cff85dbea7252760c3ea2`.
+Data: 21.10.2026. Aktualizacja: po commicie budżetu H0. Stan źródeł: master
+`9eb42f41c964d3e3adcdd5e6c3430b29dd283a88`; ostatni wykonany build pochodzi
+z `73e275ce1de772ea306714574a1be374cc4449df`. H0 nie jest jeszcze zbudowane
+ani zastosowane do runtime. Poniższe starsze obserwacje zachowano chronologicznie;
+aktualna blokada jest opisana w sekcji „Uzupełnienie: rzeczywisty restart”.
 Przeczytano cały `2026-10-21-docker-dev-workflow-audit.md` i zweryfikowano
 bezpośrednio niżej wymienione mechanizmy. Bez testów. Nie powtarzano pełnego
-zliczania LOC, historii commitów ani inspekcji obcych grup Docker.
+zliczania LOC ani historii commitów. Bieżąca inspekcja Dockera objęła mastera
+oraz dwie grupy współdzielące ledger, bez zmiany ich procesów lub danych.
 
 ## Wniosek i schemat kontenerów
 
@@ -199,3 +202,74 @@ stałych usług. Usprawnienie capture i kluczy cache może przebiegać osobno;
 nie należy uzależniać zwykłego startu od nowych ręcznych pinów recovery.
 Szczegółowe surowe hashe: [dowód konfliktu quota](../reports/2026-10-20/mx3-host-quota-conflict-evidence.json).
 API, materializacja, mesh i widoczny render nadal **NOT VERIFIED**.
+
+
+### Rozdzielenie hosta i grupy — zakres istniejącego dowodu
+
+Analiza producentów nie wykazała obecnie dowodu pełnej pojemności hosta:
+`docker_host_ledger.sh` publikuje receipt storage, a `docker_worker_cgroup.py`
+zapisuje `outer_limits.cpu.max/memory.max` dokładnie **backendowego cgroup**.
+Ścieżka przechodzi przez `/proc/1/root`, lecz to nie zmienia zakresu pomiaru
+na root/VM. Nie wolno użyć tych wartości jako limitów wspólnego hosta.
+Rozszerzenie istniejącego krótkiego helpera o jawnie rozdzielone fakty
+host-scope i consumer-scope jest kandydatem; nie wymaga trzeciej stałej usługi.
+Przed implementacją trzeba przypiąć producenta, zakres, boot/daemon identity
+oraz konsumentów initializer i cyklicznego publikatora inventory.
+
+Marker ledgera hashuje całą politykę. Czytelnik wymaga jednocześnie zgodności
+markera z polityką przekazaną przez klienta i z dokumentem na dysku.
+Sama atomowa podmiana dokumentu nie jest migracją tego kontraktu; dwie
+oddzielne podmiany marker+document mają okno niespójności po awarii.
+Dlatego bezpieczna migracja wymaga jednego atomowego punktu publikacji
+oraz jawnej walidacji zachowanej historii, zamiast kolejnej wyjątkowej
+ścieżki restartu. To propozycja do dopracowania, **nie wdrożona decyzja**.
+
+
+## Doprecyzowany schemat i priorytety DEV
+
+Pozostają **dwie stałe usługi**. Proponowana zmiana granicy gotowości:
+API udostępnia authoring, stan startu i diagnostykę także wtedy, gdy native
+runtime jest niedostępny. Przydział pracy otwiera się dopiero po prawdziwym
+probe, budżecie i gotowości solvera. Nie zmienia to wymuszonego GPU ani
+żadnej z czterech realizacji FDM CPU/GPU i FEM CPU/GPU.
+
+Obecnie `entrypoint.py:478` wywołuje `ensure_configuration` przed komunikatem
+Starting API i `Popen` z linii 482. To bezpośrednie sprzężenie, które przy
+błędzie globalnej polityki pozbawia frontend również informacji o błędzie.
+Rozdzielenie wymaga przejrzenia API startup i native service-ensure,
+zachowania pojedynczego writera accepted-store oraz jawnego stanu admission;
+nie polega na samym przeniesieniu dwóch linii. To **propozycja**, bez zmiany
+publicznego API lub lifecycle w tej rundzie.
+
+```mermaid
+flowchart LR
+  Checkout[Readonly checkout] --> Frontend[frontend: Next.js i HMR]
+  subgraph Backend[backend: jeden kontener]
+    Build[Build przyrostowy] --> API[API i diagnostyka]
+    API --> Runtime[Procesy native FDM/FEM: jawna gotowość]
+  end
+  Checkout --> Build
+  Frontend -->|prywatne backend:8081| API
+  Build --> BuildVolumes[Named volumes: cień ext4, cache, pakiet]
+  API --> UserData[Storage użytkownika: sesje, wyniki, projekty]
+  Runtime --> HostLedger[Wspólny przydział hosta CPU/GPU]
+  BuildKit[BuildKit: przypięty obraz zależności] -.-> Build
+```
+
+Kolejność prac, z oddzielnymi kryteriami odbioru:
+
+| Priorytet | Zmiana | Odbiór |
+|---|---|---|
+| 1 | API i diagnostyka dostępne przy błędzie runtime; poprawny budżet grupy | UI pokazuje konkretną przyczynę, Compute pozostaje jawnie niedostępne; zatwierdzone 16 CPU / 128 GiB nie znikają w native factory |
+| 2 | Oddzielenie pojemności hosta od quota grupy; jawna migracja starej polityki | Zmiana limitu jednej grupy nie zmienia host identity, nie narusza historycznych proofów ani drugiej grupy |
+| 3 | Jedna kopia rzeczywistych wejść buildu na ext4; oddzielenie klucza backendu od docs/TSX | Zapis live checkoutu po przygotowaniu kopii nie przerywa buildu; raport identyfikuje rzeczywiście skompilowane bajty |
+| 4 | Jedno up/status/logs/down/rebuild z automatycznym odkrywaniem tożsamości | Operator nie przepisuje UUID/SHA; zatrzymanie obserwacji nie oznacza powtórzenia ani anulowania Solve |
+| 5 | Przyrostowe zależności frontendu i HMR; dopiero potem usuwanie zastąpionego kodu | Pomiar edit→API i edit→widoczny render; potwierdzone zachowanie wyników oraz cache |
+
+Nie wdrożono nowego protokołu migracji. Released rows nadal podlegają
+`reservation.validate(policy)` i weryfikacji proof CAS, więc ich zachowanie
+wymaga wersjonowanego powiązania historycznej polityki; samo pominięcie
+sumowania ich capacity nie daje swobody zmiany host/revision/topology.
+Aktualne pliki: `host_resource_ledger.rs:774`, `:5080`, `:5881`, `:6871`;
+registry host→root: `host_ledger_registry.rs:51`. Dokładna historia
+released/proof bytes pozostaje nienaruszona.
