@@ -392,3 +392,30 @@ wyniku NOT VERIFIED także dla ExitCode0 i jawnie odrzuca `succeeded`.
 Domyślnego timeoutu nie zmieniono. Powtórzenie rzeczywistego harnessu może
 użyć istniejącego parametru `--timeout 600`, ponieważ zmierzony przebieg
 trwał 282,637 s; limity pojedynczych operacji i bramki dowodu pozostają.
+
+
+## Odbiór Home i Workspace
+
+Zarządzana kontrola przeglądarkowa zakończyła się sukcesem z zachowanym
+wynikiem i terminalnym receiptem w control volume grupy. Potwierdziła Home,
+przejście do Workspace i z powrotem, komunikację z API, stabilny canvas DOM,
+niezerowy drawing buffer WebGL2 i zachowany kontekst. Kontrole kamery,
+układu i eksportu również przeszły. Browser używał software WebGL;
+ten wynik nie kwalifikuje CUDA ani wykonania symulacji. Nie wywołano Compute,
+nie anulowano istniejącego runu i nie ponowiono Solve.
+
+Wcześniejsza próba z utraconym stdout pozostaje NOT VERIFIED mimo exit code 0.
+Zamknięto ją kontrolowaną rekoncyliacją; poprawny dowód pochodzi z osobnego,
+ukończonego przebiegu z zachowanym wynikiem.
+
+Publiczne CI zaliczyło kontrole Control Room, Pythona, Windows storage i CPU
+FDM smoke. Audyt memory churn przeszedł. Kolejny audyt FEM topology upload
+wykrył, że licznik opisany jako pozycje obejmuje wszystkie ARRAY_BUFFER,
+w tym generowane per-part normal attributes. Nie dowodzi to wzrostu uploadu
+współdzielonych pozycji. Bramka pozostaje niezaliczona do rozdzielenia metryk,
+bez podnoszenia progów ani zmiany oświetlenia sceny.
+
+HMR po edycji Windows, restart bez zmian, nowa aktywacja skryptu, rzeczywiste
+CPU/GPU Solve, trwałość po restarcie, izolacja dwóch grup i końcowe CI/merge
+nadal wymagają odrębnych dowodów. Retencja pakietów pozostaje odłożona poza
+start API; samo umieszczenie ich w named volume nie ogranicza liczby kopii.
