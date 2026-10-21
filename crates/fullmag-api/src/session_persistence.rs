@@ -5,7 +5,7 @@ mod antenna_import;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -2139,6 +2139,170 @@ async fn current_session_id(state: &AppState) -> Result<String, ApiError> {
         .as_ref()
         .map(|s| s.session.session_id.clone())
         .ok_or_else(|| ApiError::not_found("no active workspace"))
+}
+
+const MAX_RETIREMENT_SCRIPT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Documents captured from the in-memory authoring/session projection for a
+/// terminal workspace retirement.  This deliberately does not read
+/// `SessionManifest::script_path`: the canonical source may have been removed
+/// after accepted reattach, while the SceneDocument remains authoritative.
+#[derive(Debug)]
+pub(crate) struct LiveRetirementDocuments {
+    pub documents: BTreeMap<String, Vec<u8>>,
+    pub script_available: bool,
+    pub ui_state_scope: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveRetirementWorkspaceMetadata<'a> {
+    schema: &'static str,
+    session: &'a crate::types::SessionManifest,
+    run: Option<&'a crate::types::RunManifest>,
+    runtime_status: &'a RuntimeStatusView,
+    scene_revision: Option<u64>,
+    state_version: u64,
+    mesh_revision: u64,
+    mesh_build_revision: u64,
+    region_realization_revisions: &'a fullmag_authoring::RegionRealizationRevisions,
+    artifacts: &'a [crate::types::ArtifactEntry],
+    accepted_terminal_field_generation:
+        Option<&'a crate::types::CurrentLiveFieldGeneration>,
+    terminal_field_generations: &'a BTreeMap<String, u64>,
+}
+
+/// Capture the current authoring projection without acquiring the transition
+/// lock. Callers that mutate current state must hold that lock around this
+/// helper and the later publication. A scene with incomplete physics remains a
+/// valid archive and simply has no generated `main.py`.
+pub(crate) async fn capture_live_retirement_documents(
+    state: &AppState,
+    snapshot: &SessionStateResponse,
+) -> Result<LiveRetirementDocuments, ApiError> {
+    let display_selection = state.current_display_selection.read().await.clone();
+    let display_presentation = state.current_display_presentation.read().await.clone();
+    let workspace_selection = state.current_workspace_selection.read().await.clone();
+    let workspace_ribbon = state.current_workspace_ribbon.read().await.clone();
+    let workspace_layout = state.current_workspace_layout.read().await.clone();
+
+    let mut documents = BTreeMap::new();
+    if let Some(scene) = snapshot.scene_document.as_ref() {
+        documents.insert(
+            "scene_document.json".to_string(),
+            serde_json::to_vec_pretty(scene)
+                .map_err(|error| ApiError::internal(format!("serializing scene document: {error}")))?,
+        );
+    }
+    if let Some(builder) = snapshot.builder_adapter.as_ref() {
+        documents.insert(
+            "script_builder.json".to_string(),
+            serde_json::to_vec_pretty(builder)
+                .map_err(|error| ApiError::internal(format!("serializing script builder: {error}")))?,
+        );
+    }
+
+    // These are backend-owned typed resources. A missing browser does not make
+    // CLI retirement impossible, and an empty object must never masquerade as
+    // a captured workspace state. Browser-local state remains outside this
+    // archive and is named explicitly by the manifest scope.
+    let ui_state = serde_json::json!({
+        "schema": "fullmag.backend-typed-workspace-state.v1",
+        "scope": "backend_typed_workspace",
+        "display_selection": display_selection,
+        "display_presentation": display_presentation,
+        "workspace_selection": workspace_selection,
+        "workspace_ribbon": workspace_ribbon,
+        "workspace_layout": workspace_layout,
+        "preview_config": snapshot.preview_config.clone(),
+    });
+    documents.insert(
+        "ui_state.json".to_string(),
+        serde_json::to_vec_pretty(&ui_state)
+            .map_err(|error| ApiError::internal(format!("serializing typed workspace state: {error}")))?,
+    );
+
+    // Keep immutable result/artifact references without copying scalar rows,
+    // field payloads, FEM meshes, or engine logs into every retirement.
+    let metadata = LiveRetirementWorkspaceMetadata {
+        schema: "fullmag.live-retirement-workspace-metadata.v1",
+        session: &snapshot.session,
+        run: snapshot.run.as_ref(),
+        runtime_status: &snapshot.runtime_status,
+        scene_revision: snapshot.scene_document.as_ref().map(|scene| scene.revision),
+        state_version: snapshot.state_version,
+        mesh_revision: snapshot.mesh_revision,
+        mesh_build_revision: snapshot.mesh_build_revision,
+        region_realization_revisions: &snapshot.region_realization_revisions,
+        artifacts: &snapshot.artifacts,
+        accepted_terminal_field_generation: snapshot.accepted_terminal_field_generation.as_ref(),
+        terminal_field_generations: &snapshot.terminal_field_generations,
+    };
+    documents.insert(
+        "workspace_metadata.json".to_string(),
+        serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| ApiError::internal(format!("serializing retirement metadata: {error}")))?,
+    );
+
+    let mut script_available = false;
+    if let Some(scene) = snapshot.scene_document.as_ref() {
+        let temp = tempfile::tempdir().map_err(|error| {
+            ApiError::internal(format!("creating private retirement render directory: {error}"))
+        })?;
+        let output = temp.path().join("main.py");
+        if crate::script::try_render_scene_document_for_persistence(
+            &state.repo_root,
+            temp.path(),
+            &output,
+            scene,
+        )?
+        .is_some() {
+            let script = read_bounded_generated_source(&output)?;
+            if script.is_empty() {
+                return Err(ApiError::internal("generated retirement source is empty"));
+            }
+            documents.insert("main.py".to_string(), script);
+            script_available = true;
+        }
+    }
+
+    Ok(LiveRetirementDocuments {
+        documents,
+        script_available,
+        ui_state_scope: "backend_typed_workspace",
+    })
+}
+
+fn read_bounded_generated_source(path: &Path) -> Result<Vec<u8>, ApiError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        ApiError::internal(format!("inspect generated retirement source: {error}"))
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_RETIREMENT_SCRIPT_BYTES as u64 {
+        return Err(ApiError::internal("generated retirement source is not a bounded regular file"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|error| {
+        ApiError::internal(format!("open generated retirement source: {error}"))
+    })?;
+    let opened = file.metadata().map_err(|error| {
+        ApiError::internal(format!("inspect generated retirement source handle: {error}"))
+    })?;
+    if !opened.is_file() || opened.len() > MAX_RETIREMENT_SCRIPT_BYTES as u64 {
+        return Err(ApiError::internal("generated retirement source handle changed"));
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_RETIREMENT_SCRIPT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ApiError::internal(format!("read generated retirement source: {error}")))?;
+    if bytes.len() > MAX_RETIREMENT_SCRIPT_BYTES {
+        return Err(ApiError::internal("generated retirement source exceeds its byte bound"));
+    }
+    Ok(bytes)
 }
 
 async fn collect_project_documents(

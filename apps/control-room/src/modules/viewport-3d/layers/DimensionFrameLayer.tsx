@@ -1,10 +1,12 @@
 "use client";
 
+import { Line } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
-import { useCallback, useEffect, useMemo, useRef, memo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, memo } from "react";
 import {
   BufferAttribute,
   BufferGeometry,
+  LessEqualDepth,
   Vector3,
   type Camera,
   type Sprite,
@@ -18,6 +20,7 @@ import type {
   Viewport3DCameraState,
 } from "../viewport3dStore";
 import type { Viewport3DColors } from "../viewport3dTypes";
+import { VIEWPORT_3D_HUD_LAYER } from "../viewport3dHudLayer";
 import { hudAxisColor, resolveHudColors } from "../orientation/hudColors";
 import {
   useHudTextTexture,
@@ -25,14 +28,25 @@ import {
   type HudTextStyle,
 } from "../orientation/hudText";
 import {
+  dimensionFrameBoundsFromProjectedCorners,
+  resolveDimensionFrameLabelVisibility,
+  type DimensionFrameLabelCandidate,
+  type DimensionFramePixelRect,
+  type DimensionFrameProjectedPoint,
+} from "./dimensionFrameLabelLayout";
+import {
   buildDimensionFrameModel,
   type DimensionFrameAnnotation,
   type DimensionFrameAxis,
+  type DimensionFrameCameraOrientation,
   type DimensionFrameDensity,
   type DimensionFrameLabel,
   type DimensionFrameMode,
   type DimensionFrameModel,
+  type DimensionFrameOriginMode,
   type DimensionFrameUnitMode,
+  resolveDimensionFrameOrientation,
+  resolveDimensionFrameOrientationWithHysteresis,
 } from "./dimensionFrameModel";
 import type { Viewport3DMaterialProfile } from "./viewport3DMaterialProfile";
 
@@ -43,17 +57,21 @@ interface DimensionFrameLayerProps {
   cameraState: Viewport3DCameraState;
   colors: Viewport3DColors;
   density: DimensionFrameDensity;
+  gridOpacity?: number;
   labelsVisible: boolean;
   majorLinesVisible: boolean;
   materialProfile: Viewport3DMaterialProfile;
   mode: DimensionFrameMode;
   minorLinesVisible: boolean;
+  originMode?: DimensionFrameOriginMode;
+  reservedHudRegions?: readonly DimensionFramePixelRect[];
   tracker: Viewport3DResourceTracker;
   unitMode: DimensionFrameUnitMode;
 }
 
 export interface DimensionFrameLayerColors {
   axis: Record<DimensionFrameAxis, string>;
+  axisLine: string;
   extent: string;
   grid: string;
   halo: string;
@@ -65,16 +83,34 @@ type TickSpacingProbes = Partial<
   Record<DimensionFrameAxis, [DimensionFrameLabel, DimensionFrameLabel]>
 >;
 
+interface DimensionFrameCameraFrameState {
+  cameraState: Viewport3DCameraState;
+  forward: Vector3;
+  position: Vector3;
+  up: Vector3;
+}
+
 const DIMENSION_FRAME_RENDER_ORDER = 4;
 const TICK_LABEL_FONT_PX = 11;
 const TITLE_LABEL_FONT_PX = 12;
-/** Below this on-screen frame diagonal the labels would only pile up. */
-const MIN_LABELLED_FRAME_PX = 90;
 /** Minimum on-screen spacing between neighbouring tick numbers. */
 const TICK_LABEL_MIN_SPACING_PX = 34;
 /** Below this projected length the outward direction is seen end-on. */
 const DEGENERATE_OUTWARD = 0.2;
 const ANCHOR_THRESHOLD = 0.35;
+
+function createDimensionFrameCameraFrameState(): DimensionFrameCameraFrameState {
+  return {
+    cameraState: {
+      position: [0, 0, 0],
+      target: [0, 0, 1],
+      up: [0, 0, 1],
+    },
+    forward: new Vector3(),
+    position: new Vector3(),
+    up: new Vector3(),
+  };
+}
 
 export const DimensionFrameLayer = memo(function DimensionFrameLayer({
   annotation = "ticks",
@@ -83,11 +119,14 @@ export const DimensionFrameLayer = memo(function DimensionFrameLayer({
   cameraState,
   colors,
   density,
+  gridOpacity = 1,
   labelsVisible,
   majorLinesVisible,
   materialProfile,
   mode,
   minorLinesVisible,
+  originMode = "frame-center",
+  reservedHudRegions = [],
   tracker,
   unitMode,
 }: DimensionFrameLayerProps) {
@@ -96,29 +135,77 @@ export const DimensionFrameLayer = memo(function DimensionFrameLayer({
     () => resolveDimensionFrameLayerColors(colors),
     [colors],
   );
+  const [cameraOrientation, setCameraOrientation] = useState(() =>
+    resolveDimensionFrameOrientation(bounds, cameraState),
+  );
+  const cameraOrientationRef = useRef<DimensionFrameCameraOrientation | null>(null);
+  const cameraFrameStateRef = useRef<DimensionFrameCameraFrameState | null>(null);
+
+  useFrame(({ camera }) => {
+    if (mode === "off") return;
+    const frameState =
+      cameraFrameStateRef.current ?? createDimensionFrameCameraFrameState();
+    cameraFrameStateRef.current = frameState;
+    camera.updateWorldMatrix(true, false);
+    camera.getWorldPosition(frameState.position);
+    camera.getWorldDirection(frameState.forward);
+    frameState.up.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+    frameState.cameraState.position[0] = frameState.position.x;
+    frameState.cameraState.position[1] = frameState.position.y;
+    frameState.cameraState.position[2] = frameState.position.z;
+    frameState.cameraState.target[0] = frameState.position.x + frameState.forward.x;
+    frameState.cameraState.target[1] = frameState.position.y + frameState.forward.y;
+    frameState.cameraState.target[2] = frameState.position.z + frameState.forward.z;
+    frameState.cameraState.up[0] = frameState.up.x;
+    frameState.cameraState.up[1] = frameState.up.y;
+    frameState.cameraState.up[2] = frameState.up.z;
+
+    const previous = cameraOrientationRef.current ?? cameraOrientation;
+    const next = resolveDimensionFrameOrientationWithHysteresis(
+      bounds,
+      frameState.cameraState,
+      previous,
+    );
+    if (!cameraOrientationRef.current) cameraOrientationRef.current = previous;
+    if (!sameDimensionFrameOrientation(previous, next)) {
+      cameraOrientationRef.current = next;
+      setCameraOrientation(next);
+      invalidate();
+    }
+  });
+
   const model = useMemo(
     () =>
       buildDimensionFrameModel({
         annotation,
         bounds,
+        cameraOrientation,
         cameraProjection,
-        cameraState,
         density,
         labelsVisible,
         mode,
+        originMode,
         unitMode,
       }),
     [
       annotation,
       bounds,
       cameraProjection,
-      cameraState,
       density,
       labelsVisible,
       mode,
+      originMode,
       unitMode,
+      cameraOrientation,
     ],
   );
+  const axisPoints = useMemo(() => {
+    const points: [number, number, number][] = [];
+    for (let i = 0; i < model.axisLines.length; i += 3) {
+      points.push([model.axisLines[i], model.axisLines[i + 1], model.axisLines[i + 2]]);
+    }
+    return points;
+  }, [model.axisLines]);
   const minorGeometry = useTrackedLineGeometry(
     tracker,
     minorLinesVisible ? model.minorLines : null,
@@ -130,6 +217,7 @@ export const DimensionFrameLayer = memo(function DimensionFrameLayer({
   const majorTickGeometry = useTrackedLineGeometry(tracker, model.majorTickLines);
   const minorTickGeometry = useTrackedLineGeometry(tracker, model.minorTickLines);
   const extentGeometry = useTrackedLineGeometry(tracker, model.extentLines);
+  const resolvedGridOpacity = clampGridContrast(gridOpacity);
 
   useEffect(() => {
     tracker.recordDirtyFrame("dimension-frame");
@@ -146,13 +234,13 @@ export const DimensionFrameLayer = memo(function DimensionFrameLayer({
       <FrameLines
         color={layerColors.grid}
         geometry={minorGeometry}
-        opacity={frame.minorOpacity}
+        opacity={frame.minorOpacity * resolvedGridOpacity}
         renderOrder={DIMENSION_FRAME_RENDER_ORDER}
       />
       <FrameLines
         color={layerColors.grid}
         geometry={majorGeometry}
-        opacity={frame.majorOpacity}
+        opacity={frame.majorOpacity * resolvedGridOpacity}
         renderOrder={DIMENSION_FRAME_RENDER_ORDER + 1}
       />
       <FrameLines
@@ -160,12 +248,14 @@ export const DimensionFrameLayer = memo(function DimensionFrameLayer({
         geometry={minorTickGeometry}
         opacity={frame.tickOpacity}
         renderOrder={DIMENSION_FRAME_RENDER_ORDER + 2}
+        screenLengthPx={4}
       />
       <FrameLines
         color={layerColors.tick}
         geometry={majorTickGeometry}
         opacity={frame.labelOpacity}
         renderOrder={DIMENSION_FRAME_RENDER_ORDER + 2}
+        screenLengthPx={7}
       />
       <FrameLines
         color={layerColors.extent}
@@ -173,12 +263,32 @@ export const DimensionFrameLayer = memo(function DimensionFrameLayer({
         opacity={frame.labelOpacity}
         renderOrder={DIMENSION_FRAME_RENDER_ORDER + 2}
       />
+      {/* Screen-width baselines retain SI endpoints; Drei owns their geometry/material cleanup. */}
+      {axisPoints.length > 0 ? (
+        <Line
+          color={layerColors.axisLine}
+          depthFunc={LessEqualDepth}
+          depthTest
+          depthWrite={false}
+          lineWidth={2}
+          opacity={frame.labelOpacity}
+          points={axisPoints}
+          polygonOffset
+          polygonOffsetFactor={-1}
+          polygonOffsetUnits={-1}
+          renderOrder={DIMENSION_FRAME_RENDER_ORDER + 3}
+          segments
+          toneMapped={false}
+          transparent
+        />
+      ) : null}
       {model.labels.length > 0 ? (
         <DimensionFrameLabels
           colors={layerColors}
           extent={model.extent}
           labels={model.labels}
           opacity={frame.labelOpacity}
+          reservedHudRegions={reservedHudRegions}
         />
       ) : null}
     </group>
@@ -190,24 +300,148 @@ function FrameLines({
   geometry,
   opacity,
   renderOrder,
+  screenLengthPx,
 }: {
   color: string;
   geometry: BufferGeometry | null;
   opacity: number;
   renderOrder: number;
+  screenLengthPx?: number;
 }) {
   if (!geometry) return null;
   return (
-    <lineSegments geometry={geometry} renderOrder={renderOrder}>
+    <lineSegments
+      frustumCulled={screenLengthPx === undefined}
+      geometry={geometry}
+      renderOrder={renderOrder}
+    >
       <lineBasicMaterial
         color={color}
         depthTest
         depthWrite={false}
+        depthFunc={LessEqualDepth}
         opacity={opacity}
         toneMapped={false}
         transparent
+        onBeforeCompile={(shader) => {
+          // Bias only projected depth; measured coordinates and tick values stay unchanged.
+          shader.vertexShader = shader.vertexShader.replace(
+            "#include <project_vertex>",
+            "#include <project_vertex>\ngl_Position.z -= 0.000002 * gl_Position.w;",
+          );
+        }}
+        customProgramCacheKey={() => "dimension-frame-depth-bias-v1"}
       />
+      {screenLengthPx === undefined ? null : (
+        <ScreenBoundTickLengths geometry={geometry} pixelLength={screenLengthPx} />
+      )}
     </lineSegments>
+  );
+}
+
+/** Updates only tick endpoints, keeping their length stable in CSS pixels. */
+function ScreenBoundTickLengths({
+  geometry,
+  pixelLength,
+}: {
+  geometry: BufferGeometry;
+  pixelLength: number;
+}) {
+  const basePositions = useMemo(() => {
+    const attribute = geometry.getAttribute("position");
+    return new Float32Array(attribute.array as Float32Array);
+  }, [geometry]);
+  const frameStateRef = useRef<ScreenBoundTickFrameState | null>(null);
+
+  useFrame(({ camera, size }) => {
+    const frameState =
+      frameStateRef.current ?? createScreenBoundTickFrameState();
+    frameStateRef.current = frameState;
+    camera.updateMatrixWorld();
+    let changed =
+      !frameState.hasPreviousCameraMatrices || frameState.lastBasePositions !== basePositions;
+    frameState.lastBasePositions = basePositions;
+    const cameraMatrix = camera.matrixWorld.elements;
+    const projectionMatrix = camera.projectionMatrix.elements;
+    for (let index = 0; index < 16; index += 1) {
+      if (
+        frameState.previousCameraMatrices[index] !== cameraMatrix[index] ||
+        frameState.previousCameraMatrices[index + 16] !== projectionMatrix[index]
+      ) {
+        changed = true;
+      }
+      frameState.previousCameraMatrices[index] = cameraMatrix[index] ?? 0;
+      frameState.previousCameraMatrices[index + 16] = projectionMatrix[index] ?? 0;
+    }
+    if (frameState.previousCameraMatrices[32] !== size.height) changed = true;
+    frameState.previousCameraMatrices[32] = size.height;
+    frameState.hasPreviousCameraMatrices = true;
+    if (!changed || size.height <= 0) return;
+
+    camera.getWorldDirection(frameState.forward);
+    const positions = geometry.getAttribute("position");
+    for (let vertex = 0; vertex + 1 < positions.count; vertex += 2) {
+      const index = vertex * 3;
+      const endIndex = (vertex + 1) * 3;
+      const startX = basePositions[index] ?? 0;
+      const startY = basePositions[index + 1] ?? 0;
+      const startZ = basePositions[index + 2] ?? 0;
+      frameState.start.set(startX, startY, startZ);
+      frameState.direction
+        .set(
+          (basePositions[endIndex] ?? startX) - startX,
+          (basePositions[endIndex + 1] ?? startY) - startY,
+          (basePositions[endIndex + 2] ?? startZ) - startZ,
+        )
+        .normalize();
+      const worldLength =
+        worldPerPixelAt(camera, frameState.start, frameState.forward, size.height) * pixelLength;
+      positions.setXYZ(
+        vertex + 1,
+        startX + frameState.direction.x * worldLength,
+        startY + frameState.direction.y * worldLength,
+        startZ + frameState.direction.z * worldLength,
+      );
+    }
+    positions.needsUpdate = true;
+  });
+
+  return null;
+}
+
+interface ScreenBoundTickFrameState {
+  direction: Vector3;
+  forward: Vector3;
+  hasPreviousCameraMatrices: boolean;
+  lastBasePositions: Float32Array | null;
+  previousCameraMatrices: Float64Array;
+  start: Vector3;
+}
+
+function createScreenBoundTickFrameState(): ScreenBoundTickFrameState {
+  return {
+    direction: new Vector3(),
+    forward: new Vector3(),
+    hasPreviousCameraMatrices: false,
+    lastBasePositions: null,
+    previousCameraMatrices: new Float64Array(33),
+    start: new Vector3(),
+  };
+}
+
+function clampGridContrast(value: number): number {
+  return Number.isFinite(value) ? Math.min(2, Math.max(0, value)) : 1;
+}
+
+function sameDimensionFrameOrientation(
+  left: DimensionFrameCameraOrientation,
+  right: DimensionFrameCameraOrientation,
+): boolean {
+  return (
+    left.xFacing === right.xFacing &&
+    left.yFacing === right.yFacing &&
+    left.zCornerX === right.zCornerX &&
+    left.zCornerY === right.zCornerY
   );
 }
 
@@ -261,6 +495,7 @@ export function resolveDimensionFrameLayerColors(
       y: hudAxisColor(hud, "y"),
       z: hudAxisColor(hud, "z"),
     },
+    axisLine: hud.label,
     extent: hud.label,
     grid: hud.grid,
     halo: hud.halo,
@@ -277,7 +512,7 @@ export function dimensionFrameLabelRuns(
   const axisColor = colors.axis[label.axis];
   if (label.kind === "tick") {
     return {
-      runs: [{ color: colors.tick, text: label.text }],
+      runs: [{ color: colors.label, text: label.text, weight: 700 }],
       style: { font: "mono", fontPx: TICK_LABEL_FONT_PX, halo: colors.halo },
     };
   }
@@ -312,13 +547,37 @@ export function dimensionFrameLabelRuns(
 }
 
 interface LabelFrameState {
+  compact: boolean;
+  depthPoint: Vector3;
+  frameCorners: Vector3[];
   forward: Vector3;
+  projected: Vector3;
+  projectedFrameCorners: DimensionFrameProjectedPoint[];
   thinning: Record<DimensionFrameAxis, number>;
   probeA: Vector3;
   probeB: Vector3;
   right: Vector3;
   up: Vector3;
+  visibleKeys: Set<string>;
   world: Vector3;
+}
+
+function createLabelFrameState(): LabelFrameState {
+  return {
+    compact: false,
+    depthPoint: new Vector3(),
+    frameCorners: Array.from({ length: 8 }, () => new Vector3()),
+    forward: new Vector3(),
+    projected: new Vector3(),
+    projectedFrameCorners: Array.from({ length: 8 }, () => ({ x: 0, y: 0, z: 2 })),
+    thinning: { x: 1, y: 1, z: 1 },
+    probeA: new Vector3(),
+    probeB: new Vector3(),
+    right: new Vector3(),
+    up: new Vector3(),
+    visibleKeys: new Set<string>(),
+    world: new Vector3(),
+  };
 }
 
 /**
@@ -331,55 +590,74 @@ function DimensionFrameLabels({
   extent,
   labels,
   opacity,
+  reservedHudRegions,
 }: {
   colors: DimensionFrameLayerColors;
   extent: DimensionFrameModel["extent"];
   labels: DimensionFrameLabel[];
   opacity: number;
+  reservedHudRegions: readonly DimensionFramePixelRect[];
 }) {
-  const spritesRef = useRef(new Map<string, Sprite>());
-  const frameState = useMemo<LabelFrameState>(
-    () => ({
-      forward: new Vector3(),
-      thinning: { x: 1, y: 1, z: 1 },
-      probeA: new Vector3(),
-      probeB: new Vector3(),
-      right: new Vector3(),
-      up: new Vector3(),
-      world: new Vector3(),
-    }),
-    [],
-  );
+  const spritesRef = useRef<Map<string, Sprite> | null>(null);
+  const frameStateRef = useRef<LabelFrameState | null>(null);
   const spacingProbes = useMemo(() => tickSpacingProbes(labels), [labels]);
   const register = useCallback((key: string, sprite: Sprite | null) => {
-    if (sprite) spritesRef.current.set(key, sprite);
-    else spritesRef.current.delete(key);
+    const sprites = spritesRef.current ?? new Map<string, Sprite>();
+    spritesRef.current = sprites;
+    if (sprite) {
+      sprite.layers.set(VIEWPORT_3D_HUD_LAYER);
+      sprites.set(key, sprite);
+    } else {
+      sprites.delete(key);
+    }
   }, []);
 
   useFrame(({ camera, size }) => {
-    const { forward, right, up, world } = frameState;
+    const sprites = spritesRef.current;
+    if (!sprites) return;
+    const frameState = frameStateRef.current ?? createLabelFrameState();
+    frameStateRef.current = frameState;
+    const { depthPoint, forward, projected, right, up, world } = frameState;
     camera.updateMatrixWorld();
     right.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
     up.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
     forward.setFromMatrixColumn(camera.matrixWorld, 2).normalize().negate();
-    frameState.probeA.set(...extent[0]).project(camera);
-    frameState.probeB.set(...extent[1]).project(camera);
-    const framePx = Math.hypot(
-      ((frameState.probeA.x - frameState.probeB.x) * size.width) / 2,
-      ((frameState.probeA.y - frameState.probeB.y) * size.height) / 2,
+    const [min, max] = extent;
+    for (let index = 0; index < frameState.frameCorners.length; index += 1) {
+      const corner = frameState.frameCorners[index];
+      const projectedCorner = frameState.projectedFrameCorners[index];
+      if (!corner || !projectedCorner) continue;
+      corner
+        .set(
+          index & 1 ? max[0] : min[0],
+          index & 2 ? max[1] : min[1],
+          index & 4 ? max[2] : min[2],
+        )
+        .project(camera);
+      projectedCorner.x = corner.x;
+      projectedCorner.y = corner.y;
+      projectedCorner.z = corner.z;
+    }
+    const frameBounds = dimensionFrameBoundsFromProjectedCorners(
+      frameState.projectedFrameCorners,
+      size,
     );
-    const legible = framePx >= MIN_LABELLED_FRAME_PX;
+    const frameSpan = frameBounds
+      ? Math.max(
+          frameBounds.right - frameBounds.left,
+          frameBounds.bottom - frameBounds.top,
+        )
+      : 0;
+    // The wider exit threshold keeps compact mode stable during slow orbits.
+    frameState.compact = frameState.compact
+      ? frameSpan < 96
+      : frameSpan < 84;
     const thinning = resolveTickThinning(spacingProbes, camera, size, frameState);
+    const candidates: DimensionFrameLabelCandidate[] = [];
 
     for (const label of labels) {
-      const sprite = spritesRef.current.get(label.key);
+      const sprite = sprites.get(label.key);
       if (!sprite) continue;
-      sprite.visible = legible;
-      if (!legible) continue;
-      if (label.kind === "tick" && label.tickIndex !== undefined) {
-        sprite.visible = label.tickIndex % thinning[label.axis] === 0;
-        if (!sprite.visible) continue;
-      }
       world.set(label.outward[0], label.outward[1], label.outward[2]);
       let dx = world.dot(right);
       let dy = world.dot(up);
@@ -407,7 +685,56 @@ function DimensionFrameLabels({
           1,
         );
       }
+      if (!pixelSize || size.width <= 0 || size.height <= 0) continue;
+
+      projected.copy(sprite.position).project(camera);
+      depthPoint.copy(sprite.position).sub(camera.position);
+      const cameraDepth = depthPoint.dot(forward);
+      if (
+        cameraDepth <= 0 ||
+        projected.z < -1 ||
+        projected.z > 1 ||
+        !Number.isFinite(projected.x) ||
+        !Number.isFinite(projected.y)
+      ) {
+        continue;
+      }
+      const screenX = ((projected.x + 1) / 2) * size.width;
+      const screenY = ((1 - projected.y) / 2) * size.height;
+      const anchorX = anchorFor(dx);
+      const anchorY = anchorFor(dy);
+      const left = screenX - anchorX * pixelSize[0];
+      const top = screenY - (1 - anchorY) * pixelSize[1];
+      const bounds: DimensionFramePixelRect = {
+        bottom: top + pixelSize[1],
+        left,
+        right: left + pixelSize[0],
+        top,
+      };
+      candidates.push({
+        axis: label.axis,
+        bounds,
+        key: label.key,
+        kind: label.kind,
+        tickIndex: label.tickIndex,
+        tickStride: thinning[label.axis],
+      });
     }
+
+    const visibleKeys = resolveDimensionFrameLabelVisibility(
+      candidates,
+      size,
+      frameState.visibleKeys,
+      frameState.compact,
+      reservedHudRegions,
+    );
+    for (const [key, sprite] of sprites) {
+      // Sprite visibility is a Three.js scene mutation owned by this frame hook.
+      // eslint-disable-next-line react-hooks/immutability -- imperative Three.js interop in useFrame
+      sprite.visible = visibleKeys.has(key);
+    }
+    frameState.visibleKeys.clear();
+    for (const key of visibleKeys) frameState.visibleKeys.add(key);
   });
 
   return (
@@ -496,10 +823,22 @@ function tickSpacingProbes(labels: DimensionFrameLabel[]): TickSpacingProbes {
 }
 
 /** Shows every 1st, 2nd or 5th number so neighbours stay legible. */
-export function tickThinningForSpacing(spacingPx: number): number {
-  if (spacingPx >= TICK_LABEL_MIN_SPACING_PX) return 1;
-  if (spacingPx >= TICK_LABEL_MIN_SPACING_PX / 2) return 2;
-  return 5;
+export function tickThinningForSpacing(spacingPx: number, previous?: number): number {
+  if (previous === undefined) {
+    if (spacingPx >= TICK_LABEL_MIN_SPACING_PX) return 1;
+    if (spacingPx >= TICK_LABEL_MIN_SPACING_PX / 2) return 2;
+    return 5;
+  }
+  if (previous === 1) {
+    if (spacingPx < 15) return 5;
+    return spacingPx < TICK_LABEL_MIN_SPACING_PX - 4 ? 2 : 1;
+  }
+  if (previous === 2) {
+    if (spacingPx >= TICK_LABEL_MIN_SPACING_PX + 5) return 1;
+    return spacingPx < 15 ? 5 : 2;
+  }
+  if (spacingPx >= TICK_LABEL_MIN_SPACING_PX + 5) return 1;
+  return spacingPx >= TICK_LABEL_MIN_SPACING_PX / 2 + 3 ? 2 : 5;
 }
 
 const FRAME_AXES: readonly DimensionFrameAxis[] = ["x", "y", "z"];
@@ -512,9 +851,11 @@ function resolveTickThinning(
 ): Record<DimensionFrameAxis, number> {
   const thinning = state.thinning;
   for (const axis of FRAME_AXES) {
-    thinning[axis] = 1;
     const probe = probes[axis];
-    if (!probe) continue;
+    if (!probe) {
+      thinning[axis] = 1;
+      continue;
+    }
     state.probeA.set(...probe[0].position).project(camera);
     state.probeB.set(...probe[1].position).project(camera);
     thinning[axis] = tickThinningForSpacing(
@@ -522,6 +863,7 @@ function resolveTickThinning(
         ((state.probeA.x - state.probeB.x) * size.width) / 2,
         ((state.probeA.y - state.probeB.y) * size.height) / 2,
       ),
+      thinning[axis],
     );
   }
   return thinning;

@@ -1,65 +1,50 @@
-# Domknięcie etapów P1, P3, P3a i P5
+# Najbliższe bramki domknięcia po reaudytowaniu mastera
 
-Checkpoint 02.10.2026. Celem jest pełny odbiór istniejących etapów, bez
-przenoszenia brakujących wymagań do innego etapu ani podnoszenia procentów
-na podstawie samego źródłowego przyrostu.
+Aktualizacja: **20.10.2026**, baza
+`42d92610312871d591db16a5b60a8f7a6d6339b5`.
+[Stan kodu i testów](06-status-realizacji.md), [plan zakresu](03-plan-refaktoryzacji.md).
+[Dawny checkpoint 02.10](07-domkniecie-historyczne-2026-10-02.md) jest historyczny.
+Nie obowiązują jego bieżące porty, stan runnera ani opis fullscreen/inert.
 
-| Etap | Najbliższy wymagany odbiór | Stan bieżący |
-|---|---|---|
-| P1 | Fizyczny Open/Save/Close w Tauri, recovery po awarii oraz startup bez blokowania edytora | Native UI niedostępne w tym hoście; historyczne browser/CLI/Python receipts zachowane. Modal nadal blokuje przygotowanie. |
-| P3 | Procesowy publiczny `run-json`, pełny accepted flow FEM i transport cross-host | Produkcyjny build 197 zgłoszony z dokładnego commita; odbiór runtime otwarty. |
-| P3a | Stale-scope runtime, przełączenia A→B, ownerzy adapterów zgodności | Dodana bramka ośmiu operacji workspace w prywatnym smoke API; regresje skryptu PASS, runtime NOT VERIFIED. |
-| P5 | Accepted state/checkpoint/steering dla wymaganych adapterów i realizacji | Proste FDM mają wcześniejsze dowody; FEM, coupled/Frozen Spins, ogólne batch quantities oraz wymagane rekwalifikacje pozostają otwarte. |
+## 1. Kolejność odbioru
 
-Wskaźniki 98/94/90/99% są wcześniejszymi szacunkami implementacji. Nie są
-odsetkiem wykonanych bramek ani wskazaniem małego kosztu pozostałej pracy.
-Żaden z tych etapów nie został w tym checkpointcie odebrany w całości.
+| Priorytet / pakiet | Co wykorzystujemy | Konkretne domknięcie | Dowód wymagany do zaliczenia |
+|---|---|---|---|
+| 1 — P0-A/P3a | Inventory i istniejące context fences | Przejrzeć różnicę starego 304-elementowego zakresu i obecnych 371 operacji; owner, request context, klient, cache/decode, publication i removal gate aliasu | Wiersze aktualnej macierzy mają przypięty source fingerprint i wynik review; odrębne stale-scope runtime A→B |
+| 2 — M1/P1/P2 | ProjectApplication, persistence API, project controller i obecne panele | Start bez solve, niekompletna geometria/region/materiał, Save/Close/Open, zachowane dane i szkice; wyraźnie oddzielić dokument od flow tworzącego RuntimeSession | Powtarzalny realny browser/API receipt na przypiętym pakiecie; monitor niejawnych solve/mutacji; identity i byte/semantic roundtrip |
+| 3 — P3/P5 | Accepted workers, coordinator, snapshoty i lease | Idempotentny Submit, utrata ACK, cancel/retry/restart, edycja draftu przy przypiętym runie, odrzucenie stale worker publication | Terminalny journal/receipt, identyczne wejścia runu, brak podwójnego solve, potwierdzony owner exit/release; per wymagany lane |
+| 4 — P4 | Preparation receipts, native preparer, ostatni poprawny artefakt | Automatyczny producer flow, zmiana draftu podczas przygotowania, fail/retry, stale receipt rejection i zachowanie edytora | Pinned scene/run/mesh/space identity, quality, last-good i browser z żywym WebGL; mesh success nie zastępuje solve |
+| 5 — P6 | Materialized dataset read/slice i pinned viewport | Rzeczywisty archive reopen, history/live A→B, integralność, ograniczony rozmiar odczytu i brak mutacji Live | Native/API/archive oraz browser receipt, budżet pamięci i exact source identity |
+| 6 — P7 | Durable independent batches | Przyjęcie, materializacja dzieci, deterministyczne IDs/seedy, retry/cancel i backlog dla wspieranej strategii | Process E2E przypięty do batch/child RunIds; pozostałe strategie jawnie niezaliczone |
+| Równolegle — B/P8 | Obecni właściciele kodu i grupy Compose | ABI/ownership/parity per lane; osobno clean install, upgrade i rollback produktu Windows oraz wspieranego Linux | Właściwe receipts runtime/science/release. Docker DEV nie zalicza samodzielnego Windows |
 
-## Bramka P3a workspace
+## 2. Precyzyjny zakres M1 i powiązanego authoringu
 
-`scripts/verify_project_api_runtime.py` w istniejącej ścieżce
-`--include-websocket` po utworzeniu prywatnej pustej sesji sprawdza
-`GET/PUT` selection, active-node, ribbon i layout. Scope zachowuje session ID
-i scientific epoch, ale zmienia request epoch. Każdy stale request musi
-zwrócić 409 z `code=conflict` i `message=request_context_stale` zgodnie
-z bieżącym serializerem `ApiError`, a ponowny odczyt aktualnym scope musi zachować cały zasób,
-włącznie z rewizją. Helper jest podpięty do receiptu `workspace_scope`.
-Nie dodano sztucznego klienta produkcyjnego ani nowego endpointu.
+1. Zapisać source SHA, źródła pakietu, target, wersje i profil storage.
+2. Uruchomić workspace i odróżnić dokument bez sesji od pustej symulacji.
+3. Utworzyć niekompletny model; jawnie zapisać, czy flow utworzył RuntimeSession.
+4. Dodać geometrię/region i dane materiałowe w zakresie dostępnego authoringu.
+5. Pozostawić niepoprawny szkic; zweryfikować jego zachowanie bez publikacji złego IR.
+6. Save/Close/Open: porównać tożsamość i semantykę modelu, nie tylko istnienie pliku.
+7. Potwierdzić brak niejawnego solve. Utworzenie sesji samo w sobie nie oznacza solve.
+8. Odrębnie odebrać failure/recovery i fizyczny desktop, jeśli wymagane przez target.
 
-Lekkie regresje sterownika: **11/11 pytest PASS**, bez kompilacji Rust/unit
-tests. Przypadki negatywne obejmują zaakceptowane stale request, zmienioną
-rewizję i brak epoch. Pełny managed smoke wymaga osobnego wykonania;
-wynik helpera testowego nie jest dowodem HTTP działającej aplikacji.
+Projekt bez RuntimeSession ma obecnie zakres Saved Results/read-only według
+ADR 0039. Brak edytora w tej ścieżce trzeba naprawić jako zadanie
+authoringu, jeżeli jest wymagany przez odbierany scenariusz; nie zaliczać go
+samym testem transportu archiwum i nie tworzyć ukrytej sesji dla obejścia testu.
+Pakiety P1/P2 zachowują granice z planu 03; ta sekwencja łączy ich odbiór
+użytkowy, a nie przenosi wszystkich zadań P2 do P1.
 
-## Build produkcyjny
+## 3. Zasady wykonania
 
-Build **197**, job `4275d899553b40ddb5b4fcf1a11caf2a`, profil
-`fem-cpu-release`, źródło commit
-`5d91ed2aa6337c2001abf2a208b0b6586125a3a7`, capture
-`d477870c825a487dbe4946ace286f15d`, source digest
-`1e05bb1ce17d4dbb9701267b410a0ee60e8918c394e09c89617d0d97970d0d50`.
-Wynik końcowy: `succeeded`, exit 0, 119 zweryfikowanych artefaktów.
-Build nie zawiera późniejszej poprawki skryptu scope.
-Aktualny build/browser receipt: [P1 startup](p1/10-browser-empty-startup.md).
+W tej aktualizacji wykonano dokumentację, nie powyższe bramki. Nie uruchamiać
+ich zbiorczo bez ustalenia źródeł, właściciela zasobów i zgodnej recepty.
+Codzienny DEV korzysta z grupy Compose wybranego checkoutu; nie używać starego
+runnera/natywnego launchera jako fallbacku. CI/release/nauka mają osobne
+zarządzane trasy. Aktualne ograniczenia testów i udzielone wyjątki sprawdzić
+w AGENTS i poleceniach użytkownika.
 
-Pierwsza próba profilu `fdm-cpu-release` zakończyła się przed zgłoszeniem
-jobu: brak definicji profilu w konfiguracji klienta (`KeyError`). Nazwa
-dopuszczona przez koordynator nie dowodzi kompletnej konfiguracji. Dostępny
-pakiet FEM CPU służy pozyskaniu produkcyjnych binariów; nie zastępuje
-kwalifikacji FDM ani GPU. Nie zmieniono konfiguracji operatora.
-
-## Uruchomienie i pusty problem
-
-Kod udostępnia `Create simulation → New Problem` dla pustego FDM/FEM oraz
-niezależny `New project`. Historyczne browser receipts dowodzą New/Open/
-Save/Close bez solvera. `preserveMountedWorkspace` zachowuje zamontowany
-workspace po pierwszym przygotowaniu, lecz `SimulationStartupOverlayView`
-nadal jest pełnoekranowym modalem, a `WorkspaceDockLayout` stosuje `inert`.
-Zachowanie mountu nie oznacza swobodnego używania edytora podczas przygotowania.
-
-Po uruchomieniu gotowego pakietu UI działa na `http://localhost:3104/workspace`.
-Pusty start i FDM przeszły live smoke, FEM działa po reloadzie. Wykryto
-regresję zastąpienia sesji FDM przez FEM bez reloadu: Checking for sessions.
-Nie zgłaszamy pełnej naprawy modalu podczas długiego meshingu ani startupu Tauri.
-
-Aktualizacja startupu 02.10.2026: ACK scope i invalidacja replacement naprawione w źródłach; nowy build/browser NOT VERIFIED. Checkpointy BLOCKED: symlink w pierwotnym launcherze, a po jego naprawie nieobsługiwany filesystem Desktop 9p. Runner ma poniżej 8 GiB wolnego storage i wykrywa istniejący runtime. Sesja użytkownika na 3104 zachowana. Szczegóły: [raport startupu](p1/10-browser-empty-startup.md).
+Wynik nieznany oznacza reconciliation zachowanego attemptu i receiptów,
+nie ponowne Submit/Solve. Nie zatrzymywać obcego runtime, nie kasować cache,
+sesji ani wyników jako sposobu przejścia bramki.

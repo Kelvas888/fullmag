@@ -1,6 +1,15 @@
 import type { MeshBasicMaterialParameters } from "three";
 
+import {
+  DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES,
+  type Viewport3DAppearancePreferences,
+} from "../viewport3dAppearancePreferences";
 import type { Viewport3DVisualProfile } from "../viewport3dVisualProfile";
+
+type Viewport3DMaterialAppearance = Pick<
+  Viewport3DAppearancePreferences,
+  "lightingMode"
+>;
 
 export interface Viewport3DMaterialProfile {
   airSurface: Pick<
@@ -17,6 +26,9 @@ export interface Viewport3DMaterialProfile {
     MeshBasicMaterialParameters,
     | "toneMapped"
   >;
+  uniformGeometry: {
+    lit: boolean;
+  };
   featureEdges: {
     opacity: number;
   };
@@ -49,6 +61,8 @@ export interface Viewport3DMaterialProfile {
 
 export function resolveViewport3DMaterialProfile(
   visualProfile: Viewport3DVisualProfile,
+  appearance: Viewport3DMaterialAppearance =
+    DEFAULT_VIEWPORT_3D_APPEARANCE_PREFERENCES,
 ): Viewport3DMaterialProfile {
   const figureBoost = visualProfile.lighting === "figure" ? 1 : 0;
   return {
@@ -56,14 +70,16 @@ export function resolveViewport3DMaterialProfile(
       toneMapped: visualProfile.toneMapping !== "none",
     },
     magneticSurface: {
-      shadeStrength:
-        visualProfile.id === "figure" || visualProfile.id === "capture"
-          ? 0
-          : 0.45,
-      toneMapped: visualProfile.toneMapping !== "none",
+      // Quantitative field colors are always kept independent of geometry light.
+      // Keep tone mapping out of data colors across quality profiles as well.
+      shadeStrength: 0,
+      toneMapped: false,
     },
     primitivePreview: {
       toneMapped: visualProfile.toneMapping !== "none",
+    },
+    uniformGeometry: {
+      lit: appearance.lightingMode === "studio",
     },
     featureEdges: {
       opacity: Math.max(
@@ -88,10 +104,10 @@ export function resolveViewport3DMaterialProfile(
       toneMapped: false,
     },
     dimensionFrame: {
-      labelOpacity: visualProfile.lighting === "minimal" ? 0.76 : 0.9,
-      majorOpacity: visualProfile.lighting === "minimal" ? 0.26 : 0.38 + figureBoost * 0.06,
+      labelOpacity: 0.95,
+      majorOpacity: visualProfile.lighting === "minimal" ? 0.34 : 0.38 + figureBoost * 0.06,
       minorOpacity: visualProfile.lighting === "minimal" ? 0.14 : 0.22 + figureBoost * 0.04,
-      tickOpacity: visualProfile.lighting === "minimal" ? 0.4 : 0.58 + figureBoost * 0.08,
+      tickOpacity: visualProfile.lighting === "minimal" ? 0.68 : 0.7 + figureBoost * 0.08,
     },
     selectionShell: {
       opacity: visualProfile.lighting === "figure" ? 0.82 : 0.72,

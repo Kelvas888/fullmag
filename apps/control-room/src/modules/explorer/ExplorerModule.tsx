@@ -64,6 +64,8 @@ import {
 import {
   projectFlatActiveLaneDiscretization,
   resolveSessionAuthoringDiscretization,
+  resolveSessionDiscretization,
+  resolveSessionTopologyDiscretization,
   type SessionDiscretizationCapabilitiesProjection,
 } from "@/kernel/resources/sessionDiscretization";
 import { WorkspaceRenderProfiler } from "@/kernel/performance/reactRenderProfiler";
@@ -193,11 +195,18 @@ function qualityStatus(value: unknown): string | null {
 type ExplorerModelRuntimeStatus = {
   capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
     SessionDiscretizationCapabilitiesProjection;
-  domain: Pick<LiveStatusResource["domain"], "discretization">;
+  domain: Pick<LiveStatusResource["domain"], "discretization"> &
+    Partial<Pick<LiveStatusResource["domain"], "cell_count" | "generation_id">>;
   resources: Pick<
     LiveStatusResource["resources"],
     "mesh_build_revision" | "mesh_revision" | "stages_revision"
-  >;
+  > &
+    Partial<
+      Pick<
+        LiveStatusResource["resources"],
+        "domain_generation_id" | "topology_revision"
+      >
+    >;
 };
 
 function selectExplorerModelRuntimeStatus(status: {
@@ -220,11 +229,15 @@ function selectExplorerModelRuntimeStatus(status: {
     },
     domain: {
       discretization: status.data.domain.discretization,
+      cell_count: status.data.domain.cell_count,
+      generation_id: status.data.domain.generation_id,
     },
     resources: {
+      domain_generation_id: status.data.resources.domain_generation_id,
       mesh_build_revision: status.data.resources.mesh_build_revision,
       mesh_revision: status.data.resources.mesh_revision,
       stages_revision: status.data.resources.stages_revision,
+      topology_revision: status.data.resources.topology_revision,
     },
   };
 }
@@ -259,10 +272,15 @@ export function explorerModelRuntimeStatusEquals(
     previous.capabilities.active_lane_discretization ===
       next.capabilities.active_lane_discretization &&
     previous.domain.discretization === next.domain.discretization &&
+    previous.domain.cell_count === next.domain.cell_count &&
+    previous.domain.generation_id === next.domain.generation_id &&
+    previous.resources.domain_generation_id ===
+      next.resources.domain_generation_id &&
     previous.resources.mesh_build_revision ===
       next.resources.mesh_build_revision &&
     previous.resources.mesh_revision === next.resources.mesh_revision &&
-    previous.resources.stages_revision === next.resources.stages_revision
+    previous.resources.stages_revision === next.resources.stages_revision &&
+    previous.resources.topology_revision === next.resources.topology_revision
   );
 }
 
@@ -421,6 +439,11 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
     { enabled: modelTabActive, isEqual: explorerModelRuntimeStatusEquals },
   );
   const modelDiscretization = resolveSessionAuthoringDiscretization(sessionStatusData);
+  const runtimeDiscretization = resolveSessionDiscretization(sessionStatusData);
+  const topologyPreviewDiscretization =
+    resolveSessionTopologyDiscretization(sessionStatusData);
+  const unresolvedRuntimeFemPreview =
+    runtimeDiscretization === null && topologyPreviewDiscretization === "fem";
   const modelResource = useSceneResource({ enabled: modelTabActive });
   const domainMeta = useDomainMetaResource({ enabled: modelTabActive });
   const fdmMultilayerLayout = useFdmMultilayerLayoutResource({
@@ -459,7 +482,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
     enabled: shouldLoadRuntimeMeshManifest(
       modelTabActive || runtimeTabActive,
       modelTabActive ? sessionStatusData : runtimeSessionStatus.data,
-    ),
+    ) || (modelTabActive && unresolvedRuntimeFemPreview),
   });
   const qualityGates = useMeshSharedDomainQualityGatesResource({
     enabled: shouldLoadRuntimeMeshManifest(modelTabActive, sessionStatusData),

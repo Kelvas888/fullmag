@@ -416,7 +416,7 @@ fn run_scheduler(
     let mut peak_backpressured_run_count = 0usize;
     let mut active_workers = ActiveWorkers::default();
     let mut first_loop_reported = false;
-    let mut reconciliation_deferred_reported = false;
+    let mut reconciliation_deferred_detail = None::<String>;
     let mut reconciliation_stages_reported = false;
     while args
         .max_tasks
@@ -463,15 +463,25 @@ fn run_scheduler(
             })();
             reconciliation_stages_reported = true;
             match reconciliation {
-                Ok(()) => {}
+                Ok(()) => {
+                    reconciliation_deferred_detail = None;
+                }
                 Err(error) if is_store_writer_busy(&error) => {
                     tracing::warn!(
                         error = ?error,
                         "compute scheduler deferred host reconciliation while the session store writer is busy"
                     );
-                    if !reconciliation_deferred_reported {
+                    let detail = format!("{error:#}");
+                    if reconciliation_deferred_detail.as_deref() != Some(detail.as_str()) {
                         scheduler_startup_event("reconciliation_deferred", startup_started);
-                        reconciliation_deferred_reported = true;
+                        // These binaries also run without a tracing subscriber.
+                        // Preserve the actual busy root and phase in stderr.
+                        eprintln!("{}", serde_json::json!({
+                            "schema_version": "scheduler_reconciliation_deferred.v1",
+                            "component": "accepted_compute_scheduler",
+                            "detail": &detail,
+                        }));
+                        reconciliation_deferred_detail = Some(detail);
                     }
                     reconciliation_deferred = true;
                 }
@@ -902,6 +912,11 @@ fn build_run_queue_snapshot(
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         if specification.run_id != *run_id {
             bail!("scheduler run id differs from the immutable RunSpec");
+        }
+        // Held models remain available to preparation/readiness callers, but
+        // the compute queue need not reload their full study before Compute.
+        if !store.accepted_run_start_permitted(run_id.as_str())? {
+            continue;
         }
         if fullmag_runtime_control::accepted_run_has_scheduler_ready_task(store, run_id)? {
             queued.push(PrioritizedRun {

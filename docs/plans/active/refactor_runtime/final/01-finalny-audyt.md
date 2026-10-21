@@ -1,12 +1,14 @@
-# Finalny audyt architektury i planu refaktoryzacji Fullmag
+# Finalny audyt architektury i planu refaktoryzacji Fullmag — audyt historyczny
 
-Data: 20.09.2026. Baza: `14c8e73a6f3c55f4fc080835a6156f2a4db8f111`, lokalny `master`. Zakres: 5 dokumentów bazowych, 6 raportów Gemini i 7 raportów Claude, skonfrontowanych z aktualnym kodem i obowiązującymi kontraktami. Rejestr źródeł: [05](05-dowody-i-adr.md).
+Data audytu: 20.09.2026. Baza: `14c8e73a6f3c55f4fc080835a6156f2a4db8f111`, lokalny `master`. Zakres: 5 dokumentów bazowych, 6 raportów Gemini i 7 raportów Claude, skonfrontowanych wtedy z kodem i kontraktami. Rejestr materiałów z tamtego audytu: [05](05-dowody-i-adr.md).
 
-## Aktualizacja wykonawcza — 21.09.2026
+> **Granica czasowa:** tabela F01–F12 i poniższe anchors opisują historyczną diagnozę źródeł z 20.09.2026. Checkpoint 21.09 również jest historyczny. Reaudyt źródeł `master@42d92610312871d591db16a5b60a8f7a6d6339b5` z 20.10.2026 znajduje się w [08](08-reaudyt-master-2026-10-20.md), a bieżące statusy etapów w [06](06-status-realizacji.md). Reaudyt nie uruchamiał buildów, testów jednostkowych, browser smoke, solve ani kwalifikacji naukowej/release. Statyczny checker źródeł ma wyłącznie heurystyczny zakres opisany w 08; obecność kodu nie nadaje runtime bramkom PASS.
 
-Poniższy audyt zachowuje stan źródeł i ustalenia z 20.09. Po jego zapisaniu użytkownik autoryzował implementację i testowanie na `masterze`. Bieżący stan wykonawczy jest prowadzony osobno w [P0](p0/03-implementation-status.md), [P1](p1/README.md), [P2](p2/README.md), [P3](p3/README.md) i [tabeli globalnej](06-status-realizacji.md): minimalna bramka P0 przeszła, P1-A/B/D oraz większość P1-C wykonano, ikonę chowania Inspektora zweryfikowano w browser smoke, slice'y P2-A canonical bytes/parameter AST z podpięciem do `ProblemIR` i generated-script round-trip, typed projection `ModelDefinition`/`ComponentDefinition`/`PhysicsConfiguration` z Rust canonical digest, P2-B geometry feature sequence i P2-C izolacji kontekstu Python mają zapisane dowody źródłowe, a P3 ma typed `StudyPlan v2`, `study_execution_plan.v2` z jawnym horyzontem TimeEvolution, immutable `study_problem_catalog.v1`, jawne lowering przez canonical planner, immutable `RunSpecification`, procesowy ledger idempotency, trwały accepted-intent journal, monotoniczny run catalog, restartowe `reconciling`, fenced artifact catalog, typowane Task/Attempt/Ownership identities, `ResolvedTaskInput`, procesowy registry, durable `resource_lease.v1`, `worker_protocol.v2` z dedup/conflict i terminal fencing, `WorkerCoordinator` oraz idempotentne zastosowanie retry do katalogu. Nie należy traktować historycznych zdań „nie wykonano” poniżej jako opisu bieżącego checkoutu.
+## Historyczny checkpoint wykonawczy — 21.09.2026
 
-Aktualny inventory P0-A (`audit_refactor_p0.py --check`) obejmuje **300 operacji OpenAPI, 300 rozpoznanych handlerów, 0 nierozpoznanych handlerów/konsumentów, 2 router-only i 0 OpenAPI-only**. Pozostałe bramki produkcyjne — power-loss, pełna recovery runtime, fizyczny Tauri, baseline naukowy oraz kwalifikacja release — nadal pozostają `NOT VERIFIED`; P2-A ma canonical-bytes/parameter-AST slice podpięty do `ProblemIR` i generated Python oraz read-only typed projection z testem Python, P2-B ma feature-sequence slice, P2-D ma revision-fenced Undo/Redo, registry aktywnego formularza, wrapper staged sessions i helper revision-fenced immediate mutations obejmujący także monitory, Frozen Spins i material authoring, a trwały Model/Component/PhysicsConfiguration roundtrip, browser/Rust roundtrip, meshing/ambiguity, pozostałe bezpośrednie/multistep handlers oraz granica P2-C obejmująca definicję → materializację, bridge `fullmag-py-core` i równoległe capture/load są `IN PROGRESS`.
+Poniższy checkpoint zachowuje stan źródeł i ustalenia z 20–21.09.2026. Po jego zapisaniu użytkownik autoryzował implementację i testowanie na `masterze`; opisane tu slice'y, wyniki i „bieżące” statusy odnoszą się wyłącznie do tamtego checkpointu. Aktualny reaudyt i status etapów są prowadzone osobno w [08](08-reaudyt-master-2026-10-20.md) oraz [06](06-status-realizacji.md). Nie przenoś poniższych wyników na późniejszy HEAD bez sprawdzenia wejść i zakresu dowodu.
+
+Inventory P0-A (`audit_refactor_p0.py --check`) z checkpointu 21.09 obejmował **300 operacji OpenAPI, 300 rozpoznanych handlerów, 0 nierozpoznanych handlerów/konsumentów, 2 router-only i 0 OpenAPI-only**. To nie jest aktualny mianownik. Pozostałe wtedy bramki produkcyjne — power-loss, pełna recovery runtime, fizyczny Tauri, baseline naukowy oraz kwalifikacja release — miały status `NOT VERIFIED`; wymienione slice'y P2 i P3 były stanem tamtego checkpointu, nie reaudytu 20.10.
 
 Rewalidacja 21.09.2026 obejmuje także durable `retry_decision.v1` oraz
 `coordinator_journal.v1` w `fullmag-session`: zapisy są idempotentne i fenced
@@ -75,9 +77,30 @@ Wagi opisują wpływ na migrację i dane, nie potwierdzone incydenty użytkownik
 
 F01–F06 są podstawą P0 przed promocją nowych zapisów/importu. F07 zaczyna się od inventory już w P0, nowe ID są wymagane w P3, pełna migracja wyników w P6. F08 można poprawiać wcześnie jako lifecycle powłoki, ale F09 blokuje pełne współbieżne mutacje. W momencie utworzenia audytu zakres był plan-only; późniejsza zgoda użytkownika na implementację jest rozliczona w checkpointach P0/P1 i nie znosi żadnej bramki bezpieczeństwa.
 
+### Mapa statusu źródłowego F01–F12 — reaudyt 20.10.2026
+
+Poniższa mapa aktualizuje tylko ocenę obecności i zakresu kodu na `42d9261`; nie zmienia historycznych ustaleń, kryteriów ani wagi ryzyk. „Źródłowo skorygowane” oznacza naprawę w sprawdzonej ścieżce kodu, nie kwalifikację runtime. Szczegóły i dokładne anchors są w [reaudycie 08](08-reaudyt-master-2026-10-20.md); odbiór etapów pozostaje w [06](06-status-realizacji.md).
+
+| ID | Status źródłowy na `master@42d9261` | Otwarta granica odbioru |
+|---|---|---|
+| F01 | **Źródłowo skorygowane**: wspólny traversal reachability, preview GC, zakres i ponowna kontrola planu pod lease. | Nie wykonywano GC ani świeżej macierzy fault/recovery. |
+| F02 | **Źródłowo skorygowane**: capture zapisuje materialne referencje primary/aux z długością i hashem. | Nie dowodzi ExactResume wszystkich solverów ani kompletności każdego profilu. |
+| F03 | **Źródłowo skorygowane w sprawdzonym przepływie**: preflight/traversal, walidacja session ID i sprawdzona granica ścieżek. | Nie deklaruje odporności na wszystkie wejścia atakującego ani pełnego pokrycia writerów. |
+| F04 | **Źródłowo skorygowane**: commit checkpointu waliduje dane, zapisuje stan i graf przed markerem. | Crash/power-loss pozostaje oddzielną, niewykonaną kwalifikacją. |
+| F05 | **Częściowo skorygowane**: staging UUID/create-new i `sync_all` są w ścieżce publikacji. | Gwarancje filesystemów, wynik niepewny oraz power-loss wymagają właściwych profili/dowodów. |
+| F06 | **Częściowo skorygowane**: transakcja writer używa natywnego locka i owner metadata. | Platform-specific recovery, obce hosty i pełne powiązanie wszystkich writerów nie są tu zakwalifikowane. |
+| F07 | **Częściowe slice'e; bramka otwarta**: scoped identity/cache istnieją, a inventory API obejmuje obecnie większy zakres. | Pełne usunięcie placeholderów/current z trwałych producerów, migracja manifestów i review wszystkich 371 operacji pozostają otwarte. |
+| F08 | **Źródłowo skorygowane**: global gate/inert zastąpił oddzielny, nieblokujący panel przygotowania. | Brak nowego browser/runtime dowodu dla bieżącego HEAD. |
+| F09 | **Częściowe; bramka otwarta**: istnieją typed run/coordination slices, lecz legacy `scratch_runtime` nadal wiąże child z wybranymi zmianami session/backend/scene. | Trzeba rozliczyć ownerów i konsumentów oraz wykazać cutover dla wymaganych entry points; nie uogólniać tej gałęzi na wszystkie runy. |
+| F10 | **Częściowe**: istnieją runtime-free use cases dokumentu, ale główny flow pustej symulacji wiąże authoring z RuntimeSession. | Pełna edytowalna definicja projektu niezależna od wykonania pozostaje celem; RuntimeSession sama nie dowodzi solve. |
+| F11 | **Częściowe; bramka otwarta**: są scope middleware i resource/cache slice'y. | Aktualny inventory ma 371 operacji, w tym 308 `sessions/current`; wymagają review aliasy, stale-scope, decode i reconnect. |
+| F12 | **Bramka otwarta**: bieżąca architektura zachowuje istniejące ADR i właścicieli lane'ów. | Pełne uzgodnienie dotkniętych kontraktów/backend authority oraz kwalifikacja per lane nie wynikają z tego statycznego reaudytu. |
+
+Reaudyt 20.10 jest wyłącznie statyczny. Nie kwalifikuje managed runtime, browser/WebGL, nauki ani release; nie zastępuje historycznych receiptów ani tabel statusu w 06.
+
 ## 4. Metryki API: podobne liczby oznaczają różne rzeczy
 
-Powtórzony pomiar w aktualnym drzewie:
+Pomiar w drzewie i inwentarzu audytu z 20.09.2026 (historyczny; nie jest metryką HEAD 20.10):
 
 | Metoda | Całość | `sessions/current` | Znaczenie |
 |---|---:|---:|---|

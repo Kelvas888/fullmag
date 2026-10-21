@@ -223,6 +223,13 @@ def docker_capture(*args, data=None, timeout=90, allow_failure=False, env=None):
     return result
 
 
+def docker_text(*args, timeout=90, combined=False):
+    """Run one bounded Docker observation and decode its output."""
+
+    result = docker_capture(*args, timeout=timeout)
+    return (result.stdout + (result.stderr if combined else b"")).decode("utf-8", "replace")
+
+
 def compose_capture(document, *args, timeout=90):
     return docker_capture("compose", "--project-name", document["name"], "-f", "-",
                           *args, data=canonical(document), timeout=timeout).stdout
@@ -443,6 +450,23 @@ class BuildControl:
         if len(result.stdout) > MAX_DOCUMENT_BYTES:
             raise BuildControlError("Control document exceeds its byte budget")
         return json.loads(result.stdout)
+
+    def read_pinned_resume_evidence(
+        self,
+        parent_attempt: str,
+        config_sha256: str,
+        backend_started_at: str,
+        helper_image: str,
+    ) -> dict[str, object]:
+        from docker_volume_pre_admission_selector import read_pinned_resume_evidence
+
+        return read_pinned_resume_evidence(
+            self,
+            parent_attempt=parent_attempt,
+            config_sha256=config_sha256,
+            backend_started_at=backend_started_at,
+            helper_image=helper_image,
+        )
 
     @staticmethod
     def _line(process, timeout=90):

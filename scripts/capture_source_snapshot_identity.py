@@ -529,6 +529,8 @@ def _untracked_runtime_records(repo_root: Path) -> list[dict[str, object]]:
 def _status_records(
     repo_root: Path, *, ignore_non_runtime_dirty: bool = False
 ) -> list[dict[str, object]]:
+    # _capture_once filters gitlink paths from this identity. Avoid scanning
+    # their nested worktrees for status records that will be discarded.
     if not ignore_non_runtime_dirty:
         return _parse_status_records(
             _git(
@@ -537,6 +539,7 @@ def _status_records(
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=all",
+                "--ignore-submodules=all",
             )
         )
 
@@ -555,6 +558,7 @@ def _status_records(
             # a rename as the equivalent delete/add pair.
             "--no-renames",
             "--untracked-files=no",
+            "--ignore-submodules=all",
             "--",
             *_runtime_status_pathspecs(repo_root),
         )

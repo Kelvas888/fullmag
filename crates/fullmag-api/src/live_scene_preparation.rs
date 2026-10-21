@@ -829,7 +829,7 @@ pub(crate) async fn publish_accepted_frontier_preparation(
                     matches!(step.status, fullmag_plan::StudyStepLoweringStatus::Planned)
                 })
             {
-                if fullmag_runtime_control::accepted_run_step_is_scheduler_ready(
+                if fullmag_runtime_control::accepted_run_step_is_preparation_frontier(
                     &store,
                     &typed_run_id,
                     &step.step_id,
@@ -841,6 +841,49 @@ pub(crate) async fn publish_accepted_frontier_preparation(
                 })? {
                     selected = Some(step.step_id.clone());
                     break;
+                }
+            }
+            if selected.is_none() {
+                // Preparation may advance between scans. History identifies
+                // a candidate only; recheck lifecycle, dependencies and inputs
+                // before publishing it as the current live frontier.
+                let launches = store
+                    .list_preparation_process_launches(typed_run_id.as_str())
+                    .map_err(|error| {
+                        ApiError::conflict(format!(
+                            "accepted preparation launches cannot be read: {error}"
+                        ))
+                    })?;
+                for step in accepted.lowered.steps.iter().filter(|step| {
+                    matches!(step.status, fullmag_plan::StudyStepLoweringStatus::Planned)
+                }) {
+                    let task_id = fullmag_session::task_id_for_study_step(
+                        typed_run_id.as_str(),
+                        &step.step_id,
+                    )
+                    .map_err(|error| ApiError::conflict(error.to_string()))?;
+                    let launched = launches
+                        .iter()
+                        .any(|launch| launch.task_id == task_id.as_str());
+                    let prepared = store
+                        .read_task_preparation_receipt(typed_run_id.as_str(), task_id.as_str())
+                        .map_err(|error| ApiError::conflict(error.to_string()))?
+                        .is_some();
+                    if (launched || prepared)
+                        && fullmag_runtime_control::accepted_run_step_is_preparation_frontier(
+                            &store,
+                            &typed_run_id,
+                            &step.step_id,
+                        )
+                        .map_err(|error| {
+                            ApiError::conflict(format!(
+                                "accepted preparation candidate validation failed: {error}"
+                            ))
+                        })?
+                    {
+                        selected = Some(step.step_id.clone());
+                        break;
+                    }
                 }
             }
             selected.ok_or_else(|| {
@@ -855,6 +898,13 @@ pub(crate) async fn publish_accepted_frontier_preparation(
     .await
     .map_err(|error| ApiError::internal(format!("accepted preparation frontier task failed: {error}")))??;
 
+    if command_kind == "startup" {
+        let _transition = state.current_live_session_transition.lock().await;
+        crate::docker_startup::bind_startup_frontier_progress_under_transition(
+            state, context, &run_id, &step_id,
+        )
+        .await?;
+    }
     let deadline = std::time::Instant::now() + ACCEPTED_LIVE_PREPARATION_WAIT_TIMEOUT;
     loop {
         // Only one bounded receipt read/publication owns the transition.
@@ -993,12 +1043,7 @@ pub(crate) async fn publish_accepted_task_preparation_with_transition(
             serde_json::to_value(&snapshot.display_selection).map_err(|error| {
                 ApiError::internal(format!("failed to encode display projection: {error}"))
             })?;
-        let existing_preparation = snapshot.simulation_preparation.as_ref().map(|preparation| {
-            (
-                preparation.preparation_id.clone(),
-                preparation.started_at_unix_ms,
-            )
-        });
+        let existing_preparation = snapshot.simulation_preparation.clone();
         (
             scene_revision,
             display_projection,
@@ -1121,9 +1166,11 @@ pub(crate) async fn publish_accepted_task_preparation_with_transition(
 
     let (receipt, execution_plan, requested_execution) = materialized;
     let preparation_id = receipt.preparation_id.clone();
+    let existing_preparation = existing_preparation
+        .filter(|existing| existing.preparation_id == preparation_id);
     let preparation_started_at_unix_ms = existing_preparation
-        .filter(|(existing_id, _)| existing_id == &preparation_id)
-        .map(|(_, started_at)| started_at)
+        .as_ref()
+        .map(|existing| existing.started_at_unix_ms)
         .unwrap_or(observed_preparation_started_at_unix_ms);
     let plan_fingerprint = receipt.plan_fingerprint.clone();
     let binding = PreparationBinding::from_receipt(&receipt).map_err(|error| {
@@ -1174,6 +1221,36 @@ pub(crate) async fn publish_accepted_task_preparation_with_transition(
             "detail": "accepted task preparation receipt ready",
         }],
     });
+    let mut completed_stages = canonical_completed_preparation_stages(
+        now, "accepted task preparation receipt committed",
+    );
+    if let Some(existing) = existing_preparation.as_ref() {
+        for previous in &existing.stages {
+            if let Some(stage) = completed_stages.iter_mut().find(|stage| {
+                stage.id == previous.id && stage.id != "ready" && stage.id != "solver_initialization"
+            }) {
+                if previous.status == "completed" {
+                    stage.started_at_unix_ms = previous.started_at_unix_ms;
+                    stage.completed_at_unix_ms = previous.completed_at_unix_ms;
+                    stage.duration_ms = previous.duration_ms;
+                    stage.clock_adjustment = previous.clock_adjustment.clone();
+                } else if previous.status == "active" {
+                    stage.started_at_unix_ms = previous.started_at_unix_ms;
+                    stage.completed_at_unix_ms = Some(now);
+                    stage.duration_ms = previous.started_at_unix_ms.and_then(|start| now.checked_sub(start));
+                }
+            }
+        }
+    }
+    const READY_LOG: &str = "accepted task authored model preparation ready; Compute has not run";
+    let mut preparation_log = existing_preparation.as_ref()
+        .map(|existing| existing.log_tail.clone()).unwrap_or_default();
+    if !preparation_log.last().is_some_and(|entry| entry.stage_id == "ready" && entry.message == READY_LOG) {
+        preparation_log.push(canonical_ready_preparation_log(now, READY_LOG));
+    }
+    if preparation_log.len() > 128 {
+        preparation_log.drain(..preparation_log.len() - 128);
+    }
     let preparation = SimulationPreparationSnapshot {
         preparation_id: preparation_id.clone(),
         revision: preparation_revision,
@@ -1181,14 +1258,8 @@ pub(crate) async fn publish_accepted_task_preparation_with_transition(
         active_stage_id: None,
         started_at_unix_ms: preparation_started_at_unix_ms,
         completed_at_unix_ms: Some(now),
-        stages: canonical_completed_preparation_stages(
-            now,
-            "accepted task preparation receipt committed",
-        ),
-        log_tail: vec![canonical_ready_preparation_log(
-            now,
-            "accepted task authored model preparation ready; Compute has not run",
-        )],
+        stages: completed_stages,
+        log_tail: preparation_log,
         failure: None,
     };
     let mut current = state.current_live_state.write().await;

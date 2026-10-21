@@ -48,6 +48,8 @@ describe("readViewport3DColorsFromStyles", () => {
       antenna: "#f9e2af",
       accentStrong: "#b4befe",
       background: "#11111b",
+      backgroundTop: "#11111b",
+      backgroundBottom: "#11111b",
       danger: "#f38ba8",
       field: "#89b4fa",
       hud: {
@@ -67,6 +69,7 @@ describe("readViewport3DColorsFromStyles", () => {
       mesh: "#1e1e2e",
       panel: "#1e1e2e",
       panelRaised: "#313244",
+      primitivePalette: Array(12).fill("#89b4fa"),
       success: "#a6e3a1",
       textPrimary: "#cdd6f4",
       textSecondary: "#bac2de",

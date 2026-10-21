@@ -254,6 +254,143 @@ class BackendPackageTests(unittest.TestCase):
             backend._clear_rotation_journal(rotation)
         return package, control, toolchain
 
+    def _direct_retention_fixture(self, root, *, remove_launcher):
+        """Create a full receipt-backed rotation whose new package is direct-installed."""
+
+        package, control, toolchain = self._rotated_package_fixture(root, versions=2)
+        if remove_launcher:
+            (package / "bin/fullmag").unlink()
+        previous = backend._validated_package(
+            package,
+            "direct retention previous package",
+            exclude_development_control=True,
+        )
+        build_root = root / "direct-retention-build"
+        build_root.mkdir()
+        candidate = (
+            control
+            / backend.PACKAGE_CANDIDATES_DIRNAME
+            / ".backend-package-candidate-retention"
+        )
+        self._populate_direct_candidate(package, build_root, candidate)
+        candidate_records = backend._copy_package(
+            root / "direct-retention-workspace",
+            candidate,
+            direct_install=True,
+            package_root=package,
+            build_root=build_root,
+        )
+        _, manifest = self._live_manifest(
+            root, commit="4" * 40, capture_id="retention-direct"
+        )
+        backend._write_json(
+            candidate / "backend-build-receipt.json",
+            self._receipt_for_manifest(candidate_records, manifest, toolchain),
+            "direct retention candidate receipt",
+        )
+        candidate_receipt_bytes = (
+            candidate / "backend-build-receipt.json"
+        ).read_bytes()
+        rotation = backend._rotate_package(
+            package,
+            candidate,
+            control,
+            previous[2],
+            previous[1],
+            candidate_receipt_bytes,
+        )
+        backend._finalize_published_candidate(candidate, rotation)
+        backend._clear_rotation_journal(rotation)
+        current = backend._validated_package(
+            package,
+            "direct retention current package",
+            exclude_development_control=True,
+        )
+        return package, control, current
+
+    @staticmethod
+    def _direct_backup_for_current(control, current_receipt_bytes):
+        expected = backend._sha256_bytes(current_receipt_bytes)
+        backups = sorted(
+            (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                ".backend-package-backup-*"
+            )
+        )
+        matches = []
+        for backup in backups:
+            rotation = json.loads(
+                (backup / "rotation.json").read_text(encoding="utf-8")
+            )
+            if rotation.get("new_receipt_sha256") == expected:
+                matches.append(backup)
+        if len(matches) != 1:
+            raise AssertionError(f"expected one direct rollback, found {matches!r}")
+        return matches[0]
+
+    def test_retention_accepts_current_direct_package_without_legacy_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, current = self._direct_retention_fixture(
+                Path(directory), remove_launcher=True
+            )
+            backend._retain_package_backups(
+                package, control, current[0], current[1]
+            )
+            direct_backup = self._direct_backup_for_current(control, current[1])
+            self.assertFalse((direct_backup / "bin/fullmag").exists())
+            self.assertEqual(
+                len(
+                    list(
+                        (control / backend.PACKAGE_BACKUPS_DIRNAME).glob(
+                            ".backend-package-backup-*"
+                        )
+                    )
+                ),
+                1,
+            )
+
+    def test_retention_accepts_legacy_launcher_in_verified_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, current = self._direct_retention_fixture(
+                Path(directory), remove_launcher=False
+            )
+            backend._retain_package_backups(
+                package, control, current[0], current[1]
+            )
+            direct_backup = self._direct_backup_for_current(control, current[1])
+            self.assertTrue((direct_backup / "bin/fullmag").is_file())
+            self.assertEqual(
+                (direct_backup / "bin/fullmag").read_text(encoding="utf-8"),
+                "#!/usr/bin/env bash\n",
+            )
+
+    def test_retention_rejects_unrecognized_launcher_prefix_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, control, current = self._direct_retention_fixture(
+                Path(directory), remove_launcher=True
+            )
+            direct_backup = self._direct_backup_for_current(control, current[1])
+            alien = direct_backup / "bin/fullmag.extra"
+            alien.write_bytes(b"unowned\n")
+            before_backups = sorted(
+                path.name
+                for path in (control / backend.PACKAGE_BACKUPS_DIRNAME).iterdir()
+            )
+            with self.assertRaisesRegex(
+                backend.BackendBuildError,
+                "unrecognized file or directory inventory",
+            ):
+                backend._retain_package_backups(
+                    package, control, current[0], current[1]
+                )
+            self.assertEqual(
+                sorted(
+                    path.name
+                    for path in (control / backend.PACKAGE_BACKUPS_DIRNAME).iterdir()
+                ),
+                before_backups,
+            )
+            self.assertEqual(alien.read_bytes(), b"unowned\n")
+
     @staticmethod
     def _live_manifest(root, *, commit="a" * 40, capture_id="test-capture"):
         capsule = {
@@ -1515,9 +1652,12 @@ class BackendPackageTests(unittest.TestCase):
                             0,
                         )
                 prepare.assert_called_once()
-                retain.assert_called_once()
+                retain.assert_not_called()
                 serve.assert_called_once_with([])
-                self.assertIn("retention-state-is-unknown", stderr.getvalue())
+                self.assertIn(
+                    "phase=retention state=deferred reason=outside-startup",
+                    stderr.getvalue(),
+                )
                 self.assertNotEqual(
                     (package / "bin/fullmag-bin").read_bytes(), b"package\n"
                 )
@@ -2606,6 +2746,98 @@ class BackendPackageTests(unittest.TestCase):
             self.assertTrue(candidate.is_dir())
             self.assertTrue(log_path.is_file())
 
+    def test_prepare_locked_verifies_published_make_log_stat_size(self):
+        for mutate_published_log in (False, True):
+            with self.subTest(mutate_published_log=mutate_published_log), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                package = root / "package"
+                package.mkdir()
+                build_root = root / "build"
+                build_root.mkdir()
+                control = backend._ensure_package_development_root(package)
+                candidate = (
+                    control
+                    / backend.PACKAGE_CANDIDATES_DIRNAME
+                    / ".backend-package-candidate-prepare-logstat"
+                )
+                candidate.mkdir()
+                backend._write_candidate_marker(
+                    candidate, package, build_root, state="building"
+                )
+                workspace = root / "workspace"
+                workspace.mkdir()
+                manifest = root / "manifest.json"
+                manifest.write_bytes(b"fixture manifest")
+                args = backend.argparse.Namespace(
+                    source_tar=None,
+                    manifest=manifest,
+                    source_root=root / "source",
+                    git_common_root=root / "git-common",
+                )
+
+                def fake_make(command, actual_workspace, environment, log_path):
+                    self.assertEqual(command[-1], "install-cli-dev")
+                    log_path.write_bytes(b"make completed\\n")
+                    return 0
+
+                def fake_publish(*publish_args, **publish_kwargs):
+                    if mutate_published_log:
+                        with (candidate / backend.FAILED_MAKE_LOG_NAME).open("ab") as stream:
+                            stream.write(b"publisher drift\n")
+                    return 0
+
+                with (
+                    patch.object(backend, "PACKAGE_ROOT", package),
+                    patch.dict(
+                        os.environ,
+                        {"FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev"},
+                        clear=False,
+                    ),
+                    patch.object(
+                        backend,
+                        "_materialize_source",
+                        return_value=(workspace, {}, {}, "a" * 64, None, "snapshot"),
+                    ),
+                    patch.object(backend, "_build_environment", return_value={}),
+                    patch.object(backend, "_run_canonical_make", side_effect=fake_make),
+                    patch.object(
+                        backend,
+                        "_publish_completed_build",
+                        side_effect=fake_publish,
+                    ),
+                ):
+                    if mutate_published_log:
+                        with self.assertRaisesRegex(
+                            backend.BackendBuildError,
+                            "published Make diagnostic log differs",
+                        ):
+                            backend._prepare_locked(
+                                args, build_root, candidate, 2, {}, candidate
+                            )
+                        self.assertTrue(
+                            (
+                                build_root
+                                / backend.FAILED_MAKE_DIAGNOSTICS_DIRNAME
+                                / candidate.name
+                                / backend.FAILED_MAKE_LOG_NAME
+                            ).is_file()
+                        )
+                    else:
+                        self.assertEqual(
+                            backend._prepare_locked(
+                                args, build_root, candidate, 2, {}, candidate
+                            ),
+                            0,
+                        )
+                        self.assertFalse(
+                            (
+                                build_root
+                                / backend.FAILED_MAKE_DIAGNOSTICS_DIRNAME
+                                / candidate.name
+                                / backend.FAILED_MAKE_LOG_NAME
+                            ).exists()
+                        )
+
     def test_successful_make_log_is_copied_then_external_log_is_retired(self):
         with tempfile.TemporaryDirectory() as directory:
             package, build_root, candidate, log_path = self._failed_make_fixture(
@@ -3153,6 +3385,9 @@ class BackendPackageTests(unittest.TestCase):
             candidate.mkdir()
             marker = candidate / backend.PACKAGE_CANDIDATE_MARKER
             backend._write_candidate_marker(candidate, package, build_root, state="building")
+            # A candidate holding only known Make output is discarded as an
+            # interrupted build; unknown content keeps it fail-closed.
+            (candidate / "operator-notes.txt").write_bytes(b"keep")
             with self.assertRaises(backend.BackendBuildError):
                 backend._reject_partial_package_candidates(package, control, build_root)
             self.assertTrue(marker.is_file())

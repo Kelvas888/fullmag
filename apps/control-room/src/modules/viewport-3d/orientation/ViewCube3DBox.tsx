@@ -14,7 +14,6 @@ import {
   CanvasTexture,
   Color,
   DoubleSide,
-  Raycaster,
   SRGBColorSpace,
   Matrix4,
   Vector2,
@@ -27,6 +26,7 @@ import {
 } from "three";
 
 import type { Viewport3DColors, Viewport3DHudColors } from "../viewport3dTypes";
+import { createViewport3DHudRaycaster } from "../viewport3dHudLayer";
 import { holdViewport3DCameraControls } from "../layers/viewport3DCameraControlsHold";
 import type { Direction3 } from "./cameraOrientation";
 import { hudAxisColor, resolveHudColors, type HudAxisId } from "./hudColors";
@@ -237,7 +237,7 @@ export function ViewCube3DBox({
   const raycastState = useMemo(
     () => ({
       pointer: new Vector2(),
-      raycaster: new Raycaster(),
+      raycaster: createViewport3DHudRaycaster(),
     }),
     [],
   );

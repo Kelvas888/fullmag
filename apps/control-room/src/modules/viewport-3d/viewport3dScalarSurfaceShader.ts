@@ -86,7 +86,7 @@ export function createScalarSurfaceShaderMaterial(
       },
       fmScalarMax: { value: buffer.range.max },
       fmScalarMin: { value: buffer.range.min },
-      fmShadeStrength: { value: options.shadeStrength ?? 0.45 },
+      fmShadeStrength: { value: options.shadeStrength ?? 0 },
       fmWavevectorKf: { value: buffer.wavevectorKf ?? [0, 0, 0] },
       fmCellOrigin: { value: buffer.cellOrigin ?? [0, 0, 0] },
       fmSpatialPhaseSign: { value: spatialPhaseSign },
@@ -501,9 +501,12 @@ void main() {
   // changes instead of changing the surface texture.
   float t = bad ? 0.5 : clamp(v, 0.0, 1.0);
   vec3 base = bad ? vec3(0.85, 0.0, 0.85) : paletteColor(t);
-  vec3 n = normalize(vNormalView) * (gl_FrontFacing ? 1.0 : -1.0);
-  float ndl = clamp(dot(n, normalize(vec3(0.35, 0.55, 0.75))) * 0.5 + 0.5, 0.0, 1.0);
-  vec3 shaded = base * mix(1.0, 0.55 + 0.75 * ndl, fmShadeStrength);
+  vec3 shaded = base;
+  if (fmShadeStrength > 0.0) {
+    vec3 n = normalize(vNormalView) * (gl_FrontFacing ? 1.0 : -1.0);
+    float ndl = clamp(dot(n, normalize(vec3(0.35, 0.55, 0.75))) * 0.5 + 0.5, 0.0, 1.0);
+    shaded = base * mix(1.0, 0.55 + 0.75 * ndl, fmShadeStrength);
+  }
   vec3 color = srgbToLinearVec3(shaded);
   gl_FragColor = vec4(color, fmOpacity);
   #include <colorspace_fragment>
@@ -581,9 +584,12 @@ void main() {
   #include <clipping_planes_fragment>
 
   vec3 base = orientationColor(vVectorValue);
-  vec3 n = normalize(vNormalView) * (gl_FrontFacing ? 1.0 : -1.0);
-  float ndl = clamp(dot(n, normalize(vec3(0.35, 0.55, 0.75))) * 0.5 + 0.5, 0.0, 1.0);
-  vec3 shaded = base * mix(1.0, 0.55 + 0.75 * ndl, fmShadeStrength);
+  vec3 shaded = base;
+  if (fmShadeStrength > 0.0) {
+    vec3 n = normalize(vNormalView) * (gl_FrontFacing ? 1.0 : -1.0);
+    float ndl = clamp(dot(n, normalize(vec3(0.35, 0.55, 0.75))) * 0.5 + 0.5, 0.0, 1.0);
+    shaded = base * mix(1.0, 0.55 + 0.75 * ndl, fmShadeStrength);
+  }
   // Same colour-space handling as SCALAR_SURFACE_FRAGMENT_SHADER. Writing the
   // sRGB value straight out happened to look right on the default canvas, but
   // PostProcessingLayer renders the scene into a linear target whenever Bloom

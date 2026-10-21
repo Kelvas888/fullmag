@@ -1479,6 +1479,10 @@ class RecoveryExecutionBoundaryTests(unittest.TestCase):
             trusted_dev = trusted / "backend_dev.py"
             trusted_source.write_bytes(backend_source.read_bytes())
             trusted_dev.write_bytes(backend_dev.read_bytes())
+            trusted_retirement = trusted / "backend_candidate_retirement.py"
+            trusted_retirement.write_bytes(
+                backend_dev.with_name("backend_candidate_retirement.py").read_bytes()
+            )
 
             module_spec = importlib.util.spec_from_file_location(
                 "trusted_backend_dev_fixture", trusted_dev)

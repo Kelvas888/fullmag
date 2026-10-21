@@ -5,6 +5,17 @@ kompiluje aplikację i uruchamia API oraz runtime; `frontend` obsługuje Next/HM
 Obrazy zależności i helperów przygotowuje BuildKit w tym samym projekcie.
 Nie powstaje trzecia usługa aplikacyjna ani hostowy katalog kompilacji.
 
+Frontend ma limit **16 GiB RAM i 4 CPU**. Launcher Next oraz środowisko
+narzędzi uruchamianych w usłudze frontend przypinają
+`NODE_OPTIONS=--max-old-space-size=6144` (6 GiB starej generacji sterty V8
+na proces). To górne limity, a nie rezerwacja pamięci. Budżet kontenera
+pozostawia miejsce na Next, osobny proces lint/typecheck, pozostałe obszary
+sterty i alokacje natywne. Launcher nie dziedziczy dowolnych flag Node z hosta.
+Zmiana Compose lub helpera wymaga zarządzanego odtworzenia usług z aktualnym
+obrazem; sam restart istniejącego kontenera nie zmienia jego limitów.
+Odbiór wymaga `docker inspect` (Memory/NanoCpus), odczytu cgroup oraz
+potwierdzenia limitu sterty i środowiska procesu Node.
+
 ## Uruchomienie
 
 Użyj Pythona z Windows PowerShell albo Linux/WSL oraz silnika Docker Linux.
@@ -46,10 +57,20 @@ błędem. Toolchain, obrazy pomocnicze i aplikacja stosują ten sam wybór źró
 Aktywacja kolejnego skryptu odczytuje rzeczywisty port działającej grupy, więc
 nie wymaga ponownego podawania wcześniejszego nadpisania portu.
 
-Zakończ edycje przed startem; nie zmieniaj źródeł do zakończenia próby.
-Migawka odczytuje checkout dwukrotnie i odrzuca niespójne wejście.
+Migawka odczytuje checkout jednym przebiegiem. Git porównuje tylko rozmiar
+i sekundy mtime (`core.checkStat=minimal`), bo indeks hosta nie może być
+odświeżony przez readonly mount; treść wiąże SHA-256 każdego pliku. Digest pliku
+o niezmienionym rozmiarze, `mtime` (ns) i trybie jest brany z cache poprzedniej
+migawki (`/build/.fullmag-live-source/hash-cache.json`), więc ponowny start czyta
+tylko zmienione pliki. Zapis pliku
+w trakcie startu (edytor, formatter) nie kończy próby błędem: odczyt w capture
+albo synchronizacja shadow wykrywa zmianę i wykonuje ponowne przechwycenie,
+najwyżej trzy razy. Dopiero ciągłe zmiany przez wszystkie próby zatrzymują start.
 
-Nowe, jeszcze nieśledzone pliki można jawnie dodać do migawki bez `git add`:
+Nowe, nieśledzone i nieignorowane pliki runtime (poza `docs/`, frontendem,
+testami, katalogami administracyjnymi, plikami sekretów i plikami > 16 MiB)
+trafiają do migawki automatycznie, więc nowy moduł kompiluje się bez `git add`.
+Inne nieśledzone pliki można jawnie dodać do migawki:
 
 ```powershell
 python -B scripts/docker_dev.py --repo-root $source up --source-root $source --port 3197 `
@@ -60,8 +81,8 @@ python -B scripts/docker_dev.py --repo-root $source up --source-root $source --p
 Każda opcja wskazuje dokładną ścieżkę względną do jednego regularnego pliku,
 który w chwili przechwycenia zwraca `git ls-files --others --exclude-standard`.
 Dozwolone są powtórzone opcje; globs, katalogi, ścieżki absolutne, traversal,
-sekrety i pliki administracyjne są odrzucane. Pozostałe nieśledzone pliki nadal
-pozostają wykluczone. Lista z CLI jest zapisywana jako kanoniczne JSON w
+sekrety i pliki administracyjne są odrzucane. Pozostałe nieśledzone pliki spoza
+reguły automatycznej nadal pozostają wykluczone. Lista z CLI jest zapisywana jako kanoniczne JSON w
 środowisku backendu i wchodzi do digestu Compose; zmiana listy istniejącej grupy
 przechodzi przez zarządzane odtworzenie z wymaganym bezpiecznym drainem. Brak
 opcji przy uzgadnianiu istniejącej grupy zachowuje przypiętą listę; nowa grupa
@@ -70,6 +91,19 @@ indeksu Git, capture akceptuje go jako już obecny w `files` i nie dubluje go w
 `included_untracked`.
 Programowe przekazanie `[]` jawnie czyści listę; hostowa zmienna środowiskowa
 `FULLMAG_DEV_INCLUDE_UNTRACKED` nie ustala jej wartości.
+
+Build DEV kompiluje CUDA tylko dla GPU widocznych w kontenerze backendu (FEM
+i FDM, np. `89-real` dla RTX 40xx). Gdy sonda sterownika nie jest dostępna,
+build wraca do przenośnej macierzy obrazu. Wybrana lista jest zapisana
+w `build.cuda_architectures` receiptu. `backend_dev.py` rozumie też
+`FULLMAG_DEV_CUDA_ARCHITECTURES` (`auto`, `all` albo lista CMake), ale launcher
+nie przekazuje jeszcze tej zmiennej do usługi, więc DEV zawsze używa `auto`.
+Pakiet DEV nie jest artefaktem przenośnym ani wydaniem.
+
+Restart backendu po zmianie wyłącznie `docs/`, frontendu lub plików testowych
+wykorzystuje istniejący pakiet: cache-hit porównuje `runtime_source_digest`
+receiptu z plikami runtime świeżej migawki. Commit lub zmiana brancha nadal
+wymaga przebudowy, bo commit jest wkompilowany w tożsamość binariów.
 
 Port musi być wolny. Wybierz wolny port, jeśli inna instancja już działa.
 `docker-dev-images` przygotowuje wyłącznie obrazy helperów; `docker-dev-build`
@@ -99,6 +133,17 @@ nie zmieniają source identity; świadomie śledzone fixtures nadal są sprawdza
 
 ## Iteracje i awarie
 
+Gotowy kandydat pakietu po nieudanej publikacji jest odrębny od działającego
+pakietu. Backend najpierw sprawdza jego kompletność i dowody Make oraz
+zachowuje oryginalny manifest przed następnym capture źródeł. Dopiero świeże
+wejścia pozwalają wybrać istniejącą rotację pasującego pakietu albo retirement
+zbędnego stagingu. Przygotowane archiwum bez trwałego intentu niczego nie
+usuwa. Logi, receipty i manifesty pozostają w ograniczonym namespace
+`backend/candidate-retirements` control volume; bieżący pakiet, rollback,
+cache i storage użytkownika zostają zachowane. Nie usuwaj kandydata ręcznie
+i nie twórz nowych wolumenów jako obejścia blokady. Kontrakt i stan dowodu:
+[ADR 0061](../adr/0061-docker-development-build-and-runtime-container.md#rozszerzenie-20102026--gotowy-nieopublikowany-staging).
+
 `just docker-dev-restart-idle <attempt> <config-sha256> <source> <port>`
 sprawdza dokładny kontener, obraz, polecenie, etykiety i mounty oraz wymaga
 zdrowego API bez aktywnej sesji. Na czas kontroli zamyka jedyne wejście HTTP przez zatrzymanie własnego frontendu,
@@ -127,6 +172,25 @@ startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backe
 `docker-dev-recreate-volume` wymaga zatrzymanego backendu i dokładnych pinów
 próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
+Przed pierwszym admission awaria samego buildu może zachować ten sam root sesji. Wymaga to dokładnego bootstrap certyfikatu, jednej potwierdzonej awarii przypiętej do bieżącego `Docker StartedAt` oraz braku handoff, publikacji pakietu i storage probe. Dowód wskazuje bezpośredni terminal tej próby development albo związany terminal resume; bieżąca inkarnacja kontenera musi być zgodna. Launcher ponawia cały dowód pod blokadą przed odtworzeniem usług. Nie ustawia `restart_verified`, nie zmienia ownera i nie powtarza Solve; nowe API nadal wymaga zwykłego admission. Brak lub zmiana dowodu blokuje tę ścieżkę.
+
+Bezpośredni CLI `recreate-volume` obsługuje również powtarzane
+`--include-untracked`. Jawne opcje przypinają kompletną listę plików nowej
+konfiguracji; brak opcji zachowuje listę poprzedniej próby. Obowiązują te same
+kontrole dokładnych ścieżek, regularności i spójnego capture co przy `up`.
+
+Jeżeli prywatny request odzyskania przyjętego runu został już opublikowany,
+launcher ponownie sprawdza jego niezmienne archiwum procesu i właściciela,
+pierwotną aktywację, reconciliation, stop journal oraz nadal oczekujący run.
+Odtworzony proof i request muszą mieć dokładnie te same bajty. Bieżące pliki
+procesu mogą pochodzić z późniejszego kontenera i nie zastępują historii;
+jego własny dowód zatrzymania nadal przechodzi oddzielną kontrolę przed
+odtworzeniem usług. Brak lub niezgodność części opublikowanego archiwum
+blokuje start, bez powtarzania Solve i bez modyfikacji danych runu.
+Przerwana publikacja bez końcowego requestu może zostać dokończona wyłącznie
+po walidacji bieżących rekordów procesu i właściciela oraz zgodności każdego
+istniejącego fragmentu z odtworzonymi bajtami. Częściowe archiwum samo nie
+uprawnia do odzyskania historii.
 Oczekująca transakcja recovery zachowuje dokładną pierwotną autoryzację po
 ponownej walidacji. Sama publikacja receipt `recovered` nie usuwa uprawnienia
 potrzebnego przy pierwszym starcie po recovery. Jeżeli późniejszy właściciel
@@ -159,8 +223,11 @@ just docker-dev-script-pinned <attempt> <config-sha256> <checkout> <script>
 Zwykła komenda ustala `attempt` i `config-sha256` automatycznie z bieżącej
 grupy i zweryfikowanych receiptów; wymaga dokładnie jednej zgodnej, zdrowej
 pary usług. Nie uruchamia kontenerów, nie buduje i nie wybiera historycznej
-próby według daty. Przy aktywnej sesji trzeba najpierw zamknąć bieżący projekt
-w Workspace; samo zakończenie Solve nie oznacza pustego Workspace.
+próby według daty. Jeżeli poprzedni model jest terminalny, archiwizuje jego
+kanoniczny model, edytowalny skrypt i typowany stan UI, zachowując odwołania do
+wyników bez kopiowania ciężkich artefaktów. Dopiero potem aktywuje nowy skrypt.
+Trwająca symulacja lub niepotwierdzone zwolnienie zasobów blokuje przejście;
+polecenie nie anuluje symulacji ani nie zwalnia GPU.
 
 W jawnej komendzie `docker-dev-script-pinned` wartości muszą pochodzić z tego samego
 `development/attempts/<attempt>/{terminal,compose}.json` w wolumenie control.
@@ -202,12 +269,19 @@ Każde jawne wywołanie otrzymuje nowy domyślny `request_id` w postaci
 ten sam plik może posłużyć do kolejnej symulacji. Jawny `request_id` pozostaje
 stabilnym kluczem idempotencji i odtwarza wynik tego konkretnego żądania.
 Nieznany wynik wcześniejszej operacji nadal blokuje nowe wywołanie. Nowe żądanie
-przechodzi przez istniejącą
-walidację Workspace: musi być pusty według kontraktu API. Zamknięcie runu nie
-retiruje bieżącego Workspace, więc samo podanie nowego `request_id` jako piątego
-argumentu nie wystarcza; potrzebne jest istniejące, jawne przejście do pustego
-Workspace. Ten draft nie dodaje mechanizmu retire/reset. Nie używaj ponownie ID,
-którego receipt ma stan `unknown`.
+przechodzi przez istniejącą walidację pustego Workspace po potwierdzonym
+archiwizowaniu poprzedniego modelu. Prywatna operacja retirement nie tworzy
+RunIntent i nie wywołuje Solve. Jej trwały intent w control volume wiąże dokładne
+session/run oraz wejścia operacji; niezmienne archiwum projektu trafia do
+session store, obok danych użytkownika. Ponowienie tej samej operacji kończy
+wyłącznie archiwizowanie. Nie ponawia startupowego POST ani Solve po nieznanym
+wyniku. Nie używaj ponownie ID, którego receipt ma stan `unknown`.
+
+Potwierdzona odmowa przy aktywnej symulacji zamyka własną operację bez mutacji
+modelu. Utrata odpowiedzi po wysłaniu retirement zachowuje blokadę i dokładne
+piny do reconciliacji. Nowa instancja API wymaga bieżącego zakresu żądania oraz
+hasza i oryginalnego zakresu niezmiennego archiwum. Nie usuwaj markerów ręcznie.
+Ta ścieżka wymaga jeszcze kwalifikacji runtime: **NOT VERIFIED**.
 
 Nieznany wynik operacji zachowuje zasoby i blokadę do jawnego rozstrzygnięcia.
 Nie usuwaj ręcznie `active`, pakietu ani lease, aby wymusić kolejny build.
@@ -256,6 +330,88 @@ recepty, po `browser_image`. Nieudane lub
 niejednoznaczne kontrole kończą się zachowaniem zasobów i wymagają ręcznego
 przeglądu receiptu operacji.
 
+## Budżet backendu podczas trwającego startu
+
+`increase-resources` zwiększa RAM i CPU dokładnie wskazanego backendu przed
+uruchomieniem API, bez odtwarzania kontenera i bez powtarzania skryptu. Wymaga
+aktywnej próby `development`, jej uwierzytelnionego helpera i tego samego
+zarejestrowanego checkoutu. Domyślnie pokazuje plan bez zmiany limitów:
+
+```powershell
+python -B scripts/docker_dev.py --repo-root <main> increase-resources `
+  --source-root <source> --attempt <development-uuid> `
+  --backend-container-id <full-container-id> --backend-memory-gib 128 --backend-cpus 16
+# Zastosowanie tego samego zakresu: dodaj --apply.
+```
+
+Zmniejszenie limitów ani aktualizacja działającego solvera nie są obsługiwane
+przez tę komendę. Przed zmianą helper krótko wstrzymuje przypięty proces
+startowy; jeśli jego bramka cgroup już opublikowała request, odrzuca zmianę.
+Proces zostaje wznowiony po potwierdzeniu nowych limitów. Przed wysłaniem zmiany
+EOF/watchdog zwalnia pauzę; po uzbrojeniu aktualizacji nieznany wynik zachowuje
+zatrzymany startup i zapisane dowody, blokując wejście do gate. Niezależny
+hostowy finalizer wznawia przypięty proces również po śmierci helpera, jeśli
+aktualizacja jest potwierdzona albo nie została wysłana. Jednoczesna utrata
+hostowego kontrolera i helpera może pozostawić startup zatrzymany; nie jest
+to dowód zakończenia procesu i wymaga obserwacji/reconciliation jego intentu.
+Zapas swapu ponad RAM pozostaje taki sam. Budżet nie może przekraczać pojemności
+Docker VM, a planowana różnica RAM musi pozostawić co najmniej 16 GiB
+aktualnie dostępnej pamięci. Sam limit nie rezerwuje pamięci ani CPU dla runu.
+
+Kontener, obraz, sesje, dane, cache i pierwotne receipty pozostają zachowane.
+Nowy receipt jest zapisywany pod `development/attempts/<uuid>/resource-increases`.
+Profil `backend/resource-budget.json` wskazuje surowy hash tego receipt i jest
+stosowany przy kolejnych startach wyłącznie w tym samym control namespace.
+Nierozstrzygnięty wcześniejszy intent blokuje następne zwiększenie, zamiast
+automatycznie ponawiać `docker update`. Limit 200 GiB wymaga VM większej niż
+200 GiB z zapasem dla innych usług; komenda nie restartuje Docker/WSL ani innych grup.
+Odbiór uruchomienia API, meshu i solvera jest osobnym dowodem.
+
+## Zatrzymanie zbędnej kontroli rollbacków przed API
+
+Gdy opublikowany pakiet jest gotowy, lecz stary helper nadal sprawdza rollbacki,
+`stop-pre-api-start` może utworzyć checkpoint i zakończyć wyłącznie własny start
+przed API, zachowując przyjęty model i istniejący kontekst pierwszego pre-ACK:
+
+```powershell
+python -B scripts/docker_dev.py --repo-root <main> stop-pre-api-start `
+  --source-root <main> --attempt <development-uuid> --backend-container-id <full-id>
+# Odczytowy podgląd powyżej; zastosowanie: dodaj --apply.
+```
+
+Nie służy do zatrzymywania API, solvera ani aktywnego builda. Wymaga jednego
+czytanego artefaktu starego backupu, zakończonej publikacji pakietu, niezmienionego
+owner/process/config i held runu bez start_release. Nie zmienia historycznych
+receiptów, ownera, konfiguracji, katalogu ani limitów. Zachowuje intent i wynik
+w `development/attempts/<uuid>/pre-api-stop`; pierwotny kontroler kończy własną
+operację po faktycznym wyjściu backendu. Dopiero terminal `failed-confirmed` i
+potwierdzony stop pozwalają właściwemu launcherowi odtworzyć usługę z nowym
+helperem, bez nowego `--script`. Nieznany wynik wymaga obserwacji istniejącego
+intentu; komendy nie należy ponawiać. Szczegóły i granice: ADR0066.
+Jeżeli proces już zakończył się dokładnym exit143, lecz publikacja końcowego
+receipt została przerwana, `--finalize` zamiast `--apply` ponownie obserwuje
+ten sam zapisany intent pod nowym lease i może dokończyć wyłącznie receipt.
+Nie wysyła sygnału i wymaga terminalnego `failed-confirmed` pierwotnej próby.
+`--resume-unissued` służy wyłącznie do zwolnienia pauzy po przerwaniu polecenia
+przed intentem: wymaga braku nazwanego publishera i samego intentu, oryginalnego
+kontrolera oraz świeżych dowodów. Nie wznawia nieznanego lub wydanego stopu.
+
+Jeżeli ręczny restart zakończył się już błędem zamykania manifestu źródeł
+przed build/API, zamiast wysyłać stop użyj odrębnego checkpointu:
+
+```powershell
+python -B scripts/docker_dev.py --repo-root <main> checkpoint-pre-api-failure `
+  --source-root <main> --attempt <failed-development-uuid> --backend-container-id <full-id>
+```
+
+Ta komenda zapisuje jedynie dowód istniejącego exit2 i dokładne logi capture-only,
+sprawdzając niezmieniony pierwszy kontekst pre-ACK i held run. Nie powtarza
+skryptu. W razie przerwanej publikacji `stop-pre-api-start --finalize` rozpoznaje
+ten odrębny wariant i domyka receipt również bez sygnału. Następnie zwykła
+`recreate-volume` zachowuje model, cache i dane. Przed capture wstrzymaj zapisy
+źródeł do czasu potwierdzenia spójnego cienia; restart z Docker Desktop może
+zbiec się z edycją hosta i nie jest dowodem ukończonego buildu ani API.
+
 ## Granica zapisu i retencja
 
 | Dane | Miejsce |
@@ -303,7 +459,11 @@ liczba prób jednej fazy i archiwów metadanych pakietu jest ograniczona do 64.
 Wyczerpanie budżetu zatrzymuje dalszy zapis, zachowując dowody.
 
 Retencja binariów zachowuje pakiet bieżący i zweryfikowany rollback. Aktywnego
-cache nie usuwa. Nie ma automatycznego globalnego GC BuildKit, starych obrazów
+cache nie usuwa. Start backendu zachowuje wszystkie historyczne pakiety i
+raportuje odroczenie retencji; ich pełna walidacja i usuwanie nie blokują API.
+Odrębna operacja retencji nie jest obecnie udostępniona przez ten launcher.
+Przed następnym buildem nadal oceń miejsce i zachowywane dane.
+Nie ma automatycznego globalnego GC BuildKit, starych obrazów
 ani nieaktywnych grup. Ich usunięcie wymaga osobnego planu właścicieli/referencji
 i zgody. Samo usunięcie kontenera nie odzyskuje wolumenów ani fizycznego VHDX.
 
@@ -311,3 +471,13 @@ i zgody. Samo usunięcie kontenera nie odzyskuje wolumenów ani fizycznego VHDX.
 launcherów w istniejącym backendzie; nie kompiluje natywnych testów jednostkowych.
 Sukces buildu nie stanowi kwalifikacji FDM/FEM/BORIS. Release, CI i kwalifikacja
 naukowa zachowują własne jawne zarządzane recepty zgodnie z AGENTS.md.
+
+
+### Nieudany start API podczas odzyskiwania oczekującego runu
+
+Awaria API przed przypięciem native ownera może pozostawić nowszy process-tree
+niż archiwum pierwotnej awarii. Start rozpoznaje wyłącznie ściśle określony
+legacy błąd loopback z zakończonym API, niezmienionym bootstrapem i ownerem.
+Archiwa, request i natywna walidacja runu nadal są obowiązkowe. Ten wyjątek
+nie powtarza Solve, nie resetuje ownera i nie zastępuje recovery. Inny błąd,
+zmiana ownera lub brak dowodów nadal blokują start; nie usuwaj ręcznie receiptów.

@@ -1,0 +1,157 @@
+import assert from "node:assert/strict";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { chromium } from "playwright";
+
+const baseUrl = process.env.CONTROL_ROOM_URL;
+const output = process.env.FULLMAG_PREPARATION_WORKSPACE_REPORT_DIR;
+if (!baseUrl || !output) throw new Error("Managed frontend URL and report directory are required.");
+await mkdir(output, { recursive: true });
+const report = { state: "running", scope: "production UI with controlled data; no solver qualification", steps: [], errors: [] };
+const browser = await chromium.launch({ headless: true });
+const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+page.on("pageerror", error => report.errors.push(error.message));
+const panel = page.getByRole("region", { name: "Simulation preparation window", exact: true });
+const button = name => page.getByRole("button", { name, exact: true });
+const box = async () => {
+  const value = await panel.boundingBox();
+  assert.ok(value, "Preparation window must be visible");
+  return value;
+};
+try {
+  await page.goto(new URL("/dev/simulation-preparation", baseUrl).href, { waitUntil: "domcontentloaded" });
+  await panel.waitFor();
+  assert.equal(await panel.evaluate(el => getComputedStyle(el).pointerEvents), "auto");
+  assert.equal(await page.locator('[aria-modal="true"]').count(), 0);
+  const draft = page.getByRole("textbox", { name: "Workspace draft" });
+  await draft.fill("Keep this unsaved draft");
+
+  const initial = await box();
+  await button("Move window with arrow keys").press("ArrowRight");
+  assert.equal((await box()).x, initial.x + 10);
+  const header = panel.locator(".fm-draggable-panel__heading");
+  const headerBox = await header.boundingBox();
+  await page.mouse.move(headerBox.x + 20, headerBox.y + 8);
+  await page.mouse.down();
+  await page.mouse.move(headerBox.x + 80, headerBox.y + 38, { steps: 8 });
+  await page.mouse.up();
+  assert.ok((await box()).x > initial.x + 50);
+  report.steps.push("pointer and keyboard movement");
+
+  await button("View preparation details").click();
+  const expanded = await box();
+  await button("Maximize window").click();
+  await button("Restore window size").click();
+  assert.deepEqual(await box(), expanded, "CSS-sized window must restore its position before any manual resize");
+  await button("Resize window with arrow keys").press("ArrowLeft");
+  assert.equal((await box()).width, expanded.width - 10);
+  const grip = await button("Resize window with arrow keys").boundingBox();
+  await page.mouse.move(grip.x + 8, grip.y + 8);
+  await page.mouse.down();
+  await page.mouse.move(grip.x - 52, grip.y + 48, { steps: 8 });
+  await page.mouse.up();
+  const resized = await box();
+  assert.ok(resized.width < expanded.width - 50);
+  assert.ok(resized.height > expanded.height + 30);
+  await button("Maximize window").click();
+  assert.ok((await box()).width >= 1400);
+  await button("Restore window size").click();
+  assert.deepEqual(await box(), resized);
+  report.steps.push("pointer and keyboard resize, maximize and restore");
+
+  const search = page.getByRole("searchbox", { name: "Search preparation log text or stage" });
+  await search.fill("Entry 14:");
+  assert.equal(await panel.locator('[role="log"] article').count(), 1);
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(baseUrl).origin });
+  await button("Copy visible log").click();
+  await page.getByText("Visible log copied.", { exact: true }).waitFor();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  assert.match(copied, /Entry 14:/);
+  assert.match(copied, /\nFull detail is preserved/);
+  assert.doesNotMatch(copied, /Entry 13:|Entry 15:/);
+  const downloadPromise = page.waitForEvent("download");
+  await button("Download visible log .txt").click();
+  const download = await downloadPromise;
+  await download.saveAs(resolve(output, "visible-log.txt"));
+  assert.equal(await readFile(resolve(output, "visible-log.txt"), "utf8"), copied);
+  await search.fill("no-such-entry");
+  assert.equal(await button("Copy visible log").isEnabled(), false);
+  await search.fill("");
+  await page.getByRole("combobox", { name: "Level" }).click();
+  await page.getByRole("option", { name: "Errors", exact: true }).click();
+  assert.ok(await panel.locator('[role="log"] article').count() > 0);
+  assert.equal(await panel.locator('[role="log"] article:not([data-level="error"])').count(), 0);
+  await page.getByRole("combobox", { name: "Level" }).click();
+  await page.getByRole("option", { name: "All", exact: true }).click();
+  report.steps.push("search, level filter, actual clipboard contents and identical text download");
+
+  const viewport = panel.locator(".fm-simulation-preparation-log__scroll .fm-scroll-area__viewport");
+  await viewport.hover();
+  await page.mouse.wheel(0, -10000);
+  await button("Return to live log tail").waitFor();
+  const scrollBefore = await viewport.evaluate(el => el.scrollTop);
+  await button("Append log entry").click();
+  await page.getByText(/Showing 61 of 61 entries/).waitFor();
+  assert.equal(await viewport.evaluate(el => el.scrollTop), scrollBefore);
+  await button("Return to live log tail").click();
+  await page.waitForFunction(() => {
+    const el = document.querySelector(".fm-simulation-preparation-log__scroll .fm-scroll-area__viewport");
+    return el && el.scrollHeight - el.scrollTop - el.clientHeight < 5;
+  });
+  report.steps.push("reading older log entries survives append; explicit follow resumes");
+
+  await button("Minimize simulation preparation").click();
+  await button("Show simulation preparation").waitFor();
+  await page.waitForFunction(() => document.activeElement?.matches("[data-preparation-restore]"));
+  assert.equal(await panel.count(), 0);
+  await button("failed").click();
+  assert.equal(await panel.count(), 0);
+  await button("Show simulation preparation").click();
+  await page.waitForFunction(() => document.activeElement?.matches("[data-window-move]"));
+  assert.equal(await panel.getByText("Simulation preparation failed", { exact: true }).isVisible(), true);
+  await button("Close simulation preparation").click();
+  await page.waitForFunction(() => document.activeElement?.matches("[data-preparation-restore]"));
+  await button("stale").click();
+  assert.equal(await panel.count(), 0);
+  await button("Show simulation preparation").click();
+  await button("Move window with arrow keys").press("Escape");
+  await page.waitForFunction(() => document.activeElement?.matches("[data-preparation-restore]"));
+  assert.equal(await panel.count(), 0);
+  await button("New preparation").click();
+  await panel.waitFor();
+  assert.equal(await draft.inputValue(), "Keep this unsaved draft");
+  report.steps.push("minimize, close, Escape, focus restoration, failure while hidden and new attempt");
+
+  await button("View preparation details").click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForFunction(() => {
+    const el = document.querySelector(".fm-simulation-startup__window");
+    const rect = el?.getBoundingClientRect();
+    return rect && rect.left >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight;
+  });
+  assert.equal(await button("Close simulation preparation").isVisible(), true);
+  assert.ok(await viewport.evaluate(el => el.clientHeight) >= 120, "Narrow log must show more than a single line below its controls");
+  await page.screenshot({ path: resolve(output, "preparation-narrow.png") });
+  await page.setViewportSize({ width: 1280, height: 500 });
+  await page.waitForFunction(() => {
+    const rect = document.querySelector(".fm-simulation-startup__window")?.getBoundingClientRect();
+    return rect && rect.top >= 0 && rect.bottom <= innerHeight;
+  });
+  assert.equal(await button("Close simulation preparation").isVisible(), true);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.screenshot({ path: resolve(output, "preparation-window.png") });
+  report.steps.push("narrow viewport containment and readable log height; short viewport containment");
+  await button("ready").click();
+  assert.equal(await panel.count(), 0);
+  assert.equal(await button("Show simulation preparation").count(), 0);
+  assert.deepEqual(report.errors, []);
+  report.state = "passed";
+} catch (error) {
+  report.state = "failed";
+  report.error = error.stack ?? String(error);
+  await page.screenshot({ path: resolve(output, "preparation-failure.png") }).catch(() => undefined);
+  process.exitCode = 1;
+} finally {
+  await browser.close();
+  await writeFile(resolve(output, "preparation-window-report.json"), JSON.stringify(report, null, 2));
+}

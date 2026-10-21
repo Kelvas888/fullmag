@@ -14,6 +14,7 @@
 @import "../src/design/styles/dialog-mesh-build.css" layer(fm-primitives);
 @import "../src/design/styles/dialog-data-preview.css" layer(fm-primitives);
 @import "../src/design/styles/dialog-simulation-startup.css" layer(fm-primitives);
+@import "../src/design/styles/simulation-preparation-log.css" layer(fm-primitives);
 @import "../src/design/styles/dialog-communication-policy.css" layer(fm-primitives);
 @import "../src/design/styles/dialog-notifications.css" layer(fm-primitives);
 @import "../src/design/styles/accordion.css" layer(fm-primitives);

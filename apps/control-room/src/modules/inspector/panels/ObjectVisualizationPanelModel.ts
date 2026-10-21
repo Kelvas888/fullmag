@@ -760,6 +760,15 @@ export function resolveObjectVisualizationTargetForLane({
   const explicitObjectVisualizationSelection =
     objectVisualizationSelection && selection.ref?.type === "scene-object";
 
+  const publicAirboxVisualizationSelection =
+    selection.kind === "airbox.visualization" ||
+    selection.kind === "airbox.visualization.debug";
+  if (publicAirboxVisualizationSelection) {
+    // Airbox display controls do not depend on a resolved solver lane. Field
+    // carrier identity and field availability stay gated by the resolved lane.
+    return selectionTarget?.kind === "airbox" ? selectionTarget : null;
+  }
+
   if (lane === "unresolved") {
     // An explicit object/region visualization node already carries a semantic
     // target. Keep its display controls usable while the numerical lane is
@@ -815,12 +824,6 @@ export function resolveObjectVisualizationTargetForLane({
     return selectionTarget?.kind === "fdm-domain" ? null : selectionTarget;
   }
 
-  const publicAirboxVisualizationSelection =
-    selection.kind === "airbox.visualization" ||
-    selection.kind === "airbox.visualization.debug";
-  if (publicAirboxVisualizationSelection) {
-    return selectionTarget?.kind === "airbox" ? selectionTarget : null;
-  }
   if (selection.kind !== "mesh.grid.universe-outside-support") return null;
   return selectionTarget?.kind === "airbox" ? selectionTarget : null;
 }

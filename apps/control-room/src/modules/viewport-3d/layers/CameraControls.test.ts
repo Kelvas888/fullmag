@@ -8,6 +8,7 @@ import {
   resolveViewport3DOrbitDebugControlDeltas,
   resolveViewport3DOrbitDebugStep,
   resolveViewport3DCameraFit,
+  resolveViewport3DAutoFitOrbitTarget,
   resolveViewport3DCameraInteractionOptions,
   shouldApplyViewport3DOrbitDebugAngles,
   shouldApplyViewport3DCameraState,
@@ -351,9 +352,14 @@ describe("CameraControls", () => {
       new URL("./CameraControls.tsx", import.meta.url),
       "utf8",
     );
+    const targetSyncStart = source.indexOf(
+      "if (viewport3DCameraGestureActive(cameraGestureRef)) return;",
+      source.indexOf("function useOrbitCameraControlsModel"),
+    );
     const targetSyncBlock = source.slice(
-      source.indexOf('tracker.recordDirtyFrame("camera-control-target")') - 1800,
-      source.indexOf('tracker.recordDirtyFrame("camera-control-target")') + 90,
+      targetSyncStart,
+      source.indexOf('tracker.recordDirtyFrame("camera-control-target")',
+        source.indexOf("shouldSyncCameraControlsPose({", targetSyncStart)) + 90,
     );
     const orbitControlsStart = source.indexOf("<DreiOrbitControls");
     const orbitControlsBlock = source.slice(
@@ -368,7 +374,7 @@ describe("CameraControls", () => {
       "shouldPreserveViewport3DAutoFitAgainstDefaultCamera",
     );
     expect(targetSyncBlock).toContain(
-      "const fittedCamera = bounds ? resolveViewport3DCameraFit(bounds) : null;",
+      "const fittedCamera = bounds\n      ? resolveViewport3DCameraFit(bounds, {",
     );
     expect(orbitControlsBlock).not.toContain("target={cameraState.target}");
     expect(targetSyncBlock).toContain(".target.set(");
@@ -459,6 +465,62 @@ describe("CameraControls", () => {
     expect(fit.position[0]).toBeCloseTo(2.4e-7);
     expect(fit.near).toBeLessThan(1e-8);
     expect(fit.far).toBeGreaterThan(1e-6);
+  });
+
+  it("fits narrower viewports and changed FOV without using a fixed camera distance", () => {
+    const bounds = {
+      center: [1e-7, 0, 0] as [number, number, number],
+      radius: 5e-8,
+      size: [1e-7, 6e-8, 5e-9] as [number, number, number],
+    };
+    const defaultFit = resolveViewport3DCameraFit(bounds, {
+      aspect: 1,
+      fovDegrees: 42,
+    });
+    const narrowFit = resolveViewport3DCameraFit(bounds, {
+      aspect: 0.5,
+      fovDegrees: 42,
+    });
+    const narrowFovFit = resolveViewport3DCameraFit(bounds, {
+      aspect: 1,
+      fovDegrees: 35,
+    });
+    const wideFovFit = resolveViewport3DCameraFit(bounds, {
+      aspect: 1,
+      fovDegrees: 70,
+    });
+    const fitDistance = (fit: typeof defaultFit) =>
+      Math.hypot(
+        fit.position[0] - fit.target[0],
+        fit.position[1] - fit.target[1],
+        fit.position[2] - fit.target[2],
+      );
+
+    expect(fitDistance(narrowFit)).toBeGreaterThan(fitDistance(defaultFit));
+    expect(fitDistance(narrowFovFit)).toBeGreaterThan(fitDistance(wideFovFit));
+  });
+
+  it("adopts the off-center target only for an untouched source camera at its applied fit", () => {
+    const fit = resolveViewport3DCameraFit({
+      center: [2e-8, -1e-8, 7.5e-9],
+      radius: 2.5e-8,
+      size: [4e-8, 3e-8, 1e-8],
+    }, { aspect: 0.6, fovDegrees: 35 });
+    expect(resolveViewport3DAutoFitOrbitTarget({
+      cameraState: DEFAULT_VIEWPORT_3D_CAMERA_STATE,
+      currentPosition: fit.position,
+      fit,
+    })).toEqual([2e-8, -1e-8, 7.5e-9]);
+    expect(resolveViewport3DAutoFitOrbitTarget({
+      cameraState: DEFAULT_VIEWPORT_3D_CAMERA_STATE,
+      currentPosition: [fit.position[0] + 1e-8, fit.position[1], fit.position[2]],
+      fit,
+    })).toBeNull();
+    expect(resolveViewport3DAutoFitOrbitTarget({
+      cameraState: { ...DEFAULT_VIEWPORT_3D_CAMERA_STATE, target: [1e-8, 0, 0] },
+      currentPosition: fit.position,
+      fit,
+    })).toBeNull();
   });
 
   it("uses micrometer-scale defaults before resources arrive", () => {

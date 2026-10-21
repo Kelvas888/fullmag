@@ -16,10 +16,12 @@ import type { PrimitiveDraft } from "@/kernel/authoring/geometryLifecycleCommand
 
 import type { Viewport3DResourceTracker } from "../viewport3dDiagnostics";
 import type { Viewport3DColors } from "../viewport3dTypes";
-import type {
-  Viewport3DBoxCylinderDifferencePreview,
-  Viewport3DCylinderCylinderDifferencePreview,
-  Viewport3DPrimitiveObject,
+import {
+  cardinalAxisIndex,
+  planeAxesForCardinalAxis,
+  type Viewport3DBoxCylinderDifferencePreview,
+  type Viewport3DCylinderCylinderDifferencePreview,
+  type Viewport3DPrimitiveObject,
 } from "../viewport3dPrimitiveModel";
 
 export function primitiveDraftOverlayObject(
@@ -253,25 +255,6 @@ function createCylinderCylinderDifferenceGeometry(
     remapExtrudedCardinalAxisGeometry(geometry, axisIndex);
   }
   return geometry;
-}
-
-function cardinalAxisIndex(axis: readonly [number, number, number]): 0 | 1 | 2 | null {
-  const abs = axis.map((value) => Math.abs(value)) as [number, number, number];
-  const max = Math.max(...abs);
-  if (max <= 1e-12) return null;
-  const index = abs.indexOf(max) as 0 | 1 | 2;
-  for (let entryIndex = 0; entryIndex < abs.length; entryIndex += 1) {
-    if (entryIndex !== index && abs[entryIndex] / max > 1e-9) {
-      return null;
-    }
-  }
-  return index;
-}
-
-function planeAxesForCardinalAxis(axisIndex: 0 | 1 | 2): [0 | 1 | 2, 0 | 1 | 2] {
-  if (axisIndex === 0) return [1, 2];
-  if (axisIndex === 1) return [0, 2];
-  return [0, 1];
 }
 
 function remapExtrudedCardinalAxisGeometry(

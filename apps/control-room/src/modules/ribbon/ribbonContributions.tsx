@@ -761,6 +761,11 @@ type RibbonSessionStatus = {
   resources: Pick<
     LiveStatusResource["resources"],
     "field_revision" | "fields_revision"
+  > & Partial<
+    Pick<
+      LiveStatusResource["resources"],
+      "domain_generation_id" | "mesh_revision" | "topology_revision"
+    >
   >;
 };
 

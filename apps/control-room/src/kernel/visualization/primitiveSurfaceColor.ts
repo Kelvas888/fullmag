@@ -16,6 +16,25 @@ export const FERROMAGNETIC_PRIMITIVE_COLOR_TOKENS = [
   "--fm-chart-rosewater",
 ] as const;
 
+/**
+ * Rounded hue angles shared by the existing Catppuccin Mocha and Latte chart
+ * colors. Keep these aligned with the token values in design/styles/theme.css.
+ */
+const PRIMITIVE_COLOR_HUE_DEGREES = {
+  "--fm-chart-blue": 219,
+  "--fm-chart-green": 112,
+  "--fm-chart-yellow": 38,
+  "--fm-chart-red": 345,
+  "--fm-chart-mauve": 267,
+  "--fm-chart-peach": 23,
+  "--fm-chart-teal": 177,
+  "--fm-chart-sky": 193,
+  "--fm-chart-pink": 316,
+  "--fm-chart-lavender": 231,
+  "--fm-chart-flamingo": 0,
+  "--fm-chart-rosewater": 10,
+} satisfies Record<(typeof FERROMAGNETIC_PRIMITIVE_COLOR_TOKENS)[number], number>;
+
 const MAGNETIC_SURFACE_TOKEN = "var(--fm-surface-magnetic)";
 
 /** Presentation role only; this helper never enables or infers physics. */
@@ -33,8 +52,10 @@ export function isFerromagneticPrimitiveRole(
 }
 
 /**
- * Assign stable, distinct palette slots for a scene snapshot. Hash collisions
- * probe forward in deterministic order; beyond the finite palette, slots repeat.
+ * Assign stable, distinct palette slots for a scene snapshot. The first object
+ * keeps its hashed slot; later objects maximize their minimum hue distance from
+ * assigned colors, with a hash-seeded cyclic tie-break. Beyond the finite
+ * palette, slots repeat.
  */
 export function createPrimitiveSurfaceColorAssignments(
   objectIds: readonly string[],
@@ -51,18 +72,52 @@ export function createPrimitiveSurfaceColorAssignments(
   for (const { objectId, hash } of entries) {
     const initialIndex = hash % paletteSize;
     let paletteIndex = initialIndex;
-    for (let probe = 0; probe < paletteSize; probe += 1) {
-      const candidate = (initialIndex + probe) % paletteSize;
-      if (!occupied.has(candidate)) {
-        paletteIndex = candidate;
-        break;
+    if (occupied.size > 0 && occupied.size < paletteSize) {
+      let bestMinimumHueDistance = -1;
+      for (let probe = 0; probe < paletteSize; probe += 1) {
+        const candidate = (initialIndex + probe) % paletteSize;
+        if (occupied.has(candidate)) continue;
+
+        const minimumHueDistance = minimumAssignedHueDistance(
+          candidate,
+          occupied,
+        );
+        if (minimumHueDistance > bestMinimumHueDistance) {
+          paletteIndex = candidate;
+          bestMinimumHueDistance = minimumHueDistance;
+        }
       }
+    } else if (occupied.size === 0) {
+      // Keep the first scene object anchored to its stable hash slot.
+      paletteIndex = initialIndex;
     }
     occupied.add(paletteIndex);
     assignments.set(objectId, paletteIndex);
   }
 
   return assignments;
+}
+
+function minimumAssignedHueDistance(
+  candidateIndex: number,
+  assignedIndices: ReadonlySet<number>,
+): number {
+  let minimumDistance = Number.POSITIVE_INFINITY;
+  for (const assignedIndex of assignedIndices) {
+    const candidateToken = FERROMAGNETIC_PRIMITIVE_COLOR_TOKENS[candidateIndex]!;
+    const assignedToken = FERROMAGNETIC_PRIMITIVE_COLOR_TOKENS[assignedIndex]!;
+    const distance = circularHueDistance(
+      PRIMITIVE_COLOR_HUE_DEGREES[candidateToken],
+      PRIMITIVE_COLOR_HUE_DEGREES[assignedToken],
+    );
+    minimumDistance = Math.min(minimumDistance, distance);
+  }
+  return minimumDistance;
+}
+
+function circularHueDistance(left: number, right: number): number {
+  const difference = Math.abs(left - right);
+  return Math.min(difference, 360 - difference);
 }
 
 /** Presentation only; the authored role never determines solver physics. */
@@ -90,7 +145,7 @@ export function resolvePrimitiveSurfaceColor(
   const requestedPaletteIndex = requested
     ? paletteIndexForToken(requested)
     : undefined;
-  if (requestedPaletteIndex !== undefined) {
+  if (requested !== undefined && requestedPaletteIndex !== undefined) {
     return {
       color: requested,
       paletteIndex: requestedPaletteIndex,

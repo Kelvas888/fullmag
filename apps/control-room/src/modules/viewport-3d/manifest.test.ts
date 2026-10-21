@@ -55,6 +55,26 @@ describe("viewport3dManifest", () => {
     );
   });
 
+  it("opens viewport settings and resets appearance sections through commands", async () => {
+    viewport3dStore.resetForTest();
+    const registry = registerViewportCommands();
+
+    expect(registry.get("viewport-3d.open-settings")).toBeDefined();
+    expect(registry.get("workspace.visualization-settings")).toBeDefined();
+    for (const section of ["background", "frame", "lighting", "effects", "all"]) {
+      expect(registry.get(`viewport-3d.reset-appearance-${section}`)).toBeDefined();
+    }
+
+    await registry.execute("viewport-3d.open-settings", { source: "test" });
+    expect(viewport3dStore.getSnapshot().widgets.settingsDialogOpen).toBe(true);
+
+    viewport3dStore.setAppearance({ backgroundMode: "solid" });
+    await registry.execute("viewport-3d.reset-appearance-background", {
+      source: "test",
+    });
+    expect(viewport3dStore.getSnapshot().appearance.backgroundMode).toBe("gradient");
+  });
+
   it("contributes orientation widget commands for ribbon and palette", async () => {
     viewport3dStore.resetForTest();
     const registry = registerViewportCommands();

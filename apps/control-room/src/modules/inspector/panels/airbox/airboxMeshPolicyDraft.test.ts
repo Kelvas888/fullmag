@@ -136,7 +136,7 @@ describe("Airbox mesh policy draft", () => {
     };
 
     expect(buildAirboxMeshPolicyReplaceRequest(draft)).toEqual({
-      request: { config: { optimize: true } },
+      request: { config: { optimize: true }, expected_revision: 16 },
     });
   });
 
@@ -151,7 +151,7 @@ describe("Airbox mesh policy draft", () => {
     };
 
     expect(buildAirboxMeshPolicyReplaceRequest(draft)).toEqual({
-      request: { config: { optimize: true, smoothing_steps: 4 } },
+      request: { config: { optimize: true, smoothing_steps: 4 }, expected_revision: 17 },
     });
   });
 
@@ -216,7 +216,7 @@ describe("Airbox mesh policy draft", () => {
     };
 
     expect(buildAirboxMeshPolicyReplaceRequest(draft)).toEqual({
-      request: { config: { mode: "auto" } },
+      request: { config: { mode: "auto" }, expected_revision: 1 },
     });
   });
 
@@ -233,6 +233,7 @@ describe("Airbox mesh policy draft", () => {
     expect(buildAirboxMeshPolicyReplaceRequest(manual)).toEqual({
       request: {
         config: { mode: "manual", size: [2e-9, 3e-9, 4e-9] },
+        expected_revision: 2,
       },
     });
     expect(buildAirboxMeshPolicyReplaceRequest({ ...manual, airboxSizeZ: "" })).toEqual({
@@ -251,7 +252,7 @@ describe("Airbox mesh policy draft", () => {
     expect(nanometers.quantityUnits?.airboxHmax).toBe("nm");
     expect(airboxMeshPolicyDraftDirty(nanometers, base)).toBe(false);
     expect(buildAirboxMeshPolicyReplaceRequest(nanometers)).toEqual({
-      request: { config: { airbox_hmax: 2e-9 } },
+      request: { config: { airbox_hmax: 2e-9 }, expected_revision: 3 },
     });
   });
 
@@ -274,6 +275,7 @@ describe("Airbox mesh policy draft", () => {
           padding: [1e-7, 2e-7, 3e-7],
           size: [8e-7, 3.25e-7, 9e-8],
         },
+        expected_revision: 18,
       },
     });
   });
@@ -308,6 +310,7 @@ describe("Airbox mesh policy draft", () => {
           padding: [1e-7, 2e-7, 3e-7],
           size: [1e-6, 2e-6, 3e-6],
         },
+        expected_revision: 19,
       },
     });
   });

@@ -33,6 +33,258 @@ const NVIDIA_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
 const NVIDIA_NVML_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
 const NVIDIA_MEMORY_MIB: u64 = 1024 * 1024;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DockerHostCpuMax {
+    #[serde(deserialize_with = "required_nullable_u64")]
+    quota_micros: Option<u64>,
+    #[serde(deserialize_with = "required_nullable_u64")]
+    period_micros: Option<u64>,
+}
+
+/// Root/VM facts published by the existing privileged maintenance helper.
+/// Container quotas remain separate process constraints, never host identity.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DockerHostCapacity {
+    schema: String,
+    scope: String,
+    project_id: String,
+    daemon_id_sha256: String,
+    boot_id: String,
+    allowed_cpu_ids: Vec<u32>,
+    cpu_max: DockerHostCpuMax,
+    #[serde(deserialize_with = "required_nullable_u64")]
+    memory_max_bytes: Option<u64>,
+    kernel_memory_total_bytes: u64,
+    docker_cpu_count: u64,
+    docker_memory_total_bytes: u64,
+}
+
+fn required_nullable_u64<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    serde::Deserialize::deserialize(deserializer)
+}
+
+impl DockerHostCapacity {
+    fn cpu_quota(&self) -> Result<CpuQuota> {
+        match (self.cpu_max.quota_micros, self.cpu_max.period_micros) {
+            // The true cgroup v2 root has no cpu.max file.
+            (None, None) => Ok(CpuQuota::Unlimited),
+            (None, Some(period)) if period > 0 => Ok(CpuQuota::Unlimited),
+            (Some(quota), Some(period)) if period > 0 => {
+                let millis = u64::try_from(u128::from(quota) * 1000 / u128::from(period))
+                    .context("Docker root CPU capacity overflowed")?;
+                if millis == 0 {
+                    bail!("Docker root CPU quota has no positive milli-CPU capacity");
+                }
+                Ok(CpuQuota::Limited {
+                    capacity_millis: millis,
+                })
+            }
+            _ => bail!("Docker root CPU quota/period binding is invalid"),
+        }
+    }
+
+    fn allowed_cpu_ids(&self, topology: &CpuTopology) -> Result<BTreeSet<u32>> {
+        if self.allowed_cpu_ids.is_empty()
+            || self
+                .allowed_cpu_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || u64::try_from(self.allowed_cpu_ids.len())? > self.docker_cpu_count
+        {
+            bail!("Docker root CPU mask must be nonempty, sorted and within Docker capacity");
+        }
+        let online: BTreeSet<u32> = topology.logical_cpus.iter().map(|cpu| cpu.id).collect();
+        let allowed: BTreeSet<u32> = self.allowed_cpu_ids.iter().copied().collect();
+        if !allowed.is_subset(&online) {
+            bail!("Docker root CPU mask differs from the observed CPU topology");
+        }
+        Ok(allowed)
+    }
+
+    fn memory(&self, mut observed: MemoryObservation) -> Result<MemoryObservation> {
+        if self.kernel_memory_total_bytes == 0
+            || self.docker_memory_total_bytes == 0
+            || self.memory_max_bytes == Some(0)
+            || observed.total_bytes != self.kernel_memory_total_bytes
+        {
+            bail!("Docker host memory descriptor differs from the current kernel observation");
+        }
+        observed.total_bytes = observed
+            .total_bytes
+            .min(self.docker_memory_total_bytes)
+            .min(self.memory_max_bytes.unwrap_or(u64::MAX));
+        observed.available_bytes = observed.available_bytes.min(observed.total_bytes);
+        validate_memory(observed)
+    }
+}
+
+fn docker_host_capacity_from_environment() -> Result<Option<DockerHostCapacity>> {
+    let (path, digest) = match (
+        std::env::var_os("FULLMAG_DOCKER_HOST_CAPACITY_PATH"),
+        std::env::var_os("FULLMAG_DOCKER_HOST_CAPACITY_SHA256"),
+    ) {
+        (None, None) => return Ok(None),
+        (Some(path), Some(digest)) => (path, digest),
+        _ => bail!("Docker host capacity path and digest must be set together"),
+    };
+    if std::env::var("FULLMAG_DOCKER_HOST_EXECUTION").as_deref() != Ok("1")
+        || std::env::var("FULLMAG_HOST_LEDGER_PROFILE").as_deref() != Ok("host-ledger-v1")
+    {
+        bail!("Docker host capacity requires the explicit managed host profile");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, digest);
+        bail!("Docker root capacity is supported only in the Linux runtime");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let digest = digest
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("invalid Docker capacity digest"))?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("Docker host capacity digest must be lowercase SHA-256");
+        }
+        let root = Path::new("/host-ledger");
+        let relative = format!("capacity/{digest}.json");
+        if std::path::PathBuf::from(path) != root.join(&relative) {
+            bail!("Docker host capacity path differs from its immutable descriptor");
+        }
+        for directory in [root.to_path_buf(), root.join("capacity")] {
+            let metadata = std::fs::symlink_metadata(directory)?;
+            if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+                bail!("Docker host capacity directory is not root-controlled");
+            }
+        }
+        let metadata = std::fs::symlink_metadata(root.join(&relative))?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o222 != 0
+        {
+            bail!("Docker host capacity descriptor is not immutable and root-owned");
+        }
+        let bytes = read_bounded_regular_file(root, &relative, 64 * 1024)?;
+        if format!("{:x}", Sha256::digest(&bytes)) != digest {
+            bail!("Docker host capacity bytes differ from the pinned digest");
+        }
+        let capacity: DockerHostCapacity =
+            serde_json::from_slice(&bytes).context("decode Docker host capacity descriptor")?;
+        if capacity.schema != "fullmag.docker-host-capacity.v1"
+            || capacity.scope != "docker_vm_root"
+            || std::env::var("FULLMAG_DOCKER_HOST_ID").as_deref()
+                != Ok(capacity.daemon_id_sha256.as_str())
+            || std::env::var("FULLMAG_HOST_LEDGER_PROJECT_ID").as_deref()
+                != Ok(capacity.project_id.as_str())
+            || format!("linux-boot-{}", capacity.boot_id) != current_host_boot_id(Utc::now())?
+            || capacity.docker_cpu_count == 0
+            || capacity.kernel_memory_total_bytes == 0
+            || capacity.docker_memory_total_bytes == 0
+            || capacity.memory_max_bytes == Some(0)
+            || capacity.allowed_cpu_ids.is_empty()
+            || capacity
+                .allowed_cpu_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || u64::try_from(capacity.allowed_cpu_ids.len())? > capacity.docker_cpu_count
+        {
+            bail!("Docker host capacity scope, project, daemon or boot differs");
+        }
+        capacity.cpu_quota()?;
+        Ok(Some(capacity))
+    }
+}
+
+/// True only after validating the pinned root/VM descriptor. An invalid
+/// explicit descriptor never falls back to consumer-scoped inventory.
+pub fn docker_host_capacity_is_configured() -> Result<bool> {
+    Ok(docker_host_capacity_from_environment()?.is_some())
+}
+
+pub struct ProcessCpuCapacity {
+    pub allowed_cpu_ids: BTreeSet<u32>,
+    pub cpu_millis: u64,
+}
+
+/// Observe the actual consumer constraints independently of global inventory.
+pub fn current_process_cpu_capacity() -> Result<ProcessCpuCapacity> {
+    let topology = observe_cpu_topology()?;
+    let allowed_cpu_ids = observe_allowed_cpu_ids(&topology)?;
+    let quota = observe_cpu_quota()?;
+    let cpu_millis =
+        effective_cpu_capacity_millis(Ok(0), &Ok(allowed_cpu_ids.clone()), &Ok(quota))?;
+    if cpu_millis == 0 {
+        bail!("current process has no positive CPU capacity");
+    }
+    Ok(ProcessCpuCapacity {
+        allowed_cpu_ids,
+        cpu_millis,
+    })
+}
+
+/// The managed Docker consumer's memory ceiling, including all visible v2
+/// ancestors. This is separate from the root/VM memory in shared inventory.
+#[cfg(target_os = "linux")]
+pub fn current_process_memory_capacity_bytes() -> Result<u64> {
+    let memberships =
+        parse_linux_cgroup_memberships(&std::fs::read_to_string("/proc/self/cgroup")?)?;
+    let mounts = parse_linux_cgroup_mounts(&std::fs::read_to_string("/proc/self/mountinfo")?)?;
+    let membership = memberships
+        .iter()
+        .find(|entry| entry.version == LinuxCgroupVersion::V2)
+        .context("Docker memory capacity requires a unified cgroup membership")?;
+    let mount = mounts
+        .iter()
+        .filter(|mount| {
+            mount.version == LinuxCgroupVersion::V2 && membership.path.starts_with(&mount.root)
+        })
+        .min_by_key(|mount| mount.root.components().count())
+        .context("Docker memory capacity requires a matching cgroup v2 mount")?;
+    let mut current = linux_cgroup_mount_path(&membership.path, &mount.root, &mount.mount_point)?;
+    let mut limit = observe_memory()?.total_bytes;
+    let mut observed = false;
+    loop {
+        match std::fs::read_to_string(current.join("memory.max")) {
+            Ok(raw) => {
+                observed = true;
+                let value = raw.trim();
+                if value != "max" {
+                    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                        bail!("invalid cgroup v2 memory.max");
+                    }
+                    limit = limit.min(value.parse::<u64>().context("parse cgroup v2 memory.max")?);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("read cgroup v2 memory.max"),
+        }
+        if current == mount.mount_point {
+            break;
+        }
+        if !current.starts_with(&mount.mount_point) || !current.pop() {
+            bail!("Docker memory cgroup path escaped its mount point");
+        }
+    }
+    if !observed || limit == 0 {
+        bail!("Docker consumer memory capacity is not proven positive");
+    }
+    Ok(limit)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn current_process_memory_capacity_bytes() -> Result<u64> {
+    bail!("Docker consumer memory capacity requires the Linux runtime")
+}
+
 #[derive(Debug)]
 enum NvidiaProbeUnavailableKind {
     Launch(std::io::Error),
@@ -631,12 +883,24 @@ fn sample_compute_node_inner(
     previous: Option<&ComputeNodeSnapshot>,
     readiness: Option<&HostRuntimeReadiness>,
 ) -> Result<ComputeNodeSnapshot> {
+    let host_capacity = docker_host_capacity_from_environment()?;
     let cpu_topology_probe = observe_cpu_topology();
-    let allowed_cpu_ids_probe = match &cpu_topology_probe {
-        Ok(topology) => observe_allowed_cpu_ids(topology),
-        Err(error) => Err(anyhow::anyhow!("CPU topology is unavailable: {error:#}")),
+    let allowed_cpu_ids_probe = match &host_capacity {
+        Some(capacity) => {
+            let topology = cpu_topology_probe.as_ref().map_err(|error| {
+                anyhow::anyhow!("Docker host CPU topology is unavailable: {error:#}")
+            })?;
+            Ok(capacity.allowed_cpu_ids(topology)?)
+        }
+        None => match &cpu_topology_probe {
+            Ok(topology) => observe_allowed_cpu_ids(topology),
+            Err(error) => Err(anyhow::anyhow!("CPU topology is unavailable: {error:#}")),
+        },
     };
-    let cpu_quota_probe = observe_cpu_quota();
+    let cpu_quota_probe = match &host_capacity {
+        Some(capacity) => capacity.cpu_quota(),
+        None => observe_cpu_quota(),
+    };
     let cpu_capacity_fallback = std::thread::available_parallelism()
         .context("detect effective logical CPU capacity")
         .and_then(|count| {
@@ -655,7 +919,10 @@ fn sample_compute_node_inner(
         .err()
         .map(probe_failure_reason)
         .unwrap_or(UnavailableReason::ProbeFailed);
-    let memory = observe_memory();
+    let memory = match &host_capacity {
+        Some(capacity) => Ok(capacity.memory(observe_memory()?)?),
+        None => observe_memory(),
+    };
     // A CPU readiness profile intentionally does not query NVIDIA at all.
     // This keeps an absent device an explicit unavailable observation rather
     // than turning an empty probe result into a verified GPU inventory.
@@ -1251,6 +1518,8 @@ fn observe_cpu_quota() -> Result<CpuQuota> {
         &fs::read_to_string("/proc/self/mountinfo").context("read Linux cgroup mounts")?,
     )?;
 
+    // Prefer the widest visible hierarchy. A more specific delegated bind
+    // mount can hide an ancestor quota even though it matches this process.
     if let Some(membership) = memberships
         .iter()
         .find(|entry| {
@@ -1264,7 +1533,7 @@ fn observe_cpu_quota() -> Result<CpuQuota> {
                     && mount.controllers.contains("cpu")
                     && membership.path.starts_with(&mount.root)
             })
-            .max_by_key(|mount| mount.root.components().count())
+            .min_by_key(|mount| mount.root.components().count())
             .context("Linux cgroup v1 CPU controller mount is unavailable")?;
         let current = linux_cgroup_mount_path(&membership.path, &mount.root, &mount.mount_point)?;
         return read_linux_v1_cpu_quota(&current, &mount.mount_point);
@@ -1279,7 +1548,7 @@ fn observe_cpu_quota() -> Result<CpuQuota> {
         .filter(|mount| {
             mount.version == LinuxCgroupVersion::V2 && membership.path.starts_with(&mount.root)
         })
-        .max_by_key(|mount| mount.root.components().count())
+        .min_by_key(|mount| mount.root.components().count())
         .context("Linux does not expose a matching cgroup v2 mount")?;
     let current = linux_cgroup_mount_path(&membership.path, &mount.root, &mount.mount_point)?;
     read_linux_v2_cpu_quota(&current, &mount.mount_point)

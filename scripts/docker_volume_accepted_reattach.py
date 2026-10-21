@@ -493,6 +493,8 @@ def _validate_reconciliation(
     record: Mapping[str, object],
     raw: bytes,
     unresolved: Mapping[str, object],
+    *,
+    helper_witness: str | None = None,
 ) -> dict[str, object]:
     project, volume = _assert_control_identity(control)
     expected = {
@@ -518,15 +520,60 @@ def _validate_reconciliation(
     }
     if any(record.get(key) != value for key, value in expected.items()):
         raise _fail("terminal activation reconciliation differs from quarantine")
-    if record.get("helper_sha256") != unresolved.get("helper_sha256"):
+    # Only the historical omitted key is compatible. Present invalid values
+    # must not be repaired from a witness.
+    helper_sha = (record["helper_sha256"] if "helper_sha256" in record else helper_witness)
+    if helper_sha != unresolved.get("helper_sha256"):
         raise _fail("terminal activation helper digest differs from quarantine")
     if record.get("helper_absence_probe_sha256") != unresolved.get("helper_absence_probe_sha256"):
         raise _fail("terminal activation helper absence proof differs from quarantine")
-    _hash(record.get("helper_sha256"), "terminal activation helper digest")
+    _hash(helper_sha, "terminal activation helper digest")
     _hash(record.get("helper_absence_probe_sha256"), "terminal helper absence proof")
     if not raw:
         raise _fail("terminal activation reconciliation is empty")
     return dict(record)
+
+
+def _legacy_helper_witness(control, activation, activation_raw, unresolved) -> tuple[str, str]:
+    """Authenticate the omitted reconciliation field without changing its bytes."""
+    if hashlib.sha256(activation_raw).hexdigest() != unresolved["activation_receipt_sha256"]:
+        raise _fail("legacy helper witness original activation digest differs")
+    relative = "activation/attempts/{}/terminal.json".format(unresolved["activation_attempt"])
+    terminal, raw = _control_json(control, relative)
+    assert terminal is not None and raw is not None
+    expected = {
+        "schema": "fullmag.docker-build-operation.v1", "phase": "activation",
+        "state": "failed-confirmed", "attempt": unresolved["activation_attempt"],
+        "compose_project": unresolved["compose_project"],
+        "control_volume": unresolved["control_volume"],
+        "activation_outcome": "unknown-retained", "reason": "backend-namespace-stopped",
+        "reconciliation_attempt": unresolved["reconciliation_attempt"],
+        "helper_container": "fullmag-control-" + unresolved["activation_attempt"],
+    }
+    if any(terminal.get(key) != value for key, value in expected.items()):
+        raise _fail("legacy helper witness technical activation identity differs")
+    helper_sha = _hash(terminal.get("helper_sha256"), "legacy helper witness digest")
+    if helper_sha != activation.get("helper_sha256") or helper_sha != unresolved["helper_sha256"]:
+        raise _fail("legacy helper witness digest differs from original activation or quarantine")
+    if terminal.get("inputs") != activation.get("inputs"):
+        raise _fail("legacy helper witness inputs differ from original activation")
+    if terminal.get("helper_state") == "running":
+        _container(terminal.get("helper_id"), "legacy helper witness historical container")
+    elif terminal.get("helper_state") == "absent-confirmed":
+        absence = {"schema": "fullmag.docker-helper-absence-probe.v1", "state": "absent",
+                   "helper_name": expected["helper_container"], "containers": []}
+        absence_sha = hashlib.sha256(canonical(absence)).hexdigest()
+        if ("helper_id" not in terminal or terminal["helper_id"] is not None
+                or terminal.get("helper_absence_probe_sha256") != absence_sha
+                or unresolved["helper_absence_probe_sha256"] != absence_sha):
+            raise _fail("legacy helper witness absence proof differs")
+    else:
+        raise _fail("legacy helper witness has no supported helper state")
+    finished = terminal.get("finished_at")
+    if (not isinstance(finished, (int, float)) or isinstance(finished, bool)
+            or not math.isfinite(finished)):
+        raise _fail("legacy helper witness has no completion timestamp")
+    return helper_sha, hashlib.sha256(raw).hexdigest()
 
 
 def _validate_stop_journal(
@@ -787,7 +834,7 @@ def _validate_terminal_control_records(
     owner: Mapping[str, object],
     owner_raw: bytes,
 ) -> None:
-    """Bind the live control records to the stop journal's terminal pins.
+    """Bind the selected control records to the stop journal's terminal pins.
 
     A current stop journal carries the complete container incarnation in its
     own immutable bytes, so a namespace sidecar is optional for that route.
@@ -993,7 +1040,15 @@ def _bundle_from_records(
     reconciliation_relative = "activation-reconciliation/attempts/{}/terminal.json".format(quarantine["reconciliation_attempt"])
     reconciliation, reconciliation_raw = _control_json(control, reconciliation_relative)
     assert reconciliation is not None and reconciliation_raw is not None
-    _validate_reconciliation(control, reconciliation, reconciliation_raw, quarantine)
+    helper_witness = None
+    helper_witness_sha = None
+    if "helper_sha256" not in reconciliation:
+        helper_witness, helper_witness_sha = _legacy_helper_witness(
+            control, activation, activation_raw, quarantine
+        )
+    _validate_reconciliation(
+        control, reconciliation, reconciliation_raw, quarantine, helper_witness=helper_witness
+    )
     current, current_raw = _control_json(control, "activation-reconciliation/current.json")
     assert current is not None and current_raw is not None
     if current_raw != reconciliation_raw:
@@ -1002,10 +1057,28 @@ def _bundle_from_records(
     stop, stop_raw = _control_json(control, stop_relative)
     assert stop is not None and stop_raw is not None
     _validate_stop_journal(stop, stop_raw, quarantine)
-    terminal_relative = "runtime-control/runtime-service/process-tree.json"
+    key = quarantine["activation_receipt_key"]
+    archive_prefix = f"{CONTROL_RELATIVE_PREFIX}/{key}"
+    # request.json is published last. Once committed, its original terminal
+    # records are immutable history; later containers may overwrite PID 1's
+    # live receipts. Rebuild every pin below, including the current held Run,
+    # and require byte-identical proof/request before permitting replay.
+    published_request = _control_bytes(
+        control, f"{archive_prefix}/request.json", optional=True,
+        maximum=MAX_REQUEST_BYTES,
+    )
+    published_proof = None
+    if published_request is not None:
+        published_proof = _control_bytes(
+            control, f"{archive_prefix}/proof.json", maximum=MAX_PROOF_BYTES,
+        )
+        terminal_relative = f"{archive_prefix}/{TERMINAL_PROCESS_ARCHIVE_NAME}"
+        owner_relative = f"{archive_prefix}/{TERMINAL_OWNER_ARCHIVE_NAME}"
+    else:
+        terminal_relative = "runtime-control/runtime-service/process-tree.json"
+        owner_relative = "runtime-control/runtime-services/OWNER.json"
     terminal, terminal_raw = _control_json(control, terminal_relative)
     assert terminal is not None and terminal_raw is not None
-    owner_relative = "runtime-control/runtime-services/OWNER.json"
     owner, owner_raw = _control_json(control, owner_relative)
     assert owner is not None and owner_raw is not None
     _validate_terminal_control_records(stop, terminal, terminal_raw, owner, owner_raw)
@@ -1090,6 +1163,8 @@ def _bundle_from_records(
         "logical_session_id": held["logical_session_id"],
         "session_epoch": held["session_epoch"],
     }
+    if helper_witness_sha is not None:
+        proof["legacy_helper_witness_sha256"] = helper_witness_sha
     # Rust accepts these fields only when a legacy journal needs the fresh
     # namespace attestation.  A current journal's immutable container_state
     # is the authoritative incarnation proof and carries no sidecar pin.
@@ -1113,6 +1188,23 @@ def _bundle_from_records(
     }
     request_raw = _json_bytes(request, MAX_REQUEST_BYTES, "accepted reattach request")
     request_sha = hashlib.sha256(request_raw).hexdigest()
+    if published_request is not None and (
+        published_request != request_raw or published_proof != proof_raw
+    ):
+        raise _fail("committed accepted reattach archive differs from revalidated inputs")
+    if published_request is None:
+        # A crash before the last publication may leave a partial transaction.
+        # Such bytes never authorize historical replay. Live-record validation
+        # above must succeed, and every existing fragment must match the newly
+        # reconstructed bytes before the CAS publisher can finish that commit.
+        for relative, expected, maximum in (
+            (control_proof, proof_raw, MAX_PROOF_BYTES),
+            (control_terminal_process, terminal_raw, MAX_CONTROL_RECORD_BYTES),
+            (control_terminal_owner, owner_raw, MAX_CONTROL_RECORD_BYTES),
+        ):
+            fragment = _control_bytes(control, relative, optional=True, maximum=maximum)
+            if fragment is not None and fragment != expected:
+                raise _fail("partial accepted reattach publication differs from validated inputs")
     pins = {
         "schema": PRODUCER_SCHEMA,
         "state": "prepared",
@@ -1307,7 +1399,7 @@ def produce_accepted_reattach(
     The return mapping is intentionally small and serializable.  ``environment``
     can be overlaid on the selected backend start environment; ``pins`` is the
     caller's record of every immutable source/control/run identity.  The
-    producer itself writes only the two CAS-checked documents in runtime
+    producer itself writes only four CAS-checked documents in runtime
     control.
     """
 

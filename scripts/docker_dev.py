@@ -76,6 +76,7 @@ RUNTIME_IMAGE_CONTEXT_FILES = (
     ("Dockerfile.backend", "docker/all-in-one/Dockerfile.backend"),
     ("backend_dev.py", "docker/all-in-one/backend_dev.py"),
     ("backend_source.py", "docker/all-in-one/backend_source.py"),
+    ("backend_candidate_retirement.py", "docker/all-in-one/backend_candidate_retirement.py"),
     ("worker_cgroup_gate.py", "docker/all-in-one/worker_cgroup_gate.py"),
     (
         "backend_volume_cache_maintenance.py",
@@ -2524,6 +2525,33 @@ def _parser() -> argparse.ArgumentParser:
     idle_restart.add_argument("--config-sha256", required=True)
     idle_restart.add_argument("--source-root", type=Path, required=True)
     idle_restart.add_argument("--port", type=int, required=True)
+    resources = subparsers.add_parser(
+        "increase-resources", help="increase a pinned pre-API backend's budget without restarting its build"
+    )
+    resources.add_argument("--source-root", type=Path, required=True)
+    resources.add_argument("--attempt", required=True)
+    resources.add_argument("--backend-container-id", required=True)
+    resources.add_argument("--backend-memory-gib", type=int, required=True)
+    resources.add_argument("--backend-cpus", type=int, required=True)
+    resources.add_argument("--apply", action="store_true", help="apply the displayed increase; default previews without changing limits")
+    pre_api_stop = subparsers.add_parser(
+        "stop-pre-api-start", help="checkpoint and stop an owned historical rollback reader before API"
+    )
+    pre_api_stop.add_argument("--source-root", type=Path, required=True)
+    pre_api_stop.add_argument("--attempt", required=True)
+    pre_api_stop.add_argument("--backend-container-id", required=True)
+    pre_api_mode = pre_api_stop.add_mutually_exclusive_group()
+    pre_api_mode.add_argument("--apply", action="store_true")
+    pre_api_mode.add_argument("--finalize", action="store_true", help="observe and finalize an existing stopped intent; never repeat the signal")
+    pre_api_mode.add_argument("--resume-unissued", action="store_true", help="resume a held pre-API start only after proving there is no intent or publisher")
+    capture_checkpoint = subparsers.add_parser(
+        "checkpoint-pre-api-failure",
+        help=("record an already stopped capture-only or exact native host-init failure "
+              "without replaying its held run"),
+    )
+    capture_checkpoint.add_argument("--source-root", type=Path, required=True)
+    capture_checkpoint.add_argument("--attempt", required=True)
+    capture_checkpoint.add_argument("--backend-container-id", required=True)
     stop_unadmitted = subparsers.add_parser(
         "stop-unadmitted",
         help=(
@@ -2547,6 +2575,21 @@ def _parser() -> argparse.ArgumentParser:
     recreate_volume.add_argument("--config-sha256", required=True)
     recreate_volume.add_argument("--source-root", type=Path, required=True)
     recreate_volume.add_argument("--port", type=int, required=True)
+    recreate_volume.add_argument(
+        "--migrate-host-capacity", action="store_true",
+        help="explicitly migrate quiescent shared host capacity when rendering the replacement services",
+    )
+    recreate_volume.add_argument(
+        "--resume-recreation",
+        metavar="OPERATION_UUID",
+        help="resume only the exact succeeded recreate-services operation after its app containers were removed",
+    )
+    recreate_volume.add_argument(
+        "--include-untracked",
+        action="append",
+        default=None,
+        help="pin the complete exact-file allowlist for the recreated services; repeat for additional files",
+    )
     recreate_volume.add_argument(
         "--recovery-authorization",
         type=str,
@@ -2595,6 +2638,10 @@ def _parser() -> argparse.ArgumentParser:
                              help="loopback frontend port (up only)")
         command.add_argument("--script", "--startup-script", dest="script", type=Path,
                              help="optional simulation script, relative to the selected checkout or absolute inside it (up only)")
+        command.add_argument(
+            "--migrate-host-capacity", action="store_true",
+            help="explicitly migrate quiescent shared host capacity when rendering new services",
+        )
         if name == "build":
             command.set_defaults(script=None)
     codegen_parser = subparsers.add_parser(
@@ -2687,11 +2734,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "restart-idle-volume":
             from docker_volume_dev import restart_idle
             restart_idle(args)
+        elif args.action == "increase-resources":
+            from docker_volume_resources import increase
+            increase(args)
+        elif args.action == "stop-pre-api-start":
+            from docker_volume_pre_api_stop import stop
+            stop(args)
+        elif args.action == "checkpoint-pre-api-failure":
+            from docker_volume_pre_api_stop import checkpoint_capture
+            checkpoint_capture(args)
         elif args.action == "stop-unadmitted":
             from docker_volume_stop_unadmitted import stop
             stop(args)
         elif args.action == "recreate-volume":
-            if args.recovery_authorization is not None:
+            if args.resume_recreation is not None:
+                from docker_volume_dev import resume_recreation
+                resume_recreation(args)
+            elif args.recovery_authorization is not None:
                 if args.fresh_state:
                     raise _fail(
                         "container recovery cannot combine --recovery-authorization with --fresh-state"

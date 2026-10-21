@@ -1,5 +1,8 @@
 # Checkpoint P4 — PreparationPlan
 
+> **Dziennik historycznych przyrostów.** Statusy, wyniki i polecenia poniżej dotyczą źródeł oraz warunków wskazanych w poszczególnych checkpointach. Bieżący obraz mastera z 20.10.2026: [tabela implementacji i testów](../06-status-realizacji.md), [plan dalszych prac](../03-plan-refaktoryzacji.md). Dawny PASS nie jest automatycznie kwalifikacją nowego HEAD; aktualne zasady wykonania określa AGENTS.md.
+
+
 Status: **P4-A/P4-B, FDM preparation materialization, execution binding, application acceptance, durable receipt publication, source-level SceneDocument → ProblemIR adapter i provenance UI slice PASS / P4 IN PROGRESS**.
 
 Krok P4 dotyczący native FEM jest opisany w

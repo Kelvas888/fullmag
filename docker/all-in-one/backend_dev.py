@@ -37,14 +37,44 @@ try:
 except ImportError:  # pragma: no cover - direct backend images are Linux
     fcntl = None  # type: ignore[assignment]
 
+import backend_candidate_retirement as candidate_retirement
 from backend_source import (
     BackendSourceError,
+    _live_non_runtime,
     capture_live_source_manifest,
     extract_frozen_source,
 )
 
 
 RECEIPT_SCHEMA = "fullmag.direct-compose.backend-build-receipt.v1"
+LIVE_SYNC_ATTEMPTS = 3
+# Conventional SIGTERM status recorded for a Make stopped with its container.
+INTERRUPTED_MAKE_EXIT_CODE = 143
+# DEV packages run on the GPU of the host that builds them.  "auto" compiles
+# CUDA for the visible devices only; "all" keeps the image's portable matrix.
+DEV_CUDA_ARCHITECTURES_ENV = "FULLMAG_DEV_CUDA_ARCHITECTURES"
+CUDA_ARCHITECTURE_LIST_RE = re.compile(
+    r"[1-9][0-9]{1,2}(?:-real|-virtual)?(?:;[1-9][0-9]{1,2}(?:-real|-virtual)?)*"
+)
+CUDA_CAPABILITY_PROBE = r"""import ctypes, json
+driver = ctypes.CDLL("libcuda.so.1")
+if driver.cuInit(0) != 0:
+    raise SystemExit(3)
+count = ctypes.c_int()
+if driver.cuDeviceGetCount(ctypes.byref(count)) != 0 or count.value < 1:
+    raise SystemExit(4)
+found = set()
+for ordinal in range(count.value):
+    device = ctypes.c_int()
+    major = ctypes.c_int()
+    minor = ctypes.c_int()
+    if (driver.cuDeviceGet(ctypes.byref(device), ordinal) != 0
+            or driver.cuDeviceGetAttribute(ctypes.byref(major), 75, device) != 0
+            or driver.cuDeviceGetAttribute(ctypes.byref(minor), 76, device) != 0):
+        raise SystemExit(5)
+    found.add(major.value * 10 + minor.value)
+print(json.dumps(sorted(found)))
+"""
 LIVE_MANIFEST_SCHEMA = "fullmag.docker-backend-live-source.v1"
 LIVE_SOURCE_MODE = "live-shadow-v1"
 BACKEND_CARGO_PROFILE = "backend-dev"
@@ -186,6 +216,10 @@ class BackendBuildError(RuntimeError):
     """A fail-closed direct backend build or package error."""
 
 
+class LiveSourceSyncChanged(BackendBuildError):
+    """A live file differs from its fresh capture; a new capture is safe."""
+
+
 def _fail(message: str) -> NoReturn:
     raise BackendBuildError(message)
 
@@ -219,6 +253,9 @@ def _log_phase(phase: str, state: str, **fields: object) -> None:
             "reason",
             "sparse",
             "target",
+            "cargo_jobs",
+            "native_parallelism",
+            "native_fallback_jobs",
         }
     )
     parts = [f"phase={phase}", f"state={state}"]
@@ -1033,7 +1070,7 @@ def _copy_live_regular_file(source: Path, target: Path, relative: str, entry: Ma
             os.fsync(output.fileno())
         after = os.fstat(source_descriptor)
         if total != entry["size"] or digest.hexdigest() != entry["sha256"] or _file_signature(before) != _file_signature(after):
-            _fail(f"live source changed while synchronizing: {relative}")
+            raise LiveSourceSyncChanged(f"live source changed while synchronizing: {relative}")
         os.chmod(temporary, 0o555 if entry["mode"] == "100755" else 0o444)
         os.replace(temporary, target)
     except OSError as error:
@@ -1749,19 +1786,35 @@ def _materialize_live_source(
     *,
     preserve_legacy_install_stage: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any], str, None, str]:
-    document, manifest_bytes = _read_json(manifest_path, "live source manifest", 64 * 1024 * 1024)
-    capsule, native, git_object_ids, live_manifest_sha256 = _validate_live_manifest(document)
-    manifest_hash = _sha256_bytes(manifest_bytes)
-    workspace = _prepare_workspace(build_root)
-    _sync_live_source_tree(
-        source_root,
-        git_common_root,
-        workspace,
-        capsule,
-        git_object_ids,
-        live_manifest_sha256,
-        preserve_legacy_install_stage=preserve_legacy_install_stage,
-    )
+    for attempt in range(1, LIVE_SYNC_ATTEMPTS + 1):
+        document, manifest_bytes = _read_json(manifest_path, "live source manifest", 64 * 1024 * 1024)
+        capsule, native, git_object_ids, live_manifest_sha256 = _validate_live_manifest(document)
+        manifest_hash = _sha256_bytes(manifest_bytes)
+        workspace = _prepare_workspace(build_root)
+        try:
+            _sync_live_source_tree(
+                source_root,
+                git_common_root,
+                workspace,
+                capsule,
+                git_object_ids,
+                live_manifest_sha256,
+                preserve_legacy_install_stage=preserve_legacy_install_stage,
+            )
+            break
+        except LiveSourceSyncChanged:
+            if attempt == LIVE_SYNC_ATTEMPTS:
+                raise
+            # A developer saved a file after the capture.  Synchronization is
+            # hash-based and idempotent, so capture again and copy only the
+            # files that now differ from the shadow.
+            _log_phase("sync", "recapture", reason="live-source-changed")
+            try:
+                recaptured = capture_live_source_manifest(source_root, git_common_root, build_root)
+            except BackendSourceError as error:
+                _fail(f"live source recapture failed: {error}")
+            if _absolute(recaptured, "recaptured live source manifest") != manifest_path:
+                _fail("live source recapture published an unexpected manifest path")
     after_document, after_bytes = _read_json(manifest_path, "live source manifest", 64 * 1024 * 1024)
     if after_bytes != manifest_bytes or after_document != document:
         _fail("live source manifest changed during synchronization")
@@ -1922,6 +1975,37 @@ def _validate_cargo_profile(value: str) -> str:
     return value
 
 
+def _dev_cuda_architectures() -> str | None:
+    """Resolve the CUDA targets of a DEV build, or None for the image matrix."""
+
+    requested = os.environ.get(DEV_CUDA_ARCHITECTURES_ENV, "auto").strip()
+    if requested == "all":
+        return None
+    if requested != "auto":
+        if not CUDA_ARCHITECTURE_LIST_RE.fullmatch(requested):
+            _fail(f"{DEV_CUDA_ARCHITECTURES_ENV} must be auto, all, or a CMake list such as 89-real")
+        return requested
+    try:
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", CUDA_CAPABILITY_PROBE],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        capabilities = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        capabilities = None
+    if (
+        not isinstance(capabilities, list)
+        or not capabilities
+        or not all(type(value) is int and 30 <= value <= 199 for value in capabilities)
+    ):
+        _log_phase("cuda", "architectures", reason="probe-unavailable", target="image-default")
+        return None
+    return ";".join(f"{value}-real" for value in capabilities)
+
+
 def _build_environment(
     workspace: Path, build_root: Path, native: Mapping[str, Any], jobs: int,
     cargo_profile: str = BACKEND_CARGO_PROFILE,
@@ -1983,13 +2067,23 @@ def _build_environment(
             "FULLMAG_SOURCE_SNAPSHOT_SHA256": str(native["source_snapshot_sha256"]),
             **{name: str(path) for name, path in native_build_roots.items()},
             "CARGO_BUILD_JOBS": str(jobs),
-            "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs),
+            # FDM/FEM build scripts share Cargo's jobserver. Other native
+            # subprocesses must not each create another `jobs`-wide pool.
+            "CMAKE_BUILD_PARALLEL_LEVEL": "1",
             "CARGO_INCREMENTAL": "1",
             "HOME": str(build_root / "home"),
             "TMPDIR": str(build_root / "tmp"),
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
+    if cargo_profile == BACKEND_CARGO_PROFILE:
+        architectures = _dev_cuda_architectures()
+        if architectures is not None:
+            # FEM reads FULLMAG_CUDA_ARCHITECTURES; FDM has its own variable so
+            # release builds keep their fixed FDM target list.
+            environment["FULLMAG_CUDA_ARCHITECTURES"] = architectures
+            environment["FULLMAG_FDM_CUDA_ARCHITECTURES"] = architectures
+            _log_phase("cuda", "architectures", target=architectures.replace(";", ","))
     for path in (build_root / "cargo", build_root / "home", build_root / "tmp"):
         _ensure_directory(path, f"build directory {path}")
     return environment
@@ -2103,7 +2197,7 @@ def _assert_exact_backup_inventory(
     artifacts = receipt.get("artifacts")
     if not isinstance(artifacts, list):
         _fail(f"{name} receipt artifact inventory is invalid")
-    allowed_files = {"backend-build-receipt.json", "rotation.json", "bin/fullmag"}
+    allowed_files = {"backend-build-receipt.json", "rotation.json"}
     for index, artifact in enumerate(artifacts):
         if not isinstance(artifact, Mapping) or not isinstance(artifact.get("path"), str):
             _fail(f"{name} receipt artifact {index} has no safe path")
@@ -2111,7 +2205,9 @@ def _assert_exact_backup_inventory(
     build_log = root / "direct-backend-build.log"
     if build_log.exists() or build_log.is_symlink():
         allowed_files.add("direct-backend-build.log")
-    optional_files = PACKAGE_CANDIDATE_OPTIONAL_FILES - {PACKAGE_CANDIDATE_MARKER}
+    optional_files = (
+        PACKAGE_CANDIDATE_OPTIONAL_FILES - {PACKAGE_CANDIDATE_MARKER}
+    ) | {"bin/fullmag"}
     actual_files, actual_directories = _stage_tree_inventory(root)
     allowed_directories: set[str] = set()
     for relative in allowed_files:
@@ -2205,6 +2301,40 @@ def _expected_backend_build_identity(cargo_profile: str) -> dict[str, Any]:
     }
 
 
+def _runtime_source_digest(capsule: Mapping[str, Any]) -> str:
+    """Digest only the paths that can affect the backend package.
+
+    The non-runtime policy is the one that already keeps docs, the frontend,
+    and test-only files out of the native source snapshot.
+    """
+
+    files = capsule.get("files")
+    deleted = capsule.get("deleted")
+    if not isinstance(files, list) or not isinstance(deleted, list):
+        _fail("live source capsule has no file inventory for its runtime digest")
+    runtime_files = []
+    for entry in files:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str):
+            _fail("live source capsule file entry is invalid")
+        if _live_non_runtime(entry["path"]):
+            continue
+        runtime_files.append(
+            {"path": entry["path"], "mode": entry.get("mode"), "sha256": entry.get("sha256")}
+        )
+    runtime_deleted = sorted(
+        path for path in deleted if isinstance(path, str) and not _live_non_runtime(path)
+    )
+    return _sha256_bytes(
+        _canonical(
+            {
+                "schema": "fullmag.direct-compose.runtime-source-digest.v1",
+                "files": runtime_files,
+                "deleted": runtime_deleted,
+            }
+        )
+    )
+
+
 def _package_matches_fresh_live_manifest(
     receipt: Mapping[str, Any],
     manifest_path: Path,
@@ -2233,9 +2363,16 @@ def _package_matches_fresh_live_manifest(
         # The normal prepare path reads and validates the same manifest and
         # remains fail-closed if the trusted capture is malformed.
         raise
+    # Packages built before the runtime digest existed keep the exact
+    # whole-checkout comparison; newer ones ignore docs/frontend-only edits.
+    recorded_runtime_digest = source.get("runtime_source_digest")
+    if recorded_runtime_digest is None:
+        digest_matches = source.get("source_digest") == capsule.get("source_digest")
+    else:
+        digest_matches = recorded_runtime_digest == _runtime_source_digest(capsule)
     if (
         source.get("source_mode") != LIVE_SOURCE_MODE
-        or source.get("source_digest") != capsule.get("source_digest")
+        or not digest_matches
         or source.get("resolved_commit") != capsule.get("resolved_commit")
         or source.get("source_snapshot_sha256") != fresh_native.get("source_snapshot_sha256")
         or dict(native) != fresh_native
@@ -3378,6 +3515,34 @@ def _write_candidate_marker(
     _fsync_directory(candidate, "backend package candidate directory")
 
 
+def _discard_interrupted_building_candidate(
+    candidate: Path,
+    package_root: Path,
+    build_root: Path,
+) -> bool:
+    """Remove a candidate whose build was interrupted by a container stop.
+
+    Callers hold the runtime build lock, so no live Make owns a ``building``
+    candidate here: it was left by a stop or crash during the previous start.
+    Only known Make output is removed; the external attempt log is kept and
+    marked terminal.  Unknown trees still fail closed.
+    """
+
+    if not _failed_candidate_inventory_is_known(candidate):
+        return False
+    attempt = _read_failed_make_attempt(build_root, candidate)
+    if attempt is not None and attempt[0].get("state") == "building":
+        try:
+            _finish_failed_make_attempt(build_root, candidate, INTERRUPTED_MAKE_EXIT_CODE)
+        except (BackendBuildError, OSError):
+            # The attempt record stays as found; it never blocks a new build.
+            pass
+    _remove_owned_tree(candidate)
+    _fsync_directory(candidate.parent, "backend package candidate directory")
+    _log_phase("package", "candidate-discarded", reason="interrupted-build")
+    return True
+
+
 def _reject_partial_package_candidates(
     output: Path,
     control_root: Path,
@@ -3437,6 +3602,10 @@ def _reject_partial_package_candidates(
             continue
 
         marker = _validate_candidate_marker(entry, output, build_root, state=None)
+        if marker.get("state") == "building" and _discard_interrupted_building_candidate(
+            entry, output, build_root
+        ):
+            continue
         if marker.get("state") != "ready":
             _fail(
                 "backend package candidate from an incomplete prior build is preserved: "
@@ -3471,6 +3640,141 @@ def _reject_partial_package_candidates(
         except OSError as error:
             _fail(f"cannot retire published backend package candidate {entry.name}: {error}")
 
+
+_CANDIDATE_PAYLOAD_GUARD_PREFIX = (
+    "ready backend package candidate retains payload or unknown entries: "
+)
+
+
+def _candidate_retirement_entries(control_root: Path) -> list[Path]:
+    """List only bounded candidate directories for typed retirement."""
+
+    candidates = control_root / PACKAGE_CANDIDATES_DIRNAME
+    try:
+        iterator = iter(candidates.iterdir())
+        entries: list[Path] = []
+        for _ in range(MAX_PACKAGE_CANDIDATES + 1):
+            try:
+                entries.append(next(iterator))
+            except StopIteration:
+                break
+    except OSError as error:
+        _fail(f"cannot inspect backend package candidate staging: {error}")
+    if len(entries) > MAX_PACKAGE_CANDIDATES:
+        _fail("backend package candidate staging exceeds its bounded entry limit")
+    entries.sort(key=lambda path: path.name)
+    result: list[Path] = []
+    for entry in entries:
+        metadata = entry.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            _fail(
+                "backend package candidate staging contains an unsafe entry: "
+                f"{entry.name}"
+            )
+        if not PACKAGE_CANDIDATE_NAME_RE.fullmatch(entry.name):
+            _fail(
+                "backend package candidate staging contains an unknown entry: "
+                f"{entry.name}"
+            )
+        result.append(entry)
+    return result
+
+
+def _qualify_ready_candidate_retirements(
+    output: Path,
+    control_root: Path,
+    build_root: Path,
+    current_package: tuple[
+        dict[str, Any], bytes, dict[str, tuple[int, int, int, int, int]]
+    ]
+    | None,
+) -> list[Any]:
+    """Keep the old guard fail-closed except for complete ready payloads."""
+
+    try:
+        _reject_partial_package_candidates(
+            output,
+            control_root,
+            build_root,
+            current_package=current_package,
+        )
+    except BackendBuildError as error:
+        # Only the old ready-payload rejection is recoverable by the typed
+        # retirement path.  Building, malformed, unknown, and journal-related
+        # states retain the original early failure behavior.
+        if not str(error).startswith(_CANDIDATE_PAYLOAD_GUARD_PREFIX):
+            raise
+    else:
+        return []
+    return [
+        candidate_retirement.qualify_ready_candidate(
+            sys.modules[__name__],
+            candidate,
+            output,
+            control_root,
+            build_root,
+        )
+        for candidate in _candidate_retirement_entries(control_root)
+    ]
+
+
+def _classify_ready_candidate_retirements(
+    specs: list[Any],
+    fresh_manifest: Path,
+    toolchain: Mapping[str, Any],
+    cargo_profile: str,
+    current_package: tuple[
+        dict[str, Any], bytes, dict[str, tuple[int, int, int, int, int]]
+    ]
+    | None,
+) -> Any | None:
+    """Retire stale/duplicate candidates and return one fresh promotion."""
+
+    if not specs:
+        return None
+    current_artifacts = None
+    if current_package is not None:
+        current_artifacts = current_package[0].get("artifacts")
+        if not isinstance(current_artifacts, list):
+            _fail("verified current backend package has no artifact inventory")
+
+    # Count before mutating any candidate so two fresh non-duplicates fail
+    # closed without partially retiring the rest of the bounded set.
+    promotions = [
+        spec
+        for spec in specs
+        if _package_matches_fresh_live_manifest(
+            spec.receipt,
+            fresh_manifest,
+            toolchain,
+            cargo_profile,
+        )
+        and (current_artifacts is None or list(spec.artifacts) != current_artifacts)
+    ]
+    if len(promotions) > 1:
+        _fail("multiple fresh backend package candidates are eligible for promotion")
+    if current_package is None and len(promotions) != len(specs):
+        _fail("candidate retirement requires a verified current package for stale candidate")
+    promotion = promotions[0] if promotions else None
+    for spec in specs:
+        result = candidate_retirement.retire_candidate(
+            sys.modules[__name__],
+            spec,
+            fresh_manifest,
+            toolchain,
+            cargo_profile,
+            current_package,
+        )
+        if result.action == "promote":
+            if promotion is None or result.candidate != promotion.candidate:
+                _fail("candidate retirement returned an unexpected promotion")
+        elif result.action != "retired":
+            _fail(f"candidate retirement returned an unsupported action: {result.action}")
+    return promotion
 
 def _flatten_package_library_aliases(root: Path) -> None:
     """Materialize only the allowed native SONAME aliases in a direct candidate."""
@@ -4313,7 +4617,12 @@ def _write_console_chunk(chunk: bytes) -> None:
 
 def _run_canonical_make(command: list[str], workspace: Path, environment: Mapping[str, str], log_path: Path) -> int:
     started = time.monotonic()
-    _log_phase("make", "start", target=command[-1])
+    _log_phase(
+        "make", "start", target=command[-1],
+        cargo_jobs=environment.get("CARGO_BUILD_JOBS", "unset"),
+        native_parallelism="shared-or-serial",
+        native_fallback_jobs=environment.get("CMAKE_BUILD_PARALLEL_LEVEL", "unset"),
+    )
     try:
         with log_path.open("wb") as log:
             remaining_log_bytes = MAX_BUILD_LOG_BYTES
@@ -4445,18 +4754,19 @@ def _prepare_locked(
         direct_install=direct_install,
         package_root=PACKAGE_ROOT if direct_install else None,
         build_root=build_root if direct_install else None,
+        cuda_architectures=environment.get("FULLMAG_CUDA_ARCHITECTURES"),
     )
     if direct_install:
         attempt = _read_failed_make_attempt(build_root, output)
         if attempt is None or attempt[0].get("state") != "succeeded":
             _fail("successful Make attempt receipt disappeared")
         receipt = attempt[0]
-        digest, size = _sha256_file(
+        digest, metadata = _sha256_file(
             output / FAILED_MAKE_LOG_NAME,
             "published Make diagnostic log",
             MAX_BUILD_LOG_BYTES,
         )
-        if digest != receipt["log_sha256"] or size != receipt["log_size"]:
+        if digest != receipt["log_sha256"] or metadata.st_size != receipt["log_size"]:
             _fail("published Make diagnostic log differs from its attempt receipt")
         _retire_make_log(attempt)
         _prune_failed_make_logs(build_root, PACKAGE_ROOT)
@@ -4472,6 +4782,7 @@ def _publish_completed_build(
     direct_install: bool = False,
     package_root: Path | None = None,
     build_root: Path | None = None,
+    cuda_architectures: str | None = None,
 ) -> int:
     """Publish verified artifacts after the canonical Make invocation succeeded."""
     started = time.monotonic()
@@ -4489,6 +4800,7 @@ def _publish_completed_build(
         "source_mode": source_mode,
         "source_snapshot_sha256": native["source_snapshot_sha256"],
         "source_digest": capsule["source_digest"],
+        "runtime_source_digest": _runtime_source_digest(capsule),
         "resolved_commit": capsule["resolved_commit"],
     }
     if archive_hash is not None:
@@ -4523,6 +4835,8 @@ def _publish_completed_build(
             "fem_gpu_required": True,
             "libceed_required": True,
             "make_log": "direct-backend-build.log",
+            # Informational: DEV packages may target only the local GPU.
+            "cuda_architectures": cuda_architectures,
         },
         "artifacts": records,
     }
@@ -4757,6 +5071,7 @@ def _start(args: argparse.Namespace) -> int:
     provenance_before: bytes | None = None
     provenance_publish_started = False
     publication_committed = False
+    promotion_spec: Any | None = None
     # Keep the lock across package verification and the exec handoff.  The
     # descriptor is O_CLOEXEC, so the API process does not inherit a stale
     # build lock after execvpe.  A failed build therefore cannot start API.
@@ -4778,20 +5093,44 @@ def _start(args: argparse.Namespace) -> int:
                 )
             else:
                 previous_receipt = None
-            _reject_partial_package_candidates(
+            _backend_cache_receipt()
+            candidate_retirement.recover_pending_retirements(
+                sys.modules[__name__],
                 output,
                 control_root,
                 build_root,
-                current_package=previous_receipt,
+                previous_receipt,
             )
-            _backend_cache_receipt()
+            ready_retirements = _qualify_ready_candidate_retirements(
+                output,
+                control_root,
+                build_root,
+                previous_receipt,
+            )
             _prune_failed_make_logs(build_root, output)
             _, toolchain = _toolchain_identity()
             start_args = argparse.Namespace(**vars(args))
             start_args.manifest = _capture_start_manifest(args, build_root)
             start_args.source_tar = None
-            if previous_receipt is not None and _package_matches_fresh_live_manifest(
-                previous_receipt[0], start_args.manifest, toolchain, cargo_profile
+            promotion_spec = _classify_ready_candidate_retirements(
+                ready_retirements,
+                start_args.manifest,
+                toolchain,
+                cargo_profile,
+                previous_receipt,
+            )
+            if promotion_spec is None:
+                _reject_partial_package_candidates(
+                    output, control_root, build_root, current_package=previous_receipt
+                )
+            elif _candidate_retirement_entries(control_root) != [promotion_spec.candidate]:
+                _fail("ready candidate staging changed before promotion")
+            if (
+                promotion_spec is None
+                and previous_receipt is not None
+                and _package_matches_fresh_live_manifest(
+                    previous_receipt[0], start_args.manifest, toolchain, cargo_profile
+                )
             ):
                 _log_phase("start", "cache-hit", source="verified-package")
                 provenance_before = _snapshot_bound_provenance()
@@ -4799,51 +5138,60 @@ def _start(args: argparse.Namespace) -> int:
                 _publish_runtime_provenance(output)
                 _log_phase("start", "handoff", cache="hit")
                 return _serve([])
-            if previous_receipt is not None:
-                _preflight_candidate_storage(build_root, previous_receipt[0])
-            candidate = Path(
-                tempfile.mkdtemp(
-                    prefix=".backend-package-candidate-",
-                    dir=control_root / PACKAGE_CANDIDATES_DIRNAME,
+            if promotion_spec is None:
+                if previous_receipt is not None:
+                    _preflight_candidate_storage(build_root, previous_receipt[0])
+                candidate = Path(
+                    tempfile.mkdtemp(
+                        prefix=".backend-package-candidate-",
+                        dir=control_root / PACKAGE_CANDIDATES_DIRNAME,
+                    )
                 )
-            )
-            _write_candidate_marker(
-                candidate,
-                output,
-                build_root,
-                state="building",
-            )
-            try:
-                result = _prepare_locked(
-                    start_args,
+                _write_candidate_marker(
+                    candidate,
+                    output,
                     build_root,
-                    candidate,
-                    jobs,
-                    toolchain,
-                    candidate,
+                    state="building",
                 )
-            except (BackendBuildError, OSError):
-                if _discard_failed_candidate_if_owned(candidate, output, build_root):
-                    candidate = None
-                raise
-            if result != 0:
-                _fail(f"backend preparation failed with exit code {result}")
-            candidate_marker = _validate_candidate_marker(
-                candidate,
-                output,
-                build_root,
-                state="ready",
-            )
-            candidate_inventory = _hash_package(candidate)
-            if candidate_marker.get("artifact_inventory_sha256") != _sha256_bytes(
-                _canonical(candidate_inventory)
-            ):
-                _fail("candidate backend package owner marker inventory proof differs")
-            _candidate_receipt, candidate_receipt_bytes, _candidate_children = _validated_package(
-                candidate,
-                "candidate backend package",
-                exclude_candidate_marker=True,
-            )
+                try:
+                    result = _prepare_locked(
+                        start_args,
+                        build_root,
+                        candidate,
+                        jobs,
+                        toolchain,
+                        candidate,
+                    )
+                except (BackendBuildError, OSError):
+                    if _discard_failed_candidate_if_owned(candidate, output, build_root):
+                        candidate = None
+                    raise
+                if result != 0:
+                    _fail(f"backend preparation failed with exit code {result}")
+                candidate_marker = _validate_candidate_marker(
+                    candidate,
+                    output,
+                    build_root,
+                    state="ready",
+                )
+                candidate_inventory = _hash_package(candidate)
+                if candidate_marker.get("artifact_inventory_sha256") != _sha256_bytes(
+                    _canonical(candidate_inventory)
+                ):
+                    _fail("candidate backend package owner marker inventory proof differs")
+                _candidate_receipt, candidate_receipt_bytes, _candidate_children = _validated_package(
+                    candidate,
+                    "candidate backend package",
+                    exclude_candidate_marker=True,
+                )
+            else:
+                # The typed path has already validated this ready candidate and
+                # sealed its source manifest.  Reuse its payload through the
+                # normal rotation journal; no Make invocation is allowed.
+                candidate = promotion_spec.candidate
+                _candidate_receipt = dict(promotion_spec.receipt)
+                candidate_receipt_bytes = promotion_spec.receipt_bytes
+
             if previous_receipt is not None:
                 _validated_package(
                     output,
@@ -4873,26 +5221,21 @@ def _start(args: argparse.Namespace) -> int:
                 journal_cleared = False
                 _log_phase("package", "rotation-journal-retained", reason=type(error).__name__)
             if journal_cleared:
-                try:
-                    _retain_package_backups(
+                if promotion_spec is not None:
+                    promoted_current = _validated_package(
                         output,
-                        control_root,
-                        _candidate_receipt,
-                        candidate_receipt_bytes,
+                        "promoted backend package",
+                        exclude_development_control=True,
                     )
-                except (BackendBuildError, OSError) as error:
-                    # Publication is already durable.  Unknown or corrupt backup
-                    # state is retained and diagnosed; it must never roll back a
-                    # valid current package or delete a direct rollback.
-                    retention_reason = re.sub(r"[^A-Za-z0-9_.:/-]+", "-", str(error)).strip("-")
-                    if not retention_reason:
-                        retention_reason = type(error).__name__
-                    _log_phase(
-                        "retention",
-                        "skipped",
-                        reason=retention_reason[:64],
-                        error=type(error).__name__,
+                    candidate_retirement.mark_promoted_archive_historical(
+                        sys.modules[__name__],
+                        promotion_spec,
+                        promoted_current,
                     )
+                # Historical rollback validation is maintenance, not a startup
+                # prerequisite. Preserve every backup here; _serve still verifies
+                # the current package before starting the API.
+                _log_phase("retention", "deferred", reason="outside-startup", backups="retained")
             else:
                 _log_phase("retention", "skipped", reason="pending-rotation-journal")
         except (BackendBuildError, OSError) as error:

@@ -68,7 +68,9 @@ mod field_store;
 mod live_command_journal;
 mod live_execution_binding;
 mod accepted_field_materialization;
+mod accepted_field_materialization_worker;
 mod live_accepted_execution;
+mod live_retirement;
 mod live_accepted_projection;
 mod live_scene_preparation;
 mod docker_startup;
@@ -1622,6 +1624,137 @@ mod terminal_snapshot_route_tests {
 }
 
 #[cfg(test)]
+mod live_retirement_router_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    const OPERATOR_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn operator_state() -> Arc<AppState> {
+        let mut state = crate::router_v2::tests::test_app_state();
+        Arc::get_mut(&mut state)
+            .expect("test state has one owner")
+            .local_compute_operator_token = Some(Arc::<str>::from(OPERATOR_TOKEN));
+        state
+    }
+
+    fn retirement_app(state: Arc<AppState>) -> Router {
+        super::merge_live_retirement_routes(Router::new(), state.clone()).with_state(state)
+    }
+
+    fn operator_header() -> (&'static str, String) {
+        ("authorization", format!("Bearer {OPERATOR_TOKEN}"))
+    }
+
+    fn valid_retirement_body(state: &AppState) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "fullmag.live-workspace-retirement-request.v1",
+            "operation_id": "retire-test",
+            "session_id": "session-test",
+            "run_id": "run-test",
+            "request_scope_epoch": format!(
+                "{}:{}",
+                state.request_scope_instance_id,
+                state
+                    .current_live_session_epoch
+                    .load(std::sync::atomic::Ordering::Acquire)
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn authorized_empty_context_uses_the_production_retirement_composition() {
+        let state = operator_state();
+        let (header_name, header_value) = operator_header();
+        let response = retirement_app(state)
+            .oneshot(
+                Request::get(live_retirement::RETIREMENT_ENDPOINT)
+                    .header(header_name, header_value)
+                    .body(Body::empty())
+                    .expect("context request"),
+            )
+            .await
+            .expect("context response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_empty_context_is_rejected_by_the_real_route() {
+        let response = retirement_app(operator_state())
+            .oneshot(
+                Request::get(live_retirement::RETIREMENT_ENDPOINT)
+                    .body(Body::empty())
+                    .expect("context request"),
+            )
+            .await
+            .expect("context response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_empty_post_is_rejected_before_freeze() {
+        let state = operator_state();
+        let body = valid_retirement_body(&state);
+        let response = retirement_app(state.clone())
+            .oneshot(
+                Request::post(live_retirement::RETIREMENT_ENDPOINT)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&body).expect("request JSON"),
+                    ))
+                    .expect("retirement request"),
+            )
+            .await
+            .expect("retirement response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.development_admission.admit(),
+        )
+        .await
+        .expect("unauthorized POST must not leave admission closed")
+        .expect("admission must remain open");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn authorized_empty_post_returns_bounded_conflict_and_reopens_freeze() {
+        let state = operator_state();
+        let (header_name, header_value) = operator_header();
+        let body = valid_retirement_body(&state);
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            retirement_app(state.clone()).oneshot(
+                Request::post(live_retirement::RETIREMENT_ENDPOINT)
+                    .header(header_name, header_value)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&body).expect("request JSON"),
+                    ))
+                    .expect("retirement request"),
+            ),
+        )
+        .await
+        .expect("retirement request must not self-deadlock")
+        .expect("retirement response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.development_admission.admit(),
+        )
+        .await
+        .expect("retirement failure must reopen admission")
+        .expect("admission must reopen after retirement failure");
+        drop(permit);
+    }
+}
+
+#[cfg(test)]
 mod scratch_session_lifecycle_tests {
     use super::*;
 
@@ -2457,11 +2590,17 @@ async fn main() {
 
     tracing_subscriber::fmt().with_env_filter("info").init();
 
+    let bootstrap_started = std::time::Instant::now();
+    eprintln!("[fullmag-api] bootstrap phase=runtime_state state=start elapsed_ms=0");
     let repo_root = repo_root();
     let runtime_state_root = crate::script::state_root(&repo_root).unwrap_or_else(|error| {
         tracing::error!("Cannot initialize runtime state: {error}");
         std::process::exit(1);
     });
+    eprintln!(
+        "[fullmag-api] bootstrap phase=runtime_state state=complete elapsed_ms={}",
+        bootstrap_started.elapsed().as_millis()
+    );
     let current_workspace_root = runtime_state_root.join("local-live").join("current");
     let current_command_journal_store_root =
         runtime_state_root.join("local-live").join("session-store");
@@ -2475,6 +2614,10 @@ async fn main() {
         );
     }
 
+    eprintln!(
+        "[fullmag-api] bootstrap phase=app_state state=start elapsed_ms={}",
+        bootstrap_started.elapsed().as_millis()
+    );
     let state = Arc::new(AppState {
         development_admission: Default::default(),
         development_restored_authoring: Default::default(),
@@ -2532,6 +2675,10 @@ async fn main() {
         frozen_spins_previews: Arc::new(RwLock::new(Default::default())),
     });
 
+    eprintln!(
+        "[fullmag-api] bootstrap phase=app_state state=complete elapsed_ms={}",
+        bootstrap_started.elapsed().as_millis()
+    );
     development_accepted_restore::restore_before_listen(&state)
         .await
         .expect("private accepted-run reattach must succeed before API startup");
@@ -2609,12 +2756,8 @@ async fn main() {
         // ── Professional session-scoped API (v2) ───────────────────────
         .merge(router_v2::build_v2_router());
 
-    let app = maybe_merge_swagger_ui(app)
+    let app = merge_live_retirement_routes(maybe_merge_swagger_ui(app), state.clone())
         .layer(DefaultBodyLimit::max(LOCAL_BRIDGE_BODY_LIMIT_BYTES))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            router_v2::middleware::development_admission::mutation_admission_middleware,
-        ))
         .layer(cors)
         .with_state(state);
 
@@ -2666,6 +2809,33 @@ async fn main() {
         let _ = task.await;
     }
     result.expect("serving API should succeed");
+}
+
+/// Compose the production admission layer with the private retirement routes.
+///
+/// Retirement must be merged after the generic admission layer: the handler
+/// acquires its own scoped workspace freeze, so an outer read permit would
+/// self-deadlock the write-side acquisition. The route-level session scope and
+/// handler-level operator authentication remain part of this shared helper.
+fn merge_live_retirement_routes(
+    app: Router<Arc<AppState>>,
+    state: Arc<AppState>,
+) -> Router<Arc<AppState>> {
+    let retirement_routes = Router::new()
+        .route(
+            live_retirement::RETIREMENT_ENDPOINT,
+            get(live_retirement::retirement_context)
+                .post(live_retirement::retire_current_live),
+        )
+        .route_layer(axum::middleware::from_fn(
+            router_v2::middleware::session_scope::session_scope_middleware,
+        ));
+
+    app.layer(axum::middleware::from_fn_with_state(
+        state,
+        router_v2::middleware::development_admission::mutation_admission_middleware,
+    ))
+    .merge(retirement_routes)
 }
 
 #[cfg(feature = "swagger-ui")]

@@ -569,8 +569,39 @@ def test_runtime_capture_uses_pruned_status_and_untracked_scans(
     assert status_calls
     assert all("--untracked-files=all" not in call for call in status_calls)
     assert all("--no-renames" in call for call in status_calls)
+    assert all("--ignore-submodules=all" in call for call in status_calls)
     assert any(":(exclude)external_solvers/**" in call for call in status_calls)
     assert any(call[:2] == ("ls-files", "--others") for call in calls)
+
+
+def test_status_queries_ignore_submodules_in_both_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "source_identity_status_arguments", CAPTURE
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(_root: Path, *arguments: str) -> bytes:
+        calls.append(arguments)
+        return b""
+
+    monkeypatch.setattr(module, "_git", fake_git)
+    monkeypatch.setattr(module, "_runtime_status_pathspecs", lambda _root: ("src",))
+
+    assert module._status_records(tmp_path, ignore_non_runtime_dirty=False) == []
+    assert module._status_records(tmp_path, ignore_non_runtime_dirty=True) == []
+
+    status_calls = [
+        call for call in calls if call[:2] == ("status", "--porcelain=v1")
+    ]
+    assert len(status_calls) == 2
+    assert all("--ignore-submodules=all" in call for call in status_calls)
 
 
 def test_successful_compare_is_silent(tmp_path: Path) -> None:
@@ -721,7 +752,7 @@ def test_qualification_input_parent_link_cannot_escape_repository(tmp_path: Path
         module._resolve_contained_path(repo, fixture, "qualification input")
     link = repo / "outside-parent"
     try:
-        link.symlink_to(outside, target_is_directory=True)
+        link.symlink_to(Path("..") / outside.name, target_is_directory=True)
     except OSError:
         return
     with pytest.raises(module.SourceIdentityError, match="escapes snapshot root"):

@@ -6,6 +6,7 @@ const appRoot = process.cwd();
 const stylesRoot = path.join(appRoot, "src/design/styles");
 const locallyScopedCssVars = new Set([
   "--depth",
+  "--fm-results-navigator-depth",
   "--fm-mesh-build-progress",
   "--fm-refresh-progress",
   "--pct",

@@ -9593,9 +9593,10 @@ mod tests {
             "fem/relax/preview.rs must own native FEM relaxation cached-preview helpers"
         );
         assert!(
-            module.contains("pub(crate) fn finalize_terminal_cache")
-                && module.contains("quantity_ids.push(display_selection.selection.quantity.as_str())"),
-            "fem/relax/preview.rs must own bounded asynchronous terminal cache flushing that includes the active vector field"
+            module.contains("pub(crate) fn request_cached_previews(")
+                && module.contains("pub(crate) fn poll_cached(")
+                && module.contains("pub(crate) fn take_terminal_publication("),
+            "fem/relax/preview.rs must own the bounded asynchronous terminal handoff"
         );
         assert!(
             module.contains("field_materialization_quantity_ids()"),
@@ -9656,20 +9657,24 @@ mod tests {
         );
         assert!(
             finalize.contains("preview_handoff.finalize_pending_until(")
-                && finalize.contains("preview_handoff.finalize_terminal_cache(")
+                && finalize.contains("preview_handoff.take_terminal_publication(")
+                && finalize.contains("terminal_field_snapshot: true")
+                && !finalize.contains("preview_handoff.finalize_terminal_cache(")
                 && !finalize.contains("build_fem_final_cached_preview_fields(")
                 && !finalize.contains("build_fem_cached_preview_fields("),
-            "FEM relaxation finalization must drain and publish active/inactive fields through the bounded asynchronous handoff"
+            "FEM relaxation finalization must drain the bounded handoff and publish terminal quantities as fragments"
         );
         assert!(
-            finalize.contains("if pending_preview_completed {")
+            finalize.contains("if !pending_preview_completed {")
                 && finalize.contains("preview_handoff.take_terminal_publication("),
-            "an expired terminal drain must publish explicit errors without retrying backend scheduling"
+            "an expired terminal drain must retain the bounded handoff path without retrying backend scheduling"
         );
         assert!(
             module.contains("self.finish_terminal_publication(fields, magnetization,")
-                && finalize.contains("*last_step = live_stats.clone();"),
-            "terminal FEM payloads, materialization states, and provenance must survive the later finished=true update"
+                && finalize.contains("terminal_stats.field_materialization_states")
+                && finalize.contains("terminal_stats.magnetization_source_step")
+                && finalize.contains("*last_step = terminal_stats;"),
+            "terminal FEM payloads, materialization states, and provenance must be recorded in the accepted terminal stats"
         );
         let runner = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("read runner lib.rs");
@@ -10610,7 +10615,7 @@ mod tests {
     }
 
     #[test]
-    fn public_live_preview_wrapper_publishes_one_completed_terminal_field_batch() {
+    fn public_live_preview_wrapper_publishes_complete_terminal_field_fragments() {
         let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
         problem
             .problem_meta
@@ -10620,6 +10625,17 @@ mod tests {
             realization: fullmag_ir::RequestedFemDemagIR::Auto,
         });
         let plan = fullmag_plan::plan(&problem).expect("CPU FDM fixture should plan");
+        let expected_terminal_quantities = match &plan.backend_plan {
+            BackendPlanIR::Fdm(fdm) => crate::quantities::active_fdm_preview_quantities(
+                dispatch::FdmEngine::CpuReference,
+                fdm,
+                &crate::quantities::field_materialization_quantity_ids(),
+            )
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>(),
+            other => panic!("CPU FDM fixture resolved to unexpected plan: {other:?}"),
+        };
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock drift")
@@ -10652,34 +10668,79 @@ mod tests {
 
         assert_eq!(result.status, RunStatus::Completed);
         assert_eq!(updates.iter().filter(|update| update.finished).count(), 1);
-        let terminal = updates
-            .last()
-            .expect("completed run should publish a terminal update");
-        assert!(terminal.finished, "completed update must be published last");
+        let terminal_fragments = updates
+            .iter()
+            .filter(|update| update.terminal_field_snapshot)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal_fragments.len(),
+            expected_terminal_quantities.len(),
+            "terminal capture must emit exactly one complete quantity fragment per active field"
+        );
         let final_stats = result
             .steps
             .last()
             .expect("completed run should report stats");
-        assert_eq!(terminal.stats.step, final_stats.step);
-        assert_eq!(terminal.stats.time, final_stats.time);
-        let fields = terminal
-            .cached_preview_fields
-            .as_ref()
-            .expect("completed terminal update should carry fields");
-        assert!(fields.iter().any(|field| field.quantity == "eden_demag"));
-        for field in fields {
+        let expected_m = result
+            .final_magnetization
+            .iter()
+            .flat_map(|value| value.iter().copied())
+            .collect::<Vec<_>>();
+        let expected_m_digest = live_preview_values_sha256(&expected_m);
+        let mut observed_terminal_quantities = std::collections::BTreeSet::new();
+        for update in &terminal_fragments {
+            assert_eq!(update.stats.step, final_stats.step);
+            assert_eq!(update.stats.time, final_stats.time);
+            assert_eq!(
+                update.magnetization.as_deref(),
+                Some(expected_m.as_slice()),
+                "each terminal field fragment must carry the same final magnetization"
+            );
+            assert_eq!(
+                live_preview_values_sha256(
+                    update
+                        .magnetization
+                        .as_deref()
+                        .expect("terminal fragment magnetization")
+                ),
+                expected_m_digest
+            );
+            let fields = update
+                .cached_preview_fields
+                .as_ref()
+                .expect("terminal fragment must carry its field");
+            assert_eq!(fields.len(), 1);
+            let field = &fields[0];
+            assert!(
+                observed_terminal_quantities.insert(field.quantity.clone()),
+                "terminal quantity was emitted more than once: {}",
+                field.quantity
+            );
             assert_eq!(field.source_step, final_stats.step);
             assert_eq!(field.source_time_seconds, Some(final_stats.time));
             assert!(field.materialized_at_unix_ms > 0);
+            assert!(!field.auto_downscaled);
+            if field.quantity == "m" {
+                assert_eq!(field.vector_field_values, expected_m);
+            }
         }
-        let materialized_m = fields
-            .iter()
-            .find(|field| field.quantity == "m")
-            .expect("terminal materialization should carry m");
-        assert_eq!(
-            terminal.magnetization.as_deref(),
-            Some(materialized_m.vector_field_values.as_slice())
-        );
+        assert_eq!(observed_terminal_quantities, expected_terminal_quantities);
+
+        let terminal = updates
+            .last()
+            .expect("completed run should publish a terminal update");
+        assert!(terminal.finished, "completed update must be published last");
+        assert_eq!(terminal.stats.step, final_stats.step);
+        assert_eq!(terminal.stats.time, final_stats.time);
+        assert_eq!(terminal.magnetization.as_deref(), Some(expected_m.as_slice()));
+        let final_field = terminal
+            .cached_preview_fields
+            .as_ref()
+            .expect("completed update should retain the final terminal fragment");
+        assert_eq!(final_field.len(), 1);
+        assert!(expected_terminal_quantities.contains(&final_field[0].quantity));
+        assert_eq!(final_field[0].source_step, final_stats.step);
+        assert_eq!(final_field[0].source_time_seconds, Some(final_stats.time));
 
         fs::remove_dir_all(&output_dir).expect("temporary artifact directory should be removable");
     }

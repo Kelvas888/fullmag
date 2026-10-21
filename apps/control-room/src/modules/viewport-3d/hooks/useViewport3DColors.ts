@@ -57,6 +57,8 @@ export function readViewport3DColorsFromStyles(
       antenna,
       accentStrong,
       background,
+      backgroundTop: read("--fm-bg-viewport-top") || background,
+      backgroundBottom: read("--fm-bg-viewport-bottom") || background,
       danger,
       field,
       hud: readViewport3DHudColors(read, {
@@ -211,6 +213,8 @@ function sameViewport3DColors(
     left.antenna === right.antenna &&
     left.accentStrong === right.accentStrong &&
     left.background === right.background &&
+    left.backgroundTop === right.backgroundTop &&
+    left.backgroundBottom === right.backgroundBottom &&
     left.danger === right.danger &&
     left.field === right.field &&
     left.mesh === right.mesh &&

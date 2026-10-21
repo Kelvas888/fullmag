@@ -146,6 +146,9 @@ assert docker_build_control.mirror_console(b"progress\\n") is False
         control = build_control.BuildControl.__new__(build_control.BuildControl)
         control.project = "fullmag-test"
         control.volume = "fullmag-build-control-test"
+        control.namespace = ""
+        control.namespace_registry = None
+        control.namespace_registry_sha256 = None
         control.helper_args = lambda *args, **kwargs: ["fake-control-helper"]
         control.space = lambda: {"available_bytes": 64 * 1024**3}
         control._line = Mock(side_effect=("READY", "LOGGED"))
@@ -175,13 +178,16 @@ assert docker_build_control.mirror_console(b"progress\\n") is False
         control = Mock()
         operation = {"receipt": {}, "root": "development/attempts/test"}
 
+        last_state = {"running": True}
+
         def docker_text(*args, **kwargs):
             if args == ("inspect", "backend"):
-                return next(observations)
+                observed = next(observations)
+                last_state["running"] = json.loads(observed)[0]["State"]["Running"]
+                return observed
             if args[:2] == ("logs", "--since"):
-                return "phase=start state=building"
-            if args[:2] == ("logs", "--tail"):
-                return "backend failure"
+                self.assertEqual(args, ("logs", "--since", "first", "--tail", "200", "backend"))
+                return "phase=start state=building" if last_state["running"] else "backend failure"
             raise AssertionError(args)
 
         with patch.object(volume_dev, "docker_text", side_effect=docker_text), patch.object(
@@ -195,7 +201,8 @@ assert docker_build_control.mirror_console(b"progress\\n") is False
         sink.close()
 
         control.write.assert_called_once_with(
-            "development/attempts/test/backend-failure-log.json", {"log": "backend failure"}
+            "development/attempts/test/backend-failure-log.json",
+            {"started_at": "first", "log": "backend failure"},
         )
 
     def test_control_volume_logger_errors_remain_fatal(self):

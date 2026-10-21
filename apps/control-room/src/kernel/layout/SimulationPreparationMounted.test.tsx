@@ -56,6 +56,7 @@ import {
 } from "./simulationPreparationTestDom.test-support";
 import { footerManifest } from "../../modules/footer/manifest";
 import { SlotHost } from "./SlotHost";
+import { DraggablePanel } from "@/shared/ui/DraggablePanel";
 
 vi.mock("@/shared/ui/Dialog", async () => {
   const React = await import("react");
@@ -136,6 +137,38 @@ afterEach(() => {
 });
 
 describe("mounted simulation preparation UI", () => {
+  it("reflects draggable panel data attributes through the test DOM dataset", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    dom.document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+
+    await act(async () => {
+      root.render(
+        <DraggablePanel
+          open
+          maximizable
+          onOpenChange={vi.fn()}
+          title="Layout probe"
+        >
+          Probe
+        </DraggablePanel>,
+      );
+    });
+    const panel = findElement(
+      container,
+      (element) => hasClass(element, "fm-draggable-panel"),
+      "draggable panel",
+    );
+    expect(panel.dataset.maximized).toBe("false");
+
+    await act(async () => findButton(container, "Maximize window").click());
+    expect(panel.dataset.maximized).toBe("true");
+
+    await act(async () => root.unmount());
+    dom.restore();
+  });
+
   it("mounts the editable workspace while the first preparation resources are loading", async () => {
     const dom = installSimulationPreparationTestDom();
     const pendingStatus = deferred<LiveStatusResource>();
@@ -532,7 +565,9 @@ describe("mounted simulation preparation UI", () => {
     expect(findButton(dom.document.body, "Copy full diagnostic report")).toBeTruthy();
     const fullReport = findElement(
       dom.document.body,
-      (element) => element.tagName === "DETAILS",
+      (element) =>
+        element.tagName === "DETAILS" &&
+        element.textContent.includes("Full diagnostic report"),
       "full diagnostic report",
     );
     expect(fullReport.hasAttribute("open")).toBe(false);
@@ -1127,6 +1162,11 @@ function statusFixture(
   } = {},
 ): LiveStatusResource {
   return {
+    domain: {
+      cell_count: 0,
+      discretization: "fem",
+      generation_id: "fem:unmaterialized",
+    },
     resources: {
       simulation_preparation_revision: patch.preparationRevision ?? 7,
     },
@@ -1135,6 +1175,12 @@ function statusFixture(
       session_id: "session-preparation-test",
       session_epoch: "session-preparation-test@1700000000000",
       request_scope_epoch: "api-instance:preparation-test",
+    },
+    lifecycle: {
+      commandability: "allowed",
+      connectivity: "connected",
+      session_resource: "active",
+      solver: "idle",
     },
     solver: { state: patch.solverState ?? "bootstrapping" },
   } as LiveStatusResource;

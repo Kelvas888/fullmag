@@ -40,7 +40,7 @@ struct ProjectionCursor {
     execution_input_sha256: Option<String>,
     run_id: String,
     run_revision: u64,
-    artifact_revision: u64,
+    artifact_revision: Option<u64>,
     status: &'static str,
     latest_output_identity: Option<String>,
     live_observation_identity: Option<String>,
@@ -62,7 +62,8 @@ struct VerifiedOutput {
 #[derive(Debug, Clone)]
 struct DurableProjection {
     run_catalog_revision: u64,
-    artifact_catalog_revision: u64,
+    artifact_catalog_revision: Option<u64>,
+    terminal_without_outputs: bool,
     status: &'static str,
     command_id: Option<String>,
     latest_state: Option<VerifiedOutput>,
@@ -148,7 +149,12 @@ async fn poll_once(
     // transition fence.  Publish a stage-specific pinned domain before the
     // output field is admitted, then apply the field under that same fence.
     let _transition = state.current_live_session_transition.lock().await;
-    let stage_preparation = if let Some((_, observation)) = projection
+    let stage_preparation = if projection.terminal_without_outputs {
+        // A terminal catalog without outputs still carries authoritative
+        // lifecycle state. Do not require preparation/materialization or clear
+        // existing live fields before publishing that terminal state.
+        Ok(())
+    } else if let Some((_, observation)) = projection
         .live_observation
         .as_ref()
         .filter(|(_, observation)| observation.magnetization_values.is_some())
@@ -250,30 +256,71 @@ fn load_durable_projection(
     else {
         return Ok(None);
     };
-    let Some(artifact_catalog) = store
-        .read_artifact_catalog(&context.run_id)
-        .map_err(|error| ApiError::internal(format!("read accepted artifact catalog: {error}")))?
-    else {
-        return Ok(None);
-    };
     run_catalog
         .validate()
         .map_err(|error| ApiError::conflict(format!("accepted run catalog is invalid: {error}")))?;
-    artifact_catalog.validate().map_err(|error| {
-        ApiError::conflict(format!("accepted artifact catalog is invalid: {error}"))
-    })?;
-    if run_catalog.run_id != context.run_id || artifact_catalog.run_id != context.run_id {
+    if run_catalog.run_id != context.run_id {
         return Err(ApiError::conflict_with_code(
             "accepted_projection_run_identity_mismatch",
-            "accepted catalog identity differs from the current live run",
+            "accepted run catalog identity differs from the current live run",
         ));
     }
 
-    let status = accepted_projection_status(&store, &context.run_id, &run_catalog.tasks)?;
+    let catalog_lifecycle_status = catalog_status(&run_catalog.tasks);
+    let artifact_catalog = store
+        .read_artifact_catalog(&context.run_id)
+        .map_err(|error| ApiError::internal(format!("read accepted artifact catalog: {error}")))?;
+    if artifact_catalog.is_none()
+        && previous_cursor.is_some_and(|cursor| {
+            cursor_matches_context(cursor, context) && cursor.artifact_revision.is_some()
+        })
+    {
+        return Err(ApiError::conflict_with_code(
+            "accepted_projection_artifact_catalog_disappeared",
+            "a previously observed accepted artifact catalog is now missing",
+        ));
+    }
+    let terminal_without_outputs = artifact_catalog.is_none()
+        && matches!(catalog_lifecycle_status, "failed" | "cancelled")
+        && terminal_catalog_without_outputs(&run_catalog.tasks);
+    let terminal_status = matches!(
+        catalog_lifecycle_status,
+        "completed" | "failed" | "cancelled"
+    );
+    if artifact_catalog.is_none() && terminal_status && !terminal_without_outputs {
+        return Err(ApiError::conflict_with_code(
+            "accepted_projection_artifact_catalog_required",
+            "terminal accepted run has outputs or task state that requires an artifact catalog",
+        ));
+    }
+    if artifact_catalog.is_none() && !terminal_without_outputs {
+        return Ok(None);
+    }
+    if let Some(artifact_catalog) = artifact_catalog.as_ref() {
+        artifact_catalog.validate().map_err(|error| {
+            ApiError::conflict(format!("accepted artifact catalog is invalid: {error}"))
+        })?;
+        if artifact_catalog.run_id != context.run_id {
+            return Err(ApiError::conflict_with_code(
+                "accepted_projection_run_identity_mismatch",
+                "accepted artifact catalog identity differs from the current live run",
+            ));
+        }
+    }
+    // The start gate only remaps waiting_for_compute. When this is a valid
+    // terminal no-output run, the RunCatalog lifecycle is the exact status.
+    let status = if terminal_without_outputs {
+        catalog_lifecycle_status
+    } else {
+        accepted_projection_status(&store, &context.run_id, &run_catalog.tasks)?
+    };
+    let artifact_catalog_revision = artifact_catalog
+        .as_ref()
+        .map(|artifact_catalog| artifact_catalog.revision);
     let durable_changed = !previous_cursor.is_some_and(|cursor| {
         cursor_matches_context(cursor, context)
             && cursor.run_revision == run_catalog.revision
-            && cursor.artifact_revision == artifact_catalog.revision
+            && cursor.artifact_revision == artifact_catalog_revision
             && cursor.status == status
     });
     let specification: fullmag_application::RunSpecification =
@@ -391,7 +438,11 @@ fn load_durable_projection(
         return Ok(None);
     }
     let verified = if durable_changed {
-        load_verified_outputs(&store, &run_catalog, &artifact_catalog, &task_order)?
+        if let Some(artifact_catalog) = artifact_catalog.as_ref() {
+            load_verified_outputs(&store, &run_catalog, artifact_catalog, &task_order)?
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -425,9 +476,11 @@ fn load_durable_projection(
         .map(|output| output.object_ref.clone())
         .or_else(|| latest_total_energy.as_ref().map(scalar_identity))
         .or_else(|| {
-            previous_cursor
-                .filter(|cursor| cursor_matches_context(cursor, context))
-                .and_then(|cursor| cursor.latest_output_identity.clone())
+            artifact_catalog.as_ref().and_then(|_| {
+                previous_cursor
+                    .filter(|cursor| cursor_matches_context(cursor, context))
+                    .and_then(|cursor| cursor.latest_output_identity.clone())
+            })
         });
     let stage_execution = if !durable_changed {
         if let Some(cursor) = previous_cursor.filter(|cursor| cursor_matches_context(cursor, context)) {
@@ -461,7 +514,8 @@ fn load_durable_projection(
         .map(ToOwned::to_owned);
     Ok(Some(DurableProjection {
         run_catalog_revision: run_catalog.revision,
-        artifact_catalog_revision: artifact_catalog.revision,
+        artifact_catalog_revision,
+        terminal_without_outputs,
         status,
         command_id,
         latest_state,
@@ -805,6 +859,18 @@ fn catalog_status(tasks: &[fullmag_session::FmsTaskCatalogEntry]) -> &'static st
         return "running";
     }
     "waiting_for_compute"
+}
+
+fn terminal_catalog_without_outputs(tasks: &[fullmag_session::FmsTaskCatalogEntry]) -> bool {
+    !tasks.is_empty()
+        && tasks.iter().all(|task| {
+            matches!(
+                task.lifecycle,
+                fullmag_session::FmsTaskLifecycle::Failed
+                    | fullmag_session::FmsTaskLifecycle::Interrupted
+                    | fullmag_session::FmsTaskLifecycle::Cancelled
+            ) && task.artifact_ids.is_empty()
+        })
 }
 
 fn accepted_projection_status(
@@ -1658,7 +1724,7 @@ async fn apply_projection(
                 "observation_frame": frame, "provenance": provenance,
             }));
         }
-        let field_revision = next.field_revision;
+        let field_revision = crate::router_v2::handlers::sessions::status::field_revision(&next);
         let generation = next
             .terminal_field_generations
             .get(&context.run_id)
@@ -1680,7 +1746,7 @@ async fn apply_projection(
             },
             frame,
         )?;
-        changed |= next.field_revision != field_revision;
+        changed |= crate::router_v2::handlers::sessions::status::field_revision(&next) != field_revision;
     } else if live_stage_is_newer {
         let active_identity = projection.live_observation_identity.as_deref();
         let displayed_identity = next
@@ -1711,7 +1777,7 @@ async fn apply_projection(
                 value.pointer("/provenance/source").and_then(Value::as_str) == Some("accepted_live_observation")
             }).map(|(id, _)| id.clone()).collect::<Vec<_>>();
             for id in stale { fields.remove(&id); }
-            let field_revision = next.field_revision;
+            let field_revision = crate::router_v2::handlers::sessions::status::field_revision(&next);
             let generation = next
                 .terminal_field_generations
                 .get(&context.run_id)
@@ -1732,13 +1798,18 @@ async fn apply_projection(
                     clear_preview_cache: true,
                 },
             )?;
-            changed |= next.field_revision != field_revision;
+            changed |= crate::router_v2::handlers::sessions::status::field_revision(&next) != field_revision;
         }
     } else {
         if let Some(output) = projection.latest_state.as_ref() {
             if let fullmag_application::DecodedStudyArtifact::MagnetizationState(state_output) =
                 &output.decoded
             {
+                let artifact_revision = projection.artifact_catalog_revision.ok_or_else(|| {
+                    ApiError::conflict(
+                        "accepted output cannot be projected without an artifact catalog revision",
+                    )
+                })?;
                 let frame = accepted_output_frame(&next, state_output.step, state_output.time_s)?;
                 let mut fields = crate::types::LatestFields::default();
                 fields.insert(
@@ -1747,7 +1818,7 @@ async fn apply_projection(
                         "source_step": state_output.step,
                         "source_time_seconds": state_output.time_s,
                         "solver_dt": state_output.solver_dt_s,
-                        "source_revision": projection.artifact_catalog_revision,
+                        "source_revision": artifact_revision,
                         "carrier_fingerprint": state_output.space_fingerprint.clone(),
                         "accepted_state_ref": output.accepted_state_ref,
                         "state_object_ref": output.object_ref,
@@ -1786,7 +1857,7 @@ async fn apply_projection(
     }
     next.state_version = next.state_version.saturating_add(1);
 
-    if terminal {
+    if terminal && !projection.terminal_without_outputs {
         complete_bound_command(
             state,
             &next,
@@ -2096,7 +2167,7 @@ mod tests {
             execution_input_sha256: None,
             run_id: "run-a".into(),
             run_revision: 1,
-            artifact_revision: 1,
+            artifact_revision: Some(1),
             status: "running",
             latest_output_identity: None,
             live_observation_identity: None,

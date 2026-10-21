@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -109,7 +110,8 @@ def _mount_path(value: object) -> str | None:
         value = os.fspath(value)
     if not isinstance(value, str) or not value:
         return None
-    return os.path.normcase(os.path.normpath(value.replace("\\", "/")))
+    from docker_volume_activate import _canonical_host_path
+    return _canonical_host_path(value) or None
 
 
 def _validate_frontend_volume(
@@ -180,6 +182,9 @@ def _read_live_development(
     port: int,
 ) -> tuple[dict[str, object], str, str, str, dict[str, object]]:
     current = control.read("development/current.json")
+    current_fence_sha256 = hashlib.sha256(canonical(current)).hexdigest()
+    if isinstance(current, dict) and current.get("state") == "failed-confirmed":
+        current = _read_recovered_development(control, current, selected, identity)
     if not isinstance(current, dict) or current.get("state") != "succeeded":
         raise BuildControlError("Browser QA requires a succeeded live volume DEV receipt")
     if current.get("compose_project") != control.project:
@@ -218,7 +223,56 @@ def _read_live_development(
         raise BuildControlError("Frontend inputs worktree differs from selected checkout")
     if str(frontend_inputs.get("host_port")) != str(port):
         raise BuildControlError("Frontend inputs port differs from requested public port")
+    current = {**current, "development_fence_sha256": current_fence_sha256}
     return current, backend_id, frontend_id, frontend_volume, frontend_inputs
+
+
+def _read_recovered_development(control, original, selected, identity):
+    """Resolve an authenticated recovery without rewriting the original receipt."""
+    from docker_volume_activate import _linked_runtime_terminals, _validate_running_group
+
+    attempt = original.get("attempt")
+    if not isinstance(attempt, str) or not re.fullmatch(r"[0-9a-f]{32}", attempt):
+        raise BuildControlError("Development receipt has no valid original attempt")
+    root = "development/attempts/" + attempt
+    terminal = control.read(root + "/terminal.json")
+    if canonical(terminal) != canonical(original):
+        raise BuildControlError("Development current differs from its terminal receipt")
+    document = control.read(root + "/compose.json")
+    config_sha256 = hashlib.sha256(canonical(document)).hexdigest()
+    if original.get("config_sha256") not in (None, config_sha256):
+        raise BuildControlError("Development original/config pin differs")
+    inputs = original.get("inputs")
+    if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
+        raise BuildControlError("Development recovery source differs from selected checkout")
+    image = inputs.get("image_id")
+    if not isinstance(image, str) or not IMAGE_ID_RE.fullmatch(image):
+        raise BuildControlError("Development recovery requires an immutable image")
+    linked = _linked_runtime_terminals(
+        control, attempt, original, source_root=str(selected), image=image,
+        config_sha256=config_sha256,
+    )
+    matches = {}
+    for recovered in linked:
+        try:
+            ids = _validate_running_group(
+                control, identity, document, recovered, image, source_root=str(selected),
+            )
+        except BuildControlError:
+            continue
+        matches.setdefault(ids, []).append(recovered)
+    if len(matches) != 1:
+        raise BuildControlError("Development recovery does not identify exactly one live group")
+    recovered = max(next(iter(matches.values())), key=lambda item: item.get("finished_at", 0))
+    # Keep the development attempt and its standard source/image inputs. The
+    # effective runtime has separate provenance, never a fabricated DEV success.
+    return {
+        **original, **recovered, "inputs": inputs, "attempt": attempt,
+        "phase": original.get("phase"), "config_sha256": config_sha256,
+        "runtime_phase": recovered["phase"], "runtime_attempt": recovered["attempt"],
+        "runtime_terminal_sha256": hashlib.sha256(canonical(recovered)).hexdigest(),
+        "development_terminal_state": original["state"],
+    }
 
 
 def _validate_frontend(
@@ -548,12 +602,29 @@ def _compose_document(
     frontend_volume: str,
     port: int,
     timeout: int,
+    prepare_viewport_fixture: bool = False,
 ) -> dict[str, object]:
     labels = {
         **source_labels(identity),
         "org.fullmag.browser-qa.schema": OPERATION_SCHEMA,
         "org.fullmag.browser-qa.playwright-version": PLAYWRIGHT_VERSION,
     }
+    environment = {
+        "HOME": "/tmp",
+        "LANG": "C.UTF-8",
+        "NODE_ENV": "test",
+        "PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright",
+        # The browser uses the private Compose service path. The
+        # host wrapper separately probes the published loopback URL.
+        "CONTROL_ROOM_URL": "http://frontend:8080",
+        "CONTROL_ROOM_PUBLIC_URL": f"http://127.0.0.1:{port}",
+        "CONTROL_ROOM_EXPECTED_PLAYWRIGHT_VERSION": PLAYWRIGHT_VERSION,
+        "CONTROL_ROOM_BROWSER_GPU_MODE": "swiftshader-webgl-requested",
+        "CONTROL_ROOM_BROWSER_QA_TIMEOUT_MS": str(timeout * 1000),
+        "NVIDIA_VISIBLE_DEVICES": "void",
+    }
+    if prepare_viewport_fixture:
+        environment["CONTROL_ROOM_PREPARE_VIEWPORT_FIXTURE"] = "1"
     return {
         "name": identity["project_name"],
         "services": {
@@ -571,20 +642,7 @@ def _compose_document(
                 "cpus": 2,
                 "shm_size": "256m",
                 "logging": {"driver": "none"},
-                "environment": {
-                    "HOME": "/tmp",
-                    "LANG": "C.UTF-8",
-                    "NODE_ENV": "test",
-                    "PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright",
-                    # The browser uses the private Compose service path. The
-                    # host wrapper separately probes the published loopback URL.
-                    "CONTROL_ROOM_URL": "http://frontend:8080",
-                    "CONTROL_ROOM_PUBLIC_URL": f"http://127.0.0.1:{port}",
-                    "CONTROL_ROOM_EXPECTED_PLAYWRIGHT_VERSION": PLAYWRIGHT_VERSION,
-                    "CONTROL_ROOM_BROWSER_GPU_MODE": "swiftshader-webgl-requested",
-                    "CONTROL_ROOM_BROWSER_QA_TIMEOUT_MS": str(timeout * 1000),
-                    "NVIDIA_VISIBLE_DEVICES": "void",
-                },
+                "environment": environment,
                 "user": "65532:65532",
                 "working_dir": "/state/development/workspace/apps/control-room",
                 "command": [
@@ -852,6 +910,12 @@ def _run(operation: dict[str, object], control: BuildControl, document: dict[str
     operation["receipt"]["browser_container_id"] = observed["Id"]
     control.write(root + "/receipt.json", operation["receipt"])
     raw = result.stdout
+    control.write(root + "/runner-output.json", {
+        "schema": "fullmag.docker-dev-browser-qa-runner-output.v1",
+        "exit_code": result.returncode,
+        "stdout": _text(result.stdout, MAX_RESULT_BYTES // 2),
+        "stderr_tail": _text(result.stderr),
+    })
     operation["daemon_pending"] = True
     try:
         payload = _parse_result(raw, public_url, browser_url)
@@ -870,11 +934,6 @@ def _run(operation: dict[str, object], control: BuildControl, document: dict[str
     if result.returncode != 0:
         payload = {**payload, "state": "failed-confirmed", "error": "Browser helper exit code was non-zero"}
     control.write(root + "/result.json", payload)
-    control.write(root + "/runner-output.json", {
-        "schema": "fullmag.docker-dev-browser-qa-runner-output.v1",
-        "exit_code": result.returncode,
-        "stderr_tail": _text(result.stderr),
-    })
     if result.returncode != 0:
         _remove_helper(operation, observed["Id"])
         operation["receipt"].update(state="failed-confirmed", error="Browser helper exit code was non-zero", exit_code=result.returncode)
@@ -884,6 +943,158 @@ def _run(operation: dict[str, object], control: BuildControl, document: dict[str
     operation["daemon_pending"] = False
 
 
+def reconcile_browser_qa(control, selected, identity, args):
+    """Close one stopped, failed QA attempt; never infer a successful proof."""
+    from docker_volume_activation_reconcile import (
+        _control_bytes, _probe_helper_absence, _validate_helper,
+        _validate_helper_logged, _wait_for_helper_exit,
+    )
+    attempt = args.reconcile_attempt
+    if not re.fullmatch(r"[0-9a-f]{32}", attempt or ""):
+        raise BuildControlError("QA reconciliation requires a full attempt UUID")
+    for value in (args.expected_receipt_sha256, args.expected_compose_sha256):
+        if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+            raise BuildControlError("QA reconciliation requires exact receipt and Compose hashes")
+    for value in (args.expected_browser_id, args.expected_helper_id):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise BuildControlError("QA reconciliation requires full container IDs")
+    root = "browser-qa/attempts/" + attempt
+    active_raw = _control_bytes(control, "active", optional=True)
+    retained_terminal = control.read(root + "/terminal.json", optional=True)
+    already_released = active_raw is None
+    if ((already_released and not isinstance(retained_terminal, Mapping))
+            or (not already_released and active_raw != (attempt + "\n").encode())):
+        raise BuildControlError("QA reconciliation active fence differs")
+    receipt_raw = _control_bytes(control, root + "/receipt.json")
+    compose_raw = _control_bytes(control, root + "/compose.json")
+    if (hashlib.sha256(receipt_raw).hexdigest() != args.expected_receipt_sha256
+            or hashlib.sha256(compose_raw).hexdigest() != args.expected_compose_sha256):
+        raise BuildControlError("QA reconciliation evidence CAS differs")
+    receipt, document = json.loads(receipt_raw), json.loads(compose_raw)
+    required = {"phase": "browser-qa", "attempt": attempt, "compose_project": control.project,
+                "control_volume": control.volume, "state": "outcome-unknown-resources-retained"}
+    if any(receipt.get(key) != value for key, value in required.items()):
+        raise BuildControlError("QA reconciliation receipt identity/outcome differs")
+    inputs = receipt.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise BuildControlError("QA reconciliation inputs are missing")
+    if inputs.get("source_root") != str(selected) or inputs.get("worktree_id") != identity["worktree_id"]:
+        raise BuildControlError("QA reconciliation source identity differs")
+    prepare_viewport_fixture = inputs.get("prepare_viewport_fixture", False)
+    if type(prepare_viewport_fixture) is not bool:
+        raise BuildControlError("QA reconciliation viewport fixture input must be boolean")
+    expected_document = _compose_document(selected, identity, inputs["browser_image"],
+        inputs["frontend_volume"], args.port, inputs["browser_runtime_timeout"],
+        prepare_viewport_fixture=prepare_viewport_fixture)
+    if canonical(document) != canonical(expected_document):
+        raise BuildControlError("QA reconciliation Compose recipe differs")
+    helper_name = "fullmag-control-" + attempt
+    if receipt.get("helper_container") != helper_name:
+        raise BuildControlError("QA reconciliation lease helper name differs")
+    retained_evidence = control.read(root + "/reconciliation-evidence.json", optional=True)
+    if already_released:
+        if (not isinstance(retained_evidence, Mapping)
+                or retained_evidence.get("helper_id") != args.expected_helper_id
+                or _probe_helper_absence(args.expected_helper_id) is None
+                or _probe_helper_absence(helper_name) is None):
+            raise BuildControlError("QA reconciliation release is not authenticated")
+        helper_id, helper_log = args.expected_helper_id, retained_evidence.get("helper_log")
+    else:
+        _, helper_id = _validate_helper(control, helper_name, attempt, phase="browser-qa")
+        if helper_id != args.expected_helper_id:
+            raise BuildControlError("QA reconciliation lease helper incarnation differs")
+        helper_log = _validate_helper_logged(helper_id)
+    browser_name = "fullmag-browser-qa-" + attempt[:12]
+    if receipt.get("browser_container_name") != browser_name:
+        raise BuildControlError("QA reconciliation browser name differs")
+    browser_absent = _probe_helper_absence(args.expected_browser_id) is not None
+    if already_released and not browser_absent:
+        raise BuildControlError("Released QA reconciliation still has a browser container")
+    if browser_absent:
+        if not isinstance(retained_evidence, Mapping):
+            raise BuildControlError("Absent QA browser has no retained reconciliation evidence")
+        if _probe_helper_absence(browser_name) is None:
+            raise BuildControlError("QA browser name was reused by another incarnation")
+        observed = retained_evidence.get("browser_inspect") or {}
+    else:
+        observed = _inspect(args.expected_browser_id)
+    state = observed.get("State") or {}
+    if (observed.get("Name") != "/" + browser_name or observed.get("Id") != args.expected_browser_id
+            or state.get("Status") != "exited" or state.get("Running") is not False
+            or state.get("OOMKilled") is not False or type(state.get("ExitCode")) is not int
+            or not state.get("FinishedAt")
+            or observed.get("RestartCount") != 0):
+        raise BuildControlError("QA reconciliation requires an exact stopped browser")
+    _validate_browser_image_reference(inputs["browser_image"])
+    image = _inspect_image(inputs["browser_image"])
+    if image is None:
+        raise BuildControlError("QA reconciliation browser image is absent")
+    image_id, _ = _validate_browser_image_document(image, inputs["browser_image"])
+    if receipt.get("browser_image_id") != image_id:
+        raise BuildControlError("QA reconciliation browser image pin differs")
+    _validate_browser_helper(observed, control, identity, inputs["frontend_volume"],
+        image_id, state["ExitCode"], selected)
+    service = document["services"]["browser-qa"]
+    if (observed["Config"].get("Cmd") != service["command"]
+            or observed["Config"].get("Entrypoint") != image["Config"].get("Entrypoint")):
+        raise BuildControlError("QA reconciliation browser command differs")
+    evidence = {"schema": "fullmag.browser-qa-reconciliation.v1", "state": "failed-confirmed",
+        "attempt": attempt, "compose_project": control.project, "output_lost": True,
+        "observed_exit_code": state["ExitCode"], "browser_container_id": observed["Id"],
+        "receipt_sha256": args.expected_receipt_sha256, "compose_sha256": args.expected_compose_sha256,
+        "helper_id": helper_id, "helper_log": helper_log, "browser_inspect": observed,
+        "verification": "NOT VERIFIED"}
+    if retained_evidence is not None:
+        stable = {key: value for key, value in retained_evidence.items() if key != "reconciled_at"}
+        if canonical(stable) != canonical(evidence) or type(retained_evidence.get("reconciled_at")) not in (int, float):
+            raise BuildControlError("Retained QA reconciliation evidence differs")
+        evidence = retained_evidence
+    else:
+        evidence["reconciled_at"] = time.time()
+        control.write(root + "/reconciliation-evidence.json", evidence)
+    if not browser_absent:
+        if _inspect(observed["Id"])["State"] != state:
+            raise BuildControlError("QA browser incarnation changed during reconciliation")
+        docker_capture("rm", observed["Id"])
+    absence = _probe_helper_absence(observed["Id"])
+    if absence is None:
+        raise BuildControlError("QA browser absence is not confirmed")
+    terminal = {**receipt, "state": "failed-confirmed", "output_lost": True,
+        "error": "Browser QA failed; output lost after client timeout", "exit_code": state["ExitCode"],
+        "browser_container_id": observed["Id"], "browser_absence_sha256": absence,
+        "reconciliation_evidence_sha256": hashlib.sha256(canonical(evidence) + b"\n").hexdigest(),
+        "finished_at": evidence["reconciled_at"], "verification": "NOT VERIFIED"}
+    if already_released:
+        if (canonical(retained_terminal) != canonical(terminal)
+                or _control_bytes(control, "active", optional=True) is not None):
+            raise BuildControlError("Completed QA reconciliation terminal/fence differs")
+        mirror_console(json.dumps({"state": "failed-confirmed", "attempt": attempt,
+            "output_lost": True, "lease_released": True, "verification": "NOT VERIFIED"}) + "\n")
+        return
+    # Publish under the original lease, with CAS on all retained inputs. Only
+    # the authenticated original helper may remove its own active marker.
+    payload = canonical(terminal) + b"\n"
+    terminal_path = control.path(root + "/terminal.json")
+    script = (
+        "set -eu; test \"$(cat /control/active)\" = '" + attempt + "'; "
+        "test \"$(sha256sum '" + control.path(root + "/receipt.json") + "' | cut -d' ' -f1)\" = '" + args.expected_receipt_sha256 + "'; "
+        "test \"$(sha256sum '" + control.path(root + "/compose.json") + "' | cut -d' ' -f1)\" = '" + args.expected_compose_sha256 + "'; "
+        "if test -e '" + terminal_path + "'; then test \"$(sha256sum '" + terminal_path + "' | cut -d' ' -f1)\" = '" + hashlib.sha256(payload).hexdigest() + "'; exit 0; fi; umask 027; "
+        "t=$(mktemp '" + control.path(root) + "/.reconcile.XXXXXXXX'); "
+        "trap 'rm -f -- \"$t\"' EXIT; cat > \"$t\"; sync \"$t\"; "
+        "mv -T -- \"$t\" '" + terminal_path + "'; sync '" + control.path(root) + "'"
+    )
+    from docker_build_control import bounded_capture
+    result = bounded_capture(control.helper_args(script), data=payload, timeout=90)
+    if result.returncode:
+        raise ControlOutcomeUnknown("QA technical terminal publication was not confirmed")
+    _wait_for_helper_exit(helper_id)
+    if _control_bytes(control, "active", optional=True) is not None:
+        raise ControlOutcomeUnknown("QA lease remained after authenticated helper exit")
+    mirror_console(json.dumps({"state": "failed-confirmed", "attempt": attempt,
+        "output_lost": True, "lease_released": True, "verification": "NOT VERIFIED"}) + "\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, required=True)
@@ -891,6 +1102,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--pull-timeout", type=int, default=1800)
+    parser.add_argument(
+        "--prepare-viewport-fixture",
+        action="store_true",
+        help="Opt in to preparing a disposable viewport fixture in this QA session",
+    )
+    parser.add_argument("--reconcile-attempt")
+    parser.add_argument("--expected-receipt-sha256")
+    parser.add_argument("--expected-compose-sha256")
+    parser.add_argument("--expected-browser-id")
+    parser.add_argument("--expected-helper-id")
     parser.add_argument(
         "--browser-image",
         default=os.environ.get("FULLMAG_BROWSER_QA_IMAGE", DEFAULT_BROWSER_IMAGE),
@@ -913,6 +1134,9 @@ def main(argv: list[str] | None = None) -> int:
     helper_image = configured["services"]["fem-gpu-toolchain"]["build"]["args"]["FULLMAG_CUDA_BASE_IMAGE"]
     control = BuildControl(identity, helper_image)
     _validate_existing_control_volume(control)
+    if args.reconcile_attempt:
+        reconcile_browser_qa(control, selected, identity, args)
+        return 0
     current, backend_id, frontend_id, frontend_volume, frontend_inputs = _read_live_development(
         control, selected, identity, args.port
     )
@@ -925,7 +1149,15 @@ def main(argv: list[str] | None = None) -> int:
         raise BuildControlError(f"Live development group validation failed: {error}") from error
     public_url = f"http://127.0.0.1:{args.port}"
     browser_url = "http://frontend:8080"
-    document = _compose_document(selected, identity, args.browser_image, frontend_volume, args.port, args.timeout)
+    document = _compose_document(
+        selected,
+        identity,
+        args.browser_image,
+        frontend_volume,
+        args.port,
+        args.timeout,
+        prepare_viewport_fixture=args.prepare_viewport_fixture,
+    )
     source_commit = (current.get("source_commit") or (current.get("inputs") or {}).get("source_commit"))
     inputs = {
         "schema": OPERATION_SCHEMA,
@@ -935,6 +1167,10 @@ def main(argv: list[str] | None = None) -> int:
         "worktree_id": identity["worktree_id"],
         "development_attempt": current.get("attempt"),
         "development_config_sha256": current.get("config_sha256"),
+        "runtime_phase": current.get("runtime_phase", current.get("phase")),
+        "runtime_attempt": current.get("runtime_attempt", current.get("attempt")),
+        "runtime_terminal_sha256": current.get("runtime_terminal_sha256"),
+        "development_terminal_state": current.get("development_terminal_state", current.get("state")),
         "frontend_container": frontend_id,
         "frontend_volume": frontend_volume,
         "frontend_inputs_sha256": hashlib.sha256(canonical(frontend_inputs)).hexdigest(),
@@ -945,8 +1181,12 @@ def main(argv: list[str] | None = None) -> int:
         "playwright_version": PLAYWRIGHT_VERSION,
         "browser_runtime_timeout": args.timeout,
         "browser_image_pull_timeout": args.pull_timeout,
+        "prepare_viewport_fixture": args.prepare_viewport_fixture,
     }
     with control.operation("browser-qa", inputs) as operation:
+        live_fence = control.read("development/current.json")
+        if hashlib.sha256(canonical(live_fence)).hexdigest() != current["development_fence_sha256"]:
+            raise BuildControlError("Development attempt changed before browser QA admission")
         browser_image_id, _ = _ensure_browser_image(
             operation, control, document, args.browser_image, args.pull_timeout
         )
