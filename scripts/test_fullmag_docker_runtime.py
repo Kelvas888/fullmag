@@ -9,7 +9,7 @@ import sys
 import subprocess
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from contextlib import nullcontext
 
 import fullmag_docker_runtime as runtime
@@ -1135,6 +1135,129 @@ class DockerRuntimeContract(unittest.TestCase):
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
+
+    def test_wait_for_api_terminal_api_uses_canonical_error_without_retry(self):
+        service = self.load_service()
+        transport = service.RuntimeServiceTransportError(
+            "API loopback probe failed for /v2/platform/openapi.json: "
+            "[Errno 111] Connection refused"
+        )
+        poll = Mock(return_value=101)
+        with patch.object(
+            service, "_probe_api_identity", side_effect=transport
+        ) as probe, patch.object(service.time, "sleep") as sleep:
+            with self.assertRaises(service.RuntimeServiceUnknown) as caught:
+                service.wait_for_api(
+                    service.RuntimePaths(),
+                    8081,
+                    "a" * 64,
+                    timeout=300.0,
+                    api_process_poll=poll,
+                )
+        self.assertEqual(str(caught.exception), service.POST_BUILD_PROCESS_ERROR)
+        probe.assert_called_once()
+        poll.assert_called_once_with()
+        sleep.assert_not_called()
+
+    def test_wait_for_api_running_api_retries_and_succeeds(self):
+        service = self.load_service()
+        transport = service.RuntimeServiceTransportError(
+            "temporary API loopback probe failure"
+        )
+        identity = {
+            "api_instance_id": "instance",
+            "api_contract_version": "1.0.0",
+            "build_identity": {"git_commit": "commit"},
+            "runtime_store_binding": {"binding": "a" * 64},
+        }
+        profile = {"schema_version": "runtime_profile.v1"}
+        poll = Mock(return_value=None)
+        with patch.object(
+            service,
+            "_probe_api_identity",
+            side_effect=[transport, (identity, profile)],
+        ) as probe, patch.object(service.time, "sleep") as sleep:
+            observed = service.wait_for_api(
+                service.RuntimePaths(),
+                8081,
+                "a" * 64,
+                timeout=1.0,
+                api_process_poll=poll,
+            )
+        self.assertEqual(observed, {**identity, "profiles": profile})
+        self.assertEqual(probe.call_count, 2)
+        poll.assert_called_once_with()
+        sleep.assert_called_once()
+
+    def test_wait_for_api_process_observer_failure_fails_closed(self):
+        service = self.load_service()
+        transport = service.RuntimeServiceTransportError(
+            "temporary API loopback probe failure"
+        )
+        poll = Mock(side_effect=RuntimeError("process poll failed"))
+        with patch.object(
+            service, "_probe_api_identity", side_effect=transport
+        ) as probe, patch.object(service.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "process poll failed"):
+                service.wait_for_api(
+                    service.RuntimePaths(),
+                    8081,
+                    "a" * 64,
+                    timeout=300.0,
+                    api_process_poll=poll,
+                )
+        probe.assert_called_once()
+        poll.assert_called_once_with()
+        sleep.assert_not_called()
+
+    def test_start_forwards_process_observer_only_to_initial_api_wait(self):
+        service = self.load_service()
+        identity = {
+            "api_instance_id": "instance",
+            "api_contract_version": "1.0.0",
+            "build_identity": {"git_commit": "commit"},
+            "runtime_store_binding": {"binding": "a" * 64},
+        }
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "protocol": "stdin-v1",
+            "state": "ready",
+            "owner_token": "known",
+            "process_start_token": "process-token",
+            "pid": 3,
+            "host": "fullmag-test-host",
+            "target_id": service.TARGET_ID,
+            "control_address": "127.0.0.1:43123",
+            "build_commit": "a" * 40,
+            "build_snapshot": "b" * 64,
+            "compute_pool_id": service.COMPUTE_POOL_ID,
+            "preparation_pool_id": service.PREPARATION_POOL_ID,
+            "compute_pool_generation": 7,
+            "preparation_pool_generation": 8,
+            "children": [
+                {"role": "compute", "pid": 4, "status": "running"},
+                {"role": "preparation", "pid": 5, "status": "running"},
+            ],
+        }
+        poll = Mock(return_value=None)
+        with patch.object(service, "prepare_storage"), \
+                patch.object(service, "ensure_configuration", return_value={}), \
+                patch.object(service, "wait_for_api", return_value=identity) as wait, \
+                patch.object(service, "_run_cli", return_value={
+                    "schema_version": "runtime_service_discovery.v1",
+                    "status": "ready",
+                    "owner": owner,
+                }), \
+                patch.object(service, "_pin_owner"), \
+                patch.object(service, "_read_ready_owner", return_value=owner), \
+                patch.object(service, "_wait_for_api_liveness") as liveness:
+            service.start(
+                service.RuntimePaths(),
+                expected_binding="a" * 64,
+                api_process_poll=poll,
+            )
+        self.assertIs(wait.call_args.kwargs["api_process_poll"], poll)
+        self.assertNotIn("api_process_poll", liveness.call_args.kwargs)
 
     def test_accepted_reattach_immutable_publication_never_overwrites_competing_writer(self):
         from concurrent.futures import ThreadPoolExecutor

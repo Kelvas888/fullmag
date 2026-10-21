@@ -289,3 +289,22 @@ Trzy regresje obejmują Held, terminalny Consumed i odtworzenie zapisanej
 awarii preparation. Przegląd źródeł i diff-check wykonano; kompilację testów
 Rust pozostawiono istniejącemu CI zgodnie z wyjątkiem użytkownika.
 Start API i native runtime po tej poprawce pozostają NOT VERIFIED.
+
+
+## Początkowy nadzór zakończonego procesu API
+
+Po nieudanym probe `wait_for_api` sprawdza opcjonalny callback `api.poll`.
+Jeżeli proces API już się zakończył, przerywa oczekiwanie od razu zamiast
+czekać do końca budżetu 300 s. Proces nadal działający zachowuje retry.
+Przekazanie callbacku dotyczy wyłącznie początkowego oczekiwania; późniejszy
+liveness, owner, drain i recovery pozostają bez zmian. Błąd zachowuje
+rzeczywisty tekst ostatniego probe, więc znany connection-refused zachowuje
+kanoniczną postać, a inne przyczyny nadal wymagają osobnej kwalifikacji.
+
+Cały moduł interpretowanych regresji `test_fullmag_docker_runtime` przeszedł
+w ograniczonym helperze tej samej grupy Docker, z readonly source i stabilnymi
+wejściami. Receipt: `verification/interpreted-attempts/99251e33bac84b4cbb7192d4ed897ab0.json`,
+exit code 0. Nowe przypadki obejmują exit 101 bez sleep, retry żywego API,
+wyjątek obserwatora i przekazanie callbacku wyłącznie do początkowego wait.
+Niezależne review nie wykazało blokera. To kontrola Pythona, nie dowód
+zdrowego API ani kompilacja testów Rust/TypeScript.
