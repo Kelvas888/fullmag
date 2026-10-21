@@ -135,17 +135,27 @@ export function resolveDockerDevWatchPollingMs(
   return pollingMs;
 }
 
+// The frontend launcher selects `native` when the source bind is a local Linux
+// filesystem that delivers inotify events (for example a WSL ext4 checkout);
+// then nothing polls the tree.
 export function resolveDockerDevWatchOptions(
   existingIgnored: unknown,
   rawPollingMs?: string,
+  watchMode = "polling",
 ): {
-  poll: number;
+  poll?: number;
   ignored: DockerDevWatchIgnored;
 } {
-  return {
-    poll: resolveDockerDevWatchPollingMs(rawPollingMs),
-    ignored: composeDockerDevIgnored(existingIgnored),
-  };
+  const ignored = composeDockerDevIgnored(existingIgnored);
+  if (watchMode === "native") {
+    return { ignored };
+  }
+  if (watchMode !== "polling") {
+    throw new Error(
+      `FULLMAG_WATCHPACK_MODE must be "polling" or "native"; got ${watchMode}`,
+    );
+  }
+  return { poll: resolveDockerDevWatchPollingMs(rawPollingMs), ignored };
 }
 
 function pathEquals(left: string, right: string): boolean {
@@ -358,7 +368,11 @@ const nextConfig: NextConfig = {
     if (dev && process.env.FULLMAG_DOCKER_FRONTEND === "dev") {
       config.watchOptions = {
         ...config.watchOptions,
-        ...resolveDockerDevWatchOptions(config.watchOptions?.ignored),
+        ...resolveDockerDevWatchOptions(
+          config.watchOptions?.ignored,
+          undefined,
+          process.env.FULLMAG_WATCHPACK_MODE ?? "polling",
+        ),
       };
     }
     return config;
