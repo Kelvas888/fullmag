@@ -265,3 +265,27 @@ Przyczynę wzrostu subskrypcji nadal badamy; nie podniesiono limitów.
 Kontrola składni po dopasowaniu footprintu przeszła; receipt
 `verification/syntax-attempts/38233f759d3f4c4d9806e6fe43b5d4b5.json`,
 SHA audytu `fc312364daba11a193d9d1b6e5d8571960ecdaa016b913dbd62d4badde5afcc9`.
+
+
+## Odtworzenie bieżącego runu przed projekcją preparation
+
+API próby `ab140d52dd0a4be5b198429241a505bf` przeszło walidację
+locatorów i wczytanie proof, a następnie zakończyło się kodem 101:
+`accepted preparation requires the current durable live run`.
+Odczyt receipt potwierdził `failed_outcome_retained`, brak procesu native
+i SHA `a33a58aad9281450616e6c243d91914f115fdda21afedf628c1829b2588a98f1`.
+Kontrolowane `docker_volume_stop_failed.py` zatrzymało dokładnie backend
+`68a4849d…` ze stanem `stopped-confirmed`; model i historia pozostają.
+
+Przyczyna leży w konstrukcji mirroru: `default_current_live_state` tworzy
+pusty workspace i celowo nie zachowuje opcjonalnych `run` ani `metadata`.
+Prywatny adapter reattach przekazywał je w request, ale nie przenosił do
+wyniku. Teraz zachowuje obie wartości z wcześniej zweryfikowanego RunIntent
+i proof przed istniejącą walidacją frontier. Nie zmieniono wspólnego
+inicjalizatora, kontroli tożsamości ani kolejności publikacji authority.
+Operacja nie tworzy tasku, ownera, lease ani Solve.
+
+Trzy regresje obejmują Held, terminalny Consumed i odtworzenie zapisanej
+awarii preparation. Przegląd źródeł i diff-check wykonano; kompilację testów
+Rust pozostawiono istniejącemu CI zgodnie z wyjątkiem użytkownika.
+Start API i native runtime po tej poprawce pozostają NOT VERIFIED.
