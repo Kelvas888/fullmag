@@ -3180,6 +3180,47 @@ class BackendPackageTests(unittest.TestCase):
                     "mutation probe",
                 )
 
+    def test_ready_candidate_payload_requires_complete_evidence_and_is_preserved(self):
+        for mutation in (None, "payload", "marker", "log", "missing_receipt", "unknown"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                package, build_root, control, candidate, previous, _ = self._ready_rotation_fixture(
+                    Path(directory), ".backend-package-candidate-retained"
+                )
+                log_path = backend._begin_failed_make_attempt(build_root, candidate, "install-cli-dev")
+                log_path.write_bytes((candidate / backend.FAILED_MAKE_LOG_NAME).read_bytes())
+                backend._finish_failed_make_attempt(build_root, candidate, 0)
+                attempt_receipt = (build_root / backend.FAILED_MAKE_DIAGNOSTICS_DIRNAME
+                    / candidate.name / backend.FAILED_MAKE_RECEIPT_NAME)
+                if mutation == "payload":
+                    (candidate / "bin/fullmag-bin").write_bytes(b"tampered\n")
+                elif mutation == "marker":
+                    marker_path = candidate / backend.PACKAGE_CANDIDATE_MARKER
+                    marker, _ = backend._read_json(marker_path, "candidate marker")
+                    marker["artifact_inventory_sha256"] = "0" * 64
+                    backend._write_json(marker_path, marker, "candidate marker")
+                elif mutation == "log":
+                    (candidate / backend.FAILED_MAKE_LOG_NAME).write_bytes(b"tampered\n")
+                elif mutation == "missing_receipt":
+                    attempt_receipt.unlink()
+                elif mutation == "unknown":
+                    (candidate / "unknown.bin").write_bytes(b"preserve\n")
+                before = {path.relative_to(control): path.read_bytes()
+                    for path in control.rglob("*") if path.is_file()}
+                log_before = log_path.read_bytes()
+                if mutation is None:
+                    backend._reject_partial_package_candidates(
+                        package, control, build_root, current_package=previous,
+                    )
+                else:
+                    with self.assertRaises(backend.BackendBuildError):
+                        backend._reject_partial_package_candidates(
+                            package, control, build_root, current_package=previous,
+                        )
+                self.assertEqual(before, {path.relative_to(control): path.read_bytes()
+                    for path in control.rglob("*") if path.is_file()})
+                self.assertEqual(log_path.read_bytes(), log_before)
+                self.assertTrue(candidate.is_dir())
+
     def test_partial_or_foreign_candidate_is_preserved_and_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
