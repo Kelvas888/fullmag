@@ -74,6 +74,7 @@ const MAX_HEAP_GROWTH_BYTES = 25 * 1024 * 1024;
 const QUANTITY_SWITCH_TIMEOUT_MS = 20_000;
 const CAPTURE_SETTLE_TIMEOUT_MS = 5_000;
 const UNMOUNT_SETTLE_TIMEOUT_MS = 10_000;
+const UNMOUNT_RESOURCE_STABLE_SAMPLES = 3;
 // Warm every pass combination exercised by QUANTITY_SEQUENCE once per field
 // quantity. The stress loop has three independent binary layer predicates, so
 // these indices are one representative for each of its 2^3 combinations.
@@ -484,6 +485,7 @@ try {
   const finalUnmount = await waitForViewportUnmountSettled(
     page,
     "final viewport unmount",
+    unmountedBaselineRuntime,
   );
   const afterUnmount = finalUnmount.gpu;
   const afterUnmountRuntime = finalUnmount.runtime;
@@ -960,28 +962,104 @@ async function publishVisualizationStateAndWait(
   return { ackStart, revision };
 }
 
-async function waitForViewportUnmountSettled(page, label) {
+async function waitForViewportUnmountSettled(
+  page,
+  label,
+  expectedRuntime = null,
+) {
   let settled = null;
-  await waitForCondition(
-    async () => {
-      const gpu = await readBrowserAuditCounters(page);
-      const runtime = await readViewportAuditRuntime(page);
-      const workers = runtime.workers ?? {};
-      const liveBuffers = gpu.buffersCreated - gpu.buffersDeleted;
-      settled = { gpu, runtime };
-      return (
-        liveBuffers <= 4 &&
-        workers.disposed === true &&
-        Number(workers.activeLeases ?? -1) === 0 &&
-        Number(workers.jobs ?? -1) === 0 &&
-        Number(workers.timers ?? -1) === 0 &&
-        Number(workers.workers ?? -1) === 0
-      );
-    },
-    UNMOUNT_SETTLE_TIMEOUT_MS,
-    `${label} did not release WebGL buffers and worker runtime within the bounded settle window.`,
-  );
+  let previousResourceSignature = null;
+  let stableResourceSamples = 0;
+  let lastSample = null;
+  let lastReason = "no unmount settle sample was observed";
+  const expectedResourceSnapshot = expectedRuntime
+    ? normalizeResourceListenerSnapshot(expectedRuntime)
+    : null;
+  const expectedResourceSignature = expectedResourceSnapshot
+    ? JSON.stringify(expectedResourceSnapshot)
+    : null;
+
+  try {
+    await waitForCondition(
+      async () => {
+        const gpu = await readBrowserAuditCounters(page);
+        const runtime = await readViewportAuditRuntime(page);
+        const workers = runtime.workers ?? {};
+        const liveBuffers = gpu.buffersCreated - gpu.buffersDeleted;
+        const gpuWorkerIdle =
+          liveBuffers <= 4 &&
+          workers.disposed === true &&
+          Number(workers.activeLeases ?? -1) === 0 &&
+          Number(workers.jobs ?? -1) === 0 &&
+          Number(workers.timers ?? -1) === 0 &&
+          Number(workers.workers ?? -1) === 0;
+        const resourceSnapshot = normalizeResourceListenerSnapshot(runtime);
+        const resourceSignature = JSON.stringify(resourceSnapshot);
+        const resourceChanged =
+          previousResourceSignature !== null &&
+          resourceSignature !== previousResourceSignature;
+
+        if (!gpuWorkerIdle) {
+          stableResourceSamples = 0;
+          previousResourceSignature = null;
+          lastReason = "GPU/worker runtime is not idle";
+        } else if (resourceChanged) {
+          stableResourceSamples = 0;
+          previousResourceSignature = resourceSignature;
+          lastReason = "resource listener snapshot changed";
+        } else {
+          stableResourceSamples += 1;
+          previousResourceSignature = resourceSignature;
+          lastReason = `resource listener snapshot stable ${stableResourceSamples}/${UNMOUNT_RESOURCE_STABLE_SAMPLES}`;
+        }
+
+        const matchesExpected =
+          expectedResourceSignature === null ||
+          resourceSignature === expectedResourceSignature;
+        if (gpuWorkerIdle && !matchesExpected) {
+          lastReason = "resource listener snapshot has not returned to the expected baseline";
+        }
+
+        settled = { gpu, runtime };
+        lastSample = {
+          gpu,
+          runtime,
+          liveBuffers,
+          resourceSnapshot,
+          stableResourceSamples,
+        };
+        return (
+          gpuWorkerIdle &&
+          stableResourceSamples >= UNMOUNT_RESOURCE_STABLE_SAMPLES &&
+          matchesExpected
+        );
+      },
+      UNMOUNT_SETTLE_TIMEOUT_MS,
+      `${label} did not release WebGL buffers, worker runtime, and resource subscriptions within the bounded settle window.`,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${message} Last settle reason=${lastReason}; sample=${JSON.stringify({
+        expectedResourceSnapshot,
+        lastSample,
+      })}.`,
+      { cause: error },
+    );
+  }
   return settled;
+}
+
+function normalizeResourceListenerSnapshot(runtime) {
+  const countsByKey = Object.fromEntries(
+    Object.entries(runtime.listenerCounts ?? {}).sort(([left], [right]) =>
+      left.localeCompare(right),
+    ),
+  );
+  return {
+    total: Number(runtime.resources?.listenerCount ?? -1),
+    countsByKey,
+  };
 }
 
 function makeGpuCheckpoint(label, gpu) {

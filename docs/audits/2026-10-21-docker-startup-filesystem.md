@@ -308,3 +308,22 @@ exit code 0. Nowe przypadki obejmują exit 101 bez sleep, retry żywego API,
 wyjątek obserwatora i przekazanie callbacku wyłącznie do początkowego wait.
 Niezależne review nie wykazało blokera. To kontrola Pythona, nie dowód
 zdrowego API ani kompilacja testów Rust/TypeScript.
+
+
+## Zbieżność subskrypcji po odmontowaniu viewportu
+
+Końcowa bramka audytu nadal wymaga identycznych aktywnych subskrypcji jak
+po pierwszym odmontowaniu. Teraz bounded wait obejmuje także ich stabilizację: trzy
+kolejne identyczne próbki po zwolnieniu GPU/workerów, a przy ostatnim unmount
+dodatkowo powrót do dokładnego baseline. Limit 10 s, limit czterech buforów,
+120 publikacji i końcowy assert subskrypcji pozostają bez zmian. Produkcyjny
+ResourceRuntimeStore liczy aktywne listenery; zero jest brakiem klucza.
+
+Niezależne review potwierdziło zakres. Nie dowiedziono jeszcze, czy wynik
+379 → 400 z wcześniejszego CI był opóźnionym unsubscribe czy trwałym wzrostem;
+nowa bramka ma to rozróżnić, zachowując błąd i ostatnią próbkę po timeout.
+Referencja po pierwszym unmount nie dowodzi zera pozostałości przed pierwszym
+mountem. Kontrola Node --check przeszła w helperze grupy, stable source SHA
+`ad4e371bbe92708f5ab1b5f6290674e58014d1114e5bfa0e3c7edc67a5e37d19`,
+receipt `verification/syntax-attempts/418d2e6aab294815bd75a6f1aa9507e1.json`.
+Pełny browser gate pozostaje NOT VERIFIED; lokalnie nie kompilowano testów JS.
