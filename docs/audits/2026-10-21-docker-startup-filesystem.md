@@ -234,3 +234,34 @@ Nie jest to dowód wykonania testów ani WebGL.
 Kontrola składni audytu po zmianie przeszła w helperze grupy; receipt
 `verification/syntax-attempts/e15b169fae07492693f8e05ae002a53c.json`,
 SHA źródła `f992cf146efa6f8d63dc30b08b34a55885517ebff03bde9e2d5e2a5c7734404a`.
+
+
+## Powtarzalna iteracja i porównywalny pomiar GPU
+
+Następna próba `ab140d52dd0a4be5b198429241a505bf` użyła z cache tych samych
+obrazów toolchain, development-base i backend wrapper. Capture trwał 171,327 s,
+a synchronizacja 9185 plików na zachowanym wolumenie 3,358 s. Make zakończył
+się kodem 0 po 133,899 s; drugie Cargo dla modułu Python trwało 13,50 s.
+Pakiet 24 plików opublikowano w 1,974 s i zweryfikowano w 1,550 s.
+To dowód przyrostowej iteracji z zachowanym cache, nie gwarancja czasu dla
+dowolnej zmiany ani pominięcia wszystkich zależnych konsumentów. Pełny odbiór
+API/native i restart bez zmian pozostają oddzielnymi bramkami.
+
+Na HEAD `e7e2bf00…` CI zakończyło Control Room typecheck/lint/tests/build i
+Python contracts sukcesem. Regresja `development_accepted_restore::tests`
+również przeszła. Browser fixture `118978631813` doszedł do końcowej kontroli
+subskrypcji: baseline 379, po unmount 400. Artefakt `12313401509` ma SHA
+`a937ed79311f4b65e693ff58e3df55cccd6b1e0c4bb90ceaebd417d1597a9f87`.
+
+GPU checkpointy wynosiły cold 332, pierwszy unmount 2, steady 334, po stresie
+264 i końcowy unmount 4. Samo zaliczenie progu nie dowodzi braku wycieku:
+baseline miał `H_ex` i widoczne punkty, a końcowy stan `m/component-x` bez
+punktów. Większy początkowy footprint mógłby zamaskować wzrost. Audyt po pełnym
+warmupie ustawia teraz baseline na ten sam stan co końcowy shader pass,
+oczekuje ACK/adopcji i zapisuje oba footprinty; odrzuca ich niezgodność przed
+porównaniem `baseline + 16`. Stress 120 i niezależny unmount `<=4` pozostają.
+Przyczynę wzrostu subskrypcji nadal badamy; nie podniesiono limitów.
+
+Kontrola składni po dopasowaniu footprintu przeszła; receipt
+`verification/syntax-attempts/38233f759d3f4c4d9806e6fe43b5d4b5.json`,
+SHA audytu `fc312364daba11a193d9d1b6e5d8571960ecdaa016b913dbd62d4badde5afcc9`.

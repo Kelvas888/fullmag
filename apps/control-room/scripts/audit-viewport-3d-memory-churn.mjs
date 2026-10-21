@@ -277,6 +277,20 @@ try {
     fixtureRequests,
     viewport,
   );
+  // The full warmup ends at H_ex/stress-style-3. Normalize the lifecycle
+  // checkpoint to the same m/component-x/layer footprint reached by the final
+  // shader pass before taking the live-buffer baseline.
+  const lifecycleBaselineStyle =
+    WARMUP_SHADER_STYLES[WARMUP_SHADER_STYLES.length - 1];
+  advanceVisualizationState(fixture, "m", lifecycleBaselineStyle);
+  const lifecycleBaselineGpuBefore = await readBrowserAuditCounters(page);
+  await publishVisualizationStateAndWait(
+    page,
+    fixture,
+    viewport,
+    "m",
+    lifecycleBaselineGpuBefore,
+  );
   auditLog("reading steady-state baseline diagnostics");
   // Keep coldBaseline and firstUnmount as independent remount evidence. The
   // lifecycle threshold below uses only this post-remount steady baseline.
@@ -286,6 +300,9 @@ try {
     runtime: await readViewportAuditRuntime(page),
     heapBytes: await readJsHeapBytes(cdp),
   };
+  const baselineLifecycleState = lifecycleVisualizationState(
+    fixture.visualizationState,
+  );
   gpuCheckpoints.push(makeGpuCheckpoint("steady-baseline", baseline.gpu));
   rawPerformanceTrace.push(
     await captureViewportPerformanceSnapshot(page, "steady-baseline"),
@@ -429,6 +446,17 @@ try {
     "m",
     shaderRun.lastRevision,
   );
+  const afterStressLifecycleState = lifecycleVisualizationState(
+    fixture.visualizationState,
+  );
+  if (
+    JSON.stringify(afterStressLifecycleState) !==
+    JSON.stringify(baselineLifecycleState)
+  ) {
+    throw new Error(
+      `GPU lifecycle checkpoints used different visualization footprints: baseline=${JSON.stringify(baselineLifecycleState)}, afterStress=${JSON.stringify(afterStressLifecycleState)}.`,
+    );
+  }
   await page.screenshot({ path: path.join(auditArtifactsDirectory, "settled-3d.png") });
   if (injectGpuBufferLeak) {
     await injectViewportGpuBufferLeak(page);
@@ -486,7 +514,9 @@ try {
     after,
     afterUnmount,
     afterUnmountRuntime,
+    afterStressLifecycleState,
     baseline,
+    baselineLifecycleState,
     coldBaseline,
     coldWarmup,
     firstUnmount,
@@ -2571,4 +2601,23 @@ function currentFixtureQuantity(fixture) {
     fixture.visualizationState?.active_quantity_id ??
     "m"
   );
+}
+
+function lifecycleVisualizationState(state) {
+  return {
+    active_quantity_id: state?.active_quantity_id ?? null,
+    field_component: state?.field_component ?? null,
+    layers: {
+      points: state?.layers?.points?.visible ?? null,
+      vectors: state?.layers?.vectors?.visible ?? null,
+      wireframe: state?.layers?.wireframe?.visible ?? null,
+    },
+    quantity: {
+      active_quantity_id: state?.quantity?.active_quantity_id ?? null,
+      field_component: state?.quantity?.field_component ?? null,
+    },
+    vector_style: {
+      color_mode: state?.vector_style?.color_mode ?? null,
+    },
+  };
 }
