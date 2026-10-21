@@ -327,3 +327,48 @@ mountem. Kontrola Node --check przeszła w helperze grupy, stable source SHA
 `ad4e371bbe92708f5ab1b5f6290674e58014d1114e5bfa0e3c7edc67a5e37d19`,
 receipt `verification/syntax-attempts/418d2e6aab294815bd75a6f1aa9507e1.json`.
 Pełny browser gate pozostaje NOT VERIFIED; lokalnie nie kompilowano testów JS.
+
+
+## Działający backend i porównywalny moduł 2D
+
+Kontrolowane odtworzenie `6f973d8effb14fd7920459b64c6169c6` i development
+`eb982e6ce4c2404fbca89de0cc3d5b29` zakończyły się sukcesem. Config SHA:
+`5d55ac959260403281a78ba43ba302950aae9e5e2aa530de03899a771b6471ab`.
+Backend `177b9c65…` i frontend `3144d222…` są healthy, port frontendu 32871,
+obraz wrappera `sha256:af482bc37e762c45fb189a21d183ad17e62a2d649da8bd6591d275f87ba5ab82`.
+Obraz zmieniono dla poprawki Pythona; toolchain i oba wolumeny cache/package
+`fullmag-backend-v2-edd94a86dd242c865f0e0210-*` zachowano. Capture trwał
+172,041 s, sync 3,492 s, Make 117,283 s, publikacja 24 plików 2,775 s, verify 1,597 s.
+
+API czystego HEAD `2d32e83b8d55dea774925167fb0ffa85a12414aa` i snapshotu
+`d05f908d59f8e2e5201e5ef445ffc0bfdbe39465c314bf2698ed287e6ed32e1b`
+odtworzyło run bez Solve: frontier projection 5,085 s, cały restore z ACK 9,947 s.
+Od 01:46:00 UTC nadzorca zgłasza Ready API/native. Status HTTP200 pokazuje
+`fdm_cpu_relax_smoke`, connected/awaiting_command; domain/meta HTTP200 ma siatkę
+16×32×2. Receipt: `verification/api-readiness-observation-fe9142ad76b74dd6a3cc3fcbb1b9eacd.json`.
+Compute nodes HTTP200 zgłasza aktualną próbkę i RTX4080SUPER; receipt
+`verification/compute-readiness-observation-b454da5560cb4350a92ed822d4121cda.json`.
+To nie dowód wykonania symulacji ani kwalifikacji wszystkich realizacji GPU.
+
+Frontend po kompilacji odpowiada HTTP200 na /workspace (0,594 s). Zarządzana
+próba browser QA `c8edbbc85567407ba88348531b53d52a` przekroczyła obserwację
+klienta 180 s; dokładny helper `8e010bd7…` zakończył się później kodem 0 po
+282,637 s, lecz wynik stdout jest utracony. Nie kwalifikujemy browser proof
+z samego exit code; zasoby i fence zachowano do kontrolowanej rekoncyliacji.
+
+CI `39528186129` zaliczyło Rust restore oraz Control Room typecheck/lint/test/build.
+Browser fixture zachowało stabilne +21 listenerów przez 189 próbek; analiza dwóch
+niezależnych ścieżek wykazała dokładny fingerprint jednej generacji FieldMapModule.
+Pierwszy baseline mógł powstać podczas lazy Suspense przed montażem 2D. Audyt
+czeka teraz na dokładnie jeden istniejący moduł field-map w oczekiwanym układzie,
+bez companion/loading; zapisuje oba układy i diagnostykę błędu, po czym stosuje
+dotychczasową konwergencję i limity. Dowodzi montażu właścicieli, nie renderingu
+danych 2D. Node --check zaliczone, receipt
+`verification/syntax-attempts/db10e02d1f3b413fa4601dc0b45f7982.json`, stable SHA
+`41ded1c3a5d59362c367dc068b18956be52201b452fa76cd93e6761a870fcf3e`.
+Nowy browser gate, HMR/restart bez zmian, wykonanie wskazanych skryptów i merge
+pozostają NOT VERIFIED.
+
+Review uzupełniono o rzeczywisty zapis obu układów w failure artifact oraz
+diagnostykę status/alert także na root FieldMapStatus. Status danych pozostaje
+poza porównaniem tożsamości montażu; pełna gotowość planaru nie jest tu deklarowana.

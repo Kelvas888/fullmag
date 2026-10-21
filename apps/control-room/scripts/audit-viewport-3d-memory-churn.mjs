@@ -75,6 +75,7 @@ const QUANTITY_SWITCH_TIMEOUT_MS = 20_000;
 const CAPTURE_SETTLE_TIMEOUT_MS = 5_000;
 const UNMOUNT_SETTLE_TIMEOUT_MS = 10_000;
 const UNMOUNT_RESOURCE_STABLE_SAMPLES = 3;
+const VIEWPORT_2D_MOUNT_TIMEOUT_MS = 10_000;
 // Warm every pass combination exercised by QUANTITY_SEQUENCE once per field
 // quantity. The stress loop has three independent binary layer predicates, so
 // these indices are one representative for each of its 2^3 combinations.
@@ -169,6 +170,8 @@ const gpuCheckpoints = [];
 let coldBaseline = null;
 let coldWarmup = null;
 let firstUnmount = null;
+let first2DLayout = null;
+let final2DLayout = null;
 let steadyWarmup = null;
 
 await installFdmFixtureApi(page, fixture, fixtureRequests);
@@ -253,6 +256,11 @@ try {
 
   await page.locator('[data-action-id="ws-2d"]').click();
   await page.locator(".fm-viewport-3d canvas").waitFor({ state: "detached", timeout: 10_000 });
+  first2DLayout = await waitForComparable2DViewport(
+    page,
+    "cold 2D viewport mount",
+    { expectedCompanionModuleId: null },
+  );
   firstUnmount = await waitForViewportUnmountSettled(
     page,
     "cold viewport unmount",
@@ -482,6 +490,12 @@ try {
   }
   await page.locator('[data-action-id="ws-2d"]').click();
   await page.locator(".fm-viewport-3d canvas").waitFor({ state: "detached", timeout: 10_000 });
+  final2DLayout = await waitForComparable2DViewport(
+    page,
+    "final 2D viewport mount",
+    { expectedCompanionModuleId: null },
+  );
+  assertComparable2DViewportLayout(first2DLayout, final2DLayout);
   const finalUnmount = await waitForViewportUnmountSettled(
     page,
     "final viewport unmount",
@@ -522,6 +536,8 @@ try {
     coldBaseline,
     coldWarmup,
     firstUnmount,
+    first2DLayout,
+    final2DLayout,
     gpuCheckpoints,
     unmountedBaselineRuntime,
     steadyWarmup,
@@ -562,6 +578,8 @@ try {
     coldBaseline,
     coldWarmup,
     steadyWarmup,
+    first2DLayout,
+    final2DLayout,
   });
   throw error;
 } finally {
@@ -1757,6 +1775,8 @@ async function reportAuditFailure(
   {
     coldBaseline,
     coldWarmup,
+    first2DLayout,
+    final2DLayout,
     errors,
     fieldRequests,
     fixtureRequests,
@@ -1828,6 +1848,8 @@ async function reportAuditFailure(
         topologyRequests: topologyRequests.slice(-10),
         coldBaseline,
         coldWarmup,
+        first2DLayout,
+        final2DLayout,
         gpuCheckpoints,
         steadyWarmup,
         visualizationAckIdentity: fixture.visualizationIdentity,
@@ -1872,6 +1894,76 @@ async function waitForCanvasReady(canvas) {
       tick();
     }),
   );
+}
+
+async function waitForComparable2DViewport(
+  page,
+  label,
+  { expectedCompanionModuleId = null } = {},
+) {
+  const selector = 'section.fm-viewport-tabs[data-slot-id="viewport-main"]';
+  let lastObservedState = null;
+  try {
+    await waitForCondition(
+      async () => {
+        lastObservedState = await page.evaluate((hostSelector) => {
+          const hosts = document.querySelectorAll(hostSelector);
+          const host = hosts[0];
+          if (!host) return { hostCount: 0 };
+          return {
+            hostCount: hosts.length,
+            activeModuleId: host.getAttribute("data-active-module-id"),
+            companionModuleId: host.getAttribute("data-companion-module-id"),
+            fieldMapCount: host.querySelectorAll(".fm-field-map").length,
+            suspenseFallbackCount: host.querySelectorAll(".fm-slot__loading").length,
+            errorText: [...host.querySelectorAll(".fm-slot__error")]
+              .map((node) => node.textContent ?? "").join(" ").slice(0, 1000),
+            statusText: host.querySelector('.fm-field-map[role="status"], .fm-field-map[role="alert"], .fm-field-map [role="status"], .fm-field-map [role="alert"]')
+              ?.textContent?.slice(0, 500) ?? null,
+          };
+        }, selector);
+        return (
+          lastObservedState.hostCount === 1 &&
+          lastObservedState.activeModuleId === "field-map" &&
+          lastObservedState.companionModuleId === expectedCompanionModuleId &&
+          lastObservedState.fieldMapCount === 1 &&
+          lastObservedState.suspenseFallbackCount === 0 &&
+          lastObservedState.errorText === ""
+        );
+      },
+      VIEWPORT_2D_MOUNT_TIMEOUT_MS,
+      `${label} did not reach the expected mounted field-map layout.`,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${message} Last 2D layout=${JSON.stringify(lastObservedState)}.`,
+      { cause: error },
+    );
+  }
+  return lastObservedState;
+}
+
+function assertComparable2DViewportLayout(first, final) {
+  const comparableKeys = [
+    "hostCount",
+    "activeModuleId",
+    "companionModuleId",
+    "fieldMapCount",
+    "suspenseFallbackCount",
+  ];
+  const changed = Object.fromEntries(
+    comparableKeys
+      .map((key) => [key, { first: first[key], final: final[key] }])
+      .filter(([, values]) => values.first !== values.final),
+  );
+  if (Object.keys(changed).length > 0) {
+    throw new Error(
+      "2D viewport layout changed between unmount baselines: " +
+        JSON.stringify(changed) +
+        ".",
+    );
+  }
 }
 
 async function waitForDiagnostics(viewport) {
