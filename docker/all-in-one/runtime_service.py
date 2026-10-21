@@ -1949,10 +1949,37 @@ def _positive(environment: Mapping[str, str], name: str, default: int) -> int:
     return parsed
 
 
+def _docker_host_budget_limits(environment: Mapping[str, str]) -> tuple[int, int, bool]:
+    cpu_value = environment.get("FULLMAG_DOCKER_CPU_MILLIS")
+    memory_value = environment.get("FULLMAG_DOCKER_MEMORY_BYTES")
+    if (cpu_value is None) != (memory_value is None):
+        _fail("FULLMAG_DOCKER_CPU_MILLIS and FULLMAG_DOCKER_MEMORY_BYTES must be set together")
+    if cpu_value is None:
+        return 4000, 7 * GIB, False
+
+    parsed = []
+    for name, value in (
+        ("FULLMAG_DOCKER_CPU_MILLIS", cpu_value),
+        ("FULLMAG_DOCKER_MEMORY_BYTES", memory_value),
+    ):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+            _fail(f"{name} must be a positive integer")
+        number = int(value, 10)
+        if not 0 < number <= 2**64 - 1:
+            _fail(f"{name} must be a positive integer")
+        parsed.append(number)
+    cpu_millis, full_memory_bytes = parsed
+    if cpu_millis < 2000 or cpu_millis % 1000:
+        _fail("FULLMAG_DOCKER_CPU_MILLIS requires at least two whole CPUs for separate compute and preparation placements")
+    if full_memory_bytes <= GIB:
+        _fail("FULLMAG_DOCKER_MEMORY_BYTES must exceed 1 GiB of API headroom")
+    return cpu_millis, full_memory_bytes - GIB, True
+
+
 def build_configuration(
     paths: RuntimePaths | None = None, environment: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
-    """Return the explicit v1 CPU profile admitted by the current API."""
+    """Return the separate v1 CPU profile with its legacy fixed limits."""
 
     environment = os.environ if environment is None else environment
     paths = paths or canonical_paths(environment)
@@ -2003,9 +2030,10 @@ def build_configuration(
 def _validate_host_profile(
     value: Mapping[str, Any], paths: RuntimePaths, device_access: str = "gpu"
 ) -> dict[str, Any]:
-    """Check the fixed Docker boundary around the canonical Rust host factory."""
+    """Check the Docker budget boundary around the canonical Rust host factory."""
     if device_access not in DEVICE_ACCESS_CHOICES:
         _fail("FULLMAG_DOCKER_DEVICE_ACCESS must be cpu or gpu")
+    cpu_limit_millis, memory_limit_bytes, approved_budget = _docker_host_budget_limits(os.environ)
     expected_profile_schema = (
         HOST_PROFILE_SCHEMA if device_access == "gpu" else CPU_HOST_PROFILE_SCHEMA
     )
@@ -2155,10 +2183,12 @@ def _validate_host_profile(
     else:
         cpu_total = sum(cpu_budgets)
         memory_total = sum(memory_budgets)
-    if cpu_total > 4000:
-        _fail("Docker host offers exceed the backend CPU quota")
-    if memory_total > 7 * GIB:
-        _fail("Docker host offers exceed memory minus API headroom")
+    if cpu_total > cpu_limit_millis:
+        _fail("Docker host offers exceed the approved backend CPU budget")
+    if memory_total > memory_limit_bytes:
+        _fail("Docker host offers exceed approved memory minus API headroom")
+    if approved_budget and (cpu_total != cpu_limit_millis or memory_total != memory_limit_bytes):
+        _fail("Docker host offers do not match the complete approved backend budget")
     return config
 
 

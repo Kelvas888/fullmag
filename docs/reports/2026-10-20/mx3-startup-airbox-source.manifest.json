@@ -1,6 +1,6 @@
 {
-  "observed_at": "2026-10-21T00:00:46.375525+00:00",
-  "verification": "Local49 source hashes confirmed. Built commit6c5a9792f: Make exit0/218431ms; package24files/gates PASS; actual Cargo16,128GiB/16CPU. Development8bad failed-confirmed after accepted-store bootstrap180s timeout before API. Backend stopped non-OOM; frontend3198 healthy. Managed metadata-only diagnostics: --version20s timeout before main; own cuda-gdb stack nvJitLink/cublas; later same binary --version exit0/4500ms. CUDA12.6 libcublasLt and nvJitLink MD5 match package metadata. Persistent CUDA failure/bootstrap root cause NOT VERIFIED. No bootstrap retry, replay, preparation retry, Solve or tests. Mesh/UI NOT VERIFIED. Freeze RELEASED. Logger allowlist fix at8729 is not in imagef948.",
+  "observed_at": "2026-10-21T00:43:07.459649+00:00",
+  "verification": "Source hashes refreshed after H0 budget patch; two-file Python AST and source review PASS; no tests/build of H0. Actual prior build73e: Make exit0/121700ms, package24files/6161ms, verify1564ms. Resumea001 accepted-store bootstrap PASS, later failed preAPI host-policy initialization. Quota4000->16000 alone exactly reproduces rejected inventory hash. Runtime128GiB/16CPU, backend stopped non-OOM, frontend3198 healthy. No ledger migration/reset, retry04, activation or Solve. API/mesh/UI NOT VERIFIED. H0 source only; global host versus consumer policy remains open.",
   "files": [
     {
       "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
@@ -136,7 +136,7 @@
     },
     {
       "path": "docker/all-in-one/runtime_service.py",
-      "sha256": "9600359de19c522498ba64b1c6767db962a5c66e7995798f92a96fe78951fa35"
+      "sha256": "d5a4dd44e37f2f0b10b1ca2453d3b8f1cc8a5582d71fcaee84a1353b86cce67f"
     },
     {
       "path": "docs/adr/0061-docker-development-build-and-runtime-container.md",
@@ -188,7 +188,7 @@
     },
     {
       "path": "scripts/docker_volume_resources.py",
-      "sha256": "eed5839d6bda393b93bb60e5a884d34dc54d6aba2705f4be72677a548c3a9249"
+      "sha256": "b8be6b2efc2311dbaf2a79152fa53e1b2579895d85e5e2eeff061a9e6dc7a1b9"
     },
     {
       "path": "crates/fullmag-fdm-sys/build.rs",
@@ -197,6 +197,10 @@
     {
       "path": "crates/fullmag-fem-sys/build.rs",
       "sha256": "de5c575c3274b8f7c09817968d09e22ab26580825fea5f3282b7122d36975818"
+    },
+    {
+      "path": "crates/fullmag-api/src/runtime_service_main.rs",
+      "sha256": "ceb1a24fd05a974ec73c06976e44ec546173060cf0ff6bb688ac993419bf9e37"
     }
   ],
   "diagnostic_operations": {

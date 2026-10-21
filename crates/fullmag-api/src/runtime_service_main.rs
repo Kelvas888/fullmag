@@ -995,6 +995,42 @@ fn required_observation<'a, T>(value: &'a fullmag_session::compute_node_snapshot
     }
 }
 
+fn docker_host_budget_override() -> Result<Option<(u64, u64)>> {
+    let (cpu_millis, memory_bytes) = match (
+        std::env::var_os("FULLMAG_DOCKER_CPU_MILLIS"),
+        std::env::var_os("FULLMAG_DOCKER_MEMORY_BYTES"),
+    ) {
+        (None, None) => return Ok(None),
+        (Some(cpu_millis), Some(memory_bytes)) => (cpu_millis, memory_bytes),
+        _ => bail!(
+            "FULLMAG_DOCKER_CPU_MILLIS and FULLMAG_DOCKER_MEMORY_BYTES must be set together"
+        ),
+    };
+    let parse_positive = |name: &str, value: OsString| -> Result<u64> {
+        let value = value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?;
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("{name} must be a positive integer");
+        }
+        let parsed = value
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be a positive integer"))?;
+        if parsed == 0 {
+            bail!("{name} must be a positive integer");
+        }
+        Ok(parsed)
+    };
+    let cpu_millis = parse_positive("FULLMAG_DOCKER_CPU_MILLIS", cpu_millis)?;
+    if cpu_millis < 2000 || cpu_millis % 1000 != 0 {
+        bail!("FULLMAG_DOCKER_CPU_MILLIS requires at least two whole CPUs for separate compute and preparation placements");
+    }
+    Ok(Some((
+        cpu_millis,
+        parse_positive("FULLMAG_DOCKER_MEMORY_BYTES", memory_bytes)?,
+    )))
+}
+
 fn docker_host_cpu_placements(
     allowed_cpu_ids: &BTreeSet<u32>,
     total_cpu_millis: u64,
@@ -1091,19 +1127,44 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         "OS-allowed CPU IDs",
     )?
     .clone();
-    let cpu_millis = *required_observation(
+    let measured_cpu_millis = *required_observation(
         &provisional.cpu.effective_capacity_millis,
         "effective CPU capacity",
     )?;
-    let memory_bytes = *required_observation(
+    let measured_memory_bytes = *required_observation(
         &provisional.memory.total_bytes,
         "total host memory",
     )?;
-    if cpu_millis == 0 || memory_bytes == 0 {
+    if measured_cpu_millis == 0 || measured_memory_bytes == 0 {
         bail!("Docker host profile requires positive CPU and memory capacity");
     }
-    let cpu_millis = cpu_millis.min(4000);
-    let cpu_millis = if allowed_cpu_ids.is_empty() {
+    const API_MEMORY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
+    let budget_override = docker_host_budget_override()?;
+    let approved_budget = budget_override.is_some();
+    let (cpu_millis, memory_bytes) = if let Some((cpu_millis, full_memory_bytes)) = budget_override {
+        if cpu_millis > measured_cpu_millis {
+            bail!(
+                "approved Docker CPU budget {cpu_millis} milli-CPUs exceeds measured effective capacity {measured_cpu_millis}"
+            );
+        }
+        if full_memory_bytes <= API_MEMORY_HEADROOM_BYTES {
+            bail!(
+                "FULLMAG_DOCKER_MEMORY_BYTES must exceed 1 GiB of API headroom"
+            );
+        }
+        if full_memory_bytes > measured_memory_bytes {
+            bail!(
+                "approved Docker memory budget {full_memory_bytes} bytes exceeds measured MemTotal {measured_memory_bytes}"
+            );
+        }
+        (cpu_millis, full_memory_bytes - API_MEMORY_HEADROOM_BYTES)
+    } else {
+        (
+            measured_cpu_millis.min(4000),
+            measured_memory_bytes.min(7 * 1024 * 1024 * 1024),
+        )
+    };
+    let cpu_millis = if approved_budget || allowed_cpu_ids.is_empty() {
         cpu_millis
     } else {
         cpu_millis.min(
@@ -1112,7 +1173,6 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
                 .saturating_mul(1000),
         )
     };
-    let memory_bytes = memory_bytes.min(7 * 1024 * 1024 * 1024);
     if cpu_millis == 0 || memory_bytes == 0 {
         bail!("Docker host profile has no bounded CPU or memory capacity");
     }
@@ -1254,26 +1314,45 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     };
     let cpu_offer_id = "docker-all.compute.cpu".to_owned();
     let prep_offer_id = "docker-all.preparation.cpu".to_owned();
-    let offer_cpu_millis = cpu_millis.min(1000).max(1);
-    let offer_memory = memory_bytes.min(1024 * 1024 * 1024).max(1);
-    let cpu_offer_cpu_millis = cpu_millis
-        .saturating_sub(offer_cpu_millis)
-        .min(3000);
+    let (offer_cpu_millis, offer_memory) = if approved_budget {
+        // Split whole CPUs so rounding both disjoint placements cannot require
+        // more CPU IDs than the approved container allocation provides.
+        (((cpu_millis / 1000 / 4).max(1)) * 1000, (memory_bytes / 4).max(1))
+    } else {
+        (
+            cpu_millis.min(1000).max(1),
+            memory_bytes.min(1024 * 1024 * 1024).max(1),
+        )
+    };
+    let cpu_offer_cpu_millis = if approved_budget {
+        cpu_millis.saturating_sub(offer_cpu_millis)
+    } else {
+        cpu_millis.saturating_sub(offer_cpu_millis).min(3000)
+    };
     if cpu_offer_cpu_millis == 0 {
         bail!(
             "Docker host profile requires positive bounded compute CPU capacity after its preparation allocation"
         );
     }
-    let cpu_offer_memory = memory_bytes.min(6 * 1024 * 1024 * 1024).max(1);
+    let cpu_offer_memory = if approved_budget {
+        memory_bytes.saturating_sub(offer_memory)
+    } else {
+        memory_bytes.min(6 * 1024 * 1024 * 1024).max(1)
+    };
+    if cpu_offer_memory == 0 {
+        bail!(
+            "Docker host profile requires positive compute memory after its preparation allocation"
+        );
+    }
     let (compute_cpu_ids, preparation_cpu_ids) = docker_host_cpu_placements(
         &policy.allowed_cpu_ids,
         cpu_millis,
         cpu_offer_cpu_millis,
         offer_cpu_millis,
     )?;
-    let offer_budget = |gpu_memory_bytes| FmsResourceBudget {
-        cpu_millis: offer_cpu_millis,
-        memory_bytes: offer_memory,
+    let offer_budget = |cpu_millis, memory_bytes, gpu_memory_bytes| FmsResourceBudget {
+        cpu_millis,
+        memory_bytes,
         gpu_memory_bytes,
         storage_bytes,
     };
@@ -1300,7 +1379,11 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         compute_resources.push(FmsSchedulerResourceOffer {
             resource_id: resource_id.clone(),
             kind: FmsResourceKind::Gpu,
-            budget: offer_budget(*vram),
+            budget: offer_budget(
+                if approved_budget { cpu_offer_cpu_millis } else { offer_cpu_millis },
+                if approved_budget { cpu_offer_memory } else { offer_memory },
+                *vram,
+            ),
         });
         compute_placements.insert(
             resource_id,
@@ -1312,7 +1395,7 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     }
     let preparation_resources = vec![FmsPreparationResourceOffer {
         resource_id: prep_offer_id.clone(),
-        budget: offer_budget(0),
+        budget: offer_budget(offer_cpu_millis, offer_memory, 0),
     }];
     let host_execution = RuntimeServiceHostExecution {
         schema_version: RUNTIME_SERVICE_HOST_EXECUTION_SCHEMA_V1.into(),

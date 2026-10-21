@@ -1,27 +1,30 @@
 # MX3 — audyt frontendu i runtime symulacji Fullmag
 
 <!-- mx3-current-status:start -->
-## Aktualny status wdrożenia — 21.10.2026, 02:00 CEST
+## Aktualny status wdrożenia — 21.10.2026, 02:37 CEST
 
-Build źródeł `6c5a9792f` zakończony **exit 0, 218431 ms**; pakiet 24 plików
-opublikowany i zweryfikowany, retencja odroczona poza start. Bramy storage
-oraz worker-cgroup przeszły. Nowy backend miał **128 GiB RAM / 16 CPU /
-CARGO_BUILD_JOBS=16**, potwierdzone także z działającego Cargo.
+Zarządzany restart `a0019546f54c42dda7ec0024fdebc5d7` wykonał się w tym samym
+kontenerze `f7c035fd`, bez ponownej aktywacji skryptu. Build źródeł `73e275ce1`
+**PASS: Make exit 0 / 121700 ms**, pakiet 24 plików / 6161 ms, verify / 1564 ms.
+Storage gate PASS; receipt potwierdza też świeżą delegację CPU. Kontener miał
+**128 GiB RAM / 16 CPU**. Capture 359812 ms, sync ext4 3665 ms; HOLD RELEASED.
 
-**Nowa blokada:** przed startem API komenda `runtime initialize-docker-accepted-store`
-przekroczyła 180 sekund. Backend `f7c035fd` zakończył się exit 1, non-OOM,
-o 23:28:02 UTC; development `8bad15a8` ma terminal failed-confirmed.
-Frontend nadal healthy na **3198**, API nie nasłuchuje. Nie ponowiono bootstrapu.
+**Accepted-store bootstrap przeszedł. Nowa blokada jest potwierdzona:** wspólny
+host-ledger zawiera inventory z quota 4000; zmiana tylko tego pola na 16000
+odtwarza dokładnie hash odrzucony przez nowy probe. Ledger wiąże wspólną
+politykę hosta z quota konkretnego kontenera. Native profil dodatkowo nadal
+ogranicza oferty do 4 CPU / 7 GiB. Backend exited1/non-OOM o 00:16:42 UTC;
+frontend healthy3198. API nie wystartowało, materializacja/mesh/UI NOT VERIFIED.
 
-Diagnostyka tego samego pakietu: `--version` najpierw timeout 20 s przed `main`,
-stos w nvJitLink/cublas; później **exit 0 w 4500 ms**. Sumy obu sprawdzonych
-bibliotek są poprawne. Przyczyna timeoutu bootstrapu nadal niepotwierdzona (§56).
+Przygotowano opt-in przekazanie zatwierdzonego CPU/RAM do native profilu
+(3 pliki źródłowe, review PASS po korekcie przypięć całych CPU). **Nie zastosowano do runtime; samo to nie
+usuwa konfliktu wspólnej polityki.** Nie resetowano ownera, ledgera ani cache.
+W ledgerze zachowano wszystkie 14 rezerwacji (Released); nie dowodzi to braku
+aktywnego inventory ownera. Dwa inne aktywne backendy używają tego samego mountu.
 
-Capture 9183 plików PASS 295448 ms, sync ext4 PASS 17199 ms; przerwa zapisów
-zwolniona. Oryginalne dane 3806 i held04 zachowane; stary writer metadata
-pozostaje bez zmian, nie jest dowodem żywego writera. Nie wykonano replay,
-preparation retry, Compute/Solve ani testów. **Native runtime, mesh oraz
-pola/energie/Airbox w UI: NOT VERIFIED**. F0–F12 otwarte.
+3806 i held04 zachowane; brak retry04/Compute/Solve/testów. Browser tool odrzucił
+odczyt karty protokołem; pending prośba do użytkownika o nową kartę HTTP.
+F0–F12 pozostają otwarte. Szczegóły: §57.
 <!-- mx3-current-status:end -->
 
 
@@ -2156,3 +2159,80 @@ więc nie było dowodem niezgodnego hasha. Nie reinstalowano bibliotek, nie
 zmieniano timeoutów, ownerów ani konfiguracji. Backend pozostaje stopped,
 frontend healthy3198. Brak bootstrap retry, aktywacji, Compute/Solve i testów.
 API, materializacja, mesh, pola oraz browser/WebGL nadal **NOT VERIFIED**.
+
+
+## 57. Restart a001 i potwierdzony konflikt quota wspólnego ledgera — 21.10.2026
+
+Próba `resume-volume --restart-backend` nie zmieniła container ID ani danych
+sesji. Kernel/Docker: Start `2026-10-21T00:06:40.618916283Z`,
+Finish `2026-10-21T00:16:42.740433157Z`, exit1, OOM=false.
+Receipt resume SHA256 `258a9a912c8204fd1d25529b264180dcd1d7c9005e5e571611616f36c1e505f6`.
+Build receipt SHA256 `db864d1bd9411efd6272291ab6d8b3962d79dbd6156e1d3b179dd76ef6ec74eb`,
+source commit `73e275ce1de772ea306714574a1be374cc4449df`, source snapshot
+`fb452f3047621e3cc80fe968c91115c44769b25efe3aa180a6b79ac84eb2e020`.
+Make121700ms/exit0, package24files6161ms, verify1564ms. Storage gatePASS.
+Mimo logu deferred worker gate hostowy receipt potwierdza świeży successful
+helper `fullmag-cgroup-a0019546f54c42dda7ec0024fdebc5d7` i rzeczywiste
+`cpu.max=1600000 100000`, `memory.max=137438953472`.
+
+Bootstrap accepted-store i accepted preflight przeszły: wyjątek powstał dopiero
+w `ensure_configuration` → `initialize_host_configuration`. Nie uruchomiono API,
+nie ma nowego ACK ani nowego Solve. Błąd to `host resource ledger initialization
+marker differs from configured policy`, a nie brak sesyjnego writera lub OOM.
+
+### Ścisły dowód wpływu quota
+
+Odczytany immutable CAS snapshot ma SHA256
+`fd8b3a134cba86d16727ffe43842eaec86116f49369931a58a355fde1084a61d`.
+Odtworzenie kolejności serializacji `CanonicalInventory` dało oryginalny hash
+`ede15957a5e6fbc441c777bc53323f02299e3eeff71a93439f85ee7da0a42b6e`.
+Zmiana wyłącznie `cpu_quota.capacity_millis: 4000 → 16000` dała
+`a0fe375e7713662e09cdf184cf665874f18b24580ab53461f2a1c52b8b276a6f`,
+czyli dokładnie hash odrzucony w runtime. Nie zmieniano CPU topology, cpuset,
+GPU UUID, PCI ani partition. Obliczenia wykonano na odczytanych bajtach w pamięci;
+bez ekstrakcji na dysk i bez modyfikacji CAS.
+
+Shared ledger SHA256 pozostał
+`3112bce5b3b7cfc3bec141c01692443224951ba8a055a26aad57789a5c9b43d3`.
+Zawiera 14 Released reservations. Master, `docker-volume-only-implementatio`
+i `viewport-visual-quality` montują ten sam
+`/mnt/fullmag-host-ledger-fullmag-0950f4dca4ffe38f`.
+Viewport potwierdził brak aktywnej pracy, lecz poprzedni native shutdown nie był
+potwierdzony. Właściciel docker-volume-only pozostaje do ustalenia.
+Nie wnioskujemy z tych danych o braku aktywnego inventory ownera.
+
+### Zakres naprawy i granice odbioru
+
+- **H0 — budżet, przygotowany source-only:** zweryfikowany saved budget
+  przekazuje CPU/RAM do natywnego profilu; para env jest obowiązkowa razem,
+  1GiB zostaje dla API, oferty compute/preparation mieszczą się w zatwierdzonym
+  limicie. Bez env obowiązuje legacy. To nie jest jeszcze działający runtime.
+- **H1 — wspólny host a konsument:** quota konkretnego backendu musi pozostać
+  jawnym ograniczeniem konsumenta, niezależnym od wspólnej tożsamości/inventory.
+  Nie usuwać quota z istniejącego digestu snapshot.v2: zmieniłoby to jego kontrakt
+  i nie naprawiłoby starych markerów/readiness.
+- **H2 — jawna migracja:** pod blokadą writera i przy potwierdzonej nieaktywności
+  inventory ownera oraz rezerwacji zachować starą politykę, wszystkie Released
+  rows, release proofs, CAS i held04. Dotychczasowa readiness rotation zachowuje
+  policy i nie wystarcza do tej zmiany. Nie kasować markera ani resetować ownera.
+- **H3 — lifecycle:** zastosowanie nowego obrazu/env musi zachować istniejącą
+  pre-ACK authority po nowym, potwierdzonym błędzie pre-API. Wykorzystać istniejący
+  checkpoint zamiast tworzyć kolejny niezależny moduł recovery.
+- **H4 — odbiór:** managed build/start → API ready i held04 bez replay → jedno
+  jawne preparation retry tej samej próby → rzeczywisty mesh/materializacja →
+  widoczny canvas, kolory primitive, pole i Airbox. Bez testów; kwalifikacja
+  naukowa pozostaje odrębną bramką.
+
+Żadnej migracji lub H0 do aktualnego kontenera jeszcze nie zastosowano.
+
+
+### H0 — zamknięcie przeglądu źródeł
+
+Review wykrył nadmiarowe przypięcia dla budżetów niepodzielnych przez 4:
+np. 5 CPU dawało żądanie 6 ID. Poprawiono podział na całe CPU;
+override wymaga co najmniej 2 CPU i wielokrotności 1000 mCPU.
+Python i Rust mają wspólny dodatni zakres u64. Końcowy przegląd: PASS.
+Dla 16 CPU: 12 compute + 4 preparation; pamięć 95,25 + 31,75 GiB,
+1 GiB pozostaje dla API. Kontrola AST Python i diff nie uruchamia runtime.
+Bez testów/builda tej poprawki. H0 nie rozwiązuje konfliktu wspólnego
+ledgera i nie jest zastosowane do działającej grupy. H1–H4 pozostają otwarte.

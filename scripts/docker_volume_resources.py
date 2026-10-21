@@ -66,9 +66,12 @@ def apply_saved_budget(control, document):
             or memory > capacity["MemTotal"] or cpus > capacity["NCPU"]):
         raise BuildControlError("Saved backend budget is below the Compose baseline or above Docker capacity")
     backend.update(cpus=cpus, mem_limit=memory, memswap_limit=swap)
-    # The container quota and Cargo must use the same approved CPU budget.
-    # Native CMake builds share Cargo's jobserver in the build scripts.
-    backend.setdefault("environment", {})["CARGO_BUILD_JOBS"] = str(min(cpus, 64))
+    # The container quota, native host profile, and Cargo must use the same
+    # verified budget. Native CMake builds share Cargo's jobserver.
+    environment = backend.setdefault("environment", {})
+    environment["CARGO_BUILD_JOBS"] = str(min(cpus, 64))
+    environment["FULLMAG_DOCKER_CPU_MILLIS"] = str(cpus * 1000)
+    environment["FULLMAG_DOCKER_MEMORY_BYTES"] = str(memory)
 
 
 def _assert_no_unresolved_increases(control, root):

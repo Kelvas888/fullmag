@@ -155,3 +155,47 @@ nie są potwierdzone. Ciepły cache/I/O to hipoteza, nie wynik pomiaru porównaw
 Nie należy z samego timeoutu wnioskować o konflikcie writera SessionStore ani
 automatycznie zwiększać limitu 180 s. Odbiór API i meshu nadal wymaga rzeczywistego
 startu przez istniejący launcher z zachowaniem pending continuation i held04.
+
+
+## Uzupełnienie: rzeczywisty restart i konflikt wspólnego budżetu
+
+Zarządzany restart `a0019546f54c42dda7ec0024fdebc5d7` zachował kontener
+`f7c035fd8bbc54ea022f1bd22137e69165bb6e31fe1f9bbfbd0c9f510033dae5`
+i działający frontend. Build źródeł `73e275ce1de772ea306714574a1be374cc4449df`
+przeszedł: Make exit 0 / 121700 ms, pakiet 24 plików / 6161 ms,
+verify 1564 ms. Capture nadal kosztował 359812 ms, wobec 3665 ms sync do ext4.
+Accepted-store bootstrap tym razem **przeszedł**; wcześniejszy timeout
+nie jest aktualną blokadą. Backend zakończył się exit 1, non-OOM,
+21.10.2026 o 00:16:42 UTC, podczas inicjalizacji wspólnego host-ledgera.
+
+Ścisły dowód: ponowne obliczenie inventory ze starego, niezmienionego CAS
+snapshotu daje `ede15957a5e6fbc441c777bc53323f02299e3eeff71a93439f85ee7da0a42b6e`.
+Zmiana wyłącznie `cpu_quota.capacity_millis` z 4000 na 16000 daje dokładnie
+`a0fe375e7713662e09cdf184cf665874f18b24580ab53461f2a1c52b8b276a6f`, odrzucone
+przez nowy probe. Globalna tożsamość hosta zależy więc od quota konsumenta.
+Niezależnie od tego native factory i walidator Pythona nadal ograniczały
+oferty do 4 CPU / 7 GiB mimo zatwierdzonego kontenera 16 CPU / 128 GiB.
+
+Przygotowana poprawka H0 (źródła, **nie zastosowana do runtime**) przekazuje
+zweryfikowany saved budget przez istniejący render Compose do native factory
+i walidatora. Oferty compute CPU i GPU są alternatywami tego samego slotu.
+Dla 16 CPU: compute 12, preparation 4; z 128 GiB po rezerwie 1 GiB dla API
+compute dostaje 95,25 GiB, preparation 31,75 GiB. Podział CPU jest całkowity:
+5 CPU nie wymaga już 6 ID przy zaokrąglaniu dwóch rozłącznych przypięć.
+Jawny override wymaga co najmniej 2 całych CPU; bez override pozostaje
+poprzedni kontrakt. Dwa przeglądy kodu, parser AST dwóch plików Python
+i diff check nie zastępują builda ani runtime. Testów nie uruchamiano.
+
+**H0 nie usuwa konfliktu starej polityki.** Następny krok musi oddzielić
+wspólną pojemność hosta od limitów konkretnej grupy i jawnie zmigrować
+niezmienną politykę pod blokadą writera, przy potwierdzonej nieaktywności
+inventory ownera. Zachować 14 rekordów Released, stare polityki i CAS,
+proofy zakończenia i held04. Nie wystarczy usunąć quota z hashującej funkcji,
+zmienić marker ani wyczyścić ledgera. Inne aktywne grupy używają tego samego
+mountu; ich właściciele wymagają koordynacji przed migracją.
+
+To wzmacnia zalecenie uproszczenia **orkiestracji**, przy zachowaniu dwóch
+stałych usług. Usprawnienie capture i kluczy cache może przebiegać osobno;
+nie należy uzależniać zwykłego startu od nowych ręcznych pinów recovery.
+Szczegółowe surowe hashe: [dowód konfliktu quota](../reports/2026-10-20/mx3-host-quota-conflict-evidence.json).
+API, materializacja, mesh i widoczny render nadal **NOT VERIFIED**.
