@@ -23,6 +23,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[path = "accepted_save_state_worker.rs"]
+mod save_state_worker;
+
 const RUNNER_INITIAL_STATE_FILE: &str = "m_initial.json";
 pub(crate) const RUNNER_FINAL_STATE_FILE: &str = "m_final.json";
 const WORKER_EXECUTION_STARTED_RECEIPT: &str = "worker_execution_started.v1.json";
@@ -1295,6 +1298,87 @@ fn worker_execution_receipt_identity(
     })
 }
 
+fn accepted_fdm_precision(device: &str, precision: &str) -> Result<fullmag_ir::ExecutionPrecision> {
+    match (device, precision) {
+        ("cpu" | "gpu", "double") => Ok(fullmag_ir::ExecutionPrecision::Double),
+        ("gpu", "single") => Ok(fullmag_ir::ExecutionPrecision::Single),
+        _ => bail!("accepted FDM requires CPU double or GPU single/double precision"),
+    }
+}
+
+fn accepted_fdm_runner_horizon(study: &fullmag_ir::StudyIR, pinned: Option<f64>) -> Result<f64> {
+    if let Some(until) = pinned {
+        if !until.is_finite() || until <= 0.0 {
+            bail!("accepted worker runner horizon is invalid");
+        }
+        return Ok(until);
+    }
+    if let fullmag_ir::StudyIR::Relaxation { dynamics, stop, .. } = study {
+        let until = fullmag_application::script_stage_materialization::resolve_relaxation_until_seconds(dynamics, stop);
+        if until.is_nan() || until <= 0.0 {
+            bail!("accepted relaxation runner horizon is invalid");
+        }
+        // Infinity is only an internal runner sentinel. The accepted StudyPlan
+        // keeps None and the solver owns its authored convergence/step limits.
+        return Ok(until);
+    }
+    bail!("accepted worker step has no pinned runner horizon")
+}
+
+fn validate_fdm_single_output_provenance(provenance: &serde_json::Value) -> Result<()> {
+    let receipt = &provenance["fdm_gpu_execution_receipt"];
+    if provenance["execution_engine"] != "cuda_fdm"
+        || provenance["precision"] != "single"
+        || provenance["lossy_fallback_used"] != false
+        || !provenance["resolved_fallback"].is_null()
+        || receipt["requested"] != "gpu"
+        || receipt["resolved"] != "device_resident"
+        || receipt["executed"] != "cuda_fdm"
+        || receipt["precision"] != "single"
+        || receipt["accounting_valid"] != true
+        || receipt["fallback_count"] != 0
+    {
+        bail!("accepted FDM single output has no matching native GPU execution receipt");
+    }
+    let policy = &receipt["precision_policy"];
+    if policy["schema_version"] != "fullmag.fdm.cuda.precision-policy.v1"
+        || policy["requested"] != "single" || policy["accounting_valid"] != true
+        || policy["resolved"] != policy["executed"]
+    {
+        bail!("accepted FDM single output precision policy differs");
+    }
+    let executed: fullmag_ir::FdmPrecisionPolicyIR = serde_json::from_value(policy["executed"].clone())
+        .context("decode native FDM output precision components")?;
+    executed.validate_for(fullmag_ir::ExecutionPrecision::Single)
+        .map_err(anyhow::Error::msg)
+        .context("validate native FDM FP32 storage/compute/FFT and FP64 reductions")
+}
+
+fn validate_accepted_fdm_single_output(attempt: &Path, step: &AcceptedWorkerStep) -> Result<()> {
+    if step.resolved_input.requested_execution.precision != "single" {
+        return Ok(());
+    }
+    let bytes = read_explicit_runner_artifact(attempt, RUNNER_FINAL_STATE_FILE,
+        step.claim.lease.budget.storage_bytes)?;
+    let decoded = fullmag_application::decode_study_artifact_bytes(
+        "state", fullmag_application::STUDY_MAGNETIZATION_CODEC_ID,
+        fullmag_application::STUDY_MAGNETIZATION_CODEC_VERSION, &bytes)?;
+    let DecodedStudyArtifact::MagnetizationState(state) = decoded else {
+        bail!("FDM single output did not decode as magnetization");
+    };
+    // Canonical JSON and observation payloads use f64 values. Native FP32
+    // exports widen these values; they do not change the solver precision.
+    validate_fdm_single_output_provenance(&state.provenance)?;
+    if state.values.iter().flatten().any(|value| f64::from(*value as f32) != *value) {
+        bail!("FDM single output contains values outside its native FP32 representation");
+    }
+    fullmag_runner::materialize_study_magnetization_input(
+        &step.execution_plan, &state.layout, &state.values,
+    ).map_err(|error| anyhow::anyhow!(error.to_string()))
+        .context("validate FDM single output layout and sample count")?;
+    Ok(())
+}
+
 fn accepted_state_ref_from_runner_snapshot(
     attempt_output_dir: &Path,
     accepted_step: &AcceptedWorkerStep,
@@ -2233,6 +2317,14 @@ pub(crate) fn execute_accepted_worker_start(
         .validate_execution_for_problem(specification, immutable_problem)
         .context("validate accepted task execution before dispatch")?;
     let request = &accepted_step.resolved_input.requested_execution;
+    if matches!(study_step.kind, fullmag_authoring::StudyStepKind::Primitive {
+        stage_kind: fullmag_authoring::StudyPrimitiveStageKind::SaveState,
+    }) {
+        validate_accepted_worker_parameters(&specification.parameters, &accepted_step.step_id)?;
+        return save_state_worker::execute(
+            store, &accepted, start, accepted_step, study_step, case_id, interrupt_requested,
+        );
+    }
     if matches!(study_step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) {
         return execute_accepted_closed_loop_worker_start(store, &accepted, start, accepted_step, study_step, case_id, interrupt_requested);
     }
@@ -2272,10 +2364,18 @@ pub(crate) fn execute_accepted_worker_start(
     }
     if request.backend != "fdm"
         || !matches!(request.device.as_str(), "cpu" | "gpu")
-        || request.precision != "double"
         || request.mode != "strict"
     {
-        bail!("accepted worker currently supports only FDM CPU/GPU double strict");
+        bail!("accepted worker currently supports only explicit FDM CPU/GPU strict");
+    }
+    let requested_precision = accepted_fdm_precision(&request.device, &request.precision)?;
+    let planned_precision = match &accepted_step.execution_plan.backend_plan {
+        fullmag_ir::BackendPlanIR::Fdm(plan) => plan.precision,
+        fullmag_ir::BackendPlanIR::FdmMultilayer(plan) if requested_precision == fullmag_ir::ExecutionPrecision::Double => plan.precision,
+        _ => bail!("accepted FDM single precision requires a single-grid GPU plan"),
+    };
+    if planned_precision != requested_precision {
+        bail!("accepted FDM plan precision differs from the requested precision");
     }
     if !specification.seeds.is_empty()
         || !accepted_step.problem.problem_meta.seeds.is_empty()
@@ -2300,7 +2400,7 @@ pub(crate) fn execute_accepted_worker_start(
     }
     if accepted_step.problem.backend_policy.requested_backend != fullmag_ir::BackendTarget::Fdm
         || accepted_step.problem.backend_policy.execution_precision
-            != fullmag_ir::ExecutionPrecision::Double
+            != requested_precision
         || accepted_step.problem.validation_profile.execution_mode
             != fullmag_ir::ExecutionMode::Strict
         || accepted_step.execution_plan.common.requested_backend != fullmag_ir::BackendTarget::Fdm
@@ -2312,7 +2412,7 @@ pub(crate) fn execute_accepted_worker_start(
         )
     {
         bail!(
-            "accepted worker execution plan is outside the supported FDM/FDM multilayer CPU/GPU double strict lanes"
+            "accepted worker execution plan is outside the supported FDM strict execution lanes"
         );
     }
     if let fullmag_ir::BackendPlanIR::FdmMultilayer(plan) =
@@ -2335,12 +2435,7 @@ pub(crate) fn execute_accepted_worker_start(
         }
     }
 
-    let until_seconds = accepted_step
-        .until_seconds
-        .context("accepted worker step has no pinned runner horizon")?;
-    if !until_seconds.is_finite() || until_seconds <= 0.0 {
-        bail!("accepted worker runner horizon is invalid");
-    }
+    let until_seconds = accepted_fdm_runner_horizon(&accepted_step.problem.study, accepted_step.until_seconds)?;
     let execution_plan = materialize_resolved_study_inputs(store, accepted_step)
         .context("materialize accepted CAS inputs for the runner")?;
     let receipt_identity = worker_execution_receipt_identity(start, accepted_step, case_id)?;
@@ -2473,6 +2568,7 @@ pub(crate) fn execute_accepted_worker_start(
                 request.device
             );
         }
+        validate_accepted_fdm_single_output(&attempt_output_dir, accepted_step)?;
         let outputs = collect_runner_study_outputs(
             &study_step.outputs,
             case_id,
@@ -3013,6 +3109,7 @@ fn recover_accepted_fdm_worker_attempt(
         bail!("accepted worker receipt belongs to a stale task claim");
     }
     refuse_known_prelaunch_failure(&existing_path, identity)?;
+    validate_accepted_fdm_single_output(&existing_path, accepted_step)?;
     let expected_accepted_state_ref =
         accepted_state_ref_from_runner_snapshot(&existing_path, accepted_step, false)?;
     recover_completed_worker_execution(
@@ -3968,6 +4065,83 @@ pub(crate) fn read_explicit_runner_artifact(
         bail!("runner artifact `{file_name}` changed while it was being read");
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod accepted_fdm_precision_tests {
+    use super::*;
+
+    #[test]
+    fn only_gpu_adds_single_precision() {
+        use fullmag_ir::ExecutionPrecision::{Double, Single};
+        assert_eq!(accepted_fdm_precision("cpu", "double").unwrap(), Double);
+        assert_eq!(accepted_fdm_precision("gpu", "double").unwrap(), Double);
+        assert_eq!(accepted_fdm_precision("gpu", "single").unwrap(), Single);
+        for (device, precision) in [("cpu", "single"), ("auto", "single"), ("gpu", "half")] {
+            assert!(accepted_fdm_precision(device, precision).is_err());
+        }
+    }
+
+    #[test]
+    fn relaxation_uses_canonical_stop_budget_without_synthesized_time() {
+        let problem = fullmag_ir::ProblemIR::bootstrap_example();
+        let mut study = fullmag_ir::StudyIR::Relaxation {
+            algorithm: fullmag_ir::RelaxationAlgorithmIR::ProjectedGradientBb,
+            dynamics: None,
+            stop: fullmag_ir::RelaxStopIR {
+                torque_tolerance_apm: Some(1e-4), energy_tolerance_j: None,
+                max_steps: Some(10), max_relaxation_time_s: None,
+            },
+            sampling: problem.study.sampling().clone(),
+        };
+        assert_eq!(accepted_fdm_runner_horizon(&study, None).unwrap(), f64::INFINITY);
+        if let fullmag_ir::StudyIR::Relaxation { stop, .. } = &mut study {
+            stop.max_relaxation_time_s = Some(2e-9);
+        }
+        assert_eq!(accepted_fdm_runner_horizon(&study, None).unwrap(), 2e-9);
+        assert_eq!(accepted_fdm_runner_horizon(&study, Some(1e-9)).unwrap(), 1e-9);
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(accepted_fdm_runner_horizon(&study, Some(invalid)).is_err());
+        }
+        let no_horizon = fullmag_ir::StudyIR::FieldOnly { sampling: problem.study.sampling().clone() };
+        assert!(accepted_fdm_runner_horizon(&no_horizon, None).is_err());
+    }
+
+    #[test]
+    fn native_single_receipt_survives_output_json_and_rejects_precision_or_fallback_changes() {
+        let policy = fullmag_ir::FdmPrecisionPolicyIR::resolve(fullmag_ir::ExecutionPrecision::Single);
+        let provenance = serde_json::json!({
+            "execution_engine": "cuda_fdm", "precision": "single", "lossy_fallback_used": false,
+            "fdm_gpu_execution_receipt": {
+                "requested": "gpu", "resolved": "device_resident", "executed": "cuda_fdm",
+                "precision": "single", "accounting_valid": true, "fallback_count": 0,
+                "precision_policy": {
+                    "schema_version": "fullmag.fdm.cuda.precision-policy.v1", "requested": "single",
+                    "accounting_valid": true, "resolved": policy, "executed": policy,
+                },
+            },
+        });
+        let values = [[f64::from(0.6_f32), f64::from(0.8_f32), 0.0]];
+        let bytes = serde_json::to_vec(&serde_json::json!({"provenance": provenance, "values": values})).unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        validate_fdm_single_output_provenance(&output["provenance"]).unwrap();
+        let decoded: Vec<[f64; 3]> = serde_json::from_value(output["values"].clone()).unwrap();
+        assert_eq!(decoded, values);
+        assert!(decoded.iter().flatten().all(|value| f64::from(*value as f32) == *value));
+        for (path, value) in [
+            ("/precision", serde_json::json!("double")),
+            ("/execution_engine", serde_json::json!("cpu_reference")),
+            ("/fdm_gpu_execution_receipt/precision", serde_json::json!("double")),
+            ("/fdm_gpu_execution_receipt/fallback_count", serde_json::json!(1)),
+            ("/fdm_gpu_execution_receipt/precision_policy/executed/reduction", serde_json::json!("single")),
+            ("/fdm_gpu_execution_receipt/precision_policy/accounting_valid", serde_json::json!(false)),
+        ] {
+            let mut changed = provenance.clone();
+            *changed.pointer_mut(path).unwrap() = value;
+            assert!(validate_fdm_single_output_provenance(&changed).is_err(), "{path}");
+        }
+        assert!(validate_fdm_single_output_provenance(&serde_json::json!({})).is_err());
+    }
 }
 
 #[cfg(test)]

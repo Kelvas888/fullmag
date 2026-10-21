@@ -1377,6 +1377,72 @@ fn apply_resolved_docker_output_storage_binding(
     Ok(())
 }
 
+/// A script SaveState consumes the immutable state produced by its preceding
+/// solver step. It never reads the mutable current workspace or starts Solve.
+fn bind_live_save_state_inputs(study: &mut fullmag_authoring::StudyPlan) -> Result<(), ApiError> {
+    use fullmag_authoring::{
+        StudyInputPort, StudyInputSource, StudyOutputPort, StudyPortDataKind,
+        StudyPrimitiveStageKind, StudyStepKind,
+    };
+
+    let mut previous_solver = None;
+    for index in 0..study.steps.len() {
+        if !study.steps[index].enabled {
+            continue;
+        }
+        match study.steps[index].kind {
+            StudyStepKind::Primitive {
+                stage_kind: StudyPrimitiveStageKind::Run | StudyPrimitiveStageKind::Relax,
+            } => previous_solver = Some(index),
+            StudyStepKind::Primitive { stage_kind: StudyPrimitiveStageKind::SaveState } => {
+                let previous = previous_solver.ok_or_else(|| {
+                    ApiError::unprocessable_with_code(
+                        "accepted_save_state_source_missing",
+                        "SaveState requires a preceding enabled Run or Relax step",
+                    )
+                })?;
+                let source_id = study.steps[previous].step_id.clone();
+                let input = StudyInputPort {
+                    port_id: "state".into(),
+                    data_kind: StudyPortDataKind::State,
+                    required: true,
+                    source: StudyInputSource::StepOutput {
+                        step_id: source_id,
+                        port: "state".into(),
+                        case_id: "default".into(),
+                    },
+                };
+                if study.steps[index].inputs.is_empty() {
+                    study.steps[index].inputs.push(input);
+                } else if study.steps[index].inputs != [input] {
+                    return Err(ApiError::unprocessable_with_code(
+                        "accepted_save_state_source_conflict",
+                        "SaveState input must preserve the preceding solver state",
+                    ));
+                }
+                let output = StudyOutputPort {
+                    port_id: "state".into(),
+                    data_kind: StudyPortDataKind::State,
+                };
+                if let Some(existing) = study.steps[previous].outputs.iter()
+                    .find(|port| port.port_id == "state")
+                {
+                    if existing != &output {
+                        return Err(ApiError::unprocessable_with_code(
+                            "accepted_save_state_source_conflict",
+                            "SaveState source output is not a magnetization state",
+                        ));
+                    }
+                } else {
+                    study.steps[previous].outputs.push(output);
+                }
+            }
+            _ => previous_solver = None,
+        }
+    }
+    Ok(())
+}
+
 /// Expensive preparation with no accepted durable-state publication. It may
 /// materialize bounded geometry/cache/staging assets in the workspace and reads
 /// immutable profile data; RunIntent/CAS and run catalog publication happen in
@@ -1534,6 +1600,7 @@ fn prepare_live_accepted(
         }
         LiveAcceptedSubmission::Startup { .. } => None,
     };
+    bind_live_save_state_inputs(&mut study)?;
     study.validate_for_execution().map_err(|error| {
         ApiError::unprocessable_with_code(
             "accepted_study_plan_invalid",
@@ -1671,11 +1738,15 @@ fn prepare_live_accepted(
             ));
         }
         let gpu_requested = requested_gpu || profile_requests_gpu;
-        if gpu_requested && !bounded_gpu_scope(entry.problem()) {
+        let save_state = study.steps.iter().any(|step| step.step_id == entry.step_id()
+            && matches!(step.kind, fullmag_authoring::StudyStepKind::Primitive {
+                stage_kind: fullmag_authoring::StudyPrimitiveStageKind::SaveState,
+            }));
+        if gpu_requested && !save_state && !bounded_gpu_scope(entry.problem()) {
             return Err(ApiError::unprocessable_with_code(
                 "accepted_gpu_scope_unsupported",
                 format!(
-                    "accepted GPU execution for study step `{}` is limited to TimeEvolution, LLG-overdamped Relaxation, and explicit FEM ProjectedGradientBb",
+                    "accepted GPU execution for study step `{}` is limited to TimeEvolution, LLG-overdamped Relaxation, and explicit FDM/FEM ProjectedGradientBb",
                     entry.step_id()
                 ),
             ));
@@ -1994,15 +2065,13 @@ fn bounded_gpu_scope(problem: &fullmag_ir::ProblemIR) -> bool {
     }
 }
 
-/// Accepted GPU direct-minimizer scope is deliberately narrower than the
-/// runner support matrix: the first durable Workspace extension is the
-/// explicit FEM native CUDA PG-BB lane.  FDM PG-BB and other direct minimizers
-/// stay fail-closed until their own accepted receipt contract exists.
+/// Accepted GPU direct minimization uses the explicit native CUDA PG-BB
+/// realizations. Other direct minimizers retain their separate qualification.
 fn bounded_gpu_relaxation_algorithm(
     backend: fullmag_ir::BackendTarget,
     algorithm: fullmag_ir::RelaxationAlgorithmIR,
 ) -> bool {
-    backend == fullmag_ir::BackendTarget::Fem
+    matches!(backend, fullmag_ir::BackendTarget::Fdm | fullmag_ir::BackendTarget::Fem)
         && matches!(
             algorithm,
             fullmag_ir::RelaxationAlgorithmIR::ProjectedGradientBb
@@ -2302,15 +2371,59 @@ mod tests {
         );
     }
 
+    fn save_state_study() -> fullmag_authoring::StudyPlan {
+        use fullmag_authoring::*;
+        let node = |id: &str, stage_kind| StudyPipelineNode::Primitive(PrimitiveStageNode {
+            id: id.into(), label: id.into(), enabled: true, notes: None, source: None,
+            stage_kind, payload: Default::default(),
+        });
+        StudyPlan::from_pipeline(
+            "study:save-state", 1,
+            &StudyPipelineDocument {
+                version: "study_pipeline.v1".into(),
+                nodes: vec![node("relax", StudyPrimitiveStageKind::Relax),
+                    node("save", StudyPrimitiveStageKind::SaveState)],
+            },
+            &StudyPlanMigrationDefaults {
+                model: StudyModelReference { model_id: "model:film".into(), version: "1".into() },
+                solver_config: StudySolverConfigReference { preset_id: "solver:default".into(), version: "1".into() },
+                discretization: StudyDiscretizationReference { recipe_id: "mesh:default".into(), version: "1".into() },
+                execution_profile: StudyExecutionProfileReference { profile_id: "exec:default".into(), version: "1".into() },
+            },
+        ).unwrap()
+    }
+
     #[test]
-    fn accepted_gpu_scope_allows_only_explicit_fem_projected_gradient_bb() {
+    fn save_state_binds_only_the_preceding_accepted_solver_state() {
+        use fullmag_authoring::{StudyInputSource, StudyPortDataKind};
+        let mut study = save_state_study();
+        super::bind_live_save_state_inputs(&mut study).unwrap();
+        study.validate_for_execution().unwrap();
+        assert_eq!(study.steps[0].outputs[0].port_id, "state");
+        assert_eq!(study.steps[0].outputs[0].data_kind, StudyPortDataKind::State);
+        assert_eq!(study.steps[1].inputs.len(), 1);
+        assert_eq!(study.steps[1].inputs[0].source, StudyInputSource::StepOutput {
+            step_id: "relax".into(), port: "state".into(), case_id: "default".into(),
+        });
+        let unchanged = study.clone();
+        super::bind_live_save_state_inputs(&mut study).unwrap();
+        assert_eq!(study, unchanged);
+        study.steps[1].inputs[0].source = StudyInputSource::AuthoredInitialState { reference: "initial".into() };
+        assert!(super::bind_live_save_state_inputs(&mut study).is_err());
+        let mut missing = save_state_study();
+        missing.steps[0].enabled = false;
+        assert!(super::bind_live_save_state_inputs(&mut missing).is_err());
+    }
+
+    #[test]
+    fn accepted_gpu_scope_allows_explicit_fdm_and_fem_projected_gradient_bb() {
         use fullmag_ir::{BackendTarget, RelaxationAlgorithmIR};
 
         assert!(bounded_gpu_relaxation_algorithm(
             BackendTarget::Fem,
             RelaxationAlgorithmIR::ProjectedGradientBb
         ));
-        assert!(!bounded_gpu_relaxation_algorithm(
+        assert!(bounded_gpu_relaxation_algorithm(
             BackendTarget::Fdm,
             RelaxationAlgorithmIR::ProjectedGradientBb
         ));

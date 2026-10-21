@@ -38,6 +38,26 @@ Every product-facing feature should be described with one of these statuses:
 | **`production_executable`** | Executable on the intended production lane. For `Relaxation(*)`, this label additionally requires an exact source-bound managed receipt. |
 | **`validated`** | Executable and benchmarked with explicit regression coverage for the documented workload. For `Relaxation(*)`, this additionally requires an exact source-bound managed receipt. |
 
+### Accepted FDM PG-BB i zapis stanu
+
+Accepted FDM obejmuje jawne CPU/double oraz GPU/double i single-grid
+GPU/single w trybie strict. PG-BB korzysta z istniejącej realizacji CUDA;
+relaksacja zachowuje stop criteria z
+[kanonicznego kontraktu](../physics/0580-canonical-relaxation-equilibrium-contract.md),
+bez sztucznego horyzontu wyprowadzanego z kroku czasu.
+`single` wymaga natywnego receiptu CUDA z FP32 storage/compute/FFT, FP64
+reductions i brakiem fallbacku. Multilayer single pozostaje unsupported.
+
+`SaveState` ma jawne wejście `State` z CAS poprzedniego Run/Relax; zachowuje
+nazwę, format i dataset oraz nie uruchamia Solve. Obsługiwane formaty to
+JSON, Zarr ZIP i HDF5 przez istniejący konwerter magnetyzacji. Inne akcje
+pozostają odrzucane przez ten adapter. Właściciele:
+`accepted_study_worker::execute_accepted_worker_start`,
+`accepted_save_state_worker::execute` oraz
+`live_accepted_execution::bind_live_save_state_inputs`.
+Status rozszerzenia: implemented; runtime i kwalifikacja fizyki NOT VERIFIED
+przed wykonaniem scenariusza. Nie jest to deklaracja parytetu FP32/FP64.
+
 ### Docker accepted Workspace GPU
 
 [ADR 0060](../adr/0060-accepted-fem-gpu-docker-workspace.md) opisuje

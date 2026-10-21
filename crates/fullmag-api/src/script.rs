@@ -734,7 +734,13 @@ pub(crate) fn scene_document_to_study_execution_inputs_with_asset_root(
         .map(|step| {
             let matches = stages
                 .iter()
-                .filter(|stage| stage.action.is_none())
+                .filter(|stage| {
+                    stage.action.is_none()
+                        || matches!(
+                            &stage.action,
+                            Some(fullmag_application::script_stage_contract::ResolvedScriptStageAction::SaveState { .. })
+                        )
+                })
                 .filter(|stage| {
                     stage
                         .provenance
@@ -766,9 +772,30 @@ pub(crate) fn scene_document_to_study_execution_inputs_with_asset_root(
             };
             // The Study materializer binds the profile before validating the
             // solver input; authored execution fields may still be unresolved.
+            let mut problem = stage.ir.clone();
+            if let Some(fullmag_application::script_stage_contract::ResolvedScriptStageAction::SaveState {
+                artifact_name, format, dataset,
+            }) = &stage.action {
+                if !matches!(step.kind, fullmag_authoring::StudyStepKind::Primitive {
+                    stage_kind: fullmag_authoring::StudyPrimitiveStageKind::SaveState,
+                }) {
+                    return Err(ApiError::unprocessable("SaveState action differs from its authored Study step"));
+                }
+                // State export carries only the spatial problem. An inherited
+                // Run must not introduce an unrequested solver horizon.
+                problem.study = fullmag_ir::StudyIR::FieldOnly {
+                    sampling: problem.study.sampling().clone(),
+                };
+                problem.problem_meta.runtime_metadata.insert(
+                    "accepted_save_state".into(),
+                    serde_json::json!({
+                        "artifact_name": artifact_name, "format": format, "dataset": dataset,
+                    }),
+                );
+            }
             Ok(fullmag_application::StudyStepExecutionInput {
                 step_id: step.step_id.clone(),
-                problem: stage.ir.clone(),
+                problem,
                 layers: scene_document.study.execution_layers.clone(),
             })
         })

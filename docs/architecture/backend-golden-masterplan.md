@@ -288,6 +288,14 @@ Runner nie może zawierać:
 
 [ADR 0060](../adr/0060-accepted-fem-gpu-docker-workspace.md) rozszerza
 orkiestrację accepted FEM o osobny GPU state producer. Adapter
+`accepted_study_worker` przenosi single-grid FDM GPU single przez istniejący
+runner CUDA i weryfikuje natywny precision receipt przed publikacją wyniku.
+CPU i multilayer zachowują dotychczasowe ograniczenia precyzji.
+Child module `accepted_save_state_worker` zapisuje typowany stan CAS poprzedniego
+etapu przez istniejący konwerter i kontrakt project storage; nie tworzy nowego
+solver state ani nie wykonuje Solve. Profil i claims pozostają własnością
+wspólnej ścieżki accepted Study.
+
 `accepted_fem_study_worker` zachowuje wspólny lifecycle workera i wywołuje
 natywnego runnera; nie przejmuje integratora ani operatorów MFEM. CPU i GPU
 mają oddzielne wersjonowane accepted-state carriers. GPU wiąże native values,
