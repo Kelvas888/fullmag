@@ -2519,11 +2519,15 @@ def _parser() -> argparse.ArgumentParser:
         help="optional frontend port override; conflicting defaults fail closed",
     )
     script_parser.add_argument("--request-id", help="optional stable request fence")
-    idle_restart = subparsers.add_parser("restart-idle-volume", help="Restart the pinned healthy backend only while no session is active")
-    idle_restart.add_argument("--attempt", required=True)
-    idle_restart.add_argument("--config-sha256", required=True)
-    idle_restart.add_argument("--source-root", type=Path, required=True)
-    idle_restart.add_argument("--port", type=int, required=True)
+    for name, help_text in (
+        ("restart-idle-volume", "Restart the pinned healthy backend only while no session is active"),
+        ("stop-idle-volume", "Drain and stop the pinned healthy backend only while no session is active"),
+    ):
+        idle = subparsers.add_parser(name, help=help_text)
+        idle.add_argument("--attempt", required=True)
+        idle.add_argument("--config-sha256", required=True)
+        idle.add_argument("--source-root", type=Path, required=True)
+        idle.add_argument("--port", type=int, required=True)
     stop_unadmitted = subparsers.add_parser(
         "stop-unadmitted",
         help=(
@@ -2687,6 +2691,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "restart-idle-volume":
             from docker_volume_dev import restart_idle
             restart_idle(args)
+        elif args.action == "stop-idle-volume":
+            from docker_volume_dev import stop_idle
+            stop_idle(args)
         elif args.action == "stop-unadmitted":
             from docker_volume_stop_unadmitted import stop
             stop(args)
