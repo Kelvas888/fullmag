@@ -372,3 +372,23 @@ pozostają NOT VERIFIED.
 Review uzupełniono o rzeczywisty zapis obu układów w failure artifact oraz
 diagnostykę status/alert także na root FieldMapStatus. Status danych pozostaje
 poza porównaniem tożsamości montażu; pełna gotowość planaru nie jest tu deklarowana.
+
+
+## Rekoncyliacja zakończonego QA z utraconym stdout
+
+Rekoncyliacja nie kwalifikuje sukcesu z exit code. Po timeout klienta exact
+stopped helper z kodem 0 musi również dać się zamknąć technicznie jako
+`failed-confirmed`, `output_lost=true`, `verification=NOT VERIFIED`. Usunięto
+wyłącznie odrzucenie terminalnego ExitCode0; pozostają kontrole CAS receipt/
+Compose, source/image/helper identity, command, stopped/OOM/restart, trwały
+zapis dowodów przed usunięciem dokładnego browsera oraz potwierdzenie absence
+i zwolnienia oryginalnego helper fence. Żywy browser nadal jest odrzucany.
+
+Cały moduł interpretowanych regresji `test_docker_dev_browser_qa` przeszedł
+z readonly/stable source w helperze grupy. Receipt
+`verification/interpreted-attempts/2a81a9e5d08544a4883e5af05f6d2888.json`, exit0.
+Niezależne review potwierdziło fail-closed semantykę. Nowa regresja wymaga
+wyniku NOT VERIFIED także dla ExitCode0 i jawnie odrzuca `succeeded`.
+Domyślnego timeoutu nie zmieniono. Powtórzenie rzeczywistego harnessu może
+użyć istniejącego parametru `--timeout 600`, ponieważ zmierzony przebieg
+trwał 282,637 s; limity pojedynczych operacji i bramki dowodu pozostają.
