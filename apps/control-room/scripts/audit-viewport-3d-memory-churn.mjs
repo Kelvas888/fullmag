@@ -72,6 +72,50 @@ const QUANTITY_SEQUENCE = Array.from(
 const WARM_QUANTITIES = ["m", "H_eff", "H_demag", "H_ex"];
 const MAX_HEAP_GROWTH_BYTES = 25 * 1024 * 1024;
 const QUANTITY_SWITCH_TIMEOUT_MS = 20_000;
+const CAPTURE_SETTLE_TIMEOUT_MS = 5_000;
+const UNMOUNT_SETTLE_TIMEOUT_MS = 10_000;
+// Warm every pass combination exercised by QUANTITY_SEQUENCE once per field
+// quantity. The stress loop has three independent binary layer predicates, so
+// these indices are one representative for each of its 2^3 combinations.
+const WARMUP_STYLE_INDICES = [20, 4, 5, 1, 0, 12, 15, 3];
+const WARMUP_STYLES = Object.freeze(
+  WARMUP_STYLE_INDICES.map((index) => ({
+    colorMode: index % 2 === 0 ? "magnitude" : "orientation",
+    fieldComponent: index % 2 === 0 ? "x" : "magnitude",
+    id: `stress-style-${index}`,
+    pointsVisible: index % 3 === 0,
+    vectorsVisible: index % 4 !== 0,
+    wireframeVisible: index % 5 !== 0,
+  })),
+);
+// The three explicit shader checks run after stress index 119, whose layer
+// mask is points=false, vectors=true, wireframe=true.
+const WARMUP_SHADER_STYLES = Object.freeze([
+  {
+    colorMode: "magnitude",
+    fieldComponent: "magnitude",
+    id: "shader-scalar",
+    pointsVisible: false,
+    vectorsVisible: true,
+    wireframeVisible: true,
+  },
+  {
+    colorMode: "orientation",
+    fieldComponent: "magnitude",
+    id: "shader-orientation",
+    pointsVisible: false,
+    vectorsVisible: true,
+    wireframeVisible: true,
+  },
+  {
+    colorMode: "magnitude",
+    fieldComponent: "x",
+    id: "shader-component",
+    pointsVisible: false,
+    vectorsVisible: true,
+    wireframeVisible: true,
+  },
+]);
 const injectDroppedPublication =
   process.env.CONTROL_ROOM_AUDIT_INJECT_DROPPED_PUBLICATION === "1";
 const injectBlankScene = process.env.CONTROL_ROOM_AUDIT_INJECT_BLANK_SCENE === "1";
@@ -120,6 +164,11 @@ const topologyRequests = [];
 const auditedRequests = [];
 const fixture = createFdmFixture();
 let auditActive = false;
+const gpuCheckpoints = [];
+let coldBaseline = null;
+let coldWarmup = null;
+let firstUnmount = null;
+let steadyWarmup = null;
 
 await installFdmFixtureApi(page, fixture, fixtureRequests);
 await installBrowserAuditInstrumentation(page);
@@ -181,34 +230,34 @@ try {
   auditLog("waiting for render diagnostics");
   await waitForDiagnostics(viewport);
 
-  for (const quantity of WARM_QUANTITIES) {
-    auditLog("warming quantity", quantity);
-    await withTimeout(
-      setGlobalQuantity(page, fixture, fixtureRequests, quantity, {
-        allowExistingFieldRequest: true,
-        // The production-like no-session fixture may already have the selected
-        // field in its browser resource cache during bootstrap.
-        requireFieldRequest: false,
-      }),
-      QUANTITY_SWITCH_TIMEOUT_MS,
-      `Timed out warming viewport quantity ${quantity}.`,
-    );
-  }
-  await page.waitForTimeout(500);
+  auditLog("warming cold allocation paths");
+  coldWarmup = await warmViewportForChurn(
+    page,
+    fixture,
+    fixtureRequests,
+    viewport,
+  );
 
-  auditLog("reading baseline diagnostics");
-  const baseline = {
+  auditLog("reading cold allocation baseline diagnostics");
+  coldBaseline = {
     diagnostics: await readDiagnostics(viewport),
     gpu: await readBrowserAuditCounters(page),
     runtime: await readViewportAuditRuntime(page),
     heapBytes: await readJsHeapBytes(cdp),
   };
-  rawPerformanceTrace.push(await captureViewportPerformanceSnapshot(page, "baseline"));
+  gpuCheckpoints.push(makeGpuCheckpoint("cold-baseline", coldBaseline.gpu));
+  rawPerformanceTrace.push(
+    await captureViewportPerformanceSnapshot(page, "cold-baseline"),
+  );
 
   await page.locator('[data-action-id="ws-2d"]').click();
   await page.locator(".fm-viewport-3d canvas").waitFor({ state: "detached", timeout: 10_000 });
-  await page.waitForTimeout(1_000);
-  const unmountedBaselineRuntime = await readViewportAuditRuntime(page);
+  firstUnmount = await waitForViewportUnmountSettled(
+    page,
+    "cold viewport unmount",
+  );
+  gpuCheckpoints.push(makeGpuCheckpoint("after-first-unmount", firstUnmount.gpu));
+  const unmountedBaselineRuntime = firstUnmount.runtime;
   const viewport3DMenuItem = page.getByRole("menuitem", { name: "3D viewport" });
   if (await viewport3DMenuItem.isVisible()) {
     await viewport3DMenuItem.click();
@@ -221,6 +270,26 @@ try {
   await canvas.waitFor({ state: "visible", timeout: 10_000 });
   await page.keyboard.press("Escape");
   await waitForDiagnostics(viewport);
+  auditLog("warming steady-state remount paths");
+  steadyWarmup = await warmViewportForChurn(
+    page,
+    fixture,
+    fixtureRequests,
+    viewport,
+  );
+  auditLog("reading steady-state baseline diagnostics");
+  // Keep coldBaseline and firstUnmount as independent remount evidence. The
+  // lifecycle threshold below uses only this post-remount steady baseline.
+  const baseline = {
+    diagnostics: await readDiagnostics(viewport),
+    gpu: await readBrowserAuditCounters(page),
+    runtime: await readViewportAuditRuntime(page),
+    heapBytes: await readJsHeapBytes(cdp),
+  };
+  gpuCheckpoints.push(makeGpuCheckpoint("steady-baseline", baseline.gpu));
+  rawPerformanceTrace.push(
+    await captureViewportPerformanceSnapshot(page, "steady-baseline"),
+  );
   if (injectListenerLeak) {
     await page.evaluate(() => window.__FULLMAG_CONTROL_ROOM_AUDIT__?.injectViewportAuditListenerLeak());
   }
@@ -239,32 +308,19 @@ try {
     if (index % 12 === 0) {
       auditLog("switching cached quantity batch", `${index + 1}-${index + 12}`);
     }
-    fixture.visualizationState = applyPatch(fixture.visualizationState, {
-      active_quantity_id: quantity,
-      field_component: index % 2 === 0 ? "x" : "magnitude",
-      layers: {
-        points: { visible: index % 3 === 0 },
-        vectors: { visible: index % 4 !== 0 },
-        wireframe: { visible: index % 5 !== 0 },
-      },
-      quantity: {
-        active_quantity_id: quantity,
-        field_component: index % 2 === 0 ? "x" : "magnitude",
-      },
-      vector_style: {
-        color_mode: index % 2 === 0 ? "magnitude" : "orientation",
-      },
+    advanceVisualizationState(fixture, quantity, {
+      colorMode: index % 2 === 0 ? "magnitude" : "orientation",
+      fieldComponent: index % 2 === 0 ? "x" : "magnitude",
+      pointsVisible: index % 3 === 0,
+      vectorsVisible: index % 4 !== 0,
+      wireframeVisible: index % 5 !== 0,
     });
-    fixture.visualizationState.revision += 1;
-    fixture.status.resources.visualization_state_revision =
-      fixture.visualizationState.revision;
     const beforePublicationGpu = await readBrowserAuditCounters(page);
+    const ackStart = fixture.visualizationAcks.length;
     await page.evaluate(async ({ state, drop }) => {
       const hook = window.__FULLMAG_CONTROL_ROOM_AUDIT__;
       if (!hook) throw new Error("Fullmag browser audit hook is not installed.");
       if (!drop) hook.publishVisualizationState(state);
-      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
-      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
     }, { drop: injectDroppedPublication && index === 0, state: fixture.visualizationState });
     await assertPublicationRendered(
       page,
@@ -273,8 +329,16 @@ try {
       fixture.visualizationState.revision,
       beforePublicationGpu,
     );
+    await waitForCaptureSettled(
+      page,
+      fixture,
+      viewport,
+      quantity,
+      fixture.visualizationState.revision,
+      beforePublicationGpu,
+      { ackStart, ...getVisualizationAckIdentity(fixture) },
+    );
   }
-  await page.waitForTimeout(500);
   const quantitySwitchPerformanceAfter = await captureViewportPerformanceSnapshot(
     page,
     "quantity-switch-after",
@@ -356,12 +420,21 @@ try {
     await clearViewportCanvas(page);
     await assertCanvasHasFidelity(page);
   }
-  const shaderSignatures = await collectStableShaderSignatures(page, fixture, viewport);
+  const shaderRun = await collectStableShaderSignatures(page, fixture, viewport);
+  const shaderSignatures = shaderRun.signatures;
+  await waitForFinalCaptureSettled(
+    page,
+    fixture,
+    viewport,
+    "m",
+    shaderRun.lastRevision,
+  );
   await page.screenshot({ path: path.join(auditArtifactsDirectory, "settled-3d.png") });
   if (injectGpuBufferLeak) {
     await injectViewportGpuBufferLeak(page);
   }
   const gpuAfterStress = await readBrowserAuditCounters(page);
+  gpuCheckpoints.push(makeGpuCheckpoint("after-stress", gpuAfterStress));
   const baselineLiveBuffers =
     baseline.gpu.buffersCreated - baseline.gpu.buffersDeleted;
   const stressLiveBuffers =
@@ -380,9 +453,13 @@ try {
   }
   await page.locator('[data-action-id="ws-2d"]').click();
   await page.locator(".fm-viewport-3d canvas").waitFor({ state: "detached", timeout: 10_000 });
-  await page.waitForTimeout(1_000);
-  const afterUnmount = await readBrowserAuditCounters(page);
-  const afterUnmountRuntime = await readViewportAuditRuntime(page);
+  const finalUnmount = await waitForViewportUnmountSettled(
+    page,
+    "final viewport unmount",
+  );
+  const afterUnmount = finalUnmount.gpu;
+  const afterUnmountRuntime = finalUnmount.runtime;
+  gpuCheckpoints.push(makeGpuCheckpoint("after-final-unmount", afterUnmount));
   rawPerformanceTrace.push(await captureViewportPerformanceSnapshot(page, "after-unmount"));
   assertViewportPerformanceTrace(rawPerformanceTrace);
   if (afterUnmount.buffersDeleted < gpuAfterStress.buffersDeleted) {
@@ -410,9 +487,16 @@ try {
     afterUnmount,
     afterUnmountRuntime,
     baseline,
+    coldBaseline,
+    coldWarmup,
+    firstUnmount,
+    gpuCheckpoints,
     unmountedBaselineRuntime,
+    steadyWarmup,
+    visualizationAckIdentity: fixture.visualizationIdentity,
     shaderSignatures,
     fixtureRequests,
+    visualizationAckSummary: summarizeVisualizationAcks(fixture.visualizationAcks),
     gpuAfterStress,
     idle,
     idleRequests,
@@ -442,6 +526,10 @@ try {
     fieldRequests,
     fixtureRequests,
     topologyRequests,
+    gpuCheckpoints,
+    coldBaseline,
+    coldWarmup,
+    steadyWarmup,
   });
   throw error;
 } finally {
@@ -452,6 +540,17 @@ try {
 
 async function assertCanvasHasFidelity(page) {
   const canvas = page.locator(".fm-viewport-3d canvas");
+  const drawingBuffer = await canvas.evaluate((element) => {
+    const context = element.getContext("webgl2") ?? element.getContext("webgl");
+    return {
+      contextLost: context?.isContextLost() ?? true,
+      width: context?.drawingBufferWidth ?? 0,
+      height: context?.drawingBufferHeight ?? 0,
+    };
+  });
+  if (drawingBuffer.contextLost || drawingBuffer.width <= 0 || drawingBuffer.height <= 0) {
+    throw new Error("Viewport fidelity gate requires a live WebGL context and nonzero drawing buffer.");
+  }
   const box = await canvas.boundingBox();
   if (!box || box.width <= 0 || box.height <= 0) {
     throw new Error("Viewport fidelity gate could not measure the WebGL canvas.");
@@ -522,6 +621,379 @@ async function assertPublicationRendered(page, viewport, quantityId, revision, b
     2_000,
     `Audit publication r${revision} (${quantityId}) was not observed by the mounted viewport.`,
   );
+}
+
+async function waitForCaptureSettled(
+  page,
+  fixture,
+  viewport,
+  quantityId,
+  revision,
+  beforeGpu,
+  { ackStart, clientId, viewportId } = {},
+) {
+  const knownIdentity = getVisualizationAckIdentity(fixture);
+  const expectedClientId = clientId ?? knownIdentity.clientId;
+  const expectedViewportId = viewportId ?? knownIdentity.viewportId;
+  await waitForCondition(
+    async () => {
+      const matchingAck = [...fixture.visualizationAcks]
+        .slice(ackStart ?? 0)
+        .reverse()
+        .find(
+          (ack) =>
+            Number(ack?.revision) === Number(revision) &&
+            typeof ack?.client_id === "string" &&
+            typeof ack?.viewport_id === "string" &&
+            (expectedClientId === undefined ||
+              ack.client_id === expectedClientId) &&
+            (expectedViewportId === undefined ||
+              ack.viewport_id === expectedViewportId),
+        );
+      if (matchingAck) {
+        pinVisualizationAckIdentity(fixture, matchingAck);
+      }
+      if (matchingAck?.status === "failed") {
+        throw new Error(
+          "Viewport render adoption failed for revision " +
+            revision +
+            ": " +
+            JSON.stringify(matchingAck) +
+            ".",
+        );
+      }
+      const diagnostics = await readDiagnostics(viewport);
+      const runtime = await readViewportAuditRuntime(page);
+      const gpu = await readBrowserAuditCounters(page);
+      return (
+        matchingAck?.status === "rendered" &&
+        !matchingAck.error &&
+        String(runtime.visualizationRevision) === String(revision) &&
+        isCaptureDiagnosticsReady(diagnostics, quantityId) &&
+        Number(runtime.workers?.jobs ?? -1) === 0 &&
+        (gpu.frames > beforeGpu.frames || gpu.drawCalls > beforeGpu.drawCalls)
+      );
+    },
+    CAPTURE_SETTLE_TIMEOUT_MS,
+    `Timed out waiting for rendered ACK, field adoption, and worker settle for visualization revision ${revision}.`,
+  );
+  await waitForFrameBoundary(
+    page,
+    `Timed out waiting for the post-adoption frame boundary for visualization revision ${revision}.`,
+  );
+}
+
+async function waitForFinalCaptureSettled(
+  page,
+  fixture,
+  viewport,
+  quantityId,
+  revision,
+) {
+  const { clientId, viewportId } = requireVisualizationAckIdentity(fixture);
+  await waitForCondition(
+    async () => {
+      const matchingAck = [...fixture.visualizationAcks]
+        .reverse()
+        .find(
+          (ack) =>
+            Number(ack?.revision) === Number(revision) &&
+            ack?.client_id === clientId &&
+            ack?.viewport_id === viewportId,
+        );
+      const diagnostics = await readDiagnostics(viewport);
+      const runtime = await readViewportAuditRuntime(page);
+      return (
+        matchingAck?.status === "rendered" &&
+        !matchingAck.error &&
+        String(runtime.visualizationRevision) === String(revision) &&
+        isCaptureDiagnosticsReady(diagnostics, quantityId) &&
+        Number(runtime.workers?.jobs ?? -1) === 0
+      );
+    },
+    CAPTURE_SETTLE_TIMEOUT_MS,
+    `Timed out waiting for the final rendered ACK and worker settle for visualization revision ${revision}.`,
+  );
+  await waitForFrameBoundary(
+    page,
+    `Timed out waiting for the final post-adoption frame boundary for visualization revision ${revision}.`,
+  );
+}
+
+function getVisualizationAckIdentity(fixture) {
+  const identity = fixture.visualizationIdentity ?? {};
+  return {
+    ...(typeof identity.clientId === "string"
+      ? { clientId: identity.clientId }
+      : {}),
+    ...(typeof identity.viewportId === "string"
+      ? { viewportId: identity.viewportId }
+      : {}),
+  };
+}
+
+function pinVisualizationAckIdentity(fixture, ack) {
+  const clientId = ack?.client_id;
+  const viewportId = ack?.viewport_id;
+  if (typeof clientId !== "string" || typeof viewportId !== "string") {
+    throw new Error(
+      `Rendered ACK for revision ${ack?.revision} did not include client_id and viewport_id.`,
+    );
+  }
+  const knownIdentity = getVisualizationAckIdentity(fixture);
+  if (
+    (knownIdentity.clientId !== undefined &&
+      knownIdentity.clientId !== clientId) ||
+    (knownIdentity.viewportId !== undefined &&
+      knownIdentity.viewportId !== viewportId)
+  ) {
+    throw new Error(
+      `Visualization ACK identity changed from ${JSON.stringify(knownIdentity)} to ${JSON.stringify({ clientId, viewportId })}.`,
+    );
+  }
+  fixture.visualizationIdentity = { clientId, viewportId };
+}
+
+function requireVisualizationAckIdentity(fixture) {
+  const identity = getVisualizationAckIdentity(fixture);
+  if (identity.clientId === undefined || identity.viewportId === undefined) {
+    throw new Error(
+      "Cannot settle the final visualization publication without a pinned client_id and viewport_id.",
+    );
+  }
+  return identity;
+}
+
+function isCaptureDiagnosticsReady(diagnostics, quantityId) {
+  const raw = diagnostics.raw;
+  return (
+    raw.includes(`q:${quantityId}`) &&
+    !/\bfield:none\b/.test(raw) &&
+    /\bsurface:(?:ready|idle)\b/.test(raw) &&
+    /\bfield-demands:\d+\[[^\n]*:complete\b/.test(raw)
+  );
+}
+
+async function waitForFrameBoundary(page, message) {
+  await withTimeout(
+    page.evaluate(
+      () =>
+        new Promise((resolve) =>
+          requestAnimationFrame(() => resolve(undefined)),
+        ),
+    ),
+    1_000,
+    message,
+  );
+}
+
+async function warmViewportForChurn(page, fixture, fixtureRequests, viewport) {
+  let quantitySettles = 0;
+  let stylePublications = 0;
+  const quantityRequestModes = [];
+  for (const quantity of WARM_QUANTITIES) {
+    auditLog("warming quantity", quantity);
+    const previousQuantity = currentFixtureQuantity(fixture);
+    const beforeQuantityGpu = await readBrowserAuditCounters(page);
+    const quantityAckStart = fixture.visualizationAcks.length;
+    const quantityRequest = await withTimeout(
+      setGlobalQuantity(page, fixture, fixtureRequests, quantity, {
+        allowExistingFieldRequest: true,
+        requireFieldRequest: true,
+      }),
+      QUANTITY_SWITCH_TIMEOUT_MS,
+      `Timed out warming viewport quantity ${quantity}.`,
+    );
+    quantityRequestModes.push({ quantity, ...quantityRequest });
+    if (previousQuantity === quantity) {
+      await waitForQuantityDiagnosticsSettled(page, viewport, quantity);
+    } else {
+      await waitForCaptureSettled(
+        page,
+        fixture,
+        viewport,
+        quantity,
+        fixture.visualizationState.revision,
+        beforeQuantityGpu,
+        {
+          ackStart: quantityAckStart,
+          ...getVisualizationAckIdentity(fixture),
+        },
+      );
+    }
+    quantitySettles += 1;
+    const styles =
+      quantity === "m"
+        ? [...WARMUP_STYLES, ...WARMUP_SHADER_STYLES]
+        : WARMUP_STYLES;
+    for (const style of styles) {
+      advanceVisualizationState(fixture, quantity, style);
+      const beforeStyleGpu = await readBrowserAuditCounters(page);
+      await publishVisualizationStateAndWait(
+        page,
+        fixture,
+        viewport,
+        quantity,
+        beforeStyleGpu,
+      );
+      stylePublications += 1;
+    }
+  }
+  const stylePasses = [...WARMUP_STYLES, ...WARMUP_SHADER_STYLES];
+  return {
+    quantities: [...WARM_QUANTITIES],
+    quantitySettles,
+    quantityRequestModes,
+    shaderStyleQuantities: ["m"],
+    styleIds: stylePasses.map(({ id }) => id),
+    stylePublications,
+    stylePasses,
+  };
+}
+
+async function waitForQuantityDiagnosticsSettled(page, viewport, quantityId) {
+  await waitForCondition(
+    async () => {
+      const diagnostics = await readDiagnostics(viewport);
+      const runtime = await readViewportAuditRuntime(page);
+      return (
+        isCaptureDiagnosticsReady(diagnostics, quantityId) &&
+        Number(runtime.workers?.jobs ?? -1) === 0
+      );
+    },
+    CAPTURE_SETTLE_TIMEOUT_MS,
+    `Timed out waiting for diagnostics and workers to settle for quantity ${quantityId}.`,
+  );
+}
+
+function advanceVisualizationState(fixture, quantity, style) {
+  fixture.visualizationState = applyPatch(
+    fixture.visualizationState,
+    makeVisualizationStylePatch(quantity, style),
+  );
+  fixture.visualizationState.revision += 1;
+  fixture.status.resources.visualization_state_revision =
+    fixture.visualizationState.revision;
+}
+
+function makeVisualizationStylePatch(quantity, style) {
+  return {
+    active_quantity_id: quantity,
+    field_component: style.fieldComponent,
+    layers: {
+      points: { visible: style.pointsVisible },
+      vectors: { visible: style.vectorsVisible },
+      wireframe: { visible: style.wireframeVisible },
+    },
+    quantity: {
+      active_quantity_id: quantity,
+      field_component: style.fieldComponent,
+    },
+    vector_style: { color_mode: style.colorMode },
+  };
+}
+
+async function publishVisualizationStateAndWait(
+  page,
+  fixture,
+  viewport,
+  quantityId,
+  beforeGpu,
+  { drop = false } = {},
+) {
+  const revision = fixture.visualizationState.revision;
+  const ackStart = fixture.visualizationAcks.length;
+  await page.evaluate(
+    ({ dropPublication, state }) => {
+      const hook = window.__FULLMAG_CONTROL_ROOM_AUDIT__;
+      if (!hook) throw new Error("Fullmag browser audit hook is not installed.");
+      if (!dropPublication) hook.publishVisualizationState(state);
+    },
+    { dropPublication: drop, state: fixture.visualizationState },
+  );
+  await assertPublicationRendered(
+    page,
+    viewport,
+    quantityId,
+    revision,
+    beforeGpu,
+  );
+  await waitForCaptureSettled(
+    page,
+    fixture,
+    viewport,
+    quantityId,
+    revision,
+    beforeGpu,
+    { ackStart, ...getVisualizationAckIdentity(fixture) },
+  );
+  return { ackStart, revision };
+}
+
+async function waitForViewportUnmountSettled(page, label) {
+  let settled = null;
+  await waitForCondition(
+    async () => {
+      const gpu = await readBrowserAuditCounters(page);
+      const runtime = await readViewportAuditRuntime(page);
+      const workers = runtime.workers ?? {};
+      const liveBuffers = gpu.buffersCreated - gpu.buffersDeleted;
+      settled = { gpu, runtime };
+      return (
+        liveBuffers <= 4 &&
+        workers.disposed === true &&
+        Number(workers.activeLeases ?? -1) === 0 &&
+        Number(workers.jobs ?? -1) === 0 &&
+        Number(workers.timers ?? -1) === 0 &&
+        Number(workers.workers ?? -1) === 0
+      );
+    },
+    UNMOUNT_SETTLE_TIMEOUT_MS,
+    `${label} did not release WebGL buffers and worker runtime within the bounded settle window.`,
+  );
+  return settled;
+}
+
+function makeGpuCheckpoint(label, gpu) {
+  return {
+    label,
+    ...gpu,
+    liveBuffers: gpu.buffersCreated - gpu.buffersDeleted,
+  };
+}
+
+function summarizeVisualizationAcks(acks) {
+  const statuses = {};
+  for (const ack of acks) {
+    statuses[ack?.status ?? "unknown"] =
+      (statuses[ack?.status ?? "unknown"] ?? 0) + 1;
+  }
+  return {
+    count: acks.length,
+    failed: acks
+      .filter((ack) => ack?.status === "failed")
+      .slice(-10)
+      .map(({ client_id, error, revision, status, viewport_id }) => ({
+        client_id,
+        error,
+        revision,
+        status,
+        viewport_id,
+      })),
+    renderedRevisions: acks
+      .filter((ack) => ack?.status === "rendered")
+      .map((ack) => ack.revision),
+    statuses,
+    tail: acks.slice(-20).map(
+      ({ client_id, error, revision, status, viewport_id }) => ({
+        client_id,
+        error,
+        revision,
+        status,
+        viewport_id,
+      }),
+    ),
+  };
 }
 
 async function assertPartialMultilayerNativeMaskRendered(
@@ -652,6 +1124,7 @@ async function collectStableShaderSignatures(page, fixture, viewport) {
     { colorMode: "magnitude", component: "x", id: "component" },
   ];
   const signatures = {};
+  let lastRevision = null;
   for (const mode of modes) {
     fixture.visualizationState = applyPatch(fixture.visualizationState, {
       active_quantity_id: "m",
@@ -664,9 +1137,16 @@ async function collectStableShaderSignatures(page, fixture, viewport) {
     });
     fixture.visualizationState.revision += 1;
     fixture.status.resources.visualization_state_revision = fixture.visualizationState.revision;
+
     const before = await readBrowserAuditCounters(page);
-    await page.evaluate((state) => window.__FULLMAG_CONTROL_ROOM_AUDIT__?.publishVisualizationState(state), fixture.visualizationState);
-    await assertPublicationRendered(page, viewport, "m", fixture.visualizationState.revision, before);
+    const publication = await publishVisualizationStateAndWait(
+      page,
+      fixture,
+      viewport,
+      "m",
+      before,
+    );
+    lastRevision = publication.revision;
     const first = await assertCanvasHasFidelity(page);
     const second = await assertCanvasHasFidelity(page);
     if (first.signature !== second.signature) {
@@ -674,7 +1154,7 @@ async function collectStableShaderSignatures(page, fixture, viewport) {
     }
     signatures[mode.id] = first.signature;
   }
-  return signatures;
+  return { lastRevision, signatures };
 }
 
 function assertViewportRuntimeReleased(afterUnmountRuntime, baselineRuntime) {
@@ -960,6 +1440,21 @@ async function installFdmFixtureApi(page, fixture, requests) {
       await fulfillJson(route, fdmStatusFixture(fixture));
       return;
     }
+    if (
+      path === "/v2/sessions/current/visualization/client-acks" &&
+      request.method() === "POST"
+    ) {
+      const ack = parseJsonBody(request);
+      fixture.visualizationAcks.push(ack);
+      await fulfillJson(route, {
+        client_id: ack.client_id ?? "fixture-client",
+        received_at_unix_ms: Date.now(),
+        revision: ack.revision ?? fixture.visualizationState.revision,
+        status: ack.status ?? "rendered",
+        viewport_id: ack.viewport_id,
+      });
+      return;
+    }
     if (path === "/v2/sessions/current/visualization/state") {
       if (request.method() === "PATCH") {
         const patch = parsePatchBody(request);
@@ -1072,6 +1567,8 @@ async function setGlobalQuantity(
   { allowExistingFieldRequest = false, requireFieldRequest = false } = {},
 ) {
   const previousFieldRequestCount = countFieldRequests(requests, quantityId);
+  const usedExistingFieldRequest =
+    allowExistingFieldRequest && previousFieldRequestCount > 0;
   if (currentFixtureQuantity(fixture) === quantityId) {
     if (requireFieldRequest) {
       await waitForFieldRequest(requests, quantityId, {
@@ -1080,7 +1577,10 @@ async function setGlobalQuantity(
           : previousFieldRequestCount,
       });
     }
-    return;
+    return {
+      fieldRequestCount: countFieldRequests(requests, quantityId),
+      usedExistingFieldRequest,
+    };
   }
 
   await setAuditStep(page, `quantity:${quantityId}:audit-hook`);
@@ -1105,7 +1605,10 @@ async function setGlobalQuantity(
         : previousFieldRequestCount,
     });
   }
-  await page.waitForTimeout(120);
+  return {
+    fieldRequestCount: countFieldRequests(requests, quantityId),
+    usedExistingFieldRequest,
+  };
 }
 
 async function waitForFieldRequest(
@@ -1143,7 +1646,16 @@ function fdmMultilayerActiveMaskPath(layerId) {
 async function reportAuditFailure(
   page,
   fixture,
-  { errors, fieldRequests, fixtureRequests, topologyRequests },
+  {
+    coldBaseline,
+    coldWarmup,
+    errors,
+    fieldRequests,
+    fixtureRequests,
+    gpuCheckpoints,
+    steadyWarmup,
+    topologyRequests,
+  },
 ) {
   const snapshot = await page
     .evaluate(() => {
@@ -1206,6 +1718,14 @@ async function reportAuditFailure(
         fieldRequests: fieldRequests.slice(-10),
         fixtureRequests: fixtureRequests.slice(-20),
         topologyRequests: topologyRequests.slice(-10),
+        coldBaseline,
+        coldWarmup,
+        gpuCheckpoints,
+        steadyWarmup,
+        visualizationAckIdentity: fixture.visualizationIdentity,
+        visualizationAckSummary: summarizeVisualizationAcks(
+          fixture.visualizationAcks,
+        ),
         visualizationState: fixture.visualizationState,
       },
       null,
@@ -1329,13 +1849,17 @@ function applyPatch(state, patch) {
   return mergeRecords(state, patch ?? {});
 }
 
-function parsePatchBody(request) {
+function parseJsonBody(request) {
   try {
     const value = request.postDataJSON();
     return isPlainObject(value) ? value : {};
   } catch {
     return {};
   }
+}
+
+function parsePatchBody(request) {
+  return parseJsonBody(request);
 }
 
 function mergeRecords(current, patch) {
@@ -1409,6 +1933,8 @@ function createFdmFixture() {
     regions,
     scene,
     status: fdmStatusFixture({ visualizationState }),
+    visualizationIdentity: { clientId: null, viewportId: null },
+    visualizationAcks: [],
     visualizationState,
   };
   validateFdmMemoryFixture(fixture);
