@@ -195,9 +195,10 @@ LOG_TAIL_POLL_SECONDS = 0.25
 LOG_TAIL_STOP_TIMEOUT_SECONDS = 1.0
 WATCHPACK_POLLING_ENV = "FULLMAG_WATCHPACK_POLLING_MS"
 # Docker Desktop's Windows source mount pays a metadata round trip for each
-# Watchpack poll. Five seconds bounds overlapping scans while keeping the HMR
-# latency explicit; operators can provide a validated workspace override.
-WATCHPACK_POLLING_DEFAULT_MS = 5000
+# Watchpack poll. Two seconds keeps edit-to-HMR latency short while still
+# bounding scans of the watched app/src/public/scripts trees; operators can
+# provide a validated workspace override.
+WATCHPACK_POLLING_DEFAULT_MS = 2000
 WATCHPACK_POLLING_MIN_MS = 250
 WATCHPACK_POLLING_MAX_MS = 10000
 NODE_FS_THREADS_ENV = "UV_THREADPOOL_SIZE"

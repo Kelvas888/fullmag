@@ -2198,6 +2198,7 @@ class DockerRuntimeContract(unittest.TestCase):
             POST_BUILD_START_SHA_ENV=service_module.POST_BUILD_START_SHA_ENV,
             RuntimeHandle=service_module.RuntimeHandle,
             RuntimeServiceTransient=service_module.RuntimeServiceTransient,
+            SUPERVISION_FULL_API_PROBE_SECONDS=service_module.SUPERVISION_FULL_API_PROBE_SECONDS,
             prepare_storage=mock.Mock(return_value=paths),
             initialize_accepted_store=mock.Mock(return_value={"binding": "test"}),
             recover_container_namespace=mock.Mock(return_value=None),

@@ -2735,7 +2735,7 @@ impl HostResourceLedger {
             bail!("host capacity migration requires released reservations and no active inventory owner");
         }
         let previous_readiness = self.read_runtime_readiness_locked()?;
-        if !runtime_readiness_native_abi_compatible(&previous_readiness, &readiness) {
+        if !runtime_readiness_capacity_migration_compatible(&previous_readiness, &readiness) {
             bail!("host capacity migration changes native ABI or GPU compatibility");
         }
         if let Some(node_policy) = &document.node_policy {
@@ -5665,13 +5665,24 @@ fn runtime_readiness_native_abi_compatible(
     previous: &HostRuntimeReadiness,
     next: &HostRuntimeReadiness,
 ) -> bool {
+    runtime_readiness_capacity_migration_compatible(previous, next)
+        && previous.inventory_sha256 == next.inventory_sha256
+}
+
+// A capacity migration exists to change the measured CPU quota and mask, and
+// those are part of the inventory digest. The next readiness is bound to the
+// next policy topology by `validate_persisted`; GPU identity stays fenced by
+// the compatibility map here and the VRAM map in `validate_policy_transition`.
+fn runtime_readiness_capacity_migration_compatible(
+    previous: &HostRuntimeReadiness,
+    next: &HostRuntimeReadiness,
+) -> bool {
     previous.schema_version == next.schema_version
         && previous.status == next.status
         && previous.source_kind == next.source_kind
         && previous.capabilities == next.capabilities
         && previous.gpu_runtime_compatibility == next.gpu_runtime_compatibility
         && previous.gpu_visibility == next.gpu_visibility
-        && previous.inventory_sha256 == next.inventory_sha256
 }
 
 fn runtime_cas_digest(bytes: &[u8]) -> String {
