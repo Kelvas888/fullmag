@@ -297,9 +297,10 @@ class PostBuildStartIntegrationTests(unittest.TestCase):
                                                  "frontend": {"volumes": []}}, "volumes": {}},
                 }),
                 mock.patch.object(dev, "_frontend", return_value=({}, "frontend-build")),
-                mock.patch.object(dev, "_host_ledger", return_value=({"environment": {}, "volumes": []}, {
-                    "maintenance_document": {}, "project_id": "fullmag-project",
-                    "mount_root": "/host-ledger", "backing_image": NEW_IMAGE,
+                # A new render uses the group's own ledger (ADR 0067).
+                mock.patch.object(dev, "_group_ledger", return_value=({"environment": {}, "volumes": []}, {
+                    "profile": "group-ledger-v1", "image_id": NEW_IMAGE,
+                    "compose_volume": {"name": "fullmag-dev-group-ledger-v1-test", "external": True},
                 })),
                 mock.patch.object(runtime, "_provisional_development_certificate", return_value=({"image_id": NEW_IMAGE}, {}, {})),
                 mock.patch.object(runtime, "_reuse_host_certificate", side_effect=host.reuse_certificate),

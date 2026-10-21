@@ -1857,7 +1857,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             descriptor = ledger_backend["x-fullmag-host-ledger-volume"]
             backend["x-fullmag-host-ledger-volume"] = descriptor
             document["volumes"]["host-ledger"] = descriptor["compose_volume"]
-        if ledger_profile["profile"] == "group-ledger-v1":
+        if ledger_profile.get("profile") == "group-ledger-v1":
             import docker_group_ledger as group_ledger
             document["volumes"][group_ledger.COMPOSE_VOLUME] = ledger_profile["compose_volume"]
             # The group's base render must not retain any global ledger field.
@@ -1991,7 +1991,7 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
     # Complete the independent guest probes first to avoid a circular wait.
     import docker_worker_cgroup
     docker_worker_cgroup.ensure_delegation(control, operation, document, backend_id, image, selected)
-    if ledger_profile["profile"] == "group-ledger-v1":
+    if ledger_profile.get("profile") == "group-ledger-v1":
         import docker_group_ledger as group_ledger
         ledger_attestation = group_ledger.validate_container(
             json.loads(docker_text("inspect", backend_id))[0], ledger_profile, docker_text)
