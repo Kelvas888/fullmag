@@ -765,6 +765,7 @@ pub fn load_accepted_worker_step(
         .context("accepted study step has no lowered execution record")?;
     if !execution_step.enabled
         || !matches!(&execution_step.status, StudyStepLoweringStatus::Planned)
+        || execution_step.kind != study_step.kind
         || execution_step.until_seconds != study_step.until_seconds
         || execution_step.completion_dependencies != study_step.completion_dependencies
     {
@@ -796,6 +797,9 @@ pub fn load_accepted_worker_step(
     }
     if !inspection
         && matches!(problem.study, fullmag_ir::StudyIR::TimeEvolution { .. })
+        && !matches!(study_step.kind, fullmag_authoring::StudyStepKind::Primitive {
+            stage_kind: fullmag_authoring::StudyPrimitiveStageKind::SaveState,
+        })
         && execution_step.until_seconds.is_none()
     {
         bail!("accepted TimeEvolution worker step has no pinned until_seconds");

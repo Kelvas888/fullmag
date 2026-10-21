@@ -386,6 +386,9 @@ where
                 validate_closed_loop_operation(&problem, stage_id, port_mode_id, output_id)?;
             }
             if matches!(problem.study, fullmag_ir::StudyIR::TimeEvolution { .. })
+                && !matches!(step.kind, StudyStepKind::Primitive {
+                    stage_kind: fullmag_authoring::StudyPrimitiveStageKind::SaveState,
+                })
                 && step.until_seconds.is_none()
             {
                 return Err(StudyLoweringError::Contract(format!(
@@ -540,6 +543,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires an accepted positive until_seconds"));
+    }
+
+    #[test]
+    fn save_state_preserves_the_magnetic_problem_without_a_solver_horizon() {
+        let mut study = study();
+        study.steps[0].kind = StudyStepKind::Primitive {
+            stage_kind: StudyPrimitiveStageKind::SaveState,
+        };
+        study.steps[0].until_seconds = None;
+        let problem = ProblemIR::bootstrap_example();
+        problem.validate().unwrap();
+        assert!(!problem.magnets.is_empty());
+        let lowered = lower_study_plan(&study, |_| Ok::<_, &'static str>(problem.clone()))
+            .expect("SaveState must not turn its magnetic carrier into field_only");
+        assert_eq!(lowered.steps[0].until_seconds, None);
+        lowered.validate().unwrap();
     }
 
     #[test]

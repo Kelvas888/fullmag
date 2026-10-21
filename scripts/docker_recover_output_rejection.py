@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finalize only the reviewed output-mapping rejection; never replay a request.
+"""Finalize only the two reviewed startup rejections; never replay a request.
 
 The original receipt and started marker remain immutable. This trusts the
 managed private network boundary, not concurrent privileged Docker operators.
@@ -17,11 +17,15 @@ import time
 from docker_build_control import BuildControlError, bounded_capture, canonical, docker_capture
 import docker_volume_activation_reconcile as reconcile
 
-# This recovery is deliberately limited to the reviewed, clean runtime build.
+# Each rejection is limited to its reviewed, clean runtime build.
 REVIEWED_COMMIT = "7a3ced8d7c3c643e27ffe7cff451c212558228f8"
 REVIEWED_SNAPSHOT = "86ce3beb19c2bcca3ee88e3838edb6b061c0c667fc621f7c1f853aa3369ab4d3"
 CODE = "docker_startup_output_mapping_required"
 MESSAGE = "FULLMAG_SCRIPT_OUTPUT_ROOT is required for default or relative script output paths"
+MATERIALIZATION_CODE = "accepted_execution_materialization_failed"
+MATERIALIZATION_MESSAGE = "StudyPlan execution materialization failed: study step `save_state-1`: field_only cannot contain magnetic state, interactions, dynamics or torque"
+MATERIALIZATION_COMMIT = "62d70e7fb551a1055aa859cec464ede3d5712a43"
+MATERIALIZATION_SNAPSHOT = "08a69a38452271218713862d789a09aa21d0990f1582c1f5fa3b9d85e7315035"
 
 
 def validate_rejection(receipt):
@@ -29,12 +33,15 @@ def validate_rejection(receipt):
     prefix = "fullmag_image_docker_startup_script.StartupScriptError: startup activation returned HTTP 422: "
     lines = error.rstrip().splitlines()
     if not lines or not lines[-1].startswith(prefix):
-        raise BuildControlError("Not the exact retained output-mapping HTTP 422")
+        raise BuildControlError("Not an exact reviewed startup HTTP 422")
     response = json.loads(lines[-1][len(prefix):])
-    expected = {"code": CODE, "capability_reason": CODE, "message": MESSAGE, "error": MESSAGE,
-                "diagnostics": None, "revision_context": None}
-    if response != expected:
-        raise BuildControlError("Output-mapping rejection response differs")
+    expected = [
+        {"code": code, "capability_reason": code, "message": message, "error": message,
+         "diagnostics": None, "revision_context": None}
+        for code, message in ((CODE, MESSAGE), (MATERIALIZATION_CODE, MATERIALIZATION_MESSAGE))
+    ]
+    if response not in expected:
+        raise BuildControlError("Reviewed startup rejection response differs")
     return response
 
 
@@ -60,8 +67,9 @@ def validate_incarnation(observed, not_after, expected=None):
             or started != expected.get("State", {}).get("StartedAt")):
         raise BuildControlError("Container incarnation changed")
 
-def probe(store_root, ledger_root):
+def probe(store_root, ledger_root, failed_startup=""):
     import fcntl
+    import hashlib
     import json
     import os
     from pathlib import Path
@@ -70,10 +78,18 @@ def probe(store_root, ledger_root):
     import urllib.request
     import uuid
 
+    expected = json.loads(failed_startup) if failed_startup else None
+    expected_session = None if expected is None else "docker-startup-" + hashlib.sha256(
+        (expected["request_id"] + "\0" + expected["source_sha256"]).encode()).hexdigest()
+
     def read_api():
         result = {}
-        for key, path in (("health", "health"), ("queue", "compute/queue"), ("runtime", "runtime-service")):
-            with urllib.request.urlopen("http://127.0.0.1:8081/v2/platform/" + path, timeout=5) as response:
+        paths = [("health", "/v2/platform/health"), ("queue", "/v2/platform/compute/queue"),
+                 ("runtime", "/v2/platform/runtime-service")]
+        if expected is not None:
+            paths += [("session", "/v2/sessions/current"), ("status", "/v2/sessions/current/status")]
+        for key, path in paths:
+            with urllib.request.urlopen("http://127.0.0.1:8081" + path, timeout=5) as response:
                 raw = response.read(1024 * 1024 + 1)
                 instance = response.headers.get("x-fullmag-api-instance")
                 if response.status != 200 or len(raw) > 1024 * 1024 or str(uuid.UUID(instance)) != instance:
@@ -82,8 +98,21 @@ def probe(store_root, ledger_root):
                     raise RuntimeError("API incarnation changed")
                 result["instance"] = instance
                 result[key] = json.loads(raw)
-        if result["health"].get("status") != "ok" or result["health"].get("active_session") is not False:
-            raise RuntimeError("Current workspace is not empty")
+        if result["health"].get("status") != "ok" or result["health"].get("active_session") is not (expected is not None):
+            raise RuntimeError("Current workspace does not match the rejected startup")
+        if expected is not None:
+            session, status = result["session"], result["status"]
+            script_path = "/opt/fullmag/source/" + expected["source_relative"]
+            if (session.get("session_id") != expected_session or session.get("status") != "startup_failed"
+                    or session.get("script", {}).get("sha256") != expected["source_sha256"]
+                    or session.get("script", {}).get("path") != script_path
+                    or session.get("script_path") != script_path
+                    or status.get("session", {}).get("session_id") != expected_session
+                    or status.get("run", "missing") is not None
+                    or status.get("solver", {}).get("state") != "startup_failed"
+                    or status.get("metrics", {}).get("total_steps") != 0
+                    or status.get("domain", {}).get("cell_count") != 0):
+                raise RuntimeError("Startup failure session/request/source or no-compute proof differs")
         if result["queue"].get("schema_version") != "compute_queue.v1" or result["queue"].get("items") != []:
             raise RuntimeError("Compute queue is not empty")
         runtime = result["runtime"]
@@ -124,6 +153,11 @@ def probe(store_root, ledger_root):
         after = read_api()
         if before["instance"] != after["instance"]:
             raise RuntimeError("API incarnation changed")
+        if expected is not None:
+            for value in (before, after):
+                value["status"]["metrics"].pop("uptime_seconds", None)
+            if before["session"] != after["session"] or before["status"] != after["status"]:
+                raise RuntimeError("Rejected startup session changed during preflight")
         return after
     finally:
         for fd in reversed(descriptors):
@@ -167,6 +201,74 @@ def publish_script(control, records, terminal_path, proof_path, attempt):
     return "\n".join(lines)
 
 
+
+def stop_rejected_backend(control, original, records, root, terminal):
+    from docker_volume_stop_unadmitted import _read_terminal_process_receipt, _owner_identity_key
+
+    if terminal["response"]["code"] != MATERIALIZATION_CODE:
+        raise BuildControlError("Only the reviewed materialization rejection permits backend stop")
+    before_path = root + "/materialization-stop-request.json"
+    after_path = root + "/materialization-stop-drained.json"
+    for path in (before_path, after_path):
+        if reconcile._control_bytes(control, path, optional=True) is not None:
+            raise BuildControlError("A prior materialization stop requires explicit inspection; no retry")
+    for path, raw in records.items():
+        if reconcile._control_bytes(control, path) != raw:
+            raise BuildControlError("Activation evidence changed before backend stop")
+    ready_script = r"""
+import json, os, stat, sys
+sys.path.insert(0, '/opt/fullmag')
+import runtime_service
+if os.environ.get('FULLMAG_STARTUP_ENABLED') == '1':
+    raise RuntimeError('Internal startup activation is not admissible')
+path = runtime_service.process_receipt_path(runtime_service.canonical_paths())
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+with os.fdopen(fd, 'rb') as stream:
+    metadata = os.fstat(stream.fileno())
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise RuntimeError('Invalid process receipt')
+    raw = stream.read(8 * 1024 * 1024 + 1)
+if len(raw) > 8 * 1024 * 1024:
+    raise RuntimeError('Unbounded process receipt')
+receipt = json.loads(raw)
+if receipt.get('schema') != 'fullmag.docker-process-tree.v1' or receipt.get('state') != 'ready' or 'startup_activation' in receipt:
+    raise RuntimeError('Native process receipt is not ready')
+runtime_service._validate_terminal_owner(receipt.get('service_owner'), state='ready', name='pre-stop owner')
+sys.stdout.buffer.write(raw)
+"""
+    backend = original["Id"]
+    ready_raw = docker_capture("exec", backend, "/usr/local/bin/python3", "-B", "-c", ready_script, timeout=60).stdout
+    ready = json.loads(ready_raw)
+    owner = _owner_identity_key(ready.get("service_owner"), "pre-stop owner")
+    before = {"schema": "fullmag.materialization-rejection-stop.v1", "state": "stop-requested",
+              "backend_container": backend, "backend_started_at": original["State"]["StartedAt"],
+              "ready_process_receipt_sha256": hashlib.sha256(ready_raw).hexdigest(),
+              "ready_process_receipt": ready, "rejection_proof": terminal, "created_at": time.time()}
+    control.write(before_path, before)
+    docker_capture("stop", "--time", "60", backend, timeout=90)
+    observed = json.loads(docker_capture("inspect", backend).stdout)
+    if len(observed) != 1:
+        raise BuildControlError("Backend stop inspection is ambiguous; lease retained")
+    after = observed[0]
+    state = after.get("State", {})
+    if (after.get("Id") != backend or after.get("Image") != original.get("Image")
+            or state.get("StartedAt") != original["State"]["StartedAt"]
+            or state.get("Running") is not False or state.get("ExitCode") != 0 or state.get("OOMKilled") is not False):
+        raise BuildControlError("Backend did not stop gracefully in the pinned incarnation; lease retained")
+    drained_raw, drained = _read_terminal_process_receipt(after, control)
+    if (drained.get("schema") != "fullmag.docker-process-tree.v1" or drained.get("state") != "drained"
+            or not isinstance(drained.get("terminal_service_owner"), dict)
+            or _owner_identity_key(drained.get("service_owner"), "drained owner") != owner):
+        raise BuildControlError("Native drained owner differs; lease retained")
+    result = {"schema": before["schema"], "state": "stopped-confirmed", "backend_container": backend,
+              "backend_exit_code": 0, "stop_request_sha256": hashlib.sha256(canonical(before) + b"\n").hexdigest(),
+              "drained_process_receipt_sha256": hashlib.sha256(drained_raw).hexdigest(),
+              "drained_process_receipt": drained, "finished_at": time.time()}
+    control.write(after_path, result)
+    records[before_path] = canonical(before) + b"\n"
+    records[after_path] = canonical(result) + b"\n"
+    return result
+
 def recover(args):
     from docker_dev_up import _selected_context
     from docker_dev_host import require_host
@@ -209,6 +311,9 @@ def recover(args):
     if receipt_raw != raw:
         raise BuildControlError("Activation receipt changed during discovery")
     response = validate_rejection(receipt)
+    materialization_failed = response["code"] == MATERIALIZATION_CODE
+    reviewed_commit, reviewed_snapshot = ((MATERIALIZATION_COMMIT, MATERIALIZATION_SNAPSHOT)
+        if materialization_failed else (REVIEWED_COMMIT, REVIEWED_SNAPSHOT))
     ids = {"backend": backend, "frontend": frontend}
 
     def inspect_services():
@@ -233,7 +338,7 @@ def recover(args):
                 or marker.get("provenance_sha256") != pins["provenance_sha256"]):
             raise BuildControlError("Started marker authorization differs")
         for value in (provenance,):
-            if any(value.get(key) != pins[key] for key in ("request_id", "source_sha256", "source_relative")) or value.get("source_commit") != REVIEWED_COMMIT:
+            if any(value.get(key) != pins[key] for key in ("request_id", "source_sha256", "source_relative")) or value.get("source_commit") != reviewed_commit:
                 raise BuildControlError("Original activation source identity differs")
         script = selected / pins["source_relative"]
         if not script.resolve().is_relative_to(selected) or hashlib.sha256(script.read_bytes()).hexdigest() != pins["source_sha256"]:
@@ -247,7 +352,7 @@ def recover(args):
             raise BuildControlError("Image-owned activation helper differs")
         package, runtime, package_sha, hashes = _backend_documents(backend)
         source, runtime_sha, binary_sha = _validate_backend(package, runtime, package_sha, hashes)
-        if source["commit"] != REVIEWED_COMMIT or source["snapshot"] != REVIEWED_SNAPSHOT or source["worktree_state"] != "clean":
+        if source["commit"] != reviewed_commit or source["snapshot"] != reviewed_snapshot or source["worktree_state"] != "clean":
             raise BuildControlError("Runtime does not match the reviewed pre-admission implementation")
         original = inspect_services()
         validate_incarnation(original["backend"], receipt["started_at"])
@@ -265,7 +370,9 @@ def recover(args):
             _assert_private_restart_network(fresh, ids, control.project)
             proof = json.loads(docker_capture("exec", backend, "/usr/local/bin/python3", "-B", "-c", probe_script,
                 environment.get("FULLMAG_RUNS_ROOT", "/state/runs/docker-all") + "/session-store",
-                environment.get("FULLMAG_HOST_LEDGER_ROOT", "/host-ledger/ledger"), timeout=60).stdout)
+                environment.get("FULLMAG_HOST_LEDGER_ROOT", "/host-ledger/ledger"),
+                json.dumps({key: pins[key] for key in ("request_id", "source_sha256", "source_relative")})
+                    if materialization_failed else "", timeout=60).stdout)
             fresh_helper, observed_helper = reconcile._validate_helper(control, helper_name, args.activation_attempt)
             validate_incarnation(fresh_helper, receipt["finished_at"], helper_document)
             validate_incarnation(inspect_services()["backend"], receipt["started_at"], original["backend"])
@@ -274,12 +381,15 @@ def recover(args):
             if observed_helper != helper_id:
                 raise BuildControlError("Original helper changed")
             terminal = {**receipt, "state": "failed-confirmed", "activation_state": "rejected",
-                "reason": "confirmed-output-mapping-pre-admission-rejection", "finished_at": time.time(),
+                "reason": "confirmed-materialization-pre-admission-rejection" if materialization_failed else "confirmed-output-mapping-pre-admission-rejection",
+                "finished_at": time.time(),
                 "original_receipt_sha256": args.receipt_sha256, "response": response,
                 "rejection_proof": {"api": proof, "backend_started_at": original["backend"]["State"]["StartedAt"],
                     "source": source, "package_receipt_sha256": package_sha, "runtime_provenance_sha256": runtime_sha,
                     "api_binary_sha256": binary_sha, "helper_id": helper_id, "helper_log": helper_log,
                     "records_sha256": {path: hashlib.sha256(data).hexdigest() for path, data in records.items()}}}
+            if materialization_failed:
+                terminal["backend_stop"] = stop_rejected_backend(control, original["backend"], records, root, terminal)
             command = publish_script(control, records, root + "/terminal.json", root + "/output-rejection-proof.json", args.activation_attempt)
             result = bounded_capture(control.helper_args(command), data=canonical(terminal) + b"\n", timeout=90)
             if result.returncode:

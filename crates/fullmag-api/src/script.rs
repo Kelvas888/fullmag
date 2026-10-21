@@ -781,11 +781,6 @@ pub(crate) fn scene_document_to_study_execution_inputs_with_asset_root(
                 }) {
                     return Err(ApiError::unprocessable("SaveState action differs from its authored Study step"));
                 }
-                // State export carries only the spatial problem. An inherited
-                // Run must not introduce an unrequested solver horizon.
-                problem.study = fullmag_ir::StudyIR::FieldOnly {
-                    sampling: problem.study.sampling().clone(),
-                };
                 problem.problem_meta.runtime_metadata.insert(
                     "accepted_save_state".into(),
                     serde_json::json!({
