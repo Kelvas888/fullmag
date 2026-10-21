@@ -4493,6 +4493,10 @@ def _retained_operation(
         import docker_backend_volume_cache as cache_adapter
         cache_adapter.validate_container(actual["backend"], cache)
         ledger_profile = _retained_ledger_profile(control, previous_root, document, image)
+        # Fail before the lease and any stop if the drained receipt could not
+        # be read once the backend exits.
+        from docker_volume_stop_unadmitted import _preflight_terminal_process_receipt
+        _preflight_terminal_process_receipt(actual["backend"], control)
         with control.operation("iteration", {"source_root": str(selected), "image_id": image,
                                             "attempt": args.attempt, "config_sha256": args.config_sha256,
                                             **operator_probe_record}) as operation:

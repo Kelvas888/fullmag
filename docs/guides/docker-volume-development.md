@@ -163,6 +163,56 @@ uwierzytelniony drain późniejszego właściciela. Historyczne archiwum recover
 pozostaje niezmienne; nowszy `LAUNCH.json`, generacje pul i checkpointy są
 sprawdzane względem tego właściciela i konfiguracji, zamiast porównywania ich
 bajtów ze starym archiwum. Istniejące runy i ich historia pozostają zachowane.
+Odczyt drain receipt wymaga poprawnego mountu runtime-control backendu. Launcher
+sprawdza obraz, mount, subpath namespace i właściciela wolumenu jeszcze przed
+lease `iteration` i przed zatrzymaniem którejkolwiek usługi; błąd tej kontroli
+zostawia grupę działającą i nie tworzy próby. Grupa bez kwarantanny namespace
+ma `BuildControl.namespace == ""` i używa subpath `runtime-control`.
+
+#### Odzyskanie grupy zablokowanej w `iteration`
+
+Przed poprawką z 21.10.2026 idle restart grupy bez namespace (`""`) zatrzymywał
+frontend i backend, a dopiero potem odrzucał pusty namespace komunikatem
+`runtime-control namespace is invalid`. Taka grupa ma oba kontenery w stanie
+`Exited (0)`, działający helper `fullmag-control-<attempt>`, plik `active`
+z tym `<attempt>` i `iteration/attempts/<attempt>/receipt.json` ze stanem
+`outcome-unknown-resources-retained`. Każde `up` kończy się wtedy komunikatem
+`Existing DEV operation is active`. Faza `iteration` nie ma reconcilera, więc
+helper czeka bez końca na `terminal.json` tej próby.
+
+Trasa odzyskania (`NOT VERIFIED` na żywej grupie; wymaga zgody właściciela
+grupy, bo zwalnia lease):
+
+1. Tylko odczyt. Potwierdź, że `active` zawiera `<attempt>`, receipt tej próby
+   ma dokładnie powyższy stan i błąd, a w katalogu próby są
+   `idle-preflight.json` i `compose.json`, lecz nie ma `backend-drain.json`
+   ani `terminal.json`. Kontenery `backend` i `frontend` mają te same `Id`
+   co `backend_container`/`frontend_container` w `development/current.json`,
+   `Running=false`, `ExitCode=0`, `OOMKilled=false`, a `FinishedAt` jest
+   późniejsze niż `started_at` próby. Helper ma polecenie równe
+   `BuildControl.operation_script("iteration", <attempt>)`. Inny stan, błąd
+   albo działająca usługa oznacza inny przypadek: nie stosuj tej trasy.
+2. Z checkoutu zawierającego poprawkę odczytaj drain receipt zatrzymanego
+   backendu przez `_read_terminal_process_receipt` z
+   `docker_volume_stop_unadmitted`. Wymagany jest stan `drained`; zapisz jego
+   SHA-256 jako `iteration/attempts/<attempt>/backend-drain.json` w tym samym
+   schemacie, którego używa idle restart. Brak lub inny stan drain blokuje
+   dalsze kroki.
+3. Zapisz przez `BuildControl.write` plik
+   `iteration/attempts/<attempt>/terminal.json`: kopię receipt ze stanem
+   `failed-confirmed`, `reason: "runtime-control-namespace-rejected-after-graceful-stop"`,
+   SHA-256 drain receipt i czasem `finished_at`. Nie zmieniaj `receipt.json`,
+   `development/current.json` ani `verified.json`. Helper sam usuwa `active`
+   i kończy działanie; potwierdź brak `active` i kod wyjścia helpera 0.
+4. Zwykłe `just docker-dev "<checkout>" <port>` widzi zatrzymaną grupę i wybiera
+   `resume` z `restart_backend=true` (przy dryfie wejść builda lub helperów
+   obrazu: zarządzane recreate bez drainu). Resume to przyrostowy build w tym
+   samym kontenerze `backend`, bez zmiany storage i bez ponawiania Solve.
+
+Nie usuwaj helpera, wolumenu control ani pliku `active` ręcznie i nie twórz
+nowego namespace jako obejścia. Automatyczny reconciler tej fazy pozostaje
+otwarty (audyt 21.10.2026, T3 oraz R0.7/R0.8).
+
 Frontend obserwuje katalogi `app`, `src`, `public`, `scripts` i aktualizuje UI
 przez HMR. Zmiana helperów obrazu wymaga przygotowania nowego obrazu i jawnego
 odtworzenia usług; sam restart zachowuje przypięty obraz.
