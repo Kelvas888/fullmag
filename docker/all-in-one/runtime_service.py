@@ -2374,8 +2374,11 @@ def _group_ledger_transition_allowed(current: dict[str, Any], expected: dict[str
             or not isinstance(new_host.get("policy"), dict)
             or not isinstance(group_host_id, str) or not HEX64.fullmatch(group_host_id)):
         return False
+    # Only a global identity (daemon digest or legacy ID) may move to the
+    # group; a configuration bound to any other group ID never re-binds.
+    global_host_ids = {os.environ.get("FULLMAG_DOCKER_HOST_ID"), LEGACY_DOCKER_HOST_ID}
     if (new_host["policy"].get("host_id") != group_host_id
-            or old_host["policy"].get("host_id") == group_host_id
+            or old_host["policy"].get("host_id") not in global_host_ids - {None}
             or old_host.get("ledger_root") != str(HOST_LEDGER_ROOT)
             or new_host.get("ledger_root") != str(HOST_LEDGER_ROOT)):
         return False

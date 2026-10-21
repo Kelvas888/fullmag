@@ -729,6 +729,18 @@ def _group_ledger(control, operation, image, *, new_render=False):
         raise BuildControlError("Retained group ledger belongs to another daemon or group")
     key = group_ledger.volume_key(daemon["id_sha256"], control.project)
     volume = _owned_volume(control, group_ledger.VOLUME_ROLE, key)
+    # Create the ledger leaf before admission: the backend is attested
+    # before its native initializer would otherwise create it.
+    script = ("test ! -L /data/ledger; if test ! -e /data/ledger; then "
+              "mkdir -m 0750 /data/ledger; fi; test -d /data/ledger; "
+              "test $(stat -c %u /data/ledger) = 65532")
+    args = control.helper_args(script)
+    args[args.index("--entrypoint"):args.index("--entrypoint")] = [
+        "--mount", "type=volume,src=" + volume + ",dst=/data,volume-nocopy"]
+    result = bounded_capture(args, data=b"", timeout=90)
+    if result.returncode:
+        raise BuildControlError("Group ledger initialization failed: "
+                                + result.stderr.decode("utf-8", "replace"))
     profile = group_ledger.profile(daemon["id_sha256"], control.project, volume, image)
     record = {"schema": "fullmag.docker-group-ledger.v1", "profile": group_ledger.PROFILE,
               "daemon_id_sha256": daemon["id_sha256"], "compose_project": control.project,

@@ -243,6 +243,13 @@ class RuntimeServiceGroupLedgerTest(unittest.TestCase):
             self.assertTrue(allowed(current, expected))
             # Already bound to this group: a later policy change is not a transition.
             self.assertFalse(allowed(expected, copy.deepcopy(expected)))
+            legacy = copy.deepcopy(current)
+            legacy["host_execution"]["policy"]["host_id"] = "docker-all-host"
+            self.assertTrue(allowed(legacy, expected))
+            # A configuration bound to another group never re-binds here.
+            foreign = copy.deepcopy(current)
+            foreign["host_execution"]["policy"]["host_id"] = group_ledger.host_id("e" * 64, PROJECT)
+            self.assertFalse(allowed(foreign, expected))
             moved = copy.deepcopy(expected)
             moved["host_execution"]["ledger_root"] = "/state/shared-ledger"
             self.assertFalse(allowed(current, moved))
