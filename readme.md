@@ -149,6 +149,127 @@ Platform-specific setup is documented in the
 
 ## Docker development workspace
 
+### Quick guide: working with the containers on Windows and WSL
+
+This is the short, task-oriented path for people and agents. The sections
+after it describe the full contract.
+
+**1. Choose where the code lives.** Containers run in the Docker Desktop Linux
+VM. How fast they see your code depends only on the filesystem of the checkout:
+
+| | WSL checkout (recommended) | Windows checkout |
+|---|---|---|
+| Location | ext4 inside the WSL distribution, e.g. `/home/<user>/git/fullmag/fullmag` | NTFS, e.g. `C:\git\fullmag\fullmag` |
+| How containers read it | direct bind mount | 9p (drvfs) across the VM boundary |
+| Frontend file watching | native inotify (`watch_mode=native`) | polling every 5 s by every running frontend |
+| Measured on the dev host (21.10.2026) | source capture 6–12 s, `.tsx` edit visible in ≤ 2.6 s without reload, idle frontend ~1% CPU | source capture 31–140 s, page compile ~80 s, idle frontend ~30% CPU |
+| Edit with | VS Code Remote-WSL, or Windows tools via `\\wsl$\<distro>\home\...` | any Windows editor |
+
+`/mnt/c/...` inside WSL is the Windows disk through the same 9p bridge, so it
+behaves like the Windows column. Keep WSL code under `/home`.
+
+**2. One-time setup.** Run the wizard in the main checkout (it only writes the
+local `.env` and the storage marker; it never builds or starts anything):
+
+```bash
+# WSL
+cd ~/git/fullmag/fullmag
+python3 -B scripts/setup_docker.py          # pick storage on ext4, e.g. ~/git/fullmag/storage
+python3 -B scripts/setup_docker.py --check
+```
+
+```powershell
+# Windows PowerShell
+Set-Location C:\git\fullmag\fullmag
+python -B scripts\setup_docker.py
+python -B scripts\setup_docker.py --check
+```
+
+In WSL the containers run as UID `65532` and must be able to read the main
+checkout's `.git`. If the backend stops with `cannot inspect live Git worktree
+admin directory` or `Permission denied` on a Git object, grant read-only access:
+
+```bash
+cd ~/git/fullmag/fullmag
+setfacl -R -m u:65532:rX .git
+find .git -path .git/modules -prune -o -type d -print0 | xargs -0 setfacl -d -m u:65532:rX
+```
+
+**3. Daily loop.** Each checkout is its own Compose group with exactly two
+services, `backend` and `frontend`. The main checkout is `fullmag-master`; a
+worktree is `fullmag-worktree-<worktree_id>`.
+
+```bash
+# Create a worktree for the task next to the main checkout
+git -C ~/git/fullmag/fullmag worktree add ../worktrees/<task> -b codex/<task> origin/master
+cd ~/git/fullmag/worktrees/<task>
+just docker-dev-toolchain     # dependency image; slow only the first time on a host
+just docker-dev "$PWD"        # builds the backend in its container, starts API and frontend
+```
+
+- Without a port, a new group takes `FULLMAG_HTTP_PORT` (default `3197`) or the
+  next free loopback port; the launcher prints the URL. An existing group keeps
+  its port.
+- **Frontend edits** appear through HMR.
+- **Backend edits:** restart the group's backend (`docker restart <backend>` or
+  Docker Desktop). It rebuilds only what changed and starts the API again;
+  follow it with `docker logs -f <backend>`. A restart without source changes
+  reuses the built package.
+- **Run a script** in a running group: `just docker-dev-script examples/<file>.py`.
+- Never use a plain `docker compose up`, `docker system prune` or
+  `docker compose down -v` for these groups.
+
+Find a group's containers and their state:
+
+```bash
+docker ps -a --filter "label=com.docker.compose.project=<compose-project>" --format "table {{.Names}}\t{{.Status}}"
+```
+
+**4. Finish a task.** A stopped group still pins its cache volumes (often
+10–20 GB) and a running frontend keeps watching the checkout. Before removing
+the worktree, save the project, finish simulations, then:
+
+```bash
+docker stop -t 75 <frontend> <backend>          # drains the backend
+docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}' <backend> <frontend>
+docker rm <frontend> <backend>
+docker volume rm <fullmag-backend-v2-…-build> <fullmag-backend-v2-…-package> <fullmag-dev-frontend-v1-…>
+git -C ~/git/fullmag/fullmag worktree remove ../worktrees/<task>
+```
+
+Remove only the group's `-build`, `-package` and `fullmag-dev-frontend-v1-*`
+cache volumes. Keep `fullmag-build-control-*` (receipts and provenance) and any
+`host-ledger` volume, and never remove storage with sessions and results.
+
+**5. Resources.** Each group has static caps from the main `.env`
+(`FULLMAG_DEV_BACKEND_CPUS`, `FULLMAG_DEV_BACKEND_MEMORY_GIB`,
+`FULLMAG_DEV_FRONTEND_CPUS`, `FULLMAG_DEV_FRONTEND_MEMORY_GIB`); without them,
+backend min(8, CPUs/4) CPUs and min(32, RAM/6) GiB, frontend min(4, CPUs/10)
+CPUs and 8–16 GiB. All Docker data lives in `docker_data.vhdx`
+(`%LOCALAPPDATA%\Docker\wsl\disk` on Windows). The launcher needs at least
+32 GiB free on that drive; move the disk image in Docker Desktop → Settings →
+Resources → Advanced → Disk image location if the system drive is tight.
+Until per-group ledgers ([ADR 0067](docs/adr/0067-docker-dev-group-isolation.md)
+point 1) land, all groups on one storage root share one host ledger, and only
+one group per distinct build can hold a live API at a time; groups can still
+build side by side.
+
+**6. Common failures.**
+
+| Message | Cause | What to do |
+|---|---|---|
+| `Docker build filesystem has less than 32 GiB free` | the drive holding `docker_data.vhdx` is nearly full | free space or move the disk image |
+| `runtime readiness rotation requires the host inventory owner to be absent` | another group with different code has a live API on the same ledger | stop that group's backend, or wait for per-group ledgers |
+| `cannot inspect live Git worktree admin directory`, `Permission denied` on a Git object (WSL) | `.git` not readable by UID 65532 | grant the ACL from step 2 |
+| `measured host capacity differs from the persisted policy` | host capacity changed since the ledger policy was written | coordinated `--migrate-host-capacity` ([ADR 0061](docs/adr/0061-docker-development-build-and-runtime-container.md)) |
+| idle frontend near 30% CPU, slow HMR (Windows) | 9p polling | use a WSL checkout; stop groups you are not using |
+
+Agents follow [`AGENTS.md`](AGENTS.md): build only through `just docker-dev` in
+the selected checkout's group, do not stop other groups without the user's
+approval, and clean up their own group before `git worktree remove`.
+
+### Reference
+
 Recipes are defined in [`justfile`](justfile); run `just --list` from the
 selected checkout to list them. The two-service topology, mounts, and network
 are defined in [`compose.dev.yaml`](compose.dev.yaml). See the
@@ -169,8 +290,10 @@ Each checkout group has two persistent application services: `frontend` and
 ext4 cache and then starts API and native runtime in that same container. Its
 Docker Desktop Logs show compilation and service startup together. Development
 does not use a separate one-shot backend-build container or transfer the built
-package through Windows storage. This lifecycle is being integrated; the new
-end-to-end startup and controlled restart remain **NOT VERIFIED**.
+package through Windows storage. Cold start, incremental `.rs` rebuild and
+restart without changes reached `Ready: API` on Windows and WSL on 21.10.2026
+([audit §13](docs/audits/2026-10-21-docker-dev-workflow-audit.md)); interrupted
+builds and Ctrl+C are covered by source tests only.
 
 Daily FullMag development uses the direct Docker Compose workspace from
 Windows PowerShell or Linux/WSL. Windows uses Docker Desktop's `desktop-linux`
@@ -278,9 +401,10 @@ with that call publishes an interactive workspace waiting for Compute.
 
 The selected checkout must be a Git-registered checkout of this project. Both
 services receive the same checkout as a read-only source bind. Frontend edits
-are picked up by Next.js HMR; `FULLMAG_WATCHPACK_POLLING_MS` defaults to `5000`
-milliseconds and can be set in the main checkout `.env` when Docker Desktop
-does not forward Windows file events reliably. Frontend dependencies, Next
+are picked up by Next.js HMR. On an ext4/xfs/btrfs checkout (Linux/WSL) the
+frontend watches natively (`watch_mode=native`). Any other source mount,
+including a Windows 9p bind, polls every `FULLMAG_WATCHPACK_POLLING_MS`
+(default `5000`, range `250`–`10000`) set in the main checkout `.env`. Frontend dependencies, Next
 output, and watcher state stay in the group cache rather than being written to
 the checkout.
 
@@ -343,9 +467,10 @@ pass; this command still requires a real runtime activation test.
 
 ### Ports, isolation, and persistence
 
-The frontend binds one manually chosen loopback port, such as
-`127.0.0.1:3197`, to its container port `8080`; it never auto-selects a free
-port, so each active group needs a unique operator-selected port. The main
+The frontend binds one loopback port, such as `127.0.0.1:3197`, to its
+container port `8080`. An explicit port is used as given; without one, a new
+group prefers the configured port and otherwise takes a free one from a stable
+per-project rotation, and an existing group keeps the port it pins. The main
 checkout uses Compose project `fullmag-master`; a registered worktree uses
 `fullmag-worktree-<worktree_id>`. The backend publishes no host port; the
 frontend reaches it as `backend:8081` over the private bridge network for the

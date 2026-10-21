@@ -595,7 +595,7 @@ host Windows 11 + Docker Desktop WSL2, 40 CPU / ~196 GiB VM, jedno GPU (`89-real
 | R0.5 | nieśledzone pliki runtime trafiają do builda | `c8d4e7123` |
 | R0.6 | edycja tylko `docs/` lub frontendu używa gotowego pakietu (`cache-hit`) | `c8d4e7123` |
 | R0.9 | przerwany kandydat `building` jest odrzucany przy następnym starcie | `c8d4e7123`, `0cfb8ba82` |
-| R0.10 | polling Watchpack 2000 ms; nadzór API toleruje 120 s, pełna sonda co 30 s | `c8d4e7123` |
+| R0.10 | nadzór API toleruje 120 s, pełna sonda co 30 s. Polling Watchpack 2000 ms został cofnięty do 5000 ms: każdy działający frontend odpytuje drzewo przez ten sam serwer 9p (ok. 30% CPU na bezczynny frontend), a HMR nie przyspieszył | `c8d4e7123`, PR 229 |
 
 Poza planem, wymagane do uruchomienia jakiejkolwiek grupy na tym hoście:
 

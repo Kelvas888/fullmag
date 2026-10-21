@@ -195,12 +195,20 @@ LOG_TAIL_POLL_SECONDS = 0.25
 LOG_TAIL_STOP_TIMEOUT_SECONDS = 1.0
 WATCHPACK_POLLING_ENV = "FULLMAG_WATCHPACK_POLLING_MS"
 # Docker Desktop's Windows source mount pays a metadata round trip for each
-# Watchpack poll. Two seconds keeps edit-to-HMR latency short while still
+# Watchpack poll. Every running frontend polls through the same 9p server,
+# so five seconds keeps idle groups from saturating it while still
 # bounding scans of the watched app/src/public/scripts trees; operators can
 # provide a validated workspace override.
-WATCHPACK_POLLING_DEFAULT_MS = 2000
+WATCHPACK_POLLING_DEFAULT_MS = 5000
 WATCHPACK_POLLING_MIN_MS = 250
 WATCHPACK_POLLING_MAX_MS = 10000
+# A source bind on a local Linux filesystem (for example a WSL ext4 checkout)
+# delivers inotify events, so Watchpack watches natively and nothing polls the
+# tree. The Windows 9p/drvfs bind delivers none and keeps polling.
+WATCH_MODE_ENV = "FULLMAG_WATCHPACK_MODE"
+WATCH_MODES = frozenset(("polling", "native"))
+NATIVE_WATCH_FILESYSTEMS = frozenset(("ext4", "xfs", "btrfs"))
+MOUNTINFO_PATH = Path("/proc/self/mountinfo")
 NODE_FS_THREADS_ENV = "UV_THREADPOOL_SIZE"
 # Keep asynchronous filesystem work bounded for the two-CPU frontend.  The
 # live Windows source mount is backed by Docker Desktop's 9p bridge, where a
@@ -1298,16 +1306,45 @@ def _watchpack_polling_ms(environment: Mapping[str, str] | None = None) -> int:
     return _validate_watchpack_polling_ms(int(raw.strip(), 10))
 
 
+def _source_watch_mode(mountinfo: Path | None = None) -> str:
+    """Return ``native`` only when the source bind is a local Linux filesystem.
+
+    Only a mount exactly at the source root (the service's bind) counts; the
+    last such entry is the visible one. A missing, unreadable or unknown mount
+    keeps polling, which works on every bind.
+    """
+    try:
+        lines = (mountinfo or MOUNTINFO_PATH).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "polling"
+    target = str(SOURCE_CONTAINER_ROOT)
+    filesystem = None
+    for line in lines:
+        mount_fields, separator, source_fields = line.partition(" - ")
+        fields, described = mount_fields.split(), source_fields.split()
+        if separator and len(fields) >= 5 and described and fields[4] == target:
+            filesystem = described[0]
+    return "native" if filesystem in NATIVE_WATCH_FILESYSTEMS else "polling"
+
+
+def _validate_watch_mode(value: object) -> str:
+    if value not in WATCH_MODES:
+        _fail(f"{WATCH_MODE_ENV} must be one of {sorted(WATCH_MODES)}; got {value!r}")
+    return value  # type: ignore[return-value]
+
+
 def _safe_environment(
     inputs: DevelopmentInputs,
     *,
     watchpack_polling_ms: int | None = None,
+    watch_mode: str | None = None,
 ) -> dict[str, str]:
     polling_ms = (
         _watchpack_polling_ms()
         if watchpack_polling_ms is None
         else _validate_watchpack_polling_ms(watchpack_polling_ms)
     )
+    mode = _source_watch_mode() if watch_mode is None else _validate_watch_mode(watch_mode)
     environment = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": str(HOME_ROOT),
@@ -1356,6 +1393,10 @@ def _safe_environment(
         value = os.environ.get(name)
         if value:
             environment[name] = value
+    environment[WATCH_MODE_ENV] = mode
+    if mode == "native":
+        # Without WATCHPACK_POLLING Watchpack uses inotify.
+        del environment["WATCHPACK_POLLING"]
     return environment
 
 
@@ -1364,12 +1405,14 @@ def _receipt_base(
     previous: Mapping[str, Any] | None,
     *,
     watchpack_polling_ms: int | None = None,
+    watch_mode: str | None = None,
 ) -> dict[str, Any]:
     polling_ms = (
         _watchpack_polling_ms()
         if watchpack_polling_ms is None
         else _validate_watchpack_polling_ms(watchpack_polling_ms)
     )
+    mode = _source_watch_mode() if watch_mode is None else _validate_watch_mode(watch_mode)
     receipt: dict[str, Any] = {
         "schema": RECEIPT_SCHEMA,
         "source_root": inputs.source_root,
@@ -1386,6 +1429,7 @@ def _receipt_base(
         "log_path": str(LOG_PATH),
         "tool_probe_timeout_seconds": TOOL_TIMEOUT_SECONDS,
         "watchpack_polling_ms": polling_ms,
+        "watch_mode": mode,
         "uv_threadpool_size": NODE_FS_THREADS,
         "node_max_old_space_size_mib": NODE_MAX_OLD_SPACE_SIZE_MIB,
         "inspector": {
@@ -2245,11 +2289,15 @@ def _start_next(
     if type(receipt_polling_ms) is not int:
         _fail("frontend receipt is missing the bounded Watchpack polling value")
     watchpack_polling_ms = _validate_watchpack_polling_ms(receipt_polling_ms)
+    # Receipts written before the watch mode existed always polled.
+    watch_mode = _validate_watch_mode(receipt.get("watch_mode", "polling"))
     if receipt.get("uv_threadpool_size") != NODE_FS_THREADS:
         _fail("frontend receipt is missing the pinned Node filesystem thread count")
     app_root = inputs.workspace_root / "apps" / "control-room"
     command = _next_command()
-    environment = _safe_environment(inputs, watchpack_polling_ms=watchpack_polling_ms)
+    environment = _safe_environment(
+        inputs, watchpack_polling_ms=watchpack_polling_ms, watch_mode=watch_mode
+    )
     inspector_log_offset = _log_file_offset(log_stream)
     inspector = receipt.get("inspector")
     inspector_configuration_error: FrontendDevError | None = None
@@ -2270,6 +2318,7 @@ def _start_next(
         url=f"http://localhost:{inputs.host_port}",
         internal_port=INTERNAL_PORT,
         inspector_bind=f"{INSPECTOR_BIND_HOST}:{INSPECTOR_BIND_PORT}",
+        watch_mode=watch_mode,
         watchpack_polling_ms=watchpack_polling_ms,
         uv_threadpool_size=NODE_FS_THREADS,
         log_path=LOG_PATH,
@@ -2358,6 +2407,7 @@ def _start_next(
         elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
         url=f"http://localhost:{inputs.host_port}",
         inspector_bind=f"{INSPECTOR_BIND_HOST}:{INSPECTOR_BIND_PORT}",
+        watch_mode=watch_mode,
         watchpack_polling_ms=watchpack_polling_ms,
         uv_threadpool_size=NODE_FS_THREADS,
         log_path=LOG_PATH,
@@ -2385,15 +2435,16 @@ def start(stopping_event: Any) -> FrontendHandle:
     _validate_live_directories(inputs)
     _freeze_inputs(inputs, allow_generated=allow_generated)
     watchpack_polling_ms = _watchpack_polling_ms()
+    watch_mode = _source_watch_mode()
     runtime_lock = _acquire_runtime_lock()
     try:
         _rotate_log_if_needed(runtime_lock)
         node_modules_target = _prepare_managed_frontend(inputs)
         tool_environment = _safe_environment(
-            inputs, watchpack_polling_ms=watchpack_polling_ms
+            inputs, watchpack_polling_ms=watchpack_polling_ms, watch_mode=watch_mode
         )
         receipt = _receipt_base(
-            inputs, history, watchpack_polling_ms=watchpack_polling_ms
+            inputs, history, watchpack_polling_ms=watchpack_polling_ms, watch_mode=watch_mode
         )
         receipt.update(
             state="starting",
@@ -2405,6 +2456,7 @@ def start(stopping_event: Any) -> FrontendHandle:
             "frontend_start",
             tool_probe_budget_seconds=TOOL_TIMEOUT_SECONDS,
             install_budget_seconds=INSTALL_TIMEOUT_SECONDS,
+            watch_mode=watch_mode,
             watchpack_polling_ms=watchpack_polling_ms,
             log_path=LOG_PATH,
             url=f"http://localhost:{inputs.host_port}",

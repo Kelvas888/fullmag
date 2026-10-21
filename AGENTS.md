@@ -84,6 +84,14 @@ grupę. Wszystkie buildy odbywają się w jej ramach; osobny kontener budujący 
 grupą, hostowy kompilator i dawny runner są niedozwolone. Nie uruchamiaj zastępczej
 trasy, jeżeli launcher nie realizuje tego kontraktu — popraw właściwą receptę.
 
+Grupy DEV mają być niezależne ([ADR 0067](docs/adr/0067-docker-dev-group-isolation.md)):
+każda ma statyczny budżet `FULLMAG_DEV_*` i własny port. Nowa zmiana schematu lub
+polityki stanu DEV jest lokalna dla jednej grupy albo wstecznie zgodna; żadna
+migracja DEV nie zatrzymuje cudzych grup. Wyjątek do czasu wdrożenia ledgera per
+grupa: wszystkie grupy współdzielą globalny host ledger, więc migracja jego
+polityki wymaga skoordynowanego zatrzymania konsumentów `/host-ledger`, a API
+może jednocześnie działać tylko w jednej grupie z danym kodem (rotacja readiness).
+
 Rozróżniaj dwa etapy: `just docker-dev-toolchain` buduje **obraz zależności**
 przez `docker compose build` / BuildKit, przypięty do projektu tego checkoutu.
 Nie kompiluje aplikacji i nie uruchamia trzeciej stałej usługi. Jego postęp jest
