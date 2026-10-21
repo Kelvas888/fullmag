@@ -607,6 +607,15 @@ def _native_failure_probe_cas(probe: Mapping[str, object]) -> tuple[object, ...]
     )
 
 
+def _native_build_mismatch_failure(error):
+    if not isinstance(error,str):
+        return False
+    lines=[line.strip() for line in error.removeprefix('runtime CLI failed: ').strip().splitlines() if line.strip()]
+    if lines and lines[0].startswith('[fullmag] version: '):
+        lines.pop(0)
+    return len(lines)==1 and lines[0].removeprefix('Error: ')=='native service target/build mismatch; attach refused'
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root',type=Path,required=True)
@@ -630,10 +639,11 @@ def main():
     logs = (log_result.stdout + log_result.stderr).decode('utf-8','replace')
     if 'Startup or runtime failed; admission closed:' not in logs:
         raise BuildControlError('This backend incarnation has no confirmed failed-admission event')
-    script='''import hashlib,json,pathlib,sys,os
+    script='''import hashlib,json,sys,os
 sys.path.insert(0,'/opt/fullmag')
 import runtime_service
-raw=runtime_service._bounded_regular(runtime_service.process_receipt_path(runtime_service.canonical_paths()),'failed process receipt')
+paths=runtime_service.canonical_paths()
+raw=runtime_service._bounded_regular(runtime_service.process_receipt_path(paths),'failed process receipt')
 document=json.loads(raw)
 if isinstance(document.get('service_owner'),dict):
  runtime_service._validate_terminal_owner(document['service_owner'],state='ready',name='failed admission service owner')
@@ -660,11 +670,20 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
         and isinstance(receipt.get('error'), str)
         and receipt['error'].startswith(API_START_FAILURE_ERROR_PREFIX)
     )
+    pre_native_failure = (
+        _native_build_mismatch_failure(receipt.get('error'))
+        and type(receipt.get('api_pid')) is int and receipt['api_pid'] > 0
+        and not any(key in receipt for key in (
+            'service_owner', 'terminal_service_owner', 'owner_pin', 'startup_activation'))
+        and observed.get('startup_enabled') != '1'
+        and observed.get('managed_receipt_key') is None
+        and observed.get('legacy_activation_marker_exists') is False
+    )
     # A pre-marker startup failure is proven by its own drained-owner receipt
     # after stop; its post-stop evidence (terminal_service_owner present)
     # contradicts the native shutdown_unknown receipt, so the routes are
     # mutually exclusive.
-    if receipt.get('state') == 'failed_outcome_retained' and not pre_marker_failure:
+    if receipt.get('state') == 'failed_outcome_retained' and not pre_marker_failure and not pre_native_failure:
         native_probe = _capture_native_failure_probe(args.container_id)
         if 'service_owner' in receipt:
             native_failure = _validate_native_after_ready_failure_probe(
@@ -684,14 +703,22 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
     if (observed['sha256']!=args.process_receipt_sha256 or observed['api_pid_exists']
             or receipt.get('schema')!='fullmag.docker-process-tree.v1'
             or receipt.get('state')!='failed_outcome_retained'
-            or not isinstance(receipt.get('api_exit_code'),int) or receipt.get('runtime_pid') is not None
-            or (native_failure is None and not pre_marker_failure)):
+            or type(receipt.get('api_exit_code')) is not int or receipt.get('runtime_pid') is not None
+            or (native_failure is None and not pre_marker_failure and not pre_native_failure)):
         raise BuildControlError('Failed admission is not proven; no process will be stopped')
     from docker_build_control import toolchain_configuration
     config=toolchain_configuration(selected,identity)
     control=BuildControl(identity,config['services']['fem-gpu-toolchain']['build']['args']['FULLMAG_CUDA_BASE_IMAGE'])
-    if native_failure is None and not pre_marker_failure:
+    if native_failure is None and not pre_marker_failure and not pre_native_failure:
         raise BuildControlError('Failed admission has no native proof before stop')
+    if pre_native_failure:
+        rechecked=json.loads(docker_capture('exec',args.container_id,'/usr/local/bin/python3','-B','-c',script).stdout)
+        current=json.loads(docker_capture('inspect',args.container_id).stdout)
+        if (rechecked!=observed or len(current)!=1 or current[0].get('Id')!=args.container_id
+                or current[0].get('Image')!=args.image_id
+                or current[0].get('State',{}).get('Running') is not True
+                or current[0].get('State',{}).get('StartedAt')!=actual['State']['StartedAt']):
+            raise BuildControlError('Pre-native failed admission changed before stop')
     if native_failure is not None:
         recheck_probe = _capture_native_failure_probe(args.container_id)
         if 'service_owner' in receipt:
@@ -713,6 +740,8 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
         native_failure = revalidated
     journal={'schema':'fullmag.stop-failed-admission.v1','state':'stopping-confirmed-failed-supervisor',
              'container_id':args.container_id,'image_id':args.image_id,'failure_receipt':observed}
+    if pre_native_failure:
+        journal['failure_kind'] = 'pre-native-build-mismatch'
     if native_failure is not None:
         journal.update(failure_kind=native_failure_kind, native_failure_probe=native_failure['probe'])
         if api_start_failure:
@@ -725,9 +754,11 @@ print(json.dumps({'sha256':hashlib.sha256(raw).hexdigest(),'receipt':document,'a
     path='verification/stop-failed-'+args.container_id+'.json'
     control.write(path,journal)
     docker_capture('stop','--time','60',args.container_id,timeout=90)
-    after=json.loads(docker_capture('inspect',args.container_id).stdout)[0]
-    if after.get('State',{}).get('Running'):
+    after=json.loads(docker_capture('inspect',args.container_id).stdout)
+    if (len(after)!=1 or after[0].get('Id')!=args.container_id or after[0].get('Image')!=args.image_id
+            or after[0].get('State',{}).get('Running') is not False):
         raise BuildControlError('Failed supervisor is still running; no retry was attempted')
+    after=after[0]
     if native_failure is not None:
         terminal = control.read('runtime-control/runtime-service/process-tree.json')
         from docker_volume_stop_unadmitted import _control_bytes

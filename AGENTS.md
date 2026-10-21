@@ -1,3 +1,28 @@
+# Ogólne instrukcje dla agentów
+- Be concise, direct, and minimalist. Avoid unnecessary ceremony.
+- Follow KISS and YAGNI. Apply DRY only when duplication creates real maintenance cost; avoid premature abstractions and trivial helpers.
+- Make the smallest change that fully solves the problem. Preserve the existing code style and avoid unrelated refactors.
+- Write self-explanatory code. Use comments and docstrings only for non-obvious reasons, constraints, or unusual behavior.
+- Keep documentation short and practical. Create extensive documentation only when requested or clearly valuable.
+- Prefer a coherent rewrite over accumulating patches on a failing design, but first establish that rewriting is safer and cheaper than a targeted fix.
+- Verify behavior against the installed tools, dependencies, types, and source code. Consult current authoritative documentation when needed instead of guessing. State when verification is unavailable.
+- Push back on incorrect assumptions, needless complexity, and weak technical choices. Ask focused questions when missing context prevents a sound decision.
+- Run the narrowest meaningful checks or tests. Briefly report results and remaining uncertainty.
+
+## Functional Communication
+
+- Be concise and direct across interfaces, code, logs, and documentation. Use conventional language; omit decorative prose, slogans, filler, and redundant explanations.
+- Make labels and messages useful for identifying actions, understanding state, making decisions, or resolving problems.
+- Prefer meaningful names, concrete values, previews, diffs, and observable results over explanatory prose. Explain non-obvious reasons or constraints where relevant.
+- Keep routine output quiet. Report meaningful changes, failures, and required actions; reserve additional detail for verbose or debug modes.
+- Preserve accessibility, useful diagnostics, and operational visibility. Brevity must not hide information needed to act safely or troubleshoot.
+
+## Simplified Technical English (STE)
+
+- In replies and docs, use simple words, active voice, short, complete sentences, and consistent technical terms.
+- Use one topic per paragraph and one action per instruction step. Write instructions as direct commands, with required conditions before the action.
+- Preserve code, commands, paths, identifiers, and verbatim quotations.
+
 # Fullmag — instrukcje dla agentów
 
 ## Zakres i sposób pracy

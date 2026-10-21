@@ -574,6 +574,63 @@ def _verify_host_ledger_volume(control, operation, descriptor, image):
     docker_capture("rm", actual["Id"])
 
 
+def _restore_host_ledger(control, operation, document, profile, selected, storage_root):
+    """Reattach an existing ledger after VM reboot without creating storage."""
+    import copy
+    import docker_host_ledger as ledger
+    previous = profile["host_receipt"]
+    expected = {key: profile[key] for key in ("project_id", "mount_root", "backing_image")}
+    ledger._validate_host_receipt(previous, expected)
+    frozen = document["services"]["backend"].get("x-fullmag-host-ledger-volume")
+    if frozen is not None:
+        descriptor = ledger.host_volume_descriptor(control.project, profile["project_id"],
+            profile["mount_root"], frozen.get("host_receipt"))
+        if frozen != descriptor or descriptor["filesystem_uuid"] != previous["filesystem_uuid"]:
+            raise BuildControlError("Retained ledger filesystem identity differs")
+        ledger._validate_host_volume(json.loads(docker_text("volume", "inspect", descriptor["name"])), descriptor)
+    helper = selected / "scripts/lib/docker_host_ledger.sh"
+    helper_bytes = _session_host().read_owned_regular(helper, maximum=ledger.MAX_HELPER_BYTES)
+    relative = operation["root"] + "/docker_host_ledger.sh"
+    control.write_bytes(relative, helper_bytes)
+    spec = copy.deepcopy(profile["maintenance_document"])
+    arguments = ["restore", previous["filesystem_uuid"]]
+    if os.name != "nt":
+        from docker_wsl_bind import resolve_daemon_bind, _marker
+        daemon_storage = resolve_daemon_bind(control, operation, Path(storage_root), profile["image_id"])
+        arguments.extend([daemon_storage, _marker(Path(storage_root))["sha256"]])
+        frozen_storage = profile["environment"]["FULLMAG_HOST_LEDGER_STORAGE_ROOT"]
+        for mount in spec["services"]["host-ledger-maintenance"].get("volumes", []):
+            if mount.get("type") == "bind" and mount.get("target") == frozen_storage:
+                mount["source"] = str(storage_root)
+    spec["services"]["host-ledger-maintenance"]["entrypoint"] = [
+        "/bin/bash", "/fullmag-build-control/" + relative]
+    control.write(operation["root"] + "/ledger-restore-compose.json", spec)
+    name = "fullmag-ledger-restore-" + operation["receipt"]["attempt"]
+    output = compose_capture(spec, "run", "--name", name, "--no-deps", "host-ledger-maintenance",
+                             *arguments, timeout=360)
+    actual = json.loads(docker_text("inspect", name))
+    if (len(actual) != 1 or actual[0].get("Image") != profile["image_id"]
+            or actual[0].get("State", {}).get("ExitCode") != 0
+            or actual[0].get("State", {}).get("Running")
+            or actual[0].get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != control.project):
+        raise BuildControlError("Ledger restore helper identity/outcome differs; retained")
+    if _session_host().read_owned_regular(helper, maximum=ledger.MAX_HELPER_BYTES) != helper_bytes:
+        raise BuildControlError("Ledger restore helper changed during maintenance")
+    fresh = ledger._parse_json_lines(output.decode(), ledger.HOST_RECEIPT_SCHEMA)
+    ledger._validate_host_receipt(fresh, expected)
+    if fresh["filesystem_uuid"] != previous["filesystem_uuid"] or fresh.get("created_image"):
+        raise BuildControlError("Restored ledger filesystem identity differs; resources retained")
+    control.write(operation["root"] + "/ledger-restore-receipt.json", fresh)
+    control.write(operation["root"] + "/ledger-restore-log.json", {"log": docker_text("logs", name, combined=True)})
+    docker_capture("rm", actual[0]["Id"])
+    if frozen is not None:
+        current = ledger.host_volume_descriptor(control.project, profile["project_id"], profile["mount_root"], fresh)
+        if current["name"] != frozen["name"]:
+            raise BuildControlError("Restored ledger volume identity differs")
+        _verify_host_ledger_volume(control, operation, current, profile["image_id"])
+    profile["host_receipt"] = fresh
+
+
 def _host_ledger(control, operation, layout, selected, image):
     import docker_host_ledger as ledger
     values = ledger._resolve_values(layout)
@@ -2742,8 +2799,12 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         operation["receipt"].update(operator_probe_record)
         operation["receipt"].update(state="resuming-observation", state_root=str(state),
             backend_volumes=previous["backend_volumes"], frontend_volume=previous["frontend_volume"])
+        if restart_backend:
+            _restore_host_ledger(control, operation, document, ledger_profile, selected, layout["storage_root"])
         if not actual["frontend"]["State"]["Running"]:
             _frontend(control, operation, selected, state, args.port, image)
+            from docker_frontend_restart import recover_stopped_frontend
+            recover_stopped_frontend(control, operation, actual["frontend"], document, selected, args.port)
             compose_capture(document, "start", "frontend", timeout=90)
         if restart_backend:
             operation["daemon_pending"] = True

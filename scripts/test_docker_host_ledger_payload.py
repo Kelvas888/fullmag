@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -240,10 +241,12 @@ def _write_python_shim(directory: Path) -> Path:
     return shim
 
 
-def _run_ensure_probe(root: Path, python_shim: Path) -> subprocess.CompletedProcess[str]:
+def _run_ensure_probe(root: Path, python_shim: Path, *, action: str = "ensure",
+                      expected_uuid: str = "") -> subprocess.CompletedProcess[str]:
     """Run the real ensure/admission functions against a mocked host namespace."""
     source = HELPER.read_text(encoding="utf-8")
     functions = [
+        _shell_function(source, "assert_safe_path", "validate_inputs"),
         _shell_function(source, "read_mount_state", "verify_image_file"),
         _shell_function(source, "verify_image_file", "verify_loop_identity"),
         _shell_function(source, "verify_loop_identity", "verify_owner_marker"),
@@ -252,6 +255,7 @@ def _run_ensure_probe(root: Path, python_shim: Path) -> subprocess.CompletedProc
         _shell_function(source, "inspect_unmounted_mount_root", "inspect_recovery_mount_root"),
         _shell_function(source, "inspect_recovery_mount_root", "admit_existing_mount"),
         _shell_function(source, "admit_existing_mount", "acquire_lock"),
+        _shell_function(source, "verify_restore_image", "storage_marker_sha256"),
         _shell_function(source, "reject_associated_loop", "allocate_and_mount"),
         _shell_function(source, "allocate_and_mount", "write_owner_marker"),
         _shell_function(source, "write_owner_marker", "set_runtime_ownership"),
@@ -263,6 +267,7 @@ def _run_ensure_probe(root: Path, python_shim: Path) -> subprocess.CompletedProc
         """
         set -Eeuo pipefail
         fail() { echo "$*" >&2; exit 2; }
+        PROBE_ACTION="$1"
         PROFILE='host-ledger-v1'
         PROJECT_ID='fullmag-test'
         BACKING_IMAGE="$2/backing.ext4"
@@ -301,7 +306,7 @@ def _run_ensure_probe(root: Path, python_shim: Path) -> subprocess.CompletedProc
                 losetup)
                     case "${1:-}" in
                         --associated) return 1 ;;
-                        --find) printf '/dev/loop7\\n'; return 0 ;;
+                        --find) echo 'probe:loop-allocation' >&2; printf '/dev/loop7\\n'; return 0 ;;
                         *) return 99 ;;
                     esac
                     ;;
@@ -347,6 +352,10 @@ def _run_ensure_probe(root: Path, python_shim: Path) -> subprocess.CompletedProc
                         printf '%s\\n' "${IMAGE_LABEL}"
                         return 0
                     fi
+                    if [[ "${1:-}" == '-s' && "${2:-}" == 'TYPE' ]]; then
+                        printf 'ext4\\n'
+                        return 0
+                    fi
                     return 99
                     ;;
                 find)
@@ -365,7 +374,10 @@ def _run_ensure_probe(root: Path, python_shim: Path) -> subprocess.CompletedProc
         validate_inputs() { :; }
         validate_storage_marker() { :; }
         acquire_lock() { :; }
-        create_backing_image_if_needed() { verify_image_file; }
+        create_backing_image_if_needed() {
+            [[ "${PROBE_ACTION}" != "restore" ]] || fail "restore entered the image creation path"
+            verify_image_file
+        }
         emit_receipt() { printf 'ready\\n'; }
         EXPECTED_UUID='11111111-1111-1111-1111-111111111111'
         """
@@ -375,14 +387,14 @@ def _run_ensure_probe(root: Path, python_shim: Path) -> subprocess.CompletedProc
         """
 
         PATH="__PYTHON_SHIM_DIR__:${PATH}"
-        main ensure
+        main "$1" "${3:-}"
         """
     ).replace("__PYTHON_SHIM_DIR__", str(python_shim.parent))
     with tempfile.TemporaryDirectory() as directory:
         script = Path(directory) / "host-ledger-ensure-probe.sh"
         script.write_text(probe, encoding="utf-8")
         return subprocess.run(
-            ["bash", str(script), "ensure", str(root)],
+            ["bash", str(script), action, str(root), expected_uuid],
             text=True,
             capture_output=True,
         )
@@ -481,6 +493,143 @@ def _assert_persistent_mount_admission() -> None:
             raise AssertionError("fresh mount received an empty owner token")
 
 
+def _assert_restore_requires_owned_existing_filesystem() -> None:
+    """Run the restore dispatcher and real admission code without Docker/mounts."""
+    expected_uuid = "11111111-1111-1111-1111-111111111111"
+    with tempfile.TemporaryDirectory() as directory:
+        parent = Path(directory)
+        shim = _write_python_shim(parent)
+        for scenario in ("valid", "missing-image", "foreign-uuid", "invalid-uuid", "missing-marker", "foreign-marker", "missing-runtime"):
+            root = parent / scenario
+            mount = root / "mount"
+            (mount / "lost+found").mkdir(parents=True)
+            if scenario != "missing-runtime":
+                (mount / "ledger").mkdir()
+                (mount / "ledger" / "preserved-data").write_bytes(b"keep")
+            backing = root / "backing.ext4"
+            if scenario != "missing-image":
+                _create_sparse_backing(backing)
+            marker = mount / ".fullmag-host-ledger-owner.json"
+            marker_bytes = _owner_payload(
+                project_id="foreign" if scenario == "foreign-marker" else "fullmag-test",
+                backing_image=str(backing), mount_root=str(mount))
+            if scenario != "missing-marker":
+                marker.write_bytes(marker_bytes)
+                marker.chmod(0o444)
+            pinned_uuid = "22222222-2222-2222-2222-222222222222" if scenario == "foreign-uuid" else expected_uuid
+            if scenario == "invalid-uuid":
+                pinned_uuid = "00000000-0000-0000-0000-000000000000"
+            before = backing.stat() if backing.exists() else None
+            result = _run_ensure_probe(root, shim, action="restore", expected_uuid=pinned_uuid)
+            if (result.returncode == 0) != (scenario == "valid"):
+                raise AssertionError(f"restore {scenario}: unexpected outcome {result.returncode}: {result.stderr}")
+            if scenario in {"missing-image", "foreign-uuid", "invalid-uuid"} and "probe:loop-allocation" in result.stderr:
+                raise AssertionError(f"restore {scenario} allocated a loop before proving the backing UUID")
+            if before is None:
+                if backing.exists():
+                    raise AssertionError("restore created a missing backing image")
+            else:
+                after = backing.stat()
+                if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                    raise AssertionError(f"restore {scenario} changed the backing image")
+            if scenario == "missing-marker":
+                if marker.exists():
+                    raise AssertionError("restore published a missing owner marker")
+            elif marker.read_bytes() != marker_bytes:
+                raise AssertionError(f"restore {scenario} replaced an existing owner marker")
+            if scenario == "missing-runtime":
+                if (mount / "ledger").exists():
+                    raise AssertionError("restore created a missing runtime directory")
+            elif (mount / "ledger" / "preserved-data").read_bytes() != b"keep":
+                raise AssertionError(f"restore {scenario} changed existing ledger data")
+
+
+def _assert_storage_alias_restore() -> None:
+    source = HELPER.read_text(encoding="utf-8")
+    functions = "\n".join((
+        _shell_function(source, "assert_safe_path", "validate_inputs"),
+        _shell_function(source, "validate_storage_marker", "read_mount_state"),
+        _shell_function(source, "verify_image_file", "verify_loop_identity"),
+        _shell_function(source, "verify_restore_image", "storage_marker_sha256"),
+        _shell_function(source, "storage_marker_sha256", "restore_storage_alias"),
+        _shell_function(source, "restore_storage_alias", "create_backing_image_if_needed"),
+    ))
+    probe = r'''
+set -Eeuo pipefail
+fail() { echo "$*" >&2; exit 2; }
+STORAGE_ROOT="/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu-22.04/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+CURRENT="$1/current"
+OLD="$1/old"
+IMAGE_NAME='fullmag-host-ledger-v1.ext4'
+IMAGE_SIZE_BYTES=134217728
+IMAGE_LABEL='fullmag-host-v1'
+BACKING_IMAGE="${STORAGE_ROOT}/build-volumes/${IMAGE_NAME}"
+MOCK_ALIAS_BOUND=0
+translated() {
+  if [[ "$1" == "${STORAGE_ROOT}" || "$1" == "${STORAGE_ROOT}/"* ]]; then
+    if [[ "${MOCK_ALIAS_BOUND}" == "1" ]]; then printf '%s%s' "${CURRENT}" "${1#"${STORAGE_ROOT}"}"
+    else printf '%s%s' "${OLD}" "${1#"${STORAGE_ROOT}"}"; fi
+  elif [[ "$1" == "${STORAGE_ROOT%/*}" ]]; then printf '%s' "${OLD%/*}"
+  else printf '%s' "$1"; fi
+}
+host_root_path() { translated "$1"; }
+host() {
+  local operation="$1" argument
+  shift
+  case "${operation}" in
+    blkid)
+      if [[ "$2" == UUID ]]; then printf '11111111-1111-1111-1111-111111111111\n'
+      elif [[ "$2" == TYPE ]]; then printf 'ext4\n'
+      elif [[ "$2" == LABEL ]]; then printf '%s\n' "${IMAGE_LABEL}"; else return 99; fi
+      ;;
+    findmnt) return 1 ;;
+    mount)
+      [[ "$1" == --bind && "$2" == "${CURRENT}" && "$3" == "${STORAGE_ROOT}" ]] || return 99
+      echo 'probe:storage-bind' >&2
+      MOCK_ALIAS_BOUND=1
+      ;;
+    test|stat|find|mkdir)
+      local arguments=()
+      for argument in "$@"; do arguments+=("$(translated "${argument}")"); done
+      command "${operation}" "${arguments[@]}"
+      ;;
+    *) echo "unexpected host operation: ${operation}" >&2; return 99 ;;
+  esac
+}
+'''
+    probe += functions + '\nrestore_storage_alias "${CURRENT}" "$2" "$3"\n'
+    for scenario in ("valid", "absent-target", "wrong-sha", "wrong-uuid", "missing-image", "nonempty-target", "symlink-target"):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = root / "current"
+            (current / "build-volumes").mkdir(parents=True)
+            marker = json.dumps({"schema": "fullmag_storage_v1", "project_root": "/home/operator/fullmag"}).encode()
+            (current / ".fullmag-storage.json").write_bytes(marker)
+            if scenario != "missing-image":
+                _create_sparse_backing(current / "build-volumes/fullmag-host-ledger-v1.ext4")
+            old = root / "old"
+            if scenario == "symlink-target":
+                old.symlink_to(current, target_is_directory=True)
+            elif scenario != "absent-target":
+                old.mkdir()
+                if scenario == "nonempty-target":
+                    (old / "foreign-data").write_bytes(b"keep")
+            script = root / "probe.sh"
+            script.write_text(probe)
+            expected_uuid = "22222222-2222-2222-2222-222222222222" if scenario == "wrong-uuid" else "11111111-1111-1111-1111-111111111111"
+            marker_sha = "0" * 64 if scenario == "wrong-sha" else hashlib.sha256(marker).hexdigest()
+            result = subprocess.run(["bash", str(script), str(root), expected_uuid, marker_sha], capture_output=True, text=True)
+            expected_success = scenario in {"valid", "absent-target"}
+            if (result.returncode == 0) != expected_success:
+                raise AssertionError(f"alias restore {scenario}: {result.returncode}: {result.stderr}")
+            if ("probe:storage-bind" in result.stderr) != expected_success:
+                raise AssertionError(f"alias restore {scenario} crossed the mount boundary unexpectedly")
+            if scenario == "nonempty-target" and (old / "foreign-data").read_bytes() != b"keep":
+                raise AssertionError("alias restore changed foreign target data")
+            if (current / ".fullmag-storage.json").read_bytes() != marker:
+                raise AssertionError("alias restore changed the storage marker")
+
+
 def main() -> int:
     _assert_inline_python_parses()
     _run_mount_receipt_probe()
@@ -503,6 +652,8 @@ def main() -> int:
         if temporary.exists():
             raise AssertionError("temporary owner marker was not removed")
     _assert_persistent_mount_admission()
+    _assert_restore_requires_owned_existing_filesystem()
+    _assert_storage_alias_restore()
     print("host-ledger owner marker payload roundtrip: PASS")
     return 0
 

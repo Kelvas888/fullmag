@@ -192,9 +192,17 @@ class HostLedgerTests(unittest.TestCase):
         with self.assertRaises(ledger.HostLedgerError):
             ledger.validate_container(backend, profile, docker)
 
-    def test_fresh_receipt_loop_mismatch_is_rejected_before_volume_inspection(self):
+    def test_fresh_receipt_accepts_loop_reallocation_for_the_same_filesystem(self):
         backend, profile, _, docker, calls = self._volume_ledger_fixture()
         profile["host_receipt"] = {**profile["host_receipt"], "loop_device": "/dev/loop99"}
+        result = ledger.validate_container(backend, profile, docker)
+        self.assertEqual(result["loop_device"], "/dev/loop99")
+        self.assertIn(("volume", "inspect", profile["daemon_volume"]["name"]), calls)
+
+    def test_fresh_receipt_rejects_changed_filesystem_before_volume_inspection(self):
+        backend, profile, _, docker, calls = self._volume_ledger_fixture()
+        profile["host_receipt"] = {**profile["host_receipt"],
+            "filesystem_uuid": "22222222-2222-2222-2222-222222222222"}
         with self.assertRaisesRegex(ledger.HostLedgerError, "fresh maintenance"):
             ledger.validate_container(backend, profile, docker)
         self.assertEqual(calls, [])

@@ -44,6 +44,28 @@ class ContainerRecoveryTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def test_inspected_stopped_legacy_frontend_can_be_recreated_without_owner_tmpfs(self):
+        image = "sha256:" + "4" * 64
+        authorization = {"old_image_id": image, "services": {
+            "backend": {"container_id": "2" * 64}, "frontend": {"container_id": "3" * 64}}}
+        records = [{"Id": str(index) * 64, "Image": image,
+                    "Config": {"Labels": {"com.docker.compose.project": "fullmag-master",
+                                          "com.docker.compose.service": service}},
+                    "State": {"Running": False, "Pid": 0},
+                    "NetworkSettings": {"Networks": {"fullmag-master_fullmag": {}}}}
+                   for service, index in (("backend", 2), ("frontend", 3))]
+        def capture(*args, **kwargs):
+            return SimpleNamespace(stdout=json.dumps(records if args[0] == "inspect" else [{"Config": {}}]).encode())
+        with (patch.object(recovery, "docker_capture", side_effect=capture),
+              patch("docker_volume_dev._assert_private_restart_network"),
+              patch("docker_volume_dev._validate_retained_service") as validate):
+            self.assertEqual(recovery._inspect_pair(authorization, "fullmag-master", {}), tuple(records))
+            self.assertEqual(validate.call_count, 2)
+            self.assertTrue(all(call.kwargs["allow_legacy_frontend"] for call in validate.call_args_list))
+            records[1]["State"]["Running"] = True
+            with self.assertRaisesRegex(recovery.ContainerRecoveryError, "remain stopped"):
+                recovery._inspect_pair(authorization, "fullmag-master", {})
+
     def test_operator_authorization_binds_prior_journal_not_shutdown_receipt(self):
         value = recovery.validate_operator_authorization(self.operator())
         self.assertEqual(value["prior_ready_owner_proof_sha256"], "5" * 64)
@@ -175,6 +197,29 @@ class ContainerRecoveryTests(unittest.TestCase):
         self.assertEqual(json.loads(argv[-1]), compose["services"]["backend"]["x-fullmag-host-ledger-volume"])
         self.assertEqual(volume["Options"]["device"],
                          compose["services"]["backend"]["x-fullmag-host-ledger-volume"]["device_alias"])
+
+    def test_fresh_ledger_verification_updates_only_operational_loop(self):
+        import docker_host_ledger as ledger
+        compose, backend, _ = self.ledger_volume_fixture()
+        frozen = compose["services"]["backend"]["x-fullmag-host-ledger-volume"]
+        original = copy.deepcopy(frozen)
+        control = SimpleNamespace(project=compose["name"], volume="control", _recovery_attempt="a" * 32)
+        spec = {"name": control.project, "volumes": {"build-control": {"name": control.volume, "external": True}},
+                "services": {"host-ledger-maintenance": {"image": backend["Image"], "entrypoint": [
+                    "/bin/bash", "/fullmag-build-control/development/attempts/" + "a" * 32 + "/docker_host_ledger.sh"]}}}
+        fresh = {**frozen["host_receipt"], "loop_device": "/dev/loop19", "state": "validated"}
+        with patch.object(recovery, "_control_json", return_value=(spec, recovery._canonical(spec))), \
+             patch.object(recovery, "compose_capture", return_value=json.dumps(fresh).encode()) as capture:
+            current = recovery._fresh_ledger_descriptor(control, backend, frozen)
+            self.assertEqual(current["loop_device"], "/dev/loop19")
+            self.assertEqual(current["name"], frozen["name"])
+            self.assertEqual(current["options"], frozen["options"])
+            self.assertEqual(frozen, original)
+            self.assertEqual(capture.call_args.args[1:], ("run", "--rm", "--no-deps", "host-ledger-maintenance", "verify"))
+            fresh["filesystem_uuid"] = "22222222-2222-4222-8222-222222222222"
+            capture.return_value = json.dumps(fresh).encode()
+            with self.assertRaisesRegex(recovery.ContainerRecoveryError, "filesystem identity"):
+                recovery._fresh_ledger_descriptor(control, backend, frozen)
 
     def test_volume_proof_refusal_stops_helper_before_storage_snapshot(self):
         import docker_host_ledger as ledger

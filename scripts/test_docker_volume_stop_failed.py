@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import ast
+import copy
+import hashlib
+import json
+from subprocess import CompletedProcess
+import tempfile
 import importlib.util
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+from docker_build_control import BuildControlError
 
 
 MODULE_PATH = Path(__file__).with_name("docker_volume_stop_failed.py")
@@ -381,6 +388,163 @@ class NativeFailedStopTests(unittest.TestCase):
         os_mock.readlink.side_effect = PermissionError("exe denied")
         with self.assertRaisesRegex(RuntimeError, "cannot inspect private process namespace"):
             self._extract_native_processes_live(os_mock)()
+
+
+class StopFailedAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.source=Path(self.temporary.name)
+        self.container='a'*64
+        self.image='sha256:'+'b'*64
+        self.digest='c'*64
+        self.project='fullmag-master'
+        self.actual={'Id':self.container,'Image':self.image,
+            'Config':{'Labels':{'com.docker.compose.project':self.project,
+                                'com.docker.compose.service':'backend'}},
+            'State':{'Running':True,'StartedAt':'2026-10-20T12:00:00Z'}}
+        self.receipt={'schema':'fullmag.docker-process-tree.v1','state':'failed_outcome_retained',
+            'api_pid':100,'api_exit_code':-15,
+            'error':'runtime CLI failed: [fullmag] version: 0.1.0 (build abc)\nError: native service target/build mismatch; attach refused'}
+        self.observed={'sha256':self.digest,'receipt':self.receipt,'api_pid_exists':False,
+            'startup_enabled':None,'managed_receipt_key':None,'legacy_activation_marker_exists':False}
+        self.control=Mock()
+        self.calls=[]
+        self.failed_event=True
+
+    def docker(self,*args,**kwargs):
+        self.calls.append((args,kwargs))
+        stdout,stderr=b'',b''
+        if args[0]=='inspect':
+            actual=copy.deepcopy(self.actual)
+            if any(call[0][0]=='stop' for call in self.calls):
+                actual['State'].update(Running=False,ExitCode=0)
+            stdout=json.dumps([actual]).encode()
+        elif args[0]=='logs':
+            # The entrypoint publishes failed admission to stderr.
+            stderr=b'Startup or runtime failed; admission closed: target mismatch' if self.failed_event else b''
+        elif args[0]=='exec':
+            script=args[-1]
+            self.assertIn('runtime_service.process_receipt_path(paths)',script)
+            self.assertIn('runtime_service.canonical_paths()',script)
+            self.assertNotIn('/state/.fullmag/runtime-service/process-tree.json',script)
+            stdout=json.dumps(self.observed).encode()
+        elif args[0]!='stop':
+            self.fail(args)
+        return CompletedProcess(args,0,stdout,stderr)
+
+    def invoke(self):
+        argv=['stop-failed','--source-root',str(self.source),'--container-id',self.container,
+            '--image-id',self.image,'--process-receipt-sha256',self.digest]
+        with patch.object(stop.sys,'argv',argv), \
+             patch.object(stop.storage,'resolve_layout',return_value={}), \
+             patch.object(stop,'compose_project_identity',return_value={'project_name':self.project}), \
+             patch.object(stop,'validate_source_labels'), \
+             patch.object(stop,'docker_capture',side_effect=self.docker), \
+             patch.object(stop,'BuildControl',return_value=self.control), \
+             patch('docker_build_control.toolchain_configuration',return_value={
+                 'services':{'fem-gpu-toolchain':{'build':{'args':{'FULLMAG_CUDA_BASE_IMAGE':'immutable-helper'}}}}}), \
+             patch('builtins.print'):
+            return stop.main()
+
+    def test_exact_native_mismatch_stops_only_pinned_failed_supervisor(self):
+        self.assertEqual(self.invoke(),0)
+        stops=[call for call in self.calls if call[0][0]=='stop']
+        self.assertEqual(stops,[(('stop','--time','60',self.container),{'timeout':90})])
+        self.assertEqual(self.control.write.call_count,2)
+        self.assertEqual(self.control.write.call_args.args[1]['state'],'stopped-confirmed')
+        logs=next(call for call in self.calls if call[0][0]=='logs')
+        self.assertEqual(logs[0][1:4],('--since',self.actual['State']['StartedAt'],'--tail'))
+
+    def test_existing_api_readiness_failure_uses_upstream_native_proof(self):
+        self.receipt['error']='API binding did not become ready: connection refused'
+        native=api_start_failure_probe()
+        native['process_receipt']=self.receipt
+        native['process_receipt_sha256']=self.digest
+        owner_raw=json.dumps(native['failed_owner']).encode()
+        native['failed_owner_sha256']=hashlib.sha256(owner_raw).hexdigest()
+        self.control.read.return_value={**self.receipt,'state':'shutdown_unknown'}
+        with patch.object(stop,'_capture_native_failure_probe',return_value=native), \
+             patch('docker_volume_stop_unadmitted._control_bytes',return_value=owner_raw):
+            self.assertEqual(self.invoke(),0)
+
+    def test_pre_native_failure_rejects_receipt_or_incarnation_drift_before_stop(self):
+        original_docker=self.docker
+        for changed in ('receipt','incarnation'):
+            with self.subTest(changed=changed):
+                self.calls=[]
+                def drift(*args,**kwargs):
+                    result=original_docker(*args,**kwargs)
+                    if args[0]=='exec' and sum(call[0][0]=='exec' for call in self.calls)==2 and changed=='receipt':
+                        result.stdout=json.dumps({**self.observed,'sha256':'f'*64}).encode()
+                    if args[0]=='inspect' and sum(call[0][0]=='inspect' for call in self.calls)==2 and changed=='incarnation':
+                        actual=json.loads(result.stdout)
+                        actual[0]['State']['StartedAt']='2026-10-20T13:00:00Z'
+                        result.stdout=json.dumps(actual).encode()
+                    return result
+                with patch.object(self,'docker',side_effect=drift):
+                    with self.assertRaisesRegex(BuildControlError,'changed before stop'):
+                        self.invoke()
+                self.assertFalse(any(call[0][0]=='stop' for call in self.calls))
+        self.control.write.assert_not_called()
+
+
+    def test_unknown_or_extended_error_does_not_authorize_stop(self):
+        for error in ('unknown failure','service writer is busy',
+            'native service target/build mismatch; attach refused\nCaused by: unknown',
+            'prefix native service target/build mismatch; attach refused',
+            'native service target/build mismatch; attach refused extra',None):
+            with self.subTest(error=error):
+                self.calls=[]
+                self.receipt['error']=error
+                with self.assertRaises(BuildControlError):
+                    self.invoke()
+                self.assertFalse(any(call[0][0]=='stop' for call in self.calls))
+        self.control.write.assert_not_called()
+
+    def test_live_or_unknown_runtime_and_stale_receipt_never_stop(self):
+        changes=(('runtime_pid',123),('service_owner',{'state':'ready'}),('owner_pin','/owner.json'),
+                 ('api_exit_code',None),('api_exit_code',True),('state','ready'))
+        original=copy.deepcopy(self.receipt)
+        for field,value in changes:
+            with self.subTest(field=field,value=value):
+                self.calls=[]
+                self.receipt.clear()
+                self.receipt.update(original)
+                self.receipt[field]=value
+                with self.assertRaises(BuildControlError):
+                    self.invoke()
+                self.assertFalse(any(call[0][0]=='stop' for call in self.calls))
+        self.receipt.clear()
+        self.receipt.update(original)
+        for field,value in (('sha256','d'*64),('api_pid_exists',True)):
+            with self.subTest(field=field):
+                self.calls=[]
+                old=self.observed[field]
+                self.observed[field]=value
+                with self.assertRaises(BuildControlError):
+                    self.invoke()
+                self.assertFalse(any(call[0][0]=='stop' for call in self.calls))
+                self.observed[field]=old
+        self.control.write.assert_not_called()
+
+    def test_foreign_identity_and_missing_incarnation_log_never_stop(self):
+        for change in ('image','project','missing-log'):
+            with self.subTest(change=change):
+                self.calls=[]
+                actual=copy.deepcopy(self.actual)
+                if change=='image':
+                    self.actual['Image']='sha256:'+'f'*64
+                elif change=='project':
+                    self.actual['Config']['Labels']['com.docker.compose.project']='foreign'
+                else:
+                    self.failed_event=False
+                with self.assertRaises(BuildControlError):
+                    self.invoke()
+                self.assertFalse(any(call[0][0]=='stop' for call in self.calls))
+                self.actual=actual
+        self.control.write.assert_not_called()
+
 
 
 if __name__ == "__main__":

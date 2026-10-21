@@ -31,6 +31,7 @@ from docker_build_control import (
     canonical,
     control_read_script,
     docker_capture,
+    compose_capture,
     toolchain_configuration,
 )
 
@@ -41,6 +42,8 @@ from docker_build_control import (
 OPERATOR_AUTHORIZATION_SCHEMA = (
     "fullmag.docker-container-recovery-operator-authorization.v1"
 )
+COLD_JOURNAL_SCHEMA = "fullmag.docker-cold-resume-recovery-proof.v1"
+COLD_JOURNAL_STATE = "stopped-after-restart-build-mismatch"
 AUTHORIZATION_SCHEMA = "fullmag.docker-container-recovery-authorization.v1"
 REQUEST_SCHEMA = "runtime_service_container_recovery_request.v1"
 ATTESTATION_SCHEMA = "docker_namespace_teardown_attestation.v1"
@@ -198,10 +201,8 @@ def validate_operator_authorization(value: Mapping[str, object]) -> dict[str, ob
         "compose_project": project,
         "stop_journal_path": prior_stop_journal,
         "stop_journal_sha256": authorization["prior_stop_journal_sha256"],
-        # The stop journal is the immutable proof bundle.  It contains the
-        # last ready-owner reprobe and the empty-store/ledger observation.  Do
-        # not substitute the post-failure process receipt: that receipt only
-        # proves that the failed container reached shutdown_unknown.
+        # The journal binds the ready-owner proof and namespace/storage
+        # observations. A failure receipt alone does not prove prior Ready.
         "prior_ready_owner_proof_sha256": authorization["prior_stop_journal_sha256"],
         "services": {
             "backend": {
@@ -541,7 +542,7 @@ def _runtime_config(control: BuildControl) -> tuple[dict[str, object], bytes, st
     return config, raw, _sha256(raw)
 
 
-def _runtime_process_receipt(control: BuildControl) -> tuple[dict[str, object], bytes, str]:
+def _runtime_process_receipt(control: BuildControl, *, cold=False) -> tuple[dict[str, object], bytes, str]:
     receipt, raw = _control_json(
         control, f"{RUNTIME_CONTROL_RELATIVE}/runtime-service/process-tree.json"
     )
@@ -549,7 +550,9 @@ def _runtime_process_receipt(control: BuildControl) -> tuple[dict[str, object], 
         _fail("runtime-service process receipt is missing from the control volume")
     if receipt.get("schema") != "fullmag.docker-process-tree.v1":
         _fail("runtime-service process receipt schema differs from the image-owned schema")
-    if receipt.get("state") != "shutdown_unknown":
+    if cold:
+        _validate_cold_failure(receipt)
+    elif receipt.get("state") != "shutdown_unknown":
         _fail("container recovery requires the current shutdown_unknown process receipt")
     if "startup_activation" in receipt:
         _fail("container recovery cannot consume an internal startup activation receipt")
@@ -757,7 +760,34 @@ def _ledger_snapshot_mount(control, backend, compose):
             _fail("host-ledger source differs from the inspected volume mountpoint")
     except (ledger.HostLedgerError, TypeError, ValueError, KeyError) as error:
         _fail(f"host-ledger volume proof is unavailable: {error}")
+    if getattr(control, "_recovery_attempt", None) is not None:
+        descriptor = _fresh_ledger_descriptor(control, backend, descriptor)
     return f"type=volume,src={descriptor['name']},dst=/host-ledger,readonly,volume-nocopy", descriptor
+
+
+def _fresh_ledger_descriptor(control, backend, frozen):
+    import docker_host_ledger as ledger
+    attempt = control._recovery_attempt
+    spec, _ = _control_json(control, f"development/attempts/{attempt}/ledger-maintenance-compose.json")
+    if not isinstance(spec, Mapping):
+        _fail("recovery has no canonical retained ledger maintenance document")
+    service = spec.get("services", {}).get("host-ledger-maintenance", {})
+    if (spec.get("name") != control.project
+            or set(spec.get("services", {})) != {"host-ledger-maintenance"}
+            or service.get("image") != backend.get("Image")
+            or spec.get("volumes", {}).get("build-control") != {"name": control.volume, "external": True}
+            or service.get("entrypoint") != ["/bin/bash",
+                f"/fullmag-build-control/development/attempts/{attempt}/docker_host_ledger.sh"]):
+        _fail("recovery ledger maintenance document identity differs")
+    output = compose_capture(spec, "run", "--rm", "--no-deps", "host-ledger-maintenance", "verify", timeout=240)
+    fresh = ledger._parse_json_lines(output.decode(), ledger.HOST_RECEIPT_SCHEMA)
+    ledger._validate_host_receipt(fresh, {key: frozen[key] for key in
+        ("project_id", "mount_root", "backing_image")})
+    current = ledger.host_volume_descriptor(control.project, frozen["project_id"], frozen["mount_root"], fresh)
+    if any(current[key] != frozen[key] for key in
+           ("name", "options", "labels", "filesystem_uuid", "backing_image", "device_alias")):
+        _fail("fresh ledger verification changed the retained filesystem identity")
+    return current
 
 
 def _ledger_and_store_snapshot(
@@ -914,7 +944,7 @@ def _inspect_pair(
         if state.get("Running") is True or state.get("Pid") not in (0, None):
             _fail(f"pinned {service} must remain stopped before recovery")
         try:
-            _validate_retained_service(compose, item, service, image_config)
+            _validate_retained_service(compose, item, service, image_config, allow_legacy_frontend=True)
         except Exception as error:
             _fail(f"pinned {service} configuration or mount proof failed: {error}")
         result[service] = item
@@ -946,6 +976,17 @@ def _validate_pre_admission_stop_journal(
     if journal.get("attempt") != attempt:
         _fail("stop journal does not bind the exact development attempt")
     state = journal.get("state")
+    if journal.get("schema") == COLD_JOURNAL_SCHEMA:
+        if state != COLD_JOURNAL_STATE:
+            _fail("cold recovery journal has no confirmed stopped namespace")
+        for key in ("process_receipt_sha256", "config_sha256", "owner_sha256", "launch_sha256"):
+            if journal.get(key) != authorization.get(key):
+                _fail(f"cold recovery journal differs from authorization: {key}")
+        if (journal.get("backend_container_id") != authorization["backend_container_id"]
+                or journal.get("frontend_container_id") != authorization["frontend_container_id"]
+                or journal.get("image_id") != authorization["old_image_id"]):
+            _fail("cold recovery container identity differs from authorization")
+        return
     if state not in {"outcome-unknown", "stopped-confirmed"}:
         _fail("stop journal does not describe a recoverable stopped namespace")
     if (
@@ -999,6 +1040,191 @@ def _validate_pre_admission_stop_journal(
     runtime = _require_mapping(probe.get("runtime_service"), "outcome-unknown runtime service")
     if runtime.get("state") != "ready" or runtime.get("configured") is not True:
         _fail("outcome-unknown reprobe native runtime is not ready")
+
+
+def _validate_cold_failure(receipt):
+    state = receipt.get("state")
+    failed = dict(receipt)
+    if state == "shutdown_unknown":
+        if receipt.get("shutdown_error") != "no pinned runtime service owner was available for authenticated drain":
+            _fail("cold recovery terminal failure has no exact pre-native shutdown transition")
+        failed.pop("shutdown_error")
+        failed["state"] = "failed_outcome_retained"
+    elif "shutdown_error" in receipt:
+        _fail("cold recovery failure has an unexpected shutdown diagnostic")
+    error = receipt.get("error")
+    if not isinstance(error, str) or not error.startswith("runtime CLI failed: "):
+        _fail("cold recovery requires the native attach mismatch diagnostic")
+    lines = [line.strip() for line in error.removeprefix("runtime CLI failed: ").strip().splitlines()
+             if line.strip()]
+    if lines and lines[0].startswith("[fullmag] version: "):
+        lines.pop(0)
+    if (lines != ["Error: native service target/build mismatch; attach refused"]
+            or receipt.get("schema") != "fullmag.docker-process-tree.v1"
+            or state not in {"failed_outcome_retained", "shutdown_unknown"}
+            or type(receipt.get("api_exit_code")) is not int
+            or type(receipt.get("api_pid")) is not int or receipt["api_pid"] <= 0
+            or any(receipt.get(key) is not None for key in
+                   ("runtime_pid", "service_owner", "owner_pin", "startup_activation"))):
+        _fail("cold recovery requires a reaped API and failure before native attachment")
+    return failed
+
+
+def _cold_reference(control, reference, label):
+    reference = _require_mapping(reference, label)
+    path = _relative_control_path(reference.get("path"))
+    value, raw = _control_json(control, path)
+    if value is None or raw is None or _sha256(raw) != reference.get("sha256"):
+        _fail(f"cold recovery {label} changed")
+    return value
+
+
+def _validate_cold_evidence(control, journal, authorization, backend, frontend,
+                            owner, launch, config, receipt, storage_proof=None):
+    if journal.get("schema") != COLD_JOURNAL_SCHEMA:
+        _validate_process_receipt_owner(receipt, owner)
+        return
+    failed = _validate_cold_failure(receipt)
+    commit = owner.get("build_commit")
+    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None or set(commit) == {"0"}:
+        _fail("cold recovery ready owner has no complete build commit")
+    _require_sha(owner.get("build_snapshot"), "cold recovery ready build snapshot")
+    if (owner.get("state") != "ready" or launch.get("state") != "ready"
+            or launch.get("schema_version") != "runtime_service_launch.v1"
+            or launch.get("pid") != owner.get("pid") or config.get("target_id") != owner.get("target_id")):
+        _fail("cold recovery owner, launch and application target differ")
+    token = owner.get("owner_token")
+    if not isinstance(token, str) or REQUEST_ID_RE.fullmatch(token) is None:
+        _fail("cold recovery owner token is invalid")
+    ready_reference = journal.get("authenticated_ready_pin")
+    ready = _cold_reference(control, ready_reference, "authenticated ready pin")
+    if ready_reference.get("path") != f"{RUNTIME_CONTROL_RELATIVE}/runtime-services/docker-client-{token}.json":
+        _fail("cold recovery ready pin is not the canonical authenticated client pin")
+    def identity(value):
+        result = {key: item for key, item in value.items() if key != "heartbeat_at"}
+        children = value.get("children")
+        if not isinstance(children, list) or any(not isinstance(item, Mapping) for item in children):
+            _fail("cold recovery ready owner has invalid children")
+        result["children"] = sorted(children, key=_canonical)
+        return result
+    if ready.get("state") != "ready" or identity(ready) != identity(owner):
+        _fail("authenticated ready pin differs from the retained native owner")
+    historical = _cold_reference(control, journal.get("verified_receipt"), "historical verified receipt")
+    if (historical.get("state") != "succeeded"
+            or historical.get("schema") != "fullmag.docker-build-operation.v1"
+            or historical.get("phase") not in {"development", "iteration"}
+            or historical.get("compose_project") != control.project
+            or journal["verified_receipt"].get("path") !=
+                f"{historical.get('phase')}/attempts/{historical.get('attempt')}/terminal.json"
+            or historical.get("config_sha256") != authorization["compose_config_sha256"]
+            or historical.get("backend_container") != backend.get("Id")
+            or historical.get("frontend_container") != frontend.get("Id")
+            or historical.get("source_commit") != owner.get("build_commit")
+            or historical.get("source_snapshot_sha256") != owner.get("build_snapshot")):
+        _fail("historical verified receipt does not bind the ready owner and Docker pair")
+    stopped = _cold_reference(control, journal.get("managed_stop"), "managed failed stop")
+    observed = _require_mapping(stopped.get("failure_receipt"), "failed stop process observation")
+    if (stopped.get("schema") != "fullmag.stop-failed-admission.v1"
+            or stopped.get("state") != "stopped-confirmed"
+            or stopped.get("container_id") != backend.get("Id")
+            or stopped.get("image_id") != backend.get("Image")
+            or observed.get("api_pid_exists") is not False
+            or observed.get("receipt") != failed
+            or observed.get("sha256") != journal.get("pre_stop_process_receipt_sha256")):
+        _fail("managed failed stop does not prove the reaped pre-native API")
+    _require_sha(observed.get("sha256"), "managed stop pre-stop process SHA-256")
+    if failed == receipt and observed["sha256"] != authorization["process_receipt_sha256"]:
+        _fail("unchanged pre-native receipt differs from the managed stop raw SHA-256")
+    pins = [_container_pin(backend, "backend", control.project),
+            _container_pin(frontend, "frontend", control.project)]
+    observations = [_container_observation(container, pin, after=True)
+                    for container, pin in zip((backend, frontend), pins, strict=True)]
+    if journal.get("containers") != pins or journal.get("stopped_observations") != observations:
+        _fail("cold recovery Docker namespace proof changed")
+    if journal.get("application") != _application_pin(control, authorization["config_sha256"]):
+        _fail("cold recovery application pin changed")
+    if storage_proof is not None and journal.get("storage_proof") != storage_proof:
+        _fail("cold recovery accepted store or released ledger changed")
+
+
+def prepare_cold_resume_recovery(control, *, attempt, source_root, compose_config_sha256,
+                                 verified_receipt_path, stop_failed_path):
+    """Publish explicit authorization from existing proofs; never stop a service."""
+    if not isinstance(attempt, str) or ATTEMPT_RE.fullmatch(attempt) is None:
+        _fail("cold recovery development attempt is invalid")
+    _require_sha(compose_config_sha256, "cold recovery Compose SHA-256")
+    control._recovery_attempt = attempt
+    with control.operation("cold-recovery-authorization", {
+        "development_attempt": attempt, "source_root": str(source_root),
+        "compose_config_sha256": compose_config_sha256,
+    }) as operation:
+        terminal, _ = _control_json(control, f"development/attempts/{attempt}/terminal.json")
+        compose, _ = _control_json(control, f"development/attempts/{attempt}/compose.json")
+        if (not isinstance(terminal, Mapping) or not isinstance(compose, Mapping)
+                or terminal.get("attempt") != attempt or terminal.get("phase") != "development"
+                or terminal.get("inputs", {}).get("source_root") != str(source_root)
+                or compose.get("name") != control.project
+                or _sha256(_canonical(compose)) != compose_config_sha256):
+            _fail("cold recovery does not bind the selected development source/configuration")
+        def reference(path):
+            path = _relative_control_path(path)
+            value, raw = _control_json(control, path)
+            if value is None or raw is None:
+                _fail("cold recovery proof record is absent")
+            return {"path": path, "sha256": _sha256(raw)}, value
+        historical_ref, historical = reference(verified_receipt_path)
+        owner, _, owner_sha = _runtime_owner(control)
+        launch, _, launch_sha = _runtime_launch(control)
+        config, _, config_sha = _runtime_config(control)
+        process, _, process_sha = _runtime_process_receipt(control, cold=True)
+        token = owner.get("owner_token")
+        if not isinstance(token, str) or REQUEST_ID_RE.fullmatch(token) is None:
+            _fail("cold recovery owner token is invalid")
+        ready_ref, _ = reference(f"{RUNTIME_CONTROL_RELATIVE}/runtime-services/docker-client-{token}.json")
+        stopped_ref, stopped = reference(stop_failed_path)
+        request_id = str(uuid.uuid4())
+        journal_path = f"{RECOVERY_RELATIVE_ROOT}/{request_id}/cold-namespace-proof.json"
+        operator = {
+            "schema_version": OPERATOR_AUTHORIZATION_SCHEMA, "request_id": request_id,
+            "source_root": str(source_root), "compose_project": control.project,
+            "development_attempt": attempt, "compose_config_sha256": compose_config_sha256,
+            "backend_container_id": historical.get("backend_container"),
+            "frontend_container_id": historical.get("frontend_container"),
+            "old_image_id": compose.get("services", {}).get("backend", {}).get("image"),
+            "prior_stop_journal": journal_path, "prior_stop_journal_sha256": compose_config_sha256,
+            "process_receipt_sha256": process_sha, "config_sha256": config_sha,
+            "owner_sha256": owner_sha, "launch_sha256": launch_sha,
+        }
+        authorization = validate_operator_authorization(operator)
+        backend, frontend = _inspect_pair(authorization, control.project, compose)
+        _validate_owner_host(owner, backend)
+        pins = [_container_pin(backend, "backend", control.project),
+                _container_pin(frontend, "frontend", control.project)]
+        proof = _ledger_and_store_snapshot(control, backend, compose=compose)
+        journal = {
+            "schema": COLD_JOURNAL_SCHEMA, "state": COLD_JOURNAL_STATE, "attempt": attempt,
+            "backend_container_id": backend["Id"], "frontend_container_id": frontend["Id"],
+            "image_id": backend["Image"], "process_receipt_sha256": process_sha,
+            "pre_stop_process_receipt_sha256": stopped.get("failure_receipt", {}).get("sha256"),
+            "config_sha256": config_sha, "owner_sha256": owner_sha, "launch_sha256": launch_sha,
+            "authenticated_ready_pin": ready_ref, "verified_receipt": historical_ref,
+            "managed_stop": stopped_ref, "containers": pins,
+            "stopped_observations": [_container_observation(container, pin, after=True)
+                for container, pin in zip((backend, frontend), pins, strict=True)],
+            "application": _application_pin(control, config_sha), "storage_proof": proof,
+        }
+        _validate_cold_evidence(control, journal, authorization, backend, frontend,
+                                owner, launch, config, process, proof)
+        journal_sha, _ = _write_record(control, journal_path, journal)
+        operator["prior_stop_journal_sha256"] = journal_sha
+        validate_operator_authorization(operator)
+        authorization_path = f"{RECOVERY_RELATIVE_ROOT}/{request_id}/operator-authorization.json"
+        authorization_sha, _ = _write_record(control, authorization_path, operator)
+        operation["receipt"].update(state="succeeded", authorization_path=authorization_path,
+                                    authorization_sha256=authorization_sha, journal_sha256=journal_sha)
+        return {"recovery_authorization": authorization_path,
+                "recovery_authorization_sha256": authorization_sha,
+                "request_id": request_id}
 
 
 def _network_name(container: Mapping[str, object], service: str) -> str:
@@ -1343,6 +1569,7 @@ def _revalidate_recovery_boundary(
     the empty accepted store may have changed while BuildKit was running.
     """
 
+    control._recovery_attempt = attempt
     terminal, _ = _control_json(control, f"development/attempts/{attempt}/terminal.json")
     current_compose, compose_raw = _control_json(
         control, f"development/attempts/{attempt}/compose.json"
@@ -1394,15 +1621,14 @@ def _revalidate_recovery_boundary(
         )
         if backend.get("Id") != expected_backend.get("Id") or frontend.get("Id") != expected_frontend.get("Id"):
             _fail("prepared recovery manifest changed before the destructive boundary")
-    process_receipt, _, process_receipt_sha = _runtime_process_receipt(control)
+    process_receipt, _, process_receipt_sha = _runtime_process_receipt(control, cold=journal.get("schema") == COLD_JOURNAL_SCHEMA)
     if process_receipt_sha != expected_process_receipt_sha:
-        _fail("shutdown_unknown process receipt changed before the destructive boundary")
+        _fail("failed process receipt changed before the destructive boundary")
     owner, owner_raw, owner_sha = _runtime_owner(control)
     if owner_sha != authorization["owner_sha256"]:
         _fail("runtime-service owner changed before the destructive boundary")
     if _owner_identity_key(owner) != _owner_identity_key(expected_owner):
         _fail("runtime-service owner identity changed before the destructive boundary")
-    _validate_process_receipt_owner(process_receipt, owner)
     _validate_owner_host(owner, backend)
     launch, _, launch_sha = _runtime_launch(control)
     runtime_config, _, config_sha = _runtime_config(control)
@@ -1441,6 +1667,8 @@ def _revalidate_recovery_boundary(
     if backend.get("Id") != expected_backend.get("Id") or frontend.get("Id") != expected_frontend.get("Id"):
         _fail("Docker inspection identities changed before the destructive boundary")
     storage_proof = _ledger_and_store_snapshot(control, pinned_backend, compose=compose)
+    _validate_cold_evidence(control, journal, authorization, backend, frontend, owner,
+                            launch, runtime_config, process_receipt, storage_proof)
     for key in ("store_root_sha256", "ledger_root_sha256", "ledger_snapshot_sha256"):
         if storage_proof.get(key) != expected_storage.get(key):
             _fail(f"storage proof {key} changed before the destructive boundary")
@@ -1577,7 +1805,7 @@ def _recover_args(args: argparse.Namespace, selected: Path) -> argparse.Namespac
 
 
 def recover(args: argparse.Namespace) -> None:
-    """Run one explicit pre-admission container recovery.
+    """Run one explicitly authorized empty-container recovery.
 
     This function is the only mutating boundary. All proof construction before
     the development operation is read-only; once the operation is acquired,
@@ -1617,6 +1845,7 @@ def recover(args: argparse.Namespace) -> None:
     if expected_config_sha is not None and _require_sha(expected_config_sha, "Compose configuration SHA-256") != authorization["compose_config_sha256"]:
         _fail("recovery authorization does not bind the requested Compose configuration")
     attempt = authorization["development_attempt"]
+    control._recovery_attempt = attempt
     if getattr(args, "attempt", attempt) != attempt:
         _fail("recovery authorization does not bind the requested development attempt")
     if getattr(args, "source_root", None) is not None and str(args.source_root) != str(authorization["source_root"]):
@@ -1645,13 +1874,12 @@ def recover(args: argparse.Namespace) -> None:
     else:
         backend, frontend = transition["backend"], transition["frontend"]
         network_name = transition["network_name"]
-    process_receipt, process_receipt_raw, process_receipt_sha = _runtime_process_receipt(control)
+    process_receipt, process_receipt_raw, process_receipt_sha = _runtime_process_receipt(control, cold=journal.get("schema") == COLD_JOURNAL_SCHEMA)
     if process_receipt_sha != authorization["process_receipt_sha256"]:
-        _fail("current shutdown_unknown process receipt differs from operator authorization")
+        _fail("current failed process receipt differs from operator authorization")
     owner, owner_raw, observed_owner_sha = _runtime_owner(control)
     if observed_owner_sha != authorization["owner_sha256"]:
         _fail("runtime-service owner bytes differ from operator authorization")
-    _validate_process_receipt_owner(process_receipt, owner)
     _validate_owner_host(owner, backend)
     launch, launch_raw, launch_sha = _runtime_launch(control)
     runtime_config, runtime_config_raw, config_sha = _runtime_config(control)
@@ -1681,6 +1909,8 @@ def recover(args: argparse.Namespace) -> None:
     ):
         _fail("Docker container pins changed since authorization")
     storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose)
+    _validate_cold_evidence(control, journal, authorization, backend, frontend, owner,
+                            launch, runtime_config, process_receipt, storage_proof)
     manifest = transition["manifest"] if transition is not None else _manifest(
         authorization, engine_sha, backend, frontend, pins, device_release, device_mapping
     )
@@ -1843,6 +2073,9 @@ def recover(args: argparse.Namespace) -> None:
                 if transition is not None
                 else [backend, frontend]
             )
+            if any(item.get("Id") == frontend.get("Id") for item in remaining):
+                from docker_frontend_restart import recover_stopped_frontend
+                recover_stopped_frontend(control, operation, frontend, compose, selected, args.port)
             if remaining:
                 docker_capture("rm", *[item["Id"] for item in remaining], timeout=120)
             for pin in pins:
@@ -1951,6 +2184,7 @@ def recover(args: argparse.Namespace) -> None:
 __all__ = [
     "AUTHORIZATION_SCHEMA",
     "ATTESTATION_SCHEMA",
+    "COLD_JOURNAL_SCHEMA",
     "OPERATOR_AUTHORIZATION_SCHEMA",
     "REQUEST_SCHEMA",
     "ContainerRecoveryError",
@@ -1959,5 +2193,6 @@ __all__ = [
     "validate_runtime_authorization",
     "validate_request",
     "validate_attestation",
+    "prepare_cold_resume_recovery",
     "recover",
 ]

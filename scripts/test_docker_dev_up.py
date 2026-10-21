@@ -58,7 +58,7 @@ def _group(*, backend_running=True, frontend_running=True, healthy=True):
         },
         backend_id="c" * 64,
         frontend_id="d" * 64,
-        backend={"State": backend_state},
+        backend={"State": backend_state, "Config": {"Env": []}},
         frontend={"State": {"Running": frontend_running}},
     )
 

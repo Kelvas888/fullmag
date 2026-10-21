@@ -2413,13 +2413,25 @@ class DockerRuntimeContract(unittest.TestCase):
         for scenario in ("no_authorization", "wrong_hash", "profile_change", "corrupt_backup"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
-                paths = replace(service.RuntimePaths(), config=root / "runtime.json")
+                paths = replace(
+                    service.RuntimePaths(), state=root, storage=root,
+                    runs=root / "runs" / service.WORKTREE_ID,
+                    store=root / "runs" / service.WORKTREE_ID / "session-store",
+                    state_root=root / ".fullmag", config=root / "runtime.json",
+                )
                 old = self.host_profile_fixture(service)["configuration"]
                 expected = copy.deepcopy(old)
                 expected["host_execution"]["runtime_generation_sha256"] = "b" * 64
                 service._atomic_json(paths.config, old, "test config")
                 original = paths.config.read_bytes()
                 old_sha = hashlib.sha256(original).hexdigest()
+                self._write_authenticated_drain_fixture(service, paths)
+                if scenario in {"no_authorization", "wrong_hash"}:
+                    service._atomic_json(
+                        service.process_receipt_path(paths),
+                        {"schema": "fullmag.docker-process-tree.v1", "state": "shutdown_unknown"},
+                        "test unauthenticated drain",
+                    )
                 environment = {"FULLMAG_DOCKER_HOST_EXECUTION": "1"}
                 if scenario != "no_authorization":
                     environment["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = (

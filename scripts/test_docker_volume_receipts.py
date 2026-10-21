@@ -19,7 +19,7 @@ class VolumeReceiptTests(unittest.TestCase):
         import docker_volume_dev as dev
         import docker_dev
         import docker_build_control
-        document = {"name": "fullmag-master"}
+        document = {"name": "fullmag-master", "services": {"backend": {"environment": {}}}}
         digest = hashlib.sha256(dev.canonical(document)).hexdigest()
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory).resolve()
@@ -250,7 +250,8 @@ class VolumeReceiptTests(unittest.TestCase):
         import json
         from subprocess import CompletedProcess
         import docker_volume_dev as dev
-        control = BuildControl({'project_name': 'fullmag-master', 'worktree_id': 'owned', 'project_id': 'test-project', 'checkout_kind': 'master'}, 'sha256:' + 'a' * 64)
+        with mock.patch('docker_control_namespace.resolve_namespace'):
+            control = BuildControl({'project_name': 'fullmag-master', 'worktree_id': 'owned', 'project_id': 'test-project', 'checkout_kind': 'master'}, 'sha256:' + 'a' * 64)
         key = 'b' * 64
         name = 'fullmag-dev-frontend-v1-' + key[:24]
         labels = {k: v for k, v in control.labels.items() if k.startswith('org.fullmag.')}
@@ -264,7 +265,8 @@ class VolumeReceiptTests(unittest.TestCase):
 
     def test_build_control_accepts_canonical_bootstrap_labels_and_rejects_foreign_project(self):
         identity = {'project_name': 'fullmag-master', 'worktree_id': 'test-worktree', 'project_id': 'test-project', 'checkout_kind': 'master'}
-        control = BuildControl(identity, 'sha256:' + 'a' * 64)
+        with mock.patch('docker_control_namespace.resolve_namespace'):
+            control = BuildControl(identity, 'sha256:' + 'a' * 64)
         volume = {'Name': control.volume, 'Driver': 'local', 'Options': None,
                   'Labels': dict(control.shared_labels)}
         import json

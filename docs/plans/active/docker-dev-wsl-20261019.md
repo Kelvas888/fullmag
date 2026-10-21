@@ -241,3 +241,116 @@ Status: build, API, frontend HTTP, ekran startowy w przeglądarce oraz restart
 z cache zweryfikowane. HMR bez reloadu dokumentu, solver GPU,
 parytet fizyki, release oraz starszy orphan adapter volume DEV pozostają
 NOT VERIFIED. Nie wyciągać tych wniosków z dostępności GPU lub healthchecku.
+
+## Wznowienie po restarcie komputera — 20.10.2026
+
+HEAD użytkownika: `b686c7aa84fbc296d0752e64bbfdc2342ad2189a`.
+Obca zmiana `AGENTS.md` pozostaje poza zakresem poprawki.
+
+- Odtworzono brak UUID device i wygasły alias storage Docker Desktop.
+  `resume` przywraca wyłącznie istniejący obraz z zapisanym UUID. Alias może
+  zostać odtworzony tylko dla zweryfikowanego markera i istniejącego obrazu;
+  obcy mount, niepusty katalog lub niezgodny UUID blokuje operację.
+- Rzeczywista próba `resume/attempts/b80c401db87241f19da7a44a5af36e75`
+  przywróciła ledger oraz przebudowała aplikację z cache. UUID i dane zachowane.
+  Start ujawnił pozostałe blokady po niepotwierdzonym wyłączeniu:
+  frontend miał stary receipt procesu, a natywny OWNER pozostał Ready.
+- Frontend odzyskano kontrolowaną operacją
+  `frontend-restart/attempts/665a37ecf4b54b7c92f57954bc98d990`.
+  Oryginalny receipt i jego SHA zachowano przed publikacją stopped.
+  Sprawdzono zatrzymany private PID namespace, brak konsumentów wolumenu,
+  runtime flock i CAS. Cache, źródła i dane sesji nie zostały usunięte.
+- Backend odmówił attach do starego builda przed uruchomieniem native.
+  API zakończyło się kodem -15, runtime nie został uruchomiony.
+  Zarządzane stop-failed zakończyło dokładnie przypięty supervisor. Dowód:
+  `verification/stop-failed-3aee6529428c88080973ccc95b0602d28fcc8fa687391836eb82cdff84c5dba1.json`.
+  Poprawiono odczyt kanonicznej ścieżki i stderr oraz dodano wąską allowlistę
+  dokładnego błędu build mismatch; pozostałe nieznane błędy nadal blokują stop.
+- Zachowany pin Ready i OWNER mają zgodne tokeny, PID 165, host oraz stary
+  commit/snapshot. Pin: `runtime-control/runtime-services/`
+  `docker-client-dc79acbb-57a9-4fba-abf8-70dc4b6a1f93.json`.
+  LAUNCH.pid=165. Nie zmieniono OWNER ręcznie ani nie dopisano draina.
+  Jawne odzyskanie użyło istniejącego natywnego kontraktu i osobnego dowodu
+  hosta według ADR 0066, bez fabrykowania dawnego stop journal.
+- Autoryzacja `cold-recovery-authorization/attempts/7257f445219b4e37aa785f7c3d04ea4c`
+  przypięła autentyczny pin Ready, historyczny verified receipt, managed stop,
+  dokładne zatrzymane przestrzenie PID, pusty accepted store i zwolniony ledger.
+  Request ID: `53d07762-6414-43d4-b18e-993d673655e9`.
+  Native outcome: `empty_namespace_recovered`. Archiwum oryginalnego ownera:
+  `runtime-control/runtime-services/container-recovery/4eeb59dbc3e17601f2a622732af67085da16d6dc1a1f79af00fc48b77f8c0ca4/archive/manifest.json`.
+  Start `development/attempts/3c17a8ffb1ec43f48b555de02af45d72` przeszedł.
+- Próba restartu ujawniła porównywanie nowego LAUNCH i generacji zasobów
+  z archiwum poprzedniego ownera. Poprawiono replay po autentycznym drainie:
+  owner wymaga aktualnego SHA, LAUNCH pasującego PID, a dwa rekordy zasobów
+  dokładnej nowej generacji i niezmienionych ofert. Typy JSON pozostają ścisłe.
+  Archiwum, stare logi, locki i checkpointy nadal są sprawdzane bez wyjątków.
+  Rzeczywisty readonly probe na stanie Drained przeszedł:
+  `recovery-replay-probe/attempts/e38afd67bdd14096acf2a9268bd66944`.
+- Własna operacja `image-update-stop/1179d037fd3e469ea861becbeb355547`
+  zakończyła usługi prawdziwym drainem, ale host nie domknął jej receiptu.
+  Automatyczna kontrola odrzuciła ręczne oznaczenie sukcesu. Po jawnej zgodzie
+  użytkownika zamknięto wyłącznie tę operację jako `failed-confirmed`,
+  zachowując oryginalny receipt i dowody. Nie zmieniono native OWNER.
+- Końcowy start `development/attempts/0351d3f6f8a044dbb68f22d427967330`:
+  `succeeded`, exit 0. Config SHA:
+  `a870930bea656f9579ebd834f7ff6a3c5f0210315b5756d7f948961079832f5f`.
+  Obraz: `sha256:e876400b1af62a98664788873e8ddaad4da4116ea609639fca0b23954630b2c9`.
+  Profil `linux-native-v1` przeszedł admission, native owner Ready i API ready.
+  Nowe usługi nie zawierają jednorazowej autoryzacji recovery.
+- Końcowy idle restart `iteration/attempts/554e031322854324a62dae066a1cfe9e`:
+  `succeeded`, exit 0, `backend_package_cache_hit=true`, bez zmiany ID usług.
+  Backend: `b1674bb964022a4af490b63f903276f8281bd63374aeb43feab5cd7435caaf9d`.
+  Frontend: `9677dd8191b7c3bdc13375e1b5ffd8041cf298ada8bbcac8f36c76fb63930509`.
+  Obie usługi healthy; prywatne API `status=ok`, `active_session=false`.
+  URL: `http://127.0.0.1:3197`.
+- Zarządzane interpretowane regresje: 756 przypadków, exit 0, 23 skip,
+  10.076 s. Wąski zestaw hostowy: 85 przypadków, 2 skip. Payload helpera,
+  `bash -n` i `git diff --check` PASS. Nie kompilowano testów natywnych.
+  Receipt: `verification/interpreted-checks.json`; końcowe obserwacje:
+  `verification/reboot-resume-summary.json` w dotychczasowym control volume.
+
+Retencja: cache, obrazy, wolumeny, stare stany, sesje, wyniki i logi zachowano.
+Wycofano tylko dokładnie zidentyfikowane własne helpery po zachowaniu dowodów;
+nieudany helper ledgeru ma archiwum
+`verification/failed-ledger-helper-681949c25d1747d2a08ab200a9afe2ed.json`.
+Nie wykonano globalnego prune. Wolne miejsce VM: 923058319360 bajtów;
+ponowna ocena cache dopiero po wykazaniu zbędności konkretnych generacji.
+Skill `fullmag-build-stage-cleanup` nadal niedostępny; stosowano governance.
+
+Status: odzyskanie tego zimnego wznowienia, build, API oraz zwykły restart z cache
+zweryfikowane. Nie oznacza to automatycznego recovery dowolnego przerwanego runa
+lub nieznanego ownera. Solver GPU, fizyka, WebGL i release pozostają NOT VERIFIED.
+Zmiany są lokalne na `master`; bez nowego commita ani push.
+
+## Synchronizacja mastera — 20.10.2026
+
+- Na polecenie użytkownika pobrano `origin/master` (fork Kelvas888) oraz
+  `upstream/master` (MateuszZelent). Oba wskazały
+  `a63b50ca0c0c4b457f440b0ac276b483d282c555`.
+  Lokalny `master` zaktualizowano fast-forward o 89 commitów; wczorajszy
+  `b686c7aa84fbc296d0752e64bbfdc2342ad2189a` pozostaje jego przodkiem.
+- Pełna kopia 21 lokalnych plików sprzed aktualizacji pozostaje w stashu
+  `58c25d36b7e7fe10c498ed1cb2b1d143cf58d342`.
+  Użyto `stash apply`, bez usuwania kopii. Starszy stash także zachowano.
+  `.env` i obca zmiana `AGENTS.md` mają identyczne SHA jak przed aktualizacją.
+- Rozwiązano konflikty runtime, stop-failed i listy regresji, zachowując
+  nowe guardy upstream oraz obsługę zimnego wznowienia WSL. Replay korzysta
+  teraz z pełniejszej implementacji successor upstream z zachowaniem ścisłych
+  typów JSON i SHA bieżącego ownera. Legacy frontend dopuszczono wyłącznie
+  do kontrolowanego odtworzenia; nowy ephemeral owner nie wymaga zmiany
+  trwałej diagnostyki. Lokalną decyzję recovery przenumerowano na ADR 0066,
+  zachowując nowy upstream ADR 0065.
+- Przywrócono także lokalne testy stop-failed, których nazwa kolidowała z
+  nowym plikiem upstream. Dostosowano nieaktualne fixture namespace, mountów,
+  środowiska i komunikatu wycofanej trasy. Naprawiono pobrany błędny import
+  `docker_text` w `docker_worker_cgroup.py` przez adapter centralnego capture.
+- Wąskie sprawdzenie integracji: 108 testów PASS. Końcowe zarządzane
+  `docker-dev-control-checks`: 840 przypadków, 23 skip, 11.345 s, exit 0.
+  Receipt: `verification/interpreted-checks.json` w dotychczasowym control volume.
+  Brak nierozwiązanych konfliktów; indeks Git pusty. Nowe zmiany pozostają
+  lokalne, bez commita i push.
+
+Nie budowano obrazów ani nie restartowano aplikacji podczas synchronizacji.
+Działający backend nadal używa poprzedniego obrazu i buildu; start całego
+nowego mastera pozostaje NOT VERIFIED. Nie przenosić wcześniejszych dowodów
+runtime na nowe źródła. Dane użytkownika, wolumeny i cache zachowano.

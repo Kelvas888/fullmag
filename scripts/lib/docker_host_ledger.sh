@@ -141,9 +141,10 @@ validate_inputs() {
 }
 
 validate_storage_marker() {
-  host test -d "${STORAGE_ROOT}" || fail "resolved storage root is not a host directory: ${STORAGE_ROOT}"
-  host test ! -L "${STORAGE_ROOT}" || fail "resolved storage root is a symlink"
-  local marker="${STORAGE_ROOT}/.fullmag-storage.json"
+  local root="${1:-${STORAGE_ROOT}}"
+  host test -d "${root}" || fail "resolved storage root is not a host directory: ${root}"
+  host test ! -L "${root}" || fail "resolved storage root is a symlink"
+  local marker="${root}/.fullmag-storage.json"
   host test -f "${marker}" || fail "resolved storage marker is missing: ${marker}"
   host test ! -L "${marker}" || fail "resolved storage marker is a symlink"
   python3 -c 'import json, os, stat, sys
@@ -196,10 +197,11 @@ read_mount_state() {
 }
 
 verify_image_file() {
-  host test -f "${BACKING_IMAGE}" || fail "host ledger backing image is missing: ${BACKING_IMAGE}"
-  host test ! -L "${BACKING_IMAGE}" || fail "host ledger backing image is a symlink"
+  local image="${1:-${BACKING_IMAGE}}"
+  host test -f "${image}" || fail "host ledger backing image is missing: ${image}"
+  host test ! -L "${image}" || fail "host ledger backing image is a symlink"
   local size
-  size="$(host stat -c '%s' "${BACKING_IMAGE}")" || fail "cannot stat host ledger backing image"
+  size="$(host stat -c '%s' "${image}")" || fail "cannot stat host ledger backing image"
   [[ "${size}" == "${IMAGE_SIZE_BYTES}" ]] || fail "existing host ledger image has wrong size: ${size}"
 }
 
@@ -338,6 +340,70 @@ acquire_lock() {
   fi
 }
 
+verify_restore_image() {
+  local image="$1" expected_uuid="$2" observed_uuid observed_type observed_label
+  assert_safe_path retained_backing_image "${image}"
+  verify_image_file "${image}"
+  observed_uuid="$(host blkid -s UUID -o value "${image}")" || fail "cannot read retained host-ledger UUID"
+  [[ "${observed_uuid}" == "${expected_uuid}" ]] || fail "retained host-ledger backing UUID differs"
+  observed_type="$(host blkid -s TYPE -o value "${image}")" || fail "cannot read retained host-ledger filesystem type"
+  [[ "${observed_type}" == "ext4" ]] || fail "retained host ledger is not ext4"
+  observed_label="$(host blkid -s LABEL -o value "${image}")" || fail "cannot read retained host-ledger filesystem label"
+  [[ "${observed_label}" == "${IMAGE_LABEL}" ]] || fail "retained host-ledger filesystem label differs"
+}
+
+storage_marker_sha256() {
+  python3 -c 'import hashlib, os, stat, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= 16384:
+        raise SystemExit("storage marker is not one bounded regular file")
+    data = os.read(fd, 16385)
+    after = os.fstat(fd)
+    if len(data) != before.st_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise SystemExit("storage marker changed during read")
+    print(hashlib.sha256(data).hexdigest())
+finally:
+    os.close(fd)
+' "$(host_root_path "$1/.fullmag-storage.json")"
+}
+
+restore_storage_alias() {
+  local current="$1" expected_uuid="$2" expected_marker_sha="$3" marker_identity restored_identity existing_mount status parent entries
+  [[ "${STORAGE_ROOT}" =~ ^/mnt/host/wsl/docker-desktop-bind-mounts/[A-Za-z0-9][A-Za-z0-9._-]*/[0-9a-f]{64}$ ]] || fail "retained storage root is not a bounded Desktop alias"
+  assert_safe_path retained_storage_alias "${STORAGE_ROOT}"
+  [[ "${expected_marker_sha}" =~ ^[0-9a-f]{64}$ ]] || fail "storage alias restore requires the pinned marker SHA-256"
+  assert_safe_path current_storage_root "${current}"
+  [[ "${current}" != "/" ]] || fail "current storage cannot be the filesystem root"
+  validate_storage_marker "${current}"
+  [[ "$(storage_marker_sha256 "${current}")" == "${expected_marker_sha}" ]] || fail "current storage marker digest differs"
+  verify_restore_image "${current}/build-volumes/${IMAGE_NAME}" "${expected_uuid}"
+  marker_identity="$(host stat -c '%d:%i' "${current}/.fullmag-storage.json")" || fail "cannot inspect current storage marker identity"
+  if existing_mount="$(host findmnt -rn --mountpoint "${STORAGE_ROOT}" -o TARGET 2>/dev/null)"; then
+    # Idempotent only for the exact same marker inode. Never replace a mount.
+    restored_identity="$(host stat -c '%d:%i' "${STORAGE_ROOT}/.fullmag-storage.json")" || fail "existing storage alias has no marker"
+    [[ "${restored_identity}" == "${marker_identity}" && "$(storage_marker_sha256 "${STORAGE_ROOT}")" == "${expected_marker_sha}" ]] || fail "existing storage alias belongs to different data"
+    return 0
+  else
+    status=$?
+    [[ "${status}" == "1" ]] || fail "storage alias mount state is unknown"
+  fi
+  if host test -e "${STORAGE_ROOT}"; then
+    host test -d "${STORAGE_ROOT}" || fail "retained storage alias is not a directory"
+    entries="$(host find "${STORAGE_ROOT}" -mindepth 1 -maxdepth 1 -printf x -quit)" || fail "cannot inspect retained storage alias"
+    [[ -z "${entries}" ]] || fail "retained storage alias is not empty"
+  else
+    parent="$(dirname -- "${STORAGE_ROOT}")"
+    host test -d "${parent}" || fail "retained storage alias parent is missing"
+    host mkdir -- "${STORAGE_ROOT}" || fail "cannot create retained storage alias mountpoint"
+  fi
+  host mount --bind "${current}" "${STORAGE_ROOT}" || fail "cannot restore retained storage alias"
+  restored_identity="$(host stat -c '%d:%i' "${STORAGE_ROOT}/.fullmag-storage.json")" || fail "restored storage alias has no marker"
+  [[ "${restored_identity}" == "${marker_identity}" && "$(storage_marker_sha256 "${STORAGE_ROOT}")" == "${expected_marker_sha}" ]] || fail "restored storage alias identity differs"
+  verify_restore_image "${BACKING_IMAGE}" "${expected_uuid}"
+}
+
 create_backing_image_if_needed() {
   if host test -e "${BACKING_IMAGE}" || host test -L "${BACKING_IMAGE}"; then
     verify_image_file
@@ -391,7 +457,9 @@ allocate_and_mount() {
   read_mount_state
   verify_image_file
   verify_loop_identity
-  host mkdir -p "${LEDGER_ROOT}" || fail "cannot create host-ledger runtime child"
+  if [[ "${1:-}" != "existing" ]]; then
+    host mkdir -p "${LEDGER_ROOT}" || fail "cannot create host-ledger runtime child"
+  fi
   host test ! -L "${LEDGER_ROOT}" || fail "host-ledger runtime child is a symlink"
 }
 
@@ -540,8 +608,18 @@ trap cleanup EXIT
 
 main() {
   local action="${1:-}"
-  case "${action}" in prepare|ensure|verify) ;; *) fail "usage: $0 {prepare|ensure|verify}" ;; esac
+  local expected_uuid="${2:-}"
+  case "${action}" in
+    prepare|ensure|verify) ;;
+    restore)
+      [[ $# -ge 2 && $# -le 4 && "${expected_uuid}" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ && "${expected_uuid}" != "00000000-0000-0000-0000-000000000000" ]] || fail "restore requires the retained filesystem UUID"
+      ;;
+    *) fail "usage: $0 {prepare|ensure|verify|restore EXPECTED_UUID}" ;;
+  esac
   validate_inputs
+  if [[ "${action}" == "restore" && -n "${3:-}" && "$3" != "${STORAGE_ROOT}" ]]; then
+    restore_storage_alias "$3" "${expected_uuid}" "${4:-}"
+  fi
   validate_storage_marker
   read_mount_state
   case "${action}" in
@@ -562,6 +640,24 @@ main() {
       acquire_lock shared
       verify_current_mount
       emit_receipt validated 0
+      ;;
+    restore)
+      # Existing storage is mandatory. Check again under the same exclusive
+      # lock before allocating a loop; restoration never creates/formats it.
+      verify_image_file
+      acquire_lock exclusive
+      verify_image_file
+      verify_restore_image "${BACKING_IMAGE}" "${expected_uuid}"
+      read_mount_state
+      if [[ "${MOUNT_ACTIVE}" != "1" ]]; then
+        allocate_and_mount existing
+      fi
+      [[ "${FILESYSTEM_UUID}" == "${expected_uuid}" ]] || fail "restored host-ledger mount UUID differs"
+      # A retained image must already own its marker and runtime directory.
+      # Never use the fresh-image adoption/owner-publication path here.
+      verify_current_mount
+      emit_receipt validated 0
+      SUCCESS=1
       ;;
     ensure)
       acquire_lock exclusive

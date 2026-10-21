@@ -1285,7 +1285,7 @@ def validate_container(document: Mapping[str, Any] | list[Mapping[str, Any]], pr
             "mount_root": expected_mount, "backing_image": profile_values.get("backing_image")})
         descriptor = host_volume_descriptor(project, profile_values.get("project_id"), expected_mount,
             frozen.get("host_receipt"))
-        if any(fresh.get(key) != descriptor[key] for key in ("loop_device", "filesystem_uuid", "backing_image")):
+        if any(fresh.get(key) != descriptor[key] for key in ("filesystem_uuid", "backing_image")):
             raise HostLedgerError("backend host-ledger device identity differs from fresh maintenance receipt")
         if profile_values["daemon_volume"] != descriptor:
             raise HostLedgerError("backend host-ledger volume descriptor differs from canonical identity")

@@ -124,6 +124,9 @@ odtworzenia usług; sam restart zachowuje przypięty obraz.
 
 `docker-dev-resume` wznawia obserwację konkretnego potwierdzonego nieudanego
 startu; opcja `restart_backend=true` może uruchomić zachowany zatrzymany backend, również po wcześniej udanym starcie.
+Po restarcie komputera użyj tej opcji. Launcher przywraca istniejący ledger
+o zapisanym UUID przed startem usług. W WSL sprawdza bieżące mapowanie storage
+i odtwarza utracony alias Dockera; nie tworzy nowego ledgeru ani sesji.
 `docker-dev-recreate-volume` wymaga zatrzymanego backendu i dokładnych pinów
 próby/konfiguracji. Zachowuje wolumeny; opcja `fresh_state=true` tworzy nowy root
 sesji, pozostawiając poprzedni. Nie powtarza automatycznie aktywacji Solve.
