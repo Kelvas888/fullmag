@@ -4392,6 +4392,10 @@ def _retained_operation(
             "backing_image": environment["FULLMAG_HOST_LEDGER_BACKING_IMAGE"],
             "host_receipt": control.read(previous_root + "/host-ledger.json"),
             "maintenance_document": control.read(previous_root + "/ledger-maintenance-compose.json")}
+        # Fail before the lease and any stop if the drained receipt could not
+        # be read once the backend exits.
+        from docker_volume_stop_unadmitted import _preflight_terminal_process_receipt
+        _preflight_terminal_process_receipt(actual["backend"], control)
         with control.operation("iteration", {"source_root": str(selected), "image_id": image,
                                             "attempt": args.attempt, "config_sha256": args.config_sha256,
                                             **operator_probe_record}) as operation:
