@@ -122,6 +122,7 @@ def _browser_qa_reconciliation_fixture(
     browser_absent=False,
     retain_evidence=False,
     retain_terminal=False,
+    browser_exit_code=23,
 ):
     selected = ROOT.resolve()
     identity = {"project_id": "fullmag", "worktree_id": "fixture", "checkout_kind": "worktree"}
@@ -170,7 +171,7 @@ def _browser_qa_reconciliation_fixture(
             "Status": "running" if browser_running else "exited",
             "Running": browser_running,
             "OOMKilled": False,
-            "ExitCode": 0 if browser_running else 23,
+            "ExitCode": 0 if browser_running else browser_exit_code,
             "FinishedAt": "" if browser_running else "2026-10-20T10:00:00Z",
         },
         "RestartCount": 0,
@@ -627,7 +628,7 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
         qa = self.qa
         case = _browser_qa_reconciliation_fixture(qa, browser_running=True)
         with _mock_browser_qa_reconciliation(qa, case):
-            with self.assertRaisesRegex(qa.BuildControlError, "exact stopped failed browser"):
+            with self.assertRaisesRegex(qa.BuildControlError, "exact stopped browser"):
                 qa.reconcile_browser_qa(
                     case["control"], case["selected"], case["identity"], case["args"],
                 )
@@ -698,6 +699,21 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
         self.assertEqual(published["browser_container_id"], case["browser_id"])
         self.assertEqual(case["control"].active_values, [None])
         self.assertEqual(case["calls"]["wait"], [case["helper_id"]])
+
+    def test_reconcile_browser_qa_accepts_terminal_zero_exit_as_lost_output(self):
+        qa = self.qa
+        case = _browser_qa_reconciliation_fixture(qa, browser_exit_code=0)
+        with _mock_browser_qa_reconciliation(qa, case):
+            qa.reconcile_browser_qa(
+                case["control"], case["selected"], case["identity"], case["args"],
+            )
+
+        published = json.loads(case["calls"]["cas"][0][1])
+        self.assertEqual(published["state"], "failed-confirmed")
+        self.assertTrue(published["output_lost"])
+        self.assertEqual(published["exit_code"], 0)
+        self.assertEqual(published["verification"], "NOT VERIFIED")
+        self.assertNotEqual(published["state"], "succeeded")
 
     def test_reconcile_browser_qa_released_replay_requires_active_marker_to_stay_absent(self):
         qa = self.qa

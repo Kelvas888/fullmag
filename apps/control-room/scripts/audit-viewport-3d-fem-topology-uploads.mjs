@@ -11,6 +11,7 @@ import {
 const FEM_PART_COUNTS = [1, 10, 100];
 const FEM_NODE_COUNT = 4096;
 const FEM_MANIFEST_PATH = "/v2/sessions/current/meshing/meshes/shared-domain/manifest";
+const FEM_POSITION_UPLOAD_PROBE = "webgl-position-attribute";
 const PICK_SCAN_COLUMNS = 32;
 const PICK_SCAN_ROWS = 24;
 const PASS_CONFIGS = [
@@ -65,6 +66,7 @@ try {
         "FEM topology upload measurement:",
         `${passConfig.id} parts=${partCount}`,
         `array=${formatBytes(measurement.gpu.arrayBufferBytesUploaded)}`,
+        `position=${formatBytes(measurement.gpu.positionArrayBufferBytesUploaded)}`,
         `element=${formatBytes(measurement.gpu.elementArrayBufferBytesUploaded)}`,
         `draws=${measurement.gpu.drawCalls}`,
       );
@@ -432,6 +434,24 @@ async function measureFemTopologyUploads({ browser, partCount, passConfig, url }
     if (gpu.arrayBufferBytesUploaded <= 0) {
       throw new Error(`FEM ${passConfig.id} fixture with ${partCount} parts uploaded no ARRAY_BUFFER bytes.`);
     }
+    if (
+      !Number.isFinite(gpu.positionArrayBufferBytesUploaded) ||
+      gpu.positionArrayBufferBytesUploaded <= 0 ||
+      gpu.positionBuffersObserved <= 0 ||
+      gpu.positionLocationsObserved <= 0 ||
+      gpu.positionPointerCalls <= 0 ||
+      gpu.positionActiveAttributesObserved <= 0
+    ) {
+      throw new Error(
+        `FEM ${passConfig.id} fixture with ${partCount} parts produced no confirmed WebGL position upload: ${JSON.stringify({
+          positionActiveAttributesObserved: gpu.positionActiveAttributesObserved,
+          positionArrayBufferBytesUploaded: gpu.positionArrayBufferBytesUploaded,
+          positionBuffersObserved: gpu.positionBuffersObserved,
+          positionLocationsObserved: gpu.positionLocationsObserved,
+          positionPointerCalls: gpu.positionPointerCalls,
+        })}`,
+      );
+    }
     if (gpu.drawCalls < partCount) {
       throw new Error(
         `FEM ${passConfig.id} fixture rendered ${gpu.drawCalls} WebGL draw calls for ${partCount} mesh parts.`,
@@ -447,6 +467,7 @@ async function measureFemTopologyUploads({ browser, partCount, passConfig, url }
       gpu,
       partCount,
       pass: passConfig.id,
+      positionUploadProbe: FEM_POSITION_UPLOAD_PROBE,
       rawPerformanceTrace,
       webgl,
     };
@@ -463,15 +484,20 @@ function assertPositionUploadPlateau(measurements) {
     if (samples.length !== FEM_PART_COUNTS.length) {
       throw new Error(`Missing FEM upload samples for ${passConfig.id}.`);
     }
+    const probeModes = new Set(samples.map((measurement) => measurement.positionUploadProbe));
+    if (probeModes.size !== 1 || !probeModes.has(FEM_POSITION_UPLOAD_PROBE)) {
+      throw new Error(`FEM ${passConfig.id} upload samples are missing the WebGL position probe contract.`);
+    }
     const first = samples[0];
     const last = samples.at(-1);
     const allowedPositionBytes =
-      first.gpu.arrayBufferBytesUploaded + first.expectedPositionBytes * 2;
-    if (last.gpu.arrayBufferBytesUploaded > allowedPositionBytes) {
+      first.gpu.positionArrayBufferBytesUploaded + first.expectedPositionBytes * 2;
+    if (last.gpu.positionArrayBufferBytesUploaded > allowedPositionBytes) {
       throw new Error(
         `Position upload grew with FEM part count for ${passConfig.id}: ` +
-          `${first.partCount} parts=${formatBytes(first.gpu.arrayBufferBytesUploaded)}, ` +
-          `${last.partCount} parts=${formatBytes(last.gpu.arrayBufferBytesUploaded)}, ` +
+          `${first.partCount} parts=${formatBytes(first.gpu.positionArrayBufferBytesUploaded)}, ` +
+          `${last.partCount} parts=${formatBytes(last.gpu.positionArrayBufferBytesUploaded)}, ` +
+          `total-array=${formatBytes(last.gpu.arrayBufferBytesUploaded)}, ` +
           `allowed=${formatBytes(allowedPositionBytes)}.`,
       );
     }
@@ -1096,7 +1122,18 @@ function femDomainMetaFixture() {
 
 async function installBrowserAuditInstrumentation(page) {
   await page.addInitScript(() => {
-    const counters = { arrayBufferBytesUploaded: 0, bufferBytesUploaded: 0, buffersCreated: 0, drawCalls: 0, elementArrayBufferBytesUploaded: 0 };
+    const counters = {
+      arrayBufferBytesUploaded: 0,
+      bufferBytesUploaded: 0,
+      buffersCreated: 0,
+      drawCalls: 0,
+      elementArrayBufferBytesUploaded: 0,
+      positionActiveAttributesObserved: 0,
+      positionArrayBufferBytesUploaded: 0,
+      positionBuffersObserved: 0,
+      positionLocationsObserved: 0,
+      positionPointerCalls: 0,
+    };
     window.__FM_VIEWPORT_BROWSER_AUDIT__ = counters;
     const originalGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = function (...args) {
@@ -1105,6 +1142,117 @@ async function installBrowserAuditInstrumentation(page) {
       const gl = context;
       if (gl.__fullmagFemTopologyAuditWrapped) return gl;
       gl.__fullmagFemTopologyAuditWrapped = true;
+      const bufferStates = new WeakMap();
+      const activePositionPrograms = new Set();
+      const positionLocationsByProgram = new Map();
+      let boundArrayBuffer = null;
+      let currentProgram = null;
+
+      const getBufferState = (buffer) => {
+        if (!buffer) return null;
+        let state = bufferStates.get(buffer);
+        if (!state) {
+          state = { arrayBufferBytesUploaded: 0, isPosition: false };
+          bufferStates.set(buffer, state);
+        }
+        return state;
+      };
+      const markPositionBuffer = (buffer) => {
+        const state = getBufferState(buffer);
+        if (!state || state.isPosition) return;
+        state.isPosition = true;
+        counters.positionBuffersObserved += 1;
+        counters.positionArrayBufferBytesUploaded += state.arrayBufferBytesUploaded;
+      };
+      const markPositionLocation = (program, location) => {
+        if (!program || location < 0) return;
+        let locations = positionLocationsByProgram.get(program);
+        if (!locations) {
+          locations = new Set();
+          positionLocationsByProgram.set(program, locations);
+        }
+        if (!locations.has(location)) counters.positionLocationsObserved += 1;
+        locations.add(location);
+      };
+      const markPositionPointer = (index) => {
+        const locations = currentProgram
+          ? positionLocationsByProgram.get(currentProgram)
+          : null;
+        if (!boundArrayBuffer || !locations?.has(index)) return;
+        counters.positionPointerCalls += 1;
+        markPositionBuffer(boundArrayBuffer);
+      };
+      const recordPositionUpload = (buffer, byteLength) => {
+        if (!buffer || !Number.isFinite(byteLength) || byteLength <= 0) return;
+        const state = getBufferState(buffer);
+        if (!state) return;
+        state.arrayBufferBytesUploaded += byteLength;
+        if (state.isPosition) counters.positionArrayBufferBytesUploaded += byteLength;
+      };
+      const readUploadByteLength = (name, methodArgs) => {
+        const source = name === "bufferData" ? methodArgs[1] : methodArgs[2];
+        if (typeof source === "number") return Math.max(0, source);
+        if (source === undefined || source === null) return 0;
+        const bytesPerElement = Number(
+          source.BYTES_PER_ELEMENT ?? source.constructor?.BYTES_PER_ELEMENT ?? 1,
+        );
+        const sourceByteLength = Number(source.byteLength ?? 0);
+        const sourceElementCount = Number(
+          source.length ?? sourceByteLength / bytesPerElement,
+        );
+        const sourceOffset = Math.max(0, Number(methodArgs[3] ?? 0));
+        const requestedLength = methodArgs[4];
+        const elementCount =
+          requestedLength === undefined || Number(requestedLength) === 0
+            ? Math.max(0, sourceElementCount - sourceOffset)
+            : Math.max(0, Number(requestedLength));
+        return elementCount * bytesPerElement;
+      };
+
+      const originalBindBuffer = gl.bindBuffer;
+      if (typeof originalBindBuffer === "function") {
+        gl.bindBuffer = function (...methodArgs) {
+          if (methodArgs[0] === gl.ARRAY_BUFFER) boundArrayBuffer = methodArgs[1] ?? null;
+          return originalBindBuffer.apply(this, methodArgs);
+        };
+      }
+      const originalUseProgram = gl.useProgram;
+      if (typeof originalUseProgram === "function") {
+        gl.useProgram = function (...methodArgs) {
+          currentProgram = methodArgs[0] ?? null;
+          return originalUseProgram.apply(this, methodArgs);
+        };
+      }
+      const originalGetActiveAttrib = gl.getActiveAttrib;
+      if (typeof originalGetActiveAttrib === "function") {
+        gl.getActiveAttrib = function (...methodArgs) {
+          const info = originalGetActiveAttrib.apply(this, methodArgs);
+          if (info?.name === "position") {
+            counters.positionActiveAttributesObserved += 1;
+            activePositionPrograms.add(methodArgs[0]);
+          }
+          return info;
+        };
+      }
+      const originalGetAttribLocation = gl.getAttribLocation;
+      if (typeof originalGetAttribLocation === "function") {
+        gl.getAttribLocation = function (...methodArgs) {
+          const location = originalGetAttribLocation.apply(this, methodArgs);
+          if (methodArgs[1] === "position" && location >= 0 && activePositionPrograms.has(methodArgs[0])) {
+            markPositionLocation(methodArgs[0], location);
+          }
+          return location;
+        };
+      }
+      for (const name of ["vertexAttribPointer", "vertexAttribIPointer"]) {
+        const original = gl[name];
+        if (typeof original !== "function") continue;
+        gl[name] = function (...methodArgs) {
+          const result = original.apply(this, methodArgs);
+          markPositionPointer(methodArgs[0]);
+          return result;
+        };
+      }
       for (const name of ["createBuffer", "drawArrays", "drawElements", "drawArraysInstanced", "drawElementsInstanced"]) {
         const original = gl[name];
         if (typeof original !== "function") continue;
@@ -1119,10 +1267,12 @@ async function installBrowserAuditInstrumentation(page) {
         if (typeof original !== "function") continue;
         gl[name] = function (...methodArgs) {
           const target = methodArgs[0];
-          const data = methodArgs[1];
-          const byteLength = typeof data === "number" ? data : Number(data?.byteLength ?? 0);
+          const byteLength = readUploadByteLength(name, methodArgs);
           counters.bufferBytesUploaded += byteLength;
-          if (target === gl.ARRAY_BUFFER) counters.arrayBufferBytesUploaded += byteLength;
+          if (target === gl.ARRAY_BUFFER) {
+            counters.arrayBufferBytesUploaded += byteLength;
+            recordPositionUpload(boundArrayBuffer, byteLength);
+          }
           if (target === gl.ELEMENT_ARRAY_BUFFER) counters.elementArrayBufferBytesUploaded += byteLength;
           return original.apply(this, methodArgs);
         };

@@ -1652,9 +1652,12 @@ class BackendPackageTests(unittest.TestCase):
                             0,
                         )
                 prepare.assert_called_once()
-                retain.assert_called_once()
+                retain.assert_not_called()
                 serve.assert_called_once_with([])
-                self.assertIn("retention-state-is-unknown", stderr.getvalue())
+                self.assertIn(
+                    "phase=retention state=deferred reason=outside-startup",
+                    stderr.getvalue(),
+                )
                 self.assertNotEqual(
                     (package / "bin/fullmag-bin").read_bytes(), b"package\n"
                 )

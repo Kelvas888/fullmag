@@ -56,6 +56,14 @@ const MAX_CONTROL_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const ACTIVATION_OPERATION_SCHEMA: &str = "fullmag.docker-build-operation.v1";
 const STOP_VERIFICATION_SCHEMA: &str = "fullmag.stop-failed-admission.v1";
 const NAMESPACE_ATTESTATION_SCHEMA: &str = "fullmag.docker-stopped-namespace-attestation.v1";
+// Namespace attestation is emitted before the accepted-run producer copies
+// the live records into its immutable proof directory. These are therefore
+// source locators in the attestation; proof.*_record_path remains the later
+// immutable archive locator and is validated separately.
+const NAMESPACE_TERMINAL_PROCESS_SOURCE_PATH: &str =
+    "runtime-control/runtime-service/process-tree.json";
+const NAMESPACE_TERMINAL_OWNER_SOURCE_PATH: &str =
+    "runtime-control/runtime-services/OWNER.json";
 const API_START_FAILURE_MODE: &str = "api-start-failure";
 const API_START_FAILURE_ERROR_PREFIX: &str = "API binding did not become ready:";
 
@@ -321,7 +329,8 @@ pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), S
     {
         return Err("accepted-run reattach requires a fresh API workspace".into());
     }
-    let snapshot = build_snapshot(state, &loaded).map_err(|error| error.to_string())?;
+    let snapshot =
+        build_snapshot(&state.current_workspace_root, &loaded).map_err(|error| error.to_string())?;
     *state.current_live_state.write().await = Some(snapshot);
     state
         .current_live_session_epoch
@@ -2274,6 +2283,10 @@ fn validate_namespace_attestation_mode(
         "verification/stop-failed-{}.json",
         proof.backend_container
     );
+    // The attestation records where the reconciler observed the mutable
+    // source records. The accepted-run producer archives identical bytes
+    // afterward, so its proof paths must not be substituted into this field.
+    // The archive bytes and hashes are checked independently above.
     for (field, expected) in [
         ("schema", NAMESPACE_ATTESTATION_SCHEMA),
         ("state", "stopped-confirmed"),
@@ -2285,11 +2298,11 @@ fn validate_namespace_attestation_mode(
         ("stop_journal_path", expected_stop_path.as_str()),
         (
             "terminal_process_receipt_path",
-            proof.terminal_process_record_path.as_str(),
+            NAMESPACE_TERMINAL_PROCESS_SOURCE_PATH,
         ),
         (
             "terminal_failed_owner_path",
-            proof.terminal_owner_record_path.as_str(),
+            NAMESPACE_TERMINAL_OWNER_SOURCE_PATH,
         ),
     ] {
         require_equal_string(attestation, field, expected)?;
@@ -3284,7 +3297,7 @@ fn restored_preparation_failure_snapshot(
 }
 
 fn build_snapshot(
-    state: &AppState,
+    workspace_root: &Path,
     loaded: &LoadedAcceptedRestore,
 ) -> Result<crate::types::SessionStateResponse> {
     let requested = &loaded.specification.requested_execution;
@@ -3302,8 +3315,7 @@ fn build_snapshot(
     } else {
         "waiting_for_compute".into()
     };
-    let artifact_dir = state
-        .current_workspace_root
+    let artifact_dir = workspace_root
         .join("runs")
         .join(&run_id)
         .display()
@@ -3368,7 +3380,7 @@ fn build_snapshot(
         final_e_total: None,
         artifact_dir,
     };
-    let mut snapshot = crate::session::default_current_live_state(&CurrentLiveSnapshotRequest {
+    let request = CurrentLiveSnapshotRequest {
         session_id,
         session: Some(session),
         session_status: Some(session_status.clone()),
@@ -3406,7 +3418,15 @@ fn build_snapshot(
         engine_log: None,
         solver_profile: None,
         fem_mesh: None,
-    });
+    };
+    let mut snapshot = crate::session::default_current_live_state(&request);
+    // The default initializer intentionally creates an empty shell and does
+    // not retain optional run/metadata fields. Both values here come from the
+    // accepted RunIntent and proof already validated by load_accepted_restore;
+    // preserve them before frontier projection, which revalidates the same
+    // durable identity. No task, owner, lease, or Solve is created here.
+    snapshot.run = request.run;
+    snapshot.metadata = request.metadata;
     snapshot.scene_document = Some(loaded.scene.clone());
     if let Some(failure) = loaded.preparation_failure.as_ref() {
         snapshot.metadata.as_mut()
@@ -3422,6 +3442,140 @@ fn build_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fullmag_application::{
+        ProjectSnapshot, RequestedExecution, RequestedResourceBudget, StudyId, StudyReference,
+    };
+
+    fn loaded_snapshot_fixture(
+        mode: AcceptedRestoreMode,
+        terminal_outcome: Option<&str>,
+        preparation_failure: Option<Value>,
+    ) -> LoadedAcceptedRestore {
+        let run_id = RunId::parse("run-accepted-test").unwrap();
+        let project_id = ProjectId::parse("project-accepted-test").unwrap();
+        let mut specification = RunSpecification::new(
+            ProjectSnapshot {
+                project_id: project_id.clone(),
+                definition_revision: 1,
+                definition_sha256: "a".repeat(64),
+            },
+            StudyReference {
+                study_id: StudyId::parse("study-accepted-test").unwrap(),
+                plan_version: "study_plan.v1".into(),
+                plan_sha256: "b".repeat(64),
+            },
+            "c".repeat(64),
+            json!({"temperature": 300}),
+            RequestedExecution {
+                backend: "fdm".into(),
+                device: "cpu".into(),
+                precision: "double".into(),
+                mode: "strict".into(),
+                minimum_resources: Some(RequestedResourceBudget {
+                    cpu_millis: 100,
+                    memory_bytes: 1,
+                    gpu_memory_bytes: 0,
+                    storage_bytes: 1,
+                }),
+            },
+        );
+        specification.run_id = run_id.clone();
+        let mut scene = SceneDocument::default();
+        scene.revision = 7;
+        scene.scene.name = "accepted-test".into();
+        LoadedAcceptedRestore {
+            run_id,
+            project_id,
+            specification,
+            scene,
+            logical_session_id: "session-accepted-test".into(),
+            session_epoch: 9,
+            source_request_id: "source-request-accepted-test".into(),
+            source_sha256: "d".repeat(64),
+            startup_provenance_sha256: "e".repeat(64),
+            config_sha256: "f".repeat(64),
+            request_sha256: None,
+            restore_mode: None,
+            previous_ack_sha256: None,
+            proof_sha256: "1".repeat(64),
+            total_steps: 4,
+            catalog_revision: 12,
+            activation_attempt: "2".repeat(32),
+            reconciliation_attempt: "3".repeat(32),
+            mode,
+            terminal_outcome: terminal_outcome.map(str::to_owned),
+            preparation_failure,
+        }
+    }
+
+    #[test]
+    fn build_snapshot_hydrates_held_run_and_reattach_metadata() {
+        let loaded = loaded_snapshot_fixture(AcceptedRestoreMode::Held, None, None);
+        let snapshot = build_snapshot(Path::new("test-workspace"), &loaded).unwrap();
+        let run = snapshot.run.as_ref().expect("accepted run is retained");
+        assert_eq!(run.run_id, "run-accepted-test");
+        assert_eq!(run.status, "waiting_for_compute");
+        assert_eq!(
+            snapshot
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("accepted_run_reattach"))
+                .and_then(|marker| marker.get("run_id"))
+                .and_then(Value::as_str),
+            Some("run-accepted-test")
+        );
+    }
+
+    #[test]
+    fn build_snapshot_hydrates_consumed_terminal_run_status() {
+        let loaded = loaded_snapshot_fixture(
+            AcceptedRestoreMode::Consumed,
+            Some("completed"),
+            None,
+        );
+        let snapshot = build_snapshot(Path::new("test-workspace"), &loaded).unwrap();
+        assert_eq!(
+            snapshot.run.as_ref().map(|run| run.status.as_str()),
+            Some("completed")
+        );
+        assert_eq!(snapshot.session.status, "completed");
+    }
+
+    #[test]
+    fn build_snapshot_hydrates_recorded_preparation_failure_without_missing_metadata() {
+        let failure = json!({"failures": [{
+            "task_id": "task-1",
+            "preparation_attempt_id": "attempt-1",
+            "exit_receipt_id": "exit-1",
+            "started_at_unix_ms": 100,
+            "completed_at_unix_ms": 250,
+            "error": "process exited with code 1"
+        }]});
+        let loaded = loaded_snapshot_fixture(AcceptedRestoreMode::Held, None, Some(failure));
+        let snapshot = build_snapshot(Path::new("test-workspace"), &loaded).unwrap();
+        assert_eq!(
+            snapshot.run.as_ref().map(|run| run.status.as_str()),
+            Some("failed")
+        );
+        let preparation = snapshot
+            .simulation_preparation
+            .as_ref()
+            .expect("recorded preparation failure is retained");
+        assert_eq!(preparation.status, "failed");
+        let diagnostic = preparation
+            .failure
+            .as_ref()
+            .expect("recorded preparation failure has diagnostics");
+        assert!(diagnostic
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("Exit receipt: exit-1")));
+        assert!(snapshot
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("accepted_preparation"))
+            .is_some());
+    }
 
     #[test]
     fn restored_process_failure_preserves_identity_and_durable_times() {
@@ -4419,10 +4573,10 @@ mod tests {
             "container_state": container_state,
             "stop_journal_path": "verification/stop-failed-".to_string() + &"5".repeat(64) + ".json",
             "stop_journal_sha256": proof.stop_verification_sha256.clone(),
-            "terminal_process_receipt_path": proof.terminal_process_record_path.clone(),
+            "terminal_process_receipt_path": NAMESPACE_TERMINAL_PROCESS_SOURCE_PATH,
             "terminal_process_receipt_sha256": terminal_sha256.clone(),
             "terminal_process_receipt": terminal,
-            "terminal_failed_owner_path": proof.terminal_owner_record_path.clone(),
+            "terminal_failed_owner_path": NAMESPACE_TERMINAL_OWNER_SOURCE_PATH,
             "terminal_failed_owner_sha256": failed_owner_sha256,
             "terminal_failed_owner": failed_owner.clone(),
             "failure_kind": "native-start-failure",
@@ -4441,6 +4595,30 @@ mod tests {
             false,
         )
         .is_ok());
+        for (field, invalid_path) in [
+            ("terminal_process_receipt_path", proof.terminal_process_record_path.as_str()),
+            ("terminal_failed_owner_path", proof.terminal_owner_record_path.as_str()),
+            ("terminal_process_receipt_path", "runtime-control/foreign/process-tree.json"),
+            ("terminal_failed_owner_path", "runtime-control/foreign/OWNER.json"),
+            ("terminal_process_receipt_path", "../runtime-service/process-tree.json"),
+            ("terminal_failed_owner_path", "../runtime-services/OWNER.json"),
+        ] {
+            let original = attestation[field].clone();
+            attestation[field] = Value::String(invalid_path.into());
+            let error = validate_namespace_attestation(
+                &attestation,
+                &proof,
+                &verification,
+                &attestation["terminal_process_receipt"],
+                &attestation["terminal_failed_owner"],
+                &attestation["native_failure_probe"],
+                &attestation["terminal_failed_owner"],
+                false,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(&format!("record {field} differs")));
+            attestation[field] = original;
+        }
         proof.terminal_owner_record_sha256 = "9".repeat(64);
         assert!(validate_namespace_attestation(
             &attestation,

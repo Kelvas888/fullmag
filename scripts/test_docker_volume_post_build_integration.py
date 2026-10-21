@@ -87,6 +87,10 @@ class _Control:
         self.writes.append((relative, deepcopy(value)))
         self.events.append("write:" + relative)
 
+    def read(self, relative: str, *, optional: bool = False):
+        raw = self.read_raw(relative, optional=optional)
+        return None if raw is None else json.loads(raw)
+
     def read_raw(self, relative: str, *, optional: bool = False) -> bytes | None:
         try:
             return self.records[relative]

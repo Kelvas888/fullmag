@@ -606,6 +606,9 @@ jobs:
           export FULLMAG_RUNNER_CHROMIUM="$(node -p "require('./apps/control-room/node_modules/playwright').chromium.executablePath()")"
           node apps/runner-console/browser-smoke.cjs
 
+      - name: Verify FEM position upload attribution contracts
+        run: node --test apps/control-room/scripts/audit-viewport-3d-fem-topology-uploads-probe.node-test.mjs
+
       - name: Run browser fixture pre-proof gate
         env:
           CONTROL_ROOM_AUDIT_ARTIFACTS_DIR: ${{ runner.temp }}/viewport-3d-browser-audit
@@ -786,6 +789,7 @@ jobs:
         run: |
           python -B scripts/test_fullmag_docker_runtime.py -v
           python -B scripts/test_docker_backend_dev.py -v
+          python -B scripts/test_docker_backend_live_source.py -v
           python -B scripts/test_docker_candidate_retirement.py -v
           python -B scripts/test_docker_operator_capability.py -v
           python -B scripts/test_docker_build_control_cache_admission.py -v
@@ -812,6 +816,8 @@ jobs:
           python -B scripts/test_docker_volume_pre_admission_integration.py -v
           python -B scripts/test_docker_volume_post_build_generation.py -v
           python -B scripts/test_docker_volume_post_build_integration.py -v
+          python -B scripts/test_docker_volume_pending_continuation.py -v
+          python -B scripts/test_docker_volume_pending_resume.py -v
           python -B scripts/test_docker_prestart_resume.py -v
           python -B scripts/test_docker_dev_browser_qa.py -v
           python -B scripts/test_docker_volume_receipts.py -v
@@ -862,6 +868,9 @@ jobs:
         run: |
           python -m pip install 'pytest>=9,<10'
           python -m pip install -e 'packages/fullmag-py[meshing,figures]'
+
+      - name: Verify canonical source snapshot identity
+        run: python -m pytest -q scripts/test_capture_source_snapshot_identity.py
 
       - name: Run real Gmsh exact-layer airbox grading regressions
         run: |
