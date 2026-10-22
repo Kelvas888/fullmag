@@ -330,15 +330,26 @@ values = [r.value for r in results]          # w kolejności punktów
 
 ## 9. Wymagane zmiany backendu
 
-Stan ustalony przez odczyt kodu (22.10.2026):
+Stan po F5 (22.10.2026):
 
-| Zmiana | Stan dziś | Zakres |
+| Zmiana | Stan przed F5 | Stan po F5 |
 |---|---|---|
-| Kontynuacja `m` między komendami w trybie accepted | RunIntent komendy ma `seeds: {}` i `dependencies: []`; kontrakt ma `StudyInputSource::PinnedArtifact` i `ExplicitContinuation`, ale resolver istnieje tylko dla `StepOutput` | `prepare_live_accepted` dodaje wejście stanu z ostatniego zakończonego runu sesji; resolver obok `StepOutput` w `fullmag-runtime-control`; projekcja i provenance zapisują źródło stanu |
-| Utrzymanie `m` w trybie scratch przy edycji | supervisor kończy proces potomny przy zmianie rewizji sceny, stan kontynuacji jest tylko w pamięci procesu | zapis stanu przed restartem i jego wczytanie przez nowy proces z wpisem w provenance |
-| `pause`/`skip` w trybie accepted | 422 `accepted_control_unsupported`; brak stanu „paused” w katalogu runów | komenda pauzy workera i stan cyklu życia; do tego czasu D3 obowiązuje w hoście interaktywnym, a w Dockerze edycje są między komendami |
-| Kod błędu istniejącej sesji | 409 bez kodu (JSON `code: "conflict"`) | kod `session_already_active`; klient obsługuje oba |
-| Obecność klienta skryptu w sesji | brak rejestru klientów; najbliższy wzorzec to `VisualizationClientAcks` | zasób klientów z rewizją i wskaźnik w nagłówku Control Room |
+| Kontynuacja `m` między komendami w trybie accepted | RunIntent komendy miał `seeds: {}` i `dependencies: []`; resolver tylko dla `StepOutput` | zrobione: run deklaruje wyjście `final_state`; następna komenda tej samej sesji i epoki dostaje wejście `initial_state` jako `PinnedArtifact` z ostatniego zakończonego runu, gdy siatka i obsada materiałów się zgadzają (`live_accepted_continuation.rs`, nota `docs/physics/0925-live-session-magnetization-continuation.md`); inaczej stan autorski. Źródło trafia do `live_workspace.initial_state_source` |
+| Utrzymanie `m` w trybie scratch przy edycji | supervisor kończy proces potomny przy zmianie rewizji sceny | bez zmian; D3 obowiązuje w hoście interaktywnym |
+| `pause`/`skip` w trybie accepted | 422 `accepted_control_unsupported` | bez zmian (Q3: „nie teraz”); `stop` przyjmuje teraz `target: {"kind": "run", "run_id"}` i sprawdza, że run należy do bieżącej sesji |
+| Kod błędu istniejącej sesji | 409 bez kodu | zrobione: `session_already_active` |
+| Obecność klienta skryptu w sesji | brak rejestru klientów | zrobione po stronie API i klienta: `GET /v2/sessions/current/clients`, `PUT`/`DELETE /clients/{client_id}`, TTL 30 s, zdarzenie zasobu `session-clients`; `LiveSession` wysyła heartbeat co 10 s. Wskaźnik w nagłówku Control Room: nie zrobiony |
+| Walidacja etapu z adaptacyjnym krokiem bez `dt_max` | etap DSL z `dt_max` pustym odrzucany | zrobione: pusty `dt_max` dozwolony w etapie |
+
+Wady runtime znalezione podczas E2E w grupie DEV i naprawione w F5:
+
+- błąd workera kończył scheduler, runtime i API; teraz błąd zapisany trwale jako wynik zadania nie zatrzymuje schedulera (`task_failed_settled`);
+- zadanie `Running`, którego worker zakończył się bez rozliczenia, trzymało lease CPU na zawsze; scheduler rozlicza je przez ścieżkę odzyskiwania supervisora (`exited_worker_recovered`);
+- nieaktualny kandydat przyjęcia (zadanie anulowane po migawce kolejki) był błędem krytycznym; teraz jest odkładany do następnego przebiegu;
+- komendy runów zakończonych bez wyjść nigdy się nie kończyły; teraz każdy terminalny run kończy związaną komendę;
+- przyczyna błędu workera ginęła w początku stderr; teraz raport bierze ostatni znacznik `accepted worker failed:`;
+- `relax` w trybie accepted kończył się „no pinned runner horizon”; horyzont relaksacji może być nieskończony;
+- worker padał na zajętym zapisie magazynu sesji i na niepotwierdzonym ostatnim heartbeacie; zapis jest ponawiany, a nieudane wyjście z niepotwierdzonym heartbeatem przechodzi do uzgodnienia stanu.
 
 Wsparcie każdej zmiany jest deklarowane per ścieżka (FDM CPU, FDM GPU,
 FEM CPU, FEM GPU) w `docs/specs/capability-matrix-v0.md`; wymuszony GPU nie
@@ -353,7 +364,7 @@ przechodzi niejawnie na CPU.
 | F2 | dekoder FMVP, `to_numpy()`, tabele, cache ETag | zrobione: `test_live_client_data.py` i `fieldVectorCodec.fixtures.test.ts` dają identyczne wyniki na wspólnych próbkach |
 | F3 | tryb `live` w `world.py`: `fm.connect`/`FULLMAG_URL`, natychmiastowa synchronizacja, reguła tożsamości, `transaction()`, akcje, `paused()`, `export_script()` | zaimplementowane i przetestowane na stanowym fałszywym API (`test_live_dsl_mode.py`); kryterium runtime poniżej NOT VERIFIED do uruchomienia w grupie DEV: skrypt z §5.1 uruchomiony przez `python` buduje scenę w grupie DEV, relax + run działają, `m` wraca jako numpy; eksport odtwarza scenę (round-trip); ten sam skrypt w trybach `eager` i `capture` działa jak przed zmianą |
 | F4 | subskrybent WebSocket, `fm.on()`, `fm.run_until()`, dodatek Jupyter | zaimplementowane (`test_live_events.py`, prawdziwy serwer WebSocket w teście); pomiar narzutu `run_until` w grupie DEV NOT VERIFIED; wznowienie po zerwaniu połączenia, pomiar narzutu `run_until` |
-| F5 | zmiany backendu z §9 | testy kontraktowe API i dowód runtime w grupie DEV dla każdej deklarowanej ścieżki |
+| F5 | zmiany backendu z §9 | zaimplementowane (tabela w §9); testy kontraktowe Rust kompilowane tylko w CI; dowód runtime w grupie DEV: patrz raport E2E w PR |
 | F6 | `fm.sweep()` na wielu grupach DEV | zaimplementowane (`test_live_sweep.py`: 2 serwery, kolejność wyników, błędy punktów, nieosiągalna grupa); przemiatanie na ≥ 2 prawdziwych grupach DEV NOT VERIFIED |
 | F7 | opcjonalnie tryb in-process (PyO3 + `InteractiveRuntime`) z tym samym protokołem | callback po każdym kroku bez serwera |
 | F8 | przykładowy skrypt i notatnik w `examples/`, strona w `public_docs`, ściągawka Boris → Fullmag | dokumentacja publikowana razem z F3 |

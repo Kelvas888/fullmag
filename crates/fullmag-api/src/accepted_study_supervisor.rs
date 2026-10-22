@@ -2265,6 +2265,35 @@ mod tests {
     use std::process::Child;
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
+    #[test]
+    fn worker_failure_reason_keeps_the_worker_error_report() {
+        use std::os::unix::process::ExitStatusExt;
+        let noise = "[fullmag-plan][mag-texture] sampling preset 'uniform' S=[+1.0e0]
+".repeat(40);
+        let stderr = format!(
+            "{noise}accepted worker failed: execute accepted worker Start: no pinned runner horizon
+{noise}"
+        );
+        let outcome = ObservedWorkerProcess {
+            output: Output {
+                status: ExitStatus::from_raw(256),
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            },
+            timed_out: false,
+            stop_requested: false,
+            process_id: 7,
+            process_start_token: None,
+            control_failure_reason: None,
+        };
+        let reason = worker_failure_reason(&outcome);
+        assert!(
+            reason.starts_with("accepted worker process failed: accepted worker failed: execute accepted worker Start"),
+            "{reason}"
+        );
+    }
+
     fn temporary_store(name: &str) -> (PathBuf, SessionStore) {
         let root = std::env::temp_dir().join(format!(
             "fullmag-accepted-supervisor-{name}-{}",
