@@ -143,7 +143,8 @@ layer.Ms = 800e3                   # natychmiast: patch_material
 layer.alpha = 0.5
 layer.m = fm.texture.uniform(1, 0, 0)
 
-fm.relax()                         # komenda relax, czeka na zakończenie
+fm.solver(fix_dt=1e-13)                # etapy wykonywalne wymagają jawnego kroku
+fm.relax(dt=1e-13)                 # komenda relax, czeka na zakończenie
 m = fm.field("m").to_numpy()   # (punkty, 3) numpy
 
 with fm.transaction():             # kilka zmian jako jedna rewizja
@@ -208,6 +209,9 @@ przez `fullmag skrypt.py` jak dziś (`capture`).
 - `fm.relax(...)` i `fm.run(t)` najpierw dopisują etap do `scene.study.stages`
   (budowany jak etap przechwycony przez `fullmag skrypt.py`), a potem wysyłają
   komendę `relax`/`run` z `target={"kind": "stage_index", ...}` tego etapu.
+  Jak `study.stages.add_relax`/`add_run`, etap wymaga jawnego kroku czasowego
+  (`dt` albo polityki adaptacyjnej z `dt_max`); bez niego wywołanie zgłasza
+  `ValueError` przed wysłaniem komendy.
   Run accepted w Dockerze wykonuje dokładnie jeden autorski etap
   (`select_live_step` w `crates/fullmag-api/src/live_accepted_execution.rs`),
   a sekwencja etapów sprawia, że `fm.export_script()` odtwarza wykonane akcje.
@@ -305,7 +309,7 @@ def point(H):
     layer.Ms, layer.Aex, layer.alpha = 800e3, 13e-12, 0.5
     layer.m = fm.texture.uniform(1, 0, 0)
     fm.b_ext(H, 0, 0)
-    fm.relax()
+    fm.relax(dt=1e-13)
     return fm.m.average()
 
 results = fm.sweep(point, H=[0.01, 0.02, 0.03, 0.04],
@@ -339,7 +343,7 @@ Stan po F5 (22.10.2026):
 | `pause`/`skip` w trybie accepted | 422 `accepted_control_unsupported` | bez zmian (Q3: „nie teraz”); `stop` przyjmuje teraz `target: {"kind": "run", "run_id"}` i sprawdza, że run należy do bieżącej sesji |
 | Kod błędu istniejącej sesji | 409 bez kodu | zrobione: `session_already_active` |
 | Obecność klienta skryptu w sesji | brak rejestru klientów | zrobione po stronie API i klienta: `GET /v2/sessions/current/clients`, `PUT`/`DELETE /clients/{client_id}`, TTL 30 s, zdarzenie zasobu `session-clients`; `LiveSession` wysyła heartbeat co 10 s. Wskaźnik w nagłówku Control Room: nie zrobiony |
-| Walidacja etapu z adaptacyjnym krokiem bez `dt_max` | etap DSL z `dt_max` pustym odrzucany | zrobione: pusty `dt_max` dozwolony w etapie |
+| Etap live bez jawnego kroku czasowego | `fm.relax()` bez `dt` dawał etap z adaptacyjnym krokiem bez `dt_max`, którego runner nie wykona | walidacja etapu bez zmian (wymaga `dt_max`); tryb live zgłasza `ValueError` przed wysłaniem komendy, gdy brak `dt` lub `dt_max` |
 
 Wady runtime znalezione podczas E2E w grupie DEV i naprawione w F5:
 

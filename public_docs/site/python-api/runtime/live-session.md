@@ -71,6 +71,7 @@ fm.connect("http://127.0.0.1:3197")
 fm.engine("fdm")
 fm.device("cpu")
 fm.cell(5e-9, 5e-9, 10e-9)
+fm.solver(fix_dt=1e-13)  # executable stages need an explicit timestep
 layer = fm.geometry(fm.Box(400e-9, 100e-9, 10e-9), name="layer")
 layer.Ms = 800e3
 layer.Aex = 13e-12
@@ -78,7 +79,7 @@ layer.alpha = 0.02
 layer.m = fm.texture.uniform(1, 0.1, 0)
 
 # %% Actions become runtime commands; results come back as numpy
-fm.relax(tolT=1e-5, max_steps=20_000)
+fm.relax(dt=1e-13, tolT=1e-5, max_steps=20_000)
 print(fm.m.average())
 m = fm.field("m").to_numpy()
 
@@ -97,7 +98,9 @@ The same example is shipped as `examples/live_session_basics.py`.
 ## ProblemIR
 Live mode does not author ProblemIR directly. Each synchronisation lowers the world with the same
 converters as `fullmag script.py` into a SceneDocument; the server derives ProblemIR from that
-document when a command runs. `fm.relax()` and `fm.run()` add one authored stage to
+document when a command runs. Like `study.stages.add_relax`/`add_run`, they need an explicit
+timestep (`fm.solver(fix_dt=...)`, `fm.relax(dt=...)`, or an adaptive policy with `dt_max`);
+without one the call raises `ValueError` before anything is sent. `fm.relax()` and `fm.run()` add one authored stage to
 `scene.study.stages` and run it with a `stage_index` target, so `fm.export_script()` reproduces the
 executed sequence.
 

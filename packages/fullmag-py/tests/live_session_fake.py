@@ -33,6 +33,8 @@ class FakeLiveSession:
         self.api = FakeFullmagApi()
         self.scene: dict[str, Any] = {"version": "scene.v2", "revision": 3, "objects": []}
         self.session_exists = session_exists
+        self.session_status = "running"
+        self.create_bodies: list[dict[str, Any]] = []
         self.commands: dict[str, dict[str, Any]] = {}
         self.transactions: list[dict[str, Any]] = []
         self.command_status = command_status
@@ -61,10 +63,12 @@ class FakeLiveSession:
     def _current(self, _request: RecordedRequest):
         if not self.session_exists:
             return api_error(404, "not_found", "no current session")
-        return 200, {"session_id": "s1"}, {}
+        return 200, {"session_id": "s1", "status": self.session_status}, {}
 
     def _create(self, request: RecordedRequest):
+        self.create_bodies.append(request.json())
         self.session_exists = True
+        self.session_status = "running"
         self.scene = {"version": "scene.v2", "revision": 1, "objects": []}
         return 201, {"session_id": "s2", "status": {}, "scene_document": {}, "revisions": {}}, {}
 

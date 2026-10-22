@@ -978,10 +978,7 @@ fn validate_stage_solver_state(
     }
     validate_present_positive(&stage.fixed_timestep, &format!("{context}.fixed_timestep"))?;
     if let Some(adaptive) = stage.adaptive_timestep.as_ref() {
-        // An empty dt_max means "no upper bound", exactly as the Python DSL
-        // authors it and as the solvers execute it (ADR 0068 F5). The policy
-        // itself stays explicit: integrator, dt_min and tolerances are checked.
-        validate_adaptive_state(adaptive, false, &context, &stage.integrator)?;
+        validate_adaptive_state(adaptive, true, &context, &stage.integrator)?;
     }
     Ok(())
 }
@@ -3972,32 +3969,6 @@ mod tests {
         global_solver.fixed_timestep.clear();
         validate_solver_state(&global_solver, false, "study.solver")
             .expect("non-executable global solver state may omit a timestep policy");
-    }
-
-    #[test]
-    fn llg_stage_adaptive_policy_accepts_unbounded_dt_max() {
-        let stage: crate::ScriptBuilderStageState = serde_json::from_value(serde_json::json!({
-            "kind": "relax",
-            "entrypoint_kind": "flat_relax",
-            "relax_algorithm": "llg_overdamped",
-            "integrator": "rk23",
-            "adaptive_timestep": {
-                "tolerance_mode": "advanced",
-                "atol": "1e-06",
-                "rtol": "0.001",
-                "dt_initial": "",
-                "dt_min": "1e-15",
-                "dt_max": "",
-                "safety": "0.9",
-                "growth_limit": "2",
-                "shrink_limit": "0.2",
-                "max_spin_rotation": "",
-                "norm_tolerance": ""
-            }
-        }))
-        .expect("stage fixture should deserialize");
-        validate_stage_solver_state(&stage, 0)
-            .expect("an empty dt_max is the DSL's unbounded adaptive policy");
     }
 
     #[test]

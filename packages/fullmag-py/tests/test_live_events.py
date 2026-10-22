@@ -98,6 +98,7 @@ def live(monkeypatch):
             fm.connect(fake.url, events=False)
             fm.engine("fdm")
             fm.cell(5e-9, 5e-9, 10e-9)
+            fm.solver(fix_dt=1e-13)
             layer = fm.geometry(fm.Box(100e-9, 50e-9, 10e-9), name="layer")
             layer.Ms, layer.Aex, layer.alpha = 800e3, 13e-12, 0.5
             layer.m = fm.texture.uniform(1, 0, 0)

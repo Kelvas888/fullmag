@@ -21,6 +21,7 @@ fm.connect()
 fm.engine("fdm")
 fm.device("cpu")
 fm.cell(5e-9, 5e-9, 10e-9)
+fm.solver(fix_dt=1e-13)    # executable stages need an explicit timestep
 
 layer = fm.geometry(fm.Box(400e-9, 100e-9, 10e-9), name="layer")
 layer.Ms = 800e3       # saturation magnetisation [A/m]
@@ -29,7 +30,7 @@ layer.alpha = 0.02
 layer.m = fm.texture.uniform(1, 0.1, 0)
 
 # %% Relax and read the state back as numpy.
-fm.relax(tolT=1e-5, max_steps=20_000)
+fm.relax(dt=1e-13, tolT=1e-5, max_steps=20_000)
 print("relaxed <m> =", fm.m.average())
 m = fm.field("m")
 if m is not None:

@@ -34,6 +34,7 @@ def _layer():
     fm.engine("fdm")
     fm.device("cpu")
     fm.cell(5e-9, 5e-9, 10e-9)
+    fm.solver(fix_dt=1e-13)
     layer = fm.geometry(fm.Box(200e-9, 100e-9, 10e-9), name="layer")
     layer.Ms = 800e3
     layer.Aex = 13e-12
@@ -98,10 +99,25 @@ def test_transaction_groups_calls(server) -> None:
     assert _authored(server.scene) == _authored(build_world_scene(Path("x.py")))
 
 
+def test_live_actions_require_an_explicit_timestep(server) -> None:
+    fm.connect(server.url, events=False)
+    fm.engine("fdm")
+    fm.cell(5e-9, 5e-9, 10e-9)
+    layer = fm.geometry(fm.Box(200e-9, 100e-9, 10e-9), name="layer")
+    layer.Ms, layer.Aex, layer.alpha = 800e3, 13e-12, 0.5
+    layer.m = fm.texture.uniform(1, 0, 0)
+    # The accepted runner cannot execute an LLG stage without dt or dt_max.
+    with pytest.raises(ValueError, match="explicit fixed or complete adaptive"):
+        fm.relax(max_steps=10)
+    with pytest.raises(ValueError, match="explicit timestep"):
+        fm.run(1e-10)
+    assert server.command_bodies("relax") == [] and server.command_bodies("run") == []
+
+
 def test_relax_and_run_become_commands_bound_to_scene_revision(server) -> None:
     fm.connect(server.url, events=False)
     _layer()
-    result = fm.relax(tolT=1e-5, max_steps=1000)
+    result = fm.relax(dt=1e-13, tolT=1e-5, max_steps=1000)
     assert result.kind == "relax" and result.completion_status == "succeeded"
     relax = server.command_bodies("relax")[0]
     # Docker accepted runs execute one authored stage: the action is authored first, then targeted.
@@ -171,6 +187,15 @@ def test_connect_creates_session_when_none_exists(fresh_world) -> None:
         fm.connect(fake.url, backend="fem", events=False)
         created = fake.api.find("POST", "/v2/sessions")[0].json()
         assert created["backend"] == "fem" and created["device"] == "cpu"
+        fm.disconnect()
+
+
+def test_connect_replaces_a_terminal_session(fresh_world) -> None:
+    with FakeLiveSession() as fake:
+        fake.session_status = "failed"
+        fm.connect(fake.url, events=False)
+        # A failed session rejects every command; the script gets a new one.
+        assert fake.create_bodies and fake.create_bodies[0]["replace_current"] is True
         fm.disconnect()
 
 

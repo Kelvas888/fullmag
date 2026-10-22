@@ -27,6 +27,8 @@ _SESSION_DEFAULTS = {"device": "cpu", "precision": "double"}
 # Presence heartbeat period; the API lists clients for 30 s after the last one.
 _HEARTBEAT_INTERVAL_S = 10.0
 _STAGE_TARGET = Target.current_stage()
+# Mirrors the API's read-only terminal session states.
+_TERMINAL_SESSION_STATUSES = frozenset({"stopping", "stopped", "cancelled", "failed", "completed", "closed"})
 
 
 @dataclass
@@ -80,11 +82,14 @@ class LiveSession:
             current = None if new_session else self.client.sessions.current()
         except NotFoundError:
             current = None
-        if current is None:
+        # A terminal session rejects every mutating command, so a script
+        # starts a fresh one instead of attaching to it.
+        terminal = isinstance(current, Mapping) and current.get("status") in _TERMINAL_SESSION_STATUSES
+        if current is None or terminal:
             self.client.sessions.create(
                 "fullmag-python-live",
                 backend=backend,
-                replace_current=new_session,
+                replace_current=new_session or terminal,
                 **_SESSION_DEFAULTS,
             )
         scene = self.client.model.scene()

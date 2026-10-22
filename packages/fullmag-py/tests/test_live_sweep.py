@@ -18,7 +18,7 @@ def _point(H: float) -> float:
     layer.Ms, layer.Aex, layer.alpha = 800e3, 13e-12, 0.5
     layer.m = fm.texture.uniform(1, 0, 0)
     fm.b_ext(H, 0, 0)
-    fm.relax(max_steps=100)
+    fm.relax(dt=1e-13, max_steps=100)
     return H * 2
 
 

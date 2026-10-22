@@ -9977,6 +9977,7 @@ def run(until: float) -> Any:
     problem = _build_problem(study_kind="time_evolution")
     live = _live_session_or_none()
     if live is not None:
+        _require_live_timestep(problem)
         _state._live_stages.append(
             CapturedStage(problem=problem, entrypoint_kind="flat_run", default_until_seconds=until)
         )
@@ -10004,8 +10005,29 @@ def _append_live_loop_stage(*, relax: bool, chunk_time: float) -> int:
     else:
         problem = _build_problem(study_kind="time_evolution")
         stage = CapturedStage(problem=problem, entrypoint_kind="flat_run", default_until_seconds=chunk_time)
+    _require_live_timestep(problem)
     _state._live_stages.append(stage)
     return len(_state._live_stages) - 1
+
+
+def _require_live_timestep(problem: Any) -> None:
+    """Reject an LLG stage the accepted runner cannot execute, before it is submitted.
+
+    Executable stages need a fixed timestep or an adaptive policy with an
+    explicit ``dt_max``, exactly like ``study.stages.add_run``/``add_relax``.
+    """
+    dynamics = getattr(getattr(problem, "study", None), "dynamics", None)
+    if dynamics is None:
+        return
+    adaptive = getattr(dynamics, "adaptive_timestep", None)
+    if getattr(dynamics, "fixed_timestep", None) is not None:
+        return
+    if adaptive is not None and getattr(adaptive, "dt_max", None) is not None:
+        return
+    raise ValueError(
+        "live LLG stages need an explicit timestep: call fm.solver(fix_dt=...) or "
+        "fm.solver(integrator='rk23', dt_min=..., dt_max=..., max_err=...) first"
+    )
 
 
 def _evaluate_runwhile_condition(condition: QuantityCondition | Callable[[], bool] | bool) -> bool:
@@ -10285,6 +10307,9 @@ def relax(
         dt_max=dt_max,
         field_refresh=field_refresh,
         relax_alpha=resolved_relax_alpha,
+        # A live relax becomes an executable authored stage, which needs the
+        # same explicit timestep policy as `study.stages.add_relax`.
+        require_explicit_timestep=_live_session_or_none() is not None,
     )
     from fullmag.runtime import Simulation
     problem = _build_problem(

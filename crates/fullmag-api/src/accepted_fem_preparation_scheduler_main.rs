@@ -328,8 +328,26 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
         // `active` continue draining even after an offer is withdrawn.
         // Serialize membership and lease adoption with pool/lease publication.
         // Supervisors start in separate threads; never wait for them here.
-        let recovery_transaction = retry_store_writer_busy(|| store.write_transaction())
-            .context("preparation scheduler: acquire recovery transaction")?;
+        let recovery_transaction = match retry_store_writer_busy(|| store.write_transaction())
+            .context("preparation scheduler: acquire recovery transaction")
+        {
+            Ok(transaction) => transaction,
+            // A long compute-worker or API transaction may hold the shared
+            // writer past the retry budget. Nothing was written in this
+            // iteration yet, so defer the pass instead of failing the owner.
+            Err(error) if is_store_writer_busy(&error) => {
+                tracing::warn!(
+                    error = ?error,
+                    "preparation scheduler deferred recovery while the session store writer is busy"
+                );
+                if shutdown_requested.load(Ordering::Acquire) && active.is_empty() {
+                    break;
+                }
+                std::thread::sleep(args.idle_poll_interval);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let current_pool =
             retry_store_writer_busy(|| store.read_preparation_resource_pool(&args.pool_id))?;
         if let Some(pool) = &current_pool {
