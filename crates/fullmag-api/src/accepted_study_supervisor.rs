@@ -3082,9 +3082,62 @@ mod tests {
     }
 
     #[test]
-    fn operator_stop_terminates_child_and_records_distinct_outcome() {
+    fn cooperative_stop_child_fixture() {
+        if std::env::var_os("FULLMAG_ACCEPTED_SUPERVISOR_STOP_CHILD").is_some() {
+            let mut release = [0_u8; 1];
+            std::io::stdin().read_exact(&mut release).unwrap();
+            assert_eq!(release, [1]);
+            println!("cooperative Stop acknowledged");
+        }
+    }
+
+    #[test]
+    fn operator_stop_waits_for_cooperative_exit_and_records_distinct_outcome() {
+        use std::io::Write;
         let current_test_process = std::env::current_exe().unwrap();
-        let child = Command::new(current_test_process)
+        let mut child = Command::new(current_test_process)
+            .arg("--exact")
+            .arg("accepted_study_supervisor::tests::cooperative_stop_child_fixture")
+            .arg("--nocapture")
+            .env("FULLMAG_ACCEPTED_SUPERVISOR_STOP_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut release = child.stdin.take().unwrap();
+        let mut stop_sent = false;
+        let mut heartbeat_count = 0_u64;
+        let started = Instant::now();
+        let outcome = observe_child(
+            OwnedWorkerProcess::unowned_test_fixture(child),
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_millis(20)),
+            || {
+                heartbeat_count += 1;
+                Ok(true)
+            },
+            || {
+                if !stop_sent {
+                    release.write_all(&[1])?;
+                    stop_sent = true;
+                }
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(outcome.stop_requested);
+        assert!(!outcome.timed_out);
+        assert!(outcome.output.status.success());
+        assert!(String::from_utf8_lossy(&outcome.output.stdout)
+            .contains("cooperative Stop acknowledged"));
+        assert_eq!(heartbeat_count, 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn operator_stop_without_cooperative_exit_retains_timeout_outcome() {
+        let child = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("accepted_study_supervisor::tests::timeout_child_fixture")
             .arg("--nocapture")
@@ -3094,19 +3147,17 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let started = Instant::now();
         let outcome = observe_child(
             OwnedWorkerProcess::unowned_test_fixture(child),
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_millis(20)),
+            Some(Duration::from_millis(100)),
+            None,
             || Ok(true),
             || Ok(true),
         )
         .unwrap();
         assert!(outcome.stop_requested);
-        assert!(!outcome.timed_out);
+        assert!(outcome.timed_out);
         assert!(!outcome.output.status.success());
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
