@@ -1048,11 +1048,13 @@ def _publish_outputs(source: Path, outputs: Mapping[str, bytes], before: Mapping
         for name, data in outputs.items():
             destination = target_root / name
             handle, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=target_root)
+            temporary.append((Path(temporary_name), destination))
             with os.fdopen(handle, "wb", closefd=True) as stream:
                 stream.write(data)
                 stream.flush()
+                # Tracked public sources must also be readable by the frontend UID.
+                os.chmod(temporary_name, 0o644)
                 os.fsync(stream.fileno())
-            temporary.append((Path(temporary_name), destination))
         published: dict[str, str] = {}
         for temporary_name, destination in temporary:
             os.replace(temporary_name, destination)

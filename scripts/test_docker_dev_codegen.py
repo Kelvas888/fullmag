@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -471,6 +472,54 @@ class DockerDevCodegenTests(unittest.TestCase):
             published = codegen._publish_outputs(source, outputs, before)
             self.assertEqual(set(published), set(names))
             self.assertEqual({name: (generated / name).read_bytes() for name in names}, outputs)
+
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX permission bits")
+    def test_published_sources_are_world_readable_before_atomic_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            generated = source / "apps/control-room/src/kernel/api/generated"
+            generated.mkdir(parents=True)
+            names = ("openapi-v2.json", "openapi-v2-types.ts", "openapi-v2-client.ts", "openapi-v2-paths.ts")
+            before = codegen._output_baseline(source, names)
+            replace = os.replace
+            observed = []
+            def publish(prepared, destination):
+                self.assertEqual(stat.S_IMODE(prepared.stat().st_mode), 0o644)
+                observed.append(destination.name)
+                replace(prepared, destination)
+            with mock.patch.object(codegen.os, "replace", side_effect=publish):
+                codegen._publish_outputs(source, {name:name.encode() for name in names}, before)
+            self.assertEqual(observed, list(names))
+            for name in names:
+                self.assertEqual(stat.S_IMODE((generated / name).stat().st_mode), 0o644)
+                self.assertEqual((generated / name).read_bytes(), name.encode())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX permission bits")
+    def test_chmod_failure_and_source_collision_preserve_existing_outputs(self) -> None:
+        for failure in ("chmod", "collision"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary)
+                generated = source / "apps/control-room/src/kernel/api/generated"
+                generated.mkdir(parents=True)
+                names = ("openapi-v2.json", "openapi-v2-types.ts", "openapi-v2-client.ts", "openapi-v2-paths.ts")
+                for name in names:
+                    (generated / name).write_bytes(b"previous")
+                    (generated / name).chmod(0o640)
+                before = codegen._output_baseline(source, names)
+                if failure == "collision":
+                    (generated / names[0]).write_bytes(b"concurrent edit")
+                preserved = {name:((generated / name).read_bytes(), (generated / name).stat().st_mode) for name in names}
+                outputs = {name:name.encode() for name in names}
+                if failure == "chmod":
+                    with mock.patch.object(codegen.os, "chmod", side_effect=PermissionError("refused")):
+                        with self.assertRaises(PermissionError):
+                            codegen._publish_outputs(source, outputs, before)
+                else:
+                    with self.assertRaisesRegex(codegen.CodegenError, "changed while codegen"):
+                        codegen._publish_outputs(source, outputs, before)
+                self.assertEqual({name:((generated / name).read_bytes(), (generated / name).stat().st_mode) for name in names}, preserved)
+                self.assertEqual(sorted(path.name for path in generated.iterdir()), sorted(names))
 
 
 if __name__ == "__main__":
