@@ -4407,95 +4407,16 @@ def _validate_failed_prestart_successor(
             raise BuildControlError("Pre-start successor published an unexpected artifact: " + filename)
 
 
-def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None):
-    """Revalidate one completed recreation and prove its old app IDs are absent."""
+def _validate_removed_recreation_proof(
+    args, control, previous, document, identity, *, operation_id, operation_raw,
+    operation_terminal, retained_raw, retained, previous_raw, document_raw, operator_probe_record,
+):
+    """Validate the retained incarnation and native proof after exact app-ID removal.
 
-    from docker_volume_stop_unadmitted import _control_bytes
-
-    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "resume_recreation", ""))):
-        raise BuildControlError("Recreation resume requires one exact operation UUID")
-    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "attempt", ""))):
-        raise BuildControlError("Recreation resume requires the exact prior start attempt UUID")
-    if not isinstance(args.config_sha256, str) or _SHA256.fullmatch(args.config_sha256) is None:
-        raise BuildControlError("Recreation resume requires the exact prior configuration digest")
-
-    previous_root = "development/attempts/" + args.attempt
-    previous_raw, previous = _read_canonical_control_record(
-        control, previous_root + "/terminal.json", "prior development terminal receipt"
-    )
-    current_raw = _control_bytes(control, "development/current.json", optional=True)
-    if current_raw is None:
-        raise BuildControlError("Recreation resume has no current development receipt")
-    current = json.loads(current_raw)
-    if previous.get("state") not in {"failed-confirmed", "succeeded"}:
-        raise BuildControlError("Recreation resume has no admissible prior development outcome")
-    if previous.get("compose_project") != control.project:
-        raise BuildControlError("Recreation resume belongs to another Compose project")
-    inputs = previous.get("inputs")
-    if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
-        raise BuildControlError("Recreation resume source selection differs from the prior start")
-    for source_key, identity_key in (
-        ("source_project_id", "project_id"),
-        ("source_worktree_id", "worktree_id"),
-        ("source_checkout_kind", "checkout_kind"),
-    ):
-        if inputs.get(source_key) != identity.get(identity_key):
-            raise BuildControlError("Recreation resume source identity differs from the prior start")
-    image = inputs.get("image_id")
-    if not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
-        raise BuildControlError("Recreation resume has no immutable prior image identity")
-
-    document_raw, document = _read_canonical_control_record(
-        control, previous_root + "/compose.json", "prior development Compose document"
-    )
-    if (
-        hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256
-        or document.get("name") != control.project
-    ):
-        raise BuildControlError("Recreation resume prior Compose identity/configuration pin differs")
-    services = document.get("services")
-    frontend = services.get("frontend") if isinstance(services, Mapping) else None
-    frontend_ports = frontend.get("ports") if isinstance(frontend, Mapping) else None
-    if not isinstance(frontend_ports, list) or len(frontend_ports) != 1:
-        raise BuildControlError("Recreation resume prior Compose frontend port is ambiguous")
-    frontend_port = frontend_ports[0]
-    if (
-        not isinstance(frontend_port, Mapping)
-        or frontend_port.get("host_ip") != "127.0.0.1"
-        or frontend_port.get("mode") != "ingress"
-        or frontend_port.get("protocol") != "tcp"
-        or frontend_port.get("target") != 8080
-        or not isinstance(frontend_port.get("published"), str)
-        or re.fullmatch(r"[1-9][0-9]{0,4}", frontend_port["published"]) is None
-        or int(frontend_port["published"]) > 65535
-        or int(frontend_port["published"]) != args.port
-    ):
-        raise BuildControlError("Recreation resume frontend port differs from the prior start")
-    url = previous.get("url")
-    if url is not None:
-        match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})", url) if isinstance(url, str) else None
-        if match is None or int(match.group(1)) != args.port:
-            raise BuildControlError("Recreation resume prior frontend URL differs from its Compose port")
-    policy = inputs.get("gpu_access_requested")
-    if policy not in {"auto", "required", "disabled"} or getattr(args, "gpu_access", None) != policy:
-        raise BuildControlError("Recreation resume GPU access intent differs from the prior start")
-    allowlist = include_untracked_from_compose(document)
-    if normalize_include_untracked_paths(getattr(args, "include_untracked", None)) != allowlist:
-        raise BuildControlError("Recreation resume source allowlist differs from the retained Compose document")
-    operator_probe_record = _operator_probe_record_from_retained(previous, document)
-
-    active_raw = _control_bytes(control, "active", optional=True)
-    if active_raw is not None:
-        raise BuildControlError("A managed operation lease is still active; recreation resume is refused")
-
-    operation_id = args.resume_recreation
-    operation_root = "recreate-services/attempts/" + operation_id
-    operation_raw, operation_terminal = _read_canonical_control_record(
-        control, operation_root + "/terminal.json", "recreation operation terminal receipt"
-    )
-    retained_raw, retained = _read_canonical_control_record(
-        control, operation_root + "/retained-containers.json", "recreation retained-container snapshot"
-    )
+    Operation admission remains with each caller: ordinary resume requires no
+    active lease; completed-start rechecks this immutable evidence under its own.
+    """
+    image = previous["inputs"]["image_id"]
     expected_operation_inputs = {
         "attempt": args.attempt,
         "config_sha256": args.config_sha256,
@@ -4633,6 +4554,104 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
         removed_container_proof=proof,
     )
     proof["native_recovery_context"] = native_recovery_context
+    return snapshot, proof, native_recovery_context
+
+
+def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None):
+    """Revalidate one completed recreation and prove its old app IDs are absent."""
+
+    from docker_volume_stop_unadmitted import _control_bytes
+
+    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "resume_recreation", ""))):
+        raise BuildControlError("Recreation resume requires one exact operation UUID")
+    if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "attempt", ""))):
+        raise BuildControlError("Recreation resume requires the exact prior start attempt UUID")
+    if not isinstance(args.config_sha256, str) or _SHA256.fullmatch(args.config_sha256) is None:
+        raise BuildControlError("Recreation resume requires the exact prior configuration digest")
+
+    previous_root = "development/attempts/" + args.attempt
+    previous_raw, previous = _read_canonical_control_record(
+        control, previous_root + "/terminal.json", "prior development terminal receipt"
+    )
+    current_raw = _control_bytes(control, "development/current.json", optional=True)
+    if current_raw is None:
+        raise BuildControlError("Recreation resume has no current development receipt")
+    current = json.loads(current_raw)
+    if previous.get("state") not in {"failed-confirmed", "succeeded"}:
+        raise BuildControlError("Recreation resume has no admissible prior development outcome")
+    if previous.get("compose_project") != control.project:
+        raise BuildControlError("Recreation resume belongs to another Compose project")
+    inputs = previous.get("inputs")
+    if not isinstance(inputs, Mapping) or inputs.get("source_root") != str(selected):
+        raise BuildControlError("Recreation resume source selection differs from the prior start")
+    for source_key, identity_key in (
+        ("source_project_id", "project_id"),
+        ("source_worktree_id", "worktree_id"),
+        ("source_checkout_kind", "checkout_kind"),
+    ):
+        if inputs.get(source_key) != identity.get(identity_key):
+            raise BuildControlError("Recreation resume source identity differs from the prior start")
+    image = inputs.get("image_id")
+    if not isinstance(image, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+        raise BuildControlError("Recreation resume has no immutable prior image identity")
+
+    document_raw, document = _read_canonical_control_record(
+        control, previous_root + "/compose.json", "prior development Compose document"
+    )
+    if (
+        hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256
+        or document.get("name") != control.project
+    ):
+        raise BuildControlError("Recreation resume prior Compose identity/configuration pin differs")
+    services = document.get("services")
+    frontend = services.get("frontend") if isinstance(services, Mapping) else None
+    frontend_ports = frontend.get("ports") if isinstance(frontend, Mapping) else None
+    if not isinstance(frontend_ports, list) or len(frontend_ports) != 1:
+        raise BuildControlError("Recreation resume prior Compose frontend port is ambiguous")
+    frontend_port = frontend_ports[0]
+    if (
+        not isinstance(frontend_port, Mapping)
+        or frontend_port.get("host_ip") != "127.0.0.1"
+        or frontend_port.get("mode") != "ingress"
+        or frontend_port.get("protocol") != "tcp"
+        or frontend_port.get("target") != 8080
+        or not isinstance(frontend_port.get("published"), str)
+        or re.fullmatch(r"[1-9][0-9]{0,4}", frontend_port["published"]) is None
+        or int(frontend_port["published"]) > 65535
+        or int(frontend_port["published"]) != args.port
+    ):
+        raise BuildControlError("Recreation resume frontend port differs from the prior start")
+    url = previous.get("url")
+    if url is not None:
+        match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})", url) if isinstance(url, str) else None
+        if match is None or int(match.group(1)) != args.port:
+            raise BuildControlError("Recreation resume prior frontend URL differs from its Compose port")
+    policy = inputs.get("gpu_access_requested")
+    if policy not in {"auto", "required", "disabled"} or getattr(args, "gpu_access", None) != policy:
+        raise BuildControlError("Recreation resume GPU access intent differs from the prior start")
+    allowlist = include_untracked_from_compose(document)
+    if normalize_include_untracked_paths(getattr(args, "include_untracked", None)) != allowlist:
+        raise BuildControlError("Recreation resume source allowlist differs from the retained Compose document")
+    operator_probe_record = _operator_probe_record_from_retained(previous, document)
+
+    active_raw = _control_bytes(control, "active", optional=True)
+    if active_raw is not None:
+        raise BuildControlError("A managed operation lease is still active; recreation resume is refused")
+
+    operation_id = args.resume_recreation
+    operation_root = "recreate-services/attempts/" + operation_id
+    operation_raw, operation_terminal = _read_canonical_control_record(
+        control, operation_root + "/terminal.json", "recreation operation terminal receipt"
+    )
+    retained_raw, retained = _read_canonical_control_record(
+        control, operation_root + "/retained-containers.json", "recreation retained-container snapshot"
+    )
+    snapshot, proof, native_recovery_context = _validate_removed_recreation_proof(
+        args, control, previous, document, identity, operation_id=operation_id,
+        operation_raw=operation_raw, operation_terminal=operation_terminal,
+        retained_raw=retained_raw, retained=retained, previous_raw=previous_raw,
+        document_raw=document_raw, operator_probe_record=operator_probe_record,
+    )
     if expected_proof is not None and proof != expected_proof:
         raise BuildControlError("Recreation resume evidence changed before the new start admission")
     if current_raw != canonical(current) + b"\n" or current != previous:
@@ -5177,7 +5196,8 @@ def _completed_recreation_start_context(control, args, selected, layout):
     if any(_control_bytes(control, path) != previous_raw for path in ("development/current.json", "development/verified.json")):
         raise BuildControlError("A newer or inconsistent development authority superseded this continuation")
     previous = json.loads(previous_raw)
-    document = control.read(previous_base + "/compose.json")
+    document_raw = _control_bytes(control, previous_base + "/compose.json")
+    document = json.loads(document_raw)
     image = previous.get("inputs", {}).get("image_id")
     ids = [previous.get("backend_container"), previous.get("frontend_container")]
     if (previous.get("state") != "succeeded" or previous.get("compose_project") != control.project
@@ -5212,13 +5232,23 @@ def _completed_recreation_start_context(control, args, selected, layout):
         raise BuildControlError("Completed recreation session owner/admission/startup differs")
     if str(args.port) != document["services"]["frontend"]["environment"].get("FULLMAG_FRONTEND_HOST_PORT"):
         raise BuildControlError("Completed recreation retained frontend port differs")
-    recovery = _retained_recovery_context(control, previous, document, fresh_state=False, backend_id=ids[0])
+    retained_raw, retained = _read_canonical_control_record(
+        control, base + "/retained-containers.json", "completed recreation retained-container snapshot"
+    )
+    operator_probe_record = _operator_probe_record_from_retained(previous, document)
+    _, removed_proof, recovery = _validate_removed_recreation_proof(
+        args, control, previous, document, control.identity, operation_id=attempt,
+        operation_raw=raw, operation_terminal=completed, retained_raw=retained_raw,
+        retained=retained, previous_raw=previous_raw, document_raw=document_raw,
+        operator_probe_record=operator_probe_record,
+    )
     if (not recovery.get("previous_config_sha256") or not recovery.get("native_restart_metadata")
             or recovery.get("recovery_environment") or recovery.get("recovery_metadata")):
         raise BuildControlError("Completed recreation requires the exact managed failed-owner restart proof")
     reuse = {"state": state, "host_certificate": certificate_path,
         "owner_marker": owner_marker, "receipt": {"image_id": image},
-        "operator_probe_environment_record": _operator_probe_record_from_retained(previous, document)}
+        "operator_probe_environment_record": operator_probe_record,
+        "removed_recreation_proof_sha256": hashlib.sha256(canonical(removed_proof)).hexdigest()}
     return {"reuse_state": reuse, **recovery}
 
 
