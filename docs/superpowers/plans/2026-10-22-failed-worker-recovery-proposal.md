@@ -157,3 +157,16 @@ host_execution, bez panic lub zmiany wspólnego API. Parser PASS;
 recovery-optional-host-admission-fix.json zawiera dowód i rozważone rozwiązania.
 Wymagany jest nowy udany build i wykonanie CI; nieudany kandydat nie będzie
 promowany. Pełne runtime recovery nadal NOT VERIFIED i niewykonane.
+
+
+## Natywna weryfikacja requestu bez finalizacji
+
+Opcja --verify-only wykonuje dokładnie te same walidacje configu, ownera,
+pakietu, namespace, journalu/inboxu, receiptów, lease, reservation i slotu
+pod tymi samymi blokadami. Kończy się przed pierwszym Failed eventem.
+Nie zapisuje DoNotRetry, nie zwalnia lease/host reservation, nie archiwizuje
+slotu i nie uruchamia solvera. Zwraca verified_reaped_worker_failure z raw
+request SHA i mutations_applied=false. Błędne i powtórzone opcje są odrzucane.
+Weryfikacja przed zgodą zostanie porównana z pełnymi hashami trwałego stanu;
+aktualne źródła nie są jeszcze dowodem wykonania tej ścieżki. Po jej sukcesie
+konkretna aktywacja nadal wymaga osobnej decyzji operatora dla tego samego SHA.

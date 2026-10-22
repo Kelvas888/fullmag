@@ -2559,7 +2559,7 @@ fn run() -> Result<()> {
             }
             run_service(path)
         }
-        _ => bail!("usage: fullmag-runtime-service --fail-reaped-worker --config <absolute-json-path> --request <absolute-json-path> --request-sha256 <sha256> | --config <absolute-json-path> | --cancel-failed-no-spawn --config <absolute-json-path> --request <absolute-json-path> | --prepare-orphan-teardown --config <absolute-json-path> --request <absolute-json-path> | --recover-orphan-after-teardown --config <absolute-json-path> --request <absolute-json-path> --attestation <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--device-access cpu|gpu] [--native-fem-readiness <absolute-json-path>] [--host-id <stable-id>]")
+        _ => bail!("usage: fullmag-runtime-service --fail-reaped-worker --config <absolute-json-path> --request <absolute-json-path> --request-sha256 <sha256> [--verify-only] | --config <absolute-json-path> | --cancel-failed-no-spawn --config <absolute-json-path> --request <absolute-json-path> | --prepare-orphan-teardown --config <absolute-json-path> --request <absolute-json-path> | --recover-orphan-after-teardown --config <absolute-json-path> --request <absolute-json-path> --attestation <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--device-access cpu|gpu] [--native-fem-readiness <absolute-json-path>] [--host-id <stable-id>]")
     }
 }
 

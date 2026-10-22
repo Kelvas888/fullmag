@@ -2245,3 +2245,28 @@ pozostał bez ACK i poza inboxem. Wcześniejsza hipoteza pending Start była bł
 rzeczywistego applied-prefix, z odmową ambiguous pending Start i bez replay Solve.
 Najnowszy fetch potwierdził origin/master f3730d1f60ab101b3cb009d797bfa77510396987
 już zawarty w naszym HEAD. PR247 pozostaje otwarty; E1–E12 nieprzyjęte.
+
+
+### Checkpoint 22.10.2026 — kompilacja recovery i zachowana operacja buildu
+
+PR head 1ece1ef41b01d64571ca5f869e389e0077eb6d34 naprawia E0599
+HostRuntimeAdmission::open -> Result<Option<Self>> przez jawne wymaganie
+skonfigurowanego host ledger. CI d423 oraz rzeczywisty production build
+potwierdziły ten błąd; lokalnych unitów Rust nie kompilowano.
+
+Build recovery ad78022c285049968f0a5ea81a9d4612 użył stałego backendu
+własnej grupy i snapshotu d423 z 11 lokalnymi zmianami cold-open. Preflight:
+601517252608 wolnych bajtów, estymacja2790084108; capture9305files,
+9272cachehits. Make zakończył się exit2 po747850ms. Bieżący pakiet nie został
+promowany i żaden solver nie wystartował. Kontroler po znanym failed Make
+przeszedł jednak do retained_unknown i nadal trzyma swoje build/runtime
+locks; operacja nie ma jeszcze terminalnego receiptu. Nie skasowano blokad
+ani helpera. Wymagana jest analiza kanonicznego zakończenia dokładnie tej
+operacji przed następnym buildem. Pełny log w recovery-build/attempts/ad780.../build.log.
+
+Dostęp do nowego procesu Ubuntu WSL chwilowo zwrócił0x8007274c, potem
+krótkie /bin/true przeszło. Docker odpowiadał przez cały czas. Nie wykonano
+restartu WSL ani Docker Desktop. Pierwsza próba edycji --verify-only nie
+uruchomiła się z powodu tego timeoutu; późniejszy sprawdzony zapis dodał17linii
+preflight, kończących się przed terminalizacją. Parser obu plików PASS;
+rzeczywista walidacja requestu i wszystkie efekty recovery nadal NOT VERIFIED.

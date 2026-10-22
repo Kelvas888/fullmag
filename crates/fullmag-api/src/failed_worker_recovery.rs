@@ -561,11 +561,19 @@ fn terminalize(
 
 pub(super) fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
     let mut options = BTreeMap::new();
+    let mut verification_only = false;
     let mut args = args;
     while let Some(key) = args.next() {
         let key = key
             .into_string()
             .map_err(|_| anyhow::anyhow!("recovery option is not UTF-8"))?;
+        if key == "--verify-only" {
+            if verification_only {
+                bail!("duplicate reaped-worker verification option");
+            }
+            verification_only = true;
+            continue;
+        }
         if !matches!(key.as_str(), "--config" | "--request" | "--request-sha256")
             || options.contains_key(&key)
         {
@@ -706,6 +714,15 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
     }
     validate_process_receipt(&request, store.root())?;
     validate_package(&request)?;
+    if verification_only {
+        println!("{}", serde_json::json!({
+            "schema_version": SCHEMA, "status": "verified_reaped_worker_failure",
+            "request_sha256": pin, "run_id": request.identity.run_id,
+            "task_id": request.identity.task_id, "mutations_applied": false,
+            "solve_replayed": false
+        }));
+        return Ok(());
+    }
     // No solver dispatch, inbox acknowledgement or output cleanup occurs here.
     terminalize(&request, &store, recovered)?;
     if lease.state == FmsResourceLeaseState::Active {
