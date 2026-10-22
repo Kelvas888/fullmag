@@ -545,7 +545,7 @@ part does not promote the others.
 
 | Capability | FDM CPU reference | FDM GPU production | FEM CPU public | FEM GPU public | Current truth |
 |---|---|---|---|---|---|
-| `RegionalFieldDrive` / `prescribed_zeeman_mask` import compatibility | `reference_executable` | `unsupported` with explicit rejection | `source_visible` only | `unsupported` | Current truth before ADR 0019 implementation: FDM CPU consumes the legacy materialized mask; native FEM has no qualifying projection/RHS proof. Planner-visible intent is not executable evidence. New authoring exports only `RegionalFieldDrive` and no lane may fall back to `SolvedAntennaDrive` or another device. |
+| `RegionalFieldDrive` / `prescribed_zeeman_mask` import compatibility | `reference_executable` | `source_visible` | `source_visible` | `source_visible` | Source reconciliation at `9902410b016dbe934669122ef00a7825bbd2d5b0`: native drive upload and RHS consumption exist; managed runtime and lane parity remain NOT VERIFIED. See the source index below. No fallback to `SolvedAntennaDrive` or another device. |
 | variable-width 3D microstrip/CPW layout | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Current constant-width antenna structs and box preview do not encode ordered width/gap stations or explicit return conductors. |
 | `StudyIR::AntennaFieldSolve(model="quasistatic_conduction_biot_savart_3d")` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Initial target is native FEM CPU/MFEM H1 conduction plus adaptive 3D Biot-Savart. Current `mqs_2p5d_az` is an infinite-strip approximation and does not satisfy this row. |
 | `SolvedAntennaDrive` consumption | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Each lane is promoted independently after artifact compatibility, stale rejection, waveform, `H_ant`, and LLG parity gates pass. |
@@ -553,6 +553,21 @@ part does not promote the others.
 | local `W_H(u,k)` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Requires the new variable-width layout and windowed local-spectrum analysis contract. |
 | Gamma time-domain response from `RegionalFieldDrive` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Promotion requires equilibrium transfer, exact cadence, `H_drive` RHS/readback identity, RK-time convergence, linear-response, mesh, and lane-parity gates from physics note 0920. |
 | finite-k response `S_m(k,omega)` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Requires localized regional drive, open propagation supercell, absorber proof, uniform physical probe operator, and an artifact-backed response. It must not be inferred from source spectrum or a nonuniform FEM node FFT. |
+
+Regional-drive source evidence at the same pinned base:
+`crates/fullmag-runner/src/fdm/cpu/reference.rs:1125-1128`
+(`materialize_reference_problem`);
+`crates/fullmag-runner/src/fdm/gpu/cuda/native.rs:2067-2073`
+(`fullmag_fdm_backend_set_regional_field_drives_v2` call);
+`backends/fdm/gpu/cuda/interactions/demag_fp32.cu:500-512`
+(`combine_effective_field_fp32_kernel`);
+`backends/fem/cpu/mfem/interactions/effective_field.cpp:191-194`
+(`materialize_regional_field_drive` call); and
+`backends/fem/gpu/cuda/integrators/rk/rk_effective_field.cu:62-65`
+(`gpu_regional_field_drive_materialize_and_accumulate` call).
+These sources disprove the old absent-consumption claim, but do not supply
+managed waveform, RK-time convergence, or physics qualification evidence.
+The separate Gamma-response row remains unsupported pending those gates.
 
 Promotion order is fixed:
 
@@ -748,7 +763,7 @@ closed. Users do not need to author a backend-specific demag realization to ente
 | `InterfacialDMI` / `BulkDMI` | single-grid FDM exec; multilayer interfacial only | planned | planned | **lane-specific executable** (FDM); **bounded energy-observation qualification** (FEM GPU); **under-qualification** (FEM frequency response) | CPU FDM computes DMI field/energy in the reference lane and exposes `H_dmi` as a derived snapshot/preview observable. Public multilayer FDM carries global interfacial DMI through its current CPU/CUDA paths, but the multilayer planner rejects `BulkDMI` instead of silently dropping it. Separate managed uniform-`M_s` native FEM GPU fixtures select interfacial `H_dmi` and bulk `H_dmi_bulk`, and compare `eden_dmi`/`eden_total` with native `E_dmi`/`E_total` at the same source step. That evidence qualifies only the bounded time-evolution energy-observation workload; it does not promote GPU DG0 or every FEM DMI execution surface. The FEM driven frequency-response CPU/GPU P1 tetrahedral tangent DMI slices remain under their separate qualification. Per-layer/per-cell DMI fields remain deferred. |
 | `RotatedInterfacialDMI` | FDM CPU/CUDA implemented; current Göbel runtime qualification `NOT VERIFIED` | FEM CPU/GPU implemented, runtime unverified; GPU limited to P1 tet4 | planned | **lane-specific implementation; qualification pending** | Python, `ProblemIR`, study-scoped UI authoring and script rewrite preserve signed finite `D`. Single-grid FDM CPU/CUDA and bounded FEM paths carry the operator without GPU-to-CPU fallback; conventional and rotated DMI cannot be mixed, including object-scoped terms. Nonzero `D` at open magnetic boundaries requires Exchange and positive resolved local stiffness, including active-mask edges. FDM and FEM treat zero `D` as a no-op without Exchange, preserving explicit intent; zero FEM rDMI does not require periodic residual support. Native CUDA rejects cellwise material fields. `H_rotated_dmi` and on-demand `eden_rotated_dmi` are currently materialized only by FDM; scheduled scalar-field snapshots/autosave and FEM field requests reject. `E_dmi` includes `E_rotated_dmi`; total energy counts it once. The historical FP64 CUDA Göbel report passed 15 checks but does not qualify the current 19-check verifier. FEM rejects nonzero rDMI with PBC, and all rDMI eigenmode and frequency-response requests; FEM GPU also rejects prism, pyramid and mixed topology. |
 | `Zeeman` | ✅ exec | ✅ exec | planned | **public-executable** (FDM/FEM) | Public API authors `B`; planner normalizes to `H_ext` in A/m for CPU FDM and CPU FEM |
-| `RegionalFieldDrive` / legacy prescribed antenna mask import | CPU reference executable; CUDA unsupported | source-visible planning only; native CPU/GPU consumption unqualified | planned | **mixed current status; see the microwave slice above** | Separate MuMax-style source governed by note 0920 and ADR 0019. It is not a conductor field solve and must not be used as a hidden fallback for `SolvedAntennaDrive`; this summary does not promote any lane beyond the detailed row above. |
+| `RegionalFieldDrive` / legacy prescribed antenna mask import | CPU reference executable; CUDA source-visible | native CPU/GPU consumption source-visible, runtime unqualified | planned | **source reconciliation only; see the microwave slice above** | Note 0920 and ADR 0019 own the physics. The pinned source index above shows native RHS consumption, not managed qualification. No conductor solve or hidden `SolvedAntennaDrive` fallback is implied. |
 | Variable-width 3D microstrip/CPW layout | planned | planned | planned | **planned** | Ordered width/gap stations along current flow, explicit signal/return conductors, and rigid 3D placement; the current constant-width preview does not qualify. |
 | `AntennaFieldSolve` Tier 1 | artifact consumer planned | CPU solver planned; GPU unsupported | explicit state transfer planned | **planned** | Native FEM CPU owns the first H1 conduction plus adaptive 3D Biot-Savart solve. `mqs_2p5d_az` does not qualify. |
 | `SolvedAntennaDrive` | planned | planned | planned | **planned** | Immutable per-ampere basis multiplied by canonical waveform; lane promotion requires stale-artifact rejection and field/LLG parity. |
@@ -781,6 +796,194 @@ max_torque_Apm` is its equivalent in `T`, while `max_rhs_norm_per_s` is a
 separate dynamic observable in `1/s`. Budget exhaustion is completed but not
 converged; numerical stagnation is failed/non-converged. The authoritative
 completion record belongs to execution, never to sampled artifacts.
+
+<a id="saved-output-capabilities"></a>
+
+## Saved time-domain output capabilities (P0.2)
+
+This section and JSON `saved_output_capabilities` are one source-bound snapshot
+at `9902410b016dbe934669122ef00a7825bbd2d5b0`. They take precedence over the
+historical aggregate output rows above. The scope is single-grid FDM and
+native nodal-P1 FEM time-domain output, not multilayer, eigen, frequency-domain,
+SaveState, accepted CAS bundles, or the UI data plane. Source inspection is
+not managed execution, physics validation, or a production promotion.
+
+### Current saved outputs, not raw readout
+
+Each cell describes the complete public periodic field request and snapshot
+path, with required interactions enabled and an otherwise legal plan. `S64`
+means a source-wired saved field with `<f8` payloads. `S32/64` means native CUDA
+single snapshots retain `<f4` in `fields/<q>.zarr`, but stage autosave converts
+them to `<f8`. `P` means the planner rejects the public field request; `R`
+means a later snapshot route is missing even though authoring/planning can
+accept the quantity; `A` means the public field/table allowlist rejects it. These
+are documentation cell codes, not runtime reason codes. `—` means no legal
+execution precision. All FDM CPU/single, FEM CPU/single and FEM GPU/single
+cells are `—`; no output conversion makes those execution lanes legal (E8).
+
+| Quantity / request | FDM CPU double | FDM GPU double | FDM GPU single | FEM CPU double | FEM GPU double | Evidence |
+|---|---|---|---|---|---|---|
+| `m`, `H_ex`, `H_demag`, `H_ext`, `H_ani`, `H_eff`, `H_oe` field | S64 | S64 | S32/64 | S64 | S64 | E1–E4, E6 |
+| `H_drive` field | S64 | R | R | S64 | S64 | E1–E4 |
+| `H_ant` field | S64 | S64 | S64 | S64 | R | E1–E4, E6, E9 |
+| `H_dmi` field | S64 | P | P | S64 | S64 | E1–E4 |
+| `H_rotated_dmi` field | S64 | S64 | S32/64 | P | P | E1–E4 |
+| `H_dmi_bulk` field | P | P | P | S64 | S64 | E1–E4 |
+| `H_mel`, `H_therm` field | P | P | P | S64 | S64 | E1–E4 |
+| `H_ani_cubic` field | P | P | P | P | P | E1–E4 |
+| `demag_phi` field | R | R | R | S64 | S64 | E1–E4 |
+| `eden_ex`, `eden_demag`, `eden_ext`, `eden_drive`, `eden_ani`, `eden_dmi`, `eden_total` field | P | P | P | P | P | E1, E5 |
+| `eden_rotated_dmi` field | A | A | A | A | A | E1, E5 |
+| `torque`, `B_eff`, spatial `B_ext` field | A | A | A | A | A | E1, E5 |
+| `E_ex`, `E_demag`, `E_ext`, `E_drive`, `E_rotated_dmi`, `E_total`, `time`, `step`, `solver_dt`, `mx`, `my`, `mz`, `max_dm_dt`, `max_h_eff` periodic scalar | S64 | S64 | S64 | S64 | S64 | E7 |
+| `E_ani`, `E_dmi` periodic scalar | R | R | R | R | R | E7 |
+| `e_ex`, `e_demag`, `e_ext`, `e_drive`, `e_ani`, `e_dmi`, `e_rotated_dmi`, `e_total`, `t`, `mx`, `my`, `mz` TableAutosave column | S64 | S64 | S64 | S64 | S64 | E7 |
+| `B_extx`, `B_exty`, `B_extz` TableAutosave column | A | A | A | A | A | E7 |
+| `eden_ex`, `eden_demag`, `eden_ext`, `eden_drive`, `eden_ani`, `eden_dmi`, `eden_total` time-cadenced StageAutosave field | R | S64 | S32/64 | R | R | E2–E6, E10 |
+| `H_ani_cubic` time-cadenced StageAutosave field | R | R | R | S64 | S64 | E2–E4, E10 |
+| `H_dmi` time-cadenced StageAutosave field | S64 | R | R | S64 | S64 | E2–E4, E10 |
+| `H_dmi_bulk`, `H_mel`, `H_therm` time-cadenced StageAutosave field | R | R | R | S64 | S64 | E2–E4, E10 |
+| `H_rotated_dmi` time-cadenced StageAutosave field | S64 | S64 | S32/64 | R | R | E2–E4, E10 |
+
+`S64` for a table means f64 scalar values and, when routed to stage Zarr,
+`<f8` storage; CSV has no binary dtype. Lower-case table `e_ani`/`e_dmi`
+already exist. The missing upper-case periodic scalar schedules must not be
+reported as missing native energy calculations (E7).
+
+Time-cadenced StageAutosave has a different current admission path: its
+fields are added by `runtime_outputs` after the direct-output validator.
+The final five rows record those differences, not a new planner guarantee
+(E10). In particular, CUDA `eden_*` can reach a saved native snapshot through
+that path despite direct Field rejection. V1 must unify admission before
+Solve instead of relying on this bypass. Accepted-step autosave is outside
+these cadence-specific rows.
+
+The host field writer defaults to JSON. Its optional Zarr series requires
+`cuda` or `fem-gpu` at compile time, even for CPU-produced host snapshots.
+Native CUDA/FEM snapshots have a separate series route. The stage writer
+accepts f64 only. Thus the matrix does not promise that every current build
+can emit each legacy Zarr layout (E6). `H_drive` is a field request here:
+`Snapshot` has a separate validator branch that does not admit it (E1).
+
+Raw readout is broader than saved export: CPU direct readout has the listed
+`eden_*` except `eden_drive`; CUDA snapshot observables include `eden_drive`
+and `eden_rotated_dmi`, but not `H_drive`, conventional `H_dmi`, or `torque`.
+CUDA torque is a separate preview provider. Native FEM has projected
+`eden_ex/demag/ext/ani/dmi/total` readout, but these are absent from its native
+field-snapshot enum. These providers alone do not prove saved export; the StageAutosave rows
+above identify the separate source-wired route where it exists (E2–E5, E10). No scalar node projection is a canonical element-DG0 density export.
+
+### Verified source index
+
+Every current cell above inherits the relevant gates and writer evidence
+below. All line numbers refer to the pinned base, not a later implementation.
+
+- **E1 — authoring and planning:**
+  `packages/fullmag-py/src/fullmag/model/outputs.py:77-86,127-137`
+  (`SaveField.__post_init__`, `_KNOWN_FIELDS`);
+  `crates/fullmag-plan/src/validate.rs:670-859`
+  (`validate_executable_outputs`, separate Field/Scalar/Snapshot allowlists);
+  `crates/fullmag-plan/src/fdm.rs:2682-2739` and
+  `crates/fullmag-plan/src/fem.rs:3953-3988` (calls to that validator).
+- **E2 — FDM CPU snapshot vs readout:**
+  `crates/fullmag-runner/src/fdm/cpu/reference.rs:3282-3394,3911-3956`
+  (`record_due_outputs`, `direct_field_values_available`,
+  `direct_scalar_values_available`);
+  `crates/fullmag-runner/src/fdm/artifacts.rs:452-485` (`select_base_field`).
+- **E3 — FDM CUDA snapshot vs preview:**
+  `crates/fullmag-runner/src/fdm/gpu/cuda/native.rs:69-114,3080-3103,3905-3956`
+  (`CudaSnapshotObservable::from_quantity`, `can_materialize_preview_quantity`,
+  `NativeFdmBackend::begin_field_snapshot`, `snapshot_observable`);
+  `crates/fullmag-runner/src/fdm/gpu/cuda/artifacts.rs:150-215`
+  (`record_cuda_due_outputs`).
+- **E4 — native FEM snapshot:**
+  `crates/fullmag-runner/src/native_fem.rs:1035-1135,5310-5330,6135-6174`
+  (`NativeFemPreviewObservable::from_quantity`, `fem_preview_observable`,
+  `NativeFemBackend::begin_field_snapshot`, `NativeFemFieldSnapshot::wait_payload`);
+  `crates/fullmag-runner/src/fem/relax/llg_overdamped.rs:624-658`
+  (`execute_llg_overdamped`, scheduled native snapshot dispatch).
+- **E5 — readout is not export:**
+  `crates/fullmag-quantities/src/catalog.rs:221-240` (`QuantityId::Torque`,
+  `supports_export=false`);
+  `crates/fullmag-runner/src/native_fem.rs:2022-2086,2094-2103`
+  (`NativeFemEnergyDensityTerms::observables_for`,
+  `can_materialize_preview_quantity`); E1–E3 supply the other allowlists.
+- **E6 — stored dtype and feature gates:**
+  `crates/fullmag-runner/src/artifact_pipeline.rs:45-69,1351-1364,1520-1557,1625-1682,1788-1989`
+  (`configured_field_artifact_storage`, `ZarrFieldSeriesWriter`,
+  `append_field_snapshot`, `last_chunk_values_f64`, `zarr_dtype`, `writer_loop`);
+  `crates/fullmag-runner/src/autosave_zarr.rs:135-193,222-237`
+  (`append_table_row`, `append_field_sample`, `initialize_array`).
+- **E7 — scalar/table routes:**
+  `packages/fullmag-py/src/fullmag/model/study.py:295-320,365-366,581-585`
+  (`SUPPORTED_TABLE_AUTOSAVE_QUANTITIES`, `TableAutosave.__post_init__`,
+  `_require_supported_table_quantity`); `B_extx/y/z` fail this public gate.
+  `crates/fullmag-runner/src/schedules.rs:35-80` (`collect_scalar_schedules`);
+  `crates/fullmag-runner/src/table_autosave.rs:27-30,64-103,277-345,447-468`
+  (`TableRow`, `TableAutosaveConfig::from_ir`, `table_column_meta`,
+  `table_column_value`); E6 supplies stage Zarr dtype.
+- **E8 — precision admission:**
+  `crates/fullmag-plan/src/fdm.rs:2738-2747` (CPU double-only rejection);
+  `crates/fullmag-plan/src/fem.rs:3985-3989` (double-only admission);
+  `crates/fullmag-runner/src/fdm/gpu/cuda/native.rs:3631-3684`
+  (`NativeFdmFieldSnapshot::ensure_ready`, f32/f64);
+  `crates/fullmag-runner/src/fdm/cpu/reference.rs:3259-3264`
+  (`flatten_field_snapshot`, f64 CPU payload).
+- **E9 — runner-materialized antenna fields:**
+  `crates/fullmag-runner/src/fem/relax/snapshots.rs:10-25,70-82`
+  (`is_antenna_field_snapshot`, `copy_native_fem_field_snapshot`);
+  `crates/fullmag-runner/src/fem/relax/llg_overdamped.rs:629-639`
+  (`execute_llg_overdamped`, CPU-only antenna snapshot branch). E3 shows the CUDA host-field branch;
+  that branch stores f64 even for single execution.
+- **E10 — StageAutosave admission differs:**
+  `packages/fullmag-py/src/fullmag/model/study.py:410-449`
+  (`FieldAutosave`, delegates quantity validation to `SaveField`);
+  `crates/fullmag-plan/src/sampling.rs:199-236` (`runtime_outputs`);
+  `crates/fullmag-plan/src/fdm.rs:3640` and
+  `crates/fullmag-plan/src/fem.rs:4879` (`OutputPlanIR` construction).
+  E1 validates only the original study output list; E2–E4 show actual snapshot
+  dispatch after the stage field schedules are added.
+
+### Proposed v1 output contract and plan-time reasons
+
+This is a **proposal**, not the base implementation. The
+[canonical store contract](output-store-zarr-v1.md) replaces the two legacy
+Zarr layouts. All four realizations must use the same output request semantics.
+Fields preserve resolved precision (`single -> <f4`, `double -> <f8`); tables
+use `<f8`. This does not add CPU/FEM single execution. Add `B_eff` and `torque`
+field export, `B_extx/y/z` table columns, periodic `E_ani`/`E_dmi`, and explicit
+saved-field reductions. Spatial `B_ext` remains outside v1. Verify same-state
+`H_eff` drive inclusion before enabling derived `B_eff`/`torque`; do not infer
+it from a raw provider. Other `P`/`R` cells remain blocked until their exact
+request-to-writer path is implemented and checked.
+
+Before Solve, the proposed planner must check the resolved realization,
+execution precision, quantity, location, reduction, format, and writer.
+Preserve requested `auto`, resolved execution, and the rejected output request.
+Use the same rejection rules in strict/extended; hybrid remains explicit and
+cannot repair an unavailable output implicitly. No host/device fallback,
+quantity substitution, dtype conversion, or dropped request is allowed.
+The following stable codes are reserved for v1; none is claimed to exist in
+base runtime code:
+
+| Proposed reason code | Reject when |
+|---|---|
+| `output_quantity_unknown` | The quantity is absent from the canonical catalog. |
+| `output_quantity_not_exportable` | The quantity exists but has no saved-export contract. |
+| `output_realization_unsupported` | The resolved realization has no provider for this output. |
+| `output_precision_unsupported` | The resolved execution precision is illegal for the realization. |
+| `output_dtype_mismatch` | A requested field dtype differs from resolved precision, or a table dtype is not f64. |
+| `output_location_unsupported` | The requested cell/node/element representation is unavailable. |
+| `output_reduction_unsupported` | The requested component or reduction has no defined implementation. |
+| `output_dependency_unavailable` | A required interaction, primary field, or same-state derived-field input is unavailable. |
+| `output_format_unsupported` | The requested format is outside the output contract. |
+| `output_writer_unavailable` | The format is valid but its writer is absent from the selected build/runtime. |
+| `output_workflow_unsupported` | The workflow is outside the time-domain v1 scope. |
+
+Return all applicable diagnostics in this table order with quantity, requested
+and resolved lane/precision, dtype, format, and a concrete explanation.
+These output-specific codes do not replace current API quantity/materialization
+reason codes or existing backend admission errors.
 
 ## Early planner rules
 
@@ -850,7 +1053,7 @@ metody demag; ta kompozycja FDM nie rozszerza capability FEM.
 
 Dowód: analiza źródeł, bez buildów/testów/symulacji/browser. Runtime/UI/WebGL,
 parytet CPU/GPU i kwalifikacja naukowa: **NOT VERIFIED**. Szczegóły i hashe:
-[checkpoint dużych domen](../reports/2026-10-20/mx3-large-domains-airbox-heff.md).
+Evidence file unavailable: `docs/reports/2026-10-20/mx3-large-domains-airbox-heff.md`.
 
 Trwała obserwacja składa się z czterech niezależnie promowanych capability:
 `runtime.live_residency`, `runtime.historical_observation`,

@@ -18,6 +18,138 @@
     "fem_cpu_public",
     "fem_gpu_public"
   ],
+  "saved_output_capabilities": {
+    "source_commit": "9902410b016dbe934669122ef00a7825bbd2d5b0",
+    "scope": "Single-grid FDM and native nodal-P1 FEM time-domain outputs. Source inspection only; not managed execution or qualification. Excludes multilayer, eigen, frequency-domain, SaveState, accepted CAS and UI data plane.",
+    "columns": [
+      {"id": "fdm_cpu_double", "lane": "fdm_cpu_reference", "precision": "double"},
+      {"id": "fdm_gpu_double", "lane": "fdm_gpu_production", "precision": "double"},
+      {"id": "fdm_gpu_single", "lane": "fdm_gpu_production", "precision": "single"},
+      {"id": "fem_cpu_double", "lane": "fem_cpu_public", "precision": "double"},
+      {"id": "fem_gpu_double", "lane": "fem_gpu_public", "precision": "double"}
+    ],
+    "unsupported_precision_cells": {
+      "precision": "single",
+      "lanes": ["fdm_cpu_reference", "fem_cpu_public", "fem_gpu_public"],
+      "applies_to": "all rows",
+      "cell": "—",
+      "evidence": ["E8"]
+    },
+    "cell_codes": {
+      "S64": {"meaning": "Source-wired saved output; f64 values, <f8 when binary Zarr; CSV has no binary dtype", "series_dtype": "<f8", "stage_dtype": "<f8"},
+      "S32/64": {"meaning": "Native CUDA single series retains f32; stage autosave upcasts to f64", "series_dtype": "<f4", "stage_dtype": "<f8"},
+      "P": {"meaning": "Public field request rejected by planner", "series_dtype": null, "stage_dtype": null},
+      "R": {"meaning": "Authoring/planning may accept, but a later snapshot or scalar/table route is missing", "series_dtype": null, "stage_dtype": null},
+      "A": {"meaning": "Rejected by public field/table allowlist", "series_dtype": null, "stage_dtype": null},
+      "—": {"meaning": "No legal execution precision", "series_dtype": null, "stage_dtype": null}
+    },
+    "rows": [
+      {"quantities": ["m", "H_ex", "H_demag", "H_ext", "H_ani", "H_eff", "H_oe"], "request": "field", "cells": ["S64", "S64", "S32/64", "S64", "S64"], "evidence": ["E1", "E2", "E3", "E4", "E6"]},
+      {"quantities": ["H_drive"], "request": "field", "cells": ["S64", "R", "R", "S64", "S64"], "evidence": ["E1", "E2", "E3", "E4"]},
+      {"quantities": ["H_ant"], "request": "field", "cells": ["S64", "S64", "S64", "S64", "R"], "evidence": ["E1", "E2", "E3", "E4", "E6", "E9"]},
+      {"quantities": ["H_dmi"], "request": "field", "cells": ["S64", "P", "P", "S64", "S64"], "evidence": ["E1", "E2", "E3", "E4"]},
+      {"quantities": ["H_rotated_dmi"], "request": "field", "cells": ["S64", "S64", "S32/64", "P", "P"], "evidence": ["E1", "E2", "E3", "E4"]},
+      {"quantities": ["H_dmi_bulk"], "request": "field", "cells": ["P", "P", "P", "S64", "S64"], "evidence": ["E1", "E2", "E3", "E4"]},
+      {"quantities": ["H_mel", "H_therm"], "request": "field", "cells": ["P", "P", "P", "S64", "S64"], "evidence": ["E1", "E2", "E3", "E4"]},
+      {"quantities": ["H_ani_cubic"], "request": "field", "cells": ["P", "P", "P", "P", "P"], "evidence": ["E1", "E2", "E3", "E4"]},
+      {"quantities": ["demag_phi"], "request": "field", "cells": ["R", "R", "R", "S64", "S64"], "evidence": ["E1", "E2", "E3", "E4"]},
+      {"quantities": ["eden_ex", "eden_demag", "eden_ext", "eden_drive", "eden_ani", "eden_dmi", "eden_total"], "request": "field", "cells": ["P", "P", "P", "P", "P"], "evidence": ["E1", "E5"]},
+      {"quantities": ["eden_rotated_dmi"], "request": "field", "cells": ["A", "A", "A", "A", "A"], "evidence": ["E1", "E5"]},
+      {"quantities": ["torque", "B_eff", "B_ext"], "request": "field", "cells": ["A", "A", "A", "A", "A"], "evidence": ["E1", "E5"]},
+      {"quantities": ["E_ex", "E_demag", "E_ext", "E_drive", "E_rotated_dmi", "E_total", "time", "step", "solver_dt", "mx", "my", "mz", "max_dm_dt", "max_h_eff"], "request": "periodic_scalar", "cells": ["S64", "S64", "S64", "S64", "S64"], "evidence": ["E7"]},
+      {"quantities": ["E_ani", "E_dmi"], "request": "periodic_scalar", "cells": ["R", "R", "R", "R", "R"], "evidence": ["E7"]},
+      {"quantities": ["e_ex", "e_demag", "e_ext", "e_drive", "e_ani", "e_dmi", "e_rotated_dmi", "e_total", "t", "mx", "my", "mz"], "request": "table_column", "cells": ["S64", "S64", "S64", "S64", "S64"], "evidence": ["E7"]},
+      {"quantities": ["B_extx", "B_exty", "B_extz"], "request": "table_column", "cells": ["A", "A", "A", "A", "A"], "evidence": ["E7"]},
+      {"quantities": ["eden_ex", "eden_demag", "eden_ext", "eden_drive", "eden_ani", "eden_dmi", "eden_total"], "request": "stage_field_time_cadence", "cells": ["R", "S64", "S32/64", "R", "R"], "evidence": ["E2", "E3", "E4", "E5", "E6", "E10"]},
+      {"quantities": ["H_ani_cubic"], "request": "stage_field_time_cadence", "cells": ["R", "R", "R", "S64", "S64"], "evidence": ["E2", "E3", "E4", "E10"]},
+      {"quantities": ["H_dmi"], "request": "stage_field_time_cadence", "cells": ["S64", "R", "R", "S64", "S64"], "evidence": ["E2", "E3", "E4", "E10"]},
+      {"quantities": ["H_dmi_bulk", "H_mel", "H_therm"], "request": "stage_field_time_cadence", "cells": ["R", "R", "R", "S64", "S64"], "evidence": ["E2", "E3", "E4", "E10"]},
+      {"quantities": ["H_rotated_dmi"], "request": "stage_field_time_cadence", "cells": ["S64", "S64", "S32/64", "R", "R"], "evidence": ["E2", "E3", "E4", "E10"]}
+    ],
+    "evidence": {
+      "E1": [
+        {"path": "packages/fullmag-py/src/fullmag/model/outputs.py", "lines": "77-86,127-137", "symbols": ["SaveField.__post_init__", "_KNOWN_FIELDS"]},
+        {"path": "crates/fullmag-plan/src/validate.rs", "lines": "670-859", "symbols": ["validate_executable_outputs"]},
+        {"path": "crates/fullmag-plan/src/fdm.rs", "lines": "2682-2739", "symbols": ["validate_executable_outputs call"]},
+        {"path": "crates/fullmag-plan/src/fem.rs", "lines": "3953-3988", "symbols": ["validate_executable_outputs call"]}
+      ],
+      "E2": [
+        {"path": "crates/fullmag-runner/src/fdm/cpu/reference.rs", "lines": "3282-3394,3911-3956", "symbols": ["record_due_outputs", "direct_field_values_available", "direct_scalar_values_available"]},
+        {"path": "crates/fullmag-runner/src/fdm/artifacts.rs", "lines": "452-485", "symbols": ["select_base_field"]}
+      ],
+      "E3": [
+        {"path": "crates/fullmag-runner/src/fdm/gpu/cuda/native.rs", "lines": "69-114,3080-3103,3905-3956", "symbols": ["CudaSnapshotObservable::from_quantity", "can_materialize_preview_quantity", "NativeFdmBackend::begin_field_snapshot", "snapshot_observable"]},
+        {"path": "crates/fullmag-runner/src/fdm/gpu/cuda/artifacts.rs", "lines": "150-215", "symbols": ["record_cuda_due_outputs"]}
+      ],
+      "E4": [
+        {"path": "crates/fullmag-runner/src/native_fem.rs", "lines": "1035-1135,5310-5330,6135-6174", "symbols": ["NativeFemPreviewObservable::from_quantity", "fem_preview_observable", "NativeFemBackend::begin_field_snapshot", "NativeFemFieldSnapshot::wait_payload"]},
+        {"path": "crates/fullmag-runner/src/fem/relax/llg_overdamped.rs", "lines": "624-658", "symbols": ["execute_llg_overdamped"]}
+      ],
+      "E5": [
+        {"path": "crates/fullmag-quantities/src/catalog.rs", "lines": "221-240", "symbols": ["QuantityId::Torque", "supports_export"]},
+        {"path": "crates/fullmag-runner/src/native_fem.rs", "lines": "2022-2086,2094-2103", "symbols": ["NativeFemEnergyDensityTerms::observables_for", "can_materialize_preview_quantity"]}
+      ],
+      "E6": [
+        {"path": "crates/fullmag-runner/src/artifact_pipeline.rs", "lines": "45-69,1351-1364,1520-1557,1625-1682,1788-1989", "symbols": ["configured_field_artifact_storage", "ZarrFieldSeriesWriter", "append_field_snapshot", "last_chunk_values_f64", "zarr_dtype", "writer_loop"]},
+        {"path": "crates/fullmag-runner/src/autosave_zarr.rs", "lines": "135-193,222-237", "symbols": ["append_table_row", "append_field_sample", "initialize_array"]}
+      ],
+      "E7": [
+        {"path": "packages/fullmag-py/src/fullmag/model/study.py", "lines": "295-320,365-366,581-585", "symbols": ["SUPPORTED_TABLE_AUTOSAVE_QUANTITIES", "TableAutosave.__post_init__", "_require_supported_table_quantity"]},
+        {"path": "crates/fullmag-runner/src/schedules.rs", "lines": "35-80", "symbols": ["collect_scalar_schedules"]},
+        {"path": "crates/fullmag-runner/src/table_autosave.rs", "lines": "27-30,64-103,277-345,447-468", "symbols": ["TableRow", "TableAutosaveConfig::from_ir", "table_column_meta", "table_column_value"]}
+      ],
+      "E8": [
+        {"path": "crates/fullmag-plan/src/fdm.rs", "lines": "2738-2747", "symbols": ["CPU reference precision rejection"]},
+        {"path": "crates/fullmag-plan/src/fem.rs", "lines": "3985-3989", "symbols": ["fem_single_precision_rejection call"]},
+        {"path": "crates/fullmag-runner/src/fdm/gpu/cuda/native.rs", "lines": "3631-3684", "symbols": ["NativeFdmFieldSnapshot::ensure_ready"]},
+        {"path": "crates/fullmag-runner/src/fdm/cpu/reference.rs", "lines": "3259-3264", "symbols": ["flatten_field_snapshot"]}
+      ],
+      "E9": [
+        {"path": "crates/fullmag-runner/src/fem/relax/snapshots.rs", "lines": "10-25,70-82", "symbols": ["is_antenna_field_snapshot", "copy_native_fem_field_snapshot"]},
+        {"path": "crates/fullmag-runner/src/fem/relax/llg_overdamped.rs", "lines": "629-639", "symbols": ["execute_llg_overdamped"]}
+      ],
+      "E10": [
+        {"path": "packages/fullmag-py/src/fullmag/model/study.py", "lines": "410-449", "symbols": ["FieldAutosave"]},
+        {"path": "crates/fullmag-plan/src/sampling.rs", "lines": "199-236", "symbols": ["runtime_outputs"]},
+        {"path": "crates/fullmag-plan/src/fdm.rs", "lines": "3640", "symbols": ["OutputPlanIR construction"]},
+        {"path": "crates/fullmag-plan/src/fem.rs", "lines": "4879", "symbols": ["OutputPlanIR construction"]}
+      ]
+    },
+    "raw_readout_only": {
+      "fdm_cpu_reference": "Direct readout includes eden_ex/demag/ext/ani/dmi/rotated_dmi/total, not eden_drive; not scheduled export (E1,E2).",
+      "fdm_gpu_production": "Native snapshot enum includes eden_* including eden_drive and eden_rotated_dmi; H_drive, conventional H_dmi and torque are absent. Torque has a separate preview provider (E1,E3).",
+      "fem_cpu_public": "Projected eden_ex/demag/ext/ani/dmi/total readout is separate from the native field snapshot enum; not element-DG0 export (E4,E5).",
+      "fem_gpu_public": "Same projected-density readout distinction, without CPU fallback (E4,E5)."
+    },
+    "stage_admission_constraint": "Time-cadenced StageAutosave fields are added by runtime_outputs after direct-output validation. The final five rows show alternate saved snapshot routes, not a planner guarantee. V1 must unify admission before Solve. Accepted-step cadence is not covered by these rows (E10).",
+    "writer_constraints": "Host fields default to JSON. Optional host Zarr series needs cuda or fem-gpu compile feature. Native snapshots use their series route. Stage autosave accepts only f64; CUDA single is upcast. H_drive Field requests do not imply Snapshot admission (E1,E6).",
+    "proposed_v1": {
+      "status": "proposal_not_implemented_at_source_commit",
+      "spec": "docs/specs/output-store-zarr-v1.md",
+      "field_dtype": {"single": "<f4", "double": "<f8"},
+      "table_dtype": "<f8",
+      "add_field_export": ["B_eff", "torque"],
+      "add_periodic_scalars": ["E_ani", "E_dmi"],
+      "add_table_columns": ["B_extx", "B_exty", "B_extz"],
+      "add_saved_field_reductions": true,
+      "excluded_spatial_fields": ["B_ext"],
+      "gate": "Verify same-state H_eff drive inclusion before derived B_eff/torque. Other P/R cells remain blocked until their exact request-to-writer path is implemented and checked. No new CPU/FEM single execution.",
+      "planning": "Check resolved realization, precision, quantity, location, reduction, format and writer before Solve. Preserve requested auto, resolved execution and rejected request. Strict/extended use identical output gates; hybrid is explicit. No device fallback, substitution, conversion or dropped request. Return all diagnostics in reason-code order with quantity, requested/resolved lane/precision, dtype, format and explanation.",
+      "reason_codes": [
+        {"code": "output_quantity_unknown", "reject_when": "The quantity is absent from the canonical catalog."},
+        {"code": "output_quantity_not_exportable", "reject_when": "The quantity exists but has no saved-export contract."},
+        {"code": "output_realization_unsupported", "reject_when": "The resolved realization has no provider for this output."},
+        {"code": "output_precision_unsupported", "reject_when": "The resolved execution precision is illegal for the realization."},
+        {"code": "output_dtype_mismatch", "reject_when": "A requested field dtype differs from resolved precision, or a table dtype is not f64."},
+        {"code": "output_location_unsupported", "reject_when": "The requested cell/node/element representation is unavailable."},
+        {"code": "output_reduction_unsupported", "reject_when": "The requested component or reduction has no defined implementation."},
+        {"code": "output_dependency_unavailable", "reject_when": "A required interaction, primary field, or same-state derived-field input is unavailable."},
+        {"code": "output_format_unsupported", "reject_when": "The requested format is outside the output contract."},
+        {"code": "output_writer_unavailable", "reject_when": "The format is valid but its writer is absent from the selected build/runtime."},
+        {"code": "output_workflow_unsupported", "reject_when": "The workflow is outside the time-domain v1 scope."}
+      ]
+    }
+  },
   "features": [
     {
       "id": "runtime.live_residency",
@@ -879,12 +1011,21 @@
       "label": "RegionalFieldDrive / prescribed_zeeman_mask compatibility",
       "lanes": {
         "fdm_cpu_reference": "reference_executable",
-        "fdm_gpu_production": "unsupported",
+        "fdm_gpu_production": "source_visible",
         "fem_cpu_public": "source_visible",
-        "fem_gpu_public": "unsupported"
+        "fem_gpu_public": "source_visible"
       },
       "validated_workloads": [],
-      "notes": "The current prescribed_zeeman_mask path executes on CPU-reference FDM. CUDA FDM rejects or explicitly falls back. FEM planning can materialize nodal masks, but current native FEM time evolution does not yet prove consumption, so FEM remains non-executable. The target canonical name is RegionalFieldDrive; the existing payload remains a compatibility form."
+      "validation_state": "unvalidated",
+      "evidence_base_commit": "9902410b016dbe934669122ef00a7825bbd2d5b0",
+      "notes": "Source reconciliation only; no runtime promotion. FDM CPU materializes regional drives. CUDA uploads the v2 descriptor and the FP32 effective-field kernel consumes it. Native FEM CPU/GPU accumulate projected regional drives into H_eff. The old claim that native consumption is absent is stale. Managed execution, waveform/RK-time convergence and lane parity remain NOT VERIFIED; forced GPU never gains a CPU fallback.",
+      "source_evidence": [
+        {"path": "crates/fullmag-runner/src/fdm/cpu/reference.rs", "line": 1125, "symbol": "materialize_reference_problem"},
+        {"path": "crates/fullmag-runner/src/fdm/gpu/cuda/native.rs", "line": 2067, "symbol": "fullmag_fdm_backend_set_regional_field_drives_v2 call"},
+        {"path": "backends/fdm/gpu/cuda/interactions/demag_fp32.cu", "line": 500, "symbol": "combine_effective_field_fp32_kernel"},
+        {"path": "backends/fem/cpu/mfem/interactions/effective_field.cpp", "line": 191, "symbol": "materialize_regional_field_drive call"},
+        {"path": "backends/fem/gpu/cuda/integrators/rk/rk_effective_field.cu", "line": 62, "symbol": "gpu_regional_field_drive_materialize_and_accumulate call"}
+      ]
     },
     {
       "id": "object_absorbing_boundary_layer",
