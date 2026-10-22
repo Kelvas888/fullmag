@@ -2189,3 +2189,30 @@ Node/scoped ESLint/diff-check PASS; repo consistency po mirrorach PASS.
 Browser lokalnie nie uruchomiony z braku Chromium, końcowy dowód wymaga CI.
 Karta IAB po restarcie jest stroną data: blokowaną przez politykę narzędzia;
 poproszono o ponowne otwarcie własnego HTTP3203. E1–E12 nadal nieprzyjęte.
+
+
+### Checkpoint 22.10.2026 — status po odmowie Piola i następny błąd CI
+
+Prerejestracja pełnej korekcji true-residual sparse RT0/KKT została zapisana
+w commitcie 2fba2495b6cd4b8ded3a61b343ea371ea40a9149 przed edycją C++.
+Focused validator PASS i 41 testów kontraktu PASS; dowód w wolumenie:
+verification/rt0-kkt-refinement-preregistration-20261022/result.json.
+Nie zmienia progów fizycznych; native runtime i kwalifikacja nadal NOT VERIFIED.
+
+Compute supervisor zachował rzeczywisty exit receipt nieudanego workera,
+ale zakończył się na niepotwierdzonym heartbeat przed terminalizacją.
+Task pozostaje Running/Reconciling i compute lease Active. Nie zastosowano
+no-spawn ani ręcznej edycji store/ledgera. Wymagany jest osobny, przypięty
+kontrakt operatora dla Started + częściowego efektu; przygotowanie patcha
+nie jest dowodem recovery. Backend API zatrzymany; ekran startowy użytkownika
+nie dowodzi aktywnej sesji. Żaden accepted V/J/H nie został opublikowany.
+
+CI dla 780f18cdddc4c55fc42d3f7ee4a6d568380ceaea: Control Room oraz
+inspector-actions-browser-smoke PASS; Rust wykazał E0624 w teście transportu
+nonmagnetic, który wywoływał prywatne reaction_channels z sąsiedniego modułu.
+Poprawka dodaje wyłącznie cfg(test) reaction_channels_for_test, zgodnie ze
+wzorcem boundary_flux_for_test, i zachowuje wszystkie dotychczasowe asercje.
+Parser obu plików PASS; lokalnych Rust unitów nie kompilowano.
+Pełny log CI: verification/master-integration-20261022-publication/ci-rust-780f-full.log;
+parser: coupled-spin-test-access-parser.json w tym samym katalogu.
+Pozostałe uruchomione kontrole CI wymagają końcowego odczytu. PR247 niescalony.

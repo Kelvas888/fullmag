@@ -981,6 +981,11 @@ impl CoupledChargeSpinProblem {
         Ok((charge, spin_current))
     }
 
+    #[cfg(test)]
+    pub(crate) fn reaction_channels_for_test(&self, spin: &[Vector3]) -> ReactionChannels {
+        self.reaction_channels(spin)
+    }
+
     fn reaction_channels(&self, spin: &[Vector3]) -> ReactionChannels {
         let count = self.grid.cell_count();
         let mut spin_flip = vec![[0.0; 3]; count];

@@ -1188,7 +1188,7 @@ fn explicit_nonmagnetic_domain_admission_preserves_spin_flip_and_rejects_conflic
         },
     );
     let problem = build(fields.clone()).unwrap();
-    let reactions = problem.reaction_channels(&[[1.0, 2.0, 3.0]]);
+    let reactions = problem.reaction_channels_for_test(&[[1.0, 2.0, 3.0]]);
     assert_eq!(reactions.spin_flip[0], [0.375, 0.75, 1.125]);
     assert_eq!(reactions.magnetic_torque_sink[0], [0.0; 3]);
     assert!(problem.with_torque_targets(SpinTorqueTargets {
