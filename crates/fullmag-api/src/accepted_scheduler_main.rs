@@ -614,7 +614,12 @@ fn run_scheduler(
                             &checkpoint_run_ids,
                             &active_workers,
                             &worker_executable,
-                            &args,
+                            WorkerSupervisionLimits {
+                                max_concurrency: args.max_concurrency,
+                                worker_timeout: args.worker_timeout,
+                                heartbeat_interval: args.heartbeat_interval,
+                                max_automatic_retries: args.max_automatic_retries,
+                            },
                             host_admission.as_ref(),
                         )
                     },
@@ -1135,6 +1140,14 @@ fn report_settled_task_failure(run_id: &RunId, task_id: &str, error: &anyhow::Er
     );
 }
 
+#[derive(Clone, Copy)]
+struct WorkerSupervisionLimits {
+    max_concurrency: usize,
+    worker_timeout: Duration,
+    heartbeat_interval: Duration,
+    max_automatic_retries: usize,
+}
+
 /// Settle tasks whose worker process exited while it owned a resource.
 ///
 /// Host recovery resumes only pre-launch Preparing claims; a Running or
@@ -1147,7 +1160,7 @@ fn recover_exited_worker_tasks(
     run_ids: &[RunId],
     active_workers: &ActiveWorkers,
     worker_executable: &Path,
-    args: &SchedulerArgs,
+    limits: WorkerSupervisionLimits,
     host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
 ) -> Result<bool> {
     let mut recovered = false;
@@ -1184,10 +1197,10 @@ fn recover_exited_worker_tasks(
                 run_id.as_str(),
                 &task.task_id,
                 worker_executable,
-                args.max_concurrency,
-                args.worker_timeout,
-                args.heartbeat_interval,
-                args.max_automatic_retries,
+                limits.max_concurrency,
+                limits.worker_timeout,
+                limits.heartbeat_interval,
+                limits.max_automatic_retries,
                 host,
             ) {
                 Ok(result) => eprintln!(
