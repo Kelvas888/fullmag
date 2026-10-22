@@ -227,11 +227,16 @@ async fn submit_structured_command_impl_with_context(
         }
         if crate::live_accepted_execution::docker_api_only_runtime() && command.kind == "stop" {
             validate_accepted_command_admission(&state, context, &command).await?;
+            let requested_run_id = match &command.target {
+                Some(RuntimeCommandTarget::Run { run_id }) => run_id.clone(),
+                _ => None,
+            };
             let accepted = crate::live_accepted_execution::submit_live_stop_with_transition(
                 &state,
                 context,
                 &command.command_id,
                 command.reason.as_deref().unwrap_or("user requested stop"),
+                requested_run_id.as_deref(),
             )
             .await?;
             command.target = Some(RuntimeCommandTarget::Run {

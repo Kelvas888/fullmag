@@ -654,6 +654,7 @@ mod claim;
 pub use claim::{
     commit_claimed_task_admission, commit_claimed_task_admission_with_host,
     load_current_task_claim, try_commit_claimed_task_admission_with_host,
+    StaleTaskAdmissionCandidate,
 };
 
 mod scheduler;

@@ -1069,13 +1069,18 @@ async fn publish_accepted_live_study_with_preparation_failure_under_transition(
 /// preparing tasks use the durable worker Stop command; accepted/queued tasks
 /// use the session cancellation-intent record. No command is put on the
 /// legacy in-memory queue.
+///
+/// `requested_run_id` (from `target: {"kind": "run", "run_id"}`) stops that
+/// run instead of the session's latest one; it must be a live run of the same
+/// session and epoch.
 pub(crate) async fn submit_live_stop_with_transition(
     state: &Arc<AppState>,
     context: &CurrentLiveRequestContext,
     command_id: &str,
     reason: &str,
+    requested_run_id: Option<&str>,
 ) -> Result<AcceptedLiveControlExecution, ApiError> {
-    let run_id = {
+    let current_run_id = {
         let current = state.current_live_state.read().await;
         let snapshot = current
             .as_ref()
@@ -1094,7 +1099,7 @@ pub(crate) async fn submit_live_stop_with_transition(
             .ok_or_else(|| ApiError::conflict_with_code(
                 "accepted_control_run_missing",
                 "Docker Stop requires a durable accepted live run",
-            ))?
+            ))
     };
     let Some(store_root) = state.submit_store_root.clone() else {
         return Err(ApiError::with_status_and_code(
@@ -1103,6 +1108,13 @@ pub(crate) async fn submit_live_stop_with_transition(
             "durable accepted live execution storage is not configured",
         ));
     };
+    let run_id = match requested_run_id {
+        Some(requested) => requested.to_string(),
+        None => current_run_id?,
+    };
+    let targeted = requested_run_id.is_some();
+    let session_id = context.session_id.clone();
+    let session_epoch = context.session_epoch;
     let run_id_for_worker = run_id.clone();
     let command_id = command_id.to_string();
     let reason = reason.trim().to_string();
@@ -1111,6 +1123,9 @@ pub(crate) async fn submit_live_stop_with_transition(
     }
     let affected_task_ids = tokio::task::spawn_blocking(move || {
         let store = open_submit_store(&store_root)?;
+        if targeted {
+            ensure_live_run_belongs_to_session(&store, &run_id_for_worker, &session_id, session_epoch)?;
+        }
         let catalog = store
             .read_run_catalog(&run_id_for_worker)
             .map_err(|error| {
@@ -1140,6 +1155,39 @@ pub(crate) async fn submit_live_stop_with_transition(
         run_id,
         affected_task_ids,
     })
+}
+
+fn ensure_live_run_belongs_to_session(
+    store: &fullmag_session::SessionStore,
+    run_id: &str,
+    session_id: &str,
+    session_epoch: u64,
+) -> Result<(), ApiError> {
+    let intent = store
+        .read_run_intent(run_id)
+        .map_err(|error| {
+            ApiError::conflict_with_code(
+                "accepted_control_catalog_unavailable",
+                format!("accepted live Stop intent read failed: {error:#}"),
+            )
+        })?
+        .ok_or_else(|| ApiError::not_found(format!("accepted live run `{run_id}` does not exist")))?;
+    let live = intent.specification.pointer("/parameters/live_workspace");
+    let same_session = live
+        .and_then(|live| live.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(session_id)
+        && live
+            .and_then(|live| live.get("session_epoch"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(session_epoch);
+    if !same_session {
+        return Err(ApiError::conflict_with_code(
+            "accepted_control_run_foreign",
+            format!("accepted live run `{run_id}` does not belong to the current session"),
+        ));
+    }
+    Ok(())
 }
 
 fn request_accepted_stop_for_catalog(

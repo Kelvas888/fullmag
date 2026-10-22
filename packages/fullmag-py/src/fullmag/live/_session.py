@@ -5,7 +5,9 @@ import contextlib
 import logging
 import math
 import sys
+import threading
 import time
+import uuid
 from types import SimpleNamespace
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,8 @@ __all__ = ["LiveCommandResult", "LiveSession"]
 
 _LOG = logging.getLogger("fullmag.live")
 _SESSION_DEFAULTS = {"device": "cpu", "precision": "double"}
+# Presence heartbeat period; the API lists clients for 30 s after the last one.
+_HEARTBEAT_INTERVAL_S = 10.0
 _STAGE_TARGET = Target.current_stage()
 
 
@@ -64,6 +68,9 @@ class LiveSession:
         self._batch_depth = 0
         self.transactions_committed = 0
         self.events: Optional[EventStream] = None
+        self.client_id = f"python-{uuid.uuid4().hex[:12]}"
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -82,17 +89,45 @@ class LiveSession:
             )
         scene = self.client.model.scene()
         self.revision = _revision_of(scene)
+        self._start_presence()
         # The script owns the scene: the first buildable world replaces it.
         self.baseline = None
         self.sync(strict=False)
 
     def close(self) -> None:
         self.closed = True
+        self._stop_presence()
         if self.events is not None:
             self.events.close()
             self.events = None
         self.client.command_waiter = None
         self.client.close()
+
+    def _start_presence(self) -> None:
+        """Heartbeat presence so the Control Room shows that a script drives the session."""
+        label = self.source_path.name
+
+        def beat() -> None:
+            while not self._heartbeat_stop.is_set():
+                try:
+                    self.client.sessions.heartbeat(self.client_id, label=label)
+                except Exception as error:  # presence is informational and must not break the script
+                    _LOG.debug("presence heartbeat failed: %s", error)
+                self._heartbeat_stop.wait(_HEARTBEAT_INTERVAL_S)
+
+        self._heartbeat_thread = threading.Thread(target=beat, name="fullmag-live-presence", daemon=True)
+        self._heartbeat_thread.start()
+
+    def _stop_presence(self) -> None:
+        if self._heartbeat_thread is None:
+            return
+        self._heartbeat_stop.set()
+        self._heartbeat_thread.join(timeout=2.0)
+        self._heartbeat_thread = None
+        try:
+            self.client.sessions.leave(self.client_id)
+        except Exception as error:
+            _LOG.debug("presence leave failed: %s", error)
 
     def start_events(self) -> EventStream:
         """Start the realtime event stream; command waits then wake on events."""

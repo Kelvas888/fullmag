@@ -183,6 +183,24 @@ class _Sessions(_Namespace):
     def status(self) -> Any:
         return self._client.call_json("sessions_get_sessions_current_status")
 
+    def clients(self) -> Any:
+        """External clients (e.g. Python live scripts) seen within the presence TTL."""
+        return self._client.call_json("sessions_get_sessions_current_clients")
+
+    def heartbeat(self, client_id: str, *, kind: str = "python_live", label: Optional[str] = None) -> Any:
+        """Announce or refresh this client's presence in the current session."""
+        return self._client.call_json(
+            "sessions_put_sessions_current_clients_client_id",
+            path_params={"client_id": client_id},
+            body=_drop_none({"kind": kind, "label": label}),
+        )
+
+    def leave(self, client_id: str) -> None:
+        self._client.call(
+            "sessions_delete_sessions_current_clients_client_id",
+            path_params={"client_id": client_id},
+        )
+
 
 class _Model(_Namespace):
     def scene(self) -> Any:

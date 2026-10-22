@@ -1776,7 +1776,7 @@ fn persist_worker_process_exit_receipt(
     Ok(receipt)
 }
 
-fn worker_process_exit_receipt_for_current_task(
+pub(crate) fn worker_process_exit_receipt_for_current_task(
     store: &SessionStore,
     run_id: &str,
     task_id: &str,
