@@ -336,7 +336,13 @@ async fn enforce_session_command_admission(state: &Arc<AppState>, accepted_obser
         if snapshot.session.status == "closed" {
             return Err(ApiError::conflict("session_closed_read_only: closed sessions reject commands"));
         }
-        let effective = effective_runtime_status_code(snapshot);
+        // A session awaiting its next command keeps the finished run's stage
+        // state as history; that state must not close the session.
+        let effective = if snapshot.session.status == "awaiting_command" {
+            snapshot.session.status.clone()
+        } else {
+            effective_runtime_status_code(snapshot)
+        };
         let terminal_status = [effective.as_str(), snapshot.session.status.as_str()]
             .into_iter()
             .find(|status| matches!(*status, "completed" | "failed" | "cancelled" | "closed"))
