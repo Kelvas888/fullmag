@@ -9663,7 +9663,10 @@ nie kontroluje tej utraty. Osobno, czterowyrazowe sumowanie signed RT0 w long do
 może utracić dokładność względną niemal zerowej składowej. Sam większy typ nie
 zapewnia dokładnego próbkowania przy znoszeniu składników [18,19].
 
-To prerejestracja poprawki reprezentacji i walidacji, przed implementacją.
+Kontrakt prerejestrowano przed implementacją w commicie
+`3561ec5981c40c6f2ce54535aa99e00a18ebf6fe`. Producent i konsument są teraz
+SOURCE_IMPLEMENTED; kompilacja oraz wykonanie native/Rust i runtime pozostają
+NOT VERIFIED.
 Nie zmienia fizyki H1/RT0, source drive, rozwiązanych współczynników ani progów
 bilansu. Nie kwalifikuje taperu, całkowania H, projekcji ani parytetu BORIS.
 
@@ -9752,7 +9755,7 @@ zachowuje requested CPU/double i nie deklaruje kwalifikacji na podstawie buildu.
 
 | Realizacja | Stan tej poprawki |
 |---|---|
-| FEM CPU | PLANNED: dokładne retained sampling i wspólna walidacja; runtime NOT VERIFIED |
+| FEM CPU | SOURCE_IMPLEMENTED: dokładne retained sampling i wspólna walidacja; native/Rust tests oraz runtime NOT VERIFIED |
 | FEM GPU | brak nowej realizacji/kwalifikacji tego pełnego closed-loop workflow; bez fallbacku |
 | FDM CPU | nie dotyczy affine Tet4/RT0; istniejący FDM bez zmian |
 | FDM GPU | nie dotyczy affine Tet4/RT0; istniejący FDM bez zmian |
@@ -9780,10 +9783,25 @@ Brak raw próbek poprzedniego workera nie może zostać zastąpiony twierdzeniem
 
 | Kontrakt / właściciel | Ścieżka + symbol | Status |
 |---|---|---|
-| równania próbkowania i wykonalności | niniejsza nota + `DOC-ANCHOR:antenna-retained-rt0-exact-sampling-v1` | planned contract |
-| dokładna baza i wzorzec konwersji | `backends/fem/cpu/mfem/transport/affine_rt0_element.cpp` + `AffineRt0Element::face_moment` | istniejący owner; nowy sampler planowany |
-| pięć retained próbek | `backends/fem/cpu/mfem/transport/closed_loop_source_snapshot.hpp` + `export_closed_loop_source_snapshot` | zmiana wywołań planowana |
-| wspólny gate live/cold | `crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2.rs` + `verify_owned_geometry` | usunięcie pivotu planowane |
+| równania próbkowania i wykonalności | niniejsza nota + `DOC-ANCHOR:antenna-retained-rt0-exact-sampling-v1` | prerejestrowany kontrakt, implementacja źródłowa |
+| dokładna baza i wzorzec konwersji | `backends/fem/cpu/mfem/transport/affine_rt0_element.cpp` + `AffineRt0Element::face_moment` | istniejący owner; `AffineRt0Element::retained_current_at` SOURCE_IMPLEMENTED |
+| pięć retained próbek | `backends/fem/cpu/mfem/transport/closed_loop_source_snapshot.hpp` + `export_closed_loop_source_snapshot` | SOURCE_IMPLEMENTED; wyłącznie pięć retained punktów |
+| wspólny gate live/cold | `crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2.rs` + `verify_owned_geometry` | `verify_rt0_sample_affinity` SOURCE_IMPLEMENTED; pozostałe bramki identyczne |
+
+Źródłowa weryfikacja:33 niezależne przypadki Fraction, parser obu plików Rust
+i diff-check PASS; stary pivot odtwarza odmowę poprawnych próbek. Osobny
+Fraction oracle15wartości hex zgadza się z przygotowanym golden C++; model
+starego sumowania p=64 daje RED. To modele i źródła, nie wykonanie C++.
+Gorąca metoda `current_at` jest bajtowo identyczna; exporter różni się wyłącznie
+dwoma nazwami wywołań. Dodano9 testów Rust i natywny kontrakt, bez lokalnej
+kompilacji. Dowody w wolumenie grupy:
+`verification/closed-loop-affine-consumer-source-20261023/` oraz
+`verification/retained-rt0-exact-sampling-source-20261023/`.
+
+| Regresja | Ścieżka + symbol | Dowód wykonania |
+|---|---|---|
+| dokładny producent i fail-closed | `backends/fem/tests/conservative_current_view_contract.cpp` + `retained_rt0_sampling_is_exact_frozen_and_fail_closed` | source-only; native NOT COMPILED/NOT EXECUTED |
+| old-RED i wspólny slope | `crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2_affinity_tests.rs` + `rounded_rt0_samples_survive_an_ill_conditioned_pivot` | parser i Fraction model PASS; Rust NOT COMPILED/NOT EXECUTED |
 
 (antenna-source-code-index)=
 ### 13.1 Source-code index

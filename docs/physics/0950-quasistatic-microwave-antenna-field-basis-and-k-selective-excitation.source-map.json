@@ -3287,7 +3287,8 @@
         "rt0-sample-indices-operators"
       ],
       "sources": [
-        "antenna-retained-rt0-exact-sampling-prereg"
+        "antenna-retained-rt0-exact-sampling-prereg",
+        "antenna-rt0-exact-retained-point-owner"
       ]
     },
     {
@@ -3300,7 +3301,8 @@
         "rt0-sample-indices-operators"
       ],
       "sources": [
-        "antenna-retained-rt0-exact-sampling-prereg"
+        "antenna-retained-rt0-exact-sampling-prereg",
+        "antenna-rt0-common-affine-admission-owner"
       ]
     },
     {
@@ -3311,7 +3313,8 @@
         "rt0-sample-indices-operators"
       ],
       "sources": [
-        "antenna-retained-rt0-exact-sampling-prereg"
+        "antenna-retained-rt0-exact-sampling-prereg",
+        "antenna-rt0-common-affine-admission-owner"
       ]
     }
   ],
@@ -8011,8 +8014,36 @@
       "id": "antenna-retained-rt0-exact-sampling-prereg",
       "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
       "symbol": "DOC-ANCHOR:antenna-retained-rt0-exact-sampling-v1",
-      "responsibility": "Prerejestracja dokładnych5 próbek na Tet4 i wspólnej wykonalności affine RT0 z tym samym budżetem128EPS; bez implementacji ani kwalifikacji runtime.",
+      "responsibility": "Prerejestrowany kontrakt dokładnych5 próbek na Tet4 i wspólnej wykonalności affine RT0 z budżetem128EPS; źródła wdrożone, kompilacja/runtime/kwalifikacja NOT VERIFIED.",
       "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-rt0-exact-retained-point-owner",
+      "path": "backends/fem/cpu/mfem/transport/affine_rt0_element.cpp",
+      "symbol": "AffineRt0Element::retained_current_at",
+      "responsibility": "Dokładny rational frozen-binary64 sampler pięciu retained punktów; jedna konwersja i finite/nonzero gate. SOURCE_IMPLEMENTED, native runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-rt0-common-affine-admission-owner",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2.rs",
+      "symbol": "verify_rt0_sample_affinity",
+      "responsibility": "Dokładne18constraints jednego slope i wspólnego interceptu peraxis,64EPS per sample bez flooru; pozostałe gates niezmienione. SOURCE_IMPLEMENTED, Rust/runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-rt0-exact-retained-point-regression",
+      "path": "backends/fem/tests/conservative_current_view_contract.cpp",
+      "symbol": "void retained_rt0_sampling_is_exact_frozen_and_fail_closed",
+      "responsibility": "Native golden15Fraction bits, dyadic/translation/orientation/zero/reversal/frozen/overflow/underflow; NIE SKOMPILOWANO ani NIE WYKONANO.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-rt0-common-affine-admission-regression",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2_affinity_tests.rs",
+      "symbol": "rounded_rt0_samples_survive_an_ill_conditioned_pivot",
+      "responsibility": "Old-RED witness i9przygotowanych przypadków exact feasibility;33Fraction modeli PASS, parserPASS; Rust unit NIE SKOMPILOWANO ani NIE WYKONANO.",
+      "evidence_status": "source_only"
     }
   ],
   "public_api": {

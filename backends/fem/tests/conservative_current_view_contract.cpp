@@ -1,5 +1,6 @@
 #include "cpu/mfem/transport/conservative_constraint_rank.hpp"
 #include "cpu/mfem/transport/affine_trace_relations.hpp"
+#include "cpu/mfem/transport/affine_rt0_element.hpp"
 #include "cpu/mfem/transport/conservative_current_view.hpp"
 #include "cpu/mfem/transport/periodic_charge_potential.hpp"
 #include "cpu/mfem/transport/terminal_constrained_rt0_projection.hpp"
@@ -117,6 +118,113 @@ void require_rejected(Callable &&callable, const std::string &message)
         rejected = true;
     }
     require(rejected, message);
+}
+
+using Rt0Point = fullmag::fem::transport::AffineRt0Element::Point;
+
+std::array<Rt0Point, 5> retained_rt0_samples(const std::array<Rt0Point, 4> &vertices,
+    const std::array<double, 4> &signed_coefficients, bool mutate_sources = false)
+{
+    using fullmag::fem::transport::AffineRt0Element;
+    mfem::Mesh mesh(3, 4, 1, 0, 3);
+    const double unit_vertices[][3] = {{0., 0., 0.}, {1., 0., 0.},
+        {0., 1., 0.}, {0., 0., 1.}};
+    for (const auto &vertex : unit_vertices) mesh.AddVertex(vertex);
+    const int nodes[] = {0, 1, 2, 3};
+    mesh.AddTet(nodes, 1);
+    mesh.FinalizeTopology();
+    mesh.Finalize(false, true);
+    // Change only coordinates after topology finalization so the negative-
+    // determinant fixture cannot be silently reoriented by mesh finalization.
+    for (int local = 0; local < 4; ++local) {
+        for (int axis = 0; axis < 3; ++axis) mesh.GetVertex(local)[axis] = vertices[local][axis];
+    }
+    mfem::RT_FECollection collection(0, 3);
+    mfem::FiniteElementSpace space(&mesh, &collection);
+    mfem::GridFunction field(&space);
+    mfem::Array<int> dofs;
+    space.GetElementDofs(0, dofs);
+    require(dofs.Size() == 4, "retained RT0 fixture lost its four signed coefficients");
+    for (int local = 0; local < 4; ++local) {
+        const int dof = dofs[local];
+        field[dof < 0 ? -1 - dof : dof] =
+            (dof < 0 ? -1.0 : 1.0) * signed_coefficients[local];
+    }
+    const AffineRt0Element evaluator(field, 0);
+    const AffineRt0Element basis_only(space, 0);
+    require_rejected([&] { (void)basis_only.retained_current_at(vertices[0]); },
+        "retained RT0 accepted an unfrozen coefficient set");
+    require_rejected([&] {
+        (void)evaluator.retained_current_at({std::numeric_limits<double>::infinity(), 0., 0.});
+    }, "retained RT0 accepted a nonfinite sampling point");
+    if (mutate_sources) {
+        field = 0.0;
+        for (int local = 0; local < 4; ++local) mesh.GetVertex(local)[0] += 16.0;
+    }
+    std::array<Rt0Point, 5> samples;
+    Rt0Point center{};
+    for (int axis = 0; axis < 3; ++axis) {
+        long double value = 0.0L;
+        for (int local = 0; local < 4; ++local) value += static_cast<long double>(vertices[local][axis]) / 4.0L;
+        center[axis] = static_cast<double>(value);
+    }
+    for (int local = 0; local < 4; ++local) samples[local] = evaluator.retained_current_at(vertices[local]);
+    samples[4] = evaluator.retained_current_at(center);
+    return samples;
+}
+
+void retained_rt0_sampling_is_exact_frozen_and_fail_closed()
+{
+    const std::array<Rt0Point, 4> unit{{{0., 0., 0.}, {1., 0., 0.},
+        {0., 1., 0.}, {0., 0., 1.}}};
+    const auto dyadic = retained_rt0_samples(unit, {1., 2., 4., 8.});
+    const std::array<Rt0Point, 5> dyadic_expected{{{-2., -4., -8.},
+        {13., -4., -8.}, {-2., 11., -8.}, {-2., -4., 7.}, {1.75, -.25, -4.25}}};
+    require(dyadic == dyadic_expected, "retained RT0 lost exact dyadic sample values");
+    auto translated = unit;
+    for (auto &point : translated) { point[0] += 8.; point[1] -= 4.; point[2] += 2.; }
+    require(retained_rt0_samples(translated, {1., 2., 4., 8.}) == dyadic,
+        "retained RT0 changed under an exactly representable translation");
+    auto reversed_geometry = unit;
+    for (auto &point : reversed_geometry) std::swap(point[0], point[1]);
+    auto swapped = dyadic;
+    for (auto &sample : swapped) std::swap(sample[0], sample[1]);
+    require(retained_rt0_samples(reversed_geometry, {1., 2., 4., 8.}) == swapped,
+        "retained RT0 lost the absolute-determinant sign contract");
+    const std::array<Rt0Point, 4> witness{{{0., 0., 0.}, {1.1e-6, 0., 0.},
+        {0., .7e-6, 0.}, {0., 0., .3e-6}}};
+    const std::array<double, 4> coefficients{{.21000000000044933, -.21, -3.3e-13, -9.625000000000001e-14}};
+    // Independently rounded Python Fraction(binary64) oracle, including center.
+    const std::array<Rt0Point, 5> expected{{
+        {0x1.d1a94a2000000p+39, 0x1.0000000000000p+0, 0x1.0000000000000p-3},
+        {0x1.d1a94a2000385p+39, 0x1.0000000000000p+0, 0x1.0000000000000p-3},
+        {0x1.d1a94a2000000p+39, 0x1.11e88b367a41fp+0, 0x1.0000000000000p-3},
+        {0x1.d1a94a2000000p+39, 0x1.0000000000000p+0, 0x1.3d666f9635745p-3},
+        {0x1.d1a94a20000e2p+39, 0x1.047a22cd9e908p+0, 0x1.0f599be58d5d2p-3}}};
+    const auto samples = retained_rt0_samples(witness, coefficients);
+    require(samples == expected, "retained RT0 cancellation witness differs from Fraction oracle");
+    require(retained_rt0_samples(witness, coefficients, true) == samples,
+        "retained RT0 aliased the mutable input coefficients or geometry");
+    auto negative = coefficients;
+    for (auto &coefficient : negative) coefficient = -coefficient;
+    auto reversed = samples;
+    for (auto &sample : reversed) for (auto &value : sample) value = -value;
+    require(retained_rt0_samples(witness, negative) == reversed,
+        "retained RT0 failed signed-current reversal");
+    const auto zero = retained_rt0_samples(unit, {0., -0., 0., -0.});
+    for (const auto &sample : zero) for (double value : sample) {
+        require(value == 0.0 && !std::signbit(value), "retained RT0 did not preserve canonical exact zero");
+    }
+    const auto constant = retained_rt0_samples(unit, {-1., 1., 0., 0.});
+    for (const auto &sample : constant) require(sample == Rt0Point{-1., 0., 0.},
+        "retained RT0 did not preserve a constant field");
+    require_rejected([&] {
+        const double maximum = std::numeric_limits<double>::max();
+        (void)retained_rt0_samples(unit, {maximum, maximum, 0., 0.});
+    }, "retained RT0 silently accepted overflow");
+    require_rejected([&] {
+        (void)retained_rt0_samples(unit, {std::numeric_limits<double>::denorm_min(), 0., 0., 0.});
+    }, "retained RT0 silently rounded a nonzero exact sample to zero");
 }
 
 void affine_trace_relations_preserve_independent_jumps_and_reject_cycles()
@@ -5659,6 +5767,7 @@ int main(int argc, char **argv)
             "usage: fem_conservative_current_view_contract");
 #endif
 
+        retained_rt0_sampling_is_exact_frozen_and_fail_closed();
         affine_trace_relations_preserve_independent_jumps_and_reject_cycles();
         deterministic_constraint_rank_oracle_is_exact();
         constraint_rank_row_semantics_are_explicit_and_validated();
