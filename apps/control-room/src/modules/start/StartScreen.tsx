@@ -99,6 +99,18 @@ export function StartScreen({ kernel }: ModuleProps) {
     startScreenStore.getSnapshot,
     startScreenStore.getServerSnapshot,
   );
+  // Home lies over the workspace while a session is open; list it so the
+  // simulation stays reachable (including sessions a Python script created).
+  const activeSessions = useMemo(
+    () =>
+      (sessions.resource.data?.sessions ?? []).map((entry) => ({
+        sessionId: entry.session_id,
+        name: entry.name,
+        status: entry.status,
+        current: entry.current,
+      })),
+    [sessions.resource.data],
+  );
   // An empty collection is a confirmed no-session. A non-empty collection
   // requires a matching current-status identity before replacement can be
   // offered; a ready collection with a failed or mismatched status must stay
@@ -379,6 +391,8 @@ export function StartScreen({ kernel }: ModuleProps) {
               onResumeContinue={resumeContinue}
               onDiscardContinue={discardContinue}
               onRunCommand={runCommand}
+              activeSessions={activeSessions}
+              onOpenActiveSession={() => runCommand("workspace.return-to-workspace")}
             />
           ) : section === "templates" ? (
             <TemplatesSection compute={compute} />

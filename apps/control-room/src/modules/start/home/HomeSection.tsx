@@ -11,6 +11,7 @@ import type { WorkspaceResultsView, WorkspaceScriptsView } from "../model/worksp
 
 import { SectionHeader } from "../ui/SectionHeader";
 
+import { ActiveSessions, type ActiveSession } from "./ActiveSessions";
 import { ContinueCard } from "./ContinueCard";
 import { LaunchTiles } from "./LaunchTiles";
 import { RecentProjects } from "./RecentProjects";
@@ -54,6 +55,10 @@ export interface HomeSectionProps {
   readonly onDiscardContinue: (checkpointId: string, entry: RecentEntry) => Promise<string | null>;
   readonly compute: ComputeProbeState;
   readonly onRunCommand: (commandId: string) => void;
+  /** Sessions open in this instance; omitted or empty draws no section. */
+  readonly activeSessions?: readonly ActiveSession[];
+  /** Leaves Home for the current session's workspace. */
+  readonly onOpenActiveSession?: () => void;
 }
 
 export function HomeSection({
@@ -73,6 +78,8 @@ export function HomeSection({
   onResumeContinue,
   onDiscardContinue,
   onRunCommand,
+  activeSessions = [],
+  onOpenActiveSession,
 }: HomeSectionProps) {
   const today = useToday();
   const [continueBusy, setContinueBusy] = useState(false);
@@ -116,6 +123,9 @@ export function HomeSection({
         </div>
         {today ? <div className="fm-start-page-head__meta">{today}</div> : null}
       </div>
+      {onOpenActiveSession ? (
+        <ActiveSessions onOpen={onOpenActiveSession} sessions={activeSessions} />
+      ) : null}
       {session && resolution && continueEntry ? (
         <section aria-labelledby="fm-start-continue-title" className="fm-start-section">
           <SectionHeader id="fm-start-continue-title" title="Continue where you left off" />
