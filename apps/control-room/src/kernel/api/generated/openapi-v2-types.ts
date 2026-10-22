@@ -13787,6 +13787,10 @@ export interface components {
                 [key: string]: unknown;
             } | null;
             visible?: boolean | null;
+            /** @description Authored presentation metadata; it does not select physics modules. */
+            visualization_hint?: {
+                [key: string]: unknown;
+            };
         };
         SceneOerstedField: components["schemas"]["KnownSceneOerstedField"] | components["schemas"]["UnsupportedAuthoringRecord"];
         SceneOerstedTimeDependence: {

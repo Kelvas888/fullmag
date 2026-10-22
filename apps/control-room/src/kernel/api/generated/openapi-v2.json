@@ -35293,6 +35293,11 @@
               "boolean",
               "null"
             ]
+          },
+          "visualization_hint": {
+            "additionalProperties": true,
+            "description": "Authored presentation metadata; it does not select physics modules.",
+            "type": "object"
           }
         },
         "required": [

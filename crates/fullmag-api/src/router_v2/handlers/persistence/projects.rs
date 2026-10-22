@@ -2767,17 +2767,99 @@ fn opened_authoring_scene(
 }
 
 
-/// Every supplied value must survive the canonical typed scene projection.
-/// Serializer-added defaults are allowed; omitted supplied keys are not.
+/// Supplied semantic values must survive typed projection. Only exact empty
+/// placeholders emitted by the canonical Python scene producer may be omitted.
 fn raw_scene_survives_projection(raw: &Value, projected: &Value) -> bool {
-    match (raw, projected) {
-        (Value::Object(raw), Value::Object(projected)) => raw.iter().all(|(key, value)| {
-            projected.get(key).is_some_and(|next| raw_scene_survives_projection(value, next))
-        }),
-        (Value::Array(raw), Value::Array(projected)) => raw.len() == projected.len()
-            && raw.iter().zip(projected).all(|(a, b)| raw_scene_survives_projection(a, b)),
-        (Value::Number(a), Value::Number(b)) => exact_projected_number(a, b),
-        _ => raw == projected,
+    fn at<'a>(raw: &'a Value, projected: &Value, path: &mut Vec<&'a str>) -> bool {
+        match (raw, projected) {
+            (Value::Object(raw), Value::Object(projected)) => raw.iter().all(|(key, value)| {
+                path.push(key);
+                let survives = match projected.get(key) {
+                    Some(next) => at(value, next, path),
+                    None => known_omitted_scene_default(path, value),
+                };
+                path.pop();
+                survives
+            }),
+            (Value::Array(raw), Value::Array(projected)) => {
+                raw.len() == projected.len() && raw.iter().zip(projected).all(|(a, b)| {
+                    path.push("*");
+                    let survives = at(a, b, path);
+                    path.pop();
+                    survives
+                })
+            }
+            (Value::Number(a), Value::Number(b)) => exact_projected_number(a, b),
+            _ => raw == projected,
+        }
+    }
+    at(raw, projected, &mut Vec::new())
+}
+
+/// These are complete owner paths, never field-name or generic empty-value
+/// exceptions. Some Python mesh/solver placeholders have no Rust realization;
+/// their nonempty values remain evidence-only rather than implying support.
+fn known_omitted_scene_default(path: &[&str], value: &Value) -> bool {
+    let Some((field, owner)) = path.split_last() else { return false; };
+    let empty_array = value.as_array().is_some_and(Vec::is_empty);
+    let empty_object = value.as_object().is_some_and(serde_json::Map::is_empty);
+    match owner {
+        [] => (value.is_null() && *field == "universe") || (empty_array && matches!(*field,
+            "objects" | "couplings" | "materials" | "magnetization_assets" | "selections"
+            | "magnetization_constraints" | "current_transports" | "spin_transports"
+            | "spin_torques" | "oersted_fields" | "antenna_port_modes"
+            | "antenna_field_solve_stages" | "antenna_target_projections"
+            | "solved_antenna_drives" | "antenna_spectrum_requests")),
+        ["current_modules"] => (empty_array && *field == "modules")
+            || (value.is_null() && *field == "excitation_analysis"),
+        ["field_drives"] => empty_array && *field == "drives",
+        ["monitors"] => empty_array && *field == "planar",
+        ["outputs"] => empty_array && *field == "items",
+        ["editor"] => (value.is_null() && matches!(*field,
+            "selected_object_id" | "gizmo_mode" | "transform_space" | "selected_entity_id"
+            | "focused_entity_id" | "object_view_mode" | "air_mesh_visible"
+            | "air_mesh_opacity" | "active_visualization_preset_ref" | "active_transform_scope"))
+            || (empty_object && *field == "mesh_entity_view_state")
+            || (empty_array && *field == "visualization_presets"),
+        ["objects", "*"] => (value.is_null() && matches!(*field,
+            "region_name" | "magnetization_ref" | "object_mesh" | "mesh_override"
+            | "absorbing_boundary" | "notes"))
+            || (empty_array && matches!(*field, "physics_stack" | "regions"
+                | "allocated_region_ids" | "material_parameter_fields" | "tags"))
+            || (empty_object && matches!(*field, "region_overrides" | "visualization_hint")),
+        ["study"] => (value.is_null() && matches!(*field,
+            "backend" | "requested_cpu_threads" | "fem_demag_solver_policy" | "demag_realization"
+            | "fdm" | "external_field" | "rotated_interfacial_dmi" | "universe_mesh"
+            | "study_pipeline" | "table_autosave" | "output_storage" | "execution_profile"
+            | "initial_state")) || (empty_array && matches!(*field,
+                "mesh_interfaces" | "stages" | "execution_layers")),
+        ["study", "solver"] => value.as_str() == Some("")
+            && matches!(*field, "gamma" | "max_relaxation_time_s"),
+        ["study", "mesh_defaults" | "shared_domain_mesh"]
+        | ["objects", "*", "object_mesh" | "mesh_override"] => {
+            let per_object = owner[0] == "objects";
+            (empty_array && matches!(*field, "boundary_layer_target_curve_selectors"
+                | "boundary_layer_target_curve_tags" | "boundary_layer_target_surface_selectors"
+                | "boundary_layer_target_surface_tags"))
+                || (value.is_null() && matches!(*field, "boundary_layer_count"
+                    | "boundary_layer_stretching" | "resolved_narrow_regions"
+                    | "resolved_size_from_curvature"))
+                || (value.as_str() == Some("") && matches!(*field, "boundary_layer_thickness"
+                    | "interface_maximum_element_size"))
+                || (!per_object && value.as_str() == Some("") && matches!(*field,
+                    "corner_extent" | "corner_maximum_element_size" | "corner_transition_distance"
+                    | "edge_maximum_element_size" | "edge_thickness" | "edge_transition_distance"))
+                || (per_object && empty_array && matches!(*field, "operations" | "size_fields"))
+                || (per_object && value.is_null() && matches!(*field,
+                    "algorithm_2d" | "algorithm_3d" | "calibrate_for" | "compute_quality"
+                    | "element_family" | "exact_layer_count" | "mesh_strategy" | "narrow_regions"
+                    | "optimize" | "optimize_iterations" | "order" | "per_element_quality"
+                    | "size_factor" | "size_from_curvature" | "size_preset" | "smoothing_steps"
+                    | "source" | "sweep_direction" | "sweep_face_meshing" | "through_thickness_distribution"
+                    | "through_thickness_element_ratio" | "through_thickness_elements"
+                    | "through_thickness_symmetric" | "topology" | "transition_growth" | "transition_policy"))
+        }
+        _ => false,
     }
 }
 
@@ -2941,13 +3023,43 @@ mod authoring_open_tests {
         let scene: SceneDocument = serde_json::from_value(raw.clone()).unwrap();
         let projected = serde_json::to_value(&scene).unwrap();
         assert!(raw_scene_survives_projection(&raw, &projected));
-        for unknown in [Value::Null, json!({}), json!([]), json!("future")] {
+        for unknown in [Value::Null, json!({}), json!([]), json!(""), json!("future")] {
             let mut raw = raw.clone();
             raw["study"]["future"] = unknown;
             assert!(!raw_scene_survives_projection(&raw, &projected));
         }
-        // A supplied known field skipped by Serialize is conservatively evidence-only.
-        assert!(!raw_scene_survives_projection(&json!({"objects":[]}), &json!({})));
+        // A known canonical empty collection carries no authored semantic state.
+        assert!(raw_scene_survives_projection(&json!({"objects":[]}), &json!({})));
+    }
+
+    #[test]
+    fn canonical_placeholder_exceptions_are_owner_and_value_exact() {
+        for (owner, field, empty) in [
+            ("/study/solver", "max_relaxation_time_s", json!("")),
+            ("/study/mesh_defaults", "boundary_layer_count", Value::Null),
+            ("/study/mesh_defaults", "boundary_layer_thickness", json!("")),
+            ("/study/shared_domain_mesh", "boundary_layer_target_surface_tags", json!([])),
+            ("/objects/0/mesh_override", "boundary_layer_thickness", json!("")),
+        ] {
+            let projected = json!({"study":{"solver":{},"mesh_defaults":{},"shared_domain_mesh":{}},
+                "objects":[{"mesh_override":{}}]});
+            let mut raw = projected.clone();
+            raw.pointer_mut(owner).unwrap().as_object_mut().unwrap().insert(field.into(), empty.clone());
+            assert!(raw_scene_survives_projection(&raw, &projected), "{owner}/{field}");
+            for semantic in [json!("authored"), json!(1), json!([1]), json!({"value":1})] {
+                raw.pointer_mut(owner).unwrap().as_object_mut().unwrap().insert(field.into(), semantic);
+                assert!(!raw_scene_survives_projection(&raw, &projected), "{owner}/{field}");
+            }
+            // A valid placeholder name at an unrecognized owner is not an exception.
+            assert!(!raw_scene_survives_projection(&json!({"extension":{(field):empty}}),
+                &json!({"extension":{}})));
+        }
+        for empty in [Value::Null, json!({}), json!([]), json!("")] {
+            assert!(!raw_scene_survives_projection(
+                &json!({"study/solver/max_relaxation_time_s":empty}), &json!({})));
+            assert!(!raw_scene_survives_projection(
+                &json!({"study":{"solver":{"future":empty}}}), &json!({"study":{"solver":{}}})));
+        }
     }
 
     #[test]
@@ -2960,7 +3072,7 @@ mod authoring_open_tests {
             "study":{"requested_backend":"fem","requested_device":"cpu","requested_precision":"double"}
         });
         for path in ["/objects/0", "/objects/0/geometry", "/objects/0/transform"] {
-            for unknown in [Value::Null, json!({}), json!([]), json!("preserve me")] {
+            for unknown in [Value::Null, json!({}), json!([]), json!(""), json!("preserve me")] {
                 let mut raw = base.clone();
                 raw.pointer_mut(path).unwrap().as_object_mut().unwrap().insert("future".into(), unknown);
                 let scene: SceneDocument = serde_json::from_value(raw.clone()).unwrap();

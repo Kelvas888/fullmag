@@ -2362,3 +2362,45 @@ Wolne598693941248bajtów. Ocena: pre-archive-fix-build-retention.json w
 verification/public-loop-solve-fixed-binding-20261022/. Referencje oryginalnego
 requestu i wyniku nadal wymagają tych pakietów. E1–E12 pozostają otwarte,
 bez accepted V/J/H i bez kwalifikowanego parytetu BORIS.
+
+
+### Checkpoint 23.10.2026 — pakiet archiwizacji i rzeczywisty codegen
+
+Commit8b3bab193b83a1b1ae3674abdf540480436c2744 zbudowano w stałym backendzie:
+recovery-build2033737f1b594d67b1e418799ab5f6ce, Make82828ms, package2959ms,
+24 pliki,9300/9308 hash-cache hits. Promocja400b2acf7ff14ba49f61df3ffdff1b1a
+exit0, receiptdefee4d10e29d2f1f78b42308fb0332caf05036653fc9bb587ae220da46c7ac0,
+snapshot6ae88b386b743cef45528f36542917bc9bed0f1f6908b31447821783debb6df4.
+Stary pakiet69 zachowano w .development/backups/.backend-package-backup-n343csi2.
+
+Native completion verify-only przeszedł na envelope
+ed32bc1577b66e7e061e733149c7e7fbb1ace3d20cfc021babaf398ed0409a0a;
+68 plików bez zmian. Pierwszy envelope omyłkowo przypinał opakowanie journalu
+zamiast WorkerEventEnvelope; odmówił bez zmian, a oba dowody zachowano.
+Oryginalny request23a9 niezmieniony. Source/parent/store mount1298/dev2096.
+Archiwizacja nadal niewykonana do końca nowych regresji CI; API zatrzymane.
+
+CI8b skompilowało runtime-service:58 testów PASS,1 FAIL. Dokładne porównanie
+obu stron asercji wykazało różnicę tylko WRITER.owner.json (token i czasy),
+a cała historia runu identyczna. Poprawka b7882e7757fc24814a832d5f9869e958791fa6a2
+trzyma produkcyjny writer guard i porównuje wszystkie run files; parser PASS,
+bez zmiany produkcji i bez lokalnego kompilowania unitów Rust.
+
+Rzeczywisty just docker-dev-codegen zakończył się succeeded, receipt
+backend/codegen/openapi-v2/0b4837afde25679b08fb0f02b9f25d9947e851be6bfa8ce528c4276d39e05d46.json.
+Wygenerowany diff dodaje tylko opcjonalne visualization_hint do SceneObjectResource.
+Pierwszy frontend typecheck odmówił, ponieważ publisher tempfile miał0600,
+a frontend działa jako UID65532. Potwierdzono EACCES dla czterech plików.
+Przywrócono0644 wyłącznie własnym generated files bez zmiany hashes; typecheck
+PASS jako UID65532 (56s). Commit64db7bdd08ed853b98edebc12f1795528a53c9dc
+naprawia canonical publisher przed fsync/atomicreplace;23 testy PASS, old red0600.
+Nowego pełnego codegen po tej poprawce jeszcze nie wykonywano.
+
+Cold-open source zachowuje visualization_hint jako dane prezentacji w scenie,
+builderze, adapterach i API. Nie aktywuje magnetyzacji ani physics_stack.
+Projection dopuszcza wyłącznie dokładne znane puste defaults po pełnej ścieżce;
+unknown null/[]/{}/empty string oraz niepuste nieobsługiwane wartości pozostają
+evidence-only. Publiczna regresja import→archive→open, negatywne mutations i
+sprawdzenie nonmagnetic są przygotowane dla CI, lokalnie bez Rust unit compilation.
+Produkcja tych11plików była w obu udanych pakietach dirty snapshot; source+codegen
+są teraz gotowe do spójnego commita, ale rzeczywisty cold-open HTTP nadal NOT VERIFIED.

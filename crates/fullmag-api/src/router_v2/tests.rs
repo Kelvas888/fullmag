@@ -164,6 +164,7 @@ fn sample_scene_document() -> fullmag_authoring::SceneDocument {
             allocated_region_ids: Vec::new(),
             material_parameter_fields: Vec::new(),
             absorbing_boundary: None,
+            visualization_hint: Default::default(),
         }],
         mesh_interfaces: Vec::new(),
         field_drives: Vec::new(),
