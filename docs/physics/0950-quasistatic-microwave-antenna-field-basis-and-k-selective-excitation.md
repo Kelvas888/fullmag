@@ -8379,6 +8379,64 @@ Przepływy publicznego DSL/ProblemIR, planera, archiwum i UI nie są zmieniane.
 | Binding wykonania i HTTP | scripts/compare_sushruth_2020_gsg.py + compare | receipt → sesja/run/stage → niezmienne payloady |
 | Regresje porównania | scripts/test_compare_sushruth_2020_gsg.py + test_gauge_offsets_are_not_fitted_slopes | sztuczne dane sprawdzają metrykę i odmowy; nie są solve Fullmaga |
 
+(antenna-retained-rt0-reference-fit)=
+## Rekonstrukcja retained RT0 dla niezależnego oracle — kontrakt implementacji 22.10.2026
+
+Realizujemy wyłącznie uprzednio prerejestrowane równanie
+`antenna-loop-prereg-rt0-fit`, bez zmiany jego metody i progów. Stan przed
+implementacją: brak ogólnego referencyjnego fitu retained RT0; istniejący
+`antenna_rt0_fixture_check.compare_rt0_fixture` kontroluje momenty stałego prądu
+w jednym fixture i nie zastępuje tej rekonstrukcji.
+
+`antenna_rt0_surface_oracle.fit_retained_rt0` ma użyć własnego Householder QR
+12×4: trzy składowe $\boldsymbol\alpha$ i jeden skalarny $\beta$.
+Współrzędne centrujemy w $\mathbf c$, a skala $\ell$ jest największą długością
+krawędzi. Zwracamy centered coefficients; dalsza całka ma używać
+$\mathbf J_T(\mathbf r)=\boldsymbol\alpha+\beta(\mathbf r-\mathbf c)/\ell$.
+Nie odtwarzamy prądu przez wygładzanie, pełny gradient 3×3 ani korektę danych.
+
+Obowiązkowe są dwa niezależne arytmetycznie dopasowania tych samych binary64
+inputs: binary64 oraz Decimal120 z dokładnym `Decimal.from_float`. Decimal120
+ma własny jawny kontekst round-half-even, prec120 i zakres wykładników
+[-999999,999999], niezależny od rounding, traps i wykładników wywołującego.
+Oba dopasowania używają
+prerejestrowanego progu $256\epsilon$ z $\epsilon=2^{-52}$ i bez absolutnego
+floor w jednostkach prądu. Normy binary64 wymagają skalowanego hypot; RHS QR
+może być dzielony przez największy moduł wejściowej składowej J i następnie
+odskalowany. Nie zmienia to zadania LS ani progu residualu. Dla zerowego J
+wynik i residual muszą być dokładnie zerowe. Osobny dokładny determinant
+binary64 geometry ma odrzucać płaski, odwrócony lub powtórzony Tet4 — sama
+ranga4 układu12×4 nie dowodzi dodatniej objętości. Niepoprawny residual,
+niepełna ranga, wartości niefinite lub nierozstrzygnięty zakres arytmetyki
+kończą się odmową, bez false zero i bez nieskończonego progu akceptacji.
+
+| Parametr | Typ | Domyślnie | SI | Walidacja | Znaczenie | Backend | ProblemIR |
+|---|---|---|---|---|---|---|---|
+| fit_retained_rt0.vertices_m | list/tuple (4×3 float) | required | $\mathrm m$ | dokładnie4×3 skończone binary64; bool i niepositive Tet4 odrzucane | retained współrzędne jednej komórki, bez scalania ID | referencyjny Python CPU; bez wykonania backendu | bez nowej serializacji; wejście z przyjętego carriera |
+| fit_retained_rt0.vertex_current_apm2 | list/tuple (4×3 float) | required | $\mathrm{A\,m^{-2}}$ | dokładnie4×3 skończone binary64, w tej samej kolejności; wymagany scalar-slope residual gate | cztery lokalne ślady J tej komórki, bez uśredniania z sąsiadami | referencyjny Python CPU; bez wykonania backendu | bez zmiany semantyki IR |
+
+Wynik zawiera osobno binary64 i Decimal120: center, length, alpha, beta,
+maximum residual i niezmieniony residual limit. Nie publikuje scientific
+receiptu ani pola H. Brak zmian DSL, ProblemIR, planera, runtime, archiwum i
+katalogu quantities. FEM CPU wymaga późniejszego związania z rzeczywistym
+accepted V/J/H i wykonania całego A/B/C. FEM GPU, FDM CPU i FDM GPU pozostają
+poza kwalifikacją tego helpera. Samo przejście jego testów nie kwalifikuje
+triangle corpus, pełnej całki RT0, domknięcia źródła, basis, FFT ani LLG.
+
+Przed wykonaniem ustalamy testy: znany scalar slope na asymetrycznym dyadic
+Tet4; stały i zerowy prąd; odrzucenie pełnych gradientów shear/rotation i
+anisotropic diagonal; skale geometrii2^-20/1/2^20 z dokładną translacją;
+skale prądu2^-600/1/2^600 z zachowaniem odmowy względnego błędu; dodatnia
+parzysta permutacja; degeneracja, odwrócenie, niefinite, bool i zła liczba
+próbek; dokładny import binary64 i zachowanie wejść oraz kontekstu Decimal.
+To kontrole interpretowane, nie kompilacja testów natywnych.
+
+| Kontrakt | Ścieżka + symbol | Zakres dowodu |
+|---|---|---|
+| Centered scalar RT0 fit | scripts/antenna_rt0_surface_oracle.py + fit_retained_rt0 | źródłowa realizacja istniejącego równania i progu, bez pełnego H |
+| Niezgodny pełny gradient | scripts/test_antenna_rt0_surface_oracle.py + RetainedRT0FitTests.test_full_affine_non_rt0_gradients_are_rejected | odrębna kontrola przestrzeni RT0 |
+| Zera i brak absolutnego floor | scripts/test_antenna_rt0_surface_oracle.py + RetainedRT0FitTests.test_current_scaling_has_no_absolute_acceptance_floor | odrębna kontrola skali, bez kwalifikacji solvera |
+
 (antenna-scientific-bibliography)=
 ## 14. References
 

@@ -1652,7 +1652,9 @@
         "prereg_operators"
       ],
       "sources": [
-        "antenna-loop-independent-prereg-v1"
+        "antenna-loop-independent-prereg-v1",
+        "antenna-retained-reference-fit",
+        "antenna-retained-reference-fit-tests"
       ]
     },
     {
@@ -1895,6 +1897,8 @@
     }
   ],
   "sources": [
+    {"id": "antenna-retained-reference-fit", "path": "scripts/antenna_rt0_surface_oracle.py", "symbol": "fit_retained_rt0", "responsibility": "Independent centered scalar RT0 Householder reconstruction; no solver or H qualification."},
+    {"id": "antenna-retained-reference-fit-tests", "path": "scripts/test_antenna_rt0_surface_oracle.py", "symbol": "test_full_affine_non_rt0_gradients_are_rejected", "responsibility": "Analytic coefficients, invalid affine fields, geometry, scale and exact-input regressions."},
     {
       "id": "antenna-sushruth-2020-gsg-study",
       "path": "examples/fem_antenna_sushruth_2020_gsg.py",
@@ -5786,6 +5790,8 @@
   ],
   "public_api": {
     "parameters": [
+      {"python": "fit_retained_rt0.vertices_m", "type": "list/tuple (4×3 float)", "default": "required", "si_unit": "\\mathrm m", "validation": "dokładnie4×3 skończone binary64; bool i niepositive Tet4 odrzucane", "meaning": "retained współrzędne jednej komórki, bez scalania ID", "backend_support": "referencyjny Python CPU; bez wykonania backendu", "problem_ir": "bez nowej serializacji; wejście z przyjętego carriera"},
+      {"python": "fit_retained_rt0.vertex_current_apm2", "type": "list/tuple (4×3 float)", "default": "required", "si_unit": "\\mathrm{A\\,m^{-2}}", "validation": "dokładnie4×3 skończone binary64, w tej samej kolejności; wymagany scalar-slope residual gate", "meaning": "cztery lokalne ślady J tej komórki, bez uśredniania z sąsiadami", "backend_support": "referencyjny Python CPU; bez wykonania backendu", "problem_ir": "bez zmiany semantyki IR"},
       {
         "python": "TerminalLeadExtension.from_antenna_terminal.id",
         "type": "str",
