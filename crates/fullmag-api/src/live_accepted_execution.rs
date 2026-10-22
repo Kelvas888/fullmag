@@ -2297,6 +2297,30 @@ fn ensure_migrated_profile_published(
     }
 
     const LEGACY_LIVE_PROFILE_INTENT: &str = "live-legacy-execution-default";
+    // The scheduler and workers share the store writer. Hold one (re-entrant)
+    // writer lease for read-check-publish so a busy writer is retried instead
+    // of failing the command, and the catalogue revision cannot move between
+    // the lookup and the publication.
+    let _publication_lease =
+        fullmag_runtime_control::retry_store_writer_busy(|| store.write_transaction())
+            .map_err(|error| profile_catalog_error(format!("{error:#}")))?;
+    let catalog = store
+        .read_execution_profile_catalog()
+        .map_err(|error| profile_catalog_error(error.to_string()))?;
+    if let Some(existing) = catalog.entries.iter().find(|entry| {
+        entry.profile.profile_id == profile.profile_id && entry.profile.version == profile.version
+    }) {
+        if existing.profile_sha256 == expected_sha256 && existing.profile == *profile {
+            return Ok(existing.clone());
+        }
+        return Err(ApiError::conflict_with_code(
+            "execution_profile_hash_conflict",
+            format!(
+                "canonical legacy profile `{}/{}` conflicts with the published catalogue hash",
+                profile.profile_id, profile.version
+            ),
+        ));
+    }
     let publication = store.publish_execution_profile(
         catalog.revision,
         LEGACY_LIVE_PROFILE_INTENT,
