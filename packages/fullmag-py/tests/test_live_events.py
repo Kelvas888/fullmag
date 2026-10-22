@@ -81,7 +81,12 @@ def live(monkeypatch):
         with FakeLiveSession() as fake:
             rows = {"step": 0, "time": 0.0, "mx": 1.0, "my": 0.0, "mz": 0.0, "e_total": -1e-18}
 
-            def scalars(_request):
+            def scalars(request):
+                # Mirror the server's typed query: `tail` is a flag, `limit` counts rows.
+                if request.query.get("tail") not in (None, "true", "false"):
+                    return 400, {"code": "bad_request", "message": "tail must be true or false"}, {}
+                if not request.query.get("limit", "0").isdigit():
+                    return 400, {"code": "bad_request", "message": "limit must be an integer"}, {}
                 return 200, {"revision": rows["step"], "total_rows": 1, "returned_rows": 1, "columns": list(rows), "rows": [list(rows.values())], "observation_frames": []}, {}
 
             fake.api.route("GET", SCALARS, scalars)

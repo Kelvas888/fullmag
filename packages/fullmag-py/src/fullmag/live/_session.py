@@ -232,7 +232,7 @@ class LiveSession:
 
     def latest_step(self) -> SimpleNamespace:
         """The newest scalar row of the session as a step-like object (``mx``, ``e_total``, ...)."""
-        window = self.client.data.scalars(tail=1)
+        window = self.client.data.scalars(limit=1, tail=True)
         rows = window.get("rows") or []
         if not rows:
             raise RuntimeError("the live session has no scalar samples yet; run fm.relax() or fm.run() first")
