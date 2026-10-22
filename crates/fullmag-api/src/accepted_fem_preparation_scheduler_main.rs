@@ -1218,13 +1218,20 @@ mod tests {
         });
         let thread_id = handle.thread().id();
         let mut active = ActivePreparations::default();
-        active.insert(lease.resource_id.clone(), ActivePreparation { lease, handle });
+        let checkpoint_run_ids = Some(vec![lease.run_id.clone()]);
+        let next_run_id = Some("next-run".to_owned());
+        active.insert(lease.resource_id.clone(), ActivePreparation {
+            lease, handle, checkpoint_run_ids: checkpoint_run_ids.clone(),
+            next_run_id: next_run_id.clone(),
+        });
         assert!(classify_recovery_transaction::<u8>(
             Err(anyhow::Error::new(fullmag_session::StoreWriterBusy)),
         ).unwrap().is_none());
         let retained = active.get("owned-resource").unwrap();
         assert_eq!(retained.lease, expected_lease);
         assert_eq!(retained.handle.thread().id(), thread_id);
+        assert_eq!(retained.checkpoint_run_ids, checkpoint_run_ids);
+        assert_eq!(retained.next_run_id, next_run_id);
         assert!(!joined.load(Ordering::Acquire));
         release.send(()).unwrap();
         drop(active);

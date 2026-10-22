@@ -2145,3 +2145,47 @@ failed-run-catalog.json, process-tree.json i HOST_RESOURCE_LEDGER.json.
 Ledger SHA256 `1d99930b05f2fe851b5a42634a26d77972b874d5f808bb94e889d509d068f956`.
 Następnie wymagany build i ponowne własne wykonanie poprawionego workera.
 E1–E12 nadal otwarte, żadnego potwierdzonego V/J/H.
+
+
+### Pierwsze wykonanie natywnej fizyki i jawna odmowa certyfikatu — 22.10.2026
+
+Recreate-volume z poprawionym bindingiem zakończył się exit0: DEV
+`05d5785acd5543daa64d035485b939c2`, config
+`8d7e2f8e402bdad38464593b7ccf499c59e547570aad1d6f761b85616f4946ec`.
+Runtime `a9259bb183cbffe96b46d4493ec55ea471cfedbd`, snapshot
+`2a30501a0490717e9d41210b12cbb97c5fe74440b598fe428593e4c5ae4029b2`.
+CLI/API/workery build2m31s; źródła/cache w tych samych wolumenach.
+Publiczny import skryptu ponownie HTTP201/round_trip=verified, nowa sesja
+`session-18e0f3ad5b0186dd00000d06`, scena revision1 bez magnetyzacji.
+Jedno Solve HTTP200/accepted po95.95s, command
+`fm-ef7876e9-5a17-4b24-bfd9-7485ee779423`.
+
+Run `run-live-91ade96632da3c92902cd0143337a9496518ff29ea45ab0bc22313d44421eee4`
+przeszedł przygotowanie FEM i Running workera4087. Native solve został wykonany,
+ale certyfikat fizycznego prądu Piola odmówił przed publikacją: lokalny element
+value_a=-2.2630475713324681e-15 przy scale_a=1.3631510305998916e-05.
+Progi pozostają absolute1e-18A/relative1e-10; faces_ok=1, pairs_ok=1,
+elements_ok=0. Worker exit1, nie timeout. Nie ma przyjętego V/J/H.
+Rozpoczęty bundle fem_antenna_closed_loop_nonmagnetic.zarr pozostaje zachowany;
+nie należy przedstawiać jego istnienia jako ukończonego wyniku.
+Dowody: verification/public-loop-solve-fixed-binding-20261022/ oraz trwały
+worker_process_exit_receipt w store. Dalsza korekta wymaga naukowego kontraktu
+zbieżności pełnego układu KKT; nie wolno luzować progów ani naprawiać bilansu
+w getterze diagnostyk.
+
+Powtórny projects/open świeżego archiwum również nie daje aktywacyjnej sceny.
+Analiza skorygowała wstępną hipotezę: project/scene_document.json jest dokumentem
+kanonicznym, nie nieznanym opaque. Wszystkie bramki metadanych archiwum przechodzą;
+problem jest w raw_scene_survives_projection: legalne znane defaults pomijane przez
+serializator oraz visualization_hint, którego brak w Rust SceneObject. Nie
+poluzowano ochrony nieznanych pól; błąd cold-open pozostaje OTWARTY w E5/E12.
+
+CI commita a9259bb:19 PASS,3 FAIL. Naprawy dotyczą: nowego shape
+ActivePreparation w teście (metadata kolejności muszą przetrwać odroczenie),
+katalogu m w osobnym smoke-inspector oraz sześciu brakujących mirrorów
+istniejących skilli z mastera. Nie zmieniono produkcji pod te błędy testów.
+Parser schedulera PASS; fixture handler→produkcyjny quantity gate→shader PASS,
+Node/scoped ESLint/diff-check PASS; repo consistency po mirrorach PASS.
+Browser lokalnie nie uruchomiony z braku Chromium, końcowy dowód wymaga CI.
+Karta IAB po restarcie jest stroną data: blokowaną przez politykę narzędzia;
+poproszono o ponowne otwarcie własnego HTTP3203. E1–E12 nadal nieprzyjęte.
