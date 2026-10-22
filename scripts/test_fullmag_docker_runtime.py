@@ -3019,7 +3019,7 @@ class DockerRuntimeContract(unittest.TestCase):
             "FULLMAG_DOCKER_HOST_ID": "a" * 64,
             "FULLMAG_HOST_LEDGER_PROFILE": "other-profile",
         }, clear=True):
-            with self.assertRaisesRegex(service.RuntimeServiceError, "canonical host-ledger-v1"):
+            with self.assertRaisesRegex(service.RuntimeServiceError, "host-ledger-v1 or group-ledger-v1"):
                 service._validated_docker_host_id()
 
     def test_native_host_profile_rejects_wrong_store_device_policy_and_overcommit(self):

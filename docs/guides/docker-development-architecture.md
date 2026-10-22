@@ -79,8 +79,12 @@ Zmiana kodu aplikacji nie przebudowuje automatycznie CUDA, MFEM, hypre ani
 libCEED. Zmiana zależności, kompilatora lub flag może unieważnić szerszy cache.
 Blokada backendu chroni konkretny trwały wolumen; odrębne grupy mogą kompilować
 równolegle. Blokady i rejestry techniczne buildu pozostają w granicy grupy Compose.
-Przydział fizycznego GPU nadal przechodzi przez wspólny host ledger, który jest
-operacyjną infrastrukturą zasobów, a nie cache'em buildu ani danymi sesji.
+Przydziały CPU/RAM/GPU grupy przechodzą przez jej własny ledger
+(`group-ledger-v1`, [ADR 0067](../adr/0067-docker-dev-group-isolation.md)):
+nazwany wolumen grupy pod `/host-ledger`, operacyjny stan runtime, a nie cache
+buildu ani dane sesji. Grupy nie rezerwują zasobów między sobą; chronią je
+statyczne budżety `FULLMAG_DEV_*`. Globalny `host-ledger-v1` dotyczy release,
+kwalifikacji i managed runtime.
 
 ## Polecenia trybu developerskiego
 
@@ -393,7 +397,7 @@ i rzeczywiste granice automatycznego sprzątania:
 | Kontrola runtime i metadata usług technicznych | Wydzielony podwolumen Docker grupy Compose; nie katalog sesji użytkownika |
 | Sesje, modele, wyniki i logi symulacji | Fizyczny storage Windows, mount `/state` |
 | Ustawienia, ostatnie projekty i historia grupy | `storage/user-data/<compose-project>/workspace.db`, mount `/user-data` |
-| Przydziały fizycznego CPU/GPU | Wspólny `host-ledger-v1` zarządzany osobnym kontraktem; nie cache buildu ani ledger per grupa |
+| Przydziały CPU/RAM/GPU grupy | Ledger grupy `group-ledger-v1` w jej nazwanym wolumenie Docker, mount `/host-ledger`; nie cache buildu. Release i kwalifikacja używają `host-ledger-v1` |
 
 ### Granica zapisu i kontrola wzrostu danych technicznych
 
