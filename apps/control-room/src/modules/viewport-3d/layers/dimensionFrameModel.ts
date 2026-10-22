@@ -10,6 +10,15 @@ export type DimensionFrameUnitMode = "auto" | "nm" | "um" | "mm" | "m";
 /** Which annotations sit on the frame edges: tick scales, overall extents, or both. */
 export type DimensionFrameAnnotation = "ticks" | "extents" | "both";
 export type DimensionFrameAxis = "x" | "y" | "z";
+export type DimensionFrameOriginMode = "frame-center" | "world";
+
+/** Discrete camera orientation used to choose the three annotated frame edges. */
+export interface DimensionFrameCameraOrientation {
+  xFacing: -1 | 1;
+  yFacing: -1 | 1;
+  zCornerX: -1 | 1;
+  zCornerY: -1 | 1;
+}
 type DimensionFramePlaneId =
   | "xy-min"
   | "x-min"
@@ -21,10 +30,12 @@ export interface DimensionFrameOptions {
   annotation?: DimensionFrameAnnotation;
   bounds: Viewport3DBounds | null;
   cameraProjection: Viewport3DCameraProjection;
-  cameraState: Viewport3DCameraState;
+  cameraState?: Viewport3DCameraState;
+  cameraOrientation?: DimensionFrameCameraOrientation;
   density: DimensionFrameDensity;
   labelsVisible: boolean;
   mode: DimensionFrameMode;
+  originMode?: DimensionFrameOriginMode;
   unitMode: DimensionFrameUnitMode;
 }
 
@@ -56,14 +67,16 @@ export interface DimensionFrameLabel {
   pixelOffset: number;
   position: [number, number, number];
   text: string;
-  /** Major-step index from the frame centre; the renderer thins by it. */
+  /** Major-step index from the selected frame or world origin. */
   tickIndex?: number;
   unitLabel?: string;
 }
 
 export interface DimensionFrameModel {
   annotation: DimensionFrameAnnotation;
-  /** Opposite bounds corners; the renderer hides labels on a tiny frame. */
+  /** Three continuous scale edges, independent of labels and grid visibility. */
+  axisLines: Float32Array;
+  /** Physical bounds; the renderer projects all eight corners for HUD layout. */
   extent: [[number, number, number], [number, number, number]];
   extentLines: Float32Array;
   labels: DimensionFrameLabel[];
@@ -72,6 +85,7 @@ export interface DimensionFrameModel {
   minorLines: Float32Array;
   minorTickLines: Float32Array;
   mode: DimensionFrameMode;
+  originMode: DimensionFrameOriginMode;
   planes: DimensionFramePlane[];
   signature: string;
   unit: DimensionFrameUnit;
@@ -151,33 +165,64 @@ export function resolveDimensionFrameStep(
   return niceStep(Math.max(spanMeters, 1e-18) / target);
 }
 
+/** Whether bounds contain a finite, non-degenerate extent worth measuring. */
+export function hasMeaningfulDimensionFrameBounds(
+  bounds: Viewport3DBounds | null,
+): boolean {
+  if (
+    !bounds ||
+    !Array.isArray(bounds.center) ||
+    bounds.center.length !== 3 ||
+    !Array.isArray(bounds.size) ||
+    bounds.size.length !== 3 ||
+    !bounds.center.every(Number.isFinite) ||
+    !bounds.size.every(
+      (span) => Number.isFinite(span) && span >= 0,
+    )
+  ) {
+    return false;
+  }
+
+  return bounds.size.some((span) => span > 0);
+}
+
 export function buildDimensionFrameModel({
   annotation = "ticks",
   bounds,
+  cameraOrientation,
   cameraState,
   density,
   labelsVisible,
   mode,
+  originMode = "frame-center",
   unitMode,
 }: DimensionFrameOptions): DimensionFrameModel {
   const resolvedBounds = resolveBounds(bounds);
   const maxSpan = Math.max(...resolvedBounds.size, 1e-18);
   const unit = resolveDimensionFrameUnit(maxSpan, unitMode);
+  const orientation =
+    cameraOrientation ??
+    resolveDimensionFrameOrientationFromResolved(
+      resolvedBounds,
+      cameraState ?? DEFAULT_CAMERA_STATE,
+    );
   if (mode === "off") {
-    return emptyDimensionFrameModel(mode, unit, annotation);
+    return emptyDimensionFrameModel(mode, unit, annotation, originMode);
   }
 
   const step = resolveDimensionFrameStep(maxSpan, density);
-  const planes = resolveDimensionFramePlanes(mode, resolvedBounds, cameraState);
+  const planes = resolveDimensionFramePlanes(mode, resolvedBounds, orientation);
   const minorStep = step / MINOR_SUBDIVISIONS[density];
   const majorLines: number[] = [];
   const minorLines: number[] = [];
+  const axisLines = buildAxisLines(resolvedBounds, orientation);
 
   for (const plane of planes) {
     appendPlaneLines({
       bounds: resolvedBounds,
       lineBuffer: minorLines,
       maxSegments: MINOR_SEGMENT_CAP,
+      originMode,
       plane,
       skipStep: step,
       step: minorStep,
@@ -186,6 +231,7 @@ export function buildDimensionFrameModel({
       bounds: resolvedBounds,
       lineBuffer: majorLines,
       maxSegments: MAJOR_SEGMENT_CAP,
+      originMode,
       plane,
       step,
     });
@@ -195,9 +241,10 @@ export function buildDimensionFrameModel({
     ? buildEdgeAnnotations({
         annotation,
         bounds: resolvedBounds,
-        cameraState,
+        orientation,
         maxSpan,
         minorStep,
+        originMode,
         step,
         unit,
       })
@@ -205,6 +252,7 @@ export function buildDimensionFrameModel({
 
   return {
     annotation,
+    axisLines: new Float32Array(axisLines),
     extent: [resolvedBounds.min, resolvedBounds.max],
     extentLines: new Float32Array(annotations.extentLines),
     labels: annotations.labels,
@@ -213,6 +261,7 @@ export function buildDimensionFrameModel({
     minorLines: new Float32Array(minorLines),
     minorTickLines: new Float32Array(annotations.minorTickLines),
     mode,
+    originMode,
     planes,
     signature: [
       mode,
@@ -220,6 +269,11 @@ export function buildDimensionFrameModel({
       unit.id,
       annotation,
       labelsVisible ? "labels" : "nolabels",
+      originMode,
+      orientation.xFacing,
+      orientation.yFacing,
+      orientation.zCornerX,
+      orientation.zCornerY,
       step,
       ...resolvedBounds.center,
       ...resolvedBounds.size,
@@ -233,7 +287,7 @@ export function buildDimensionFrameModel({
 function resolveDimensionFramePlanes(
   mode: Exclude<DimensionFrameMode, "off">,
   bounds: ResolvedBounds,
-  cameraState: Viewport3DCameraState,
+  orientation: DimensionFrameCameraOrientation,
 ): DimensionFramePlane[] {
   const floor: DimensionFramePlane = {
     fixedAxis: "z",
@@ -245,7 +299,7 @@ function resolveDimensionFramePlanes(
   if (mode === "floor") return [floor];
 
   const xWall: DimensionFramePlane =
-    cameraState.position[0] >= cameraState.target[0]
+    orientation.xFacing >= 0
       ? {
           fixedAxis: "x",
           fixedValue: bounds.min[0],
@@ -261,7 +315,7 @@ function resolveDimensionFramePlanes(
           vAxis: "z",
         };
   const yWall: DimensionFramePlane =
-    cameraState.position[1] >= cameraState.target[1]
+    orientation.yFacing >= 0
       ? {
           fixedAxis: "y",
           fixedValue: bounds.min[1],
@@ -284,6 +338,7 @@ function appendPlaneLines({
   bounds,
   lineBuffer,
   maxSegments,
+  originMode,
   plane,
   skipStep,
   step,
@@ -291,6 +346,7 @@ function appendPlaneLines({
   bounds: ResolvedBounds;
   lineBuffer: number[];
   maxSegments: number;
+  originMode: DimensionFrameOriginMode;
   plane: DimensionFramePlane;
   skipStep?: number;
   step: number;
@@ -301,10 +357,15 @@ function appendPlaneLines({
   for (const value of centeredTicksBetween({
     max: bounds.max[uIndex],
     min: bounds.min[uIndex],
-    origin: bounds.center[uIndex],
+    origin: tickOrigin(bounds, plane.uAxis, originMode),
     step,
   })) {
-    if (skipStep && isOnMajorStep(value - bounds.center[uIndex], skipStep)) continue;
+    if (
+      skipStep &&
+      isOnMajorStep(value - tickOrigin(bounds, plane.uAxis, originMode), skipStep)
+    ) {
+      continue;
+    }
     if (lineBuffer.length / 6 >= maxSegments) return;
     pushSegment(
       lineBuffer,
@@ -315,10 +376,15 @@ function appendPlaneLines({
   for (const value of centeredTicksBetween({
     max: bounds.max[vIndex],
     min: bounds.min[vIndex],
-    origin: bounds.center[vIndex],
+    origin: tickOrigin(bounds, plane.vAxis, originMode),
     step,
   })) {
-    if (skipStep && isOnMajorStep(value - bounds.center[vIndex], skipStep)) continue;
+    if (
+      skipStep &&
+      isOnMajorStep(value - tickOrigin(bounds, plane.vAxis, originMode), skipStep)
+    ) {
+      continue;
+    }
     if (lineBuffer.length / 6 >= maxSegments) return;
     pushSegment(
       lineBuffer,
@@ -367,10 +433,98 @@ export function resolveDimensionFrameEdges(
   bounds: Pick<ResolvedBounds, "max" | "min">,
   cameraState: Viewport3DCameraState,
 ): DimensionFrameEdge[] {
+  return resolveDimensionFrameEdgesForOrientation(
+    bounds,
+    resolveDimensionFrameOrientationFromResolved(bounds, cameraState),
+  );
+}
+
+/**
+ * Resolve camera-dependent edge selection as four discrete signs. The frame
+ * geometry only needs to change when one of these signs flips during an orbit.
+ */
+export function resolveDimensionFrameOrientation(
+  bounds: Viewport3DBounds | null,
+  cameraState: Viewport3DCameraState,
+): DimensionFrameCameraOrientation {
+  return resolveDimensionFrameOrientationFromResolved(
+    resolveBounds(bounds),
+    cameraState,
+  );
+}
+
+/**
+ * Keep the currently selected frame edges while the camera is close to a
+ * quadrant boundary. A new edge must win by a small angular margin before
+ * the model changes, which avoids rapid swaps during slow orbit gestures.
+ */
+export function resolveDimensionFrameOrientationWithHysteresis(
+  bounds: Viewport3DBounds | null,
+  cameraState: Viewport3DCameraState,
+  previous: DimensionFrameCameraOrientation,
+  hysteresisDegrees = 4,
+): DimensionFrameCameraOrientation {
+  const resolvedBounds = resolveBounds(bounds);
   const toCamera = subtract(cameraState.position, cameraState.target);
-  const xEdgeY = toCamera[1] >= 0 ? bounds.max[1] : bounds.min[1];
-  const yEdgeX = toCamera[0] >= 0 ? bounds.max[0] : bounds.min[0];
-  const floorZ = bounds.min[2];
+  const length = Math.hypot(...toCamera);
+  if (!Number.isFinite(length) || length < 1e-12) {
+    return resolveDimensionFrameOrientationFromResolved(resolvedBounds, cameraState);
+  }
+
+  const degrees = Number.isFinite(hysteresisDegrees)
+    ? Math.min(45, Math.max(0, hysteresisDegrees))
+    : 4;
+  const margin = Math.sin((degrees * Math.PI) / 180);
+  const raw = resolveDimensionFrameOrientationFromResolved(resolvedBounds, cameraState);
+  const right = screenRight(cameraState);
+  const floorDiagonal = Math.hypot(
+    resolvedBounds.max[0] - resolvedBounds.min[0],
+    resolvedBounds.max[1] - resolvedBounds.min[1],
+  );
+  const previousCornerScore = cornerScreenScore(resolvedBounds, previous, right);
+  const candidateCornerScore = cornerScreenScore(resolvedBounds, raw, right);
+  const switchCorner =
+    floorDiagonal <= 1e-12 ||
+    candidateCornerScore + margin * floorDiagonal < previousCornerScore;
+
+  return {
+    xFacing: resolveHysteresisSign(toCamera[0] / length, previous.xFacing, margin),
+    yFacing: resolveHysteresisSign(toCamera[1] / length, previous.yFacing, margin),
+    zCornerX: switchCorner ? raw.zCornerX : previous.zCornerX,
+    zCornerY: switchCorner ? raw.zCornerY : previous.zCornerY,
+  };
+}
+
+function resolveHysteresisSign(
+  normalizedComponent: number,
+  previous: -1 | 1,
+  margin: number,
+): -1 | 1 {
+  if (previous > 0) return normalizedComponent < -margin ? -1 : 1;
+  return normalizedComponent > margin ? 1 : -1;
+}
+
+function cornerScreenScore(
+  bounds: Pick<ResolvedBounds, "max" | "min">,
+  orientation: DimensionFrameCameraOrientation,
+  right: readonly [number, number],
+): number {
+  const x = orientation.zCornerX > 0 ? bounds.max[0] : bounds.min[0];
+  const y = orientation.zCornerY > 0 ? bounds.max[1] : bounds.min[1];
+  return x * right[0] + y * right[1];
+}
+
+const DEFAULT_CAMERA_STATE: Viewport3DCameraState = {
+  position: [1, 1, 1],
+  target: [0, 0, 0],
+  up: [0, 0, 1],
+};
+
+function resolveDimensionFrameOrientationFromResolved(
+  bounds: Pick<ResolvedBounds, "max" | "min">,
+  cameraState: Viewport3DCameraState,
+): DimensionFrameCameraOrientation {
+  const toCamera = subtract(cameraState.position, cameraState.target);
   const right = screenRight(cameraState);
   const corners: Array<[number, number]> = [
     [bounds.min[0], bounds.min[1]],
@@ -384,10 +538,27 @@ export function resolveDimensionFrameEdges(
       ? corner
       : best,
   );
-  const xSign = xEdgeY === bounds.max[1] ? 1 : -1;
-  const ySign = yEdgeX === bounds.max[0] ? 1 : -1;
-  const zxSign = zx === bounds.max[0] ? 1 : -1;
-  const zySign = zy === bounds.max[1] ? 1 : -1;
+  return {
+    xFacing: toCamera[0] >= 0 ? 1 : -1,
+    yFacing: toCamera[1] >= 0 ? 1 : -1,
+    zCornerX: zx === bounds.max[0] ? 1 : -1,
+    zCornerY: zy === bounds.max[1] ? 1 : -1,
+  };
+}
+
+function resolveDimensionFrameEdgesForOrientation(
+  bounds: Pick<ResolvedBounds, "max" | "min">,
+  orientation: DimensionFrameCameraOrientation,
+): DimensionFrameEdge[] {
+  const xEdgeY = orientation.yFacing >= 0 ? bounds.max[1] : bounds.min[1];
+  const yEdgeX = orientation.xFacing >= 0 ? bounds.max[0] : bounds.min[0];
+  const floorZ = bounds.min[2];
+  const xSign = orientation.yFacing;
+  const ySign = orientation.xFacing;
+  const zxSign = orientation.zCornerX;
+  const zySign = orientation.zCornerY;
+  const zx = zxSign > 0 ? bounds.max[0] : bounds.min[0];
+  const zy = zySign > 0 ? bounds.max[1] : bounds.min[1];
   return [
     {
       axis: "x",
@@ -413,17 +584,19 @@ export function resolveDimensionFrameEdges(
 function buildEdgeAnnotations({
   annotation,
   bounds,
-  cameraState,
+  orientation,
   maxSpan,
   minorStep,
+  originMode,
   step,
   unit,
 }: {
   annotation: DimensionFrameAnnotation;
   bounds: ResolvedBounds;
-  cameraState: Viewport3DCameraState;
+  orientation: DimensionFrameCameraOrientation;
   maxSpan: number;
   minorStep: number;
+  originMode: DimensionFrameOriginMode;
   step: number;
   unit: DimensionFrameUnit;
 }): EdgeAnnotations {
@@ -440,25 +613,25 @@ function buildEdgeAnnotations({
   const minorLength = maxSpan * MINOR_TICK_FRACTION;
   let tickLabelCount = 0;
 
-  for (const edge of resolveDimensionFrameEdges(bounds, cameraState)) {
+  for (const edge of resolveDimensionFrameEdgesForOrientation(bounds, orientation)) {
     const index = AXIS_INDEX[edge.axis];
     const min = bounds.min[index];
     const max = bounds.max[index];
     const center = bounds.center[index];
+    const origin = tickOrigin(bounds, edge.axis, originMode);
     result.edgeIds.push(edge.id);
 
     if (showTicks) {
-      // Tick values are rounded to 12 significant digits around the frame
-      // centre; a span tiny relative to its centre collapses several values
-      // onto one, so each major index is labelled once.
+      // The default scale stays frame-centred. World mode aligns major steps
+      // to SI zero so the displayed world coordinates remain a clean scale.
       const labelledTicks = new Set<number>();
       for (const value of centeredTicksBetween({
         max,
         min,
-        origin: center,
+        origin,
         step: minorStep,
       })) {
-        const major = isOnMajorStep(value - center, step);
+        const major = isOnMajorStep(value - origin, step);
         const start = edge.at(value);
         const end = offsetPoint(start, edge.outward, major ? majorLength : minorLength);
         if (
@@ -467,7 +640,7 @@ function buildEdgeAnnotations({
         ) {
           pushSegment(major ? result.majorTickLines : result.minorTickLines, start, end);
         }
-        const tickIndex = Math.round((value - center) / step);
+        const tickIndex = Math.round((value - origin) / step);
         if (major && tickLabelCount < LABEL_CAP && !labelledTicks.has(tickIndex)) {
           labelledTicks.add(tickIndex);
           tickLabelCount += 1;
@@ -478,7 +651,10 @@ function buildEdgeAnnotations({
             outward: edge.outward,
             pixelOffset: TICK_LABEL_GAP_PX,
             position: end,
-            text: formatDimensionFrameTickValue(value - center, unit),
+            text: formatDimensionFrameTickValue(
+              originMode === "world" ? value : value - center,
+              unit,
+            ),
             tickIndex,
           });
         }
@@ -576,6 +752,26 @@ function offsetPoint(
   ];
 }
 
+function tickOrigin(
+  bounds: ResolvedBounds,
+  axis: DimensionFrameAxis,
+  originMode: DimensionFrameOriginMode,
+): number {
+  return originMode === "world" ? 0 : bounds.center[AXIS_INDEX[axis]];
+}
+
+function buildAxisLines(
+  bounds: ResolvedBounds,
+  orientation: DimensionFrameCameraOrientation,
+): number[] {
+  const lines: number[] = [];
+  for (const edge of resolveDimensionFrameEdgesForOrientation(bounds, orientation)) {
+    const index = AXIS_INDEX[edge.axis];
+    pushSegment(lines, edge.at(bounds.min[index]), edge.at(bounds.max[index]));
+  }
+  return lines;
+}
+
 function subtract(
   left: readonly [number, number, number],
   right: readonly [number, number, number],
@@ -598,9 +794,11 @@ function emptyDimensionFrameModel(
   mode: DimensionFrameMode,
   unit: DimensionFrameUnit,
   annotation: DimensionFrameAnnotation,
+  originMode: DimensionFrameOriginMode,
 ): DimensionFrameModel {
   return {
     annotation,
+    axisLines: EMPTY_LINES,
     extent: [
       [0, 0, 0],
       [0, 0, 0],
@@ -612,8 +810,9 @@ function emptyDimensionFrameModel(
     minorLines: EMPTY_LINES,
     minorTickLines: EMPTY_LINES,
     mode,
+    originMode,
     planes: [],
-    signature: `${mode}:${unit.id}:${annotation}`,
+    signature: `${mode}:${unit.id}:${annotation}:${originMode}`,
     unit,
   };
 }

@@ -30,6 +30,13 @@ IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ENV_LINE = re.compile(r"^(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*)$")
 _SOURCE_ENV = "FULLMAG_SOURCE_ROOT"
 _PORT_ENVS = ("FULLMAG_HTTP_PORT", "FULLMAG_FRONTEND_HOST_PORT")
+# Static per-group resource budget; see docker_volume_resources.apply_group_budget.
+GROUP_BUDGET_ENVS = (
+    "FULLMAG_DEV_BACKEND_CPUS",
+    "FULLMAG_DEV_BACKEND_MEMORY_GIB",
+    "FULLMAG_DEV_FRONTEND_CPUS",
+    "FULLMAG_DEV_FRONTEND_MEMORY_GIB",
+)
 _VERIFIED_RECEIPTS = (
     "development/verified.json",
     "resume/verified.json",
@@ -114,7 +121,8 @@ def _read_dotenv(path: Path) -> dict[str, str]:
         if not match:
             continue
         key = match.group(1)
-        if key not in {_SOURCE_ENV, *_PORT_ENVS, "FULLMAG_PROJECT_STORAGE_ROOT", "FULLMAG_SCRIPT_OUTPUT_DIRECTORY"}:
+        if key not in {_SOURCE_ENV, *_PORT_ENVS, *GROUP_BUDGET_ENVS,
+                       "FULLMAG_PROJECT_STORAGE_ROOT", "FULLMAG_SCRIPT_OUTPUT_DIRECTORY"}:
             continue
         if key in values:
             raise DiscoveryError(f"duplicate {key} in main .env at {path}:{number}")
@@ -275,6 +283,28 @@ def resolve_defaults(
             else:
                 resolved_port = DEFAULT_PORT
     return ScriptDefaults(source_root=selected, port=resolved_port)
+
+
+def configured_group_budget(
+    repo: Path, environ: Mapping[str, str] | None = None
+) -> dict[str, int]:
+    """Return the operator's per-group budget settings as positive integers.
+
+    The process environment overrides the main checkout's ``.env``.  Unset
+    entries are omitted so the caller derives them from Docker capacity.
+    """
+    repo = Path(repo).resolve(strict=True)
+    environ = os.environ if environ is None else environ
+    dotenv = _read_dotenv(_known_checkouts(repo)[0] / ".env")
+    budget: dict[str, int] = {}
+    for name in GROUP_BUDGET_ENVS:
+        raw = environ.get(name, "").strip() or dotenv.get(name, "").strip()
+        if not raw:
+            continue
+        if not raw.isdecimal() or int(raw) < 1:
+            raise DiscoveryError(f"{name} must be a positive whole number")
+        budget[name] = int(raw)
+    return budget
 
 
 def _document_port(document: Mapping[str, object]) -> int:

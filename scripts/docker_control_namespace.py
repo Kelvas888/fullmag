@@ -344,10 +344,22 @@ def quarantine(args):
     run_id, snapshot = _held_run(store, activation)
     mounts = compose["services"]["backend"]["volumes"]
     ledger_mounts = [m for m in mounts if m.get("target") == "/host-ledger"]
-    if (len(ledger_mounts) != 1 or ledger_mounts[0].get("type") != "bind"
+    import docker_group_ledger as group_ledger
+    group_volume = compose.get("volumes", {}).get(group_ledger.COMPOSE_VOLUME)
+    if (len(ledger_mounts) == 1 and ledger_mounts[0].get("type") == "volume"
+            and ledger_mounts[0].get("source") == group_ledger.COMPOSE_VOLUME
+            and isinstance(group_volume, dict) and group_volume.get("external") is True
+            and str(group_volume.get("name", "")).startswith(group_ledger.VOLUME_PREFIX)
+            and group_ledger.is_group_ledger_backend(compose["services"]["backend"].get("environment", {}))):
+        # ADR 0067: the group's own ledger volume, never a host path.
+        ledger_root = group_volume["name"]
+        ledger_mount = "type=volume,src=" + ledger_root + ",dst=/ledger,readonly,volume-nocopy"
+    elif (len(ledger_mounts) != 1 or ledger_mounts[0].get("type") != "bind"
             or not re.fullmatch(r"/mnt/fullmag-host-ledger-[a-z0-9_-]+", ledger_mounts[0].get("source", ""))):
-        raise BuildControlError("Recovery requires the exact retained canonical ledger bind")
-    ledger_root = ledger_mounts[0]["source"]
+        raise BuildControlError("Recovery requires the exact retained canonical ledger bind or group volume")
+    else:
+        ledger_root = ledger_mounts[0]["source"]
+        ledger_mount = "type=bind,src=" + ledger_root + ",dst=/ledger,readonly"
     paths = ["active", relative, prefix + "/terminal.json", prefix + "/compose.json",
              "runtime-control/runtime-services/OWNER.json", "runtime-control/runtime-services/LAUNCH.json",
              "runtime-control/runtime-service/process-tree.json"]
@@ -358,6 +370,8 @@ def quarantine(args):
     ):
         raise BuildControlError("Retained native owner is not terminal failed")
     protected = set(terminal.get("backend_volumes", {}).values()) | {control.volume}
+    if ledger_root.startswith(group_ledger.VOLUME_PREFIX):
+        protected.add(ledger_root)
     helper_name = "fullmag-namespace-recovery-" + args.recovery_id
     _inventory(control, protected, str(state), ledger_root)
     engine = docker_capture("info", "--format", "{{.ID}}").stdout.decode().strip()
@@ -367,7 +381,7 @@ def quarantine(args):
         raise BuildControlError("Recovery requires a retained verified immutable helper toolchain")
     probe = control.helper_args("head -c 8388608 /ledger/ledger/HOST_RESOURCE_LEDGER.json")
     i = probe.index("--entrypoint")
-    probe[i:i] = ["--mount", "type=bind,src=" + ledger_root + ",dst=/ledger,readonly"]
+    probe[i:i] = ["--mount", ledger_mount]
     observed = bounded_capture(probe, data=b"", timeout=60)
     if observed.returncode:
         raise BuildControlError("Cannot read the exact retained ledger")
@@ -403,7 +417,7 @@ def quarantine(args):
     command = control.helper_args("exec python3 -I -B -c " + shlex.quote(COMMIT), name=helper_name)
     command[command.index(control.image)] = image
     i = command.index("--entrypoint")
-    command[i:i] = ["--mount", "type=bind,src=" + ledger_root + ",dst=/ledger,readonly",
+    command[i:i] = ["--mount", ledger_mount,
                    "--mount", "type=bind,src=" + str(store) + ",dst=/retained,readonly"]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:

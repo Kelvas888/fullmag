@@ -29,35 +29,37 @@ describe("ObjectRegionsPanel physical scalar inputs", () => {
     );
   });
 
-  it("buffers scientific notation text locally while editing SI values", () => {
+  it("routes scientific notation editing through the shared QuantityField", () => {
     const source = readFileSync(
       new URL("./ObjectRegionsPanel.tsx", import.meta.url),
       "utf8",
     );
 
+    expect(source).toContain("function parsePhysicalScalarText");
+    expect(source).toContain("const parsed = parseRegionPhysicalScalar(text);");
     expect(source).toContain("function PhysicalScalarField");
-    expect(source).toContain("const [text, setText] = useState(formatted);");
-    expect(source).toContain("parseRegionPhysicalScalar(nextText)");
-    expect(source).toContain("const parsed = parseRegionPhysicalScalar(displayValue);");
-    expect(source).toContain("invalid={invalid}");
-    expect(source).toContain('error={invalid ? "Enter a valid SI value" : undefined}');
-    expect(source).toContain('type="text"');
-    expect(source).toContain('inputMode="decimal"');
+    expect(source).toContain("return (\n    <QuantityField");
+    expect(source).toContain("draftKey={draftKey}");
+    expect(source).toContain("format={formatRegionPhysicalScalar}");
+    expect(source).toContain('invalidMessage="Enter a valid SI value"');
+    expect(source).toContain("parse={parsePhysicalScalarText}");
+    expect(source).toContain("onCommit={onValueChange}");
     expect(source).not.toContain("function parsePhysicalInput");
   });
 
-  it("does not write region scalar drafts when the parsed value is unchanged", () => {
+  it("keeps no-op equality and raw draft ownership in QuantityField", () => {
     const source = readFileSync(
       new URL("./ObjectRegionsPanel.tsx", import.meta.url),
       "utf8",
     );
+    const quantityField = readFileSync(
+      new URL("../primitives/QuantityField.tsx", import.meta.url),
+      "utf8",
+    );
 
-    expect(source).toContain(
-      "if (parsed !== null && !Object.is(parsed, value)) {",
-    );
-    expect(source).not.toContain(
-      "if (parsed !== null) {\n          onValueChange(parsed);",
-    );
+    expect(source).toContain("onCommit={onValueChange}");
+    expect(quantityField).toContain("const text = entry?.rawText ?? formatted;");
+    expect(quantityField).toContain("if (!equals(parsed.value, value)) onCommit(parsed.value);");
   });
 
   it("renders capability diagnostics inline in the relevant region panels", () => {
@@ -212,7 +214,7 @@ describe("ObjectRegionsPanel physical scalar inputs", () => {
     expect(source.slice(applyRegionStart, duplicateRegionStart)).toContain(
       "runAuthoringMutationWithHistory",
     );
-    expect(source).toContain('{ historyMode: "mutation-owned" }');
+    expect(source).toContain('historyMode: "mutation-owned"');
     expect(source).toContain("requireRegionBaseRevision(baseRevision)");
     expect(source).not.toContain("return Date.now()");
   });

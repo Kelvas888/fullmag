@@ -334,7 +334,7 @@ class FrontendDevContractTests(TestCase):
         self.assertFalse(self.module.enabled({}))
         self.assertEqual(self.module.EXPECTED_PNPM_VERSION, "10.8.1")
 
-    def test_dev_next_command_uses_local_ephemeral_inspector_without_node_options(self):
+    def test_dev_next_command_uses_local_ephemeral_inspector_with_pinned_heap(self):
         command = self.module._next_command()
         self.assertIn(self.module.INSPECTOR_FLAG, command)
         self.assertEqual(self.module.INSPECTOR_FLAG, "--inspect=127.0.0.1:0")
@@ -357,7 +357,11 @@ class FrontendDevContractTests(TestCase):
             )
             self.assertNotIn("/opt/fullmag/package", environment["PYTHONPATH"].split(os.pathsep))
             self.assertEqual(environment["FULLMAG_REPO_ROOT"], str(_workspace))
-            self.assertNotIn("NODE_OPTIONS", environment)
+            self.assertEqual(environment["NODE_OPTIONS"], "--max-old-space-size=6144")
+            self.assertEqual(
+                self.module._receipt_base(inputs, None)["node_max_old_space_size_mib"],
+                6144,
+            )
             inspector = self.module._receipt_base(inputs, None)["inspector"]
             self.assertEqual(inspector["profile"], "next-dev")
             self.assertEqual(inspector["bind_host"], "127.0.0.1")
@@ -816,6 +820,43 @@ else:
             self.assertEqual(overridden["WATCHPACK_POLLING"], "1500")
             self.assertEqual(overridden_receipt["watchpack_polling_ms"], 1500)
 
+    def test_watch_mode_is_native_only_for_a_linux_filesystem_bind_at_the_source_root(self):
+        source = str(self.module.SOURCE_CONTAINER_ROOT)
+        cases = {
+            "ext4 bind": (f"36 25 8:17 /src {source} ro,relatime - ext4 /dev/sdd ro\n", "native"),
+            "windows 9p bind": (
+                f"36 25 0:52 / {source} ro,noatime - 9p C:\\ ro,aname=drvfs\n", "polling"),
+            "only the root is ext4": ("25 1 8:1 / / rw - ext4 /dev/sda rw\n", "polling"),
+            "later 9p bind hides ext4": (
+                f"36 25 8:17 /src {source} ro - ext4 /dev/sdd ro\n"
+                f"37 25 0:52 / {source} ro - 9p C:\\ ro\n", "polling"),
+            "malformed table": ("garbage\n", "polling"),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for name, (table, expected) in cases.items():
+                with self.subTest(name=name):
+                    path = Path(directory) / "mountinfo"
+                    path.write_text(table, encoding="utf-8")
+                    self.assertEqual(self.module._source_watch_mode(path), expected)
+            self.assertEqual(
+                self.module._source_watch_mode(Path(directory) / "missing"), "polling"
+            )
+
+    def test_native_watch_mode_removes_polling_from_child_and_records_it(self):
+        with isolated(self.module) as (_root, _workspace, inputs):
+            with patch.dict(os.environ, {}, clear=True):
+                native = self.module._safe_environment(inputs, watch_mode="native")
+                polling = self.module._safe_environment(inputs, watch_mode="polling")
+                receipt = self.module._receipt_base(inputs, None, watch_mode="native")
+            self.assertNotIn("WATCHPACK_POLLING", native)
+            self.assertEqual(native["FULLMAG_WATCHPACK_MODE"], "native")
+            self.assertEqual(polling["WATCHPACK_POLLING"], "5000")
+            self.assertEqual(polling["FULLMAG_WATCHPACK_MODE"], "polling")
+            self.assertEqual(receipt["watch_mode"], "native")
+            self.assertEqual(receipt["watchpack_polling_ms"], 5000)
+            with self.assertRaisesRegex(self.module.FrontendDevError, "FULLMAG_WATCHPACK_MODE"):
+                self.module._safe_environment(inputs, watch_mode="inotify")
+
     def test_node_filesystem_threads_are_pinned_and_uncontrolled_node_options_do_not_leak(self):
         with isolated(self.module) as (_root, _workspace, inputs):
             with patch.dict(
@@ -828,7 +869,7 @@ else:
             ):
                 environment = self.module._safe_environment(inputs)
             self.assertEqual(environment["UV_THREADPOOL_SIZE"], "8")
-            self.assertNotIn("NODE_OPTIONS", environment)
+            self.assertEqual(environment["NODE_OPTIONS"], "--max-old-space-size=6144")
 
     def test_watchpack_polling_rejects_values_outside_bounded_integer_contract(self):
         with isolated(self.module) as (_root, _workspace, inputs):

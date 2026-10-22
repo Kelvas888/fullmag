@@ -4,7 +4,7 @@ import { getViewport3DVisualProfile } from "../viewport3dVisualProfile";
 import { resolveViewport3DMaterialProfile } from "./viewport3DMaterialProfile";
 
 describe("viewport3D material profile", () => {
-  it("configures shadeStrength per visual profile (S-01)", () => {
+  it("keeps quantitative shade strength independent from visual quality", () => {
     const interactive = resolveViewport3DMaterialProfile(
       getViewport3DVisualProfile("interactive"),
     );
@@ -15,9 +15,27 @@ describe("viewport3D material profile", () => {
       getViewport3DVisualProfile("capture"),
     );
 
-    expect(interactive.magneticSurface.shadeStrength).toBe(0.45);
+    expect(interactive.magneticSurface.shadeStrength).toBe(0);
     expect(figure.magneticSurface.shadeStrength).toBe(0);
     expect(capture.magneticSurface.shadeStrength).toBe(0);
+    expect(figure.magneticSurface.toneMapped).toBe(false);
+    expect(capture.magneticSurface.toneMapped).toBe(false);
+  });
+
+  it("keeps quantitative field colors unshaded in both geometry lighting modes", () => {
+    const studio = resolveViewport3DMaterialProfile(
+      getViewport3DVisualProfile("interactive"),
+      { lightingMode: "studio" },
+    );
+    const flat = resolveViewport3DMaterialProfile(
+      getViewport3DVisualProfile("capture"),
+      { lightingMode: "flat" },
+    );
+
+    expect(studio.magneticSurface.shadeStrength).toBe(0);
+    expect(flat.magneticSurface.shadeStrength).toBe(0);
+    expect(studio).not.toHaveProperty("fieldColorShading");
+    expect(flat).not.toHaveProperty("fieldColorShading");
   });
 
   it("keeps lite materials un-tonemapped", () => {
@@ -29,22 +47,23 @@ describe("viewport3D material profile", () => {
     expect(profile.primitivePreview.toneMapped).toBe(false);
   });
 
-  it("keeps magnetic and primitive surfaces unlit", () => {
+  it("keeps quantitative surfaces flat while enabling studio for uniform geometry", () => {
     const interactive = resolveViewport3DMaterialProfile(
       getViewport3DVisualProfile("interactive"),
     );
 
     expect(interactive.magneticSurface).toEqual({
-      shadeStrength: 0.45,
+      shadeStrength: 0,
       toneMapped: false,
     });
     expect(interactive.primitivePreview).toEqual({ toneMapped: false });
+    expect(interactive.uniformGeometry.lit).toBe(true);
     expect(interactive.magneticSurface).not.toHaveProperty("metalness");
     expect(interactive.magneticSurface).not.toHaveProperty("roughness");
     expect(interactive.primitivePreview).not.toHaveProperty("emissiveIntensity");
   });
 
-  it("keeps capture-oriented primitive previews unlit", () => {
+  it("keeps lighting mode independent from capture quality", () => {
     const interactive = resolveViewport3DMaterialProfile(
       getViewport3DVisualProfile("interactive"),
     );
@@ -53,6 +72,17 @@ describe("viewport3D material profile", () => {
     );
 
     expect(figure.primitivePreview).toEqual(interactive.primitivePreview);
+    expect(figure.uniformGeometry).toEqual(interactive.uniformGeometry);
+  });
+
+  it("supports flat uniform geometry without changing quantitative shading", () => {
+    const flat = resolveViewport3DMaterialProfile(
+      getViewport3DVisualProfile("interactive"),
+      { lightingMode: "flat" },
+    );
+
+    expect(flat.uniformGeometry.lit).toBe(false);
+    expect(flat.magneticSurface.shadeStrength).toBe(0);
   });
 
   it("maps visual profile edge opacity and boost into feature edge opacity", () => {

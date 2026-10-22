@@ -4,7 +4,9 @@ import type { Viewport3DBounds } from "../viewport3dRenderModel";
 import {
   buildDimensionFrameModel,
   formatDimensionFrameTickValue,
+  hasMeaningfulDimensionFrameBounds,
   resolveDimensionFrameEdges,
+  resolveDimensionFrameOrientationWithHysteresis,
   resolveDimensionFrameStep,
   resolveDimensionFrameUnit,
 } from "./dimensionFrameModel";
@@ -20,6 +22,57 @@ const cameraState = {
   target: [0, 0, 0] as [number, number, number],
   up: [0, 0, 1] as [number, number, number],
 };
+
+describe("hasMeaningfulDimensionFrameBounds", () => {
+  const boundsWith = (
+    center: [number, number, number],
+    size: [number, number, number],
+  ): Viewport3DBounds => ({
+    center,
+    radius: 1e-12,
+    size,
+  });
+
+  it("rejects missing, point-degenerate, non-finite, and negative bounds", () => {
+    expect(hasMeaningfulDimensionFrameBounds(null)).toBe(false);
+    expect(
+      hasMeaningfulDimensionFrameBounds(boundsWith([0, 0, 0], [0, 0, 0])),
+    ).toBe(false);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([Number.NaN, 0, 0], [1, 0, 0]),
+      ),
+    ).toBe(false);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [1, Number.POSITIVE_INFINITY, 0]),
+      ),
+    ).toBe(false);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [1, -1, 0]),
+      ),
+    ).toBe(false);
+  });
+
+  it("accepts positive one-dimensional, flat two-dimensional, and thin 3D extents", () => {
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [2e-6, 0, 0]),
+      ),
+    ).toBe(true);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [2e-6, 1e-6, 0]),
+      ),
+    ).toBe(true);
+    expect(
+      hasMeaningfulDimensionFrameBounds(
+        boundsWith([0, 0, 0], [3e-6, 2e-6, 1e-15]),
+      ),
+    ).toBe(true);
+  });
+});
 
 describe("resolveDimensionFrameUnit", () => {
   it("uses nm for nanoscale magnetic domains", () => {
@@ -132,6 +185,7 @@ describe("buildDimensionFrameModel", () => {
     expect(model.minorLines).toHaveLength(0);
     expect(model.labels).toHaveLength(0);
     expect(model.majorTickLines).toHaveLength(0);
+    expect(model.axisLines).toHaveLength(0);
   });
 
   it("puts the scale on the floor edges facing the camera", () => {
@@ -145,6 +199,58 @@ describe("buildDimensionFrameModel", () => {
       position: [-1e-6, -1e-6, 1e-6],
     });
     expect(behind.map((edge) => edge.id)).toEqual(["x@ymin", "y@xmin", "z@xminymax"]);
+  });
+
+  it("holds edge selection near camera quadrant boundaries", () => {
+    const previous = {
+      xFacing: 1 as const,
+      yFacing: -1 as const,
+      zCornerX: 1 as const,
+      zCornerY: -1 as const,
+    };
+    const near = resolveDimensionFrameOrientationWithHysteresis(
+      bounds,
+      {
+        position: [-0.05, -1, 0.4],
+        target: [0, 0, 0],
+        up: [0, 0, 1],
+      },
+      previous,
+    );
+    const pastBoundary = resolveDimensionFrameOrientationWithHysteresis(
+      bounds,
+      {
+        position: [-0.2, -1, 0.4],
+        target: [0, 0, 0],
+        up: [0, 0, 1],
+      },
+      previous,
+    );
+
+    expect(near.xFacing).toBe(1);
+    expect(pastBoundary.xFacing).toBe(-1);
+  });
+
+  it("holds the left silhouette corner until it wins by the angular margin", () => {
+    const previous = {
+      xFacing: 1 as const,
+      yFacing: -1 as const,
+      zCornerX: 1 as const,
+      zCornerY: -1 as const,
+    };
+    const resolve = (y: number) =>
+      resolveDimensionFrameOrientationWithHysteresis(
+        bounds,
+        {
+          position: [1, y, 1],
+          target: [0, 0, 0],
+          up: [0, 0, 1],
+        },
+        previous,
+      );
+
+    expect(resolve(-0.02).zCornerX).toBe(1);
+    expect(resolve(-0.2).zCornerX).toBe(-1);
   });
 
   it("titles each annotated axis with its unit", () => {
@@ -165,6 +271,87 @@ describe("buildDimensionFrameModel", () => {
       ["z", "nm"],
     ]);
     expect(model.extentLines).toHaveLength(0);
+  });
+
+  it("keeps the three scale baselines when labels are hidden", () => {
+    const labelled = buildDimensionFrameModel({
+      bounds,
+      cameraProjection: "perspective",
+      cameraState,
+      density: "auto",
+      labelsVisible: true,
+      mode: "floor",
+      unitMode: "auto",
+    });
+    const unlabelled = buildDimensionFrameModel({
+      bounds,
+      cameraProjection: "perspective",
+      cameraState,
+      density: "auto",
+      labelsVisible: false,
+      mode: "floor",
+      unitMode: "auto",
+    });
+
+    expect(unlabelled.labels).toHaveLength(0);
+    expect(unlabelled.axisLines).toHaveLength(18);
+    expect(unlabelled.axisLines).toEqual(labelled.axisLines);
+    const selectedEdges = resolveDimensionFrameEdges(
+      {
+        max: [50e-9, 40e-9, 10e-9],
+        min: [-50e-9, -40e-9, -10e-9],
+      },
+      cameraState,
+    );
+    const axisIndex = { x: 0, y: 1, z: 2 } as const;
+    const expectedLines = selectedEdges.flatMap((edge) => {
+      const index = axisIndex[edge.axis];
+      return [
+        ...edge.at([-50e-9, -40e-9, -10e-9][index]),
+        ...edge.at([50e-9, 40e-9, 10e-9][index]),
+      ];
+    });
+    expect(Array.from(unlabelled.axisLines)).toEqual(expectedLines.map(Math.fround));
+  });
+
+  it("uses SI world ticks when requested and keeps frame-centred ticks by default", () => {
+    const offsetBounds: Viewport3DBounds = {
+      center: [20e-9, 0, 0],
+      radius: Math.hypot(100e-9, 80e-9, 20e-9) / 2,
+      size: [100e-9, 80e-9, 20e-9],
+    };
+    const centred = buildDimensionFrameModel({
+      bounds: offsetBounds,
+      cameraProjection: "perspective",
+      cameraState,
+      density: "auto",
+      labelsVisible: true,
+      mode: "floor",
+      unitMode: "nm",
+    });
+    const world = buildDimensionFrameModel({
+      bounds: offsetBounds,
+      cameraProjection: "perspective",
+      cameraState,
+      density: "auto",
+      labelsVisible: true,
+      mode: "floor",
+      originMode: "world",
+      unitMode: "nm",
+    });
+    const centredZero = centred.labels.find(
+      (label) => label.kind === "tick" && label.axis === "x" && label.tickIndex === 0,
+    );
+    const worldZero = world.labels.find(
+      (label) => label.kind === "tick" && label.axis === "x" && label.tickIndex === 0,
+    );
+
+    expect(centred.originMode).toBe("frame-center");
+    expect(centredZero?.text).toBe("0");
+    expect(centredZero?.position[0]).toBeCloseTo(20e-9);
+    expect(world.originMode).toBe("world");
+    expect(worldZero?.text).toBe("0");
+    expect(worldZero?.position[0]).toBeCloseTo(0);
   });
 
   it("draws overall extents instead of ticks in extents mode", () => {

@@ -937,4 +937,4 @@ For this topic, `Exchange + Demag + Zeeman` are now executable in the public FDM
 
 | Accepted original-context fields | crates/fullmag-runner/src/accepted_materialization.rs | capture_solver_observables, materialize_captured_observables | Copy complete same-clock fields and bind them to the final immutable state before CAS publication. | FDM CPU/GPU | source-visible; runtime NOT VERIFIED |
 | Terminal binary spool | crates/fullmag-api/src/accepted_observation_spool.rs | write_fragment | Write one complete quantity with accepted-source guards and admitted budgets. | FDM/FEM CPU/GPU | source-only; runtime NOT VERIFIED |
-| Terminal binary publication | crates/fullmag-api/src/accepted_quantity_bundle.rs | materialize_spool | Validate complete catalog and publish immutable CAS chunks plus metadata. | FDM/FEM CPU/GPU | source-only; runtime NOT VERIFIED |
+| Terminal binary publication | crates/fullmag-api/src/accepted_field_materialization_worker.rs | materialize_spool | Validate complete catalog and publish immutable CAS chunks plus metadata. | FDM/FEM CPU/GPU | source-only; runtime NOT VERIFIED |

@@ -83,6 +83,7 @@ describe("ViewCube3DBox", () => {
     expect(source).toContain("capture: true");
     expect(source).toContain("const rect = element.getBoundingClientRect();");
     expect(source).toContain("raycaster.intersectObject(group, true)");
+    expect(source).toContain("raycaster: createViewport3DHudRaycaster()");
     expect(source).toContain("viewCubeTargetDirection");
     expect(source).toContain("viewCubeFallbackBox");
   });

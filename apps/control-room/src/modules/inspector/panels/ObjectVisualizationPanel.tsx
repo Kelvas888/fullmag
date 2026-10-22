@@ -46,7 +46,10 @@ import {
   type ViewportTargetRenderingPreferences,
 } from "@/kernel/visualization/ObjectVisualizationController";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
-import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
+import {
+  resolveSessionDiscretization,
+  resolveSessionTopologyDiscretization,
+} from "@/kernel/resources/sessionDiscretization";
 import {
   shouldLoadRuntimeMeshManifest,
   useFieldCatalogResource,
@@ -276,8 +279,10 @@ function useObjectVisualizationPanelState(
     },
   );
   const lane = resolveObjectVisualizationLane(
-    resolveSessionDiscretization(manifestStatus),
+    resolveSessionTopologyDiscretization(manifestStatus),
   );
+  const unresolvedRuntimeLaneHasPublishedFemPreview =
+    resolveSessionDiscretization(manifestStatus) === null && lane === "fem";
   const fdmMultilayerLayout = useFdmMultilayerLayoutResource({
     enabled: !artifactInspection && lane === "fdm",
   });
@@ -327,7 +332,8 @@ function useObjectVisualizationPanelState(
   const manifest = useMeshSharedDomainManifestResource({
     enabled:
       femResourcesEnabled &&
-      shouldLoadRuntimeMeshManifest(Boolean(target), manifestStatus),
+      (shouldLoadRuntimeMeshManifest(Boolean(target), manifestStatus) ||
+        (Boolean(target) && unresolvedRuntimeLaneHasPublishedFemPreview)),
   });
   const sceneObjectIds = useMemo(
     () => visualizationSceneObjectIds(scene.data),
@@ -1097,7 +1103,26 @@ function useObjectVisualizationPanelState(
     });
   }
 
+  const meshState = artifactInspection
+    ? artifactPresentation
+      ? "Own carrier ready"
+      : "Awaiting owned carrier"
+    : renderResolution?.degradedReasons.length
+      ? "Degraded"
+      : lane === "unresolved"
+        ? "Unresolved"
+        : lane === "fem"
+          ? manifest.status === "error"
+            ? "Unavailable"
+            : manifest.status !== "ready" || !manifest.data
+              ? manifestStatus?.resources.mesh_revision === 0
+                ? "Not published"
+                : "Loading"
+              : "Ready"
+          : "Ready";
+
   return {
+    meshState,
     artifactInspection,
     artifactPresentation,
     sharedArtifactFieldMeta,
@@ -1472,9 +1497,7 @@ function ObjectVisualizationPanelView({
     !isFdmUniverseOutsideSupportTarget(target)
       ? { ...target, kind: "fdm-domain" as const }
       : target;
-  const meshState = panel.artifactInspection ? panel.artifactPresentation ? "Own carrier ready" : "Awaiting owned carrier" : renderResolution?.degradedReasons.length
-    ? "Degraded"
-    : "Ready";
+  const meshState = panel.meshState;
   return (
     <div
       className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group"

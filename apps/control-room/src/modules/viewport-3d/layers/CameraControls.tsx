@@ -4,9 +4,13 @@ import { OrbitControls as DreiOrbitControls } from "@react-three/drei";
 import { useFrame, useThree } from "@react-three/fiber";
 import { useCallback, useEffect, useRef } from "react";
 import type { ComponentRef } from "react";
-import { MathUtils, type Camera } from "three";
+import { MathUtils, PerspectiveCamera, type Camera } from "three";
 
 import type { Viewport3DResourceTracker } from "../viewport3dDiagnostics";
+import {
+  DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+  resolveViewport3DCameraFovDegrees,
+} from "../viewport3dCameraFov";
 import { nearTuple3, sameTuple3 } from "../viewport3dMath";
 import type { Viewport3DBounds } from "../viewport3dRenderModel";
 import { useBatchedInvalidate } from "../viewport3dBatchedInvalidate";
@@ -354,11 +358,27 @@ function applyCameraLookAt(camera: Camera, target: [number, number, number]): vo
 
 export function resolveViewport3DCameraFit(
   bounds: Viewport3DBounds | null,
+  {
+    aspect = 1,
+    fovDegrees = DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+  }: { aspect?: number; fovDegrees?: number } = {},
 ): Viewport3DCameraFit {
   const activeBounds = bounds ?? FALLBACK_CAMERA_BOUNDS;
   const [x, y, z] = activeBounds.center;
   const radius = Math.max(activeBounds.radius, 1e-12);
-  const distance = radius * 2.8;
+  const resolvedFov = resolveViewport3DCameraFovDegrees(fovDegrees);
+  const safeAspect =
+    Number.isFinite(aspect) && aspect > 0
+      ? MathUtils.clamp(aspect, 1e-3, 1e3)
+      : 1;
+  const verticalHalfFov = MathUtils.degToRad(resolvedFov / 2);
+  const horizontalHalfFov = Math.atan(
+    Math.tan(verticalHalfFov) * safeAspect,
+  );
+  const limitingHalfFov = Math.min(verticalHalfFov, horizontalHalfFov);
+  const cameraDistance =
+    (radius * CAMERA_FIT_MARGIN) / Math.sin(limitingHalfFov);
+  const distance = cameraDistance / CAMERA_FIT_OFFSET_LENGTH;
   const near = Math.max(distance / 100, 1e-12);
   const far = Math.max(distance * 100, near * 100, 1e-3);
 
@@ -376,6 +396,28 @@ export function resolveViewport3DCameraFit(
       activeBounds.center[2],
     ],
   };
+}
+
+const CAMERA_FIT_OFFSET_LENGTH = Math.hypot(1, 0.72, 1);
+// Preserve the existing 2.8-radius default fit at 42 degrees and square aspect.
+const CAMERA_FIT_MARGIN =
+  2.8 * CAMERA_FIT_OFFSET_LENGTH * Math.sin(
+    MathUtils.degToRad(DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES / 2),
+  );
+
+export function resolveViewport3DAutoFitOrbitTarget({
+  cameraState,
+  currentPosition,
+  fit,
+}: {
+  cameraState: Viewport3DCameraState;
+  currentPosition: [number, number, number];
+  fit: Viewport3DCameraFit | null;
+}): [number, number, number] | null {
+  // Only adopt a target for the exact fit already applied by CameraController.
+  // An authored pose or a position moved by a gesture must keep its own target.
+  return fit && isDefaultCameraState(cameraState) &&
+    sameTuple3(currentPosition, fit.position) ? fit.target : null;
 }
 
 function boundsSignature(bounds: Viewport3DBounds | null): string | null {
@@ -500,7 +542,7 @@ export function CameraController({
   resetCameraRevision: number;
   tracker: Viewport3DResourceTracker;
 }) {
-  const { camera } = useThree();
+  const { camera, size } = useThree();
   const invalidate = useBatchedInvalidate("camera");
   const handledFitRevisionRef = useRef(fitRevision);
   const handledResetCameraRevisionRef = useRef(resetCameraRevision);
@@ -548,7 +590,15 @@ export function CameraController({
       shouldAutoFitChangedBounds;
     if (!shouldFit) return;
 
-    const fit = resolveViewport3DCameraFit(bounds);
+    const perspectiveCamera = camera instanceof PerspectiveCamera;
+    const fit = resolveViewport3DCameraFit(bounds, {
+      aspect: perspectiveCamera
+        ? size.width / Math.max(size.height, 1)
+        : 1,
+      fovDegrees: perspectiveCamera
+        ? camera.fov
+        : DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+    });
 
     applyViewport3DWorldUp(camera);
     camera.position.set(...fit.position);
@@ -581,6 +631,7 @@ export function CameraController({
     fitRevision,
     invalidate,
     resetCameraRevision,
+    size,
     tracker,
   ]);
 
@@ -853,10 +904,37 @@ function useOrbitCameraControlsModel({
   useEffect(() => {
     if (viewport3DCameraGestureActive(cameraGestureRef)) return;
     const controls = controlsRef.current;
-    const currentTarget = controls?.target?.toArray();
+    let currentTarget = controls?.target?.toArray();
     if (!controls || !currentTarget) return;
     const currentPosition = camera.position.toArray();
-    const fittedCamera = bounds ? resolveViewport3DCameraFit(bounds) : null;
+    const perspectiveCamera = camera instanceof PerspectiveCamera;
+    const fittedCamera = bounds
+      ? resolveViewport3DCameraFit(bounds, {
+          aspect: perspectiveCamera
+            ? size.width / Math.max(size.height, 1)
+            : 1,
+          fovDegrees: perspectiveCamera
+            ? camera.fov
+            : DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+        })
+      : null;
+    const autoFitTarget = resolveViewport3DAutoFitOrbitTarget({
+      cameraState,
+      currentPosition: tuple3(currentPosition),
+      fit: fittedCamera,
+    });
+    if (autoFitTarget && !sameTuple3(tuple3(currentTarget), autoFitTarget)) {
+      controlsSyncingRef.current = true;
+      try {
+        controls.target.set(...autoFitTarget);
+        controls.update();
+        currentTarget = controls.target.toArray();
+      } finally {
+        controlsSyncingRef.current = false;
+      }
+      invalidate();
+      tracker.recordDirtyFrame("camera-control-target");
+    }
     if (
       fittedCamera &&
       shouldPreserveViewport3DAutoFitAgainstDefaultCamera({
@@ -903,6 +981,8 @@ function useOrbitCameraControlsModel({
     cameraGestureRef,
     cameraState,
     invalidate,
+    size.height,
+    size.width,
     tracker,
   ]);
 

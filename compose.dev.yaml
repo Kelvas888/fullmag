@@ -142,6 +142,9 @@ services:
       FULLMAG_RUNTIME_IMAGE_ID: ${FULLMAG_DEV_IMAGE}
       FULLMAG_TOOLCHAIN_IMAGE_ID: ${FULLMAG_TOOLCHAIN_IMAGE_ID:?Pin the toolchain identity}
       FULLMAG_BACKEND_CARGO_PROFILE: ${FULLMAG_BACKEND_CARGO_PROFILE:-backend-dev}
+      # Match the baseline backend CPU quota; the managed saved budget
+      # updates both this value and the quota when rendering Compose.
+      CARGO_BUILD_JOBS: "4"
       FULLMAG_DOCKER_DEVICE_ACCESS: ${FULLMAG_DOCKER_DEVICE_ACCESS:?Resolved device access is required}
       # Bounded operator-probe controls.  These are the only workload
       # variables admitted from the host environment; do not replace this
@@ -242,8 +245,9 @@ services:
     init: true
     user: "65532:65532"
     read_only: true
-    cpus: 2
-    mem_limit: 6g
+    cpus: 4
+    # Leave room for Next plus a separate lint/typecheck process and native allocations.
+    mem_limit: 16g
     pids_limit: 512
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -255,6 +259,9 @@ services:
     environment:
       FULLMAG_DOCKER_ROLE: frontend
       FULLMAG_DOCKER_FRONTEND: dev
+      # Also applies to tools invoked through docker exec; the Next launcher
+      # independently pins the same heap budget in its sanitized environment.
+      NODE_OPTIONS: --max-old-space-size=6144
       FULLMAG_API_PROXY_TARGET: http://backend:8081
       FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-5000}
       FULLMAG_SOURCE_ROOT: ${FULLMAG_SOURCE_ROOT:?Select the Windows source checkout}

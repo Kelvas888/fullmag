@@ -576,6 +576,8 @@ class StartupRejectionTests(unittest.TestCase):
                     side_effect=lambda _paths, _recovery: nullcontext()
                 ),
                 recover_idle_failure=mock.Mock(return_value=None),
+                POST_BUILD_START_ENV="FULLMAG_DOCKER_POST_BUILD_CONTINUATION",
+                POST_BUILD_START_SHA_ENV="FULLMAG_DOCKER_POST_BUILD_CONTINUATION_SHA256",
                 ensure_configuration=mock.Mock(return_value={}),
                 process_environment=mock.Mock(return_value={}),
                 accepted_reattach_preflight=lambda _paths: None,

@@ -569,6 +569,7 @@ def _validate_preflight(args: argparse.Namespace, selected: Path, identity: Mapp
         raise _fail("backend source identity does not match the selected checkout")
     _validate_source_bind(actual["frontend"], selected,
                           compose["services"]["frontend"].get("x-fullmag-daemon-binds"))
+    _preflight_terminal_process_receipt(actual["backend"], control)
     probe = _probe(args.backend_container_id, args.request_id, args.session_id, args.source_sha256, args.failure_marker_sha256)
     _validate_probe_document(probe, args)
     return retained, dict(actual), probe
@@ -589,9 +590,13 @@ def _restore_frontend(frontend_id: str) -> None:
 
 
 def _runtime_control_volume_mount(
-    actual_backend: Mapping[str, object], project: str
+    actual_backend: Mapping[str, object], project: str, *, namespace: str | None = None,
 ) -> tuple[str, str]:
-    """Return the exact named volume and Compose subpath for runtime-control."""
+    """Return the exact named volume and selected namespace subpath."""
+    # BuildControl records a group without a quarantined namespace as "".
+    if namespace and re.fullmatch(r"namespaces/[0-9a-f]{32}", namespace) is None:
+        raise _fail("runtime-control namespace is invalid")
+    expected_subpath = f"{namespace}/{RUNTIME_CONTROL_SUBPATH}" if namespace else RUNTIME_CONTROL_SUBPATH
     mounts = actual_backend.get("Mounts")
     if not isinstance(mounts, list):
         raise _fail("backend runtime-control mounts cannot be inspected")
@@ -627,7 +632,7 @@ def _runtime_control_volume_mount(
         host_mount.get("Type") != "volume"
         or host_mount.get("Source") != name
         or not isinstance(options, Mapping)
-        or options.get("Subpath") != RUNTIME_CONTROL_SUBPATH
+        or options.get("Subpath") != expected_subpath
         or host_mount.get("ReadOnly") is True
     ):
         raise _fail("backend runtime-control mount does not prove the canonical subpath")
@@ -644,7 +649,7 @@ def _runtime_control_volume_mount(
         or labels.get("com.fullmag.compose.project") != project
     ):
         raise _fail("runtime-control volume ownership differs from the selected group")
-    return name, RUNTIME_CONTROL_SUBPATH
+    return name, expected_subpath
 
 
 def _runtime_control_validation_helper(
@@ -654,7 +659,11 @@ def _runtime_control_validation_helper(
     image = actual_backend.get("Image")
     if not isinstance(image, str) or not IMAGE_ID_RE.fullmatch(image):
         raise _fail("backend image identity is unavailable for terminal validation")
-    volume, subpath = _runtime_control_volume_mount(actual_backend, control.project)
+    volume, subpath = _runtime_control_volume_mount(
+        actual_backend, control.project, namespace=control.namespace,
+    )
+    if volume != control.volume:
+        raise _fail("runtime-control volume differs from the selected controller")
     script = r'''
 import json, sys
 sys.path.insert(0, '/opt/fullmag')
@@ -692,6 +701,17 @@ sys.stdout.buffer.write(data)
         "-B", "-c", script,
     ]
     return args
+
+
+def _preflight_terminal_process_receipt(
+    actual_backend: Mapping[str, object], control: BuildControl
+) -> None:
+    """Prove before any stop that the drained receipt can be read afterwards.
+
+    The read itself needs the stopped backend; its image, runtime-control
+    mount and volume ownership do not change across a graceful stop.
+    """
+    _runtime_control_validation_helper(actual_backend, control)
 
 
 def _read_terminal_process_receipt(

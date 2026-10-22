@@ -15,6 +15,10 @@ import {
   VIEWPORT_3D_WORLD_UP,
   type Viewport3DCameraChange,
 } from "../layers/CameraControls";
+import {
+  DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+  resolveViewport3DCameraFovDegrees,
+} from "../viewport3dCameraFov";
 import type { Viewport3DBounds } from "../viewport3dRenderModel";
 import {
   DEFAULT_VIEWPORT_3D_CAMERA_STATE,
@@ -40,7 +44,7 @@ export interface SavedViewportCameraController {
   cameraState: Viewport3DCameraState;
   beginInteraction: (epoch?: number) => number;
   endInteraction: (epoch?: number) => void;
-  fitCamera: () => boolean;
+  fitCamera: (aspect?: number) => boolean;
   patchCamera: (patch: SavedViewportCameraPatch, epoch?: number) => boolean;
   resetCamera: () => boolean;
   saveCameraState: (camera: Viewport3DCameraChange, epoch?: number) => boolean;
@@ -60,6 +64,7 @@ interface SavedViewportCameraStore {
   fitCamera: (
     identityKey: string,
     bounds: Viewport3DBounds | null,
+    aspect?: number,
   ) => boolean;
   getSnapshot: () => SavedViewportCameraSnapshot;
   getSnapshotForIdentity: (
@@ -79,7 +84,6 @@ interface SavedViewportCameraStore {
   subscribe: (listener: SavedViewportCameraListener) => () => void;
 }
 
-const DEFAULT_FOV_DEGREES = 42;
 const MAX_SAVED_VIEWPORT_CAMERA_SNAPSHOTS = 8;
 
 export function normalizeSavedViewportCameraIdentity(
@@ -107,7 +111,7 @@ function cloneCameraState(
 
 function defaultCameraState(): CameraRegistryCameraState {
   return {
-    fov_degrees: DEFAULT_FOV_DEGREES,
+    fov_degrees: DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
     orthographic_scale: null,
     position: [
       DEFAULT_VIEWPORT_3D_CAMERA_STATE.position[0],
@@ -339,10 +343,18 @@ function createStore(): SavedViewportCameraStore {
       activeInteractionEpoch = null;
       interactionEpochExplicit = false;
     },
-    fitCamera(identityKey, bounds) {
+    fitCamera(identityKey, bounds, aspect = 1) {
       if (activeIdentityKey !== identityKey) activate(identityKey);
       ensureInteractionEpoch();
-      const fit = resolveViewport3DCameraFit(bounds);
+      const perspective = activeSnapshot.camera.projection === "perspective";
+      const fit = resolveViewport3DCameraFit(bounds, {
+        aspect: perspective ? aspect : 1,
+        fovDegrees: perspective
+          ? resolveViewport3DCameraFovDegrees(
+              activeSnapshot.camera.fov_degrees,
+            )
+          : DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
+      });
       return setCamera(identityKey, {
         ...activeSnapshot.camera,
         position: fit.position,
@@ -480,14 +492,14 @@ export function useSavedViewportCamera({
     },
     [activeIdentityKey, activeIdentityRef, store],
   );
-  const fitCamera = useCallback(() => {
+  const fitCamera = useCallback((aspect = 1) => {
     if (
       !activeIdentityKey ||
       activeIdentityRef.current !== activeIdentityKey
     ) {
       return false;
     }
-    return store.fitCamera(activeIdentityKey, bounds);
+    return store.fitCamera(activeIdentityKey, bounds, aspect);
   }, [activeIdentityKey, activeIdentityRef, bounds, store]);
   const resetCamera = useCallback(() => {
     if (

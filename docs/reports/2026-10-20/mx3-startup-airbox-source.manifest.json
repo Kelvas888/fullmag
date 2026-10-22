@@ -1,0 +1,227 @@
+{
+  "observed_at": "2026-10-21T02:20:56.522017+00:00",
+  "verification": "H0/H1/H2 source only. H2 library and integration source reviews completed after descriptor-resume, Mounts inventory and CPU/RAM-only budget fixes. Python AST3 and Rust parser2 PASS; no tests or compilation. Actual read-only migration preflight blocked by two running foreign /host-ledger consumers; expanded stop/recovery authorization pending. No migration, foreign stop, new build, retry04 or Solve. Last actual build73e Make exit0/121700ms; H3 checkpoint740722f4 stopped-confirmed receipt SHA a15f43cbe50ab8ce9e25aef97ae81c777f4c1d712f74d7751c63adb1a60a6c5a. API/mesh/browser NOT VERIFIED. Hashes identify current source bytes only.",
+  "files": [
+    {
+      "path": "apps/control-room/src/kernel/layout/SimulationStartupOverlay.tsx",
+      "sha256": "9d05abaf152dc14a8b3f35ac2a03cdc6c995eb3891b8daf5a4776d73143f157d"
+    },
+    {
+      "path": "apps/control-room/src/kernel/layout/simulationPreparationModel.ts",
+      "sha256": "e7f1dbdc59ce256ec409387a1f29b09c5b1d88db92df9b017363f7fb0ac08c94"
+    },
+    {
+      "path": "apps/control-room/src/kernel/resources/sessionDiscretization.ts",
+      "sha256": "0eb274d4efc1572a120e5f923f2e25f70831f525e78c6a80c3f584d475dea94e"
+    },
+    {
+      "path": "apps/control-room/src/kernel/runtime/studyRuntimeCommandContributions.ts",
+      "sha256": "d0e192f7d64ac7ef620f62f2a6101f8750b9f87f5432d820572ca6978c67f6a5"
+    },
+    {
+      "path": "apps/control-room/src/kernel/visualization/primitiveSurfaceColor.ts",
+      "sha256": "9a07fa78faebd795e3e3d73a9cd1a673f748f62654be9c97c5ff3576179ad938"
+    },
+    {
+      "path": "apps/control-room/src/modules/explorer/ExplorerModule.tsx",
+      "sha256": "0cac512afe2349d6bf82c309c9ea3963cfb91c0547462990a195656603099318"
+    },
+    {
+      "path": "apps/control-room/src/modules/inspector/panels/ObjectVisualizationHelpers.ts",
+      "sha256": "66d0542e9346831d8a23001e1094c9f35a2565dd6f7de0801b2b3250d2d95e17"
+    },
+    {
+      "path": "apps/control-room/src/modules/inspector/panels/ObjectVisualizationPanel.tsx",
+      "sha256": "cadeb450612b0684193a0e02c060b3f869d3286af2f77383d1f6d8af12ebd82d"
+    },
+    {
+      "path": "apps/control-room/src/modules/inspector/panels/ObjectVisualizationPanelModel.ts",
+      "sha256": "71b2c2e36f800e196935f9b72213cf43f06888340e6f2f14eeb6fabdbcb59ca8"
+    },
+    {
+      "path": "apps/control-room/src/modules/inspector/panels/StudyInspectorPanel.tsx",
+      "sha256": "12dfe624388270aee6b8365ebb97588f8594c557e0f6c885b104ffbd131a5ac5"
+    },
+    {
+      "path": "apps/control-room/src/modules/viewport-3d/Viewport3DModule.tsx",
+      "sha256": "26070d7559c532f2c8476c3ff79b154ae071a58b4f74d8d7cd456bbaf4501b27"
+    },
+    {
+      "path": "apps/control-room/src/modules/viewport-3d/hooks/useViewport3DSceneModel.ts",
+      "sha256": "4246f448f2cd9011cf8a169c42c40ce4498bde47f8c79e61ed098ac45ae9338b"
+    },
+    {
+      "path": "compose.dev.yaml",
+      "sha256": "0e92f05388c2f6adeeee5ea78f21d857a9d314d3a5a66ec667afd7a1e5d5c9f9"
+    },
+    {
+      "path": "compose.host-ledger.yaml",
+      "sha256": "c30a0e074e49c261631a497f752a8d83ab7324960d3d28e257efd60200ac7e3a"
+    },
+    {
+      "path": "crates/fullmag-api/src/accepted_fem_preparation_scheduler_main.rs",
+      "sha256": "e05f0a6c36f8b5b93a54bf7d0afb23a277b40d1010a2cb80aec9d990a968225a"
+    },
+    {
+      "path": "crates/fullmag-api/src/accepted_fem_preparation_supervisor.rs",
+      "sha256": "f183f98d434d273bbaab4ed4b6c6b162c26354bb75fda3ba2c84ab2356d7c834"
+    },
+    {
+      "path": "crates/fullmag-api/src/accepted_scheduler_main.rs",
+      "sha256": "f53de2241291280b5f562584a1d40a02dfb4d1363191fec3753b6793359b9a57"
+    },
+    {
+      "path": "crates/fullmag-api/src/development_accepted_restore.rs",
+      "sha256": "ee50a1bf360ae2f0c292ebd124d10c972c01f8057e3299e97ae18a25d5629455"
+    },
+    {
+      "path": "crates/fullmag-api/src/docker_startup.rs",
+      "sha256": "565ef2a330952b7486e9eab14b85cdb24ba2f8d6e3dc23f150bad32caacdc21c"
+    },
+    {
+      "path": "crates/fullmag-api/src/live_accepted_projection.rs",
+      "sha256": "37af132e0ac0010dcf0705e14e4c90f502f246e69509891acb256f822d13e4b5"
+    },
+    {
+      "path": "crates/fullmag-api/src/live_scene_preparation.rs",
+      "sha256": "e321a1fd7a35f219b8c576a5c802abcbc3e00f215cc0ba447c6bcdc2165bf343"
+    },
+    {
+      "path": "crates/fullmag-api/src/main.rs",
+      "sha256": "b3d1cd13efc33ad1da79926eb5b9d17eee31f899c1aa604aece8cd837572b661"
+    },
+    {
+      "path": "crates/fullmag-api/src/runtime_service_main.rs",
+      "sha256": "0f0033b41680857deece4d7b175958d704e726c29cca825cce9daf81465d550b"
+    },
+    {
+      "path": "crates/fullmag-fdm-sys/build.rs",
+      "sha256": "a109cb16b8b9283aa87f29cdc9f1fd22b013376c7b910c247437fbb43fb35ba0"
+    },
+    {
+      "path": "crates/fullmag-fem-sys/build.rs",
+      "sha256": "de5c575c3274b8f7c09817968d09e22ab26580825fea5f3282b7122d36975818"
+    },
+    {
+      "path": "crates/fullmag-runtime-control/src/claim.rs",
+      "sha256": "3653e16fa467eef8d47c75d1c0ed2f01e8e13da531779a7c7e0a21480912a5e9"
+    },
+    {
+      "path": "crates/fullmag-runtime-control/src/compute_node_probe.rs",
+      "sha256": "08c4e50b6743158e738bb2b302a48840b2a9492ed7494d0413b97fed1fdeed3a"
+    },
+    {
+      "path": "crates/fullmag-runtime-control/src/host_runtime.rs",
+      "sha256": "58ef7eee6ea71468495779f5209918adf1df7fe658969eeb6a68b51cf1c86021"
+    },
+    {
+      "path": "crates/fullmag-runtime-control/src/lib.rs",
+      "sha256": "14f01d693f1208277a177831cb214b29011259f90dcf0b0be461f2cb66ea8143"
+    },
+    {
+      "path": "crates/fullmag-runtime-control/src/scheduler.rs",
+      "sha256": "09eb52e871129b05c30ce74dc24c20a4d8f8e99973d6d0f6abd7cb466d00e94d"
+    },
+    {
+      "path": "crates/fullmag-runtime-control/src/study.rs",
+      "sha256": "e2b921fb0c5a17d32dbb3fb00dbf150412cd4b2151a41815dc5ceb206998db68"
+    },
+    {
+      "path": "crates/fullmag-runtime-control/src/study_completion.rs",
+      "sha256": "2547078d0d604bdcb90756f9bdae852dd7a7cd9733aaeb618e3ae8a8e6b86a2f"
+    },
+    {
+      "path": "crates/fullmag-session/src/host_resource_ledger.rs",
+      "sha256": "588876980eb63adc5dff89d17a74dd719e9059a2c28a5568548d850a94fc6597"
+    },
+    {
+      "path": "crates/fullmag-session/src/store.rs",
+      "sha256": "dcbfa1dd05b15805899443f84512354f27a1965cc20a231ffaf4c662bc5aead6"
+    },
+    {
+      "path": "docker/all-in-one/backend_dev.py",
+      "sha256": "c8c90bbb1cb44c3ce6e5259c18404d47b36b1363eb2074c0145bff51bc348fa2"
+    },
+    {
+      "path": "docker/all-in-one/backend_source.py",
+      "sha256": "725c303c6e3378c76f9c9b322780c9591331fc96ea64cbf3cde3474b36bf0e19"
+    },
+    {
+      "path": "docker/all-in-one/entrypoint.py",
+      "sha256": "d4e6777171d5b0273cfd9542095450498fba95a0682393ddfae708b697ed3ef5"
+    },
+    {
+      "path": "docker/all-in-one/frontend_dev.py",
+      "sha256": "a400e7b078a94e17f732e6810fb74380db1347e26b1eef94780a0d3dde3dfd3c"
+    },
+    {
+      "path": "docker/all-in-one/runtime_service.py",
+      "sha256": "dcce5023cfe4e4018cf1e2f281dc7a81a0cafa51f58a5236d3c880037707075b"
+    },
+    {
+      "path": "docs/adr/0061-docker-development-build-and-runtime-container.md",
+      "sha256": "e286f50491f60d765a836b64ef1e42499aaf9afaaf939faef3b0fd72205bde4f"
+    },
+    {
+      "path": "docs/adr/0066-docker-post-build-generation-continuation.md",
+      "sha256": "e87344d6624971a6132e03db8fd4ecb7760a8dd74ecb6d59e6b1a72664ba5478"
+    },
+    {
+      "path": "docs/guides/docker-build-storage-lifecycle.md",
+      "sha256": "18eb9cf48e5a3ab45262fc0eb8b17c557e66e9d72a408b061752e9e664199e2d"
+    },
+    {
+      "path": "docs/guides/docker-development-architecture.md",
+      "sha256": "b9c48a651c4e20183842a57a155fd376eaf571003a13889705d17bbf83c1df6e"
+    },
+    {
+      "path": "docs/guides/docker-volume-development.md",
+      "sha256": "08ea035fc85157328a65c07e06c6f3fa8485e8b7e0b908349f5dd5832c35e0bd"
+    },
+    {
+      "path": "scripts/docker_dev.py",
+      "sha256": "e050f6222fa21c4a60114fdb6ce4d0aff6687fa83e68ebb36c2afebf39f8bca9"
+    },
+    {
+      "path": "scripts/docker_host_ledger.py",
+      "sha256": "110eac4f94e86d68fbc3cf2b3ae547f54b7a9e9963c1e2dd107f2b7be2d4aa68"
+    },
+    {
+      "path": "scripts/docker_volume_accepted_reattach.py",
+      "sha256": "14ab82480c6af4565b6539597231639cfae625366ee2dac8062b562ba1c43c28"
+    },
+    {
+      "path": "scripts/docker_volume_activation_reconcile.py",
+      "sha256": "2fe891decdbf67fc6c9d44a8b24eed6a0ae972dc226742025f2a2c72eb271bff"
+    },
+    {
+      "path": "scripts/docker_volume_capture_failure_reconcile.py",
+      "sha256": "8915c0486a833e0a231d30b647c2512dcc4bc44d3bbc346fab6ba888323c11f1"
+    },
+    {
+      "path": "scripts/docker_volume_dev.py",
+      "sha256": "49b4949078820b54ac71dfd613150c88f16a1926efbeb3448d4ec5c42ce9e9f4"
+    },
+    {
+      "path": "scripts/docker_volume_pre_ack_retry.py",
+      "sha256": "5e5cac1135494899ce2d77fc05ab2c6aaa0b74393cde4f5c0c9210970063d2a7"
+    },
+    {
+      "path": "scripts/docker_volume_pre_api_stop.py",
+      "sha256": "b80c387f5c6db763ce5e322f5b1716c231dd9fb35164da1e54845e74b03bc611"
+    },
+    {
+      "path": "scripts/docker_volume_resources.py",
+      "sha256": "b8be6b2efc2311dbaf2a79152fa53e1b2579895d85e5e2eeff061a9e6dc7a1b9"
+    },
+    {
+      "path": "scripts/lib/docker_host_ledger.sh",
+      "sha256": "204dedbcf511f3161566413c288f391c245e761a33722b6d28d574e45e37d1e6"
+    }
+  ],
+  "diagnostic_operations": {
+    "loader_trace": "adc1c0bf4bce464797a91538ef54513d",
+    "own_inferior_backtrace": "2207c2dcf5a1409091adc313318dfd05",
+    "library_isolation_and_successful_version": "3d9a7d86cc7447c19512c78af22416ba"
+  }
+}

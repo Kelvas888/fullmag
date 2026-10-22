@@ -3419,7 +3419,7 @@ fn apply_accepted_start_effect(
     // Evaluate immutable terminal observables while this process still owns
     // the solver's resource lease. HTTP handlers only adopt the CAS bundle.
     if !control.interrupt_requested.load(Ordering::Acquire) {
-        crate::accepted_quantity_bundle::prepare_and_publish(
+        crate::accepted_field_materialization_worker::prepare_and_publish(
             store, accepted, &accepted_step, &durable_execution,
         )?;
     }

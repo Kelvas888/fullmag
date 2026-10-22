@@ -742,11 +742,11 @@ def render_scene_document_as_script(
     if include_authored_stages:
         study_for_render = scene_for_render.get("study")
         if isinstance(study_for_render, dict):
-            raw_stages_for_render = study_for_render.get("stages")
-            if isinstance(raw_stages_for_render, list):
-                study_for_render["stages"] = _enabled_scene_stages(
-                    raw_stages_for_render
-                )
+            # Use the same ordered pipeline materialization as bootstrap;
+            # its flat stage mirror may predate edits to nested stage payloads.
+            study_for_render["stages"] = _enabled_scene_stages(
+                _scene_antenna_stage_sequence(builder)
+            )
     _inherit_scene_stage_timestep(scene_for_render, builder)
     with tempfile.TemporaryDirectory(prefix="fullmag-scene-export-") as temporary:
         script_path = Path(temporary) / "scene_document.py"

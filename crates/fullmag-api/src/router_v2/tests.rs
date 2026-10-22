@@ -6203,11 +6203,10 @@ async fn field_vector_returns_pending_metadata_for_active_compute_fields_quantit
     dispatch_compute_fields_command(&state, &command_id).await;
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
-                .uri(
-                    "/v2/sessions/current/data/fields/H_demag/samples/vector?scope_kind=airbox&scope_id=airbox",
-                )
+                .uri("/v2/sessions/current/data/fields/H_demag/samples/vector")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6221,11 +6220,27 @@ async fn field_vector_returns_pending_metadata_for_active_compute_fields_quantit
     assert_eq!(pending["retry_after_ms"], 250);
     assert_eq!(pending["command_id"], command_id);
     assert_eq!(pending["quantity_id"], "H_demag");
-    assert_eq!(pending["scope_kind"], "airbox");
-    assert_eq!(pending["scope_id"], "airbox");
+    assert_eq!(pending["scope_kind"], "full");
+    assert!(pending["scope_id"].is_null());
     assert!(pending["generation_id"]
         .as_str()
         .is_some_and(|generation| !generation.is_empty()));
+
+    // A missing optional Airbox carrier has no active Airbox requirement and
+    // must remain an ordinary no-content resource until that carrier exists.
+    let airbox = app
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/v2/sessions/current/data/fields/H_demag/samples/vector?scope_kind=airbox&scope_id=airbox",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(airbox.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(airbox).await.is_empty());
 
     let _ = fs::remove_dir_all(&artifact_dir);
 }
@@ -11341,6 +11356,7 @@ async fn mesh_capabilities_replace_stale_workspace_mixed_features_fail_closed() 
                 "mesh.topology.mixed_p1": { "status": "production_executable" },
                 "mesh.swept.prism": { "status": "production_executable" },
                 "mesh.transition.pyramid_tet": { "status": "production_executable" },
+                "mesh.topology.mixed_p1.v2.disconnected_bodies": { "status": "production_executable" },
                 "mesh.exact_layer_count": { "status": "production_executable" }
             }
         }));
@@ -11364,6 +11380,12 @@ async fn mesh_capabilities_replace_stale_workspace_mixed_features_fail_closed() 
                         "status": "semantic_only",
                         "reason": "native mixed-P1 execution is not advertised",
                         "scope": "pyramid5 transition and tet4 far air"
+                    },
+                    "mesh.topology.mixed_p1.v2.disconnected_bodies": {
+                        "status": "implemented",
+                        "reason": "v2 source-contract only; managed runtime is not verified",
+                        "scope": "positive-gap disconnected bodies",
+                        "supported_layer_counts": [1, 2, 3]
                     },
                     "fem.cpu.exchange_demag.mixed_p1": {
                         "status": "unsupported",
@@ -11415,6 +11437,18 @@ async fn mesh_capabilities_replace_stale_workspace_mixed_features_fail_closed() 
     }
     assert!(!capabilities.contains_key("mesh.exact_layer_count"));
     assert!(!capabilities.contains_key("fem.cpu.exchange_demag.mixed_p1"));
+    assert_eq!(
+        capabilities["mesh.topology.mixed_p1.v2.disconnected_bodies"]["status"],
+        "implemented"
+    );
+    assert_eq!(
+        capabilities["mesh.topology.mixed_p1.v2.disconnected_bodies"]["supported_layer_counts"],
+        serde_json::json!([1, 2, 3])
+    );
+    assert!(!capabilities["mesh.topology.mixed_p1.v2.disconnected_bodies"]
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status == "production_executable"));
 }
 
 #[tokio::test]
@@ -11548,6 +11582,134 @@ async fn mixed_shared_domain_resources_publish_typed_topology_truth() {
     assert_eq!(airbox["element_counts_by_type"]["tet4"], 8);
     assert!(manifest.get("cells").is_none());
     assert!(manifest.get("connectivity").is_none());
+}
+
+#[tokio::test]
+async fn mixed_v2_shared_domain_resources_publish_v2_capability_reason() {
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.scene_document = Some(sample_scene_document());
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fullmag-ir/tests/fixtures/mixed_layer_topology_certificate_v1_python_golden.json"
+        ))
+        .expect("mixed certificate fixture should parse");
+        let mut certificate = fixture["certificate"].clone();
+        certificate["schema_version"] = serde_json::json!(
+            "mixed_layer_topology_certificate.v2"
+        );
+        certificate["magnetic_regions"] = serde_json::json!([
+            { "object_id": "layer", "body_marker": 1, "material_marker": 1,
+              "cell_family_counts": { "prism6": 12 },
+              "exact_sweep": {
+                "sweep_direction_requested": "z", "sweep_direction_resolved": "z",
+                "requested_layer_count": 1, "realized_layer_count": 1,
+                "magnetic_plane_coordinates_m": [0.0, 1.6e-9],
+                "plane_tolerance_m": 1e-15,
+                "topology_fingerprint_version": "v3",
+                "topology_fingerprint": "test-fingerprint",
+                "node_order_digest": "test-node-order"
+              } },
+            { "object_id": "ring", "body_marker": 2, "material_marker": 2,
+              "cell_family_counts": { "tet4": 48 } }
+        ]);
+        certificate["body_separation_pairs"] = serde_json::json!([]);
+        certificate["body_material_fields"] = serde_json::json!([{
+            "object_id": "ring", "field_basis": "body_owned_p1",
+            "coefficient_domains": ["Ms"], "air_interpolation_policy": "none",
+            "cross_body_interpolation_policy": "none",
+            "node_order_digest": "test-node-order",
+            "field_digest": "test-field-digest",
+            "values": { "Ms": [1.51e6, 1.51e6] }
+        }]);
+        let mut mesh = sample_fem_mesh_payload_with_manifest();
+        mesh.build_report = Some(
+            serde_json::from_value(serde_json::json!({
+                "build_mode": "shared_domain",
+                "fallbacks_triggered": [],
+                "mixed_layer_topology_certificate_v2": certificate,
+                "mixed_topology_provenance": {
+                    "requested_topology": "mixed_p1",
+                    "resolved_topology": "mixed_p1",
+                    "accepted_certificate_fingerprint": fixture["certificate"]["topology_fingerprint"].clone(),
+                    "requested_device": "gpu",
+                    "precision": "double",
+                    "capability_status": "implemented"
+                }
+            }))
+            .expect("mixed v2 build report fixture should deserialize"),
+        );
+        snapshot.fem_mesh = Some(mesh);
+        snapshot.capabilities = Some(
+            serde_json::from_value(serde_json::json!({
+                "engine_id": "fem_native_gpu",
+                "capability_profile_version": "2026-07-28",
+                "supported_terms": [],
+                "feature_capabilities": {
+                    "mesh.topology.mixed_p1": {
+                        "status": "semantic_only",
+                        "reason": "v1 capability reason must not leak into v2",
+                        "scope": "conforming P1"
+                    },
+                    "mesh.topology.mixed_p1.v2.disconnected_bodies": {
+                        "status": "implemented",
+                        "reason": "v2 source-contract only; managed runtime is not verified",
+                        "scope": "positive-gap disconnected bodies"
+                    }
+                },
+                "supported_demag_realizations": [],
+                "preview_quantities": [],
+                "snapshot_quantities": [],
+                "scalar_outputs": [],
+                "approximate_operators": [],
+                "supports_frequency_response": false,
+                "supports_coupled_magnetoelastic_quasistatic": false,
+                "supports_coupled_magnetoelastic_elastodynamic": false,
+                "supports_frequency_domain_elastodynamics": false,
+                "supports_coupled_eigenmodes": false,
+                "supports_lossy_fallback_override": false
+            }))
+            .expect("backend capabilities fixture should deserialize"),
+        );
+        snapshot.mesh_workspace = Some(serde_json::json!({
+            "mesh_summary": { "mesh_name": "test-mesh" }
+        }));
+        snapshot.mesh_revision = 92;
+    }
+    let app = build_v2_router().with_state(state);
+
+    let semantics_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/meshing/semantics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(semantics_response.status(), StatusCode::OK);
+    let semantics = body_json(semantics_response).await;
+    assert_eq!(
+        semantics["solver_mesh"]["build_report"]["mixed_topology_provenance"]
+            ["capability_reason"],
+        "v2 source-contract only; managed runtime is not verified"
+    );
+
+    let manifest_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/meshing/meshes/shared-domain/manifest")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(manifest_response.status(), StatusCode::OK);
+    let manifest = body_json(manifest_response).await;
+    assert_eq!(
+        manifest["mixed_topology_provenance"]["capability_reason"],
+        "v2 source-contract only; managed runtime is not verified"
+    );
 }
 
 #[test]
@@ -23330,6 +23492,15 @@ async fn compute_fields_command_contract_resolves_multilayer_full_and_airbox_req
                     [1.0, 1.0, 0.0]
                 ],
                 "layout": { "grid_cells": [4, 1, 1] }
+            },
+            "H_demag": {
+                "values": [
+                    [0.1, 0.0, 0.0],
+                    [0.0, 0.1, 0.0],
+                    [0.0, 0.0, 0.1],
+                    [0.1, 0.1, 0.0]
+                ],
+                "layout": { "grid_cells": [4, 1, 1] }
             }
         }))
         .expect("multilayer field fixture should deserialize");
@@ -23358,7 +23529,10 @@ async fn compute_fields_command_contract_resolves_multilayer_full_and_airbox_req
         .as_array()
         .expect("multilayer requirements should be an array");
     assert_eq!(requirements.len(), 2);
-    assert_eq!(requirements[0]["quantity_ids"], serde_json::json!(["m"]));
+    assert_eq!(
+        requirements[0]["quantity_ids"],
+        serde_json::json!(["m", "H_demag"])
+    );
     assert_eq!(requirements[0]["scope_kind"], "full");
     assert_eq!(
         requirements[1]["quantity_ids"],
@@ -23447,6 +23621,15 @@ async fn compute_fields_completion_requires_exact_quantity_scope_generation_and_
                     [1.0, 1.0, 0.0]
                 ],
                 "layout": { "grid_cells": [4, 1, 1] }
+            },
+            "H_demag": {
+                "values": [
+                    [0.1, 0.0, 0.0],
+                    [0.0, 0.1, 0.0],
+                    [0.0, 0.0, 0.1],
+                    [0.1, 0.1, 0.0]
+                ],
+                "layout": { "grid_cells": [4, 1, 1] }
             }
         }))
         .expect("multilayer field fixture should deserialize");
@@ -23488,6 +23671,14 @@ async fn compute_fields_completion_requires_exact_quantity_scope_generation_and_
         .and_then(|snapshot| snapshot.latest_fields.get("m"))
         .cloned()
         .expect("full magnetization field should be present");
+    let saved_h_demag = state
+        .current_live_state
+        .read()
+        .await
+        .as_ref()
+        .and_then(|snapshot| snapshot.latest_fields.get("H_demag"))
+        .cloned()
+        .expect("full demagnetization field should be present");
     let saved_live_magnetization = state
         .current_live_state
         .read()
@@ -23520,6 +23711,9 @@ async fn compute_fields_completion_requires_exact_quantity_scope_generation_and_
         let mut guard = state.current_live_state.write().await;
         let snapshot = guard.as_mut().expect("live session should exist");
         snapshot.latest_fields.insert("m".into(), saved_m);
+        snapshot
+            .latest_fields
+            .insert("H_demag".into(), saved_h_demag);
         snapshot
             .live_state
             .as_mut()
@@ -23592,7 +23786,7 @@ async fn compute_fields_completion_requires_exact_quantity_scope_generation_and_
 }
 
 #[tokio::test]
-async fn compute_fields_command_stays_dispatched_until_airbox_carrier_is_readable() {
+async fn compute_fields_command_stays_dispatched_until_native_multilayer_fields_are_readable() {
     let (app, state, artifact_dir) = test_router_with_session_state_and_artifact_dir().await;
     set_test_fdm_multilayer_layout(&state, [4, 1, 1]).await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
@@ -23634,9 +23828,9 @@ async fn compute_fields_command_stays_dispatched_until_airbox_carrier_is_readabl
     let requirements = detail["field_materialization_requirements"]
         .as_array()
         .expect("multilayer requirements should be an array");
-    assert_eq!(requirements.len(), 2);
-    assert_eq!(requirements[1]["scope_kind"], "airbox");
-    assert!(requirements[1]["carrier_fingerprint"].is_null());
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(requirements[0]["quantity_ids"], serde_json::json!(["m", "H_demag"]));
+    assert_eq!(requirements[0]["scope_kind"], "full");
 
     let availability = app
         .clone()
@@ -23662,6 +23856,65 @@ async fn compute_fields_command_stays_dispatched_until_airbox_carrier_is_readabl
     let still_dispatched = get_command_detail(&app, command_id).await;
     assert_eq!(still_dispatched["status"], "dispatched");
     assert!(still_dispatched["completion_status"].is_null());
+
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard.as_mut().expect("test live session");
+        let latest_fields = serde_json::from_value(serde_json::json!({
+            "m": {
+                "values": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [1.0, 1.0, 0.0]
+                ],
+                "layout": { "grid_cells": [4, 1, 1] }
+            },
+            "H_demag": {
+                "values": [
+                    [0.1, 0.0, 0.0],
+                    [0.0, 0.1, 0.0],
+                    [0.0, 0.0, 0.1],
+                    [0.1, 0.1, 0.0]
+                ],
+                "layout": { "grid_cells": [4, 1, 1] }
+            }
+        }))
+        .expect("native multilayer field fixture should deserialize");
+        publish_test_fields_from_physical_step(
+            snapshot,
+            physical_test_live_state(
+                2,
+                2.0e-12,
+                [4, 1, 1],
+                Some(vec![
+                    1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0,
+                ]),
+            ),
+            latest_fields,
+        )
+        .expect("native multilayer fields should be published from an admitted physical step");
+        assert!(snapshot
+            .field_quantity_revisions
+            .get("m")
+            .copied()
+            .unwrap_or_default()
+            > 1);
+        assert!(snapshot
+            .field_quantity_revisions
+            .get("H_demag")
+            .copied()
+            .unwrap_or_default()
+            > 0);
+    }
+
+    assert!(
+        reconcile_compute_fields_command(&state).await,
+        "native full m and H_demag should complete without an Airbox carrier"
+    );
+    let completed = get_command_detail(&app, command_id).await;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["completion_status"], "completed");
 
     let _ = fs::remove_dir_all(&artifact_dir);
 }

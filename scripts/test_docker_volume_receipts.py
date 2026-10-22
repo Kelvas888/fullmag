@@ -19,18 +19,35 @@ class VolumeReceiptTests(unittest.TestCase):
         import docker_volume_dev as dev
         import docker_dev
         import docker_build_control
-        document = {"name": "fullmag-master", "services": {"backend": {"environment": {}}}}
-        digest = hashlib.sha256(dev.canonical(document)).hexdigest()
+        project_name = "fullmag-master"
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory).resolve()
             for policy in ("auto", "required", "disabled", None, "unknown"):
                 with self.subTest(policy=policy):
+                    retained_policy = policy if policy in {"auto", "required", "disabled"} else "auto"
+                    document = {
+                        "name": project_name,
+                        "services": {
+                            "backend": {
+                                "environment": {
+                                    "FULLMAG_DOCKER_DEVICE_ACCESS": retained_policy,
+                                    "FULLMAG_DEV_INCLUDE_UNTRACKED": "[]",
+                                    "FULLMAG_RUNTIME_IMAGE_ID": "sha256:" + "b" * 64,
+                                    "FULLMAG_TOOLCHAIN_IMAGE_ID": "sha256:" + "c" * 64,
+                                    "FULLMAG_PACKAGE_PROVENANCE": "/opt/fullmag/control/backend/runtime-provenance.json",
+                                    "FULLMAG_RUNTIME_PROVENANCE": "/opt/fullmag/control/backend/runtime-provenance.json",
+                                    "FULLMAG_DEVELOPMENT_INPUTS_PATH": "/opt/fullmag/control/frontend/development-inputs.json",
+                                },
+                            },
+                        },
+                    }
+                    digest = hashlib.sha256(dev.canonical(document)).hexdigest()
                     args = SimpleNamespace(repo_root=source, source_root=source,
                                            attempt="a" * 32, config_sha256=digest)
-                    previous = {"state": "failed-confirmed", "compose_project": document["name"],
+                    previous = {"state": "failed-confirmed", "compose_project": project_name,
                                 "inputs": {"source_root": str(source), "gpu_access_requested": policy,
                                            "image_id": "sha256:" + "b" * 64}}
-                    control = mock.Mock(project=document["name"])
+                    control = mock.Mock(project=project_name)
                     control.read.side_effect = [previous, document]
                     configuration = {"services": {"fem-gpu-toolchain": {"build": {"args": {
                         "FULLMAG_CUDA_BASE_IMAGE": "unused"}}}}}
@@ -433,7 +450,7 @@ class VolumeReceiptTests(unittest.TestCase):
         import json
         from subprocess import CompletedProcess
         import docker_volume_dev as dev
-        with mock.patch('docker_control_namespace.resolve_namespace'):
+        with mock.patch('docker_control_namespace.resolve_namespace', return_value=None):
             control = BuildControl({'project_name': 'fullmag-master', 'worktree_id': 'owned', 'project_id': 'test-project', 'checkout_kind': 'master'}, 'sha256:' + 'a' * 64)
         key = 'b' * 64
         name = 'fullmag-dev-frontend-v1-' + key[:24]
@@ -448,7 +465,7 @@ class VolumeReceiptTests(unittest.TestCase):
 
     def test_build_control_accepts_canonical_bootstrap_labels_and_rejects_foreign_project(self):
         identity = {'project_name': 'fullmag-master', 'worktree_id': 'test-worktree', 'project_id': 'test-project', 'checkout_kind': 'master'}
-        with mock.patch('docker_control_namespace.resolve_namespace'):
+        with mock.patch('docker_control_namespace.resolve_namespace', return_value=None):
             control = BuildControl(identity, 'sha256:' + 'a' * 64)
         volume = {'Name': control.volume, 'Driver': 'local', 'Options': None,
                   'Labels': dict(control.shared_labels)}

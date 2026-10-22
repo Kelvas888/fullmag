@@ -10,7 +10,9 @@ use fullmag_session::compute_node_snapshot::{
     ComputeNodeSnapshot, Reported, COMPUTE_NODE_SNAPSHOT_SCHEMA_V2,
 };
 use fullmag_session::host_resource_ledger::HostResourceLedger;
-use fullmag_session::host_resource_ledger::{HostReservationRequest, HostResourceReservationState};
+use fullmag_session::host_resource_ledger::{
+    HostReservationRequest, HostResourceLedgerSnapshot, HostResourceReservationState,
+};
 use fullmag_session::runtime_service::RuntimeServiceConfig;
 use fullmag_session::{
     FmsPreparationResourceLease, FmsPreparationResourcePool, FmsSchedulerResourcePool, SessionStore,
@@ -1131,6 +1133,30 @@ impl HostRuntimeAdmission {
                 continue;
             }
             for intent in intents {
+                let catalog = store
+                    .read_run_catalog(&intent.run_id)?
+                    .context("cancellation reconciliation requires its run catalog")?;
+                let task = catalog
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == intent.task.task_id)
+                    .context("cancellation reconciliation task is missing")?;
+                if catalog.revision > intent.expected_catalog_revision
+                    && matches!(
+                        task.lifecycle,
+                        FmsTaskLifecycle::Succeeded
+                            | FmsTaskLifecycle::Failed
+                            | FmsTaskLifecycle::Cancelled
+                            | FmsTaskLifecycle::Interrupted
+                    )
+                {
+                    // A terminal projection still has to match the immutable
+                    // cancellation scope, but has nothing left to publish.
+                    // Replaying its fsync transaction on every scheduler poll
+                    // needlessly competes with startup and live admissions.
+                    intent.validate_task_scope(store, task, catalog.revision)?;
+                    continue;
+                }
                 // Replay validates scope and repairs a crash before the revision bump.
                 store.request_task_cancellation_intent(
                     &intent.run_id,
@@ -1191,20 +1217,31 @@ impl HostRuntimeAdmission {
         &self,
         store: &SessionStore,
     ) -> Result<usize> {
+        let store_id = HostResourceLedger::store_id(store.root())?;
+        let snapshot = self.ledger.read()?;
+        self.reconcile_prestart_stopping_store_reservations_from_snapshot(
+            store, &store_id, &snapshot,
+        )
+    }
+
+    fn reconcile_prestart_stopping_store_reservations_from_snapshot(
+        &self,
+        store: &SessionStore,
+        store_id: &str,
+        snapshot: &HostResourceLedgerSnapshot,
+    ) -> Result<usize> {
         use fullmag_application::{
             CoordinatorPhase, DurableWorkerCoordinator, RunId, WorkerEvent, WorkerEventEnvelope,
         };
         use fullmag_session::host_resource_ledger::{HostReservationOwner, HostWorkerLaunchGate};
-        let store_id = HostResourceLedger::store_id(store.root())?;
-        let snapshot = self.ledger.read()?;
         let mut repaired = 0;
-        for reservation in snapshot.reservations {
+        for reservation in &snapshot.reservations {
             let identity = &reservation.identity;
             if identity.store_id != store_id
                 || reservation.state != HostResourceReservationState::Committed
                 || !matches!(&identity.owner, HostReservationOwner::Solver { .. })
                 || !matches!(
-                    reservation.worker_launch_gate,
+                    &reservation.worker_launch_gate,
                     Some(HostWorkerLaunchGate::Pending | HostWorkerLaunchGate::Closed)
                 )
             {
@@ -1352,12 +1389,22 @@ impl HostRuntimeAdmission {
     /// Closed/Cancelled worker may finish its interrupted local release; other
     /// active leases and absent exit proofs never authorize capacity recovery.
     pub fn reconcile_released_store_reservations(&self, store: &SessionStore) -> Result<usize> {
-        self.reconcile_prestart_stopping_store_reservations(store)?;
         use fullmag_session::host_resource_ledger::HostReservationOwner;
         use fullmag_session::FmsResourceLeaseState;
 
         let store_id = HostResourceLedger::store_id(store.root())?;
-        let snapshot = self.ledger.read()?;
+        // Discovery does not authorize a release. Each release rechecks the
+        // exact current reservation and Released local lease under HOST ->
+        // STORE writer guards; prestart repair separately fences launch first.
+        let snapshot = self.ledger.read_observation_snapshot()?;
+        let prestart_repaired = self.reconcile_prestart_stopping_store_reservations_from_snapshot(
+            store, &store_id, &snapshot,
+        )?;
+        let snapshot = if prestart_repaired > 0 {
+            self.ledger.read_observation_snapshot()?
+        } else {
+            snapshot
+        };
         let mut worker_receipts = BTreeMap::new();
         let mut preparation_receipts = BTreeMap::new();
         let mut reconciled = 0;
@@ -1432,16 +1479,29 @@ impl HostRuntimeAdmission {
                 } => {
                     if self
                         .ledger
-                        .release_cancelled_preparation_without_spawn(store, identity)?
+                        .release_cancelled_preparation_without_spawn(store, identity)
+                        .with_context(|| {
+                            format!(
+                                "reconciling cancelled preparation: run_id={}, resource_id={}, lease_token={}",
+                                identity.run_id, identity.resource_id, identity.lease_token,
+                            )
+                        })?
                     {
                         reconciled += 1;
                         continue;
                     }
-                    let Some(lease) = store.read_preparation_resource_lease(
-                        &identity.run_id,
-                        &identity.resource_id,
-                        &identity.lease_token,
-                    )?
+                    let Some(lease) = store
+                        .read_preparation_resource_lease(
+                            &identity.run_id,
+                            &identity.resource_id,
+                            &identity.lease_token,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "reading preparation lease for release reconciliation: run_id={}, resource_id={}, lease_token={}",
+                                identity.run_id, identity.resource_id, identity.lease_token,
+                            )
+                        })?
                     else {
                         continue;
                     };

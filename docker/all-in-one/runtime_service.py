@@ -17,10 +17,11 @@ import re
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
-from typing import Any, Mapping, NoReturn, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 STATE_ROOT = Path("/state")
 SOURCE_ROOT = Path("/opt/fullmag/source")
@@ -47,6 +48,14 @@ DEVICE_ACCESS_CHOICES = frozenset({"cpu", "gpu"})
 # the serialized CLI/profile value stable across host operating systems.
 HOST_LEDGER_ROOT = PurePosixPath("/host-ledger/ledger")
 HOST_LEDGER_PROFILE = "host-ledger-v1"
+# ADR 0067: a volume DEV group's own ledger volume at the same container path.
+GROUP_LEDGER_PROFILE = "group-ledger-v1"
+GROUP_LEDGER_HOST_ID_ENV = "FULLMAG_GROUP_LEDGER_HOST_ID"
+HOST_CAPACITY_ENVIRONMENT = (
+    "FULLMAG_DOCKER_HOST_CAPACITY_PATH",
+    "FULLMAG_DOCKER_HOST_CAPACITY_SHA256",
+    "FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256",
+)
 HOST_RESOURCE_LEDGER_FILE = "HOST_RESOURCE_LEDGER.json"
 LEGACY_DOCKER_HOST_ID = "docker-all-host"
 MAX_HOST_LEDGER_BYTES = 8 * 1024 * 1024
@@ -71,6 +80,12 @@ MAX_HTTP_BYTES = 4 * 1024 * 1024
 # request budget above that limit so Windows-folder I/O cannot turn a healthy
 # native probe into a transport timeout at the API boundary.
 API_LIVENESS_TIMEOUT_SECONDS = 5.0
+API_BINDING_STARTUP_TIMEOUT_SECONDS = 60.0
+# A pinned accepted-run restore validates immutable Study/CAS and historical
+# proofs before listening. Windows-folder I/O can exceed ordinary API startup.
+# This only extends the pre-listen budget; admission and identity checks stay
+# unchanged and the native service is not launched before the API is pinned.
+ACCEPTED_REATTACH_API_STARTUP_TIMEOUT_SECONDS = 300.0
 STARTUP_LIVENESS_GRACE_SECONDS = 30.0
 # Process limits for lifecycle calls whose work includes Windows-folder (9p)
 # I/O.  The accepted-store bootstrap and diagnostic service-status call can
@@ -79,8 +94,12 @@ SERVICE_STATUS_CLI_TIMEOUT_SECONDS = 30
 STORE_BOOTSTRAP_CLI_TIMEOUT_SECONDS = 180
 # A live API observation may be temporarily unprovable while the native
 # service is still running.  The API remains fail-closed in that state; this
-# window only prevents one bounded transport/probe blip from killing PID 1.
-SUPERVISION_GRACE_SECONDS = 30.0
+# window only prevents a busy API (for example a long scene or mesh request on
+# the Windows-folder mount) from being killed as if it had failed.
+SUPERVISION_GRACE_SECONDS = 120.0
+# The complete OpenAPI identity document is large; liveness is still checked
+# every second, the full identity only at this interval.
+SUPERVISION_FULL_API_PROBE_SECONDS = 30.0
 TRANSIENT_LIVENESS_OBSERVATIONS = frozenset(
     {
         ("observation_unknown", "live_probe_failed"),
@@ -455,14 +474,27 @@ def recover_idle_failure(
 
 
 def _validated_docker_host_id() -> str:
-    """Return the daemon attestation required by the canonical host-ledger adapter."""
+    """Return the ledger host ID bound to the verified Docker daemon.
 
-    if os.environ.get("FULLMAG_HOST_LEDGER_PROFILE") != HOST_LEDGER_PROFILE:
-        _fail("Docker host initialization requires the canonical host-ledger-v1 profile")
+    ``host-ledger-v1`` uses the daemon digest itself.  A ``group-ledger-v1``
+    DEV group uses its launcher-derived ID (daemon digest plus Compose
+    project); the daemon digest remains the storage-admission identity.
+    """
+
+    profile = os.environ.get("FULLMAG_HOST_LEDGER_PROFILE")
+    if profile not in {HOST_LEDGER_PROFILE, GROUP_LEDGER_PROFILE}:
+        _fail("Docker host initialization requires the host-ledger-v1 or group-ledger-v1 profile")
     value = os.environ.get("FULLMAG_DOCKER_HOST_ID", "")
     if HEX64.fullmatch(value) is None:
         _fail("FULLMAG_DOCKER_HOST_ID must be the verified lowercase Docker daemon SHA-256")
-    return value
+    if profile == HOST_LEDGER_PROFILE:
+        return value
+    if any(os.environ.get(name) is not None for name in HOST_CAPACITY_ENVIRONMENT):
+        _fail("a group ledger cannot bind the global Docker host capacity descriptor")
+    group_host_id = os.environ.get(GROUP_LEDGER_HOST_ID_ENV, "")
+    if HEX64.fullmatch(group_host_id) is None or group_host_id == value:
+        _fail(GROUP_LEDGER_HOST_ID_ENV + " must be the group's derived lowercase SHA-256")
+    return group_host_id
 
 
 def _initializer_host_id(daemon_host_id: str) -> str:
@@ -490,7 +522,10 @@ def _initializer_host_id(daemon_host_id: str) -> str:
     stored_host_id = policy.get("host_id")
     if not isinstance(stored_host_id, str) or not stored_host_id:
         _fail("existing host resource ledger policy has no host_id")
-    if stored_host_id not in {LEGACY_DOCKER_HOST_ID, daemon_host_id}:
+    accepted = {daemon_host_id}
+    if os.environ.get("FULLMAG_HOST_LEDGER_PROFILE") == HOST_LEDGER_PROFILE:
+        accepted.add(LEGACY_DOCKER_HOST_ID)
+    if stored_host_id not in accepted:
         _fail("existing host resource ledger host_id differs from the verified Docker daemon")
     return stored_host_id
 
@@ -726,6 +761,18 @@ ACCEPTED_REATTACH_FIELDS = frozenset({
     "schema", "run_id", "project_id", "source_request_id", "source_sha256",
     "startup_provenance_sha256", "config_sha256", "proof_path", "proof_sha256",
 })
+_ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS = frozenset({
+    "schema", "state", "api_pid", "api_exit_code", "accepted_store",
+    "bootstrap", "qualification", "error", "shutdown_error",
+})
+_ACCEPTED_REATTACH_PRE_RESTORE_API_EXIT_CODE = 101
+_ACCEPTED_REATTACH_PRE_RESTORE_API_ERROR = (
+    "API binding did not become ready: API loopback probe failed for "
+    "/v2/platform/openapi.json: [Errno 111] Connection refused"
+)
+_ACCEPTED_REATTACH_PRE_RESTORE_SHUTDOWN_ERROR = (
+    "no pinned runtime service owner was available for authenticated drain"
+)
 
 
 def _reattach_relative(root: Path, relative: str, name: str) -> Path:
@@ -1014,6 +1061,280 @@ def _read_optional_accepted_reattach_record(path: Path, name: str) -> tuple[byte
     return raw, _accepted_reattach_json(raw, name)
 
 
+PRE_ACK_RETRY_SCHEMA = "fullmag.docker-accepted-pre-ack-retry.v1"
+
+
+def _pre_ack_attempt_container(terminal, attempt, project, expected_image):
+    """Read the explicit historical container binding from the same operation."""
+    if not isinstance(expected_image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_image):
+        _fail("pre-ACK operation has an invalid historical image identity")
+    ready = terminal.get("worker_cgroup")
+    helper = terminal.get("worker_cgroup_helper")
+    if (not isinstance(ready, dict) or not isinstance(helper, dict)
+            or ready.get("schema") != "fullmag.worker-cgroup-ready.v1"
+            or ready.get("state") != "ready"
+            or ready.get("compose_project") != project
+            or ready.get("image_id") != expected_image
+            or helper.get("state") != "succeeded"
+            or helper.get("name") != "fullmag-cgroup-" + attempt
+            or not isinstance(helper.get("sha256"), str)
+            or not HEX64.fullmatch(helper["sha256"])):
+        _fail("pre-ACK operation has no matching canonical container binding")
+    container = ready.get("container_id")
+    if (not isinstance(container, str) or not HEX64.fullmatch(container)
+            or ready.get("container_cgroup") != "/docker/" + container):
+        _fail("pre-ACK operation has an invalid historical cgroup container identity")
+    if "backend_container" in terminal and terminal["backend_container"] != container:
+        _fail("pre-ACK operation backend and cgroup container identities differ")
+    return container
+
+
+def _pre_ack_utc_timestamp_ns(value):
+    # Python 3.10's ISO parser does not define support for arbitrary fractional
+    # seconds. Validate the UTC calendar separately and retain all nine digits.
+    from datetime import datetime
+    import calendar
+    match = re.fullmatch(
+        r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?Z",
+        value if isinstance(value, str) else "",
+    )
+    if match is None:
+        _fail("pre-ACK incarnation timestamp is not bounded UTC RFC3339")
+    try:
+        base = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        _fail("pre-ACK incarnation timestamp has an invalid UTC calendar")
+    if base.year < 1970:
+        _fail("pre-ACK incarnation timestamp predates the Unix epoch")
+    fraction = int((match.group(2) or "").ljust(9, "0"))
+    return calendar.timegm(base.timetuple()) * 1_000_000_000 + fraction
+
+
+def _assert_pre_ack_unconsumed(directory: Path) -> None:
+    allowed = {"request.json", "proof.json", "terminal-owner.json", "terminal-process.json",
+               "pre-ack-retry.json", "pre-ack-api-terminal.json"}
+    entries = list(directory.iterdir())
+    if len(entries) > 64:
+        _fail("pre-ACK retry record inventory exceeds its bound")
+    for entry in entries:
+        if (entry.name not in allowed or entry.is_symlink() or not entry.is_file()
+                or entry.name.startswith((ACCEPTED_REATTACH_ACK_PREFIX, ACCEPTED_REATTACH_DRAIN_PREFIX))
+                or entry.name.endswith((".part", ".tmp"))):
+            _fail("pre-ACK retry has consumed or uncertain acknowledgement evidence")
+
+
+def _validate_pre_ack_retry_record(record, raw, request, proof, request_sha, read_record,
+                                  *, require_operation=True):
+    """Validate one first retry; never authorize another retry or a Solve."""
+    expected = {
+        "schema": PRE_ACK_RETRY_SCHEMA, "parent": None,
+        "request_sha256": request_sha, "proof_sha256": request["proof_sha256"],
+        "run_id": request["run_id"], "project_id": request["project_id"],
+        "compose_project": proof["compose_project"], "control_volume": proof["control_volume"],
+        "original_process_sha256": proof["terminal_process_record_sha256"],
+        "owner_sha256": proof["terminal_owner_record_sha256"],
+    }
+    if "parent" not in record or any(record.get(k) != v for k, v in expected.items()):
+        _fail("pre-ACK retry identity or first-retry scope differs")
+    for key in ("api_attempt", "preflight_attempt", "operation_attempt"):
+        if not isinstance(record.get(key), str) or not re.fullmatch(r"[0-9a-f]{32}", record[key]):
+            _fail("pre-ACK retry has an invalid " + key)
+    for key in ("api_container", "preflight_container"):
+        if not isinstance(record.get(key), str) or not HEX64.fullmatch(record[key]):
+            _fail("pre-ACK retry has an invalid " + key)
+    if (record["api_attempt"] == record["preflight_attempt"]
+            or record["api_container"] == record["preflight_container"]):
+        _fail("pre-ACK retry must bind two distinct attempts and container incarnations")
+    for kind in ("api", "preflight"):
+        terminal_raw, terminal = read_record(
+            "development/attempts/" + record[kind + "_attempt"] + "/terminal.json", kind + " attempt"
+        )
+        if (_sha256_bytes(terminal_raw) != record.get(kind + "_attempt_sha256")
+                or terminal.get("state") != "failed-confirmed"
+                or terminal.get("compose_project") != proof["compose_project"]
+                or terminal.get("control_volume") != proof["control_volume"]
+                or terminal.get("inputs", {}).get("image_id") != record.get(kind + "_image")
+                or terminal.get("inputs", {}).get("source_root") != proof["source_root"]):
+            _fail("pre-ACK retry development attempt differs: " + kind)
+        if _pre_ack_attempt_container(
+                terminal, record[kind + "_attempt"], proof["compose_project"],
+                record[kind + "_image"]) != record[kind + "_container"]:
+            _fail("pre-ACK retry recorded container differs: " + kind)
+        if kind == "api" and terminal.get("backend_started_at") != record.get("api_incarnation", {}).get("started_at"):
+            _fail("pre-ACK retry API attempt start time differs from its journal")
+        if kind == "preflight":
+            restart = terminal.get("inputs", {}).get("native_failed_restart", {})
+            if (restart.get("container_id") != record["api_container"]
+                    or restart.get("image_id") != record["api_image"]
+                    or restart.get("journal_sha256") != record["api_stop_sha256"]):
+                _fail("pre-ACK retry preflight attempt does not bind the stopped API predecessor")
+            encoded = json.dumps(restart, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            if _sha256_bytes(encoded) != record.get("native_restart_sha256"):
+                _fail("pre-ACK retry native restart metadata payload differs")
+    journal_raw, journal = read_record(
+        "verification/stop-failed-" + record["api_container"] + ".json", "pre-ACK API stop journal"
+    )
+    if (_sha256_bytes(journal_raw) != record.get("api_stop_sha256")
+            or journal.get("schema") != "fullmag.stop-failed-admission.v1"
+            or journal.get("state") != "stopped-confirmed"
+            or journal.get("failure_kind") != "native-start-failure"
+            or journal.get("failure_mode") != "api-start-failure"
+            or journal.get("container_id") != record["api_container"]
+            or journal.get("image_id") != record["api_image"]
+            or journal.get("container_state") != record.get("api_incarnation")):
+        _fail("pre-ACK retry is not bound to the exact API-start stop journal")
+    process_raw, process = read_record(
+        "runtime-control/" + str(PurePosixPath(request["proof_path"]).parent / "pre-ack-api-terminal.json"),
+        "pre-ACK stopped API terminal",
+    )
+    if (_sha256_bytes(process_raw) != record.get("current_process_sha256")
+            or process != journal.get("terminal_process_receipt")
+            or process.get("schema") != "fullmag.docker-process-tree.v1"
+            or process.get("state") != "shutdown_unknown"
+            or type(process.get("api_pid")) is not int or process["api_pid"] <= 0
+            or type(process.get("api_exit_code")) is not int or process["api_exit_code"] != -15
+            or process.get("runtime_pid") is not None
+            or any(k in process for k in ("service_owner", "terminal_service_owner", "accepted_reattach"))):
+        _fail("pre-ACK retry stopped API terminal differs")
+    probe = journal.get("native_failure_probe", {})
+    if (probe.get("api_pid_exists") is not False or probe.get("owner_pid_exists") is not False
+            or probe.get("child_pids_exist") is not False or probe.get("native_processes_live") is not False
+            or type(probe.get("active_lease_count")) is not int or probe["active_lease_count"] != 0
+            or probe.get("failed_owner_sha256") != record["owner_sha256"]
+            or any(not isinstance(probe.get(k), list) or any(s != "released" for s in probe[k])
+                   for k in ("lease_states", "reservation_states"))):
+        _fail("pre-ACK retry has no exact stopped and released native proof")
+    if journal.get("terminal_failed_owner_sha256") != record["owner_sha256"]:
+        _fail("pre-ACK retry stop journal owner differs from original owner")
+    incarnation = record.get("preflight_incarnation", {})
+    if (incarnation.get("id") != record["preflight_container"]
+            or incarnation.get("image") != record["preflight_image"]
+            or type(incarnation.get("pid")) is not int or incarnation["pid"] != 0
+            or type(incarnation.get("exit_code")) is not int or incarnation["exit_code"] != 1
+            or incarnation.get("status") != "exited" or incarnation.get("oom_killed") is not False):
+        _fail("pre-ACK retry preflight incarnation differs")
+    try:
+        api_end = _pre_ack_utc_timestamp_ns(record["api_incarnation"]["finished_at"])
+        pre_start = _pre_ack_utc_timestamp_ns(incarnation["started_at"])
+        pre_end = _pre_ack_utc_timestamp_ns(incarnation["finished_at"])
+        if not api_end < pre_start <= pre_end:
+            _fail("pre-ACK retry incarnation order differs")
+    except (KeyError, TypeError, ValueError):
+        _fail("pre-ACK retry has invalid incarnation timestamps")
+    safety_raw, safety = read_record(
+        "pre-ack-retry/attempts/" + record["operation_attempt"] + "/released-observation.json", "pre-ACK released observation"
+    )
+    if (_sha256_bytes(safety_raw) != record.get("released_observation_sha256")
+            or safety.get("schema") != "fullmag.pre-ack-released-observation.v1"
+            or type(safety.get("active_count")) is not int or safety["active_count"] != 0
+            or not isinstance(safety.get("reservations"), list) or not isinstance(safety.get("leases"), list)):
+        _fail("pre-ACK retry released observation differs")
+    compose_raw, compose = read_record(
+        "development/attempts/" + record["preflight_attempt"] + "/compose.json", "pre-ACK Compose"
+    )
+    if _sha256_bytes(compose_raw) != record.get("preflight_compose_sha256") or compose.get("name") != proof["compose_project"]:
+        _fail("pre-ACK retry Compose identity differs")
+    provenance_raw, provenance = read_record(
+        "pre-ack-retry/attempts/" + record["operation_attempt"] + "/preflight-provenance.json", "pre-ACK build provenance"
+    )
+    if (_sha256_bytes(provenance_raw) != record.get("preflight_provenance_sha256")
+            or provenance.get("schema") != "fullmag.docker-all-image.v1"
+            or provenance.get("state") != "succeeded"
+            or provenance.get("source_snapshot_sha256") != record.get("preflight_source_snapshot")):
+        _fail("pre-ACK retry immutable build provenance differs")
+    log_raw, log_record = read_record(
+        "pre-ack-retry/attempts/" + record["operation_attempt"] + "/preflight-log.json", "pre-ACK preflight log"
+    )
+    log = log_record.get("log")
+    if (_sha256_bytes(log_raw) != record.get("preflight_log_sha256")
+            or log_record.get("incarnation") != incarnation or not isinstance(log, str)
+            or "accepted_reattach_preflight" not in log
+            or "current terminal record differs from immutable backing evidence" not in log
+            or "[fullmag-backend] Starting API and runtime service" in log
+            or "starting fullmag-api" in log):
+        _fail("pre-ACK retry does not prove a failure before API spawn")
+    if require_operation:
+        operation_raw, operation = read_record(
+            "pre-ack-retry/attempts/" + record["operation_attempt"] + "/terminal.json", "pre-ACK retry operation"
+        )
+        if (operation.get("state") != "succeeded" or operation.get("phase") != "pre-ack-retry"
+                or operation.get("compose_project") != proof["compose_project"]
+                or operation.get("control_volume") != proof["control_volume"]
+                or operation.get("retry_record_sha256") != _sha256_bytes(raw)):
+            _fail("pre-ACK retry operation is not a bound succeeded publication")
+    return record
+
+
+def _validate_initial_pre_restore_process_delta(
+    archive_raw: bytes, current_raw: bytes, owner_raw: bytes
+) -> None:
+    """Accept only the known API-before-owner terminal receipt transition."""
+
+    archive = _accepted_reattach_json(
+        archive_raw, "accepted-run immutable terminal process record"
+    )
+    current = _accepted_reattach_json(
+        current_raw, "accepted-run current terminal process record"
+    )
+    owner = _accepted_reattach_json(owner_raw, "accepted-run terminal owner record")
+    if set(current) != _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS:
+        _fail("accepted-run current terminal process record shape differs")
+    if set(archive) not in (
+        _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS,
+        _ACCEPTED_REATTACH_PRE_RESTORE_PROCESS_FIELDS | {"service_owner"},
+    ):
+        _fail("accepted-run immutable terminal process record shape differs")
+    for field in ("schema", "state", "accepted_store", "bootstrap", "qualification"):
+        if current.get(field) != archive.get(field):
+            _fail("accepted-run terminal process immutable field differs: " + field)
+    if (
+        current.get("schema") != "fullmag.docker-process-tree.v1"
+        or current.get("state") != "shutdown_unknown"
+    ):
+        _fail("accepted-run current terminal process is not the known pre-restore failure")
+    if (
+        archive.get("schema") != "fullmag.docker-process-tree.v1"
+        or archive.get("state") != "shutdown_unknown"
+    ):
+        _fail("accepted-run immutable terminal process is not shutdown_unknown")
+    if type(current.get("api_pid")) is not int or current["api_pid"] <= 0:
+        _fail("accepted-run current terminal process API PID is invalid")
+    if (type(current.get("api_exit_code")) is not int
+            or current["api_exit_code"] != _ACCEPTED_REATTACH_PRE_RESTORE_API_EXIT_CODE):
+        _fail("accepted-run current terminal process API exit code is invalid")
+    if current.get("error") != _ACCEPTED_REATTACH_PRE_RESTORE_API_ERROR:
+        _fail("accepted-run current terminal process API error differs")
+    if (
+        current.get("shutdown_error")
+        != _ACCEPTED_REATTACH_PRE_RESTORE_SHUTDOWN_ERROR
+    ):
+        _fail("accepted-run current terminal process shutdown reason differs")
+    _validate_terminal_owner(
+        owner,
+        state="failed",
+        name="accepted-run terminal failed owner",
+        allowed_child_statuses=(
+            ("exited_success", "exited_failure")
+            if "service_owner" in archive else ("exited_success",)
+        ),
+    )
+    if "service_owner" in archive:
+        retained_ready_owner = archive["service_owner"]
+        if not isinstance(retained_ready_owner, dict):
+            _fail("accepted-run retained ready owner is not an object")
+        _validate_terminal_owner(
+            retained_ready_owner,
+            state="ready",
+            name="accepted-run retained ready owner",
+        )
+        if (
+            _owner_identity(retained_ready_owner) != _owner_identity(owner)
+            or _owner_child_identity(retained_ready_owner)
+            != _owner_child_identity(owner)
+        ):
+            _fail("accepted-run retained ready owner differs from failed owner identity")
+
+
 def accepted_reattach_preflight(paths: RuntimePaths):
     """Pin old records or an authenticated successor drain before rotation.
 
@@ -1032,9 +1353,10 @@ def accepted_reattach_preflight(paths: RuntimePaths):
     proof_path = _reattach_relative(paths.state_root, request["proof_path"], "accepted-run proof")
 
     # The first entrypoint invocation has no native ack yet.  It is admitted
-    # only while both mutable records are byte-identical to the archived
-    # terminal records.  A later invocation may never infer this phase from a
-    # state string or marker: it needs the exact drained successor metadata.
+    # from the immutable archive and may accept only the explicitly typed
+    # API-before-owner failure receipt below.  A later invocation may never
+    # infer its phase from a state string or marker: it needs exact drained
+    # successor metadata.
     current_receipt_path = process_receipt_path(paths)
     metadata = None
     try:
@@ -1149,20 +1471,81 @@ def accepted_reattach_preflight(paths: RuntimePaths):
     # The API-specific acknowledgement filename is not knowable until the
     # native successor receives its new API instance identity.  No mutable
     # marker is accepted as a substitute for that first native acknowledgement.
-    for prefix, filename, current in (
-            ("terminal_owner_record", "terminal-owner.json", runtime_services_root(paths) / "OWNER.json"),
-            ("terminal_process_record", "terminal-process.json", process_receipt_path(paths))):
-        relative, expected = proof.get(prefix + "_path"), proof.get(prefix + "_sha256")
-        if not isinstance(expected, str) or not HEX64.fullmatch(expected):
-            _fail("accepted-run backing record digest is missing or invalid")
-        archived = _reattach_relative(paths.state_root, relative, "accepted-run backing record")
-        if archived.parent != proof_path.parent or archived.name != filename:
-            _fail("accepted-run backing record is outside its proof directory")
-        archive_raw = _bounded_regular(archived, "accepted-run immutable terminal record", 256 * 1024)
-        current_raw = _bounded_regular(current, "accepted-run current terminal record", 256 * 1024)
-        if _sha256_bytes(archive_raw) != expected or current_raw != archive_raw:
-            _fail("accepted-run current terminal record differs from immutable backing evidence")
-    return {
+    owner_relative, owner_expected = (
+        proof.get("terminal_owner_record_path"),
+        proof.get("terminal_owner_record_sha256"),
+    )
+    if not isinstance(owner_expected, str) or not HEX64.fullmatch(owner_expected):
+        _fail("accepted-run backing record digest is missing or invalid")
+    archived_owner = _reattach_relative(
+        paths.state_root, owner_relative, "accepted-run backing owner record"
+    )
+    if (
+        archived_owner.parent != proof_path.parent
+        or archived_owner.name != "terminal-owner.json"
+    ):
+        _fail("accepted-run backing owner record is outside its proof directory")
+    archive_owner_raw = _bounded_regular(
+        archived_owner, "accepted-run immutable terminal owner", 256 * 1024
+    )
+    current_owner_path = runtime_services_root(paths) / "OWNER.json"
+    current_owner_raw = _bounded_regular(
+        current_owner_path, "accepted-run current terminal owner", 256 * 1024
+    )
+    if (
+        _sha256_bytes(archive_owner_raw) != owner_expected
+        or current_owner_raw != archive_owner_raw
+    ):
+        _fail("accepted-run current terminal owner differs from immutable backing evidence")
+
+    process_relative, process_expected = (
+        proof.get("terminal_process_record_path"),
+        proof.get("terminal_process_record_sha256"),
+    )
+    if not isinstance(process_expected, str) or not HEX64.fullmatch(process_expected):
+        _fail("accepted-run backing record digest is missing or invalid")
+    archived_process = _reattach_relative(
+        paths.state_root, process_relative, "accepted-run backing process record"
+    )
+    if (
+        archived_process.parent != proof_path.parent
+        or archived_process.name != "terminal-process.json"
+    ):
+        _fail("accepted-run backing process record is outside its proof directory")
+    archive_process_raw = _bounded_regular(
+        archived_process, "accepted-run immutable terminal process", 256 * 1024
+    )
+    if _sha256_bytes(archive_process_raw) != process_expected:
+        _fail("accepted-run immutable terminal process digest differs")
+    current_process_raw = _bounded_regular(
+        process_receipt_path(paths), "accepted-run current terminal process", 256 * 1024
+    )
+    retry = None
+    if current_process_raw != archive_process_raw:
+        retry_relative = _accepted_reattach_record_relative(request, "pre-ack-retry.json")
+        retry_path = _reattach_relative(paths.state_root, retry_relative, "pre-ACK retry")
+        retry_observation = _read_optional_accepted_reattach_record(retry_path, "pre-ACK retry")
+        if retry_observation is None:
+            # Retain the remote's exact legacy exit-101 compatibility case.
+            _validate_initial_pre_restore_process_delta(
+                archive_process_raw, current_process_raw, archive_owner_raw
+            )
+        else:
+            # An existing certificate must validate; never fall back from an
+            # invalid or uncertain certificate to the legacy receipt case.
+            retry_raw, retry_record = retry_observation
+            def read_retry_record(relative, label):
+                maximum = 8 * 1024 * 1024 if relative.endswith("/preflight-log.json") else MAX_JSON_BYTES
+                data = _bounded_regular(_reattach_relative(BUILD_CONTROL_ROOT, relative, label), label, maximum)
+                return data, _accepted_reattach_json(data, label)
+            _validate_pre_ack_retry_record(
+                retry_record, retry_raw, request, proof, request_sha256, read_retry_record
+            )
+            if _sha256_bytes(current_process_raw) != retry_record["current_process_sha256"]:
+                _fail("pre-ACK retry cannot authorize another API incarnation")
+            _assert_pre_ack_unconsumed(retry_path.parent)
+            retry = {"pre_ack_retry_path": retry_relative, "pre_ack_retry_sha256": _sha256_bytes(retry_raw)}
+    result = {
         "request_sha256": request_sha256,
         "proof_sha256": request["proof_sha256"],
         "restore_mode": ACCEPTED_REATTACH_INITIAL_MODE,
@@ -1171,6 +1554,9 @@ def accepted_reattach_preflight(paths: RuntimePaths):
         "previous_drain_relative": None,
         "previous_drain_sha256": None,
     }
+    if retry is not None:
+        result.update(retry)
+    return result
 
 
 @contextmanager
@@ -1193,6 +1579,8 @@ def accepted_reattach_api_input(paths: RuntimePaths, *, preflight=None):
         "previous_drain_relative": preflight.get("previous_drain_relative") if isinstance(preflight, dict) else None,
         "previous_drain_sha256": preflight.get("previous_drain_sha256") if isinstance(preflight, dict) else None,
     }
+    if isinstance(preflight, dict) and "pre_ack_retry_path" in preflight:
+        expected_preflight.update({key: preflight.get(key) for key in ("pre_ack_retry_path", "pre_ack_retry_sha256")})
     if preflight != expected_preflight:
         _fail("accepted-run API input requires the matching early terminal preflight")
     _accepted_reattach_preflight_shape(environment, request, preflight)
@@ -1217,6 +1605,8 @@ def accepted_reattach_api_input(paths: RuntimePaths, *, preflight=None):
         previous_drain_path=preflight["previous_drain_relative"],
         previous_drain_sha256=preflight["previous_drain_sha256"],
     )
+    if "pre_ack_retry_path" in preflight:
+        payload.update({key: preflight[key] for key in ("pre_ack_retry_path", "pre_ack_retry_sha256")})
     _ensure_directory(paths.state_root, "accepted-run runtime control")
     with tempfile.TemporaryFile(mode="w+b", dir=paths.state_root) as stream:
         stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf8"))
@@ -1288,6 +1678,8 @@ def _accepted_reattach_preflight_shape(
         "previous_drain_relative": preflight.get("previous_drain_relative"),
         "previous_drain_sha256": preflight.get("previous_drain_sha256"),
     }
+    if "pre_ack_retry_path" in preflight:
+        expected.update({key: preflight.get(key) for key in ("pre_ack_retry_path", "pre_ack_retry_sha256")})
     if dict(preflight) != expected:
         _fail("accepted-run API input requires the matching early terminal preflight")
     restore_mode = preflight.get("restore_mode")
@@ -1300,7 +1692,14 @@ def _accepted_reattach_preflight_shape(
     if restore_mode == ACCEPTED_REATTACH_INITIAL_MODE:
         if any(preflight.get(field) is not None for field in previous_fields):
             _fail("initial accepted-run restore cannot reference successor records")
+        if "pre_ack_retry_path" in preflight:
+            if (preflight["pre_ack_retry_path"] != _accepted_reattach_record_relative(request, "pre-ack-retry.json")
+                    or not isinstance(preflight.get("pre_ack_retry_sha256"), str)
+                    or not HEX64.fullmatch(preflight["pre_ack_retry_sha256"])):
+                _fail("pre-ACK retry transport path or digest differs")
         return
+    if "pre_ack_retry_path" in preflight:
+        _fail("successor transport cannot carry a pre-ACK retry")
     for field in ("previous_ack_relative", "previous_drain_relative"):
         value = preflight.get(field)
         try:
@@ -1579,10 +1978,37 @@ def _positive(environment: Mapping[str, str], name: str, default: int) -> int:
     return parsed
 
 
+def _docker_host_budget_limits(environment: Mapping[str, str]) -> tuple[int, int, bool]:
+    cpu_value = environment.get("FULLMAG_DOCKER_CPU_MILLIS")
+    memory_value = environment.get("FULLMAG_DOCKER_MEMORY_BYTES")
+    if (cpu_value is None) != (memory_value is None):
+        _fail("FULLMAG_DOCKER_CPU_MILLIS and FULLMAG_DOCKER_MEMORY_BYTES must be set together")
+    if cpu_value is None:
+        return 4000, 7 * GIB, False
+
+    parsed = []
+    for name, value in (
+        ("FULLMAG_DOCKER_CPU_MILLIS", cpu_value),
+        ("FULLMAG_DOCKER_MEMORY_BYTES", memory_value),
+    ):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+            _fail(f"{name} must be a positive integer")
+        number = int(value, 10)
+        if not 0 < number <= 2**64 - 1:
+            _fail(f"{name} must be a positive integer")
+        parsed.append(number)
+    cpu_millis, full_memory_bytes = parsed
+    if cpu_millis < 2000 or cpu_millis % 1000:
+        _fail("FULLMAG_DOCKER_CPU_MILLIS requires at least two whole CPUs for separate compute and preparation placements")
+    if full_memory_bytes <= GIB:
+        _fail("FULLMAG_DOCKER_MEMORY_BYTES must exceed 1 GiB of API headroom")
+    return cpu_millis, full_memory_bytes - GIB, True
+
+
 def build_configuration(
     paths: RuntimePaths | None = None, environment: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
-    """Return the explicit v1 CPU profile admitted by the current API."""
+    """Return the separate v1 CPU profile with its legacy fixed limits."""
 
     environment = os.environ if environment is None else environment
     paths = paths or canonical_paths(environment)
@@ -1633,9 +2059,10 @@ def build_configuration(
 def _validate_host_profile(
     value: Mapping[str, Any], paths: RuntimePaths, device_access: str = "gpu"
 ) -> dict[str, Any]:
-    """Check the fixed Docker boundary around the canonical Rust host factory."""
+    """Check the Docker budget boundary around the canonical Rust host factory."""
     if device_access not in DEVICE_ACCESS_CHOICES:
         _fail("FULLMAG_DOCKER_DEVICE_ACCESS must be cpu or gpu")
+    cpu_limit_millis, memory_limit_bytes, approved_budget = _docker_host_budget_limits(os.environ)
     expected_profile_schema = (
         HOST_PROFILE_SCHEMA if device_access == "gpu" else CPU_HOST_PROFILE_SCHEMA
     )
@@ -1785,111 +2212,19 @@ def _validate_host_profile(
     else:
         cpu_total = sum(cpu_budgets)
         memory_total = sum(memory_budgets)
-    if cpu_total > 4000:
-        _fail("Docker host offers exceed the backend CPU quota")
-    if memory_total > 7 * GIB:
-        _fail("Docker host offers exceed memory minus API headroom")
+    if cpu_total > cpu_limit_millis:
+        _fail("Docker host offers exceed the approved backend CPU budget")
+    if memory_total > memory_limit_bytes:
+        _fail("Docker host offers exceed approved memory minus API headroom")
+    if approved_budget and (cpu_total != cpu_limit_millis or memory_total != memory_limit_bytes):
+        _fail("Docker host offers do not match the complete approved backend budget")
     return config
 
 
-def _run_worker_cpu_quota_migration(paths: RuntimePaths, command: list[str], environment: dict[str, str]) -> None:
-    directory = RUNTIME_CONTROL_ROOT / "runtime-service"
-    request_path = directory / "worker-cpu-quota-migration.json"
-    if not os.path.lexists(request_path):
-        return
-    request_raw = _bounded_regular(request_path, "worker CPU quota migration request")
-    request = json.loads(request_raw, object_pairs_hook=_reject_duplicate_keys)
-    if not isinstance(request, dict):
-        _fail("worker CPU quota migration request must be an object")
-    fields = {"schema", "request_id", "expected_generation", "compose_project", "container_id",
-              "image_id", "cgroup_nonce", "boot_id", "pid", "process_start_token", "package_receipt_sha256"}
-    if set(request) != fields or request["schema"] != "fullmag.worker-cpu-quota-migration-request.v1":
-        _fail("invalid worker CPU quota migration request schema")
-    for field in ("request_id", "boot_id"):
-        if not isinstance(request[field], str) or UUID_RE.fullmatch(request[field]) is None:
-            _fail("invalid migration " + field)
-    if uuid.UUID(request["request_id"]).version != 4:
-        _fail("migration request ID must be a UUID4")
-    for field in ("expected_generation", "container_id", "package_receipt_sha256"):
-        if not isinstance(request[field], str) or HEX64.fullmatch(request[field]) is None:
-            _fail("invalid migration " + field)
-    if (not isinstance(request["image_id"], str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", request["image_id"]) is None
-            or not isinstance(request["cgroup_nonce"], str)
-            or re.fullmatch(r"[0-9a-f]{32}", request["cgroup_nonce"]) is None
-            or type(request["pid"]) is not int or request["pid"] < 1
-            or not isinstance(request["process_start_token"], str)
-            or re.fullmatch(r"[0-9]+", request["process_start_token"]) is None
-            or request["compose_project"] != os.environ.get("FULLMAG_COMPOSE_PROJECT")):
-        _fail("invalid worker CPU quota migration identity")
-    request_digest = _sha256_bytes(request_raw)
-    claim_path = directory / "worker-cpu-quota-migration.claim.json"
-    result_path = directory / "worker-cpu-quota-migration.result.json"
-    claim = {"schema": "fullmag.worker-cpu-quota-migration-claim.v1", "request_sha256": request_digest}
-    if os.path.lexists(result_path):
-        result = _read_json(result_path, "worker CPU quota migration result")
-        recorded_claim = _read_json(claim_path, "worker CPU quota migration claim")
-        native = result.get("native_receipt", {})
-        if (recorded_claim != claim or result.get("request_sha256") != request_digest
-                or result.get("schema") != "fullmag.worker-cpu-quota-migration-result.v1"
-                or result.get("state") != "succeeded" or not isinstance(native, dict)
-                or native.get("schema_version") != "host_worker_cpu_quota_migration.v1"
-                or native.get("previous_generation") != request["expected_generation"]
-                or not isinstance(native.get("runtime_generation_sha256"), str)
-                or HEX64.fullmatch(native["runtime_generation_sha256"]) is None
-                or native["runtime_generation_sha256"] == request["expected_generation"]):
-            _fail("worker CPU quota migration requires explicit outcome reconciliation")
-        return
-    if os.path.lexists(claim_path):
-        _fail("worker CPU quota migration outcome is unknown; explicit reconciliation is required")
-    ready = _read_json(RUNTIME_CONTROL_ROOT / "worker-cgroup/ready.json", "worker cgroup readiness")
-    if (ready.get("schema") != "fullmag.worker-cgroup-ready.v1" or ready.get("state") != "ready"
-            or ready.get("nonce") != request["cgroup_nonce"]
-            or any(ready.get(field) != request[field] for field in
-                   ("compose_project", "container_id", "image_id", "boot_id", "pid", "process_start_token"))):
-        _fail("worker CPU quota migration is not bound to the current cgroup gate")
-    process_stat = Path("/proc/self/stat").read_text()
-    start_token = process_stat[process_stat.rfind(")") + 2:].split()[19]
-    if (request["pid"] != os.getpid() or request["process_start_token"] != start_token
-            or request["boot_id"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip()):
-        _fail("worker CPU quota migration belongs to another process incarnation")
-    package_raw = _bounded_regular(
-        paths.package / "backend-build-receipt.json", "backend build receipt", maximum=8 * 1024 * 1024
-    )
-    if _sha256_bytes(package_raw) != request["package_receipt_sha256"]:
-        _fail("worker CPU quota migration package differs from its authorization")
-    _publish_accepted_reattach_record(claim_path, claim, "worker CPU quota migration claim")
-    result = {"schema": "fullmag.worker-cpu-quota-migration-result.v1",
-              "request_sha256": request_digest, "state": "unknown"}
-    try:
-        process = subprocess.run(
-            [*command, "--migrate-worker-cpu-quota-from", request["expected_generation"]],
-            cwd=str(paths.state), env=environment, stdin=subprocess.DEVNULL,
-            capture_output=True, timeout=60,
-        )
-        if len(process.stdout) + len(process.stderr) > 64 * 1024:
-            _fail("worker CPU quota migration output exceeds its size bound")
-        result.update(exit_code=process.returncode,
-                      stdout=process.stdout.decode("utf-8", errors="replace"),
-                      stderr=process.stderr.decode("utf-8", errors="replace"))
-        if process.returncode:
-            result["state"] = "failed"
-            _fail("native worker CPU quota migration failed: " + result["stderr"])
-        native = json.loads(process.stdout, object_pairs_hook=_reject_duplicate_keys)
-        if (not isinstance(native, dict) or set(native) !=
-                {"schema_version", "previous_generation", "runtime_generation_sha256"}
-                or native["schema_version"] != "host_worker_cpu_quota_migration.v1"
-                or native["previous_generation"] != request["expected_generation"]
-                or not isinstance(native["runtime_generation_sha256"], str)
-                or HEX64.fullmatch(native["runtime_generation_sha256"]) is None
-                or native["runtime_generation_sha256"] == request["expected_generation"]):
-            _fail("native worker CPU quota migration returned an invalid receipt")
-        result.update(state="succeeded", native_receipt=native)
-    finally:
-        _publish_accepted_reattach_record(result_path, result, "worker CPU quota migration result")
-
-
-def initialize_host_configuration(paths: RuntimePaths, device_access: str = "gpu") -> dict[str, Any]:
+def initialize_host_configuration(
+    paths: RuntimePaths, device_access: str = "gpu",
+    capacity_authority: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Discover native devices and initialize the exact shared Rust ledger."""
     if device_access not in DEVICE_ACCESS_CHOICES:
         _fail("FULLMAG_DOCKER_DEVICE_ACCESS must be cpu or gpu")
@@ -1917,6 +2252,11 @@ def initialize_host_configuration(paths: RuntimePaths, device_access: str = "gpu
     if result.returncode:
         detail = (result.stderr or result.stdout).decode("utf-8", errors="replace")[-4096:]
         _fail("native Docker host profile initialization failed: " + detail)
+    if os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256") is not None and result.stderr:
+        # The native receipt is diagnostic output; preserve it in the backend
+        # log rather than discarding it with the successful subprocess capture.
+        print(result.stderr[-MAX_JSON_BYTES:].decode("utf-8", errors="replace"),
+              file=sys.stderr, end="", flush=True)
     if len(result.stdout) > MAX_JSON_BYTES:
         _fail("native Docker host profile exceeds its bounded size")
     try:
@@ -1925,7 +2265,27 @@ def initialize_host_configuration(paths: RuntimePaths, device_access: str = "gpu
         raise RuntimeServiceError("native Docker host profile is invalid JSON") from error
     if not isinstance(value, dict):
         _fail("native Docker host profile must contain an object")
-    return _validate_host_profile(value, paths, device_access)
+    config = _validate_host_profile(value, paths, device_access)
+    if capacity_authority is not None:
+        capacity_authority.clear()
+        evidence = value.get("capacity_migration")
+        if evidence is not None:
+            descriptor = os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_SHA256")
+            requested = os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256")
+            if (not isinstance(evidence, dict)
+                    or set(evidence) != {"descriptor_sha256", "historical_policies"}
+                    or not isinstance(requested, str) or not HEX64.fullmatch(requested)
+                    or descriptor != requested or evidence["descriptor_sha256"] != requested
+                    or not isinstance(evidence["historical_policies"], list)
+                    or len(evidence["historical_policies"]) > 16
+                    or any(not isinstance(policy, dict) for policy in evidence["historical_policies"])):
+                _fail("native capacity transition evidence differs from the explicit descriptor")
+            capacity_authority.update(
+                descriptor_sha256=requested,
+                current_policy=config["host_execution"]["policy"],
+                historical_policies=evidence["historical_policies"],
+            )
+    return config
 
 
 def _retain_previous_configuration(path: Path, raw: bytes) -> None:
@@ -1958,10 +2318,110 @@ def _retain_previous_configuration(path: Path, raw: bytes) -> None:
         _fail("previous runtime configuration backup verification failed")
 
 
+def _capacity_projection(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Project a configuration onto the fields a measured transition keeps."""
+    result = dict(config)
+    for name in ("compute_resources", "preparation_resources"):
+        offers = result.get(name)
+        if (not isinstance(offers, list) or not offers
+                or any(not isinstance(offer, dict) or not isinstance(offer.get("budget"), dict)
+                       for offer in offers)):
+            return None
+        result[name] = [
+            {**offer, "budget": {
+                key: value for key, value in offer["budget"].items()
+                if key not in {"cpu_millis", "memory_bytes"}
+            }}
+            for offer in offers
+        ]
+    host = result.get("host_execution")
+    if not isinstance(host, dict):
+        return None
+    host = dict(host)
+    host.pop("policy", None)
+    host.pop("runtime_generation_sha256", None)
+    placements = host.get("compute_placements")
+    preparation = host.get("preparation_cpu_ids")
+    if (not isinstance(placements, dict) or not isinstance(preparation, dict)
+            or any(not isinstance(value, dict) for value in placements.values())
+            or any(not isinstance(value, list) for value in preparation.values())):
+        return None
+    # Resource identities, GPU UUIDs, concurrency, paths and timing remain
+    # exact, including storage and GPU memory. Only CPU/RAM budgets and CPU
+    # masks are permitted to vary.
+    host["compute_placements"] = {
+        key: {field: value for field, value in placement.items() if field != "cpu_ids"}
+        for key, placement in placements.items()
+    }
+    host["preparation_cpu_ids"] = dict.fromkeys(preparation)
+    result["host_execution"] = host
+    return result
+
+
+def _group_ledger_transition_allowed(current: dict[str, Any], expected: dict[str, Any]) -> bool:
+    """Allow one move of a DEV group from the global ledger to its own ledger.
+
+    The caller holds the authenticated terminal drain of the previous owner.
+    Only the policy (host ID and the group's own budget/topology) and the
+    CPU/RAM budgets and masks may change; paths, pools, resource identities,
+    GPU placement and concurrency stay exact.  Reservations of the global
+    ledger are not carried over (ADR 0067).  A configuration that is already
+    bound to this group's host ID never takes this path again.
+    """
+    if os.environ.get("FULLMAG_HOST_LEDGER_PROFILE") != GROUP_LEDGER_PROFILE:
+        return False
+    group_host_id = os.environ.get(GROUP_LEDGER_HOST_ID_ENV)
+    old_host, new_host = current.get("host_execution"), expected.get("host_execution")
+    if (not isinstance(old_host, dict) or not isinstance(new_host, dict)
+            or not isinstance(old_host.get("policy"), dict)
+            or not isinstance(new_host.get("policy"), dict)
+            or not isinstance(group_host_id, str) or not HEX64.fullmatch(group_host_id)):
+        return False
+    # Only a global identity (daemon digest or legacy ID) may move to the
+    # group; a configuration bound to any other group ID never re-binds.
+    global_host_ids = {os.environ.get("FULLMAG_DOCKER_HOST_ID"), LEGACY_DOCKER_HOST_ID}
+    if (new_host["policy"].get("host_id") != group_host_id
+            or old_host["policy"].get("host_id") not in global_host_ids - {None}
+            or old_host.get("ledger_root") != str(HOST_LEDGER_ROOT)
+            or new_host.get("ledger_root") != str(HOST_LEDGER_ROOT)):
+        return False
+    old_projection, new_projection = _capacity_projection(current), _capacity_projection(expected)
+    return old_projection is not None and old_projection == new_projection
+
+
+def _capacity_profile_transition_allowed(
+    current: dict[str, Any], expected: dict[str, Any], authority: Mapping[str, Any] | None,
+) -> bool:
+    """Constrain an explicit stopped-consumer transition to native-measured capacity.
+
+    Native validates the complete anchored policy history. This adapter only
+    compares that returned evidence and preserves the rest of the profile.
+    """
+    if not isinstance(authority, Mapping):
+        return False
+    descriptor = authority.get("descriptor_sha256")
+    if (not isinstance(descriptor, str) or not HEX64.fullmatch(descriptor)
+            or descriptor != os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_SHA256")
+            or descriptor != os.environ.get("FULLMAG_DOCKER_HOST_CAPACITY_MIGRATION_SHA256")):
+        return False
+    old_host, new_host = current.get("host_execution"), expected.get("host_execution")
+    if not isinstance(old_host, dict) or not isinstance(new_host, dict):
+        return False
+    history = authority.get("historical_policies")
+    if (not isinstance(history, list)
+            or new_host.get("policy") != authority.get("current_policy")
+            or old_host.get("policy") not in [new_host.get("policy"), *history]):
+        return False
+
+    old_projection, new_projection = _capacity_projection(current), _capacity_projection(expected)
+    return old_projection is not None and old_projection == new_projection
+
+
 def _rotate_configuration_generation(
-    paths: RuntimePaths, current: dict[str, Any], expected: dict[str, Any], previous_sha256: str
+    paths: RuntimePaths, current: dict[str, Any], expected: dict[str, Any], previous_sha256: str,
+    *, capacity_authority: Mapping[str, Any] | None = None,
 ) -> None:
-    """Change only the generation after the launcher verified an owned stop."""
+    """Change a generation or explicitly measured capacity after an owned stop."""
     old_host, new_host = current.get("host_execution"), expected.get("host_execution")
     if not isinstance(old_host, dict) or not isinstance(new_host, dict):
         _fail("runtime configuration rotation requires the same native host profile")
@@ -1976,7 +2436,9 @@ def _rotate_configuration_generation(
     old_profile.pop("runtime_generation_sha256", None)
     new_profile.pop("runtime_generation_sha256", None)
     if ({**current, "host_execution": old_profile}
-            != {**expected, "host_execution": new_profile}):
+            != {**expected, "host_execution": new_profile}
+            and not _capacity_profile_transition_allowed(current, expected, capacity_authority)
+            and not _group_ledger_transition_allowed(current, expected)):
         _fail("runtime configuration rotation cannot change the operator profile")
     raw = _bounded_regular(paths.config, "runtime configuration before rotation")
     if hashlib.sha256(raw).hexdigest() != previous_sha256:
@@ -1992,7 +2454,817 @@ def _rotate_configuration_generation(
         _fail("runtime configuration generation publication did not retain the expected profile")
 
 
-def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
+POST_BUILD_START_SCHEMA = "fullmag.docker-post-build-failed-owner-start.v1"
+POST_BUILD_METADATA_SCHEMA = "fullmag.docker-post-build-failed-owner-continuation.v1"
+POST_BUILD_START_ENV = "FULLMAG_DOCKER_POST_BUILD_CONTINUATION"
+POST_BUILD_START_SHA_ENV = "FULLMAG_DOCKER_POST_BUILD_CONTINUATION_SHA256"
+POST_BUILD_CONSUMED_SCHEMA = "fullmag.docker-post-build-failed-owner-consumed.v1"
+POST_BUILD_CONSUMED_RELATIVE = PurePosixPath("post-build-continuation")
+POST_BUILD_MAX_BYTES = 512 * 1024
+POST_BUILD_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+POST_BUILD_IMAGE = re.compile(r"^sha256:[0-9a-f]{64}$")
+POST_BUILD_CONTAINER = re.compile(r"^[0-9a-f]{64}$")
+POST_BUILD_PROCESS_KEYS = (
+    "schema", "state", "api_pid", "api_exit_code", "accepted_store",
+    "bootstrap", "qualification", "error", "shutdown_error",
+)
+POST_BUILD_PROCESS_ERROR = (
+    "API binding did not become ready: API loopback probe failed for "
+    "/v2/platform/openapi.json: [Errno 111] Connection refused"
+)
+POST_BUILD_PROCESS_SHUTDOWN_ERROR = (
+    "no pinned runtime service owner was available for authenticated drain"
+)
+POST_BUILD_LIVE_OPERATION_STATES = frozenset(
+    {"starting", "starting-services", "running", "recreating-services", "resuming-observation"}
+)
+
+
+def _post_build_canonical(value: Mapping[str, Any]) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
+
+
+def _post_build_open_fd(path: Path, name: str, flags: int) -> int:
+    """Open one control-volume path with an fd-relative no-follow walk."""
+
+    path = _absolute(path, name)
+    if os.open not in getattr(os, "supports_dir_fd", set()):
+        _fail(f"{name} requires fd-relative path support")
+    parts = path.parts
+    if len(parts) < 2:
+        _fail(f"{name} is not a regular file path")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    parent = None
+    descriptor = None
+    try:
+        parent = os.open(path.anchor, directory_flags)
+        for component in parts[1:-1]:
+            child = os.open(component, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        descriptor = os.open(
+            parts[-1], flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+    except FileNotFoundError:
+        raise
+    except TypeError as error:
+        _fail(f"{name} cannot use fd-relative path resolution: {error}")
+    except OSError as error:
+        _fail(f"{name} cannot be opened safely: {error}")
+    finally:
+        if parent is not None:
+            os.close(parent)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        _fail(f"{name} is not a single-link regular file")
+    return descriptor
+
+
+def _post_build_read_bytes(path: Path, name: str, maximum: int = POST_BUILD_MAX_BYTES) -> bytes:
+    descriptor = _post_build_open_fd(path, name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_size > maximum:
+            _fail(f"{name} exceeds its size bound")
+        data = bytearray()
+        while len(data) <= maximum:
+            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > maximum:
+            _fail(f"{name} exceeds its size bound")
+        return bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def _post_build_read_optional_bytes(
+    path: Path, name: str, maximum: int = POST_BUILD_MAX_BYTES
+) -> bytes | None:
+    try:
+        return _post_build_read_bytes(path, name, maximum)
+    except FileNotFoundError:
+        return None
+
+
+def _post_build_json(raw: bytes, name: str, *, canonical: bool = False) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {constant}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        _fail(f"{name} is not valid JSON: {error}")
+    if not isinstance(value, dict):
+        _fail(f"{name} must contain a JSON object")
+    if canonical and raw != _post_build_canonical(value):
+        _fail(f"{name} is not canonical JSON")
+    return value
+
+
+def _post_build_read_json(path: Path, name: str, *, canonical: bool = False) -> tuple[bytes, dict[str, Any]]:
+    raw = _post_build_read_bytes(path, name)
+    return raw, _post_build_json(raw, name, canonical=canonical)
+
+
+def _post_build_digest(value: Any, name: str) -> str:
+    if not isinstance(value, str) or HEX64.fullmatch(value) is None or set(value) == {"0"}:
+        _fail(f"{name} is not a non-zero lowercase SHA-256")
+    return value
+
+
+def _post_build_token(value: Any, name: str) -> str:
+    if not isinstance(value, str) or POST_BUILD_TOKEN.fullmatch(value) is None:
+        _fail(f"{name} is not a lowercase operation token")
+    return value
+
+
+def _post_build_text(value: Any, name: str, maximum: int = 4096) -> str:
+    if (not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value
+            or any(ord(character) < 32 for character in value)):
+        _fail(f"{name} is not bounded text")
+    return value
+
+
+def _post_build_relative(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        _fail(f"{name} is not a bounded relative path")
+    parsed = PurePosixPath(value)
+    if (parsed.is_absolute() or str(parsed) != value or "\\" in value or ":" in value
+            or any(part in {"", ".", ".."} for part in parsed.parts)):
+        _fail(f"{name} escapes its control root")
+    return value
+
+
+def _post_build_control_path(value: Any, name: str) -> Path:
+    if not isinstance(value, str) or not value:
+        _fail(f"{name} is missing")
+    path = _absolute(Path(value), name)
+    try:
+        relative = path.relative_to(BUILD_CONTROL_ROOT)
+    except ValueError:
+        _fail(f"{name} is outside the build-control volume")
+    if str(path) != value or any(part in {"", ".", ".."} for part in relative.parts):
+        _fail(f"{name} is not a canonical build-control path")
+    return path
+
+
+
+def _post_build_validate_stable_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        _fail("post-build certificate stable identity is not an object")
+    profile = value.get("storage_profile")
+    if profile == WINDOWS_STORAGE_PROFILE:
+        required = {
+            "schema", "storage_profile", "role", "owner_scope", "owner_token", "engine_id",
+            "host_root", "host_filesystem", "host_drive_type", "host_volume_serial",
+            "host_root_no_reparse",
+        }
+        expected_schema = "fullmag.windows-folder-host.v1"
+        expected_scope = "docker-desktop-linux"
+    elif profile == LINUX_STORAGE_PROFILE:
+        required = {
+            "schema", "storage_profile", "role", "owner_scope", "owner_token", "engine_id",
+            "host_root", "host_filesystem", "host_platform", "host_device",
+            "host_root_no_reparse", "host_inode",
+        }
+        expected_schema = "fullmag.linux-native-host.v1"
+        expected_scope = "docker-linux"
+    else:
+        _fail("post-build certificate stable identity has an unsupported storage profile")
+    if set(value) != required or value.get("schema") != expected_schema \
+            or value.get("role") != "session" or value.get("owner_scope") != expected_scope:
+        _fail("post-build certificate stable identity fields differ")
+    owner_token = value.get("owner_token")
+    if profile == WINDOWS_STORAGE_PROFILE:
+        if not isinstance(owner_token, str) or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                owner_token,
+        ) is None or set(owner_token.replace("-", "")) == {"0"}:
+            _fail("post-build Windows stable owner token is invalid")
+    elif (not isinstance(owner_token, str) or re.fullmatch(r"[0-9a-f]{32}", owner_token) is None
+          or set(owner_token) == {"0"}):
+        _fail("post-build Linux stable owner token is invalid")
+    for field, maximum in (("engine_id", 256), ("host_root", 4096), ("host_filesystem", 64)):
+        _post_build_text(value.get(field), "post-build stable " + field, maximum)
+    if value.get("host_root_no_reparse") is not True:
+        _fail("post-build stable identity permits reparse roots")
+    if profile == WINDOWS_STORAGE_PROFILE:
+        if (type(value.get("host_drive_type")) is not int
+                or value["host_drive_type"] != 3
+                or type(value.get("host_volume_serial")) is not int
+                or value["host_volume_serial"] < 0):
+            _fail("post-build Windows stable volume identity is invalid")
+    else:
+        _post_build_text(value.get("host_platform"), "post-build stable host platform", 64)
+        if (type(value.get("host_device")) is not int or value["host_device"] <= 0
+                or type(value.get("host_inode")) is not int or value["host_inode"] <= 0):
+            _fail("post-build Linux stable volume identity is invalid")
+    return dict(value)
+
+
+def _post_build_certificate_stable_identity(certificate: Mapping[str, Any]) -> dict[str, Any]:
+    profile = certificate.get("storage_profile") if isinstance(certificate, Mapping) else None
+    fields = (
+        {
+            "schema", "storage_profile", "role", "owner_scope", "owner_token", "engine_id",
+            "host_root", "host_filesystem", "host_drive_type", "host_volume_serial",
+            "host_root_no_reparse",
+        }
+        if profile == WINDOWS_STORAGE_PROFILE else {
+            "schema", "storage_profile", "role", "owner_scope", "owner_token", "engine_id",
+            "host_root", "host_filesystem", "host_platform", "host_device",
+            "host_root_no_reparse", "host_inode",
+        }
+        if profile == LINUX_STORAGE_PROFILE else set()
+    )
+    if not fields:
+        _fail("post-build host certificate has an unsupported storage profile")
+    return _post_build_validate_stable_identity({key: certificate.get(key) for key in fields})
+
+def _post_build_validate_recreate(metadata: Mapping[str, Any]) -> None:
+    """Validate the host's completed recreation reference, not Docker semantics."""
+    record = metadata.get("recreate_operation")
+    fields = {
+        "schema", "operation_id", "terminal_relative", "terminal_sha256",
+        "retained_relative", "retained_sha256", "prior_terminal_sha256",
+        "prior_compose_sha256", "backend_container", "frontend_container", "image_id", "absence",
+    }
+    if (not isinstance(record, dict) or set(record) != fields
+            or record.get("schema") != "fullmag.docker-removed-recreation-container.v1"):
+        _fail("post-build recreation reference schema or fields differ")
+    token = _post_build_token(record["operation_id"], "post-build recreation attempt")
+    prefix = "recreate-services/attempts/" + token
+    if (record["terminal_relative"] != prefix + "/terminal.json"
+            or record["retained_relative"] != prefix + "/retained-containers.json"):
+        _fail("post-build recreation reference paths differ")
+    for field in ("terminal_sha256", "retained_sha256", "prior_terminal_sha256", "prior_compose_sha256"):
+        _post_build_digest(record[field], "post-build recreation " + field)
+    for field in ("backend_container", "frontend_container"):
+        if not isinstance(record[field], str) or POST_BUILD_CONTAINER.fullmatch(record[field]) is None:
+            _fail("post-build recreation container identity is invalid")
+    namespace = metadata["current_namespace"]
+    if (record["backend_container"] != namespace["container_id"]
+            or record["image_id"] != namespace["image_id"]
+            or record["backend_container"] == record["frontend_container"]):
+        _fail("post-build recreation does not bind the outgoing namespace")
+    absence = record["absence"]
+    if not isinstance(absence, dict) or set(absence) != {"backend", "frontend"}:
+        _fail("post-build recreation absence fields differ")
+    for service in ("backend", "frontend"):
+        item = absence[service]
+        if (not isinstance(item, dict) or set(item) != {
+                "container_id", "inspect_returncode", "inspect_output_sha256",
+                "ps_returncode", "ps_output_sha256"}
+                or item["container_id"] != record[service + "_container"]
+                or type(item["inspect_returncode"]) is not int or item["inspect_returncode"] == 0
+                or type(item["ps_returncode"]) is not int or item["ps_returncode"] != 0):
+            _fail("post-build recreation absence identity or outcome differs")
+        _post_build_digest(item["inspect_output_sha256"], "post-build Docker inspect absence")
+        _post_build_digest(item["ps_output_sha256"], "post-build Docker ps absence")
+
+
+def _post_build_read_recreate(metadata: Mapping[str, Any]) -> None:
+    record = metadata["recreate_operation"]
+    for path_field, digest_field in (("terminal_relative", "terminal_sha256"), ("retained_relative", "retained_sha256")):
+        path = BUILD_CONTROL_ROOT / record[path_field]
+        raw = _post_build_read_bytes(path, "post-build recreation evidence")
+        if _sha256_bytes(raw) != record[digest_field]:
+            _fail("post-build recreation evidence changed after host proof")
+        value = _post_build_json(raw, "post-build recreation evidence", canonical=True)
+        if path_field == "terminal_relative":
+            if (value.get("schema") != "fullmag.docker-build-operation.v1"
+                    or value.get("phase") != "recreate-services" or value.get("state") != "succeeded"
+                    or value.get("attempt") != record["operation_id"]
+                    or value.get("compose_project") != metadata["compose_project"]
+                    or value.get("removed_containers") != [record["backend_container"], record["frontend_container"]]):
+                _fail("post-build recreation terminal does not confirm the exact removed services")
+
+
+def _post_build_validate_metadata(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        _fail("post-build continuation metadata is not an object")
+    required = {
+        "schema", "state", "operation_id", "compose_project", "source_root", "source_identity",
+        "original_stop", "current_namespace", "failed_owner", "current_process",
+        "runtime_config", "certificate", "accepted_run", "recreate_operation",
+    }
+    if set(metadata) != required or metadata.get("schema") != POST_BUILD_METADATA_SCHEMA \
+            or metadata.get("state") != "authorized":
+        _fail("post-build continuation metadata schema or fields differ")
+    _post_build_token(metadata.get("operation_id"), "continuation operation")
+    _post_build_text(metadata.get("compose_project"), "continuation Compose project")
+    _post_build_text(metadata.get("source_root"), "continuation source root")
+    source = metadata["source_identity"]
+    if not isinstance(source, dict) or set(source) != {"project_id", "worktree_id", "checkout_kind"}:
+        _fail("continuation source identity is incomplete")
+    for field in source:
+        _post_build_text(source[field], "continuation source " + field, 256)
+
+    original = metadata["original_stop"]
+    original_fields = {
+        "relative", "sha256", "container_id", "image_id", "failure_kind",
+        "native_failure_probe_sha256", "terminal_process_sha256", "terminal_owner_sha256",
+    }
+    if not isinstance(original, dict) or set(original) != original_fields:
+        _fail("continuation original stop record is incomplete")
+    _post_build_relative(original["relative"], "continuation original stop path")
+    for field in ("sha256", "native_failure_probe_sha256", "terminal_process_sha256", "terminal_owner_sha256"):
+        _post_build_digest(original[field], "continuation original stop " + field)
+    if (not isinstance(original["container_id"], str)
+            or POST_BUILD_CONTAINER.fullmatch(original["container_id"]) is None
+            or set(original["container_id"]) == {"0"}):
+        _fail("continuation original container is invalid")
+    if (not isinstance(original["image_id"], str)
+            or POST_BUILD_IMAGE.fullmatch(original["image_id"]) is None
+            or set(original["image_id"][7:]) == {"0"}):
+        _fail("continuation original image is invalid")
+    _post_build_text(original["failure_kind"], "continuation failure kind", 64)
+
+    namespace = metadata["current_namespace"]
+    namespace_fields = {"container_id", "image_id", "started_at", "finished_at", "exit_code"}
+    if not isinstance(namespace, dict) or set(namespace) != namespace_fields:
+        _fail("continuation current namespace is incomplete")
+    if (not isinstance(namespace["container_id"], str)
+            or POST_BUILD_CONTAINER.fullmatch(namespace["container_id"]) is None
+            or set(namespace["container_id"]) == {"0"}):
+        _fail("continuation current container is invalid")
+    if (not isinstance(namespace["image_id"], str)
+            or POST_BUILD_IMAGE.fullmatch(namespace["image_id"]) is None
+            or set(namespace["image_id"][7:]) == {"0"}):
+        _fail("continuation current image is invalid")
+    _post_build_text(namespace["started_at"], "continuation current StartedAt")
+    _post_build_text(namespace["finished_at"], "continuation current FinishedAt")
+    if type(namespace["exit_code"]) is not int:
+        _fail("continuation current exit code is invalid")
+
+    owner = metadata["failed_owner"]
+    if not isinstance(owner, dict) or set(owner) != {"relative", "sha256", "identity"}:
+        _fail("continuation Failed owner record is incomplete")
+    if owner["relative"] != "runtime-control/runtime-services/OWNER.json":
+        _fail("continuation Failed owner path differs")
+    _post_build_digest(owner["sha256"], "continuation Failed owner")
+    identity_fields = {
+        "owner_token", "process_start_token", "pid", "host", "target_id", "control_address",
+        "build_commit", "build_snapshot", "compute_pool_id", "preparation_pool_id",
+        "compute_pool_generation", "preparation_pool_generation",
+    }
+    if not isinstance(owner["identity"], dict) or set(owner["identity"]) != identity_fields:
+        _fail("continuation Failed owner identity differs")
+
+    process = metadata["current_process"]
+    process_fields = {
+        "relative", "sha256", "immutable_keys", "api_pid", "api_exit_code",
+        "error_sha256", "shutdown_error_sha256",
+    }
+    if not isinstance(process, dict) or set(process) != process_fields:
+        _fail("continuation process record is incomplete")
+    if process["relative"] != "runtime-control/runtime-service/process-tree.json":
+        _fail("continuation process path differs")
+    _post_build_digest(process["sha256"], "continuation process")
+    if process["immutable_keys"] != list(POST_BUILD_PROCESS_KEYS):
+        _fail("continuation process immutable keys differ")
+    if (type(process["api_pid"]) is not int or process["api_pid"] <= 0
+            or type(process["api_exit_code"]) is not int
+            or process["api_exit_code"] != 101):
+        _fail("continuation process identity differs")
+    for field in ("error_sha256", "shutdown_error_sha256"):
+        _post_build_digest(process[field], "continuation process " + field)
+
+    config = metadata["runtime_config"]
+    if not isinstance(config, dict) or set(config) != {"relative", "sha256"}:
+        _fail("continuation runtime config record is incomplete")
+    if config["relative"] != "runtime-control/runtime-service/docker-all.json":
+        _fail("continuation runtime config path differs")
+    _post_build_digest(config["sha256"], "continuation runtime config")
+
+    certificate = metadata["certificate"]
+    certificate_fields = {
+        "historical_certificate_sha256", "historical_owner_marker_sha256",
+        "stable_identity", "storage_profile", "restart_verified",
+    }
+    if not isinstance(certificate, dict) or set(certificate) != certificate_fields:
+        _fail("continuation certificate is incomplete")
+    _post_build_digest(
+        certificate["historical_certificate_sha256"], "continuation historical certificate"
+    )
+    _post_build_digest(
+        certificate["historical_owner_marker_sha256"], "continuation historical owner marker"
+    )
+    stable_identity = _post_build_validate_stable_identity(certificate["stable_identity"])
+    if certificate["storage_profile"] != stable_identity["storage_profile"]:
+        _fail("continuation certificate profile differs from stable identity")
+    if certificate["restart_verified"] is not True:
+        _fail("continuation certificate is not restart_verified")
+
+    _post_build_validate_recreate(metadata)
+    accepted = metadata["accepted_run"]
+    if accepted != {}:
+        accepted_fields = {
+            "schema", "state", "run_id", "project_id", "store_run_relative", "request_relative",
+            "proof_relative", "source_root", "source_relative", "compose_project", "control_volume",
+            "logical_session_id", "session_epoch", "stop_verification_relative",
+            "terminal_process_record_relative", "terminal_owner_record_relative", "development_attempt",
+            "activation_attempt", "reconciliation_attempt", "backend_container", "image_id",
+            "request_sha256", "proof_sha256", "terminal_process_record_sha256",
+            "terminal_owner_record_sha256", "stop_reconcile_proof_sha256", "stop_verification_sha256",
+            "catalog_revision", "task_count",
+        }
+        if not isinstance(accepted, dict) or set(accepted) != accepted_fields:
+            _fail("continuation accepted-run record is incomplete")
+        if (accepted["schema"] != "fullmag.docker-accepted-run-reattach-producer.v1"
+                or accepted["state"] != "prepared"):
+            _fail("continuation accepted-run record is not prepared")
+        for field in (
+            "request_sha256", "proof_sha256", "terminal_process_record_sha256",
+            "terminal_owner_record_sha256", "stop_reconcile_proof_sha256", "stop_verification_sha256",
+        ):
+            _post_build_digest(accepted[field], "continuation accepted-run " + field)
+        for field in (
+            "run_id", "project_id", "store_run_relative", "request_relative", "proof_relative",
+            "source_root", "source_relative", "compose_project", "control_volume",
+            "logical_session_id", "stop_verification_relative",
+            "terminal_process_record_relative", "terminal_owner_record_relative",
+            "development_attempt", "activation_attempt", "reconciliation_attempt",
+        ):
+            _post_build_text(accepted[field], "continuation accepted-run " + field)
+        for field in (
+            "source_relative", "stop_verification_relative", "terminal_process_record_relative",
+            "terminal_owner_record_relative",
+        ):
+            _post_build_relative(accepted[field], "continuation accepted-run " + field)
+        accepted_backend = accepted["backend_container"]
+        if (not isinstance(accepted_backend, str)
+                or POST_BUILD_CONTAINER.fullmatch(accepted_backend) is None):
+            _fail("continuation accepted-run backend container is invalid")
+        accepted_image = accepted["image_id"]
+        if (not isinstance(accepted_image, str)
+                or POST_BUILD_IMAGE.fullmatch(accepted_image) is None):
+            _fail("continuation accepted-run image is invalid")
+        if accepted["stop_verification_relative"] != (
+                "verification/stop-failed-" + accepted_backend + ".json"):
+            _fail("continuation accepted-run stop path is not bound to its backend")
+        if (type(accepted["session_epoch"]) is not int or accepted["session_epoch"] <= 0
+                or type(accepted["catalog_revision"]) is not int
+                or accepted["catalog_revision"] <= 0
+                or type(accepted["task_count"]) is not int
+                or accepted["task_count"] <= 0):
+            _fail("continuation accepted-run catalog pin is invalid")
+    return dict(metadata)
+
+
+def _post_build_validate_binding_document(binding: Any) -> dict[str, Any]:
+    if not isinstance(binding, dict):
+        _fail("post-build start binding is not an object")
+    required = {
+        "schema", "state", "attempt", "receipt_relative", "active_relative", "active_token",
+        "continuation_relative", "continuation_sha256", "previous_config_sha256", "continuation",
+    }
+    if set(binding) != required or binding.get("schema") != POST_BUILD_START_SCHEMA:
+        _fail("post-build start binding schema or fields differ")
+    if binding.get("state") not in {"pending", "consumed"}:
+        _fail("post-build start binding state is unsupported")
+    token = _post_build_token(binding.get("attempt"), "post-build start attempt")
+    if binding.get("active_relative") != "active" or binding.get("active_token") != token:
+        _fail("post-build start binding active marker differs")
+    expected_root = f"development/attempts/{token}"
+    if binding.get("receipt_relative") != expected_root + "/receipt.json":
+        _fail("post-build start binding receipt path differs")
+    expected_relative = expected_root + "/post-build-continuation.json"
+    if binding.get("continuation_relative") != expected_relative:
+        _fail("post-build start binding continuation path differs")
+    metadata = _post_build_validate_metadata(binding.get("continuation"))
+    metadata_sha = _sha256_bytes(_post_build_canonical(metadata))
+    if binding.get("continuation_sha256") != metadata_sha:
+        _fail("post-build continuation digest differs")
+    previous_sha = _post_build_digest(binding.get("previous_config_sha256"), "post-build previous config")
+    if previous_sha != metadata["runtime_config"]["sha256"]:
+        _fail("post-build previous config differs from continuation proof")
+    return dict(binding)
+
+
+def _post_build_validate_operation_lock() -> None:
+    """Require the host helper's operation lease to remain genuinely held."""
+
+    try:
+        import fcntl
+    except ImportError as error:
+        _fail(f"post-build operation lease cannot be checked: {error}")
+    descriptor = _post_build_open_fd(
+        BUILD_CONTROL_ROOT / "operation.lock", "post-build operation lock", os.O_RDWR
+    )
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        except OSError as error:
+            if getattr(error, "errno", None) == 11:
+                return
+            _fail(f"post-build operation lease cannot be checked: {error}")
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _fail("post-build operation lease is not held")
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _post_build_failed_owner_lock(paths: RuntimePaths):
+    """Hold OWNER.lock while rechecking failed-owner evidence and publishing."""
+
+    lock_path = runtime_services_root(paths) / "OWNER.lock"
+    _assert_no_links(lock_path, "post-build runtime service owner lock")
+    try:
+        import fcntl
+    except ImportError as error:
+        _fail(f"post-build runtime service owner lock cannot be checked: {error}")
+    descriptor = _post_build_open_fd(
+        lock_path, "post-build runtime service owner lock", os.O_RDWR
+    )
+    try:
+        identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        _assert_owner_lock_identity(lock_path, descriptor, identity)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _fail("post-build runtime service owner is still active")
+        except OSError as error:
+            if getattr(error, "errno", None) == 11:
+                _fail("post-build runtime service owner is still active")
+            _fail(f"post-build runtime service owner lock cannot be checked: {error}")
+        try:
+            _assert_owner_lock_identity(lock_path, descriptor, identity)
+            yield lambda: _assert_owner_lock_identity(lock_path, descriptor, identity)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _post_build_validate_process(raw: bytes, process: Mapping[str, Any], proof: Mapping[str, Any]) -> None:
+    if set(process) != set(POST_BUILD_PROCESS_KEYS):
+        _fail("post-build current process receipt is not the exact nine-key receipt")
+    if process.get("schema") != "fullmag.docker-process-tree.v1" or process.get("state") != "shutdown_unknown":
+        _fail("post-build current process receipt is not shutdown_unknown")
+    if (type(process.get("api_pid")) is not int or process["api_pid"] <= 0
+            or type(process.get("api_exit_code")) is not int
+            or process.get("api_exit_code") != 101):
+        _fail("post-build current process receipt API identity differs")
+    store = _post_build_text(process.get("accepted_store"), "post-build accepted store")
+    if (not PurePosixPath(store).is_absolute() or ".." in PurePosixPath(store).parts
+            or not isinstance(process.get("bootstrap"), dict)
+            or process.get("qualification") != "NOT VERIFIED"):
+        _fail("post-build current process receipt has invalid store/bootstrap/qualification fields")
+    if process.get("error") != POST_BUILD_PROCESS_ERROR \
+            or process.get("shutdown_error") != POST_BUILD_PROCESS_SHUTDOWN_ERROR:
+        _fail("post-build current process receipt failure text differs")
+    process_proof = proof["current_process"]
+    if (_sha256_bytes(raw) != process_proof["sha256"]
+            or _sha256_bytes(process["error"].encode()) != process_proof["error_sha256"]
+            or _sha256_bytes(process["shutdown_error"].encode()) != process_proof["shutdown_error_sha256"]):
+        _fail("post-build current process receipt changed after host proof")
+
+
+def _post_build_validate_current_evidence(
+    paths: RuntimePaths, metadata: Mapping[str, Any], accepted_preflight: Mapping[str, Any] | None
+) -> None:
+    _post_build_read_recreate(metadata)
+    expected_project = metadata["compose_project"]
+    current_project = os.environ.get("FULLMAG_COMPOSE_PROJECT")
+    if current_project is not None and current_project != expected_project:
+        _fail("post-build Compose project differs from host proof")
+    expected_source = metadata["source_root"]
+    current_source = os.environ.get("FULLMAG_SOURCE_HOST_ROOT")
+    if current_source is not None and current_source != expected_source:
+        _fail("post-build source root differs from host proof")
+    for field, environment_name in (
+        ("project_id", "FULLMAG_SOURCE_PROJECT_ID"),
+        ("worktree_id", "FULLMAG_SOURCE_WORKTREE_ID"),
+        ("checkout_kind", "FULLMAG_SOURCE_CHECKOUT_KIND"),
+    ):
+        observed = os.environ.get(environment_name)
+        if observed is not None and observed != metadata["source_identity"][field]:
+            _fail("post-build source identity differs from host proof")
+
+    owner_proof = metadata["failed_owner"]
+    owner_raw = _post_build_read_bytes(
+        runtime_services_root(paths) / "OWNER.json", "post-build current Failed OWNER.json"
+    )
+    if _sha256_bytes(owner_raw) != owner_proof["sha256"]:
+        _fail("post-build current Failed OWNER.json changed after host proof")
+    owner = _post_build_json(owner_raw, "post-build current Failed OWNER.json")
+    if owner.get("schema_version") != "runtime_service_owner.v1" or owner.get("state") != "failed":
+        _fail("post-build current owner is not the retained Failed owner")
+    if _owner_identity(owner) != owner_proof["identity"]:
+        _fail("post-build current owner identity differs from host proof")
+
+    process_raw, process = _post_build_read_json(
+        process_receipt_path(paths), "post-build current process receipt"
+    )
+    _post_build_validate_process(process_raw, process, metadata)
+
+    certificate_proof = metadata["certificate"]
+    certificate_raw = _post_build_read_bytes(paths.host_certificate, "post-build host certificate")
+    certificate = _post_build_json(certificate_raw, "post-build host certificate")
+    profile = certificate_proof["storage_profile"]
+    stable_identity = _post_build_certificate_stable_identity(certificate)
+    if (stable_identity != certificate_proof["stable_identity"]
+            or certificate.get("restart_verified") is not True):
+        _fail("post-build host certificate stable identity differs from host proof")
+    # The historical namespace belongs to the outgoing image. The existing
+    # storage gates attest the incoming certificate; bind it to this runtime.
+    runtime_image = os.environ.get("FULLMAG_RUNTIME_IMAGE_ID")
+    if (not isinstance(runtime_image, str) or POST_BUILD_IMAGE.fullmatch(runtime_image) is None
+            or runtime_image != certificate.get("image_id")):
+        _fail("post-build runtime image differs from the retained host certificate")
+    marker_name = (
+        ".fullmag-windows-folder-owner.json"
+        if profile == WINDOWS_STORAGE_PROFILE else ".fullmag-linux-native-owner.json"
+    )
+    marker_raw = _post_build_read_bytes(
+        paths.state / marker_name, "post-build host owner marker"
+    )
+    marker = _post_build_json(marker_raw, "post-build host owner marker")
+    if marker != certificate:
+        _fail("post-build host certificate and owner marker differ")
+    profile_env = os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE")
+    if profile_env is not None and profile_env != profile:
+        _fail("post-build host storage profile differs from host proof")
+
+    accepted = metadata["accepted_run"]
+    request = os.environ.get(ACCEPTED_REATTACH_REQUEST_ENV)
+    request_sha = os.environ.get(ACCEPTED_REATTACH_DIGEST_ENV)
+    if accepted == {}:
+        if accepted_preflight is not None or request is not None or request_sha is not None:
+            _fail("post-build accepted-run environment was added after host proof")
+    else:
+        if not isinstance(accepted_preflight, Mapping):
+            _fail("post-build accepted-run preflight is unavailable")
+        if (request_sha != accepted["request_sha256"]
+                or accepted_preflight.get("request_sha256") != accepted["request_sha256"]
+                or accepted_preflight.get("proof_sha256") != accepted["proof_sha256"]):
+            _fail("post-build accepted-run pins differ from host proof")
+
+
+def _post_build_consumed_path(paths: RuntimePaths, token: str) -> Path:
+    return runtime_services_root(paths) / POST_BUILD_CONSUMED_RELATIVE / token / "consumed.json"
+
+
+def _post_build_read_consumed(
+    paths: RuntimePaths, binding: Mapping[str, Any]
+) -> bool:
+    token = binding["attempt"]
+    raw = _post_build_read_optional_bytes(
+        _post_build_consumed_path(paths, token), "post-build consumed record"
+    )
+    if raw is None:
+        return False
+    record = _post_build_json(raw, "post-build consumed record", canonical=True)
+    required = {
+        "schema", "state", "attempt", "binding_sha256", "continuation_sha256",
+        "previous_config_sha256", "new_config_sha256",
+    }
+    if (set(record) != required or record.get("schema") != POST_BUILD_CONSUMED_SCHEMA
+            or record.get("state") != "consumed" or record.get("attempt") != token):
+        _fail("post-build consumed record schema or fields differ")
+    binding_path = _post_build_control_path(
+        os.environ[POST_BUILD_START_ENV], "post-build continuation path"
+    )
+    binding_raw = _post_build_read_bytes(binding_path, "post-build continuation binding")
+    _post_build_digest(record.get("new_config_sha256"), "post-build consumed configuration")
+    if (record.get("binding_sha256") != _sha256_bytes(binding_raw)
+            or record.get("continuation_sha256") != binding["continuation_sha256"]
+            or record.get("previous_config_sha256") != binding["previous_config_sha256"]
+            or not HEX64.fullmatch(record.get("new_config_sha256", ""))):
+        _fail("post-build consumed record pin differs")
+    return True
+
+
+def _post_build_publish_consumed(
+    paths: RuntimePaths, binding: Mapping[str, Any], new_config_sha256: str
+) -> None:
+    binding_path = _post_build_control_path(
+        os.environ[POST_BUILD_START_ENV], "post-build continuation path"
+    )
+    binding_raw = _post_build_read_bytes(binding_path, "post-build continuation binding")
+    record = {
+        "schema": POST_BUILD_CONSUMED_SCHEMA,
+        "state": "consumed",
+        "attempt": binding["attempt"],
+        "binding_sha256": _sha256_bytes(binding_raw),
+        "continuation_sha256": binding["continuation_sha256"],
+        "previous_config_sha256": binding["previous_config_sha256"],
+        "new_config_sha256": _post_build_digest(new_config_sha256, "post-build new config"),
+    }
+    _publish_accepted_reattach_record(
+        _post_build_consumed_path(paths, binding["attempt"]), record,
+        "post-build consumed record",
+    )
+    current_raw = _post_build_read_bytes(paths.config, "runtime configuration after consumed publication")
+    if _sha256_bytes(current_raw) != new_config_sha256:
+        _fail("post-build consumed record does not match the published configuration")
+    if not _post_build_read_consumed(paths, binding):
+        _fail("post-build consumed record publication could not be verified")
+
+
+def _post_build_binding_state(
+    paths: RuntimePaths,
+    current_raw: bytes,
+    *,
+    accepted_preflight: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    configured_path = os.environ.get(POST_BUILD_START_ENV)
+    configured_sha = os.environ.get(POST_BUILD_START_SHA_ENV)
+    if configured_path is None and configured_sha is None:
+        return None
+    if not configured_path or not configured_sha:
+        _fail("post-build continuation requires both private controls")
+    _post_build_digest(configured_sha, "post-build continuation binding digest")
+    binding_path = _post_build_control_path(configured_path, "post-build continuation path")
+    binding_raw, binding = _post_build_read_json(
+        binding_path, "post-build continuation binding", canonical=True
+    )
+    if _sha256_bytes(binding_raw) != configured_sha:
+        _fail("post-build continuation binding digest differs")
+    binding = _post_build_validate_binding_document(binding)
+    expected_path = BUILD_CONTROL_ROOT / binding["continuation_relative"]
+    if binding_path != expected_path:
+        _fail("post-build continuation binding path differs")
+    receipt_path = _post_build_control_path(
+        str(BUILD_CONTROL_ROOT / binding["receipt_relative"]),
+        "post-build operation receipt",
+    )
+    _, receipt = _post_build_read_json(
+        receipt_path, "post-build development operation receipt", canonical=True
+    )
+    metadata = binding["continuation"]
+    if (receipt.get("schema") != "fullmag.docker-build-operation.v1"
+            or receipt.get("phase") != "development"
+            or receipt.get("attempt") != binding["attempt"]
+            or receipt.get("compose_project") != metadata["compose_project"]):
+        _fail("post-build operation receipt identity differs")
+    inputs = receipt.get("inputs")
+    if (not isinstance(inputs, dict) or inputs.get("source_root") != metadata["source_root"]
+            or inputs.get("source_project_id") != metadata["source_identity"]["project_id"]
+            or inputs.get("source_worktree_id") != metadata["source_identity"]["worktree_id"]
+            or inputs.get("source_checkout_kind") != metadata["source_identity"]["checkout_kind"]
+            or inputs.get("image_id") != os.environ.get("FULLMAG_RUNTIME_IMAGE_ID")
+            or receipt.get("post_build_generation") != metadata
+            or inputs.get("post_build_generation") != metadata):
+        _fail("post-build operation receipt source or continuation differs")
+    reference = receipt.get("post_build_start")
+    reference_fields = {"schema", "state", "path", "sha256", "continuation_sha256"}
+    if (not isinstance(reference, dict) or set(reference) != reference_fields
+            or reference.get("schema") != POST_BUILD_START_SCHEMA
+            or reference.get("path") != configured_path
+            or reference.get("sha256") != configured_sha
+            or reference.get("continuation_sha256") != binding["continuation_sha256"]):
+        _fail("post-build operation receipt binding reference differs")
+    if reference.get("state") not in {"pending", "consumed"}:
+        _fail("post-build operation receipt binding state is unsupported")
+    if reference["state"] == "consumed" and binding["state"] != "pending":
+        _fail("post-build consumed reference has an unexpected binding state")
+    if reference["state"] == "pending" and binding["state"] == "consumed":
+        _fail("post-build pending reference has a consumed binding")
+
+    if _post_build_read_consumed(paths, binding):
+        return {"state": "consumed", "binding": binding}
+    if reference["state"] == "consumed":
+        _fail("post-build operation marked consumed without an immutable consumed record")
+
+    active_path = _post_build_control_path(
+        str(BUILD_CONTROL_ROOT / binding["active_relative"]), "post-build active marker path"
+    )
+    active_raw = _post_build_read_optional_bytes(active_path, "post-build active marker", 128)
+    if active_raw != (binding["active_token"] + "\n").encode("ascii"):
+        _fail("post-build active marker differs from the bound attempt")
+    terminal_path = receipt_path.with_name("terminal.json")
+    if _post_build_read_optional_bytes(terminal_path, "post-build operation terminal") is not None:
+        _fail("post-build operation already has a terminal record")
+    if receipt.get("state") not in POST_BUILD_LIVE_OPERATION_STATES:
+        _fail("post-build operation is not live")
+    _post_build_validate_operation_lock()
+    return {
+        "state": "pending",
+        "binding": binding,
+        "previous_config_sha256": binding["previous_config_sha256"],
+    }
+
+def ensure_configuration(
+    paths: RuntimePaths | None = None,
+    *,
+    accepted_preflight: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     paths = paths or canonical_paths()
     host_mode = os.environ.get("FULLMAG_DOCKER_HOST_EXECUTION", "1")
     if host_mode != "1":
@@ -2005,34 +3277,100 @@ def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
         host_mode != "1" or not HEX64.fullmatch(previous_sha256)
     ):
         _fail("FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256 requires native host mode and a lowercase SHA-256")
-    expected = initialize_host_configuration(paths, device_access)
+    capacity_authority: dict[str, Any] = {}
+    expected = initialize_host_configuration(paths, device_access, capacity_authority)
     try:
-        current = _read_json(paths.config, "runtime service configuration")
+        current_raw = _bounded_regular(paths.config, "runtime service configuration")
+        current = _post_build_json(current_raw, "runtime service configuration")
     except FileNotFoundError:
-        if previous_sha256 is not None:
+        if previous_sha256 is not None or (
+            os.environ.get(POST_BUILD_START_ENV) is not None
+            or os.environ.get(POST_BUILD_START_SHA_ENV) is not None
+        ):
             _fail("authorized recreate runtime configuration is missing")
         _atomic_json(paths.config, expected, "runtime service configuration")
         return expected
+
+    post_build = _post_build_binding_state(
+        paths, current_raw, accepted_preflight=accepted_preflight
+    )
+    if post_build is not None and post_build["state"] == "consumed":
+        # A consumed record is a permanent fence for the old host pin, but it
+        # does not pin the current generation forever.  Continue through the
+        # ordinary authenticated-drain path if the expected generation changed.
+        previous_sha256 = None
+    elif post_build is not None:
+        bound_previous = post_build["previous_config_sha256"]
+        if previous_sha256 != bound_previous:
+            _fail("post-build continuation does not match the previous config pin")
+        expected_raw = (
+            json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        expected_sha256 = _sha256_bytes(expected_raw)
+        current_sha256 = _sha256_bytes(current_raw)
+        if current_sha256 not in {bound_previous, expected_sha256}:
+            _fail("post-build runtime configuration differs from both pinned generations")
+        with _post_build_failed_owner_lock(paths) as assert_owner_lock:
+            # Re-read the immutable acknowledgement and all mutable evidence
+            # under OWNER.lock.  The initial scan may have raced publication.
+            if _post_build_read_consumed(paths, post_build["binding"]):
+                previous_sha256 = None
+            else:
+                _post_build_validate_current_evidence(
+                    paths, post_build["binding"]["continuation"], accepted_preflight
+                )
+                assert_owner_lock()
+                current_raw = _post_build_read_bytes(
+                    paths.config, "runtime service configuration under owner lock"
+                )
+                current = _post_build_json(
+                    current_raw, "runtime service configuration under owner lock"
+                )
+                current_sha256 = _sha256_bytes(current_raw)
+                if current_sha256 not in {bound_previous, expected_sha256}:
+                    _fail("post-build runtime configuration changed under owner lock")
+                # Recheck the exact operation while holding OWNER.lock, after
+                # all evidence reads and immediately before publication.
+                refreshed = _post_build_binding_state(
+                    paths, current_raw, accepted_preflight=accepted_preflight
+                )
+                if refreshed != post_build:
+                    _fail("post-build operation changed before configuration publication")
+                if current_sha256 == expected_sha256:
+                    assert_owner_lock()
+                    _post_build_publish_consumed(
+                        paths, post_build["binding"], expected_sha256
+                    )
+                    return expected
+                _rotate_configuration_generation(
+                    paths, current, expected, bound_previous, capacity_authority=capacity_authority,
+                )
+                published_raw = _post_build_read_bytes(
+                    paths.config, "runtime configuration after post-build rotation"
+                )
+                if _sha256_bytes(published_raw) != expected_sha256:
+                    _fail("post-build runtime configuration publication differs")
+                assert_owner_lock()
+                _post_build_publish_consumed(
+                    paths, post_build["binding"], expected_sha256
+                )
+                return expected
+
     if current != expected:
         if previous_sha256 is None:
             # A normal Docker restart has no host-side config digest.  Derive
             # it from the exact current bytes only after the previous native
-            # owner has published an authenticated, successful drain.  The
-            # lock and all owner/pin/receipt checks remain inside this fence.
+            # owner has published an authenticated, successful drain.
             with _authenticated_terminal_drain(paths) as assert_owner_lock:
                 previous_sha256 = hashlib.sha256(
                     _bounded_regular(paths.config, "runtime configuration before automatic rotation")
                 ).hexdigest()
                 assert_owner_lock()
-                _rotate_configuration_generation(paths, current, expected, previous_sha256)
+                _rotate_configuration_generation(paths, current, expected, previous_sha256,
+                                                 capacity_authority=capacity_authority)
         else:
-            # A direct recreate pin is one-shot.  After its first successful
-            # rotation, the same Compose environment can survive a later
-            # restart while still carrying the old digest.  Do not treat a
-            # stale pin as authorization for the new current bytes: require
-            # the same authenticated terminal drain used by an ordinary
-            # restart, then derive the exact digest while holding its owner
-            # lock.  Failed/unknown owners cannot satisfy that fence.
+            # A direct recreate pin is one-shot.  A stale pin can authorize a
+            # second generation only after the normal authenticated drain.
             current_raw = _bounded_regular(
                 paths.config, "runtime configuration before stale-pin check"
             )
@@ -2045,9 +3383,11 @@ def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
                         )
                     ).hexdigest()
                     assert_owner_lock()
-                    _rotate_configuration_generation(paths, current, expected, previous_sha256)
+                    _rotate_configuration_generation(paths, current, expected, previous_sha256,
+                                                 capacity_authority=capacity_authority)
             else:
-                _rotate_configuration_generation(paths, current, expected, previous_sha256)
+                _rotate_configuration_generation(paths, current, expected, previous_sha256,
+                                                 capacity_authority=capacity_authority)
         return expected
     return current
 
@@ -3511,7 +4851,8 @@ def _source_identity(paths: RuntimePaths) -> tuple[str, str]:
 
 
 def _probe_api_identity(
-    paths: RuntimePaths, port: int, expected_binding: str, *, timeout: float = 5.0
+    paths: RuntimePaths, port: int, expected_binding: str, *, timeout: float = 5.0,
+    deadline: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate one complete API identity and return it with the profile document."""
 
@@ -3519,9 +4860,18 @@ def _probe_api_identity(
         _fail("API probe timeout must be positive")
     if not HEX64.fullmatch(expected_binding):
         _fail("API accepted-store binding must be a lowercase SHA-256")
+
+    def request_timeout() -> float:
+        if deadline is None:
+            return timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeServiceTransportError("API identity probe deadline expired")
+        return min(timeout, remaining)
+
     commit, snapshot = _source_identity(paths)
     status, headers, document = _http_json(
-        port, "/v2/platform/openapi.json", timeout=timeout
+        port, "/v2/platform/openapi.json", timeout=request_timeout()
     )
     contract_version = _single_header(headers, "x-api-contract-version")
     if status != 200 or contract_version != "1.0.0":
@@ -3549,7 +4899,7 @@ def _probe_api_identity(
     ):
         _fail("API accepted-store binding differs from /state")
     profile_status, _, profile = _http_json(
-        port, "/v2/platform/compute/profiles?limit=100", timeout=timeout
+        port, "/v2/platform/compute/profiles?limit=100", timeout=request_timeout()
     )
     if profile_status != 200:
         _fail("API compute profile route is unavailable")
@@ -3677,23 +5027,47 @@ def _wait_for_api_liveness(
 
 
 def wait_for_api(
-    paths: RuntimePaths, port: int, expected_binding: str, timeout: float = 60.0
+    paths: RuntimePaths, port: int, expected_binding: str,
+    timeout: float = API_BINDING_STARTUP_TIMEOUT_SECONDS,
+    *,
+    api_process_poll: Callable[[], int | None] | None = None,
 ) -> Mapping[str, Any]:
     """Pin API source, instance, accepted store, and the v2 profile route."""
 
-    if timeout <= 0:
-        _fail("API startup timeout must be positive")
-    deadline = time.monotonic() + timeout
+    if (type(timeout) not in (int, float)
+            or not 0 < timeout <= ACCEPTED_REATTACH_API_STARTUP_TIMEOUT_SECONDS):
+        _fail("API startup timeout must be positive and at most 300 seconds")
+    started = time.monotonic()
+    deadline = started + timeout
+    next_progress = started + 10.0
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
             identity, profile = _probe_api_identity(
-                paths, port, expected_binding, timeout=5.0
+                paths, port, expected_binding,
+                timeout=min(5.0, max(0.001, deadline - time.monotonic())),
+                deadline=deadline,
             )
+            if time.monotonic() >= deadline:
+                raise RuntimeServiceTransportError(
+                    "API identity validation exceeded startup deadline"
+                )
             return {**identity, "profiles": profile}
         except (RuntimeServiceError, OSError) as error:
             last_error = error
-        time.sleep(0.2)
+            if api_process_poll is not None and api_process_poll() is not None:
+                raise RuntimeServiceUnknown(
+                    f"API binding did not become ready: {last_error}"
+                ) from error
+        now = time.monotonic()
+        if now >= next_progress:
+            print(
+                "[fullmag-backend] Waiting for API binding: "
+                f"elapsed_seconds={now - started:.0f} budget_seconds={timeout:.0f}",
+                flush=True,
+            )
+            next_progress = now + 10.0
+        time.sleep(min(0.2, max(0.0, deadline - now)))
     raise RuntimeServiceUnknown(f"API binding did not become ready: {last_error}")
 
 
@@ -3745,7 +5119,13 @@ def _owner_child_identity(owner: Mapping[str, Any]) -> list[tuple[Any, Any]]:
     return sorted(identity, key=lambda item: (str(item[0]), str(item[1])))
 
 
-def _terminal_owner_children(owner: Mapping[str, Any], *, state: str, name: str) -> None:
+def _terminal_owner_children(
+    owner: Mapping[str, Any],
+    *,
+    state: str,
+    name: str,
+    allowed_child_statuses: Sequence[str] | None = None,
+) -> None:
     """Require the two native scheduler children for one terminal proof."""
 
     children = owner.get("children")
@@ -3766,12 +5146,23 @@ def _terminal_owner_children(owner: Mapping[str, Any], *, state: str, name: str)
         pids.add(pid)
     if set(by_role) != {"compute", "preparation"}:
         _fail(f"{name} has an unexpected scheduler child set")
-    expected_status = "running" if state == "ready" else "exited_success"
-    if any(child.get("status") != expected_status for child in by_role.values()):
-        _fail(f"{name} child status is not {expected_status}")
+    if allowed_child_statuses is None:
+        expected_status = "running" if state == "ready" else "exited_success"
+        if any(child.get("status") != expected_status for child in by_role.values()):
+            _fail(f"{name} child status is not {expected_status}")
+    else:
+        expected_statuses = tuple(allowed_child_statuses)
+        if any(child.get("status") not in expected_statuses for child in by_role.values()):
+            _fail(f"{name} child status is not one of {expected_statuses!r}")
 
 
-def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str) -> None:
+def _validate_terminal_owner(
+    owner: Mapping[str, Any],
+    *,
+    state: str,
+    name: str,
+    allowed_child_statuses: Sequence[str] | None = None,
+) -> None:
     if owner.get("schema_version") != "runtime_service_owner.v1":
         _fail(f"{name} schema is unsupported")
     if owner.get("state") != state:
@@ -3805,7 +5196,12 @@ def _validate_terminal_owner(owner: Mapping[str, Any], *, state: str, name: str)
         _fail(f"{name} has invalid scheduler pool identity")
     if not isinstance(owner.get("control_address"), str) or not owner["control_address"]:
         _fail(f"{name} has no control address")
-    _terminal_owner_children(owner, state=state, name=name)
+    _terminal_owner_children(
+        owner,
+        state=state,
+        name=name,
+        allowed_child_statuses=allowed_child_statuses,
+    )
     _owner_fingerprint(owner)
 
 
@@ -4060,6 +5456,8 @@ def start(
     api_port: int | None = None,
     cli: Path | None = None,
     timeout: float = 90.0,
+    api_startup_timeout: float | None = None,
+    api_process_poll: Callable[[], int | None] | None = None,
     expected_binding: str,
     configuration: Mapping[str, Any] | None = None,
 ) -> RuntimeHandle:
@@ -4077,7 +5475,12 @@ def start(
     port = api_port or int(os.environ.get("FULLMAG_API_PORT", "8081"))
     if not 1 <= port <= 65535:
         _fail("API port is outside the valid range")
-    api_probe = wait_for_api(paths, port, expected_binding, timeout=min(timeout, 60.0))
+    api_probe = wait_for_api(
+        paths, port, expected_binding,
+        timeout=(min(timeout, API_BINDING_STARTUP_TIMEOUT_SECONDS)
+                 if api_startup_timeout is None else api_startup_timeout),
+        api_process_poll=api_process_poll,
+    )
     api_identity = {
         key: api_probe[key]
         for key in (

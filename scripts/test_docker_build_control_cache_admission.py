@@ -351,7 +351,8 @@ class BuildSpaceAdmissionTests(unittest.TestCase):
 
     def test_bounded_budget_does_not_start_zero_space_lease(self):
         identity = {"project_name": "fullmag-cache-test", "worktree_id": "test"}
-        instance = control.BuildControl(identity, HELPER)
+        with mock.patch("docker_control_namespace.resolve_namespace", return_value=None):
+            instance = control.BuildControl(identity, HELPER)
         with mock.patch.object(instance, "space", return_value=LOW_CONTROL_SPACE), \
              mock.patch.object(instance, "helper_args", return_value=["helper"]), \
              mock.patch.object(control.subprocess, "Popen") as popen:
@@ -361,9 +362,20 @@ class BuildSpaceAdmissionTests(unittest.TestCase):
                     self.fail("bounded cache admission must fail before lease")
         popen.assert_not_called()
 
+    def test_docker_text_decodes_bounded_capture_and_optional_stderr(self):
+        observed = subprocess.CompletedProcess([], 0, b"out", b"err")
+        with mock.patch.object(control, "docker_capture", return_value=observed) as capture:
+            self.assertEqual(control.docker_text("version"), "out")
+            self.assertEqual(control.docker_text("version", combined=True), "outerr")
+        self.assertEqual(capture.call_args_list, [
+            mock.call("version", timeout=90),
+            mock.call("version", timeout=90),
+        ])
+
     def test_windows_pre_pull_guard_uses_physical_backing_measurement(self):
         identity = {"project_name": "fullmag-cache-test", "worktree_id": "test"}
-        instance = control.BuildControl(identity, HELPER)
+        with mock.patch("docker_control_namespace.resolve_namespace", return_value=None):
+            instance = control.BuildControl(identity, HELPER)
         with mock.patch.object(instance, "_windows_backing_volume", return_value={
                 "available_bytes": control.MIN_FREE_BUILD_BYTES - 1}):
             with self.assertRaisesRegex(control.BuildControlError, "32 GiB"):
@@ -371,7 +383,8 @@ class BuildSpaceAdmissionTests(unittest.TestCase):
 
     def test_development_keeps_full_32_gib_guard_and_rejects_cache_budget(self):
         identity = {"project_name": "fullmag-cache-test", "worktree_id": "test"}
-        instance = control.BuildControl(identity, HELPER)
+        with mock.patch("docker_control_namespace.resolve_namespace", return_value=None):
+            instance = control.BuildControl(identity, HELPER)
         with mock.patch.object(instance, "space", return_value=LOW_CONTROL_SPACE), \
              mock.patch.object(instance, "helper_args", return_value=["helper"]), \
              mock.patch.object(control.subprocess, "Popen") as popen:

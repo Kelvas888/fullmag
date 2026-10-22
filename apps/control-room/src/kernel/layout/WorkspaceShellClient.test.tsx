@@ -37,6 +37,19 @@ import { StartScreen } from "@/modules/start/StartScreen";
 
 const LAUNCH_TILE_NAMES = ["FDM simulation", "FEM simulation", "From template", "Import"];
 
+const UNMATERIALIZED_DOMAIN = {
+  cell_count: 0,
+  discretization: "fem",
+  generation_id: "fem:unmaterialized",
+} as const;
+
+const ACTIVE_IDLE_LIFECYCLE = {
+  commandability: "allowed",
+  connectivity: "connected",
+  session_resource: "active",
+  solver: "idle",
+} as const;
+
 // This custom DOM checks shell lifetime; browser layout and gestures need a browser.
 vi.mock("@/shared/ui/Resizable", () => {
   const Container = ({ children, className, id, inert }: {
@@ -200,6 +213,8 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     }) as LiveStatusResource);
     const list = vi.fn(async () => ({
@@ -275,6 +290,8 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
     const currentStatus = vi.fn(async () => liveStatus)
@@ -382,6 +399,8 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
     const list = vi.fn(async () => sessionList);
@@ -498,6 +517,8 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "workspace-shell-session@1700000000000",
         session_id: "workspace-shell-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
     const list = vi.fn(async () => sessionList);
@@ -565,6 +586,8 @@ describe("WorkspaceShellClient Home entry surface", () => {
         session_epoch: "other-session@1700000000000",
         session_id: "other-session",
       },
+      domain: UNMATERIALIZED_DOMAIN,
+      lifecycle: ACTIVE_IDLE_LIFECYCLE,
       solver: { state: "bootstrapping" },
     } as LiveStatusResource;
     const statusForListedSession = {

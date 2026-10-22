@@ -52,6 +52,10 @@ def run(*args: str) -> str:
 def main():
     if os.getuid() != 0:
         fail("cgroup maintenance requires uid 0")
+    # Cross-container migration is rejected with ENOENT from a private cgroup
+    # namespace, even when the destination file is visible through /proc/1/root.
+    if os.readlink("/proc/self/ns/cgroup") != os.readlink("/proc/1/ns/cgroup"):
+        fail("cgroup maintenance requires the host cgroup namespace")
     project = os.environ["FULLMAG_CGROUP_PROJECT"]
     container = os.environ["FULLMAG_CGROUP_CONTAINER_ID"]
     image = os.environ["FULLMAG_CGROUP_IMAGE_ID"]

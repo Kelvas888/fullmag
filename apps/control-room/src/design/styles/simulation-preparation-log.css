@@ -1,0 +1,184 @@
+.fm-simulation-preparation-log {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--fm-border-subtle);
+  border-radius: var(--fm-radius-md);
+  background: var(--fm-bg-panel);
+  color: var(--fm-text-primary);
+}
+
+.fm-simulation-preparation-log__header {
+  display: flex;
+  min-width: 0;
+  min-height: var(--fm-panel-header-height);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--fm-space-2);
+  border-bottom: 1px solid var(--fm-border-subtle);
+  padding: var(--fm-space-2) var(--fm-space-3);
+}
+
+.fm-simulation-preparation-log__header h3 {
+  min-width: 0;
+  margin: 0;
+  color: var(--fm-text-secondary);
+  font-size: var(--fm-font-size-xs);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  line-height: 1.25;
+  text-transform: uppercase;
+}
+
+.fm-simulation-preparation-log__follow-state {
+  flex: 0 0 auto;
+  color: var(--fm-success);
+  font-size: var(--fm-font-size-2xs);
+  font-weight: 600;
+}
+
+.fm-simulation-preparation-log__tail-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.fm-simulation-preparation-log__controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(112px, 0.55fr) minmax(0, 1.5fr);
+  align-items: end;
+  gap: var(--fm-space-2);
+  border-bottom: 1px solid var(--fm-border-subtle);
+  padding: var(--fm-space-2) var(--fm-space-3);
+}
+
+.fm-simulation-preparation-log__field {
+  display: grid;
+  min-width: 0;
+  gap: var(--fm-space-1);
+  color: var(--fm-text-secondary);
+  font-size: var(--fm-font-size-2xs);
+}
+
+.fm-simulation-preparation-log__search,
+.fm-simulation-preparation-log__level-trigger {
+  min-width: 0;
+  width: 100%;
+}
+
+.fm-simulation-preparation-log__actions {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--fm-space-1);
+}
+
+.fm-simulation-preparation-log__count,
+.fm-simulation-preparation-log__action-message {
+  grid-column: 1 / -1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--fm-text-muted);
+  font-size: var(--fm-font-size-2xs);
+  line-height: 1.35;
+}
+
+.fm-simulation-preparation-log__action-message {
+  color: var(--fm-text-secondary);
+}
+
+.fm-simulation-preparation-log__scroll {
+  min-width: 0;
+  min-height: 0;
+}
+
+.fm-simulation-preparation-log__entries {
+  display: grid;
+  align-content: start;
+  padding: var(--fm-space-2) var(--fm-space-3);
+  font-family: var(--fm-font-mono);
+  font-size: var(--fm-font-size-sm);
+  line-height: 1.45;
+}
+
+.fm-simulation-preparation-log__entry {
+  display: grid;
+  min-width: 0;
+  gap: var(--fm-space-1);
+  border-bottom: 1px solid color-mix(in srgb, var(--fm-border-subtle) 62%, transparent);
+  padding: var(--fm-space-2) 0;
+}
+
+.fm-simulation-preparation-log__metadata {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--fm-space-1) var(--fm-space-3);
+  color: var(--fm-text-muted);
+  font-size: var(--fm-font-size-2xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.fm-simulation-preparation-log__level {
+  color: var(--fm-text-secondary);
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.fm-simulation-preparation-log__entry[data-level="warning"] .fm-simulation-preparation-log__level {
+  color: var(--fm-warning);
+}
+
+.fm-simulation-preparation-log__entry[data-level="error"] .fm-simulation-preparation-log__level {
+  color: var(--fm-danger);
+}
+
+.fm-simulation-preparation-log__stage {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--fm-text-secondary);
+}
+
+.fm-simulation-preparation-log__message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--fm-text-primary);
+  white-space: pre-wrap;
+}
+
+.fm-simulation-preparation-log__empty {
+  margin: 0;
+  padding: var(--fm-space-3) 0;
+  color: var(--fm-text-muted);
+  font-family: var(--fm-font-ui);
+  font-size: var(--fm-font-size-sm);
+}
+
+@container (max-width: 900px) {
+  .fm-simulation-preparation-log__controls {
+    grid-template-columns: minmax(0, 1fr) minmax(110px, 0.55fr);
+  }
+
+  .fm-simulation-preparation-log__actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+}
+
+@container (max-width: 480px) {
+  .fm-simulation-preparation-log__controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fm-simulation-preparation-log__actions {
+    grid-column: auto;
+  }
+
+  .fm-simulation-preparation-log__tail-button {
+    white-space: normal;
+  }
+}

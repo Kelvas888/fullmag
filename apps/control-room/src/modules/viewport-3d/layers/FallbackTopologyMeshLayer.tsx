@@ -285,6 +285,7 @@ export function FallbackTopologyMeshLayer({
       createScalarSurfaceShaderMaterial(visibleShaderScalarColors, {
         ...surfacePolicy,
         opacity: surfaceOpacity,
+        shadeStrength: 0,
         toneMapped: materialProfile.magneticSurface.toneMapped,
       }),
     );

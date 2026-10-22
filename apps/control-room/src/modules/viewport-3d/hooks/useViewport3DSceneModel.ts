@@ -46,7 +46,10 @@ import { useCrossSectionResource } from "@/kernel/resources/crossSectionResource
 import { useModeCompositionFieldLayerResources } from "@/kernel/resources/modeCompositionFieldLayerResources";
 import { useModeCompositionControllerResource } from "@/kernel/resources/modeCompositionResources";
 import { useModeFieldOverlayIntentResource } from "@/kernel/resources/modeFieldOverlayResources";
-import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
+import {
+  resolveSessionDiscretization,
+  resolveSessionTopologyDiscretization,
+} from "@/kernel/resources/sessionDiscretization";
 import {
   useFdmRegionMembershipBinaryResource,
   useFdmMultilayerLayerActiveMasksResource,
@@ -314,6 +317,7 @@ import {
   type Viewport3DBounds,
   viewport3DFieldRenderOptionsNeedFieldData,
 } from "../viewport3dRenderModel";
+import { resolveViewport3DCameraFovDegrees } from "../viewport3dCameraFov";
 import { useMaterializedDatasetResource } from "@/kernel/resources/solutionSetResources";
 import { useSavedFieldViewportResources } from "@/kernel/resources/savedFieldViewportResources";
 import { buildSavedFieldViewportSceneModel } from "../savedFieldViewportAdapter";
@@ -2934,6 +2938,7 @@ export function resolveViewport3DSceneCameraView({
 }): {
   cameraOrthographicScale: number | null;
   cameraProjection: Viewport3DCameraProjection;
+  cameraFov: number;
   cameraResource: VisualizationStateResource["camera"];
   cameraState: Viewport3DCameraState;
 } {
@@ -2944,6 +2949,9 @@ export function resolveViewport3DSceneCameraView({
     cameraProjection: resolveViewport3DCameraProjection({
       camera: cameraRegistryCamera,
     }),
+    cameraFov: resolveViewport3DCameraFovDegrees(
+      cameraRegistryCamera?.fov_degrees,
+    ),
     cameraResource: cameraRegistryCamera,
     cameraState: resolveViewport3DCameraState({ camera: cameraRegistryCamera }),
   };
@@ -3061,8 +3069,14 @@ export function useViewport3DSceneModel({
   const sessionDiscretization = useSessionStatusSelector((status) =>
     resolveSessionDiscretization(status.data),
   );
-  const fdmLaneActive = sessionDiscretization === "fdm";
-  const femLaneActive = sessionDiscretization === "fem";
+  // Published topology may select a binary preview adapter while runtime lane
+  // resolution is pending. Solver-facing state continues to use the strict
+  // sessionDiscretization value above.
+  const viewportDataDiscretization = useSessionStatusSelector((status) =>
+    resolveSessionTopologyDiscretization(status.data),
+  );
+  const fdmLaneActive = viewportDataDiscretization === "fdm";
+  const femLaneActive = viewportDataDiscretization === "fem";
   const sessionIdentity = useSessionResourceIdentity();
   const pinnedObservationSource = useObservationSourceWorkspaceSelector(
     (state) => state.pinned,
@@ -3466,7 +3480,7 @@ export function useViewport3DSceneModel({
     sharedDomainManifest.refetch();
   }, [femLaneActive, scene.data, sharedDomainManifest]);
   const domainRenderLane = resolveViewport3DDomainRenderLane({
-    discretization: sessionDiscretization,
+    discretization: viewportDataDiscretization,
     femDomain,
     topologyFreshness,
   });
@@ -4084,7 +4098,7 @@ export function useViewport3DSceneModel({
   const nativeLayerFieldVectors = useViewport3DQuantityFieldVectors(
     nativeLayerFieldRequests,
     liveViewportResourcesEnabled &&
-      Boolean(fdmLaneActive && nativeLayerFieldRequests.size > 0),
+      sessionDiscretization === "fdm" && nativeLayerFieldRequests.size > 0,
     { selectedTargetId: selectedVisualizationTargetId },
   );
   const fdmTargetSettingsById = useMemo(() => {
@@ -4434,14 +4448,15 @@ export function useViewport3DSceneModel({
     fdmMultilayerAirboxFieldRequest,
     liveViewportResourcesEnabled &&
       Boolean(
-        fdmLaneActive &&
+        sessionDiscretization === "fdm" &&
         fdmMultilayerAirboxDomain &&
         shouldRequestFdmMultilayerAirboxField(airboxSettings, airboxSettings.activeQuantityId),
       ),
   );
   const magneticPartFieldVectors = useViewport3DPartFieldVectors(
     magneticPartFieldQueries,
-    liveViewportResourcesEnabled && magneticPartFieldQueries.size > 0,
+    liveViewportResourcesEnabled &&
+      sessionDiscretization === "fem" && magneticPartFieldQueries.size > 0,
     { selectedTargetId: selectedVisualizationTargetId, tracker },
   );
   const targetQuantityFieldVectors = useViewport3DQuantityFieldVectors(
@@ -4453,6 +4468,7 @@ export function useViewport3DSceneModel({
     airboxSettings.activeQuantityId,
     airboxFieldVectorParts,
     liveViewportResourcesEnabled &&
+      sessionDiscretization === "fem" &&
       airboxFieldVectorEnabled &&
       airboxFieldVectorParts.length > 0,
     airboxFieldVectorRequests,
@@ -4830,6 +4846,7 @@ export function useViewport3DSceneModel({
   );
   const fieldVectorEnabled =
     liveViewportResourcesEnabled &&
+    (sessionDiscretization !== null || Boolean(analysisOverlay) || pinnedObservationActive) &&
     primaryFieldVectorEnabled &&
     hysteresisReplayMeshCompatibility.status !== "mismatch";
   const scalarRangeModeFlags = useMemo(
@@ -7190,6 +7207,9 @@ export function useViewport3DSceneModel({
     bounds,
     cameraOrthographicScale: effectiveCameraOrthographicScale,
     cameraProjection: effectiveCameraProjection,
+    cameraFov: resolveViewport3DCameraFovDegrees(
+      cameraResource?.fov_degrees,
+    ),
     cameraResource,
     cameraState: effectiveCameraState,
     clip: renderingState?.clip ?? null,

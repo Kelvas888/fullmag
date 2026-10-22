@@ -1,5 +1,8 @@
 # Checkpoint P5 — bezpieczny runtime i live steering
 
+> **Dziennik historycznych przyrostów.** Statusy, wyniki i polecenia poniżej dotyczą źródeł oraz warunków wskazanych w poszczególnych checkpointach. Bieżący obraz mastera z 20.10.2026: [tabela implementacji i testów](../06-status-realizacji.md), [plan dalszych prac](../03-plan-refaktoryzacji.md). Dawny PASS nie jest automatycznie kwalifikacją nowego HEAD; aktualne zasady wykonania określa AGENTS.md.
+
+
 Status: **P5 IN PROGRESS**.
 
 P5 obejmuje fencing i recovery workerów, sterowanie na granicach

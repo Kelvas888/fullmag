@@ -36,6 +36,14 @@ import { RIBBON_COMMANDS } from "@/modules/ribbon/ribbonCommands";
 
 import { Viewport3DObjectMoveResourceSurface } from "./Viewport3DObjectMoveInteraction";
 
+vi.mock("./hooks/useViewport3DColors", () => ({
+  useViewport3DColors: () => ({
+    clientReady: true,
+    colors: { accent: "#89b4fa", danger: "#f38ba8", success: "#a6e3a1" },
+    colorsUnavailable: false,
+  }),
+}));
+
 const SESSION_A_SCOPE_KEY =
   "session=session-a&epoch=session-a%401&request_scope_epoch=test-api%3Asession-a";
 const SESSION_A_SCENE_KEY = sessionScopedResourceKey(

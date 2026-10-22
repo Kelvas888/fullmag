@@ -16,7 +16,6 @@ def docker_text(*args, timeout=90, combined=False):
     result = docker_capture(*args, timeout=timeout)
     return (result.stdout + (result.stderr if combined else b"")).decode("utf-8", "replace")
 
-
 _REQUEST = """import json,os,pathlib,stat
 p=pathlib.Path('/opt/fullmag/runtime-control/worker-cgroup/request.json')
 try:
@@ -126,7 +125,7 @@ def ensure_delegation(control, operation, document, backend_id, image, selected,
     helper_name = "fullmag-cgroup-" + operation["receipt"]["attempt"]
     service = {
         "image": image, "pull_policy": "never", "user": "0:0",
-        "privileged": True, "pid": "host", "read_only": True,
+        "privileged": True, "pid": "host", "cgroup": "host", "read_only": True,
         "network_mode": "none", "restart": "no",
         "entrypoint": ["/usr/local/bin/python3", "-I", "-B", "/fullmag-build-control/" + helper_relative],
         "environment": {
@@ -138,9 +137,9 @@ def ensure_delegation(control, operation, document, backend_id, image, selected,
         },
         "volumes": [
             {"type": "volume", "source": "build-control", "target": "/fullmag-build-control", "read_only": True,
-             "volume": {"nocopy": True}},
+             "volume": {"nocopy": True, **({"subpath": control.subpath()} if control.namespace else {})}},
             {"type": "volume", "source": "build-control", "target": "/control",
-             "volume": {"nocopy": True, "subpath": "runtime-control/worker-cgroup"}},
+             "volume": {"nocopy": True, "subpath": control.subpath("runtime-control/worker-cgroup")}},
         ],
         "logging": {"driver": "local", "options": {"max-size": "10m", "max-file": "3"}},
     }
@@ -153,6 +152,8 @@ def ensure_delegation(control, operation, document, backend_id, image, selected,
     output = compose_capture(spec, "run", "--name", helper_name, "--no-deps", "worker-cgroup-maintenance", timeout=180)
     helper = json.loads(docker_text("inspect", helper_name))[0]
     if (helper.get("Image") != image or helper.get("State", {}).get("Running")
+            or helper.get("HostConfig", {}).get("CgroupnsMode") != "host"
+            or helper.get("HostConfig", {}).get("PidMode") != "host"
             or helper.get("State", {}).get("ExitCode") != 0
             or helper.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != control.project
             or helper.get("Config", {}).get("Labels", {}).get("com.docker.compose.service") != "worker-cgroup-maintenance"):

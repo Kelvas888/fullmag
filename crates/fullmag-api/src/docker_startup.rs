@@ -276,6 +276,9 @@ pub(crate) async fn activate_current_live_startup(
             return Err(error);
         }
     };
+    if accepted.preparation_error.is_none() {
+        advance_startup_preparation_progress(&mut accepted_snapshot);
+    }
     let accepted_context = CurrentLiveRequestContext {
         session_id: context.session_id.clone(),
         run_id: Some(accepted.run_id.clone()),
@@ -1218,6 +1221,8 @@ fn build_startup_snapshot(
         }
     }));
     snapshot.runtime_status = build_runtime_status_view("activating");
+    snapshot.simulation_preparation_revision = 1;
+    snapshot.simulation_preparation = Some(build_startup_preparation_progress(&snapshot));
     Ok(snapshot)
 }
 
@@ -1584,6 +1589,134 @@ fn bounded_preparation_value(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn startup_progress_preparation_id(snapshot: &crate::types::SessionStateResponse) -> String {
+    format!(
+        "docker-startup-progress-{}",
+        fullmag_session::hex_sha256(snapshot.session.session_id.as_bytes())
+    )
+}
+
+fn build_startup_preparation_progress(
+    snapshot: &crate::types::SessionStateResponse,
+) -> crate::types::SimulationPreparationSnapshot {
+    let now = u64::try_from(snapshot.session.started_at_unix_ms).unwrap_or(u64::MAX);
+    let detail = match snapshot.session.requested_backend.as_str() {
+        "fem" => "Materializing the model and Python/Gmsh mesh assets. The FEM mesh is not published yet; no solver has started.",
+        "fdm" => "Materializing the model and FDM grid inputs. The grid is not published yet; no solver has started.",
+        _ => "Materializing the model and domain inputs. Backend resolution and domain publication are pending; no solver has started.",
+    };
+    let stages = CANONICAL_PREPARATION_STAGES
+        .into_iter()
+        .map(|(id, label)| {
+            let mut stage = canonical_preparation_stage(id, label);
+            if id == "runtime_startup" {
+                stage.status = "completed".into();
+                stage.detail = "The API received the script and published its authored scene".into();
+            } else if id == "script_materialization" {
+                stage.status = "active".into();
+                stage.detail = detail.into();
+                stage.started_at_unix_ms = Some(now);
+                stage.progress_label = Some("Materializing model".into());
+            }
+            stage
+        })
+        .collect();
+    crate::types::SimulationPreparationSnapshot {
+        preparation_id: startup_progress_preparation_id(snapshot),
+        revision: 1,
+        status: "running".into(),
+        active_stage_id: Some("script_materialization".into()),
+        started_at_unix_ms: now,
+        completed_at_unix_ms: None,
+        stages,
+        log_tail: vec![crate::types::SimulationPreparationLogEntrySnapshot {
+            timestamp_unix_ms: now,
+            level: "info".into(),
+            stage_id: "script_materialization".into(),
+            message: detail.into(),
+        }],
+        failure: None,
+    }
+}
+
+fn advance_startup_preparation_progress(snapshot: &mut crate::types::SessionStateResponse) {
+    let expected_id = startup_progress_preparation_id(snapshot);
+    let now = u64::try_from(crate::unix_time_millis_now()).unwrap_or(u64::MAX);
+    let detail = match snapshot.session.requested_backend.as_str() {
+        "fem" => "The Study is accepted. Waiting for its native FEM mesh preparation receipt; Compute has not started.",
+        "fdm" => "The Study is accepted. Waiting for its FDM grid preparation receipt; Compute has not started.",
+        _ => "The Study is accepted. Waiting for its resolved domain preparation receipt; Compute has not started.",
+    };
+    let Some(preparation) = snapshot.simulation_preparation.as_mut() else { return };
+    if preparation.preparation_id != expected_id || preparation.status != "running" {
+        return;
+    }
+    for stage in &mut preparation.stages {
+        if stage.id == "script_materialization" {
+            stage.status = "completed".into();
+            stage.completed_at_unix_ms = Some(now);
+            stage.duration_ms = stage.started_at_unix_ms.and_then(|start| now.checked_sub(start));
+            stage.progress_label = None;
+        } else if matches!(stage.id.as_str(), "validation" | "planning") {
+            stage.status = "completed".into();
+            stage.detail = "Accepted Study validation and planning completed".into();
+            stage.completed_at_unix_ms = Some(now);
+        } else if stage.id == "domain_preparation" {
+            stage.status = "active".into();
+            stage.detail = detail.into();
+            stage.started_at_unix_ms = Some(now);
+            stage.progress_label = Some("Waiting for domain receipt".into());
+        }
+    }
+    preparation.active_stage_id = Some("domain_preparation".into());
+    preparation.revision = snapshot.simulation_preparation_revision.max(preparation.revision).saturating_add(1);
+    preparation.log_tail.push(crate::types::SimulationPreparationLogEntrySnapshot {
+        timestamp_unix_ms: now,
+        level: "info".into(),
+        stage_id: "domain_preparation".into(),
+        message: detail.into(),
+    });
+    snapshot.simulation_preparation_revision = preparation.revision;
+}
+
+/// Rebind only the transient startup diagnostics to the exact selected task.
+/// A durable receipt is never replaced or inferred from this progress state.
+pub(crate) async fn bind_startup_frontier_progress_under_transition(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+    run_id: &str,
+    step_id: &str,
+) -> Result<(), ApiError> {
+    let has_durable_receipt = state.current_live_preparation_receipt.read().await.is_some();
+    let mut current = state.current_live_state.write().await;
+    let snapshot = current.as_mut().ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(snapshot, context, state.current_live_session_epoch.load(Ordering::Acquire))?;
+    crate::live_scene_preparation::ensure_preparation_run_is_active(snapshot)?;
+    if snapshot.run.as_ref().map(|run| run.run_id.as_str()) != Some(run_id) {
+        return Err(ApiError::conflict("startup preparation progress run changed"));
+    }
+    let expected_id = startup_progress_preparation_id(snapshot);
+    if snapshot.simulation_preparation.as_ref().is_none_or(|preparation| {
+        preparation.preparation_id != expected_id || preparation.status != "running"
+    }) {
+        return Ok(());
+    }
+    if has_durable_receipt {
+        return Err(ApiError::conflict("transient startup progress has a durable preparation anchor"));
+    }
+    let task_id = fullmag_session::task_id_for_study_step(run_id, step_id)
+        .map_err(|error| ApiError::bad_request(format!("startup preparation step is invalid: {error}")))?;
+    let preparation = snapshot.simulation_preparation.as_mut().expect("transient progress checked above");
+    preparation.preparation_id = format!("prep-{task_id}");
+    preparation.revision = snapshot.simulation_preparation_revision.max(preparation.revision).saturating_add(1);
+    snapshot.simulation_preparation_revision = preparation.revision;
+    let realtime_snapshot = snapshot.clone();
+    drop(current);
+    let display_revision = state.current_display_selection.read().await.revision;
+    let realtime = crate::current_live_realtime_state_from_snapshot(state, &realtime_snapshot, display_revision).await;
+    crate::publish_current_live_realtime_batch_changed(state, &realtime, false, 0).await
+}
+
 fn startup_failure_preparation_id(snapshot: &crate::types::SessionStateResponse) -> String {
     let identity = format!("{}\0{}", snapshot.session.session_id, snapshot.session.run_id);
     format!(
@@ -1772,19 +1905,39 @@ fn apply_preparation_failure_snapshot(
                 && has_failure;
             if !already_failed {
                 changed = true;
+                let failed_stage = preparation.active_stage_id.as_deref()
+                    .filter(|id| canonical_preparation_stage_index(id).is_some())
+                    .unwrap_or("runtime_startup").to_string();
                 preparation.status = "failed".to_string();
                 preparation.active_stage_id = None;
                 preparation.completed_at_unix_ms = Some(timestamp_unix_ms);
+                if let Some(stage) = preparation.stages.iter_mut().find(|stage| stage.id == failed_stage) {
+                    stage.status = "failed".into();
+                    stage.detail = bounded_summary.clone();
+                    stage.completed_at_unix_ms = Some(timestamp_unix_ms);
+                    stage.duration_ms = stage.started_at_unix_ms.and_then(|start| timestamp_unix_ms.checked_sub(start));
+                    stage.progress_percent = None;
+                    stage.progress_label = None;
+                }
                 if !has_failure {
                     preparation.failure = Some(
                         crate::types::SimulationPreparationFailureSnapshot {
                             error_code: bounded_code,
                             summary: bounded_summary.clone(),
                             detail: None,
-                            stage_id: "runtime_startup".to_string(),
+                            stage_id: failed_stage.clone(),
                             diagnostics_correlation_id: None,
                         },
                     );
+                }
+                preparation.log_tail.push(crate::types::SimulationPreparationLogEntrySnapshot {
+                    timestamp_unix_ms,
+                    level: "error".into(),
+                    stage_id: failed_stage,
+                    message: bounded_summary.clone(),
+                });
+                if preparation.log_tail.len() > 128 {
+                    preparation.log_tail.drain(..preparation.log_tail.len() - 128);
                 }
             }
             if changed {

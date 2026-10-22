@@ -1642,6 +1642,34 @@ pub fn validate_study_task_completion(store: &SessionStore, claim: &TaskClaim) -
         &specification.run_id,
         &specification.snapshot.project_id,
     )?;
+    if accepted.run.intent != intent {
+        bail!("accepted run intent changed while loading the study completion snapshot");
+    }
+    validate_study_task_completion_for_snapshot(store, claim, &accepted)
+}
+
+/// Validate completion against an already fully validated accepted snapshot.
+/// The fresh immutable intent fence must be checked while the caller holds the
+/// store writer; all mutable catalog, artifact and CAS checks remain here.
+pub(crate) fn validate_study_task_completion_for_snapshot(
+    store: &SessionStore,
+    claim: &TaskClaim,
+    accepted: &AcceptedStudySnapshot,
+) -> Result<()> {
+    let run_id = claim.run_id.as_str();
+    let current_intent = store.read_run_intent(run_id)?;
+    if current_intent.as_ref() != Some(&accepted.run.intent) {
+        bail!("accepted run intent changed during study completion validation");
+    }
+    if accepted.run.intent.run_id != run_id
+        || accepted.run.specification.run_id != claim.run_id
+    {
+        bail!("accepted study completion claim belongs to another run");
+    }
+    if accepted.run.intent.study_object_ref.is_none() {
+        bail!("study completion snapshot has no immutable study object");
+    }
+
     let mut source_step = None;
     for step in &accepted.study.steps {
         if fullmag_session::task_id_for_study_step(run_id, &step.step_id)? == claim.task_id.as_str()

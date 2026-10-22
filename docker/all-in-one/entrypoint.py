@@ -469,7 +469,13 @@ def serve():
     # rotation; ordinary startup never invokes this path.
     runtime_recovery = service.recover_idle_failure(paths)
     with service.container_recovery_configuration_override(paths, container_recovery):
-        configuration = service.ensure_configuration(paths)
+        if (os.environ.get(service.POST_BUILD_START_ENV) is not None
+                or os.environ.get(service.POST_BUILD_START_SHA_ENV) is not None):
+            configuration = service.ensure_configuration(
+                paths, accepted_preflight=accepted_preflight
+            )
+        else:
+            configuration = service.ensure_configuration(paths)
     print("[fullmag-backend] Starting API and runtime service", flush=True)
     with service.accepted_reattach_api_input(paths, preflight=accepted_preflight) as (api_environment, restore_input):
         api_environment = _api_environment_with_operator_capability(api_environment)
@@ -493,8 +499,15 @@ def serve():
     accepted_runtime = None
     try:
         service._atomic_json(receipt_path, receipt, "process tree receipt")
+        api_startup_timeout = (
+            service.ACCEPTED_REATTACH_API_STARTUP_TIMEOUT_SECONDS
+            if accepted_preflight is not None
+            else None
+        )
         handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"],
-                               configuration=configuration)
+                               configuration=configuration,
+                               api_startup_timeout=api_startup_timeout,
+                               api_process_poll=api.poll)
         # Persist the authenticated owner before optional startup activation.
         # Activation may reject or fail after service.start has pinned the
         # native owner; the terminal drain receipt must retain that identity.
@@ -541,7 +554,9 @@ def serve():
             if status is not None:
                 raise RuntimeError(f"Fullmag API exited unexpectedly ({status})")
             now = time.monotonic()
-            full_api_probe = now - last_full_api_probe >= 5.0
+            full_api_probe = (
+                now - last_full_api_probe >= service.SUPERVISION_FULL_API_PROBE_SECONDS
+            )
             degraded_since = _supervise_once(
                 service,
                 handle,

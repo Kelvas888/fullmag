@@ -269,16 +269,19 @@ class StopUnadmittedTests(unittest.TestCase):
 
     def test_runtime_validation_helper_uses_host_adapter_and_preserves_isolation(self):
         backend = {"Image": "sha256:" + "a" * 64}
-        control = SimpleNamespace(project="fullmag-master")
-        with patch.object(stop, "_runtime_control_volume_mount", return_value=("owned-volume", "runtime-control")), \
+        namespace = "namespaces/" + "a" * 32
+        subpath = namespace + "/runtime-control"
+        control = SimpleNamespace(project="fullmag-master", namespace=namespace, volume="owned-volume")
+        with patch.object(stop, "_runtime_control_volume_mount", return_value=("owned-volume", subpath)) as mount, \
                 patch.object(stop, "docker_argv", return_value=["docker", "run"]) as adapter:
             args = stop._runtime_control_validation_helper(backend, control)
+        mount.assert_called_once_with(backend, control.project, namespace=namespace)
         adapter.assert_called_once_with("run")
         self.assertEqual(args[:2], ["docker", "run"])
         self.assertNotIn("desktop-linux", args)
         self.assertIn("--read-only", args)
         self.assertIn("com.docker.compose.project=fullmag-master", args)
-        self.assertIn("type=volume,src=owned-volume,dst=/opt/fullmag/runtime-control,readonly,volume-subpath=runtime-control,volume-nocopy", args)
+        self.assertIn(f"type=volume,src=owned-volume,dst=/opt/fullmag/runtime-control,readonly,volume-subpath={subpath},volume-nocopy", args)
 
     def test_runtime_process_receipt_uses_image_default_when_override_is_absent(self):
         stop._validate_runtime_process_receipt_override({})
@@ -327,6 +330,59 @@ class StopUnadmittedTests(unittest.TestCase):
             stop.StopUnadmittedError
         ):
             stop._runtime_control_volume_mount(backend, "fullmag-master")
+
+    def test_runtime_control_mount_treats_empty_namespace_as_unnamespaced(self):
+        # BuildControl.namespace is "" for a group that never quarantined its
+        # control namespace; idle restart passes it through unchanged.
+        backend = {
+            "Mounts": [{
+                "Destination": "/opt/fullmag/runtime-control",
+                "Type": "volume",
+                "Name": "fullmag-build-control-test",
+                "RW": True,
+            }],
+            "HostConfig": {"Mounts": [{
+                "Target": "/opt/fullmag/runtime-control",
+                "Type": "volume",
+                "Source": "fullmag-build-control-test",
+                "ReadOnly": False,
+                "VolumeOptions": {"Subpath": "runtime-control"},
+            }]},
+        }
+        result = type("Result", (), {"stdout": json.dumps([{
+            "Name": "fullmag-build-control-test",
+            "Driver": "local",
+            "Options": {},
+            "Labels": {"com.fullmag.compose.project": "fullmag-master"},
+        }]).encode()})()
+        with patch.object(stop, "docker_capture", return_value=result):
+            self.assertEqual(
+                stop._runtime_control_volume_mount(backend, "fullmag-master", namespace=""),
+                ("fullmag-build-control-test", "runtime-control"),
+            )
+        namespace = "namespaces/" + "b" * 32
+        backend["HostConfig"]["Mounts"][0]["VolumeOptions"] = {
+            "Subpath": namespace + "/runtime-control",
+        }
+        with patch.object(stop, "docker_capture", return_value=result):
+            self.assertEqual(
+                stop._runtime_control_volume_mount(backend, "fullmag-master", namespace=namespace),
+                ("fullmag-build-control-test", namespace + "/runtime-control"),
+            )
+        for invalid in ("namespaces/", "namespaces/" + "B" * 32, "../runtime-control"):
+            with self.subTest(namespace=invalid), patch.object(
+                stop, "docker_capture", return_value=result
+            ), self.assertRaisesRegex(stop.StopUnadmittedError, "namespace is invalid"):
+                stop._runtime_control_volume_mount(backend, "fullmag-master", namespace=invalid)
+
+    def test_terminal_receipt_preflight_builds_the_same_helper_without_running_it(self):
+        backend = {"Image": "sha256:" + "a" * 64}
+        control = SimpleNamespace(project="fullmag-master", namespace="", volume="owned-volume")
+        with patch.object(stop, "_runtime_control_validation_helper") as helper, \
+                patch.object(stop, "bounded_capture") as capture:
+            stop._preflight_terminal_process_receipt(backend, control)
+        helper.assert_called_once_with(backend, control)
+        capture.assert_not_called()
 
     def test_retained_attempt_pins_config_source_and_image(self):
         args = self.args()

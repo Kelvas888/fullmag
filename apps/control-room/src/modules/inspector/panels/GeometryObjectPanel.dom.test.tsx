@@ -326,7 +326,6 @@ describe("GeometryObjectPanel primitive transaction", () => {
       expect(mocks.patchObject).toHaveBeenCalledExactlyOnceWith(createdObjectId, {
         base_revision: 13,
         name: "Later name",
-        notes: "",
         material_ref: "later-material",
         region_name: "later-region",
       }, { sessionScopeKey: "session=A&epoch=1" });

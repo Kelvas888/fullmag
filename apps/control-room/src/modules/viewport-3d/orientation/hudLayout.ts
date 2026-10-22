@@ -15,15 +15,18 @@ export function resolveOrientationHudAnchors({
   hslReference: HudAnchor;
   viewCube: HudAnchor;
 } {
+  const compact = width < 640 || height < 420;
+  const cubeMargin = compact ? 72 : ORIENTATION_VIEW_CUBE_MARGIN_PX;
+  const hslMargin = compact ? 64 : HSL_REFERENCE_MARGIN_PX;
   return {
     hslReference: [
-      -width / 2 + HSL_REFERENCE_MARGIN_PX,
-      -height / 2 + HSL_REFERENCE_MARGIN_PX,
+      -width / 2 + hslMargin,
+      -height / 2 + hslMargin,
       0,
     ],
     viewCube: [
-      width / 2 - ORIENTATION_VIEW_CUBE_MARGIN_PX,
-      height / 2 - ORIENTATION_VIEW_CUBE_MARGIN_PX,
+      width / 2 - cubeMargin,
+      height / 2 - cubeMargin,
       0,
     ],
   };

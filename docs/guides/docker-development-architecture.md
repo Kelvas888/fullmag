@@ -79,8 +79,12 @@ Zmiana kodu aplikacji nie przebudowuje automatycznie CUDA, MFEM, hypre ani
 libCEED. Zmiana zależności, kompilatora lub flag może unieważnić szerszy cache.
 Blokada backendu chroni konkretny trwały wolumen; odrębne grupy mogą kompilować
 równolegle. Blokady i rejestry techniczne buildu pozostają w granicy grupy Compose.
-Przydział fizycznego GPU nadal przechodzi przez wspólny host ledger, który jest
-operacyjną infrastrukturą zasobów, a nie cache'em buildu ani danymi sesji.
+Przydziały CPU/RAM/GPU grupy przechodzą przez jej własny ledger
+(`group-ledger-v1`, [ADR 0067](../adr/0067-docker-dev-group-isolation.md)):
+nazwany wolumen grupy pod `/host-ledger`, operacyjny stan runtime, a nie cache
+buildu ani dane sesji. Grupy nie rezerwują zasobów między sobą; chronią je
+statyczne budżety `FULLMAG_DEV_*`. Globalny `host-ledger-v1` dotyczy release,
+kwalifikacji i managed runtime.
 
 ## Polecenia trybu developerskiego
 
@@ -172,10 +176,18 @@ python -B "$main\scripts\docker_dev.py" --repo-root $main up --source-root $sour
 
 ### Cykl edycji i przebudowy
 
-Frontend reaguje przez HMR na zapis plików Windows. Watchpack domyślnie używa
-pollingu `5000` ms; lokalne `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza
-`250`–`10000` ms. Wykrycie edycji może więc poczekać do następnego skanu,
-po którym Next przebudowuje zmienione moduły. Docker DEV pomija wygenerowane
+Frontend reaguje przez HMR na zapis plików. Tryb obserwacji wynika z mountu
+źródeł `/opt/fullmag/source` i jest zapisany w receipcie jako `watch_mode`:
+
+- `native` — bind z ext4, xfs albo btrfs (checkout w Linux/WSL). Zapis generuje
+  zdarzenia inotify w kontenerze, więc Watchpack nie odpytuje drzewa;
+- `polling` — każdy inny mount, w tym bind z dysku Windows przez 9p, który nie
+  dostarcza zdarzeń. Watchpack domyślnie odpytuje co `5000` ms, a lokalne
+  `FULLMAG_WATCHPACK_POLLING_MS` dopuszcza `250`–`10000` ms. Wykrycie edycji
+  może poczekać do następnego skanu. Każdy działający frontend odpytuje przez
+  ten sam serwer 9p, więc bezczynne grupy obciążają też I/O pozostałych.
+
+Po wykryciu zmiany Next przebudowuje zmienione moduły. Docker DEV pomija wygenerowane
 katalogi `.fullmag-frontend`, `.next*` i `node_modules`; `app`, `src`, `public`
 i `scripts` pozostają obserwowane. Zależności pnpm i cache Next zostają w
 nazwanym wolumenie frontendowym; HMR nie buduje backendu ani toolchaina.
@@ -385,7 +397,7 @@ i rzeczywiste granice automatycznego sprzątania:
 | Kontrola runtime i metadata usług technicznych | Wydzielony podwolumen Docker grupy Compose; nie katalog sesji użytkownika |
 | Sesje, modele, wyniki i logi symulacji | Fizyczny storage Windows, mount `/state` |
 | Ustawienia, ostatnie projekty i historia grupy | `storage/user-data/<compose-project>/workspace.db`, mount `/user-data` |
-| Przydziały fizycznego CPU/GPU | Wspólny `host-ledger-v1` zarządzany osobnym kontraktem; nie cache buildu ani ledger per grupa |
+| Przydziały CPU/RAM/GPU grupy | Ledger grupy `group-ledger-v1` w jej nazwanym wolumenie Docker, mount `/host-ledger`; nie cache buildu. Release i kwalifikacja używają `host-ledger-v1` |
 
 ### Granica zapisu i kontrola wzrostu danych technicznych
 
@@ -429,20 +441,27 @@ Szczegóły: [ADR 0049](../adr/0049-native-runtime-owner-control.md),
 
 ### Retencja pakietów developerskich
 
-Decyzja użytkownika z 17.10.2026: kolejne buildy automatycznie usuwają
-zweryfikowane, zastąpione pakiety techniczne. Bieżący pakiet i bezpośrednio
-poprzedni pakiet do rollbacku pozostają. Wiek lub nazwa katalogu nie stanowią
-dowodu zbędności: wymagane są zgodne receipty i łańcuch zakończonych rotacji.
+Korekta z 20.10.2026 odracza automatyczną retencję z decyzji 17.10.2026:
+start zachowuje bieżący pakiet i wszystkie historyczne rollbacki, raportując
+`phase=retention state=deferred`. Pełne hashowanie starych kopii nie blokuje API.
+Obowiązkowa walidacja aktualnego pakietu pozostaje. Każda nowa publikacja może
+dodać pełny backup; obecnie brak limitu liczby kopii i osobnej udostępnionej
+operacji konserwacyjnej. Istniejący preflight mierzy build/cache volume;
+nie gwarantuje miejsca w osobnym package volume. Przed kolejnym buildem
+należy ocenić również miejsce dla pakietów i rollbacków. Szczegóły:
+[ADR 0061](../adr/0061-docker-development-build-and-runtime-container.md#korekta-20102026--retencja-poza-startem-api).
 
-Sprzątanie odbywa się wewnątrz backendu pod blokadą jego cache, po trwałej,
-zweryfikowanej publikacji nowego pakietu. Retired zachowuje tylko receipt i
+Zachowana w źródłach funkcja retencji wymaga blokady cache i trwałej,
+zweryfikowanej publikacji nowego pakietu, lecz nie jest wywoływana przez start.
+Jej kontrakt archiwum retired zachowuje tylko receipt i
 rotację, bez kolejnych kopii pełnego build logu. Zostawia najwyżej 8 archiwów
 i 64 MiB łącznego rozmiaru plików; zachowuje najnowsze według zapisanego
 `retired_at_ns` (dla starszych wpisów kolejność wyznacza czas pliku manifestu).
 Archiwa legacy z logiem są usuwane, jeśli przekraczają ten limit; log jest
 sprawdzany hashem, gdy pozostaje w zachowanym archiwum. Nieznane, niespójne lub
 używane dane pozostają z diagnostyką. Niepowodzenie sprzątania nie unieważnia
-poprawnie opublikowanego pakietu.
+poprawnie opublikowanego pakietu. Limity tej funkcji nie są obecnie egzekwowane
+przez ścieżkę startu; nie usunięto istniejących archiwów ani backupów.
 
 Retencja nie obejmuje cache Cargo/CMake/CUDA, źródeł, sesji, projektów, wyników,
 bazy grupy ani historii rezerwacji. Restart używający aktualnego pakietu nie
