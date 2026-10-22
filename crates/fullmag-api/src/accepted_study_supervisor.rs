@@ -168,6 +168,68 @@ pub(crate) struct ReapedSupervisorSlotPin {
     pub(crate) process_start_token: String,
 }
 
+/// Open the actual existing ancestor without following links. Missing archive
+/// directories inherit this mount; publication rechecks their opened parents.
+fn archive_existing_parent(path: &Path) -> Result<fs::File> {
+    let mut existing = path;
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    bail!("slot archive parent must be a real directory");
+                }
+                let mut options = OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+                }
+                let file = options.open(existing)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let opened = file.metadata()?;
+                    let current = fs::symlink_metadata(existing)?;
+                    if opened.dev() != current.dev() || opened.ino() != current.ino() {
+                        bail!("slot archive parent inode changed during preflight");
+                    }
+                }
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().context("slot archive existing ancestor missing")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn require_same_archive_mount(source: &fs::File, destination: &fs::File) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let mount_id = |file: &fs::File| -> Result<u64> {
+            let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+            let id = info.lines().find_map(|line| line.strip_prefix("mnt_id:"))
+                .context("slot archive mount id unavailable")?;
+            Ok(id.trim().parse()?)
+        };
+        if source.metadata()?.dev() != destination.metadata()?.dev()
+            || mount_id(source)? != mount_id(destination)?
+        {
+            bail!("slot archive must remain on the same mounted filesystem before recovery");
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source, destination);
+        bail!("slot archive mount preflight currently requires Linux");
+    }
+}
+
 /// Read-only half of operator recovery. Uses the same owner codec, resource
 /// naming and process-start-token observer as ordinary stale-slot recovery.
 pub(crate) fn validate_reaped_supervisor_slot(
@@ -185,15 +247,31 @@ pub(crate) fn validate_reaped_supervisor_slot(
         fullmag_session::hex_sha256(claim.lease.resource_id.as_bytes())
     );
     let active = fullmag_session::repository_path::checked_path(store.root(), &relative)?;
-    let archived = fullmag_session::repository_path::checked_path(
+    let canonical_archive = fullmag_session::repository_path::checked_path(
+        store.root(), &format!("reaped-worker-recovery/{request_id}/supervisor-slot"),
+    )?;
+    let legacy_archive = fullmag_session::repository_path::checked_path(
         store.root(),
         &format!("runtime-services/reaped-worker-recovery/{request_id}/supervisor-slot"),
     )?;
-    let selected = match (active.try_exists()?, archived.try_exists()?) {
-        (true, false) => &active,
-        (false, true) => &archived,
-        _ => bail!("reaped supervisor slot must exist at exactly one pinned location"),
-    };
+    let locations = [active.try_exists()?, canonical_archive.try_exists()?, legacy_archive.try_exists()?];
+    if locations.iter().filter(|exists| **exists).count() != 1 {
+        bail!("reaped supervisor slot must exist at exactly one pinned location");
+    }
+    let archived = if locations[2] { legacy_archive } else { canonical_archive };
+    let selected = if locations[0] { &active } else { &archived };
+    if locations[0] {
+        // A slot mounted separately from its parent cannot be renamed even if
+        // the source and destination parents share a filesystem.
+        require_same_archive_mount(
+            &archive_existing_parent(&active)?,
+            &archive_existing_parent(active.parent().context("slot source parent missing")?)?,
+        )?;
+        require_same_archive_mount(
+            &archive_existing_parent(active.parent().context("slot source parent missing")?)?,
+            &archive_existing_parent(archived.parent().context("slot archive parent missing")?)?,
+        )?;
+    }
     let metadata = fs::symlink_metadata(selected)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("reaped supervisor slot must be a real directory");
@@ -222,6 +300,23 @@ pub(crate) fn validate_reaped_supervisor_slot(
         bail!("reaped supervisor slot contains unexpected evidence; archive refused");
     }
     Ok((active, archived))
+}
+
+fn sync_archive_ancestors(store: &SessionStore, archived: &Path) -> Result<()> {
+    let mut parent = archived.parent().context("slot archive parent missing")?;
+    if !parent.starts_with(store.root()) {
+        bail!("slot archive durability barrier escapes the exact store");
+    }
+    loop {
+        if !parent.try_exists()? {
+            bail!("slot archive durability ancestor is missing");
+        }
+        archive_existing_parent(parent)?.sync_all()?;
+        if parent == store.root() {
+            return Ok(());
+        }
+        parent = parent.parent().context("slot archive store ancestor missing")?;
+    }
 }
 
 /// Preserve the entire slot only after terminal failure and proof-backed host
@@ -303,30 +398,41 @@ pub(crate) fn archive_reaped_supervisor_slot(
     }
     let (active, archived) = validate_reaped_supervisor_slot(store, claim, request_id, pin)?;
     if active.try_exists()? {
-        let parent_relative = format!("runtime-services/reaped-worker-recovery/{request_id}");
+        let parent_relative = format!("reaped-worker-recovery/{request_id}");
         let parent =
             fullmag_session::repository_path::checked_path(store.root(), &parent_relative)?;
         if !parent.try_exists()? {
             fullmag_session::repository_path::create_new_directory(store.root(), &parent_relative)?;
         }
+        // Confirm every ancestor entry even after replay of an uncertain
+        // create_new_directory, before moving the immutable owner evidence.
+        sync_archive_ancestors(store, &archived)?;
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::ffi::OsStrExt;
-            let from = std::ffi::CString::new(active.as_os_str().as_bytes())?;
-            let to = std::ffi::CString::new(archived.as_os_str().as_bytes())?;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+            let source_parent = archive_existing_parent(active.parent().context("slot source parent missing")?)?;
+            let target_parent = archive_existing_parent(&parent)?;
+            require_same_archive_mount(&source_parent, &target_parent)?;
+            require_same_archive_mount(&archive_existing_parent(&active)?, &source_parent)?;
+            let before = fs::symlink_metadata(&active)?;
+            let from = std::ffi::CString::new(active.file_name().context("slot source name missing")?.as_bytes())?;
+            let to = std::ffi::CString::new(archived.file_name().context("slot archive name missing")?.as_bytes())?;
             if unsafe {
                 libc::renameat2(
-                    libc::AT_FDCWD,
-                    from.as_ptr(),
-                    libc::AT_FDCWD,
-                    to.as_ptr(),
-                    libc::RENAME_NOREPLACE,
+                    source_parent.as_raw_fd(), from.as_ptr(),
+                    target_parent.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE,
                 )
-            } != 0
-            {
+            } != 0 {
                 return Err(std::io::Error::last_os_error())
                     .context("archive exact supervisor slot without overwrite");
             }
+            let after = fs::symlink_metadata(&archived)?;
+            if before.dev() != after.dev() || before.ino() != after.ino() {
+                bail!("archived supervisor slot inode differs from its exact source");
+            }
+            source_parent.sync_all()?;
+            target_parent.sync_all()?;
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -337,6 +443,7 @@ pub(crate) fn archive_reaped_supervisor_slot(
     for parent in [active.parent(), archived.parent()] {
         std::fs::File::open(parent.context("slot archive parent missing")?)?.sync_all()?;
     }
+    sync_archive_ancestors(store, &archived)?;
     validate_reaped_supervisor_slot(store, claim, request_id, pin)?;
     Ok(())
 }
@@ -2416,6 +2523,25 @@ fn is_coordinator_watermark_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reaped_slot_mount_preflight_refuses_cross_mount_and_final_symlink() {
+        let source = tempfile::tempdir().unwrap();
+        // Linux CI provides tmpfs /dev/shm separately from the checkout/tmp mount.
+        let target = tempfile::tempdir_in("/dev/shm").unwrap();
+        let from = super::archive_existing_parent(source.path()).unwrap();
+        let to = super::archive_existing_parent(target.path()).unwrap();
+        assert!(super::require_same_archive_mount(&from, &to).unwrap_err()
+            .to_string().contains("same mounted filesystem"));
+        let same = super::archive_existing_parent(&source.path().join("not-created/archive")).unwrap();
+        super::require_same_archive_mount(&from, &same).unwrap();
+        assert!(!source.path().join("not-created").exists());
+        let link = source.path().join("link");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        assert!(super::archive_existing_parent(&link).is_err());
+    }
+
     use super::*;
     use std::process::Child;
     use std::time::{Duration, Instant};

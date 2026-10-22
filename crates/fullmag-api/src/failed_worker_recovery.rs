@@ -42,6 +42,79 @@ struct Request {
     reason: String,
 }
 
+const COMPLETION_SCHEMA: &str = "runtime_service_reaped_worker_archive_completion.v1";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackagePins {
+    package_receipt_sha256: String,
+    executable_sha256: String,
+    build_commit: String,
+    source_snapshot_sha256: String,
+}
+
+impl PackagePins {
+    fn from_request(request: &Request) -> Self {
+        Self {
+            package_receipt_sha256: request.package_receipt_sha256.clone(),
+            executable_sha256: request.executable_sha256.clone(),
+            build_commit: request.build_commit.clone(),
+            source_snapshot_sha256: request.source_snapshot_sha256.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        for value in [&self.package_receipt_sha256, &self.executable_sha256, &self.source_snapshot_sha256] {
+            require_digest(value)?;
+        }
+        if self.build_commit.len() != 40
+            || !self.build_commit.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            bail!("archive completion requires an exact tool build commit");
+        }
+        Ok(())
+    }
+}
+
+/// A separate authorization for a new tool completing an already committed
+/// old request. Never substitute these pins into Request or its failure reason.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Completion {
+    schema_version: String,
+    original_request_sha256: String,
+    retained_package_root: PathBuf,
+    tool: PackagePins,
+    failure_event_sha256: String,
+    retry_decision_sha256: String,
+    release_proof_sha256: String,
+}
+
+impl Completion {
+    fn validate(&self, original_pin: &str, current_package: &Path) -> Result<()> {
+        self.tool.validate()?;
+        for value in [&self.original_request_sha256, &self.failure_event_sha256,
+                      &self.retry_decision_sha256, &self.release_proof_sha256] {
+            require_digest(value)?;
+        }
+        let backup = &self.retained_package_root;
+        let name = backup.file_name().and_then(|value| value.to_str()).unwrap_or("");
+        if self.schema_version != COMPLETION_SCHEMA || self.original_request_sha256 != original_pin
+            || backup.parent() != Some(current_package.join(".development/backups").as_path())
+            || !name.strip_prefix(".backend-package-backup-").is_some_and(|suffix|
+                !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+        {
+            bail!("archive completion original request or retained package namespace differs");
+        }
+        let relative = backup.strip_prefix(current_package)?.to_str()
+            .context("retained package path is not UTF-8")?;
+        if checked_path(current_package, relative)? != *backup {
+            bail!("archive completion retained package path differs");
+        }
+        Ok(())
+    }
+}
+
 fn digest(value: &impl Serialize) -> Result<String> {
     Ok(fullmag_session::canonical_json_sha256(
         &serde_json::to_value(value)?,
@@ -249,13 +322,22 @@ fn validate_process_receipt(request: &Request, store_root: &Path) -> Result<()> 
 }
 
 fn validate_package(request: &Request) -> Result<()> {
+    validate_current_package(&PackagePins::from_request(request))
+}
+
+fn validate_current_package(pins: &PackagePins) -> Result<()> {
+    pins.validate()?;
     let identity = fullmag_build_info::identity();
-    if identity.git_commit != request.build_commit
-        || identity.source_snapshot_sha256 != request.source_snapshot_sha256
+    if identity.git_commit != pins.build_commit
+        || identity.source_snapshot_sha256 != pins.source_snapshot_sha256
     {
         bail!("reaped-worker recovery binary source identity differs from its pin");
     }
-    let executable = std::env::current_exe()?;
+    validate_package_files(pins, &std::env::current_exe()?)
+}
+
+fn validate_package_files(pins: &PackagePins, executable: &Path) -> Result<()> {
+    pins.validate()?;
     let bin = executable
         .parent()
         .context("recovery executable has no bin directory")?;
@@ -267,14 +349,14 @@ fn validate_package(request: &Request) -> Result<()> {
         &package.join("backend-build-receipt.json"),
         8 * 1024 * 1024,
     )?;
-    if fullmag_session::hex_sha256(&bytes) != request.package_receipt_sha256 {
+    if fullmag_session::hex_sha256(&bytes) != pins.package_receipt_sha256 {
         bail!("reaped-worker recovery installed package receipt differs from its pin");
     }
     let receipt: serde_json::Value = serde_json::from_slice(&bytes)?;
     if receipt["schema"] != "fullmag.direct-compose.backend-build-receipt.v1"
         || receipt["state"] != "succeeded"
-        || receipt["source"]["resolved_commit"] != request.build_commit
-        || receipt["source"]["source_snapshot_sha256"] != request.source_snapshot_sha256
+        || receipt["source"]["resolved_commit"] != pins.build_commit
+        || receipt["source"]["source_snapshot_sha256"] != pins.source_snapshot_sha256
     {
         bail!("reaped-worker recovery package source identity is inconsistent");
     }
@@ -287,9 +369,9 @@ fn validate_package(request: &Request) -> Result<()> {
         .collect::<Vec<_>>();
     let bytes = read_stable_absolute_operational_file(&executable, 512 * 1024 * 1024)?;
     if matching.len() != 1
-        || matching[0]["sha256"] != request.executable_sha256
+        || matching[0]["sha256"] != pins.executable_sha256
         || matching[0]["size"].as_u64() != Some(bytes.len() as u64)
-        || fullmag_session::hex_sha256(&bytes) != request.executable_sha256
+        || fullmag_session::hex_sha256(&bytes) != pins.executable_sha256
     {
         bail!("reaped-worker recovery executable differs from its package and operator pins");
     }
@@ -559,7 +641,55 @@ fn terminalize(
     Ok(())
 }
 
+fn validate_completion_state(
+    request: &Request,
+    completion: &Completion,
+    store: &SessionStore,
+    reservation: &HostResourceReservation,
+) -> Result<()> {
+    validate_reservation(request, reservation)?;
+    if reservation.state != HostResourceReservationState::Released
+        || reservation.release_proof_sha256.as_deref() != Some(completion.release_proof_sha256.as_str())
+    {
+        bail!("archive completion requires the exact existing proof-backed host release");
+    }
+    let lease = store.read_resource_lease(
+        &request.identity.run_id, &request.identity.resource_id, &request.identity.lease_token,
+    )?.context("archive completion lease missing")?;
+    if lease.state != FmsResourceLeaseState::Released {
+        bail!("archive completion cannot release an active local lease");
+    }
+    let exits = store.list_worker_process_exit_receipts(&request.identity.run_id)?
+        .into_iter().filter(|exit| exit.task_id == request.identity.task_id).collect::<Vec<_>>();
+    if exits.len() != 1 {
+        bail!("archive completion requires one exact worker exit receipt");
+    }
+    validate_exit(request, &lease, &exits[0])?;
+    let recovered = validate_attempt(request, store)?;
+    let event = recovered.events.last().context("archive completion failure event missing")?;
+    let decision = store.read_retry_decision(request.claim.run_id.as_str(), &request.event_id())?
+        .context("archive completion DoNotRetry decision missing")?;
+    if recovered.coordinator.phase() != CoordinatorPhase::Terminal
+        || digest(event)? != completion.failure_event_sha256
+        || digest(&decision)? != completion.retry_decision_sha256
+        || decision.action != FmsRetryAction::DoNotRetry
+        || decision.trigger != FmsRetryTrigger::ExplicitOperatorRequest
+        || decision.reason != request.failure_reason()?
+    {
+        bail!("archive completion requires the original exact Failed/DoNotRetry outcome");
+    }
+    Ok(())
+}
+
 pub(super) fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
+    run_mode(args, false)
+}
+
+pub(super) fn run_completion(args: impl Iterator<Item = OsString>) -> Result<()> {
+    run_mode(args, true)
+}
+
+fn run_mode(args: impl Iterator<Item = OsString>, completion_only: bool) -> Result<()> {
     let mut options = BTreeMap::new();
     let mut verification_only = false;
     let mut args = args;
@@ -574,7 +704,8 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
             verification_only = true;
             continue;
         }
-        if !matches!(key.as_str(), "--config" | "--request" | "--request-sha256")
+        if !(matches!(key.as_str(), "--config" | "--request" | "--request-sha256")
+            || (completion_only && matches!(key.as_str(), "--completion" | "--completion-sha256")))
             || options.contains_key(&key)
         {
             bail!("unknown or duplicate reaped-worker recovery option");
@@ -606,6 +737,23 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
     }
     let request: Request = serde_json::from_slice(&bytes)?;
     request.validate()?;
+    let completion_input = if completion_only {
+        let path = PathBuf::from(options.remove("--completion").context("archive completion requires --completion")?);
+        let pin = options.remove("--completion-sha256").context("archive completion requires --completion-sha256")?
+            .into_string().map_err(|_| anyhow::anyhow!("completion pin is not UTF-8"))?;
+        require_digest(&pin)?;
+        let raw = read_stable_absolute_operational_file(&path, MAX_BYTES)?;
+        if fullmag_session::hex_sha256(&raw) != pin {
+            bail!("archive completion differs from its explicit SHA pin");
+        }
+        let envelope: Completion = serde_json::from_slice(&raw)?;
+        let executable = std::env::current_exe()?;
+        let package = executable.parent().and_then(Path::parent).context("completion package root missing")?;
+        envelope.validate(&fullmag_session::hex_sha256(&bytes), package)?;
+        Some((path, raw, pin, envelope))
+    } else {
+        None
+    };
     if request.process_receipt_path
         != config_path
             .parent()
@@ -655,9 +803,56 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
         bail!("recovery lacks the exact Failed owner with terminal children and store identity");
     }
     validate_process_receipt(&request, store.root())?;
-    validate_package(&request)?;
+    if let Some((_, _, _, completion)) = &completion_input {
+        validate_current_package(&completion.tool)?;
+        validate_package_files(&PackagePins::from_request(&request),
+            &completion.retained_package_root.join("bin/fullmag-runtime-service"))?;
+    } else {
+        validate_package(&request)?;
+    }
     let admission = fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(&config)?
         .context("reaped-worker recovery requires the configured physical-host ledger")?;
+    if let Some((completion_path, completion_bytes, completion_pin, completion)) = &completion_input {
+        // Host writer precedes the store writer, and validates durable release
+        // proofs without publishing or releasing anything in the host ledger.
+        return admission.ledger().with_container_runtime_recovery_quiescence(|snapshot| {
+            let _writer = store.write_transaction()?;
+            let released = snapshot.reservations.iter().find(|row| row.identity == request.identity)
+                .context("archive completion exact released reservation missing")?;
+            validate_completion_state(&request, completion, &store, released)?;
+            super::accepted_study_supervisor::validate_reaped_supervisor_slot(
+                &store, &request.claim, &request.request_id, &request.supervisor_slot,
+            )?;
+            if read_stable_absolute_operational_file(&config_path, 65_536)? != config_bytes
+                || read_stable_absolute_operational_file(&request_path, MAX_BYTES)? != bytes
+                || read_stable_absolute_operational_file(completion_path, MAX_BYTES)? != *completion_bytes
+                || read_stable_store_operational_file(&store, RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH, MAX_BYTES)? != owner_bytes
+            {
+                bail!("archive completion authorization changed before publication");
+            }
+            validate_process_receipt(&request, store.root())?;
+            validate_current_package(&completion.tool)?;
+            validate_package_files(&PackagePins::from_request(&request),
+                &completion.retained_package_root.join("bin/fullmag-runtime-service"))?;
+            if !verification_only {
+                super::accepted_study_supervisor::archive_reaped_supervisor_slot(
+                    &store, &request.claim, &request.request_id, &request.supervisor_slot, released,
+                )?;
+            }
+            let (_, archive) = super::accepted_study_supervisor::validate_reaped_supervisor_slot(
+                &store, &request.claim, &request.request_id, &request.supervisor_slot,
+            )?;
+            println!("{}", serde_json::json!({
+                "schema_version": COMPLETION_SCHEMA,
+                "status": if verification_only { "verified_reaped_worker_archive_completion" } else { "completed_reaped_worker_archive" },
+                "original_request_sha256": pin, "completion_sha256": completion_pin,
+                "release_proof_sha256": released.release_proof_sha256, "supervisor_slot_archive": archive,
+                "terminal_state_modified": false, "leases_modified": false, "solve_replayed": false,
+                "archive_applied": !verification_only
+            }));
+            Ok(())
+        });
+    }
     let snapshot = admission.ledger().read()?;
     let reservation = snapshot
         .reservations
@@ -1298,6 +1493,18 @@ mod tests {
             .unwrap();
         released.state = HostResourceReservationState::Released;
         released.release_proof_sha256 = Some("a".repeat(64));
+        let collision = fixture.store.root().join(format!(
+            "reaped-worker-recovery/{}/supervisor-slot", fixture.request.request_id));
+        std::fs::create_dir_all(&collision).unwrap();
+        assert!(archive_reaped_supervisor_slot(
+            &fixture.store, &fixture.request.claim, &fixture.request.request_id,
+            &fixture.request.supervisor_slot, &released,
+        ).is_err());
+        assert!(active.exists());
+        assert_eq!(std::fs::read_dir(&collision).unwrap().count(), 0);
+        std::fs::remove_dir(&collision).unwrap(); // fixture-owned empty collision only
+        use std::os::unix::fs::MetadataExt;
+        let active_inode = std::fs::metadata(&active).unwrap().ino();
         archive_reaped_supervisor_slot(
             &fixture.store,
             &fixture.request.claim,
@@ -1322,6 +1529,9 @@ mod tests {
         )
         .unwrap();
         assert!(!active.exists());
+        assert_eq!(std::fs::metadata(&archived).unwrap().ino(), active_inode);
+        assert!(archived.starts_with(fixture.store.root().join("reaped-worker-recovery")));
+        assert!(!archived.starts_with(fixture.store.root().join("runtime-services")));
         assert_eq!(
             std::fs::read(archived.join("owner.v2.json")).unwrap(),
             owner
@@ -1362,4 +1572,159 @@ mod tests {
         .pending
         .is_some());
     }
+
+    fn completion_fixture() -> (Fixture, HostResourceReservation, Completion) {
+        let mut fixture = fixture();
+        let mut released = reservation(&fixture.request);
+        fixture.request.reservation_sha256 = digest(&released).unwrap();
+        let recovered = validate_attempt(&fixture.request, &fixture.store).unwrap();
+        terminalize(&fixture.request, &fixture.store, recovered).unwrap();
+        fixture.store.release_resource_lease(&fixture.lease).unwrap();
+        released.state = HostResourceReservationState::Released;
+        released.release_proof_sha256 = Some("e".repeat(64));
+        let recovered = validate_attempt(&fixture.request, &fixture.store).unwrap();
+        let decision = fixture.store.read_retry_decision("run", &fixture.request.event_id()).unwrap().unwrap();
+        let completion = Completion {
+            schema_version: COMPLETION_SCHEMA.into(),
+            original_request_sha256: "f".repeat(64),
+            retained_package_root: PathBuf::from("/package/.development/backups/.backend-package-backup-old"),
+            tool: PackagePins {
+                package_receipt_sha256: "1".repeat(64), executable_sha256: "2".repeat(64),
+                build_commit: "3".repeat(40), source_snapshot_sha256: "4".repeat(64),
+            },
+            failure_event_sha256: digest(recovered.events.last().unwrap()).unwrap(),
+            retry_decision_sha256: digest(&decision).unwrap(),
+            release_proof_sha256: "e".repeat(64),
+        };
+        (fixture, released, completion)
+    }
+
+    fn tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut result = BTreeMap::new();
+        fn visit(path: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { visit(&path, result); }
+                else { result.insert(path.clone(), std::fs::read(path).unwrap()); }
+            }
+        }
+        visit(root, &mut result);
+        result
+    }
+
+    #[test]
+    fn archive_completion_validates_original_terminal_history_without_mutation() {
+        let (fixture, released, completion) = completion_fixture();
+        let reason = fixture.request.failure_reason().unwrap();
+        let request_bytes = serde_json::to_vec(&fixture.request).unwrap();
+        let before = tree_bytes(fixture.store.root());
+        validate_completion_state(&fixture.request, &completion, &fixture.store, &released).unwrap();
+        validate_completion_state(&fixture.request, &completion, &fixture.store, &released).unwrap();
+        for field in ["host_state", "release_proof", "event", "decision", "original_tool"] {
+            let mut changed = completion.clone();
+            let mut row = released.clone();
+            let mut original = fixture.request.clone();
+            match field {
+                "host_state" => { row.state = HostResourceReservationState::Committed; row.release_proof_sha256 = None; }
+                "release_proof" => changed.release_proof_sha256 = "9".repeat(64),
+                "event" => changed.failure_event_sha256 = "9".repeat(64),
+                "decision" => changed.retry_decision_sha256 = "9".repeat(64),
+                _ => original.executable_sha256 = "9".repeat(64),
+            }
+            assert!(validate_completion_state(&original, &changed, &fixture.store, &row).is_err(), "{field}");
+        }
+        assert_eq!(tree_bytes(fixture.store.root()), before);
+        assert_eq!(fixture.request.failure_reason().unwrap(), reason);
+        assert_eq!(serde_json::to_vec(&fixture.request).unwrap(), request_bytes);
+        assert_ne!(completion.tool.executable_sha256, fixture.request.executable_sha256);
+    }
+
+    #[test]
+    fn archive_completion_envelope_binds_original_request_and_exact_backup_namespace() {
+        let (_, _, mut completion) = completion_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("package");
+        std::fs::create_dir_all(package.join(".development/backups")).unwrap();
+        completion.retained_package_root = package.join(".development/backups/.backend-package-backup-old");
+        completion.validate(&"f".repeat(64), &package).unwrap();
+        assert!(completion.validate(&"0".repeat(64), &package).is_err());
+        let mut changed = completion.clone();
+        changed.retained_package_root = package.join(".development/candidates/.backend-package-candidate-new");
+        assert!(changed.validate(&"f".repeat(64), &package).is_err());
+        let mut changed = completion.clone();
+        changed.tool.executable_sha256 = "unpinned".into();
+        assert!(changed.validate(&"f".repeat(64), &package).is_err());
+        let mut document = serde_json::to_value(&completion).unwrap();
+        document["replace_original_request"] = true.into();
+        assert!(serde_json::from_value::<Completion>(document).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.path(), &completion.retained_package_root).unwrap();
+            assert!(completion.validate(&"f".repeat(64), &package).is_err());
+        }
+    }
+
+    #[test]
+    fn archive_completion_package_files_require_both_receipt_and_executable_pins() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join(".backend-package-backup-old");
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        let executable = package.join("bin/fullmag-runtime-service");
+        let binary = b"exact retained executable bytes";
+        std::fs::write(&executable, binary).unwrap();
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "schema": "fullmag.direct-compose.backend-build-receipt.v1", "state": "succeeded",
+            "source": {"resolved_commit": "a".repeat(40), "source_snapshot_sha256": "b".repeat(64)},
+            "artifacts": [{"path":"bin/fullmag-runtime-service","sha256":fullmag_session::hex_sha256(binary),"size":binary.len()}]
+        })).unwrap();
+        std::fs::write(package.join("backend-build-receipt.json"), &receipt).unwrap();
+        let pins = PackagePins {
+            package_receipt_sha256: fullmag_session::hex_sha256(&receipt),
+            executable_sha256: fullmag_session::hex_sha256(binary),
+            build_commit: "a".repeat(40), source_snapshot_sha256: "b".repeat(64),
+        };
+        validate_package_files(&pins, &executable).unwrap();
+        for field in ["receipt", "executable", "commit", "snapshot"] {
+            let mut changed = pins.clone();
+            match field {
+                "receipt" => changed.package_receipt_sha256 = "0".repeat(64),
+                "executable" => changed.executable_sha256 = "0".repeat(64),
+                "commit" => changed.build_commit = "0".repeat(40),
+                _ => changed.source_snapshot_sha256 = "0".repeat(64),
+            }
+            assert!(validate_package_files(&changed, &executable).is_err(), "{field}");
+        }
+        std::fs::write(&executable, b"changed retained executable").unwrap();
+        assert!(validate_package_files(&pins, &executable).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_completion_preserves_legacy_archive_and_refuses_duplicate_slot() {
+        use super::super::accepted_study_supervisor::validate_reaped_supervisor_slot;
+        let mut fixture = fixture();
+        fixture.request.supervisor_slot.process_id = u32::MAX - 1;
+        let owner = serde_json::to_vec(&serde_json::json!({
+            "schema_version":"fullmag.accepted_worker_supervisor_slot.v3",
+            "process_id":fixture.request.supervisor_slot.process_id,
+            "process_start_token":fixture.request.supervisor_slot.process_start_token,
+            "run_id":"run","task_id":"task","resource_id":"cpu","max_concurrency":1,
+            "acquired_at":fixture.request.expected_owner.acquired_at,
+        })).unwrap();
+        fixture.request.supervisor_slot.owner_sha256 = fullmag_session::hex_sha256(&owner);
+        let legacy = fixture.store.root().join(format!(
+            "runtime-services/reaped-worker-recovery/{}/supervisor-slot",fixture.request.request_id));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("owner.v2.json"), &owner).unwrap();
+        let (active, selected) = validate_reaped_supervisor_slot(
+            &fixture.store,&fixture.request.claim,&fixture.request.request_id,&fixture.request.supervisor_slot).unwrap();
+        assert_eq!(selected,legacy);
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("owner.v2.json"), &owner).unwrap();
+        assert!(validate_reaped_supervisor_slot(
+            &fixture.store,&fixture.request.claim,&fixture.request.request_id,&fixture.request.supervisor_slot).is_err());
+        assert_eq!(std::fs::read(legacy.join("owner.v2.json")).unwrap(),owner);
+        assert_eq!(std::fs::read(active.join("owner.v2.json")).unwrap(),owner);
+    }
+
 }

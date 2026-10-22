@@ -2324,3 +2324,41 @@ Actual apply f975dc21... exit0: failed-confirmed, helpery i manager zakończone,
 marker-only kandydat/logi zachowane, cztery locki dostępne, active nie istnieje.
 Pełny przebieg, nowe piny i dowód niezmienionego zakresu opisuje przegląd ad780.
 API i scientific claim nadal wymagają następnego pakietu oraz oddzielnego recovery.
+
+
+### Checkpoint 23.10.2026 — zwolniona rezerwacja i niedokończone archiwum
+
+Pakiet69a7ff212193917ee7b5cec74cf741721e8a62b5 został rzeczywiście
+zbudowany i promowany w tym samym backendzie własnej grupy, bez utraty cache.
+Native verify-only requestu23a9ecd41c672d91c9572401e073b7f86d50ab481e1c1aed9f43ae7b0b93d0ee
+przeszedł; 66 obserwowanych plików pozostało identycznych. Użytkownik zatwierdził
+jego zastosowanie. Failed/DoNotRetry, catalog revision47, lokalny Released i
+host Released z proof62a33d02037dc04728289f5b57f4ffa95453aaa6134a9f68f3439807085e3374
+są już trwałe. Końcowe archive odmówiło EXDEV: runtime-services jest overmountem
+innego wolumenu. Aktywny slot oraz częściowy Zarr zachowały bajty. API nadal
+zatrzymane; żadne nowe Solve nie wystartowało. Dokładny stan, piny i następny
+krok opisuje 2026-10-22-failed-worker-recovery-proposal.md.
+
+CI69 zaliczyło rzeczywiste kroki browser-fixture-smoke oraz
+inspector-actions-browser-smoke. Rust odmówił na starym komunikacie testu
+host_admission_retries_when_ledger_writer_is_temporarily_busy: marker jest
+obecnie porównywany z trwałą historią, a nie z błędną żądaną polityką.
+Commitc280454563a87b820b2221587a8136191a1ce785 poprawia wyłącznie cfg(test),
+zachowuje szybkie odrzucenie trwałego błędu i odróżnienie StoreWriterBusy.
+Parser PASS, nowe CI jeszcze w toku; lokalnych unitów Rust nie kompilowano.
+
+Commit4f7426f18b1dbcb46dc2c9e23b207e837a723bc6 naprawia walidację aliasu
+bind mountu WSL w codegen: tylko po exact succeeded DEV admission, terminalu,
+config digest, obu container/image IDs, źródle, pełnej izolacji i daemon pins.
+40 testów interpretowanych oraz odczyt rzeczywistych obu usług PASS;
+oryginalny kod odrzucał regresję. Codegen jeszcze niewykonany — wymaga nowego
+zgodnego pakietu. Poprawka cold-open pozostaje w11 lokalnych plikach Rust.
+Dowody codegen-wsl-bind-20261023/ w wolumenie kontrolnym.
+
+Retencja: brak fullmag-build-stage-cleanup w tym worktree; zastosowano reguły
+build-storage governance i procedury Docker. Zachowano aktualny pakiet69,
+rollbacka925, aktywny cache, control i całą historię; niczego nie usuwano.
+Wolne598693941248bajtów. Ocena: pre-archive-fix-build-retention.json w
+verification/public-loop-solve-fixed-binding-20261022/. Referencje oryginalnego
+requestu i wyniku nadal wymagają tych pakietów. E1–E12 pozostają otwarte,
+bez accepted V/J/H i bez kwalifikowanego parytetu BORIS.

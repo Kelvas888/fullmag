@@ -1,7 +1,10 @@
 # Finalizacja znanego błędu zakończonego workera — propozycja do review
 
-Status: przygotowany patch, bez kompilacji lokalnych unitów Rust i bez wykonania
-recovery. Aktywacja wymaga nowego pakietu, CI, konkretnego requestu i decyzji operatora.
+Status aktualny 23.10.2026: zatwierdzona finalizacja zapisała Failed/DoNotRetry
+i zwolniła dokładną rezerwację CPU; archiwizacja slotu nie powiodła się z EXDEV.
+API pozostaje zatrzymane. Poniższy pierwotny przegląd opisuje stan przed operacją;
+wynik i ograniczenia znajdują się w końcowym checkpointcie. Lokalnych unitów Rust
+nie kompilowano.
 
 ## Rzeczywisty stan i sprostowanie wcześniejszej hipotezy
 
@@ -170,3 +173,73 @@ request SHA i mutations_applied=false. Błędne i powtórzone opcje są odrzucan
 Weryfikacja przed zgodą zostanie porównana z pełnymi hashami trwałego stanu;
 aktualne źródła nie są jeszcze dowodem wykonania tej ścieżki. Po jej sukcesie
 konkretna aktywacja nadal wymaga osobnej decyzji operatora dla tego samego SHA.
+
+
+## Wykonanie zatwierdzonego requestu — 23.10.2026
+
+Zarządzany build `0e30f618f98e49cc973b7dd8b545cf30` i promocja
+`9f40a801672048b4b224d3db6263de39` zakończyły się exit0 w tym samym
+stałym backendzie własnej grupy. Pakiet: commit
+`69a7ff212193917ee7b5cec74cf741721e8a62b5`, snapshot
+`a9aee69fe28d4f345632e33f49445c937d1a2fe2f027d92f3881a69c1018be95`,
+receipt SHA256 `a5e6c76c01351868fe7a077e32193e331a27fe902ad7bc55b9fe28d1aebcd3c4`.
+Produkcja zawiera korekcję RT0/KKT; nie oznacza to wykonania nowego solve.
+
+Native verify-only requestu raw SHA256
+`23a9ecd41c672d91c9572401e073b7f86d50ab481e1c1aed9f43ae7b0b93d0ee`
+zakończył się exit0; 66 obserwowanych plików pozostało identycznych.
+Po jednoznacznej zgodzie użytkownika wykonano dokładnie ten request.
+Proces zakończył się exit1 dopiero na archiwizacji slotu:
+`Invalid cross-device link (os error 18)`.
+
+Potwierdzony stan po operacji:
+
+- katalog revision47: Failed/Disconnected; istnieje DoNotRetry;
+- lokalny compute lease Released, heartbeat18;
+- dokładna rezerwacja Solver Released z istniejącym proof SHA256
+  `62a33d02037dc04728289f5b57f4ffa95453aaa6134a9f68f3439807085e3374`;
+- cały aktywny slot i owner SHA256
+  `1556112ac3c3af1d850125e1b9f25691d59ae2f91f6c21d29c914a74c7d8f89d`
+  pozostały zachowane; cel archiwizacji nie istnieje;
+- częściowy wynik Zarr zachował wszystkie uprzednio zapisane hashe;
+- API pozostaje zatrzymane; nie ponowiono Solve ani recovery.
+
+Przyczyna: aktywny slot i store znajdują się na mount ID1298/dev2096,
+a `runtime-services` jest overmountem wolumenu kontrolnego, mount ID1310/dev2112.
+Atomic rename nie przenosi między mountami. Verify-only nie sprawdził tego
+warunku przed trwałą finalizacją. Samo równe st_dev też nie dowodzi zgodności
+mountów. Pełny wynik znajduje się w wolumenie kontrolnym pod
+`verification/public-loop-solve-fixed-binding-20261022/reaped-worker-native-preflight-69a7ff212/`,
+pliki `activation-result.json` i `post-activation-observed-state.json`.
+
+Dokończenie wymaga poprawki natywnej archiwizacji oraz nowego pakietu i
+preflightu. Oryginalny request pozostaje niezmieniony: jego canonical digest
+jest częścią już zapisanego Failed reason. Nowe narzędzie musi być osobno
+przypięte i sprawdzić stary pakiet zachowany przy promocji. Operacja domykająca
+nie może ponownie terminalizować, zwalniać rezerwacji, zmieniać inboxu ani
+przepisywać historii. Archiwum ma znaleźć się poza overmountem runtime-services,
+na tym samym mount co slot, z zachowaniem zgodności odczytu dawnego archiwum.
+To plan poprawki, nie dowód jej wykonania. Żadnego accepted V/J/H.
+
+
+## Poprawka źródłowa domknięcia archiwum
+
+Nowy jawny `--complete-reaped-worker-archive` przyjmuje niezmieniony oryginalny
+request i osobny envelope `runtime_service_reaped_worker_archive_completion.v1`.
+Envelope przypina raw SHA oryginału, dokładny retained backup jego pakietu,
+cztery piny nowego narzędzia, canonical Failed event/DoNotRetry oraz już istniejący
+release proof. Pod HOST→STORE writer potwierdza terminalną historię i oba Released;
+nie terminalizuje, nie publikuje nowego release, nie ACK i nie ponawia solve.
+Nowe archiwum: `store/reaped-worker-recovery/<request-id>/supervisor-slot`.
+Czytnik zachowuje legacy archive i odmawia wielu lokalizacji. Mount ID/dev
+rzeczywistego slotu oraz rodziców są sprawdzane przed pierwszą mutacją i przed
+FD-relative renameat2 NOREPLACE. Sprawdzany jest inode oraz fsync ancestorów
+przed rename i na replay. Verify-only nie tworzy katalogów archiwum.
+
+Parser Rust i diff-check PASS; nowe focused regresje historii, envelope,
+package pins, mountów, collision/inode/replay są przygotowane dla CI.
+Brak lokalnej kompilacji Rust unitów. Build/promocja nowego narzędzia,
+rzeczywisty preflight oraz dokończenie archiwizacji pozostają NOT VERIFIED.
+Freeze i dokładny CLI/schema: wolumen kontrolny,
+`verification/public-loop-solve-fixed-binding-20261022/archive-completion-source-review-20261023.json`,
+SHA256 `945ac79e176374ddb11dc0e043e16b64ab6e975df04d855574213eb454534936`.
