@@ -16,6 +16,17 @@ import docker_dev_codegen as codegen  # noqa: E402
 
 
 class DockerDevCodegenTests(unittest.TestCase):
+    def test_failed_command_retains_both_streams_and_exit_code(self) -> None:
+        command = [sys.executable, '-B', '-c',
+                   'import sys; print("compiler diagnostic"); print("wrapper failure", file=sys.stderr); sys.exit(7)']
+        with mock.patch.object(codegen, '_docker_argv', return_value=command):
+            with self.assertRaises(codegen.CodegenError) as raised:
+                codegen._capture(('fixture',), timeout=5)
+        self.assertEqual(raised.exception.exit_code, 7)
+        self.assertEqual(raised.exception.stdout.strip(), b'compiler diagnostic')
+        self.assertEqual(raised.exception.stderr.strip(), b'wrapper failure')
+        self.assertFalse(raised.exception.reconciliation_required)
+
     @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires executable POSIX shell fixture")
     def test_just_wrapper_preserves_explicit_codegen_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

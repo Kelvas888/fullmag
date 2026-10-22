@@ -203,9 +203,13 @@ if root.exists():
 class CodegenError(RuntimeError):
     """The existing DEV services did not satisfy the codegen contract."""
 
-    def __init__(self, message: str, *, reconciliation_required: bool = False) -> None:
+    def __init__(self, message: str, *, reconciliation_required: bool = False,
+                 stdout: bytes = b"", stderr: bytes = b"", exit_code: int | None = None) -> None:
         super().__init__(message)
         self.reconciliation_required = reconciliation_required
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
 
 
 def _sha256(data: bytes) -> str:
@@ -405,7 +409,8 @@ def _capture(arguments: Sequence[object], *, timeout: int = 120,
     stderr = bytes(output["stderr"])
     if process.returncode:
         message = stderr.decode("utf-8", "replace").strip() or stdout.decode("utf-8", "replace").strip()
-        raise CodegenError(message or f"Docker command failed ({process.returncode})")
+        raise CodegenError(message or f"Docker command failed ({process.returncode})",
+                           stdout=stdout, stderr=stderr, exit_code=process.returncode)
     return stdout, stderr
 
 
