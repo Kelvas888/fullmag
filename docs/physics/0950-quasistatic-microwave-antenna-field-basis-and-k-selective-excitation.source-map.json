@@ -7884,8 +7884,8 @@
       "id": "antenna-rt0-full-kkt-owner",
       "path": "backends/fem/cpu/mfem/transport/conservative_current_view.cpp",
       "symbol": "solve_weighted_rt0_projection",
-      "responsibility": "Istniejący sparse KKT owner; planned full residual correction przed owned field, bez zmian dense/CG/physics gates.",
-      "evidence_status": "planned_contract"
+      "responsibility": "Pełny same-operator sparse KKT true-residual refinement przed owned field; SOURCE_IMPLEMENTED, native build/runtime NOT VERIFIED; dense/CG i final physical gates bez zmian.",
+      "evidence_status": "source_only"
     },
     {
       "id": "antenna-rt0-refinement-physical-certificate",
@@ -7907,6 +7907,20 @@
       "symbol": "void large_tetrahedral_projection_uses_sparse_kkt_lane",
       "responsibility": "Istniejący punkt rozszerzenia regresji ponad4096DOF; nowe przypadki niewykonane.",
       "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-rt0-refinement-exact-witness",
+      "path": "backends/fem/tests/conservative_current_view_contract.cpp",
+      "symbol": "void global_kkt_norm_does_not_certify_a_local_current_balance",
+      "responsibility": "Exact-rational witness: global residual przechodzi przy błędnym lokalnym bilansie; pełna korekcja obu bloków. Native NOT COMPILED/NOT EXECUTED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-rt0-refinement-si-regression",
+      "path": "backends/fem/tests/conservative_current_view_contract.cpp",
+      "symbol": "void sparse_terminal_source_preserves_local_si_balances_and_h1_reactions",
+      "responsibility": "Real sparse4410face/4018freeDOF i H1→RT0 w SI, local gates, original-K reactions, analytic J/power, immutable getters; nie gwarantuje refinement trigger. Native NOT COMPILED/NOT EXECUTED.",
+      "evidence_status": "source_only"
     }
   ],
   "public_api": {

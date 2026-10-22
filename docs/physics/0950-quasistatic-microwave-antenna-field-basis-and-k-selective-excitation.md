@@ -9431,9 +9431,10 @@ Przypięta rewizja źródeł MFEM odpowiada odczytanej recepturze budowy; odręb
 (antenna-rt0-true-residual-kkt-refinement-v1)=
 ## FEM CPU: prerejestracja pełnej korekcji rzeczywistego residualu RT0/KKT — 22.10.2026
 
-**Stan: SOURCE_PLANNED; implementacja, native runtime i kwalifikacja naukowa
-NOT VERIFIED.** To prerejestracja przed zmianą C++, dotycząca wyłącznie sparse
-MINRES w `conservative_current_view.cpp::solve_weighted_rt0_projection`.
+**Stan: SOURCE_IMPLEMENTED; native build, runtime i kwalifikacja naukowa
+NOT VERIFIED.** Prerejestracja powstała w commicie
+`2fba2495b6cd4b8ded3a61b343ea371ea40a9149` przed zmianą C++; algorytm ma teraz
+realizację źródłową, dotyczącą wyłącznie sparse MINRES w `conservative_current_view.cpp::solve_weighted_rt0_projection`.
 Dense KKT oraz CG dla układu bez constraints pozostają bez zmian. Nie jest to
 nowa fizyka, nowy backend ani publiczny parametr. Zachowujemy pełny conductor,
 coincident cut, source voltage, conductivity, gauge, zaakceptowany H1 snapshot,
@@ -9590,12 +9591,13 @@ nie ma fallbacku CPU/GPU ani alternatywnej sesji/ścieżki wyników.
 
 | Realizacja | Zakres / stan dowodu |
 |---|---|
-| FEM CPU | SOURCE_PLANNED: serial affine Tet4 sparse RT0/KKT; native runtime i kwalifikacja NOT VERIFIED |
+| FEM CPU | SOURCE_IMPLEMENTED: serial affine Tet4 sparse RT0/KKT; native build/runtime i kwalifikacja NOT VERIFIED |
 | FEM GPU | poza zakresem; brak implementacji refinement i brak parytetu |
 | FDM CPU | nie dotyczy: inna dyskretyzacja charge/current; bez zmian |
 | FDM GPU | nie dotyczy: inna realizacja; bez zmian i bez fallbacku |
 
-Przed implementacją rejestrujemy następujące dowody do wykonania:
+Przed implementacją zarejestrowano następujące dowody; ich native wykonanie
+pozostaje wymagane:
 
 1. Dokładny analityczny SPD M / signed D demonstrator: globalny residual i
    wewnętrzny relative stop mogą przejść przy lokalnym residualu większym od
@@ -9620,7 +9622,14 @@ kryterium przy dokładnym residualu constraint 2.263047571332468e-15 A,
 local gate 1.3641510305998915e-15 A i zerowej stationarity. Nie jest testem
 MFEM ani dowodem wykonania planowanej poprawki. Powyższe native/mesh/field
 regresje pozostają NOT EXECUTED. Strukturalny validator dokumentacji nie jest
-naukowym certyfikatem. Odroczone: implementacja, review, zarządzany build i
+naukowym certyfikatem. Zapisano native exact KKT counterexample oraz
+nieopcjonalną regresję accepted H1→RT0 na siatce7×7×7 Tet4:4410 face DOF i
+4018 free DOF; asercje obejmują rzeczywisty sparse path, każdy lokalny bilans,
+terminalowe original-K reactions, analityczny J/power i niezmienność getterów.
+Sam ten mesh test nie gwarantuje wykonania rundy refinement; trigger korekcji
+wymaga późniejszego odtworzenia identycznej pętli, która wcześniej failowała.
+Nie dodano publicznej diagnostyki ani injection seam wyłącznie dla testu.
+Odroczone: review, zarządzany build i
 rzeczywisty publiczny solve, niezależne oracle oraz pełna kwalifikacja E2/E3.
 
 Podstawa metody: Higham 1995 [16], sekcja 1 (residual/correction/update), oraz
@@ -9630,11 +9639,13 @@ uzasadniają metodę i rozróżnienie norm; nie dowodzą jej realizacji w Fullma
 | Ścieżka | Symbol / DOC-ANCHOR | Odpowiedzialność / evidence |
 |---|---|---|
 | `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-rt0-true-residual-kkt-refinement-v1` | prerejestracja równań, SI, polityki i testów; planned contract |
-| `backends/fem/cpu/mfem/transport/conservative_current_view.cpp` | `solve_weighted_rt0_projection` | istniejący właściciel sparse KKT; refinement dopiero SOURCE_PLANNED |
+| `backends/fem/cpu/mfem/transport/conservative_current_view.cpp` | `solve_weighted_rt0_projection` | istniejący właściciel sparse KKT; refinement SOURCE_IMPLEMENTED, native build/runtime NOT VERIFIED |
 | `backends/fem/cpu/mfem/transport/conservative_current_view.cpp` | `integrate_physical_certificate` | final niezależny physical Piola certificate; ma pozostać bez zmian |
 | `backends/fem/cpu/mfem/transport/affine_rt0_element.cpp` | `AffineRt0Element::face_moment` | exact-rational pomiar frozen coefficients; nie solver repair |
 | `backends/fem/cpu/mfem/transport/periodic_charge_potential.cpp` | `PeriodicChargePotentialSolver::Solve` | existing original-K paired weak reaction certificate; bez nowego solve |
-| `backends/fem/tests/conservative_current_view_contract.cpp` | `void large_tetrahedral_projection_uses_sparse_kkt_lane` | istniejący punkt rozszerzenia native regression ponad cutoff; nowe wykonanie NOT VERIFIED |
+| `backends/fem/tests/conservative_current_view_contract.cpp` | `void large_tetrahedral_projection_uses_sparse_kkt_lane` | istniejący opcjonalny native control ponad cutoff; nowe wykonanie NOT VERIFIED |
+| `backends/fem/tests/conservative_current_view_contract.cpp` | `void global_kkt_norm_does_not_certify_a_local_current_balance` | exact-rational mały witness obu residual blocks; SOURCE_IMPLEMENTED, native test NOT COMPILED/NOT EXECUTED |
+| `backends/fem/tests/conservative_current_view_contract.cpp` | `void sparse_terminal_source_preserves_local_si_balances_and_h1_reactions` | real sparse4410face/4018freeDOF, H1→RT0 w SI i niezmienne original-K reactions; SOURCE_IMPLEMENTED, native test NOT COMPILED/NOT EXECUTED |
 
 (antenna-source-code-index)=
 ### 13.1 Source-code index
