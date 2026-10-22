@@ -464,7 +464,9 @@ describe("CameraControls", () => {
     expect(fit.target).toEqual([1e-7, 0, 0]);
     expect(fit.position[0]).toBeCloseTo(2.4e-7);
     expect(fit.near).toBeLessThan(1e-8);
-    expect(fit.far).toBeGreaterThan(1e-6);
+    const distance = Math.hypot(...fit.position.map((value, index) => value - fit.target[index]));
+    expect(fit.far).toBeGreaterThan(distance + 5e-8);
+    expect(fit.far).toBeLessThan(1e-6);
   });
 
   it("fits narrower viewports and changed FOV without using a fixed camera distance", () => {
