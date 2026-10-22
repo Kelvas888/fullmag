@@ -105,12 +105,8 @@ pub(crate) fn prepare_accepted_fem_execution(
     validate_native_fem_preflight(&problem, &execution_plan, runtime)?;
     let stage_mesh = StageFemMeshAsset::build_from_backend_plan(&execution_plan.backend_plan)
         .context("accepted FEM plan has no stage mesh identity")?;
-    let until_seconds = accepted_step
-        .until_seconds
-        .context("accepted FEM step has no pinned runner horizon")?;
-    if !until_seconds.is_finite() || until_seconds <= 0.0 {
-        bail!("accepted FEM runner horizon is invalid");
-    }
+    let until_seconds = crate::accepted_study_worker::accepted_runner_horizon(accepted_step)
+        .context("accepted FEM step runner horizon")?;
 
     Ok(AcceptedFemPreparedExecution {
         case_id: case_id.to_owned(),

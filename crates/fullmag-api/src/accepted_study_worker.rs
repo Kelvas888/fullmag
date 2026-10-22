@@ -1628,6 +1628,30 @@ fn fdm_cpu_observation_grid(accepted_step: &AcceptedWorkerStep) -> Option<[u32; 
     .then_some(fdm_plan.grid.cells)
 }
 
+/// The runner horizon of an accepted step. Time evolution needs a pinned
+/// positive `until_seconds`; a relaxation without one runs until its stop
+/// criteria, exactly as the script path resolves it
+/// (`resolve_relaxation_until_seconds`: `max_relaxation_time_s`, else unbounded).
+pub(crate) fn accepted_runner_horizon(accepted_step: &AcceptedWorkerStep) -> Result<f64> {
+    let until_seconds = match (accepted_step.until_seconds, &accepted_step.problem.study) {
+        (Some(until_seconds), _) => until_seconds,
+        (None, fullmag_ir::StudyIR::Relaxation { dynamics, stop, .. }) => {
+            fullmag_application::script_stage_materialization::resolve_relaxation_until_seconds(
+                dynamics, stop,
+            )
+        }
+        (None, _) => bail!("accepted worker step has no pinned runner horizon"),
+    };
+    let relaxation = matches!(&accepted_step.problem.study, fullmag_ir::StudyIR::Relaxation { .. });
+    if until_seconds.is_nan()
+        || until_seconds <= 0.0
+        || (until_seconds.is_infinite() && !relaxation)
+    {
+        bail!("accepted worker runner horizon is invalid");
+    }
+    Ok(until_seconds)
+}
+
 fn expected_output_binding(
     port: &StudyOutputPort,
 ) -> Result<(&'static str, &'static str, &'static str)> {
@@ -2336,12 +2360,7 @@ pub(crate) fn execute_accepted_worker_start(
         }
     }
 
-    let until_seconds = accepted_step
-        .until_seconds
-        .context("accepted worker step has no pinned runner horizon")?;
-    if !until_seconds.is_finite() || until_seconds <= 0.0 {
-        bail!("accepted worker runner horizon is invalid");
-    }
+    let until_seconds = accepted_runner_horizon(accepted_step)?;
     let execution_plan = materialize_resolved_study_inputs(store, accepted_step)
         .context("materialize accepted CAS inputs for the runner")?;
     let receipt_identity = worker_execution_receipt_identity(start, accepted_step, case_id)?;
