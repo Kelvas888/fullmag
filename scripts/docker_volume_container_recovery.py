@@ -730,6 +730,18 @@ def _ledger_snapshot_mount(control, backend, compose):
     if retained is None and mounted.get("Type") == "bind":
         source = _bind_source(backend, "/host-ledger")
         return f"type=bind,src={source},dst=/host-ledger,readonly", None
+    import docker_group_ledger as group_ledger
+    if retained is None and group_ledger.is_group_ledger_mount(mounted):
+        # A DEV group ledger is the group's own named volume (ADR 0067).
+        if not isinstance(compose, Mapping) or compose.get("name") != control.project:
+            _fail("group ledger requires its retained Compose document")
+        expected = compose.get("volumes", {}).get(group_ledger.COMPOSE_VOLUME)
+        if (not isinstance(expected, Mapping) or expected.get("external") is not True
+                or expected.get("name") != mounted.get("Name")
+                or not group_ledger.is_group_ledger_backend(service.get("environment", {}))
+                or mounted.get("Driver") != "local" or mounted.get("RW") is not True):
+            _fail("group ledger mount differs from its retained Compose volume")
+        return f"type=volume,src={mounted['Name']},dst=/host-ledger,readonly,volume-nocopy", None
     if not isinstance(retained, Mapping) or not isinstance(compose, Mapping):
         _fail("host-ledger volume requires its retained Compose descriptor")
     try:
@@ -1722,6 +1734,14 @@ def recover(args: argparse.Namespace) -> None:
         },
     }
     with control.operation("development", operation_inputs) as operation:
+        # Recovery keeps the ledger of the stopped backend; its storage proof
+        # was taken from that ledger. A later normal start may switch it.
+        import docker_group_ledger as group_ledger
+        operation["receipt"]["ledger_profile"] = (
+            group_ledger.PROFILE
+            if group_ledger.is_group_ledger_backend(
+                compose.get("services", {}).get("backend", {}).get("environment", {}))
+            else "host-ledger-v1")
         fresh = _revalidate_recovery_boundary(
             control,
             authorization,

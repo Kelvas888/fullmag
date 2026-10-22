@@ -7,23 +7,19 @@ Stan implementacji:
 
 | Punkt | Stan |
 |---|---|
-| 1. Ledger per grupa | **niezaimplementowany**; grupy DEV nadal współdzielą globalny `host-ledger-v1` (etap R2.9 audytu) |
+| 1. Ledger per grupa | zaimplementowany w launcherze i runtime (`group-ledger-v1`, 21.10.2026); dowód runtime w sekcji Weryfikacja |
 | 2. Statyczne budżety `FULLMAG_DEV_*` | zaimplementowane w launcherze |
 | 3. Automatyczny port | zaimplementowany w launcherze |
-| 4. Zasada zmian stanu DEV | obowiązuje dla nowych zmian; jedyny wyjątek to istniejący globalny ledger do czasu punktu 1 |
+| 4. Zasada zmian stanu DEV | obowiązuje; globalny ledger dotyczy już tylko release, kwalifikacji i managed runtime |
 
-Dopóki punkt 1 nie zostanie wdrożony, migracja polityki globalnego ledgera
-nadal wymaga skoordynowanego zatrzymania konsumentów `/host-ledger`
-(`--migrate-host-capacity`, ADR 0061).
-
-Pomiar 21.10.2026: globalny ledger przechowuje jedną readiness przypiętą do
-tożsamości builda (`source_snapshot_sha256`, `runtime_identity_sha256`).
-Backend z innym kodem musi ją obrócić, a rotacja wymaga braku aktywnego
-właściciela inwentarza (`host_resource_ledger.rs`, `upgrade_runtime_readiness`).
-Grupa `zen-nobel` przy działającej grupie Fali 0 zakończyła się błędem
-„runtime readiness rotation requires the host inventory owner to be absent”.
-Bez punktu 1 **tylko jedna grupa z danym kodem może mieć jednocześnie działające
-API**; budżety i port pozwalają równolegle budować, nie uruchamiać API.
+Pomiar przed punktem 1 (21.10.2026): globalny ledger przechowuje jedną
+readiness przypiętą do tożsamości builda (`source_snapshot_sha256`,
+`runtime_identity_sha256`). Backend z innym kodem musi ją obrócić, a rotacja
+wymaga braku aktywnego właściciela inwentarza (`host_resource_ledger.rs`,
+`upgrade_runtime_readiness`). Grupa `zen-nobel` przy działającej grupie Fali 0
+zakończyła się błędem „runtime readiness rotation requires the host inventory
+owner to be absent”. Ledger per grupa usuwa to sprzężenie: readiness grupy
+obraca wyłącznie jej własny backend przy własnym restarcie.
 
 ## Kontekst
 
@@ -41,12 +37,29 @@ wirtualnej Docker oraz porty loopback frontendu.
 ## Decyzja
 
 1. **Ledger per grupa w DEV.** Profil volume DEV (`docker_volume_dev`, cargo
-   `backend-dev`) używa ledgera w wolumenie kontrolnym własnej grupy: zwykłe
-   pliki i blokada `flock` (`writer.rs`), bez obrazu ext4, urządzenia loop,
-   uprzywilejowanego helpera i deskryptora pojemności hosta. Polityka ledgera
-   grupy jest jej własnym budżetem. W DEV nie ma admisji rezerwacji między
-   grupami. Globalny `host-ledger-v1` pozostaje jedynym źródłem prawdy dla
-   release, kwalifikacji i managed runtime (`fullmag_docker_runtime`).
+   `backend-dev`) używa profilu `group-ledger-v1`: ledger leży we własnym
+   nazwanym wolumenie Docker grupy (`fullmag-dev-group-ledger-v1-<klucz>`,
+   etykiety projektu Compose), zwykłe pliki i blokada `flock` (`writer.rs`),
+   bez obrazu ext4, urządzenia loop, uprzywilejowanego helpera i deskryptora
+   pojemności hosta. Polityka ledgera grupy jest jej własnym budżetem. W DEV
+   nie ma admisji rezerwacji między grupami. Globalny `host-ledger-v1`
+   pozostaje jedynym źródłem prawdy dla release, kwalifikacji i managed
+   runtime (`fullmag_docker_runtime`).
+
+   Doprecyzowanie z 21.10.2026 (decyzja użytkownika): zamiast podkatalogu
+   wolumenu kontrolnego ledger ma osobny wolumen grupy, widoczny w backendzie
+   pod niezmienioną ścieżką `/host-ledger` (`/host-ledger/ledger`). Helpery
+   odzyskiwania zatrzymanego backendu montują cały wolumen spod `/host-ledger`
+   bez `subpath`, więc zachowują układ i blokady bez zmian. Profil rozpoznaje
+   zmienna `FULLMAG_HOST_LEDGER_PROFILE=group-ledger-v1`.
+   `FULLMAG_DOCKER_HOST_ID` pozostaje digestem daemona (porównuje go admisja
+   storage); logiczny `host_id` ledgera, `node_id` i pin w rejestrze
+   `host-ledger-roots` wynikają z `FULLMAG_GROUP_LEDGER_HOST_ID` = SHA-256
+   (digest daemona, projekt Compose). Grupa nie ustawia pól globalnego
+   overlayu (`FULLMAG_HOST_LEDGER_MOUNT_ROOT`, `FULLMAG_DOCKER_HOST_CAPACITY_*`
+   itd.); runtime odrzuca deskryptor pojemności z profilem grupy, a
+   `--migrate-host-capacity` nie dotyczy grupy. Kontrola quiescence migracji
+   globalnej pomija mounty `/host-ledger` będące wolumenem grupy.
 2. **Ochrona między grupami przez statyczne budżety.** Każda grupa dostaje
    limity Compose dla `backend` i `frontend` z `FULLMAG_DEV_BACKEND_CPUS`,
    `FULLMAG_DEV_BACKEND_MEMORY_GIB`, `FULLMAG_DEV_FRONTEND_CPUS` i
@@ -78,8 +91,8 @@ wirtualnej Docker oraz porty loopback frontendu.
 
 ## Konsekwencje
 
-- Trzy grupy mogą jednocześnie budować w swoich budżetach. Jednoczesne API
-  grup z różnym kodem wymaga punktu 1 (patrz pomiar w stanie implementacji).
+- Trzy grupy mogą jednocześnie budować w swoich budżetach i mieć działające
+  API niezależnie od kodu, bo readiness każdej grupy leży w jej ledgerze.
 - Po wdrożeniu punktu 1 także migracja jednej grupy nie zatrzymuje
   pozostałych, a grupy DEV przestają korzystać z kontroli cgroup2
   i deskryptora pojemności hosta.
@@ -88,7 +101,17 @@ wirtualnej Docker oraz porty loopback frontendu.
   limit, nie zatrzymanie innych.
 - Rezerwacje istniejące w globalnym ledgerze nie są przenoszone do ledgera
   grupy. Grupa przechodzi na ledger per grupa przy własnym starcie z nowym
-  kodem.
+  kodem: każdy nowy render launchera wybiera `group-ledger-v1`, a częściowo
+  wznowiona operacja zachowuje profil przypięty w swoim receipcie.
+  `runtime_service.py` dopuszcza jedną rotację konfiguracji z ledgera
+  globalnego na ledger grupy, wyłącznie po uwierzytelnionym drain poprzedniego
+  ownera tej grupy; zmieniać się mogą tylko polityka (host ID, budżet,
+  topologia) oraz budżety i maski CPU/RAM. Ścieżki, pule, identyfikatory
+  zasobów, GPU i współbieżność pozostają dokładne. Konfiguracja już związana z
+  host ID grupy nie przechodzi tej ścieżki ponownie.
+- Wolumen ledgera grupy jest operacyjnym stanem runtime grupy, nie cache'em
+  buildu. Zachowuje się go razem z wolumenem kontrolnym grupy; nie usuwa się
+  go przy restarcie ani przy sprzątaniu cache.
 
 ## Weryfikacja
 
@@ -97,3 +120,39 @@ równolegle, a restart jednej nie zmienia stanu pozostałych (`docker ps`, logi
 backendów). Do czasu tego dowodu implementacja ma status NOT VERIFIED.
 Punkt 1 wymaga osobnego dowodu: migracja polityki ledgera jednej grupy przy
 działających pozostałych grupach.
+
+Dowód punktu 1 (21.10.2026, Windows, Docker Desktop `desktop-linux`, GPU):
+
+- Grupy `fullmag-worktree-determined-pasteur-cb1518-…` (commit `5c8a96032`,
+  snapshot źródeł `d7b8fc0a…`) i `fullmag-worktree-group-ledger-proof-b-…`
+  (commit `b3decc875`, snapshot `d1369672…`) zbudowały się równolegle i obie
+  miały jednocześnie `Ready: API and runtime service` (porty 3197 i 3202).
+  Każdy backend montuje wyłącznie własny wolumen `fullmag-dev-group-ledger-v1-*`
+  pod `/host-ledger`; ledger v4 ma host ID grupy i jej budżet, w środowisku nie
+  ma pól globalnego overlayu ani helpera `nsenter`.
+- Zmiana stanu jednej grupy: B przełączony na inny commit i zrestartowany
+  (`docker restart`) przebudował się, obrócił readiness we własnym ledgerze i
+  wrócił do `Ready`; kontener A zachował ID, `StartedAt` i `healthy`.
+  Następnie restart A (przyrostowy build i `Ready`) nie zmienił kontenera B
+  (ID, `StartedAt`, `healthy`, 0 restartów). W obu kierunkach supervisor
+  grupy niezrestartowanej zgłaszał w czasie buildu drugiej grupy pojedyncze
+  4-sekundowe degradacje obserwacji (wspólne CPU VM) i sam je zamykał;
+  admisja nie była zamknięta.
+- Trzecia, świeża grupa `fullmag-worktree-group-ledger-proof-c-…` (commit
+  `61c1612ae`, liść `ledger/` tworzony przez launcher przed admisją)
+  zbudowała się i osiągnęła `Ready` przy działającej B (port 3255); B nie
+  zmieniła `StartedAt` ani stanu.
+- `_assert_host_capacity_migration_quiescent()` na żywo przy obu działających
+  grupach: PASS (backendy grup nie są konsumentami globalnego ledgera).
+- Testy interpretowane w kontenerze grupy (`just docker-dev-control-checks`
+  oraz moduły ledgera): nowe `test_docker_group_ledger` zielone, w tym
+  rotacja konfiguracji global→grupa; 6 niepowodzeń występuje identycznie na
+  bazie `7259210af` i nie wynika z tej zmiany.
+
+NOT VERIFIED: jednorazowa rotacja istniejącej grupy z ledgera globalnego na
+ledger grupy w runtime (sprawdzona tylko testem kontraktu); ścieżki recovery
+zatrzymanego backendu z wolumenem grupy (namespace, container recovery,
+orphan recovery); host Linux/WSL. Znane ograniczenie (fail-closed): dowody
+runów przyjętych pod ledgerem globalnym (`host_id` daemona) nie pasują do
+host ID grupy, więc capture-failure reconcile i pre-ack retry takich runów po
+przejściu grupy na własny ledger są odrzucane.
