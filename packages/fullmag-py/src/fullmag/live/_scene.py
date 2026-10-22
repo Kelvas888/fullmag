@@ -72,7 +72,33 @@ def build_world_scene(source_path: Path) -> dict[str, Any]:
             entrypoint_kind="flat_workspace",
             workspace_problem=problem,
         )
-    return build_scene_document_from_builder(export_builder_draft(loaded))
+    scene = build_scene_document_from_builder(export_builder_draft(loaded))
+    _trim_pipeline_run_payloads(scene)
+    return scene
+
+
+# The server's run primitive accepts only its duration; solver, sampling and
+# autosave are configured on the study (validate_pipeline_run_primitive_payload
+# in fullmag-application). The shared Python exporter still emits the full
+# stage draft for run nodes, so the live scene keeps only the accepted keys.
+_PIPELINE_RUN_PAYLOAD_KEYS = (
+    "kind",
+    "entrypoint_kind",
+    "stage_id",
+    "until_seconds",
+    "output_every_seconds",
+    "autosave",
+)
+
+
+def _trim_pipeline_run_payloads(scene: dict[str, Any]) -> None:
+    pipeline = scene.get("study", {}).get("study_pipeline")
+    if not isinstance(pipeline, dict):
+        return
+    for node in pipeline.get("nodes") or []:
+        payload = node.get("payload")
+        if node.get("stage_kind") == "run" and isinstance(payload, dict):
+            node["payload"] = {key: payload[key] for key in _PIPELINE_RUN_PAYLOAD_KEYS if key in payload}
 
 
 def merge_patch_diff(before: Any, after: Any) -> Any:

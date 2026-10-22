@@ -273,3 +273,14 @@ def test_rerunning_geometry_cell_updates_the_same_object(server) -> None:
     objects = server.scene["objects"]
     assert [item["id"] for item in objects] == ["layer"]
     assert objects[0]["geometry"]["geometry_params"]["size"][0] == pytest.approx(300e-9)
+
+
+def test_live_run_stage_sends_only_the_run_primitive_keys(server) -> None:
+    fm.connect(server.url, events=False)
+    _layer()
+    fm.run(1e-10)
+    nodes = server.scene["study"]["study_pipeline"]["nodes"]
+    run_payload = next(node["payload"] for node in nodes if node["stage_kind"] == "run")
+    # The server's run primitive accepts only its duration (fullmag-application).
+    assert set(run_payload) <= {"kind", "entrypoint_kind", "stage_id", "until_seconds", "output_every_seconds", "autosave"}
+    assert float(run_payload["until_seconds"]) == pytest.approx(1e-10)
