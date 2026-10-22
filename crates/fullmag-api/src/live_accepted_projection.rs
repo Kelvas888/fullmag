@@ -94,7 +94,17 @@ pub(crate) fn spawn(state: Arc<AppState>) {
         loop {
             interval.tick().await;
             match poll_once(&state, &mut cursor).await {
-                Ok(()) => last_deferral = None,
+                Ok(()) => {
+                    last_deferral = None;
+                    // This poller is the Docker runtime's publication path. A
+                    // finished run publishes nothing more, yet the path stays
+                    // live; without this the session turned `disconnected`
+                    // 45 s after a run and rejected every further command.
+                    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(
+                        &state,
+                    )
+                    .await;
+                }
                 Err(error) => {
                     let detail = error.to_string();
                     if last_deferral.as_deref() != Some(detail.as_str()) {
