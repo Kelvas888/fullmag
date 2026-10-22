@@ -243,3 +243,48 @@ rzeczywisty preflight oraz dokończenie archiwizacji pozostają NOT VERIFIED.
 Freeze i dokładny CLI/schema: wolumen kontrolny,
 `verification/public-loop-solve-fixed-binding-20261022/archive-completion-source-review-20261023.json`,
 SHA256 `945ac79e176374ddb11dc0e043e16b64ab6e975df04d855574213eb454534936`.
+
+## Potwierdzone domknięcie archiwizacji — 23.10.2026
+
+Poniższy wynik zastępuje wcześniejszy status NOT VERIFIED dotyczący wykonania
+archiwizacji. Nie zmienia statusu kwalifikacji naukowej anteny.
+
+Pakiet `b62950ee11a76f74a1f2bf1d9913de2e068c4ac2` zbudowano i promowano
+w stałym backendzie własnej grupy Compose. Build
+`93be046105c247a28b1b980a90287213`, promocja
+`0f793cf34e4d4600846f117b0ae5f7ce`; receipt SHA256
+`174702b8a526a5cad3118de162cb932791971034177c49c0c6d616e9ca79e41f`.
+Obie wymagane kontrole recovery w jobie GitHub `120129279703` przeszły;
+cały job miał osobne błędy późniejszych kontraktów API, więc nie jest zieloną
+bramką integracji PR.
+
+Niezmieniony oryginalny request raw SHA256
+`23a9ecd41c672d91c9572401e073b7f86d50ab481e1c1aed9f43ae7b0b93d0ee`
+powiązano z completion envelope raw SHA256
+`e784e0884f914fef1e9e36a730e32fe007a5562d371628d48d941ec97d6906dc`.
+Native verify-only zakończył się exit0 w 2,653 s; 68 obserwowanych plików
+pozostało identycznych. Następnie, w granicach zgody użytkownika na archiwizację,
+native completion zakończył się exit0 w 2,489 s: archive_applied=true,
+leases_modified=false, terminal_state_modified=false, solve_replayed=false.
+
+Archiwum znajduje się w
+`store/reaped-worker-recovery/57f0de2b-10a5-43b7-b730-5028da02ad3c/supervisor-slot`.
+Zachowano inode246076 i owner SHA256
+`1556112ac3c3af1d850125e1b9f25691d59ae2f91f6c21d29c914a74c7d8f89d`.
+Po uwzględnieniu wyłącznie przeniesienia ścieżki slotu wszystkie 68 obserwowanych
+plików ma te same bajty. Częściowy Zarr, historia, ledger i oryginalny request
+pozostały zachowane. Aktywny slot nie istnieje; Failed/DoNotRetry i Released
+pozostają trwałe. Nie należy ponawiać finalizacji ani zwalniania tej próby.
+
+Pełne dowody w wolumenie kontrolnym grupy:
+`verification/public-loop-solve-fixed-binding-20261022/archive-completion-native-preflight-b62950ee1/`:
+`completion.json`, `ci-proof.json`, `activation-command.json`,
+`post-activation-proof.json` oraz wyniki preflightu i aktywacji.
+
+Następnie kanoniczne odtworzenie usług usunęło tylko stare kontenery,
+z zachowaniem wolumenów i danych. Receipt próby
+`e71bc5ab9ccb41ba88a3856428ce8754` ma raw SHA256
+`0d359fef32ac717675c08a56f4f6199e2d6ca2258dcdf3fc9d0563134309c166`.
+Start usług nadal wymaga naprawy kontynuacji: walidator próbuje inspect już
+usuniętego backendu zamiast użyć istniejącego przypiętego retained snapshotu.
+API/UI są obecnie zatrzymane. Nowego solve ani accepted V/J/H nadal nie ma.
