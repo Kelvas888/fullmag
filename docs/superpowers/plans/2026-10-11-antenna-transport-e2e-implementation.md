@@ -2098,3 +2098,50 @@ Pełny browser fixture wymaga ponownego CI; rzeczywisty viewport i V/J/H nadal
 NIEZWERYFIKOWANE. Kolejny krok: wypchnąć korekty CI, zarządzane stop-failed
 oraz recreate-volume własnej grupy na porcie 3203, następnie publiczny solve.
 E1–E12 pozostają otwarte.
+
+
+### Rzeczywisty Start workera po integracji mastera — 22.10.2026
+
+Zarządzane stop-failed oraz recreate-volume zakończyły się exit0; nowa próba
+DEV `51e4737ab9ea4c6ba50744c4f3cc68a8`, config
+`f29f5a95f52b97e71fcf63e37878baceccfa5574d7dd26ca664d210030c816f5`.
+Wszystkie trzy obrazy cache-hit. Backend skompilował CLI/API/workery w 3m00s,
+moduł Python w 53.21s; Make242042ms, pakiet24pliki. Runtime źródła
+`daca53bb56c4198876f3836d936b4f1f47b698cb`, snapshot
+`93ac0ba0c921193769e3cd7f0d03d6c66e43a42fab707363c8d80e88cd42d781`.
+API health i lista pustych sesji HTTP200. Nie jest to dowód solve.
+
+Starszy FMS otworzył się jako dokument, lecz nie zwrócił authoring_scene_document.
+Nie usunięto nieznanego opaque wpisu ani nie pominięto bramki. Publiczny
+POST projects/from-script z niezmienionym przykładem (SHA
+`e9bafa15be767ff4914cda3bd7bbad65844b4a330b568f548c8eba0a87a53a13`)
+zwrócił HTTP201 i round_trip=verified. Nowa własna sesja
+`session-18e0f287e935612300000d48`; replace_scene HTTP200/revision1,
+brak magnetization_ref. Jedno Solve, bez ponawiania po timeout klienta120s.
+
+Przygotowanie FEM rzeczywiście zakończyło się exit0, plan
+`sha256:a6cd67f331e36eeea9edf2a070983632231bb4a426eab915b41bfc10d5585ee1`.
+Run `run-live-188fb79e6d889f6611fcd1083dc6fd5b7c56ccc6fc7a0a5a561648d601f6b8c6`
+doszedł do Start workera. Worker exit1 przed trwałym efektem obliczeń:
+`inspection live workspace binding has unsupported fields`. Task
+`task-20a07f0b5275225b1daa22c3d6c749785d944573305bfe81ee0b40b80f59a2c5`
+ma Failed/revision12, receipt procesu4283, wszystkie cztery historyczne rezerwacje
+ledger Released. Nadzorca zatrzymał API; sam frontend wyświetlił Home ze stanem
+reconnecting. Viewport rzeczywistego wyniku nadal NIEZWERYFIKOWANY.
+
+Przyczyna: producent dodaje execution_input, zwykły worker już je waliduje,
+a osobny walidator closed-loop miał starą listę dziewięciu pól. Consumer
+external-lead wymagał wręcz pustych parameters. Oba korzystają teraz ze wspólnego
+inspection validatora: najpierw istniejący walidator shape/schema/digest/policy,
+potem pełne immutable run/project/study/scene/command/step/source binding.
+Nie zdejmowano bramek identity, nie zmieniano zasilania ani fizyki. Regresje
+legacy/versioned startup i Solve oraz odmowy malformed identity/start policy
+włączono jawnie do istniejącego Rust CI. Lokalny parser rustfmt i diff-check PASS;
+kompilacja/wykonanie testów Rust lokalnie NIE WYKONANE.
+
+Dowody control volume: verification/public-loop-solve-master-20261022/, w tym
+imported-original-script.json, model-activation-ack.json, solve-request.json,
+failed-run-catalog.json, process-tree.json i HOST_RESOURCE_LEDGER.json.
+Ledger SHA256 `1d99930b05f2fe851b5a42634a26d77972b874d5f808bb94e889d509d068f956`.
+Następnie wymagany build i ponowne własne wykonanie poprawionego workera.
+E1–E12 nadal otwarte, żadnego potwierdzonego V/J/H.

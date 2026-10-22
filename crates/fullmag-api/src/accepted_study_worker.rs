@@ -2584,12 +2584,13 @@ pub(crate) fn execute_accepted_worker_start(
 }
 
 /// These existing live/start-policy fields describe orchestration only. Physical
-/// parameters still have no binding in the closed-loop worker. Validate against
+/// parameters still have no binding in inspection workers. Validate against
 /// immutable acceptance, never the current API incarnation (cold recovery).
-fn validate_closed_loop_run_parameters(
+pub(crate) fn validate_accepted_inspection_run_parameters(
     specification: &fullmag_application::RunSpecification,
     step_id: &str,
 ) -> Result<()> {
+    validate_accepted_worker_parameters(&specification.parameters, step_id)?;
     let parameters = specification.parameters.as_object()
         .context("inspection RunSpec parameters must be an object")?;
     if parameters.keys().any(|key| {
@@ -2603,7 +2604,8 @@ fn validate_closed_loop_run_parameters(
         "api_instance_id", "session_id", "session_epoch", "scene_revision", "command_id",
         "request_idempotency_key", "step_id", "command", "startup_source_sha256",
     ].into_iter().collect();
-    if live.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys {
+    if live.keys().map(String::as_str).filter(|key| *key != "execution_input")
+        .collect::<BTreeSet<_>>() != expected_keys {
         bail!("inspection live workspace binding has unsupported fields");
     }
     let text = |key: &str| -> Result<&str> {
@@ -2670,7 +2672,7 @@ fn execute_accepted_closed_loop_worker_start(
         || !accepted.run.specification.seeds.is_empty() || !accepted_step.problem.problem_meta.seeds.is_empty() {
         bail!("accepted inspection requires v4 FEM CPU/auto strict double, one artifact, no horizon/state/seeds");
     }
-    validate_closed_loop_run_parameters(&accepted.run.specification, &study_step.step_id)?;
+    validate_accepted_inspection_run_parameters(&accepted.run.specification, &study_step.step_id)?;
     if !store.accepted_run_start_permitted(accepted.run.specification.run_id.as_str())? {
         bail!("accepted inspection refuses to execute before explicit Compute release");
     }
@@ -4154,7 +4156,7 @@ pub(crate) fn read_explicit_runner_artifact(
 
 #[cfg(test)]
 mod closed_loop_run_parameter_tests {
-    use super::validate_closed_loop_run_parameters;
+    use super::validate_accepted_inspection_run_parameters;
     use fullmag_application::{ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget,
         RunId, RunSpecification, StudyId, StudyReference};
     use serde_json::json;
@@ -4196,14 +4198,62 @@ mod closed_loop_run_parameter_tests {
     #[test]
     fn startup_control_metadata_is_not_an_unbound_physics_parameter() {
         let mut specification = startup();
-        validate_closed_loop_run_parameters(&specification, "inspect").unwrap();
+        validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
         specification.parameters[fullmag_session::ACCEPTED_RUN_START_POLICY_KEY] = json!({
             "schema_version": "accepted_run_start_policy.v1", "mode": "manual",
         });
         // The existing durable start gate separately requires the exact Compute release.
-        validate_closed_loop_run_parameters(&specification, "inspect").unwrap();
+        validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
         specification.parameters = json!({});
-        validate_closed_loop_run_parameters(&specification, "inspect").unwrap();
+        validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
+    }
+
+    #[test]
+    fn startup_and_solve_accept_versioned_input_identity_and_legacy_binding() {
+        let mut solve = startup();
+        solve.parameters["live_workspace"]["command"] = json!({
+            "kind": "solve", "command_id": "request",
+        });
+        solve.parameters["live_workspace"]["startup_source_sha256"] = json!(null);
+        solve.parameters["live_workspace"]["request_idempotency_key"] = json!(null);
+        let solve_identity = fullmag_session::hex_sha256(b"api\0session\01\07\0request\0");
+        solve.run_id = RunId::parse(format!("run-live-{solve_identity}")).unwrap();
+        solve.study.study_id = StudyId::parse(format!("live-study-{solve_identity}")).unwrap();
+        for mut specification in [startup(), solve] {
+            validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
+            specification.parameters["live_workspace"]["execution_input"] = json!({
+                "schema_version": fullmag_authoring::SCENE_EXECUTION_INPUT_SCHEMA,
+                "sha256": "f".repeat(64),
+            });
+            validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
+            specification.parameters[fullmag_session::ACCEPTED_RUN_START_POLICY_KEY] = json!({
+                "schema_version": "accepted_run_start_policy.v1", "mode": "manual",
+            });
+            validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_versioned_input_identity_and_start_policy_are_rejected() {
+        for identity in [
+            json!(null),
+            json!({"schema_version": "unknown", "sha256": "f".repeat(64)}),
+            json!({"schema_version": fullmag_authoring::SCENE_EXECUTION_INPUT_SCHEMA,
+                "sha256": "not-a-digest"}),
+            json!({"schema_version": fullmag_authoring::SCENE_EXECUTION_INPUT_SCHEMA,
+                "sha256": "g".repeat(64)}),
+            json!({"schema_version": fullmag_authoring::SCENE_EXECUTION_INPUT_SCHEMA,
+                "sha256": "f".repeat(64), "extra": true}),
+        ] {
+            let mut specification = startup();
+            specification.parameters["live_workspace"]["execution_input"] = identity;
+            assert!(validate_accepted_inspection_run_parameters(&specification, "inspect").is_err());
+        }
+        let mut specification = startup();
+        specification.parameters[fullmag_session::ACCEPTED_RUN_START_POLICY_KEY] = json!({
+            "schema_version": "accepted_run_start_policy.v1", "mode": "automatic",
+        });
+        assert!(validate_accepted_inspection_run_parameters(&specification, "inspect").is_err());
     }
 
     #[test]
@@ -4221,7 +4271,7 @@ mod closed_loop_run_parameter_tests {
             let (parent, key) = pointer.rsplit_once('/').unwrap();
             value_spec.pointer_mut(parent).unwrap().as_object_mut().unwrap().insert(key.into(), value);
             let changed: RunSpecification = serde_json::from_value(value_spec).unwrap();
-            assert!(validate_closed_loop_run_parameters(&changed, "inspect").is_err(), "{pointer}");
+            assert!(validate_accepted_inspection_run_parameters(&changed, "inspect").is_err(), "{pointer}");
         }
     }
 }
