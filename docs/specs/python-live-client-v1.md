@@ -354,6 +354,17 @@ Wady runtime znalezione podczas E2E w grupie DEV i naprawione w F5:
 - przyczyna błędu workera ginęła w początku stderr; teraz raport bierze ostatni znacznik `accepted worker failed:`;
 - `relax` w trybie accepted kończył się „no pinned runner horizon”; horyzont relaksacji może być nieskończony;
 - worker padał na zajętym zapisie magazynu sesji i na niepotwierdzonym ostatnim heartbeacie; zapis jest ponawiany, a nieudane wyjście z niepotwierdzonym heartbeatem przechodzi do uzgodnienia stanu.
+- scheduler przygotowania kończył się, gdy blokada zapisu magazynu była zajęta dłużej niż 5 s; usługa runtime przechodziła wtedy w `draining`, a nadzorca zamykał API (objaw: „po otwarciu UI pada backend”). Teraz odracza przebieg;
+- worker tracił już policzony wynik, bo blokada zapisu to nieblokujący, niesprawiedliwy try-lock współdzielony przez API, oba schedulery i workery, a 5-sekundowe odpytywanie mogło się zagłodzić. Ścieżki workera czekają do `WORKER_STORE_WRITER_WAIT` (120 s); schedulery zostają przy 5 s i odraczają;
+- po edycji modelu po zakończonym runie projekcja co 500 ms ponawiała sprawdzenie wejścia tego runu i logowała ostrzeżenie; zakończony, już zrzutowany run jest pomijany, a każde odroczenie raportowane raz;
+- `fm.relax()`/`fm.run()` bez jawnego kroku dawały etap, którego runner nie wykona; tryb live zgłasza `ValueError` przed wysłaniem;
+- `fm.connect()` dołączał do sesji terminalnej (`failed`), która odrzuca każdą komendę; teraz zakłada nową.
+
+Ograniczenia stwierdzone w grupie DEV (poza zakresem F5):
+
+- API nie ma operacji zamknięcia sesji (`PATCH /v2/sessions/current` zwraca 400), a launcher celowo nie restartuje backendu z aktywną sesją. Sesja założona przez `fm.connect()` blokuje więc `just docker-dev` po zmianie backendu; launcher mówi to teraz wprost. Docelowy model wielu sesji (karty sesji obok Home) to osobny temat;
+- `docker restart` backendu bez launchera pomija delegowaną bramkę cgroup workerów; próbka węzła ma wtedy `cpu_quota: unavailable`, a ledger hosta po cichu odrzuca przyjęcia CPU (komenda zostaje `accepted`). Po zmianie backendu trzeba restartować przez launcher;
+- `fm.export_script()` dla sesji bez ścieżki skryptu zwraca 400 („does not expose a script path”).
 
 Wsparcie każdej zmiany jest deklarowane per ścieżka (FDM CPU, FDM GPU,
 FEM CPU, FEM GPU) w `docs/specs/capability-matrix-v0.md`; wymuszony GPU nie

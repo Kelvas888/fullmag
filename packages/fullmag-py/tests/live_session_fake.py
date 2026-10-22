@@ -47,6 +47,7 @@ class FakeLiveSession:
         api.route("GET", f"{BASE}/model/scene", lambda _r: (200, self.scene, {}))
         api.route("POST", f"{BASE}/model/transactions", self._transaction)
         api.route("GET", f"{BASE}/model/script", lambda _r: (200, {"source": "import fullmag as fm\n", "bytes": 21, "canonical": True}, {}))
+        api.route("POST", f"{BASE}/model/syncs", self._render_script)
         api.route("POST", f"{BASE}/simulation/commands", self._command)
 
     @property
@@ -71,6 +72,12 @@ class FakeLiveSession:
         self.session_status = "running"
         self.scene = {"version": "scene.v2", "revision": 1, "objects": []}
         return 201, {"session_id": "s2", "status": {}, "scene_document": {}, "revisions": {}}, {}
+
+    def _render_script(self, request: RecordedRequest):
+        expected = request.json().get("expected_scene_revision")
+        if expected is not None and expected != self.scene["revision"]:
+            return api_error(409, "scene_revision_mismatch", "scene changed while rendering")
+        return 200, {"source": "import fullmag as fm\n", "scene_revision": self.scene["revision"]}, {}
 
     def _transaction(self, request: RecordedRequest):
         body = request.json()

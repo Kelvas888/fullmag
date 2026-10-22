@@ -45,6 +45,7 @@ OPERATION_IDS: tuple[str, ...] = (
     "model_patch_sessions_current_model_scene",
     "model_post_sessions_current_model_transactions",
     "model_get_sessions_current_model_script",
+    "model_post_sessions_current_model_syncs",
     "simulation_get_sessions_current_simulation_commands",
     "simulation_post_sessions_current_simulation_commands",
     "simulation_get_sessions_current_simulation_commands_command_id",

@@ -190,6 +190,16 @@ def test_connect_creates_session_when_none_exists(fresh_world) -> None:
         fm.disconnect()
 
 
+def test_export_script_renders_the_current_scene(server) -> None:
+    fm.connect(server.url, events=False)
+    _layer()
+    source = fm.export_script()
+    assert source.startswith("import fullmag as fm")
+    rendered = server.api.find("POST", "/v2/sessions/current/model/syncs")[-1].json()
+    # Bound to the revision the script just committed.
+    assert rendered["expected_scene_revision"] == server.scene["revision"]
+
+
 def test_connect_replaces_a_terminal_session(fresh_world) -> None:
     with FakeLiveSession() as fake:
         fake.session_status = "failed"

@@ -152,6 +152,16 @@ OPERATIONS: Dict[str, Operation] = {
         request_schema=None,
         responses={'200': (('application/json', 'ScriptSourceResponse'), ), '404': ()},
     ),
+    'model_post_sessions_current_model_syncs': Operation(
+        operation_id='model_post_sessions_current_model_syncs',
+        method='POST',
+        path='/v2/sessions/current/model/syncs',
+        path_params=(),
+        query_params=(),
+        header_params=('x-fullmag-session-scope',),
+        request_schema='ScriptSyncRequest',
+        responses={'200': (('application/json', 'ScriptSyncResponse'), ), '400': (), '404': ()},
+    ),
     'simulation_get_sessions_current_simulation_commands': Operation(
         operation_id='simulation_get_sessions_current_simulation_commands',
         method='GET',

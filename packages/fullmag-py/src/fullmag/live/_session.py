@@ -287,7 +287,13 @@ class LiveSession:
         return last  # type: ignore[return-value]
 
     def export_script(self) -> str:
-        response = self.client.model.script()
+        """The current scene as canonical Python, rendered by the server.
+
+        Sessions created by a script (``fm.connect()``) have no source file, so
+        the scene is rendered rather than read back.
+        """
+        self.sync(strict=False)
+        response = self.client.model.render_script(expected_scene_revision=self.revision)
         return str(response.get("source", "")) if isinstance(response, Mapping) else str(response)
 
 

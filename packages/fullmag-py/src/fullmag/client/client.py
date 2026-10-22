@@ -209,6 +209,13 @@ class _Model(_Namespace):
     def script(self) -> Any:
         return self._client.call_json("model_get_sessions_current_model_script")
 
+    def render_script(self, *, expected_scene_revision: Optional[int] = None) -> Any:
+        """Render the current scene as canonical Python (``source``) and record it in the session."""
+        return self._client.call_json(
+            "model_post_sessions_current_model_syncs",
+            body=_drop_none({"expected_scene_revision": expected_scene_revision}),
+        )
+
     def commit(self, transaction: Mapping[str, Any]) -> Any:
         """Commit one ``AuthoringTransactionRequest`` and return the response."""
         return self._client.call_json("model_post_sessions_current_model_transactions", body=dict(transaction))
