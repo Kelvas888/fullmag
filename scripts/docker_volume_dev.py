@@ -2147,8 +2147,9 @@ def _validate_retained_service(document, actual, service, image_config, *,
                 raise BuildControlError("Frontend owner tmpfs mount is not private and bounded")
         if not owner_specs and not allow_legacy_frontend:
             raise BuildControlError("Retained frontend is missing the ephemeral owner tmpfs")
-        # Legacy frontend admission is limited to recreation or draining the
-        # backend while that frontend stays stopped. Normal resume is strict.
+        # A retained compose document from before this migration may be read
+        # only during a controlled recreation that renders the current document;
+        # a normal resume must never restart it without the new owner boundary.
     for mount in expected["volumes"]:
         observed = mounts[mount["target"]]
         if observed.get("Type") != mount["type"] or bool(observed.get("RW")) == bool(mount.get("read_only", False)):
@@ -3173,19 +3174,6 @@ def restart_idle(args):
 def stop_idle(args):
     """Drain the exact idle backend before managed service recreation."""
     return _retained_operation(args, recreate_services=False, restart_idle_service=True, stop_after_drain=True)
-
-
-def migrate_worker_cpu_quota(args):
-    from docker_host_readiness_migration import validate_intent
-    args.worker_cpu_quota_migration = validate_intent(args.request_id, args.from_readiness_sha256)
-    args.restart_backend = True
-    return _retained_operation(args, recreate_services=False)
-
-
-def verify_worker_cpu_quota(args):
-    args.verify_worker_cpu_quota = True
-    args.restart_backend = True
-    return _retained_operation(args, recreate_services=False)
 
 
 def recreate(args):
@@ -4486,14 +4474,8 @@ def _retained_operation(
             observed,
             service,
             image_config,
-            allow_legacy_frontend=(recreate_services or (
-                stop_after_drain and service == "frontend"
-                and observed.get("State", {}).get("Running") is False
-            )),
+            allow_legacy_frontend=recreate_services,
         )
-    if getattr(args, "verify_worker_cpu_quota", False):
-        from docker_worker_cpu_quota_check import run
-        return run(control, args, actual["backend"], image)
     if restart_idle_service:
         if (not actual["backend"]["State"]["Running"]
                 or actual["backend"]["State"].get("Health", {}).get("Status") != "healthy"):
@@ -4581,10 +4563,9 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     if fresh_scratch["fingerprint"] != empty_scratch["fingerprint"]:
                         raise BuildControlError("Pinned empty scratch changed before backend drain")
             except Exception:
-                if actual["frontend"]["State"]["Running"]:
-                    operation["daemon_pending"] = True
-                    docker_capture("start", ids["frontend"], timeout=90)
-                    operation["daemon_pending"] = False
+                operation["daemon_pending"] = True
+                docker_capture("start", ids["frontend"], timeout=90)
+                operation["daemon_pending"] = False
                 raise
             control.write(operation["root"] + "/idle-preflight.json", health)
             control.write(operation["root"] + "/compose.json", document)
@@ -5147,9 +5128,6 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
     with control.operation("resume", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                        **operator_probe_record}) as operation:
         operation["receipt"].update(operator_probe_record)
-        migration = getattr(args, "worker_cpu_quota_migration", None)
-        if migration is not None:
-            operation["receipt"]["worker_cpu_quota_migration_intent"] = migration
         operation["receipt"].update(state="resuming-observation", state_root=str(state),
             backend_volumes=previous["backend_volumes"], frontend_volume=previous["frontend_volume"])
         if not actual["frontend"]["State"]["Running"]:

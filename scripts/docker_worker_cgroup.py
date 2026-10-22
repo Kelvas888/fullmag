@@ -55,11 +55,9 @@ def configure_backend(document):
     environment["FULLMAG_WORKER_CGROUP_ROOT"] = ROOT
 
 
-def ensure_delegation(control, operation, document, backend_id, image, selected, *, before_ready=None):
+def ensure_delegation(control, operation, document, backend_id, image, selected):
     environment = document["services"]["backend"]["environment"]
     if environment.get("FULLMAG_WORKER_CGROUP_PROFILE") is None:
-        if before_ready is not None:
-            raise BuildControlError("Migration requires a worker cgroup delegation gate")
         return
     if environment.get("FULLMAG_WORKER_CGROUP_PROFILE") != PROFILE:
         raise BuildControlError("Unexpected backend cgroup delegation profile")
@@ -90,8 +88,6 @@ def ensure_delegation(control, operation, document, backend_id, image, selected,
     # in the image-owned backend module; it must not recreate host children.
     previous = operation["receipt"].get("worker_cgroup")
     if isinstance(previous, dict) and previous.get("nonce") == request.get("nonce"):
-        if before_ready is not None:
-            raise BuildControlError("Migration cannot enter an already completed worker cgroup gate")
         if (any(previous.get(key) != request.get(key) for key in
                 ("compose_project", "pid", "process_start_token", "boot_id"))
                 or previous.get("container_id") != backend_id or previous.get("image_id") != image
@@ -104,8 +100,6 @@ def ensure_delegation(control, operation, document, backend_id, image, selected,
     # current delegation, not a stale proof from an earlier container start.
     retained = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-I", "-B", "-c", _READY))
     if retained and retained.get("nonce") == request.get("nonce"):
-        if before_ready is not None:
-            raise BuildControlError("Migration cannot enter an already completed worker cgroup gate")
         if (any(retained.get(key) != request.get(key) for key in
                 ("compose_project", "pid", "process_start_token", "boot_id"))
                 or retained.get("schema") != "fullmag.worker-cgroup-ready.v1"
@@ -147,8 +141,6 @@ def ensure_delegation(control, operation, document, backend_id, image, selected,
             "volumes": {"build-control": {"name": control.volume, "external": True}}}
     control.write(operation["root"] + "/worker-cgroup-compose.json", spec)
     operation["receipt"]["worker_cgroup_helper"] = {"name": helper_name, "sha256": helper_sha, "state": "starting"}
-    if before_ready is not None:
-        before_ready(request)
     output = compose_capture(spec, "run", "--name", helper_name, "--no-deps", "worker-cgroup-maintenance", timeout=180)
     helper = json.loads(docker_text("inspect", helper_name))[0]
     if (helper.get("Image") != image or helper.get("State", {}).get("Running")

@@ -2240,8 +2240,10 @@ def initialize_host_configuration(
     environment = process_environment(paths, service=True)
     try:
         result = subprocess.run(
-            command,
-            cwd=str(paths.state), env=environment,
+            [str(executable), "--initialize-docker-host", "--ledger-root", str(HOST_LEDGER_ROOT),
+             "--store-root", str(paths.store), "--device-access", device_access,
+             "--host-id", logical_host_id],
+            cwd=str(paths.state), env=process_environment(paths, service=True),
             stdin=subprocess.DEVNULL, capture_output=True, timeout=60,
         )
     except subprocess.TimeoutExpired as error:
