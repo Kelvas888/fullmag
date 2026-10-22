@@ -5201,14 +5201,15 @@ def _completed_recreation_start_context(control, args, selected, layout):
         raise BuildControlError("Completed recreation with accepted-run reattach requires its retained handoff; continuation refused")
     for identifier in ids:
         _assert_container_absent(identifier)
-    state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Windows sessions")
-    from windows_folder_host import read_owned_regular
-    certificate_path = state / "windows-folder-host.json"
-    certificate = json.loads(read_owned_regular(certificate_path))
-    if (canonical(json.loads(read_owned_regular(state / ".fullmag-windows-folder-owner.json"))) != canonical(certificate)
+    state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained sessions")
+    host = _session_host()
+    certificate_path = _certificate_path(state)
+    owner_marker = state / host.OWNER_NAME
+    certificate = json.loads(host.read_owned_regular(certificate_path))
+    if (canonical(json.loads(host.read_owned_regular(owner_marker))) != canonical(certificate)
             or certificate.get("image_id") != image or certificate.get("restart_verified") is not True
             or document["services"]["backend"]["environment"].get("FULLMAG_STARTUP_ENABLED") == "1"):
-        raise BuildControlError("Completed recreation Windows owner/admission/startup differs")
+        raise BuildControlError("Completed recreation session owner/admission/startup differs")
     if str(args.port) != document["services"]["frontend"]["environment"].get("FULLMAG_FRONTEND_HOST_PORT"):
         raise BuildControlError("Completed recreation retained frontend port differs")
     recovery = _retained_recovery_context(control, previous, document, fresh_state=False, backend_id=ids[0])
@@ -5216,7 +5217,7 @@ def _completed_recreation_start_context(control, args, selected, layout):
             or recovery.get("recovery_environment") or recovery.get("recovery_metadata")):
         raise BuildControlError("Completed recreation requires the exact managed failed-owner restart proof")
     reuse = {"state": state, "host_certificate": certificate_path,
-        "owner_marker": state / ".fullmag-windows-folder-owner.json", "receipt": {"image_id": image},
+        "owner_marker": owner_marker, "receipt": {"image_id": image},
         "operator_probe_environment_record": _operator_probe_record_from_retained(previous, document)}
     return {"reuse_state": reuse, **recovery}
 

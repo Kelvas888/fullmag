@@ -448,17 +448,69 @@ class CompletedRecreationContinuationTests(unittest.TestCase):
         self.completed={'schema':'fullmag.docker-build-operation.v1','phase':'recreate-services','state':'succeeded','attempt':'2'*32,'compose_project':'fixture','fresh_state':False,'inputs':{'attempt':'1'*32,'config_sha256':self.args.config_sha256},'removed_containers':[BACKEND_ID,'f'*64],'previous_state_root':str(self.state),'retained_volumes':self.previous['backend_volumes'],'retained_frontend_volume':'frontend-volume'}
         self.cert={'image_id':IMAGE_ID,'restart_verified':True};self.recovery={'previous_config_sha256':'c'*64,'native_restart_metadata':{'schema':'fullmag.docker-runtime-supervision-restart.v1','claim_pending':False,'terminal_failed_owner_sha256':'e'*64}}
         self.control=Mock();self.control.project='fixture';self.control.read.return_value=self.document;self.drift={};self.absence=types.SimpleNamespace(returncode=1,stdout=b'',stderr=b'Error: No such object: fixture')
-    def invoke(self):
+    def invoke(self, host=None):
         import docker_volume_container_recovery as recovery,types
+        if host is None:
+            import windows_folder_host
+            host=types.SimpleNamespace(HOST_CERT_PATH=windows_folder_host.HOST_CERT_PATH,
+                OWNER_NAME=windows_folder_host.OWNER_NAME,
+                read_owned_regular=Mock(return_value=json.dumps(self.cert).encode()))
         previous_raw=json.dumps(self.previous,sort_keys=True).encode();completed_raw=json.dumps(self.completed,sort_keys=True).encode()
         if not self.args.completed_recreation_sha256:self.args.completed_recreation_sha256=hashlib.sha256(completed_raw).hexdigest()
         def read(control,path,**kw):
             if path in self.drift:return self.drift[path]
             return completed_raw if path.startswith('recreate-services/') else previous_raw
-        with patch.object(stop_unadmitted,'_control_bytes',side_effect=read),patch.object(recovery,'docker_capture',return_value=self.absence),patch.object(dev,'_retained_recovery_context',return_value=self.recovery),patch.object(dev,'_operator_probe_record_from_retained',return_value={}),patch('windows_folder_host.read_owned_regular',return_value=json.dumps(self.cert).encode()):
+        with patch.object(stop_unadmitted,'_control_bytes',side_effect=read),patch.object(recovery,'docker_capture',return_value=self.absence),patch.object(dev,'_retained_recovery_context',return_value=self.recovery),patch.object(dev,'_operator_probe_record_from_retained',return_value={}),patch.object(dev,'_session_host',return_value=host):
             return dev._completed_recreation_start_context(self.control,self.args,self.selected,{'runtime_root':self.root})
     def test_completed_removal_restores_exact_state_and_existing_r5_context(self):
         context=self.invoke();self.assertEqual(context['reuse_state']['state'],self.state);self.assertEqual(context['previous_config_sha256'],'c'*64);self.assertEqual(context['native_restart_metadata'],self.recovery['native_restart_metadata']);self.control.write.assert_not_called()
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires the real Linux no-follow reader")
+    def test_linux_completed_removal_uses_profile_paths_and_real_owned_reader(self):
+        import linux_native_host as host
+        for name in (Path(host.HOST_CERT_PATH).name,host.OWNER_NAME):
+            (self.state/name).write_text(json.dumps(self.cert))
+        # These old Windows files must not be consumed as a Linux certificate.
+        (self.state/"windows-folder-host.json").write_text("invalid Windows certificate")
+        (self.state/".fullmag-windows-folder-owner.json").write_text("invalid Windows owner")
+        with patch('windows_folder_host.read_owned_regular',side_effect=AssertionError("Windows reader used on Linux")):
+            context=self.invoke(host=host)
+        self.assertEqual(context['reuse_state']['host_certificate'],self.state/Path(host.HOST_CERT_PATH).name)
+        self.assertEqual(context['reuse_state']['owner_marker'],self.state/host.OWNER_NAME)
+        self.assertEqual(context['reuse_state']['receipt']['image_id'],IMAGE_ID)
+        self.assertEqual(context['native_restart_metadata'],self.recovery['native_restart_metadata'])
+        self.control.write.assert_not_called()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires the real Linux no-follow reader")
+    def test_linux_continuation_preserves_owner_image_restart_and_startup_guards(self):
+        import linux_native_host as host,copy
+        for change in ('owner','image','restart','startup'):
+            with self.subTest(change=change):
+                cert=copy.deepcopy(self.cert);owner=copy.deepcopy(self.cert)
+                if change=='owner':owner['image_id']='sha256:'+'d'*64
+                elif change=='image':cert['image_id']=owner['image_id']='sha256:'+'d'*64
+                elif change=='restart':cert['restart_verified']=owner['restart_verified']=False
+                else:self.document['services']['backend']['environment']['FULLMAG_STARTUP_ENABLED']='1'
+                (self.state/Path(host.HOST_CERT_PATH).name).write_text(json.dumps(cert))
+                (self.state/host.OWNER_NAME).write_text(json.dumps(owner))
+                self.args.config_sha256=hashlib.sha256(dev.canonical(self.document)).hexdigest()
+                self.previous['config_sha256']=self.args.config_sha256
+                self.completed['inputs']['config_sha256']=self.args.config_sha256
+                self.args.completed_recreation_sha256=''
+                with self.assertRaisesRegex(dev.BuildControlError,'session owner/admission/startup'):
+                    self.invoke(host=host)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires the real Linux no-follow reader")
+    def test_linux_continuation_does_not_follow_certificate_or_owner_symlinks(self):
+        import linux_native_host as host
+        for name in (Path(host.HOST_CERT_PATH).name,host.OWNER_NAME):
+            (self.state/name).write_text(json.dumps(self.cert))
+        for name in (Path(host.HOST_CERT_PATH).name,host.OWNER_NAME):
+            with self.subTest(name=name):
+                path=self.state/name;path.unlink();target=self.root/'external-evidence.json'
+                target.write_text(json.dumps(self.cert));path.symlink_to(target)
+                with self.assertRaisesRegex(dev.storage.StorageError,'symlink/junction'):self.invoke(host=host)
+                path.unlink();path.write_text(json.dumps(self.cert))
+
     def test_missing_old_ids_are_expected_but_present_old_id_refuses(self):
         self.invoke();self.absence.returncode=0
         with self.assertRaises(Exception):self.invoke()
