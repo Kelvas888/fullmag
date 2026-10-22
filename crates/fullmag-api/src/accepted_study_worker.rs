@@ -3328,7 +3328,8 @@ fn apply_accepted_start_effect(
     if !control.interrupt_requested.load(Ordering::Acquire) {
         crate::accepted_field_materialization_worker::prepare_and_publish(
             store, accepted, &accepted_step, &durable_execution,
-        )?;
+        )
+        .context("publish accepted terminal observables")?;
     }
     if control.interrupt_requested.load(Ordering::Acquire) {
         let control_result = finish_worker_control(store, claim, control)?;
