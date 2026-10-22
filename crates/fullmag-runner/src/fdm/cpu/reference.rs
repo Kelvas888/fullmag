@@ -1581,8 +1581,18 @@ pub(crate) fn execute_reference_fdm_with_terminal_context(
         });
     }
     let mut spin_transport = FdmSpinTransportWorkflow::from_plan(plan)?;
-    if coupled_checkpoint.is_some() {
-        crate::validate_fdm_transport_checkpoint_resume_support(plan)?;
+    if let Some(checkpoint) = coupled_checkpoint.as_ref() {
+        // Preserve the existing non-frozen M3 V1 solver-state continuation.
+        // Full checkpoint/output ExactResume admission remains a separate gate.
+        let legacy_m3_solver_state = plan.frozen_spins.is_none()
+            && spin_transport
+                .as_ref()
+                .is_some_and(FdmSpinTransportWorkflow::has_transient)
+            && checkpoint.get("schema").and_then(serde_json::Value::as_str)
+                == Some("fullmag.fdm.coupled_m3_checkpoint.v1");
+        if !legacy_m3_solver_state {
+            crate::validate_fdm_transport_checkpoint_resume_support(plan)?;
+        }
     }
     if spin_transport.is_some() {
         let transient = spin_transport

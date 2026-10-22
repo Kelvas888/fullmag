@@ -6813,8 +6813,10 @@ pub fn run_reference_fem(
     Ok(fem_baseline::execute_reference_fem(plan, until_seconds, outputs, None, None)?.result)
 }
 
-/// Resume the CPU-double coupled M3 reference runtime from the exact backend
-/// state captured in a session checkpoint.
+/// Continue the non-frozen CPU-double M3 solver state from a complete V1 payload.
+/// The caller supplies the unchanged original FDM plan and execution endpoint.
+/// This restores solver state, not the committed output prefix or output cursors,
+/// and does not qualify public checkpoint ExactResume admission.
 pub fn resume_reference_fdm_from_coupled_checkpoint(
     plan: &FdmPlanIR,
     checkpoint: serde_json::Value,
@@ -6878,8 +6880,8 @@ pub fn resume_reference_fdm_from_frozen_spins_checkpoint(
     )
 }
 
-/// Resume the CPU-double coupled M3 reference runtime and return the public
-/// qualification evidence emitted by the accepted backend execution.
+/// Numerical evidence from limited non-frozen CPU-double M3 V1 continuation.
+/// This is not qualification of checkpoint/output ExactResume.
 #[derive(serde::Serialize)]
 pub struct CoupledM3ResumeEvidence {
     status: RunStatus,
@@ -6890,6 +6892,9 @@ pub struct CoupledM3ResumeEvidence {
     coupled_checkpoint: Box<serde_json::value::RawValue>,
 }
 
+/// Continue complete M3 V1 solver state with the unchanged original FDM plan
+/// and execution endpoint, returning its final accepted numerical artifacts.
+/// Committed output prefixes/cursors and public ExactResume remain unsupported.
 pub fn resume_reference_fdm_from_coupled_checkpoint_evidence(
     plan: &FdmPlanIR,
     checkpoint: serde_json::Value,

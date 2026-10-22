@@ -275,14 +275,29 @@ reference i historii. Osobno zachować regression no-transport all-frozen.
 
 **Publiczna odmowa A: `IMPLEMENTED_SOURCE_ONLY`, `NOT_COMPILED`,
 `NOT_EXECUTED`.** Wspólny runner-owned
-`validate_fdm_transport_checkpoint_resume_support` odmawia checkpoint continuation
-rzeczywistego CPU workflow M1/M2/M3, również z frozen spins. Jego `Ok(())`
-oznacza tylko brak tej konkretnej odmowy, nie pozytywny admission formatu lub
-tożsamości. API klasyfikuje te checkpointy jako `RestoreClass::Unsupported`
+`validate_fdm_transport_checkpoint_resume_support` odmawia publicznego
+ExactResume rzeczywistego CPU workflow M1/M2/M3, również z frozen spins. Jego
+`Ok(())` oznacza tylko brak tej konkretnej odmowy, nie pozytywny admission
+formatu lub tożsamości. API klasyfikuje te checkpointy jako `RestoreClass::Unsupported`
 (`unsupported`) i odmawia restore przed odczytem common state oraz mutacją;
 CLI odmawia przed pobraniem paused state przez `take()`, a UI dopuszcza restore
 wyłącznie dla `exact_resume`. Nie ma automatycznego downgrade do
 InitialConditionImport, LogicalResume ani portable importu.
+
+Istniejąca, ograniczona kontynuacja stanu solvera nonfrozen M3 V1 pozostaje
+w `execute_reference_fdm_with_coupled_checkpoint` oraz istniejących Rust
+`resume_reference_fdm_from_coupled_checkpoint` i
+`resume_reference_fdm_from_coupled_checkpoint_evidence`. Wyjątek wymaga schematu
+`fullmag.fdm.coupled_m3_checkpoint.v1`, braku resolved frozen planu i workflow
+transient. Pełny walidator V1 oraz porównanie kompletnej identity/module history
+pozostają obowiązkowe przed zmianą lokalnego workflow. Caller przekazuje
+niezmieniony oryginalny plan i endpoint; V1 sam nie utrwala endpointu ani
+committed output prefix/cursorów. To zachowanie solvera nie jest publicznym
+ExactResume. API, CLI i orchestrator zachowują powyższą odmowę. Pozytywna
+regresja porównuje final M, accepted artifact i ostatni wiersz; nie kwalifikuje
+pełnej historii wyjść ani frozen+M3. Bieżąca poprawka kompatybilności jest
+`IMPLEMENTED_SOURCE_ONLY`; nowe regresje są `NOT_COMPILED`, `NOT_EXECUTED`.
+Pełne E11/composite restore pozostaje OPEN.
 
 Nie dodano globalnej odmowy pure-magnetic/frozen/ABM3 bez spin workflow;
 GPU/FEM zachowują własnych ownerów i bramki. Pozostała klasyfikacja katalogu
@@ -812,10 +827,11 @@ Brak Rust/HTTP/cold execution evidence; publiczny ExactResume nadal Unsupported.
 | Aneks terminal C+D | `crates/fullmag-application/src/study_artifact.rs` | `encode_frozen_study_state` | Nowy envelope z rzeczywistym terminal child clock; legacy state bytes nietknięte. | FDM CPU FP64; pozostali unsupported dla nowej ścieżki | source/parser; runtime NOT VERIFIED | planned_contract | storage candidate; path + symbol |
 | Jawny adapter metadata terminal M | `crates/fullmag-application/src/study_artifact.rs` | `materialize_study_state_at_terminal_clock` | Metadata aktualnego M bez zmiany wartości | FDM CPU FP64; pozostali unsupported dla nowej ścieżki | source review; runtime NOT VERIFIED | planned_contract | storage candidate; path + symbol |
 | Wspólna owner/role/raw identity | `crates/fullmag-session/src/types.rs` | `terminal_publication_artifact_id` | Jedna formuła publishera i cold readera | FDM CPU FP64; pozostali unsupported dla nowej ścieżki | source review; runtime NOT VERIFIED | planned_contract | storage candidate; path + symbol |
-| Publiczna odmowa transport resume A | `crates/fullmag-runner/src/lib.rs` | `validate_fdm_transport_checkpoint_resume_support` | Wspólna odmowa checkpoint continuation dla rzeczywistego CPU M1/M2/M3 workflow; Ok(()) nie dowodzi admission. | FDM CPU M1/M2/M3; pozostali ownerzy bez zmian | source/parser controls; bez HTTP/native | SOURCE_ONLY; NOT_COMPILED; NOT_EXECUTED | source freeze 77afed0bb488f115d3692e27044d5209daa876e33eceafbe34e78566c8267844; path + symbol |
+| Publiczna odmowa transport resume A | `crates/fullmag-runner/src/lib.rs` | `validate_fdm_transport_checkpoint_resume_support` | Wspólna publiczna odmowa ExactResume dla CPU M1/M2/M3; ograniczona kontynuacja solver-state V1 nie jest admission. | FDM CPU M1/M2/M3; pozostali ownerzy bez zmian | source/parser controls; bez HTTP/native | SOURCE_ONLY; NOT_COMPILED; NOT_EXECUTED | source freeze 77afed0bb488f115d3692e27044d5209daa876e33eceafbe34e78566c8267844; path + symbol |
 | Publiczna odmowa transport resume A | `crates/fullmag-api/src/session_persistence.rs` | `checkpoint_resume_unsupported_reason` | Typed metadata i schema wyznaczają powód Unsupported; brak wymaganej transport identity daje odmowę. | FDM CPU M1/M2/M3; pozostali ownerzy bez zmian | source/parser controls; bez HTTP/native | SOURCE_ONLY; NOT_COMPILED; NOT_EXECUTED | source freeze 77afed0bb488f115d3692e27044d5209daa876e33eceafbe34e78566c8267844; path + symbol |
 | Publiczna odmowa transport resume A | `crates/fullmag-api/src/session_persistence.rs` | `supported_checkpoint_restore_class` | Unsupported przed dotychczasową klasyfikacją; pozostały catalog self-compatibility nie jest naprawiony przez A. | FDM CPU M1/M2/M3; pozostali ownerzy bez zmian | source/parser controls; bez HTTP/native | SOURCE_ONLY; NOT_COMPILED; NOT_EXECUTED | source freeze 77afed0bb488f115d3692e27044d5209daa876e33eceafbe34e78566c8267844; path + symbol |
 | Publiczna odmowa transport resume A | `crates/fullmag-api/src/session_persistence.rs` | `restore_checkpoint_with_context` | API odmawia przed odczytem common state i mutacją snapshotu; brak automatycznego downgrade. | FDM CPU M1/M2/M3; pozostali ownerzy bez zmian | source/parser controls; bez HTTP/native | SOURCE_ONLY; NOT_COMPILED; NOT_EXECUTED | source freeze 77afed0bb488f115d3692e27044d5209daa876e33eceafbe34e78566c8267844; path + symbol |
+| Ograniczona kontynuacja nonfrozen M3 V1 | `crates/fullmag-runner/src/fdm/cpu/reference.rs` | `execute_reference_fdm_with_coupled_checkpoint` | Zachowanie pełnego V1 solver state przy niezmienionym planie; bez output prefix/cursorów i bez publicznego ExactResume. | FDM CPU FP64 M3 bez frozen | `legacy_m3_solver_state_rejects_changed_plan_and_frozen_before_publication`; zachowana pozytywna regresja resume | SOURCE_ONLY; NOT_COMPILED; NOT_EXECUTED | `worktree/uncommitted`; path + symbol |
 | Prywatny codec composite v2 | `crates/fullmag-runner/src/fdm/cpu/spin_transport/composite_checkpoint.rs` | `FdmCompositeCheckpointV2` | Prywatne typy composite v2; IMPLEMENTED_SOURCE_ONLY, NOT_COMPILED, NOT_EXECUTED. | FDM CPU FP64; inne lane unsupported | parser/source checks, bez wykonania codec | `IMPLEMENTED_SOURCE_ONLY`; `NOT_COMPILED`; `NOT_EXECUTED` | `worktree/uncommitted`; path + symbol |
 | Prywatny codec composite v2 | `crates/fullmag-runner/src/fdm/cpu/spin_transport/composite_checkpoint.rs` | `decode_composite_m3_codec_v2` | Strict raw ingress, required-null, typed roundtrip i outer hash; wyłącznie codec źródłowy. | FDM CPU FP64; inne lane unsupported | parser/source checks, bez wykonania codec | `IMPLEMENTED_SOURCE_ONLY`; `NOT_COMPILED`; `NOT_EXECUTED` | `worktree/uncommitted`; path + symbol |
 | Prywatny original-stage gate | `crates/fullmag-runner/src/fdm/cpu/spin_transport/composite_checkpoint.rs` | `validate_for_original_stage` | CodecCheckedCompositeV2::validate_for_original_stage sprawdza oryginalne problem/plan/stage/outputs przekazane przez admitted ownera; sam helper nie dowodzi immutable admission. SOURCE_ONLY; NOT_COMPILED; NOT_EXECUTED. | FDM CPU FP64; inne lane unsupported | parser/source checks; bez wykonania Rust | `SOURCE_ONLY`; `NOT_COMPILED`; `NOT_EXECUTED`; reszta gates OPEN | `worktree/uncommitted`; path + symbol |

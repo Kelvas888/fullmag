@@ -4030,15 +4030,32 @@ mod tests {
                 };
                 object.as_object_mut().unwrap().remove(key);
             }
-            super::super::reference::execute_reference_fdm_with_coupled_checkpoint(
+            let mut published_steps = 0;
+            let error = super::super::reference::execute_reference_fdm_with_coupled_checkpoint(
                 &plan,
                 2.0e-4,
                 &[],
-                None,
+                Some(crate::types::LiveStepConsumer {
+                    grid: plan.grid.cells,
+                    field_every_n: 1,
+                    initial_snapshot: true,
+                    display_selection: None,
+                    interrupt_requested: None,
+                    on_step: &mut |_| {
+                        published_steps += 1;
+                        crate::StepAction::Continue
+                    },
+                }),
                 None,
                 Some(raw),
             )
             .expect_err(label);
+            assert_ne!(
+                error.message,
+                crate::FDM_CPU_TRANSPORT_EXACT_RESUME_UNSUPPORTED,
+                "invalid V1 state must reach payload validation for {label}",
+            );
+            assert_eq!(published_steps, 0, "invalid V1 state published for {label}");
         }
 
         type Mutation = Box<dyn Fn(&mut FdmCoupledCheckpoint)>;
@@ -4161,6 +4178,109 @@ mod tests {
                 .restore_coupled_checkpoint(malformed)
                 .expect_err(label);
             assert_eq!(workflow, pristine, "restore mutated workflow for {label}");
+        }
+    }
+
+    #[test]
+    fn legacy_m3_solver_state_rejects_changed_plan_and_frozen_before_publication() {
+        let plan = fixed_transient_plan(1.0e-4);
+        let first =
+            super::super::reference::execute_reference_fdm(&plan, 1.0e-4, &[], None, None).unwrap();
+        let checkpoint: FdmCoupledCheckpoint = serde_json::from_slice(
+            &first
+                .auxiliary_artifacts
+                .iter()
+                .find(|artifact| artifact.relative_path == "transport/coupled_checkpoint.json")
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        let mut changed_plan = plan.clone();
+        changed_plan.material.damping += 0.01;
+        let mut workflow = FdmSpinTransportWorkflow::from_plan(&changed_plan)
+            .unwrap()
+            .unwrap();
+        let pristine = workflow.clone();
+        let error = workflow
+            .restore_coupled_checkpoint(checkpoint.clone())
+            .expect_err("changed original plan must reject V1 continuation");
+        assert_eq!(error.message, "coupled checkpoint plan revision mismatch");
+        assert_eq!(workflow, pristine, "identity rejection mutated workflow");
+
+        let mut frozen_plan = plan.clone();
+        let mask = vec![true; plan.initial_magnetization.len()];
+        let count = mask.len() as u64;
+        let mut hash = Sha256::new();
+        hash.update(count.to_le_bytes());
+        hash.update(vec![1_u8; mask.len()]);
+        let mask_sha256 = format!("{:x}", hash.finalize());
+        frozen_plan.frozen_spins = Some(ResolvedFrozenSpinsPlanIR {
+            schema_version: RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION.into(),
+            constraint_ids: vec!["pinned".into()],
+            frozen_mask: mask,
+            active_dof_count: count,
+            frozen_dof_count: count,
+            free_dof_count: 0,
+            mask_sha256: mask_sha256.clone(),
+            grid_or_mesh_fingerprint: "transport-test-grid".into(),
+            source_state_revision: Some(1),
+            all_active_dofs_frozen: true,
+            certificate: SelectionCertificateIR {
+                schema_version: SELECTION_CERTIFICATE_SCHEMA_VERSION.into(),
+                evaluator_id: "selection.fdm_cell_center.v1".into(),
+                constraint_ids: vec!["pinned".into()],
+                authored_fingerprints: vec![SelectionAuthoredFingerprintIR {
+                    constraint_id: "pinned".into(),
+                    selector_sha256: "a".repeat(64),
+                }],
+                raw_candidate_dof_count: count,
+                inactive_candidate_dof_count: 0,
+                active_dof_count: count,
+                frozen_dof_count: count,
+                free_dof_count: 0,
+                bounds_m: None,
+                grid_or_mesh_fingerprint: "transport-test-grid".into(),
+                source_state_revision: Some(1),
+                mask_sha256,
+                resolved_reference_sha256: "b".repeat(64),
+                warnings: Vec::new(),
+            },
+        });
+        frozen_plan
+            .frozen_spins
+            .as_ref()
+            .unwrap()
+            .validate_intrinsic()
+            .unwrap();
+        for (candidate_plan, expected_frozen_refusal) in
+            [(&changed_plan, false), (&frozen_plan, true)]
+        {
+            let mut published_steps = 0;
+            let error = super::super::reference::execute_reference_fdm_with_coupled_checkpoint(
+                candidate_plan,
+                2.0e-4,
+                &[],
+                Some(crate::types::LiveStepConsumer {
+                    grid: candidate_plan.grid.cells,
+                    field_every_n: 1,
+                    initial_snapshot: true,
+                    display_selection: None,
+                    interrupt_requested: None,
+                    on_step: &mut |_| {
+                        published_steps += 1;
+                        crate::StepAction::Continue
+                    },
+                }),
+                None,
+                Some(serde_json::to_value(&checkpoint).unwrap()),
+            )
+            .expect_err("unsupported or changed-plan continuation must fail before publication");
+            if expected_frozen_refusal {
+                assert_eq!(error.message, crate::FDM_CPU_TRANSPORT_EXACT_RESUME_UNSUPPORTED);
+            } else {
+                assert_eq!(error.message, "coupled checkpoint plan revision mismatch");
+            }
+            assert_eq!(published_steps, 0, "rejected restore published a live state");
         }
     }
 

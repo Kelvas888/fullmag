@@ -1756,7 +1756,7 @@ mod accepted_start_tests {
             &fixture.run_id,
             offer(),
             |_| Ok(true),
-            |_task, _claim, _inputs| {
+            |_task, _claim, _inputs, _preparation| {
                 admission_calls.set(admission_calls.get() + 1);
                 Ok(None)
             },
@@ -1803,7 +1803,7 @@ mod accepted_start_tests {
             &fixture.run_id,
             offer(),
             |_| Ok(true),
-            |_task, _claim, _inputs| {
+            |_task, _claim, _inputs, _preparation| {
                 admission_calls.set(admission_calls.get() + 1);
                 Ok(None)
             },

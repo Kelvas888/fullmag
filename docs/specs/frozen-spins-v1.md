@@ -314,7 +314,7 @@ tego planu i nie realizują constraintu. Status każdego lane pozostaje
 
 Publiczna odmowa A jest `IMPLEMENTED_SOURCE_ONLY`, `NOT_COMPILED`,
 `NOT_EXECUTED`: istniejący runner support preflight odmawia checkpoint
-continuation rzeczywistego CPU M1/M2/M3 workflow. API reklamuje wtedy
+ExactResume admission rzeczywistego CPU M1/M2/M3 workflow. API reklamuje wtedy
 `RestoreClass::Unsupported` i odmawia przed odczytem common state/mutacją;
 CLI przed `take()` paused state, UI restore wyłącznie dla `exact_resume`.
 Nie ma automatycznego InitialConditionImport, LogicalResume ani portable
@@ -691,8 +691,20 @@ Tymczasowa odmowa legacy transport resume w aktualnie naprawianej ścieżce jest
 osobnym fail-closed zabezpieczeniem; ta prerejestracja jej nie usuwa.
 PortableStateImport pozostaje jawnym, odrębnym workflow, bez automatic downgrade.
 
-Bieżąca tymczasowa bramka runnera odmawia checkpoint/resume z **każdym
-aktywnym transportem M1/M2/M3**. Niniejszy format ma wyłącznie owner/formułę M3;
+Bieżąca tymczasowa bramka publicznego admission odmawia ExactResume z **każdym
+aktywnym transportem M1/M2/M3**. Nie usuwa istniejącej ograniczonej kontynuacji
+solver-state nonfrozen M3 V1: `execute_reference_fdm_with_coupled_checkpoint`
+dopuszcza wyłącznie jawny schema V1, brak resolved frozen planu i workflow
+transient, nadal przez kompletne walidatory V1 oraz identity wszystkich modułów.
+Istniejące Rust wrappers `resume_reference_fdm_from_coupled_checkpoint` i
+`resume_reference_fdm_from_coupled_checkpoint_evidence` zachowują ten sam zakres.
+Caller przekazuje niezmieniony oryginalny plan i endpoint; V1 nie utrwala
+endpointu ani output cursorów/committed prefix. API/CLI/orchestrator zachowują
+publiczną odmowę. Regresja final M/accepted artifact/ostatniego wiersza nie
+kwalifikuje pełnego ExactResume ani frozen+M3. Poprawka i nowe negatywne
+regresje mają status SOURCE_ONLY, NOT_COMPILED, NOT_EXECUTED; E11 pozostaje OPEN.
+
+Niniejszy format ma wyłącznie owner/formułę M3;
 nie przywraca frozen + steady M1/M2 ani ich current/output ExactResume.
 Domknięcie tej części wymaga osobnego work itemu w tej samej kanonicznej
 architekturze checkpointów, bez opakowywania steady stanu w pozorny payload

@@ -2049,3 +2049,52 @@ integracji; port własnej grupy to 3203, a cudza instancja 3202 pozostaje poza o
 
 E0 pozostaje przyjęte. E1–E12 pozostają otwarte do właściwych dowodów runtime,
 naukowych i przeglądarkowych. Publikacja kodu nie zmienia ich statusów.
+
+
+### Promocja naprawionego pakietu i kontrola CI PR #247 — 22.10.2026
+
+Kod opublikowano na gałęzi zadania do commita
+`58cf288e5fb75e62aca4bd632d64f6d7bba6ac23` i otwarto
+https://github.com/MateuszZelent/fullmag/pull/247. Nie wykonano bezpośredniego
+push do mastera ani merge przy czerwonych kontrolach.
+
+Kanoniczny `just docker-dev-recovery-build` zakończył się exit0 w stałym
+backendzie grupy zadania, operacja `0ebaf38b26764da7a4c85360babff1a5`.
+Snapshot źródeł `07d6e46cc4af42c51d3c45a34fee54a361fdd4532d11cd477d5c8b80e64070b5`;
+Make 622939 ms, 24 pliki pakietu. Nie budowano ponownie toolchaina CUDA.
+`just docker-dev-promote-recovery` zakończył się exit0, operacja
+`c5956a2454fa4bc8aa69ccf4484d0bd4`; bieżący receipt SHA256
+`389f79956b96305fbf776b078a42dff1dd7513ed16214b0128ae3c5da06ac1d9`,
+provenance SHA256 `8cb2d56cc0ddc163738ec683266de09fbc9adaa171c08105452c4ffd91bee6d3`.
+Poprzedni pakiet zachowano jako backup, stary kandydat jest w kwarantannie.
+Nie usunięto cache, wolumenów ani wyników.
+
+Nowy kanoniczny fullmag-runtime-service wykonał przypięte
+`--cancel-failed-no-spawn`, exit0, status cancelled_no_spawn. Stary task
+`task-84d44df0a8dba6c45a935556b6725a9698a5cb6ce0eaf46c74d77ea335127966`
+ma lifecycle Cancelled, jego rezerwacje lokalne i wspólny ledger mają Released;
+release proof SHA256 `b9429f11e3663404ded799fbfc5cd427ad3db0858b952e4687e4b20791c1157e`.
+RunIntent zachował SHA256 `b0cd2a2577880bcf5a596b02bf6907b3732cf8dac3a0e17cf313e808ef6e7165`.
+Dowody: control volume, `verification/failed-no-spawn-recovery-20261022/`,
+w tym canonical-promoted-execution.result.json i canonical-ledger-release.json.
+To dowód zwolnienia blokady, nie wykonania solve.
+
+Pierwsze CI PR: 17 kontroli PASS, pięć FAIL. Przyczyny: dwie stare sygnatury
+callbacków scheduler testów, niepełny fixture recovery, stare mocki katalogu
+quantities i projekcji tensora, browser fixture bez authored magnetization
+oraz katalogu quantities, a także nadmierna odmowa istniejącej kontynuacji
+stanu nonfrozen M3 V1. Przygotowane poprawki nie osłabiają WebGL/ACK ani
+walidacji identity/checkpoint; pełne publiczne ExactResume nadal Unsupported.
+Pozytywny test M3 pozostał niezmieniony. Nowe negatywne regresje wymagają CI;
+lokalnie testów Rust nie kompilowano.
+
+Po korekcie: 185 skupionych testów frontendu PASS, typecheck i scoped lint PASS;
+pełny Vitest 8789 PASS, jeden FAIL z braku legacy apps/web/dev-server.mjs
+w bootstrap workspace kontenera (ten test przeszedł w pierwszym CI).
+Pełny log frontend-ci-full-regression.log w wolumenie frontend ma SHA256
+`dbe932b4da2783df7c51f184cfb093d3d38f36a40331b37020a535975fe27d5c`.
+Dwanaście testów retained recovery PASS. Mapa 0996 i 41 testów kontraktu PASS.
+Pełny browser fixture wymaga ponownego CI; rzeczywisty viewport i V/J/H nadal
+NIEZWERYFIKOWANE. Kolejny krok: wypchnąć korekty CI, zarządzane stop-failed
+oraz recreate-volume własnej grupy na porcie 3203, następnie publiczny solve.
+E1–E12 pozostają otwarte.
