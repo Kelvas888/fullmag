@@ -1528,6 +1528,11 @@ fn observe_cpu_quota() -> Result<CpuQuota> {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn observe_linux_cpu_quota(cgroup: &str, mountinfo: &str) -> Result<CpuQuota> {
+    let memberships = parse_linux_cgroup_memberships(cgroup)?;
+    let mounts = parse_linux_cgroup_mounts(mountinfo)?;
+
     // Prefer the widest visible hierarchy. A more specific delegated bind
     // mount can hide an ancestor quota even though it matches this process.
     if let Some(membership) = memberships

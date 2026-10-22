@@ -2238,7 +2238,6 @@ def initialize_host_configuration(
                "--store-root", str(paths.store), "--device-access", device_access,
                "--host-id", logical_host_id]
     environment = process_environment(paths, service=True)
-    _run_worker_cpu_quota_migration(paths, command, environment)
     try:
         result = subprocess.run(
             command,

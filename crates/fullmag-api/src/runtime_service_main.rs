@@ -1134,6 +1134,9 @@ fn docker_host_cpu_placements(
 
 fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     let args = parse_docker_host_init_args(args)?;
+    if args.migrate_worker_cpu_quota_from.is_some() {
+        bail!("worker CPU quota readiness migration is not supported by the current ledger initialization path");
+    }
     let host_capacity_scope =
         fullmag_runtime_control::compute_node_probe::docker_host_capacity_is_configured()?;
     let capacity_migration_descriptor_sha256 =
@@ -1148,9 +1151,6 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         bail!(
             "native readiness fixture paths are restricted to FULLMAG_DOCKER_HOST_READINESS_FIXTURE=1"
         );
-    }
-    if args.migrate_worker_cpu_quota_from.is_some() && fixture_readiness {
-        bail!("worker CPU quota migration requires a live native probe, not a readiness fixture");
     }
     let readiness = match (fixture_readiness, args.readiness_path.as_deref()) {
         (true, Some(path)) => {
@@ -3157,6 +3157,14 @@ mod tests {
             .migrate_worker_cpu_quota_from.as_deref(), Some(generation.as_str()));
         args.extend(["--migrate-worker-cpu-quota-from".into(), generation.into()]);
         assert!(parse_docker_host_init_args(args.into_iter()).is_err());
+    }
+
+    #[test]
+    fn docker_host_initializer_rejects_removed_worker_cpu_quota_migration() {
+        let mut args = docker_host_initializer_arguments();
+        args.extend(["--migrate-worker-cpu-quota-from".into(), "a".repeat(64).into()]);
+        let error = initialize_docker_host(args.into_iter()).unwrap_err();
+        assert!(error.to_string().contains("worker CPU quota readiness migration is not supported"));
     }
 
     #[test]

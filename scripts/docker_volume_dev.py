@@ -1604,19 +1604,6 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                          if provided_operation is None
                          else nullcontext(provided_operation))
     with operation_context as operation:
-        if recreate_resume is not None:
-            resumed_reuse, resumed_context = _resume_recreate_context(
-                control, recreate_resume, selected, layout
-            )
-            if resumed_reuse != reuse_state or resumed_context != {
-                "previous_config_sha256": previous_config_sha256,
-                "native_restart_metadata": validated_native_restart_metadata,
-            }:
-                raise BuildControlError("Recreate resume proof changed before start")
-            operation["receipt"]["resumed_recreate"] = {
-                "attempt": recreate_resume.recreate_attempt,
-                "receipt_sha256": recreate_resume.recreate_receipt_sha256,
-            }
         operation["receipt"].update(operator_probe_record)
         if validated_recovery_metadata is not None:
             operation["receipt"]["container_recovery"] = validated_recovery_metadata
@@ -3480,7 +3467,6 @@ def _native_failed_stop_recovery_context(
             owner_raw=terminal_owner_raw,
             owner=terminal_owner,
             selected_source=previous_inputs["source_root"],
-            **({"removed_backend": removed_backend} if removed_backend is not None else {}),
         )
     capture_failure_sidecar = None
     if isinstance(journal.get("container_state"), Mapping):
@@ -5166,8 +5152,6 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             operation["receipt"]["worker_cpu_quota_migration_intent"] = migration
         operation["receipt"].update(state="resuming-observation", state_root=str(state),
             backend_volumes=previous["backend_volumes"], frontend_volume=previous["frontend_volume"])
-        if restart_backend:
-            _restore_host_ledger(control, operation, document, ledger_profile, selected, layout["storage_root"])
         if not actual["frontend"]["State"]["Running"]:
             _frontend(control, operation, selected, state, args.port, image)
             from docker_frontend_restart import recover_stopped_frontend
