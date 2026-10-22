@@ -159,6 +159,188 @@ impl SupervisorSlot {
     }
 }
 
+/// Exact immutable slot identity authenticated by the failed runtime owner.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReapedSupervisorSlotPin {
+    pub(crate) owner_sha256: String,
+    pub(crate) process_id: u32,
+    pub(crate) process_start_token: String,
+}
+
+/// Read-only half of operator recovery. Uses the same owner codec, resource
+/// naming and process-start-token observer as ordinary stale-slot recovery.
+pub(crate) fn validate_reaped_supervisor_slot(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    request_id: &str,
+    pin: &ReapedSupervisorSlotPin,
+) -> Result<(PathBuf, PathBuf)> {
+    let id = uuid::Uuid::parse_str(request_id)?;
+    if id.is_nil() || id.to_string() != request_id {
+        bail!("invalid slot recovery request id");
+    }
+    let relative = format!(
+        "{SUPERVISOR_DIRECTORY}/resource-{}",
+        fullmag_session::hex_sha256(claim.lease.resource_id.as_bytes())
+    );
+    let active = fullmag_session::repository_path::checked_path(store.root(), &relative)?;
+    let archived = fullmag_session::repository_path::checked_path(
+        store.root(),
+        &format!("runtime-services/reaped-worker-recovery/{request_id}/supervisor-slot"),
+    )?;
+    let selected = match (active.try_exists()?, archived.try_exists()?) {
+        (true, false) => &active,
+        (false, true) => &archived,
+        _ => bail!("reaped supervisor slot must exist at exactly one pinned location"),
+    };
+    let metadata = fs::symlink_metadata(selected)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("reaped supervisor slot must be a real directory");
+    }
+    let bytes = fullmag_session::repository_path::read_bounded_regular_file(
+        selected,
+        SLOT_OWNER_FILE,
+        16 * 1024,
+    )?;
+    let owner: SupervisorSlotOwner = serde_json::from_slice(&bytes)?;
+    if fullmag_session::hex_sha256(&bytes) != pin.owner_sha256
+        || owner.schema_version != "fullmag.accepted_worker_supervisor_slot.v3"
+        || owner.run_id != claim.run_id.as_str()
+        || owner.task_id != claim.task_id.as_str()
+        || owner.resource_id.as_deref() != Some(claim.lease.resource_id.as_str())
+        || owner.process_id != pin.process_id
+        || owner.process_start_token != pin.process_start_token
+        || owner.max_concurrency.is_none_or(|limit| limit == 0)
+        || pin.process_start_token.is_empty()
+        || process_start_token(owner.process_id)?.as_deref() == Some(&owner.process_start_token)
+    {
+        bail!("reaped supervisor slot differs from its failed-owner/start-token proof");
+    }
+    let entries = fs::read_dir(selected)?.collect::<std::io::Result<Vec<_>>>()?;
+    if entries.len() != 1 || entries[0].file_name() != SLOT_OWNER_FILE {
+        bail!("reaped supervisor slot contains unexpected evidence; archive refused");
+    }
+    Ok((active, archived))
+}
+
+/// Preserve the entire slot only after terminal failure and proof-backed host
+/// release. Does not remove owner evidence or any worker-attempt effect.
+pub(crate) fn archive_reaped_supervisor_slot(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    request_id: &str,
+    pin: &ReapedSupervisorSlotPin,
+    released: &fullmag_session::host_resource_ledger::HostResourceReservation,
+) -> Result<()> {
+    use fullmag_session::host_resource_ledger::{
+        HostReservationOwner, HostResourceReservationState,
+    };
+    if released.state != HostResourceReservationState::Released
+        || released.release_proof_sha256.is_none()
+        || released.identity.store_id
+            != fullmag_session::host_resource_ledger::HostResourceLedger::store_id(store.root())?
+        || released.identity.run_id != claim.run_id.as_str()
+        || released.identity.task_id != claim.task_id.as_str()
+        || released.identity.resource_id != claim.lease.resource_id
+        || released.identity.lease_token != claim.lease.lease_token.as_str()
+        || released.identity.owner
+            != (HostReservationOwner::Solver {
+                attempt_id: claim.attempt_id.as_str().into(),
+                ownership_epoch: claim.ownership_epoch.value(),
+            })
+    {
+        bail!("slot archive requires exact proof-backed host release");
+    }
+    let _writer = store.write_transaction()?;
+    let catalog = store
+        .read_run_catalog(claim.run_id.as_str())?
+        .context("slot archive catalog missing")?;
+    let task = catalog
+        .tasks
+        .iter()
+        .find(|task| task.task_id == claim.task_id.as_str())
+        .context("slot archive task missing")?;
+    let lease = store
+        .read_resource_lease(
+            claim.run_id.as_str(),
+            &claim.lease.resource_id,
+            claim.lease.lease_token.as_str(),
+        )?
+        .context("slot archive lease missing")?;
+    if task.lifecycle != fullmag_session::FmsTaskLifecycle::Failed
+        || task.attempt_id.as_deref() != Some(claim.attempt_id.as_str())
+        || task.ownership_epoch != Some(claim.ownership_epoch.value())
+        || lease.state != fullmag_session::FmsResourceLeaseState::Released
+        || lease.attempt_id != claim.attempt_id.as_str()
+        || lease.ownership_epoch != claim.ownership_epoch.value()
+        || lease.heartbeat_sequence != claim.lease.heartbeat_sequence
+    {
+        bail!("slot archive requires exact terminal Failed and Released lease");
+    }
+    let decision_id = format!("reaped-worker-failure-{request_id}");
+    let decision = store.read_retry_decision(claim.run_id.as_str(), &decision_id)?
+        .context("slot archive requires its durable DoNotRetry decision")?;
+    decision.validate_for_task(task)?;
+    let recovered = fullmag_runtime_control::recover_coordinator(store, claim)?;
+    let exact_failure = recovered.events.last().is_some_and(|event|
+        event.message_id == decision_id && event.event == (WorkerEvent::Failed {
+            retryable: false, reason: decision.reason.clone(),
+        }));
+    let receipts = store.list_worker_process_exit_receipts(claim.run_id.as_str())?.into_iter()
+        .filter(|receipt| receipt.task_id == claim.task_id.as_str()).collect::<Vec<_>>();
+    if decision.action != FmsRetryAction::DoNotRetry
+        || decision.trigger != FmsRetryTrigger::ExplicitOperatorRequest || !exact_failure
+        || receipts.len() != 1 {
+        bail!("slot archive lacks its exact Failed/DoNotRetry/process-exit chain");
+    }
+    receipts[0].validate_for_task(task)?;
+    if receipts[0].lease_token != claim.lease.lease_token.as_str()
+        || receipts[0].resource_id != claim.lease.resource_id
+        || receipts[0].lease_heartbeat_sequence != lease.heartbeat_sequence
+        || receipts[0].status_success || receipts[0].timed_out || receipts[0].stop_requested {
+        bail!("slot archive process-exit proof differs from the released attempt");
+    }
+    let (active, archived) = validate_reaped_supervisor_slot(store, claim, request_id, pin)?;
+    if active.try_exists()? {
+        let parent_relative = format!("runtime-services/reaped-worker-recovery/{request_id}");
+        let parent =
+            fullmag_session::repository_path::checked_path(store.root(), &parent_relative)?;
+        if !parent.try_exists()? {
+            fullmag_session::repository_path::create_new_directory(store.root(), &parent_relative)?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let from = std::ffi::CString::new(active.as_os_str().as_bytes())?;
+            let to = std::ffi::CString::new(archived.as_os_str().as_bytes())?;
+            if unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    from.as_ptr(),
+                    libc::AT_FDCWD,
+                    to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("archive exact supervisor slot without overwrite");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            bail!("reaped supervisor slot archival currently requires Linux no-replace rename");
+        }
+    }
+    // Reconfirm both directory barriers on replay after an uncertain rename.
+    for parent in [active.parent(), archived.parent()] {
+        std::fs::File::open(parent.context("slot archive parent missing")?)?.sync_all()?;
+    }
+    validate_reaped_supervisor_slot(store, claim, request_id, pin)?;
+    Ok(())
+}
+
 fn reclaim_stale_retry_slot(
     slot_path: &Path,
     run_id: &str,
