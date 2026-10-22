@@ -56,6 +56,8 @@ OPERATION_IDS: tuple[str, ...] = (
     "data_get_sessions_current_data_fields_quantity_id_meta",
     "data_get_sessions_current_data_fields_quantity_id_samples_vector",
     "data_get_sessions_current_data_scalars",
+    "data_get_sessions_current_data_observation_frames",
+    "data_get_sessions_current_data_observation_frames_frame_id_magnetization",
     "data_get_sessions_current_data_tables",
     "data_get_sessions_current_data_tables_table_id_rows",
     "data_get_sessions_current_data_tables_table_id_rows_bin",

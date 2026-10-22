@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
-from fullmag.client import Client, CommandHandle, NotFoundError, Target
+from fullmag.client import ApiError, Client, CommandHandle, NotFoundError, Target
 from fullmag.client.events import EventStream, LiveEvent, Subscription
 from fullmag.client.fmtb import TableRows
 from fullmag.client.fmvp import FieldVector
@@ -225,7 +225,18 @@ class LiveSession:
     # ---- data -------------------------------------------------------------
 
     def field(self, quantity_id: str, **query: Any) -> Optional[FieldVector]:
-        return self.client.data.read_field(quantity_id, **query)
+        try:
+            return self.client.data.read_field(quantity_id, **query)
+        except ApiError as error:
+            # Accepted Docker runs publish m through observation frames; the
+            # live field route has no resolved quantity registry for them.
+            if quantity_id != "m" or query or "quantity_registry_not_resolved_plan" not in error.message:
+                raise
+        frames = self.client.data.observation_frames().get("frames") or []
+        complete = [frame for frame in frames if frame.get("status") == "complete"]
+        if not complete:
+            return None
+        return self.client.data.frame_magnetization(complete[-1]["frame_id"])
 
     def table(self, table_id: str, *, columns: Optional[tuple[str, ...]] = None, **query: Any) -> TableRows:
         return self.client.data.read_table(table_id, columns=columns, **query)

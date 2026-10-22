@@ -168,3 +168,28 @@ def test_field_only_runs_average_m_from_the_published_field(monkeypatch) -> None
                 assert fm.live.active_session().latest_step().step == 500
             finally:
                 fm.disconnect()
+
+
+def test_accepted_runs_read_m_from_the_latest_observation_frame(monkeypatch) -> None:
+    field_bytes = (Path(__file__).resolve().parent / "fixtures" / "fmvp" / "v4_live_explicit.bin").read_bytes()
+    monkeypatch.delenv("FULLMAG_URL", raising=False)
+    with fm.ExecutionContext():
+        with FakeLiveSession() as fake:
+            fake.api.route(
+                "GET",
+                "/v2/sessions/current/data/fields/m/samples/vector",
+                (400, {"code": "bad_request", "message": "quantity 'm' is not requestable as a field vector: quantity_registry_not_resolved_plan"}, {}),
+            )
+            fake.api.route(
+                "GET",
+                "/v2/sessions/current/data/observation-frames",
+                (200, {"frames": [{"frame_id": "frame-old", "status": "complete"}, {"frame_id": "frame-new", "status": "complete"}, {"frame_id": "frame-busy", "status": "pending"}]}, {}),
+            )
+            fake.api.route("GET", "/v2/sessions/current/data/observation-frames/frame-new/magnetization", (200, field_bytes, {}))
+            fm.connect(fake.url, events=False)
+            try:
+                vector = fm.field("m")
+                assert vector is not None and vector.quantity_id == "m"
+                assert fake.api.find("GET", "/v2/sessions/current/data/observation-frames/frame-new/magnetization")
+            finally:
+                fm.disconnect()

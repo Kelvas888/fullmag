@@ -284,6 +284,19 @@ class _Data(_Namespace):
     def fields(self, *, stage_id: Optional[str] = None) -> Any:
         return self._client.call_json("data_get_sessions_current_data_fields", query=_drop_none({"stage_id": stage_id}))
 
+    def observation_frames(self) -> Any:
+        """Accepted-run observation frames of the current run (newest last)."""
+        return self._client.call_json("data_get_sessions_current_data_observation_frames")
+
+    def frame_magnetization(self, frame_id: str) -> FieldVector:
+        """Decode the source-qualified magnetization of one observation frame (FMVP v4)."""
+        response = self._client.call(
+            "data_get_sessions_current_data_observation_frames_frame_id_magnetization",
+            path_params={"frame_id": frame_id},
+            accept="application/octet-stream, application/json",
+        )
+        return decode_field_vector(response.body)
+
     def field_meta(self, quantity_id: str) -> Any:
         return self._client.call_json(
             "data_get_sessions_current_data_fields_quantity_id_meta",
