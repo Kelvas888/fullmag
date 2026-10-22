@@ -373,18 +373,22 @@ mod tests {
         let mut snapshot = snapshot_with_field_provider("V_electric");
         snapshot.capabilities = None;
         snapshot.metadata = Some(serde_json::json!({"magnetic_state_present":false}));
-        let spec = quantity_spec("V_electric").unwrap();
-        let carriers = current_field_carriers(spec, "object", Some("antenna"), "source-mesh",
-            Some("source-fingerprint"), None);
-        let resolved = resolved_quantity_capability_for_snapshot(&snapshot, spec,
-            QuantityMaterializationCapability::Materialized, carriers, "object");
-        assert_eq!(resolved.provider, fullmag_runner::QuantityProviderCapability::Available);
-        assert_eq!(resolved.render, fullmag_runner::QuantityRenderCapability::Renderable);
-        assert_eq!(resolved.reason_code.as_deref(), Some("saved_field_read_only"));
-        assert!(snapshot.capabilities.is_none());
-        let unmaterialized = resolved_quantity_capability_for_snapshot(&snapshot, spec,
-            QuantityMaterializationCapability::Unmaterialized, vec![], "object");
-        assert_eq!(unmaterialized.request, fullmag_runner::QuantityRequestCapability::Unavailable);
+        for id in ["V_electric", "J_charge"] {
+            let spec = quantity_spec(id).unwrap();
+            let carriers = current_field_carriers(spec, "object", Some("antenna"), "source-mesh",
+                Some("source-fingerprint"), None);
+            let resolved = resolved_quantity_capability_for_snapshot(&snapshot, spec,
+                QuantityMaterializationCapability::Materialized, carriers, "object");
+            assert_eq!(resolved.provider, fullmag_runner::QuantityProviderCapability::Available);
+            assert_eq!(resolved.render, fullmag_runner::QuantityRenderCapability::Renderable);
+            assert_eq!(resolved.publication, fullmag_runner::QuantityPublicationCapability::Interactive);
+            assert_eq!(resolved.reason_code.as_deref(), Some("saved_field_read_only"));
+            assert!(snapshot.capabilities.is_none());
+            assert!(!spec.cached_preview);
+            let unmaterialized = resolved_quantity_capability_for_snapshot(&snapshot, spec,
+                QuantityMaterializationCapability::Unmaterialized, vec![], "object");
+            assert_eq!(unmaterialized.request, fullmag_runner::QuantityRequestCapability::Unavailable);
+        }
         for id in ["m", "H_ex", "mat_ms"] {
             let magnetic = quantity_spec(id).unwrap();
             assert_eq!(magnetic.domain, fullmag_quantities::QuantityDomain::MagneticOnly);

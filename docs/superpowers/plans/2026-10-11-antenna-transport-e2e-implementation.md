@@ -2216,3 +2216,32 @@ Parser obu plików PASS; lokalnych Rust unitów nie kompilowano.
 Pełny log CI: verification/master-integration-20261022-publication/ci-rust-780f-full.log;
 parser: coupled-spin-test-access-parser.json w tym samym katalogu.
 Pozostałe uruchomione kontrole CI wymagają końcowego odczytu. PR247 niescalony.
+
+
+### Checkpoint 22.10.2026 — true-residual source i katalog V/J
+
+Commit 97497f1f5f7f16a0722b96ec2fe6ed71aa4124f9 zawiera przejrzaną
+implementację korekcji sparse KKT q+lambda z zachowaniem finalnych gates.
+25 kontroli źródeł, dokładne oracle, focused validator i changed-page gate PASS;
+nowe native regresje oraz build/runtime nadal niewykonane. Evidence freeze:
+verification/rt0-kkt-refinement-source-20261022/implementation-freeze.json.
+
+CI 32fc02401b016b0391949b1c0c4a091c63a515bb:20 PASS,1 FAIL,1 pending w chwili
+odczytu. Rust kompiluje dalej, ale field_only_stored_carrier_is_readable_without_solver_capabilities
+wykazał Unavailable zamiast Renderable dla V_electric. Wspólny katalog nadal
+miał wyłączone interactive_preview/supports_preview_2d/supports_preview_3d
+V/J mimo implementacji ich skalarnych/wektorowych carrierów. Poprawka zmienia
+kanoniczne metadane V/J, zachowuje cached_preview=false i rozszerza tę samą
+regresję na oba pola. Brak provider/zweryfikowanego pola nadal odmawia request;
+magnetic-only quantities i tensor pozostają chronione wcześniejszymi asercjami.
+Parser PASS; wykonanie Rust regresji wymaga kolejnego CI, rzeczywisty podgląd
+pozostaje NOT VERIFIED. Log: ci-rust-32fc-full.log, parser:
+electric-field-catalog-parser.json w verification/master-integration-20261022-publication/.
+
+Erratum diagnozy recovery: dokładny durable inbox bieżącego runu ma pending=null,
+a applied obejmuje Prepare/Start i heartbeat do ACK18. Tylko końcowy HB19
+pozostał bez ACK i poza inboxem. Wcześniejsza hipoteza pending Start była błędna;
+żadnej mutacji na jej podstawie nie wykonano. Nowy operator jest zawężany do
+rzeczywistego applied-prefix, z odmową ambiguous pending Start i bez replay Solve.
+Najnowszy fetch potwierdził origin/master f3730d1f60ab101b3cb009d797bfa77510396987
+już zawarty w naszym HEAD. PR247 pozostaje otwarty; E1–E12 nieprzyjęte.
