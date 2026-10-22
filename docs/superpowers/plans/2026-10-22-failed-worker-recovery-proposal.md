@@ -135,3 +135,25 @@ ani brakującego heartbeat. Nie każdy exit1 jest takim błędem: partial public
 nieznany CAS i crash przed terminalnym eventem pozostają fail-closed.
 Osobne testy muszą rozróżniać scientific failure, publication failure, crash,
 sukces i opóźniony heartbeat. Tego zakresu obecny patch operatora nie implementuje.
+
+
+## Korekta przeglądu requestu i kompilacji
+
+Oryginalny wrapper observed-fields-only nie jest requestem CLI i zawierał
+błędnie wybraną zwolnioną rezerwację preparation o tym samym run/task.
+Nie zastosowano go. Dokładne dopasowanie musi obejmować solver owner,
+attempt/epoch, compute resource i lease token; sam run/task nie wystarcza.
+Poprawione obserwacje: reaped-worker-recovery-observed-solver-fields-only.json,
+SHA256 6731c6a39c9bd5b8076657a17888a0ca6558e79ddcfc88d10549b04f5e235255.
+Wskazują docker-all.compute.cpu, Active lease18 i Committed reservation;
+canonical reservation SHA256 bc7ace1ac7178a4c173512201add9c7a0214c3e35c745d9f6ccae53c264b520b.
+Oryginał pozostaje zachowany jako dowód korekty, bez zgody aktywacji.
+Guard Request::validate odmawia preparation identity; nie poluzowano go.
+
+CI oraz zarządzany build pakietu d423ef7fe5b0fcbab7c8c45457a7462f3c6ee60f
+wykryły E0599: HostRuntimeAdmission::open zwraca Result<Option<Self>>.
+Poprawka wymaga Some przez istniejące anyhow::Context i odmawia przy braku
+host_execution, bez panic lub zmiany wspólnego API. Parser PASS;
+recovery-optional-host-admission-fix.json zawiera dowód i rozważone rozwiązania.
+Wymagany jest nowy udany build i wykonanie CI; nieudany kandydat nie będzie
+promowany. Pełne runtime recovery nadal NOT VERIFIED i niewykonane.

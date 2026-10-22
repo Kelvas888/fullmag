@@ -648,7 +648,8 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
     }
     validate_process_receipt(&request, store.root())?;
     validate_package(&request)?;
-    let admission = fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(&config)?;
+    let admission = fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(&config)?
+        .context("reaped-worker recovery requires the configured physical-host ledger")?;
     let snapshot = admission.ledger().read()?;
     let reservation = snapshot
         .reservations
