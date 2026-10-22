@@ -249,17 +249,19 @@ CPUs and 8–16 GiB. All Docker data lives in `docker_data.vhdx`
 (`%LOCALAPPDATA%\Docker\wsl\disk` on Windows). The launcher needs at least
 32 GiB free on that drive; move the disk image in Docker Desktop → Settings →
 Resources → Advanced → Disk image location if the system drive is tight.
-Until per-group ledgers ([ADR 0067](docs/adr/0067-docker-dev-group-isolation.md)
-point 1) land, all groups on one storage root share one host ledger, and only
-one group per distinct build can hold a live API at a time; groups can still
-build side by side.
+Each DEV group keeps its own resource ledger (`group-ledger-v1`, a volume of
+that group; [ADR 0067](docs/adr/0067-docker-dev-group-isolation.md)), so groups
+with different code can build and hold live APIs side by side. A new group gets
+its own ledger at once; an existing group moves to it when its services are
+re-rendered (`docker-dev-recreate-volume`), while a resumed older operation
+keeps the global ledger pinned in its receipt.
 
 **6. Common failures.**
 
 | Message | Cause | What to do |
 |---|---|---|
 | `Docker build filesystem has less than 32 GiB free` | the drive holding `docker_data.vhdx` is nearly full | free space or move the disk image |
-| `runtime readiness rotation requires the host inventory owner to be absent` | another group with different code has a live API on the same ledger | stop that group's backend, or wait for per-group ledgers |
+| `runtime readiness rotation requires the host inventory owner to be absent` | an older group still on the shared global ledger meets another live API there | stop that group's backend; it gets its own ledger when its services are re-rendered (`just docker-dev-recreate-volume`, pins from the launcher output) |
 | `cannot inspect live Git worktree admin directory`, `Permission denied` on a Git object (WSL) | `.git` not readable by UID 65532 | grant the ACL from step 2 |
 | `measured host capacity differs from the persisted policy` | host capacity changed since the ledger policy was written | coordinated `--migrate-host-capacity` ([ADR 0061](docs/adr/0061-docker-development-build-and-runtime-container.md)) |
 | idle frontend near 30% CPU, slow HMR (Windows) | 9p polling | use a WSL checkout; stop groups you are not using |
