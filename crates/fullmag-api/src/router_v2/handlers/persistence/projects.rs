@@ -2751,6 +2751,11 @@ fn opened_authoring_scene(
     if raw_scene.get("version")?.as_str()? != "scene.v2" { return None; }
     let scene: SceneDocument = serde_json::from_value(raw_scene.clone()).ok()?;
     validate_scene_document_for_authoring(&scene).ok()?;
+    // Structural drafts can retain unsupported execution strings as evidence;
+    // an activation projection still requires the canonical backend contract.
+    serde_json::from_value::<fullmag_ir::BackendTarget>(Value::String(
+        scene.study.requested_backend.trim().to_ascii_lowercase(),
+    )).ok()?;
     let projected = serde_json::to_value(&scene).ok()?;
     if !raw_scene_survives_projection(raw_scene, &projected)
         || scene_references_unmaterialized_assets(&projected)
