@@ -52,9 +52,9 @@ sesją, a sandbox przechwytywania i tak blokuje gniazda.
 | `ns.setfield(...)` | `fm.b_ext(...)` → transakcja napędu pola |
 | `ns.setstages([...])`, `ns.addstage(...)` | `study.stages.add_relax(...)` → `merge_patch` na `study.stages` |
 | `ns.Run()` (blokujące) | `fm.relax()`, `fm.run(1e-9)` → komenda + oczekiwanie |
-| `ns.stop()`, `ns.runstage(i)` | `fm.stop()`, `fm.run_stage(i)` → komendy z `target` |
+| `ns.stop()`, `ns.pause()` | `fm.stop()`, `fm.pause()`, `fm.resume()`, `fm.skip()` → komendy z `target=current_stage` |
 | `bufferCommand=True` + `runcommbuffer` | `with fm.transaction(): …` → jedna transakcja |
-| `mesh.quant.M.getvalue(...)`, OVF2 | `fm.m.to_numpy()` / `fm.field("m").to_numpy()` (FMVP) |
+| `mesh.quant.M.getvalue(...)`, OVF2 | `fm.m.average()`, `fm.field("m").to_numpy()` (FMVP) |
 | `Get_Data_Columns(file)` | `fm.table(id).to_numpy()` / `.to_pandas()` |
 | `Run(callback)` (embedded) | `fm.on(...)`, `fm.run_until(predicate, chunk_steps=N)` |
 | `NSMultiClient(ports=[...])` | `fm.sweep(fn, points, groups=[url1, url2, …])` |
@@ -144,7 +144,7 @@ layer.alpha = 0.5
 layer.m = fm.texture.uniform(1, 0, 0)
 
 fm.relax()                         # komenda relax, czeka na zakończenie
-m = fm.m.to_numpy()
+m = fm.field("m").to_numpy()   # (punkty, 3) numpy
 
 with fm.transaction():             # kilka zmian jako jedna rewizja
     fm.b_ext(0.05, 0, 0)
@@ -158,44 +158,100 @@ przez `fullmag skrypt.py` jak dziś (`capture`).
 
 ### 5.2 Synchronizacja i tożsamość
 
-- Każde wywołanie definiujące scenę wysyła natychmiast jedną transakcję z
-  `base_revision` (ADR 0068, D1). Wyjątek: blok `with fm.transaction():`
-  zbiera wywołania w jedną transakcję wysyłaną na wyjściu z bloku.
-- Wywołanie, którego argumenty nie wystarczają do zbudowania poprawnego
-  zasobu, jest odrzucane lokalnie przed wysłaniem; do sesji nie trafia
-  częściowo zbudowany obiekt.
-- Obiekty mają niezmienny `object_id`. DSL identyfikuje obiekt w sesji po
-  `name` (domyślnie `"body"`): ponowne wykonanie `fm.geometry(..., name=X)`
-  dla istniejącego `X` aktualizuje geometrię tego obiektu
-  (`patch_object_geometry`) zamiast tworzyć duplikat. Zmiana nazwy to
-  `rename_object`.
+- Funkcje DSL definiujące scenę (eksportowane z `fullmag`) oraz przypisania i
+  publiczne metody uchwytów (`MagnetHandle`, `MagnetizationHandle`,
+  `AlphaControl`, `GeometryMeshHandle`, rejestry regionów, `StudyBuilder` i
+  jego uchwyty) działają w `fullmag.live._hooks.dsl_call`. Wspólny licznik
+  zagłębienia sprawia, że synchronizuje dopiero najbardziej zewnętrzne
+  wywołanie: `fm.b_ext(...)`, które wewnętrznie ustawia kilka pól, daje jedną
+  transakcję. Poza trybem `live` hak tylko sprawdza brak sesji.
+- Synchronizacja buduje SceneDocument z bieżącego świata tymi samymi
+  konwerterami co `fullmag skrypt.py` (`export_builder_draft` +
+  `build_scene_document_from_builder`, ~1 ms) i porównuje go z ostatnio
+  wysłanym dokumentem (bez `revision` i `editor`). Brak różnicy: nic nie
+  jest wysyłane.
+- Zmiana jest wysyłana jako:
+  - `replace_scene` — pierwszy kompletny świat po `fm.connect()` lub
+    `fm.reset()` (skrypt jest właścicielem sceny) oraz gdy zmiana wymaga
+    ustawienia `null`, którego merge patch nie wyraża;
+  - `patch_material` — gdy zmieniły się tylko właściwości `Ms`, `Aex`,
+    `alpha`, `Dind`, `Dbulk` jednego materiału (serwer synchronizuje wtedy
+    DMI);
+  - `assign_study_execution` — zmiana `study.execution_profile`, której
+    serwer nie przyjmuje przez merge patch;
+  - `merge_patch` (RFC 7386) — pozostałe zmiany, jedna transakcja.
+  Wszystkie warianty serwer stosuje do tego samego dokumentu i zatwierdza
+  jedną ścieżką (`commit_authoring_transaction`), więc dokument sesji jest
+  równy dokumentowi świata.
+- Świat, którego nie da się jeszcze obniżyć (np. magnes bez `Ms`), nie jest
+  wysyłany: zmiany czekają i trafiają do sesji przy pierwszym kompletnym
+  stanie. Akcje (`relax`, `run`) wymagają kompletnej sceny i zgłaszają błąd.
+- `with fm.transaction():` zbiera wywołania w jedną synchronizację na
+  wyjściu z bloku.
+- Ponowne wykonanie `fm.geometry(shape, name=X)` dla istniejącego `X` w
+  trybie `live` podmienia kształt tego obiektu i zwraca ten sam uchwyt
+  (ponowne uruchomienie komórki notatnika); poza trybem `live` duplikat
+  nadal jest błędem.
 - Typ obiektu nie włącza fizyki; moduły fizyczne włącza się jawnie, tak jak w
   DSL.
-- Uchwyty DSL (`MagnetHandle` i pozostałe) w trybie `live` nie trzymają stanu
-  dłużej niż jedna rewizja; odczyt po zmianie rewizji pobiera zasób ponownie.
-- Funkcja DSL bez zdefiniowanego zachowania w trybie `live` zgłasza
-  `NotImplementedError` z nazwą funkcji; nie wykonuje się po cichu lokalnie.
+- Operacje bez zachowania w trybie `live` zgłaszają `fm.LiveModeError` z
+  podpowiedzią: deklaracje etapów (`relax_stage`, `run_stage`,
+  `eigenmodes_stage`, `frequency_response_stage`, `save_state_stage`),
+  `eigenmodes`, `frequency_response` oraz zapis plików z lokalnego wyniku
+  (`save`, `save_response`, `snapshot`). Nic nie wykonuje się po cichu
+  lokalnie.
+- `fm.reset()` zachowuje sesję; następny kompletny świat zastępuje scenę
+  (odpowiednik `ns.default()`).
 
 ### 5.3 Akcje, stany i pauza
 
-- `fm.relax()`, `fm.run()`, `fm.minimize()`, … wysyłają komendę i czekają na
-  stan końcowy. Argument `wait=False` zwraca `RunHandle` z `.wait()`,
-  `.progress()` i `.cancel()`.
-- `fm.pause()`, `fm.resume()`, `fm.stop()`, `fm.skip()` mapują się na
-  komendy o tej samej nazwie.
-- `with fm.paused():` wysyła `pause`, czeka na potwierdzony stan wstrzymany,
-  wykonuje blok i wysyła `resume` także po wyjątku. Edycje wejścia przyjęte w
-  pauzie obowiązują od następnej granicy etapu (ADR 0068, D3).
+- `fm.relax(...)` i `fm.run(t)` najpierw dopisują etap do `scene.study.stages`
+  (budowany jak etap przechwycony przez `fullmag skrypt.py`), a potem wysyłają
+  komendę `relax`/`run` z `target={"kind": "stage_index", ...}` tego etapu.
+  Run accepted w Dockerze wykonuje dokładnie jeden autorski etap
+  (`select_live_step` w `crates/fullmag-api/src/live_accepted_execution.rs`),
+  a sekwencja etapów sprawia, że `fm.export_script()` odtwarza wykonane akcje.
+  Parametry `relax` są znormalizowane jak lokalnie (`torque_tolerance_apm`,
+  `energy_tolerance_j`, `max_steps`, `max_relaxation_time_s`,
+  `relax_algorithm`, `relax_alpha`, `fixed_timestep`, `max_error`);
+  `fm.minimize` deleguje do `relax`; `until_seconds` w `run` to długość
+  odcinka. Komenda ma warunek `scene_revision` równy rewizji zbudowanej przez
+  skrypt, czeka na stan końcowy i zwraca `LiveCommandResult`. Odrzucona,
+  nieudana lub anulowana komenda zgłasza `CommandFailedError`.
+- `fm.pause()`, `fm.resume()`, `fm.stop()`, `fm.skip()` wysyłają komendy o
+  tej samej nazwie z `target={"kind": "current_stage"}`, jak Control Room.
+- `with fm.paused():` wysyła `pause`, czeka na zakończenie komendy, wykonuje
+  blok jako jedną transakcję i wysyła `resume` także po wyjątku. Edycje
+  wejścia przyjęte w pauzie obowiązują od następnej granicy etapu (ADR
+  0068, D3; zakres backendu w §9).
 - Edycja wejścia podczas biegu bez pauzy zgłasza `InputLockedError`; klient
   nie wysyła niejawnie `stop`.
+- Tryb accepted (Docker DEV) ma dziś ograniczenia serwera, które klient
+  zgłasza jawnie, a nie obchodzi:
+  - `pause` i `skip` zwracają 422 `accepted_control_unsupported`
+    (`UnsupportedCapabilityError`), więc `fm.paused()` działa tylko w
+    hoście interaktywnym poza Dockerem; w Dockerze edycje wykonuje się między
+    komendami (run jest wtedy terminalny);
+  - każda komenda to osobny run startujący od `m` zadanego w scenie, czyli
+    `fm.relax()` → `fm.run()` nie kontynuuje jeszcze zrelaksowanego stanu —
+    zakres F5 w §9.
+- Odczyty wielkości DSL (`fm.m.average()`, `fm.mx`, `fm.E_total`, warunki
+  `fm.mx > 0.5`) w trybie `live` czytają najnowszy wiersz skalarów sesji
+  (`GET …/data/scalars?tail=1`); `fm.m.get()` czyta pole `m` przez FMVP.
+  `fm.field(q)` i `fm.table(id)` zwracają dane jako numpy.
 
 ### 5.4 Pętle sterujące
 
-- `fm.on("scalar.sample", fn)` i `fm.on("resource.changed", fn)`: callbacki
-  w wątku subskrybenta (sync) lub w pętli asyncio (async).
-- `fm.run_until(predicate, chunk_steps=N, max_time=…)`: pętla
-  `run(max_steps=N)` → odczyt skalarów → `predicate(sample)`. Koszt: jedno
-  wstrzymanie i odczyt na blok; dokumentacja podaje pomiar narzutu.
+- `fm.on(event_type, fn)` wywołuje `fn(event)` w wątku strumienia zdarzeń
+  dla `scalar.sample`, `resource.batch_changed`, `hello`,
+  `resync.required` lub `"*"`; zwraca subskrypcję z `cancel()`.
+- `fm.run_until(predicate, chunk_time=…, max_time=…|max_chunks=…)`: pętla
+  `run(until_seconds=chunk_time)` → najnowszy wiersz skalarów →
+  `predicate(step)`. Wymaga co najmniej jednego ogranicznika. Koszt jednej
+  iteracji to jedna komenda i jeden odczyt skalarów.
+- `fm.run_while(condition, chunk_time=…, max_time=…|max_steps=…)` działa w
+  trybie `live` na tej samej pętli; `max_steps` liczy kroki solvera z
+  kolumny `step` sesji.
 - Warunki stopu, które backend obsługuje natywnie (tolerancje relax,
   `until_seconds`), mają pierwszeństwo przed `run_until`.
 
@@ -221,42 +277,68 @@ przez `fullmag skrypt.py` jak dziś (`capture`).
 
 ## 7. Zdarzenia
 
-- Subskrybent WebSocket `fullmag.live.v1` z `after_seq`; po zerwaniu
-  połączenia wznawia od ostatniego `seq`, a po `resync` odczytuje zasoby od
-  nowa.
+- `fullmag.client.events`: klient WebSocket RFC 6455 na bibliotece
+  standardowej (handshake z `Sec-WebSocket-Protocol: fullmag.live.v1`,
+  weryfikacja `Sec-WebSocket-Accept`, ramki fragmentowane, odpowiedź na ping,
+  zamknięcie). Strumień jest wyłącznie odbiorczy, zgodnie z
+  `docs/specs/asyncapi/fullmag-live-realtime-v1.json`.
+- `EventStream` czyta zdarzenia w wątku tła, po zerwaniu połączenia wznawia z
+  `after_seq` = ostatni `seq`, a `resync.required` czyści kursor.
+- `fm.connect(events=True)` (domyślnie) uruchamia strumień; oczekiwanie na
+  komendę budzi się wtedy na zdarzeniach zamiast odpytywać z backoffem.
 - Zdarzenia są wyłącznie powiadomieniami; dane pobiera się osobnym GET po
   zmianie rewizji.
-- Dodatek `fullmag[jupyter]`: pasek postępu runu i wykres skalarów na żywo
-  (ipywidgets); bez dodatku tryb `live` działa w terminalu i REPL.
+- Dodatek `fullmag[jupyter]` (`ipython`, `matplotlib`):
+  `fm.live.jupyter.monitor(("mx", "my", "mz"))` aktualizuje jedno wyjście
+  komórki wykresem skalarów z `scalar.sample` (bez matplotlib — tabela
+  tekstowa). Bez IPython monitor tylko zbiera próbki.
 
 ## 8. Przemiatanie parametrów (wiele grup DEV)
 
 ```python
-def point(fm, H):
+import fullmag as fm
+
+def point(H):
+    fm.engine("fdm")
+    fm.cell(5e-9, 5e-9, 10e-9)
+    layer = fm.geometry(fm.Box(200e-9, 100e-9, 10e-9), name="layer")
+    layer.Ms, layer.Aex, layer.alpha = 800e3, 13e-12, 0.5
+    layer.m = fm.texture.uniform(1, 0, 0)
     fm.b_ext(H, 0, 0)
     fm.relax()
-    return fm.m.mean()
+    return fm.m.average()
 
 results = fm.sweep(point, H=[0.01, 0.02, 0.03, 0.04],
                    groups=["http://127.0.0.1:3197", "http://127.0.0.1:3198"])
+values = [r.value for r in results]          # w kolejności punktów
 ```
 
-- Każda grupa DEV (ADR 0067) ma własną sesję `current`; `fm.sweep` tworzy po
-  jednym kontekście `live` na grupę i rozdziela punkty między nie.
-- Przed każdym punktem kontekst przywraca scenę bazową (`replace_scene`),
-  odpowiednik `ns.default()`.
-- Równoległość jest ograniczona liczbą uruchomionych grup i ich budżetami
-  `FULLMAG_DEV_*`; `fm.sweep` nie uruchamia grup samodzielnie.
-- Wynik: lista wyników w kolejności punktów oraz identyfikatory runów w
-  każdej grupie (provenance).
+- `fm.sweep(function, groups=[...], points=[...] | **listy)` uruchamia jeden
+  wątek na grupę DEV (ADR 0067). Każdy wątek ma własny kontekst autorski
+  (`fm.ExecutionContext`) i własne połączenie `live`; punkty pobiera ze
+  wspólnej kolejki, więc szybsza grupa liczy więcej punktów.
+- Przed każdym punktem świat jest resetowany (`fm.reset()`), a pierwszy
+  kompletny świat punktu zastępuje scenę grupy (`replace_scene`),
+  odpowiednik `ns.default()`. `function` buduje cały model zwykłym DSL.
+- Wynik: `SweepResult(index, point, group, value, run_id, error)` w kolejności
+  punktów. Błędy punktów są zbierane; domyślnie `SweepError` po zakończeniu
+  wszystkich punktów, `raise_on_error=False` zwraca wyniki z błędami.
+- Grupa, która nie odpowiada w `connect_retry_s` (domyślnie 5 s), jest
+  pomijana, a jej punkty liczą pozostałe grupy. `fm.sweep` nie uruchamia
+  grup samodzielnie; równoległość ograniczają liczba grup i ich budżety
+  `FULLMAG_DEV_*`.
 
 ## 9. Wymagane zmiany backendu
 
-| Zmiana | Uzasadnienie | Warunek |
+Stan ustalony przez odczyt kodu (22.10.2026):
+
+| Zmiana | Stan dziś | Zakres |
 |---|---|---|
-| Edycje wejścia w pauzie, obowiązujące od granicy etapu | dziś `validate_active_scene_mutation` blokuje każdą zmianę wejścia przy aktywnym runie, także wstrzymanym | deklaracja per ścieżka wykonania; zmiany w trakcie całkowania dopiero po notatce w `docs/physics/` |
-| Utrzymanie stanu runtime scratch przy edycji | supervisor kończy proces potomny przy każdej zmianie rewizji sceny, co gubi `m`; przy synchronizacji po każdym wywołaniu byłoby to po każdej linii skryptu | kontrakt przeniesienia stanu z wpisem w provenance |
-| Obecność klienta skryptu w sesji | Control Room ma pokazywać, że sesję zmienia skrypt (ADR 0068, pytanie 4) | zasób obecności klientów z rewizją, bez nowego kanału danych |
+| Kontynuacja `m` między komendami w trybie accepted | RunIntent komendy ma `seeds: {}` i `dependencies: []`; kontrakt ma `StudyInputSource::PinnedArtifact` i `ExplicitContinuation`, ale resolver istnieje tylko dla `StepOutput` | `prepare_live_accepted` dodaje wejście stanu z ostatniego zakończonego runu sesji; resolver obok `StepOutput` w `fullmag-runtime-control`; projekcja i provenance zapisują źródło stanu |
+| Utrzymanie `m` w trybie scratch przy edycji | supervisor kończy proces potomny przy zmianie rewizji sceny, stan kontynuacji jest tylko w pamięci procesu | zapis stanu przed restartem i jego wczytanie przez nowy proces z wpisem w provenance |
+| `pause`/`skip` w trybie accepted | 422 `accepted_control_unsupported`; brak stanu „paused” w katalogu runów | komenda pauzy workera i stan cyklu życia; do tego czasu D3 obowiązuje w hoście interaktywnym, a w Dockerze edycje są między komendami |
+| Kod błędu istniejącej sesji | 409 bez kodu (JSON `code: "conflict"`) | kod `session_already_active`; klient obsługuje oba |
+| Obecność klienta skryptu w sesji | brak rejestru klientów; najbliższy wzorzec to `VisualizationClientAcks` | zasób klientów z rewizją i wskaźnik w nagłówku Control Room |
 
 Wsparcie każdej zmiany jest deklarowane per ścieżka (FDM CPU, FDM GPU,
 FEM CPU, FEM GPU) w `docs/specs/capability-matrix-v0.md`; wymuszony GPU nie
@@ -269,10 +351,10 @@ przechodzi niejawnie na CPU.
 | F0 | ADR 0068 i ta spec | zrobione: decyzje przyjęte 22.10.2026 |
 | F1 | `fullmag.client`: transport, modele generowane, błędy, komendy, ponawianie przy handoffie | zrobione: `test_live_client_core.py` na prawdziwym serwerze HTTP w procesie, kontrola aktualności modeli, job CI `python-live-client-contracts` |
 | F2 | dekoder FMVP, `to_numpy()`, tabele, cache ETag | zrobione: `test_live_client_data.py` i `fieldVectorCodec.fixtures.test.ts` dają identyczne wyniki na wspólnych próbkach |
-| F3 | tryb `live` w `world.py`: `fm.connect`/`FULLMAG_URL`, natychmiastowa synchronizacja, reguła tożsamości, `transaction()`, akcje, `paused()`, `export_script()` | skrypt z §5.1 uruchomiony przez `python` buduje scenę w grupie DEV, relax + run działają, `m` wraca jako numpy; eksport odtwarza scenę (round-trip); ten sam skrypt w trybach `eager` i `capture` działa jak przed zmianą |
-| F4 | subskrybent WebSocket, `fm.on()`, `fm.run_until()`, dodatek Jupyter | wznowienie po zerwaniu połączenia, pomiar narzutu `run_until` |
+| F3 | tryb `live` w `world.py`: `fm.connect`/`FULLMAG_URL`, natychmiastowa synchronizacja, reguła tożsamości, `transaction()`, akcje, `paused()`, `export_script()` | zaimplementowane i przetestowane na stanowym fałszywym API (`test_live_dsl_mode.py`); kryterium runtime poniżej NOT VERIFIED do uruchomienia w grupie DEV: skrypt z §5.1 uruchomiony przez `python` buduje scenę w grupie DEV, relax + run działają, `m` wraca jako numpy; eksport odtwarza scenę (round-trip); ten sam skrypt w trybach `eager` i `capture` działa jak przed zmianą |
+| F4 | subskrybent WebSocket, `fm.on()`, `fm.run_until()`, dodatek Jupyter | zaimplementowane (`test_live_events.py`, prawdziwy serwer WebSocket w teście); pomiar narzutu `run_until` w grupie DEV NOT VERIFIED; wznowienie po zerwaniu połączenia, pomiar narzutu `run_until` |
 | F5 | zmiany backendu z §9 | testy kontraktowe API i dowód runtime w grupie DEV dla każdej deklarowanej ścieżki |
-| F6 | `fm.sweep()` na wielu grupach DEV | przemiatanie N punktów na ≥ 2 grupach z wynikami jako numpy i identyfikatorami runów |
+| F6 | `fm.sweep()` na wielu grupach DEV | zaimplementowane (`test_live_sweep.py`: 2 serwery, kolejność wyników, błędy punktów, nieosiągalna grupa); przemiatanie na ≥ 2 prawdziwych grupach DEV NOT VERIFIED |
 | F7 | opcjonalnie tryb in-process (PyO3 + `InteractiveRuntime`) z tym samym protokołem | callback po każdym kroku bez serwera |
 | F8 | przykładowy skrypt i notatnik w `examples/`, strona w `public_docs`, ściągawka Boris → Fullmag | dokumentacja publikowana razem z F3 |
 

@@ -403,6 +403,67 @@ from .world import (
     mz,
 )
 from . import meshing as _mesh_controls
+from . import world as _world
+from .live import (
+    LiveModeError,
+    LiveSession,
+    connect,
+    disconnect,
+    export_script,
+    field,
+    on,
+    pause,
+    paused,
+    resume,
+    run_until,
+    skip,
+    stop,
+    sweep,
+    sync,
+    table,
+    transaction,
+)
+from .live import _hooks as _live_hooks
+
+# Live mode (ADR 0068): every scene-defining DSL call synchronises with the
+# connected session once its outermost call returns.  Outside live mode the
+# wrapper only checks for an active session.
+_LIVE_SYNCED_FUNCTIONS = (
+    "antenna_object", "geometry_object", "antenna_field_source", "field_drive",
+    "current_transport", "oersted", "spin_transport", "spin_torque", "build_domain_mesh",
+    "build_mesh", "boundary_correction", "domain_mesh", "frozen_magnetic_submesh", "name",
+    "parameter", "engine", "exchange", "disable_exchange", "thermal_noise", "demag",
+    "disable_demag", "device", "mode", "threads", "parallel_execution", "fem_demag_solver",
+    "cell", "fdm", "pbc", "object_mesh_defaults", "_legacy_mesh", "hmax", "fem_order",
+    "interactive", "adaptive_mesh", "wait_for_solve", "runtime_metadata",
+    "dispersion_validation", "k0_kittel_validation", "visualization", "geometry", "solver",
+    "demag_quality", "b_ext", "clear_outputs", "tableautosave", "tableadd", "set_name",
+    "spin_wave_excitation", "study", "reset",
+)
+for _live_name in _LIVE_SYNCED_FUNCTIONS:
+    globals()[_live_name] = _live_hooks.synced(globals()[_live_name])
+del _live_name
+_live_hooks.install_handle_hooks(
+    (
+        _world.MagnetHandle,
+        _world.MagnetizationHandle,
+        _world.AlphaControl,
+        _world.GeometryMeshHandle,
+        _world.RegionRegistry,
+        _world.StudyRegionRegistry,
+        _world.StudyBuilder,
+        _world.StudyAirboxHandle,
+        _world.StudyAirboxVisualizationHandle,
+        _world.StudyUniverseHandle,
+        _world.StudyObjectsMeshDefaultsHandle,
+        _world.StudyObjectsMeshHandle,
+        _world.StudyObjectsHandle,
+        _world.StudyMeshHandle,
+        _world.StudyCouplingsHandle,
+        _world.StudyFieldDriveRegistry,
+        _world.StudyEnergyTermRegistry,
+    )
+)
 
 
 class _MeshNamespace:
@@ -416,6 +477,23 @@ class _MeshNamespace:
 mesh = _MeshNamespace()
 
 __all__ = [
+    "LiveModeError",
+    "LiveSession",
+    "connect",
+    "disconnect",
+    "export_script",
+    "field",
+    "on",
+    "pause",
+    "paused",
+    "resume",
+    "run_until",
+    "skip",
+    "stop",
+    "sweep",
+    "sync",
+    "table",
+    "transaction",
     "AbsorbingBoundaryLayer",
     "ExecutionContext",
     "ParameterDefinition",

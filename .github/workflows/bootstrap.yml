@@ -1012,11 +1012,14 @@ jobs:
           python -m pip install 'pytest>=9,<10'
           python -m pip install -e packages/fullmag-py
 
-      - name: Run live client contracts (ADR 0068)
+      - name: Run live client and live DSL contracts (ADR 0068)
         run: >-
           python -m pytest -q
           packages/fullmag-py/tests/test_live_client_core.py
           packages/fullmag-py/tests/test_live_client_data.py
+          packages/fullmag-py/tests/test_live_dsl_mode.py
+          packages/fullmag-py/tests/test_live_events.py
+          packages/fullmag-py/tests/test_live_sweep.py
 
 
   windows-volatile-storage-contracts:
