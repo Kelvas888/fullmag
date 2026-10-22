@@ -59,7 +59,7 @@ fn one_shared_scalar_slope_rejects_shear_rotation_and_anisotropy() {
 
 #[test]
 fn all_vertex_pairs_are_required_for_a_common_intercept() {
-    let mut currents = [1e12; 12];
+    let mut currents = [1e12_f64; 12];
     currents[4] -= 0.02;
     currents[10] += 0.02;
     for index in [4, 10] {
