@@ -2073,12 +2073,18 @@ fn worker_failure_reason(outcome: &ObservedWorkerProcess) -> String {
     let detail = if normalized.is_empty() {
         format!("exit code {:?}", output.status.code())
     } else {
-        // The worker reports its error last; keep the tail so diagnostic
-        // progress lines printed earlier cannot hide the failure.
-        let chars = normalized.chars().collect::<Vec<_>>();
-        let start = chars.len().saturating_sub(512);
-        let tail = chars[start..].iter().collect::<String>();
-        if start > 0 { format!("...{tail}") } else { tail }
+        // Prefer the worker's own error report; diagnostic progress lines
+        // printed around it must not hide the failure. Otherwise keep the tail.
+        let marker = "accepted worker failed:";
+        let report = normalized.rfind(marker).map(|index| &normalized[index..]);
+        let chars = report.unwrap_or(&normalized).chars().collect::<Vec<_>>();
+        if report.is_some() {
+            chars.iter().take(1024).collect()
+        } else {
+            let start = chars.len().saturating_sub(512);
+            let tail = chars[start..].iter().collect::<String>();
+            if start > 0 { format!("...{tail}") } else { tail }
+        }
     };
     format!("accepted worker process failed: {detail}")
 }

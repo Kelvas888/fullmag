@@ -1857,7 +1857,9 @@ async fn apply_projection(
     }
     next.state_version = next.state_version.saturating_add(1);
 
-    if terminal && !projection.terminal_without_outputs {
+    // A run that failed or was cancelled before publishing outputs still ends
+    // its bound command; otherwise its client would wait forever.
+    if terminal {
         complete_bound_command(
             state,
             &next,
