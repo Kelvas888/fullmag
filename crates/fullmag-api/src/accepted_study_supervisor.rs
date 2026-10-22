@@ -683,11 +683,21 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
     };
     accepted_supervisor_test_fail_after_process_exit_receipt()?;
     if let Err(error) = final_heartbeat_result {
-        slot.retain_for_reconciliation();
-        return Err(error.context(format!(
-            "reconcile final worker-acknowledged resource heartbeat; {}",
-            worker_failure_reason(&outcome)
-        )));
+        // A worker that exited unsuccessfully cannot acknowledge its last
+        // heartbeat; that pending lease renewal has no solver effect, so the
+        // durable process exit is reconciled as an ordinary failure below.
+        // A successful exit with an unacknowledged heartbeat stays ambiguous.
+        if process_exit_receipt.status_success {
+            slot.retain_for_reconciliation();
+            return Err(error.context(format!(
+                "reconcile final worker-acknowledged resource heartbeat; {}",
+                worker_failure_reason(&outcome)
+            )));
+        }
+        tracing::warn!(
+            error = ?error,
+            "failed accepted worker left its final heartbeat unacknowledged; reconciling the process exit"
+        );
     }
     let reconciliation = reconcile_worker_exit(
         store,
@@ -1572,7 +1582,13 @@ fn reconcile_worker_exit(
     if process_exit.status_success {
         bail!("worker exited successfully without a durable succeeded task");
     }
-    if inbox_checkpoint.pending.is_some() && accepted_worker_attempt_reserved(store, claim)? {
+    // A pending lease heartbeat is not a solver effect; only another pending
+    // command (Start/Stop) leaves the outcome ambiguous.
+    let pending_effect = inbox_checkpoint
+        .pending
+        .as_ref()
+        .is_some_and(|pending| !matches!(&pending.command, WorkerCommand::Heartbeat { .. }));
+    if pending_effect && accepted_worker_attempt_reserved(store, claim)? {
         bail!(
             "worker exited with an ambiguous pending effect; resource lease retained for reconciliation: {}",
             process_exit

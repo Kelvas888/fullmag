@@ -920,8 +920,9 @@ pub(crate) fn create_private_attempt_output_dir(
             .with_context(|| format!("worker attempt {label} is invalid"))?;
     }
 
-    let _writer = store
-        .write_transaction()
+    // The API projection and scheduler share this store; a busy writer is
+    // transient and nothing was reserved yet, so wait for the lock.
+    let _writer = retry_store_writer_busy(|| store.write_transaction())
         .context("lock session store before reserving worker attempt output")?;
     let current_claim = retry_worker_claim_store_busy(
         store,
