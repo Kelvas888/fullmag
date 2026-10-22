@@ -103,6 +103,8 @@ export const openApiV2PathLiterals = [
   "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/samples",
   "/v2/sessions/current/analysis/spin-wave/dynamic-structure-factor.v1",
   "/v2/sessions/current/analysis/spin-wave/gamma.v1",
+  "/v2/sessions/current/clients",
+  "/v2/sessions/current/clients/{client_id}",
   "/v2/sessions/current/data/antenna/field-solutions/{solution_id}",
   "/v2/sessions/current/data/antenna/field-solutions/{solution_id}/payloads/{payload_kind}",
   "/v2/sessions/current/data/antenna/source-spectra/{output_id}",
