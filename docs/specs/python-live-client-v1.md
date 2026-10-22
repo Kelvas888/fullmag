@@ -368,7 +368,7 @@ Ograniczenia stwierdzone w grupie DEV (poza zakresem F5):
 - API nie ma operacji zamknięcia sesji (`PATCH /v2/sessions/current` zwraca 400), a launcher celowo nie restartuje backendu z aktywną sesją. Sesja założona przez `fm.connect()` blokuje więc `just docker-dev` po zmianie backendu; launcher mówi to teraz wprost. Docelowy model wielu sesji (karty sesji obok Home) to osobny temat;
 - `docker restart` backendu bez launchera pomija delegowaną bramkę cgroup workerów; próbka węzła ma wtedy `cpu_quota: unavailable`, a ledger hosta po cichu odrzuca przyjęcia CPU (komenda zostaje `accepted`). Po zmianie backendu trzeba restartować przez launcher;
 - projekcja tabeli skalarów i rejestru wielkości dla runów accepted (wykresy na żywo, `E_total`, trasa wektora pól) nie istnieje; klient obchodzi to ramkami obserwacji;
-- magazyn sesji na folderze Windows (`FULLMAG_PROJECT_STORAGE_ROOT=C:\gitullmag\storage`, montowanie Docker Desktop) wydłuża każdą transakcję do 3–6 s i daje sporadyczne `ENOENT` przy odczycie listingu pod blokadą zapisu; zalecany magazyn na ext4 (WSL) albo w wolumenie Dockera.
+- magazyn sesji na folderze Windows (`FULLMAG_PROJECT_STORAGE_ROOT=C:\git\fullmag\storage`, montowanie Docker Desktop) wydłuża każdą transakcję do 3–6 s i daje sporadyczne `ENOENT` przy odczycie listingu pod blokadą zapisu; zalecany magazyn na ext4 (WSL) albo w wolumenie Dockera.
 
 Wsparcie każdej zmiany jest deklarowane per ścieżka (FDM CPU, FDM GPU,
 FEM CPU, FEM GPU) w `docs/specs/capability-matrix-v0.md`; wymuszony GPU nie

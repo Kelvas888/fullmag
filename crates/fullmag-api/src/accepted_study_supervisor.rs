@@ -838,16 +838,50 @@ fn task_stop_requested(store: &SessionStore, run_id: &str, task_id: &str) -> Res
     ))
 }
 
+/// Read-only claim reconstruction for one heartbeat. On a Docker Desktop
+/// Windows host folder a file that another process atomically replaces can
+/// read as missing for a moment, even under the writer lock. The run catalog
+/// never disappears during a run, so such an observation is retried briefly
+/// instead of failing a running task.
+fn load_claim_for_heartbeat(
+    store: &SessionStore,
+    run_id: &fullmag_application::RunId,
+    task_id: &str,
+) -> Result<fullmag_application::TaskClaim> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match retry_store_writer_busy(|| {
+            fullmag_runtime_control::load_current_task_claim(store, run_id, task_id)
+        }) {
+            Ok(claim) => return Ok(claim),
+            Err(error)
+                if transiently_missing_store_file(&error)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn transiently_missing_store_file(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            || cause.to_string() == "task claim recovery requires a durable run catalog"
+    })
+}
+
 fn renew_resource_lease(store: &SessionStore, lease: &mut FmsResourceLease) -> Result<bool> {
     if task_is_terminal(store, lease)? {
         return Ok(false);
     }
     let run_id = fullmag_application::RunId::parse(lease.run_id.clone())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let claim = retry_store_writer_busy(|| {
-        fullmag_runtime_control::load_current_task_claim(store, &run_id, &lease.task_id)
-    })
-    .context("load accepted-worker claim before heartbeat command")?;
+    let claim = load_claim_for_heartbeat(store, &run_id, &lease.task_id)
+        .context("load accepted-worker claim before heartbeat command")?;
     if reconcile_acknowledged_resource_lease(store, &claim, lease)? {
         return Ok(true);
     }
@@ -2264,6 +2298,17 @@ mod tests {
     use super::*;
     use std::process::Child;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn heartbeat_claim_reads_retry_only_transiently_missing_files() {
+        let missing = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("read run catalog");
+        assert!(transiently_missing_store_file(&missing));
+        let no_catalog = anyhow::anyhow!("task claim recovery requires a durable run catalog");
+        assert!(transiently_missing_store_file(&no_catalog));
+        let not_ready = anyhow::anyhow!("task is not ready under an active durable claim");
+        assert!(!transiently_missing_store_file(&not_ready));
+    }
 
     #[cfg(unix)]
     #[test]
