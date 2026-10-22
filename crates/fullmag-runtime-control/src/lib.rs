@@ -32,11 +32,25 @@ use fullmag_session::{
 /// idempotent operation. Process- and thread-dependent jitter prevents
 /// scheduler, supervisor, and worker loops from repeatedly colliding in
 /// lockstep while preserving the five-second bounded wait.
-pub fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+pub fn retry_store_writer_busy<T>(operation: impl FnMut() -> Result<T>) -> Result<T> {
+    retry_store_writer_busy_within(std::time::Duration::from_secs(5), operation)
+}
+
+/// Bounded wait for a running worker. The writer lock is a non-blocking,
+/// unfair try-lock shared by the API, both schedulers and every worker, so a
+/// five-second poll can starve while they keep taking it. Losing a computed
+/// result to that is worse than waiting; schedulers keep the short bound and
+/// defer their pass instead.
+pub const WORKER_STORE_WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+pub fn retry_store_writer_busy_within<T>(
+    wait: std::time::Duration,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
     use std::hash::{Hash, Hasher};
     use std::time::{Duration, Instant};
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + wait;
     let mut attempt = 0_u64;
     loop {
         match operation() {
