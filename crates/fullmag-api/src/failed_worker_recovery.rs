@@ -1613,11 +1613,15 @@ mod tests {
     }
 
     #[test]
-    fn archive_completion_validates_original_terminal_history_without_mutation() {
+    fn archive_completion_validates_original_terminal_history_without_run_mutation() {
         let (fixture, released, completion) = completion_fixture();
         let reason = fixture.request.failure_reason().unwrap();
         let request_bytes = serde_json::to_vec(&fixture.request).unwrap();
-        let before = tree_bytes(fixture.store.root());
+        // Production holds this writer while canonical recovery reads refresh
+        // its ownership heartbeat. Every byte of run history must stay fixed.
+        let _writer = fixture.store.write_transaction().unwrap();
+        let run_root = fixture.store.root().join("runs");
+        let before = tree_bytes(&run_root);
         validate_completion_state(&fixture.request, &completion, &fixture.store, &released).unwrap();
         validate_completion_state(&fixture.request, &completion, &fixture.store, &released).unwrap();
         for field in ["host_state", "release_proof", "event", "decision", "original_tool"] {
@@ -1633,7 +1637,7 @@ mod tests {
             }
             assert!(validate_completion_state(&original, &changed, &fixture.store, &row).is_err(), "{field}");
         }
-        assert_eq!(tree_bytes(fixture.store.root()), before);
+        assert_eq!(tree_bytes(&run_root), before);
         assert_eq!(fixture.request.failure_reason().unwrap(), reason);
         assert_eq!(serde_json::to_vec(&fixture.request).unwrap(), request_bytes);
         assert_ne!(completion.tool.executable_sha256, fixture.request.executable_sha256);
