@@ -30896,7 +30896,18 @@ async fn coupled_m3_restore_rejects_every_identity_and_state_shape_mismatch_with
             .await
             .unwrap();
         let create_status = create.status();
-        if create_status == StatusCode::BAD_REQUEST {
+        if create_status == StatusCode::BAD_REQUEST || label == "common-state magnetization" {
+            if label == "common-state magnetization" {
+                // Split primary frames are rejected by storage capture before
+                // any checkpoint exists; do not bypass that coherence gate.
+                assert_eq!(create_status, StatusCode::INTERNAL_SERVER_ERROR);
+                let response_body = body_json(create).await;
+                assert_eq!(response_body["code"], "internal_error");
+                assert_eq!(
+                    response_body["message"],
+                    "capturing checkpoint: capture backend and common primary frame differ"
+                );
+            }
             let mut guard = state.current_live_state.write().await;
             let snapshot = guard.as_mut().unwrap();
             assert_eq!(
@@ -50704,7 +50715,7 @@ async fn frequency_response_binary_cache_tracks_content_and_representation() {
             "components": ["x", "y", "z"],
             "complex_pair_count": 12,
             "payload_value_count": 24,
-            "available_views": ["complex", "real", "imag", "abs", "phase_rotated_real"],
+            "available_views": ["complex", "real", "imag", "abs", "phase", "phase_rotated_real"],
             "default_view": "phase_rotated_real",
             "default_phase_rad": 0.0
         })).unwrap(),
