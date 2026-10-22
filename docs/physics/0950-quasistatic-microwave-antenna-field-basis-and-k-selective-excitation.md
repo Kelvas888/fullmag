@@ -9428,6 +9428,214 @@ Przypięta rewizja źródeł MFEM odpowiada odczytanej recepturze budowy; odręb
 | `backends/fem/cpu/mfem/workflows/antenna_field_solve/charge_trace_workspace.cpp` | `ChargeTraceWorkspace::Impl::solve` | planned same-operator true-residual correction; runtime NOT VERIFIED |
 | `backends/fem/tests/conservative_current_view_contract.cpp` | `charge_trace_workspace_preserves_component_gauges_and_weak_reactions` | istniejąca numerical regression source, nieuruchomiona |
 
+(antenna-rt0-true-residual-kkt-refinement-v1)=
+## FEM CPU: prerejestracja pełnej korekcji rzeczywistego residualu RT0/KKT — 22.10.2026
+
+**Stan: SOURCE_PLANNED; implementacja, native runtime i kwalifikacja naukowa
+NOT VERIFIED.** To prerejestracja przed zmianą C++, dotycząca wyłącznie sparse
+MINRES w `conservative_current_view.cpp::solve_weighted_rt0_projection`.
+Dense KKT oraz CG dla układu bez constraints pozostają bez zmian. Nie jest to
+nowa fizyka, nowy backend ani publiczny parametr. Zachowujemy pełny conductor,
+coincident cut, source voltage, conductivity, gauge, zaakceptowany H1 snapshot,
+rank ledger, objective oraz wszystkie istniejące równania i progi certyfikatów.
+
+### Problem, dowód odmowy i granica wnioskowania
+
+Rzeczywista próba publiczna
+`run-live-91ade96632da3c92902cd0143337a9496518ff29ea45ab0bc22313d44421eee4`
+na pakiecie `a9259bb183cbffe96b46d4493ec55ea471cfedbd` doszła do native solve.
+Receipt workera `worker-process-exit-8c796b30fe9662d1cbf3355dd8a71d450ebc8c16010d417da0d076b4d43d2b38`
+potwierdza exit 1 i lokalny residual $-2.2630475713324681\times10^{-15}\,\mathrm A$
+przy skali $1.3631510305998916\times10^{-5}\,\mathrm A$.
+Niezmieniony dopuszczalny błąd to
+$1.3641510305998915\times10^{-15}\,\mathrm A$; odmowa jest prawidłowa.
+Przygotowanie miało 1867 Tet4, 1324 boundary faces i 678 nodes, bez invalid cells;
+4396 RT0 face DOF już przed dodatkowym rozcięciem przekracza dense cutoff 4096.
+Stan nie zawiera accepted V/J/H. Sukces solvera lub buildu nie jest
+kwalifikacją naukową.
+
+MFEM `MINRESSolver::Mult` kontroluje rekurencyjną normę z preconditionerem.
+Dotychczasowy final `scaled_kkt_residual` miesza residuale w V i A, z dolnym
+ograniczeniem mianownika 1.0; nie daje gwarancji każdego lokalnego bilansu w A.
+`AffineRt0Element::face_moment` mierzy rzeczywiste frozen coefficients przez
+exact-rational geometry moments, więc nie wolno zastąpić niezależnego pomiaru
+kopią shared DOF ani dodać flooru roundoff do certyfikatu. Nie zachowano wektora
+KKT nieudanej próby; nie rozstrzygamy udziału rekurencyjnego błędu MINRES i
+propagacji do omitted rows. Usuwamy wykazaną lukę kryterium stopu, bez obietnicy
+zbieżności dowolnego układu.
+
+### Równania pełnego refinement i jednostki
+
+Macierze oraz prawe strony pozostają oryginalne i niezmienne. D oznacza tutaj
+aktywne, niezależne constraints po dotychczasowym rank reduction; wszystkie
+wiersze, również omitted, zachowują osobny ledger i końcowe kontrole.
+
+```{math}
+:label: antenna-rt0-refinement-kkt
+\begin{bmatrix}M&D^T\\D&0\end{bmatrix}
+\begin{bmatrix}\mathbf q\\\boldsymbol\lambda\end{bmatrix}
+=\begin{bmatrix}\mathbf f\\\mathbf h\end{bmatrix}.
+```
+
+```{math}
+:label: antenna-rt0-refinement-residual
+\mathbf r_V=\mathbf f-M\mathbf q-D^T\boldsymbol\lambda,\qquad
+\mathbf r_A=\mathbf h-D\mathbf q,\qquad
+s_{V,i}=|f_i|+\sum_j|M_{ij}q_j|+\sum_k|D_{ki}\lambda_k|.
+```
+
+```{math}
+:label: antenna-rt0-refinement-update
+\begin{bmatrix}M&D^T\\D&0\end{bmatrix}
+\begin{bmatrix}\delta\mathbf q\\\delta\boldsymbol\lambda\end{bmatrix}
+=\begin{bmatrix}\mathbf r_V\\\mathbf r_A\end{bmatrix},\qquad
+\mathbf q\leftarrow\mathbf q+\delta\mathbf q,\quad
+\boldsymbol\lambda\leftarrow\boldsymbol\lambda+\delta\boldsymbol\lambda.
+```
+
+```{math}
+:label: antenna-rt0-refinement-local-gates
+\left|\sum_j d_{ij}q_j\right|\le a_A+
+\tau_c\sum_j|d_{ij}q_j|\quad\text{(div/pair)},\qquad
+\left|\sum_j d_{ij}q_j-h_i\right|\le a_A+\tau_t|h_i|
+\quad\text{(existing terminal)}.
+```
+
+```{math}
+:label: antenna-rt0-refinement-stationarity-budget
+|r_{V,i}|\le\tau_s s_{V,i},\qquad
+s_{V,i}=0\Longrightarrow r_{V,i}=0,\qquad
+\sum_{\ell=0}^{p}n_\ell\le N_{\max},\qquad
+N_{\max}=\begin{cases}
+\max(2000,4N)&N\le50000,\\
+200000&N>50000.
+\end{cases}
+```
+
+| Dokładny token | Znaczenie | Jednostka SI |
+|---|---|---|
+| $M$ | oryginalna assembled weighted RT0 mass matrix w physical flux coordinates | $\Omega$ |
+| $D,d_{ij}$ | aktywna incidence matrix i współczynniki wszystkich kontrolowanych constraints; bez nowych wierszy | $1$ |
+| $\mathbf q,q_j,\delta\mathbf q$ | physical face moments i ich pełna korekcja KKT | $\mathrm A$ |
+| $\mathbf h,h_i$ | oryginalne constraint RHS; zero dla div/pair | $\mathrm A$ |
+| $\mathbf f,f_i$ | oryginalny weighted load z tego samego zaakceptowanego H1 | $\mathrm V$ |
+| $\boldsymbol\lambda,\lambda_k,\delta\boldsymbol\lambda$ | mnożniki Lagrange'a i ich korekcja | $\mathrm V$ |
+| $\mathbf r_V,r_{V,i},s_{V,i}$ | true stationarity residual i jego lokalna skala sumy modułów | $\mathrm V$ |
+| $\mathbf r_A$ | true residual aktywnych constraints | $\mathrm A$ |
+| $a_A$ | niezmieniony absolute physical current gate, $10^{-18}$ | $\mathrm A$ |
+| $\tau_c$ | niezmieniony local continuity gate, $10^{-10}$ | $1$ |
+| $\tau_t$ | niezmieniony existing terminal-current gate, $10^{-8}$ | $1$ |
+| $\tau_s$ | nowy ostrzejszy stationarity backward-error gate, $10^{-12}$ | $1$ |
+| $N,N_{\max},n_\ell,p,\ell$ | rozmiar sparse KKT, wspólny limit, actual iteracje wywołania, ostatnie wywołanie i indeks | $1$ |
+| $i,j,k$ | indeks wiersza, flux DOF i aktywnego constraint | $1$ |
+| $\sum,\lvert\cdot\rvert,\max,{}^T,\delta,\leftarrow$ | suma, moduł, maksimum, transpozycja, korekcja i aktualizacja; jednostki argumentów zachowane | $1$ jako operatory |
+
+### Realizacja, kompletna polityka i fail-closed
+
+True residual obliczamy z oryginalnego CSR M, niezmienionych D/f/h oraz aktualnych
+binary64 q/lambda; iloczyny i sumy w `long double`, z kontrolą representability
+przy przekazaniu RHS do MFEM. Nie kopiujemy residualu rekurencyjnego ani nie
+traktujemy `GetConverged` jako admission. Nowy row-wise stationarity gate jest
+ostrzejszym warunkiem wewnętrznym, a nie zmianą dotychczasowego globalnego gate.
+Skale V i A pozostają osobne; nie sumujemy ich w nowym kryterium. Zerowa skala
+stationarity wymaga dokładnie zerowego residualu, bez arbitralnego flooru.
+
+Po pierwotnym solve kontrolujemy wszystkie div/pair rows, także omitted, oraz
+istniejące terminal rows. Gdy wszystkie lokalne i stationarity gates przechodzą,
+nie wykonujemy korekcji. W przeciwnym razie rozwiązujemy pełny układ correction
+na tym samym operatorze i preconditionerze. Aktualizacja obejmuje q **i** lambda;
+nie jest constraint-only repair, projekcją samych bilansów ani dopasowaniem
+source current. Nie zmieniamy M, D, f, h, rank decision, H1, jump, conductivity,
+voltage ani źródła. Nie dodajemy constraint $I_{\mathrm{RT0}}=I_{\mathrm{H1}}$.
+Te dwie miary i prerejestrowane porównanie source-current pozostają oddzielne.
+
+| Polityka / parametr | Typ / default lub wartość stała | SI | Walidacja i semantyka | Public Python / ProblemIR |
+|---|---|---|---|---|
+| sparse cutoff | internal integer, 4096 | $1$ | `global_dof_count > 4096`; dense bez zmian | brak nowego pola |
+| MINRES relative stop | internal double, `1e-12` | $1$ | bez zmian, każde correction solve ten sam operator i preconditioner | bez zmiany requested/resolved policy |
+| MINRES absolute stop | internal double, `0.0` | $1$ w normie wewnętrznej solvera | bez zmian; brak fixed absolute shortcut | brak nowego pola |
+| stationarity backward error | internal double, $\tau_s=10^{-12}$ | $1$ | nowy warunek per row, finite; zero scale wymaga zero residualu | brak publicznego parametru |
+| local div/pair | internal doubles, $a_A=10^{-18}$ i $\tau_c=10^{-10}$ | odpowiednio $\mathrm A$ i $1$ | wszystkie rows, również omitted; bez roundoff floor | istniejące native physical policy pins, bez nowej serializacji |
+| existing terminal | internal double, $\tau_t=10^{-8}$ | $1$ | tylko istniejące terminal constraints, skala własnego signed RHS | bez dodawania terminal/source actuator |
+| total sparse iteration budget | internal integer, $N_{\max}$ powyżej | $1$ | łącznie initial i corrections; istniejący cap typu `int`; next solve tylko remaining budget | odrębny istniejący limit RT0; nie reinterpretować H1 `max_iterations` |
+| final global KKT gate | internal double, `1e-10` | $1$ jako istniejący legacy wskaźnik | zachowany dodatkowo; sam nie dowodzi lokalnej dokładności SI | bez zmiany publicznych pins |
+| final physical Piola gates | existing request doubles, `1e-18 A` / `1e-10` | $\mathrm A$ / $1$ | ponowny niezależny pomiar final field; bez poluzowania | bez zmian IR/capabilities |
+
+Każde wywołanie MINRES musi spełnić istniejące `GetConverged`. Budżet liczymy
+łącznie, nie od nowa dla każdego RHS. Nonfinite operator/residual/correction,
+nieprzedstawialny RHS, brak zbieżności, zero postępu iteracyjnego, aktualizacja
+niezmieniająca żadnego binary64 q/lambda lub wyczerpanie budżetu kończą się
+odmową przed accepted state. Nie dodajemy safety factor, dodatkowych iteracji
+po budżecie ani mniejszego RelTol dobranego po wynikach. Refinement nie gwarantuje
+zbieżności przy złym conditioning lub na granicy roundoff.
+
+Pozostaje sparse CSR i O(N) dodatkowych wektorów, bez dense inverse/Schur matrix.
+Po zakończeniu korekcji obliczamy dotychczasowy global residual i correction
+energy z final q/lambda. Dopiero potem jedna konwersja physical moments do
+owned MFEM coefficients; niezależny `integrate_physical_certificate` ponownie mierzy
+wszystkie physical gates bez zmian. J, signed current i H muszą pochodzić z tego
+samego zaakceptowanego owned field. Getter, diagnostyka, eksport i odczyt pola
+nie uruchamiają solve/refinement i nie zmieniają zaakceptowanych coefficients.
+
+### Publiczny kontrakt, realizacje i walidacja przed kwalifikacją
+
+Publiczny flat stage-first przykład
+`examples/fem_antenna_closed_loop_nonmagnetic.py::study` oraz istniejące mapy
+Python→ProblemIR tej noty pozostają bez zmian; brak nowych constructors,
+kwargs, IR fields i capability. H1 requested policy, charge digest, prepared
+binding oraz rank ledger są zachowane. Nowy accepted source digest wynika
+wyłącznie z rzeczywistego finalnego RT0, a nie ze skorygowanej diagnostyki.
+Runtime odmawia przed publikacją V/J/H, jeżeli którakolwiek bramka nie przejdzie;
+nie ma fallbacku CPU/GPU ani alternatywnej sesji/ścieżki wyników.
+
+| Realizacja | Zakres / stan dowodu |
+|---|---|
+| FEM CPU | SOURCE_PLANNED: serial affine Tet4 sparse RT0/KKT; native runtime i kwalifikacja NOT VERIFIED |
+| FEM GPU | poza zakresem; brak implementacji refinement i brak parytetu |
+| FDM CPU | nie dotyczy: inna dyskretyzacja charge/current; bez zmian |
+| FDM GPU | nie dotyczy: inna realizacja; bez zmian i bez fallbacku |
+
+Przed implementacją rejestrujemy następujące dowody do wykonania:
+
+1. Dokładny analityczny SPD M / signed D demonstrator: globalny residual i
+   wewnętrzny relative stop mogą przejść przy lokalnym residualu większym od
+   physical gate; pełna korekcja rozwiązuje oba bloki, bez rescale prądu.
+2. Native FEM CPU przypadek **ponad 4096 RT0 DOF**, który rzeczywiście uruchamia
+   sparse MINRES i refinement, oraz niezmienione dense controls. Każdy element,
+   paired/outer face, terminal i omitted row musi przejść swój istniejący gate.
+3. Analityczny stały prąd: V/J, podpisane I, reversal, zero drive i porównanie
+   z własną słabą reakcją oraz mocą. Zachować niezmienione H1 V/original-K
+   paired-vertex ledger i jego gate `1e-18 A + 1e-10 * sum abs(reactions)`;
+   same raw P1 face flux nie są weak reaction certificate.
+4. Ta sama pełna pętla na trzech prerejestrowanych mesh levels, bez zmian
+   geometrii, materiałów, sourcecut, napięcia, fixed targets i progów A/B/C
+   tej noty. H1/RT0 current comparison i H oracle są osobnymi bramkami;
+   algebraiczny PASS nie zastępuje convergence ani source qualification.
+5. Nonfinite, stagnation, insufficient budget i brak zbieżności: odmowa i zero
+   accepted publication. Każde powtórne odczytanie J/current/H zachowuje field,
+   H1 weak ledger i digests; getter nie może naprawiać wyniku.
+
+Read-only demonstrator Fraction wykonany podczas diagnozy potwierdził lukę
+kryterium przy dokładnym residualu constraint 2.263047571332468e-15 A,
+local gate 1.3641510305998915e-15 A i zerowej stationarity. Nie jest testem
+MFEM ani dowodem wykonania planowanej poprawki. Powyższe native/mesh/field
+regresje pozostają NOT EXECUTED. Strukturalny validator dokumentacji nie jest
+naukowym certyfikatem. Odroczone: implementacja, review, zarządzany build i
+rzeczywisty publiczny solve, niezależne oracle oraz pełna kwalifikacja E2/E3.
+
+Podstawa metody: Higham 1995 [16], sekcja 1 (residual/correction/update), oraz
+MFEM 4.7 `MINRESSolver::Mult` [17] (preconditioned recursive norm). Źródła te
+uzasadniają metodę i rozróżnienie norm; nie dowodzą jej realizacji w Fullmagu.
+
+| Ścieżka | Symbol / DOC-ANCHOR | Odpowiedzialność / evidence |
+|---|---|---|
+| `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-rt0-true-residual-kkt-refinement-v1` | prerejestracja równań, SI, polityki i testów; planned contract |
+| `backends/fem/cpu/mfem/transport/conservative_current_view.cpp` | `solve_weighted_rt0_projection` | istniejący właściciel sparse KKT; refinement dopiero SOURCE_PLANNED |
+| `backends/fem/cpu/mfem/transport/conservative_current_view.cpp` | `integrate_physical_certificate` | final niezależny physical Piola certificate; ma pozostać bez zmian |
+| `backends/fem/cpu/mfem/transport/affine_rt0_element.cpp` | `AffineRt0Element::face_moment` | exact-rational pomiar frozen coefficients; nie solver repair |
+| `backends/fem/cpu/mfem/transport/periodic_charge_potential.cpp` | `PeriodicChargePotentialSolver::Solve` | existing original-K paired weak reaction certificate; bez nowego solve |
+| `backends/fem/tests/conservative_current_view_contract.cpp` | `void large_tetrahedral_projection_uses_sparse_kkt_lane` | istniejący punkt rozszerzenia native regression ponad cutoff; nowe wykonanie NOT VERIFIED |
+
 (antenna-source-code-index)=
 ### 13.1 Source-code index
 
@@ -10373,3 +10581,12 @@ To kontrole interpretowane, nie kompilacja testów natywnych.
 13. Erratum (2015), DOI https://doi.org/10.1007/s11517-015-1300-0. Treść **nieprzeczytana**; nie domniemywać korekty ani zakresu niewpływania na własne wyprowadzenie.
 14. Gmsh manual, https://gmsh.info/doc/texinfo/gmsh.html. Primary API dla OCC/meshimport; `MeshOnlyVisible` experimental, geometry-only proof23nodes/48Tet niefulltaper qualification.
 15. PyPI, mpmath1.3.0 releasefiles, https://pypi.org/project/mpmath/1.3.0/#files. Wheelpin/hash metadata, nie mathematical errorcertificate; nieinstalowane w tej publikacji.
+
+16. N. J. Higham, „Iterative Refinement and LAPACK”, Numerical Analysis Report 277,
+    University of Manchester (1995), https://www.netlib.org/lapack/lawnspdf/lawn104.pdf
+    (odczyt 2026-10-22). Podstawa pełnej korekcji residualu, nie gwarancja
+    zbieżności konkretnego sparse KKT Fullmaga.
+17. MFEM 4.7, `MINRESSolver::Mult`, primary source:
+    https://docs.mfem.org/4.7/solvers_8cpp_source.html
+    (odczyt 2026-10-22). Preconditioned recursive norm i relative stop;
+    nie local-current admission ani dowód pakietu Fullmaga.

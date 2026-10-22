@@ -1612,6 +1612,96 @@
       "latex": "y",
       "meaning": "współrzędna wzdłuż prądu",
       "si_unit": "\\mathrm m"
+    },
+    {
+      "id": "rt0-refine-mass",
+      "latex": "$M$",
+      "meaning": "oryginalna assembled weighted RT0 mass matrix w physical flux coordinates",
+      "si_unit": "$\\Omega$"
+    },
+    {
+      "id": "rt0-refine-incidence",
+      "latex": "$D,d_{ij}$",
+      "meaning": "aktywna incidence matrix i współczynniki wszystkich kontrolowanych constraints; bez nowych wierszy",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "rt0-refine-flux",
+      "latex": "$\\mathbf q,q_j,\\delta\\mathbf q$",
+      "meaning": "physical face moments i ich pełna korekcja KKT",
+      "si_unit": "$\\mathrm A$"
+    },
+    {
+      "id": "rt0-refine-constraint-rhs",
+      "latex": "$\\mathbf h,h_i$",
+      "meaning": "oryginalne constraint RHS; zero dla div/pair",
+      "si_unit": "$\\mathrm A$"
+    },
+    {
+      "id": "rt0-refine-load",
+      "latex": "$\\mathbf f,f_i$",
+      "meaning": "oryginalny weighted load z tego samego zaakceptowanego H1",
+      "si_unit": "$\\mathrm V$"
+    },
+    {
+      "id": "rt0-refine-multipliers",
+      "latex": "$\\boldsymbol\\lambda,\\lambda_k,\\delta\\boldsymbol\\lambda$",
+      "meaning": "mnożniki Lagrange'a i ich korekcja",
+      "si_unit": "$\\mathrm V$"
+    },
+    {
+      "id": "rt0-refine-stationarity",
+      "latex": "$\\mathbf r_V,r_{V,i},s_{V,i}$",
+      "meaning": "true stationarity residual i jego lokalna skala sumy modułów",
+      "si_unit": "$\\mathrm V$"
+    },
+    {
+      "id": "rt0-refine-constraint-residual",
+      "latex": "$\\mathbf r_A$",
+      "meaning": "true residual aktywnych constraints",
+      "si_unit": "$\\mathrm A$"
+    },
+    {
+      "id": "rt0-refine-absolute",
+      "latex": "$a_A$",
+      "meaning": "niezmieniony absolute physical current gate, $10^{-18}$",
+      "si_unit": "$\\mathrm A$"
+    },
+    {
+      "id": "rt0-refine-continuity",
+      "latex": "$\\tau_c$",
+      "meaning": "niezmieniony local continuity gate, $10^{-10}$",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "rt0-refine-terminal",
+      "latex": "$\\tau_t$",
+      "meaning": "niezmieniony existing terminal-current gate, $10^{-8}$",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "rt0-refine-stationarity-tolerance",
+      "latex": "$\\tau_s$",
+      "meaning": "nowy ostrzejszy stationarity backward-error gate, $10^{-12}$",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "rt0-refine-budget",
+      "latex": "$N,N_{\\max},n_\\ell,p,\\ell$",
+      "meaning": "rozmiar sparse KKT, wspólny limit, actual iteracje wywołania, ostatnie wywołanie i indeks",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "rt0-refine-indices",
+      "latex": "$i,j,k$",
+      "meaning": "indeks wiersza, flux DOF i aktywnego constraint",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "rt0-refine-operators",
+      "latex": "$\\sum,\\lvert\\cdot\\rvert,\\max,{}^T,\\delta,\\leftarrow$",
+      "meaning": "suma, moduł, maksimum, transpozycja, korekcja i aktualizacja; jednostki argumentów zachowane",
+      "si_unit": "$1$ jako operatory"
     }
   ],
   "equations": [
@@ -3056,6 +3146,87 @@
       "sources": [
         "antenna-gsg-fixed-reference",
         "antenna-gsg-fixed-reference-tests"
+      ]
+    },
+    {
+      "id": "antenna-rt0-refinement-kkt",
+      "symbols": [
+        "rt0-refine-mass",
+        "rt0-refine-incidence",
+        "rt0-refine-flux",
+        "rt0-refine-multipliers",
+        "rt0-refine-load",
+        "rt0-refine-constraint-rhs"
+      ],
+      "sources": [
+        "antenna-rt0-true-residual-prereg",
+        "antenna-rt0-full-kkt-owner"
+      ]
+    },
+    {
+      "id": "antenna-rt0-refinement-residual",
+      "symbols": [
+        "rt0-refine-mass",
+        "rt0-refine-incidence",
+        "rt0-refine-flux",
+        "rt0-refine-multipliers",
+        "rt0-refine-load",
+        "rt0-refine-constraint-rhs",
+        "rt0-refine-stationarity",
+        "rt0-refine-constraint-residual",
+        "rt0-refine-indices",
+        "rt0-refine-operators"
+      ],
+      "sources": [
+        "antenna-rt0-true-residual-prereg",
+        "antenna-rt0-full-kkt-owner"
+      ]
+    },
+    {
+      "id": "antenna-rt0-refinement-update",
+      "symbols": [
+        "rt0-refine-mass",
+        "rt0-refine-incidence",
+        "rt0-refine-flux",
+        "rt0-refine-multipliers",
+        "rt0-refine-stationarity",
+        "rt0-refine-constraint-residual",
+        "rt0-refine-operators"
+      ],
+      "sources": [
+        "antenna-rt0-true-residual-prereg",
+        "antenna-rt0-full-kkt-owner"
+      ]
+    },
+    {
+      "id": "antenna-rt0-refinement-local-gates",
+      "symbols": [
+        "rt0-refine-incidence",
+        "rt0-refine-flux",
+        "rt0-refine-constraint-rhs",
+        "rt0-refine-absolute",
+        "rt0-refine-continuity",
+        "rt0-refine-terminal",
+        "rt0-refine-indices",
+        "rt0-refine-operators"
+      ],
+      "sources": [
+        "antenna-rt0-true-residual-prereg",
+        "antenna-rt0-full-kkt-owner"
+      ]
+    },
+    {
+      "id": "antenna-rt0-refinement-stationarity-budget",
+      "symbols": [
+        "rt0-refine-stationarity",
+        "rt0-refine-stationarity-tolerance",
+        "rt0-refine-budget",
+        "rt0-refine-indices",
+        "rt0-refine-operators"
+      ],
+      "sources": [
+        "antenna-rt0-true-residual-prereg",
+        "antenna-rt0-full-kkt-owner"
       ]
     }
   ],
@@ -7701,6 +7872,41 @@
       "path": "scripts/test_compare_sushruth_2020_gsg.py",
       "symbol": "test_gauge_offsets_are_not_fitted_slopes",
       "responsibility": "Regresje metryki, geometrii, znaków, gauges i odmów; sztuczne dane nie są solve."
+    },
+    {
+      "id": "antenna-rt0-true-residual-prereg",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-rt0-true-residual-kkt-refinement-v1",
+      "responsibility": "Prerejestracja pełnego sparse KKT refinement; bez implementacji i kwalifikacji runtime.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-rt0-full-kkt-owner",
+      "path": "backends/fem/cpu/mfem/transport/conservative_current_view.cpp",
+      "symbol": "solve_weighted_rt0_projection",
+      "responsibility": "Istniejący sparse KKT owner; planned full residual correction przed owned field, bez zmian dense/CG/physics gates.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-rt0-refinement-physical-certificate",
+      "path": "backends/fem/cpu/mfem/transport/conservative_current_view.cpp",
+      "symbol": "PhysicalCertificate integrate_physical_certificate",
+      "responsibility": "Istniejący niezależny final physical certificate ma pozostać bez zmian; nie metoda korekcji.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-rt0-refinement-weak-reactions",
+      "path": "backends/fem/cpu/mfem/transport/periodic_charge_potential.cpp",
+      "symbol": "PeriodicChargePotentialSolver::Solve",
+      "responsibility": "Zachowanie original-K paired weak reactions tego samego H1; brak constraint I_RT0=I_H1.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-rt0-refinement-sparse-regression",
+      "path": "backends/fem/tests/conservative_current_view_contract.cpp",
+      "symbol": "void large_tetrahedral_projection_uses_sparse_kkt_lane",
+      "responsibility": "Istniejący punkt rozszerzenia regresji ponad4096DOF; nowe przypadki niewykonane.",
+      "evidence_status": "planned_contract"
     }
   ],
   "public_api": {
