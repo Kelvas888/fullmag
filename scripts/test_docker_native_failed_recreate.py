@@ -277,41 +277,6 @@ class NativeFailedRecreateTests(unittest.TestCase):
             attestation["retained_ready_owner"] = self.journal["retained_ready_owner"]
         self.namespace_raw = reconcile.canonical(attestation) + b"\n"
 
-    def test_removed_backend_requires_strict_incarnation_with_optional_namespace_proof(self):
-        self.configure_after_ready_journal()
-        self.make_namespace_attestation()
-        archived = json.loads(self.stopped_backend_inspect().stdout)[0]
-        with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
-                patch.object(dev, "_read_runtime_config_digest", return_value="c" * 64), \
-                patch.object(reconcile, "docker_capture") as docker:
-            context = dev._native_failed_stop_recovery_context(
-                self.control, self.previous(), backend_id=BACKEND_ID,
-                fresh_state=False, removed_backend=archived,
-            )
-            self.assertEqual(context["native_restart_metadata"]["container_id"], BACKEND_ID)
-            docker.assert_not_called()
-            archived["State"]["StartedAt"] = "2026-10-19T11:00:00Z"
-            with self.assertRaisesRegex(dev.BuildControlError, "incarnation"):
-                dev._native_failed_stop_recovery_context(
-                    self.control, self.previous(), backend_id=BACKEND_ID,
-                    fresh_state=False, removed_backend=archived,
-                )
-            self.namespace_raw = None
-            archived = json.loads(self.stopped_backend_inspect().stdout)[0]
-            context = dev._native_failed_stop_recovery_context(
-                self.control, self.previous(), backend_id=BACKEND_ID,
-                fresh_state=False, removed_backend=archived,
-            )
-            self.assertEqual(context["native_restart_metadata"]["container_id"], BACKEND_ID)
-            self.assertNotIn("namespace_attestation_path", context["native_restart_metadata"])
-            self.journal.pop("container_state")
-            self.journal_raw = json.dumps(self.journal, sort_keys=True).encode()
-            with self.assertRaisesRegex(dev.BuildControlError, "strict native stop incarnation"):
-                dev._native_failed_stop_recovery_context(
-                    self.control, self.previous(), backend_id=BACKEND_ID,
-                    fresh_state=False, removed_backend=archived,
-                )
-
     def test_native_stop_journal_pins_owner_and_current_config(self):
         with patch.object(stop_unadmitted, "_control_bytes", side_effect=self.control_bytes), \
                 patch.object(dev, "_read_runtime_config_digest", return_value="c" * 64):

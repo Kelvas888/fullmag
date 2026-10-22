@@ -43,7 +43,6 @@ mod accepted_study_worker;
 mod accepted_observation_spool;
 mod accepted_field_binary;
 mod accepted_project_storage;
-mod accepted_quantity_bundle;
 mod analysis;
 mod artifacts;
 mod assets;

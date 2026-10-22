@@ -2525,6 +2525,7 @@ def _parser() -> argparse.ArgumentParser:
     idle_restart.add_argument("--config-sha256", required=True)
     idle_restart.add_argument("--source-root", type=Path, required=True)
     idle_restart.add_argument("--port", type=int, required=True)
+    idle_restart.add_argument("--empty-scratch-session-id", help="Export this exact untouched scratch session and restart the backend")
     resources = subparsers.add_parser(
         "increase-resources", help="increase a pinned pre-API backend's budget without restarting its build"
     )

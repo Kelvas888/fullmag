@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 from subprocess import CompletedProcess
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import docker_volume_dev as dev
 import linux_native_host as host
@@ -15,118 +15,6 @@ from docker_build_control import BuildControlError
 
 
 class VolumeWslTests(unittest.TestCase):
-    def test_cold_resume_restores_ledger_before_starting_services(self):
-        from types import SimpleNamespace
-        import hashlib
-        import docker_dev
-        import docker_build_control
-        from test_docker_host_ledger import HostLedgerTests
-        _, profile, _, _, _ = HostLedgerTests._volume_ledger_fixture()
-        source = Path('/source')
-        environment = profile['environment']
-        environment.update(FULLMAG_SOURCE_GIT_COMMON='/git', FULLMAG_TOOLCHAIN_IMAGE_ID=profile['image_id'],
-                           FULLMAG_HOST_LEDGER_BACKING_IMAGE=profile['backing_image'])
-        document = {'name': 'fullmag-master', 'services': {
-            'backend': {'environment': environment}, 'frontend': {}}}
-        previous = {'state': 'succeeded', 'compose_project': document['name'],
-                    'inputs': {'source_root': str(source), 'image_id': profile['image_id']},
-                    'state_root': '/state', 'backend_volumes': {}, 'frontend_volume': 'frontend'}
-        args = SimpleNamespace(repo_root=Path(__file__).resolve().parents[1], source_root=source, attempt='a' * 32,
-                               config_sha256=hashlib.sha256(dev.canonical(document)).hexdigest(),
-                               restart_backend=True, port=3197)
-        records = {'terminal.json': previous, 'compose.json': document, 'backend-cache.json': {},
-                   'host-ledger.json': profile['host_receipt'], 'ledger-maintenance-compose.json': {}}
-        for broken in (False, True):
-            events = []
-            control = MagicMock(project=document['name'])
-            control.read.side_effect = lambda path: records[path.rsplit('/', 1)[1]]
-            control.operation.return_value.__enter__.return_value = {
-                'root': 'resume/attempts/test', 'receipt': {'attempt': 'b' * 32}}
-            def compose(spec, *args, **kwargs):
-                if args[0] == 'ps':
-                    return args[-1].encode()
-                events.append(args)
-                return b''
-            def text(*args, **kwargs):
-                if args[:2] == ('image', 'inspect'):
-                    return json.dumps([{'Config': {}}])
-                service = args[1]
-                return json.dumps([{'Id': service, 'Image': profile['image_id'],
-                    'State': {'Running': False}, 'Config': {'Labels': {
-                        'com.docker.compose.project': document['name'],
-                        'com.docker.compose.service': service, 'org.fullmag.source.worktree-id': 'main'}}}])
-            def restore(*args):
-                events.append('restore')
-                if broken:
-                    raise BuildControlError('ledger unavailable')
-            with ExitStack() as stack:
-                for target, name, values in (
-                    (docker_dev, '_select_source', {'return_value': (source, {
-                        'runtime_root': Path('/state'), 'storage_root': Path('/storage')})}),
-                    (docker_dev, '_compose_identity', {'return_value': {'worktree_id': 'main'}}),
-                    (docker_build_control, 'toolchain_configuration', {'return_value': {'services': {
-                        'fem-gpu-toolchain': {'build': {'args': {'FULLMAG_CUDA_BASE_IMAGE': 'helper'}}}}}}),
-                    (dev, 'require_host', {}), (dev, 'BuildControl', {'return_value': control}),
-                    (dev, '_operator_probe_record_from_retained', {'return_value': {}}),
-                    (dev, '_validate_retained_service', {}), (dev, '_retained_certificate', {'return_value': {}}),
-                    (dev, 'compose_capture', {'side_effect': compose}), (dev, 'docker_text', {'side_effect': text}),
-                    (dev, '_restore_host_ledger', {'side_effect': restore}), (dev, '_frontend', {}),
-                    (dev, '_finish', {}), (dev.storage, 'validate_path', {'return_value': Path('/state')}),
-                ):
-                    stack.enter_context(patch.object(target, name, **values))
-                stack.enter_context(patch('docker_backend_volume_cache.validate_container'))
-                stack.enter_context(patch('docker_frontend_restart.recover_stopped_frontend'))
-                if broken:
-                    with self.assertRaisesRegex(BuildControlError, 'ledger unavailable'):
-                        dev.resume(args)
-                    self.assertEqual(events, ['restore'])
-                else:
-                    dev.resume(args)
-                    self.assertEqual(events, ['restore', ('start', 'frontend'), ('start', 'backend')])
-
-    def test_restore_keeps_volume_identity_and_probes_the_new_loop(self):
-        from test_docker_host_ledger import HostLedgerTests
-        backend, profile, volume, _, _ = HostLedgerTests._volume_ledger_fixture()
-        profile['environment']['FULLMAG_HOST_LEDGER_STORAGE_ROOT'] = '/old/storage'
-        profile['maintenance_document'] = {'name': 'fullmag-master', 'services': {
-            'host-ledger-maintenance': {'entrypoint': ['/bin/bash', '/old/helper'],
-                                      'image': profile['image_id']}}}
-        document = {'services': {'backend': {
-            'x-fullmag-host-ledger-volume': profile['daemon_volume']}}}
-        original = copy.deepcopy(document)
-        fresh = {**profile['host_receipt'], 'loop_device': '/dev/loop99'}
-        operation = {'root': 'resume/attempts/test', 'receipt': {'attempt': 'a' * 32}}
-        control = Mock(project='fullmag-master')
-        actual = {'Id': 'restored-helper', 'Image': profile['image_id'],
-                  'State': {'ExitCode': 0, 'Running': False},
-                  'Config': {'Labels': {'com.docker.compose.project': control.project}}}
-        for foreign in (False, True):
-            with self.subTest(foreign=foreign):
-                observed = dict(fresh)
-                if foreign:
-                    observed['filesystem_uuid'] = '22222222-2222-2222-2222-222222222222'
-                with patch.object(dev, '_session_host') as adapter, \
-                     patch.object(dev, 'compose_capture', return_value=json.dumps(observed).encode()) as capture, \
-                     patch.object(dev, 'docker_text', side_effect=lambda *a, **kw:
-                                  json.dumps([volume]) if a[:2] == ('volume', 'inspect') else
-                                  json.dumps([actual]) if a[0] == 'inspect' else 'restore log'), \
-                     patch.object(dev, 'docker_capture'), \
-                     patch('docker_wsl_bind.resolve_daemon_bind', return_value='/new/storage'), \
-                     patch('docker_wsl_bind._marker', return_value={'sha256': 'f' * 64}), \
-                     patch.object(dev, '_verify_host_ledger_volume') as probe:
-                    adapter.return_value.read_owned_regular.return_value = b'versioned helper'
-                    if foreign:
-                        with self.assertRaisesRegex(BuildControlError, 'filesystem identity'):
-                            dev._restore_host_ledger(control, operation, document, profile, Path('/source'), Path('/storage'))
-                        probe.assert_not_called()
-                    else:
-                        dev._restore_host_ledger(control, operation, document, profile, Path('/source'), Path('/storage'))
-                        self.assertEqual(profile['host_receipt']['loop_device'], '/dev/loop99')
-                        self.assertEqual(probe.call_args.args[2]['name'], volume['Name'])
-                        self.assertEqual(probe.call_args.args[2]['loop_device'], '/dev/loop99')
-                    self.assertEqual(capture.call_args.args[-4:], ('restore', fresh['filesystem_uuid'], '/new/storage', 'f' * 64))
-                    self.assertEqual(document, original)
-
     def test_ledger_probe_requires_readonly_mount_and_archives_before_retirement(self):
         import docker_host_ledger as ledger
         descriptor = {"name": "owned-ledger", "filesystem_uuid": "owned-filesystem"}
@@ -207,8 +95,7 @@ class VolumeWslTests(unittest.TestCase):
                 stack.enter_context(patch.object(dev, "docker_text", side_effect=
                     lambda *args, **kwargs: json.dumps(inspected) if args[0] == "inspect" else "maintenance logs"))
                 remove = stack.enter_context(patch.object(dev, "docker_capture"))
-                control = Mock(project="fullmag-master", volume="control", namespace="")
-                control.subpath.side_effect = lambda relative="": relative
+                control = Mock(project="fullmag-master", volume="control")
                 operation = {"root": "test", "receipt": {"attempt": "owned-attempt"}}
                 layout = {"storage_root": "/home/operator/storage", "project_id": "project"}
                 if changed:

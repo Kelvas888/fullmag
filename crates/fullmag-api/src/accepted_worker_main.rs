@@ -12,10 +12,6 @@ mod error;
 #[path = "accepted_study_worker.rs"]
 mod accepted_study_worker;
 mod accepted_project_storage;
-mod accepted_quantity_bundle;
-mod accepted_observation_spool;
-mod accepted_field_binary;
-mod error;
 
 mod worker_startup_gate;
 
