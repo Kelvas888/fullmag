@@ -1,7 +1,9 @@
 """Realtime events, quantity reads and chunked loops in live mode (ADR 0068 F4, spec §5.4, §7)."""
 from __future__ import annotations
 
+import math
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -148,3 +150,21 @@ def test_jupyter_monitor_collects_samples_without_ipython(live) -> None:
     assert "mx" in jupyter._table(monitor.samples, "time", ("mx",))
     session.events = None
     monitor.stop()
+
+
+def test_field_only_runs_average_m_from_the_published_field(monkeypatch) -> None:
+    # Accepted Docker runs publish fields but no scalar rows yet.
+    field_bytes = (Path(__file__).resolve().parent / "fixtures" / "fmvp" / "v2_grid.bin").read_bytes()
+    monkeypatch.delenv("FULLMAG_URL", raising=False)
+    with fm.ExecutionContext():
+        with FakeLiveSession() as fake:
+            fake.api.route("GET", SCALARS, (200, {"revision": 0, "total_rows": 0, "returned_rows": 0, "columns": ["step", "mx"], "rows": [], "observation_frames": []}, {}))
+            fake.api.route("GET", "/v2/sessions/current/data/fields/m/samples/vector", (200, field_bytes, {}))
+            fake.api.route("GET", "/v2/sessions/current/data/fields", (200, {"quantities": [{"quantity_id": "m", "source_step": 500, "source_time_seconds": 5e-11}]}, {}))
+            fm.connect(fake.url, events=False)
+            try:
+                assert fm.m.average() == pytest.approx((2.75, 3.25, 3.75))
+                assert math.isnan(float(fm.E_total))
+                assert fm.live.active_session().latest_step().step == 500
+            finally:
+                fm.disconnect()

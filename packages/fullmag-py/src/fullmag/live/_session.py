@@ -230,13 +230,29 @@ class LiveSession:
     def table(self, table_id: str, *, columns: Optional[tuple[str, ...]] = None, **query: Any) -> TableRows:
         return self.client.data.read_table(table_id, columns=columns, **query)
 
-    def latest_step(self) -> SimpleNamespace:
-        """The newest scalar row of the session as a step-like object (``mx``, ``e_total``, ...)."""
+    def latest_step(self) -> Any:
+        """The newest scalar row of the session as a step-like object (``mx``, ``e_total``, ...).
+
+        Accepted Docker runs publish fields but not yet the scalar table; then
+        ``mx``/``my``/``mz`` come from the unweighted mean of the published
+        ``m`` (exact for FDM cells) and other scalars raise a clear error.
+        """
         window = self.client.data.scalars(limit=1, tail=True)
         rows = window.get("rows") or []
-        if not rows:
+        if rows:
+            return SimpleNamespace(**dict(zip(window.get("columns") or [], rows[-1])))
+        vector = self.field("m")
+        if vector is None:
             raise RuntimeError("the live session has no scalar samples yet; run fm.relax() or fm.run() first")
-        return SimpleNamespace(**dict(zip(window.get("columns") or [], rows[-1])))
+        mean = vector.to_numpy().reshape(-1, 3).mean(axis=0)
+        source = _field_source(self.client.data.fields(), "m")
+        return _FieldOnlyStep(
+            mx=float(mean[0]),
+            my=float(mean[1]),
+            mz=float(mean[2]),
+            step=source.get("source_step"),
+            time=source.get("source_time_seconds"),
+        )
 
     def latest_result(self) -> SimpleNamespace:
         """A result-like object whose ``final_magnetization`` is the session's current ``m``."""
@@ -282,7 +298,7 @@ class LiveSession:
             step = self.latest_step()
             if predicate(step):
                 break
-            if max_solver_steps is not None and int(getattr(step, "step", 0)) - start_step >= max_solver_steps:
+            if max_solver_steps is not None and int(getattr(step, "step", 0) or 0) - start_step >= max_solver_steps:
                 break
         return last  # type: ignore[return-value]
 
@@ -297,9 +313,25 @@ class LiveSession:
         return str(response.get("source", "")) if isinstance(response, Mapping) else str(response)
 
 
+class _FieldOnlyStep(SimpleNamespace):
+    """A step derived from published fields; scalars without a field are absent."""
+
+    def __getattr__(self, name: str) -> Any:
+        # An AttributeError keeps getattr(step, name, default) working.
+        raise AttributeError(
+            f"scalar {name!r} is not available: this run published fields but no scalar "
+            "table (accepted Docker runs do not project scalar rows yet)"
+        )
+
+
+def _field_source(catalog: Any, quantity_id: str) -> Mapping[str, Any]:
+    entries = catalog.get("quantities", []) if isinstance(catalog, Mapping) else []
+    return next((entry for entry in entries if entry.get("quantity_id") == quantity_id), {})
+
+
 def _step_count(session: "LiveSession") -> int:
     try:
-        return int(getattr(session.latest_step(), "step", 0))
+        return int(getattr(session.latest_step(), "step", 0) or 0)
     except RuntimeError:
         return 0
 
