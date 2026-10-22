@@ -12,6 +12,7 @@ apps/desktop/src-tauri/gen/
 !docs/*.md
 !docs/**/*.md
 !/AGENTS.md
+!/CLAUDE.md
 !/readme.md
 !.agents/**/*.md
 !.github/**/*.md
