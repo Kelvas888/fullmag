@@ -43,7 +43,8 @@ run_gate() {
         apps/control-room/src/kernel/api/generated/openapi-v2.json \
         apps/control-room/src/kernel/api/generated/openapi-v2-types.ts \
         apps/control-room/src/kernel/api/generated/openapi-v2-client.ts \
-        apps/control-room/src/kernel/api/generated/openapi-v2-paths.ts
+        apps/control-room/src/kernel/api/generated/openapi-v2-paths.ts \
+        packages/fullmag-py/src/fullmag/client/_generated
       ;;
     architecture-api-hygiene)
       ./scripts/ci-resource-first-gates.sh --strict

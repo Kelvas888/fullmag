@@ -2775,8 +2775,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             recreate(args)
         elif args.action == "codegen-openapi":
             from docker_dev_codegen import run as run_codegen
+            from docker_development_inputs import select_checkout
+            from generate_python_api_models import write_outputs as write_python_api_models
 
-            return run_codegen(args.repo_root.resolve(strict=True), args.source_root)
+            repo_root = args.repo_root.resolve(strict=True)
+            status = run_codegen(repo_root, args.source_root)
+            if status == 0:
+                # The Python live-client models derive from the OpenAPI document just written.
+                write_python_api_models(select_checkout(repo_root, args.source_root).resolve(strict=True))
+            return status
         else:
             raise _fail(f"unsupported action: {args.action}")
         return 0
