@@ -27,6 +27,41 @@ def functions(source, names, scope):
     return scope
 
 
+class HostPidfdCompatibilityTests(unittest.TestCase):
+    def test_missing_python_binding_observes_exact_child_exit_without_signals(self):
+        release_r, release_w = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(release_w)
+            os.read(release_r, 1)
+            os._exit(0)
+        os.close(release_r)
+        descriptor = None
+        try:
+            with patch.object(os, 'pidfd_open', None, create=True):
+                descriptor = recovery.host_pidfd_open(child)
+            self.assertFalse(select.select([descriptor], [], [], 0)[0])
+            os.write(release_w, b'1')
+            self.assertEqual(select.select([descriptor], [], [], 5)[0], [descriptor])
+            _, status = os.waitpid(child, 0)
+            child = None
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        finally:
+            os.close(release_w)
+            if descriptor is not None:
+                os.close(descriptor)
+            if child is not None:
+                os.waitpid(child, 0)
+
+    def test_missing_python_binding_preserves_errno_and_rejects_unknown_architecture(self):
+        with patch.object(os, 'pidfd_open', None, create=True):
+            with self.assertRaises(ProcessLookupError):
+                recovery.host_pidfd_open(2_147_483_647)
+            with patch.object(os, 'uname', return_value=SimpleNamespace(sysname='Linux', machine='unknown')):
+                with self.assertRaises(ValueError):
+                    recovery.host_pidfd_open(os.getpid())
+
+
 class FailedBuildRecoveryTests(unittest.TestCase):
     def test_generated_controller_parses_and_preview_never_calls_mutation(self):
         for apply,verify in ((False,False),(True,False),(False,True)):

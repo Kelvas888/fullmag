@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import inspect
 import json
@@ -193,6 +194,25 @@ def finalize_native(request):
 """
 
 
+def host_pidfd_open(pid):
+    native = getattr(os, 'pidfd_open', None)
+    if native is not None:
+        return native(pid)
+    # Some standalone Python builds omit this binding despite a capable kernel.
+    # Linux x86_64 syscall 434 is SYS_pidfd_open; flags zero preserve pidfd semantics.
+    repair.require(os.name == 'posix' and os.uname().sysname == 'Linux'
+                   and os.uname().machine == 'x86_64',
+                   'Host Python lacks pidfd_open on this unsupported platform')
+    repair.require(type(pid) is int and 0 < pid <= 2_147_483_647, 'Invalid pidfd process identity')
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    descriptor = libc.syscall(ctypes.c_long(434), ctypes.c_int(pid), ctypes.c_uint(0))
+    if descriptor < 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+    return descriptor
+
+
 def host_process(pid):
     root = Path('/proc')/str(pid)
     fields = (root/'stat').read_text().rsplit(')', 1)[1].split()
@@ -338,6 +358,13 @@ def run(args):
                    'operation_receipt_path': '/opt/fullmag/control/'+root+'/receipt.json',
                    'result_path': '/opt/fullmag/control/'+root+'/result.json',
                    'source_pins': source_pins(), 'host_manager': manager_pin(operation['inputs'])}
+        manager_fd = host_pidfd_open(request['host_manager']['pid'])
+        try:
+            require(host_process(request['host_manager']['pid']) == request['host_manager']
+                    and not select.select([manager_fd], [], [], 0)[0],
+                    'Host manager pidfd identity is not live during preview')
+        finally:
+            os.close(manager_fd)
         request['observation'] = backend_call(args, request)
         request_id = uuid.uuid4().hex
         relative='verification/failed-build-recovery/'+args.attempt+'/'+request_id
@@ -356,7 +383,7 @@ def run(args):
     request=json.loads(raw)
     validate_request(request,args,operation,helper_pin)
     request['canonical_request_sha256']=hashlib.sha256(canonical(request)).hexdigest()
-    manager_fd=os.pidfd_open(request['host_manager']['pid'])
+    manager_fd=host_pidfd_open(request['host_manager']['pid'])
     try:
         require(host_process(request['host_manager']['pid']) == request['host_manager'], 'Host manager changed before handoff')
         proof=backend_call(args,request,apply=True)

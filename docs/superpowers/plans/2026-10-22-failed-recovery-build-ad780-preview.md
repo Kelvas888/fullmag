@@ -140,3 +140,37 @@ podgląd i testy nie stanowią zgody na jego aktywację.
 Niezależna kontrola końcowa root: 27/27 PASS w4.22s. Pełny log i receipt
 root-reviewed-regressions.log/json zapisano obok końcowego requestu.
 SHA256 logu: b551bbbd110f5aa1d077b823e19646359447e9dbdf5ca30cbbe61a7c2dfe6bac.
+
+## Wykonanie po zgodzie użytkownika
+
+Użytkownik zatwierdził procedurę dla requestu5507b974.... Pierwsze uruchomienie
+zatrzymało się przed native call: hostowy Python3.12.10 nie ma os.pidfd_open,
+podobnie systemowy Python3.8.10. Testy kontenerowe nie wykrywały tej różnicy.
+Nie wysłano wtedy sygnałów. Sprawdzono lokalny nagłówek unistd_64.h:
+__NR_pidfd_open434, Linuxx86_64; libc nie ma wrappera, ma syscall.
+Zamiast instalować kolejny interpreter albo zmieniać natywny protokół,
+dodano zgodną obserwację pidfd przez syscall434/flags0 wyłącznie na Linuxx86_64.
+Nieznana architektura odmawia; errno zachowane. Podgląd sprawdza teraz także
+rzeczywisty hostowy pidfd przed decyzją. Dokumentacja:
+[Linux pidfd_open](https://man7.org/linux/man-pages/man2/pidfd_open.2.html),
+[Python os](https://docs.python.org/3/library/os.html#os.pidfd_open).
+Dwa rzeczywiste testy obserwacji własnego child exit w WSL PASS,29/29
+regresji interpretowanych w backendzie PASS. Nie kompilowano native unitów.
+
+Nowy podgląd: verification/failed-build-recovery/ad78022c285049968f0a5ea81a9d4612/5637b800f3c6491f95671ed5943d1f12/request.json,
+rawSHA256f975dc21c7c8b0c37aa60f858a13da9f551fee4690997d9a403d1c3bc7ab2b3f.
+AdapterSHA9fa192f3722cf5f3d065ac329254793ec885d7f9385b4d975feb26750996e14f.
+Porównanie host-compatibility-diff.json potwierdza: tylko adapter hostowego
+obserwatora i ścieżka nowego dowodu; kod native apply1c03a618... i repair06887dc9...
+identyczne, identyczne oba procesy, manager, blokady i wszystkie chronione rekordy.
+Nie rozszerzono zatwierdzonego zakresu działania.
+
+Recepta apply zakończyła się exit0 i failed-confirmed. Dokładne PID7793/7799
+zakończone, przejście PPID7793→1 potwierdzone; oryginalny manager zakończył
+się naturalnie. Kandydat qc31opdm zachowany w quarantine. Oryginalny helper
+zakończył własny lease; active nie istnieje, candidates pusty, wszystkie cztery
+istniejące locki dają się uzyskać bez wymiany inode. Chronione rekordy bez zmian.
+Terminal: recovery-build/attempts/ad78022c285049968f0a5ea81a9d4612/terminal.json.
+Pełny finalny log128513B SHA256
+30e969a3c4fec1c1d422e2d9f63e1e046a04125ce8e06b9431e3d576ea70a602.
+Scientific claim pozostaje nietknięty; nie wykonano ponownego Solve ani startu API.

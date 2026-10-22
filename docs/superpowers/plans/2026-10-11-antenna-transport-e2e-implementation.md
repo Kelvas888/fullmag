@@ -2313,3 +2313,14 @@ CI0134 zaliczyło już runtime service sampler/control oraz jawne testy
 reaped-worker recovery; cały przebieg jeszcze trwa. API pozostaje zatrzymane,
 frontend HTTP200, proxy sessions HTTP500. Projekt9291B ma niezmieniony SHA256
 d1ce5e22d273213da0119492a95a24a46428b75a199a24dbd93dd0c216bf24de.
+
+### Checkpoint 22.10.2026 — zatwierdzony failed build rzeczywiście sfinalizowany
+
+Użytkownik zatwierdził dokładny zakres dwóch helperów. Pierwsza próba odmówiła
+przed native call przez brak os.pidfd_open w hostowym Pythonie; zgodny kernelowy
+obserwator syscall434 naprawił wyłącznie tę granicę WSL. Dwa testy WSL i29/29
+kontenerowych PASS; natywny kod sygnałów oraz wszystkie immutable pins bez zmian.
+Actual apply f975dc21... exit0: failed-confirmed, helpery i manager zakończone,
+marker-only kandydat/logi zachowane, cztery locki dostępne, active nie istnieje.
+Pełny przebieg, nowe piny i dowód niezmienionego zakresu opisuje przegląd ad780.
+API i scientific claim nadal wymagają następnego pakietu oraz oddzielnego recovery.
