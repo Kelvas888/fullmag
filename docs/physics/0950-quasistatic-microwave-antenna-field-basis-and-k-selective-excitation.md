@@ -9647,6 +9647,144 @@ uzasadniają metodę i rozróżnienie norm; nie dowodzą jej realizacji w Fullma
 | `backends/fem/tests/conservative_current_view_contract.cpp` | `void global_kkt_norm_does_not_certify_a_local_current_balance` | exact-rational mały witness obu residual blocks; SOURCE_IMPLEMENTED, native test NOT COMPILED/NOT EXECUTED |
 | `backends/fem/tests/conservative_current_view_contract.cpp` | `void sparse_terminal_source_preserves_local_si_balances_and_h1_reactions` | real sparse4410face/4018freeDOF, H1→RT0 w SI i niezmienne original-K reactions; SOURCE_IMPLEMENTED, native test NOT COMPILED/NOT EXECUTED |
 
+
+(antenna-retained-rt0-exact-sampling-v1)=
+## FEM CPU: prerejestracja dokładnego próbkowania i wspólnej wykonalności RT0 — 23.10.2026
+
+### Problem i granica dowodu
+
+Rzeczywisty publiczny Solve pakietu `e4dce5d1551378faa8d9445620b6869c2b3dcf7d`
+zakończył się odmową `J samples are not one affine RT0 field`, przed publikacją
+accepted V/J/H. Surowe próbki tego workera nie zostały zachowane. Poniższy
+kontrprzykład dowodzi niezależnego błędu walidatora; nie jest pomiarem jego komórki.
+Dla afinicznego pola z dużą stałą składową różnica dwóch poprawnie zaokrąglonych
+próbek traci informację o nachyleniu. Wybranie najdłuższej krawędzi współrzędnych
+nie kontroluje tej utraty. Osobno, czterowyrazowe sumowanie signed RT0 w long double
+może utracić dokładność względną niemal zerowej składowej. Sam większy typ nie
+zapewnia dokładnego próbkowania przy znoszeniu składników [18,19].
+
+To prerejestracja poprawki reprezentacji i walidacji, przed implementacją.
+Nie zmienia fizyki H1/RT0, source drive, rozwiązanych współczynników ani progów
+bilansu. Nie kwalifikuje taperu, całkowania H, projekcji ani parytetu BORIS.
+
+### Dokładny producent i wspólny konsument
+
+Dla zamrożonych binary64 współczynników i geometrii przyjmujemy ich dokładne
+wartości dyadyczne. Tylko pięć retained próbek na Tet4 jest obliczanych przez
+istniejącego właściciela `AffineRt0Element` w arytmetyce wymiernej:
+
+```{math}
+:label: antenna-retained-rt0-exact-point-current
+J_k^{\ast}(\mathbf x)=
+\frac{\sum_{i=0}^{3}c_i^{\mathrm{signed}}(x_k-v_{i,k})}{D},
+\qquad D=\left|\det(\mathbf v_1-\mathbf v_0,
+\mathbf v_2-\mathbf v_0,\mathbf v_3-\mathbf v_0)\right|.
+```
+
+Iloczyny, suma i determinant są dokładne; dopiero końcowe dzielenie wymierne
+jest konwertowane do binary64. Producent nie rozwiązuje ponownie transportu.
+Sampler otrzymuje obecny retained center oraz cztery wierzchołki i zachowuje
+odmowę overflow oraz niezerowego exact wyniku zaokrąglonego do zera.
+Nie należy zastępować nim `current_at` w gorącej pętli całkowania H.
+Obie realizacje opisują to samo zamrożone pole; dokładność H jest osobną bramką.
+
+Konsument nie wyznacza nachylenia z jednej pary. Dla wszystkich sześciu par
+wierzchołków i trzech osi sprawdza istnienie jednego wspólnego nachylenia:
+
+```{math}
+:label: antenna-retained-rt0-common-slope-feasibility
+ e_{ik}=64\epsilon |s_{ik}|,\qquad \epsilon=2^{-52},
+\qquad
+(s_{ik}-s_{jk})-(e_{ik}+e_{jk})
+\le \beta(x_{ik}-x_{jk})
+\le (s_{ik}-s_{jk})+(e_{ik}+e_{jk}).
+```
+
+Wszystkie różnice, końce przedziałów, dzielenie i przecięcia są wymierne,
+z dokładnych wartości binary64; nie stosuje się dodatkowego zaokrąglania
+ani rozszerzenia przedziałów. Wspólne przecięcie18 warunków jest równoważne
+istnieniu offsetu dla każdej osi i jednego nachylenia takiego, że
+$|s_{ik}-(A_k+\beta x_{ik})|\le e_{ik}$: na każdej osi przedziały możliwych
+offsetów są parami przecinające się wtedy i tylko wtedy, gdy mają wspólne
+przecięcie. Dla równej współrzędnej przedział różnicy musi zawierać zero.
+Co najmniej jedna nierówna współrzędna jest wymagana przez nieosobliwą geometrię.
+Nie jest dopuszczony dowolny afiniczny tensor gradientu: shear, rotacja oraz
+różne nachylenia osi muszą być odrzucone.
+
+Dotychczasowy budżet pary nie jest podnoszony:
+
+```{math}
+:label: antenna-retained-rt0-pair-rounding-budget
+ e_{ik}+e_{jk}=64\epsilon(|s_{ik}|+|s_{jk}|)
+ \le128\epsilon\max(|s_{ik}|,|s_{jk}|).
+```
+
+### Symbole, SI i pełna polityka tego zakresu
+
+| Dokładny token | Znaczenie | Jednostka SI |
+|---|---|---|
+| $J_k^{\ast}(\mathbf x)$ | dokładna składowa pola zamrożonego RT0 | $\mathrm{A\,m^{-2}}$ |
+| $\mathbf x,x_k,x_{ik},\mathbf v_i,v_{i,k}$ | punkt próbkowania i wierzchołki Tet4 | $\mathrm m$ |
+| $c_i^{\mathrm{signed}}$ | zamrożony signed współczynnik istniejącej bazy RT0 | $\mathrm A$ |
+| $D$ | moduł determinantu geometrii komórki | $\mathrm{m^3}$ |
+| $s_{ik},e_{ik},A_k$ | retained próbka, jej budżet i offset składowej | $\mathrm{A\,m^{-2}}$ |
+| $\beta$ | wspólne skalarne nachylenie przestrzennego RT0 | $\mathrm{A\,m^{-3}}$ |
+| $\epsilon$ | binary64 machine epsilon, nie unit roundoff | $1$ |
+| $i,j,k,\sum,\det,|\cdot|,\max$ | indeksy wierzchołków/osi i operatory o jednostkach argumentów | $1$ |
+
+| Polityka | Typ i wartość | Walidacja i znaczenie | Python / ProblemIR |
+|---|---|---|---|
+| retained punkty | internal integer,5/cell |4 wierzchołki i obecny center; bez zmiany kolejności | brak nowego parametru |
+| arytmetyka producenta | exact rational z binary64 | skończone wejścia, dodatni nieosobliwy determinant, finite output; nonzero→zero odmawia | ten sam accepted source |
+| budżet próbki | internal exact rational, $64\epsilon|s_{ik}|$ | bez dodatniego absolute flooru; dla zera szerokość0 | brak nowego parametru |
+| wspólna wykonalność |18 exact pair constraints | jedna wartość $\beta$ dla wszystkich osi; puste przecięcie odmawia | brak zmiany IR |
+| subnormal/overflow | zachowane fail-closed | nie deklarujemy względnej kwalifikacji dowolnych skal subnormalnych; niespełnienie tego samego warunku odmawia | brak fallbacku |
+| pozostałe bramki | istniejące wartości | digest/identity, center interpolation, canonical face flux, divergence i signed source current bez zmiany | bez zmiany wersji operatora i payloadu |
+
+Publiczny scenariusz pozostaje `examples/fem_antenna_closed_loop_nonmagnetic.py` +
+`study`: jawne FEM CPU/double,1e-12 charge rtol, jedna antena niemagnetyczna i
+jeden stage `inspect_loop`. Python→ProblemIR→planner→runtime zachowuje te same
+geometrie, materiały, port, source cut i stage; zmienia się tylko dokładność
+retained próbek i weryfikacja ich reprezentacji. Nie dodaje się konstruktora,
+parametru ani backend capability. Acykliczne preimages nadal przypinają faktyczne
+bajty V/J/H; nie przepisuje się istniejących bundle ani ich digestów. Runtime
+zachowuje requested CPU/double i nie deklaruje kwalifikacji na podstawie buildu.
+
+| Realizacja | Stan tej poprawki |
+|---|---|
+| FEM CPU | PLANNED: dokładne retained sampling i wspólna walidacja; runtime NOT VERIFIED |
+| FEM GPU | brak nowej realizacji/kwalifikacji tego pełnego closed-loop workflow; bez fallbacku |
+| FDM CPU | nie dotyczy affine Tet4/RT0; istniejący FDM bez zmian |
+| FDM GPU | nie dotyczy affine Tet4/RT0; istniejący FDM bez zmian |
+
+### Prerejestrowane regresje, dowody i ograniczenia
+
+Counterexample: Tet4 o bokach1.1e-6,0.7e-6,0.3e-6 m, signed coefficients
+(0.21000000000044933,−0.21,−3.3e-13,−9.625000000000001e-14) A.
+Dokładne nachylenie wynosi około99935.12398881587 A/m³. Stary pivot z poprawnie
+zaokrąglonych próbek daje około99986.68323863635 A/m³ i fałszywą odmowę.
+Warunkowa emulacja każdej operacji long double o64 bitach precyzji daje osobną
+odmowę próbki prawie zerowej; to model arytmetyczny, nie wykonanie C++.
+Dowód analizy w wolumenie kontrolnym:
+`verification/closed-loop-affine-sampling-analysis-20261023/witness-and-proposal.json`,
+SHA256 `d70122caa044de99f6626e732997560588bdcd6b0966cee2a13decb70d2ccd4b`.
+
+Wymagane: old-RED counterexample; dokładny sampler przeciw niezależnemu Fraction
+oracle; normalne skale i translacje, zero/constant/reversal, niezmienione frozen
+coefficients, odmowy shear/rotation/anisotropic diagonal i overflow/underflow.
+Rust/native testów lokalnie nie kompilujemy; ich wykonanie należy do CI.
+Następnie identyczny publiczny Solve z nowym jawnym katalogiem wyników,
+actual V/J/H, binary smokes i dopiero odrębna naukowa kwalifikacja.
+Brak raw próbek poprzedniego workera nie może zostać zastąpiony twierdzeniem,
+że counterexample jest jego zmierzoną komórką.
+
+| Kontrakt / właściciel | Ścieżka + symbol | Status |
+|---|---|---|
+| równania próbkowania i wykonalności | niniejsza nota + `DOC-ANCHOR:antenna-retained-rt0-exact-sampling-v1` | planned contract |
+| dokładna baza i wzorzec konwersji | `backends/fem/cpu/mfem/transport/affine_rt0_element.cpp` + `AffineRt0Element::face_moment` | istniejący owner; nowy sampler planowany |
+| pięć retained próbek | `backends/fem/cpu/mfem/transport/closed_loop_source_snapshot.hpp` + `export_closed_loop_source_snapshot` | zmiana wywołań planowana |
+| wspólny gate live/cold | `crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2.rs` + `verify_owned_geometry` | usunięcie pivotu planowane |
+
 (antenna-source-code-index)=
 ### 13.1 Source-code index
 
@@ -10601,3 +10739,13 @@ To kontrole interpretowane, nie kompilacja testów natywnych.
     https://docs.mfem.org/4.7/solvers_8cpp_source.html
     (odczyt 2026-10-22). Preconditioned recursive norm i relative stop;
     nie local-current admission ani dowód pakietu Fullmaga.
+18. D. Goldberg, „What Every Computer Scientist Should Know About Floating-Point Arithmetic”,
+    Computing Surveys (1991), edytowany przedruk autora w Oracle Numerical
+    Computation Guide: https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
+    (odczyt 2026-10-23). Zaokrąglenia i utrata informacji w różnicy zaokrąglonych
+    danych; nie dowód samplera ani kwalifikacji Fullmaga.
+19. N. J. Higham, „The Accuracy of Floating Point Summation”, SIAM Journal on
+    Scientific Computing14(4),783–799 (1993), https://doi.org/10.1137/0914050;
+    kopia autora: https://nhigham.com/wp-content/uploads/2023/10/high93s.pdf
+    (odczyt 2026-10-23). Błąd sumowania znoszących się składników; bez gwarancji
+    względnej przy underflow i bez dowodu konkretnego kodu Fullmaga.

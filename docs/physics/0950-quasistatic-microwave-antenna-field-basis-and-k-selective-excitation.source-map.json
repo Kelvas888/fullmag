@@ -1702,6 +1702,54 @@
       "latex": "$\\sum,\\lvert\\cdot\\rvert,\\max,{}^T,\\delta,\\leftarrow$",
       "meaning": "suma, moduł, maksimum, transpozycja, korekcja i aktualizacja; jednostki argumentów zachowane",
       "si_unit": "$1$ jako operatory"
+    },
+    {
+      "id": "rt0-sample-exact-current",
+      "latex": "$J_k^{\\ast}(\\mathbf x)$",
+      "meaning": "dokładna składowa pola zamrożonego RT0",
+      "si_unit": "$\\mathrm{A\\,m^{-2}}$"
+    },
+    {
+      "id": "rt0-sample-coordinate",
+      "latex": "$\\mathbf x,x_k,x_{ik},\\mathbf v_i,v_{i,k}$",
+      "meaning": "punkt próbkowania i wierzchołki Tet4",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "rt0-sample-signed-coefficient",
+      "latex": "$c_i^{\\mathrm{signed}}$",
+      "meaning": "zamrożony signed współczynnik istniejącej bazy RT0",
+      "si_unit": "$\\mathrm A$"
+    },
+    {
+      "id": "rt0-sample-determinant",
+      "latex": "$D$",
+      "meaning": "moduł determinantu geometrii komórki",
+      "si_unit": "$\\mathrm{m^3}$"
+    },
+    {
+      "id": "rt0-sample-interval",
+      "latex": "$s_{ik},e_{ik},A_k$",
+      "meaning": "retained próbka, jej budżet i offset",
+      "si_unit": "$\\mathrm{A\\,m^{-2}}$"
+    },
+    {
+      "id": "rt0-sample-common-slope",
+      "latex": "$\\beta$",
+      "meaning": "wspólne skalarne nachylenie przestrzennego RT0",
+      "si_unit": "$\\mathrm{A\\,m^{-3}}$"
+    },
+    {
+      "id": "rt0-sample-epsilon",
+      "latex": "$\\epsilon$",
+      "meaning": "binary64 machine epsilon, nie unit roundoff",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "rt0-sample-indices-operators",
+      "latex": "$i,j,k,\\sum,\\det,|\\cdot|,\\max$",
+      "meaning": "indeksy wierzchołków/osi i operatory o jednostkach argumentów",
+      "si_unit": "$1$"
     }
   ],
   "equations": [
@@ -3227,6 +3275,43 @@
       "sources": [
         "antenna-rt0-true-residual-prereg",
         "antenna-rt0-full-kkt-owner"
+      ]
+    },
+    {
+      "id": "antenna-retained-rt0-exact-point-current",
+      "symbols": [
+        "rt0-sample-exact-current",
+        "rt0-sample-coordinate",
+        "rt0-sample-signed-coefficient",
+        "rt0-sample-determinant",
+        "rt0-sample-indices-operators"
+      ],
+      "sources": [
+        "antenna-retained-rt0-exact-sampling-prereg"
+      ]
+    },
+    {
+      "id": "antenna-retained-rt0-common-slope-feasibility",
+      "symbols": [
+        "rt0-sample-coordinate",
+        "rt0-sample-interval",
+        "rt0-sample-common-slope",
+        "rt0-sample-epsilon",
+        "rt0-sample-indices-operators"
+      ],
+      "sources": [
+        "antenna-retained-rt0-exact-sampling-prereg"
+      ]
+    },
+    {
+      "id": "antenna-retained-rt0-pair-rounding-budget",
+      "symbols": [
+        "rt0-sample-interval",
+        "rt0-sample-epsilon",
+        "rt0-sample-indices-operators"
+      ],
+      "sources": [
+        "antenna-retained-rt0-exact-sampling-prereg"
       ]
     }
   ],
@@ -7921,6 +8006,13 @@
       "symbol": "void sparse_terminal_source_preserves_local_si_balances_and_h1_reactions",
       "responsibility": "Real sparse4410face/4018freeDOF i H1→RT0 w SI, local gates, original-K reactions, analytic J/power, immutable getters; nie gwarantuje refinement trigger. Native NOT COMPILED/NOT EXECUTED.",
       "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-retained-rt0-exact-sampling-prereg",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-retained-rt0-exact-sampling-v1",
+      "responsibility": "Prerejestracja dokładnych5 próbek na Tet4 i wspólnej wykonalności affine RT0 z tym samym budżetem128EPS; bez implementacji ani kwalifikacji runtime.",
+      "evidence_status": "planned_contract"
     }
   ],
   "public_api": {
