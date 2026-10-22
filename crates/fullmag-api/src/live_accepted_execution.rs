@@ -95,6 +95,8 @@ enum LiveAcceptedSubmission {
     Command {
         command: SessionCommand,
         request_idempotency_key: Option<String>,
+        /// The session's latest live run (a hint for state continuation, ADR 0068 F5).
+        previous_run_id: Option<String>,
     },
     Startup {
         request_id: String,
@@ -137,7 +139,7 @@ pub(crate) async fn submit_live_command_with_transition(
     context: &CurrentLiveRequestContext,
     request_idempotency_key: Option<String>,
 ) -> Result<Option<AcceptedLiveExecution>, ApiError> {
-    let (scene, source_script_path) = {
+    let (scene, source_script_path, previous_run_id) = {
         let current = state.current_live_state.read().await;
         let snapshot = current
             .as_ref()
@@ -154,7 +156,8 @@ pub(crate) async fn submit_live_command_with_transition(
         }
         let source_script_path = (!snapshot.session.script_path.is_empty())
             .then(|| PathBuf::from(snapshot.session.script_path.clone()));
-        (snapshot.scene_document.clone(), source_script_path)
+        let previous_run_id = snapshot.run.as_ref().map(|run| run.run_id.clone());
+        (snapshot.scene_document.clone(), source_script_path, previous_run_id)
     };
 
     let scene = match scene {
@@ -305,6 +308,7 @@ pub(crate) async fn submit_live_command_with_transition(
             LiveAcceptedSubmission::Command {
                 command,
                 request_idempotency_key,
+                previous_run_id,
             },
         )
     })
@@ -1440,6 +1444,7 @@ fn prepare_live_accepted(
             LiveAcceptedSubmission::Command {
                 command,
                 request_idempotency_key,
+                ..
             } => (
                 command.command_id.clone(),
                 request_idempotency_key.clone(),
@@ -1516,6 +1521,7 @@ fn prepare_live_accepted(
         )
     })?;
 
+    let mut selected_step_index = None;
     let selected_step_id = match &submission {
         LiveAcceptedSubmission::Command { command, .. } => {
             if command.kind == "solve" {
@@ -1529,6 +1535,11 @@ fn prepare_live_accepted(
                 if let Some(until_seconds) = command.until_seconds {
                     study.steps[step_index].until_seconds = Some(until_seconds);
                 }
+                // Publish the final m so the next live command can continue from it.
+                crate::live_accepted_continuation::declare_final_state_output(
+                    &mut study.steps[step_index],
+                );
+                selected_step_index = Some(step_index);
                 Some(selected_step_id)
             }
         }
@@ -1629,25 +1640,36 @@ fn prepare_live_accepted(
         }
     }
 
-    let catalog = fullmag_application::materialize_study_execution(
-        &study,
-        inputs,
-        |profile_id, version| {
-            if profile_id == published_profile.profile_id && version == published_profile.version {
-                Ok(published_profile.clone())
-            } else {
-                Err(format!(
-                    "execution profile `{profile_id}/{version}` is not the pinned live profile"
-                ))
-            }
-        },
-    )
-    .map_err(|error| {
-        ApiError::unprocessable_with_code(
-            "accepted_execution_materialization_failed",
-            format!("StudyPlan execution materialization failed: {error}"),
-        )
-    })?;
+    let profile_lookup = |profile_id: &str, version: &str| {
+        if profile_id == published_profile.profile_id && version == published_profile.version {
+            Ok(published_profile.clone())
+        } else {
+            Err(format!(
+                "execution profile `{profile_id}/{version}` is not the pinned live profile"
+            ))
+        }
+    };
+    // A continued command pins its initial state, which changes the StudyPlan
+    // digest the catalog is bound to; keep the inputs to rebuild it.
+    let rebind_inputs: Option<Vec<fullmag_application::StudyStepExecutionInput>> =
+        selected_step_index.map(|_| {
+            inputs
+                .iter()
+                .map(|input| fullmag_application::StudyStepExecutionInput {
+                    step_id: input.step_id.clone(),
+                    problem: input.problem.clone(),
+                    layers: input.layers.clone(),
+                })
+                .collect()
+        });
+    let mut catalog =
+        fullmag_application::materialize_study_execution(&study, inputs, profile_lookup)
+            .map_err(|error| {
+                ApiError::unprocessable_with_code(
+                    "accepted_execution_materialization_failed",
+                    format!("StudyPlan execution materialization failed: {error}"),
+                )
+            })?;
 
     let entries = catalog.entries();
     let requested_gpu = requested_execution.device.eq_ignore_ascii_case("gpu");
@@ -1732,6 +1754,59 @@ fn prepare_live_accepted(
         ));
     }
 
+    // Continuation (ADR 0068 F5): start from the previous live command's final
+    // m when the accepted plan has exactly the same magnetization layout.
+    let initial_state = match (&submission, selected_step_index) {
+        (LiveAcceptedSubmission::Command { previous_run_id, .. }, Some(step_index)) => {
+            let step_id = study.steps[step_index].step_id.clone();
+            let plan = lowered
+                .steps
+                .iter()
+                .find(|step| step.step_id == step_id)
+                .and_then(|step| step.execution_plan.as_ref());
+            let decision = match plan {
+                Some(plan) => crate::live_accepted_continuation::decide_initial_state(
+                    &store,
+                    previous_run_id.as_deref(),
+                    &context.session_id,
+                    context.session_epoch,
+                    plan,
+                ),
+                None => crate::live_accepted_continuation::InitialStateDecision::Authored {
+                    reason: "selected step has no execution plan".into(),
+                },
+            };
+            if let crate::live_accepted_continuation::InitialStateDecision::Continuation(source) =
+                &decision
+            {
+                crate::live_accepted_continuation::declare_pinned_initial_state(
+                    &mut study.steps[step_index],
+                    source,
+                );
+                study.validate_for_execution().map_err(|error| {
+                    ApiError::unprocessable_with_code(
+                        "accepted_study_plan_invalid",
+                        format!("continued live study is not executable: {error}"),
+                    )
+                })?;
+                let inputs = rebind_inputs.expect("selected live step keeps its inputs");
+                catalog = fullmag_application::materialize_study_execution(
+                    &study,
+                    inputs,
+                    profile_lookup,
+                )
+                .map_err(|error| {
+                    ApiError::unprocessable_with_code(
+                        "accepted_execution_materialization_failed",
+                        format!("continued StudyPlan materialization failed: {error}"),
+                    )
+                })?;
+            }
+            Some(decision.provenance())
+        }
+        _ => None,
+    };
+
     let scene_value = serde_json::to_value(&effective_scene).map_err(|error| {
         ApiError::internal(format!("failed to serialize accepted SceneDocument: {error}"))
     })?;
@@ -1770,6 +1845,12 @@ fn prepare_live_accepted(
             "startup_source_sha256": &startup_source_sha256,
         }
     });
+    if let Some(initial_state) = initial_state {
+        parameters["live_workspace"]
+            .as_object_mut()
+            .expect("live_workspace parameters object")
+            .insert("initial_state_source".to_string(), initial_state);
+    }
     if !queue_tasks {
         parameters
             .as_object_mut()

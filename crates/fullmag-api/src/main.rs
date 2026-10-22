@@ -69,6 +69,7 @@ mod live_command_journal;
 mod live_execution_binding;
 mod accepted_field_materialization;
 mod accepted_field_materialization_worker;
+mod live_accepted_continuation;
 mod live_accepted_execution;
 mod live_retirement;
 mod live_accepted_projection;
@@ -2660,6 +2661,8 @@ async fn main() {
         current_display_selection: Arc::new(RwLock::new(CurrentDisplaySelection::default())),
         current_display_presentation: Arc::new(RwLock::new(DisplayPresentationState::default())),
         current_visualization_client_acks: Arc::new(RwLock::new(BTreeMap::new())),
+        current_session_clients: Arc::new(RwLock::new(BTreeMap::new())),
+        current_session_clients_revision: Arc::new(AtomicU64::new(0)),
         current_visualization_client_ack_revision: Arc::new(AtomicU64::new(0)),
         current_workspace_selection: Arc::new(RwLock::new(CurrentWorkspaceSelection::default())),
         current_workspace_ribbon: Arc::new(RwLock::new(CurrentWorkspaceRibbon::default())),
@@ -3819,6 +3822,7 @@ pub(crate) async fn reset_current_live_session_resources(state: &AppState) {
     state
         .current_visualization_client_ack_revision
         .store(0, Ordering::Relaxed);
+    state.current_session_clients.write().await.clear();
     *state.current_workspace_selection.write().await = CurrentWorkspaceSelection::default();
     *state.current_workspace_ribbon.write().await = CurrentWorkspaceRibbon::default();
     *state.current_workspace_layout.write().await = CurrentWorkspaceLayout::default();

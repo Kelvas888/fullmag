@@ -547,6 +547,7 @@ fn validate_accepted_worker_parameters(
             "step_id",
             "command",
             "startup_source_sha256",
+            "initial_state_source",
         ];
         if let Some(key) = live_workspace
             .keys()

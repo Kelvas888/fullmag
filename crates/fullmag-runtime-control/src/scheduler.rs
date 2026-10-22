@@ -234,14 +234,20 @@ fn step_is_ready(
         let dependencies_ready =
             crate::study_completion::dependencies_ready_locked(store, accepted, study_step)?;
         Ok(dependencies_ready
-            && inputs_are_automatically_resolvable(run_id.as_str(), &study_step.inputs, &catalog)?)
+            && inputs_are_automatically_resolvable(
+                store,
+                run_id.as_str(),
+                &study_step.inputs,
+                &catalog,
+            )?)
     })
 }
 
 /// Select and durably dispatch one accepted task for the supplied resource.
 ///
 /// Tasks are considered in immutable study order. A required StepOutput is
-/// eligible only after its source task succeeds. Required authored, pinned, or
+/// eligible only after its source task succeeds. A required `PinnedArtifact`
+/// state is eligible once its CAS object exists; required authored or
 /// continuation inputs remain blocked because this scheduler has no external
 /// resolver for them. A concurrent winner is rejected by durable admission
 /// fencing; callers may run another pass from a fresh catalog.
@@ -1137,11 +1143,20 @@ fn is_store_writer_busy(error: &anyhow::Error) -> bool {
 }
 
 fn inputs_are_automatically_resolvable(
+    store: &SessionStore,
     run_id: &str,
     inputs: &[fullmag_authoring::StudyInputPort],
     catalog: &fullmag_session::FmsRunCatalog,
 ) -> Result<bool> {
     for input in inputs.iter().filter(|input| input.required) {
+        // A content-pinned state (live continuation, ADR 0068 F5) is ready
+        // once its exact CAS object is present.
+        if let StudyInputSource::PinnedArtifact { content_sha256, .. } = &input.source {
+            if !store.cas().contains(content_sha256) {
+                return Ok(false);
+            }
+            continue;
+        }
         let StudyInputSource::StepOutput { step_id, .. } = &input.source else {
             return Ok(false);
         };
