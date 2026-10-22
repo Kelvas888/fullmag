@@ -322,6 +322,18 @@ pub struct AntennaPortBranchResource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AntennaPortNormalizationResource {
+    SourceCutRt0 {source_cut_ref: String, orientation: AntennaSourceCutOrientationResource},
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AntennaSourceCutOrientationResource {
+    MinusOutward,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AntennaPortModeResource {
     pub schema_version: String,
@@ -329,6 +341,8 @@ pub struct AntennaPortModeResource {
     pub source_object_id: String,
     pub current_transport_id: String,
     pub branches: Vec<AntennaPortBranchResource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalization: Option<AntennaPortNormalizationResource>,
     #[serde(default = "default_antenna_normalization_current_a")]
     pub normalization_current_a: f64,
 }

@@ -2294,7 +2294,7 @@ fn cancel_failed_no_spawn(args: impl Iterator<Item = OsString>) -> Result<()> {
         | fullmag_application::CoordinatorPhase::Running
         | fullmag_application::CoordinatorPhase::Stopping => Some(
             fullmag_runtime_control::retry_store_writer_busy(|| {
-                fullmag_runtime_control::request_accepted_task_stop(
+                fullmag_runtime_control::request_failed_no_spawn_task_stop(
                     &store,
                     &run_id,
                     &request.identity.task_id,

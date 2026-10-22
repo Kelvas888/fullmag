@@ -139,18 +139,16 @@ fn project_run_task_resource(
                 }
                 let bytes = store
                     .cas()
-                    .get(object_ref)
+                    .get_bounded(object_ref, fullmag_session::MAX_TERMINAL_CATALOG_METADATA_BYTES)
                     .map_err(|error| ApiError::internal(error.to_string()))?
                     .ok_or_else(|| {
                         ApiError::internal("study output manifest CAS object is missing")
                     })?;
-                let manifest: fullmag_session::FmsStudyOutputManifest =
-                    serde_json::from_slice(&bytes).map_err(|error| {
+                // This resource exposes identity metadata, not numerical observation admission.
+                let manifest = fullmag_runtime_control::read_study_output_manifest_projection(&bytes)
+                    .map_err(|error| {
                         ApiError::internal(format!("invalid study output manifest: {error}"))
                     })?;
-                manifest
-                    .validate()
-                    .map_err(|error| ApiError::internal(error.to_string()))?;
                 if manifest.run_id != run_id
                     || manifest.task_id != task.task_id
                     || manifest.attempt_id != attempt_id
@@ -2359,11 +2357,10 @@ pub async fn open(
     } else {
         source_bytes
     };
-    Ok(Json(resource_from_application(
-        &application,
-        opened.view,
-        archive,
-    )?))
+    let authoring_scene_document = opened_authoring_scene(&application, &opened.view);
+    let mut resource = resource_from_application(&application, opened.view, archive)?;
+    resource.authoring_scene_document = authoring_scene_document;
+    Ok(Json(resource))
 }
 
 #[utoipa::path(
@@ -2715,6 +2712,106 @@ pub(super) fn encode_current(
         .map_err(|error| ApiError::bad_request(format!("project archive is not writable: {error}")))
 }
 
+fn opened_authoring_scene(
+    application: &ProjectApplication<FileProjectRepository>,
+    view: &fullmag_application::DocumentView,
+) -> Option<std::collections::BTreeMap<String, Value>> {
+    if !view.mode.is_writable() || !view.migration.can_write || view.migration.migrated
+        || view.schema_version != fullmag_application::CURRENT_PROJECT_SCHEMA
+        || view.migration.source_schema != fullmag_application::CURRENT_PROJECT_SCHEMA
+        || view.source_hash.is_none()
+    {
+        return None;
+    }
+    let document = application.current_document()?;
+    if !document.assets.is_empty()
+        || !document.raw_definition.unknown_object_fields(
+            ["schema", "project_id", "name", "revision", "scene"]).is_empty()
+        || document.opaque_documents.iter().any(|entry| !matches!(entry.path(),
+            "project/provenance.json" | "project/source/script.py" | "project/source/script.json"))
+    {
+        return None;
+    }
+    let provenance = document.opaque_documents.iter()
+        .find(|entry| entry.path() == super::script_project::PROVENANCE_PATH)?;
+    let raw: Value = serde_json::from_slice(provenance.bytes()).ok()?;
+    // The display parser drops malformed records. Never infer "no runs" from it.
+    if !raw.get("runs")?.as_array()?.is_empty() { return None; }
+    let parsed = fullmag_workspace_inspect::provenance::parse_provenance(provenance.bytes()).ok()?;
+    for key in ["authors", "history", "runs"] {
+        if raw.get(key)?.as_array()? != parsed.get(key)?.as_array()? { return None; }
+    }
+    if raw.as_object()?.keys().any(|key| !matches!(key.as_str(), "authors" | "history" | "runs" | "citation"))
+        || raw["history"].as_array()?.iter().any(|entry|
+            !matches!(entry["kind"].as_str(), Some("import" | "edit")) || entry.get("run_id").is_some())
+    {
+        return None;
+    }
+    let raw_scene = document.definition.scene.value();
+    if raw_scene.get("version")?.as_str()? != "scene.v2" { return None; }
+    let scene: SceneDocument = serde_json::from_value(raw_scene.clone()).ok()?;
+    validate_scene_document_for_authoring(&scene).ok()?;
+    let projected = serde_json::to_value(&scene).ok()?;
+    if !raw_scene_survives_projection(raw_scene, &projected)
+        || scene_references_unmaterialized_assets(&projected)
+    {
+        return None;
+    }
+    // Open has no asset materialization lease; external fields remain evidence-only.
+    if scene.study.initial_state.is_some()
+        || scene.magnetization_assets.iter().any(|asset| asset.source_path.is_some())
+    {
+        return None;
+    }
+    Some(raw_scene.as_object()?.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
+}
+
+
+/// Every supplied value must survive the canonical typed scene projection.
+/// Serializer-added defaults are allowed; omitted supplied keys are not.
+fn raw_scene_survives_projection(raw: &Value, projected: &Value) -> bool {
+    match (raw, projected) {
+        (Value::Object(raw), Value::Object(projected)) => raw.iter().all(|(key, value)| {
+            projected.get(key).is_some_and(|next| raw_scene_survives_projection(value, next))
+        }),
+        (Value::Array(raw), Value::Array(projected)) => raw.len() == projected.len()
+            && raw.iter().zip(projected).all(|(a, b)| raw_scene_survives_projection(a, b)),
+        (Value::Number(a), Value::Number(b)) => exact_projected_number(a, b),
+        _ => raw == projected,
+    }
+}
+
+fn exact_projected_number(a: &serde_json::Number, b: &serde_json::Number) -> bool {
+    if a == b { return true; }
+    let (integer, float) = if a.is_f64() { (b, a) } else { (a, b) };
+    if !float.is_f64() { return false; }
+    let Some(value) = float.as_f64() else { return false; };
+    if !value.is_finite() || value.fract() != 0.0 { return false; }
+    if let Some(integer) = integer.as_u64() {
+        value >= 0.0 && value < 18_446_744_073_709_551_616.0 && value as u64 == integer
+    } else if let Some(integer) = integer.as_i64() {
+        value >= -9_223_372_036_854_775_808.0 && value < 9_223_372_036_854_775_808.0
+            && value as i64 == integer
+    } else {
+        false
+    }
+}
+
+/// Open has no archive-asset materialization owner. Conservatively retain
+/// asset-bearing authoring payloads as evidence, including opaque extensions.
+fn scene_references_unmaterialized_assets(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().any(|(key, value)| {
+            key == "asset_id"
+                || (matches!(key.as_str(), "source_path" | "mode_basis_ref" | "equilibrium_ref")
+                    && value.as_str().is_some_and(|text| !text.trim().is_empty()))
+                || scene_references_unmaterialized_assets(value)
+        }),
+        Value::Array(items) => items.iter().any(scene_references_unmaterialized_assets),
+        _ => false,
+    }
+}
+
 pub(super) fn resource_from_application(
     application: &ProjectApplication<FileProjectRepository>,
     view: fullmag_application::DocumentView,
@@ -2737,6 +2834,7 @@ pub(super) fn resource_from_application(
         dirty: view.dirty,
         mode,
         source_hash: view.source_hash,
+        authoring_scene_document: None,
         migration: ProjectMigrationResource {
             source_schema: view.migration.source_schema,
             target_schema: view.migration.target_schema,
@@ -2748,4 +2846,171 @@ pub(super) fn resource_from_application(
         archive_base64: STANDARD.encode(archive),
         durability: ProjectArchiveDurability::MemoryOnly,
     })
+}
+
+#[cfg(test)]
+mod authoring_open_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn opened(provenance: Value) -> (ProjectApplication<FileProjectRepository>, fullmag_application::DocumentView) {
+        let mut application = ProjectApplication::new(FileProjectRepository::new());
+        let created = application.create(CreateProjectRequest::new("Archived authoring")).unwrap();
+        let mut draft = application.current_document().unwrap().clone();
+        draft.replace_scene(RawJsonEnvelope::from_value(json!({
+            "version":"scene.v2","revision":11,
+            "study":{"requested_backend":"fem","requested_device":"cpu","requested_precision":"double"}
+        })).unwrap()).unwrap();
+        for (path, bytes) in [
+            ("project/provenance.json", serde_json::to_vec(&provenance).unwrap()),
+            ("project/source/script.py", b"raise RuntimeError('must never execute')".to_vec()),
+            ("project/source/script.json", b"{}".to_vec()),
+        ] {
+            draft.opaque_documents.push(OpaqueDocument::new(path,bytes).unwrap());
+        }
+        application.replace_draft(draft,created.revision).unwrap();
+        let bytes = application.repository().encode_archive(application.current_document().unwrap()).unwrap();
+        let mut reopened = ProjectApplication::new(FileProjectRepository::new());
+        let result = reopened.open(ProjectSource::Bytes { display_name:"authoring.fms".into(),bytes }).unwrap();
+        (reopened,result.view)
+    }
+
+    fn provenance() -> Value {
+        json!({"authors":[],"history":[{"revision":0,"at":"2026-10-20T00:00:00Z","kind":"import","summary":"Original source"}],"runs":[]})
+    }
+
+    #[test]
+    fn authoring_projection_uses_owner_parsed_archive_without_changing_source() {
+        let (application,view) = opened(provenance());
+        let before=application.current_document().unwrap().clone();
+        let scene=opened_authoring_scene(&application,&view).unwrap();
+        assert_eq!(scene["version"],"scene.v2");
+        assert_eq!(scene["revision"],11);
+        assert_eq!(application.current_document().unwrap(),&before);
+        assert_eq!(view.project_id,before.definition.project_id);
+        assert_eq!(view.revision,before.definition.revision);
+    }
+
+    #[test]
+    fn historical_malformed_missing_and_read_only_inputs_have_no_activation_projection() {
+        for change in 0..7 {
+            let mut provenance=provenance();
+            match change {
+                0 => provenance["runs"]=json!([{"unrecognised":"must not disappear"}]),
+                1 => { provenance.as_object_mut().unwrap().remove("runs"); }
+                2 => provenance["history"][0]["kind"]=json!("run"),
+                3 => provenance["history"][0]["run_id"]=json!("accepted-run"),
+                4 => provenance["authors"]=json!([{}]),
+                5 => provenance["accepted_provenance"]=json!({}),
+                _ => {}
+            }
+            let (application,mut view)=opened(provenance);
+            if change==6 { view.mode=DocumentMode::ReadOnly {reason:"legacy execution archive".into()}; }
+            assert!(opened_authoring_scene(&application,&view).is_none(),"change {change}");
+        }
+    }
+
+    #[test]
+    fn unresolved_assets_and_unknown_documents_remain_evidence_only() {
+        for change in 0..5 {
+            let (mut application,view)=opened(provenance());
+            let mut draft=application.current_document().unwrap().clone();
+            if change==0 {
+                draft.assets.push(fullmag_application::OpaqueAsset::new("project/assets/mesh.dat",b"unresolved".to_vec(),None).unwrap());
+            } else if change==1 {
+                draft.opaque_documents.push(OpaqueDocument::new("project/accepted_provenance.json",b"{}".to_vec()).unwrap());
+            } else {
+                let mut scene = draft.definition.scene.value().clone();
+                if change == 2 {
+                    scene["study"]["requested_backend"] = json!("unknown");
+                } else if change == 3 {
+                    scene["study"]["initial_state"] = json!({"source_path":"missing.ovf","format":"ovf"});
+                } else {
+                    scene["magnetization_assets"] = json!([{"id":"external","name":"External","kind":"uniform","source_path":"missing.ovf"}]);
+                }
+                draft.replace_scene(RawJsonEnvelope::from_value(scene).unwrap()).unwrap();
+            }
+            application.replace_draft(draft,view.revision).unwrap();
+            assert!(opened_authoring_scene(&application,&application.current().unwrap()).is_none(),"change {change}");
+        }
+    }
+
+    #[test]
+    fn omitted_defaults_survive_without_allowing_unknown_null_or_empty_fields() {
+        let raw = json!({"version":"scene.v2","study":{"requested_backend":"fem"}});
+        let scene: SceneDocument = serde_json::from_value(raw.clone()).unwrap();
+        let projected = serde_json::to_value(&scene).unwrap();
+        assert!(raw_scene_survives_projection(&raw, &projected));
+        for unknown in [Value::Null, json!({}), json!([]), json!("future")] {
+            let mut raw = raw.clone();
+            raw["study"]["future"] = unknown;
+            assert!(!raw_scene_survives_projection(&raw, &projected));
+        }
+        // A supplied known field skipped by Serialize is conservatively evidence-only.
+        assert!(!raw_scene_survives_projection(&json!({"objects":[]}), &json!({})));
+    }
+
+    #[test]
+    fn unknown_nested_object_geometry_transform_and_tagged_fields_are_evidence_only() {
+        let base = json!({
+            "version":"scene.v2","revision":11,
+            "objects":[{"id":"body","name":"Body","role":"geometry","material_ref":"",
+                "geometry":{"geometry_kind":"Box","geometry_params":{"size":[1e-6,1e-6,1e-6]}},
+                "transform":{"translation":[0,0,0]}}],
+            "study":{"requested_backend":"fem","requested_device":"cpu","requested_precision":"double"}
+        });
+        for path in ["/objects/0", "/objects/0/geometry", "/objects/0/transform"] {
+            for unknown in [Value::Null, json!({}), json!([]), json!("preserve me")] {
+                let mut raw = base.clone();
+                raw.pointer_mut(path).unwrap().as_object_mut().unwrap().insert("future".into(), unknown);
+                let scene: SceneDocument = serde_json::from_value(raw.clone()).unwrap();
+                assert!(!raw_scene_survives_projection(&raw, &serde_json::to_value(&scene).unwrap()), "{path}");
+                let (mut application, view) = opened(provenance());
+                let mut draft = application.current_document().unwrap().clone();
+                draft.replace_scene(RawJsonEnvelope::from_value(raw).unwrap()).unwrap();
+                let current = application.replace_draft(draft, view.revision).unwrap();
+                assert!(opened_authoring_scene(&application, &current).is_none());
+            }
+        }
+        let raw = json!({"kind":"constant","value":1.0,"future":null});
+        let field: fullmag_authoring::SceneMaterialParameterField = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!raw_scene_survives_projection(&raw, &serde_json::to_value(field).unwrap()));
+    }
+
+    #[test]
+    fn numeric_projection_has_no_tolerance_or_large_integer_rounding() {
+        for (raw, projected, expected) in [
+            (json!(1), json!(1.0), true),
+            (json!(-1), json!(-1.0), true),
+            (json!(1e-12), json!(1e-12), true),
+            (json!(1.0), json!(1.0 + 1e-12), false),
+            (json!(9_007_199_254_740_993_u64), json!(9_007_199_254_740_992.0), false),
+            (json!(u64::MAX), json!(18_446_744_073_709_551_616.0), false),
+            (json!(i64::MIN), json!(-9_223_372_036_854_775_808.0), true),
+        ] {
+            assert_eq!(raw_scene_survives_projection(&raw, &projected), expected);
+        }
+    }
+
+    #[test]
+    fn all_nested_asset_reference_families_remain_evidence_only() {
+        for reference in [
+            json!({"objects":[{"material_parameter_fields":[{"value":{"kind":"sampled","asset_id":"missing"}}]}]}),
+            json!({"objects":[{"regions":[{"material_overrides":[{"value":{"kind":"sampled","asset_id":"missing"}}]}]}]}),
+            json!({"magnetization_constraints":[{"reference":{"kind":"explicit_field_asset","asset_id":"missing"}}]}),
+            json!({"selections":[{"expression":{"kind":"inside_geometry","geometry":{"kind":"imported_solid","asset_id":"missing"}}}]}),
+            json!({"antenna_target_projections":[{"solution":{"asset_id":"missing"}}]}),
+            json!({"antenna_spectrum_requests":[{"equilibrium_ref":{"kind":"artifact","asset_id":"missing"}}]}),
+            json!({"antenna_spectrum_requests":[{"equilibrium_ref":"legacy-artifact"}]}),
+            json!({"antenna_spectrum_requests":[{"mode_basis_ref":"missing"}]}),
+            json!({"opaque_payload":{"nested":[{"asset_id":null}]}}),
+        ] {
+            assert!(scene_references_unmaterialized_assets(&reference));
+        }
+        assert!(!scene_references_unmaterialized_assets(&json!({
+            "solution":{"kind":"stage_output","stage_id":"solve","output_id":"basis"},
+            "equilibrium_ref":{"kind":"stage_output","stage_id":"relax","output_id":"state"}
+        })));
+    }
+
 }
