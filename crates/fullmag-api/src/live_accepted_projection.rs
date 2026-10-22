@@ -87,16 +87,22 @@ pub(crate) fn spawn(state: Arc<AppState>) {
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut cursor: Option<ProjectionCursor> = None;
+        // The poll repeats every interval; report each distinct deferral once.
+        let mut last_deferral: Option<String> = None;
         loop {
             interval.tick().await;
             match poll_once(&state, &mut cursor).await {
-                Ok(()) => {}
+                Ok(()) => last_deferral = None,
                 Err(error) => {
-                    tracing::warn!(
-                        code = ?error.code,
-                        error = %error,
-                        "accepted live read-model projection deferred"
-                    );
+                    let detail = error.to_string();
+                    if last_deferral.as_deref() != Some(detail.as_str()) {
+                        tracing::warn!(
+                            code = ?error.code,
+                            error = %error,
+                            "accepted live read-model projection deferred"
+                        );
+                        last_deferral = Some(detail);
+                    }
                 }
             }
         }
@@ -110,6 +116,17 @@ async fn poll_once(
     let Some(context) = capture_context(state).await? else {
         return Ok(());
     };
+    // A terminal run whose final state is already projected has nothing left
+    // to publish. Editing the model after it (the normal live workflow between
+    // commands) changes the input identity and must not retry it forever.
+    if cursor.as_ref().is_some_and(|previous| {
+        previous.run_id == context.run_id
+            && previous.session_id == context.session_id
+            && previous.session_epoch == context.session_epoch
+            && matches!(previous.status, "completed" | "failed" | "cancelled")
+    }) {
+        return Ok(());
+    }
     let Some(store_root) = state.submit_store_root.clone() else {
         return Ok(());
     };
