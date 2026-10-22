@@ -565,7 +565,7 @@ pub fn probe_native_fem_gpu_readiness() -> Result<HostRuntimeReadiness> {
         bail!("native FEM/GPU ABI returned invalid CUDA memory bounds");
     }
 
-    let devices = discover_nvidia_gpus()?;
+    let devices = discover_nvidia_gpus(None)?;
     if devices.len() != usize::try_from(status.visible_cuda_device_count)? {
         bail!(
             "native CUDA visibility ({}) differs from the current NVIDIA inventory ({})",
@@ -927,7 +927,16 @@ fn sample_compute_node_inner(
     // This keeps an absent device an explicit unavailable observation rather
     // than turning an empty probe result into a verified GPU inventory.
     let cpu_only_profile = readiness.is_some_and(HostRuntimeReadiness::is_cpu_only_profile);
-    let gpus = (!cpu_only_profile).then(discover_nvidia_gpus);
+    // Partition identity survives an absent NVML observation only within the
+    // node and boot that proved it.
+    let previous_gpus = previous
+        .filter(|snapshot| {
+            snapshot.node_id == node_id
+                && current_host_boot_id(Utc::now()).is_ok_and(|boot_id| boot_id == snapshot.boot_id)
+        })
+        .and_then(|snapshot| snapshot.gpus.known_value())
+        .map(Vec::as_slice);
+    let gpus = (!cpu_only_profile).then(|| discover_nvidia_gpus(previous_gpus));
     let now = Utc::now();
     let boot_monotonic_ns = current_boot_monotonic_ns()?;
     let boot_id = current_host_boot_id(now.clone())?;
@@ -1221,7 +1230,9 @@ fn validate_warm_gpu_inventory(
                 device.uuid
             );
         }
-        if !matches!(&device.partition, Reported::Available { .. }) {
+        // A partition retained as last-known after an absent NVML observation
+        // is still the identity bound by the digests checked above.
+        if device.partition.known_value().is_none() {
             bail!(
                 "previous GPU {} has no complete durable partition identity",
                 device.uuid
@@ -2285,7 +2296,9 @@ fn validate_memory(memory: MemoryObservation) -> Result<MemoryObservation> {
     Ok(memory)
 }
 
-fn discover_nvidia_gpus() -> Result<Vec<GpuDeviceSnapshot>> {
+/// `previous_devices` is the GPU inventory of the last published sample of
+/// this node and boot; it is consulted only when NVML gives no observation.
+fn discover_nvidia_gpus(previous_devices: Option<&[GpuDeviceSnapshot]>) -> Result<Vec<GpuDeviceSnapshot>> {
     const QUERY_WITH_MIG_MODE: &str =
         "uuid,pci.bus_id,name,memory.total,utilization.gpu,temperature.gpu,mig.mode.current";
     const LEGACY_QUERY: &str =
@@ -2303,6 +2316,11 @@ fn discover_nvidia_gpus() -> Result<Vec<GpuDeviceSnapshot>> {
     };
     let stdout = String::from_utf8(output).context("nvidia-smi output is not UTF-8")?;
     let mut devices = parse_nvidia_smi_output(&stdout, includes_mig_mode)?;
+    let mig_enabled = if includes_mig_mode {
+        nvidia_smi_mig_enabled_uuids(&stdout)
+    } else {
+        BTreeSet::new()
+    };
     // NVML is a separate, bounded evidence path. Do not spend the remaining
     // nvidia-smi budget on a child probe: a slow SMI query must not turn a
     // valid physical GPU into an unobserved partition.
@@ -2333,11 +2351,53 @@ fn discover_nvidia_gpus() -> Result<Vec<GpuDeviceSnapshot>> {
                         report.attempts,
                         report.timed_out,
                     );
+                    if reason.is_retryable() && !mig_enabled.contains(&device.uuid) {
+                        retain_unconfirmed_full_device_partition(device, previous_devices);
+                    }
                 }
             }
         }
     }
     Ok(devices)
+}
+
+/// UUIDs for which nvidia-smi positively reported MIG mode as enabled. That
+/// report is evidence against a full device even when NVML gives none.
+fn nvidia_smi_mig_enabled_uuids(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let columns = line.split(',').map(str::trim).collect::<Vec<_>>();
+            (columns.len() == 7 && columns[6].eq_ignore_ascii_case("enabled"))
+                .then(|| columns[0].to_owned())
+        })
+        .collect()
+}
+
+/// An inconclusive NVML probe is an absent observation, not a partition
+/// change. When the previous sample of this boot proved the same UUID at the
+/// same PCI id to be a full device, the partition is reported unavailable
+/// with that identity as last-known: the inventory digest is unchanged, so
+/// the sample stays publishable, while GPU admission, which requires a
+/// current `full_device`, stays closed until a probe confirms it again.
+/// A positive non-full result, a new device or a changed binding is never
+/// retained and keeps failing publication closed.
+fn retain_unconfirmed_full_device_partition(
+    device: &mut GpuDeviceSnapshot,
+    previous_devices: Option<&[GpuDeviceSnapshot]>,
+) {
+    let proven_full_device = previous_devices.unwrap_or_default().iter().any(|previous| {
+        previous.uuid == device.uuid
+            && previous.pci_id.known_value().is_some()
+            && previous.pci_id.known_value() == device.pci_id.known_value()
+            && previous.partition.known_value() == Some(&GpuPartition::FullDevice)
+    });
+    if proven_full_device {
+        device.partition = Reported::Unavailable {
+            reason: UnavailableReason::ProbeFailed,
+            last_known: Some(GpuPartition::FullDevice),
+        };
+    }
 }
 
 fn query_nvidia_smi(
@@ -3013,6 +3073,66 @@ mod tests {
                 value: GpuPartition::Unknown
             }
         );
+    }
+
+    #[test]
+    fn absent_nvml_observation_retains_only_a_proven_full_device_partition() {
+        let row = "GPU-a,pci-0000:01:00.0,NVIDIA A,4096,0,42,N/A\n";
+        let unresolved = parse_nvidia_smi_output(row, true).unwrap().remove(0);
+        let mut proven = unresolved.clone();
+        proven.partition = Reported::Available {
+            value: GpuPartition::FullDevice,
+        };
+        let retained = Reported::Unavailable {
+            reason: UnavailableReason::ProbeFailed,
+            last_known: Some(GpuPartition::FullDevice),
+        };
+
+        let mut device = unresolved.clone();
+        retain_unconfirmed_full_device_partition(&mut device, Some(std::slice::from_ref(&proven)));
+        assert_eq!(device.partition, retained);
+        // A retained partition chains, and the inventory identity is unchanged.
+        let mut chained = proven.clone();
+        chained.partition = retained.clone();
+        let mut device = unresolved.clone();
+        retain_unconfirmed_full_device_partition(&mut device, Some(std::slice::from_ref(&chained)));
+        assert_eq!(device.partition, retained);
+        assert_eq!(device.partition.known_value(), proven.partition.known_value());
+
+        // No previous sample, a never-proven device, another UUID or another
+        // PCI binding keep the unknown partition that fails publication.
+        for previous in [
+            None,
+            Some(vec![unresolved.clone()]),
+            Some(vec![GpuDeviceSnapshot {
+                uuid: "GPU-b".into(),
+                ..proven.clone()
+            }]),
+            Some(vec![GpuDeviceSnapshot {
+                pci_id: reported_text("pci-0000:02:00.0"),
+                ..proven.clone()
+            }]),
+        ] {
+            let mut device = unresolved.clone();
+            retain_unconfirmed_full_device_partition(&mut device, previous.as_deref());
+            assert_eq!(
+                device.partition,
+                Reported::Available {
+                    value: GpuPartition::Unknown
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_mig_enabled_report_is_evidence_against_a_full_device() {
+        let enabled = nvidia_smi_mig_enabled_uuids(concat!(
+            "GPU-b,pci-0000:02:00.0,NVIDIA B,8192,63,71,Enabled\n",
+            "GPU-a,pci-0000:01:00.0,NVIDIA A,4096,N/A,N/A,N/A\n",
+            "GPU-c,pci-0000:03:00.0,NVIDIA C,4096,0,42,Disabled\n",
+        ));
+        assert_eq!(enabled, BTreeSet::from(["GPU-b".to_owned()]));
+        assert!(nvidia_smi_mig_enabled_uuids("GPU-a,pci-0000:01:00.0,NVIDIA A,4096,0,42\n").is_empty());
     }
 
     #[test]

@@ -128,11 +128,6 @@ async fn publish_compute_node_sample(
                 previous.as_ref(),
             )?
         };
-        let unresolved = transient_gpu_partition_uuids(previous.as_ref(), &snapshot);
-        if !unresolved.is_empty() {
-            // Nothing is published: the ledger keeps the last proven sample.
-            return Err(TransientGpuPartitionSample { uuids: unresolved }.into());
-        }
         fullmag_runtime_control::retry_store_writer_busy(|| {
             ledger.publish_compute_node_snapshot_with_owner_for_generation(
                 &inventory_owner,
@@ -168,73 +163,7 @@ async fn publish_compute_node_sample(
 }
 
 const MAX_CONSECUTIVE_SAMPLE_STORE_WRITER_BUSY: u32 = 5;
-// Six 5 s samples stay inside HOST_ADMISSION_DEFERRAL_BUDGET, so the last
-// published snapshot is never trusted beyond the existing freshness deferral.
-const MAX_CONSECUTIVE_TRANSIENT_GPU_PARTITION_SAMPLES: u32 = 6;
 const HOST_ADMISSION_DEFERRAL_BUDGET: Duration = Duration::from_secs(60);
-
-/// A sample that could not resolve the partition of a GPU which the previous
-/// published sample proved to be a full device. A timed-out NVML or
-/// nvidia-smi query reports such a device as unknown; one slow probe must not
-/// end host admission by itself.
-#[derive(Debug)]
-struct TransientGpuPartitionSample {
-    uuids: Vec<String>,
-}
-
-impl std::fmt::Display for TransientGpuPartitionSample {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "GPU partition was not resolved for previously full devices: {}",
-            self.uuids.join(", ")
-        )
-    }
-}
-
-impl std::error::Error for TransientGpuPartitionSample {}
-
-fn transient_gpu_partition_sample_within_budget(consecutive: &mut u32) -> bool {
-    *consecutive = consecutive.saturating_add(1);
-    *consecutive <= MAX_CONSECUTIVE_TRANSIENT_GPU_PARTITION_SAMPLES
-}
-
-fn is_transient_gpu_partition_sample(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<TransientGpuPartitionSample>())
-}
-
-/// UUIDs present in both samples whose partition was a full device before and
-/// is anything else now. A device that disappears, changes UUID or starts with
-/// an unresolved partition is not transient and is handled by publication.
-fn transient_gpu_partition_uuids(
-    previous: Option<&fullmag_session::compute_node_snapshot::ComputeNodeSnapshot>,
-    snapshot: &fullmag_session::compute_node_snapshot::ComputeNodeSnapshot,
-) -> Vec<String> {
-    match (
-        previous.and_then(|sample| sample.gpus.known_value()),
-        snapshot.gpus.known_value(),
-    ) {
-        (Some(before), Some(now)) => unresolved_full_device_uuids(before, now),
-        _ => Vec::new(),
-    }
-}
-
-fn unresolved_full_device_uuids(
-    before: &[fullmag_session::compute_node_snapshot::GpuDeviceSnapshot],
-    now: &[fullmag_session::compute_node_snapshot::GpuDeviceSnapshot],
-) -> Vec<String> {
-    use fullmag_session::compute_node_snapshot::GpuPartition;
-    now.iter()
-        .filter(|gpu| gpu.partition.known_value() != Some(&GpuPartition::FullDevice))
-        .filter(|gpu| {
-            before.iter().any(|old| {
-                old.uuid == gpu.uuid
-                    && old.partition.known_value() == Some(&GpuPartition::FullDevice)
-            })
-        })
-        .map(|gpu| gpu.uuid.clone())
-        .collect()
-}
 
 fn is_store_writer_busy(error: &anyhow::Error) -> bool {
     error
@@ -2825,7 +2754,6 @@ fn run_service(path: PathBuf) -> Result<()> {
             let mut last_compute_node_sample = Instant::now();
             let mut pending_compute_node_sample: Option<ComputeNodeSampleFuture> = None;
             let mut consecutive_busy_samples = 0_u32;
-            let mut consecutive_transient_gpu_samples = 0_u32;
             let mut admission_deferred_at = None;
             // A drain or control error observed while a sample is in flight
             // cannot make us leave the loop: doing so would drop the future
@@ -2905,31 +2833,18 @@ fn run_service(path: PathBuf) -> Result<()> {
                     match sample_result {
                         Ok(sample_owner) => {
                             consecutive_busy_samples = 0;
-                            consecutive_transient_gpu_samples = 0;
                             inventory_owner = sample_owner;
                         }
                         Err(error) => {
-                            let deferral = if is_store_writer_busy(&error)
+                            if is_store_writer_busy(&error)
                                 && sample_store_writer_busy_within_budget(
                                     &mut consecutive_busy_samples,
                                 )
                             {
-                                Some("compute-node sample deferred while the host ledger writer is busy")
-                            } else if is_transient_gpu_partition_sample(&error)
-                                && transient_gpu_partition_sample_within_budget(
-                                    &mut consecutive_transient_gpu_samples,
-                                )
-                            {
-                                Some("compute-node sample deferred while a GPU partition is unresolved")
-                            } else {
-                                None
-                            };
-                            if let Some(reason) = deferral {
                                 tracing::warn!(
                                     error = ?error,
                                     consecutive_busy_samples,
-                                    consecutive_transient_gpu_samples,
-                                    "{reason}"
+                                    "compute-node sample deferred while the host ledger writer is busy"
                                 );
                                 last_compute_node_sample = Instant::now();
                                 if let Some(control_error) = deferred_control_error.take() {
@@ -3186,61 +3101,6 @@ fn run_service(path: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn gpu_with_partition(
-        uuid: &str,
-        partition: fullmag_session::compute_node_snapshot::GpuPartition,
-    ) -> fullmag_session::compute_node_snapshot::GpuDeviceSnapshot {
-        use fullmag_session::compute_node_snapshot::{
-            GpuDeviceSnapshot, Observation, UnavailableReason,
-        };
-        let not_reported = UnavailableReason::NotReported;
-        GpuDeviceSnapshot {
-            uuid: uuid.into(),
-            pci_id: Reported::Available { value: "00000000:01:00.0".into() },
-            name: Reported::Unavailable { reason: not_reported, last_known: None },
-            local_ordinal: Observation::Available { value: 0 },
-            vram_bytes: Reported::Available { value: 16 * 1024 * 1024 * 1024 },
-            utilization_percent: Observation::Unavailable { reason: not_reported },
-            temperature_millicelsius: Observation::Unavailable { reason: not_reported },
-            partition: Reported::Available { value: partition },
-            topology: Reported::Unavailable { reason: not_reported, last_known: None },
-            runtime_compatibility: Reported::Available { value: vec!["fem.gpu".into()] },
-        }
-    }
-
-    #[test]
-    fn unresolved_partition_of_a_previously_full_gpu_is_transient() {
-        use fullmag_session::compute_node_snapshot::GpuPartition;
-        let full = gpu_with_partition("GPU-a", GpuPartition::FullDevice);
-        let unresolved = gpu_with_partition("GPU-a", GpuPartition::Unknown);
-        assert_eq!(
-            unresolved_full_device_uuids(&[full.clone()], &[unresolved.clone()]),
-            vec!["GPU-a".to_owned()]
-        );
-        // Still full, a new device, or a device that was never proven full are
-        // not transient: publication decides them as before.
-        assert!(unresolved_full_device_uuids(&[full.clone()], &[full.clone()]).is_empty());
-        assert!(unresolved_full_device_uuids(
-            &[full],
-            &[gpu_with_partition("GPU-b", GpuPartition::Unknown)]
-        )
-        .is_empty());
-        assert!(unresolved_full_device_uuids(&[unresolved.clone()], &[unresolved]).is_empty());
-    }
-
-    #[test]
-    fn transient_gpu_partition_samples_are_deferred_only_within_budget() {
-        let mut consecutive = 0;
-        for _ in 0..MAX_CONSECUTIVE_TRANSIENT_GPU_PARTITION_SAMPLES {
-            assert!(transient_gpu_partition_sample_within_budget(&mut consecutive));
-        }
-        assert!(!transient_gpu_partition_sample_within_budget(&mut consecutive));
-        let error = anyhow::Error::new(TransientGpuPartitionSample { uuids: vec!["GPU-a".into()] })
-            .context("compute-node sampling worker failed");
-        assert!(is_transient_gpu_partition_sample(&error));
-        assert!(!is_transient_gpu_partition_sample(&anyhow::anyhow!("compute-node sample rejected")));
-    }
 
     fn docker_host_initializer_arguments() -> Vec<OsString> {
         let root = std::env::temp_dir().join("fullmag-host-initializer-parser");
