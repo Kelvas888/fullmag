@@ -359,12 +359,16 @@ Wady runtime znalezione podczas E2E w grupie DEV i naprawione w F5:
 - po edycji modelu po zakończonym runie projekcja co 500 ms ponawiała sprawdzenie wejścia tego runu i logowała ostrzeżenie; zakończony, już zrzutowany run jest pomijany, a każde odroczenie raportowane raz;
 - `fm.relax()`/`fm.run()` bez jawnego kroku dawały etap, którego runner nie wykona; tryb live zgłasza `ValueError` przed wysłaniem;
 - `fm.connect()` dołączał do sesji terminalnej (`failed`), która odrzuca każdą komendę; teraz zakłada nową.
+- projekcja przepisywała status zakończonego runu na status sesji, więc po pierwszej komendzie sesja stawała się `completed` i odrzucała następne (także kontynuację stanu). Run komendy interaktywnej przywraca teraz sesję do `awaiting_command`; run skryptu startowego nadal kończy sesję;
+- `fm.m.average()`/`fm.field("m")` po runie accepted: tabela skalarów nie jest jeszcze projektowana, a trasa wektora pól odpowiada `quantity_registry_not_resolved_plan`; klient czyta `m` z najnowszej ramki obserwacji (`/data/observation-frames/{id}/magnetization`, FMVP v4), a średnie liczy z pola. `fm.E_total` daje wtedy NaN;
+- `fm.export_script()` renderuje bieżącą scenę przez `POST /model/syncs`.
 
 Ograniczenia stwierdzone w grupie DEV (poza zakresem F5):
 
 - API nie ma operacji zamknięcia sesji (`PATCH /v2/sessions/current` zwraca 400), a launcher celowo nie restartuje backendu z aktywną sesją. Sesja założona przez `fm.connect()` blokuje więc `just docker-dev` po zmianie backendu; launcher mówi to teraz wprost. Docelowy model wielu sesji (karty sesji obok Home) to osobny temat;
 - `docker restart` backendu bez launchera pomija delegowaną bramkę cgroup workerów; próbka węzła ma wtedy `cpu_quota: unavailable`, a ledger hosta po cichu odrzuca przyjęcia CPU (komenda zostaje `accepted`). Po zmianie backendu trzeba restartować przez launcher;
-- `fm.export_script()` dla sesji bez ścieżki skryptu zwraca 400 („does not expose a script path”).
+- projekcja tabeli skalarów i rejestru wielkości dla runów accepted (wykresy na żywo, `E_total`, trasa wektora pól) nie istnieje; klient obchodzi to ramkami obserwacji;
+- magazyn sesji na folderze Windows (`FULLMAG_PROJECT_STORAGE_ROOT=C:\gitullmag\storage`, montowanie Docker Desktop) wydłuża każdą transakcję do 3–6 s i daje sporadyczne `ENOENT` przy odczycie listingu pod blokadą zapisu; zalecany magazyn na ext4 (WSL) albo w wolumenie Dockera.
 
 Wsparcie każdej zmiany jest deklarowane per ścieżka (FDM CPU, FDM GPU,
 FEM CPU, FEM GPU) w `docs/specs/capability-matrix-v0.md`; wymuszony GPU nie

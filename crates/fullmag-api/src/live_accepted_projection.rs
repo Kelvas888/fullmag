@@ -66,6 +66,8 @@ struct DurableProjection {
     terminal_without_outputs: bool,
     status: &'static str,
     command_id: Option<String>,
+    /// The run executes one interactive command (not a startup script).
+    interactive_command: bool,
     latest_state: Option<VerifiedOutput>,
     latest_total_energy: Option<fullmag_application::StudyScalarArtifact>,
     latest_output_identity: Option<String>,
@@ -529,12 +531,18 @@ fn load_durable_projection(
         .pointer("/parameters/live_workspace/command_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let interactive_command = intent
+        .specification
+        .pointer("/parameters/live_workspace/command/kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "startup_script");
     Ok(Some(DurableProjection {
         run_catalog_revision: run_catalog.revision,
         artifact_catalog_revision,
         terminal_without_outputs,
         status,
         command_id,
+        interactive_command,
         latest_state,
         latest_total_energy,
         latest_output_identity,
@@ -836,6 +844,19 @@ fn validate_live_intent(
         ));
     }
     Ok(())
+}
+
+/// The session's public status for a projected run. A run that executed one
+/// interactive command (a live `run`/`relax`/... from the Control Room or a
+/// `fm.connect()` script) ends that command, not the session: the session
+/// returns to `awaiting_command` so the next command, which continues from
+/// this run's final state, is admitted. A startup-script run ends the session.
+fn session_status_after_projection(run_status: &'static str, interactive_command: bool) -> &'static str {
+    match run_status {
+        "waiting_for_solve" => "awaiting_command",
+        "completed" | "failed" | "cancelled" if interactive_command => "awaiting_command",
+        status => status,
+    }
 }
 
 fn catalog_status(tasks: &[fullmag_session::FmsTaskCatalogEntry]) -> &'static str {
@@ -1600,17 +1621,14 @@ async fn apply_projection(
             }
         }
     }
-    let public_status = if projection.status == "waiting_for_solve" {
-        "awaiting_command"
-    } else {
-        projection.status
-    };
+    let public_status =
+        session_status_after_projection(projection.status, projection.interactive_command);
     if next.session.status != public_status {
         next.session.status = public_status.to_string();
         changed = true;
     }
     next.runtime_status = crate::session::build_runtime_status_view(public_status);
-    if terminal && next.session.finished_at_unix_ms == 0 {
+    if terminal && !projection.interactive_command && next.session.finished_at_unix_ms == 0 {
         next.session.finished_at_unix_ms = unix_time_millis_now();
         changed = true;
     }
@@ -1996,6 +2014,16 @@ mod tests {
             coordinator_watermark: None,
             coordinator_genesis: None,
         }
+    }
+
+    #[test]
+    fn finished_interactive_commands_return_the_session_to_awaiting_command() {
+        for status in ["completed", "failed", "cancelled"] {
+            assert_eq!(session_status_after_projection(status, true), "awaiting_command");
+            assert_eq!(session_status_after_projection(status, false), status);
+        }
+        assert_eq!(session_status_after_projection("running", true), "running");
+        assert_eq!(session_status_after_projection("waiting_for_solve", false), "awaiting_command");
     }
 
     #[test]
