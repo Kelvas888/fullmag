@@ -2270,3 +2270,46 @@ restartu WSL ani Docker Desktop. Pierwsza próba edycji --verify-only nie
 uruchomiła się z powodu tego timeoutu; późniejszy sprawdzony zapis dodał17linii
 preflight, kończących się przed terminalizacją. Parser obu plików PASS;
 rzeczywista walidacja requestu i wszystkie efekty recovery nadal NOT VERIFIED.
+
+### Checkpoint 22.10.2026 — wykonane testy recovery i poprawiony kontrakt Stop
+
+CI head 1ece1ef41b01d64571ca5f869e389e0077eb6d34 skompilowało natywny
+runtime-service i wykonało wszystkie sześć nowych testów failed_worker_recovery:
+PASS. Szerszy filtr accepted_study_supervisor:51 PASS,1 FAIL. Jedyną odmową
+był stary test operator_stop_terminates_child_and_records_distinct_outcome:
+fixture oczekiwał natychmiastowego kill, chociaż produkcja od commita
+2fb3d3d23053339231b37e252f4f76948c654c47 obserwuje kooperatywne Stop.
+Nie zmieniono produkcji. Commit 0134a542697d2c8eca5dff90a60bb4cc428b945b
+zastępuje fixture kontrolowanym pipe-gated zakończeniem, sprawdza odebrane
+potwierdzenie i wyłączenie heartbeat po Stop; osobna regresja zachowuje
+stop_requested=true i timed_out=true dla workera, który nie współpracuje.
+Parser PASS; wykonanie zmienionych testów wymaga kolejnego CI.
+Wypchnięto też b5288a98a401a0e2927a0fec4f9d89b17be2e0aa (--verify-only).
+
+Pełny log: verification/master-integration-20261022-publication/ci-rust-1ece-full.log.
+Parser: verification/public-loop-solve-fixed-binding-20261022/cooperative-stop-fixture-parser.json.
+Rzeczywisty failed Make ma niezależny trwały MakeAttempt receipt:
+/build/failed-candidate-diagnostics/.backend-package-candidate-qc31opdm/attempt.json,
+SHA256 d24fbc668df013a4c0a9df8c5690e1957a7dd5637256c8d1ae2e5283c2e606f1,
+state=failed, exit_code=2. Log125655bajtów ma SHA256
+9917739c429a8c90a529962b1ba4356c2b2173f41b9aa3b60a2f41f6a1c0ca80.
+Obecne retained helpery nie mają kanału przyjęcia nowego kodu; przygotowywana
+jest jawna, przypięta finalizacja tej samej operacji, z domyślnym preview.
+Nie wykonano sygnałów, ręcznego zwolnienia locków, recovery claimu ani
+ponownego Solve. API i ekran symulacji nadal nieprzywrócone; E1–E12 otwarte.
+
+### Checkpoint 22.10.2026 — gotowy preview finalizacji wyłącznie failed buildu
+
+Przejrzano cały adapter, ACK, wrapper i testy. Naprawiono w przeglądzie
+reparent dziecka po exit rodzica, wspólne wykluczanie wszystkich requestów
+tej samej operacji oraz zachowanie kandydata przez RENAME_NOREPLACE.
+Niezależnie wykonano27/27 interpretowanych regresji: PASS, bez Rust/native
+unit compilation. Nie wykonano actual recovery, sygnałów ani zmiany claimu.
+Rzeczywisty preview: verification/failed-build-recovery/ad78022c285049968f0a5ea81a9d4612/3b8b60e9239c451cb82f82918c7689dd/request.json,
+rawSHA2565507b974eb97c119e4e8cdb1051840f696d054a8cd702141fe2daeb4c9113c7a.
+Dokładny zakres i ograniczenia:2026-10-22-failed-recovery-build-ad780-preview.md.
+Aktywacja pozostaje do decyzji użytkownika przed kolejnym buildem.
+CI0134 zaliczyło już runtime service sampler/control oraz jawne testy
+reaped-worker recovery; cały przebieg jeszcze trwa. API pozostaje zatrzymane,
+frontend HTTP200, proxy sessions HTTP500. Projekt9291B ma niezmieniony SHA256
+d1ce5e22d273213da0119492a95a24a46428b75a199a24dbd93dd0c216bf24de.

@@ -201,6 +201,26 @@ case "${recipe}" in
     fi
     exec "${bash_executable}" -euo pipefail -c "${recipe}"
     ;;
+  *"scripts/docker_dev_failed_build_recovery.py"*)
+    failed_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_failed_build_recovery.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --attempt '([0-9a-f]{32})'( --request '(verification/failed-build-recovery/[0-9a-f]{32}/[0-9a-f]{32}/request.json)' --request-sha256 '([0-9a-f]{64})')?( --apply)?[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${failed_build_pattern} ]]; then
+      echo "[fullmag just] invalid failed repair-build recovery recipe" >&2
+      exit 2
+    fi
+    failed_build_args=(--source-root "${BASH_REMATCH[1]}" --backend-container-id "${BASH_REMATCH[2]}"
+      --image-id "${BASH_REMATCH[3]}" --attempt "${BASH_REMATCH[4]}")
+    if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
+      failed_build_args+=(--request "${BASH_REMATCH[6]}" --request-sha256 "${BASH_REMATCH[7]}")
+    fi
+    if [[ -n "${BASH_REMATCH[8]:-}" ]]; then
+      if [[ -z "${BASH_REMATCH[5]:-}" ]]; then
+        echo "[fullmag just] failed build apply requires reviewed request pins" >&2
+        exit 2
+      fi
+      failed_build_args+=(--apply)
+    fi
+    exec "${python_cmd}" -B "${script_dir}/docker_dev_failed_build_recovery.py" "${failed_build_args[@]}"
+    ;;
   *"scripts/docker_dev_recovery_build.py"*)
     recovery_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_recovery_build.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --process-receipt-sha256 '([0-9a-f]{64})' --owner-sha256 '([0-9a-f]{64})'"
     promotion_pattern=" --promote --candidate-basename '(\.backend-package-candidate-[A-Za-z0-9._-]+)' --candidate-receipt-sha256 '([0-9a-f]{64})' --current-receipt-sha256 '([0-9a-f]{64})' --provenance-sha256 '([0-9a-f]{64})'"

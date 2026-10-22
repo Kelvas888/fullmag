@@ -156,6 +156,113 @@ class RecoveryBuildTests(unittest.TestCase):
                                    '_recover_pending_package_rotation', '_reject_partial_package_candidates'})
 
 
+class FailedMakeAcknowledgementTests(unittest.TestCase):
+    def factory(self, root, state='failed', exit_code=2):
+        candidate=root/'package'/'.development'/'candidates'/'.backend-package-candidate-failed'
+        candidate.mkdir(parents=True); (candidate/'.candidate-owner.json').write_bytes(b'marker')
+        attempt=root/'attempt';attempt.mkdir();(attempt/'attempt.json').write_bytes(b'durable waited exit')
+        record={'state':state,'exit_code':exit_code,'log_sha256':'a'*64,'log_size':17}
+        backend=SimpleNamespace(PACKAGE_ROOT=root/'package',PACKAGE_CANDIDATE_MARKER='.candidate-owner.json',
+            FAILED_MAKE_RECEIPT_NAME='attempt.json',_validate_candidate_marker=lambda *args,**kwargs:None,
+            _read_failed_make_attempt=lambda *args:(record,attempt,attempt/'log'),
+            _validated_package=lambda *args,**kwargs:('current',b'package',{}))
+        scope={'Path':Path,'backend':backend,'require':repair.require,'hashlib':hashlib,
+               'read':lambda path:path.read_bytes(),'pinned_evidence':lambda *args:{'ledger':'unchanged'}}
+        tree=ast.parse(repair.RUNTIME);function=next(node for node in tree.body
+            if isinstance(node,ast.FunctionDef) and node.name=='failed_make_result')
+        exec(compile(ast.Module(body=[function],type_ignores=[]),'<failed-make-proof>','exec'),scope)
+        return candidate,record,scope
+
+    def test_only_durable_nonzero_make_failure_is_acknowledged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate,record,scope=self.factory(Path(directory))
+            result=scope['failed_make_result']({'source_commit':'b'*40},candidate,None,{'ledger':'unchanged'},('current',b'package',{}))
+            self.assertEqual(result['state'],'failed-confirmed');self.assertEqual(result['make_exit_code'],2)
+            self.assertFalse(result['package_promoted']);self.assertFalse(result['runtime_started'])
+            for state,code in [('building',2),('succeeded',0),('failed',0),('failed',True)]:
+                record.update(state=state,exit_code=code)
+                with self.subTest(state=state,code=code),self.assertRaises(ValueError):
+                    scope['failed_make_result']({'source_commit':'b'*40},candidate,None,{'ledger':'unchanged'},('current',b'package',{}))
+
+    def test_changed_runtime_partial_publication_and_foreign_candidate_are_retained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate,_,scope=self.factory(Path(directory))
+            arguments=({'source_commit':'b'*40},candidate,None,{'ledger':'changed'},('current',b'package',{}))
+            with self.assertRaises(ValueError):scope['failed_make_result'](*arguments)
+            (candidate/'backend-build-receipt.json').write_bytes(b'partial publication')
+            with self.assertRaises(ValueError):
+                scope['failed_make_result']({'source_commit':'b'*40},candidate,None,{'ledger':'unchanged'},('current',b'package',{}))
+
+    def test_guard_releases_kernel_locks_only_after_exact_failed_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);guard=RecoveryBuildTests().guard_fixture(root)
+            result={'schema':'fullmag.docker-recovery-build-failure.v1','state':'failed-confirmed','candidate':'/candidate','make_exit_code':2}
+            guard.__globals__['failed_make_result']=lambda *args:result
+            guard.__globals__['archive_failed_make']=lambda *args:result
+            guard.__globals__['backend']._write_json=lambda path,value,label:path.write_text(json.dumps(value))
+            ready_r,ready_w=os.pipe();decision_r,decision_w=os.pipe();pid=os.fork()
+            if pid==0:
+                os.close(ready_r);os.close(decision_w)
+                try:guard({'result_path':str(root/'result.json')},ready_w,decision_r)
+                except BaseException:os._exit(2)
+                os._exit(0)
+            os.close(ready_w);os.close(decision_r)
+            try:
+                with os.fdopen(ready_r) as ready,os.fdopen(decision_w,'w') as decision:
+                    self.assertEqual(ready.readline(),'READY\n');decision.write('BEGIN\n');decision.flush()
+                    self.assertEqual(ready.readline(),'BUILDING\n');decision.write(json.dumps(result)+'\n');decision.flush()
+                    self.assertEqual(ready.readline(),'FAILED_CONFIRMED\n')
+                _,status=os.waitpid(pid,0);pid=None;self.assertEqual(os.waitstatus_to_exitcode(status),0)
+                with (root/'OWNER.lock').open('r+') as lock:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                self.assertEqual(json.loads((root/'result.json').read_text()),result)
+            finally:
+                if pid is not None:os.kill(pid,signal.SIGTERM);os.waitpid(pid,0)
+
+    def test_full_parent_and_guard_acknowledge_actual_backend_build_exception(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);guard=RecoveryBuildTests().guard_fixture(root);scope=guard.__globals__
+            backend=scope['backend']
+            class BackendBuildError(RuntimeError):
+                pass
+            backend.BackendBuildError=BackendBuildError
+            backend.PACKAGE_CANDIDATE_MARKER='.candidate-owner.json'
+            backend.FAILED_MAKE_RECEIPT_NAME='attempt.json'
+            backend._preflight_candidate_storage=lambda *args:None
+            backend._capture_start_manifest=lambda *args:root/'manifest.json'
+            backend._read_json=lambda *args:({'resolved_commit':'b'*40},None)
+            backend._toolchain_identity=lambda:(None,{})
+            backend._write_candidate_marker=lambda candidate,*args,**kwargs:(candidate/backend.PACKAGE_CANDIDATE_MARKER).write_bytes(b'marker')
+            backend._write_json=lambda path,value,*args:path.write_text(json.dumps(value))
+            backend._ensure_directory=lambda path,*args:path.mkdir(parents=True,exist_ok=True)
+            backend._fsync_owned_tree=lambda *args:None
+            backend._fsync_directory=lambda *args:None
+            attempt=root/'failed-attempt';attempt.mkdir()
+            def prepare(*args):
+                (attempt/'attempt.json').write_bytes(b'waitpid Make exit 2')
+                raise BackendBuildError('Canonical Make failed with exit 2')
+            backend._prepare_locked=prepare
+            backend._read_failed_make_attempt=lambda *args:({'state':'failed','exit_code':2,
+                'log_sha256':'a'*64,'log_size':17},attempt,attempt/'log')
+            scope.update(argparse=argparse,tempfile=tempfile,ctypes=__import__('ctypes'),
+                         read=lambda path:path.read_bytes())
+            tree=ast.parse(repair.RUNTIME)
+            functions=[node for node in tree.body if isinstance(node,ast.FunctionDef)
+                and node.name in {'inside','failed_make_result','archive_failed_make','rename_no_replace'}]
+            exec(compile(ast.Module(body=functions,type_ignores=[]),'<actual-parent-guard>','exec'),scope)
+            request={'compose_project':'test','source_root':'/test','source_commit':'b'*40,
+                     'result_path':str(root/'result.json')}
+            with patch.dict(os.environ,FULLMAG_COMPOSE_PROJECT='test',FULLMAG_SOURCE_HOST_ROOT='/test'):
+                with self.assertRaises(SystemExit) as stopped:scope['inside'](request)
+            self.assertEqual(stopped.exception.code,43)
+            proof=json.loads((root/'result.json').read_bytes())
+            self.assertEqual(proof['make_exit_code'],2)
+            self.assertTrue(Path(proof['candidate_archive']).is_dir())
+            self.assertEqual(list((root/'package'/'.development'/'candidates').iterdir()),[])
+            self.assertEqual((attempt/'attempt.json').read_bytes(),b'waitpid Make exit 2')
+            for name in ('STARTUP-GATE.lock','LAUNCH.lock','OWNER.lock','cache.lock'):
+                with (root/name).open('r+') as lock:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
+
 class RecoveryPromotionTests(unittest.TestCase):
     @contextlib.contextmanager
     def fixture(self):

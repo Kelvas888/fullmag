@@ -53,7 +53,7 @@ def validate_backend(actual, identity, backend_id, image_id):
 
 
 RUNTIME = r'''
-import argparse, contextlib, fcntl, os, stat, subprocess, sys, tempfile, time
+import argparse, contextlib, ctypes, fcntl, os, stat, subprocess, sys, tempfile, time
 sys.path.insert(0, '/opt/fullmag')
 import backend_dev as backend
 import runtime_service as runtime
@@ -172,6 +172,59 @@ def archive_superseded(request, paths, before, current):
         retained_unknown()
 
 
+def failed_make_result(request, candidate, paths, before, current):
+    # The image-owned producer commits this receipt only after process.wait().
+    # A compiler log string or a generic exception is never exit proof.
+    expected = backend.PACKAGE_ROOT/'.development'/'candidates'/candidate.name
+    require(candidate == expected, 'Failed Make candidate belongs to another package')
+    backend._validate_candidate_marker(candidate, backend.PACKAGE_ROOT, Path('/build'), state='building')
+    require(sorted(path.name for path in candidate.iterdir()) == [backend.PACKAGE_CANDIDATE_MARKER],
+            'Known failed Make acknowledgement requires an unpublished marker-only candidate')
+    attempt = backend._read_failed_make_attempt(Path('/build'), candidate)
+    require(attempt is not None and attempt[0]['state'] == 'failed'
+            and type(attempt[0]['exit_code']) is int and attempt[0]['exit_code'] != 0,
+            'Known failed Make requires its durable nonzero waited exit receipt')
+    require(pinned_evidence(request, paths) == before
+            and backend._validated_package(backend.PACKAGE_ROOT, 'unchanged failed Make package',
+                exclude_development_control=True) == current, 'Protected runtime or package changed after failed Make')
+    return {'schema': 'fullmag.docker-recovery-build-failure.v1', 'state': 'failed-confirmed',
+        'candidate': str(candidate), 'source_commit': request['source_commit'],
+        'make_exit_code': attempt[0]['exit_code'],
+        'make_attempt_sha256': hashlib.sha256(read(attempt[1]/backend.FAILED_MAKE_RECEIPT_NAME)).hexdigest(),
+        'marker_sha256': hashlib.sha256(read(candidate/backend.PACKAGE_CANDIDATE_MARKER)).hexdigest(),
+        'log_sha256': attempt[0]['log_sha256'], 'log_size': attempt[0]['log_size'],
+        'package_promoted': False, 'runtime_started': False}
+
+
+def rename_no_replace(source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = libc.renameat2
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), str(destination))
+
+
+def archive_failed_make(request, result, paths, before, current):
+    candidate = Path(result['candidate'])
+    require(failed_make_result(request, candidate, paths, before, current) == result,
+            'Failed Make proof changed before archive')
+    destination = candidate.parent.parent/'quarantine'/candidate.name
+    backend._assert_no_links(destination, 'failed candidate archive')
+    backend._ensure_directory(destination.parent, 'failed candidate quarantine')
+    backend._fsync_owned_tree(candidate, 'failed candidate before archive')
+    rename_no_replace(candidate, destination)
+    backend._fsync_directory(candidate.parent, 'failed candidate source')
+    backend._fsync_directory(destination.parent, 'failed candidate archive')
+    require(hashlib.sha256(read(destination/backend.PACKAGE_CANDIDATE_MARKER)).hexdigest()
+            == result['marker_sha256'], 'Archived candidate marker differs')
+    require(pinned_evidence(request, paths) == before
+            and backend._validated_package(backend.PACKAGE_ROOT, 'unchanged archived failure package',
+                exclude_development_control=True) == current, 'Runtime or package changed during failed archive')
+    return {**result, 'candidate_archive': str(destination)}
+
+
 def guard(request, ready_fd, decision_fd):
     with runtime_locks(build_lock=False) as paths:
         before = pinned_evidence(request, paths)
@@ -203,6 +256,13 @@ def guard(request, ready_fd, decision_fd):
                     line = decisions.readline(4096)
                     require(line.endswith('\n'), 'Repair build completion missing')
                     result = json.loads(line)
+                    if result.get('schema') == 'fullmag.docker-recovery-build-failure.v1':
+                        expected = failed_make_result(request, Path(result['candidate']), paths, before, current)
+                        require(result == expected, 'Failed Make acknowledgement differs from its durable proof')
+                        result = archive_failed_make(request, result, paths, before, current)
+                        backend._write_json(Path(request['result_path']), result, 'known failed Make result')
+                        ready.write('FAILED_CONFIRMED\n'); ready.flush()
+                        return
                     require(set(result) == {'candidate', 'receipt_sha256'}, 'Invalid repair acknowledgement')
                     candidate = Path(result['candidate'])
                     backend._validate_candidate_marker(candidate, backend.PACKAGE_ROOT, Path('/build'), state='ready')
@@ -260,6 +320,7 @@ def inside(request):
         candidate = Path(tempfile.mkdtemp(prefix='.backend-package-candidate-',
                          dir=control_root/backend.PACKAGE_CANDIDATES_DIRNAME))
         backend._write_candidate_marker(candidate, package, build_root, state='building')
+        before_build = pinned_evidence(request, runtime.canonical_paths())
         began = True
         decision.write('BEGIN\n'); decision.flush()
         require(ready.readline(64) == 'BUILDING\n', 'Runtime guard build handoff unknown')
@@ -277,6 +338,20 @@ def inside(request):
         backend._write_json(Path(request['result_path']), result, 'repair build result')
         print('recovery-build: ready-candidate ' + json.dumps(result, sort_keys=True), flush=True)
     except BaseException as error:
+        if began and isinstance(error, backend.BackendBuildError):
+            try:
+                result = failed_make_result(request, candidate, runtime.canonical_paths(),
+                    before_build, current)
+            except BaseException:
+                # Missing, successful, malformed or uncertain Make proof retains guards.
+                pass
+            else:
+                decision.write(json.dumps(result) + '\n'); decision.flush(); decision.close()
+                require(ready.readline(64) == 'FAILED_CONFIRMED\n', 'Failed Make guard ACK unknown')
+                _, status = os.waitpid(pid, 0)
+                require(os.waitstatus_to_exitcode(status) == 0, 'Failed Make guard release unknown')
+                print('recovery-build: known-failed-Make ' + json.dumps(result, sort_keys=True), flush=True)
+                raise SystemExit(43)
         if not began:
             print('recovery-build: refused before Make: ' + str(error), flush=True)
             decision.write('ABORT\n'); decision.flush(); decision.close()
@@ -483,6 +558,18 @@ def run(args):
             operation['logger'].stdin.write(chunk); operation['logger'].stdin.flush()
             mirror_console(chunk)
         code = process.wait()
+        if code == 43:
+            result = control.read(operation['root'] + '/result.json')
+            require(result.get('schema') == 'fullmag.docker-recovery-build-failure.v1'
+                    and result.get('state') == 'failed-confirmed'
+                    and type(result.get('make_exit_code')) is int and result['make_exit_code'] != 0
+                    and result.get('source_commit') == inputs['source_commit']
+                    and result.get('package_promoted') is False and result.get('runtime_started') is False,
+                    'Failed Make has no exact acknowledged terminal result')
+            operation['daemon_pending'] = False
+            operation['receipt'].update(state='failed-confirmed', image_id=args.image_id, failure=result)
+            raise BuildControlError('Canonical repair Make failed with known exit '
+                                    + str(result['make_exit_code']) + '; candidate and evidence preserved')
         if code == 42:
             operation['daemon_pending'] = False
             operation['receipt']['state'] = 'failed-confirmed'
