@@ -63,39 +63,54 @@ sesją, a sandbox przechwytywania i tak blokuje gniazda.
 
 ### 4.1 Transport
 
-- HTTP JSON przez httpx; API synchroniczne (`Client`) i asynchroniczne
-  (`AsyncClient`) o tym samym kształcie.
+- Wyłącznie biblioteka standardowa (`http.client`), bez nowych zależności
+  runtime: `fm.connect()` działa w każdym środowisku z pakietem `fullmag`,
+  także w obrazie Docker. API jest synchroniczne (`fullmag.client.Client`).
+- Jedno trwałe połączenie HTTP/1.1 na wątek, więc synchronizacja po każdym
+  wywołaniu DSL nie płaci za nowe połączenie TCP.
 - Bazowy URL to origin frontendu grupy DEV, który przekazuje `/v2/*` i
-  WebSocket do API. Domyślnie loopback; inny host wymaga jawnego argumentu.
-- Nagłówki: `x-fullmag-session-scope` po pierwszym odczycie sesji;
-  `Authorization: Bearer` tylko gdy podano token.
-- Odrzucenie przez `development_admission` (handoff backendu) jest ponawiane
-  z backoffem i limitem czasu.
-- Zależności jako dodatek `fullmag[client]`; import `fullmag` bez dodatku
-  nie wymaga httpx, a `fm.connect()` bez dodatku zgłasza czytelny błąd.
+  WebSocket do API. Kolejność: argument `url`, `FULLMAG_URL`,
+  `http://127.0.0.1:3197`. Token z argumentu lub `FULLMAG_TOKEN`, wysyłany
+  wyłącznie jako `Authorization: Bearer`.
+- Nagłówek `x-fullmag-session-scope` jest wysyłany tylko do operacji, które go
+  deklarują, i tylko gdy klient zna zakres sesji.
+- Ponawiane są wyłącznie żądania, które na pewno nie zostały zastosowane:
+  nieudane nawiązanie połączenia, zamknięte bezczynne połączenie keep-alive,
+  502 z proxy frontendu oraz 409 `development_restart_in_progress`, z
+  backoffem do budżetu `retry_budget_s` (domyślnie 60 s). GET dodatkowo przy
+  503/504. Komendy przy ponowieniu zachowują ten sam `client_intent_id`.
 
 ### 4.2 Modele
 
-- Generowane z `openapi-v2.json` dla tagów: sessions, model (authoring),
-  simulation (commands, runs, stages), data, events, persistence
-  (checkpoints).
-- Generator i podzbiór tagów są zapisane w recepcie uruchamianej przez
-  `just docker-dev-codegen`; wynik leży w
-  `packages/fullmag-py/src/fullmag/client/_generated/` i jest commitowany.
-- Test kontraktowy porównuje listę wygenerowanych schematów ze specyfikacją.
+- `scripts/generate_python_api_models.py` generuje z `openapi-v2.json`
+  domknięcie schematów operacji używanych przez klienta (lista
+  `OPERATION_IDS`): `TypedDict`-y, tabele `REQUIRED_FIELDS` i
+  `DISCRIMINATED_UNIONS` do walidacji w czasie działania oraz tabelę operacji.
+  Dokumenty sceny (`SceneResource` i pokrewne) są nieprzezroczyste
+  (`Dict[str, Any]`), bo tworzą je kanoniczne konwertery DSL.
+- Wynik leży w `packages/fullmag-py/src/fullmag/client/_generated/` i jest
+  commitowany. Generator uruchamiają `pnpm run generate:api` oraz
+  `just docker-dev-codegen`; bramka `generated-api-determinism` i test
+  `test_generated_models_are_current` wykrywają nieaktualne modele.
+- Klient wywołuje operacje wyłącznie przez tabelę: nieznana operacja,
+  parametr zapytania lub brak parametru ścieżki to błąd przed wysłaniem;
+  ciało żądania przechodzi kontrolę pól wymaganych i dyskryminatora `kind`.
 
 ### 4.3 Błędy
 
 | Odpowiedź serwera | Wyjątek |
 |---|---|
-| 409 `scene_stale_revision` | `StaleRevisionError(expected, actual)` |
+| 409 `revision_conflict` | `StaleRevisionError` |
 | 409 `accepted_execution_input_locked` lub edycja podczas biegu bez pauzy | `InputLockedError` |
 | 409 sesja istnieje bez `replace_current` | `SessionExistsError` |
-| 4xx walidacji | `ValidationError` z polami z odpowiedzi |
-| komenda `Rejected` / `Failed` | `CommandFailedError(command_id, reason)` |
-| brak połączenia | `ConnectionError` z adresem i wskazówką o grupie DEV |
+| 409 `development_restart_in_progress` po wyczerpaniu budżetu | `DevelopmentRestartError` |
+| 400 / 404 / 422 | `ValidationError` / `NotFoundError` / `UnsupportedCapabilityError` |
+| komenda `rejected` / `failed` / zakończona jako `cancelled` | `CommandFailedError` |
+| przekroczony czas oczekiwania na komendę | `CommandTimeoutError` |
+| niepoprawny payload lokalnie | `RequestValidationError` |
+| brak połączenia | `FullmagConnectionError` z adresem i wskazówką o grupie DEV |
 
-Klient nie ponawia transakcji po `StaleRevisionError` automatycznie. Sesja
+Wszystkie dziedziczą po `FullmagClientError`. Klient nie ponawia transakcji po `StaleRevisionError` automatycznie. Sesja
 jest współdzielona z Control Room (ADR 0068, pytanie 4), więc konflikt
 oznacza zmianę wprowadzoną przez inną stronę i trafia do użytkownika.
 
@@ -186,15 +201,23 @@ przez `fullmag skrypt.py` jak dziś (`capture`).
 
 ## 6. Dane
 
-- Dekoder FMVP w czystym Pythonie z numpy (`fullmag.client.fmvp`),
-  przeniesiony z dekodera Control Room (`kernel/api/binaryDecode*`).
-- `fm.field(q).to_numpy()` i uchwyty wielkości (`fm.m.to_numpy()`) zwracają
-  tablicę `(…, 3)` w jednostkach SI z metadanymi siatki (FDM: kształt komórek
-  i rozmiar; FEM: węzły/elementy).
-- Cache po ETag/`If-None-Match`; brak zmiany rewizji oznacza brak transferu.
-- Tabele: `rows.bin` → numpy; `to_pandas()` tylko gdy pandas jest dostępny.
-- Zgodność: wspólne próbki binarne w `packages/fullmag-py/tests/fixtures/fmvp/`
-  dekodowane identycznie przez dekoder TS i Python.
+- Dekoder FMVP v2–v6 w Pythonie z numpy (`fullmag.client.fmvp`) zachowuje
+  wszystkie kontrole dekodera Control Room (`fieldVectorCodec.ts`,
+  `artifactFieldVectorCodec.ts`); FMTB (`rows.bin`) dekoduje
+  `fullmag.client.fmtb`.
+- `FieldVector.to_numpy()` zwraca tablicę `(point_count, n_comp)` w
+  jednostkach SI; `as_grid()` dla pola FDM pełnej domeny zwraca
+  `(nz, ny, nx, n_comp)` (x zmienia się najszybciej, jak w silniku FDM);
+  `as_complex()` łączy pary (re, im).
+- `client.data.read_field(q)` korzysta z ETag/`If-None-Match`: brak zmiany
+  (304) zwraca poprzednio zdekodowany obiekt bez transferu; 202 jest
+  odpytywane do limitu czasu, 204 zwraca `None`.
+- `client.data.read_table(id, columns=...)` zwraca `TableRows` z numpy;
+  `to_pandas()` tylko gdy pandas jest dostępny.
+- Zgodność: próbki w `packages/fullmag-py/tests/fixtures/fmvp/` powstają z
+  enkoderów odwzorowujących `field_store.rs` bajt w bajt; dekoduje je test
+  Pythona i `fieldVectorCodec.fixtures.test.ts`, porównując z jednym
+  `expected.json`.
 
 ## 7. Zdarzenia
 
@@ -244,8 +267,8 @@ przechodzi niejawnie na CPU.
 | Faza | Zakres | Kryterium |
 |---|---|---|
 | F0 | ADR 0068 i ta spec | zrobione: decyzje przyjęte 22.10.2026 |
-| F1 | `fullmag.client`: transport, modele generowane, błędy, komendy, ponawianie przy handoffie | testy pytest na nagranych odpowiedziach + test zgodności ze spec, bez kompilacji Rusta |
-| F2 | dekoder FMVP, `to_numpy()`, tabele, cache ETag | identyczne tablice z dekoderem TS na wspólnych próbkach |
+| F1 | `fullmag.client`: transport, modele generowane, błędy, komendy, ponawianie przy handoffie | zrobione: `test_live_client_core.py` na prawdziwym serwerze HTTP w procesie, kontrola aktualności modeli, job CI `python-live-client-contracts` |
+| F2 | dekoder FMVP, `to_numpy()`, tabele, cache ETag | zrobione: `test_live_client_data.py` i `fieldVectorCodec.fixtures.test.ts` dają identyczne wyniki na wspólnych próbkach |
 | F3 | tryb `live` w `world.py`: `fm.connect`/`FULLMAG_URL`, natychmiastowa synchronizacja, reguła tożsamości, `transaction()`, akcje, `paused()`, `export_script()` | skrypt z §5.1 uruchomiony przez `python` buduje scenę w grupie DEV, relax + run działają, `m` wraca jako numpy; eksport odtwarza scenę (round-trip); ten sam skrypt w trybach `eager` i `capture` działa jak przed zmianą |
 | F4 | subskrybent WebSocket, `fm.on()`, `fm.run_until()`, dodatek Jupyter | wznowienie po zerwaniu połączenia, pomiar narzutu `run_until` |
 | F5 | zmiany backendu z §9 | testy kontraktowe API i dowód runtime w grupie DEV dla każdej deklarowanej ścieżki |
