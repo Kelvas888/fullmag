@@ -2773,3 +2773,23 @@ Logi: `prestart-writer-red.log`, `prestart-writer-green.log` oraz
 To domknięcie już zatwierdzonego przypadku prestart, bez nowego rodzaju
 recovery, zmiany polityki lub dodatkowej próby startu. Usługi nadal zatrzymane;
 0 nowych startów i Solve na tym checkpointcie.
+
+
+### Potwierdzone recovery i domknięcie recepty `just`
+
+Reconciliation zakończył się rzeczywistym `failed-confirmed`; właściciel
+poprzedniej operacji zwolnił lease własną ścieżką. Terminal SHA256:
+`a0e9a98b77d549fce8f41042e49f6fb87c6663f55e5d76533eb400d6c0ba2b95`.
+Dowód: `confirmed-prestart-failure.json` w katalogu verification powyżej.
+Nie uruchomiono usług ani nowego Solve.
+
+Pierwsze wywołanie resume zostało odrzucone przez parser powłoki `just`
+przed dispatch: brakowało przekazania zatwierdzonej pary pinów prestart.
+Regresja odtwarza błąd przed poprawką. Parser przyjmuje teraz wyłącznie
+pełną parę UUID/SHA256 razem z `--restart-backend`, przekazaną jako osobne
+argumenty bez eval. Niepełne pary, błędny hash i obce argumenty pozostają
+odrzucone. Składnia bash oraz wszystkie 14 interpretowanych testów defaults
+PASS; logi `prestart-just-forwarding-red.log` i
+`prestart-just-forwarding-green.log` w control volume. To uzupełnienie
+integracji tej samej zatwierdzonej operacji. Dokładnie jedna rzeczywista
+próba startu 3203 nadal pozostaje do wykonania; 0 nowych Solve.
