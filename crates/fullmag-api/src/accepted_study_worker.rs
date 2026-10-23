@@ -3380,6 +3380,11 @@ fn apply_accepted_start_effect(
         return publish_worker_stopped(store, claim, control_result);
     }
     let published = retry_store_writer_busy(|| {
+        // Hold one (re-entrant) writer lease across the whole publication.
+        // Its CAS puts and catalog append are separate transactions; on a
+        // slow store a busy writer between them restarted the publication
+        // from scratch until the retry budget ran out.
+        let _publication = store.write_transaction()?;
         fullmag_runtime_control::publish_study_outputs(
             store,
             accepted,
