@@ -2,8 +2,6 @@
 use anyhow::{bail, Context, Result};
 use fullmag_application::{AcceptedPreparationReceipt, CoordinatorCheckpoint, ProjectId, RunId, TaskLifecycle, WorkerEvent};
 use fullmag_session::{FmsTaskLifecycle, SessionStore};
-use std::fs::File;
-use std::io::Read;
 
 fn exact_attempt(actual_attempt: Option<&str>, actual_epoch: Option<u64>, attempt: &str, epoch: u64) -> Result<()> {
     if epoch == 0 || actual_attempt != Some(attempt) || actual_epoch != Some(epoch) {
@@ -49,18 +47,8 @@ fn read_saved_inspection<T>(
     attempt_id: &str, epoch: u64, expected_object: &str,
     build: impl FnOnce(serde_json::Value, &[u8], usize, &fullmag_authoring::StudyStep) -> Result<T>,
 ) -> Result<T> {
-    let lock_path = store.root().join("WRITER.lock");
-    let metadata = std::fs::symlink_metadata(&lock_path)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        bail!("inspection cold-load writer descriptor is not a regular file");
-    }
-    let descriptor = File::open(&lock_path)?;
-    descriptor.try_lock_shared().context("inspection cold-load requires no active store writer")?;
-    let mut lock_bytes = Vec::new();
-    descriptor.try_clone()?.take(128).read_to_end(&mut lock_bytes)?;
-    if lock_bytes != b"fullmag.writer.lock.v1\n" {
-        bail!("inspection cold-load writer descriptor identity mismatch");
-    }
+    let transaction = store.read_transaction()
+        .context("inspection cold-load requires a valid shared store snapshot")?;
     let catalog = store.read_run_catalog(run.as_str())?.context("inspection run catalog missing")?;
     let task = catalog.tasks.iter().find(|task| task.task_id == task_id).context("inspection task missing")?;
     if task.lifecycle != FmsTaskLifecycle::Succeeded { bail!("inspection task is not succeeded"); }
@@ -86,7 +74,8 @@ fn read_saved_inspection<T>(
     exact_attempt(Some(claim.attempt_id.as_str()), Some(claim.ownership_epoch.value()), attempt_id, epoch)?;
     // The shared lock replaces only the writer acquisition. This existing replay
     // validates the same causal transitions and current catalog without repairs.
-    let recovered = crate::recover_coordinator_locked(store, &claim)?;
+    let recovered = crate::recover_coordinator_with_journal(store, &claim, ||
+        store.read_coordinator_journal_readonly(run.as_str(), &transaction))?;
     if recovered.coordinator.task().lifecycle != TaskLifecycle::Succeeded
         || !recovered.events.iter().any(|event| matches!(&event.event, WorkerEvent::Completed { .. })) {
         bail!("inspection cold-load requires exact durable successful Completed");
@@ -127,20 +116,6 @@ fn read_saved_inspection<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn shared_cold_descriptor_excludes_writer_without_changing_bytes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("WRITER.lock");
-        std::fs::write(&path, b"fullmag.writer.lock.v1\n").unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let reader = File::open(&path).unwrap();
-        reader.try_lock_shared().unwrap();
-        let writer = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
-        assert!(writer.try_lock().is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        drop(reader);
-        writer.try_lock().unwrap();
-    }
     #[test]
     fn current_attempt_and_epoch_are_both_required() {
         assert!(exact_attempt(Some("a"), Some(2), "a", 2).is_ok());

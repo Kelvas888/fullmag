@@ -33,7 +33,7 @@ use crate::repository_path::{
 };
 use crate::solution_set_catalog::SolutionSetCatalog;
 use crate::types::*;
-use crate::writer::{WriteTransaction, Writer};
+use crate::writer::{ReadTransaction, WriteTransaction, Writer};
 
 const MAX_TASK_ADMISSION_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_JOB_SUBMISSION_BYTES: usize = 64 * 1024;
@@ -308,6 +308,11 @@ impl SessionStore {
     /// Bind a multi-file operation to one native writer lease.
     pub fn write_transaction(&self) -> Result<WriteTransaction> {
         self.writer.acquire()
+    }
+
+    /// Fence a consistent read without creating files or changing writer ownership.
+    pub fn read_transaction(&self) -> Result<ReadTransaction> {
+        ReadTransaction::acquire(&self.root)
     }
 
     // ── Sessions ───────────────────────────────────────────────────────
@@ -3169,6 +3174,16 @@ impl SessionStore {
     ) -> Result<Vec<FmsCoordinatorJournalEntry>> {
         validate_store_id(run_id)?;
         let _lease = self.write_transaction()?;
+        self.read_coordinator_journal_unlocked(run_id)
+    }
+
+    /// Read under the caller's shared fence, including nested cold integrity checks.
+    pub fn read_coordinator_journal_readonly(
+        &self,
+        run_id: &str,
+        transaction: &ReadTransaction,
+    ) -> Result<Vec<FmsCoordinatorJournalEntry>> {
+        transaction.require_root(&self.root)?;
         self.read_coordinator_journal_unlocked(run_id)
     }
 
@@ -11410,4 +11425,50 @@ mod admission_tests {
             .is_err());
     }
 
+}
+
+#[cfg(test)]
+mod read_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn read_transaction_reuses_shared_fence_without_owner_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        store.commit_run_catalog(&FmsRunCatalog {
+            schema_version: FMS_RUN_CATALOG_SCHEMA.into(),
+            run_id: "run-read".into(), revision: 1,
+            updated_at: chrono::Utc::now(), tasks: Vec::new(),
+        }).unwrap();
+        let lock_before = fs::read(store.root().join("WRITER.lock")).unwrap();
+        let owner_before = fs::read(store.root().join("WRITER.owner.json")).unwrap();
+        let other = SessionStore::open_existing(store.root()).unwrap();
+        let first = store.read_transaction().unwrap();
+        let second = other.read_transaction().unwrap();
+        for _ in 0..2 {
+            assert!(store.read_coordinator_journal_readonly("run-read", &first).unwrap().is_empty());
+            assert!(other.read_coordinator_journal_readonly("run-read", &second).unwrap().is_empty());
+        }
+        assert!(other.write_transaction().err().unwrap().is::<crate::StoreWriterBusy>());
+        assert_eq!(fs::read(store.root().join("WRITER.lock")).unwrap(), lock_before);
+        assert_eq!(fs::read(store.root().join("WRITER.owner.json")).unwrap(), owner_before);
+        drop(first);
+        assert!(other.write_transaction().is_err());
+        drop(second);
+        assert_eq!(fs::read(store.root().join("WRITER.owner.json")).unwrap(), owner_before);
+        let writer = other.write_transaction().unwrap();
+        assert!(store.read_transaction().is_err());
+        drop(writer);
+        assert!(store.read_transaction().is_ok());
+    }
+
+    #[test]
+    fn read_transaction_rejects_another_store_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = SessionStore::open(directory.path().join("first")).unwrap();
+        let second = SessionStore::open(directory.path().join("second")).unwrap();
+        let transaction = first.read_transaction().unwrap();
+        let error = second.read_coordinator_journal_readonly("run-read", &transaction).unwrap_err();
+        assert!(error.to_string().contains("another store"));
+    }
 }

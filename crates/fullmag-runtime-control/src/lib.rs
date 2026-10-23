@@ -352,6 +352,15 @@ pub fn recover_coordinator(
 
 /// Caller already holds this store handle's native writer.
 pub(crate) fn recover_coordinator_locked(store: &SessionStore, claim: &fullmag_application::TaskClaim) -> Result<RecoveredCoordinator> {
+    recover_coordinator_with_journal(store, claim, || store.read_coordinator_journal(claim.run_id.as_str()))
+}
+
+// Both writer recovery and shared cold reads replay the same validated causal chain.
+fn recover_coordinator_with_journal(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    read_journal: impl FnOnce() -> Result<Vec<fullmag_session::FmsCoordinatorJournalEntry>>,
+) -> Result<RecoveredCoordinator> {
     let catalog = store
         .read_run_catalog(claim.run_id.as_str())?
         .context("coordinator recovery requires a run catalog")?;
@@ -392,7 +401,7 @@ pub(crate) fn recover_coordinator_locked(store: &SessionStore, claim: &fullmag_a
         None
     };
     let mut transitions = Vec::new();
-    for entry in store.read_coordinator_journal(claim.run_id.as_str())? {
+    for entry in read_journal()? {
         if entry.task_id != claim.task_id.as_str()
             || entry.attempt_id != claim.attempt_id.as_str()
             || entry.ownership_epoch != claim.ownership_epoch.value()
@@ -950,5 +959,16 @@ mod tests {
             .unwrap();
         assert_eq!(catalog.tasks[0].lifecycle, FmsTaskLifecycle::Cancelled);
         store.release_resource_lease(&durable_lease).unwrap();
+        let owner_before = std::fs::read(store.root().join("WRITER.owner.json")).unwrap();
+        let catalog_before = std::fs::read(store.root().join(format!("runs/{}/run_catalog.json", claim.run_id.as_str()))).unwrap();
+        let transaction = store.read_transaction().unwrap();
+        // The writer getter conflicts with this shared snapshot: cold replay must use the guarded reader.
+        assert!(store.read_coordinator_journal(claim.run_id.as_str()).is_err());
+        let shared = recover_coordinator_with_journal(&store, &current_claim, ||
+            store.read_coordinator_journal_readonly(claim.run_id.as_str(), &transaction)).unwrap();
+        assert_eq!(shared.coordinator.task().lifecycle, TaskLifecycle::Cancelled);
+        assert_eq!(shared.coordinator.checkpoint(), stopping.checkpoint());
+        assert_eq!(std::fs::read(store.root().join("WRITER.owner.json")).unwrap(), owner_before);
+        assert_eq!(std::fs::read(store.root().join(format!("runs/{}/run_catalog.json", claim.run_id.as_str()))).unwrap(), catalog_before);
     }
 }

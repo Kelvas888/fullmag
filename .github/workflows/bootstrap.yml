@@ -111,6 +111,13 @@ jobs:
                   f"FULLMAG_PROJECT_STORAGE_ROOT={layout['storage_root']}\n"
               )
           PY
+      - name: Run shared accepted-inspection read contracts
+        run: |
+          cargo test -p fullmag-session --lib read_transaction
+          cargo test -p fullmag-runtime-control --lib accepted_task_stop_is_durable_idempotent_and_terminal_after_stopped_event
+          cargo test -p fullmag-runtime-control --lib failed_no_spawn_stop_without_start_preserves_public_stop_fence_and_replays
+          cargo test -p fullmag-runtime-control --lib study_inspection_integrity
+
       - name: Run accepted explicit Compute start-gate contracts
         run: |
           cargo test -p fullmag-session --lib accepted_start_gate

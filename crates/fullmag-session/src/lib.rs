@@ -85,4 +85,4 @@ pub use task_cancellation::{
     TaskCancellationIntentCommitDisposition, TaskCancellationIntentConflict,
 };
 pub use types::*;
-pub use writer::{StoreWriterBusy, WriteTransaction};
+pub use writer::{ReadTransaction, StoreWriterBusy, WriteTransaction};

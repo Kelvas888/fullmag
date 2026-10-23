@@ -2460,3 +2460,45 @@ witness `1657520264ae324b0fb962f99703ad3774468d0cbc38fd551d5d57c859b149b3`,
 zero aktywnych rezerwacji. To dowody kontroli i przygotowania, nie przywrócenia
 API ani wyniku naukowego. Po usunięciu aktualnego namespace automatyczne resume
 tej nowej ścieżki pozostaje celowo niedopuszczone bez dodatkowych dowodów.
+
+
+### Checkpoint 23.10.2026 — pierwszy udany publiczny Solve anteny
+
+Pakiet6282750e916a17be4487925cc42f59520b433d54 osiągnął Ready w stałym
+backendzie6172ba4376f431b2347f4946300bc2de6905470fae64da434d90d5df07d17592
+grupy anteny WSL. Próba development4f5f21c2dc754f02b9135ae3a88bed6e
+zakończyła się succeeded; Make1006038ms, exit0, walidacja24 plików PASS.
+GPU było dostępne, a auto dobrało86-real. CI39916099736:12 wykonanych
+jobów PASS,9 opcjonalnych SKIPPED; nie jest to kwalifikacja naukowa.
+
+Publiczne authoring→session→replace_scene→jeden Solve wykonało pełny obwód
+3D bez magnetyzacji, Relax ani Run. Run
+`run-live-b0ccf5c3ba49833e9f1ac1c6ee5102cd065f4ad3843ac364e911de15866b94a4`
+ma trwałe Succeeded/Completed, task
+`task-8770ba4c63465cf0459c7acfa5cf035f4a3f7d1f109930663563715b50c8a13e`,
+attempt `attempt-c8a4fe2dd2b1413a80f4ecc96bc419af`, epoch1.
+Zapisano bundle6824037B, CAS
+`fd5edd5783f7b018559ccd589ceb6ae59c3f8a89b240da9f8ab01a7e7ed8ec62`.
+Wszystkie22 payloady przeszły niezależne sprawdzenie długości i SHA256.
+Native wykonywało się około82s; to inspekcja, nie kwalifikowana baza.
+
+Wynik użytkownika pozostaje w examples pod unikalnym
+`fem_antenna_closed_loop_nonmagnetic.6282750e9-58339272576148329020bdf72a3f7d24.zarr`.
+Oryginalny skrypt i plikFMS zachowano. Dowody HTTP i wejścia są w named volume
+frontendu pod `verification/public-antenna-6282750e9-c4a3d6eb8e9c4416b70df7642e2d1435`.
+
+Odczyt przez starsze endpointy external-lead był błędnym wyborem. Istniejący
+wspólny provider accepted obsługuje typed closed-loop przez
+`/v2/sessions/current/data/fields?stage_id=script-execution-2df97d99b6b88a3c58d0b135696e390a819e720b84d6311f4f6d0a62a8969bec`.
+Ten rzeczywisty GET wykazał osobny409: shared cold lock jest utrzymywany,
+ale replay journal próbuje pobrać exclusive writer. To deterministyczny
+konflikt wewnątrz jednego odczytu, nie brak wyniku ani potrzeba nowego Solve.
+Poprawka dodaje jawny ReadTransaction i guarded journal z tym samym parserem
+i tym samym replay. Nie zmienia równań, tolerancji, CAS ani progów akceptacji.
+Regresje sprawdzają wykluczenie writerów, zgodność root, niezmienność ownera
+i descriptoru oraz replay pod blokadą współdzieloną; wykonanie Rust pozostaje
+w autoryzowanym CI. Nowy build, cold-read HTTP i UI nadal NOT VERIFIED.
+
+Przeglądarka zgłosiła tab7 na3203, ale auto-review odrzucił jej otwarcie,
+przypisując origin3202. Nie użyto innej przeglądarki ani obejścia.
+Widoczny canvas i końcowa kwalifikacja E1–E12 pozostają otwarte.
