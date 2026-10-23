@@ -2573,3 +2573,20 @@ Użytkownik zatwierdził zastąpienie wyłącznie zakończonej obserwacji3203,
 zachowanie wszystkich70 plików i historii, zarządzany build oraz odtworzenie
 sceny bez kolejnego Solve. Istniejący saved-authoring probe wymaga jednak
 Windows storage i pustej historii; trwa weryfikacja właściwej trasy WSL.
+
+
+23.10.2026 — użytkownik jawnie zatwierdził patch bramki restartu WSL
+`db889d5572d26f3bd60a4f7d6ec53d89402caca6c938bfb572f533694cec59e8`.
+Zastosowano dokładne bajty: źródło przed
+`3f271fdb495245b8ba85a867e62cf82b275a1417f3109776aa6610e25ecaf7d5`,
+po `294b35edf135e084fa1ce435faad44d28048d9bd4dbf11460aa1a2d72d294aaa`.
+25 testów offline dotyczy identycznego proponowanego źródła. Nowy test
+historii włączono do bootstrap CI. Restart i build pozostają do rzeczywistej
+weryfikacji; nie oznaczono ich jako wykonanych. Autoryzacja zachowuje70
+plików, całą historię i scenę, bez ponownego Solve.
+CI39936822692 dla009a7ac52e96d263f2c5c6db538f8a63b720e8aa:12PASS,9SKIPPED;
+pełna regresja v4 eksportu i trzy regresje pustych wejść rzeczywiście wykonane.
+Pełny log16383903B, SHA256
+`b6d5f228c2c84a6354ad1cfeef036d505e40cf82097b18325d6fc727df31cf49`
+w `verification/shared-inspection-read-20261023/rust-contracts-009a7ac52.log`
+w wolumenie kontrolnym grupy.
