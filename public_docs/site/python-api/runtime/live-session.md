@@ -61,37 +61,31 @@ Tolerances keep the units of {doc}`../studies/relaxation`. Other parameters are 
 
 ### Complete live example
 
-```python
-# %% Connect to a running DEV group (or set FULLMAG_URL)
-import fullmag as fm
+A live session is typed into a running Python interpreter or Jupyter kernel,
+so it is shown as an interactive transcript. It needs a running DEV group and
+is not executed by the documentation build.
 
-fm.connect("http://127.0.0.1:3197")
-
-# %% Each statement is committed to the live session immediately
-fm.engine("fdm")
-fm.device("cpu")
-fm.cell(5e-9, 5e-9, 10e-9)
-fm.solver(fix_dt=1e-13)  # executable stages need an explicit timestep
-layer = fm.geometry(fm.Box(400e-9, 100e-9, 10e-9), name="layer")
-layer.Ms = 800e3
-layer.Aex = 13e-12
-layer.alpha = 0.02
-layer.m = fm.texture.uniform(1, 0.1, 0)
-
-# %% Actions become runtime commands; results come back as numpy
-fm.relax(dt=1e-13, tolT=1e-5, max_steps=20_000)
-print(fm.m.average())
-m = fm.field("m").to_numpy()
-
-# %% Several edits as one transaction, then dynamics
-with fm.transaction():
-    fm.b_ext(0.02, 0.0, 0.0)
-    layer.alpha = 0.01
-fm.run(1e-9)
-print(fm.export_script())
+```pycon
+>>> import fullmag as fm
+>>> fm.connect("http://127.0.0.1:3197")   # or set FULLMAG_URL
+>>> fm.engine("fdm")                       # each statement is committed at once
+>>> fm.device("cpu")
+>>> fm.cell(5e-9, 5e-9, 10e-9)
+>>> fm.solver(fix_dt=1e-13)                # executable stages need an explicit timestep
+>>> layer = fm.geometry(fm.Box(400e-9, 100e-9, 10e-9), name="layer")
+>>> layer.Ms, layer.Aex, layer.alpha = 800e3, 13e-12, 0.02
+>>> layer.m = fm.texture.uniform(1, 0.1, 0)
+>>> fm.relax(dt=1e-13, tolT=1e-5, max_steps=20_000)   # a runtime command
+>>> fm.m.average()                         # results come back as numpy
+>>> m = fm.field("m").to_numpy()
+>>> with fm.transaction():                 # several edits, one revision
+...     fm.b_ext(0.02, 0.0, 0.0)
+...     layer.alpha = 0.01
+>>> fm.run(1e-9)
+>>> print(fm.export_script())
 ```
 
-The same example is shipped as `examples/live_session_basics.py`.
+The same session is shipped as the script `examples/live_session_basics.py`.
 
 (python-api-runtime-live-session-problem-ir)=
 <!-- (problem-ir)= -->
