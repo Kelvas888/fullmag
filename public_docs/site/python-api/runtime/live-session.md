@@ -59,8 +59,39 @@ Tolerances keep the units of {doc}`../studies/relaxation`. Other parameters are 
 | `fm.field(quantity)` | `str` | `required` | field SI unit | quantity id of the session catalog | Current samples as `numpy` | FEM/FDM CPU/GPU | none (read) |
 | `fm.sweep(function, groups=[...], **lists)` | callable, `list[str]` | `required` | $1$ | distinct group URLs; equal-length lists | Run points across several DEV groups | FEM/FDM CPU/GPU | one session per group |
 
+### The model as a stage-first study
+
+Live mode programs the same model that a batch script authors. The batch form
+below is executed by the documentation build; `fullmag script.py` captures its
+stages and runs them in order:
+
+```python
+# %% Model
+import fullmag as fm
+
+study = fm.study("live_session_basics")
+study.engine("fdm")
+study.device("cpu", precision="double")
+study.cell(5e-9, 5e-9, 10e-9)
+study.solver(fix_dt=1e-13)
+
+layer = study.geometry(fm.Box(size=(400e-9, 100e-9, 10e-9), name="layer"), name="layer")
+layer.Ms = 800e3
+layer.Aex = 13e-12
+layer.alpha = 0.02
+layer.m = fm.texture.uniform(1, 0.1, 0)
+
+# %% Stages: relax, then dynamics in a bias field
+study.b_ext(0.02, 0.0, 0.0)
+study.stages.add_relax(algorithm="llg_overdamped", dt=1e-13, tolT=1e-5, max_steps=20_000)
+study.stages.add_run(1e-9)
+```
+
 ### Complete live example
 
+In a live session the same calls are sent one by one: `fm.relax(...)` and
+`fm.run(...)` (or `study.relax(...)` and `study.run(...)`) become runtime
+commands, and each command starts from the final state of the previous one.
 A live session is typed into a running Python interpreter or Jupyter kernel,
 so it is shown as an interactive transcript. It needs a running DEV group and
 is not executed by the documentation build.
