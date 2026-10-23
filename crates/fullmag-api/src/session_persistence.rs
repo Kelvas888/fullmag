@@ -1872,6 +1872,169 @@ mod accepted_fms_persistence_tests {
         state
     }
 
+    fn captured_export_source_fixture(store: &SessionStore) -> (serde_json::Value, Vec<u8>) {
+        let script = b"# Exact admitted bytes, including CRLF.\r\nimport fullmag\r\nstudy = fullmag.Study()\r\n".to_vec();
+        let digest = store.cas().put(&script).expect("captured Python entry CAS");
+        let helper = b"HELPER = True\n";
+        let helper_digest = store.cas().put(helper).expect("captured helper CAS");
+        let source = serde_json::json!({"capture":{"entry_relative_path":"source/scenario.py", "records":[
+            {"relative_path":"source/helper.py", "role":"source", "sha256":helper_digest, "byte_count":helper.len()},
+            {"relative_path":"source/scenario.py", "role":"source", "sha256":digest, "byte_count":script.len()}
+        ]}});
+        (source, script)
+    }
+
+    #[test]
+    fn accepted_export_preserves_exact_bytes_and_selects_declared_capture_entry() {
+        let root = tempfile::tempdir().expect("capture root");
+        let store = SessionStore::open(root.path()).expect("capture store");
+        let (source, script) = captured_export_source_fixture(&store);
+        assert_eq!(read_captured_export_script(&store, &source).expect("captured export source"), script);
+        let mut missing = source.clone();
+        missing["capture"]["entry_relative_path"] = serde_json::json!("source/missing.py");
+        assert!(read_captured_export_script(&store, &missing).is_err());
+        let mut duplicate = source.clone();
+        let entry = duplicate["capture"]["records"][1].clone();
+        duplicate["capture"]["records"].as_array_mut().unwrap().push(entry);
+        assert!(read_captured_export_script(&store, &duplicate).is_err());
+        let mut runtime_entry = source;
+        runtime_entry["capture"]["records"][1]["role"] = serde_json::json!("runtime");
+        assert!(read_captured_export_script(&store, &runtime_entry).is_err());
+    }
+
+    #[test]
+    fn accepted_export_refuses_missing_changed_or_oversized_captured_entry() {
+        let root = tempfile::tempdir().expect("capture root");
+        let store = SessionStore::open(root.path()).expect("capture store");
+        let (source, _) = captured_export_source_fixture(&store);
+        for (field, value) in [
+            ("sha256", serde_json::json!("f".repeat(64))),
+            ("byte_count", serde_json::json!(1)),
+            ("byte_count", serde_json::json!(0)),
+            ("byte_count", serde_json::json!(MAX_RETIREMENT_SCRIPT_BYTES + 1)),
+        ] {
+            let mut changed = source.clone();
+            changed["capture"]["records"][1][field] = value;
+            assert!(read_captured_export_script(&store, &changed).is_err(), "accepted changed {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_v4_export_resolves_ui_source_without_a_filesystem_script_and_fences_input() {
+        use fullmag_application::{ProjectId, RunId, RunIntentAuthoring};
+        use fullmag_application::script_stage_contract::{ScriptExecutionConfig, ScriptExecutionStage};
+        let root = tempfile::tempdir().expect("accepted UI export root");
+        let accepted_root = root.path().join("accepted-store");
+        let store = SessionStore::open(&accepted_root).expect("accepted store");
+        let admitted = b"# Immutable UI source\r\nimport fullmag\r\nstudy = fullmag.Study()\r\n";
+        // Reuse the canonical compiler's capture contract, including its pinned runtime inventory.
+        let files = [("source/main.py", "source", admitted.as_slice()),
+            ("fullmag/__init__.py", "runtime", b"fullmag".as_slice()),
+            ("interpreter/python", "runtime", b"python".as_slice())];
+        let records = files.iter().map(|(path, role, bytes)| serde_json::json!({
+            "relative_path":path, "asset_id":format!("script-file-{}", fullmag_session::hex_sha256(path.as_bytes())),
+            "sha256":fullmag_session::hex_sha256(bytes), "byte_count":bytes.len(), "role":role
+        })).collect::<Vec<_>>();
+        let fullmag_inventory = serde_json::json!([{"relative_path":"fullmag/__init__.py",
+            "sha256":fullmag_session::hex_sha256(b"fullmag"), "byte_count":7}]);
+        let capture = serde_json::json!({"schema_version":"fullmag.script-source-capture.v1",
+            "entry_relative_path":"source/main.py", "records":records,
+            "runtime":{"python_version":"3.10.12", "implementation":"cpython", "numpy_version":null,
+                "executable_sha256":fullmag_session::hex_sha256(b"python"),
+                "fullmag_source_tree_sha256":fullmag_ir::canonical_ir_json_sha256(&fullmag_inventory).unwrap(),
+                "fullmag_version_binding":"source_tree_only", "capture_policy":"trusted_readonly_dsl_observed_io.v1",
+                "native_io_completeness":"NOT_VERIFIED", "source_bytes":admitted.len(), "runtime_bytes":13},
+            "observed_reads":["source/main.py"], "inventory_sha256":"a".repeat(64)});
+        let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        problem.problem_meta.runtime_metadata.insert("active_stage_id".into(), serde_json::json!("first"));
+        let config = ScriptExecutionConfig { ir:problem.clone(), antenna_inventory:Default::default(),
+            shared_geometry_assets:None, default_until_seconds:Some(1e-12),
+            study_pipeline:Some(serde_json::from_value(serde_json::json!({"version":"study_pipeline.v1", "nodes":[
+                {"node_kind":"primitive", "id":"first", "label":"First", "stage_kind":"run", "payload":{"until_seconds":1e-12}}
+            ]})).unwrap()),
+            stages:vec![ScriptExecutionStage {ir:problem, default_until_seconds:Some(1e-12), entrypoint_kind:"flat_run".into(), action:None}] };
+        let profile = fullmag_ir::ExecutionProfileIR {profile_id:"physical".into(), version:"v1".into(),
+            defaults:fullmag_ir::ExecutionRequestPatchIR {
+                backend:fullmag_ir::FieldPatch::Value(fullmag_ir::BackendTarget::Fdm),
+                device:fullmag_ir::FieldPatch::Value(fullmag_ir::ExecutionDevice::Cpu),
+                precision:fullmag_ir::FieldPatch::Value(fullmag_ir::ExecutionPrecision::Double),
+                mode:fullmag_ir::FieldPatch::Value(fullmag_ir::ExecutionMode::Strict), ..Default::default()}, ..Default::default()};
+        let compiled = fullmag_application::compile_accepted_closed_loop_pipeline(config, "export-study".into(), 17,
+            fullmag_authoring::StudyExecutionProfileReference {profile_id:profile.profile_id.clone(), version:profile.version.clone()},
+            vec![], capture, |_,_| Ok(profile.clone()), fullmag_ir::configure_project_autosave_policy).expect("canonical v4 compilation");
+        let authored_scene = scene(17);
+        let mut definition = fullmag_application::ProjectEnvelope::blank(ProjectId::parse("project-ui-export").unwrap(), "UI export").unwrap();
+        definition.replace_scene(fullmag_application::RawJsonEnvelope::from_value(serde_json::to_value(&authored_scene).unwrap()).unwrap()).unwrap();
+        definition.definition.revision = 17;
+        definition.rewrite_known_fields().unwrap();
+        let mut paths = BTreeMap::new();
+        for (path, _, bytes) in &files {
+            let asset_id = format!("script-file-{}", fullmag_session::hex_sha256(path.as_bytes()));
+            let asset_path = format!("project/assets/accepted-script/files/{path}");
+            definition.assets.push(fullmag_application::OpaqueAsset::new(&asset_path, bytes.to_vec(), None).unwrap());
+            paths.insert(asset_id, asset_path);
+        }
+        let pipeline_path = "project/assets/accepted-script/pipeline-source.json";
+        definition.assets.push(fullmag_application::OpaqueAsset::new(pipeline_path, compiled.source_bytes.clone(), None).unwrap());
+        paths.insert(compiled.source_reference.asset_id.clone(), pipeline_path.into());
+        let authored = RunIntentAuthoring {run_id:RunId::parse("run-ui-export").unwrap(), idempotency_key:"intent-ui-export".into(),
+            parameters:serde_json::json!({"live_workspace":{"scene_revision":17,
+                "execution_input":crate::live_execution_binding::input_identity(&authored_scene).unwrap()}}),
+            seeds:BTreeMap::new(), dependencies:Vec::new(), scheduling_priority:0,
+            requested_execution:fullmag_application::RequestedExecution {backend:"fdm".into(), device:"cpu".into(),
+                precision:"double".into(), mode:"strict".into(), minimum_resources:None}};
+        let intent = fullmag_application::materialize_run_intent(&definition, &compiled.study, &compiled.catalog, authored, &paths)
+            .expect("canonical immutable RunSpec");
+        let mut persisted = fullmag_session::FmsRunIntent::new("run-ui-export", "intent-ui-export", serde_json::to_value(&intent.specification).unwrap());
+        persisted.definition_object_ref = Some(store.cas().put(definition.raw_definition.raw_bytes()).unwrap());
+        persisted.study_object_ref = Some(store.cas().put(&serde_json::to_vec(&serde_json::to_value(&compiled.study).unwrap()).unwrap()).unwrap());
+        persisted.study_catalog_object_ref = Some(store.cas().put(&serde_json::to_vec(&serde_json::to_value(&compiled.catalog).unwrap()).unwrap()).unwrap());
+        assert_eq!(persisted.study_object_ref.as_deref(), Some(intent.specification.study.plan_sha256.as_str()));
+        assert_eq!(persisted.study_catalog_object_ref.as_deref(), Some(intent.specification.study_catalog_sha256.as_str()));
+        for asset in &intent.specification.immutable_assets {
+            let project_asset = definition.assets.iter().find(|candidate| candidate.path() == paths[&asset.asset_id].as_str()).unwrap();
+            persisted.asset_object_refs.insert(asset.asset_id.clone(), store.cas().put(project_asset.bytes()).unwrap());
+        }
+        store.commit_run_intent(&persisted).unwrap();
+        store.commit_run_catalog(&fullmag_session::FmsRunCatalog {schema_version:fullmag_session::FMS_RUN_CATALOG_SCHEMA.into(),
+            run_id:"run-ui-export".into(), revision:1, updated_at:chrono::Utc::now(), tasks:Vec::new()}).unwrap();
+        drop(store);
+        let mut state = destination_state(root.path()).await;
+        Arc::get_mut(&mut state).unwrap().submit_store_root = Some(accepted_root);
+        state.current_live_session_epoch.store(7, Ordering::Release);
+        {
+            let mut current = state.current_live_state.write().await;
+            let snapshot = current.as_mut().unwrap();
+            snapshot.session.run_id = "run-ui-export".into();
+            snapshot.session.script_path.clear();
+            snapshot.scene_document = Some(authored_scene);
+            snapshot.metadata = Some(serde_json::json!({"docker_startup":{"run_id":"run-ui-export", "scene_revision":17}}));
+            snapshot.run = Some(crate::types::RunManifest {run_id:"run-ui-export".into(), session_id:snapshot.session.session_id.clone(),
+                status:"completed".into(), total_steps:0, final_time:None, final_e_ex:None, final_e_demag:None, final_e_ext:None,
+                final_e_ani:None, final_e_dmi:None, final_e_rotated_dmi:None, final_e_total:None, artifact_dir:String::new()});
+        }
+        let capture = accepted_export_capture(&state, state.current_live_state.read().await.as_ref().unwrap(),
+            &FmsExportProfile::for_profile(SaveProfile::Solved)).unwrap().unwrap();
+        assert_eq!(read_canonical_script(&state, Some(&capture)).await.unwrap().as_slice(), admitted.as_slice());
+        let decoy = root.path().join("decoy.py");
+        std::fs::write(&decoy, b"raise RuntimeError('filesystem source must not win')\n").unwrap();
+        state.current_live_state.write().await.as_mut().unwrap().session.script_path = decoy.display().to_string();
+        assert_eq!(read_canonical_script(&state, Some(&capture)).await.unwrap().as_slice(), admitted.as_slice());
+        state.current_live_state.write().await.as_mut().unwrap().scene_document.as_mut().unwrap().study.requested_device = "gpu".into();
+        let error = read_canonical_script(&state, Some(&capture)).await.expect_err("changed authored input must reject");
+        assert_eq!(error.code.as_deref(), Some("accepted_execution_input_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn missing_nonaccepted_script_still_fails_without_generated_fallback() {
+        let root = tempfile::tempdir().expect("legacy root");
+        let state = destination_state(root.path()).await;
+        state.current_live_state.write().await.as_mut().unwrap().session.script_path.clear();
+        let error = read_canonical_script(&state, None).await.expect_err("empty legacy script path");
+        assert_eq!(error.status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.message.contains("invalid_script"));
+    }
+
     #[tokio::test]
     async fn accepted_fms_export_inspect_readonly_import_and_tamper_rejection() {
         let source_root = tempfile::tempdir().expect("source temp root");
@@ -2358,11 +2521,68 @@ async fn collect_project_documents(
     docs
 }
 
-async fn read_canonical_script(state: &AppState) -> Result<Vec<u8>, ApiError> {
+fn read_captured_export_script(store: &SessionStore, source: &serde_json::Value) -> Result<Vec<u8>, ApiError> {
+    let invalid = |message: &str| ApiError::conflict(format!("accepted export source: {message}"));
+    let capture = &source["capture"];
+    let entry = capture["entry_relative_path"].as_str().ok_or_else(|| invalid("entry path missing"))?;
+    let records = capture["records"].as_array().ok_or_else(|| invalid("capture records missing"))?;
+    let entries = records.iter().filter(|record| record["relative_path"].as_str() == Some(entry)).collect::<Vec<_>>();
+    if entries.len() != 1 || entries[0]["role"].as_str() != Some("source") {
+        return Err(invalid("entry is not one captured source file"));
+    }
+    let record = entries[0];
+    let length = record["byte_count"].as_u64().filter(|length| *length > 0 && *length <= MAX_RETIREMENT_SCRIPT_BYTES as u64)
+        .ok_or_else(|| invalid("entry exceeds source byte budget or is empty"))?;
+    let digest = record["sha256"].as_str().ok_or_else(|| invalid("entry digest missing"))?;
+    let bytes = store.cas().get_bounded(digest, length)
+        .map_err(|error| ApiError::conflict(format!("accepted export source read failed: {error}")))?
+        .ok_or_else(|| invalid("captured entry CAS object missing"))?;
+    if bytes.len() as u64 != length || fullmag_session::hex_sha256(&bytes) != digest {
+        return Err(invalid("captured entry differs from immutable source"));
+    }
+    Ok(bytes)
+}
+
+fn accepted_export_script(
+    state: &AppState, snapshot: &SessionStateResponse, capture: &AcceptedExportCapture,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let root = state.submit_store_root.as_ref().ok_or_else(|| ApiError::conflict("accepted export store unavailable"))?;
+    let store = SessionStore::open_existing(root).map_err(|error| ApiError::conflict(error.to_string()))?;
+    let intent = store.read_run_intent(&capture.identity.run_id).map_err(|error| ApiError::conflict(error.to_string()))?
+        .ok_or_else(|| ApiError::conflict("accepted export RunIntent missing"))?;
+    if !intent.asset_object_refs.contains_key(fullmag_application::SCRIPT_PIPELINE_SOURCE_ASSET_ID) {
+        return Ok(None);
+    }
+    let specification: fullmag_application::RunSpecification = serde_json::from_value(intent.specification.clone())
+        .map_err(|error| ApiError::conflict(format!("accepted export specification invalid: {error}")))?;
+    let scene = snapshot.scene_document.as_ref().ok_or_else(|| ApiError::conflict("accepted export scene missing"))?;
+    crate::live_execution_binding::validate_input_binding(&intent.specification,
+        &crate::live_execution_binding::input_identity(scene)?, scene.revision)?;
+    let run = fullmag_application::RunId::parse(capture.identity.run_id.as_str()).map_err(|error| ApiError::conflict(error.to_string()))?;
+    let accepted = fullmag_runtime_control::load_accepted_study_snapshot(&store, &run, &specification.snapshot.project_id)
+        .map_err(|error| ApiError::conflict(format!("accepted export source closure invalid: {error}")))?;
+    let reference = accepted.run.specification.immutable_assets.iter()
+        .find(|asset| asset.asset_id == fullmag_application::SCRIPT_PIPELINE_SOURCE_ASSET_ID)
+        .ok_or_else(|| ApiError::conflict("accepted export captured source reference missing"))?;
+    let bytes = store.cas().get_bounded(&reference.content_sha256, 16 * 1024 * 1024)
+        .map_err(|error| ApiError::conflict(error.to_string()))?
+        .ok_or_else(|| ApiError::conflict("accepted export captured source missing"))?;
+    let source = fullmag_application::validate_accepted_script_pipeline_source(&accepted.study, &accepted.catalog, &bytes)
+        .map_err(|error| ApiError::conflict(format!("accepted export captured source invalid: {error}")))?;
+    // The accepted snapshot reader already verifies every captured file against RunSpec and CAS.
+    read_captured_export_script(&store, &source).map(Some)
+}
+
+async fn read_canonical_script(state: &AppState, accepted: Option<&AcceptedExportCapture>) -> Result<Vec<u8>, ApiError> {
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active workspace"))?;
+    if let Some(capture) = accepted {
+        if let Some(script) = accepted_export_script(state, snapshot, capture)? {
+            return Ok(script);
+        }
+    }
     let script_path = Path::new(&snapshot.session.script_path);
     let metadata = std::fs::symlink_metadata(script_path).map_err(|_| {
         ApiError::unprocessable(
@@ -2623,7 +2843,6 @@ pub(crate) async fn export_session_with_context(
     let requested_target = req.target_path.as_deref();
     validate_session_output_request(requested_target, save_to_source)?;
     let session_id = current_session_id(&state).await?;
-    let script = read_canonical_script(&state).await?;
 
     let name = if let Some(n) = req.name {
         n
@@ -2651,6 +2870,7 @@ pub(crate) async fn export_session_with_context(
         None
     };
     let mut accepted_capture = accepted_export_capture(&state, &snapshot, &export_profile)?;
+    let script = read_canonical_script(&state, accepted_capture.as_ref()).await?;
     let mut session_manifest = FmsSessionManifest::new(&session_id, &name, req.profile);
 
     if let Some(capture) = accepted_capture.as_ref() {

@@ -3613,14 +3613,29 @@ mod tests {
 
     #[test]
     fn v2_accepted_provenance_uses_readonly_import_namespace() {
+        accepted_provenance_readonly_roundtrip(false);
+    }
+
+    #[test]
+    fn v2_accepted_provenance_roundtrips_empty_input_asset() {
+        accepted_provenance_readonly_roundtrip(true);
+    }
+
+    fn accepted_provenance_readonly_roundtrip(empty_input: bool) {
         let directory = tempfile::tempdir().unwrap();
         let accepted_root = directory.path().join("accepted-store");
         let accepted = SessionStore::open(&accepted_root).unwrap();
-        let intent = FmsRunIntent::new(
-            "run-accepted",
-            "intent-accepted",
-            serde_json::json!({"run_id": "run-accepted", "solver": "fixture"}),
-        );
+        let empty = empty_input.then(|| accepted.cas().put(b"").unwrap());
+        let mut specification = serde_json::json!({"run_id": "run-accepted", "solver": "fixture"});
+        if let Some(reference) = &empty {
+            specification["immutable_assets"] = serde_json::json!([
+                {"asset_id": "package-marker", "content_sha256": reference}
+            ]);
+        }
+        let mut intent = FmsRunIntent::new("run-accepted", "intent-accepted", specification);
+        if let Some(reference) = &empty {
+            intent.asset_object_refs.insert("package-marker".into(), reference.clone());
+        }
         accepted.commit_run_intent(&intent).unwrap();
         accepted
             .commit_run_catalog(&FmsRunCatalog {
@@ -3752,6 +3767,10 @@ mod tests {
                 .exists()
         );
         assert!(imported.read_run_intent("run-accepted").unwrap().is_none());
+        if let Some(reference) = empty {
+            assert_eq!(imported.cas().get(&reference).unwrap(), Some(Vec::new()));
+            assert_eq!(imported.cas().verified_length(&reference).unwrap(), Some(0));
+        }
         assert_eq!(
             imported
                 .current_session()

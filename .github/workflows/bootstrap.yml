@@ -167,7 +167,7 @@ jobs:
         run: |
           cargo test -p fullmag-session --lib accepted_provenance
           cargo test -p fullmag-session --lib session_schema_guard_distinguishes_v1_and_readonly_v2_provenance
-          cargo test -p fullmag-api --bin fullmag-api accepted_fms_export_inspect_readonly_import_and_tamper_rejection
+          cargo test -p fullmag-api --bin fullmag-api accepted_fms_persistence_tests
           cargo test -p fullmag-api --bin fullmag-api context_bound_export_rejects_session_identity_before_script_read
 
       - name: Run fail-closed compact workspace import regression

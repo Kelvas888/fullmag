@@ -2539,3 +2539,26 @@ odmawia409: accepted provenance odrzuca rzeczywisty zerowy CAS obiekt
 przypiętego runtime/source capture(np. numpy/py.typed), mimo poprawnego SHA256.
 Poprawka musi zachować dopuszczalne puste wejścia bez dopuszczenia pustych
 wyników pól. Archiwum i cold-load nie są zaliczone.
+
+
+Przegląd przyczyny eksportu: zerowy obiekt ma poprawny pełny SHA256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+RunSpec zawiera1966 immutable assets;26 wejściowych plików runtime capture
+wiąże się z tym samym pustym obiektem(np.numpy/py.typed i puste __init__.py).
+Nie jest to pusty wynik solvera. Poprawka eksportu/importu dopuszcza0B wyłącznie
+jako input asset; digest używany również jako wynik, tensor, definicja lub
+geometria nadal jest odrzucany. Długość0 musi odpowiadać SHA256(empty).
+Trzy regresje obejmują pełne FMS pack→preflight→readonly unpack oraz
+negatywne role/długości. Starszy czytnik nadal odrzuci takie nowe archiwum
+poprzez dawną bramkę0B; format pozostaje accepted_provenance.v1, bez migracji
+CAS ani przepisywania danych. Wymagany jest spójny nowy pakiet odbiorcy.
+
+Oddzielna poprawka UI-first pobiera entry skryptu z dokładnego immutable
+capture zaakceptowanego runu, zachowując oryginalne bajty i zgodność sceny,
+zamiast wymagać wcześniejszego zapisu lokalnego pliku przez użytkownika.
+Bez accepted source nadal obowiązuje dotychczasowa kontrola ścieżki.
+Nowe testy i rzeczywisty FMS pozostają do wykonania po przeglądzie/w CI/runtime.
+
+CI39930825611 dla54589225bee5c93d59c33b09c09d7d318c789e26 zakończyło się
+success:12 wykonanych jobów PASS,9 opcjonalnych SKIPPED. Dotyczy read-fence,
+nie późniejszych poprawek źródła eksportu i pustych wejść.
