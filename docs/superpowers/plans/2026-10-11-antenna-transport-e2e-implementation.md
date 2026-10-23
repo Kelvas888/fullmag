@@ -2795,7 +2795,7 @@ integracji tej samej zatwierdzonej operacji. Dokładnie jedna rzeczywista
 próba startu 3203 nadal pozostaje do wykonania; 0 nowych Solve.
 
 
-### 23.10.2026 — recovery i build PASS, capture Universe odrzucony przed sesją
+### 23.10.2026 — recovery i build PASS, capture Universe odrzucony
 
 Zarządzany resume `9ed72cef7b084179b979e1b687e39bd1`: succeeded, exit 0.
 Te same dwa kontenery wystartowały poprawnie; hook NVIDIA nie powtórzył błędu.
@@ -2830,3 +2830,40 @@ wyłącznie jeden source file. Nie wykonano skryptu. Zgodność noty i mapy
 źródeł PASS; 41 interpretowanych testów kontraktu dokumentacji PASS.
 Dowody: `isolated-capture-inventory-only.json` i
 `isolated-example-doc-validation.log` w control volume.
+
+### 23.10.2026 — przygotowanie Universe i kontencja writera
+
+Publiczny import izolowanego skryptu zachował dokładne źródło i pełny round-trip.
+Zapisano projekt Universe: `antenna-universe-volume-5afd3b953.fms`, SHA256
+`55c8a90d323d8d6d2581397985f0a438efa2860f3ce2155405954bb92dff0665`.
+Korekta wcześniejszego opisu: pierwszy odrzucony capture utworzył pustą sesję
+`startup_failed`, mimo braku session_id w receipcie aktywacji. Zachowano jej
+odczyty, a następnie użyto zatwierdzonego zastąpienia sesją roboczą i importu.
+
+Pojedynczy MeshBuild zwrócił HTTP 500 i utworzył Run
+`run-live-8609701cc88f952c62fe2c39acd9b0159bec887c5f9c703de9f764b365c38f15`,
+z trybem startu manual i task awaiting_preparation. Nie wydano Solve i nie
+opublikowano start_release. Preparation scheduler zakończył się na typowanym
+`StoreWriterBusy` w discovery; supervisor zamknął runtime i API.
+
+Minimalna poprawka w `accepted_fem_preparation_scheduler_main.rs` odracza
+wyłącznie całe discovery przy tym typowanym błędzie. Zachowuje aktywne supervisory,
+checkpoint i kolejność; inne błędy pozostają fatal. Patch SHA256:
+`03b44b3a2c55d65a919cfb8d52fab85a06f9f71a8d62ec518be6abb90c46e801`.
+Dwie regresje Rust obejmują klasyfikację i rzeczywistą blokadę między procesami.
+Przegląd źródeł, git apply --check, git diff --check i diagnostyka składni Rust PASS.
+Testy Rust nie były kompilowane ani wykonywane; managed runtime pozostaje do
+weryfikacji. Nie zmieniono schematów, bramek recovery ani polityki startu Compute.
+
+Świeży odczytowy native-after-ready preview PASS: API/owner/dzieci zakończone,
+zero aktywnych leases, wszystkie rezerwacje released. 70 plików wcześniejszych
+wyników i pięć historycznych katalogów są byte-identical. Istniejąca procedura
+`docker-dev-stop-failed` + `docker-dev-recreate-volume` z fresh_state=false
+obsługuje Linux i zachowuje Run. Odtworzy wyłącznie dwa własne kontenery grupy
+3203, zachowując state i named volumes. Po wznowieniu preparation może ruszyć
+automatycznie; manual gate nadal wymaga jawnego Solve. Użytkownik polecił
+kontynuację po przedstawieniu tej operacji.
+
+Aktualne dowody i pełny patch: control volume,
+`verification/universe-volume-policy-20261023/preparation-busy-failure/`.
+Brak potwierdzenia UI/WebGL; nie wznawiano zablokowanej ścieżki przeglądarki.
