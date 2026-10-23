@@ -243,6 +243,19 @@ case "${recipe}" in
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_dev_recovery_build.py" "${recovery_args[@]}"
     ;;
+  *"scripts/docker_volume_development_interrupted.py"*)
+    development_reconcile_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_development_interrupted.py\" --request '([a-zA-Z0-9_./-]+)' --request-sha256 '([0-9a-f]{64})' --source-root '([^']+)'( --apply)?[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${development_reconcile_pattern} ]]; then
+      echo "[fullmag just] invalid development reconciliation recipe" >&2
+      exit 2
+    fi
+    development_reconcile_args=(--request "${BASH_REMATCH[1]}" --request-sha256 "${BASH_REMATCH[2]}"
+      --source-root "${BASH_REMATCH[3]}")
+    if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+      development_reconcile_args+=(--apply)
+    fi
+    exec "${python_cmd}" -B "${script_dir}/docker_volume_development_interrupted.py" "${development_reconcile_args[@]}"
+    ;;
   *"scripts/docker_volume_toolchain_reconcile.py"*)
     toolchain_reconcile_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_toolchain_reconcile.py\" --request '([a-zA-Z0-9_./-]+)' --request-sha256 '([0-9a-f]{64})' --source-root '([^']+)'( --preview)?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${toolchain_reconcile_pattern} ]]; then

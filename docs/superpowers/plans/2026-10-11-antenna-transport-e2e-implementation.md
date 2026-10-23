@@ -2918,3 +2918,11 @@ Zastosowano przypięty patch 677d39ff47f7117880872fcaf1338d4183ffc3979820fd878ef
 Natywny preview przez just zwrócił validated-only, a następna jawna publikacja failed-confirmed. Receipt, current i terminal mają SHA256 fc90d480d831f52f81c834ca0695c74346d3fd9cb99b62123f72f9a5bcaa5a2f. Oryginalny helper naturalnie zakończył pracę, active nie istnieje, poprzedni verified jest identyczny. Potwierdzono ponownie 70 plików wyników, pięć katalogów historycznych oraz projekt Universe bez zmian. Nie wysłano Solve Universe.
 
 Dowód w wolumenie kontrolnym: verification/universe-volume-policy-20261023/toolchain-timeout-proposal/v8/applied-native-reconciliation.json. Następny krok to zatwierdzona kontynuacja ukończonego odtworzenia usług e47a16d91bd840b78a694b670e2da206 przez docker-dev-recreate-volume. Build aplikacji, wynik Universe i UI/WebGL pozostają do sprawdzenia.
+
+### 23.10.2026 — zatwierdzone recovery po przerwaniu całego WSL
+
+Toolchain ec4ba i oba obrazy aplikacji zostały zbudowane. Po przerwaniu WSL/Dockera operacja development `843b86c40a9d44b087775662771bf85a` pozostała starting bez terminala; oba kontenery exited255, brak handoff i niepotwierdzona przyczyna przerwania. Użytkownik zatwierdził odrębny patch failure-only `ccce5fb695a53ca9f4703b4f7a8d5fd2b6f90c610b3f63a136e7678470158a34`.
+
+8 testów interpretowanych i 6 izolowanych prób Bash/flock/CAS PASS; niezależny review bez pozostałych blockerów. Natywny preview i apply przez nową receptę just: exit0, terminal failed-confirmed SHA256 `a6b428a51e15f6cc84152b05c67eb72f3ce850d97a1cc8b4fe97c4951db94971`, bez wymyślonego exit Make i bez aktualizacji verified. Oryginalny receipt zarchiwizowany, tylko własny marker zwolniony. Ponowna kontrola: 70 plików wyników, 5 katalogów historii i FMS Universe bez zmian. Kontenery i cache zachowane.
+
+Następny krok: jedno zatwierdzone docker-dev-resume z cache; brak aktywnego launchera w chwili tego checkpointu. Zero Universe Solve. API, pełna mapa H, cold-load, WebGL i kwalifikacja naukowa nie są dowiedzione tym recovery. E0 pozostaje jedynym odebranym etapem; E1–E12 otwarte.

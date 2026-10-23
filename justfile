@@ -83,6 +83,10 @@ docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend=
 docker-dev-reconcile-iteration request request_sha256 source_root port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_reconcile.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}
 
+# Confirm one interrupted development only; preview never changes its native receipt.
+docker-dev-reconcile-development request request_sha256 source_root apply="false":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_development_interrupted.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}}{{if apply == "true" { " --apply" } else if apply == "false" { "" } else { error("apply must be true or false") }}}
+
 # Confirm one canceled BuildKit toolchain only; preserve images, caches and verified receipt.
 docker-dev-reconcile-toolchain request request_sha256 source_root preview="true":
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_toolchain_reconcile.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}}{{if preview == "true" { " --preview" } else if preview == "false" { "" } else { error("preview must be true or false") }}}
