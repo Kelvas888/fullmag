@@ -87,3 +87,11 @@ wireframe geometrii przed zbudowaniem siatki, bez zmiany fizyki i solver mesh.
   żądania. Canvas/PNG/mesh acceptance nadal NOT VERIFIED.
 - PR/merge/cleanup pozostają do wykonania po bramce WebGL i rozstrzygnięciu
   automatycznej kompilacji unit tests w CI. Zachować worktree i jego zasoby.
+
+## Blokady potwierdzone 2026-10-23T09:03:55.470209+00:00
+
+- Użytkownik: zakaz kompilacji unit tests obejmuje CI; PR uruchamiający bootstrap.yml zablokowany.
+- Aktywacja a97f47244fc0451c86f846fb9aff5e0a: outcome unknown, zasoby zachowane, bez replay.
+- Odczyt Docker: daemon niedostępny; WebGL NOT VERIFIED.
+- Master ae8e570f2aa9655cb9fd8321c716b8d49a87e084 nadal ma starą politykę near/far; poprawki nie są zintegrowane.
+- Zachować worktree i zasoby, wznowić odbiór po ustąpieniu blokad.

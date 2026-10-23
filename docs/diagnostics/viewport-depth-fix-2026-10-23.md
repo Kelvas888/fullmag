@@ -150,10 +150,37 @@ Wysyła wyłącznie mesh_build, zachowuje command_id i nie powtarza istniejąceg
 żądania. Nie stanowi dowodu gotowej siatki ani wykonania fizyki.
 
 PR, wymagane CI, merge, fast-forward i cleanup worktree: **niewykonane**.
-Wysłano pytanie o zakres tymczasowego zakazu kompilacji unit tests wobec CI;
-nie zakładamy odpowiedzi. Worktree i zasoby pozostają do zakończenia bramek.
- Workflow
-`bootstrap.yml` automatycznie kompiluje unit tests C++/Rust przy PR; pozostaje
-rozstrzygnięcie tego działania w świetle tymczasowego zakazu ich kompilacji.
+Użytkownik potwierdził, że zakaz kompilacji unit tests obejmuje również CI.
+`bootstrap.yml` automatycznie kompiluje unit tests C++/Rust przy PR, dlatego
+otwarcie PR pozostaje zablokowane. Nie wyłączano wymaganych kontroli ani
+nie otwierano PR z obejściem workflow. Worktree i zasoby zachowano.
 
 Checkpoint zapisano UTC: 2026-10-23T08:21:56.361342+00:00.
+
+## Aktualizacja po kolejnym zgłoszeniu z mastera
+
+Checkpoint UTC: 2026-10-23T09:03:55.470209+00:00.
+
+Nowy zrzut nadal pokazuje poszarpane ciemne obszary na kapslu i obrzeżach ringu.
+To defekty wewnątrz powierzchni, a nie wyłącznie schodkowanie sylwetki.
+Widoczny jest też komunikat `Resource load deadline exceeded`; jego związek
+z defektami pozostaje niepotwierdzony.
+
+Plik zgłoszenia: `codex-clipboard-4a0cbe6d-eb16-4dfd-9079-9c7b68927fa1.png`, SHA-256 `6709324586894d96ba0c585b0ed60c025fdbb5d5c5f7e0571d23959aa4d6524b`.
+
+Odczyt lokalnego mastera potwierdza HEAD `ae8e570f2aa9655cb9fd8321c716b8d49a87e084`
+i nadal starą politykę kamery: near minimum1e-12 oraz far minimum1e-3.
+Poprawki z brancha zadania nie są zintegrowane, więc ten obraz nie jest
+dowodem regresji wersji poprawionej. Nie potwierdzono jeszcze źródeł aktualnie
+załadowanego bundla w przeglądarce użytkownika.
+
+Istniejąca aktywacja `a97f47244fc0451c86f846fb9aff5e0a` zakończyła obserwację
+stanem `outcome-unknown-resources-retained` (timeout); launcher blokuje retry
+przez zachowane activation.json. Kolejny odczyt Docker zwrócił:
+`Cannot connect to the Docker daemon at unix:///var/run/docker.sock`.
+Nie restartowano demona ani innych grup. Odbiór WebGL pozostaje NOT VERIFIED.
+
+Warunki kontynuacji: przywrócona dostępność Docker i ustalenie końcowego
+wyniku istniejącej aktywacji; następnie managed browser QA. Otwarcie PR
+wymaga rozstrzygnięcia konfliktu z zakazem kompilacji w standardowym CI.
+PR/merge/cleanup nadal niewykonane.
