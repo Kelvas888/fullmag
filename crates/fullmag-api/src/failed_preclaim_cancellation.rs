@@ -78,11 +78,13 @@ fn catalog_matches(actual: &FmsRunCatalog, original: &FmsRunCatalog, has_intent:
 }
 
 fn inventory(root: &Path, path: &Path, result: &mut BTreeMap<String,String>, budget: &mut usize, allowed: &BTreeMap<String,String>) -> Result<()> {
-    fullmag_session::repository_path::reject_link(path)?;
+    let relative_path = path.strip_prefix(root)?.to_str().context("non UTF-8 run path")?;
+    // The public resolver checks links/reparse points and containment at every level.
+    checked_path(root, if relative_path.is_empty() { "run_catalog.json" } else { relative_path })?;
     for row in std::fs::read_dir(path)? {
         let row = row?;
-        fullmag_session::repository_path::reject_link(&row.path())?;
         let relative = row.path().strip_prefix(root)?.to_str().context("non UTF-8 run path")?.to_owned();
+        checked_path(root, &relative)?;
         if row.file_type()?.is_dir() {
             if (!allowed.keys().any(|name| name.starts_with(&(relative.clone()+"/")))
                 && relative != "task_cancellation_intents")
