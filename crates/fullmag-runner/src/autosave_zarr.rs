@@ -11,6 +11,8 @@ pub struct ZarrAutosaveWriter {
     root: PathBuf,
     current: Option<ZarrStage>,
     latest_provenance: Option<serde_json::Value>,
+    fdm_grid: Option<crate::output_store::FdmGrid>,
+    output_store: Option<crate::output_store::FdmOutputStore>,
 }
 
 struct ZarrStage {
@@ -26,6 +28,31 @@ impl ZarrAutosaveWriter {
             root: root.into(),
             current: None,
             latest_provenance: None,
+            fdm_grid: None,
+            output_store: None,
+        }
+    }
+
+    /// Also writes the mumax3-compatible `fullmag.output_store.v1` arrays for this FDM grid.
+    pub(crate) fn with_fdm_grid(root: impl Into<PathBuf>, grid: crate::output_store::FdmGrid) -> Self {
+        Self { fdm_grid: Some(grid), ..Self::new(root) }
+    }
+
+    /// Writes one field sample into the output store; the legacy stage array is written by
+    /// `append_field_sample`, which lacks the component order and precision.
+    pub(crate) fn append_output_store_field(
+        &mut self,
+        entry: &ContinuousIndexEntry,
+        quantity: &str,
+        step: u64,
+        time_s: f64,
+        values: &[f64],
+        order: crate::output_store::ComponentOrder,
+        single: bool,
+    ) -> Result<(), String> {
+        match self.output_store.as_mut() {
+            Some(store) => store.append_field(quantity, time_s, step, &entry.stage_id, values, order, single),
+            None => Ok(()),
         }
     }
 
@@ -123,6 +150,12 @@ impl AutosaveTargetWriter for ZarrAutosaveWriter {
                 &json!({"payload_policy": "references_only", "index": "index.jsonl"}),
             )?;
         }
+        if let Some(grid) = self.fdm_grid.clone() {
+            let store = self
+                .output_store
+                .get_or_insert_with(|| crate::output_store::FdmOutputStore::new(&store, grid));
+            store.write_root_attrs()?;
+        }
         self.current = Some(ZarrStage {
             manifest: effective_manifest,
             path: stage_path,
@@ -146,7 +179,16 @@ impl AutosaveTargetWriter for ZarrAutosaveWriter {
         write_f64_chunk(&table.join(format!("{}.0", current.table_samples)), values)?;
         current.table_samples += 1;
         initialize_array(&table, current.table_samples, values.len())?;
-        append_continuous_index(&root, &current.manifest, entry)
+        append_continuous_index(&root, &current.manifest, entry)?;
+        let quantities = current.manifest.table_quantities.clone();
+        if let Some(store) = self.output_store.as_mut() {
+            let time_s = match entry.coordinate {
+                crate::autosave_storage::StageSampleCoordinate::PhysicalTime { time_s } => time_s,
+                crate::autosave_storage::StageSampleCoordinate::AcceptedStep { .. } => f64::NAN,
+            };
+            store.append_table_row(time_s, &quantities, values)?;
+        }
+        Ok(())
     }
 
     fn append_field_sample(

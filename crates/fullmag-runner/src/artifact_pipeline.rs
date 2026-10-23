@@ -854,15 +854,20 @@ impl StageAutosaveRuntime {
         self.writer.update_provenance(provenance)
     }
 
-    fn new(output_dir: &Path, config: StageAutosavePipelineConfig) -> Result<Self, String> {
+    fn new(
+        output_dir: &Path,
+        config: StageAutosavePipelineConfig,
+        fdm_grid: Option<crate::output_store::FdmGrid>,
+    ) -> Result<Self, String> {
         let policy = config.policy;
         let writer = match policy.format {
             fullmag_ir::AutosaveFormatIR::Txt => {
                 StageAutosaveWriter::Txt(crate::autosave_txt::TxtAutosaveWriter::new(output_dir))
             }
-            fullmag_ir::AutosaveFormatIR::Zarr => {
-                StageAutosaveWriter::Zarr(crate::autosave_zarr::ZarrAutosaveWriter::new(output_dir))
-            }
+            fullmag_ir::AutosaveFormatIR::Zarr => StageAutosaveWriter::Zarr(match fdm_grid {
+                Some(grid) => crate::autosave_zarr::ZarrAutosaveWriter::with_fdm_grid(output_dir, grid),
+                None => crate::autosave_zarr::ZarrAutosaveWriter::new(output_dir),
+            }),
             fullmag_ir::AutosaveFormatIR::Hdf5 => {
                 #[cfg(feature = "stage-autosave-hdf5")]
                 {
@@ -959,9 +964,12 @@ impl StageAutosaveRuntime {
             snapshot.time,
             snapshot.solver_dt,
             &values,
+            crate::output_store::ComponentOrder::Interleaved,
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_field_values(
         &mut self,
         name: &str,
@@ -969,6 +977,8 @@ impl StageAutosaveRuntime {
         time: f64,
         solver_dt: f64,
         values: &[f64],
+        order: crate::output_store::ComponentOrder,
+        single: bool,
     ) -> Result<(), String> {
         let Some(cadence) = self.fields.get_mut(name) else {
             return Ok(());
@@ -991,20 +1001,26 @@ impl StageAutosaveRuntime {
             return Ok(());
         }
         cadence.last_step = Some(step);
-        self.state.append_field_sample(
-            &mut self.writer,
-            coordinate(
-                self.relaxation_clock,
-                &StepStats {
-                    step,
-                    time,
-                    dt: solver_dt,
-                    ..StepStats::default()
-                },
-            ),
-            name,
-            values,
-        )?;
+        let entry = self
+            .state
+            .append_field_sample(
+                &mut self.writer,
+                coordinate(
+                    self.relaxation_clock,
+                    &StepStats {
+                        step,
+                        time,
+                        dt: solver_dt,
+                        ..StepStats::default()
+                    },
+                ),
+                name,
+                values,
+            )?
+            .clone();
+        if let StageAutosaveWriter::Zarr(writer) = &mut self.writer {
+            writer.append_output_store_field(&entry, name, step, time, values, order, single)?;
+        }
         Ok(())
     }
 
@@ -1618,6 +1634,10 @@ impl ZarrFieldSeriesWriter {
         Ok(())
     }
 
+    fn is_single(&self) -> bool {
+        self.info.scalar_type == NativeSnapshotScalarType::F32
+    }
+
     fn last_chunk_values_f64(&self) -> Result<Vec<f64>, String> {
         let sample_index = self
             .sample_count
@@ -1724,7 +1744,13 @@ fn writer_loop(
             .map(|config| config.stage_id.clone()),
     );
     let mut stage_autosave = stage_autosave_config
-        .map(|config| StageAutosaveRuntime::new(autosave_root, config))
+        .map(|config| {
+            StageAutosaveRuntime::new(
+                autosave_root,
+                config,
+                crate::output_store::FdmGrid::from_layout(&field_context.layout),
+            )
+        })
         .transpose()?;
     #[cfg(any(feature = "cuda", feature = "fem-gpu"))]
     let mut zarr_writers: HashMap<String, ZarrFieldSeriesWriter> = HashMap::new();
@@ -1875,6 +1901,8 @@ fn writer_loop(
                                     snapshot.time,
                                     snapshot.solver_dt,
                                     &values,
+                                    crate::output_store::ComponentOrder::ComponentMajor,
+                                    writer.is_single(),
                                 )?;
                             }
                         }
@@ -1925,6 +1953,8 @@ fn writer_loop(
                         snapshot.time,
                         snapshot.solver_dt,
                         &values,
+                        crate::output_store::ComponentOrder::ComponentMajor,
+                        writer.is_single(),
                     )?;
                 }
                 summary.field_snapshots_written += 1;
@@ -1975,6 +2005,8 @@ fn writer_loop(
                         snapshot.time,
                         snapshot.solver_dt,
                         &values,
+                        crate::output_store::ComponentOrder::ComponentMajor,
+                        writer.is_single(),
                     )?;
                 }
                 summary.field_snapshots_written += 1;

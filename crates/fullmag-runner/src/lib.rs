@@ -88,6 +88,7 @@ pub mod autosave_storage;
 pub mod autosave_txt;
 pub mod autosave_zarr;
 pub mod capabilities;
+pub(crate) mod output_store;
 pub mod constraints;
 mod derived_fields;
 mod dispatch;
