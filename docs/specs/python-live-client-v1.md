@@ -368,7 +368,7 @@ Stan ścieżek trybu live w grupie DEV (23.10.2026):
 | Ścieżka | Wynik | Uwagi |
 |---|---|---|
 | FDM CPU | działa | pełne E2E powtarzalne: model, `relax`, `m` (trasa pól, FMVP v2), `transaction()`, `run` z kontynuacją, zdarzenia, eksport |
-| FDM GPU | `run` działa | kolejne `run` z kontynuacją i odczytem `m`; `relax` (`llg_overdamped`) zatrzymuje bramka kwalifikacji `strict` „final execution is not fully device-proven” (operator na hoście) — ograniczenie ścieżki GPU, nie trybu live |
+| FDM GPU | `run` działa | kolejne `run` z kontynuacją i odczytem `m`; `relax` (`llg_overdamped`) niedostępny z założenia: w macierzy możliwości relaks CUDA to ścieżka rozwojowa, więc bramka `strict` go odrzuca („final execution is not fully device-proven”), a worker runtime'u accepted obsługuje tylko tryb `strict` (`fm.mode("extended")` kończy się „supports only FDM CPU/GPU double strict”) |
 | FEM CPU | działa | `relax` → `m` → `transaction()` → `run` → `m` (bez demagnetyzacji; demag FEM wymaga `build_domain_mesh()` z airboxem) |
 | FEM GPU | działa | jak FEM CPU; kontynuacja ze stanu runu FEM CPU tej samej sesji |
 
