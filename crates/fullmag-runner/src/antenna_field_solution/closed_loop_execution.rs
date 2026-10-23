@@ -132,8 +132,13 @@ fn execute_native(input: &ResolvedAntennaClosedLoopCurrentInputIR, output_id: &s
     let mut solved = solved?;
     let accepted = solved.prepared_closed_loop_source_snapshot.take().ok_or_else(|| invalid("native accepted prepared source absent"))?;
     let direct = solved.oersted_quadrature_snapshot.take().ok_or_else(|| invalid("native direct H evidence absent"))?;
+    let budget = fullmag_ir::antenna_closed_loop_direct_budget(&input.stage.solver_policy)
+        .ok_or_else(|| invalid("unknown closed-loop direct work policy"))?;
     let policy = &input.direct_field_policy;
-    if direct.base_quadrature_order != policy.base_quadrature_order
+    if policy.policy_version != budget.policy_version
+        || direct.maximum_kernel_evaluations != budget.maximum_kernel_evaluations
+        || direct.maximum_ledger_leaf_visits != budget.maximum_ledger_leaf_visits
+        || direct.base_quadrature_order != policy.base_quadrature_order
         || direct.maximum_subdivision_depth != policy.maximum_subdivision_depth
         || direct.absolute_tolerance_apm != policy.absolute_tolerance_apm || direct.relative_tolerance != policy.relative_tolerance
         || direct.maximum_source_target_pairs != policy.maximum_source_target_pairs
@@ -144,7 +149,7 @@ fn execute_native(input: &ResolvedAntennaClosedLoopCurrentInputIR, output_id: &s
     let requested_intent = json!({"source_revision":input.source.revision,"object_id":input.source.object_id,
         "geometry_id":input.source.geometry_id,"source_module_id":binding.source_module_id,
         "mesh_digest":input.source.mesh_digest,"authored_input_digest":input.source.authored_input_digest,
-        "materials_digest":input.source.materials_digest,"requested_execution":input.authored_input_preimage.get("requested_execution").ok_or_else(|| invalid("requested authoring execution absent"))?});
+        "materials_digest":input.source.materials_digest,"solver_policy":input.stage.solver_policy,"requested_execution":input.authored_input_preimage.get("requested_execution").ok_or_else(|| invalid("requested authoring execution absent"))?});
     let resolved_execution = json!({"mesh_revision":binding.mesh_revision,"topology_revision":binding.topology_revision,
         "envelope_revision":binding.envelope_revision,"envelope_digest":binding.envelope_digest,
         "stable_vertex_id_version":"stable_mesh_vertex_u64.v1","stage_identity":binding.stage_identity.to_string(),
@@ -152,7 +157,11 @@ fn execute_native(input: &ResolvedAntennaClosedLoopCurrentInputIR, output_id: &s
         "execution_lane":1,"charge_gauge":2,"maximum_iterations":request.maximum_iterations,
         "charge_relative_tolerance":request.relative_tolerance,"charge_absolute_tolerance":request.absolute_tolerance,
         "algebraic_relative_tolerance":input.algebraic_relative_tolerance,"physical_relative_gate":input.physical_relative_gate,
-        "physical_absolute_gate_a":input.physical_absolute_gate_a});
+        "physical_absolute_gate_a":input.physical_absolute_gate_a,
+        "direct_field_policy":{"policy_version":budget.policy_version,
+            "maximum_source_target_pairs":budget.maximum_source_target_pairs,
+            "maximum_kernel_evaluations":budget.maximum_kernel_evaluations,
+            "maximum_ledger_leaf_visits":budget.maximum_ledger_leaf_visits}});
     let current_signature = format!("sha256:{}",accepted.accepted_source_state_digest);
     let sample_carrier = super::AntennaSampleCarrier {domain:input.field_sampling.domain.clone(),
         carrier_kind:input.field_sampling.carrier_kind.clone(),location:input.field_sampling.location.clone(),

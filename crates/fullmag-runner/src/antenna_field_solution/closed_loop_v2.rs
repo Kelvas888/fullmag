@@ -518,6 +518,7 @@ pub(crate) fn build(
         scale_per_a: scale,
         current_balance_certificate_digest: s.metadata.current_balance_certificate_digest.clone(),
     };
+    evidence.verify_policy_binding(&input.requested_intent, &input.resolved_execution)?;
     if input.signatures.field_solution_signature
         != field_signature(
             &s.metadata.accepted_source_state_digest,
@@ -1041,6 +1042,7 @@ pub(crate) fn verify(
     }
     let evidence =
         super::direct_quadrature_v2::DirectQuadratureEvidenceV2::decode(get("direct_evidence"))?;
+    evidence.verify_policy_binding(&m.requested_intent, &m.resolved_execution)?;
     if evidence.signed_normalization_a.to_bits() != m.signed_normalization_a.to_bits()
         || evidence.scale_per_a.to_bits() != m.scale_per_a.to_bits()
         || evidence.source_absolute_flux_a.to_bits() != m.source.source_absolute_flux_a.to_bits()

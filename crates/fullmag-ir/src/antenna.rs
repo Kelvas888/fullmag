@@ -21,6 +21,33 @@ pub const ANTENNA_PORT_MIGRATION_REQUIRES_TERMINAL_PAIRS: &str =
 /// changing meaning when the default pair budget is revised.
 pub const ANTENNA_DIRECT_OERSTED_BUDGET_POLICY_V1: &str = "antenna_direct_oersted_budget.v1";
 pub const ANTENNA_DIRECT_OERSTED_MAX_SOURCE_TARGET_PAIRS: u64 = 1_000_000;
+/// Closed-loop inspection work limits; selecting a larger budget does not qualify a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AntennaClosedLoopDirectBudgetIR {
+    pub policy_version: &'static str,
+    pub maximum_source_target_pairs: u64,
+    pub maximum_kernel_evaluations: u64,
+    pub maximum_ledger_leaf_visits: u64,
+}
+
+pub fn antenna_closed_loop_direct_budget(solver_policy: &str) -> Option<AntennaClosedLoopDirectBudgetIR> {
+    match solver_policy {
+        "production_default" => Some(AntennaClosedLoopDirectBudgetIR {
+            policy_version: "closed_loop_direct_defaults.unqualified.v2",
+            maximum_source_target_pairs: ANTENNA_DIRECT_OERSTED_MAX_SOURCE_TARGET_PAIRS,
+            maximum_kernel_evaluations: 100_000_000,
+            maximum_ledger_leaf_visits: 100_000_000,
+        }),
+        "volume_inspection_v1" => Some(AntennaClosedLoopDirectBudgetIR {
+            policy_version: "closed_loop_direct_volume.unqualified.v1",
+            maximum_source_target_pairs: 4_000_000,
+            maximum_kernel_evaluations: 500_000_000,
+            maximum_ledger_leaf_visits: 500_000_000,
+        }),
+        _ => None,
+    }
+}
+
 pub const ANTENNA_DIRECT_OERSTED_OPERATOR_VERSION: &str = "fem_oersted_direct_tetra_quadrature.v3";
 pub const ANTENNA_DIRECT_OERSTED_BASE_QUADRATURE_ORDER: i32 = 4;
 pub const ANTENNA_DIRECT_OERSTED_MAX_SUBDIVISION_DEPTH: i32 = 6;
@@ -1793,6 +1820,23 @@ pub(crate) fn validate_antenna_composition_v03(problem: &ProblemIR, errors: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_loop_direct_budget_requires_exact_opt_in_and_preserves_legacy_defaults() {
+        let legacy = super::antenna_closed_loop_direct_budget("production_default").unwrap();
+        assert_eq!(legacy.policy_version, "closed_loop_direct_defaults.unqualified.v2");
+        assert_eq!(legacy.maximum_source_target_pairs, 1_000_000);
+        assert_eq!(legacy.maximum_kernel_evaluations, 100_000_000);
+        assert_eq!(legacy.maximum_ledger_leaf_visits, 100_000_000);
+        let volume = super::antenna_closed_loop_direct_budget("volume_inspection_v1").unwrap();
+        assert_eq!(volume.policy_version, "closed_loop_direct_volume.unqualified.v1");
+        assert_eq!(volume.maximum_source_target_pairs, 4_000_000);
+        assert_eq!(volume.maximum_kernel_evaluations, 500_000_000);
+        assert_eq!(volume.maximum_ledger_leaf_visits, 500_000_000);
+        for unknown in ["", "direct", "volume_inspection_v2", "Volume_Inspection_v1", "volume_inspection_v1 "] {
+            assert!(super::antenna_closed_loop_direct_budget(unknown).is_none());
+        }
+    }
 
     #[test]
     fn antenna_solution_reference_preserves_symbolic_and_published_wire_shapes() {

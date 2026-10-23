@@ -2640,3 +2640,42 @@ Dwie regresje `accepted_antenna_linkage` obejmują rozdzielenie ID oraz odmowę
 niezgodnego rodzaju/planu. Zostały przygotowane, lecz lokalnie nie kompilowano
 testów; istniejący krok bootstrap `live_accepted_projection::tests` je obejmuje.
 Wdrożenie runtime i rzeczywisty widok nadal wymagają weryfikacji.
+
+
+### 23.10.2026 — zatwierdzony profil mapy objętościowej Universe
+
+Użytkownik zatwierdził dokładną propozycję z commita
+`58e96e859c05def0c822e618bbaedc2781ccd1e8`: jawny `volume_inspection_v1`
+i jedną próbę Universe. Profil ogranicza całe wywołanie do 4 000 000 par,
+500 000 000 próbek jądra i 500 000 000 odwiedzin ledgeru. Nie resetuje budżetu
+między punktami. `production_default` pozostaje przy 1M/100M/100M;
+order 4, depth 6, tolerancje 1e-9 A/m i 1e-5 oraz limit liści na target 1M
+są zachowane. Profil dotyczy wyłącznie przygotowanej zamkniętej pętli FEM CPU
+double w trybie inspekcji. Nie kwalifikuje bazy, projekcji H1, external-lead
+ani użycia LLG. Limity CPU/RAM kontenera pozostają bez zmian.
+
+Wybrany profil przechodzi przez IR, planner, Rust/C ABI i pojedynczy natywny
+WorkBudget. Snapshot i cold reader v2 dopuszczają wyłącznie dokładne dwa
+zestawy limitów; zapisany requested/resolved profil musi odpowiadać evidence.
+Starszy zapis bez jawnego profilu jest nadal odczytywany wyłącznie jako
+legacy. Codec v1 i jego legacy odmowy pozostają zachowane. Nowe regresje
+IR/plannera/codec są włączone do istniejącego CI Rust; testy ABI/native
+przygotowano, ale lokalnie nie kompilowano testów jednostkowych.
+
+Poprzednie CI 39945466728 zaliczyło nowe testy powiązania etapu Raw SI,
+lecz końcowy router test poległ w przygotowaniu pliku fixture (`ENOENT`),
+przed HTTP: 1145 PASS, 1 FAIL, 3 ignored. Zidentyfikowano lukę izolacji
+katalogów opartych na zegarze; oddzielny commit dodaje licznik atomowy
+oraz exclusive create_dir. Kolizja jest hipotezą zgodną z kodem, a nie
+udowodnionym sprawcą tej awarii. Pełny log pozostaje w control volume:
+`verification/ci39945466728/rust-contracts-failed.log`.
+
+Checkpoint przed buildem:
+`verification/universe-volume-policy-20261023/saved-authoring-prebuild.json`,
+SHA256 `2a67b9d733fcd2663506d9d8fe512903cfab7ca9c4665837c47c5a44bbe3d066`.
+Przypina bezczynną sesję, archiwum sceny, właściciela runtime i pięć
+terminalnych katalogów runów. Na D: jest 153,55 GiB wolnego;
+backendowy filesystem Docker ma 536,01 GiB wolnego logicznie.
+Budowa i nowy Solve są na tym checkpointcie jeszcze niewykonane.
+Weryfikacja starego wyniku, nowego pełnego H i rzeczywistego UI pozostaje
+osobną bramką. E1–E12 nadal otwarte.

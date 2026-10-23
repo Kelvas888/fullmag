@@ -111,6 +111,13 @@ jobs:
                   f"FULLMAG_PROJECT_STORAGE_ROOT={layout['storage_root']}\n"
               )
           PY
+      - name: Run closed-loop volume inspection policy contracts
+        run: |
+          cargo test -p fullmag-ir --lib closed_loop_direct_budget_
+          cargo test -p fullmag-plan --lib antenna_current_source::tests::closed_loop_volume_budget_
+          cargo test -p fullmag-plan --lib antenna_current_source::tests::external_lead_does_not_inherit_closed_loop_volume_budget
+          cargo test -p fullmag-runner --lib antenna_field_solution::direct_quadrature
+
       - name: Run shared accepted-inspection read contracts
         run: |
           cargo test -p fullmag-session --lib read_transaction

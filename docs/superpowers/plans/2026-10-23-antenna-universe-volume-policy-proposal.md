@@ -1,6 +1,8 @@
 # Universe anteny — propozycja jawnego profilu pracy pola
 
-Status: projekt decyzji; profil nie jest zaimplementowany ani uruchomiony.
+Status: użytkownik zatwierdził dokładny profil z propozycji 58e96 i jedną próbę Universe.
+Implementacja źródłowa jest integrowana; build, CI i nowe wykonanie H pozostają
+bramkami weryfikacji. Nie deklarujemy wykonanego Solve ani kwalifikacji.
 Zakres: wyłącznie inspekcja niemagnetycznej pełnej pętli FEM CPU/double.
 Nie jest to kwalifikowana baza anteny ani reprodukcja publikacji.
 
@@ -11,7 +13,7 @@ a zamiast lokalnej kostki tworzy Universe z marginesem 0,5 µm po każdej stroni
 Parametry otoczenia: minimum 150 nm, maksimum 500 nm, growth 1,6, geometric.
 Diagnostyczna generacja dała 1154 węzły i 6487 Tet4 w 12,44 s, bez fallbacku.
 Nie wysłano Solve. Przy poprzedniej siatce źródła 1867 Tet4 potrzeba
-2 154 518 par; obecna wersjonowana polityka dopuszcza najwyżej 1 000 000.
+2 154 518 par; zachowany domyślny profil dopuszcza najwyżej 1 000 000.
 Liczność nowego źródła musi zostać ponownie sprawdzona po jego przygotowaniu.
 
 Zachowany wynik b0 ma 26 138 par, 993 244 kernel evaluations i 26 138 ledger
@@ -23,9 +25,9 @@ SHA256 zachowanego bundle:
 SHA256 dowodu kwadratury:
 `7416af155e6d68859335f117d4afe49aa2fbc77c35cd7e5987c6adbdfc48ef61`.
 
-## Konkretny proponowany profil
+## Zatwierdzony profil
 
-| Parametr | Zachowany domyślny profil | Nowy profil wymagający jawnego wyboru |
+| Parametr | Zachowany domyślny profil | Zatwierdzony profil wymagający jawnego wyboru |
 |---|---:|---:|
 | `solver_policy` | `production_default` | `volume_inspection_v1` |
 | Resolved policy | `closed_loop_direct_defaults.unqualified.v2` | `closed_loop_direct_volume.unqualified.v1` |
@@ -49,8 +51,8 @@ dla całego zapytania; nie resetujemy ich przez batching i nie ponawiamy Solve.
    `materialize_antenna_closed_loop_current_input` w
    `crates/fullmag-plan/src/antenna_current_source.rs`.
 2. Existing `solver_policy` przechodzi przez Python i round-trip; nowego pola
-   modelu ani równoległego solvera nie dodajemy. Nowy przykład jawnie wybierze
-   profil dopiero po decyzji.
+   modelu ani równoległego solvera nie dodajemy. Przykład
+   `fem_antenna_closed_loop_universe.py` jawnie wybiera `volume_inspection_v1`.
 3. Runner przekazuje wybrany tuple do natywnego wywołania i weryfikuje go w
    snapshotcie. Native używa jednego resolvera dla walidacji, pojedynczego
    WorkBudget oraz zapisu headera.
@@ -80,15 +82,15 @@ dla całego zapytania; nie resetujemy ich przez batching i nie ponawiamy Solve.
   osobne klatki siatki i czytelnych wektorów. Rzeczywisty browser/WebGL nadal
   jest wymaganą bramką, a nie skutkiem samego przejścia CI.
 
-## Dlaczego potrzebna jest decyzja
+## Zapis zgody i jej granice
 
 Instrukcje AGENTS.md przekazane przez użytkownika, sekcja 8, wymagają pytania,
 gdy zmiana dotyka elementu „load-bearing, versioned, or has a migration path”.
-Tutaj zwiększamy wersjonowany budżet całego operatora i wymagania zgodności
-czytników. Zgoda dotyczy wdrożenia powyższego profilu oraz jednej ograniczonej
+Dla tego wersjonowanego budżetu i zgodności czytników użytkownik zatwierdził
+powyższy konkretny profil. Zgoda dotyczy wdrożenia oraz jednej ograniczonej
 próby pełnej domeny; nie oznacza zgody na usunięcie danych lub kolejne
 podnoszenie limitów. Jest to decyzja o konkretnym projekcie, nie zatwierdzenie
-nieistniejącego patcha ani deklaracja kwalifikacji naukowej.
+wyniku przed wykonaniem ani deklaracja kwalifikacji naukowej.
 
 Kontrakt fizyczny i mapa implementacji: nota 0950, sekcja
 `antenna-universe-inspection-carrier`. Siatka i wynik źródłowy pozostają

@@ -1,9 +1,10 @@
 """Full-volume microstrip loop with a graded nonmagnetic Universe H carrier.
 
 The inlet bridge contains one ideal coincident potential jump. This stage
-authors raw inspection V/J/H and waits for Compute. The legacy direct-field
-work limit currently rejects the full sampling domain; no H solve is claimed.
-It does not qualify a reusable antenna basis.
+authors raw inspection V/J/H and waits for Compute. It explicitly selects the
+bounded volume_inspection_v1 work profile without changing quadrature tolerances.
+Runtime H verification is pending; this script
+does not qualify a reusable antenna basis.
 See docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md.
 """
 
@@ -105,6 +106,7 @@ study.stages.add_antenna_field_solve(
         id="inspect_loop", source_object_id="antenna", current_transport_id="antenna_charge",
         port_mode_ids=["loop_port"], field_sampling_domain=fm.FieldTarget.global_domain(),
         target_refs=[fm.FieldTarget.global_domain()],
+        solver_policy="volume_inspection_v1",
         # The stage selector is existing API vocabulary; publication remains inspection_only.
         outputs=[fm.AntennaNamedOutput("loop_inspection", "H_ant_basis")],
     ),

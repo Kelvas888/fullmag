@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -78,6 +79,85 @@ void direct_tetra_signed_current_and_budget_contract()
     }
     require(rejected,
         "direct tetrahedral Oersted did not reject an exceeded pair budget");
+}
+
+void direct_tetra_explicit_volume_profile_contract()
+{
+    DirectTetraQuadratureOptions options;
+    const auto legacy = DirectTetraQuadrature::ResolveWorkLimits(options);
+    require(legacy.maximum_kernel_evaluations == 100'000'000 &&
+            legacy.maximum_ledger_leaf_visits == 100'000'000,
+        "default direct tetra work limits changed");
+    auto restricted_legacy = options;
+    restricted_legacy.maximum_source_target_pairs = 1;
+    restricted_legacy.base_quadrature_order = 16;
+    restricted_legacy.maximum_subdivision_depth = 0;
+    restricted_legacy.absolute_tolerance_apm = 0.0;
+    restricted_legacy.relative_tolerance = 0.0;
+    require(DirectTetraQuadrature::ResolveWorkLimits(restricted_legacy).maximum_kernel_evaluations == 100'000'000,
+        "legacy restricted pair limits or generic quadrature options changed");
+    auto reject = [](const DirectTetraQuadratureOptions &bad) {
+        bool rejected = false;
+        try { (void)DirectTetraQuadrature::ResolveWorkLimits(bad); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        require(rejected, "direct tetra accepted an unknown or mixed work profile");
+    };
+    for (const auto limit : {std::uint64_t{0}, std::uint64_t{1'000'001},
+            std::uint64_t{3'999'999}, std::uint64_t{4'000'001},
+            std::numeric_limits<std::uint64_t>::max()}) {
+        auto bad = options; bad.maximum_source_target_pairs = limit; reject(bad);
+    }
+    options.maximum_source_target_pairs = 4'000'000;
+    const auto volume = DirectTetraQuadrature::ResolveWorkLimits(options);
+    require(volume.maximum_kernel_evaluations == 500'000'000 &&
+            volume.maximum_ledger_leaf_visits == 500'000'000 &&
+            DirectTetraQuadrature::maximum_final_leaves_per_target == 1'000'000,
+        "explicit volume work limits differ from the approved tuple");
+    auto bad = options; bad.base_quadrature_order = 6; reject(bad);
+    bad = options; bad.maximum_subdivision_depth = 5; reject(bad);
+    bad = options; bad.absolute_tolerance_apm = std::nextafter(1.0e-9, 0.0); reject(bad);
+    bad = options; bad.relative_tolerance = std::nextafter(1.0e-5, 0.0); reject(bad);
+
+    auto mesh = mfem::Mesh::MakeCartesian3D(
+        1, 1, 1, mfem::Element::TETRAHEDRON, 1.0, 1.0, 1.0);
+    mfem::RT_FECollection collection(0, 3);
+    mfem::FiniteElementSpace space(&mesh, &collection);
+    mfem::GridFunction current(&space);
+    mfem::Vector vector(3); vector = 0.0; vector[0] = 4.0;
+    mfem::VectorConstantCoefficient coefficient(vector);
+    current.ProjectCoefficient(coefficient);
+    const std::vector<std::array<double, 3>> targets{{2.0, 0.5, 0.5}, {2.0, 0.25, 0.75}};
+    const auto legacy_result = DirectTetraQuadrature::EvaluateField(mesh, current, targets);
+    const auto volume_result = DirectTetraQuadrature::EvaluateField(mesh, current, targets, options);
+    require(volume_result.h_xyz_apm == legacy_result.h_xyz_apm &&
+            volume_result.diagnostics.kernel_evaluations == legacy_result.diagnostics.kernel_evaluations &&
+            volume_result.diagnostics.ledger_leaf_visits == legacy_result.diagnostics.ledger_leaf_visits,
+        "volume work limits changed quadrature or field values below the legacy cap");
+    std::uint64_t samples = 0, visits = 0;
+    for (const auto &target : volume_result.target_diagnostics) {
+        samples += target.kernel_evaluations; visits += target.ledger_leaf_visits;
+    }
+    require(samples == volume_result.diagnostics.kernel_evaluations &&
+            visits == volume_result.diagnostics.ledger_leaf_visits &&
+            samples > volume_result.target_diagnostics.front().kernel_evaluations &&
+            visits > volume_result.target_diagnostics.front().ledger_leaf_visits,
+        "direct tetra work counters did not retain all targets");
+
+    // Stop at coordinate validation: admission is tested without a multi-million-pair solve.
+    const auto admission_error = [&](std::size_t count, const DirectTetraQuadratureOptions &policy) {
+        std::vector<std::array<double, 3>> invalid_targets(count, targets.front());
+        invalid_targets.front()[0] = std::numeric_limits<double>::quiet_NaN();
+        try { (void)DirectTetraQuadrature::EvaluateField(mesh, current, invalid_targets, policy); }
+        catch (const std::invalid_argument &error) { return std::string(error.what()); }
+        throw std::runtime_error("nonfinite admission fixture was accepted");
+    };
+    const auto source_count = static_cast<std::size_t>(mesh.GetNE());
+    const auto large_count = 1'000'000u / source_count + 1u;
+    require(admission_error(large_count, {}).find("pair budget exceeded") != std::string::npos &&
+            admission_error(large_count, options).find("target is non-finite") != std::string::npos &&
+            admission_error(4'000'000u / source_count, options).find("target is non-finite") != std::string::npos &&
+            admission_error(4'000'000u / source_count + 1u, options).find("pair budget exceeded") != std::string::npos,
+        "explicit volume pair admission is not bounded independently from the legacy profile");
 }
 
 void direct_tetra_singular_target_contract()
@@ -196,6 +276,12 @@ void direct_tetra_consistent_h1_projection_contract()
         "consistent H1 projection left unconverged source pairs");
     require(diagnostics.source_target_pairs > 0,
         "consistent H1 projection did not evaluate direct source pairs");
+    DirectTetraQuadratureOptions volume;
+    volume.maximum_source_target_pairs = 4'000'000;
+    bool volume_rejected = false;
+    try { (void)DirectTetraQuadrature::ProjectField(current, projected, volume); }
+    catch (const std::invalid_argument &) { volume_rejected = true; }
+    require(volume_rejected, "H1 projection accepted the inspection-only volume profile");
     require(std::all_of(projected.begin(), projected.end(),
             [](double value) { return std::isfinite(value); }),
         "consistent H1 projection produced a non-finite field");
@@ -393,6 +479,7 @@ int main()
 {
     try {
         direct_tetra_signed_current_and_budget_contract();
+        direct_tetra_explicit_volume_profile_contract();
         direct_tetra_singular_target_contract();
         direct_tetra_consistent_h1_projection_contract();
         direct_tetra_h_refinement_contract();

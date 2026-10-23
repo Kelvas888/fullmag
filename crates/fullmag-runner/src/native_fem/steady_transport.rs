@@ -22,6 +22,18 @@ fn preflight_direct_oersted_pair_budget(
     source_cell_count: usize,
     target_count: usize,
 ) -> Result<u64, RunError> {
+    preflight_direct_oersted_pair_budget_with_limit(
+        source_cell_count, target_count, DIRECT_OERSTED_MAX_SOURCE_TARGET_PAIRS,
+        fullmag_ir::ANTENNA_DIRECT_OERSTED_BUDGET_POLICY_V1,
+    )
+}
+
+fn preflight_direct_oersted_pair_budget_with_limit(
+    source_cell_count: usize,
+    target_count: usize,
+    maximum_pairs: u64,
+    policy_version: &str,
+) -> Result<u64, RunError> {
     if source_cell_count == 0 || target_count == 0 {
         return Err(RunError {
             message: format!(
@@ -40,11 +52,11 @@ fn preflight_direct_oersted_pair_budget(
             "antenna Oersted preflight source-target pair count overflows: {source_count} source tetrahedra x {target_count} target points"
         ),
     })?;
-    if pairs > DIRECT_OERSTED_MAX_SOURCE_TARGET_PAIRS {
+    if pairs > maximum_pairs {
         return Err(RunError {
             message: format!(
-                "antenna Oersted preflight policy='{}' requires {pairs} source-target pairs ({source_count} source tetrahedra x {target_count} target points), exceeding the limit {DIRECT_OERSTED_MAX_SOURCE_TARGET_PAIRS}; reduce the authored target resolution or select the qualified vector-potential realization",
-                fullmag_ir::ANTENNA_DIRECT_OERSTED_BUDGET_POLICY_V1,
+                "antenna Oersted preflight policy='{}' requires {pairs} source-target pairs ({source_count} source tetrahedra x {target_count} target points), exceeding the limit {maximum_pairs}; reduce the authored target resolution or select the qualified vector-potential realization",
+                policy_version,
             ),
         });
     }
@@ -1173,17 +1185,38 @@ pub(crate) fn solve_native_fem_steady_transport_rt0(
         identity: Some(&view.identity), pins: Some(&view.pins), closure: &view.closure,
         algebraic_relative_tolerance:view.algebraic_relative_tolerance,physical_relative_gate:view.physical_relative_gate,
         physical_absolute_gate_a:view.physical_absolute_gate_a,reference_mpi_gather_broadcast:view.reference_mpi_gather_broadcast,
-    }, oersted_method,target_points,None)
+    }, oersted_method,target_points,None,None)
 }
 pub(crate) fn solve_native_fem_prepared_closed_loop(
     request:&NativeFemPreparedClosedLoopChargeRequest,input:&fullmag_ir::ResolvedAntennaClosedLoopCurrentInputIR,
     binding:&PreparedClosedLoopRuntimeBinding,target_points:Option<&[[f64;3]]>,
 )->Result<NativeFemSteadyTransportRt0Result,RunError>{
+    let budget = fullmag_ir::antenna_closed_loop_direct_budget(&input.stage.solver_policy)
+        .ok_or_else(|| RunError { message: "unsupported prepared closed-loop direct solver policy".into() })?;
+    let policy = &input.direct_field_policy;
+    if policy.policy_version != budget.policy_version
+        || policy.maximum_source_target_pairs != budget.maximum_source_target_pairs
+        || policy.base_quadrature_order != fullmag_ir::ANTENNA_DIRECT_OERSTED_BASE_QUADRATURE_ORDER
+        || policy.maximum_subdivision_depth != fullmag_ir::ANTENNA_DIRECT_OERSTED_MAX_SUBDIVISION_DEPTH
+        || policy.absolute_tolerance_apm.to_bits() != fullmag_ir::ANTENNA_DIRECT_OERSTED_ABSOLUTE_TOLERANCE_APM.to_bits()
+        || policy.relative_tolerance.to_bits() != fullmag_ir::ANTENNA_DIRECT_OERSTED_RELATIVE_TOLERANCE.to_bits()
+        || policy.relative_scale_floor_apm.to_bits() != 0.0_f64.to_bits()
+    {
+        return Err(RunError { message: "prepared closed-loop direct policy differs from the selected budget".into() });
+    }
+    if let Some(points) = target_points {
+        let pairs = preflight_direct_oersted_pair_budget_with_limit(
+            request.mesh.cell_count(), points.len(), budget.maximum_source_target_pairs, budget.policy_version,
+        )?;
+        if policy.source_target_pairs != pairs {
+            return Err(RunError { message: "prepared closed-loop source-target pair pin differs".into() });
+        }
+    }
     let prepared=prepared_closed_loop::PreparedRequestBuffer::new(input,binding,request)?;
     solve_rt0_common(Rt0NumericInput{mesh:&request.mesh,charge_conductivity_spm_per_element:&request.charge_conductivity_spm_per_element,gauge:request.gauge,relative_tolerance:request.relative_tolerance,absolute_tolerance:request.absolute_tolerance,maximum_iterations:request.maximum_iterations,legacy:None},Rt0InputView{stable_vertex_ids:&input.source.stable_vertex_ids,boundary_faces:&input.boundary_roles,
         identity:None,pins:None,closure:&input.source.closure,algebraic_relative_tolerance:input.algebraic_relative_tolerance,
         physical_relative_gate:input.physical_relative_gate,physical_absolute_gate_a:input.physical_absolute_gate_a,
-        reference_mpi_gather_broadcast:false},NativeFemSteadyTransportOerstedMethod::DirectTetraQuadrature,target_points,Some(prepared))
+        reference_mpi_gather_broadcast:false},NativeFemSteadyTransportOerstedMethod::DirectTetraQuadrature,target_points,Some(prepared),Some(budget))
 }
 struct Rt0NumericInput<'a>{mesh:&'a MeshIR,charge_conductivity_spm_per_element:&'a [f64],gauge:NativeFemSteadyTransportGauge,relative_tolerance:f64,absolute_tolerance:f64,maximum_iterations:u32,legacy:Option<&'a NativeFemSteadyTransportRequest>}
 impl<'a> Rt0NumericInput<'a>{fn legacy(r:&'a NativeFemSteadyTransportRequest)->Self{Self{mesh:&r.mesh,charge_conductivity_spm_per_element:&r.charge_conductivity_spm_per_element,gauge:r.gauge,relative_tolerance:r.relative_tolerance,absolute_tolerance:r.absolute_tolerance,maximum_iterations:r.maximum_iterations,legacy:Some(r)}}}
@@ -1194,7 +1227,8 @@ struct Rt0InputView<'a> {
     physical_absolute_gate_a:f64,reference_mpi_gather_broadcast:bool,
 }
 fn solve_rt0_common(request:Rt0NumericInput<'_>,view:Rt0InputView<'_>,oersted_method:NativeFemSteadyTransportOerstedMethod,
-    target_points:Option<&[[f64;3]]>, mut prepared:Option<prepared_closed_loop::PreparedRequestBuffer<'_>>) -> Result<NativeFemSteadyTransportRt0Result,RunError> {
+    target_points:Option<&[[f64;3]]>, mut prepared:Option<prepared_closed_loop::PreparedRequestBuffer<'_>>,
+    direct_budget:Option<fullmag_ir::AntennaClosedLoopDirectBudgetIR>) -> Result<NativeFemSteadyTransportRt0Result,RunError> {
     let coincident = matches!(view.closure, ConservativeCurrentClosureIR::ClosedGeometry { operator_version, .. }
         if operator_version == "fem_closed_current_geometry.v2");
     if coincident && (request.gauge != NativeFemSteadyTransportGauge::ZeroMeanPotential ||
@@ -1217,7 +1251,12 @@ fn solve_rt0_common(request:Rt0NumericInput<'_>,view:Rt0InputView<'_>,oersted_me
         NativeFemSteadyTransportOerstedMethod::DirectTetraQuadrature
     ) {
         if let Some(target_points) = target_points {
-            preflight_direct_oersted_pair_budget(rt0_cell_count, target_points.len())?;
+            if let Some(budget) = direct_budget {
+                preflight_direct_oersted_pair_budget_with_limit(rt0_cell_count, target_points.len(),
+                    budget.maximum_source_target_pairs, budget.policy_version)?;
+            } else {
+                preflight_direct_oersted_pair_budget(rt0_cell_count, target_points.len())?;
+            }
         }
     }
     // The legacy H1 preflight rejects periodic topology because its old ABI
@@ -1604,7 +1643,7 @@ fn solve_rt0_common(request:Rt0NumericInput<'_>,view:Rt0InputView<'_>,oersted_me
                     maximum_subdivision_depth: fullmag_ir::ANTENNA_DIRECT_OERSTED_MAX_SUBDIVISION_DEPTH,
                     absolute_tolerance_apm: fullmag_ir::ANTENNA_DIRECT_OERSTED_ABSOLUTE_TOLERANCE_APM,
                     relative_tolerance: fullmag_ir::ANTENNA_DIRECT_OERSTED_RELATIVE_TOLERANCE,
-                    maximum_source_target_pairs: DIRECT_OERSTED_MAX_SOURCE_TARGET_PAIRS,
+                    maximum_source_target_pairs: direct_budget.map_or(DIRECT_OERSTED_MAX_SOURCE_TARGET_PAIRS, |budget| budget.maximum_source_target_pairs),
                 };
                 let mut outer_result = ffi::fullmag_fem_steady_transport_rt0_oersted_result_v1 {
                     abi_version: ffi::FULLMAG_FEM_STEADY_TRANSPORT_RT0_OERSTED_ABI_VERSION,
@@ -1854,15 +1893,16 @@ fn solve_rt0_common(request:Rt0NumericInput<'_>,view:Rt0InputView<'_>,oersted_me
             oersted_result.unconverged_pair_count,
             oersted_result.maximum_pair_error_apm,
         )?;
-        let quadrature_snapshot = snapshot_buffer.finish(
-            &oersted_result,
-            target_points.ok_or_else(|| RunError {
-                message: "native FEM OE-F1 snapshot has no authored target points".into(),
-            })?,
-            &h_xyz_apm,
-            rt0_cell_count,
-            &source_view_identity_digest,
-        )?;
+        let points = target_points.ok_or_else(|| RunError {
+            message: "native FEM OE-F1 snapshot has no authored target points".into(),
+        })?;
+        let quadrature_snapshot = if let Some(budget) = direct_budget {
+            snapshot_buffer.finish_with_budget(&oersted_result, points, &h_xyz_apm,
+                rt0_cell_count, &source_view_identity_digest, budget)?
+        } else {
+            snapshot_buffer.finish(&oersted_result, points, &h_xyz_apm,
+                rt0_cell_count, &source_view_identity_digest)?
+        };
         let diagnostics = quadrature_snapshot.diagnostics();
         Some(NativeFemOerstedField {
             field: h_xyz_apm,

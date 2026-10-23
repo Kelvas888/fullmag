@@ -3337,6 +3337,83 @@
     }
   ],
   "sources": [
+    {
+      "id": "antenna-universe-volume-native-binding",
+      "path": "crates/fullmag-runner/src/native_fem/steady_transport.rs",
+      "symbol": "solve_native_fem_prepared_closed_loop",
+      "responsibility": "Sprawdza requested/resolved policy oraz rzeczywistą liczbę par przed wywołaniem natywnym.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-cold-binding",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/direct_quadrature_v2.rs",
+      "symbol": "verify_policy_binding",
+      "responsibility": "Cold v2 wiąże dokładny tuple budżetu ze snapshotem i requested/resolved provenance; legacy bez nowych pól wymaga starego profilu.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-native-selector",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp",
+      "symbol": "DirectTetraQuadrature::ResolveWorkLimits",
+      "responsibility": "Zamknięty selektor legacy 1..1M lub dokładnie 4M; wyznacza globalne limity kernel i ledger bez zmiany ABI.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-whole-invocation-work",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp",
+      "symbol": "WorkBudget",
+      "responsibility": "Wspólny licznik kernel/ledger całego zapytania, obejmujący wszystkie targety i adaptację.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-budget-type",
+      "path": "crates/fullmag-ir/src/antenna.rs",
+      "symbol": "AntennaClosedLoopDirectBudgetIR",
+      "responsibility": "Wspólny typ dokładnego wersjonowanego zestawu limitów pętli; bez nowego modelu fizycznego.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-resolver",
+      "path": "crates/fullmag-ir/src/antenna.rs",
+      "symbol": "antenna_closed_loop_direct_budget",
+      "responsibility": "Dokładne mapowanie production_default i volume_inspection_v1; nieznany token odrzucony.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-planner",
+      "path": "crates/fullmag-plan/src/antenna_current_source.rs",
+      "symbol": "closed_loop_direct_field_policy",
+      "responsibility": "Kontrolowany dodatni iloczyn par, wybrany limit i niezmienione tolerancje.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-profile-test",
+      "path": "crates/fullmag-ir/src/antenna.rs",
+      "symbol": "closed_loop_direct_budget_requires_exact_opt_in_and_preserves_legacy_defaults",
+      "responsibility": "Regresja obu dokładnych profili i odmowy nieznanych tokenów; test przygotowany do CI.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-accuracy-test",
+      "path": "crates/fullmag-plan/src/antenna_current_source.rs",
+      "symbol": "closed_loop_volume_budget_is_explicit_and_preserves_legacy_accuracy_options",
+      "responsibility": "Regresja 2 154 518 par oraz niezmienionych opcji dokładności; test przygotowany do CI.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-limits-test",
+      "path": "crates/fullmag-plan/src/antenna_current_source.rs",
+      "symbol": "closed_loop_volume_budget_rejects_over_cap_overflow_empty_and_unknown_policy",
+      "responsibility": "Regresja granicy 4M, overflow, pustego wejścia i nieznanego profilu; test przygotowany do CI.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-volume-external-lead-test",
+      "path": "crates/fullmag-plan/src/antenna_current_source.rs",
+      "symbol": "external_lead_does_not_inherit_closed_loop_volume_budget",
+      "responsibility": "Regresja zachowania odmowy nowego profilu dla external-lead; test przygotowany do CI.",
+      "evidence_status": "source_only"
+    },
     {"id": "antenna-retained-reference-fit", "path": "scripts/antenna_rt0_surface_oracle.py", "symbol": "fit_retained_rt0", "responsibility": "Independent centered scalar RT0 Householder reconstruction; no solver or H qualification."},
     {"id": "antenna-retained-reference-fit-tests", "path": "scripts/test_antenna_rt0_surface_oracle.py", "symbol": "test_full_affine_non_rt0_gradients_are_rejected", "responsibility": "Analytic coefficients, invalid affine fields, geometry, scale and exact-input regressions."},
     {
@@ -8088,7 +8165,7 @@
       "id": "antenna-universe-sampling-example",
       "path": "examples/fem_antenna_closed_loop_universe.py",
       "symbol": "study",
-      "responsibility": "Osobny przykład niemagnetycznej domeny: diagnostycznie 1154 węzły/6487 Tet4, brak H solve; obecny budżet 1M par blokuje pełne wykonanie.",
+      "responsibility": "Niemagnetyczny Universe i jawny volume_inspection_v1; diagnostyczna siatka 1154 węzły/6487 Tet4; wykonanie H nadal oczekuje na weryfikację.",
       "evidence_status": "source_only"
     }
   ],
@@ -8661,9 +8738,9 @@
         "type": "str",
         "default": "production_default",
         "si_unit": "$1$",
-        "validation": "niepusty token; materializator nowego source obsługuje wyłącznie production_default, inne odrzuca",
-        "meaning": "requested policy zachowana osobno od resolved unqualified preset",
-        "backend_support": "FEM CPU/double input; public source execution niedostępne",
+        "validation": "niepusty token Python; preparowana pętla dopuszcza dokładnie production_default lub volume_inspection_v1, pozostałe odrzuca; external-lead wyłącznie production_default",
+        "meaning": "requested policy zachowana oddzielnie od resolved unqualified preset; jawny opt-in bez zmiany tolerancji",
+        "backend_support": "inspekcja preparowanej pełnej pętli FEM CPU/double/P1/strict; Universe H runtime pending",
         "problem_ir": "antenna_field_solve_stages[].solver_policy"
       },
       {
@@ -9483,7 +9560,7 @@
         "si_unit": "$1$",
         "validation": "auto/manual; manual wymaga size",
         "meaning": "sposób określenia granic",
-        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "backend_support": "inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane",
         "problem_ir": "problem_meta.runtime_metadata.study_universe.mode"
       },
       {
@@ -9493,7 +9570,7 @@
         "si_unit": "$\\mathrm m$",
         "validation": "trzy skończone nieujemne składowe",
         "meaning": "dwustronny margines domeny",
-        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "backend_support": "inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane",
         "problem_ir": "problem_meta.runtime_metadata.study_universe.padding"
       },
       {
@@ -9503,7 +9580,7 @@
         "si_unit": "$\\mathrm m$",
         "validation": "skończone dodatnie minimum nie większe od maksimum",
         "meaning": "minimalny rozmiar elementu otoczenia",
-        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "backend_support": "inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane",
         "problem_ir": "problem_meta.runtime_metadata.study_universe.airbox_hmin"
       },
       {
@@ -9513,7 +9590,7 @@
         "si_unit": "$\\mathrm m$",
         "validation": "skończone dodatnie maksimum nie mniejsze od minimum",
         "meaning": "maksymalny rozmiar elementu otoczenia",
-        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "backend_support": "inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane",
         "problem_ir": "problem_meta.runtime_metadata.study_universe.airbox_hmax"
       },
       {
@@ -9523,7 +9600,7 @@
         "si_unit": "$1$",
         "validation": "skończona wartość większa od jeden",
         "meaning": "współczynnik stopniowania",
-        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "backend_support": "inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane",
         "problem_ir": "problem_meta.runtime_metadata.study_universe.airbox_growth_rate"
       },
       {
@@ -9533,7 +9610,7 @@
         "si_unit": "$1$",
         "validation": "auto/geometric/linear",
         "meaning": "rodzaj stopniowania",
-        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "backend_support": "inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane",
         "problem_ir": "problem_meta.runtime_metadata.study_universe.airbox_grading"
       },
       {
@@ -9543,7 +9620,7 @@
         "si_unit": "$1$",
         "validation": "wymaga geometrii i konfiguracji siatki FEM",
         "meaning": "jawna materializacja domeny",
-        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "backend_support": "inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane",
         "problem_ir": "problem_meta.runtime_metadata.mesh_workflow; geometry_assets.fem_domain_mesh_asset"
       }
     ]

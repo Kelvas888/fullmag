@@ -2449,6 +2449,7 @@ int solve_rt0(
         options.relative_tolerance = oersted_request->relative_tolerance;
         options.maximum_source_target_pairs =
             oersted_request->maximum_source_target_pairs;
+        const auto work_limits = fullmag::fem::oersted::DirectTetraQuadrature::ResolveWorkLimits(options);
         std::vector<std::array<double, 3>> target_points;
         target_points.reserve(static_cast<std::size_t>(target_count));
         for (std::uint64_t index = 0; index < target_count; ++index) {
@@ -2528,10 +2529,8 @@ int solve_rt0(
             quadrature_snapshot->maximum_source_target_pairs = options.maximum_source_target_pairs;
             quadrature_snapshot->maximum_final_leaves_per_target =
                 fullmag::fem::oersted::DirectTetraQuadrature::maximum_final_leaves_per_target;
-            quadrature_snapshot->maximum_kernel_evaluations =
-                fullmag::fem::oersted::DirectTetraQuadrature::maximum_kernel_evaluations;
-            quadrature_snapshot->maximum_ledger_leaf_visits =
-                fullmag::fem::oersted::DirectTetraQuadrature::maximum_ledger_leaf_visits;
+            quadrature_snapshot->maximum_kernel_evaluations = work_limits.maximum_kernel_evaluations;
+            quadrature_snapshot->maximum_ledger_leaf_visits = work_limits.maximum_ledger_leaf_visits;
             copy_rt0_text(quadrature_snapshot->schema_version,
                 sizeof(quadrature_snapshot->schema_version),
                 "fem_direct_oersted_target_snapshot.v1", "OE-F1 snapshot schema");

@@ -1960,13 +1960,14 @@ przestrzenny kierunek statycznego $\mathbf H$, a nie precesję w czasie.
 
 | Parametr Python | Typ | Wartość domyślna | Jednostka SI | Walidacja | Znaczenie | Zakres realizacji | Pole ProblemIR |
 |---|---|---|---|---|---|---|---|
-| study.universe.mode | str \| None | None; początkowo auto | $1$ | auto/manual; manual wymaga size | sposób określenia granic | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.mode |
-| study.universe.padding | Sequence[float] \| None | None; początkowo (0,0,0) | $\mathrm m$ | trzy skończone nieujemne składowe | dwustronny margines domeny | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.padding |
-| study.universe.mesh.minimum_element_size | float \| None | None | $\mathrm m$ | skończone dodatnie minimum nie większe od maksimum | minimalny rozmiar elementu otoczenia | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.airbox_hmin |
-| study.universe.mesh.maximum_element_size | float \| None | None | $\mathrm m$ | skończone dodatnie maksimum nie mniejsze od minimum | maksymalny rozmiar elementu otoczenia | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.airbox_hmax |
-| study.universe.mesh.growth_rate | float \| None | None | $1$ | skończona wartość większa od jeden | współczynnik stopniowania | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.airbox_growth_rate |
-| study.universe.mesh.grading | str \| None | None | $1$ | auto/geometric/linear | rodzaj stopniowania | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.airbox_grading |
-| study.build_domain_mesh | method | jawne wywołanie | $1$ | wymaga geometrii i konfiguracji siatki FEM | jawna materializacja domeny | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.mesh_workflow; geometry_assets.fem_domain_mesh_asset |
+| study.universe.mode | str \| None | None; początkowo auto | $1$ | auto/manual; manual wymaga size | sposób określenia granic | inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane | problem_meta.runtime_metadata.study_universe.mode |
+| study.universe.padding | Sequence[float] \| None | None; początkowo (0,0,0) | $\mathrm m$ | trzy skończone nieujemne składowe | dwustronny margines domeny | inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane | problem_meta.runtime_metadata.study_universe.padding |
+| study.universe.mesh.minimum_element_size | float \| None | None | $\mathrm m$ | skończone dodatnie minimum nie większe od maksimum | minimalny rozmiar elementu otoczenia | inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane | problem_meta.runtime_metadata.study_universe.airbox_hmin |
+| study.universe.mesh.maximum_element_size | float \| None | None | $\mathrm m$ | skończone dodatnie maksimum nie mniejsze od minimum | maksymalny rozmiar elementu otoczenia | inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane | problem_meta.runtime_metadata.study_universe.airbox_hmax |
+| study.universe.mesh.growth_rate | float \| None | None | $1$ | skończona wartość większa od jeden | współczynnik stopniowania | inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane | problem_meta.runtime_metadata.study_universe.airbox_growth_rate |
+| study.universe.mesh.grading | str \| None | None | $1$ | auto/geometric/linear | rodzaj stopniowania | inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane | problem_meta.runtime_metadata.study_universe.airbox_grading |
+| study.build_domain_mesh | method | jawne wywołanie | $1$ | wymaga geometrii i konfiguracji siatki FEM | jawna materializacja domeny | inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane | problem_meta.runtime_metadata.mesh_workflow; geometry_assets.fem_domain_mesh_asset |
+| fm.AntennaFieldSolveStage.solver_policy | str | production_default; przykład jawnie volume_inspection_v1 | $1$ | Python wymaga niepustego tokenu; materializator pętli dopuszcza dokładnie production_default lub volume_inspection_v1, pozostałe odrzuca | jawny wybór ograniczonego budżetu, bez zmiany fizyki i tolerancji | preparowana pełna pętla FEM CPU/double/P1/strict; external-lead odrzuca volume_inspection_v1 | antenna_field_solve_stages[].solver_policy; ResolvedAntennaClosedLoopCurrentInputIR.direct_field_policy.policy_version |
 
 Wartości przykładu: margines po każdej stronie $0.5\times10^{-6}\,\mathrm m$, minimum $150\times10^{-9}\,\mathrm m$, maksimum $500\times10^{-9}\,\mathrm m$, wzrost $1.6$, grading `geometric`. Sampling i jeden `target_ref` korzystają z `fm.FieldTarget.global_domain()`.
 
@@ -1989,14 +1990,65 @@ Tet4, bez fallbacku meshera, w 12,44 s. To dowód generacji siatki,
 pozostają w wolumenie kontrolnym grupy, pod
 `backend/verification/universe-mesh-preflight-20261023/`.
 
-Obowiązująca polityka `antenna_direct_oersted_budget.v1` ogranicza pełne
-zapytanie do miliona par źródło–punkt. Dla dotychczasowego źródła o 1867
-komórkach i tej domeny daje to 2 154 518 par; jest to oszacowanie z poprzedniej
-siatki źródła, a nie pomiar przygotowania nowego zaakceptowanego runu.
-Wykonanie tego wariantu wymaga zgodnego, jawnie wersjonowanego rozwiązania
-ograniczenia pracy. Nie zmieniono limitu, tolerancji, reguły kwadratury ani
-warunków akceptacji wyniku. Dzielenie zapytania z resetowaniem liczników nie
-jest istniejącą metodą większej domeny.
+Domyślny profil `production_default` nadal ogranicza pełne zapytanie do
+miliona par źródło–punkt. Dla dotychczasowego źródła o 1867 komórkach i tej
+domeny daje to 2 154 518 par; jest to oszacowanie z poprzedniej siatki źródła,
+a nie pomiar przygotowania nowego zaakceptowanego runu. Przykład wybiera
+jawnie zatwierdzony `volume_inspection_v1`. Nie jest to automatyczna zmiana
+domyślnego profilu ani obietnica zbieżności większej domeny.
+
+(antenna-universe-volume-budget)=
+##### Jawny wersjonowany budżet inspekcji objętości
+
+| Parametr wykonania | Typ | production_default (domyślny) | volume_inspection_v1 (jawny wybór) | Jednostka SI | Walidacja / znaczenie |
+|---|---|---|---|---|---|
+| resolved policy_version | str | closed_loop_direct_defaults.unqualified.v2 | closed_loop_direct_volume.unqualified.v1 | $1$ | dokładny identyfikator resolvera; nieznany token jest odrzucany |
+| maximum_source_target_pairs | u64 | 1 000 000 | 4 000 000 | $1$ | dodatni iloczyn liczby źródeł i targetów, kontrolowane mnożenie; overflow lub przekroczenie odmawia przygotowania |
+| maximum_kernel_evaluations | u64 | 100 000 000 | 500 000 000 | $1$ | wspólny licznik wywołań kernela dla całego natywnego zapytania |
+| maximum_ledger_leaf_visits | u64 | 100 000 000 | 500 000 000 | $1$ | wspólny licznik odwiedzin liści dla całego natywnego zapytania |
+| maximum_final_leaves_per_target | u64 | 1 000 000 | 1 000 000 | $1$ | limit finalnych liści pojedynczego targetu bez zmian |
+| base_quadrature_order | u32 | 4 | 4 | $1$ | niezmieniony rząd bazowy reguły low/high |
+| maximum_subdivision_depth | u32 | 6 | 6 | $1$ | niezmieniona maksymalna głębokość adaptacji |
+| absolute_tolerance_apm | f64 | 1e-9 | 1e-9 | $\mathrm{A\,m^{-1}}$ | niezmieniona tolerancja absolutna estymatora H |
+| relative_tolerance | f64 | 1e-5 | 1e-5 | $1$ | niezmieniona tolerancja względna estymatora H |
+| relative_scale_floor_apm | f64 | 0 | 0 | $\mathrm{A\,m^{-1}}$ | brak dodatkowej skali maskującej małe pole |
+
+Zmiana dotyczy wyłącznie dopuszczalnej pracy istniejącego operatora Biota–Savarta
+i estymatora błędu {eq}`antenna-global-target-quadrature-budget`, z całkowaniem
+Duffy {eq}`antenna-duffy-regular-field`. Nie zmienia równań, jednostek V/J/H,
+siatki, reguł low/high, głębokości, tolerancji ani kryterium akceptacji. Liczniki
+pracy należą do całego wywołania obejmującego wszystkie targety, w tym adaptację
+i Duffy; dzielenie zapytania z resetowaniem liczników jest niedopuszczalne.
+Przekroczenie limitu lub brak zbieżności kończy próbę jawną odmową, bez
+automatycznego ponawiania Solve lub redukcji jakości.
+
+Python zachowuje token bez zamiany na limit liczbowy w
+`AntennaFieldSolveStage.to_ir`. Planner rozwiązuje go przez
+`antenna_closed_loop_direct_budget`, a `closed_loop_direct_field_policy`
+zapisuje resolved policy, rzeczywistą liczbę par oraz niezmienione tolerancje
+w `ResolvedAntennaClosedLoopCurrentInputIR.direct_field_policy`. Round-trip
+zachowuje requested `solver_policy`; zgodność wymaga spójnego nowego pakietu.
+W cold evidence v1 pozostaje wyłącznie stary profil, natomiast v2 rozpoznaje
+dokładne zestawy limitów obu profili. Zestaw mieszany lub nieznany jest
+odrzucany, a wcześniejszy wynik nie jest przepisywany. Layout C ABI nie
+otrzymuje nowego pola: istniejący limit par rozróżnia zakres legacy 1..1M
+od dokładnego selektora 4M; inne większe selektory są niedopuszczalne.
+
+| Solver / backend | Zakres tego profilu | Stan dowodu |
+|---|---|---|
+| FEM CPU/double | preparowana pełna pętla 3D, P1, strict, raw inspection_only V/J/H w Universe | implementacja źródłowa; nowe wykonanie i zbieżność H oczekują na weryfikację |
+| FEM GPU | profil niedostępny: precompute tego pola jest realizacją CPU | brak deklaracji wykonania GPU |
+| FDM CPU | profil niedostępny: nie jest metodą FDM ani zakwalifikowaną bazą dla LLG | nie dotyczy wykonania tej inspekcji |
+| FDM GPU | profil niedostępny: nie jest metodą FDM ani zakwalifikowaną bazą dla LLG | nie dotyczy wykonania tej inspekcji |
+
+Regresje źródłowe obejmują zachowanie dokładnego defaultu, dopuszczenie
+2 154 518 par tylko przy opt-in, granicę 4M, overflow, puste wejście, nieznany
+token oraz odmowę rozszerzenia external-lead. Nie są dowodem wykonania
+natywnego ani kwalifikacji. Wymagane pozostają testy CI, sprawdzenie ciągłości
+liczników i cold evidence, jeden jawnie zatwierdzony przebieg Universe oraz
+odczyt skończonych H z kompletną topologią i provenance. Do tego czasu
+**pełny wynik H w Universe pozostaje niezweryfikowany**. Zwiększenie budżetu
+nie usuwa obowiązku niezależnej oceny zbieżności siatki i kwadratury.
 
 Źródła implementacji: `packages/fullmag-py/src/fullmag/world.py` —
 `StudyUniverseHandle`, `StudyUniverseConfig.to_ir`, `build_domain_mesh`;
@@ -2010,7 +2062,18 @@ jest istniejącą metodą większej domeny.
 | packages/fullmag-py/src/fullmag/world.py | class StudyUniverseHandle | Publiczne rozdzielenie granic Universe i jego siatki; jawne minimum, maksimum, wzrost i grading. | source_only |
 | packages/fullmag-py/src/fullmag/world.py | class StudyUniverseConfig | Walidacja i serializacja pierwotnej konfiguracji Universe, bez magnetycznego stanu. | source_only |
 | packages/fullmag-py/src/fullmag/world.py | _build_explicit_mesh_assets | Żądanie budowy wspólnej domeny; capture zachowuje odrębność deklaracji i topologii. | source_only |
-| examples/fem_antenna_closed_loop_universe.py | study | Osobny przykład niemagnetycznej domeny: diagnostycznie 1154 węzły/6487 Tet4, brak H solve; obecny budżet 1M par blokuje pełne wykonanie. | source_only |
+| examples/fem_antenna_closed_loop_universe.py | study | Niemagnetyczny Universe i jawny volume_inspection_v1; diagnostyczna siatka 1154 węzły/6487 Tet4; wykonanie H nadal oczekuje na weryfikację. | source_only |
+| crates/fullmag-runner/src/native_fem/steady_transport.rs | solve_native_fem_prepared_closed_loop | Sprawdza requested/resolved policy oraz rzeczywistą liczbę par przed wywołaniem natywnym. | source_only |
+| crates/fullmag-runner/src/antenna_field_solution/direct_quadrature_v2.rs | verify_policy_binding | Cold v2 wiąże dokładny tuple budżetu ze snapshotem i requested/resolved provenance; legacy bez nowych pól wymaga starego profilu. | source_only |
+| backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp | DirectTetraQuadrature::ResolveWorkLimits | Zamknięty selektor legacy 1..1M lub dokładnie 4M; wyznacza globalne limity kernel i ledger bez zmiany ABI. | source_only |
+| backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp | WorkBudget | Wspólny licznik kernel/ledger całego zapytania, obejmujący wszystkie targety i adaptację. | source_only |
+| crates/fullmag-ir/src/antenna.rs | AntennaClosedLoopDirectBudgetIR | Wspólny typ dokładnego wersjonowanego zestawu limitów pętli; bez nowego modelu fizycznego. | source_only |
+| crates/fullmag-ir/src/antenna.rs | antenna_closed_loop_direct_budget | Dokładne mapowanie production_default i volume_inspection_v1; nieznany token odrzucony. | source_only |
+| crates/fullmag-plan/src/antenna_current_source.rs | closed_loop_direct_field_policy | Kontrolowany dodatni iloczyn par, wybrany limit i niezmienione tolerancje. | source_only |
+| crates/fullmag-ir/src/antenna.rs | closed_loop_direct_budget_requires_exact_opt_in_and_preserves_legacy_defaults | Regresja obu dokładnych profili i odmowy nieznanych tokenów; test przygotowany do CI. | source_only |
+| crates/fullmag-plan/src/antenna_current_source.rs | closed_loop_volume_budget_is_explicit_and_preserves_legacy_accuracy_options | Regresja 2 154 518 par oraz niezmienionych opcji dokładności; test przygotowany do CI. | source_only |
+| crates/fullmag-plan/src/antenna_current_source.rs | closed_loop_volume_budget_rejects_over_cap_overflow_empty_and_unknown_policy | Regresja granicy 4M, overflow, pustego wejścia i nieznanego profilu; test przygotowany do CI. | source_only |
+| crates/fullmag-plan/src/antenna_current_source.rs | external_lead_does_not_inherit_closed_loop_volume_budget | Regresja zachowania odmowy nowego profilu dla external-lead; test przygotowany do CI. | source_only |
 
 (antenna-fdm-interpretation)=
 ### 6.4 FDM consumption
@@ -5266,7 +5329,7 @@ w authoringu nie jest dowodem gotowości takiego wyniku do LLG.
 | `CurrentSourceDrive.id` | `str` | required | $1$ | niepusty UTF-8 bez NUL, maksymalnie 4096 bytes | tożsamość autorskiego drive | authoring ekspercki | `current_modules[].definition.conservative_current_source.drives[].id` |
 | `CurrentSourceDrive.port_mode_ref` | `str` | required | $1$ | unique exact referencja autorskiego port mode | wybór mode bez fallbacku do pierwszego drive | authoring ekspercki | `current_modules[].definition.conservative_current_source.drives[].port_mode_ref` |
 | `CurrentSourceDrive.outer_terminal_currents_a` | `Mapping[str,float]` | required | $\mathrm A$ | exact terminal ID coverage; finite signed w tym zero; bilans fizycznych komponentów | zewnętrzne actuation, nie wywnioskowane wagi gałęzi | authoring ekspercki; current solve niezakwalifikowany | `current_modules[].definition.conservative_current_source.drives[].outer_terminal_currents_a` |
-| `AntennaFieldSolveStage.solver_policy` | `str` | production_default | $1$ | niepusty token; materializator nowego source obsługuje wyłącznie production_default, inne odrzuca | requested policy zachowana osobno od resolved unqualified preset | FEM CPU/double input; public source execution niedostępne | `antenna_field_solve_stages[].solver_policy` |
+| AntennaFieldSolveStage.solver_policy | str | production_default | $1$ | niepusty token Python; preparowana pętla dopuszcza dokładnie production_default lub volume_inspection_v1, pozostałe odrzuca; external-lead wyłącznie production_default | requested policy zachowana oddzielnie od resolved unqualified preset; jawny opt-in bez zmiany tolerancji | inspekcja preparowanej pełnej pętli FEM CPU/double/P1/strict; Universe H runtime pending | antenna_field_solve_stages[].solver_policy |
 | `AntennaFieldSolveStage.conductor_mesh_policy` | `str` | authored_shared_domain | $1$ | nowy source wymaga authored_shared_domain i rzeczywistej pełnej siatki 3D Tet4 | istniejąca polityka autorskiej siatki, nie dowód jakości lub zbieżności | FEM CPU/double input; inne source mesh policies niedostępne | `antenna_field_solve_stages[].conductor_mesh_policy` |
 
 Gauge usuwa wyłącznie nullspace potencjału. Native wybiera w każdej
@@ -9873,6 +9936,17 @@ Uzupełnienie E9b (mapping implementacji; build Windows i API50 nie stanowią kw
 
 | Path | Symbol / anchor | Responsibility / evidence |
 |---|---|---|
+| `crates/fullmag-runner/src/native_fem/steady_transport.rs` | `solve_native_fem_prepared_closed_loop` | Sprawdza requested/resolved policy oraz rzeczywistą liczbę par przed wywołaniem natywnym. FEM CPU/double; source_only, runtime pending. |
+| `crates/fullmag-runner/src/antenna_field_solution/direct_quadrature_v2.rs` | `verify_policy_binding` | Cold v2 wiąże dokładny tuple budżetu ze snapshotem i requested/resolved provenance; legacy bez nowych pól wymaga starego profilu. FEM CPU/double; source_only, runtime pending. |
+| `backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp` | `DirectTetraQuadrature::ResolveWorkLimits` | Zamknięty selektor legacy 1..1M lub dokładnie 4M; wyznacza globalne limity kernel i ledger bez zmiany ABI. FEM CPU/double; source_only, runtime pending. |
+| `backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp` | `WorkBudget` | Wspólny licznik kernel/ledger całego zapytania, obejmujący wszystkie targety i adaptację. FEM CPU/double; source_only, runtime pending. |
+| `crates/fullmag-ir/src/antenna.rs` | `AntennaClosedLoopDirectBudgetIR` | Wspólny typ dokładnego wersjonowanego zestawu limitów pętli; bez nowego modelu fizycznego. FEM CPU/double; source_only, runtime pending. |
+| `crates/fullmag-ir/src/antenna.rs` | `antenna_closed_loop_direct_budget` | Dokładne mapowanie production_default i volume_inspection_v1; nieznany token odrzucony. FEM CPU/double; source_only, runtime pending. |
+| `crates/fullmag-plan/src/antenna_current_source.rs` | `closed_loop_direct_field_policy` | Kontrolowany dodatni iloczyn par, wybrany limit i niezmienione tolerancje. FEM CPU/double; source_only, runtime pending. |
+| `crates/fullmag-ir/src/antenna.rs` | `closed_loop_direct_budget_requires_exact_opt_in_and_preserves_legacy_defaults` | Regresja obu dokładnych profili i odmowy nieznanych tokenów; test przygotowany do CI. FEM CPU/double; source_only, runtime pending. |
+| `crates/fullmag-plan/src/antenna_current_source.rs` | `closed_loop_volume_budget_is_explicit_and_preserves_legacy_accuracy_options` | Regresja 2 154 518 par oraz niezmienionych opcji dokładności; test przygotowany do CI. FEM CPU/double; source_only, runtime pending. |
+| `crates/fullmag-plan/src/antenna_current_source.rs` | `closed_loop_volume_budget_rejects_over_cap_overflow_empty_and_unknown_policy` | Regresja granicy 4M, overflow, pustego wejścia i nieznanego profilu; test przygotowany do CI. FEM CPU/double; source_only, runtime pending. |
+| `crates/fullmag-plan/src/antenna_current_source.rs` | `external_lead_does_not_inherit_closed_loop_volume_budget` | Regresja zachowania odmowy nowego profilu dla external-lead; test przygotowany do CI. FEM CPU/double; source_only, runtime pending. |
 | `crates/fullmag-application/src/script_stage_materialization.rs` | `validate_antenna_equilibrium_dependencies` | jednoznaczny wcześniejszy wykonawczy Relax i accepted_equilibrium; skompilowane w natywnym Windows, regresje wykonania helpera oraz target/eligibility NOT VERIFIED |
 | `packages/fullmag-py/src/fullmag/model/antenna.py` | `class EquilibriumStageOutputRef` | Istniejąca typed symbolic accepted Relax reference; public round-trip sprawdzony, runtime NOT VERIFIED. |
 | `packages/fullmag-py/src/fullmag/model/antenna.py` | `class EquilibriumArtifactRef` | Istniejący exact asset/equilibrium/content pin; v7 runtime wymaga canonical owner context. |

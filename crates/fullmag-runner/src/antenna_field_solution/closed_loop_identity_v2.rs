@@ -276,7 +276,11 @@ pub(crate) fn verify(source: &ClosedLoopAcceptedSourceInputV2, requested_intent:
     require(n > 0 && n <= MAX_VERTICES && cells > 0 && cells <= MAX_CELLS &&
         source.vertex_xyz_m.len() == n && source.electric_potential_v.len() == n && source.conductivity_spm.len() == cells,
         "carrier count mismatch")?;
-    require(requested_intent.as_object().is_some_and(|o|o.len()==8) && resolved_execution.as_object().is_some_and(|o|o.len()==16), "missing or foreign execution provenance fields")?;
+    let explicit_policy = requested_intent.get("solver_policy").is_some()
+        && resolved_execution.get("direct_field_policy").is_some();
+    require(requested_intent.as_object().is_some_and(|o|o.len()==8+usize::from(explicit_policy))
+        && resolved_execution.as_object().is_some_and(|o|o.len()==16+usize::from(explicit_policy)),
+        "missing or foreign execution provenance fields")?;
     require(m.digest_encoding == "canonical_named_fields_be_bits.v2" &&
         m.periodic_operator_version == "fem_charge_h1_periodic_jump.v2" && m.closure_operator_version == "fem_closed_current_geometry.v2" &&
         m.conservative_current_operator_version == "fem_conservative_current_rt0_view.v1" &&
