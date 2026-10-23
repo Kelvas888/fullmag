@@ -68,6 +68,9 @@ struct DurableProjection {
     command_id: Option<String>,
     /// The run executes one interactive command (not a startup script).
     interactive_command: bool,
+    /// Runtime capabilities of the finished step, including the resolved
+    /// quantity registry that admits its published fields for reading.
+    resolved_capabilities: Option<fullmag_runner::BackendCapabilities>,
     latest_state: Option<VerifiedOutput>,
     latest_total_energy: Option<fullmag_application::StudyScalarArtifact>,
     latest_output_identity: Option<String>,
@@ -546,6 +549,11 @@ fn load_durable_projection(
         .pointer("/parameters/live_workspace/command/kind")
         .and_then(Value::as_str)
         .is_some_and(|kind| kind != "startup_script");
+    let resolved_capabilities = if matches!(status, "completed" | "failed" | "cancelled") {
+        finished_step_capabilities(&accepted, &intent.specification)
+    } else {
+        None
+    };
     Ok(Some(DurableProjection {
         run_catalog_revision: run_catalog.revision,
         artifact_catalog_revision,
@@ -553,6 +561,7 @@ fn load_durable_projection(
         status,
         command_id,
         interactive_command,
+        resolved_capabilities,
         latest_state,
         latest_total_energy,
         latest_output_identity,
@@ -854,6 +863,31 @@ fn validate_live_intent(
         ));
     }
     Ok(())
+}
+
+/// Runtime capabilities of the step a finished accepted run executed. The
+/// in-process runner publishes these with its fields; an accepted run left the
+/// session with the scratch authoring capabilities, whose registry is not a
+/// resolved plan, so its published fields (m, H_eff, ...) were not readable.
+fn finished_step_capabilities(
+    accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
+    specification: &Value,
+) -> Option<fullmag_runner::BackendCapabilities> {
+    let step_id = specification
+        .pointer("/parameters/live_workspace/step_id")
+        .and_then(Value::as_str);
+    let entry = accepted
+        .catalog
+        .entries()
+        .iter()
+        .find(|entry| step_id.is_none_or(|step_id| entry.step_id() == step_id))?;
+    match fullmag_runner::resolve_runtime_capabilities(entry.problem()) {
+        Ok(capabilities) => Some(capabilities),
+        Err(error) => {
+            tracing::warn!(error = %error, "accepted step runtime capabilities are unavailable");
+            None
+        }
+    }
 }
 
 /// The session's public status for a projected run. A run that executed one
@@ -1638,6 +1672,15 @@ async fn apply_projection(
         changed = true;
     }
     next.runtime_status = crate::session::build_runtime_status_view(public_status);
+    if let Some(capabilities) = projection.resolved_capabilities.as_ref() {
+        let unchanged = next.capabilities.as_ref().is_some_and(|current| {
+            serde_json::to_value(current).ok() == serde_json::to_value(capabilities).ok()
+        });
+        if !unchanged {
+            next.capabilities = Some(capabilities.clone());
+            changed = true;
+        }
+    }
     if terminal && !projection.interactive_command && next.session.finished_at_unix_ms == 0 {
         next.session.finished_at_unix_ms = unix_time_millis_now();
         changed = true;
