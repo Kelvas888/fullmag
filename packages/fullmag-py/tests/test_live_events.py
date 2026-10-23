@@ -41,9 +41,11 @@ def test_event_stream_dispatches_and_resumes_after_drop() -> None:
         stream.close()
     assert received == [1, 2, 3, 4], "replay after reconnect must not duplicate or skip events"
     # A loaded host can time out a handshake before any event arrives; such
-    # retries carry no cursor. The reconnect after the drop resumes at seq 2.
+    # retries carry no cursor. The reconnect resumes after the last event the
+    # client received: 2, or 1 when closing the fake's socket with the client's
+    # unread pong resets the connection before event 2 is read.
     queries = [connection["query"] for connection in server.connections]
-    assert queries[-1] == {"after_seq": "2"}
+    assert queries[-1] in ({"after_seq": "2"}, {"after_seq": "1"}), queries
     assert all(query == {} for query in queries[:-1]), queries
     assert changed == [{"commands"}]
 
