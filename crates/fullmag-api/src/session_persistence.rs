@@ -1977,12 +1977,23 @@ mod accepted_fms_persistence_tests {
         let pipeline_path = "project/assets/accepted-script/pipeline-source.json";
         definition.assets.push(fullmag_application::OpaqueAsset::new(pipeline_path, compiled.source_bytes.clone(), None).unwrap());
         paths.insert(compiled.source_reference.asset_id.clone(), pipeline_path.into());
+        let resources = fullmag_ir::ComputeResourcesIR::from_problem(compiled.catalog.entries()[0].problem())
+            .expect("compiled compute resources").expect("canonical profile declares compute resources");
+        let threads = match resources.parallelism {
+            fullmag_ir::ComputeParallelismIR::SingleProcess => resources.cpu.threads.count().unwrap_or(1) as u64,
+            fullmag_ir::ComputeParallelismIR::Distributed {ranks, threads_per_rank, ..} => u64::from(ranks) * u64::from(threads_per_rank),
+        };
+        let minimum_resources = fullmag_application::RequestedResourceBudget {
+            cpu_millis:threads.checked_mul(1_000).expect("fixture CPU reservation"),
+            memory_bytes:resources.ram.reservation_bytes.unwrap_or(1),
+            storage_bytes:resources.scratch.reservation_bytes.unwrap_or(1), gpu_memory_bytes:0,
+        };
         let authored = RunIntentAuthoring {run_id:RunId::parse("run-ui-export").unwrap(), idempotency_key:"intent-ui-export".into(),
             parameters:serde_json::json!({"live_workspace":{"scene_revision":17,
                 "execution_input":crate::live_execution_binding::input_identity(&authored_scene).unwrap()}}),
             seeds:BTreeMap::new(), dependencies:Vec::new(), scheduling_priority:0,
             requested_execution:fullmag_application::RequestedExecution {backend:"fdm".into(), device:"cpu".into(),
-                precision:"double".into(), mode:"strict".into(), minimum_resources:None}};
+                precision:"double".into(), mode:"strict".into(), minimum_resources:Some(minimum_resources)}};
         let intent = fullmag_application::materialize_run_intent(&definition, &compiled.study, &compiled.catalog, authored, &paths)
             .expect("canonical immutable RunSpec");
         let mut persisted = fullmag_session::FmsRunIntent::new("run-ui-export", "intent-ui-export", serde_json::to_value(&intent.specification).unwrap());

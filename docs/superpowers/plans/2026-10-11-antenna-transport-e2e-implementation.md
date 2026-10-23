@@ -2562,3 +2562,14 @@ Nowe testy i rzeczywisty FMS pozostają do wykonania po przeglądzie/w CI/runtim
 CI39930825611 dla54589225bee5c93d59c33b09c09d7d318c789e26 zakończyło się
 success:12 wykonanych jobów PASS,9 opcjonalnych SKIPPED. Dotyczy read-fence,
 nie późniejszych poprawek źródła eksportu i pustych wejść.
+
+
+CI39935253677 wykonało trzy nowe regresje pustych immutable inputs: PASS.
+Pełna regresja v4 eksportu zatrzymała się na niekompletnym fixture: brak
+requested_execution.minimum_resources przy istniejącym compute_resources.
+Fixture poprawiono przez kanoniczny budżet skompilowanego problemu, bez
+zmiany walidatorów produkcyjnych. Kolejne CI jest wymagane.
+Użytkownik zatwierdził zastąpienie wyłącznie zakończonej obserwacji3203,
+zachowanie wszystkich70 plików i historii, zarządzany build oraz odtworzenie
+sceny bez kolejnego Solve. Istniejący saved-authoring probe wymaga jednak
+Windows storage i pustej historii; trwa weryfikacja właściwej trasy WSL.
