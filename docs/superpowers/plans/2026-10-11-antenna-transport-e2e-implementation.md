@@ -2502,3 +2502,40 @@ w autoryzowanym CI. Nowy build, cold-read HTTP i UI nadal NOT VERIFIED.
 Przeglądarka zgłosiła tab7 na3203, ale auto-review odrzucił jej otwarcie,
 przypisując origin3202. Nie użyto innej przeglądarki ani obejścia.
 Widoczny canvas i końcowa kwalifikacja E1–E12 pozostają otwarte.
+
+
+### Checkpoint 23.10.2026 — V/J/H przez publiczny katalog Results
+
+Read-only HTTP przez istniejące persistence solution-sets wykazało faktycznie
+zmaterializowane pola bez zależności od bieżącego live carrier:
+solution `solution-92166e9b846ea58c4b529b16ff965dba36b06037fc55e9443c8682975538712c`,
+revision2, member `member-d467ab5d5cb971b272d1dd6fc07141b89f35f3ada7f44b15d2148535b9e30c71`.
+Run ma status succeeded, manifest closed, scientific assessment unassessed.
+
+Istniejący smoke_saved_antenna_fields pomijał sześć wymaganych pinów zapytania
+slice i dostawał400missing schema_version. Dodano identyfikatory z dokładnego
+manifestu. Rzeczywisty smoke po poprawce PASS(2,88s): V678 próbek/V, J7468
+próbek lokalnych w Tet4/A/m², H14 punktów/A/m; poprawne geometrie, support,
+framing i hashe; obce piny odrzucone409. Osobny odczyt manifestu native bundle
+potwierdził identyczne SHA256 wartości V/J/H. Jest to dowód
+native→trwałeCAS→HTTP, bez kwalifikacji nauki, cold-reopen i przeglądarki.
+Dowody named volume frontendu: `28-saved-fields-http-smoke-fixed.json` oraz
+`33-public-field-value-summary.json` w dotychczasowym katalogu public-antenna.
+
+Nowe read-fence regresje przeszły w CI39930825611; cały przebieg pozostaje
+do sprawdzenia. Commit naprawy:54589225bee5c93d59c33b09c09d7d318c789e26.
+Nie wdrożono go jeszcze do pakietu runtime: bezpieczny restart blokuje
+ukończony workspace. Retirement114a37196c72479fb2ce3237edac563b otrzymał
+trwałą odmowę live_retirement_busy przed zmianami. Potwierdzono brak archiwum
+i niezmienność70 plików run/Zarr; frontend przywrócono, oryginalny helper
+zwolnił lease po publikacji failed-confirmed. Niczego nie anulowano.
+Wcześniejsza próba4707276bfc964a4a8045e5cef3249ae5 przerwała wyłącznie preflight
+przez omyłkowe porównanie zmiennego uptime; nie wywołała retirement.
+
+Publiczny model/syncs z expected_scene_revision1 zapisał zarządzaną kopię
+kanonicznego skryptu4884B; fidelity not_checked, oryginał bez zmian. Usunęło to
+wcześniejszą przeszkodę pustego script_path w eksporcie. Pełny SolvedFMS nadal
+odmawia409: accepted provenance odrzuca rzeczywisty zerowy CAS obiekt
+przypiętego runtime/source capture(np. numpy/py.typed), mimo poprawnego SHA256.
+Poprawka musi zachować dopuszczalne puste wejścia bez dopuszczenia pustych
+wyników pól. Archiwum i cold-load nie są zaliczone.
