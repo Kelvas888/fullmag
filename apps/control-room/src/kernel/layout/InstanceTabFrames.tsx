@@ -15,7 +15,8 @@ export function InstanceTabFrames() {
   const tabs = useInstanceTabs();
   const discovery = useInstanceDiscovery();
   const activePort = tabs.activePort;
-  const framed = tabs.framedPorts.filter((port) => tabs.openPorts.includes(port));
+  const open = new Set(tabs.openPorts);
+  const framed = tabs.framedPorts.filter((port) => open.has(port));
   const known = new Set((discovery.data?.instances ?? []).map((instance) => instance.port));
   const activeUnavailable = activePort !== null && discovery.data !== null && !known.has(activePort);
 
