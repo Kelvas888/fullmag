@@ -2590,3 +2590,40 @@ Pełny log16383903B, SHA256
 `b6d5f228c2c84a6354ad1cfeef036d505e40cf82097b18325d6fc727df31cf49`
 w `verification/shared-inspection-read-20261023/rust-contracts-009a7ac52.log`
 w wolumenie kontrolnym grupy.
+
+
+### 23.10.2026 — zatwierdzony restart WSL wykonany i wynik zachowany
+
+Zakończono operację `iteration/attempts/0a93504d96ac4bc8bf291e04b588a1b2`
+ze stanem `succeeded`. Zbudowany i uruchomiony commit:
+`28ed0603a2c803caae9476a01fee5608c322a106`; snapshot źródeł:
+`7e7b554a9422915c47b9cfe405a87aacf00a823b973ce90843fee28fb6835af9`.
+Kompilacja miała exit code 0, przygotowanie pakietu i obie bramki
+`linux-native-v1` oraz `worker-cgroup` przeszły. Backend pozostał tym samym
+kontenerem `6172ba4376f431b2347f4946300bc2de6905470fae64da434d90d5df07d17592`.
+Kontrolowany drain, pięć przypiętych katalogów historii i zapisane archiwum
+przeszły rzeczywiste kontrole procedury. Cache zachowano; niczego nie usuwano.
+
+Po restarcie API zwróciło health 200 i brak aktywnej sesji, zgodnie z bramką.
+Publiczne utworzenie sesji i `replace_scene` przywróciły dokładną zapisaną
+scenę anteny do `session-18e1238e493da75a00000fca`, revision 1. Stan:
+`awaiting_command`, `run: null`; nie wysłano nowego Solve. Wszystkie 70 plików
+run/Zarr oraz oryginalne pliki `.py` i `.20261022.fms` zachowały długości
+oraz SHA256. Dowód: `verification/shared-inspection-read-20261023/restart-28ed0603a-results-preserved.json`
+w wolumenie kontrolnym grupy.
+
+Ponowny rzeczywisty smoke Results HTTP na nowym pakiecie: PASS, 2,68 s.
+V: 678 próbek, J: 7468 próbek, H: 14 próbek; jednostki, nośniki i hashe
+pozostały identyczne z poprzednim wynikiem. To odczyt istniejącego wyniku,
+bez nowego Solve. Dowód frontendu:
+`verification/authorized-session-replacement-20261023/post-restart-28ed0603a/12-saved-fields-http-proof.json`.
+Kontrole HTTP nie są dowodem działania rzeczywistego viewportu.
+
+[CI 39940179901](https://github.com/MateuszZelent/fullmag/actions/runs/39940179901)
+dla powyższego commita: success, 12 wykonanych jobów PASS, 9 opcjonalnych
+SKIPPED. Nowe regresje historii restartu są w zaliczonym kroku Python.
+Log `verification/shared-inspection-read-20261023/python-contracts-28ed0603a.log`:
+1201829 B, SHA256 `adfd5b8ade25995cb3b623d9c9131c650186b93dabe0a677bd55cd5da2d77598`.
+Ten checkpoint zamyka wcześniejsze oczekiwanie na zgodę i wykonanie restartu.
+Pełny FMS zakończonej obserwacji, cold-load i rzeczywisty UI/WebGL nadal
+pozostają niezweryfikowane; E1–E12 nie są zamknięte.
