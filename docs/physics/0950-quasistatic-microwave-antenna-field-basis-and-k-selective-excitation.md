@@ -1949,6 +1949,69 @@ signature records the interpolation realization and mapping digest. Direct
 RT0 reevaluation and native MFEM transfer remain separate, not silently
 substituted by this stored-basis projection.
 
+(antenna-universe-inspection-carrier)=
+#### 6.3.1. Niemagnetyczny Universe jako nośnik mapy pola
+
+Przykład `examples/fem_antenna_closed_loop_universe.py` zachowuje pełny obwód
+3D, materiały i źródło z przykładu `fem_antenna_closed_loop_nonmagnetic.py`.
+Zastępuje lokalny obiekt `sampling` domeną Universe. Nie dodaje materiału
+magnetycznego, magnetyzacji ani dynamiki LLG. „Obieg pola” oznacza tutaj
+przestrzenny kierunek statycznego $\mathbf H$, a nie precesję w czasie.
+
+| Parametr Python | Typ | Wartość domyślna | Jednostka SI | Walidacja | Znaczenie | Zakres realizacji | Pole ProblemIR |
+|---|---|---|---|---|---|---|---|
+| study.universe.mode | str \| None | None; początkowo auto | $1$ | auto/manual; manual wymaga size | sposób określenia granic | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.mode |
+| study.universe.padding | Sequence[float] \| None | None; początkowo (0,0,0) | $\mathrm m$ | trzy skończone nieujemne składowe | dwustronny margines domeny | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.padding |
+| study.universe.mesh.minimum_element_size | float \| None | None | $\mathrm m$ | skończone dodatnie minimum nie większe od maksimum | minimalny rozmiar elementu otoczenia | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.airbox_hmin |
+| study.universe.mesh.maximum_element_size | float \| None | None | $\mathrm m$ | skończone dodatnie maksimum nie mniejsze od minimum | maksymalny rozmiar elementu otoczenia | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.airbox_hmax |
+| study.universe.mesh.growth_rate | float \| None | None | $1$ | skończona wartość większa od jeden | współczynnik stopniowania | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.airbox_growth_rate |
+| study.universe.mesh.grading | str \| None | None | $1$ | auto/geometric/linear | rodzaj stopniowania | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.study_universe.airbox_grading |
+| study.build_domain_mesh | method | jawne wywołanie | $1$ | wymaga geometrii i konfiguracji siatki FEM | jawna materializacja domeny | wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy | problem_meta.runtime_metadata.mesh_workflow; geometry_assets.fem_domain_mesh_asset |
+
+Wartości przykładu: margines po każdej stronie $0.5\times10^{-6}\,\mathrm m$, minimum $150\times10^{-9}\,\mathrm m$, maksimum $500\times10^{-9}\,\mathrm m$, wzrost $1.6$, grading `geometric`. Sampling i jeden `target_ref` korzystają z `fm.FieldTarget.global_domain()`.
+
+| Symbol | Znaczenie | Jednostka SI |
+|---|---|---|
+| $p_x,p_y,p_z$ | nieujemne marginesy domeny obserwacji po obu stronach geometrii | $\mathrm m$ |
+| $h_{\min},h_{\max}$ | dodatnie ograniczenia rozmiaru elementu w otoczeniu anteny | $\mathrm m$ |
+| $g$ | skończony współczynnik stopniowania rozmiaru siatki większy od jeden | $1$ |
+
+Interpretacja wykonania pozostaje FEM CPU/double; nie zadeklarowano tu
+wykonania pola na GPU ani nowej realizacji FDM. Siatka przewodnika zachowuje
+maksymalny i minimalny rozmiar $150\times10^{-9}\,\mathrm m$ oraz rząd jeden.
+Pole jest obliczane na węzłach domeny, z jej własną topologią; nie wolno
+rozciągać wcześniejszych czternastu próbek na większą objętość.
+
+Diagnostyczna materializacja tego wariantu na pakiecie
+`28ed0603a2c803caae9476a01fee5608c322a106` dała 1154 węzły i 6487 elementów
+Tet4, bez fallbacku meshera, w 12,44 s. To dowód generacji siatki,
+**nie wykonania pola H ani kwalifikacji zbieżności**. Dowód i pełny log
+pozostają w wolumenie kontrolnym grupy, pod
+`backend/verification/universe-mesh-preflight-20261023/`.
+
+Obowiązująca polityka `antenna_direct_oersted_budget.v1` ogranicza pełne
+zapytanie do miliona par źródło–punkt. Dla dotychczasowego źródła o 1867
+komórkach i tej domeny daje to 2 154 518 par; jest to oszacowanie z poprzedniej
+siatki źródła, a nie pomiar przygotowania nowego zaakceptowanego runu.
+Wykonanie tego wariantu wymaga zgodnego, jawnie wersjonowanego rozwiązania
+ograniczenia pracy. Nie zmieniono limitu, tolerancji, reguły kwadratury ani
+warunków akceptacji wyniku. Dzielenie zapytania z resetowaniem liczników nie
+jest istniejącą metodą większej domeny.
+
+Źródła implementacji: `packages/fullmag-py/src/fullmag/world.py` —
+`StudyUniverseHandle`, `StudyUniverseConfig.to_ir`, `build_domain_mesh`;
+`packages/fullmag-py/src/fullmag/model/problem.py` —
+`build_geometry_assets_for_request`; `crates/fullmag-plan/src/antenna_field_solve.rs`
+— `resolve_field_sampling`; `crates/fullmag-plan/src/antenna_current_source.rs`
+— `materialize_antenna_closed_loop_current_input`.
+
+| Ścieżka | Stabilny symbol | Odpowiedzialność | Dowód |
+|---|---|---|---|
+| packages/fullmag-py/src/fullmag/world.py | class StudyUniverseHandle | Publiczne rozdzielenie granic Universe i jego siatki; jawne minimum, maksimum, wzrost i grading. | source_only |
+| packages/fullmag-py/src/fullmag/world.py | class StudyUniverseConfig | Walidacja i serializacja pierwotnej konfiguracji Universe, bez magnetycznego stanu. | source_only |
+| packages/fullmag-py/src/fullmag/world.py | _build_explicit_mesh_assets | Żądanie budowy wspólnej domeny; capture zachowuje odrębność deklaracji i topologii. | source_only |
+| examples/fem_antenna_closed_loop_universe.py | study | Osobny przykład niemagnetycznej domeny: diagnostycznie 1154 węzły/6487 Tet4, brak H solve; obecny budżet 1M par blokuje pełne wykonanie. | source_only |
+
 (antenna-fdm-interpretation)=
 ### 6.4 FDM consumption
 

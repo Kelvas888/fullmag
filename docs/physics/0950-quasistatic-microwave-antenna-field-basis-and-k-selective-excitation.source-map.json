@@ -1750,6 +1750,24 @@
       "latex": "$i,j,k,\\sum,\\det,|\\cdot|,\\max$",
       "meaning": "indeksy wierzchołków/osi i operatory o jednostkach argumentów",
       "si_unit": "$1$"
+    },
+    {
+      "id": "universe-inspection-padding",
+      "latex": "$p_x,p_y,p_z$",
+      "meaning": "nieujemne marginesy domeny obserwacji po obu stronach geometrii",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "universe-inspection-mesh-scales",
+      "latex": "$h_{\\min},h_{\\max}$",
+      "meaning": "dodatnie ograniczenia rozmiaru elementu w otoczeniu anteny",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "universe-inspection-growth",
+      "latex": "$g$",
+      "meaning": "skończony współczynnik stopniowania rozmiaru siatki większy od jeden",
+      "si_unit": "$1$"
     }
   ],
   "equations": [
@@ -8044,6 +8062,34 @@
       "symbol": "rounded_rt0_samples_survive_an_ill_conditioned_pivot",
       "responsibility": "Old-RED witness i9przygotowanych przypadków exact feasibility;33Fraction modeli PASS, parserPASS; Rust unit NIE SKOMPILOWANO ani NIE WYKONANO.",
       "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-public-facade",
+      "path": "packages/fullmag-py/src/fullmag/world.py",
+      "symbol": "class StudyUniverseHandle",
+      "responsibility": "Publiczne rozdzielenie granic Universe i jego siatki; jawne minimum, maksimum, wzrost i grading.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-authored-config",
+      "path": "packages/fullmag-py/src/fullmag/world.py",
+      "symbol": "class StudyUniverseConfig",
+      "responsibility": "Walidacja i serializacja pierwotnej konfiguracji Universe, bez magnetycznego stanu.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-explicit-mesh-request",
+      "path": "packages/fullmag-py/src/fullmag/world.py",
+      "symbol": "_build_explicit_mesh_assets",
+      "responsibility": "Żądanie budowy wspólnej domeny; capture zachowuje odrębność deklaracji i topologii.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-universe-sampling-example",
+      "path": "examples/fem_antenna_closed_loop_universe.py",
+      "symbol": "study",
+      "responsibility": "Osobny przykład niemagnetycznej domeny: diagnostycznie 1154 węzły/6487 Tet4, brak H solve; obecny budżet 1M par blokuje pełne wykonanie.",
+      "evidence_status": "source_only"
     }
   ],
   "public_api": {
@@ -9429,6 +9475,76 @@
         "meaning": "surowe próbki w układzie świata; helper metryki bez dowodu pochodzenia HTTP",
         "backend_support": "diagnostyka nominalnego FEM CPU double; bez wykonania backendu",
         "problem_ir": "bez zmiany IR"
+      },
+      {
+        "python": "study.universe.mode",
+        "type": "str | None",
+        "default": "None; początkowo auto",
+        "si_unit": "$1$",
+        "validation": "auto/manual; manual wymaga size",
+        "meaning": "sposób określenia granic",
+        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "problem_ir": "problem_meta.runtime_metadata.study_universe.mode"
+      },
+      {
+        "python": "study.universe.padding",
+        "type": "Sequence[float] | None",
+        "default": "None; początkowo (0,0,0)",
+        "si_unit": "$\\mathrm m$",
+        "validation": "trzy skończone nieujemne składowe",
+        "meaning": "dwustronny margines domeny",
+        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "problem_ir": "problem_meta.runtime_metadata.study_universe.padding"
+      },
+      {
+        "python": "study.universe.mesh.minimum_element_size",
+        "type": "float | None",
+        "default": "None",
+        "si_unit": "$\\mathrm m$",
+        "validation": "skończone dodatnie minimum nie większe od maksimum",
+        "meaning": "minimalny rozmiar elementu otoczenia",
+        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "problem_ir": "problem_meta.runtime_metadata.study_universe.airbox_hmin"
+      },
+      {
+        "python": "study.universe.mesh.maximum_element_size",
+        "type": "float | None",
+        "default": "None",
+        "si_unit": "$\\mathrm m$",
+        "validation": "skończone dodatnie maksimum nie mniejsze od minimum",
+        "meaning": "maksymalny rozmiar elementu otoczenia",
+        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "problem_ir": "problem_meta.runtime_metadata.study_universe.airbox_hmax"
+      },
+      {
+        "python": "study.universe.mesh.growth_rate",
+        "type": "float | None",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "skończona wartość większa od jeden",
+        "meaning": "współczynnik stopniowania",
+        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "problem_ir": "problem_meta.runtime_metadata.study_universe.airbox_growth_rate"
+      },
+      {
+        "python": "study.universe.mesh.grading",
+        "type": "str | None",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "auto/geometric/linear",
+        "meaning": "rodzaj stopniowania",
+        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "problem_ir": "problem_meta.runtime_metadata.study_universe.airbox_grading"
+      },
+      {
+        "python": "study.build_domain_mesh",
+        "type": "method",
+        "default": "jawne wywołanie",
+        "si_unit": "$1$",
+        "validation": "wymaga geometrii i konfiguracji siatki FEM",
+        "meaning": "jawna materializacja domeny",
+        "backend_support": "wariant FEM CPU; H solve niezweryfikowany i blokowany obecnym limitem pracy",
+        "problem_ir": "problem_meta.runtime_metadata.mesh_workflow; geometry_assets.fem_domain_mesh_asset"
       }
     ]
   }
