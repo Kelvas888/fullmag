@@ -2867,3 +2867,45 @@ kontynuację po przedstawieniu tej operacji.
 Aktualne dowody i pełny patch: control volume,
 `verification/universe-volume-policy-20261023/preparation-busy-failure/`.
 Brak potwierdzenia UI/WebGL; nie wznawiano zablokowanej ścieżki przeglądarki.
+
+
+### 23.10.2026 — niezależny limit nośnika H i przerwany toolchain
+
+Walidator HTTP błędnie używał limitu 4096 komórek przewodnika także dla
+niezależnej siatki próbkowania H. Osobny SAMPLE_CELL_BOUND wynosi teraz 16384;
+limit źródła 4096, liczby węzłów 16384, 16 MiB na payload i 64 MiB łącznie
+pozostały bez zmian. To granica skryptu kontrolnego, bez zmiany solvera,
+metody, tolerancji ani kwalifikacji. Sześć interpretowanych testów obejmuje
+14 przypadków, w tym niezależny carrier 6487 Tet4, granice, błędne liczności
+oraz rozmiary payloadów. PASS; git diff --check PASS. Dowód w control volume:
+verification/universe-volume-policy-20261023/sample-carrier-smoke-bound/verification.json,
+SHA256 c996d051730ac1324dd1ce8e199b9c214fc1777606707c45d911a19c5b01214f.
+
+Zarządzane odtworzenie usług e47a16d91bd840b78a694b670e2da206 zakończyło się
+poprawnie i zachowało state oraz wolumeny. Następna operacja toolchain
+185b3e45743f4cfe9621725a706daf80 budowała zmieniony wariant CUDA 86 z dwoma
+zadaniami MFEM; wszystkie 16 hashy plików wejściowych obrazu były identyczne
+z poprzednim wariantem. Ukończono hypre, PETSc i SLEPc. MFEM osiągnął 90/269.
+Nie rozpoczęła się kompilacja aplikacji ani żaden nowy Solve Universe.
+
+O 17:01:19 UTC zewnętrzny timeout 3600 s ustawiony przez agenta przerwał
+proces nadrzędny i BuildKit. Był to błąd orkiestracji zadania, nie błąd
+kompilatora. BuildKit rglzww139nplvgl57j3t13tl1 ma trwały status canceled.
+Kolejny długi build trzeba uruchomić przez receptę just w trwałej sesji,
+bez nadrzędnego timeoutu, który zabija zarządzane procesy. Krótkie odczyty
+postępu pozostają niezależne od czasu życia kompilacji.
+
+Oryginalny helper zakończył zapis (READY, LOGGED) i czeka na terminal;
+active pozostaje celowo zachowany. Istniejące recovery nie obsługuje fazy
+toolchain. Nie zmieniono markerów ani receiptów, nie rozpoczęto ponownego
+buildu. Przygotowywana jest osobna, przypięta procedura failure-only do
+przeglądu i decyzji operatora; brak pierwotnego BuildRef/PID w receipcie
+wymaga jawnej korelacji historycznej, nie fikcyjnego dowodu launchera.
+
+Kontrola po przerwaniu: 70 plików wyników, pięć historycznych katalogów
+i zapisany projekt Universe pozostały identyczne. Manualny Run 860970 nadal
+ma wyłącznie run_catalog.json oraz run_intent.json, bez start_release.
+Dowód: verification/universe-volume-policy-20261023/toolchain-timeout-proposal/post-timeout-preservation.json,
+SHA256 105de72a5b75b268ff0ebf938d966f3a09bc0956cff111bf7e90f9188927dc89.
+Backend/frontend tej grupy są nieobecne po zakończonym odtworzeniu usług;
+nowy wynik, runtime poprawki schedulera oraz UI/WebGL pozostają NOT VERIFIED.

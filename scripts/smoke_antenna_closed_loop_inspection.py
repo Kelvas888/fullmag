@@ -22,6 +22,7 @@ METADATA_BOUND = 64 << 10
 BINARY_BOUND = 16 << 20
 TOTAL_BOUND = 64 << 20
 CELL_BOUND = 4096
+SAMPLE_CELL_BOUND = 16384
 VERTEX_BOUND = 4 * CELL_BOUND
 HEX = re.compile(r"[0-9a-f]{64}")
 PIN = re.compile(r"sha256:[0-9a-f]{64}")
@@ -81,7 +82,7 @@ def validate_resource(resource, stage_id):
     require(m.get("signed_normalization_a") == current and m.get("scale_per_a") == 1 / current and finite(m["scale_per_a"]), "unsigned or unresolved per-A scale")
     require(all(finite(s.get(k)) for k in ("potential_jump_v", "measured_potential_jump_v", "gauge_mean_v", "charge_relative_residual", "max_paired_weak_flux_mismatch_a")) and 0 <= s["charge_relative_residual"] <= 1e-12, "invalid accepted charge scalars")
     require(isinstance(s.get("terminal_observation_currents"), dict) and all(finite(v) for v in s["terminal_observation_currents"].values()), "invalid observation currents")
-    n, c, t, h = (count(m.get(k), bound, k) for k, bound in (("vertex_count", VERTEX_BOUND), ("cell_count", CELL_BOUND), ("target_count", VERTEX_BOUND), ("sample_cell_count", CELL_BOUND)))
+    n, c, t, h = (count(m.get(k), bound, k) for k, bound in (("vertex_count", VERTEX_BOUND), ("cell_count", CELL_BOUND), ("target_count", VERTEX_BOUND), ("sample_cell_count", SAMPLE_CELL_BOUND)))
     f, w = count(m.get("face_count"), 4*c, "face_count"), count(m.get("weak_reaction_count"), n, "weak_reaction_count")
     specs = {
         "stable_vertex_ids": ("node_u64_le", "1", n*8), "vertex_xyz": ("node_xyz_f64_le", "m", n*24),
