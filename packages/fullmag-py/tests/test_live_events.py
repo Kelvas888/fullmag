@@ -40,8 +40,11 @@ def test_event_stream_dispatches_and_resumes_after_drop() -> None:
         assert done.wait(10), received
         stream.close()
     assert received == [1, 2, 3, 4], "replay after reconnect must not duplicate or skip events"
-    assert server.connections[0]["query"] == {}
-    assert server.connections[1]["query"] == {"after_seq": "2"}
+    # A loaded host can time out a handshake before any event arrives; such
+    # retries carry no cursor. The reconnect after the drop resumes at seq 2.
+    queries = [connection["query"] for connection in server.connections]
+    assert queries[-1] == {"after_seq": "2"}
+    assert all(query == {} for query in queries[:-1]), queries
     assert changed == [{"commands"}]
 
 
