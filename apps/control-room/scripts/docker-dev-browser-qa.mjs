@@ -104,6 +104,7 @@ const canvasState = async (page) => page.locator(".fm-viewport-3d canvas").first
     context_lost: context?.isContextLost?.() ?? null,
     drawing_buffer_width: context?.drawingBufferWidth ?? 0,
     drawing_buffer_height: context?.drawingBufferHeight ?? 0,
+    depth_bits: context ? context.getParameter(context.DEPTH_BITS) : null,
     preserve_drawing_buffer: context?.getContextAttributes?.().preserveDrawingBuffer ?? null,
     vendor: debugInfo ? context.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : null,
     renderer: debugInfo ? context.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : null,
@@ -194,6 +195,17 @@ const main = async () => {
     if (!sceneResponse.ok()) throw new Error(`Viewport model readiness returned HTTP ${sceneResponse.status()}`);
     const sceneSnapshot = await sceneResponse.json();
     if (!Array.isArray(sceneSnapshot.objects)) throw new Error("Viewport model readiness omitted canonical objects");
+    const ringDepthRegression = sceneSnapshot.scene?.name === "permalloy_layer_cofeb_rings_relax_300nm" &&
+      sceneSnapshot.objects.length === 2 &&
+      sceneSnapshot.objects.some((object) => object.name === "cofeb_top_ring") &&
+      sceneSnapshot.objects.some((object) => object.name === "permalloy_layer");
+    if (ringDepthRegression) {
+      await page.waitForFunction((ids) => {
+        const adopted = document.querySelector(".fm-viewport-3d")
+          ?.getAttribute("data-primitive-object-ids")?.split(" ") ?? [];
+        return ids.every((id) => adopted.includes(id));
+      }, sceneSnapshot.objects.map((object) => object.id), { timeout });
+    }
     const fixtureObjectId = "qa-offset-film-mvgw65uf";
     partialProof.viewport_model_readiness = {
       scene_revision: sceneSnapshot.revision,
@@ -227,6 +239,7 @@ const main = async () => {
     try {
       partialProof.viewport_camera = await runViewportCameraBrowserQa(page, {
         assertCanvas: (label) => assertCanvas(page, label), pngDecoder: PNG, timeout,
+        ringDepthRegression,
       });
     } catch (error) {
       if (error?.partialProof) partialProof.viewport_camera = error.partialProof;

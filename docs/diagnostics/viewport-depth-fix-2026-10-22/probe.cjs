@@ -72,8 +72,31 @@ for (const scale of [1e-9, 1e-6, 1]) {
 const bounds = { center: [0, 0, 0], radius: 1.85e-6, size: [2.8e-6, 2.1e-6, 1.2e-6] };
 const position = { x: 1.6710714031932422e-7, y: -6.101199092239823e-7, z: 2.0428454917790962e-7 };
 const forward = { x: -position.x, y: -position.y, z: 1.55e-7 - position.z };
-const clip = api.resolveViewport3DCameraDepthRange(bounds, position, forward, Math.hypot(forward.x, forward.y, forward.z));
-const tangential = [-1e-9, 0, 1e-12, 1e-9].map((z) => api.resolveViewport3DCameraDepthRange(bounds, { x: 6e-7, y: 0, z }, { x: 0, y: 0, z: -1 }, 6e-7));
+const legacyDepth = process.argv.includes("--legacy-depth");
+const depthRange = legacyDepth ? () => ({ near: 1e-12, far: 1e-3 }) : api.resolveViewport3DCameraDepthRange;
+const focusDistance = Math.hypot(forward.x, forward.y, forward.z);
+const clip = depthRange(bounds, position, forward, focusDistance);
+const tangential = [-1e-9, 0, 1e-12, 1e-9].map((z) => depthRange(bounds, { x: 6e-7, y: 0, z }, { x: 0, y: 0, z: -1 }, 6e-7));
+const depthCode = (depth, range) => Math.round((range.far / (range.far - range.near) -
+  range.far * range.near / ((range.far - range.near) * depth)) * (2 ** 24 - 1));
+const filmLevels = (depth, range) => depthCode(depth + 1.6e-9, range) - depthCode(depth, range);
+const scaleChecks = [1e-6, 1e-3, 1e3, 1e6].map((scale) => {
+  const range = depthRange({ ...bounds, radius: bounds.radius * scale },
+    Object.fromEntries(Object.entries(position).map(([key, value]) => [key, value * scale])),
+    forward, focusDistance * scale);
+  return { scale, passed: Math.abs(range.near / scale / clip.near - 1) < 1e-10 &&
+    Math.abs(range.far / scale / clip.far - 1) < 1e-10 };
+});
+const depthChecks = {
+  finite_ordered: Number.isFinite(clip.near) && Number.isFinite(clip.far) && clip.near > 0 && clip.far > clip.near,
+  thin_film_levels: filmLevels(6.34057e-7, clip),
+  tangential_film_levels: tangential.map((range) => filmLevels(6e-7, range)),
+  orthographic_step_m: (clip.far - clip.near) / (2 ** 24 - 1),
+  scale_checks: scaleChecks,
+};
+const depthPassed = depthChecks.finite_ordered && depthChecks.thin_film_levels > 20 &&
+  depthChecks.tangential_film_levels.every((levels) => levels > 20) &&
+  depthChecks.orthographic_step_m < 1.6e-9 / 1000 && scaleChecks.every((check) => check.passed);
 const stable = Object.entries(sources).every(([file, text]) => text === fs.readFileSync(root + file, "utf8"));
-console.log(JSON.stringify({ schema: "fullmag.viewport-depth-source-diagnostic.v1", evidence: "production declarations; Node type erasure; no unit-test build; no WebGL", three_revision: THREE.REVISION, source_hashes: Object.fromEntries(Object.entries(sources).map(([file, text]) => [file, hash(text)])), extracted_sha256: hash(source), sources_stable: stable, geometry: results, clip, tangential }, null, 2));
-process.exitCode = stable && results.every((r) => r.endpoints > 0 && r.off_surface_segments === 0) ? 0 : 1;
+console.log(JSON.stringify({ schema: "fullmag.viewport-depth-source-diagnostic.v1", evidence: "production declarations; Node type erasure; no unit-test build; no WebGL", three_revision: THREE.REVISION, source_hashes: Object.fromEntries(Object.entries(sources).map(([file, text]) => [file, hash(text)])), extracted_sha256: hash(source), sources_stable: stable, geometry: results, clip, tangential, depth_policy: legacyDepth ? "legacy-negative-control" : "production", depth_checks: depthChecks, depth_passed: depthPassed }, null, 2));
+process.exitCode = stable && depthPassed && results.every((r) => r.endpoints > 0 && r.off_surface_segments === 0) ? 0 : 1;
