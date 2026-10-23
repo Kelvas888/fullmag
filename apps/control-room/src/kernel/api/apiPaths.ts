@@ -60,6 +60,9 @@ export const SESSION_CLIENT_PATH = openApiV2Path(
   "/v2/sessions/current/clients/{client_id}",
 );
 
+/** Fullmag instances on this host, one per Control Room origin (ADR 0069). */
+export const PLATFORM_INSTANCES_PATH = openApiV2Path("/v2/platform/instances");
+
 export const ANALYSIS_FREQUENCY_RESPONSE_MAGNETIC_SWEEP_V1_PATH = openApiV2Path(
   "/v2/sessions/current/analysis/frequency-response/magnetic-sweep.v1",
 );

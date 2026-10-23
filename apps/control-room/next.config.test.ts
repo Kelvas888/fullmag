@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 
 import nextConfig, {
   DOCKER_DEV_WATCH_POLLING_DEFAULT_MS,
+  INSTANCE_TAB_FRAME_ANCESTORS,
   isDockerDevGeneratedWatchPath,
   resolveControlRoomDistDir,
   resolveDockerDevWatchOptions,
@@ -316,6 +317,17 @@ describe("control-room Next dev proxy config", () => {
       } else {
         process.env.FULLMAG_API_PROXY_TARGET = previousTarget;
       }
+    }
+  });
+});
+
+describe("instance tab framing (ADR 0069)", () => {
+  it("lets only this origin and loopback instances frame the Control Room", () => {
+    expect(INSTANCE_TAB_FRAME_ANCESTORS).toContain("'self'");
+    expect(INSTANCE_TAB_FRAME_ANCESTORS).toContain("http://127.0.0.1:*");
+    expect(INSTANCE_TAB_FRAME_ANCESTORS).toContain("http://localhost:*");
+    for (const source of INSTANCE_TAB_FRAME_ANCESTORS) {
+      expect(source).toMatch(/^('self'|https?:\/\/(127\.0\.0\.1|localhost):\*)$/);
     }
   });
 });

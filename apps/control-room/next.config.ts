@@ -302,10 +302,23 @@ const allowedDevOrigins = [
  * rejects `headers()` when `output: "export"` is set, and the desktop shell
  * is not a browser-hosted document anyway.
  */
+/**
+ * Loopback origins of Fullmag instances: they may embed this Control Room as
+ * an instance tab, and this Control Room may frame them (ADR 0069).
+ */
+export const INSTANCE_TAB_FRAME_ANCESTORS = [
+  "'self'",
+  "http://127.0.0.1:*",
+  "https://127.0.0.1:*",
+  "http://localhost:*",
+  "https://localhost:*",
+];
+
 function securityHeaders() {
   return [
     { key: "X-Content-Type-Options", value: "nosniff" },
-    { key: "X-Frame-Options", value: "SAMEORIGIN" },
+    // No X-Frame-Options: it cannot list origins, and `frame-ancestors` below
+    // supersedes it in every current browser (ADR 0069).
     { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
     {
       key: "Permissions-Policy",
@@ -321,7 +334,11 @@ function securityHeaders() {
         "font-src 'self' data:",
         "connect-src 'self' http: https: ws: wss:",
         "worker-src 'self' blob:",
-        "frame-ancestors 'self'",
+        // Session tabs show other local instances in frames (ADR 0069).
+        `frame-src ${INSTANCE_TAB_FRAME_ANCESTORS.join(" ")}`,
+        // Another local instance may show this one in a session tab (ADR 0069);
+        // remote pages still cannot frame the Control Room.
+        `frame-ancestors ${INSTANCE_TAB_FRAME_ANCESTORS.join(" ")}`,
         "base-uri 'self'",
         "object-src 'none'",
       ].join("; "),
