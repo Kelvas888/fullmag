@@ -2423,11 +2423,14 @@ Pakiet z commita `1b8b7db8e69c5b6f894fd115b7578fcce01cd660` zbudowano
 w stałym backendzie859f2. Make exit0, 1307240ms; walidacja24 plików PASS.
 Receipt `aefc906539be8995e39bde8ba468c0b942596d66b6963bd0d379e529bc633228`,
 snapshot `cc35c497687d6ad9e6b8fadb2c860a598aca235a07a97167d1905cdf59dabdb4`.
-Operator omyłkowo podał szersze architektury CUDA zamiast wcześniejszego
-86-real, powodując pełną przebudowę natywnego kodu. Nie był to brak cache.
-Gotowy pakiet zachowano; nie należy ponawiać ciężkiego buildu tylko w celu
-poprawienia tej deklaracji. Właściwy automatyczny dobór należy przywrócić
-przy kolejnym uzasadnionym cyklu konfiguracji.
+Build użył szerszej macierzy obrazu zamiast wcześniejszego86-real, ponieważ
+backend utracił dostęp do GPU i sonda automatycznego doboru była niedostępna.
+Wcześniejsze przypisanie przyczyny zmiennej hosta było błędne: launcher nie
+przekazuje FULLMAG_DEV_CUDA_ARCHITECTURES, a _build_environment sam wybiera
+architekturę widocznego GPU albo macierz obrazu. To skutek tej samej regresji
+profilu, nie brak cache. Gotowy pakiet zachowano. Przywrócenie GPU przywróci
+automatyczny dobór86-real; zmiana wkompilowanego commita wymaga spójnego nowego
+pakietu, a zmiana listy architektur może wymagać przebudowy natywnego kodu.
 
 Próba8454 zakończyła się przed API, exit1 bez OOM: nowy Compose miał
 requestedauto/resolvedcpu, podczas gdy poprzednia próba271 i istniejąca
