@@ -2926,3 +2926,110 @@ Toolchain ec4ba i oba obrazy aplikacji zostały zbudowane. Po przerwaniu WSL/Doc
 8 testów interpretowanych i 6 izolowanych prób Bash/flock/CAS PASS; niezależny review bez pozostałych blockerów. Natywny preview i apply przez nową receptę just: exit0, terminal failed-confirmed SHA256 `a6b428a51e15f6cc84152b05c67eb72f3ce850d97a1cc8b4fe97c4951db94971`, bez wymyślonego exit Make i bez aktualizacji verified. Oryginalny receipt zarchiwizowany, tylko własny marker zwolniony. Ponowna kontrola: 70 plików wyników, 5 katalogów historii i FMS Universe bez zmian. Kontenery i cache zachowane.
 
 Następny krok: jedno zatwierdzone docker-dev-resume z cache; brak aktywnego launchera w chwili tego checkpointu. Zero Universe Solve. API, pełna mapa H, cold-load, WebGL i kwalifikacja naukowa nie są dowiedzione tym recovery. E0 pozostaje jedynym odebranym etapem; E1–E12 otwarte.
+
+
+### 24.10.2026 — wznowiony build zakończony, Universe zatrzymany przed compute
+
+Zatwierdzone wznowienie `7fe211454fea49e3b54ff7937f347de4` zakończyło się
+exit0. Pakiet z commita `58b6ce8fa3032dec5ce0fe04fb238ab8bd2837c8` i snapshotu
+`80b78d1bc5c18ef613a3c9d7a9ff41e17870e3b965bc4fe163b57037c9c3d039`
+przeszedł kontrolę 24 plików i wystartował API w stałym backendzie tej grupy.
+To dowód buildu/startu, nie obliczenia pola ani UI.
+
+Stary Run `860970…`, bez próby wykonawczej, anulowano istniejącą publiczną
+komendą przed claimem (katalog revision4). Zachowany FMS Universe otwiera się
+przez API, ale bez bezpiecznej projekcji `authoring_scene_document` — bramka
+cold-load E5 pozostaje niezaliczona. Dokładny skrypt Universe ponownie
+zaimportowano przez publiczne `projects/from-script`: round-trip verified,
+bez wykonania Solve podczas importu. Utworzono własną niemagnetyczną sesję
+`session-18e1474c9f2a120d00000df8`, scena revision1, globalny sampling Universe.
+Nie dodano m, Ms ani Aex w odpowiedzi na nadal magnetyczne generic readiness.
+
+Wysłano dokładnie JEDEN publiczny Solve z intentem
+`universe-volume-inspection-20261023-01`. Timeout HTTP nie oznaczał odmowy:
+utworzono Run
+`run-live-a64208b634566c8860f02400cb9b0a7f78c0a5a2d116c94a7629e613b7ee223f`.
+Przygotowanie zakończyło się exit0. Compute odmówił przed claimem:
+`durable task fingerprint differs from the accepted study step`.
+Nadzorca zamknął API i runtime; backend ma tylko supervisor i jest unhealthy.
+Brak attempt, wykonania solvera i opublikowanego V/J/H Universe. Nie ponowiono
+Solve i nie zmieniono fingerprintów, OWNER ani rezerwacji.
+
+Przyczyna: `MeshIR.per_domain_quality` jest HashMap; `resolve_field_sampling`
+hashuje surowe bajty serde_json całego MeshIR. Powtórne odczyty tego samego
+CAS `97717f89a94f47c538d2260159404dea49fd9e5141ae58cbfd1d2bd5206cec4e`
+mają dwie legalne kolejności domen jakości 0/1. Rzeczywiste stare
+`fullmag-bin plan-json --execution-plan`, 24 odczytowe wywołania tego samego
+ProblemIR (1157 próbek): dwa digests, odpowiednio 13 i 11 wystąpień.
+To diagnostyka planera, bez nowego Solve, zapisu runu lub kwalifikacji fizyki.
+
+Minimalna poprawka źródeł: uporządkowany serializer tylko `per_domain_quality`
+po kluczach u32; format pozostałych pól, puste/single-domain bajty, schemat
+`task_input.v1` i ścisła kontrola consumer pozostają. Dodano trzy regresje
+źródłowe; parser rustfmt PASS. Testów Rust NIE kompilowano. Poprawiony
+pakiet i ponowny publiczny przepływ pozostają NOT VERIFIED.
+
+Zarządzany `docker-dev-recovery-build` odmówił przed Make: kontroler wybiera
+stare `development/verified.json`, chociaż bieżący kontener pochodzi z
+poprawnego nowszego resume. Nie podmieniono receiptów i nie pominięto kontroli
+środowiska/cache. Przygotowywana jest konkretna propozycja przypiętej authority
+resume oraz natywnego anulowania preclaim przy martwym API. Nowa procedura
+recovery wymaga decyzji o konkretnym patchu zgodnie z §8 instrukcji użytkownika.
+
+Po awarii ponownie porównano wszystkie 70 plików wcześniejszego wyniku,
+5 historycznych katalogów i FMS Universe — identyczne. Nowy katalog pozostaje
+Accepted revision2, bez attempt/artifacts. Dowody w wolumenie kontrolnym:
+`verification/universe-volume-policy-20261023/mesh-quality-determinism/`
+(`old-binary-reproduction.json`, `preservation.json`). E0 jest jedynym
+odebranym etapem; E1–E12, pełna mapa H, cold-load, browser/WebGL i naukowa
+kwalifikacja pozostają otwarte.
+
+
+Końcowy checkpoint 24.10.2026: przygotowany i przejrzany połączony patch recovery
+`6ce99bd5c18ce667c9a617c5b4908b08df06785b025d1efcc4ebf54e24c24a1a`.
+13 testów interpretowanych, 6 prób fixed argv, Bash, parser just oraz apply-check
+PASS. Konkretna warunkowa procedura i zakres decyzji:
+[przegląd recovery Universe](2026-10-24-universe-fingerprint-recovery-proposal.md).
+Najpierw sprawdzenie zgodności i zachowanie istniejącego Run; anulowanie oraz
+jedno nowe Solve wyłącznie przy niezgodności i po zgodzie. Patch bramek,
+build kandydata, natywny preview i dalsze operacje nie zostały wykonane.
+
+
+### 24.10.2026 — E5: ustalona rozbieżność projekcji Universe z FMS
+
+Niezależny audyt podczas oczekiwania na zgodę recovery; brak zmian runtime,
+guardów lub zapisanego projektu. Istniejący `fullmag-bin project open` odczytał
+oryginalny FMS (SHA256 `55c8a90d323d8d6d2581397985f0a438efa2860f3ce2155405954bb92dff0665`),
+exit0, read_write, migrated=false, runtime untouched. To dowód odczytu archiwum
+przez aplikację, nie odtworzenia sceny ani wyników przez HTTP.
+
+`packages/fullmag-py/src/fullmag/runtime/script_builder.py` + `_export_universe`
+emituje jednocześnie airbox_hmax/hmin i maximum_element_size/minimum_element_size.
+W rzeczywistym archiwum wartości wynoszą odpowiednio 5e-7 m i 1.5e-7 m,
+a obie pary aliasów są zgodne. `crates/fullmag-authoring/src/builder.rs` +
+`ScriptBuilderUniverseState` nie zawiera dwóch nowych nazw. Dotyczy to zarówno
+`/universe`, jak i `/study/universe_mesh`. Te cztery niepuste pola są pomijane
+przy typed projection; dodatkowo size=null jest pomijane przez Option::is_none.
+Serde opisuje te zachowania w [container attributes](https://serde.rs/container-attrs.html)
+i [field attributes](https://serde.rs/field-attrs.html).
+
+`crates/fullmag-api/src/router_v2/handlers/persistence/projects.rs` +
+`opened_authoring_scene`, `raw_scene_survives_projection` i
+`known_omitted_scene_default` wymagają zachowania dostarczonych niepustych pól;
+nie rozpoznają tych ścieżek jako równoważnych aliasów. To wystarczający warunek
+odmowy projekcji w aktualnym kodzie, zgodny z wcześniejszym rzeczywistym
+odpowiednikiem HTTP bez authoring_scene_document. Nie wykonano teraz samej
+funkcji HTTP, bo API jest zatrzymane. Nie wyłączono jej ochrony i nie usunięto
+pól z archiwum. Odrębny drift od niestabilnego digestu schedulera.
+
+FMS zawiera zero assetów i runs=[], jest więc zapisem authoringu. Nie dowodzi
+cold-load V/J/H; historyczne wyniki pozostają osobno zachowane. Przyszła naprawa
+musi spójnie obsłużyć nowe i starsze nazwy Universe, odmowę sprzecznych wartości
+oraz auto size=null, zachowując odmowę utraty rzeczywiście nieznanych danych.
+Nie dopisujemy wyjątku dla jednej anteny. Nie jest to gotowa specyfikacja zmiany
+schematu ani kwalifikacja publikacyjna; E5 pozostaje otwarte.
+
+Dowody w wolumenie kontrolnym grupy:
+`verification/universe-volume-policy-20261023/fms-open-projection-audit/`:
+`native-open.json` oraz `source-audit.json`. Bez kompilacji testów Rust,
+nowego Solve, ponownego startu API lub rozszerzania oczekującej zgody recovery.

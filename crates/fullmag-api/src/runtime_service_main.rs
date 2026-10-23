@@ -4,6 +4,7 @@ mod accepted_study_supervisor;
 #[path = "compute_operator_env.rs"]
 mod compute_operator_env;
 mod failed_worker_recovery;
+mod failed_preclaim_cancellation;
 use anyhow::{bail, Context, Result};
 use fullmag_session::{
     compute_node_snapshot::Reported,
@@ -2545,6 +2546,9 @@ fn run() -> Result<()> {
         }
         Some(value) if value == OsString::from("--complete-reaped-worker-archive") => {
             failed_worker_recovery::run_completion(args)
+        }
+        Some(value) if value == OsString::from("--cancel-failed-preclaim") => {
+            failed_preclaim_cancellation::run(args)
         }
         Some(value) if value == OsString::from("--cancel-failed-no-spawn") => {
             cancel_failed_no_spawn(args)

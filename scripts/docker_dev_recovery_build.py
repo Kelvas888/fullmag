@@ -473,6 +473,79 @@ def inspect_one(kind, name):
     return rows[0]
 
 
+
+def recovery_authority(control, args, selected):
+    """Select the legacy authority or one explicitly pinned successful resume."""
+    from docker_volume_reconcile import read_raw
+    attempt = getattr(args, 'resume_attempt', None)
+    terminal_sha = getattr(args, 'resume_terminal_sha256', None)
+    require(bool(attempt) == bool(terminal_sha), 'Both resume authority pins are required')
+    if not attempt:
+        previous = control.read('development/verified.json')
+        root = 'development/attempts/' + previous['attempt']
+        return previous, previous, control.read(root + '/compose.json'), control.read(root + '/backend-cache.json'), {}
+    require(re.fullmatch(r'[0-9a-f]{32}', attempt) and re.fullmatch(r'[0-9a-f]{64}', terminal_sha),
+            'Exact resume attempt and terminal SHA-256 are required')
+    pins = {}
+    def read(relative):
+        raw = read_raw(control, relative)
+        pins[relative] = hashlib.sha256(raw).hexdigest()
+        return json.loads(raw)
+    resume_root = 'resume/attempts/' + attempt
+    resume = read(resume_root + '/terminal.json')
+    require(pins[resume_root + '/terminal.json'] == terminal_sha, 'Resume terminal CAS differs')
+    require(resume.get('schema') == 'fullmag.docker-build-operation.v1'
+            and resume.get('phase') == 'resume' and resume.get('state') == 'succeeded'
+            and resume.get('attempt') == attempt and resume.get('compose_project') == control.project
+            and resume.get('control_volume') == control.volume, 'Successful resume authority differs')
+    parent_attempt = resume.get('inputs', {}).get('attempt')
+    require(isinstance(parent_attempt, str) and re.fullmatch(r'[0-9a-f]{32}', parent_attempt)
+            and parent_attempt != attempt, 'Resume parent attempt is invalid')
+    root = 'development/attempts/' + parent_attempt
+    previous = read(root + '/terminal.json')
+    document, profile = read(root + '/compose.json'), read(root + '/backend-cache.json')
+    require(previous.get('schema') == 'fullmag.docker-build-operation.v1'
+            and previous.get('phase') == 'development' and previous.get('attempt') == parent_attempt
+            and previous.get('state') in {'succeeded', 'failed-confirmed'}
+            and previous.get('compose_project') == control.project
+            and previous.get('control_volume') == control.volume
+            and previous.get('inputs', {}).get('source_root') == str(selected)
+            and previous.get('inputs', {}).get('image_id') == args.image_id,
+            'Resume parent source/image authority differs')
+    config_sha = hashlib.sha256(canonical(document)).hexdigest()
+    require(document.get('name') == control.project and previous.get('config_sha256') == config_sha
+            and resume.get('config_sha256') == config_sha
+            and resume['inputs'].get('config_sha256') == config_sha, 'Resume configuration chain differs')
+    for service in ('backend', 'frontend'):
+        identifier = resume.get(service + '_container')
+        require(isinstance(identifier, str) and re.fullmatch(r'[0-9a-f]{64}', identifier)
+                and previous.get(service + '_container') == identifier,
+                'Resume service incarnation differs: ' + service)
+    require(resume['backend_container'] == args.backend_container_id
+            and isinstance(resume.get('backend_started_at'), str) and bool(resume['backend_started_at']),
+            'Resume backend/start identity differs')
+    for key in ('state_root', 'backend_volumes', 'frontend_volume'):
+        require(previous.get(key) is not None and resume.get(key) == previous[key],
+                'Resume retained state differs: ' + key)
+    require(profile.get('volume_names') == resume['backend_volumes'], 'Resume cache volume authority differs')
+    package = read(resume_root + '/backend-build-receipt.json')
+    provenance = read(resume_root + '/provenance.json')
+    package_sha = pins[resume_root + '/backend-build-receipt.json']
+    require(package.get('state') == 'succeeded' and provenance.get('state') == 'succeeded'
+            and provenance.get('build_receipt_sha256') == package_sha
+            and resume.get('backend_build_receipt_sha256') == package_sha,
+            'Resume package publication authority differs')
+    for terminal_key, provenance_key in (('source_commit', 'commit'), ('source_digest', 'source_digest'),
+                                        ('source_snapshot_sha256', 'source_snapshot_sha256')):
+        value = resume.get(terminal_key)
+        width = 40 if terminal_key == 'source_commit' else 64
+        require(isinstance(value, str) and re.fullmatch('[0-9a-f]{' + str(width) + '}', value)
+                and provenance.get(provenance_key) == value, 'Resume source publication differs: ' + terminal_key)
+    return previous, resume, document, profile, {'phase': 'resume', 'attempt': attempt,
+        'terminal_sha256': terminal_sha, 'parent_attempt': parent_attempt, 'config_sha256': config_sha,
+        'documents': pins}
+
+
 def run(args):
     from docker_dev import _select_source, _compose_identity
     import docker_backend_volume_cache as cache
@@ -508,16 +581,17 @@ def run(args):
     identity = _compose_identity(layout)
     control = BuildControl(identity, args.image_id)
     control.prepare()
-    previous = control.read('development/verified.json')
-    root = 'development/attempts/' + previous['attempt']
-    document, profile = control.read(root + '/compose.json'), control.read(root + '/backend-cache.json')
+    previous, authority, document, profile, authority_pins = recovery_authority(control, args, selected)
     image = inspect_one('image', args.image_id)
     actual = inspect_one('container', args.backend_container_id)
     validate_backend(actual, identity, args.backend_container_id, args.image_id)
     _validate_retained_service(document, actual, 'backend', image['Config'])
-    require(previous.get('state') == 'succeeded' and previous.get('compose_project') == control.project
+    if authority_pins:
+        require(actual.get('State', {}).get('StartedAt') == authority['backend_started_at'],
+                'Backend incarnation differs from pinned resume')
+    require(authority.get('state') == 'succeeded' and previous.get('compose_project') == control.project
             and previous.get('inputs', {}).get('source_root') == str(selected)
-            and previous.get('backend_container') == args.backend_container_id
+            and authority.get('backend_container') == args.backend_container_id
             and document.get('name') == control.project, 'Verified source/backend authority differs')
     expected_cache = cache.cache_key(selected, identity['worktree_id'],
                                     profile['toolchain_image_id'], profile['cargo_profile'])
@@ -538,6 +612,8 @@ def run(args):
                   source_commit=storage.git(selected, 'rev-parse', 'HEAD'),
                   backend_started_at=actual['State']['StartedAt'],
                   container_fingerprint=fingerprint(actual), controller_sha256=hashlib.sha256(inside_code(promote).encode()).hexdigest())
+    if authority_pins:
+        inputs['retained_authority'] = authority_pins
     if promote:
         inputs.update({name: getattr(args, name) for name in promotion_pins})
     if superseded is not None:
@@ -545,6 +621,9 @@ def run(args):
             for key, path in {'FULLMAG_RECOVERY_HELPER_SHA256': 'docker/all-in-one/backend_candidate_recovery.py',
                               'FULLMAG_RECOVERY_BACKEND_SHA256': 'docker/all-in-one/backend_dev.py'}.items()})
     with control.operation('recovery-promotion' if promote else 'recovery-build', inputs) as operation:
+        if authority_pins:
+            require(recovery_authority(control, args, selected)[4] == authority_pins,
+                    'Resume authority changed before repair operation')
         request = {**inputs, 'result_path': backend_control_path(control.path(operation['root'] + '/result.json'))}
         fresh = inspect_one('container', args.backend_container_id)
         require(fingerprint(fresh) == inputs['container_fingerprint']
@@ -590,6 +669,8 @@ def main():
     parser.add_argument('--image-id', required=True)
     parser.add_argument('--process-receipt-sha256', required=True)
     parser.add_argument('--owner-sha256', required=True)
+    parser.add_argument('--resume-attempt')
+    parser.add_argument('--resume-terminal-sha256')
     for name in ('candidate-basename', 'marker-sha256', 'receipt-sha256', 'make-attempt-sha256'):
         parser.add_argument('--superseded-' + name)
     parser.add_argument('--promote', action='store_true')

@@ -87,6 +87,19 @@ fi
 
 # Closed scientific route, before diagnostic/storage shortcuts; never eval argv.
 case "${recipe}" in
+  *"scripts/docker_dev_preclaim_cancel.py"*)
+    preclaim_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_preclaim_cancel.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --candidate-basename '(\\.backend-package-candidate-[A-Za-z0-9._-]+)' --candidate-receipt-sha256 '([0-9a-f]{64})' --request '(verification/[A-Za-z0-9._/-]+)' --request-sha256 '([0-9a-f]{64})'( --apply)?[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${preclaim_pattern} ]]; then
+      echo "[fullmag just] invalid native preclaim cancellation recipe" >&2
+      exit 2
+    fi
+    preclaim_args=(--source-root "${BASH_REMATCH[1]}" --backend-container-id "${BASH_REMATCH[2]}"
+      --image-id "${BASH_REMATCH[3]}" --candidate-basename "${BASH_REMATCH[4]}"
+      --candidate-receipt-sha256 "${BASH_REMATCH[5]}" --request "${BASH_REMATCH[6]}"
+      --request-sha256 "${BASH_REMATCH[7]}")
+    if [[ -n "${BASH_REMATCH[8]:-}" ]]; then preclaim_args+=(--apply); fi
+    exec "${python_cmd}" -B "${script_dir}/docker_dev_preclaim_cancel.py" "${preclaim_args[@]}"
+    ;;
   *"scripts/docker_nf_common_volume.py"*)
     nf_volume_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_nf_common_volume.py\" --repo-root \"[^\"]+\" --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --producer-attempt '([0-9a-f]{32})' --producer-receipt-sha256 '([0-9a-f]{64})' --report-id '([0-9a-f]{32})'( --profile '(comparison|fixed-m-iterations-1248)')?$"
     if [[ ! "${recipe}" =~ ${nf_volume_pattern} ]]; then
@@ -225,7 +238,8 @@ case "${recipe}" in
     recovery_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_recovery_build.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --process-receipt-sha256 '([0-9a-f]{64})' --owner-sha256 '([0-9a-f]{64})'"
     promotion_pattern=" --promote --candidate-basename '(\.backend-package-candidate-[A-Za-z0-9._-]+)' --candidate-receipt-sha256 '([0-9a-f]{64})' --current-receipt-sha256 '([0-9a-f]{64})' --provenance-sha256 '([0-9a-f]{64})'"
     superseded_pattern=" --superseded-candidate-basename '(\.backend-package-candidate-[A-Za-z0-9._-]+)' --superseded-marker-sha256 '([0-9a-f]{64})' --superseded-receipt-sha256 '([0-9a-f]{64})' --superseded-make-attempt-sha256 '([0-9a-f]{64})'"
-    recovery_pattern="${recovery_build_pattern}((${promotion_pattern})|(${superseded_pattern}))?[[:space:]]*$"
+    resume_authority_pattern=" --resume-attempt '([0-9a-f]{32})' --resume-terminal-sha256 '([0-9a-f]{64})'"
+    recovery_pattern="${recovery_build_pattern}((${promotion_pattern})|(${superseded_pattern}))?(${resume_authority_pattern})?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${recovery_pattern} ]]; then
       echo "[fullmag just] invalid repair build/promotion recipe" >&2
       exit 2
@@ -240,6 +254,9 @@ case "${recipe}" in
       recovery_args+=(--superseded-candidate-basename "${BASH_REMATCH[13]}"
         --superseded-marker-sha256 "${BASH_REMATCH[14]}" --superseded-receipt-sha256 "${BASH_REMATCH[15]}"
         --superseded-make-attempt-sha256 "${BASH_REMATCH[16]}")
+    fi
+    if [[ -n "${BASH_REMATCH[17]:-}" ]]; then
+      recovery_args+=(--resume-attempt "${BASH_REMATCH[18]}" --resume-terminal-sha256 "${BASH_REMATCH[19]}")
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_dev_recovery_build.py" "${recovery_args[@]}"
     ;;
