@@ -1377,13 +1377,12 @@ fn apply_resolved_docker_output_storage_binding(
     Ok(())
 }
 
-/// A script SaveState consumes the immutable state produced by its preceding
-/// solver step. It never reads the mutable current workspace or starts Solve.
-fn bind_live_save_state_inputs(study: &mut fullmag_authoring::StudyPlan) -> Result<(), ApiError> {
-    use fullmag_authoring::{
-        StudyInputPort, StudyInputSource, StudyOutputPort, StudyPortDataKind,
-        StudyPrimitiveStageKind, StudyStepKind,
-    };
+/// Script solver steps continue from the immutable final state of the preceding
+/// enabled Run or Relax step (relax -> run starts from the relaxed state), and a
+/// script SaveState consumes that same state. Neither reads the mutable current
+/// workspace or starts Solve. Any other step kind ends the state chain.
+fn bind_live_solver_state_inputs(study: &mut fullmag_authoring::StudyPlan) -> Result<(), ApiError> {
+    use fullmag_authoring::{StudyPrimitiveStageKind, StudyStepKind};
 
     let mut previous_solver = None;
     for index in 0..study.steps.len() {
@@ -1393,7 +1392,18 @@ fn bind_live_save_state_inputs(study: &mut fullmag_authoring::StudyPlan) -> Resu
         match study.steps[index].kind {
             StudyStepKind::Primitive {
                 stage_kind: StudyPrimitiveStageKind::Run | StudyPrimitiveStageKind::Relax,
-            } => previous_solver = Some(index),
+            } => {
+                if let Some(previous) = previous_solver {
+                    bind_preceding_solver_state(
+                        study,
+                        previous,
+                        index,
+                        "initial_state",
+                        "accepted_solver_state_source_conflict",
+                    )?;
+                }
+                previous_solver = Some(index);
+            }
             StudyStepKind::Primitive { stage_kind: StudyPrimitiveStageKind::SaveState } => {
                 let previous = previous_solver.ok_or_else(|| {
                     ApiError::unprocessable_with_code(
@@ -1401,44 +1411,65 @@ fn bind_live_save_state_inputs(study: &mut fullmag_authoring::StudyPlan) -> Resu
                         "SaveState requires a preceding enabled Run or Relax step",
                     )
                 })?;
-                let source_id = study.steps[previous].step_id.clone();
-                let input = StudyInputPort {
-                    port_id: "state".into(),
-                    data_kind: StudyPortDataKind::State,
-                    required: true,
-                    source: StudyInputSource::StepOutput {
-                        step_id: source_id,
-                        port: "state".into(),
-                        case_id: "default".into(),
-                    },
-                };
-                if study.steps[index].inputs.is_empty() {
-                    study.steps[index].inputs.push(input);
-                } else if study.steps[index].inputs != [input] {
-                    return Err(ApiError::unprocessable_with_code(
-                        "accepted_save_state_source_conflict",
-                        "SaveState input must preserve the preceding solver state",
-                    ));
-                }
-                let output = StudyOutputPort {
-                    port_id: "state".into(),
-                    data_kind: StudyPortDataKind::State,
-                };
-                if let Some(existing) = study.steps[previous].outputs.iter()
-                    .find(|port| port.port_id == "state")
-                {
-                    if existing != &output {
-                        return Err(ApiError::unprocessable_with_code(
-                            "accepted_save_state_source_conflict",
-                            "SaveState source output is not a magnetization state",
-                        ));
-                    }
-                } else {
-                    study.steps[previous].outputs.push(output);
-                }
+                bind_preceding_solver_state(
+                    study,
+                    previous,
+                    index,
+                    "state",
+                    "accepted_save_state_source_conflict",
+                )?;
             }
             _ => previous_solver = None,
         }
+    }
+    Ok(())
+}
+
+/// Bind `steps[consumer].<input_port>` to the `state` output of
+/// `steps[previous]`, declaring that output when absent. Rebinding the same
+/// edge is idempotent; any other authored input or output is a conflict.
+fn bind_preceding_solver_state(
+    study: &mut fullmag_authoring::StudyPlan,
+    previous: usize,
+    consumer: usize,
+    input_port: &str,
+    conflict_code: &'static str,
+) -> Result<(), ApiError> {
+    use fullmag_authoring::{StudyInputPort, StudyInputSource, StudyOutputPort, StudyPortDataKind};
+
+    let input = StudyInputPort {
+        port_id: input_port.into(),
+        data_kind: StudyPortDataKind::State,
+        required: true,
+        source: StudyInputSource::StepOutput {
+            step_id: study.steps[previous].step_id.clone(),
+            port: "state".into(),
+            case_id: "default".into(),
+        },
+    };
+    if study.steps[consumer].inputs.is_empty() {
+        study.steps[consumer].inputs.push(input);
+    } else if study.steps[consumer].inputs != [input] {
+        return Err(ApiError::unprocessable_with_code(
+            conflict_code,
+            "step input must preserve the preceding solver state",
+        ));
+    }
+    let output = StudyOutputPort {
+        port_id: "state".into(),
+        data_kind: StudyPortDataKind::State,
+    };
+    if let Some(existing) = study.steps[previous].outputs.iter()
+        .find(|port| port.port_id == "state")
+    {
+        if existing != &output {
+            return Err(ApiError::unprocessable_with_code(
+                conflict_code,
+                "preceding solver output is not a magnetization state",
+            ));
+        }
+    } else {
+        study.steps[previous].outputs.push(output);
     }
     Ok(())
 }
@@ -1600,7 +1631,7 @@ fn prepare_live_accepted(
         }
         LiveAcceptedSubmission::Startup { .. } => None,
     };
-    bind_live_save_state_inputs(&mut study)?;
+    bind_live_solver_state_inputs(&mut study)?;
     study.validate_for_execution().map_err(|error| {
         ApiError::unprocessable_with_code(
             "accepted_study_plan_invalid",
@@ -2372,6 +2403,13 @@ mod tests {
     }
 
     fn save_state_study() -> fullmag_authoring::StudyPlan {
+        use fullmag_authoring::StudyPrimitiveStageKind::{Relax, SaveState};
+        primitive_study(&[("relax", Relax), ("save", SaveState)])
+    }
+
+    fn primitive_study(
+        nodes: &[(&str, fullmag_authoring::StudyPrimitiveStageKind)],
+    ) -> fullmag_authoring::StudyPlan {
         use fullmag_authoring::*;
         let node = |id: &str, stage_kind| StudyPipelineNode::Primitive(PrimitiveStageNode {
             id: id.into(), label: id.into(), enabled: true, notes: None, source: None,
@@ -2381,8 +2419,7 @@ mod tests {
             "study:save-state", 1,
             &StudyPipelineDocument {
                 version: "study_pipeline.v1".into(),
-                nodes: vec![node("relax", StudyPrimitiveStageKind::Relax),
-                    node("save", StudyPrimitiveStageKind::SaveState)],
+                nodes: nodes.iter().map(|(id, kind)| node(id, *kind)).collect(),
             },
             &StudyPlanMigrationDefaults {
                 model: StudyModelReference { model_id: "model:film".into(), version: "1".into() },
@@ -2397,7 +2434,7 @@ mod tests {
     fn save_state_binds_only_the_preceding_accepted_solver_state() {
         use fullmag_authoring::{StudyInputSource, StudyPortDataKind};
         let mut study = save_state_study();
-        super::bind_live_save_state_inputs(&mut study).unwrap();
+        super::bind_live_solver_state_inputs(&mut study).unwrap();
         study.validate_for_execution().unwrap();
         assert_eq!(study.steps[0].outputs[0].port_id, "state");
         assert_eq!(study.steps[0].outputs[0].data_kind, StudyPortDataKind::State);
@@ -2406,13 +2443,57 @@ mod tests {
             step_id: "relax".into(), port: "state".into(), case_id: "default".into(),
         });
         let unchanged = study.clone();
-        super::bind_live_save_state_inputs(&mut study).unwrap();
+        super::bind_live_solver_state_inputs(&mut study).unwrap();
         assert_eq!(study, unchanged);
         study.steps[1].inputs[0].source = StudyInputSource::AuthoredInitialState { reference: "initial".into() };
-        assert!(super::bind_live_save_state_inputs(&mut study).is_err());
+        assert!(super::bind_live_solver_state_inputs(&mut study).is_err());
         let mut missing = save_state_study();
         missing.steps[0].enabled = false;
-        assert!(super::bind_live_save_state_inputs(&mut missing).is_err());
+        assert!(super::bind_live_solver_state_inputs(&mut missing).is_err());
+    }
+
+    #[test]
+    fn solver_steps_continue_from_the_preceding_accepted_solver_state() {
+        use fullmag_authoring::StudyPrimitiveStageKind::{Relax, Run, SaveState};
+        use fullmag_authoring::{StudyInputSource, StudyPortDataKind};
+        let relax_state = StudyInputSource::StepOutput {
+            step_id: "relax".into(), port: "state".into(), case_id: "default".into(),
+        };
+
+        let mut study = primitive_study(&[("relax", Relax), ("run", Run)]);
+        super::bind_live_solver_state_inputs(&mut study).unwrap();
+        study.validate_for_execution().unwrap();
+        assert_eq!(study.topological_order().unwrap(), vec!["relax", "run"]);
+        assert!(study.steps[0].inputs.is_empty());
+        assert_eq!(study.steps[0].outputs.len(), 1);
+        assert_eq!(study.steps[0].outputs[0].port_id, "state");
+        assert_eq!(study.steps[0].outputs[0].data_kind, StudyPortDataKind::State);
+        assert_eq!(study.steps[1].inputs.len(), 1);
+        assert_eq!(study.steps[1].inputs[0].port_id, "initial_state");
+        assert_eq!(study.steps[1].inputs[0].data_kind, StudyPortDataKind::State);
+        assert_eq!(study.steps[1].inputs[0].source, relax_state);
+        let unchanged = study.clone();
+        super::bind_live_solver_state_inputs(&mut study).unwrap();
+        assert_eq!(study, unchanged);
+        study.steps[1].inputs[0].source = StudyInputSource::AuthoredInitialState { reference: "initial".into() };
+        assert!(super::bind_live_solver_state_inputs(&mut study).is_err());
+
+        // SaveState does not break the chain: run still continues from relax.
+        let mut saved = primitive_study(&[("relax", Relax), ("save", SaveState), ("run", Run)]);
+        super::bind_live_solver_state_inputs(&mut saved).unwrap();
+        saved.validate_for_execution().unwrap();
+        assert_eq!(saved.steps[0].outputs.len(), 1);
+        assert_eq!(saved.steps[1].inputs[0].source, relax_state);
+        assert_eq!(saved.steps[2].inputs[0].port_id, "initial_state");
+        assert_eq!(saved.steps[2].inputs[0].source, relax_state);
+
+        // A selected single step (others disabled) keeps its authored initial state.
+        let mut selected = primitive_study(&[("relax", Relax), ("run", Run)]);
+        selected.steps[0].enabled = false;
+        super::bind_live_solver_state_inputs(&mut selected).unwrap();
+        selected.validate_for_execution().unwrap();
+        assert!(selected.steps[1].inputs.is_empty());
+        assert!(selected.steps[0].outputs.is_empty());
     }
 
     #[test]
