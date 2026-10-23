@@ -3517,7 +3517,7 @@ impl SessionStore {
         }
         let _writer_lease = self.write_transaction()?;
         let lease_path = self.resource_lease_path(lease)?;
-        let lease_bytes = fs::read(&lease_path)
+        let lease_bytes = read_file_held_under_writer(&lease_path)
             .with_context(|| format!("reading resource lease {}", lease_path.display()))?;
         let current_lease: FmsResourceLease = serde_json::from_slice(&lease_bytes)
             .with_context(|| format!("parsing resource lease {}", lease_path.display()))?;
@@ -5993,7 +5993,7 @@ impl SessionStore {
         // below remain unchanged.
         self.validate_resource_lease_owner_unlocked(lease, true)?;
         let path = self.resource_lease_path(lease)?;
-        let data = fs::read(&path)
+        let data = read_file_held_under_writer(&path)
             .with_context(|| format!("reading resource lease {}", path.display()))?;
         let current: FmsResourceLease = serde_json::from_slice(&data)?;
         current.validate()?;
@@ -6042,7 +6042,7 @@ impl SessionStore {
             anyhow::bail!("resource lease release requires the active lease identity");
         }
         let path = self.resource_lease_path(lease)?;
-        let data = fs::read(&path)
+        let data = read_file_held_under_writer(&path)
             .with_context(|| format!("reading resource lease {}", path.display()))?;
         let mut current: FmsResourceLease = serde_json::from_slice(&data)?;
         current.validate()?;
@@ -7142,6 +7142,26 @@ fn magnetization_from_bytes(data: &[u8]) -> Vec<[f64; 3]> {
         m.push([mx, my, mz]);
     }
     m
+}
+
+
+/// Read a file that must exist while the caller holds the store writer, such
+/// as an active resource lease: no other writer can remove it. On a Docker
+/// Desktop host folder (NTFS) an atomic replace can still read as missing for
+/// a moment, so such a read is retried briefly before it is reported.
+fn read_file_held_under_writer(path: &Path) -> std::io::Result<Vec<u8>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match fs::read(path) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 #[cfg(test)]
