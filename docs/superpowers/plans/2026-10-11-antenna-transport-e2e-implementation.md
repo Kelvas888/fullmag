@@ -2627,3 +2627,16 @@ Log `verification/shared-inspection-read-20261023/python-contracts-28ed0603a.log
 Ten checkpoint zamyka wcześniejsze oczekiwanie na zgodę i wykonanie restartu.
 Pełny FMS zakończonej obserwacji, cold-load i rzeczywisty UI/WebGL nadal
 pozostają niezweryfikowane; E1–E12 nie są zamknięte.
+
+
+### 23.10.2026 — powiązanie etapu inspekcji z istniejącym widokiem Raw SI
+
+Analiza nowego wariantu Universe wykazała, że projekcja accepted runu
+pozostawiała `antenna_solve_stage_id=None`. Istniejący frontend prawidłowo
+odrzucał taki niepowiązany etap. Projektor wyprowadza teraz autorskie ID
+z typed `ClosedLoopInspection` albo właściwego planu `AntennaFieldSolve`,
+zachowując osobne runtime ID i wszystkie kontrole własności wyniku.
+Dwie regresje `accepted_antenna_linkage` obejmują rozdzielenie ID oraz odmowę
+niezgodnego rodzaju/planu. Zostały przygotowane, lecz lokalnie nie kompilowano
+testów; istniejący krok bootstrap `live_accepted_projection::tests` je obejmuje.
+Wdrożenie runtime i rzeczywisty widok nadal wymagają weryfikacji.

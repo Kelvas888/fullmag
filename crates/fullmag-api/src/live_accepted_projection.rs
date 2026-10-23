@@ -629,6 +629,21 @@ fn build_stage_execution(
             None,
             stage_status,
         );
+        record.antenna_solve_stage_id = match &step.kind {
+            fullmag_authoring::StudyStepKind::ClosedLoopInspection { stage_id, .. } => {
+                Some(stage_id.clone())
+            }
+            fullmag_authoring::StudyStepKind::Primitive {
+                stage_kind: fullmag_authoring::StudyPrimitiveStageKind::AntennaFieldSolve,
+            } => step.execution_plan.as_ref().and_then(|plan| match &plan.backend_plan {
+                fullmag_ir::BackendPlanIR::AntennaFieldOnly(antenna) => Some(antenna.stage_id.clone()),
+                fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(antenna) => {
+                    Some(antenna.input.stage.id.clone())
+                }
+                _ => None,
+            }),
+            _ => None,
+        };
         if let Some(detail) = task
             .and_then(|task| terminal_details.get(&task.task_id))
             .and_then(Option::as_ref)
@@ -2158,6 +2173,65 @@ mod tests {
         let catalog = store.read_run_catalog(&context.run_id).unwrap().unwrap();
         assert_eq!(catalog.revision, 5);
         (directory, store, context, catalog)
+    }
+
+    #[test]
+    fn accepted_antenna_linkage_keeps_closed_loop_authored_and_runtime_ids_separate() {
+        let (_directory, store, context, mut catalog) = preclaim_cancelled_fixture();
+        let mut accepted = fullmag_runtime_control::load_accepted_study_snapshot(&store,
+            &fullmag_application::RunId::parse(context.run_id).unwrap(),
+            &fullmag_application::ProjectId::parse("project-cancel").unwrap()).unwrap();
+        let step = &mut accepted.lowered.steps[0];
+        let runtime_id = step.step_id.clone();
+        step.kind = fullmag_authoring::StudyStepKind::ClosedLoopInspection {
+            stage_id: "inspect_loop".into(), port_mode_id: "loop_port".into(), output_id: "loop_output".into(),
+        };
+        // Closed-loop linkage comes from its typed operation, without assuming
+        // the runtime ID, label or a magnetic backend plan is the authored ID.
+        step.execution_plan = None;
+        for task in &mut catalog.tasks { task.lifecycle = fullmag_session::FmsTaskLifecycle::Succeeded; }
+        let projected = build_stage_execution(&accepted, &catalog.tasks, None, &[],
+            &std::collections::BTreeMap::new(), "completed").unwrap();
+        assert_eq!(projected.stages[0].stage_id.as_deref(), Some(runtime_id.as_str()));
+        assert_eq!(projected.stages[0].antenna_solve_stage_id.as_deref(), Some("inspect_loop"));
+        assert_eq!(projected.stages[0].status, crate::types::StageLifecycleState::Completed);
+        assert!(projected.stages[0].artifact_refs.is_empty());
+        assert!(projected.stages[1].antenna_solve_stage_id.is_none());
+    }
+
+    #[test]
+    fn accepted_antenna_linkage_requires_primitive_kind_and_selected_typed_plan() {
+        let (_directory, store, context, catalog) = preclaim_cancelled_fixture();
+        let mut accepted = fullmag_runtime_control::load_accepted_study_snapshot(&store,
+            &fullmag_application::RunId::parse(context.run_id).unwrap(),
+            &fullmag_application::ProjectId::parse("project-cancel").unwrap()).unwrap();
+        let step = &mut accepted.lowered.steps[0];
+        step.kind = fullmag_authoring::StudyStepKind::Primitive {
+            stage_kind: fullmag_authoring::StudyPrimitiveStageKind::AntennaFieldSolve,
+        };
+        let before = build_stage_execution(&accepted, &catalog.tasks, None, &[],
+            &std::collections::BTreeMap::new(), "cancelled").unwrap();
+        assert!(before.stages[0].antenna_solve_stage_id.is_none());
+        accepted.lowered.steps[0].execution_plan.as_mut().unwrap().backend_plan =
+            fullmag_ir::BackendPlanIR::AntennaFieldOnly(fullmag_ir::AntennaFieldOnlyPlanIR {
+                schema_version: "antenna_field_only_plan.v1".into(), stage_id: "authored-inspection".into(),
+                port_mode_id: "port".into(), source_object_id: "antenna".into(),
+                source_mesh: fullmag_ir::MeshIR::default(), source_object_segments: Vec::new(), source_mesh_parts: Vec::new(),
+                field_sampling: fullmag_ir::AntennaFieldSamplingPlanIR {
+                    domain: fullmag_ir::FieldTargetIR::Global {}, carrier_kind: "fem_domain_mesh_asset".into(),
+                    location: "node".into(), topology_digest: "a".repeat(64), positions_xyz_m: Vec::new(),
+                    cells: fullmag_ir::FemConnectivityIR::empty(),
+                },
+            });
+        let projected = build_stage_execution(&accepted, &catalog.tasks, None, &[],
+            &std::collections::BTreeMap::new(), "cancelled").unwrap();
+        assert_eq!(projected.stages[0].antenna_solve_stage_id.as_deref(), Some("authored-inspection"));
+        accepted.lowered.steps[0].kind = fullmag_authoring::StudyStepKind::Primitive {
+            stage_kind: fullmag_authoring::StudyPrimitiveStageKind::Run,
+        };
+        let unrelated = build_stage_execution(&accepted, &catalog.tasks, None, &[],
+            &std::collections::BTreeMap::new(), "cancelled").unwrap();
+        assert!(unrelated.stages[0].antenna_solve_stage_id.is_none());
     }
 
     #[test]
