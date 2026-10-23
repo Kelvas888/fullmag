@@ -1106,7 +1106,10 @@ fn verify_host_worker_launch_for_claim(
             .iter()
             .next()
             .context("host GPU worker has no physical allocation")?;
-        if reservation.budget.gpu_memory_bytes != lease.budget.gpu_memory_bytes
+        // Host reservations account VRAM per physical device
+        // (`host_request_for_task_claim` leaves the aggregate budget at zero),
+        // so the exact allocation is the one device's VRAM, not the aggregate.
+        if reservation.budget.gpu_memory_bytes != 0
             || reservation.gpu_vram_bytes_by_uuid.get(uuid)
                 != Some(&lease.budget.gpu_memory_bytes)
             || std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref() != Some(uuid.as_str())
