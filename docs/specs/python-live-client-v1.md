@@ -367,10 +367,10 @@ Stan ścieżek trybu live w grupie DEV (23.10.2026):
 
 | Ścieżka | Wynik | Uwagi |
 |---|---|---|
-| FDM CPU | działa | pełne E2E: model, `relax`, `m`, `transaction()`, `run` z kontynuacją, zdarzenia, eksport |
-| FDM GPU | `run` działa | worker GPU przechodzi po poprawce kontroli VRAM per urządzenie; `relax` (`llg_overdamped`) zatrzymuje bramka `strict` „final execution is not fully device-proven” (operator na hoście); po runie GPU brak ramek obserwacji, więc `m` nie jest odczytywalne |
-| FEM CPU | nie działa | komenda kolejkuje zadanie obliczeń bez potwierdzenia przygotowania FEM („no preparation receipt”); FEM w Dockerze wymaga Prepare → Compute (bramka startu), którego tryb live jeszcze nie prowadzi; demagnetyzacja FEM wymaga też `build_domain_mesh()` z airboxem |
-| FEM GPU | niesprawdzone | jak FEM CPU |
+| FDM CPU | działa | pełne E2E powtarzalne: model, `relax`, `m` (trasa pól, FMVP v2), `transaction()`, `run` z kontynuacją, zdarzenia, eksport |
+| FDM GPU | `run` działa | dwa kolejne `run` z kontynuacją i odczytem `m` po poprawkach kontroli VRAM i możliwości runtime; `relax` (`llg_overdamped`) zatrzymuje bramka `strict` „final execution is not fully device-proven” (operator na hoście) |
+| FEM CPU | działa niestabilnie | przygotowanie i solver działają (po poprawce klucza potwierdzenia przygotowania); `relax` zakończył się sukcesem, ale publikacja wyników bywa głodzona przez blokadę zapisu magazynu na folderze Windows (> 120 s bez wejścia); demagnetyzacja FEM wymaga `build_domain_mesh()` z airboxem |
+| FEM GPU | niesprawdzone | |
 
 Ograniczenia stwierdzone w grupie DEV (poza zakresem F5):
 
