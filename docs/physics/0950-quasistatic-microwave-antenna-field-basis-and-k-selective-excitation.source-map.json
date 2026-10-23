@@ -8163,7 +8163,7 @@
     },
     {
       "id": "antenna-universe-sampling-example",
-      "path": "examples/fem_antenna_closed_loop_universe.py",
+      "path": "examples/antenna_universe/fem_antenna_closed_loop_universe.py",
       "symbol": "study",
       "responsibility": "Niemagnetyczny Universe i jawny volume_inspection_v1; diagnostyczna siatka 1154 węzły/6487 Tet4; wykonanie H nadal oczekuje na weryfikację.",
       "evidence_status": "source_only"

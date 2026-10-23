@@ -2793,3 +2793,40 @@ PASS; logi `prestart-just-forwarding-red.log` i
 `prestart-just-forwarding-green.log` w control volume. To uzupełnienie
 integracji tej samej zatwierdzonej operacji. Dokładnie jedna rzeczywista
 próba startu 3203 nadal pozostaje do wykonania; 0 nowych Solve.
+
+
+### 23.10.2026 — recovery i build PASS, capture Universe odrzucony przed sesją
+
+Zarządzany resume `9ed72cef7b084179b979e1b687e39bd1`: succeeded, exit 0.
+Te same dwa kontenery wystartowały poprawnie; hook NVIDIA nie powtórzył błędu.
+Pakiet: commit `50f3976525fb85cd234326cfff2538d8cc3712b2`, snapshot
+`9f881ff8833ef3188ad009d8a79d75c70906c01ebbf2ed1f7e566c493b07f37c`.
+Make: exit 0, 942732 ms; publikacja i weryfikacja 24 plików PASS.
+Nowe API: health ok, active_session=false. Rzeczywisty odczyt zapisanych
+V/J/H przez nowe API PASS, wszystkie trzy hashe payloadów identyczne.
+70 plików wyników i pięć katalogów historii pozostało niezmienionych.
+Dowody: `post-recovery-start-results-preserved.json` oraz
+`post-recovery-saved-fields-http.json` w control volume.
+
+Aktywacja `25f38f683cbe422f98cfc7701004e3b5` została potwierdzona jako
+failed-confirmed/rejected (HTTP 422 accepted_script_capture_invalid), bez
+session_id i run_id. Nie wydano Solve. Odrzuconego requestu nie ponawiamy.
+Odczytowy inventory-only bez wykonania skryptu wskazał
+`source_capture_aggregate_budget`. Katalog examples zawiera około 28,8 MB,
+w tym niepowiązany STL 18 MB i stary wynik Zarr 6,8 MB; limit źródeł to 8 MiB.
+
+Dwa rozwiązania: zmiana wersjonowanej polityki selekcji/limitu capture albo
+samodzielny katalog przykładu. Wybrano minimalną relokację do
+`examples/antenna_universe/fem_antenna_closed_loop_universe.py`, z identycznymi
+5599 bajtami, SHA256 `ab47a68d632ccedbbdf0b66c272a63d5aa7600a35e956c46259bd9e8185d05ac`.
+Zaktualizowano odwołania i source-map. Nie zmieniono fizyki, polityki capture,
+limitów obliczeń ani źródeł starego przykładu. Odrzucony receipt pozostaje.
+Kolejny krok: odczytowe inventory izolowanego inputu, walidacja odwołań,
+a następnie nowy jawny input przez tę samą receptę i pierwsze Solve Universe.
+
+
+Inventory izolowanego inputu: PASS, 5599 B źródeł, 92197563 B runtime,
+wyłącznie jeden source file. Nie wykonano skryptu. Zgodność noty i mapy
+źródeł PASS; 41 interpretowanych testów kontraktu dokumentacji PASS.
+Dowody: `isolated-capture-inventory-only.json` i
+`isolated-example-doc-validation.log` w control volume.

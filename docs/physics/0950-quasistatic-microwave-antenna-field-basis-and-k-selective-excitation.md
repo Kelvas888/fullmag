@@ -1952,7 +1952,7 @@ substituted by this stored-basis projection.
 (antenna-universe-inspection-carrier)=
 #### 6.3.1. Niemagnetyczny Universe jako nośnik mapy pola
 
-Przykład `examples/fem_antenna_closed_loop_universe.py` zachowuje pełny obwód
+Przykład `examples/antenna_universe/fem_antenna_closed_loop_universe.py` zachowuje pełny obwód
 3D, materiały i źródło z przykładu `fem_antenna_closed_loop_nonmagnetic.py`.
 Zastępuje lokalny obiekt `sampling` domeną Universe. Nie dodaje materiału
 magnetycznego, magnetyzacji ani dynamiki LLG. „Obieg pola” oznacza tutaj
@@ -2062,7 +2062,7 @@ nie usuwa obowiązku niezależnej oceny zbieżności siatki i kwadratury.
 | packages/fullmag-py/src/fullmag/world.py | class StudyUniverseHandle | Publiczne rozdzielenie granic Universe i jego siatki; jawne minimum, maksimum, wzrost i grading. | source_only |
 | packages/fullmag-py/src/fullmag/world.py | class StudyUniverseConfig | Walidacja i serializacja pierwotnej konfiguracji Universe, bez magnetycznego stanu. | source_only |
 | packages/fullmag-py/src/fullmag/world.py | _build_explicit_mesh_assets | Żądanie budowy wspólnej domeny; capture zachowuje odrębność deklaracji i topologii. | source_only |
-| examples/fem_antenna_closed_loop_universe.py | study | Niemagnetyczny Universe i jawny volume_inspection_v1; diagnostyczna siatka 1154 węzły/6487 Tet4; wykonanie H nadal oczekuje na weryfikację. | source_only |
+| examples/antenna_universe/fem_antenna_closed_loop_universe.py | study | Niemagnetyczny Universe i jawny volume_inspection_v1; diagnostyczna siatka 1154 węzły/6487 Tet4; wykonanie H nadal oczekuje na weryfikację. | source_only |
 | crates/fullmag-runner/src/native_fem/steady_transport.rs | solve_native_fem_prepared_closed_loop | Sprawdza requested/resolved policy oraz rzeczywistą liczbę par przed wywołaniem natywnym. | source_only |
 | crates/fullmag-runner/src/antenna_field_solution/direct_quadrature_v2.rs | verify_policy_binding | Cold v2 wiąże dokładny tuple budżetu ze snapshotem i requested/resolved provenance; legacy bez nowych pól wymaga starego profilu. | source_only |
 | backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp | DirectTetraQuadrature::ResolveWorkLimits | Zamknięty selektor legacy 1..1M lub dokładnie 4M; wyznacza globalne limity kernel i ledger bez zmiany ABI. | source_only |
