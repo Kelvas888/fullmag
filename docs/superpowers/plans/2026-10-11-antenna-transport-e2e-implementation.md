@@ -2690,3 +2690,43 @@ w wolumenie kontrolnym. Nowe CI nie zostało uruchomione: GitHub CLI zwraca
 Pierwszy preflight restartu odrzucił hash kompaktowej reprezentacji JSON
 zamiast hasha zapisanych bajtów, przed zmianą usług. Pin poprawiono na
 rzeczywisty SHA256 powyżej; ślad zachowuje `checkpoint-file-pin.json`.
+
+
+### 23.10.2026 — build profilu zatrzymany przed startem PID1
+
+Zarządzana operacja `iteration/6db0e30ac9df4824bd366d4af20c9457` wykonała
+kontrolowany drain oraz zatrzymanie obu własnych usług. Docker odmówił
+ponownego startu tego samego backendu: `nvidia-container-cli: ldcache error:
+process /sbin/ldconfig terminated with signal 9`. Backend ma PID=0,
+ExitCode=128, OOMKilled=false i niezmieniony StartedAt poprzedniej inkarnacji.
+Kompilacja nowego pakietu nie rozpoczęła się; nie wydano żadnego nowego Solve.
+Stan kontrolera: `outcome-unknown-resources-retained`; lease pozostaje
+u dotychczasowego właściciela. Backend i frontend 3203 są zatrzymane.
+
+Log jądra Docker Desktop zawiera `CPU Watchdog Timeout (hard)` dla
+`memfd:/sbin/ldc`. WSL nvidia-smi widzi RTX 3070 Laptop i sterownik 596.21;
+nie dowodzi to poprawności hooka kontenera. Nie zmieniono sterowników,
+konfiguracji GPU, limitów kontenera ani wspólnego Dockera/WSL.
+
+Rzeczywista kontrola zachowania wyników po tej awarii: PASS, wszystkie
+70 plików starego run/Zarr i pięć przypiętych katalogów historii są identyczne.
+Oryginalny skrypt i plik użytkownika `.20261022.fms` również zachowały SHA256.
+Dowody w wolumenie kontrolnym grupy:
+`verification/universe-volume-policy-20261023/post-failed-prestart-results-preserved.json`
+oraz `verification/universe-volume-policy-20261023/checkpoint.json`.
+Profil jest wdrożony w źródłach, ale nowe CI, native runtime, wynik Universe
+i UI/WebGL pozostają NOT VERIFIED. Istniejący reconcile nie obsługuje
+potwierdzonego błędu OCI przed PID1; przygotowywany addytywny patch recovery
+nie jest jeszcze zastosowany. Nie zamykamy E1–E12.
+
+
+Pakiet recovery jest przygotowany, lecz aktywne launchery pozostają niezmienione.
+Przegląd: `2026-10-23-oci-prestart-recovery-proposal.md` obok tego dokumentu.
+Dokładny patch SHA256 `136c5d0ef949219e528bf6125e2976b9f468fd99bb5abf264a552fcc271c0b4b`,
+request SHA256 `daa2fc63db52b91099316ff6c2597ffb6a7c77e91596f038a52b2f1996931751`.
+16 interpretowanych testów offline PASS; root powtórzył je po przeniesieniu
+artefaktu do śledzonego `.patch.txt`. Rzeczywista kontrola rdzenia tylko do
+odczytu PASS. `git apply --check` potwierdza składnię i oryginalny kontekst
+patcha; wymagane spacje pustych linii unified diff pozostają jego danymi.
+Pełne CLI preview i wykonanie recovery pozostają niewykonane do osobnej zgody
+na zmianę bramki wymaganej przez przekazane AGENTS.md, sekcję 8.
