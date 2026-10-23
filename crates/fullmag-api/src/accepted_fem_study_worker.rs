@@ -80,8 +80,9 @@ pub(crate) fn prepare_accepted_fem_execution(
     }
     validate_declared_outputs(&study_step.outputs)?;
 
+    // Receipts are keyed by the durable task id, not the study step id.
     let preparation = accepted
-        .read_task_preparation_receipt(store, &accepted_step.step_id)
+        .read_task_preparation_receipt(store, accepted_step.claim.task_id.as_str())
         .context("load exact accepted FEM preparation receipt")?;
     let preparation_binding = PreparationBinding::from_receipt(&preparation)
         .map_err(|error| anyhow::anyhow!(error.to_string()))
