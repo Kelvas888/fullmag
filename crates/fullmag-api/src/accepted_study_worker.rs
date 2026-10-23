@@ -3629,11 +3629,8 @@ fn accepted_worker_test_fail_before_start_effect() -> Result<()> {
     Ok(())
 }
 
-fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
-    fullmag_runtime_control::retry_store_writer_busy_within(
-        fullmag_runtime_control::WORKER_STORE_WRITER_WAIT,
-        &mut operation,
-    )
+fn retry_store_writer_busy<T>(operation: impl FnMut() -> Result<T>) -> Result<T> {
+    fullmag_runtime_control::retry_worker_store_transient(operation)
 }
 
 /// Retry only idempotent claim/lease validation while honoring a durable

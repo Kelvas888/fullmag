@@ -219,10 +219,7 @@ pub(crate) fn prepare_and_publish(
 /// This module runs inside the worker, which waits for the shared writer
 /// rather than losing a computed result (`WORKER_STORE_WRITER_WAIT`).
 fn retry_worker_store_writer_busy<T>(operation: impl FnMut() -> Result<T>) -> Result<T> {
-    fullmag_runtime_control::retry_store_writer_busy_within(
-        fullmag_runtime_control::WORKER_STORE_WRITER_WAIT,
-        operation,
-    )
+    fullmag_runtime_control::retry_worker_store_transient(operation)
 }
 
 pub(crate) fn field_key(field: &fullmag_runner::AcceptedMaterializedField) -> String {

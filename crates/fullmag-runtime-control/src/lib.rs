@@ -74,6 +74,30 @@ pub fn retry_store_writer_busy_within<T>(
     }
 }
 
+/// Worker retry for idempotent store operations: a busy writer is waited for
+/// up to `WORKER_STORE_WRITER_WAIT`, and a file that briefly reads as missing
+/// (an atomic replace seen through a Docker Desktop host folder) for a few
+/// seconds. A genuinely missing file still fails after that short bound.
+pub fn retry_worker_store_transient<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    use std::time::{Duration, Instant};
+
+    let missing_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match retry_store_writer_busy_within(WORKER_STORE_WRITER_WAIT, &mut operation) {
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) && Instant::now() < missing_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
 pub fn commit_worker_checkpoint(
     store: &SessionStore,
     claim: &fullmag_application::TaskClaim,
