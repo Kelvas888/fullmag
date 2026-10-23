@@ -368,9 +368,9 @@ Stan ścieżek trybu live w grupie DEV (23.10.2026):
 | Ścieżka | Wynik | Uwagi |
 |---|---|---|
 | FDM CPU | działa | pełne E2E powtarzalne: model, `relax`, `m` (trasa pól, FMVP v2), `transaction()`, `run` z kontynuacją, zdarzenia, eksport |
-| FDM GPU | `run` działa | dwa kolejne `run` z kontynuacją i odczytem `m` po poprawkach kontroli VRAM i możliwości runtime; `relax` (`llg_overdamped`) zatrzymuje bramka `strict` „final execution is not fully device-proven” (operator na hoście) |
-| FEM CPU | działa niestabilnie | przygotowanie i solver działają (po poprawce klucza potwierdzenia przygotowania); `relax` zakończył się sukcesem, ale publikacja wyników bywa głodzona przez blokadę zapisu magazynu na folderze Windows (> 120 s bez wejścia); demagnetyzacja FEM wymaga `build_domain_mesh()` z airboxem |
-| FEM GPU | niesprawdzone | |
+| FDM GPU | `run` działa | kolejne `run` z kontynuacją i odczytem `m`; `relax` (`llg_overdamped`) zatrzymuje bramka kwalifikacji `strict` „final execution is not fully device-proven” (operator na hoście) — ograniczenie ścieżki GPU, nie trybu live |
+| FEM CPU | działa | `relax` → `m` → `transaction()` → `run` → `m` (bez demagnetyzacji; demag FEM wymaga `build_domain_mesh()` z airboxem) |
+| FEM GPU | działa | jak FEM CPU; kontynuacja ze stanu runu FEM CPU tej samej sesji |
 
 Ograniczenia stwierdzone w grupie DEV (poza zakresem F5):
 
@@ -392,7 +392,7 @@ przechodzi niejawnie na CPU.
 | F2 | dekoder FMVP, `to_numpy()`, tabele, cache ETag | zrobione: `test_live_client_data.py` i `fieldVectorCodec.fixtures.test.ts` dają identyczne wyniki na wspólnych próbkach |
 | F3 | tryb `live` w `world.py`: `fm.connect`/`FULLMAG_URL`, natychmiastowa synchronizacja, reguła tożsamości, `transaction()`, akcje, `paused()`, `export_script()` | zrobione: testy na stanowym fałszywym API (`test_live_dsl_mode.py`) oraz E2E w grupie DEV (FDM CPU, 23.10.2026): model → `relax` → `m.average()` i `field("m")` → `transaction()` → `run` → `export_script()`; `pause`/`skip` w Dockerze nadal 422 (Q3) |
 | F4 | subskrybent WebSocket, `fm.on()`, `fm.run_until()`, dodatek Jupyter | zrobione: `test_live_events.py` (prawdziwy serwer WebSocket w teście); w E2E w grupie DEV strumień dostarczył 29 zdarzeń; pomiar narzutu `run_until` w grupie DEV NOT VERIFIED |
-| F5 | zmiany backendu z §9 | zrobione dla FDM CPU (kontynuacja `m` potwierdzona w E2E: `initial_state_source.kind = continuation` z artefaktu `final_state`), FDM GPU tylko `run`; FEM nie działa w trybie live (tabela ścieżek w §9); kod `session_already_active`, obecność klientów potwierdzona; testy Rust kompilowane tylko w CI |
+| F5 | zmiany backendu z §9 | zrobione: regresja E2E w grupie DEV na jednej wersji (23.10.2026) przechodzi na FDM CPU, FDM GPU (`run`), FEM CPU i FEM GPU, z kontynuacją `m` między komendami (`initial_state_source.kind = continuation`); obecność klientów potwierdzona; wyjątek: `relax` na FDM GPU (bramka `strict`); testy Rust kompilowane tylko w CI |
 | F6 | `fm.sweep()` na wielu grupach DEV | zaimplementowane (`test_live_sweep.py`: 2 serwery, kolejność wyników, błędy punktów, nieosiągalna grupa); przemiatanie na ≥ 2 prawdziwych grupach DEV NOT VERIFIED |
 | F7 | opcjonalnie tryb in-process (PyO3 + `InteractiveRuntime`) z tym samym protokołem | callback po każdym kroku bez serwera |
 | F8 | przykładowy skrypt i notatnik w `examples/`, strona w `public_docs`, ściągawka Boris → Fullmag | dokumentacja publikowana razem z F3 |
