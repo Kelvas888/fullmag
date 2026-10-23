@@ -74,6 +74,10 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
             get(handlers::platform::get_capabilities),
         )
         .route(
+            "/v2/platform/instances",
+            get(handlers::platform::instances::get_instances),
+        )
+        .route(
             "/v2/platform/asyncapi.json",
             get(handlers::platform::get_asyncapi_document),
         )
