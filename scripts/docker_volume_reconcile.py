@@ -261,7 +261,7 @@ def commit_script(control, root, request, journal_relative, result_sha, current_
                   and request.get("schema") == ACTIVATION_PREFLIGHT_SCHEMA)
     require(activation or (phase, publish_verified) in (("iteration", True), ("iteration", False), ("boris-reference", False)), "Closed reconciliation phase required")
     require(phase != "iteration" or publish_verified
-            or request.get("schema") == FAILED_BUILD_SCHEMA, "Failure-only publication requires its explicit schema")
+            or request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA), "Failure-only publication requires its explicit schema")
     phase = control.path(phase)
     targets = f"'{path}/receipt.json' '{phase}/current.json' " + (f"'{phase}/verified.json' " if publish_verified else "") + f"'{path}/terminal.json'"
     marker_commit = ""
@@ -405,11 +405,12 @@ def reconcile(args):
         validate_package(request)
     validate_partial_journal(control, journal_root, current_raw,
                              request["unknown_receipt_sha256"], args.request_sha256)
+    observer_script = claim_script(control, root, request, digest(current_raw), publish_verified=not failed_build)
     if prestart and getattr(args, "preview", False):
         print(json.dumps({"state": "validated-only", "attempt": request["attempt"], "schema": PRESTART_SCHEMA}))
         return
     claim_name = "fullmag-iteration-observer-" + uuid.uuid4().hex
-    claim = subprocess.Popen(control.helper_args(claim_script(control, root, request, digest(current_raw), publish_verified=not failed_build), name=claim_name),
+    claim = subprocess.Popen(control.helper_args(observer_script, name=claim_name),
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     admitted = False
     observation_error = None

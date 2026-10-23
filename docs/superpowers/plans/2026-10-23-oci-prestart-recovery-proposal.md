@@ -120,3 +120,28 @@ managed restart pozostają na tym checkpointcie niewykonane.
 Osobna zgoda wymagana przez przekazane AGENTS.md, sekcję 8, została uzyskana
 23.10.2026: „Tak, zastosuj patch i wykonaj recovery”. Obejmuje przypięty patch
 oraz jedną zarządzaną próbę startu naszej grupy 3203.
+
+
+### Korekta integracji writer — w granicach zatwierdzonego przypadku
+
+Pierwszy pełny reconciliation zatrzymał się przed utworzeniem helpera obserwacji:
+`commit_script` nadal dopuszczał wyłącznie schema błędu Make. Nie zapisano journalu,
+terminalu ani nie zmieniono lease i usług. Regresja konstruktora claim/commit
+odtwarza ten błąd przed poprawką. Minimalna korekta dopuszcza w tym samym
+failure-only writerze także wcześniej zatwierdzony PRESTART_SCHEMA; pozostałe
+schema nadal są odrzucane. Preview generuje teraz ten sam skrypt writera przed
+powrotem, bez uruchamiania go. Niezależny przegląd nie wykazał innego pominięcia
+schema ani rozszerzenia polityki. Publikowane są tylko receipt/current/terminal,
+bez verified i bez ręcznego usuwania active.
+
+Po korekcie: 18 interpretowanych testów PASS i pełny canonical preview PASS.
+Nowy SHA256 kontrolera: `424ea583457bf650ba63e7baa1c76da01d705ac41997f53c9a4a0198e19b3d23`.
+Wszystkie piny kontenerów, State, checkpointu, drainu i historii są bez zmian.
+Request wiąże nowy kod kontrolera: `000b108ff680d4e0d89acc3f3f9b603fabec25ac927326c66ec01856abc78f3e`,
+w pliku `2026-10-23-oci-prestart-recovery-writer-fixed-request.json`.
+Logi: `prestart-writer-red.log`, `prestart-writer-green.log` oraz
+`formal-writer-fixed-prestart-preview.log` pod
+`verification/universe-volume-policy-20261023/` w control volume.
+To domknięcie już zatwierdzonego przypadku prestart, bez nowego rodzaju
+recovery, zmiany polityki lub dodatkowej próby startu. Usługi nadal zatrzymane;
+0 nowych startów i Solve na tym checkpointcie.

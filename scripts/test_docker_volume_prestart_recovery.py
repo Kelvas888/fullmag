@@ -152,6 +152,27 @@ class PrestartRecoveryTests(unittest.TestCase):
         prior["backend_started_at"] = "new"
         with self.assertRaises(BuildControlError): recovery.validate_failure(control,"root",request,prior,self.actual,Path("/state"))
 
+    def test_prestart_claim_uses_failure_only_publication_targets(self):
+        control = types.SimpleNamespace(path=lambda value: "/control/" + value)
+        for schema in (recovery.SCHEMA, original.FAILED_BUILD_SCHEMA):
+            with self.subTest(schema=schema):
+                request = {"schema": schema, "attempt": "a"*32,
+                           "unknown_receipt_sha256": "b"*64}
+                script = self.controller.claim_script(control, "iteration/attempts/" + "a"*32,
+                    request, "b"*64, publish_verified=False)
+                self.assertIn("terminal.json", script)
+                self.assertIn("iteration/current.json", script)
+                self.assertNotIn("verified.json", script)
+                self.assertNotIn("rm ", script)
+
+    def test_unrecognized_iteration_failure_schema_is_rejected(self):
+        control = types.SimpleNamespace(path=lambda value: "/control/" + value)
+        for schema in (original.SCHEMA, original.ACTIVATION_PREFLIGHT_SCHEMA, "unknown"):
+            with self.subTest(schema=schema), self.assertRaises(BuildControlError):
+                self.controller.claim_script(control, "iteration/attempts/" + "a"*32,
+                    {"schema": schema, "attempt": "a"*32, "unknown_receipt_sha256": "b"*64},
+                    "b"*64, publish_verified=False)
+
     def test_legacy_continuation_noop(self):
         self.assertIsNone(recovery.continuation(None, types.SimpleNamespace(), {}, {}, {}, None))
 
