@@ -1,0 +1,159 @@
+# Naprawa głębokości i podglądu Primitive — odbiór 3D
+
+Data: 23.10.2026. Status: poprawki źródeł sprawdzone i zapisane; odbiór browser/WebGL, PR i integracja oczekują.
+
+## Zakres i diagnoza
+
+Zgłoszenie dotyczyło artefaktów trójkątów na ringu przy zbliżeniu oraz gwiazdy
+przekątnych w podglądzie Primitive przed wygenerowaniem siatki obliczeniowej.
+Punktem odniesienia jest grupa master na porcie 3198 i istniejący przykład
+`examples/permalloy_layer_cofeb_rings_relax_300nm.py`.
+
+Pierwotny [audyt głębokości](viewport-ring-depth-audit-2026-10-22.md) wskazał
+przyczynę w polityce kamery: oko znajdujące się wewnątrz globalnej sfery bounds
+sprowadzało near do 1 pm, a far pozostawało co najmniej 1 mm, także w scenie
+nanometrowej. To odbierało buforowi głębokości możliwość rozróżnienia bliskich
+powierzchni. Użycie pełnej triangulacji do wireframe Primitive niezależnie
+pokazywało przekątne płaskich kapsli ringu.
+
+## Zmiany
+
+- Jeden helper zakresu głębokości dla Fit, zapisanej projekcji i bieżącej
+  kamery OrbitControls. Zakres skaluje się ze sceną; dodatni konserwatywny
+  front bounds ogranicza near dla bliskiej geometrii. Wyeliminowano stały
+  próg 1 mm dla far oraz załamanie skali przy środku bounds w płaszczyźnie oka.
+- Podczas gestów aktualizowane są tylko płaszczyzny projekcji po OrbitControls,
+  bez publikowania pośrednich pozycji i bez uruchamiania dodatkowej pętli renderu.
+- Primitive ma generator krawędzi prezentacyjnych. Dla CSG obrzeża powstają
+  z rzeczywistych trójkątów kapsli: krawędzie wewnętrzne mają dwie przyległe
+  ściany i są usuwane; cztery obrzeża ringu pozostają. Pozostałe bryły
+  otrzymują obrys boxa lub rzadszą siatkę południków/równoleżników i generatorów.
+- Zachowano tracker oraz zwalnianie geometrii. Nie zmieniono generatora ani
+  wyświetlania właściwych krawędzi siatki FEM/FDM.
+- Do QA dodano fixture istniejącego przykładu oczekującą na Compute, ujęcia
+  z bliska, odczyt near/far i rzeczywistego stanu kontekstu WebGL.
+
+## Dowody źródłowe
+
+Weryfikacja w frontendzie grupy
+`fullmag-worktree-viewport-depth-20261022-d13d8cf2842d9225`, port 3212.
+Dane techniczne pozostają w jej wolumenach Docker.
+
+| Kontrola | Wynik | Granica dowodu |
+| --- | --- | --- |
+| ESLint pięciu produkcyjnych TS/TSX | PASS, exit 0 | Powtórzony po integracji mastera: PASS |
+| Typecheck aplikacji, `tsc --noEmit` | PASS, exit 0 | Wyklucza źródła unit tests |
+| Parsery dwóch zmienionych MJS | PASS, exit 0 | Końcowe MJS po rozszerzeniu QA: PASS |
+| Diagnostyka deklaracji produkcyjnych, Three r186 | PASS, 36/36 | Node type erasure, bez WebGL |
+| React Doctor | Częściowy wynik | Brak findingów w zmienianych plikach; dead-code scan nie zakończył się poprawnie |
+| Kompilacja/wykonanie unit tests | NOT RUN | Obowiązuje tymczasowy zakaz użytkownika |
+
+Diagnostyka geometrii obejmuje ring, box-hole (także niesymetryczny) dla osi
+X/Y/Z oraz box, sphere, cylinder, w trzech skalach. Każdy odcinek pokrywa się dokładnie z rzeczywistą
+krawędzią trójkąta powierzchni. Ring: 1024 endpointy, box-hole: 536, box: 24,
+sphere: 704, cylinder: 144. Zero odcinków poza krawędziami powierzchni.
+
+Pierwszy przebieg wykrył cztery rozbieżności zamknięcia okręgów. Ręczne
+odtwarzanie próbek zastąpiono ekstrakcją z powierzchni; dokładnych asercji
+nie poluzowano. Pełna triangulacja jako kontrola negatywna zostaje odrzucona
+przez asercję liczby krawędzi, także gdy wszystkie endpointy leżą na powierzchni.
+Diagnostyka odtwarzalna:
+[probe.cjs](viewport-depth-fix-2026-10-22/probe.cjs).
+
+Dla zapisanej kamery i umownego 24-bitowego depth buffer:
+
+| Parametr | Przed | Po |
+| --- | ---: | ---: |
+| near | 1e-12 m | 6.345077357801499e-10 m |
+| far | 1e-3 m | 8.046547155777423e-6 m |
+| Krok głębokości przy badanej powierzchni | 23.96 nm | 0.03776 nm |
+| Liczba poziomów dla 1.6 nm | 0 | 42 |
+
+Separacja 1.6 nm jest tutaj odległością w osi kamery. Kontrola negatywna
+`probe.cjs --legacy-depth` odrzuca starą politykę (exit 1), a bieżąca przechodzi
+(exit 0); dodatkowo przechodzą cztery skale oraz przejście środka bounds
+przez płaszczyznę oka (44 poziomy).
+
+To obliczenie kwantyzacji perspektywy, nie pomiar pikseli ani gwarancja
+rozdzielczości dla dowolnej pozycji kamery lub GPU.
+
+Receipty/logi kontroli: frontend volume, `/state/development/qa/viewport-depth/`,
+pliki `post-merge-checks.json`, `depth-regression.json`,
+`depth-legacy-negative-control.json`, `final-production-checks.json`, `geometry-source-diagnostic.json`,
+`depth-diagnostic.json`, `react-doctor.json`. Weryfikacja hashy źródeł była
+stabilna podczas kontroli. Końcowy probe używa helperów o SHA-256:
+
+- `viewport3DCameraClip.ts`: `6ab315e7a4d67fe0deebd55f083aacd8a29dcb92ac59607123f2036676c7c7f0`.
+- `primitiveWireframeGeometry.ts`: `9e3665fc4a2bb0db30c75012b220304880ae86cbbb16dfdd74637ad263fa9628`.
+
+Źródła biblioteki sprawdzono przez wymagany Context7, wersja Three.js r186:
+[precyzja kamer](https://github.com/mrdoob/three.js/blob/r186/manual/pages/cameras.html),
+[EdgesGeometry](https://github.com/mrdoob/three.js/blob/r186/docs/pages/EdgesGeometry.html),
+[ExtrudeGeometry](https://github.com/mrdoob/three.js/blob/r186/src/geometries/ExtrudeGeometry.js).
+Niezależne review źródeł po merge mastera nie zgłosiło actionable findings;
+nie zastępuje ono odbioru obrazu.
+
+## Runtime i browser/WebGL
+
+Pierwszy build aplikacji backendowej zakończył się exit 0 i uruchomił API
+22.10 o 21:10 UTC. Grupa została później zatrzymana; 23.10 wznowiono ją
+zarządzanym launcherem po włączeniu aktualnego mastera. Browser/WebGL,
+primitive-to-mesh i oględziny końcowych PNG: **NOT VERIFIED — w toku**.
+Nie uruchamiano Solve dla odbioru wizualnego.
+
+Stan końcowego odbioru na tym checkpointcie:
+
+- Start `46515f12f2a04d9fa8dc41d4ee98821c` potwierdzony `succeeded`,
+  konfiguracja `a826d61c53e6de06cbe2b4e5f2ac07288b30c9724450a9f31e9a161e68083347`.
+- Po restarcie Docker poprzedni ledger grupy miał obcy zapis writera i puste
+  rezerwacje. Zatrzymano tylko jej API diagnostyczne (exit0), zapisano dowód
+  `verification/viewport-depth-native-init-stop.json`, a zarządzane odtworzenie
+  `7619448e203847f891769465ed66e8e7` zachowało stary stan i uruchomiło świeży.
+  Nie zmieniano zapisów ownera ani ledgera; grupy innych zadań pozostały aktywne.
+- Pierwsza aktywacja fixture spod `apps/control-room/scripts/fixtures` została
+  odrzucona HTTP422 `docker_startup_output_mapping_required`, przed utworzeniem
+  sesji. Poprawiona fixture jest w `examples/qa/viewport_depth_preview.py`.
+  To wrapper istniejącego przykładu, z zachowanymi parametrami i wait_for_solve.
+- Nowa sesja: `docker-startup-2060aff7ea6d325a8cf5dceeef467987169c905c2253a7c8dfd637268419d798`.
+  Widoczny status API: `fem:unmaterialized`, cell_count0, solver `activating`.
+  Trwa eksport konfiguracji; nie ponawiano aktywacji ani nie uruchamiano Solve.
+- Zarządzany browser QA zakończył się przed uruchomieniem browsera:
+  `Docker observation exceeded its time/output budget during _raw (timeout=60s)`.
+  Proces eksportu czekał w `folio_wait_bit_common`; obserwowane full I/O pressure
+  około79%, bez presji pamięci. To zaobserwowane oczekiwanie na I/O, bez diagnozy
+  awarii sprzętu. Wolne miejsce: WSL24GiB, WindowsC75GiB. Health portu3212: HTTP200.
+- Browser/WebGL, końcowe PNG oraz primitive-to-mesh: **NOT VERIFIED**.
+  Do kontynuacji użyć tej samej aktywacji i jej zachowanych receiptów; nie
+  powtarzać komendy o nieznanym wyniku. Po jej zakończeniu ponowić wyłącznie
+  bezpieczny odczyt/preflight QA, a potem odbiór obrazu.
+
+
+## Commity i integracja
+
+- `5e12f782c4d5be861078b092917db26b9a922699`: zakres głębokości i kamera na żywo.
+- `fded49ec104eeed75a60dd9be77ae5567df8bf09`: kontury Primitive i diagnostyka.
+- `115c90761831dcf06d4169a574359ee532e18110`: mapper fixture examples/qa i asercje liczby konturów,36 wariantów; kontrole negatywne odrzucone.
+- `b098a82ea0887729228b9c1041b9c64957438678`: regresje głębokości, kontrola negatywna i ujęcia trzech trybów przez UI.
+- `5ac7eae523e5fc117eab9195f62ecda404841601`: włączenie lokalnego mastera.
+- Włączono lokalny master `ae8e570f2aa9655cb9fd8321c716b8d49a87e084`, zachowując
+  jego poprawki przekazywania renderowania z Primitive do gotowej siatki.
+
+Hook pre-commit próbowałby instalować `react-doctor@latest` przez hostowe npx.
+Dla commitów zadania użyto jednorazowego pominięcia tego hooka; zależności i
+kontrole wykonano w grupie Docker, zgodnie z regułami projektu. Konfiguracja
+hooków repozytorium nie została zmieniona.
+
+Odtwarzalny następny etap: [build-ring-mesh.py](viewport-depth-fix-2026-10-22/build-ring-mesh.py).
+AST sprawdzony; skrypt nie został wykonany z powodu trwającej aktywacji. Wymaga
+jawnego session_id, istniejącego klienta v2 i ścieżki receiptu w wolumenie grupy.
+Wysyła wyłącznie mesh_build, zachowuje command_id i nie powtarza istniejącego
+żądania. Nie stanowi dowodu gotowej siatki ani wykonania fizyki.
+
+PR, wymagane CI, merge, fast-forward i cleanup worktree: **niewykonane**.
+Wysłano pytanie o zakres tymczasowego zakazu kompilacji unit tests wobec CI;
+nie zakładamy odpowiedzi. Worktree i zasoby pozostają do zakończenia bramek.
+ Workflow
+`bootstrap.yml` automatycznie kompiluje unit tests C++/Rust przy PR; pozostaje
+rozstrzygnięcie tego działania w świetle tymczasowego zakazu ich kompilacji.
+
+Checkpoint zapisano UTC: 2026-10-23T08:21:56.361342+00:00.
