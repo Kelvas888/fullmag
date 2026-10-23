@@ -2672,10 +2672,21 @@ udowodnionym sprawcą tej awarii. Pełny log pozostaje w control volume:
 
 Checkpoint przed buildem:
 `verification/universe-volume-policy-20261023/saved-authoring-prebuild.json`,
-SHA256 `2a67b9d733fcd2663506d9d8fe512903cfab7ca9c4665837c47c5a44bbe3d066`.
+SHA256 zapisanego pliku `02b26eaae06c44e2f9fabcbaa0f77540a1fcef785d6123f0ae1b4f861096cf16`.
 Przypina bezczynną sesję, archiwum sceny, właściciela runtime i pięć
 terminalnych katalogów runów. Na D: jest 153,55 GiB wolnego;
 backendowy filesystem Docker ma 536,01 GiB wolnego logicznie.
 Budowa i nowy Solve są na tym checkpointcie jeszcze niewykonane.
 Weryfikacja starego wyniku, nowego pełnego H i rzeczywistego UI pozostaje
 osobną bramką. E1–E12 nadal otwarte.
+
+
+Walidacja źródeł profilu `9dbf04021efa5941dde96f8cdf980be1d8c90045`:
+focused validator noty i mapy PASS, 41 testów kontraktu dokumentacji PASS,
+guard publicznego przykładu PASS, kontrola zmienionej dokumentacji PASS.
+Pełny log ostatniej bramki: `verification/universe-volume-policy-20261023/changed-docs-9dbf04021.log`
+w wolumenie kontrolnym. Nowe CI nie zostało uruchomione: GitHub CLI zwraca
+401 i potwierdziło nieważne logowanie; użytkownik odłożył ponowne logowanie.
+Pierwszy preflight restartu odrzucił hash kompaktowej reprezentacji JSON
+zamiast hasha zapisanych bajtów, przed zmianą usług. Pin poprawiono na
+rzeczywisty SHA256 powyżej; ślad zachowuje `checkpoint-file-pin.json`.
