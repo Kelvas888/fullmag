@@ -17,6 +17,7 @@ import type { KernelEventMap } from "../events/eventTypes";
 import { KernelContext } from "../KernelContext";
 import { ModuleRegistry } from "../module/ModuleRegistry";
 import { DiagnosticRecorderController } from "../performance/diagnostic-recorder/DiagnosticRecorderController";
+import { RealtimeConnectionController } from "../realtime/RealtimeConnectionController";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { resetSharedResourceRuntimeStoreForTests } from "../resources/ResourceRuntimeStore";
 import type { KernelApi } from "../types";
@@ -279,6 +280,12 @@ function makeKernel(): KernelApi {
       },
       platform: {
         capabilities: async () => { throw new Error("capabilities are not served in this test"); },
+        health: async () => ({
+          status: "ok",
+          uptime_seconds: 0,
+          api_contract_version: "1.0.0",
+          active_session: false,
+        }),
         computeNodes: async () => ({
           nodes: [],
           schema_version: "compute_nodes.v1",
@@ -302,6 +309,7 @@ function makeKernel(): KernelApi {
     diagnosticRecorder: new DiagnosticRecorderController({ config: { enabled: false } }),
     layout: new LayoutController(bus),
     modules,
+    realtimeConnection: new RealtimeConnectionController(),
     resources: new ResourceInvalidationController(bus),
   } as unknown as KernelApi;
 }
