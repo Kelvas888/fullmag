@@ -16,6 +16,7 @@ SCHEMA = "fullmag.docker-iteration-reconciliation.v1"
 FAILED_BUILD_SCHEMA = "fullmag.docker-iteration-failed-build-reconciliation.v1"
 PRESTART_SCHEMA = "fullmag.docker-iteration-prestart-reconciliation.v1"
 ACTIVATION_PREFLIGHT_SCHEMA = "fullmag.docker-activation-preflight-reconciliation.v1"
+TOOLCHAIN_CANCELED_SCHEMA = "fullmag.docker-toolchain-canceled-reconciliation.v1"
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 
@@ -259,7 +260,9 @@ def commit_script(control, root, request, journal_relative, result_sha, current_
     original = request["unknown_receipt_sha256"]
     activation = (phase == "activation" and publish_verified is False
                   and request.get("schema") == ACTIVATION_PREFLIGHT_SCHEMA)
-    require(activation or (phase, publish_verified) in (("iteration", True), ("iteration", False), ("boris-reference", False)), "Closed reconciliation phase required")
+    toolchain = (phase == "toolchain" and publish_verified is False
+                 and request.get("schema") == TOOLCHAIN_CANCELED_SCHEMA)
+    require(activation or toolchain or (phase, publish_verified) in (("iteration", True), ("iteration", False), ("boris-reference", False)), "Closed reconciliation phase required")
     require(phase != "iteration" or publish_verified
             or request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA), "Failure-only publication requires its explicit schema")
     phase = control.path(phase)
@@ -282,6 +285,31 @@ def commit_script(control, root, request, journal_relative, result_sha, current_
             "t=$(mktemp \"$parent/.reconcile.XXXXXXXX\"); "
             f"cat '{prepared_marker}' > \"$t\"; sync \"$t\"; mv -T -- \"$t\" '{marker}'; sync \"$parent\"; "
         )
+    if toolchain:
+        # Failure-only CAS preserves the last verified image and permits exact partial replay.
+        marker_commit = "exec 8<>/control/operation.lock; if flock -n 8; then exit 72; fi; "
+        for relative, expected, allow_result in (
+            ("toolchain/current.json", request["phase_current_sha256"], True),
+            ("toolchain/verified.json", request["verified_sha256"], False),
+            (root + "/compose.json", request["compose_sha256"], False),
+            (root + "/build.log", request["build_log_sha256"], False),
+        ):
+            require(expected is None or SHA.fullmatch(expected), "Invalid toolchain document pin")
+            target = control.path(relative)
+            marker_commit += f"test ! -L '{target}'; "
+            check = (f"test -f '{target}'; test $(stat -c %h '{target}') = 1; "
+                     f"s=$(sha256sum '{target}' | cut -d' ' -f1); ")
+            if expected is None:
+                if allow_result:
+                    marker_commit += (f"if test -e '{target}'; then " + check
+                                      + f"test \"$s\" = '{result_sha}'; fi; ")
+                else:
+                    marker_commit += f"test ! -e '{target}'; "
+            else:
+                marker_commit += check + f"test \"$s\" = '{expected}'"
+                if allow_result:
+                    marker_commit += f" || test \"$s\" = '{result_sha}'"
+                marker_commit += "; "
     # Each write is atomic; a prepared journal admits only the original or exact prepared receipt.
     return ("umask 027; "
         f"test ! -L '{path}/reconcile-commit.lock'; "

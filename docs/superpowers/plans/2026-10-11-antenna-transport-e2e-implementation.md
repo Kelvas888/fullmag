@@ -2909,3 +2909,12 @@ Dowód: verification/universe-volume-policy-20261023/toolchain-timeout-proposal/
 SHA256 105de72a5b75b268ff0ebf938d966f3a09bc0956cff111bf7e90f9188927dc89.
 Backend/frontend tej grupy są nieobecne po zakończonym odtworzeniu usług;
 nowy wynik, runtime poprawki schedulera oraz UI/WebGL pozostają NOT VERIFIED.
+
+
+## Wykonanie po zgodzie użytkownika — 23.10.2026
+
+Zastosowano przypięty patch 677d39ff47f7117880872fcaf1338d4183ffc3979820fd878eff7daa8243a907. Pierwszy natywny preview ujawnił brak podłączenia nowej recepty w just_storage_shell.sh: ogólna trasa eksportowała profil linux-host zamiast docker-all-gpu. Dodano wyłącznie zamkniętą trasę argv analogiczną do istniejącego recovery; polityka kontrolera i jego przypięte bajty pozostały bez zmian. Wrapper nie należy do szesnastu wejść obrazu. Trzy interpretowane regresje obejmują preview/apply i dziesięć odmów poleceń złożonych lub błędnych argumentów; PASS. bash -n, diff-check i niezależny review PASS.
+
+Natywny preview przez just zwrócił validated-only, a następna jawna publikacja failed-confirmed. Receipt, current i terminal mają SHA256 fc90d480d831f52f81c834ca0695c74346d3fd9cb99b62123f72f9a5bcaa5a2f. Oryginalny helper naturalnie zakończył pracę, active nie istnieje, poprzedni verified jest identyczny. Potwierdzono ponownie 70 plików wyników, pięć katalogów historycznych oraz projekt Universe bez zmian. Nie wysłano Solve Universe.
+
+Dowód w wolumenie kontrolnym: verification/universe-volume-policy-20261023/toolchain-timeout-proposal/v8/applied-native-reconciliation.json. Następny krok to zatwierdzona kontynuacja ukończonego odtworzenia usług e47a16d91bd840b78a694b670e2da206 przez docker-dev-recreate-volume. Build aplikacji, wynik Universe i UI/WebGL pozostają do sprawdzenia.

@@ -243,6 +243,19 @@ case "${recipe}" in
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_dev_recovery_build.py" "${recovery_args[@]}"
     ;;
+  *"scripts/docker_volume_toolchain_reconcile.py"*)
+    toolchain_reconcile_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_toolchain_reconcile.py\" --request '([a-zA-Z0-9_./-]+)' --request-sha256 '([0-9a-f]{64})' --source-root '([^']+)'( --preview)?[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${toolchain_reconcile_pattern} ]]; then
+      echo "[fullmag just] invalid toolchain reconciliation recipe" >&2
+      exit 2
+    fi
+    toolchain_reconcile_args=(--request "${BASH_REMATCH[1]}" --request-sha256 "${BASH_REMATCH[2]}"
+      --source-root "${BASH_REMATCH[3]}")
+    if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+      toolchain_reconcile_args+=(--preview)
+    fi
+    exec "${python_cmd}" -B "${script_dir}/docker_volume_toolchain_reconcile.py" "${toolchain_reconcile_args[@]}"
+    ;;
   *"scripts/docker_volume_reconcile.py"*)
     volume_reconcile_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_reconcile.py\" --request '([a-zA-Z0-9_./-]+)' --request-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --preview)?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${volume_reconcile_pattern} ]]; then
