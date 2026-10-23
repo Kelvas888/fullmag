@@ -1,6 +1,7 @@
 # Propozycja odzyskania po odrzuceniu OCI przed PID 1
 
-Status: **do przeglądu i osobnej zgody użytkownika; patch NIEZASTOSOWANY**.
+Status: **zatwierdzony przez użytkownika 23.10.2026; dokładny patch zastosowany**.
+Pełny kanoniczny preview zakończył się PASS; reconciliation i start są kolejnymi krokami.
 Nie zapisano journalu ani terminalnego receiptu, nie zwolniono lease i nie uruchomiono usług.
 
 ## Konkretny stan
@@ -110,9 +111,12 @@ Użyto istniejących kanonicznych, krótkotrwałych helperów diagnostycznych te
 Raport: control volume `verification/universe-volume-policy-20261023/oci-prestart-core-proof.json`.
 Zapisano wyłącznie raport techniczny. Active lease zachowany; 0 startów usług, 0 Solve.
 
-Formalne `--preview` całej proponowanej CLI: **NOT VERIFIED**, ponieważ guard pozostaje
-niezastosowany. To pierwszy krok po zgodzie. Rzeczywista kontrola rdzenia i testy offline
-nie są dowodem wykonania całego reconciliation ani późniejszego managed restartu.
+Formalne `--preview` całej CLI po zgodzie i zastosowaniu dokładnego patcha: **PASS**,
+exit code 0, wynik `validated-only` dla operacji `6db0e30ac9df4824bd366d4af20c9457`.
+Log w control volume: `verification/universe-volume-policy-20261023/formal-approved-prestart-preview.log`.
+16 interpretowanych regresji po zastosowaniu patcha: PASS. Reconciliation i późniejszy
+managed restart pozostają na tym checkpointcie niewykonane.
 
-Osobna zgoda jest wymagana przez AGENTS.md sekcję 8: zmiana dotyczy wersjonowanej,
-krytycznej bramki recovery. Wcześniejsza zgoda na profil obliczeń nie obejmuje tej zmiany.
+Osobna zgoda wymagana przez przekazane AGENTS.md, sekcję 8, została uzyskana
+23.10.2026: „Tak, zastosuj patch i wykonaj recovery”. Obejmuje przypięty patch
+oraz jedną zarządzaną próbę startu naszej grupy 3203.

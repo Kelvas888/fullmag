@@ -6260,20 +6260,35 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
     cache_adapter.validate_container(actual["backend"], cache)
     environment = document["services"]["backend"]["environment"]
     ledger_profile = _retained_ledger_profile(control, previous_root, document, image)
+    from docker_volume_prestart_recovery import continuation
+    prestart_checkpoint = continuation(control, args, previous, document, actual, state)
     with control.operation("resume", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                        **operator_probe_record}) as operation:
         operation["receipt"].update(operator_probe_record)
         operation["receipt"].update(state="resuming-observation", state_root=str(state),
             backend_volumes=previous["backend_volumes"], frontend_volume=previous["frontend_volume"])
+        if prestart_checkpoint:
+            fresh = {name: json.loads(docker_text("inspect", identifier))[0] for name, identifier in ids.items()}
+            _assert_private_restart_network(fresh, ids, control.project)
+            _retained_certificate(state, document)
+            prestart_checkpoint = continuation(control, args, previous, document, fresh, state)
+            operation["receipt"].update(
+                saved_authoring_restore_required=prestart_checkpoint[0]["archive"],
+                prestart_reconciliation=args.prestart_reconciliation,
+                prestart_reconciliation_sha256=args.prestart_reconciliation_sha256)
+            operation["daemon_pending"] = True
         if not actual["frontend"]["State"]["Running"]:
             _frontend(control, operation, selected, state, args.port, image)
             compose_capture(document, "start", "frontend", timeout=90)
         if restart_backend:
             operation["daemon_pending"] = True
             compose_capture(document, "start", "backend", timeout=90)
-            operation["daemon_pending"] = False
+            operation["daemon_pending"] = bool(prestart_checkpoint)
         git_common = Path(environment["FULLMAG_SOURCE_GIT_COMMON"]) if "FULLMAG_SOURCE_GIT_COMMON" in environment else Path(
             next(m["source"] for m in document["services"]["backend"]["volumes"] if m["target"] == "/opt/fullmag/source-git"))
         _finish(control, operation, document, ids["backend"], ids["frontend"], selected, state,
             certificate_path, certificate, cache, {"image_id": environment["FULLMAG_TOOLCHAIN_IMAGE_ID"]},
-            image, git_common, ledger_profile, args.port)
+            image, git_common, ledger_profile, args.port,
+            completion_gate=(lambda: _saved_authoring_complete(control, operation,
+                ids["backend"], prestart_checkpoint[0], state, prestart_checkpoint[1]))
+                if prestart_checkpoint else None)

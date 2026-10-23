@@ -2730,3 +2730,21 @@ odczytu PASS. `git apply --check` potwierdza składnię i oryginalny kontekst
 patcha; wymagane spacje pustych linii unified diff pozostają jego danymi.
 Pełne CLI preview i wykonanie recovery pozostają niewykonane do osobnej zgody
 na zmianę bramki wymaganej przez przekazane AGENTS.md, sekcję 8.
+
+
+### 23.10.2026 — zgoda na recovery i pełny preview PASS
+
+Użytkownik zatwierdził dokładny patch recovery
+`136c5d0ef949219e528bf6125e2976b9f468fd99bb5abf264a552fcc271c0b4b`
+i jedną zarządzaną próbę startu grupy 3203. Zastosowano wyłącznie cztery
+przejrzane pliki launchera; wszystkie hashe po zmianie odpowiadają propozycji.
+16 interpretowanych testów po zastosowaniu patcha: PASS.
+Pełna recepta `docker-dev-reconcile-activation ... 3203 true`: PASS,
+exit 0, `validated-only` dla operacji `6db0e30ac9df4824bd366d4af20c9457`.
+Request zachowuje SHA256 `daa2fc63db52b91099316ff6c2597ffb6a7c77e91596f038a52b2f1996931751`.
+Log i ślad zgody pozostają w control volume pod
+`verification/universe-volume-policy-20261023/`.
+Przed startem: D: 153,55 GiB wolnego, filesystem Docker 575540695040 B
+wolnego, MemAvailable WSL 13099796 KiB. Retencja: zachować cache, bieżący
+pakiet/rollback i wszystkie wyniki; niczego nie usuwano. Kolejny krok to
+potwierdzenie failure i dokładnie jeden managed start, bez automatycznego Solve.

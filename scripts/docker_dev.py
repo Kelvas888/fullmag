@@ -2491,6 +2491,8 @@ def _parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--source-root", type=Path, required=True)
     resume_parser.add_argument("--port", type=int, required=True)
     resume_parser.add_argument("--restart-backend", action="store_true", help="Start the retained stopped backend; never stop an active service")
+    resume_parser.add_argument("--prestart-reconciliation", help="Exact confirmed prestart iteration UUID")
+    resume_parser.add_argument("--prestart-reconciliation-sha256", help="SHA-256 of its terminal receipt")
     activate_parser = subparsers.add_parser(
         "activate-script",
         help="activate one Python script in the already-running retained backend",

@@ -76,8 +76,8 @@ docker-dev-browser-qa source_root="" port="" browser_image="" timeout="180" pull
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev_browser_qa.py" --repo-root "{{repo_root}}" {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if port == "" { "" } else { "--port " + quote(port) }}} --timeout {{quote(timeout)}} --pull-timeout {{quote(pull_timeout)}} {{if browser_image == "" { "" } else { "--browser-image " + quote(browser_image) }}}
 
 # Resume observation of one retained volume DEV start without restarting backend.
-docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend="false":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" resume-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if restart_backend == "true" { "--restart-backend" } else if restart_backend == "false" { "" } else { error("restart_backend must be true or false") }}}
+docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend="false" prestart_reconciliation="" prestart_reconciliation_sha256="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" resume-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if restart_backend == "true" { "--restart-backend" } else if restart_backend == "false" { "" } else { error("restart_backend must be true or false") }}}{{if prestart_reconciliation == "" { if prestart_reconciliation_sha256 == "" { "" } else { error("prestart recovery requires both pins") } } else if prestart_reconciliation_sha256 == "" { error("prestart recovery requires both pins") } else { " --prestart-reconciliation " + quote(prestart_reconciliation) + " --prestart-reconciliation-sha256 " + quote(prestart_reconciliation_sha256) }}}
 
 # Reconcile only the existing unknown iteration; no backend/frontend lifecycle.
 docker-dev-reconcile-iteration request request_sha256 source_root port="3197":
