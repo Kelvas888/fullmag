@@ -144,11 +144,15 @@ class RecreatedOperationCallerTests(unittest.TestCase):
         previous = {
             "attempt": self.old_attempt,
             "state_root": "/state/fullmag",
-            "inputs": {"source_root": "/src/fullmag", "gpu_access_requested": "auto"},
+            "inputs": {"source_root": "/src/fullmag", "gpu_access_requested": "auto",
+                       "device_access": "gpu", "gpu_preflight": "PASS"},
         }
         return {
             "previous": previous,
-            "document": {"services": {"backend": {"environment": {}}}},
+            "document": {"services": {"backend": {
+                "environment": {"FULLMAG_DOCKER_DEVICE_ACCESS": "gpu"},
+                "gpus": [{"count": "all"}],
+            }}},
             "operation_terminal": {
                 "attempt": self.recreate_attempt,
                 "post_build_generation": metadata,
@@ -222,6 +226,7 @@ class RecreatedOperationCallerTests(unittest.TestCase):
         # The actual caller must pass the immutable old metadata and the new
         # recreation proof; it must never call bind_recreate_operation here.
         start.assert_called_once()
+        self.assertEqual(start.call_args.kwargs["retained_device_access"], "gpu")
         self.assertEqual(start.call_args.kwargs["post_build_generation"], metadata)
         self.assertEqual(start.call_args.kwargs["recreation_resume_proof"], records["proof"])
         pending_validate.assert_called_once()
@@ -258,6 +263,7 @@ class RecreatedOperationCallerTests(unittest.TestCase):
         self.assertEqual(result, "started")
         bind.assert_called_once()
         start.assert_called_once()
+        self.assertEqual(start.call_args.kwargs["retained_device_access"], "gpu")
 
     def test_false_certificate_without_carry_receipt_stays_rejected(self):
         records, certificate = self._records(

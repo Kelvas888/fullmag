@@ -1596,9 +1596,11 @@ def recover(args: argparse.Namespace) -> None:
     the request/manifest are published before the exact old IDs are removed.
     """
 
-    from docker_dev import _compose_identity, _select_source, _resolve_gpu_access, _verify_docker_gpu_access
+    from docker_dev import _compose_identity, _select_source
     from docker_volume_dev import (
         _operator_probe_record_from_retained,
+        _probe_retained_device_access,
+        _retained_device_access,
         _validate_recovery_metadata,
         start,
     )
@@ -1712,7 +1714,10 @@ def recover(args: argparse.Namespace) -> None:
     policy = retained_operation.get("gpu_access_requested")
     if policy not in {"auto", "required", "disabled"}:
         _fail("retained development operation has no valid requested GPU access policy")
-    device_access = _verify_docker_gpu_access(_resolve_gpu_access(policy), policy, backend_image, control.project)
+    retained_access = _retained_device_access(terminal, compose)
+    if retained_access != old_access:
+        _fail("retained device-access receipt differs from the stopped backend")
+    device_access = _probe_retained_device_access(retained_access, backend_image, control.project)
     if device_access != old_access:
         _fail("current Docker GPU availability does not match the retained device-access proof")
     operation_inputs = {
@@ -1963,6 +1968,7 @@ def recover(args: argparse.Namespace) -> None:
             control=control,
             operation=operation,
             prepared=prepared,
+            retained_device_access=retained_access,
             recovery_environment=recovery_environment,
             recovery_metadata=recovery_metadata,
         )

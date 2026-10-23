@@ -86,6 +86,31 @@ from unittest import mock
 import docker_dev_codegen as codegen
 
 
+class OfflineHostTests(unittest.TestCase):
+    def test_offline_linux_uses_the_host_adapter_before_inspecting_the_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory).resolve()
+            with mock.patch.object(checks.sys, 'platform', 'linux'), \
+                 mock.patch.object(checks.sys, 'argv', ['checks', '--source-root', str(source),
+                     '--offline', '--modules', 'test_docker_volume_receipts']), \
+                 mock.patch.object(checks, 'require_host') as host, \
+                 mock.patch.object(checks.storage, 'resolve_layout', side_effect=RuntimeError('selected group')):
+                with self.assertRaisesRegex(RuntimeError, 'selected group'):
+                    checks.main()
+            host.assert_called_once_with()
+
+    def test_unsupported_host_is_rejected_before_storage_or_docker(self):
+        with mock.patch.object(checks.sys, 'argv', ['checks', '--source-root', '/selected',
+                 '--offline', '--modules', 'test_docker_volume_receipts']), \
+             mock.patch.object(checks, 'require_host', side_effect=ValueError('unsupported host')), \
+             mock.patch.object(checks.storage, 'resolve_layout') as resolve, \
+             mock.patch.object(checks, 'docker_capture') as docker:
+            with self.assertRaisesRegex(ValueError, 'unsupported host'):
+                checks.main()
+        resolve.assert_not_called()
+        docker.assert_not_called()
+
+
 class FrontendImportCheckTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

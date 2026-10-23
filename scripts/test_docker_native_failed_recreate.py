@@ -442,9 +442,9 @@ class CompletedRecreationContinuationTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
         self.args=types.SimpleNamespace(port=3202,attempt='1'*32,config_sha256='',completed_recreation_attempt='2'*32,completed_recreation_sha256='',fresh_state=False,recovery_authorization=None)
         self.selected=Path('D:/selected checkout');self.state=self.root/'state';self.state.mkdir()
-        self.document={'name':'fixture','services':{'backend':{'environment':{'FULLMAG_STARTUP_ENABLED':'0'}},'frontend':{'environment':{'FULLMAG_FRONTEND_HOST_PORT':'3202'}}}}
+        self.document={'name':'fixture','services':{'backend':{'gpus':[{'count':'all'}],'environment':{'FULLMAG_STARTUP_ENABLED':'0','FULLMAG_DOCKER_DEVICE_ACCESS':'gpu'}},'frontend':{'environment':{'FULLMAG_FRONTEND_HOST_PORT':'3202'}}}}
         self.args.config_sha256=hashlib.sha256(dev.canonical(self.document)).hexdigest()
-        self.previous={'state':'succeeded','phase':'development','attempt':'1'*32,'compose_project':'fixture','config_sha256':self.args.config_sha256,'inputs':{'source_root':str(self.selected),'image_id':IMAGE_ID,'gpu_access_requested':'required'},'backend_container':BACKEND_ID,'frontend_container':'f'*64,'state_root':str(self.state),'backend_volumes':{'build':'build-volume','package':'package-volume','control':'control-volume'},'frontend_volume':'frontend-volume'}
+        self.previous={'state':'succeeded','phase':'development','attempt':'1'*32,'compose_project':'fixture','config_sha256':self.args.config_sha256,'inputs':{'source_root':str(self.selected),'image_id':IMAGE_ID,'gpu_access_requested':'required','device_access':'gpu','gpu_preflight':'PASS'},'backend_container':BACKEND_ID,'frontend_container':'f'*64,'state_root':str(self.state),'backend_volumes':{'build':'build-volume','package':'package-volume','control':'control-volume'},'frontend_volume':'frontend-volume'}
         self.completed={'schema':'fullmag.docker-build-operation.v1','phase':'recreate-services','state':'succeeded','attempt':'2'*32,'compose_project':'fixture','fresh_state':False,'inputs':{'attempt':'1'*32,'config_sha256':self.args.config_sha256},'removed_containers':[BACKEND_ID,'f'*64],'previous_state_root':str(self.state),'retained_volumes':self.previous['backend_volumes'],'retained_frontend_volume':'frontend-volume'}
         self.cert={'image_id':IMAGE_ID,'restart_verified':True};self.recovery={'previous_config_sha256':'c'*64,'native_restart_metadata':{'schema':'fullmag.docker-runtime-supervision-restart.v1','claim_pending':False,'terminal_failed_owner_sha256':'e'*64}}
         self.control=Mock();self.control.project='fixture';self.control.read.return_value=self.document;self.drift={};self.absence=types.SimpleNamespace(returncode=1,stdout=b'',stderr=b'Error: No such object: fixture')
@@ -594,7 +594,7 @@ class CompletedRemovalNativeProofTests(unittest.TestCase):
         for role,identifier in [('backend',BACKEND_ID),('frontend','f'*64)]:
             labels={'com.docker.compose.project':'fixture','com.docker.compose.service':role,
                 'org.fullmag.source.worktree-id':'worktree'}
-            environment={'FULLMAG_STARTUP_ENABLED':'0'} if role=='backend' else {'FULLMAG_FRONTEND_HOST_PORT':'3202'}
+            environment={'FULLMAG_STARTUP_ENABLED':'0','FULLMAG_DOCKER_DEVICE_ACCESS':'gpu'} if role=='backend' else {'FULLMAG_FRONTEND_HOST_PORT':'3202'}
             volumes=[{'type':'bind','source':str(self.selected),'target':'/opt/fullmag/source','read_only':True}]
             technical=[('/build','build'),('/opt/fullmag/package','package'),('/opt/fullmag/control','control')] if role=='backend' else [('/state/development','frontend'),('/opt/fullmag/control','control')]
             for target,name in technical:
@@ -610,6 +610,7 @@ class CompletedRemovalNativeProofTests(unittest.TestCase):
                 'State':{'Running':False,'StartedAt':'2026-10-19T10:00:00.000000000Z',
                     'FinishedAt':'2026-10-19T10:00:10.000000000Z','ExitCode':1 if role=='backend' else 0}}
         self.control.read.return_value=self.document
+        self.document['services']['backend']['gpus']=[{'count':'all'}]
         self.document['services']['frontend']['ports']=[{'host_ip':'127.0.0.1','mode':'ingress','protocol':'tcp','target':8080,'published':'3202'}]
         self.args.config_sha256=hashlib.sha256(dev.canonical(self.document)).hexdigest()
         self.args.gpu_access='required';self.args.include_untracked=[]

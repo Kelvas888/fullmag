@@ -2404,3 +2404,56 @@ evidence-only. Publiczna regresja import→archive→open, negatywne mutations i
 sprawdzenie nonmagnetic są przygotowane dla CI, lokalnie bez Rust unit compilation.
 Produkcja tych11plików była w obu udanych pakietach dirty snapshot; source+codegen
 są teraz gotowe do spójnego commita, ale rzeczywisty cold-open HTTP nadal NOT VERIFIED.
+
+
+### Checkpoint 23.10.2026 — zakończenie a080 i odmowa profilu GPU/CPU
+
+Zgoda użytkownika „tak” dotyczyła dokładnie requestu
+`c262826942f8296b465952d93adf47a15570957509f6b7de03321460aba29f3e`.
+Native verify-only i apply zakończyły się exit0. Run a080 został Failed,
+retry decision DoNotRetry; wyłącznie jego lease CPU i odpowiadająca rezerwacja
+hosta zostały Released. Slot przeniesiono atomowo z zachowaniem inode.
+158 z160 wcześniej istniejących plików pozostało identycznych; dwa zmienione
+pliki to wskazany run_catalog oraz jego lease. Pozostałe siedem rezerwacji,
+oba częściowe Zarr i wcześniejsza historia pozostały zachowane. Solve nie
+powtórzono. Dowód: `verification/reaped-worker-a080-native-preflight-e4dce5d15-2253d2a4/approved-apply-20261023/post-apply-proof.json`,
+SHA256 `4927bcf628350713c747cd64e0d9139a5e5ba588d18cf35f8b7c7d1f2cd3e297`.
+
+Pakiet z commita `1b8b7db8e69c5b6f894fd115b7578fcce01cd660` zbudowano
+w stałym backendzie859f2. Make exit0, 1307240ms; walidacja24 plików PASS.
+Receipt `aefc906539be8995e39bde8ba468c0b942596d66b6963bd0d379e529bc633228`,
+snapshot `cc35c497687d6ad9e6b8fadb2c860a598aca235a07a97167d1905cdf59dabdb4`.
+Operator omyłkowo podał szersze architektury CUDA zamiast wcześniejszego
+86-real, powodując pełną przebudowę natywnego kodu. Nie był to brak cache.
+Gotowy pakiet zachowano; nie należy ponawiać ciężkiego buildu tylko w celu
+poprawienia tej deklaracji. Właściwy automatyczny dobór należy przywrócić
+przy kolejnym uzasadnionym cyklu konfiguracji.
+
+Próba8454 zakończyła się przed API, exit1 bez OOM: nowy Compose miał
+requestedauto/resolvedcpu, podczas gdy poprzednia próba271 i istniejąca
+polityka grupy miały GPU. To nie jest migracja formatu ledgera: runtime
+wybiera v2 dla GPU, v3 dla CPU-only. Wymagany hostowy i kontenerowy probe GPU
+przeszedł. Rejestru nie zmieniono. Poprawka zachowuje zweryfikowany resolved
+profil podczas recreate/resume/recovery i wymaga świeżego probe przed stop/rm.
+Osobny witness nieudanego następcy musi potwierdzić brak API/native admission
+przed ponownym użyciem niezmienionego oryginalnego kontekstu afterReady.
+Odtworzenie API i ponowny publiczny Solve pozostają NOT VERIFIED.
+
+CI dla1b8: wszystkie22 wykonane kontrole PASS,10 opcjonalnych SKIPPED;
+wszystkie9 nowych regresji Rust rzeczywiście wykonano. Dowody w
+`verification/retained-rt0-exact-sampling-20261023/ci-final-1b8-all-success.json`.
+Zielone CI nie kwalifikuje V/J/H. E1–E12 nadal otwarte; zaakceptowanego
+wyniku i parytetu BORIS nadal brak. Cache, pakiety rollback, control i dane
+użytkownika zachowano; niczego nie usuwano w ramach tej diagnozy.
+
+
+Weryfikacja poprawki profilu i nowego witness:232 testy interpretowane PASS
+w kanonicznym helperze offline tej grupy, źródła stabilne podczas wykonania.
+Dowód `verification/gpu-profile-recovery-20261023/final-regressions.json`.
+Niezależny przegląd nie wykazał dalszych usterek. Regresja podwójnego tracebacku
+najpierw odmówiła zaliczenia, następnie wymaganie dokładnie jednego tracebacku
+zamknęło tę lukę. Rzeczywisty read-only constructor preview również PASS:
+witness `1657520264ae324b0fb962f99703ad3774468d0cbc38fd551d5d57c859b149b3`,
+zero aktywnych rezerwacji. To dowody kontroli i przygotowania, nie przywrócenia
+API ani wyniku naukowego. Po usunięciu aktualnego namespace automatyczne resume
+tej nowej ścieżki pozostaje celowo niedopuszczone bez dodatkowych dowodów.

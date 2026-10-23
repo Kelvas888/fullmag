@@ -52,8 +52,9 @@ class VolumeReceiptTests(IsolatedReceiptTests):
                         "name": project_name,
                         "services": {
                             "backend": {
+                                "gpus": [] if retained_policy == "disabled" else [{"count": "all"}],
                                 "environment": {
-                                    "FULLMAG_DOCKER_DEVICE_ACCESS": retained_policy,
+                                    "FULLMAG_DOCKER_DEVICE_ACCESS": "cpu" if retained_policy == "disabled" else "gpu",
                                     "FULLMAG_DEV_INCLUDE_UNTRACKED": "[]",
                                     "FULLMAG_RUNTIME_IMAGE_ID": "sha256:" + "b" * 64,
                                     "FULLMAG_TOOLCHAIN_IMAGE_ID": "sha256:" + "c" * 64,
@@ -69,6 +70,8 @@ class VolumeReceiptTests(IsolatedReceiptTests):
                                            attempt="a" * 32, config_sha256=digest)
                     previous = {"state": "failed-confirmed", "compose_project": project_name,
                                 "inputs": {"source_root": str(source), "gpu_access_requested": policy,
+                                           "device_access": "cpu" if retained_policy == "disabled" else "gpu",
+                                           "gpu_preflight": "NOT_REQUIRED" if retained_policy == "disabled" else "PASS",
                                            "image_id": "sha256:" + "b" * 64}}
                     control = mock.Mock(project=project_name)
                     control.read.side_effect = [previous, document]

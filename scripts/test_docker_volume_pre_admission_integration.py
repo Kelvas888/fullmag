@@ -141,7 +141,9 @@ class _Harness:
             "services": {
                 "backend": {
                     "image": IMAGE,
+                    "gpus": [{"count": "all"}],
                     "environment": {
+                        "FULLMAG_DOCKER_DEVICE_ACCESS": "gpu",
                         "FULLMAG_DEV_INCLUDE_UNTRACKED": "[]",
                         "FULLMAG_STARTUP_ENABLED": "0",
                     },
@@ -185,6 +187,7 @@ class _Harness:
                 "source_checkout_kind": "worktree",
                 "gpu_access_requested": "auto",
                 "device_access": "gpu",
+                "gpu_preflight": "PASS",
             },
         }
         self.actual = {
@@ -294,7 +297,7 @@ def _helper_module(harness: _Harness, *, proof_drift: bool = False, reject: bool
 
 
 class RetainedPreAdmissionIntegrationTests(unittest.TestCase):
-    def _run(self, harness: _Harness, *, helper: types.ModuleType, accepted_module: types.ModuleType | None = None, recovery_context=None):
+    def _run(self, harness: _Harness, *, helper: types.ModuleType, accepted_module: types.ModuleType | None = None, recovery_context=None, device_probe=None):
         import docker_build_control
         import docker_dev
         import docker_volume_activation_reconcile
@@ -316,7 +319,9 @@ class RetainedPreAdmissionIntegrationTests(unittest.TestCase):
             mock.patch.object(dev, "docker_text", side_effect=harness.docker_text),
             mock.patch.object(dev, "docker_capture", side_effect=harness.docker_capture),
             mock.patch.object(dev, "_validate_retained_service"),
-            mock.patch.object(dev, "_retained_recovery_context", return_value=recovery_context or {}),
+            mock.patch.object(dev, "_retained_recovery_context",
+                              **({"side_effect": recovery_context} if callable(recovery_context)
+                                 else {"return_value": recovery_context or {}})),
             mock.patch.object(dev, "_retained_certificate", return_value=harness.certificate),
             mock.patch.object(dev, "_certificate_path", return_value=harness.state / "certificate.json"),
             mock.patch.object(dev.storage, "validate_path", side_effect=lambda value, *_args: Path(value)),
@@ -336,6 +341,8 @@ class RetainedPreAdmissionIntegrationTests(unittest.TestCase):
                 mock.patch.object(dev, "_validate_accepted_reattach_environment", side_effect=lambda value: value),
                 mock.patch.object(dev, "_validate_accepted_reattach_metadata", side_effect=lambda value, _environment: value),
             ])
+        patches.append(mock.patch.object(dev, "_probe_retained_device_access",
+                                         **({"side_effect": device_probe} if device_probe is not None else {"return_value": "gpu"})))
         patches.append(mock.patch.dict(sys.modules, {"docker_volume_pre_admission_recreate": helper}))
         with ExitStack() as stack:
             for patch in patches:

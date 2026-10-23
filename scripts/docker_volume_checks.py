@@ -9,7 +9,7 @@ import sys
 
 import fullmag_storage as storage
 from docker_build_control import (
-    BuildControl, BuildControlError, ControlOutcomeUnknown, bounded_capture, canonical, docker_capture, mirror_console,
+    BuildControl, BuildControlError, ControlOutcomeUnknown, bounded_capture, canonical, docker_capture, mirror_console, require_host,
 )
 from docker_compose_identity import compose_project_identity, validate_source_labels
 
@@ -18,7 +18,7 @@ BASE_IMPLEMENTATIONS = ('docker_build_control', 'docker_volume_dev', 'docker_vol
                         'docker_volume_stop_failed', 'docker_volume_checks')
 OPTIONAL_IMPLEMENTATIONS = ('docker_volume_activation_reconcile', 'docker_volume_accepted_reattach',
                             'docker_volume_pre_admission_recreate', 'docker_volume_pre_admission_selector',
-                            'docker_volume_pending_continuation')
+                            'docker_volume_pending_continuation', 'docker_volume_native_init_successor')
 
 
 def _validate_offline_result(value, modules, *, implementations=BASE_IMPLEMENTATIONS):
@@ -328,8 +328,7 @@ def main():
     if args.offline:
         if args.scope != 'all':
             raise BuildControlError('Offline module checks cannot combine with a service-specific scope')
-        if sys.platform != 'win32':
-            raise BuildControlError('Offline Docker checks require native Windows Python')
+        require_host()
         if not args.modules or len(args.modules) > 32 or any(re.fullmatch(r'test_[A-Za-z0-9_]+', module) is None for module in args.modules):
             raise BuildControlError('Offline checks require 1-32 explicit test modules')
     elif args.modules:
@@ -361,7 +360,7 @@ pathlib.Path('/build/verification-tmp').mkdir(exist_ok=True)
 environment = {key:value for key,value in os.environ.items() if not key.startswith('FULLMAG_')}
 environment.update(TMPDIR='/build/verification-tmp', PYTHONDONTWRITEBYTECODE='1', HOME='/build/verification-tmp/home', USER='fullmag-checks', LOGNAME='fullmag-checks')
 pathlib.Path(environment['HOME']).mkdir(exist_ok=True)
-command=[sys.executable,'-B','-m','unittest','test_docker_dev_defaults','test_docker_dev_up','test_docker_dev_owned_control','test_docker_dev_codegen','test_docker_volume_activate','test_docker_volume_reconcile','test_docker_activation_preflight','test_antenna_rt0_surface_oracle','test_docker_volume_container_recovery','test_docker_volume_stop_unadmitted','test_docker_volume_dev_runtime_state','test_docker_runtime_control_volume','test_docker_container_runtime_recovery','test_runtime_service_recovery_busy_retry','test_docker_backend_volume_cache','test_bootstrap_docker_toolchain','test_docker_toolchain_host_inputs','test_docker_compose_identity','test_docker_host_ledger','test_docker_group_ledger','test_docker_volume_receipts','test_docker_dev_host','test_docker_volume_wsl','test_docker_wsl_bind','test_linux_native_host','test_linux_native_probe','test_docker_python_no_test_build','test_mfem_cuda_fast_compile','test_docker_frontend_dev','test_docker_dev_browser_qa','test_docker_development_inputs_linux','test_docker_backend_dev','test_docker_dev_fast_loop','test_docker_backend_live_source','test_docker_candidate_retirement','test_docker_startup_script','test_backend_volume_cache_maintenance','test_docker_cpu_access','test_docker_dev_storage','test_docker_dev_image_context','test_docker_dev_recreate','test_docker_volume_pre_admission_recreate','test_docker_volume_pre_admission_selector','test_docker_volume_pre_admission_integration','test_docker_volume_post_build_generation','test_docker_volume_post_build_integration','test_docker_volume_pending_continuation','test_docker_volume_pending_resume','test_docker_prestart_resume','test_docker_frontend_cache','test_docker_frontend_cache_named_volume','test_fullmag_docker_runtime','test_docker_orphan_recovery','test_recover_docker_orphan','test_just_orphan_recovery_shell','test_docker_volume_checks']
+command=[sys.executable,'-B','-m','unittest','test_docker_dev_defaults','test_docker_dev_up','test_docker_dev_owned_control','test_docker_dev_codegen','test_docker_volume_activate','test_docker_volume_reconcile','test_docker_activation_preflight','test_antenna_rt0_surface_oracle','test_docker_volume_container_recovery','test_docker_volume_stop_unadmitted','test_docker_volume_dev_runtime_state','test_docker_runtime_control_volume','test_docker_container_runtime_recovery','test_runtime_service_recovery_busy_retry','test_docker_backend_volume_cache','test_bootstrap_docker_toolchain','test_docker_toolchain_host_inputs','test_docker_compose_identity','test_docker_host_ledger','test_docker_group_ledger','test_docker_volume_receipts','test_docker_volume_device_access','test_docker_volume_retained_device_lifecycle','test_docker_volume_native_init_successor','test_docker_dev_host','test_docker_volume_wsl','test_docker_wsl_bind','test_linux_native_host','test_linux_native_probe','test_docker_python_no_test_build','test_mfem_cuda_fast_compile','test_docker_frontend_dev','test_docker_dev_browser_qa','test_docker_development_inputs_linux','test_docker_backend_dev','test_docker_dev_fast_loop','test_docker_backend_live_source','test_docker_candidate_retirement','test_docker_startup_script','test_backend_volume_cache_maintenance','test_docker_cpu_access','test_docker_dev_storage','test_docker_dev_image_context','test_docker_dev_recreate','test_docker_volume_pre_admission_recreate','test_docker_volume_pre_admission_selector','test_docker_volume_pre_admission_integration','test_docker_volume_post_build_generation','test_docker_volume_post_build_integration','test_docker_volume_pending_continuation','test_docker_volume_pending_resume','test_docker_prestart_resume','test_docker_frontend_cache','test_docker_frontend_cache_named_volume','test_fullmag_docker_runtime','test_docker_orphan_recovery','test_recover_docker_orphan','test_just_orphan_recovery_shell','test_docker_volume_checks']
 if sys.argv[1] == 'frontend-tools':
     command = [sys.executable, '-B', '-m', 'unittest', 'test_docker_dev_codegen', 'test_docker_volume_checks', 'test_docker_volume_frontend_recovery', 'test_docker_volume_dev_runtime_state', 'test_docker_volume_receipts', 'test_docker_dev_browser_qa']
 if sys.argv[1] == 'field-only':

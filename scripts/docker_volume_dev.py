@@ -1458,17 +1458,52 @@ def _precreate_new_windows_runtime_state(state):
     return tuple(relative.as_posix() for relative in _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES)
 
 
+def _retained_device_access(previous, document):
+    """Bind resolved CPU/GPU access to the retained receipt and Compose render."""
+    inputs = previous.get("inputs")
+    services = document.get("services")
+    backend = services.get("backend") if isinstance(services, Mapping) else None
+    environment = backend.get("environment") if isinstance(backend, Mapping) else None
+    if not isinstance(inputs, Mapping) or not isinstance(environment, Mapping):
+        raise BuildControlError("Retained device access has no receipt/Compose binding")
+    policy = inputs.get("gpu_access_requested")
+    access = inputs.get("device_access")
+    if (policy not in ("auto", "required", "disabled") or access not in ("cpu", "gpu")
+            or (policy == "required" and access != "gpu")
+            or (policy == "disabled" and access != "cpu")
+            or environment.get("FULLMAG_DOCKER_DEVICE_ACCESS") != access
+            or inputs.get("gpu_preflight") != ("PASS" if access == "gpu" else "NOT_REQUIRED")
+            or bool(backend.get("gpus")) != (access == "gpu")):
+        raise BuildControlError("Retained resolved device access differs from its receipt/Compose proof")
+    return access
+
+
+def _probe_retained_device_access(device_access, image, project):
+    """A retained profile cannot gain or lose GPU access during recreation."""
+    from docker_dev import _resolve_gpu_access, _verify_docker_gpu_access
+    if device_access not in ("cpu", "gpu"):
+        raise BuildControlError("Retained device access must be cpu or gpu")
+    if device_access == "cpu":
+        return "cpu"
+    resolved = _verify_docker_gpu_access(_resolve_gpu_access("required"), "required", image, project)
+    if resolved != device_access:
+        raise BuildControlError("Current Docker GPU access differs from the retained device profile")
+    return resolved
+
+
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
           recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
           native_restart_metadata=None, accepted_reattach_environment=None,
           accepted_reattach_metadata=None, recreation_resume_proof=None,
-          post_build_generation=None):
+          post_build_generation=None, retained_device_access=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
     import fullmag_docker_runtime as runtime
     provided_control = control
     provided_operation = operation
+    if retained_device_access is not None and retained_device_access not in ("cpu", "gpu"):
+        raise BuildControlError("Retained device access must be cpu or gpu")
     if (provided_control is None) != (provided_operation is None):
         raise BuildControlError("Recovery start requires both control and operation")
     if recreation_resume_proof is not None and (reuse_state is None or provided_operation is not None):
@@ -1547,7 +1582,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         )
     from docker_dev import _resolve_gpu_access, _verify_docker_gpu_access
     policy = getattr(args, "gpu_access", None) or "auto"
-    device_access = _resolve_gpu_access(policy)
+    if retained_device_access is not None and (
+            policy not in ("auto", "required", "disabled")
+            or (policy == "required" and retained_device_access != "gpu")
+            or (policy == "disabled" and retained_device_access != "cpu")):
+        raise BuildControlError("Retained device access differs from the requested GPU policy")
+    device_access = _resolve_gpu_access(policy) if retained_device_access is None else retained_device_access
     if provided_operation is None:
         toolchain = build_volume_toolchain(selected)
         control = BuildControl(identity, toolchain["inputs"]["build_args"]["FULLMAG_CUDA_BASE_IMAGE"])
@@ -1556,7 +1596,10 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         control = provided_control
         toolchain, images = _validate_prepared_start_context(prepared)
     image = images["backend"]["image_id"]
-    device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
+    if retained_device_access is None:
+        device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
+    else:
+        device_access = _probe_retained_device_access(retained_device_access, image, control.project)
     _assert_no_running_fullmag(control.project, identity, **admission_context)
     if recreation_resume_proof is not None:
         if args.script is not None or getattr(args, "fresh_state", False):
@@ -1618,7 +1661,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             current = _completed_recreation_start_context(control, args, selected, layout)
             if (current.pop("reuse_state") != reuse_state
                     or current != {"previous_config_sha256": previous_config_sha256,
-                                   "native_restart_metadata": validated_native_restart_metadata}):
+                                   "native_restart_metadata": validated_native_restart_metadata,
+                                   "retained_device_access": retained_device_access}):
                 raise BuildControlError("Completed recreation handoff changed before start")
         operation["receipt"].update(operator_probe_record)
         if validated_recovery_metadata is not None:
@@ -4052,6 +4096,13 @@ def _retained_recovery_context(
         )
         if native is not None:
             return native
+        from docker_volume_native_init_successor import retained_context as retained_successor_context
+        successor = retained_successor_context(
+            control, previous, document, backend_id or previous.get("backend_container"),
+            fresh_state=fresh_state, removed_container_proof=removed_container_proof,
+        )
+        if successor is not None:
+            return successor
         from docker_volume_pre_api_stop import retained_context as retained_pre_api_context
         pre_api = retained_pre_api_context(
             control, previous, document, backend_id or previous.get("backend_container"),
@@ -4883,6 +4934,7 @@ def _resume_recreated_operation(args, control, selected, layout, identity):
         args,
         reuse_state=reuse,
         recreation_resume_proof=proof,
+        retained_device_access=_retained_device_access(previous, document),
         **recovery_context,
     )
 
@@ -5249,7 +5301,8 @@ def _completed_recreation_start_context(control, args, selected, layout):
         "owner_marker": owner_marker, "receipt": {"image_id": image},
         "operator_probe_environment_record": operator_probe_record,
         "removed_recreation_proof_sha256": hashlib.sha256(canonical(removed_proof)).hexdigest()}
-    return {"reuse_state": reuse, **recovery}
+    return {"reuse_state": reuse,
+            "retained_device_access": _retained_device_access(previous, document), **recovery}
 
 
 def _resume_oom_frontend(control, args, document, actual, ids, selected):
@@ -5394,6 +5447,7 @@ def _retained_operation(
         if policy not in {"auto", "required", "disabled"}:
             raise BuildControlError("Recreation requires the retained GPU access intent")
         args.gpu_access = policy
+        retained_device_access = _retained_device_access(previous, document)
     completed_attempt = getattr(args, "completed_recreation_attempt", None)
     completed_sha = getattr(args, "completed_recreation_sha256", None)
     if completed_attempt or completed_sha:
@@ -5629,6 +5683,12 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             control, previous, document, fresh_state=fresh_state,
             backend_id=actual["backend"].get("Id"),
         )
+        from docker_volume_native_init_successor import NativeInitSuccessorContext
+        native_init_successor = isinstance(recovery_context, NativeInitSuccessorContext)
+        if native_init_successor:
+            if args.script is not None or pre_activation_stop is not None:
+                raise BuildControlError("Native init successor cannot activate a new script")
+            retained_device_access = recovery_context.target_device_access
         # Reconcile only the exact activation helper that still owns the
         # control lease.  The native failed-stop proof above authenticates the
         # stopped backend; the reconciler preserves the unknown activation
@@ -5691,7 +5751,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             and native_restart.get("claim_pending") is False
         )
         if (not fresh_state and pre_activation_stop is None and not pre_api_stopped
-                and not original_after_ready_stop
+                and not original_after_ready_stop and not native_init_successor
                 and certificate.get("restart_verified") is True):
             retained_environment = document["services"]["backend"]["environment"]
             retained_reattach_declared = (
@@ -5743,7 +5803,8 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         # This checkpoint already carries authenticated native recovery
         # authority. It must not enter the mutually exclusive no-native
         # pre-admission path merely because the old storage probe was limited.
-        if not fresh_state and not pre_api_stopped and not certificate.get("restart_verified"):
+        if (not fresh_state and not pre_api_stopped and not native_init_successor
+                and not certificate.get("restart_verified")):
             retained_environment = document["services"]["backend"]["environment"]
             observed_environment = actual["backend"].get("Config", {}).get("Env") or []
             retained_reattach_declared = (
@@ -5843,11 +5904,17 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 helper_ids.append(helper_document["Id"])
         with control.operation("recreate-services", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                                       **operator_probe_record}) as operation:
-            if native_recovery_context != _retained_recovery_context(
+            leased_recovery_context = _retained_recovery_context(
                 control, previous, document, fresh_state=fresh_state,
                 backend_id=actual["backend"].get("Id"),
-            ):
+            )
+            if native_recovery_context != leased_recovery_context:
                 raise BuildControlError("Retained container recovery capability changed before recreation")
+            if native_init_successor:
+                if (not isinstance(leased_recovery_context, NativeInitSuccessorContext)
+                        or leased_recovery_context.witness != recovery_context.witness):
+                    raise BuildControlError("Native init successor witness changed under recreate lease")
+                operation["receipt"]["native_init_successor"] = recovery_context.witness
             operation["receipt"].update(operator_probe_record)
             if reconciliation is not None:
                 operation["receipt"]["activation_reconciliation"] = {
@@ -5864,7 +5931,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 ]
             if post_build_generation is not None:
                 operation["receipt"]["post_build_generation"] = post_build_generation
-            if post_build_generation is not None:
+            if post_build_generation is not None or native_init_successor:
                 # The retained snapshot was observed before this lease. Pin
                 # both application services again under the recreate lease;
                 # the post-build proof must never authorize stop/rm from a
@@ -5889,13 +5956,25 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                             "Post-build continuation service incarnation changed under lease: "
                             + service
                         )
+                    retained_image_config = image_config
+                    if native_init_successor:
+                        service_images = json.loads(docker_text("image", "inspect", observed["Image"]))
+                        if len(service_images) != 1 or service_images[0].get("Id") != observed["Image"]:
+                            raise BuildControlError("Native init successor service image changed")
+                        retained_image_config = service_images[0]["Config"]
                     _validate_retained_service(
                         document,
                         observed,
                         service,
-                        image_config,
+                        retained_image_config,
                         allow_legacy_frontend=True,
                     )
+                    if native_init_successor and any(
+                        observed.get("State", {}).get(key) != before.get("State", {}).get(key)
+                        for key in ("Running", "Status", "Pid", "StartedAt", "FinishedAt",
+                                    "ExitCode", "OOMKilled")
+                    ):
+                        raise BuildControlError("Native init successor service changed under lease")
                     leased_actual[service] = observed
                 _retained_certificate(state, document)
                 actual = leased_actual
@@ -6050,6 +6129,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 if leased_post_build != post_build_generation:
                     raise BuildControlError("Post-build continuation differs under recreate lease")
                 actual["backend"] = leased_backend
+            _probe_retained_device_access(retained_device_access, image, control.project)
             control.write(operation["root"] + "/retained-containers.json", actual)
             if pre_activation_stop is not None:
                 operation["receipt"]["pre_activation_stop_receipt"] = pre_activation_stop
@@ -6114,7 +6194,8 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             "owner_marker": owner_path, "receipt": {"image_id": image},
             "operator_probe_environment_record": operator_probe_record}
         recovery_context.update(accepted_reattach_context)
-        return start(args, reuse_state=reuse, **recovery_context)
+        return start(args, reuse_state=reuse, retained_device_access=retained_device_access,
+                     **recovery_context)
     restart_backend = bool(getattr(args, "restart_backend", False))
     if restart_backend:
         if actual["backend"]["State"]["Running"]:

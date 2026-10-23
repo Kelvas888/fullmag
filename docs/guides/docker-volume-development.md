@@ -513,6 +513,29 @@ ten odrębny wariant i domyka receipt również bez sygnału. Następnie zwykła
 źródeł do czasu potwierdzenia spójnego cienia; restart z Docker Desktop może
 zbiec się z edycją hosta i nie jest dowodem ukończonego buildu ani API.
 
+### Zachowanie profilu urządzeń przy odtwarzaniu
+
+Odtwarzanie zachowuje zarówno żądany tryb `auto/required/disabled`, jak i
+zweryfikowany wcześniej dostęp `gpu/cpu`. Dla zachowanego GPU launcher wymaga
+świeżego dowodu hostowego i kontenerowego przed zatrzymaniem lub usunięciem
+usług, a następnie przed nowym startem. Błąd probe lub nieznany wynik nie
+powoduje przejścia na CPU. Nowa grupa nadal może rozstrzygnąć `auto` do CPU.
+Nie zmienia to polityki istniejącego ledgera.
+
+`recreate-volume` rozpoznaje także wąski przypadek następcy, który po poprawnym
+buildzie zakończył się przed API na błędzie `stored host resource policy differs
+from explicit ledger configuration`, ponieważ `auto` zmieniło dostęp GPU na CPU.
+Osobny witness wiąże dokładny terminal, logi i namespace następcy z poprzednim
+ukończonym odtworzeniem, oryginalnym dowodem afterReady oraz niezmienionymi
+OWNER/config/process. Wszystkie zasoby muszą być Released; nowy skrypt startowy
+jest zabroniony. Witness i obie usługi są ponownie sprawdzane pod blokadą.
+Oryginalny kontekst restartu pozostaje identyczny, a nowy start wymaga GPU.
+
+Ta ścieżka nie resetuje ownera, nie migruje ledgera i nie powtarza Solve.
+Celowo nie udaje recovery po usunięciu namespace: przerwane odtworzenie
+wymaga osobnego przeglądu zachowanych dowodów. Zwykłe uruchomienie tej samej
+komendy nie zastępuje brakującego potwierdzenia.
+
 ## Granica zapisu i retencja
 
 | Dane | Miejsce |
