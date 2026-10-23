@@ -363,6 +363,15 @@ Wady runtime znalezione podczas E2E w grupie DEV i naprawione w F5:
 - `fm.m.average()`/`fm.field("m")` po runie accepted: tabela skalarów nie jest jeszcze projektowana, a trasa wektora pól odpowiada `quantity_registry_not_resolved_plan`; klient czyta `m` z najnowszej ramki obserwacji (`/data/observation-frames/{id}/magnetization`, FMVP v4), a średnie liczy z pola. `fm.E_total` daje wtedy NaN;
 - `fm.export_script()` renderuje bieżącą scenę przez `POST /model/syncs`.
 
+Stan ścieżek trybu live w grupie DEV (23.10.2026):
+
+| Ścieżka | Wynik | Uwagi |
+|---|---|---|
+| FDM CPU | działa | pełne E2E: model, `relax`, `m`, `transaction()`, `run` z kontynuacją, zdarzenia, eksport |
+| FDM GPU | `run` działa | worker GPU przechodzi po poprawce kontroli VRAM per urządzenie; `relax` (`llg_overdamped`) zatrzymuje bramka `strict` „final execution is not fully device-proven” (operator na hoście); po runie GPU brak ramek obserwacji, więc `m` nie jest odczytywalne |
+| FEM CPU | nie działa | komenda kolejkuje zadanie obliczeń bez potwierdzenia przygotowania FEM („no preparation receipt”); FEM w Dockerze wymaga Prepare → Compute (bramka startu), którego tryb live jeszcze nie prowadzi; demagnetyzacja FEM wymaga też `build_domain_mesh()` z airboxem |
+| FEM GPU | niesprawdzone | jak FEM CPU |
+
 Ograniczenia stwierdzone w grupie DEV (poza zakresem F5):
 
 - API nie ma operacji zamknięcia sesji (`PATCH /v2/sessions/current` zwraca 400), a launcher celowo nie restartuje backendu z aktywną sesją. Sesja założona przez `fm.connect()` blokuje więc `just docker-dev` po zmianie backendu; launcher mówi to teraz wprost. Docelowy model wielu sesji (karty sesji obok Home) to osobny temat;
@@ -383,7 +392,7 @@ przechodzi niejawnie na CPU.
 | F2 | dekoder FMVP, `to_numpy()`, tabele, cache ETag | zrobione: `test_live_client_data.py` i `fieldVectorCodec.fixtures.test.ts` dają identyczne wyniki na wspólnych próbkach |
 | F3 | tryb `live` w `world.py`: `fm.connect`/`FULLMAG_URL`, natychmiastowa synchronizacja, reguła tożsamości, `transaction()`, akcje, `paused()`, `export_script()` | zrobione: testy na stanowym fałszywym API (`test_live_dsl_mode.py`) oraz E2E w grupie DEV (FDM CPU, 23.10.2026): model → `relax` → `m.average()` i `field("m")` → `transaction()` → `run` → `export_script()`; `pause`/`skip` w Dockerze nadal 422 (Q3) |
 | F4 | subskrybent WebSocket, `fm.on()`, `fm.run_until()`, dodatek Jupyter | zrobione: `test_live_events.py` (prawdziwy serwer WebSocket w teście); w E2E w grupie DEV strumień dostarczył 29 zdarzeń; pomiar narzutu `run_until` w grupie DEV NOT VERIFIED |
-| F5 | zmiany backendu z §9 | zrobione dla FDM CPU: kontynuacja `m` potwierdzona w E2E (`initial_state_source.kind = continuation` z artefaktu `final_state` poprzedniego runu), kod `session_already_active`, obecność klientów (`GET /clients` pokazał klienta `e2e_live.py`); testy Rust kompilowane tylko w CI; FDM GPU, FEM CPU/GPU NOT VERIFIED |
+| F5 | zmiany backendu z §9 | zrobione dla FDM CPU (kontynuacja `m` potwierdzona w E2E: `initial_state_source.kind = continuation` z artefaktu `final_state`), FDM GPU tylko `run`; FEM nie działa w trybie live (tabela ścieżek w §9); kod `session_already_active`, obecność klientów potwierdzona; testy Rust kompilowane tylko w CI |
 | F6 | `fm.sweep()` na wielu grupach DEV | zaimplementowane (`test_live_sweep.py`: 2 serwery, kolejność wyników, błędy punktów, nieosiągalna grupa); przemiatanie na ≥ 2 prawdziwych grupach DEV NOT VERIFIED |
 | F7 | opcjonalnie tryb in-process (PyO3 + `InteractiveRuntime`) z tym samym protokołem | callback po każdym kroku bez serwera |
 | F8 | przykładowy skrypt i notatnik w `examples/`, strona w `public_docs`, ściągawka Boris → Fullmag | dokumentacja publikowana razem z F3 |
