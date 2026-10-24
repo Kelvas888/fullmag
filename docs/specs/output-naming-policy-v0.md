@@ -199,7 +199,10 @@ sibling `/path/x.zarr` Zarr v2 group. The bundle has the stable roles:
 The root `.zattrs` declares `fullmag.script_results.v1` and records script and
 session identity. A repeated ordinary launch reserves a fresh directory with
 an execution suffix (`existing_output=timestamp`) or fails explicitly
-(`existing_output=error`). Existing results are never removed or overwritten.
+(`existing_output=error`). Existing results are never removed or overwritten,
+except under the explicit `existing_output=overwrite` policy, which replaces
+only an inactive fullmag result at the requested path and refuses any other
+directory (see [the common project policy](project-output-storage.md)).
 An explicit `--output-dir` overrides the sibling convention with the same
 safe reservation policy. Output format, private temporary storage and cleanup
 follow [the common project policy](project-output-storage.md).

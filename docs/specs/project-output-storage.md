@@ -15,7 +15,7 @@ Eksport skryptu i ponowny import zachowują wszystkie pola.
 | `temp_dir` | Katalog nadrzędny prywatnych danych tymczasowych | `.fullmag-tmp` obok katalogu wyników |
 | `data_format` | Format tablic pól i tabel etapów | `zarr`; `h5` normalizowane do `hdf5` |
 | `cleanup` | Usuwanie prywatnego tmp po zakończonym wykonaniu | `on_success`; również `always`, `never` |
-| `existing_output` | Reakcja na zajęty katalog konkretnego wykonania | `timestamp`; również `error` |
+| `existing_output` | Reakcja na zajęty katalog konkretnego wykonania | `timestamp`; również `error`, `overwrite` |
 
 Ścieżki nie mogą być puste, zawierać NUL ani komponentu `..`. UI wymaga ścieżek absolutnych
 na hoście backendu. Runtime dodatkowo odmawia dowiązań i Windows junction/reparse points
@@ -60,6 +60,11 @@ study.storage(fm.OutputStorage(
 Zwykłe `fullmag skrypt.py` bez ustawień zapisuje pierwsze wykonanie do `skrypt.zarr`
 w katalogu skryptu. Ponowne wykonanie nie kasuje poprzednich danych: wybiera świeżą nazwę
 z identyfikatorem wykonania albo zatrzymuje się przy `existing_output="error"`.
+With `existing_output="overwrite"` (mumax3-like) the run reuses the requested result path:
+an existing directory there is removed and recreated only when it is an inactive fullmag
+result (fullmag `.zattrs` metadata or an `output-storage.json` receipt, no
+`.fullmag-active.lock` reservation anywhere in its tree, no links or reparse points);
+any other directory is refused with an error naming the path and is left untouched.
 Dla HDF5 bez jawnej ścieżki używa katalogu `skrypt.results`; faktyczne pliki etapów mają
 rozszerzenie `.h5`. Flagi `--output-dir`, `--temp-dir`, `--data-format`, `--temp-cleanup`
 i `--existing-output` mają pierwszeństwo przed polityką skryptu, a ta przed defaults.

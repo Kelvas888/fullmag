@@ -1,6 +1,8 @@
 //! Owned per-run output reservation and temporary-directory lifecycle.
-//! Results are never removed by this owner. Only a marked private scratch
-//! directory can be cleaned, after the caller has joined its run workers.
+//! Results are removed by this owner only under the explicit `overwrite`
+//! collision policy, and only when the existing directory is an inactive
+//! fullmag result. Only a marked private scratch directory can be cleaned,
+//! after the caller has joined its run workers.
 
 use fullmag_ir::{ExistingOutputIR, OutputDataFormatIR, OutputStorageIR, ProblemIR, TempCleanupIR};
 use serde::Serialize;
@@ -72,6 +74,7 @@ impl ProjectStorageLease {
         }
         let mut output_dir = desired.clone();
         let mut reserved = false;
+        let mut replaced = false;
         for attempt in 0..100 {
             match fs::create_dir(&output_dir) {
                 Ok(()) => {
@@ -79,11 +82,27 @@ impl ProjectStorageLease {
                     break;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if settings.existing_output == ExistingOutputIR::Error {
-                        return Err(format!(
-                            "result location already exists: {}",
-                            output_dir.display()
-                        ));
+                    match settings.existing_output {
+                        ExistingOutputIR::Error => {
+                            return Err(format!(
+                                "result location already exists: {}",
+                                output_dir.display()
+                            ));
+                        }
+                        ExistingOutputIR::Overwrite => {
+                            // Replace once; a directory that reappears after the
+                            // removal belongs to a concurrent writer.
+                            if replaced {
+                                return Err(format!(
+                                    "result location reappeared while overwriting: {}",
+                                    output_dir.display()
+                                ));
+                            }
+                            remove_inactive_result(&output_dir)?;
+                            replaced = true;
+                            continue;
+                        }
+                        ExistingOutputIR::Timestamp => {}
                     }
                     let name = desired_name.to_string_lossy();
                     let (stem, suffix) = name
@@ -338,6 +357,66 @@ fn reject_reparse_tree(path: &Path) -> Result<(), String> {
 
 fn message(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// Remove an existing result directory for the `overwrite` policy. Only an
+/// inactive fullmag result without links/reparse points is removed; any other
+/// directory is refused and left untouched.
+fn remove_inactive_result(path: &Path) -> Result<(), String> {
+    let refuse = |reason: &str| {
+        format!(
+            "refusing to overwrite a directory that is not an inactive fullmag result \
+             ({reason}): {}",
+            path.display()
+        )
+    };
+    ensure_no_reparse_ancestors(path).map_err(|error| refuse(error.as_str()))?;
+    if !fs::symlink_metadata(path).map_err(message)?.is_dir() {
+        return Err(refuse("not a directory"));
+    }
+    reject_reparse_tree(path).map_err(|error| refuse(error.as_str()))?;
+    if contains_active_reservation(path)? {
+        return Err(refuse("an active run reservation is present"));
+    }
+    if !is_fullmag_result_directory(path) {
+        return Err(refuse("no fullmag result metadata"));
+    }
+    fs::remove_dir_all(path).map_err(message)
+}
+
+/// Any reservation file in the tree marks a live (or crashed, unreconciled)
+/// writer; such data is never removed automatically.
+fn contains_active_reservation(path: &Path) -> Result<bool, String> {
+    for entry in fs::read_dir(path).map_err(message)? {
+        let entry = entry.map_err(message)?;
+        if entry.file_name() == ACTIVE_FILE {
+            return Ok(true);
+        }
+        if entry.file_type().map_err(message)?.is_dir()
+            && contains_active_reservation(&entry.path())?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_fullmag_result_directory(path: &Path) -> bool {
+    let read_json = |name: &str| -> Option<serde_json::Value> {
+        serde_json::from_slice(&fs::read(path.join(name)).ok()?).ok()
+    };
+    let zattrs_marked = read_json(".zattrs").is_some_and(|attributes| {
+        attributes.get("output_store_schema").is_some()
+            || attributes
+                .get("schema_version")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|schema| schema.starts_with("fullmag."))
+    });
+    let receipt_marked = read_json("output-storage.json").is_some_and(|receipt| {
+        receipt.get("schema").and_then(serde_json::Value::as_str)
+            == Some("fullmag.output_storage.resolved.v1")
+    });
+    zattrs_marked || receipt_marked
 }
 
 /// Add the primary field/table writer before planning. Runtime writer
@@ -679,4 +758,73 @@ pub(crate) fn open_verified_artifact(root: &Path, relative: &Path) -> Result<Fil
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn open_verified_artifact(_root: &Path, _relative: &Path) -> Result<File, String> {
     Err("verified artifact copy is unsupported on this platform".into())
+}
+
+#[cfg(test)]
+mod overwrite_tests {
+    use super::*;
+
+    fn settings(output_dir: &Path, temp_dir: &Path) -> OutputStorageIR {
+        OutputStorageIR {
+            output_dir: Some(output_dir.to_string_lossy().into_owned()),
+            temp_dir: Some(temp_dir.to_string_lossy().into_owned()),
+            data_format: OutputDataFormatIR::Zarr,
+            cleanup: TempCleanupIR::Always,
+            existing_output: ExistingOutputIR::Overwrite,
+        }
+    }
+
+    #[test]
+    fn overwrite_replaces_an_inactive_fullmag_result() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let output = root.path().join("results.zarr");
+        let temp = root.path().join("scratch");
+        let settings = settings(&output, &temp);
+        let mut first = ProjectStorageLease::prepare(&settings, &output, root.path(), "first")
+            .expect("first reservation");
+        fs::write(output.join("stale.bin"), b"old").expect("stale result data");
+        first.finish(true).expect("finish first run");
+        drop(first);
+
+        let mut second = ProjectStorageLease::prepare(&settings, &output, root.path(), "second")
+            .expect("overwrite inactive result");
+        assert_eq!(second.resolved().output_dir, fs::canonicalize(&output).unwrap());
+        assert!(!output.join("stale.bin").exists());
+        assert!(output.join(ACTIVE_FILE).exists());
+        second.finish(true).expect("finish second run");
+    }
+
+    #[test]
+    fn overwrite_refuses_a_foreign_directory() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let output = root.path().join("results.zarr");
+        let temp = root.path().join("scratch");
+        fs::create_dir(&output).expect("foreign directory");
+        fs::write(output.join("notes.txt"), b"user data").expect("foreign file");
+
+        let settings = settings(&output, &temp);
+        let error = ProjectStorageLease::prepare(&settings, &output, root.path(), "run")
+            .err()
+            .expect("foreign directory must be refused");
+        let canonical = fs::canonicalize(&output).expect("canonical output");
+        assert!(error.contains("refusing to overwrite"), "{error}");
+        assert!(error.contains(&canonical.display().to_string()), "{error}");
+        assert_eq!(fs::read(output.join("notes.txt")).unwrap(), b"user data");
+    }
+
+    #[test]
+    fn overwrite_refuses_a_result_with_an_active_reservation() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let output = root.path().join("results.zarr");
+        let temp = root.path().join("scratch");
+        let settings = settings(&output, &temp);
+        let _active = ProjectStorageLease::prepare(&settings, &output, root.path(), "active")
+            .expect("active reservation");
+
+        let error = ProjectStorageLease::prepare(&settings, &output, root.path(), "other")
+            .err()
+            .expect("active result must be refused");
+        assert!(error.contains("active run reservation"), "{error}");
+        assert!(output.join(ACTIVE_FILE).exists());
+    }
 }
