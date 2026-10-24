@@ -348,3 +348,89 @@ Nie publikujemy nowego operatora ani twierdzenia o zbieżności.
 Weryfikacja tego etapu: niezależny odczytowy audyt źródeł i CAS, kontrola
 istnienia ścieżek/symboli oraz git diff --check. Brak zmian terminalnej noty
 naukowej lub kodu, brak buildu, Rust unit tests i dowodu browser/WebGL.
+
+
+## E5: poprawka zgodności Universe — zbudowany kandydat, bez wdrożenia
+
+Status: źródła i zbudowany kandydat, bez promocji i weryfikacji cold-load HTTP. Oczekujący request recovery
+550a170177411ff23c2996ca5be7de19899e6e69f35d43462b90529059ec328d pozostaje
+niezmieniony; brak Apply, restartu oraz następnego Solve.
+
+Niezależna od dalszej kwadratury luka E5: Python eksportuje równocześnie
+maximum_element_size/minimum_element_size i airbox_hmax/hmin. Rust ignorował
+nowe nazwy. Zapisane size=null również znikało z projekcji. Ochrona przed
+utratą pól słusznie odmawiała odtworzenia takiej sceny z FMS.
+
+WIP obejmuje:
+- crates/fullmag-authoring/src/builder.rs::ScriptBuilderUniverseState i nowy
+  universe_state.rs::UniverseStateWire/TryFrom: jeden resolver wejścia dla
+  starych, nowych i zgodnych podwójnych nazw; sprzeczność odrzucana dokładnie,
+  bez tolerancji i bez wyboru nazwy na podstawie kolejności;
+- oba istniejące miejsca SceneDocument.universe i SceneStudyState.universe_mesh
+  korzystają z tego samego typu; nie dodano równoległego modelu anteny;
+- crates/fullmag-api/src/router_v2/handlers/persistence/projects.rs::
+  authoring_scene_wire_projection tworzy wyłącznie wartość do dowodu zgodności:
+  nowe aliasy bierze z typowanych wartości kanonicznych, znane null zachowuje
+  tylko w dwóch dokładnych owner paths Universe. Nie kopiuje nieznanych pól;
+  raw_scene_survives_projection i known_omitted_scene_default pozostają bez zmian.
+
+Review wykrył i wyeliminował ryzyko globalnego Serialize/into: checkpoint_compatibility
+w crates/fullmag-api/src/session_persistence.rs hashuje surową serializację sceny.
+Zmiana tego zapisu mogłaby odmówić ExactResume dla starego checkpointu mimo tej
+samej fizyki. Obecny WIP ma tylko try_from; dotychczasowy Serialize oraz jego
+pomijanie None są zachowane. Nie wprowadzamy migracji, zmiany hash guardów,
+przepisywania RunIntent/CAS ani reguły ignorowania brakujących danych.
+
+Przygotowane źródła regresji obejmują stare/nowe/podwójne nazwy, dokładną odmowę
+sprzeczności, null/auto oraz manual bounds, bajty legacy serialization i encode/open
+FMS dla obu ownerów z kontrolą niezmienności dokumentu i odmową unknown pól.
+Testy Rust NIE ZOSTAŁY skompilowane ani uruchomione. Kontrola parsera rustfmt
+jest wyłącznie kontrolą składni; nie dowodzi typów, działania lub cold-load HTTP.
+Brak kwalifikacji E5 oraz brak nowego wyniku Universe.
+
+Następne wymagane dowody: review skorygowanej wersji, build aplikacji przez
+zarządzaną receptę we własnym backendzie (bez unit-test compilation), odtworzenie
+tego samego FMS przez rzeczywiste API i kontrola jego sceny bez Solve. Weryfikacja
+zapisanych wyników V/J/H pozostaje odrębną bramką; ten FMS zawiera runs=[] i zero
+assetów. WIP nie zmienia przypiętego zainstalowanego pakietu ani requestu recovery.
+
+Skill fullmag-build-stage-cleanup nie jest obecny pod .agents/skills i nie znaleziono
+go przez wyszukiwanie cleanup. Zastosowano fallback retencji z governance: zachowano aktywny cache, bieżący
+pakiet potrzebny do recovery oraz nowy kandydat do weryfikacji; niczego nie usunięto.
+Przed buildem wolne miejsce w /build wynosiło około 509,4 GiB, a preflight
+oszacował potrzebę około 2,8 GB. Brak quota pozostaje ograniczeniem tej ścieżki.
+
+
+### Wynik build-only E5 — 24.10.2026
+
+Niezależny review skorygowanej wersji: brak pozostałych blockerów źródłowych.
+Parser rustfmt dla zmienionych źródeł i git diff --check PASS. Testów Rust nie
+kompilowano ani nie uruchamiano. Build-only przez istniejący just docker-dev-recovery-build
+w tym samym stałym backendzie zakończył się exit0:
+86d2032051d9431e96fb35f70b160af6, state=succeeded.
+Baza źródeł f53e724c006fada596fc4914d6eb0e21eba3b69e z jawnym dirty capture.
+Snapshot c33e6bbf4c7bc358df561102aaf9fa4f90be488dc9264b3ce8ae1289396d9dac.
+Kandydat /opt/fullmag/package/.development/candidates/.backend-package-candidate-e_xq7ikb,
+receipt SHA256 d10b9180885bd34a096ed1d37dc12829dafd1a51bbe90bc6ac07584bce3ebdf7.
+Make exit0 / 226429 ms; pakiet 24 pliki. Capture użył cache dla 9334/9340 plików.
+Nie przebudowywano obrazu toolchaina, nie zwiększano CPU/RAM ani limitów numeryki.
+
+Pełny log 201311 B odczytano, nie zawiera błędów kompilatora; jego SHA256:
+4f5ec40057843047bd1415bbf8d77b0c5c6d580e38a404d0ab048c59b368aeed.
+Istnieją ostrzeżenia w innych modułach; nie poprawiano ich poza zakresem.
+Package_promoted=false, runtime_started=false. Uchwyt buildu zakończony exit0;
+nie jest to aktywny build ani działające API.
+
+Ponownie sprawdzono niezmienność requestu recovery, config, Failed OWNER,
+process receipt, bieżącego package receipt i native executable; nowy Run
+pozostał rev52. Wszystkie 70 historycznych plików, pięć katalogów i FMS mają
+identyczne rozmiary/hash jak przed buildem. Dowody techniczne w control volume:
+verification/universe-volume-policy-20261023/e5-universe-wire-compatibility-wip/:
+syntax-diagnostic-current.json, build-log-summary.json, candidate-preservation.json,
+scientific-data-preservation.json. Terminal i pełny build.log pozostają pod
+recovery-build/attempts/86d2032051d9431e96fb35f70b160af6/.
+
+Wymagane dalej: decyzja o istniejącym przypiętym recovery, jego świeży preflight,
+a dopiero po autoryzowanej terminalizacji/promocji i managed restarcie rzeczywisty
+FMS open → authoring scene przez HTTP, bez Solve. Sam build nie zalicza E5,
+nie dowodzi historycznego cold-load V/J/H ani wyniku H Universe. E1–E12 otwarte.

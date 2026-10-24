@@ -237,6 +237,7 @@ pub struct ScriptBuilderMeshOperationState {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(try_from = "crate::universe_state::UniverseStateWire")]
 pub struct ScriptBuilderUniverseState {
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

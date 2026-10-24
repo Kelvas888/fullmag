@@ -2756,7 +2756,7 @@ fn opened_authoring_scene(
     serde_json::from_value::<fullmag_ir::BackendTarget>(Value::String(
         scene.study.requested_backend.trim().to_ascii_lowercase(),
     )).ok()?;
-    let projected = serde_json::to_value(&scene).ok()?;
+    let projected = authoring_scene_wire_projection(raw_scene, &scene)?;
     if !raw_scene_survives_projection(raw_scene, &projected)
         || scene_references_unmaterialized_assets(&projected)
     {
@@ -2771,6 +2771,33 @@ fn opened_authoring_scene(
     Some(raw_scene.as_object()?.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
 }
 
+
+/// Compare Python's redundant Universe wire names with the canonical typed
+/// values without changing the serialization used by checkpoint identities.
+fn authoring_scene_wire_projection(raw: &Value, scene: &SceneDocument) -> Option<Value> {
+    let mut projected = serde_json::to_value(scene).ok()?;
+    for owner in ["/universe", "/study/universe_mesh"] {
+        let Some(supplied) = raw.pointer(owner).and_then(Value::as_object) else { continue; };
+        let canonical = projected.pointer_mut(owner)?.as_object_mut()?;
+        for (current, legacy) in [
+            ("maximum_element_size", "airbox_hmax"),
+            ("minimum_element_size", "airbox_hmin"),
+        ] {
+            if supplied.contains_key(current) {
+                // Values come only from the validated typed state, never raw JSON.
+                let value = canonical.get(legacy).cloned().unwrap_or(Value::Null);
+                canonical.insert(current.into(), value);
+            }
+        }
+        for field in ["size", "center", "padding", "airbox_hmax", "airbox_hmin",
+            "airbox_growth_rate", "airbox_grading"] {
+            if supplied.get(field) == Some(&Value::Null) && !canonical.contains_key(field) {
+                canonical.insert(field.into(), Value::Null);
+            }
+        }
+    }
+    Some(projected)
+}
 
 /// Supplied semantic values must survive typed projection. Only exact empty
 /// placeholders emitted by the canonical Python scene producer may be omitted.
@@ -2976,6 +3003,49 @@ mod authoring_open_tests {
         assert_eq!(application.current_document().unwrap(),&before);
         assert_eq!(view.project_id,before.definition.project_id);
         assert_eq!(view.revision,before.definition.revision);
+    }
+
+    #[test]
+    fn universe_aliases_survive_archive_open_without_unknown_field_exceptions() {
+        for owner in ["/universe", "/study/universe_mesh"] {
+            for universe in [
+                json!({"mode":"auto","size":null,"airbox_hmax":5e-7,"airbox_hmin":1.5e-7}),
+                json!({"mode":"auto","size":null,"maximum_element_size":5e-7,"minimum_element_size":1.5e-7}),
+                json!({"mode":"auto","size":null,"airbox_hmax":5e-7,"airbox_hmin":1.5e-7,
+                    "maximum_element_size":5e-7,"minimum_element_size":1.5e-7}),
+            ] {
+                let (mut application, view) = opened(provenance());
+                let mut draft = application.current_document().unwrap().clone();
+                let mut raw = draft.definition.scene.value().clone();
+                if owner == "/universe" {
+                    raw["universe"] = universe;
+                } else {
+                    raw["study"]["universe_mesh"] = universe;
+                }
+                draft.replace_scene(RawJsonEnvelope::from_value(raw.clone()).unwrap()).unwrap();
+                application.replace_draft(draft, view.revision).unwrap();
+                let bytes = application.repository().encode_archive(application.current_document().unwrap()).unwrap();
+                let mut cold = ProjectApplication::new(FileProjectRepository::new());
+                let result = cold.open(ProjectSource::Bytes { display_name:"universe.fms".into(), bytes }).unwrap();
+                let before = cold.current_document().unwrap().clone();
+                let projected = opened_authoring_scene(&cold, &result.view).unwrap();
+                assert_eq!(serde_json::to_value(projected).unwrap(), raw);
+                assert_eq!(cold.current_document().unwrap(), &before);
+
+                for unknown in [Value::Null, json!({}), json!([]), json!("future")] {
+                    let mut unknown_raw = raw.clone();
+                    unknown_raw.pointer_mut(owner).unwrap().as_object_mut().unwrap().insert("future".into(), unknown);
+                    let scene: SceneDocument = serde_json::from_value(unknown_raw.clone()).unwrap();
+                    let projected = authoring_scene_wire_projection(&unknown_raw, &scene).unwrap();
+                    assert!(!raw_scene_survives_projection(&unknown_raw, &projected));
+                }
+                let mut conflict = raw;
+                let universe = conflict.pointer_mut(owner).unwrap().as_object_mut().unwrap();
+                universe.insert("airbox_hmax".into(), json!(5e-7));
+                universe.insert("maximum_element_size".into(), json!(6e-7));
+                assert!(serde_json::from_value::<SceneDocument>(conflict).is_err());
+            }
+        }
     }
 
     #[test]
