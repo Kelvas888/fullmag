@@ -3423,6 +3423,103 @@ impl NativeFdmBackend {
         )
     }
 
+    /// Select the device-resident projected-gradient BB minimizer for this
+    /// handle (docs/physics/0500-fdm-relaxation-algorithms.md §3.1.7). Call it
+    /// before the execution receipt is begun: DIRECT_MINIMIZER replaces
+    /// LLG_INTEGRATOR in the required operator set.
+    pub(crate) fn configure_direct_minimizer(
+        &mut self,
+        energy_tolerance_relative: f64,
+    ) -> Result<(), RunError> {
+        use crate::relaxation::direct_minimizer::{
+            ARMIJO_COEFFICIENT, DEFAULT_STEP_SIZE, MAX_STEP_SIZE, MIN_STEP_SIZE,
+            PROJECTED_GRADIENT_MAX_BACKTRACK,
+        };
+        let config = ffi::fullmag_fdm_direct_minimizer_config_v1 {
+            abi_version: ffi::FULLMAG_FDM_DIRECT_MINIMIZER_ABI_V1,
+            struct_size: std::mem::size_of::<ffi::fullmag_fdm_direct_minimizer_config_v1>() as u32,
+            algorithm: ffi::FULLMAG_FDM_DIRECT_MINIMIZER_PROJECTED_GRADIENT_BB,
+            max_backtracks: PROJECTED_GRADIENT_MAX_BACKTRACK,
+            initial_step_size: DEFAULT_STEP_SIZE,
+            min_step_size: MIN_STEP_SIZE,
+            max_step_size: MAX_STEP_SIZE,
+            armijo_coefficient: ARMIJO_COEFFICIENT,
+            energy_tolerance_relative,
+        };
+        let rc = unsafe {
+            ffi::fullmag_fdm_backend_configure_direct_minimizer_v1(self.handle as *mut _, &config)
+        };
+        if rc != ffi::FULLMAG_FDM_OK {
+            return Err(self.last_error_or("configure_direct_minimizer failed"));
+        }
+        Ok(())
+    }
+
+    /// Evaluate the current state for the device minimizer (status READY).
+    pub(crate) fn direct_minimizer_begin(
+        &mut self,
+    ) -> Result<(StepStats, ffi::fullmag_fdm_direct_minimizer_status_v1), RunError> {
+        self.direct_minimizer_call(ffi::fullmag_fdm_backend_direct_minimizer_begin_v1, "begin")
+    }
+
+    /// One device-resident projected-gradient BB step; see the status code.
+    pub(crate) fn direct_minimizer_step(
+        &mut self,
+    ) -> Result<(StepStats, ffi::fullmag_fdm_direct_minimizer_status_v1), RunError> {
+        self.direct_minimizer_call(ffi::fullmag_fdm_backend_direct_minimizer_step_v1, "step")
+    }
+
+    fn direct_minimizer_call(
+        &mut self,
+        call: unsafe extern "C" fn(
+            *mut ffi::fullmag_fdm_backend,
+            *mut ffi::fullmag_fdm_step_stats,
+            *mut ffi::fullmag_fdm_direct_minimizer_status_v1,
+        ) -> i32,
+        name: &str,
+    ) -> Result<(StepStats, ffi::fullmag_fdm_direct_minimizer_status_v1), RunError> {
+        // SAFETY: fullmag_fdm_step_stats is a plain C struct of integers and floats.
+        let mut stats: ffi::fullmag_fdm_step_stats = unsafe { std::mem::zeroed() };
+        let mut status = ffi::fullmag_fdm_direct_minimizer_status_v1 {
+            abi_version: ffi::FULLMAG_FDM_DIRECT_MINIMIZER_ABI_V1,
+            struct_size: std::mem::size_of::<ffi::fullmag_fdm_direct_minimizer_status_v1>() as u32,
+            ..Default::default()
+        };
+        let rc = unsafe { call(self.handle as *mut _, &mut stats, &mut status) };
+        if rc != ffi::FULLMAG_FDM_OK {
+            return Err(self.last_error_or(&format!("direct_minimizer_{name} failed")));
+        }
+        let (e_dmi, e_rotated_dmi) = self.split_dmi_energy(stats.dmi_energy_joules);
+        let max_torque_apm = if stats.max_torque_Apm.is_finite() { stats.max_torque_Apm } else { 0.0 };
+        let mut step_stats = StepStats {
+            step: stats.step,
+            time: stats.time_seconds,
+            dt: stats.dt_seconds,
+            e_ex: stats.exchange_energy_joules,
+            e_demag: stats.demag_energy_joules,
+            e_ext: stats.external_energy_joules,
+            e_ani: stats.anisotropy_energy_joules + stats.cubic_energy_joules,
+            e_dmi,
+            e_rotated_dmi,
+            e_total: stats.total_energy_joules,
+            max_h_eff: stats.max_effective_field_amplitude,
+            max_h_demag: stats.max_demag_field_amplitude,
+            max_torque_Apm: max_torque_apm,
+            max_torque_T: max_torque_apm * crate::MU0,
+            wall_time_ns: stats.wall_time_ns,
+            hot_loop_d2h_bytes: stats.hot_loop_d2h_bytes,
+            hot_loop_host_sync_count: stats.hot_loop_host_sync_count,
+            hot_loop_control_scalar_d2h_bytes: stats.hot_loop_control_scalar_d2h_bytes,
+            hot_loop_control_scalar_host_sync_count: stats.hot_loop_control_scalar_host_sync_count,
+            mx: status.mean_m[0],
+            my: status.mean_m[1],
+            mz: status.mean_m[2],
+            ..StepStats::default()
+        };
+        step_stats.per_object_scalars = single_object_scalars("free", &step_stats);
+        Ok((step_stats, status))
+    }
+
     pub fn refresh_observables(&mut self) -> Result<(), RunError> {
         let rc = unsafe { ffi::fullmag_fdm_backend_refresh_observables(self.handle as *mut _) };
         if rc != ffi::FULLMAG_FDM_OK {

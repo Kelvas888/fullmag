@@ -43,6 +43,29 @@ struct DeviceVectorField {
     void *z = nullptr;
 };
 
+/// Device-resident projected-gradient BB minimizer (gpu/cuda/relaxation/pgbb.cu).
+/// The vectors of the current accepted state stay on the device; the cache is
+/// valid while `cache_revision` equals the context's accepted-state revision.
+struct DirectMinimizerState {
+    bool configured = false;
+    fullmag_fdm_direct_minimizer_config_v1 config{};
+    DeviceVectorField m_prev;   // state before the trial
+    DeviceVectorField h_prev;   // H_eff of m_prev
+    DeviceVectorField g;        // tangent gradient of the current state
+    DeviceVectorField g_trial;  // tangent gradient of the accepted trial
+    int *invalid_flag = nullptr;
+    bool cache_valid = false;
+    uint64_t cache_revision = 0;
+    double energy_j = 0.0;
+    double gradient_norm_sq = 0.0;
+    double max_torque_apm = 0.0;
+    double step_size = 0.0;
+    bool use_bb1 = true;
+    uint64_t reset_consecutive = 0;
+    uint64_t accepted_steps = 0;
+    fullmag_fdm_step_stats stats{};
+};
+
 /// Device-side copy of one resolved regional-drive waveform descriptor.
 /// Spatial bases are stored separately as flattened SoA arrays with layout
 /// [drive][cell]. The native FDM clock is stage-local; the upload boundary
@@ -768,6 +791,7 @@ struct Context {
     uint64_t reduction_scratch_len = 0;
     double *reduction_scratch_aux = nullptr;
     uint64_t reduction_scratch_aux_len = 0;
+    DirectMinimizerState direct_minimizer;
     AdaptiveDeviceControl *adaptive_policy_scratch = nullptr;
     AdaptiveDeviceBatchState *adaptive_batch_state = nullptr;
     AdaptiveDeviceControl *adaptive_accepted_batch = nullptr;
@@ -2130,7 +2154,10 @@ inline bool fullmag_fdm_multilayer_has_active_mask(const Context &ctx) {
 }
 
 inline uint64_t fullmag_fdm_required_operator_mask(const Context &ctx) {
-    uint64_t required_operator_mask = FULLMAG_FDM_OPERATOR_LLG_INTEGRATOR;
+    // A minimizer handle advances by direct-minimizer steps, never by LLG.
+    uint64_t required_operator_mask = ctx.direct_minimizer.configured
+        ? FULLMAG_FDM_OPERATOR_DIRECT_MINIMIZER
+        : FULLMAG_FDM_OPERATOR_LLG_INTEGRATOR;
     if (ctx.adaptive_enabled ||
         ctx.stats_mode == FULLMAG_FDM_STATS_FULL ||
         ctx.stats_mode == FULLMAG_FDM_STATS_CONTROL) {
@@ -2433,7 +2460,7 @@ inline void fullmag_fdm_commit_operator_residency(Context &ctx) {
     std::lock_guard<std::mutex> lock(state.accounting_mutex);
     const uint64_t required = fullmag_fdm_required_operator_mask(ctx);
     state.required_operator_mask |= required;
-    for (uint64_t bit = 1; bit <= FULLMAG_FDM_OPERATOR_GPU_TRANSPORT; bit <<= 1) {
+    for (uint64_t bit = 1; bit <= FULLMAG_FDM_OPERATOR_DIRECT_MINIMIZER; bit <<= 1) {
         if ((required & bit) != 0) {
             state.device_operator_mask |= bit;
             state.host_operator_mask &= ~bit;
@@ -2962,6 +2989,18 @@ bool context_query_device_info(Context &ctx);
 bool context_refresh_observables(Context &ctx);
 bool context_ensure_observable_fields(Context &ctx, uint64_t required_mask);
 void context_invalidate_observables(Context &ctx);
+bool context_allocate_direct_minimizer_workspace(Context &ctx);
+void context_free_direct_minimizer_workspace(Context &ctx);
+int direct_minimizer_configure(
+    Context &ctx, const fullmag_fdm_direct_minimizer_config_v1 &config);
+int direct_minimizer_begin(
+    Context &ctx,
+    fullmag_fdm_step_stats &out_stats,
+    fullmag_fdm_direct_minimizer_status_v1 &out_status);
+int direct_minimizer_step(
+    Context &ctx,
+    fullmag_fdm_step_stats &out_stats,
+    fullmag_fdm_direct_minimizer_status_v1 &out_status);
 
 /// Populate only H_demag for the current state without advancing time.
 bool context_refresh_demag_observable(Context &ctx);

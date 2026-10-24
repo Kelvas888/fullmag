@@ -104,6 +104,134 @@ fn restore_previous_state_after_failed_line_search(
     })
 }
 
+/// Publish one live step of a direct-minimizer loop. Returns true when the
+/// consumer asked to stop. `magnetization` supplies the current state on demand.
+fn observe_live_step(
+    backend: &mut NativeFdmBackend,
+    plan: &FdmPlanIR,
+    live: &mut LiveStepConsumer<'_>,
+    mut live_observations: Option<&mut FdmLiveObservationScheduler>,
+    current_stats: &mut StepStats,
+    last_preview_revision: &mut Option<u64>,
+    magnetization: impl FnOnce(&mut NativeFdmBackend) -> Result<Vec<f64>, RunError>,
+) -> Result<bool, RunError> {
+    let display_selection = live.display_selection.map(|get| get());
+    let preview_due = display_selection
+        .as_ref()
+        .is_some_and(|selection| {
+            display_refresh_due(*last_preview_revision, selection, current_stats.step)
+        });
+    let preview_targets_global_scalar = display_selection
+        .as_ref()
+        .is_some_and(display_is_global_scalar);
+    let heavy_payload_every = live.field_every_n.max(1);
+    let heavy_payload_due = current_stats.step > 0
+        && current_stats.step % heavy_payload_every == 0;
+    let full_fields_due = heavy_payload_due && live.field_every_n == 1;
+    if display_selection.is_some() || heavy_payload_due {
+        let mut observation_publication = display_selection.as_ref().and_then(|selection| {
+            live_observations.as_mut().map(|scheduler| {
+                scheduler.observe(
+                    backend,
+                    selection,
+                    current_stats.step,
+                    current_stats.time,
+                    current_stats.dt,
+                )
+            })
+        });
+        let (preview_field, scheduler_cached_preview_fields) =
+            if let Some(publication) = observation_publication.as_mut() {
+                publication.apply_to_stats(current_stats);
+                (
+                    publication.preview_field.take(),
+                    publication.cached_preview_fields.take(),
+                )
+            } else {
+                (None, None)
+            };
+        let config_revision = display_selection
+            .as_ref()
+            .map(|selection| selection.revision)
+            .unwrap_or(0);
+        let cached_preview_fields = if full_fields_due {
+            let capture_started = Instant::now();
+            match super::execute::capture_full_active_cuda_fields(
+                backend,
+                plan,
+                live.grid,
+                current_stats.step,
+                current_stats.time,
+                config_revision,
+                None,
+            ) {
+                Ok(mut fields) => {
+                    super::execute::mark_full_fields_materialized(
+                        current_stats,
+                        &fields,
+                    );
+                    if let Some(mut scheduler_fields) = scheduler_cached_preview_fields {
+                        scheduler_fields.retain(|scheduled| {
+                            !fields
+                                .iter()
+                                .any(|full| full.quantity == scheduled.quantity)
+                        });
+                        fields.extend(scheduler_fields);
+                    }
+                    current_stats.cached_preview_wall_time_ns = current_stats
+                        .cached_preview_wall_time_ns
+                        .saturating_add(capture_started.elapsed().as_nanos() as u64);
+                    Some(fields)
+                }
+                Err(error) => {
+                    let source_step = current_stats.step;
+                    super::execute::mark_full_fields_materialization_error(
+                        current_stats,
+                        plan,
+                        source_step,
+                        config_revision,
+                        &error.message,
+                    );
+                    current_stats.cached_preview_wall_time_ns = current_stats
+                        .cached_preview_wall_time_ns
+                        .saturating_add(capture_started.elapsed().as_nanos() as u64);
+                    None
+                }
+            }
+        } else {
+            scheduler_cached_preview_fields
+        };
+        let magnetization = magnetization(backend)?;
+        let action = (live.on_step)(StepUpdate {
+            coupled_checkpoint: None,
+            stats: current_stats.clone(),
+            grid: live.grid,
+            fem_mesh_generation_id: None,
+            magnetization: Some(magnetization),
+            preview_field,
+            cached_preview_fields,
+            hysteresis_field_m_t: None,
+            hysteresis_point_index: None,
+            hysteresis_settle_step_index: None,
+            hysteresis_settle_step_kind: None,
+            hysteresis_settle_step_method: None,
+            scalar_row_due: preview_due && preview_targets_global_scalar,
+            terminal_field_snapshot: false,
+            finished: false,
+            magnetization_carrier: None,
+        });
+        if preview_due {
+            *last_preview_revision = display_selection
+                .as_ref()
+                .map(|selection| selection.revision);
+        }
+        if action == StepAction::Stop {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn execute_direct_minimizer(
     backend: &mut NativeFdmBackend,
     plan: &FdmPlanIR,
@@ -117,6 +245,20 @@ pub(crate) fn execute_direct_minimizer(
     mut last_preview_revision: Option<u64>,
     mut live_observations: Option<&mut FdmLiveObservationScheduler>,
 ) -> Result<CudaDirectMinimizerOutcome, RunError> {
+    if direct_minimizer.algorithm == DirectMinimizerAlgorithm::ProjectedGradientBb {
+        return execute_device_projected_gradient_bb(
+            backend,
+            plan,
+            direct_minimizer,
+            current_stats,
+            live,
+            artifacts,
+            steps,
+            energy_plateau,
+            last_preview_revision,
+            live_observations,
+        );
+    }
     let control = direct_minimizer.control;
     let mut latest_stats = Some(current_stats.clone());
     let mut cancelled = false;
@@ -155,119 +297,18 @@ pub(crate) fn execute_direct_minimizer(
 
     while direct_minimizer_within_runtime_budget(&state, control) {
         if let Some(live) = live.as_mut() {
-            let display_selection = live.display_selection.map(|get| get());
-            let preview_due = display_selection
-                .as_ref()
-                .is_some_and(|selection| {
-                    display_refresh_due(last_preview_revision, selection, current_stats.step)
-                });
-            let preview_targets_global_scalar = display_selection
-                .as_ref()
-                .is_some_and(display_is_global_scalar);
-            let heavy_payload_every = live.field_every_n.max(1);
-            let heavy_payload_due = current_stats.step > 0
-                && current_stats.step % heavy_payload_every == 0;
-            let full_fields_due = heavy_payload_due && live.field_every_n == 1;
-            if display_selection.is_some() || heavy_payload_due {
-                let mut observation_publication = display_selection.as_ref().and_then(|selection| {
-                    live_observations.as_mut().map(|scheduler| {
-                        scheduler.observe(
-                            backend,
-                            selection,
-                            current_stats.step,
-                            current_stats.time,
-                            current_stats.dt,
-                        )
-                    })
-                });
-                let (preview_field, scheduler_cached_preview_fields) =
-                    if let Some(publication) = observation_publication.as_mut() {
-                        publication.apply_to_stats(&mut current_stats);
-                        (
-                            publication.preview_field.take(),
-                            publication.cached_preview_fields.take(),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                let config_revision = display_selection
-                    .as_ref()
-                    .map(|selection| selection.revision)
-                    .unwrap_or(0);
-                let cached_preview_fields = if full_fields_due {
-                    let capture_started = Instant::now();
-                    match super::execute::capture_full_active_cuda_fields(
-                        backend,
-                        plan,
-                        live.grid,
-                        current_stats.step,
-                        current_stats.time,
-                        config_revision,
-                        None,
-                    ) {
-                        Ok(mut fields) => {
-                            super::execute::mark_full_fields_materialized(
-                                &mut current_stats,
-                                &fields,
-                            );
-                            if let Some(mut scheduler_fields) = scheduler_cached_preview_fields {
-                                scheduler_fields.retain(|scheduled| {
-                                    !fields
-                                        .iter()
-                                        .any(|full| full.quantity == scheduled.quantity)
-                                });
-                                fields.extend(scheduler_fields);
-                            }
-                            current_stats.cached_preview_wall_time_ns = current_stats
-                                .cached_preview_wall_time_ns
-                                .saturating_add(capture_started.elapsed().as_nanos() as u64);
-                            Some(fields)
-                        }
-                        Err(error) => {
-                            let source_step = current_stats.step;
-                            super::execute::mark_full_fields_materialization_error(
-                                &mut current_stats,
-                                plan,
-                                source_step,
-                                config_revision,
-                                &error.message,
-                            );
-                            current_stats.cached_preview_wall_time_ns = current_stats
-                                .cached_preview_wall_time_ns
-                                .saturating_add(capture_started.elapsed().as_nanos() as u64);
-                            None
-                        }
-                    }
-                } else {
-                    scheduler_cached_preview_fields
-                };
-                let action = (live.on_step)(StepUpdate {
-                    coupled_checkpoint: None,
-                    stats: current_stats.clone(),
-                    grid: live.grid,
-                    fem_mesh_generation_id: None,
-                    magnetization: Some(flatten_vectors(&state.magnetization)),
-                    preview_field,
-                    cached_preview_fields,
-                    hysteresis_field_m_t: None,
-                    hysteresis_point_index: None,
-                    hysteresis_settle_step_index: None,
-                    hysteresis_settle_step_kind: None,
-                    hysteresis_settle_step_method: None,
-                    scalar_row_due: preview_due && preview_targets_global_scalar,
-                    terminal_field_snapshot: false,
-                    finished: false,
-                    magnetization_carrier: None,
-                });
-                if preview_due {
-                    last_preview_revision = display_selection
-                        .as_ref()
-                        .map(|selection| selection.revision);
-                }
-                if action == StepAction::Stop {
-                    cancelled = true;
-                    break;
-                }
+            let magnetization = &state.magnetization;
+            if observe_live_step(
+                backend,
+                plan,
+                live,
+                live_observations.as_deref_mut(),
+                &mut current_stats,
+                &mut last_preview_revision,
+                |_| Ok(flatten_vectors(magnetization)),
+            )? {
+                cancelled = true;
+                break;
             }
         }
         if cancelled {
@@ -576,6 +617,184 @@ pub(crate) fn execute_direct_minimizer(
             energy_plateau_range,
             torque_apm,
             state.accepted_steps,
+        ) {
+            torque_confirmed = true;
+            break;
+        }
+    }
+
+    Ok(CudaDirectMinimizerOutcome {
+        latest_stats,
+        cancelled,
+        torque_confirmed,
+        numerical_stagnation,
+    })
+}
+
+/// Device-resident projected-gradient BB (docs/physics/0500 §3.1.7): every
+/// accepted step is one native call; the host keeps only the stop policy
+/// (torque confirmation, energy plateau, step budget) and the scalar results.
+fn execute_device_projected_gradient_bb(
+    backend: &mut NativeFdmBackend,
+    plan: &FdmPlanIR,
+    direct_minimizer: DirectMinimizerControl<'_>,
+    mut current_stats: StepStats,
+    mut live: Option<&mut LiveStepConsumer<'_>>,
+    artifacts: &mut ArtifactRecorder,
+    steps: &mut Vec<StepStats>,
+    energy_plateau: &mut RelaxationEnergyPlateauWindow,
+    mut last_preview_revision: Option<u64>,
+    mut live_observations: Option<&mut FdmLiveObservationScheduler>,
+) -> Result<CudaDirectMinimizerOutcome, RunError> {
+    use fullmag_fdm_sys as ffi;
+
+    let control = direct_minimizer.control;
+    let mut latest_stats = Some(current_stats.clone());
+    let mut cancelled = false;
+    let mut torque_confirmed = false;
+    let mut numerical_stagnation = false;
+    let mut torque_confirmation = RelaxationTorqueConfirmation::default();
+    let (_, mut status) = backend.direct_minimizer_begin()?;
+    let budget = crate::relaxation::direct_minimizer::direct_minimizer_step_budget(control);
+
+    while status.accepted_steps < budget {
+        if let Some(live) = live.as_mut() {
+            let cell_count = plan.grid.cells.iter().map(|&n| n as usize).product();
+            if observe_live_step(
+                backend,
+                plan,
+                live,
+                live_observations.as_deref_mut(),
+                &mut current_stats,
+                &mut last_preview_revision,
+                |backend| Ok(flatten_vectors(&backend.copy_m(cell_count)?)),
+            )? {
+                cancelled = true;
+                break;
+            }
+        }
+
+        if direct_minimizer_gradient_invalid(status.gradient_norm_sq) {
+            return Err(RunError {
+                message: "FDM CUDA direct-minimizer gradient metric is invalid".to_string(),
+            });
+        }
+        if torque_confirmation.observe_at_accepted_step(
+            control,
+            energy_plateau.range(),
+            status.max_torque_apm,
+            status.accepted_steps,
+        ) {
+            torque_confirmed = true;
+            break;
+        }
+        if direct_minimizer_gradient_degenerate(status.gradient_norm_sq) {
+            if control.stop.torque_tolerance_apm.is_some_and(|threshold| {
+                status.max_torque_apm.is_finite() && status.max_torque_apm <= threshold
+            }) && control.stop.energy_tolerance_j.is_none()
+            {
+                for _ in 0..2 {
+                    backend.refresh_observables()?;
+                    let fresh = backend.snapshot_step_stats(plan.grid.cells)?;
+                    if torque_confirmation.observe(
+                        control,
+                        energy_plateau.range(),
+                        fresh.max_torque_Apm,
+                    ) {
+                        torque_confirmed = true;
+                        break;
+                    }
+                }
+            }
+            numerical_stagnation = !torque_confirmed;
+            break;
+        }
+
+        let initial_step_size = status.next_step_size;
+        let (mut accepted_stats, next) = backend.direct_minimizer_step()?;
+        match next.status {
+            ffi::FULLMAG_FDM_DIRECT_MINIMIZER_ACCEPTED => {}
+            ffi::FULLMAG_FDM_DIRECT_MINIMIZER_LINE_SEARCH_EXHAUSTED => {
+                let cell_volume_m3 = plan.cell_size.iter().product::<f64>();
+                let active_cell_count = plan.active_mask.as_ref().map_or(
+                    plan.grid.cells.iter().map(|&n| n as usize).product(),
+                    |mask| mask.iter().filter(|active| **active).count(),
+                );
+                let ms = plan.material.saturation_magnetisation;
+                return Err(RunError {
+                    message: format!(
+                        "{}; previous magnetization was restored",
+                        format_line_search_failure_message(
+                            "projected-gradient BB",
+                            PROJECTED_GRADIENT_MAX_BACKTRACK,
+                            DirectMinimizerLineSearchFailure {
+                                previous_energy_j: next.previous_energy_j,
+                                last_trial_energy_j: next.last_trial_energy_j,
+                                initial_step_size_m_per_a: initial_step_size,
+                                last_trial_step_size_m_per_a: next.last_trial_step_size,
+                                direction_dot_gradient_j_per_step: -status.gradient_norm_sq,
+                                energy_tolerance_j: next.energy_tolerance_j,
+                                evaluations: next.energy_evaluations,
+                                gradient_max_apm: f64::NAN,
+                                active_gradient_max_apm: f64::NAN,
+                                active_cell_count,
+                                cell_volume_m3,
+                                ms_min_apm: ms,
+                                ms_max_apm: ms,
+                            },
+                        )
+                    ),
+                });
+            }
+            other => {
+                // The gradient checks above run on the same state, so the native
+                // step cannot disagree with them except for a non-finite metric.
+                status = next;
+                if other == ffi::FULLMAG_FDM_DIRECT_MINIMIZER_GRADIENT_INVALID {
+                    continue;
+                }
+                numerical_stagnation = true;
+                break;
+            }
+        }
+        status = next;
+
+        accepted_stats.step = status.accepted_steps;
+        accepted_stats.time = 0.0;
+        accepted_stats.dt = 0.0;
+        accepted_stats.pseudo_time_s = None;
+        accepted_stats.max_dm_dt = 0.0;
+        ensure_single_object_scalars(&mut accepted_stats, "free");
+        let scalar_metrics = accepted_stats
+            .per_object_scalars
+            .entry("free".to_string())
+            .or_default();
+        for (name, value) in [
+            ("mx", status.mean_m[0]),
+            ("my", status.mean_m[1]),
+            ("mz", status.mean_m[2]),
+            ("accepted_step_m_per_A", status.accepted_step_size),
+            ("line_search_backtracks", f64::from(status.backtracks)),
+            ("energy_evaluations", f64::from(status.energy_evaluations)),
+            ("field_evaluations", f64::from(status.energy_evaluations)),
+            ("rhs_evaluations", f64::from(status.energy_evaluations)),
+            ("accepted_steps", status.accepted_steps as f64),
+        ] {
+            scalar_metrics.insert(name.to_string(), value);
+        }
+
+        artifacts.observe_energy_evaluation();
+        artifacts.record_scalar(&accepted_stats)?;
+        steps.push(accepted_stats.clone());
+        latest_stats = Some(accepted_stats.clone());
+        current_stats = accepted_stats;
+
+        let energy_plateau_range = energy_plateau.record(status.energy_j);
+        if torque_confirmation.observe_at_accepted_step(
+            control,
+            energy_plateau_range,
+            status.max_torque_apm,
+            status.accepted_steps,
         ) {
             torque_confirmed = true;
             break;

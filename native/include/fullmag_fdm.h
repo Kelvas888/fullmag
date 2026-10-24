@@ -931,6 +931,63 @@ typedef struct {
     uint64_t transaction_commit_count;
 } fullmag_fdm_fsal_telemetry_v1;
 
+/* ── Device-resident direct minimizer (projected-gradient Barzilai-Borwein) ──
+ * docs/physics/0500-fdm-relaxation-algorithms.md §3.1.2 and §3.1.7. One
+ * accepted step per call; vectors stay on the device and only control scalars
+ * cross to the host. */
+#define FULLMAG_FDM_DIRECT_MINIMIZER_ABI_V1 1u
+#define FULLMAG_FDM_DIRECT_MINIMIZER_PROJECTED_GRADIENT_BB 1u
+
+typedef struct {
+    uint32_t abi_version;          /* FULLMAG_FDM_DIRECT_MINIMIZER_ABI_V1 */
+    uint32_t struct_size;
+    uint32_t algorithm;            /* FULLMAG_FDM_DIRECT_MINIMIZER_PROJECTED_GRADIENT_BB */
+    uint32_t max_backtracks;       /* line-search halvings before failure */
+    double   initial_step_size;    /* lambda_0 [m/A] */
+    double   min_step_size;        /* BB clamp */
+    double   max_step_size;        /* BB clamp */
+    double   armijo_coefficient;   /* c_1 */
+    double   energy_tolerance_relative; /* Armijo slack = this * |E_prev| */
+} fullmag_fdm_direct_minimizer_config_v1;
+
+#define FULLMAG_FDM_DIRECT_MINIMIZER_READY 1u
+#define FULLMAG_FDM_DIRECT_MINIMIZER_ACCEPTED 2u
+#define FULLMAG_FDM_DIRECT_MINIMIZER_LINE_SEARCH_EXHAUSTED 3u
+#define FULLMAG_FDM_DIRECT_MINIMIZER_GRADIENT_DEGENERATE 4u
+#define FULLMAG_FDM_DIRECT_MINIMIZER_GRADIENT_INVALID 5u
+
+typedef struct {
+    uint32_t abi_version;          /* caller sets FULLMAG_FDM_DIRECT_MINIMIZER_ABI_V1 */
+    uint32_t struct_size;
+    uint32_t status;               /* FULLMAG_FDM_DIRECT_MINIMIZER_* */
+    uint32_t backtracks;
+    uint32_t energy_evaluations;
+    uint32_t use_bb1;              /* formula preferred for the next step */
+    uint64_t accepted_steps;
+    uint64_t reset_consecutive;
+    double   energy_j;             /* energy of the current (accepted) state */
+    double   previous_energy_j;
+    double   accepted_step_size;   /* lambda of the accepted trial */
+    double   next_step_size;
+    double   gradient_norm_sq;     /* <g, g>_E of the current state */
+    double   max_torque_apm;       /* max |m x H_eff| of the current state */
+    double   chord_increment_j;    /* -<H_prev, m_t - m_prev>_E of the last trial */
+    double   energy_tolerance_j;
+    double   last_trial_energy_j;
+    double   last_trial_step_size;
+    double   s_dot_s;
+    double   s_dot_y;
+    double   y_dot_y;
+    double   mean_m[3];            /* average m over active cells */
+} fullmag_fdm_direct_minimizer_status_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_direct_minimizer_config_v1) == 56,
+              "direct minimizer config v1 ABI size changed");
+static_assert(sizeof(fullmag_fdm_direct_minimizer_status_v1) == 168,
+              "direct minimizer status v1 ABI size changed");
+#endif
+
 #define FULLMAG_FDM_FSAL_TELEMETRY_ABI_V2 2u
 typedef struct {
     uint32_t abi_version;
@@ -1474,6 +1531,35 @@ int fullmag_fdm_backend_copy_adaptive_attempts_v1(
     fullmag_fdm_adaptive_attempt_v1 *out_attempts,
     uint32_t capacity,
     uint32_t *out_count);
+
+/*
+ * Select the device-resident direct minimizer for this handle. Call before the
+ * execution receipt is read: DIRECT_MINIMIZER replaces LLG_INTEGRATOR in the
+ * required operator set. Allocates the minimizer workspace.
+ */
+int fullmag_fdm_backend_configure_direct_minimizer_v1(
+    fullmag_fdm_backend *handle,
+    const fullmag_fdm_direct_minimizer_config_v1 *config);
+
+/*
+ * Evaluate the current state (field, energy, tangent gradient, torque) and
+ * report it with status READY. Outside the solver phase; no step is taken.
+ */
+int fullmag_fdm_backend_direct_minimizer_begin_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_step_stats *out_stats,
+    fullmag_fdm_direct_minimizer_status_v1 *out_status);
+
+/*
+ * Take one projected-gradient BB step with an Armijo line search, all on the
+ * device. Returns FULLMAG_FDM_OK with status ACCEPTED (a committed step and
+ * its stats), LINE_SEARCH_EXHAUSTED (state restored, nothing committed), or
+ * GRADIENT_DEGENERATE / GRADIENT_INVALID (no step attempted).
+ */
+int fullmag_fdm_backend_direct_minimizer_step_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_step_stats *out_stats,
+    fullmag_fdm_direct_minimizer_status_v1 *out_status);
 
 /* Caller initializes abi_version and struct_size. Invalid headers leave output unchanged. */
 int fullmag_fdm_backend_get_fsal_telemetry_v1(

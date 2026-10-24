@@ -709,6 +709,20 @@ pub(crate) fn execute_cuda_fdm(
         backend.bind_gpu_transport(&binding)?;
     }
     let device_info = backend.device_info()?;
+    // The device minimizer replaces LLG_INTEGRATOR in the required operator set,
+    // so it is selected before the receipt lifecycle freezes that set.
+    if direct_minimizer_control(plan.relaxation.as_ref()).is_some_and(|control| {
+        control.algorithm
+            == crate::relaxation::direct_minimizer::DirectMinimizerAlgorithm::ProjectedGradientBb
+    }) {
+        let energy_tolerance_relative = if plan.precision == fullmag_ir::ExecutionPrecision::Single
+        {
+            8.0 * f64::from(f32::EPSILON)
+        } else {
+            0.0
+        };
+        backend.configure_direct_minimizer(energy_tolerance_relative)?;
+    }
     let (receipt_lifecycle, initial_execution_receipt) =
         crate::fdm::gpu::cuda::native::residency::FdmGpuReceiptLifecycle::begin(
             &backend,

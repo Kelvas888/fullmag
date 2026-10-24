@@ -921,6 +921,57 @@ pub struct fullmag_fdm_fsal_telemetry_v1 {
     pub transaction_commit_count: u64,
 }
 
+pub const FULLMAG_FDM_DIRECT_MINIMIZER_ABI_V1: u32 = 1;
+pub const FULLMAG_FDM_DIRECT_MINIMIZER_PROJECTED_GRADIENT_BB: u32 = 1;
+pub const FULLMAG_FDM_DIRECT_MINIMIZER_READY: u32 = 1;
+pub const FULLMAG_FDM_DIRECT_MINIMIZER_ACCEPTED: u32 = 2;
+pub const FULLMAG_FDM_DIRECT_MINIMIZER_LINE_SEARCH_EXHAUSTED: u32 = 3;
+pub const FULLMAG_FDM_DIRECT_MINIMIZER_GRADIENT_DEGENERATE: u32 = 4;
+pub const FULLMAG_FDM_DIRECT_MINIMIZER_GRADIENT_INVALID: u32 = 5;
+
+/// Device-resident projected-gradient BB settings (`fullmag_fdm.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_direct_minimizer_config_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub algorithm: u32,
+    pub max_backtracks: u32,
+    pub initial_step_size: f64,
+    pub min_step_size: f64,
+    pub max_step_size: f64,
+    pub armijo_coefficient: f64,
+    pub energy_tolerance_relative: f64,
+}
+
+/// Scalar outcome of one device-resident minimizer call (`fullmag_fdm.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fullmag_fdm_direct_minimizer_status_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub status: u32,
+    pub backtracks: u32,
+    pub energy_evaluations: u32,
+    pub use_bb1: u32,
+    pub accepted_steps: u64,
+    pub reset_consecutive: u64,
+    pub energy_j: f64,
+    pub previous_energy_j: f64,
+    pub accepted_step_size: f64,
+    pub next_step_size: f64,
+    pub gradient_norm_sq: f64,
+    pub max_torque_apm: f64,
+    pub chord_increment_j: f64,
+    pub energy_tolerance_j: f64,
+    pub last_trial_energy_j: f64,
+    pub last_trial_step_size: f64,
+    pub s_dot_s: f64,
+    pub s_dot_y: f64,
+    pub y_dot_y: f64,
+    pub mean_m: [f64; 3],
+}
+
 pub const FULLMAG_FDM_FSAL_TELEMETRY_ABI_V2: u32 = 2;
 
 #[repr(C)]
@@ -1212,6 +1263,7 @@ pub const FULLMAG_FDM_OPERATOR_MULTILAYER_TRANSFER: u64 = 1 << 15;
 pub const FULLMAG_FDM_OPERATOR_MULTILAYER_INTERACTIONS: u64 = 1 << 16;
 pub const FULLMAG_FDM_OPERATOR_MULTILAYER_DEMAG: u64 = 1 << 17;
 pub const FULLMAG_FDM_OPERATOR_GPU_TRANSPORT: u64 = 1 << 18;
+pub const FULLMAG_FDM_OPERATOR_DIRECT_MINIMIZER: u64 = 1 << 19;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct fullmag_fdm_execution_receipt_v1 {
@@ -2006,6 +2058,23 @@ extern "C" {
         out_telemetry: *mut fullmag_fdm_fsal_telemetry_v1,
     ) -> i32;
 
+    pub fn fullmag_fdm_backend_configure_direct_minimizer_v1(
+        handle: *mut fullmag_fdm_backend,
+        config: *const fullmag_fdm_direct_minimizer_config_v1,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_direct_minimizer_begin_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_stats: *mut fullmag_fdm_step_stats,
+        out_status: *mut fullmag_fdm_direct_minimizer_status_v1,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_direct_minimizer_step_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_stats: *mut fullmag_fdm_step_stats,
+        out_status: *mut fullmag_fdm_direct_minimizer_status_v1,
+    ) -> i32;
+
     pub fn fullmag_fdm_backend_get_fsal_telemetry_v2(
         handle: *mut fullmag_fdm_backend,
         out_telemetry: *mut fullmag_fdm_fsal_telemetry_v2,
@@ -2376,6 +2445,34 @@ mod tests {
     fn adaptive_execution_telemetry_v1_has_stable_layout() {
         assert_eq!(size_of::<fullmag_fdm_adaptive_execution_telemetry_v1>(), 64);
         assert_eq!(align_of::<fullmag_fdm_adaptive_execution_telemetry_v1>(), 8);
+    }
+
+    #[test]
+    fn direct_minimizer_v1_has_stable_layout_and_ffi_symbols() {
+        assert_eq!(size_of::<fullmag_fdm_direct_minimizer_config_v1>(), 56);
+        assert_eq!(offset_of!(fullmag_fdm_direct_minimizer_config_v1, initial_step_size), 16);
+        assert_eq!(
+            offset_of!(fullmag_fdm_direct_minimizer_config_v1, energy_tolerance_relative),
+            48
+        );
+        assert_eq!(size_of::<fullmag_fdm_direct_minimizer_status_v1>(), 168);
+        assert_eq!(offset_of!(fullmag_fdm_direct_minimizer_status_v1, accepted_steps), 24);
+        assert_eq!(offset_of!(fullmag_fdm_direct_minimizer_status_v1, energy_j), 40);
+        assert_eq!(offset_of!(fullmag_fdm_direct_minimizer_status_v1, mean_m), 144);
+        let _configure: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *const fullmag_fdm_direct_minimizer_config_v1,
+        ) -> i32 = fullmag_fdm_backend_configure_direct_minimizer_v1;
+        let _step: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_step_stats,
+            *mut fullmag_fdm_direct_minimizer_status_v1,
+        ) -> i32 = fullmag_fdm_backend_direct_minimizer_step_v1;
+        let _begin: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_step_stats,
+            *mut fullmag_fdm_direct_minimizer_status_v1,
+        ) -> i32 = fullmag_fdm_backend_direct_minimizer_begin_v1;
     }
 
     #[test]

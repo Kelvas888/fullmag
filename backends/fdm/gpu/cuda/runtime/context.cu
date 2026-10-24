@@ -589,6 +589,39 @@ static bool free_tracked_vector_field(Context &ctx, DeviceVectorField &field) {
     return released;
 }
 
+bool context_allocate_direct_minimizer_workspace(Context &ctx) {
+    DirectMinimizerState &state = ctx.direct_minimizer;
+    DeviceVectorField *fields[] = {&state.m_prev, &state.h_prev, &state.g, &state.g_trial};
+    for (DeviceVectorField *field : fields) {
+        if (field->x == nullptr && !alloc_vector_field(ctx, *field)) {
+            context_free_direct_minimizer_workspace(ctx);
+            return false;
+        }
+    }
+    if (state.invalid_flag == nullptr) {
+        const cudaError_t err = cudaMalloc(&state.invalid_flag, sizeof(int));
+        if (err != cudaSuccess) {
+            set_cuda_error(ctx, "cudaMalloc(direct_minimizer_invalid_flag)", err);
+            context_free_direct_minimizer_workspace(ctx);
+            return false;
+        }
+    }
+    return true;
+}
+
+void context_free_direct_minimizer_workspace(Context &ctx) {
+    DirectMinimizerState &state = ctx.direct_minimizer;
+    (void)free_tracked_vector_field(ctx, state.m_prev);
+    (void)free_tracked_vector_field(ctx, state.h_prev);
+    (void)free_tracked_vector_field(ctx, state.g);
+    (void)free_tracked_vector_field(ctx, state.g_trial);
+    if (state.invalid_flag != nullptr &&
+        context_gpu_workspace_cuda_free(ctx, state.invalid_flag) == cudaSuccess) {
+        state.invalid_flag = nullptr;
+    }
+    state.cache_valid = false;
+}
+
 static void free_regional_field_drives(Context &ctx) {
     if (ctx.regional_field_drive_x) {
         fullmag_fdm_untracked_cuda_free(ctx.regional_field_drive_x);
@@ -3505,6 +3538,7 @@ void context_free_device(Context &ctx) {
     free_vector_field(ctx.gpu_transport_pre_step_abm_f_n);
     free_vector_field(ctx.gpu_transport_pre_step_abm_f_n1);
     free_vector_field(ctx.gpu_transport_pre_step_abm_f_n2);
+    context_free_direct_minimizer_workspace(ctx);
     free_vector_field(ctx.work);
     // DP45 stage buffers
     free_vector_field(ctx.k2);

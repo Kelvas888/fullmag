@@ -45,7 +45,7 @@ fn finalize_receipt_result<T>(
     }
 }
 
-const KNOWN_OPERATOR_MASK: u64 = (1_u64 << 19) - 1;
+const KNOWN_OPERATOR_MASK: u64 = (1_u64 << 20) - 1;
 
 #[cfg(test)]
 pub(super) fn known_operator_mask() -> u64 {
@@ -1235,6 +1235,16 @@ pub(super) fn query_execution_receipt(
         ffi::FULLMAG_FDM_OPERATOR_LLG_INTEGRATOR,
         "llg_integrator",
         integrator_realization(native.integrator, &precision)?,
+    );
+    push_operator(
+        &mut operator_residency,
+        native.required_operator_mask,
+        ffi::FULLMAG_FDM_OPERATOR_DIRECT_MINIMIZER,
+        "direct_minimizer",
+        format!(
+            "cuda_projected_gradient_bb_{}",
+            if precision == "single" { "fp32" } else { "fp64" }
+        ),
     );
     push_operator(
         &mut operator_residency,

@@ -3265,6 +3265,128 @@ int fullmag_fdm_backend_get_fsal_telemetry_v1(
         ? FULLMAG_FDM_OK : FULLMAG_FDM_ERR_ABI;
 }
 
+namespace {
+
+bool direct_minimizer_status_header_valid(
+    const fullmag_fdm_direct_minimizer_status_v1 *status)
+{
+    return status != nullptr &&
+        status->abi_version == FULLMAG_FDM_DIRECT_MINIMIZER_ABI_V1 &&
+        status->struct_size == sizeof(*status);
+}
+
+void publish_direct_minimizer_status(
+    const fullmag_fdm_direct_minimizer_status_v1 &status,
+    fullmag_fdm_direct_minimizer_status_v1 *out_status)
+{
+    *out_status = status;
+    out_status->abi_version = FULLMAG_FDM_DIRECT_MINIMIZER_ABI_V1;
+    out_status->struct_size = sizeof(*out_status);
+}
+
+} // namespace
+
+int fullmag_fdm_backend_configure_direct_minimizer_v1(
+    fullmag_fdm_backend *handle,
+    const fullmag_fdm_direct_minimizer_config_v1 *config)
+{
+#if FULLMAG_HAS_CUDA
+    if (handle == nullptr || config == nullptr) return FULLMAG_FDM_ERR_INVALID;
+    auto *ctx = reinterpret_cast<Context *>(handle);
+    if (reject_step_transaction_mutation(*ctx, "configure_direct_minimizer")) {
+        return FULLMAG_FDM_ERR_INVALID;
+    }
+    ctx->last_error.clear();
+    return direct_minimizer_configure(*ctx, *config);
+#else
+    (void)handle;
+    (void)config;
+    return FULLMAG_FDM_ERR_CUDA;
+#endif
+}
+
+int fullmag_fdm_backend_direct_minimizer_begin_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_step_stats *out_stats,
+    fullmag_fdm_direct_minimizer_status_v1 *out_status)
+{
+#if FULLMAG_HAS_CUDA
+    if (handle == nullptr || out_stats == nullptr) return FULLMAG_FDM_ERR_INVALID;
+    if (!direct_minimizer_status_header_valid(out_status)) return FULLMAG_FDM_ERR_ABI;
+    auto *ctx = reinterpret_cast<Context *>(handle);
+    if (reject_step_transaction_mutation(*ctx, "direct_minimizer_begin")) {
+        return FULLMAG_FDM_ERR_INVALID;
+    }
+    ctx->last_error.clear();
+    fullmag_fdm_step_stats stats{};
+    fullmag_fdm_direct_minimizer_status_v1 status{};
+    const int rc = direct_minimizer_begin(*ctx, stats, status);
+    if (rc != FULLMAG_FDM_OK) return rc;
+    *out_stats = stats;
+    publish_direct_minimizer_status(status, out_status);
+    return FULLMAG_FDM_OK;
+#else
+    (void)handle;
+    (void)out_stats;
+    (void)out_status;
+    return FULLMAG_FDM_ERR_CUDA;
+#endif
+}
+
+int fullmag_fdm_backend_direct_minimizer_step_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_step_stats *out_stats,
+    fullmag_fdm_direct_minimizer_status_v1 *out_status)
+{
+#if FULLMAG_HAS_CUDA
+    if (handle == nullptr || out_stats == nullptr) return FULLMAG_FDM_ERR_INVALID;
+    if (!direct_minimizer_status_header_valid(out_status)) return FULLMAG_FDM_ERR_ABI;
+    auto *ctx = reinterpret_cast<Context *>(handle);
+    // Same receipt boundary as fullmag_fdm_backend_step: one accepted
+    // minimizer step is one solver-phase attempt.
+    GpuWorkspaceStepAccountingGuard workspace_step_accounting(*ctx);
+    ctx->last_error.clear();
+    ctx->step_interrupted = false;
+    fullmag_fdm_reset_hot_loop_audit(*ctx);
+    context_begin_endpoint_step_accounting(*ctx);
+    ReceiptSolverPhaseGuard receipt_solver_phase(*ctx);
+    fullmag_fdm_step_stats stats{};
+    fullmag_fdm_direct_minimizer_status_v1 status{};
+    const int rc = direct_minimizer_step(*ctx, stats, status);
+    if (rc != FULLMAG_FDM_OK) {
+        context_reject_staged_step(*ctx);
+        context_invalidate_observables(*ctx);
+        return rc;
+    }
+    if (status.status == FULLMAG_FDM_DIRECT_MINIMIZER_ACCEPTED) {
+        if (!context_complete_solver_receipt_attempt(
+                *ctx, "cudaStreamSynchronize(direct minimizer receipt attempt)")) {
+            context_reject_staged_step(*ctx);
+            context_invalidate_observables(*ctx);
+            return FULLMAG_FDM_ERR_CUDA;
+        }
+        context_commit_accepted_step(*ctx);
+        fullmag_fdm_publish_hot_loop_audit(*ctx, &stats);
+        fullmag_fdm_note_operator_device_execution(
+            *ctx, FULLMAG_FDM_OPERATOR_DIRECT_MINIMIZER);
+        receipt_solver_phase.commit();
+        if (fullmag_fdm_should_fill_step_stats(*ctx)) {
+            context_publish_endpoint_fields(*ctx, OBSERVABLE_ENDPOINT_CORE_FIELDS);
+            context_publish_endpoint_stats(*ctx, stats);
+        }
+    }
+    context_finish_endpoint_step_accounting(*ctx);
+    *out_stats = stats;
+    publish_direct_minimizer_status(status, out_status);
+    return FULLMAG_FDM_OK;
+#else
+    (void)handle;
+    (void)out_stats;
+    (void)out_status;
+    return FULLMAG_FDM_ERR_CUDA;
+#endif
+}
+
 int fullmag_fdm_backend_copy_adaptive_attempts_v1(
     fullmag_fdm_backend *handle,
     fullmag_fdm_adaptive_attempt_v1 *out_attempts,

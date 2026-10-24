@@ -237,7 +237,7 @@ fn generate_execution_receipt_value_assertions() {
         operator_location_count, 5,
         "operator location value count drift"
     );
-    assert_eq!(operator_mask_count, 19, "operator mask value count drift");
+    assert_eq!(operator_mask_count, 20, "operator mask value count drift");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     std::fs::write(
         out_dir.join("execution_receipt_v1_value_assertions.rs"),

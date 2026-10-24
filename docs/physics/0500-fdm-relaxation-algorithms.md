@@ -377,15 +377,20 @@ Barzilai–Borwein (BB) method [Barzilai & Borwein, 1988].
     - BB1 requires $\langle \boldsymbol{s}, \boldsymbol{y} \rangle > 0$;
     - BB2 requires $\langle \boldsymbol{s}, \boldsymbol{y} \rangle \cdot \langle \boldsymbol{y}, \boldsymbol{y} \rangle > 0$.
 
-    If the preferred BB formula fails its sign check, the other is tried as
-    fallback.  If both fail, a **reset mechanism** (following Boris) activates:
-    the step counter $k_{\mathrm{reset}}$ is incremented and the step is set to
+    On a BB2 iteration whose BB2 sign check fails, BB1 is tried as fallback
+    when $\langle \boldsymbol{s}, \boldsymbol{y} \rangle > 0$. A BB1 iteration
+    has no BB2 fallback. If no formula applies, a **reset mechanism** (following
+    Boris) activates: the counter $k_{\mathrm{reset}}$ is incremented and the
+    step is set to
 
     $$
-    \lambda = \min(k_{\mathrm{reset}} \cdot \lambda_{\min},\; \lambda_{\max}).
+    \lambda = \operatorname{clamp}\!\left(\frac{\lambda_0}{k_{\mathrm{reset}} + 1},
+    \lambda_{\min}, \lambda_{\max}\right), \qquad \lambda_0 = 10^{-6}.
     $$
 
-    The counter resets to zero after the next successful BB computation.
+    The counter resets to zero after the next successful BB computation. The
+    BB1/BB2 alternation flips after every accepted step, whether or not the
+    preferred formula applied.
 
     All BB step sizes are clamped to $[\lambda_{\min}, \lambda_{\max}] = [10^{-15}, 10^{-3}]$.
 
@@ -556,12 +561,42 @@ All FDM relaxation algorithms reuse the same GPU kernels for:
 - energy reduction,
 - torque reduction.
 
-Additional GPU operations needed for BB/NCG:
+**Device-resident CUDA projected-gradient BB (2026-10-24).** The CUDA FDM
+realization of §3.1.2 keeps every vector of the iteration on the device and
+crosses to the host only with control scalars, so strict FDM GPU execution can
+prove its residency. One native call performs one accepted PG-BB step:
 
-- tangent-gradient kernel ($g_i = -P_{m_i} H_{\mathrm{eff},i}$),
-- BB scalar reductions ($\langle s, s \rangle$, $\langle s, y \rangle$, $\langle y, y \rangle$),
-- line-search energy evaluation,
-- NCG direction update and vector transport.
+1. $\boldsymbol{m}_n$, $\boldsymbol{H}_n = \boldsymbol{H}_{\mathrm{eff}}(\boldsymbol{m}_n)$ and
+   $\boldsymbol{g}_n = -P_{\boldsymbol{m}_n}\boldsymbol{H}_n$ are held in device buffers
+   from the previous accepted step (recomputed after any external state change).
+2. Trial retraction kernel: $\boldsymbol{m}_t = \operatorname{normalize}(\boldsymbol{m}_n - \lambda \boldsymbol{g}_n)$
+   per active cell, in the storage precision; inactive cells are zero. A cell whose
+   unnormalized vector is non-finite or has $|\cdot|^2 \le$ `DBL_MIN` raises a device
+   flag and the trial backtracks without an energy evaluation, as on the host.
+3. The ordinary field and energy kernels evaluate $\boldsymbol{H}_t$ and $E_t$ at the
+   stored trial state.
+4. The chord increment $\Delta E = -\langle \boldsymbol{H}_n, \boldsymbol{m}_t - \boldsymbol{m}_n \rangle_E$
+   is a device reduction over the stored trial, so in single precision it measures
+   the chord to the representable FP32 trial actually evaluated.
+5. The Armijo test of §3.1.2 (same $c_1$, tolerance and 20-backtrack limit, step
+   halving) is decided natively from these scalars. An exhausted line search
+   restores $\boldsymbol{m}_n$ and reports the failure without accepting a step.
+6. After acceptance, a tangent-gradient kernel forms $\boldsymbol{g}_t$, and one fused
+   pass reduces $\langle s,s\rangle$, $\langle s,y\rangle$, $\langle y,y\rangle$ with
+   $\boldsymbol{s} = P_{\boldsymbol{m}_t}(\boldsymbol{m}_t - \boldsymbol{m}_n)$ and
+   $\boldsymbol{y} = \boldsymbol{g}_t - P_{\boldsymbol{m}_t}\boldsymbol{g}_n$; the BB rule above
+   sets the next $\lambda$.
+
+Energy-metric products use $w_i = \mu_0 M_s \phi_i V_{\mathrm{cell}}$, the same per-cell
+volume weighting $\phi_i$ as the energy reductions (for full cells $\phi_i = 1$, which
+equals the host metric). Pointwise arithmetic uses the storage precision and every
+sum or maximum accumulates in FP64, as the precision policy requires. Physical time
+does not advance. The receipt records the step under its own operator,
+`DIRECT_MINIMIZER`, which replaces `LLG_INTEGRATOR` in the required operator set of
+a minimizer backend; its scalar reads count as control-scalar synchronizations.
+
+Not covered by this realization: nonlinear CG (still host-orchestrated, so strict
+GPU mode rejects it), frozen spins and multilayer plans.
 
 The dominant cost remains the demagnetization FFT, so algorithms that require
 fewer trial evaluations (NCG > BB > overdamped LLG) are preferred at scale.
