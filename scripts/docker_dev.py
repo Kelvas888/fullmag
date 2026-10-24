@@ -2504,6 +2504,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=_repo_default(),
                         help="main Fullmag checkout used for storage and Compose definitions")
     subparsers = parser.add_subparsers(dest="action", required=True)
+    empty_quarantine = subparsers.add_parser(
+        "quarantine-empty-stopped",
+        help="quarantine one empty session after an abrupt stop; preserve old evidence and never replay activation",
+    )
+    empty_quarantine.add_argument("--source-root", type=Path, required=True)
+    empty_quarantine.add_argument("--activation", required=True)
+    empty_quarantine.add_argument("--recovery-id", required=True)
+    empty_quarantine.add_argument("--apply", action="store_true", help="commit after exact stopped-namespace and empty-store proofs; default is dry-run")
     resume_parser = subparsers.add_parser("resume-volume", help="Observe one exact retained volume DEV start without restarting backend")
     resume_parser.add_argument("--attempt", required=True)
     resume_parser.add_argument("--config-sha256", required=True)
@@ -2905,6 +2913,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "recover-cancelled-volume":
             from docker_volume_cancelled_recovery import recover_cancelled
             recover_cancelled(args)
+        elif args.action == "quarantine-empty-stopped":
+            from docker_volume_empty_quarantine import quarantine
+            quarantine(args)
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)

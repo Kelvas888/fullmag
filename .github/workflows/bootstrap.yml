@@ -795,6 +795,7 @@ jobs:
           python -B scripts/test_docker_build_control_cache_admission.py -v
           python -B scripts/test_docker_container_runtime_recovery.py -v
           python -B scripts/test_docker_volume_container_recovery.py -v
+          python -B scripts/test_docker_volume_empty_quarantine.py -v
           python -B scripts/test_docker_volume_dev_runtime_state.py -v
           python -B scripts/test_docker_volume_dev_cancelled_activation.py -v
           python -B scripts/test_docker_volume_readiness_receipt.py -v

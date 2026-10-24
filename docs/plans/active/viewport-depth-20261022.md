@@ -95,3 +95,47 @@ wireframe geometrii przed zbudowaniem siatki, bez zmiany fizyki i solver mesh.
 - Odczyt Docker: daemon niedostępny; WebGL NOT VERIFIED.
 - Master ae8e570f2aa9655cb9fd8321c716b8d49a87e084 nadal ma starą politykę near/far; poprawki nie są zintegrowane.
 - Zachować worktree i zasoby, wznowić odbiór po ustąpieniu blokad.
+
+## Rozszerzenie zatwierdzone przez użytkownika: odzyskanie pustego namespace
+
+Polecenie „no to zrob co trzeba” obejmuje usunięcie blokady runtime przed
+odbieraniem obrazu. Nie obejmuje danych ani usług innych grup.
+
+Dowody: dokładna para usług zadania jest stopped/Pid0/exit255 po przerwaniu
+Dockera; helper aktywacji nie istnieje. Sesja zawiera jedynie WRITER.lock,
+WRITER.owner.json i dwa deskryptory scheduler_pools. Brak RunIntent, katalogu
+runu i wyników. Grupowy ledger v4 ma reservations=[]. Owner i process-tree
+pozostają ready; nie są dowodem działających procesów ani terminalnego drain.
+
+Wybrana ścieżka: nowy, jawny tryb zarządzanej kwarantanny pustej sesji,
+wykorzystujący istniejący rejestr namespace i ten sam inode operation.lock.
+Nie udajemy managed native stopu i nie wpisujemy stanu failed/drained do
+starego ownera. Nie usuwamy aktywnego markera ani starego receipt. Zwykłe
+resume pozostaje fail-closed. Obecna kwarantanna przyjętego/anulowanego runu
+nie pasuje; rozszerzenie dotyczy tylko pustego store i pustego ledgera.
+
+Warunki i kolejność:
+1. Dry-run przypina checkout/projekt, attempt/config/image, dokładne ID
+   backendu i frontendu, timestamps, prywatny PID namespace, mounty/etykiety,
+   nieobecność dokładnego helpera i brak cudzych żywych konsumentów.
+2. Dopuszczalny store ma zamkniętą allowlistę technicznych plików, bez runów,
+   obiektów, aktywnych zadań lub wyników. Ledger musi mieć pustą listę
+   rezerwacji, a kontenery korzystać wyłącznie z grupowego ledgera.
+3. Jeden ograniczony helper bez sieci/socketu i bez zapisu do hosta trzyma
+   operation.lock oraz dotychczasowe locki ownera, launchera, store i ledgera.
+   Ponownie sprawdza control pins, snapshot store i pusty ledger.
+4. Trwały intent z inspekcjami pary powstaje przed usuwaniem kontenerów.
+   Host ponownie sprawdza inkarnacje i konsumentów pod blokadami, usuwa
+   tylko dwa zatrzymane kontenery, bez force. Awaria po częściowym usunięciu
+   wymaga tego samego intentu i autorytatywnego dowodu nieobecności ID.
+5. Po ponownej kontroli helper atomowo publikuje niezmienny receipt oraz
+   rejestr świeżego namespace. Stare control/state/ledger pozostają w miejscu.
+   Stary request_id nie może być odtworzony. Nowy namespace wybiera nowy
+   klucz ledgera grupy po recovery_id, zachowując oba stare wolumeny.
+6. Normalny launcher buduje/startuje dwie usługi tej samej grupy. Nowe
+   żądanie fixture oczekuje na Compute. Bez automatycznego Solve.
+
+Weryfikacja: interpretowane regresje fail-closed (bez kompilacji unit tests),
+review kontraktu, rzeczywisty dry-run/apply, zachowane hashe i receipty,
+readiness nowego API, test WebGL ringu i Primitive→mesh. Standardowe CI PR252
+jest dozwolone. Dopiero potem merge i dokładny cleanup zadania.
