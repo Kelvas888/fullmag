@@ -55,6 +55,11 @@ BROWSER_IMAGE_RE = re.compile(
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_RESULT_BYTES = 2 * 1024 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DESKTOP_WSL_BIND_ALIAS_RE = re.compile(
+    r"^/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+    r"([A-Za-z0-9][A-Za-z0-9._-]*)/([0-9a-f]{64})$"
+)
+LOCAL_WSL_BIND_MOUNT_ROOT = Path("/mnt/wsl/docker-desktop-bind-mounts")
 
 
 def _text(value: bytes, limit: int = 4096) -> str:
@@ -112,6 +117,38 @@ def _mount_path(value: object) -> str | None:
         return None
     from docker_volume_activate import _canonical_host_path
     return _canonical_host_path(value) or None
+
+
+def _source_mount_matches_selected(value: object, expected: Path) -> bool:
+    """Match the selected source path, proving Desktop WSL aliases by inode."""
+    observed = _mount_path(value)
+    expected_key = _mount_path(expected)
+    if not observed or not expected_key:
+        return False
+    if observed == expected_key:
+        return True
+
+    # Docker Desktop exposes WSL bind mounts through an opaque daemon path. Only
+    # accept its exact alias form, then prove it names the selected local dir.
+    # Match the raw source so normpath cannot erase traversal or extra segments.
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if not isinstance(value, str):
+        return False
+    match = DESKTOP_WSL_BIND_ALIAS_RE.fullmatch(value)
+    if match is None:
+        return False
+    distro, token = match.groups()
+    local_alias = LOCAL_WSL_BIND_MOUNT_ROOT / distro / token
+    expected_path = Path(expected_key)
+    try:
+        return (
+            local_alias.is_dir()
+            and expected_path.is_dir()
+            and local_alias.samefile(expected_path)
+        )
+    except OSError:
+        return False
 
 
 def _validate_frontend_volume(
@@ -729,10 +766,11 @@ def _validate_browser_helper(
     if state_mount.get("Type") != "volume" or state_mount.get("Name") != frontend_volume:
         raise ControlOutcomeUnknown("Browser helper state volume differs")
     script_mount = next(m for m in mounts if m.get("Destination") == "/state/development/workspace/apps/control-room/scripts")
-    expected_script_source = _mount_path(selected / "apps/control-room/scripts")
     if (
         script_mount.get("Type") != "bind"
-        or _mount_path(script_mount.get("Source")) != expected_script_source
+        or not _source_mount_matches_selected(
+            script_mount.get("Source"), selected / "apps/control-room/scripts"
+        )
     ):
         raise ControlOutcomeUnknown("Browser helper script is not a readonly selected-source bind")
 
