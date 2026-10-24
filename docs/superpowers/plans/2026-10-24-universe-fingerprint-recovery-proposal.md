@@ -203,3 +203,66 @@ odrębnego, przypiętego requestu/preflight do decyzji użytkownika. Zgoda na a6
 nie obejmuje zmiany nowego Running task 8d181… . Numerykę trzeba zbadać przed
 proponowaniem większego limitu; samo jego zwiększenie nie dowodzi zbieżności.
 Dowód pełnego bieżącego logu zachowano jako approved-new-solve/failed-compute-log.json.
+
+
+## Nowy request po awarii 8d181 — gotowy do decyzji
+
+### Odzyskanie po nieudanym Universe Solve 8d181 — decyzja operatora
+
+Status: request przygotowany; rzeczywisty native verify-only PASS. Apply,
+zwolnienie zasobów i restart NIE zostały wykonane. Nie ma wyniku H Universe.
+
+#### Dokładny zakres
+
+Run: run-live-8d181b0e7ac898ebbc0cb6e8b6a7b958219a6f8ccea0943e7e5d5704824bb331.
+Task: task-3151e003704f28bd5eabf7936ee5248af7446c9150d261a8c2301c057c476cc0.
+Attempt: attempt-7c35a45efffb4389ad7435ef83ebbd98; ownership epoch 1.
+Katalog pozostaje Running/reconciling rev52, bez opublikowanych artefaktów.
+Worker zakończył się exit1 po final_leaf_budget_exceeded. API i runtime
+zostały zakończone przez nadzorcę; nie działają żadne obliczenia tej próby.
+
+Request: request.json w tym katalogu.
+SHA256: 550a170177411ff23c2996ca5be7de19899e6e69f35d43462b90529059ec328d.
+Request zawiera wrażliwe tożsamości procesu; jego treści nie publikujemy.
+
+#### Zmiany po zgodzie
+
+1. Ponownie sprawdzić dokładne piny i wykonać istniejący native preflight.
+2. Zastosować wyłącznie przypięty --fail-reaped-worker: kanoniczny Failed,
+   nieretrywalny event, DoNotRetry, zwolnienie wyłącznie tej rezerwacji CPU,
+   archiwizacja przypiętego slotu. Zachować exit receipt, journal, inbox,
+   przygotowanie, CAS i całą historię. Bez ręcznej edycji katalogu/ledgera.
+3. Potwierdzić końcowe receipty, brak aktywnego lease i zachowanie danych.
+4. Przywrócić wyłącznie naszą grupę 3203 przez managed just stop-failed i
+   recreate/resume z zachowaniem state/cache (fresh_state=false), wraz z
+   potrzebnym buildem w jej stałym backendzie. Przywrócić ten sam model
+   authoring przez publiczne API. Nie zatrzymywać cudzych grup ani WSL/Dockera.
+5. Nie ponawiać Solve, nie zwiększać limitów całkowania ani CPU/RAM, nie
+   zmieniać tolerancji. Diagnostyka numeryczna pozostaje osobnym zadaniem.
+
+Zmiana któregokolwiek pina, nowy proces lub niejednoznaczny wynik przerywa
+procedurę. Unknown nie oznacza zgody na ponowienie. Nie cofamy Failed ani
+DoNotRetry. Sam restart nie będzie przedstawiany jako poprawne obliczenie H.
+
+#### Dowody
+
+verify-only.stdout: verified_reaped_worker_failure; mutations_applied=false,
+solve_replayed=false; exit0, stderr puste. Natywna kontrola sprawdziła tożsamości
+hosta/boot/PID, Failed OWNER, dokładne Start i exit, lease/rezerwację, journal
+24 komendy / 23 zdarzenia, pojedynczy niepotwierdzony ogon heartbeat, brak
+pending effect oraz archiwizowalność przypiętego slotu. Jest to odrębna,
+niesymulacyjna kontrola istniejącego CLI wewnątrz własnego backendu; nie bramka
+FEM ani nowy Solve. Nie ma receptury just dla tego read-only CLI.
+
+Po preview ponownie sprawdzono: 70 historycznych plików, pięć katalogów, FMS
+identyczne; nowy Run nadal bez zmian rev52. Tryb verify-only może aktualizować
+diagnostyczne WRITER.owner.json przy blokadach; nie zmienia biznesowego stanu
+Run, rezerwacji ani retry. Testów Rust nie kompilowano.
+
+#### Dlaczego nowa zgoda
+
+Poprzednia decyzja wskazywała a642… i jeden zastępczy Solve. Nie obejmowała
+terminalizacji nowego Running task 8d181… . AGENTS.md przekazany w rozmowie,
+§8, wymaga decyzji przy zmianie elementu load-bearing lub wersjonowanego.
+Zgoda dotyczy wyłącznie opisanej terminalizacji i przywrócenia naszej grupy,
+bez następnego obliczenia i bez zmiany polityki numerycznej.
