@@ -1823,6 +1823,13 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
         document["study"]["fdm"] = copy.deepcopy(builder.get("fdm"))
     document["study"].update(_execution_profile_fields(builder, "builder"))
     document["study"].update(_compute_resources_fields(builder, "builder"))
+    visualization_hint = builder.get("visualization_hint")
+    if isinstance(visualization_hint, Mapping):
+        airbox_hint = visualization_hint.get("airbox")
+        if airbox_hint is not None:
+            document["study"]["visualization_hint"] = {
+                "airbox": copy.deepcopy(airbox_hint)
+            }
     if "spin_torques" in builder:
         document["spin_torques"] = _canonical_spin_torques(
             builder["spin_torques"], scene_ids=True
@@ -2479,6 +2486,26 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
         "excitation_analysis": builder.get("excitation_analysis"),
     }
     raw_study = scene.get("study")
+    if isinstance(raw_study, Mapping) and "visualization_hint" in raw_study:
+        visualization_hint = raw_study.get("visualization_hint")
+        if visualization_hint is not None:
+            if not isinstance(visualization_hint, Mapping):
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint must be an object"
+                )
+            unsupported_visualization_fields = sorted(
+                str(name)
+                for name in set(visualization_hint) - {"airbox"}
+            )
+            if unsupported_visualization_fields:
+                names = ", ".join(unsupported_visualization_fields)
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint has unsupported fields: "
+                    f"{names}"
+                )
+            overrides["visualization_hint"] = copy.deepcopy(
+                dict(visualization_hint)
+            )
     if isinstance(raw_study, Mapping) and "pbc" in raw_study:
         # Missing is no override; explicit null intentionally clears PBC.
         overrides["pbc"] = copy.deepcopy(builder["pbc"])

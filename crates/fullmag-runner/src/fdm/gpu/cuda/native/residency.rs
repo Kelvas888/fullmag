@@ -135,21 +135,27 @@ impl FdmGpuReceiptLifecycle {
         artifacts: Option<&mut crate::artifact_pipeline::ArtifactRecorder>,
         outcome: Result<T, RunError>,
     ) -> Result<T, RunError> {
-        let receipt_result = backend
-            .execution_receipt(&self.requested_device, self.execution_mode)
-            .and_then(|mut receipt| {
-                if outcome.is_ok() && self.execution_mode == fullmag_ir::ExecutionMode::Strict {
-                    validate_strict_final_receipt(&receipt)?;
+        let mut receipt_result =
+            backend.execution_receipt(&self.requested_device, self.execution_mode);
+        // Keep the queried native accounting when final validation fails.
+        // Replacing it with a synthetic empty receipt hides the missing
+        // operator that caused the strict rejection.
+        let validation_result = match receipt_result.as_mut() {
+            Ok(receipt)
+                if outcome.is_ok() && self.execution_mode == fullmag_ir::ExecutionMode::Strict =>
+            {
+                validate_strict_final_receipt(receipt).map(|()| {
                     receipt.validation_state = "validated".to_string();
-                }
-                Ok(receipt)
-            });
+                })
+            }
+            _ => Ok(()),
+        };
         let telemetry_result = query_step_transaction_telemetry(backend);
         if let Ok(telemetry) = &telemetry_result {
             provenance.fdm_gpu_step_transaction_telemetry = Some(telemetry.clone());
         }
         let outcome = match outcome {
-            Ok(value) => telemetry_result.map(|_| value),
+            Ok(value) => telemetry_result.and_then(|_| validation_result.map(|_| value)),
             Err(primary) => Err(primary),
         };
         finalize_receipt_result(receipt_result, provenance, artifacts, outcome)
@@ -231,7 +237,15 @@ pub(crate) fn validate_strict_final_receipt(
         || receipt.executed_unknown_operator_mask != 0
     {
         return Err(RunError {
-            message: "strict FDM GPU final execution is not fully device-proven".to_string(),
+            message: format!(
+                "strict FDM GPU final execution is not fully device-proven: executed={} required={:#x} executed_device={:#x} executed_host={:#x} executed_unknown={:#x} missing_device={:#x}",
+                receipt.executed,
+                receipt.required_operator_mask,
+                receipt.executed_device_operator_mask,
+                receipt.executed_host_operator_mask,
+                receipt.executed_unknown_operator_mask,
+                receipt.required_operator_mask & !receipt.executed_device_operator_mask,
+            ),
         });
     }
     let counts = &receipt.transfer_counts;

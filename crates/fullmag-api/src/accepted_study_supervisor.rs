@@ -2320,7 +2320,7 @@ fn worker_failure_reason(outcome: &ObservedWorkerProcess) -> String {
         .unwrap_or(stderr.as_ref());
     let normalized = failure.split_whitespace().collect::<Vec<_>>().join(" ");
     let detail = if normalized.is_empty() {
-        format!("exit code {:?}", output.status.code())
+        "no worker error output".to_string()
     } else {
         // Prefer the worker's own error report; diagnostic progress lines
         // printed around it must not hide the failure. Otherwise keep the tail.
@@ -2335,7 +2335,9 @@ fn worker_failure_reason(outcome: &ObservedWorkerProcess) -> String {
             if start > 0 { format!("...{tail}") } else { tail }
         }
     };
-    format!("accepted worker process failed: {detail}")
+    // ExitStatus also preserves a Unix signal (where code() is None).
+    // Stderr can contain only successful startup diagnostics after a crash.
+    format!("accepted worker process failed ({}): {detail}", output.status)
 }
 
 fn commit_worker_command(

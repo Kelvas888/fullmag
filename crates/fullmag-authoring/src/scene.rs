@@ -895,6 +895,10 @@ pub struct SceneStudyState {
     pub execution_layers: Vec<fullmag_ir::ExecutionRequestLayerIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_state: Option<ScriptBuilderInitialState>,
+    /// Study-level presentation hint authored by the Python DSL. This is kept
+    /// with the scene for initial viewport defaults and is not solver input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visualization_hint: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]

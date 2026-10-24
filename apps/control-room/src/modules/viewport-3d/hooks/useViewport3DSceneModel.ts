@@ -4216,16 +4216,16 @@ export function useViewport3DSceneModel({
       resolveTargetVisualization({
         snapshot: objectVisualizationSnapshot,
         target: AIRBOX_VISUALIZATION_TARGET,
-        visualizationState: femLaneActive ? renderingState : null,
+        visualizationState: renderingState,
       }).effectiveSettings,
-    [femLaneActive, objectVisualizationSnapshot, renderingState],
+    [objectVisualizationSnapshot, renderingState],
   );
   // Airbox is the public display target for both FDM paths.  The structured
   // outside-support id remains a carrier/query scope only; it must not own a
   // second set of display toggles.  A published multilayer Airbox uses its
   // target-only carrier, while legacy single-grid rendering uses these same
   // canonical settings for its inactive-cell model.
-  const fdmSingleGridAirboxSettings = fdmMultilayerAirboxDomain
+  const fdmSingleGridAirboxSettings = fdmMultilayerLayout.data?.available
     ? null
     : airboxSettings;
   const fdmVectorScale = fdmDomain

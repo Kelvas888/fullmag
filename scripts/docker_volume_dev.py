@@ -2361,22 +2361,262 @@ def _assert_private_restart_network(actual, ids, project):
         raise BuildControlError("Idle restart bridge has unknown consumers; no backend will be stopped")
 
 
-def _terminal_session_restart_probe(backend_id, *, allow_prepared=False):
-    """Allow drain after a terminal task or an explicitly allowed prepared Study.
+def _terminal_session_restart_probe(backend_id, *, allow_prepared=False, startup_enabled=False):
+    """Allow drain after a terminal task or an exact pre-acceptance failure.
 
     Called only with the private frontend stopped and the group control lease
     held. This is admission to graceful drain, not proof of process absence:
     the existing native drain receipt remains mandatory before restart.
     """
-    script = 'ALLOW_PREPARED = ' + repr(bool(allow_prepared)) + '\n' + r'''import hashlib,json,os,re,stat,urllib.error,urllib.request
+    script = ('ALLOW_PREPARED = ' + repr(bool(allow_prepared)) + '\n'
+        + 'STARTUP_ENABLED = ' + repr(bool(startup_enabled)) + '\n' + r'''import hashlib,json,os,re,stat,urllib.error,urllib.request
 MAX=1024*1024
+MAX_STARTUP_RECEIPT=2*MAX
+MAX_STARTUP_MARKERS=256
+MAX_CONTROL_ENTRIES=4096
 instance=None
+last_current_run_not_found=None
 def unique_object(pairs):
     result={}
     for key,value in pairs:
         if key in result: raise RuntimeError("restart record has duplicate JSON keys")
         result[key]=value
     return result
+def read_startup_marker(key):
+    root="/opt/fullmag/control/backend"
+    if os.path.realpath(root)!=root:
+        raise RuntimeError("startup receipt root is not canonical")
+    flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK
+    root_fd=os.open(root,flags|os.O_DIRECTORY)
+    try:
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise RuntimeError("startup receipt root is not a directory")
+        marker_dir=os.open("script-activation-"+key,flags|os.O_DIRECTORY,dir_fd=root_fd)
+        try:
+            fd=os.open("activation.json",flags,dir_fd=marker_dir)
+            with os.fdopen(fd,"rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise RuntimeError("startup activation receipt is not a regular file")
+                raw=source.read(MAX_STARTUP_RECEIPT+1)
+            if len(raw)>MAX_STARTUP_RECEIPT:
+                raise RuntimeError("startup activation receipt exceeds its bound")
+        finally: os.close(marker_dir)
+    finally: os.close(root_fd)
+    value=json.loads(raw,object_pairs_hook=unique_object)
+    if not isinstance(value,dict): raise RuntimeError("startup activation receipt is invalid")
+    return raw,value
+def rejected_startup_marker(status,identity):
+    session=status.get("session") or {}
+    script=session.get("script") or {}
+    script_path=script.get("path")
+    if not isinstance(script_path,str) or not script_path:
+        raise RuntimeError("startup_failed session has no public script path")
+    configured_key=os.environ.get("FULLMAG_STARTUP_RECEIPT_KEY") if STARTUP_ENABLED else None
+    if STARTUP_ENABLED and (not isinstance(configured_key,str)
+            or re.fullmatch(r"[0-9a-f]{64}",configured_key) is None
+            or os.environ.get("FULLMAG_STARTUP_SCRIPT")!=script_path):
+        raise RuntimeError("configured startup activation does not bind the current script")
+    root="/opt/fullmag/control/backend"
+    if os.path.realpath(root)!=root:
+        raise RuntimeError("startup receipt root is not canonical")
+    flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_DIRECTORY
+    root_fd=os.open(root,flags)
+    try:
+        names=sorted(os.listdir(root_fd))
+        if len(names)>MAX_CONTROL_ENTRIES:
+            raise RuntimeError("startup receipt namespace exceeds its entry bound")
+        keys=[]
+        for name in names:
+            match=re.fullmatch(r"script-activation-([0-9a-f]{64})",name)
+            if match:
+                keys.append(match.group(1))
+        if len(keys)>MAX_STARTUP_MARKERS:
+            raise RuntimeError("startup receipt namespace exceeds its marker bound")
+    finally: os.close(root_fd)
+    if STARTUP_ENABLED:
+        keys=[key for key in keys if key==configured_key]
+    matches=[]
+    for key in keys:
+        try: raw,marker=read_startup_marker(key)
+        except (FileNotFoundError,PermissionError,NotADirectoryError,OSError,RuntimeError,json.JSONDecodeError,UnicodeDecodeError):
+            continue
+        request_id=marker.get("request_id")
+        source_sha=marker.get("source_sha256")
+        if (not isinstance(request_id,str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",request_id) is None
+                or not isinstance(source_sha,str)
+                or re.fullmatch(r"[0-9a-f]{64}",source_sha) is None):
+            continue
+        expected_session="docker-startup-"+hashlib.sha256(
+            (request_id+"\0"+source_sha).encode("utf-8")).hexdigest()
+        if expected_session!=identity[0]: continue
+        authorization=marker.get("authorization")
+        if not isinstance(authorization,dict):
+            raise RuntimeError("startup activation receipt has no authorization")
+        if (hashlib.sha256(request_id.encode("utf-8")).hexdigest()!=key
+                or marker.get("schema")!="fullmag.docker-startup-activation-receipt.v1"
+                or marker.get("state")!="rejected"
+                or set(marker)!={"schema","state","request_id","provenance_sha256","source_sha256","authorization","result"
+                }
+                or marker.get("request_id")!=request_id
+                or marker.get("source_sha256")!=source_sha
+                or re.fullmatch(r"[0-9a-f]{64}",marker.get("provenance_sha256","")) is None):
+            raise RuntimeError("current session is not bound to a rejected startup receipt")
+        relative=authorization.get("source_relative")
+        if (set(authorization)!={"schema","authorization","source_root","source_path","source_relative","source_sha256","source_size_bytes","source_commit","container_source_root","container_script_path","request_id","execution_policy"}
+                or authorization.get("schema")!="fullmag.docker-startup-script.v1"
+                or authorization.get("authorization")!="explicit_startup_script"
+                or authorization.get("request_id")!=request_id
+                or authorization.get("source_sha256")!=source_sha
+                or authorization.get("container_source_root")!="/opt/fullmag/source"
+                or not isinstance(relative,str) or not relative.lower().endswith(".py")
+                or relative.startswith("/") or "\\" in relative or "\x00" in relative
+                or any(not part or part in {".",".."} for part in relative.split("/"))
+                or authorization.get("container_script_path")!="/opt/fullmag/source/"+relative
+                or authorization.get("source_size_bytes") is None
+                or isinstance(authorization.get("source_size_bytes"),bool)
+                or not isinstance(authorization.get("source_size_bytes"),int)
+                or not 0<=authorization["source_size_bytes"]<=MAX
+                or (authorization.get("source_commit") is not None
+                    and re.fullmatch(r"[0-9a-f]{40}",authorization.get("source_commit","")) is None)
+                or authorization.get("source_path") is None or authorization.get("source_root") is None
+                or authorization.get("container_script_path")!=script_path):
+            raise RuntimeError("startup authorization differs from the current session source")
+        if STARTUP_ENABLED and (key!=configured_key
+                or os.environ.get("FULLMAG_STARTUP_PROVENANCE_SHA256")!=marker.get("provenance_sha256")):
+            raise RuntimeError("configured startup receipt/provenance differs from its rejected marker")
+        policy={"mode":"canonical_live_v2","auto_study":True,"interactive":"script_metadata","wait_for_solve":"script_metadata","legacy_cli":False}
+        if authorization.get("execution_policy")!=policy:
+            raise RuntimeError("startup authorization execution policy differs")
+        result=marker.get("result")
+        if (not isinstance(result,dict)
+                or set(result)!={"schema","state","request_id","source_sha256","source_relative","rejection"}
+                or result.get("schema")!="fullmag.startup-script-activation.v1"
+                or result.get("state")!="rejected"
+                or result.get("request_id")!=request_id
+                or result.get("source_sha256")!=source_sha
+                or result.get("source_relative")!=relative):
+            raise RuntimeError("startup activation rejection result differs from its receipt")
+        rejection=result.get("rejection")
+        rejection_codes={"bad_request","validation_error","unprocessable_entity","unsupported_capability","accepted_execution_command_unsupported","accepted_study_plan_invalid","accepted_execution_stage_missing","accepted_gpu_scope_unsupported","accepted_execution_plan_invalid","accepted_backend_unsupported","accepted_study_step_unsupported","accepted_study_step_ambiguous","docker_startup_output_mapping_required","docker_startup_output_mapping_invalid"}
+        if (not isinstance(rejection,dict)
+                or set(rejection)!={"http_status","code","message"}
+                or type(rejection.get("http_status")) is not int
+                or rejection["http_status"] not in {400,422}
+                or rejection.get("code") not in rejection_codes
+                or not isinstance(rejection.get("message"),str)
+                or not rejection["message"].strip() or len(rejection["message"])>2048):
+            raise RuntimeError("startup activation rejection is not a known pre-acceptance outcome")
+        matches.append({"key":key,"raw":raw,"marker":marker,"request_id":request_id,
+            "source_sha256":source_sha,"source_relative":relative,"rejection":rejection})
+    if len(matches)!=1:
+        raise RuntimeError("startup_failed session has no unique exact rejected activation receipt")
+    return matches[0]
+def require_empty_queue(queue):
+    return (queue.get("schema_version")=="compute_queue.v1"
+        and queue.get("next_cursor") is None and queue.get("items")==[])
+def require_empty_commands(commands):
+    count_fields=("pending_count","accepted_count","dispatched_count","running_count",
+        "completed_count","rejected_count","failed_count")
+    return (commands.get("commands")==[]
+        and all(type(commands.get(key)) is int and commands[key]==0 for key in count_fields)
+        and commands.get("can_accept_commands") is False)
+def require_ready_runtime(runtime):
+    return runtime.get("configured") is True and runtime.get("state")=="ready"
+def startup_failed_preacceptance(status,run,identity):
+    session=status.get("session") or {}
+    run_not_found=last_current_run_not_found
+    if (run is not None or status.get("run") is not None
+            or status.get("solver",{}).get("state")!="startup_failed"
+            or status.get("lifecycle",{}).get("solver")!="startup_failed"
+            or status.get("lifecycle",{}).get("session_resource")!="active"
+            or status.get("lifecycle",{}).get("commandability")!="forbidden"
+            or not isinstance(run_not_found,dict)
+            or run_not_found.get("status")!=404
+            or run_not_found.get("code")!="not_found"
+            or run_not_found.get("message")!="no active run"):
+        raise RuntimeError("current session is not an unaccepted startup_failed session")
+    activation=rejected_startup_marker(status,identity)
+    preparation=get("/v2/sessions/current/simulation/preparation")
+    failure=preparation.get("failure")
+    stages=preparation.get("stages")
+    # An ApiError without an application code has two deliberate projections:
+    # HTTP rejection uses bad_request; preparation uses docker_startup_failed.
+    # Bind that exact fallback to the same bounded original error message.
+    rejection=activation["rejection"]
+    failure_code_matches=isinstance(failure,dict) and (
+        failure.get("error_code")==rejection.get("code")
+        or (failure.get("error_code")=="docker_startup_failed"
+            and rejection.get("code")=="bad_request"
+            and rejection.get("http_status")==400
+            and isinstance(failure.get("summary"),str) and bool(failure["summary"].strip())
+            and rejection["message"].startswith(failure["summary"])))
+    if (preparation.get("status")!="failed"
+            or preparation.get("active_stage_id") is not None
+            or not isinstance(preparation.get("started_at_unix_ms"),int)
+            or isinstance(preparation.get("started_at_unix_ms"),bool)
+            or not isinstance(preparation.get("completed_at_unix_ms"),int)
+            or isinstance(preparation.get("completed_at_unix_ms"),bool)
+            or preparation["completed_at_unix_ms"]<preparation["started_at_unix_ms"]
+            or not isinstance(failure,dict)
+            or not failure_code_matches
+            or not isinstance(failure.get("summary"),str) or not failure["summary"].strip()
+            or not isinstance(failure.get("stage_id"),str)
+            or not isinstance(stages,list) or not stages
+            or any(not isinstance(stage,dict)
+                or stage.get("status") not in {"completed","failed","pending","skipped"}
+                for stage in stages)
+            or not any(stage.get("id")==failure["stage_id"] and stage.get("status")=="failed"
+                for stage in stages)):
+        raise RuntimeError("startup_failed session has no terminal failed-preparation receipt")
+    queue=get("/v2/platform/compute/queue")
+    commands=get("/v2/sessions/current/simulation/commands")
+    runtime=get("/v2/platform/runtime-service")
+    if not require_empty_queue(queue):
+        raise RuntimeError("startup_failed pre-acceptance restart requires an empty unpaginated queue")
+    if not require_empty_commands(commands):
+        raise RuntimeError("startup_failed pre-acceptance restart requires an empty command ledger")
+    if not require_ready_runtime(runtime):
+        raise RuntimeError("startup_failed pre-acceptance restart requires a ready native runtime")
+    after=get("/v2/sessions/current/status")
+    after_run=get("/v2/sessions/current/simulation/runs/current",optional=True)
+    after_run_not_found=last_current_run_not_found
+    after_preparation=get("/v2/sessions/current/simulation/preparation")
+    after_queue=get("/v2/platform/compute/queue")
+    after_commands=get("/v2/sessions/current/simulation/commands")
+    after_runtime=get("/v2/platform/runtime-service")
+    after_session=after.get("session") or {}
+    after_identity=tuple(after_session.get(k) for k in ("session_id","session_epoch","request_scope_epoch"))
+    if (after_identity!=identity or after.get("solver",{}).get("state")!="startup_failed"
+            or after.get("lifecycle",{}).get("solver")!="startup_failed"
+            or after.get("lifecycle",{}).get("session_resource")!="active"
+            or after.get("lifecycle",{}).get("commandability")!="forbidden"
+            or after.get("resources")!=status.get("resources")
+            or after_session.get("script",{}).get("path")!=activation["marker"]["authorization"].get("container_script_path")
+            or after_run is not None or after.get("run") is not None
+            or after_run_not_found!=run_not_found
+            or after_preparation!=preparation or after_queue!=queue
+            or after_commands!=commands or not require_empty_queue(after_queue)
+            or not require_empty_commands(after_commands)
+            or not require_ready_runtime(after_runtime)
+            or after_runtime.get("configured")!=runtime.get("configured")):
+        raise RuntimeError("startup_failed pre-acceptance proof changed during observation")
+    raw_after,marker_after=read_startup_marker(activation["key"])
+    if raw_after!=activation["raw"] or marker_after!=activation["marker"]:
+        raise RuntimeError("rejected startup activation receipt changed during observation")
+    return {"schema":"fullmag.docker-preaccepted-startup-failure-drain-preflight.v1",
+        "api_instance_id":instance,"session_id":identity[0],"session_epoch":identity[1],
+        "request_scope_epoch":identity[2],"current_run_status":404,
+        "current_run_not_found":run_not_found,
+        "startup_activation":{"receipt_key":activation["key"],
+            "receipt_sha256":hashlib.sha256(activation["raw"]).hexdigest(),
+            "request_id":activation["request_id"],"source_sha256":activation["source_sha256"],
+            "source_relative":activation["source_relative"],
+            "rejection":activation["rejection"]},
+        "session_status":{"solver":status.get("solver"),"lifecycle":status.get("lifecycle"),
+            "resources":status.get("resources"),"session":session},
+        "preparation":preparation,"compute_queue":queue,"commands":commands,
+        "runtime_service":runtime}
 def held_run_proofs(items):
     config_path=os.environ.get("FULLMAG_RUNTIME_SERVICE_CONFIG")
     if not config_path or not os.path.isabs(config_path):
@@ -2419,7 +2659,7 @@ def held_run_proofs(items):
         finally: os.close(runs_fd)
     finally: os.close(root_fd)
 def get(path,optional=False):
-    global instance
+    global instance,last_current_run_not_found
     headers={"Accept":"application/json","Host":"localhost"}
     if instance: headers["x-fullmag-api-instance"]=instance
     request=urllib.request.Request("http://127.0.0.1:8081"+path,headers=headers)
@@ -2428,7 +2668,21 @@ def get(path,optional=False):
     except urllib.error.HTTPError as error:
         if (optional and error.code==404 and instance is not None
                 and error.headers.get_all("x-fullmag-api-instance")==[instance]):
-            error.close()
+            try:
+                raw_error=error.read(MAX+1)
+                if len(raw_error)>MAX:
+                    raise RuntimeError("optional current-run error exceeds restart bound")
+                error_document=json.loads(raw_error,object_pairs_hook=unique_object)
+            finally:
+                error.close()
+            if (path!="/v2/sessions/current/simulation/runs/current"
+                    or not isinstance(error_document,dict)
+                    or error_document.get("code")!="not_found"
+                    or error_document.get("message")!="no active run"
+                    or error_document.get("error")!="no active run"):
+                raise RuntimeError("current run is not the exact no-active-run 404")
+            last_current_run_not_found={"status":404,"code":"not_found",
+                "message":"no active run","api_instance_id":instance}
             return None
         raise
     with response:
@@ -2453,7 +2707,10 @@ run=get("/v2/sessions/current/simulation/runs/current",optional=True)
 terminal={"completed","failed","cancelled","stopped"}
 prepared=bool(ALLOW_PREPARED and run and run.get("status")=="waiting_for_solve"
     and status.get("solver",{}).get("state")=="awaiting_command")
-if run is None or (run.get("status") not in terminal and not prepared):
+if (not STARTUP_ENABLED and run is None
+        and status.get("solver",{}).get("state")=="startup_failed"):
+    print(json.dumps(startup_failed_preacceptance(status,run,identity),sort_keys=True))
+elif STARTUP_ENABLED or run is None or (run.get("status") not in terminal and not prepared):
     print("null")
 else:
     run_id=run.get("run_id")
@@ -2515,6 +2772,7 @@ else:
     if held_runs: result["held_run_intent_sha256"]=held_runs
     print(json.dumps(result,sort_keys=True))
 '''
+    )
     return json.loads(docker_text(
         "exec", backend_id, "/usr/local/bin/python3", "-B", "-c", script,
     ))

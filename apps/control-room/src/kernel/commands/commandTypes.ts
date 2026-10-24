@@ -100,6 +100,10 @@ export function defaultCommandFeedbackOwner(
 export interface CommandResult {
   status: "completed" | "failed" | "cancelled" | "pending";
   commandId?: string;
+  /** Stable API intent used to reconcile an ambiguous submission. */
+  clientIntentId?: string;
+  /** Backend command kind paired with clientIntentId for exact reconciliation. */
+  clientIntentKind?: string;
   observation?: "waiting" | "disconnected" | "publication-unconfirmed";
   message?: string;
 }

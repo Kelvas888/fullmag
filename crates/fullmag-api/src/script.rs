@@ -1056,10 +1056,19 @@ fn capture_authored_scene_with_asset_root_and_progress<T: serde::de::Deserialize
     let output = output?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Preparation summaries are bounded. Put the Python exception before
+        // the traceback so the UI retains the cause rather than only frames.
+        let details = if stderr.contains("Traceback (most recent call last)") {
+            let cause = stderr.lines().rev().find(|line| !line.trim().is_empty())
+                .unwrap_or("Python helper failed").chars().take(1024).collect::<String>();
+            format!("{}\n{}", cause.trim(), stderr.trim())
+        } else {
+            stderr.trim().to_string()
+        };
         return Err(ApiError::bad_request(format!(
             "SceneDocument could not be lowered to {}: {}",
             kind.label(),
-            stderr.trim()
+            details
         )));
     }
 
@@ -1207,7 +1216,9 @@ fn run_python_helper_with_policy(
     {
         let mut command = python_command(repo_root)?;
         command.args(args);
-        command.env("PYTHONUNBUFFERED", "1");
+        // Large mesh exports use stdout as a JSON data channel. Keep it
+        // buffered; progress events already flush stderr explicitly.
+        command.env_remove("PYTHONUNBUFFERED");
         if matches!(policy, PythonHelperOutputPolicy::Progress { .. }) {
             command.env("FULLMAG_PROGRESS", "1");
         }

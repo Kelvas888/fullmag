@@ -160,7 +160,7 @@ async fn acquire_workspace_for_restart_inner(
         Some(snapshot) => {
             let kind = validate_runtime_status(snapshot)?;
             validate_preparation(snapshot)?;
-            validate_mesh_workspace(snapshot.mesh_workspace.as_ref())?;
+            validate_current_mesh_workspace(snapshot)?;
             let scene_document = snapshot
                 .scene_document
                 .as_ref()
@@ -409,6 +409,52 @@ fn validate_preparation(snapshot: &SessionStateResponse) -> Result<(), ApiError>
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_current_mesh_workspace(snapshot: &SessionStateResponse) -> Result<(), ApiError> {
+    let Some(workspace) = snapshot.mesh_workspace.as_ref().and_then(Value::as_object) else {
+        return validate_mesh_workspace(snapshot.mesh_workspace.as_ref());
+    };
+    if workspace.get("schema_version").and_then(Value::as_str)
+        != Some(crate::live_scene_preparation::LIVE_SCENE_PREPARATION_READ_MODEL_SCHEMA)
+    {
+        return validate_mesh_workspace(snapshot.mesh_workspace.as_ref());
+    }
+    // Accepted workers publish one completed receipt, rather than the legacy
+    // FEM/grid mesher phase array. Validate that producer's run-bound shape;
+    // this remains workspace capture, never native-process drain evidence.
+    let pipeline = workspace.get("mesh_pipeline_status").and_then(Value::as_array);
+    let valid_pipeline = pipeline.is_some_and(|stages| {
+        stages.len() == 1 && stages[0].get("status").and_then(Value::as_str) == Some("completed")
+            && matches!(stages[0].get("id").and_then(Value::as_str),
+                Some("startup" | "solve" | "run" | "relax" | "resume" | "mesh_build" | "fdm_grid_refresh"
+                    | "accepted_run_reattach" | "accepted_projection_stage_preparation" | "remesh"))
+    });
+    let fingerprint = workspace.get("plan_fingerprint").and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("sha256:"));
+    let has_identity = ["preparation_id", "accepted_step_id"].iter().all(|key| {
+        workspace.get(*key).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
+    });
+    if workspace.get("status").and_then(Value::as_str) != Some("completed")
+        || workspace.get("active_build").is_none_or(|value| !value.is_null())
+        || workspace.get("last_build_error").is_none_or(|value| !value.is_null())
+        || workspace.get("accepted_run_id").and_then(Value::as_str)
+            != snapshot.run.as_ref().map(|run| run.run_id.as_str())
+        || snapshot.run.is_none()
+        || workspace.get("source_scene_revision").and_then(Value::as_u64).is_none()
+        || !fingerprint.is_some_and(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        || !has_identity || !valid_pipeline
+    {
+        return Err(not_restartable("accepted preparation workspace has no complete run-bound receipt"));
+    }
+    let plan = workspace.get("execution_plan")
+        .ok_or_else(|| not_restartable("accepted preparation workspace has no execution plan"))?;
+    // Deserialize by reference to avoid cloning the large JSON mesh first.
+    // The workspace projection does not contain requested_execution; that
+    // belongs to the separate persisted preparation read model.
+    let _: fullmag_ir::ExecutionPlanIR = serde::Deserialize::deserialize(plan)
+        .map_err(|_| not_restartable("accepted preparation workspace execution plan is malformed"))?;
     Ok(())
 }
 
@@ -749,6 +795,21 @@ fn validate_command_ledger<'a>(
 }
 
 async fn validate_connectivity(state: &AppState, is_scratch: bool) -> Result<(), ApiError> {
+    if !is_scratch && crate::live_accepted_execution::docker_api_only_runtime() {
+        // Accepted workers do not publish the legacy interactive heartbeat.
+        // Reuse the same fresh owner/configuration/liveness proof as status;
+        // terminal task and lease evidence is checked separately by retirement.
+        let connectivity =
+            crate::router_v2::handlers::sessions::status::refresh_current_live_connectivity(state)
+                .await;
+        return if connectivity == SessionConnectivity::Connected {
+            Ok(())
+        } else {
+            Err(not_restartable(
+                "the native runtime service is not ready for workspace handoff",
+            ))
+        };
+    }
     let connectivity = *state.current_live_connectivity.read().await;
     if connectivity != SessionConnectivity::Connected {
         return Err(not_restartable(

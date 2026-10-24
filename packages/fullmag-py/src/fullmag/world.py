@@ -9757,14 +9757,37 @@ def _build_problem(
                 "unequal FDM native cell sizes require "
                 "study.universe.mesh(cell_size=(dx, dy, dz))"
             )
-        demag_policy = None
-        if s._common_fdm_cell_size is not None:
-            demag_policy = FDMDemag(common_cell_size=s._common_fdm_cell_size)
-        disc_kwargs["fdm"] = FDM(
+        # Object mesh hints refine the requested policy; they must not erase
+        # explicit multilayer mode, FFT backend, or projection settings.
+        fdm_policy = s._fdm if s._fdm is not None else FDM(
             default_cell=s._default_fdm_cell_size,
             per_magnet=authored_fdm_cells or None,
+        )
+        demag_policy = fdm_policy.demag
+        if s._common_fdm_cell_size is not None:
+            if (
+                demag_policy is not None
+                and demag_policy.common_cell_size is not None
+                and demag_policy.common_cell_size != s._common_fdm_cell_size
+            ):
+                raise ValueError(
+                    "study.universe mesh cell_size conflicts with "
+                    "study.fdm demag common_cell_size"
+                )
+            demag_policy = replace(
+                demag_policy if demag_policy is not None else FDMDemag(),
+                common_cell_size=s._common_fdm_cell_size,
+            )
+        disc_kwargs["fdm"] = replace(
+            fdm_policy,
+            default_cell=s._default_fdm_cell_size or fdm_policy.default_cell,
+            per_magnet={**(fdm_policy.per_magnet or {}), **authored_fdm_cells} or None,
             demag=demag_policy,
-            boundary_correction=s._boundary_correction,
+            boundary_correction=(
+                s._boundary_correction
+                if s._boundary_correction is not None
+                else fdm_policy.boundary_correction
+            ),
         )
     elif s._fdm is not None:
         disc_kwargs["fdm"] = s._fdm
