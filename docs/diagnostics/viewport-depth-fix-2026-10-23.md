@@ -226,3 +226,41 @@ Wolne miejsce hosta przy preflight: WSL20GiB, WindowsC28GiB. Nie budowano
 nowych obrazów, nie kompilowano unit tests, nie usuwano cache. Browser/WebGL
 i Primitive→mesh pozostają NOT VERIFIED. Zakaz unit tests nadal obejmuje CI;
 PR/merge/cleanup niewykonane.
+
+## Recovery wykonane i rozdzielenie fixture wizualnej od przygotowania FEM
+
+Commit `92e2535f7bb837a93ad24aff340f9e0dfeb48498`: 20/20 nowych
+regresji interpretowanych, 25/25 istniejących kontroli runtime/ledgera,
+niezależne review bez actionable findings. CI bootstrap, contract-guard
+i dispersion-artifact-consumers dla tego HEAD zakończone success.
+
+Zarządzane dry-run i apply kwarantanny: PASS, recovery
+`54c063ef98f546edbace248807e25651`. Nowy namespace o tym samym ID;
+stary marker, owner, store i ledger pozostały byte-identical. Cztery inne
+backendy zachowały ID i StartedAt. Receipt w nowym namespace:
+`verification/empty-quarantine-acceptance.json`. Nie wykonywano rzeczywistego
+przerwania transakcji; częściowy rm jest sprawdzony regresją protokołu.
+
+Start `33f95aaed1a44101a007ed066b5c62cf`, config
+`bf670c9da73443a4eb86afc080b937a6f9d387e0f7d1fb97cbb2b7640db73b9c`:
+build aplikacji i API/native readiness PASS, cache obrazów wykorzystany.
+Aktywacja pełnego przykładu `29b71361591e428bae43232fc9691d2a` została
+przyjęta jako run `run-live-022431ae8f6b7f40f68a851936b7e78fa729ee6cf0165bee76ed318e2013eb51`,
+lecz przygotowanie zakończyło się błędem native runtime przed receipt.
+Log preparera potwierdza serię typed writer contention i końcowe:
+`host admission requires a current sample for the active compute-node owner`.
+To dowód błędu przygotowania, nie diagnoza konkretnej przyczyny kosztu
+eksportu ani dowód problemu renderera. Nie było OOM ani Solve.
+
+Istniejące `stop-diagnostic-volume --pending-activation` zakończyło się
+`stopped-awaiting-fresh-archive`, execution_state=not-started,
+restart_policy=fresh-state-only. Run, lease, owner i receipty zachowane.
+Nie użyto nowej kwarantanny pustego store wobec przyjętego runu.
+
+Wrapper runpy zastąpiono osobną fixture wizualną: identyczne geometrie,
+materiały, uniwersum, parametry FEM i requested GPU/double, bez żądania
+budowy siatki i bez etapu solvera. Oryginalny przykład fizyczny pozostaje
+bez zmian. wait_for_solve w oryginale następuje po materializacji; nie
+stanowi pauzy przed przygotowaniem pełnej siatki. Nowa fixture służy
+do jawnego rozdzielenia Primitive i późniejszego mesh_build przez API.
+AST i zgodność parametrów źródłowych: PASS. Browser/WebGL nadal NOT VERIFIED.
