@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -59,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--existing-output",
-        choices=("timestamp", "error"),
+        choices=("timestamp", "error", "overwrite"),
         help="Override behavior when the requested result path already exists.",
     )
     parser.add_argument(
@@ -369,9 +370,13 @@ def _require_target_grid_identity(
 
 
 def _reserve_stage_sequence_root(base: Path, *, existing_output: str) -> Path:
-    """Reserve a fresh sequence root without changing an earlier project's files."""
-    if existing_output not in {"timestamp", "error"}:
-        raise ValueError("existing_output must be 'timestamp' or 'error'")
+    """Reserve a sequence root.
+
+    An earlier project's files are changed only under ``overwrite``, and only
+    when the existing root is an inactive fullmag result.
+    """
+    if existing_output not in {"timestamp", "error", "overwrite"}:
+        raise ValueError("existing_output must be 'timestamp', 'error', or 'overwrite'")
     if ".." in base.parts:
         raise ValueError("output path must not contain '..' components")
     base = base.expanduser().absolute()
@@ -389,6 +394,7 @@ def _reserve_stage_sequence_root(base: Path, *, existing_output: str) -> Path:
     stem = base.name[:-len(suffix)] if suffix else base.name
     run_id = f"py-sequence-{time.time_ns()}-{os.getpid()}"
     candidate = base
+    replaced = False
     for attempt in range(100):
         try:
             candidate.mkdir(exist_ok=False)
@@ -396,8 +402,66 @@ def _reserve_stage_sequence_root(base: Path, *, existing_output: str) -> Path:
         except FileExistsError:
             if existing_output == "error":
                 raise FileExistsError(f"result location already exists: {candidate}") from None
+            if existing_output == "overwrite":
+                if replaced:
+                    raise FileExistsError(
+                        f"result location reappeared while overwriting: {candidate}"
+                    ) from None
+                _remove_inactive_result(candidate)
+                replaced = True
+                continue
             candidate = base.parent / f"{stem}-{run_id}-{attempt}{suffix}"
     raise FileExistsError("unable to reserve a fresh sequence root after 100 attempts")
+
+
+_ACTIVE_RESERVATION_FILE = ".fullmag-active.lock"
+
+
+def _remove_inactive_result(path: Path) -> None:
+    """Remove an inactive fullmag result tree for the ``overwrite`` policy.
+
+    Mirrors the native lease rule: any link/reparse point, active reservation,
+    or missing fullmag metadata leaves the directory untouched.
+    """
+
+    def refuse(reason: str) -> FileExistsError:
+        return FileExistsError(
+            "refusing to overwrite a directory that is not an inactive fullmag "
+            f"result ({reason}): {path}"
+        )
+
+    if not path.is_dir() or path.is_symlink():
+        raise refuse("not a directory")
+    for current, directories, files in os.walk(path):
+        for name in (*directories, *files):
+            entry = Path(current) / name
+            if entry.is_symlink() or getattr(entry.lstat(), "st_file_attributes", 0) & 0x400:
+                raise refuse(f"contains a link/reparse point {entry}")
+            if name == _ACTIVE_RESERVATION_FILE:
+                raise refuse("an active run reservation is present")
+    if not _is_fullmag_result_directory(path):
+        raise refuse("no fullmag result metadata")
+    shutil.rmtree(path)
+
+
+def _is_fullmag_result_directory(path: Path) -> bool:
+    def read_json(name: str) -> object:
+        try:
+            return json.loads((path / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    attributes = read_json(".zattrs")
+    if isinstance(attributes, dict) and (
+        "output_store_schema" in attributes
+        or str(attributes.get("schema_version", "")).startswith("fullmag.")
+    ):
+        return True
+    receipt = read_json("output-storage.json")
+    if isinstance(receipt, dict) and receipt.get("schema") == "fullmag.output_storage.resolved.v1":
+        return True
+    manifest = read_json("sequence_manifest.json")
+    return isinstance(manifest, dict) and manifest.get("kind") == "flat_sequence"
 
 
 def _stage_output_dir(
