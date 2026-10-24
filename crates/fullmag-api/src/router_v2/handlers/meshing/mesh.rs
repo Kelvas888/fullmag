@@ -2119,88 +2119,6 @@ pub async fn get_mesh_shared_domain_manifest(
         Some(mesh) => {
             let provenance = mesh_build_provenance(&snapshot);
             let topology_hash = fullmag_runner::fem_mesh_topology_fingerprint(mesh);
-            let topology_truth = mesh
-                .build_report
-                .as_ref()
-                .and_then(|report| typed_shared_domain_build_report_from_ir(&snapshot, report));
-            let facet_index =
-                crate::router_v2::handlers::shared::FacetGlobalOrdinalIndex::new(&mesh.facets);
-            let body = MeshSharedDomainManifestResource {
-                revision: snapshot.mesh_revision,
-                source_scene_revision: provenance.source_scene_revision,
-                geometry_realization_revision: provenance.geometry_realization_revision,
-                mesh_name: mesh.mesh_name.clone(),
-                mesh_id: mesh.mesh_id.clone(),
-                topology_fingerprint: topology_hash.clone(),
-                topology_schema_version: Some(2),
-                topology_counts: Some(mesh_topology_counts(mesh)),
-                element_counts_by_type: topology_truth
-                    .as_ref()
-                    .map(|truth| truth.element_counts_by_type.clone())
-                    .unwrap_or_default(),
-                facet_counts_by_type_and_role: topology_truth
-                    .as_ref()
-                    .map(|truth| truth.facet_counts_by_type_and_role.clone())
-                    .unwrap_or_default(),
-                requested_layered_policy: topology_truth
-                    .as_ref()
-                    .and_then(|truth| truth.requested_layered_policy.clone()),
-                resolved_layered_policy: topology_truth
-                    .as_ref()
-                    .and_then(|truth| truth.resolved_layered_policy.clone()),
-                mixed_layer_topology_certificate: topology_truth
-                    .as_ref()
-                    .and_then(|truth| truth.mixed_layer_topology_certificate.clone()),
-                mixed_layer_topology_certificate_v2: topology_truth
-                    .as_ref()
-                    .and_then(|truth| truth.mixed_layer_topology_certificate_v2.clone()),
-                mixed_topology_provenance: topology_truth
-                    .as_ref()
-                    .and_then(|truth| truth.mixed_topology_provenance.clone()),
-                gmsh_version: topology_truth
-                    .as_ref()
-                    .and_then(|truth| truth.gmsh_version.clone()),
-                fallbacks_triggered: topology_truth
-                    .as_ref()
-                    .and_then(|truth| truth.fallbacks_triggered.clone()),
-                generation_id: mesh.generation_id.clone(),
-                domain_mesh_mode: mesh.domain_mesh_mode.clone(),
-                object_segments: mesh
-                    .object_segments
-                    .iter()
-                    .map(MeshObjectSegmentResource::from)
-                    .collect(),
-                mesh_parts: mesh
-                    .mesh_parts
-                    .iter()
-                    .map(|part| {
-                        let mut resource = MeshPartResource::from(part);
-                        resource.element_counts_by_type = mesh_part_family_counts(mesh, part);
-                        if let Some((resolved_indices, surface_faces)) =
-                            crate::router_v2::handlers::shared::mesh_part_surface_faces_with_indices(
-                                mesh,
-                                part,
-                                &facet_index,
-                            )
-                        {
-                            resource.boundary_face_indices = resolved_indices;
-                            resource.surface_faces = surface_faces;
-                        }
-                        resource.surface_node_indices =
-                            (!resource.surface_faces.is_empty()).then(|| {
-                                crate::router_v2::handlers::shared::surface_node_indices_from_faces(
-                                    &resource.surface_faces,
-                                )
-                            });
-                        resource
-                    })
-                    .collect(),
-                regions: snapshot
-                    .scene_document
-                    .as_ref()
-                    .map(|scene| mesh_manifest_regions(scene, mesh))
-                    .unwrap_or_default(),
-            };
             let generation_id = mesh.generation_id.as_deref().unwrap_or("no-generation");
             let etag = crate::router_v2::handlers::shared::stable_strong_etag(&format!(
                 "mesh-shared-domain-manifest:{generation_id}:{topology_hash}:{}:{}:{}",
@@ -2215,9 +2133,96 @@ pub async fn get_mesh_shared_domain_manifest(
                     .unwrap_or_else(|| "unknown".to_string())
             ));
             crate::validate_current_live_request_context(&state, &request_context).await?;
+            // Revalidation is the common case; skip the per-part surface
+            // extraction when the client already holds this manifest.
             Ok(
-                crate::router_v2::handlers::shared::conditional_json_response(
-                    &headers, &etag, &body,
+                crate::router_v2::handlers::shared::conditional_json_response_with(
+                    &headers,
+                    &etag,
+                    || {
+                        let topology_truth = mesh
+                            .build_report
+                            .as_ref()
+                            .and_then(|report| typed_shared_domain_build_report_from_ir(&snapshot, report));
+                        let facet_index =
+                            crate::router_v2::handlers::shared::FacetGlobalOrdinalIndex::new(&mesh.facets);
+                        MeshSharedDomainManifestResource {
+                            revision: snapshot.mesh_revision,
+                            source_scene_revision: provenance.source_scene_revision,
+                            geometry_realization_revision: provenance.geometry_realization_revision,
+                            mesh_name: mesh.mesh_name.clone(),
+                            mesh_id: mesh.mesh_id.clone(),
+                            topology_fingerprint: topology_hash.clone(),
+                            topology_schema_version: Some(2),
+                            topology_counts: Some(mesh_topology_counts(mesh)),
+                            element_counts_by_type: topology_truth
+                                .as_ref()
+                                .map(|truth| truth.element_counts_by_type.clone())
+                                .unwrap_or_default(),
+                            facet_counts_by_type_and_role: topology_truth
+                                .as_ref()
+                                .map(|truth| truth.facet_counts_by_type_and_role.clone())
+                                .unwrap_or_default(),
+                            requested_layered_policy: topology_truth
+                                .as_ref()
+                                .and_then(|truth| truth.requested_layered_policy.clone()),
+                            resolved_layered_policy: topology_truth
+                                .as_ref()
+                                .and_then(|truth| truth.resolved_layered_policy.clone()),
+                            mixed_layer_topology_certificate: topology_truth
+                                .as_ref()
+                                .and_then(|truth| truth.mixed_layer_topology_certificate.clone()),
+                            mixed_layer_topology_certificate_v2: topology_truth
+                                .as_ref()
+                                .and_then(|truth| truth.mixed_layer_topology_certificate_v2.clone()),
+                            mixed_topology_provenance: topology_truth
+                                .as_ref()
+                                .and_then(|truth| truth.mixed_topology_provenance.clone()),
+                            gmsh_version: topology_truth
+                                .as_ref()
+                                .and_then(|truth| truth.gmsh_version.clone()),
+                            fallbacks_triggered: topology_truth
+                                .as_ref()
+                                .and_then(|truth| truth.fallbacks_triggered.clone()),
+                            generation_id: mesh.generation_id.clone(),
+                            domain_mesh_mode: mesh.domain_mesh_mode.clone(),
+                            object_segments: mesh
+                                .object_segments
+                                .iter()
+                                .map(MeshObjectSegmentResource::from)
+                                .collect(),
+                            mesh_parts: mesh
+                                .mesh_parts
+                                .iter()
+                                .map(|part| {
+                                    let mut resource = MeshPartResource::from(part);
+                                    resource.element_counts_by_type = mesh_part_family_counts(mesh, part);
+                                    if let Some((resolved_indices, surface_faces)) =
+                                        crate::router_v2::handlers::shared::mesh_part_surface_faces_with_indices(
+                                            mesh,
+                                            part,
+                                            &facet_index,
+                                        )
+                                    {
+                                        resource.boundary_face_indices = resolved_indices;
+                                        resource.surface_faces = surface_faces;
+                                    }
+                                    resource.surface_node_indices =
+                                        (!resource.surface_faces.is_empty()).then(|| {
+                                            crate::router_v2::handlers::shared::surface_node_indices_from_faces(
+                                                &resource.surface_faces,
+                                            )
+                                        });
+                                    resource
+                                })
+                                .collect(),
+                            regions: snapshot
+                                .scene_document
+                                .as_ref()
+                                .map(|scene| mesh_manifest_regions(scene, mesh))
+                                .unwrap_or_default(),
+                        }
+                    },
                 ),
             )
         }
