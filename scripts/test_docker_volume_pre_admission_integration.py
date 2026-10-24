@@ -120,6 +120,7 @@ class _Harness:
         self.events: list[object] = []
         self.drift_under_lease = drift_under_lease
         self.inspect_calls: dict[str, int] = {"backend": 0, "frontend": 0}
+        self.archive_runtime_control = mock.Mock(return_value={"archived": True})
         self.certificate = {
             "schema": "fullmag.windows-folder-host.v1",
             "storage_profile": "windows-folder-v1",
@@ -329,6 +330,12 @@ class RetainedPreAdmissionIntegrationTests(unittest.TestCase):
                 ),
             ),
             mock.patch.object(dev, "start", started),
+            # Fresh state archives the old runtime root through the managed
+            # control helper; the harness control is not a real BuildControl.
+            mock.patch(
+                "docker_volume_fresh_runtime.archive_runtime_control",
+                harness.archive_runtime_control,
+            ),
         ]
         if accepted_module is not None:
             patches.append(mock.patch.dict(sys.modules, {"docker_volume_accepted_reattach": accepted_module}))
@@ -493,6 +500,7 @@ class RetainedPreAdmissionIntegrationTests(unittest.TestCase):
         _result, started = self._run(harness, helper=helper)
         self.assertEqual(helper.calls["count"], 0)
         self.assertIsNone(started.call_args.kwargs["reuse_state"])
+        harness.archive_runtime_control.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

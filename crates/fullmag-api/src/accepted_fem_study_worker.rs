@@ -484,19 +484,20 @@ fn validate_projected_gradient_bb_receipt(
         bail!("accepted FEM GPU ProjectedGradientBb receipt records a fallback");
     }
 
-    let receipt: fullmag_runner::FemGpuExecutionReceipt = serde_json::from_value(
+    let receipt: fullmag_runner::FemGpuMinimizerExecutionReceipt = serde_json::from_value(
         provenance
-            .get("fem_gpu_execution_receipt")
+            .get("fem_gpu_minimizer_execution_receipt")
             .cloned()
             .context("accepted FEM GPU ProjectedGradientBb receipt is missing")?,
     )
     .context("decode accepted FEM GPU ProjectedGradientBb receipt")?;
-    if receipt.requested != "strict_device"
-        || receipt.resolved != "device_resident"
-        || receipt.executed != "cuda_fem"
-        || receipt.precision != "double"
-        || receipt.device_ordinal != 0
-        || receipt.accepted_step_count == 0
+    if receipt.algorithm != "projected_gradient_bb"
+        || receipt.accounting.requested != "strict_device"
+        || receipt.accounting.resolved != "device_resident"
+        || receipt.accounting.executed != "cuda_fem"
+        || receipt.accounting.precision != "double"
+        || receipt.accounting.device_ordinal != 0
+        || receipt.accounting.accepted_step_count == 0
     {
         bail!(
             "accepted FEM GPU ProjectedGradientBb receipt is not the strict double CUDA realization"
@@ -655,19 +656,22 @@ mod source_contract_tests {
             "requested_energy_minimizer": "projected_gradient_bb",
             "resolved_energy_minimizer": "projected_gradient_bb",
             "energy_minimizer_realization": "native_cuda_pgbb",
-            "fem_gpu_execution_receipt": {
+            "fem_gpu_minimizer_execution_receipt": {
+                "schema_version": "fullmag.fem.gpu.minimizer-execution-receipt.v1",
+                "algorithm": "projected_gradient_bb",
+                "accounting": {
                 "requested": "strict_device",
                 "resolved": "device_resident",
                 "executed": "cuda_fem",
                 "execution_class": "device_resident",
                 "device_ordinal": 0,
                 "precision": "double",
-                "integrator": "heun",
-                "required_operator_mask": 1023,
-                "resolved_device_operator_mask": 1023,
+                "integrator": "not_used",
+                "required_operator_mask": 1823,
+                "resolved_device_operator_mask": 1823,
                 "resolved_host_operator_mask": 0,
                 "resolved_unknown_operator_mask": 0,
-                "executed_device_operator_mask": 1023,
+                "executed_device_operator_mask": 1823,
                 "executed_host_operator_mask": 0,
                 "executed_unknown_operator_mask": 0,
                 "fallback_count": 0,
@@ -678,6 +682,7 @@ mod source_contract_tests {
                 "hot_loop_compute_d2h_bytes": 0,
                 "hot_loop_compute_host_sync_count": 0,
                 "accounting_valid": true
+                }
             }
         });
         assert!(validate_projected_gradient_bb_receipt(

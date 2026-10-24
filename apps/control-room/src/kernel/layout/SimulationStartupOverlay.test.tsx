@@ -344,6 +344,9 @@ describe("SimulationStartupOverlay", () => {
       ),
       { ...statusResource(), status: "stale" },
       20_000,
+      // Only a transport disruption (or failed refresh) makes a retained
+      // snapshot stale; a refetch in flight alone does not.
+      true,
     );
     expect(shouldRefreshSimulationStartupStatus(staleReady)).toBe(true);
   });
