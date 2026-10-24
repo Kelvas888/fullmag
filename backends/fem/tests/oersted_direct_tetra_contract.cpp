@@ -8,6 +8,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -217,14 +218,58 @@ void direct_tetra_singular_target_contract()
     auto bounded = options;
     bounded.maximum_subdivision_depth = 0;
     bool rejected = false;
+    std::string failure;
+    std::ostringstream failure_log;
+    auto *previous_stderr = std::cerr.rdbuf(failure_log.rdbuf());
     try {
         (void)DirectTetraQuadrature::EvaluateField(
             mesh, current, {targets.front()}, bounded);
-    } catch (const std::runtime_error &) {
+    } catch (const std::runtime_error &error) {
         rejected = true;
+        failure = error.what();
+    } catch (...) {
+        std::cerr.rdbuf(previous_stderr);
+        throw;
     }
+    std::cerr.rdbuf(previous_stderr);
     require(rejected,
         "singular-target Oersted silently accepted an exhausted depth budget");
+    require(failure.find("global_target_depth_exhausted; target_m=(") == 0 &&
+            failure.find("estimated_error_apm=") != std::string::npos,
+        "additive failure diagnostics changed the original exception");
+    const auto text = failure_log.str();
+    require(text.find("[oersted_failure_v1] reason=global_target_depth_exhausted;") == 0 &&
+            text.size() <= 480 && std::count(text.begin(), text.end(), '\n') == 1 &&
+            text.find("depth_limited=" + std::to_string(mesh.GetNE())) != std::string::npos &&
+            text.find("unresolved=0") != std::string::npos &&
+            text.find("depth_error_apm=") != std::string::npos &&
+            text.find("top_s_d_e_r=[") != std::string::npos &&
+            text.size() >= 2 && text.substr(text.size() - 2) == "]\n",
+        "failure diagnostics are missing, unbounded or incomplete");
+    const auto top_begin = text.find("top_s_d_e_r=[") + std::string("top_s_d_e_r=[").size();
+    std::istringstream rows(text.substr(top_begin, text.size() - top_begin - 2));
+    std::string row;
+    std::vector<std::size_t> source_indices;
+    double previous_error = std::numeric_limits<double>::infinity();
+    while (std::getline(rows, row, ';')) {
+        std::replace(row.begin(), row.end(), ',', ' ');
+        std::istringstream columns(row);
+        std::size_t source_index;
+        int depth;
+        double error;
+        char rule;
+        require(static_cast<bool>(columns >> source_index >> depth >> error >> rule),
+            "failure dominant-leaf tuple cannot be decoded");
+        require(source_index < static_cast<std::size_t>(mesh.GetNE()) && depth == 0 &&
+                std::isfinite(error) && error >= 0.0 && error <= previous_error &&
+                (rule == 'D' || rule == 'R' || rule == 'U') &&
+                std::find(source_indices.begin(), source_indices.end(), source_index) == source_indices.end(),
+            "failure dominant leaves are not distinct ordered source roots");
+        source_indices.push_back(source_index);
+        previous_error = error;
+    }
+    require(source_indices.size() == 3,
+        "failure diagnostics did not retain exactly three dominant roots");
 
     auto convergence_options = options;
     convergence_options.maximum_subdivision_depth = 4;

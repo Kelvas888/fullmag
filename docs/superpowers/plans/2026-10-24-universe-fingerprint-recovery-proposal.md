@@ -526,3 +526,52 @@ Nie zmieniono metody ani reguł akceptacji. Dalszy krok to ograniczona
 failure-only diagnostyka dominujących liści i regresja near-vertex, zanim
 wybierzemy korektę metody. Pełny Universe H i browser/WebGL pozostają
 NOT VERIFIED; E1–E12 nie są uznane za zakończone.
+
+## Diagnostyka zachowanych liści kwadratury — wejście do buildu 24.10.2026
+
+Dodano `direct_tetra_quadrature.cpp::emit_failure_leaves`, wywoływane wyłącznie
+w istniejącym catch funkcji evaluate_target. Skan obejmuje wszystkie zachowane
+liście, także zablokowane maksymalną głębokością. Stała tablica trzech wskaźników
+wybiera największe error, remis rozstrzyga sequence; nie używa heap.front jako
+maksimum zachowanego błędu. Nie dotyczy niedokończonego dziecka, które nie trafiło
+do retained ledger. Rekord zawiera source_index, depth, przybliżony error w A/m
+(sześć miejsc po przecinku zapisu naukowego) i ponownie obliczoną klasyfikację
+geometrii D/R/U, a także target, liczbę liści i sumę błędu liści depth-limited.
+Nie wykonuje nowych próbek prądu lub pola, nie zmienia WorkBudget.
+
+Jeden rekord stderr ma maksymalnie 479 znaków ASCII plus newline. Dotychczasowy
+wyjątek pozostaje bez zmian. Ograniczenie kanału jest istotne: ABI przenosi 255
+bajtów komunikatu, a accepted_study_supervisor::worker_failure_reason zapisuje
+pierwsze 512 znaków całego stderr, bez trwałego raw logu. Wcześniejsze komunikaty
+mogą wyprzeć dodatkowy rekord. Nie deklarujemy jeszcze trwałego dostarczenia
+raportu w rzeczywistym workerze. Nie zmieniono nadzorcy, ABI, polityk ani retry.
+
+Rozszerzono istniejący `oersted_direct_tetra_contract.cpp::direct_tetra_singular_target_contract`:
+sprawdza niezmieniony wyjątek wymuszonego depth0, jeden ograniczony rekord,
+trzy odrębne poprawne źródłowe indeksy, depth0, dopuszczalną klasyfikację i
+nierosnący błąd. Test natywny NIE został skompilowany ani wykonany.
+Source review nie wykazał blokera; luka pustej top-listy wykryta w review
+została objęta dodatkowymi asercjami. Usunięcie z diffu helpera, dwóch include
+i jednego wywołania catch odtwarza pozostały plik operatora identycznie z bazą.
+To kontrola zachowania źródeł, nie wykonania C++ ani kwalifikacji pola.
+
+Przed buildem zapisano bieżącą scenę przez publiczny projects/authoring do
+`antenna-universe-diagnostics-saved-20261024T061822Z.fms`, 8612 B,
+SHA256 `0c8c45183bdd6d6fd270a311b7fdde1be3d495708ea86ecc6b7f3f956d69b259`.
+Ponowne publiczne open zwróciło tę samą scenę. Oryginalny FMS zachowano.
+Przygotowano checkpoint restartu dla tej sesji i wszystkich dziewięciu
+terminalnych katalogów: SHA256
+`223bdba4cf806d5d795c6b5951e743d9fee4b818e172efcf971346a70dffadaa`.
+Dowody są w control volume pod
+`verification/universe-volume-policy-20261023/failure-leaf-diagnostics-20261024/`.
+Retencja: zachować aktywny cache, pakiet bieżący, rollback i artefakty recovery;
+niczego nie usuwać. Brak skilla cleanup nadal jawny; użyto governance.
+Zmierzono około 504 GiB wolnych w /build; quota niezweryfikowana.
+Build i restart tego wejścia pozostają do wykonania; nie ma nowego Solve.
+
+Próba lekkiej regresji `scripts/test_antenna_duffy_source.py` w stałym backendzie
+nie doszła do wykonania przypadków: obraz nie zawiera modułu pytest.
+Nie instalowano zależności na hoście ani w działającym runtime. To brak
+środowiska testowego, nie wynik PASS/FAIL kodu. Natychmiastowe kontrole obejmują
+review i identyczność niezmienionej części operatora; build aplikacji jest
+wymagany przed twierdzeniem o skompilowanej diagnostyce.
