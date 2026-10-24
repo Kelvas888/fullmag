@@ -266,3 +266,85 @@ terminalizacji nowego Running task 8d181… . AGENTS.md przekazany w rozmowie,
 §8, wymaga decyzji przy zmianie elementu load-bearing lub wersjonowanego.
 Zgoda dotyczy wyłącznie opisanej terminalizacji i przywrócenia naszej grupy,
 bez następnego obliczenia i bez zmiany polityki numerycznej.
+
+
+## Audyt geometrii i ograniczenie wniosków po awarii 8d181
+
+Status: audyt tylko do odczytu. Nie zmieniono metody, tolerancji, polityki,
+siatek ani stanu runtime; nie uruchomiono kolejnego Solve. Ponowny odczyt
+indeksu preflightu potwierdza apply_invoked=false. Wniosek o terminalizację
+8d181 pozostaje osobną, oczekującą decyzją; wcześniejsze „akceptuje” dotyczyło
+wykonanej już procedury a642 i pojedynczego zastępczego Solve.
+
+### Dowód geometryczny
+
+Zweryfikowany katalog CAS:
+32ad3f04cfb8fc3e9912f2d2ad1bf906d7a6789206c456e458aa872785f78861.
+Źródło: 678 węzłów / 1863 Tet4. Universe: 1157 węzłów / 6498 Tet4.
+Dokładny target z błędu jest globalnym węzłem 52:
+(0, -4.6176898829131121e-12, -1e-7) m. Najbliższy source vertex 48:
+(0, -2.220446049250313e-22, -1e-7) m; odległość
+4.617689882691067e-12 m, około 4,6 pm.
+
+Diagnostyka geometrii umieszcza target na krawędzi komórek źródła
+234, 1481 i 1484. Dwie współrzędne barycentryczne wynoszą zero; dwie
+pozostałe około 3.0784599218e-5 i 0.9999692154. Nie wykazała dodatnich
+podkomórek Duffy o względnej objętości mniejszej niż 1e-10. To nie jest dowód
+natywnego przebiegu kwadratury: Python fsum ma inny porządek zaokrągleń niż
+wyrażenia C++; raport jawnie ma same_algorithm_as_native=false oraz
+physics_qualified=false. Nie obliczano prądu ani pola.
+
+Dowód w wolumenie kontrolnym grupy:
+verification/universe-volume-policy-20261023/failed-target-geometry-audit.json.
+Bliskość do wierzchołka jest wskazówką do regresji, nie potwierdzoną przyczyną
+wyczerpania miliona liści. Brakuje rozkładu błędu po elementach i głębokościach
+oraz zachowanych współczynników RT0 z nieudanej próby; atomowa publikacja
+nie pozostawiła zaakceptowanego V/J/H tej próby.
+
+### Dwa odrębne nośniki są obecną realizacją kontraktu
+
+| Źródło: ścieżka + symbol | Zaobserwowane zachowanie |
+|---|---|
+| packages/fullmag-py/src/fullmag/runtime/antenna_coincident_materialization.py::materialize_antenna_coincident_loops | independent_workflow usuwa domain_mesh_source/domain_region_markers/domain_object_region_markers; buduje przewodnik bez study_universe i podmienia fem_mesh_assets, zachowując globalny asset. |
+| packages/fullmag-py/src/fullmag/meshing/_antenna_coincident_cut.py::realize_antenna_coincident_loop_mesh oraz prepare_antenna_coincident_loop | Osobna pełna siatka 3D i sourcecut z własnymi stable IDs. |
+| crates/fullmag-plan/src/antenna_field_solve.rs::load_object_mesh oraz resolve_field_sampling | Niezależny asset przewodnika i odrębny fem_domain_mesh_asset dla globalnego samplingu. |
+| crates/fullmag-plan/src/antenna_current_source.rs::materialize_antenna_closed_loop_current_input | Pełny oryginalny właściciel, ordynały oraz source.mesh_digest są częścią przypiętego wejścia. |
+| docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md: parametr AntennaFieldSolveStage.conductor_mesh_policy oraz anchor antenna-universe-inspection-carrier | authored_shared_domain zachowuje publiczny default pełnej 3D Tet4; sampling ma własne rzeczywiste xyz i connectivity, przypięte do signature. |
+
+Nie znaleziono obietnicy, że source mesh musi być wycięciem Universe.
+Nazwa tokenu jest mniej precyzyjna niż realizacja; nie upoważnia do zmiany
+zaakceptowanego modelu. Snap punktu, usunięcie trudnych targetów lub zamiana
+source na wycinek globalnej siatki zmieniłyby wejście i provenance.
+
+### Granice diagnozy numerycznej
+
+backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp:
+
+- decompose_target_tetrahedron wybiera podział Duffy dla targetów wewnątrz/na
+  Tet; integrate_duffy_once usuwa radialną osobliwość bez fizycznego cutoffu;
+- evaluate_leaf porównuje reguły rzędu 4+2*depth i o dwa większego;
+- evaluate_target sumuje nieujemne estymaty błędu liści na cały target,
+  wybiera dalsze refinements stertą i końcowo przelicza ledger;
+- liście osiągające maximum_subdivision_depth nie trafiają ponownie do sterty.
+  Bez końcowego rozkładu błędu nie wiadomo, czy pozostały błąd tej próby
+  dominował w takich liściach; sam kod nie dowodzi tego scenariusza.
+
+backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.hpp::
+DirectTetraQuadrature określa milion final leaves per target; ResolveWorkLimits
+w .cpp daje profilowi volume_inspection_v1 500 mln kernel evaluations i ledger
+visits. To odrębne limity. Osiągnięcie pierwszego nie jest dowodem braku RAM.
+backends/fem/cpu/mfem/transport/affine_rt0_element.cpp::AffineRt0Element::current_at
+wiąże obecną kwadraturę z rzeczywistym afinnym prądem RT0; bez jego
+współczynników nie przedstawiamy diagnozy samej geometrii jako odtworzenia pola.
+
+Najwęższy następny eksperyment numeryczny powinien zachować dokładne wejście,
+source view, target i tolerancje, a zebrać ograniczony rozkład błędu według
+source element/depth i klasyfikacji inside/edge/near. Najpierw należy ustalić,
+czy można odtworzyć ten sam zamrożony prąd, a następnie przygotować kanoniczną
+regresję i dowód z zarządzanej ścieżki. Ten eksperyment nie został wykonany;
+nie stanowi zgody na kolejny Solve ani na zmianę wersjonowanej metody.
+Nie publikujemy nowego operatora ani twierdzenia o zbieżności.
+
+Weryfikacja tego etapu: niezależny odczytowy audyt źródeł i CAS, kontrola
+istnienia ścieżek/symboli oraz git diff --check. Brak zmian terminalnej noty
+naukowej lub kodu, brak buildu, Rust unit tests i dowodu browser/WebGL.
