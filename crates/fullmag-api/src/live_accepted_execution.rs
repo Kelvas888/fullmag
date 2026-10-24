@@ -1542,13 +1542,43 @@ fn bind_preceding_solver_state(
 ) -> Result<(), ApiError> {
     use fullmag_authoring::{StudyInputPort, StudyInputSource, StudyOutputPort, StudyPortDataKind};
 
+    // Reuse the preceding step's single declared state output (for example the
+    // live default `final_state`); terminal materialization accepts exactly one.
+    let state_outputs: Vec<String> = study.steps[previous]
+        .outputs
+        .iter()
+        .filter(|port| port.data_kind == StudyPortDataKind::State)
+        .map(|port| port.port_id.clone())
+        .collect();
+    let output_port = match state_outputs.as_slice() {
+        [] => {
+            if study.steps[previous].outputs.iter().any(|port| port.port_id == "state") {
+                return Err(ApiError::unprocessable_with_code(
+                    conflict_code,
+                    "preceding solver output is not a magnetization state",
+                ));
+            }
+            study.steps[previous].outputs.push(StudyOutputPort {
+                port_id: "state".into(),
+                data_kind: StudyPortDataKind::State,
+            });
+            "state".to_string()
+        }
+        [single] => single.clone(),
+        _ => {
+            return Err(ApiError::unprocessable_with_code(
+                conflict_code,
+                "preceding solver step declares more than one state output",
+            ));
+        }
+    };
     let input = StudyInputPort {
         port_id: input_port.into(),
         data_kind: StudyPortDataKind::State,
         required: true,
         source: StudyInputSource::StepOutput {
             step_id: study.steps[previous].step_id.clone(),
-            port: "state".into(),
+            port: output_port,
             case_id: "default".into(),
         },
     };
@@ -1559,22 +1589,6 @@ fn bind_preceding_solver_state(
             conflict_code,
             "step input must preserve the preceding solver state",
         ));
-    }
-    let output = StudyOutputPort {
-        port_id: "state".into(),
-        data_kind: StudyPortDataKind::State,
-    };
-    if let Some(existing) = study.steps[previous].outputs.iter()
-        .find(|port| port.port_id == "state")
-    {
-        if existing != &output {
-            return Err(ApiError::unprocessable_with_code(
-                conflict_code,
-                "preceding solver output is not a magnetization state",
-            ));
-        }
-    } else {
-        study.steps[previous].outputs.push(output);
     }
     Ok(())
 }
@@ -2974,6 +2988,25 @@ mod tests {
         assert_eq!(saved.steps[1].inputs[0].source, relax_state);
         assert_eq!(saved.steps[2].inputs[0].port_id, "initial_state");
         assert_eq!(saved.steps[2].inputs[0].source, relax_state);
+
+        // Live default outputs declare `final_state`; the binding reuses it
+        // instead of adding a second state output.
+        let mut defaulted = primitive_study(&[("relax", Relax), ("run", Run)]);
+        super::apply_live_accepted_observation_output_defaults(&mut defaulted);
+        super::bind_live_solver_state_inputs(&mut defaulted).unwrap();
+        defaulted.validate_for_execution().unwrap();
+        let state_outputs = defaulted.steps[0]
+            .outputs
+            .iter()
+            .filter(|port| port.data_kind == StudyPortDataKind::State)
+            .count();
+        assert_eq!(state_outputs, 1);
+        assert_eq!(
+            defaulted.steps[1].inputs[0].source,
+            StudyInputSource::StepOutput {
+                step_id: "relax".into(), port: "final_state".into(), case_id: "default".into(),
+            }
+        );
 
         // A selected single step (others disabled) keeps its authored initial state.
         let mut selected = primitive_study(&[("relax", Relax), ("run", Run)]);
