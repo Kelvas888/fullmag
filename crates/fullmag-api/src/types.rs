@@ -2365,7 +2365,7 @@ mod tests {
             run: response.run.as_ref(),
             live_state: response.live_state.as_ref(),
             runtime_status: &response.runtime_status,
-            metadata: response.metadata.as_ref(),
+            metadata: response.metadata.as_deref(),
             mesh_workspace: response.mesh_workspace.as_ref(),
             stage_execution: response.stage_execution.as_ref(),
             scene_document: response.scene_document.as_ref(),

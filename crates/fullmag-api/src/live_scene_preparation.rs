@@ -3301,7 +3301,7 @@ mod tests {
         }))
         .unwrap();
         let mut snapshot = crate::session::default_current_live_state(&request);
-        snapshot.metadata = request.metadata.clone();
+        snapshot.metadata = request.metadata.clone().map(Into::into);
         let model = prepared_fem_read_model(true);
         assert_eq!(
             match &model.execution_plan.backend_plan {

@@ -9141,7 +9141,7 @@ async fn completed_rotated_dmi_scalar_preview_uses_plan_gated_manifest_fallback(
     // Missing or corrupt legacy provenance cannot relabel an aggregate as a
     // rotated component; the aggregate remains readable in both cases.
     for metadata in [None, Some(serde_json::json!({ "execution_plan": {} }))] {
-        snapshot.metadata = metadata;
+        snapshot.metadata = metadata.map(Into::into);
         assert_eq!(
             crate::current_global_scalar_value(snapshot, "E_rotated_dmi"),
             None
@@ -28098,7 +28098,7 @@ async fn solver_status_exposes_solver_owned_frozen_spins_activation_certificate(
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         let metadata = snapshot
             .metadata
-            .get_or_insert_with(|| serde_json::json!({}));
+            .get_or_insert_with(|| serde_json::json!({}).into());
         metadata["frozen_spins_runtime_status"] = serde_json::json!({
             "schema": "fullmag.frozen_spins.runtime-status.v1",
             "constraint_activation_epochs": { "pin": 2 },

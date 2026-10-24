@@ -3389,7 +3389,7 @@ mod tests {
         let run = snapshot.run.as_ref().expect("accepted run manifest");
         assert_eq!(run.run_id, "accepted-run");
         assert_eq!(run.total_steps, 2);
-        assert_eq!(snapshot.metadata.as_ref(), Some(&metadata));
+        assert_eq!(snapshot.metadata.as_deref(), Some(&metadata));
     }
 
     #[test]
