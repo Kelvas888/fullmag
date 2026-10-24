@@ -10,7 +10,7 @@ import operator
 from pathlib import Path
 import struct
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 from weakref import WeakSet
 import numpy as np
 from numpy.typing import NDArray
@@ -2879,7 +2879,13 @@ class MeshData:
             u64(len(data))
             encoded.extend(data)
 
-        def sequence(values: object, write_item: Any) -> None:
+        def sequence(values: object, write_item: Any, payload: bytes | None = None) -> None:
+            # ``payload`` is the already validated little-endian encoding of
+            # every item; ``None`` keeps the per-item writer and its errors.
+            if payload is not None:
+                u64(len(values))  # type: ignore[arg-type]
+                encoded.extend(payload)
+                return
             items = list(values)  # type: ignore[arg-type]
             u64(len(items))
             for item in items:
@@ -2910,30 +2916,29 @@ class MeshData:
                 ) from error
             u8(tag)
 
-        sequence(self.nodes, f64x3)
-        sequence(
-            self.cell_types,
-            lambda value: enum({"tet4": 1, "prism6": 2, "pyramid5": 3, "hex8": 4}, value),
-        )
-        sequence(self.cell_offsets, u32)
-        sequence(self.cell_nodes, u32)
-        sequence(self.cell_global_ordinals, u64)
-        sequence(
-            self.cell_mesh_parts,
-            lambda value: enum({"magnetic": 1, "transition_air": 2, "far_air": 3}, value),
-        )
-        sequence(self.element_markers, u32)
-        sequence(self.facet_types, lambda value: enum({"tri3": 1, "quad4": 2}, value))
-        sequence(
+        def enum_sequence(values: object, mapping: dict[str, int]) -> None:
+            sequence(
+                values,
+                lambda value: enum(mapping, value),
+                _fingerprint_enum_payload(values, mapping),
+            )
+
+        sequence(self.nodes, f64x3, _fingerprint_f64x3_payload(self.nodes))
+        enum_sequence(self.cell_types, {"tet4": 1, "prism6": 2, "pyramid5": 3, "hex8": 4})
+        sequence(self.cell_offsets, u32, _fingerprint_uint_payload(self.cell_offsets, 32))
+        sequence(self.cell_nodes, u32, _fingerprint_uint_payload(self.cell_nodes, 32))
+        sequence(self.cell_global_ordinals, u64, _fingerprint_uint_payload(self.cell_global_ordinals, 64))
+        enum_sequence(self.cell_mesh_parts, {"magnetic": 1, "transition_air": 2, "far_air": 3})
+        sequence(self.element_markers, u32, _fingerprint_uint_payload(self.element_markers, 32))
+        enum_sequence(self.facet_types, {"tri3": 1, "quad4": 2})
+        enum_sequence(
             self.facet_roles,
-            lambda value: enum(
-                {"exterior": 1, "material_interface": 2, "periodic_seam": 3}, value
-            ),
+            {"exterior": 1, "material_interface": 2, "periodic_seam": 3},
         )
-        sequence(self.facet_offsets, u32)
-        sequence(self.facet_nodes, u32)
-        sequence(self.facet_global_ordinals, u64)
-        sequence(self.boundary_markers, u32)
+        sequence(self.facet_offsets, u32, _fingerprint_uint_payload(self.facet_offsets, 32))
+        sequence(self.facet_nodes, u32, _fingerprint_uint_payload(self.facet_nodes, 32))
+        sequence(self.facet_global_ordinals, u64, _fingerprint_uint_payload(self.facet_global_ordinals, 64))
+        sequence(self.boundary_markers, u32, _fingerprint_uint_payload(self.boundary_markers, 32))
 
         def periodic_boundary_pair(pair: object) -> None:
             if not isinstance(pair, dict):
@@ -3177,7 +3182,36 @@ class MeshData:
         if self.element_markers.shape != (self.n_elements,):
             raise ValueError("element_markers must cover every FEM cell")
 
-        for index, cell_type in enumerate(self.cell_types.tolist()):
+        # A batched screen finds every candidate failure; the scalar check
+        # below stays the authority for the verdict, its order and its
+        # message.  The screen widens the epsilon by a relative margin far
+        # above the rounding difference of its vectorized ``L**3``.
+        candidates: list[NDArray[np.int64]] = []
+        for cell_type, ordinals, coordinates in _iter_cell_family_batches(self):
+            determinants = _cell_jacobian_determinants_batch(cell_type, coordinates)
+            if eps_volume is not None:
+                screen_eps = np.full(ordinals.size, float(eps_volume) * 6.0)
+            else:
+                characteristic_length = np.max(
+                    np.linalg.norm(
+                        coordinates[:, :, np.newaxis, :] - coordinates[:, np.newaxis, :, :],
+                        axis=3,
+                    ),
+                    axis=(1, 2),
+                )
+                screen_eps = np.maximum(
+                    np.finfo(np.float64).tiny,
+                    FEM_TOPOLOGY_RELATIVE_DETERMINANT_EPS * characteristic_length**3,
+                )
+            flagged = ~(np.min(np.abs(determinants), axis=1) > screen_eps * (1.0 + 1.0e-9))
+            if require_positive_orientation:
+                flagged |= np.any(determinants < 0.0, axis=1)
+            candidates.append(ordinals[flagged])
+        candidate_ordinals = (
+            np.sort(np.concatenate(candidates)) if candidates else np.zeros(0, dtype=np.int64)
+        )
+        for index in candidate_ordinals.tolist():
+            cell_type = str(self.cell_types[index])
             coordinates = self.nodes[self.cell_node_ids(index)]
             determinants = _cell_jacobian_determinants(cell_type, coordinates)
             characteristic_length = float(np.max(np.linalg.norm(
@@ -3379,14 +3413,14 @@ class MeshData:
             "hex8": [1, 0, 3, 2, 5, 4, 7, 6],
         }
         changed = False
-        for index, cell_type in enumerate(self.cell_types.tolist()):
-            start, stop = int(self.cell_offsets[index]), int(self.cell_offsets[index + 1])
-            determinant = _cell_jacobian_determinants(
-                cell_type,
-                self.nodes[cell_nodes[start:stop]],
-            )
-            if np.all(determinant < 0.0):
-                cell_nodes[start:stop] = cell_nodes[start:stop][reverse[cell_type]]
+        for cell_type, ordinals, coordinates in _iter_cell_family_batches(self):
+            determinants = _cell_jacobian_determinants_batch(cell_type, coordinates)
+            flipped = ordinals[np.all(determinants < 0.0, axis=1)]
+            if flipped.size:
+                starts = self.cell_offsets[flipped][:, np.newaxis]
+                cell_nodes[starts + np.arange(len(reverse[cell_type]))] = self.cell_nodes[
+                    starts + np.asarray(reverse[cell_type], dtype=np.int64)
+                ]
                 changed = True
         if not changed:
             return self
@@ -4905,6 +4939,40 @@ def _mixed_cell_signed_and_absolute_volume(
     return sum(signed_tetra_volumes), sum(abs(value) for value in signed_tetra_volumes)
 
 
+def _fingerprint_f64x3_payload(values: object) -> bytes | None:
+    """Encode finite ``(N, 3)`` float rows exactly like the per-item f64 writer."""
+    if (
+        not isinstance(values, np.ndarray)
+        or values.ndim != 2
+        or values.shape[1] != 3
+        or values.dtype.kind != "f"
+        or not np.all(np.isfinite(values))
+    ):
+        return None
+    return values.astype("<f8").tobytes()
+
+
+def _fingerprint_uint_payload(values: object, bits: int) -> bytes | None:
+    """Encode an in-range integer vector exactly like the per-item u32/u64 writer."""
+    if not isinstance(values, np.ndarray) or values.ndim != 1 or values.dtype.kind not in "iu":
+        return None
+    if values.size and (int(values.min()) < 0 or int(values.max()) > (1 << bits) - 1):
+        return None
+    return values.astype(f"<u{bits // 8}").tobytes()
+
+
+def _fingerprint_enum_payload(values: object, mapping: Mapping[str, int]) -> bytes | None:
+    """Encode a string vector of known enum values as u8 tags."""
+    if not isinstance(values, np.ndarray) or values.ndim != 1 or values.dtype.kind != "U":
+        return None
+    tags = np.zeros(values.shape[0], dtype=np.uint8)
+    for value, tag in mapping.items():
+        tags[values == value] = tag
+    if np.any(tags == 0):
+        return None
+    return tags.tobytes()
+
+
 def _mixed_reference_derivative_samples(family: str) -> NDArray[np.float64]:
     """Return the fixed order-2 reference derivatives for one cell family."""
     q = 1.0 / math.sqrt(3.0)
@@ -4964,6 +5032,26 @@ def _mixed_cell_scaled_jacobians(
         denominator = float(np.prod(np.linalg.norm(matrix, axis=0)))
         values.append(abs(float(np.linalg.det(matrix))) / denominator if denominator else 0.0)
     return np.asarray(values, dtype=np.float64)
+
+
+def _mixed_cell_scaled_jacobians_batch(
+    family: str, coordinates: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Evaluate ``_mixed_cell_scaled_jacobians`` for ``(M, k, 3)`` cells.
+
+    Every per-cell operation keeps the scalar operand layout and reduction
+    order, so row ``m`` is bit-identical to the scalar result for cell ``m``.
+    """
+    transposed = coordinates.transpose(0, 2, 1)
+    samples = _mixed_reference_derivative_samples(family)
+    values = np.empty((coordinates.shape[0], samples.shape[0]), dtype=np.float64)
+    for sample, derivatives in enumerate(samples):
+        matrix = np.matmul(transposed, derivatives)
+        denominator = np.prod(np.linalg.norm(matrix, axis=1), axis=1)
+        determinant = np.abs(np.linalg.det(matrix))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            values[:, sample] = np.where(denominator != 0.0, determinant / denominator, 0.0)
+    return values
 
 
 def _mixed_face_adjacency(
@@ -5584,6 +5672,58 @@ def _cell_jacobian_determinants(
                     rows.append(float(np.linalg.det(coordinates.T @ derivatives)))
         return np.asarray(rows)
     raise ValueError(f"unknown cell type: {cell_type}")
+
+
+_CELL_JACOBIAN_BATCH_SIZE = 1 << 17
+
+
+def _cell_jacobian_determinants_batch(
+    cell_type: str,
+    coordinates: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Evaluate ``_cell_jacobian_determinants`` for ``(M, k, 3)`` cells.
+
+    Row ``m`` is bit-identical to the scalar result for cell ``m``: the batch
+    uses the same reference derivatives, the same per-cell matrix layout and
+    the same LAPACK determinant.  ``hex8`` keeps the scalar evaluation.
+    """
+    count = coordinates.shape[0]
+    if cell_type == "tet4":
+        matrix = np.stack(
+            [coordinates[:, 1] - coordinates[:, 0], coordinates[:, 2] - coordinates[:, 0], coordinates[:, 3] - coordinates[:, 0]],
+            axis=2,
+        )
+        return np.linalg.det(matrix).reshape(count, 1)
+    if cell_type in ("prism6", "pyramid5"):
+        transposed = coordinates.transpose(0, 2, 1)
+        samples = _mixed_reference_derivative_samples(cell_type)
+        result = np.empty((count, samples.shape[0]), dtype=np.float64)
+        for sample, derivatives in enumerate(samples):
+            result[:, sample] = np.linalg.det(np.matmul(transposed, derivatives))
+        return result
+    if cell_type == "hex8":
+        if count == 0:
+            return np.empty((0, 8), dtype=np.float64)
+        return np.stack([_cell_jacobian_determinants(cell_type, cell) for cell in coordinates])
+    raise ValueError(f"unknown cell type: {cell_type}")
+
+
+def _iter_cell_family_batches(
+    mesh: "MeshData",
+) -> Iterator[tuple[str, NDArray[np.int64], NDArray[np.float64]]]:
+    """Yield ``(family, cell ordinals, (M, k, 3) coordinates)`` blocks.
+
+    Blocks follow cell-ordinal order within each family and are bounded so
+    that a production mesh does not materialize every Jacobian at once.
+    """
+    families = np.asarray(mesh.cell_types)
+    for family in dict.fromkeys(families.tolist()):
+        arity = FEM_CELL_ARITIES[str(family)]
+        ordinals = np.flatnonzero(families == family).astype(np.int64)
+        for start in range(0, ordinals.size, _CELL_JACOBIAN_BATCH_SIZE):
+            block = ordinals[start : start + _CELL_JACOBIAN_BATCH_SIZE]
+            node_index = mesh.cell_offsets[block][:, np.newaxis] + np.arange(arity, dtype=np.int64)
+            yield str(family), block, mesh.nodes[mesh.cell_nodes[node_index]]
 
 
 def _tetra_signed_volumes(mesh: MeshData) -> NDArray[np.float64]:
