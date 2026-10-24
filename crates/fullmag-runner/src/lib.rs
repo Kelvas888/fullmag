@@ -151,6 +151,7 @@ mod fem_eigen;
 mod frequency_response;
 pub mod frames_index;
 pub mod hysteresis;
+mod hysteresis_accepted;
 pub mod interactive;
 mod interactive_runtime;
 mod native_fem;
@@ -4520,7 +4521,7 @@ fn run_planned_problem_with_live_preview_artifact_context(
     require_resolved_runtime_sampling(problem, plan)?;
     let parallel_execution = validate_parallel_execution_workflow(problem, plan)?;
     if let fullmag_ir::StudyIR::Hysteresis { .. } = &problem.study {
-        return hysteresis::run_planned_hysteresis_with_live_preview(
+        let result = hysteresis::run_planned_hysteresis_with_live_preview(
             problem,
             plan,
             fem_mesh_identity,
@@ -4532,7 +4533,15 @@ fn run_planned_problem_with_live_preview_artifact_context(
             initial_snapshot,
             None,
             &mut on_step,
-        );
+        )?;
+        hysteresis_accepted::publish_accepted_hysteresis_outputs(
+            problem,
+            plan,
+            output_dir,
+            autosave_root,
+            &result,
+        )?;
+        return Ok(result);
     }
     let fem_stage_context = fem_mesh_identity
         .cloned()

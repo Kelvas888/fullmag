@@ -1375,6 +1375,7 @@ fn materialize_pipeline_primitive(
             .map(Some),
         "relax" => materialize_pipeline_relax(current_ir, payload).map(Some),
         "eigenmodes" => materialize_pipeline_eigenmodes(current_ir, payload).map(Some),
+        "hysteresis" => materialize_pipeline_hysteresis(current_ir, payload).map(Some),
         "frequency_response" => {
             materialize_pipeline_frequency_response(current_ir, payload).map(Some)
         }
@@ -2275,6 +2276,36 @@ fn attach_stage_autosave_from_payload(
 }
 
 #[doc(hidden)]
+/// A hysteresis node carries its whole `StudyIR::Hysteresis` (field schedule,
+/// settle pipeline, protocol) as payload; it runs as one solver stage that
+/// loops over its field points internally.
+pub fn materialize_pipeline_hysteresis(
+    base_ir: &ProblemIR,
+    payload: &BTreeMap<String, Value>,
+) -> Result<ResolvedScriptStage> {
+    let mut ir = base_ir.clone();
+    let mut study: serde_json::Map<String, Value> = payload
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "entrypoint_kind" | "stage_id" | "output_every_seconds" | "table_autosave"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    study.insert("kind".into(), Value::String("hysteresis".into()));
+    if !study.contains_key("sampling") {
+        study.insert("sampling".into(), serde_json::to_value(base_ir.study.sampling())?);
+    }
+    let study: fullmag_ir::StudyIR = serde_json::from_value(Value::Object(study))
+        .context("hysteresis pipeline stage payload is not a valid hysteresis study")?;
+    ir.study = study;
+    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
+        .unwrap_or_else(|| "study_pipeline_hysteresis".to_string());
+    Ok(ResolvedScriptStage::solver(ir, 0.0, entrypoint_kind))
+}
+
 pub fn materialize_pipeline_eigenmodes(
     base_ir: &ProblemIR,
     payload: &BTreeMap<String, Value>,

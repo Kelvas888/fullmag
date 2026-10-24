@@ -1391,7 +1391,10 @@ fn bind_live_solver_state_inputs(study: &mut fullmag_authoring::StudyPlan) -> Re
         }
         match study.steps[index].kind {
             StudyStepKind::Primitive {
-                stage_kind: StudyPrimitiveStageKind::Run | StudyPrimitiveStageKind::Relax,
+                stage_kind:
+                    StudyPrimitiveStageKind::Run
+                    | StudyPrimitiveStageKind::Relax
+                    | StudyPrimitiveStageKind::Hysteresis,
             } => {
                 if let Some(previous) = previous_solver {
                     bind_preceding_solver_state(
@@ -2080,6 +2083,10 @@ fn select_live_step(
 
 fn bounded_gpu_scope(problem: &fullmag_ir::ProblemIR) -> bool {
     match &problem.study {
+        hysteresis @ fullmag_ir::StudyIR::Hysteresis { .. } => {
+            problem.backend_policy.requested_backend == fullmag_ir::BackendTarget::Fdm
+                && bounded_gpu_hysteresis(hysteresis)
+        }
         fullmag_ir::StudyIR::TimeEvolution { .. }
         | fullmag_ir::StudyIR::Relaxation {
             algorithm: fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped,
@@ -2094,6 +2101,46 @@ fn bounded_gpu_scope(problem: &fullmag_ir::ProblemIR) -> bool {
         ),
         _ => false,
     }
+}
+
+/// FDM hysteresis settles every field point with the same CUDA relaxation
+/// paths as Relax steps. Angular families, minor loops and adaptive refinement
+/// keep their separate qualification.
+fn bounded_gpu_hysteresis(study: &fullmag_ir::StudyIR) -> bool {
+    let fullmag_ir::StudyIR::Hysteresis {
+        angular_family,
+        minor_loops,
+        adaptive_refinement,
+        settle_pipeline,
+        ..
+    } = study
+    else {
+        return false;
+    };
+    if angular_family.is_some()
+        || minor_loops.as_ref().is_some_and(|loops| !loops.is_empty())
+        || adaptive_refinement.is_some()
+    {
+        return false;
+    }
+    let Some(settle_pipeline) = settle_pipeline else {
+        // The runner default settle is LLG-overdamped relaxation.
+        return true;
+    };
+    let steps: Vec<&fullmag_ir::SettleStepIR> = match settle_pipeline {
+        fullmag_ir::SettlePipelineIR::Sequence { steps } => steps.iter().collect(),
+        fullmag_ir::SettlePipelineIR::Tree { default, branches } => std::iter::once(default)
+            .chain(branches.iter().map(|branch| &branch.run))
+            .collect(),
+    };
+    !steps.is_empty()
+        && steps.into_iter().all(|step| match step {
+            fullmag_ir::SettleStepIR::Minimize { method, .. } => {
+                method.as_str() == "projected_gradient_bb"
+            }
+            fullmag_ir::SettleStepIR::Relax { method, .. } => method.as_str() == "llg_overdamped",
+            _ => false,
+        })
 }
 
 /// Accepted GPU direct minimization uses the explicit native CUDA PG-BB
@@ -2516,6 +2563,41 @@ mod tests {
             BackendTarget::Fem,
             RelaxationAlgorithmIR::TangentPlaneImplicit
         ));
+    }
+
+    #[test]
+    fn accepted_gpu_scope_allows_plain_fdm_hysteresis_with_receipted_settles() {
+        let sampling = fullmag_ir::ProblemIR::bootstrap_example().study.sampling().clone();
+        let hysteresis = |extra: serde_json::Value| -> fullmag_ir::StudyIR {
+            let mut study = serde_json::json!({
+                "kind": "hysteresis",
+                "field_values_mT": [0.0, 1.0],
+                "sampling": sampling,
+            });
+            study.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(study).unwrap()
+        };
+        let minimize = serde_json::json!({"settle_pipeline": {"kind": "sequence", "steps": [{
+            "kind": "minimize", "method": "projected_gradient_bb", "torque_tolerance": 1e-3,
+            "energy_tolerance": 1e-20, "max_steps": 1000, "on_non_convergence": "warn",
+        }]}});
+        assert!(super::bounded_gpu_hysteresis(&hysteresis(minimize.clone())));
+        assert!(super::bounded_gpu_hysteresis(&hysteresis(serde_json::json!({}))));
+        let ncg = serde_json::json!({"settle_pipeline": {"kind": "sequence", "steps": [{
+            "kind": "minimize", "method": "nonlinear_cg", "torque_tolerance": 1e-3,
+            "energy_tolerance": 1e-20, "max_steps": 1000, "on_non_convergence": "warn",
+        }]}});
+        assert!(!super::bounded_gpu_hysteresis(&hysteresis(ncg)));
+        let mut refined = minimize;
+        refined["minor_loops"] = serde_json::json!([{"from_mT": 0.0, "to_mT": 1.0, "step_mT": 0.5}]);
+        let refined: Result<fullmag_ir::StudyIR, _> = serde_json::from_value({
+            let mut study = serde_json::json!({"kind": "hysteresis", "field_values_mT": [0.0], "sampling": sampling});
+            study.as_object_mut().unwrap().extend(refined.as_object().unwrap().clone());
+            study
+        });
+        if let Ok(refined) = refined {
+            assert!(!super::bounded_gpu_hysteresis(&refined));
+        }
     }
 
     fn queued_task(task_id: &str) -> fullmag_session::FmsTaskCatalogEntry {

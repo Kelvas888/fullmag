@@ -1216,7 +1216,34 @@ fn merge_hysteresis_execution_provenance(
     let previous_module_ids = std::mem::take(&mut accumulated.executed_physics_module_ids);
     let previous_kinds = std::mem::take(&mut accumulated.executed_physics_kinds);
     let previous_transport = std::mem::take(&mut accumulated.transport_modules);
+    let previous_receipt = accumulated.fdm_gpu_execution_receipt.take();
     *accumulated = next.clone();
+    // The merged native GPU receipt stands for every settle of the sweep, not
+    // only the last one: any settle with different residency invalidates it.
+    if let Some(previous) = previous_receipt {
+        match accumulated.fdm_gpu_execution_receipt.as_mut() {
+            Some(receipt) => {
+                let same_residency = previous.accounting_valid
+                    && previous.requested == receipt.requested
+                    && previous.resolved == receipt.resolved
+                    && previous.executed == receipt.executed
+                    && previous.device == receipt.device
+                    && previous.precision == receipt.precision
+                    && previous.precision_policy == receipt.precision_policy;
+                receipt.fallback_count = receipt.fallback_count.max(previous.fallback_count);
+                if !same_residency {
+                    receipt.accounting_valid = false;
+                    receipt.validation_state = "inconsistent_across_hysteresis_settles".to_string();
+                }
+            }
+            None => {
+                let mut receipt = previous;
+                receipt.accounting_valid = false;
+                receipt.validation_state = "inconsistent_across_hysteresis_settles".to_string();
+                accumulated.fdm_gpu_execution_receipt = Some(receipt);
+            }
+        }
+    }
 
     accumulated
         .executed_physics_module_ids

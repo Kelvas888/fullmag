@@ -1339,6 +1339,10 @@ fn accepted_fdm_runner_horizon(study: &fullmag_ir::StudyIR, pinned: Option<f64>)
         // keeps None and the solver owns its authored convergence/step limits.
         return Ok(until);
     }
+    if let fullmag_ir::StudyIR::Hysteresis { .. } = study {
+        // Each field point is settled by its own step limits; the sweep has no time horizon.
+        return Ok(f64::INFINITY);
+    }
     bail!("accepted worker step has no pinned runner horizon")
 }
 
@@ -4155,6 +4159,13 @@ mod accepted_fdm_precision_tests {
         }
         let no_horizon = fullmag_ir::StudyIR::FieldOnly { sampling: problem.study.sampling().clone() };
         assert!(accepted_fdm_runner_horizon(&no_horizon, None).is_err());
+        let hysteresis: fullmag_ir::StudyIR = serde_json::from_value(serde_json::json!({
+            "kind": "hysteresis",
+            "field_values_mT": [0.0, 1.0],
+            "sampling": problem.study.sampling(),
+        }))
+        .unwrap();
+        assert_eq!(accepted_fdm_runner_horizon(&hysteresis, None).unwrap(), f64::INFINITY);
     }
 
     #[test]

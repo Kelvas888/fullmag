@@ -4127,6 +4127,45 @@ mod tests {
     }
 
     #[test]
+    fn materialize_pipeline_hysteresis_keeps_its_field_schedule_and_settle_pipeline() {
+        let base = sample_problem_ir();
+        let payload = serde_json::from_value(json!({
+            "kind": "hysteresis",
+            "entrypoint_kind": "flat_hysteresis",
+            "stage_id": "hysteresis-1",
+            "field_values_mT": [0.0, 1.0, 2.0],
+            "direction": [1.0, 0.0, 0.0],
+            "initial_protocol": "as_authored",
+            "settle_pipeline": {"kind": "sequence", "steps": [{
+                "kind": "minimize", "method": "projected_gradient_bb", "torque_tolerance": 1.0,
+                "energy_tolerance": 1e-20, "max_steps": 50000,
+                "on_non_convergence": "continue_with_warning"
+            }]}
+        }))
+        .expect("payload");
+        let stage = fullmag_application::script_stage_materialization::materialize_pipeline_hysteresis(
+            &base, &payload,
+        )
+        .expect("hysteresis stage");
+        assert_eq!(stage.until_seconds, 0.0);
+        assert_eq!(stage.entrypoint_kind, "flat_hysteresis");
+        let fullmag_ir::StudyIR::Hysteresis {
+            field_values_mT,
+            initial_protocol,
+            settle_pipeline,
+            sampling,
+            ..
+        } = &stage.ir.study
+        else {
+            panic!("expected a hysteresis study");
+        };
+        assert_eq!(field_values_mT.as_deref(), Some(&[0.0, 1.0, 2.0][..]));
+        assert_eq!(initial_protocol, "as_authored");
+        assert!(settle_pipeline.is_some());
+        assert_eq!(sampling, base.study.sampling());
+    }
+
+    #[test]
     fn session_command_direct_minimizer_rejects_llg_only_controls() {
         let base_problem = sample_problem_ir();
         let command = crate::types::SessionCommand {
