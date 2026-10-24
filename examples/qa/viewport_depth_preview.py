@@ -1,8 +1,8 @@
-"""Geometry-only viewport fixture using the CoFeB ring scene dimensions.
+"""Paused viewport fixture using the physical CoFeB ring scene dimensions.
 
-The magnetic material and FEM mesh policies mirror the physical example, but
-this fixture does not request mesh construction or define a solver stage. It is
-for visual QA only and is not a physics qualification case.
+The accepted startup contract requires an authored stage and prepares FEM mesh
+assets before the wait gate. This fixture never starts Solve automatically.
+Its visual evidence does not qualify the physical model or solver.
 """
 
 import fullmag as fm
@@ -108,3 +108,6 @@ study.objects.mesh.defaults(
     compute_quality=True,
     per_element_quality=True,
 )
+
+# Accepted startup requires a real authored stage, even when paused before Solve.
+study.stages.add_minimize(method="bb", max_steps=10, tolA=1e-4)

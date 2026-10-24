@@ -264,3 +264,24 @@ bez zmian. wait_for_solve w oryginale następuje po materializacji; nie
 stanowi pauzy przed przygotowaniem pełnej siatki. Nowa fixture służy
 do jawnego rozdzielenia Primitive i późniejszego mesh_build przez API.
 AST i zgodność parametrów źródłowych: PASS. Browser/WebGL nadal NOT VERIFIED.
+
+
+## Weryfikacja fixture: kontrakt przygotowania wymaga etapu
+
+Fresh-state archive i start `093eaeceee1f401db5d9d495a633b01e`: PASS,
+config `36d81819dfcd1dc92787b57d84587fed1bb53a28738bddaae58c995126459b8d`.
+Aktywacja bez etapów `cb69d0e76e2241dc9629632576baceb6` zakończyła się
+failed-confirmed: `accepted_execution_stage_missing`. Nie przyjęto runu.
+Przygotowanie FEM zawsze materializuje zasoby, niezależnie od
+`mesh_workflow.build_requested`: log potwierdza odczyt cache siatki
+183764 nodes / 1087250 elements i eksport w 84.5 s. Wcześniejsze założenie,
+że usunięcie build_domain_mesh zatrzyma tę ścieżkę przed materializacją,
+było błędne. Fixture otrzymuje rzeczywisty etap BB z oryginalnego przykładu;
+interactive/wait_for_solve zatrzymują wykonanie przed Solve.
+
+Browser QA: pierwszy start odmówił zajętej blokady aktywacji; kolejny
+nie doczekał zimnej kompilacji /workspace. Po HTTP200 przeglądarka wykonała
+próbę, lecz walidator mounta odrzucił alias Docker Desktop WSL. To błąd
+porównania ścieżek w harnessie; lokalny alias i katalog źródeł mają ten sam
+device/inode. Wynik tej próby pozostaje nieznany i zasoby zachowane do
+jawnej reconciliacji; nie jest zaliczonym odbiorem WebGL.
