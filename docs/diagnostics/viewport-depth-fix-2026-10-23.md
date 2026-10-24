@@ -184,3 +184,45 @@ Warunki kontynuacji: przywrócona dostępność Docker i ustalenie końcowego
 wyniku istniejącej aktywacji; następnie managed browser QA. Otwarcie PR
 wymaga rozstrzygnięcia konfliktu z zakazem kompilacji w standardowym CI.
 PR/merge/cleanup nadal niewykonane.
+
+## Wznowienie 24.10.2026 — osierocona aktywacja po wyłączeniu Docker
+
+Checkpoint UTC: 2026-10-24T05:47:30.362698+00:00. Docker ponownie odpowiada. Główny checkout nadal
+ma HEAD `ae8e570f2aa9655cb9fd8321c716b8d49a87e084`; zawiera cudze zmiany
+robocze, których nie modyfikowano. Worktree zadania przed wznowieniem czysty,
+HEAD `1487cd9fdb0fe6712a05f023d1a90bad4ced5233`.
+
+Oba kontenery zadania są zatrzymane exit255. Dokładny backend
+`bd1c59f8a9fb1db38e83d3bf6f5a274a309cd1799954b70a98322b147779606c`
+ma Pid0, StartedAt `2026-10-23T07:53:24.080341642Z`, FinishedAt
+`2026-10-23T23:17:26.131576641Z`. Nie wnioskowano z tego o końcowym
+wyniku aktywacji ani o zwolnieniu rezerwacji native.
+
+Zachowany marker `active` wskazuje `a97f47244fc0451c86f846fb9aff5e0a`.
+Receipt tej aktywacji pozostaje `outcome-unknown-resources-retained`; jej
+marker per-request pozostaje `started`, bez terminal.json. Kontener jej
+helpera jest nieobecny. Proces-tree i OWNER nadal mają stan `ready`,
+a dokładny journal `verification/stop-failed-<backend-id>.json` nie istnieje.
+Nie usuwano markerów, nie resetowano ownera i nie ponawiano skryptu.
+
+Przypięte zarządzane `resume-volume --restart-backend` zakończyło się exit2,
+próba `81a17bcfcf4b4a53a2e99c5c7b9ead2d`, komunikat:
+`Control helper exited before acknowledging its durable lease`.
+Ponowny inspect potwierdził, że usługi nie zostały uruchomione.
+
+Niezależne review istniejącego kodu recovery: brak trasy obsługującej te
+dowody. Resume nie wywołuje reconciliacji aktywacji; recreate ją wywołuje,
+ale wymaga native failed-stop metadata i dokładnego journalu. Stan ready
+i brak journalu nie spełniają tej bramki. Nie rozszerzano wyjątków recovery
+ani nie tworzono nowego namespace jako obejścia.
+
+Brakujący kontrakt: uwierzytelniony dowód zakończenia dokładnej inkarnacji
+backendu po przerwaniu demona, obejmujący procesy, lease i rezerwacje;
+następnie CAS zaległego lease aktywacji z zachowaniem kwarantanny i
+nieznanego wyniku, bez replay Solve. Zmiana dotyka kontraktu runtime;
+wysłano użytkownikowi wybór rozszerzenia zakresu albo oczekiwania na recovery.
+
+Wolne miejsce hosta przy preflight: WSL20GiB, WindowsC28GiB. Nie budowano
+nowych obrazów, nie kompilowano unit tests, nie usuwano cache. Browser/WebGL
+i Primitive→mesh pozostają NOT VERIFIED. Zakaz unit tests nadal obejmuje CI;
+PR/merge/cleanup niewykonane.
