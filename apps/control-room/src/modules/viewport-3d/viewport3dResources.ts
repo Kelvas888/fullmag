@@ -668,13 +668,13 @@ const FULL_FIELD_VECTOR_QUERY: FieldVectorQuery = {
   scope_kind: "full",
 };
 /**
- * FEM topology is a sequential header/full/decode load. The live 1.4 MiB
- * topology measured a 3.3 s header response before the full payload could
- * start, so the generic 5 s hook deadline expired before adoption. Keep the
- * larger budget local to topology; field resources retain their own policy.
+ * FEM topology is a sequential header/range/decode load. The ring fixture has
+ * a 45.6 MB topology; its live DEV browser repeatedly exhausted 15 s before
+ * adoption. Keep a finite 60 s budget local to topology, including all ranges
+ * and decoding. Field resources retain their own policy.
  */
 export const VIEWPORT_3D_TOPOLOGY_RETRY_POLICY: ResourceRetryPolicy = {
-  deadlineMs: 15_000,
+  deadlineMs: 60_000,
   maxAttempts: 3,
   retryAfterMs: 250,
   retryableReasonCodes: [

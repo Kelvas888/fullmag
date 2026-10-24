@@ -150,6 +150,9 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
             }
             capture.estimated_24bit_depth_step_m = resolution;
             captures.push(capture);
+            // This fixed fixture has a red CoFeB ring. HUD axes alone must not
+            // qualify a blank canvas after a topology resource failure.
+            if (mode !== "Wireframe") assertRingSurfacePixels(capture);
           }
         }
       } finally {
@@ -552,6 +555,7 @@ async function captureCanvas(page, {
       png_sha256: pngSha256,
       decoded_pixel_sha256: pixelSha256,
       non_empty_rgba_pixels: nonEmptyPixels,
+      red_dominant_pixels: countRedDominantPixels(data, width, height),
       camera,
       webgl,
       live_depth_range: liveDepthRange,
@@ -950,4 +954,30 @@ function boundedTimeout(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return 15_000;
   return Math.min(Math.max(numeric, 1_000), MAX_ACTION_TIMEOUT_MS);
+}
+
+// Scoped to the fixed red-ring fixture, never a generic material assumption.
+export function countRedDominantPixels(data, width, height) {
+  if (!Number.isInteger(width) || !Number.isInteger(height) ||
+      width <= 0 || height <= 0 || data?.length !== width * height * 4) {
+    throw new Error("Ring pixel check requires valid decoded RGBA dimensions");
+  }
+  let count = 0;
+  // The fixture targets the ring at the center. Exclude the red orientation
+  // sphere/axes at the bottom left and the ViewCube at the top right.
+  for (let y = Math.ceil(height * 0.15); y < height * 0.8; y += 1) {
+    for (let x = Math.ceil(width * 0.25); x < width * 0.75; x += 1) {
+      const offset = (y * width + x) * 4;
+      if (data[offset + 3] > 0 && data[offset] > 32 &&
+          data[offset] > data[offset + 1] * 1.3 && data[offset] > data[offset + 2] * 1.3) count += 1;
+    }
+  }
+  return count;
+}
+
+export function assertRingSurfacePixels(capture) {
+  if (!Number.isFinite(capture.red_dominant_pixels) ||
+      capture.red_dominant_pixels < Math.max(128, capture.width * capture.height * 0.002)) {
+    throw new Error(`Ring geometry is absent at ${capture.name}: ${capture.red_dominant_pixels} red surface pixels`);
+  }
 }

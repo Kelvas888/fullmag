@@ -91,7 +91,7 @@ with Client("http://backend:8081", timeout=30, retry_budget_s=0) as client:
     try:
         handle = client.commands.submit("mesh_build", client_intent_id=record["client_intent_id"],
             reason="viewport_depth_qa", mesh_reason="shared-domain", mesh_target={"kind": "study_domain"},
-            precondition={"scene_revision": scene["revision"], "command_revision": len(queue["commands"])})
+            precondition={"scene_revision": scene["revision"], "command_revision": queue["revision"]})
         record.update(state="accepted", command_id=handle.command_id)
         save()
         terminal = handle.wait(timeout=600)

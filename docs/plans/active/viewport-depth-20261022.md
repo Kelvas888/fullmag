@@ -147,3 +147,11 @@ jest dozwolone. Dopiero potem merge i dokładny cleanup zadania.
 - Primitive przed siatką: browser8fda5f6f37384bfdb0a8a11359d1a18c, viewport_camera PASS, eksport/DPR/lifecycle PASS. Ogólny harness FAIL przez planar-default HTTP422 pustej domeny; bez wyciszania.
 - mesh_build0333b7f51c5b053c92eaff9b completed, ta sama sesja, domena0→1087250, rewizje3, Compute niewykonane. Observer wykrył niezgodny effective CPU wobec authoredGPU; kwalifikacjaGPU NOT VERIFIED, źródłowy guard odmawia przed kolejną mutacją.
 - Końcowa próba po publikacji siatki trwa. Audyt zawiera dokładne identyfikatory i ograniczenia; PR pozostaje draft do ostatniej kontroli renderowania i CI końcowego HEAD.
+
+## Końcowy checkpoint renderowania
+
+- Commit guardów diagnostyki:2332a0ee5e526f9dbaed6644b697e2b436c9ae15.
+- Dodatkowy problem:45,6MB topologii potrzebowało31,343s; lokalny limit15s przerywał adoption. Budżet topologii60s, pola bez zmian.
+- Browserc977c79890474c259d316495730ec82a: camera26/ring9, export,DPR1/2,lifecycle zakończone. Pixel guard odrzuca6pustychPNG; źródła lint/typecheck PASS.
+- Ogólny harness nadal FAIL przez analysis404 i planar422. ImportGPU/effectiveCPU poza naprawą; Compute niewykonane. Audyt nie przedstawia tego jako kwalifikacji całej aplikacji.
+- Dalsze kroki: commit końcowego etapu, push, CI bieżącegoHEAD, mergePR252, fast-forward bez ingerencji w cudze zmiany, drain i cleanup dokładnego worktree.

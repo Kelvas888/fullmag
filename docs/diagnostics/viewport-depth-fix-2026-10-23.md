@@ -1,6 +1,11 @@
 # Naprawa głębokości i podglądu Primitive — odbiór 3D
 
-Data: 23.10.2026. Status: poprawki źródeł sprawdzone i zapisane; odbiór browser/WebGL, PR i integracja oczekują.
+Data pierwotna: 23.10.2026; aktualizacja odbioru: 24.10.2026.
+Status: zakres kamery/ringu i Primitive sprawdzony w WebGL; publikacja topologii,
+eksport PNG, DPR i lifecycle sprawdzone po korekcie budżetu topologii.
+Ogólny harness nie jest zielony: odrębne endpointy analysis/planar zwracają
+404/422. Nie jest to kwalifikacja solvera/GPU. PR252 oczekuje końcowego CI
+i integracji; dalsze sekcje zachowują także wcześniejsze nieudane próby.
 
 ## Zakres i diagnoza
 
@@ -412,3 +417,57 @@ po przygotowaniu osobno odrzucono resolved CPU oraz zmiany requested_mode
 i resolved_mode. Nie wysłano przy tym żadnych poleceń. Niezależne review
 potwierdziło zamknięcie luki resolved/mode i kontrolę manualnego gate.
 AST i git diff --check PASS. Pełny helper nie został ponownie uruchomiony.
+
+
+## Końcowy odbiór 24.10 — topologia, piksele, eksport i lifecycle
+
+Próby `7319be87cb434c74812e5374fcf95fda` i
+`922f01b07b174501b5ec5fcefddc7d7c` wykazały pusty viewport po wygaśnięciu
+15-sekundowego deadline topologii. Pierwszy harness błędnie uznawał sam
+niepusty HUD i poprawną kamerę za wystarczające; oględziny PNG ujawniły brak
+geometrii. Guard fixed-fixture teraz wymaga czerwonej powierzchni w centralnym
+ROI, z wyłączeniem czerwonych osi/sfery HUD. 18 rzeczywistych PNG: 12 dodatnich
+powierzchni przyjętych, 6 pustych obrazów odrzuconych. Próba922f z nowym guardem
+prawidłowo zakończyła camera.state=failed (0 pikseli powierzchni), z restoration.
+Negatywny dowód zachowano w verification/ring-published-mesh-browser-proof.json.
+
+Pomiar pełnej topologii: 45 632 256 B, silny ETag i poprawne Content-Range.
+Prywatny Range64KiB: 0,092 s. Pierwszy publiczny nagłówek: 7,717 s,
+kolejne8MiB: 0,119 s. To pojedyncze pomiary, nie benchmark wydajności.
+Zwiększono wyłącznie skończony budżet topologii15→60s; nie zmieniono limitów
+pól, liczby prób, walidacji ETag, zakresów ani lifecycle. Regresja źródłowa
+przetrzymuje request przez15001ms (stary limit go przerywa); uruchomienie
+unit tests pozostawiono do jawnie dozwolonego CI. Lokalnie app typecheck
+i scoped ESLint PASS, exit0; parsery MJS i Python AST PASS.
+
+Próba `c977c79890474c259d316495730ec82a`:
+
+- Widoczny canvas, WebGL2, context_lost=false, niezerowy drawing buffer.
+- Topologia została pobrana: od pierwszego requestu do końca ostatniego
+  zakresu31,343s; sam pierwszy nagłówek8,637s, pierwsza sekcja12,692s.
+  Pomiar wyjaśnia przekroczenie wcześniejszych15s; nie oznacza przyspieszenia.
+- viewport_camera.state=passed:26 captures,9 ujęć ringu, zgodny depth range,
+  dodatnie piksele powierzchni we wszystkich6 trybach shaded, przywrócone
+  ustawienia i ten sam canvas/kontekst. Oględziny ponownie potwierdziły obrysy
+  Primitive bez triangulacji kapsli. Sam ten przebieg pokazuje podgląd
+  Primitive także przy przyjętej topologii; nie przedstawiamy obrysów jako
+  dowodu triangulacji FEM. Wcześniejszy odrębny PNG ortho-wireframe zawiera
+  rzeczywiste krawędzie FEM; fizyka pozostaje poza zakresem tych obrazów.
+- Eksport PNG (także transparent geometry), DPR1/DPR2 oraz lifecycle
+  zakończyły swoje kontrole. Nie wystąpił wcześniejszy pusty eksport ani
+  timeout pobrania PNG. Nie zgłaszamy zmierzonej poprawy pamięci lub idle.
+- Page errors i transport failures: puste. **Ogólny wynik nadal FAIL** przez
+  404 z frequency-domain response i422 z planar-default field metadata.
+  Nie wyciszono błędów i nie zmieniono tych ścieżek. To ogranicza odbiór
+  całej aplikacji, niezależnie od zaliczonego zakresu renderowania ringu.
+
+Dowód: verification/ring-topology-60s-browser-proof.json w zachowywanym
+wolumenie kontrolnym. Browser SwiftShader,2CPU/2GiB; memory.peak=2147520512B,
+memory.events max=4982, oom=0, oom_kill=0. Nie jest to test braku wycieków.
+Niezależne review guardów oraz lokalnej polityki deadline bez pozostałych
+findingów; skuteczność60s potwierdził powyższy rzeczywisty przebieg.
+
+Pozostałe jawne ograniczenia: nie naprawiano importu authoredGPU/effectiveCPU
+ani endpointów analizy/planar2D. Nie wykonano Compute/Solve, kwalifikacji
+naukowej ani hardwareGPU. Zaliczenie zakresu tego PR nie oznacza zielonego
+ogólnego harnessu ani poprawności tych odrębnych ścieżek runtime.

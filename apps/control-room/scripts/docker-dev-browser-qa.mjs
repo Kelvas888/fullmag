@@ -104,6 +104,10 @@ const canvasState = async (page) => page.locator(".fm-viewport-3d canvas").first
     context_lost: context?.isContextLost?.() ?? null,
     drawing_buffer_width: context?.drawingBufferWidth ?? 0,
     drawing_buffer_height: context?.drawingBufferHeight ?? 0,
+    topology_transfers: performance.getEntriesByType("resource")
+      .filter((entry) => new URL(entry.name).pathname.endsWith("/data/domain/topology"))
+      .slice(-24).map((entry) => ({ start_ms: entry.startTime, duration_ms: entry.duration,
+        transfer_bytes: entry.transferSize, encoded_bytes: entry.encodedBodySize })),
     depth_bits: context ? context.getParameter(context.DEPTH_BITS) : null,
     preserve_drawing_buffer: context?.getContextAttributes?.().preserveDrawingBuffer ?? null,
     vendor: debugInfo ? context.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : null,
