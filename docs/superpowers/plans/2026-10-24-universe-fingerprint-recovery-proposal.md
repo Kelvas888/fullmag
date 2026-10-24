@@ -1,8 +1,8 @@
 # Universe: poprawka tożsamości siatki i odzyskanie własnej grupy 3203
 
-Status: zatwierdzona procedura wykonana do uruchomienia natywnego Solve.
-Build, preview, warunkowy Cancel i restart przeszły. Nowy wynik Universe oraz
-WebGL pozostają NOT VERIFIED. E1–E12 nadal otwarte.
+Status: zatwierdzony recovery wykonany, natywny Solve wystartował i zakończył
+się błędem limitu liści całkowania. Nie opublikowano wyniku H Universe. API zostało
+zatrzymane przez nadzorcę po wtórnym błędzie heartbeat. E1–E12 nadal otwarte.
 
 ## Stan rzeczywisty
 
@@ -175,3 +175,31 @@ wykonania, jeszcze nie poprawnego V/J/H. Nie ma zgody na kolejne przyjęte Solve
 Po recovery ponownie potwierdzono 70 wcześniejszych plików, pięć katalogów i FMS
 jako identyczne. Dowody: approved-new-solve/ oraz preclaim-cancel-proposal/
 w verification/universe-volume-policy-20261023 w wolumenie kontrolnym grupy.
+
+
+## Wynik wykonania i granica dalszej zgody — 24.10.2026
+
+Natywny worker 8d181… zakończył się exit1. Potwierdzony błąd:
+final_leaf_budget_exceeded przy target_m=(0,-4.6176898829131121e-12,-1e-7).
+Estymata błędu 11.056035818905203 A/m przekroczyła tolerancję
+2.4709319136549057 A/m; roundoff indicator 2.4305242514006608e-10 A/m.
+Liczba liści na ten punkt osiągnęła 1000000. Końcówka reason jest ucięta;
+nie wolno interpretować urwanego kernel_evaluations=353 jako pełnego licznika.
+Limit wynika z DirectTetraQuadrature::maximum_final_leaves_per_target w
+backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.hpp,
+a odmowa z evaluate_target w odpowiadającym .cpp. To limit na jeden target,
+nie liczba par źródło-target ani przydział CPU/RAM kontenera.
+
+Następnie scheduler odmówił reconcile final worker-acknowledged resource heartbeat:
+worker exited with an unacknowledged heartbeat command. OWNER przeszedł w Failed,
+nadzorca zreapował API (exit -15) oraz runtime. Katalog pozostał Running/reconciling
+rev52, zero artifact_ids; nie jest to aktywne obliczenie ani zaakceptowany wynik.
+Istnieje trwały worker process exit receipt. Globalny mesh CAS ma 1157 węzłów
+i 6498 elementów; jego istnienie nie dowodzi obliczenia pola.
+
+Nie zwiększono limitów, nie zmieniono tolerancji i nie wysłano kolejnego Solve.
+Dalsza terminalizacja tej nowej próby i zwolnienie jej rezerwacji wymagają
+odrębnego, przypiętego requestu/preflight do decyzji użytkownika. Zgoda na a642…
+nie obejmuje zmiany nowego Running task 8d181… . Numerykę trzeba zbadać przed
+proponowaniem większego limitu; samo jego zwiększenie nie dowodzi zbieżności.
+Dowód pełnego bieżącego logu zachowano jako approved-new-solve/failed-compute-log.json.

@@ -3050,3 +3050,14 @@ Jego przygotowanie zakończyło się poprawnie i natywny worker rzeczywiście dz
 Jeden wcześniejszy request odrzucono HTTP409 przed przyjęciem; timeout poprawnego
 requestu nie spowodował ponowienia. Wynik Universe, binarna walidacja V/J/H oraz
 WebGL nadal NOT VERIFIED w chwili tego wpisu; E0 pozostaje jedynym odebranym etapem.
+
+
+### Wynik zastępczego Universe Solve — 24.10.2026
+
+Run 8d181… faktycznie uruchomił worker, ale zakończył się final_leaf_budget_exceeded:
+limit 1 mln liści na jeden punkt, estymata błędu 11.056 A/m > tolerancja 2.471 A/m.
+Nie opublikowano V/J/H Universe. Wtórny błąd niepotwierdzonego heartbeat zatrzymał
+scheduler, a nadzorca zakończył API/runtime. Katalog Running/reconciling rev52
+jest stanem niezamkniętej historii, nie nadal pracującym solverem. Żadne kolejne
+Solve ani zwiększenie budżetu nie zostało wykonane. Pełne dowody i granica nowej
+zgody są w końcowej sekcji 2026-10-24-universe-fingerprint-recovery-proposal.md.
