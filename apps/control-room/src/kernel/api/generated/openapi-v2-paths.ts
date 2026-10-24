@@ -39,6 +39,7 @@ export const openApiV2PathLiterals = [
   "/v2/platform/compute/queue",
   "/v2/platform/docs/asyncapi",
   "/v2/platform/health",
+  "/v2/platform/instances",
   "/v2/platform/openapi.json",
   "/v2/platform/output-storage",
   "/v2/platform/runtime-service",

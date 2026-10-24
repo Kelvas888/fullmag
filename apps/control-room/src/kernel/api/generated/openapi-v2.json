@@ -8590,6 +8590,38 @@
         ],
         "type": "object"
       },
+      "DiscoveredInstance": {
+        "description": "A Fullmag instance answering on one loopback port.",
+        "properties": {
+          "api_instance_id": {
+            "description": "Process identity of the instance's API (`x-fullmag-api-instance`).",
+            "type": "string"
+          },
+          "is_self": {
+            "description": "The instance that answered this discovery request.",
+            "type": "boolean"
+          },
+          "port": {
+            "description": "Port of the instance's Control Room origin, which also serves its API.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/InstanceSessionSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "port",
+          "api_instance_id",
+          "is_self",
+          "sessions"
+        ],
+        "type": "object"
+      },
       "DisplayPatch": {
         "properties": {
           "active_quantity_id": {
@@ -19352,6 +19384,68 @@
           "error"
         ],
         "type": "string"
+      },
+      "InstanceDiscoveryResource": {
+        "properties": {
+          "first_port": {
+            "description": "First port of the probed window (inclusive).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instances": {
+            "description": "Instances that answered with a Fullmag session list, ordered by port.",
+            "items": {
+              "$ref": "#/components/schemas/DiscoveredInstance"
+            },
+            "type": "array"
+          },
+          "last_port": {
+            "description": "Last port of the probed window (inclusive).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "self_api_instance_id": {
+            "description": "Process identity of the API that answered this request.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "self_api_instance_id",
+          "first_port",
+          "last_port",
+          "instances"
+        ],
+        "type": "object"
+      },
+      "InstanceSessionSummary": {
+        "description": "One session of a discovered instance, as its `GET /v2/sessions` reported it.",
+        "properties": {
+          "current": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "name",
+          "status",
+          "current"
+        ],
+        "type": "object"
       },
       "ItemDetail": {
         "description": "Inspector document of one workspace item.",
@@ -49705,6 +49799,29 @@
               }
             },
             "description": "Health check"
+          }
+        },
+        "tags": [
+          "platform"
+        ]
+      }
+    },
+    "/v2/platform/instances": {
+      "get": {
+        "operationId": "platform_get_platform_instances",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceDiscoveryResource"
+                }
+              }
+            },
+            "description": "Fullmag instances answering in the discovery port window"
+          },
+          "500": {
+            "description": "The discovery port window is misconfigured"
           }
         },
         "tags": [

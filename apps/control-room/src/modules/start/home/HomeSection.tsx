@@ -12,6 +12,7 @@ import type { WorkspaceResultsView, WorkspaceScriptsView } from "../model/worksp
 import { SectionHeader } from "../ui/SectionHeader";
 
 import { ActiveSessions, type ActiveSession } from "./ActiveSessions";
+import { OtherInstances, type OtherInstance } from "./OtherInstances";
 import { ContinueCard } from "./ContinueCard";
 import { LaunchTiles } from "./LaunchTiles";
 import { RecentProjects } from "./RecentProjects";
@@ -59,6 +60,10 @@ export interface HomeSectionProps {
   readonly activeSessions?: readonly ActiveSession[];
   /** Leaves Home for the current session's workspace. */
   readonly onOpenActiveSession?: () => void;
+  /** Other Fullmag instances on this host; omitted or empty draws no section. */
+  readonly otherInstances?: readonly OtherInstance[];
+  /** Opens another instance in its own tab. */
+  readonly onOpenInstance?: (port: number) => void;
 }
 
 export function HomeSection({
@@ -80,6 +85,8 @@ export function HomeSection({
   onRunCommand,
   activeSessions = [],
   onOpenActiveSession,
+  otherInstances = [],
+  onOpenInstance,
 }: HomeSectionProps) {
   const today = useToday();
   const [continueBusy, setContinueBusy] = useState(false);
@@ -125,6 +132,9 @@ export function HomeSection({
       </div>
       {onOpenActiveSession ? (
         <ActiveSessions onOpen={onOpenActiveSession} sessions={activeSessions} />
+      ) : null}
+      {onOpenInstance ? (
+        <OtherInstances instances={otherInstances} onOpen={onOpenInstance} />
       ) : null}
       {session && resolution && continueEntry ? (
         <section aria-labelledby="fm-start-continue-title" className="fm-start-section">

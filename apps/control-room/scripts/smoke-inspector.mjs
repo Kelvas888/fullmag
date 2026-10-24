@@ -4123,6 +4123,15 @@ async function installInspectorFixtureApi(page, fixture) {
     if (path === "/v2/platform/capabilities" && request.method() === "GET") {
       return fulfillJson(route, { engines: [], profile_version: "fixture.v1" });
     }
+    if (path === "/v2/platform/instances" && request.method() === "GET") {
+      return fulfillJson(route, {
+        first_port: 3197,
+        instances: [],
+        last_port: 3260,
+        schema_version: "1.0.0",
+        self_api_instance_id: "fixture-instance",
+      });
+    }
     if (path === "/v2/platform/health" && request.method() === "GET") {
       return fulfillJson(route, {
         active_session: true,

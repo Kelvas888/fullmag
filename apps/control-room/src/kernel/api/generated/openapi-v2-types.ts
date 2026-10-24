@@ -628,6 +628,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/platform/instances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["platform_get_platform_instances"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/platform/openapi.json": {
         parameters: {
             query?: never;
@@ -7040,6 +7056,19 @@ export interface components {
             /** Format: double */
             position_fraction: number;
         };
+        /** @description A Fullmag instance answering on one loopback port. */
+        DiscoveredInstance: {
+            /** @description Process identity of the instance's API (`x-fullmag-api-instance`). */
+            api_instance_id: string;
+            /** @description The instance that answered this discovery request. */
+            is_self: boolean;
+            /**
+             * Format: int32
+             * @description Port of the instance's Control Room origin, which also serves its API.
+             */
+            port: number;
+            sessions: components["schemas"]["InstanceSessionSummary"][];
+        };
         DisplayPatch: {
             active_quantity_id?: string | null;
             auto_contrast?: boolean | null;
@@ -9758,6 +9787,30 @@ export interface components {
         };
         /** @enum {string} */
         InactiveSelectionPolicySchema: "warn_and_intersect" | "error";
+        InstanceDiscoveryResource: {
+            /**
+             * Format: int32
+             * @description First port of the probed window (inclusive).
+             */
+            first_port: number;
+            /** @description Instances that answered with a Fullmag session list, ordered by port. */
+            instances: components["schemas"]["DiscoveredInstance"][];
+            /**
+             * Format: int32
+             * @description Last port of the probed window (inclusive).
+             */
+            last_port: number;
+            schema_version: string;
+            /** @description Process identity of the API that answered this request. */
+            self_api_instance_id: string;
+        };
+        /** @description One session of a discovered instance, as its `GET /v2/sessions` reported it. */
+        InstanceSessionSummary: {
+            current: boolean;
+            name: string;
+            session_id: string;
+            status: string;
+        };
         /** @description Inspector document of one workspace item. */
         ItemDetail: (components["schemas"]["ProjectDetail"] & {
             /** @enum {string} */
@@ -18962,6 +19015,33 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
                 };
+            };
+        };
+    };
+    platform_get_platform_instances: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fullmag instances answering in the discovery port window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstanceDiscoveryResource"];
+                };
+            };
+            /** @description The discovery port window is misconfigured */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
