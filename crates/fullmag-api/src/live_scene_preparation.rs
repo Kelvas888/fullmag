@@ -3403,7 +3403,7 @@ mod tests {
         })).unwrap();
         let mut snapshot = crate::session::default_current_live_state(&request);
         let (_, mesh) = prepared_domain_publication(&snapshot, &prepared_fem_read_model(true)).unwrap();
-        snapshot.fem_mesh = mesh;
+        snapshot.fem_mesh = mesh.map(Into::into);
         assert!(snapshot.fem_mesh.is_some());
         crate::session::apply_current_live_metadata(&mut snapshot, json!({
             "execution_plan": {"backend_plan": {"kind": "fdm_multilayer"}},

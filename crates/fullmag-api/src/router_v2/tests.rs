@@ -10934,7 +10934,7 @@ async fn mesh_object_quality_fallback_reports_size_distribution() {
                 "avg_quality": 0.72
             }
         });
-        let mesh =
+        let mesh: FemMeshPayload =
             serde_json::from_value(mesh_value).expect("mesh quality payload should deserialize");
         snapshot.scene_document = Some(sample_scene_document());
         snapshot.fem_mesh = Some(mesh.into());
@@ -11079,7 +11079,7 @@ async fn mesh_universe_quality_fallback_reports_volume_ratio() {
                 "avg_quality": 0.72
             }
         });
-        let mesh =
+        let mesh: FemMeshPayload =
             serde_json::from_value(mesh_value).expect("mesh quality payload should deserialize");
         snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_workspace = Some(serde_json::json!({
@@ -28694,7 +28694,8 @@ async fn object_metrics_endpoint_uses_mesh_part_node_indices_for_shared_fem_node
         snapshot.fem_mesh = snapshot
             .live_state
             .as_mut()
-            .and_then(|live_state| live_state.latest_step.fem_mesh.take());
+            .and_then(|live_state| live_state.latest_step.fem_mesh.take())
+            .map(Into::into);
         snapshot.scalar_revision = 21;
     }
     let app = build_v2_router().with_state(state);
@@ -41799,7 +41800,7 @@ async fn v2_fdm_vector_respects_max_samples_when_preview_would_be_downscaled() {
             .expect("current FDM physical step should apply");
         publish_test_preview_fields(snapshot, vec![preview])
             .expect("downscaled preview should publish through an accepted field frame");
-        snapshot.fem_mesh = stale_fem_mesh;
+        snapshot.fem_mesh = stale_fem_mesh.map(Into::into);
         snapshot.state_version = 26;
     }
     let app = build_v2_router().with_state(state);
