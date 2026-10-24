@@ -14,7 +14,7 @@ def validate_options(args):
                           ("candidate_receipt_sha256", r"[0-9a-f]{64}")):
         if re.fullmatch(pattern, getattr(args,name,"")) is None:
             raise ValueError("Full immutable pin required: "+name)
-    if re.fullmatch(r"\.backend-package-candidate-[A-Za-z0-9._-]+",args.candidate_basename) is None:
+    if args.candidate_basename != "published" and re.fullmatch(r"\.backend-package-candidate-[A-Za-z0-9._-]+",args.candidate_basename) is None:
         raise ValueError("Exact managed candidate basename required")
     if not args.request.startswith("verification/") or ".." in Path(args.request).parts:
         raise ValueError("Request must be a relative control verification artifact")
@@ -29,12 +29,23 @@ x=json.loads(sys.argv[1])
 with backend._runtime_build_lock(Path("/build")):
  if os.environ.get("FULLMAG_COMPOSE_PROJECT")!=x["compose_project"]:
      raise RuntimeError("Compose identity changed")
- candidate=backend.PACKAGE_ROOT/".development"/backend.PACKAGE_CANDIDATES_DIRNAME/x["candidate_basename"]
- backend._assert_no_links(candidate,"recovery candidate")
- marker=backend._validate_candidate_marker(candidate,backend.PACKAGE_ROOT,Path("/build"),state="ready")
- if marker["artifact_inventory_sha256"]!=backend._sha256_bytes(backend._canonical(backend._hash_package(candidate))):
-    raise RuntimeError("Ready marker differs from the candidate artifact inventory")
- receipt,raw,_=backend._validated_package(candidate,"preclaim recovery candidate",exclude_candidate_marker=True)
+ if x["candidate_basename"]=="published":
+    candidate=backend.PACKAGE_ROOT
+    backend._assert_no_links(candidate,"published recovery package")
+    receipt,raw,_=backend._validated_package(candidate,"published preclaim recovery package",exclude_development_control=True)
+    provenance=backend._snapshot_bound_provenance()
+    if provenance is None:
+        raise RuntimeError("Published package has no bound provenance")
+    bound=json.loads(provenance)
+    if bound.get("build_receipt_sha256")!=x["candidate_receipt_sha256"] or bound.get("package_root")!=str(candidate):
+        raise RuntimeError("Published package provenance differs from pinned receipt")
+ else:
+    candidate=backend.PACKAGE_ROOT/".development"/backend.PACKAGE_CANDIDATES_DIRNAME/x["candidate_basename"]
+    backend._assert_no_links(candidate,"recovery candidate")
+    marker=backend._validate_candidate_marker(candidate,backend.PACKAGE_ROOT,Path("/build"),state="ready")
+    if marker["artifact_inventory_sha256"]!=backend._sha256_bytes(backend._canonical(backend._hash_package(candidate))):
+        raise RuntimeError("Ready marker differs from the candidate artifact inventory")
+    receipt,raw,_=backend._validated_package(candidate,"preclaim recovery candidate",exclude_candidate_marker=True)
  if hashlib.sha256(raw).hexdigest()!=x["candidate_receipt_sha256"]:
      raise RuntimeError("Candidate receipt changed")
  request=Path(x["request_path"])

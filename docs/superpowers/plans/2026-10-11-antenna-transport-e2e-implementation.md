@@ -3033,3 +3033,20 @@ Dowody w wolumenie kontrolnym grupy:
 `verification/universe-volume-policy-20261023/fms-open-projection-audit/`:
 `native-open.json` oraz `source-audit.json`. Bez kompilacji testów Rust,
 nowego Solve, ponownego startu API lub rozszerzania oczekującej zgody recovery.
+
+
+### Wykonanie zgody fingerprint recovery — 24.10.2026
+
+Użytkownik zaakceptował patch 6ce99bd5… i warunkowy recovery. Build kandydata,
+pełny preview, dwie negatywne kontrole pinów, Cancel a642… rev4, promocja oraz
+zarządzany restart grupy 3203 przeszły. Dwa preview potwierdziły jeden stabilny
+fingerprint różny od starego. Siedemdziesiąt wcześniejszych plików, pięć katalogów
+i FMS zachowano identyczne. Szczegóły i ograniczenia są w
+2026-10-24-universe-fingerprint-recovery-proposal.md, sekcja wykonania po zgodzie.
+
+Publiczny zastępczy Solve został przyjęty jako Run
+run-live-8d181b0e7ac898ebbc0cb6e8b6a7b958219a6f8ccea0943e7e5d5704824bb331.
+Jego przygotowanie zakończyło się poprawnie i natywny worker rzeczywiście działa.
+Jeden wcześniejszy request odrzucono HTTP409 przed przyjęciem; timeout poprawnego
+requestu nie spowodował ponowienia. Wynik Universe, binarna walidacja V/J/H oraz
+WebGL nadal NOT VERIFIED w chwili tego wpisu; E0 pozostaje jedynym odebranym etapem.

@@ -1,7 +1,8 @@
 # Universe: poprawka tożsamości siatki i odzyskanie własnej grupy 3203
 
-Status: propozycja do decyzji użytkownika. Patch bramek nie został zastosowany.
-Build kandydata i natywny preview nie zostały wykonane. E1–E12 nadal otwarte.
+Status: zatwierdzona procedura wykonana do uruchomienia natywnego Solve.
+Build, preview, warunkowy Cancel i restart przeszły. Nowy wynik Universe oraz
+WebGL pozostają NOT VERIFIED. E1–E12 nadal otwarte.
 
 ## Stan rzeczywisty
 
@@ -118,3 +119,59 @@ Użytkownik zatwierdził opisaną warunkową procedurę („akceptuje”). Dokł
 patch 6ce99bd5… został zastosowany po sprawdzeniu wszystkich hashy bazowych
 i końcowych. Nie zmieniono jeszcze katalogu Run ani stanu runtime. Następny
 krok: sprawdzenia źródeł, commit oraz zarządzany build kandydata.
+
+
+## Wykonanie po zgodzie — 24.10.2026, stan podczas obliczeń
+
+Zastosowany patch zapisano w 7008afd9eab3ecb6b9e17bccb1a02fee802e2d02.
+Pierwszy build ujawnił użycie prywatnego reject_link. Minimalna poprawka
+7501800a074b89c73990185a388427b954f1a24a używa istniejącego publicznego
+checked_path, zachowując kontrolę linków i containment. Następny build
+b6a0da22261443b8a8f63a31ab5afac2 przeszedł, bez błędów kompilatora.
+Receipt pakietu: d1e628a2a25aadf99faa309149705fa297e29cdcbfa02830f7361febf38f39f9.
+
+Preview przed promocją odmówił: nowy commit binarny nie zgadzał się ze starym
+kanonicznym provenance. Nie wyłączono tej kontroli. Promocja bez startu runtime
+87ebf6014f484bf08d4a787fb163c999 przeszła, po czym kontroler otrzymał jawny
+wybór published: tylko PACKAGE_ROOT, kompletne inventory, dokładny receipt
+oraz powiązane provenance pod dotychczasową build lock. Nie zmieniono natywnych
+warunków anulowania. Sześć lekkich testów opcji, parser Bash/just oraz niezależny
+review wiring przeszły. Testów Rust nie kompilowano.
+
+Dwa rzeczywiste preview dały identyczny poprawiony fingerprint
+2ece71556b96d660c424f104a6367fcf596e4ebe9a64550db4f509f0eab9f843,
+różny od zapisanego 2118aec25de60892d810e3e4999bc6365b1d4cf43695d3c336fcc8332cc32899.
+Negatywne verify-only z błędnym OWNER SHA i przestrzenią PID odmówiły.
+Zatwierdzony apply f08c6c11acad4769bf5c5d4853c19cd4 zakończył wyłącznie a642…:
+Cancelled rev4, hash katalogu 3f193d206c4a020358964db3410cd0d0e2b5a80f66545578fbb15aa650e272c7.
+Input fingerprint, przygotowanie i CAS nie zostały przepisane.
+
+Zarządzane stop-failed i recreate zachowały state/cache. Pierwszy start odmówił
+z powodu chwilowego kontenera, którego po odmowie nie było już w Dockerze.
+Istniejący CLI resume-recreation wystawiono przez ścisłą recepturę just;
+nie zmieniono bramek lifecycle ani nie powtórzono usuwania usług.
+Start 8b881fa8d50746e8aca521a1b6618f72 zakończył się succeeded, port 3203,
+config ff12a3b0e4d89aa23997f6a2f0062ee03b53b2e1fc49734697f44cd10a5ded17.
+Toolchain/images były cache hit; aplikacja przebudowała swój pakiet w backendzie.
+
+Publiczny import skryptu potwierdził round-trip. Osobne przygotowanie Mesh Build
+zakończyło się poprawnie, a jego nieuruchomioną obserwację b29… zamknięto publicznym
+Stop, zachowując siatkę. To terminalizowało sesję; Solve dostał jawne HTTP409
+session_cancelled_read_only bez utworzenia zadania. Ten sam kanoniczny model
+przywrócono do nowej sesji, a Solve sam przygotował domenę. Nie ponawiano Solve
+po timeout transportu: trwały katalog potwierdził przyjęcie i uruchomienie.
+
+Jedyny przyjęty zastępczy Solve:
+- sesja session-18e14e039f9aa74a00000a85;
+- Run run-live-8d181b0e7ac898ebbc0cb6e8b6a7b958219a6f8ccea0943e7e5d5704824bb331;
+- task task-3151e003704f28bd5eabf7936ee5248af7446c9150d261a8c2301c057c476cc0;
+- attempt attempt-7c35a45efffb4389ad7435ef83ebbd98;
+- komenda fm-a32e38b8-a217-4486-b183-04c7b11f7a0b.
+
+Przygotowanie native potwierdziło 678 węzłów i 1863 Tet4 przewodnika,
+zero niepoprawnych komórek. Istnieje worker_execution_started; trwały lifecycle
+Running, aktywny worker widoczny w procesach kontenera. To dowód rzeczywistego
+wykonania, jeszcze nie poprawnego V/J/H. Nie ma zgody na kolejne przyjęte Solve.
+Po recovery ponownie potwierdzono 70 wcześniejszych plików, pięć katalogów i FMS
+jako identyczne. Dowody: approved-new-solve/ oraz preclaim-cancel-proposal/
+w verification/universe-volume-policy-20261023 w wolumenie kontrolnym grupy.
