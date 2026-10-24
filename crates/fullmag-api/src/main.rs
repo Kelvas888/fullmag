@@ -91,6 +91,7 @@ mod script;
 mod script_check;
 mod session;
 mod session_persistence;
+mod shared_json;
 mod types;
 
 use artifacts::*;
@@ -3917,7 +3918,7 @@ mod authoring_grid_heartbeat_tests {
         req.session_status = Some("running".into());
         assert!(!is_authoring_grid_snapshot(&req));
         let mut req = grid();
-        req.metadata = Some(json!({"publisher": "runtime"}));
+        req.metadata = Some(json!({"publisher": "runtime"}).into());
         assert!(!is_authoring_grid_snapshot(&req));
         let mut req = grid();
         req.coupled_checkpoint = Some(json!({}));
@@ -7190,12 +7191,9 @@ fn current_global_scalar_value(current: &SessionStateResponse, quantity: &str) -
             // Only the component fallback needs plan provenance. Do not clone
             // mesh/material arrays on live reads or unrelated scalar requests.
             let plan = (metric_key == "e_rotated_dmi")
-                .then(|| current.metadata.as_ref()?.get("execution_plan"))
-                .flatten()
-                .and_then(|value| {
-                    serde_json::from_value::<fullmag_ir::ExecutionPlanIR>(value.clone()).ok()
-                });
-            run_manifest_scalar_value(current.run.as_ref(), metric_key, plan.as_ref())
+                .then(|| current.metadata.as_ref()?.execution_plan())
+                .flatten();
+            run_manifest_scalar_value(current.run.as_ref(), metric_key, plan.as_deref())
         })
 }
 

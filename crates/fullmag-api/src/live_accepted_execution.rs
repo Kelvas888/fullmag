@@ -1072,7 +1072,11 @@ async fn publish_accepted_live_study_with_preparation_failure_under_transition(
             .current_live_session_epoch
             .load(std::sync::atomic::Ordering::Acquire),
     )?;
-    let mut metadata = snapshot.metadata.take().unwrap_or_else(|| json!({}));
+    let mut metadata = snapshot
+        .metadata
+        .take()
+        .map(crate::shared_json::SharedJson::into_value)
+        .unwrap_or_else(|| json!({}));
     if !metadata.is_object() {
         metadata = json!({"previous_metadata": metadata});
     }

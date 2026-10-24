@@ -9441,7 +9441,7 @@ mod tests {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         snapshot
             .field_quantity_revisions
             .insert("H_demag".to_string(), 7);
@@ -9516,7 +9516,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         snapshot.live_state = Some(
             serde_json::from_value(serde_json::json!({
                 "status": "running",
@@ -9636,7 +9636,7 @@ mod tests {
                 "backend": "fdm_multilayer",
                 "grid_cells": [2, 1, 1]
             }
-        }));
+        }).into());
         add_physical_field_source(&mut snapshot, 2, None);
         snapshot.preview_cache.insert(LivePreviewField {
             config_revision: 1,
@@ -9781,7 +9781,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         snapshot.live_state = Some(
             serde_json::from_value(serde_json::json!({
                 "status": "running",
@@ -9894,7 +9894,7 @@ mod tests {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         snapshot.field_samples_revision = 91;
         snapshot
             .field_quantity_revisions
@@ -10090,7 +10090,7 @@ mod tests {
         let mut snapshot = default_current_live_state(&request);
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } }
-        }));
+        }).into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "source_step": 12,

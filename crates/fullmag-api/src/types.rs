@@ -832,7 +832,7 @@ pub(crate) struct SessionStateResponse {
     pub runtime_status: RuntimeStatusView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<BackendCapabilities>,
-    pub metadata: Option<Value>,
+    pub metadata: Option<crate::shared_json::SharedJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mesh_workspace: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

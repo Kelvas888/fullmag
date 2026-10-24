@@ -1760,7 +1760,7 @@ struct CurrentLiveApplyFlags {
 }
 
 pub(crate) fn apply_current_live_metadata(current: &mut SessionStateResponse, metadata: Value) {
-    current.metadata = Some(metadata);
+    current.metadata = Some(metadata.into());
     if let Some(metadata) = current.metadata.as_ref() {
         // A session can be reused while switching execution lanes.  The FEM
         // mesh is solver-domain state, not scene authoring geometry; retain it
@@ -2006,7 +2006,7 @@ fn apply_frozen_spins_runtime_status(
 ) {
     let Some(metadata) = current
         .metadata
-        .get_or_insert_with(|| serde_json::json!({}))
+        .get_or_insert_with(|| serde_json::json!({}).into())
         .as_object_mut()
     else {
         return;
@@ -5469,7 +5469,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         current.latest_fields =
             serde_json::from_value(json!({"m": {"generation": 1}})).expect("valid fields fixture");
         add_physical_observation(&mut current, 1, None);
@@ -5610,7 +5610,7 @@ mod tests {
             let mut current = test_current_snapshot();
             current.metadata = Some(json!({
                 "artifact_layout": { "backend": "fdm", "grid_cells": [1, 1, 1] }
-            }));
+            }).into());
             if kind == "compute_fields" {
                 add_physical_observation(&mut current, 0, None);
             }
@@ -5788,7 +5788,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         add_physical_observation(&mut current, 1, Some(1.0e-12));
         let generation_id = domain_generation_id(&current);
         let mut command = session_command("cmd-fields", "compute_fields");
@@ -5854,7 +5854,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         current.accepted_terminal_field_generation =
             Some(crate::types::CurrentLiveFieldGeneration {
                 run_id: "run-1".to_string(),
@@ -7238,7 +7238,7 @@ mod tests {
         let mut current = test_current_snapshot();
         current.metadata = Some(json!({
             "execution_plan": { "backend_plan": { "kind": "antenna_external_lead_inspection" } }
-        }));
+        }).into());
         let mut late = live_state_with_magnetization(5, vec![1.0, 0.0, 0.0]);
         late.latest_step.preview_field = Some(preview_field("H_eff"));
         apply_current_live_runtime_frame(
@@ -7934,7 +7934,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         add_physical_observation(&mut current, 52, None);
         current.latest_fields = serde_json::from_value(json!({
             "H_demag": {
@@ -8230,7 +8230,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [2, 1, 1]
             }
-        }));
+        }).into());
         add_physical_observation(&mut current, 52, None);
         let field = |values: Vec<Vec<f64>>| -> LatestFields {
             serde_json::from_value(json!({
@@ -8289,7 +8289,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         add_physical_observation(&mut current, 10, None);
         add_physical_observation(&mut current, 11, None);
         current.latest_fields = serde_json::from_value(json!({

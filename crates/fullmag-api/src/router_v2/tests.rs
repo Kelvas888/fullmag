@@ -2867,7 +2867,7 @@ async fn test_router_with_runtime_read_models() -> axum::Router {
                     "integrator": "rk45"
                 }
             }
-        }));
+        }).into());
         snapshot.engine_log = vec![
             crate::types::EngineLogEntry {
                 timestamp_unix_ms: 1,
@@ -4239,7 +4239,7 @@ async fn status_active_lane_uses_published_resolved_execution_when_session_field
                 "precision": "double",
                 "mode": "strict"
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(
             serde_json::from_value(serde_json::json!({
                 "engine_id": "fdm_cpu_reference",
@@ -4292,7 +4292,7 @@ async fn status_active_lane_fails_closed_for_partial_session_resolution() {
             "resolved_execution": {
                 "backend": "fdm", "device": "cpu", "precision": "double", "mode": "strict"
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -4320,7 +4320,7 @@ async fn status_active_lane_fails_closed_when_session_and_metadata_conflict() {
             "resolved_execution": {
                 "backend": "fdm", "device": "cuda", "precision": "double", "mode": "strict"
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -4371,7 +4371,7 @@ async fn status_exposes_typed_relaxation_algorithm_from_canonical_metadata() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.metadata = Some(serde_json::json!({
             "relaxation_algorithm": "nonlinear_cg"
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -4564,7 +4564,7 @@ async fn domain_status_and_meta_preserve_built_fem_and_explicit_fdm_with_retaine
                     }
                 }
             }
-        }));
+        }).into());
     }
 
     let fdm_status_response = app
@@ -4614,7 +4614,7 @@ async fn domain_meta_uses_fdm_physical_cell_size_for_grid_and_bounds() {
                 "origin_m": [1.0e-9, -2.0e-9, 3.0e-9],
                 "cell_size": [2.0e-9, 3.0e-9, 4.0e-9]
             }
-        }));
+        }).into());
         snapshot.live_state = Some(LiveState {
             status: "running".into(),
             updated_at_unix_ms: 1_700_000_000_123,
@@ -4698,7 +4698,7 @@ async fn domain_meta_uses_fdm_artifact_layout_before_first_live_step() {
                 "origin": [-3.0e-9, -2.0e-9, -1.0e-9],
                 "cell_size": [1.0e-9, 2.0e-9, 5.0e-9]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
     let app = build_v2_router().with_state(state);
@@ -4809,7 +4809,7 @@ async fn fdm_multilayer_layout_exposes_common_and_native_layer_metadata() {
                     }
                 }
             }
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
     let response = app
@@ -4873,7 +4873,7 @@ async fn fdm_multilayer_native_active_mask_is_served_as_revisioned_fmbm() {
                 }],
                 "common_cells": [4, 3, 1]
             }}
-        }));
+        }).into());
     }
 
     let layout_response = build_v2_router()
@@ -4970,7 +4970,7 @@ async fn fdm_multilayer_layout_correlates_reordered_artifact_layers_by_identity(
                     }
                 ]
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -5036,7 +5036,7 @@ async fn fdm_multilayer_layout_rejects_plan_artifact_grid_and_count_conflicts() 
                     "total_cell_count": 3, "active_cell_count": 1, "inactive_cell_count": 2
                 }]
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -5157,7 +5157,7 @@ async fn fdm_multilayer_layout_rejects_missing_or_malformed_native_layers() {
                     "native_origin": [0.0, 0.0, 0.0]
                 }]
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -5180,7 +5180,7 @@ async fn fdm_multilayer_layout_rejects_missing_or_malformed_native_layers() {
                     "native_grid": [1, 1, 1], "native_origin": [0.0, 0.0, 0.0]
                 }]
             } }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -5209,7 +5209,7 @@ async fn fdm_multilayer_layout_rejects_unmaterialized_or_malformed_active_masks(
                     "native_active_mask": [true]
                 }]
             } }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -5259,7 +5259,7 @@ async fn fdm_multilayer_layout_rejects_unmaterialized_or_malformed_active_masks(
                     "total_cell_count": 2, "active_cell_count": 2, "inactive_cell_count": 0
                 }]
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -5285,7 +5285,7 @@ async fn status_uses_fdm_artifact_layout_revision_before_first_live_step() {
                 "origin_m": [-3.0e-9, -2.0e-9, -1.0e-9],
                 "cell_size": [1.0e-9, 2.0e-9, 5.0e-9]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
     let app = build_v2_router().with_state(state);
@@ -5453,7 +5453,7 @@ async fn realtime_state_uses_fdm_artifact_layout_domain_revision() {
                 "origin": [-3.0e-9, -2.0e-9, -1.0e-9],
                 "cell_size": [1.0e-9, 2.0e-9, 5.0e-9]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
         snapshot.clone()
     };
@@ -5475,7 +5475,7 @@ async fn domain_meta_accepts_planar_fdm_zero_spacing_axis() {
                 "grid_cells": [4, 3, 1],
                 "cell_size": [2.0e-9, 3.0e-9, 0.0]
             }
-        }));
+        }).into());
         snapshot.live_state = Some(LiveState {
             status: "running".into(),
             updated_at_unix_ms: 1_700_000_000_123,
@@ -5564,7 +5564,7 @@ async fn fdm_domain_endpoints_ignore_reused_fem_topology() {
                 "backend": "fdm",
                 "grid_cells": [4, 1, 1]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
     let app = build_v2_router().with_state(state);
@@ -5615,7 +5615,7 @@ async fn fdm_multilayer_domain_endpoints_ignore_reused_fem_topology() {
                 "common_cells": [4, 2, 1],
                 "layers": []
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
     let app = build_v2_router().with_state(state);
@@ -5705,7 +5705,7 @@ async fn fdm_multilayer_field_slice_uses_common_grid_geometry() {
                 "common_cells": [4, 2, 1],
                 "layers": []
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -9132,7 +9132,7 @@ async fn completed_rotated_dmi_scalar_preview_uses_plan_gated_manifest_fallback(
             physics_graph: None,
         },
     };
-    snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan }));
+    snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan }).into());
     assert_eq!(
         crate::current_global_scalar_value(snapshot, "E_rotated_dmi"),
         Some(-2.5e-18)
@@ -9170,7 +9170,7 @@ async fn table_rows_expose_rotated_dmi_energy_as_an_independent_global_scalar() 
                 "every_steps": 1,
                 "quantities": ["step", "e_rotated_dmi"]
             }
-        }));
+        }).into());
         snapshot.scalar_rows = vec![row];
         snapshot.scalar_revision = 1;
     }
@@ -9209,7 +9209,7 @@ async fn table_resources_expose_only_configured_autosave_quantities() {
                 "every_steps": 10,
                 "quantities": ["step", "mx", "e_ex"]
             }
-        }));
+        }).into());
         snapshot.scalar_rows = vec![sample_scalar_row(1, 1e-12, 6.9)];
         snapshot.scalar_revision = 1;
     }
@@ -9668,7 +9668,7 @@ async fn frozen_spins_uses_quantity_catalog_field_catalog_and_fmvp_scalar_data_p
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(resolved_compute_fields_capabilities(&["frozen_spins"]));
         let latest_fields = serde_json::from_value(serde_json::json!({
             "frozen_spins": {
@@ -9816,7 +9816,7 @@ async fn fem_frozen_spins_object_scope_uses_true_mesh_node_carrier() {
         snapshot.session.resolved_backend = Some("fem-cpu".to_string());
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fem" } }
-        }));
+        }).into());
         snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
         snapshot.mesh_revision = 11;
         snapshot.capabilities = Some(resolved_compute_fields_capabilities(&["frozen_spins"]));
@@ -12417,7 +12417,7 @@ async fn fdm_grid_refresh_command_is_queued_for_atomic_runtime_replan() {
                     "grid": { "cells": [2, 2, 1] }
                 }
             }
-        }));
+        }).into());
         crate::session::refresh_runtime_status(snapshot);
     }
     let app = build_v2_router().with_state(state.clone());
@@ -12557,7 +12557,7 @@ async fn fdm_grid_refresh_command_rejects_non_fdm_sessions_without_queueing() {
         snapshot.scene_document = Some(scene);
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": { "backend": "fdm" }
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state.clone());
 
@@ -12629,7 +12629,7 @@ async fn fdm_grid_refresh_rejects_unknown_or_automatic_lane_without_artifact_fal
                     "backend_plan": { "kind": kind }
                 });
             }
-            snapshot.metadata = Some(metadata);
+            snapshot.metadata = Some(metadata.into());
         }
         let app = build_v2_router().with_state(state.clone());
 
@@ -12697,7 +12697,7 @@ async fn fdm_grid_refresh_uses_active_plan_or_explicit_request_without_resolved_
                 .unwrap_or_else(sample_scene_document);
             scene.study.requested_backend = "fdm".into();
             snapshot.scene_document = Some(scene);
-            snapshot.metadata = Some(metadata);
+            snapshot.metadata = Some(metadata.into());
             crate::session::refresh_runtime_status(snapshot);
         }
         let app = build_v2_router().with_state(state.clone());
@@ -12731,7 +12731,7 @@ async fn fdm_grid_refresh_command_rejects_missing_authoring_scene_without_queuei
         snapshot.scene_document = None;
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } }
-        }));
+        }).into());
         crate::session::refresh_runtime_status(snapshot);
     }
     let app = build_v2_router().with_state(state.clone());
@@ -17049,7 +17049,7 @@ async fn fdm_universe_config_put_preserves_shared_airbox_authoring_contract() {
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } },
             "artifact_layout": { "backend": "fdm", "grid_cells": [128, 32, 30] }
-        }));
+        }).into());
         snapshot.scene_document = Some(sample_scene_document());
     }
     let app = build_v2_router().with_state(state.clone());
@@ -18508,7 +18508,7 @@ async fn planar_field_resources_publish_meta_binary_probe_png_and_etag() {
                 "origin_m": [-0.5, -0.5, -0.5],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -19012,7 +19012,7 @@ async fn planar_field_fdm_object_target_uses_published_membership_and_grid_geome
                     "material": { "ms_field": [4.0, 9.0] }
                 }
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "mat_ms": {
                 "values": [4.0, 9.0],
@@ -19332,7 +19332,7 @@ async fn planar_field_snapshot_is_stage_scoped_and_uses_persisted_values() {
                 "origin_m": [-0.5, -0.5, -0.5],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
     }
     let base = "/v2/sessions/current/data/fields/m/planar-monitors/snapshot_xy/meta";
     let valid = app
@@ -23290,7 +23290,7 @@ async fn compute_fields_command_contract_resolves_fdm_full_requirement() {
             "capabilities": {
                 "preview_quantities": ["m"]
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(resolved_compute_fields_capabilities(&["m"]));
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -23878,7 +23878,7 @@ async fn compute_fields_command_contract_resolves_fem_full_requirement() {
             "capabilities": {
                 "preview_quantities": ["m"]
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(resolved_compute_fields_capabilities(&["m"]));
         snapshot.fem_mesh = Some(sample_fem_mesh_payload());
         let latest_fields = serde_json::from_value(serde_json::json!({
@@ -33159,7 +33159,7 @@ async fn set_test_fdm_multilayer_layout(state: &Arc<AppState>, common_cells: [u3
                 "value_count": 1
             }]
         }
-    }));
+    }).into());
     snapshot.live_state = None;
 }
 
@@ -33676,7 +33676,7 @@ async fn set_test_fdm_domain_geometry(
             "origin_m": origin_m,
             "cell_size": cell_m
         }
-    }));
+    }).into());
     snapshot.live_state = None;
 }
 
@@ -33689,7 +33689,7 @@ async fn fdm_region_membership_is_not_current_for_a_fem_snapshot() {
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fem" } },
             "artifact_layout": { "backend": "fem" }
-        }));
+        }).into());
     }
 
     let response = app
@@ -33723,7 +33723,7 @@ async fn fdm_region_membership_is_available_from_execution_plan_before_artifact_
         serde_json::from_value(plan_value["backend_plan"]["grid_certificate"]["counts"].clone())
             .expect("planned FDM grid certificate should expose counts");
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan_value }));
+        snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan_value }).into());
         snapshot.live_state = None;
     }
     assert!(
@@ -33785,7 +33785,7 @@ async fn fdm_region_membership_rejects_a_descriptor_for_an_old_grid() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
 
@@ -33849,7 +33849,7 @@ async fn fdm_field_vector_object_scope_uses_membership_cell_ordinals() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -33951,7 +33951,7 @@ async fn fdm_field_vector_object_scope_rejects_mixed_default_numeric_membership(
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -34002,7 +34002,7 @@ async fn fdm_terminal_spatial_scalar_full_grid_preserves_values_and_object_indic
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "eden_demag": {
                 "quantity": "eden_demag",
@@ -34094,7 +34094,7 @@ async fn fdm_terminal_spatial_scalar_plane_is_not_a_current_3d_field() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "eden_demag": {
                 "quantity": "eden_demag",
@@ -34173,7 +34173,7 @@ async fn fdm_field_vector_airbox_surface_and_max_samples_use_cell_ordinals() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let values = (0..27)
             .map(|index| [index as f64, 0.0, 0.0])
             .collect::<Vec<_>>();
@@ -34260,7 +34260,7 @@ async fn fdm_field_vector_region_scope_requires_owner_for_duplicate_region_ids()
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -34473,7 +34473,7 @@ async fn fdm_multilayer_field_vector_layer_scope_uses_native_layer_layout() {
                     "value_count": 1
                 }]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -34643,7 +34643,7 @@ async fn fdm_multilayer_field_vector_object_scope_preserves_object_identity() {
                     "value_count": 1
                 }]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -34768,7 +34768,7 @@ async fn fdm_multilayer_field_vector_scope_rejects_ambiguous_identity_aliases() 
                     "value_count": 1
                 }]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -34834,7 +34834,7 @@ async fn fdm_multilayer_field_vector_region_scope_fails_closed_without_single_gr
                     "value_count": 2
                 }]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": { "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] }
@@ -35101,7 +35101,7 @@ async fn fdm_multilayer_planar_layer_scope_uses_native_grid_and_local_region_mem
                     }
                 }
             }]}
-        }));
+        }).into());
         snapshot.live_state = None;
         snapshot.latest_fields = LatestFields::default();
         snapshot.region_realization_revisions.membership = 23;
@@ -41739,7 +41739,7 @@ async fn v2_fdm_vector_respects_max_samples_when_preview_would_be_downscaled() {
                     "cell_m": [1.0, 1.0, 1.0]
                 }
             } }
-        }));
+        }).into());
         // The solver domain is a 4-cell FDM grid.  Both the legacy materialized
         // field and the preview cache below only carry a 2-cell display preview.
         let latest_fields = serde_json::from_value(serde_json::json!({
@@ -42673,7 +42673,7 @@ async fn topological_charge_uses_fdm_field_topology_with_retained_fem_mesh() {
         snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } }
-        }));
+        }).into());
         snapshot.live_state = Some(LiveState {
             status: "running".into(),
             updated_at_unix_ms: 1_700_000_000_789,
@@ -45703,7 +45703,7 @@ async fn default_planar_fdm_test_state() -> Arc<AppState> {
                 "origin_m": [10.0, 20.0, 30.0],
                 "cell_size": [1.0, 2.0, 4.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -45760,7 +45760,7 @@ async fn planar_default_fdm_even_depth_uses_cell_centered_midplane() {
                 "origin_m": [-1.0, -1.0, -1.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -45862,7 +45862,7 @@ async fn source_parity_across_meta_vector_and_planar() {
                 "origin_m": [-1.0, -1.0, -1.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -45993,7 +45993,7 @@ async fn planar_default_meta_publishes_source_and_offset_domain_frame() {
                 "origin_m": [10.0, 20.0, 30.0],
                 "cell_size": [1.0, 2.0, 4.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -52552,7 +52552,7 @@ async fn frozen_spins_test_state() -> Arc<AppState> {
                     }
                 }
             }
-        }));
+        }).into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -53071,7 +53071,7 @@ async fn frozen_spins_preview_supports_authoritative_fem_p1_carrier() {
         let source_state_revision = snapshot.state_version;
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": {"backend": "fem"}
-        }));
+        }).into());
         snapshot.fem_mesh = Some(mesh);
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -53164,7 +53164,7 @@ async fn frozen_spins_fem_preview_uses_compact_local_to_global_mapping_with_airb
         let source_state_revision = snapshot.state_version;
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": {"backend": "fem"}
-        }));
+        }).into());
         snapshot.fem_mesh = Some(mesh);
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -53255,7 +53255,7 @@ async fn frozen_spins_fem_preview_rejects_ambiguous_element_ownership() {
         let source_state_revision = snapshot.state_version;
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": {"backend": "fem"}
-        }));
+        }).into());
         snapshot.fem_mesh = Some(mesh);
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -54705,7 +54705,7 @@ async fn frozen_spins_preview_intersects_all_magnetic_with_target_object() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }}}
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
