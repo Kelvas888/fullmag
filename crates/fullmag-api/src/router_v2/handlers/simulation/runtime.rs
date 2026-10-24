@@ -1494,7 +1494,7 @@ async fn attach_hysteresis_live_magnetization(
         .live_state
         .as_ref()
         .and_then(|live| {
-            average_hysteresis_live_magnetization(&live.latest_step, snapshot.fem_mesh.as_ref())
+            average_hysteresis_live_magnetization(&live.latest_step, snapshot.fem_mesh.as_deref())
         })
         .or_else(|| {
             snapshot

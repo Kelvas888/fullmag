@@ -1655,7 +1655,7 @@ pub async fn get_authoring_couplings(
     };
     Ok(Json(CouplingListResource {
         scene_revision: scene.revision,
-        couplings: authored_coupling_resources(&scene, execution_plan.as_deref(), fem_mesh.as_ref()),
+        couplings: authored_coupling_resources(&scene, execution_plan.as_deref(), fem_mesh.as_deref()),
     }))
 }
 

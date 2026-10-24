@@ -92,6 +92,7 @@ mod script_check;
 mod session;
 mod session_persistence;
 mod shared_json;
+mod shared_mesh;
 mod types;
 
 use artifacts::*;
@@ -6692,7 +6693,7 @@ fn build_spatial_preview_state(
             auto_downscaled: false,
             auto_downscale_message: None,
             preview_grid: [vectors.len(), 1, 1],
-            fem_mesh: Some(mesh.clone()),
+            fem_mesh: Some(fullmag_runner::FemMeshPayload::clone(mesh)),
             original_node_count: Some(mesh.nodes.len()),
             original_face_count: Some(mesh.facet_count()),
             active_mask,
@@ -6984,7 +6985,7 @@ fn build_preview_state_from_live_field(
             auto_downscaled: field.auto_downscaled,
             auto_downscale_message: field.auto_downscale_message.clone(),
             preview_grid,
-            fem_mesh: Some(mesh.clone()),
+            fem_mesh: Some(fullmag_runner::FemMeshPayload::clone(&mesh)),
             original_node_count: Some(mesh.nodes.len()),
             original_face_count: Some(mesh.facet_count()),
             active_mask,

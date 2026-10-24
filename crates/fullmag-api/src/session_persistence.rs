@@ -63,7 +63,7 @@ struct PersistedCurrentLiveSnapshot {
     scalar_rows: Vec<crate::types::ScalarRow>,
     engine_log: Vec<crate::types::EngineLogEntry>,
     quantities: Vec<crate::types::QuantityDescriptor>,
-    fem_mesh: Option<fullmag_runner::FemMeshPayload>,
+    fem_mesh: Option<crate::shared_mesh::SharedFemMesh>,
     latest_fields: crate::types::LatestFields,
     #[serde(default)]
     field_publication_bundles: BTreeMap<String, crate::schemas::common::FieldPublicationBundle>,

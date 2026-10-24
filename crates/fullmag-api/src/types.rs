@@ -845,7 +845,7 @@ pub(crate) struct SessionStateResponse {
     pub engine_log: Vec<EngineLogEntry>,
     pub solver_profile: SolverProfileResource,
     pub quantities: Vec<QuantityDescriptor>,
-    pub fem_mesh: Option<FemMeshPayload>,
+    pub fem_mesh: Option<crate::shared_mesh::SharedFemMesh>,
     pub latest_fields: LatestFields,
     /// Exact accepted-frame publication bindings. These are produced together
     /// with field/scalar acceptance and must never be reconstructed by a read handler.
@@ -2373,7 +2373,7 @@ mod tests {
             engine_log: &response.engine_log,
             solver_profile: &response.solver_profile,
             quantities: &response.quantities,
-            fem_mesh: response.fem_mesh.as_ref(),
+            fem_mesh: response.fem_mesh.as_deref(),
             latest_fields: &response.latest_fields,
             artifacts: &response.artifacts,
             display_selection: &response.display_selection,

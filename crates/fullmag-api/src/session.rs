@@ -1583,11 +1583,11 @@ fn apply_fem_mesh_update(
     }
 
     let changed =
-        current.fem_mesh.as_ref().map(fem_mesh_identity) != Some(fem_mesh_identity(&fem_mesh));
+        current.fem_mesh.as_deref().map(fem_mesh_identity) != Some(fem_mesh_identity(&fem_mesh));
     if changed {
         clear_mesh_dirty_tags_for_solver_mesh(current, &fem_mesh);
     }
-    current.fem_mesh = Some(fem_mesh);
+    current.fem_mesh = Some(fem_mesh.into());
     if changed {
         bump_mesh_revision(current);
         bump_mesh_build_revision(current);
@@ -2146,7 +2146,8 @@ fn finalize_current_live_apply(
         current.fem_mesh = current
             .metadata
             .as_ref()
-            .and_then(extract_fem_mesh_from_metadata);
+            .and_then(extract_fem_mesh_from_metadata)
+            .map(Into::into);
     }
     if let Some(node_count) = current.fem_mesh.as_ref().map(|mesh| mesh.nodes.len()) {
         expand_uniform_material_latest_fields(&mut current.latest_fields, node_count);
@@ -4388,7 +4389,7 @@ mod tests {
     #[test]
     fn cached_physical_field_sources_survive_a_later_solver_progress_callback() {
         let mut current = test_current_snapshot();
-        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1"));
+        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1").into());
         add_physical_observation(&mut current, 4, Some(4.0e-12));
         let node_values = vec![[1.0, 0.0, 0.0]; 4];
         let mut latest_fields: LatestFields = serde_json::from_value(json!({
@@ -4839,7 +4840,7 @@ mod tests {
             fem_mesh: None,
         });
 
-        current.fem_mesh = Some(domain_fem_mesh("stale-fem-domain"));
+        current.fem_mesh = Some(domain_fem_mesh("stale-fem-domain").into());
         apply_current_live_metadata(
             &mut current,
             json!({
@@ -6598,7 +6599,7 @@ mod tests {
 
     fn current_with_accepted_fem_m_preview() -> (SessionStateResponse, LivePreviewField) {
         let mut current = test_current_snapshot();
-        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1"));
+        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1").into());
         let mut preview = preview_field("m");
         preview.source_step = 7;
         preview.source_time_seconds = Some(7.0e-12);
@@ -6651,7 +6652,7 @@ mod tests {
     #[test]
     fn new_mesh_frame_does_not_inherit_the_previous_fem_generation_hint() {
         let mut current = test_current_snapshot();
-        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1"));
+        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1").into());
         let mut previous_live_state =
             live_state_with_magnetization(7, vec![0.25; 12]);
         previous_live_state.latest_step.grid = [4, 1, 1];
@@ -6763,7 +6764,7 @@ mod tests {
     #[test]
     fn explicit_stale_fem_generation_does_not_qualify_live_m() {
         let mut current = test_current_snapshot();
-        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-current"));
+        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-current").into());
         let mut live_state = live_state_with_magnetization(
             8,
             vec![
@@ -6947,7 +6948,7 @@ mod tests {
     #[test]
     fn latest_m_writer_rejects_registered_replay_after_topology_change() {
         let mut current = test_current_snapshot();
-        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1"));
+        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1").into());
         let mut live_state = live_state_with_magnetization(7, vec![0.25; 12]);
         live_state.latest_step.grid = [4, 1, 1];
         live_state.latest_step.fem_mesh_generation_id =
@@ -6986,7 +6987,7 @@ mod tests {
             .as_object_mut()
             .expect("Latest m is an object")
             .remove("observation_frame");
-        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-2"));
+        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-2").into());
         let replay_fields = serde_json::from_value(json!({ "m": replay }))
             .expect("exact Latest m replay should deserialize");
 
@@ -7097,7 +7098,7 @@ mod tests {
         for change_generation_id in [false, true] {
             let mut current = test_current_snapshot();
             let original_mesh = domain_fem_mesh("mesh-generation-1");
-            current.fem_mesh = Some(original_mesh.clone());
+            current.fem_mesh = Some(original_mesh.clone().into());
             current.live_state = Some(live_state_with_magnetization(
                 7,
                 vec![
@@ -7158,7 +7159,7 @@ mod tests {
     #[test]
     fn standalone_snapshot_clears_magnetic_carriers_without_clearing_terminal_fence() {
         let mut current = test_current_snapshot();
-        current.fem_mesh = Some(domain_fem_mesh("old-magnetic-mesh"));
+        current.fem_mesh = Some(domain_fem_mesh("old-magnetic-mesh").into());
         current.latest_fields = serde_json::from_value(json!({
             "m": { "values": [[1.0, 0.0, 0.0]] },
             "mat_ms": { "values": [800_000.0] }
