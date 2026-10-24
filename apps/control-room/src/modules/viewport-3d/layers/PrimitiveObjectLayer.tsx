@@ -20,7 +20,6 @@ import {
 
 import type { Viewport3DResourceTracker } from "../viewport3dDiagnostics";
 import { useBatchedInvalidate } from "../viewport3dBatchedInvalidate";
-import { buildSurfaceEdgeGeometryFromBufferGeometry } from "../viewport3dSurfaceEdges";
 import { buildViewport3DPrimitiveFrameKey } from "../viewport3dPrimitiveModel";
 import type {
   Viewport3DPrimitiveObject,
@@ -33,6 +32,7 @@ import {
   pointColorFromSettings,
 } from "./viewport3DLayerSettings";
 import { resolveViewport3DTargetRenderPlan } from "./viewport3DTargetRenderPlan";
+import { buildPrimitiveWireframeGeometry } from "./primitiveWireframeGeometry";
 import {
   buildPrimitiveTransformGizmoSegments,
   releasePrimitiveObjectGeometry,
@@ -216,9 +216,9 @@ function RenderablePrimitiveObject({
     [geometry, tracker],
   );
   const edgeGeometry = useMemo(() => {
-    const next = buildSurfaceEdgeGeometryFromBufferGeometry(geometry);
+    const next = buildPrimitiveWireframeGeometry(object, geometry);
     return next ? tracker.track("geometry", next) : null;
-  }, [geometry, tracker]);
+  }, [geometry, object, tracker]);
 
   useEffect(
     () => () => tracker.release("geometry", edgeGeometry),

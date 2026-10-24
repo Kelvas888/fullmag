@@ -139,6 +139,9 @@ struct DurableProjection {
     artifact_catalog_revision: Option<u64>,
     terminal_without_outputs: bool,
     status: &'static str,
+    accepted_runtime_capabilities: Option<fullmag_runner::BackendCapabilities>,
+    accepted_runtime_mode: Option<fullmag_ir::ExecutionMode>,
+    accepted_runtime_problem: Option<fullmag_ir::ProblemIR>,
     command_id: Option<String>,
     /// The run executes one interactive command (not a startup script).
     interactive_command: bool,
@@ -226,7 +229,7 @@ async fn poll_once(
     })
     .await
     .map_err(|error| ApiError::internal(format!("accepted projection task failed: {error}")))??;
-    let Some(projection) = projection else {
+    let Some(mut projection) = projection else {
         return Ok(());
     };
     let next_cursor = ProjectionCursor {
@@ -258,36 +261,77 @@ async fn poll_once(
         // A terminal catalog without outputs still carries authoritative
         // lifecycle state. Do not require preparation/materialization or clear
         // existing live fields before publishing that terminal state.
-        Ok(())
+        Ok(None)
     } else if let Some((_, observation)) = projection
         .live_observation
         .as_ref()
         .filter(|(_, observation)| observation.magnetization_values.is_some())
     {
-        ensure_stage_preparation_for_step(
-            state,
-            &context,
-            &observation.header.step_id,
-            None,
-        )
-        .await
+        ensure_stage_preparation_for_step(state, &context, &observation.header.step_id, None)
+            .await
         .and_then(|prepared| {
             validate_live_magnetization_domain(observation, &prepared.execution_plan)?;
-            Ok(())
+            Ok(None)
         })
     } else {
         ensure_stage_preparation(state, &context, &projection).await
     };
-    if let Err(error) = stage_preparation {
-        if error.code.as_deref() != Some("accepted_preparation_current_state_changed") {
-            if let Err(clear_error) = clear_stale_magnetization(state, &context).await {
-                tracing::error!(
-                    error = %clear_error,
-                    "failed to clear stale accepted magnetization after domain admission failure"
-                );
+    let prepared_state_domain = match stage_preparation {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if error.code.as_deref() != Some("accepted_preparation_current_state_changed") {
+                if let Err(clear_error) = clear_stale_magnetization(state, &context).await {
+                    tracing::error!(
+                        error = %clear_error,
+                        "failed to clear stale accepted magnetization after domain admission failure"
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+    if matches!(projection.status, "completed" | "failed" | "cancelled") {
+        if let Some(output) = projection.latest_state.as_ref() {
+            if let fullmag_application::DecodedStudyArtifact::MagnetizationState(state_output) =
+                &output.decoded
+            {
+                let prepared = if let Some(prepared) = prepared_state_domain {
+                    prepared
+                } else {
+                    let prepared = ensure_stage_preparation_for_step(
+                        state,
+                        &context,
+                        &output.step_id,
+                        output.accepted_state_ref.as_ref(),
+                    )
+                    .await?;
+                    validate_accepted_state_domain(
+                        state_output,
+                        &prepared.execution_plan,
+                        &prepared.plan_fingerprint,
+                        context.run_id.as_str(),
+                        output.step_id.as_str(),
+                        output.accepted_state_ref.as_ref(),
+                    )?;
+                    prepared
+                };
+                projection.accepted_runtime_capabilities = projection
+                    .accepted_runtime_problem
+                    .as_ref()
+                    .and_then(|problem| {
+                        accepted_runtime_capabilities_for_state(
+                            problem,
+                            &prepared.execution_plan,
+                            &prepared.plan_fingerprint,
+                            context.run_id.as_str(),
+                            output,
+                        )
+                    });
+                if projection.accepted_runtime_capabilities.is_some() {
+                    projection.accepted_runtime_mode = Some(prepared.execution_plan.common.execution_mode);
+                }
             }
         }
-        return Err(error);
     }
     apply_projection(state, &context, projection).await?;
     *cursor = Some(next_cursor);
@@ -603,6 +647,18 @@ fn load_durable_projection(
         .filter(|output| output.data_kind == "state")
         .max_by(|left, right| compare_magnetization_outputs(left, right))
         .cloned();
+    let accepted_runtime_problem = if matches!(status, "completed" | "failed" | "cancelled") {
+        latest_state.as_ref().and_then(|output| {
+            accepted
+                .catalog
+                .entries()
+                .iter()
+                .find(|entry| entry.step_id() == output.step_id)
+                .map(|entry| entry.problem().clone())
+        })
+    } else {
+        None
+    };
     let latest_total_energy = verified
         .iter()
         .filter_map(|output| match &output.decoded {
@@ -674,6 +730,9 @@ fn load_durable_projection(
         artifact_catalog_revision,
         terminal_without_outputs,
         status,
+        accepted_runtime_capabilities: None,
+        accepted_runtime_mode: None,
+        accepted_runtime_problem,
         command_id,
         interactive_command,
         resolved_capabilities,
@@ -686,6 +745,67 @@ fn load_durable_projection(
         live_magnetization_sequence,
         stage_execution,
     }))
+}
+
+/// Rebuild plan-scoped provider capabilities only after the accepted state has
+/// been checked against the durable prepared stage. The actual worker engine
+/// and precision must agree with the runner's resolution of that immutable
+/// plan; requested intent alone never selects or promotes a provider.
+fn accepted_runtime_capabilities_for_state(
+    problem: &fullmag_ir::ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    plan_fingerprint: &str,
+    run_id: &str,
+    output: &VerifiedOutput,
+) -> Option<fullmag_runner::BackendCapabilities> {
+    let accepted_state_ref = output.accepted_state_ref.as_ref()?;
+    if accepted_state_ref.id.run_id != run_id
+        || accepted_state_ref.id.stage_id.as_deref() != Some(output.step_id.as_str())
+        || accepted_state_ref.id.domain_digest != plan_fingerprint
+    {
+        return None;
+    }
+    let fullmag_application::DecodedStudyArtifact::MagnetizationState(state) = &output.decoded
+    else {
+        return None;
+    };
+    if state
+        .provenance
+        .get("resolved_fallback")
+        .is_some_and(|fallback| !fallback.is_null())
+        || state
+            .provenance
+            .get("lossy_fallback_used")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        return None;
+    }
+    if !matches!(
+        &plan.backend_plan,
+        fullmag_ir::BackendPlanIR::Fdm(_)
+            | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
+            | fullmag_ir::BackendPlanIR::Fem(_)
+    ) {
+        return None;
+    }
+    let capabilities =
+        fullmag_runner::resolve_planned_runtime_capabilities(problem, plan).ok()?;
+    let registry = capabilities.resolved_quantity_registry.as_ref()?;
+    let provenance_precision = state.provenance.get("precision").and_then(Value::as_str)?;
+    if registry.source != fullmag_runner::QuantityProviderRegistrySource::ResolvedPlan
+        || registry.precision != provenance_precision
+        || accepted_state_ref.id.accepted_step != state.step
+        || fullmag_runner::validate_accepted_state_execution_provenance(
+            &plan.backend_plan,
+            capabilities.engine_id,
+            &state.provenance,
+        )
+        .is_err()
+    {
+        return None;
+    }
+    Some(capabilities)
 }
 
 fn build_stage_execution(
@@ -1247,14 +1367,14 @@ async fn ensure_stage_preparation(
     state: &Arc<AppState>,
     context: &ProjectionContext,
     projection: &DurableProjection,
-) -> Result<(), ApiError> {
+) -> Result<Option<PreparedProjectionDomain>, ApiError> {
     let Some(output) = projection.latest_state.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let fullmag_application::DecodedStudyArtifact::MagnetizationState(state_output) =
         &output.decoded
     else {
-        return Ok(());
+        return Ok(None);
     };
     let prepared = ensure_stage_preparation_for_step(
         state,
@@ -1270,7 +1390,8 @@ async fn ensure_stage_preparation(
         context.run_id.as_str(),
         output.step_id.as_str(),
         output.accepted_state_ref.as_ref(),
-    )
+    )?;
+    Ok(Some(prepared))
 }
 
 async fn ensure_stage_preparation_for_step(
@@ -1796,6 +1917,12 @@ async fn apply_projection(
             changed = true;
         }
     }
+    if let Some(live) = next.live_state.as_mut() {
+        if live.status != public_status {
+            live.status = public_status.to_string();
+            changed = true;
+        }
+    }
     if terminal && !projection.interactive_command && next.session.finished_at_unix_ms == 0 {
         next.session.finished_at_unix_ms = unix_time_millis_now();
         changed = true;
@@ -1806,6 +1933,97 @@ async fn apply_projection(
         projection.stage_execution.clone(),
     ) {
         changed = true;
+    }
+    if let Some(capabilities) = projection
+        .accepted_runtime_capabilities
+        .as_ref()
+        .filter(|capabilities| {
+            capabilities
+                .resolved_quantity_registry
+                .as_ref()
+                .is_some_and(|registry| {
+                    registry.source == fullmag_runner::QuantityProviderRegistrySource::ResolvedPlan
+                })
+        })
+    {
+        if let Some(registry) = capabilities.resolved_quantity_registry.as_ref() {
+            let same_plan_registry = next.capabilities.as_ref().is_some_and(|current| {
+                current.engine_id == capabilities.engine_id
+                    && current.resolved_quantity_registry.as_ref() == Some(registry)
+            });
+            if !same_plan_registry {
+                next.capabilities = Some(capabilities.clone());
+                changed = true;
+            }
+            let resolved_lane = match capabilities.engine_id {
+                fullmag_runner::RuntimeEngineId::FdmCpuReference => Some(("fdm", "cpu")),
+                fullmag_runner::RuntimeEngineId::FdmCuda => Some(("fdm", "gpu")),
+                fullmag_runner::RuntimeEngineId::FemCpuNative => Some(("fem", "cpu")),
+                fullmag_runner::RuntimeEngineId::FemNativeGpu => Some(("fem", "gpu")),
+                _ => None,
+            };
+            if let Some((resolved_backend, resolved_device)) = resolved_lane {
+                if next.session.resolved_backend.as_deref() != Some(resolved_backend) {
+                    next.session.resolved_backend = Some(resolved_backend.to_owned());
+                    changed = true;
+                }
+                if next.session.resolved_device.as_deref() != Some(resolved_device) {
+                    next.session.resolved_device = Some(resolved_device.to_owned());
+                    changed = true;
+                }
+                if next.session.resolved_engine_id.as_deref()
+                    != Some(capabilities.engine_id.as_str())
+                {
+                    next.session.resolved_engine_id =
+                        Some(capabilities.engine_id.as_str().to_owned());
+                    changed = true;
+                }
+                if next.session.resolved_precision.as_deref() != Some(registry.precision.as_str()) {
+                    next.session.resolved_precision = Some(registry.precision.clone());
+                    changed = true;
+                }
+                // Complete the identity from the same verified immutable plan,
+                // never from requested intent. A partial identity is correctly
+                // rejected by the public capability snapshot and hides fields.
+                if let Some(mode) = projection.accepted_runtime_mode {
+                    let mode = match mode {
+                        fullmag_ir::ExecutionMode::Strict => "strict",
+                        fullmag_ir::ExecutionMode::Extended => "extended",
+                        fullmag_ir::ExecutionMode::Hybrid => "hybrid",
+                    };
+                    if next.session.resolved_mode.as_deref() != Some(mode) {
+                        next.session.resolved_mode = Some(mode.to_owned());
+                        changed = true;
+                    }
+                }
+            }
+        }
+    } else if terminal && projection.latest_state.is_some() {
+        let stale_resolved_plan = next
+            .capabilities
+            .as_ref()
+            .and_then(|current| {
+                current
+                    .resolved_quantity_registry
+                    .as_ref()
+                    .filter(|registry| {
+                        registry.source
+                            == fullmag_runner::QuantityProviderRegistrySource::ResolvedPlan
+                    })
+                    .map(|_| current.engine_id)
+            });
+        if let Some(engine_id) = stale_resolved_plan {
+            next.capabilities = None;
+            changed = true;
+            if next.session.resolved_engine_id.as_deref() == Some(engine_id.as_str()) {
+                next.session.resolved_backend = None;
+                next.session.resolved_device = None;
+                next.session.resolved_engine_id = None;
+                next.session.resolved_precision = None;
+                next.session.resolved_mode = None;
+                changed = true;
+            }
+        }
     }
     if let Some((_, observation)) = projection.live_observation.as_ref() {
         let stats = &observation.header.stats;
@@ -2171,20 +2389,38 @@ async fn complete_bound_command(
     command_id: Option<&str>,
     status: &str,
 ) -> Result<(), ApiError> {
-    let Some(command_id) = command_id else {
-        return Ok(());
-    };
+    let run_id = snapshot.run.as_ref().map(|run| run.run_id.as_str());
     let completion = match status {
         "completed" => crate::types::CommandCompletionState::Completed,
         "cancelled" => crate::types::CommandCompletionState::Cancelled,
         "failed" => crate::types::CommandCompletionState::Failed,
         _ => return Ok(()),
     };
+    let failure_message = (completion == crate::types::CommandCompletionState::Failed)
+        .then(|| accepted_command_failure_message(snapshot));
     let completed_at = unix_time_millis_now();
     crate::live_command_journal::mutate(state, snapshot, |records| {
         let mut changed = false;
         for record in records.iter_mut() {
-            if record.command.command_id != command_id
+            // Releasing a held startup Study does not rewrite its immutable
+            // RunIntent command_id. Complete the exact run-bound Solve too,
+            // otherwise its Accepted ledger entry blocks future commands.
+            let targets_this_run = matches!(
+                record.command.target.as_ref(),
+                Some(crate::schemas::commands::RuntimeCommandTarget::Run {
+                    run_id: Some(target_run_id),
+                }) if Some(target_run_id.as_str()) == run_id
+            );
+            let releases_this_run = targets_this_run && matches!(
+                record.command.kind.as_str(), "solve" | "run" | "relax" | "resume"
+            );
+            // A durable cancellation confirms that the run-bound Stop action
+            // succeeded, including a Study cancelled before its first solve.
+            let stops_this_run = targets_this_run
+                && record.command.kind == "stop"
+                && status == "cancelled";
+            if (!command_id.is_some_and(|id| record.command.command_id == id)
+                && !releases_this_run && !stops_this_run)
                 || matches!(
                     record.status,
                     crate::types::CommandLifecycleState::Completed
@@ -2201,14 +2437,36 @@ async fn complete_bound_command(
                 _ => crate::types::CommandLifecycleState::Completed,
             };
             record.completed_at_unix_ms = Some(completed_at);
-            record.completion_status = Some(completion);
-            record.error = (completion == crate::types::CommandCompletionState::Failed)
-                .then(|| "accepted Study execution failed".to_string());
+            record.completion_status = Some(if stops_this_run {
+                crate::types::CommandCompletionState::Completed
+            } else {
+                completion
+            });
+            record.error = failure_message.clone();
             changed = true;
         }
         Ok(((), changed))
     })
     .await
+}
+
+fn accepted_command_failure_message(snapshot: &SessionStateResponse) -> String {
+    let failed_stage = snapshot.stage_execution.as_ref().and_then(|execution| {
+        execution.stages.iter().enumerate().find(|(_, stage)| {
+            stage.status == crate::types::StageLifecycleState::Failed
+        })
+    });
+    let detail = failed_stage.map(|(index, stage)| {
+        let stage_id = stage.stage_id.as_deref().filter(|id| !id.trim().is_empty())
+            .map(|id| id.chars().take(128).collect::<String>())
+            .unwrap_or_else(|| format!("stage {}", index + 1));
+        let cause = stage.state_transition_reason.as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("no failure detail was published");
+        let cause = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+        format!("Stage {stage_id} failed: {}", cause.chars().take(768).collect::<String>())
+    }).unwrap_or_else(|| "Accepted Study execution failed; no stage detail was published".into());
+    format!("{detail}. Inspect diagnostics and correct the cause before starting another run.")
 }
 
 fn unix_time_millis_now() -> u128 {

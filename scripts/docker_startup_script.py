@@ -47,6 +47,7 @@ RETIREMENT_TIMEOUT_SECONDS = 30.0
 RETIREMENT_NO_MUTATION_CODES = frozenset({
     "live_retirement_invalid_request", "live_retirement_current_mismatch",
     "live_retirement_runtime_not_terminal", "live_retirement_busy",
+    "live_retirement_capture_failed",
 })
 MAX_SCRIPT_BYTES = 1024 * 1024
 MAX_PROVENANCE_BYTES = 256 * 1024

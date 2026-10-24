@@ -382,7 +382,20 @@ pub(crate) async fn retire_current_live(
         )
     })?;
 
-    let captured = crate::session_persistence::capture_live_retirement_documents(&state, &current).await?;
+    let captured = crate::session_persistence::capture_live_retirement_documents(&state, &current)
+        .await
+        .map_err(|error| {
+            tracing::warn!(operation_id = %request.operation_id, error = %error,
+                "live workspace retirement authoring capture failed");
+            // No archive or current-pointer publication has happened here.
+            // Preserve the workspace and report a definite refusal, rather
+            // than quarantining a launcher operation as an unknown commit.
+            ApiError::conflict_with_code(
+                "live_retirement_capture_failed",
+                format!("Workspace capture failed before archive publication; the current workspace is retained: {}",
+                    error.message.chars().take(1024).collect::<String>()),
+            )
+        })?;
     let proof = LiveRetirementProof {
         schema: PROOF_SCHEMA.to_string(),
         state: "retired".to_string(),
@@ -465,6 +478,7 @@ fn current_request_scope(state: &AppState) -> String {
 
 fn map_workspace_acquisition_error(error: ApiError) -> ApiError {
     if error.code.as_deref() == Some("development_restart_not_safe") {
+        tracing::warn!(reason = %error, "live workspace retirement preflight refused");
         return ApiError::conflict_with_code(
             "live_retirement_busy",
             "the current workspace is not safely quiescent for retirement",

@@ -177,6 +177,13 @@ static bool compute_abm3_rhs_fp64(
 /* ── Helper: compute diagnostics and fill stats ── */
 
 static void abm3_fill_diagnostics(Context &ctx, double dt, fullmag_fdm_step_stats *stats) {
+    if (fullmag_fdm_should_fill_control_stats(ctx)) {
+        if (context_fill_current_stats(ctx, stats)) {
+            stats->dt_seconds = dt;
+            stats->suggested_next_dt = 0.0;
+        }
+        return;
+    }
     if (!fullmag_fdm_should_fill_step_stats(ctx)) {
         fullmag_fdm_fill_step_stats_metadata(ctx, stats, dt);
         return;

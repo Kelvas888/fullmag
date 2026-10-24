@@ -207,6 +207,43 @@ private:
     bool committed_ = false;
 };
 
+class ReceiptSnapshotPhaseGuard {
+public:
+    // A nested snapshot contributes to its solver attempt; it must not reset
+    // or commit that attempt's pending operator evidence.
+    explicit ReceiptSnapshotPhaseGuard(Context &context)
+        : context_(context), owns_attempt_(
+              !fullmag_fdm_solver_phase_active(*context.execution_receipt))
+    {
+        if (owns_attempt_) {
+            fullmag_fdm_begin_operator_execution_attempt(*context_.execution_receipt);
+        }
+    }
+
+    ~ReceiptSnapshotPhaseGuard() {
+        if (owns_attempt_ && !committed_) {
+            fullmag_fdm_discard_operator_execution_attempt(
+                *context_.execution_receipt);
+        }
+    }
+
+    void commit() {
+        if (owns_attempt_) {
+            fullmag_fdm_commit_operator_execution_attempt(
+                *context_.execution_receipt);
+        }
+        committed_ = true;
+    }
+
+    ReceiptSnapshotPhaseGuard(const ReceiptSnapshotPhaseGuard &) = delete;
+    ReceiptSnapshotPhaseGuard &operator=(const ReceiptSnapshotPhaseGuard &) = delete;
+
+private:
+    Context &context_;
+    bool owns_attempt_;
+    bool committed_ = false;
+};
+
 std::optional<int> selected_cuda_device_from_env() {
     const char *specific = std::getenv("FULLMAG_FDM_GPU_INDEX");
     const char *generic = std::getenv("FULLMAG_CUDA_DEVICE_INDEX");
@@ -3027,9 +3064,11 @@ int fullmag_fdm_backend_snapshot_stats(
         return FULLMAG_FDM_OK;
     }
 
+    ReceiptSnapshotPhaseGuard receipt_snapshot_phase(*ctx);
     if (!context_fill_current_stats(*ctx, out_stats)) {
         return FULLMAG_FDM_ERR_CUDA;
     }
+    receipt_snapshot_phase.commit();
 
     return FULLMAG_FDM_OK;
 #else

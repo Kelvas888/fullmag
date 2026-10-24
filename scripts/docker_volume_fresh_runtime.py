@@ -30,6 +30,49 @@ def _fail(message: str) -> None:
     raise BuildControlError(message)
 
 
+def _preserve_previous_preparation_abort_archive(control: BuildControl, operation: Mapping[str, object]) -> bool:
+    """Anchor an older abort before this recreation rotates its generation pointer."""
+    from docker_volume_preparation_abort import RECORD, pin_completed_fresh_archive
+
+    receipt = operation.get("receipt")
+    inputs = receipt.get("inputs") if isinstance(receipt, Mapping) else None
+    development_attempt = inputs.get("attempt") if isinstance(inputs, Mapping) else None
+    if not isinstance(development_attempt, str) or _OPERATION_ID.fullmatch(development_attempt) is None:
+        _fail("Fresh-runtime archive has no exact retained development attempt")
+
+    record = control.read(RECORD, optional=True)
+    if record is None:
+        return False
+    if not isinstance(record, Mapping):
+        _fail("Preparation abort current pointer is malformed before fresh archive")
+
+    from docker_volume_stop_diagnostic import ATTEMPT_RE
+    activation_attempt = record.get("activation_attempt")
+    if not isinstance(activation_attempt, str) or ATTEMPT_RE.fullmatch(activation_attempt) is None:
+        _fail("Preparation abort activation identity is malformed before fresh archive")
+    anchor = control.read(
+        "preparation-abort/archives/" + activation_attempt + ".json",
+        optional=True,
+    )
+    if anchor is not None:
+        pin_completed_fresh_archive(control)
+        return True
+
+    # The first recreation for this abort has not yet published its operation
+    # terminal, so pinning here would claim completion prematurely. A later
+    # recreation has a different parent attempt; pin its completed predecessor
+    # while group-ledger-generation.json still names that exact archive.
+    if record.get("development_attempt") == development_attempt:
+        return False
+    generation = control.read("group-ledger-generation.json", optional=True)
+    if generation is None:
+        _fail("Older preparation abort has no completed archive generation to preserve")
+    if not isinstance(generation, Mapping):
+        _fail("Previous group ledger generation is malformed before fresh archive")
+    pin_completed_fresh_archive(control)
+    return True
+
+
 def _json_documents(raw: bytes, description: str) -> list[dict[str, object]]:
     try:
         value = json.loads(raw)
@@ -389,6 +432,8 @@ def archive_runtime_control(
     terminal_path = operation["root"] + "/runtime-control-archive-terminal.json"
     if control.read(intent_path, optional=True) is not None or control.read(terminal_path, optional=True) is not None:
         _fail("Fresh-runtime archive attempt already has intent or terminal evidence")
+
+    _preserve_previous_preparation_abort_archive(control, operation)
 
     intent = {
         "schema": "fullmag.docker-fresh-runtime-archive-intent.v1",

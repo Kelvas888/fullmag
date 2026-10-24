@@ -124,7 +124,7 @@ storage/
   tmp/<worktree-id>/<profile-id>/ krótkotrwały staging profilu
   index/                    rejestr worktree i linków
   locks/<worktree-id>.*     blokada oraz właściciel worktree
-  build-volumes/            backing images nowych ciężkich buildów Linux
+  build-volumes/            istniejące obrazy legacy; nowe obrazy na tym hoście: E:\git\storage
 ```
 
 `builds/<worktree-id>/<profile-id>` zawiera wyjścia przypisane do worktree i
@@ -316,8 +316,14 @@ zarządzanego storage opartego na ext4. Bezpośredni zapis dużych danych na CIF
 jest odrzucany. Mount view, np. `/mnt/fullmag-zfn2-native`, nie jest storage
 rootem i nie może być traktowany jako dowolny katalog projektu.
 
-Backing images dla nowych wdrożeń kieruje się do
-`<storage-root>/build-volumes`. Jeżeli kanoniczny obraz nie istnieje, resolver
+Decyzja hostowa z 24.10.2026 kieruje nowe pliki obrazów ext4 (backing images)
+bezpośrednio do `E:\git\storage` (WSL: `/mnt/e/git/storage`), zamiast do
+`<storage-root>/build-volumes`. Lokalizacja pliku obrazu nie jest mountem ext4
+ani rootem danych użytkownika; nie zmienia `FULLMAG_PROJECT_STORAGE_ROOT`
+ani zasady named volumes/BuildKit dla buildu Docker DEV. Przed alokacją
+sprawdź obsługę nowej ścieżki przez launcher/resolver. Brak obsługi oznacza
+`NOT VERIFIED`, bez tworzenia obrazu w starej lokalizacji. Zmiana dokumentacji
+nie stanowi wdrożenia konfiguracji runtime. Jeżeli kanoniczny obraz nie istnieje, resolver
 może jawnie użyć istniejącego obrazu legacy wskazanego przez aktywny profil;
 zwraca wtedy `native_storage_legacy=true`. Nie oznacza to migracji ani zgody na
 tworzenie kolejnego obrazu. Istniejących aktywnych obrazów ext4 nie wolno

@@ -163,7 +163,6 @@ async fn publish_compute_node_sample(
     .context("compute-node sampling worker failed")?
 }
 
-const MAX_CONSECUTIVE_SAMPLE_STORE_WRITER_BUSY: u32 = 5;
 const HOST_ADMISSION_DEFERRAL_BUDGET: Duration = Duration::from_secs(60);
 
 fn is_store_writer_busy(error: &anyhow::Error) -> bool {
@@ -172,9 +171,8 @@ fn is_store_writer_busy(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
 }
 
-fn sample_store_writer_busy_within_budget(consecutive: &mut u32) -> bool {
+fn record_sample_store_writer_busy(consecutive: &mut u32) {
     *consecutive = consecutive.saturating_add(1);
-    *consecutive <= MAX_CONSECUTIVE_SAMPLE_STORE_WRITER_BUSY
 }
 
 fn host_admission_deferral_within_budget(deferred_at: &mut Option<Instant>, now: Instant) -> bool {
@@ -2840,11 +2838,11 @@ fn run_service(path: PathBuf) -> Result<()> {
                             inventory_owner = sample_owner;
                         }
                         Err(error) => {
-                            if is_store_writer_busy(&error)
-                                && sample_store_writer_busy_within_budget(
-                                    &mut consecutive_busy_samples,
-                                )
-                            {
+                            if is_store_writer_busy(&error) {
+                                // A competing writer cannot invalidate the
+                                // service owner. The scheduler independently
+                                // gates every new admission on a fresh sample.
+                                record_sample_store_writer_busy(&mut consecutive_busy_samples);
                                 tracing::warn!(
                                     error = ?error,
                                     consecutive_busy_samples,
@@ -2927,19 +2925,11 @@ fn run_service(path: PathBuf) -> Result<()> {
                                 tracing::debug!(%reason, "host compute-node admission deferred");
                             }
                             Err(error) if is_store_writer_busy(&error) => {
-                                if !host_admission_deferral_within_budget(
-                                    &mut admission_deferred_at,
-                                    Instant::now(),
-                                ) {
-                                    admission_unknown = true;
-                                    owner.publish(
-                                        RuntimeServiceState::Unknown,
-                                        generations.map(|p| p.0),
-                                        generations.map(|p| p.1),
-                                        children.describe(),
-                                    )?;
-                                    bail!("host compute-node admission observation failed: {error:#}");
-                                }
+                                // Contention is not evidence of a failed owner.
+                                // Reservations still require a fresh snapshot;
+                                // keep validating pools and publishing liveness.
+                                // Do not consume the separate stale/topology
+                                // observation budget without an observation.
                                 tracing::warn!(error = ?error, "host admission observation deferred while the ledger writer is busy");
                             }
                             Err(error) => {
@@ -3199,12 +3189,15 @@ mod tests {
     }
 
     #[test]
-    fn sample_writer_busy_budget_allows_five_cycles_only() {
+    fn sample_writer_busy_counter_is_diagnostic_and_saturates() {
         let mut consecutive = 0;
-        for _ in 0..MAX_CONSECUTIVE_SAMPLE_STORE_WRITER_BUSY {
-            assert!(sample_store_writer_busy_within_budget(&mut consecutive));
+        for _ in 0..6 {
+            record_sample_store_writer_busy(&mut consecutive);
         }
-        assert!(!sample_store_writer_busy_within_budget(&mut consecutive));
+        assert_eq!(consecutive, 6);
+        consecutive = u32::MAX;
+        record_sample_store_writer_busy(&mut consecutive);
+        assert_eq!(consecutive, u32::MAX);
     }
 
     #[test]

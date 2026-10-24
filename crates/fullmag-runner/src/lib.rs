@@ -101,6 +101,7 @@ pub use accepted_materialization::{
     materialize_accepted_observables, AcceptedMagnetizationInput,
     AcceptedMaterializationBatch, AcceptedMaterializationLane,
     AcceptedMaterializationRequest, AcceptedMaterializedField,
+    validate_accepted_state_execution_provenance,
 };
 
 /// Validate which current FDM multilayer execution realization an accepted

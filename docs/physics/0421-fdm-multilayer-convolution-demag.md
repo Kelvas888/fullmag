@@ -589,6 +589,17 @@ values with unit saturation coefficient; their magnitudes, including zero,
 must remain unchanged by upload. Target shape, spacing, origin, source masks,
 and native-to-target transfer fingerprints belong to the observation manifest.
 The magnetic layers and common FFT scratch retain their separate identities.
+
+When `runtime_metadata.airbox_observation` is absent, accepted multilayer
+postprocessing may derive a target-only grid from `runtime_metadata.study_universe`
+only when an explicit size and finite center are available (the universe DSL
+defaults an omitted center to the origin). Its spacing is the
+immutable planned common convolution cell size; each size component must be an
+integer number of cells within scale-aware floating-point roundoff, and the
+target origin is `center - size / 2`. An `auto` universe without explicit size
+has no observation target. The declared extent is used as-is: this creates no
+physical Airbox mesh and does not reuse the common FFT scratch as a target.
+
 The target observer publishes `H_demag` in ampere per metre. The following
 extension is source-only work, without numerical/runtime qualification: for a
 legal multilayer plan with complete uniform external field, its exterior

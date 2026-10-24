@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -912,6 +913,53 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             ],
         }
         qa._validate_browser_helper(document, FakeControl(), identity, "fullmag-frontend-state", browser_id, 0, ROOT)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            local_alias_root = Path(temporary) / "docker-desktop-bind-mounts"
+            selected_scripts = (ROOT / "apps/control-room/scripts").resolve(strict=True)
+            valid_alias = local_alias_root / "Ubuntu2" / ("a" * 64)
+            valid_alias.parent.mkdir(parents=True)
+            valid_alias.symlink_to(selected_scripts, target_is_directory=True)
+            alias_source = (
+                "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                "Ubuntu2/" + "a" * 64
+            )
+            alias_document = deepcopy(document)
+            alias_document["Mounts"][1]["Source"] = alias_source
+            with patch.object(qa, "LOCAL_WSL_BIND_MOUNT_ROOT", local_alias_root):
+                self.assertTrue(valid_alias.samefile(selected_scripts))
+                qa._validate_browser_helper(
+                    alias_document, FakeControl(), identity,
+                    "fullmag-frontend-state", browser_id, 0, ROOT,
+                )
+
+                different_target = Path(temporary) / "different-selected-source"
+                different_target.mkdir()
+                different_alias = local_alias_root / "Ubuntu2" / ("b" * 64)
+                different_alias.symlink_to(different_target, target_is_directory=True)
+                rejected_sources = [
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                    "Ubuntu2/" + "c" * 64,  # local alias is missing
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                    "Ubuntu2/" + "b" * 64,  # local alias points to another inode
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                    "Ubuntu2/../Ubuntu2/" + "a" * 64,
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                    "Ubuntu2/" + "a" * 64 + "/extra",
+                    "/run/desktop/mnt/host/windows/docker-desktop-bind-mounts/"
+                    "Ubuntu2/" + "a" * 64,
+                ]
+                for source in rejected_sources:
+                    rejected = deepcopy(document)
+                    rejected["Mounts"][1]["Source"] = source
+                    with self.subTest(source=source), self.assertRaises(
+                        qa.ControlOutcomeUnknown
+                    ):
+                        qa._validate_browser_helper(
+                            rejected, FakeControl(), identity,
+                            "fullmag-frontend-state", browser_id, 0, ROOT,
+                        )
+
         wrong_user = deepcopy(document)
         wrong_user["Config"]["User"] = "0:0"
         with self.assertRaises(qa.ControlOutcomeUnknown):

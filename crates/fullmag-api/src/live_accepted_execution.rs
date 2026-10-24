@@ -411,7 +411,7 @@ enum ExistingAcceptedRunGate {
     Released(String),
 }
 
-fn accepted_frontier_preparation_is_ready(
+pub(crate) fn accepted_frontier_preparation_is_ready(
     preparation: Option<&crate::types::SimulationPreparationSnapshot>,
     mesh_workspace: Option<&serde_json::Value>,
     run_id: &str,

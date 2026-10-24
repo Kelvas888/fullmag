@@ -12,6 +12,7 @@ import {
   resolveViewport3DCameraFovDegrees,
 } from "../viewport3dCameraFov";
 import { nearTuple3, sameTuple3 } from "../viewport3dMath";
+import { resolveViewport3DCameraDepthRange } from "./viewport3DCameraClip";
 import type { Viewport3DBounds } from "../viewport3dRenderModel";
 import { useBatchedInvalidate } from "../viewport3dBatchedInvalidate";
 import {
@@ -61,6 +62,8 @@ export interface Viewport3DOrbitDebugAngles {
 type OrbitControlsHandle = ComponentRef<typeof DreiOrbitControls>;
 
 interface Viewport3DCameraControlsDiagnostics {
+  cameraNear: number | null;
+  cameraFar: number | null;
   cameraPosition: [number, number, number];
   cameraUp: [number, number, number];
   controlTarget: [number, number, number] | null;
@@ -379,8 +382,12 @@ export function resolveViewport3DCameraFit(
   const cameraDistance =
     (radius * CAMERA_FIT_MARGIN) / Math.sin(limitingHalfFov);
   const distance = cameraDistance / CAMERA_FIT_OFFSET_LENGTH;
-  const near = Math.max(distance / 100, 1e-12);
-  const far = Math.max(distance * 100, near * 100, 1e-3);
+  const { near, far } = resolveViewport3DCameraDepthRange(
+    activeBounds,
+    { x: x + distance, y: y + distance * 0.72, z: z + distance },
+    { x: -distance, y: -distance * 0.72, z: -distance },
+    cameraDistance,
+  );
 
   return {
     far,
@@ -748,6 +755,8 @@ function readViewport3DCameraControlsDiagnostics({
       })
     | null;
   return {
+    cameraNear: "near" in camera && typeof camera.near === "number" ? camera.near : null,
+    cameraFar: "far" in camera && typeof camera.far === "number" ? camera.far : null,
     cameraPosition: tuple3(camera.position.toArray()),
     cameraUp: tuple3(camera.up.toArray()),
     controlTarget: controls?.target ? tuple3(controls.target.toArray()) : null,
@@ -1111,6 +1120,31 @@ function useOrbitCameraControlsModel({
 
     invalidate();
     tracker.recordDirtyFrame("camera-orbit-debug");
+  });
+
+  // OrbitControls updates at priority -1; the debug transition above also runs
+  // before this callback. Refresh only projection planes from the live pose,
+  // without publishing intermediate poses or starting a demand-render loop.
+  // Waiting for the debounced store commit would clip geometry during a dolly.
+  useFrame(() => {
+    const target = controlsRef.current?.target;
+    if (!target) return;
+    const forward = {
+      x: target.x - camera.position.x,
+      y: target.y - camera.position.y,
+      z: target.z - camera.position.z,
+    };
+    const clip = resolveViewport3DCameraDepthRange(
+      bounds, camera.position, forward, Math.hypot(forward.x, forward.y, forward.z),
+    );
+    const projectionCamera = camera as Camera & {
+      near: number;
+      far: number;
+      updateProjectionMatrix(): void;
+    };
+    if (projectionCamera.near === clip.near && projectionCamera.far === clip.far) return;
+    applyCameraClipping(camera, clip.near, clip.far);
+    projectionCamera.updateProjectionMatrix();
   });
 
   const commitCameraControlsPose = useCallback((epoch: number) => {

@@ -114,6 +114,10 @@ async fn adopt_bundle(
         }
         for requirement in requirements {
             for quantity in &requirement.quantity_ids {
+                // Magnetization is the accepted solver state, not a derived
+                // evaluator output. Its exact source, clock and carrier were
+                // validated above; preserve that published full-domain field.
+                if quantity == "m" && requirement.scope_kind == "full" { continue; }
                 if !batch.fields.iter().any(|field| field.quantity_id == *quantity
                     && (field.role == "airbox") == (requirement.scope_kind == "airbox")) {
                     let key = format!("{}:{quantity}", requirement.scope_kind);

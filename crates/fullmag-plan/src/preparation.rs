@@ -1221,7 +1221,10 @@ impl<'a> FdmPreparationEvidence<'a> {
                         marker_ids.extend(legend.iter().map(|entry| entry.numeric_id));
                     }
                     if let Some(mask) = &layer.native_region_mask {
-                        marker_ids.extend(mask.iter().copied().filter(|id| *id != 0));
+                        marker_ids.extend(collect_active_region_marker_ids(
+                            mask,
+                            layer.native_active_mask.as_deref(),
+                        )?);
                     }
                 }
                 let marker_ids = marker_ids.into_iter().collect::<Vec<_>>();

@@ -235,9 +235,18 @@ void launch_rk4_step_fp64(Context &ctx, double dt, fullmag_fdm_step_stats *stats
 
     context_stage_accepted_step(ctx, dt);
 
-    if (!fullmag_fdm_should_fill_step_stats(ctx)) {
+    const bool fill_control_stats = fullmag_fdm_should_fill_control_stats(ctx);
+    if (!fullmag_fdm_should_fill_step_stats(ctx) && !fill_control_stats) {
         if (!context_complete_gpu_transport_rhs(ctx)) return;
         fullmag_fdm_fill_step_stats_metadata(ctx, stats, dt);
+        return;
+    }
+    if (fill_control_stats) {
+        if (!context_complete_gpu_transport_rhs(ctx)) return;
+        if (context_fill_current_stats(ctx, stats)) {
+            stats->dt_seconds = dt;
+            stats->suggested_next_dt = 0.0;
+        }
         return;
     }
 

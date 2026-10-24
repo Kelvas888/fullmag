@@ -145,6 +145,8 @@ export interface KernelEventMap {
    */
   "command:outcome": {
     backendCommandId: string | null;
+    clientIntentId: string | null;
+    clientIntentKind: string | null;
     commandId: string;
     feedback: CommandFeedbackOwner;
     invocationId: string;

@@ -5502,6 +5502,15 @@ async fn get_or_load_current_live_scene_document_with_context(
         if let Some(scene_document) = snapshot.scene_document.clone() {
             return Ok(scene_document);
         }
+        // Diagnostic reads may expose the retained model after a runtime
+        // failure, but must never re-execute Python to reconstruct a scene.
+        if state.development_admission.observe_runtime_failure_fence() {
+            return Err(ApiError::with_status_and_code(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "retained_scene_unavailable",
+                "No retained scene is available. Script loading is disabled after a runtime failure; inspect diagnostics before a managed restart.",
+            ));
+        }
         let script_path = snapshot.session.script_path.trim();
         if script_path.is_empty() {
             return Err(ApiError::not_found(
@@ -5534,6 +5543,13 @@ async fn get_or_load_current_live_scene_document_with_context(
         )?;
     }
     if snapshot.scene_document.is_none() {
+        if state.development_admission.observe_runtime_failure_fence() {
+            return Err(ApiError::with_status_and_code(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "retained_scene_unavailable",
+                "Runtime failed while the scene was loading; the retained workspace was not changed. Inspect diagnostics before a managed restart.",
+            ));
+        }
         snapshot.builder_adapter = builder_adapter;
         snapshot.scene_document = Some(current_scene);
     }

@@ -156,6 +156,12 @@ pub(crate) async fn activate_current_live_startup(
     let session_id = startup_session_id(&request, &loaded.source);
     let initial_run_id = format!("run-{session_id}");
     let snapshot = build_startup_snapshot(&state, &request, &loaded, &session_id, &initial_run_id)?;
+    {
+        let mut presentation = state.current_display_presentation.write().await;
+        crate::router_v2::handlers::visualization::display::initialize_scene_airbox_visualization(
+            &loaded.scene, &mut presentation,
+        )?;
+    }
     let session_epoch = {
         let mut current = state.current_live_state.write().await;
         let epoch = state

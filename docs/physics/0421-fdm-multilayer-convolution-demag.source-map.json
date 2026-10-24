@@ -320,6 +320,13 @@
       "evidence_status": "source-visible only; runtime, browser and scientific qualification NOT VERIFIED"
     },
     {
+      "id": "airboxTargetGridResolution",
+      "path": "crates/fullmag-runner/src/fdm/cpu/airbox_observation.rs",
+      "symbol": "airbox_observation_target",
+      "responsibility": "Resolves an explicit target-only Airbox grid or derives one from an explicit study universe using the planned common convolution cell",
+      "evidence_status": "source-visible only; runtime and scientific qualification NOT VERIFIED"
+    },
+    {
       "id": "geometry-mesh-authoring",
       "path": "packages/fullmag-py/src/fullmag/world.py",
       "symbol": "class GeometryMeshHandle",
