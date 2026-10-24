@@ -9,7 +9,6 @@ import {
   countCellFaces,
   forEachCellFace,
   topologyCellCsr,
-  type TopologyCellCsr,
   type Viewport3DTopologyCells,
 } from "./viewport3dTopologyCells";
 import { EdgeKeySet, FaceKeyTable, indexBound } from "./viewport3dTopologyKeys";
