@@ -80,6 +80,7 @@ pub(crate) fn prepare_accepted_fem_execution(
     }
     validate_declared_outputs(&study_step.outputs)?;
 
+    // Receipts are keyed by the durable task id, not the study step id.
     let preparation = accepted
         .read_task_preparation_receipt(store, accepted_step.claim.task_id.as_str())
         .context("load exact accepted FEM preparation receipt")?;
@@ -105,7 +106,8 @@ pub(crate) fn prepare_accepted_fem_execution(
     validate_native_fem_preflight(&problem, &execution_plan, runtime)?;
     let stage_mesh = StageFemMeshAsset::build_from_backend_plan(&execution_plan.backend_plan)
         .context("accepted FEM plan has no stage mesh identity")?;
-    let until_seconds = crate::accepted_study_worker::accepted_runner_horizon(accepted_step)?;
+    let until_seconds = crate::accepted_study_worker::accepted_runner_horizon(accepted_step)
+        .context("accepted FEM step runner horizon")?;
 
     Ok(AcceptedFemPreparedExecution {
         case_id: case_id.to_owned(),

@@ -3287,9 +3287,16 @@ def _validate_cancelled_activation_preflight(
     *, require_quiesced_activation=True,
 ):
     """Accept the stale active-session exception only for one immutable proof."""
-    current, current_raw = _read_cancelled_activation_record(control, "activation/current.json")
+    current, current_raw = _read_cancelled_activation_record(
+        control, "activation/current.json", optional=True
+    )
     if current is None or current_raw is None:
-        raise BuildControlError("Restart has no accepted-then-cancelled activation proof")
+        # No script activation was cancelled: the session is a live one (for
+        # example created by `fm.connect()`), and restarting would end it.
+        raise BuildControlError(
+            "Restart refused: the backend has an active session and no cancelled script "
+            "activation; the active session is never interrupted"
+        )
     if (current.get("schema") != "fullmag.docker-build-operation.v1"
             or current.get("phase") != "activation"
             or current.get("compose_project") != control.project

@@ -36,6 +36,7 @@ pub mod runtime_service;
 pub mod saved_field_geometry;
 pub mod scalars;
 #[allow(dead_code)]
+pub mod session_clients;
 pub mod sessions;
 pub mod solutions;
 pub mod status;

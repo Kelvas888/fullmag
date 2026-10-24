@@ -547,6 +547,7 @@ fn validate_accepted_worker_parameters(
             "step_id",
             "command",
             "startup_source_sha256",
+            "initial_state_source",
         ];
         if let Some(key) = live_workspace
             .keys()
@@ -921,8 +922,9 @@ pub(crate) fn create_private_attempt_output_dir(
             .with_context(|| format!("worker attempt {label} is invalid"))?;
     }
 
-    let _writer = store
-        .write_transaction()
+    // The API projection and scheduler share this store; a busy writer is
+    // transient and nothing was reserved yet, so wait for the lock.
+    let _writer = retry_store_writer_busy(|| store.write_transaction())
         .context("lock session store before reserving worker attempt output")?;
     let current_claim = retry_worker_claim_store_busy(
         store,
@@ -3495,7 +3497,8 @@ fn apply_accepted_start_effect(
     if !control.interrupt_requested.load(Ordering::Acquire) {
         crate::accepted_field_materialization_worker::prepare_and_publish(
             store, accepted, &accepted_step, &durable_execution,
-        )?;
+        )
+        .context("publish accepted terminal observables")?;
     }
     if control.interrupt_requested.load(Ordering::Acquire) {
         let control_result = finish_worker_control(store, claim, control)?;
@@ -3543,6 +3546,11 @@ fn apply_accepted_start_effect(
         return publish_worker_stopped(store, claim, control_result);
     }
     let published = retry_store_writer_busy(|| {
+        // Hold one (re-entrant) writer lease across the whole publication.
+        // Its CAS puts and catalog append are separate transactions; on a
+        // slow store a busy writer between them restarted the publication
+        // from scratch until the retry budget ran out.
+        let _publication = store.write_transaction()?;
         fullmag_runtime_control::publish_study_outputs(
             store,
             accepted,
@@ -3821,8 +3829,8 @@ fn accepted_worker_test_fail_before_start_effect() -> Result<()> {
     Ok(())
 }
 
-fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
-    fullmag_runtime_control::retry_store_writer_busy(&mut operation)
+fn retry_store_writer_busy<T>(operation: impl FnMut() -> Result<T>) -> Result<T> {
+    fullmag_runtime_control::retry_worker_store_transient(operation)
 }
 
 /// Retry only idempotent claim/lease validation while honoring a durable

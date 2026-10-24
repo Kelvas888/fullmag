@@ -32,11 +32,25 @@ use fullmag_session::{
 /// idempotent operation. Process- and thread-dependent jitter prevents
 /// scheduler, supervisor, and worker loops from repeatedly colliding in
 /// lockstep while preserving the five-second bounded wait.
-pub fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+pub fn retry_store_writer_busy<T>(operation: impl FnMut() -> Result<T>) -> Result<T> {
+    retry_store_writer_busy_within(std::time::Duration::from_secs(5), operation)
+}
+
+/// Bounded wait for a running worker. The writer lock is a non-blocking,
+/// unfair try-lock shared by the API, both schedulers and every worker, so a
+/// five-second poll can starve while they keep taking it. Losing a computed
+/// result to that is worse than waiting; schedulers keep the short bound and
+/// defer their pass instead.
+pub const WORKER_STORE_WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+pub fn retry_store_writer_busy_within<T>(
+    wait: std::time::Duration,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
     use std::hash::{Hash, Hasher};
     use std::time::{Duration, Instant};
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + wait;
     let mut attempt = 0_u64;
     loop {
         match operation() {
@@ -56,6 +70,30 @@ pub fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> R
                 std::thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Worker retry for idempotent store operations: a busy writer is waited for
+/// up to `WORKER_STORE_WRITER_WAIT`, and a file that briefly reads as missing
+/// (an atomic replace seen through a Docker Desktop host folder) for a few
+/// seconds. A genuinely missing file still fails after that short bound.
+pub fn retry_worker_store_transient<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    use std::time::{Duration, Instant};
+
+    let missing_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match retry_store_writer_busy_within(WORKER_STORE_WRITER_WAIT, &mut operation) {
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) && Instant::now() < missing_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
         }
     }
 }
@@ -698,6 +736,7 @@ mod claim;
 pub use claim::{
     commit_claimed_task_admission, commit_claimed_task_admission_with_host,
     load_current_task_claim, try_commit_claimed_task_admission_with_host,
+    StaleTaskAdmissionCandidate,
 };
 
 mod scheduler;

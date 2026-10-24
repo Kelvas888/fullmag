@@ -23,6 +23,7 @@ import { useKernel } from "../KernelContext";
 import { sessionRequestScopeKey } from "../resources/sessionResourceIdentity";
 import { homeView, useHomeViewOpen } from "./homeView";
 import { useLayoutSelector } from "./useLayout";
+import { useRealtimeConnection } from "../realtime/useRealtimeConnection";
 
 export function WorkspaceShellClient() {
   const sessions = useSessionCollection();
@@ -252,8 +253,27 @@ function ActiveWorkspaceShell() {
 }
 
 function RuntimeDegradedBanner() {
-  const health = usePlatformHealthResource({ pollIntervalMs: 5_000 });
+  // An idle healthy workspace issues no periodic requests. Health is read on
+  // mount, again whenever the realtime connection changes or the page becomes
+  // visible, and polled only while the runtime is already degraded.
+  const health = usePlatformHealthResource();
   const degraded = health.data?.status === "degraded";
+  const realtime = useRealtimeConnection();
+  const refetchHealth = health.refetch;
+  useEffect(() => {
+    refetchHealth();
+  }, [realtime.status, realtime.disrupted, refetchHealth]);
+  useEffect(() => {
+    const refreshVisible = () => {
+      if (document.visibilityState === "visible") refetchHealth();
+    };
+    document.addEventListener("visibilitychange", refreshVisible);
+    const timer = degraded ? window.setInterval(refreshVisible, 5_000) : undefined;
+    return () => {
+      document.removeEventListener("visibilitychange", refreshVisible);
+      if (timer !== undefined) window.clearInterval(timer);
+    };
+  }, [degraded, refetchHealth]);
   const runtimeService = usePlatformRuntimeServiceResource({
     enabled: degraded,
     pollIntervalMs: degraded ? 5_000 : 0,
@@ -287,7 +307,7 @@ function RuntimeDegradedBanner() {
         <span>
           No computation will be rerun automatically. API diagnostics remain available;
           previously loaded results are retained. Inspect the runtime logs for the failed
-          stage and cause. A task's completion status is shown separately from API availability.
+          stage and cause. A task&apos;s completion status is shown separately from API availability.
         </span>
       </div>
     </div>

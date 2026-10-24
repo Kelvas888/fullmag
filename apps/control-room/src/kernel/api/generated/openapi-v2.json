@@ -38181,6 +38181,92 @@
         ],
         "type": "object"
       },
+      "SessionClientEntry": {
+        "properties": {
+          "client_id": {
+            "type": "string"
+          },
+          "connected_at_unix_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SessionClientKind"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_seen_unix_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "client_id",
+          "kind",
+          "connected_at_unix_ms",
+          "last_seen_unix_ms"
+        ],
+        "type": "object"
+      },
+      "SessionClientHeartbeatRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/SessionClientKind"
+          },
+          "label": {
+            "description": "Short human label, e.g. the script file name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "SessionClientKind": {
+        "description": "Kind of external client driving the session (ADR 0068).",
+        "enum": [
+          "python_live"
+        ],
+        "type": "string"
+      },
+      "SessionClientsResource": {
+        "properties": {
+          "clients": {
+            "items": {
+              "$ref": "#/components/schemas/SessionClientEntry"
+            },
+            "type": "array"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ttl_ms": {
+            "description": "A client without a heartbeat for this long is no longer listed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "ttl_ms",
+          "clients"
+        ],
+        "type": "object"
+      },
       "SessionCommandability": {
         "enum": [
           "allowed",
@@ -53014,6 +53100,103 @@
         },
         "tags": [
           "analysis"
+        ]
+      }
+    },
+    "/v2/sessions/current/clients": {
+      "get": {
+        "operationId": "sessions_get_sessions_current_clients",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionClientsResource"
+                }
+              }
+            },
+            "description": "External clients seen within the presence TTL"
+          }
+        },
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v2/sessions/current/clients/{client_id}": {
+      "delete": {
+        "operationId": "sessions_delete_sessions_current_clients_client_id",
+        "parameters": [
+          {
+            "description": "Client-chosen stable identifier",
+            "in": "path",
+            "name": "client_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Client removed or already absent"
+          }
+        },
+        "tags": [
+          "sessions"
+        ]
+      },
+      "put": {
+        "operationId": "sessions_put_sessions_current_clients_client_id",
+        "parameters": [
+          {
+            "description": "Client-chosen stable identifier",
+            "in": "path",
+            "name": "client_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionClientHeartbeatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionClientEntry"
+                }
+              }
+            },
+            "description": "Heartbeat recorded"
+          },
+          "400": {
+            "description": "Invalid client identity"
+          }
+        },
+        "tags": [
+          "sessions"
         ]
       }
     },

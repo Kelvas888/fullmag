@@ -140,6 +140,11 @@ struct DurableProjection {
     terminal_without_outputs: bool,
     status: &'static str,
     command_id: Option<String>,
+    /// The run executes one interactive command (not a startup script).
+    interactive_command: bool,
+    /// Runtime capabilities of the finished step, including the resolved
+    /// quantity registry that admits its published fields for reading.
+    resolved_capabilities: Option<fullmag_runner::BackendCapabilities>,
     latest_state: Option<VerifiedOutput>,
     latest_total_energy: Option<fullmag_application::StudyScalarArtifact>,
     latest_output_identity: Option<String>,
@@ -161,16 +166,32 @@ pub(crate) fn spawn(state: Arc<AppState>) {
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut cursor: Option<ProjectionCursor> = None;
+        // The poll repeats every interval; report each distinct deferral once.
+        let mut last_deferral: Option<String> = None;
         loop {
             interval.tick().await;
             match poll_once(&state, &mut cursor).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    last_deferral = None;
+                    // This poller is the Docker runtime's publication path. A
+                    // finished run publishes nothing more, yet the path stays
+                    // live; without this the session turned `disconnected`
+                    // 45 s after a run and rejected every further command.
+                    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(
+                        &state,
+                    )
+                    .await;
+                }
                 Err(error) => {
-                    tracing::warn!(
-                        code = ?error.code,
-                        error = %error,
-                        "accepted live read-model projection deferred"
-                    );
+                    let detail = error.to_string();
+                    if last_deferral.as_deref() != Some(detail.as_str()) {
+                        tracing::warn!(
+                            code = ?error.code,
+                            error = %error,
+                            "accepted live read-model projection deferred"
+                        );
+                        last_deferral = Some(detail);
+                    }
                 }
             }
         }
@@ -184,6 +205,17 @@ async fn poll_once(
     let Some(context) = capture_context(state).await? else {
         return Ok(());
     };
+    // A terminal run whose final state is already projected has nothing left
+    // to publish. Editing the model after it (the normal live workflow between
+    // commands) changes the input identity and must not retry it forever.
+    if cursor.as_ref().is_some_and(|previous| {
+        previous.run_id == context.run_id
+            && previous.session_id == context.session_id
+            && previous.session_epoch == context.session_epoch
+            && matches!(previous.status, "completed" | "failed" | "cancelled")
+    }) {
+        return Ok(());
+    }
     let Some(store_root) = state.submit_store_root.clone() else {
         return Ok(());
     };
@@ -627,12 +659,24 @@ fn load_durable_projection(
         .pointer("/parameters/live_workspace/command_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let interactive_command = intent
+        .specification
+        .pointer("/parameters/live_workspace/command/kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "startup_script");
+    let resolved_capabilities = if matches!(status, "completed" | "failed" | "cancelled") {
+        finished_step_capabilities(&accepted, &intent.specification)
+    } else {
+        None
+    };
     Ok(Some(DurableProjection {
         run_catalog_revision: run_catalog.revision,
         artifact_catalog_revision,
         terminal_without_outputs,
         status,
         command_id,
+        interactive_command,
+        resolved_capabilities,
         latest_state,
         latest_total_energy,
         latest_output_identity,
@@ -934,6 +978,44 @@ fn validate_live_intent(
         ));
     }
     Ok(())
+}
+
+/// Runtime capabilities of the step a finished accepted run executed. The
+/// in-process runner publishes these with its fields; an accepted run left the
+/// session with the scratch authoring capabilities, whose registry is not a
+/// resolved plan, so its published fields (m, H_eff, ...) were not readable.
+fn finished_step_capabilities(
+    accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
+    specification: &Value,
+) -> Option<fullmag_runner::BackendCapabilities> {
+    let step_id = specification
+        .pointer("/parameters/live_workspace/step_id")
+        .and_then(Value::as_str);
+    let entry = accepted
+        .catalog
+        .entries()
+        .iter()
+        .find(|entry| step_id.is_none_or(|step_id| entry.step_id() == step_id))?;
+    match fullmag_runner::resolve_runtime_capabilities(entry.problem()) {
+        Ok(capabilities) => Some(capabilities),
+        Err(error) => {
+            tracing::warn!(error = %error, "accepted step runtime capabilities are unavailable");
+            None
+        }
+    }
+}
+
+/// The session's public status for a projected run. A run that executed one
+/// interactive command (a live `run`/`relax`/... from the Control Room or a
+/// `fm.connect()` script) ends that command, not the session: the session
+/// returns to `awaiting_command` so the next command, which continues from
+/// this run's final state, is admitted. A startup-script run ends the session.
+fn session_status_after_projection(run_status: &'static str, interactive_command: bool) -> &'static str {
+    match run_status {
+        "waiting_for_solve" => "awaiting_command",
+        "completed" | "failed" | "cancelled" if interactive_command => "awaiting_command",
+        status => status,
+    }
 }
 
 fn catalog_status(tasks: &[fullmag_session::FmsTaskCatalogEntry]) -> &'static str {
@@ -1702,17 +1784,23 @@ async fn apply_projection(
             }
         }
     }
-    let public_status = if projection.status == "waiting_for_solve" {
-        "awaiting_command"
-    } else {
-        projection.status
-    };
+    let public_status =
+        session_status_after_projection(projection.status, projection.interactive_command);
     if next.session.status != public_status {
         next.session.status = public_status.to_string();
         changed = true;
     }
     next.runtime_status = crate::session::build_runtime_status_view(public_status);
-    if terminal && next.session.finished_at_unix_ms == 0 {
+    if let Some(capabilities) = projection.resolved_capabilities.as_ref() {
+        let unchanged = next.capabilities.as_ref().is_some_and(|current| {
+            serde_json::to_value(current).ok() == serde_json::to_value(capabilities).ok()
+        });
+        if !unchanged {
+            next.capabilities = Some(capabilities.clone());
+            changed = true;
+        }
+    }
+    if terminal && !projection.interactive_command && next.session.finished_at_unix_ms == 0 {
         next.session.finished_at_unix_ms = unix_time_millis_now();
         changed = true;
     }
@@ -2004,7 +2092,9 @@ async fn apply_projection(
             ));
         }
     }
-    if terminal && !projection.terminal_without_outputs {
+    // A run that failed or was cancelled before publishing outputs still ends
+    // its bound command; otherwise its client would wait forever.
+    if terminal {
         complete_bound_command(
             state,
             &next,
@@ -2151,6 +2241,16 @@ mod tests {
             coordinator_watermark: None,
             coordinator_genesis: None,
         }
+    }
+
+    #[test]
+    fn finished_interactive_commands_return_the_session_to_awaiting_command() {
+        for status in ["completed", "failed", "cancelled"] {
+            assert_eq!(session_status_after_projection(status, true), "awaiting_command");
+            assert_eq!(session_status_after_projection(status, false), status);
+        }
+        assert_eq!(session_status_after_projection("running", true), "running");
+        assert_eq!(session_status_after_projection("waiting_for_solve", false), "awaiting_command");
     }
 
     #[test]

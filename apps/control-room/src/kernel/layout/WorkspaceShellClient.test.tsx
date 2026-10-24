@@ -725,6 +725,12 @@ function makeKernel(
       },
       platform: {
         capabilities: async () => { throw new Error("capabilities are not served in this test"); },
+        health: async () => ({
+          status: "ok",
+          uptime_seconds: 0,
+          api_contract_version: "1.0.0",
+          active_session: false,
+        }),
         computeNodes: async () => ({
           nodes: [],
           schema_version: "compute_nodes.v1",

@@ -89,6 +89,8 @@ struct PendingWorker {
 
 struct ActiveWorker {
     resource: SchedulerResourceOffer,
+    run_id: RunId,
+    task_id: String,
     handle: JoinHandle<Result<CompletedWorker>>,
 }
 
@@ -605,6 +607,33 @@ fn run_scheduler(
                         break 'scheduling_pass;
                     }
                 };
+                match defer_scheduler_writer_busy(
+                    || {
+                        recover_exited_worker_tasks(
+                            &store,
+                            &checkpoint_run_ids,
+                            &active_workers,
+                            &worker_executable,
+                            WorkerSupervisionLimits {
+                                max_concurrency: args.max_concurrency,
+                                worker_timeout: args.worker_timeout,
+                                heartbeat_interval: args.heartbeat_interval,
+                                max_automatic_retries: args.max_automatic_retries,
+                            },
+                            host_admission.as_ref(),
+                        )
+                    },
+                    || "compute scheduler: recover exited workers".to_owned(),
+                )? {
+                    SchedulerOperation::Completed(true) => {
+                        scheduled_any = true;
+                    }
+                    SchedulerOperation::Completed(false) => {}
+                    SchedulerOperation::Deferred => {
+                        scheduling_deferred = true;
+                        break 'scheduling_pass;
+                    }
+                }
                 peak_queued_run_count = peak_queued_run_count.max(queue.queued_run_count);
                 peak_backpressured_run_count =
                     peak_backpressured_run_count.max(queue.backpressured_run_count);
@@ -745,6 +774,8 @@ fn run_scheduler(
                 }
                 for pending in pending_workers {
                     let resource_id = pending.resource.resource_id.clone();
+                    let worker_run_id = pending.run_id.clone();
+                    let worker_task_id = pending.scheduled.claim.task_id.as_str().to_owned();
                     let handle = spawn_supervised_worker(
                         args.store_root.clone(),
                         resource_id.clone(),
@@ -762,6 +793,8 @@ fn run_scheduler(
                         resource_id,
                         ActiveWorker {
                             resource: pending.resource,
+                            run_id: worker_run_id,
+                            task_id: worker_task_id,
                             handle,
                         },
                     );
@@ -823,6 +856,12 @@ fn run_scheduler(
                 continue;
             }
             Ok(Err(error)) => {
+                // A failed simulation is a task outcome once it is durably
+                // settled; only an unsettled task keeps the fail-stop.
+                if task_outcome_settled(&store, &worker.run_id, &worker.task_id)? {
+                    report_settled_task_failure(&worker.run_id, &worker.task_id, &error);
+                    continue;
+                }
                 return Err(error).context("supervise scheduled accepted worker");
             }
             Err(_) => {
@@ -1071,6 +1110,13 @@ fn classify_scheduler_operation<T>(result: Result<T>) -> Result<SchedulerOperati
             );
             Ok(SchedulerOperation::Deferred)
         }
+        Err(error) if is_stale_admission_candidate(&error) => {
+            tracing::warn!(
+                error = ?error,
+                "compute scheduler deferred a stale admission candidate"
+            );
+            Ok(SchedulerOperation::Deferred)
+        }
         Err(error)
             if error.chain().any(|cause| {
                 cause.is::<fullmag_session::host_resource_ledger::TransientGpuInventoryUnavailable>()
@@ -1096,6 +1142,151 @@ fn is_store_writer_busy(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
+}
+
+fn is_stale_admission_candidate(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<fullmag_runtime_control::StaleTaskAdmissionCandidate>())
+}
+
+/// Whether a task reached a durable outcome and holds no resource lease: a
+/// terminal lifecycle, or queued again by a durable retry decision.
+fn task_outcome_settled(store: &SessionStore, run_id: &RunId, task_id: &str) -> Result<bool> {
+    let Some(catalog) = retry_store_writer_busy(|| store.read_run_catalog(run_id.as_str()))?
+    else {
+        return Ok(false);
+    };
+    let Some(task) = catalog.tasks.iter().find(|task| task.task_id == task_id) else {
+        return Ok(false);
+    };
+    if !matches!(
+        task.lifecycle,
+        fullmag_session::FmsTaskLifecycle::Succeeded
+            | fullmag_session::FmsTaskLifecycle::Failed
+            | fullmag_session::FmsTaskLifecycle::Cancelled
+            | fullmag_session::FmsTaskLifecycle::Queued
+    ) {
+        return Ok(false);
+    }
+    let lease = retry_store_writer_busy(|| {
+        store.read_active_resource_lease_for_task(run_id.as_str(), task_id)
+    })?;
+    Ok(lease.is_none())
+}
+
+fn report_settled_task_failure(run_id: &RunId, task_id: &str, error: &anyhow::Error) {
+    tracing::warn!(
+        run_id = run_id.as_str(),
+        task_id,
+        error = ?error,
+        "accepted task failed; its outcome is durable and scheduling continues"
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "schema_version": "scheduler_task_outcome.v1",
+            "event": "task_failed_settled",
+            "component": "accepted_compute_scheduler",
+            "run_id": run_id.as_str(),
+            "task_id": task_id,
+            "reason": format!("{error:#}"),
+        })
+    );
+}
+
+#[derive(Clone, Copy)]
+struct WorkerSupervisionLimits {
+    max_concurrency: usize,
+    worker_timeout: Duration,
+    heartbeat_interval: Duration,
+    max_automatic_retries: usize,
+}
+
+/// Settle tasks whose worker process exited while it owned a resource.
+///
+/// Host recovery resumes only pre-launch Preparing claims; a Running or
+/// Stopping task whose worker died (it has a durable process-exit receipt)
+/// otherwise kept its resource lease forever. Its supervisor recovery path
+/// records the failure, a retry decision or the cancellation and releases the
+/// lease. Resources with an active worker in this process are skipped.
+fn recover_exited_worker_tasks(
+    store: &SessionStore,
+    run_ids: &[RunId],
+    active_workers: &ActiveWorkers,
+    worker_executable: &Path,
+    limits: WorkerSupervisionLimits,
+    host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
+) -> Result<bool> {
+    let mut recovered = false;
+    for run_id in run_ids {
+        let Some(catalog) = store.read_run_catalog(run_id.as_str())? else {
+            continue;
+        };
+        for task in &catalog.tasks {
+            if !matches!(
+                task.lifecycle,
+                fullmag_session::FmsTaskLifecycle::Running
+                    | fullmag_session::FmsTaskLifecycle::Stopping
+            ) {
+                continue;
+            }
+            let Some(resource_id) = task.resource_id.as_deref() else {
+                continue;
+            };
+            if active_workers.contains_key(resource_id) {
+                continue;
+            }
+            if accepted_study_supervisor::worker_process_exit_receipt_for_current_task(
+                store,
+                run_id.as_str(),
+                &task.task_id,
+            )?
+            .is_none()
+            {
+                continue;
+            }
+            recovered = true;
+            match accepted_study_supervisor::run_supervised_accepted_worker_with_host(
+                store,
+                run_id.as_str(),
+                &task.task_id,
+                worker_executable,
+                limits.max_concurrency,
+                limits.worker_timeout,
+                limits.heartbeat_interval,
+                limits.max_automatic_retries,
+                host,
+            ) {
+                Ok(result) => eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": "scheduler_task_outcome.v1",
+                        "event": "exited_worker_recovered",
+                        "component": "accepted_compute_scheduler",
+                        "run_id": run_id.as_str(),
+                        "task_id": task.task_id,
+                        "retry_scheduled": result.retry_scheduled,
+                        "worker_cancelled": result.worker_cancelled,
+                        "worker": result.worker_summary,
+                    })
+                ),
+                Err(error) if task_outcome_settled(store, run_id, &task.task_id)? => {
+                    report_settled_task_failure(run_id, &task.task_id, &error);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "recover exited worker of task `{}` in run `{}`",
+                            task.task_id,
+                            run_id.as_str()
+                        )
+                    })
+                }
+            }
+        }
+    }
+    Ok(recovered)
 }
 
 fn sibling_worker_executable() -> Result<PathBuf> {

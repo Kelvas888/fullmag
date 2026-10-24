@@ -19,6 +19,7 @@ provenance records that keep requested intent separated from resolved execution.
 runtime-selection
 backend-policy
 simulation
+live-session
 results
 artifacts
 provenance

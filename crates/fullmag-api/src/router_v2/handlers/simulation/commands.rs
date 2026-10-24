@@ -236,11 +236,16 @@ async fn submit_structured_command_impl_with_context(
         }
         if crate::live_accepted_execution::docker_api_only_runtime() && command.kind == "stop" {
             validate_accepted_command_admission(&state, context, &command).await?;
+            let requested_run_id = match &command.target {
+                Some(RuntimeCommandTarget::Run { run_id }) => run_id.clone(),
+                _ => None,
+            };
             let accepted = crate::live_accepted_execution::submit_live_stop_with_transition(
                 &state,
                 context,
                 &command.command_id,
                 command.reason.as_deref().unwrap_or("user requested stop"),
+                requested_run_id.as_deref(),
             )
             .await?;
             command.target = Some(RuntimeCommandTarget::Run {
@@ -340,7 +345,13 @@ async fn enforce_session_command_admission(state: &Arc<AppState>, accepted_obser
         if snapshot.session.status == "closed" {
             return Err(ApiError::conflict("session_closed_read_only: closed sessions reject commands"));
         }
-        let effective = effective_runtime_status_code(snapshot);
+        // A session awaiting its next command keeps the finished run's stage
+        // state as history; that state must not close the session.
+        let effective = if snapshot.session.status == "awaiting_command" {
+            snapshot.session.status.clone()
+        } else {
+            effective_runtime_status_code(snapshot)
+        };
         let terminal_status = [effective.as_str(), snapshot.session.status.as_str()]
             .into_iter()
             .find(|status| matches!(*status, "completed" | "failed" | "cancelled" | "closed"))

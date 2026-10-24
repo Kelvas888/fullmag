@@ -13,6 +13,21 @@ use fullmag_session::{
 /// Durably admit a claimed application task before publishing its worker
 /// coordinator or process. Replaying the same claim repairs an interrupted
 /// catalog/lease projection without creating a new attempt.
+
+/// A scheduler admission candidate went stale between the queue snapshot and
+/// the durable admission (for example the task was cancelled meanwhile). It is
+/// transient: no durable state was written and the next pass re-reads the queue.
+#[derive(Debug)]
+pub struct StaleTaskAdmissionCandidate;
+
+impl std::fmt::Display for StaleTaskAdmissionCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stale scheduler admission candidate")
+    }
+}
+
+impl std::error::Error for StaleTaskAdmissionCandidate {}
+
 pub fn commit_claimed_task_admission(
     store: &SessionStore,
     task: &TaskRecord,
@@ -231,7 +246,11 @@ fn commit_claimed_task_admission_with<'a>(
         && durable_task.ownership_epoch == Some(claim.ownership_epoch.value())
         && durable_task.resource_id.as_deref() == Some(claim.lease.resource_id.as_str());
     if !is_unclaimed_queue && !is_exact_replay {
-        bail!("durable task is neither queued nor owned by this admission claim");
+        // The scheduler built this claim from an earlier snapshot; the task
+        // changed since (e.g. it was cancelled). Nothing was written yet, so
+        // the candidate is re-evaluated in the next scheduling pass.
+        return Err(anyhow::Error::new(StaleTaskAdmissionCandidate)
+            .context("durable task is neither queued nor owned by this admission claim"));
     }
 
     let kind = match claim.lease.kind {

@@ -195,7 +195,7 @@ pub(crate) fn prepare_and_publish(
             "accepted quantity receipt omitted: observation storage budget exhausted");
         return Ok(());
     }
-    let object_ref = fullmag_runtime_control::retry_store_writer_busy(|| store.cas().put(&bytes))?;
+    let object_ref = retry_worker_store_writer_busy(|| store.cas().put(&bytes))?;
     let lease = store.read_resource_lease(step.claim.run_id.as_str(),
         step.claim.lease.resource_id.as_str(), step.claim.lease.lease_token.as_str())?
         .context("materialization resource lease missing")?;
@@ -210,10 +210,16 @@ pub(crate) fn prepare_and_publish(
         required: false, study_output: None,
     };
     binary_entries.push(entry);
-    fullmag_runtime_control::retry_store_writer_busy(|| {
+    retry_worker_store_writer_busy(|| {
         store.append_artifact_catalog_entries_for_lease(&lease, &binary_entries)
     })?;
     Ok(())
+}
+
+/// This module runs inside the worker, which waits for the shared writer
+/// rather than losing a computed result (`WORKER_STORE_WRITER_WAIT`).
+fn retry_worker_store_writer_busy<T>(operation: impl FnMut() -> Result<T>) -> Result<T> {
+    fullmag_runtime_control::retry_worker_store_transient(operation)
 }
 
 pub(crate) fn field_key(field: &fullmag_runner::AcceptedMaterializedField) -> String {
@@ -327,7 +333,7 @@ fn publish_observation_object(
 ) -> Result<String> {
     *used = used.checked_add(bytes.len() as u64).context("observation storage size overflow")?;
     if *used > budget { bail!("binary observations exceed the remaining storage lease"); }
-    let hash = fullmag_runtime_control::retry_store_writer_busy(|| store.cas().put(bytes))?;
+    let hash = retry_worker_store_writer_busy(|| store.cas().put(bytes))?;
     if !entries.iter().any(|entry| entry.content_sha256 == hash) {
         entries.push(FmsArtifactCatalogEntry {
             artifact_id: format!("accepted-field-{}", fullmag_session::canonical_json_sha256(

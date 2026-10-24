@@ -1652,6 +1652,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/sessions/current/clients": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["sessions_get_sessions_current_clients"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/sessions/current/clients/{client_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["sessions_put_sessions_current_clients_client_id"];
+        post?: never;
+        delete: operations["sessions_delete_sessions_current_clients_client_id"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/sessions/current/data/antenna/field-solutions/{solution_id}": {
         parameters: {
             query?: never;
@@ -14528,6 +14560,35 @@ export interface components {
             summary: components["schemas"]["ImportedAssetSummary"];
             target_realization: string;
         };
+        SessionClientEntry: {
+            client_id: string;
+            /** Format: int64 */
+            connected_at_unix_ms: number;
+            kind: components["schemas"]["SessionClientKind"];
+            label?: string | null;
+            /** Format: int64 */
+            last_seen_unix_ms: number;
+        };
+        SessionClientHeartbeatRequest: {
+            kind: components["schemas"]["SessionClientKind"];
+            /** @description Short human label, e.g. the script file name. */
+            label?: string | null;
+        };
+        /**
+         * @description Kind of external client driving the session (ADR 0068).
+         * @enum {string}
+         */
+        SessionClientKind: "python_live";
+        SessionClientsResource: {
+            clients: components["schemas"]["SessionClientEntry"][];
+            /** Format: int64 */
+            revision: number;
+            /**
+             * Format: int64
+             * @description A client without a heartbeat for this long is no longer listed.
+             */
+            ttl_ms: number;
+        };
         /** @enum {string} */
         SessionCommandability: "allowed" | "forbidden" | "read_only";
         /** @enum {string} */
@@ -21019,6 +21080,90 @@ export interface operations {
             };
             /** @description No Γ spin-wave response artifact */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    sessions_get_sessions_current_clients: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description External clients seen within the presence TTL */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionClientsResource"];
+                };
+            };
+        };
+    };
+    sessions_put_sessions_current_clients_client_id: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+            };
+            path: {
+                /** @description Client-chosen stable identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionClientHeartbeatRequest"];
+            };
+        };
+        responses: {
+            /** @description Heartbeat recorded */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionClientEntry"];
+                };
+            };
+            /** @description Invalid client identity */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    sessions_delete_sessions_current_clients_client_id: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+            };
+            path: {
+                /** @description Client-chosen stable identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Client removed or already absent */
+            204: {
                 headers: {
                     [name: string]: unknown;
                 };

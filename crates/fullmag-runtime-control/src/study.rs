@@ -2691,6 +2691,64 @@ fn validate_study_input_dependencies(
     Ok(())
 }
 
+/// Bind `PinnedArtifact` magnetization inputs by content alone (ADR 0068 F5).
+///
+/// A live command that continues the previous command's final state pins the
+/// exact CAS object at accept time. Resolution is deterministic: the same
+/// port always yields the same typed binding, so claim, Prepare rehydration
+/// and scheduler recovery agree. The worker still decodes the bytes and
+/// requires an exact layout match against the accepted execution plan.
+fn resolve_pinned_state_inputs(
+    store: &SessionStore,
+    ports: &[StudyInputPort],
+    resolved: &mut std::collections::BTreeMap<String, ResolvedInput>,
+) -> Result<()> {
+    for port in ports {
+        let StudyInputSource::PinnedArtifact {
+            artifact_id,
+            content_sha256,
+        } = &port.source
+        else {
+            continue;
+        };
+        let data_kind = match port.data_kind {
+            fullmag_authoring::StudyPortDataKind::State => "state",
+            fullmag_authoring::StudyPortDataKind::InitialState => "initial_state",
+            unsupported => bail!(
+                "pinned study input `{}` has unsupported data kind {unsupported:?}",
+                port.port_id
+            ),
+        };
+        if !store.cas().contains(content_sha256) {
+            bail!(
+                "pinned study input `{}` CAS object {content_sha256} is missing",
+                port.port_id
+            );
+        }
+        let binding = ResolvedInput {
+            source: artifact_id.clone(),
+            content_sha256: content_sha256.clone(),
+            study_artifact: Some(fullmag_application::ResolvedStudyArtifact {
+                artifact_id: artifact_id.clone(),
+                object_ref: content_sha256.clone(),
+                data_kind: data_kind.to_string(),
+                codec_id: fullmag_application::STUDY_MAGNETIZATION_CODEC_ID.to_string(),
+                codec_version: fullmag_application::STUDY_MAGNETIZATION_CODEC_VERSION.to_string(),
+            }),
+        };
+        if let Some(supplied) = resolved.get(&port.port_id) {
+            if supplied.source != binding.source || supplied.content_sha256 != binding.content_sha256 {
+                bail!(
+                    "pinned study input `{}` differs from its accepted artifact identity",
+                    port.port_id
+                );
+            }
+        }
+        resolved.insert(port.port_id.clone(), binding);
+    }
+    Ok(())
+}
+
 /// Resolve the exact accepted step's declared inputs from durable artifact and
 /// run catalogs. This read-only projection does not create or claim a task.
 pub fn resolve_accepted_study_inputs(
@@ -2718,6 +2776,7 @@ pub fn resolve_accepted_study_inputs(
         catalog,
         artifact_catalog.as_ref(),
     )?;
+    resolve_pinned_state_inputs(store, &study_step.inputs, &mut resolved_inputs)?;
     validate_study_input_dependencies(
         run_id,
         &study_step.inputs,

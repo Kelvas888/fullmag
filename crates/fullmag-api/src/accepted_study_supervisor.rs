@@ -907,16 +907,50 @@ fn task_stop_requested(store: &SessionStore, run_id: &str, task_id: &str) -> Res
     ))
 }
 
+/// Read-only claim reconstruction for one heartbeat. On a Docker Desktop
+/// Windows host folder a file that another process atomically replaces can
+/// read as missing for a moment, even under the writer lock. The run catalog
+/// never disappears during a run, so such an observation is retried briefly
+/// instead of failing a running task.
+fn load_claim_for_heartbeat(
+    store: &SessionStore,
+    run_id: &fullmag_application::RunId,
+    task_id: &str,
+) -> Result<fullmag_application::TaskClaim> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match retry_store_writer_busy(|| {
+            fullmag_runtime_control::load_current_task_claim(store, run_id, task_id)
+        }) {
+            Ok(claim) => return Ok(claim),
+            Err(error)
+                if transiently_missing_store_file(&error)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn transiently_missing_store_file(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            || cause.to_string() == "task claim recovery requires a durable run catalog"
+    })
+}
+
 fn renew_resource_lease(store: &SessionStore, lease: &mut FmsResourceLease) -> Result<bool> {
     if task_is_terminal(store, lease)? {
         return Ok(false);
     }
     let run_id = fullmag_application::RunId::parse(lease.run_id.clone())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let claim = retry_store_writer_busy(|| {
-        fullmag_runtime_control::load_current_task_claim(store, &run_id, &lease.task_id)
-    })
-    .context("load accepted-worker claim before heartbeat command")?;
+    let claim = load_claim_for_heartbeat(store, &run_id, &lease.task_id)
+        .context("load accepted-worker claim before heartbeat command")?;
     if reconcile_acknowledged_resource_lease(store, &claim, lease)? {
         return Ok(true);
     }
@@ -1719,7 +1753,13 @@ fn reconcile_worker_exit(
     if process_exit.status_success {
         bail!("worker exited successfully without a durable succeeded task");
     }
-    if inbox_checkpoint.pending.is_some() && accepted_worker_attempt_reserved(store, claim)? {
+    // A pending lease heartbeat is not a solver effect; only another pending
+    // command (Start/Stop) leaves the outcome ambiguous.
+    let pending_effect = inbox_checkpoint
+        .pending
+        .as_ref()
+        .is_some_and(|pending| !matches!(&pending.command, WorkerCommand::Heartbeat { .. }));
+    if pending_effect && accepted_worker_attempt_reserved(store, claim)? {
         bail!(
             "worker exited with an ambiguous pending effect; resource lease retained for reconciliation: {}",
             process_exit
@@ -1960,7 +2000,7 @@ fn persist_worker_process_exit_receipt(
     Ok(receipt)
 }
 
-fn worker_process_exit_receipt_for_current_task(
+pub(crate) fn worker_process_exit_receipt_for_current_task(
     store: &SessionStore,
     run_id: &str,
     task_id: &str,
@@ -2282,10 +2322,18 @@ fn worker_failure_reason(outcome: &ObservedWorkerProcess) -> String {
     let detail = if normalized.is_empty() {
         format!("exit code {:?}", output.status.code())
     } else {
-        normalized
-            .chars()
-            .skip(normalized.chars().count().saturating_sub(512))
-            .collect()
+        // Prefer the worker's own error report; diagnostic progress lines
+        // printed around it must not hide the failure. Otherwise keep the tail.
+        let marker = "accepted worker failed:";
+        let report = normalized.rfind(marker).map(|index| &normalized[index..]);
+        let chars = report.unwrap_or(&normalized).chars().collect::<Vec<_>>();
+        if report.is_some() {
+            chars.iter().take(1024).collect()
+        } else {
+            let start = chars.len().saturating_sub(512);
+            let tail = chars[start..].iter().collect::<String>();
+            if start > 0 { format!("...{tail}") } else { tail }
+        }
     };
     format!("accepted worker process failed: {detail}")
 }
@@ -2449,6 +2497,46 @@ mod tests {
     use super::*;
     use std::process::Child;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn heartbeat_claim_reads_retry_only_transiently_missing_files() {
+        let missing = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("read run catalog");
+        assert!(transiently_missing_store_file(&missing));
+        let no_catalog = anyhow::anyhow!("task claim recovery requires a durable run catalog");
+        assert!(transiently_missing_store_file(&no_catalog));
+        let not_ready = anyhow::anyhow!("task is not ready under an active durable claim");
+        assert!(!transiently_missing_store_file(&not_ready));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_failure_reason_keeps_the_worker_error_report() {
+        use std::os::unix::process::ExitStatusExt;
+        let noise = "[fullmag-plan][mag-texture] sampling preset 'uniform' S=[+1.0e0]
+".repeat(40);
+        let stderr = format!(
+            "{noise}accepted worker failed: execute accepted worker Start: no pinned runner horizon
+{noise}"
+        );
+        let outcome = ObservedWorkerProcess {
+            output: Output {
+                status: ExitStatus::from_raw(256),
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            },
+            timed_out: false,
+            stop_requested: false,
+            process_id: 7,
+            process_start_token: None,
+            control_failure_reason: None,
+        };
+        let reason = worker_failure_reason(&outcome);
+        assert!(
+            reason.starts_with("accepted worker process failed: accepted worker failed: execute accepted worker Start"),
+            "{reason}"
+        );
+    }
 
     fn temporary_store(name: &str) -> (PathBuf, SessionStore) {
         let root = std::env::temp_dir().join(format!(

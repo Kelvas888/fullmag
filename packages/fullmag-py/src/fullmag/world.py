@@ -32,6 +32,7 @@ Multi-magnet example::
 from __future__ import annotations
 
 import copy
+import functools
 import asyncio
 import math
 import threading
@@ -2620,6 +2621,12 @@ class _WorldState:
     _declared_stages: list[CapturedStage] = field(default_factory=list)
     _magnetization_constraints: list[FrozenSpins] = field(default_factory=list)
 
+    # Live execution mode (ADR 0068): the fullmag.live session bound to this world.
+    _live_session: Any | None = None
+    _live_auto_attempted: bool = False
+    # Actions issued in live mode, authored into scene.study.stages like captured stages.
+    _live_stages: list[CapturedStage] = field(default_factory=list)
+
 
 _RELAXATION_DEFAULT_TORQUE_TOLERANCE_APM = DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM
 _RELAXATION_DEFAULT_TORQUE_TOLERANCE_T = DEFAULT_RELAXATION_TORQUE_TOLERANCE_T
@@ -2732,6 +2739,36 @@ class _WorldStateBinding:
 
 _state = _WorldStateBinding()
 _capture_binding = _ContextBinding("fullmag_capture_state", _CaptureState)
+
+
+def _live_session_or_none() -> Any | None:
+    """The fullmag.live session of this context, or ``None`` outside live mode (ADR 0068)."""
+    if _capture_binding.current().enabled:
+        return None
+    from fullmag.live import active_session
+
+    return active_session()
+
+
+def _not_in_live_mode(hint: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Reject a DSL operation in live mode instead of silently running it locally."""
+
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(function)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if _live_session_or_none() is not None:
+                from fullmag.live import LiveModeError
+
+                raise LiveModeError(f"fm.{function.__name__}() is not available in live mode: {hint}")
+            return function(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
+def _drop_none_values(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if value is not None}
 
 
 class ExecutionContext:
@@ -2938,12 +2975,18 @@ def _normalize_quantity_name(quantity: str) -> str:
 
 
 def _latest_result():
+    live = _live_session_or_none()
+    if live is not None:
+        return live.latest_result()
     if _state._last_result is None:
         raise RuntimeError("No simulation result available yet. Run fm.run() or fm.relax() first.")
     return _state._last_result
 
 
 def _latest_step():
+    live = _live_session_or_none()
+    if live is not None:
+        return live.latest_step()
     if _state._last_step is None:
         raise RuntimeError("No step statistics available yet. Run fm.run() or fm.relax() first.")
     return _state._last_step
@@ -3154,6 +3197,7 @@ def _resolve_flat_relax_stop(
     )
 
 
+@_not_in_live_mode('declared stages belong to `fullmag script.py`; in live mode call fm.relax()/fm.run() directly')
 def relax_stage(
     *,
     tol: object = _RELAX_UNSET,
@@ -3245,6 +3289,7 @@ def relax_stage(
     )
 
 
+@_not_in_live_mode('declared stages belong to `fullmag script.py`; in live mode call fm.relax()/fm.run() directly')
 def run_stage(
     until: float,
 ) -> RunStageSpec:
@@ -3253,6 +3298,7 @@ def run_stage(
     return RunStageSpec(until=until)
 
 
+@_not_in_live_mode('declared stages belong to `fullmag script.py`; in live mode call fm.relax()/fm.run() directly')
 def eigenmodes_stage(
     *,
     count: int = 10,
@@ -3301,6 +3347,7 @@ def eigenmodes_stage(
     )
 
 
+@_not_in_live_mode('declared stages belong to `fullmag script.py`; in live mode call fm.relax()/fm.run() directly')
 def frequency_response_stage(
     *,
     frequencies_hz: Sequence[float],
@@ -3400,6 +3447,7 @@ def _fem_eigen_solver_policy(
     )
 
 
+@_not_in_live_mode('declared stages belong to `fullmag script.py`; in live mode call fm.relax()/fm.run() directly')
 def save_state_stage(
     *,
     artifact_name: str = "state_snapshot",
@@ -3910,8 +3958,18 @@ def _normalize_domain_region_markers(
 
 
 def reset() -> None:
-    """Reset world state to defaults (useful between scripts)."""
+    """Reset world state to defaults (useful between scripts).
+
+    A live session survives the reset; the next complete world replaces the
+    session's scene (the counterpart of Boris ``ns.default()``).
+    """
+    session = _state._live_session
     _state.replace()
+    if session is not None and not getattr(session, "closed", True) and not _capture_binding.current().enabled:
+        _state._live_session = session
+        _state._live_auto_attempted = True
+        session.state = _state.current()
+        session.baseline = None
 
 
 def begin_script_capture(source_root: str | Path | None = None) -> None:
@@ -6889,6 +6947,7 @@ class StudyBuilder:
         )
 
 
+@_not_in_live_mode('frequency-domain studies run through `fullmag script.py`')
 def frequency_response(
     *,
     frequencies_hz: Sequence[float],
@@ -8687,7 +8746,17 @@ def geometry(
         layer.Aex = 13e-12
 
     Multiple calls register multiple magnets.
+
+    In live mode (ADR 0068) re-running ``fm.geometry(..., name=X)`` for an
+    existing magnet ``X`` replaces its shape and returns the same handle, so a
+    notebook cell can be executed again without a duplicate-object error.
     """
+    if _live_session_or_none() is not None:
+        live_id = require_non_empty(object_id, "object_id") if object_id is not None else name
+        for existing in _state._magnets:
+            if live_id == (existing.object_id if existing.object_id is not None else existing._name):
+                existing._shape = shape
+                return existing
     handle = MagnetHandle(shape, name, object_id=object_id)
     resolved_id = handle.object_id if handle.object_id is not None else handle._name
     if resolved_id in _state._auxiliary_geometry_object_ids.values() or any(
@@ -9160,6 +9229,7 @@ _SCALAR_QUANTITIES = {
 _EIGEN_QUANTITIES = {"spectrum", "mode", "dispersion", "diagnostics"}
 
 
+@_not_in_live_mode('read fields with fm.field(...)/fm.table(...) and save them with numpy')
 def save(
     quantity: str,
     *,
@@ -9269,6 +9339,7 @@ def _periodic_output_name(output: object) -> str | None:
     return None
 
 
+@_not_in_live_mode('read fields with fm.field(...)/fm.table(...) and save them with numpy')
 def save_response(observable: str = "susceptibility_tensor") -> None:
     """Register a frequency-response observable output."""
     _state._outputs_explicit = True
@@ -9281,6 +9352,7 @@ def clear_outputs() -> None:
     _state._outputs_explicit = True
 
 
+@_not_in_live_mode('read fields with fm.field(...)/fm.table(...) and save them with numpy')
 def snapshot(
     layer_or_quantity: "str | MagnetHandle",
     quantity: str | None = None,
@@ -9903,6 +9975,13 @@ def run(until: float) -> Any:
         raise ValueError("run(until) requires a positive stop time")
     from fullmag.runtime import Simulation
     problem = _build_problem(study_kind="time_evolution")
+    live = _live_session_or_none()
+    if live is not None:
+        _require_live_timestep(problem)
+        _state._live_stages.append(
+            CapturedStage(problem=problem, entrypoint_kind="flat_run", default_until_seconds=until)
+        )
+        return live.submit_stage("run", len(_state._live_stages) - 1, until_seconds=float(until))
     if _capture_binding.current().enabled:
         _capture_binding.current().stages.append(
             CapturedStage(
@@ -9916,6 +9995,39 @@ def run(until: float) -> Any:
     result = Simulation(problem).run(until=until)
     _record_result(result)
     return result
+
+
+def _append_live_loop_stage(*, relax: bool, chunk_time: float) -> int:
+    """Author one stage that every chunk of a live loop targets; return its index."""
+    if relax:
+        problem = _build_problem(study_kind="relaxation")
+        stage = CapturedStage(problem=problem, entrypoint_kind="flat_relax", default_until_seconds=None)
+    else:
+        problem = _build_problem(study_kind="time_evolution")
+        stage = CapturedStage(problem=problem, entrypoint_kind="flat_run", default_until_seconds=chunk_time)
+    _require_live_timestep(problem)
+    _state._live_stages.append(stage)
+    return len(_state._live_stages) - 1
+
+
+def _require_live_timestep(problem: Any) -> None:
+    """Reject an LLG stage the accepted runner cannot execute, before it is submitted.
+
+    Executable stages need a fixed timestep or an adaptive policy with an
+    explicit ``dt_max``, exactly like ``study.stages.add_run``/``add_relax``.
+    """
+    dynamics = getattr(getattr(problem, "study", None), "dynamics", None)
+    if dynamics is None:
+        return
+    adaptive = getattr(dynamics, "adaptive_timestep", None)
+    if getattr(dynamics, "fixed_timestep", None) is not None:
+        return
+    if adaptive is not None and getattr(adaptive, "dt_max", None) is not None:
+        return
+    raise ValueError(
+        "live LLG stages need an explicit timestep: call fm.solver(fix_dt=...) or "
+        "fm.solver(integrator='rk23', dt_min=..., dt_max=..., max_err=...) first"
+    )
 
 
 def _evaluate_runwhile_condition(condition: QuantityCondition | Callable[[], bool] | bool) -> bool:
@@ -9943,6 +10055,20 @@ def run_while(
     * At least one guard (`max_time` or `max_steps`) is required.
     * `max_steps` guards the accumulated solver steps across all chunks.
     """
+    live = _live_session_or_none()
+    if live is not None:
+        if kwargs:
+            raise TypeError("run_while() in live mode accepts no extra relax keyword arguments")
+        if max_time is None and max_steps is None:
+            raise ValueError("run_while requires max_time or max_steps as a guard")
+        return live.run_until(
+            lambda _step: not _evaluate_runwhile_condition(condition),
+            chunk_time=float(chunk_time),
+            max_time=max_time,
+            max_solver_steps=max_steps,
+            relax=relax,
+            stage_index=_append_live_loop_stage(relax=relax, chunk_time=float(chunk_time)),
+        )
     _guard_profile_direct_execution()
     relax_kwargs: dict[str, object] = {}
     relax_fn = globals()["relax"]
@@ -10181,6 +10307,9 @@ def relax(
         dt_max=dt_max,
         field_refresh=field_refresh,
         relax_alpha=resolved_relax_alpha,
+        # A live relax becomes an executable authored stage, which needs the
+        # same explicit timestep policy as `study.stages.add_relax`.
+        require_explicit_timestep=_live_session_or_none() is not None,
     )
     from fullmag.runtime import Simulation
     problem = _build_problem(
@@ -10212,6 +10341,28 @@ def relax(
             for magnet in problem.magnets
         ]
         problem = dataclasses.replace(problem, magnets=new_magnets)
+
+    live = _live_session_or_none()
+    if live is not None:
+        _state._live_stages.append(
+            CapturedStage(problem=problem, entrypoint_kind="flat_relax", default_until_seconds=None)
+        )
+        return live.submit_stage(
+            "relax",
+            len(_state._live_stages) - 1,
+            **_drop_none_values(
+                {
+                    "relax_algorithm": algorithm,
+                    "torque_tolerance_apm": stop.torque_tolerance_apm,
+                    "energy_tolerance_j": stop.energy_tolerance_j,
+                    "max_steps": stop.max_steps,
+                    "max_relaxation_time_s": stop.max_relaxation_time_s,
+                    "relax_alpha": resolved_relax_alpha,
+                    "fixed_timestep": float(dt) if isinstance(dt, (int, float)) else None,
+                    "max_error": max_error,
+                }
+            ),
+        )
 
     if _capture_binding.current().enabled:
         _capture_binding.current().stages.append(
@@ -10294,6 +10445,7 @@ def Minimize(
     )
 
 
+@_not_in_live_mode('eigenmode studies run through `fullmag script.py`')
 def eigenmodes(
     *,
     count: int = 10,

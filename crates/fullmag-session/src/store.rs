@@ -1388,6 +1388,36 @@ impl SessionStore {
     /// Read the durable task catalog for one run, if present.
     pub fn read_run_catalog(&self, run_id: &str) -> Result<Option<FmsRunCatalog>> {
         validate_store_id(run_id)?;
+        // On a host-shared folder (Docker Desktop over NTFS) a file that is
+        // atomically replaced can read as missing for a moment, even under
+        // the writer lock. A run with an intent always has a catalog, so a
+        // missing catalog next to its intent is re-read briefly before it is
+        // reported absent.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let observed = self.read_run_catalog_once(run_id);
+            let transiently_missing = match &observed {
+                Ok(None) => self.run_intent_file_exists(run_id)?,
+                Ok(Some(_)) => false,
+                Err(error) => error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }),
+            };
+            if !transiently_missing || std::time::Instant::now() >= deadline {
+                return observed;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn run_intent_file_exists(&self, run_id: &str) -> Result<bool> {
+        let path = checked_path(&self.root, &format!("runs/{run_id}/run_intent.json"))?;
+        Ok(fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()))
+    }
+
+    fn read_run_catalog_once(&self, run_id: &str) -> Result<Option<FmsRunCatalog>> {
         let relative = format!("runs/{run_id}/run_catalog.json");
         let path = checked_path(&self.root, &relative)?;
         match fs::symlink_metadata(&path) {
@@ -3488,7 +3518,7 @@ impl SessionStore {
         }
         let _writer_lease = self.write_transaction()?;
         let lease_path = self.resource_lease_path(lease)?;
-        let lease_bytes = fs::read(&lease_path)
+        let lease_bytes = read_file_held_under_writer(&lease_path)
             .with_context(|| format!("reading resource lease {}", lease_path.display()))?;
         let current_lease: FmsResourceLease = serde_json::from_slice(&lease_bytes)
             .with_context(|| format!("parsing resource lease {}", lease_path.display()))?;
@@ -5976,7 +6006,7 @@ impl SessionStore {
         // below remain unchanged.
         self.validate_resource_lease_owner_unlocked(lease, true)?;
         let path = self.resource_lease_path(lease)?;
-        let data = fs::read(&path)
+        let data = read_file_held_under_writer(&path)
             .with_context(|| format!("reading resource lease {}", path.display()))?;
         let current: FmsResourceLease = serde_json::from_slice(&data)?;
         current.validate()?;
@@ -6025,7 +6055,7 @@ impl SessionStore {
             anyhow::bail!("resource lease release requires the active lease identity");
         }
         let path = self.resource_lease_path(lease)?;
-        let data = fs::read(&path)
+        let data = read_file_held_under_writer(&path)
             .with_context(|| format!("reading resource lease {}", path.display()))?;
         let mut current: FmsResourceLease = serde_json::from_slice(&data)?;
         current.validate()?;
@@ -7131,6 +7161,26 @@ fn magnetization_from_bytes(data: &[u8]) -> Vec<[f64; 3]> {
         m.push([mx, my, mz]);
     }
     m
+}
+
+
+/// Read a file that must exist while the caller holds the store writer, such
+/// as an active resource lease: no other writer can remove it. On a Docker
+/// Desktop host folder (NTFS) an atomic replace can still read as missing for
+/// a moment, so such a read is retried briefly before it is reported.
+fn read_file_held_under_writer(path: &Path) -> std::io::Result<Vec<u8>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match fs::read(path) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 #[cfg(test)]

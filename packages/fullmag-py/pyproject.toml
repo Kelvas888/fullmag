@@ -27,6 +27,10 @@ meshing = [
 figures = [
     "Pillow>=10,<13",
 ]
+jupyter = [
+    "ipython>=8,<10",
+    "matplotlib>=3.7,<4",
+]
 
 [dependency-groups]
 dev = [

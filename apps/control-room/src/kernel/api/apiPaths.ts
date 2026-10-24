@@ -51,6 +51,15 @@ export const SESSION_STATUS_PATH = openApiV2Path(
   "/v2/sessions/current/status",
 );
 
+/** External clients (e.g. Python live scripts) present in the current session. */
+export const SESSION_CLIENTS_PATH = openApiV2Path(
+  "/v2/sessions/current/clients",
+);
+
+export const SESSION_CLIENT_PATH = openApiV2Path(
+  "/v2/sessions/current/clients/{client_id}",
+);
+
 export const ANALYSIS_FREQUENCY_RESPONSE_MAGNETIC_SWEEP_V1_PATH = openApiV2Path(
   "/v2/sessions/current/analysis/frequency-response/magnetic-sweep.v1",
 );
