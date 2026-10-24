@@ -531,7 +531,7 @@ mod tests {
             "plan_fingerprint": "plan-current",
             "source_scene_revision": 7,
             "status": "completed"
-        }));
+        }).into());
         let mut scene = fullmag_authoring::SceneDocument::default();
         scene.revision = 7;
         snapshot.scene_document = Some(scene);

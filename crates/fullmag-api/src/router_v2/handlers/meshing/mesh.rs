@@ -2559,7 +2559,7 @@ pub async fn get_mesh_region_quality(
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active FEM mesh"))?;
     let null_workspace = Value::Null;
-    let mesh_workspace = snapshot.mesh_workspace.as_ref().unwrap_or(&null_workspace);
+    let mesh_workspace = snapshot.mesh_workspace.as_deref().unwrap_or(&null_workspace);
     let membership =
         crate::router_v2::handlers::data::mesh_region_membership::build_mesh_region_membership(
             scene,
@@ -3015,7 +3015,7 @@ fn current_mesh_workspace(snapshot: &SessionStateResponse) -> Result<&Value, Api
         std::sync::LazyLock::new(|| Value::Object(serde_json::Map::new()));
     Ok(snapshot
         .mesh_workspace
-        .as_ref()
+        .as_deref()
         .unwrap_or(&EMPTY_MESH_WORKSPACE))
 }
 

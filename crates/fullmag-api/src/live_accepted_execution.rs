@@ -497,7 +497,7 @@ async fn current_live_waiting_for_compute_gate(
         let run_id = run.run_id.clone();
         let preparation_ready = accepted_frontier_preparation_is_ready(
             snapshot.simulation_preparation.as_ref(),
-            snapshot.mesh_workspace.as_ref(),
+            snapshot.mesh_workspace.as_deref(),
             &run_id,
         );
         (run_id, preparation_ready)

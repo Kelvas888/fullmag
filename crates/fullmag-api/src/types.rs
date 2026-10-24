@@ -834,7 +834,7 @@ pub(crate) struct SessionStateResponse {
     pub capabilities: Option<BackendCapabilities>,
     pub metadata: Option<crate::shared_json::SharedJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mesh_workspace: Option<Value>,
+    pub mesh_workspace: Option<crate::shared_json::SharedJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_execution: Option<StageExecutionState>,
     #[serde(skip_serializing)]
@@ -2369,7 +2369,7 @@ mod tests {
             live_state: response.live_state.as_ref(),
             runtime_status: &response.runtime_status,
             metadata: response.metadata.as_deref(),
-            mesh_workspace: response.mesh_workspace.as_ref(),
+            mesh_workspace: response.mesh_workspace.as_deref(),
             stage_execution: response.stage_execution.as_ref(),
             scene_document: response.scene_document.as_ref(),
             scalar_rows: &response.scalar_rows,

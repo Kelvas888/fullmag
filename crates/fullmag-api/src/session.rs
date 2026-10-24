@@ -1502,10 +1502,10 @@ fn mesh_build_resource_signature(mesh_workspace: &Value) -> Value {
 }
 
 fn apply_mesh_workspace_update(current: &mut SessionStateResponse, mesh_workspace: Value) {
-    let previous_mesh_signature = current.mesh_workspace.as_ref().map(mesh_resource_signature);
+    let previous_mesh_signature = current.mesh_workspace.as_deref().map(mesh_resource_signature);
     let previous_build_signature = current
         .mesh_workspace
-        .as_ref()
+        .as_deref()
         .map(mesh_build_resource_signature);
     let next_mesh_signature = mesh_resource_signature(&mesh_workspace);
     let next_build_signature = mesh_build_resource_signature(&mesh_workspace);
@@ -1514,7 +1514,7 @@ fn apply_mesh_workspace_update(current: &mut SessionStateResponse, mesh_workspac
     {
         clear_mesh_dirty_tags_for_built_scene(current, source_scene_revision);
     }
-    current.mesh_workspace = Some(mesh_workspace);
+    current.mesh_workspace = Some(mesh_workspace.into());
     if previous_build_signature.as_ref() != Some(&next_build_signature) {
         bump_mesh_build_revision(current);
     }
@@ -5974,7 +5974,7 @@ mod tests {
                 "n_nodes": 16,
                 "n_elements": 8
             }
-        }));
+        }).into());
         current.engine_log = vec![
             engine_log(
                 1_700_000_000_600,
@@ -6045,7 +6045,7 @@ mod tests {
                 "error": "gmsh exited non-zero"
             }],
             "last_build_error": "gmsh exited non-zero"
-        }));
+        }).into());
         current.engine_log = vec![engine_log(
             1_700_000_000_700,
             "error",
@@ -6092,7 +6092,7 @@ mod tests {
                     "error": "FDM planner rejected the grid"
                 }
             ]
-        }));
+        }).into());
         let mut ledger = VecDeque::from([
             tracked_command("cmd-fdm-complete", "fdm_grid_refresh"),
             tracked_command("cmd-fdm-failed", "fdm_grid_refresh"),
@@ -6129,7 +6129,7 @@ mod tests {
                 "completed_at_unix_ms": 1_700_000_000_700u64,
                 "mesh_generation_id": "generation-a"
             }]
-        }));
+        }).into());
         current.engine_log = vec![engine_log(
             1_700_000_000_800,
             "error",

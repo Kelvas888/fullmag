@@ -1490,7 +1490,7 @@ async fn model_readiness_marks_fem_mesh_stale_against_scene_revision() {
         snapshot.mesh_revision = 9;
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": { "source_scene_revision": scene_revision - 1 }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -10842,7 +10842,7 @@ async fn mesh_summary_returns_current_mesh_workspace() {
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_summary": { "nodes": 12, "elements": 24 },
             "mesh_quality_summary": { "min_quality": 0.82 }
-        }));
+        }).into());
         snapshot.mesh_revision = 11;
     }
     let app = build_v2_router().with_state(state);
@@ -10875,7 +10875,7 @@ async fn mesh_object_quality_returns_normalized_scope_statistics() {
                 "body": { "marker": 7, "maximum_element_size": 2e-9 }
             },
             "mesh_statistics": sample_scoped_mesh_statistics()
-        }));
+        }).into());
         snapshot.mesh_revision = 21;
     }
     let app = build_v2_router().with_state(state);
@@ -10942,7 +10942,7 @@ async fn mesh_object_quality_fallback_reports_size_distribution() {
             "effective_per_object_targets": {
                 "body": { "marker": 7, "maximum_element_size": 2e-9 }
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 26;
     }
     let app = build_v2_router().with_state(state);
@@ -10983,7 +10983,7 @@ async fn mesh_universe_quality_returns_airbox_scope_statistics() {
         snapshot.mesh_workspace = Some(serde_json::json!({
             "effective_airbox_target": { "maximum_element_size": 1e-8 },
             "mesh_statistics": sample_scoped_mesh_statistics()
-        }));
+        }).into());
         snapshot.mesh_revision = 22;
     }
     let app = build_v2_router().with_state(state);
@@ -11030,7 +11030,7 @@ async fn mesh_universe_quality_reads_scoped_statistics_from_last_build_summary()
                 "kind": "mesh_build_summary",
                 "mesh_statistics": sample_scoped_mesh_statistics()
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 23;
     }
     let app = build_v2_router().with_state(state);
@@ -11084,7 +11084,7 @@ async fn mesh_universe_quality_fallback_reports_volume_ratio() {
         snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_workspace = Some(serde_json::json!({
             "effective_airbox_target": { "maximum_element_size": 5e-7 }
-        }));
+        }).into());
         snapshot.mesh_revision = 24;
     }
     let app = build_v2_router().with_state(state);
@@ -11132,7 +11132,7 @@ async fn mesh_universe_quality_reports_airbox_size_distribution_without_quality_
         snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_workspace = Some(serde_json::json!({
             "effective_airbox_target": { "maximum_element_size": 5e-7 }
-        }));
+        }).into());
         snapshot.mesh_revision = 25;
     }
     let app = build_v2_router().with_state(state);
@@ -11173,7 +11173,7 @@ async fn mesh_summary_returns_304_when_etag_matches() {
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_summary": { "nodes": 12, "elements": 24 },
             "mesh_quality_summary": { "min_quality": 0.82 }
-        }));
+        }).into());
         snapshot.mesh_revision = 11;
     }
     let app = build_v2_router().with_state(state);
@@ -11239,7 +11239,7 @@ async fn mesh_semantics_returns_three_level_projection() {
             "last_build_summary": { "elements": 24 },
             "mesh_pipeline_status": [{ "id": "meshing", "status": "active" }],
             "last_build_error": "quality threshold not met"
-        }));
+        }).into());
         let mut fem_mesh = sample_fem_mesh_payload_with_manifest();
         fem_mesh.build_report = serde_json::from_value(serde_json::json!({
             "build_mode": "component_aware",
@@ -11308,7 +11308,7 @@ async fn mesh_capabilities_replace_stale_workspace_mixed_features_fail_closed() 
                 "mesh.topology.mixed_p1.v2.disconnected_bodies": { "status": "production_executable" },
                 "mesh.exact_layer_count": { "status": "production_executable" }
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(
             serde_json::from_value(serde_json::json!({
                 "engine_id": "fem_cpu_native",
@@ -11455,7 +11455,7 @@ async fn mixed_shared_domain_resources_publish_typed_topology_truth() {
         );
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_summary": { "mesh_name": "test-mesh" }
-        }));
+        }).into());
         snapshot.mesh_revision = 91;
     }
     let app = build_v2_router().with_state(state);
@@ -11621,7 +11621,7 @@ async fn mixed_v2_shared_domain_resources_publish_v2_capability_reason() {
         );
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_summary": { "mesh_name": "test-mesh" }
-        }));
+        }).into());
         snapshot.mesh_revision = 92;
     }
     let app = build_v2_router().with_state(state);
@@ -11715,7 +11715,7 @@ async fn mesh_active_build_publishes_mixed_layer_rejection_evidence() {
                 }
             },
             "last_build_error": "resolved 2 layers"
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -11832,7 +11832,7 @@ async fn mesh_active_build_returns_projection_from_mesh_workspace() {
                 }
             },
             "last_build_error": "stale topology"
-        }));
+        }).into());
         snapshot.mesh_build_revision = 13;
         snapshot.mesh_revision = 44;
     }
@@ -11929,7 +11929,7 @@ async fn mesh_shared_domain_report_preserves_backend_truth_payloads() {
                 }],
                 "mesh_statistics": { "mesh_name": "mesh-b" }
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 17;
     }
     let app = build_v2_router().with_state(state);
@@ -11976,7 +11976,7 @@ async fn mesh_realized_size_fields_returns_backend_truth_payload() {
                     }]
                 }
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 18;
     }
     let app = build_v2_router().with_state(state);
@@ -12013,7 +12013,7 @@ async fn mesh_quality_gates_prefers_backend_truth_payload() {
                     "status": "pass"
                 }]
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 19;
     }
     let app = build_v2_router().with_state(state);
@@ -12042,7 +12042,7 @@ async fn mesh_quality_gates_returns_marked_projection_when_backend_payload_is_mi
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_quality_summary": { "sicn": { "p05": 0.34 } },
             "mesh_statistics": { "global": { "element_count": 0 } }
-        }));
+        }).into());
         snapshot.mesh_revision = 20;
     }
     let app = build_v2_router().with_state(state);
@@ -12113,7 +12113,7 @@ async fn mesh_quality_gates_publishes_revision_bound_mixed_certificate_evidence(
             per_domain_quality: Default::default(),
             build_report: Some(report),
         }.into());
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
         snapshot.mesh_revision = 91;
     }
     let app = build_v2_router().with_state(state);
@@ -12192,7 +12192,7 @@ async fn mesh_quality_gates_preserves_legacy_v2_mixed_certificate_evidence() {
             per_domain_quality: Default::default(),
             build_report: Some(report),
         }.into());
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
         snapshot.mesh_revision = 92;
     }
     let app = build_v2_router().with_state(state);
@@ -12262,7 +12262,7 @@ async fn mesh_quality_gates_rejects_quality_evidence_mutated_for_the_same_topolo
             per_domain_quality: Default::default(),
             build_report: Some(report),
         }.into());
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
         snapshot.mesh_revision = 93;
     }
     let app = build_v2_router().with_state(state);
@@ -12310,7 +12310,7 @@ async fn mesh_quality_gates_suppresses_stale_mixed_certificate_values() {
         let mut mesh = sample_fem_mesh_payload();
         mesh.build_report = Some(report);
         snapshot.fem_mesh = Some(mesh.into());
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
         snapshot.mesh_revision = 92;
     }
     let app = build_v2_router().with_state(state);
@@ -12356,7 +12356,7 @@ async fn mesh_active_build_returns_304_when_etag_matches() {
             "effective_per_object_targets": { "body": { "hmax": "2e-9" } },
             "last_build_summary": { "elements": 42 },
             "last_build_error": "stale topology"
-        }));
+        }).into());
         snapshot.mesh_build_revision = 13;
     }
     let app = build_v2_router().with_state(state);
@@ -12483,7 +12483,7 @@ async fn fdm_grid_refresh_command_is_queued_for_atomic_runtime_replan() {
                 "completed_at_unix_ms": 1_700_000_000_700u64,
                 "mesh_generation_id": "fdm-generation-b"
             }]
-        }));
+        }).into());
         snapshot.clone()
     };
     let reconciled = {
@@ -13307,7 +13307,7 @@ async fn mesh_build_history_returns_history_projection() {
                 { "mesh_name": "mesh-a", "node_count": 11 },
                 { "mesh_name": "mesh-b", "node_count": 17 }
             ]
-        }));
+        }).into());
         snapshot.mesh_build_revision = 29;
     }
     let app = build_v2_router().with_state(state);
@@ -13338,7 +13338,7 @@ async fn mesh_build_history_returns_304_when_etag_matches() {
                 { "mesh_name": "mesh-a", "node_count": 11 },
                 { "mesh_name": "mesh-b", "node_count": 17 }
             ]
-        }));
+        }).into());
         snapshot.mesh_build_revision = 29;
     }
     let app = build_v2_router().with_state(state);
@@ -13387,7 +13387,7 @@ async fn mesh_last_successful_build_returns_projection() {
             "effective_airbox_target": { "hmax": "5e-9" },
             "effective_per_object_targets": { "body": { "hmax": "2e-9" } },
             "last_build_error": "previous remesh failed"
-        }));
+        }).into());
         snapshot.mesh_build_revision = 31;
     }
     let app = build_v2_router().with_state(state);
@@ -13421,7 +13421,7 @@ async fn mesh_last_successful_build_returns_304_when_etag_matches() {
             "effective_airbox_target": { "hmax": "5e-9" },
             "effective_per_object_targets": { "body": { "hmax": "2e-9" } },
             "last_build_error": "previous remesh failed"
-        }));
+        }).into());
         snapshot.mesh_build_revision = 31;
     }
     let app = build_v2_router().with_state(state);
@@ -13888,7 +13888,7 @@ async fn mesh_shared_domain_cross_section_quality_returns_parent_element_fmqs_pa
                 "element_count": 1,
                 "metrics": ["sicn", "gamma", "volume"]
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 42;
     }
     let app = build_v2_router().with_state(state);
@@ -14314,7 +14314,7 @@ async fn mesh_shared_domain_quality_data_returns_binary_artifact() {
                 "element_count": 1,
                 "metrics": ["sicn", "gamma", "volume"]
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 42;
     }
     let app = build_v2_router().with_state(state);
@@ -14354,7 +14354,7 @@ async fn mesh_periodic_pairs_returns_v1_diagnostics() {
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 41}
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -14623,7 +14623,7 @@ async fn mesh_periodic_pairs_marks_accepted_certificate_stale_after_scene_edit()
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 45}
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -14676,7 +14676,7 @@ async fn mesh_periodic_pairs_marks_matching_topology_artifact_stale_after_scene_
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 45}
-        }));
+        }).into());
     }
     let mesh_dir = artifact_dir.join("mesh");
     fs::create_dir_all(&mesh_dir).expect("mesh artifact dir should be created");
@@ -14763,7 +14763,7 @@ async fn mesh_periodic_pairs_rejects_artifact_with_mismatched_marker_certificate
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 45}
-        }));
+        }).into());
     }
     let mesh_dir = artifact_dir.join("mesh");
     fs::create_dir_all(&mesh_dir).expect("mesh artifact dir should be created");
@@ -14920,7 +14920,7 @@ async fn mesh_periodic_pairs_rejects_artifact_from_stale_scene_revision() {
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 45}
-        }));
+        }).into());
     }
     let mesh_dir = artifact_dir.join("mesh");
     fs::create_dir_all(&mesh_dir).expect("mesh artifact dir should be created");
@@ -15708,7 +15708,7 @@ async fn mesh_shared_domain_manifest_returns_tree_metadata() {
                     "realization_revision": 3
                 }
             }
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -15925,7 +15925,7 @@ async fn mesh_region_quality_returns_scoped_size_and_quality_distributions() {
                 "element_count": 1,
                 "metrics": ["sicn", "gamma", "volume"]
             }
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -16796,7 +16796,7 @@ async fn mesh_shared_domain_manifest_reports_clean_scene_provenance_without_buil
         snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_revision = 96;
         snapshot.scene_document = Some(scene);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -16828,7 +16828,7 @@ async fn mesh_shared_domain_manifest_keeps_provenance_unknown_for_dirty_scene_wi
         snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_revision = 97;
         snapshot.scene_document = Some(scene);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -16860,7 +16860,7 @@ async fn mesh_build_resources_report_clean_scene_provenance_without_build_summar
         snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_build_revision = 99;
         snapshot.scene_document = Some(scene);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -16935,7 +16935,7 @@ async fn mesh_shared_domain_manifest_etag_changes_when_provenance_is_recovered()
         snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_revision = 41;
         snapshot.scene_document = Some(dirty_scene);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
     }
     let app = build_v2_router().with_state(state.clone());
 

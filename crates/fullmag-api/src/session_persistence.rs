@@ -57,7 +57,7 @@ struct PersistedCurrentLiveSnapshot {
     runtime_status: RuntimeStatusView,
     capabilities: Option<fullmag_runner::BackendCapabilities>,
     metadata: Option<crate::shared_json::SharedJson>,
-    mesh_workspace: Option<serde_json::Value>,
+    mesh_workspace: Option<crate::shared_json::SharedJson>,
     stage_execution: Option<crate::types::StageExecutionState>,
     scene_document: Option<fullmag_authoring::SceneDocument>,
     scalar_rows: Vec<crate::types::ScalarRow>,
