@@ -55,25 +55,40 @@ Accepted Study execution has a different ownership hierarchy. **Base:**
 `fullmag.accepted_project_output.v1`, using create-new
 (`crates/fullmag-api/src/accepted_project_storage.rs:225-240`).
 
-**v1:** retain those attempt leaves and their descriptors. The accepted
-run owner reserves one separate canonical store at
-`<output_dir>/<run_id>/output.zarr`. A run-scoped writer receives sequential
-stage samples from successful worker attempts; step workers must not create
-one canonical store per stage or write concurrently to the shared store.
-Keep its working store in owned private staging until authorized successful
-publication. An attempt's `run.json` remains outside `output.zarr`; it must
-not overwrite or be overwritten by canonical `output.zarr/run.json`.
-Existing descriptor consumers keep their old path/schema. Add the canonical
-store path to run-level artifact discovery; do not repurpose that descriptor.
-Integration must provide the run-scoped lease/aggregation before enabling
-accepted v1 output. Record a separate `canonical_store_path` in execution
-provenance; do not change the meaning of `resolved_output_storage.output_dir`
-for existing accepted consumers. This is a future integration obligation,
-not evidence that the base already consolidates multi-step outputs.
+**v1 (user decision 2026-10-24, implemented in
+`crates/fullmag-runner/src/script_store.rs`):** an accepted run writes one
+mumax3-like store, `script.py -> <output_dir>/script.zarr`, like
+`script.mx3 -> script.zarr`. The name is the script stem
+(`output_storage_source_stem`), else the problem name. Without an explicit
+`output_dir` the store goes beside the script. `AcceptedProjectStorage::prepare`
+reserves the store for the run (`ScriptStore::acquire`); every later step of the
+same run reopens it. Each step still stages its data in private scratch; on
+success `finish` appends the step's output-store arrays (`m/`, `table/`, ...)
+to the run store under a store lock, removes the staged copies, and publishes
+the step descriptors (`run.json` of schema `fullmag.accepted_project_output.v1`,
+`solver/m_final.json`, `fullmag-run.json`) to the hidden attempt leaf
+`script.zarr/.fullmag/<step_id>-attempt-<epoch>/`. Legacy `stages/` and
+`continuous/` groups are not copied into the run store.
 
-Retain OutputStorage's `timestamp`/`error` collision policy, ownership,
-path validation, private temporary directory, and cleanup rules. Never
-replace existing user data or reuse another run's root. Permission or
+Time follows mumax3: relaxation keeps the store time (`relax()` restores t);
+time evolution advances it by the step's final stage-local time. Frame `step`
+lists are global accepted steps across steps. The root `.zattrs` equals
+`run.json` and carries the mesh keys, `engine`, `start_time`, `end_time`,
+`completion`, `steps`, `total_time`, and a `fullmag` block with schema
+`fullmag.script_store.v1`, `run_id`, provenance, and one entry per step.
+`table.txt` mirrors the table in mumax3 text form and `log.txt` lists the
+steps. A failed or cancelled step records its status and keeps committed data.
+HDF5 accepted output keeps the per-step leaf
+`<output_dir>/<run_id>/<step_id>-attempt-<epoch>`.
+
+Collision policy applies to the run store: `error` stops when another run owns
+it, `timestamp` picks `script-<UTC time>.zarr`, and `overwrite` (mumax3 `-f`)
+replaces it only when it is an inactive fullmag script store; foreign data is
+never removed.
+
+Retain OutputStorage's collision policy, ownership, path validation,
+private temporary directory, and cleanup rules. Never replace user data
+that is not an inactive fullmag result, and never reuse another run's root. Permission or
 format failure stops preflight; no alternate writable directory or format
 is chosen silently. HDF5 remains a separate writer contract.
 

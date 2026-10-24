@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use fullmag_application::TaskClaim;
 use fullmag_ir::{OutputStorageIR, ProblemIR};
 use fullmag_runner::project_storage::ProjectStorageLease;
+use fullmag_runner::script_store::{ScriptStore, StepRecord};
 use fullmag_session::SessionStore;
 use fullmag_workspace_inspect::manifest::{
     collect_outputs, write_run_manifest, RunManifest, RunSource,
@@ -19,6 +20,17 @@ pub(crate) struct AcceptedProjectStorage {
     finalized: bool,
     manifest: RunManifest,
     outcome: Option<(&'static str, Option<String>)>,
+    /// The run's `<script>.zarr` and this step's identity in it.
+    script: Option<(ScriptStore, StepRecord)>,
+}
+
+/// Where an accepted run writes: the output directory, the script store name,
+/// and the collision policy of that store.
+struct StoreTarget {
+    settings: OutputStorageIR,
+    source_dir: PathBuf,
+    base: PathBuf,
+    stem: String,
 }
 
 /// `fullmag-run.json` of an accepted project run, as known when its results
@@ -62,7 +74,7 @@ impl AcceptedProjectStorage {
         problem: &ProblemIR,
         store: &SessionStore,
         step_id: &str,
-    ) -> Result<Option<(OutputStorageIR, PathBuf, PathBuf)>> {
+    ) -> Result<Option<StoreTarget>> {
         let Some(value) = problem.problem_meta.runtime_metadata.get("output_storage") else {
             // Legacy accepted runs keep their original artifact contract. New
             // UI/Python projects carry an explicit canonical storage policy.
@@ -87,31 +99,55 @@ impl AcceptedProjectStorage {
             bail!("accepted stage format conflicts with project output_storage; no solver was launched");
         }
         fullmag_session::repository_path::validate_store_id(step_id)?;
-        let source_dir = problem
+        let script_dir = problem
             .problem_meta
             .runtime_metadata
             .get("output_storage_source_dir")
             .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| store.root().to_path_buf());
+            .map(PathBuf::from);
+        let source_dir = script_dir.clone().unwrap_or_else(|| store.root().to_path_buf());
+        // script.py -> script.zarr, as mumax3 writes script.mx3 -> script.zarr.
+        let stem = problem
+            .problem_meta
+            .runtime_metadata
+            .get("output_storage_source_stem")
+            .and_then(serde_json::Value::as_str)
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or(problem.problem_meta.name.as_str())
+            .to_string();
+        fullmag_runner::script_store::validate_store_stem(&stem).map_err(anyhow::Error::msg)?;
         let requested_base = settings
             .output_dir
             .as_ref()
             .map(PathBuf::from)
+            .or(script_dir)
             .unwrap_or_else(|| store.root().join("project-results"));
         let base = if requested_base.is_absolute() {
             requested_base
         } else {
             source_dir.join(requested_base)
         };
-        let (base, temp_parent) = fullmag_runner::project_storage::preflight_project_storage(
-            &settings,
-            &base,
+        // A Zarr run owns <base>/<stem>.zarr only, so scratch may sit beside it in <base>.
+        let zarr = settings.data_format == fullmag_ir::OutputDataFormatIR::Zarr;
+        let checked = if zarr { base.join(format!("{stem}.zarr")) } else { base };
+        let mut checked_settings = settings.clone();
+        checked_settings.output_dir = Some(checked.to_string_lossy().into_owned());
+        let (checked, temp_parent) = fullmag_runner::project_storage::preflight_project_storage(
+            &checked_settings,
+            &checked,
             &source_dir,
         )
         .map_err(anyhow::Error::msg)?;
+        let base = if zarr {
+            checked
+                .parent()
+                .context("script store has no parent directory")?
+                .to_path_buf()
+        } else {
+            checked
+        };
         settings.temp_dir = Some(temp_parent.to_string_lossy().into_owned());
-        Ok(Some((settings, source_dir, base)))
+        Ok(Some(StoreTarget { settings, source_dir, base, stem }))
     }
 
     /// Validate paths/capabilities before reserving the durable worker attempt.
@@ -121,10 +157,96 @@ impl AcceptedProjectStorage {
         claim: &TaskClaim,
         step_id: &str,
     ) -> Result<()> {
-        let Some((mut settings, source_dir, base)) = Self::configuration(problem, store, step_id)?
-        else {
+        let Some(target) = Self::configuration(problem, store, step_id)? else {
             return Ok(());
         };
+        if target.settings.data_format != fullmag_ir::OutputDataFormatIR::Zarr {
+            return Self::preflight_leaf(target, claim, step_id);
+        }
+        let script = target.base.join(format!("{}.zarr", target.stem));
+        if target.settings.existing_output == fullmag_ir::ExistingOutputIR::Error
+            && script.exists()
+            && ScriptStore::owner_of(&script).map_err(anyhow::Error::msg)?.as_deref()
+                != Some(claim.run_id.as_str())
+        {
+            bail!(
+                "accepted project result location already exists: {}",
+                script.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare(
+        problem: &ProblemIR,
+        store: &SessionStore,
+        claim: &TaskClaim,
+        step_id: &str,
+        manifest: RunManifest,
+    ) -> Result<Option<Self>> {
+        let Some(target) = Self::configuration(problem, store, step_id)? else {
+            return Ok(None);
+        };
+        if target.settings.data_format != fullmag_ir::OutputDataFormatIR::Zarr {
+            return Self::prepare_leaf(target, claim, step_id, manifest).map(Some);
+        }
+        let StoreTarget { mut settings, source_dir, base, stem } = target;
+        // All steps of one run append to one <script>.zarr; this step's attempt
+        // descriptors go to its hidden .fullmag/ directory.
+        let script = ScriptStore::acquire(
+            &base,
+            &stem,
+            claim.run_id.as_str(),
+            settings.existing_output,
+            &fullmag_workspace::now_rfc3339(),
+        )
+        .map_err(anyhow::Error::msg)
+        .context("reserve the run's script store")?;
+        script.mark_running().map_err(anyhow::Error::msg)?;
+        let leaf = script.internal_dir().join(format!(
+            "{step_id}-attempt-{}",
+            claim.ownership_epoch.value()
+        ));
+        settings.output_dir = Some(leaf.to_string_lossy().into_owned());
+        settings.existing_output = fullmag_ir::ExistingOutputIR::Timestamp;
+        let run_id = format!(
+            "{}-{}",
+            claim.run_id.as_str(),
+            claim.ownership_epoch.value()
+        );
+        let lease = ProjectStorageLease::prepare(&settings, &leaf, &source_dir, &run_id)
+            .map_err(anyhow::Error::msg)
+            .context("reserve accepted project output and scratch")?;
+        let data_root = lease.resolved().temp_dir.join("data");
+        fs::create_dir(&data_root).context("create owned staging directory for numerical data")?;
+        let kind = serde_json::to_value(&problem.study)
+            .ok()
+            .and_then(|study| study.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let record = StepRecord {
+            step_id: step_id.to_string(),
+            advances_time: kind == "time_evolution",
+            kind,
+            end_time_s: 0.0,
+            steps: 0,
+            provenance: None,
+            finished_at: String::new(),
+        };
+        let mut storage = Self {
+            lease,
+            data_root,
+            finalized: false,
+            manifest,
+            outcome: None,
+            script: Some((script, record)),
+        };
+        storage.write_manifest();
+        Ok(Some(storage))
+    }
+
+    /// HDF5 keeps one published leaf per step: `<output_dir>/<run_id>/<step_id>-attempt-<epoch>`.
+    fn preflight_leaf(target: StoreTarget, claim: &TaskClaim, step_id: &str) -> Result<()> {
+        let StoreTarget { mut settings, source_dir, base, .. } = target;
         let leaf = base.join(claim.run_id.as_str()).join(format!(
             "{step_id}-attempt-{}",
             claim.ownership_epoch.value()
@@ -141,19 +263,13 @@ impl AcceptedProjectStorage {
         Ok(())
     }
 
-    pub(crate) fn prepare(
-        problem: &ProblemIR,
-        store: &SessionStore,
+    fn prepare_leaf(
+        target: StoreTarget,
         claim: &TaskClaim,
         step_id: &str,
         manifest: RunManifest,
-    ) -> Result<Option<Self>> {
-        let Some((mut settings, source_dir, base)) = Self::configuration(problem, store, step_id)?
-        else {
-            return Ok(None);
-        };
-        // Each accepted run/step owns a new leaf. Reconciliation remains based
-        // on the private attempt receipt, never on these user-facing copies.
+    ) -> Result<Self> {
+        let StoreTarget { mut settings, source_dir, base, .. } = target;
         fullmag_runner::project_storage::initialize_result_container(&base, settings.data_format)
             .map_err(anyhow::Error::msg)?;
         let run_root = base.join(claim.run_id.as_str());
@@ -177,15 +293,16 @@ impl AcceptedProjectStorage {
             .context("reserve accepted project output and scratch")?;
         let data_root = lease.resolved().temp_dir.join("data");
         fs::create_dir(&data_root).context("create owned staging directory for numerical data")?;
-        let mut storage = Self {
+        let storage = Self {
             lease,
             data_root,
             finalized: false,
             manifest,
             outcome: None,
+            script: None,
         };
         storage.write_manifest();
-        Ok(Some(storage))
+        Ok(storage)
     }
 
     /// Record how the run ended when it is not plain success or failure.
@@ -252,6 +369,13 @@ impl AcceptedProjectStorage {
                     )
                     .map_err(anyhow::Error::msg)?;
                 }
+                if let Some((script, record)) = &self.script {
+                    let provenance = serde_json::json!({
+                        "requested": self.manifest.requested,
+                        "resolved": self.manifest.resolved,
+                    });
+                    merge_step_data(script, record, &self.data_root, attempt_dir, provenance)?;
+                }
                 self.lease
                     .publish_directory(&self.data_root)
                     .map_err(anyhow::Error::msg)
@@ -271,10 +395,55 @@ impl AcceptedProjectStorage {
             (None, Ok(())) if success => ("completed", None),
             (None, Ok(())) => ("failed", None),
         };
+        if status != "completed" {
+            if let Some((script, record)) = &self.script {
+                if let Err(record_error) = script.record_failure(
+                    &record.step_id,
+                    status,
+                    error.as_deref(),
+                    &fullmag_workspace::now_rfc3339(),
+                ) {
+                    tracing::warn!("could not record the step outcome in the script store: {record_error}");
+                }
+            }
+        }
         self.write_final_manifest(status, error);
         finished?;
         publication.context("publish accepted project numerical data")
     }
+}
+
+/// Append a successful step's staged arrays to the run's `<script>.zarr`. The
+/// staged `*.zarr` directories are removed afterwards, so the hidden attempt
+/// leaf keeps descriptors only and never a second copy of the data.
+fn merge_step_data(
+    script: &ScriptStore,
+    record: &StepRecord,
+    data_root: &Path,
+    attempt_dir: &Path,
+    provenance: serde_json::Value,
+) -> Result<()> {
+    let mut record = record.clone();
+    let final_state = attempt_dir.join("solver").join("m_final.json");
+    if final_state.is_file() {
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(&final_state)?)
+            .context("read the step's final state for the script store")?;
+        record.end_time_s = state.get("time").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        record.steps = state.get("step").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    }
+    record.provenance = Some(provenance);
+    record.finished_at = fullmag_workspace::now_rfc3339();
+    script
+        .merge_step(data_root, &record)
+        .map_err(anyhow::Error::msg)
+        .context("append the step outputs to the script store")?;
+    for entry in fs::read_dir(data_root)? {
+        let path = entry?.path();
+        if path.is_dir() && path.extension().is_some_and(|ext| ext == "zarr") {
+            fs::remove_dir_all(&path)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -360,6 +529,7 @@ mod tests {
             finalized: false,
             manifest: manifest(),
             outcome: None,
+            script: None,
         };
         storage.write_manifest();
         (storage, leaf)

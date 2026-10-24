@@ -162,6 +162,7 @@ mod physics_graph_execution;
 mod preview;
 pub mod quantities;
 pub mod project_storage;
+pub mod script_store;
 mod solvers;
 pub use observation::{
     accepted_state_digests, observation_provider_policy, AcceptedPrimaryCarrier,

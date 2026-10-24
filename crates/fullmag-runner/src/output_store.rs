@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const SCHEMA: &str = "fullmag.output_store.v1";
-const TABLE_CHUNK_ROWS: usize = 1024;
+pub(crate) const TABLE_CHUNK_ROWS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FdmGrid {
@@ -242,7 +242,7 @@ fn interleaved_bytes(
     bytes
 }
 
-fn zarray(shape: &[usize], chunks: &[usize], dtype: &str) -> Value {
+pub(crate) fn zarray(shape: &[usize], chunks: &[usize], dtype: &str) -> Value {
     json!({
         "zarr_format": 2,
         "shape": shape,
@@ -256,7 +256,7 @@ fn zarray(shape: &[usize], chunks: &[usize], dtype: &str) -> Value {
     })
 }
 
-fn unit(quantity: &str) -> &'static str {
+pub(crate) fn unit(quantity: &str) -> &'static str {
     match quantity {
         "t" | "time" => "s",
         _ if quantity.starts_with("H_") => "A/m",
