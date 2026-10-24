@@ -285,3 +285,41 @@ próbę, lecz walidator mounta odrzucił alias Docker Desktop WSL. To błąd
 porównania ścieżek w harnessie; lokalny alias i katalog źródeł mają ten sam
 device/inode. Wynik tej próby pozostaje nieznany i zasoby zachowane do
 jawnej reconciliacji; nie jest zaliczonym odbiorem WebGL.
+
+
+## Druga rotacja fresh-state: zachowanie dowodu archiwizacji
+
+Walidator aliasu WSL otrzymał kontrolę device/inode z zamkniętą postacią
+aliasu i fail-closed przy braku lokalnego potwierdzenia. 24 interpretowane
+regresje QA PASS. Zachowana próba przeglądarki
+`2073860b21e54601a0d1018fd2b19940` została jawnie zreconciliowana:
+failed-confirmed, exit1, output_lost=true, lease_released=true. Nie jest
+dowodem WebGL.
+
+Zastąpienie odrzuconej sesji odmówione przed mutacją: live_retirement_busy.
+stop-unadmitted początkowo odrzucił zmieniony hash pliku fixture.
+Przywrócono dokładne bajty commita df64e11 wyłącznie dla dowodu wejść
+odrzuconej sesji; stop `52291a1d438c4e4990cba66a39c18e8a` potwierdził
+brak przyjętych runów/rezerwacji i graceful drain. Następnie odtworzono
+poprawioną fixture z HEAD; nie ponawiano starej aktywacji.
+
+Recreate `a896dc51e36e4a9d8842b013a809c4d7` i start
+`8d52e69c27a245e19388fca9591c223f` PASS; config
+`6ddcf68e9c5ef0acc09736b95999dcdbc8f16bdbe24e34f0d909fc29d314f577`.
+Nowa aktywacja została odmówiona jeszcze przed operacją/admission:
+rotacja group-ledger-generation.json przesłoniła dowód wcześniejszej,
+kompletnej archiwizacji `04af5e9fd7e842d0acaf293b12e1a46c`. Stare abort
+i terminalne receipty pozostały nienaruszone. Wymagana jest trwałość
+przypięcia dowodu archiwizacji przy kolejnych rotacjach, bez luzowania
+zakazu replay i bez nadpisywania starego runu/ledgera.
+
+
+Poprawka trwałości: 8/8 nowych regresji interpretowanych PASS, 9/9
+istniejących runtime-state PASS. Kontrola odczytowa rzeczywistych danych:
+bieżący wskaźnik false, dokładny stary archive attempt true.
+Pin pod lease verification `1c6a12eeffa54fbdb5c8f6e7d1db3b33`: PASS.
+Stary abort i bieżący group-ledger-generation.json byte-identical;
+old_request_replayed=false. Receipt: verification/attempts/
+1c6a12eeffa54fbdb5c8f6e7d1db3b33/archive-anchor-proof.json.
+Automatyczny pin przed przyszłą rotacją sprawdzony regresją, bez kolejnej
+zbędnej rzeczywistej rotacji. Nie zmieniano progu świeżości próbek ani lease.

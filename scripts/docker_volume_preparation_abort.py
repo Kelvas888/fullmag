@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import time
+from collections.abc import Mapping
 from pathlib import Path
 import os
 import tarfile
@@ -533,55 +534,141 @@ def require_fresh_archive(control, args, previous, document, *, recreate_service
     return record
 
 
-def has_fresh_archive(control, record):
-    """Authenticate the existing archive/Compose terminal, never just its age."""
+def _fresh_archive_generation(control, archive_attempt=None):
+    """Read the current generation or reconstruct one from one exact archive."""
     from docker_volume_stop_diagnostic import ATTEMPT_RE
-    anchor = control.read("preparation-abort/archives/" + record["activation_attempt"] + ".json", optional=True)
-    if anchor is not None:
-        if (anchor.get("schema") != "fullmag.docker-preparation-abort-archive.v1"
-            or anchor.get("abort_sha256") != hashlib.sha256(canonical(record)).hexdigest()):
-            _fail("Preparation abort archive anchor differs")
-        generation = anchor.get("group_ledger_generation")
-    else:
-        generation = control.read("group-ledger-generation.json", optional=True)
-    if generation is None:
+
+    if archive_attempt is None:
+        return control.read("group-ledger-generation.json", optional=True)
+    if not isinstance(archive_attempt, str) or ATTEMPT_RE.fullmatch(archive_attempt) is None:
+        _fail("Explicit fresh archive attempt must be an exact 32-hex identity")
+
+    path = "recreate-services/attempts/" + archive_attempt
+    archive_path = path + "/runtime-control-archive-terminal.json"
+    archive = control.read(archive_path, optional=True)
+    recreation = control.read(path + "/terminal.json", optional=True)
+    if not isinstance(archive, Mapping) or not isinstance(recreation, Mapping):
+        _fail("Explicit fresh archive attempt has no immutable completed records")
+    return {
+        "schema": "fullmag.docker-group-ledger-generation.v1",
+        "compose_project": archive.get("compose_project"),
+        "generation": archive_attempt,
+        "archive_terminal_path": archive_path,
+        "archive_terminal_sha256": hashlib.sha256(canonical(archive)).hexdigest(),
+        "preserved_volume": archive.get("preserved_group_ledger_volume"),
+    }
+
+
+def _fresh_archive_matches_abort(control, record, generation):
+    from docker_volume_stop_diagnostic import ATTEMPT_RE
+
+    if not isinstance(record, Mapping) or not isinstance(generation, Mapping):
+        return False
+    activation_attempt = record.get("activation_attempt")
+    if not isinstance(activation_attempt, str) or ATTEMPT_RE.fullmatch(activation_attempt) is None:
         return False
     token = generation.get("generation")
     if not isinstance(token, str) or ATTEMPT_RE.fullmatch(token) is None:
-        _fail("Fresh archive generation identity is invalid")
+        return False
     path = "recreate-services/attempts/" + token
-    if generation.get("archive_terminal_path") != path + "/runtime-control-archive-terminal.json":
-        _fail("Fresh archive path differs")
-    archive = control.read(generation["archive_terminal_path"])
-    recreation = control.read(path + "/terminal.json")
-    if (generation.get("schema") != "fullmag.docker-group-ledger-generation.v1"
+    archive_path = path + "/runtime-control-archive-terminal.json"
+    if generation.get("archive_terminal_path") != archive_path:
+        return False
+    archive = control.read(archive_path, optional=True)
+    recreation = control.read(path + "/terminal.json", optional=True)
+    if not isinstance(archive, Mapping) or not isinstance(recreation, Mapping):
+        return False
+    removed = archive.get("removed_containers")
+    recreation_inputs = recreation.get("inputs")
+    if not isinstance(removed, Mapping) or not isinstance(recreation_inputs, Mapping):
+        return False
+    recreation_namespace = recreation.get("control_namespace")
+    namespace_matches = (
+        recreation_namespace == control.namespace
+        if control.namespace
+        else recreation_namespace in (None, "")
+    )
+    if (
+        generation.get("schema") != "fullmag.docker-group-ledger-generation.v1"
+        or generation.get("compose_project") != control.project
+        or generation.get("archive_terminal_sha256")
+            != hashlib.sha256(canonical(archive)).hexdigest()
+        or generation.get("preserved_volume")
+            != archive.get("preserved_group_ledger_volume")
         or archive.get("schema") != "fullmag.docker-fresh-runtime-archive-terminal.v1"
-        or archive.get("state") != "succeeded" or archive.get("operation_attempt") != token
-        or archive.get("compose_project") != control.project or archive.get("control_volume") != control.volume
+        or archive.get("state") != "succeeded"
+        or archive.get("operation_attempt") != token
+        or archive.get("compose_project") != control.project
+        or archive.get("control_volume") != control.volume
         or archive.get("control_namespace") != control.namespace
-        or hashlib.sha256(canonical(archive)).hexdigest() != generation.get("archive_terminal_sha256")
-        or archive.get("removed_containers", {}).get("backend") != record.get("backend_container")
-        or recreation.get("state") != "succeeded" or recreation.get("runtime_control_archive") != archive
-        or recreation.get("inputs", {}).get("attempt") != record.get("development_attempt")
-        or recreation.get("inputs", {}).get("config_sha256") != record.get("config_sha256")):
+        or removed.get("backend") != record.get("backend_container")
+        or recreation.get("schema") != "fullmag.docker-build-operation.v1"
+        or recreation.get("phase") != "recreate-services"
+        or recreation.get("state") != "succeeded"
+        or recreation.get("attempt") != token
+        or recreation.get("compose_project") != control.project
+        or recreation.get("control_volume") != control.volume
+        or not namespace_matches
+        or recreation.get("fresh_state") is not True
+        or recreation.get("runtime_control_archive") != archive
+        or recreation_inputs.get("attempt") != record.get("development_attempt")
+        or recreation_inputs.get("config_sha256") != record.get("config_sha256")
+    ):
         return False
     return True
 
 
-def pin_completed_fresh_archive(control):
+def has_fresh_archive(control, record, *, archive_attempt=None):
+    """Authenticate the existing archive/Compose terminal, never just its age."""
+    from docker_volume_stop_diagnostic import ATTEMPT_RE
+    if not isinstance(record, Mapping):
+        return False
+    activation_attempt = record.get("activation_attempt")
+    if not isinstance(activation_attempt, str) or ATTEMPT_RE.fullmatch(activation_attempt) is None:
+        return False
+    anchor = control.read("preparation-abort/archives/" + activation_attempt + ".json", optional=True)
+    if anchor is not None:
+        if (anchor.get("schema") != "fullmag.docker-preparation-abort-archive.v1"
+            or anchor.get("abort_sha256") != hashlib.sha256(canonical(record)).hexdigest()):
+            _fail("Preparation abort archive anchor differs")
+        if archive_attempt is not None:
+            anchored_generation = anchor.get("group_ledger_generation")
+            if (not isinstance(anchored_generation, Mapping)
+                or anchored_generation.get("generation") != archive_attempt):
+                _fail("Preparation abort is anchored to another fresh archive attempt")
+        generation = anchor.get("group_ledger_generation")
+    else:
+        generation = _fresh_archive_generation(control, archive_attempt)
+    if generation is None:
+        return False
+    return _fresh_archive_matches_abort(control, record, generation)
+
+
+def pin_completed_fresh_archive(control, *, archive_attempt=None):
     """Keep a proven archive admissible when a later DEV generation rotates."""
     from docker_volume_unclaimed_cancellation import _publish_immutable
     record = control.read(RECORD, optional=True)
     if record is None:
+        if archive_attempt is not None:
+            _fail("Explicit fresh archive pin has no preparation abort record")
         return
-    path = "preparation-abort/archives/" + record["activation_attempt"] + ".json"
+    if not isinstance(record, Mapping):
+        _fail("Preparation abort current pointer is malformed")
+    from docker_volume_stop_diagnostic import ATTEMPT_RE
+    activation_attempt = record.get("activation_attempt")
+    if not isinstance(activation_attempt, str) or ATTEMPT_RE.fullmatch(activation_attempt) is None:
+        _fail("Preparation abort activation identity is invalid")
+    path = "preparation-abort/archives/" + activation_attempt + ".json"
     if control.read(path, optional=True) is not None:
-        if not has_fresh_archive(control, record):
+        if not has_fresh_archive(control, record, archive_attempt=archive_attempt):
             _fail("Existing preparation archive anchor is no longer valid")
         return
-    if not has_fresh_archive(control, record):
+    if not has_fresh_archive(control, record, archive_attempt=archive_attempt):
         _fail("Preparation abort has no completed fresh archive to pin")
-    anchor = {"schema": "fullmag.docker-preparation-abort-archive.v1",
+    generation = _fresh_archive_generation(control, archive_attempt)
+    anchor = {
+        "schema": "fullmag.docker-preparation-abort-archive.v1",
         "abort_sha256": hashlib.sha256(canonical(record)).hexdigest(),
-        "group_ledger_generation": control.read("group-ledger-generation.json")}
+        "group_ledger_generation": generation,
+    }
     _publish_immutable(control, path, canonical(anchor) + b"\n")
