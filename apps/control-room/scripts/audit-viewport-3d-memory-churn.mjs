@@ -1549,6 +1549,16 @@ async function installFdmFixtureApi(page, fixture, requests) {
       });
       return;
     }
+    if (path === "/v2/platform/instances") {
+      await fulfillJson(route, {
+        first_port: 3197,
+        instances: [],
+        last_port: 3260,
+        schema_version: "1.0.0",
+        self_api_instance_id: "fixture-instance",
+      });
+      return;
+    }
     if (path === "/v2/platform/health") {
       await fulfillJson(route, {
         active_session: true,

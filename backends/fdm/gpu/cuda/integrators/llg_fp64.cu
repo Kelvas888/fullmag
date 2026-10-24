@@ -617,10 +617,23 @@ void launch_heun_step_fp64(Context &ctx, double dt, fullmag_fdm_step_stats *stat
             ctx, ctx.m, step_start_time + dt,
             ctx.gpu_transport_active_attempt_id, 3)) return;
 
-    if (!fullmag_fdm_should_fill_step_stats_for_step(ctx, ctx.step_count + 1)) {
+    const uint64_t accepted_step = ctx.step_count + 1;
+    const bool fill_control_stats =
+        fullmag_fdm_should_fill_control_stats_for_step(ctx, accepted_step);
+    if (!fullmag_fdm_should_fill_step_stats_for_step(ctx, accepted_step) &&
+        !fill_control_stats) {
         if (!context_complete_gpu_transport_rhs(ctx)) return;
         context_stage_accepted_step(ctx, dt);
         fullmag_fdm_fill_step_stats_metadata(ctx, stats, dt);
+        return;
+    }
+    if (fill_control_stats) {
+        if (!context_complete_gpu_transport_rhs(ctx)) return;
+        context_stage_accepted_step(ctx, dt);
+        if (context_fill_current_stats(ctx, stats)) {
+            stats->dt_seconds = dt;
+            stats->suggested_next_dt = 0.0;
+        }
         return;
     }
 

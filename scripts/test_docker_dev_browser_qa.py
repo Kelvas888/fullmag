@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -892,6 +893,7 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             },
             "HostConfig": {
                 "ReadonlyRootfs": True,
+                "GroupAdd": qa._script_bind_groups(ROOT),
                 "NetworkMode": identity["network_name"],
                 "PortBindings": None,
                 "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=256m"},
@@ -912,6 +914,57 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             ],
         }
         qa._validate_browser_helper(document, FakeControl(), identity, "fullmag-frontend-state", browser_id, 0, ROOT)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            local_alias_root = Path(temporary) / "docker-desktop-bind-mounts"
+            selected_scripts = (ROOT / "apps/control-room/scripts").resolve(strict=True)
+            valid_alias = local_alias_root / "Ubuntu2" / ("a" * 64)
+            valid_alias.parent.mkdir(parents=True)
+            valid_alias.symlink_to(selected_scripts, target_is_directory=True)
+            alias_source = (
+                "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                "Ubuntu2/" + "a" * 64
+            )
+            alias_document = deepcopy(document)
+            alias_document["Mounts"][1]["Source"] = alias_source
+            with patch.object(qa, "LOCAL_WSL_BIND_MOUNT_ROOT", local_alias_root):
+                self.assertTrue(valid_alias.samefile(selected_scripts))
+                qa._validate_browser_helper(
+                    alias_document, FakeControl(), identity,
+                    "fullmag-frontend-state", browser_id, 0, ROOT,
+                )
+
+                different_target = Path(temporary) / "different-selected-source"
+                different_target.mkdir()
+                different_alias = local_alias_root / "Ubuntu2" / ("b" * 64)
+                different_alias.symlink_to(different_target, target_is_directory=True)
+                rejected_sources = [
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                    "Ubuntu2/" + "c" * 64,  # local alias is missing
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                    "Ubuntu2/" + "b" * 64,  # local alias points to another inode
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                    "Ubuntu2/../Ubuntu2/" + "a" * 64,
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+                    "Ubuntu2/" + "a" * 64 + "/extra",
+                    "/run/desktop/mnt/host/windows/docker-desktop-bind-mounts/"
+                    "Ubuntu2/" + "a" * 64,
+                ]
+                for source in rejected_sources:
+                    rejected = deepcopy(document)
+                    rejected["Mounts"][1]["Source"] = source
+                    with self.subTest(source=source), self.assertRaises(
+                        qa.ControlOutcomeUnknown
+                    ):
+                        qa._validate_browser_helper(
+                            rejected, FakeControl(), identity,
+                            "fullmag-frontend-state", browser_id, 0, ROOT,
+                        )
+
+        wrong_group = deepcopy(document)
+        wrong_group["HostConfig"]["GroupAdd"] = ["123456789"]
+        with self.assertRaisesRegex(qa.ControlOutcomeUnknown, "source read group differs"):
+            qa._validate_browser_helper(wrong_group, FakeControl(), identity, "fullmag-frontend-state", browser_id, 0, ROOT)
         wrong_user = deepcopy(document)
         wrong_user["Config"]["User"] = "0:0"
         with self.assertRaises(qa.ControlOutcomeUnknown):
@@ -1189,7 +1242,7 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
                 return SimpleNamespace(returncode=1, stdout=b"", stderr=b"not found")
             raise AssertionError(f"unexpected daemon command: {args!r}")
 
-        def fake_parse(*_args):
+        def fake_parse(*_args, **_kwargs):
             raise qa.BuildControlError("invalid canvas evidence")
 
         with patch.object(qa, "_probe_public_loopback", return_value={"state": "passed"}), \
@@ -1209,6 +1262,10 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
                     "http://127.0.0.1:32871",
                     "http://frontend:8080",
                     180,
+                    canvas_only=False,
+                    expect_live_field=None,
+                    expect_airbox_vectors=False,
+                    expect_ambiguous_compute_fields=False,
                 )
 
         self.assertEqual(operation["receipt"]["helper_container"], "fullmag-control-" + "a" * 32)
@@ -1238,6 +1295,12 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             "probe_url": "http://frontend:8080",
             "playwright_version": "1.62.1",
             "browser_gpu_mode": "swiftshader-webgl-requested",
+            "canvas_only": False,
+            "expect_live_field": None,
+            "expect_airbox_vectors": False,
+            "expect_ambiguous_compute_fields": False,
+            "qa_scope": "full-browser-qa",
+            "skipped_areas": [],
             "home_round_trip": True,
             "session": {
                 "session_id": "session-1",
@@ -1247,12 +1310,43 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             "workspace": {"visible": True, "canvas_dom_stable": True},
             "canvas_before": canvas,
             "canvas_after": deepcopy(canvas),
+            "viewport_dom_observations": {
+                "field_data_proven": False,
+                "note": self.qa.VIEWPORT_DOM_OBSERVATIONS_NOTE,
+                **{
+                    key: {
+                        "dataset": {}, "quantity_labels": [],
+                        "dataset_entry_count": 0, "quantity_label_count": 0,
+                        "dataset_truncated": False, "quantity_labels_truncated": False,
+                    }
+                    for key in ("before_home", "after_home")
+                },
+            },
             "page_errors": 0,
             "console_errors": 0,
             "request_failures": 0,
+            "http_errors": [],
+            "resource_responses": [],
         }
         encoded = lambda value: (json.dumps(value) + "\n").encode("utf-8")
         self.assertEqual(self.qa._parse_result(encoded(payload), payload["public_url"], payload["probe_url"]), payload)
+        for field, bad_value in (
+            ("canvas_only", True),
+            ("qa_scope", "canvas-home-only"),
+            ("skipped_areas", ["viewport-appearance"]),
+            ("expect_live_field", "H_Oersted"),
+            ("expect_airbox_vectors", True),
+            ("expect_ambiguous_compute_fields", True),
+            ("viewport_dom_observations", None),
+            ("http_errors", [{"status": 400}]),
+            ("resource_responses", None),
+            ("canvas_screenshot", {"state": "captured"}),
+        ):
+            with self.subTest(rejected_field=field):
+                invalid = deepcopy(payload)
+                invalid[field] = bad_value
+                with self.assertRaises(self.qa.BuildControlError):
+                    self.qa._parse_result(encoded(invalid), payload["public_url"], payload["probe_url"])
         invalid_buffer = deepcopy(payload)
         invalid_buffer["canvas_after"]["drawing_buffer_width"] = 0
         with self.assertRaises(self.qa.BuildControlError):
@@ -1288,7 +1382,14 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             "canvas_dom_stable",
         ):
             self.assertIn(required, text)
-        self.assertNotIn("screenshot", text.lower())
+        for required in (
+            'page.locator(".fm-viewport-3d canvas").first().screenshot',
+            "maxCanvasScreenshotBytes",
+            'state: "omitted-size-limit", image_proof: false',
+            'state: "omitted-capture-failed", image_proof: false',
+            "canvas_screenshot: await captureCanvasScreenshot(page, after)",
+        ):
+            self.assertIn(required, text)
         self.assertNotIn('http://127.0.0.1:32871', text.split("const publicUrl", 1)[1].split("const probeUrl", 1)[0])
         self.assertNotIn("CONTROL_ROOM_SMOKE_ALLOW_MISSING_SESSION", text)
 

@@ -118,7 +118,8 @@ pub(crate) fn prepare(
     {
         bail!("antenna inspection has no RunSpec parameter or seed binding");
     }
-    let preparation = accepted.read_task_preparation_receipt(store, &step.step_id)?;
+    // Receipts are keyed by the durable task id, not the study step id.
+    let preparation = accepted.read_task_preparation_receipt(store, step.claim.task_id.as_str())?;
     if PreparationBinding::from_receipt(&preparation)? != step.resolved_input.preparation
         || preparation.plan.requested_backend != BackendTarget::Fem
         || preparation.plan.resolved_backend != BackendTarget::Fem

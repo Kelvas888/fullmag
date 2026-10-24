@@ -101,6 +101,7 @@ pub use accepted_materialization::{
     materialize_accepted_observables, AcceptedMagnetizationInput,
     AcceptedMaterializationBatch, AcceptedMaterializationLane,
     AcceptedMaterializationRequest, AcceptedMaterializedField,
+    validate_accepted_state_execution_provenance,
 };
 
 /// Validate which current FDM multilayer execution realization an accepted
@@ -672,7 +673,8 @@ pub use types::{
     AuxiliaryArtifact, CertifiedFemEquilibriumFields, ExecutionProvenance, FdmGpuExecutionReceipt,
     FdmGpuOperatorResidency, FdmGpuPrecisionComponents, FdmGpuPrecisionPolicyReceipt,
     FdmGpuTransferCounts, FemCrossoverDecision, FemEigenRunResult, FemMeshObjectSegment,
-    FemGpuExecutionClass, FemGpuExecutionReceipt, FemMeshPartPayload, FemMeshPayload,
+    FemGpuExecutionClass, FemGpuExecutionReceipt, FemGpuMinimizerExecutionReceipt,
+    FemMeshPartPayload, FemMeshPayload,
     InitialTimestepReason, LegacyDtPolicy,
     LiveFieldMaterializationState, LiveFieldMaterializationStatus, LivePreviewField,
     LiveParallelExecutionTelemetry, LivePreviewRequest, LiveVectorFieldSnapshot,

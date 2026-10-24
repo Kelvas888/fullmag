@@ -47,6 +47,10 @@ class _LoggerStdin:
 class _Logger:
     stdin = _LoggerStdin()
 
+    def poll(self):
+        # The control helper stays alive until the lease is finalized.
+        return None
+
     def wait(self, timeout):
         self.wait_timeout = timeout
         return 0
@@ -149,6 +153,9 @@ assert docker_build_control.mirror_console(b"progress\\n") is False
         control.namespace = ""
         control.namespace_registry = None
         control.namespace_registry_sha256 = None
+        control._active_operation = None
+        # Helper identity pinning inspects Docker; this test covers console loss only.
+        control._pin_operation_helper = lambda _operation: "a" * 64
         control.helper_args = lambda *args, **kwargs: ["fake-control-helper"]
         control.space = lambda: {"available_bytes": 64 * 1024**3}
         control._line = Mock(side_effect=("READY", "LOGGED"))

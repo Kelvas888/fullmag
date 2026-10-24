@@ -47,15 +47,19 @@ fn relaxation_algorithms_available() -> Vec<String> {
     tag = "sessions"
 )]
 pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<LiveStatus>, ApiError> {
-    let request_context = crate::capture_current_live_request_context(&state).await?;
-    let _transition = state.current_live_session_transition.lock().await;
+    let request_context = crate::capture_current_live_read_context(&state).await?;
+    // Native probing may wait on its bounded socket timeout. Do not hold the
+    // session transition while observing the separately owned service.
+    let connectivity = refresh_current_live_connectivity(&state).await;
+    // Read the last committed snapshot during long RunIntent commits too.
+    // Session identity is checked under the snapshot read lock and again
+    // before returning, without waiting behind the mutation transition.
     crate::validate_current_live_request_context(&state, &request_context).await?;
     let display_sel = state.current_display_selection.read().await.clone();
     let display_presentation = state.current_display_presentation.read().await.clone();
     let workspace_selection = state.current_workspace_selection.read().await.clone();
     let workspace_ribbon = state.current_workspace_ribbon.read().await.clone();
     let workspace_layout = state.current_workspace_layout.read().await.clone();
-    let connectivity = refresh_current_live_connectivity(&state).await;
     let (commands_revision, command_completion_revision) = {
         let ledger = state.current_command_ledger.lock().await;
         let revisions = command_ledger_revisions(
@@ -73,6 +77,11 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<LiveS
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        snapshot,
+        &request_context,
+        state.current_live_session_epoch.load(Ordering::Acquire),
+    )?;
 
     let response = build_live_status(
         state.current_workspace_root.as_path(),
@@ -87,14 +96,30 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<LiveS
         command_completion_revision,
         connectivity,
     );
+    drop(guard);
     crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(Json(response))
 }
 
-/// Advances backend-owned connectivity from the real runner publication
-/// heartbeat. Only an accepted publication may restore `Connected`; this path
-/// can only preserve or worsen connectivity when the heartbeat becomes stale.
+/// Native accepted-run execution uses the verified service, including while
+/// idle before Compute. Legacy runners retain their publication heartbeat.
 pub(crate) async fn refresh_current_live_connectivity(state: &AppState) -> SessionConnectivity {
+    if crate::live_accepted_execution::docker_api_only_runtime() {
+        use crate::schemas::runtime_service::RuntimeServiceStatusState;
+        let observed =
+            crate::router_v2::handlers::platform::runtime_service::observe_runtime_service(state)
+                .await;
+        return match observed.map(|status| status.state) {
+            Ok(RuntimeServiceStatusState::Ready) => SessionConnectivity::Connected,
+            Ok(
+                RuntimeServiceStatusState::Starting
+                | RuntimeServiceStatusState::ObservationUnknown
+                | RuntimeServiceStatusState::Unknown,
+            )
+            | Err(_) => SessionConnectivity::Degraded,
+            Ok(_) => SessionConnectivity::Disconnected,
+        };
+    }
     refresh_current_live_connectivity_at(state, current_unix_ms()).await
 }
 
@@ -199,7 +224,7 @@ pub(crate) fn build_live_status(
     command_completion_revision: u64,
     connectivity: SessionConnectivity,
 ) -> LiveStatus {
-    let solver_lifecycle = crate::session::effective_runtime_status_code(snapshot);
+    let solver_lifecycle = session_lifecycle_solver_code(snapshot);
     let lifecycle = lifecycle_contract(
         &solver_lifecycle,
         snapshot.runtime_status.can_accept_commands && !snapshot.runtime_status.is_busy,
@@ -230,7 +255,11 @@ pub(crate) fn build_live_status(
                 .unwrap_or_default(),
             stage_count: stage_exec.map(|se| se.total_stages as u32).unwrap_or(0),
             started_at: snapshot.session.started_at_unix_ms.to_string(),
-            solver_steps: r.total_steps as u64,
+            solver_steps: if crate::live_accepted_execution::docker_api_only_runtime() {
+                accepted_solver_steps(snapshot, &r.run_id)
+            } else {
+                r.total_steps as u64
+            },
             solver_time: r
                 .final_time
                 .or_else(|| snapshot.live_state.as_ref().map(|ls| ls.latest_step.time))
@@ -416,12 +445,60 @@ pub(crate) fn lifecycle_contract(
     }
 }
 
+fn accepted_solver_steps(snapshot: &SessionStateResponse, run_id: &str) -> u64 {
+    let Some(magnetization) = snapshot.latest_fields.get("m") else {
+        return 0;
+    };
+    let Some(accepted_state) = magnetization.get("accepted_state_ref") else {
+        return 0;
+    };
+    let Some(accepted_id) = accepted_state.get("id") else {
+        return 0;
+    };
+    if accepted_id.get("run_id").and_then(Value::as_str) != Some(run_id) {
+        return 0;
+    }
+
+    let Some(source_step) = magnetization.get("source_step").and_then(Value::as_u64) else {
+        return 0;
+    };
+    let Some(accepted_step) = accepted_id.get("accepted_step").and_then(Value::as_u64) else {
+        return 0;
+    };
+    let Some(observation_frame) = magnetization.get("observation_frame").and_then(|value| {
+        serde_json::from_value::<crate::schemas::common::AcceptedObservationFrameRef>(value.clone())
+            .ok()
+    }) else {
+        return 0;
+    };
+    let expected_session_epoch = format!(
+        "{}@{}",
+        snapshot.session.session_id, snapshot.session.started_at_unix_ms
+    );
+    if source_step != accepted_step
+        || observation_frame.source_step != source_step
+        || observation_frame.session_epoch != expected_session_epoch
+    {
+        return 0;
+    }
+
+    source_step
+}
+
 fn terminal_solver_lifecycle(solver: &str) -> bool {
-    matches!(solver, "completed" | "failed" | "cancelled" | "closed")
+    solver == "closed"
+}
+
+fn session_lifecycle_solver_code(snapshot: &SessionStateResponse) -> String {
+    if snapshot.session.status == "closed" {
+        "closed".to_string()
+    } else {
+        crate::session::effective_runtime_status_code(snapshot)
+    }
 }
 
 pub(crate) fn snapshot_session_epoch(snapshot: &SessionStateResponse) -> String {
-    let solver = crate::session::effective_runtime_status_code(snapshot);
+    let solver = session_lifecycle_solver_code(snapshot);
     session_epoch(
         &snapshot.session.session_id,
         snapshot.session.started_at_unix_ms,
@@ -450,7 +527,7 @@ pub(crate) fn session_epoch(
 /// receives this value in `LiveStatus.session.session_epoch` and echoes it in
 /// `x-fullmag-session-scope`.
 pub(crate) fn current_live_session_epoch(snapshot: &SessionStateResponse) -> String {
-    let solver_lifecycle = crate::session::effective_runtime_status_code(snapshot);
+    let solver_lifecycle = session_lifecycle_solver_code(snapshot);
     let lifecycle = lifecycle_contract(
         &solver_lifecycle,
         snapshot.runtime_status.can_accept_commands && !snapshot.runtime_status.is_busy,
@@ -1566,13 +1643,20 @@ mod tests {
     }
 
     #[test]
-    fn completed_session_is_a_read_only_tombstone_with_a_new_epoch() {
-        let lifecycle = lifecycle_contract("completed", false, SessionConnectivity::Connected);
+    fn solver_terminal_outcomes_keep_the_session_until_explicit_close() {
+        for solver in ["completed", "failed", "cancelled"] {
+            let lifecycle = lifecycle_contract(solver, false, SessionConnectivity::Connected);
+            assert_eq!(lifecycle.solver, solver);
+            assert_eq!(lifecycle.session_resource, SessionResourceLifecycle::Active);
+            assert_eq!(lifecycle.commandability, SessionCommandability::Forbidden);
+        }
+
+        let closed = lifecycle_contract("closed", true, SessionConnectivity::Connected);
         assert_eq!(
-            lifecycle.session_resource,
+            closed.session_resource,
             SessionResourceLifecycle::Tombstoned
         );
-        assert_eq!(lifecycle.commandability, SessionCommandability::ReadOnly);
+        assert_eq!(closed.commandability, SessionCommandability::ReadOnly);
         assert_eq!(session_epoch("session-1", 1000, 0, false), "session-1@1000");
         assert_eq!(
             session_epoch("session-1", 1000, 2000, true),

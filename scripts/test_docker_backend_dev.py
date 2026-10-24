@@ -17,6 +17,20 @@ import backend_dev as backend
 
 @unittest.skipIf(os.name == "nt", "Linux container symlink contract")
 class BackendPackageTests(unittest.TestCase):
+    def setUp(self):
+        control = tempfile.TemporaryDirectory()
+        self.addCleanup(control.cleanup)
+        root = Path(control.name)
+        for name, path in {
+            "CONTROL_ROOT": root,
+            "BACKEND_CONTROL_ROOT": root / "backend",
+            "PROVENANCE_PATH": root / "backend" / "runtime-provenance.json",
+            "CACHE_RECEIPT_PATH": root / "backend" / backend.PACKAGE_CACHE_RECEIPT_NAME,
+        }.items():
+            patcher = patch.object(backend, name, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @staticmethod
     def _capsule(source_digest, files):
         entries = []

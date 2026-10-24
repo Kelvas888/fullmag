@@ -118,6 +118,93 @@ impl AirboxObservationTarget {
             source_spacing_m: [0.0; 3],
         })
     }
+
+    fn from_study_universe(value: &Value, plan: &FdmMultilayerPlanIR) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "runtime_metadata.study_universe must be an object".to_string())?;
+        let mode = match object.get("mode") {
+            None | Some(Value::Null) => "auto",
+            Some(Value::String(mode)) => mode.as_str(),
+            Some(_) => return Err("Airbox target study universe mode must be a string".into()),
+        };
+        let mode = if mode == "box" { "manual" } else { mode };
+        if !matches!(mode, "manual" | "auto") {
+            return Err(format!(
+                "Airbox target cannot use unsupported study universe mode '{mode}'"
+            ));
+        }
+        let size = parse_finite3(object.get("size"), "study_universe.size", true)?;
+        let center = match object.get("center") {
+            None | Some(Value::Null) => [0.0; 3],
+            Some(value) => parse_finite3(Some(value), "study_universe.center", false)?,
+        };
+
+        let first_layer = plan
+            .layers
+            .first()
+            .ok_or_else(|| "Airbox observation requires at least one source layer".to_string())?;
+        let spacing_m = first_layer.convolution_cell_size;
+        if plan
+            .layers
+            .iter()
+            .any(|layer| layer.convolution_cell_size != spacing_m)
+        {
+            return Err(
+                "Airbox target requires one immutable common convolution cell size".to_string(),
+            );
+        }
+        validate_grid("planned common convolution", [1; 3], spacing_m, [0.0; 3])?;
+
+        let mut shape = [0usize; 3];
+        let mut grid = [0u32; 3];
+        for axis in 0..3 {
+            let cells = size[axis] / spacing_m[axis];
+            if !cells.is_finite() || cells < 1.0 || cells > f64::from(u32::MAX) {
+                return Err(format!(
+                    "Airbox target study universe size[{axis}] is outside the supported common-cell grid range"
+                ));
+            }
+            let nearest = cells.round();
+            let rounded_extent = nearest * spacing_m[axis];
+            let tolerance = 8.0
+                * f64::EPSILON
+                * size[axis]
+                    .abs()
+                    .max(rounded_extent.abs())
+                    .max(spacing_m[axis].abs());
+            if nearest < 1.0
+                || !rounded_extent.is_finite()
+                || (size[axis] - rounded_extent).abs() > tolerance
+            {
+                return Err(format!(
+                    "Airbox target study universe size[{axis}] is not an integer multiple of the planned common convolution cell size within floating-point roundoff"
+                ));
+            }
+            grid[axis] = nearest as u32;
+            shape[axis] = usize::try_from(grid[axis]).map_err(|_| {
+                format!("Airbox target cell count on axis {axis} is not addressable")
+            })?;
+        }
+        fullmag_plan::checked_fdm_grid_cost(grid, fullmag_plan::FDM_GRID_ESTIMATED_BYTES_PER_CELL)
+            .map_err(|error| {
+                format!("Airbox derived target grid budget rejected before allocation: {error}")
+            })?;
+        let origin_m = [
+            center[0] - size[0] / 2.0,
+            center[1] - size[1] / 2.0,
+            center[2] - size[2] / 2.0,
+        ];
+        validate_grid("derived target", shape, spacing_m, origin_m)?;
+        Ok(Self {
+            shape,
+            spacing_m,
+            origin_m,
+            padding_cells_above_below: [0, 0],
+            source_shape: [0; 3],
+            source_spacing_m: [0.0; 3],
+        })
+    }
 }
 
 /// Materialize the optional CPU target-only carrier from an executed run.
@@ -167,19 +254,35 @@ pub(crate) fn airbox_observation_target(
     problem: &ProblemIR,
     plan: &FdmMultilayerPlanIR,
 ) -> Result<Option<AirboxObservationTarget>, String> {
-    let Some(metadata) = problem
-        .problem_meta
-        .runtime_metadata
-        .get("airbox_observation")
-    else {
+    let runtime_metadata = &problem.problem_meta.runtime_metadata;
+    let mut target = if let Some(metadata) = runtime_metadata.get("airbox_observation") {
+        AirboxObservationTarget::from_runtime_metadata(metadata)?
+    } else if let Some(universe) = runtime_metadata.get("study_universe") {
+        let Some(object) = universe.as_object() else {
+            return Ok(None);
+        };
+        if !object.get("size").is_some_and(|size| !size.is_null()) {
+            return Ok(None);
+        }
+        AirboxObservationTarget::from_study_universe(universe, plan)?
+    } else {
         return Ok(None);
     };
-    let mut target = AirboxObservationTarget::from_runtime_metadata(metadata)?;
     let (source_shape, source_spacing) = source_grid_summary(plan)?;
     target.source_shape = source_shape;
     target.source_spacing_m = source_spacing;
     validate_grid("target", target.shape, target.spacing_m, target.origin_m)?;
     Ok(Some(target))
+}
+
+pub(crate) fn airbox_observation_requested(problem: &ProblemIR) -> bool {
+    let runtime_metadata = &problem.problem_meta.runtime_metadata;
+    runtime_metadata.contains_key("airbox_observation")
+        || runtime_metadata
+            .get("study_universe")
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("size"))
+            .is_some_and(|size| !size.is_null())
 }
 
 /// Encode target-only fields and per-quantity manifests after either a CPU or

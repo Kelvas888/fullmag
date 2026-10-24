@@ -605,3 +605,28 @@ legacy błąd loopback z zakończonym API, niezmienionym bootstrapem i ownerem.
 Archiwa, request i natywna walidacja runu nadal są obowiązkowe. Ten wyjątek
 nie powtarza Solve, nie resetuje ownera i nie zastępuje recovery. Inny błąd,
 zmiana ownera lub brak dowodów nadal blokują start; nie usuwaj ręcznie receiptów.
+
+## Kwarantanna pustej sesji po nagłym zatrzymaniu Docker
+
+Gdy helper aktywacji zniknął, a owner zachował stan ready, zwykłe resume
+pozostaje zablokowane. Jawne odzyskanie jest dostępne wyłącznie dla store
+bez RunIntent, runów i wyników oraz grupowego ledgera bez rezerwacji:
+
+```sh
+python3 -B scripts/docker_dev.py --repo-root "$source" quarantine-empty-stopped \
+  --source-root "$source" --activation "$activation" --recovery-id "$recovery"
+# Po kontroli planu: identyczne piny i dodatkowe --apply.
+```
+
+Recovery ID jest nowym UUID bez myślników, zachowywanym przy kontynuacji.
+Polecenie dowodzi zatrzymania dokładnej pary, nieobecności helpera i braku
+innych konsumentów; pod blokadami ponownie sprawdza piny i publikuje trwały
+intent przed usunięciem wyłącznie zatrzymanych kontenerów. Nie używa force.
+Po częściowym usunięciu wolno kontynuować tylko ten sam intent z dowodem
+nieobecności dokładnych ID. Stare control/state/ledger pozostają bez zmian,
+a niezmienny receipt otwiera świeży namespace z nowym ledgerem. Stary
+request_id pozostaje zakazany; nie potwierdzamy wyniku starej aktywacji,
+drainu ani wykonania fizyki. Następnie obowiązuje zwykły docker-dev up
+wybranego checkoutu i nowe jawne żądanie skryptu. Implementacja i kontrola
+interpretowana nie zastępują dowodu runtime tej trasy: NOT VERIFIED do
+zakończenia rzeczywistego preflight→apply→API→browser.

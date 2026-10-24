@@ -3563,6 +3563,9 @@ pub(crate) async fn import_session_commit_with_context(
     crate::reset_current_live_session_resources(&state).await;
     {
         let mut current = state.current_live_state.write().await;
+        state
+            .current_live_session_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         *current = Some(restored.clone());
     }
     {
@@ -3585,9 +3588,6 @@ pub(crate) async fn import_session_commit_with_context(
         let mut layout = state.current_workspace_layout.write().await;
         *layout = persisted.workspace_layout.clone();
     }
-    state
-        .current_live_session_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let realtime_state = current_live_realtime_state_from_snapshot(
         &state,
         &restored,

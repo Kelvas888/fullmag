@@ -12,6 +12,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
+import stat
 import sys
 import time
 
@@ -35,6 +36,29 @@ def _session_host():
     else:
         import linux_native_host as host
     return host
+
+
+def _source_supplementary_groups(*paths):
+    """Return non-primary owner groups needed to read selected source paths."""
+    if sys.platform != "linux":
+        return []
+    groups = set()
+    for path in (path.resolve(strict=True) for path in paths):
+        info = path.stat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise BuildControlError("Selected source mount is not a directory: " + str(path))
+        if info.st_gid == 0:
+            owner_access = info.st_uid == 65532 and info.st_mode & 0o500 == 0o500
+            other_access = info.st_mode & 0o005 == 0o005
+            if not (owner_access or other_access):
+                raise BuildControlError(
+                    "Selected source path requires GID 0 for runtime access: " + str(path)
+                    + "; assign it to a non-root group or grant read/traverse access to others"
+                )
+            continue
+        if info.st_gid != 65532:
+            groups.add(str(info.st_gid))
+    return sorted(groups, key=int)
 
 
 def normalize_include_untracked_paths(values):
@@ -427,6 +451,8 @@ def _validate_existing_operation_inputs(receipt, expected):
             raise BuildControlError(
                 "Existing development operation input differs: " + key
             )
+    if actual.get("unclaimed_cancellation") != expected.get("unclaimed_cancellation"):
+        raise BuildControlError("Existing development operation input differs: unclaimed_cancellation")
     if "post_build_generation" in expected and actual.get("post_build_generation") != expected.get(
         "post_build_generation"
     ):
@@ -731,8 +757,31 @@ def _group_ledger(control, operation, image, *, new_render=False):
             or retained.get("daemon_id_sha256") != daemon["id_sha256"]
             or retained.get("compose_project") != control.project):
         raise BuildControlError("Retained group ledger belongs to another daemon or group")
-    key = group_ledger.volume_key(daemon["id_sha256"], control.project)
+    generation_record = control.read("group-ledger-generation.json", optional=True)
+    empty_generation = _empty_stopped_namespace_ledger_generation(control)
+    generation = empty_generation
+    if generation_record is not None:
+        if (not isinstance(generation_record, Mapping)
+                or generation_record.get("schema") != "fullmag.docker-group-ledger-generation.v1"
+                or generation_record.get("compose_project") != control.project
+                or not re.fullmatch(r"[0-9a-f]{32}", str(generation_record.get("generation", "")))):
+            raise BuildControlError("Fresh group ledger generation is malformed")
+        generation = generation_record["generation"]
+        terminal_path = "recreate-services/attempts/" + generation + "/runtime-control-archive-terminal.json"
+        if generation_record.get("archive_terminal_path") != terminal_path:
+            raise BuildControlError("Fresh ledger generation has another archive path")
+        terminal = control.read(terminal_path)
+        if (terminal.get("state") != "succeeded"
+                or terminal.get("operation_attempt") != generation
+                or terminal.get("compose_project") != control.project
+                or terminal.get("preserved_group_ledger_volume") != generation_record.get("preserved_volume")
+                or hashlib.sha256(canonical(terminal)).hexdigest()
+                   != generation_record.get("archive_terminal_sha256")):
+            raise BuildControlError("Fresh ledger generation has no exact completed runtime archive")
+    generation = _select_group_ledger_generation(empty_generation, generation_record)
+    key = group_ledger.volume_key(daemon["id_sha256"], control.project, generation)
     volume = _owned_volume(control, group_ledger.VOLUME_ROLE, key)
+    _validate_empty_quarantine_ledger_volume(control, empty_generation, volume)
     # Create the ledger leaf before admission: the backend is attested
     # before its native initializer would otherwise create it.
     script = ("test ! -L /data/ledger; if test ! -e /data/ledger; then "
@@ -753,6 +802,41 @@ def _group_ledger(control, operation, image, *, new_render=False):
         raise BuildControlError("Retained group ledger identity changed during partial resume")
     control.write(operation["root"] + "/group-ledger.json", record)
     return profile["backend"], profile
+
+
+def _empty_stopped_namespace_ledger_generation(control):
+    """Bind an empty-stopped namespace to its fresh isolated ledger generation."""
+    if not control.namespace:
+        return None
+    retirement = control.namespace_registry.get("retirement")
+    if not isinstance(retirement, Mapping):
+        return None
+    if retirement.get("schema") != "fullmag.docker-control-namespace-empty-quarantine.v1":
+        return None
+    token = retirement.get("recovery_id")
+    if (retirement.get("scope") != "empty-stopped-namespace"
+            or retirement.get("state") != "quarantined-empty-not-replayed"
+            or not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{32}", token) is None
+            or control.namespace != "namespaces/" + token
+            or not isinstance(retirement.get("ledger_volume"), str)
+            or not retirement["ledger_volume"].startswith("fullmag-dev-group-ledger-v1-")):
+        raise BuildControlError("Empty quarantine namespace has an invalid fresh-ledger binding")
+    return token
+
+
+def _select_group_ledger_generation(empty_generation, generation_record):
+    """Let a later explicit archive rotation supersede the bootstrap token."""
+    if generation_record is not None:
+        return generation_record["generation"]
+    return empty_generation
+
+
+def _validate_empty_quarantine_ledger_volume(control, empty_generation, volume):
+    if empty_generation is None:
+        return
+    retirement = control.namespace_registry.get("retirement", {})
+    if volume == retirement.get("ledger_volume"):
+        raise BuildControlError("Empty quarantine namespace resolved to the retained old ledger")
 
 
 def _retained_ledger_profile(control, previous_root, document, image):
@@ -1492,11 +1576,32 @@ def _probe_retained_device_access(device_access, image, project):
     return resolved
 
 
+def _validate_cancellation_maintenance(value):
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"request_id", "request_sha256", "request_path"}:
+        raise BuildControlError("Cancellation maintenance has an unsupported shape")
+    import uuid
+    request_id = value["request_id"]
+    try:
+        parsed = uuid.UUID(request_id)
+    except (ValueError, TypeError, AttributeError) as error:
+        raise BuildControlError("Cancellation maintenance request ID is invalid") from error
+    if parsed.int == 0 or str(parsed) != request_id:
+        raise BuildControlError("Cancellation maintenance request ID is not canonical")
+    if not isinstance(value["request_sha256"], str) or not _SHA256.fullmatch(value["request_sha256"]):
+        raise BuildControlError("Cancellation maintenance request SHA is invalid")
+    expected = "/opt/fullmag/control/backend/runtime-service/unclaimed-cancellation/requests/" + request_id + ".json"
+    if value["request_path"] != expected:
+        raise BuildControlError("Cancellation maintenance request path differs from its identity")
+    return dict(value)
+
+
 def start(args, *, reuse_state=None, control=None, operation=None, prepared=None,
           recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
           native_restart_metadata=None, accepted_reattach_environment=None,
           accepted_reattach_metadata=None, recreation_resume_proof=None,
-          post_build_generation=None, retained_device_access=None):
+          post_build_generation=None, retained_device_access=None, maintenance=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -1505,6 +1610,14 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     provided_operation = operation
     if retained_device_access is not None and retained_device_access not in ("cpu", "gpu"):
         raise BuildControlError("Retained device access must be cpu or gpu")
+    maintenance = _validate_cancellation_maintenance(maintenance)
+    if maintenance is not None:
+        if (provided_operation is None or reuse_state is None or args.script is not None
+                or any(value is not None for value in (
+                    recovery_environment, recovery_metadata, native_restart_metadata,
+                    accepted_reattach_environment, accepted_reattach_metadata,
+                    recreation_resume_proof, post_build_generation))):
+            raise BuildControlError("Cancellation maintenance requires its owned operation and retained store, without runtime activation")
     if (provided_control is None) != (provided_operation is None):
         raise BuildControlError("Recovery start requires both control and operation")
     if recreation_resume_proof is not None and (reuse_state is None or provided_operation is not None):
@@ -1550,6 +1663,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             "attempt": held["attempt"],
             "image": provided_control.image,
             "volume": provided_control.volume,
+            "namespace": provided_control.namespace,
         }
     _assert_no_running_fullmag(identity["project_name"], identity, **admission_context)
     if (getattr(args, "migrate_host_capacity", False)
@@ -1633,6 +1747,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         }
     if previous_config_sha256 is not None:
         operation_inputs["previous_config_sha256"] = previous_config_sha256
+    if maintenance is not None:
+        operation_inputs["unclaimed_cancellation"] = maintenance
     if validated_native_restart_metadata is not None:
         operation_inputs["native_failed_restart"] = validated_native_restart_metadata
     if validated_accepted_reattach_metadata is not None:
@@ -1666,6 +1782,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                                    "retained_device_access": retained_device_access}):
                 raise BuildControlError("Completed recreation handoff changed before start")
         operation["receipt"].update(operator_probe_record)
+        if maintenance is not None:
+            operation["receipt"]["unclaimed_cancellation"] = maintenance
         if validated_recovery_metadata is not None:
             operation["receipt"]["container_recovery"] = validated_recovery_metadata
         if validated_recovery_environment:
@@ -1859,6 +1977,21 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         if device_access == "gpu":
             document["services"]["backend"]["gpus"] = [{"count": "all"}]
         backend, frontend = (document["services"][name] for name in ("backend", "frontend"))
+        service_source_groups = (
+            (backend, _source_supplementary_groups(selected, git_common)),
+            (frontend, _source_supplementary_groups(selected)),
+        )
+        for service, source_groups in service_source_groups:
+            if source_groups:
+                existing_groups = service.get("group_add", [])
+                if not isinstance(existing_groups, list) or any(
+                    not isinstance(group, (str, int)) or isinstance(group, bool)
+                    for group in existing_groups
+                ):
+                    raise BuildControlError("Rendered DEV service has invalid supplementary groups")
+                merged_groups = list(dict.fromkeys(str(group) for group in existing_groups))
+                merged_groups.extend(group for group in source_groups if group not in merged_groups)
+                service["group_add"] = merged_groups
         control_namespace = _control_namespace_from_document({
             "x-fullmag-control-namespace": control.namespace,
         })
@@ -1884,6 +2017,16 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                 previous_config_sha256
             )
         backend["environment"].update(validated_recovery_environment)
+        for name in ("FULLMAG_RUNTIME_UNCLAIMED_CANCELLATION_REQUEST",
+                     "FULLMAG_RUNTIME_UNCLAIMED_CANCELLATION_REQUEST_SHA256",
+                     "FULLMAG_RUNTIME_UNCLAIMED_CANCELLATION_ATTEMPT"):
+            backend["environment"].pop(name, None)
+        if maintenance is not None:
+            backend["environment"].update({
+                "FULLMAG_RUNTIME_UNCLAIMED_CANCELLATION_REQUEST": maintenance["request_path"],
+                "FULLMAG_RUNTIME_UNCLAIMED_CANCELLATION_REQUEST_SHA256": maintenance["request_sha256"],
+                "FULLMAG_RUNTIME_UNCLAIMED_CANCELLATION_ATTEMPT": operation["receipt"]["attempt"],
+            })
         backend["environment"].pop("FULLMAG_DOCKER_POST_BUILD_CONTINUATION", None)
         backend["environment"].pop("FULLMAG_DOCKER_POST_BUILD_CONTINUATION_SHA256", None)
         if post_build_start_binding is not None:
@@ -2097,6 +2240,33 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
             ledger_profile = {**ledger_profile, "daemon_volume": backend_service["x-fullmag-host-ledger-volume"]}
         ledger_attestation = ledger.validate_container(json.loads(docker_text("inspect", backend_id))[0], ledger_profile, docker_text)
         control.write(operation["root"] + "/host-ledger-attestation.json", ledger_attestation)
+    maintenance = _validate_cancellation_maintenance(operation["receipt"].get("unclaimed_cancellation"))
+    if maintenance is not None:
+        operation["receipt"].update(
+            backend_build_receipt_sha256=provenance["build_receipt_sha256"],
+            source_commit=provenance["commit"], source_digest=provenance["source_digest"],
+            source_snapshot_sha256=provenance["source_snapshot_sha256"],
+            backend_container=backend_id, frontend_container=frontend_id,
+        )
+        admission = {
+            "schema": "fullmag.docker-runtime-unclaimed-cancellation-admission.v1",
+            "attempt": token, "request_id": maintenance["request_id"],
+            "request_sha256": maintenance["request_sha256"],
+            "backend_container_id": backend_id,
+            "backend_started_at": operation["receipt"]["backend_started_at"],
+            "backend_build_receipt_sha256": provenance["build_receipt_sha256"],
+        }
+        admission_path = "backend/runtime-service/unclaimed-cancellation/admissions/" + token + ".json"
+        previous = control.read(admission_path, optional=True)
+        if previous is not None and previous != admission:
+            raise BuildControlError("Cancellation maintenance admission already exists with different evidence")
+        if previous is None:
+            control.write(admission_path, admission)
+        operation["receipt"]["unclaimed_cancellation_admission"] = admission
+        from docker_volume_unclaimed_cancellation import wait_for_maintenance
+        result = wait_for_maintenance(control, operation, backend_id, document, maintenance)
+        operation["receipt"].update(state="succeeded", unclaimed_cancellation_result=result)
+        return
     # Observe the existing incarnations; a readiness check must never run up
     # again or wait an hour after the supervisor has already closed admission.
     service_images = {name: document['services'][name]['image'] for name in ('backend', 'frontend')}
@@ -2172,6 +2342,16 @@ def _validate_retained_service(document, actual, service, image_config, *,
     for field, observed in (("hostname", config.get("Hostname")), ("user", config.get("User"))):
         if field in expected and expected[field] != observed:
             raise BuildControlError("Retained service configuration differs: " + service + "/" + field)
+    expected_groups = expected.get("group_add", [])
+    observed_groups = host.get("GroupAdd") or []
+    if (
+        not isinstance(expected_groups, list)
+        or not isinstance(observed_groups, list)
+        or any(not isinstance(group, (str, int)) or isinstance(group, bool)
+               for group in expected_groups + observed_groups)
+        or {str(group) for group in expected_groups} != {str(group) for group in observed_groups}
+    ):
+        raise BuildControlError("Retained service supplementary groups differ: " + service)
     for field, image_field in (("entrypoint", "Entrypoint"), ("command", "Cmd")):
         resolved = expected.get(field)
         if resolved is None:
@@ -2247,6 +2427,423 @@ def _assert_private_restart_network(actual, ids, project):
             or observed[0].get("Labels", {}).get("com.docker.compose.project") != project
             or set(observed[0].get("Containers", {})) - set(ids.values())):
         raise BuildControlError("Idle restart bridge has unknown consumers; no backend will be stopped")
+
+
+def _terminal_session_restart_probe(backend_id, *, allow_prepared=False, startup_enabled=False):
+    """Allow drain after a terminal task or an exact pre-acceptance failure.
+
+    Called only with the private frontend stopped and the group control lease
+    held. This is admission to graceful drain, not proof of process absence:
+    the existing native drain receipt remains mandatory before restart.
+    """
+    script = ('ALLOW_PREPARED = ' + repr(bool(allow_prepared)) + '\n'
+        + 'STARTUP_ENABLED = ' + repr(bool(startup_enabled)) + '\n' + r'''import hashlib,json,os,re,stat,urllib.error,urllib.request
+MAX=1024*1024
+MAX_STARTUP_RECEIPT=2*MAX
+MAX_STARTUP_MARKERS=256
+MAX_CONTROL_ENTRIES=4096
+instance=None
+last_current_run_not_found=None
+def unique_object(pairs):
+    result={}
+    for key,value in pairs:
+        if key in result: raise RuntimeError("restart record has duplicate JSON keys")
+        result[key]=value
+    return result
+def read_startup_marker(key):
+    root="/opt/fullmag/control/backend"
+    if os.path.realpath(root)!=root:
+        raise RuntimeError("startup receipt root is not canonical")
+    flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK
+    root_fd=os.open(root,flags|os.O_DIRECTORY)
+    try:
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise RuntimeError("startup receipt root is not a directory")
+        marker_dir=os.open("script-activation-"+key,flags|os.O_DIRECTORY,dir_fd=root_fd)
+        try:
+            fd=os.open("activation.json",flags,dir_fd=marker_dir)
+            with os.fdopen(fd,"rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise RuntimeError("startup activation receipt is not a regular file")
+                raw=source.read(MAX_STARTUP_RECEIPT+1)
+            if len(raw)>MAX_STARTUP_RECEIPT:
+                raise RuntimeError("startup activation receipt exceeds its bound")
+        finally: os.close(marker_dir)
+    finally: os.close(root_fd)
+    value=json.loads(raw,object_pairs_hook=unique_object)
+    if not isinstance(value,dict): raise RuntimeError("startup activation receipt is invalid")
+    return raw,value
+def rejected_startup_marker(status,identity):
+    session=status.get("session") or {}
+    script=session.get("script") or {}
+    script_path=script.get("path")
+    if not isinstance(script_path,str) or not script_path:
+        raise RuntimeError("startup_failed session has no public script path")
+    configured_key=os.environ.get("FULLMAG_STARTUP_RECEIPT_KEY") if STARTUP_ENABLED else None
+    if STARTUP_ENABLED and (not isinstance(configured_key,str)
+            or re.fullmatch(r"[0-9a-f]{64}",configured_key) is None
+            or os.environ.get("FULLMAG_STARTUP_SCRIPT")!=script_path):
+        raise RuntimeError("configured startup activation does not bind the current script")
+    root="/opt/fullmag/control/backend"
+    if os.path.realpath(root)!=root:
+        raise RuntimeError("startup receipt root is not canonical")
+    flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_DIRECTORY
+    root_fd=os.open(root,flags)
+    try:
+        names=sorted(os.listdir(root_fd))
+        if len(names)>MAX_CONTROL_ENTRIES:
+            raise RuntimeError("startup receipt namespace exceeds its entry bound")
+        keys=[]
+        for name in names:
+            match=re.fullmatch(r"script-activation-([0-9a-f]{64})",name)
+            if match:
+                keys.append(match.group(1))
+        if len(keys)>MAX_STARTUP_MARKERS:
+            raise RuntimeError("startup receipt namespace exceeds its marker bound")
+    finally: os.close(root_fd)
+    if STARTUP_ENABLED:
+        keys=[key for key in keys if key==configured_key]
+    matches=[]
+    for key in keys:
+        try: raw,marker=read_startup_marker(key)
+        except (FileNotFoundError,PermissionError,NotADirectoryError,OSError,RuntimeError,json.JSONDecodeError,UnicodeDecodeError):
+            continue
+        request_id=marker.get("request_id")
+        source_sha=marker.get("source_sha256")
+        if (not isinstance(request_id,str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",request_id) is None
+                or not isinstance(source_sha,str)
+                or re.fullmatch(r"[0-9a-f]{64}",source_sha) is None):
+            continue
+        expected_session="docker-startup-"+hashlib.sha256(
+            (request_id+"\0"+source_sha).encode("utf-8")).hexdigest()
+        if expected_session!=identity[0]: continue
+        authorization=marker.get("authorization")
+        if not isinstance(authorization,dict):
+            raise RuntimeError("startup activation receipt has no authorization")
+        if (hashlib.sha256(request_id.encode("utf-8")).hexdigest()!=key
+                or marker.get("schema")!="fullmag.docker-startup-activation-receipt.v1"
+                or marker.get("state")!="rejected"
+                or set(marker)!={"schema","state","request_id","provenance_sha256","source_sha256","authorization","result"
+                }
+                or marker.get("request_id")!=request_id
+                or marker.get("source_sha256")!=source_sha
+                or re.fullmatch(r"[0-9a-f]{64}",marker.get("provenance_sha256","")) is None):
+            raise RuntimeError("current session is not bound to a rejected startup receipt")
+        relative=authorization.get("source_relative")
+        if (set(authorization)!={"schema","authorization","source_root","source_path","source_relative","source_sha256","source_size_bytes","source_commit","container_source_root","container_script_path","request_id","execution_policy"}
+                or authorization.get("schema")!="fullmag.docker-startup-script.v1"
+                or authorization.get("authorization")!="explicit_startup_script"
+                or authorization.get("request_id")!=request_id
+                or authorization.get("source_sha256")!=source_sha
+                or authorization.get("container_source_root")!="/opt/fullmag/source"
+                or not isinstance(relative,str) or not relative.lower().endswith(".py")
+                or relative.startswith("/") or "\\" in relative or "\x00" in relative
+                or any(not part or part in {".",".."} for part in relative.split("/"))
+                or authorization.get("container_script_path")!="/opt/fullmag/source/"+relative
+                or authorization.get("source_size_bytes") is None
+                or isinstance(authorization.get("source_size_bytes"),bool)
+                or not isinstance(authorization.get("source_size_bytes"),int)
+                or not 0<=authorization["source_size_bytes"]<=MAX
+                or (authorization.get("source_commit") is not None
+                    and re.fullmatch(r"[0-9a-f]{40}",authorization.get("source_commit","")) is None)
+                or authorization.get("source_path") is None or authorization.get("source_root") is None
+                or authorization.get("container_script_path")!=script_path):
+            raise RuntimeError("startup authorization differs from the current session source")
+        if STARTUP_ENABLED and (key!=configured_key
+                or os.environ.get("FULLMAG_STARTUP_PROVENANCE_SHA256")!=marker.get("provenance_sha256")):
+            raise RuntimeError("configured startup receipt/provenance differs from its rejected marker")
+        policy={"mode":"canonical_live_v2","auto_study":True,"interactive":"script_metadata","wait_for_solve":"script_metadata","legacy_cli":False}
+        if authorization.get("execution_policy")!=policy:
+            raise RuntimeError("startup authorization execution policy differs")
+        result=marker.get("result")
+        if (not isinstance(result,dict)
+                or set(result)!={"schema","state","request_id","source_sha256","source_relative","rejection"}
+                or result.get("schema")!="fullmag.startup-script-activation.v1"
+                or result.get("state")!="rejected"
+                or result.get("request_id")!=request_id
+                or result.get("source_sha256")!=source_sha
+                or result.get("source_relative")!=relative):
+            raise RuntimeError("startup activation rejection result differs from its receipt")
+        rejection=result.get("rejection")
+        rejection_codes={"bad_request","validation_error","unprocessable_entity","unsupported_capability","accepted_execution_command_unsupported","accepted_study_plan_invalid","accepted_execution_stage_missing","accepted_gpu_scope_unsupported","accepted_execution_plan_invalid","accepted_backend_unsupported","accepted_study_step_unsupported","accepted_study_step_ambiguous","docker_startup_output_mapping_required","docker_startup_output_mapping_invalid"}
+        if (not isinstance(rejection,dict)
+                or set(rejection)!={"http_status","code","message"}
+                or type(rejection.get("http_status")) is not int
+                or rejection["http_status"] not in {400,422}
+                or rejection.get("code") not in rejection_codes
+                or not isinstance(rejection.get("message"),str)
+                or not rejection["message"].strip() or len(rejection["message"])>2048):
+            raise RuntimeError("startup activation rejection is not a known pre-acceptance outcome")
+        matches.append({"key":key,"raw":raw,"marker":marker,"request_id":request_id,
+            "source_sha256":source_sha,"source_relative":relative,"rejection":rejection})
+    if len(matches)!=1:
+        raise RuntimeError("startup_failed session has no unique exact rejected activation receipt")
+    return matches[0]
+def require_empty_queue(queue):
+    return (queue.get("schema_version")=="compute_queue.v1"
+        and queue.get("next_cursor") is None and queue.get("items")==[])
+def require_empty_commands(commands):
+    count_fields=("pending_count","accepted_count","dispatched_count","running_count",
+        "completed_count","rejected_count","failed_count")
+    return (commands.get("commands")==[]
+        and all(type(commands.get(key)) is int and commands[key]==0 for key in count_fields)
+        and commands.get("can_accept_commands") is False)
+def require_ready_runtime(runtime):
+    return runtime.get("configured") is True and runtime.get("state")=="ready"
+def startup_failed_preacceptance(status,run,identity):
+    session=status.get("session") or {}
+    run_not_found=last_current_run_not_found
+    if (run is not None or status.get("run") is not None
+            or status.get("solver",{}).get("state")!="startup_failed"
+            or status.get("lifecycle",{}).get("solver")!="startup_failed"
+            or status.get("lifecycle",{}).get("session_resource")!="active"
+            or status.get("lifecycle",{}).get("commandability")!="forbidden"
+            or not isinstance(run_not_found,dict)
+            or run_not_found.get("status")!=404
+            or run_not_found.get("code")!="not_found"
+            or run_not_found.get("message")!="no active run"):
+        raise RuntimeError("current session is not an unaccepted startup_failed session")
+    activation=rejected_startup_marker(status,identity)
+    preparation=get("/v2/sessions/current/simulation/preparation")
+    failure=preparation.get("failure")
+    stages=preparation.get("stages")
+    # An ApiError without an application code has two deliberate projections:
+    # HTTP rejection uses bad_request; preparation uses docker_startup_failed.
+    # Bind that exact fallback to the same bounded original error message.
+    rejection=activation["rejection"]
+    failure_code_matches=isinstance(failure,dict) and (
+        failure.get("error_code")==rejection.get("code")
+        or (failure.get("error_code")=="docker_startup_failed"
+            and rejection.get("code")=="bad_request"
+            and rejection.get("http_status")==400
+            and isinstance(failure.get("summary"),str) and bool(failure["summary"].strip())
+            and rejection["message"].startswith(failure["summary"])))
+    if (preparation.get("status")!="failed"
+            or preparation.get("active_stage_id") is not None
+            or not isinstance(preparation.get("started_at_unix_ms"),int)
+            or isinstance(preparation.get("started_at_unix_ms"),bool)
+            or not isinstance(preparation.get("completed_at_unix_ms"),int)
+            or isinstance(preparation.get("completed_at_unix_ms"),bool)
+            or preparation["completed_at_unix_ms"]<preparation["started_at_unix_ms"]
+            or not isinstance(failure,dict)
+            or not failure_code_matches
+            or not isinstance(failure.get("summary"),str) or not failure["summary"].strip()
+            or not isinstance(failure.get("stage_id"),str)
+            or not isinstance(stages,list) or not stages
+            or any(not isinstance(stage,dict)
+                or stage.get("status") not in {"completed","failed","pending","skipped"}
+                for stage in stages)
+            or not any(stage.get("id")==failure["stage_id"] and stage.get("status")=="failed"
+                for stage in stages)):
+        raise RuntimeError("startup_failed session has no terminal failed-preparation receipt")
+    queue=get("/v2/platform/compute/queue")
+    commands=get("/v2/sessions/current/simulation/commands")
+    runtime=get("/v2/platform/runtime-service")
+    if not require_empty_queue(queue):
+        raise RuntimeError("startup_failed pre-acceptance restart requires an empty unpaginated queue")
+    if not require_empty_commands(commands):
+        raise RuntimeError("startup_failed pre-acceptance restart requires an empty command ledger")
+    if not require_ready_runtime(runtime):
+        raise RuntimeError("startup_failed pre-acceptance restart requires a ready native runtime")
+    after=get("/v2/sessions/current/status")
+    after_run=get("/v2/sessions/current/simulation/runs/current",optional=True)
+    after_run_not_found=last_current_run_not_found
+    after_preparation=get("/v2/sessions/current/simulation/preparation")
+    after_queue=get("/v2/platform/compute/queue")
+    after_commands=get("/v2/sessions/current/simulation/commands")
+    after_runtime=get("/v2/platform/runtime-service")
+    after_session=after.get("session") or {}
+    after_identity=tuple(after_session.get(k) for k in ("session_id","session_epoch","request_scope_epoch"))
+    if (after_identity!=identity or after.get("solver",{}).get("state")!="startup_failed"
+            or after.get("lifecycle",{}).get("solver")!="startup_failed"
+            or after.get("lifecycle",{}).get("session_resource")!="active"
+            or after.get("lifecycle",{}).get("commandability")!="forbidden"
+            or after.get("resources")!=status.get("resources")
+            or after_session.get("script",{}).get("path")!=activation["marker"]["authorization"].get("container_script_path")
+            or after_run is not None or after.get("run") is not None
+            or after_run_not_found!=run_not_found
+            or after_preparation!=preparation or after_queue!=queue
+            or after_commands!=commands or not require_empty_queue(after_queue)
+            or not require_empty_commands(after_commands)
+            or not require_ready_runtime(after_runtime)
+            or after_runtime.get("configured")!=runtime.get("configured")):
+        raise RuntimeError("startup_failed pre-acceptance proof changed during observation")
+    raw_after,marker_after=read_startup_marker(activation["key"])
+    if raw_after!=activation["raw"] or marker_after!=activation["marker"]:
+        raise RuntimeError("rejected startup activation receipt changed during observation")
+    return {"schema":"fullmag.docker-preaccepted-startup-failure-drain-preflight.v1",
+        "api_instance_id":instance,"session_id":identity[0],"session_epoch":identity[1],
+        "request_scope_epoch":identity[2],"current_run_status":404,
+        "current_run_not_found":run_not_found,
+        "startup_activation":{"receipt_key":activation["key"],
+            "receipt_sha256":hashlib.sha256(activation["raw"]).hexdigest(),
+            "request_id":activation["request_id"],"source_sha256":activation["source_sha256"],
+            "source_relative":activation["source_relative"],
+            "rejection":activation["rejection"]},
+        "session_status":{"solver":status.get("solver"),"lifecycle":status.get("lifecycle"),
+            "resources":status.get("resources"),"session":session},
+        "preparation":preparation,"compute_queue":queue,"commands":commands,
+        "runtime_service":runtime}
+def held_run_proofs(items):
+    config_path=os.environ.get("FULLMAG_RUNTIME_SERVICE_CONFIG")
+    if not config_path or not os.path.isabs(config_path):
+        raise RuntimeError("prepared restart has no native service configuration")
+    flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK
+    with os.fdopen(os.open(config_path,flags),"rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise RuntimeError("native configuration is not a regular file")
+        raw=source.read(MAX+1)
+    if len(raw)>MAX: raise RuntimeError("native configuration exceeds restart bound")
+    root=json.loads(raw,object_pairs_hook=unique_object).get("store_root")
+    if not isinstance(root,str) or not os.path.isabs(root) or os.path.realpath(root)!=root:
+        raise RuntimeError("prepared restart store is not canonical")
+    root_fd=os.open(root,flags|os.O_DIRECTORY)
+    try:
+        runs_fd=os.open("runs",flags|os.O_DIRECTORY,dir_fd=root_fd)
+        try:
+            proofs={}
+            for run_id in sorted({item["run_id"] for item in items}):
+                if not isinstance(run_id,str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",run_id):
+                    raise RuntimeError("prepared restart queue has an invalid run identity")
+                run_fd=os.open(run_id,flags|os.O_DIRECTORY,dir_fd=runs_fd)
+                try:
+                    fd=os.open("run_intent.json",flags,dir_fd=run_fd)
+                    with os.fdopen(fd,"rb") as source:
+                        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                            raise RuntimeError("accepted intent is not a regular file")
+                        raw=source.read(MAX+1)
+                    if len(raw)>MAX: raise RuntimeError("accepted intent exceeds restart bound")
+                    intent=json.loads(raw,object_pairs_hook=unique_object)
+                    policy=(intent.get("specification") or {}).get("parameters",{}).get("fullmag.accepted_run_start")
+                    if intent.get("run_id")!=run_id or policy!={"schema_version":"accepted_run_start_policy.v1","mode":"manual"}:
+                        raise RuntimeError("prepared restart requires an explicitly held manual run")
+                    try: os.stat("start_release.json",dir_fd=run_fd,follow_symlinks=False)
+                    except FileNotFoundError: pass
+                    else: raise RuntimeError("prepared restart refuses a released Compute gate")
+                    proofs[run_id]=hashlib.sha256(raw).hexdigest()
+                finally: os.close(run_fd)
+            return proofs
+        finally: os.close(runs_fd)
+    finally: os.close(root_fd)
+def get(path,optional=False):
+    global instance,last_current_run_not_found
+    headers={"Accept":"application/json","Host":"localhost"}
+    if instance: headers["x-fullmag-api-instance"]=instance
+    request=urllib.request.Request("http://127.0.0.1:8081"+path,headers=headers)
+    try:
+        response=urllib.request.urlopen(request,timeout=30)
+    except urllib.error.HTTPError as error:
+        if (optional and error.code==404 and instance is not None
+                and error.headers.get_all("x-fullmag-api-instance")==[instance]):
+            try:
+                raw_error=error.read(MAX+1)
+                if len(raw_error)>MAX:
+                    raise RuntimeError("optional current-run error exceeds restart bound")
+                error_document=json.loads(raw_error,object_pairs_hook=unique_object)
+            finally:
+                error.close()
+            if (path!="/v2/sessions/current/simulation/runs/current"
+                    or not isinstance(error_document,dict)
+                    or error_document.get("code")!="not_found"
+                    or error_document.get("message")!="no active run"
+                    or error_document.get("error")!="no active run"):
+                raise RuntimeError("current run is not the exact no-active-run 404")
+            last_current_run_not_found={"status":404,"code":"not_found",
+                "message":"no active run","api_instance_id":instance}
+            return None
+        raise
+    with response:
+        ids=response.headers.get_all("x-fullmag-api-instance") or []
+        if len(ids)!=1 or not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}",ids[0]):
+            raise RuntimeError("terminal restart probe has no exact API identity")
+        if instance is not None and instance!=ids[0]:
+            raise RuntimeError("API identity changed during terminal restart probe")
+        instance=ids[0]
+        raw=response.read(MAX+1)
+        if response.status!=200 or len(raw)>MAX:
+            raise RuntimeError("terminal restart response is unavailable or too large")
+    value=json.loads(raw)
+    if not isinstance(value,dict): raise RuntimeError("invalid terminal restart response")
+    return value
+status=get("/v2/sessions/current/status")
+session=status.get("session") or {}
+identity=tuple(session.get(k) for k in ("session_id","session_epoch","request_scope_epoch"))
+if not all(isinstance(v,str) and v for v in identity):
+    raise RuntimeError("terminal restart has no current session identity")
+run=get("/v2/sessions/current/simulation/runs/current",optional=True)
+terminal={"completed","failed","cancelled","stopped"}
+prepared=bool(ALLOW_PREPARED and run and run.get("status")=="waiting_for_solve"
+    and status.get("solver",{}).get("state")=="awaiting_command")
+if (not STARTUP_ENABLED and run is None
+        and status.get("solver",{}).get("state")=="startup_failed"):
+    print(json.dumps(startup_failed_preacceptance(status,run,identity),sort_keys=True))
+elif STARTUP_ENABLED or run is None or (run.get("status") not in terminal and not prepared):
+    print("null")
+else:
+    run_id=run.get("run_id")
+    if (not isinstance(run_id,str) or not run_id
+            or run.get("session_id")!=identity[0]
+            or status.get("run",{}).get("run_id")!=run_id
+            or status.get("solver",{}).get("state") not in
+                (terminal|{"idle"}|({"awaiting_command"} if prepared else set()))):
+        raise RuntimeError("terminal run differs from the current session")
+    queue=get("/v2/platform/compute/queue")
+    runtime=get("/v2/platform/runtime-service")
+    items=queue.get("items")
+    if (queue.get("schema_version")!="compute_queue.v1" or queue.get("next_cursor") is not None
+            or not isinstance(items,list)
+            or (not ALLOW_PREPARED and items!=[])
+            or (ALLOW_PREPARED and any(not isinstance(item,dict)
+                or item.get("state")!="accepted" for item in items))):
+        raise RuntimeError("restart requires no running or released computation")
+    held_items=items+([{"run_id":run_id}] if prepared else [])
+    held_runs=held_run_proofs(held_items) if ALLOW_PREPARED and held_items else {}
+    if prepared:
+        preparation=get("/v2/sessions/current/simulation/preparation")
+        stages=get("/v2/sessions/current/simulation/stages/execution")
+        commands=get("/v2/sessions/current/simulation/commands")
+        if (preparation.get("status")!="ready" or preparation.get("failure") is not None
+                or status.get("resources",{}).get("mesh_revision",0)<=0
+                or stages.get("run_id")!=run_id
+                or stages.get("runtime_state")!="awaiting_command"
+                or not stages.get("stage_statuses")
+                or len(stages["stage_statuses"])!=stages.get("total_stages")
+                or stages.get("completed_stage_indexes")!=[]
+                or any(value!="pending" for value in stages["stage_statuses"])
+                or commands.get("commands")!=[]):
+            raise RuntimeError("prepared restart requires a ready mesh and a never-started Study")
+    if runtime.get("configured") is not True or runtime.get("state")!="ready":
+        raise RuntimeError("terminal restart requires a live native runtime for drain")
+    after=get("/v2/sessions/current/status")
+    after_run=get("/v2/sessions/current/simulation/runs/current")
+    if (tuple((after.get("session") or {}).get(k) for k in
+              ("session_id","session_epoch","request_scope_epoch"))!=identity
+            or after.get("run",{}).get("run_id")!=run_id
+            or after.get("solver",{}).get("state")!=status.get("solver",{}).get("state")
+            or after_run.get("run_id")!=run_id
+            or after_run.get("session_id")!=identity[0]
+            or after_run.get("status")!=run.get("status")
+            or after_run.get("revision")!=run.get("revision")):
+        raise RuntimeError("terminal session changed before drain")
+    if prepared and any((after.get("resources") or {}).get(key)!=(status.get("resources") or {}).get(key)
+            for key in ("scene_revision","mesh_revision","stages_revision","commands_revision",
+                        "command_completion_revision","simulation_preparation_revision")):
+        raise RuntimeError("prepared session changed before drain")
+    if held_runs and held_run_proofs(held_items)!=held_runs:
+        raise RuntimeError("manual start gate changed before drain")
+    result={"schema":("fullmag.docker-prepared-session-drain-preflight.v1" if prepared
+            else "fullmag.docker-terminal-session-drain-preflight.v1"),
+        "api_instance_id":instance,"session_id":identity[0],"session_epoch":identity[1],
+        "request_scope_epoch":identity[2],"run":run,"compute_queue":queue,
+        "runtime_service":runtime}
+    if held_runs: result["held_run_intent_sha256"]=held_runs
+    print(json.dumps(result,sort_keys=True))
+'''
+    )
+    return json.loads(docker_text(
+        "exec", backend_id, "/usr/local/bin/python3", "-B", "-c", script,
+    ))
 
 
 def _read_cancelled_activation_bytes(control, relative, *, optional=False):
@@ -3054,9 +3651,16 @@ def _validate_cancelled_activation_preflight(
     *, require_quiesced_activation=True,
 ):
     """Accept the stale active-session exception only for one immutable proof."""
-    current, current_raw = _read_cancelled_activation_record(control, "activation/current.json")
+    current, current_raw = _read_cancelled_activation_record(
+        control, "activation/current.json", optional=True
+    )
     if current is None or current_raw is None:
-        raise BuildControlError("Restart has no accepted-then-cancelled activation proof")
+        # No script activation was cancelled: the session is a live one (for
+        # example created by `fm.connect()`), and restarting would end it.
+        raise BuildControlError(
+            "Restart refused: the backend has an active session and no cancelled script "
+            "activation; the active session is never interrupted"
+        )
     if (current.get("schema") != "fullmag.docker-build-operation.v1"
             or current.get("phase") != "activation"
             or current.get("compose_project") != control.project
@@ -3820,8 +4424,6 @@ def _validate_completed_recovery_receipt(control, authorization, recovery_module
         # must be carried unchanged so PID 1 can finish its authenticated
         # recovery protocol on the next start.
         return False
-    if receipt.get("outcome") != "empty_namespace_recovered":
-        raise BuildControlError("Completed recovery receipt has an unsupported outcome")
     request_relative = authorization["native_request_path"][len("/opt/fullmag/control/"):]
     request_raw = recovery_module._control_bytes(control, request_relative)
     if hashlib.sha256(request_raw).hexdigest() != authorization["native_request_sha256"]:
@@ -3829,6 +4431,8 @@ def _validate_completed_recovery_receipt(control, authorization, recovery_module
     request = recovery_module.validate_request(
         recovery_module._parse_json(request_raw, "retained recovery request")
     )
+    if receipt.get("outcome") != recovery_module.expected_recovery_outcome(request):
+        raise BuildControlError("Completed recovery outcome differs from its request scope")
     for field in ("request_id", "config_sha256", "owner_sha256"):
         if request.get(field) != authorization[field]:
             raise BuildControlError("Completed recovery request differs from authorization")
@@ -5470,6 +6074,8 @@ def _retained_operation(
     document = control.read(previous_root + "/compose.json")
     if hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256 or document.get("name") != control.project:
         raise BuildControlError("Resume Compose identity/CAS differs")
+    from docker_volume_preparation_abort import require_fresh_archive
+    preparation_abort = require_fresh_archive(control, args, previous, document, recreate_services=recreate_services)
     operator_probe_record = _operator_probe_record_from_retained(previous, document)
     image = previous["inputs"]["image_id"]
     if previous["inputs"]["source_root"] != str(selected):
@@ -5632,14 +6238,23 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 elif active_session is True:
                     if startup_enabled:
                         raise BuildControlError("Backend has an active session; idle restart refused")
-                    cancelled_activation = _validate_cancelled_activation_preflight(
-                        control, previous_root, previous, document, selected, args.config_sha256,
-                        ids["backend"], environment, require_quiesced_activation=False,
+                    terminal_session = _terminal_session_restart_probe(
+                        ids["backend"], allow_prepared=getattr(args, "allow_prepared_session", False),
                     )
-                    health = cancelled_activation["probe"]["health"]
-                    operation["receipt"]["accepted_then_cancelled_proof_sha256"] = (
-                        cancelled_activation["proof_sha256"]
-                    )
+                    if terminal_session is not None:
+                        control.write(operation["root"] + "/terminal-session-preflight.json", terminal_session)
+                        operation["receipt"]["terminal_session_preflight_sha256"] = hashlib.sha256(
+                            canonical(terminal_session)
+                        ).hexdigest()
+                    else:
+                        cancelled_activation = _validate_cancelled_activation_preflight(
+                            control, previous_root, previous, document, selected, args.config_sha256,
+                            ids["backend"], environment, require_quiesced_activation=False,
+                        )
+                        health = cancelled_activation["probe"]["health"]
+                        operation["receipt"]["accepted_then_cancelled_proof_sha256"] = (
+                            cancelled_activation["proof_sha256"]
+                        )
                 elif active_session is not False:
                     raise BuildControlError("Backend has an active or unknown session; idle restart refused")
                 if saved_authoring:
@@ -5705,7 +6320,8 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         if actual["backend"]["State"]["Running"]:
             raise BuildControlError("Recreation requires the backend stopped; an active build/runtime is never interrupted")
         pre_activation_stop = None
-        if document["services"]["backend"]["environment"].get("FULLMAG_STARTUP_ENABLED") == "1":
+        if (document["services"]["backend"]["environment"].get("FULLMAG_STARTUP_ENABLED") == "1"
+                and preparation_abort is None):
             stop_path = "verification/stop-failed-" + ids["backend"] + ".json"
             stop = control.read(stop_path)
             failure = stop.get("failure_receipt", {}).get("receipt", {})
@@ -5729,8 +6345,10 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         if certificate.get("image_id") != image:
             raise BuildControlError("Retained storage image differs")
         fresh_state = bool(getattr(args, "fresh_state", False))
-        recovery_context = _retained_recovery_context(
-            control, previous, document, fresh_state=fresh_state,
+        # A fresh session archives its entire old runtime namespace below.
+        # It must not carry permissions to recover or restore the old owner.
+        recovery_context = {} if fresh_state else _retained_recovery_context(
+            control, previous, document, fresh_state=False,
             backend_id=actual["backend"].get("Id"),
         )
         from docker_volume_native_init_successor import NativeInitSuccessorContext
@@ -5966,6 +6584,25 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     raise BuildControlError("Native init successor witness changed under recreate lease")
                 operation["receipt"]["native_init_successor"] = recovery_context.witness
             operation["receipt"].update(operator_probe_record)
+            if fresh_state:
+                # Re-pin the stopped generation under the same lease that
+                # owns removal and archival, including Docker Desktop restarts.
+                for service, identifier in ids.items():
+                    observed_rows = json.loads(docker_text("inspect", identifier))
+                    if len(observed_rows) != 1:
+                        raise BuildControlError("Fresh session service identity is ambiguous")
+                    observed = observed_rows[0]
+                    before = actual[service]
+                    if any(observed.get(key) != before.get(key) for key in ("Id", "Image")) or (
+                        observed.get("State", {}).get("StartedAt")
+                        != before.get("State", {}).get("StartedAt")
+                    ):
+                        raise BuildControlError("Service restarted before fresh session: " + service)
+                    _validate_retained_service(document, observed, service, image_config,
+                                               allow_legacy_frontend=True)
+                    if service == "backend" and observed.get("State", {}).get("Running"):
+                        raise BuildControlError("Fresh session requires the backend stopped")
+                    actual[service] = observed
             if reconciliation is not None:
                 operation["receipt"]["activation_reconciliation"] = {
                     key: reconciliation[key]
@@ -6188,12 +6825,28 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             operation["daemon_pending"] = True
             if actual["frontend"]["State"]["Running"]:
                 docker_capture("stop", "--time", "60", ids["frontend"], timeout=90)
-            for identifier in ids.values():
-                if json.loads(docker_text("inspect", identifier))[0]["State"]["Running"]:
+            for service, identifier in ids.items():
+                observed = json.loads(docker_text("inspect", identifier))[0]
+                if observed["State"]["Running"]:
                     raise BuildControlError("An owned service is still running; resources retained")
+                if fresh_state and (
+                    observed.get("Id") != actual[service].get("Id")
+                    or observed.get("Image") != actual[service].get("Image")
+                    or observed["State"].get("StartedAt") != actual[service]["State"].get("StartedAt")
+                ):
+                    raise BuildControlError("Service restarted during fresh session: " + service)
             docker_capture("rm", *ids.values())
             if helper_ids:
                 docker_capture("rm", *helper_ids)
+            if fresh_state:
+                from docker_volume_fresh_runtime import archive_runtime_control
+                operation["receipt"]["runtime_control_archive"] = archive_runtime_control(
+                    control,
+                    operation,
+                    previous_state_root=str(state),
+                    source_root=str(selected),
+                    removed_containers=list(ids.values()),
+                )
             operation["daemon_pending"] = False
             operation["receipt"].update(state="succeeded", removed_containers=list(ids.values()),
                                         retained_volumes=previous["backend_volumes"], retained_frontend_volume=previous["frontend_volume"])

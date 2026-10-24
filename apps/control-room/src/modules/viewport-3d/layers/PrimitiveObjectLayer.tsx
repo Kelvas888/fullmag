@@ -20,7 +20,6 @@ import {
 
 import type { Viewport3DResourceTracker } from "../viewport3dDiagnostics";
 import { useBatchedInvalidate } from "../viewport3dBatchedInvalidate";
-import { buildSurfaceEdgeGeometryFromBufferGeometry } from "../viewport3dSurfaceEdges";
 import { buildViewport3DPrimitiveFrameKey } from "../viewport3dPrimitiveModel";
 import type {
   Viewport3DPrimitiveObject,
@@ -33,6 +32,7 @@ import {
   pointColorFromSettings,
 } from "./viewport3DLayerSettings";
 import { resolveViewport3DTargetRenderPlan } from "./viewport3DTargetRenderPlan";
+import { buildPrimitiveWireframeGeometry } from "./primitiveWireframeGeometry";
 import {
   buildPrimitiveTransformGizmoSegments,
   releasePrimitiveObjectGeometry,
@@ -51,6 +51,7 @@ export function PrimitiveObjectLayer({
   materialProfile,
   onSelectObject,
   primitiveModel,
+  meshReadyFallbackObjectIds,
   realizedObjectIds,
   tracker,
 }: {
@@ -58,6 +59,7 @@ export function PrimitiveObjectLayer({
   getObjectSettings: (object: Viewport3DPrimitiveObject) => VisualizationTargetSettings;
   materialProfile: Viewport3DMaterialProfile;
   onSelectObject: (object: Viewport3DPrimitiveObject) => void;
+  meshReadyFallbackObjectIds?: ReadonlySet<string>;
   primitiveModel: Viewport3DPrimitiveRenderModel | null;
   realizedObjectIds?: ReadonlySet<string>;
   tracker: Viewport3DResourceTracker;
@@ -118,6 +120,11 @@ export function PrimitiveObjectLayer({
           primitiveColorAssignments={primitiveColorAssignments}
           materialProfile={materialProfile}
           hasRealizedObjectGeometry={realizedObjectIds?.has(object.objectId) ?? false}
+          allowMeshReadyPreview={
+            object.role === "antenna" ||
+            (isFerromagneticPrimitiveRole(object.role) &&
+              (meshReadyFallbackObjectIds?.has(object.objectId) ?? false))
+          }
           settings={getObjectSettings(object)}
           tracker={tracker}
         />
@@ -131,6 +138,7 @@ function PrimitiveObject({
   object,
   materialProfile,
   hasRealizedObjectGeometry,
+  allowMeshReadyPreview,
   onSelectObject,
   primitiveColorAssignments,
   settings,
@@ -138,6 +146,7 @@ function PrimitiveObject({
 }: {
   colors: Viewport3DColors;
   hasRealizedObjectGeometry: boolean;
+  allowMeshReadyPreview: boolean;
   materialProfile: Viewport3DMaterialProfile;
   object: Viewport3DPrimitiveObject;
   onSelectObject: (object: Viewport3DPrimitiveObject) => void;
@@ -145,7 +154,12 @@ function PrimitiveObject({
   settings: VisualizationTargetSettings;
   tracker: Viewport3DResourceTracker;
 }) {
-  if (!shouldRenderPrimitiveObject(object, settings, hasRealizedObjectGeometry)) {
+  if (!shouldRenderPrimitiveObject(
+    object,
+    settings,
+    hasRealizedObjectGeometry,
+    allowMeshReadyPreview,
+  )) {
     return null;
   }
 
@@ -154,6 +168,7 @@ function PrimitiveObject({
       colors={colors}
       materialProfile={materialProfile}
       object={object}
+      allowMeshReadyPreview={allowMeshReadyPreview}
       onSelectObject={onSelectObject}
       primitiveColorAssignments={primitiveColorAssignments}
       settings={settings}
@@ -165,6 +180,7 @@ function PrimitiveObject({
 function RenderablePrimitiveObject({
   colors,
   object,
+  allowMeshReadyPreview = false,
   materialProfile,
   onSelectObject,
   primitiveColorAssignments,
@@ -174,6 +190,7 @@ function RenderablePrimitiveObject({
   colors: Viewport3DColors;
   materialProfile: Viewport3DMaterialProfile;
   object: Viewport3DPrimitiveObject;
+  allowMeshReadyPreview?: boolean;
   onSelectObject: (object: Viewport3DPrimitiveObject) => void;
   primitiveColorAssignments: ReadonlyMap<string, number>;
   settings: VisualizationTargetSettings;
@@ -191,7 +208,11 @@ function RenderablePrimitiveObject({
     tracker.release("texture", antennaTextures.matcap);
     tracker.release("texture", antennaTextures.brush);
   }, [antennaTextures, tracker]);
-  const renderSettings = resolvePrimitiveObjectRenderSettings(object, settings);
+  const renderSettings = resolvePrimitiveObjectRenderSettings(
+    object,
+    settings,
+    allowMeshReadyPreview,
+  );
   const geometry = useMemo(
     () => trackPrimitiveObjectGeometry(tracker, object),
     [object, tracker],
@@ -209,9 +230,9 @@ function RenderablePrimitiveObject({
     [geometry, tracker],
   );
   const edgeGeometry = useMemo(() => {
-    const next = buildSurfaceEdgeGeometryFromBufferGeometry(geometry);
+    const next = buildPrimitiveWireframeGeometry(object, geometry);
     return next ? tracker.track("geometry", next) : null;
-  }, [geometry, tracker]);
+  }, [geometry, object, tracker]);
 
   useEffect(
     () => () => tracker.release("geometry", edgeGeometry),

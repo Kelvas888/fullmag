@@ -187,6 +187,11 @@ pub(crate) struct AppState {
         Arc<RwLock<BTreeMap<String, VisualizationClientAckEntry>>>,
     /// Monotonic revision of the visualization client acknowledgement resource.
     pub current_visualization_client_ack_revision: Arc<AtomicU64>,
+    /// External clients (Python live scripts) seen in the current session (ADR 0068).
+    pub current_session_clients:
+        Arc<RwLock<BTreeMap<String, crate::schemas::session_clients::SessionClientEntry>>>,
+    /// Monotonic revision of the session clients resource.
+    pub current_session_clients_revision: Arc<AtomicU64>,
     /// Workspace-only selection state for the local control room.
     pub current_workspace_selection: Arc<RwLock<CurrentWorkspaceSelection>>,
     /// Workspace-only ribbon state for the local control room.

@@ -41,21 +41,21 @@ pub async fn create(
     let _transition = state.current_live_session_transition.lock().await;
     let replacing = state.current_live_state.read().await.is_some();
     if replacing && !request.replace_current {
-        return Err(ApiError {
-            status: StatusCode::CONFLICT,
-            code: None,
-            message: "an active local session already exists; set replace_current to replace it"
-                .to_string(),
-            diagnostics: Vec::new(),
-        });
+        return Err(ApiError::conflict_with_code(
+            "session_already_active",
+            "an active local session already exists; set replace_current to replace it",
+        ));
     }
     if replacing {
         reset_current_live_session_resources(&state).await;
     }
-    state
-        .current_live_session_epoch
-        .fetch_add(1, Ordering::Relaxed);
-    *state.current_live_state.write().await = Some(snapshot.clone());
+    {
+        let mut current = state.current_live_state.write().await;
+        state
+            .current_live_session_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        *current = Some(snapshot.clone());
+    }
 
     let display_revision = state.current_display_selection.read().await.revision;
     let realtime_state =

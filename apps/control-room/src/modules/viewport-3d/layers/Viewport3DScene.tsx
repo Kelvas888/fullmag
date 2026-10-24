@@ -72,6 +72,7 @@ import type {
   Viewport3DTopologyRenderModel,
   Viewport3DTopologyPartRenderModel,
 } from "../viewport3dRenderModel";
+import { buildViewport3DRenderableMeshPartKey } from "../viewport3dRenderModel";
 import type { Viewport3DMeshSizeHighlightModel } from "../viewport3dMeshSizeHighlight";
 import type { ScalarColorBuffer } from "../viewport3dFieldMapping";
 import {
@@ -114,6 +115,7 @@ import {
   type Viewport3DOrbitDebugAngles,
 } from "./CameraControls";
 import { CanvasLifecycleProbe } from "./CanvasLifecycleProbe";
+import { resolveViewport3DCameraDepthRange } from "./viewport3DCameraClip";
 import {
   AirboxLayer,
   DomainBoxLayer,
@@ -305,6 +307,7 @@ interface Viewport3DSceneProps {
   selectedRegionId: string | null;
   tracker: Viewport3DResourceTracker;
   topologyFreshness: Viewport3DTopologyFreshness;
+  topologyIndexStatus: "idle" | "building" | "ready" | "unavailable";
   topology: DecodedTopology | null | undefined;
   topologyModel: Viewport3DTopologyRenderModel<Viewport3DMeshPart> | null;
   topologyRevision: number | string | null;
@@ -413,33 +416,15 @@ export function resolveViewport3DProjectionCameraClip(
     fovDegrees = DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
   }: { aspect?: number; fovDegrees?: number } = {},
 ): Viewport3DCameraClip {
-  const fit = resolveViewport3DCameraFit(bounds, { aspect, fovDegrees });
-  if (!cameraState) return { near: fit.near, far: fit.far };
+  if (!cameraState) {
+    const fit = resolveViewport3DCameraFit(bounds, { aspect, fovDegrees });
+    return { near: fit.near, far: fit.far };
+  }
 
   const position = new Vector3(...cameraState.position);
   const forward = new Vector3(...cameraState.target).sub(position);
   const distance = forward.length();
-  const radius = Math.max(bounds?.radius ?? FALLBACK_GRID_SIZE / 2, 1e-12);
-  // FOV changes projection without moving the camera. A hypothetical fit must
-  // never push the near plane through geometry visible from the actual pose.
-  const minimumNear = 1e-12;
-  const centerDepth = bounds && Number.isFinite(distance) && distance > 0
-    ? new Vector3(...bounds.center).sub(position).dot(forward.divideScalar(distance))
-    : null;
-  const nearestDepth = centerDepth === null ? null : centerDepth - radius;
-  const poseNearLimit = nearestDepth !== null
-    ? nearestDepth > minimumNear ? nearestDepth * 0.5 : minimumNear
-    : Number.isFinite(distance) && distance > 0 ? distance / 100 : minimumNear;
-  const near = Math.max(minimumNear, Math.min(fit.near, poseNearLimit));
-  const orbitFar =
-    Number.isFinite(distance) && distance > 0
-      ? distance + radius * 4
-      : fit.far;
-
-  return {
-    near,
-    far: Math.max(fit.far, orbitFar, (centerDepth ?? 0) + radius * 4, near * 100, 1e-3),
-  };
+  return resolveViewport3DCameraDepthRange(bounds, position, forward, distance);
 }
 
 export function resolveViewport3DOrthographicZoom(
@@ -1256,6 +1241,8 @@ function Viewport3DModelLayerStack({
   sceneLayersEnabled,
   savedViewportActive,
   stageVisibility,
+  meshReadyFallbackObjectIds,
+  onRenderableMeshPartChange,
 }: Pick<
   Viewport3DSceneProps,
   | "adoptionRegistry"
@@ -1317,6 +1304,11 @@ function Viewport3DModelLayerStack({
   | "vectorStyle"
   | "visualizationRevision"
 > & {
+  meshReadyFallbackObjectIds: ReadonlySet<string>;
+  onRenderableMeshPartChange: (
+    renderableGeometryKey: string,
+    ready: boolean,
+  ) => void;
   fdmCuboidLayerEnabled: boolean;
   materialProfile: ReturnType<typeof resolveViewport3DMaterialProfile>;
   savedViewportActive: boolean;
@@ -1564,6 +1556,7 @@ function Viewport3DModelLayerStack({
           materialProfile={materialProfile}
           onSelectObject={onSelectObject}
           primitiveModel={primitiveModel}
+          meshReadyFallbackObjectIds={meshReadyFallbackObjectIds}
           realizedObjectIds={realizedObjectIds}
           tracker={tracker}
         />
@@ -1596,6 +1589,8 @@ function Viewport3DModelLayerStack({
             modeCompositionId={modeCompositionId}
             modeCompositionPhaseByLayerId={modeCompositionPhaseByLayerId}
             onSelectPart={onSelectPart}
+            onRenderableGeometryChange={onRenderableMeshPartChange}
+            renderableGeometryStageVisible={stageVisibility.baseGeometry}
             tracker={tracker}
             topologyFreshness={topologyFreshness}
             topologyModel={topologyModel}
@@ -1923,6 +1918,7 @@ export function Viewport3DScene({
   tracker,
   topology,
   topologyFreshness,
+  topologyIndexStatus,
   topologyModel,
   topologyRevision,
   vectorColorMode,
@@ -1967,6 +1963,102 @@ export function Viewport3DScene({
     }
   }, [cameraGestureRef, onCameraInteractionEnd]);
   const [moveGestureActive, setMoveGestureActive] = useState(false);
+  const [renderableMeshPartKeys, setRenderableMeshPartKeys] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
+  const onRenderableMeshPartChange = useCallback(
+    (key: string, ready: boolean) => {
+      setRenderableMeshPartKeys((current) => {
+        if (current.has(key) === ready) return current;
+        const next = new Set(current);
+        if (ready) next.add(key);
+        else next.delete(key);
+        return next;
+      });
+    },
+    [],
+  );
+  const meshReadyFallbackObjectParts = useMemo(() => {
+    const fallbackParts = new Map<string, readonly string[]>();
+    if (
+      savedViewportActive ||
+      fdmLaneActive ||
+      (topologyIndexStatus !== "building" && topologyIndexStatus !== "ready") ||
+      !isViewport3DTopologyRenderable(topologyFreshness) ||
+      !primitiveModel ||
+      !topologyModel
+    ) {
+      return fallbackParts;
+    }
+
+    const topologyPartsById = new Map(
+      topologyModel.magneticParts.map(
+        (partModel) => [partModel.part.id, partModel] as const,
+      ),
+    );
+    for (const object of primitiveModel.objects) {
+      if (!getObjectSettings(object).visible) continue;
+      const objectPartIds = femDomain.objectPartIds.get(object.objectId) ?? [];
+      const fallbackPartIds = new Set<string>();
+      for (const partId of objectPartIds) {
+        const partModel = topologyPartsById.get(partId);
+        if (!partModel) continue;
+        const partSettings = getPartSettings(partModel.part);
+        if (!partSettings.visible) continue;
+        const surfaceActive = partSettings.shaderVisible;
+        const wireframeActive = partSettings.wireframeVisible;
+        if (!surfaceActive && !wireframeActive) continue;
+        if (topologyIndexStatus === "ready") {
+          const wireframeIndices =
+            partSettings.geometryScope === "full"
+              ? partModel.volumeEdgeIndices
+              : partModel.edgeIndices;
+          const matchingIndexReady =
+            (surfaceActive && Boolean(partModel.surfaceIndices?.length)) ||
+            (wireframeActive && Boolean(wireframeIndices?.length));
+          if (!matchingIndexReady) continue;
+        }
+        fallbackPartIds.add(partId);
+      }
+      if (fallbackPartIds.size > 0) {
+        fallbackParts.set(object.objectId, [...fallbackPartIds]);
+      }
+    }
+    return fallbackParts;
+  }, [
+    fdmLaneActive,
+    femDomain.objectPartIds,
+    getObjectSettings,
+    getPartSettings,
+    primitiveModel,
+    savedViewportActive,
+    topologyFreshness,
+    topologyIndexStatus,
+    topologyModel,
+  ]);
+  const meshReadyFallbackObjectIds = useMemo(() => {
+    const fallbackObjectIds = new Set<string>();
+    for (const [objectId, partIds] of meshReadyFallbackObjectParts) {
+      // A primitive represents the whole authored object. Remove it as soon
+      // as any matching active part has uploaded, avoiding surface overlap.
+      const hasUploadedPart = partIds.some((partId) =>
+        renderableMeshPartKeys.has(
+          buildViewport3DRenderableMeshPartKey(
+            partId,
+            topologyModel,
+            sessionIdentity,
+          ),
+        ),
+      );
+      if (!hasUploadedPart) fallbackObjectIds.add(objectId);
+    }
+    return fallbackObjectIds;
+  }, [
+    meshReadyFallbackObjectParts,
+    renderableMeshPartKeys,
+    sessionIdentity,
+    topologyModel,
+  ]);
   const handleMoveGestureActiveChange = useCallback((active: boolean) => {
     onMoveGestureActiveChange?.(active);
     setMoveGestureActive(active);
@@ -2318,6 +2410,8 @@ export function Viewport3DScene({
         topologyModel={topologyModel}
         topologyRevision={topologyRevision}
         tracker={tracker}
+        meshReadyFallbackObjectIds={meshReadyFallbackObjectIds}
+        onRenderableMeshPartChange={onRenderableMeshPartChange}
         vectorColorMode={vectorColorMode}
         vectorScale={vectorScale}
         vectorStyle={vectorStyle}

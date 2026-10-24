@@ -74,7 +74,8 @@ class VolumeReceiptTests(IsolatedReceiptTests):
                                            "gpu_preflight": "NOT_REQUIRED" if retained_policy == "disabled" else "PASS",
                                            "image_id": "sha256:" + "b" * 64}}
                     control = mock.Mock(project=project_name)
-                    control.read.side_effect = [previous, document]
+                    # Retained receipt, its Compose document, then no aborted preparation.
+                    control.read.side_effect = [previous, document, None]
                     configuration = {"services": {"fem-gpu-toolchain": {"build": {"args": {
                         "FULLMAG_CUDA_BASE_IMAGE": "unused"}}}}}
                     with mock.patch.object(docker_dev, "_select_source", return_value=(source, {})), \
@@ -690,6 +691,7 @@ class SavedAuthoringRestartTests(IsolatedReceiptTests):
         control = BuildControl({'project_name': 'fullmag-test', 'worktree_id': 'owned',
             'project_id': 'test-project', 'checkout_kind': 'worktree'}, 'sha256:' + 'a' * 64)
         logger = mock.Mock(stdin=io.BytesIO())
+        logger.poll.return_value = None
         logger.wait.return_value = 0
         written = {};events = [];operation = None
         def write(path, value):
@@ -732,6 +734,7 @@ class SavedAuthoringRestartTests(IsolatedReceiptTests):
                 (control, 'space', {'return_value': {'available_bytes': 100 * 1024**3}}),
                 (control, 'helper_args', {'return_value': ['mock-only-no-process']}),
                 (control, '_line', {'side_effect': ['READY', 'LOGGED']}),
+                (control, '_inspect_operation_helper', {'return_value': 'e' * 64}),
                 (control, 'write', {'side_effect': write}),
                 (build_control.subprocess, 'Popen', {'return_value': logger}),
                 (dev, '_operator_probe_record_from_retained', {'return_value': {}}),
@@ -894,11 +897,14 @@ class FrontendMetadataRefreshTests(IsolatedReceiptTests):
         import docker_development_inputs as frontend_inputs
         import windows_folder_host,fullmag_storage,docker_volume_reconcile,docker_build_control
         control=mock.Mock(spec=BuildControl);control.project='own';control.volume='control';control.namespace=''
+        control._active_operation=None
         control.operation=types.MethodType(BuildControl.operation,control)
+        control._pin_operation_helper=types.MethodType(BuildControl._pin_operation_helper,control)
+        control._inspect_operation_helper.return_value='e'*64
         control.path.side_effect=lambda value:'/control/'+value
         control.space.return_value={'available_bytes':64*1024**3}
         control._line.side_effect=['READY','LOGGED']
-        logger=mock.Mock();logger.wait.return_value=0;logger.stdin.closed=False
+        logger=mock.Mock();logger.poll.return_value=None;logger.wait.return_value=0;logger.stdin.closed=False
         logger.stdin.close.side_effect=lambda:setattr(logger.stdin,'closed',True)
         writes={}
         def write(path,value):

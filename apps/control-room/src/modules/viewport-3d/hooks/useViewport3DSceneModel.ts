@@ -3869,11 +3869,58 @@ export function useViewport3DSceneModel({
     () => (topologyCurrent ? resolveTopologyBounds(topology.data) : null),
     [topology.data, topologyCurrent],
   );
+  const universeRootSelectionBounds = useMemo(() => {
+    const resourceAuthoredBounds = universe.data
+      ? resolveUniverseBounds({
+          ...universe.data,
+          object_bounds_max: null,
+          object_bounds_min: null,
+        })
+      : null;
+    const sceneUniverse = scene.data?.universe;
+    const sceneAuthoredBounds = sceneUniverse
+      ? resolveUniverseBounds({
+          mesh_dirty: false,
+          object_bounds_max: null,
+          object_bounds_min: null,
+          scene_revision: scene.data?.scene_revision ?? 0,
+          study_universe_mesh: null,
+          universe: sceneUniverse,
+        })
+      : null;
+    const sceneRevision = scene.data?.scene_revision;
+    const resourceRevision = universe.data?.scene_revision;
+    const sceneIsNewer = Boolean(
+      sceneAuthoredBounds &&
+        sceneRevision != null &&
+        resourceRevision != null &&
+        sceneRevision > resourceRevision,
+    );
+    const authoredBounds = sceneIsNewer
+      ? sceneAuthoredBounds
+      : resourceAuthoredBounds ?? sceneAuthoredBounds;
+
+    return (
+      authoredBounds ??
+      fdmUniverseOutsideSupport?.universeBounds ??
+      (topologyCurrent ? resolveDomainBounds(domainMeta.data) : null)
+    );
+  }, [
+    domainMeta.data,
+    fdmUniverseOutsideSupport?.universeBounds,
+    scene.data?.scene_revision,
+    scene.data?.universe,
+    topologyCurrent,
+    universe.data,
+  ]);
+  // Unmaterialized domains publish placeholder bounds. Frame the authored
+  // Universe until current mesh data is available, not just the magnetic objects.
   const primaryResourceBounds =
+    fdmUniverseOutsideSupport?.universeBounds ??
+    (topologyCurrent ? resolveDomainBounds(domainMeta.data) : null) ??
+    universeRootSelectionBounds ??
     topologyBounds ??
-    (fdmUniverseOutsideSupport?.universeBounds ??
-      resolveDomainBounds(domainMeta.data) ??
-      universeBounds);
+    universeBounds;
   const resourceBounds =
     combineViewport3DBounds(
       [primaryResourceBounds, fdmMultilayerAirboxDomain?.bounds].filter(
@@ -3979,6 +4026,7 @@ export function useViewport3DSceneModel({
         fdmSelectionGrid,
         fdmUniverseOutsideSupport,
         sharedDomainManifest.data?.generation_id,
+        universeRootSelectionBounds,
       ),
     [
       selection,
@@ -3989,6 +4037,7 @@ export function useViewport3DSceneModel({
       fdmSelectionGrid,
       fdmUniverseOutsideSupport,
       sharedDomainManifest.data?.generation_id,
+      universeRootSelectionBounds,
     ],
   );
   const globalLayers = renderingState?.layers;
@@ -4264,16 +4313,16 @@ export function useViewport3DSceneModel({
       resolveTargetVisualization({
         snapshot: objectVisualizationSnapshot,
         target: AIRBOX_VISUALIZATION_TARGET,
-        visualizationState: femLaneActive ? renderingState : null,
+        visualizationState: renderingState,
       }).effectiveSettings,
-    [femLaneActive, objectVisualizationSnapshot, renderingState],
+    [objectVisualizationSnapshot, renderingState],
   );
   // Airbox is the public display target for both FDM paths.  The structured
   // outside-support id remains a carrier/query scope only; it must not own a
   // second set of display toggles.  A published multilayer Airbox uses its
   // target-only carrier, while legacy single-grid rendering uses these same
   // canonical settings for its inactive-cell model.
-  const fdmSingleGridAirboxSettings = fdmMultilayerAirboxDomain
+  const fdmSingleGridAirboxSettings = fdmMultilayerLayout.data?.available
     ? null
     : airboxSettings;
   const fdmVectorScale = fdmDomain
@@ -4953,7 +5002,10 @@ export function useViewport3DSceneModel({
   );
   const fieldVectorEnabled =
     liveViewportResourcesEnabled &&
-    (sessionDiscretization !== null || Boolean(analysisOverlay) || pinnedObservationActive) &&
+    // Published fields belong to the published domain, including the initial
+    // magnetization before Compute resolves a runtime lane. This opens the
+    // published-field data path; execution, availability and topology stay fenced.
+    (viewportDataDiscretization !== null || Boolean(analysisOverlay) || pinnedObservationActive) &&
     primaryFieldVectorEnabled &&
     hysteresisReplayMeshCompatibility.status !== "mismatch";
   const scalarRangeModeFlags = useMemo(
@@ -7035,6 +7087,12 @@ export function useViewport3DSceneModel({
     surfaceColorStatus: chunkedScalarColors.status,
     targetDiagnostics: fieldRenderModel?.targetDiagnostics,
     topologyRevision: topology.revision,
+    topologyIndexStatus:
+      savedSelectionActive || !femLaneActive
+        ? "idle"
+        : topologyIndexBundle.status === "unavailable"
+          ? "error"
+          : topologyIndexBundle.status,
     tracker: resourceCounts,
   });
   useEffect(() => {
@@ -7465,6 +7523,9 @@ export function useViewport3DSceneModel({
     topologyRevision: effectiveViewportTopologyRevision,
     visualizationDebugSource,
     topologyFreshness: effectiveViewportTopologyFreshness,
+    topologyIndexStatus: savedSelectionActive
+      ? "idle"
+      : topologyIndexBundle.status,
     topologyModel: effectiveViewportTopologyModel,
     vectorColorMode: effectiveViewportVectorColorMode,
     vectorScale: savedSelectionActive ? vectorScale : fdmVectorScale,

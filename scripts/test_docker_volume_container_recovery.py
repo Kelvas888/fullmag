@@ -172,7 +172,10 @@ class ContainerRecoveryTests(unittest.TestCase):
         argv = helper.call_args.args[0]
         self.assertIn("type=volume,src=" + volume["Name"] + ",dst=/host-ledger,readonly,volume-nocopy", argv)
         self.assertFalse(any(volume["Mountpoint"] in argument for argument in argv))
-        self.assertEqual(json.loads(argv[-1]), compose["services"]["backend"]["x-fullmag-host-ledger-volume"])
+        observation = json.loads(argv[-1])
+        self.assertEqual(observation["ledger_descriptor"], compose["services"]["backend"]["x-fullmag-host-ledger-volume"])
+        # No retained cancelled runs are pinned for this recovery.
+        self.assertIsNone(observation["retained_cancelled_runs"])
         self.assertEqual(volume["Options"]["device"],
                          compose["services"]["backend"]["x-fullmag-host-ledger-volume"]["device_alias"])
 

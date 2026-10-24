@@ -28,7 +28,11 @@ pub use owned_samples::*;
 
 pub const FEM_P1_GEOMETRY_SCHEMA: &str = "fullmag.fem_p1_field_geometry.v1";
 pub const MAX_FIELD_GEOMETRY_MANIFEST_BYTES: u64 = 1024 * 1024;
-pub const MAX_FEM_P1_GEOMETRY_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum byte length of the canonical persisted JSON geometry CAS object.
+pub const MAX_FEM_P1_GEOMETRY_BYTES: u64 = 256 * 1024 * 1024;
+/// 64 MiB-derived shape bound for node coordinates, cells, and facets. This
+/// remains independent from the larger serialized JSON object budget above.
+pub const MAX_FEM_P1_GEOMETRY_SHAPE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -113,9 +117,9 @@ impl SavedFemP1FieldGeometry {
         if self.schema_version != FEM_P1_GEOMETRY_SCHEMA || self.coordinate_unit != "m" {
             bail!("saved FEM P1 geometry schema or coordinate unit is invalid");
         }
-        if self.mesh.nodes.len() > MAX_FEM_P1_GEOMETRY_BYTES as usize / 24
-            || self.mesh.cells.len() > MAX_FEM_P1_GEOMETRY_BYTES as usize / 16
-            || self.mesh.facets.len() > MAX_FEM_P1_GEOMETRY_BYTES as usize / 12
+        if self.mesh.nodes.len() > MAX_FEM_P1_GEOMETRY_SHAPE_BYTES as usize / 24
+            || self.mesh.cells.len() > MAX_FEM_P1_GEOMETRY_SHAPE_BYTES as usize / 16
+            || self.mesh.facets.len() > MAX_FEM_P1_GEOMETRY_SHAPE_BYTES as usize / 12
             || self
                 .mesh
                 .nodes

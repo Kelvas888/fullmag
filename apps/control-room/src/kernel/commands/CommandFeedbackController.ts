@@ -9,6 +9,8 @@ export type CommandFeedbackTone = "error" | "info" | "success" | "warning";
 /** One foreground notice; `pending` notices describe an ACK, not completion. */
 export interface CommandFeedbackNotice {
   backendCommandId: string | null;
+  clientIntentId: string | null;
+  clientIntentKind: string | null;
   commandId: string;
   /** Stable identity across one invocation; duplicate delivery bumps `repeatCount`. */
   id: string;
@@ -35,8 +37,8 @@ export interface CommandFeedbackControllerOptions {
 }
 
 const OBSERVATION_TEXT: Record<NonNullable<CommandOutcomeEvent["observation"]>, string> = {
-  disconnected: "Connection lost before completion could be confirmed.",
-  "publication-unconfirmed": "Submitted; publication is not confirmed yet.",
+  disconnected: "Connection lost; command confirmation is pending.",
+  "publication-unconfirmed": "Submission confirmation is pending. The command was not sent again.",
   waiting: "Accepted; waiting for the backend to finish.",
 };
 
@@ -106,16 +108,74 @@ export class CommandFeedbackController {
   observeCommandQueue(queue: CommandQueueStatusResource, sessionScopeKey: string | null): void {
     if (!sessionScopeKey || sessionScopeKey !== this.currentScopeKey()) return;
     const terminalNotices: CommandFeedbackNotice[] = [];
-    for (const [key, notice] of this.pendingBackendCommands) {
-      if (notice.sessionScopeKey !== sessionScopeKey || !notice.backendCommandId) continue;
-      const record = queue.commands.find((entry) => entry.command_id === notice.backendCommandId);
+    for (const [key, originalNotice] of [...this.pendingBackendCommands]) {
+      if (originalNotice.sessionScopeKey !== sessionScopeKey) continue;
+
+      let notice = originalNotice;
+      let trackingKey = key;
+      let record: CommandQueueStatusResource["commands"][number] | undefined;
+      if (notice.backendCommandId) {
+        const commandRecords = queue.commands.filter(
+          (entry) => entry.command_id === notice.backendCommandId,
+        );
+        if (commandRecords.length !== 1) continue;
+        record = commandRecords[0];
+        if (
+          (notice.clientIntentKind && record.kind !== notice.clientIntentKind) ||
+          (notice.clientIntentId && record.client_intent_id != null && record.client_intent_id !== notice.clientIntentId)
+        ) {
+          continue;
+        }
+        if (notice.clientIntentId && record.client_intent_id === notice.clientIntentId) {
+          const intentRecords = queue.commands.filter(
+            (entry) => entry.client_intent_id === notice.clientIntentId,
+          );
+          if (
+            intentRecords.length !== 1 ||
+            intentRecords[0].command_id !== notice.backendCommandId ||
+            intentRecords[0].kind !== notice.clientIntentKind
+          ) {
+            continue;
+          }
+        }
+      } else {
+        if (!notice.clientIntentId || !notice.clientIntentKind) continue;
+        const pendingSameIntent = [...this.pendingBackendCommands.values()].filter(
+          (candidate) =>
+            candidate.sessionScopeKey === sessionScopeKey &&
+            candidate.clientIntentId === notice.clientIntentId,
+        );
+        if (pendingSameIntent.length !== 1) continue;
+        const intentRecords = queue.commands.filter(
+          (entry) => entry.client_intent_id === notice.clientIntentId,
+        );
+        if (
+          intentRecords.length !== 1 ||
+          intentRecords[0].kind !== notice.clientIntentKind ||
+          !intentRecords[0].command_id ||
+          queue.commands.filter((entry) => entry.command_id === intentRecords[0].command_id).length !== 1
+        ) {
+          continue;
+        }
+        record = intentRecords[0];
+        notice = {
+          ...notice,
+          backendCommandId: record.command_id,
+          message: "Command accepted; waiting for the backend result.",
+        };
+        this.pendingBackendCommands.delete(key);
+        trackingKey = pendingTrackingIdentity(notice);
+        this.pendingBackendCommands.set(trackingKey, notice);
+        this.upsertMany([notice]);
+      }
+
       if (!record || !["completed", "failed", "rejected", "cancelled"].includes(record.status)) continue;
       // A completed journal entry may carry a failed/cancelled completion.
       const status = record.status === "completed"
         ? record.completion_status ?? record.status
         : record.status;
       if (!["completed", "failed", "rejected", "cancelled"].includes(status)) continue;
-      this.pendingBackendCommands.delete(key);
+      this.pendingBackendCommands.delete(trackingKey);
       const terminalStatus = status === "completed"
         ? "completed"
         : status === "cancelled"
@@ -193,7 +253,11 @@ export class CommandFeedbackController {
   }
 
   private upsert(notice: CommandFeedbackNotice): void {
-    if (notice.status === "pending" && notice.backendCommandId !== null) {
+    if (
+      notice.status === "pending" &&
+      (notice.backendCommandId !== null ||
+        (notice.clientIntentId !== null && notice.clientIntentKind !== null))
+    ) {
       this.pendingBackendCommands.set(pendingTrackingIdentity(notice), notice);
     }
     this.upsertMany([notice]);
@@ -243,6 +307,8 @@ function noticeFromOutcome(event: CommandOutcomeEvent): CommandFeedbackNotice {
   const message = event.message?.trim() ? event.message : fallback;
   return {
     backendCommandId: event.backendCommandId,
+    clientIntentId: event.clientIntentId,
+    clientIntentKind: event.clientIntentKind,
     commandId: event.commandId,
     // Each invocation has its own stable identity through ACK and completion.
     id: noticeIdentity(event.commandId, event.backendCommandId, event.invocationId),
@@ -277,7 +343,13 @@ function noticeIdentity(commandId: string, backendCommandId: string | null, invo
 }
 
 function pendingTrackingIdentity(notice: CommandFeedbackNotice): string {
-  return JSON.stringify([notice.sessionScopeKey, notice.backendCommandId, notice.invocationId]);
+  return JSON.stringify([
+    notice.sessionScopeKey,
+    notice.backendCommandId,
+    notice.clientIntentId,
+    notice.clientIntentKind,
+    notice.invocationId,
+  ]);
 }
 
 function noticeTitle(title: string, status: CommandOutcomeEvent["status"]): string {

@@ -162,7 +162,11 @@ class UnknownActivationTests(unittest.TestCase):
             module._validate_unresolved_activation(
                 Control(), record, expected={**expected, "source_root": "C:/other"}
             )
-        with patch.object(module, "_read_json", return_value=record):
+        # Only the unresolved activation exists; no preparation was aborted.
+        def read_json(_control, relative, optional=False):
+            return record if relative == "activation/unresolved.json" else None
+
+        with patch.object(module, "_read_json", side_effect=read_json):
             with self.assertRaisesRegex(BuildControlError, "unknown outcome"):
                 module.assert_no_unresolved_activation(
                     Control(),

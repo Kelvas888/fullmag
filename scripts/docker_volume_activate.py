@@ -51,6 +51,7 @@ RETIREMENT_REFUSAL_CODES = frozenset({
     "live_retirement_current_mismatch",
     "live_retirement_runtime_not_terminal",
     "live_retirement_busy",
+    "live_retirement_capture_failed",
 })
 RETIREMENT_REFUSAL_EXIT = 78
 
@@ -159,6 +160,7 @@ if retirement_operation_id:
             "live_retirement_current_mismatch",
             "live_retirement_runtime_not_terminal",
             "live_retirement_busy",
+            "live_retirement_capture_failed",
         }
         if (
             retirement_only
@@ -399,6 +401,7 @@ def _validate_running_group(
     image: str,
     *,
     source_root: str | None = None,
+    require_healthy: bool = True,
 ) -> tuple[str, str]:
     if not isinstance(document, Mapping):
         raise BuildControlError("Retained Compose configuration is not an object")
@@ -478,7 +481,7 @@ def _validate_running_group(
         raise BuildControlError("Retained backend source identity differs from its readonly bind")
     if source_root is not None and not _same_host_path(source_identity, source_root):
         raise BuildControlError("Retained backend source differs from the selected source")
-    if (
+    if require_healthy and (
         json.loads(_docker_text("inspect", ids["backend"]))[0]
         .get("State", {})
         .get("Health", {})
@@ -1645,7 +1648,7 @@ def _resume_retained_retirement(
     )
 
 
-def activate(args: argparse.Namespace) -> None:
+def activate(args: argparse.Namespace) -> dict[str, object]:
     from docker_dev import _compose_identity, _select_source
     from docker_dev_host import require_host
 
@@ -1859,6 +1862,7 @@ def activate(args: argparse.Namespace) -> None:
         # durable.  A committed API result with a failed receipt publication
         # must not look like a safe retry.
         _record_activation_result(operation, result)
+        return dict(result)
 
 
 def _parser() -> argparse.ArgumentParser:

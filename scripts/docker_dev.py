@@ -67,6 +67,7 @@ BASE_CONTEXT_FILES = (
     ("windows_folder_probe.py", "docker/all-in-one/windows_folder_probe.py"),
     ("linux_native_probe.py", "docker/all-in-one/linux_native_probe.py"),
     ("runtime_service.py", "docker/all-in-one/runtime_service.py"),
+    ("runtime_service_unclaimed_cancellation.py", "docker/all-in-one/runtime_service_unclaimed_cancellation.py"),
     ("frontend_dev.py", "docker/all-in-one/frontend_dev.py"),
     ("healthcheck.py", "docker/all-in-one/healthcheck.py"),
     ("docker_startup_script.py", "scripts/docker_startup_script.py"),
@@ -1814,12 +1815,16 @@ def _assert_no_running_fullmag(
     if owned_control is not None:
         required_control_fields = {"name", "image", "volume", "attempt"}
         if (not isinstance(owned_control, Mapping)
-                or set(owned_control) != required_control_fields):
+                or set(owned_control) not in (required_control_fields, required_control_fields | {"namespace"})):
             raise _fail("Owned build-control identity must contain exactly name, image, volume, and attempt")
         control_name = owned_control["name"]
         control_image = owned_control["image"]
         control_volume = owned_control["volume"]
         control_attempt = owned_control["attempt"]
+        control_namespace = owned_control.get("namespace", "")
+        if not isinstance(control_namespace, str) or (
+                control_namespace and re.fullmatch(r"namespaces/[0-9a-f]{32}", control_namespace) is None):
+            raise _fail("Owned build-control namespace is not canonical")
         if (not isinstance(control_attempt, str)
                 or re.fullmatch(r"[0-9a-f]{32}", control_attempt) is None
                 or not isinstance(control_name, str)
@@ -1901,13 +1906,27 @@ def _assert_no_running_fullmag(
                     or labels.get("com.docker.compose.service") != "build-control"
                     or any(labels.get(key) != value for key, value in expected_labels.items())
                     or not isinstance(mounts, list)
-                    or len(mounts) != 1):
+                    or len(mounts) != (2 if control_namespace else 1)):
                 return False
-            mount = mounts[0]
-            return (isinstance(mount, Mapping)
-                    and mount.get("Type") == "volume"
-                    and mount.get("Name") == control_volume
-                    and mount.get("Destination") == "/control")
+            by_target = {mount.get("Destination"): mount for mount in mounts if isinstance(mount, Mapping)}
+            expected_targets = {"/control", "/registry"} if control_namespace else {"/control"}
+            if set(by_target) != expected_targets:
+                return False
+            for destination, mount in by_target.items():
+                if (mount.get("Type") != "volume" or mount.get("Name") != control_volume
+                        or mount.get("RW") is not (destination == "/control")):
+                    return False
+            declared = host_config.get("Mounts")
+            if not isinstance(declared, list) or len(declared) != len(expected_targets):
+                return False
+            for mount in declared:
+                if not isinstance(mount, Mapping) or mount.get("Target") not in expected_targets:
+                    return False
+                expected_subpath = control_namespace if mount["Target"] == "/control" else ""
+                if (mount.get("Source") != control_volume or mount.get("Type") != "volume"
+                        or (mount.get("VolumeOptions") or {}).get("Subpath", "") != expected_subpath):
+                    return False
+            return True
 
         matches = [document for document in documents
                    if isinstance(document, Mapping) and is_owned_control(document)]
@@ -2485,6 +2504,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=_repo_default(),
                         help="main Fullmag checkout used for storage and Compose definitions")
     subparsers = parser.add_subparsers(dest="action", required=True)
+    empty_quarantine = subparsers.add_parser(
+        "quarantine-empty-stopped",
+        help="quarantine one empty session after an abrupt stop; preserve old evidence and never replay activation",
+    )
+    empty_quarantine.add_argument("--source-root", type=Path, required=True)
+    empty_quarantine.add_argument("--activation", required=True)
+    empty_quarantine.add_argument("--recovery-id", required=True)
+    empty_quarantine.add_argument("--apply", action="store_true", help="commit after exact stopped-namespace and empty-store proofs; default is dry-run")
     resume_parser = subparsers.add_parser("resume-volume", help="Observe one exact retained volume DEV start without restarting backend")
     resume_parser.add_argument("--attempt", required=True)
     resume_parser.add_argument("--config-sha256", required=True)
@@ -2527,6 +2554,18 @@ def _parser() -> argparse.ArgumentParser:
     frontend_refresh.add_argument("--config-sha256", required=True)
     frontend_refresh.add_argument("--source-root", type=Path, required=True)
     frontend_refresh.add_argument("--port", type=int, required=True)
+    run_script_parser = subparsers.add_parser(
+        "run-script",
+        help="run one script in the managed DEV group and observe its result; keep API/frontend running",
+    )
+    run_script_parser.add_argument("--script", type=Path, required=True)
+    run_script_parser.add_argument("--source-root", type=Path)
+    run_script_parser.add_argument("--port", type=int)
+    run_script_parser.add_argument("--request-id")
+    run_script_parser.add_argument(
+        "--timeout-seconds", type=float, default=None,
+        help="optional observation deadline; expiration does not cancel or replay the script",
+    )
     idle_restart = subparsers.add_parser("restart-idle-volume", help="Restart the pinned healthy backend only while no session is active")
     idle_restart.add_argument("--attempt", required=True)
     idle_restart.add_argument("--config-sha256", required=True)
@@ -2535,6 +2574,10 @@ def _parser() -> argparse.ArgumentParser:
     idle_restart.add_argument("--saved-authoring-checkpoint")
     idle_restart.add_argument("--saved-authoring-checkpoint-sha256")
     idle_restart.add_argument("--stop-only", action="store_true", help="Drain and stop the pinned backend without restarting it")
+    idle_restart.add_argument(
+        "--allow-prepared-session", action="store_true",
+        help="allow graceful drain with never-started manual Studies, including held queue entries after a terminal task; retain accepted inputs and never release Solve",
+    )
     resources = subparsers.add_parser(
         "increase-resources", help="increase a pinned pre-API backend's budget without restarting its build"
     )
@@ -2580,6 +2623,52 @@ def _parser() -> argparse.ArgumentParser:
     stop_unadmitted.add_argument("--source-sha256", required=True)
     stop_unadmitted.add_argument("--request-id", required=True)
     stop_unadmitted.add_argument("--session-id", required=True)
+    stop_diagnostic = subparsers.add_parser(
+        "stop-diagnostic-volume",
+        help="stop one pinned backend that retains only its failed-owner diagnostic API",
+    )
+    stop_diagnostic.add_argument("--attempt", required=True)
+    stop_diagnostic.add_argument("--config-sha256", required=True)
+    stop_diagnostic.add_argument("--source-root", type=Path, required=True)
+    stop_diagnostic.add_argument("--port", type=int, required=True)
+    stop_diagnostic.add_argument(
+        "--resume-attempt",
+        help="exact successful retained resume attempt that pins the current backend start time",
+    )
+    stop_diagnostic.add_argument(
+        "--iteration-attempt",
+        help="exact successful retained idle-restart iteration that pins the current backend start time; mutually exclusive with --resume-attempt",
+    )
+    stop_diagnostic.add_argument(
+        "--reconcile-read-attempt",
+        help="reconcile one exact preflight control-read timeout before beginning a new stop attempt",
+    )
+    stop_diagnostic.add_argument(
+        "--pending-activation",
+        help="close one exact unreleased preparation after native owner failure; permits only subsequent fresh-state archival",
+    )
+    stop_held = subparsers.add_parser(
+        "stop-held-retirement-volume",
+        help="preview a pinned diagnostic backend drain; apply requires an explicit UI-reset acknowledgement and plan digest",
+    )
+    stop_held.add_argument("--attempt", required=True)
+    stop_held.add_argument("--iteration-attempt", required=True)
+    stop_held.add_argument("--activation-attempt", required=True)
+    stop_held.add_argument("--config-sha256", required=True)
+    stop_held.add_argument("--source-root", type=Path, required=True)
+    stop_held.add_argument("--port", type=int, required=True)
+    stop_held.add_argument("--apply", action="store_true")
+    stop_held.add_argument("--allow-ui-reset", action="store_true")
+    stop_held.add_argument("--expected-plan-sha256")
+    stop_bootstrap = subparsers.add_parser(
+        "stop-bootstrap-volume",
+        help="stop one pinned backend retaining only its exact pre-owner startup-fenced diagnostic API",
+    )
+    stop_bootstrap.add_argument("--attempt", required=True)
+    stop_bootstrap.add_argument("--config-sha256", required=True)
+    stop_bootstrap.add_argument("--resume-attempt", required=True)
+    stop_bootstrap.add_argument("--source-root", type=Path, required=True)
+    stop_bootstrap.add_argument("--port", type=int, required=True)
     recreate_volume = subparsers.add_parser("recreate-volume", help="Replace exact stopped-backend DEV services while retaining Docker caches")
     recreate_volume.add_argument("--attempt", required=True)
     recreate_volume.add_argument("--config-sha256", required=True)
@@ -2612,9 +2701,85 @@ def _parser() -> argparse.ArgumentParser:
     )
     recreate_volume.add_argument("--completed-recreation-attempt", help="Continue this exact succeeded removal without repeating rm")
     recreate_volume.add_argument("--completed-recreation-sha256", help="SHA-256 of the completed removal terminal receipt")
-    recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the old host storage root and create a fresh one")
+    recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the previous session and archive its runtime state before starting an empty session")
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
                                  include_untracked=None, script=None)
+
+    cancel_unclaimed = subparsers.add_parser(
+        "cancel-unclaimed-volume",
+        help=(
+            "cancel one explicitly named accepted/queued task through a one-shot "
+            "managed backend maintenance start; never start its API or solver"
+        ),
+    )
+    cancel_unclaimed.add_argument("--attempt", required=True,
+                                  help="exact retained development attempt to replace")
+    cancellation_resume = cancel_unclaimed.add_mutually_exclusive_group()
+    cancellation_resume.add_argument(
+        "--resume-maintenance-attempt",
+        metavar="OPERATION_UUID",
+        help=(
+            "resume only the exact failed-confirmed pre-start maintenance attempt "
+            "after its pinned old services are already absent"
+        ),
+    )
+    cancellation_resume.add_argument(
+        "--resume-native-failure-attempt",
+        metavar="OPERATION_UUID",
+        help=(
+            "continue only the exact failed native cancellation start after proving "
+            "its cancellation intent was not published"
+        ),
+    )
+    cancel_unclaimed.add_argument(
+        "--failed-backend-container-id",
+        help="full backend container ID from the exact failed native maintenance attempt",
+    )
+    cancel_unclaimed.add_argument("--config-sha256", required=True,
+                                  help="canonical SHA-256 of that attempt's retained Compose document")
+    cancel_unclaimed.add_argument("--source-root", type=Path, required=True,
+                                  help="exact registered checkout mounted by the retained group")
+    cancel_unclaimed.add_argument("--port", type=int, required=True,
+                                  help="explicit retained frontend loopback port")
+    cancel_unclaimed.add_argument("--request-id", required=True,
+                                  help="canonical UUID used as the durable task-cancellation ID")
+    cancel_unclaimed.add_argument("--run-id", required=True,
+                                  help="exact accepted run containing the unclaimed task")
+    cancel_unclaimed.add_argument("--task-id", required=True,
+                                  help="exact Accepted or Queued task to cancel")
+    cancel_unclaimed.add_argument("--reason", required=True,
+                                  help="bounded durable reason for this explicit cancellation")
+    cancel_unclaimed.add_argument(
+        "--include-untracked", action="append", default=None,
+        help="include one exact untracked source file in the managed backend build; repeat as needed",
+    )
+    cancel_unclaimed.set_defaults(
+        profile="dev", image=None, toolchain_image=None, source_manifest=None,
+        include_untracked=None, script=None, fresh_state=False,
+        migrate_host_capacity=False,
+    )
+
+    recover_cancelled = subparsers.add_parser(
+        "recover-cancelled-volume",
+        help=(
+            "recover one retained Unknown runtime after a typed unclaimed-task cancellation; "
+            "never replay the cancelled task"
+        ),
+    )
+    recover_cancelled.add_argument("--attempt", required=True,
+                                   help="successful managed cancellation attempt UUID")
+    recover_cancelled.add_argument("--cancellation-terminal-sha256", required=True,
+                                   help="raw SHA-256 of that exact successful terminal receipt")
+    recover_cancelled.add_argument("--request-id", required=True,
+                                   help="canonical UUID of the completed cancellation request")
+    recover_cancelled.add_argument("--source-root", type=Path, required=True,
+                                   help="exact registered checkout mounted by the retained group")
+    recover_cancelled.add_argument("--port", type=int, required=True,
+                                   help="explicit retained frontend loopback port")
+    recover_cancelled.add_argument(
+        "--include-untracked", action="append", default=None,
+        help="include one exact untracked source file in the managed backend build; repeat as needed",
+    )
 
     for name in ("build", "up"):
         command = subparsers.add_parser(name, help=(
@@ -2761,6 +2926,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "stop-unadmitted":
             from docker_volume_stop_unadmitted import stop
             stop(args)
+        elif args.action == "stop-diagnostic-volume":
+            from docker_volume_stop_diagnostic import stop_diagnostic
+            result = stop_diagnostic(args)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif args.action == "stop-held-retirement-volume":
+            from docker_volume_stop_held_retirement import apply, plan
+            from docker_volume_retirement_probe import inspect_retirement
+            if args.apply:
+                result = apply(args)
+            else:
+                if args.allow_ui_reset or args.expected_plan_sha256 is not None:
+                    raise _fail("Apply acknowledgement and plan digest require --apply")
+                result = plan(inspect_retirement(args))
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif args.action == "stop-bootstrap-volume":
+            from docker_volume_stop_bootstrap import stop_bootstrap
+            result = stop_bootstrap(args)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.action == "recreate-volume":
             if bool(args.completed_recreation_attempt) != bool(args.completed_recreation_sha256):
                 raise _fail("completed recreation requires both attempt and terminal SHA-256")
@@ -2779,6 +2962,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 from docker_volume_dev import recreate as recreate_volume
                 recreate_volume(args)
+        elif args.action == "cancel-unclaimed-volume":
+            from docker_volume_unclaimed_cancellation import cancel_unclaimed
+            cancel_unclaimed(args)
+        elif args.action == "recover-cancelled-volume":
+            from docker_volume_cancelled_recovery import recover_cancelled
+            recover_cancelled(args)
+        elif args.action == "quarantine-empty-stopped":
+            from docker_volume_empty_quarantine import quarantine
+            quarantine(args)
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)
@@ -2788,6 +2980,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "script":
             from docker_dev_defaults import activate_discovered
             activate_discovered(args)
+        elif args.action == "run-script":
+            from docker_dev_run_script import run_script
+            result = run_script(
+                args.repo_root, args.script, source_root=args.source_root,
+                port=args.port, request_id=args.request_id,
+                timeout_seconds=args.timeout_seconds,
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return int(result["exit_code"])
         elif args.action == "up":
             up(args)
         elif args.action == "recreate":

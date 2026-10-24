@@ -200,19 +200,6 @@ fn map_scheduler_callback_error(
     ExecutionError::Invalid(error.to_string())
 }
 
-fn persist_checkpoint_anyhow(
-    store: &SessionStore,
-    claim: &TaskClaim,
-    checkpoint: &WorkerInboxCheckpoint,
-) -> anyhow::Result<()> {
-    persist_checkpoint_anyhow_until(
-        store,
-        claim,
-        checkpoint,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-}
-
 fn persist_checkpoint_anyhow_until(
     store: &SessionStore,
     claim: &TaskClaim,
@@ -240,8 +227,16 @@ fn persist_checkpoint(
     claim: &TaskClaim,
     checkpoint: &WorkerInboxCheckpoint,
 ) -> Result<(), ExecutionError> {
-    persist_checkpoint_anyhow(store, claim, checkpoint)
-        .map_err(|error| ExecutionError::Invalid(error.to_string()))
+    // `receive`/`confirm_applied` run in the worker process, which waits for
+    // the shared writer instead of failing its task (see
+    // `WORKER_STORE_WRITER_WAIT`); the scheduler adapters keep five seconds.
+    persist_checkpoint_anyhow_until(
+        store,
+        claim,
+        checkpoint,
+        std::time::Instant::now() + crate::WORKER_STORE_WRITER_WAIT,
+    )
+    .map_err(|error| ExecutionError::Invalid(error.to_string()))
 }
 
 #[cfg(test)]

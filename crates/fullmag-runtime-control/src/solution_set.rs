@@ -53,6 +53,15 @@ pub(crate) fn reconcile_study_solution(
     claim: &TaskClaim,
     task: &fullmag_application::TaskRecord,
 ) -> Result<()> {
+    let Some((execution_status, assessment)) = terminal_solution_state(task)? else {
+        return Ok(());
+    };
+    let Some(artifact_catalog) = store.read_artifact_catalog(claim.run_id.as_str())? else {
+        return Ok(());
+    };
+    if !has_attempt_manifest(&artifact_catalog, claim) {
+        return Ok(());
+    }
     let Some(intent) = store.read_run_intent(claim.run_id.as_str())? else {
         return Ok(());
     };
@@ -81,17 +90,21 @@ pub(crate) fn reconcile_study_solution(
     }
     let step_id = accepted_step_id
         .context("accepted study solution task is not a step in the accepted plan")?;
-    let Some(artifact_catalog) = store.read_artifact_catalog(claim.run_id.as_str())? else {
-        return Ok(());
-    };
-    if !has_attempt_manifest(&artifact_catalog, claim) {
+    crate::study::validate_study_task_completion(store, claim)?;
+    // An unsuccessful attempt may have published its typed output manifest
+    // before portable-result conversion failed. Its terminal event must not
+    // run that conversion again and turn the same task error into a scheduler
+    // failure. Retain the catalog/CAS outputs and original task diagnostic;
+    // only close a portable solution that was actually published beforehand.
+    // Successful completion still requires the complete publication barrier.
+    if execution_status != SolutionExecutionStatus::Succeeded
+        && store
+            .solution_sets()
+            .read(&solution_set_id_for_claim(claim))?
+            .is_none()
+    {
         return Ok(());
     }
-    crate::study::validate_study_task_completion(store, claim)?;
-
-    let Some((execution_status, assessment)) = terminal_solution_state(task)? else {
-        return Ok(());
-    };
     let solution = build_solution(
         store,
         &accepted,
@@ -183,6 +196,18 @@ fn has_attempt_manifest(catalog: &FmsArtifactCatalog, claim: &TaskClaim) -> bool
     })
 }
 
+fn solution_set_id_for_claim(claim: &TaskClaim) -> String {
+    format!(
+        "solution-{}",
+        fullmag_session::canonical_json_sha256(&serde_json::json!({
+            "run_id": claim.run_id.as_str(),
+            "task_id": claim.task_id.as_str(),
+            "attempt_id": claim.attempt_id.as_str(),
+            "ownership_epoch": claim.ownership_epoch.value(),
+        }))
+    )
+}
+
 fn build_solution(
     store: &SessionStore,
     accepted: &AcceptedStudySnapshot,
@@ -250,15 +275,7 @@ fn build_solution(
         .as_ref()
         .with_context(|| format!("accepted study step `{step_id}` has no resolved plan"))?;
 
-    let solution_set_id = format!(
-        "solution-{}",
-        fullmag_session::canonical_json_sha256(&serde_json::json!({
-            "run_id": claim.run_id.as_str(),
-            "task_id": task_id,
-            "attempt_id": attempt_id,
-            "ownership_epoch": ownership_epoch,
-        }))
-    );
+    let solution_set_id = solution_set_id_for_claim(claim);
     let provenance = SolutionSetProvenance {
         run_spec_digest: prefixed_digest(accepted.run.specification.fingerprint()?),
         model_digest: canonical_digest(&serde_json::json!({

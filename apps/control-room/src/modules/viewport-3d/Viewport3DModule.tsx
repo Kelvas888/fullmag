@@ -2730,7 +2730,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           ? JSON.stringify(sceneProps.fdmDomain.bounds)
           : ""
       }
-      data-fdm-model-count={String(sceneProps.fdmInstanceModel?.count ?? 0)}
+      data-fdm-model-count={String(
+        sceneProps.fdmNativeLayerViews.length > 0
+          ? sceneProps.fdmNativeLayerViews.reduce((count, view) => count + (view.model?.count ?? 0), 0)
+          : sceneProps.fdmInstanceModel?.count ?? 0,
+      )}
       data-fdm-vector-segment-count={String(
         Math.floor((sceneProps.fdmVectorSegments?.length ?? 0) / 7),
       )}

@@ -16,6 +16,7 @@ pub mod fields;
 #[allow(dead_code)]
 pub mod frozen_spins;
 pub mod hysteresis;
+pub mod instances;
 pub mod logs;
 pub mod materialized_dataset;
 pub mod materialized_dataset_slice;
@@ -36,6 +37,7 @@ pub mod runtime_service;
 pub mod saved_field_geometry;
 pub mod scalars;
 #[allow(dead_code)]
+pub mod session_clients;
 pub mod sessions;
 pub mod solutions;
 pub mod status;

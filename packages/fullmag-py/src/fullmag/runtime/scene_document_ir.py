@@ -84,6 +84,8 @@ _STUDY_FIELDS = frozenset(
         "table_autosave",
         "output_storage",
         "initial_state",
+        # Preserved by the canonical renderer as presentation metadata only.
+        "visualization_hint",
     }
 )
 _TABLE_AUTOSAVE_FIELDS = frozenset(

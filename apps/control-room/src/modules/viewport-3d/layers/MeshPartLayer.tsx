@@ -65,6 +65,7 @@ import type {
   Viewport3DTopologyPartRenderModel,
   Viewport3DTopologyRenderModel,
 } from "../viewport3dRenderModel";
+import { buildViewport3DRenderableMeshPartKey } from "../viewport3dRenderModel";
 import type { Viewport3DColors } from "../viewport3dTypes";
 import { BoundsBox } from "./BoundsLayers";
 import { VectorFieldLayer } from "./VectorFieldLayer";
@@ -576,6 +577,8 @@ export const MeshPartLayer = memo(function MeshPartLayer({
   topologyModel,
   tracker,
   vectorStyle,
+  onRenderableGeometryChange,
+  renderableGeometryStageVisible,
 }: {
   adoptionRegistry?: Viewport3DRenderAdoptionRegistry;
   colors: Viewport3DColors;
@@ -598,6 +601,11 @@ export const MeshPartLayer = memo(function MeshPartLayer({
   topologyModel: Viewport3DTopologyRenderModel | null;
   tracker: Viewport3DResourceTracker;
   vectorStyle: VectorFieldLayerVectorStyle;
+  onRenderableGeometryChange?: (
+    renderableGeometryKey: string,
+    ready: boolean,
+  ) => void;
+  renderableGeometryStageVisible: boolean;
 }) {
   const invalidate = useBatchedInvalidate();
   const renderSettings = settings;
@@ -1150,6 +1158,38 @@ export const MeshPartLayer = memo(function MeshPartLayer({
     return () => onGeometryReady?.(partModel, false);
   }, [geometry, hasAnyVisibleRenderableSubLayer, onGeometryReady, partModel,
     surfaceIndices, surfaceOwners, topologyModel]);
+  const hasRenderableSurfaceOrEdgeGeometry =
+    renderableGeometryStageVisible &&
+    ((renderSettings.visible &&
+      (modalSurfaceActive || renderPlan.surface.visible) &&
+      Boolean(geometry)) ||
+      (renderPlan.wireframe.visible && Boolean(edgeGeometry)));
+  useLayoutEffect(() => {
+    if (!onRenderableGeometryChange) return undefined;
+    onRenderableGeometryChange(
+      buildViewport3DRenderableMeshPartKey(
+        part.id,
+        topologyModel,
+        sessionIdentity,
+      ),
+      hasRenderableSurfaceOrEdgeGeometry,
+    );
+    return () =>
+      onRenderableGeometryChange(
+        buildViewport3DRenderableMeshPartKey(
+          part.id,
+          topologyModel,
+          sessionIdentity,
+        ),
+        false,
+      );
+  }, [
+    hasRenderableSurfaceOrEdgeGeometry,
+    onRenderableGeometryChange,
+    part.id,
+    sessionIdentity,
+    topologyModel,
+  ]);
 
   if (
     (!renderSettings.visible && !modalSurfaceActive && !modalVectorsActive) ||

@@ -81,7 +81,7 @@ pub struct HysteresisExecutionTreeQuery {
 pub async fn get_simulation_preparation(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SimulationPreparationResource>, ApiError> {
-    let request_context = crate::capture_current_live_request_context(&state).await?;
+    let request_context = crate::capture_current_live_read_context(&state).await?;
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
@@ -2198,6 +2198,16 @@ fn runtime_command_disabled_reason(
         // command routing in `commands.rs`, which rejects Pause and routes
         // Stop to durable task cancellation (including pre-claim states).
         match kind {
+            "solve" if snapshot.run.as_ref().is_some_and(|run| {
+                matches!(run.status.as_str(), "waiting_for_compute" | "waiting_for_solve")
+                    && !crate::live_accepted_execution::accepted_frontier_preparation_is_ready(
+                        snapshot.simulation_preparation.as_ref(),
+                        snapshot.mesh_workspace.as_ref(),
+                        &run.run_id,
+                    )
+            }) => {
+                return Some("Accepted preparation is pending; Compute remains held.".into());
+            }
             "pause" => return Some(ACCEPTED_PAUSE_UNSUPPORTED_REASON.into()),
             "stop" => return accepted_stop_disabled_reason(snapshot),
             "compute_fields" | "compute_energies" => {

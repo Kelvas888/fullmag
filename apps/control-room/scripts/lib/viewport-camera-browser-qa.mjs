@@ -107,6 +107,63 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
       embedPng: true,
     }));
 
+    // The ring example reproduces the original depth regression: the eye is
+    // inside the universe bounds, while the 50 nm ring and 1.6 nm film are ahead.
+    if (options.ringDepthRegression === true) {
+      const originalRibbonTabId = await page.locator('.fm-ribbon__tab[aria-selected="true"]').getAttribute("id");
+      if (!/^fm-ribbon-tab-[a-zA-Z0-9_.:-]+$/.test(originalRibbonTabId ?? "")) {
+        throw new Error("Selected ribbon tab has no stable identity");
+      }
+      await setCameraDialogOpen(page, cameraDialog, false, timeout);
+      const originalSurfacePasses = await readSurfacePasses(page, timeout);
+      try {
+        for (const pose of [
+          { name: "ring-close-oblique", position: [1.6710714031932422e-7, -6.101199092239823e-7, 2.0428454917790962e-7], target: [0, 0, 1.55e-7], projection: "perspective" },
+          { name: "ring-close-front", position: [6e-7, 0, 1.608e-7], target: [0, 0, 1.608e-7], projection: "perspective" },
+          { name: "ring-close-ortho", position: [6e-7, 0, 1.608e-7], target: [0, 0, 1.608e-7], projection: "orthographic" },
+        ]) {
+          await setCameraDialogOpen(page, cameraDialog, true, timeout);
+          await fillVector(cameraDialog, "Position (m)", pose.position);
+          await fillVector(cameraDialog, "Target (m)", pose.target);
+          await getProjectionInput(cameraDialog).selectOption(pose.projection);
+          await getScalarInput(cameraDialog, "FOV").fill("45");
+          await getScalarInput(cameraDialog, "Ortho scale").fill("6e-7");
+          mutationStarted = true;
+          await cameraDialog.getByRole("button", { exact: true, name: "Apply" }).click({ timeout });
+          await waitForCamera(page, viewport, pose, timeout);
+          for (const mode of ["Shaded surface", "Shaded + wireframe", "Wireframe"]) {
+            await setCameraDialogOpen(page, cameraDialog, false, timeout);
+            await setSurfaceRenderMode(page, mode, timeout);
+            const capture = await captureCanvas(page, {
+              assertCanvas, cameraDialog, canvas,
+              name: `${pose.name}-${mode.toLowerCase().replace(/[^a-z]+/g, "-")}`, pngDecoder,
+              preserveDialogOpen: true, timeout, snapshots, embedPng: true,
+            });
+            capture.surface_render_mode = mode;
+            const { near, far } = capture.live_depth_range;
+            const depth = distance(pose.position, pose.target);
+            const resolution = pose.projection === "orthographic"
+              ? (far - near) / (2 ** 24 - 1)
+              : (depth * depth * (far - near)) / (far * near * (2 ** 24 - 1));
+            if (near >= depth / 10 || far <= depth || resolution > 1.6e-9 / 20) {
+              throw new Error(`Ring depth range loses thin-film precision at ${pose.name}: ${JSON.stringify({ near, far, resolution })}`);
+            }
+            capture.estimated_24bit_depth_step_m = resolution;
+            captures.push(capture);
+            // This fixed fixture has a red CoFeB ring. HUD axes alone must not
+            // qualify a blank canvas after a topology resource failure.
+            if (mode !== "Wireframe") assertRingSurfacePixels(capture);
+          }
+        }
+      } finally {
+        await setCameraDialogOpen(page, cameraDialog, false, timeout);
+        await restoreSurfacePasses(page, originalSurfacePasses, timeout);
+        await page.locator(`.fm-ribbon__tab[id="${originalRibbonTabId}"]`).click({ timeout });
+        await setCameraDialogOpen(page, cameraDialog, true, timeout);
+      }
+      await restoreCamera(page, cameraDialog, originalCamera, originalDialogValues, timeout);
+    }
+
     const pointerRadius = distance(originalCamera.position, originalCamera.target);
     const pointerDirection = normalize([1, 0.1, 0.1]);
     const pointerPosition = originalCamera.target.map((value, index) =>
@@ -384,6 +441,55 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
   return proof;
 }
 
+const SURFACE_PASS_LABELS = ["Surface on/off", "Wireframe on/off", "Points on/off"];
+
+async function openSurfaceMenu(page, timeout) {
+  await page.getByRole("tab", { name: "View", exact: true }).click({ timeout });
+  await page.locator('[data-action-id="view-surface"]').click({ timeout });
+  await page.getByRole("menuitemradio", { name: "Shaded surface", exact: true }).waitFor({ state: "visible", timeout });
+}
+
+async function readSurfacePasses(page, timeout) {
+  await openSurfaceMenu(page, timeout);
+  try {
+    const mode = (await page.locator('[role="menuitemradio"][aria-checked="true"]').innerText()).trim();
+    const passes = {};
+    for (const name of SURFACE_PASS_LABELS) {
+      passes[name] = await page.getByRole("menuitemcheckbox", { name, exact: true }).getAttribute("aria-checked") === "true";
+    }
+    return { mode, passes };
+  } finally {
+    await page.keyboard.press("Escape");
+  }
+}
+
+async function setSurfaceRenderMode(page, mode, timeout) {
+  await openSurfaceMenu(page, timeout);
+  await page.getByRole("menuitemradio", { name: mode, exact: true }).click({ timeout });
+  await openSurfaceMenu(page, timeout);
+  try {
+    await page.getByRole("menuitemradio", { name: mode, exact: true, checked: true }).waitFor({ state: "visible", timeout });
+  } finally {
+    await page.keyboard.press("Escape");
+  }
+}
+
+async function restoreSurfacePasses(page, original, timeout) {
+  await setSurfaceRenderMode(page, original.mode, timeout);
+  await openSurfaceMenu(page, timeout);
+  try {
+    for (const [name, checked] of Object.entries(original.passes)) {
+      const control = page.getByRole("menuitemcheckbox", { name, exact: true });
+      if ((await control.getAttribute("aria-checked") === "true") !== checked) {
+        await control.click({ timeout });
+      }
+      await page.getByRole("menuitemcheckbox", { name, exact: true, checked }).waitFor({ state: "visible", timeout });
+    }
+  } finally {
+    await page.keyboard.press("Escape");
+  }
+}
+
 async function captureCanvas(page, {
   assertCanvas,
   cameraDialog,
@@ -399,7 +505,7 @@ async function captureCanvas(page, {
   let result = null;
   try {
     await setCameraDialogOpen(page, cameraDialog, false, timeout);
-    await assertCanvas(`before ${name} camera screenshot`);
+    const webgl = await assertCanvas(`before ${name} camera screenshot`);
     await page.waitForTimeout(80);
     const png = Buffer.from(await canvas.screenshot({ type: "png", timeout }));
     if (!png.length) throw new Error(`Canvas screenshot for ${name} was empty`);
@@ -427,6 +533,14 @@ async function captureCanvas(page, {
     }
 
     const camera = await readCamera(page.locator(VIEWPORT_SELECTOR));
+    const liveDepthRange = await page.evaluate(() => {
+      const diagnostics = window.__FULLMAG_READ_VIEWPORT_3D_CAMERA_CONTROLS__?.();
+      return { near: diagnostics?.cameraNear, far: diagnostics?.cameraFar };
+    });
+    if (!Number.isFinite(liveDepthRange.near) || !Number.isFinite(liveDepthRange.far) ||
+        liveDepthRange.near <= 0 || liveDepthRange.far <= liveDepthRange.near) {
+      throw new Error(`Invalid live camera depth range at ${name}: ${JSON.stringify(liveDepthRange)}`);
+    }
     const pngSha256 = sha256(png);
     const pixelSha256 = sha256(data);
     const snapshot = { pngSha256, pixelSha256, width, height,
@@ -441,7 +555,10 @@ async function captureCanvas(page, {
       png_sha256: pngSha256,
       decoded_pixel_sha256: pixelSha256,
       non_empty_rgba_pixels: nonEmptyPixels,
+      red_dominant_pixels: countRedDominantPixels(data, width, height),
       camera,
+      webgl,
+      live_depth_range: liveDepthRange,
       png_base64_state: embedPng
         ? png.length <= MAX_EMBEDDED_PNG_BYTES
           ? "included"
@@ -837,4 +954,30 @@ function boundedTimeout(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return 15_000;
   return Math.min(Math.max(numeric, 1_000), MAX_ACTION_TIMEOUT_MS);
+}
+
+// Scoped to the fixed red-ring fixture, never a generic material assumption.
+export function countRedDominantPixels(data, width, height) {
+  if (!Number.isInteger(width) || !Number.isInteger(height) ||
+      width <= 0 || height <= 0 || data?.length !== width * height * 4) {
+    throw new Error("Ring pixel check requires valid decoded RGBA dimensions");
+  }
+  let count = 0;
+  // The fixture targets the ring at the center. Exclude the red orientation
+  // sphere/axes at the bottom left and the ViewCube at the top right.
+  for (let y = Math.ceil(height * 0.15); y < height * 0.8; y += 1) {
+    for (let x = Math.ceil(width * 0.25); x < width * 0.75; x += 1) {
+      const offset = (y * width + x) * 4;
+      if (data[offset + 3] > 0 && data[offset] > 32 &&
+          data[offset] > data[offset + 1] * 1.3 && data[offset] > data[offset + 2] * 1.3) count += 1;
+    }
+  }
+  return count;
+}
+
+export function assertRingSurfacePixels(capture) {
+  if (!Number.isFinite(capture.red_dominant_pixels) ||
+      capture.red_dominant_pixels < Math.max(128, capture.width * capture.height * 0.002)) {
+    throw new Error(`Ring geometry is absent at ${capture.name}: ${capture.red_dominant_pixels} red surface pixels`);
+  }
 }

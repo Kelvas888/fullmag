@@ -74,6 +74,10 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
             get(handlers::platform::get_capabilities),
         )
         .route(
+            "/v2/platform/instances",
+            get(handlers::platform::instances::get_instances),
+        )
+        .route(
             "/v2/platform/asyncapi.json",
             get(handlers::platform::get_asyncapi_document),
         )
@@ -92,6 +96,15 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
         .route(
             "/v2/sessions/current/status",
             get(handlers::sessions::get_status),
+        )
+        .route(
+            "/v2/sessions/current/clients",
+            get(handlers::sessions::get_session_clients),
+        )
+        .route(
+            "/v2/sessions/current/clients/:client_id",
+            axum::routing::put(handlers::sessions::put_session_client)
+                .delete(handlers::sessions::delete_session_client),
         )
         .route(
             "/v2/sessions/current/events/ws",

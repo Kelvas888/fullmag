@@ -628,6 +628,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/platform/instances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["platform_get_platform_instances"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/platform/openapi.json": {
         parameters: {
             query?: never;
@@ -1647,6 +1663,38 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/sessions/current/clients": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["sessions_get_sessions_current_clients"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/sessions/current/clients/{client_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["sessions_put_sessions_current_clients_client_id"];
+        post?: never;
+        delete: operations["sessions_delete_sessions_current_clients_client_id"];
         options?: never;
         head?: never;
         patch?: never;
@@ -7017,6 +7065,19 @@ export interface components {
             /** Format: double */
             position_fraction: number;
         };
+        /** @description A Fullmag instance answering on one loopback port. */
+        DiscoveredInstance: {
+            /** @description Process identity of the instance's API (`x-fullmag-api-instance`). */
+            api_instance_id: string;
+            /** @description The instance that answered this discovery request. */
+            is_self: boolean;
+            /**
+             * Format: int32
+             * @description Port of the instance's Control Room origin, which also serves its API.
+             */
+            port: number;
+            sessions: components["schemas"]["InstanceSessionSummary"][];
+        };
         DisplayPatch: {
             active_quantity_id?: string | null;
             auto_contrast?: boolean | null;
@@ -9735,6 +9796,30 @@ export interface components {
         };
         /** @enum {string} */
         InactiveSelectionPolicySchema: "warn_and_intersect" | "error";
+        InstanceDiscoveryResource: {
+            /**
+             * Format: int32
+             * @description First port of the probed window (inclusive).
+             */
+            first_port: number;
+            /** @description Instances that answered with a Fullmag session list, ordered by port. */
+            instances: components["schemas"]["DiscoveredInstance"][];
+            /**
+             * Format: int32
+             * @description Last port of the probed window (inclusive).
+             */
+            last_port: number;
+            schema_version: string;
+            /** @description Process identity of the API that answered this request. */
+            self_api_instance_id: string;
+        };
+        /** @description One session of a discovered instance, as its `GET /v2/sessions` reported it. */
+        InstanceSessionSummary: {
+            current: boolean;
+            name: string;
+            session_id: string;
+            status: string;
+        };
         /** @description Inspector document of one workspace item. */
         ItemDetail: (components["schemas"]["ProjectDetail"] & {
             /** @enum {string} */
@@ -14556,6 +14641,35 @@ export interface components {
             summary: components["schemas"]["ImportedAssetSummary"];
             target_realization: string;
         };
+        SessionClientEntry: {
+            client_id: string;
+            /** Format: int64 */
+            connected_at_unix_ms: number;
+            kind: components["schemas"]["SessionClientKind"];
+            label?: string | null;
+            /** Format: int64 */
+            last_seen_unix_ms: number;
+        };
+        SessionClientHeartbeatRequest: {
+            kind: components["schemas"]["SessionClientKind"];
+            /** @description Short human label, e.g. the script file name. */
+            label?: string | null;
+        };
+        /**
+         * @description Kind of external client driving the session (ADR 0068).
+         * @enum {string}
+         */
+        SessionClientKind: "python_live";
+        SessionClientsResource: {
+            clients: components["schemas"]["SessionClientEntry"][];
+            /** Format: int64 */
+            revision: number;
+            /**
+             * Format: int64
+             * @description A client without a heartbeat for this long is no longer listed.
+             */
+            ttl_ms: number;
+        };
         /** @enum {string} */
         SessionCommandability: "allowed" | "forbidden" | "read_only";
         /** @enum {string} */
@@ -18932,6 +19046,33 @@ export interface operations {
             };
         };
     };
+    platform_get_platform_instances: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fullmag instances answering in the discovery port window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstanceDiscoveryResource"];
+                };
+            };
+            /** @description The discovery port window is misconfigured */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     platform_get_platform_openapi_json: {
         parameters: {
             query?: never;
@@ -21047,6 +21188,90 @@ export interface operations {
             };
             /** @description No Γ spin-wave response artifact */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    sessions_get_sessions_current_clients: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description External clients seen within the presence TTL */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionClientsResource"];
+                };
+            };
+        };
+    };
+    sessions_put_sessions_current_clients_client_id: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+            };
+            path: {
+                /** @description Client-chosen stable identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SessionClientHeartbeatRequest"];
+            };
+        };
+        responses: {
+            /** @description Heartbeat recorded */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionClientEntry"];
+                };
+            };
+            /** @description Invalid client identity */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    sessions_delete_sessions_current_clients_client_id: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+            };
+            path: {
+                /** @description Client-chosen stable identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Client removed or already absent */
+            204: {
                 headers: {
                     [name: string]: unknown;
                 };

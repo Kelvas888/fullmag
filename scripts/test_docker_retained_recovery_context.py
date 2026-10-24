@@ -150,9 +150,19 @@ class RetainedRecoveryContextTests(unittest.TestCase):
             'status': 'recovered',
             'outcome': 'failed',
         })
-        with patch.object(recovery, '_control_bytes', return_value=recovered):
-            with self.assertRaisesRegex(dev.BuildControlError, 'unsupported outcome'):
-                dev._validate_completed_recovery_receipt(self.control, self.auth, recovery)
+        request_raw = recovery._canonical({'request_id': self.auth['request_id']})
+        # The request is bound to the authorization, so the outcome check is
+        # the one that must refuse the receipt.
+        auth = {**self.auth, 'native_request_sha256': hashlib.sha256(request_raw).hexdigest()}
+
+        def control_bytes(_control, relative, *, optional=False):
+            return recovered if relative.endswith('/receipt.json') else request_raw
+
+        with patch.object(recovery, '_control_bytes', side_effect=control_bytes), \
+                patch.object(recovery, 'validate_request', side_effect=lambda request: request), \
+                patch.object(recovery, 'expected_recovery_outcome', return_value='recovered'):
+            with self.assertRaisesRegex(dev.BuildControlError, 'outcome differs from its request scope'):
+                dev._validate_completed_recovery_receipt(self.control, auth, recovery)
 
 
 if __name__ == '__main__':
