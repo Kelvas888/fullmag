@@ -589,22 +589,50 @@ static bool free_tracked_vector_field(Context &ctx, DeviceVectorField &field) {
     return released;
 }
 
+// Like the rotated-DMI and static-field extensions: the minimizer workspace is
+// a setup extension, allowed only before the first step and checked for its
+// exact allocation delta, after which the setup baseline moves forward.
 bool context_allocate_direct_minimizer_workspace(Context &ctx) {
     DirectMinimizerState &state = ctx.direct_minimizer;
+    if (state.m_prev.x != nullptr) return true;
+    const bool baseline_was_current = !ctx.gpu_workspace_setup_complete ||
+        (ctx.gpu_workspace_total_device_allocation_count ==
+             ctx.gpu_workspace_setup_device_allocation_count &&
+         ctx.gpu_workspace_total_device_allocation_bytes ==
+             ctx.gpu_workspace_setup_device_allocation_bytes);
+    if (!baseline_was_current || ctx.gpu_workspace_observed_step_count != 0) {
+        ctx.last_error =
+            "direct minimizer workspace must be allocated before the first step";
+        return false;
+    }
+    const uint64_t count_before = ctx.gpu_workspace_total_device_allocation_count;
+    const uint64_t bytes_before = ctx.gpu_workspace_total_device_allocation_bytes;
     DeviceVectorField *fields[] = {&state.m_prev, &state.h_prev, &state.g, &state.g_trial};
     for (DeviceVectorField *field : fields) {
-        if (field->x == nullptr && !alloc_vector_field(ctx, *field)) {
+        if (!alloc_vector_field(ctx, *field)) {
             context_free_direct_minimizer_workspace(ctx);
             return false;
         }
     }
-    if (state.invalid_flag == nullptr) {
-        const cudaError_t err = cudaMalloc(&state.invalid_flag, sizeof(int));
-        if (err != cudaSuccess) {
-            set_cuda_error(ctx, "cudaMalloc(direct_minimizer_invalid_flag)", err);
-            context_free_direct_minimizer_workspace(ctx);
-            return false;
-        }
+    const cudaError_t err = cudaMalloc(&state.invalid_flag, sizeof(int));
+    if (err != cudaSuccess) {
+        set_cuda_error(ctx, "cudaMalloc(direct_minimizer_invalid_flag)", err);
+        context_free_direct_minimizer_workspace(ctx);
+        return false;
+    }
+    const uint64_t expected_bytes =
+        12ull * ctx.cell_count * scalar_size(ctx.precision) + sizeof(int);
+    if (ctx.gpu_workspace_total_device_allocation_count - count_before != 13 ||
+        ctx.gpu_workspace_total_device_allocation_bytes - bytes_before != expected_bytes) {
+        ctx.gpu_workspace_accounting_valid = false;
+        ctx.last_error = "direct minimizer workspace extension violated setup accounting";
+        return false;
+    }
+    if (ctx.gpu_workspace_setup_complete) {
+        ctx.gpu_workspace_setup_device_allocation_count =
+            ctx.gpu_workspace_total_device_allocation_count;
+        ctx.gpu_workspace_setup_device_allocation_bytes =
+            ctx.gpu_workspace_total_device_allocation_bytes;
     }
     return true;
 }
