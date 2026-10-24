@@ -230,7 +230,9 @@ impl ScriptStore {
             }
         }
 
-        let end_time = if record.advances_time { time_offset + record.end_time_s } else { time_offset };
+        // Without a final-state record, the last saved sample bounds the step time.
+        let local_end = record.end_time_s.max(last_local_time(&sources));
+        let end_time = if record.advances_time { time_offset + local_end } else { time_offset };
         let end_step = step_offset + record.steps;
         let mut stages = fullmag.get("stages").and_then(Value::as_array).cloned().unwrap_or_default();
         stages.push(json!({
@@ -555,10 +557,40 @@ fn write_table_text(store: &Path) -> Result<(), String> {
     );
     text.push('\n');
     for row in rows {
-        text.push_str(&row.iter().map(|value| value.to_string()).collect::<Vec<_>>().join("\t"));
+        text.push_str(&row.iter().map(|value| go_float(*value)).collect::<Vec<_>>().join("\t"));
         text.push('\n');
     }
     write_bytes(&store.join("table.txt"), text.as_bytes())
+}
+
+/// Shortest round-trip text with an exponent for small and large magnitudes, as Go's
+/// `%g`-like formatting in mumax3 `table.txt` (`0`, `1.05e-11`, `0.9669666`).
+fn go_float(value: f64) -> String {
+    if value == 0.0 || !value.is_finite() || (1e-4..1e21).contains(&value.abs()) {
+        value.to_string()
+    } else {
+        format!("{value:e}")
+    }
+}
+
+/// Largest stage-local time among the staged field and table samples.
+fn last_local_time(sources: &[PathBuf]) -> f64 {
+    let mut last = 0.0_f64;
+    for source in sources {
+        let Ok(entries) = fs::read_dir(source) else { continue };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if file_name(&path) == "table" {
+                if let Ok((columns, rows)) = read_table(&path) {
+                    if let Some(t) = columns.iter().position(|column| column == "t") {
+                        last = rows.iter().map(|row| row[t]).fold(last, f64::max);
+                    }
+                }
+            } else if let Ok(attrs) = read_json(&path.join(".zattrs")) {
+                last = attrs["t"].as_array().into_iter().flatten().filter_map(Value::as_f64).fold(last, f64::max);
+            }
+        }
+    }
+    last
 }
 
 fn append_log(store: &Path, line: &str) -> Result<(), String> {

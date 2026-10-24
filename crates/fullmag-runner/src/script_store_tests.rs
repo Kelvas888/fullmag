@@ -70,7 +70,9 @@ fn relax_then_run_writes_one_mumax_like_store() {
     assert_eq!(attrs["fullmag"]["stages"].as_array().unwrap().len(), 2);
     assert_eq!(json_at(&root.join("table/manifest.json"))["committed_rows"], json!(2));
     let text = fs::read_to_string(root.join("table.txt")).unwrap();
-    assert!(text.starts_with("# t (s)\tmx ()\n0\t0\n"));
+    assert!(text.starts_with("# t (s)\tmx ()\n0\t0\n2e-10\t1\n"), "{text}");
+    assert_eq!(go_float(0.9669666), "0.9669666");
+    assert_eq!(go_float(1.0504356091240277e-11), "1.0504356091240277e-11");
     assert!(root.join("log.txt").is_file());
 }
 
@@ -83,7 +85,9 @@ fn a_second_run_continues_the_store_time() {
     store.merge_step(&first, &record("a", true, 1e-9, 100)).unwrap();
     let second = dir.path().join("second");
     stage_step(&second, "b", &[0.0, 5e-10]);
-    store.merge_step(&second, &record("b", true, 5e-10, 50)).unwrap();
+    // No final-state record: the last saved sample sets the step end time.
+    store.merge_step(&second, &record("b", true, 0.0, 50)).unwrap();
+    assert_eq!(json_at(&store.path().join(".zattrs"))["total_time"], json!(1e-9 + 5e-10));
 
     let m = json_at(&store.path().join("m/.zattrs"));
     assert_eq!(m["t"], json!([0.0, 1e-9, 1e-9, 1e-9 + 5e-10]));

@@ -424,8 +424,10 @@ fn merge_step_data(
     provenance: serde_json::Value,
 ) -> Result<()> {
     let mut record = record.clone();
-    let final_state = attempt_dir.join("solver").join("m_final.json");
-    if final_state.is_file() {
+    let final_state = [attempt_dir.join("m_final.json"), attempt_dir.join("solver").join("m_final.json")]
+        .into_iter()
+        .find(|path| path.is_file());
+    if let Some(final_state) = final_state {
         let state: serde_json::Value = serde_json::from_slice(&fs::read(&final_state)?)
             .context("read the step's final state for the script store")?;
         record.end_time_s = state.get("time").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
