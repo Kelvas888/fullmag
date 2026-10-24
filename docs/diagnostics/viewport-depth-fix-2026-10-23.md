@@ -471,3 +471,17 @@ Pozostałe jawne ograniczenia: nie naprawiano importu authoredGPU/effectiveCPU
 ani endpointów analizy/planar2D. Nie wykonano Compute/Solve, kwalifikacji
 naukowej ani hardwareGPU. Zaliczenie zakresu tego PR nie oznacza zielonego
 ogólnego harnessu ani poprawności tych odrębnych ścieżek runtime.
+
+## Kontrakt command_revision przy zamykaniu QA
+
+Pierwszy Stop przed cleanupem nie został przyjęty:409 precondition failed,
+expected2/got1. Błędnie użyto rewizji zasobu queue.revision=2; bieżący
+kontrakt admission porównuje command_revision z ledger.len()=1
+(router_v2/handlers/simulation/commands.rs), a rewizja zasobu rośnie także
+przy completion. Polecenie mesh_build było jedynym wpisem i było completed.
+Receipt6948738e2b8647ffb51d13d4509740cd zachowuje odrzucenie; nie oznaczono
+Stop jako wykonanego. Diagnostyka używa teraz jawnie długości dziennika,
+z komentarzem rozróżniającym te wartości. Pierwotne mesh_build miało pusty
+dziennik, więc obie wartości wynosiły0; nie zmienia to jego wyniku.
+Nowy Stop wymaga ponownego odczytu dziennika i potwierdzenia, że poprzedni
+intent nie został przyjęty; nie jest ponowieniem nieznanego żądania.

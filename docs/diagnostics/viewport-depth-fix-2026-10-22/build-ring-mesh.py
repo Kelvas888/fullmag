@@ -89,9 +89,10 @@ with Client("http://backend:8081", timeout=30, retry_budget_s=0) as client:
         hashlib.sha256((client.session_scope + ":" + str(scene["revision"])).encode()).hexdigest()[:24], state="submitting")
     save()
     try:
+        # Admission compares journal length; queue.revision also advances on completion.
         handle = client.commands.submit("mesh_build", client_intent_id=record["client_intent_id"],
             reason="viewport_depth_qa", mesh_reason="shared-domain", mesh_target={"kind": "study_domain"},
-            precondition={"scene_revision": scene["revision"], "command_revision": queue["revision"]})
+            precondition={"scene_revision": scene["revision"], "command_revision": len(queue["commands"])})
         record.update(state="accepted", command_id=handle.command_id)
         save()
         terminal = handle.wait(timeout=600)
