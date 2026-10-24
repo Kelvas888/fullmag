@@ -714,6 +714,15 @@ fn execute_device_projected_gradient_bb(
         let (mut accepted_stats, next) = backend.direct_minimizer_step()?;
         match next.status {
             ffi::FULLMAG_FDM_DIRECT_MINIMIZER_ACCEPTED => {}
+            ffi::FULLMAG_FDM_DIRECT_MINIMIZER_LINE_SEARCH_EXHAUSTED
+                if next.energy_tolerance_j > 0.0
+                    && (next.last_trial_energy_j - next.previous_energy_j).abs()
+                        <= next.energy_tolerance_j =>
+            {
+                // The energy cannot resolve a further decrease at this precision.
+                numerical_stagnation = true;
+                break;
+            }
             ffi::FULLMAG_FDM_DIRECT_MINIMIZER_LINE_SEARCH_EXHAUSTED => {
                 let cell_volume_m3 = plan.cell_size.iter().product::<f64>();
                 let active_cell_count = plan.active_mask.as_ref().map_or(

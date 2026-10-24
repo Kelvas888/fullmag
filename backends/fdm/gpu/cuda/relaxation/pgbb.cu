@@ -178,6 +178,34 @@ __global__ void metric_dot_blocks_kernel(
     block_sum_store(sum, block_out);
 }
 
+// Chord of the FP64 retraction, as the host reference evaluates it:
+// sum_i coeff phi_i H_prev,i . (normalize(m_prev,i - lambda g_i) - m_prev,i).
+// The stored trial may be FP32; its rounding noise is not a descent direction.
+template <typename S>
+__global__ void retraction_chord_blocks_kernel(
+    Field<S> h_prev, Field<S> m_prev, Field<S> g, double lambda,
+    const double *volume_fraction, int has_vf, const uint8_t *active, int has_active,
+    double coeff, double *block_out, uint64_t n)
+{
+    double sum = 0.0;
+    for (uint64_t i = blockIdx.x * static_cast<uint64_t>(blockDim.x) + threadIdx.x; i < n;
+         i += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+        const double w = cell_weight(volume_fraction, has_vf, active, has_active, i);
+        if (w == 0.0) continue;
+        const double p0 = m_prev.x[i], p1 = m_prev.y[i], p2 = m_prev.z[i];
+        const double v0 = p0 - lambda * static_cast<double>(g.x[i]);
+        const double v1 = p1 - lambda * static_cast<double>(g.y[i]);
+        const double v2 = p2 - lambda * static_cast<double>(g.z[i]);
+        const double norm_sq = v0 * v0 + v1 * v1 + v2 * v2;
+        if (!(norm_sq > DBL_MIN) || !isfinite(norm_sq)) continue;
+        const double inv = 1.0 / sqrt(norm_sq);
+        sum += coeff * w * (static_cast<double>(h_prev.x[i]) * (v0 * inv - p0) +
+                            static_cast<double>(h_prev.y[i]) * (v1 * inv - p1) +
+                            static_cast<double>(h_prev.z[i]) * (v2 * inv - p2));
+    }
+    block_sum_store(sum, block_out);
+}
+
 // BB products with s = P_m(m - m_prev), y = g - P_m(g_prev), P_m(v) = v - (m.v/|m|^2) m.
 // term: 0 -> <s,s>, 1 -> <s,y>, 2 -> <y,y>.
 template <typename S>
@@ -277,6 +305,17 @@ bool metric_dot(Context &ctx, const DeviceVectorField &a, const DeviceVectorFiel
     const Field<S> none{nullptr, nullptr, nullptr};
     metric_dot_blocks_kernel<S><<<static_cast<unsigned>(blocks), BLOCK>>>(
         as_field<S>(a), as_field<S>(b), c ? as_field<S>(*c) : none, c ? 1 : 0,
+        ctx.volume_fraction, has_vf(ctx), ctx.active_mask, ctx.has_active_mask ? 1 : 0,
+        metric_coefficient(ctx), ctx.reduction_scratch, ctx.cell_count);
+    return finish_sum(ctx, blocks, out);
+}
+
+template <typename S>
+bool retraction_chord(Context &ctx, double lambda, double &out) {
+    DirectMinimizerState &state = ctx.direct_minimizer;
+    const uint64_t blocks = grid_for(ctx.cell_count);
+    retraction_chord_blocks_kernel<S><<<static_cast<unsigned>(blocks), BLOCK>>>(
+        as_field<S>(state.h_prev), as_field<S>(state.m_prev), as_field<S>(state.g), lambda,
         ctx.volume_fraction, has_vf(ctx), ctx.active_mask, ctx.has_active_mask ? 1 : 0,
         metric_coefficient(ctx), ctx.reduction_scratch, ctx.cell_count);
     return finish_sum(ctx, blocks, out);
@@ -504,9 +543,7 @@ int step_impl(Context &ctx, fullmag_fdm_step_stats &out_stats,
             trial_energy = total_energy(trial);
             trial.total_energy_joules = trial_energy;
             double chord_dot = 0.0;
-            if (!metric_dot<S>(ctx, state.h_prev, ctx.m, &state.m_prev, chord_dot)) {
-                return FULLMAG_FDM_ERR_CUDA;
-            }
+            if (!retraction_chord<S>(ctx, step_size, chord_dot)) return FULLMAG_FDM_ERR_CUDA;
             chord = -chord_dot;
             // projected_gradient_armijo_accepts_with_tolerance
             if (std::isfinite(previous_energy) && std::isfinite(trial_energy) &&

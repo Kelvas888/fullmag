@@ -576,11 +576,17 @@ prove its residency. One native call performs one accepted PG-BB step:
 3. The ordinary field and energy kernels evaluate $\boldsymbol{H}_t$ and $E_t$ at the
    stored trial state.
 4. The chord increment $\Delta E = -\langle \boldsymbol{H}_n, \boldsymbol{m}_t - \boldsymbol{m}_n \rangle_E$
-   is a device reduction over the stored trial, so in single precision it measures
-   the chord to the representable FP32 trial actually evaluated.
+   is a device reduction of the FP64 retraction $\operatorname{normalize}(\boldsymbol{m}_n - \lambda \boldsymbol{g}_n)$,
+   exactly as the host reference forms it before the state is stored. In single
+   precision the stored FP32 trial differs from it by rounding; near a minimum that
+   rounding (mostly along $\boldsymbol{m}$, where $\boldsymbol{H}$ is large) can exceed the
+   tangential descent and would flip the sign of a chord measured on the stored trial.
 5. The Armijo test of §3.1.2 (same $c_1$, tolerance and 20-backtrack limit, step
    halving) is decided natively from these scalars. An exhausted line search
-   restores $\boldsymbol{m}_n$ and reports the failure without accepting a step.
+   restores $\boldsymbol{m}_n$ and accepts no step. When the last rejected trial stayed
+   within the Armijo energy tolerance of $E_n$ (the precision floor of the energy),
+   the runner reports numerical stagnation; otherwise it reports the line-search
+   failure as an error.
 6. After acceptance, a tangent-gradient kernel forms $\boldsymbol{g}_t$, and one fused
    pass reduces $\langle s,s\rangle$, $\langle s,y\rangle$, $\langle y,y\rangle$ with
    $\boldsymbol{s} = P_{\boldsymbol{m}_t}(\boldsymbol{m}_t - \boldsymbol{m}_n)$ and
