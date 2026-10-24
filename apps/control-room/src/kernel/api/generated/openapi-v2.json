@@ -8590,6 +8590,38 @@
         ],
         "type": "object"
       },
+      "DiscoveredInstance": {
+        "description": "A Fullmag instance answering on one loopback port.",
+        "properties": {
+          "api_instance_id": {
+            "description": "Process identity of the instance's API (`x-fullmag-api-instance`).",
+            "type": "string"
+          },
+          "is_self": {
+            "description": "The instance that answered this discovery request.",
+            "type": "boolean"
+          },
+          "port": {
+            "description": "Port of the instance's Control Room origin, which also serves its API.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/InstanceSessionSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "port",
+          "api_instance_id",
+          "is_self",
+          "sessions"
+        ],
+        "type": "object"
+      },
       "DisplayPatch": {
         "properties": {
           "active_quantity_id": {
@@ -19353,6 +19385,68 @@
           "error"
         ],
         "type": "string"
+      },
+      "InstanceDiscoveryResource": {
+        "properties": {
+          "first_port": {
+            "description": "First port of the probed window (inclusive).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instances": {
+            "description": "Instances that answered with a Fullmag session list, ordered by port.",
+            "items": {
+              "$ref": "#/components/schemas/DiscoveredInstance"
+            },
+            "type": "array"
+          },
+          "last_port": {
+            "description": "Last port of the probed window (inclusive).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "self_api_instance_id": {
+            "description": "Process identity of the API that answered this request.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "self_api_instance_id",
+          "first_port",
+          "last_port",
+          "instances"
+        ],
+        "type": "object"
+      },
+      "InstanceSessionSummary": {
+        "description": "One session of a discovered instance, as its `GET /v2/sessions` reported it.",
+        "properties": {
+          "current": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "name",
+          "status",
+          "current"
+        ],
+        "type": "object"
       },
       "ItemDetail": {
         "description": "Inspector document of one workspace item.",
@@ -38184,6 +38278,92 @@
         ],
         "type": "object"
       },
+      "SessionClientEntry": {
+        "properties": {
+          "client_id": {
+            "type": "string"
+          },
+          "connected_at_unix_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SessionClientKind"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_seen_unix_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "client_id",
+          "kind",
+          "connected_at_unix_ms",
+          "last_seen_unix_ms"
+        ],
+        "type": "object"
+      },
+      "SessionClientHeartbeatRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/SessionClientKind"
+          },
+          "label": {
+            "description": "Short human label, e.g. the script file name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "SessionClientKind": {
+        "description": "Kind of external client driving the session (ADR 0068).",
+        "enum": [
+          "python_live"
+        ],
+        "type": "string"
+      },
+      "SessionClientsResource": {
+        "properties": {
+          "clients": {
+            "items": {
+              "$ref": "#/components/schemas/SessionClientEntry"
+            },
+            "type": "array"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ttl_ms": {
+            "description": "A client without a heartbeat for this long is no longer listed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "ttl_ms",
+          "clients"
+        ],
+        "type": "object"
+      },
       "SessionCommandability": {
         "enum": [
           "allowed",
@@ -49629,6 +49809,29 @@
         ]
       }
     },
+    "/v2/platform/instances": {
+      "get": {
+        "operationId": "platform_get_platform_instances",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceDiscoveryResource"
+                }
+              }
+            },
+            "description": "Fullmag instances answering in the discovery port window"
+          },
+          "500": {
+            "description": "The discovery port window is misconfigured"
+          }
+        },
+        "tags": [
+          "platform"
+        ]
+      }
+    },
     "/v2/platform/openapi.json": {
       "get": {
         "operationId": "platform_get_platform_openapi_json",
@@ -53017,6 +53220,103 @@
         },
         "tags": [
           "analysis"
+        ]
+      }
+    },
+    "/v2/sessions/current/clients": {
+      "get": {
+        "operationId": "sessions_get_sessions_current_clients",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionClientsResource"
+                }
+              }
+            },
+            "description": "External clients seen within the presence TTL"
+          }
+        },
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v2/sessions/current/clients/{client_id}": {
+      "delete": {
+        "operationId": "sessions_delete_sessions_current_clients_client_id",
+        "parameters": [
+          {
+            "description": "Client-chosen stable identifier",
+            "in": "path",
+            "name": "client_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Client removed or already absent"
+          }
+        },
+        "tags": [
+          "sessions"
+        ]
+      },
+      "put": {
+        "operationId": "sessions_put_sessions_current_clients_client_id",
+        "parameters": [
+          {
+            "description": "Client-chosen stable identifier",
+            "in": "path",
+            "name": "client_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionClientHeartbeatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionClientEntry"
+                }
+              }
+            },
+            "description": "Heartbeat recorded"
+          },
+          "400": {
+            "description": "Invalid client identity"
+          }
+        },
+        "tags": [
+          "sessions"
         ]
       }
     },

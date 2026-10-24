@@ -550,6 +550,7 @@ fn validate_accepted_worker_parameters(
             "step_id",
             "command",
             "startup_source_sha256",
+            "initial_state_source",
         ];
         if let Some(key) = live_workspace
             .keys()
@@ -805,6 +806,8 @@ fn read_live_magnetization(
 // validation; never replay worker startup or solver effects.
 const ACCEPTED_WORKER_CLAIM_RETRY_LIMIT: Duration = Duration::from_secs(30);
 const ACCEPTED_WORKER_CLAIM_RETRY_DELAY: Duration = Duration::from_millis(10);
+const ACCEPTED_WORKER_GPU_INVENTORY_RETRY_LIMIT: Duration = Duration::from_secs(30);
+const ACCEPTED_WORKER_GPU_INVENTORY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub(crate) struct AcceptedRunnerExecution {
     pub(crate) status: RunStatus,
@@ -922,8 +925,9 @@ pub(crate) fn create_private_attempt_output_dir(
             .with_context(|| format!("worker attempt {label} is invalid"))?;
     }
 
-    let _writer = store
-        .write_transaction()
+    // The API projection and scheduler share this store; a busy writer is
+    // transient and nothing was reserved yet, so wait for the lock.
+    let _writer = retry_store_writer_busy(|| store.write_transaction())
         .context("lock session store before reserving worker attempt output")?;
     let current_claim = retry_worker_claim_store_busy(
         store,
@@ -1090,12 +1094,18 @@ fn verify_host_worker_launch_for_claim(
             || ledger.validate_runtime_generation(expected_generation),
         )?;
     }
-    let reservation = retry_worker_claim_store_busy(
-        store,
-        claim.run_id.as_str(),
-        claim.task_id.as_str(),
-        || ledger.validate_worker_launch(store, &lease, &token),
-    )?;
+    let reservation = if lease.kind == fullmag_session::FmsResourceKind::Gpu {
+        retry_worker_gpu_launch_validation(
+            store,
+            claim.run_id.as_str(),
+            claim.task_id.as_str(),
+            || ledger.validate_worker_launch(store, &lease, &token),
+        )?
+    } else {
+        retry_worker_claim_store_busy(store, claim.run_id.as_str(), claim.task_id.as_str(), || {
+            ledger.validate_worker_launch(store, &lease, &token)
+        })?
+    };
     if lease.kind == fullmag_session::FmsResourceKind::Gpu {
         let environment = [
             std::env::var("CUDA_VISIBLE_DEVICES").ok(),
@@ -1136,6 +1146,100 @@ fn validate_host_gpu_allocation(
         bail!("host GPU worker environment differs from its exact single-device allocation");
     }
     Ok(uuid.clone())
+}
+
+/// A GPU launch permit is one-shot, but the inventory sampler may publish a
+/// transient unavailable observation between supervisor authorization and
+/// this worker-side validation. Retry only that typed probe state (and native
+/// writer contention); every poll rechecks the same token, lease, owner,
+/// generation, UUID, and current inventory. Locks from a failed validation
+/// are released before sleeping.
+fn retry_worker_gpu_launch_validation<T>(
+    store: &SessionStore,
+    run_id: &str,
+    task_id: &str,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + ACCEPTED_WORKER_GPU_INVENTORY_RETRY_LIMIT;
+    let mut reported_wait = false;
+    loop {
+        let cancellation_intent = match store.read_task_cancellation_intent(run_id, task_id) {
+            Ok(intent) => intent,
+            Err(error) if is_store_writer_busy(&error) && Instant::now() < deadline => {
+                if !reported_wait {
+                    eprintln!(
+                        "accepted worker waiting for GPU launch validation (session-store writer is busy)"
+                    );
+                    reported_wait = true;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(ACCEPTED_WORKER_GPU_INVENTORY_RETRY_DELAY.min(remaining));
+                continue;
+            }
+            Err(error) if is_store_writer_busy(&error) => {
+                return Err(error).context(
+                    "timed out waiting for current GPU inventory during accepted worker launch",
+                );
+            }
+            Err(error) => {
+                return Err(error).context(
+                    "failed to check durable cancellation before accepted GPU worker launch",
+                );
+            }
+        };
+        if cancellation_intent.is_some() {
+            bail!("accepted worker launch validation cancelled by durable task cancellation");
+        }
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if (is_store_writer_busy(&error)
+                    || transient_gpu_inventory_reason(&error).is_some())
+                    && Instant::now() < deadline =>
+            {
+                if let Some(reason) = transient_gpu_inventory_reason(&error) {
+                    if !reported_wait {
+                        eprintln!(
+                            "accepted worker waiting for a fresh GPU inventory sample (probe reason: {reason:?})"
+                        );
+                        reported_wait = true;
+                    }
+                } else if !reported_wait {
+                    eprintln!(
+                        "accepted worker waiting for GPU launch validation (session-store writer is busy)"
+                    );
+                    reported_wait = true;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(ACCEPTED_WORKER_GPU_INVENTORY_RETRY_DELAY.min(remaining));
+            }
+            Err(error) if is_store_writer_busy(&error)
+                || transient_gpu_inventory_reason(&error).is_some() =>
+            {
+                return Err(error).context(
+                    "timed out waiting for current GPU inventory during accepted worker launch",
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn transient_gpu_inventory_reason(error: &anyhow::Error) -> Option<
+    fullmag_session::compute_node_snapshot::UnavailableReason,
+> {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<
+                    fullmag_session::host_resource_ledger::TransientGpuInventoryUnavailable,
+                >()
+                .map(|unavailable| unavailable.reason)
+        })
 }
 
 fn requires_gpu_host_binding(
@@ -1321,29 +1425,6 @@ fn accepted_fdm_precision(device: &str, precision: &str) -> Result<fullmag_ir::E
         ("gpu", "single") => Ok(fullmag_ir::ExecutionPrecision::Single),
         _ => bail!("accepted FDM requires CPU double or GPU single/double precision"),
     }
-}
-
-fn accepted_fdm_runner_horizon(study: &fullmag_ir::StudyIR, pinned: Option<f64>) -> Result<f64> {
-    if let Some(until) = pinned {
-        if !until.is_finite() || until <= 0.0 {
-            bail!("accepted worker runner horizon is invalid");
-        }
-        return Ok(until);
-    }
-    if let fullmag_ir::StudyIR::Relaxation { dynamics, stop, .. } = study {
-        let until = fullmag_application::script_stage_materialization::resolve_relaxation_until_seconds(dynamics, stop);
-        if until.is_nan() || until <= 0.0 {
-            bail!("accepted relaxation runner horizon is invalid");
-        }
-        // Infinity is only an internal runner sentinel. The accepted StudyPlan
-        // keeps None and the solver owns its authored convergence/step limits.
-        return Ok(until);
-    }
-    if let fullmag_ir::StudyIR::Hysteresis { .. } = study {
-        // Each field point is settled by its own step limits; the sweep has no time horizon.
-        return Ok(f64::INFINITY);
-    }
-    bail!("accepted worker step has no pinned runner horizon")
 }
 
 fn validate_fdm_single_output_provenance(provenance: &serde_json::Value) -> Result<()> {
@@ -2233,6 +2314,33 @@ pub(crate) fn materialize_resolved_study_inputs(
     Ok(execution_plan)
 }
 
+/// Match canonical CLI stage timing: relaxation may have only a step or
+/// convergence limit, while time evolution requires an explicit horizon.
+/// Infinity stays a runner argument; the authored optional horizon is unchanged.
+pub(crate) fn accepted_runner_horizon(accepted_step: &AcceptedWorkerStep) -> Result<f64> {
+    runner_horizon(&accepted_step.problem, accepted_step.until_seconds)
+}
+
+fn runner_horizon(problem: &fullmag_ir::ProblemIR, until_seconds: Option<f64>) -> Result<f64> {
+    if matches!(&problem.study, fullmag_ir::StudyIR::Hysteresis { .. }) {
+        // Each field point is settled by its own step limits; the sweep has no time horizon.
+        return Ok(f64::INFINITY);
+    }
+    let until_seconds =
+        fullmag_application::script_stage_materialization::resolve_script_until_seconds(
+            problem,
+            until_seconds,
+        )?;
+    if until_seconds.is_nan()
+        || until_seconds <= 0.0
+        || (!until_seconds.is_finite()
+            && !matches!(&problem.study, fullmag_ir::StudyIR::Relaxation { .. }))
+    {
+        bail!("accepted worker runner horizon is invalid");
+    }
+    Ok(until_seconds)
+}
+
 /// Execute the explicitly supported accepted-study lane after a durable Start
 /// has entered the worker inbox. This is a narrow adapter: unsupported request
 /// semantics, acceptance rules, or device overrides fail closed until they
@@ -2245,6 +2353,60 @@ pub(crate) fn execute_accepted_worker_start(
     case_id: &str,
     interrupt_requested: Option<&AtomicBool>,
 ) -> Result<AcceptedRunnerExecution> {
+    validate_accepted_worker_start_preconditions(store, start, accepted_step, case_id)?;
+
+    let snapshot_started_at = Instant::now();
+    let accepted = retry_store_writer_busy(|| {
+        fullmag_runtime_control::load_accepted_study_snapshot(
+            store,
+            &accepted_step.claim.run_id,
+            project_id,
+        )
+    })
+    .context("load immutable accepted study for worker execution")?;
+    eprintln!(
+        "accepted worker immutable study snapshot loaded (elapsed_ms={})",
+        snapshot_started_at.elapsed().as_millis()
+    );
+
+    execute_accepted_worker_start_with_snapshot(
+        store,
+        &accepted,
+        start,
+        accepted_step,
+        case_id,
+        interrupt_requested,
+    )
+}
+
+/// Execute a Start using the immutable accepted snapshot already validated by
+/// `run_pending_accepted_start`. Recheck the durable worker boundary before
+/// dispatch, but do not reload the immutable study/catalog payload.
+fn execute_accepted_worker_start_from_snapshot(
+    store: &SessionStore,
+    accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
+    start: &fullmag_application::WorkerCommandEnvelope,
+    accepted_step: &AcceptedWorkerStep,
+    case_id: &str,
+    interrupt_requested: Option<&AtomicBool>,
+) -> Result<AcceptedRunnerExecution> {
+    validate_accepted_worker_start_preconditions(store, start, accepted_step, case_id)?;
+    execute_accepted_worker_start_with_snapshot(
+        store,
+        accepted,
+        start,
+        accepted_step,
+        case_id,
+        interrupt_requested,
+    )
+}
+
+fn validate_accepted_worker_start_preconditions(
+    store: &SessionStore,
+    start: &fullmag_application::WorkerCommandEnvelope,
+    accepted_step: &AcceptedWorkerStep,
+    case_id: &str,
+) -> Result<()> {
     if !matches!(&start.command, fullmag_application::WorkerCommand::Start) {
         bail!("accepted runner execution requires a durable Start command");
     }
@@ -2295,14 +2457,17 @@ pub(crate) fn execute_accepted_worker_start(
         bail!("accepted Start worker context has a stale task claim");
     }
 
-    let accepted = retry_store_writer_busy(|| {
-        fullmag_runtime_control::load_accepted_study_snapshot(
-            store,
-            &accepted_step.claim.run_id,
-            project_id,
-        )
-    })
-    .context("load immutable accepted study for worker execution")?;
+    Ok(())
+}
+
+fn execute_accepted_worker_start_with_snapshot(
+    store: &SessionStore,
+    accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
+    start: &fullmag_application::WorkerCommandEnvelope,
+    accepted_step: &AcceptedWorkerStep,
+    case_id: &str,
+    interrupt_requested: Option<&AtomicBool>,
+) -> Result<AcceptedRunnerExecution> {
     let study_step = accepted
         .study
         .steps
@@ -2347,7 +2512,7 @@ pub(crate) fn execute_accepted_worker_start(
         );
     }
     if matches!(study_step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) {
-        return execute_accepted_closed_loop_worker_start(store, &accepted, start, accepted_step, study_step, case_id, interrupt_requested);
+        return execute_accepted_closed_loop_worker_start(store, accepted, start, accepted_step, study_step, case_id, interrupt_requested);
     }
     if matches!(
         &accepted_step.execution_plan.backend_plan,
@@ -2356,7 +2521,7 @@ pub(crate) fn execute_accepted_worker_start(
         crate::accepted_antenna_inspection_worker::validate_declared_outputs(&study_step.outputs)?;
         return execute_accepted_antenna_worker_start(
             store,
-            &accepted,
+            accepted,
             start,
             accepted_step,
             study_step,
@@ -2375,7 +2540,7 @@ pub(crate) fn execute_accepted_worker_start(
             .context("validate accepted FEM output contract before recovery or reservation")?;
         return execute_accepted_fem_worker_start(
             store,
-            &accepted,
+            accepted,
             start,
             accepted_step,
             study_step,
@@ -2456,7 +2621,7 @@ pub(crate) fn execute_accepted_worker_start(
         }
     }
 
-    let until_seconds = accepted_fdm_runner_horizon(&accepted_step.problem.study, accepted_step.until_seconds)?;
+    let until_seconds = accepted_runner_horizon(accepted_step)?;
     let execution_plan = materialize_resolved_study_inputs(store, accepted_step)
         .context("materialize accepted CAS inputs for the runner")?;
     let receipt_identity = worker_execution_receipt_identity(start, accepted_step, case_id)?;
@@ -2528,7 +2693,7 @@ pub(crate) fn execute_accepted_worker_start(
     let mut storage = prepare_accepted_project_storage(
         &problem,
         store,
-        &accepted,
+        accepted,
         accepted_step,
         &receipt_identity,
         &attempt_output_dir,
@@ -3234,6 +3399,7 @@ pub(crate) fn run_pending_accepted_start(
     if !store.accepted_run_start_permitted(run_id.as_str())? {
         bail!("accepted worker refuses to execute before explicit Compute release");
     }
+    let snapshot_started_at = Instant::now();
     let accepted = retry_store_writer_busy(|| {
         fullmag_runtime_control::load_accepted_study_snapshot(
             store,
@@ -3242,6 +3408,10 @@ pub(crate) fn run_pending_accepted_start(
         )
     })
     .context("load immutable accepted study for worker process")?;
+    eprintln!(
+        "accepted worker immutable study snapshot loaded (elapsed_ms={})",
+        snapshot_started_at.elapsed().as_millis()
+    );
     let claim = retry_worker_claim_store_busy(
         store,
         run_id.as_str(),
@@ -3314,7 +3484,7 @@ pub(crate) fn run_pending_accepted_start(
         inbox
             .confirm_applied(&start)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        return apply_accepted_start_effect(store, &specification, &accepted, &claim, &start);
+        return apply_accepted_start_effect(store, &accepted, &claim, &start);
     }
 
     let disposition = inbox
@@ -3348,24 +3518,28 @@ pub(crate) fn run_pending_accepted_start(
     if disposition != fullmag_application::ProtocolDisposition::Accepted {
         bail!("worker process Start was already consumed; no solver was launched");
     }
-    apply_accepted_start_effect(store, &specification, &accepted, &claim, &start)
+    apply_accepted_start_effect(store, &accepted, &claim, &start)
 }
 
 fn apply_accepted_start_effect(
     store: &SessionStore,
-    specification: &fullmag_application::RunSpecification,
     accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
     claim: &fullmag_application::TaskClaim,
     start: &fullmag_application::WorkerCommandEnvelope,
 ) -> Result<AcceptedWorkerProcessOutcome> {
+    let start_rehydration_started_at = Instant::now();
     let accepted_step = retry_store_writer_busy(|| {
-        fullmag_runtime_control::load_accepted_worker_step_for_start(
+        fullmag_runtime_control::load_accepted_worker_step_for_start_from_snapshot(
             store,
-            &specification.snapshot.project_id,
+            accepted,
             start,
         )
     })
     .context("load accepted worker step")?;
+    eprintln!(
+        "accepted worker Start context rehydrated from immutable snapshot (elapsed_ms={})",
+        start_rehydration_started_at.elapsed().as_millis()
+    );
     let recovered_coordinator =
         retry_store_writer_busy(|| fullmag_runtime_control::recover_coordinator(store, claim))
             .context("recover worker coordinator before Start")?;
@@ -3388,9 +3562,9 @@ fn apply_accepted_start_effect(
     let control = WorkerControlLoop::start(store.root(), claim.clone())?;
     accepted_worker_test_delay_after_started(&control.interrupt_requested)?;
 
-    let execution = execute_accepted_worker_start(
+    let execution = execute_accepted_worker_start_from_snapshot(
         store,
-        &specification.snapshot.project_id,
+        accepted,
         start,
         &accepted_step,
         "default",
@@ -3405,9 +3579,9 @@ fn apply_accepted_start_effect(
         SessionStore::open_existing(store.root().to_path_buf())
             .context("reopen worker receipt store")
     })?;
-    let durable_execution = execute_accepted_worker_start(
+    let durable_execution = execute_accepted_worker_start_from_snapshot(
         &receipt_store,
-        &specification.snapshot.project_id,
+        accepted,
         start,
         &accepted_step,
         "default",
@@ -3425,7 +3599,8 @@ fn apply_accepted_start_effect(
     if !control.interrupt_requested.load(Ordering::Acquire) {
         crate::accepted_field_materialization_worker::prepare_and_publish(
             store, accepted, &accepted_step, &durable_execution,
-        )?;
+        )
+        .context("publish accepted terminal observables")?;
     }
     if control.interrupt_requested.load(Ordering::Acquire) {
         let control_result = finish_worker_control(store, claim, control)?;
@@ -3473,6 +3648,11 @@ fn apply_accepted_start_effect(
         return publish_worker_stopped(store, claim, control_result);
     }
     let published = retry_store_writer_busy(|| {
+        // Hold one (re-entrant) writer lease across the whole publication.
+        // Its CAS puts and catalog append are separate transactions; on a
+        // slow store a busy writer between them restarted the publication
+        // from scratch until the retry budget ran out.
+        let _publication = store.write_transaction()?;
         fullmag_runtime_control::publish_study_outputs(
             store,
             accepted,
@@ -3576,10 +3756,15 @@ impl WorkerControlLoop {
             .spawn(move || {
                 let store = SessionStore::open_existing(store_root)
                     .context("open session store for worker control loop")?;
+                let mut inbox = recover_worker_control_inbox(&store, &claim)?;
                 let mut acknowledged_heartbeat_count = 0_usize;
                 loop {
-                    let consumed =
-                        consume_worker_control_commands(&store, &claim, &thread_interrupt)?;
+                    let consumed = consume_worker_control_commands_with_inbox(
+                        &store,
+                        &claim,
+                        &thread_interrupt,
+                        &mut inbox,
+                    )?;
                     acknowledged_heartbeat_count += consumed.acknowledged_heartbeat_count;
                     if consumed.stop_received {
                         return Ok(WorkerControlLoopResult {
@@ -3617,16 +3802,35 @@ fn consume_worker_control_commands(
     claim: &fullmag_application::TaskClaim,
     interrupt_requested: &AtomicBool,
 ) -> Result<WorkerControlLoopResult> {
+    let mut inbox = recover_worker_control_inbox(store, claim)?;
+    consume_worker_control_commands_with_inbox(store, claim, interrupt_requested, &mut inbox)
+}
+
+fn recover_worker_control_inbox(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+) -> Result<fullmag_runtime_control::DurableWorkerInbox> {
     let store_root = store.root().to_path_buf();
-    let mut inbox = retry_store_writer_busy(|| {
+    retry_store_writer_busy(|| {
         let worker_store = SessionStore::open_existing(store_root.clone())
             .context("open durable worker inbox store for control command")?;
         fullmag_runtime_control::DurableWorkerInbox::recover(worker_store, claim.clone())
     })
-    .context("recover durable worker inbox for control command")?;
+    .context("recover durable worker inbox for control command")
+}
+
+fn consume_worker_control_commands_with_inbox(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    interrupt_requested: &AtomicBool,
+    inbox: &mut fullmag_runtime_control::DurableWorkerInbox,
+) -> Result<WorkerControlLoopResult> {
     let mut acknowledged_heartbeat_count = 0_usize;
     loop {
         let checkpoint = inbox.checkpoint();
+        if checkpoint.claim != claim.identity() {
+            bail!("worker control inbox belongs to a stale task claim");
+        }
         if checkpoint.pending.is_some() {
             bail!("worker control inbox has an uncertain pending command");
         }
@@ -3638,6 +3842,11 @@ fn consume_worker_control_commands(
             .iter()
             .find(|task| task.task_id == claim.task_id.as_str())
             .context("worker control command task is missing from its run catalog")?;
+        if task.attempt_id.as_deref() != Some(claim.attempt_id.as_str())
+            || task.ownership_epoch != Some(claim.ownership_epoch.value())
+        {
+            bail!("worker control catalog belongs to a stale task claim");
+        }
         let durable_command_count = task
             .coordinator_watermark
             .as_ref()
@@ -3722,8 +3931,8 @@ fn accepted_worker_test_fail_before_start_effect() -> Result<()> {
     Ok(())
 }
 
-fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
-    fullmag_runtime_control::retry_store_writer_busy(&mut operation)
+fn retry_store_writer_busy<T>(operation: impl FnMut() -> Result<T>) -> Result<T> {
+    fullmag_runtime_control::retry_worker_store_transient(operation)
 }
 
 /// Retry only idempotent claim/lease validation while honoring a durable
@@ -4138,34 +4347,35 @@ mod accepted_fdm_precision_tests {
 
     #[test]
     fn relaxation_uses_canonical_stop_budget_without_synthesized_time() {
-        let problem = fullmag_ir::ProblemIR::bootstrap_example();
-        let mut study = fullmag_ir::StudyIR::Relaxation {
+        let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        let sampling = problem.study.sampling().clone();
+        problem.study = fullmag_ir::StudyIR::Relaxation {
             algorithm: fullmag_ir::RelaxationAlgorithmIR::ProjectedGradientBb,
             dynamics: None,
             stop: fullmag_ir::RelaxStopIR {
                 torque_tolerance_apm: Some(1e-4), energy_tolerance_j: None,
                 max_steps: Some(10), max_relaxation_time_s: None,
             },
-            sampling: problem.study.sampling().clone(),
+            sampling: sampling.clone(),
         };
-        assert_eq!(accepted_fdm_runner_horizon(&study, None).unwrap(), f64::INFINITY);
-        if let fullmag_ir::StudyIR::Relaxation { stop, .. } = &mut study {
+        assert_eq!(runner_horizon(&problem, None).unwrap(), f64::INFINITY);
+        if let fullmag_ir::StudyIR::Relaxation { stop, .. } = &mut problem.study {
             stop.max_relaxation_time_s = Some(2e-9);
         }
-        assert_eq!(accepted_fdm_runner_horizon(&study, None).unwrap(), 2e-9);
-        assert_eq!(accepted_fdm_runner_horizon(&study, Some(1e-9)).unwrap(), 1e-9);
-        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert!(accepted_fdm_runner_horizon(&study, Some(invalid)).is_err());
+        assert_eq!(runner_horizon(&problem, None).unwrap(), 2e-9);
+        assert_eq!(runner_horizon(&problem, Some(1e-9)).unwrap(), 1e-9);
+        for invalid in [0.0, -1.0, f64::NAN] {
+            assert!(runner_horizon(&problem, Some(invalid)).is_err());
         }
-        let no_horizon = fullmag_ir::StudyIR::FieldOnly { sampling: problem.study.sampling().clone() };
-        assert!(accepted_fdm_runner_horizon(&no_horizon, None).is_err());
-        let hysteresis: fullmag_ir::StudyIR = serde_json::from_value(serde_json::json!({
+        problem.study = fullmag_ir::StudyIR::FieldOnly { sampling: sampling.clone() };
+        assert!(runner_horizon(&problem, None).is_err());
+        problem.study = serde_json::from_value(serde_json::json!({
             "kind": "hysteresis",
             "field_values_mT": [0.0, 1.0],
-            "sampling": problem.study.sampling(),
+            "sampling": sampling,
         }))
         .unwrap();
-        assert_eq!(accepted_fdm_runner_horizon(&hysteresis, None).unwrap(), f64::INFINITY);
+        assert_eq!(runner_horizon(&problem, None).unwrap(), f64::INFINITY);
     }
 
     #[test]

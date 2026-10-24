@@ -993,6 +993,34 @@ jobs:
       - name: Repository consistency checks
         run: python scripts/check_repo_consistency.py
 
+  python-live-client-contracts:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.contract_scope != 'native-receipt' && inputs.contract_scope != 'positive-mass' && inputs.contract_scope != 'floquet-source-moments' && inputs.contract_scope != 'browser' && inputs.contract_scope != 'native-modal' && inputs.contract_scope != 'floquet-modal-slepc' && inputs.contract_scope != 'generic-modal-slepc' && inputs.contract_scope != 'floquet-count-slepc' && inputs.contract_scope != 'modal-phase-slepc' && inputs.contract_scope != 'retention' && inputs.contract_scope != 'rust' && inputs.contract_scope != 'bias-field-artifacts') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: packages/fullmag-py/pyproject.toml
+
+      - name: Install Python package
+        run: |
+          python -m pip install 'pytest>=9,<10'
+          python -m pip install -e packages/fullmag-py
+
+      - name: Run live client and live DSL contracts (ADR 0068)
+        run: >-
+          python -m pytest -q
+          packages/fullmag-py/tests/test_live_client_core.py
+          packages/fullmag-py/tests/test_live_client_data.py
+          packages/fullmag-py/tests/test_live_dsl_mode.py
+          packages/fullmag-py/tests/test_live_events.py
+          packages/fullmag-py/tests/test_live_sweep.py
+
 
   windows-volatile-storage-contracts:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.contract_scope != 'native-receipt' && inputs.contract_scope != 'positive-mass' && inputs.contract_scope != 'floquet-source-moments' && inputs.contract_scope != 'browser' && inputs.contract_scope != 'native-modal' && inputs.contract_scope != 'floquet-modal-slepc' && inputs.contract_scope != 'generic-modal-slepc' && inputs.contract_scope != 'floquet-count-slepc' && inputs.contract_scope != 'modal-phase-slepc' && inputs.contract_scope != 'retention' && inputs.contract_scope != 'rust' && inputs.contract_scope != 'bias-field-artifacts') }}

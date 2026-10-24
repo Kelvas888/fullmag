@@ -29,6 +29,80 @@ struct ProjectionContext {
     allow_api_instance_rebind: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionPublicationFence {
+    session_id: String,
+    session_status: String,
+    run_id: String,
+    run_status: String,
+    scene_revision: u64,
+    state_version: u64,
+    scalar_revision: u64,
+    mesh_revision: u64,
+    mesh_build_revision: u64,
+    field_catalog_revision: u64,
+    field_samples_revision: u64,
+    field_quantity_revisions: std::collections::BTreeMap<String, u64>,
+    stage_execution_revision: u64,
+    simulation_preparation_revision: u64,
+    preparation_id: Option<String>,
+    accepted_run_id: Option<String>,
+    accepted_step_id: Option<String>,
+}
+
+impl ProjectionPublicationFence {
+    fn capture(snapshot: &SessionStateResponse) -> Result<Self, ApiError> {
+        let run = snapshot.run.as_ref().ok_or_else(|| {
+            ApiError::conflict_with_code(
+                "accepted_projection_current_run_changed",
+                "current live run disappeared during accepted projection",
+            )
+        })?;
+        let scene_revision = snapshot
+            .scene_document
+            .as_ref()
+            .map(|scene| scene.revision)
+            .ok_or_else(|| {
+                ApiError::conflict_with_code(
+                    "accepted_projection_current_session_changed",
+                    "current live scene disappeared during accepted projection",
+                )
+            })?;
+        Ok(Self {
+            session_id: snapshot.session.session_id.clone(),
+            session_status: snapshot.session.status.clone(),
+            run_id: run.run_id.clone(),
+            run_status: run.status.clone(),
+            scene_revision,
+            state_version: snapshot.state_version,
+            scalar_revision: snapshot.scalar_revision,
+            mesh_revision: snapshot.mesh_revision,
+            mesh_build_revision: snapshot.mesh_build_revision,
+            field_catalog_revision: snapshot.field_catalog_revision,
+            field_samples_revision: snapshot.field_samples_revision,
+            field_quantity_revisions: snapshot.field_quantity_revisions.clone(),
+            stage_execution_revision: snapshot.stage_execution_revision,
+            simulation_preparation_revision: snapshot.simulation_preparation_revision,
+            preparation_id: snapshot
+                .simulation_preparation
+                .as_ref()
+                .map(|preparation| preparation.preparation_id.clone()),
+            accepted_run_id: snapshot
+                .mesh_workspace
+                .as_ref()
+                .and_then(|workspace| workspace.get("accepted_run_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            accepted_step_id: snapshot
+                .mesh_workspace
+                .as_ref()
+                .and_then(|workspace| workspace.get("accepted_step_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ProjectionCursor {
     api_instance_id: String,
@@ -66,6 +140,11 @@ struct DurableProjection {
     terminal_without_outputs: bool,
     status: &'static str,
     command_id: Option<String>,
+    /// The run executes one interactive command (not a startup script).
+    interactive_command: bool,
+    /// Runtime capabilities of the finished step, including the resolved
+    /// quantity registry that admits its published fields for reading.
+    resolved_capabilities: Option<fullmag_runner::BackendCapabilities>,
     latest_state: Option<VerifiedOutput>,
     latest_total_energy: Option<fullmag_application::StudyScalarArtifact>,
     latest_output_identity: Option<String>,
@@ -87,16 +166,32 @@ pub(crate) fn spawn(state: Arc<AppState>) {
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut cursor: Option<ProjectionCursor> = None;
+        // The poll repeats every interval; report each distinct deferral once.
+        let mut last_deferral: Option<String> = None;
         loop {
             interval.tick().await;
             match poll_once(&state, &mut cursor).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    last_deferral = None;
+                    // This poller is the Docker runtime's publication path. A
+                    // finished run publishes nothing more, yet the path stays
+                    // live; without this the session turned `disconnected`
+                    // 45 s after a run and rejected every further command.
+                    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(
+                        &state,
+                    )
+                    .await;
+                }
                 Err(error) => {
-                    tracing::warn!(
-                        code = ?error.code,
-                        error = %error,
-                        "accepted live read-model projection deferred"
-                    );
+                    let detail = error.to_string();
+                    if last_deferral.as_deref() != Some(detail.as_str()) {
+                        tracing::warn!(
+                            code = ?error.code,
+                            error = %error,
+                            "accepted live read-model projection deferred"
+                        );
+                        last_deferral = Some(detail);
+                    }
                 }
             }
         }
@@ -110,6 +205,17 @@ async fn poll_once(
     let Some(context) = capture_context(state).await? else {
         return Ok(());
     };
+    // A terminal run whose final state is already projected has nothing left
+    // to publish. Editing the model after it (the normal live workflow between
+    // commands) changes the input identity and must not retry it forever.
+    if cursor.as_ref().is_some_and(|previous| {
+        previous.run_id == context.run_id
+            && previous.session_id == context.session_id
+            && previous.session_epoch == context.session_epoch
+            && matches!(previous.status, "completed" | "failed" | "cancelled")
+    }) {
+        return Ok(());
+    }
     let Some(store_root) = state.submit_store_root.clone() else {
         return Ok(());
     };
@@ -145,10 +251,9 @@ async fn poll_once(
     if cursor.as_ref() == Some(&next_cursor) {
         return Ok(());
     }
-    // The accepted task-preparation bridge expects its caller to own the
-    // transition fence.  Publish a stage-specific pinned domain before the
-    // output field is admitted, then apply the field under that same fence.
-    let _transition = state.current_live_session_transition.lock().await;
+    // Publish a stage-specific pinned domain before admitting the output.
+    // Preparation performs catalog/plan validation outside the transition
+    // fence and uses its own exact final CAS.
     let stage_preparation = if projection.terminal_without_outputs {
         // A terminal catalog without outputs still carries authoritative
         // lifecycle state. Do not require preparation/materialization or clear
@@ -174,11 +279,13 @@ async fn poll_once(
         ensure_stage_preparation(state, &context, &projection).await
     };
     if let Err(error) = stage_preparation {
-        if let Err(clear_error) = clear_stale_magnetization(state, &context).await {
-            tracing::error!(
-                error = %clear_error,
-                "failed to clear stale accepted magnetization after domain admission failure"
-            );
+        if error.code.as_deref() != Some("accepted_preparation_current_state_changed") {
+            if let Err(clear_error) = clear_stale_magnetization(state, &context).await {
+                tracing::error!(
+                    error = %clear_error,
+                    "failed to clear stale accepted magnetization after domain admission failure"
+                );
+            }
         }
         return Err(error);
     }
@@ -293,7 +400,26 @@ fn load_durable_projection(
             "terminal accepted run has outputs or task state that requires an artifact catalog",
         ));
     }
-    if artifact_catalog.is_none() && !terminal_without_outputs {
+    // Accepted work has no artifacts yet. Project its durable lifecycle and
+    // live sidecars without waiting for the first output; otherwise the UI
+    // remains at its initial state throughout preparation/solver startup.
+    let outputless_nonterminal_catalog = artifact_catalog.is_none()
+        && !terminal_status
+        && !run_catalog.tasks.is_empty()
+        && run_catalog.tasks.iter().all(|task| {
+            matches!(
+                task.lifecycle,
+                fullmag_session::FmsTaskLifecycle::Accepted
+                    | fullmag_session::FmsTaskLifecycle::Queued
+                    | fullmag_session::FmsTaskLifecycle::Preparing
+                    | fullmag_session::FmsTaskLifecycle::Running
+                    | fullmag_session::FmsTaskLifecycle::Stopping
+            ) && task.artifact_ids.is_empty()
+        });
+    if artifact_catalog.is_none()
+        && !terminal_without_outputs
+        && !outputless_nonterminal_catalog
+    {
         return Ok(None);
     }
     if let Some(artifact_catalog) = artifact_catalog.as_ref() {
@@ -317,12 +443,33 @@ fn load_durable_projection(
     let artifact_catalog_revision = artifact_catalog
         .as_ref()
         .map(|artifact_catalog| artifact_catalog.revision);
-    let durable_changed = !previous_cursor.is_some_and(|cursor| {
+    let durable_unchanged = previous_cursor.is_some_and(|cursor| {
         cursor_matches_context(cursor, context)
             && cursor.run_revision == run_catalog.revision
             && cursor.artifact_revision == artifact_catalog_revision
             && cursor.status == status
     });
+    let has_active_task = run_catalog.tasks.iter().any(|task| {
+        matches!(
+            task.lifecycle,
+            fullmag_session::FmsTaskLifecycle::Running
+                | fullmag_session::FmsTaskLifecycle::Stopping
+        )
+    });
+    let previous_live_observation_is_empty = previous_cursor.is_some_and(|cursor| {
+        cursor_matches_context(cursor, context)
+            && cursor.live_observation_identity.is_none()
+            && cursor.live_observation_sequence.is_none()
+            && cursor.live_magnetization_sequence.is_none()
+    });
+    if durable_unchanged && !has_active_task && previous_live_observation_is_empty {
+        // RunIntent, catalog identities, lifecycle, start gate, and current
+        // session binding were freshly checked above. With no active attempt
+        // there can be no new live sidecar sequence, so avoid reloading and
+        // re-lowering the immutable accepted Study on an unchanged poll.
+        return Ok(None);
+    }
+    let durable_changed = !durable_unchanged;
     let specification: fullmag_application::RunSpecification =
         serde_json::from_value(intent.specification.clone()).map_err(|error| {
             ApiError::conflict(format!(
@@ -512,12 +659,24 @@ fn load_durable_projection(
         .pointer("/parameters/live_workspace/command_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let interactive_command = intent
+        .specification
+        .pointer("/parameters/live_workspace/command/kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "startup_script");
+    let resolved_capabilities = if matches!(status, "completed" | "failed" | "cancelled") {
+        finished_step_capabilities(&accepted, &intent.specification)
+    } else {
+        None
+    };
     Ok(Some(DurableProjection {
         run_catalog_revision: run_catalog.revision,
         artifact_catalog_revision,
         terminal_without_outputs,
         status,
         command_id,
+        interactive_command,
+        resolved_capabilities,
         latest_state,
         latest_total_energy,
         latest_output_identity,
@@ -821,6 +980,44 @@ fn validate_live_intent(
     Ok(())
 }
 
+/// Runtime capabilities of the step a finished accepted run executed. The
+/// in-process runner publishes these with its fields; an accepted run left the
+/// session with the scratch authoring capabilities, whose registry is not a
+/// resolved plan, so its published fields (m, H_eff, ...) were not readable.
+fn finished_step_capabilities(
+    accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
+    specification: &Value,
+) -> Option<fullmag_runner::BackendCapabilities> {
+    let step_id = specification
+        .pointer("/parameters/live_workspace/step_id")
+        .and_then(Value::as_str);
+    let entry = accepted
+        .catalog
+        .entries()
+        .iter()
+        .find(|entry| step_id.is_none_or(|step_id| entry.step_id() == step_id))?;
+    match fullmag_runner::resolve_runtime_capabilities(entry.problem()) {
+        Ok(capabilities) => Some(capabilities),
+        Err(error) => {
+            tracing::warn!(error = %error, "accepted step runtime capabilities are unavailable");
+            None
+        }
+    }
+}
+
+/// The session's public status for a projected run. A run that executed one
+/// interactive command (a live `run`/`relax`/... from the Control Room or a
+/// `fm.connect()` script) ends that command, not the session: the session
+/// returns to `awaiting_command` so the next command, which continues from
+/// this run's final state, is admitted. A startup-script run ends the session.
+fn session_status_after_projection(run_status: &'static str, interactive_command: bool) -> &'static str {
+    match run_status {
+        "waiting_for_solve" => "awaiting_command",
+        "completed" | "failed" | "cancelled" if interactive_command => "awaiting_command",
+        status => status,
+    }
+}
+
 fn catalog_status(tasks: &[fullmag_session::FmsTaskCatalogEntry]) -> &'static str {
     if tasks.is_empty() {
         return "waiting_for_compute";
@@ -1122,7 +1319,7 @@ async fn ensure_stage_preparation_for_step(
             request_scope_epoch: format!("{}:{}", context.api_instance_id, context.session_epoch),
         };
         let published =
-            crate::live_scene_preparation::publish_accepted_task_preparation_with_transition(
+            crate::live_scene_preparation::publish_accepted_task_preparation(
                 state,
                 &live_context,
                 &context.run_id,
@@ -1466,6 +1663,7 @@ async fn clear_stale_magnetization(
     state: &Arc<AppState>,
     context: &ProjectionContext,
 ) -> Result<(), ApiError> {
+    let transition = state.current_live_session_transition.lock().await;
     let mut current = state.current_live_state.write().await;
     let snapshot = current
         .as_mut()
@@ -1502,6 +1700,7 @@ async fn clear_stale_magnetization(
     )?;
     let cleared = snapshot.clone();
     drop(current);
+    drop(transition);
     crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
     let display_revision = state.current_display_selection.read().await.revision;
     let realtime_state =
@@ -1544,6 +1743,8 @@ async fn apply_projection(
         .cloned()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
     ensure_projection_context(state, context, &next)?;
+    let publication_fence = ProjectionPublicationFence::capture(&next)?;
+    let display_revision = state.current_display_selection.read().await.revision;
 
     let previous_status = next.session.status.clone();
     let terminal = matches!(projection.status, "completed" | "failed" | "cancelled");
@@ -1583,17 +1784,23 @@ async fn apply_projection(
             }
         }
     }
-    let public_status = if projection.status == "waiting_for_solve" {
-        "awaiting_command"
-    } else {
-        projection.status
-    };
+    let public_status =
+        session_status_after_projection(projection.status, projection.interactive_command);
     if next.session.status != public_status {
         next.session.status = public_status.to_string();
         changed = true;
     }
     next.runtime_status = crate::session::build_runtime_status_view(public_status);
-    if terminal && next.session.finished_at_unix_ms == 0 {
+    if let Some(capabilities) = projection.resolved_capabilities.as_ref() {
+        let unchanged = next.capabilities.as_ref().is_some_and(|current| {
+            serde_json::to_value(current).ok() == serde_json::to_value(capabilities).ok()
+        });
+        if !unchanged {
+            next.capabilities = Some(capabilities.clone());
+            changed = true;
+        }
+    }
+    if terminal && !projection.interactive_command && next.session.finished_at_unix_ms == 0 {
         next.session.finished_at_unix_ms = unix_time_millis_now();
         changed = true;
     }
@@ -1856,8 +2063,38 @@ async fn apply_projection(
         return Ok(());
     }
     next.state_version = next.state_version.saturating_add(1);
+    let published_fence = ProjectionPublicationFence::capture(&next)?;
+    let mut realtime_state =
+        crate::current_live_realtime_state_from_snapshot(state, &next, display_revision).await;
 
-    if terminal && !projection.terminal_without_outputs {
+    // Artifact decoding, field/frame construction, and the candidate state
+    // clone above are deliberately outside the transition fence.  Serialize
+    // only the final identity/revision CAS, terminal command completion, and
+    // state pointer swap.
+    let transition = state.current_live_session_transition.lock().await;
+    let current_display_revision = state.current_display_selection.read().await.revision;
+    if current_display_revision != display_revision {
+        return Err(ApiError::conflict_with_code(
+            "accepted_projection_current_state_changed",
+            "display selection changed while accepted output was being projected",
+        ));
+    }
+    {
+        let current = state.current_live_state.read().await;
+        let snapshot = current
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        ensure_projection_context(state, context, snapshot)?;
+        if ProjectionPublicationFence::capture(snapshot)? != publication_fence {
+            return Err(ApiError::conflict_with_code(
+                "accepted_projection_current_state_changed",
+                "current live resources changed while accepted output was being projected",
+            ));
+        }
+    }
+    // A run that failed or was cancelled before publishing outputs still ends
+    // its bound command; otherwise its client would wait forever.
+    if terminal {
         complete_bound_command(
             state,
             &next,
@@ -1866,15 +2103,45 @@ async fn apply_projection(
         )
         .await?;
     }
-    {
+    let previous = {
         let mut current = state.current_live_state.write().await;
-        *current = Some(next.clone());
+        std::mem::replace(&mut *current, Some(next))
+    };
+    drop(transition);
+    if let Some(previous) = previous {
+        let _ = tokio::task::spawn_blocking(move || drop(previous));
     }
     if terminal && projection.latest_state.as_ref().is_some_and(|output| output.accepted_state_ref.is_some()) {
-        match crate::accepted_field_materialization::adopt_terminal_bundle(state).await {
+        // Terminal CAS adoption has its own documented transition-fence
+        // requirement. Reacquire only around its exact final-state check and
+        // adoption, never around the preceding artifact/field construction.
+        let terminal_transition = state.current_live_session_transition.lock().await;
+        {
+            let current = state.current_live_state.read().await;
+            let snapshot = current
+                .as_ref()
+                .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+            ensure_projection_context(state, context, snapshot)?;
+            if ProjectionPublicationFence::capture(snapshot)? != published_fence {
+                return Err(ApiError::conflict_with_code(
+                    "accepted_projection_current_state_changed",
+                    "current live state changed before terminal observation adoption",
+                ));
+            }
+        }
+        let adoption = crate::accepted_field_materialization::adopt_terminal_bundle(state).await;
+        drop(terminal_transition);
+        match adoption {
             Ok(()) => {
-                if let Some(published) = state.current_live_state.read().await.as_ref() {
-                    next = published.clone();
+                let published = state.current_live_state.read().await.as_ref().cloned();
+                if let Some(published) = published {
+                    let display_revision = state.current_display_selection.read().await.revision;
+                    realtime_state = crate::current_live_realtime_state_from_snapshot(
+                        state,
+                        &published,
+                        display_revision,
+                    )
+                    .await;
                 }
             }
             Err(error) => tracing::warn!(code = ?error.code, error = %error,
@@ -1882,9 +2149,6 @@ async fn apply_projection(
         }
     }
     crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
-    let display_revision = state.current_display_selection.read().await.revision;
-    let realtime_state =
-        crate::current_live_realtime_state_from_snapshot(state, &next, display_revision).await;
     crate::publish_current_live_realtime_batch_changed(state, &realtime_state, true, 100).await
 }
 
@@ -1977,6 +2241,16 @@ mod tests {
             coordinator_watermark: None,
             coordinator_genesis: None,
         }
+    }
+
+    #[test]
+    fn finished_interactive_commands_return_the_session_to_awaiting_command() {
+        for status in ["completed", "failed", "cancelled"] {
+            assert_eq!(session_status_after_projection(status, true), "awaiting_command");
+            assert_eq!(session_status_after_projection(status, false), status);
+        }
+        assert_eq!(session_status_after_projection("running", true), "running");
+        assert_eq!(session_status_after_projection("waiting_for_solve", false), "awaiting_command");
     }
 
     #[test]

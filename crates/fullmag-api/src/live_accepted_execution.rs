@@ -76,10 +76,7 @@ pub(crate) struct PreparedLiveAcceptedStudy {
     scene: fullmag_authoring::SceneDocument,
     pub(crate) run_id: String,
     project_id: fullmag_application::ProjectId,
-    definition: fullmag_application::ProjectEnvelope,
-    study: fullmag_authoring::StudyPlan,
-    catalog: fullmag_plan::StudyProblemCatalog,
-    intent: fullmag_application::RunIntent,
+    validated_commit: crate::run_intent_persistence::PreparedRunIntentCommit<'static>,
     pub(crate) step_ids: Vec<String>,
     migrated_profile_to_publish: Option<fullmag_ir::ExecutionProfileIR>,
 }
@@ -95,6 +92,8 @@ enum LiveAcceptedSubmission {
     Command {
         command: SessionCommand,
         request_idempotency_key: Option<String>,
+        /// The session's latest live run (a hint for state continuation, ADR 0068 F5).
+        previous_run_id: Option<String>,
     },
     Startup {
         request_id: String,
@@ -137,7 +136,7 @@ pub(crate) async fn submit_live_command_with_transition(
     context: &CurrentLiveRequestContext,
     request_idempotency_key: Option<String>,
 ) -> Result<Option<AcceptedLiveExecution>, ApiError> {
-    let (scene, source_script_path) = {
+    let (scene, source_script_path, previous_run_id) = {
         let current = state.current_live_state.read().await;
         let snapshot = current
             .as_ref()
@@ -154,7 +153,8 @@ pub(crate) async fn submit_live_command_with_transition(
         }
         let source_script_path = (!snapshot.session.script_path.is_empty())
             .then(|| PathBuf::from(snapshot.session.script_path.clone()));
-        (snapshot.scene_document.clone(), source_script_path)
+        let previous_run_id = snapshot.run.as_ref().map(|run| run.run_id.clone());
+        (snapshot.scene_document.clone(), source_script_path, previous_run_id)
     };
 
     let scene = match scene {
@@ -305,7 +305,9 @@ pub(crate) async fn submit_live_command_with_transition(
             LiveAcceptedSubmission::Command {
                 command,
                 request_idempotency_key,
+                previous_run_id,
             },
+            None,
         )
     })
     .await
@@ -773,6 +775,56 @@ pub(crate) async fn prepare_live_study_with_asset_root(
     asset_root: Option<PathBuf>,
     source_script_path: Option<PathBuf>,
 ) -> Result<PreparedLiveAcceptedStudy, ApiError> {
+    prepare_live_study_with_asset_root_inner(
+        state,
+        context,
+        scene,
+        request_id,
+        source_sha256,
+        auto_run,
+        asset_root,
+        source_script_path,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_live_study_with_asset_root_and_progress(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+    scene: fullmag_authoring::SceneDocument,
+    request_id: String,
+    source_sha256: String,
+    auto_run: bool,
+    asset_root: Option<PathBuf>,
+    source_script_path: Option<PathBuf>,
+    progress_sender: tokio::sync::mpsc::Sender<crate::script::PythonHelperProgress>,
+) -> Result<PreparedLiveAcceptedStudy, ApiError> {
+    prepare_live_study_with_asset_root_inner(
+        state,
+        context,
+        scene,
+        request_id,
+        source_sha256,
+        auto_run,
+        asset_root,
+        source_script_path,
+        Some(progress_sender),
+    )
+    .await
+}
+
+async fn prepare_live_study_with_asset_root_inner(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+    scene: fullmag_authoring::SceneDocument,
+    request_id: String,
+    source_sha256: String,
+    auto_run: bool,
+    asset_root: Option<PathBuf>,
+    source_script_path: Option<PathBuf>,
+    progress_sender: Option<tokio::sync::mpsc::Sender<crate::script::PythonHelperProgress>>,
+) -> Result<PreparedLiveAcceptedStudy, ApiError> {
     validate_live_scene_for_context(state, context, &scene).await?;
     let Some(store_root) = state.submit_store_root.clone() else {
         return Err(ApiError::with_status_and_code(
@@ -802,6 +854,7 @@ pub(crate) async fn prepare_live_study_with_asset_root(
                 source_sha256,
                 auto_run,
             },
+            progress_sender,
         )
     })
     .await
@@ -1065,13 +1118,18 @@ async fn publish_accepted_live_study_with_preparation_failure_under_transition(
 /// preparing tasks use the durable worker Stop command; accepted/queued tasks
 /// use the session cancellation-intent record. No command is put on the
 /// legacy in-memory queue.
+///
+/// `requested_run_id` (from `target: {"kind": "run", "run_id"}`) stops that
+/// run instead of the session's latest one; it must be a live run of the same
+/// session and epoch.
 pub(crate) async fn submit_live_stop_with_transition(
     state: &Arc<AppState>,
     context: &CurrentLiveRequestContext,
     command_id: &str,
     reason: &str,
+    requested_run_id: Option<&str>,
 ) -> Result<AcceptedLiveControlExecution, ApiError> {
-    let run_id = {
+    let current_run_id = {
         let current = state.current_live_state.read().await;
         let snapshot = current
             .as_ref()
@@ -1090,7 +1148,7 @@ pub(crate) async fn submit_live_stop_with_transition(
             .ok_or_else(|| ApiError::conflict_with_code(
                 "accepted_control_run_missing",
                 "Docker Stop requires a durable accepted live run",
-            ))?
+            ))
     };
     let Some(store_root) = state.submit_store_root.clone() else {
         return Err(ApiError::with_status_and_code(
@@ -1099,6 +1157,13 @@ pub(crate) async fn submit_live_stop_with_transition(
             "durable accepted live execution storage is not configured",
         ));
     };
+    let run_id = match requested_run_id {
+        Some(requested) => requested.to_string(),
+        None => current_run_id?,
+    };
+    let targeted = requested_run_id.is_some();
+    let session_id = context.session_id.clone();
+    let session_epoch = context.session_epoch;
     let run_id_for_worker = run_id.clone();
     let command_id = command_id.to_string();
     let reason = reason.trim().to_string();
@@ -1107,6 +1172,9 @@ pub(crate) async fn submit_live_stop_with_transition(
     }
     let affected_task_ids = tokio::task::spawn_blocking(move || {
         let store = open_submit_store(&store_root)?;
+        if targeted {
+            ensure_live_run_belongs_to_session(&store, &run_id_for_worker, &session_id, session_epoch)?;
+        }
         let catalog = store
             .read_run_catalog(&run_id_for_worker)
             .map_err(|error| {
@@ -1136,6 +1204,39 @@ pub(crate) async fn submit_live_stop_with_transition(
         run_id,
         affected_task_ids,
     })
+}
+
+fn ensure_live_run_belongs_to_session(
+    store: &fullmag_session::SessionStore,
+    run_id: &str,
+    session_id: &str,
+    session_epoch: u64,
+) -> Result<(), ApiError> {
+    let intent = store
+        .read_run_intent(run_id)
+        .map_err(|error| {
+            ApiError::conflict_with_code(
+                "accepted_control_catalog_unavailable",
+                format!("accepted live Stop intent read failed: {error:#}"),
+            )
+        })?
+        .ok_or_else(|| ApiError::not_found(format!("accepted live run `{run_id}` does not exist")))?;
+    let live = intent.specification.pointer("/parameters/live_workspace");
+    let same_session = live
+        .and_then(|live| live.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(session_id)
+        && live
+            .and_then(|live| live.get("session_epoch"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(session_epoch);
+    if !same_session {
+        return Err(ApiError::conflict_with_code(
+            "accepted_control_run_foreign",
+            format!("accepted live run `{run_id}` does not belong to the current session"),
+        ));
+    }
+    Ok(())
 }
 
 fn request_accepted_stop_for_catalog(
@@ -1286,6 +1387,7 @@ fn materialize_live_accepted(
         scene,
         source_script_path,
         submission,
+        None,
     )?;
     commit_prepared_live_accepted(&prepared)
 }
@@ -1492,6 +1594,7 @@ fn prepare_live_accepted(
     scene: &fullmag_authoring::SceneDocument,
     source_script_path: Option<PathBuf>,
     submission: LiveAcceptedSubmission,
+    progress_sender: Option<tokio::sync::mpsc::Sender<crate::script::PythonHelperProgress>>,
 ) -> Result<PreparedLiveAcceptedStudy, ApiError> {
     let queue_tasks = match &submission {
         LiveAcceptedSubmission::Command { .. } => true,
@@ -1540,6 +1643,7 @@ fn prepare_live_accepted(
             LiveAcceptedSubmission::Command {
                 command,
                 request_idempotency_key,
+                ..
             } => (
                 command.command_id.clone(),
                 request_idempotency_key.clone(),
@@ -1616,6 +1720,7 @@ fn prepare_live_accepted(
         )
     })?;
 
+    let mut selected_step_index = None;
     let selected_step_id = match &submission {
         LiveAcceptedSubmission::Command { command, .. } => {
             if command.kind == "solve" {
@@ -1629,11 +1734,19 @@ fn prepare_live_accepted(
                 if let Some(until_seconds) = command.until_seconds {
                     study.steps[step_index].until_seconds = Some(until_seconds);
                 }
+                // Publish the final m so the next live command can continue from it.
+                crate::live_accepted_continuation::declare_final_state_output(
+                    &mut study.steps[step_index],
+                );
+                selected_step_index = Some(step_index);
                 Some(selected_step_id)
             }
         }
         LiveAcceptedSubmission::Startup { .. } => None,
     };
+    // Defaults first: binding declares a `state` output on the preceding step,
+    // which must not suppress that step's required default outputs.
+    apply_live_accepted_observation_output_defaults(&mut study);
     bind_live_solver_state_inputs(&mut study)?;
     study.validate_for_execution().map_err(|error| {
         ApiError::unprocessable_with_code(
@@ -1642,14 +1755,27 @@ fn prepare_live_accepted(
         )
     })?;
 
-    let mut inputs = crate::script::scene_document_to_study_execution_inputs_with_asset_root(
+    let mut inputs = crate::script::scene_document_to_study_execution_inputs_with_asset_root_and_progress(
         repo_root,
         workspace_root,
         asset_root,
         &effective_scene,
         &requested_execution,
         &study,
+        progress_sender.as_ref(),
     )?;
+    let report_progress = |label: &str, message: &str| {
+        if let Some(sender) = progress_sender.as_ref() {
+            let _ = sender.try_send(crate::script::PythonHelperProgress {
+                label: label.to_owned(),
+                message: message.to_owned(),
+            });
+        }
+    };
+    report_progress(
+        "Validating materialized Study inputs",
+        "Python/Gmsh preparation finished. Validating the materialized Study inputs and resolving execution plans; no solver has started.",
+    );
     apply_docker_output_storage_binding(
         &mut inputs,
         &effective_scene,
@@ -1730,25 +1856,36 @@ fn prepare_live_accepted(
         }
     }
 
-    let catalog = fullmag_application::materialize_study_execution(
-        &study,
-        inputs,
-        |profile_id, version| {
-            if profile_id == published_profile.profile_id && version == published_profile.version {
-                Ok(published_profile.clone())
-            } else {
-                Err(format!(
-                    "execution profile `{profile_id}/{version}` is not the pinned live profile"
-                ))
-            }
-        },
-    )
-    .map_err(|error| {
-        ApiError::unprocessable_with_code(
-            "accepted_execution_materialization_failed",
-            format!("StudyPlan execution materialization failed: {error}"),
-        )
-    })?;
+    let profile_lookup = |profile_id: &str, version: &str| {
+        if profile_id == published_profile.profile_id && version == published_profile.version {
+            Ok(published_profile.clone())
+        } else {
+            Err(format!(
+                "execution profile `{profile_id}/{version}` is not the pinned live profile"
+            ))
+        }
+    };
+    // A continued command pins its initial state, which changes the StudyPlan
+    // digest the catalog is bound to; keep the inputs to rebuild it.
+    let rebind_inputs: Option<Vec<fullmag_application::StudyStepExecutionInput>> =
+        selected_step_index.map(|_| {
+            inputs
+                .iter()
+                .map(|input| fullmag_application::StudyStepExecutionInput {
+                    step_id: input.step_id.clone(),
+                    problem: input.problem.clone(),
+                    layers: input.layers.clone(),
+                })
+                .collect()
+        });
+    let mut catalog =
+        fullmag_application::materialize_study_execution(&study, inputs, profile_lookup)
+            .map_err(|error| {
+                ApiError::unprocessable_with_code(
+                    "accepted_execution_materialization_failed",
+                    format!("StudyPlan execution materialization failed: {error}"),
+                )
+            })?;
 
     let entries = catalog.entries();
     let requested_gpu = requested_execution.device.eq_ignore_ascii_case("gpu");
@@ -1837,6 +1974,59 @@ fn prepare_live_accepted(
         ));
     }
 
+    // Continuation (ADR 0068 F5): start from the previous live command's final
+    // m when the accepted plan has exactly the same magnetization layout.
+    let initial_state = match (&submission, selected_step_index) {
+        (LiveAcceptedSubmission::Command { previous_run_id, .. }, Some(step_index)) => {
+            let step_id = study.steps[step_index].step_id.clone();
+            let plan = lowered
+                .steps
+                .iter()
+                .find(|step| step.step_id == step_id)
+                .and_then(|step| step.execution_plan.as_ref());
+            let decision = match plan {
+                Some(plan) => crate::live_accepted_continuation::decide_initial_state(
+                    &store,
+                    previous_run_id.as_deref(),
+                    &context.session_id,
+                    context.session_epoch,
+                    plan,
+                ),
+                None => crate::live_accepted_continuation::InitialStateDecision::Authored {
+                    reason: "selected step has no execution plan".into(),
+                },
+            };
+            if let crate::live_accepted_continuation::InitialStateDecision::Continuation(source) =
+                &decision
+            {
+                crate::live_accepted_continuation::declare_pinned_initial_state(
+                    &mut study.steps[step_index],
+                    source,
+                );
+                study.validate_for_execution().map_err(|error| {
+                    ApiError::unprocessable_with_code(
+                        "accepted_study_plan_invalid",
+                        format!("continued live study is not executable: {error}"),
+                    )
+                })?;
+                let inputs = rebind_inputs.expect("selected live step keeps its inputs");
+                catalog = fullmag_application::materialize_study_execution(
+                    &study,
+                    inputs,
+                    profile_lookup,
+                )
+                .map_err(|error| {
+                    ApiError::unprocessable_with_code(
+                        "accepted_execution_materialization_failed",
+                        format!("continued StudyPlan materialization failed: {error}"),
+                    )
+                })?;
+            }
+            Some(decision.provenance())
+        }
+        _ => None,
+    };
+
     let scene_value = serde_json::to_value(&effective_scene).map_err(|error| {
         ApiError::internal(format!("failed to serialize accepted SceneDocument: {error}"))
     })?;
@@ -1875,6 +2065,12 @@ fn prepare_live_accepted(
             "startup_source_sha256": &startup_source_sha256,
         }
     });
+    if let Some(initial_state) = initial_state {
+        parameters["live_workspace"]
+            .as_object_mut()
+            .expect("live_workspace parameters object")
+            .insert("initial_state_source".to_string(), initial_state);
+    }
     if !queue_tasks {
         parameters
             .as_object_mut()
@@ -1901,6 +2097,10 @@ fn prepare_live_accepted(
         scheduling_priority: 0,
         requested_execution,
     };
+    report_progress(
+        "Materializing the accepted run definition",
+        "Execution plans are resolved. Materializing the accepted run definition from the validated model and Study.",
+    );
     let intent = fullmag_application::materialize_run_intent(
         &definition,
         &study,
@@ -1914,16 +2114,30 @@ fn prepare_live_accepted(
             format!("typed live RunIntent materialization failed: {error:#}"),
         )
     })?;
+    report_progress(
+        "Validating and encoding durable inputs",
+        "Validating and encoding immutable run inputs before publication. Native domain preparation and Compute have not started.",
+    );
+    let validated_commit = crate::run_intent_persistence::prepare_owned_run_intent_commit(
+        intent,
+        &definition,
+        &study,
+        &catalog,
+        BTreeMap::new(),
+    )
+    .map_err(|error| {
+        ApiError::unprocessable_with_code(
+            "accepted_run_commit_failed",
+            format!("durable accepted RunIntent precommit validation failed: {error:#}"),
+        )
+    })?;
     Ok(PreparedLiveAcceptedStudy {
         store_root: store_root.to_path_buf(),
         backlog_limit,
         scene: scene.clone(),
         run_id,
         project_id,
-        definition,
-        study,
-        catalog,
-        intent,
+        validated_commit,
         step_ids,
         migrated_profile_to_publish,
     })
@@ -1952,18 +2166,14 @@ pub(crate) fn commit_prepared_live_accepted(
             ));
         }
     }
-    // A successful return is the typed commit boundary: the persistence
-    // helper validates the immutable intent, writes the CAS/RunIntent under
-    // one lease, and constructs its SubmitReceipt from that same intent. Do
-    // not add a fallible post-commit validation here; after acceptance any
-    // error path must preserve the accepted identity for recovery.
-    let _committed = crate::run_intent_persistence::commit_validated_run_intent_with_backlog_limit(
+    // A successful return is the typed commit boundary: the opaque payload
+    // was fully validated during preparation, and this helper writes its
+    // pinned CAS bytes and RunIntent under one lease. Do not add a fallible
+    // post-commit validation here; after acceptance any error path must
+    // preserve the accepted identity for recovery.
+    let _committed = crate::run_intent_persistence::commit_prepared_run_intent_with_backlog_limit(
         &store,
-        &prepared.intent,
-        &prepared.definition,
-        &prepared.study,
-        &prepared.catalog,
-        &BTreeMap::new(),
+        &prepared.validated_commit,
         prepared.backlog_limit,
     )
     .map_err(|error| {
@@ -2079,6 +2289,38 @@ fn select_live_step(
         "accepted_study_step_ambiguous",
         "a live Run/Relax command must target exactly one enabled StudyPlan step",
     ))
+}
+
+/// Supply the accepted-live observation outputs required by the shared FDM/FEM
+/// Run/Relax workers when an enabled primitive has no authored outputs. The
+/// public authoring projection remains unchanged; explicit outputs and other
+/// primitive, macro, group, or unsupported steps retain their authored shape.
+fn apply_live_accepted_observation_output_defaults(study: &mut fullmag_authoring::StudyPlan) {
+    for step in &mut study.steps {
+        if !step.enabled || !step.outputs.is_empty() {
+            continue;
+        }
+        let needs_observation_outputs = match &step.kind {
+            fullmag_authoring::StudyStepKind::Primitive { stage_kind } => matches!(
+                *stage_kind,
+                fullmag_authoring::StudyPrimitiveStageKind::Run
+                    | fullmag_authoring::StudyPrimitiveStageKind::Relax
+            ),
+            _ => false,
+        };
+        if needs_observation_outputs {
+            step.outputs = vec![
+                fullmag_authoring::StudyOutputPort {
+                    port_id: "final_state".to_owned(),
+                    data_kind: fullmag_authoring::StudyPortDataKind::State,
+                },
+                fullmag_authoring::StudyOutputPort {
+                    port_id: "total_energy".to_owned(),
+                    data_kind: fullmag_authoring::StudyPortDataKind::Scalar,
+                },
+            ];
+        }
+    }
 }
 
 fn bounded_gpu_scope(problem: &fullmag_ir::ProblemIR) -> bool {
@@ -2315,6 +2557,30 @@ fn ensure_migrated_profile_published(
     }
 
     const LEGACY_LIVE_PROFILE_INTENT: &str = "live-legacy-execution-default";
+    // The scheduler and workers share the store writer. Hold one (re-entrant)
+    // writer lease for read-check-publish so a busy writer is retried instead
+    // of failing the command, and the catalogue revision cannot move between
+    // the lookup and the publication.
+    let _publication_lease =
+        fullmag_runtime_control::retry_store_writer_busy(|| store.write_transaction())
+            .map_err(|error| profile_catalog_error(format!("{error:#}")))?;
+    let catalog = store
+        .read_execution_profile_catalog()
+        .map_err(|error| profile_catalog_error(error.to_string()))?;
+    if let Some(existing) = catalog.entries.iter().find(|entry| {
+        entry.profile.profile_id == profile.profile_id && entry.profile.version == profile.version
+    }) {
+        if existing.profile_sha256 == expected_sha256 && existing.profile == *profile {
+            return Ok(existing.clone());
+        }
+        return Err(ApiError::conflict_with_code(
+            "execution_profile_hash_conflict",
+            format!(
+                "canonical legacy profile `{}/{}` conflicts with the published catalogue hash",
+                profile.profile_id, profile.version
+            ),
+        ));
+    }
     let publication = store.publish_execution_profile(
         catalog.revision,
         LEGACY_LIVE_PROFILE_INTENT,
@@ -2356,11 +2622,186 @@ mod tests {
 
     use super::{
         accepted_frontier_preparation_is_ready, apply_docker_output_storage_binding,
+        apply_live_accepted_observation_output_defaults,
         apply_resolved_docker_output_storage_binding, bounded_gpu_relaxation_algorithm,
         bounded_recovery_error,
         request_accepted_stop_for_catalog, validate_scene_revision_and_content,
         AcceptedLiveStudyExecution, AcceptedLiveStudyPreparationError, MAX_RECOVERY_ERROR_CHARS,
     };
+
+    fn live_step(
+        step_id: &str,
+        enabled: bool,
+        kind: fullmag_authoring::StudyStepKind,
+        outputs: Vec<fullmag_authoring::StudyOutputPort>,
+    ) -> fullmag_authoring::StudyStep {
+        fullmag_authoring::StudyStep {
+            step_id: step_id.to_owned(),
+            label: step_id.to_owned(),
+            enabled,
+            notes: None,
+            source: None,
+            kind,
+            model: fullmag_authoring::StudyModelReference {
+                model_id: "model:test".into(),
+                version: "1".into(),
+            },
+            solver_config: fullmag_authoring::StudySolverConfigReference {
+                preset_id: "solver:test".into(),
+                version: "1".into(),
+            },
+            discretization: fullmag_authoring::StudyDiscretizationReference {
+                recipe_id: "mesh:test".into(),
+                version: "1".into(),
+            },
+            execution_profile: fullmag_authoring::StudyExecutionProfileReference {
+                profile_id: "profile:test".into(),
+                version: "1".into(),
+            },
+            until_seconds: None,
+            inputs: Vec::new(),
+            completion_dependencies: Vec::new(),
+            outputs,
+            acceptance: fullmag_authoring::StudyAcceptancePolicy::Any,
+            acquisition: fullmag_authoring::StudyAcquisitionPolicy::Exclusive,
+            legacy_payload: None,
+        }
+    }
+
+    fn default_observation_outputs() -> Vec<fullmag_authoring::StudyOutputPort> {
+        vec![
+            fullmag_authoring::StudyOutputPort {
+                port_id: "final_state".into(),
+                data_kind: fullmag_authoring::StudyPortDataKind::State,
+            },
+            fullmag_authoring::StudyOutputPort {
+                port_id: "total_energy".into(),
+                data_kind: fullmag_authoring::StudyPortDataKind::Scalar,
+            },
+        ]
+    }
+
+    #[test]
+    fn live_accepted_observation_defaults_are_limited_to_enabled_empty_run_relax_steps() {
+        use fullmag_authoring::{StudyPrimitiveStageKind as Stage, StudyStepKind as Kind};
+
+        let explicit = vec![
+            fullmag_authoring::StudyOutputPort {
+                port_id: "authored-state".into(),
+                data_kind: fullmag_authoring::StudyPortDataKind::State,
+            },
+            fullmag_authoring::StudyOutputPort {
+                port_id: "authored-table".into(),
+                data_kind: fullmag_authoring::StudyPortDataKind::Table,
+            },
+        ];
+        let antenna = vec![fullmag_authoring::StudyOutputPort {
+            port_id: "inspection".into(),
+            data_kind: fullmag_authoring::StudyPortDataKind::Artifact,
+        }];
+        let mut study = fullmag_authoring::StudyPlan {
+            schema_version: "study_plan.v2".into(),
+            study_id: "study:test".into(),
+            revision: 1,
+            source_pipeline_version: None,
+            steps: vec![
+                live_step(
+                    "run",
+                    true,
+                    Kind::Primitive {
+                        stage_kind: Stage::Run,
+                    },
+                    Vec::new(),
+                ),
+                live_step(
+                    "relax",
+                    true,
+                    Kind::Primitive {
+                        stage_kind: Stage::Relax,
+                    },
+                    Vec::new(),
+                ),
+                live_step(
+                    "disabled-run",
+                    false,
+                    Kind::Primitive {
+                        stage_kind: Stage::Run,
+                    },
+                    Vec::new(),
+                ),
+                live_step(
+                    "explicit-run",
+                    true,
+                    Kind::Primitive {
+                        stage_kind: Stage::Run,
+                    },
+                    explicit.clone(),
+                ),
+                live_step(
+                    "eigenmodes",
+                    true,
+                    Kind::Primitive {
+                        stage_kind: Stage::Eigenmodes,
+                    },
+                    Vec::new(),
+                ),
+                live_step(
+                    "antenna",
+                    true,
+                    Kind::Primitive {
+                        stage_kind: Stage::AntennaFieldSolve,
+                    },
+                    antenna.clone(),
+                ),
+                live_step(
+                    "empty-antenna",
+                    true,
+                    Kind::Primitive {
+                        stage_kind: Stage::AntennaFieldSolve,
+                    },
+                    Vec::new(),
+                ),
+                live_step(
+                    "macro",
+                    true,
+                    Kind::Macro {
+                        macro_kind: fullmag_authoring::StudyMacroStageKind::RelaxRun,
+                    },
+                    Vec::new(),
+                ),
+                live_step(
+                    "group",
+                    true,
+                    Kind::Group {
+                        child_step_ids: Vec::new(),
+                    },
+                    Vec::new(),
+                ),
+                live_step(
+                    "unsupported",
+                    true,
+                    Kind::Unsupported {
+                        unsupported_kind: "future_step".into(),
+                        payload: serde_json::json!({}),
+                    },
+                    Vec::new(),
+                ),
+            ],
+        };
+
+        apply_live_accepted_observation_output_defaults(&mut study);
+
+        assert_eq!(study.steps[0].outputs, default_observation_outputs());
+        assert_eq!(study.steps[1].outputs, default_observation_outputs());
+        assert!(study.steps[2].outputs.is_empty());
+        assert_eq!(study.steps[3].outputs, explicit);
+        assert!(study.steps[4].outputs.is_empty());
+        assert_eq!(study.steps[5].outputs, antenna);
+        assert!(study.steps[6].outputs.is_empty());
+        assert!(study.steps[7].outputs.is_empty());
+        assert!(study.steps[8].outputs.is_empty());
+        assert!(study.steps[9].outputs.is_empty());
+    }
 
     #[test]
     fn startup_commit_guard_rejects_changed_scene_revision() {

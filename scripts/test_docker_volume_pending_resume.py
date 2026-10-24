@@ -106,6 +106,7 @@ class RecreateResumeCallerGateTests(unittest.TestCase):
                 "docker_volume_pre_ack_retry.retained_pre_ack_context",
                 return_value=None,
             ),
+            patch("docker_volume_pre_api_stop.retained_context", return_value=None),
         ):
             context = docker_dev._retained_recovery_context(
                 control,

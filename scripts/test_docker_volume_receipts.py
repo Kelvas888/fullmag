@@ -48,7 +48,8 @@ class VolumeReceiptTests(unittest.TestCase):
                                 "inputs": {"source_root": str(source), "gpu_access_requested": policy,
                                            "image_id": "sha256:" + "b" * 64}}
                     control = mock.Mock(project=project_name)
-                    control.read.side_effect = [previous, document]
+                    # Retained receipt, its Compose document, then no aborted preparation.
+                    control.read.side_effect = [previous, document, None]
                     configuration = {"services": {"fem-gpu-toolchain": {"build": {"args": {
                         "FULLMAG_CUDA_BASE_IMAGE": "unused"}}}}}
                     with mock.patch.object(docker_dev, "_select_source", return_value=(source, {})), \

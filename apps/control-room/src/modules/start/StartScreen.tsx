@@ -4,6 +4,8 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "reac
 
 import { createCommandContext } from "@/kernel/commands/commandContext";
 import { homeView } from "@/kernel/layout/homeView";
+import { instanceTabs, useEmbeddedInstanceTab } from "@/kernel/layout/instanceTabs";
+import { useInstanceDiscovery } from "@/kernel/resources/instanceDiscoveryResources";
 import { useProjectDocumentSnapshot } from "@/kernel/persistence/ProjectDocumentStatus";
 import { useSessionCollection } from "@/kernel/resources/useSessionCollection";
 import { useSessionResourceIdentity, useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
@@ -98,6 +100,36 @@ export function StartScreen({ kernel }: ModuleProps) {
     startScreenStore.subscribe,
     startScreenStore.getSnapshot,
     startScreenStore.getServerSnapshot,
+  );
+  // Home lies over the workspace while a session is open; list it so the
+  // simulation stays reachable (including sessions a Python script created).
+  const activeSessions = useMemo(
+    () =>
+      (sessions.resource.data?.sessions ?? []).map((entry) => ({
+        sessionId: entry.session_id,
+        name: entry.name,
+        status: entry.status,
+        current: entry.current,
+      })),
+    [sessions.resource.data],
+  );
+  // Other instances open in tabs of this page; inside another instance's tab
+  // the host page owns the tabs, so the section is not offered there.
+  const embeddedInTab = useEmbeddedInstanceTab();
+  const discovery = useInstanceDiscovery({ enabled: !embeddedInTab });
+  const otherInstances = useMemo(
+    () =>
+      (discovery.data?.instances ?? [])
+        .filter((instance) => !instance.is_self)
+        .map((instance) => {
+          const session =
+            instance.sessions.find((entry) => entry.current) ?? instance.sessions[0] ?? null;
+          return {
+            port: instance.port,
+            session: session ? { name: session.name, status: session.status } : null,
+          };
+        }),
+    [discovery.data],
   );
   // An empty collection is a confirmed no-session. A non-empty collection
   // requires a matching current-status identity before replacement can be
@@ -379,6 +411,10 @@ export function StartScreen({ kernel }: ModuleProps) {
               onResumeContinue={resumeContinue}
               onDiscardContinue={discardContinue}
               onRunCommand={runCommand}
+              activeSessions={activeSessions}
+              onOpenActiveSession={() => runCommand("workspace.return-to-workspace")}
+              otherInstances={otherInstances}
+              onOpenInstance={embeddedInTab ? undefined : instanceTabs.open}
             />
           ) : section === "templates" ? (
             <TemplatesSection compute={compute} />
