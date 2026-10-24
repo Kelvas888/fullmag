@@ -3,13 +3,20 @@
 import { Button } from "@/shared/ui/Button";
 
 import { useInstanceDiscovery } from "../resources/instanceDiscoveryResources";
-import { instanceOrigin, instanceTabs, useInstanceTabs } from "./instanceTabs";
+import {
+  INSTANCE_TAB_FRAME_NAME,
+  instanceOrigin,
+  instanceTabs,
+  useInstanceTabs,
+} from "./instanceTabs";
 
 /**
  * Other instances' own Control Rooms, each in a frame of its own origin, so the
  * UI always matches the version of that instance's API (ADR 0069). A frame is
- * created the first time its tab comes to the front and then stays mounted
- * (hidden by visibility) to keep its view state and WebGL context.
+ * created when its tab comes to the front and stays mounted (hidden by
+ * visibility) to keep its view state and WebGL context, up to
+ * `MAX_MOUNTED_FRAMES` most recently used frames. A hidden frame keeps
+ * running: its document stays visible to itself.
  */
 export function InstanceTabFrames() {
   const tabs = useInstanceTabs();
@@ -35,6 +42,7 @@ export function InstanceTabFrames() {
           data-active={port === activePort || undefined}
           data-instance-port={port}
           key={port}
+          name={INSTANCE_TAB_FRAME_NAME}
           src={`${instanceOrigin(port, window.location)}/workspace`}
           title={`Fullmag instance on port ${port}`}
         />

@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 import nextConfig, {
   DOCKER_DEV_WATCH_POLLING_DEFAULT_MS,
   INSTANCE_TAB_FRAME_ANCESTORS,
+  instanceTabFrameSources,
   isDockerDevGeneratedWatchPath,
   resolveControlRoomDistDir,
   resolveDockerDevWatchOptions,
@@ -322,12 +323,25 @@ describe("control-room Next dev proxy config", () => {
 });
 
 describe("instance tab framing (ADR 0069)", () => {
-  it("lets only this origin and loopback instances frame the Control Room", () => {
-    expect(INSTANCE_TAB_FRAME_ANCESTORS).toContain("'self'");
-    expect(INSTANCE_TAB_FRAME_ANCESTORS).toContain("http://127.0.0.1:*");
-    expect(INSTANCE_TAB_FRAME_ANCESTORS).toContain("http://localhost:*");
-    for (const source of INSTANCE_TAB_FRAME_ANCESTORS) {
-      expect(source).toMatch(/^('self'|https?:\/\/(127\.0\.0\.1|localhost):\*)$/);
+  it("lists only http loopback origins of the discovery window", () => {
+    expect(INSTANCE_TAB_FRAME_ANCESTORS[0]).toBe("'self'");
+    expect(INSTANCE_TAB_FRAME_ANCESTORS).toContain("http://127.0.0.1:3197");
+    expect(INSTANCE_TAB_FRAME_ANCESTORS).toContain("http://localhost:3260");
+    expect(INSTANCE_TAB_FRAME_ANCESTORS).not.toContain("http://127.0.0.1:3261");
+    for (const source of INSTANCE_TAB_FRAME_ANCESTORS.slice(1)) {
+      expect(source).toMatch(/^http:\/\/(127\.0\.0\.1|localhost):\d+$/);
     }
+  });
+
+  it("follows the discovery port window and rejects an invalid one", () => {
+    expect(instanceTabFrameSources("4000-4001")).toEqual([
+      "'self'",
+      "http://127.0.0.1:4000",
+      "http://localhost:4000",
+      "http://127.0.0.1:4001",
+      "http://localhost:4001",
+    ]);
+    expect(() => instanceTabFrameSources("4001-4000")).toThrow();
+    expect(() => instanceTabFrameSources("3000-3256")).toThrow();
   });
 });

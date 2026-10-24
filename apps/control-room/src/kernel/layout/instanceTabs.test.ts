@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  INSTANCE_TAB_FRAME_NAME,
   INSTANCE_TABS_STORAGE_KEY,
+  MAX_MOUNTED_FRAMES,
   instanceOrigin,
   instanceTabs,
+  isEmbeddedInstanceTab,
 } from "./instanceTabs";
 
 function memoryStorage(initial: Record<string, string> = {}) {
@@ -30,7 +33,7 @@ describe("instanceTabs", () => {
     expect(instanceTabs.getSnapshot()).toEqual({
       openPorts: [3206, 3210],
       activePort: 3206,
-      framedPorts: [3206, 3210],
+      framedPorts: [3210, 3206],
     });
     expect(storage.values.get(INSTANCE_TABS_STORAGE_KEY)).toBe("[3206,3210]");
   });
@@ -82,6 +85,25 @@ describe("instanceTabs", () => {
     });
     instanceTabs.open(3206);
     expect(instanceTabs.getSnapshot().openPorts).toEqual([3206]);
+  });
+
+  it("keeps only the most recently used frames mounted", () => {
+    vi.stubGlobal("window", { localStorage: memoryStorage() });
+    for (const port of [3201, 3202, 3203, 3204]) instanceTabs.open(port);
+    expect(instanceTabs.getSnapshot().framedPorts).toEqual([3202, 3203, 3204]);
+    expect(MAX_MOUNTED_FRAMES).toBe(3);
+    instanceTabs.activate(3202);
+    expect(instanceTabs.getSnapshot().framedPorts).toEqual([3203, 3204, 3202]);
+    instanceTabs.activate(3201);
+    expect(instanceTabs.getSnapshot().framedPorts).toEqual([3204, 3202, 3201]);
+    expect(instanceTabs.getSnapshot().openPorts).toEqual([3201, 3202, 3203, 3204]);
+  });
+
+  it("treats only a frame named by the tab host as embedded", () => {
+    vi.stubGlobal("window", { name: INSTANCE_TAB_FRAME_NAME });
+    expect(isEmbeddedInstanceTab()).toBe(true);
+    vi.stubGlobal("window", { name: "ide-preview" });
+    expect(isEmbeddedInstanceTab()).toBe(false);
   });
 
   it("notifies subscribers only on change", () => {

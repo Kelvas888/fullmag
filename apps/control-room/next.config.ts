@@ -302,17 +302,48 @@ const allowedDevOrigins = [
  * rejects `headers()` when `output: "export"` is set, and the desktop shell
  * is not a browser-hosted document anyway.
  */
+/** Same window and variable as the API's instance discovery (ADR 0069). */
+const INSTANCE_DISCOVERY_PORTS_ENV = "FULLMAG_INSTANCE_DISCOVERY_PORTS";
+const DEFAULT_INSTANCE_DISCOVERY_PORTS = { first: 3197, last: 3260 };
+const MAX_INSTANCE_DISCOVERY_PORTS = 256;
+
+export function resolveInstanceDiscoveryPorts(
+  value: string | undefined,
+): { first: number; last: number } {
+  if (value === undefined || value.trim() === "") return DEFAULT_INSTANCE_DISCOVERY_PORTS;
+  const match = /^\s*(\d+)\s*-\s*(\d+)\s*$/.exec(value);
+  const first = match ? Number(match[1]) : Number.NaN;
+  const last = match ? Number(match[2]) : Number.NaN;
+  if (
+    !Number.isInteger(first) ||
+    !Number.isInteger(last) ||
+    first < 1 ||
+    last > 65_535 ||
+    last < first ||
+    last - first + 1 > MAX_INSTANCE_DISCOVERY_PORTS
+  ) {
+    throw new Error(`${INSTANCE_DISCOVERY_PORTS_ENV} must be an ascending window of at most 256 ports`);
+  }
+  return { first, last };
+}
+
 /**
- * Loopback origins of Fullmag instances: they may embed this Control Room as
- * an instance tab, and this Control Room may frame them (ADR 0069).
+ * Exactly the loopback origins of the discovery window: they may embed this
+ * Control Room as an instance tab, and this Control Room may frame them
+ * (ADR 0069). Other local servers and remote pages cannot frame it.
  */
-export const INSTANCE_TAB_FRAME_ANCESTORS = [
-  "'self'",
-  "http://127.0.0.1:*",
-  "https://127.0.0.1:*",
-  "http://localhost:*",
-  "https://localhost:*",
-];
+export function instanceTabFrameSources(value: string | undefined): string[] {
+  const { first, last } = resolveInstanceDiscoveryPorts(value);
+  const origins: string[] = ["'self'"];
+  for (let port = first; port <= last; port += 1) {
+    origins.push(`http://127.0.0.1:${port}`, `http://localhost:${port}`);
+  }
+  return origins;
+}
+
+export const INSTANCE_TAB_FRAME_ANCESTORS = instanceTabFrameSources(
+  process.env[INSTANCE_DISCOVERY_PORTS_ENV],
+);
 
 function securityHeaders() {
   return [

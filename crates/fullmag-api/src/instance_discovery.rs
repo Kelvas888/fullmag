@@ -7,7 +7,8 @@
 //! service, is not reported as an instance.
 
 use std::ops::RangeInclusive;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,6 +32,19 @@ const HOST_ENV: &str = "FULLMAG_INSTANCE_DISCOVERY_HOST";
 const DOCKER_HOST_GATEWAY: &str = "host.docker.internal";
 const LOOPBACK_HOST: &str = "127.0.0.1";
 const INSTANCE_HEADER: &str = "x-fullmag-api-instance";
+/// Viewers poll discovery; one probe pass serves every request in this window.
+const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
+
+struct CachedDiscovery {
+    at: Instant,
+    window: RangeInclusive<u16>,
+    instances: Vec<DiscoveredInstance>,
+}
+
+fn discovery_cache() -> &'static tokio::sync::Mutex<Option<CachedDiscovery>> {
+    static CACHE: OnceLock<tokio::sync::Mutex<Option<CachedDiscovery>>> = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
 
 /// One instance's answer to the session-list probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +226,27 @@ pub(crate) async fn discover_instances(
         }
     }
     discovered_instances(answers, self_instance_id)
+}
+
+/// Single-flight discovery: concurrent requests wait for one probe pass and
+/// share a result younger than `DISCOVERY_CACHE_TTL`.
+pub(crate) async fn discover_instances_cached(
+    window: RangeInclusive<u16>,
+    self_instance_id: &str,
+) -> Vec<DiscoveredInstance> {
+    let mut cache = discovery_cache().lock().await;
+    if let Some(cached) = cache.as_ref() {
+        if cached.window == window && cached.at.elapsed() < DISCOVERY_CACHE_TTL {
+            return cached.instances.clone();
+        }
+    }
+    let instances = discover_instances(window.clone(), self_instance_id).await;
+    *cache = Some(CachedDiscovery {
+        at: Instant::now(),
+        window,
+        instances: instances.clone(),
+    });
+    instances
 }
 
 #[cfg(test)]

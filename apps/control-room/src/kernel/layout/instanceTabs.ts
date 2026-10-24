@@ -16,14 +16,20 @@ export interface InstanceTabsSnapshot {
   /** The instance tab in front, or null when Home or this session is. */
   readonly activePort: number | null;
   /**
-   * Tabs that have been in front on this page. Their frames stay mounted so
-   * an instance's view survives switching away; restored tabs load lazily.
+   * Tabs whose frames are mounted, least recently in front first. A frame
+   * keeps its view and WebGL context while hidden; at most
+   * `MAX_MOUNTED_FRAMES` stay mounted, so a few tabs never exhaust the
+   * browser's WebGL contexts. Restored tabs load lazily.
    */
   readonly framedPorts: readonly number[];
 }
 
 export const INSTANCE_TABS_STORAGE_KEY = "fullmag.instance-tabs.v1";
 const MAX_OPEN_TABS = 16;
+/** Frames of other instances kept mounted besides this page's own viewport. */
+export const MAX_MOUNTED_FRAMES = 3;
+/** Window name of an instance tab frame; the embedded page checks it. */
+export const INSTANCE_TAB_FRAME_NAME = "fullmag-instance-tab";
 const EMPTY: InstanceTabsSnapshot = { openPorts: [], activePort: null, framedPorts: [] };
 
 const listeners = new Set<Listener>();
@@ -54,8 +60,10 @@ function writeStoredPorts(ports: readonly number[]): void {
   }
 }
 
-function withPort(ports: readonly number[], port: number): readonly number[] {
-  return ports.includes(port) ? ports : [...ports, port];
+/** Move `port` to the most recent end and drop the oldest beyond the cap. */
+function framedWith(ports: readonly number[], port: number): readonly number[] {
+  if (ports[ports.length - 1] === port) return ports;
+  return [...ports.filter((framed) => framed !== port), port].slice(-MAX_MOUNTED_FRAMES);
 }
 
 function restore(): void {
@@ -91,7 +99,7 @@ export const instanceTabs = {
     const openPorts = snapshot.openPorts.includes(port)
       ? snapshot.openPorts
       : [...snapshot.openPorts, port].slice(-MAX_OPEN_TABS);
-    publish({ openPorts, activePort: port, framedPorts: withPort(snapshot.framedPorts, port) });
+    publish({ openPorts, activePort: port, framedPorts: framedWith(snapshot.framedPorts, port) });
   },
   /** Brings an open instance tab to the front, or null for Home/this session. */
   activate: (port: number | null): void => {
@@ -100,7 +108,7 @@ export const instanceTabs = {
     publish({
       ...snapshot,
       activePort: port,
-      framedPorts: port === null ? snapshot.framedPorts : withPort(snapshot.framedPorts, port),
+      framedPorts: port === null ? snapshot.framedPorts : framedWith(snapshot.framedPorts, port),
     });
   },
   /** Closes the tab. The instance and its session keep running. */
@@ -132,15 +140,14 @@ export function useInstanceTabs(): InstanceTabsSnapshot {
   );
 }
 
-/** Whether this Control Room runs inside another instance's tab. */
+/**
+ * Whether this Control Room runs inside another instance's tab. The host
+ * names the frame; any other embedding (e.g. an IDE preview pane) keeps the
+ * full shell.
+ */
 export function isEmbeddedInstanceTab(): boolean {
   if (typeof window === "undefined") return false;
-  try {
-    return window.top !== window.self;
-  } catch {
-    // A cross-origin parent can make the comparison throw: still embedded.
-    return true;
-  }
+  return window.name === INSTANCE_TAB_FRAME_NAME;
 }
 
 /** The origin of the instance on `port`, on the host this page was opened with. */

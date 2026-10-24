@@ -6,7 +6,7 @@
 use axum::Json;
 
 use crate::error::ApiError;
-use crate::instance_discovery::{configured_port_window, discover_instances};
+use crate::instance_discovery::{configured_port_window, discover_instances_cached};
 use crate::router_v2::middleware::version::instance_id;
 use crate::schemas::instances::InstanceDiscoveryResource;
 
@@ -22,7 +22,7 @@ use crate::schemas::instances::InstanceDiscoveryResource;
 pub async fn get_instances() -> Result<Json<InstanceDiscoveryResource>, ApiError> {
     let window = configured_port_window().map_err(ApiError::internal)?;
     let self_api_instance_id = instance_id();
-    let instances = discover_instances(window.clone(), self_api_instance_id).await;
+    let instances = discover_instances_cached(window.clone(), self_api_instance_id).await;
     Ok(Json(InstanceDiscoveryResource {
         schema_version: "1.0.0".to_string(),
         self_api_instance_id: self_api_instance_id.to_string(),
