@@ -357,3 +357,58 @@ następny test eksportu PNG przekroczył 20 s czekania na download.
 Nie oznaczono go jako PASS. Osobny dowód kamery:
 verification/ring-camera-full-mesh-browser-proof.json. Trwa test Primitive
 przed pierwszą publikacją siatki oraz diagnoza eksportu.
+
+
+## Odbiór rzeczywistego Primitive przed pierwszą siatką — 24.10
+
+Scratch `session-18e18b10f1f79f7f00000c10` utworzono przez publiczne API;
+zaimportowano tę samą geometrię i authored study. Przed poleceniem mesh_build:
+run=null, domain.cell_count=0. Źródła i receipt jednorazowego importu zachowano
+w verification/attempts/94f041ceeec8482f94cfad3d7400337f/continuation.json.
+Nie pozostawiono eksperymentalnego helpera importu w repozytorium; jego
+źródła i nieudane receipty zachowano w control volume.
+
+Browser `8fda5f6f37384bfdb0a8a11359d1a18c`: viewport_camera.state=passed,
+26 captures, w tym wszystkie 9 ujęć ringu bez opublikowanej siatki.
+Widoczny canvas, niezerowy drawing buffer, context_lost=false.
+Oględziny PNG: ciągła powierzchnia bez pasów głębokości; wireframe pokazuje
+obrzeża kapsli, bez wachlarza przekątnych. Perspektywa i ortho poprawne.
+Testy eksportu PNG, DPR1/DPR2 oraz lifecycle również zakończyły się poprawnie.
+Ogólny harness pozostał failed-confirmed przez 20 odpowiedzi HTTP422 z
+planar-default/meta przy pustej domenie. Nie wyciszono ich. To odrębna
+ścieżka gotowości pola 2D; poprawki tej ścieżki znajdują się w cudzych,
+niezacommitowanych zmianach głównego checkoutu i nie są częścią tego PR.
+Dowód: verification/ring-primitive-browser-proof.json.
+
+## Jawne przejście Primitive → opublikowana siatka
+
+Wysłano dokładnie jedno mesh_build, intent
+`viewport-depth-mesh-0333b7f51c5b053c92eaff9b`, z warunkami scene_revision=1,
+command_revision=0. HTTP przekroczyło 30 s; nie ponawiano POST.
+Odczyt tego samego polecenia `fm-d8abd9db-ec0c-449b-ab30-2a15267a3739`
+potwierdził completed po około 612 s. Ta sama tożsamość sesji i scope;
+1087250 cells, mesh/topology/mesh_build revisions=3. Runtime utworzył
+przyjęty Study do przygotowania domeny: run
+`run-live-b0948e93e19d555f87de205d3d7b5034af9575ac10686a2ded64787fd49adbf3`,
+waiting_for_solve, stages=[pending], completed_stage_indexes=[], solver_time=0.
+Nie wysyłano Compute ani Solve. Legacy solver_steps=1 oznacza tu plan,
+nie wykonany krok; metrics.total_steps=0.
+
+**Wykryta rozbieżność runtime, niezaliczona kwalifikacja GPU:** import
+SceneResource zachował authored GPU/double/strict, lecz scratch zachował
+effective request i resolved CPU/double/strict z inicjalizacji. Polecenie
+mesh_build raportuje CPU. Odczytowy observer
+`51b3fd2dc4dc4bd2bedc2d6813d8e8c7` prawidłowo zakończył się asercją
+niezgodności intentu; nie oznaczono go jako PASS. Samo completed i zasób
+siatki są potwierdzone, parytet GPU nie jest. Wcześniejsza sesja uruchomiona
+z pliku GPU oraz jej dowód kamery pozostają odrębnym przebiegiem.
+Diagnostyka build-ring-mesh.py teraz odmawia już przed mutacją, jeśli
+requested/resolved lane nie odpowiada authored strict intent. Jej zapis
+receiptu jest wyłączny i atomowy, bez automatycznego replay po timeout.
+
+Kontrole guardów diagnostyki wykonane interpretacyjnie na rzeczywistym
+statusie API: niezgodne CPU/GPU odrzucone, zgodny strict intent przyjęty;
+po przygotowaniu osobno odrzucono resolved CPU oraz zmiany requested_mode
+i resolved_mode. Nie wysłano przy tym żadnych poleceń. Niezależne review
+potwierdziło zamknięcie luki resolved/mode i kontrolę manualnego gate.
+AST i git diff --check PASS. Pełny helper nie został ponownie uruchomiony.

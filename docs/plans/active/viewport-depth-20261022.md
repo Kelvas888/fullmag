@@ -139,3 +139,11 @@ Weryfikacja: interpretowane regresje fail-closed (bez kompilacji unit tests),
 review kontraktu, rzeczywisty dry-run/apply, zachowane hashe i receipty,
 readiness nowego API, test WebGL ringu i Primitive→mesh. Standardowe CI PR252
 jest dozwolone. Dopiero potem merge i dokładny cleanup zadania.
+
+## Checkpoint końcowego odbioru 24.10
+
+- Standardowe CI jest jawnie dozwolone; c550d91658feb1d5bd76ba5b15f256b3aacf5fbd: wszystkie trzy workflow SUCCESS. Lokalnie unit tests niekompilowane.
+- Kamera i ring: browser ee82204eafb142d8bc4786027c323d49 PASS w zakresie viewport_camera, 26 captures; eksport dużej siatki przekroczył limit20s.
+- Primitive przed siatką: browser8fda5f6f37384bfdb0a8a11359d1a18c, viewport_camera PASS, eksport/DPR/lifecycle PASS. Ogólny harness FAIL przez planar-default HTTP422 pustej domeny; bez wyciszania.
+- mesh_build0333b7f51c5b053c92eaff9b completed, ta sama sesja, domena0→1087250, rewizje3, Compute niewykonane. Observer wykrył niezgodny effective CPU wobec authoredGPU; kwalifikacjaGPU NOT VERIFIED, źródłowy guard odmawia przed kolejną mutacją.
+- Końcowa próba po publikacji siatki trwa. Audyt zawiera dokładne identyfikatory i ograniczenia; PR pozostaje draft do ostatniej kontroli renderowania i CI końcowego HEAD.
