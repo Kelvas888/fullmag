@@ -102,3 +102,19 @@ Rozważone warianty:
 - Dowód runtime: dwie grupy DEV na jednym hoście; z jednej strony widoczna
   druga instancja w Home i w pasku, osadzony workspace drugiej instancji
   w zakładce, przełączanie Home ↔ sesja ↔ druga instancja bez utraty stanu.
+
+### Dowód runtime (24.10.2026, grupa DEV 3199)
+
+- `GET /v2/platform/instances` z grupy 3199 zwrócił siebie (`is_self: true`)
+  i grupę 3206 z jej sesją `fullmag-python-live` (`awaiting_command`).
+- Strona `http://localhost:3199` osadziła `http://127.0.0.1:3199/workspace`
+  (inny origin) bez błędów CSP; nagłówki zawierają `frame-src` i
+  `frame-ancestors` dla originów loopback.
+- Zakładka instancji: ramka widoczna, osadzone UI rysuje workspace bez
+  własnego paska zakładek, workspace hosta jest `inert`. Powrót do Home
+  ukrywa ramkę (`visibility: hidden`) bez odmontowania; ponowne otwarcie
+  pokazuje tę samą ramkę. Zamknięcie usuwa ramkę i wpis w `localStorage`.
+- Instancja sprzed tej zmiany (3206) odmawia osadzenia (`frame-ancestors
+  'self'`); pasek oferuje wtedy „Open in window”.
+- Nie sprawdzono: dwóch odrębnych procesów API z nowym kodem naraz (druga
+  grupa nie przeszła progu 32 GiB wolnego miejsca na dysku hosta).
