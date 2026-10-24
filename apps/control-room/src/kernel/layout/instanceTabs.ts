@@ -164,3 +164,19 @@ const noSubscription = () => () => {};
 export function useEmbeddedInstanceTab(): boolean {
   return useSyncExternalStore(noSubscription, isEmbeddedInstanceTab, () => false);
 }
+
+export type PageLocation = Pick<Location, "hostname" | "protocol">;
+
+let pageLocation: PageLocation | null = null;
+
+function readPageLocation(): PageLocation | null {
+  if (typeof window === "undefined") return null;
+  // The page's host never changes without a navigation; keep one stable snapshot.
+  pageLocation ??= { hostname: window.location.hostname, protocol: window.location.protocol };
+  return pageLocation;
+}
+
+/** The page's host and protocol on the client; null during server rendering. */
+export function usePageLocation(): PageLocation | null {
+  return useSyncExternalStore(noSubscription, readPageLocation, () => null);
+}

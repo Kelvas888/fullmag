@@ -104,8 +104,11 @@ Rozważone warianty:
 
 6. **Home.** Home pokazuje sesje własnej instancji (ADR 0068) oraz sekcję
    innych instancji na tym komputerze z nazwą sesji, statusem i przyciskiem
-   otwarcia w zakładce. Pasek zakładek odświeża wykrywanie co 5 s, gdy strona
-   jest widoczna.
+   otwarcia w zakładce. Wykrywanie ładuje się przy starcie strony i po jej
+   ponownym pokazaniu, a co 5 s tylko wtedy, gdy stan instancji jest na
+   ekranie (Home albo otwarta zakładka instancji). Bezczynny workspace bez
+   zakładek instancji nie wysyła żadnych zapytań, zgodnie z kontraktem ciszy
+   sieciowej audytów przeglądarkowych.
 
 Odrzucony wariant 2 (wiele sesji w jednym API) wymaga zmiany decyzji D5
 z ADR 0068 („jedna sesja na grupę”) i przebudowy stanu API: około 25 pól

@@ -8,6 +8,7 @@ import {
   instanceOrigin,
   instanceTabs,
   useInstanceTabs,
+  usePageLocation,
 } from "./instanceTabs";
 
 /**
@@ -21,6 +22,7 @@ import {
 export function InstanceTabFrames() {
   const tabs = useInstanceTabs();
   const discovery = useInstanceDiscovery();
+  const location = usePageLocation();
   const activePort = tabs.activePort;
   const open = new Set(tabs.openPorts);
   const framed = tabs.framedPorts.filter((port) => open.has(port));
@@ -33,9 +35,7 @@ export function InstanceTabFrames() {
       data-active-port={activePort ?? undefined}
       data-state={activePort === null ? "hidden" : "visible"}
     >
-      {/* Frames exist only after a client-side activation, so reading the
-          page location here never runs during server rendering. */}
-      {framed.map((port) => (
+      {location === null ? null : framed.map((port) => (
         <iframe
           allow="fullscreen; clipboard-read; clipboard-write"
           className="fm-instance-frames__frame"
@@ -43,7 +43,7 @@ export function InstanceTabFrames() {
           data-instance-port={port}
           key={port}
           name={INSTANCE_TAB_FRAME_NAME}
-          src={`${instanceOrigin(port, window.location)}/workspace`}
+          src={`${instanceOrigin(port, location)}/workspace`}
           title={`Fullmag instance on port ${port}`}
         />
       ))}

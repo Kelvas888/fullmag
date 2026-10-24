@@ -9,13 +9,17 @@ import { useKernel } from "../KernelContext";
 import type { ResourceResult } from "./resourceTypes";
 import { useResource } from "./useResource";
 
-/** How often the tab strip refreshes the instances while the page is visible. */
-export const INSTANCE_DISCOVERY_POLL_MS = 5_000;
+/** Refresh cadence while instance status is on screen (Home or an instance tab). */
+export const INSTANCE_DISCOVERY_REFRESH_MS = 5_000;
 
 export interface InstanceDiscoveryOptions {
   readonly enabled?: boolean;
-  /** Refresh periodically while the page is visible (one owner per page). */
-  readonly poll?: boolean;
+  /**
+   * Keep instance status current while it is on screen (one owner per page).
+   * Otherwise discovery loads once and again when the page becomes visible,
+   * so an idle workspace issues no requests.
+   */
+  readonly live?: boolean;
 }
 
 /**
@@ -24,7 +28,7 @@ export interface InstanceDiscoveryOptions {
  */
 export function useInstanceDiscovery({
   enabled = true,
-  poll = false,
+  live = false,
 }: InstanceDiscoveryOptions = {}): ResourceResult<InstanceDiscoveryResource> {
   const { api } = useKernel();
   const load = useCallback(
@@ -36,23 +40,23 @@ export function useInstanceDiscovery({
     load,
     // Every discovery probes the whole port window; shared refreshes of the
     // page must not run it more often than the strip's own cadence.
-    minRefetchIntervalMs: INSTANCE_DISCOVERY_POLL_MS,
+    minRefetchIntervalMs: INSTANCE_DISCOVERY_REFRESH_MS,
     notifyOnError: false,
     resolveRevision: () => null,
     resourceKey: PLATFORM_INSTANCES_PATH,
   });
   const refetch = resource.refetch;
   useEffect(() => {
-    if (!enabled || !poll) return;
+    if (!enabled) return;
     const refreshVisible = () => {
       if (document.visibilityState === "visible") refetch();
     };
-    const timer = window.setInterval(refreshVisible, INSTANCE_DISCOVERY_POLL_MS);
     document.addEventListener("visibilitychange", refreshVisible);
+    const timer = live ? window.setInterval(refreshVisible, INSTANCE_DISCOVERY_REFRESH_MS) : undefined;
     return () => {
-      window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshVisible);
+      if (timer !== undefined) window.clearInterval(timer);
     };
-  }, [enabled, poll, refetch]);
+  }, [enabled, live, refetch]);
   return resource;
 }

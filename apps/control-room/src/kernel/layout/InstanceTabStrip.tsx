@@ -5,36 +5,26 @@ import { ExternalLink, House, X } from "lucide-react";
 import { Button } from "@/shared/ui/Button";
 import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/Tabs";
 
-import type { DiscoveredInstance } from "../api/apiTypes";
 import { useInstanceDiscovery } from "../resources/instanceDiscoveryResources";
 import { useSessionCollection } from "../resources/useSessionCollection";
 import { homeView, useHomeViewOpen } from "./homeView";
-import { instanceOrigin, instanceTabs, useInstanceTabs } from "./instanceTabs";
+import { instanceTabLabel, sessionTone } from "./instanceTabModel";
+import { instanceOrigin, instanceTabs, useInstanceTabs, usePageLocation } from "./instanceTabs";
 
 const HOME_TAB = "home";
 const SESSION_TAB = "session";
 const INSTANCE_TAB_PREFIX = "instance:";
 
-export type SessionTone = "running" | "failed" | "idle";
-
-/** The dot colour of a session lifecycle word; the word itself stays in the title. */
-export function sessionTone(status: string | undefined): SessionTone {
-  switch (status) {
-    case "running":
-    case "activating":
-    case "materializing_script":
-    case "waiting_for_compute":
-      return "running";
-    case "failed":
-      return "failed";
-    default:
-      return "idle";
+function selectTab(next: string): void {
+  if (next === HOME_TAB) {
+    instanceTabs.activate(null);
+    homeView.open();
+  } else if (next === SESSION_TAB) {
+    instanceTabs.activate(null);
+    homeView.close();
+  } else if (next.startsWith(INSTANCE_TAB_PREFIX)) {
+    instanceTabs.activate(Number(next.slice(INSTANCE_TAB_PREFIX.length)));
   }
-}
-
-export function instanceTabLabel(instance: DiscoveredInstance | undefined): string {
-  const session = instance?.sessions.find((entry) => entry.current) ?? instance?.sessions[0];
-  return session?.name || (instance ? "No session" : "Unavailable");
 }
 
 /**
@@ -44,10 +34,16 @@ export function instanceTabLabel(instance: DiscoveredInstance | undefined): stri
  */
 export function InstanceTabStrip() {
   const sessions = useSessionCollection();
-  const discovery = useInstanceDiscovery({ poll: true });
   const tabs = useInstanceTabs();
   const homeOpen = useHomeViewOpen();
+  const location = usePageLocation();
   const current = sessions.resource.data?.sessions.find((entry) => entry.current) ?? null;
+  // Instance status refreshes while it is on screen: Home (always shown
+  // without a session) or any open instance tab. An idle workspace with no
+  // instance tabs issues no discovery requests.
+  const discovery = useInstanceDiscovery({
+    live: homeOpen || current === null || tabs.openPorts.length > 0,
+  });
   const instances = new Map(
     (discovery.data?.instances ?? []).map((instance) => [instance.port, instance]),
   );
@@ -59,21 +55,9 @@ export function InstanceTabStrip() {
       ? SESSION_TAB
       : HOME_TAB;
 
-  const select = (next: string) => {
-    if (next === HOME_TAB) {
-      instanceTabs.activate(null);
-      homeView.open();
-    } else if (next === SESSION_TAB) {
-      instanceTabs.activate(null);
-      homeView.close();
-    } else if (next.startsWith(INSTANCE_TAB_PREFIX)) {
-      instanceTabs.activate(Number(next.slice(INSTANCE_TAB_PREFIX.length)));
-    }
-  };
-
   return (
     <nav aria-label="Sessions" className="fm-instance-tabs" data-instance-tabs="">
-      <Tabs onValueChange={select} value={value}>
+      <Tabs onValueChange={selectTab} value={value}>
         <TabsList aria-label="Open sessions" className="fm-instance-tabs__list">
           <TabsTrigger className="fm-instance-tabs__tab" data-tab-kind="home" value={HOME_TAB}>
             <House aria-hidden="true" size={13} />
@@ -128,13 +112,12 @@ export function InstanceTabStrip() {
           })}
         </TabsList>
       </Tabs>
-      {tabs.activePort !== null ? (
+      {tabs.activePort !== null && location !== null ? (
         // An instance older than tab support refuses to be framed; it can
-        // still be opened on its own. The active port exists only after a
-        // client-side activation, so the page location is available here.
+        // still be opened on its own.
         <a
           className="fm-instance-tabs__popout"
-          href={`${instanceOrigin(tabs.activePort, window.location)}/workspace`}
+          href={`${instanceOrigin(tabs.activePort, location)}/workspace`}
           rel="noreferrer"
           target="_blank"
         >

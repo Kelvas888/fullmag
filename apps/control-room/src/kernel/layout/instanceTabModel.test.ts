@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { instanceTabLabel, sessionTone } from "./InstanceTabStrip";
+import { instanceTabLabel, sessionTone } from "./instanceTabModel";
 
 describe("InstanceTabStrip helpers", () => {
   it("labels a tab with the instance's current session", () => {
