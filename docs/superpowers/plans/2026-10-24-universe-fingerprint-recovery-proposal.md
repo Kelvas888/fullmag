@@ -1,8 +1,11 @@
 # Universe: poprawka tożsamości siatki i odzyskanie własnej grupy 3203
 
-Status: zatwierdzony recovery wykonany, natywny Solve wystartował i zakończył
-się błędem limitu liści całkowania. Nie opublikowano wyniku H Universe. API zostało
-zatrzymane przez nadzorcę po wtórnym błędzie heartbeat. E1–E12 nadal otwarte.
+> Aktualny stan 24.10.2026: recovery requestu `550a1701…` wykonane po zgodzie użytkownika; API 3203 i scena anteny z Universe przywrócone. Publiczne kontrole zgodności FMS: 24/24 PASS. Wyniku H Universe nadal brak. Wcześniejsze opisy oczekiwania poniżej są zapisem historycznym; wynik opisuje sekcja „Wdrożenie recovery i rzeczywista regresja HTTP E5”.
+
+
+Status: recovery po błędzie limitu liści i wtórnym błędzie heartbeat wykonany;
+API oraz scena anteny z Universe przywrócone. Kontrole zgodności FMS HTTP: 24/24
+PASS. Nie opublikowano wyniku H Universe i nie ponowiono Solve. E1–E12 otwarte.
 
 ## Stan rzeczywisty
 
@@ -205,7 +208,7 @@ proponowaniem większego limitu; samo jego zwiększenie nie dowodzi zbieżności
 Dowód pełnego bieżącego logu zachowano jako approved-new-solve/failed-compute-log.json.
 
 
-## Nowy request po awarii 8d181 — gotowy do decyzji
+## Historyczny request po awarii 8d181 — następnie zatwierdzony i wykonany
 
 ### Odzyskanie po nieudanym Universe Solve 8d181 — decyzja operatora
 
@@ -350,7 +353,7 @@ istnienia ścieżek/symboli oraz git diff --check. Brak zmian terminalnej noty
 naukowej lub kodu, brak buildu, Rust unit tests i dowodu browser/WebGL.
 
 
-## E5: poprawka zgodności Universe — zbudowany kandydat, bez wdrożenia
+## E5: historyczny etap przygotowania kandydata przed wdrożeniem
 
 Status: źródła i zbudowany kandydat, bez promocji i weryfikacji cold-load HTTP. Oczekujący request recovery
 550a170177411ff23c2996ca5be7de19899e6e69f35d43462b90529059ec328d pozostaje
@@ -434,3 +437,92 @@ Wymagane dalej: decyzja o istniejącym przypiętym recovery, jego świeży prefl
 a dopiero po autoryzowanej terminalizacji/promocji i managed restarcie rzeczywisty
 FMS open → authoring scene przez HTTP, bez Solve. Sam build nie zalicza E5,
 nie dowodzi historycznego cold-load V/J/H ani wyniku H Universe. E1–E12 otwarte.
+
+## Wdrożenie recovery i rzeczywista regresja HTTP E5
+
+Stan 24.10.2026: zrealizowano zgodę użytkownika „ok, zgadzam sie i nie pytaj
+sie wiecej o to”. Ta zgoda obejmuje opisane recovery i odtworzenie własnej
+grupy 3203; nie oczekujemy kolejnej zgody na te same kroki. Nie uruchomiono
+nowego Solve ani MeshBuild i nie zmieniono limitów/tolerancji.
+
+Native preflight oraz Apply requestu
+`550a170177411ff23c2996ca5be7de19899e6e69f35d43462b90529059ec328d`
+zakończyły się exit0. Run `run-live-8d181b0e7ac898ebbc0cb6e8b6a7b958219a6f8ccea0943e7e5d5704824bb331`
+ma rewizję 53, lifecycle Failed/DoNotRetry, zero artefaktów; jego compute/prep
+lease i rezerwacje zwolniono przez natywną procedurę, slot zarchiwizowano.
+Nie edytowano ręcznie katalogu ani ledgera.
+
+Build aktualnego czystego commita
+`f672d4db935934f3012fd55c077483810d676003` wykonano przez istniejącą receptę
+`just docker-dev-recovery-build` we własnym stałym backendzie:
+
+| Dowód | Wartość |
+|---|---|
+| build, exit0 | `5c28f5dce0cd4f39a08ee5bd34cec0b5` |
+| snapshot | `f07106724bbc97c452b4e24be05934ac147cbc6840a2672e85c3bf63e8469b71` |
+| receipt pakietu | `2fd4cb0f0313ae2b4de423caa464c9e4d77e26f11bc271905b7dd320daea9a56` |
+| promocja, exit0 | `3fae5e9dc9594d858c682ca83f8b9e67` |
+| recreate-services, exit0 | `c1254b44500544d39f38b64346297906` |
+| development, exit0 | `a011437d007a4490940f22cd70744242` |
+| konfiguracja | `64e0a7517b7d27127293d7ea2d929e5a2b864f843382e9973aad41399b07285c` |
+
+Użyto `just docker-dev-stop-failed` i `just docker-dev-recreate-volume` z
+`fresh_state=false`. Cache, pakiet rollback i kandydat z poprzedniego dirty
+capture pozostały zachowane; nie wykonywano globalnego prune. Oba kontenery
+mają status healthy. Start backendu wykorzystał istniejący pakiet, zweryfikował
+24 pliki i 9340/9340 trafień cache capture, bez ponownej kompilacji aplikacji.
+Testów jednostkowych Rust nie kompilowano ani nie uruchamiano.
+
+Publiczne `POST /v2/persistence/projects/open` dla zachowanego FMS zwróciło
+`authoring_scene_document`, read_write, can_write=true, migrated=false.
+Przez `POST /v2/sessions` i istniejącą, revision-fenced transakcję replace_scene
+odtworzono authoring w `session-18e1617fa2503362000000c0`, scene revision 1.
+Obiekt zachowuje role=antenna, pełną geometrię i transport/port/field stage.
+Universe zachowuje padding 500 nm, minimum 150 nm i maksimum 500 nm.
+Nie dodano magnetyzacji, exchange ani demag. API pomija 83 puste wartości
+zgodnie z istniejącą projekcją zasobu; nie wykazano utraty wypełnionych pól.
+Katalog komend tej sesji ma zero accepted/pending/running. `/workspace`
+odpowiedział HTTP200, 48853 B HTML; nie jest to dowód renderowania WebGL.
+
+Kontrola po restarcie potwierdziła niezmienność 70 plików historycznych wyników,
+pięciu historycznych katalogów oraz oryginalnego FMS SHA256
+`55c8a90d323d8d6d2581397985f0a438efa2860f3ce2155405954bb92dff0665`.
+Pełne dowody techniczne są w wolumenie kontrolnym grupy pod
+`verification/universe-volume-policy-20261023/approved-recovery-http-20261024/`:
+`summary-pl.json`, `preservation.json`, `object-projection-comparison.json`,
+`opened.json`, `replace-scene.json` oraz zasoby sesji.
+
+### Powtarzalna kontrola zgodności bez uruchamiania solvera
+
+`scripts/validate_antenna_universe_authoring_http.py::validate` otwiera wyłącznie
+kopie archiwum w pamięci przez istniejące publiczne API; nie importuje Python,
+nie zmienia aktywnej sceny i nie wysyła komend wykonawczych. Dla obu ownerów
+universe i study.universe_mesh sprawdza:
+
+- stare, nowe i zgodne podwójne aliasy: projekcja dostępna i identyczna;
+- sprzeczność minimum/maksimum: brak projekcji do aktywacji;
+- nieznane pole null/pusty obiekt/pusta lista/pusty tekst/wypełniony obiekt:
+  brak projekcji, ale oryginalna scena pozostaje w archiwum;
+- mieszane null/wartość aliasów: brak projekcji;
+- niezmienność bieżących sessions/scene/commands i pliku wejściowego.
+
+Wykonanie skryptu w stałym backendzie: 24/24 PASS, bez Solve/MeshBuild.
+Dowód `e5-universe-http-regression-20261024/repository-validator-results.json`
+w tym samym katalogu verification. To dowód rzeczywistej zgodności HTTP
+kopii archiwum, a nie kwalifikacji pola. Ten FMS nadal zawiera zero assetów
+wynikowych; pełne archive→cold-load→HTTP dla V/J/H pozostaje otwarte.
+
+### Dalsza diagnoza numeryczna — bez nowego obliczenia
+
+Odczyt źródeł potwierdza, że
+`backends/fem/cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp::integrate_duffy_once`
+usuwa zależność osobliwą od współrzędnej radialnej, lecz zachowuje zmienny
+mianownik normy ray w dwóch współrzędnych kątowych. Niezależna analiza
+geometryczna trzech zachowanych Tet wskazała wąskie minimum blisko narożnika
+tej dziedziny. Nie jest to dowód wkładu tych Tet do całych 11.056 A/m błędu:
+brakuje retained RT0 i per-leaf diagnostics z nieudanej próby.
+Snap effective_target nie został potwierdzony jako przyczyna awarii.
+Nie zmieniono metody ani reguł akceptacji. Dalszy krok to ograniczona
+failure-only diagnostyka dominujących liści i regresja near-vertex, zanim
+wybierzemy korektę metody. Pełny Universe H i browser/WebGL pozostają
+NOT VERIFIED; E1–E12 nie są uznane za zakończone.
