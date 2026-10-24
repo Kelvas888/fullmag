@@ -754,7 +754,8 @@ def _group_ledger(control, operation, image, *, new_render=False):
             or retained.get("compose_project") != control.project):
         raise BuildControlError("Retained group ledger belongs to another daemon or group")
     generation_record = control.read("group-ledger-generation.json", optional=True)
-    generation = None
+    empty_generation = _empty_stopped_namespace_ledger_generation(control)
+    generation = empty_generation
     if generation_record is not None:
         if (not isinstance(generation_record, Mapping)
                 or generation_record.get("schema") != "fullmag.docker-group-ledger-generation.v1"
@@ -773,8 +774,10 @@ def _group_ledger(control, operation, image, *, new_render=False):
                 or hashlib.sha256(canonical(terminal)).hexdigest()
                    != generation_record.get("archive_terminal_sha256")):
             raise BuildControlError("Fresh ledger generation has no exact completed runtime archive")
+    generation = _select_group_ledger_generation(empty_generation, generation_record)
     key = group_ledger.volume_key(daemon["id_sha256"], control.project, generation)
     volume = _owned_volume(control, group_ledger.VOLUME_ROLE, key)
+    _validate_empty_quarantine_ledger_volume(control, empty_generation, volume)
     # Create the ledger leaf before admission: the backend is attested
     # before its native initializer would otherwise create it.
     script = ("test ! -L /data/ledger; if test ! -e /data/ledger; then "
@@ -795,6 +798,41 @@ def _group_ledger(control, operation, image, *, new_render=False):
         raise BuildControlError("Retained group ledger identity changed during partial resume")
     control.write(operation["root"] + "/group-ledger.json", record)
     return profile["backend"], profile
+
+
+def _empty_stopped_namespace_ledger_generation(control):
+    """Bind an empty-stopped namespace to its fresh isolated ledger generation."""
+    if not control.namespace:
+        return None
+    retirement = control.namespace_registry.get("retirement")
+    if not isinstance(retirement, Mapping):
+        return None
+    if retirement.get("schema") != "fullmag.docker-control-namespace-empty-quarantine.v1":
+        return None
+    token = retirement.get("recovery_id")
+    if (retirement.get("scope") != "empty-stopped-namespace"
+            or retirement.get("state") != "quarantined-empty-not-replayed"
+            or not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{32}", token) is None
+            or control.namespace != "namespaces/" + token
+            or not isinstance(retirement.get("ledger_volume"), str)
+            or not retirement["ledger_volume"].startswith("fullmag-dev-group-ledger-v1-")):
+        raise BuildControlError("Empty quarantine namespace has an invalid fresh-ledger binding")
+    return token
+
+
+def _select_group_ledger_generation(empty_generation, generation_record):
+    """Let a later explicit archive rotation supersede the bootstrap token."""
+    if generation_record is not None:
+        return generation_record["generation"]
+    return empty_generation
+
+
+def _validate_empty_quarantine_ledger_volume(control, empty_generation, volume):
+    if empty_generation is None:
+        return
+    retirement = control.namespace_registry.get("retirement", {})
+    if volume == retirement.get("ledger_volume"):
+        raise BuildControlError("Empty quarantine namespace resolved to the retained old ledger")
 
 
 def _retained_ledger_profile(control, previous_root, document, image):

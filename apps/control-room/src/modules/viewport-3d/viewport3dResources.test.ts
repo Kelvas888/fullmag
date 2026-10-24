@@ -99,8 +99,8 @@ describe("viewport3dResources", () => {
     expect(hookSource).toContain(
       "retryPolicy: VIEWPORT_3D_TOPOLOGY_RETRY_POLICY",
     );
-    expect(source).toContain("deadlineMs: 15_000");
-    expect(source).toContain("The live 1.4 MiB");
+    expect(source).toContain("deadlineMs: 60_000");
+    expect(source).toContain("45.6 MB topology");
   });
 
   it("keeps the measured sequential topology read alive beyond the generic deadline", async () => {
@@ -123,9 +123,9 @@ describe("viewport3dResources", () => {
         retryPolicy: VIEWPORT_3D_TOPOLOGY_RETRY_POLICY,
       });
 
-      await vi.advanceTimersByTimeAsync(5_001);
+      await vi.advanceTimersByTimeAsync(15_001);
       expect(requestSignal.aborted).toBe(false);
-      expect(VIEWPORT_3D_TOPOLOGY_RETRY_POLICY.deadlineMs).toBe(15_000);
+      expect(VIEWPORT_3D_TOPOLOGY_RETRY_POLICY.deadlineMs).toBe(60_000);
 
       release("decoded topology");
       await expect(result).resolves.toMatchObject({
