@@ -323,3 +323,37 @@ old_request_replayed=false. Receipt: verification/attempts/
 1c6a12eeffa54fbdb5c8f6e7d1db3b33/archive-anchor-proof.json.
 Automatyczny pin przed przyszłą rotacją sprawdzony regresją, bez kolejnej
 zbędnej rzeczywistej rotacji. Nie zmieniano progu świeżości próbek ani lease.
+
+
+## Odbiór kamery i ringu w przeglądarce: PASS, eksport osobno
+
+Aktywacja `ffb67c5eec14444f996e0de0a39faa28`: succeeded. Native preparer
+PID4944: exit0, status_success=true, stderr=0, status=prepared. Run
+`run-live-7f3fa32a0c193e8f5009441ec00d2a9f8b8bc7751cd939ec435e88db30738279`
+nie otrzymał Compute/Solve. Opublikowano domenę FEM 1087250 cells,
+mesh/topology/mesh_build revisions=2. Próbki zasobów podczas przygotowania
+pozostawały świeże; surowe obserwacje w verification/paused-study-host-samples-active.jsonl.
+
+Próba browser `ee82204eafb142d8bc4786027c323d49`: sam
+viewport_camera.state=passed. 26 captures, w tym 3 kamery × 3 tryby ringu,
+FOV/Fit, przełączanie projekcji, 11 ustawień osiowych/skośnych, ViewCube +X
+i rzeczywisty orbit drag. Restoration verified, ten sam canvas i kontekst.
+WebGL2, 712×554 drawing buffer, depth24, context_lost=false. Page, console,
+request i HTTP errors: puste. SwiftShader; bez kwalifikacji hardware GPU.
+
+Obejrzane PNG nie pokazują dawnych pasów z-buffer. Kontury podglądu są
+ciągłe, pełna siatka pokazuje własną triangulację. Podczas pierwszego
+ładowania część ujęć zawiera fallback Primitive przed uploadem topologii;
+nie zastępuje to osobnego odbioru jawnie niezeszowanej sceny.
+
+W pierwszej próbie wstążka była przywracana przez innerText (CSS uppercase
+WORKSPACE), co nie odpowiadało nazwie accessible. Harness używa teraz
+stabilnego ID zakładki. Syntax check w grupie i 24 regresje harnessu PASS;
+próba ee822 potwierdza restoration. Zachowywany stdout ma pełny dotychczasowy
+limit wyniku, aby nie tracić poprawnych części raportu po innym błędzie.
+
+Ogólny browser QA pozostaje failed-confirmed: po zaliczeniu kamery
+następny test eksportu PNG przekroczył 20 s czekania na download.
+Nie oznaczono go jako PASS. Osobny dowód kamery:
+verification/ring-camera-full-mesh-browser-proof.json. Trwa test Primitive
+przed pierwszą publikacją siatki oraz diagnoza eksportu.

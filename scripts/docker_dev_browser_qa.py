@@ -936,7 +936,7 @@ def _run(operation: dict[str, object], control: BuildControl, document: dict[str
     control.write(root + "/runner-output.json", {
         "schema": "fullmag.docker-dev-browser-qa-runner-output.v1",
         "exit_code": result.returncode,
-        "stdout": _text(result.stdout, MAX_RESULT_BYTES // 2),
+        "stdout": _text(result.stdout, MAX_RESULT_BYTES),
         "stderr_tail": _text(result.stderr),
     })
     operation["daemon_pending"] = True

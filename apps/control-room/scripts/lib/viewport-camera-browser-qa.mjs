@@ -110,7 +110,10 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
     // The ring example reproduces the original depth regression: the eye is
     // inside the universe bounds, while the 50 nm ring and 1.6 nm film are ahead.
     if (options.ringDepthRegression === true) {
-      const originalRibbonTab = await page.locator('.fm-ribbon__tab[aria-selected="true"]').innerText();
+      const originalRibbonTabId = await page.locator('.fm-ribbon__tab[aria-selected="true"]').getAttribute("id");
+      if (!/^fm-ribbon-tab-[a-zA-Z0-9_.:-]+$/.test(originalRibbonTabId ?? "")) {
+        throw new Error("Selected ribbon tab has no stable identity");
+      }
       await setCameraDialogOpen(page, cameraDialog, false, timeout);
       const originalSurfacePasses = await readSurfacePasses(page, timeout);
       try {
@@ -152,7 +155,7 @@ export async function runViewportCameraBrowserQa(page, options = {}) {
       } finally {
         await setCameraDialogOpen(page, cameraDialog, false, timeout);
         await restoreSurfacePasses(page, originalSurfacePasses, timeout);
-        await page.getByRole("tab", { name: originalRibbonTab, exact: true }).click({ timeout });
+        await page.locator(`.fm-ribbon__tab[id="${originalRibbonTabId}"]`).click({ timeout });
         await setCameraDialogOpen(page, cameraDialog, true, timeout);
       }
       await restoreCamera(page, cameraDialog, originalCamera, originalDialogValues, timeout);
