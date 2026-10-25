@@ -522,3 +522,84 @@ Wszystkie wyniki, receipty, cache i niezacommitowany plik użytkownika
 zachowano. Brak wykazanej zbędności danych: bez prune/usuwania.
 Następny krok: dalsze obniżenie kosztu dokładnego operatora przed ponowną
 pełną próbą; nie zwiększać limitów ani nie redukować domeny/jakości.
+
+
+### Cache centrowanego prądu — próba w toku 25.10.2026
+
+Poprzedni etap to commit 8cacaa6ad0a117dd3c0d3bbb93e08ca4e3d79c22.
+Nowy WIP przygotowuje C=sum(c_i) i M=sum(c_i*(v_i-v_0)) raz na komórkę;
+J(t)=[C*(t-v_0)-M]/abs(det). Zachowuje niezerowe C, znaki i wszystkie
+instrumentowane operacje. Fraction: 4608 konfiguracji PASS, oba zwroty,
+permutacje, skale, translacje, zera i cancellation. Skrajne konfiguracje
+Fraction dowodzą tożsamości, nie reprezentowalności wejścia binary64.
+Niezależny read-only review: bez błędu kodu; status istniejącego source-map
+zmieniono na not_verified do potwierdzenia nowej próby native.
+
+Managed restart tej samej grupy, iteration fa4e4651a4cf49cf84edcd78150e0681,
+zakończył się succeeded/exit0. Native make 197342 ms, cache i kontener
+zachowane. Nie kompilowano testów jednostkowych native/Rust. Preflight:
+465477775360 B wolnych w /build, brak aktywnego workera, zdrowe puste API.
+Pierwsza diagnostyka użyła nieistniejącego /health i otrzymała 404; właściwy
+odczyt /v2/platform/health potwierdził status ok. Nie zmieniano routingu.
+
+Jedna nowa publiczna próba, submit201/materialization200:
+run-surface-centered-current-20261025-01,
+task-2e5265a3b7dac09f2d7944374f02d873adb15f53f78f65a39d3fb0e2c3714bf3,
+attempt-c2aba7f2916145578846173e3e6d9eb0, epoch1.
+Potwierdzono lifecycle running i żywy PID3701, start_ticks15017135,
+użytkownik2994 ticks/system334 ticks w chwili obserwacji. Request SHA256:
+67ef7e07216a77cc1b3e260e0c7fb766ff1877abac6027cdcc21f00fba2b03c1.
+Archiwum, study/catalog i fizyka identyczne z poprzednią próbą; zmieniono
+wyłącznie run_id i idempotency_key. Comparator przygotowany PRZED wynikiem:
+compare-centered-current-results.py, baseline453bb352b0e4ed9458942bfbf13bd5b2a331ba01286c782451227b9e69300a6d.
+Pliki w control-volume verification/surface-rt0-performance-20261025/.
+Stan wyniku/przyspieszenia do porównania pozostaje NOT VERIFIED.
+
+Odrębny read-only przegląd kosztu HTTP wykazał minimum trzy wywołania
+pełnego walidatora pakietu w jednym GET: study.rs completion,
+study_inspection_integrity.rs read_saved_inspection i runner decode.
+Metadata17.15s/h_raw336B17.28s/30417.33s vs katalog1.10s i stale4091.34s
+pochodzą z zachowanego raportu, nie nowego profilu. Udział funkcji w czasie
+jest hipotezą, redundancja jest potwierdzona źródłami. Pierwsza poprawka
+powinna współdzielić zweryfikowany wynik w JEDNYM żądaniu, bez publicznego
+skip_validation, bez osłabienia completion, CAS hashing i pre/post fence.
+Nie zmieniano loaderów, polityki, cache/admission ani API w tym etapie.
+
+Retencja: bieżące/porównawcze pakiety, cache, receipty i historie są potrzebne;
+nie wykazano zasobów zbędnych. Bez prune/usuwania. Skill cleanup nadal brak.
+Pełne Universe i widok UI pozostają nieukończone.
+
+
+### Rozstrzygnięcie cache prądu — brak mierzalnego przyspieszenia
+
+Ta sama próba zakończyła się Succeeded; exit workera0, wszystkie21
+payloady i pełne diagnostyki numeryczne identyczne. Nowy bundle:
+e8e735f33a7a283e05453a29c8fa7477221fa5fbb113ae49d4c52c4b5dde8d0a.
+Czas operatora 373.749115756 s wobec 371.592043076 s baseline,
+speedup0.9942285544257763. Różnica około0.58% nie dowodzi trwałej regresji,
+ale NIE spełnia przypiętej bramki przyspieszenia. Comparator zakończył exit1
+na assert no measured acceleration; pozostałe bramki były spełnione.
+Nie poluzowano testu ani tolerancji. Zapisano oddzielny raport odrzucenia:
+centered-current-result-comparison.json, SHA256
+15aac0aebe8e50411289f7fc975d228c1baaaa5338ca934586e3f5063492b79a.
+Operacje wymierne14 851 953 ->14 221 583, całkowite297 494 414 ->285 327 154;
+redukcja liczby operacji nie przełożyła się na potwierdzony czas.
+
+Zachowano patch tej próby w control volume jako
+verification/surface-rt0-performance-20261025/centered-current-rejected-candidate.patch.
+Wycofano wyłącznie cztery własne zmiany CPP/noty/source-map/regresji
+z bieżącego worktree do HEAD8cacaa6ad0a117dd3c0d3bbb93e08ca4e3d79c22.
+Użytkownikowy FMS, wszystkie wyniki i cache pozostają. Pakiet uruchomiony
+po próbie nadal zawiera równoważny numerycznie wariant testowy; kolejnym
+krokiem jest managed restart przy idle do przywróconego źródła, bez Solve.
+Nie traktować tej próby jako kolejnego przyspieszenia lub pełnego Universe.
+Potwierdzono rzeczywiste Release/-O3, zgodność CPP ze zbudowanym cieniem
+SHA256 b04fddd522b93fd445ec05c332cb959e5efc2e6053bf1b232e8c41e5e3c31046
+i mapowanie workera na /opt/fullmag/package/lib/libfullmag_fem.so.0.
+MemAvailable około13GB i load2.41 podczas końcowej kontroli nie wskazywały
+na brak RAM jako wyjaśnienie kosztu operatora. Nie zmieniano limitów hosta.
+Następny istotny kierunek to dokładna arytmetyka/GMP i funkcje wysokiej
+precyzji/MPFR, osobno mierzone i jawnie opisane; nie domniemany zysk z
+liczników i nie ponawianie pełnego Universe bez rozwiązania kosztu.
+
+Patch eksperymentu SHA256: d7cb7032954f315a45c1efeea83930347fbae450efd47f1a4530d29aa0d88ce7.
