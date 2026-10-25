@@ -117,3 +117,22 @@ dowodem wykonania recovery ani dowodem działania przeglądarki.
   failed exit 1, sekwencje heartbeat launch 0 → exit/released lease 3, brak
   admission i aktywnych zasobów solvera. `CurrentRun.total_steps=1` jest liczbą
   zaplanowanych zadań (`step_ids.len()`), nie licznikiem wykonanych iteracji.
+
+- Recovery zapisane w `f7e9d7962fa97d52479ef8932cb3b36a5512e8a2` wykonano:
+  exit backendu 0, drain potwierdzony, oryginalne rekordy zachowane i lease
+  zwolniony przez helper. Receipt recovery:
+  `50c496c984f771586c1800ff471a1d17da22f2330969726d9c34496a959f6785`.
+- Świeże odtworzenie `96b8c72338e042709cd550847b5bec61`: sukces z archiwum
+  runtime-control i zachowaniem starego state root. Nowa próba development
+  `99eb100faa664e6793cf9977cfaf34ee` używa konfiguracji
+  `2f9c9518a282af18e32faca71e12a99b1363b307e130ed269dace41d60717723`.
+- Build `33497222e00fef318774736705c3bd508fa3abf9` ujawnił pięć konfliktów
+  typów po integracji master: `SharedFemMesh` wymaga `as_deref()` przy
+  przekazaniu `Option<&FemMeshPayload>`. Poprawiono wywołania; potwierdzenie
+  kompilacji wymaga następnego zarządzanego buildu.
+- Harness porównuje teraz wartości rozkładów geometrii, jakości rodzin,
+  percentyle, progi i wspólne węzły z API. Kontrola składni i sprawdzenie
+  odrzucenia zera zamiast `1e-24 m³`: sukces. Osiem uwag hooka React Doctor
+  dotyczy ograniczonych wyszukiwań w panelach, celowo sekwencyjnych obserwacji
+  stanu i klonowania syntetycznego JSON. Nie stanowią błędów produkcyjnego UI;
+  rzeczywisty harness nadal czeka na poprawny runtime.

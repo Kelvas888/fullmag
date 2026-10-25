@@ -113,7 +113,7 @@ pub async fn get_mesh_summary(
         revision: snapshot.mesh_revision,
         mesh_summary: mesh_workspace.get("mesh_summary").cloned(),
         mesh_quality_summary: mesh_workspace.get("mesh_quality_summary").cloned(),
-        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_ref()),
+        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_deref()),
         effective_per_object_targets: mesh_workspace.get("effective_per_object_targets").cloned(),
     };
     let etag = crate::router_v2::handlers::shared::stable_strong_etag(&format!(
@@ -314,7 +314,7 @@ pub async fn get_mesh_active_build(
         policy_diff: mesh_build_policy_diff(mesh_workspace),
         active_build: mesh_workspace.get("active_build").cloned(),
         mesh_pipeline_status: mesh_workspace.get("mesh_pipeline_status").cloned(),
-        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_ref()),
+        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_deref()),
         effective_per_object_targets: mesh_workspace.get("effective_per_object_targets").cloned(),
         last_build_summary: mesh_workspace.get("last_build_summary").cloned(),
         shared_domain_build_report: typed_shared_domain_build_report(&snapshot, mesh_workspace),
@@ -551,7 +551,7 @@ pub async fn get_mesh_last_successful_build(
         source_scene_revision: provenance.source_scene_revision,
         geometry_realization_revision: provenance.geometry_realization_revision,
         last_success: mesh_workspace.get("last_build_summary").cloned(),
-        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_ref()),
+        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_deref()),
         effective_per_object_targets: mesh_workspace.get("effective_per_object_targets").cloned(),
         last_build_error: mesh_workspace
             .get("last_build_error")
@@ -677,8 +677,8 @@ pub async fn get_mesh_universe_report(
     let mesh_workspace = current_mesh_workspace(&snapshot)?;
     let report = Some(json!({
         "config": current_universe_mesh_config(scene),
-        "effective_airbox_target": effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_ref()),
-        "shared_interface_node_count": snapshot.fem_mesh.as_ref().and_then(super::airbox_evidence::shared_interface_node_count),
+        "effective_airbox_target": effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_deref()),
+        "shared_interface_node_count": snapshot.fem_mesh.as_deref().and_then(super::airbox_evidence::shared_interface_node_count),
         "mesh_summary": mesh_workspace.get("mesh_summary").cloned().unwrap_or(Value::Null),
         "last_build_summary": mesh_workspace.get("last_build_summary").cloned().unwrap_or(Value::Null),
     }));
