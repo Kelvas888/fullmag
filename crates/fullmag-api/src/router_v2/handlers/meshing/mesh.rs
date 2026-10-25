@@ -3341,6 +3341,27 @@ fn merge_mesh_scope_size_statistics(
     mesh: Option<&FemMeshPayload>,
     marker: u32,
 ) {
+    // New publications already contain the bounded geometry summaries. Keep
+    // legacy reconstruction off the request path for those meshes.
+    let complete = quality.get("global").is_some_and(|global| {
+        global.get("marker").and_then(Value::as_u64) == Some(u64::from(marker))
+            && ["volume", "characteristic_size", "edge_length"]
+                .iter()
+                .all(|metric| {
+                    global.get(*metric).is_some_and(|statistics| {
+                        ["min", "max", "mean", "std"].iter().all(|field| {
+                            statistics.get(*field).and_then(Value::as_f64)
+                                .is_some_and(f64::is_finite)
+                        }) && statistics.get("histogram").and_then(Value::as_array)
+                            .is_some_and(|bins| !bins.is_empty())
+                    })
+                })
+            && global.get("volume").and_then(|value| value.get("total"))
+                .and_then(Value::as_f64).is_some_and(f64::is_finite)
+    });
+    if complete {
+        return;
+    }
     let Some(size_statistics) = mesh.and_then(|mesh| mesh_scope_size_statistics(mesh, marker))
     else {
         return;
@@ -3391,25 +3412,18 @@ fn mesh_scope_size_statistics(mesh: &FemMeshPayload, marker: u32) -> Option<Valu
     if mesh.element_markers.len() != mesh.cell_count() {
         return None;
     }
-    let elements = mesh.require_tet4_elements().ok()?;
-
     let mut volumes = Vec::new();
     let mut characteristic_sizes = Vec::new();
     let mut edge_lengths = Vec::new();
 
-    for (element_index, element) in elements.iter().enumerate() {
+    for element_index in 0..mesh.cell_count() {
         if mesh.element_markers[element_index] != marker {
             continue;
         }
-        let Some(tet) = element_nodes(mesh, element) else {
-            continue;
-        };
-        edge_lengths.extend(tet_edge_lengths(tet));
-        let volume = tet_volume(tet).abs();
-        if volume > 0.0 && volume.is_finite() {
-            volumes.push(volume);
-            characteristic_sizes.push((volume * 6.0 * 2.0_f64.sqrt()).cbrt());
-        }
+        let geometry = super::mesh_cell_geometry::cell_geometry(mesh, element_index)?;
+        edge_lengths.extend_from_slice(&geometry.edges[..geometry.edge_count]);
+        volumes.push(geometry.volume);
+        characteristic_sizes.push((geometry.volume * 6.0 * 2.0_f64.sqrt()).cbrt());
     }
 
     if volumes.is_empty() && edge_lengths.is_empty() {
@@ -3417,6 +3431,16 @@ fn mesh_scope_size_statistics(mesh: &FemMeshPayload, marker: u32) -> Option<Valu
     }
 
     let element_count = volumes.len();
+    let mut volume_statistics = distribution_statistics(&volumes);
+    volume_statistics["total"] = json!(volumes.iter().sum::<f64>());
+    volume_statistics["definition"] = json!("absolute_canonical_tetrahedral_decomposition");
+    volume_statistics["unit"] = json!("m^3");
+    let mut size_statistics = distribution_statistics(&characteristic_sizes);
+    size_statistics["definition"] = json!("volume_equivalent_regular_tetrahedron");
+    size_statistics["unit"] = json!("m");
+    let mut edge_statistics = distribution_statistics(&edge_lengths);
+    edge_statistics["definition"] = json!("canonical_edges_per_cell");
+    edge_statistics["unit"] = json!("m");
 
     Some(json!({
         "scope_id": format!("marker:{marker}"),
@@ -3425,9 +3449,10 @@ fn mesh_scope_size_statistics(mesh: &FemMeshPayload, marker: u32) -> Option<Valu
         "role": if marker == 0 { "air" } else { "domain" },
         "marker": marker,
         "element_count": element_count,
-        "characteristic_size": distribution_statistics(&characteristic_sizes),
-        "edge_length": distribution_statistics(&edge_lengths),
-        "volume": distribution_statistics(&volumes),
+        "geometry_source": "canonical_cell_decomposition",
+        "characteristic_size": size_statistics,
+        "edge_length": edge_statistics,
+        "volume": volume_statistics,
     }))
 }
 
@@ -3677,11 +3702,11 @@ fn tet_edge_lengths(tet: [[f64; 3]; 4]) -> [f64; 6] {
     ]
 }
 
-fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(super) fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
-fn tet_volume(tet: [[f64; 3]; 4]) -> f64 {
+pub(super) fn tet_volume(tet: [[f64; 3]; 4]) -> f64 {
     let a = sub(tet[1], tet[0]);
     let b = sub(tet[2], tet[0]);
     let c = sub(tet[3], tet[0]);
@@ -3740,7 +3765,7 @@ fn size_histogram_bins(values: &[f64], bin_count: usize) -> Vec<Value> {
         return Vec::new();
     }
     if (edges[edges.len() - 1] - edges[0]).abs()
-        <= f64::EPSILON * edges[edges.len() - 1].abs().max(1.0)
+        <= f64::EPSILON * edges[edges.len() - 1].abs().max(edges[0].abs())
     {
         return vec![
             json!({ "lo": edges[0], "hi": edges[edges.len() - 1], "count": values.len() }),
@@ -3750,13 +3775,7 @@ fn size_histogram_bins(values: &[f64], bin_count: usize) -> Vec<Value> {
     let bins = edges.len() - 1;
     let mut counts = vec![0usize; bins];
     for value in values {
-        let mut bin_index = bins - 1;
-        for index in 0..bins {
-            if *value < edges[index + 1] || index == bins - 1 {
-                bin_index = index;
-                break;
-            }
-        }
+        let bin_index = edges[1..].partition_point(|edge| *edge <= *value).min(bins - 1);
         counts[bin_index] += 1;
     }
 
@@ -3782,7 +3801,7 @@ fn size_histogram_edges(values: &[f64], bin_count: usize) -> Vec<f64> {
     if !min.is_finite() || !max.is_finite() {
         return Vec::new();
     }
-    if (max - min).abs() <= f64::EPSILON * max.abs().max(1.0) {
+    if (max - min).abs() <= f64::EPSILON * max.abs().max(min.abs()) {
         return vec![min, max];
     }
 
@@ -5294,6 +5313,16 @@ fn collect_part_source_node_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_histograms_preserve_si_volume_variation() {
+        let values = [1e-27, 2e-27, 9e-27];
+        let bins = size_histogram_bins(&values, 3);
+        assert_eq!(bins.len(), 3);
+        assert_eq!(bins.iter().map(|bin| bin["count"].as_u64().unwrap()).sum::<u64>(), 3);
+        assert_eq!(size_histogram_bins(&[0.0, 0.0], 3).len(), 1);
+        assert_eq!(size_histogram_bins(&[1e-27, 1e-27], 3).len(), 1);
+    }
 
     #[test]
     fn shared_domain_manifest_counts_are_global_topology_counts() {
