@@ -17,6 +17,10 @@ use crate::types::{
 use fullmag_authoring::SceneExecutionInputIdentity;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Ceiling for retrying one unchanged deferral. Each retry reloads the run's
+/// durable outputs, which on a multi-million-cell grid kept a core busy and
+/// the API's memory high for as long as the deferral lasted.
+const MAX_DEFERRAL_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct ProjectionContext {
@@ -171,11 +175,13 @@ pub(crate) fn spawn(state: Arc<AppState>) {
         let mut cursor: Option<ProjectionCursor> = None;
         // The poll repeats every interval; report each distinct deferral once.
         let mut last_deferral: Option<String> = None;
+        let mut repeated_deferrals: u32 = 0;
         loop {
             interval.tick().await;
             match poll_once(&state, &mut cursor).await {
                 Ok(()) => {
                     last_deferral = None;
+                    repeated_deferrals = 0;
                     // This poller is the Docker runtime's publication path. A
                     // finished run publishes nothing more, yet the path stays
                     // live; without this the session turned `disconnected`
@@ -194,6 +200,15 @@ pub(crate) fn spawn(state: Arc<AppState>) {
                             "accepted live read-model projection deferred"
                         );
                         last_deferral = Some(detail);
+                        repeated_deferrals = 0;
+                    } else {
+                        // Back off an unchanged deferral; a new run, session
+                        // or error still retries on the next interval.
+                        repeated_deferrals = repeated_deferrals.saturating_add(1);
+                        let backoff = POLL_INTERVAL
+                            .saturating_mul(1_u32 << repeated_deferrals.min(6))
+                            .min(MAX_DEFERRAL_BACKOFF);
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }
