@@ -239,7 +239,7 @@ case "${recipe}" in
     promotion_pattern=" --promote --candidate-basename '(\.backend-package-candidate-[A-Za-z0-9._-]+)' --candidate-receipt-sha256 '([0-9a-f]{64})' --current-receipt-sha256 '([0-9a-f]{64})' --provenance-sha256 '([0-9a-f]{64})'"
     superseded_pattern=" --superseded-candidate-basename '(\.backend-package-candidate-[A-Za-z0-9._-]+)' --superseded-marker-sha256 '([0-9a-f]{64})' --superseded-receipt-sha256 '([0-9a-f]{64})' --superseded-make-attempt-sha256 '([0-9a-f]{64})'"
     resume_authority_pattern=" --resume-attempt '([0-9a-f]{32})' --resume-terminal-sha256 '([0-9a-f]{64})'"
-    recovery_pattern="${recovery_build_pattern}((${promotion_pattern})|(${superseded_pattern}))?(${resume_authority_pattern})?[[:space:]]*$"
+    recovery_pattern="${recovery_build_pattern}((${promotion_pattern})|(${superseded_pattern}))?(${resume_authority_pattern})?( --diagnostic-api-only)?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${recovery_pattern} ]]; then
       echo "[fullmag just] invalid repair build/promotion recipe" >&2
       exit 2
@@ -257,6 +257,13 @@ case "${recipe}" in
     fi
     if [[ -n "${BASH_REMATCH[17]:-}" ]]; then
       recovery_args+=(--resume-attempt "${BASH_REMATCH[18]}" --resume-terminal-sha256 "${BASH_REMATCH[19]}")
+    fi
+    if [[ -n "${BASH_REMATCH[20]:-}" ]]; then
+      if [[ -n "${BASH_REMATCH[7]:-}" ]]; then
+        echo "[fullmag just] diagnostic API mode cannot promote a package" >&2
+        exit 2
+      fi
+      recovery_args+=(--diagnostic-api-only)
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_dev_recovery_build.py" "${recovery_args[@]}"
     ;;

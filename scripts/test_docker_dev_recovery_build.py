@@ -580,5 +580,45 @@ class DiagnosticBuildOnlyTests(unittest.TestCase):
             namespace['inside_promote']({'diagnostic_api_only': True})
 
 
+
+
+class RecoveryBuildShellTests(unittest.TestCase):
+    def dispatch(self, extra=''):
+        import subprocess
+        wrapper = (Path(__file__).parent/'just_storage_shell.sh').read_text()
+        body = wrapper.split('  *"scripts/docker_dev_recovery_build.py"*)\n',1)[1].split('\n    ;;',1)[0]
+        recipe = ('python "/ignored/scripts/docker_dev_recovery_build.py" '
+                  "--source-root '/selected/worktree' --backend-container-id '"+'b'*64+
+                  "' --image-id 'sha256:"+'c'*64+"' --process-receipt-sha256 '"+'d'*64+
+                  "' --owner-sha256 '"+'e'*64+"'"+extra)
+        program = ('set -euo pipefail\nrecipe="$RECIPE_LITERAL"\n'
+                   'python_cmd="/recorded/python"\nscript_dir="/registered/scripts"\n'
+                   'exec() { printf \'%s\\0\' "$@"; }\n'+body)
+        return subprocess.run(['/bin/bash','--noprofile','--norc','-c',program],
+            env={**os.environ,'RECIPE_LITERAL':recipe},capture_output=True,timeout=15)
+
+    def test_default_and_diagnostic_resume_preserve_exact_argv(self):
+        result = self.dispatch()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertNotIn(b'--diagnostic-api-only',result.stdout)
+        suffix = " --resume-attempt '"+'a'*32+"' --resume-terminal-sha256 '"+'f'*64+"' --diagnostic-api-only"
+        result = self.dispatch(suffix)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout.split(b'\0')[-6:-1],
+                         [b'--resume-attempt',b'a'*32,b'--resume-terminal-sha256',b'f'*64,b'--diagnostic-api-only'])
+
+    def test_promotion_duplicate_and_composite_diagnostic_flags_are_rejected(self):
+        promotion = (" --promote --candidate-basename '.backend-package-candidate-own'"
+                     " --candidate-receipt-sha256 '"+'1'*64+"' --current-receipt-sha256 '"+'2'*64+
+                     "' --provenance-sha256 '"+'3'*64+"'")
+        legacy = self.dispatch(promotion)
+        self.assertEqual(legacy.returncode,0,legacy.stderr)
+        for suffix in [promotion+' --diagnostic-api-only',' --diagnostic-api-only --diagnostic-api-only',
+                       ' --diagnostic-api-only; printf injected',' --diagnostic-api-only && printf injected']:
+            result=self.dispatch(suffix)
+            self.assertEqual(result.returncode,2,result.stderr)
+            self.assertFalse(result.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

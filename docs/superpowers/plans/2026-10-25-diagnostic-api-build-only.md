@@ -49,3 +49,12 @@ W wolumenie kontrolnym grupy, pod
 Build, wykonanie nowego pakietu, recovery oraz publiczne V/J/H pozostają
 oddzielnymi bramkami. Przed deklaracją wykonania należy odczytać terminalny
 receipt konkretnej operacji. Pełne Universe i UI/WebGL nadal NOT VERIFIED.
+
+## Kontrola pełnej ścieżki recepty
+
+Pierwsze wywołanie `just` odmówiło przed BuildControl/Make, ponieważ dodatkowy
+parser `scripts/just_storage_shell.sh` nie dopuszczał nowej flagi. Uzupełniono
+jego stałe argv i zachowano zakaz promocji. Regresje starego wariantu,
+resume+diagnostic, promocji, powielonej flagi oraz złożonych komend przeszły:
+`diagnostic-build-checks-v2.json`, 26 testów PASS. Nie uznajemy poprzedniej
+odmowy za rozpoczęty lub zakończony build.
