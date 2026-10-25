@@ -13,6 +13,7 @@ import { activeLaneCapabilityFixture } from "@/kernel/resources/activeLaneCapabi
 import {
   buildFooterTelemetryModel,
   footerTelemetryStatusEquals,
+  resolveFooterMagneticModelPresent,
   resolvePrimaryTelemetryObjectId,
   selectFooterTelemetryStatus,
 } from "./FooterTelemetry";
@@ -183,6 +184,47 @@ describe("FooterTelemetry", () => {
     expect(byId.rate?.label).toBe("End-to-end rate");
     expect(byId.rate?.detail).toBe("Closed profiler span");
 
+  });
+
+  it("hides magnetic telemetry only for a ready, explicitly nonmagnetic scene", () => {
+    const scene = { objects: [{ id: "conductor", name: "Conductor" }], revision: 1 } satisfies SceneResource;
+    const magneticModelPresent = resolveFooterMagneticModelPresent({ data: scene, status: "ready" });
+    expect(magneticModelPresent).toBe(false);
+    const model = buildFooterTelemetryModel(null, objectMetrics, null, null, null, null, null, null, { magneticModelPresent });
+    expect(model.metrics.some((metric) => metric.id.startsWith("avg-m") || metric.id.startsWith("energy-") || metric.id === "max-torque")).toBe(false);
+    expect(model.metrics.some((metric) => metric.id === "time")).toBe(true);
+  });
+
+  it("retains global magnetic telemetry when a nonmagnetic object is selected in a mixed scene", () => {
+    const scene = { objects: [
+      { id: "conductor", name: "Conductor" },
+      { id: "film", name: "Film", magnetization_ref: "initial_m" },
+    ], revision: 1 } satisfies SceneResource;
+    expect(resolvePrimaryTelemetryObjectId(scene, "conductor")).toBeNull();
+    const magneticModelPresent = resolveFooterMagneticModelPresent({ data: scene, status: "ready" });
+    expect(magneticModelPresent).toBe(true);
+    const model = buildFooterTelemetryModel(null, null, null, null, null, null, null, null, { magneticModelPresent });
+    expect(model.metrics.some((metric) => metric.id === "avg-mx")).toBe(true);
+    expect(model.metrics.some((metric) => metric.id === "energy-total")).toBe(true);
+  });
+
+  it("keeps unknown scene availability distinct from a nonmagnetic scene", () => {
+    expect(resolveFooterMagneticModelPresent({ data: null, status: "loading" })).toBeNull();
+    expect(resolveFooterMagneticModelPresent({ data: { revision: 1 }, status: "ready" })).toBeNull();
+    expect(resolveFooterMagneticModelPresent({ data: { objects: [], revision: 1 }, status: "loading" })).toBeNull();
+    const model = buildFooterTelemetryModel(null, null, null, null, null, null, null, null, { magneticModelPresent: null });
+    expect(model.metrics.find((metric) => metric.id === "max-torque")?.value).toBe("—");
+    expect(model.metrics.find((metric) => metric.id === "dt")?.value).toBe("—");
+  });
+
+  it.each([null, Number.NaN, Number.POSITIVE_INFINITY, 0])("distinguishes absent torque and timestep from genuine zero: %s", (value) => {
+    const telemetryStatus = selectFooterTelemetryStatus({
+      data: { ...status, solver: { ...status.solver, max_torque_T: value, dt: value } },
+      error: null, refetch: () => {}, revision: 1, status: "ready",
+    });
+    const model = buildFooterTelemetryModel(telemetryStatus, null);
+    expect(model.metrics.find((metric) => metric.id === "max-torque")?.value).toBe(value === 0 ? "0.000000e0 T" : "—");
+    expect(model.metrics.find((metric) => metric.id === "dt")?.value).toBe(value === 0 ? "0.000000e+0" : "—");
   });
 
   it("uses detailed runtime state for the visible compute status", () => {
@@ -381,6 +423,7 @@ describe("FooterTelemetry", () => {
         revision: 26,
         row: {
           active_runtime_s: 0.2,
+          mx: 1, my: 0, mz: 0,
           pseudo_time_s: 9e-6,
           step: 9,
           time: 0,
@@ -904,6 +947,7 @@ describe("FooterTelemetry", () => {
     expect(byId.time?.label).toBe("Sim time");
     expect(byId["sim-time"]).toBeUndefined();
     expect(byId.dt?.label).toBe("dt");
+    expect(byId["avg-mx"]?.value).toBe("—");
   });
 
   it("selects only telemetry-relevant status fields", () => {

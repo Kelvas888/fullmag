@@ -139,7 +139,11 @@ export function FooterTelemetry({
     responseProgress.data,
     responseSweep.data,
     scalarResourceSample,
-    { stageExecutionUnpublished, userSolvePhase },
+    {
+      magneticModelPresent: resolveFooterMagneticModelPresent(scene),
+      stageExecutionUnpublished,
+      userSolvePhase,
+    },
   );
 
   return (
@@ -372,6 +376,7 @@ export function buildFooterTelemetryModel(
   responseSweep?: unknown,
   scalarResourceSample?: FooterScalarResourceSample | null,
   runtimePhase?: {
+    magneticModelPresent?: boolean | null;
     stageExecutionUnpublished?: boolean;
     userSolvePhase?: RuntimeUserSolvePhase | null;
   },
@@ -500,7 +505,7 @@ export function buildFooterTelemetryModel(
     awaitingCompute: userSolvePhase === "awaiting_user_solve",
     frequencyDomainProgress,
     stageProgressNotice,
-    metrics: [
+    metrics: ([
       {
         detail: usesPseudoTime
           ? "Direct minimizer pseudotime"
@@ -566,7 +571,7 @@ export function buildFooterTelemetryModel(
         label: usesPseudoTime ? "Pseudo dt" : "dt",
         subdetail: `State: ${runtimeStateLabel}`,
         unit: "s",
-        value: formatScientific(dt, "0.000000e+0"),
+        value: formatScientific(dt, "—"),
       },
       ...(!usesPseudoTime && (errorEstimate !== null || maxError !== null)
         ? [
@@ -636,7 +641,11 @@ export function buildFooterTelemetryModel(
       energyMetric("zeeman", "Zeeman", "Zeeman"),
       energyMetric("anisotropy", "Anisotropy", "Anisotropy"),
       energyMetric("dmi", "DMI", "DMI"),
-    ] satisfies FooterTelemetryMetric[],
+    ] satisfies FooterTelemetryMetric[]).filter((metric) =>
+      runtimePhase?.magneticModelPresent !== false ||
+      (metric.id !== "max-torque" && metricGroup(metric.id) !== "magnetization" &&
+        metricGroup(metric.id) !== "energy"),
+    ),
     onlineDetail: status ? "Live session channel" : "Awaiting session",
     onlineTitle: userSolvePhase === "preparing_model"
       ? "Online / Preparing"
@@ -1149,6 +1158,13 @@ function selectLatestFooterScalarSample(
   return liveSample;
 }
 
+export function resolveFooterMagneticModelPresent(
+  scene: Pick<ResourceResult<SceneResource>, "data" | "status">,
+): boolean | null {
+  if (scene.status !== "ready" || !Array.isArray(scene.data?.objects)) return null;
+  return !scene.data.objects.every(hasEmptyObjectMagneticModel);
+}
+
 export function resolvePrimaryTelemetryObjectId(
   scene: SceneResource | null | undefined,
   selectedObjectId?: string | null,
@@ -1280,7 +1296,7 @@ function formatScientific(
 function formatTorqueTelemetry(valueT: number | null | undefined): string {
   return typeof valueT === "number" && Number.isFinite(valueT)
     ? formatTorqueT(valueT)
-    : "0.000000e+0 T";
+    : "—";
 }
 
 function formatBoolean(value: boolean | null | undefined): string {

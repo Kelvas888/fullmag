@@ -660,3 +660,41 @@ w źródle; nie uruchamiano skompilowanych testów ani przeglądarki.
 Bieżący run nadal running, konkretny worker 6335 potwierdzony w /proc,
 RSS około 519 MiB. Nie wydano nowego Solve. Bramka prądu i pola nadal otwarta;
 pełny zaakceptowany wynik V/J/H jeszcze nie jest opublikowany.
+
+### Telemetria sceny niemagnetycznej — 26.10.2026
+
+Stopka korzysta z istniejącego zasobu sceny i kanonicznego predykatu braku
+autorskiej konfiguracji magnetycznej. Dopiero gotowa scena z jawną listą
+obiektów, z których żaden nie ma tej konfiguracji, ukrywa moment, średnią
+magnetyzację i energie magnetyczne. Scena mieszana zachowuje globalne
+wskaźniki także przy zaznaczeniu anteny; nieznany lub ładowany zasób nie
+stanowi dowodu niemagnetyczności. Nie wnioskujemy o fizyce z nazwy ani typu.
+Brak oraz NaN/Infinity momentu i dt pokazują „—”; rzeczywiste zero pozostaje
+zerem. Nie dodano subskrypcji ani nowej komendy runtime.
+
+Weryfikacja: 45 interpretowanych kontroli rzeczywistych helperów/filtra
+i formattera zgłoszonych przez agenta przeglądu PASS; root sprawdził diff,
+konsumenta sceny i kanoniczny predykat. Pełny TypeScript oraz ESLint obu
+plików w stałym kontenerze frontend zakończyły się exit 0. Dodane regresje
+źródłowe nie były kompilowane ani uruchamiane; brak kontroli przeglądarkowej.
+Nie jest to zaliczenie bramki UI ani obliczeń.
+
+### Koszt aktualnej próby pełnego pola — audyt odczytowy
+
+Dla 2160158 par źródło–target operator wykonuje 8640632 wywołania geometrii
+ścian oraz 25921896 przejść ścian w double/80/120 bitach. Jest to policzona
+praca algorytmu, nie profil czasowy. Trzy precyzje i kontrole błędu pozostają
+obowiązkowe. Publikacja H następuje dopiero po zakończeniu całego operatora;
+brak częściowych payloadów podczas pracy nie dowodzi zawieszenia.
+
+Audyt wskazał możliwe ograniczenie powtarzanych konwersji i stałych w
+face_pass, później dokładną afiniczną postać J i ograniczony cache zależny
+od wykładnika. Nie wdrożono tych optymalizacji podczas trwającej próby.
+Wcześniejszy benchmark zero-copy 354,300 vs 346,505 s (+2,2495%) zachował
+21 payloadów, lecz nie wykazał przyspieszenia. Przed zmianą realizacji
+wymagane są pomiary na tym samym wejściu oraz kontrola zgodności wyników,
+odmów numerycznych, liczników i limitów; nie zmniejszamy siatki ani jakości.
+
+Ostatni autorytatywny odczyt obecnej próby: około 1621 s od Solve, run
+running, algorytm antenna_field_only, warnings=[], worker 6335 obecny.
+Nie zaliczono V/J/H ani pełnego pola Universe.
