@@ -1,5 +1,54 @@
 # Przegląd integracji mastera i dwóch blokad recovery — 25.10.2026
 
+
+## Aktualny checkpoint: recovery wykonane, API i inspekcja przywrócone — 25.10.2026
+
+Po konkretnej zgodzie użytkownika wykonano request
+`5101ae72214536a28d15cc95ca7b2286346ea7c3b94da6d06ccd244fbca39052`.
+Native finalizacja exit 0: Failed/ExplicitOperatorRequest/DoNotRetry,
+release proof `40b62697f875492002b9e7f19f8871cb4d0842b244b9957829c096fbaa662f12`,
+slot zarchiwizowany, aktywne rezerwacje: 0. Sprawdzono 39 plików naukowych
+przed/po apply oraz osobno 70/70 plików wcześniejszego wyniku i oba archiwa
+FMS: bez zmian. Nie wykonano nowego Solve.
+
+Managed stop-failed i resume zakończyły się kodem 0. Resume attempt
+`ad9fea4b382849088ce7498d1d1f0234`; ten sam backend i frontend, zachowane
+cache i storage, port 3203. Make 227585 ms; źródło pakietu
+`e5c0576527a95d5a8656d2f3c4eb97eb096e3f38`, snapshot
+`dca90ca3acdad2e9d0b8e32c43b56430c58a429165a24eaa75d3e1a52d1e9283`,
+receipt `770c58fe8fe6f52a2281385cc3bd6fc1e8a96ffd91a619e2022d035f52532ab6`,
+provenance `657d21c180826455770c5ae459842727217ebba77acf0dd49bca08af3fb4b9d8`.
+
+Po starcie API było poprawnie dostępne, ale bez aktywnego workspace.
+Kanoniczne zachowane FMS przeszło preflight i import visualization_only
+(HTTP 200); odtworzono projekcję accepted definition tylko do odczytu,
+nie pełny dawny stan authoringu ani checkpoint solvera. Status i scena
+przez publiczny origin 3203: HTTP 200, dwa obiekty, jeden port i jeden
+stage anteny. Restore class config_only i ostrzeżenia archiwum zachowano.
+
+Rzeczywisty walidator accepted HTTP: 31 kontroli PASS — V/J/H niezerowe
+i skończone, właściwe jednostki i SHA, ETag/Range, odrzucenie obcych pinów,
+bez zmiany sesji, sceny i komend. V: 678 wartości, J cell-local: 22404,
+H: 42 wartości (14 punktów). To stary zaakceptowany wynik inspection-only.
+
+Dla quantity catalog należy jawnie wybrać runtime stage
+`script-execution-2df97d99b6b88a3c58d0b135696e390a819e720b84d6311f4f6d0a62a8969bec`.
+`data/quantities?stage_id=...` zwraca V_electric/J_charge/H_ant jako
+requestable, stale_complete, historical inspection. Brak dostępności
+w katalogu ogólnym oraz brak native stage_execution przy autorowym
+inspect_loop nie są dowodem braku danych. Wcześniejsza hipoteza o luce
+facade na tej podstawie nie została potwierdzona; nie zmieniano kodu.
+
+Nie zastosowano B. Zwykły managed start po Failed/released przeszedł bez
+tej poprawki. WebGL, rzeczywista prezentacja w UI, pełne Universe,
+kwalifikowana baza LLG/FFT i odtworzenie publikacji nadal nie są odebrane.
+Pełny zakres E0–E12 pozostaje nieukończony. Master f08fc7755 jest pobrany,
+lecz niescalony. Dowody: `verification/approved-heartbeat-A-20261025/`
+w wolumenie kontrolnym, w szczególności
+`recovery-and-restoration-checkpoint.json`,
+`restored-accepted-http-checks.json` i `post-apply-old-results-retention.json`.
+
+
 To przegląd operacyjny lokalnej grupy, nie kwalifikacja naukowa ani zgoda
 na automatyczne ponowienie Solve.
 
