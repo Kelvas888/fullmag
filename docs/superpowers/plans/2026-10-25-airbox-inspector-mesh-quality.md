@@ -192,3 +192,22 @@ dowodem wykonania recovery ani dowodem działania przeglądarki.
   zbędnego zasobu wymagającego kasowania; 24 GiB wolne na hoście i 471 GiB
   w przestrzeni wolumenów Docker w ostatnim pomiarze. Cache zadania podlega
   ponownej ocenie dopiero po integracji i potwierdzonym drain.
+
+- Build czystego `35561e4c1ec6d2b1e74dd4912eea7e20f6a513b3`: sukces,
+  iteration `1e6332ce43dc4044b170201c75155b1e`, snapshot
+  `b358c7067f8b155b6fe0c8416285974f59cc8f199713c12ca7159b36e0730a8a`.
+  Aktywacja `6b798cd361c04554bf958d27b4243932`: przygotowanie gotowe,
+  oczekiwanie na Compute, bez Solve. Żywe API publikuje 7131 węzłów i 39946
+  komórek: 38844 tet4, 1012 prism6, 90 pyramid5. Marker Airboxa 0 zawiera
+  38161 komórek (38071 tet4 + 90 pyramid5), z SICN min
+  0.14847032019231338, p05 0.5032030886511972, mean 0.7681302002971812.
+  Interpretowane asercje potwierdziły sumy markerów i rodzin, liczności
+  histogramów oraz średnie ważone z tolerancją 1e-12. Gamma dla pyramid5
+  pozostaje jawnie niedostępna; bramki pass/pass/unknown nie udają pełnego pass.
+- Browser QA `17b4445fe8424cb7bf0a9f53069b9d49`: timeout początkowego
+  loopback GET; ponowny niezależny probe zakończył się HTTP 200.
+  Próba `8e5274ed0aa64da293967abb8ecc9655` weszła do wszystkich paneli,
+  ale porównanie Scope wykryło `not published` zamiast `airbox`; odnotowano
+  też PATCH visualization/state wymagający wyjaśnienia. Wynik **niezaliczony**,
+  bez błędów strony, konsoli i transportu. Pełny browser proof i merge nadal
+  oczekują na usunięcie przyczyn i zielone CI.
