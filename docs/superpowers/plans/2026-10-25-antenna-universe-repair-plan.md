@@ -2,7 +2,8 @@
 
 Data: 25.10.2026. Status: plan wykonawczy; pełne zadanie niezakończone.
 Branch: `codex/antenna-transport-e2e-20261011`.
-HEAD: `b15ea875191a5a1abf74b36da2b1234ab1350c38` + niezacommitowane zmiany.
+Baza pierwszego audytu: `b15ea875191a5a1abf74b36da2b1234ab1350c38` + niezacommitowane zmiany.
+Kolejne wykonania i ich tożsamości zapisano w rejestrze poniżej.
 Środowisko: worktree WSL Ubuntu, grupa Docker DEV anteny, UI na porcie 3203.
 
 ## Cel i zasada prowadzenia pracy
@@ -302,3 +303,62 @@ oraz jawnymi argumentami i przypiętego docker-dev-restart-idle zakończyły
 się kodem 0. `git diff --check` przeszedł. To kontrola składni i rozwinięcia
 poleceń, nie dowód buildu ani uruchomienia Universe. Pierwotny błąd wystąpił
 przed wykonaniem recepty, więc nie zatrzymał usług i nie rozpoczął buildu.
+
+
+### Publiczne przygotowanie po poprawkach — wynik niezaliczony
+
+Managed restart `edb6b26336d1409e844e77e0d09f876f` zakończył się
+`succeeded`, kompilacja exit 0 (309345 ms), API i frontend zostały
+uruchomione w tej samej grupie 3203. Commit
+`66db3c86a5ee3f3f87ced3d6dcd3b25e5439da9e`, snapshot
+`8c9f767c6bbdeae1568a7c6e572829c21406fe904d9ca32a1a81f06b562f2e78`.
+Cache zachowany; brak usuwania danych. Nie kwalifikuje to retencji,
+przeglądarki ani obliczenia pola.
+
+Jedna aktywacja `8beaabccc9f8463eae1cc19a24ae5ea2`, request
+`antenna-universe-mesh-si-20261025-01`, zakończyła się `succeeded`.
+Publiczne preparation=ready, run=waiting_for_solve, solver=awaiting_command.
+Run: `run-live-36bd51495b58e60c056a8c8503bec76065e6fa53159e33d74bc3e58034f577b6`.
+Nowy katalog CAS: `e460871f733b18f6cb5976d7b7616222f52177ae4c853541ed3bae9e8a9208e0`.
+Nie uruchomiono Solve, LLG ani nowego importu.
+
+**P11 — błędny nośnik publicznej domeny.** Katalog zawiera Global
+1149 węzłów / 6472 Tet4 i przewodnik 677 / 1861. API
+`/v2/sessions/current/meshing/meshes/shared-domain/manifest` zwraca
+jednak przewodnik 677 / 1861, z jedną częścią conductor. Raport
+shared-domain ma mesh_statistics=null, a quality Universe i anteny
+są puste. Przyczyna wyboru topologii potwierdzona w kodzie:
+`live_scene_preparation.rs::prepared_fem_mesh` wywołuje
+`StageFemMeshAsset::build_from_antenna_field_only_plan`, które zawsze
+bierze `plan.source_mesh`. `resolve_field_sampling` zachowuje punkty
+i connectivity Global, lecz pomija markery, facets i raport budowy.
+Nie wolno naprawić tego przez przemianowanie siatki źródła lub
+przepisanie nośników V/J na Global. Następna poprawka musi publikować
+rzeczywistą domenę z przypiętego modelu, zachowując osobny nośnik prądu.
+
+**P12 — stare jednostki mimo poprawionych źródeł.** Nowy katalog
+zachowuje poprawną geometrię, ale raporty objętości Global oraz
+przewodnika nadal mają skalę większą o 1e18. Niezależne porównanie
+z determinantami elementów nie przeszło. Przywrócenie raportów
+przewodnika działa (są cztery markery), lecz nie kwalifikuje ich jednostek.
+Poprawione pliki Python w `/build/workspace` są bajtowo zgodne
+z checkoutem. Proces API ma cache `/build/cache/fem-mesh`, lecz
+nie ma FULLMAG_SOURCE_SNAPSHOT_SHA256; helper klucza cache zwraca
+wtedy brak tożsamości źródeł. Ponowne użycie starych metadanych jest
+hipotezą wymagającą potwierdzenia, nie jeszcze zakończoną naprawą.
+Następny krok: prześledzić przekazanie zweryfikowanej tożsamości
+do Python oraz cache hit/miss, zachowując stare wpisy.
+
+Diagnostyka kształtu: 16 elementów powietrza i 25 przewodnika
+w Global ma SICN poniżej 0.1; p5 odpowiednio 0.37419 i 0.47795.
+Minimalna gamma jest poniżej istniejącego progu diagnostycznego 0.08.
+To progi statystyk inspekcyjnych, nie nowa bramka solvera ani dowód
+zbieżności. Nie zmieniono siatki i tolerancji.
+
+Dowody w wolumenie kontrolnym:
+`verification/antenna-universe-mesh-audit-20261025/shape-quality-diagnostic.json`
+oraz `public-prepare-si/`: zapisane odpowiedzi preparation/run/solver,
+manifest, raporty i `result.json` z niezaliczonymi kontrolami.
+**Bramka 1/5 nadal otwarta: dwie potwierdzone rozbieżności publicznego
+przepływu oraz kontrola UI NOT VERIFIED.** Pełne pole Universe nadal
+nieobliczone.
