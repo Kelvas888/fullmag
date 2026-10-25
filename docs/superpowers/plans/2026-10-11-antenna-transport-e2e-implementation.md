@@ -35,8 +35,13 @@ Dowody: `verification/universe-surface-trial-20261025/` i
 `verification/wrapper-refresh-20261025/` w wolumenie kontrolnym grupy.
 
 Ponowny fetch potwierdził `origin/master`
-`f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`; nie został jeszcze scalony.
-Integracja nastąpi po terminalnym rozstrzygnięciu tej próby. E0–E12 pozostaje
+`f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`. Źródła zintegrowano bez
+restartu aktywnego pakietu. Jedyny konflikt w schedulerze rozwiązano,
+zachowując frozen context oraz upstreamową obsługę utraty świeżości próbki
+zasobów. To integracja źródeł, nie zweryfikowany build tej integracji.
+Worker nadal wykonuje `/opt/fullmag/package/bin/fullmag-api-accepted-worker`
+z poprzedniego, przypiętego pakietu; jego wejścia i próba nie zostały zmienione.
+Build i restart pozostają odłożone do terminalnego rozstrzygnięcia próby. E0–E12 pozostaje
 nieukończone: wykonanie próby nie oznacza kwalifikacji bazy, LLG/FFT ani BORIS.
 
 ## Aktualny checkpoint: recovery wykonane, API i inspekcja przywrócone — 25.10.2026

@@ -408,16 +408,25 @@ pub fn schedule_next_ready_accepted_task_with_host(
             if !host.has_current_compute_snapshot()? {
                 return Ok(None);
             }
-            let request = crate::host_allocation::host_request_for_task_claim(
+            let admission = crate::host_allocation::host_request_for_task_claim(
                 store,
                 ledger,
                 claim,
                 placement,
                 host.expected_runtime_generation_sha256(),
-            )?;
-            crate::claim::try_commit_claimed_task_admission_with_host_and_frozen_context(
-                store, task, claim, ledger, &request, inputs, frozen, accepted,
             )
+            .and_then(|request| {
+                crate::claim::try_commit_claimed_task_admission_with_host_and_frozen_context(
+                    store, task, claim, ledger, &request, inputs, frozen, accepted,
+                )
+            });
+            match admission {
+                // Preserve upstream retry behavior when the compute sample
+                // expires during admission. Any durable admission remains
+                // owned by the existing resume path.
+                Err(_) if !host.has_current_compute_snapshot()? => Ok(None),
+                other => other,
+            }
         },
     )
 }

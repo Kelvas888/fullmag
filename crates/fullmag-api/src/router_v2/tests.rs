@@ -1487,11 +1487,11 @@ async fn model_readiness_marks_fem_mesh_stale_against_scene_revision() {
     let scene_revision = scene.revision;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(scene);
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 9;
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": { "source_scene_revision": scene_revision - 1 }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -2868,7 +2868,7 @@ async fn test_router_with_runtime_read_models() -> axum::Router {
                     "integrator": "rk45"
                 }
             }
-        }));
+        }).into());
         snapshot.engine_log = vec![
             crate::types::EngineLogEntry {
                 timestamp_unix_ms: 1,
@@ -4238,7 +4238,7 @@ async fn status_active_lane_uses_published_resolved_execution_when_session_field
                 "precision": "double",
                 "mode": "strict"
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(
             serde_json::from_value(serde_json::json!({
                 "engine_id": "fdm_cpu_reference",
@@ -4291,7 +4291,7 @@ async fn status_active_lane_fails_closed_for_partial_session_resolution() {
             "resolved_execution": {
                 "backend": "fdm", "device": "cpu", "precision": "double", "mode": "strict"
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -4319,7 +4319,7 @@ async fn status_active_lane_fails_closed_when_session_and_metadata_conflict() {
             "resolved_execution": {
                 "backend": "fdm", "device": "cuda", "precision": "double", "mode": "strict"
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -4370,7 +4370,7 @@ async fn status_exposes_typed_relaxation_algorithm_from_canonical_metadata() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.metadata = Some(serde_json::json!({
             "relaxation_algorithm": "nonlinear_cg"
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -4458,7 +4458,7 @@ async fn domain_status_and_meta_preserve_built_fem_and_explicit_fdm_with_retaine
         let snapshot = guard.as_mut().expect("fixture session is active");
         snapshot.session.requested_backend = "fem".into();
         snapshot.session.resolved_backend = Some("fem".into());
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 17;
         snapshot.metadata = None;
     }
@@ -4519,7 +4519,7 @@ async fn domain_status_and_meta_preserve_built_fem_and_explicit_fdm_with_retaine
         let snapshot = guard.as_mut().expect("fixture session is active");
         snapshot.session.requested_backend = "fem".into();
         snapshot.session.resolved_backend = Some("fem".into());
-        snapshot.fem_mesh = Some(empty_fem_mesh);
+        snapshot.fem_mesh = Some(empty_fem_mesh.into());
         snapshot.metadata = None;
     }
 
@@ -4547,7 +4547,7 @@ async fn domain_status_and_meta_preserve_built_fem_and_explicit_fdm_with_retaine
         let snapshot = guard.as_mut().expect("fixture session is active");
         snapshot.session.requested_backend = "fdm".into();
         snapshot.session.resolved_backend = Some("fdm".into());
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": {
                 "backend": "fdm",
@@ -4563,7 +4563,7 @@ async fn domain_status_and_meta_preserve_built_fem_and_explicit_fdm_with_retaine
                     }
                 }
             }
-        }));
+        }).into());
     }
 
     let fdm_status_response = app
@@ -4613,7 +4613,7 @@ async fn domain_meta_uses_fdm_physical_cell_size_for_grid_and_bounds() {
                 "origin_m": [1.0e-9, -2.0e-9, 3.0e-9],
                 "cell_size": [2.0e-9, 3.0e-9, 4.0e-9]
             }
-        }));
+        }).into());
         snapshot.live_state = Some(LiveState {
             status: "running".into(),
             updated_at_unix_ms: 1_700_000_000_123,
@@ -4697,7 +4697,7 @@ async fn domain_meta_uses_fdm_artifact_layout_before_first_live_step() {
                 "origin": [-3.0e-9, -2.0e-9, -1.0e-9],
                 "cell_size": [1.0e-9, 2.0e-9, 5.0e-9]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
     let app = build_v2_router().with_state(state);
@@ -4808,7 +4808,7 @@ async fn fdm_multilayer_layout_exposes_common_and_native_layer_metadata() {
                     }
                 }
             }
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
     let response = app
@@ -4872,7 +4872,7 @@ async fn fdm_multilayer_native_active_mask_is_served_as_revisioned_fmbm() {
                 }],
                 "common_cells": [4, 3, 1]
             }}
-        }));
+        }).into());
     }
 
     let layout_response = build_v2_router()
@@ -4969,7 +4969,7 @@ async fn fdm_multilayer_layout_correlates_reordered_artifact_layers_by_identity(
                     }
                 ]
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -5035,7 +5035,7 @@ async fn fdm_multilayer_layout_rejects_plan_artifact_grid_and_count_conflicts() 
                     "total_cell_count": 3, "active_cell_count": 1, "inactive_cell_count": 2
                 }]
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -5156,7 +5156,7 @@ async fn fdm_multilayer_layout_rejects_missing_or_malformed_native_layers() {
                     "native_origin": [0.0, 0.0, 0.0]
                 }]
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -5179,7 +5179,7 @@ async fn fdm_multilayer_layout_rejects_missing_or_malformed_native_layers() {
                     "native_grid": [1, 1, 1], "native_origin": [0.0, 0.0, 0.0]
                 }]
             } }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -5208,7 +5208,7 @@ async fn fdm_multilayer_layout_rejects_unmaterialized_or_malformed_active_masks(
                     "native_active_mask": [true]
                 }]
             } }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state.clone())
@@ -5258,7 +5258,7 @@ async fn fdm_multilayer_layout_rejects_unmaterialized_or_malformed_active_masks(
                     "total_cell_count": 2, "active_cell_count": 2, "inactive_cell_count": 0
                 }]
             }
-        }));
+        }).into());
     }
     let response = build_v2_router()
         .with_state(state)
@@ -5284,7 +5284,7 @@ async fn status_uses_fdm_artifact_layout_revision_before_first_live_step() {
                 "origin_m": [-3.0e-9, -2.0e-9, -1.0e-9],
                 "cell_size": [1.0e-9, 2.0e-9, 5.0e-9]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
     let app = build_v2_router().with_state(state);
@@ -5327,7 +5327,7 @@ async fn fem_string_generation_identity_is_preserved_across_domain_status_catalo
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         let mut mesh = sample_fem_mesh_payload();
         mesh.generation_id = Some(generation_id.to_string());
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -5421,7 +5421,7 @@ async fn domain_meta_reports_mixed_fem_cell_types_without_calling_them_tetrahedr
             global_ordinals: vec![0, 1],
             mesh_parts: Vec::new(),
         };
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
     let response = app
@@ -5452,7 +5452,7 @@ async fn realtime_state_uses_fdm_artifact_layout_domain_revision() {
                 "origin": [-3.0e-9, -2.0e-9, -1.0e-9],
                 "cell_size": [1.0e-9, 2.0e-9, 5.0e-9]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
         snapshot.clone()
     };
@@ -5474,7 +5474,7 @@ async fn domain_meta_accepts_planar_fdm_zero_spacing_axis() {
                 "grid_cells": [4, 3, 1],
                 "cell_size": [2.0e-9, 3.0e-9, 0.0]
             }
-        }));
+        }).into());
         snapshot.live_state = Some(LiveState {
             status: "running".into(),
             updated_at_unix_ms: 1_700_000_000_123,
@@ -5556,14 +5556,14 @@ async fn domain_topology_returns_204_for_fdm() {
 async fn fdm_domain_endpoints_ignore_reused_fem_topology() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } },
             "artifact_layout": {
                 "backend": "fdm",
                 "grid_cells": [4, 1, 1]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
     let app = build_v2_router().with_state(state);
@@ -5596,7 +5596,7 @@ async fn fdm_domain_endpoints_ignore_reused_fem_topology() {
 async fn fdm_multilayer_domain_endpoints_ignore_reused_fem_topology() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": {
                 "backend_plan": {
@@ -5614,7 +5614,7 @@ async fn fdm_multilayer_domain_endpoints_ignore_reused_fem_topology() {
                 "common_cells": [4, 2, 1],
                 "layers": []
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
     let app = build_v2_router().with_state(state);
@@ -5704,7 +5704,7 @@ async fn fdm_multilayer_field_slice_uses_common_grid_geometry() {
                 "common_cells": [4, 2, 1],
                 "layers": []
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -5759,7 +5759,7 @@ async fn fdm_multilayer_field_slice_uses_common_grid_geometry() {
 async fn domain_topology_returns_304_when_etag_matches() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 17;
     }
     let app = build_v2_router().with_state(state);
@@ -5808,7 +5808,7 @@ async fn domain_topology_includes_mesh_topology_hash_header() {
     let mesh = sample_fem_mesh_payload();
     let expected_hash = fullmag_runner::fem_mesh_topology_fingerprint(&mesh);
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 17;
     }
     let app = build_v2_router().with_state(state);
@@ -5837,7 +5837,7 @@ async fn domain_topology_includes_mesh_topology_hash_header() {
 async fn domain_topology_supports_byte_ranges_for_large_topology_payloads() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 18;
     }
     let cache_state = state.clone();
@@ -5905,7 +5905,7 @@ async fn domain_topology_matching_etag_does_not_populate_binary_cache() {
         "domain-topology:{generation_id}:{topology_hash}:19"
     ));
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 19;
     }
     let cache_state = state.clone();
@@ -5954,7 +5954,7 @@ async fn domain_slice_mesh_overlay_returns_204_for_fdm() {
 async fn domain_slice_mesh_overlay_returns_json_for_fem() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 31;
     }
     let app = build_v2_router().with_state(state);
@@ -6003,7 +6003,7 @@ async fn domain_slice_mesh_overlay_returns_json_for_fem() {
 async fn domain_slice_mesh_overlay_returns_304_when_etag_matches() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 9;
     }
     let app = build_v2_router().with_state(state);
@@ -6443,7 +6443,7 @@ async fn field_meta_keeps_atomic_publication_bundle_after_topology_advances() {
         let snapshot = guard.as_mut().expect("live session exists");
         let mesh = sample_fem_mesh_payload();
         expected_topology_hash = fullmag_runner::fem_mesh_topology_fingerprint(&mesh);
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 7;
         crate::session::apply_current_live_snapshot(
             snapshot,
@@ -6970,7 +6970,7 @@ async fn status_payload_remains_thin_even_with_large_field_buffers() {
 async fn status_topology_revision_is_stable_across_quantity_switch() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 77;
     }
     let app = build_v2_router().with_state(state);
@@ -7175,7 +7175,7 @@ async fn visualization_state_exposes_one_canonical_airbox_and_only_orphan_part_f
 
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(scene);
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -7820,7 +7820,7 @@ async fn visualization_planar_target_overrides_accept_current_part_target() {
     part.object_id = None;
     part.geometry_id = None;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
     let part_override = serde_json::json!({
@@ -9131,7 +9131,7 @@ async fn completed_rotated_dmi_scalar_preview_uses_plan_gated_manifest_fallback(
             physics_graph: None,
         },
     };
-    snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan }));
+    snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan }).into());
     assert_eq!(
         crate::current_global_scalar_value(snapshot, "E_rotated_dmi"),
         Some(-2.5e-18)
@@ -9140,7 +9140,7 @@ async fn completed_rotated_dmi_scalar_preview_uses_plan_gated_manifest_fallback(
     // Missing or corrupt legacy provenance cannot relabel an aggregate as a
     // rotated component; the aggregate remains readable in both cases.
     for metadata in [None, Some(serde_json::json!({ "execution_plan": {} }))] {
-        snapshot.metadata = metadata;
+        snapshot.metadata = metadata.map(Into::into);
         assert_eq!(
             crate::current_global_scalar_value(snapshot, "E_rotated_dmi"),
             None
@@ -9169,7 +9169,7 @@ async fn table_rows_expose_rotated_dmi_energy_as_an_independent_global_scalar() 
                 "every_steps": 1,
                 "quantities": ["step", "e_rotated_dmi"]
             }
-        }));
+        }).into());
         snapshot.scalar_rows = vec![row];
         snapshot.scalar_revision = 1;
     }
@@ -9208,7 +9208,7 @@ async fn table_resources_expose_only_configured_autosave_quantities() {
                 "every_steps": 10,
                 "quantities": ["step", "mx", "e_ex"]
             }
-        }));
+        }).into());
         snapshot.scalar_rows = vec![sample_scalar_row(1, 1e-12, 6.9)];
         snapshot.scalar_revision = 1;
     }
@@ -9667,7 +9667,7 @@ async fn frozen_spins_uses_quantity_catalog_field_catalog_and_fmvp_scalar_data_p
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(resolved_compute_fields_capabilities(&["frozen_spins"]));
         let latest_fields = serde_json::from_value(serde_json::json!({
             "frozen_spins": {
@@ -9815,8 +9815,8 @@ async fn fem_frozen_spins_object_scope_uses_true_mesh_node_carrier() {
         snapshot.session.resolved_backend = Some("fem-cpu".to_string());
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fem" } }
-        }));
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        }).into());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.mesh_revision = 11;
         snapshot.capabilities = Some(resolved_compute_fields_capabilities(&["frozen_spins"]));
         let latest_fields = serde_json::from_value(serde_json::json!({
@@ -10841,7 +10841,7 @@ async fn mesh_summary_returns_current_mesh_workspace() {
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_summary": { "nodes": 12, "elements": 24 },
             "mesh_quality_summary": { "min_quality": 0.82 }
-        }));
+        }).into());
         snapshot.mesh_revision = 11;
     }
     let app = build_v2_router().with_state(state);
@@ -10868,13 +10868,13 @@ async fn mesh_object_quality_returns_normalized_scope_statistics() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(sample_scene_document());
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.mesh_workspace = Some(serde_json::json!({
             "effective_per_object_targets": {
                 "body": { "marker": 7, "maximum_element_size": 2e-9 }
             },
             "mesh_statistics": sample_scoped_mesh_statistics()
-        }));
+        }).into());
         snapshot.mesh_revision = 21;
     }
     let app = build_v2_router().with_state(state);
@@ -10933,15 +10933,15 @@ async fn mesh_object_quality_fallback_reports_size_distribution() {
                 "avg_quality": 0.72
             }
         });
-        let mesh =
+        let mesh: FemMeshPayload =
             serde_json::from_value(mesh_value).expect("mesh quality payload should deserialize");
         snapshot.scene_document = Some(sample_scene_document());
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_workspace = Some(serde_json::json!({
             "effective_per_object_targets": {
                 "body": { "marker": 7, "maximum_element_size": 2e-9 }
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 26;
     }
     let app = build_v2_router().with_state(state);
@@ -10982,7 +10982,7 @@ async fn mesh_universe_quality_returns_airbox_scope_statistics() {
         snapshot.mesh_workspace = Some(serde_json::json!({
             "effective_airbox_target": { "maximum_element_size": 1e-8 },
             "mesh_statistics": sample_scoped_mesh_statistics()
-        }));
+        }).into());
         snapshot.mesh_revision = 22;
     }
     let app = build_v2_router().with_state(state);
@@ -11029,7 +11029,7 @@ async fn mesh_universe_quality_reads_scoped_statistics_from_last_build_summary()
                 "kind": "mesh_build_summary",
                 "mesh_statistics": sample_scoped_mesh_statistics()
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 23;
     }
     let app = build_v2_router().with_state(state);
@@ -11078,12 +11078,12 @@ async fn mesh_universe_quality_fallback_reports_volume_ratio() {
                 "avg_quality": 0.72
             }
         });
-        let mesh =
+        let mesh: FemMeshPayload =
             serde_json::from_value(mesh_value).expect("mesh quality payload should deserialize");
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_workspace = Some(serde_json::json!({
             "effective_airbox_target": { "maximum_element_size": 5e-7 }
-        }));
+        }).into());
         snapshot.mesh_revision = 24;
     }
     let app = build_v2_router().with_state(state);
@@ -11128,10 +11128,10 @@ async fn mesh_universe_quality_reports_airbox_size_distribution_without_quality_
         let mut mesh = sample_fem_mesh_payload();
         mesh.element_markers = vec![0];
         mesh.per_domain_quality.clear();
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_workspace = Some(serde_json::json!({
             "effective_airbox_target": { "maximum_element_size": 5e-7 }
-        }));
+        }).into());
         snapshot.mesh_revision = 25;
     }
     let app = build_v2_router().with_state(state);
@@ -11172,7 +11172,7 @@ async fn mesh_summary_returns_304_when_etag_matches() {
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_summary": { "nodes": 12, "elements": 24 },
             "mesh_quality_summary": { "min_quality": 0.82 }
-        }));
+        }).into());
         snapshot.mesh_revision = 11;
     }
     let app = build_v2_router().with_state(state);
@@ -11238,7 +11238,7 @@ async fn mesh_semantics_returns_three_level_projection() {
             "last_build_summary": { "elements": 24 },
             "mesh_pipeline_status": [{ "id": "meshing", "status": "active" }],
             "last_build_error": "quality threshold not met"
-        }));
+        }).into());
         let mut fem_mesh = sample_fem_mesh_payload_with_manifest();
         fem_mesh.build_report = serde_json::from_value(serde_json::json!({
             "build_mode": "component_aware",
@@ -11248,7 +11248,7 @@ async fn mesh_semantics_returns_three_level_projection() {
             "rejected_element_types": []
         }))
         .expect("mesh build report fixture should deserialize");
-        snapshot.fem_mesh = Some(fem_mesh);
+        snapshot.fem_mesh = Some(fem_mesh.into());
         snapshot.mesh_revision = 73;
     }
     let app = build_v2_router().with_state(state);
@@ -11307,7 +11307,7 @@ async fn mesh_capabilities_replace_stale_workspace_mixed_features_fail_closed() 
                 "mesh.topology.mixed_p1.v2.disconnected_bodies": { "status": "production_executable" },
                 "mesh.exact_layer_count": { "status": "production_executable" }
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(
             serde_json::from_value(serde_json::json!({
                 "engine_id": "fem_cpu_native",
@@ -11425,7 +11425,7 @@ async fn mixed_shared_domain_resources_publish_typed_topology_truth() {
             }))
             .expect("mixed build report fixture should deserialize"),
         );
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.capabilities = Some(
             serde_json::from_value(serde_json::json!({
                 "engine_id": "fem_cpu_native",
@@ -11454,7 +11454,7 @@ async fn mixed_shared_domain_resources_publish_typed_topology_truth() {
         );
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_summary": { "mesh_name": "test-mesh" }
-        }));
+        }).into());
         snapshot.mesh_revision = 91;
     }
     let app = build_v2_router().with_state(state);
@@ -11586,7 +11586,7 @@ async fn mixed_v2_shared_domain_resources_publish_v2_capability_reason() {
             }))
             .expect("mixed v2 build report fixture should deserialize"),
         );
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.capabilities = Some(
             serde_json::from_value(serde_json::json!({
                 "engine_id": "fem_native_gpu",
@@ -11620,7 +11620,7 @@ async fn mixed_v2_shared_domain_resources_publish_v2_capability_reason() {
         );
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_summary": { "mesh_name": "test-mesh" }
-        }));
+        }).into());
         snapshot.mesh_revision = 92;
     }
     let app = build_v2_router().with_state(state);
@@ -11714,7 +11714,7 @@ async fn mesh_active_build_publishes_mixed_layer_rejection_evidence() {
                 }
             },
             "last_build_error": "resolved 2 layers"
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -11831,7 +11831,7 @@ async fn mesh_active_build_returns_projection_from_mesh_workspace() {
                 }
             },
             "last_build_error": "stale topology"
-        }));
+        }).into());
         snapshot.mesh_build_revision = 13;
         snapshot.mesh_revision = 44;
     }
@@ -11928,7 +11928,7 @@ async fn mesh_shared_domain_report_preserves_backend_truth_payloads() {
                 }],
                 "mesh_statistics": { "mesh_name": "mesh-b" }
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 17;
     }
     let app = build_v2_router().with_state(state);
@@ -11975,7 +11975,7 @@ async fn mesh_realized_size_fields_returns_backend_truth_payload() {
                     }]
                 }
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 18;
     }
     let app = build_v2_router().with_state(state);
@@ -12012,7 +12012,7 @@ async fn mesh_quality_gates_prefers_backend_truth_payload() {
                     "status": "pass"
                 }]
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 19;
     }
     let app = build_v2_router().with_state(state);
@@ -12041,7 +12041,7 @@ async fn mesh_quality_gates_returns_marked_projection_when_backend_payload_is_mi
         snapshot.mesh_workspace = Some(serde_json::json!({
             "mesh_quality_summary": { "sicn": { "p05": 0.34 } },
             "mesh_statistics": { "global": { "element_count": 0 } }
-        }));
+        }).into());
         snapshot.mesh_revision = 20;
     }
     let app = build_v2_router().with_state(state);
@@ -12111,8 +12111,8 @@ async fn mesh_quality_gates_publishes_revision_bound_mixed_certificate_evidence(
             generation_id: Some("mixed-quality-generation".to_string()),
             per_domain_quality: Default::default(),
             build_report: Some(report),
-        });
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        }.into());
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
         snapshot.mesh_revision = 91;
     }
     let app = build_v2_router().with_state(state);
@@ -12190,8 +12190,8 @@ async fn mesh_quality_gates_preserves_legacy_v2_mixed_certificate_evidence() {
             generation_id: Some("mixed-quality-v2-generation".to_string()),
             per_domain_quality: Default::default(),
             build_report: Some(report),
-        });
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        }.into());
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
         snapshot.mesh_revision = 92;
     }
     let app = build_v2_router().with_state(state);
@@ -12260,8 +12260,8 @@ async fn mesh_quality_gates_rejects_quality_evidence_mutated_for_the_same_topolo
             generation_id: Some("mixed-quality-mutated-generation".to_string()),
             per_domain_quality: Default::default(),
             build_report: Some(report),
-        });
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        }.into());
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
         snapshot.mesh_revision = 93;
     }
     let app = build_v2_router().with_state(state);
@@ -12308,8 +12308,8 @@ async fn mesh_quality_gates_suppresses_stale_mixed_certificate_values() {
             .expect("mixed build report should deserialize");
         let mut mesh = sample_fem_mesh_payload();
         mesh.build_report = Some(report);
-        snapshot.fem_mesh = Some(mesh);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.fem_mesh = Some(mesh.into());
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
         snapshot.mesh_revision = 92;
     }
     let app = build_v2_router().with_state(state);
@@ -12355,7 +12355,7 @@ async fn mesh_active_build_returns_304_when_etag_matches() {
             "effective_per_object_targets": { "body": { "hmax": "2e-9" } },
             "last_build_summary": { "elements": 42 },
             "last_build_error": "stale topology"
-        }));
+        }).into());
         snapshot.mesh_build_revision = 13;
     }
     let app = build_v2_router().with_state(state);
@@ -12416,7 +12416,7 @@ async fn fdm_grid_refresh_command_is_queued_for_atomic_runtime_replan() {
                     "grid": { "cells": [2, 2, 1] }
                 }
             }
-        }));
+        }).into());
         crate::session::refresh_runtime_status(snapshot);
     }
     let app = build_v2_router().with_state(state.clone());
@@ -12482,7 +12482,7 @@ async fn fdm_grid_refresh_command_is_queued_for_atomic_runtime_replan() {
                 "completed_at_unix_ms": 1_700_000_000_700u64,
                 "mesh_generation_id": "fdm-generation-b"
             }]
-        }));
+        }).into());
         snapshot.clone()
     };
     let reconciled = {
@@ -12547,7 +12547,7 @@ async fn fdm_grid_refresh_command_rejects_non_fdm_sessions_without_queueing() {
         snapshot.session.resolved_backend = Some("fem".into());
         snapshot.session.requested_backend = "fdm".into();
         snapshot.session.explicit_selection = true;
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         let mut scene = snapshot
             .scene_document
             .take()
@@ -12556,7 +12556,7 @@ async fn fdm_grid_refresh_command_rejects_non_fdm_sessions_without_queueing() {
         snapshot.scene_document = Some(scene);
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": { "backend": "fdm" }
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state.clone());
 
@@ -12628,7 +12628,7 @@ async fn fdm_grid_refresh_rejects_unknown_or_automatic_lane_without_artifact_fal
                     "backend_plan": { "kind": kind }
                 });
             }
-            snapshot.metadata = Some(metadata);
+            snapshot.metadata = Some(metadata.into());
         }
         let app = build_v2_router().with_state(state.clone());
 
@@ -12696,7 +12696,7 @@ async fn fdm_grid_refresh_uses_active_plan_or_explicit_request_without_resolved_
                 .unwrap_or_else(sample_scene_document);
             scene.study.requested_backend = "fdm".into();
             snapshot.scene_document = Some(scene);
-            snapshot.metadata = Some(metadata);
+            snapshot.metadata = Some(metadata.into());
             crate::session::refresh_runtime_status(snapshot);
         }
         let app = build_v2_router().with_state(state.clone());
@@ -12730,7 +12730,7 @@ async fn fdm_grid_refresh_command_rejects_missing_authoring_scene_without_queuei
         snapshot.scene_document = None;
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } }
-        }));
+        }).into());
         crate::session::refresh_runtime_status(snapshot);
     }
     let app = build_v2_router().with_state(state.clone());
@@ -13306,7 +13306,7 @@ async fn mesh_build_history_returns_history_projection() {
                 { "mesh_name": "mesh-a", "node_count": 11 },
                 { "mesh_name": "mesh-b", "node_count": 17 }
             ]
-        }));
+        }).into());
         snapshot.mesh_build_revision = 29;
     }
     let app = build_v2_router().with_state(state);
@@ -13337,7 +13337,7 @@ async fn mesh_build_history_returns_304_when_etag_matches() {
                 { "mesh_name": "mesh-a", "node_count": 11 },
                 { "mesh_name": "mesh-b", "node_count": 17 }
             ]
-        }));
+        }).into());
         snapshot.mesh_build_revision = 29;
     }
     let app = build_v2_router().with_state(state);
@@ -13386,7 +13386,7 @@ async fn mesh_last_successful_build_returns_projection() {
             "effective_airbox_target": { "hmax": "5e-9" },
             "effective_per_object_targets": { "body": { "hmax": "2e-9" } },
             "last_build_error": "previous remesh failed"
-        }));
+        }).into());
         snapshot.mesh_build_revision = 31;
     }
     let app = build_v2_router().with_state(state);
@@ -13420,7 +13420,7 @@ async fn mesh_last_successful_build_returns_304_when_etag_matches() {
             "effective_airbox_target": { "hmax": "5e-9" },
             "effective_per_object_targets": { "body": { "hmax": "2e-9" } },
             "last_build_error": "previous remesh failed"
-        }));
+        }).into());
         snapshot.mesh_build_revision = 31;
     }
     let app = build_v2_router().with_state(state);
@@ -13464,7 +13464,7 @@ async fn mesh_last_successful_build_returns_304_when_etag_matches() {
 async fn mesh_shared_domain_topology_returns_binary_fmmt_payload() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -13503,7 +13503,7 @@ async fn all_fmmt_v2_topology_routes_serve_mixed_cells() {
             global_ordinals: vec![901],
             mesh_parts: Vec::new(),
         };
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -13577,7 +13577,7 @@ async fn fmmt_v2_topology_routes_reject_malformed_csr_instead_of_truncating() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         let mut mesh = sample_fem_mesh_payload();
         mesh.cells.offsets[1] = 3;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -13598,7 +13598,7 @@ async fn fmmt_v2_topology_routes_reject_malformed_csr_instead_of_truncating() {
 async fn scoped_topology_routes_distinguish_missing_resources_from_malformed_topology() {
     let valid_state = test_app_state_with_live_session().await;
     if let Some(snapshot) = valid_state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
     }
     let valid_app = build_v2_router().with_state(valid_state);
     for uri in [
@@ -13617,7 +13617,7 @@ async fn scoped_topology_routes_distinguish_missing_resources_from_malformed_top
     if let Some(snapshot) = malformed_state.current_live_state.write().await.as_mut() {
         let mut mesh = sample_fem_mesh_payload_with_manifest();
         mesh.cells.offsets[1] = 3;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let malformed_app = build_v2_router().with_state(malformed_state);
     for uri in [
@@ -13637,7 +13637,7 @@ async fn scoped_topology_routes_distinguish_missing_resources_from_malformed_top
 async fn mesh_shared_domain_cross_section_returns_binary_fmcs_payload() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 42;
     }
     let app = build_v2_router().with_state(state);
@@ -13684,7 +13684,7 @@ async fn mixed_mesh_cross_section_endpoints_return_stable_unsupported_code() {
             global_ordinals: vec![901],
             mesh_parts: Vec::new(),
         };
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -13738,7 +13738,7 @@ fn openapi_types_cross_section_conflicts_as_api_errors() {
 async fn mesh_shared_domain_cross_section_image_returns_png_payload() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 42;
     }
     let app = build_v2_router().with_state(state);
@@ -13778,7 +13778,7 @@ async fn mesh_shared_domain_cross_section_image_returns_png_payload() {
 async fn mesh_shared_domain_cross_section_image_returns_304_when_etag_matches() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 42;
     }
     let app = build_v2_router().with_state(state);
@@ -13816,7 +13816,7 @@ async fn mesh_shared_domain_cross_section_image_returns_304_when_etag_matches() 
 async fn mesh_shared_domain_cross_section_image_rejects_invalid_resolution() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -13877,7 +13877,7 @@ async fn mesh_shared_domain_cross_section_quality_returns_parent_element_fmqs_pa
 
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_workspace = Some(serde_json::json!({
             "quality_data_artifact": {
                 "kind": "fmmq.v1",
@@ -13887,7 +13887,7 @@ async fn mesh_shared_domain_cross_section_quality_returns_parent_element_fmqs_pa
                 "element_count": 1,
                 "metrics": ["sicn", "gamma", "volume"]
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 42;
     }
     let app = build_v2_router().with_state(state);
@@ -13924,7 +13924,7 @@ async fn mesh_shared_domain_cross_section_quality_returns_parent_element_fmqs_pa
 async fn mesh_shared_domain_cross_section_quality_computes_parent_tet_metrics_without_artifact() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(regular_tetra_fem_mesh_payload());
+        snapshot.fem_mesh = Some(regular_tetra_fem_mesh_payload().into());
         snapshot.mesh_workspace = None;
         snapshot.mesh_revision = 42;
     }
@@ -13963,7 +13963,7 @@ async fn mesh_shared_domain_cross_section_quality_computes_parent_tet_metrics_wi
 async fn mesh_shared_domain_topology_returns_304_when_etag_matches() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 41;
     }
     let app = build_v2_router().with_state(state);
@@ -14009,7 +14009,7 @@ async fn mesh_shared_domain_manifest_includes_topology_fingerprint() {
     let mesh = sample_fem_mesh_payload_with_manifest();
     let expected_hash = fullmag_runner::fem_mesh_topology_fingerprint(&mesh);
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 41;
     }
     let app = build_v2_router().with_state(state);
@@ -14041,7 +14041,7 @@ async fn mesh_shared_domain_manifest_omits_unpublished_fallback_evidence() {
         .expect("legacy build report should deserialize"),
     );
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -14066,7 +14066,7 @@ async fn mesh_shared_domain_manifest_includes_derived_surface_node_membership() 
     let mut mesh = sample_scoped_fem_mesh_payload();
     mesh.mesh_parts[1].facet_global_ordinals.clear();
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -14105,7 +14105,7 @@ async fn mesh_shared_domain_manifest_projects_quad_surface_faces_without_interna
     mesh.mesh_parts[1].boundary_face_count = 2;
     mesh.mesh_parts[1].facet_global_ordinals = vec![12, 700];
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -14253,7 +14253,7 @@ async fn mesh_shared_domain_topology_includes_mesh_topology_hash_header() {
     let mesh = sample_fem_mesh_payload();
     let expected_hash = fullmag_runner::fem_mesh_topology_fingerprint(&mesh);
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 41;
     }
     let app = build_v2_router().with_state(state);
@@ -14313,7 +14313,7 @@ async fn mesh_shared_domain_quality_data_returns_binary_artifact() {
                 "element_count": 1,
                 "metrics": ["sicn", "gamma", "volume"]
             }
-        }));
+        }).into());
         snapshot.mesh_revision = 42;
     }
     let app = build_v2_router().with_state(state);
@@ -14346,14 +14346,14 @@ async fn mesh_shared_domain_quality_data_returns_binary_artifact() {
 async fn mesh_periodic_pairs_returns_v1_diagnostics() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_periodic_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_periodic_fem_mesh_payload().into());
         snapshot.mesh_revision = 41;
         let mut scene = sample_scene_document();
         scene.revision = 41;
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 41}
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -14421,7 +14421,7 @@ async fn mesh_periodic_pairs_returns_v1_diagnostics() {
 async fn mesh_periodic_pairs_binary_returns_deterministic_v1_payload() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_periodic_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_periodic_fem_mesh_payload().into());
         snapshot.mesh_revision = 41;
     }
     let app = build_v2_router().with_state(state.clone());
@@ -14492,7 +14492,7 @@ async fn mesh_periodic_pairs_binary_returns_deterministic_v1_payload() {
 async fn mesh_periodic_pairs_etag_changes_when_residual_changes() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_periodic_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_periodic_fem_mesh_payload().into());
         snapshot.mesh_revision = 41;
     }
     let app = build_v2_router().with_state(state.clone());
@@ -14553,7 +14553,7 @@ async fn mesh_periodic_pairs_marks_unpaired_boundary_nodes_invalid() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         let mut mesh = sample_periodic_fem_mesh_payload();
         mesh.periodic_node_pairs.pop();
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 42;
     }
     let app = build_v2_router().with_state(state);
@@ -14585,7 +14585,7 @@ async fn mesh_periodic_pairs_does_not_count_mixed_domain_nodes_as_magnetic() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         let mut mesh = sample_periodic_fem_mesh_payload();
         mesh.periodic_node_pairs[1].node_b = 5;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 43;
     }
     let app = build_v2_router().with_state(state);
@@ -14615,14 +14615,14 @@ async fn mesh_periodic_pairs_does_not_count_mixed_domain_nodes_as_magnetic() {
 async fn mesh_periodic_pairs_marks_accepted_certificate_stale_after_scene_edit() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_periodic_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_periodic_fem_mesh_payload().into());
         snapshot.mesh_revision = 45;
         let mut scene = sample_scene_document();
         scene.revision = 46;
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 45}
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -14668,14 +14668,14 @@ async fn mesh_periodic_pairs_marks_matching_topology_artifact_stale_after_scene_
     }
     .topology_fingerprint_v6();
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh.clone());
+        snapshot.fem_mesh = Some(mesh.clone().into());
         snapshot.mesh_revision = 45;
         let mut scene = sample_scene_document();
         scene.revision = 46;
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 45}
-        }));
+        }).into());
     }
     let mesh_dir = artifact_dir.join("mesh");
     fs::create_dir_all(&mesh_dir).expect("mesh artifact dir should be created");
@@ -14755,14 +14755,14 @@ async fn mesh_periodic_pairs_rejects_artifact_with_mismatched_marker_certificate
     };
     let topology_fingerprint = mesh_ir.topology_fingerprint_v6();
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 45;
         let mut scene = sample_scene_document();
         scene.revision = 45;
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 45}
-        }));
+        }).into());
     }
     let mesh_dir = artifact_dir.join("mesh");
     fs::create_dir_all(&mesh_dir).expect("mesh artifact dir should be created");
@@ -14821,7 +14821,7 @@ async fn mesh_periodic_pairs_does_not_publish_nearest_face_with_excessive_residu
         let mut faces = mesh.require_tri3_boundary_faces().unwrap();
         faces[1] = [1, 5, 4];
         mesh.set_tri3_facets(faces);
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 44;
     }
     let app = build_v2_router().with_state(state);
@@ -14919,7 +14919,7 @@ async fn mesh_periodic_pairs_rejects_artifact_from_stale_scene_revision() {
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
             "last_build_summary": {"source_scene_revision": 45}
-        }));
+        }).into());
     }
     let mesh_dir = artifact_dir.join("mesh");
     fs::create_dir_all(&mesh_dir).expect("mesh artifact dir should be created");
@@ -15696,7 +15696,7 @@ async fn mesh_shared_domain_manifest_returns_tree_metadata() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Conformal,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 41;
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
@@ -15707,7 +15707,7 @@ async fn mesh_shared_domain_manifest_returns_tree_metadata() {
                     "realization_revision": 3
                 }
             }
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -15806,7 +15806,7 @@ async fn mesh_region_membership_returns_indices_for_mesh_backed_region() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Conformal,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 41;
         snapshot.scene_document = Some(scene);
     }
@@ -15912,7 +15912,7 @@ async fn mesh_region_quality_returns_scoped_size_and_quality_distributions() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Conformal,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 41;
         snapshot.scene_document = Some(scene);
         snapshot.mesh_workspace = Some(serde_json::json!({
@@ -15924,7 +15924,7 @@ async fn mesh_region_quality_returns_scoped_size_and_quality_distributions() {
                 "element_count": 1,
                 "metrics": ["sicn", "gamma", "volume"]
             }
-        }));
+        }).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -16006,7 +16006,7 @@ async fn mesh_region_membership_falls_back_to_object_segments_for_non_part_regio
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Conformal,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 42;
         snapshot.scene_document = Some(scene);
     }
@@ -16060,7 +16060,7 @@ async fn mesh_region_membership_projects_authored_region_shape_without_mesh_part
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 43;
         snapshot.scene_document = Some(scene);
     }
@@ -16131,7 +16131,7 @@ async fn mesh_region_membership_projects_object_frame_region_with_owner_translat
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 44;
         snapshot.scene_document = Some(scene);
     }
@@ -16186,7 +16186,7 @@ async fn mesh_region_membership_projects_object_frame_rotation() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 45;
         snapshot.scene_document = Some(scene);
     }
@@ -16238,7 +16238,7 @@ async fn mesh_region_membership_projects_object_frame_nonuniform_scale() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 46;
         snapshot.scene_document = Some(scene);
     }
@@ -16317,7 +16317,7 @@ async fn mesh_region_membership_api_matches_shared_cross_consumer_corpus() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.scene_document = Some(scene);
     }
     let app = build_v2_router().with_state(state);
@@ -16405,7 +16405,7 @@ async fn mesh_region_membership_returns_typed_422_for_selection_failures() {
                     material_transition: None,
                     realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
                 });
-            snapshot.fem_mesh = Some(mesh);
+            snapshot.fem_mesh = Some(mesh.into());
             snapshot.scene_document = Some(scene);
         }
         let app = build_v2_router().with_state(state);
@@ -16457,7 +16457,7 @@ async fn mesh_region_membership_list_preserves_selection_error() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.scene_document = Some(scene);
     }
     let app = build_v2_router().with_state(state);
@@ -16505,7 +16505,7 @@ async fn mesh_region_quality_preserves_selection_error() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.scene_document = Some(scene);
     }
     let app = build_v2_router().with_state(state);
@@ -16636,7 +16636,7 @@ async fn mesh_region_memberships_lists_available_authored_region_memberships() {
                 material_transition: None,
                 realization_policy: fullmag_authoring::SceneRegionRealizationPolicy::Project,
             });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 47;
         snapshot.scene_document = Some(scene);
     }
@@ -16734,7 +16734,7 @@ async fn mesh_region_membership_is_qualified_by_owner_when_region_ids_repeat() {
         second_object.regions.push(second_region);
         scene.objects.push(second_object);
 
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.scene_document = Some(scene);
     }
     let app = build_v2_router().with_state(state);
@@ -16792,10 +16792,10 @@ async fn mesh_shared_domain_manifest_reports_clean_scene_provenance_without_buil
     let mut scene = sample_scene_document();
     scene.revision = 93;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_revision = 96;
         snapshot.scene_document = Some(scene);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -16824,10 +16824,10 @@ async fn mesh_shared_domain_manifest_keeps_provenance_unknown_for_dirty_scene_wi
     scene.revision = 94;
     scene.objects[0].tags.push("mesh:dirty".to_string());
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_revision = 97;
         snapshot.scene_document = Some(scene);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -16856,10 +16856,10 @@ async fn mesh_build_resources_report_clean_scene_provenance_without_build_summar
     let mut scene = sample_scene_document();
     scene.revision = 95;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_build_revision = 99;
         snapshot.scene_document = Some(scene);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -16885,7 +16885,7 @@ async fn mesh_build_resources_report_clean_scene_provenance_without_build_summar
 async fn mesh_shared_domain_manifest_returns_304_when_etag_matches() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_revision = 41;
     }
     let app = build_v2_router().with_state(state);
@@ -16931,10 +16931,10 @@ async fn mesh_shared_domain_manifest_etag_changes_when_provenance_is_recovered()
     let mut dirty_scene = sample_scene_document();
     dirty_scene.objects[0].tags.push("mesh:dirty".to_string());
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload_with_manifest().into());
         snapshot.mesh_revision = 41;
         snapshot.scene_document = Some(dirty_scene);
-        snapshot.mesh_workspace = Some(serde_json::json!({}));
+        snapshot.mesh_workspace = Some(serde_json::json!({}).into());
     }
     let app = build_v2_router().with_state(state.clone());
 
@@ -17048,7 +17048,7 @@ async fn fdm_universe_config_put_preserves_shared_airbox_authoring_contract() {
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } },
             "artifact_layout": { "backend": "fdm", "grid_cells": [128, 32, 30] }
-        }));
+        }).into());
         snapshot.scene_document = Some(sample_scene_document());
     }
     let app = build_v2_router().with_state(state.clone());
@@ -18507,7 +18507,7 @@ async fn planar_field_resources_publish_meta_binary_probe_png_and_etag() {
                 "origin_m": [-0.5, -0.5, -0.5],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -19011,7 +19011,7 @@ async fn planar_field_fdm_object_target_uses_published_membership_and_grid_geome
                     "material": { "ms_field": [4.0, 9.0] }
                 }
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "mat_ms": {
                 "values": [4.0, 9.0],
@@ -19086,7 +19086,7 @@ async fn planar_field_fem_overlay_is_fmcs_v4_and_mesh_part_scope_changes_samplin
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(scene);
         snapshot.session.script_path.clear();
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -19331,7 +19331,7 @@ async fn planar_field_snapshot_is_stage_scoped_and_uses_persisted_values() {
                 "origin_m": [-0.5, -0.5, -0.5],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
     }
     let base = "/v2/sessions/current/data/fields/m/planar-monitors/snapshot_xy/meta";
     let valid = app
@@ -21551,7 +21551,7 @@ async fn authoring_coupling_resource_resolves_bbox_surface_from_current_fem_mesh
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(scene);
         snapshot.session.script_path.clear();
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -21633,7 +21633,7 @@ async fn authoring_coupling_resource_blocks_surface_without_boundary_markers() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(scene);
         snapshot.session.script_path.clear();
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -21697,7 +21697,7 @@ async fn authoring_coupling_resource_does_not_treat_unknown_mesh_part_as_magneti
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(scene);
         snapshot.session.script_path.clear();
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -23289,7 +23289,7 @@ async fn compute_fields_command_contract_resolves_fdm_full_requirement() {
             "capabilities": {
                 "preview_quantities": ["m"]
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(resolved_compute_fields_capabilities(&["m"]));
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -23877,9 +23877,9 @@ async fn compute_fields_command_contract_resolves_fem_full_requirement() {
             "capabilities": {
                 "preview_quantities": ["m"]
             }
-        }));
+        }).into());
         snapshot.capabilities = Some(resolved_compute_fields_capabilities(&["m"]));
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -26127,7 +26127,7 @@ async fn hysteresis_stage_requested_resources_return_authoring_payload() {
     let (app, state, _repo_root) = test_router_with_session_store_state().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 12;
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.scene_document = Some(sample_scene_document_with_stage(serde_json::json!({
             "branch_mode": "major_loop",
             "entrypoint_kind": "flat_hysteresis",
@@ -26807,7 +26807,7 @@ async fn hysteresis_progress_endpoint_averages_only_magnetic_fem_nodes() {
     let (app, state, _repo_root) = test_router_with_session_store_state().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         let mesh = sample_scoped_fem_mesh_payload();
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.state_version = 16;
         snapshot.scene_document = Some(sample_scene_document_with_stage(serde_json::json!({
             "entrypoint_kind": "flat_hysteresis",
@@ -26902,7 +26902,7 @@ async fn hysteresis_progress_endpoint_uses_fem_element_volume_weights_for_live_a
         mesh.mesh_parts[1].role = "magnetic_object".to_string();
         mesh.mesh_parts[1].object_id = Some("body-large".to_string());
         mesh.mesh_parts[1].material_id = Some("mat-body".to_string());
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.state_version = 17;
         snapshot.scene_document = Some(sample_scene_document_with_stage(serde_json::json!({
             "entrypoint_kind": "flat_hysteresis",
@@ -26997,7 +26997,7 @@ async fn hysteresis_progress_endpoint_uses_fem_element_volume_weights_for_live_a
 async fn hysteresis_progress_endpoint_uses_snapshot_fem_mesh_for_live_average() {
     let (app, state, _repo_root) = test_router_with_session_store_state().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.state_version = 17;
         snapshot.scene_document = Some(sample_scene_document_with_stage(serde_json::json!({
             "entrypoint_kind": "flat_hysteresis",
@@ -28097,7 +28097,7 @@ async fn solver_status_exposes_solver_owned_frozen_spins_activation_certificate(
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         let metadata = snapshot
             .metadata
-            .get_or_insert_with(|| serde_json::json!({}));
+            .get_or_insert_with(|| serde_json::json!({}).into());
         metadata["frozen_spins_runtime_status"] = serde_json::json!({
             "schema": "fullmag.frozen_spins.runtime-status.v1",
             "constraint_activation_epochs": { "pin": 2 },
@@ -28693,7 +28693,8 @@ async fn object_metrics_endpoint_uses_mesh_part_node_indices_for_shared_fem_node
         snapshot.fem_mesh = snapshot
             .live_state
             .as_mut()
-            .and_then(|live_state| live_state.latest_step.fem_mesh.take());
+            .and_then(|live_state| live_state.latest_step.fem_mesh.take())
+            .map(Into::into);
         snapshot.scalar_revision = 21;
     }
     let app = build_v2_router().with_state(state);
@@ -33164,7 +33165,7 @@ async fn set_test_fdm_multilayer_layout(state: &Arc<AppState>, common_cells: [u3
                 "value_count": 1
             }]
         }
-    }));
+    }).into());
     snapshot.live_state = None;
 }
 
@@ -33393,7 +33394,7 @@ async fn resolved_current_spatial_field_accepts_fem_element_cardinality() {
         let snapshot = guard.as_mut().expect("live session exists");
         snapshot.session.requested_backend = "fem".to_string();
         snapshot.session.resolved_backend = Some("fem_cpu_native".to_string());
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "eps": {
                 "values": [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]
@@ -33681,7 +33682,7 @@ async fn set_test_fdm_domain_geometry(
             "origin_m": origin_m,
             "cell_size": cell_m
         }
-    }));
+    }).into());
     snapshot.live_state = None;
 }
 
@@ -33690,11 +33691,11 @@ async fn fdm_region_membership_is_not_current_for_a_fem_snapshot() {
     let (app, state, artifact_dir) = test_router_with_session_state_and_artifact_dir().await;
     write_test_fdm_membership_artifact(&artifact_dir, [2, 1, 1]);
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fem" } },
             "artifact_layout": { "backend": "fem" }
-        }));
+        }).into());
     }
 
     let response = app
@@ -33728,7 +33729,7 @@ async fn fdm_region_membership_is_available_from_execution_plan_before_artifact_
         serde_json::from_value(plan_value["backend_plan"]["grid_certificate"]["counts"].clone())
             .expect("planned FDM grid certificate should expose counts");
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan_value }));
+        snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan_value }).into());
         snapshot.live_state = None;
     }
     assert!(
@@ -33790,7 +33791,7 @@ async fn fdm_region_membership_rejects_a_descriptor_for_an_old_grid() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
     }
 
@@ -33854,7 +33855,7 @@ async fn fdm_field_vector_object_scope_uses_membership_cell_ordinals() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -33956,7 +33957,7 @@ async fn fdm_field_vector_object_scope_rejects_mixed_default_numeric_membership(
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -34007,7 +34008,7 @@ async fn fdm_terminal_spatial_scalar_full_grid_preserves_values_and_object_indic
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "eden_demag": {
                 "quantity": "eden_demag",
@@ -34099,7 +34100,7 @@ async fn fdm_terminal_spatial_scalar_plane_is_not_a_current_3d_field() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "eden_demag": {
                 "quantity": "eden_demag",
@@ -34178,7 +34179,7 @@ async fn fdm_field_vector_airbox_surface_and_max_samples_use_cell_ordinals() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let values = (0..27)
             .map(|index| [index as f64, 0.0, 0.0])
             .collect::<Vec<_>>();
@@ -34265,7 +34266,7 @@ async fn fdm_field_vector_region_scope_requires_owner_for_duplicate_region_ids()
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -34478,7 +34479,7 @@ async fn fdm_multilayer_field_vector_layer_scope_uses_native_layer_layout() {
                     "value_count": 1
                 }]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -34648,7 +34649,7 @@ async fn fdm_multilayer_field_vector_object_scope_preserves_object_identity() {
                     "value_count": 1
                 }]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -34773,7 +34774,7 @@ async fn fdm_multilayer_field_vector_scope_rejects_ambiguous_identity_aliases() 
                     "value_count": 1
                 }]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -34839,7 +34840,7 @@ async fn fdm_multilayer_field_vector_region_scope_fails_closed_without_single_gr
                     "value_count": 2
                 }]
             }
-        }));
+        }).into());
         snapshot.live_state = None;
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": { "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] }
@@ -35106,7 +35107,7 @@ async fn fdm_multilayer_planar_layer_scope_uses_native_grid_and_local_region_mem
                     }
                 }
             }]}
-        }));
+        }).into());
         snapshot.live_state = None;
         snapshot.latest_fields = LatestFields::default();
         snapshot.region_realization_revisions.membership = 23;
@@ -36240,7 +36241,7 @@ async fn test_router_with_mock_field() -> axum::Router {
 async fn test_router_with_fem_nodal_field() -> axum::Router {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -36517,7 +36518,7 @@ async fn test_router_with_mock_field_fem_without_topology() -> axum::Router {
             generation_id: Some("101".to_string()),
             per_domain_quality: Default::default(),
             build_report: None,
-        });
+        }.into());
     }
     build_v2_router().with_state(state)
 }
@@ -39605,7 +39606,7 @@ async fn v2_magnetization_meta_vector_revision_and_etag_follow_provenance_field_
 async fn field_meta_component_query_reports_scoped_object_stats() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -39662,7 +39663,7 @@ async fn field_meta_component_query_reports_scoped_object_stats() {
 async fn field_meta_component_query_reports_scoped_h_demag_object_stats() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -39712,7 +39713,7 @@ async fn field_meta_component_query_reports_scoped_h_demag_object_stats() {
 async fn field_meta_energy_density_accepts_object_prefixed_scope_ids() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "eden_total": {
                 "values": [10.0, 11.0, 12.0, 13.0, 0.0, 1.0, 2.0, 3.0],
@@ -39760,7 +39761,7 @@ async fn field_meta_energy_density_accepts_geom_suffixed_part_ids() {
         mesh.mesh_parts[0].label = "Permalloy layer".to_string();
         mesh.mesh_parts[0].object_id = None;
         mesh.mesh_parts[0].geometry_id = None;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "eden_total": {
                 "values": [10.0, 11.0, 12.0, 13.0, 0.0, 1.0, 2.0, 3.0],
@@ -39806,7 +39807,7 @@ async fn field_meta_energy_density_accepts_geom_suffixed_object_segment_geometry
         mesh.mesh_parts.clear();
         mesh.object_segments[0].object_id = "native-segment-0".to_string();
         mesh.object_segments[0].geometry_id = Some("permalloy_layer_geom".to_string());
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "eden_total": {
                 "values": [10.0, 11.0, 12.0, 13.0, 0.0, 1.0, 2.0, 3.0],
@@ -40150,7 +40151,7 @@ async fn v2_field_catalog_rejects_fem_live_magnetization_with_wrong_point_count(
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 23;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.live_state = Some(LiveState {
             status: "running".into(),
             updated_at_unix_ms: 1_700_000_000_123,
@@ -40250,7 +40251,7 @@ async fn v2_field_vector_accepts_fem_live_magnetization_on_magnetic_nodes() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 23;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.live_state = Some(LiveState {
             status: "running".into(),
             updated_at_unix_ms: 1_700_000_000_123,
@@ -40331,7 +40332,7 @@ async fn v2_field_vector_normalizes_unset_fem_grid_without_losing_topology_ident
             .collect::<Vec<_>>();
         snapshot.state_version = 52;
         snapshot.mesh_revision = 19;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.preview_cache = Default::default();
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
@@ -40628,7 +40629,7 @@ async fn v2_older_runtime_m_frame_preserves_newer_selected_source_and_bundle() {
         let snapshot = guard.as_mut().expect("live session exists");
         let mesh = sample_fem_mesh_payload();
         let expected_topology_hash = fullmag_runner::fem_mesh_topology_fingerprint(&mesh);
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.mesh_revision = 7;
         let selected_m = vec![
             1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0,
@@ -40832,7 +40833,7 @@ async fn v2_m_publication_bundle_requires_matching_physical_scalar_row() {
     {
         let mut guard = state.current_live_state.write().await;
         let snapshot = guard.as_mut().expect("live session exists");
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
         snapshot.mesh_revision = 7;
         let selected_m = vec![
             1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0,
@@ -41452,7 +41453,7 @@ async fn public_fem_m1_run_is_decoded_by_v2_with_artifact_revisions() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.session.artifact_dir = artifact_dir.display().to_string();
-        snapshot.fem_mesh = Some(fem_mesh);
+        snapshot.fem_mesh = Some(fem_mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -41744,7 +41745,7 @@ async fn v2_fdm_vector_respects_max_samples_when_preview_would_be_downscaled() {
                     "cell_m": [1.0, 1.0, 1.0]
                 }
             } }
-        }));
+        }).into());
         // The solver domain is a 4-cell FDM grid.  Both the legacy materialized
         // field and the preview cache below only carry a 2-cell display preview.
         let latest_fields = serde_json::from_value(serde_json::json!({
@@ -41804,7 +41805,7 @@ async fn v2_fdm_vector_respects_max_samples_when_preview_would_be_downscaled() {
             .expect("current FDM physical step should apply");
         publish_test_preview_fields(snapshot, vec![preview])
             .expect("downscaled preview should publish through an accepted field frame");
-        snapshot.fem_mesh = stale_fem_mesh;
+        snapshot.fem_mesh = stale_fem_mesh.map(Into::into);
         snapshot.state_version = 26;
     }
     let app = build_v2_router().with_state(state);
@@ -42675,10 +42676,10 @@ async fn topological_charge_uses_fdm_field_topology_with_retained_fem_mesh() {
     let object_id = scene.objects[0].id.clone();
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.scene_document = Some(scene);
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } }
-        }));
+        }).into());
         snapshot.live_state = Some(LiveState {
             status: "running".into(),
             updated_at_unix_ms: 1_700_000_000_789,
@@ -42984,7 +42985,7 @@ async fn topological_charge_computes_uniform_fem_object_from_native_layer_faces(
         snapshot.scene_document = Some(scene);
         snapshot.session.plan_summary = serde_json::json!({ "fe_order": 1 });
         snapshot.mesh_revision = 17;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "field_revision": 13,
@@ -43057,7 +43058,7 @@ async fn topological_charge_computes_analytic_neel_skyrmion_from_fem_layer_profi
         snapshot.scene_document = Some(scene);
         snapshot.session.plan_summary = serde_json::json!({ "fe_order": 1 });
         snapshot.mesh_revision = 23;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "field_revision": 29,
@@ -43115,7 +43116,7 @@ async fn topological_charge_reports_degenerate_support_when_no_volume_sampler_is
         mesh.mesh_parts[0].facet_global_ordinals.clear();
         snapshot.scene_document = Some(scene);
         snapshot.session.plan_summary = serde_json::json!({ "fe_order": 1 });
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "field_revision": 14,
@@ -43164,7 +43165,7 @@ async fn v2_field_vector_supports_mesh_scoped_samples() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 29;
         snapshot.mesh_revision = 31;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -43241,7 +43242,7 @@ async fn v2_field_vector_applies_max_samples_to_scoped_samples() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 29;
         snapshot.mesh_revision = 31;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -43324,7 +43325,7 @@ async fn v2_fem_field_vector_max_samples_one_preserves_sampled_node_ordinal() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 29;
         snapshot.mesh_revision = 31;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -43381,7 +43382,7 @@ async fn v2_field_vector_applies_max_samples_to_part_scope() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 29;
         snapshot.mesh_revision = 31;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -43509,7 +43510,7 @@ async fn v2_field_vector_rejects_magnetic_only_quantity_on_airbox_scope() {
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 30;
         snapshot.mesh_revision = 32;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -43598,7 +43599,7 @@ async fn v2_field_vector_accepts_quantity_alias_for_scoped_airbox_samples() {
         mesh.mesh_parts[1].id = "part:__air__".to_string();
         snapshot.state_version = 30;
         snapshot.mesh_revision = 32;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -43668,7 +43669,7 @@ async fn v2_field_vector_airbox_scope_excludes_shared_magnetic_nodes() {
         mesh.mesh_parts[1].node_indices = vec![0, 1, 2, 4, 5];
         mesh.mesh_parts[1].node_start = 0;
         mesh.mesh_parts[1].node_count = 5;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -43725,7 +43726,7 @@ async fn v2_field_vector_airbox_scope_excludes_shared_magnetic_nodes() {
 async fn v2_field_vector_airbox_surface_scope_samples_only_surface_nodes() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -43802,7 +43803,7 @@ async fn v2_field_vector_rejects_airbox_surface_without_surface_membership() {
         airbox.facet_global_ordinals.clear();
         airbox.boundary_face_indices.clear();
         airbox.boundary_face_count = 0;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "values": [
@@ -43850,7 +43851,7 @@ async fn v2_field_vector_object_scope_prefers_mesh_part_node_indices() {
         mesh.mesh_parts[0].node_indices = vec![3, 1];
         mesh.mesh_parts[0].node_start = 0;
         mesh.mesh_parts[0].node_count = 2;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -43969,7 +43970,7 @@ async fn v2_field_vector_object_scope_fallback_uses_segment_element_nodes() {
         mesh.object_segments[0].node_start = 3;
         mesh.object_segments[0].node_count = 1;
         mesh.set_tet4_cells(vec![[0, 1, 2, 3]]);
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -44036,7 +44037,7 @@ async fn v2_field_vector_supports_workspace_selection_scope() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.state_version = 30;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -44116,7 +44117,7 @@ async fn v2_mesh_part_topology_returns_scoped_mesh() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.mesh_revision = 31;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -44159,7 +44160,7 @@ async fn v2_mesh_histogram_bin_elements_returns_airbox_indices() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.mesh_revision = 32;
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -44187,7 +44188,7 @@ async fn v2_mesh_histogram_bin_elements_returns_airbox_indices() {
 async fn v2_mesh_histogram_bin_elements_rejects_invalid_bin() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -44210,7 +44211,7 @@ async fn v2_mesh_histogram_bin_elements_rejects_mixed_topology_with_typed_code()
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         let mut mesh = sample_scoped_fem_mesh_payload();
         mesh.cells.types[0] = fullmag_ir::FemCellTypeIR::Prism6;
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -44233,7 +44234,7 @@ async fn v2_mesh_histogram_bin_elements_rejects_mixed_topology_with_typed_code()
 async fn v2_mesh_histogram_bin_elements_preserves_shared_node_indices() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_shared_node_airbox_mesh_payload());
+        snapshot.fem_mesh = Some(sample_shared_node_airbox_mesh_payload().into());
     }
     let app = build_v2_router().with_state(state);
 
@@ -44669,7 +44670,7 @@ async fn projection_and_slice_etags_are_scoped_to_session_identity() {
 async fn field_vector_topology_change_invalidates_etag_without_field_revision_change() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
-        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload().into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": { "values": [
                 [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0],
@@ -45708,7 +45709,7 @@ async fn default_planar_fdm_test_state() -> Arc<AppState> {
                 "origin_m": [10.0, 20.0, 30.0],
                 "cell_size": [1.0, 2.0, 4.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -45765,7 +45766,7 @@ async fn planar_default_fdm_even_depth_uses_cell_centered_midplane() {
                 "origin_m": [-1.0, -1.0, -1.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -45867,7 +45868,7 @@ async fn source_parity_across_meta_vector_and_planar() {
                 "origin_m": [-1.0, -1.0, -1.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -45998,7 +45999,7 @@ async fn planar_default_meta_publishes_source_and_offset_domain_frame() {
                 "origin_m": [10.0, 20.0, 30.0],
                 "cell_size": [1.0, 2.0, 4.0]
             }
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -48482,7 +48483,7 @@ async fn frequency_domain_artifact_identity_uses_top_level_fem_mesh_generation()
         let snapshot = snapshot.as_mut().expect("session snapshot should exist");
         snapshot.stage_execution = None;
         snapshot.live_state = None;
-        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
     }
     let eigen_dir = artifact_dir.join("eigen");
     fs::create_dir_all(&eigen_dir).expect("eigen artifact directory should be created");
@@ -48782,7 +48783,7 @@ async fn frequency_domain_artifact_resources_report_ready_and_missing_states() {
         let mut snapshot = state.current_live_state.write().await;
         let snapshot = snapshot.as_mut().expect("session snapshot should exist");
         snapshot.mesh_revision = 9;
-        snapshot.fem_mesh = Some(current_mesh);
+        snapshot.fem_mesh = Some(current_mesh.into());
     }
     set_running_stage_execution(&state, 10).await;
     {
@@ -49835,7 +49836,7 @@ async fn frequency_domain_eigen_mode_field_rejects_stale_topology_with_same_node
         let mut snapshot = state.current_live_state.write().await;
         let snapshot = snapshot.as_mut().expect("session snapshot should exist");
         snapshot.mesh_revision = 9;
-        snapshot.fem_mesh = Some(current_mesh);
+        snapshot.fem_mesh = Some(current_mesh.into());
     }
 
     let mode_dir = artifact_dir.join("eigen/modes/sample_0000");
@@ -49901,7 +49902,7 @@ async fn frequency_domain_eigen_mode_field_prefers_zarr_payload_path() {
         let mut snapshot = state.current_live_state.write().await;
         let snapshot = snapshot.as_mut().expect("session snapshot should exist");
         snapshot.mesh_revision = 9;
-        snapshot.fem_mesh = Some(current_mesh);
+        snapshot.fem_mesh = Some(current_mesh.into());
     }
     let mode_dir = artifact_dir.join("eigen").join("modes").join("sample_0000");
     fs::create_dir_all(&mode_dir).expect("mode metadata directory should be created");
@@ -52695,7 +52696,7 @@ async fn frozen_spins_test_state() -> Arc<AppState> {
                     }
                 }
             }
-        }));
+        }).into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -53214,8 +53215,8 @@ async fn frozen_spins_preview_supports_authoritative_fem_p1_carrier() {
         let source_state_revision = snapshot.state_version;
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": {"backend": "fem"}
-        }));
-        snapshot.fem_mesh = Some(mesh);
+        }).into());
+        snapshot.fem_mesh = Some(mesh.into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -53307,8 +53308,8 @@ async fn frozen_spins_fem_preview_uses_compact_local_to_global_mapping_with_airb
         let source_state_revision = snapshot.state_version;
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": {"backend": "fem"}
-        }));
-        snapshot.fem_mesh = Some(mesh);
+        }).into());
+        snapshot.fem_mesh = Some(mesh.into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -53398,8 +53399,8 @@ async fn frozen_spins_fem_preview_rejects_ambiguous_element_ownership() {
         let source_state_revision = snapshot.state_version;
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": {"backend": "fem"}
-        }));
-        snapshot.fem_mesh = Some(mesh);
+        }).into());
+        snapshot.fem_mesh = Some(mesh.into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
@@ -54848,7 +54849,7 @@ async fn frozen_spins_preview_intersects_all_magnetic_with_target_object() {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }}}
-        }));
+        }).into());
         let latest_fields = serde_json::from_value(serde_json::json!({
             "m": {
                 "values": [
