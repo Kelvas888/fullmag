@@ -67,10 +67,22 @@ fn read_optional_bounded_regular_file(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("checking {label}")),
     }
-    Ok(Some(
-        read_bounded_regular_file(root, relative, maximum)
-            .with_context(|| format!("reading {label}"))?,
-    ))
+    // Lock-free readers race writers that remove the file (e.g. a released
+    // lease being finalized); a file gone between the check and the open is
+    // the same observation as a file that was already absent.
+    match read_bounded_regular_file(root, relative, maximum) {
+        Ok(data) => Ok(Some(data)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {label}")),
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 #[path = "accepted_start_gate.rs"]
@@ -7187,6 +7199,17 @@ fn read_file_held_under_writer(path: &Path) -> std::io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn optional_reads_treat_a_file_removed_after_the_check_as_absent() {
+        let removed = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("opening resource lease");
+        assert!(is_not_found(&removed));
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!is_not_found(&denied));
+        assert!(!is_not_found(&anyhow::anyhow!("resource lease is malformed")));
+    }
 
     #[test]
     fn live_command_journal_replaces_current_generation_and_reopens() {
