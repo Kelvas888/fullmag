@@ -255,3 +255,33 @@ mesh-structure-report.json, audit_sourcecut_contract.py,
 sourcecut-contract-report.json, run_occ_quality_check.py,
 occ-quality-red-direct.json, occ-quality-green-direct.json,
 quality-scaling-regression.json.
+
+### Dalsza naprawa etapu 1: jakość przewodnika i przekroju źródła
+
+W `realize_antenna_coincident_loop_mesh` przeliczono objętości raportu
+jakości globalnego i domenowego wraz z węzłami na SI.
+`split_coincident_sourcecut` zachowuje teraz oba raporty: rozcięcie zmienia
+identyfikatory węzłów przekroju, ale nie zmienia współrzędnych żadnego
+elementu, jego kolejności ani przypisania materiałowego.
+
+Regresje przed poprawką wykazały błędne jednostki wszystkich 1869
+elementów nowej testowej siatki oraz `prepared.quality is None`.
+Pierwsza wersja drugiego testu miała błędne wywołanie publicznego wrappera
+z argumentem raw_mesh; poprawiono test na istniejącą wewnętrzną funkcję
+przygotowania. Zachowano pierwotny błąd oraz osobny dowód faktycznej
+utraty jakości. Po poprawce pełny interpretowany unittest
+`test_antenna_coincident_cut`: 15/15 PASS, bez pominięć, w stałym
+backendzie Docker. Obejmuje rzeczywisty Gmsh, jednostki, zachowanie
+raportów i bajtów geometrii, kolejność elementów oraz odrzucanie
+nieprawidłowych przekrojów. Nie wykonano nowego Solve.
+
+Dowody: conductor-quality-red.log, conductor-quality-loss-red.log,
+conductor-quality-suite-green.log w tym samym katalogu kontrolnym audytu.
+Kontrola kodu `model/problem.py::_fem_mesh_cache_key` i
+`_fem_cache_contract_identity` potwierdza uwzględnienie
+FULLMAG_SOURCE_SNAPSHOT_SHA256 w kluczu cache przewodnika. Wdrożenie
+wymaga nowego zweryfikowanego snapshotu launchera i sprawdzenia
+publicznego przygotowania; ten etap nie został jeszcze wykonany.
+Dodatkowe syntetyczne sprawdzenie kluczy nie wystartowało, ponieważ
+automatyczny przegląd uprawnień przekroczył limit czasu. Nie traktujemy
+go jako dowodu PASS. Cache i historyczne wyniki pozostały zachowane.

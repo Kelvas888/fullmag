@@ -312,5 +312,45 @@ class CoincidentCutTests(unittest.TestCase):
         self.assertEqual(len(prepared.conductivity_s_per_m_per_element),prepared.mesh.n_elements)
         self.assertFalse(prepared.receipt["basis_qualified"])
 
+    def _quality_loop(self):
+        from fullmag.meshing._antenna_coincident_cut import realize_antenna_coincident_loop_mesh
+        from fullmag.meshing._gmsh_types import MeshOptions
+        return realize_antenna_coincident_loop_mesh(closure(), geometry=loop_geometry(),
+            object_id="object", hmax_m=0.15e-6,
+            mesh_options=MeshOptions(compute_quality=True, per_element_quality=True))
+
+    def _assert_si_quality(self, mesh):
+        xyz = mesh.nodes[mesh.elements]
+        volumes = np.abs(np.linalg.det(xyz[:, 1:] - xyz[:, :1])) / 6
+        self.assertIsNotNone(mesh.quality)
+        self.assertTrue(mesh.per_domain_quality)
+        np.testing.assert_allclose(mesh.quality.element_volume, volumes, rtol=1e-8, atol=0)
+        reports = [(mesh.quality, volumes)] + [(report, volumes[mesh.element_markers == marker])
+            for marker, report in mesh.per_domain_quality.items()]
+        for report, values in reports:
+            np.testing.assert_allclose(
+                [report.volume_min, report.volume_max, report.volume_mean, report.volume_std],
+                [values.min(), values.max(), values.mean(), values.std()], rtol=1e-8, atol=0)
+
+    @unittest.skipUnless(importlib.util.find_spec("gmsh"),"Gmsh Python runtime unavailable")
+    def test_real_loop_quality_uses_si_volumes(self):
+        self._assert_si_quality(self._quality_loop())
+
+    @unittest.skipUnless(importlib.util.find_spec("gmsh"),"Gmsh Python runtime unavailable")
+    def test_sourcecut_preserves_quality_and_element_order(self):
+        raw = self._quality_loop()
+        before = copy.deepcopy(raw.to_ir("loop"))
+        from fullmag.meshing._antenna_coincident_cut import prepare_antenna_coincident_loop
+        prepared = prepare_antenna_coincident_loop(closure(), geometry=loop_geometry(),
+            object_id="object", hmax_m=0.15e-6, raw_mesh=raw).mesh
+        self.assertIsNotNone(prepared.quality)
+        self.assertEqual(prepared.quality, raw.quality)
+        self.assertEqual(prepared.per_domain_quality, raw.per_domain_quality)
+        self.assertEqual(prepared.nodes[prepared.elements].tobytes(), raw.nodes[raw.elements].tobytes())
+        np.testing.assert_array_equal(prepared.element_markers, raw.element_markers)
+        np.testing.assert_array_equal(prepared.cell_global_ordinals, raw.cell_global_ordinals)
+        self.assertEqual(raw.to_ir("loop"), before)
+        self._assert_si_quality(prepared)
+
 
 if __name__=="__main__":unittest.main()
