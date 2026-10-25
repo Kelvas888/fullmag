@@ -285,3 +285,20 @@ publicznego przygotowania; ten etap nie został jeszcze wykonany.
 Dodatkowe syntetyczne sprawdzenie kluczy nie wystartowało, ponieważ
 automatyczny przegląd uprawnień przekroczył limit czasu. Nie traktujemy
 go jako dowodu PASS. Cache i historyczne wyniki pozostały zachowane.
+
+
+### Odblokowanie recept WSL — 25.10.2026
+
+Zainstalowany `just 1.42.4` odrzucał cały justfile na złączonym zamknięciu
+wyrażenia warunkowego i interpolacji. Minimalny reproducer potwierdził błąd
+przed zmianą oraz poprawne parsowanie po rozdzieleniu nawiasów spacją.
+Rozważono rozdzielenie delimitera, ujęcie wyrażeń w nawiasy, wydzielenie
+zmiennych i aktualizację just. Wybrano wyłącznie whitespace zgodny z
+https://just.systems/man/en/conditional-expressions.html — bez zmiany
+wspólnej instalacji, komend, argumentów, polityki ani bramek restartu.
+
+Weryfikacja: pełny plik parsuje 645 recept; dry-run docker-dev z pustymi
+oraz jawnymi argumentami i przypiętego docker-dev-restart-idle zakończyły
+się kodem 0. `git diff --check` przeszedł. To kontrola składni i rozwinięcia
+poleceń, nie dowód buildu ani uruchomienia Universe. Pierwotny błąd wystąpił
+przed wykonaniem recepty, więc nie zatrzymał usług i nie rozpoczął buildu.
