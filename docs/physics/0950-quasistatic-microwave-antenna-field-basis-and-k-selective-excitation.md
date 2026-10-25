@@ -11724,7 +11724,11 @@ dla jednego pola lub konkretnego wyniku.
 
 Pierwszy publiczny benchmark zakończył się odmową certyfikatu/J. Nie ma
 przyjętego H ani pomiaru przyspieszenia. Kontrprzykład Fraction jest wykonany;
-kompilacja i rzeczywiste ponowienie z zamrożonymi wejściami pozostają do
-wykonania. Nie kompilujemy natywnych testów jednostkowych. Podstawą naukową
+rzeczywiste ponowienie z zamrożonymi wejściami pozostaje do wykonania.
+Kompilację aplikacji z poprawką potwierdził build kandydata
+`6b7b046482f8408e850eb1918caa7985` ze źródła
+`4a489e3c549e51cfb2cd30e51c14d6944baaac7c` (Make exit0, 221317 ms).
+Kandydat nie został promowany ani uruchomiony; to dowód kompilacji, nie
+nowego V/J/H. Nie kompilujemy natywnych testów jednostkowych. Podstawą naukową
 pozostają definicja RT0 i bibliografia kanonicznego rozdziału wyżej; nowa
 kontrola nie dodaje aproksymacji modelu.

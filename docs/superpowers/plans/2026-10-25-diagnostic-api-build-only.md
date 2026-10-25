@@ -58,3 +58,26 @@ jego stałe argv i zachowano zakaz promocji. Regresje starego wariantu,
 resume+diagnostic, promocji, powielonej flagi oraz złożonych komend przeszły:
 `diagnostic-build-checks-v2.json`, 26 testów PASS. Nie uznajemy poprzedniej
 odmowy za rozpoczęty lub zakończony build.
+
+## Rzeczywisty wynik buildu
+
+Operacja `6b7b046482f8408e850eb1918caa7985` zakończyła się `succeeded`,
+exit0. Make trwał 221317 ms, pakowanie 6566 ms i objęło 24 pliki.
+Źródło: `4a489e3c549e51cfb2cd30e51c14d6944baaac7c`, snapshot
+`01de70a34fbee088c8120bbff41659300a686add1b9bffcfd4eb45b4f6592de5`.
+Kandydat:
+`/opt/fullmag/package/.development/candidates/.backend-package-candidate-sexe5b82`.
+Receipt SHA256:
+`ad43456987c1120f5df879afb78b0d39ef064dc0008c4ae53c6769d00b1bc307`.
+
+Obecny pakiet i provenance pozostały niezmienione; `package_promoted=false`,
+`runtime_started=false`. Kontrola niezmienności 70 plików wcześniejszego wyniku,
+2 archiwów, 6 chronionych plików nieudanej próby Universe oraz sceny użytkownika
+przeszła. Dowody: `diagnostic-candidate-build-checkpoint.json` oraz
+`retention-after-diagnostic-build.json` w tym samym katalogu kontrolnym.
+
+Kompilacja poprawki jest teraz potwierdzona. Nowe V/J/H, recovery ownera Unknown,
+przyspieszenie RT0 i Universe w UI pozostają NOT VERIFIED. Kandydat jest
+zachowany; nie wolno ponawiać buildu ani usuwać go tylko dlatego, że nie został
+jeszcze promowany. Następna operacja ma wykorzystać kanoniczne dowody terminalnej
+historii, bez ręcznej zmiany OWNER lub rezerwacji i bez powtórzenia starego Solve.
