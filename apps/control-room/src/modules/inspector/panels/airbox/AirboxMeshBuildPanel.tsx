@@ -53,7 +53,7 @@ export function AirboxMeshBuildPanel({ selection }: InspectorPanelProps) {
         <FieldRow label="Current scene revision" value={String(lifecycle.sceneRevision ?? "unknown")} />
         <FieldRow label="Source scene revision" value={String(lifecycle.sourceSceneRevision ?? "unknown")} />
         <FieldRow label="Mesh freshness" value={lifecycle.freshness} />
-        <FieldRow label="Latest successful revision" value={String(lifecycle.latestSuccess.revision ?? "unknown")} />
+        <FieldRow label="Build history resource revision" value={String(lifecycle.latestSuccess.resourceRevision ?? "unknown")} />
         <FieldRow label="Universe report revision" value={String(report.data?.revision ?? "unknown")} />
         <FieldRow
           label="Fallbacks"
@@ -76,7 +76,11 @@ export function AirboxMeshBuildPanel({ selection }: InspectorPanelProps) {
         <FieldRow label="Provenance mesh revision" value={String(lifecycle.provenance.meshRevision ?? "not published")} />
         <FieldRow label="Provenance source scene revision" value={String(lifecycle.provenance.sourceSceneRevision ?? "not published")} />
       </InspectorGroup>
-      <InspectorGroup title="Latest Successful Build" badge={String(lifecycle.latestSuccess.revision ?? "missing")}>
+      <InspectorGroup
+        title="Latest Successful Build"
+        badge={lifecycle.latestSuccess.artifactPublished ? "published" : "missing"}
+      >
+        <FieldRow label="Artifact" value={lifecycle.latestSuccess.artifactPublished ? "published" : "not published"} />
         <FieldRow label="Latest geometry realization revision" value={String(lifecycle.latestSuccess.geometryRealizationRevision ?? "not published")} />
         <FieldRow label="Latest source scene revision" value={String(lifecycle.latestSuccess.sourceSceneRevision ?? "not published")} />
         <FieldRow label="Latest build error" value={lifecycle.latestSuccess.lastBuildError ?? "none published"} />

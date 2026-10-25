@@ -218,6 +218,55 @@ describe("airboxMeshInspectorModel", () => {
     });
   });
 
+  it("keeps build history resource revision separate from successful artifact availability", () => {
+    const model = buildAirboxMeshBuildModel({
+      current: null,
+      currentSceneRevision: 10,
+      latest: ({
+        geometry_realization_revision: 8,
+        last_success: null,
+        revision: 17,
+        source_scene_revision: 9,
+      } as unknown) as Parameters<typeof buildAirboxMeshBuildModel>[0]["latest"],
+      report: null,
+    });
+
+    expect(model.latestSuccess).toMatchObject({
+      artifactPublished: false,
+      geometryRealizationRevision: null,
+      lastSuccess: null,
+      resourceRevision: 17,
+      sourceSceneRevision: null,
+    });
+  });
+
+  it("reads successful build revisions from its artifact instead of resource provenance", () => {
+    const model = buildAirboxMeshBuildModel({
+      current: null,
+      latest: ({
+        geometry_realization_revision: 81,
+        last_success: {
+          geometry_realization: {
+            realization_revision: 8,
+            source_scene_revision: 7,
+          },
+          realization_revision: 8,
+          source_scene_revision: 7,
+        },
+        revision: 17,
+        source_scene_revision: 71,
+      } as unknown) as Parameters<typeof buildAirboxMeshBuildModel>[0]["latest"],
+      report: null,
+    });
+
+    expect(model.latestSuccess).toMatchObject({
+      artifactPublished: true,
+      geometryRealizationRevision: 8,
+      resourceRevision: 17,
+      sourceSceneRevision: 7,
+    });
+  });
+
   it("uses published report and last-build summary targets when current targets are absent", () => {
     const fromSummary = buildAirboxMeshBuildModel({
       current: ({
@@ -424,7 +473,12 @@ describe("airboxMeshInspectorModel", () => {
       } as unknown) as Parameters<typeof buildAirboxMeshBuildModel>[0]["current"],
       latest: ({
         geometry_realization_revision: 8,
-        last_success: { build_id: "build-9", artifact: "mesh-9" },
+        last_success: {
+          build_id: "build-9",
+          artifact: "mesh-9",
+          realization_revision: 3,
+          source_scene_revision: 2,
+        },
         revision: 9,
         source_scene_revision: 6,
       } as unknown) as Parameters<typeof buildAirboxMeshBuildModel>[0]["latest"],
@@ -473,10 +527,11 @@ describe("airboxMeshInspectorModel", () => {
       status: "degraded",
     });
     expect(model.latestSuccess).toMatchObject({
-      geometryRealizationRevision: 8,
+      artifactPublished: true,
+      geometryRealizationRevision: 3,
       lastSuccess: null,
-      revision: 9,
-      sourceSceneRevision: 6,
+      resourceRevision: 9,
+      sourceSceneRevision: 2,
     });
     expect(new TextEncoder().encode(model.rawDetails.serialized).byteLength).toBeLessThanOrEqual(4_096);
     expect(model.rawDetails.serialized).toContain("activeBuild");

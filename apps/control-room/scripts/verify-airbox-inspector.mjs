@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { startBrowserQaLoopbackProxy } from "./lib/browser-qa-loopback-proxy.mjs";
 
 const timeout = Math.min(
   Number.parseInt(process.env.CONTROL_ROOM_BROWSER_QA_TIMEOUT_MS ?? "180000", 10),
@@ -85,6 +86,8 @@ const resourcePaths = {
 const pageErrors = [];
 const consoleErrors = [];
 const requestFailures = [];
+const requestCancellations = [];
+const requestStartedAt = new WeakMap();
 const httpErrors = [];
 const mutationRequests = [];
 const resourceResponses = [];
@@ -97,6 +100,9 @@ let refreshStatus = null;
 let refreshBodyPreserved = false;
 let syntheticQualityErrorActive = false;
 let resourceInvalidationSequence = 0;
+const runStartedAt = Date.now();
+let teardownStartedAt = null;
+let browserOrigin = null;
 
 const qualityPath = new URL(resourcePaths.universeQuality, probeUrl).pathname;
 
@@ -104,12 +110,160 @@ function bounded(value, limit = 2048) {
   return String(value).slice(0, limit);
 }
 
+function diagnosticText(value, limit = 800) {
+  return bounded(String(value ?? "")
+    .replace(/\bhttps?:\/\/[^\s"'<>]+/gi, (candidate) => {
+      try {
+        const url = new URL(candidate);
+        return `${url.origin}${url.pathname}`;
+      } catch {
+        return "[url]";
+      }
+    })
+    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replace(/\b((?:access|refresh)?_?(?:token|secret|password|api[_-]?key))\s*[:=]\s*["']?[^\s,"'<>]+/gi, "$1=[redacted]")
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[email]")
+    .replace(/\b[A-Za-z0-9_-]{64,}\b/g, "[opaque]"), limit);
+}
+
+function safePageUrl(value) {
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return bounded(value, 240);
+  }
+}
+
+function diagnosticSamples(values, limit = 8) {
+  return values.slice(0, limit).map((value) => diagnosticText(value, 600));
+}
+
+async function collectFailurePageDiagnostics(page, workspaceEntry) {
+  if (!page) return null;
+  let dom = null;
+  let explorerNodes = null;
+  try {
+    dom = await page.evaluate(() => {
+      const summarize = (selector) => {
+        const element = document.querySelector(selector);
+        if (!element) return { present: false, visible: false };
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        const visible = style.display !== "none" && style.visibility !== "hidden" &&
+          Number(style.opacity) > 0 && rect.width > 0 && rect.height > 0;
+        const text = visible ? String(element.innerText ?? "").replace(/\s+/g, " ").trim() : "";
+        return {
+          present: true,
+          visible,
+          tag: element.tagName.toLowerCase(),
+          role: element.getAttribute("role"),
+          state: element.getAttribute("data-state"),
+          text: text.slice(0, 500),
+        };
+      };
+      const bodyText = String(document.body?.innerText ?? "").replace(/\s+/g, " ").trim();
+      return {
+        title: String(document.title ?? "").slice(0, 120),
+        document_ready_state: document.readyState,
+        visible_body_text: bodyText.slice(0, 900),
+        roots: {
+          main: summarize("main"),
+          workspace_shell: summarize(".fm-workspace-shell"),
+          workspace_body: summarize("#fm-main-content.fm-workspace-body"),
+          explorer: summarize(".fm-explorer"),
+          home_overlay: summarize('.fm-home-overlay[data-state="home-overlay"]'),
+          next_error: summarize("[data-nextjs-dialog]"),
+        },
+      };
+    });
+  } catch (error) {
+    dom = { read_error: diagnosticText(error?.message ?? error, 400) };
+  }
+  try {
+    explorerNodes = await readExplorerNodeDiagnostics(page);
+  } catch {
+    explorerNodes = { read_error: "Explorer node snapshot unavailable" };
+  }
+  return {
+    current_url: safePageUrl(page.url()),
+    workspace_entry: { ...workspaceEntry },
+    dom: dom && {
+      ...dom,
+      title: diagnosticText(dom.title ?? "", 120),
+      visible_body_text: diagnosticText(dom.visible_body_text ?? "", 900),
+      read_error: dom.read_error ? diagnosticText(dom.read_error, 400) : undefined,
+      roots: dom.roots && Object.fromEntries(Object.entries(dom.roots).map(([name, root]) => [name, {
+        ...root,
+        text: diagnosticText(root.text ?? "", 500),
+      }])),
+    },
+    page_error_messages: diagnosticSamples(pageErrors),
+    console_error_messages: diagnosticSamples(consoleErrors),
+    request_failure_messages: diagnosticSamples(requestFailures),
+    mutation_request_messages: diagnosticSamples(mutationRequests),
+    explorer_nodes: explorerNodes,
+  };
+}
+
+async function readExplorerNodeDiagnostics(page) {
+  return page.evaluate(() => {
+    const relevantNode = (nodeId) =>
+      nodeId === "model:universe" ||
+      nodeId === "model:boundary-faces" ||
+      nodeId === "model:mesh" ||
+      nodeId.startsWith("model:airbox");
+    const rows = [...document.querySelectorAll('.fm-explorer [role="treeitem"][data-node-id]')]
+      .filter((row) => relevantNode(row.getAttribute("data-node-id") ?? ""));
+    return {
+      count: rows.length,
+      truncated: rows.length > 32,
+      nodes: rows.slice(0, 32).map((row) => ({
+        id: row.getAttribute("data-node-id"),
+        label: row.querySelector(".fm-explorer-tree-row__label")?.textContent?.trim().slice(0, 120) ?? null,
+        status: row.getAttribute("data-status"),
+        status_text: row.querySelector(".fm-explorer-tree-row__status-text")?.textContent?.trim().slice(0, 120) ?? null,
+        badge: row.querySelector(".fm-explorer-tree-row__badge")?.textContent?.trim().slice(0, 160) ?? null,
+        reason: row.querySelector(".fm-explorer-tree-row__description")?.textContent?.trim().slice(0, 240) ?? null,
+        text: String(row.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 240),
+      })),
+    };
+  });
+}
+
 function collect(target, value) {
   if (target.length < 32) target.push(bounded(value));
 }
 
+function collectRequestFailure(request, errorText) {
+  const failedAt = Date.now();
+  const startedAt = requestStartedAt.get(request) ?? null;
+  const method = request.method();
+  const path = new URL(request.url()).pathname;
+  const record = {
+    method,
+    path,
+    error: errorText,
+    run_elapsed_ms: Math.max(0, failedAt - runStartedAt),
+    request_duration_ms: startedAt === null ? null : Math.max(0, failedAt - startedAt),
+  };
+  if (teardownStartedAt !== null && method === "GET" && errorText === "net::ERR_ABORTED") {
+    if (requestCancellations.length < 32) {
+      requestCancellations.push({
+        ...record,
+        teardown_elapsed_ms: Math.max(0, failedAt - teardownStartedAt),
+        phase: "browser-context-shutdown",
+      });
+    }
+    return;
+  }
+  collect(requestFailures, diagnosticText(
+    `${method} ${path}: ${errorText} (run +${record.run_elapsed_ms}ms; request ${record.request_duration_ms ?? "unknown"}ms)`,
+  ));
+}
+
 function routeUrl(path) {
-  return new URL(path, probeUrl).toString();
+  return new URL(path, browserOrigin ?? probeUrl).toString();
 }
 
 function safeCount(value) {
@@ -1155,14 +1309,27 @@ async function main() {
   const runnerPath = fileURLToPath(import.meta.url);
   const scriptSha256 = createHash("sha256").update(await readFile(runnerPath)).digest("hex");
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--enable-unsafe-swiftshader", "--use-angle=swiftshader-webgl"],
-  });
+  let loopbackProxy;
+  let browser;
   let context;
   let page;
   let proof;
+  let resultPayload;
+  const workspaceEntry = {
+    stage: "proxy-not-started",
+    requested_path: "/workspace",
+    home_overlay_visible: null,
+    workspace_body_visible: false,
+    explorer_visible: false,
+  };
   try {
+    loopbackProxy = await startBrowserQaLoopbackProxy(publicUrl, probeUrl);
+    browserOrigin = loopbackProxy.origin;
+    workspaceEntry.stage = "proxy-started";
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--enable-unsafe-swiftshader", "--use-angle=swiftshader-webgl"],
+    });
     context = await browser.newContext({
       viewport: { width: 1440, height: 1000 },
       deviceScaleFactor: 1,
@@ -1176,10 +1343,10 @@ async function main() {
     });
     page = await context.newPage();
     page.setDefaultTimeout(timeoutMs);
-    page.on("pageerror", (error) => collect(pageErrors, error?.message ?? error));
+    page.on("pageerror", (error) => collect(pageErrors, diagnosticText(error?.message ?? error)));
     page.on("console", (message) => {
       if (message.type() === "error") {
-        const text = message.text();
+        const text = diagnosticText(message.text());
         const locationUrl = message.location()?.url;
         let isSyntheticQualityConsoleError = false;
         if (syntheticQualityErrorActive && typeof locationUrl === "string" && locationUrl) {
@@ -1190,19 +1357,21 @@ async function main() {
           }
         }
         if (isSyntheticQualityConsoleError) {
-          collect(syntheticQualityConsoleErrors, `${locationUrl}: ${text}`);
+          collect(syntheticQualityConsoleErrors, diagnosticText(`${locationUrl}: ${text}`));
         } else {
           collect(consoleErrors, text);
         }
       }
     });
-    page.on("requestfailed", (request) => collect(requestFailures, `${request.method()} ${request.url()}: ${request.failure()?.errorText ?? "failed"}`));
     page.on("request", (request) => {
+      requestStartedAt.set(request, Date.now());
       const path = new URL(request.url()).pathname;
       if (path.startsWith("/v2/sessions/current/") && !["GET", "HEAD"].includes(request.method())) {
         collect(mutationRequests, `${request.method()} ${path}`);
       }
     });
+    page.on("requestfailed", (request) =>
+      collectRequestFailure(request, request.failure()?.errorText ?? "failed"));
     page.on("response", (response) => {
       if (response.status() >= 400) {
         const item = `${response.status()} ${response.request().method()} ${new URL(response.url()).pathname}`;
@@ -1217,10 +1386,36 @@ async function main() {
       }
     });
 
-    await page.goto(new URL("/workspace", probeUrl).toString(), { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    workspaceEntry.stage = "navigating";
+    const navigationResponse = await page.goto(new URL("/workspace", loopbackProxy.origin).toString(), {
+      waitUntil: "domcontentloaded",
+      timeout: timeoutMs,
+    });
+    workspaceEntry.navigation_status = navigationResponse?.status() ?? null;
+    workspaceEntry.current_url = safePageUrl(page.url());
+    assert(navigationResponse && navigationResponse.status() < 400,
+      `Workspace navigation returned HTTP ${navigationResponse?.status() ?? "no response"}`);
+    workspaceEntry.stage = "page-loaded";
+    const homeOverlay = page.locator('.fm-home-overlay[data-state="home-overlay"]');
+    workspaceEntry.home_overlay_visible = await homeOverlay.isVisible();
+    if (workspaceEntry.home_overlay_visible) {
+      workspaceEntry.stage = "returning-from-home-overlay";
+      await page.getByRole("button", { name: "Back to simulation", exact: true }).click();
+      await homeOverlay.waitFor({ state: "hidden", timeout: timeoutMs });
+      workspaceEntry.returned_from_home_overlay = true;
+    } else {
+      workspaceEntry.returned_from_home_overlay = false;
+    }
+    workspaceEntry.stage = "waiting-for-workspace";
+    await page.locator("#fm-main-content.fm-workspace-body").waitFor({ state: "visible", timeout: timeoutMs });
+    workspaceEntry.workspace_body_visible = true;
     await page.locator(".fm-explorer").waitFor({ state: "visible", timeout: timeoutMs });
+    workspaceEntry.explorer_visible = true;
     await page.locator("[data-node-id='model:airbox']").waitFor({ state: "visible", timeout: timeoutMs });
     await page.waitForFunction(() => Boolean(window.__FULLMAG_CONTROL_ROOM_AUDIT__?.invalidateResource), null, { timeout: timeoutMs });
+    workspaceEntry.stage = "ready";
+    assert.equal(mutationRequests.length, 0,
+      `Opening the workspace sent mutating session requests: ${mutationRequests.join(", ")}`);
 
     const status = await readResource(page.request, resourcePaths.sessionStatus, "current session status");
     const authoredMethod = status.capabilities?.active_lane?.authored?.discretization ?? null;
@@ -1250,9 +1445,14 @@ async function main() {
     assert.equal(manifest.generation_id, status.domain.generation_id, "Manifest generation differs from live FEM status");
     assert.equal(String(manifest.revision), String(status.resources.mesh_revision), "Manifest revision differs from live FEM mesh revision");
     assert.equal(manifest.revision, status.resources.mesh_revision, "Manifest revision is not the current published mesh revision");
+    assert.equal(String(report.revision), String(status.resources.mesh_revision),
+      "Universe report revision differs from the current published FEM mesh");
     assert.equal(manifest.topology_fingerprint?.length > 0, true, "Manifest omitted topology fingerprint");
     assert.equal(currentBuild.revision != null, true, "Current build resource omitted its revision");
-    assert.equal(latestBuild.last_success != null, true, "Latest successful build resource omitted its artifact");
+    if (latestBuild.last_success != null) {
+      assert.equal(typeof latestBuild.last_success, "object",
+        "Published latest successful build artifact must be an object");
+    }
 
     const canvas = await inspectCanvas(page);
     assert.equal(canvas.visible, true, "Workspace canvas is not visible");
@@ -1261,6 +1461,7 @@ async function main() {
 
     await expandNode(page, "model:airbox");
     await expandNode(page, "model:airbox:mesh");
+    const explorerNodes = await readExplorerNodeDiagnostics(page);
     const nullResolution = activeLaneStatus?.resolved === null
       ? { status_overrides: 0, other_fields_preserved: true }
       : await installResolvedNullStatusRoute(page);
@@ -1292,10 +1493,19 @@ async function main() {
       }
       if (panel.id === "build") {
         const buildFields = snapshot.buildFields;
+        const latestSuccessfulArtifactPublished = latestBuild.last_success != null;
+        const artifactState = groupValue(
+          panelProof,
+          "build",
+          "Latest Successful Build",
+          "Artifact",
+        );
         const buildIdentityMatches = numberFromText(buildFields["Current build revision"]) === currentBuild.revision
           && numberFromText(buildFields["Universe report revision"]) === report.revision
-          && numberFromText(buildFields["Latest successful revision"]) === (latestBuild.revision ?? null);
+          && numberFromText(buildFields["Build history resource revision"]) === latestBuild.revision
+          && artifactState === (latestSuccessfulArtifactPublished ? "published" : "not published");
         panelProof[panelProof.length - 1].build_identity = { verified: buildIdentityMatches };
+        panelProof[panelProof.length - 1].latest_successful_artifact_published = latestSuccessfulArtifactPublished;
         assert(buildIdentityMatches, "Airbox Build panel does not match live current/report/latest-success API resources");
       }
     }
@@ -1329,6 +1539,8 @@ async function main() {
       generic_unknown_header_rejected: true,
       no_mutating_requests: true,
       canvas,
+      workspace_entry: { ...workspaceEntry },
+      explorer_nodes: explorerNodes,
       panels: panelProof,
       api_comparisons: comparisons,
       resource_refresh: refresh,
@@ -1353,8 +1565,9 @@ async function main() {
       resource_responses: resourceResponses,
       inspector_proof: proof,
     };
-    process.stdout.write(`${JSON.stringify(output)}\n`);
+    resultPayload = output;
   } catch (error) {
+    const failureDiagnostics = await collectFailurePageDiagnostics(page, workspaceEntry);
     const failure = {
       schema: resultSchema,
       state: "failed",
@@ -1370,15 +1583,62 @@ async function main() {
       synthetic_http_errors: syntheticQualityHttpErrors,
       synthetic_console_errors: syntheticQualityConsoleErrors,
       resource_responses: resourceResponses,
-      error: bounded(error?.stack ?? error),
+      error: diagnosticText(error?.stack ?? error, 2048),
+      failure_diagnostics: failureDiagnostics,
+      browser_route: loopbackProxy ? {
+        origin: loopbackProxy.origin,
+        upstream: loopbackProxy.upstream,
+        proxy_failures: loopbackProxy.failures.slice(0, 8).map((failure) => diagnosticText(failure, 400)),
+      } : null,
       partial_inspector_proof: proof,
     };
-    process.stdout.write(`${JSON.stringify(failure)}\n`);
+    resultPayload = failure;
     process.exitCode = 1;
   } finally {
+    teardownStartedAt = Date.now();
     await context?.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    await browser?.close().catch(() => undefined);
+    await loopbackProxy?.close().catch(() => undefined);
+    browserOrigin = null;
   }
+  if (!resultPayload) {
+    process.exitCode = 1;
+    process.stdout.write(`${JSON.stringify({
+      schema: resultSchema,
+      state: "failed",
+      scenario: "airbox-inspector",
+      error: "Browser QA ended without a result payload.",
+    })}\n`);
+    return;
+  }
+  const shutdownFindings = [
+    pageErrors.length > 0 ? `${pageErrors.length} page error(s)` : null,
+    consoleErrors.length > 0 ? `${consoleErrors.length} console error(s)` : null,
+    requestFailures.length > 0 ? `${requestFailures.length} request failure(s)` : null,
+    httpErrors.length > 0 ? `${httpErrors.length} HTTP error(s)` : null,
+    loopbackProxy?.failures.length ? `${loopbackProxy.failures.length} proxy failure(s)` : null,
+  ].filter(Boolean);
+  if (resultPayload.state === "passed" && shutdownFindings.length > 0) {
+    resultPayload.state = "failed";
+    resultPayload.error = `Browser lifecycle recorded errors after scenario checks: ${shutdownFindings.join(", ")}.`;
+    process.exitCode = 1;
+  }
+  Object.assign(resultPayload, {
+    page_errors: pageErrors.length,
+    page_error_messages: diagnosticSamples(pageErrors),
+    console_errors: consoleErrors.length,
+    console_error_messages: diagnosticSamples(consoleErrors),
+    request_failures: requestFailures.length,
+    request_failure_messages: diagnosticSamples(requestFailures),
+    request_cancellations: requestCancellations.slice(0, 8),
+    http_errors: httpErrors,
+    browser_route: loopbackProxy ? {
+      origin: loopbackProxy.origin,
+      upstream: loopbackProxy.upstream,
+      proxy_failures: loopbackProxy.failures.slice(0, 8).map((failure) => diagnosticText(failure, 400)),
+    } : null,
+  });
+  process.stdout.write(`${JSON.stringify(resultPayload)}\n`);
 }
 
 await main();

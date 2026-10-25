@@ -65,11 +65,12 @@ export interface AirboxMeshBuildModel {
   freshness: "current" | "stale" | "unknown";
   status: "current" | "degraded" | "missing";
   latestSuccess: {
+    artifactPublished: boolean;
     effectiveAirboxTarget: JsonRecord | null;
     geometryRealizationRevision: number | null;
     lastBuildError: string | null;
     lastSuccess: unknown;
-    revision: number | null;
+    resourceRevision: number | null;
     sourceSceneRevision: number | null;
   };
 }
@@ -116,6 +117,11 @@ export function buildAirboxMeshBuildModel({
     stringField(reportRecord, "error"),
   );
   const missing = !current && !report;
+  const latestSuccessArtifact = asJsonRecord(latest?.last_success);
+  const latestSuccessArtifactPublished = latestSuccessArtifact !== null;
+  const latestSuccessGeometryRealization = asJsonRecord(
+    latestSuccessArtifact?.geometry_realization,
+  );
   const sourceSceneRevision =
     current?.source_scene_revision ??
     current?.provenance?.source_scene_revision ??
@@ -201,13 +207,20 @@ export function buildAirboxMeshBuildModel({
     freshness,
     status: missing ? "missing" : degraded ? "degraded" : "current",
     latestSuccess: {
+      artifactPublished: latestSuccessArtifactPublished,
       effectiveAirboxTarget: asJsonRecord(latest?.effective_airbox_target),
       geometryRealizationRevision:
-        latest?.geometry_realization_revision ?? null,
+        latestSuccessArtifactPublished
+          ? numericField(latestSuccessArtifact, "realization_revision") ??
+            numericField(latestSuccessGeometryRealization, "realization_revision")
+          : null,
       lastBuildError: boundedDisplayText(latest?.last_build_error),
       lastSuccess: null,
-      revision: latest?.revision ?? null,
-      sourceSceneRevision: latest?.source_scene_revision ?? null,
+      resourceRevision: latest?.revision ?? null,
+      sourceSceneRevision: latestSuccessArtifactPublished
+        ? numericField(latestSuccessArtifact, "source_scene_revision") ??
+          numericField(latestSuccessGeometryRealization, "source_scene_revision")
+        : null,
     },
   };
 }

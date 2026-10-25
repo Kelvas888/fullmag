@@ -180,6 +180,10 @@ describe("AirboxMeshBuildPanel", () => {
     expect(html).toContain("meshing/manifest/7");
     expect(html).toContain("mesh-6");
     expect(html).toContain("Latest Successful Build");
+    expect(html).toContain("Build history resource revision");
+    expect(html).not.toContain("Latest successful revision");
+    expect(html).toContain("Artifact");
+    expect(html).toContain("published");
   });
 
   it("renders bounded metadata instead of an oversized universe report", () => {
