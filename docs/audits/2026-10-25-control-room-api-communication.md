@@ -108,6 +108,7 @@ Ważność: K – krytyczna, W – wysoka, Ś – średnia, N – niska. „Zmie
   już istnieje dla pól H. Alternatywnie `Arc<[f64]>`. Stan dekodować raz i współdzielić z adopcją.
 
 **A5 (W, kod i zmierzone). Capabilities runtime powstają dopiero przy stanie terminalnym.**
+Właściciel naprawy: branch `codex/viz-parity-20261025`, w toku. Tutaj tylko opis.
 - `resolved_capabilities` i `accepted_runtime_capabilities` są liczone wyłącznie dla
   `completed|failed|cancelled` (`live_accepted_projection.rs`, `load_durable_projection` i `poll_once`).
 - W biegu `resolved_quantity_capability_for_snapshot` zwraca `runtime_capabilities_unavailable`
@@ -319,7 +320,7 @@ zaobserwowanego ruchu:
 | 4 | Runner i worker | C1: kadencja czasowa pól live, wymuszona publikacja przy pauzie i stopie | średnie | największy zysk dla solvera; wymaga testów runtime FDM/FEM CPU/GPU |
 | 5 | Runner | C2: Airbox binarnie, bez `pretty`, cache kernela, leniwie | średnie | skraca życie workera o ~20 min |
 | 6 | API i frontend | B2 + D3: `display_budget` z decymacją 3D i f32 | średnie | kontrakt OpenAPI; usuwa 23× nadmiar |
-| 7 | API | A5: capabilities z planu przy przygotowaniu etapu | średnie | koniec czarnego viewportu w biegu |
+| 7 | API | A5: capabilities z planu przy przygotowaniu etapu | średnie | w toku na `codex/viz-parity-20261025` |
 | 8 | API | A4 + B3 + B4: `m` binarnie, ETag przed odczytem, cache zdekodowanych wartości | średnie | ogranicza RSS API |
 | 9 | Frontend | D1, D4, D5: latest-wins, semafor ciężkich żądań, pauza na ukrytej karcie, jedno discovery | średnie | dowód przeglądarkowy wymagany |
 | 10 | Platforma | C3, A6, A7, B5, B6 | niskie–średnie | porządkowe |
@@ -329,10 +330,28 @@ kontrakt danych pól i powinny trafić do jednego planu (OpenAPI + typy frontend
 
 ## Weryfikacja zmian w tym PR
 
-Szczegóły i wyniki: sekcja „Dowody” w opisie PR.
+- `just check-api-service-source`: `passed` (cargo check produkcyjnych binarek API, bez testów,
+  3 min 27 s). Nowych ostrzeżeń brak; ostrzeżenia w `session.rs:690` i `:2649` istniały wcześniej.
+- Kontener frontendu grupy `fullmag-worktree-backend-api-docker-stability-383-bd9c800c01f1fa40`:
+  - vitest `viewport3dResources.test.ts`: 67/67 testów przeszło;
+  - nowy test bez poprawki kończy się błędem (sprawdzone);
+  - `eslint --max-warnings=0` na zmienionych plikach: exit 0;
+  - `pnpm run typecheck`: exit 0.
+- Test Rust `replay_payload_comparison_ignores_only_the_observation_frame` jest dopisany w źródle,
+  ale **nie został skompilowany** z powodu obowiązującego zakazu: `NOT VERIFIED`.
+- Pomiar CPU i I/O projektora po poprawce A1 w trakcie biegu: `NOT VERIFIED`.
+  Grupa DEV tego worktree zbudowała się i wystartowała, ale nie przyjęła skryptu pomiarowego
+  (blokada opisana niżej). Wartości wyjściowe (przed poprawką) pochodzą z grupy `viz-parity`.
 
-- `just check-api-service-source` (cargo check produkcyjnych binarek API, bez testów).
-- vitest `viewport3dResources.test.ts` w kontenerze frontendu grupy tego worktree.
-- Testy Rust (`replay_payload_comparison_ignores_only_the_observation_frame`) są dopisane w źródle,
-  ale **nie zostały skompilowane** z powodu obowiązującego zakazu: `NOT VERIFIED`.
-- Pomiar CPU i I/O projektora po poprawce A1 w biegu: patrz opis PR. Bez pomiaru: `NOT VERIFIED`.
+### Usterki napotkane przy weryfikacji (poza zakresem)
+
+- `examples/permalloy_box_relax_300x1000x10nm_fdm.py` na `master` nie przechodzi walidacji
+  skryptu: `ValueError: LLG relaxation requires an explicit fixed or complete adaptive timestep policy`.
+- Po tym odrzuceniu grupa DEV zostaje zablokowana:
+  - każde następne `run-script` kończy się `activation_outcome_unknown`, a wewnętrznie
+    `ControlOutcomeUnknown: startup activation outcome is unknown; canonical marker/quarantine
+    reconciliation is required`;
+  - `just docker-dev … <script>` zwraca „Existing DEV operation is active”;
+  - `just docker-dev-resume` zwraca „Retained start has no admissible terminal outcome”.
+- Odrzucony skrypt użytkownika nie powinien zostawiać kwarantanny, której nie da się usunąć
+  udokumentowaną receptą.
