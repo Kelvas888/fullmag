@@ -74,6 +74,15 @@ inactive native cell contributes and receives exactly zero. When the scratch
 extent covers only part of a native cell, the operator represents exactly that
 intersection and its pull remains the volume adjoint of the same map.
 
+Time integration keeps the same carrier. An inactive native cell stores
+$\mathbf m_i=\mathbf 0$ and, because every local field and the pulled demag
+field vanish there, its LLG right-hand side is exactly zero. Each explicit RK
+or ABM3 stage therefore projects $\mathbf m\mapsto\mathbf m/|\mathbf m|$ only
+on cells with a non-zero candidate; an inactive cell whose initial state and
+stage candidate are both exactly zero stays $\mathbf 0$. A zero or non-finite
+candidate on a cell whose initial state is non-zero remains a hard error,
+since it is a numerical failure of an active cell rather than empty space.
+
 The cell represented by a pair kernel has dimensions $\mathbf h^K_l$. In
 `three_d`, $\mathbf h^K_l$ is the layer scratch spacing. In `two_d_stack`, it is
 $(h_{\mathrm{scratch},x},h_{\mathrm{scratch},y},h_{n,z})$: the transform has one
