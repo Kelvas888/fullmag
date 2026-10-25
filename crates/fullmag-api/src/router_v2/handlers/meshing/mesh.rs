@@ -261,7 +261,8 @@ pub async fn get_mesh_semantics(
             .as_ref()
             .map(|workspace| MeshBuildDiagnosticsResource {
                 mesh_quality_summary: workspace.get("mesh_quality_summary").cloned(),
-                mesh_statistics: workspace.get("mesh_statistics").cloned(),
+                mesh_statistics: workspace_mesh_statistics(workspace, snapshot.fem_mesh.as_deref())
+                    .cloned(),
                 last_build_summary: workspace.get("last_build_summary").cloned(),
                 mesh_pipeline_status: workspace.get("mesh_pipeline_status").cloned(),
                 last_build_error: workspace
@@ -802,7 +803,7 @@ pub async fn get_mesh_shared_domain_report(
     let mesh_workspace = current_mesh_workspace(&snapshot)?;
     let mut report = json!({
         "mesh_summary": mesh_workspace.get("mesh_summary").cloned().unwrap_or(Value::Null),
-        "mesh_statistics": workspace_mesh_statistics(mesh_workspace).cloned().unwrap_or(Value::Null),
+        "mesh_statistics": workspace_mesh_statistics(mesh_workspace, snapshot.fem_mesh.as_deref()).cloned().unwrap_or(Value::Null),
         "mesh_cost_report": mesh_workspace.get("mesh_cost_report").cloned().unwrap_or(Value::Null),
         "mesh_pipeline_status": mesh_workspace.get("mesh_pipeline_status").cloned().unwrap_or(Value::Null),
         "last_build_summary": mesh_workspace.get("last_build_summary").cloned().unwrap_or(Value::Null),
@@ -3055,9 +3056,19 @@ fn first_workspace_u128(root: &Value, paths: &[&[&str]]) -> Option<u128> {
     })
 }
 
-fn workspace_mesh_statistics(mesh_workspace: &Value) -> Option<&Value> {
-    workspace_value_at(mesh_workspace, &["mesh_statistics"])
+fn workspace_mesh_statistics<'a>(
+    mesh_workspace: &'a Value,
+    mesh: Option<&'a FemMeshPayload>,
+) -> Option<&'a Value> {
+    // Accepted preparation publishes its evidence with the canonical mesh,
+    // independently of the optional interactive workspace diagnostics.
+    mesh.and_then(|mesh| mesh.build_report.as_ref())
+        .and_then(|report| report.mesh_statistics.as_ref())
         .filter(|value| !value.is_null())
+        .or_else(|| {
+            workspace_value_at(mesh_workspace, &["mesh_statistics"])
+                .filter(|value| !value.is_null())
+        })
         .or_else(|| {
             workspace_value_at(mesh_workspace, &["last_build_summary", "mesh_statistics"])
                 .filter(|value| !value.is_null())
@@ -3101,7 +3112,7 @@ fn derive_mesh_quality_gates(snapshot: &SessionStateResponse, mesh_workspace: &V
             }
         ],
         "mesh_quality_summary": mesh_workspace.get("mesh_quality_summary").cloned().unwrap_or(Value::Null),
-        "mesh_statistics": workspace_mesh_statistics(mesh_workspace).cloned().unwrap_or(Value::Null)
+        "mesh_statistics": workspace_mesh_statistics(mesh_workspace, snapshot.fem_mesh.as_deref()).cloned().unwrap_or(Value::Null)
     })
 }
 
@@ -3267,10 +3278,11 @@ fn filtered_worst_entries(value: Option<&Value>, marker: u32) -> Vec<Value> {
 
 fn scoped_mesh_statistics(
     mesh_workspace: &Value,
+    mesh: Option<&FemMeshPayload>,
     marker: Option<u32>,
     kind: Option<&str>,
 ) -> Option<Value> {
-    let mesh_statistics = workspace_mesh_statistics(mesh_workspace)?;
+    let mesh_statistics = workspace_mesh_statistics(mesh_workspace, mesh)?;
     let scopes = mesh_statistics.get("scopes").and_then(Value::as_array)?;
     let scope = scopes.iter().find(|scope| {
         marker.is_some_and(|marker| scope_marker(scope) == Some(marker))
@@ -3910,7 +3922,7 @@ fn universe_quality(mesh_workspace: &Value, mesh: Option<&FemMeshPayload>) -> Va
     let per_domain_quality = mesh
         .and_then(|mesh| mesh.per_domain_quality.get(&0))
         .and_then(|quality| serde_json::to_value(quality).ok());
-    let mut quality = scoped_mesh_statistics(mesh_workspace, Some(0), Some("airbox"))
+    let mut quality = scoped_mesh_statistics(mesh_workspace, mesh, Some(0), Some("airbox"))
         .or_else(|| {
             per_domain_quality
                 .as_ref()
@@ -3994,7 +4006,9 @@ fn object_quality(
         })
         .and_then(|quality| serde_json::to_value(quality).ok());
     let mut quality = marker
-        .and_then(|marker| scoped_mesh_statistics(mesh_workspace, Some(marker), None))
+        .and_then(|marker| {
+            scoped_mesh_statistics(mesh_workspace, snapshot.fem_mesh.as_deref(), Some(marker), None)
+        })
         .or_else(|| {
             marker.and_then(|marker| {
                 per_domain_quality.as_ref().and_then(|quality| {

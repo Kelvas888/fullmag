@@ -1482,19 +1482,6 @@ def build_geometry_assets_for_request(
 
             assert domain_mesh is not None
             assert region_markers is not None
-            if _realized_domain_mesh_sink is not None:
-                # The public asset remains JSON MeshIR for the ProblemIR
-                # contract, while the state owner can retain this exact typed
-                # mesh for the immediately-following persistence operation.
-                # This avoids a JSON -> NumPy rehydration of the same large
-                # mixed CSR payload.
-                _realized_domain_mesh_sink.append(
-                    (
-                        domain_mesh,
-                        [dict(entry) for entry in region_markers],
-                        build_report,
-                    )
-                )
             if _include_domain_mesh_ir:
                 with indeterminate_progress_phase(
                     phase="postprocessing",
@@ -1539,11 +1526,36 @@ def build_geometry_assets_for_request(
                     )
                 ),
             }
-            if build_report is not None:
-                domain_asset["build_report"] = (
-                    dict(build_report)
-                    if isinstance(build_report, Mapping)
-                    else build_report.to_dict()
+            build_report_payload = None
+            if isinstance(build_report, Mapping):
+                build_report_payload = dict(build_report)
+            elif build_report is not None:
+                build_report_payload = build_report.to_dict()
+            if build_report_payload is not None:
+                mesh_statistics = (
+                    domain_mesh_ir.get("mesh_statistics")
+                    if isinstance(domain_mesh_ir, Mapping)
+                    else None
+                )
+                if not isinstance(mesh_statistics, Mapping):
+                    # MeshData.to_ir already computed this report for ProblemIR
+                    # callers. Reuse it instead of repeating the mixed geometry
+                    # and edge-statistics passes. The typed-mesh sink path skips
+                    # MeshIR materialization, so compute the same report there.
+                    mesh_statistics = domain_mesh.statistics_ir("study_domain")
+                if isinstance(mesh_statistics, Mapping):
+                    build_report_payload["mesh_statistics"] = dict(mesh_statistics)
+                domain_asset["build_report"] = build_report_payload
+            if _realized_domain_mesh_sink is not None:
+                # Retain the typed mesh to avoid JSON -> NumPy rehydration, and
+                # pass the same enriched report that the canonical MeshIR asset
+                # publishes. The world persistence consumer accepts mappings.
+                _realized_domain_mesh_sink.append(
+                    (
+                        domain_mesh,
+                        [dict(entry) for entry in region_markers],
+                        build_report_payload,
+                    )
                 )
             assets["fem_domain_mesh_asset"] = domain_asset
 

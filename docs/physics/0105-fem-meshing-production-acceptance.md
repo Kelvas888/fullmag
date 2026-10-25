@@ -330,6 +330,16 @@ publikacja pomija cały starszy format zamiast emitować niekompletny podzbiór.
 Nie usuwa to bogatych `mesh_statistics` ani dostępnych metryk per-family;
 nie wprowadza również sztucznych wartości gamma.
 
+W ścieżce accepted preparation bogaty raport jest przenoszony przez
+`domain_asset.build_report.mesh_statistics`, opcjonalne pole
+`FemSharedDomainBuildReportIR`, `FemPlanIR.mesh_build_report` oraz
+`FemMeshPayload.build_report`. Samo `mesh_statistics` na najwyższym poziomie
+JSON siatki nie stanowi tego kontraktu: starszy typowany `MeshIR` pomija
+nieznane pola. API odczytuje raport przypisany do bieżącej siatki przed
+starszymi diagnostykami workspace, a endpoint Airboxa wybiera wyłącznie
+scope markera 0. Brak nowego pola pozostaje zgodny ze starszymi artefaktami
+i uruchamia dotychczasowy fallback geometrii, bez tworzenia metryk Gmsh.
+
 The mixed-v2 Gmsh producer extracts these metrics when quality computation is
 requested and converts its scaled-coordinate volume channels back to SI before
 attaching them to `MeshData`. Marker reports are rekeyed only when the final

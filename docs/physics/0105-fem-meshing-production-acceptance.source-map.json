@@ -282,6 +282,18 @@
       "responsibility": "Builds bounded global and marker-scope statistics with truthful per-family availability and volume/edge histograms."
     },
     {
+      "id": "accepted-mesh-statistics-carrier",
+      "path": "crates/fullmag-ir/src/mesh_assets.rs",
+      "symbol": "FemSharedDomainBuildReportIR",
+      "responsibility": "Preserves optional rich mesh_statistics independently of legacy gamma-bearing marker reports through accepted preparation."
+    },
+    {
+      "id": "accepted-mesh-statistics-api",
+      "path": "crates/fullmag-api/src/router_v2/handlers/meshing/mesh.rs",
+      "symbol": "workspace_mesh_statistics",
+      "responsibility": "Reads rich statistics from the current canonical mesh build report before legacy workspace diagnostics and projects marker-scoped quality."
+    },
+    {
       "id": "legacy-marker-quality-serialization",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py",
       "symbol": "_legacy_per_domain_quality_is_complete",

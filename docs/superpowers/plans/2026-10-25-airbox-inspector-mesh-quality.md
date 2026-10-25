@@ -136,3 +136,23 @@ dowodem wykonania recovery ani dowodem działania przeglądarki.
   dotyczy ograniczonych wyszukiwań w panelach, celowo sekwencyjnych obserwacji
   stanu i klonowania syntetycznego JSON. Nie stanowią błędów produkcyjnego UI;
   rzeczywisty harness nadal czeka na poprawny runtime.
+
+### Dalsza weryfikacja po recovery
+
+- Zarządzane wznowienie `53f9ae86d38c4af28187ace268501c3b` zbudowało
+  `6c8199b525a05515032204cd1355c9d38c1c532f` i uruchomiło API. Aktywacja
+  `835d9c35a7054baab74d5991b7630b11` przygotowała fixture bez Solve.
+- Rzeczywista siatka: 7131 węzłów, 39946 komórek (38844 tet4, 1012 prism6,
+  90 pyramid5), Airbox marker 0: 38161 komórek, 1407 wspólnych węzłów.
+  Audyt API ujawnił utratę bogatych statystyk podczas deserializacji MeshIR.
+  Poprawka przenosi je przez opcjonalne `build_report.mesh_statistics`, także
+  w ścieżce zachowującej typowaną siatkę zamiast JSON. Trzy interpretowane
+  regresje producenta przeszły; brak raportu nadal nie tworzy niepełnego IR.
+- Dwie próby przeglądarkowe ujawniły problemy harnessu: brak bezpiecznego
+  loopback origin oraz błędne wymaganie historii interaktywnego buildu dla
+  siatki przygotowanej skryptem. Druga próba weszła do workspace, bez błędów
+  strony i konsoli, ale nie ukończyła dowodu Inspectora. Żadna nie jest
+  zaliczonym browser proof. Kontrole TypeScript i lint po poprawkach: sukces.
+- Kompilacja testów jednostkowych pozostaje wyłączona zgodnie z poleceniem
+  użytkownika. Nowy nośnik statystyk wymaga produkcyjnego buildu, ponownego
+  przygotowania modelu oraz porównania danych z panelem w przeglądarce.
