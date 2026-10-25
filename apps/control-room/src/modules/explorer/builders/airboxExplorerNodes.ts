@@ -337,13 +337,38 @@ export function buildFemAirboxNode(
 export function buildBoundaryFacesNode(
   snapshot: ModelTreeSnapshot | null,
 ): ExplorerNode {
-  const status: ExplorerNodeStatus =
-    (snapshot?.mesh?.outerBoundaryPartCount ?? 0) > 0
-      ? meshFreshnessStatus(
-          meshFreshnessState(snapshot?.mesh),
-          meshRootStatus(snapshot?.mesh),
-        )
-      : "unavailable";
+  const evidenceStatus = snapshot?.mesh?.outerBoundaryEvidenceStatus ?? "unknown";
+  const carrierCount = snapshot?.mesh?.outerBoundaryPartCount;
+  const currentCarrierInventoryVerified =
+    evidenceStatus === "verified" && typeof carrierCount === "number";
+  const hasCurrentCarrier = evidenceStatus === "verified" &&
+    typeof carrierCount === "number" && carrierCount > 0;
+  const verifiedNoCarrier = currentCarrierInventoryVerified && carrierCount === 0;
+  const status: ExplorerNodeStatus = hasCurrentCarrier
+    ? meshFreshnessStatus(
+        meshFreshnessState(snapshot?.mesh),
+        meshRootStatus(snapshot?.mesh),
+      )
+    : verifiedNoCarrier
+      ? "unavailable"
+      : evidenceStatus === "loading"
+        ? "mesh-building"
+        : evidenceStatus === "stale"
+          ? "mesh-stale"
+          : evidenceStatus === "error"
+            ? "mesh-failed"
+            : "unavailable";
+  const statusReason = verifiedNoCarrier
+    ? "The current published FEM manifest has no Universe outer-boundary carrier."
+    : evidenceStatus === "loading"
+      ? "The mesh manifest or current scene is loading; boundary-carrier availability is not known yet."
+      : evidenceStatus === "stale"
+        ? "The boundary manifest does not match the current mesh revision or source scene."
+        : evidenceStatus === "error"
+          ? "The mesh manifest or current scene failed to load; boundary-carrier availability is unknown."
+          : evidenceStatus === "unknown"
+            ? "The current mesh topology identity is incomplete or non-FEM, so boundary-carrier availability cannot be verified."
+            : undefined;
 
   return {
     id: "model:boundary-faces",
@@ -351,12 +376,15 @@ export function buildBoundaryFacesNode(
     label: "Boundary Faces",
     parentId: "model:universe",
     badge:
-      status === "mesh-ready"
+      hasCurrentCarrier && status === "mesh-ready"
         ? "realized"
-        : status === "unavailable"
-          ? "mesh required"
-          : meshStatusBadge(status),
+        : verifiedNoCarrier
+          ? "no carrier"
+          : evidenceStatus === "unknown"
+            ? "identity unknown"
+            : meshStatusBadge(status),
     icon: "mesh",
     status,
+    statusReason,
   };
 }

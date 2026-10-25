@@ -156,3 +156,39 @@ dowodem wykonania recovery ani dowodem działania przeglądarki.
 - Kompilacja testów jednostkowych pozostaje wyłączona zgodnie z poleceniem
   użytkownika. Nowy nośnik statystyk wymaga produkcyjnego buildu, ponownego
   przygotowania modelu oraz porównania danych z panelem w przeglądarce.
+
+- Produkcyjny build czystego `dc339bfc3d8f6e8ef47232b93835ff193448c0e3`
+  przeszedł: iteration `6e4cc722cb2a46ce8cd1f5a484893fa0`, snapshot
+  `65911408fdfba8f701ff451edf756142e3a7b0d8066b37656a2dff4a3ec51c90`.
+  Aktywacja `146bae4e14ba45268059309a5b4d81be`: sukces, model oczekuje na
+  Compute, licznik solvera 0. Pełny raport jakości przeszedł przez IR do API.
+- Odczyt scoped API wykrył drugi błąd: fizyczna grupa Gmsh `air` miała tag 3
+  w raporcie jakości, a marker 0 w topologii. Commit
+  `cf38878523058ec0132fca8cc0b7fa6119fef6c1` normalizuje oba identycznie,
+  zachowuje kontrolę nakładania grup i zmienia klucz cache bez kasowania
+  starych danych. 13 interpretowanych regresji: sukces.
+- Próba browser QA `f545b477cca940bc94d129a956935449` przeszła początkowe
+  ładowanie i odczyt siedmiu paneli, a następnie poprawnie odrzuciła brak
+  dostępnego percentyla Airboxa w starym runtime. Page errors i console
+  errors: 0. Pozostaje pełna próba po nowym przygotowaniu; ten wynik nie
+  kwalifikuje Inspectora. Wcześniejsze błędy harnessu opóźniania odpowiedzi
+  pozostają w receiptach kontrolnych i nie są zaliczonymi dowodami.
+
+- Zintegrowano `master` do `86003cd811ab9097f0b61437dbae0fd68170689a` przez
+  merge `caf50d2d88a6cb4a286252709870d5eb3df556bd`. CI starszego
+  `dc339bfc3d8f6e8ef47232b93835ff193448c0e3` wykryło nieaktualne fixture testów
+  Inspectora/recovery oraz oczekiwania odziedziczone z master. Ich korekta
+  jest w `d397c166366c11b8b5ed3c059e8bdac05d692420`. Interpretowane testy
+  aktywacji: 19/19, guard recovery: 9/9, validator browser QA: 26/26.
+  Typecheck, lint zmienionego UI, składnia harnessu i audyt compute: sukces.
+- Boundary Faces rozróżnia brak osobnego nośnika w aktualnym manifeście od
+  braku aktualnego dowodu; dodatnie stare dane nie dają statusu realized.
+  Harness jawnie oddziela diagnostyczne ACK renderera od mutacji modelu i
+  Solve, odrzuca błędne ACK i przekroczenie limitu dowodów, a handlery
+  opóźnionych odpowiedzi kończy przed usunięciem routingu. Review źródłowe
+  zamknięte; pozostaje pełny dowód runtime i browser dla nowego commita.
+- Retencja przed kolejnym buildem: zachowano aktualny pakiet, cache
+  przyrostowy, ledger, state roots i wszystkie receipty prób. Brak wskazanego
+  zbędnego zasobu wymagającego kasowania; 24 GiB wolne na hoście i 471 GiB
+  w przestrzeni wolumenów Docker w ostatnim pomiarze. Cache zadania podlega
+  ponownej ocenie dopiero po integracji i potwierdzonym drain.

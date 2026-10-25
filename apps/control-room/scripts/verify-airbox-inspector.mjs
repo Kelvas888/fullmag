@@ -18,6 +18,8 @@ const resultSchema = "fullmag.docker-dev-airbox-inspector-result.v1";
 const proofSchema = "fullmag.airbox-inspector-browser-proof.v1";
 const manifestPath = "/v2/sessions/current/meshing/meshes/shared-domain/manifest";
 const statusPath = "/v2/sessions/current/status";
+const planarMonitorsPath = "/v2/sessions/current/model/planar-monitors";
+const visualizationClientAcksPath = "/v2/sessions/current/visualization/client-acks";
 const timeoutMs = Number.isFinite(timeout) ? timeout : 120_000;
 const require = createRequire(import.meta.url);
 
@@ -90,6 +92,10 @@ const requestCancellations = [];
 const requestStartedAt = new WeakMap();
 const httpErrors = [];
 const mutationRequests = [];
+const visualizationClientAcknowledgements = [];
+const visualizationAckByRequest = new WeakMap();
+const planarMonitorRequests = [];
+const planarMonitorRequestByRequest = new WeakMap();
 const resourceResponses = [];
 const syntheticQualityHttpErrors = [];
 const syntheticQualityConsoleErrors = [];
@@ -103,6 +109,7 @@ let resourceInvalidationSequence = 0;
 const runStartedAt = Date.now();
 let teardownStartedAt = null;
 let browserOrigin = null;
+let harnessPhase = "startup";
 
 const qualityPath = new URL(resourcePaths.universeQuality, probeUrl).pathname;
 
@@ -137,6 +144,70 @@ function safePageUrl(value) {
 
 function diagnosticSamples(values, limit = 8) {
   return values.slice(0, limit).map((value) => diagnosticText(value, 600));
+}
+
+function visualizationAckPayloadMetadata(request) {
+  let payload;
+  try {
+    payload = JSON.parse(request.postData() ?? "null");
+  } catch {
+    return { body_valid_json: false };
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { body_valid_json: false };
+  }
+  const fields = [
+    "client_id",
+    "client_label",
+    "effective_render_mode",
+    "error",
+    "revision",
+    "status",
+    "viewport_id",
+  ];
+  return {
+    body_valid_json: true,
+    fields_present: fields.filter((field) => Object.prototype.hasOwnProperty.call(payload, field)),
+    client_id_present: typeof payload.client_id === "string" && payload.client_id.length > 0,
+    client_label_present: typeof payload.client_label === "string" && payload.client_label.length > 0,
+    viewport_id_present: typeof payload.viewport_id === "string" && payload.viewport_id.length > 0,
+    revision: Number.isSafeInteger(payload.revision) ? payload.revision : null,
+    status: ["applied", "rendered", "failed"].includes(payload.status) ? payload.status : null,
+    effective_render_mode: typeof payload.effective_render_mode === "string"
+      ? bounded(payload.effective_render_mode, 128)
+      : null,
+    error_present: typeof payload.error === "string" && payload.error.length > 0,
+  };
+}
+
+function planarMonitorRequestEvidence() {
+  return planarMonitorRequests.slice(0, 16).map((request) => ({
+    method: "GET",
+    path: planarMonitorsPath,
+    started_phase: request.startedPhase,
+    settled: request.settled,
+    outcome: request.outcome,
+    status: request.status,
+    error: request.error,
+    duration_ms: request.settledAt === null
+      ? null
+      : Math.max(0, request.settledAt - request.startedAt),
+  }));
+}
+
+async function waitForPendingPlanarMonitorRequests() {
+  const pending = planarMonitorRequests.filter((request) => !request.settled);
+  if (pending.length > 0) {
+    await withTimeout(
+      Promise.all(pending.map((request) => request.done.promise)),
+      "Initial planar-monitor GET did not settle before the synthetic status probe",
+    );
+  }
+  return {
+    pending_at_probe_start: pending.length,
+    settled_before_probe: pending.every((request) => request.settled),
+    requests: planarMonitorRequestEvidence(),
+  };
 }
 
 async function collectFailurePageDiagnostics(page, workspaceEntry) {
@@ -202,6 +273,8 @@ async function collectFailurePageDiagnostics(page, workspaceEntry) {
     console_error_messages: diagnosticSamples(consoleErrors),
     request_failure_messages: diagnosticSamples(requestFailures),
     mutation_request_messages: diagnosticSamples(mutationRequests),
+    visualization_client_acknowledgements: visualizationClientAcknowledgements.slice(0, 16),
+    planar_monitor_requests: planarMonitorRequestEvidence(),
     explorer_nodes: explorerNodes,
   };
 }
@@ -240,13 +313,27 @@ function collectRequestFailure(request, errorText) {
   const startedAt = requestStartedAt.get(request) ?? null;
   const method = request.method();
   const path = new URL(request.url()).pathname;
+  const planarMonitor = planarMonitorRequestByRequest.get(request);
+  const acknowledgement = visualizationAckByRequest.get(request);
+  if (acknowledgement) {
+    acknowledgement.outcome = "request_failed";
+    acknowledgement.error = errorText;
+  }
   const record = {
     method,
     path,
     error: errorText,
     run_elapsed_ms: Math.max(0, failedAt - runStartedAt),
     request_duration_ms: startedAt === null ? null : Math.max(0, failedAt - startedAt),
+    phase: harnessPhase,
   };
+  if (planarMonitor) {
+    planarMonitor.settled = true;
+    planarMonitor.settledAt = failedAt;
+    planarMonitor.outcome = "request-failed";
+    planarMonitor.error = errorText;
+    planarMonitor.done.resolve();
+  }
   if (teardownStartedAt !== null && method === "GET" && errorText === "net::ERR_ABORTED") {
     if (requestCancellations.length < 32) {
       requestCancellations.push({
@@ -258,7 +345,7 @@ function collectRequestFailure(request, errorText) {
     return;
   }
   collect(requestFailures, diagnosticText(
-    `${method} ${path}: ${errorText} (run +${record.run_elapsed_ms}ms; request ${record.request_duration_ms ?? "unknown"}ms)`,
+    `${method} ${path}: ${errorText} (phase ${harnessPhase}; run +${record.run_elapsed_ms}ms; request ${record.request_duration_ms ?? "unknown"}ms)`,
   ));
 }
 
@@ -482,15 +569,15 @@ function uiSnapshot() {
   };
 }
 
-async function readPanel(page, panel) {
+async function readPanel(page, panel, { select = true } = {}) {
   const node = page.locator(`.fm-explorer [role="treeitem"][data-node-id="${panel.nodeId}"]`).first();
   await node.waitFor({ state: "visible", timeout: timeoutMs });
-  if ((await node.getAttribute("aria-expanded")) === "false") {
+  if (select && (await node.getAttribute("aria-expanded")) === "false") {
     await node.scrollIntoViewIfNeeded();
     await node.dblclick({ timeout: timeoutMs });
   }
   await node.scrollIntoViewIfNeeded();
-  await node.click({ timeout: timeoutMs });
+  if (select) await node.click({ timeout: timeoutMs });
   await page.waitForFunction(
     ({ nodeId, selectionKind }) => {
       const selected = document.querySelector(`.fm-explorer [role="treeitem"][data-node-id="${nodeId}"]`);
@@ -981,6 +1068,8 @@ async function expandNode(page, nodeId) {
 }
 
 async function installResolvedNullStatusRoute(page) {
+  const planarMonitorSettlement = await waitForPendingPlanarMonitorRequests();
+  harnessPhase = "synthetic-resolved-null-status-probe";
   let preserved = false;
   await page.route(`**${statusPath}*`, async (route) => {
     if (route.request().method() !== "GET") return route.continue();
@@ -1012,7 +1101,11 @@ async function installResolvedNullStatusRoute(page) {
       && snapshot?.data?.domain?.discretization === "fem");
   }, null, { timeout: timeoutMs });
   assert(statusOverrides > 0, "Resolved-null status probe was not exercised through the application resource layer");
-  return { status_overrides: statusOverrides, other_fields_preserved: preserved };
+  return {
+    status_overrides: statusOverrides,
+    other_fields_preserved: preserved,
+    planar_monitor_settlement: planarMonitorSettlement,
+  };
 }
 
 async function triggerStableManifestRefresh(page, expectedManifest) {
@@ -1068,38 +1161,85 @@ async function exerciseInitialQualityLoading(page, expectedQuality) {
   let requestCount = 0;
   let responseStatus = null;
   let responsePreserved = false;
-  await page.route(pattern, async (route) => {
-    if (route.request().method() !== "GET") return route.continue();
-    requestCount += 1;
-    const response = await route.fetch();
-    const body = await response.body();
-    responseStatus = response.status();
-    refreshStarted.resolve();
-    await releaseRefresh.promise;
-    try {
-      responsePreserved = JSON.stringify(JSON.parse(body.toString("utf8")))
-        === JSON.stringify(expectedQuality);
-    } catch {
-      responsePreserved = false;
-    }
-    await route.fulfill({ response, body });
-  });
+  let acceptingDelayedRequests = true;
+  const pendingRouteHandlers = new Set();
+  const routeHandlerErrors = [];
+  const qualityRouteHandler = (route) => {
+    const task = (async () => {
+      if (!acceptingDelayedRequests || route.request().method() !== "GET") {
+        return route.continue();
+      }
+      requestCount += 1;
+      const response = await route.fetch();
+      const body = await response.body();
+      responseStatus = response.status();
+      refreshStarted.resolve();
+      await releaseRefresh.promise;
+      try {
+        responsePreserved = JSON.stringify(JSON.parse(body.toString("utf8")))
+          === JSON.stringify(expectedQuality);
+      } catch {
+        responsePreserved = false;
+      }
+      await route.fulfill({ response, body });
+    })();
+    const handledTask = task.then(
+      () => pendingRouteHandlers.delete(handledTask),
+      (error) => {
+        pendingRouteHandlers.delete(handledTask);
+        routeHandlerErrors.push(error);
+      },
+    );
+    pendingRouteHandlers.add(handledTask);
+    return handledTask;
+  };
   let loadingPanel;
   let loadingStatus;
+  let scenarioError = null;
+  let cleanupError = null;
+  await page.route(pattern, qualityRouteHandler);
   try {
-    await readPanel(page, panels[0]);
-    await readPanel(page, panels[1]);
+    const qualityPanel = panels.find((panel) => panel.id === "quality-gates");
+    assert(qualityPanel, "Quality Gates panel is not configured in browser QA");
+    loadingPanel = await readPanel(page, qualityPanel);
     await withTimeout(refreshStarted.promise, "First Inspector quality GET did not start");
     const pending = await waitForResourceState(page, path, ["loading"]);
     loadingStatus = pending?.status ?? null;
-    loadingPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+    loadingPanel = await readPanel(page, qualityPanel, { select: false });
     assert.equal(loadingPanel.fields["Quality resource"], "loading",
       "Quality Gates panel did not expose the first-load state");
     assert.equal(loadingPanel.fields["Airbox-scoped result"], "unknown",
       "Airbox quality panel showed a pass/fail result while its resource was loading");
+  } catch (error) {
+    scenarioError = error;
   } finally {
     releaseRefresh.resolve();
-    await page.unroute(pattern);
+    try {
+      while (pendingRouteHandlers.size > 0) {
+        await withTimeout(
+          Promise.all([...pendingRouteHandlers]),
+          "Quality route handlers did not finish after releasing the delayed response",
+        );
+      }
+      acceptingDelayedRequests = false;
+      await page.unroute(pattern, qualityRouteHandler);
+      while (pendingRouteHandlers.size > 0) {
+        await withTimeout(
+          Promise.all([...pendingRouteHandlers]),
+          "Quality route handlers did not finish after route removal",
+        );
+      }
+    } catch (error) {
+      cleanupError = error;
+    }
+  }
+  const failures = [
+    scenarioError ? `quality loading assertion: ${scenarioError.stack ?? scenarioError}` : null,
+    ...routeHandlerErrors.map((error) => `quality route handler: ${error?.stack ?? error}`),
+    cleanupError ? `quality route cleanup: ${cleanupError.stack ?? cleanupError}` : null,
+  ].filter(Boolean);
+  if (failures.length > 0) {
+    throw new Error(failures.join("\n"));
   }
   await waitForResourceState(page, path, ["ready"]);
   const recovered = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
@@ -1364,15 +1504,59 @@ async function main() {
       }
     });
     page.on("request", (request) => {
-      requestStartedAt.set(request, Date.now());
+      const startedAt = Date.now();
+      requestStartedAt.set(request, startedAt);
       const path = new URL(request.url()).pathname;
+      if (request.method() === "GET" && path === planarMonitorsPath) {
+        const monitorRequest = {
+          done: deferred(),
+          startedAt,
+          startedPhase: harnessPhase,
+          settled: false,
+          settledAt: null,
+          outcome: null,
+          status: null,
+          error: null,
+        };
+        planarMonitorRequests.push(monitorRequest);
+        planarMonitorRequestByRequest.set(request, monitorRequest);
+      }
       if (path.startsWith("/v2/sessions/current/") && !["GET", "HEAD"].includes(request.method())) {
-        collect(mutationRequests, `${request.method()} ${path}`);
+        if (request.method() === "POST" && path === visualizationClientAcksPath) {
+          const acknowledgement = {
+            path,
+            method: request.method(),
+            payload: visualizationAckPayloadMetadata(request),
+            response_status: null,
+            outcome: "pending",
+          };
+          visualizationAckByRequest.set(request, acknowledgement);
+          if (visualizationClientAcknowledgements.length < 16) {
+            visualizationClientAcknowledgements.push(acknowledgement);
+          } else {
+            collect(requestFailures, "Visualization acknowledgement evidence exceeded its 16-request bound");
+          }
+        } else {
+          collect(mutationRequests, `${request.method()} ${path}`);
+        }
       }
     });
     page.on("requestfailed", (request) =>
       collectRequestFailure(request, request.failure()?.errorText ?? "failed"));
     page.on("response", (response) => {
+      const acknowledgement = visualizationAckByRequest.get(response.request());
+      if (acknowledgement) {
+        acknowledgement.response_status = response.status();
+        acknowledgement.outcome = response.status() < 400 ? "recorded" : "http_error";
+      }
+      const monitorRequest = planarMonitorRequestByRequest.get(response.request());
+      if (monitorRequest) {
+        monitorRequest.settled = true;
+        monitorRequest.settledAt = Date.now();
+        monitorRequest.status = response.status();
+        monitorRequest.outcome = response.status() < 400 ? "response" : "http_error";
+        monitorRequest.done.resolve();
+      }
       if (response.status() >= 400) {
         const item = `${response.status()} ${response.request().method()} ${new URL(response.url()).pathname}`;
         if (syntheticQualityErrorActive
@@ -1387,6 +1571,7 @@ async function main() {
     });
 
     workspaceEntry.stage = "navigating";
+    harnessPhase = "workspace-navigation";
     const navigationResponse = await page.goto(new URL("/workspace", loopbackProxy.origin).toString(), {
       waitUntil: "domcontentloaded",
       timeout: timeoutMs,
@@ -1414,10 +1599,12 @@ async function main() {
     await page.locator("[data-node-id='model:airbox']").waitFor({ state: "visible", timeout: timeoutMs });
     await page.waitForFunction(() => Boolean(window.__FULLMAG_CONTROL_ROOM_AUDIT__?.invalidateResource), null, { timeout: timeoutMs });
     workspaceEntry.stage = "ready";
+    harnessPhase = "workspace-ready";
     assert.equal(mutationRequests.length, 0,
-      `Opening the workspace sent mutating session requests: ${mutationRequests.join(", ")}`);
+      `Opening the workspace sent unexpected authoring/solve mutations: ${mutationRequests.join(", ")}`);
 
     const status = await readResource(page.request, resourcePaths.sessionStatus, "current session status");
+    harnessPhase = "session-resource-validation";
     const authoredMethod = status.capabilities?.active_lane?.authored?.discretization ?? null;
     const activeLaneStatus = status.capabilities?.active_lane ?? null;
     const actualResolved = activeLaneStatus?.resolved?.discretization ?? null;
@@ -1462,12 +1649,15 @@ async function main() {
     await expandNode(page, "model:airbox");
     await expandNode(page, "model:airbox:mesh");
     const explorerNodes = await readExplorerNodeDiagnostics(page);
+    harnessPhase = "inspector-status-preparation";
     const nullResolution = activeLaneStatus?.resolved === null
-      ? { status_overrides: 0, other_fields_preserved: true }
+      ? { status_overrides: 0, other_fields_preserved: true, planar_monitor_settlement: null }
       : await installResolvedNullStatusRoute(page);
     assert.equal(nullResolution.other_fields_preserved, true, "Resolved-null status probe changed live API fields outside the lane");
+    harnessPhase = "initial-quality-loading";
     const initialQualityLoading = await exerciseInitialQualityLoading(page, quality);
 
+    harnessPhase = "inspector-panel-proof";
     const panelProof = [];
     for (const panel of panels) {
       panelProof.push(await readPanel(page, panel));
@@ -1512,10 +1702,21 @@ async function main() {
 
     // Return to the root to prove its DOM node survives a real GET refresh.
     await readPanel(page, panels[0]);
+    harnessPhase = "manifest-refresh";
     const refresh = await triggerStableManifestRefresh(page, manifest);
     const comparisons = deriveApiComparisons({ policy, manifest, quality, report, status, panels: panelProof });
+    harnessPhase = "quality-state-probes";
     const qualityStateProof = await exerciseQualityReadStates(page);
     assert.equal(mutationRequests.length, 0, `Browser sent mutating session requests: ${mutationRequests.join(", ")}`);
+    const solveMutationRequests = mutationRequests.filter((request) =>
+      /(?:^|\/)solve(?:\/|$)/i.test(request.slice(request.indexOf(" ") + 1)),
+    );
+    assert.equal(solveMutationRequests.length, 0, `Browser sent Solve commands: ${solveMutationRequests.join(", ")}`);
+    assert.equal(
+      visualizationClientAcknowledgements.filter((acknowledgement) => !acknowledgement.payload.body_valid_json).length,
+      0,
+      "Visualization client acknowledgement did not carry valid JSON metadata",
+    );
     assert.equal(pageErrors.length, 0, `Browser page errors: ${pageErrors.join(" | ")}`);
     assert.equal(consoleErrors.length, 0, `Browser console errors: ${consoleErrors.join(" | ")}`);
     assert.equal(requestFailures.length, 0, `Browser request failures: ${requestFailures.join(" | ")}`);
@@ -1531,13 +1732,17 @@ async function main() {
         source: actualResolved === null ? "live-session-status" : "single-field-status-route-overlay",
         status_overrides: nullResolution.status_overrides,
         only_active_lane_resolved_changed: nullResolution.other_fields_preserved,
+        planar_monitor_settlement: nullResolution.planar_monitor_settlement,
         domain_discretization: status.domain.discretization,
         domain_generation_id: status.domain.generation_id,
         mesh_revision: status.resources.mesh_revision,
         topology_revision: status.resources.topology_revision,
       },
       generic_unknown_header_rejected: true,
-      no_mutating_requests: true,
+      no_authoring_mutations: true,
+      no_solve_commands: solveMutationRequests.length === 0,
+      visualization_client_acknowledgements: visualizationClientAcknowledgements,
+      planar_monitor_requests: planarMonitorRequestEvidence(),
       canvas,
       workspace_entry: { ...workspaceEntry },
       explorer_nodes: explorerNodes,
@@ -1563,6 +1768,8 @@ async function main() {
       synthetic_http_errors: syntheticQualityHttpErrors,
       synthetic_console_errors: syntheticQualityConsoleErrors,
       resource_responses: resourceResponses,
+      visualization_client_acknowledgements: visualizationClientAcknowledgements,
+      planar_monitor_requests: planarMonitorRequestEvidence(),
       inspector_proof: proof,
     };
     resultPayload = output;
@@ -1583,6 +1790,8 @@ async function main() {
       synthetic_http_errors: syntheticQualityHttpErrors,
       synthetic_console_errors: syntheticQualityConsoleErrors,
       resource_responses: resourceResponses,
+      visualization_client_acknowledgements: visualizationClientAcknowledgements,
+      planar_monitor_requests: planarMonitorRequestEvidence(),
       error: diagnosticText(error?.stack ?? error, 2048),
       failure_diagnostics: failureDiagnostics,
       browser_route: loopbackProxy ? {

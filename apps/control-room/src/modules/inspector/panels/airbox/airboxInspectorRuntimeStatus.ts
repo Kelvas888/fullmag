@@ -7,11 +7,12 @@ import {
   type SessionAuthoringMethodDescription,
   type SessionDiscretizationCapabilitiesProjection,
 } from "@/kernel/resources/sessionDiscretization";
-import type { MeshSharedDomainManifestResource } from "@/kernel/api/apiTypes";
 import { shouldLoadRuntimeMeshManifest } from "@/kernel/resources/studyRuntimeResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import type { Selection } from "@/kernel/selection/selectionTypes";
 import { isExplicitFdmStudy } from "../StudyGlobalAuthoringModel";
+
+export { matchesAirboxTopologyIdentity } from "@/kernel/resources/meshTopologyIdentity";
 
 export type AirboxInspectorRuntimeStatus = {
   authoring: SessionAuthoringMethodDescription;
@@ -137,29 +138,6 @@ export function shouldLoadAirboxMeshManifest(
   return (
     shouldLoadRuntimeMeshManifest(enabled, status) ||
     (enabled && hasPublishedFemTopologyInspectionLane(status))
-  );
-}
-
-export function matchesAirboxTopologyIdentity(
-  status: AirboxInspectorRuntimeStatus | null | undefined,
-  manifest: MeshSharedDomainManifestResource | null | undefined,
-): boolean {
-  if (!manifest || resolveSessionTopologyDiscretization(status) !== "fem") {
-    return false;
-  }
-  const generationId = status?.domain.generation_id;
-  const cellCount = status?.domain.cell_count;
-  const domainGenerationId = status?.resources.domain_generation_id;
-  const meshRevision = status?.resources.mesh_revision;
-  const topologyRevision = status?.resources.topology_revision;
-  return (
-    typeof generationId === "string" && generationId.length > 0 &&
-    generationId === domainGenerationId &&
-    generationId === manifest.generation_id &&
-    typeof cellCount === "number" && Number.isSafeInteger(cellCount) && cellCount > 0 &&
-    typeof meshRevision === "number" && Number.isSafeInteger(meshRevision) && meshRevision > 0 &&
-    typeof topologyRevision === "number" && Number.isSafeInteger(topologyRevision) && topologyRevision > 0 &&
-    String(manifest.revision) === String(meshRevision)
   );
 }
 

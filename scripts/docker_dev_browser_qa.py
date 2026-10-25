@@ -1240,8 +1240,30 @@ def _parse_airbox_inspector_result(
             or proof.get("authored_method") != "fem"
             or proof.get("published_fem_with_unresolved_runtime") is not True
             or proof.get("generic_unknown_header_rejected") is not True
-            or proof.get("no_mutating_requests") is not True):
+            or proof.get("no_authoring_mutations") is not True
+            or proof.get("no_solve_commands") is not True):
         raise BuildControlError("Airbox Inspector helper did not prove the published FEM inspection case")
+    acknowledgements = proof.get("visualization_client_acknowledgements")
+    if not isinstance(acknowledgements, list) or len(acknowledgements) > 16:
+        raise BuildControlError("Airbox Inspector visualization acknowledgements are malformed")
+    for acknowledgement in acknowledgements:
+        if not isinstance(acknowledgement, Mapping):
+            raise BuildControlError("Airbox Inspector visualization acknowledgement is malformed")
+        metadata = acknowledgement.get("payload")
+        status = acknowledgement.get("response_status")
+        if (acknowledgement.get("method") != "POST"
+                or acknowledgement.get("path") != "/v2/sessions/current/visualization/client-acks"
+                or acknowledgement.get("outcome") != "recorded"
+                or type(status) is not int or not 200 <= status < 300
+                or not isinstance(metadata, Mapping)
+                or metadata.get("body_valid_json") is not True
+                or metadata.get("client_id_present") is not True
+                or metadata.get("viewport_id_present") is not True
+                or metadata.get("status") not in {"applied", "rendered"}
+                or metadata.get("error_present") is not False
+                or type(metadata.get("revision")) is not int
+                or metadata["revision"] < 0):
+            raise BuildControlError("Airbox Inspector recorded an invalid or failed visualization acknowledgement")
     unresolved = proof.get("unresolved_status_probe")
     if (not isinstance(unresolved, Mapping)
             or unresolved.get("only_active_lane_resolved_changed") is not True

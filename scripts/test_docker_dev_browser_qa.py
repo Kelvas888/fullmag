@@ -52,7 +52,9 @@ def _airbox_inspector_result_fixture(qa):
         "authored_method": "fem",
         "published_fem_with_unresolved_runtime": True,
         "generic_unknown_header_rejected": True,
-        "no_mutating_requests": True,
+        "no_authoring_mutations": True,
+        "no_solve_commands": True,
+        "visualization_client_acknowledgements": [],
         "unresolved_status_probe": {
             "only_active_lane_resolved_changed": True,
             "domain_discretization": "fem",
@@ -1074,6 +1076,30 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
         self.assertEqual(parsed["inspector_proof"]["synthetic_quality_fault_injection"]["evidence_kind"],
                          "fault-injected-ui-only-not-scientific")
 
+        acknowledged = deepcopy(payload)
+        acknowledgement = {
+            "method": "POST",
+            "path": "/v2/sessions/current/visualization/client-acks",
+            "outcome": "recorded", "response_status": 200,
+            "payload": {"body_valid_json": True, "client_id_present": True,
+                        "viewport_id_present": True, "status": "rendered",
+                        "error_present": False, "revision": 7},
+        }
+        acknowledged["inspector_proof"]["visualization_client_acknowledgements"] = [acknowledgement]
+        self.qa._parse_airbox_inspector_result(
+            encoded(acknowledged), public_url, browser_url, script_sha256,
+        )
+        for invalid in (
+            {**acknowledgement, "path": "/v2/sessions/current/simulation/commands"},
+            {**acknowledgement, "outcome": "pending", "response_status": None},
+            {**acknowledgement, "payload": {**acknowledgement["payload"], "status": "failed"}},
+        ):
+            acknowledged["inspector_proof"]["visualization_client_acknowledgements"] = [invalid]
+            with self.assertRaises(self.qa.BuildControlError):
+                self.qa._parse_airbox_inspector_result(
+                    encoded(acknowledged), public_url, browser_url, script_sha256,
+                )
+
         generic_header = deepcopy(payload)
         generic_header["inspector_proof"]["panels"][0]["header"] = "Inspector"
         with self.assertRaises(self.qa.BuildControlError):
@@ -1167,6 +1193,7 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
                 "PortBindings": None,
                 "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=256m"},
                 "CapDrop": ["ALL"],
+                "GroupAdd": qa._script_bind_groups(ROOT),
                 "SecurityOpt": ["no-new-privileges:true"],
                 "ExtraHosts": None,
             },
@@ -1238,6 +1265,10 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
         writable_mount["Mounts"][0]["RW"] = True
         with self.assertRaises(qa.ControlOutcomeUnknown):
             qa._validate_browser_helper(writable_mount, FakeControl(), identity, "fullmag-frontend-state", browser_id, 0, ROOT)
+        wrong_read_group = deepcopy(document)
+        wrong_read_group["HostConfig"]["GroupAdd"] = qa._script_bind_groups(ROOT) + ["99999999"]
+        with self.assertRaises(qa.ControlOutcomeUnknown):
+            qa._validate_browser_helper(wrong_read_group, FakeControl(), identity, "fullmag-frontend-state", browser_id, 0, ROOT)
 
     def test_control_volume_preflight_is_read_only_and_fail_closed_when_absent(self):
         qa = self.qa
@@ -1494,6 +1525,11 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             "probe_url": "http://frontend:8080",
             "playwright_version": "1.62.1",
             "browser_gpu_mode": "swiftshader-webgl-requested",
+            "canvas_only": False,
+            "expect_live_field": None,
+            "expect_airbox_vectors": False,
+            "qa_scope": "full-browser-qa",
+            "skipped_areas": [],
             "home_round_trip": True,
             "session": {
                 "session_id": "session-1",
@@ -1506,6 +1542,28 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             "page_errors": 0,
             "console_errors": 0,
             "request_failures": 0,
+            "http_errors": [],
+            "viewport_dom_observations": {
+                "field_data_proven": False,
+                "note": self.qa.VIEWPORT_DOM_OBSERVATIONS_NOTE,
+                "before_home": {
+                    "dataset": {},
+                    "quantity_labels": [],
+                    "dataset_entry_count": 0,
+                    "quantity_label_count": 0,
+                    "dataset_truncated": False,
+                    "quantity_labels_truncated": False,
+                },
+                "after_home": {
+                    "dataset": {},
+                    "quantity_labels": [],
+                    "dataset_entry_count": 0,
+                    "quantity_label_count": 0,
+                    "dataset_truncated": False,
+                    "quantity_labels_truncated": False,
+                },
+            },
+            "resource_responses": [],
         }
         encoded = lambda value: (json.dumps(value) + "\n").encode("utf-8")
         self.assertEqual(self.qa._parse_result(encoded(payload), payload["public_url"], payload["probe_url"]), payload)
@@ -1544,7 +1602,9 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             "canvas_dom_stable",
         ):
             self.assertIn(required, text)
-        self.assertNotIn("screenshot", text.lower())
+        self.assertIn("const captureCanvasScreenshot = async", text)
+        live_field_result = text.split("...(expectedLiveField ? {", 1)[1].split("} : {}),", 1)[0]
+        self.assertIn("canvas_screenshot: await captureCanvasScreenshot(page, after)", live_field_result)
         self.assertNotIn('http://127.0.0.1:32871', text.split("const publicUrl", 1)[1].split("const probeUrl", 1)[0])
         self.assertNotIn("CONTROL_ROOM_SMOKE_ALLOW_MISSING_SESSION", text)
 
