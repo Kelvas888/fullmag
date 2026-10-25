@@ -543,10 +543,14 @@ describe("buildModelTree", () => {
     const airbox = universe?.children?.find((node) => node.id === "model:airbox");
 
     expect(airbox).toMatchObject({
+      availability: "available",
+      executionState: "not_started",
       id: "model:airbox",
       kind: "airbox.root",
       label: "Airbox",
       parentId: "model:universe",
+      resourceState: "stale",
+      statusReason: "Published FEM mesh has no source-scene provenance; freshness is unknown.",
     });
     expect(airbox?.children?.map(({ id, kind, label, parentId }) => ({
       id,
@@ -569,6 +573,12 @@ describe("buildModelTree", () => {
     ]);
 
     const mesh = airbox?.children?.[0];
+    expect(mesh).toMatchObject({
+      availability: "available",
+      executionState: "not_started",
+      resourceState: "stale",
+      statusReason: "Published FEM mesh has no source-scene provenance; freshness is unknown.",
+    });
     expect(mesh?.children?.map(({ id, kind, label, parentId }) => ({
       id,
       kind,

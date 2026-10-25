@@ -3,9 +3,12 @@ import {
   describeSessionAuthoringDiscretization,
   projectFlatActiveLaneDiscretization,
   resolveSessionDiscretization,
+  resolveSessionTopologyDiscretization,
   type SessionAuthoringMethodDescription,
   type SessionDiscretizationCapabilitiesProjection,
 } from "@/kernel/resources/sessionDiscretization";
+import type { MeshSharedDomainManifestResource } from "@/kernel/api/apiTypes";
+import { shouldLoadRuntimeMeshManifest } from "@/kernel/resources/studyRuntimeResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import type { Selection } from "@/kernel/selection/selectionTypes";
 import { isExplicitFdmStudy } from "../StudyGlobalAuthoringModel";
@@ -14,10 +17,16 @@ export type AirboxInspectorRuntimeStatus = {
   authoring: SessionAuthoringMethodDescription;
   capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
     SessionDiscretizationCapabilitiesProjection;
-  domain: Pick<LiveStatusResource["domain"], "discretization">;
+  domain: Pick<
+    LiveStatusResource["domain"],
+    "cell_count" | "discretization" | "generation_id"
+  >;
   resources: Pick<
     LiveStatusResource["resources"],
-    "mesh_build_revision" | "mesh_revision"
+    | "domain_generation_id"
+    | "mesh_build_revision"
+    | "mesh_revision"
+    | "topology_revision"
   >;
 };
 
@@ -41,11 +50,15 @@ export function selectAirboxInspectorRuntimeStatus(status: {
       ...(flatLane ? { active_lane_discretization: flatLane.value } : {}),
     },
     domain: {
+      cell_count: status.data.domain?.cell_count,
       discretization: status.data.domain?.discretization ?? "",
+      generation_id: status.data.domain?.generation_id,
     },
     resources: {
+      domain_generation_id: status.data.resources.domain_generation_id,
       mesh_build_revision: status.data.resources.mesh_build_revision,
       mesh_revision: status.data.resources.mesh_revision,
+      topology_revision: status.data.resources.topology_revision,
     },
   };
 }
@@ -89,10 +102,64 @@ export function airboxInspectorRuntimeStatusEquals(
       next.capabilities.active_lane_discretization &&
     previous.capabilities.explicit_topology ===
       next.capabilities.explicit_topology &&
+    previous.domain.cell_count === next.domain.cell_count &&
     previous.domain.discretization === next.domain.discretization &&
+    previous.domain.generation_id === next.domain.generation_id &&
+    previous.resources.domain_generation_id ===
+      next.resources.domain_generation_id &&
     previous.resources.mesh_build_revision ===
       next.resources.mesh_build_revision &&
-    previous.resources.mesh_revision === next.resources.mesh_revision
+    previous.resources.mesh_revision === next.resources.mesh_revision &&
+    previous.resources.topology_revision === next.resources.topology_revision
+  );
+}
+
+/**
+ * A published FEM topology can be inspected while runtime resolution is
+ * pending only when the thin status snapshot carries a complete matching
+ * generation/cell/revision identity. This projection never resolves solver
+ * capabilities or enables build/solve commands.
+ */
+export function hasPublishedFemTopologyInspectionLane(
+  status: AirboxInspectorRuntimeStatus | null | undefined,
+): boolean {
+  return (
+    status?.authoring.method === "fem" &&
+    resolveSessionDiscretization(status) === null &&
+    resolveSessionTopologyDiscretization(status) === "fem"
+  );
+}
+
+export function shouldLoadAirboxMeshManifest(
+  enabled: boolean,
+  status: AirboxInspectorRuntimeStatus | null | undefined,
+): boolean {
+  return (
+    shouldLoadRuntimeMeshManifest(enabled, status) ||
+    (enabled && hasPublishedFemTopologyInspectionLane(status))
+  );
+}
+
+export function matchesAirboxTopologyIdentity(
+  status: AirboxInspectorRuntimeStatus | null | undefined,
+  manifest: MeshSharedDomainManifestResource | null | undefined,
+): boolean {
+  if (!manifest || resolveSessionTopologyDiscretization(status) !== "fem") {
+    return false;
+  }
+  const generationId = status?.domain.generation_id;
+  const cellCount = status?.domain.cell_count;
+  const domainGenerationId = status?.resources.domain_generation_id;
+  const meshRevision = status?.resources.mesh_revision;
+  const topologyRevision = status?.resources.topology_revision;
+  return (
+    typeof generationId === "string" && generationId.length > 0 &&
+    generationId === domainGenerationId &&
+    generationId === manifest.generation_id &&
+    typeof cellCount === "number" && Number.isSafeInteger(cellCount) && cellCount > 0 &&
+    typeof meshRevision === "number" && Number.isSafeInteger(meshRevision) && meshRevision > 0 &&
+    typeof topologyRevision === "number" && Number.isSafeInteger(topologyRevision) && topologyRevision > 0 &&
+    String(manifest.revision) === String(meshRevision)
   );
 }
 

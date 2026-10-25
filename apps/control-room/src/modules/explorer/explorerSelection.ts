@@ -522,8 +522,16 @@ export function selectionRefFromNode(node: ExplorerNode): SelectionRef | null {
       node.kind === "airbox.root" ||
       node.kind === "airbox.multilayer.target";
     return {
+      ...(node.availability ? { availability: node.availability } : {}),
+      ...(node.contractGap !== undefined
+        ? { contractGap: node.contractGap }
+        : node.statusReason
+          ? { contractGap: node.statusReason }
+          : {}),
+      ...(node.executionState ? { executionState: node.executionState } : {}),
       kind: node.kind,
       nodeId: node.id,
+      ...(node.resourceState ? { resourceState: node.resourceState } : {}),
       type: "airbox",
       visualizationTargetId:
         !isPublicAirboxVisualization &&

@@ -968,6 +968,28 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
   }, [activeTab, baseNodes, kernel, nodes, selectedNodeId, selectedRef]);
 
   useEffect(() => {
+    if (
+      !modelTabActive ||
+      selectedRef?.type !== "airbox" ||
+      !selectedNodeId
+    ) {
+      return;
+    }
+    const currentNode = resolveCurrentExplorerSelectionNode(
+      baseNodes,
+      selectedNodeId,
+      selectedRef,
+      baseNodes,
+    );
+    if (!currentNode || !currentNode.kind.startsWith("airbox.")) return;
+    const currentRef = selectionRefFromNode(currentNode);
+    if (selectionRefEquals(selectedRef, currentRef)) return;
+    // Refresh only the selected node's resource facets. Selection identity and
+    // inspector routing remain stable as mesh resources invalidate.
+    selectExplorerNode(kernel, currentNode, "explorer");
+  }, [baseNodes, kernel, modelTabActive, selectedNodeId, selectedRef]);
+
+  useEffect(() => {
     const unsubscribe = subscribeExplorerTextureLoadNodeRequested(
       kernel.bus,
       (event) => {

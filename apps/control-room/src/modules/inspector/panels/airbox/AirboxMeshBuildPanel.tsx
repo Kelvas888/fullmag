@@ -12,7 +12,10 @@ import type { InspectorPanelProps } from "../../inspectorTypes";
 import { AirboxFieldRow as FieldRow } from "./airboxDisplay";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { useAirboxInspectorRuntimeStatus } from "./airboxInspectorRuntimeStatus";
-import { buildAirboxMeshBuildModel } from "./airboxMeshInspectorModel";
+import {
+  buildAirboxMeshBuildModel,
+  currentAirboxReportEvidence,
+} from "./airboxMeshInspectorModel";
 
 export function AirboxMeshBuildPanel({ selection }: InspectorPanelProps) {
   void selection;
@@ -22,12 +25,19 @@ export function AirboxMeshBuildPanel({ selection }: InspectorPanelProps) {
   const current = useMeshBuildCurrent({ enabled: buildEnabled });
   const latest = useMeshBuildLatestSuccessful({ enabled: buildEnabled });
   const scene = useSceneResource({ enabled: buildEnabled });
+  const currentMeshRevision = runtimeStatus?.resources.mesh_revision ?? null;
+  const currentReport = currentAirboxReportEvidence(
+    report,
+    currentMeshRevision !== null,
+    currentMeshRevision,
+  );
   const lifecycle = buildAirboxMeshBuildModel({
     current: current.data ?? null,
-    currentSceneRevision:
-      scene.data?.scene_revision ?? scene.data?.revision ?? null,
+    currentSceneRevision: scene.status === "ready" && !scene.error
+      ? scene.data?.scene_revision ?? scene.data?.revision ?? null
+      : null,
     latest: latest.data ?? null,
-    report: report.data ?? null,
+    report: currentReport,
   });
 
   return (
