@@ -11647,3 +11647,84 @@ Skrypty zachowują odpowiednio SHA256
 Dowody: surface-public-integration-20261024/example-lowering/ w tym samym
 wolumenie kontrolnym. Wygenerowane IR mają wyłącznie nową metodę z kompletną
 polityką i bez magnetów. Nie uruchomiono Solve; native H nadal NOT VERIFIED.
+
+
+(antenna-cold-rt0-moments-v2)=
+### Walidacja cold-load: momenty RT0 a zaokrąglone ślady J — 25.10.2026
+
+Dokładny kontrprzykład na pierwszym Tet4 siatki benchmarku wykazał błąd
+walidatora, a nie nowy model fizyczny. Zadane współczynniki
+$(0,1/8,-1/4,1/8)\,\mathrm A$ dają dokładnie zerowy moment przez ścianę
+przeciwległą do pierwszego wierzchołka. Po jednorazowym zaokrągleniu śladów J
+do binary64 naiwny iloczyn przez normalną daje około
+$-5.8912\times10^{-18}\,\mathrm A$. Porównanie względem samych znoszących się
+strumieni odrzuca go przy około $10^{-18}\,\mathrm A$. To niezależny
+kontrprzykład tej kontroli na rzeczywistej geometrii, nie odzysk wartości
+nieudanego natywnego rozwiązania.
+
+Kanoniczne momenty fizyczne pozostają właścicielem bilansu. Dla dodatnio
+zorientowanego straight Tet4 i generic RT0 zachowujemy tożsamość
+`antenna-retained-rt0-exact-point-current` oraz:
+
+```{math}
+:label: antenna-cold-rt0-moment-reconstruction
+c_{Ti}=2s_{Ti}\Phi_{F_i},\qquad
+\mathbf J_T(\mathbf r)=
+\frac{\sum_{i=0}^{3}c_{Ti}(\mathbf r-\mathbf v_{Ti})}
+     {|\det(\mathbf v_{T1}-\mathbf v_{T0},\mathbf v_{T2}-\mathbf v_{T0},\mathbf v_{T3}-\mathbf v_{T0})|}.
+```
+
+| Symbol | Znaczenie | Jednostka SI |
+|---|---|---|
+| $T$, $i$ | Komórka i lokalny indeks przeciwległego wierzchołka $0,\ldots,3$ | $1$ |
+| $F_i$ | Ściana przeciwległa do wierzchołka $i$ | $1$ |
+| $\mathbf v_{Ti}$, $\mathbf r$ | Wierzchołek i punkt próbkowania | $\mathrm m$ |
+| $c_{Ti}$ | Współczynnik generic RT0 ze znakiem; nie fizyczny strumień | $\mathrm A$ |
+| $\Phi_{F_i}$ | Fizyczny strumień w orientacji rosnących stable vertex IDs | $\mathrm A$ |
+| $s_{Ti}$ | Znak przejścia od normalnej kanonicznej do outward normal komórki | $1$ |
+| $\mathbf J_T$ | Prąd RT0 z kanonicznych momentów | $\mathrm{A\,m^{-2}}$ |
+| $u$ | Dotychczasowa epsilon binary64, $2^{-52}$ | $1$ |
+
+Znak wyznacza parzystość permutacji stable IDs względem outward table
+`(123),(032),(013),(021)` dodatnio zorientowanego Tet4. Iloczyn generic basis
+przez outward surface ma dokładnie moment $1/2$; stąd czynnik 2. Ten sam
+wynik daje natywne `geometric_face_weights`. Wszystkie współrzędne i momenty
+binary64 traktujemy jako dokładne liczby wymierne podczas rekonstrukcji.
+Każdy zapisany komponent J musi odpowiadać rekonstrukcji w istniejącym
+budżecie $64u$ względnego błędu próbki, bez absolutnego flooru. Zachowujemy
+również wcześniejszy test wspólnej afiniczności i interpolacji środka.
+Nie zwiększamy tego budżetu ani fizycznych gates certyfikatu.
+
+`verify_balance_certificate` sprawdza potem fizyczne bilanse, outward flux,
+pary źródła, izolację, rangę i residuals względem kanonicznych momentów,
+a nie ponownie całkuje prezentacyjne ślady J. Nie wolno użyć tej funkcji
+bez wcześniejszego `verify_owned_geometry`, które wiąże wszystkie ślady
+z tymi momentami. Nie ma wygładzania nodal J, korekcji strumieni ani
+ponownego solve.
+
+| Prywatne wejście kontroli | Typ / domyślnie | SI | Walidacja i destination |
+|---|---|---|---|
+| points | $4\times3$ binary64 / wymagane | $\mathrm m$ | finite, dodatni niezerowy exact determinant; zachowana kolejność Tet4; brak nowego ProblemIR |
+| vertex_ids | 4 uint64 / wymagane | $1$ | istniejące unikalne stable IDs nośnika; brak nowego ProblemIR |
+| currents | 12 binary64 / wymagane | $\mathrm{A\,m^{-2}}$ | cell-local4 XYZ, finite, zgodność z exact RT0 w istniejącym budżecie; brak nowego ProblemIR |
+| fluxes | mapa sorted 3 IDs → binary64 / wymagane | $\mathrm A$ | kompletne istniejące canonical face records, finite, bez zmiany kolejności lub podpisów; brak nowego ProblemIR |
+
+Zakres: cold validation wyników FEM CPU. Native FEM CPU nie zmienia
+równań ani rozwiązania. FDM CPU/FDM GPU/FEM GPU nie otrzymują nowej
+realizacji ani kwalifikacji. Publiczny Python, ProblemIR, planner,
+requested/resolved, schemat bundle v2, jednostki i hashe pozostają bez zmian.
+Starsze i nowe archiwa przechodzą ten sam globalny walidator; nie ma wyjątku
+dla jednego pola lub konkretnego wyniku.
+
+| Twierdzenie | Ścieżka + symbol | Dowód i ograniczenia |
+|---|---|---|
+| Rekonstrukcja z momentów | `crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2.rs` + `verify_rt0_sample_moments` | źródło wymaga buildu/runtime; exact counterexample w wolumenie kontrolnym |
+| Zachowanie fizycznego certyfikatu | `crates/fullmag-runner/src/antenna_field_solution/closed_loop_balance_v2.rs` + `verify_balance_certificate` | niezmienione fizyczne gates; runtime NOT VERIFIED |
+| Natywny moment i ślady | `backends/fem/cpu/mfem/transport/affine_rt0_element.cpp` + `AffineRt0Element::face_moment`, `AffineRt0Element::retained_current_at` | obecna dokładna definicja; nie nowy solver |
+
+Pierwszy publiczny benchmark zakończył się odmową certyfikatu/J. Nie ma
+przyjętego H ani pomiaru przyspieszenia. Kontrprzykład Fraction jest wykonany;
+kompilacja i rzeczywiste ponowienie z zamrożonymi wejściami pozostają do
+wykonania. Nie kompilujemy natywnych testów jednostkowych. Podstawą naukową
+pozostają definicja RT0 i bibliografia kanonicznego rozdziału wyżej; nowa
+kontrola nie dodaje aproksymacji modelu.

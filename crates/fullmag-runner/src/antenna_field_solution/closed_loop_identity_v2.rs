@@ -197,6 +197,63 @@ fn verify_rt0_sample_affinity(points: &[[f64; 3]; 4], currents: &[f64; 12]) -> R
     require(slope_interval.is_some(), "RT0 interpolation pivot")
 }
 
+
+// Canonical face moments retain the RT0 DOFs; rounded display traces do not.
+// Reconstruct the exact field before applying the existing per-sample budget.
+fn verify_rt0_sample_moments(
+    points: &[[f64; 3]; 4],
+    vertex_ids: &[u64; 4],
+    currents: &[f64; 12],
+    fluxes: &BTreeMap<[u64; 3], f64>,
+) -> Result<(), RunError> {
+    let zero = BigRational::from_integer(BigInt::from(0));
+    let two = BigRational::from_integer(BigInt::from(2));
+    let budget = BigRational::new(BigInt::from(64), BigInt::from(1) << 52_usize);
+    let mut coordinates: [[BigRational; 3]; 4] =
+        std::array::from_fn(|_| std::array::from_fn(|_| zero.clone()));
+    for local in 0..4 {
+        for axis in 0..3 {
+            coordinates[local][axis] = BigRational::from_float(points[local][axis])
+                .ok_or_else(|| invalid("nonfinite RT0 moment coordinate"))?;
+        }
+    }
+    let edges: [[BigRational; 3]; 3] = std::array::from_fn(|i|
+        std::array::from_fn(|k| &coordinates[i + 1][k] - &coordinates[0][k]));
+    let determinant = &edges[0][0] * (&edges[1][1] * &edges[2][2] - &edges[1][2] * &edges[2][1])
+        - &edges[0][1] * (&edges[1][0] * &edges[2][2] - &edges[1][2] * &edges[2][0])
+        + &edges[0][2] * (&edges[1][0] * &edges[2][1] - &edges[1][1] * &edges[2][0]);
+    require(determinant > zero, "nonpositive exact RT0 moment determinant")?;
+    let outward = [[1, 2, 3], [0, 3, 2], [0, 1, 3], [0, 2, 1]];
+    let mut coefficients: [BigRational; 4] = std::array::from_fn(|_| zero.clone());
+    for opposite in 0..4 {
+        let order = outward[opposite];
+        let mut ids = order.map(|i| vertex_ids[i]);
+        let inversions = usize::from(ids[0] > ids[1]) + usize::from(ids[0] > ids[2])
+            + usize::from(ids[1] > ids[2]);
+        ids.sort_unstable();
+        let flux = *fluxes.get(&ids).ok_or_else(|| invalid("missing RT0 moment face"))?;
+        let coefficient = BigRational::from_float(flux)
+            .ok_or_else(|| invalid("nonfinite RT0 face moment"))? * &two;
+        coefficients[opposite] = if inversions % 2 == 0 { coefficient } else { -coefficient };
+    }
+    for local in 0..4 {
+        for axis in 0..3 {
+            let mut numerator = zero.clone();
+            for i in 0..4 {
+                numerator += &coefficients[i] * (&coordinates[local][axis] - &coordinates[i][axis]);
+            }
+            let expected = numerator / &determinant;
+            let sample = BigRational::from_float(currents[3 * local + axis])
+                .ok_or_else(|| invalid("nonfinite RT0 moment sample"))?;
+            let magnitude = if sample < zero { -sample.clone() } else { sample.clone() };
+            let error = &budget * magnitude;
+            require(expected >= &sample - &error && expected <= &sample + &error,
+                "J samples differ from canonical RT0 moments")?;
+        }
+    }
+    Ok(())
+}
+
 fn verify_owned_geometry(source: &ClosedLoopAcceptedSourceInputV2,
     by_id: &BTreeMap<u64,usize>, faces: &BTreeMap<[u64;3],f64>, owners: &BTreeMap<[u64;3],Vec<usize>>,
     cut_pairs: &[([u64;3],[u64;3])]) -> Result<(),RunError> {
@@ -221,6 +278,7 @@ fn verify_owned_geometry(source: &ClosedLoopAcceptedSourceInputV2,
             require(cell.center_current_xyz_apm2[axis].is_finite() && (mean-cell.center_current_xyz_apm2[axis]).abs()<=128.0*f64::EPSILON*j_scale,"cell-local J interpolation mismatch")?;
         }
         verify_rt0_sample_affinity(&points, &cell.vertex_current_xyz_apm2)?;
+        verify_rt0_sample_moments(&points, &cell.vertex_ids, &cell.vertex_current_xyz_apm2, faces)?;
         let mut outward_fluxes=Vec::new();
         for opposite in 0..4 {
             let mut ids=cell.vertex_ids.iter().enumerate().filter_map(|(i,id)|(i!=opposite).then_some(*id)).collect::<Vec<_>>(); ids.sort_unstable();

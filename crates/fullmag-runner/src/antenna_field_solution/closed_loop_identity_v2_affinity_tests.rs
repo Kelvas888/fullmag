@@ -1,4 +1,5 @@
-use super::verify_rt0_sample_affinity;
+use super::{verify_rt0_sample_affinity, verify_rt0_sample_moments};
+use std::collections::BTreeMap;
 
 const UNIT_TET: [[f64; 3]; 4] = [
     [0.0, 0.0, 0.0],
@@ -129,4 +130,43 @@ fn nonfinite_and_extreme_inconsistent_inputs_fail_closed_without_float_overflow(
     currents[4] = -f64::MAX;
     assert!(verify_rt0_sample_affinity(&UNIT_TET, &currents).is_err());
     assert!(verify_rt0_sample_affinity(&[[0.0; 3]; 4], &[0.0; 12]).is_err());
+}
+
+
+// Independent Fraction evaluation of coefficients (0, 1/8, -1/4, 1/8) A
+// on an actual benchmark Tet4. The exact first-face moment is zero.
+const MOMENT_POINTS: [[f64; 3]; 4] = [
+    [1.5058082349688059e-6, 3.1514364492491983e-10, 1e-7],
+    [1.647926299341373e-6, 1.0453407445066876e-9, 1e-7],
+    [1.4999999999999996e-6, -9.999999999999994e-8, -4.163336342344337e-23],
+    [1.5058106326571492e-6, 1.4416104806800113e-10, -1.0000000000000001e-7],
+];
+const MOMENT_J: [f64; 12] = [
+    -6747487252645.16, -8830172301893.402, -0.0030736851685839953,
+    -6747487252645.16, -8830172301893.402, -0.0030736851685839953,
+    -6747487252645.16, -8830172301893.402, -0.0030736851685839953,
+    -6747487252645.16, -8830172301893.402, -0.0030736851685839953,
+];
+fn golden_moments() -> BTreeMap<[u64; 3], f64> {
+    BTreeMap::from([([2, 3, 4], 0.0), ([1, 3, 4], -0.0625),
+        ([1, 2, 4], -0.125), ([1, 2, 3], -0.0625)])
+}
+
+#[test]
+fn canonical_moments_bind_rounded_tangential_current() {
+    assert!(verify_rt0_sample_moments(&MOMENT_POINTS, &[1, 2, 3, 4], &MOMENT_J, &golden_moments()).is_ok());
+    // Reversing stable IDs reverses each canonical face normal, not the field.
+    let reversed = BTreeMap::from([([1, 2, 3], 0.0), ([1, 2, 4], 0.0625),
+        ([1, 3, 4], 0.125), ([2, 3, 4], 0.0625)]);
+    assert!(verify_rt0_sample_moments(&MOMENT_POINTS, &[4, 3, 2, 1], &MOMENT_J, &reversed).is_ok());
+}
+
+#[test]
+fn affine_current_and_face_moments_cannot_be_changed_independently() {
+    let doubled = MOMENT_J.map(|value| 2.0 * value);
+    assert!(verify_rt0_sample_affinity(&MOMENT_POINTS, &doubled).is_ok());
+    assert!(verify_rt0_sample_moments(&MOMENT_POINTS, &[1, 2, 3, 4], &doubled, &golden_moments()).is_err());
+    let mut moments = golden_moments();
+    moments.insert([1, 3, 4], -0.125);
+    assert!(verify_rt0_sample_moments(&MOMENT_POINTS, &[1, 2, 3, 4], &MOMENT_J, &moments).is_err());
 }

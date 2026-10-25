@@ -4006,7 +4006,9 @@ impl HostResourceLedger {
         )?;
         let bytes =
             read_bounded_regular_file(&self.root, HOST_RESOURCE_LEDGER_FILE, MAX_LEDGER_BYTES)?;
-        let document = self.validate_document_snapshot(&marker, &bytes)?;
+        // A publisher may retire the old CAS while this lock-free read validates it.
+        // Recheck the pointer before treating a validation error as durable corruption.
+        let validation = self.validate_document_snapshot(&marker, &bytes);
         let current_marker = read_bounded_regular_file(
             &self.root,
             HOST_RESOURCE_LEDGER_MARKER_FILE,
@@ -4018,6 +4020,7 @@ impl HostResourceLedger {
             return Err(anyhow::Error::new(crate::writer::StoreWriterBusy)
                 .context("host ledger observation changed during validation"));
         }
+        let document = validation?;
         Ok(HostResourceLedgerSnapshot {
             policy_history_sha256: document.policy_history_sha256()?,
             policy: document.policy,

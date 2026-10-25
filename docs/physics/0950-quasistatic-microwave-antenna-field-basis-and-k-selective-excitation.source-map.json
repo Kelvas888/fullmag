@@ -1768,6 +1768,24 @@
       "latex": "$g$",
       "meaning": "skończony współczynnik stopniowania rozmiaru siatki większy od jeden",
       "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-cold-rt0-c",
+      "latex": "c_{Ti}",
+      "meaning": "Współczynnik generic RT0 ze znakiem",
+      "si_unit": "\\mathrm A"
+    },
+    {
+      "id": "antenna-cold-rt0-phi",
+      "latex": "\\Phi_{F_i}",
+      "meaning": "Fizyczny strumień w orientacji rosnących stable vertex IDs",
+      "si_unit": "\\mathrm A"
+    },
+    {
+      "id": "antenna-cold-rt0-sign",
+      "latex": "s_{Ti}",
+      "meaning": "Znak przejścia od normalnej kanonicznej do outward normal komórki",
+      "si_unit": "1"
     }
   ],
   "equations": [
@@ -3358,6 +3376,18 @@
       "sources": [
         "antenna-retained-rt0-exact-sampling-prereg",
         "antenna-rt0-common-affine-admission-owner"
+      ]
+    },
+    {
+      "id": "antenna-cold-rt0-moment-reconstruction",
+      "symbols": [
+        "antenna-cold-rt0-c",
+        "antenna-cold-rt0-phi",
+        "antenna-cold-rt0-sign"
+      ],
+      "sources": [
+        "antenna-cold-rt0-moments-owner",
+        "antenna-cold-rt0-certificate-owner"
       ]
     }
   ],
@@ -8467,6 +8497,27 @@
       "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_public_inspection.rs",
       "symbol": "inspection_view",
       "responsibility": "Po pełnej walidacji bundle cienkie API mapuje 14 znanych liczników surface na nazwane skalary; oryginalny manifest/evidence bez zmiany.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-cold-rt0-moments-owner",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2.rs",
+      "symbol": "verify_rt0_sample_moments",
+      "responsibility": "Dokładna rekonstrukcja lokalnego RT0 z kanonicznych momentów i niezmieniony budżet64EPS próbek; runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-cold-rt0-certificate-owner",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_balance_v2.rs",
+      "symbol": "verify_balance_certificate",
+      "responsibility": "Fizyczny certyfikat względem owned canonical moments po niezależnej kontroli śladów J; niezmienione gates, runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-cold-rt0-moments-regression",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_identity_v2_affinity_tests.rs",
+      "symbol": "canonical_moments_bind_rounded_tangential_current",
+      "responsibility": "Golden exact Fraction, zmiana stable IDs i niezależna zmiana J/momentów; przygotowany test Rust, nie skompilowano ani nie wykonano.",
       "evidence_status": "source_only"
     }
   ],
