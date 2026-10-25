@@ -469,6 +469,37 @@ class SavedAuthoringRestartTests(IsolatedReceiptTests):
         dev._saved_authoring_validate_services(pin, actual, quiesced=True)
         dev._saved_authoring_validate_probe(proof, pin, scene)
 
+    def test_accepts_public_authoring_source_without_rebinding_preserved_script(self):
+        import hashlib, json
+        from docker_build_control import canonical
+        for source_path in ('project/source.py', 'project/source/script.py'):
+            with self.subTest(source_path=source_path):
+                dev, pin, scene, _, files, pack, _, _ = self.fixture()
+                manifest = json.loads(files['manifest/project.json'])
+                manifest['source'] = source_path
+                if source_path == 'project/source.py':
+                    files[source_path] = b'# Canonical source regenerated from the edited scene\n'
+                files['manifest/project.json'] = canonical(manifest)
+                raw = pack(files)
+                pin['archive'].update(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                self.assertEqual(dev._saved_authoring_validate_archive(raw, pin['archive']), scene)
+
+    def test_refuses_missing_or_foreign_manifest_authoring_source(self):
+        import hashlib, json
+        from docker_build_control import canonical
+        for source_path in ('project/source.py', 'project/foreign.py'):
+            with self.subTest(source_path=source_path):
+                dev, pin, _, _, files, pack, _, _ = self.fixture()
+                manifest = json.loads(files['manifest/project.json'])
+                manifest['source'] = source_path
+                if source_path == 'project/foreign.py':
+                    files[source_path] = b'# Unrecognized source path\n'
+                files['manifest/project.json'] = canonical(manifest)
+                raw = pack(files)
+                pin['archive'].update(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                with self.assertRaises(BuildControlError):
+                    dev._saved_authoring_validate_archive(raw, pin['archive'])
+
     def test_refuses_changed_saved_bytes_and_runtime_or_duplicate_archive_entries(self):
         import hashlib, io, zipfile
         dev, pin, _, raw, files, pack, _, _ = self.fixture()
