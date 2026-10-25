@@ -146,6 +146,9 @@ jobs:
       - name: Run disconnected mixed-P1 v2 API summary contracts
         run: cargo test -p fullmag-api --bin fullmag-api mixed_v2_summary_tests --no-fail-fast
 
+      - name: Run instance discovery contracts (ADR 0069)
+        run: cargo test -p fullmag-api --bin fullmag-api instance_discovery::tests --no-fail-fast
+
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast
 
