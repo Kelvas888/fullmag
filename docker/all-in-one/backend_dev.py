@@ -5572,6 +5572,14 @@ def _serve(extra: list[str]) -> int:
         files=len(actual_artifacts),
         duration_ms=round((time.monotonic() - package_started) * 1000),
     )
+    source = receipt.get("source")
+    if (not isinstance(source, Mapping) or not isinstance(source.get("resolved_commit"), str)
+            or not GIT_OBJECT_RE.fullmatch(source["resolved_commit"])):
+        _fail("runtime package receipt has no pinned source commit")
+    native = _validate_native_identity(receipt.get("native_source_identity"), source["resolved_commit"])
+    if (source.get("source_snapshot_sha256") != native["source_snapshot_sha256"]
+            or receipt.get("native_source_identity_sha256") != _sha256_bytes(_canonical(native))):
+        _fail("runtime package source snapshot identity differs from its receipt")
     receipt_sha256 = _sha256_bytes(receipt_bytes)
     if os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == WINDOWS_FOLDER_STORAGE_PROFILE:
         _log_phase("gate", "start", profile=WINDOWS_FOLDER_STORAGE_PROFILE)
@@ -5623,6 +5631,10 @@ def _serve(extra: list[str]) -> int:
             "FULLMAG_RUNTIME_PACKAGE_ROOT": str(PACKAGE_ROOT),
             "FULLMAG_PACKAGE_PROVENANCE": str(PROVENANCE_PATH),
             "FULLMAG_RUNTIME_PROVENANCE": str(PROVENANCE_PATH),
+            # Python mesh caches must use the same verified source identity as the binaries.
+            "FULLMAG_SOURCE_GIT_COMMIT": native["head_commit_full"],
+            "FULLMAG_SOURCE_SNAPSHOT_SHA256": native["source_snapshot_sha256"],
+            "FULLMAG_SOURCE_WORKTREE_STATE": "dirty" if native["source_snapshot_dirty"] else "clean",
             "FULLMAG_WEB_STATIC_DIR": str(PACKAGE_ROOT / "web"),
             "PATH": f"{PACKAGE_ROOT / 'bin'}:/opt/fullmag-deps/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin",
         }

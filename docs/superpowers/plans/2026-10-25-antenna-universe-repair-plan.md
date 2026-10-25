@@ -362,3 +362,28 @@ manifest, raporty i `result.json` z niezaliczonymi kontrolami.
 **Bramka 1/5 nadal otwarta: dwie potwierdzone rozbieżności publicznego
 przepływu oraz kontrola UI NOT VERIFIED.** Pełne pole Universe nadal
 nieobliczone.
+
+### P12 — przekazanie tożsamości źródeł do runtime
+
+Potwierdzono brak trzech zmiennych tożsamości w `_serve`, mimo ich
+przekazania do kompilacji przez `_build_environment`. Poprawka w
+`docker/all-in-one/backend_dev.py::_serve` bierze commit, hash snapshotu
+oraz stan dirty ze zweryfikowanego receiptu pakietu. Sprawdza zgodność
+rekordu source, native_source_identity i jego hasha przed uruchomieniem API;
+wartość odziedziczona z procesu nie może zastąpić tożsamości pakietu.
+Aktualny receipt działającej grupy zawiera wymagane pola. Poprawka nie
+usuwa cache ani nie zmienia równań, tolerancji lub formatu siatki.
+
+Regresja przed zmianą: brak hasha oraz odziedziczony obcy hash przechodziły
+do handoffu; niespójność receiptu nie była odrzucana. Po zmianie 5/5 testów
+interpretowanego Pythona przeszło w stałym backendzie grupy (0.397 s).
+Zakres: brak/obcy hash, niespójny receipt, istniejący start Compose,
+uszkodzony manifest i odrębny storage probe. Handoff procesu i delegacja
+cgroup były mockowane; nie uruchamiano ani nie zatrzymywano usługi.
+Dowody: `verification/antenna-universe-mesh-audit-20261025/cache-source-identity/`
+(`red.log`, `green.log`) w wolumenie kontrolnym.
+
+**Wdrożenie i skutek dla publicznego przygotowania: NOT VERIFIED.**
+Helper należy do obrazu; wymaga zarządzanej aktualizacji obrazu grupy,
+a następnie sprawdzenia środowiska API i metryk nowej siatki. Nie wolno
+uznać tych testów za dowód usunięcia błędu jednostek w działającej sesji.

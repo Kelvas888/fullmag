@@ -610,6 +610,47 @@ class BackendPackageTests(unittest.TestCase):
             finally:
                 backend.PACKAGE_ROOT = original_package_root
 
+    def test_serve_exports_receipt_source_identity_for_mesh_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, records = self._published_package(root)
+            _, manifest = self._live_manifest(root)
+            receipt = self._receipt_for_manifest(records, manifest, self._toolchain_fixture())
+            backend._write_json(output / "backend-build-receipt.json", receipt, "test receipt")
+            for inherited in (None, "e" * 64):
+                with (
+                    self.subTest(inherited=inherited),
+                    patch.object(backend, "PACKAGE_ROOT", output),
+                    patch.dict(os.environ, {}, clear=True),
+                    patch("worker_cgroup_gate.wait_for_delegation", return_value={"state": "ready"}),
+                    patch.object(backend.os, "execvpe") as handoff,
+                ):
+                    if inherited is not None:
+                        os.environ["FULLMAG_SOURCE_SNAPSHOT_SHA256"] = inherited
+                    self.assertEqual(backend._serve([]), 0)
+                    environment = handoff.call_args.args[2]
+                    self.assertEqual(environment.get("FULLMAG_SOURCE_SNAPSHOT_SHA256"), "d" * 64)
+                    self.assertEqual(environment.get("FULLMAG_SOURCE_GIT_COMMIT"), "a" * 40)
+                    self.assertEqual(environment.get("FULLMAG_SOURCE_WORKTREE_STATE"), "clean")
+
+    def test_serve_rejects_inconsistent_source_identity_before_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, records = self._published_package(root)
+            _, manifest = self._live_manifest(root)
+            receipt = self._receipt_for_manifest(records, manifest, self._toolchain_fixture())
+            receipt["source"]["source_snapshot_sha256"] = "e" * 64
+            backend._write_json(output / "backend-build-receipt.json", receipt, "test receipt")
+            with (
+                patch.object(backend, "PACKAGE_ROOT", output),
+                patch.dict(os.environ, {}, clear=True),
+                patch("worker_cgroup_gate.wait_for_delegation", return_value={"state": "ready"}),
+                patch.object(backend.os, "execvpe") as handoff,
+            ):
+                with self.assertRaisesRegex(backend.BackendBuildError, "source snapshot"):
+                    backend._serve([])
+                handoff.assert_not_called()
+
     def test_development_compose_selects_receipt_validated_backend_start(self):
         repository = Path(__file__).resolve().parents[1]
         development_compose = (repository / "compose.dev.yaml").read_text(encoding="utf-8")
@@ -641,14 +682,10 @@ class BackendPackageTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output, records = self._published_package(Path(directory))
+            _, source_manifest = self._live_manifest(Path(directory))
             backend._write_json(
                 output / "backend-build-receipt.json",
-                {
-                    "schema": backend.RECEIPT_SCHEMA,
-                    "state": "succeeded",
-                    "execution_lanes": {lane: {} for lane in backend.LANES},
-                    "artifacts": records,
-                },
+                self._receipt_for_manifest(records, source_manifest, self._toolchain_fixture()),
                 "test backend build receipt",
             )
             original_package_root = backend.PACKAGE_ROOT
