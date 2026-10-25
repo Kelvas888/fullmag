@@ -73,6 +73,19 @@ export function formatTabRoute(route: Exclude<TabRoute, { kind: "default" }>): s
 }
 
 /**
+ * The address of `route` that keeps the query parameters a tab address does
+ * not own, such as diagnostic flags read on load. Only `port` is replaced.
+ */
+export function tabRouteHref(route: Exclude<TabRoute, { kind: "default" }>, search: string): string {
+  const [pathname, ownQuery = ""] = formatTabRoute(route).split("?");
+  const params = new URLSearchParams(search);
+  params.delete("port");
+  for (const [key, value] of new URLSearchParams(ownQuery)) params.set(key, value);
+  const query = params.toString();
+  return query ? `${pathname}?${query}` : pathname;
+}
+
+/**
  * Which tab an address names, regardless of the session it shows: a renamed
  * or replaced session stays in the same tab.
  */

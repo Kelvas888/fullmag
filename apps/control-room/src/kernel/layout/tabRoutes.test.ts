@@ -8,6 +8,7 @@ import {
   resolveTabRoute,
   sessionSlug,
   tabRouteChangePushes,
+  tabRouteHref,
 } from "./tabRoutes";
 
 function instance(port: number, name: string | null, isSelf = false): DiscoveredInstance {
@@ -49,6 +50,18 @@ describe("tab addresses", () => {
     expect(formatTabRoute({ kind: "session", slug: "rings-fdm", port: null })).toBe("/session/rings-fdm");
     expect(formatTabRoute({ kind: "session", slug: "rings-fdm", port: 3219 })).toBe("/session/rings-fdm?port=3219");
     expect(formatTabRoute({ kind: "instance", port: 3201 })).toBe("/instance/3201");
+  });
+
+  it("keeps query parameters the tab address does not own", () => {
+    const session = { kind: "session", slug: "rings", port: null } as const;
+    expect(tabRouteHref(session, "")).toBe("/session/rings");
+    expect(tabRouteHref(session, "?inspectorRealtimeFixture=1")).toBe(
+      "/session/rings?inspectorRealtimeFixture=1",
+    );
+    expect(tabRouteHref({ ...session, port: 3219 }, "?debug=1&port=3198")).toBe(
+      "/session/rings?debug=1&port=3219",
+    );
+    expect(tabRouteHref({ kind: "home" }, "?port=3198")).toBe("/home");
   });
 
   it("names the tab the strip has in front", () => {

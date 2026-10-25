@@ -10,10 +10,10 @@ import { instanceTabLabel } from "./instanceTabModel";
 import { instanceTabs, isEmbeddedInstanceTab, useInstanceTabs } from "./instanceTabs";
 import {
   activeTabRoute,
-  formatTabRoute,
   parseTabRoute,
   resolveTabRoute,
   tabRouteChangePushes,
+  tabRouteHref,
   tabRouteKey,
   type TabRoute,
   type TabRouteAction,
@@ -110,7 +110,7 @@ export function TabRouteSync() {
     if (route.kind === "instance" && byPort === null && tabRouteKey(shown) === tabRouteKey(route)) {
       return;
     }
-    const href = formatTabRoute(route);
+    const href = tabRouteHref(route, window.location.search);
     if (href === `${window.location.pathname}${window.location.search}`) return;
     if (!correction && tabRouteChangePushes(shown, route, openPorts)) {
       window.history.pushState(null, "", href);
