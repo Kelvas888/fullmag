@@ -293,6 +293,10 @@ function readGlobalQuality(quality) {
   return value.global ?? null;
 }
 
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function uiSnapshot() {
   const root = document.querySelector('[data-inspector-owner="airbox-inspector"]');
   if (!root) return null;
@@ -300,7 +304,8 @@ function uiSnapshot() {
   const groups = [...root.querySelectorAll('[data-slot="inspector-group"]')];
   const groupRows = groups.map((section) => {
     const group = section.querySelector('[data-slot="inspector-group-heading"] h3, [data-slot="inspector-group-header"] h3, [data-slot="inspector-group-trigger"] h3, [data-slot="inspector-group-trigger"] span')?.textContent?.trim() ?? "";
-    const rows = [...section.querySelectorAll(".fm-inspector-field-row")];
+    const rows = [...section.querySelectorAll(".fm-inspector-field-row")]
+      .filter((row) => row.closest('[data-slot="inspector-group"]') === section);
     const fields = Object.fromEntries(rows.map((row) => {
       const label = row.querySelector(".fm-inspector-field-row__label")?.textContent?.trim() ?? "";
       const value = row.querySelector(".fm-inspector-field-row__value")?.textContent?.trim() ?? "";
@@ -363,6 +368,11 @@ async function readPanel(page, panel) {
     required_group: panel.requiredGroup,
     fields: group.fields,
     units: group.units,
+    groups: snapshot.groupRows.map(({ group: groupName, fields, units }) => ({
+      group: groupName,
+      fields,
+      units,
+    })),
     verified: true,
   };
 }
@@ -380,10 +390,66 @@ function numberFromText(text) {
   return match ? Number(match[0]) : null;
 }
 
+function groupFields(panelProof, panelId, groupName) {
+  const record = panelProof.find((entry) => entry.id === panelId);
+  assert(record, `Missing panel proof ${panelId}`);
+  const group = record.groups?.find((item) => item.group === groupName);
+  assert(group, `${panelId} did not publish the ${groupName} group`);
+  return group.fields;
+}
+
+function groupValue(panelProof, panelId, groupName, label) {
+  const fields = groupFields(panelProof, panelId, groupName);
+  const value = fields[label];
+  assert(typeof value === "string", `${panelId}.${groupName} did not publish ${label}`);
+  return value;
+}
+
+function labelledNumber(text, label) {
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const numericToken = "(-?(?:\\d[\\d,]*(?:\\.\\d*)?|\\.\\d+)(?:e[+-]?\\d+)?)";
+  const match = String(text).match(new RegExp(`(?:^|[;,]\\s*)${escapedLabel}\\s+${numericToken}`, "i"));
+  return match ? Number(match[1].replaceAll(",", "")) : null;
+}
+
+function displayTolerance(expected, significantDigits = null) {
+  const magnitude = Math.abs(expected);
+  if (magnitude === 0) return 0;
+  if (significantDigits !== null) {
+    const roundingStep = 10 ** (Math.floor(Math.log10(magnitude)) - significantDigits + 1);
+    return roundingStep / 2 + Number.EPSILON * magnitude * 4;
+  }
+  return Math.max(Number.MIN_VALUE, magnitude * 1e-12);
+}
+
+function assertDisplayedMetricNumber(text, label, expected, description, significantDigits = null) {
+  assert(typeof expected === "number" && Number.isFinite(expected), `${description} API value is not finite`);
+  const actual = labelledNumber(text, label);
+  const tolerance = displayTolerance(expected, significantDigits);
+  assert(actual !== null && Math.abs(actual - expected) <= tolerance,
+    `${description} UI value ${actual ?? "missing"} differs from API ${expected} (tolerance ${tolerance})`);
+}
+
+function assertDisplayedMetricFields(text, metric, fields, description, significantDigits = null) {
+  let comparisons = 0;
+  for (const [apiField, displayLabel] of fields) {
+    const expected = metric?.[apiField];
+    if (typeof expected !== "number" || !Number.isFinite(expected)) continue;
+    assertDisplayedMetricNumber(text, displayLabel, expected, `${description}.${apiField}`, significantDigits);
+    comparisons += 1;
+  }
+  return comparisons;
+}
+
 function assertDisplayedCount(panelProof, panelId, group, label, expected) {
   assert(Number.isSafeInteger(expected) && expected >= 0, `API did not publish ${label}`);
   const actualText = fieldValue(panelProof, panelId, group, label);
-  assert.equal(numberFromText(actualText), expected, `${panelId}.${label} differs from API-derived count`);
+  assertDisplayedCountText(actualText, expected, `${panelId}.${label}`);
+}
+
+function assertDisplayedCountText(actualText, expected, description) {
+  assert(Number.isSafeInteger(expected) && expected >= 0, `API did not publish ${description}`);
+  assert.equal(numberFromText(actualText), expected, `${description} differs from API-derived count`);
 }
 
 function deriveApiComparisons({ policy, manifest, quality, report, status, panels: panelProof }) {
@@ -452,17 +518,149 @@ function deriveApiComparisons({ policy, manifest, quality, report, status, panel
   assert.equal(structuralScope, "airbox", "Quality Gates scope row is not Airbox-specific");
   const globalQuality = readGlobalQuality(quality);
   assert(globalQuality && typeof globalQuality === "object", "Universe quality resource omitted the quality statistics scope");
-  const statsScope = fieldValue(panelProof, "statistics", "statistics", "Scope");
+  const statsScope = groupValue(panelProof, "statistics", "Airbox Quality Distributions", "Scope");
   const qualityLabel = typeof globalQuality.label === "string" ? globalQuality.label : "Airbox endpoint scope";
   assert.equal(statsScope, qualityLabel, "Statistics panel quality scope differs from the API");
   const statsMarker = globalQuality.marker == null ? "not published" : String(globalQuality.marker);
-  assert.equal(fieldValue(panelProof, "statistics", "statistics", "Marker"), statsMarker);
+  assert.equal(groupValue(panelProof, "statistics", "Airbox Quality Distributions", "Marker"), statsMarker);
   if (typeof qualityRecord.quality_source === "string") {
-    assert.equal(fieldValue(panelProof, "statistics", "statistics", "Quality source"), qualityRecord.quality_source);
+    assert.equal(groupValue(panelProof, "statistics", "Airbox Quality Distributions", "Quality source"), qualityRecord.quality_source);
   }
   if (globalQuality.element_count != null) {
-    assertDisplayedCount(panelProof, "statistics", "statistics", "Elements in quality statistics", globalQuality.element_count);
+    assertDisplayedCountText(
+      groupValue(panelProof, "statistics", "Airbox Quality Distributions", "Elements in quality statistics"),
+      globalQuality.element_count,
+      "statistics.Elements in quality statistics",
+    );
   }
+
+  const reportRecord = report.report ?? {};
+  const sharedInterfaceNodeCount = reportRecord.shared_interface_node_count;
+  if (sharedInterfaceNodeCount !== undefined && sharedInterfaceNodeCount !== null) {
+    assertDisplayedCountText(
+      groupValue(panelProof, "statistics", "Airbox Mesh Statistics", "Shared interface nodes"),
+      sharedInterfaceNodeCount,
+      "statistics.Shared interface nodes",
+    );
+  }
+
+  const sizeDistributionSpecs = [
+    ["Equivalent tetrahedral size", "characteristic_size"],
+    ["Edge length", "edge_length"],
+    ["Element volume", "volume"],
+  ];
+  let sizeDistributionComparisons = 0;
+  for (const [label, apiKey] of sizeDistributionSpecs) {
+    const distribution = globalQuality[apiKey];
+    if (!isRecord(distribution)) continue;
+    const hasDistribution = ["min", "mean", "max", "std", "ratio"]
+      .some((key) => typeof distribution[key] === "number" && Number.isFinite(distribution[key]))
+      || (Array.isArray(distribution.histogram) && distribution.histogram.length > 0);
+    if (!hasDistribution) continue;
+    const text = groupValue(panelProof, "statistics", "Airbox Quality Distributions", label);
+    const comparisons = assertDisplayedMetricFields(
+      text,
+      distribution,
+      [["min", "min"], ["mean", "mean"], ["max", "max"]],
+      `statistics.${label}`,
+    );
+    sizeDistributionComparisons += comparisons;
+    const expectedUnit = apiKey === "volume" ? "m³" : "m";
+    const actualUnit = panelProof.find((entry) => entry.id === "statistics")?.groups
+      ?.find((item) => item.group === "Airbox Quality Distributions")?.units?.[label];
+    assert.equal(actualUnit, expectedUnit, `Statistics unit differs for ${label}`);
+  }
+  assert(sizeDistributionComparisons > 0, "No displayed size-distribution min/mean/max values were compared with the quality API");
+
+  let qualityMetricComparisons = 0;
+  let percentileComparisons = 0;
+  for (const [id, label] of [["sicn", "SICN"], ["gamma", "Gamma"]]) {
+    const metric = globalQuality[id];
+    if (!isRecord(metric)) continue;
+    const hasMetric = ["min", "mean", "max", "p05"]
+      .some((key) => typeof metric[key] === "number" && Number.isFinite(metric[key]))
+      || (Array.isArray(metric.histogram) && metric.histogram.length > 0);
+    if (!hasMetric) continue;
+    const text = groupValue(panelProof, "statistics", "Airbox Quality Distributions", label);
+    const comparisons = assertDisplayedMetricFields(
+      text,
+      metric,
+      [["min", "min"], ["mean", "mean"], ["below_threshold_count", "Below target"]],
+      `statistics.${label}`,
+    );
+    qualityMetricComparisons += comparisons;
+  }
+
+  const qualityFamilies = globalQuality.quality_by_family;
+  assert(isRecord(qualityFamilies), "Universe quality scope omitted quality_by_family");
+  const familyRows = Object.entries(qualityFamilies).filter(([, value]) => isRecord(value));
+  assert(familyRows.length > 0, "Universe quality scope did not publish any family rows");
+  for (const [family, familyRecord] of familyRows) {
+    const familyGroup = `${family} quality`;
+    const fields = groupFields(panelProof, "statistics", familyGroup);
+    if (typeof familyRecord.cell_count === "number") {
+      assertDisplayedCountText(fields["Cell count"], familyRecord.cell_count, `statistics.${familyGroup}.Cell count`);
+    }
+    for (const [apiKey, displayLabel] of [
+      ["sicn", "SICN"],
+      ["gamma", "Gamma"],
+      ["mixed_topology_scaled_jacobian", "Mixed-topology scaled Jacobian"],
+    ]) {
+      const metric = familyRecord[apiKey];
+      const text = fields[displayLabel];
+      assert(typeof text === "string", `Statistics ${familyGroup} did not publish ${displayLabel}`);
+      if (!isRecord(metric)) {
+        assert.equal(text, "not published", `${familyGroup}.${displayLabel} should remain unpublished`);
+        continue;
+      }
+      if (metric.status === "unavailable") {
+        assert(text.startsWith("unavailable"), `${familyGroup}.${displayLabel} hid API unavailability`);
+        if (typeof metric.reason === "string" && metric.reason.length > 0) {
+          assert(text.includes(metric.reason.slice(0, 128)), `${familyGroup}.${displayLabel} reason differs from the API`);
+        }
+        continue;
+      }
+      const hasNumericMetric = ["min", "p05", "mean", "max", "threshold"]
+        .some((key) => typeof metric[key] === "number" && Number.isFinite(metric[key]));
+      const available = metric.status === "available"
+        || (apiKey === "mixed_topology_scaled_jacobian" && metric.status == null && hasNumericMetric);
+      if (!available) {
+        assert.equal(text, "unknown", `${familyGroup}.${displayLabel} fabricated a metric value`);
+        continue;
+      }
+      const comparisons = assertDisplayedMetricFields(
+        text,
+        metric,
+        [["min", "min"], ["p05", "p05"], ["mean", "mean"], ["max", "max"], ["threshold", "threshold"]],
+        `${familyGroup}.${displayLabel}`,
+        4,
+      );
+      qualityMetricComparisons += comparisons;
+      if (typeof metric.p05 === "number" && Number.isFinite(metric.p05)) {
+        percentileComparisons += 1;
+      }
+    }
+  }
+
+  let gateMetricComparisons = 0;
+  for (const check of Array.isArray(gates.checks) ? gates.checks : []) {
+    if (!isRecord(check) || typeof check.id !== "string") continue;
+    const text = fieldValue(panelProof, "quality-gates", "quality-gates", check.id);
+    const expectedStatus = check.status === "pass" || check.status === "fail" ? check.status : "unknown";
+    assert(text.startsWith(`${expectedStatus};`), `Quality gate ${check.id} status differs from the API`);
+    if (typeof check.value === "number" && Number.isFinite(check.value)) {
+      assertDisplayedMetricNumber(text, "value", check.value, `quality-gates.${check.id}.value`);
+      gateMetricComparisons += 1;
+    }
+    if (typeof check.threshold === "number" && Number.isFinite(check.threshold)) {
+      const comparisonLabel = typeof check.comparison === "string" ? check.comparison : "comparison not published";
+      assertDisplayedMetricNumber(text, comparisonLabel, check.threshold, `quality-gates.${check.id}.threshold`);
+      gateMetricComparisons += 1;
+    }
+  }
+  qualityMetricComparisons += gateMetricComparisons;
+  assert(qualityMetricComparisons > 0, "No available quality metrics were compared with their API values");
+  assert(percentileComparisons > 0, "No available quality percentile was compared with the API");
 
   const policyConfig = policy.config ?? {};
   const effective = policy.effective_config ?? {};
@@ -513,7 +711,8 @@ function deriveApiComparisons({ policy, manifest, quality, report, status, panel
       && Math.abs(value - expected[index]) <= Math.max(1e-15, Math.abs(expected[index]) * 1e-9)),
     `Topology ${label} differs from the published SI bounds`);
   }
-  const statisticsUnits = panelProof.find((entry) => entry.id === "statistics")?.units ?? {};
+  const statisticsUnits = panelProof.find((entry) => entry.id === "statistics")?.groups
+    ?.find((item) => item.group === "Airbox Quality Distributions")?.units ?? {};
   for (const [label, expectedUnit] of [["Equivalent tetrahedral size", "m"], ["Edge length", "m"], ["Element volume", "m³"]]) {
     if (statisticsUnits[label] !== undefined) {
       assert.equal(statisticsUnits[label], expectedUnit, `Statistics unit differs for ${label}`);
@@ -529,7 +728,6 @@ function deriveApiComparisons({ policy, manifest, quality, report, status, panel
   );
   const buildIdentity = panelProof.find((entry) => entry.id === "build")?.build_identity;
   assert(buildIdentity?.verified === true, "Airbox Build panel did not match published build resources");
-  const reportRecord = report.report ?? {};
   return {
     airbox_carrier_count: airboxParts.length,
     canonical_carrier_id: canonical.id,
@@ -550,6 +748,10 @@ function deriveApiComparisons({ policy, manifest, quality, report, status, panel
     quality_check_count: Array.isArray(gates.checks) ? gates.checks.length : 0,
     quality_statistics_scope: qualityLabel,
     quality_statistics_marker: statsMarker,
+    shared_interface_node_count: safeCount(sharedInterfaceNodeCount),
+    size_distribution_numeric_comparisons: sizeDistributionComparisons,
+    quality_metric_numeric_comparisons: qualityMetricComparisons,
+    quality_percentile_comparisons: percentileComparisons,
     report_status: reportRecord.status ?? null,
     policy_revision: policy.revision,
     quality_revision: quality.revision,
