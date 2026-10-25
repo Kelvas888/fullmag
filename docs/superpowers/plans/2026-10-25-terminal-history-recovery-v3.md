@@ -116,3 +116,95 @@ mount i provenance dotychczasowego backendu bez zmian.
 
 Odczyt silnika na tym hoście: Docker Engine `29.7.2`, API `1.55`.
 Wersja nie jest blokadą `volume-subpath`; sama nowa recepta nadal NOT VERIFIED.
+
+## Zarządzany widok diagnostyczny kandydata
+
+Przygotowano `just docker-dev-candidate-history` oraz kontroler
+`scripts/docker_candidate_history.py`. Recepta wymaga pełnych pinów źródła,
+backendu, obrazu, zakończonego recovery-build i receiptu kandydata. Nie buduje,
+nie promuje pakietu i nie uruchamia API ani Solve.
+
+Kontroler sprawdza terminalną authority builda, marker Ready i pełny inventory
+kandydata oraz diagnostyczny stan donora. BuildControl serializuje operację
+`candidate-history`. Techniczny helper tej samej grupy otrzymuje:
+
+- readonly subpath istniejącego package volume pod `/opt/fullmag/package`;
+- readonly główny control volume oraz osobny zapisywalny subpath operacji jako
+  `/opt/fullmag/control/backend`, aby kanoniczny producent wystawił provenance
+  tego kandydata bez zmiany globalnego provenance donora;
+- oryginalne dane i grant Linux, bez zmiany owner tokenów, markerów lub `.env`;
+- RW SessionStore i host ledger wyłącznie dla wymaganych natywnych blokad.
+  Bajty całego naukowego SessionStore (bez technicznego aliasu runtime-services)
+  są porównywane przed odczytami i po nich; owner/process/config/provenance i
+  ledger donora również muszą pozostać identyczne;
+- brak `/build`, socketu Docker i sieci; root filesystem readonly. Sterownik
+  CUDA jest dostępny do załadowania zależności CLI. W WSL dopuszczony jest
+  most `/dev/dxg`; raport zapisuje faktyczną topologię, bez twierdzenia o izolacji GPU.
+
+Package/provenance w helperze przechodzą dotychczasową bramkę storage bez
+zmiany walidatora Rust. Natywna komenda pozostaje odczytowa. Wynik przechowuje
+rozróżnienie sukcesu diagnostyki i dowodu każdego runu; brakujący lub niespójny
+run nie tworzy częściowej listy gotowej do recovery. Trzy negatywne przypadki
+muszą dotrzeć do oczekiwanych bramek, nie tylko zwrócić dowolny błąd.
+
+Audyt writerów: host nie kopiuje źródeł/pakietów ani nie zapisuje artefaktów
+buildu do storage. Scope, logi, prywatne provenance i wynik pozostają w control
+volume. Pakiet jest RO. Kontroler nie ma operacji usuwania, rotacji, promocji,
+admission ani zmiany stanu ownera. Helper jest efemeryczną diagnostyką, a nie
+alternatywnym builderem lub runtime aplikacji. Timeout zachowuje nieznany wynik
+operacji BuildControl; nie powoduje automatycznego ponowienia.
+
+Interpretowane regresje nowej topologii i stałego argv oraz dotychczasowego
+recovery: 30 PASS (`candidate-view-tests.json` w katalogu verification v3).
+Nie kompilowano testów native. Rzeczywisty wynik nowej recepty wymaga jeszcze
+odczytu terminalnego receiptu; nie utożsamiamy testów topologii z działającym
+preflightem danych ani z recovery.
+
+## Diagnoza środowiska sterownika WSL
+
+Pierwsza próba ujawniła brak zachowania VolumeOptions.Subpath; poprawiono
+kopiowanie aliasów i dodano regresję. Kolejna zachowała 5737 plików store,
+lecz 14 komend zatrzymało ładowanie libcuda.so.1, zanim weszły do CLI.
+Runtime NVIDIA z NVIDIA_VISIBLE_DEVICES=none dostarczył bibliotekę, lecz
+WSL udostępnia /dev/dxg również w tej konfiguracji. To nie dowodzi braku
+dostępu do GPU. Kontroler zapisuje kernel i urządzenia, dopuszcza wyłącznie
+pustą listę albo dxg na kernelu Microsoft, i nadal uruchamia tylko stałą
+komendę odczytową. Nie uruchamia API, workera ani Solve.
+
+## Wynik rzeczywistej próby i checkpoint
+
+Próba `d6be2a86e8824ed9a232d6087b36bc6d` zakończyła się
+`failed-confirmed`, bez promocji, recovery, API i Solve. Sterownik załadowano;
+raport potwierdza kernel Microsoft WSL2 i wyłącznie most `dxg`.
+`native-observations.json`, `store-before.json` i `store-after.json` pozostają
+w `candidate-history/attempts/d6be2a86e8824ed9a232d6087b36bc6d` wolumenu
+kontrolnego grupy.
+
+Porównanie wszystkich plików wykazało dokładnie jedną zmianę:
+`WRITER.owner.json` w korzeniu SessionStore. To doradczy zapis blokady
+technicznej, tworzony przez kanoniczny writer przy wejściu i wyjściu.
+Pozostałe 5736 plików, w tym wyniki naukowe, zachowały identyczne SHA256.
+Nie osłabiono kontroli inventory: helper nadal odmawia przy tej zmianie.
+Dodatkowa kontrola donora potwierdziła niezmienione przypięte bajty
+owner/process/config/provenance i ledgera (`donor-retention.json`).
+
+Każdy z 14 runów odmówił w bramce `Linux native probe is not bound to this
+owner/mount/namespace`. Dowód `.linux-native-probe.json` został rzeczywiście
+wystawiony dla namespace backendu; nowy namespace nie może go dziedziczyć.
+Nie zmieniono tego dowodu, nie sfałszowano namespace ani wyników testów probe.
+Negatywne przypadki złego config SHA i niebezpiecznego run_id trafiły we
+właściwe bramki; brakujący run pozostaje niezweryfikowany z powodu wcześniejszej
+odmowy namespace. Nie ma gotowych pinów recovery (0/14).
+
+Ta recepta jest narzędziem diagnostycznym z zachowaną odmową, a nie
+zakwalifikowaną trasą odczytu historii. Dalsza poprawka wymaga kanonicznego,
+izolowanego producenta probe dla namespace diagnostyki bez nadpisania dowodu
+działającego backendu oraz rozdzielenia kontroli technicznych metadanych writera
+od niezmienności naukowych plików. Nie ponawiać tej samej trasy bez takiej zmiany.
+
+W tym checkpointcie: 5 interpretowanych regresji topologii/argv PASS, parser
+Python PASS, `git diff --check` PASS. Nie kompilowano testów Rust.
+Fetch `origin/master` wskazał `f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`,
+który jest już przodkiem brancha zadania: brak nowych commitów do scalenia.
+Build aplikacji pozostaje wcześniejszym dowodem; nie jest dowodem recovery
+ani udanego Solve Universe.

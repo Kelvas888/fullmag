@@ -234,6 +234,14 @@ case "${recipe}" in
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_dev_failed_build_recovery.py" "${failed_build_args[@]}"
     ;;
+  *"scripts/docker_candidate_history.py"*)
+    candidate_history_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_candidate_history.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --build-attempt '([0-9a-f]{32})' --candidate-receipt-sha256 '([0-9a-f]{64})'[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${candidate_history_pattern} ]]; then
+      echo "[fullmag just] invalid candidate history diagnostic recipe" >&2
+      exit 2
+    fi
+    exec "${python_cmd}" -B "${script_dir}/docker_candidate_history.py" --source-root "${BASH_REMATCH[1]}" --backend-container-id "${BASH_REMATCH[2]}" --image-id "${BASH_REMATCH[3]}" --build-attempt "${BASH_REMATCH[4]}" --candidate-receipt-sha256 "${BASH_REMATCH[5]}"
+    ;;
   *"scripts/docker_dev_recovery_build.py"*)
     recovery_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_recovery_build.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --process-receipt-sha256 '([0-9a-f]{64})' --owner-sha256 '([0-9a-f]{64})'"
     promotion_pattern=" --promote --candidate-basename '(\.backend-package-candidate-[A-Za-z0-9._-]+)' --candidate-receipt-sha256 '([0-9a-f]{64})' --current-receipt-sha256 '([0-9a-f]{64})' --provenance-sha256 '([0-9a-f]{64})'"
