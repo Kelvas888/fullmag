@@ -13,7 +13,7 @@ import fullmag as fm
 
 
 fm.reset()
-probe = Path(__file__).resolve().parents[4] / "examples" / "fem_disconnected_mixed_p1_operator_probe.py"
+probe = Path(__file__).resolve().parents[1] / "examples" / "fem_disconnected_mixed_p1_operator_probe.py"
 study = runpy.run_path(str(probe))["study"]
 study.interactive(True)
 study.wait_for_solve(True)
