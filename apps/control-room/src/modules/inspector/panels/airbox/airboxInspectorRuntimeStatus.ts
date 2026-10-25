@@ -12,6 +12,7 @@ import { isExplicitFdmStudy } from "../StudyGlobalAuthoringModel";
 
 export type AirboxInspectorRuntimeStatus = {
   authoring: SessionAuthoringMethodDescription;
+  executionState?: string;
   capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
     SessionDiscretizationCapabilitiesProjection;
   domain: Pick<LiveStatusResource["domain"], "discretization">;
@@ -33,6 +34,7 @@ export function selectAirboxInspectorRuntimeStatus(status: {
   );
   return {
     authoring: describeSessionAuthoringDiscretization(status.data),
+    executionState: status.data.lifecycle?.solver ?? "unknown",
     capabilities: {
       explicit_topology: status.data.capabilities?.explicit_topology ?? false,
       ...(hasActiveLane
@@ -65,6 +67,7 @@ export function airboxInspectorRuntimeStatusEquals(
     nextLane && Object.prototype.hasOwnProperty.call(nextLane, "authored"),
   );
   return (
+    previous.executionState === next.executionState &&
     previous.authoring.method === next.authoring.method &&
     previous.authoring.state === next.authoring.state &&
     previous.authoring.reason === next.authoring.reason &&

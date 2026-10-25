@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const testState = vi.hoisted(() => ({
   calls: [] as boolean[],
   publishedFemMesh: false,
+  executionState: "awaiting_command",
   discretization: "fdm" as "fdm" | "fem" | null,
   authoringMethod: null as "fdm" | "fem" | null,
   resolvedDiscretization: null as "fdm" | "fem" | null,
@@ -22,6 +23,7 @@ vi.mock("@/kernel/resources/useSessionStatus", () => ({
   useSessionStatusSelector: (selector: (value: unknown) => unknown) =>
     selector({
       data: testState.discretization === null ? null : {
+        lifecycle: { solver: testState.executionState },
         capabilities: {
           explicit_topology: testState.publishedFemMesh,
           ...(testState.authoringMethod
@@ -157,6 +159,7 @@ describe("AirboxInspectorLanePanel", () => {
   beforeEach(() => {
     testState.calls.length = 0;
     testState.publishedFemMesh = false;
+    testState.executionState = "awaiting_command";
     parameterPanelLanes.values.length = 0;
     testState.discretization = "fdm";
     testState.authoringMethod = null;
@@ -183,6 +186,7 @@ describe("AirboxInspectorLanePanel", () => {
 
   it("keeps Airbox status facets and contract gaps visible in the shared frame", () => {
     testState.discretization = "fem";
+    testState.executionState = "unknown";
 
     const html = renderToStaticMarkup(
       <AirboxOverviewLanePanel selection={staleAirboxSelection} />,
@@ -237,9 +241,12 @@ describe("AirboxInspectorLanePanel", () => {
     testState.discretization = "fem";
     testState.authoringMethod = "fem";
     testState.publishedFemMesh = true;
+    testState.executionState = "running";
     const html = renderToStaticMarkup(<AirboxMeshStatisticsLanePanel selection={selection} />);
     expect(html).toContain("FEM Airbox child");
-    expect(html).toContain("FEM mesh · execution unresolved");
+    expect(html).toContain("FEM mesh");
+    expect(html).toContain(">running<");
+    expect(html).not.toContain("execution unresolved");
     expect(html).toContain("mesh published");
   });
 

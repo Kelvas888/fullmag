@@ -632,3 +632,31 @@ ostrzeżeń solvera. Nie uruchomiono Run/Relax ani drugiego Solve. Zachowano
 profil, siatkę, tolerancje i limity. Wynik V/J/H nie jest jeszcze opublikowany;
 nie zaliczono bramki transportu ani pola.
 Dowody: `verification/antenna-universe-current-field-20261026/` w control volume.
+
+
+### Inspektor — rzeczywisty stan wykonania niezależny od lane LLG
+
+Pierwszy fragment inspektora zapisano w commicie
+`cc601436c63a858e4489f7c2f839f3fdbf01a9ca`. Wybrane hunki Quantity Source
+zacommitowano przez izolowany indeks; wcześniejsze hunki integracji artefaktów
+i wpis ArtifactInspectionSource pozostawiono poza commitem.
+
+Doprecyzowano projekcję statusu Airbox: Execution pochodzi z lifecycle.solver
+bieżącego API, a selector porównuje wyłącznie ten mały stan. Brak lane LLG
+nie powoduje już opisu wykonania jako nierozstrzygniętego podczas działającego
+antenna_field_only. Nie dodano odrębnej subskrypcji ani stanu kopii danych.
+Stan opublikowanej siatki i stan wykonania pozostają niezależne.
+
+Osiem interpretowanych kontroli rzeczywistych funkcji na aktualnym API PASS:
+execution=running, opublikowana siatka i odczyt manifestu dostępne, ogólna
+lane nadal null; equality reaguje na zmianę wykonania i ignoruje równoważną
+kopię. Dowód w wolumenie frontendu:
+`verification/antenna-universe-inspector-20261026/actual-inspector-projection.json`.
+Pierwsze wycięcie deklaracji w skrypcie audytu błędnie kończyło się na typie
+argumentu; poprawiono ekstrakcję całej funkcji przed uzyskaniem wyniku PASS.
+TypeScript i focused ESLint po doprecyzowaniu: exit 0. Regresję SSR zaktualizowano
+w źródle; nie uruchamiano skompilowanych testów ani przeglądarki.
+
+Bieżący run nadal running, konkretny worker 6335 potwierdzony w /proc,
+RSS około 519 MiB. Nie wydano nowego Solve. Bramka prądu i pola nadal otwarta;
+pełny zaakceptowany wynik V/J/H jeszcze nie jest opublikowany.

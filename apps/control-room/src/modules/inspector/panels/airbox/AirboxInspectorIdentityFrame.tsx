@@ -24,11 +24,11 @@ function laneLabel(lane: AirboxInspectorLane): string {
   return "runtime lane unresolved";
 }
 
-function statusForSelection(selection: Selection, lane: AirboxInspectorLane, publishedFemMesh: boolean) {
+function statusForSelection(selection: Selection, lane: AirboxInspectorLane, publishedFemMesh: boolean, executionState?: string) {
   const ref = selection.ref?.type === "airbox" ? selection.ref : null;
   return {
     availability: ref?.availability ?? (lane === "conflict" ? "unsupported" : publishedFemMesh ? "mesh inspection available" : "unknown"),
-    execution: ref?.executionState ?? (publishedFemMesh && lane === "unresolved" ? "execution unresolved" : "unknown"),
+    execution: executionState && executionState !== "unknown" ? executionState : ref?.executionState ?? "unknown",
     resource: ref?.resourceState ?? (publishedFemMesh ? "mesh published" : "unknown"),
   };
 }
@@ -45,18 +45,20 @@ function diagnosticsForSelection(selection: Selection, lane: AirboxInspectorLane
 
 export function AirboxInspectorIdentityFrame({
   children,
+  executionState,
   lane,
   owner = "airbox-inspector",
   publishedFemMesh = false,
   selection,
 }: InspectorPanelProps & {
   children: ReactNode;
+  executionState?: string;
   lane: AirboxInspectorLane;
   owner?: string;
   publishedFemMesh?: boolean;
 }) {
   const ref = selection.ref?.type === "airbox" ? selection.ref : null;
-  const status = statusForSelection(selection, lane, publishedFemMesh);
+  const status = statusForSelection(selection, lane, publishedFemMesh, executionState);
   const title = TITLES[selection.kind ?? ""] ?? "Airbox Inspector";
   const target = ref?.visualizationTargetId ?? "airbox";
 
@@ -65,7 +67,7 @@ export function AirboxInspectorIdentityFrame({
       <ScientificInspectorTemplate
         breadcrumbs={["Model", "Airbox", title]}
         diagnostics={diagnosticsForSelection(selection, lane)}
-        methodLabel={publishedFemMesh && lane === "unresolved" ? "FEM mesh · execution unresolved" : laneLabel(lane)}
+        methodLabel={publishedFemMesh && lane === "unresolved" ? "FEM mesh" : laneLabel(lane)}
         physicalLabel="Airbox"
         properties={[
           { label: "Target", mono: true, value: target },

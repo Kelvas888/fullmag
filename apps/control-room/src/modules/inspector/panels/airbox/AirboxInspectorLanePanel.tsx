@@ -174,7 +174,7 @@ function AirboxInspectorLanePanel({
   }
 
   return (
-    <AirboxInspectorIdentityFrame lane={inspectionLane} publishedFemMesh={publishedFemMesh && inspectionLane !== "conflict"} selection={selection}>
+    <AirboxInspectorIdentityFrame executionState={runtimeStatus?.executionState} lane={inspectionLane} publishedFemMesh={publishedFemMesh && inspectionLane !== "conflict"} selection={selection}>
       {content}
     </AirboxInspectorIdentityFrame>
   );
