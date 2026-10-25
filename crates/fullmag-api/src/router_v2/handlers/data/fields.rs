@@ -9989,7 +9989,7 @@ mod tests {
     #[test]
     fn field_only_availability_rejects_magnetic_fields_with_missing_or_inherited_capabilities() {
         let mut snapshot = snapshot_with_field_provider("m");
-        snapshot.metadata = Some(serde_json::json!({"magnetic_state_present": false}));
+        snapshot.metadata = Some(serde_json::json!({"magnetic_state_present": false}).into());
         for inherited in [true, false] {
             if !inherited { snapshot.capabilities = None; }
             for spec in fullmag_quantities::quantity_specs().iter()
@@ -10016,7 +10016,7 @@ mod tests {
         })).expect("minimal snapshot");
         let mut snapshot = default_current_live_state(&request);
         snapshot.capabilities = None;
-        snapshot.metadata = Some(serde_json::json!({"magnetic_state_present": false}));
+        snapshot.metadata = Some(serde_json::json!({"magnetic_state_present": false}).into());
         snapshot.fem_mesh = Some(FemMeshPayload {
             mesh_name: "stored-domain".into(), mesh_id: "mesh:stored-domain".into(),
             nodes: vec![[0.0,0.0,0.0],[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]],
@@ -10026,7 +10026,7 @@ mod tests {
             periodic_node_pairs: Vec::new(), object_segments: Vec::new(), mesh_parts: Vec::new(),
             domain_mesh_mode: None, domain_frame: None, generation_id: Some("stored-generation".into()),
             per_domain_quality: std::collections::HashMap::new(), build_report: None,
-        });
+        }.into());
         add_physical_field_source(&mut snapshot, 2, None);
         for quantity in ["V_electric", "J_charge", "H_ant", "spin_current_tensor"] {
             let spec = fullmag_quantities::quantity_spec(quantity).expect("canonical stored quantity");
@@ -10128,7 +10128,7 @@ mod tests {
         assert_eq!(quantities[1].location, "node");
         assert_eq!(quantities[0].source_time_seconds, Some(2.5e-12));
         let mut snapshot = snapshot_with_field_provider("m");
-        snapshot.metadata = Some(serde_json::json!({"magnetic_state_present": false}));
+        snapshot.metadata = Some(serde_json::json!({"magnetic_state_present": false}).into());
         let resolved = super::resolved_quantity_capability_for_snapshot(&snapshot,
             fullmag_quantities::quantity_spec("m").unwrap(),
             fullmag_runner::QuantityMaterializationCapability::Materialized, Vec::new(), "full");

@@ -507,17 +507,17 @@ mod tests {
                 positions_xyz_m:vec![[1e-6,0.0,0.3e-6],[1.02e-6,0.0,0.3e-6],[1e-6,0.02e-6,0.3e-6],[1e-6,0.0,0.32e-6]],cells:fullmag_ir::FemConnectivityIR::from_tet4(vec![[0,1,2,3]]),
             },
         };
-        snapshot.fem_mesh = Some(fullmag_runner::StageFemMeshAsset::build_from_antenna_field_only_plan(&plan).payload);
+        snapshot.fem_mesh = Some(fullmag_runner::StageFemMeshAsset::build_from_antenna_field_only_plan(&plan).payload.into());
         let execution_plan = json!({"backend_plan":fullmag_ir::BackendPlanIR::AntennaFieldOnly(plan)});
         snapshot.scene_document = Some(scene.clone());
-        snapshot.metadata = Some(json!({"execution_plan":execution_plan.clone()}));
+        snapshot.metadata = Some(json!({"execution_plan":execution_plan.clone()}).into());
         snapshot.mesh_workspace = Some(json!({
             "schema_version":crate::live_scene_preparation::LIVE_SCENE_PREPARATION_READ_MODEL_SCHEMA,
             "preparation_id":"prep-readiness","source_scene_revision":scene.revision,
             "plan_fingerprint":format!("sha256:{}","b".repeat(64)),
             "status":"completed","active_build":null,"last_build_error":null,"execution_plan":execution_plan,
             "accepted_run_id":snapshot.session.run_id,"accepted_step_id":"inspection-step"
-        }));
+        }).into());
         snapshot.simulation_preparation = Some(crate::types::SimulationPreparationSnapshot {
             preparation_id:"prep-readiness".into(),revision:1,status:"ready".into(),active_stage_id:None,
             started_at_unix_ms:1,completed_at_unix_ms:Some(2),stages:Vec::new(),log_tail:Vec::new(),failure:None,

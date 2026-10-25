@@ -50690,7 +50690,7 @@ async fn frequency_response_binary_cache_tracks_content_and_representation() {
     let (app, state, artifact_dir) = test_router_with_session_state_and_artifact_dir().await;
     {
         let mut current = state.current_live_state.write().await;
-        current.as_mut().unwrap().fem_mesh = Some(sample_fem_mesh_payload());
+        current.as_mut().unwrap().fem_mesh = Some(sample_fem_mesh_payload().into());
     }
     let point_dir = artifact_dir.join("response/frequency_points");
     let payload_dir = artifact_dir.join("response/field_payloads/frequency_0001");
@@ -50790,7 +50790,7 @@ async fn frequency_response_binary_cache_tracks_content_and_representation() {
         {
             let mut current = state.current_live_state.write().await;
             let snapshot = current.as_mut().unwrap();
-            snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+            snapshot.fem_mesh = Some(sample_fem_mesh_payload().into());
             snapshot.mesh_revision = baseline_mesh_revision;
         }
         let baseline = app.clone().oneshot(request(query, None)).await.unwrap();

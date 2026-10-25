@@ -7239,7 +7239,7 @@ mod tests {
     #[test]
     fn field_only_snapshot_retains_source_mesh_and_rejects_stale_magnetic_carriers() {
         let mut current = test_current_snapshot();
-        current.fem_mesh = Some(domain_fem_mesh("inspection-source"));
+        current.fem_mesh = Some(domain_fem_mesh("inspection-source").into());
         current.latest_fields = serde_json::from_value(json!({
             "m": {"values": [[1.0, 0.0, 0.0]]},
             "mat_ms": {"values": [800_000.0]},
@@ -7285,7 +7285,7 @@ mod tests {
     #[test]
     fn field_only_preparation_rejects_foreign_full_domain_carrier_without_touching_solver_profile() {
         let mut current = test_current_snapshot();
-        current.fem_mesh = Some(domain_fem_mesh("inspection-source"));
+        current.fem_mesh = Some(domain_fem_mesh("inspection-source").into());
         let mut foreign = accepted_observation_frame_ref(&current, 0, Some(0.0));
         foreign.session_epoch = "foreign-session@1".into();
         current.latest_fields = serde_json::from_value(json!({

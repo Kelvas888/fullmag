@@ -1603,7 +1603,7 @@ fn historical_export_snapshot(state: &AppState, source: &AcceptedRunExportSource
     snapshot.metadata = Some(serde_json::json!({"accepted_definition_projection":projection,"historical_export":{
         "run_id":source.run_id,"project_id":source.project_id,"session_epoch":epoch,
         "run_catalog_revision":source.run_catalog_revision,"artifact_catalog_revision":source.artifact_catalog_revision
-    }}));
+    }}).into());
     Ok((snapshot, epoch, script))
 }
 
@@ -2234,7 +2234,7 @@ mod accepted_fms_persistence_tests {
             snapshot.session.run_id = "run-ui-export".into();
             snapshot.session.script_path.clear();
             snapshot.scene_document = Some(authored_scene);
-            snapshot.metadata = Some(serde_json::json!({"docker_startup":{"run_id":"run-ui-export", "scene_revision":17}}));
+            snapshot.metadata = Some(serde_json::json!({"docker_startup":{"run_id":"run-ui-export", "scene_revision":17}}).into());
             snapshot.run = Some(crate::types::RunManifest {run_id:"run-ui-export".into(), session_id:snapshot.session.session_id.clone(),
                 status:"completed".into(), total_steps:0, final_time:None, final_e_ex:None, final_e_demag:None, final_e_ext:None,
                 final_e_ani:None, final_e_dmi:None, final_e_rotated_dmi:None, final_e_total:None, artifact_dir:String::new()});
@@ -3780,12 +3780,12 @@ pub(crate) async fn import_session_commit_with_context(
     // Replace any archive-supplied marker with the reference just validated by
     // the canonical importer. It pins subsequent cold reads to this closure.
     if let Some(reference) = preflight.session.accepted_provenance_ref.as_ref() {
-        let metadata = persisted.metadata.get_or_insert_with(|| serde_json::json!({}));
+        let metadata = persisted.metadata.get_or_insert_with(|| serde_json::json!({}).into());
         let metadata = metadata.as_object_mut().ok_or_else(|| ApiError::bad_request("invalid_fms_snapshot: accepted metadata must be an object"))?;
         metadata.insert("imported_accepted_evidence".into(), serde_json::json!({
             "run_id":reference.accepted_run_id,"closure_sha256":reference.closure_sha256
         }));
-    } else if let Some(metadata) = persisted.metadata.as_mut().and_then(serde_json::Value::as_object_mut) {
+    } else if let Some(metadata) = persisted.metadata.as_deref_mut().and_then(serde_json::Value::as_object_mut) {
         metadata.remove("imported_accepted_evidence");
     }
     let import_id = format!(

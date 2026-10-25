@@ -3397,7 +3397,7 @@ mod tests {
             "session_id": "prepared-field-only-session",
         })).unwrap();
         let mut snapshot = crate::session::default_current_live_state(&request);
-        snapshot.metadata = Some(json!({"artifact_layout": {"backend": "fdm"}}));
+        snapshot.metadata = Some(json!({"artifact_layout": {"backend": "fdm"}}).into());
         snapshot.latest_fields = serde_json::from_value(json!({
             "m": {"values": [[1.0, 0.0, 0.0]]},
             "mat_ms": {"values": [800_000.0]},
