@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -33,7 +34,7 @@ def validate(base_url: str, authored: dict) -> dict:
 
     def current_identity():
         status = request("/v2/sessions/current/status")
-        return {"session": status["session"], "run_id": status["run"]["run_id"],
+        return {"session": status["session"], "run_id": (status.get("run") or {}).get("run_id"),
                 "scene_revision": status["resources"]["scene_revision"],
                 "commands_revision": status["resources"]["commands_revision"]}
 
@@ -43,6 +44,9 @@ def validate(base_url: str, authored: dict) -> dict:
     if not scene.get("antenna_field_solve_stages"):
         raise ValueError("Regression requires an authored antenna field solve stage")
     before = current_identity()
+    created = request("/v2/persistence/projects", {"name": "Antenna authoring regression"}, expected=201)
+    authored = {**authored, "archive_base64": created["archive_base64"],
+                "expected_project_id": created["project_id"], "expected_revision": created["revision"]}
     updated = request("/v2/persistence/projects/authoring", authored)
     raw = base64.b64decode(updated["archive_base64"], validate=True)
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
@@ -69,12 +73,67 @@ def validate(base_url: str, authored: dict) -> dict:
     for key, value in (("expected_project_id", foreign_id),
                        ("expected_revision", int(authored["expected_revision"]) + 1)):
         request("/v2/persistence/projects/authoring", {**authored, key: value}, expected=409)
+    def entries(resource):
+        with zipfile.ZipFile(io.BytesIO(base64.b64decode(resource["archive_base64"], validate=True))) as archive:
+            return {name: archive.read(name) for name in archive.namelist()}
+
+    def cold_open(resource):
+        return request("/v2/persistence/projects/open", {
+            "display_name": authored["display_name"], "archive_base64": resource["archive_base64"]})
+
+    previous_sources = {}
+    for label in ("Antenna regression edit 1", "Antenna regression edit 2"):
+        previous_sources["project/source-history/" + hashlib.sha256(source).hexdigest() + ".py"] = source
+        scene = copy.deepcopy(scene)
+        scene["objects"][0]["name"] = label
+        updated = request("/v2/persistence/projects/authoring", {
+            **authored, "archive_base64": updated["archive_base64"],
+            "expected_revision": updated["revision"], "scene_document": scene})
+        content = entries(updated)
+        next_source = content[source_path]
+        if source == next_source:
+            raise ValueError("Regression edit did not change the canonical source")
+        source = next_source
+        ast.parse(source.decode("utf-8"))
+        if any(content.get(path) != value for path, value in previous_sources.items()):
+            raise ValueError("Previous canonical source bytes were not retained")
+        if cold_open(updated).get("authoring_scene_document") != scene:
+            raise ValueError("Cold open rejected its own source history")
+    content = entries(updated)
+    unchanged = request("/v2/persistence/projects/authoring", {
+        **authored, "archive_base64": updated["archive_base64"],
+        "expected_revision": updated["revision"], "scene_document": scene})
+    if entries(unchanged) != content or unchanged["revision"] != updated["revision"]:
+        raise ValueError("No-op authoring changed archive contents or revision")
+
+    def refuse_projection(modified):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, value in modified.items():
+                archive.writestr(name, value)
+        resource = {"archive_base64": base64.b64encode(output.getvalue()).decode()}
+        opened = cold_open(resource)
+        if opened.get("authoring_scene_document") is not None:
+            raise ValueError("Unsafe archive was projected into authoring")
+        if entries(opened) != modified:
+            raise ValueError("Evidence-only archive bytes were changed")
+
+    history_path = next(iter(previous_sources))
+    refuse_projection({**content, history_path: b"# altered source history\n"})
+    refuse_projection({**content, "project/source-history/invalid.py": b"# invalid name\n"})
+    refuse_projection({**content, "project/unknown.txt": b"unknown evidence"})
+    refuse_projection({key: value for key, value in content.items() if key != "project/provenance.json"})
+    for provenance in (b"{}", b"not json", b'{"authors":[],"history":[],"runs":[{}]}',
+                       b'{"authors":[],"history":[{"kind":"run","run_id":"old"}],"runs":[]}'):
+        refuse_projection({**content, "project/provenance.json": provenance})
     if current_identity() != before:
         raise ValueError("Runtime-free authoring changed the active session, scene or commands")
+    raw = base64.b64decode(updated["archive_base64"], validate=True)
     return {"status": "pass", "project_id": updated["project_id"],
             "revision": updated["revision"], "source_path": source_path,
             "source_bytes": len(source), "source_sha256": hashlib.sha256(source).hexdigest(),
-            "archive_sha256": hashlib.sha256(raw).hexdigest(), "cold_open": True,
+            "archive_sha256": hashlib.sha256(raw).hexdigest(), "cold_open": True, "successive_source_edits": 2, "no_op_preserved": True,
+            "unsafe_archive_cases": 8,
             "foreign_identity_rejected": True, "stale_revision_rejected": True,
             "active_session_unchanged": True, "new_solve": False,
             "scope": "Publiczny zapis i cold-open projektu bez magnetyka; nie wykonanie ani kwalifikacja fizyki."}

@@ -158,3 +158,23 @@ Integracja źródeł mastera została następnie zapisana w merge
 `3babed412bf8af3ac681f3ea3a920b535085052b`; zgodność ze współdzielonymi
 typami w `db4e2da2e2b13303edb0db6f5af61af269442dc8`. Bieżący plan
 realizacji rozróżnia tę integrację od oczekującego buildu i GREEN zapisu anteny.
+
+
+## Zapis anteny po aktualizacji mastera — 25.10.2026
+
+Master `f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48` jest zintegrowany przez
+`3babed412bf8af3ac681f3ea3a920b535085052b`. Zarządzany resume
+`140a9536ec134565ae55ded40a906b90` zakończył się sukcesem; Make trwał
+498150 ms. Pakiet pochodzi z czystego `0aaac63298eb70a0ccf5bbbd695a4dec0d38139f`,
+snapshot `9814adfd25698311d69e02e57efedf26d5e27b26a440c041dc97793efb058e2e`.
+To dowód buildu i startu, nie zakończenia obliczeń Universe.
+
+Rzeczywiste API zapisuje źródło Python anteny bez magnetyka, lecz ponowne
+otwarcie nie udostępnia sceny authoringu: publiczny create nie zapisuje
+provenance, a czytnik odrzuca własną historię źródła. Poprawka dodaje
+prawdziwe puste provenance wyłącznie nowym projektom oraz dopuszcza historię
+źródła tylko przy dokładnej ścieżce SHA256 zgodnej z bajtami. Nie dopisuje
+historii zastanym archiwom. Create zwraca rewizję po inicjalizacji; klient
+musi używać zwróconej rewizji. Regresja HTTP obejmuje kolejne edycje, no-op
+i osiem przypadków niepewnych archiwów. Weryfikacja nowego pakietu pozostaje
+do wykonania; wynik cold-open obecnego pakietu jest FAIL.

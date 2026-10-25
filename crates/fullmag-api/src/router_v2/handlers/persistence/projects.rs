@@ -2321,6 +2321,21 @@ pub async fn create(
     let view = application
         .create(CreateProjectRequest::new(request.name))
         .map_err(|error| ApiError::bad_request(format!("invalid_project_document: {error}")))?;
+    let mut draft = application
+        .current_document()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("project application has no current document"))?;
+    // Only a freshly created project is known to have no historical runs.
+    draft.opaque_documents.push(
+        OpaqueDocument::new(
+            super::script_project::PROVENANCE_PATH,
+            br#"{"authors":[],"history":[],"runs":[]}"#.to_vec(),
+        )
+        .map_err(|error| ApiError::internal(format!("invalid provenance path: {error}")))?,
+    );
+    let view = application
+        .replace_draft(draft, view.revision)
+        .map_err(|error| ApiError::internal(format!("initialize project provenance: {error}")))?;
     let archive = encode_current(&application)?;
     Ok((
         StatusCode::CREATED,
@@ -2724,8 +2739,15 @@ fn opened_authoring_scene(
     if !document.assets.is_empty()
         || !document.raw_definition.unknown_object_fields(
             ["schema", "project_id", "name", "revision", "scene"]).is_empty()
-        || document.opaque_documents.iter().any(|entry| !matches!(entry.path(),
-            "project/provenance.json" | "project/source/script.py" | "project/source/script.json"))
+        || document.opaque_documents.iter().any(|entry| {
+            if matches!(entry.path(),
+                "project/provenance.json" | "project/source/script.py" | "project/source/script.json")
+            {
+                return false;
+            }
+            // Accept only the exact content-addressed history emitted by this writer.
+            entry.path() != format!("project/source-history/{:x}.py", Sha256::digest(entry.bytes()))
+        })
     {
         return None;
     }
