@@ -147,6 +147,16 @@ const qualityPayload = {
   quality_source: "region_membership",
 };
 
+const airboxQualityPayload = {
+  ...qualityPayload,
+  global: {
+    ...qualityPayload.global,
+    label: "Airbox",
+    marker: 0,
+  },
+  quality_source: "gmsh",
+};
+
 const objectQualityPayload = {
   ...qualityPayload,
   quality_source: "object",
@@ -374,7 +384,7 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
   }),
   useMeshUniverseQualityResource: () => ({
     data: {
-      quality: qualityPayload,
+      quality: airboxQualityPayload,
       revision: 3,
     },
     error: null,
@@ -769,8 +779,9 @@ describe("scoped mesh quality panels", () => {
       <AirboxMeshStatisticsPanel selection={airboxQualitySelection} />,
     );
 
-    expect(html).toContain("Shared-domain Quality Distributions");
-    expect(html).toContain("cross-reference, not Airbox-scoped");
+    expect(html).toContain("Airbox Quality Distributions");
+    expect(html).toMatch(/Scope<\/span><span[^>]*>Airbox<\/span>/);
+    expect(html).toMatch(/Marker<\/span><span[^>]*>0<\/span>/);
     expect(html).toContain("SICN");
     expect(html).toContain("Gamma");
     expect(html).toContain("Below target");
@@ -842,7 +853,7 @@ describe("scoped mesh quality panels", () => {
     expect(html).toContain("Airbox-scoped quality gates are not published");
     expect(html).toContain("unknown");
     expect(html).toContain("ui-derived");
-    expect(html).toContain("cross-reference only");
+    expect(html).toContain("Structural availability only; not an Airbox quality pass/fail.");
   });
 
   it("renders topology metadata from the manifest without a binary topology hook", () => {
@@ -888,9 +899,11 @@ describe("scoped mesh quality panels", () => {
     expect(mesh).toContain("Last build summary");
   });
 
-  it("bounds shared-domain quality cross-reference strings and collections", () => {
+  it("bounds warnings from the Airbox marker-zero quality resource", () => {
     const html = renderToStaticMarkup(<AirboxMeshStatisticsPanel selection={airboxQualitySelection} />);
-    expect(html).toContain("Shared-domain cross-reference");
+    expect(html).toContain("Airbox Quality Distributions");
+    expect(html.match(/>Warning 1<\/span>/g)).toHaveLength(50);
+    expect(html).toContain("warning-49-");
     expect(html).not.toContain("warning-50-");
     expect(html).not.toContain("界".repeat(513));
   });

@@ -323,9 +323,13 @@ describe("AirboxInspectorLanePanel", () => {
     expect(html).toContain("not current for this grid");
   });
 
-  it.each(["loading", "stale", "error"] as const)(
-    "withholds cached FDM membership counts while membership is %s",
-    (membershipStatus) => {
+  it.each([
+    ["loading", "FDM membership data is loading"],
+    ["stale", "FDM membership data is stale"],
+    ["error", "FDM membership data failed to load"],
+  ] as const)(
+    "withholds cached FDM membership counts and shows the model notice while membership is %s",
+    (membershipStatus, expectedNotice) => {
       testState.discretization = "fdm";
       testState.fdmMembershipStatus = membershipStatus;
 
@@ -335,7 +339,9 @@ describe("AirboxInspectorLanePanel", () => {
 
       expect(html).toContain("Airbox cells");
       expect(html).toMatch(/Airbox cells<\/span><span[^>]*>not materialized<\/span>/);
-      expect(html).toContain("not current for this grid");
+      expect(html).toContain(expectedNotice);
+      expect(html).not.toContain("Membership freshness");
+      expect(html).not.toContain("not current for this grid");
     },
   );
 
@@ -347,8 +353,9 @@ describe("AirboxInspectorLanePanel", () => {
       <AirboxMeshStatisticsLanePanel selection={selection} />,
     );
 
-    expect(html).toContain("not-materialized");
-    expect(html).toContain("not current for this grid");
+    expect(html).toContain("does not match the current structured grid");
+    expect(html).not.toContain("Membership freshness");
+    expect(html).not.toContain("not current for this grid");
     expect(html).toMatch(/Airbox cells<\/span><span[^>]*>not materialized<\/span>/);
   });
 

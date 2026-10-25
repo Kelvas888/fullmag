@@ -60,7 +60,9 @@ describe("Airbox inspector panel performance contracts", () => {
     expect(panelSources["AirboxMeshStatisticsPanel.tsx"]).not.toContain("MeshQualityStatisticsView");
     expect(panelSources["AirboxOverviewPanel.tsx"]).toContain("authored.mode");
     expect(panelSources["AirboxOverviewPanel.tsx"]).not.toContain("authored.airbox_mode");
-    expect(panelSources["AirboxMeshTopologyPanel.tsx"]).toContain('label="Canonical marker" value="not published"');
+    expect(panelSources["AirboxMeshTopologyPanel.tsx"]).toContain(
+      'label="Canonical marker" value="not published by the topology manifest"',
+    );
     const statistics = panelSources["AirboxMeshStatisticsPanel.tsx"];
     expect(statistics).toMatch(
       /const\s+summaryEnabled\s*=\s*shouldLoadRuntimeMeshSummary\s*\(\s*true\s*,\s*runtimeStatus\s*\)/,

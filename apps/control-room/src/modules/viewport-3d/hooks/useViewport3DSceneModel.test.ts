@@ -793,7 +793,7 @@ describe("useViewport3DSceneModel", () => {
     expect(nativeLayerSettingsBlock).not.toContain("visualizationState: renderingState");
   });
 
-  it("uses canonical local Airbox settings for both FDM Airbox carriers", () => {
+  it("uses canonical Airbox settings only when the multilayer layout is unavailable", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     expect(source).toContain(
       "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: renderingState,",
@@ -802,7 +802,9 @@ describe("useViewport3DSceneModel", () => {
       source.indexOf("const fdmSingleGridAirboxSettings ="),
       source.indexOf("const fdmVectorScale =", source.indexOf("const fdmSingleGridAirboxSettings =")),
     );
-    expect(fdmSingleGridAirboxBlock).toContain("fdmMultilayerAirboxDomain");
+    expect(fdmSingleGridAirboxBlock).toMatch(
+      /const fdmSingleGridAirboxSettings = fdmMultilayerLayout\.data\?\.available\s*\?\s*null\s*:\s*airboxSettings;/,
+    );
     expect(fdmSingleGridAirboxBlock).toContain(": airboxSettings");
     expect(fdmSingleGridAirboxBlock).not.toContain("fdmUniverseOutsideSupportSettings");
   });
