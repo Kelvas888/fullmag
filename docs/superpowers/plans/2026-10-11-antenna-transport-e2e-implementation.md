@@ -1,6 +1,6 @@
 # Anteny i transport — realizacja E0–E12, 11.10.2026
 
-## Bieżący checkpoint: grupa odtworzona, Universe w wykonaniu — 25.10.2026
+## Bieżący checkpoint: grupa odtworzona, próba Universe nieudana — 25.10.2026
 
 Zarządzane odtworzenie grupy zakończyło się sukcesem: removal
 `7d6f913f9349430ab78f5d81b721af56`, development
@@ -29,8 +29,18 @@ Po ponownym sprawdzeniu ready receipt i rewizji wysłano dokładnie jeden Solve:
 `antenna-universe-surface-20261025-solve-01`, HTTP 200 accepted.
 Run `run-live-ace433241f22879d2bc6fc8c5df1b24368fb4f68ecbd973799ec8e3460ab1992`,
 attempt `attempt-3519d1b2bee5418d8b17784621fd4fb0`, ownership epoch 1.
-Publiczny stan zadania jest running; nie ma jeszcze zaakceptowanego wyniku H.
-Nie ponawiać komendy ani nie zmieniać polityki w trakcie próby.
+Próba zakończyła się Failed, retryable=false, bez opublikowanych artefaktów:
+`surface RT0 wall-time exhausted`. Zdarzenie terminalne: sequence 340,
+`5948bf8fe8e742428caf3bcde5b7fbdd`, raw SHA256
+`767c07d08a4c3774d200f4d16771a0ac6575d714fdee2a04330e46b01cf4a4fd`.
+Worker exit 1, timed_out=false w receipcie procesu: limit zgłosił natywny
+moduł, nie zewnętrzny watchdog. Proces nie istnieje; kolejka jest pusta,
+obie rezerwacje tej próby (preparation/compute) są released. Nie ponowiono Solve
+ani nie zwiększono limitów. Nie ma nowej mapy H do pokazania w UI.
+Kontrola przed buildem: 70/70 wcześniejszych plików i oba archiwa bez zmian,
+sześć niezmiennych plików wejścia/dowodów tej próby przypięto SHA256.
+Raporty: `failure-checkpoint.json` i `pre-build-retention.json` w katalogu
+`verification/universe-surface-trial-20261025/`.
 Dowody: `verification/universe-surface-trial-20261025/` i
 `verification/wrapper-refresh-20261025/` w wolumenie kontrolnym grupy.
 
@@ -43,6 +53,27 @@ Worker nadal wykonuje `/opt/fullmag/package/bin/fullmag-api-accepted-worker`
 z poprzedniego, przypiętego pakietu; jego wejścia i próba nie zostały zmienione.
 Build i restart pozostają odłożone do terminalnego rozstrzygnięcia próby. E0–E12 pozostaje
 nieukończone: wykonanie próby nie oznacza kwalifikacji bazy, LLG/FFT ani BORIS.
+
+## Integracja źródeł i regresja zapisu — 25.10.2026
+
+Master `f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48` jest przodkiem merge
+`3babed412bf8af3ac681f3ea3a920b535085052b`. Po scaleniu dostosowano
+trzy produkcyjne miejsca zapisu metadata oraz powiązane fixtures do
+SharedJson/SharedFemMesh; zmiany te oczekują na rzeczywisty build.
+Parser Rust przeanalizował siedem zmienionych plików bez błędów;
+nie kompilowano ani nie wykonywano testów Rust.
+
+Na osobnym runtime-free projekcie publiczny authoring odtwarza brak source
+w manifest/project.json dla anteny bez magnetyka. Kanoniczny renderer generuje
+5743 bajty; ponowny lekki loader zachowuje porównane kolekcje jednego portu
+i jednego etapu anteny, bez magnetów. Nie jest to pełny odbiór round-trip.
+W źródłach usunięto wymóg roli magnet z bramki zapisu, zachowując wymóg
+geometrii i walidację sceny. Nowy validator
+`scripts/validate_antenna_authoring_source_http.py` na dotychczasowym API
+kończy się oczekiwanym RED: brak kanonicznego źródła. GREEN publicznego zapisu,
+cold-open i odmów złej identity/revision pozostaje do sprawdzenia po buildzie.
+Dowody: `verification/antenna-authoring-source-20261025/` w wolumenie kontrolnym.
+Aktywna próba Universe nie została zastąpiona ani ponowiona.
 
 ## Aktualny checkpoint: recovery wykonane, API i inspekcja przywrócone — 25.10.2026
 

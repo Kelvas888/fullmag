@@ -2457,10 +2457,7 @@ fn authoring_update_blocking(
         .cloned()
         .ok_or_else(|| ApiError::internal("project application has no current document"))?;
     let raw_scene_matches = current.definition.scene.value() == &scene_value;
-    let renderable = scene_document
-        .objects
-        .iter()
-        .any(|object| object.role == "magnet")
+    let renderable = !scene_document.objects.is_empty()
         && validate_scene_document(&scene_document).is_ok();
     let generated_source = if renderable {
         let private_dir = workspace_root.join(format!(
