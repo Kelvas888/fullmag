@@ -345,6 +345,15 @@ export const INSTANCE_TAB_FRAME_ANCESTORS = instanceTabFrameSources(
   process.env[INSTANCE_DISCOVERY_PORTS_ENV],
 );
 
+/**
+ * The same window for the client: an embedded Control Room accepts tab
+ * visibility messages only from these loopback origins (ADR 0069).
+ */
+export function instanceTabPortsClientValue(value: string | undefined): string {
+  const { first, last } = resolveInstanceDiscoveryPorts(value);
+  return `${first}-${last}`;
+}
+
 function securityHeaders() {
   return [
     { key: "X-Content-Type-Options", value: "nosniff" },
@@ -380,6 +389,11 @@ function securityHeaders() {
 const nextConfig: NextConfig = {
   allowedDevOrigins,
   distDir,
+  env: {
+    FULLMAG_INSTANCE_TAB_PORTS: instanceTabPortsClientValue(
+      process.env[INSTANCE_DISCOVERY_PORTS_ENV],
+    ),
+  },
   // R3F v9 force-loses WebGL during React development strict remounts.
   reactStrictMode: false,
   ...(staticExport
