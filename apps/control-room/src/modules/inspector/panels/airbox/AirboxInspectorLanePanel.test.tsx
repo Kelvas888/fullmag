@@ -22,6 +22,7 @@ vi.mock("@/kernel/KernelContext", () => ({ useKernel: () => kernelMocks }));
 vi.mock("@/kernel/commands/commandContext", () => ({ createCommandContext: () => ({}) }));
 
 vi.mock("@/kernel/resources/useSessionStatus", () => ({
+  SESSION_STATUS_RESOURCE_KEY: "session:status",
   useSessionStatusSelector: (selector: (value: unknown) => unknown) =>
     selector({
       data: testState.discretization === null && !testState.authoringMethod

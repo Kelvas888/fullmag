@@ -188,11 +188,12 @@ describe("AirboxMeshBuildPanel", () => {
 
   it("renders bounded metadata instead of an oversized universe report", () => {
     testState.meshBuildRevision = 8;
+    testState.meshRevision = 7;
     testState.current = null;
     testState.latest = null;
     testState.report = {
       report: { payload: "x".repeat(5_000), status: "FAILED" },
-      revision: 8,
+      revision: 7,
     };
 
     const html = renderToStaticMarkup(

@@ -504,7 +504,7 @@ describe("FDM Airbox mesh demand", () => {
     );
 
     expect(settingsBlock).toContain(
-      "visualizationState: femLaneActive ? renderingState : null",
+      "visualizationState: renderingState",
     );
   });
 
@@ -796,7 +796,7 @@ describe("useViewport3DSceneModel", () => {
   it("uses canonical local Airbox settings for both FDM Airbox carriers", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     expect(source).toContain(
-      "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: femLaneActive ? renderingState : null,",
+      "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: renderingState,",
     );
     const fdmSingleGridAirboxBlock = source.slice(
       source.indexOf("const fdmSingleGridAirboxSettings ="),
@@ -817,7 +817,7 @@ describe("useViewport3DSceneModel", () => {
     expect(airboxSettingsBlock).toContain("resolveTargetVisualization({");
     expect(airboxSettingsBlock).toContain("target: AIRBOX_VISUALIZATION_TARGET");
     expect(airboxSettingsBlock).toContain(
-      "visualizationState: femLaneActive ? renderingState : null",
+      "visualizationState: renderingState",
     );
     expect(airboxSettingsBlock).not.toContain("resolveViewport3DFdmTargetVisualization({");
 

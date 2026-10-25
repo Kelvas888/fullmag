@@ -56,11 +56,15 @@ const sessionStatusMock = {
       },
     },
     domain: {
+      cell_count: 59_244,
       discretization: "fem",
+      generation_id: "generation-3",
     },
     resources: {
+      domain_generation_id: "generation-3",
       mesh_build_revision: 3,
       mesh_revision: 3,
+      topology_revision: 2,
     },
   },
   error: null,

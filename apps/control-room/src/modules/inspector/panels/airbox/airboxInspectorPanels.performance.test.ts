@@ -30,7 +30,7 @@ describe("Airbox inspector panel performance contracts", () => {
       "AirboxMeshTopologyPanel.tsx",
     ]) {
       expect(panelSources[file]).toMatch(
-        /useMeshSharedDomainManifestResource\s*\(\s*\{\s*enabled:\s*shouldLoadRuntimeMeshManifest\s*\(\s*true\s*,\s*runtimeStatus\s*\)/,
+        /useMeshSharedDomainManifestResource\s*\(\s*\{\s*enabled:\s*shouldLoadAirboxMeshManifest\s*\(\s*true\s*,\s*runtimeStatus\s*\)/,
       );
     }
     expect(panelSources["AirboxMeshBuildPanel.tsx"]).toMatch(
