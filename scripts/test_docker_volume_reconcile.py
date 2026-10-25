@@ -233,7 +233,7 @@ class ShellTransactions(unittest.TestCase):
         (folder / "result.json").write_bytes(result)
         return journal, result
 
-    def test_failed_build_publication_preserves_previous_verified_and_active_owner(self):
+    def assert_failure_publication(self, schema):
         self.original_lease()
         verified = self.base / "iteration/verified.json"
         verified.write_bytes(b"previous verified package")
@@ -241,7 +241,7 @@ class ShellTransactions(unittest.TestCase):
         journal = self.root + "/reconciliation/" + recovery.digest(result)
         folder = self.base / journal; folder.mkdir(parents=True)
         (folder / "result.json").write_bytes(result)
-        request = {**self.request, "schema": recovery.FAILED_BUILD_SCHEMA}
+        request = {**self.request, "schema": schema}
         script = self.script(recovery.claim_script(self.control, self.root, request,
             recovery.digest(self.original), publish_verified=False))
         outcome = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
@@ -253,6 +253,12 @@ class ShellTransactions(unittest.TestCase):
         self.assertEqual(verified.read_bytes(), b"previous verified package")
         self.assertEqual((self.base / "active").read_text().strip(), "1"*32)
         self.assertIsNone(self.children[0].poll())
+
+    def test_failed_build_publication_preserves_previous_verified_and_active_owner(self):
+        self.assert_failure_publication(recovery.FAILED_BUILD_SCHEMA)
+
+    def test_cgroup_failure_publication_preserves_previous_verified_and_active_owner(self):
+        self.assert_failure_publication(recovery.CGROUP_FAILURE_SCHEMA)
 
     def activation_case(self):
         self.root = "activation/attempts/" + "1"*32
@@ -620,5 +626,108 @@ class FailedBuildFences(unittest.TestCase):
         with self.assertRaises(recovery.BuildControlError):
             recovery.commit_script(control, "iteration/attempts/"+"1"*32, RequestFences().request(),
                 "journal", "d"*64, "e"*64, publish_verified=False)
+
+class CgroupFailureFences(unittest.TestCase):
+    def request(self):
+        request = RequestFences().request()
+        request["schema"] = recovery.CGROUP_FAILURE_SCHEMA
+        request["failure"] = {key: "a"*64 for key in ("checkpoint_sha256", "drain_sha256",
+            "helper_source_sha256", "helper_compose_sha256", "helper_log_sha256",
+            "cgroup_request_sha256", "verified_sha256", "recovery_helper_sha256")}
+        request["failure"].update(checkpoint_relative="verification/cgroup/current-checkpoint.json",
+            original_checkpoint_relative="verification/cgroup/original-checkpoint.json",
+            helper={"id": "b"*64, "name": "fullmag-cgroup-"+request["attempt"],
+                "image": "sha256:"+"6"*64, "started_at": "start", "finished_at": "finish",
+                "exit_code": 1, "fingerprint": "c"*64})
+        return request
+
+    def test_closed_failure_request_requires_completed_package_and_all_proofs(self):
+        recovery.validate_request(self.request())
+        for key in self.request()["failure"]:
+            with self.subTest(key=key), self.assertRaises(recovery.BuildControlError):
+                request = self.request(); del request["failure"][key]
+                recovery.validate_request(request)
+        for change in ({}, {"receipt": "8"*64}):
+            with self.subTest(package=change), self.assertRaises(recovery.BuildControlError):
+                request = self.request(); request["package_documents"] = change
+                recovery.validate_request(request)
+
+    def test_invalid_or_foreign_helper_and_checkpoint_cannot_be_admitted(self):
+        for key, value in (("id", None), ("image", []), ("fingerprint", 1),
+                ("name", "fullmag-cgroup-"+"2"*32), ("exit_code", 0), ("exit_code", True),
+                ("started_at", ""), ("finished_at", None)):
+            with self.subTest(key=key), self.assertRaises(recovery.BuildControlError):
+                request = self.request(); request["failure"]["helper"][key] = value
+                recovery.validate_request(request)
+        for relative in ("../verification/proof", "verification/../proof", "/verification/proof",
+                "verification//proof", "verification/./proof", "verification/proof\x00"):
+            with self.subTest(path=relative), self.assertRaises(recovery.BuildControlError):
+                request = self.request(); request["failure"]["checkpoint_relative"] = relative
+                recovery.validate_request(request)
+
+    def test_failure_schema_never_allows_success_publication(self):
+        request = self.request()
+        control = type("Control", (), {"path": staticmethod(lambda p: "/control/"+p)})()
+        with self.assertRaises(recovery.BuildControlError):
+            recovery.commit_script(control, "iteration/attempts/"+request["attempt"], request,
+                "journal", "d"*64, request["unknown_receipt_sha256"], publish_verified=True)
+
+
+class CgroupCpuEnableRace(unittest.TestCase):
+    @staticmethod
+    def module():
+        import importlib.util
+        path = Path(__file__).parent / "lib/docker_worker_cgroup.py"
+        spec = importlib.util.spec_from_file_location("delegation_gate", path)
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        return module
+
+    def exercise(self, errors):
+        import errno
+        from unittest.mock import Mock
+        module = self.module(); state = {"processes": "101", "enabled": "", "writes": 0, "moved": []}
+        root, controls = Path('/selected-backend'), Path('/selected-backend/fullmag-control')
+        def read(path, *args, **kwargs):
+            if path == root/'cgroup.procs': return state['processes']
+            if path == root/'cgroup.subtree_control': return state['enabled']
+            raise AssertionError('Unexpected read: '+str(path))
+        def write(path, value, *args, **kwargs):
+            if path == controls/'cgroup.procs':
+                state['moved'].append(value.strip()); state['processes'] = ''; return len(value)
+            if path != root/'cgroup.subtree_control': raise AssertionError('Unexpected write: '+str(path))
+            state['writes'] += 1
+            error = errors(state['writes'])
+            if error is not None:
+                # New process arrived precisely after the empty check/fence.
+                state['processes'] = str(101+state['writes'])
+                raise OSError(error, 'injected enable error')
+            self.assertEqual(state['processes'], ''); state['enabled'] = 'cpu'; return len(value)
+        fence = Mock()
+        with patch.object(Path, 'read_text', read), patch.object(Path, 'write_text', write):
+            try: module.enable_cpu(root, controls, fence)
+            except BaseException as error: return state, fence, error
+        return state, fence, None
+
+    def test_process_between_empty_read_and_enable_is_drained_on_retry(self):
+        import errno
+        state, fence, error = self.exercise(lambda n: errno.EBUSY if n == 1 else None)
+        self.assertIsNone(error); self.assertEqual(state['writes'], 2)
+        self.assertEqual(state['moved'], ['101', '102']); self.assertEqual(state['enabled'], 'cpu')
+        self.assertEqual(fence.call_count, 5)
+
+    def test_continuous_contention_is_bounded_and_never_returns_ready(self):
+        import errno
+        state, fence, error = self.exercise(lambda n: errno.EBUSY)
+        self.assertIsInstance(error, RuntimeError); self.assertEqual(state['writes'], 32)
+        self.assertEqual(state['enabled'], ''); self.assertIn('32 fenced attempts', str(error))
+
+    def test_non_busy_errors_are_not_retried(self):
+        import errno
+        for code in (errno.EPERM, errno.ENOENT, errno.EINVAL):
+            with self.subTest(code=code):
+                state, fence, error = self.exercise(lambda n: code)
+                self.assertIsInstance(error, OSError); self.assertEqual(error.errno, code)
+                self.assertEqual(state['writes'], 1); self.assertEqual(state['enabled'], '')
+
 
 if __name__ == "__main__": unittest.main(verbosity=2)

@@ -440,9 +440,13 @@ fn validate_attempt(
         }),
         _ => true,
     });
+    // The final heartbeat may be applied before its ACK is persisted. This
+    // read-only command grants no new effect; never fabricate its missing ACK.
+    let applied_prefix_matches = inbox.applied.as_slice() == acknowledged_prefix
+        || (unacknowledged_tail && inbox.applied == recovered.commands);
     if starts.len() != 1
         || inbox.pending.is_some()
-        || inbox.applied.as_slice() != acknowledged_prefix
+        || !applied_prefix_matches
         || !unacknowledged_tail
         || !all_prior_heartbeats_acknowledged
         || digest(&inbox)? != request.inbox_sha256

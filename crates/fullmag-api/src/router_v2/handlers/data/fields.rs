@@ -5561,7 +5561,13 @@ fn artifact_field_vector_response(
     let mut response=crate::router_v2::handlers::shared::conditional_binary_response(headers,&etag,binary);
     insert_field_headers(&mut response,&field.quantity_id,&component,field.quantity_revision,&locator.carrier_digest,
         locator.sample_count as usize,values.len());
-    for (name,value) in [(HDR_ENCODING,"FMVP;version=6".to_owned()),(HDR_FIELD_INDEXING,locator.indexing.as_str().to_owned()),
+    if let Some(scope_id)=locator.carrier_scope_id.as_deref() {
+        response.headers_mut().insert(HeaderName::from_static(HDR_SCOPE_ID),
+            HeaderValue::from_str(scope_id).map_err(|_| ApiError::conflict("invalid artifact response header"))?);
+    }
+    for (name,value) in [(HDR_ENCODING,"FMVP;version=6".to_owned()),
+        (HDR_SCOPE_KIND,locator.carrier_scope_kind),("x-fullmag-mesh-topology-hash",locator.carrier_digest.clone()),
+        (HDR_FIELD_INDEXING,locator.indexing.as_str().to_owned()),
         ("x-fullmag-carrier-id",locator.carrier_id),("x-fullmag-carrier-revision",locator.carrier_revision.to_string()),
         ("x-fullmag-carrier-digest",locator.carrier_digest),("x-fullmag-source-kind","artifact_inspection".into()),
         ("x-fullmag-source-id",locator.owner.source_digest),("x-fullmag-source-revision",field.quantity_revision.to_string()),
@@ -9236,6 +9242,80 @@ fn urlencoding(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn artifact_response_headers_follow_owned_scope_on_200_and_304() {
+        use crate::router_v2::handlers::data::artifact_field_carrier::{
+            ArtifactSampleCarrier, ArtifactSampleIdentity,
+        };
+        use crate::schemas::fields::{ArtifactFieldOwnerBinding, ArtifactSampleIndexing};
+        use axum::http::{HeaderMap, StatusCode, header::{ETAG, IF_NONE_MATCH}};
+
+        for (quantity, indexing, components, scope) in [
+            ("V_electric", ArtifactSampleIndexing::SourceNodes, 1, "object"),
+            ("J_charge", ArtifactSampleIndexing::Tet4CellLocalNodes, 3, "object"),
+            ("H_ant", ArtifactSampleIndexing::SampleNodes, 3, "object"),
+            ("H_ant", ArtifactSampleIndexing::SampleNodes, 3, "full"),
+        ] {
+            let owner = ArtifactFieldOwnerBinding {
+                session_id: "header-session".into(), session_epoch: "header-epoch".into(),
+                request_scope_epoch: "header-scope".into(), run_id: "header-run".into(),
+                runtime_stage_id: "header-runtime-stage".into(), authored_stage_id: "inspect".into(),
+                module_id: "transport".into(), object_id: "antenna".into(), output_id: "inspection".into(),
+                source_digest: format!("sha256:{}", "b".repeat(64)),
+                content_digest: format!("sha256:{}", "c".repeat(64)),
+                observation_mesh_revision: 1, observation_topology_revision: 1,
+                historical_inspection: true, accepted_artifact: None,
+                native_mesh_identity: "native-mesh".into(), native_topology_identity: "native-topology".into(),
+            };
+            let identities = (0_u8..4).map(|local| match indexing {
+                ArtifactSampleIndexing::SourceNodes => ArtifactSampleIdentity::SourceNode(10 + u64::from(local)),
+                ArtifactSampleIndexing::Tet4CellLocalNodes => ArtifactSampleIdentity::CellLocal {
+                    source_element_ordinal: 7, local_vertex_index: local, stable_vertex_id: 10 + u64::from(local),
+                },
+                ArtifactSampleIndexing::SampleNodes => ArtifactSampleIdentity::SampleOrdinal(u64::from(local)),
+                _ => unreachable!(),
+            }).collect();
+            let carrier = std::sync::Arc::new(ArtifactSampleCarrier {
+                owner, carrier_scope_kind: scope.into(),
+                carrier_scope_id: (scope == "object").then(|| "antenna".into()),
+                indexing, positions_xyz_m: vec![[0., 0., 0.], [1e-6, 0., 0.],
+                    [0., 1e-6, 0.], [0., 0., 1e-6]],
+                sample_identity: identities,
+                // This response serializes FMVP samples, not a topology response.
+                topology: None, carrier_digest: "a".repeat(64),
+                carrier_revision: u64::from_le_bytes([0xaa; 8]),
+            });
+            let field = ResolvedSpatialField::from_artifact_samples(
+                quantity, vec![1.; 4 * components], carrier, 3,
+            ).unwrap();
+            let locator = crate::router_v2::handlers::data::inspection_field_provider::locator(&field).unwrap();
+            // "full" is a supported complete-carrier alias, even for an object-owned carrier.
+            let query: FieldVectorQuery = serde_json::from_value(serde_json::json!({
+                "component": "full", "scope_kind": "full",
+                "carrier_id": locator.carrier_id, "stage_id": locator.owner.runtime_stage_id,
+                "expected_carrier_revision": locator.carrier_revision,
+                "expected_generation_id": locator.carrier_digest
+            })).unwrap();
+            let response = super::artifact_field_vector_response(&field, &query, &HeaderMap::new()).unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut conditional = HeaderMap::new();
+            conditional.insert(IF_NONE_MATCH, response.headers().get(ETAG).unwrap().clone());
+            let cached = super::artifact_field_vector_response(&field, &query, &conditional).unwrap();
+            assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+            for response in [&response, &cached] {
+                let headers = response.headers();
+                assert_eq!(headers.get("x-fullmag-scope-kind").unwrap().to_str().unwrap(),
+                    locator.carrier_scope_kind.as_str());
+                assert_eq!(headers.get("x-fullmag-scope-id").map(|v| v.to_str().unwrap()),
+                    locator.carrier_scope_id.as_deref());
+                let hash = headers.get("x-fullmag-mesh-topology-hash").unwrap().to_str().unwrap();
+                assert_eq!(hash.strip_prefix("sha256:").unwrap_or(hash), locator.carrier_digest.as_str());
+                assert_eq!(headers.get("x-fullmag-encoding").unwrap().to_str().unwrap(), "FMVP;version=6");
+                assert_eq!(headers.get("x-fullmag-n-comp").unwrap().to_str().unwrap(), components.to_string());
+            }
+        }
+    }
+
     #[test]
     fn response_etag_tracks_source_and_representation_independently() {
         let etag = |digest, view, component, phase| {

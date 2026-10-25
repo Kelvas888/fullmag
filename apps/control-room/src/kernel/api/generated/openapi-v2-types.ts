@@ -4999,7 +4999,20 @@ export interface components {
             study_step_id: string;
             task_id: string;
         };
-        AcceptedAntennaInspectionResource: {
+        AcceptedAntennaInspectionResource: components["schemas"]["AcceptedExternalLeadInspectionResource"] | components["schemas"]["AcceptedClosedLoopInspectionResource"];
+        AcceptedClosedLoopInspectionResource: {
+            capabilities: components["schemas"]["AntennaInspectionDisplayCapabilities"];
+            /** @description Existing verified, bounded closed-loop descriptors; numerical arrays stay binary. */
+            closed_loop_display: unknown;
+            normalization: string;
+            output_id: string;
+            owner: components["schemas"]["AcceptedAntennaInspectionIdentity"];
+            port_mode_id: string;
+            project_id: string;
+            resource_id: string;
+            schema_version: string;
+        };
+        AcceptedExternalLeadInspectionResource: {
             display: components["schemas"]["AntennaInspectionDisplayDataResource"];
             manifest: components["schemas"]["AntennaInspectionManifestResource"];
             output_id: string;
@@ -5027,6 +5040,14 @@ export interface components {
             /** Format: double */
             source_time_seconds?: number | null;
             topology_revision: string;
+        };
+        AcceptedRunExportSource: {
+            /** Format: int64 */
+            artifact_catalog_revision: number;
+            project_id: string;
+            /** Format: int64 */
+            run_catalog_revision: number;
+            run_id: string;
         };
         AcceptedStateGenerationResource: {
             /** Format: int64 */
@@ -12933,6 +12954,14 @@ export interface components {
         };
         /** @enum {string} */
         QuantityMaterializationCapability: "not_applicable" | "unmaterialized" | "pending" | "materialized" | "legacy_unverified" | "unavailable";
+        QuantityProjectionCapability: {
+            /** Format: int32 */
+            components: number;
+            output_shape: string;
+            publication: components["schemas"]["QuantityPublicationCapability"];
+            render: components["schemas"]["QuantityRenderCapability"];
+            token: string;
+        };
         /** @enum {string} */
         QuantityProviderCapability: "available" | "unavailable";
         /** @enum {string} */
@@ -13206,6 +13235,7 @@ export interface components {
             lane: string;
             materialization: components["schemas"]["QuantityMaterializationCapability"];
             precision: string;
+            projections?: components["schemas"]["QuantityProjectionCapability"][];
             provider: components["schemas"]["QuantityProviderCapability"];
             publication: components["schemas"]["QuantityPublicationCapability"];
             quantity_id: string;
@@ -14680,6 +14710,7 @@ export interface components {
             precision: components["schemas"]["ScratchSessionPrecision"];
         };
         SessionExportRequest: {
+            accepted_run?: null | components["schemas"]["AcceptedRunExportSource"];
             compression?: null | components["schemas"]["CompressionProfile"];
             /** @description Optional session name override. */
             name?: string | null;

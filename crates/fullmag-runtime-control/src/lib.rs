@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 pub mod accepted_store;
 pub mod study_inspection;
 mod study_inspection_integrity;
-pub use study_inspection_integrity::{load_saved_inspection, verify_saved_inspection};
+pub use study_inspection_integrity::{load_imported_study_evidence, load_imported_inspection, ImportedStudyEvidence, load_saved_inspection, verify_saved_inspection};
 pub mod application_attach;
 pub mod application_service_status;
 pub mod compute_node_probe;
@@ -727,6 +727,18 @@ pub fn load_accepted_run_snapshot(
     let intent = store
         .read_run_intent(run_id.as_str())?
         .context("accepted run intent is missing")?;
+    load_accepted_run_snapshot_from_intent(store.cas(), intent, run_id, project_id)
+}
+
+/// Validate the same immutable intent against a read-only imported CAS.
+/// This returns data only; it never grants scheduler or worker authority.
+pub fn load_accepted_run_snapshot_from_intent(
+    cas: &fullmag_session::CasStore,
+    intent: fullmag_session::FmsRunIntent,
+    run_id: &fullmag_application::RunId,
+    project_id: &fullmag_application::ProjectId,
+) -> Result<AcceptedRunSnapshot> {
+    intent.validate()?;
     let specification: fullmag_application::RunSpecification =
         serde_json::from_value(intent.specification.clone())
             .context("accepted run specification is not typed")?;
@@ -743,9 +755,8 @@ pub fn load_accepted_run_snapshot(
     if definition_ref != specification.snapshot.definition_sha256 {
         bail!("accepted run definition reference differs from snapshot");
     }
-    let definition_bytes = store
-        .cas()
-        .get(definition_ref)?
+    let definition_bytes = cas
+        .get_bounded(definition_ref, fullmag_session::MAX_TERMINAL_CATALOG_METADATA_BYTES)?
         .context("accepted run definition object is missing")?;
     Ok(AcceptedRunSnapshot {
         intent,
@@ -790,8 +801,8 @@ mod study;
 mod study_completion;
 pub use study::{
     materialize_accepted_worker_execution_plan,
-    load_accepted_study_snapshot, load_accepted_worker_step, load_accepted_worker_step_for_start,
-    load_accepted_worker_step_for_start_from_snapshot,
+    load_accepted_study_snapshot, load_accepted_study_snapshot_from_run, load_accepted_worker_step,
+    load_accepted_worker_step_for_start, load_accepted_worker_step_for_start_from_snapshot,
     load_study_observation_runtime, publish_accepted_task_prepare, publish_accepted_task_start,
     publish_study_outputs, publish_terminal_study_outputs, queue_accepted_study_task, resolve_accepted_study_inputs,
     validate_requested_execution, validate_study_task_completion, AcceptedStudySnapshot,

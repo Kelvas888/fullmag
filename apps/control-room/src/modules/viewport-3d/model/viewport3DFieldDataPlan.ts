@@ -634,6 +634,7 @@ export function resolveViewport3DAirboxFieldVectorDemandPlan({
   quantityCatalog,
   fieldQuery = { component: "full", scope_kind: "full" },
   quantityId,
+  tensorProjection = null,
   replayQuery = null,
   vectorBudget = fieldQuery.max_samples ?? 0,
   vectorsVisible = Boolean(fieldQuery.max_samples != null),
@@ -644,6 +645,7 @@ export function resolveViewport3DAirboxFieldVectorDemandPlan({
   quantityCatalog?: QuantityCatalogResource | null;
   fieldQuery?: FieldVectorQuery;
   quantityId: string;
+  tensorProjection?: string | null;
   replayQuery?: FieldVectorQuery | null;
   shaderVisible?: boolean;
   surfaceColorSource?: SurfaceColorSource;
@@ -654,6 +656,7 @@ export function resolveViewport3DAirboxFieldVectorDemandPlan({
     quantityCatalog,
     quantityId,
     "airbox",
+    tensorProjection,
   );
   if (
     (quantityCatalogSupportsAirbox === false ||
@@ -676,6 +679,7 @@ export function resolveViewport3DAirboxFieldVectorDemandPlan({
       quantityId,
       settings: {
         geometryScope: "full",
+        tensorProjection: normalizeTensorProjection(tensorProjection),
         scalarColorPalette: "viridis",
         shaderMonoColor: DEFAULT_VIEWPORT3D_SHADER_MONO_COLOR,
         shaderVisible: false,
@@ -746,15 +750,18 @@ function airboxQuantityIsAvailable({
   fieldCatalog,
   quantityCatalog,
   quantityId,
+  tensorProjection,
 }: {
   fieldCatalog?: FieldCatalogResource | null;
   quantityCatalog?: QuantityCatalogResource | null;
   quantityId: string;
+  tensorProjection?: string | null;
 }): boolean {
   const capability = quantityCatalogSupportsQuantity(
     quantityCatalog,
     quantityId,
     "airbox",
+    tensorProjection,
   );
   if (capability !== null) return capability;
   return !fieldCatalog || fieldCatalogQuantitySupportsAirbox(fieldCatalog, quantityId);
@@ -920,6 +927,7 @@ export function resolveViewport3DTargetQuantityFieldDemandPlan({
           fieldCatalog,
           quantityCatalog,
           quantityId,
+          tensorProjection: target.settings.tensorProjection,
         }))
     ) {
       continue;
@@ -988,6 +996,7 @@ export function resolveViewport3DTargetQuantityFieldDemandPlan({
           fieldCatalog,
           quantityCatalog,
           quantityId,
+          tensorProjection: target.settings.tensorProjection,
         }))
     ) {
       continue;

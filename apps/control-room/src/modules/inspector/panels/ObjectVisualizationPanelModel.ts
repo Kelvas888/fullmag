@@ -25,8 +25,8 @@ import {
   fieldCatalogQuantitySupportsAirbox,
   fieldCatalogQuantitySupportsSpatialVisualization,
   isScalarSpatialQuantityId,
-  quantityCatalogEntrySupportsAirbox,
-  quantityCatalogEntrySupportsSpatialVisualization,
+  quantityCatalogEntrySupportsAnyAirboxVisualization,
+  quantityCatalogEntrySupportsAnySpatialVisualization,
   resolveCanonicalQuantityId,
 } from "@/kernel/api/quantityIds";
 import {
@@ -2282,8 +2282,8 @@ export function visualizationQuantityItems(
     ? quantityCatalog.quantities
         .filter(
           targetKind === "airbox"
-            ? quantityCatalogEntrySupportsAirbox
-            : quantityCatalogEntrySupportsSpatialVisualization,
+            ? quantityCatalogEntrySupportsAnyAirboxVisualization
+            : quantityCatalogEntrySupportsAnySpatialVisualization,
         )
         .map((quantity) => ({
           label: quantity.label || quantity.id,

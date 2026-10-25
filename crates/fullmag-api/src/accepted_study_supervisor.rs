@@ -14,6 +14,9 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[path = "accepted_worker_execution_receipt.rs"]
+mod accepted_worker_execution_receipt;
+
 #[path = "owned_worker_process.rs"]
 mod owned_worker_process;
 #[path = "compute_operator_env.rs"]
@@ -2039,6 +2042,22 @@ fn reconcile_worker_exit(
         });
     }
 
+    if recovered.events.last().is_some_and(|event|
+        matches!(event.event, WorkerEvent::Failed { retryable: false, .. })
+    ) {
+        let _transaction = retry_store_writer_busy(|| store.write_transaction())?;
+        let fresh = fullmag_runtime_control::recover_coordinator(store, claim)?;
+        let fresh_inbox = fullmag_runtime_control::recover_worker_inbox(store, claim)?.checkpoint();
+        let decision = reported_nonretryable_failure(
+            store, claim, lease, process_exit, &fresh, &fresh_inbox,
+        )?.context("nonretryable terminal report changed before release")?;
+        retry_store_writer_busy(|| store.commit_retry_decision(&decision))
+            .context("persist worker-reported DoNotRetry before releasing its lease")?;
+        retry_store_writer_busy(|| store.release_resource_lease(lease))
+            .context("release exact lease after reported nonretryable worker exit")?;
+        return Ok(reported_failure_result(process_exit));
+    }
+
     if process_exit.status_success {
         bail!("worker exited successfully without a durable succeeded task");
     }
@@ -2140,6 +2159,86 @@ fn reconcile_worker_exit(
             .context("release terminal failed worker resource lease")?;
     }
     bail!("accepted worker exited without a successful durable completion")
+}
+
+fn reported_failure_result(exit: &FmsWorkerProcessExitReceipt) -> SupervisedWorkerResult {
+    SupervisedWorkerResult {
+        recovered_terminal_completion: false,
+        worker_timed_out: false,
+        worker_cancelled: false,
+        retry_scheduled: false,
+        worker_summary: serde_json::json!({
+            "status": "failed", "retryable": false, "exit_code": exit.exit_code,
+            "receipt_id": exit.receipt_id,
+        }),
+    }
+}
+
+/// Only a drained, fenced worker report can turn an unsuccessful child exit
+/// into a handled job. Stderr and an exit code alone never authorize release.
+fn reported_nonretryable_failure(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    lease: &FmsResourceLease,
+    exit: &FmsWorkerProcessExitReceipt,
+    recovered: &fullmag_runtime_control::RecoveredCoordinator,
+    inbox: &fullmag_application::WorkerInboxCheckpoint,
+) -> Result<Option<FmsRetryDecision>> {
+    let Some(last) = recovered.events.last() else { return Ok(None); };
+    let WorkerEvent::Failed { retryable: false, reason } = &last.event else { return Ok(None); };
+    if recovered.coordinator.phase() != CoordinatorPhase::Terminal
+        || recovered.coordinator.task().lifecycle != TaskLifecycle::Failed
+        || !recovered.events.iter().any(|event| matches!(event.event, WorkerEvent::Completing))
+        || recovered.events.iter().any(|event| matches!(event.event,
+            WorkerEvent::Completed { .. } | WorkerEvent::Stopped | WorkerEvent::Rejected { .. }))
+        || exit.status_success || exit.exit_code != Some(1) || exit.timed_out || exit.stop_requested
+        || inbox.pending.is_some() || inbox.applied != recovered.commands
+    {
+        bail!("nonretryable worker report lacks its drained terminal exit proof");
+    }
+    exit.validate_for_lease(lease)?;
+    let attempt = fullmag_session::repository_path::checked_path(store.root(), &format!(
+        "runs/{}/worker-attempts/{}/{}/epoch-{}", claim.run_id.as_str(),
+        claim.task_id.as_str(), claim.attempt_id.as_str(), claim.ownership_epoch.value(),
+    ))?;
+    if !accepted_worker_attempt_reserved(store, claim)? {
+        bail!("reported native failure has no reserved execution attempt");
+    }
+    match fs::symlink_metadata(attempt.join("worker_execution_completed.v1.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => bail!("reported native failure conflicts with a completed execution"),
+    }
+    if store.read_artifact_catalog(claim.run_id.as_str())?
+        .is_some_and(|catalog| catalog.entries.iter().any(|entry|
+            entry.task_id == claim.task_id.as_str()
+                && entry.attempt_id == claim.attempt_id.as_str()
+                && entry.ownership_epoch == claim.ownership_epoch.value())) {
+        bail!("reported native failure conflicts with accepted artifacts");
+    }
+    let starts = recovered.commands.iter()
+        .filter(|command| matches!(command.command, WorkerCommand::Start)).collect::<Vec<_>>();
+    if starts.len() != 1 {
+        bail!("reported native failure requires exactly one Start");
+    }
+    accepted_worker_execution_receipt::validate_reported_native_failure_started(
+        store, &attempt, claim, starts[0],
+    )?;
+    let decision = FmsRetryDecision {
+        schema_version: FMS_RETRY_DECISION_SCHEMA.into(),
+        decision_id: format!("reported-failure-{}", fullmag_session::hex_sha256(last.message_id.as_bytes())),
+        run_id: claim.run_id.as_str().into(), task_id: claim.task_id.as_str().into(),
+        attempt_id: claim.attempt_id.as_str().into(), ownership_epoch: claim.ownership_epoch.value(),
+        trigger: FmsRetryTrigger::WorkerDisconnected,
+        action: FmsRetryAction::DoNotRetry, reason: reason.clone(), created_at: lease.acquired_at,
+    };
+    if store.list_retry_decisions(claim.run_id.as_str())?.iter().any(|stored|
+        stored.task_id == decision.task_id && stored.attempt_id == decision.attempt_id
+        && stored.ownership_epoch == decision.ownership_epoch && stored != &decision
+    ) {
+        bail!("reported worker failure conflicts with an existing retry decision");
+    }
+    Ok(Some(decision))
 }
 
 fn accepted_worker_attempt_reserved(
@@ -2380,6 +2479,27 @@ fn reconcile_durable_worker_exit_before_spawn(
             .iter()
             .find(|task| task.task_id == task_id)
             .context("reconciled process exit task is missing")?;
+        if task.lifecycle == fullmag_session::FmsTaskLifecycle::Failed {
+            let lease = store.read_resource_lease(run_id, &receipt.resource_id, &receipt.lease_token)?
+                .context("reported failure replay requires its retained lease")?;
+            if lease.state != fullmag_session::FmsResourceLeaseState::Released || lease.released_at.is_none() {
+                bail!("reported failure replay requires the exact released lease");
+            }
+            // Validate the receipted pre-release identity without rewriting
+            // the durable Released record or minting another allocation.
+            let mut before_release = lease.clone();
+            before_release.state = fullmag_session::FmsResourceLeaseState::Active;
+            before_release.released_at = None;
+            let claim = claim_from_worker_process_exit(&receipt, &before_release)?;
+            let recovered = fullmag_runtime_control::recover_coordinator(store, &claim)?;
+            let inbox = fullmag_runtime_control::recover_worker_inbox(store, &claim)?.checkpoint();
+            let decision = reported_nonretryable_failure(store, &claim, &before_release, &receipt, &recovered, &inbox)?
+                .context("released failure has no authenticated nonretryable report")?;
+            if !store.list_retry_decisions(run_id)?.iter().any(|stored| stored == &decision) {
+                bail!("released worker failure has no exact durable DoNotRetry");
+            }
+            return Ok(Some(reported_failure_result(&receipt)));
+        }
         return match task.lifecycle {
             fullmag_session::FmsTaskLifecycle::Succeeded => Ok(Some(SupervisedWorkerResult {
                 recovered_terminal_completion: true,
@@ -2785,6 +2905,178 @@ fn is_coordinator_watermark_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+
+    /// Exercise the real journal, inbox, artifact catalog and release replay.
+    /// No child, solver, host admission or test-only production bypass is used.
+    #[test]
+    fn reported_failure_preserves_prior_outputs_and_requires_exact_started_identity() {
+        use fullmag_application::{
+            DurableWorkerCoordinator, ProjectId, ProjectSnapshot, RequestedExecution,
+            ResourceBudget, ResourceKind, ResourceLease, RunSpecification, StudyId,
+            StudyReference, TaskId, TaskRecord, WorkerCoordinator,
+        };
+        use fullmag_authoring::{StudyPlan, STUDY_PLAN_SCHEMA_VERSION};
+        use fullmag_plan::{StudyProblemCatalog, StudyProblemCatalogEntry};
+
+        for mutation in ["none", "current_artifact", "case", "plan", "missing_plan", "pending", "exit"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = SessionStore::open(directory.path().join("store")).unwrap();
+            let study: StudyPlan = serde_json::from_value(serde_json::json!({
+                "schema_version": STUDY_PLAN_SCHEMA_VERSION, "study_id": "failure-study", "revision": 1,
+                "steps": [{
+                    "step_id": "solver", "label": "solver",
+                    "kind": {"kind": "primitive", "stage_kind": "run"},
+                    "model": {"model_id": "m", "version": "v1"},
+                    "solver_config": {"preset_id": "s", "version": "v1"},
+                    "discretization": {"recipe_id": "d", "version": "v1"},
+                    "execution_profile": {"profile_id": "e", "version": "v1"},
+                    "until_seconds": 1e-9, "acceptance": {"kind": "any"}, "acquisition": "exclusive"
+                }]
+            })).unwrap();
+            let problems = StudyProblemCatalog::from_entries(&study, vec![
+                StudyProblemCatalogEntry::from_step(&study.steps[0], fullmag_ir::ProblemIR::bootstrap_example()),
+            ]).unwrap();
+            let definition = store.cas().put(b"{}").unwrap();
+            let study_ref = store.cas().put(&study.canonical_json_bytes().unwrap()).unwrap();
+            let catalog_ref = store.cas().put(&fullmag_session::canonical_json_bytes(
+                &serde_json::to_value(&problems).unwrap())).unwrap();
+            let specification = RunSpecification::new(
+                ProjectSnapshot { project_id: ProjectId::new(), definition_revision: 1, definition_sha256: definition.clone() },
+                StudyReference { study_id: StudyId::parse("failure-study").unwrap(),
+                    plan_version: STUDY_PLAN_SCHEMA_VERSION.into(), plan_sha256: study_ref.clone() },
+                catalog_ref.clone(), serde_json::json!({}),
+                RequestedExecution { backend: "fdm".into(), device: "cpu".into(), precision: "double".into(),
+                    mode: "strict".into(), minimum_resources: None },
+            );
+            let mut intent = fullmag_session::FmsRunIntent::new(specification.run_id.as_str(),
+                "reported-failure-fixture", serde_json::to_value(&specification).unwrap());
+            intent.definition_object_ref = Some(definition);
+            intent.study_object_ref = Some(study_ref);
+            intent.study_catalog_object_ref = Some(catalog_ref);
+            store.commit_run_intent(&intent).unwrap();
+            let accepted = fullmag_runtime_control::load_accepted_study_snapshot(
+                &store, &specification.run_id, &specification.snapshot.project_id).unwrap();
+            let lowered = &accepted.lowered.steps[0];
+            let mut task = TaskRecord::new(specification.run_id.clone(),
+                fullmag_application::study_task_input_fingerprint(&specification, lowered).unwrap()).unwrap();
+            task.task_id = TaskId::parse(fullmag_session::task_id_for_study_step(
+                specification.run_id.as_str(), "solver").unwrap()).unwrap();
+            task.queue().unwrap();
+            let claim = task.claim(ResourceLease::new("failure-cpu", ResourceKind::Cpu,
+                ResourceBudget { cpu_millis: 100, memory_bytes: 1024, storage_bytes: 1024, gpu_memory_bytes: 0 }
+            ).unwrap()).unwrap();
+            let now = chrono::Utc::now();
+            let current = fullmag_session::FmsTaskCatalogEntry {
+                task_id: claim.task_id.as_str().into(), input_fingerprint: task.input_fingerprint.clone(),
+                lifecycle: fullmag_session::FmsTaskLifecycle::Preparing,
+                readiness: fullmag_session::FmsTaskReadiness::Ready, observation: None,
+                attempt_id: Some(claim.attempt_id.as_str().into()), ownership_epoch: Some(claim.ownership_epoch.value()),
+                resolved_input_fingerprint: None, artifact_ids: vec![], resource_id: Some(claim.lease.resource_id.clone()),
+                coordinator_watermark: Some(fullmag_session::FmsCoordinatorWatermark::default()), coordinator_genesis: None,
+            };
+            let mut prior = current.clone();
+            prior.task_id = "task-prior".into();
+            prior.attempt_id = Some("attempt-prior".into());
+            prior.resource_id = Some("prior-cpu".into());
+            prior.lifecycle = fullmag_session::FmsTaskLifecycle::Running;
+            prior.coordinator_watermark = None;
+            store.commit_run_catalog(&fullmag_session::FmsRunCatalog {
+                schema_version: fullmag_session::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: claim.run_id.as_str().into(), revision: 1, updated_at: now, tasks: vec![current, prior],
+            }).unwrap();
+            let lease = FmsResourceLease {
+                schema_version: fullmag_session::FMS_RESOURCE_LEASE_SCHEMA.into(),
+                resource_id: claim.lease.resource_id.clone(), kind: fullmag_session::FmsResourceKind::Cpu,
+                budget: fullmag_session::FmsResourceBudget { cpu_millis: 100, memory_bytes: 1024, storage_bytes: 1024, gpu_memory_bytes: 0 },
+                run_id: claim.run_id.as_str().into(), task_id: claim.task_id.as_str().into(),
+                attempt_id: claim.attempt_id.as_str().into(), ownership_epoch: claim.ownership_epoch.value(),
+                lease_token: claim.lease.lease_token.as_str().into(), state: fullmag_session::FmsResourceLeaseState::Active,
+                acquired_at: now, heartbeat_at: now, heartbeat_sequence: 0, released_at: None, host_launch_binding: None,
+            };
+            store.commit_resource_lease(&lease).unwrap();
+            let mut prior_lease = lease.clone();
+            prior_lease.task_id = "task-prior".into();
+            prior_lease.attempt_id = "attempt-prior".into();
+            prior_lease.resource_id = "prior-cpu".into();
+            prior_lease.lease_token = "prior-lease".into();
+            store.commit_resource_lease(&prior_lease).unwrap();
+            let artifact = fullmag_session::FmsArtifactCatalogEntry {
+                artifact_id: "prior-result".into(), task_id: prior_lease.task_id.clone(),
+                attempt_id: prior_lease.attempt_id.clone(), ownership_epoch: prior_lease.ownership_epoch,
+                logical_path: "prior-result.bin".into(), artifact_type: "diagnostic".into(),
+                content_sha256: "a".repeat(64), object_ref: None,
+                status: fullmag_session::FmsArtifactStatus::Published, required: false, study_output: None,
+            };
+            store.append_artifact_catalog_entries_for_lease(&prior_lease, &[artifact.clone()]).unwrap();
+            let mut catalog = store.read_run_catalog(claim.run_id.as_str()).unwrap().unwrap();
+            catalog.tasks.iter_mut().find(|task| task.task_id == prior_lease.task_id).unwrap().lifecycle =
+                fullmag_session::FmsTaskLifecycle::Succeeded;
+            catalog.revision += 1;
+            store.commit_run_catalog(&catalog).unwrap();
+            store.release_resource_lease(&prior_lease).unwrap();
+
+            let mut coordinator = DurableWorkerCoordinator::new(WorkerCoordinator::new(task, claim.clone()).unwrap());
+            fullmag_runtime_control::commit_coordinator_genesis(&store, &coordinator.checkpoint()).unwrap();
+            let start = commit_worker_command(&store, &mut coordinator, WorkerCommand::Start).unwrap();
+            let mut inbox = fullmag_runtime_control::DurableWorkerInbox::new(
+                SessionStore::open_existing(store.root()).unwrap(), claim.clone());
+            inbox.receive(&start, |_| Ok(())).unwrap();
+            commit_worker_event(&store, &mut coordinator, WorkerEvent::Started).unwrap();
+            if mutation == "current_artifact" {
+                let mut entry = artifact.clone();
+                entry.artifact_id = "failed-result".into(); entry.logical_path = "failed-result.bin".into();
+                entry.task_id = lease.task_id.clone(); entry.attempt_id = lease.attempt_id.clone();
+                store.append_artifact_catalog_entries_for_lease(&lease, &[entry]).unwrap();
+            }
+            commit_worker_event(&store, &mut coordinator, WorkerEvent::Completing).unwrap();
+            commit_worker_event(&store, &mut coordinator, WorkerEvent::Failed {
+                retryable: false, reason: "returned prepared native failure".into(),
+            }).unwrap();
+            let attempt = store.root().join(format!("runs/{}/worker-attempts/{}/{}/epoch-{}",
+                claim.run_id.as_str(), claim.task_id.as_str(), claim.attempt_id.as_str(), claim.ownership_epoch.value()));
+            fs::create_dir_all(&attempt).unwrap();
+            let mut started = serde_json::json!({"identity": {
+                "schema_version": "fullmag.accepted_worker_execution.v1", "claim": claim,
+                "start_message_id": start.message_id, "start_sequence": start.sequence,
+                "case_id": "default", "plan_fingerprint": fullmag_session::canonical_json_sha256(
+                    &serde_json::to_value(lowered.execution_plan.as_ref().unwrap()).unwrap())
+            }});
+            match mutation {
+                "case" => started["identity"]["case_id"] = serde_json::json!("foreign"),
+                "plan" => started["identity"]["plan_fingerprint"] = serde_json::json!("f".repeat(64)),
+                "missing_plan" => { started["identity"].as_object_mut().unwrap().remove("plan_fingerprint"); }
+                _ => {}
+            }
+            fs::write(attempt.join("worker_execution_started.v1.json"), serde_json::to_vec(&started).unwrap()).unwrap();
+            let exit = FmsWorkerProcessExitReceipt {
+                schema_version: FMS_WORKER_PROCESS_EXIT_RECEIPT_SCHEMA.into(), receipt_id: "failure-exit".into(),
+                run_id: lease.run_id.clone(), task_id: lease.task_id.clone(), attempt_id: lease.attempt_id.clone(),
+                ownership_epoch: lease.ownership_epoch, resource_id: lease.resource_id.clone(), lease_token: lease.lease_token.clone(),
+                lease_heartbeat_sequence: 0, process_id: 42, process_start_token: None,
+                status_success: false, exit_code: Some(if mutation == "exit" { 2 } else { 1 }),
+                timed_out: false, stop_requested: false, failure_reason: Some("controlled failure".into()), observed_at: now,
+            };
+            let recovered = fullmag_runtime_control::recover_coordinator(&store, &claim).unwrap();
+            let mut checkpoint = inbox.checkpoint();
+            if mutation == "pending" { checkpoint.pending = Some(start.clone()); }
+            let proof = reported_nonretryable_failure(&store, &claim, &lease, &exit, &recovered, &checkpoint);
+            if mutation != "none" {
+                assert!(proof.is_err(), "{mutation} must retain the allocation");
+                assert_eq!(store.read_resource_lease(&lease.run_id, &lease.resource_id, &lease.lease_token).unwrap().unwrap().state,
+                    fullmag_session::FmsResourceLeaseState::Active);
+                continue;
+            }
+            assert!(proof.unwrap().is_some(), "previous task output must not block this failure");
+            store.commit_worker_process_exit_receipt(&exit).unwrap();
+            reconcile_worker_exit(&store, &claim, &lease, &exit, None, 0).unwrap();
+            let replay = reconcile_durable_worker_exit_before_spawn(&store, &lease.run_id, &lease.task_id, 0).unwrap().unwrap();
+            assert!(!replay.retry_scheduled);
+            assert_eq!(store.read_artifact_catalog(&lease.run_id).unwrap().unwrap().entries, vec![artifact]);
+            assert_eq!(store.read_resource_lease(&lease.run_id, &lease.resource_id, &lease.lease_token).unwrap().unwrap().state,
+                fullmag_session::FmsResourceLeaseState::Released);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

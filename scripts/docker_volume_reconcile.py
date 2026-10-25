@@ -9,6 +9,7 @@ import re
 import subprocess
 import time
 import uuid
+from docker_worker_cgroup import CGROUP_FAILURE_SCHEMA
 from docker_build_control import (BuildControl, BuildControlError, MAX_DOCUMENT_BYTES,
     bounded_capture, canonical, control_read_script, docker_capture, toolchain_configuration)
 
@@ -62,14 +63,17 @@ def fingerprint(actual):
 
 def validate_request(request):
     prestart = isinstance(request, dict) and request.get("schema") == PRESTART_SCHEMA
-    failed = isinstance(request, dict) and request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA)
+    cgroup = isinstance(request, dict) and request.get("schema") == CGROUP_FAILURE_SCHEMA
+    failed = isinstance(request, dict) and request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA)
     expected = {"schema", "attempt", "compose_project", "source_root", "port", "config_sha256",
         "unknown_receipt_sha256", "controller_sha256", "containers", "package_documents"}
     if failed:
         expected = (expected - {"package_documents"}) | {"failure"}
+    if cgroup:
+        expected.add("package_documents")
     if prestart:
         expected.add("prestart_helper_sha256")
-    require(isinstance(request, dict) and set(request) == expected and request["schema"] in (SCHEMA, FAILED_BUILD_SCHEMA, PRESTART_SCHEMA),
+    require(isinstance(request, dict) and set(request) == expected and request["schema"] in (SCHEMA, FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA),
             "Reconciliation request schema/keys differ")
     require(isinstance(request["attempt"], str) and TOKEN.fullmatch(request["attempt"]), "Invalid iteration attempt")
     for key in ("config_sha256", "unknown_receipt_sha256", "controller_sha256"):
@@ -86,12 +90,15 @@ def validate_request(request):
                 and isinstance(pin["started_at"], str) and bool(pin["started_at"]), "Incomplete container pin: " + name)
     require(len({pin["id"] for pin in request["containers"].values()}) == 3,
             "Lease/backend/frontend must be distinct containers")
+    if cgroup:
+        from docker_worker_cgroup import validate_failure_pin
+        validate_failure_pin(request["failure"], request["attempt"])
     if prestart:
         from docker_volume_prestart_recovery import validate_failure_pin
         require(isinstance(request["prestart_helper_sha256"], str) and SHA.fullmatch(request["prestart_helper_sha256"]), "Invalid prestart helper digest")
         validate_failure_pin(request["failure"])
         return
-    if failed:
+    if failed and not cgroup:
         proof = request["failure"]
         require(isinstance(proof, dict) and set(proof) == {
             "checkpoint_sha256", "drain_sha256", "log_sha256", "finished_at", "exit_code"},
@@ -196,6 +203,9 @@ def validate_failed_build(control, root, request, original, actual, state):
     if request["schema"] == PRESTART_SCHEMA:
         from docker_volume_prestart_recovery import validate_failure
         return validate_failure(control, root, request, original, actual, state)
+    if request["schema"] == CGROUP_FAILURE_SCHEMA:
+        from docker_worker_cgroup import validate_failure
+        return validate_failure(control, root, request, original, actual, state)
     proof = request["failure"]
     checkpoint_raw = read_raw(control, root + "/saved-authoring-checkpoint.json")
     drain_raw = read_raw(control, root + "/backend-drain.json")
@@ -264,7 +274,9 @@ def commit_script(control, root, request, journal_relative, result_sha, current_
                  and request.get("schema") == TOOLCHAIN_CANCELED_SCHEMA)
     require(activation or toolchain or (phase, publish_verified) in (("iteration", True), ("iteration", False), ("boris-reference", False)), "Closed reconciliation phase required")
     require(phase != "iteration" or publish_verified
-            or request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA), "Failure-only publication requires its explicit schema")
+            or request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA), "Failure-only publication requires its explicit schema")
+    require(not publish_verified or request.get("schema") not in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA),
+            "A failed iteration cannot publish a verified success")
     phase = control.path(phase)
     targets = f"'{path}/receipt.json' '{phase}/current.json' " + (f"'{phase}/verified.json' " if publish_verified else "") + f"'{path}/terminal.json'"
     marker_commit = ""
@@ -349,14 +361,16 @@ def reconcile(args):
         from docker_activation_preflight_runtime import reconcile_preflight
         return reconcile_preflight(args, control, selected, request, request_raw)
     prestart = isinstance(request, dict) and request.get("schema") == PRESTART_SCHEMA
-    require(prestart or not getattr(args, "preview", False), "Preview is scoped to activation-preflight or prestart reconciliation")
-    if not prestart:
+    cgroup = isinstance(request, dict) and request.get("schema") == CGROUP_FAILURE_SCHEMA
+    typed_failure = prestart or cgroup or (isinstance(request, dict) and request.get("schema") == FAILED_BUILD_SCHEMA)
+    require(typed_failure or not getattr(args, "preview", False), "Preview is scoped to a typed failure reconciliation")
+    if not typed_failure:
         _require_native_windows()
     if isinstance(request, dict) and request.get("schema") == "fullmag.boris.preproducer-reconciliation.v1":
         from docker_boris_volume import reconcile_preproducer
         return reconcile_preproducer(args, control, selected, request, request_raw)
     validate_request(request)
-    failed_build = request["schema"] in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA)
+    failed_build = request["schema"] in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA)
     require(request["source_root"] == str(selected) and request["compose_project"] == control.project
             and request["port"] == args.port, "Selected checkout/group/port differs")
     require(digest(Path(__file__).read_bytes()) == request["controller_sha256"], "Controller code differs from reviewed request")
@@ -402,7 +416,7 @@ def reconcile(args):
     dev._operator_probe_record_from_retained(original, document)
     cache = control.read(base + "/backend-cache.json")
     state = storage.validate_path(Path(original["state_root"]), layout["runtime_root"], "retained Windows sessions")
-    if prestart:
+    if typed_failure:
         certificate_path = dev._certificate_path(state)
         certificate = dev._retained_certificate(state, document)
         ledger_profile = None  # Failure-only reconciliation never calls _finish.
@@ -434,8 +448,8 @@ def reconcile(args):
     validate_partial_journal(control, journal_root, current_raw,
                              request["unknown_receipt_sha256"], args.request_sha256)
     observer_script = claim_script(control, root, request, digest(current_raw), publish_verified=not failed_build)
-    if prestart and getattr(args, "preview", False):
-        print(json.dumps({"state": "validated-only", "attempt": request["attempt"], "schema": PRESTART_SCHEMA}))
+    if typed_failure and getattr(args, "preview", False):
+        print(json.dumps({"state": "validated-only", "attempt": request["attempt"], "schema": request["schema"]}))
         return
     claim_name = "fullmag-iteration-observer-" + uuid.uuid4().hex
     claim = subprocess.Popen(control.helper_args(observer_script, name=claim_name),
@@ -481,7 +495,7 @@ def reconcile(args):
         require(control._line(claim) == "OBSERVING", "Observer BEGIN outcome unknown; resources retained")
         if failed_build:
             actual = inspect_pins(request)
-            result["prestart_failure_proof" if prestart else "failed_build_proof"] = validate_failed_build(control, root, request, original, actual, state)
+            result["cgroup_failure_proof" if cgroup else "prestart_failure_proof" if prestart else "failed_build_proof"] = validate_failed_build(control, root, request, original, actual, state)
             result.update(state="failed-confirmed", backend_container=ids["backend"],
                           frontend_container=ids["frontend"])
         else:
@@ -507,6 +521,9 @@ def reconcile(args):
         claim.stdin.close()
         require(control._line(claim) == "COMMITTED", "Finalization outcome unknown; original owner/journal retained")
         require(read_raw(control, root + "/terminal.json") == result_raw, "Terminal publication differs")
+        if cgroup:
+            require(digest(read_raw(control, "iteration/verified.json")) == request["failure"]["verified_sha256"],
+                    "Failure-only publication changed the last verified iteration")
         # The old helper alone removes active after seeing terminal; we never unlink it.
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -546,7 +563,7 @@ def main():
     parser.add_argument("--request", required=True)
     parser.add_argument("--request-sha256", required=True)
     parser.add_argument("--port", required=True, type=int)
-    parser.add_argument("--preview", action="store_true", help="Read-only activation-preflight validation")
+    parser.add_argument("--preview", action="store_true", help="Read-only validation of a typed failure reconciliation")
     reconcile(parser.parse_args())
 
 

@@ -2562,7 +2562,9 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-plan",
+        "gm-implemented-kernel"
       ]
     },
     {
@@ -2594,7 +2596,8 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-plan"
       ]
     },
     {
@@ -2626,7 +2629,8 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-angular"
       ]
     },
     {
@@ -2658,7 +2662,8 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-radial-parameters"
       ]
     },
     {
@@ -2690,7 +2695,9 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-kernel",
+        "gm-implemented-direct"
       ]
     },
     {
@@ -2722,7 +2729,8 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-radial-parameters"
       ]
     },
     {
@@ -2754,7 +2762,8 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-kernel"
       ]
     },
     {
@@ -2786,7 +2795,8 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-kernel"
       ]
     },
     {
@@ -2850,7 +2860,8 @@
         "gm-prereg",
         "gm-routing",
         "gm-radial",
-        "gm-accounting"
+        "gm-accounting",
+        "gm-implemented-gates"
       ]
     },
     {
@@ -3081,7 +3092,11 @@
         "prereg_operators"
       ],
       "sources": [
-        "analytic-v2-prereg"
+        "analytic-v2-prereg",
+        "antenna-retained-rt0-surface-evaluation",
+        "antenna-retained-rt0-field-regressions",
+        "native-surface-rt0-current",
+        "native-surface-rt0-evaluator"
       ]
     },
     {
@@ -3100,7 +3115,9 @@
         "prereg_operators"
       ],
       "sources": [
-        "analytic-v2-prereg"
+        "analytic-v2-prereg",
+        "native-surface-rt0-geometry",
+        "native-surface-rt0-faces"
       ]
     },
     {
@@ -3119,7 +3136,9 @@
         "prereg_operators"
       ],
       "sources": [
-        "analytic-v2-prereg"
+        "analytic-v2-prereg",
+        "native-surface-rt0-geometry",
+        "native-surface-rt0-faces"
       ]
     },
     {
@@ -3138,7 +3157,9 @@
         "prereg_operators"
       ],
       "sources": [
-        "analytic-v2-prereg"
+        "analytic-v2-prereg",
+        "native-surface-rt0-geometry",
+        "native-surface-rt0-faces"
       ]
     },
     {
@@ -3157,7 +3178,9 @@
         "prereg_operators"
       ],
       "sources": [
-        "analytic-v2-prereg"
+        "analytic-v2-prereg",
+        "native-surface-rt0-geometry",
+        "native-surface-rt0-faces"
       ]
     },
     {
@@ -3306,7 +3329,9 @@
       ],
       "sources": [
         "antenna-retained-rt0-exact-sampling-prereg",
-        "antenna-rt0-exact-retained-point-owner"
+        "antenna-rt0-exact-retained-point-owner",
+        "native-surface-rt0-current",
+        "native-surface-rt0-frozen-input"
       ]
     },
     {
@@ -3414,8 +3439,18 @@
       "responsibility": "Regresja zachowania odmowy nowego profilu dla external-lead; test przygotowany do CI.",
       "evidence_status": "source_only"
     },
-    {"id": "antenna-retained-reference-fit", "path": "scripts/antenna_rt0_surface_oracle.py", "symbol": "fit_retained_rt0", "responsibility": "Independent centered scalar RT0 Householder reconstruction; no solver or H qualification."},
-    {"id": "antenna-retained-reference-fit-tests", "path": "scripts/test_antenna_rt0_surface_oracle.py", "symbol": "test_full_affine_non_rt0_gradients_are_rejected", "responsibility": "Analytic coefficients, invalid affine fields, geometry, scale and exact-input regressions."},
+    {
+      "id": "antenna-retained-reference-fit",
+      "path": "scripts/antenna_rt0_surface_oracle.py",
+      "symbol": "fit_retained_rt0",
+      "responsibility": "Independent centered scalar RT0 Householder reconstruction; no solver or H qualification."
+    },
+    {
+      "id": "antenna-retained-reference-fit-tests",
+      "path": "scripts/test_antenna_rt0_surface_oracle.py",
+      "symbol": "test_full_affine_non_rt0_gradients_are_rejected",
+      "responsibility": "Analytic coefficients, invalid affine fields, geometry, scale and exact-input regressions."
+    },
     {
       "id": "antenna-sushruth-2020-gsg-study",
       "path": "examples/fem_antenna_sushruth_2020_gsg.py",
@@ -8167,12 +8202,296 @@
       "symbol": "study",
       "responsibility": "Niemagnetyczny Universe i jawny volume_inspection_v1; diagnostyczna siatka 1154 węzły/6487 Tet4; wykonanie H nadal oczekuje na weryfikację.",
       "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-retained-rt0-surface-evaluation",
+      "path": "scripts/antenna_rt0_surface_oracle.py",
+      "symbol": "evaluate_retained_rt0",
+      "responsibility": "Redukcja jednego zachowanego RT0 do H przez istniejące potencjały czterech outward faces; wspólne bramki precyzji i budżetu.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "antenna-retained-rt0-field-regressions",
+      "path": "scripts/test_antenna_rt0_surface_oracle.py",
+      "symbol": "class RetainedRT0FieldTests",
+      "responsibility": "Znany H, znaki i skalowanie, niezerowy target, dodatnia permutacja, bramka64epsilon i wspólny wyczerpany budżet.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-plan",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "prepare_case",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-angular",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "angular_point",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-radial-parameters",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "radial_parameters",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-kernel",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "mapped_radial_sample",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-direct",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "direct_pass",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-radial",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "radial_pass",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-gates",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "check_gates",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-pair",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "reference_pair",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-cases",
+      "path": "scripts/antenna_triangle_general_map_reference.py",
+      "symbol": "frozen_cases24",
+      "responsibility": "Źródłowy właściciel general-map; interpreted tests i review, bez rzeczywistej kwadratury i kwalifikacji native.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "gm-implemented-tests",
+      "path": "scripts/test_antenna_triangle_general_map_reference.py",
+      "symbol": "class GeneralMapReferenceTests",
+      "responsibility": "14 regresji algebry, liczników i mockowanej kwadratury; brak actual quad.",
+      "evidence_status": "interpreted_synthetic_tests"
+    },
+    {
+      "id": "native-surface-rt0-contract",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.hpp",
+      "symbol": "evaluate_surface_rt0",
+      "responsibility": "Prywatny C++ interfejs FrozenInput, mandatory typed limits/tolerances i callback RSS; brak publicznego Python/IR/dispatch.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-frozen-input",
+      "path": "backends/fem/cpu/mfem/transport/affine_rt0_element.cpp",
+      "symbol": "AffineRt0Element::frozen_input",
+      "responsibility": "Własna kopia geometrii i generic signed coefficients A, bez MFEM aliasu i powtórnego znaku; nie face fluxes.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-current",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "element",
+      "responsibility": "Dokładny J(r) ze współczynników i abs(det) tego samego FrozenInput, bez QR/nodal average/current_at lub solve.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-outward",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "outward_face",
+      "responsibility": "Winding outward dla obu orientacji Tet4, bez permutowania coefficients; exact opposite-apex predicate.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-geometry",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "geometry",
+      "responsibility": "Exact zero/sign, normalizacja power-of-two i skalowane dane scalar faces; bez przesuwania targetu.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-faces",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "face_pass",
+      "responsibility": "Scalar signed-fan i whole-face w binary64/80/120, local owned weights i H A/m bez mu0; nie kwalifikacja numeryczna.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-scalar-gates",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "evaluate_surface_rt0",
+      "responsibility": "Wywołanie scalar_agreement i obowiązkowych passów z prywatnego evaluatora; jawne scalar80/120 whole/fan i precision gates, bez rigorous error certificate.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-work",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "class Work",
+      "responsibility": "Mandatory total/per-target named limits, overflow/preallocation/time i caller sampled lifetimepeak RSS; nie hard allocator cap lub exhaustive heap count.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-exact",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "class ExactArithmetic",
+      "responsibility": "IEEEbinary64 exact input i instrumentowane Fraction/integer operations z raw/reduced bit guards; nie exhaustive Boost/gcd arithmetic.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-evaluator",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "evaluate_surface_rt0",
+      "responsibility": "Prywatna redukcja wszystkich ownerów i uporządkowanych targetów, local/global H gates oraz outputdouble quantization; opaque caller digest, bez runtime aktywacji.",
+      "evidence_status": "compiled_only"
+    },
+    {
+      "id": "native-surface-rt0-note",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-native-rt0-surface-core",
+      "responsibility": "Pełne parametry prywatnego operatora, zakres source-only review i oddzielny20/24 scalar terminal; native i Universe NOT VERIFIED.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "accepted-surface-rt0-boundary-contract",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-accepted-surface-boundary",
+      "responsibility": "Addytywna granica zaakceptowanego źródła RT0, osobny wynik i jawne limity bez nowych Python/IR/defaultów oraz bez publicznej kwalifikacji.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "surface-rt0-public-policy-contract",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-surface-public-policy",
+      "responsibility": "Pełny planned public policy contract bez defaults, nieprzekraczalne bramki, niezmieniony source preimage i odrębny field evidence.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "surface-public-class",
+      "path": "packages/fullmag-py/src/fullmag/model/antenna.py",
+      "symbol": "class AntennaSurfaceFieldPolicy",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "interpreted_checks_passed"
+    },
+    {
+      "id": "surface-script-export",
+      "path": "packages/fullmag-py/src/fullmag/runtime/script_builder.py",
+      "symbol": "_render_antenna_field_solve_definition_expr",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "interpreted_checks_passed"
+    },
+    {
+      "id": "surface-ir-policy",
+      "path": "crates/fullmag-ir/src/antenna.rs",
+      "symbol": "AntennaSurfaceFieldPolicyIR",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-resolved-oneof",
+      "path": "crates/fullmag-ir/src/antenna_current_source.rs",
+      "symbol": "validate_field_policy",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-prepared-planner",
+      "path": "crates/fullmag-plan/src/antenna_current_source.rs",
+      "symbol": "materialize_antenna_closed_loop_current_input",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-prepared-abi",
+      "path": "backends/fem/cpu/mfem/transport/steady_transport_c_api.cpp",
+      "symbol": "extern \"C\" int fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-accepted-owner",
+      "path": "backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_surface_rt0.cpp",
+      "symbol": "evaluate_accepted_surface_rt0",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-snapshot-validation",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/surface_rt0_evidence_v1.rs",
+      "symbol": "SurfaceRt0Snapshot",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-evidence-decoder",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/surface_rt0_evidence_v1.rs",
+      "symbol": "SurfaceRt0EvidenceV1",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-evidence-sum",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_field_evidence.rs",
+      "symbol": "ClosedLoopFieldEvidence",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-field-signature",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_v2.rs",
+      "symbol": "field_signature",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-execution-dispatch",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_execution.rs",
+      "symbol": "execute_closed_loop",
+      "responsibility": "Addytywna integracja surface: jedno zaakceptowane źródło, jawna polityka i osobny dowód, bez kwalifikacji fizycznej.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "surface-thin-inspection-view",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/closed_loop_public_inspection.rs",
+      "symbol": "inspection_view",
+      "responsibility": "Po pełnej walidacji bundle cienkie API mapuje 14 znanych liczników surface na nazwane skalary; oryginalny manifest/evidence bez zmiany.",
+      "evidence_status": "source_only"
     }
   ],
   "public_api": {
     "parameters": [
-      {"python": "fit_retained_rt0.vertices_m", "type": "list/tuple (4×3 float)", "default": "required", "si_unit": "\\mathrm m", "validation": "dokładnie4×3 skończone binary64; bool i niepositive Tet4 odrzucane", "meaning": "retained współrzędne jednej komórki, bez scalania ID", "backend_support": "referencyjny Python CPU; bez wykonania backendu", "problem_ir": "bez nowej serializacji; wejście z przyjętego carriera"},
-      {"python": "fit_retained_rt0.vertex_current_apm2", "type": "list/tuple (4×3 float)", "default": "required", "si_unit": "\\mathrm{A\\,m^{-2}}", "validation": "dokładnie4×3 skończone binary64, w tej samej kolejności; wymagany scalar-slope residual gate", "meaning": "cztery lokalne ślady J tej komórki, bez uśredniania z sąsiadami", "backend_support": "referencyjny Python CPU; bez wykonania backendu", "problem_ir": "bez zmiany semantyki IR"},
+      {
+        "python": "fit_retained_rt0.vertices_m",
+        "type": "list/tuple (4×3 float)",
+        "default": "required",
+        "si_unit": "\\mathrm m",
+        "validation": "dokładnie4×3 skończone binary64; bool i niepositive Tet4 odrzucane",
+        "meaning": "retained współrzędne jednej komórki, bez scalania ID",
+        "backend_support": "referencyjny Python CPU; bez wykonania backendu",
+        "problem_ir": "bez nowej serializacji; wejście z przyjętego carriera"
+      },
+      {
+        "python": "fit_retained_rt0.vertex_current_apm2",
+        "type": "list/tuple (4×3 float)",
+        "default": "required",
+        "si_unit": "\\mathrm{A\\,m^{-2}}",
+        "validation": "dokładnie4×3 skończone binary64, w tej samej kolejności; wymagany scalar-slope residual gate",
+        "meaning": "cztery lokalne ślady J tej komórki, bez uśredniania z sąsiadami",
+        "backend_support": "referencyjny Python CPU; bez wykonania backendu",
+        "problem_ir": "bez zmiany semantyki IR"
+      },
       {
         "python": "TerminalLeadExtension.from_antenna_terminal.id",
         "type": "str",
@@ -9622,6 +9941,86 @@
         "meaning": "jawna materializacja domeny",
         "backend_support": "inspekcja FEM CPU/double; wykonanie H w Universe niezweryfikowane",
         "problem_ir": "problem_meta.runtime_metadata.mesh_workflow; geometry_assets.fem_domain_mesh_asset"
+      },
+      {
+        "python": "evaluate_retained_rt0.vertices_m",
+        "type": "4×3 int/float",
+        "default": "required",
+        "si_unit": "$\\mathrm m$",
+        "validation": "Skończone binary64 bez bool; dodatni niepłaski Tet4.",
+        "meaning": "Zachowana geometria jednej komórki.",
+        "backend_support": "referencyjny Python CPU; bez wykonania lub kwalifikacji native",
+        "problem_ir": "brak nowej serializacji; research-only retained data"
+      },
+      {
+        "python": "evaluate_retained_rt0.vertex_current_apm2",
+        "type": "4×3 int/float",
+        "default": "required",
+        "si_unit": "$\\mathrm{A/m^2}$",
+        "validation": "Skończone lokalne ślady bez bool; scalar-slope RT0 residual gate.",
+        "meaning": "Retained J tej samej komórki.",
+        "backend_support": "referencyjny Python CPU; bez wykonania lub kwalifikacji native",
+        "problem_ir": "brak nowej serializacji; research-only retained data"
+      },
+      {
+        "python": "evaluate_retained_rt0.target_m",
+        "type": "3 int/float",
+        "default": "required",
+        "si_unit": "$\\mathrm m$",
+        "validation": "Trzy skończone binary64 bez bool, bez przesuwania punktu.",
+        "meaning": "Punkt odczytu H.",
+        "backend_support": "referencyjny Python CPU; bez wykonania lub kwalifikacji native",
+        "problem_ir": "brak nowej serializacji; research-only retained data"
+      },
+      {
+        "python": "evaluate_retained_rt0.budget",
+        "type": "Budget | None",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "Istniejące zamrożone limity; wspólny przekazany licznik nie jest resetowany.",
+        "meaning": "Czas i koszt wszystkich czterech ścian oraz redukcji pola.",
+        "backend_support": "referencyjny Python CPU; bez wykonania lub kwalifikacji native",
+        "problem_ir": "brak nowej serializacji; research-only retained data"
+      },
+      {
+        "python": "AntennaSurfaceFieldPolicy.policy_version",
+        "type": "str",
+        "default": "required",
+        "si_unit": "$1$",
+        "validation": "dokładnie caller_supplied_rt0_surface.inspection.v1",
+        "meaning": "jawna wersja parametrów bez ukrytych defaults",
+        "backend_support": "prepared FEM CPU double strict inspection; GPU/FDM unsupported",
+        "problem_ir": "surface_field_policy.policy_version"
+      },
+      {
+        "python": "AntennaSurfaceFieldPolicy.limits",
+        "type": "Mapping[str,object]",
+        "default": "required",
+        "si_unit": "mieszane; pełne tabele limits w sekcji private native",
+        "validation": "closed mapping; wszystkie dodatnie uint64 i finite seconds; totalpairs<=4000000",
+        "meaning": "jawny bounded koszt pracy",
+        "backend_support": "prepared FEM CPU double strict inspection; GPU/FDM unsupported",
+        "problem_ir": "surface_field_policy.limits"
+      },
+      {
+        "python": "AntennaSurfaceFieldPolicy.tolerances",
+        "type": "Mapping[str,float]",
+        "default": "required",
+        "si_unit": "mieszane; A/m i1 jak pełne tabele tolerances",
+        "validation": "closed mapping 11 pól; finite positive oraz nieprzekraczalne bramki",
+        "meaning": "jawna dokładność inspekcji",
+        "backend_support": "prepared FEM CPU double strict inspection; GPU/FDM unsupported",
+        "problem_ir": "surface_field_policy.tolerances"
+      },
+      {
+        "python": "AntennaFieldSolveStage.surface_field_policy",
+        "type": "Optional[AntennaSurfaceFieldPolicy]",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "wymagane iff analytic_rt0_surface; dla innychmetod forbidden",
+        "meaning": "polityka zaawansowanej metody wykonania",
+        "backend_support": "prepared FEM CPU double strict inspection; GPU/FDM unsupported",
+        "problem_ir": "antenna_field_solve_stages[].surface_field_policy"
       }
     ]
   }

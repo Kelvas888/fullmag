@@ -23,11 +23,24 @@ pub fn validate_accepted_inspection_bytes(problem:&ProblemIR, step:&StudyStep, b
     // Budget is enforced before framing decoder allocates any retained payload copies.
     let bundle=fullmag_application::decode_antenna_inspection_bundle(bytes,max_bytes)?;
     let manifest:serde_json::Value=serde_json::from_slice(&bundle.manifest_bytes)?;
-    let expected_intent=serde_json::json!({"source_revision":input.source.revision,"object_id":input.source.object_id,
+    input.validate_field_policy().map_err(anyhow::Error::msg)?;
+    let legacy_intent=serde_json::json!({"source_revision":input.source.revision,"object_id":input.source.object_id,
         "geometry_id":input.source.geometry_id,"source_module_id":input.stage.current_transport_id,
         "mesh_digest":input.source.mesh_digest,"authored_input_digest":input.source.authored_input_digest,
         "materials_digest":input.source.materials_digest,"requested_execution":input.authored_input_preimage.get("requested_execution").context("accepted inspection has no authored execution")?});
-    if manifest["requested_intent"]!=expected_intent || manifest["source_object_id"]!=input.source.object_id
+    let mut expected_intent=legacy_intent.clone();
+    expected_intent["solver_policy"]=serde_json::json!(input.stage.solver_policy);
+    let legacy_direct=match input.stage.oersted_realization {
+        fullmag_ir::AntennaOerstedRealizationIR::DirectTetraQuadrature => manifest["requested_intent"]==legacy_intent,
+        fullmag_ir::AntennaOerstedRealizationIR::AnalyticRt0Surface => {
+            expected_intent["oersted_realization"]=serde_json::json!("analytic_rt0_surface");
+            expected_intent["surface_field_policy"]=serde_json::to_value(input.surface_field_policy.as_ref()
+                .context("accepted surface inspection has no field policy")?)?;
+            false
+        },
+        _ => bail!("inspection output has an unsupported field method"),
+    };
+    if (!legacy_direct && manifest["requested_intent"]!=expected_intent) || manifest["source_object_id"]!=input.source.object_id
         || manifest["current_transport_id"]!=input.stage.current_transport_id {
         bail!("inspection artifact source differs from immutable accepted operation");
     }

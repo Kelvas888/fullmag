@@ -126,12 +126,13 @@ def _checked_worker_receipt(value,admission):
 
 
 def run(args):
-    from docker_dev import _require_native_windows,_select_source,_compose_identity
+    from docker_dev import _select_source,_compose_identity
+    from docker_dev_host import require_host
     from docker_volume_activate import _linked_runtime_terminals,_validate_running_group
     from docker_volume_dev import (_assert_private_restart_network,_retained_startup_enabled)
     from docker_dev_codegen import _backend_documents,_validate_backend,_probe_source,_source_matches
     import docker_backend_volume_cache as cache
-    _require_native_windows()
+    require_host()
     require(re.fullmatch(r"[0-9a-f]{32}",args.attempt) and re.fullmatch(r"[0-9a-f]{64}",args.config_sha256),"exact attempt/config pins required")
     require(args.reference_asset_image_id==ASSET and 0<args.maximum_build_seconds<=28800,"asset/duration differs")
     selected,layout=_select_source(Path(args.repo_root).resolve(strict=True),args.source_root)

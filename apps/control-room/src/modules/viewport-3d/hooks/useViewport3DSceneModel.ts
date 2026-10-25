@@ -41,6 +41,7 @@ import {
   isScalarSpatialQuantityId,
   quantityCatalogSupportsQuantity,
   quantityCatalogEntrySupportsSpatialVisualization,
+  quantityCatalogEntrySupportsAnySpatialVisualization,
   resolveCanonicalQuantityId,
   sameRenderableFieldQuantityId,
 } from "@/kernel/api/quantityIds";
@@ -534,7 +535,7 @@ export function mergeViewport3DQuantityCapabilityIds(
     ),
   );
   for (const quantity of quantityCatalog?.quantities ?? []) {
-    if (quantityCatalogEntrySupportsSpatialVisualization(quantity)) {
+    if (quantityCatalogEntrySupportsAnySpatialVisualization(quantity)) {
       merged.add(resolveCanonicalQuantityId(quantity.id));
     }
   }
@@ -4342,6 +4343,7 @@ export function useViewport3DSceneModel({
       quantityCatalog.data,
       airboxSettings.activeQuantityId,
       "airbox",
+      airboxSettings.tensorProjection,
     ) ??
       fieldCatalogQuantitySupportsAirbox(
         fieldCatalog.data,
@@ -4478,6 +4480,7 @@ export function useViewport3DSceneModel({
         fieldCatalog: fieldCatalog.data,
         quantityCatalog: quantityCatalog.data,
         fieldQuery: airboxFieldQuery,
+        tensorProjection: airboxSettings.tensorProjection,
         quantityId: airboxSettings.activeQuantityId,
         replayQuery: selectedSnapshotQuery,
         vectorBudget: resolveViewport3DAirboxVectorSampleBudget(
@@ -4490,6 +4493,7 @@ export function useViewport3DSceneModel({
       airboxFieldQuery,
       airboxFieldVectorParts,
       airboxSettings.activeQuantityId,
+      airboxSettings.tensorProjection,
       airboxAvailableNodeCount,
       airboxSettings.vectorBudget,
       airboxVectorsVisible,

@@ -409,6 +409,34 @@ Solver residuals, balance errors, refresh counts, and requested/resolved lane
 belong in thin diagnostics/manifests, while numerical arrays stay under
 `data/fields`.
 
+
+### Jawne projekcje quantities tensorowych
+
+Katalog quantities rozdziela dostępność surowego tensora i jego jawnych widoków.
+Dla opisanego deskryptorem flow-major tensora3×3 surowe dziewięć komponentów
+zachowuje render=unsupported_shape oraz publication=export_only. Sam deskryptor
+lub możliwość pobrania payloadu nie upoważnia UI do renderowania.
+
+Opcjonalna lista resolved_capability.projections zawiera token, components,
+output_shape, render i publication. Pusta lista jest pomijana w JSON;
+starszy klient nadal odrzuca surowy tensor. c0…c8 i frobenius dają
+spatial_scalar/1, a spin_flow_x/y/z dają vector_field/3. components opisuje
+wynik projekcji, nie zmienia indeksowania zachowanego źródłowego nośnika9.
+Norma po interpolacji wymaga zachowania wszystkich składowych do interpolacji;
+nie wolno interpolować samych norm węzłowych.
+
+Listę rozstrzyga wspólny resolver runnera na podstawie kanonicznego opisu,
+rzeczywistego providera i stanu materializacji. Dla materialized wymagany jest
+zgodny nielegacy nośnik9komponentów z tożsamością i rewizją; unmaterialized
+lub pending dopuszczają żądanie tylko przy rzeczywistym providerze.
+Unavailable, legacy_unverified, brak deskryptora, full i nieznany token
+nie dają zgody na interaktywną projekcję. Katalog nie tworzy brakującego pola.
+
+Wspólne helpery klienta sprawdzają dokładny wybrany token, kształt wyniku
+i render/publication. Object, Airbox oraz FieldMap korzystają z tej samej
+polityki; wybór quantity i pierwszej dozwolonej projekcji jest jedną
+transakcją. Zmiana widoku nie uruchamia nowego Solve.
+
 ## 3.1 Realtime invalidation rules
 
 The canonical websocket remains an invalidation bus, not a payload stream. That
@@ -1370,6 +1398,41 @@ typowanego klienta, facade/resource hooks, runtime HTTP oraz UI. Sama obecność
 tras i niewykonanych regresji Rust pozostaje `source_only`, nie dowodzi
 działającej powierzchni użytkownika.
 
+### Odczyt zaakceptowanej inspekcji anteny po restarcie
+
+Istniejąca rodzina `persistence/projects/{project_id}/runs/{run_id}/antenna-inspections`
+obsługuje inspekcję z zewnętrznymi leadami oraz jawną operację Study
+`ClosedLoopInspection`. Katalog zwraca tożsamości publikacji, bez dekodowania
+pakietów liczbowych. ID w ścieżce wybranego wyniku jest ID kroku Study;
+`owner.native_stage_id` pozostaje osobnym ID etapu anteny.
+
+Metadane `/{step_id}` i bajty `/{step_id}/payloads/{payload_kind}` wymagają
+przypiętych parametrów `attempt_id`, `ownership_epoch`, `package_object_ref`.
+Próba musi być bieżąca i zakończona sukcesem, a manifest oraz CAS zgodne
+z zaakceptowanym krokiem i dokładnym kodekiem jego rodziny. Zmienione
+katalogi lub nieaktualne piny dają konflikt przed odpowiedzią warunkową.
+Przejściowe zajęcie natywnej blokady zapisu daje `409` z kodem
+`antenna_store_busy`; można ponowić wyłącznie odczyt, z ograniczoną liczbą prób. Uszkodzony
+deskryptor i pozostałe błędy integralności nadal są błędami, bez fallbacku.
+Odczyt pełnej pętli dodatkowo korzysta z istniejącego `load_saved_inspection`:
+sprawdza przygotowanie, fingerprint wejścia, trwałe `Completed`, journal,
+zaakceptowany problem i cały pakiet pod blokadą odczytu. Metadane i payloady
+współdzielą ograniczone dopuszczenie z istniejącym czytnikiem pól inspekcji.
+
+Dotychczasowy JSON `accepted_antenna_inspection.v1` pozostaje bez zmian.
+Pełna pętla ma wariant `accepted_antenna_inspection.closed_loop.v1`, wspólne
+`owner`, `port_mode_id`, `output_id` oraz bounded `closed_loop_display`
+z deskryptorami istniejącego pakietu. Nie powstają fikcyjne identyfikatory
+sesji live. Liczbowe `v_raw`, `j_local_raw`, `h_raw` są odczytywane binarnie
+wraz z geometrią przez nazwy payloadów właściwe dla tej rodziny. ETag wiąże
+publikację i zawartość; GET obsługuje warunkowe `304` i pojedynczy Range.
+Nieaktualny owner nie może otrzymać `304` ani fragmentu starego wyniku.
+
+`validation_scope=full_cold_bundle` potwierdza integralność odczytu.
+`qualification=NOT VERIFIED`, `per_ampere_basis=false` i `llg_drive=false`
+pozostają jawne: odczyt archiwum nie kwalifikuje bazy pola, nie uruchamia
+Solve ani nie zastępuje istniejącej sceny użytkownika.
+
 ### Planar topological-charge analysis resource
 
 The canonical physical and numerical contract is
@@ -2005,3 +2068,59 @@ Po publikacji zaakceptowanego stanu kompletna tożsamość `resolved` obejmuje
 backend, device, precision i mode z tego samego zweryfikowanego planu.
 Dostępność pól oraz planera nie zastępuje tej tożsamości. Ukończenie zadania
 nie usuwa jej ze statusu sesji ani nie blokuje odczytu wyników.
+
+
+### Archiwalny wynik anteny w istniejącym FMS
+
+Istniejący `POST /v2/sessions/current/persistence/exports` przyjmuje opcjonalne
+`accepted_run` z `project_id`, `run_id`, `run_catalog_revision` i
+`artifact_catalog_revision`. Jest to jawny wybór źródła historycznego dla
+pobrania profilu `solved`; zapis obok źródła, dodatkowa ścieżka i nadpisanie UI
+są w tym trybie odrzucane. Pominięcie selektora zachowuje dotychczasowy eksport
+bieżącej sesji. Żądanie nadal podlega kontekstowi bieżącej sesji, ale nie
+zastępuje jej ani nie uruchamia obliczeń.
+
+Źródło historyczne musi być zakończonym, zaakceptowanym Study z typowanym
+`ClosedLoopInspection`. Eksporter kontroluje przypięte rewizje katalogów,
+niezmienne wejścia, oryginalną tożsamość sesji i sceny oraz rzeczywisty zapis
+ukończenia przez wspólną bramkę cold-read. Do dokumentów archiwum trafia scena
+zaakceptowanego runu, bez skopiowanych pól, siatki i ustawień bieżącego
+workspace. Oryginalny skrypt pochodzi z zaakceptowanego capture CAS; nie jest
+wykonywany podczas eksportu ani importu. Rozstrzygnięte wykonanie pozostaje
+w receiptach i pakiecie wyniku; eksport nie dopisuje nieznanego runtime.
+
+Po istniejącym imporcie `visualization_only` katalog ilości, pola i topologia
+czytają dane z prywatnego magazynu importu. Importer przypina zweryfikowany
+`closure_sha256` w metadanych obserwacji; nie przyjmuje znacznika dostarczonego
+przez archiwum. Czytnik kontroluje domknięcie, długości i hashe CAS,
+RunSpec/Study/ProblemIR, przygotowanie i dokładne powiązanie
+run/task/attempt/epoch/port/codec/artifact. Nie rekonstruuje claimów, lease'ów
+ani journala i nie korzysta awaryjnie z pierwotnego magazynu zaakceptowanych
+runów. Dane nadal mają status `inspection_only` i nie przyznają kwalifikacji
+bazy pola ani prawa do Compute/LLG. Starsze archiwa bez tego domknięcia
+zachowują dotychczasowy odczyt zarejestrowanych artefaktów.
+
+Odkrywanie i materializacja pól korzystają z tej samej ograniczonej kolejki
+czytników. Metadane domknięcia mają łącznie limit 64 MiB, pojedynczy rekord
+zachowuje istniejący limit 16 MiB, a pakiet wyniku używa istniejącego limitu
+kodeka. Ta obsługa dotyczy dostępnych punktów próbkowania; nie tworzy pola H
+na pełnej siatce Universe i nie potwierdza kwalifikacji naukowej obliczenia.
+
+
+Historyczna scena ma jawny znacznik
+`accepted_definition_readonly_projection.v1`: `project_id`, `run_id`,
+`definition_sha256`, `projection_sha256` i zachowane bez zmian
+`authored_execution_input`. Nie oznacza dokładnego odtworzenia dawnego
+workspace authoring. Definicja zaakceptowanego wykonania może zawierać już
+rozstrzygnięte ustawienia wyjścia lub projekcję zgodną ze schematem czytnika;
+jej hash nie zastępuje oryginalnego hasha authored input. Zwykły eksport
+bieżącej sesji nadal wymaga niezmienionej kontroli `validate_input_binding`.
+
+Historyczny Python czyta osobny, wewnętrzny helper dopiero po walidacji
+zaakceptowanego Study/Catalog i captured source assets. Nie ma fallbacku do
+aktualnego skryptu. Zarówno inspekcja, jak i commit importu sprawdzają
+znacznik względem RunSpec oraz definicji w przenośnym CAS i odrzucają inną
+scenę, hash albo przypisanie projektu/runu. Obie odpowiedzi wyraźnie
+sygnalizują projekcję tylko do odczytu; nie deklarują zgodności z dawnym
+stanem authoring ani kwalifikacji naukowej. Dane wynikowe pozostają związane
+z niezmiennymi wejściami przyjętego obliczenia.

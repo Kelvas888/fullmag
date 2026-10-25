@@ -462,6 +462,76 @@ pub enum AntennaFieldModelIR {
 pub enum AntennaOerstedRealizationIR {
     DirectTetraQuadrature,
     VectorPotentialSolver,
+    AnalyticRt0Surface,
+}
+
+pub const ANTENNA_SURFACE_FIELD_POLICY_VERSION: &str = "caller_supplied_rt0_surface.inspection.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AntennaSurfaceFieldLimitsIR {
+    pub total: [u64; 14],
+    pub per_target: [u64; 14],
+    pub maximum_raw_integer_bits: u64,
+    pub maximum_reduced_fraction_bits: u64,
+    pub maximum_lifetime_peak_rss_bytes: u64,
+    pub guard_interval_events: u64,
+    pub maximum_total_seconds: f64,
+    pub maximum_target_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AntennaSurfaceFieldTolerancesIR {
+    pub absolute_field_apm: f64,
+    pub relative_field: f64,
+    pub cancellation_floor_apm: f64,
+    pub scalar_relative_80: f64,
+    pub scalar_relative_120: f64,
+    pub angle_relative_80: f64,
+    pub angle_relative_120: f64,
+    pub binary_scalar_epsilon_factor: f64,
+    pub binary_roundoff_epsilon_factor: f64,
+    pub binary_cancellation_limit: f64,
+    pub highprecision_cancellation_limit: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AntennaSurfaceFieldPolicyIR {
+    pub policy_version: String,
+    pub limits: AntennaSurfaceFieldLimitsIR,
+    pub tolerances: AntennaSurfaceFieldTolerancesIR,
+}
+
+impl AntennaSurfaceFieldPolicyIR {
+    pub fn validation_errors(&self, path: &str) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.policy_version != ANTENNA_SURFACE_FIELD_POLICY_VERSION {
+            errors.push(format!("{path}.policy_version is unsupported"));
+        }
+        let limits = &self.limits;
+        if limits.total.contains(&0) || limits.per_target.contains(&0)
+            || limits.maximum_raw_integer_bits == 0 || limits.maximum_reduced_fraction_bits == 0
+            || limits.maximum_lifetime_peak_rss_bytes == 0 || limits.guard_interval_events == 0
+            || !limits.maximum_total_seconds.is_finite() || limits.maximum_total_seconds <= 0.0
+            || !limits.maximum_target_seconds.is_finite() || limits.maximum_target_seconds <= 0.0
+            || limits.total[0] > 4_000_000 {
+            errors.push(format!("{path}.limits must be positive, finite and within the 4000000 pair cap"));
+        }
+        let t = &self.tolerances;
+        let bounded = [(t.absolute_field_apm, 1e-9), (t.relative_field, 1e-5),
+            (t.cancellation_floor_apm, 1e-6), (t.scalar_relative_80, 1e-45),
+            (t.scalar_relative_120, 1e-55), (t.angle_relative_80, 1e-45),
+            (t.angle_relative_120, 1e-55), (t.binary_cancellation_limit, 1e8),
+            (t.highprecision_cancellation_limit, 1e40)];
+        if bounded.iter().any(|(value, maximum)| !value.is_finite() || *value <= 0.0 || value > maximum)
+            || !t.binary_scalar_epsilon_factor.is_finite() || t.binary_scalar_epsilon_factor <= 0.0
+            || !t.binary_roundoff_epsilon_factor.is_finite() || t.binary_roundoff_epsilon_factor < 64.0 {
+            errors.push(format!("{path}.tolerances must be positive, finite and preserve inspection gates"));
+        }
+        errors
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,6 +552,8 @@ pub struct AntennaFieldSolveStageIR {
     pub conservative_current_view_ref: Option<String>,
     pub model: AntennaFieldModelIR,
     pub oersted_realization: AntennaOerstedRealizationIR,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_field_policy: Option<AntennaSurfaceFieldPolicyIR>,
     pub conductor_mesh_policy: String,
     pub field_sampling_domain: FieldTargetIR,
     pub target_refs: Vec<FieldTargetIR>,
@@ -1159,6 +1231,16 @@ fn validate_stage_current_view_ref(
     }
 }
 
+fn validate_stage_surface_field_policy(stage: &AntennaFieldSolveStageIR, prefix: &str, errors: &mut Vec<String>) {
+    if (stage.oersted_realization == AntennaOerstedRealizationIR::AnalyticRt0Surface)
+        != stage.surface_field_policy.is_some() {
+        errors.push(format!("{prefix}.surface_field_policy is required only for analytic_rt0_surface"));
+    }
+    if let Some(policy) = &stage.surface_field_policy {
+        errors.extend(policy.validation_errors(&format!("{prefix}.surface_field_policy")));
+    }
+}
+
 pub(crate) fn validate_antenna_composition(problem: &ProblemIRV04, errors: &mut Vec<String>) {
     let objects = problem
         .objects
@@ -1236,6 +1318,7 @@ pub(crate) fn validate_antenna_composition(problem: &ProblemIRV04, errors: &mut 
             errors.push(format!("{prefix}.id must be non-empty and unique"));
         }
         validate_stage_current_view_ref(stage, &problem.current_modules, &prefix, errors);
+        validate_stage_surface_field_policy(stage, &prefix, errors);
         let referenced_ports = stage
             .port_mode_ids
             .iter()
@@ -1590,6 +1673,7 @@ pub(crate) fn validate_antenna_composition_v03(problem: &ProblemIR, errors: &mut
             errors.push(format!("{prefix}.id must be non-empty and unique"));
         }
         validate_stage_current_view_ref(stage, &problem.current_modules, &prefix, errors);
+        validate_stage_surface_field_policy(stage, &prefix, errors);
         let valid_ports = stage.port_mode_ids.len() == 1
             && stage.port_mode_ids.iter().all(|id| {
                 problem
@@ -1905,6 +1989,7 @@ mod tests {
             conservative_current_view_ref: Some("current_view".to_string()),
             model: AntennaFieldModelIR::QuasistaticConductionBiotSavart3d,
             oersted_realization: AntennaOerstedRealizationIR::DirectTetraQuadrature,
+            surface_field_policy: None,
             conductor_mesh_policy: "full_3d".to_string(),
             field_sampling_domain: FieldTargetIR::Global {},
             target_refs: vec![FieldTargetIR::Global {}],

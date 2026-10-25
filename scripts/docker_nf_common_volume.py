@@ -477,11 +477,12 @@ def run(args):
     import run_managed_boris_nf_v2 as tools
     import run_managed_fullmag_nf_common_v2 as fullmag
     from bootstrap_docker_toolchain import read_input
-    from docker_dev import _require_native_windows, _select_source, _compose_identity
+    from docker_dev import _select_source, _compose_identity
+    from docker_dev_host import require_host
     from docker_volume_activate import _linked_runtime_terminals, _validate_running_group
     from docker_dev_codegen import _backend_documents, _validate_backend, _probe_source, _source_matches
     import docker_backend_volume_cache as cache_owner
-    _require_native_windows()
+    require_host()
     require(TOKEN.fullmatch(args.attempt) and TOKEN.fullmatch(args.producer_attempt) and
         TOKEN.fullmatch(args.report_id) and SHA.fullmatch(args.config_sha256) and
         SHA.fullmatch(args.producer_receipt_sha256), "exact DEV/producer/report/config pins required")

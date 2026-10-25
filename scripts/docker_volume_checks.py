@@ -1,5 +1,8 @@
 """Run interpreted control checks in the selected DEV service or offline helper."""
 import argparse
+import ast
+import hashlib
+import stat
 import json
 import re
 import shlex
@@ -19,6 +22,54 @@ BASE_IMPLEMENTATIONS = ('docker_build_control', 'docker_volume_dev', 'docker_vol
 OPTIONAL_IMPLEMENTATIONS = ('docker_volume_activation_reconcile', 'docker_volume_accepted_reattach',
                             'docker_volume_pre_admission_recreate', 'docker_volume_pre_admission_selector',
                             'docker_volume_pending_continuation', 'docker_volume_native_init_successor')
+
+
+_ORACLE_WHEEL_ROOT = Path('/opt/fullmag/control/verification')
+_ORACLE_WHEEL_NAME = 'mpmath-1.3.0-py3-none-any.whl'
+
+
+def _oracle_wheel_binding(source, reference):
+    if reference is None:
+        return None
+    if not isinstance(reference, str) or any(char in reference for char in '\0\r\n:'):
+        raise BuildControlError('Oracle wheel reference is invalid')
+    path = PurePosixPath(reference)
+    if (str(path) != reference or '..' in path.parts
+            or not path.is_relative_to(_ORACLE_WHEEL_ROOT)
+            or path.name != _ORACLE_WHEEL_NAME):
+        raise BuildControlError('Oracle wheel must be a canonical group verification reference')
+    pin_source = Path(source) / 'scripts/antenna_triangle_surface_oracle.py'
+    try:
+        raw = pin_source.read_bytes()
+        pins = [ast.literal_eval(node.value) for node in ast.parse(raw).body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == 'WHEEL_SHA'
+                        for target in node.targets)]
+    except (OSError, SyntaxError, ValueError, TypeError) as error:
+        raise BuildControlError('Oracle wheel source pin is unavailable') from error
+    if len(pins) != 1 or not isinstance(pins[0], str) or re.fullmatch(r'[0-9a-f]{64}', pins[0]) is None:
+        raise BuildControlError('Oracle wheel source pin is invalid')
+    return {'path': reference, 'sha256': pins[0], 'source_sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def _verify_oracle_wheel(binding, source=Path('/opt/fullmag/source')):
+    if not isinstance(binding, dict) or _oracle_wheel_binding(source, binding.get('path')) != binding:
+        raise BuildControlError('Oracle wheel binding differs from the selected source')
+    path = Path(binding['path'])
+    try:
+        if path.resolve(strict=True) != path:
+            raise BuildControlError('Oracle wheel path is not canonical')
+        before = path.stat()
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 2 * 1024 * 1024:
+            raise BuildControlError('Oracle wheel must be a bounded regular file')
+        data = path.read_bytes()
+        after = path.stat()
+    except OSError as error:
+        raise BuildControlError('Oracle wheel is unavailable') from error
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if identity(before) != identity(after) or hashlib.sha256(data).hexdigest() != binding['sha256']:
+        raise BuildControlError('Oracle wheel digest or identity differs')
+    return {**binding, 'file_identity': identity(after)}
 
 
 def _validate_offline_result(value, modules, *, implementations=BASE_IMPLEMENTATIONS):
@@ -321,10 +372,13 @@ def frontend_import_checks(control, selected, identity, *, scope='frontend-impor
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root', type=Path, required=True)
+    parser.add_argument('--oracle-wheel', help='Explicit registered mpmath wheel in the group verification volume (all scope only)')
     parser.add_argument('--offline', action='store_true', help='Run interpreted checks in a private group helper when backend is stopped')
     parser.add_argument('--modules', nargs='+', help='Explicit unittest modules (offline mode only)')
     parser.add_argument('--scope', choices=('all', 'source-capture', 'frontend-import', 'frontend-antenna', 'frontend-visualization', 'frontend-tools', 'field-only'), default='all')
     args = parser.parse_args()
+    if args.oracle_wheel is not None and (args.offline or args.scope != 'all'):
+        raise BuildControlError('Oracle wheel is supported only for live all checks')
     if args.offline:
         if args.scope != 'all':
             raise BuildControlError('Offline module checks cannot combine with a service-specific scope')
@@ -334,6 +388,7 @@ def main():
     elif args.modules:
         raise BuildControlError('--modules requires the explicit --offline mode')
     selected = args.source_root.resolve(strict=True)
+    oracle_dependency = _oracle_wheel_binding(selected, args.oracle_wheel)
     identity = compose_project_identity(storage.resolve_layout(selected, 'docker-all-gpu'))
     from docker_build_control import toolchain_configuration
     configured = toolchain_configuration(selected, identity)
@@ -355,11 +410,22 @@ def main():
     mounts = [m for m in observed.get('Mounts', []) if m['Destination']=='/build']
     if len(mounts)!=1 or mounts[0]['Type']!='volume':
         raise BuildControlError('Checks require the persistent build volume')
-    script = '''import os, pathlib, subprocess, sys
+    if oracle_dependency is not None:
+        control_mounts = [mount for mount in observed.get('Mounts', [])
+                          if mount['Destination'] == '/opt/fullmag/control']
+        if (len(control_mounts) != 1 or control_mounts[0]['Type'] != 'volume'
+                or control_mounts[0].get('Name') != control.volume):
+            raise BuildControlError('Oracle wheel requires the selected group control volume')
+    script = '''import json, os, pathlib, subprocess, sys
 pathlib.Path('/build/verification-tmp').mkdir(exist_ok=True)
 environment = {key:value for key,value in os.environ.items() if not key.startswith('FULLMAG_')}
 environment.update(TMPDIR='/build/verification-tmp', PYTHONDONTWRITEBYTECODE='1', HOME='/build/verification-tmp/home', USER='fullmag-checks', LOGNAME='fullmag-checks')
 pathlib.Path(environment['HOME']).mkdir(exist_ok=True)
+oracle_binding = json.loads(sys.argv[2]) if len(sys.argv) > 2 else None
+if oracle_binding is not None:
+    from docker_volume_checks import _verify_oracle_wheel
+    oracle_before = _verify_oracle_wheel(oracle_binding)
+    environment['PYTHONPATH'] = oracle_binding['path'] + (os.pathsep + environment['PYTHONPATH'] if environment.get('PYTHONPATH') else '')
 command=[sys.executable,'-B','-m','unittest','test_docker_dev_defaults','test_docker_dev_up','test_docker_dev_owned_control','test_docker_dev_codegen','test_docker_volume_activate','test_docker_volume_reconcile','test_docker_activation_preflight','test_antenna_rt0_surface_oracle','test_docker_volume_container_recovery','test_docker_volume_stop_unadmitted','test_docker_volume_dev_runtime_state','test_docker_runtime_control_volume','test_docker_container_runtime_recovery','test_runtime_service_recovery_busy_retry','test_docker_backend_volume_cache','test_bootstrap_docker_toolchain','test_docker_toolchain_host_inputs','test_docker_compose_identity','test_docker_host_ledger','test_docker_group_ledger','test_docker_volume_receipts','test_docker_volume_device_access','test_docker_volume_retained_device_lifecycle','test_docker_volume_native_init_successor','test_docker_dev_host','test_docker_volume_wsl','test_docker_wsl_bind','test_linux_native_host','test_linux_native_probe','test_docker_python_no_test_build','test_mfem_cuda_fast_compile','test_docker_frontend_dev','test_docker_dev_browser_qa','test_docker_development_inputs_linux','test_docker_backend_dev','test_docker_dev_fast_loop','test_docker_backend_live_source','test_docker_candidate_retirement','test_docker_startup_script','test_backend_volume_cache_maintenance','test_docker_cpu_access','test_docker_dev_storage','test_docker_dev_image_context','test_docker_dev_recreate','test_docker_volume_pre_admission_recreate','test_docker_volume_pre_admission_selector','test_docker_volume_pre_admission_integration','test_docker_volume_post_build_generation','test_docker_volume_post_build_integration','test_docker_volume_pending_continuation','test_docker_volume_pending_resume','test_docker_prestart_resume','test_docker_frontend_cache','test_docker_frontend_cache_named_volume','test_fullmag_docker_runtime','test_docker_orphan_recovery','test_recover_docker_orphan','test_just_orphan_recovery_shell','test_docker_volume_checks']
 if sys.argv[1] == 'frontend-tools':
     command = [sys.executable, '-B', '-m', 'unittest', 'test_docker_dev_codegen', 'test_docker_volume_checks', 'test_docker_volume_frontend_recovery', 'test_docker_volume_dev_runtime_state', 'test_docker_volume_receipts', 'test_docker_dev_browser_qa']
@@ -374,13 +440,19 @@ if result == 0 and sys.argv[1] not in ('field-only', 'frontend-tools'):
     result = subprocess.call([sys.executable, '-B', '/opt/fullmag/source/scripts/verify_accepted_source_scene_capture.py',
                               '--fullmag-root', '/opt/fullmag/source/packages/fullmag-py/src/fullmag',
                               '--output-dir', '/build/verification-tmp'], env=environment)
+if oracle_binding is not None and _verify_oracle_wheel(oracle_binding) != oracle_before:
+    raise RuntimeError('Oracle wheel changed during checks')
 sys.exit(result)
 '''
     result = docker_capture('exec', '--workdir', '/opt/fullmag/source/scripts', ids[0],
-                           '/usr/local/bin/python3', '-B', '-c', script, args.scope, allow_failure=True, timeout=900)
+                           '/usr/local/bin/python3', '-B', '-c', script, args.scope,
+                           *([json.dumps(oracle_dependency, sort_keys=True)] if oracle_dependency is not None else []),
+                           allow_failure=True, timeout=900)
     receipt={'schema':'fullmag.volume-dev-interpreted-checks.v1','exit_code':result.returncode,
              'scope':args.scope, 'container_id':ids[0], 'image_id':observed['Image'], 'compose_project':control.project,
              'stdout':result.stdout.decode('utf-8','replace'), 'stderr':result.stderr.decode('utf-8','replace')}
+    if oracle_dependency is not None:
+        receipt['oracle_dependency'] = oracle_dependency
     control.write('verification/interpreted-frontend-tools-checks.json' if args.scope == 'frontend-tools' else
                   'verification/interpreted-checks.json' if args.scope == 'all' else
                   'verification/interpreted-field-only-checks.json' if args.scope == 'field-only' else

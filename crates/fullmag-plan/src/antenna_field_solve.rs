@@ -522,6 +522,7 @@ pub fn plan_antenna_field_solve_execution(
         AntennaOerstedRealizationIR::DirectTetraQuadrature => {
             fullmag_ir::OerstedRealization::BiotSavartMidpoint
         }
+        AntennaOerstedRealizationIR::AnalyticRt0Surface => return Err(fail("analytic RT0 surface requires the prepared closed-loop inspection path; no fallback")),
         AntennaOerstedRealizationIR::VectorPotentialSolver => {
             fullmag_ir::OerstedRealization::FemVectorPotential
         }

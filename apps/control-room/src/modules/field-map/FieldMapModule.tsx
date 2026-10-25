@@ -4,6 +4,9 @@ import { useCallback, useMemo, useState } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
 import { decodeFieldVector } from "@/kernel/api/codecs";
+import { normalizeTensorProjection } from "@/kernel/api/tensorFieldProjection";
+import { quantityCatalogEntrySupportsSpatialVisualization } from "@/kernel/api/quantityIds";
+import { useQuantityCatalogResource } from "@/kernel/resources/studyRuntimeResources";
 import type { PlanarFieldSource } from "@/kernel/api/apiTypes";
 import {
   planarFieldQueryFromMeta,
@@ -135,6 +138,19 @@ function useFieldMapModuleController() {
     visualization.data?.targets,
   ]);
 
+  const quantityCatalog = useQuantityCatalogResource({
+    enabled: active,
+    stageId: selectedFieldContext.stageId,
+  });
+  const selectedQuantity = quantityCatalog.data?.quantities.find(
+    (entry) => entry.id === canonicalPlanar?.quantity_id,
+  );
+  const requiresTensorProjection = selectedQuantity?.tensor != null ||
+    selectedQuantity?.shape === "tensor_field" ||
+    normalizeTensorProjection(canonicalPlanar?.component) !== null;
+  const projectionAllowed = !requiresTensorProjection || Boolean(
+    selectedQuantity && quantityCatalogEntrySupportsSpatialVisualization(selectedQuantity, canonicalPlanar?.component),
+  );
   const plan = useMemo(
     () => buildFieldMapDataPlan({
       active: active && canonicalPlanar !== undefined && canonicalPlanar.visible !== false,
@@ -145,6 +161,7 @@ function useFieldMapModuleController() {
       source,
       quality: canonicalPlanar?.quality ?? "interactive",
       quantityId: canonicalPlanar?.quantity_id ?? "",
+      projectionAllowed,
       resolution: [
         canonicalPlanar?.resolution.width ?? 0,
         canonicalPlanar?.resolution.height ?? 0,
@@ -159,6 +176,7 @@ function useFieldMapModuleController() {
       active,
       domain.data?.discretization,
       canonicalPlanar,
+      projectionAllowed,
       runtime,
       source,
       selectedFieldContext.snapshotId,

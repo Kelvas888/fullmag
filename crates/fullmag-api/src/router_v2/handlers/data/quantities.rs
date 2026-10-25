@@ -309,7 +309,11 @@ pub(crate) fn resolved_quantity_capability_for_snapshot(
                     fullmag_runner::QuantityPublicationCapability::ExportOnly
                 } else { fullmag_runner::QuantityPublicationCapability::Hidden },
                 scope: scope.to_string(), reason_code: Some("saved_field_read_only".into()),
-                lane: "stored_field_read_only".into(), precision: precision.to_string(), carriers,
+                lane: "stored_field_read_only".into(), precision: precision.to_string(),
+                projections: fullmag_runner::resolve_quantity_projection_capabilities(spec,
+                    fullmag_runner::QuantityProviderCapability::Available,
+                    fullmag_runner::QuantityRequestCapability::FieldVector, materialization, &carriers),
+                carriers,
             }
         },
         None => {
@@ -331,6 +335,7 @@ pub(crate) fn resolved_quantity_capability_for_snapshot(
                 lane: "unresolved".to_string(),
                 precision: precision.to_string(),
                 carriers: Vec::new(),
+                projections: Vec::new(),
             };
             if let Some(prepared_carriers) =
                 (!field_only).then(|| prepared_initial_state_m_carriers(snapshot, spec, scope)).flatten()

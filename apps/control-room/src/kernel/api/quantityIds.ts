@@ -3,13 +3,30 @@ import type {
   QuantityCatalogResource,
 } from "./apiTypes";
 
+import { isFlowMajorTensorDescriptor, normalizeTensorProjection, tensorProjectionOptions, tensorProjectionOutputKind } from "./tensorFieldProjection";
+
 export type FieldCatalogQuantity = FieldCatalogResource["quantities"][number];
 export type QuantityCatalogEntry = QuantityCatalogResource["quantities"][number];
 
 export function quantityCatalogEntrySupportsSpatialVisualization(
   quantity: QuantityCatalogEntry,
+  projection?: unknown,
 ): boolean {
   const resolved = quantity.resolved_capability;
+  const tensor = quantity.shape === "tensor_field" || quantity.tensor != null || quantity.n_comp === 9;
+  if (tensor || normalizeTensorProjection(projection) !== null) {
+    const token = normalizeTensorProjection(projection);
+    if (!tensor || !isFlowMajorTensorDescriptor(quantity.tensor) || !token ||
+      resolved?.provider !== "available" || resolved.request !== "field_vector" ||
+      resolveCanonicalQuantityId(resolved.quantity_id) !== resolveCanonicalQuantityId(quantity.id) ||
+      !["materialized", "pending", "unmaterialized"].includes(resolved.materialization)) return false;
+    const kind = tensorProjectionOutputKind(token);
+    const matches = (resolved.projections ?? []).filter((entry) => entry.token === token);
+    return matches.length === 1 && matches[0].render === "renderable" &&
+      matches[0].publication === "interactive" &&
+      matches[0].components === (kind === "vector" ? 3 : 1) &&
+      matches[0].output_shape === (kind === "vector" ? "vector_field" : "spatial_scalar");
+  }
   if (resolved) {
     const providerBackedRead =
       resolved.provider === "available" &&
@@ -67,13 +84,29 @@ export function quantityCatalogEntrySupportsSpatialVisualization(
   );
 }
 
+/** Options are granted by the resolved catalog; tensor metadata alone grants none. */
+export function quantityCatalogEntrySpatialProjections(quantity: QuantityCatalogEntry | null | undefined) {
+  return quantity ? tensorProjectionOptions(quantity.tensor).filter(
+    (option) => quantityCatalogEntrySupportsSpatialVisualization(quantity, option.value),
+  ) : [];
+}
+
+export function quantityCatalogEntrySupportsAnySpatialVisualization(quantity: QuantityCatalogEntry): boolean {
+  return quantityCatalogEntrySupportsSpatialVisualization(quantity) ||
+    quantityCatalogEntrySpatialProjections(quantity).length > 0;
+}
+
+export function quantityCatalogEntrySupportsAnyAirboxVisualization(quantity: QuantityCatalogEntry): boolean {
+  return quantity.domain === "full_domain" && quantityCatalogEntrySupportsAnySpatialVisualization(quantity);
+}
+
 export function quantityCatalogEntryHasAdoptableSpatialCarrier(
   quantity: QuantityCatalogEntry,
 ): boolean {
   const resolved = quantity.resolved_capability;
   return Boolean(
     resolved &&
-      quantityCatalogEntrySupportsSpatialVisualization(quantity) &&
+      quantityCatalogEntrySupportsAnySpatialVisualization(quantity) &&
       resolved.materialization === "materialized" &&
       resolved.carriers.some(
         (carrier) =>
@@ -87,9 +120,10 @@ export function quantityCatalogEntryHasAdoptableSpatialCarrier(
 
 export function quantityCatalogEntrySupportsAirbox(
   quantity: QuantityCatalogEntry,
+  projection?: unknown,
 ): boolean {
   return (
-    quantityCatalogEntrySupportsSpatialVisualization(quantity) &&
+    quantityCatalogEntrySupportsSpatialVisualization(quantity, projection) &&
     quantity.domain === "full_domain"
   );
 }
@@ -98,6 +132,7 @@ export function quantityCatalogSupportsQuantity(
   catalog: QuantityCatalogResource | null | undefined,
   quantityId: string,
   targetKind: "airbox" | "spatial" = "spatial",
+  projection?: unknown,
 ): boolean | null {
   if (!catalog) return null;
   const canonicalQuantityId = storedFieldQuantityId(quantityId);
@@ -106,8 +141,8 @@ export function quantityCatalogSupportsQuantity(
   );
   if (!entry) return false;
   return targetKind === "airbox"
-    ? quantityCatalogEntrySupportsAirbox(entry)
-    : quantityCatalogEntrySupportsSpatialVisualization(entry);
+    ? quantityCatalogEntrySupportsAirbox(entry, projection)
+    : quantityCatalogEntrySupportsSpatialVisualization(entry, projection);
 }
 
 /** Canonical catalog gate for quantities the spatial viewport may offer. */

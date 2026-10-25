@@ -351,6 +351,7 @@ pub(crate) fn capability(field: &ResolvedSpatialField<'_>) -> Result<fullmag_run
             else if spec.supports_export {fullmag_runner::QuantityPublicationCapability::ExportOnly}
             else {fullmag_runner::QuantityPublicationCapability::Hidden},
         scope:locator.carrier_scope_kind.clone(),reason_code:Some("historical_inspection_read_only".into()),lane:"artifact_inspection_read_only".into(),precision:"double".into(),
+        projections:Vec::new(),
         carriers:vec![fullmag_runner::FieldCarrierDescriptor {carrier_id:locator.carrier_id,carrier_fingerprint:locator.carrier_digest,
             scope:locator.carrier_scope_kind.clone(),scope_kind:locator.carrier_scope_kind,scope_id:locator.carrier_scope_id,components:spec.n_comp,
             indexing:locator.indexing.as_str().into(),view:if locator.indexing==ArtifactSampleIndexing::CellCenters {"cell_centers"} else {"full"}.into(),

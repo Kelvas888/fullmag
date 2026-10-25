@@ -104,6 +104,59 @@
         "type": "object"
       },
       "AcceptedAntennaInspectionResource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AcceptedExternalLeadInspectionResource"
+          },
+          {
+            "$ref": "#/components/schemas/AcceptedClosedLoopInspectionResource"
+          }
+        ]
+      },
+      "AcceptedClosedLoopInspectionResource": {
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/AntennaInspectionDisplayCapabilities"
+          },
+          "closed_loop_display": {
+            "description": "Existing verified, bounded closed-loop descriptors; numerical arrays stay binary."
+          },
+          "normalization": {
+            "type": "string"
+          },
+          "output_id": {
+            "type": "string"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/AcceptedAntennaInspectionIdentity"
+          },
+          "port_mode_id": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "resource_id",
+          "project_id",
+          "owner",
+          "port_mode_id",
+          "output_id",
+          "capabilities",
+          "normalization",
+          "closed_loop_display"
+        ],
+        "type": "object"
+      },
+      "AcceptedExternalLeadInspectionResource": {
         "properties": {
           "display": {
             "$ref": "#/components/schemas/AntennaInspectionDisplayDataResource"
@@ -208,6 +261,34 @@
           "domain_generation_id",
           "topology_revision",
           "source_step"
+        ],
+        "type": "object"
+      },
+      "AcceptedRunExportSource": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "run_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "run_id",
+          "run_catalog_revision",
+          "artifact_catalog_revision"
         ],
         "type": "object"
       },
@@ -31672,6 +31753,35 @@
         ],
         "type": "string"
       },
+      "QuantityProjectionCapability": {
+        "properties": {
+          "components": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_shape": {
+            "type": "string"
+          },
+          "publication": {
+            "$ref": "#/components/schemas/QuantityPublicationCapability"
+          },
+          "render": {
+            "$ref": "#/components/schemas/QuantityRenderCapability"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "components",
+          "output_shape",
+          "render",
+          "publication"
+        ],
+        "type": "object"
+      },
       "QuantityProviderCapability": {
         "enum": [
           "available",
@@ -32794,6 +32904,12 @@
           },
           "precision": {
             "type": "string"
+          },
+          "projections": {
+            "items": {
+              "$ref": "#/components/schemas/QuantityProjectionCapability"
+            },
+            "type": "array"
           },
           "provider": {
             "$ref": "#/components/schemas/QuantityProviderCapability"
@@ -38514,6 +38630,17 @@
       },
       "SessionExportRequest": {
         "properties": {
+          "accepted_run": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AcceptedRunExportSource",
+                "description": "Explicit immutable historical source. Solved downloads only; the current\nauthoring workspace is not changed or used as historical result evidence."
+              }
+            ]
+          },
           "compression": {
             "oneOf": [
               {

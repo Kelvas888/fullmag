@@ -131,6 +131,7 @@ mod canonical_relaxation_time_tests {
             conservative_current_view_ref: None,
             model: fullmag_ir::AntennaFieldModelIR::QuasistaticConductionBiotSavart3d,
             oersted_realization: fullmag_ir::AntennaOerstedRealizationIR::DirectTetraQuadrature,
+            surface_field_policy: None,
             conductor_mesh_policy: "default".into(),
             field_sampling_domain: fullmag_ir::FieldTargetIR::Global {},
             target_refs: Vec::new(),

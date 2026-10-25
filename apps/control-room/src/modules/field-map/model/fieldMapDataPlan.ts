@@ -28,6 +28,7 @@ export interface FieldMapDataPlanInput {
   source: PlanarFieldSource;
   quality: "interactive" | "export";
   quantityId: string;
+  projectionAllowed?: boolean;
   resolution: readonly [number, number];
   showVectors: boolean;
   snapshotId?: string | null;
@@ -57,12 +58,13 @@ export function buildFieldMapDataPlan(
     discretization: input.discretization,
     scopeKind: viewScope.kind,
   });
+  const projectionAllowed = input.projectionAllowed !== false;
   const unavailableReason = !scope.enabled
     ? "structured FDM grid planar sampling does not support mesh-part or airbox scopes."
-    : null;
+    : !projectionAllowed ? "The selected tensor projection is not available in the canonical catalog." : null;
   const enabled =
-    input.active && scope.enabled;
-  const availability: FieldMapDataPlanAvailability = !scope.enabled
+    input.active && scope.enabled && projectionAllowed;
+  const availability: FieldMapDataPlanAvailability = !scope.enabled || !projectionAllowed
     ? "not-applicable"
     : enabled
       ? "ready"

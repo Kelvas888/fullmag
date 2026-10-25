@@ -1038,6 +1038,27 @@ pub(super) fn validate_payload_kind(kind: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+pub(super) fn validate_family_payload_kind(kind: &str) -> Result<(), ApiError> {
+    if ![
+        "stable_vertex_ids", "vertex_xyz", "sample_xyz", "conductivity",
+        "v_raw", "v_per_a", "j_center_raw", "j_center_per_a", "j_local_raw", "j_local_per_a",
+        "h_raw", "h_per_a", "cells", "faces", "weak", "prepared_preimage", "charge_preimage",
+        "source_preimage", "certificate", "authoring_receipt", "direct_evidence", "sample_cells",
+    ].contains(&kind) {
+        validate_payload_kind(kind)?;
+    }
+    Ok(())
+}
+
+pub(super) fn select_closed_payload(
+    mut loaded: fullmag_runner::LoadedAntennaClosedLoopInspection,
+    kind: &str,
+) -> Result<(String, Vec<u8>), ApiError> {
+    let bytes = loaded.payloads.remove(kind)
+        .ok_or_else(|| ApiError::bad_request("unknown closed-loop inspection payload kind"))?;
+    Ok((digest(&bytes), bytes))
+}
+
 pub(super) fn select_payload(
     loaded: LoadedAntennaExternalLeadSolution,
     kind: &str,
@@ -1141,16 +1162,7 @@ pub async fn get_antenna_external_lead_inspection_payload(
     let Query(query) = query.map_err(|error| {
         ApiError::bad_request(format!("invalid inspection payload query: {error}"))
     })?;
-    // Closed-loop payload names belong to the closed-loop bundle. Accepted
-    // external-lead resources keep their narrower shared validator.
-    if ![
-        "stable_vertex_ids", "vertex_xyz", "sample_xyz", "conductivity",
-        "v_raw", "v_per_a", "j_center_raw", "j_center_per_a", "j_local_raw", "j_local_per_a",
-        "h_raw", "h_per_a", "cells", "faces", "weak", "prepared_preimage", "charge_preimage",
-        "source_preimage", "certificate", "authoring_receipt", "direct_evidence", "sample_cells",
-    ].contains(&payload_kind.as_str()) {
-        validate_payload_kind(&payload_kind)?;
-    }
+    validate_family_payload_kind(&payload_kind)?;
     let snapshot = snapshot(&state, &stage_id).await?;
     let owner = snapshot.owner.clone();
     let (etag, bytes) = tokio::task::spawn_blocking(move || {
@@ -1168,9 +1180,7 @@ pub async fn get_antenna_external_lead_inspection_payload(
             ));
         }
         let (payload_sha256, bytes) = if record.schema_version == "antenna_closed_loop_stage_output.v2" {
-            let mut loaded = load_closed(&record, &snapshot.owner.artifact_dir)?;
-            let bytes = loaded.payloads.remove(&payload_kind).ok_or_else(|| ApiError::bad_request("unknown closed-loop inspection payload kind"))?;
-            (digest(&bytes), bytes)
+            select_closed_payload(load_closed(&record, &snapshot.owner.artifact_dir)?, &payload_kind)?
         } else {
             let loaded = fullmag_runner::load_published_antenna_external_lead_solution(
                 &snapshot.owner.artifact_dir, &output.inspection_ref.runner_reference(),

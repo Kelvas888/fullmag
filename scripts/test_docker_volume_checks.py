@@ -334,6 +334,102 @@ class FrontendAntennaShellBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(result.stdout.strip())
 
+    def test_dispatches_pinned_oracle_as_one_literal_argument(self):
+        source = "/selected/$(printf literal);worktree"
+        wheel = "/opt/fullmag/control/verification/task/mpmath-1.3.0-py3-none-any.whl"
+        recipe = ('python "/ignored/scripts/docker_volume_checks.py" '
+                  f"--source-root '{source}' --scope 'all' --oracle-wheel '{wheel}'")
+        result = self.dispatch(recipe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [
+            '--source-root', source, '--scope', 'all', '--oracle-wheel', wheel,
+        ])
+        for suffix in ("; printf injected", " --oracle-wheel '/other.whl'"):
+            rejected = self.dispatch(recipe + suffix)
+            self.assertEqual(rejected.returncode, 2, rejected.stderr)
+            self.assertFalse(rejected.stdout.strip())
+
+
+@unittest.skipIf(os.name == 'nt', 'Container wheel filesystem is POSIX')
+class OracleWheelBindingTests(unittest.TestCase):
+    def setUp(self):
+        import hashlib
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.source = self.root / 'source'
+        self.pin = self.source / 'scripts/antenna_triangle_surface_oracle.py'
+        self.pin.parent.mkdir(parents=True)
+        self.directory = self.root / 'verification'
+        self.wheel = self.directory / 'task/mpmath-1.3.0-py3-none-any.whl'
+        self.wheel.parent.mkdir(parents=True)
+        self.wheel.write_bytes(b'registered fixture wheel')
+        self.digest = hashlib.sha256(self.wheel.read_bytes()).hexdigest()
+        self.pin.write_text('WHEEL_SHA = ' + repr(self.digest) + '\n')
+        patcher = mock.patch.object(checks, '_ORACLE_WHEEL_ROOT', self.directory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def binding(self):
+        return checks._oracle_wheel_binding(self.source, str(self.wheel))
+
+    def test_accepts_pinned_file_and_records_its_identity(self):
+        binding = self.binding()
+        self.assertEqual(binding['sha256'], self.digest)
+        verified = checks._verify_oracle_wheel(binding, self.source)
+        self.assertEqual(verified['path'], str(self.wheel))
+        self.assertEqual(verified['sha256'], self.digest)
+        self.assertEqual(checks._verify_oracle_wheel(binding, self.source), verified)
+        self.assertIsNone(checks._oracle_wheel_binding(self.source, None))
+
+    def test_rejects_unbound_or_noncanonical_references(self):
+        for reference in (
+            str(self.root / self.wheel.name),
+            str(self.directory / '../task' / self.wheel.name),
+            str(self.directory / 'task' / 'other.whl'),
+            str(self.directory / 'task:extra' / self.wheel.name),
+            str(self.directory) + '//task/' + self.wheel.name,
+        ):
+            with self.subTest(reference=reference), self.assertRaises(checks.BuildControlError):
+                checks._oracle_wheel_binding(self.source, reference)
+
+    def test_rejects_wrong_bytes_changed_pin_symlink_and_oversize(self):
+        binding = self.binding()
+        self.wheel.write_bytes(b'changed')
+        with self.assertRaisesRegex(checks.BuildControlError, 'digest'):
+            checks._verify_oracle_wheel(binding, self.source)
+        self.wheel.write_bytes(b'registered fixture wheel')
+        self.pin.write_text('WHEEL_SHA = ' + repr('f' * 64) + '\n')
+        with self.assertRaisesRegex(checks.BuildControlError, 'binding'):
+            checks._verify_oracle_wheel(binding, self.source)
+        self.pin.write_text('WHEEL_SHA = ' + repr(self.digest) + '\n')
+        target = self.directory / 'wheel-copy'
+        self.wheel.rename(target)
+        self.wheel.symlink_to(target)
+        with self.assertRaisesRegex(checks.BuildControlError, 'canonical'):
+            checks._verify_oracle_wheel(binding, self.source)
+        self.wheel.unlink()
+        self.wheel.write_bytes(b'x' * (2 * 1024 * 1024 + 1))
+        with self.assertRaisesRegex(checks.BuildControlError, 'bounded'):
+            checks._verify_oracle_wheel(binding, self.source)
+
+    def test_rejects_a_mutated_reference_without_reading_another_file(self):
+        binding = self.binding()
+        for update in ({'sha256': 'f' * 64}, {'extra': True}, {'source_sha256': 'f' * 64}):
+            with self.subTest(update=update), self.assertRaises(checks.BuildControlError):
+                checks._verify_oracle_wheel({**binding, **update}, self.source)
+
+    def test_rejects_oracle_for_other_scopes_before_storage(self):
+        for suffix in (['--scope', 'frontend-tools'], ['--offline', '--modules', 'test_fixture']):
+            with self.subTest(suffix=suffix), \
+                 mock.patch.object(checks.sys, 'argv', ['checks', '--source-root', str(self.source),
+                     '--oracle-wheel', str(self.wheel), *suffix]), \
+                 mock.patch.object(checks.storage, 'resolve_layout') as resolve:
+                with self.assertRaisesRegex(checks.BuildControlError, 'only.*all'):
+                    checks.main()
+            resolve.assert_not_called()
+
+
 
 if __name__ == '__main__':
     unittest.main()

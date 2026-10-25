@@ -90,7 +90,7 @@ function resolveObjectContextVisualizationSettings(
   const quantity = catalog?.quantities.find(
     (entry) => resolveCanonicalQuantityId(entry.id) === resolveCanonicalQuantityId(settings.activeQuantityId),
   );
-  return quantity && quantityCatalogEntrySupportsSpatialVisualization(quantity)
+  return quantity && quantityCatalogEntrySupportsSpatialVisualization(quantity, settings.tensorProjection)
     ? settings
     : { ...settings, activeQuantityId: "" };
 }

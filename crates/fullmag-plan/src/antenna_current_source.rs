@@ -1316,6 +1316,7 @@ mod tests {
             conservative_current_view_ref: None,
             model: AntennaFieldModelIR::QuasistaticConductionBiotSavart3d,
             oersted_realization: AntennaOerstedRealizationIR::DirectTetraQuadrature,
+            surface_field_policy: None,
             conductor_mesh_policy: "authored_shared_domain".into(),
             field_sampling_domain: FieldTargetIR::Global {},
             target_refs: vec![],
@@ -2431,11 +2432,10 @@ pub fn materialize_antenna_closed_loop_current_input(
     require(stage.source_object_id==source.object_id && port.source_object_id==source.object_id
         && stage.current_transport_id==port.current_transport_id && stage.port_mode_ids==[port.id.clone()]
         && port.schema_version=="antenna_port_mode.v3" && stage.conservative_current_view_ref.is_none()
-        && stage.oersted_realization==AntennaOerstedRealizationIR::DirectTetraQuadrature
+        && matches!(stage.oersted_realization,AntennaOerstedRealizationIR::DirectTetraQuadrature | AntennaOerstedRealizationIR::AnalyticRt0Surface)
         && stage.model==AntennaFieldModelIR::QuasistaticConductionBiotSavart3d
-        && stage.conductor_mesh_policy=="authored_shared_domain"
-        && fullmag_ir::antenna_closed_loop_direct_budget(&stage.solver_policy).is_some(),
-        "prepared loop requires one matching explicit v3 source port and direct inspection stage")?;
+        && stage.conductor_mesh_policy=="authored_shared_domain",
+        "prepared loop requires one matching explicit v3 source port and supported inspection stage")?;
     require(definition.domain.len()==1 && definition.domain[0].object_id==source.object_id
         && definition.domain[0].region_id.is_none() && definition.boundaries.is_empty()
         && definition.gauge==ChargePotentialGaugeIR::ZeroMean && definition.external_lead_preparation.is_none()
@@ -2611,9 +2611,27 @@ pub fn materialize_antenna_closed_loop_current_input(
         role:if source_faces.contains(face) {fullmag_ir::ConservativeCurrentBoundaryRoleIR::SourceCut} else {fullmag_ir::ConservativeCurrentBoundaryRoleIR::InsulatingOuter},
         circuit_id:source_faces.contains(face).then(||cut.id.clone())}).collect();
     require(!field_sampling.positions_xyz_m.is_empty() && field_sampling.positions_xyz_m.iter().flatten().all(|value|value.is_finite()),"prepared source sampling must be finite and nonempty")?;
-    let direct_field_policy = closed_loop_direct_field_policy(&stage.solver_policy, mesh.cell_count(), field_sampling.positions_xyz_m.len())?;
+    let (direct_field_policy, surface_field_policy) = match stage.oersted_realization {
+        AntennaOerstedRealizationIR::DirectTetraQuadrature => {
+            require(stage.surface_field_policy.is_none(), "direct field stage refuses surface policy")?;
+            (Some(closed_loop_direct_field_policy(&stage.solver_policy, mesh.cell_count(), field_sampling.positions_xyz_m.len())?), None)
+        }
+        AntennaOerstedRealizationIR::AnalyticRt0Surface => {
+            let policy = stage.surface_field_policy.as_ref().ok_or_else(|| fail("surface field requires explicit complete policy"))?;
+            let errors = policy.validation_errors("surface_field_policy");
+            if !errors.is_empty() { return Err(PlanError {reasons:errors}); }
+            let pairs = u64::try_from(mesh.cell_count()).ok().and_then(|sources|
+                u64::try_from(field_sampling.positions_xyz_m.len()).ok().and_then(|targets| sources.checked_mul(targets)))
+                .filter(|pairs| *pairs > 0 && *pairs <= policy.limits.total[0])
+                .ok_or_else(|| fail("surface field source-target pair budget exceeded or empty"))?;
+            require(pairs / field_sampling.positions_xyz_m.len() as u64 <= policy.limits.per_target[0],
+                "surface field per-target source pair budget exceeded")?;
+            (None, Some(policy.clone()))
+        }
+        AntennaOerstedRealizationIR::VectorPotentialSolver => return Err(fail("prepared loop vector potential is unsupported; no fallback")),
+    };
     Ok(ResolvedAntennaClosedLoopCurrentInputIR {schema_version:"antenna_closed_loop_current_input.v2".into(),field_scope:"full_closed_loop.inspection_only.v2".into(),
         stage:stage.clone(),port:port.clone(),authored_definition:definition.clone(),source_mesh:mesh.clone(),source_object_segments:segments.to_vec(),source:source.clone(),authored_input_preimage,
         conductivity_spm_per_element:conductivity,boundary_roles,solver:solver.clone(),field_sampling:field_sampling.clone(),algebraic_relative_tolerance:1.0e-12,
-        physical_relative_gate:1.0e-10,physical_absolute_gate_a:1.0e-18,direct_field_policy})
+        physical_relative_gate:1.0e-10,physical_absolute_gate_a:1.0e-18,direct_field_policy,surface_field_policy})
 }

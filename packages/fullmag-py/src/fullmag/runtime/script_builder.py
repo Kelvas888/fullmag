@@ -5636,6 +5636,9 @@ def _render_antenna_field_solve_definition_expr(definition: dict[str, object]) -
         "model", "oersted_realization", "conductor_mesh_policy", "solver_policy",
     )
     args = [f"{field}={_py_literal(definition[field])}" for field in scalar_fields]
+    if definition.get("surface_field_policy") is not None:
+        args.append("surface_field_policy=fm.AntennaSurfaceFieldPolicy(**"
+                    + _py_literal(_normalize_mapping(definition["surface_field_policy"])) + ")")
     if definition.get("conservative_current_view_ref") is not None:
         args.append(
             "conservative_current_view_ref="

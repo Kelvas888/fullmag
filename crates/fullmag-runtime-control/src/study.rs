@@ -373,6 +373,18 @@ impl AcceptedStudySnapshot {
         self.validate_task_preparation_envelope(&durable, task_id)
     }
 
+    /// Validate portable readiness evidence without creating execution authority.
+    pub fn bind_closed_inspection_preparation(
+        &self, durable: &fullmag_session::FmsTaskPreparationReceipt, task_id: &str,
+    ) -> Result<ClosedLoopPreparationReceipt> {
+        match self.validate_task_preparation_envelope(durable, task_id)? {
+            AcceptedPreparationReceipt::ClosedLoop(receipt) => Ok(receipt),
+            AcceptedPreparationReceipt::Solver(_) => {
+                bail!("inspection readiness requires a typed closed-loop step")
+            }
+        }
+    }
+
     /// Resolve a claimed study task using only its durable preparation receipt
     /// and this immutable accepted snapshot. This does not create or persist a
     /// claim, admit execution, or change task readiness. The dispatch boundary
@@ -3494,6 +3506,14 @@ pub fn load_accepted_study_snapshot(
     project_id: &ProjectId,
 ) -> Result<AcceptedStudySnapshot> {
     let run = crate::load_accepted_run_snapshot(store, run_id, project_id)?;
+    load_accepted_study_snapshot_from_run(store.cas(), run)
+}
+
+/// Share canonical planning/input verification with an imported evidence-only CAS.
+pub fn load_accepted_study_snapshot_from_run(
+    cas: &fullmag_session::CasStore,
+    run: crate::AcceptedRunSnapshot,
+) -> Result<AcceptedStudySnapshot> {
     let intent = &run.intent;
     let specification = &run.specification;
     let study_ref = intent
@@ -3504,13 +3524,11 @@ pub fn load_accepted_study_snapshot(
         .study_catalog_object_ref
         .as_deref()
         .context("accepted run has no immutable study catalog object")?;
-    let study_bytes = store
-        .cas()
-        .get(study_ref)?
+    let study_bytes = cas
+        .get_bounded(study_ref, fullmag_session::MAX_TERMINAL_CATALOG_METADATA_BYTES)?
         .context("accepted run study object is missing")?;
-    let catalog_bytes = store
-        .cas()
-        .get(catalog_ref)?
+    let catalog_bytes = cas
+        .get_bounded(catalog_ref, fullmag_session::MAX_TERMINAL_CATALOG_METADATA_BYTES)?
         .context("accepted run study catalog object is missing")?;
     let study: StudyPlan =
         serde_json::from_slice(&study_bytes).context("accepted run study object is not typed")?;
@@ -3540,7 +3558,7 @@ pub fn load_accepted_study_snapshot(
             );
         }
         // Verify all bytes without retaining a discarded buffer, preserving the v4 cap.
-        let length = store.cas().verified_length(object_ref)?;
+        let length = cas.verified_length(object_ref)?;
         if study.schema_version == fullmag_authoring::STUDY_PLAN_SCHEMA_VERSION_V4
             && length.is_some_and(|bytes| bytes > 32 * 1024 * 1024) {
             bail!("accepted v4 run asset exceeds its metadata budget");
@@ -3552,9 +3570,9 @@ pub fn load_accepted_study_snapshot(
     if study.schema_version==fullmag_authoring::STUDY_PLAN_SCHEMA_VERSION_V4 {
         let asset=specification.immutable_assets.iter().find(|asset|asset.asset_id==fullmag_application::SCRIPT_PIPELINE_SOURCE_ASSET_ID)
             .context("accepted v4 requires captured compiled source asset")?;
-        let bytes=store.cas().get_bounded(&asset.content_sha256,16*1024*1024)?.context("accepted v4 source asset missing")?;
+        let bytes=cas.get_bounded(&asset.content_sha256,16*1024*1024)?.context("accepted v4 source asset missing")?;
         let source=fullmag_application::validate_accepted_script_pipeline_source(&study,&catalog,&bytes)?;
-        fullmag_application::validate_script_source_assets(specification,&source,|hash,maximum|store.cas().get_bounded(hash,maximum)?.context("accepted source file missing"))?;
+        fullmag_application::validate_script_source_assets(specification,&source,|hash,maximum|cas.get_bounded(hash,maximum)?.context("accepted source file missing"))?;
     }
     let lowered = lower_study_plan_with_catalog(&study, &catalog)
         .context("lower immutable study through canonical planner")?;

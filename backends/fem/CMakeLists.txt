@@ -266,8 +266,10 @@ if(FULLMAG_USE_MFEM_STACK)
         cpu/mfem/workflows/antenna_field_solve/charge_control_nullspace_rank.cpp
         cpu/mfem/workflows/antenna_field_solve/charge_terminal_current_constraints.cpp
         cpu/mfem/workflows/antenna_field_solve/accepted_terminal_charge_source.cpp
+        cpu/mfem/workflows/antenna_field_solve/accepted_surface_rt0.cpp
           cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.cpp
         cpu/mfem/interactions/oersted/direct_tetra_quadrature.cpp
+        cpu/mfem/interactions/oersted/surface_rt0.cpp
         cpu/mfem/interactions/oersted/vector_potential.cpp
     )
 

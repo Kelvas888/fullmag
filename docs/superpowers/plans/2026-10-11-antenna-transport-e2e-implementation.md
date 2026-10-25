@@ -1,5 +1,31 @@
 # Anteny i transport — realizacja E0–E12, 11.10.2026
 
+
+## Aktualny checkpoint: poprawka A zweryfikowana — 25.10.2026
+
+Zatwierdzony patch A jest zastosowany. Managed build `dce721b26fcc4f7f90614367a0f516ac`
+i promocja `77d8c6371b164f16980fa9a4df47f60f` zakończyły się kodem 0.
+Aktualny receipt pakietu: `f29fe925cf173feb1dce461a43f599b229269b0f4b712a5c18a7a298b835bd42`;
+provenance: `d9b1fa84e1b44c74910fe09e70426d2c001c2677149b119e0f0bd3265acc112e`.
+API nie wystartowało; poprzedni pakiet zachowano jako rollback.
+
+Native verify-only na rzeczywistym runie 743a85: exit 0, request SHA256
+`5101ae72214536a28d15cc95ca7b2286346ea7c3b94da6d06ccd244fbca39052`.
+Dziesięć requestów z niezgodnymi pinami zostało odrzuconych, 236 chronionych
+plików runu/ledgera/runtime bez zmian. Nie wykonano apply ani nowego Solve.
+Dowody: `verification/approved-heartbeat-A-20261025/` w wolumenie kontrolnym.
+To weryfikacja bramki recovery, nie uruchomionego API, Universe ani kwalifikacja fizyki.
+
+Oryginalna propozycja B jest wycofana jako niepełna; analiza wywołań nie
+wykazała jej konieczności do zwykłego startup po dokładnym Failed/released.
+Nie wdrażamy spekulacyjnego następcy B. Rzeczywisty startup po recovery
+pozostaje do sprawdzenia; samą finalizację i release należy oddzielić od
+zatwierdzonego zastosowania A. Odbiór E0–E12 nadal nieukończony.
+
+Na polecenie użytkownika pobrano `origin/master` do
+`f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`; fetch nie zmienia worktree.
+
+
 ## Zakres i stan
 
 Zadanie obejmuje cały zakres E0–E12 z polecenia użytkownika. Ten dokument jest
@@ -12,7 +38,134 @@ fixture; rzeczywisty runtime; kwalifikacja naukowa określonej lane i zakresu;
 kwalifikacja end-to-end UI. Brak testu nie oznacza braku kodu. Zielony build nie
 oznacza kwalifikacji fizyki ani UI.
 
-## Zamrożone wejścia
+## Bieżący checkpoint — 25.10.2026: integracja mastera
+
+Na jawne polecenie użytkownika pobrano origin/master:
+28f4fcf5bba4387025944b8fb276c94b3eef5eb5.
+Zintegrowano go z gałęzią anten przez merge commit
+250a7728ba7c24cb96d20468ae3fa457a860d555.
+Master jest przodkiem HEAD. Rozwiązano 28 konfliktów commitów, zachowując
+semantykę mastera i anteny, bez blanket ours/theirs. Dostosowano trzy
+moduły fixture do kontraktów helpera/QA oraz odizolowano testy pakietu od
+prawdziwych archiwów. Kontenerowa recepta docker-dev-control-checks all:
+1181 testów interpretowanych PASS, 24 pominięte. Bez kompilacji unit testów.
+
+WIP zabezpieczono przed merge w wolumenie kontrolnym:
+verification/master-integration-20261025-28f4fcf5/preintegration.tar.gz,
+SHA256 1f376c9a6db8a2f6a95fd7f9dd56dfbe25cec8e137b2b6f3bb9f6aace4e06cfc,
+oraz w stashu 26a563993c1914aea4c81d5a41d0f7ccd1e3fbdd.
+Stash przywrócono bez usuwania jego kopii; rozwiązano sześć konfliktów WIP.
+Indeks ponownie pusty. Z 105 zabezpieczonych plików 84 niekolidujące
+pozostały identyczne bajtowo, 21 śledzonych połączono z masterem.
+Wszystkie 16 nieśledzonych plików zachowane bajtowo. Chroniony FMS nadal ma
+SHA256 d1ce5e22d273213da0119492a95a24a46428b75a199a24dbd93dd0c216bf24de.
+Modele Python zregenerowano kanonicznym generatorem z połączonego OpenAPI;
+świeży eksport API z nowego binarium pozostaje wymagany po buildzie.
+
+Runtime pozostaje w poprzednim, terminalnym stanie; API nie uruchomiono.
+Po integracji managed build exit0 (attempt3898ce004d0a4400b1cae74df1ec7670,
+make1228287ms) i promocja bez startu runtime (attempt70b716228411495d90524fceb58f0ee6)
+publikują nowy installed receipt
+84fcc386709def983cc3f3aaf6c42665012bea991e10920ec3d5883f632eb0e8,
+provenance05edb71446d59442f32cf75d41ecd92c1621f4499fa36559cae434ec041e9b22.
+Poprzedni pakiet189b45d1… zachowano w rollbacku. Process-tree pozostał
+c1da239cd9af4422c86a1e4b14a875b268932c31096f29229737d822b4fda015.
+Managed codegen exit0: backend/codegen/openapi-v2/
+9a3c17e1a16066412284b85b979b2d2ec2451ee1556380e66d06501856dce1f4.json.
+Python generator check bez driftu; pomocniczy typecheck po codegenie i lint5
+warstw viewportu exit0; 84 fixture checks PASS. Po WIP domyślne1195testów
+miało12błędów braku zarejestrowanego wheela mpmath; osobne19testów oracle
+z dokładnym istniejącym wheelem PASS. Nie oznaczono domyślnej recepty jako zielonej.
+Wyniki70/70 i oba FMS ponownie zweryfikowane bez zmian.
+Obie propozycje recovery pozostają niezastosowane. Konkretny przegląd:
+2026-10-25-master-integration-recovery-review.md. Odbiór E0–E12 nadal1/13.
+
+Przegląd integracji wykrył dodatkową niezgodność w
+crates/fullmag-api/src/accepted_study_supervisor.rs::
+reconcile_durable_worker_exit_before_spawn: gałąź Failed wymaga opcjonalnego
+raportu native failure również dla zwykłych historycznych błędów mastera.
+Proponowana korekta warunkuje specjalny replay przez Some(decision), zachowuje
+wszystkie walidacje raportu i DoNotRetry; działa tylko na już Released lease.
+Automatyczna kontrola odrzuciła tę edycję przed wykonaniem polecenia,
+uznając ją za osobną zmianę bramki recovery. Kod pozostał bez korekty;
+nie zastosowano obejścia. Build-only nie kwalifikuje tej ścieżki runtime.
+
+Retencja: brak skilla fullmag-build-stage-cleanup w bieżącym checkoutcie.
+Zachowano cache, rollback, wcześniejszy quarantine candidate i logi.
+Nie tworzono nowych backing images, kontenerów ani grup; nie wykonywano prune.
+
+## Checkpoint historyczny — 24.10.2026
+
+Zaakceptowany pozostaje wyłącznie etap E0: **1/13 etapów**; pozostałe 12
+ma otwarte kryteria. Fragment działający źródłowo nie zamyka etapu.
+Worktree /home/kking/git/fullmag/worktrees/antenna-transport-e2e-20261011,
+branch codex/antenna-transport-e2e-20261011, HEAD
+3ce85b87f0c44c34b57d2c6156eec5f994bd297d.
+Grupa fullmag-worktree-antenna-transport-e2e-20261011-5d5deadcd16e0fb1,
+frontend 3203; **API pozostaje zatrzymane po nieudanej próbie publikacji**.
+
+Jeden publiczny Solve run-live-743a85ce65a3a257777cb73c1bf4a1c9f7f44563e6fa6b28b10b2651e9d9e5c0
+uruchomił natywne wykonanie analytic_rt0_surface, lecz wspólna bramka
+requested_intent odmówiła publikacji metadanych. Nie powstał zaakceptowany
+nowy wynik H. Scheduler zakończył się przy finalnym heartbeat, nadzorca
+zamknął API; brak OOM. Nie ponawiano Solve.
+
+Poprawka metadanych oraz kanoniczny kontrakt projekcji tensora przeszły
+rzeczywisty managed build w tym samym kontenerze: exit 0, attempt
+9915a3fa144c47a3a29a92359a07d101, make 820212 ms. Snapshot:
+29e6a57d6aa7a1e057603f37da7a5330249b204828503feb0de67857b985a95a.
+Nastąpiła zarządzana promocja bez startu runtime, attempt
+3cd7d16bfc2645a3b035970159b5b266, receipt SHA256
+189b45d1df4fd2aa506087edf33b84f5ef5aa9cfdb15a33f7644cd418948d65c,
+provenance SHA256
+9c95be35a845e277ba165b018c72e8a18c489bf5d440d75ede24a060d55be9ec.
+Poprzedni pakiet zachowany jako rollback; wcześniejszy niepromowany kandydat
+zjs53twt zachowany w /opt/fullmag/package/.development/quarantine.
+Cache i dane użytkownika zachowane.
+
+Recepta docker-dev-codegen zakończyła się exit 0 i opublikowała cztery
+generowane pliki. Receipt w wolumenie kontrolnym:
+backend/codegen/openapi-v2/864254ec1ec125fb2f781286c0b50d1225f44eec09746740011dd320e1666d56.json.
+Nie edytowano generowanych typów ręcznie.
+
+E10 ma teraz osobne, kanoniczne resolved_capability.projections dla 13
+jawnych projekcji. Surowy tensor pozostaje UnsupportedShape/ExportOnly.
+Przekazanie projekcji do Airbox odtworzono jako rzeczywistą porażkę funkcji
+produkcyjnej (projekcja skalarna błędnie żądała glyphów), następnie naprawiono
+jedną linią tensorProjection w syntetycznych settings. Po poprawce **84/84**
+sprawdzenia funkcji produkcyjnych PASS, w tym Airbox, planar i FieldMap;
+baseline odtwarza 13 odmów poprawnych projekcji. To fixture, nie runtime
+tensora ani dowód WebGL. Dowody w wolumenie frontendu:
+development/verification/e10-canonical-projections-20261024/check-airbox.mjs
+oraz report.json. Pomocniczy produkcyjny typecheck exit 0; lint wszystkich 10 zmienionych plików, check:architecture-hygiene i check:api-hygiene exit 0. Raport: development/verification/e10-canonical-projections-20261024/source-diagnostics.json.
+Zarządzana kwalifikacja frontend-visualization odmówiła przed wykonaniem
+kontroli: Frontend checks require healthy existing services. Nie obchodzono
+tej bramki ani nie przedstawiano diagnostyki jako kwalifikacji managed.
+
+Recovery nadal blokuje dokładny stan: końcowy Heartbeat109 został applied,
+lecz ostatni trwały ACK/lease to108. Natywne verify-only odmawia.
+Patch SHA256 34cd8b21e9a5276cd26f7c7743d996470b87a1c739d1e29f737647b3566e5400
+pozostaje **niezastosowany**. Po wiadomości użytkownika „ok, zgadzam sie i nie
+pytaj sie wiecej o to” ponowna automatyczna kontrola odrzuciła próbę
+zastosowania przed uruchomieniem polecenia: brak jednoznacznego potwierdzenia
+dokładnej relaksacji applied heartbeat bez trwałego ACK. Nie wykonano
+finalizacji, zwolnienia rezerwacji ani ręcznej zmiany inbox/ACK/owner/journal.
+Konkretna propozycja pozostaje w:
+ /home/kking/git/storage/reviews/antenna-surface-applied-heartbeat-20261024/przeglad-pl.md.
+
+Wcześniejszy niemagnetyczny FEM CPU raw closed-loop ma V678nodes,
+J7468local samples w1867Tet4 oraz H14targets; historyczne 31 kontroli HTTP
+przeszło. Ostatnia weryfikacja retencji zachowała 70/70 plików i oba archiwa.
+**Pełna mapa Universe, nowy zaakceptowany surface wynik, WebGL oraz
+zakwalifikowana baza/FFT/LLG pozostają nieodebrane.** Scalar24 zakończono
+odmową czasu M16/shear z20/24 ukończonymi przypadkami; zakres skalarny nie
+kwalifikuje ważonego native RT0.
+
+Sekcje poniżej zachowują historię. Dawne stwierdzenia „backend działa”
+opisują moment historyczny. Obowiązuje ta sama grupa Docker WSL,
+repozytoryjne just i zachowanie cache/wyników.
+
+## Zamrożone wejścia z rozpoczęcia zadania
 
 - Worktree zadania: `D:/git/fullmag/worktrees/antenna-transport-e2e-20261011`.
 - Branch: `codex/antenna-transport-e2e-20261011`.
@@ -49,7 +202,7 @@ oznacza kwalifikacji fizyki ani UI.
 | Accepted current → H → publikacja | `antenna_external_lead_solution/execution.rs::execute_antenna_external_lead_inspection`; native `backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.cpp::solve_accepted_external_lead_display_bundle`; `antenna_external_lead_solution/publication.rs::publish_antenna_external_lead_solution_atomically` | Osobny owned bundle publikuje V/RT0/J/H z jednego źródła. Nie wolno promować truncated inspection do reusable basis. Standardowy tor pozostaje odrębnym problemem E3. |
 | Archiwum → API → hooks → Inspector → renderer | `antenna_external_lead_solution/publication.rs::load_published_antenna_external_lead_solution`; `crates/fullmag-api/src/router_v2/handlers/data/antenna_inspection.rs::get_antenna_external_lead_inspection`, `get_antenna_external_lead_inspection_display`, `get_antenna_external_lead_inspection_payload`; `apps/control-room/src/kernel/resources/antennaResources.ts`; `AntennaVisualizationPanel.tsx`; `AntennaFieldLayer.tsx` | Kod obsługuje v1 bez J i v2 z J, binary payload oraz current cell-local traces. Nowa sesja, cold-load i rzeczywisty UI nadal wymagają osobnych dowodów. Nie wystarcza fixture. |
 | Basis → projection → waveform → LLG | `crates/fullmag-runner/src/antenna_field_solution.rs::load_solved_antenna_drive_basis_projected`, `materialize_fem_solved_antenna_drives`, `materialize_fdm_solved_antenna_drives`; `crates/fullmag-plan/src/antenna_projection.rs::resolve_fem_antenna_projection_mask` | Loaders i projekcje istnieją. Własność normalizacji, pełne cache dependencies, wszystkie RHS integratory, rollback/checkpoint i activation wymagają audytu/wykonania. |
-| Source FFT oraz odpowiedź | `crates/fullmag-runner/src/antenna_spectrum.rs::compute_antenna_source_spectrum_artifact`, `compute_structured_antenna_source_spectrum`, `compute_nonuniform_k_antenna_source_spectrum`; `spin_wave_response.rs::append_requested_spin_wave_artifacts`, `build_gamma_response`; `spin_wave_sampling.rs` | Istnieją FFT i interpolacja Tet4; publiczny transverse/equilibrium loader jest niezrealizowaną bramką, nie wolno zastępować m0 osią z. Obecność Gamma nie dowodzi pełnej odpowiedzi m(k,ω). |
+| Source FFT oraz odpowiedź | `crates/fullmag-runner/src/antenna_spectrum.rs::compute_antenna_source_spectrum_artifact`, `compute_structured_antenna_source_spectrum`, `compute_nonuniform_k_antenna_source_spectrum`; `spin_wave_response.rs::append_requested_spin_wave_artifacts`, `build_gamma_response`; `spin_wave_sampling.rs` | Istnieją FFT i interpolacja Tet4; tor skryptowy ma loader verified equilibrium i transverse context; wykonanie i accepted Study niezweryfikowane, nie wolno zastępować m0 osią z. Obecność Gamma nie dowodzi pełnej odpowiedzi m(k,ω). |
 
 ## Potwierdzone różnice i zachowane odmowy
 
@@ -84,18 +237,18 @@ dokładne nowe symbole i commands/exit codes dopisuje checkpoint danego etapu.
 | Etap | Stan i plan | Kontrakt, zależności, walidacja i kryterium |
 |---|---|---|
 | E0 | Zamknięty etap źródłowy: baza, kopia WIP, owner i mapa sześciu przepływów | Pełne SHA, owner i source pins; żadnego równoległego modelu/klienta. Odbiór po potwierdzeniu sześciu przepływów i spin lanes; source reading nie kwalifikuje runtime. |
-| E1 | Mapowanie adaptera naprawione i sprawdzone na raw OVF; nowy benchmark solverów otwarty | Q_ia row-major: i flow, a spin; wersjonowane units; raw OVF z 9 różnymi składowymi, wieloma punktami N/F, signs; RED→GREEN przed nowym benchmarkiem pinned źródeł/binariów. E0. |
-| E2 | Istnieją kontrakty external leads i draft creators; workflow niekompletny | Geometria signal/feed/return oddzielona od terminal BC i port weights; stable surface IDs, closure/gauge/component rejection przed solve; UI→Python→UI bez JSON. E0 + nota naukowa. |
-| E3 | Owned inspection istnieje; standardowy charge/RT0 split otwarty | Jeden accepted owner V/J/H/raw currents/normalization/certificate, SI, atomowa publikacja, getters bez mutacji; regresja dwóch stanów i próg błędu ustalony przed wynikami. E2. |
-| E4 | Tet4 sampling istnieje; Region brak, nonmagnetic public execution niezweryfikowane | V conductor, J local cells, H sampling, target projection osobno; jawne outside status i invalidation; oba A/B przez prawdziwy field-only bez m/Ms/Aex. E3. |
-| E5 | v2 metadata/binary i disk loader istnieją, cold archive HTTP niezweryfikowane | V[V], J[A/m²], H[A/m], basis[1/m]; session/epoch/stage/source/carrier/revision/digest; legacy bez J; mismatch/corruption/stale/session switch odmowa; native→archive→cold HTTP. E3–E4. |
-| E6 | Port i Projection mają publiczne edit/rebind/remove; Spectrum nie jest podłączone do accepted Study; runtime/UI odbiór otwarty | Właściciel canonical zasobu, Apply/Reset/history, field transaction pending, revision conflict, explicit dependent removal policy; każdy node własny view; focus/scroll/root stability Object/Airbox. E2–E5. |
-| E7 | Wspólny szablon i antenna overlay istnieją; real browser otwarty | Scalar V bez vectors, RT0 interpolation vector before norm bez nodal averaging, units/carrier/raw-perA-scaled legenda; canvas/context/drawing buffer, camera, bounded requests/payload/idle. E5–E6. |
+| E1 | Adapter naprawiony i sprawdzony na raw OVF; host admission WSL ma34 interpreted PASS; rzeczywisty nowy producer BORIS i benchmark nadal otwarte | Q_ia row-major: i flow, a spin; wersjonowane units; raw OVF z 9 różnymi składowymi, wieloma punktami N/F, signs; RED→GREEN przed nowym benchmarkiem pinned źródeł/binariów. E0. |
+| E2 | Pełny obwód3D ze source cut działa w rzeczywistym skrypcie closed-loop; workflow wyboru powierzchni i UI round-trip nieodebrany | Geometria signal/feed/return oddzielona od terminal BC i port weights; stable surface IDs, closure/gauge/component rejection przed solve; UI→Python→UI bez JSON. E0 + nota naukowa. |
+| E3 | Jeden owned wynik raw closed-loop V/J/H uruchomiony i zachowany; standardowy charge/RT0 split oraz qualification/basis pozostają otwarte | Jeden accepted owner V/J/H/raw currents/normalization/certificate, SI, atomowa publikacja, getters bez mutacji; regresja dwóch stanów i próg błędu ustalony przed wynikami. E2. |
+| E4 | Niemagnetyczny field-only FEM CPU wykonał V/J/H bez m/Ms/Aex; H ma14 targets; pełny Universe odmówił na budżecie, Region i dalszy odbiór otwarte | V conductor, J local cells, H sampling, target projection osobno; jawne outside status i invalidation; oba A/B przez prawdziwy field-only bez m/Ms/Aex. E3. |
+| E5 | Archiwum/cold-load/HTTP raw V/J/H i produkcyjne dekodery potwierdzone; brakujące nagłówki FMVP6 naprawione źródłowo, ich rzeczywisty HTTP po buildzie nadal otwarty | V[V], J[A/m²], H[A/m], basis[1/m]; session/epoch/stage/source/carrier/revision/digest; legacy bez J; mismatch/corruption/stale/session switch odmowa; native→archive→cold HTTP. E3–E4. |
+| E6 | Port i Projection mają publiczne edit/rebind/remove; v3 zero weights zachowane w rzeczywistym publicznym imporcie HTTP201; źródłowa ochrona source-cut przy ACK (28 Python +27 Node PASS); Spectrum nie jest podłączone do accepted Study; runtime/UI odbiór otwarty | Właściciel canonical zasobu, Apply/Reset/history, field transaction pending, revision conflict, explicit dependent removal policy; każdy node własny view; focus/scroll/root stability Object/Airbox. E2–E5. |
+| E7 | Wspólny szablon raw SI i rozdzielone scalar/local-J/H carriers istnieją; realne binaria przeszły dekodery i produkcyjny prepare/present overlay (39 source pins,12 odmów); admission nagłówków, pełny Universe i browser/WebGL nieodebrane | Scalar V bez vectors, RT0 interpolation vector before norm bez nodal averaging, units/carrier/raw-perA-scaled legenda; canvas/context/drawing buffer, camera, bounded requests/payload/idle. E5–E6. |
 | E8 | Loaders/projections/waveforms istnieją; kwalifikacja niezamknięta | Fixed linear source basis z accepted signed Iref, operator dependencies, waveform nie invaliduje basis; RHS substeps/retry/origin/checkpoint, DC Relax, requested/resolved device; 0/sign/2x/superposition i brak solve w LLG. E3–E5 kwalifikowane. |
-| E9 | Structured/nonuniform FFT istnieją w script executor; brak typed accepted Study operation i kwalifikowanego producer/input; transverse public loader otwarty | Fizyczny resampling, exponent/origin/window/Nyquist/units, transfer budget, amplitude/phase/Re/Im/squared spectrum; osobny Run monitoring m(k,ω); modal refusal bez qualified basis. E8; known harmonic i independent normalization + real source/response. |
-| E10 | Jawny edytor paired trace refs jest podłączony źródłowo; kontrola modelu PASS; typecheck, DOM i runtime/UI odbiór otwarte | canonical IDs, rank/layout, 9 components, Q_dot_a flow vector, Frobenius norm, 3×3 table, surface flux tylko carrier+normal; bez implicit XYZ; Python/UI round-trip. E0–E1 + catalog/API. |
+| E9 | Structured/nonuniform FFT istnieją w script executor; brak typed accepted Study operation i kwalifikowanego producer/input; verified equilibrium/transverse loader istnieje w torze skryptowym, jego runtime niezweryfikowany | Fizyczny resampling, exponent/origin/window/Nyquist/units, transfer budget, amplitude/phase/Re/Im/squared spectrum; osobny Run monitoring m(k,ω); modal refusal bez qualified basis. E8; known harmonic i independent normalization + real source/response. |
+| E10 | Kanoniczne 13 jawnych projection capabilities wdrożone w catalog/runner/API i wygenerowanych typach; Airbox/planar/FieldMap respektują wybraną projekcję. Managed build i codegen exit0, 84/84 interpreted fixture PASS, pomocniczy typecheck exit0; managed frontend qualification blokuje niezdrowe API, rzeczywisty tensor runtime/WebGL nadal otwarte | canonical IDs, rank/layout, 9 components, Q_dot_a flow vector, Frobenius norm, 3×3 table, surface flux tylko carrier+normal; bez implicit XYZ; Python/UI round-trip. E0–E1 + catalog/API. |
 | E11 | Lane implementations istnieją z oddzielnymi ograniczeniami | FDM CPU M1/M2/M3 combinations, GPU steady M1 scope, FEM CPU M1/M2; forced GPU bez fallback; charge/spin/SHE/iSHE/torque/balance i LLG checkpoint evidence; supported/unsupported/unqualified matrix. E1+E10. |
-| E12 | Nie rozpoczęto odbioru całego zakresu | Własne sesje: nonmagnetic field-only/cold-load; microstrip qualified basis/DC Relax/AC Run; source FFT/response; N/F tensor/torque; round-trip/invalidation/refusals/Object/Airbox. Analytic + independent refinements transport/field/projection, far/near/inside osobno; commands/exit codes/SHA/screenshots i raport PL. Wszystkie wymagane wcześniejsze etapy. |
+| E12 | Odbiór całego zakresu pozostaje otwarty; jeden raw nonmagnetic V/J/H ma dowody runtime/cold HTTP, bez qualified basis, LLG i UI E2E | Własne sesje: nonmagnetic field-only/cold-load; microstrip qualified basis/DC Relax/AC Run; source FFT/response; N/F tensor/torque; round-trip/invalidation/refusals/Object/Airbox. Analytic + independent refinements transport/field/projection, far/near/inside osobno; commands/exit codes/SHA/screenshots i raport PL. Wszystkie wymagane wcześniejsze etapy. |
 
 ## Dowody i bramki operacyjne
 
@@ -3061,3 +3214,1595 @@ scheduler, a nadzorca zakończył API/runtime. Katalog Running/reconciling rev52
 jest stanem niezamkniętej historii, nie nadal pracującym solverem. Żadne kolejne
 Solve ani zwiększenie budżetu nie zostało wykonane. Pełne dowody i granica nowej
 zgody są w końcowej sekcji 2026-10-24-universe-fingerprint-recovery-proposal.md.
+
+
+## Integralność wewnętrznego wyniku po zimnym imporcie — 24.10.2026
+
+W ramach utrzymanej zgody użytkownika wykonano rzeczywistą regresję przez
+publiczne API własnej grupy Compose 3203. Nie uruchomiono Solve ani MeshBuild,
+nie zmieniono solvera, tolerancji, limitów ani oryginalnego wyniku.
+
+Wejście pozytywne to kanoniczny, domyślnie skompresowany FMS:
+`antenna-closed-loop-inspection-canonical-compressed-20261024.fms`, 31843013 B,
+SHA256 `bac01e621c625171da82b8cf2a6c6cba6ae840ee7525cd8f401e29bc48929ad2`.
+W kopii rzeczywistego bundle FMACLB01 zmieniono jeden bajt payloadu v_raw.bin,
+zachowując wewnętrzny manifest i jego pierwotną sumę. Przeliczono zewnętrzne
+CAS bundle i study_output_manifest.v3, detached ArtifactCatalog i rekordy
+SolutionSet, ich długości i sumy, closure oraz powiązanie session manifest.
+Kontrola niezależnie potwierdziła zgodność 1959 obiektów CAS i siedmiu rekordów.
+Kopia ma SHA256
+`72224267ad9f5b95d657d8ffcac539a530955606ce3726bedf1d8a5aa455ee7f`.
+
+Publiczna inspekcja FMS zwróciła HTTP 200 bez zmiany obserwacji. Import
+visualization_only również przeszedł. Następujący po nim odczyt katalogu pól
+dla rzeczywistego Study step zwrócił HTTP 409,
+`accepted_inspection_owner_invalid`, z przyczyną
+`antenna inspection bundle v1: payload digest mismatch`. Oryginalny accepted
+store był nadal dostępny. Provider nie podstawił jego poprawnych danych za
+uszkodzony import ani nie zwrócił zerowego pola lub magnetyzacji.
+
+Następnie przez ten sam publiczny import przywrócono poprawny kanoniczny FMS.
+Ponowny odczyt surowych V/J/H potwierdził identyczność bajtową z zachowanym
+wynikiem: V ma 678 próbek, J ma 7468 lokalnych śladów, H ma 14 punktów.
+Wszystkie 70 plików wynikowych i dziewięć historycznych RunCatalog pozostały
+identyczne pod względem długości i SHA256. API jest zdrowe, katalog komend
+pozostaje pusty. Dowód: inner-payload-rehashed-outer-preservation.json.
+
+Dowody i wykonywalne skrypty są w wolumenie kontrolnym własnej grupy, pod
+`verification/universe-volume-policy-20261023/fms-portable-inspection-20261024/`:
+
+- `inner-payload-rehashed-outer-http.py` i `inner-payload-rehashed-outer-preparation.json`;
+- `inner-payload-rehashed-outer-inspection.json`;
+- `inner-payload-rehashed-outer-runtime.py` i `inner-payload-rehashed-outer-runtime.json`;
+- `inner-payload-rehashed-outer-preservation.py` i `inner-payload-rehashed-outer-preservation.json`.
+
+To dowód integralności przenośnej obserwacji i braku fallbacku do innego
+magazynu. H nadal obejmuje 14 zachowanych punktów, a nie pełną objętość
+Universe. Kwalifikacja naukowa, browser/WebGL oraz pełne E5 pozostają otwarte;
+nie zaliczono kolejnego kamienia E1–E12. Nie dodawano plików do indeksu Git,
+nie kompilowano testów Rust i nie uruchamiano niedostępnego CI.
+
+
+## Rzeczywista diagnostyka Universe i recovery bez ponowienia — 24.10.2026
+
+Poprzedni etap uznano za postęp: zakończono rzeczywisty test spójnego zewnętrznie,
+ale uszkodzonego wewnętrznie importu i przywrócono identyczne V/J/H. Cały zakres
+E0–E12 pozostaje bez zmian; nie zaliczono następnego kamienia.
+
+Zarządzana aktywacja skryptu, attempt 4ff0f77f4ef04f15b3e445c010da52c7,
+odmówiła retirement obserwacji read-only przed mutacją (live_retirement_busy).
+Nie powtarzano tej aktywacji. Istniejącym publicznym przepływem utworzono
+własną sesję roboczą i przywrócono dokładną scenę z zachowanego FMS Universe.
+Brak zasobu preparation przed Compute zwrócił 404; katalog komend potwierdził
+can_accept_commands=true i solve enabled. Wysłano raz Solve, przypinając scene
+revision1 oraz client_intent_id i Idempotency-Key. ACK potwierdził przyjęcie:
+fm-07b406c7-528b-43b3-b32f-349f06dc0061.
+
+Run: run-live-470df3280dd2c65a81b63098ab64a502729c1b0aeb6901fabd75203f7b83efdf.
+Task: task-2265907dab80222ff321cea60ae4964cdd5f51bfa4894d44e59e53bb77ec9e79.
+Attempt: attempt-b0b3b1f4b46a408cb5dd382018b455f8; epoch1.
+Requested i resolved: FEM CPU double strict. Potwierdzono lifecycle Preparing,
+następnie Running oraz rzeczywisty proces fullmag-api-accepted-worker PID8042.
+
+Worker zakończył się exit1, timed_out=false, stop_requested=false. Zachowany
+worker-process-exit receipt zawiera pełny ograniczony rekord diagnostyczny:
+
+- reason=final_leaf_budget_exceeded; target=(0,-4.6176898829131121e-12,-1e-7) m;
+- final leaves=1000000, depth_limited=101288, unresolved=0;
+- depth_error_apm=1.105604e+01;
+- top3 (source_index,depth,error A/m,rule): (250,6,2.805483,R),
+  (1504,6,1.281964,R), (1492,6,0.9767105,R).
+
+R oznacza zwykłą kwadraturę, a nie część Duffy. To dowód zmieniający kierunek
+diagnozy: trzy największe zachowane błędy pochodzą ze zwykłej kwadratury na
+maksymalnej głębokości. Nie dowodzi to klasyfikacji wszystkich pozostałych liści
+ani dokładnej geometrii podzielonych komórek; ich ścieżki podziału nie zostały
+zapisane. Wcześniejsza hipoteza near-vertex Duffy nie wyjaśnia samodzielnie tych
+trzech wkładów. Nie zmieniono numeryki, budżetów, tolerancji ani geometrii.
+Rekord emit_failure_leaves faktycznie przeszedł do trwałego failure_reason;
+wcześniej potwierdzano wyłącznie jego kompilację i review źródeł.
+
+Awaria nadzorcy runtime i SIGTERM API były następstwem błędu workera.
+Kontrola wykazała zero oom i oom_kill, brak restartu kontenera i API exit -15.
+Nie jest to dowód braku problemów pamięci w innych przebiegach.
+
+Wykonano tę samą zatwierdzoną procedurę recovery własnej grupy, bez kolejnego
+pytania ani ponowienia Solve. Świeży native preflight i Apply zakończyły się exit0.
+Request SHA256: 7d8480817f5c9db256f722d2fca9b3ec0a90cebc18faec381aca23d01371ed77.
+Run ma rewizję75 i Failed/DoNotRetry, zero artefaktów, zwolnione własne leases.
+Natywna procedura zachowała CAS, journal, exit receipt, przygotowanie i historię.
+
+Managed stop-failed zatrzymał własny backend. Recreation f0c2110e30144d668e741594e1dc5bdb
+zakończyła zmianę usług, lecz start odmówił z powodu własnego starego helpera
+fullmag-cgroup-fb0b0257c0f64a988381761ceba6aec9. Potwierdzono exited1 i
+failed-confirmed jego operacji; pełny inspect i oba logi zarchiwizowano.
+Usunięto wyłącznie ten kontener, bez force i bez wolumenów. Wznowiono dokładną
+zakończoną recreation, bez powtarzania usuwania usług. Niczego nie prune'owano.
+
+Development: 169b439d06174be9897d8fb0cfd42ecf, succeeded.
+Config SHA256: 35cd2cfc67da85359678baae5b064eb2728a78f9d738b2ff6e397a028790b0cf.
+Backend d8be140dcc0a3386c45aad34e2f7c06f97d570ba4bf824fd3858d0ca5a15c14d,
+frontend 4e5820308bc8426c6ce164fb00942f8f5baf119431eba6a4c4592d3c83aa274b:
+oba healthy. Wykorzystano istniejący pakiet i te same cache build/package/frontend;
+nie kompilowano aplikacji ponownie. Odczyt /v2/platform/health: ok.
+
+Potwierdzono identyczność 70 plików dawnych wyników oraz dziewięciu dawnych
+RunCatalog. Po recovery publicznym API odtworzono dokładnie ten sam model
+Universe (scene SHA256 93fd3ea07d2ede195da64c00776be95475fa2c33f8a1d446ecc3e7c3745e8220),
+session-18e16fae6c2a4395000000bb, scene revision1, zero komend i bez Solve.
+H dla pełnego Universe nadal NIE zostało obliczone; browser/WebGL NOT VERIFIED.
+
+Dowody w wolumenie kontrolnym własnej grupy:
+verification/universe-volume-policy-20261023/failure-leaf-runtime-20261024/
+(compute-request, ACK, snapshots katalogu, worker-process-exit-original,
+recovery-preservation, authoring-after-recovery, closed-helper-fb0)
+oraz reaped-worker-470df-native-preflight-bc470a82-3e4e-474a-b803-07ee1c291547/.
+Nie zmieniano indeksu Git ani nie uruchamiano niedostępnego CI.
+
+Niezależny odczyt E1 wykazał dodatkowy konkretny brak migracji WSL: oba
+kontrolery docker_boris_volume i docker_nf_common_volume nadal wywołują
+_require_native_windows. W obecnej grupie nie ma producenta BORIS ani jego
+kwalifikującego receiptu. Najmniejszy następny fragment E1 to zgodny host
+admission Windows/WSL z interpretowanymi regresjami i zachowaniem bramek
+bezczynności/source/package/group, przed nowym buildem BORIS. Nie uruchamiano
+producenta ani benchmarku równolegle z Compute; historyczne Windows receipty
+nie zostały przeniesione w twierdzenia o tej grupie.
+
+
+## Wzorzec pola retained RT0 oraz admission BORIS WSL — 24.10.2026
+
+Zgoda na tę samą procedurę recovery własnej grupy pozostaje utrzymana;
+nie ponawiano pytania, recovery, Solve ani buildu w tym fragmencie.
+Cel E0–E12 pozostaje aktywny: odebrano E0, 1/13; dwanaście etapów nadal otwartych.
+
+Rozszerzono istniejący antenna_rt0_surface_oracle.evaluate_retained_rt0
+o sumę potencjałów czterech outward faces. Zachowano scalar-slope fit,
+niezmienne targety, binary64/80/120, wspólny licznik pracy oraz istniejące
+progi. Dodano oddzielny warunek 64*epsilon*sum_local_norm dla binary64.
+Helper nie aktywuje fizyki, solvera, quantity ani receiptu naukowego.
+Dziewiętnaście interpretowanych regresji PASS; niezależne review nie
+znalazło pozostałych blockerów w tym ograniczonym zakresie.
+
+Istniejący korpus scalar trójkątów przeszedł 54/54 analytic i 54/54
+analytic120 vs GENERAL_RADIAL_1D o 160/200 cyfrach (stopnie 8/10/12).
+Czas części referencyjnej 554,91 s, 1 305 106 integrand evaluations, peak RAM 49 238 016 B.
+Nie zmieniano budżetów ani tolerancji. Direct2D independence, pełne identities,
+extreme cases i independent RT0 volume 3D nadal NOT VERIFIED.
+Raport scalar-corpus-reference.json: SHA256
+38b6611aae1a869377c3eb8b3a884d334b811c0d07355eace4758c7ccb851d02.
+
+Odczyt istniejącego FMACLB01 fd5edd5783f7b018559ccd589ceb6ae59c3f8a89b240da9f8ab01a7e7ed8ec62
+sprawdził 22 payload SHA, lokalną/globalną geometrię stable IDs i cells280/J_local.
+Własny fit binary64/Decimal120 przeszedł 1867/1867 komórek, max residual/gate
+0.006670316465837793. Dla pierwszego zachowanego targetu (9.6e-7,-4e-8,3.4e-7) m
+niezależna suma H wszystkich komórek różni się od native o 0.0004736117313045841 A/m,
+czyli 1.1698771017619965e-8 normy native; czas 154,02 s.
+To jedno porównanie historycznego pola 14-punktowego, nie Universe ani
+kwalifikacja globalnej bramki cancellation (ten driver nie zachował sumy
+norm wszystkich fanów). Nie wolno utożsamiać tej siatki 1867 Tet z failed 470df / 1863 Tet.
+Raport retained-first-target.json: SHA256
+22dbe513222526a66db51886df2a9394a54f1852123ec607ff1bb8f6c519bbe1.
+
+Osobny driver ocenia historyczne źródło w punkcie failure 470df i zachowuje
+sumę norm wszystkich fanów oraz globalne precision/formula gates.
+Dodatkowe wykonanie zakończyło się exit 0 po 154,14 s: H około
+(1713.51345787,247158.911230,245.562588371) A/m. Globalny cancellation 484.3371,
+suma norm fanów 1.1971117016e8 A/m; precision/formula consistency przeszła
+istniejący gate 0.24716597 A/m. Brak porównywalnego native H i brak prawa do
+deklarowania naprawy failed 470df lub kwalifikacji naukowej.
+Raport historical-source-near-target.json: SHA256
+15795e97ca63f4ad76daa646d32c7373c62463b3269796170a420c0fd4404ee8.
+Odczyt własnego API po tych obliczeniach: health HTTP 200, zero komend,
+can_accept_commands=true. Nie uruchomiono kolejnego Solve.
+
+Kontrolery docker_boris_volume i docker_nf_common_volume używają teraz
+istniejącego docker_dev_host.require_host zamiast Windows-only guard.
+Zmiana ogranicza się do importu i wywołania; źródła, idle, package, group,
+ABI i kwalifikacja pozostają bez zmian. Nowy test Docker BORIS admission
+plus istniejące testy hosta i porównania: 34 PASS, exit 0.
+Nie uruchomiono producenta ani benchmarku BORIS; E1 pozostaje otwarte.
+
+Wszystkie obliczenia interpretowane wykonano w aktualnym backendzie
+d8be140dcc0a3386c45aad34e2f7c06f97d570ba4bf824fd3858d0ca5a15c14d
+własnej grupy 3203. Nie kompilowano lokalnie testów Rust/native,
+nie używano hostowego kompilatora i nie instalowano mpmath globalnie.
+Walidator kontraktu dokumentacji: 41 istniejących testów PASS;
+focused validator zmienionej noty PASS po korekcie tabel i path+symbol.
+Indeks Git niezmieniony; CI i browser/WebGL nadal NOT VERIFIED.
+Dowody techniczne: verification/universe-volume-policy-20261023/rt0-surface-reference-20261024/
+w wolumenie kontrolnym grupy; nie są wynikami zaakceptowanego runu.
+
+Następny zakres: dokończyć niezależne bramki matematyczne i kontrakt
+wydzielonego natywnego operatora powierzchniowego RT0. Istniejący snapshot v3
+wymaga literalnie sum_final_leaf_l2_difference.v1 i weighted_terms_binary64_epsilon.v1;
+nie można podstawić różnicy precyzji lub zer jako starej estymaty.
+Aktywacja odmiennej metody wymaga jawnie wersjonowanej semantyki diagnostyk;
+nie rozwiązujemy tego zwiększaniem limitów, przesuwaniem targetów ani zmianą 3D na 2.5D.
+
+
+## Niezależna general-map direct2D — źródła i rozpoczęcie próby 24.10.2026
+
+Poprzedni turn stanowił postęp: helper pola przeszedł19 testów, wykonano54/54
+scalar comparison i rzeczywiste1867/1867 RT0 fits, porównano H w jednym
+zachowanym punkcie i oceniono historyczne źródło w bliskim punkcie.
+To nie zamknęło pełnego Universe ani kolejnego kamienia E1–E12.
+
+Odczyt aktualnej0950 ujawnił nowszy, już opisany kontrakt
+analytic-v2-direct2d-general-map-prereg, zastępujący starszy method-only GL.
+Zaimplementowano go w wydzielonym research helperze
+scripts/antenna_triangle_general_map_reference.py oraz nowym interpretowanym
+teście. Stary triangle oracle i jego historyczny AST/source pin są niezmienione.
+Nie powstał drugi publiczny solver, model danych ani endpoint.
+
+Po niezależnym root review poprawiono exact Fraction poza instrumentacją,
+niezliczony midpoint predicate, dodatkowe niezamrożone degree8/cross gates,
+zachowanie pierwotnego błędu przy cleanup i kolejność attempted counters.
+Finalne14/14 interpreted regresji PASS, exit0,2.063s, bez realnego quad.
+Dla24 planów:985 exact comparisons, max66/test,169bit raw i85bit reduced.
+Zachowano174/9396,8192bit,160/200digits,stopnie8/10/12,10M/100M,60min/8h i2GiB.
+Każda metoda ma6freshctx; neutralny exactplan powstaje raz dla obu.
+Źródło SHA256 bcac7f82c7467bb78ed3c5384dd2604b3a2611d2826dd07e6774378402730500.
+Test SHA2564d46e947f5eca5ee2998276650f6d735ffdb8b6ac89600cb8b7e54d3145c9d5b.
+
+Focused validator zmienionej0950/source-map oraz git diff --check zakończyły sięexit0.
+Istniejące41 testów walidatora pozostają zielonym dowodem niezmienionego kodu;
+nie powtarzano ich wyłącznie z powodu checkpointu.
+Root-source-and-execution-review SHA256
+447cedc7edce73f5b563f064681e3c6ef91c34e5b8e410c6c493a3f7846d414c.
+
+Uruchomiono dokładnie jedną ograniczoną próbę całej uporządkowanej listy24:
+attempt af098a83098f4ed39f0599c05ff6c690, owned PID6276,startticks przypięte
+w receipcie. Oryginalny proces ma potwierdzone running/CPU; nie restartowano go
+na podstawie timeoutu obserwacji. Pierwszy M01/base zakończył12 passów
+i total/local/cross gates,17 562 reference_evals,85.43s; próba przeszła doM02/base.
+Stan całego eksperymentu pozostaje RUNNING, nie PASS24.
+
+Driver zachowuje niezmienne passy i kapsułę źródeł przed wykonaniem,
+liczniki panel/część/metoda/precyzja/poziom, oryginalny sharedBudget
+i terminal przy pierwszej odmowie. SIGALRM obejmuje pozostały target/case
+wall time; monitor sum_next deleguje niezmienione sumowanie. Jego kontrola
+stałej sumy i propagacji odmowy przeszła bez adaptivequad. Driver SHA256
+72e5117cf73f619d3764924a548edf0269243e404e95a7cc048695759a62ac34.
+
+Dowody: verification/universe-volume-policy-20261023/general-map-direct2d-20261024/
+w wolumenie kontrolnym własnej grupy, a finalne testy są pod
+rt0-surface-reference-20261024/general-map-source-only/post-root-attempt-counters-*.
+Kapsuła przed wykonaniem zapisuje notę jako niewykonaną w chwili freeze;
+stan rzeczywistego procesu jest w progress.json/terminal.json tego attemptu.
+
+Nie uruchomiono native Solve, BORIS producenta, buildu, CI ani browser/WebGL.
+Nowe źródła są unstaged, indeks niezmieniony, FMS użytkownika nietknięty.
+Pełny zakres54 identities/extreme, volume3D, native surface operator,
+Universe i kwalifikacja bazy nadal pozostają osobnymi otwartymi bramkami.
+
+
+## Izolacja błędu zadania od życia API — diagnoza źródłowa 24.10.2026
+
+Kontynuacja nie zmienia zakresu zgody użytkownika ani nie uruchamia ponownego
+Solve. Niezależny review zamrożonego general-map helpera i drivera nie znalazł
+konkretnego blockera; obejmuje wyłącznie kod skalarnego eksperymentu24.
+Receipt independent-frozen-source-review.json ma SHA256
+ aadc0d212eac6ffa90ef867ffb7892e3eef57a1007a9790357b9e2575a2601f6.
+Dowód zapisano w general-map-direct2d-20261024 w wolumenie kontrolnym.
+Eksperyment af098a83098f4ed39f0599c05ff6c690 jest nadal aktywny;
+8 pierwszych przypadków ukończyło12 passów i ich bramki, M09/base trwa.
+Nie oznacza to PASS24 ani kwalifikacji native RT0, V/J/H lub Universe.
+
+Przyczyna utraty API po błędzie native jest odrębnym problemem runtime.
+accepted_study_worker.rs::apply_accepted_start_effect propaguje błąd
+execute_accepted_worker_start przed finish_worker_control i trwałym Failed.
+Proces kończy się kodem1; accepted_study_supervisor.rs wymaga potwierdzenia
+ostatniego heartbeat przed reconcile_worker_exit. Niepotwierdzone polecenie
+zachowuje slot i rezerwację; błąd nadzorcy kończy scheduler, a potem API.
+Nie należy ignorować śmierci schedulera ani odblokowywać nieznanego ownera.
+
+Przygotowywana minimalna poprawka SOURCE-only zachowuje RunError i legacy
+entrypoints. Nowa typowana ścieżka rozróżnia wyłącznie kontrolowany powrót
+znanego statusu -1/-2/-3 z istniejącego prepared CPU ABI od błędów walidacji,
+publikacji, store i nieznanego statusu. Status -3 obejmuje także błąd native;
+nie nazywamy go automatycznie rozpoznaną odmową numeryczną. W C ABI nie ma
+zmiany semantyki: status jest sprawdzany przed walidacją snapshotu i przed
+utworzeniem artefaktów; żaden częściowy wynik nie jest akceptowany.
+
+Worker musi użyć istniejącego Completing jako bariery końca side effect,
+potem opróżnić control/ACK i dopiero zapisać Failed(retryable=false) pod
+writer fence. ProtocolLedger::check_event odrzuca nowe ACK po terminalnym
+Failed, dlatego odwrotna kolejność byłaby błędna. Stop wygrywający fence
+zachowuje istniejący Stopped. Supervisor może zakończyć obsługę nieudanej
+pracy dopiero po dokładnym terminalnym journalu tego claim/attempt/Start,
+DoNotRetry, potwierdzonym końcu procesu i zwolnieniu dokładnej rezerwacji.
+Brak raportu, kill/panic, obcy claim, nieznany status lub błąd trwałego zapisu
+nadal wymagają dotychczasowych zabezpieczeń.
+
+Stan: poprawka źródłowa w przygotowaniu, nieaktywna w pakiecie runtime.
+Wymagane: review diffu, managed build w tej samej grupie po zakończeniu
+skalarnego procesu, rzeczywisty heartbeat-before-failure oraz ujemne przypadki.
+Lokalnych testów Rust/native nie kompilujemy. Testy helpera i review źródeł
+nie zastępują tej weryfikacji. Pinned0950/source-map/helperów eksperymentu
+nie edytujemy przed jego terminalem. E0 zaakceptowane; E1–E12 otwarte.
+
+
+### Poprawka containment po review — zapis źródeł
+
+Przygotowano patch7 plików, bez aktywacji w runtime i bez zmiany C ABI,
+globalnego RunError, legacy solvera, nieznanych błędów lub polityki retry.
+KnownNativeCallFailure koduje tylko Invalid/Unavailable/Internal dla
+kontrolowanego powrotu przygotowanego wywołania CPU. Anulowanie zachowuje
+pierwszeństwo. API zachowuje typ błędu, zamiast zamieniać go na sam tekst.
+
+Root i niezależny reviewer wykryli i poprawiono trzy blockery pierwszego diffu:
+- kontrola artefaktów ogranicza się teraz do dokładnego task/attempt/epoch;
+- recovery, sprawdzenie duplikatu i publikacja HeartbeatAck są pod jednym
+  writer fence, aby Completing nie unieważniło po drodze watermarku;
+- Started jest parsowany istniejącym typem i porównywany ze wspólnym
+  identity builderem accepted planu, łącznie z case_id i plan_fingerprint.
+Nie zmieniono guardów aktywnego Start: terminalny odczyt używa zachowanego
+accepted snapshotu, którego plan jest tym samym klonem co plan receipt.
+
+Dodano źródłowe regresje klasyfikacji, kolejności Completing/ACK/Failed,
+Stop oraz fixture trwałego SessionStore z wcześniejszym artefaktem,
+niezgodnymi świadkami i released replay. Żadnego z tych testów Rust nie
+kompilowano ani nie uruchamiano; nie są zielonym dowodem działania.
+Końcowe7/7 źródeł przeszło wyłącznie parser rustfmt w istniejącym backendzie
+(--emit stdout, bez zapisu i bez kompilacji); git diff --check exit0.
+Receipt review-rustfmt-parse-only.json: SHA256
+7d429b2b7a31d38a6810860f09dc7c0477f82421bf36a155decf7477e9a5bc1c.
+Konkretny review-seven-files.patch: SHA256
+fd40d8608de4b81a5b18e0e6f3085947ede9da862f09f7b0c94538e2ae6e6aff,
+49139 bajtów; obok zachowano pełną kapsułę7 źródeł. Wszystko w
+verification/universe-volume-policy-20261023/prepared-native-failure-containment-source-20261024
+w wolumenie kontrolnym grupy3203. Indeks Git pozostaje bez zmian.
+
+Do rzeczywistej próby przygotowano kopię istniejącego publicznego przykładu
+niemagnetycznego: jedyna różnica charge_max_iterations10000→1, przy
+niezmienionym relative_tolerance1e-12 i całej geometrii. Oryginał nietknięty.
+Native CG stosuje ten limit i przy braku zbieżności zwraca kontrolowany
+błąd charge trace H1 solve did not converge. Nie zakładamy, że konkretna
+siatka na pewno nie zbiegnie w jednej iteracji. W razie sukcesu zachowamy
+wynik i odnotujemy niespełnione oczekiwanie testu, bez automatycznej kolejnej próby.
+Publiczny tor: from-script → własna sesja → ReplaceScene → jeden Solve
+z aktualnymi scope/CAS i stałą idempotencją; bez nowego hooka lub ręcznej
+edycji journalu. Odczyt rzeczywistego ACK przed błędem jest osobną bramką:
+jego brak nie zalicza regresji wyścigu heartbeat. Preview NIE wykonano.
+Preview SHA2567fa682e7f977216cd51c6aa9e8ef5fe9d44ed6eda25dc89da03311693a9424dd;
+zmodyfikowany skrypt SHA256f8f827ab3f9c1182cb060db299a6b6c48afda71c297d56c4a8222c6f34095c6a.
+
+Build pozostaje wstrzymany do terminalu aktywnego eksperymentu skalarnego,
+aby zachować jego oryginalny proces i zamrożone źródła. Parser, source review,
+fixture i przygotowany preview nie zastępują managed app builda, wykonania
+worker failure, CI ani browser/WebGL. Te bramki pozostają NOT VERIFIED.
+
+
+Końcowy focused niezależny review poprawki containment nie znalazł następnego
+potwierdzonego blockera; final-independent-source-review.json SHA256
+486159ec1f28a1a6c9372983aec3b563890c4f8159e4ca195ebe347bad07cecc.
+To nadal review źródeł, bez kompilacji i rzeczywistej awarii workera.
+Eksperyment scalar24 zaliczył10/24 przypadków wraz z M10/base i przeszedł
+do M11/base, bez restartu oryginalnego procesu. API health ponownie HTTP200.
+Ten turn przyniósł implementację containment i zamknięcie3 blockerów review;
+nie jest trzecim powtórzeniem tej samej blokady ani odbiorem całego celu.
+Następnie: obserwować ten sam terminal; dopiero po nim aktualizować przypiętą
+0950/source-map, wykonać adekwatną walidację, ocenić retencję i przejść przez
+istniejącą receptę managed build tej samej grupy do małej próby błędu.
+
+
+## Odczyt wyników i przygotowanie kolejnego buildu 24.10.2026
+
+Poprzedni turn był postępem: źródłowo zaimplementowano containment i zamknięto
+trzy konkretne blockery review. Bieżąca kontynuacja potwierdziła oryginalny
+PID6276/startticks5022696 jako działający z rosnącym CPU; session handle72043
+pozostaje aktywny. Pięć przypiętych źródeł eksperymentu jest nadal identyczne.
+M11/base ukończył dotąd4 z12 passów; pełnych przypadków jest10/24.
+Nie restartowano procesu na podstawie timeoutu obserwacji.
+
+Sprawdzono zapisane wartości wszystkich10 zakończonych przypadków bez
+uruchamiania nowej kwadratury lub analitycznego kernela. Identyczność geometrii
+wiązano12 wartościami binary64, a wcześniejszy raport54 miał sprawdzone SHA256.
+Direct200/degree12 i analytic120 mieszczą się w istniejącym cross gate dla
+każdego z tych10 przypadków; największy iloraz delta/gate wynosi
+1.10707467e-91. Nie tworzy to nowej tolerancji ani kwalifikacji całego24.
+Receipt stored-analytic-vs-direct-readback-through-10.json w katalogu attemptu:
+SHA25682f1e4933c3eeb8dba46d4bea5a3cbc6c2eb3c63c903ea60318c65bdb07c0f10.
+
+Przed przyszłym buildem porównano70 plików historycznego V/J/H,9 zachowanych
+RunCatalog i2 archiwa FMS z istniejącymi pinami: wszystkie identyczne.
+Receipt retained-before-next-build.json:
+SHA25684e22648f95618f8c212163e8cd33cbc1b78088165654076325d645105a70654.
+Nie jest to nowy wynik Universe. Archiwum baseline compression checkpoint
+leży pod verification/universe-volume-policy-20261023/fms-portable-inspection-20261024,
+nie bezpośrednio w verification/fms-portable-inspection-20261024.
+
+Przeczytano aktualny fullmag-docker-build, jego procedure/artifact-policy,
+backend.md, justfile i kontrakt retencji governance. Osobny skill
+fullmag-build-stage-cleanup nie jest dostępny pod wskazaną ścieżką; stosujemy
+kontrakt retencji z governance i skilla builda. Zachowujemy aktywny cache,
+bieżący pakiet, rollback, logi, wszystkie wyniki i dowody. Nie usuwano danych.
+Pomiar fizycznego D:106522128384 B wolne; Docker filesystem521242005504 B
+wolne; user state236174708736 B wolne. To pomiary, nie quota lub gwarancja
+maksymalnej alokacji przyszłego kandydata. Nie sumujemy wspólnego filesystemu
+każdego named volume jako oddzielnego wolnego miejsca.
+
+Inspect potwierdził dwie istniejące usługi w tej samej grupie; backend4CPU/8GiB,
+frontend2CPU/8GiB, OOMKilled=false. Podręcznik opisuje wyższy domyślny limit
+frontendu; nie zmieniamy aktualnej przypiętej konfiguracji grupy jako skutku
+buildu. Readonly source/git oraz osobne named build/package/frontend/control
+volumes zachowane; istniejący writable alias examples pozostaje jedynym
+zatwierdzonym zapisem do źródeł. To inspekcja topologii, nie nowy dowód buildu.
+
+Przygotowano świeży checkpoint zapisanej sceny z bieżącymi ID kontenerów,
+sesją18e16fae…, pakietem i10 zakończonymi RunCatalog. Przeszedł istniejący
+walidator żądania i odczyt archiwum; nie uruchomiono restartu/drain.
+Ścieżka względna do control:
+verification/universe-volume-policy-20261023/prepared-native-failure-containment-source-20261024/saved-authoring-checkpoint-before-containment-build.json
+SHA256d8e5b4acfcdd2118922d15c8c3c48fcde4714405e82e10ec55698f5f0b4e46b9.
+Przyszła recepta to istniejąca docker-dev-restart-saved-authoring dla attemptu
+169b439d06174be9897d8fb0cfd42ecf/config35cd2cfc67da85359678baae5b064eb2728a78f9d738b2ff6e397a028790b0cf,
+źródeł tego worktree i portu3203. Pełny native preflight i ponowny odczyt pinów
+obowiązują w chwili uruchomienia. Najpierw musi zakończyć się scalar24:
+natywna gotowość API nie oznacza, że nasz osobny proces referencji można przerwać.
+Indeks, CI, browser/WebGL i managed runtime containment pozostają bez nowego dowodu.
+
+
+## Diagnostyka zachowanego źródła RT0 — 24.10.2026
+
+Jedna ograniczona próba odczytu historycznego FMACLB01 zakończyła kontrolę
+wszystkich22 deskryptorów, geometrii1867 komórek,7468 własnych momentów ścian,
+pełnych preimage źródła oraz9335 próbek prądu. Wszystkie28005 składowych J
+odtworzyły zachowane binary64 bez rozbieżności, po kanonizacji znaku zera.
+Każdy współczynnik pochodził z własnego outward moment w certificate;
+nie kopiowano wartości sąsiedniej strony, nie dopasowywano QR i nie korygowano
+bilansu. Wszystkie zachowane jumps są zerowe. Najmniejszy niezerowy moment
+wynosi5.114111823037877e-7 A; nie wystąpił odrzucany przypadek subnormalny.
+
+To tylko obserwacyjna kontrola danych: bieżący kod i lokalny commit historyczny
+są zgodne, a wersja executable wskazuje6282750e916a17be4487925cc42f59520b433d54,
+ale brak niezależnego bindingu załadowanej historycznej biblioteki native do
+pakietu/źródeł. Nie deklarujemy oryginalnych bitów współczynników producenta
+ani kwalifikowanego źródła. Nie obliczano H, nie wywołano C ABI/Solve,
+nie opublikowano ani nie zmieniono wyniku. CAS przed/po identyczny.
+Python Fraction→binary64 nie jest wykonaniem historycznego Boost convert_to.
+1296 zerowych współczynników ma nieodtwarzalny pierwotny znak zera.
+
+Skrypt SHA256d76e2df7956bd69d3de6803872b9a2b5b2a46cc51124aa7783c4994aaacfe44d;
+raport observation-20261024T122628Z-15255.json SHA256
+3314a5e3da3dbea3d85e405149f73fc82b7e9b7c99ca15f75f9a00e6c0e9b4fe
+w verification/universe-volume-policy-20261023/rt0-surface-reference-20261024/canonical-face-inversion-diagnostic
+wolumenu kontrolnego grupy3203. Czas15.4604s, peakRAM50307072 B,
+856953 ograniczone operacje Fraction; limity120s/1GiB/4mln operacji.
+Raport kończy się OBSERVATIONAL DATA CHECKS PASS / HISTORICAL NATIVE PRODUCER
+UNVERIFIED i celowo nie daje zielonego kodu kwalifikacji (main zwraca2;
+zewnętrzny launcher WSL zgłosił1). Nie ponawiano próby.
+
+Eksperyment general-map af098… nadal działa w tym samym PID6276/startticks5022696.
+Zakończył14/24 przypadków i rozpoczął M15/base. Nie zmieniono jego pięciu
+przypiętych źródeł, tolerancji lub limitów; nie wykonano restartu/buildu.
+
+
+Dalszy odczyt 14 ukończonych przypadków scalar potwierdził168 immutable pass
+payloads i98 zapisanych gates total/local, dokładne case SHA/bytes oraz
+zgodność geometry fixtures, drivera i pięciu live/capsule source pins.
+Nie wykonano nowej kwadratury. Receipt pass-and-gate-integrity-through-14.json
+w attempt af098… ma SHA2568161a4307ee4df4e6ec7ab8164872422ac34aeec91b3f6f02c1ad9bc127197ca.
+Kontrola używa literalnego result.status SCALAR REFERENCE CONVERGENCE ONLY;
+wrapper case status ma inną nazwę i nie jest zamiennikiem statusu wyniku.
+
+Gotowy do dalszego review i użycia PO buildzie, lecz NIEURUCHOMIONY, jest
+control-only one-shot-public-charge-refusal.py w katalogu przygotowania
+containment. SHA256ceae1d2ed6f8848b8a953c5ed3e9fcf25901fd3a08db36bf2c94f7d7c28cd9de.
+Wymaga nowych pinów zainstalowanego pakietu/manifestu źródeł, generacji API
+oraz obu schedulerów, aktualnego scope/sceny i osobnego output storage.
+Tworzy autentyczną nową sesję próby i wysyła tylko jeden Solve. Timeout
+zostawia żywy run bez cancel/retry. Przed publicznymi POST zapisuje intent;
+nie publikuje sekretów claim/lease. Wymaga dokładnie1 Start/Started, Failed/DNR,
+Released, braku completion receipt i braku artefaktów exact task/attempt/epoch.
+Root source review doprecyzował te warunki. Naturalna próba NIE kwalifikuje
+współbieżnego wyścigu: race_qualified zawsze false; ACK przed Failed oraz
+Completing→ACK→Failed są wyłącznie osobnymi obserwacjami protokołu.
+Rzeczywiste kształty i relacje claim odczytano z470df/b0cc, bez sekretów:
+existing-record-shapes.json SHA256cf13bd0fbefeef5612d433ab39c583da081d51e36c15542c15cf13c138fe1f16,
+existing-record-claim-relations.json SHA256b0fdcfa0cf47ff229fa84771010e274a2c7bf01907d7f5c4dd22a577ee51edf4.
+Parser ast PASS, ale driver/HTTP/Solve nie wykonano. Historyczne recovery470df
+nie dowodzi działania nowej ścieżki. Przywrócenie zachowanej sceny i kontrola
+wszystkich dawnych wyników po próbie pozostają osobnymi krokami root.
+
+Control-only native-surface-migration-proposal-pl.md w katalogu
+rt0-surface-reference-20261024 ma SHA256
+d110021a1f475e0586dadd8915072626a65c7331c95b4f1d0e766f4214c57710.
+To propozycja, nie zaimplementowany/aktywowany operator. Zakłada fresh owned
+frozen vertices+signed coefficients, oddzielne surface evidence i addytywny
+inspection-only dispatch, bez QR, zmiany starego directquad ani pozorowania
+leaf error. Liczbowa polityka pracy pozostaje nieprzypięta.4faces×3precisions
+nie wystarcza do policzenia dwóch formuł: bez wykazanych shares potrzeba
+co najmniej24 formula-facepasses/pair i dodatkowych paneli. Istniejące54
+analytic oraz54 radial PASS zachowane; nie zastępują pełnego identity/extreme,
+ważonego RT0 ani native volume3D proof. Root skorygował te dwie granice opisu.
+Repo/0950/source-map pozostają w tym obszarze bez nowych zmian.
+
+Siedem live plików containment ponownie porównano bajtowo z końcową kapsułą
+review: identyczne. Scalar PID6276 nadal żywy; M15/base ukończył4/12 passów,
+przy14 pełnych przypadkach i7931100 reference evals. Nadal nie wolno
+restartować tego kontenera przed terminalem eksperymentu. Nie wykonano
+buildu, kolejnego Solve, stagingu, commitów ani browser/WebGL. Te bramki
+pozostają otwarte. Bieżąca kontynuacja przyniosła nowy rzeczywisty dowód
+28005 J bits i przygotowanie poprawionego drivera; nie jest powtórzeniem
+tej samej blokady bez postępu. Cały zakres E0–E12 nadal nieukończony.
+
+
+## Naprawa brakujących nagłówków pola w przeglądarce — 24.10.2026
+
+Poprzednia kontynuacja była postępem: uzyskano pełny obserwacyjny round-trip
+28005 składowych J i przygotowano bezpieczną publiczną próbę containment.
+Bieżąca kontynuacja wykorzystała czas żywego scalar24 na weryfikację
+rzeczywistego toru danych frontendu, bez zmiany sesji lub nowego Solve.
+
+Ograniczony przegląd E5–E7 potwierdził istniejące raw-SI artifact visualization,
+wykluczenie magnetic_only/m/frozen_spins dla niemagnetycznych obiektów,
+odcięcie live zasobów w artifactInspection oraz różne nośniki V/J/H. Nie
+powielano tych napraw. Ograniczony przegląd E10 potwierdził istniejące rank2,
+flow-major Q_ia, dziewięć składowych, projekcje spin-flow i Frobeniusa oraz
+blokadę przekazania nComp9 do XYZ glyphs. Centralne capabilities nadal
+odmawiają renderu pełnego tensora (runner capabilities.rs::resolve_quantity_capability),
+więc nie zaliczono E10 na podstawie samych helperów/shadera.
+
+Zachowane autentyczne cold-import HTTP binaria V678×1, J7468×3, H14×3
+przepuszczono przez aktualne produkcyjne decodeArtifactFieldVector,
+decodeTopology i parseArtifactFieldLocator w istniejącym frontendzie grupy.
+Wszystkie raw value SHA są identyczne z historycznym wynikiem. Zachowano
+BigInt stable IDs,1867 lokalnych Tet4 i678 wspólnych tożsamości J, bez
+uśredniania. Dziewięć celowych uszkodzeń magic/nonfinite zostało odrzuconych.
+Report frontend-cold-binary-decode-smoke-report.json SHA256
+6fec0bd97fb997f93f423cd4d4644acb3e9824d8db111e811020e24bc349dde5;
+script stdin SHA2569eeccc1fafc33404046c31cf80f2cf0c8c070fe1dd42254c8e8ac91df904f6d6
+w verification/universe-volume-policy-20261023/frontend-cold-buffer-smoke-20261024.
+To interpreted smoke produkcyjnych dekoderów, bez kompilacji unit tests,
+DOM, przeglądarki, admission nagłówków lub Universe.
+
+Inspekcja mountów ujawniła ważną granicę: frontend /opt/fullmag/control jest
+readonly widokiem volume Subpath=frontend, podczas gdy backend widzi cały
+control. Docker inspect Mounts.Source nie pokazuje tej różnicy; potwierdza ją
+HostConfig.Mounts.VolumeOptions.Subpath. Pierwszy start skryptu przez jego
+backendowy control path nie znalazł pliku. Nie rozszerzano mountu ani nie
+zmieniano runtime inputów frontendu: publiczne binaria przekazano jednorazowemu
+procesowi Node przez stdin, a dowody zapisano przez backend do control.
+Źródła i wszystkie wejściowe pliki pozostały identyczne.
+
+Znaleziono konkretny blocker: fields.rs::artifact_field_vector_response
+emitował FMVP6 bez x-fullmag-scope-kind, scope-id oraz mesh-topology-hash.
+insert_field_headers też ich nie dodaje, a zewnętrzny handler zwraca tę
+odpowiedź bez uzupełnienia. Produkcyjne artifactFieldResponseIdentityError
+odrzuca przez to prawidłowe V/J/H. Naprawiono wyłącznie tę emisję: scope kind,
+opcjonalny scope ID i hash pochodzą z locatora zgodnego z payloadem; scope-id
+nie jest emitowane dla prawdziwego full. Nie osłabiono klienta ani nie
+użyto query.full jako tożsamości object-owned carriera.
+
+Aktualny fields.rs SHA256a7e15e0d2b017848f2eaa87b40b0c42db0592a28de1547c4981d859f56ab7973;
+fields.patch SHA256add0cdf2427f37715b45893818d7acd01c02185c5b81198ca37ee040b4808c3e;
+source-review.json SHA2565f1857fe55540323a274831b23faf7784f1b19c258d62cd8ed4e74709bd55ac6
+w frontend-cold-buffer-smoke-20261024/header-fix-source-review.
+Dodano źródłową regresję rzeczywistego constructora i emitera: V/source,
+J/cell-local, H/object i H/full, statusy200/304, scope i hash. Nie kompilowano
+ani nie wykonano testu Rust. Parser rustfmt --emit stdout/skip_children=true
+PASS, niezależny focused review nie znalazł potwierdzonego blockera. Pełny
+build, rzeczywisty HTTP i wykonanie testu pozostają otwarte.
+
+Produkcjne funkcje parsera/identity klienta uruchomiono na realnych binariach
+z JAWNYM fixture nagłówków, bez udawania capture HTTP. Dla wszystkich3 fields
+brakujący zestaw odtwarza missing or inconsistent scopeKind; kompletny fixture
+przechodzi,6 negatywnych mutacji/field jest odrzuconych, syntetyczne full bez ID
+przechodzi. Report artifact-header-client-contract-reproduction-report.json
+SHA256d2f5efed3e75843ac9403b3af8bccc105aa8c12e535fdd8eea72a190adb9afa6;
+script SHA256f9cc9adf5183c09f5194e34d3c8b3c94063531136399ebeda929f23fdca1f48b.
+Ten dowód klienta nie wykonuje backendowego emitera i nie zalicza UI/WebGL.
+
+Historyczny capture ma etag=null i używa case-sensitive dict lookup ETag
+wobec nagłówków HTTP. Taki odczyt nie dowodzi braku ETag na serwerze i nie
+stanowi osobnego findingu produktu.
+Kompletny rzeczywisty capture response headers oraz QuantityCatalog nie był
+zachowany. Nie odtwarzano tych nagłówków z locatora. Przyszły runtime test
+musi po buildzie odczytać realne headers i używać dokładnego scope locatora;
+backendowy legalny alias query.full→payload.object nie przechodzi ścisłego
+klienta i nie powinien służyć do pozorowania frontendowego odbioru.
+
+Scalar24 zachowuje ten sam proces/źródła; ukończono15/24, M16/base ma4/12
+passów,10369236 cumulative reference evals. Build nadal czeka na jego
+terminal, aby go nie przerwać. Nie restartowano usług, nie aktywowano innej
+sesji, nie uruchomiono nowego native Solve, nie zmieniono indeksu Git.
+Wszystkie E0–E12 kryteria odbioru pozostają pełnym zakresem celu; powyższa
+naprawa jest rzeczywistym postępem E5/E7, a nie odbiorem całych etapów.
+
+
+Do użycia wyłącznie PO buildzie i prawdziwym cold-import b0cc przygotowano
+post-build-public-header-capture.py w katalogu
+verification/universe-volume-policy-20261023/frontend-cold-buffer-smoke-20261024/header-regression-proposal
+wolumenu kontrolnego grupy.
+SHA256ec3fc44321dc3ead9cc1332a96ec08d362c07a17e5a3aa2d126650ae580bc3e4.
+AST PASS, ZERO wykonania HTTP. To wyłącznie GET: pobierze prawdziwe quantity
+catalog/field catalog/meta/FMVP/FMMT i wszystkie rzeczywiste headers dla200/304,
+sprawdzi dokładny scope, carrier, source i raw V/J/H SHA. Wymaga świeżych
+przejrzanych pinów source/package oraz --pins-sha256. Stabilny pin statusu
+pomija wyłącznie metrics.uptime_seconds; wszystkie session/run/revision
+pozostają w porównaniu przed/po. Nie importuje sam archiwum ani nie zmienia
+sesji. Bieżąca scena Universe nie spełnia precondition i skryptu NIE uruchamiano.
+Nowa kopia evidence nie nadpisuje starego capture. Root skontrolował i poprawił
+zbyt ścisły pin całego statusu, który niepotrzebnie wiązał upływ sekundy.
+Następny rzeczywisty krok: po terminalu scalar24 zachować wyniki/źródła,
+zweryfikować saved-authoring checkpoint i wykonać istniejący managed build
+containment + header fix w tej samej grupie. Dopiero potem mała publiczna
+próba błędu i realny cold-load/header capture, bez nowego Universe Solve.
+M16/base ukończył5/12 passów; w pełni zakończone przypadki nadal15/24.
+
+
+## Checkpoint 24.10.2026 — publiczne Failed bez artefaktów
+
+Zgoda użytkownika obejmuje kontynuację opisanych operacji we własnej grupie;
+nie ponawia się pytań o tę samą operację. Nadal nie rozszerza się jej na
+arbitralną zmianę tolerancji, obce zasoby, indeks Git ani obejście blokad narzędzi.
+
+Odnaleziono dwa powiązane problemy w `live_accepted_projection.rs`:
+`apply_projection` pomijał `complete_bound_command` dla terminalnego Failed
+bez artefaktów, zaś `load_durable_projection` nie wywoływał wtedy
+`load_stage_terminal_details`. Mogło to pozostawić Solve jako Running mimo
+Failed sesji oraz nie przekazać przyczyny błędu do publicznego etapu.
+
+Naprawiono wyłącznie te bramki. Failed nadal musi przejść istniejącą walidację
+RunIntent, katalogu, task identity i session fence. Komendę kończy istniejący
+trwały journal oraz dokładne bound ID. Sukces bez wymaganego katalogu pozostaje
+odrzucany; warunki anulowania, atomowa publikacja i unknown-native-failure guard
+pozostają zachowane. Szczegółowy reason pochodzi wyłącznie z journalu tego samego
+task/attempt/ownership epoch, a błąd komendy pozostaje ogólnym
+`accepted Study execution failed`.
+
+Źródło SHA256 `ced5b2b4f750ac812e50f9bb8f19330ba72b8d6e8b312409d40e9dd0ba70d84d`;
+patch SHA256 `85efc0e04b639e8308618d1a857f8b6fd4b42c7aa65371c940ff92ec95bb7797`.
+Kapsuła: `verification/universe-volume-policy-20261023/`
+`prepared-native-failure-containment-source-20261024/public-terminal-projection-fix`
+w wolumenie kontrolnym grupy. `parse-only.json` SHA256
+`82cf66cd08a9acc1811ddd7b4fb703220dffef6a70b87935311524af8d96540a`;
+`independent-source-review.json` SHA256
+`cac81b1fbc6834be22ad65010dbb5e20c466e1a18175d2cb6667ad16a9a93eb4`.
+Parser Rust i diff check PASS. Niezależne source review nie wykazało blockera.
+Dodana regresja sprawdza bound Failed, obce komendy i stabilny timestamp replay,
+ale **nie była kompilowana ani wykonywana**. Fixture nie zawiera rzeczywistego
+native failure journalu, więc nie zastępuje publicznej próby po buildzie.
+
+Przygotowany control-only `one-shot-public-charge-refusal.py` uzupełniono
+o oczekiwane przejście terminalne epoch do tombstone, zachowując dokładne
+session/run/request-scope identity. Sprawdzi publiczne solver/stage Failed,
+reason zgodny z hashem journalu oraz dokładny bound Solve Failed,
+completion_status, timestamp i error. Nowy SHA256
+`0f56cc917f0b42e0d362e7ba0c41ce3e62b662e506d16c2bdba87692138c28d0`.
+Poprzedni driver `ceae1d2ed6f8848b8a953c5ed3e9fcf25901fd3a08db36bf2c94f7d7c28cd9de`
+zachowano. AST PASS i 21/21 czystych kontroli modelu PASS; test SHA256
+`ef70d8bb02cbf17cbbae92ed2d990ebe389a74d184dc3c17d59d25b7413bdc47`.
+**Driver, HTTP i Solve nieuruchomione.** Model nie dowodzi rzeczywistej
+konkurencji heartbeat/ACK ani odporności na restart.
+
+Scalar24 pozostaje tą samą żywą próbą `af098a83098f4ed39f0599c05ff6c690`:
+16 kompletnych przypadków; trwa M17/base. Odczyt zapisanych wyników direct200/12
+względem analytic120 dla 16 przypadków PASS, bez ponownego całkowania.
+Receipt `stored-analytic-vs-direct-readback-through-16.json` SHA256
+`fe8acb53ad556a4820323ffe117e40f207e84c082f694a7ef7e5f07207d60847`.
+To nadal referencja skalarna, nie kwalifikacja pełnego RT0 ani Universe.
+Nie restartowano usług i nie uruchamiano nowego Solve. Po terminalu tej próby
+należy ponownie sprawdzić checkpoint i zachowanie wyników, wykonać istniejący
+managed build z powyższą naprawą, a następnie pojedynczą publiczną próbę błędu
+i rzeczywisty cold-load/capture nagłówków. Nie ponawiać Universe Solve przed
+zamknięciem bramki numerycznej.
+
+
+## Checkpoint 24.10.2026 — tensor a bramka prezentacji planar
+
+Source review E10 potwierdził nadal dwa centralne ograniczenia renderowania:
+runner `capabilities.rs::resolve_quantity_capability` oraz fallback
+`data/quantities.rs::stored_field_read_only`. Katalog pozostawia tensor
+ExportOnly; zmiana samych flag nie byłaby kwalifikacją. Nie włączano tych flag,
+nie rozszerzano carrierów ani nie dodawano publicznego enum Frobenius.
+
+Naprawiono konkretną lukę frontendową w trzech plikach. Wspólne
+`planarCapabilities.ts::resolveFieldMapCapabilities` uznawało każde nComp>=2
+za wektor. Dodatkowo Inspector przy brakującym deskryptorze przekazywał raw9,
+a nieznaną projekcję poprawnego tensora zamieniał na pozorny scalar1.
+Teraz raster/glyph wymagają obsługiwanego outputu1/2/3; tensor musi zachować
+carrier9, poprawny canonical rank2/3×3/flow_major descriptor oraz jawny token
+projekcji c0–c8/frobenius/spin_flow_x/y/z. Brak lub mismatch metadata/carriera,
+null i nieobsługiwany token blokują raster/glyph. Geometria mesh/bounds ma
+nadal własne bramki. Zwykłe scalar1/vector2/vector3 zachowują prezentację.
+Selektor nie przedstawia XYZ dla nieobsługiwanego surowego shape.
+
+Rzeczywiste moduły aplikacji uruchomiono w istniejącym frontendzie przez Node24
+z odczytem TypeScript, bez kompilowania suite. Ta sama reprodukcja przed zmianą:
+7 PASS / 36 FAIL, exit1; po zmianie: **43/43 PASS, exit0**. Obejmuje wszystkie
+13 jawnych projekcji, niepoprawne rank/shape/axes/labels, mismatch carriera,
+nieobsługiwane shape oraz zachowanie zwykłych pól. Kolumna Q=[1…9] dla spin_y
+daje [2,5,8], Frobenius sqrt(285). Źródła helpera nie zmieniły się podczas prób.
+Istniejące regresje Vitest rozszerzono źródłowo, ale ich nie kompilowano
+ani nie uruchamiano. `git diff --check` PASS.
+
+Dowody w `verification/e10-activation-readiness-20261024` wolumenu kontrolnego:
+`planar-admission-pure.mjs`, `red.json`, `green.json`,
+`planar-admission-review.json`, `root-tsx-import-review.json`.
+GREEN SHA256 `4cfc619bd3dac2ed2360d117e899b0036140ee0a64d0486f9ad079c1495b05cc`.
+Root odnalazł i poprawił pominięte importy dwóch helperów nadal używanych
+w handlerach JSX. Końcowy parser TSX aplikacji: zero diagnostics; wszystkie
+trzy używane helpery mają import. To parser/import check, nie pełny typecheck.
+Root receipt SHA256 `673a1594e2f1f13d82e311ae5dcacd26ae1601b55c4753e5279bd5f3160f0a4e`.
+
+Końcowe SHA256:
+- helper `762e4ba4ea84059925c49780f12b6cde74ba7b79b24855f8f0ed97dc82de828c`;
+- Inspector `ec968d60590bba8738b9ed3d6f42859752e9dac5de9e5c3a9a1476609392efea`;
+- test source `1351db218e49b14e5a47237fec885b3306ead9c631dff623165e5148e514526c`.
+Wcześniejszy receipt agenta zachowuje SHA sprzed korekty importów; ostatni root
+receipt określa stan końcowy. Helper i GREEN43 pozostały identyczne.
+
+Brak browser/WebGL/HTTP i pełnego UI acceptance. Ta poprawka nie kwalifikuje
+renderowania tensora w całym produkcie ani etapu E10. Nie zmieniano flag,
+API/solverów, indeksu, pięciu przypiętych plików scalar24 ani sesji.
+
+
+## Checkpoint 24.10.2026 — geometria overlay i integralność referencji16
+
+Poprzedni etap sklasyfikowano jako postęp: zmieniono źródła lifecycle i planar
+admission oraz wykonano odpowiednie kontrole. Niniejszy etap uzupełnia rzeczywiste
+dowody E5/E7 i kontroli scalar24; nie zastępuje pełnego celu E0–E12.
+
+### Produkcyjny overlay na autentycznych cold V/J/H
+
+W istniejącym frontendzie Node24 uruchomiono rzeczywiste
+`artifactFieldOverlayModel.ts::artifactOverlayLocator`,
+`prepareArtifactFieldOverlay`, `presentArtifactFieldOverlay` oraz
+`artifactSurfaceProjection` na zachowanych danych cold b0cc, bez nowych danych
+solvera. Nie zmieniano sesji ani runtime. Bezpośrednio podane geometry-only
+wejście z prawdziwych dekoderów nie udaje zakończonego HTTP admission.
+
+- V:678scalar w1867Tet4,1324boundarytriangles,zero glyphs mimo vectorsVisible.
+- J:7468local slots w1867Tet4,1324boundarytriangles;678unique stable vertex IDs,
+  6790slots zachowuje wartość różną od pierwszego śladu tego samego vertex.
+  Każdy boundary triangle używa slotów jednego Tet4; nie wykonano nodal averaging.
+- H:14wektorów na jego własnym carrierze24Tet4,24boundarytriangles; nie Universe.
+
+Raw V/J/H SHA i jednostki V, A/m², A/m pozostały identyczne. Bufor rawSurface
+zachowuje oryginalny Float64Array. Atrybuty shadera zachowują komponenty wektora
+z podziałem przez jawny surfaceVectorScale. Face projection liczy średnią
+komponentów, a shader przenosi varying vec3 i oblicza length w fragmencie.
+To dowód struktury danych i źródła, **bez wykonania shadera GPU**. Rzeczywista
+różnica normy średniej i średniej norm jest mała (max0.0009765625A/m²), więc sama
+nie stanowi silnego niezależnego oracle dla interpolacji. Nie publikowano jej
+jako kwalifikacji numerycznej.
+
+Dwanaście negatywnych kontroli odrzuciło niezgodne komponenty, skrócone payloady,
+niezgodny indexing i niewspieraną thickness projection. Root potwierdził wszystkie
+39 source pins i10input pins po smoke. Nie znaleziono nowego potwierdzonego błędu
+produktu w tym zakresie. Wymuszone7468glyphs w smoke nie dowodzi czytelności,
+wydajności ani domyślnego zagęszczenia w UI.
+
+Katalog control:
+`verification/universe-volume-policy-20261023/frontend-cold-buffer-smoke-20261024/overlay-production-check`.
+Skrypt `overlay-production-smoke-v2.mjs` SHA256
+`de6cd50b86bcf1f7d880b0bafd1bc7afe97858751a3070369f7b6ca47f951c0c`;
+`v2-stdout.json` SHA256
+`e330a5592debd0f596710a14169f3570a414a8686a872ded1923a4914443579e`;
+`przeglad-pl.md` SHA256
+`2240e2e285004b96c6f11023075d9a6efc2ccccaa4211433e48503c9fff70174`;
+`root-review.json` SHA256
+`de5b22aa556a5d276222728278d6fe2fb9819797ab6361c9439dd8efc4a03842`.
+Pierwsze wywołanie nie wystartowało przez błędny cwd; poprawny smoke używał
+istniejącego `/state/development/workspace/apps/control-room/package.json`
+i cwd `/build`, bez zmiany mountów i zależności. Brak HTTP admission,
+React hook, DOM, browser/WebGL i screen proof pozostaje jawny.
+
+### Odczyt192passów i112bramek
+
+Dodano control-only `readback-pass-gate-integrity.py` w istniejącym katalogu
+`verification/universe-volume-policy-20261023/general-map-direct2d-20261024`.
+SHA256 `81fac735ac2c21a84fcd109ef9f97f251dce194f60cfffc506e194e7fe0941b7`.
+Nie importuje ani nie uruchamia kwadratury. Weryfikuje source/driver/wheel pins,
+zamrożony fixture i bitowy porządek geometrii, case hash,12zachowanych passów,
+7porównań total/local i oryginalną formułę gate. Porównuje dokładne Fraction
+po odtworzeniu oryginalnych535/668-bit kontekstów z zapisów dps+5.
+
+Pierwsza wersja readera błędnie traktowała decimalprintingULP jako jedyne
+zaokrąglenie sumy, pomijając binarny fsum rounding; M04 miał różnicę8.89e-162
+wobec1.2e-164 z samego wydruku. To błąd readera, nie eksperymentu. Zachowano
+pierwotny plik4b18a60; poprawiono wyłącznie rekonstrukcję i granicę spójności
+operacji. **Naukowe gates nie zostały zmienione**: stored i dokładnie odtworzone
+delta muszą osobno spełnić ten sam threshold, odtworzony w ctx200 zgodnie ze
+źródłem. Cztery mutacje uszkadzające dowód zostały odrzucone.
+
+Readback16 PASS:192passy,112comparisons. Receipt
+`af098a83098f4ed39f0599c05ff6c690/pass-and-gate-integrity-v2-through-16.json`
+SHA256 `c8b3cee2743e925aba81ceda67e40fc2ea6187bff73dc2f886a80ebea238f44c`.
+Niezależne review całego readera i zamrożonego check_gates nie wykazało blockera;
+mini roundtrip7values i3fsumcases dla obu precyzji PASS. Review receipt
+`readback-pass-gate-integrity-independent-review.json` SHA256
+`147b2d68dce1a49caee399e151d73366a83571d81cc3fa24df7ee1a493a0c44f`.
+To kontrola integralności zapisanych wyników, **nie** nowa niezależna referencja,
+certified error bound, audyt per-pass work/time/RAM ani kwalifikacja RT0/H.
+Po zakończeniu wszystkich 24 przypadków można użyć tego samego readera
+z `--through 24`, z nowym wyjściem;
+nie odtwarzać ani nie nadpisywać starych receiptów.
+
+Pierwotny proces6276/start_ticks5022696 pozostaje żywy,16/24cases ukończonych;
+M17/base wykonał5/12passów,15181896cumulative reference evals przy ostatnim
+odczycie. Nie restartowano grupy, nie uruchomiono drugiego eksperymentu, nowego
+native Solve ani buildu. Zachowano pięć zamrożonych źródeł. Następny ciężki krok
+nadal wymaga terminalu tej konkretnej próby, a potem ponownej walidacji istniejącego
+checkpointu i tego samego managed builda; nie zastępować go hostową trasą.
+
+
+## Checkpoint 24.10.2026 — kontrakt Port v3 i referencja19
+
+Naprawiono dwa potwierdzone błędy E2/E6, bez tworzenia nowego modelu ani API.
+Istniejący `SceneResource.antenna_port_modes` pozostaje właścicielem, zapis
+przechodzi przez `model.commitTransaction` z base_revision. Zastosowano skill
+`python-api-class`; kontrakt fizyczny jest już określony w zamrożonej nocie0950
+(6897–6918, tabela6951–6953), a IR i native stosują go poprawnie. Nie zmieniano
+ProblemIR ani schematu: to usunięcie rozbieżności istniejącego Python/UI.
+
+`AntennaPortMode` w Pythonie błędnie wymagał dla każdego schematu bilansu wag
+v2. Dla v3 skończone podpisane wagi są obserwacyjne; rzeczywistą normalizację
+wyznacza podpisany prąd RT0 przez `source_cut_rt0/minus_outward`. Ograniczenia
+sumy0/positive1/return obowiązują teraz wyłącznie w v2. Wspólne kontrole
+skończoności, unikalnych ID, branch/terminal mapping, źródła oraz1A pozostają.
+`committedAntennaPortScene` odrzuca teraz ACK, który podmienia kind/source_cut_ref/
+orientation normalizacji, nawet gdy podmieniona odpowiedź jest wewnętrznie
+spójna z równocześnie zmienionym cut sceny. v2 bez normalization zachowuje się
+jak wcześniej; porównanie jest po polach, bez zależności od porządku JSON.
+
+Rzeczywisty publiczny Python (constructor, exporter, StudyBuilder, to_ir):
+**28 kontroli PASS**. Rzeczywisty produkcyjny model i walidator Node24:
+**27 kontroli PASS** (v3 zero/niestandardowe wagi, poprawny i podmieniony ACK,
+nowszy draft, revision/session fences, v2 i brak mutacji). Są zachowane reprodukcje
+RED sprzed poprawek. Nie używano stubów ani mutacji serwera. W kontenerze nie ma
+pytest; nie instalowano go. Pełne pytest/Vitest/typecheck nie zostały wykonane.
+Parsery Python/TS oraz diff check PASS. Root przejrzał pełne źródła i proofy.
+
+Cztery końcowe source SHA256:
+
+- `packages/fullmag-py/src/fullmag/model/antenna.py`:
+  `efcfcedeefaeef778e590cfa1b88ec5c17c55f8ecdff73d63f45ffe9bbcc29c8`;
+- `packages/fullmag-py/tests/test_antenna_composition_contract.py`:
+  `ae6b824fd2ab2495e17b4bee4d516f9017749d93e4a00a7cc5cdc758ea136e38`;
+- `AntennaPortEditorModel.ts`:
+  `9f8455a8a0468a7dc90d5cf42ce395886ec7732436069694d20a881431c10e63`;
+- `AntennaPortEditorModel.test.ts`:
+  `b875c34bd70ac0ecb77e8614495b19bafc3a96dc49a116877fd5583a8bc0b35c`.
+
+Dowody `verification/e6-port-authoring-20261024` w wolumenie kontrolnym:
+Python GREEN SHA256 `2a6ecaecf5e517d4549f98144e30213825cb25b6eef13656685dd1c06a589016`;
+Node GREEN `379aa94cfbd591c94a7f1f8ceb6d6c5d7e75497d4861309d5a8bd0740f5273dd`;
+pełny source review `68b455c83d4ec3c96b9cc151ad364f700dfd4dc061035e160bcd4e7f4f940070`;
+root review `6821a38204ab71a48889ff03f285bede70d685d2fabf5e332ff4f688d095dd31`.
+Dokładny wykonywalny proof publicznego Python zachowano jako
+`python-public-port-proof.py`, SHA256
+`5b174be5d581606d5a76dfff7bcec0651e5af224d7ee5a42c5d1732b6e37a66a`.
+
+W istniejącym harnessie dodano źródłową regresję browser prepared-v3:
+cztery rzeczywiste observation IDs, pending → nowszy draft → podmieniony ACK.
+Obejmuje tożsamość root/input, focus/scroll, unrelated disabled/opacity,
+zero opacity animations, jeden POST, brak historii i publikacji obcego cut
+w cache, zachowanie draftu oraz bounded render/request. Autorytatywny refetch
+ma przywrócić revision2. Port nie jest fizyką Airbox, więc ten edytor nie ma
+odpowiednika mutacji Airbox. Parser TSX, Node --check, rzeczywisty generator
+danych z produkcyjnym walidatorem i diff check PASS. **Nie uruchamiano
+przeglądarki/DOM/HTTP, serwera, suite, builda ani Solve.** To źródło regresji,
+nie zaliczony test browser. Root sprawdził cache key, refetch catch i cleanup.
+
+Fixture SHA256 `98d30a85c23dec909a56e7fb86eb14f89e0e17b05906dc8765096e007eb8b546`;
+smoke source `8d679dbbbc67105289e0ccbfc5d4b65461b7be1acf0a4fca4e54003d11a16123`.
+Kapsuła `verification/e6-port-authoring-20261024/browser-regression-source`:
+source review `f584b9a12f088af3685dd0d2c7f308fc70200918182df1ce384822756efebaa8`,
+pure fixture report `a049aca8131e40346c007c7b033e939e28fa9f93159ad9bcf9d51f41331ff787`,
+root review `237872c94560a89ecdac871f41ec8d55fafe0856bef39fdd2a2b96c91a0d19e6`.
+E6 pozostaje otwarte; build, rzeczywista mutacja i browser acceptance niewykonane.
+
+### Postęp niezmienionego eksperymentu scalar24
+
+Pierwotny6276/start_ticks5022696 osiągnął19/24 ukończonych przypadków;
+nowe M17/base, M18/base, M08/shear mają PASS. M10/shear jest w toku.
+Odczyt19 zachowanych wyników i228passów daje133porównania w tych samych gates.
+`pass-and-gate-integrity-v2-through-19.json` SHA256
+`d8ff7848f272727ac43cc9f6365345afff746a88758119196da058893bb7b490`.
+`stored-analytic-vs-direct-readback-through-19.json` SHA256
+`66e8196e7048f9769011c8dfcf3f37df2960954b5af09fa8983e0bbca215c422`;
+maxdelta/existinggate1.57012700716566657e-91. Oba readery bez nowej kwadratury.
+Pięć source pins i capsule pozostają identyczne, nie zmieniano gates ani
+budżetów, nie wykonywano nowego native Solve ani restartu grupy. To nadal
+referencja scalar, bez dowodu ważonego RT0, full Universe lub publikacji UI.
+Zaliczone etapy pozostają1/13. Następny krok: rzeczywisty terminal tej próby,
+pełny readback i kontrola retencji, a następnie ten sam managed build w WSL.
+
+
+## Checkpoint 24.10.2026 — preflight buildu, Spectrum i budżet20
+
+Wykonano rzeczywisty repozytoryjny `_saved_authoring_probe` oraz request/service/
+archive validation na bieżącej grupie i uprzednim przypiętym checkpointcie.
+Natywny preflight PASS: ta sama scena Universe revision1,10retained RunCatalogs,
+17rezerwacji released, zero transient files. Nie wykonano drain/restart/builda,
+zwolnienia lease ani Solve. Kontrola jest wstępna; launcher przed restartem
+powtórzy ją pod własną blokadą. Wciąż pracuje scalar6276 i musi zakończyć się
+przed restartem. Pełny SceneResource canonical SHA256 pozostaje
+`93fd3ea07d2ede195da64c00776be95475fa2c33f8a1d446ecc3e7c3745e8220`;
+hash samego pola `scene` nie jest hashem tego zasobu.
+
+Receipt `prepared-native-failure-containment-source-20261024/readonly-native-checkpoint-preflight-20cases.json`
+SHA256 `25a47068cfb7413c1aecc5441a594fd0bda1bf7793d2861de7aa99b0c36f2016`.
+Podstawa operacji pozostaje bez zmian: checkpoint SHA256
+`d8e5b4acfcdd2118922d15c8c3c48fcde4714405e82e10ec55698f5f0b4e46b9`,
+recepta `docker-dev-restart-saved-authoring`, ta sama grupa3203, trwałe cache,
+bez kompilacji unit tests i bez nowej aktywacji startup Solve.
+
+Ponownie odczytano i porównano dokładnie70historycznych plików run/Zarr oraz
+2archiwa FMS: wszystkie rozmiary i SHA identyczne z baseline. Receipt
+`prepared-native-failure-containment-source-20261024/retained-readback-20cases.json`
+SHA256 `e5de3f51e36aadb38b69352314c75bace170eae743bc42a2b680ebe8847b7794`.
+Pięć scalar source pins i ich capsule są identyczne. Nietknięty użytkownikowy
+`examples/fem_antenna_closed_loop_nonmagnetic.20261022.fms` ma9291B i SHA256
+`d1ce5e22d273213da0119492a95a24a46428b75a199a24dbd93dd0c216bf24de`.
+Nie usuwano danych ani nie zmieniano indeksu Git.
+
+### Rzeczywista luka Spectrum i korekta czterech tekstów
+
+Bieżący create/edit flow zapisuje `SceneResource.antenna_spectrum_requests`:
+`AntennaSpectrumComposer.tsx::AntennaSpectrumComposer` i
+`AntennaResourceEditorModel.ts::buildAntennaResourceTransaction`. Nie dodaje
+operacji do accepted Study. To nie tylko brak przycisku: `StudyPrimitiveStageKind`
+(`fullmag-authoring/src/builder.rs`) i `StudyStepKind`
+(`fullmag-authoring/src/study_contract.rs`) nie zawierają operatora Spectrum;
+`StudyPlan::validate_for_execution` zachowuje odmowę Unsupported. Accepted
+worker nie ma właściwego dispatchera. Wykonawca istnieje w script/CLI:
+`script_stage_materialization::materialize_pipeline_antenna_source_spectrum`
+i `fullmag-cli/src/orchestrator.rs`, lecz nie stanowi dowodu accepted execution.
+
+Pełna implementacja musi dodać jawny kontrakt operacji i outputu, lowering
+z immutable request/dependency od trwale zakończonej qualified basis, istniejący
+interruptible compute z journal/CAS/cancel/replay oraz odczyt API przez accepted
+owner. Dopiero potem można połączyć create/edit ze Study, zachowując zgodność
+requestu i osadzonego pipeline payloadu. Nie dodano pozornej akcji ani nowego
+endpointu. Raw inspection H nie zastępuje qualified per-ampere basis;
+`load_antenna_field_solution_samples_for_spectrum` nadal tego wymaga.
+
+Konkretna korekta UI usuwa mylne polecenie, że sam qualified field solve
+opublikuje FFT. W istniejącym readout, otwartym opisie Spectrum, pending feedback
+i ACK kreatora tekst jasno mówi: zapisanie requestu nie oblicza FFT, wykonanie
+FFT nie jest jeszcze dostępne w tym workspace. Żadnej zmiany handlerów,
+pending state, resource owner, hooków ani fizyki. Parser TSX dwóch plików bez
+błędów i diff check PASS; browser nadal NOT VERIFIED.
+Source SHA256:
+`AntennaCompositionPanels.tsx` =
+`cbfc0521e38da9604d1c6b74ce68074f357fb4286222f3184d3a35a25d629f60`;
+`AntennaSpectrumComposer.tsx` =
+`dcf00759e06ff3a0c5a9d3a294be41e597e727a51d640c33056941fd58dc55b6`.
+Parser receipt `verification/e6-port-authoring-20261024/spectrum-readiness-copy-parser.json`
+SHA256 `5b7c7dca4bd5d65f234e71f937c9d7ddd7bba546f7254f06bdd1a708a41cfcb3`.
+To korekta komunikacji faktycznego ograniczenia, nie implementacja Spectrum/E9.
+
+### Kontrola integralności i pracy20 przypadków
+
+Nowy M10/shear zakończył się PASS;20/24, M16/shear w toku. Istniejące readery
+sprawdziły nowe dane bez nowej kwadratury.240immutable pass payloads,
+140stored convergence comparisons PASS; analytic120/direct200 porównanie mieści
+się w tym samym gate (maxdelta/gate1.57012700716566657e-91).
+`pass-and-gate-integrity-v2-through-20.json` SHA256
+`aa636e5c83372dfe0ec8dca1c3bbbb0b40018c48fc8d7aea88caa364504e801d`;
+`stored-analytic-vs-direct-readback-through-20.json` SHA256
+`d8e5703dadacca7104b2d73c896e88d1146a6295dd0c68cdc2677d67ec735cb2`.
+
+Niezależny control-only reader `readback-work-time-ram-through20.py` sprawdził
+260snapshotów (240pass+20case): brak resetu i monotoniczne counts/target/precision,
+sum(by_target)==counts i sum(by_precision)==counts, stare targety nie przyrastają.
+18,207,582reference evals global, max4,838,436/target;808exact comparisons global,
+max66/target. Wszystkie odpowiednie uprzednie limity zachowane:100M/10M evals,
+9396/174comparisons,8192bits,28800s global,3600s target,2GiB. Raw169/reduced85bits,
+finalelapsed11673.159236s, konserwatywny casewall upper max2752.301924s,
+lifetimepeak z guard44,802,048B. Cztery mutacje: niespójna suma,10Mtarget cap,
+reset i2GiBpeak cap zostały odrzucone. Root przeczytał cały reader i semantykę
+Budget/driver, nie znalazł blockera w deklarowanym zakresie.
+Reader SHA256 `3d414b645b1823b2723108b3fb3329a42c8b8271678b2fc238f1dc81fd2a4fd0`;
+receipt `work-time-ram-through20.json` SHA256
+`894b793325a78f3b502e7928f18d40dc4e1954881630574d8363cda79ff66409`.
+
+To audyt zapisanych liczników, nie pomiar każdej chwilowej wartości lub timera.
+Peak jest ostatnim OS lifetime peak z guard, nie ciągłym RSS monitorowaniem.
+Map transcendent telemetry nie podlega ograniczeniu analytic sqrt/log/log1p/atan2;
+libmp/CPython arithmetic nie jest zliczana wyczerpująco. Audyt nie dowodzi
+ukończenia24, certified error, weighted native RT0/H ani mapy Universe.
+Nie zmieniano gates/budżetów, nie uruchamiano nowej kwadratury ani native Solve.
+Nadal1/13zaakceptowanych etapów; główny cel Universe pozostaje niewykonany.
+
+
+## Checkpoint 24.10.2026 — publiczny import portu i rzeczywisty RED fidelity
+
+Poprzedni etap był postępem: korekta komunikatów Spectrum, rzeczywisty native
+preflight oraz nowe readbacki20. Bieżący etap poprawia E2/E6/E12, zachowując pełny
+cel E0–E12. Universe nadal nie jest gotowy; zaakceptowane pozostaje1/13 etapów.
+
+Przez `POST /v2/persistence/projects/from-script` zaimportowano istniejący
+closed-loop example ze zmienionymi wyłącznie wagami obserwacyjnymi portu v3
+z(+1,-1) na(0,0). Rzeczywiste HTTP201 zachowało source-cut normalization oraz obie
+zerowe wagi. Current session, pełna scena i command ledger przed/po identyczne;
+nie uruchamiano Solve. To mocniejszy dowód niż sam helper Python: poprawiony
+konstruktor jest osiągalny przez działający publiczny importer już przed nowym
+buildem Rust. Nie dowodzi jeszcze wykonania port mutation w UI lub solverze.
+Kapsuła `verification/e6-port-authoring-20261024/public-import-zero-weights-prebuild`:
+`report.json` SHA256 `5e3d63fc79e739e5c8d81a7d0a5c00284033f62b95196f6cc7c5b5d69552a923`,
+fixture `c65f42dead8f58c476f0f9294a72f99fe2cb4925fa874d0e8749ed29541c99a9`.
+Rzeczywisty renderer i oba lightweight export-run-config (bez geometry assets)
+zachowano w tej samej kapsule;21wybranych kluczy,12obecnych w modelu i etapie,
+mają identyczne wartości i typy, również żądany runtime FEM CPU double strict.
+
+### Potwierdzona luka werdyktu zgodności
+
+`script_project.rs::compare_lowered` pomijało deklaracje anteny i transportu.
+Nie wystarcza dopisanie ich tylko do root IR: kanoniczny `run_config_export`
+umieszcza nieaktywne deklaracje w opcjonalnym `/antenna_inventory`, a
+`LoadedProblem.pipeline_base_problem` celowo usuwa je z aktywnego IR.
+`stage_summary` pomijało też żądany backend/device/precision każdego etapu.
+Zastosowano `resource-first-api-check`; schema/endpoint/enum i frontend facade
+pozostają bez zmian, więc ten patch nie wymaga generacji OpenAPI.
+
+Wprowadzono ograniczony helper wybierający21istniejących pól kanonicznych:
+antenna/drive/port/stage/projection/spectrum, current/spin transport/STT (także
+faktyczny adapter legacy), material parameter fields, physics graph/objects,
+excitation analysis oraz pełny optional inventory. Porównanie używa `ValueEq`
+poza dotychczasowym tolerancyjnym json_close. Zachowuje binding names/object IDs,
+cut refs/digests, parametry i UINT64>2^53; brak/null/[] pozostają różne. Każdy
+etap wnosi własne IR. Legacy single-stage bierze root IR bez przenoszenia
+globalnego inventory do etapu. Istniejące równoważności zero-translate i zero
+Zeeman zachowano. `stage_summary` używa istniejącego `runtime_request_summary`.
+
+Dodano5regresji źródłowych: cut i drobna zmiana napięcia w etapie, inventory
+poza aktywnym IR, legacy inventory fallback, brak/null/[] i stable_vertex_ids,
+a także5żądanych pól runtime etapu. Rust testów nie kompilowano/nie uruchamiano.
+Końcowy source `crates/fullmag-api/src/router_v2/handlers/persistence/script_project.rs`
+SHA256 `871fd0a986904d20ec7c65fe682347980564950c222123f3bdcaa9a40e853311`;
+patch SHA256 `1daaa7299f1c90c53ccd58347e36085c207709a359215ba02056c23f75b6a1bb`.
+Parser rustfmt (emit stdout, bez zapisu źródła), diff check i niezależne static
+review PASS. Kapsuła `verification/e6-port-authoring-20261024/roundtrip-fidelity-source`,
+`parse-and-real-exports-v2.json` SHA256
+`471578127145db24ee80e0478be5f8f00edc4b564037ec03a06f3f93bfb06d6c`.
+Źródłowy comparator nadal NIE jest zbudowany ani wykonany w API.
+
+### Rzeczywisty publiczny przypadek negatywny
+
+Utworzono jawnie kontrolowany skrypt zależny od fazy helpera: przy
+export-scene-document zadaje0.25V, przy export-run-config0.5V. Nie zapisuje
+plików, nie aktywuje sceny i nie wykonuje Solve. To kontrast dwóch ocen źródła,
+**nie** samoczynna utrata danych przez renderer. Rzeczywiste lightweight
+exporty potwierdziły różnicę; następnie stary publiczny importer zwrócił201,
+scenę0.25V i **round_trip verified**. Tym samym odtworzono rzeczywisty fałszywy
+werdykt, a nie tylko statyczny brak pokrycia. Current/scene/commands identyczne
+przed/po. Nie zmieniano sesji Universe.
+Kapsuła `verification/e6-port-authoring-20261024/phase-sensitive-fidelity-regression`:
+fixture SHA256 `ffd03514739d01b22a3cfe1b7f889aa554e7e8864b462c0c805f058add8b1853`;
+`prebuild-http-report.json` SHA256
+`f4a764d830a77ca913ea2f2f798400c67fabd8d807febb6551eda54043089556`.
+Po nowym buildzie ten sam fixture musi dostać fidelity failed z opisem rozbieżnych
+deklaracji, zachowując HTTP201 i aktywną scenę. Zachowano wykonywalny driver
+`check-public-fidelity-after-build.py`, SHA256
+`915f4733c14d7591841080da2cd6bc66144d06520f872a68ed7003b11d5f61ce`:
+AST PASS, NIEURUCHOMIONY; wymaga jawnego pinu nowego source snapshotu pakietu.
+Pierwsza próba zapisania drivera miała błąd quoting przed wykonaniem/zapisem;
+poprawny zapis zachowano, bez requestu lub zmiany źródeł przy błędnej próbie.
+
+Referencja6276/start_ticks5022696 nadal pracuje:20cases ukończonych,
+M16/shear3/12passy przy ostatniej obserwacji;20,212,281reference evals,
+elapsed13245.780874s. Nie restartowano grupy i nie uruchamiano nowego native
+Solve. Następny krok pozostaje terminal dokładnie tej próby; jeżeli odmówi,
+zachować refusal i nie resetować/nie podnosić budżetu. Dopiero potem audyt
+ukończonego zakresu, ten sam saved-authoring restart/build, restore Universe,
+regresja publicznego fidelity oraz przygotowana jednorazowa próba containment.
+Żaden z tych dowodów nie kwalifikuje jeszcze pełnego H w Universe.
+
+
+## Checkpoint 24.10.2026 — początek natywnego wejścia RT0 dla Universe
+
+Poprzedni etap sklasyfikowano jako postęp: rzeczywisty import portu, publiczny
+RED błędnego fidelity oraz poprawka jego źródeł. Bieżąca zmiana prowadzi wprost
+do natywnego operatora H Universe, ale nie zastępuje celu ani kwalifikacji.
+Przyjęte pozostaje1/13 etapów; pełnej mapy H Universe nadal nie ma.
+
+Zastosowano `backend-golden-masterplan` i `fem-native-backend-architecture`.
+Lane: wyłącznie FEM CPU. Przeczytano istniejący `AffineRt0Element`, konstruktory,
+`ConservativeCurrentView` oraz `export_closed_loop_source_snapshot`. Ten sam
+właściciel posiada już geometrię i współczynniki, których należy użyć zamiast
+rekonstrukcji prądu z historycznych, zaokrąglonych próbek J.
+
+W istniejących `affine_rt0_element.hpp/.cpp` dodano14linii: nested `FrozenInput`
+(4x3 vertices_m oraz4signed_coefficients_a) i `frozen_input() const`. Getter
+wymaga `coefficients_frozen_` i zwraca własną kopię obu istniejących tablic.
+Nie wykonuje arytmetyki, nie stosuje ponownie znaku DOF, nie eksportuje
+zaokrąglonej determinanty ani pointerów MFEM. Jednostki: geometria m,
+współczynniki bazy A. To nie są fizyczne zintegrowane prądy ścian.
+Nie zmieniono bieżących metod current_at/retained_current_at/face_moment,
+layoutu danych instancji, C ABI, dispatchu ani polityki. Nowy getter nie jest
+jeszcze podłączony do operatora H. Przyszły caller musi wiązać świeży accepted
+view z digestem źródła; sam typ FrozenInput nie jest takim poświadczeniem.
+Indeksy wierzchołków i coefficients pozostają sparowane, bez reorderingu;
+przyszła dokładna geometria musi obsłużyć obie orientacje Tet4.
+
+Source SHA256:
+
+- `backends/fem/cpu/mfem/transport/affine_rt0_element.hpp`:
+  `72530ce34a4b948d9591b2cf629b7415f40adb845f3cd744c24b41ccb369d212`;
+- `backends/fem/cpu/mfem/transport/affine_rt0_element.cpp`:
+  `b5fe3f7c7732cf453c62c3bc2860d0faaffae25f6da426be68d5e247710f9a3b`;
+- patch `ac9c92d39ef79fb857422fd94cbfa45428074182cb4689f03effa7166942ba8e`.
+
+`git diff --check` PASS. Niezależne source review nie wykazało blockera;
+receipt `verification/universe-volume-policy-20261023/native-rt0-frozen-input-source-20261024/independent-source-review.json`
+SHA256 `584ac8c3428bf614f290ccca1eee86c164400be876ce9d5760eaebd7f44096e3`.
+Końcowy polski `root-source-checkpoint-pl-v2.json` w tej samej kapsule ma SHA256
+`2ac5ce24d23760edfde7a1e974ef548527879851fa25945d5e1f50f6ce15d670`.
+Zachowano dokładne źródła i patch. To review źródeł, **bez kompilacji i wykonania**;
+nie uruchamiano hostowego kompilatora, C++/Rust unit tests lub nowej symulacji.
+Właściwą ścieżką builda pozostaje ta sama grupa WSL i istniejące
+`docker-dev-restart-saved-authoring` po rzeczywistym terminalu scalar6276.
+
+Nie dodano jeszcze SurfaceRt0Field, nowego wyboru metody/IR/ABI/evidence,
+liczbowej polityki kosztu ani aktywacji. Dotychczasowa propozycja migracji
+z SHA256 d110021a1f475e0586dadd8915072626a65c7331c95b4f1d0e766f4214c57710
+pozostaje zachowanym wejściem review; niniejszy checkpoint opisuje wykonany
+źródłowy fragment kroku1, nie realizację całej propozycji. Zamrożone scalar
+źródła i nota0950/source-map pozostają nietknięte.
+
+Ten sam handle72043 nadal potwierdza żywy proces6276/start_ticks5022696:
+20cases ukończonych, M16/shear4/12passy,20,458,242reference evals,
+elapsed13450.273714s przy ostatniej obserwacji. Brak terminalu nie jest
+niepowodzeniem ani podstawą do restartu. Następny krok: terminal tej próby,
+audyt ukończonego zakresu bez resetów/refusal retries, ponowny saved-authoring
+preflight i build w tej samej grupie, a następnie przygotowane publiczne
+regresje fidelity/containment. Pełna metoda H wymaga dalszej implementacji
+oraz własnych bramek numerycznych i nie jest oznaczana jako gotowa.
+
+
+## Checkpoint 24.10.2026 — terminal referencji i rzeczywisty build poprawek
+
+Stan realizacji nadal1/13. Ta iteracja wykonała rzeczywisty build, ujawniła
+błąd granicy modułów osobnego programu i poprawiła jego źródłową przyczynę.
+Nie uznaje się nieudanego buildu ani prywatnego operatora za wdrożenie.
+
+Eksperyment `af098a83098f4ed39f0599c05ff6c690` zakończył się
+`REFUSED / NOT VERIFIED`, exit1. Przypadek21 M16/shear osiągnął uprzedni limit
+3600s podczas szóstego passu; zachowano pięć ukończonych passów. Zaliczone
+pozostają20przypadków. M16/shear oraz M08/M10/M16 rotate90 są nieukończone.
+Całość trwała około15273,34s; szczyt RAM44802048B; wszystkie pięć źródeł
+pozostało identycznych. Nie zmieniono tolerancji i nie ponowiono próby.
+Terminal w kapsule `general-map-direct2d-20261024/af098a83098f4ed39f0599c05ff6c690/terminal.json`
+ma SHA256 `7975ab6ff2402f7e10ab61a5bdcfcc4528b81428e3c0e6085026cdd94211b9d3`.
+Zapisany odczyt terminalu i retencji `terminal-and-retention-before-build.json`
+w kapsule `prepared-native-failure-containment-source-20261024` ma SHA256
+`72eecbeb7065f5091b72710df5fe4c82e136415b6ac8f8456724f739ed7b58f3`:
+70plików wyników oraz2archiwa ponownie identyczne, cache i pakiet zachowane,
+około485,43GiB wolnego na filesystemie buildu; bez usuwania danych.
+
+Przez `just docker-dev-restart-saved-authoring` uruchomiono tę samą grupę,
+kontener d8be140dcc0a… i nowy snapshot
+`c65ccc2fbada11a672419aca5a9f8e34de1872bc3a604302de04e1bb360b2be5`.
+Iteracja `98dee24e06b744d3848ded9d5e3b8666` zakończyła się nieudanym Make
+(exit2, bez OOM) i zachowanymi zasobami. Rzeczywisty Rust E0433:
+`accepted_study_supervisor.rs` odwoływał się do `crate::accepted_study_worker`,
+którego standalone `accepted_supervisor_main.rs` nie deklaruje.
+
+Naprawa przenosi istniejące typy Started/identity, stałe formatu, fingerprint
+planu i walidację do jednego `accepted_worker_execution_receipt.rs` (95linii).
+Worker i supervisor dołączają ten sam moduł przez lokalne `#[path]`.
+Format serde, schema, fingerprint i reguły zgodności claim pozostają te same.
+Niezależny przegląd źródeł nie wykazał blockera; kompilacji tej poprawki
+jeszcze nie potwierdzono. SHA256:
+
+- moduł: `855ea5e45f2d3b9d8ea7fc21ebfb86d23aa0b4ca3a7cb3c94605552a429d6ee9`;
+- worker: `edccace07918f51519fcd7cb9e0ef48030c6af098e78269bfcfd91b2037fe903`;
+- supervisor: `f93f607aeac0c34fa7649604294c76035bedc8c5d49af7e4ae702fa9d34564bb`.
+
+Następny krok: przypięty preview i rekonsyliacja dokładnie nieudanej iteracji,
+zarządzane wznowienie z zachowaniem cache/wyników, restore zapisanej sceny,
+publiczne regresje fidelity i obsługi Failed. Nie wykonano nowego Solve.
+Prywatny operator powierzchniowy powstaje w osobnej kapsule i pozostaje
+niepodłączony do CMake/publicznego dispatchu; pełne H Universe nadal niegotowe.
+
+
+Źródłowy operator `surface_rt0.hpp/.cpp` jest już zapisany w bieżącym worktree
+(127/831linii), nadal bez CMake, publicznego ABI, dispatchu i Solve. Przyjmuje
+świeże geometrie oraz signed coefficients z istniejącego FrozenInput; digest
+pozostaje jawnym wiązaniem odpowiedzialności callera. Zawiera rozdzielone
+obliczenia binary64/80/120, sumowanie lokalne/globalne, sprawdzanie zgodności
+formuł i precyzji oraz reprezentowalności końcowego H w binary64. Wszystkie
+limity kosztu i tolerancje są obowiązkowymi wejściami; nie aktywowano nowej
+liczbowej polityki. Pomiar szczytu RSS przez callback jest próbkowaniem,
+nie twardym limitem alokatora ani pełnym licznikiem heap Boost.
+
+W review poprawiono odczyt jeszcze niezainicjalizowanego następnego wierzchołka,
+preflight reprezentacji exact binary64, brak porównania whole/fan przy80cyfrach,
+kontrolę błędu kwantyzacji i reset raportu na wejściu. Delimitery/diff są poprawne;
+to **wyłącznie sprawdzenia źródłowe**, nie dowód kompilacji lub poprawności
+numerycznej. HPP SHA256 `ce0cf6fe1c8b3fd4deb6fc6218dd0a428ad7ff19d1cd7d6c1abeafc38e671253`,
+CPP SHA256 `e43030789b5a2ff1ac92a4c7537c12b3c0c75fbb5751e0cda7cfcba39e002eb2`.
+Końcowy receipt: `native-rt0-surface-core-source-20261024/source-only-published-checkpoint.json`.
+Niezależny przegląd nie wykazał potwierdzonego blockera źródłowego. Kontenerowa
+kompilacja, kwalifikacja ważonego RT0, podłączenie kanonicznej ścieżki i rzeczywiste
+H Universe/UI pozostają niezweryfikowane.
+
+
+## Checkpoint 24.10.2026 — rzeczywisty pakiet i publiczne regresje
+
+Poprzedni etap: postęp. Ta iteracja: postęp, bez zamknięcia E1–E12; nadal1/13.
+Nie zmieniono celu na same helpery, getter lub kontrolę awarii.
+
+Rekonsyliacja nieudanego Make `98dee24e06b744d3848ded9d5e3b8666` przeszła
+canonical preview i apply `failed-confirmed` na request SHA256
+`c6fed40089ca63920b4d7b27e1fb0b215f81dd115ada301253c7ebc4926c257b`.
+`just docker-dev-resume` z istniejącą development attempt169b439d… i
+config35cd2c… zakończył się sukcesem: resume `3f95011c1f9b4f6787280a25d5e1ebe4`.
+Backend d8be140dcc0a… i frontend4e5820308bc8… pozostają z tej samej grupy;
+cache zachowany, `backend_package_cache_hit=false` oznacza rzeczywisty build
+zmienionej aplikacji, nie wyczyszczenie cache zależności. Nowy snapshot:
+`11da23f3028b9c8be7081ad94849e83dc2f8db2900506a43ec2fb03270f902a1`.
+Sześć krytycznych plików źródłowych porównano z cieniem kompilacji; zgodne.
+
+Rzeczywiste HTTP regresje E2/E6 po buildzie:
+
+- Celowo phase-sensitive napięcie0.5V/0.25V: HTTP201, fidelity `failed`,
+  z wykrytą różnicą anten/transportu w całym modelu i etapie. Dawne API dawało
+  fałszywe `verified`. Aktywne current/scene/commands pozostały identyczne.
+- Poprawny portv3 z zerowymi wagami obserwacyjnymi: HTTP201,
+  fidelity `verified`, normalization source_cut_rt0/minus_outward zachowana.
+  Receipt `public-import-zero-weights-postbuild-11da23f3/report.json` ma SHA256
+  `399420f52b32d1098f7d4058e3b737d3149fa045775ce05ee8a04870608f0ded`.
+  Żaden import nie aktywował sceny ani Solve.
+
+Jednorazowy test błędu native (H1 charge max_iterations=1) uruchomił dokładnie
+jeden Solve. POST command przekroczył60s i driver zakończył się bez ponowienia;
+nie nazywa się tego nominalnym PASS drivera. Odczyt trwały wykazał własny run
+`run-live-f088902430ee0eff997a7b44efbc05f6623134585920a7c1bc87be00ab5860ac`,
+Failed(retryable=false), DoNotRetry, dokładnie jeden Start/Started,
+Completing → heartbeat ACK drain → Failed, brak artefaktów/completion receipt,
+oraz dokładną rezerwację `released`. API i oba schedulery zachowały PID/start_ticks.
+
+Po ustąpieniu opóźnienia publiczne API dało200: statusFailed, stageFailed,
+identyczny z journalem powód i właściwa komenda zakończonaFailed. Receipt
+`public-terminal-proof-after-timeout.json` w `trial-postbuild-11da23f3-native-failure`
+ma SHA256 `995e66c85b1276fcd3b4e8887fc866e486904e21df013926750edc6e3acc3369`.
+To dowód tej ścieżki awarii; nie kwalifikacja race, sukcesu H ani całego E3.
+
+Read-only diagnoza opóźnienia:73.892882128s od request timestamp do durable
+RunIntent,122.102s do publicznego completion. To różnice wall timestamps,
+nie profil faz ani monotoniczny benchmark. Source review potwierdza wspólną
+blokadę transition przez prepare/commit/materializację i oczekiwanie GETstatus
+na tę blokadę. Nie znaleziono cyklu deadlock; sam WARN journal writerBusy
+pochodzi z odczytu przed transition i nie dowodzi jego przetrzymywania.
+Nie zmieniono blokad na podstawie hipotezy; pozostaje pomiar faz i poprawka latencji.
+Dowód: `latency-existing-timestamps-and-source-review-pl.json`, SHA256
+`3e727dbe02656c926c0f9020f3086cc0ae1b83fc70e878b3837c28e0a7b0ab6a`.
+
+Po tej próbie publiczną ścieżką odtworzono zapisany Universe bez Solve.
+Bieżąca sesja: `session-18e18256f0449a2a00000c4f`, rev1, brakrun, commands[].
+Cały SceneResource jest dokładnie równy dokumentowi z FMS; canonical SHA256
+`93fd3ea07d2ede195da64c00776be95475fa2c33f8a1d446ecc3e7c3745e8220`.
+Receipt restore SHA256 `9f1a781c8383479b91f0e76148269e6638c39b23aa9dcf37968e4fb5a0b63e99`.
+Pierwsza kontrola porównała omyłkowo dokument z samym nagłówkiem `scene`;
+porównanie całego zasobu skorygowano, bez dodatkowej transakcji.
+
+Końcowy odczyt retencji ponownie potwierdził70identycznych plików i2archiwa,
+bez usuwania, około482.79GiB wolnego na filesystemie builda. Receipt
+`postbuild-11da23f3-retention.json` SHA256
+`9a0637009312389fff8550b480938ef7e5926a7b00821fab8b642256b28c696a`.
+Prywatny SurfaceRT0 przeszedł root i niezależne source review; receipt
+`root-independent-review-pl.json` SHA256
+`0492fdb103c7682064b318857893e9c20fdf66dc07faa8492a9acf95ccd81959`.
+CMake/publiczna ścieżka/kwalifikacja ważonego native nadal niepodłączone.
+Następny krok: kontenerowa kompilacja prywatnego operatora zgodnie z notą/mapą,
+własne bramki native RT0 oraz domknięcie latency/header readback. Nie powtarzać
+odmówionego scalar24, nie podnosić gates i nie deklarować gotowego H Universe.
+
+
+## Checkpoint 24.10.2026 — operator powierzchniowy skompilowany w grupie WSL
+
+Poprzedni etap: postęp (pakiet11da, publiczne regresje, kontrolowana awaria).
+Bieżąca iteracja: postęp — rzeczywista kompilacja nowego operatora, nie tylko
+review źródeł. Nadal przyjęto1/13 etapów; pełne H Universe nie jest gotowe.
+
+Uzupełniono kanoniczną notę0950 i source-map: pełne argumenty prywatnego
+wywołania,14kategorii pracy,8pól limits,11tolerancji, fresh FrozenInput,
+rozróżnienie affine extension J_T(r) od fizycznego prądu poza przewodnikiem,
+całkowite i lokalne liczniki, sampled RSS oraz opaque binding digestu.
+Focused validator PASS i41/41interpreted kontraktów dokumentacji PASS.
+Zmiana CMake to jeden wpis `cpu/mfem/interactions/oersted/surface_rt0.cpp`
+w produkcyjnym FEM_SOURCES pod MFEM; lista źródeł testów pozostała nietknięta.
+CMake SHA256 `adb5cd96e9efb74c040bceb97013c211adb0a8d08ce97fb72a7f309566090ea3`.
+
+Świeży checkpoint sceny SHA256
+`e36c4666ec94715f8bc7e028b5d416b61f7ee91653a76fa4e18e73504ec73f10`
+przeszedł rzeczywisty native preflight:11terminalnych katalogów,
+8lokalnych lease released,19dotyczących rezerwacji hosta released, braktransientów
+orazpusta kolejka. Nie zakładano wcześniej podanych liczników18/17.
+Użyto tej samej recepty `just docker-dev-restart-saved-authoring`, backendu,
+frontendu, obrazu, cache i portu3203. Nie wykonano nowego Solve ani kompilacji
+C++/Rust unit tests. Iteracja `d5ff44bd896e4613b5d85d1d58d8cc00`: succeeded;
+nowy snapshot `5579ddeee3a12d0f4591612f517451bba8158f7a1901c5d81bf6c28de5c68a59`.
+Make exit0,168545ms; cache zachowany, bez package cache hit dla zmienionego kodu.
+
+Potwierdzono nowy obiekt `surface_rt0.cpp.o`,738576B, SHA256
+`21025b820c8a741abb58e20817260fcb17fe2b00c580a5495d5cb8fce6b2ba9d`.
+Zainstalowana biblioteka FEM9040072B ma SHA256
+`f9b5d320b94b36a0533f0be332b85ab0e342d9009ba55f2011b9d8f248b11416`.
+`nm -C` zainstalowanej biblioteki potwierdził symbol `evaluate_surface_rt0`;
+nie oparto tego wniosku na samym Cargo success lub starym cache.
+Nowy kod i faktyczny Boost/kompilator są zgodne w tym toolchainie.
+
+Po pełnym succeeded receipcie publicznie otwarto zachowany FMS i odtworzono
+scenę, bez Solve. Aktualna sesja `session-18e1837f89c749e900000b14`, rev1,
+runnull, commands[]. Cały SceneResource nadal ma canonical SHA256
+`93fd3ea07d2ede195da64c00776be95475fa2c33f8a1d446ecc3e7c3745e8220`.
+Receipt `surface-rt0-compile-preflight-20261024/postbuild-5579ddee/report.json`
+SHA256 `01667d77e56b00f112ce9b4aaab816cedd0b0f08d6081695bfe8495a428b3860`.
+
+Notę i mapę uaktualniono po otrzymaniu dowodu na `compiled_only`, nadal bez
+wykonania/numerical qualification. Focused validator po tej korekcie exit0.
+Aktualne SHA256: nota
+`1d481627b5f2ea087583ac70061945ef9dc5de0210c46dcc65b4b648be678068`, mapa
+`a22268555b829a874fd688bdd9c6e2c3806304e9c9df287cba7dbb287718ebf3`.
+Nie powtarzano41niezmienionych testów samego validatora tylko z powodu dopisania
+dowodu. Te późniejsze metadane nie zmieniają historycznej kapsuły scalar24.
+
+Następny krok nadal prowadzi do pełnego celu: wykonanie operatora ze świeżych
+współczynników zaakceptowanego RT0, niezależne bramki ważonego H/near/inside,
+kanoniczny wariant metody i wyników oraz cała mapa Universe przez API/UI.
+Brak publicznego dispatchu, wywołania operatora, native numerical qualification,
+pełnego scalar24PASS i WebGL proof pozostaje jawny; kompilacja nie zamyka E3/E4/E7.
+
+
+### 24.10.2026 — integracja surface od publicznego authoring do artefaktu, przed buildem
+
+Stan odbioru E0–E12 pozostaje **1/13**; źródłowa integracja nie jest dowodem
+wykonania ani kwalifikacji. Dodano analytic_rt0_surface z kompletną jawną
+AntennaSurfaceFieldPolicy (bez domyślnych budżetów), nieprzekraczalnymi bramkami,
+Python/IR/planner one-of, addytywnym C ABI i jednym accepted RT0 solve.
+Osobny snapshot/evidence ma własny magic i wiąże źródło, ordered targets,
+parametry, raw H i signed per-A; framing FMACLB01 oraz stare direct bytes
+pozostają zachowane. Historyczny slot direct_evidence jest dyskryminowany
+przez schema; nie publikuje fikcyjnych direct error/leaf counters.
+
+Niezależny przegląd wykrył i zamknięto dwie poprawki: nagłówek requestu
+sprawdzany przed nested pointer traversal oraz numeryczna spójność retained
+surface diagnostics (exactdecimal delta<=budget, H120→raw bits i obowiązkowe
+liczniki 80/120). Konserwatywny L1 guard nie jest certyfikatem błędu.
+6 nowych unittest/22 negative subtests i27 istniejących unittest PASS;
+pytest nie jest zainstalowany, Rust/C++ unit tests nie kompilowano.
+Actual Python/script/IR dowody: verification/surface-public-policy-20261024/,
+report a1a50887b0beced4378ea421dad7dabf860b9b2b9943fb051db256879b10e9f7.
+Focused scientific-doc validator po aktualizacji mapy i tabel exit0.
+
+Zaplanowany zarządzany build używa tej samej grupy i checkpointu
+verification/universe-volume-policy-20261023/surface-public-integration-20261024/checkpoint.json,
+SHA256 7bf3d0a9d791f53c071fb8933736772549bda56519a9da2272fef28bc5dd2945.
+Piny: pakiet5579ddeee3a12d0f4591612f517451bba8158f7a1901c5d81bf6c28de5c68a59,
+sesja session-18e1837f89c749e900000b14, brak Solve/runu/commands.
+Nie aktywowano nowej próby ani nowych parametrów wykonania. Pełne Universe,
+fresh native result, public API i cold import nadal NOT VERIFIED.
+
+
+### 24.10.2026 — zarządzany pakiet surface zbudowany, follow-up metadanych gotowy
+
+Iteracja296a70c94fd24417aeb249c8eecbb8cc succeeded, make exit0/1493889 ms.
+Pakiet4b64b46b6025e2ddb0534135c904f58541a3ee9251b1af2cd93ec22c1b4b9453,
+libfullmag_fem SHA e7b90abe08bc50eafb736ba88e70c25b484a03b5bcc523762a326eebdab1dba9,
+wyeksportowany fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1.
+API healthok, pełna zapisana scena Universe SHA93fd3ea07d2ede195da64c00776be95475fa2c33f8a1d446ecc3e7c3745e8220
+przywrócona w session-18e186a00aa73146000021f5, bez run/commands/Solve.
+Nie oznacza to obliczenia nowego H ani kwalifikacji; E0–E12 nadal1/13.
+
+Przed buildem przeoczono konieczność projection policy counters do nazwanych
+scalar maps w thinAPI. Poprawka source-only w inspection_view zachowuje
+manifest/evidence i jego podpis; publiczne mapy mają14 nazwanych kluczy,
+surface_counter_encoding=named_work_kind.v1, bez wyłączania zakazu tablic.
+ParserRust i focusedscientificdocs exit0; wymaga kolejnego managedbuildu iHTTP.
+
+Przygotowano osobne skrypty bez autoSolve i bez zmiany istniejących wyników:
+examples/fem_antenna_surface_nonmagnetic.py (SHA24a40b2d730c3064ac6005c6870373fe2297cd07f724755243dc23051e397d38),
+examples/antenna_universe/fem_antenna_closed_loop_universe_surface.py
+(SHAfcfba6ee532835b75e0e18f029246e8576fd0e8e5de82e5fafd727df848a2bd5).
+Oba rzeczywiście lowered doIR w3.746/8.766 s, bez Solve; report
+verification/universe-volume-policy-20261023/surface-public-integration-20261024/example-lowering/report.json.
+Parametry pracy są jawne, nie nowym implicit default/profilerem kwalifikacji;
+mały carrier40k par/600s, pełna niezmieniona Universe4M par/1800s,
+90s/target, RSS6GiB, bitcaps8192. Kontener nadal4CPU/8GiB.
+Najpierw rzeczywiste V/J/H małego carrieru i sanitycomparison retained direct,
+następnie jedna pełna próba Universe, publicAPI i coldimport. Nie wolno
+ponowić komendy o nieznanym wyniku ani uznać budżetu za evidence sukcesu.
+Gitindex pozostaje zamrożony, nic nie staged/committed/pushed.
+
+
+Follow-up thinAPI używa nowego checkpointu
+verification/universe-volume-policy-20261023/surface-public-integration-20261024/checkpoint-thin-followup.json,
+SHA06930bbad1b390ffe4fad99adb98d84d419aac885a0b02853d7f0321e0a36384.
+Zachowuje pakiet4b64, sesjęsession-18e186a00aa73146000021f5, tę samą scenę
+93fd3ea0… i11 terminalnych katalogów historii. Brak Solve; w źródłach tylko
+follow-up thinAPI, opis właścicieli i jawne przykłady authoring po pierwszym
+udanym buildzie. CMake już ma prawidłowe source-specific provenance dla
+DirectCompose; nie zmieniono mechanizmu cache, flags ani limitów zasobów.
+
+
+### 24.10.2026 — finalny pakiet thin API i rzeczywiste regresje odczytu
+
+Zarządzana iteracja242d1794962642c4b1a8b9481fc35b17 zakończona exit0.
+Zainstalowany snapshot3e5c157a7e013432adbe548fa3ab8713e578d2b5221612fc7d0f110695827777,
+biblioteka FEM SHA50aebbe62cf31dfb85651320292ddff366434ef5deec9b23d447bb2e1723a824.
+Symbol publicznego ABI surface obecny; API zdrowe, zachowana scena Universe
+93fd3ea07d2ede195da64c00776be95475fa2c33f8a1d446ecc3e7c3745e8220 przywrócona.
+Ta sama grupa, obraz, kontenery i cache; nie kompilowano unit tests.
+
+Rzeczywisty validate_accepted_antenna_closed_loop_http:31 kontroli PASS,
+131.8256s, dotychczasowy zaakceptowany wynik direct, bez Solve. Raport
+verification/universe-volume-policy-20261023/surface-public-integration-20261024/postbuild-3e5c157a/direct-backward-http.json,
+SHA5047fd664c0e9de6c814fd063cc0194363f42353fdfe99bc3124498b84162b00.
+Odczyt pełnego bundle, V/J/H, ETag, byte ranges i odmowy błędnych ownerów
+został wykonany przez HTTP, nie na fixture. Osobny retention.json potwierdza
+70/70 starych plików i oba archiwa bez zmian.
+
+Sterownik pojedynczego Solve ma kontrolę całej odczytanej sceny przed Solve,
+zgodności geometrii/numeracji nośników porównania oraz powiązania komendy,
+scope, runu, tasku i zaakceptowanego ownera. Jawna prerejestracja porównania
+to wyłącznie sanity check względem retained direct, nie niezależna kwalifikacja.
+Pierwsze uruchomienie zatrzymało się na GET antenna_store_busy przed mutacją;
+dodano cztery ograniczone próby wyłącznie GET zgodnie z istniejącym walidatorem.
+Drugie wykonało pojedynczy import skryptu, potwierdzony fidelity.round_trip=verified,
+po czym sterownik zatrzymał się na błędnym oczekiwaniu pola fidelity.status.
+Nie wysłano w tych dwóch uruchomieniach żadnego Solve. Poprawiono odczyt
+i przypięto istniejącą odpowiedź importu SHA114f084b610e826b70cb6066aa364b9d65162652176731a32a4c9584bd1cc80f
+do kontynuacji, bez ponawiania POST importu. Dowody i audyty pozostają zachowane.
+Stan wykonania nowego H i pełnej Universe wymaga dalszego sprawdzenia;
+odbiór E0–E12 nadal1/13. Brak nowego dowodu WebGL, FFT, LLG i reprodukcji publikacji.
+
+
+### 24.10.2026 — rzeczywisty surface Solve, odmowa publikacji i pakiet naprawczy
+
+Wysłano dokładnie jeden Solve po potwierdzeniu fizycznej zgodności sceny.
+Run run-live-743a85ce65a3a257777cb73c1bf4a1c9f7f44563e6fa6b28b10b2651e9d9e5c0,
+task task-52cd4f16fd3b44c32a02519cbc059c1d722070a366adadb153a7c2b555fe7f95,
+attempt attempt-dad534dd37644e01be20a254b8fa75f1.
+Pierwsze trzy zatrzymania sterownika były przed Solve; import wykonano raz,
+ReplaceScene raz. Kontynuacja użyła istniejącej sceny i przypiętej referencji HTTP.
+Różnice readbacku były pomijaniem pustych pól oraz false eigen_include_demag
+dla etapu antenna_field_solve, bez zmiany geometrii, transportu, targetów i policy.
+
+Worker doszedł do bramki publikacji, lecz zakończył się exit1:
+inspection artifact source differs from immutable accepted operation.
+Wspólna bramka study_inspection::validate_accepted_inspection_bytes oczekiwała
+dokładnie starego requested_intent z8polami; producent publikuje9dla direct
+lub11dla surface. Nie ma zaakceptowanego nowego wyniku ani dowodu H przezHTTP.
+Nie przedstawiać przejścia do bramki jako niezależnej kwalifikacji native.
+Pozostało9plików częściowego Zarr, wszystkie zachowano. 70starych plików
+wyniku ponownie sprawdzono: identyczne. Nowy raport actual-surface-trial-failure.json
+SHA34bae3528ca30dbbbd92c7d416238eeab038af82500d7bf8a63c74f8e69d19cc
+w verification/universe-volume-policy-20261023/surface-public-integration-20261024/.
+
+Błąd integralności publikacji spowodował final heartbeat failure schedulera,
+Failed ownera i kontrolowane SIGTERM API. API nie działa. Nie było OOM:
+kontener OOMKilled=false, cgroup oom_kill=0; obserwowany worker około428MiB.
+Trwały task pozostał Running/Reconciling, bez artifact_ids; nie wolno go
+uznać za Completed ani zwolnić ręcznie jego rezerwacji.
+
+Naprawiono tylko wspólną bramkę publikacji: input.validate_field_policy(),
+dokładny intent9direct/11surface, historyczny exact8wyłącznie direct,
+bez usuwania provenance, subset comparison ani pominięcia full verifier.
+ParserRust exit0, niezależny przegląd źródeł bez nowej luki.
+study_inspection.rs SHA6b30fbf2a5afe53b17c3a2342382e73528a4e2d25d24f807457416c05c4e1107.
+
+Managed just docker-dev-recovery-build w tym samym kontenerze zakończony exit0:
+attempt3e406ca83fc74c90a02a72d48084a84b,
+candidate /opt/fullmag/package/.development/candidates/.backend-package-candidate-zjs53twt,
+snapshot65b61dc7b45f26cea733c32a8f1f59cbf32c788c132d68e45176f5e09d688264,
+receipt21fbcca42551d5187b61163498e4a050a162911cf39280453630e5617718c5ed.
+Make205688ms; cache zachowany. Brak promocji i uruchomienia runtime,
+brak kompilacji unit tests. Odrzucony patch recovery nie jest w tym kandydacie.
+Właściwe narzędzia hostowego orkiestratora: istniejące just1.58.0 z
+/home/kking/.local/share/fullmag-tools/just-1.58.0/just oraz
+FULLMAG_STORAGE_PYTHON=/home/kking/.local/bin/python3.
+Wcześniejsze próby z just1.42.4 i domyślnym starym Pythonem zatrzymały się
+przed kompilacją; nie zastąpiono zarządzanej drogi ręcznym buildem.
+
+Recovery starego narzędzia natywnie odmawia:111komend/110zdarzeń,
+ostatni ACK/lease108, końcowy Heartbeat109, pendingNone,
+applied obejmuje wszystkie111komend. Poprzedni wariant dopuszczał jedynie
+applied potwierdzonego prefiksu. Verify-only exit1, request
+cee5edc76fcc559a876908f51f72c2834bd77ef68793a6f6014dcc9a4a07bbef;
+nie wykonano finalizacji, release ani archiwizacji.
+
+Automatyczna kontrola odrzuciła edycję tej granicy recovery jako brakująco
+autoryzowane dopuszczenie applied heartbeat bez trwałego ACK.
+Nie zastosowano patcha ani obejścia. Oddzielny, niezastosowany patch
+SHA34cd8b21e9a5276cd26f7c7743d996470b87a1c739d1e29f737647b3566e5400
+i polski przegląd zapisano w
+/home/kking/git/storage/reviews/antenna-surface-applied-heartbeat-20261024/.
+Wysłano jedno konkretne pytanie o ten patch i finalizację tej jednej próby,
+wyjaśniając odmowę mimo prośby o nieponawianie pytań.
+Wymagany po zgodzie: managedbuild, exact native verify-only i odmowy
+zmienionych wejść, następnie istniejące Failed/DoNotRetry/release/archive.
+Nie dopisywać ACK, nie cofać inboxu, nie uruchamiać automatycznie Solve.
+
+E0–E12 pozostaje1/13. Pełna Universe, zaakceptowane surfaceV/J/H, coldimport,
+WebGL oraz reprodukcja publikacji są nadal niezweryfikowane.
+
+## Utrwalenie regresji Airbox i korekta statusu Spectrum — 24.10.2026
+
+Dopisano trwałe przypadki w istniejącym
+apps/control-room/src/modules/viewport-3d/model/viewport3DFieldDataPlan.test.ts:
+c0/Frobenius nie żądają glyphów, spin_flow_y zachowuje polaryzację mimo
+wejściowego zapytania full, a brak/duplikat uprawnienia i obcy układ osi
+dają pusty plan. Lint pliku exit 0; **nie kompilowano ani nie uruchamiano
+Vitest**. Dowód wykonania funkcji produkcyjnej pozostaje osobnym wcześniejszym
+sprawdzeniem 84/84 w wolumenie frontendu. Zmiana testów nie zamyka WebGL.
+
+Aktualne źródła korygują historyczny opis E9b: loader equilibrium istnieje
+w torze skryptowym. crates/fullmag-cli/src/orchestrator.rs::
+execute_antenna_spectrum_requests wywołuje load_verified_antenna_equilibrium
+oraz compute_antenna_source_spectrum_with_equilibrium. Prywatny
+VerifiedAntennaEquilibriumContext i odmowa transverse bez niego pozostają.
+Jest to stan kodu, bez nowego dowodu wykonania i bez kwalifikacji Study.
+
+Rzeczywista luka E9 to typowana operacja accepted Study:
+crates/fullmag-authoring/src/study_contract.rs::StudyStepKind nie ma Spectrum;
+scene_study_plan.rs::scene_document_to_study_plan zachowuje nierozpoznany
+stage jako Unsupported. Brakuje dispatch w
+crates/fullmag-api/src/accepted_study_worker.rs::execute_accepted_worker_start
+oraz codec/portu w crates/fullmag-application/src/study_artifact.rs::
+DecodedStudyArtifact i decode_study_artifact. Istniejące
+ScriptExecutionStageAction::AntennaSourceSpectrum,
+ResolvedScriptStageAction::AntennaSourceSpectrum oraz
+materialize_pipeline_antenna_source_spectrum nie dowodzą tej integracji.
+
+Kompletne połączenie ma użyć istniejącego request_id i przypiętej qualified
+field basis, rozwiązanej dopiero z trwałego Completed producenta oraz
+manifest/CAS, istniejącego FFT i atomowej publikacji, z weryfikacją
+request/source/carrier w codec oraz cold-load. Bramka
+crates/fullmag-plan/src/antenna_field_solve.rs::
+plan_antenna_field_solve_execution nadal odrzuca odwołania Spectrum do
+conservative_current_source inspection. Nie zniesiono tej odmowy ani nie
+dodano pustego wariantu enum jako pozornego ukończenia funkcji.
+
+Stan usług ponownie potwierdzony: ten sam backend running/unhealthy,
+frontend running/healthy, oba bez OOM; terminalny process-tree SHA256
+c1da239cd9af4422c86a1e4b14a875b268932c31096f29229737d822b4fda015,
+failed_outcome_retained, API exit -15. Brak nowej próby recovery, startu lub
+Solve. Nie ponawiano pytania o zgodę; konkretne pytanie po automatycznej
+odmowie pozostaje otwarte.
+
+## Audyt trwałej blokady wykonania — 24.10.2026
+
+Poprzednia kontynuacja przyniosła postęp: trwałe regresje Airbox i korektę
+mapy Spectrum. Obecny odczyt nie wykazał zmiany zewnętrznej: backend nadal
+unhealthy, frontend healthy, ten sam terminalny process-tree SHA256
+c1da239cd9af4422c86a1e4b14a875b268932c31096f29229737d822b4fda015,
+API exit -15, brak OOM. Odrzucony patch recovery nadal niezastosowany.
+Nie ma aktywnego buildu ani procesu symulacji, na który należałoby czekać.
+
+Ta sama odmowa zmiany bramki applied heartbeat bez trwałego ACK występuje
+w trzech kolejnych turach celu. Zakończono niezależne kontrole bieżącej
+poprawki: managed build, codegen, 84 fixture checks, pomocnicze typecheck,
+lint i hygiene. Nie zamykają one publicznego runtime ani UI. Dalszy
+wymagany ciąg to dokładnie zatwierdzone recovery jednej błędnej próby,
+przywrócenie API, walidacja publikacji oraz próba Universe; nie wolno
+zastępować go kolejnym fixture ani promować inspection do bazy FFT/LLG.
+Brak rozstrzygnięcia konkretnej zgody pozostawia zadanie zablokowane.
+
+Następny krok po jednoznacznym zatwierdzeniu patcha
+34cd8b21e9a5276cd26f7c7743d996470b87a1c739d1e29f737647b3566e5400:
+managed build, świeżo przypięty native verify-only i negatywne kontrole;
+wyłącznie potem finalizacja tej jednej próby Failed/DoNotRetry,
+zwolnienie jej rezerwacji i zarządzane odtworzenie API bez automatycznego
+Solve. Wyniki, historia, index i cache pozostają zachowane.
+Odbiór E0–E12 pozostaje 1/13; nie zgłoszono ukończenia celu.
+
+
+### Weryfikacja zależności po integracji mastera — 25.10.2026
+
+Master `28f4fcf5bba4387025944b8fb276c94b3eef5eb5` jest przodkiem HEAD `250a7728ba7c24cb96d20468ae3fa457a860d555`; bieżący remote master potwierdzono przez Git. Zachowano lokalne WIP, indeks pozostał pusty.
+
+Zarządzane `just docker-dev-control-checks <worktree> all <przypięty-wheel>` zakończyło się kodem 0: 1201 testów w 83,682 s, 24 pominięte. Wcześniej 42 kontrole obsługi argumentu i dyspozytora również przeszły. Jawny wheel mpmath 1.3.0 pochodzi z wolumenu kontrolnego grupy; jego SHA256 i źródłowy pin są sprawdzane przed i po testach. Nie instalowano zależności globalnie ani nie zmieniano tolerancji oracle. Receipt: `verification/interpreted-checks.json`.
+
+To dowód kontroli interpretowanych, nie kwalifikacji naukowej ani WebGL. Build pakietu po scaleniu przeszedł wcześniej; API pozostaje wyłączone, a oba proponowane patche recovery pozostają niezastosowane po odmowie automatycznej kontroli. Nie uruchomiono nowego Solve.
+
+
+Niezależny przegląd czterech plików ścieżki oracle-wheel nie wykazał błędów wymagających poprawki. Zakres i ograniczenia zapisano w wolumenie kontrolnym jako `verification/oracle-wheel-route-20261025/review-pl.json`. Ochrona przed zwykłymi zmianami współbieżnymi nie jest izolacją od wrogiego procesu; nie deklarujemy takiej gwarancji. Źródłowa analiza replayu potwierdziła, że wymóg szczególnego raportu awarii z zakazem ponowienia przesłania ogólną gałąź Failed. Żadnego patcha recovery nie zastosowano.
+
+Stan runtime potwierdzono odczytem `/opt/fullmag/runtime-control/runtime-service/process-tree.json`: `failed_outcome_retained`, SHA256 `c1da239cd9af4422c86a1e4b14a875b268932c31096f29229737d822b4fda015`. Lista procesów nie zawiera API ani workera obliczeń.

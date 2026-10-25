@@ -23,12 +23,18 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[path = "accepted_worker_execution_receipt.rs"]
+mod accepted_worker_execution_receipt;
+use accepted_worker_execution_receipt::{
+    worker_execution_identity_from_plan, WorkerExecutionReceiptIdentity,
+    WorkerExecutionStartedReceipt, WORKER_EXECUTION_RECEIPT_SCHEMA,
+    WORKER_EXECUTION_STARTED_RECEIPT,
+};
+
 const RUNNER_INITIAL_STATE_FILE: &str = "m_initial.json";
 pub(crate) const RUNNER_FINAL_STATE_FILE: &str = "m_final.json";
-const WORKER_EXECUTION_STARTED_RECEIPT: &str = "worker_execution_started.v1.json";
 const WORKER_PRELAUNCH_FAILED_RECEIPT: &str = "worker_prelaunch_failed.v1.json";
 const WORKER_EXECUTION_COMPLETED_RECEIPT: &str = "worker_execution_completed.v1.json";
-const WORKER_EXECUTION_RECEIPT_SCHEMA: &str = "fullmag.accepted_worker_execution.v1";
 
 // Live observation channel (accepted worker -> current-live projector).
 //
@@ -833,34 +839,6 @@ struct WorkerControlLoopResult {
     acknowledged_heartbeat_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct WorkerExecutionReceiptIdentity {
-    schema_version: String,
-    claim: fullmag_application::TaskClaim,
-    start_message_id: String,
-    start_sequence: u64,
-    case_id: String,
-    plan_fingerprint: String,
-}
-
-impl WorkerExecutionReceiptIdentity {
-    fn matches_same_attempt(&self, current: &Self) -> bool {
-        self.schema_version == current.schema_version
-            && self.claim.is_same_or_renewed_by(&current.claim)
-            && self.start_message_id == current.start_message_id
-            && self.start_sequence == current.start_sequence
-            && self.case_id == current.case_id
-            && self.plan_fingerprint == current.plan_fingerprint
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerExecutionStartedReceipt {
-    identity: WorkerExecutionReceiptIdentity,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerPrelaunchFailedReceipt {
@@ -1415,18 +1393,7 @@ fn worker_execution_receipt_identity(
     accepted_step: &AcceptedWorkerStep,
     case_id: &str,
 ) -> Result<WorkerExecutionReceiptIdentity> {
-    let plan_fingerprint = fullmag_session::canonical_json_sha256(
-        &serde_json::to_value(&accepted_step.execution_plan)
-            .context("serialize accepted worker execution plan for receipt")?,
-    );
-    Ok(WorkerExecutionReceiptIdentity {
-        schema_version: WORKER_EXECUTION_RECEIPT_SCHEMA.into(),
-        claim: accepted_step.claim.clone(),
-        start_message_id: start.message_id.clone(),
-        start_sequence: start.sequence,
-        case_id: case_id.to_owned(),
-        plan_fingerprint,
-    })
+    worker_execution_identity_from_plan(start, &accepted_step.claim, &accepted_step.execution_plan, case_id)
 }
 
 fn accepted_state_ref_from_runner_snapshot(
@@ -2888,11 +2855,11 @@ fn execute_accepted_closed_loop_worker_start(
     write_immutable_attempt_receipt(&attempt,WORKER_EXECUTION_STARTED_RECEIPT,&WorkerExecutionStartedReceipt {identity:identity.clone()})?;
     let mut storage=prepare_accepted_project_storage(&accepted_step.problem,store,accepted,accepted_step,&identity,&attempt)?;
     let execution:Result<AcceptedRunnerExecution>=(|| {
-        let artifacts=match fullmag_runner::execute_antenna_closed_loop_inspection(&input,&requested_execution,&output_id,interrupt_requested) {
+        let artifacts=match fullmag_runner::execute_antenna_closed_loop_inspection_typed(&input,&requested_execution,&output_id,interrupt_requested) {
             Ok(artifacts)=>artifacts,
             Err(_error) if interrupt_requested.is_some_and(|flag|flag.load(Ordering::Acquire))=>return Ok(AcceptedRunnerExecution {
         terminal_publication: None,status:RunStatus::Cancelled,completed_step_count:0,outputs:vec![],attempt_output_dir:attempt.clone(),recovered_from_receipt:false,accepted_state_ref:None,observation_source:None}),
-            Err(error)=>return Err(anyhow::anyhow!(error.to_string())).context("execute canonical full-volume inspection"),
+            Err(error)=>return Err(anyhow::Error::new(error)).context("execute canonical full-volume inspection"),
         };
         let manifest_path=format!("antenna/field_solutions/{output_id}/manifest.v2.json");
         let mut manifest=None;let mut payloads=BTreeMap::new();let mut total=0usize;
@@ -3606,8 +3573,17 @@ fn apply_accepted_start_effect(
         &accepted_step,
         "default",
         Some(&control.interrupt_requested),
-    )
-    .context("execute accepted worker Start")?;
+    );
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) if error.chain().any(|cause| matches!(
+            cause.downcast_ref::<fullmag_runner::ClosedLoopExecutionError>(),
+            Some(fullmag_runner::ClosedLoopExecutionError::NativeCallFailed { .. })
+        )) => {
+            return publish_native_call_failure(store, claim, control, error);
+        }
+        Err(error) => return Err(error).context("execute accepted worker Start"),
+    };
     if execution.status == RunStatus::Cancelled {
         let control_result = finish_worker_control(store, claim, control)?;
         return publish_worker_stopped(store, claim, control_result);
@@ -3739,6 +3715,59 @@ fn apply_accepted_start_effect(
             receipt_recovered_before_publication: true,
         },
     ))
+}
+
+/// Freeze new heartbeats with the existing Completing barrier, drain every
+/// prior control command, then publish failure. Terminal events forbid ACKs.
+fn publish_native_call_failure(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    control: WorkerControlLoop,
+    error: anyhow::Error,
+) -> Result<AcceptedWorkerProcessOutcome> {
+    {
+        let _transaction = retry_store_writer_busy(|| store.write_transaction())?;
+        let recovered = fullmag_runtime_control::recover_coordinator(store, claim)?;
+        let mut coordinator =
+            fullmag_application::DurableWorkerCoordinator::new(recovered.coordinator);
+        match coordinator.phase() {
+            fullmag_application::CoordinatorPhase::Stopping => {}
+            fullmag_application::CoordinatorPhase::Running => {
+                commit_worker_event(store, &mut coordinator,
+                    fullmag_application::WorkerEvent::Completing)?;
+            }
+            _ => bail!("native failure barrier requires the exact running or stopping claim"),
+        }
+    }
+    let control_result = finish_worker_control(store, claim, control)?;
+    if control_result.stop_received {
+        return publish_worker_stopped(store, claim, control_result);
+    }
+    let stopped = {
+        let _transaction = retry_store_writer_busy(|| store.write_transaction())?;
+        let recovered = fullmag_runtime_control::recover_coordinator(store, claim)?;
+        let mut coordinator =
+            fullmag_application::DurableWorkerCoordinator::new(recovered.coordinator);
+        match coordinator.phase() {
+            fullmag_application::CoordinatorPhase::Stopping => true,
+            fullmag_application::CoordinatorPhase::Running => {
+                commit_worker_event(store, &mut coordinator,
+                    fullmag_application::WorkerEvent::Failed {
+                        retryable: false, reason: format!("{error:#}"),
+                    })?;
+                false
+            }
+            _ => bail!("native failure publication requires the exact running or stopping claim"),
+        }
+    };
+    if stopped {
+        let interrupt = AtomicBool::new(false);
+        let consumed = consume_worker_control_commands(store, claim, &interrupt)?;
+        return publish_worker_stopped(store, claim, consumed);
+    }
+    // The process remains unsuccessful. Only its fenced terminal report and
+    // the supervisor's reaped-child proof permit release of this allocation.
+    Err(error).context("reported nonretryable prepared native failure")
 }
 
 fn finish_worker_control(
@@ -3916,10 +3945,12 @@ fn consume_worker_control_commands_with_inbox(
                 inbox
                     .receive(&command, |_| Ok(()))
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let recovered_after_apply = retry_store_writer_busy(|| {
+                // Keep recovery, duplicate detection, and ACK publication under
+                // one writer fence so Completing cannot stale this watermark.
+                let _transaction = retry_store_writer_busy(|| store.write_transaction())?;
+                let recovered_after_apply =
                     fullmag_runtime_control::recover_coordinator(store, claim)
-                })
-                .context("recover coordinator before worker HeartbeatAck")?;
+                        .context("recover coordinator before worker HeartbeatAck")?;
                 if !recovered_after_apply.events.iter().any(|event| {
                     matches!(
                         &event.event,
@@ -4816,5 +4847,70 @@ mod accepted_worker_claim_retry_tests {
 
         assert_eq!(attempts, 1, "durable cancellation must stop before retry");
         assert!(format!("{error:#}").contains("cancelled by durable task cancellation"));
+    }
+}
+
+
+#[cfg(test)]
+mod native_failure_protocol_tests {
+    use fullmag_application::{
+        CoordinatorPhase, ResourceBudget, ResourceKind, ResourceLease, RunId,
+        TaskLifecycle, TaskRecord, WorkerCoordinator, WorkerEvent, WorkerEventEnvelope,
+        WORKER_PROTOCOL_SCHEMA,
+    };
+
+    fn running() -> WorkerCoordinator {
+        let mut task = TaskRecord::new(RunId::parse("run-native-failure-contract").unwrap(), "a".repeat(64)).unwrap();
+        task.queue().unwrap();
+        let claim = task.claim(ResourceLease::new("cpu-native-failure", ResourceKind::Cpu,
+            ResourceBudget { cpu_millis: 1000, memory_bytes: 1024, gpu_memory_bytes: 0, storage_bytes: 1024 },
+        ).unwrap()).unwrap();
+        task.begin_running(&claim).unwrap();
+        WorkerCoordinator::new(task, claim).unwrap()
+    }
+
+    fn event(coordinator: &WorkerCoordinator, sequence: u64, event: WorkerEvent) -> WorkerEventEnvelope {
+        WorkerEventEnvelope {
+            schema_version: WORKER_PROTOCOL_SCHEMA.into(),
+            message_id: format!("native-failure-event-{sequence}"), sequence,
+            claim: coordinator.claim().identity(), event,
+        }
+    }
+
+    #[test]
+    fn completing_drains_pending_heartbeat_before_terminal_failure() {
+        let mut coordinator = running();
+        let heartbeat = coordinator.heartbeat().unwrap();
+        let sequence = coordinator.claim().lease.heartbeat_sequence;
+        let completing = event(&coordinator, 1, WorkerEvent::Completing);
+        coordinator.accept_event(completing.clone()).unwrap();
+        assert_eq!(coordinator.phase(), CoordinatorPhase::Running);
+        let ack = event(&coordinator, 2, WorkerEvent::HeartbeatAck { lease_heartbeat_sequence: sequence });
+        coordinator.accept_event(ack.clone()).unwrap();
+        let failed = event(&coordinator, 3, WorkerEvent::Failed { retryable: false, reason: "returned native error".into() });
+        coordinator.accept_event(failed.clone()).unwrap();
+        assert_eq!(coordinator.task().lifecycle, TaskLifecycle::Failed);
+        let restored = WorkerCoordinator::restore(coordinator.checkpoint(), &[heartbeat], &[completing, ack, failed]).unwrap();
+        assert_eq!(restored.phase(), CoordinatorPhase::Terminal);
+        let late = event(&coordinator, 4, WorkerEvent::HeartbeatAck { lease_heartbeat_sequence: sequence });
+        assert!(coordinator.accept_event(late).is_err());
+    }
+
+    #[test]
+    fn stop_winning_either_failure_fence_remains_cancellation() {
+        for completing_first in [false, true] {
+            let mut coordinator = running();
+            let mut next = 1;
+            if completing_first {
+                coordinator.accept_event(event(&coordinator, next, WorkerEvent::Completing)).unwrap();
+                next += 1;
+            }
+            coordinator.stop("operator stop").unwrap();
+            assert_eq!(coordinator.phase(), CoordinatorPhase::Stopping);
+            coordinator.accept_event(event(&coordinator, next, WorkerEvent::Stopped)).unwrap();
+            assert_eq!(coordinator.task().lifecycle, TaskLifecycle::Cancelled);
+            assert!(coordinator.accept_event(event(&coordinator, next + 1,
+                WorkerEvent::Failed { retryable: false, reason: "late native failure".into() })).is_err());
+        }
     }
 }

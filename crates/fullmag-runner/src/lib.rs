@@ -39,7 +39,7 @@ mod antenna_field_solution;
 mod antenna_spectrum;
 mod antenna_stage;
 pub use antenna_field_solution::{
-    execute_antenna_closed_loop_inspection, verify_antenna_closed_loop_inspection_bytes,
+    execute_antenna_closed_loop_inspection, execute_antenna_closed_loop_inspection_typed, ClosedLoopExecutionError, KnownNativeCallFailure, verify_antenna_closed_loop_inspection_bytes,
     load_antenna_closed_loop_inspection_bytes,
     load_published_antenna_closed_loop_inspection, LoadedAntennaClosedLoopInspection,
     load_antenna_field_solution_samples, load_antenna_field_solution_samples_for_spectrum,
@@ -613,10 +613,10 @@ pub fn frozen_spins_runtime_status_for_backend_plan(
 
 // Public re-exports (unchanged API surface).
 pub use capabilities::{
-    resolve_quantity_capability, scratch_authoring_capabilities, BackendCapabilities,
+    resolve_quantity_capability, resolve_quantity_projection_capabilities, scratch_authoring_capabilities, BackendCapabilities,
     FeatureCapability, FeatureCapabilityStatus, FieldCarrierDescriptor, FieldPayloadState,
     QuantityMaterializationCapability, QuantityProviderCapability, QuantityProviderRegistrySource,
-    QuantityPublicationCapability, QuantityRenderCapability, QuantityRequestCapability,
+    QuantityProjectionCapability, QuantityPublicationCapability, QuantityRenderCapability, QuantityRequestCapability,
     ResolvedQuantityCapability, ResolvedQuantityCapabilityContext,
     ResolvedQuantityProviderRegistry, RuntimeEngineId, MIXED_P1_FEATURE_CAPABILITY_IDS,
     MIXED_P1_MESH_FEATURE_CAPABILITY_IDS,

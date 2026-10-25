@@ -135,5 +135,82 @@ class RetainedRT0FitTests(unittest.TestCase):
             self.assertNotEqual(expected, rounded)
 
 
+
+class RetainedRT0FieldTests(unittest.TestCase):
+    vertices = ((0., 0., 0.), (1., 0., 0.), (0., 1., 0.), (0., 0., 1.))
+
+    def evaluate(self, vertices=None, data=None, target=(0., 0., 0.)):
+        from antenna_rt0_surface_oracle import evaluate_retained_rt0
+        return evaluate_retained_rt0(vertices or self.vertices,
+                                    data if data is not None else ((1., -2., 3.),) * 4, target)
+
+    def assert_field(self, result, expected):
+        import math
+        values = tuple(float(x) for x in result['h_xyz_apm'])
+        gate = 4096 * math.ulp(1.) * (1 + math.hypot(*expected))
+        self.assertLessEqual(math.hypot(*(a-b for a, b in zip(values, expected))), gate)
+        self.assertEqual(result['qualification'], 'NOT VERIFIED')
+        self.assertLessEqual(float(result['local_precision_error_apm']), float(result['precision_budget_apm']))
+        self.assertLessEqual(float(result['local_formula_error_apm']), float(result['precision_budget_apm']))
+        self.assertEqual(len(result['faces']), 4)
+
+    def test_vertex_closed_form_and_scalar_slope(self):
+        # The octant solid angle gives integral grad(1/R)=(-pi/6,)*3.
+        expected = (5/24, -2/24, -3/24)
+        for slope in (0., .75):
+            with self.subTest(slope=slope):
+                data = tuple(tuple(a+slope*x for a, x in zip((1., -2., 3.), p)) for p in self.vertices)
+                self.assert_field(self.evaluate(data=data), expected)
+
+    def test_current_sign_amplitude_and_geometry_scale(self):
+        for factor in (-2., .5):
+            for length in (2.**-20, 1., 2.**20):
+                with self.subTest(factor=factor, length=length):
+                    vertices = tuple(tuple(length*x for x in p) for p in self.vertices)
+                    data = ((factor, -2*factor, 3*factor),) * 4
+                    self.assert_field(self.evaluate(vertices, data), tuple(factor*length*x/24 for x in (5., -2., -3.)))
+
+    def test_roundoff_indicator_requires_high_precision_below_kappa_limit(self):
+        import math
+        result = self.evaluate(data=((2.**45, 0., 0.),) * 4, target=(1056.,) * 3)
+        low = result['passes'][0]
+        indicator = float(result['binary64_roundoff_indicator_apm'])
+        expected = 64 * math.ulp(1.) * math.fsum(math.hypot(*(float(x) for x in row))
+                                               for row in low['local_h_xyz_apm'])
+        self.assertAlmostEqual(indicator, expected)
+        self.assertLess(float(low['cancellation']), 1e8)
+        self.assertGreater(indicator, float(result['precision_budget_apm']))
+        self.assertTrue(result['binary64_requires_highprecision'])
+
+    def test_nonzero_target_even_permutation_preserves_field(self):
+        target = (.125, .1875, .25)
+        data = tuple(tuple(a+.75*x for a, x in zip((1., -2., 3.), p)) for p in self.vertices)
+        baseline = self.evaluate(data=data, target=target)
+        order = (1, 2, 0, 3)
+        other = self.evaluate(tuple(self.vertices[i] for i in order), tuple(data[i] for i in order), target)
+        self.assert_field(other, tuple(float(x) for x in baseline['h_xyz_apm']))
+
+    def test_shared_exhausted_budget_is_not_reset(self):
+        from antenna_triangle_surface_oracle import Budget, LIMITS, Refusal
+        from antenna_rt0_surface_oracle import evaluate_retained_rt0
+        budget = Budget()
+        budget.counts['pairs'] = LIMITS['pairs_case']
+        with self.assertRaisesRegex(Refusal, 'analytic pair limit'):
+            evaluate_retained_rt0(self.vertices, ((1., -2., 3.),) * 4, (0., 0., 0.), budget)
+        self.assertGreater(budget.counts['pairs'], LIMITS['pairs_case'])
+
+    def test_zero_current_has_zero_field(self):
+        result = self.evaluate(data=((0., 0., 0.),) * 4)
+        self.assert_field(result, (0., 0., 0.))
+        self.assertEqual(tuple(float(x) for x in result['h_xyz_apm']), (0., 0., 0.))
+
+    def test_invalid_target_and_non_rt0_current_are_refused(self):
+        for target in ((0., 0.), (True, 0., 0.), (0., float('nan'), 0.), (0., 0., float('inf'))):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                self.evaluate(target=target)
+        bad = ((1., -2., 3.), (2., -2., 3.), (1., 0., 3.), (1., -2., 6.))
+        with self.assertRaisesRegex(ValueError, 'RT0 residual'):
+            self.evaluate(data=bad)
+
 if __name__ == '__main__':
     unittest.main()

@@ -55,8 +55,8 @@ docker-dev-stop-unadmitted attempt config_sha256 source_root backend_container_i
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" stop-unadmitted --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --backend-container-id {{quote(backend_container_id)}} --frontend-container-id {{quote(frontend_container_id)}} --image-id {{quote(image_id)}} --failure-marker-sha256 {{quote(failure_marker_sha256)}} --process-receipt-sha256 {{quote(process_receipt_sha256)}} --source-sha256 {{quote(source_sha256)}} --request-id {{quote(request_id)}} --session-id {{quote(session_id)}}
 
 # Interpreted launcher/cache regressions run inside the selected fixed backend.
-docker-dev-control-checks source_root scope="all":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_checks.py" --source-root {{quote(source_root)}} --scope {{quote(scope)}}
+docker-dev-control-checks source_root scope="all" oracle_wheel="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_checks.py" --source-root {{quote(source_root)}} --scope {{quote(scope)}}{{if oracle_wheel == "" { "" } else { " --oracle-wheel " + quote(oracle_wheel) }}}
 
 # Build a repair candidate in the existing Failed backend; never restart or promote it.
 docker-dev-recovery-build source_root backend_container_id image_id process_receipt_sha256 owner_sha256 superseded_candidate_basename="" superseded_marker_sha256="" superseded_receipt_sha256="" superseded_make_attempt_sha256="" resume_attempt="" resume_terminal_sha256="":
@@ -86,8 +86,8 @@ docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend=
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" resume-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} {{if restart_backend == "true" { "--restart-backend" } else if restart_backend == "false" { "" } else { error("restart_backend must be true or false") }}}{{if prestart_reconciliation == "" { if prestart_reconciliation_sha256 == "" { "" } else { error("prestart recovery requires both pins") } } else if prestart_reconciliation_sha256 == "" { error("prestart recovery requires both pins") } else { " --prestart-reconciliation " + quote(prestart_reconciliation) + " --prestart-reconciliation-sha256 " + quote(prestart_reconciliation_sha256) }}}
 
 # Reconcile only the existing unknown iteration; no backend/frontend lifecycle.
-docker-dev-reconcile-iteration request request_sha256 source_root port="3197":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_reconcile.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}
+docker-dev-reconcile-iteration request request_sha256 source_root port="3197" preview="false":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_reconcile.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}{{if preview == "true" { " --preview" } else if preview == "false" { "" } else { error("preview must be true or false") }}}
 
 # Confirm one interrupted development only; preview never changes its native receipt.
 docker-dev-reconcile-development request request_sha256 source_root apply="false":

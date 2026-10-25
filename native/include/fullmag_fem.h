@@ -1445,6 +1445,61 @@ FULLMAG_FEM_API int fullmag_fem_solve_prepared_closed_loop_rt0_oersted_v2(
     fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source);
 
 
+/* Additive inspection-only surface RT0 ABI. All numeric limits are caller-owned. */
+#define FULLMAG_FEM_SURFACE_RT0_ABI_VERSION 1u
+#define FULLMAG_FEM_SURFACE_RT0_WORK_KIND_COUNT 14u
+typedef struct {
+    uint64_t total[14], per_target[14];
+    uint64_t maximum_raw_integer_bits, maximum_reduced_fraction_bits;
+    uint64_t maximum_lifetime_peak_rss_bytes, guard_interval_events;
+    double maximum_total_seconds, maximum_target_seconds;
+} fullmag_fem_surface_rt0_work_limits_v1;
+typedef struct {
+    double absolute_field_apm, relative_field, cancellation_floor_apm;
+    double scalar_relative_80, scalar_relative_120;
+    double angle_relative_80, angle_relative_120;
+    double binary_scalar_epsilon_factor, binary_roundoff_epsilon_factor;
+    double binary_cancellation_limit, highprecision_cancellation_limit;
+} fullmag_fem_surface_rt0_tolerances_v1;
+typedef struct {
+    fullmag_fem_surface_rt0_work_limits_v1 work_limits;
+    fullmag_fem_surface_rt0_tolerances_v1 tolerances;
+    const char *policy_version;
+} fullmag_fem_surface_rt0_options_v1;
+typedef struct {
+    uint32_t abi_version, reserved_flags;
+    uint64_t struct_size;
+    fullmag_fem_prepared_closed_loop_request_v2 rt0;
+    const double *target_points_xyz;
+    uint64_t target_points_xyz_len;
+    fullmag_fem_surface_rt0_options_v1 options;
+} fullmag_fem_prepared_closed_loop_rt0_surface_request_v1;
+typedef struct {
+    uint32_t abi_version, reserved_flags;
+    uint64_t struct_size;
+    fullmag_fem_steady_transport_rt0_result_v1 rt0;
+    double *h_xyz_apm;
+    uint64_t h_xyz_apm_capacity, h_xyz_apm_len;
+    uint8_t *evidence_json;
+    uint64_t evidence_json_capacity, evidence_json_len;
+    char error_message[256];
+} fullmag_fem_prepared_closed_loop_rt0_surface_result_v1;
+#if defined(__cplusplus) && INTPTR_MAX == INT64_MAX
+static_assert(sizeof(fullmag_fem_surface_rt0_work_limits_v1) == 272, "surface limits ABI");
+static_assert(sizeof(fullmag_fem_surface_rt0_tolerances_v1) == 88, "surface tolerances ABI");
+static_assert(sizeof(fullmag_fem_surface_rt0_options_v1) == 368, "surface options ABI");
+static_assert(sizeof(fullmag_fem_prepared_closed_loop_rt0_surface_request_v1) == 1008, "surface request ABI");
+static_assert(sizeof(fullmag_fem_prepared_closed_loop_rt0_surface_result_v1) == 2072, "surface result ABI");
+static_assert(offsetof(fullmag_fem_prepared_closed_loop_rt0_surface_result_v1, evidence_json) == 1792, "surface evidence pointer ABI");
+#endif
+FULLMAG_FEM_API int fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1(
+    const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
+    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source);
+
+
+
 typedef struct {
     uint32_t abi_version;
     uint32_t reserved_flags;

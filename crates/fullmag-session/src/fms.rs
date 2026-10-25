@@ -414,9 +414,9 @@ fn pack_fms_inner<W: Write + Seek>(
     }
 
     if let Some(provenance) = provenance {
-        let blob_opts = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)
-            .large_file(true);
+        // Accepted CAS also contains text inputs and JSON scientific bundles.
+        // Preserve the selected archive profile instead of forcing Stored.
+        let blob_opts = fopts.large_file(true);
         for object in &provenance.cas_objects {
             if cas_entries
                 .iter()

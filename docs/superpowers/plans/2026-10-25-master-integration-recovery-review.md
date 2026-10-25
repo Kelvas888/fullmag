@@ -1,0 +1,212 @@
+# Przegląd integracji mastera i dwóch blokad recovery — 25.10.2026
+
+To przegląd operacyjny lokalnej grupy, nie kwalifikacja naukowa ani zgoda
+na automatyczne ponowienie Solve.
+
+## Zakończona integracja
+
+- origin/master: 28f4fcf5bba4387025944b8fb276c94b3eef5eb5.
+- Merge na gałęzi anten: 250a7728ba7c24cb96d20468ae3fa457a860d555.
+- Rozwiązano 28 konfliktów commitów i 6 konfliktów odtwarzanego WIP.
+- Stash 26a563993c1914aea4c81d5a41d0f7ccd1e3fbdd i kopia kontrolna pozostają.
+  Wszystkie 16 pierwotnych nieśledzonych plików są zachowane bajtowo.
+- Managed build: exit 0, attempt 3898ce004d0a4400b1cae74df1ec7670,
+  make 1228287 ms. Snapshot:
+  1f22c9a855da6660de8c56d4a4a2f36404e5f435f65dc99bd8a1a78bc05f7b75.
+- Pakiet promowany bez startu runtime: receipt
+  84fcc386709def983cc3f3aaf6c42665012bea991e10920ec3d5883f632eb0e8.
+  Poprzedni pakiet zachowano jako rollback.
+- Managed OpenAPI/TypeScript codegen exit 0, Python generator check bez driftu.
+  Pomocniczy typecheck po codegenie i lint pięciu warstw viewportu exit 0.
+- 84 sprawdzenia funkcji projekcji PASS. Sam merge: 1181 testów
+  interpretowanych PASS, 24 pominięte. Po przywróceniu WIP domyślna recepta
+  wykonała 1195 testów, ale miała 12 błędów brakującego mpmath. Osobne
+  19 testów oracle z jawnym, wcześniej przypiętym wheelem PASS.
+  Domyślnej recepty bez zależności po WIP nie oznaczono jako zielonej.
+  Następnie wdrożono jawny argument przypiętego wheela w tej samej
+  zarządzanej recepcie: 1201 testów PASS w 83,682 s, 24 pominięte,
+  exit 0. 42 kontrole skoncentrowane PASS; niezależny przegląd nie
+  wykazał błędów wymagających poprawki. Nie instalowano mpmath globalnie.
+- 70/70 plików wyników i oba archiwa FMS zachowane bez zmian.
+- API pozostaje wyłączone. Nie uruchomiono nowego Solve. WebGL i pełna mapa
+  Universe pozostają niezweryfikowane. Odbiór E0–E12 nadal 1/13.
+
+## A. Zastosowany heartbeat bez trwałego ACK
+
+Plik: crates/fullmag-api/src/failed_worker_recovery.rs.
+
+Dokładny przygotowany patch SHA256:
+34cd8b21e9a5276cd26f7c7743d996470b87a1c739d1e29f737647b3566e5400.
+
+Propozycja dopuszcza dodatkowy stan inbox: wszystkie komendy zastosowane,
+pending=None, dokładnie jeden końcowy Heartbeat109 bez trwałego ACK, podczas
+gdy lease i ostatni ACK mają sekwencję108. Nie dopisuje ACK ani nie cofa inboxu.
+Zachowane muszą pozostać wszystkie piny, wcześniejsze ACK, brak ukończonego
+wyniku, Failed/DoNotRetry oraz zwolnienie dopiero po trwałej finalizacji.
+
+Ryzyko: zmiana granicy integralności recovery dopuszcza stan, którego obecna
+bramka nie akceptuje. Automatyczna kontrola odrzuciła jej zapis jako brak
+jednoznacznej zgody na tę konkretną zmianę. Patch pozostaje niezastosowany.
+
+Pełny wcześniejszy przegląd:
+ /home/kking/git/storage/reviews/antenna-surface-applied-heartbeat-20261024/przeglad-pl.md.
+
+## B. Zwykły terminalny błąd a raport native failure
+
+Plik: crates/fullmag-api/src/accepted_study_supervisor.rs,
+reconcile_durable_worker_exit_before_spawn.
+
+Dokładny przygotowany patch SHA256:
+ee8fc87ec3227290e2a53a153c439497d3993be6d409880ae886da7b8a74f98c.
+
+Po połączeniu zmian każdy Failed w gałęzi już Released lease wymaga raportu
+native failure, zanim dotrze do istniejącej obsługi zwykłego błędu z mastera.
+Propozycja używa Some(decision) do wejścia w wyspecjalizowany replay.
+None pozwala przejść do zwykłej obsługi; Err nadal odmawia. Dla rozpoznanego
+raportu zachowane są jego walidacje i dokładny trwały DoNotRetry.
+
+Ryzyko: zmienia to warunek replayu Failed bez raportu native. Automatyczna
+kontrola odrzuciła zapis jako osobną zmianę bramki recovery, której nie
+obejmuje samo polecenie integracji mastera. Nie zmieniono źródła nadzorcy.
+Po zatwierdzeniu nadal wymagane są regresje odróżniające zwykły błąd,
+poprawny raport, brak DoNotRetry i raport niepoprawny.
+
+Patch i przegląd w wolumenie kontrolnym:
+ verification/master-integration-20261025-28f4fcf5/supervisor-replay-proposal.patch
+ verification/master-integration-20261025-28f4fcf5/przeglad-replay-pl.md.
+
+## Ściśle ograniczona operacja po zatwierdzeniu
+
+1. Zastosować zatwierdzone poprawki, zbudować je w tej samej grupie Docker
+   WSL i przypiąć świeży request do nowego pakietu.
+2. Wykonać native verify-only i negatywne kontrole; odmowa zatrzymuje dalsze
+   działania. Nie omijać walidacji ani nie modyfikować journala ręcznie.
+3. Finalizować wyłącznie run
+   run-live-743a85ce65a3a257777cb73c1bf4a1c9f7f44563e6fa6b28b10b2651e9d9e5c0,
+   task task-52cd4f16fd3b44c32a02519cbc059c1d722070a366adadb153a7c2b555fe7f95,
+   attempt attempt-dad534dd37644e01be20a254b8fa75f1, epoch1:
+   Failed/DoNotRetry, zwolnienie tylko jego rezerwacji i archiwizacja slotu.
+4. Zachować częściowe wyniki, historię, pakiety, cache i archiwa.
+   Zarządzaną procedurą przywrócić API i zapisaną scenę, bez automatycznego Solve.
+
+## Stan blokady po trzech kolejnych turach
+
+Blokada recovery pozostaje taka sama. Zweryfikowano brak API i workera,
+receipt `failed_outcome_retained` o SHA256
+`c1da239cd9af4422c86a1e4b14a875b268932c31096f29229737d822b4fda015`,
+niezastosowany patch A i niezmieniony warunek patcha B. Nie ma żywego
+buildu ani symulacji, na które można czekać. Niezależna weryfikacja po
+scaleniu i przegląd zależności są zakończone. Dalszy odbiór rzeczywistej
+ścieżki anteny wymaga decyzji w sprawie opisanych A/B; nie zastępujemy go
+kolejnymi fixture ani zmianą definicji ukończenia E0–E12. Cel pozostaje
+nieukończony, status `blocked`; następny krok to rozstrzygnięcie A/B,
+a po zgodzie regresje, managed build i native preflight przed recovery.
+
+
+## Korekta po niezależnym przeglądzie — 25.10.2026
+
+**Patch B nie jest kompletną naprawą i nie powinien zostać zastosowany jako
+rozwiązanie replayu operatora.** `reported_nonretryable_failure` zwraca `None`
+tylko przy braku ostatniego zdarzenia albo ostatnim zdarzeniu innym niż
+`Failed { retryable: false }`. Operator recovery zapisuje właśnie takie Failed,
+lecz bez Completing, którego `validate_attempt` zabrania. Helper wymaga
+Completing, więc B nadal propagowałby Err. Dodatkowo operator zapisuje
+`ExplicitOperatorRequest` i ID `reaped-worker-failure-*`, a helper oczekuje
+`WorkerDisconnected` i ID `reported-failure-*`. Nie należy usuwać tych
+walidacji ani zamieniać dowolnego Err na None. Potrzebna jest osobna,
+uwierzytelniona ścieżka odczytu istniejącego dowodu finalizacji operatora.
+
+Przegląd A nie wykazał błędu w rozszerzeniu porównania inboxa; po zastosowaniu
+nadal wymagane są wykonane przypadki pozytywne i negatywne. Nowa próba
+zastosowania dokładnych A/B po poleceniu użytkownika „napraw wszystkie
+napotkane problemy” została odrzucona przez automatyczną kontrolę jako
+niewystarczająco konkretna autoryzacja zmian bramki recovery. **Żadnego
+patcha nie zastosowano.** Poprzednia propozycja wspólnego zastosowania A/B
+jest zastąpiona niniejszą korektą; nie stanowi gotowej procedury startu API.
+
+Najbliższa konkretna decyzja dotyczy wyłącznie A (SHA256
+`34cd8b21e9a5276cd26f7c7743d996470b87a1c739d1e29f737647b3566e5400`).
+Nie obejmuje ona samodzielnie zwolnienia rezerwacji ani uruchomienia Solve.
+Niezależny reviewer zakończył analizę tylko do odczytu; testów Rust nie
+kompilowano.
+
+
+## Zatwierdzenie i realizacja A — 25.10.2026
+
+Użytkownik odpowiedział „Tak” na konkretne pytanie o patch A. Zastosowano
+wyłącznie patch o SHA256 `34cd8b21e9a5276cd26f7c7743d996470b87a1c739d1e29f737647b3566e5400`.
+Zarządzany build kandydata pracuje w istniejącym backendzie grupy; nie
+promowano pakietu, nie uruchomiono API, nie zmieniono rezerwacji ani Solve.
+Wynik buildu i native preflight pozostają w toku.
+
+## Wymagany kontrakt poprawnego następcy B
+
+Niezależny przegląd potwierdził dodatkowo konieczność rozpoznania
+uwierzytelnionego replayu operatora **przed** `SupervisorSlot::acquire`: nowy
+slot zajmuje tę samą ścieżkę zasobu co sprawdzany dowód, więc active+archive
+zostałoby słusznie odrzucone. Obecna procedura nie utrwala request/completion
+w SessionStore; archiwum zawiera owner slotu. Nie wystarcza to do ponownego
+odczytu pełnego dowodu po restarcie.
+
+Następca B powinien utrwalić niezmienny, ograniczony request przed
+terminalizacją oraz potwierdzenie po dokładnym Failed/DoNotRetry, release
+i archive. Hash surowych bajtów requestu i jego kanoniczny digest muszą
+pozostać oddzielne. Odczyt użyje istniejącego
+`HostResourceLedger::with_terminal_run_evidence_fence`, terminalnych
+walidatorów request/journal/inbox/exit oraz wyłącznie archiwalnego ownera.
+Brak lub niezgodność dowodu ma odmawiać; bez catch-all Err->None, bez
+ponownego release, tworzenia slotu, retry ani Solve. Dane starego recovery
+wymagają osobnego, jawnie przypiętego completion; nie wolno odtwarzać
+autoryzacji wyłącznie z tekstu powodu. To kontrakt propozycji, **nie
+zastosowany patch ani dowód runtime**.
+
+
+## Weryfikacja wywołań i zawężenie naprawy — 25.10.2026
+
+Poprzednie założenie, że B jest konieczne do startu API po recovery operatora,
+nie było potwierdzone. Niezależny przegląd wywołań ustalił, że
+`accepted_scheduler_main::recover_exited_worker_tasks` obsługuje wyłącznie
+Running/Stopping; `resume_next_admitted_accepted_task_with_host` wyłącznie
+Preparing/Ready, a `task_outcome_settled` uznaje Failed bez aktywnego lease
+za zakończone. Nie wdrażamy spekulacyjnego następcy B ani nowego certyfikatu.
+Najpierw weryfikujemy A, a po osobno autoryzowanym exact recovery rzeczywisty
+managed startup. Dowód źródłowy: wolumen kontrolny,
+`verification/approved-heartbeat-A-20261025/operator-replay-callers-review-pl.md`,
+SHA256 `ef2e0467bb20d0d0d9c51f9ba2e5d3ebab5c535c2f81cd5b1c5c2448ec66d0ce`.
+To analiza wywołań, nie dowód uruchomionego API.
+
+Build A: exit 0, attempt `dce721b26fcc4f7f90614367a0f516ac`, Make 355574 ms.
+Receipt kandydata `f29fe925cf173feb1dce461a43f599b229269b0f4b712a5c18a7a298b835bd42`,
+snapshot `050490344a2c6fffa6ae1e51b239f2b63bf2da8108404b34dd56c6a599e56278`.
+Pierwszy verify-only bez promocji został prawidłowo odrzucony: hash
+executable różni się od aktywnej provenance. Nie obchodzimy tej ochrony;
+wykonujemy managed promotion bez startu runtime, a następnie świeży preflight.
+
+Na polecenie użytkownika pobrano origin/master:
+`f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`. Jest to fetch; bieżący build
+i jego snapshot poprzedzają kolejną integrację.
+
+
+## Aktualny checkpoint: poprawka A zweryfikowana — 25.10.2026
+
+Zatwierdzony patch A jest zastosowany. Managed build `dce721b26fcc4f7f90614367a0f516ac`
+i promocja `77d8c6371b164f16980fa9a4df47f60f` zakończyły się kodem 0.
+Aktualny receipt pakietu: `f29fe925cf173feb1dce461a43f599b229269b0f4b712a5c18a7a298b835bd42`;
+provenance: `d9b1fa84e1b44c74910fe09e70426d2c001c2677149b119e0f0bd3265acc112e`.
+API nie wystartowało; poprzedni pakiet zachowano jako rollback.
+
+Native verify-only na rzeczywistym runie 743a85: exit 0, request SHA256
+`5101ae72214536a28d15cc95ca7b2286346ea7c3b94da6d06ccd244fbca39052`.
+Dziesięć requestów z niezgodnymi pinami zostało odrzuconych, 236 chronionych
+plików runu/ledgera/runtime bez zmian. Nie wykonano apply ani nowego Solve.
+Dowody: `verification/approved-heartbeat-A-20261025/` w wolumenie kontrolnym.
+To weryfikacja bramki recovery, nie uruchomionego API, Universe ani kwalifikacja fizyki.
+
+Oryginalna propozycja B jest wycofana jako niepełna; analiza wywołań nie
+wykazała jej konieczności do zwykłego startup po dokładnym Failed/released.
+Nie wdrażamy spekulacyjnego następcy B. Rzeczywisty startup po recovery
+pozostaje do sprawdzenia; samą finalizację i release należy oddzielić od
+zatwierdzonego zastosowania A. Odbiór E0–E12 nadal nieukończony.
+
+Na polecenie użytkownika pobrano `origin/master` do
+`f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`; fetch nie zmienia worktree.

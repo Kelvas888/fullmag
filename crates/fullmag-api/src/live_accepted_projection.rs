@@ -345,6 +345,9 @@ async fn capture_context(state: &AppState) -> Result<Option<ProjectionContext>, 
         let Some(snapshot) = current.as_ref() else {
             return Ok(None);
         };
+        if snapshot.runtime_status.code == "imported_read_only" {
+            return Ok(None);
+        }
         let Some(run) = snapshot.run.as_ref() else {
             return Ok(None);
         };
@@ -659,7 +662,9 @@ fn load_durable_projection(
     } else {
         Vec::new()
     };
-    let stage_terminal_details = if durable_changed && artifact_catalog.is_some() {
+    let stage_terminal_details = if durable_changed
+        && (artifact_catalog.is_some() || status == "failed")
+    {
         load_stage_terminal_details(&store, &context.run_id, &run_catalog.tasks)?
     } else {
         std::collections::BTreeMap::new()
@@ -2356,8 +2361,7 @@ async fn apply_projection(
             }
         }
     }
-    if !changed && previous_status == public_status
-        && !(terminal && !projection.preclaim_cancellations.is_empty()) {
+    if !changed && previous_status == public_status && !terminal {
         return Ok(());
     }
     next.state_version = next.state_version.saturating_add(1);
@@ -2401,6 +2405,12 @@ async fn apply_projection(
             projection.status,
         )
         .await?;
+    }
+    // Terminal command reconciliation is idempotent even when the snapshot
+    // was already projected; do not publish an unchanged snapshot again.
+    if !changed && previous_status == public_status {
+        drop(transition);
+        return Ok(());
     }
     let previous = {
         let mut current = state.current_live_state.write().await;
@@ -2842,6 +2852,74 @@ mod tests {
             .read_live_command_journal(&context.session_id).unwrap().unwrap();
         let journal: Value = serde_json::from_slice(&journal).unwrap();
         assert_eq!(journal["records"][0]["completion_status"], "cancelled");
+        assert!(store.read_artifact_catalog(&context.run_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_run_without_outputs_completes_only_its_bound_command() {
+        let (directory, store, context, mut catalog) = preclaim_cancelled_fixture();
+        for task in &mut catalog.tasks {
+            task.lifecycle = fullmag_session::FmsTaskLifecycle::Failed;
+        }
+        std::fs::write(store.root().join(format!("runs/{}/run_catalog.json", context.run_id)),
+            serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let mut state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        Arc::get_mut(&mut state).unwrap().current_command_journal_store_root =
+            Some(directory.path().join("live-journal"));
+        state.current_live_session_epoch.store(context.session_epoch, std::sync::atomic::Ordering::Release);
+        let mut scene = crate::router_v2::handlers::sessions::create::create_empty_scene_document(
+            &serde_json::from_value(json!({"name":"Failure", "backend":"fdm", "device":"cpu", "precision":"double"})).unwrap(),
+        ).unwrap();
+        scene.revision = context.scene_revision;
+        scene.scene.id = context.session_id.clone();
+        {
+            let mut current = state.current_live_state.write().await;
+            let snapshot = current.as_mut().unwrap();
+            snapshot.session.session_id = context.session_id.clone();
+            snapshot.session.run_id = context.run_id.clone();
+            snapshot.session.status = "running".into();
+            snapshot.scene_document = Some(scene);
+            snapshot.run = Some(serde_json::from_value(json!({
+                "run_id":context.run_id, "session_id":context.session_id, "status":"running",
+                "total_steps":2, "artifact_dir":""
+            })).unwrap());
+        }
+        for (seq, id, kind) in [
+            (1, "live-preparation-mesh-command", "solve"),
+            (2, "unrelated-solve", "solve"),
+            (3, "stop-command", "stop"),
+        ] {
+            state.current_command_ledger.lock().await.push_back(serde_json::from_value(json!({
+                "command":{"seq":seq,"command_id":id,"kind":kind,"created_at_unix_ms":1},
+                "status":"running"
+            })).unwrap());
+        }
+        let _transition = state.current_live_session_transition.lock().await;
+        let projection = load_durable_projection(store.root(), &context, None).unwrap().unwrap();
+        assert_eq!(projection.status, "failed");
+        assert!(projection.terminal_without_outputs);
+        assert!(projection.preclaim_cancellations.is_empty());
+        assert!(projection.stage_execution.stages.iter().all(|stage|
+            stage.status == crate::types::StageLifecycleState::Failed));
+        apply_projection(&state, &context, projection).await.unwrap();
+        let completed_at = {
+            let ledger = state.current_command_ledger.lock().await;
+            assert_eq!(ledger[0].status, crate::types::CommandLifecycleState::Failed);
+            assert_eq!(ledger[0].completion_status, Some(crate::types::CommandCompletionState::Failed));
+            assert_eq!(ledger[0].error.as_deref(), Some("accepted Study execution failed"));
+            assert!(ledger.iter().skip(1).all(|record|
+                record.status == crate::types::CommandLifecycleState::Running));
+            ledger[0].completed_at_unix_ms.unwrap()
+        };
+        assert!(completed_at > 0);
+        let projection = load_durable_projection(store.root(), &context, None).unwrap().unwrap();
+        apply_projection(&state, &context, projection).await.unwrap();
+        assert_eq!(state.current_command_ledger.lock().await[0].completed_at_unix_ms, Some(completed_at));
+        let current = state.current_live_state.read().await;
+        let snapshot = current.as_ref().unwrap();
+        assert_eq!(snapshot.session.status, "failed");
+        assert_eq!(snapshot.run.as_ref().unwrap().status, "failed");
+        assert!(snapshot.session.finished_at_unix_ms > 0);
         assert!(store.read_artifact_catalog(&context.run_id).unwrap().is_none());
     }
 

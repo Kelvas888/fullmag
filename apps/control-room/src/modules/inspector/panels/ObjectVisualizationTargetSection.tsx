@@ -16,8 +16,8 @@ import {
   type FieldMetaResource,
   type QuantityCatalogResource,
 } from "@/kernel/api/apiTypes";
-import { isFlowMajorTensorDescriptor, tensorProjectionOptions, normalizeTensorProjection } from "@/kernel/api/tensorFieldProjection";
-import { quantityUnitForColorbar } from "@/kernel/api/quantityIds";
+import { isFlowMajorTensorDescriptor, normalizeTensorProjection } from "@/kernel/api/tensorFieldProjection";
+import { quantityUnitForColorbar, quantityCatalogEntrySpatialProjections } from "@/kernel/api/quantityIds";
 import { primitiveMonoColorForRole } from "@/kernel/visualization/primitiveSurfaceColor";
 import { Button } from "@/shared/ui/Button";
 import {
@@ -687,8 +687,9 @@ export function VisualizationQuantitySection({
   targetFieldAvailability?: ReadonlyMap<string, TargetFieldAvailability>;
   targetKind?: VisualizationTargetKind;
 }) {
-  const descriptor = quantityCatalog?.quantities.find((entry) => entry.id === settings.activeQuantityId)?.tensor;
-  const tensorOptions = tensorProjectionOptions(descriptor);
+  const selectedQuantity = quantityCatalog?.quantities.find((entry) => entry.id === settings.activeQuantityId);
+  const descriptor = selectedQuantity?.tensor;
+  const tensorOptions = quantityCatalogEntrySpatialProjections(selectedQuantity);
   return (
     <>
     <FormField
@@ -703,9 +704,11 @@ export function VisualizationQuantitySection({
       value={settings.activeQuantityId}
       onChange={(event) => {
         const patchValue = quantitySourcePatch(settings, event.target.value);
-        const nextTensor = quantityCatalog?.quantities.find((entry) => entry.id === event.target.value)?.tensor;
-        if (isFlowMajorTensorDescriptor(nextTensor)) {
-          patchValue.tensorProjection = "c0";
+        const nextQuantity = quantityCatalog?.quantities.find((entry) => entry.id === event.target.value);
+        if (isFlowMajorTensorDescriptor(nextQuantity?.tensor)) {
+          const options = quantityCatalogEntrySpatialProjections(nextQuantity);
+          if (options.length === 0) return;
+          patchValue.tensorProjection = options[0].value;
           patchValue.surfaceColorSource = "colormap";
           patchValue.vectorsVisible = false;
         }
@@ -742,7 +745,7 @@ export function VisualizationQuantitySection({
         value={settings.tensorProjection ?? ""}
         onChange={(event) => {
           const tensorProjection = normalizeTensorProjection(event.target.value);
-          if (tensorProjection) void patch({ tensorProjection, surfaceColorSource: "colormap" });
+          if (tensorProjection && tensorOptions.some((option) => option.value === tensorProjection)) void patch({ tensorProjection, surfaceColorSource: "colormap" });
         }}
       >
         <option disabled value="">Select tensor projection</option>

@@ -397,6 +397,15 @@ impl From<PersistedCurrentLiveSnapshot> for SessionStateResponse {
 // ── Request / Response types ───────────────────────────────────────────
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptedRunExportSource {
+    pub project_id: String,
+    pub run_id: String,
+    pub run_catalog_revision: u64,
+    pub artifact_catalog_revision: u64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct SessionExportRequest {
     /// Save profile: "compact", "solved", "resume", "archive".
     pub profile: SaveProfile,
@@ -418,6 +427,10 @@ pub(crate) struct SessionExportRequest {
     /// historical export/download behavior.
     #[serde(default)]
     pub save_to_source: Option<bool>,
+    /// Explicit immutable historical source. Solved downloads only; the current
+    /// authoring workspace is not changed or used as historical result evidence.
+    #[serde(default)]
+    pub accepted_run: Option<AcceptedRunExportSource>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1230,7 +1243,7 @@ struct HysteresisMagnetizationSnapshotArtifact {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn session_store_root(state: &AppState) -> std::path::PathBuf {
+pub(crate) fn session_store_root(state: &AppState) -> std::path::PathBuf {
     session_store_path(
         &state.repo_root,
         state.current_command_journal_store_root.as_deref(),
@@ -1460,10 +1473,166 @@ fn accepted_plan_for_profile(
     Ok(filtered)
 }
 
+fn historical_export_error(error: anyhow::Error) -> ApiError {
+    if error.chain().any(|cause| matches!(cause.downcast_ref::<std::fs::TryLockError>(),
+        Some(std::fs::TryLockError::WouldBlock))) {
+        ApiError::conflict_with_code("antenna_store_busy", "accepted source has an active writer; retry this read")
+    } else {
+        ApiError::conflict(format!("historical_export_source_invalid: {error}"))
+    }
+}
+
+fn validate_historical_export_pins(state: &AppState, source: &AcceptedRunExportSource, capture: &AcceptedExportCapture)
+    -> Result<(), ApiError> {
+    let root = state.submit_store_root.as_ref().ok_or_else(|| ApiError::conflict("accepted export store disappeared"))?;
+    for (kind, expected) in [(AcceptedProvenanceRecordKind::RunCatalog, source.run_catalog_revision),
+        (AcceptedProvenanceRecordKind::ArtifactCatalog, source.artifact_catalog_revision)] {
+        let records = capture.full_provenance_manifest.records.iter().filter(|record| record.kind == kind).collect::<Vec<_>>();
+        if records.len() != 1 { return Err(ApiError::conflict("historical export catalog is absent or ambiguous")); }
+        let record = records[0];
+        let bytes = fullmag_session::repository_path::read_bounded_regular_file(root, &record.source_path,
+            fullmag_session::accepted_provenance::MAX_ACCEPTED_PROVENANCE_RECORD_BYTES).map_err(historical_export_error)?;
+        if bytes.len() as u64 != record.byte_count || fullmag_session::hex_sha256(&bytes) != record.content_sha256 {
+            return Err(ApiError::conflict("historical export catalog changed after initial capture"));
+        }
+        let revision = match kind {
+            AcceptedProvenanceRecordKind::RunCatalog => serde_json::from_slice::<fullmag_session::FmsRunCatalog>(&bytes)
+                .map(|catalog| catalog.revision),
+            AcceptedProvenanceRecordKind::ArtifactCatalog => serde_json::from_slice::<fullmag_session::FmsArtifactCatalog>(&bytes)
+                .map(|catalog| catalog.revision),
+            _ => unreachable!("only catalogs are selected above"),
+        }.map_err(|e| ApiError::conflict(e.to_string()))?;
+        if revision != expected { return Err(ApiError::conflict("historical export catalog differs from the requested revision")); }
+    }
+    Ok(())
+}
+
+const ACCEPTED_PROJECTION_WARNING: &str = "accepted_definition_readonly_projection: scene is a read-only projection of the immutable accepted definition, not an exact restoration of the former authored workspace; original authored input identity is preserved in provenance";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptedDefinitionProjection {
+    schema_version: String,
+    project_id: String,
+    run_id: String,
+    definition_sha256: String,
+    projection_sha256: String,
+    authored_execution_input: serde_json::Value,
+}
+
+// This constructs archive documents only. It never publishes a current session,
+// reattaches a worker or restores scheduler authority for a historical run.
+fn historical_export_snapshot(state: &AppState, source: &AcceptedRunExportSource)
+    -> Result<(SessionStateResponse, u64, Vec<u8>), ApiError> {
+    let invalid = |error: String| ApiError::conflict(format!("historical_export_source_invalid: {error}"));
+    let root = state.submit_store_root.as_ref().ok_or_else(|| invalid("accepted store unavailable".into()))?;
+    let store = SessionStore::open_existing(root).map_err(|e| invalid(e.to_string()))?;
+    let _transaction = store.read_transaction().map_err(historical_export_error)?;
+    let run = fullmag_application::RunId::parse(&source.run_id).map_err(|e| invalid(e.to_string()))?;
+    let project = fullmag_application::ProjectId::parse(&source.project_id).map_err(|e| invalid(e.to_string()))?;
+    let accepted = fullmag_runtime_control::load_accepted_study_snapshot(&store, &run, &project).map_err(|e| invalid(e.to_string()))?;
+    let catalog = store.read_run_catalog(run.as_str()).map_err(|e| invalid(e.to_string()))?
+        .ok_or_else(|| invalid("run catalog absent".into()))?;
+    let artifacts = store.read_artifact_catalog(run.as_str()).map_err(|e| invalid(e.to_string()))?
+        .ok_or_else(|| invalid("artifact catalog absent".into()))?;
+    catalog.validate().map_err(|e| invalid(e.to_string()))?;
+    artifacts.validate().map_err(|e| invalid(e.to_string()))?;
+    if catalog.revision != source.run_catalog_revision || artifacts.revision != source.artifact_catalog_revision
+        || catalog.tasks.is_empty() || catalog.tasks.iter().any(|task| task.lifecycle != fullmag_session::FmsTaskLifecycle::Succeeded) {
+        return Err(invalid("catalog pins differ or the run is not successfully completed".into()));
+    }
+    let specification = &accepted.run.specification;
+    let workspace = &specification.parameters["live_workspace"];
+    let session_id = workspace["session_id"].as_str().ok_or_else(|| invalid("source session identity absent".into()))?;
+    fullmag_session::repository_path::validate_store_id(session_id).map_err(|e| invalid(e.to_string()))?;
+    let epoch = workspace["session_epoch"].as_u64().filter(|value| *value > 0).ok_or_else(|| invalid("source epoch absent".into()))?;
+    let definition: serde_json::Value = serde_json::from_slice(&accepted.run.definition_bytes).map_err(|e| invalid(e.to_string()))?;
+    let scene: fullmag_authoring::SceneDocument = serde_json::from_value(definition["scene"].clone()).map_err(|e| invalid(e.to_string()))?;
+    if workspace["scene_revision"].as_u64() != Some(scene.revision) {
+        return Err(invalid("source scene revision differs".into()));
+    }
+    // A historical definition is immutable accepted input, not a reconstruction
+    // of the former live authored document. Preserve both identities explicitly.
+    let projection = AcceptedDefinitionProjection {
+        schema_version: "accepted_definition_readonly_projection.v1".into(),
+        project_id: project.as_str().into(), run_id: run.as_str().into(),
+        definition_sha256: specification.snapshot.definition_sha256.clone(),
+        projection_sha256: fullmag_session::canonical_json_sha256(&serde_json::to_value(&scene)
+            .map_err(|e| invalid(e.to_string()))?),
+        authored_execution_input: workspace.get("execution_input").cloned().unwrap_or(serde_json::Value::Null),
+    };
+    let script = accepted_captured_script(&store, &accepted)?;
+    // Require a genuine typed antenna inspection, with the same durable cold
+    // gate used by accepted HTTP reads. No new Solve is submitted for export.
+    let mut inspections = 0;
+    for step in &accepted.study.steps {
+        if !step.enabled || !matches!(step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) { continue; }
+        let task_id = fullmag_session::task_id_for_study_step(run.as_str(), &step.step_id).map_err(|e| invalid(e.to_string()))?;
+        let task = catalog.tasks.iter().find(|task| task.task_id == task_id).ok_or_else(|| invalid("inspection task absent".into()))?;
+        let attempt = task.attempt_id.as_deref().ok_or_else(|| invalid("inspection attempt absent".into()))?;
+        let ownership_epoch = task.ownership_epoch.ok_or_else(|| invalid("inspection epoch absent".into()))?;
+        let outputs = artifacts.entries.iter().filter(|entry| entry.task_id == task_id && entry.attempt_id == attempt
+            && entry.ownership_epoch == ownership_epoch && entry.artifact_type == "artifact" && entry.study_output.is_some()).collect::<Vec<_>>();
+        if outputs.len() != 1 { return Err(invalid("inspection output absent or ambiguous".into())); }
+        let object = outputs[0].object_ref.as_deref().ok_or_else(|| invalid("inspection CAS absent".into()))?;
+        fullmag_runtime_control::verify_saved_inspection(&store, &project, &run, &task_id, attempt, ownership_epoch, object)
+            .map_err(historical_export_error)?;
+        inspections += 1;
+    }
+    if inspections == 0 { return Err(invalid("historical source has no typed closed-loop inspection".into())); }
+    let request: crate::types::CurrentLiveSnapshotRequest = serde_json::from_value(serde_json::json!({
+        "session_id":session_id,"session_status":"completed"
+    })).map_err(|e| invalid(e.to_string()))?;
+    let mut snapshot = crate::default_current_live_state(&request);
+    let requested = &specification.requested_execution;
+    snapshot.session.run_id = run.as_str().into();
+    snapshot.session.problem_name = scene.scene.name.clone();
+    snapshot.session.requested_backend = requested.backend.clone();
+    snapshot.session.authored_requested_device = requested.device.clone();
+    snapshot.session.requested_device = requested.device.clone();
+    snapshot.session.requested_precision = requested.precision.clone();
+    snapshot.session.precision = requested.precision.clone();
+    snapshot.session.requested_mode = requested.mode.clone();
+    snapshot.session.execution_mode = requested.mode.clone();
+    snapshot.session.plan_summary = serde_json::json!({"requested_execution":requested,
+        "historical_export":true,"resolved_execution_source":"accepted_preparation_and_output"});
+    snapshot.run = Some(crate::types::RunManifest { run_id:run.as_str().into(),session_id:session_id.into(),
+        status:"completed".into(),total_steps:0,final_time:None,final_e_ex:None,final_e_demag:None,
+        final_e_ext:None,final_e_ani:None,final_e_dmi:None,final_e_rotated_dmi:None,final_e_total:None,artifact_dir:String::new() });
+    snapshot.scene_document = Some(scene);
+    snapshot.metadata = Some(serde_json::json!({"accepted_definition_projection":projection,"historical_export":{
+        "run_id":source.run_id,"project_id":source.project_id,"session_epoch":epoch,
+        "run_catalog_revision":source.run_catalog_revision,"artifact_catalog_revision":source.artifact_catalog_revision
+    }}));
+    Ok((snapshot, epoch, script))
+}
+
+fn historical_project_documents(snapshot: &SessionStateResponse, script: Vec<u8>) -> Result<HashMap<String, Vec<u8>>, ApiError> {
+    let mut documents = HashMap::new();
+    let mut persisted = PersistedCurrentLiveSnapshot::from(snapshot);
+    persisted.display_presentation_schema_version = Some(DISPLAY_PRESENTATION_SCHEMA_VERSION);
+    persisted.display_presentation = persisted_display_presentation(&DisplayPresentationState::default())
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    documents.insert("main.py".into(), script);
+    documents.insert("ui_state.json".into(), b"{}".to_vec());
+    documents.insert("scene_document.json".into(), serde_json::to_vec_pretty(&snapshot.scene_document)
+        .map_err(|e| ApiError::internal(e.to_string()))?);
+    documents.insert("current_live_snapshot.json".into(), serde_json::to_vec_pretty(&persisted)
+        .map_err(|e| ApiError::internal(e.to_string()))?);
+    Ok(documents)
+}
+
 fn accepted_export_capture(
     state: &AppState,
     snapshot: &SessionStateResponse,
     profile: &FmsExportProfile,
+) -> Result<Option<AcceptedExportCapture>, ApiError> {
+    accepted_export_capture_at_epoch(state, snapshot, profile,
+        state.current_live_session_epoch.load(std::sync::atomic::Ordering::Acquire))
+}
+
+fn accepted_export_capture_at_epoch(
+    state: &AppState, snapshot: &SessionStateResponse, profile: &FmsExportProfile, session_epoch: u64,
 ) -> Result<Option<AcceptedExportCapture>, ApiError> {
     if snapshot.runtime_status.code == "imported_read_only" {
         return Err(ApiError::conflict(
@@ -1534,9 +1703,6 @@ fn accepted_export_capture(
         .as_ref()
         .map(|scene| scene.revision)
         .ok_or_else(|| ApiError::conflict("accepted export has no persisted scene revision"))?;
-    let session_epoch = state
-        .current_live_session_epoch
-        .load(std::sync::atomic::Ordering::Acquire);
     if session_epoch == 0 {
         return Err(ApiError::conflict(
             "accepted export has no positive live session epoch",
@@ -1606,10 +1772,8 @@ fn validate_accepted_export_capture(
     snapshot: &SessionStateResponse,
     capture: &AcceptedExportCapture,
     profile: &FmsExportProfile,
+    epoch: u64,
 ) -> Result<AcceptedProvenancePlan, ApiError> {
-    let epoch = state
-        .current_live_session_epoch
-        .load(std::sync::atomic::Ordering::Acquire);
     if epoch != capture.identity.session_epoch
         || snapshot.session.session_id != capture.identity.session_id
         || snapshot
@@ -1682,11 +1846,60 @@ fn validate_accepted_export_capture(
     Ok(refreshed)
 }
 
+fn validate_imported_definition_projection(
+    preflight: &FmsStagedPreflight, persisted: &PersistedCurrentLiveSnapshot, manifest: &AcceptedProvenanceManifest,
+) -> Result<(), ApiError> {
+    let Some(value) = persisted.metadata.as_ref().and_then(|metadata| metadata.get("accepted_definition_projection")) else {
+        return Ok(());
+    };
+    let invalid = |message: String| ApiError::bad_request(format!("invalid_fms_definition_projection: {message}"));
+    let projection: AcceptedDefinitionProjection = serde_json::from_value(value.clone()).map_err(|e| invalid(e.to_string()))?;
+    if projection.schema_version != "accepted_definition_readonly_projection.v1" || projection.run_id != manifest.accepted_run_id {
+        return Err(invalid("projection schema or run differs".into()));
+    }
+    let intents = manifest.records.iter().filter(|record| record.kind == AcceptedProvenanceRecordKind::RunIntent).collect::<Vec<_>>();
+    if intents.len() != 1 { return Err(invalid("one immutable RunIntent is required".into())); }
+    let record = intents[0];
+    let bytes = preflight.read_document(&record.archive_path).map_err(|e| invalid(e.to_string()))?;
+    if bytes.len() as u64 != record.byte_count || fullmag_session::hex_sha256(&bytes) != record.content_sha256 {
+        return Err(invalid("RunIntent differs from portable closure".into()));
+    }
+    let intent: fullmag_session::FmsRunIntent = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    intent.validate().map_err(|e| invalid(e.to_string()))?;
+    let specification: fullmag_application::RunSpecification = serde_json::from_value(intent.specification.clone())
+        .map_err(|e| invalid(e.to_string()))?;
+    if specification.fingerprint().map_err(|e| invalid(e.to_string()))? != intent.payload_sha256
+        || specification.run_id.as_str() != projection.run_id || specification.snapshot.project_id.as_str() != projection.project_id
+        || specification.snapshot.definition_sha256 != projection.definition_sha256
+        || intent.definition_object_ref.as_deref() != Some(projection.definition_sha256.as_str())
+        || specification.parameters["live_workspace"].get("execution_input").cloned().unwrap_or(serde_json::Value::Null) != projection.authored_execution_input {
+        return Err(invalid("projection differs from immutable run/source identity".into()));
+    }
+    let bytes = preflight.read_document(&format!("objects/sha256/{}", projection.definition_sha256)).map_err(|e| invalid(e.to_string()))?;
+    if fullmag_session::hex_sha256(&bytes) != projection.definition_sha256 {
+        return Err(invalid("definition CAS digest differs".into()));
+    }
+    let definition: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    let expected: fullmag_authoring::SceneDocument = serde_json::from_value(definition["scene"].clone()).map_err(|e| invalid(e.to_string()))?;
+    let projected = persisted.scene_document.as_ref().ok_or_else(|| invalid("projected scene absent".into()))?;
+    let hash = |scene: &fullmag_authoring::SceneDocument| -> Result<String, serde_json::Error> {
+        Ok(fullmag_session::canonical_json_sha256(&serde_json::to_value(scene)?))
+    };
+    if hash(&expected).map_err(|e| invalid(e.to_string()))? != projection.projection_sha256
+        || hash(projected).map_err(|e| invalid(e.to_string()))? != projection.projection_sha256 {
+        return Err(invalid("readonly scene is not the pinned accepted definition projection".into()));
+    }
+    Ok(())
+}
+
 fn validate_imported_accepted_provenance(
     preflight: &FmsStagedPreflight,
     persisted: &PersistedCurrentLiveSnapshot,
 ) -> Result<(), ApiError> {
     let Some(reference) = preflight.session.accepted_provenance_ref.as_ref() else {
+        if persisted.metadata.as_ref().is_some_and(|metadata| metadata.get("accepted_definition_projection").is_some()) {
+            return Err(ApiError::bad_request("invalid_fms_definition_projection: portable accepted closure absent"));
+        }
         return Ok(());
     };
     let manifest_bytes = preflight
@@ -1744,6 +1957,8 @@ fn validate_imported_accepted_provenance(
             "invalid_fms_accepted_provenance: captured scene revision does not match persisted snapshot",
         ));
     }
+
+    validate_imported_definition_projection(preflight, persisted, &manifest)?;
 
     // The startup metadata is an optional duplicate marker. If present, it is
     // part of the same binding and must not silently disagree with the typed
@@ -2120,6 +2335,7 @@ mod accepted_fms_persistence_tests {
                 ui_state: None,
                 target_path: None,
                 save_to_source: None,
+                accepted_run: None,
             }),
             None,
         )
@@ -2189,6 +2405,7 @@ mod accepted_fms_persistence_tests {
                 ui_state: None,
                 target_path: None,
                 save_to_source: None,
+                accepted_run: None,
             }),
         )
         .await
@@ -2297,6 +2514,7 @@ mod accepted_fms_persistence_tests {
                 ui_state: None,
                 target_path: None,
                 save_to_source: None,
+                accepted_run: None,
             }),
             Some(&context),
         )
@@ -2572,6 +2790,11 @@ fn accepted_export_script(
     let run = fullmag_application::RunId::parse(capture.identity.run_id.as_str()).map_err(|error| ApiError::conflict(error.to_string()))?;
     let accepted = fullmag_runtime_control::load_accepted_study_snapshot(&store, &run, &specification.snapshot.project_id)
         .map_err(|error| ApiError::conflict(format!("accepted export source closure invalid: {error}")))?;
+    accepted_captured_script(&store, &accepted).map(Some)
+}
+
+fn accepted_captured_script(store: &SessionStore, accepted: &fullmag_runtime_control::AcceptedStudySnapshot)
+    -> Result<Vec<u8>, ApiError> {
     let reference = accepted.run.specification.immutable_assets.iter()
         .find(|asset| asset.asset_id == fullmag_application::SCRIPT_PIPELINE_SOURCE_ASSET_ID)
         .ok_or_else(|| ApiError::conflict("accepted export captured source reference missing"))?;
@@ -2581,7 +2804,10 @@ fn accepted_export_script(
     let source = fullmag_application::validate_accepted_script_pipeline_source(&accepted.study, &accepted.catalog, &bytes)
         .map_err(|error| ApiError::conflict(format!("accepted export captured source invalid: {error}")))?;
     // The accepted snapshot reader already verifies every captured file against RunSpec and CAS.
-    read_captured_export_script(&store, &source).map(Some)
+    fullmag_application::validate_script_source_assets(&accepted.run.specification, &source, |hash, maximum|
+        store.cas().get_bounded(hash, maximum)?.ok_or_else(|| anyhow::anyhow!("accepted source file missing")))
+        .map_err(|error| ApiError::conflict(format!("accepted export source assets invalid: {error}")))?;
+    read_captured_export_script(store, &source)
 }
 
 async fn read_canonical_script(state: &AppState, accepted: Option<&AcceptedExportCapture>) -> Result<Vec<u8>, ApiError> {
@@ -2853,7 +3079,11 @@ pub(crate) async fn export_session_with_context(
     let save_to_source = req.save_to_source.unwrap_or(false);
     let requested_target = req.target_path.as_deref();
     validate_session_output_request(requested_target, save_to_source)?;
-    let session_id = current_session_id(&state).await?;
+    let mut session_id = current_session_id(&state).await?;
+    if req.accepted_run.is_some() && (req.profile != SaveProfile::Solved || save_to_source
+        || req.ui_state.is_some() || requested_target.is_some()) {
+        return Err(ApiError::bad_request("historical accepted_run export requires a solved download without UI override or output path"));
+    }
 
     let name = if let Some(n) = req.name {
         n
@@ -2866,12 +3096,22 @@ pub(crate) async fn export_session_with_context(
     };
 
     let export_profile = FmsExportProfile::for_profile(req.profile);
-    let snapshot = state
+    let mut snapshot = state
         .current_live_state
         .read()
         .await
         .clone()
         .ok_or_else(|| ApiError::not_found("no active workspace"))?;
+    let mut historical_script = None;
+    let source_epoch = if let Some(source) = req.accepted_run.as_ref() {
+        let (historical, epoch, script) = historical_export_snapshot(&state, source)?;
+        historical_script = Some(script);
+        session_id = historical.session.session_id.clone();
+        snapshot = historical;
+        epoch
+    } else {
+        state.current_live_session_epoch.load(std::sync::atomic::Ordering::Acquire)
+    };
     let save_target = if save_to_source {
         Some(resolve_session_output_target(
             Path::new(&snapshot.session.script_path),
@@ -2880,8 +3120,15 @@ pub(crate) async fn export_session_with_context(
     } else {
         None
     };
-    let mut accepted_capture = accepted_export_capture(&state, &snapshot, &export_profile)?;
-    let script = read_canonical_script(&state, accepted_capture.as_ref()).await?;
+    let mut accepted_capture = if req.accepted_run.is_some() {
+        accepted_export_capture_at_epoch(&state, &snapshot, &export_profile, source_epoch)?
+    } else { accepted_export_capture(&state, &snapshot, &export_profile)? };
+    if let Some(source) = req.accepted_run.as_ref() {
+        validate_historical_export_pins(&state, source, accepted_capture.as_ref()
+            .ok_or_else(|| ApiError::conflict("historical accepted capture absent"))?)?;
+    }
+    let script = if let Some(script) = historical_script { script }
+        else { read_canonical_script(&state, accepted_capture.as_ref()).await? };
     let mut session_manifest = FmsSessionManifest::new(&session_id, &name, req.profile);
 
     if let Some(capture) = accepted_capture.as_ref() {
@@ -2934,22 +3181,23 @@ pub(crate) async fn export_session_with_context(
         };
         Some((run_manifest, crate::session::current_artifact_dir(&snapshot)))
     };
-    let docs = collect_project_documents(&state, req.ui_state.as_ref(), script).await;
+    let docs = if req.accepted_run.is_some() { historical_project_documents(&snapshot, script)? }
+        else { collect_project_documents(&state, req.ui_state.as_ref(), script).await };
 
     if let Some(context) = request_context {
         crate::validate_current_live_request_context(&state, context).await?;
     }
     if let Some(capture) = accepted_capture.as_mut() {
-        let current = state.current_live_state.read().await;
-        let current = current
-            .as_ref()
-            .ok_or_else(|| ApiError::conflict("accepted export workspace disappeared"))?;
-        let refreshed = validate_accepted_export_capture(
-            &state,
-            current,
-            &*capture,
-            &export_profile,
-        )?;
+        // The transition fence above pins the requester; the source closure
+        // below is separately fenced without substituting the current run.
+        let refreshed = if req.accepted_run.is_some() {
+            validate_accepted_export_capture(&state, &snapshot, capture, &export_profile, source_epoch)?
+        } else {
+            let current = state.current_live_state.read().await;
+            let current = current.as_ref().ok_or_else(|| ApiError::conflict("accepted export workspace disappeared"))?;
+            validate_accepted_export_capture(&state, current, capture, &export_profile,
+                state.current_live_session_epoch.load(std::sync::atomic::Ordering::Acquire))?
+        };
         capture.provenance = refreshed;
     }
     let store = open_store(&state)?;
@@ -2977,7 +3225,7 @@ pub(crate) async fn export_session_with_context(
         script_sha256: fullmag_session::hex_sha256(script),
         ui_state_ref: "project/ui_state.json".into(),
         scene_document_ref: "project/scene_document.json".into(),
-        script_builder_ref: Some("project/script_builder.json".into()),
+        script_builder_ref: docs.contains_key("script_builder.json").then(|| "project/script_builder.json".into()),
         model_builder_graph_ref: None,
         asset_index_ref: None,
     };
@@ -3069,6 +3317,7 @@ pub(crate) async fn import_session_inspect(
         .map_err(|error| ApiError::internal(format!("creating archive decode root: {error}")))?;
     let staged = preflight_fms_staged(Cursor::new(&fms_bytes), &[], &decoding_root)
         .map_err(|error| archive_preflight_error(error, "invalid_fms_preflight"))?;
+    let mut inspection = staged.inspection.clone();
     if staged.session.accepted_provenance_ref.is_some() {
         let snapshot_bytes = staged
             .read_document("project/current_live_snapshot.json")
@@ -3084,8 +3333,10 @@ pub(crate) async fn import_session_inspect(
                 ))
             })?;
         validate_imported_accepted_provenance(&staged, &persisted)?;
+        if persisted.metadata.as_ref().is_some_and(|metadata| metadata.get("accepted_definition_projection").is_some()) {
+            inspection.warnings.push(ACCEPTED_PROJECTION_WARNING.into());
+        }
     }
-    let inspection = staged.inspection.clone();
 
     Ok(Json(SessionImportInspectResponse { inspection }))
 }
@@ -3521,8 +3772,22 @@ pub(crate) async fn import_session_commit_with_context(
     // archive before any presentation/reference normalization can rewrite
     // identity-bearing fields.
     validate_imported_accepted_provenance(&preflight, &persisted)?;
+    if persisted.metadata.as_ref().is_some_and(|metadata| metadata.get("accepted_definition_projection").is_some()) {
+        warnings.push(ACCEPTED_PROJECTION_WARNING.into());
+    }
     antenna_import::normalize_registered_refs(&mut persisted, &preflight)?;
     normalize_imported_read_only(&mut persisted);
+    // Replace any archive-supplied marker with the reference just validated by
+    // the canonical importer. It pins subsequent cold reads to this closure.
+    if let Some(reference) = preflight.session.accepted_provenance_ref.as_ref() {
+        let metadata = persisted.metadata.get_or_insert_with(|| serde_json::json!({}));
+        let metadata = metadata.as_object_mut().ok_or_else(|| ApiError::bad_request("invalid_fms_snapshot: accepted metadata must be an object"))?;
+        metadata.insert("imported_accepted_evidence".into(), serde_json::json!({
+            "run_id":reference.accepted_run_id,"closure_sha256":reference.closure_sha256
+        }));
+    } else if let Some(metadata) = persisted.metadata.as_mut().and_then(serde_json::Value::as_object_mut) {
+        metadata.remove("imported_accepted_evidence");
+    }
     let import_id = format!(
         "{}-{}",
         safe_import_session_id(&preflight.session.session_id),

@@ -182,6 +182,12 @@ AffineRt0Element::AffineRt0Element(const mfem::GridFunction &field, int element)
     coefficients_frozen_ = true;
 }
 
+AffineRt0Element::FrozenInput AffineRt0Element::frozen_input() const
+{
+    require(coefficients_frozen_, "affine RT0 frozen input requires frozen field coefficients");
+    return {vertices_, signed_coefficients_};
+}
+
 AffineRt0Element::Point AffineRt0Element::basis_value_at(const Point &physical_point, int local) const
 {
     require(local >= 0 && local < 4, "affine RT0 basis index is invalid");

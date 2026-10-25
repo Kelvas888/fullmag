@@ -5452,6 +5452,7 @@ mod tests {
             conservative_current_view_ref: Some("charge:rt0".into()),
             model: AntennaFieldModelIR::QuasistaticConductionBiotSavart3d,
             oersted_realization: AntennaOerstedRealizationIR::DirectTetraQuadrature,
+            surface_field_policy: None,
             conductor_mesh_policy: "authored_shared_domain".into(),
             field_sampling_domain: FieldTargetIR::Global {},
             target_refs: vec![FieldTargetIR::Object {
