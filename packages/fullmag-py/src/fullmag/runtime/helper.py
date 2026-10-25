@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 import stat
@@ -62,17 +61,24 @@ def _benchmark_problem_ir_identity(problem_ir: dict[str, object]) -> dict[str, o
     used to compare those runs.
     """
 
-    normalized = copy.deepcopy(problem_ir)
+    # Copy only the dictionaries on the edited path: the result is hashed,
+    # never mutated, and a deep copy of a production mesh IR costs tens of
+    # seconds on every export.
+    normalized = dict(problem_ir)
     problem_meta = normalized.get("problem_meta")
     if isinstance(problem_meta, dict):
         runtime_metadata = problem_meta.get("runtime_metadata")
         if isinstance(runtime_metadata, dict):
+            runtime_metadata = dict(runtime_metadata)
             runtime_metadata.pop("runtime_device_override", None)
+            normalized["problem_meta"] = {**problem_meta, "runtime_metadata": runtime_metadata}
     return normalized
 
 
 def _write_json(value: object) -> None:
-    json.dump(value, sys.stdout)
+    # ``json.dumps`` uses the C encoder; streaming ``json.dump`` falls back to
+    # the pure-Python encoder.  Both produce the same text.
+    sys.stdout.write(json.dumps(value))
     sys.stdout.write("\n")
 
 
