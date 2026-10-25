@@ -113,7 +113,7 @@ pub async fn get_mesh_summary(
         revision: snapshot.mesh_revision,
         mesh_summary: mesh_workspace.get("mesh_summary").cloned(),
         mesh_quality_summary: mesh_workspace.get("mesh_quality_summary").cloned(),
-        effective_airbox_target: mesh_workspace.get("effective_airbox_target").cloned(),
+        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_ref()),
         effective_per_object_targets: mesh_workspace.get("effective_per_object_targets").cloned(),
     };
     let etag = crate::router_v2::handlers::shared::stable_strong_etag(&format!(
@@ -314,7 +314,7 @@ pub async fn get_mesh_active_build(
         policy_diff: mesh_build_policy_diff(mesh_workspace),
         active_build: mesh_workspace.get("active_build").cloned(),
         mesh_pipeline_status: mesh_workspace.get("mesh_pipeline_status").cloned(),
-        effective_airbox_target: mesh_workspace.get("effective_airbox_target").cloned(),
+        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_ref()),
         effective_per_object_targets: mesh_workspace.get("effective_per_object_targets").cloned(),
         last_build_summary: mesh_workspace.get("last_build_summary").cloned(),
         shared_domain_build_report: typed_shared_domain_build_report(&snapshot, mesh_workspace),
@@ -551,7 +551,7 @@ pub async fn get_mesh_last_successful_build(
         source_scene_revision: provenance.source_scene_revision,
         geometry_realization_revision: provenance.geometry_realization_revision,
         last_success: mesh_workspace.get("last_build_summary").cloned(),
-        effective_airbox_target: mesh_workspace.get("effective_airbox_target").cloned(),
+        effective_airbox_target: effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_ref()),
         effective_per_object_targets: mesh_workspace.get("effective_per_object_targets").cloned(),
         last_build_error: mesh_workspace
             .get("last_build_error")
@@ -677,7 +677,8 @@ pub async fn get_mesh_universe_report(
     let mesh_workspace = current_mesh_workspace(&snapshot)?;
     let report = Some(json!({
         "config": current_universe_mesh_config(scene),
-        "effective_airbox_target": mesh_workspace.get("effective_airbox_target").cloned().unwrap_or(Value::Null),
+        "effective_airbox_target": effective_airbox_target(mesh_workspace, snapshot.fem_mesh.as_ref()),
+        "shared_interface_node_count": snapshot.fem_mesh.as_ref().and_then(super::airbox_evidence::shared_interface_node_count),
         "mesh_summary": mesh_workspace.get("mesh_summary").cloned().unwrap_or(Value::Null),
         "last_build_summary": mesh_workspace.get("last_build_summary").cloned().unwrap_or(Value::Null),
     }));
@@ -3033,10 +3034,12 @@ fn first_workspace_u128(root: &Value, paths: &[&[&str]]) -> Option<u128> {
 }
 
 fn workspace_mesh_statistics(mesh_workspace: &Value) -> Option<&Value> {
-    workspace_value_at(mesh_workspace, &["mesh_statistics"]).or_else(|| {
-        workspace_value_at(mesh_workspace, &["last_build_summary", "mesh_statistics"])
-            .filter(|value| !value.is_null())
-    })
+    workspace_value_at(mesh_workspace, &["mesh_statistics"])
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            workspace_value_at(mesh_workspace, &["last_build_summary", "mesh_statistics"])
+                .filter(|value| !value.is_null())
+        })
 }
 
 fn derive_mesh_quality_gates(snapshot: &SessionStateResponse, mesh_workspace: &Value) -> Value {
@@ -3836,6 +3839,32 @@ fn object_marker_from_mesh(mesh: Option<&FemMeshPayload>, object_id: &str) -> Op
     }
 }
 
+fn effective_airbox_target(mesh_workspace: &Value, mesh: Option<&FemMeshPayload>) -> Option<Value> {
+    [
+        &["effective_airbox_target"][..],
+        &["last_build_summary", "effective_airbox_target"],
+        &[
+            "last_build_summary",
+            "shared_domain_build_report",
+            "effective_airbox_target",
+        ],
+        &["shared_domain_build_report", "effective_airbox_target"],
+    ]
+    .iter()
+    .find_map(|path| {
+        workspace_value_at(mesh_workspace, path)
+            .filter(|value| value.is_object())
+            .cloned()
+    })
+    .or_else(|| {
+        mesh?.build_report
+            .as_ref()?
+            .effective_airbox_target
+            .as_ref()
+            .and_then(|target| serde_json::to_value(target).ok())
+    })
+}
+
 fn universe_quality(mesh_workspace: &Value, mesh: Option<&FemMeshPayload>) -> Value {
     let per_domain_quality = mesh
         .and_then(|mesh| mesh.per_domain_quality.get(&0))
@@ -3852,10 +3881,7 @@ fn universe_quality(mesh_workspace: &Value, mesh: Option<&FemMeshPayload>) -> Va
     merge_quality_field(
         &mut quality,
         "effective_airbox_target",
-        mesh_workspace
-            .get("effective_airbox_target")
-            .cloned()
-            .unwrap_or(Value::Null),
+        effective_airbox_target(mesh_workspace, mesh).unwrap_or(Value::Null),
     );
     merge_quality_field(
         &mut quality,
@@ -3870,6 +3896,34 @@ fn universe_quality(mesh_workspace: &Value, mesh: Option<&FemMeshPayload>) -> Va
         "per_domain_quality",
         per_domain_quality.unwrap_or(Value::Null),
     );
+    if mesh.is_some_and(|mesh| !super::airbox_evidence::airbox_gamma_supported(mesh)) {
+        // Historical Gmsh publications can contain numeric gamma placeholders
+        // for unsupported cell families. Do not expose them as measurements.
+        let unavailable = json!({
+            "status": "unavailable",
+            "reason": "Gmsh gamma is undefined for pyramid and hexahedron cells."
+        });
+        if let Some(global) = quality.get_mut("global").and_then(Value::as_object_mut) {
+            global.insert("gamma".to_string(), unavailable.clone());
+        }
+        if let Some(scopes) = quality.get_mut("scopes").and_then(Value::as_array_mut) {
+            for scope in scopes {
+                if let Some(scope) = scope.as_object_mut() {
+                    scope.insert("gamma".to_string(), unavailable.clone());
+                }
+            }
+        }
+        if let Some(legacy) = quality
+            .get_mut("per_domain_quality")
+            .and_then(Value::as_object_mut)
+        {
+            for key in ["gamma_min", "gamma_mean", "gamma_histogram"] {
+                legacy.insert(key.to_string(), Value::Null);
+            }
+        }
+    }
+    let gates = super::airbox_evidence::airbox_quality_gates(&quality, mesh);
+    merge_quality_field(&mut quality, "airbox_quality_gates", gates);
     quality
 }
 
