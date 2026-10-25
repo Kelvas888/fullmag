@@ -4,7 +4,9 @@
 
 Poprzedni celowy turn przyniósł postęp: commit aplikacji 498a36ae, udany managed
 build 3abcda48 oraz rzeczywiste regresje projektu i odczytu V/J/H. Pełna próba
-Universe pozostaje Failed po limicie 1800 s, nie jest aktywnym oczekiwaniem.
+Universe pozostaje Failed po natywnym limicie czasu, nie jest aktywnym oczekiwaniem.
+Skonfigurowano 1800 s łącznie i 90 s na target; dawny tekst błędu nie
+rozróżnia obu przyczyn, więc sam komunikat nie dowodzi wyczerpania 1800 s.
 
 Następny etap ma doprowadzić do pełnej mapy, bez zmniejszania liczby 1154
 targetów, dokładności, budżetów ani kontroli whole-face/fan i 80/120.
@@ -48,3 +50,39 @@ Canonical physics owner: docs/physics/0950-quasistatic-microwave-antenna-field-b
 Mapa implementacji: surface_rt0.cpp + face_pass, Arithmetic::angle i
 evaluate_surface_rt0; accepted_surface_rt0.cpp + evaluate_accepted_surface_rt0.
 Nie zmieniamy równań ani statusu inspection_only.
+
+
+## Rzeczywiste przygotowanie i pomiar początkowy
+
+Dwie aktywacje zostały odrzucone przed zmianą solvera: pełny własny authoring
+nie jest idle scratch (`live_retirement_busy`), a pusta sesja bez prawdziwego
+runu nie pasuje do terminalnego retirement (`live_retirement_current_mismatch`).
+To nadal luka produktu; nie zmieniono tej bramki. Zapisano własną scenę
+w archiwum, wykonano standardowe przejście do scratch i dopiero istniejący
+managed restart z checkpointem. Dane i 13 historii zachowano.
+
+Stop `5b751743267d4c0f84c328c5c305271c` i resume/build
+`1ab5205c9e59421e87f4b30ff47d199d` zakończyły się sukcesem. Aktywacja
+`578a868f803744f2936f4eadef5acc12` przeszła, a Prepare ma status ready.
+Pojedyncze Solve zostało przyjęte HTTP 200, command
+`fm-916f837c-af6a-4193-91da-0127c7c7e227`.
+
+Run `run-live-255fa587f4084d187d7e690f4d75076a4889fcf685a044ee02e4e8486a06b2da`,
+attempt `attempt-35f480a608e6427ebebf02d127657ab8`, epoch 1.
+Ostatnia obserwacja 1792926369512 ms: Running i rzeczywiście żywy PID 3830
+z tokenem startu 13297839. Nie ma jeszcze terminalnego wyniku ani pomiaru
+kernela; nie deklarujemy przyspieszenia. Kod solvera pozostaje niezmieniony.
+
+Katalog CAS `5402dbf7ec87f2fee4f110f1da67fe4eaab45ce6102ea76e3097fb4806dd72f9`
+został sprawdzony SHA256. Źródło ma 678 węzłów i 1865 Tet4; sampling
+14 węzłów i 24 Tet4. Zatem pełny benchmark ma 26110 par źródło–target.
+Przy odtwarzaniu trzeba użyć tych dokładnych nośników: nowy meshing nie daje
+automatycznie tej samej siatki. Raport wejść: `before-frozen-inputs-v3.json`;
+dwie wcześniejsze wersje miały błędny odczyt liczby komórek CSR i nie są
+dowodem tej liczby. V3 sprawdza types/offsets/connectivity/global_ordinals
+oraz zgodność z natywnym receiptem Prepare. Skróty siatek zachowano.
+Wszystkie powyższe receipty pomiaru: wolumen kontrolny grupy,
+`verification/surface-rt0-performance-20261025/`.
+
+Strukturalny baseline noty 0950 przeszedł istniejący validator (exit 0),
+bez zmiany noty lub kernela. Nie kompilowano natywnych testów jednostkowych.
