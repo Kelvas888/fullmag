@@ -3965,7 +3965,7 @@ def _saved_authoring_validate_archive(raw, pin):
         allowed = {'manifest/project.json', 'project/definition.json', 'project/scene_document.json'}
         source = manifest.get('source')
         if source is not None:
-            _saved_authoring_require(source in {'project/source.py', 'project/source/script.py'}, 'unexpected authoring source path')
+            _saved_authoring_require(source in ('project/source.py', 'project/source/script.py'), 'unexpected authoring source path')
             allowed.add(source)
         assets = manifest.get('assets')
         opaque = manifest.get('opaque_documents')

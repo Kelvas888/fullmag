@@ -487,7 +487,7 @@ class SavedAuthoringRestartTests(IsolatedReceiptTests):
     def test_refuses_missing_or_foreign_manifest_authoring_source(self):
         import hashlib, json
         from docker_build_control import canonical
-        for source_path in ('project/source.py', 'project/foreign.py'):
+        for source_path in ('project/source.py', 'project/foreign.py', [], {}):
             with self.subTest(source_path=source_path):
                 dev, pin, _, _, files, pack, _, _ = self.fixture()
                 manifest = json.loads(files['manifest/project.json'])
