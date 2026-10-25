@@ -210,3 +210,37 @@ zatwierdzonego zastosowania A. Odbiór E0–E12 nadal nieukończony.
 
 Na polecenie użytkownika pobrano `origin/master` do
 `f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`; fetch nie zmienia worktree.
+
+
+## Konkretna operacja finalizacji po zweryfikowaniu A — 25.10.2026
+
+Zatwierdzenie patcha A nie obejmowało finalizacji ani zwolnienia rezerwacji.
+Niniejsza operacja jest przygotowana do odrębnej decyzji.
+
+- Request SHA256: `5101ae72214536a28d15cc95ca7b2286346ea7c3b94da6d06ccd244fbca39052`.
+- Request w wolumenie kontrolnym: `verification/approved-heartbeat-A-20261025/reaped-worker-743a85-native-preflight-c849ba0f-db07-4feb-ad3b-7a74a8a66231/request.json`.
+- Run: `run-live-743a85ce65a3a257777cb73c1bf4a1c9f7f44563e6fa6b28b10b2651e9d9e5c0`.
+- Task: `task-52cd4f16fd3b44c32a02519cbc059c1d722070a366adadb153a7c2b555fe7f95`.
+- Attempt: `attempt-dad534dd37644e01be20a254b8fa75f1`, epoch 1.
+- Pakiet: receipt `f29fe925cf173feb1dce461a43f599b229269b0f4b712a5c18a7a298b835bd42`, provenance `d9b1fa84e1b44c74910fe09e70426d2c001c2677149b119e0f0bd3265acc112e`.
+
+Ponowny native `--verify-only` na niezmienionym request: exit 0. Ledger
+ma dokładnie jedną niezwolnioną rezerwację, a jej identity jest identyczne
+z przypiętym requestem. Task nadal Running/Reconciling; nie istnieje
+wykonywany worker. Wcześniejsze dziesięć negatywnych requestów odrzucono,
+236 chronionych plików pozostało identycznych.
+
+Po zgodzie ta sama natywna procedura `--fail-reaped-worker`, z tym samym
+requestem i SHA, lecz bez `--verify-only`, zapisze dokładny Failed oraz
+ExplicitOperatorRequest/DoNotRetry, zwolni wyłącznie wskazany lease
+i proof-backed host reservation oraz zarchiwizuje slot. Nie dopisze ACK,
+nie zmieni inboxa, nie ponowi Solve ani nie usunie częściowych Zarr,
+archiwów, wyników, historii lub cache. Odmowa dowolnego pinu zatrzymuje
+działanie. Po ewentualnym niejasnym wyniku nie wolno automatycznie ponawiać:
+najpierw należy odczytać trwały wynik i zastosować istniejące recovery.
+
+Ryzyko: operacja nieodwracalnie zmienia status tej próby na Failed i
+wycofuje jej przydział zasobów. Nie jest uznaniem wyniku za poprawny.
+Uruchomienie API wymaga następnie osobnej zarządzanej kontroli startu;
+nie ma gwarancji, że nie ujawni ona kolejnego problemu. Nowy master jest
+wyłącznie pobrany; nie został scalony.
