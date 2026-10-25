@@ -387,3 +387,123 @@ Dowody: `verification/antenna-universe-mesh-audit-20261025/cache-source-identity
 Helper należy do obrazu; wymaga zarządzanej aktualizacji obrazu grupy,
 a następnie sprawdzenia środowiska API i metryk nowej siatki. Nie wolno
 uznać tych testów za dowód usunięcia błędu jednostek w działającej sesji.
+
+### P12 — dowód cache i przygotowanie obrazu (bez wdrożenia)
+
+Odczyt cache i zaakceptowanego katalogu
+`e460871f733b18f6cb5976d7b7616222f52177ae4c853541ed3bae9e8a9208e0`
+potwierdził identyczne współrzędne komórek oraz wszystkie publikowane pola
+jakości czterech markerów źródła i dwóch markerów Global. Objętości zapisane
+w obu cache są większe od niezależnych determinant SI o 1e18. Źródło cache
+ma 664 węzły; przygotowanie zachowuje 1861 komórek i dodaje 13 rozszczepień
+węzłów przekroju, dając 677 węzłów. Global zachowuje 1149/6472.
+Archiwum wspólnej domeny jest v1, bez cache_identity. Dowód:
+`cache-source-identity/cache-content-audit.json` w katalogu audytu wolumenu.
+To potwierdza zgodność starych metryk z cache, bez kasowania lub przepisywania
+historycznych danych. Nie zastępuje nowego przygotowania po wdrożeniu.
+
+Poprawka handoffu zapisana w commicie
+`1b276bd5d6842013a9036c497aac718fabdf1bb2`.
+Zarządzane `just docker-dev-images` zakończone exit 0:
+- toolchain `4b756ac17fd942079a7911f605ee137f`: cache hit;
+- image-dev `6cedb61519de441da7c03e5da1d99e2a`: cache hit;
+- image-backend `8c9dc0cd2d544b1db987e1514526c387`: nowy helper,
+  obraz `sha256:4aaeaac4e770f9f491974b84dbc864ac557d05ca8e5b3b867212f49d6f93f6c5`.
+Przygotowanie obrazu nie restartowało usług ani nie wykonało Solve.
+Pierwsze wywołanie nie znalazło just w nieinteraktywnym PATH; użyto istniejącego
+`/home/kking/.local/bin/just`, bez instalacji i zmian wspólnego środowiska.
+
+Odczytowy natywny preflight z jawnym allow_prepared potwierdził gotowy,
+nigdy nieuruchomiony model waiting_for_solve. Przez publiczny eksport
+zapisano kopię compact FMS: 31043248 B, SHA256
+`ba0f8b39fc26e0100251efcfe443d4370e400db75ad5a8df8a373e600f567b59`;
+ZIP sprawdzony, session_id przypięty. Kopia znajduje się w wolumenie pod
+`cache-source-identity/prepared-scene-before-image.fms`. Nie oznacza ona
+zakończenia obliczeń. Odtworzenie obrazu i przygotowanie nowej siatki nadal
+pozostają do wykonania po przeglądzie poprawki publikacji.
+
+Retencja tego fragmentu: zachowano cache, aktualny pakiet, kopię sceny,
+receipty i wyniki. Nie wytypowano danych do usunięcia. Przed przygotowaniem
+obrazu wolne D: 182953345024 B, filesystem `/build`: 432787095552 B.
+
+
+### P11/P12 — rzeczywista publikacja Global i jednostki po wdrożeniu
+
+Wdrożono obraz `sha256:4aaeaac4e770f9f491974b84dbc864ac557d05ca8e5b3b867212f49d6f93f6c5`.
+Aktualna próba DEV `b8caf9450c654efc84688285684834f6`, konfiguracja
+`9f4856073cde3f3ffe8338b23610277a5e242bee4d9c552300f7b122ed51e276`.
+Build aplikacji zakończył się poprawnie (228436 ms). Zachowano cache i wyniki.
+Pierwsza aktywacja po poprzednim odtworzeniu została odrzucona przed przyjęciem
+runu, ponieważ pominięto wcześniej zatwierdzone mapowanie wyjścia `examples`.
+Przywrócono je wyłącznie w środowisku zadania; nie zmieniano wspólnego `.env`.
+Zmiana klasyfikacji trzech plików danych examples zmieniła hash snapshotu:
+nie był to cache hit pakietu, mimo zgodności śledzonych źródeł runtime.
+
+Nowa aktywacja `antenna-universe-global-mesh-20261025-03` zakończona poprawnie,
+bez Solve. Run `run-live-6a1ab0dfeccc1e967d143ccef50278ba9331b5ba0dd284f7cc01bbad39ceb2f2`
+czeka na Solve. Katalog `9e4c550eae28c448065c28aa61631ed2a6ba77915e681b3fa8752160b86caf86`.
+Global: 1150 węzłów, 6464 Tet4 (4738 powietrza, 1726 przewodnika).
+Osobna siatka przewodnika z przekrojem źródła: 679 węzłów, 1867 Tet4.
+Publiczny binary Global zachowuje dokładnie współrzędne, connectivity,
+offsets, ordinals i markery zaakceptowanego katalogu. Niezależne determinanty
+potwierdziły dodatnie objętości i jednostki SI statystyk min/max/mean/std
+wszystkich markerów Global i przewodnika. Te kontrole przeszły; nie są dowodem
+zbieżności ani kwalifikacją pola H. Pełne pole Universe nadal nieobliczone.
+Dowody: `verification/antenna-universe-mesh-audit-20261025/public-global-after-identity-fix-v2/`.
+
+### P13 — finalizacja startup usuwa metadane przygotowanej sceny
+
+Publiczne odczyty topology/quality/report źródła zwracają 409
+`antenna_source_mesh_invalid`. Potwierdzona przyczyna nie leży w parserze:
+`docker_startup.rs::publish_startup_result` nadpisuje metadata po
+`publish_accepted_frontier_preparation`, usuwając `execution_plan`,
+`antenna_domain_publication` i `magnetic_state_present`.
+Eksport FMS o SHA256 `a04b81a60e3a5cccd165775fabad8d38ff1685edddd445bde77a143dc8af9baf`
+(31125974 B) zawiera tylko klucz `docker_startup`; plan pozostał w workspace.
+
+Poprawka zachowuje obiekt metadata i zastępuje tylko wpis właściciela startup.
+Niepoprawna postać metadata jest odrzucana przed mutacją snapshotu.
+Dwie dodane regresje Rust obejmują zachowanie pozostałych wpisów oraz brak
+częściowej mutacji po odrzuceniu; nie kompilowano ich zgodnie z zakazem repo.
+Niezależny przegląd kodu nie znalazł blockerów. Runtime poprawki: NOT VERIFIED
+przed kolejnym zarządzanym buildem. Nie dodano fallbacku do workspace.
+
+Retencja: zachowano wszystkie cache, wyniki, scenę, pakiet i receipty;
+nie wskazano danych do usunięcia. Wolne D: 178504294400 B, /build: 427047272448 B.
+Bramka 1/5 pozostaje otwarta: źródło przez API wymaga ponownej kontroli,
+a rzeczywisty UI/WebGL nadal NOT VERIFIED. Kolejność dalszych kroków:
+naprawiona publikacja i siatki → prąd → pole → cold-load → UI.
+
+
+### P13 — weryfikacja runtime po poprawce, 26.10.2026
+
+Zarządzany restart zakończony poprawnie: iteration
+`b2d649c1e5c24c90b48ad855923a2569`, konfiguracja bez zmian.
+Build aplikacji exit 0, 219599 ms; pakiet nie był cache hit, cache zachowany.
+API uruchomione ze snapshotem
+`79037219b3e3f4c1f4e27a2edad8097dc3aa91ffaada3aaddea4f7b308034864`.
+Aktywacja `antenna-universe-global-mesh-20261026-04`, receipt
+`de1ff83ca18e4d29bfc693bee6b2171f`, zakończona poprawnie bez Solve.
+
+Bieżący run `run-live-2f2f35216a3d2f071397d9524ecb3d62db1f517291bac27e64524428444a0ca0`
+czeka na Solve; katalog
+`fe71c28c34c4b2168e031f693f0c77b602e0ec525f7d3c30c11cf09f9dbc2481`.
+Nowe przygotowanie Gmsh daje Global 1162 węzły / 6548 Tet4 oraz przewodnik
+677 / 1859. Nie jest to zmiana poprzedniego zaakceptowanego katalogu.
+
+Odczytowy audyt `verify_public_mesh_v3.py` w wolumenie zakończył się exit 0.
+Topologia, raport i jakość źródła oraz Global wracają przez publiczne API;
+błąd 409 nie występuje. Zgodność współrzędnych, markerów, connectivity,
+offsets i ordinals obu siatek z nowym katalogiem jest dokładna. Determinanty
+potwierdzają dodatnie skończone objętości oraz SI min/max/mean/std każdego
+markera. Universe zawiera części powietrza i przewodnika; źródło ma cztery
+markery i osobny nośnik. Nieistniejący obiekt zwraca 404, bez podstawienia
+Global. Tożsamość sesji pozostała stabilna przez audyt.
+Dowody: `verification/antenna-universe-mesh-audit-20261025/public-after-startup-metadata-fix/`.
+
+Aktualny status P13: naprawa potwierdzona w rzeczywistym runtime dla
+przygotowania i odczytu siatek. Dwie regresje Rust pozostają niewykonane
+(zakaz kompilowania testów). Cold-load i UI/WebGL pozostają NOT VERIFIED.
+Bramka 1/5 jest częściowo zaliczona po stronie API; nie zamykamy jej jako
+pełnego etapu. Pełne H w Universe nadal nieobliczone. Retencja: bez usuwania,
+zachowano cache, wyniki, kopie sceny, pakiety i receipty.
