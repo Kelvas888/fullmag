@@ -62,3 +62,36 @@ W trakcie implementacji uzupełnić wyniki i pełne hashe commitów. Audyt wejś
 - Poprawiona aktywacja wygenerowała 39 946 komórek mixed-v2. Natywny preparer zakończył się kodem 1: `FEM per-domain quality marker coverage does not match the canonical mesh`. Przyczyna: starszy format jakości wymaga kompletnego zestawu markerów, a pominięcie samego markera z nieobsługiwaną gamma tworzyło niekompletny zestaw. Poprawka ma pomijać cały niekompletny starszy format, zachowując bogate statystyki i rzeczywiście dostępne metryki. Brak publikacji siatki oznacza nadal NOT VERIFIED dla browser proof; solver ma zero kroków.
 - Aktualny `origin/master` `28a856ed9df5a4493d2ffd32a7647ac5cc378429` włączono do brancha. Rozwiązano konflikt adaptera zaznaczenia, zachowując fallback statusów z master i przyczynę stanu Airboxa. Typecheck i lint zmienionego adaptera przeszły; 29 testów kernelów oraz 10 kontroli jakości/statystyk po automatycznym połączeniu Pythona przeszło.
 - Hook React Doctor nie ukończył analizy ze względu na błąd parsera oxlint (`Unexpected discriminant 7 for TSTypeName`); nie traktujemy komunikatu „No issues found” jako dowodu. Wcześniejsze siedem wskazań harnessu dotyczy ograniczonych wyszukiwań w siedmiu panelach, celowej kolejności obserwacji stanu i klonowania syntetycznego JSON; nie są potwierdzonymi regresjami produkcyjnego UI.
+- Poprawka pełnego pokrycia starszego raportu: `e8adeef015c886d71b1e826bfb3eb13a98f23e52`. Pięć ukierunkowanych regresji Pythona, walidator source-map oraz 41 testów kontraktu dokumentacji przeszły. Kontrole obejmują niedostępną gamma dla piramid, zachowanie bogatych statystyk, kompletne prism/tet, zgodność markerów i liczników oraz zgodność ze starszym raportem tetra bez jawnego licznika gamma.
+
+### Blokada runtime i integracji
+
+Aktywacja `d58f86f68d664597843d3fe19eecda20` dotyczyła wyłącznie modelu QA. Jej run
+`run-live-3b56027074d2cec8f6b47c1f447e359a207eb94481365e69adeecc1af4d11385`
+ma 39 946 komórek: marker 0 — 38 161 (38 071 tet4 i 90 pyramid5), marker 1 —
+1 012, marker 2 — 773. Niekompletny starszy raport zawierał tylko markery 1 i 2.
+Exit receipt preparera potwierdza kod 1; lease został zwolniony, artefakty nie
+zostały opublikowane. Naprawiono producenta danych, lecz jeszcze nie wdrożono
+tej poprawki do runtime.
+
+Oficjalne polecenie Stop zostało przyjęte (command
+`fm-b5a1e95b-539e-48ad-8a5b-e0b80a2ab38f`); API potwierdza `cancelled` i zero
+kroków solvera. Aktywacja zakończyła się HTTP 409
+`accepted_preparation_run_stopped`, a launcher zachował
+`outcome-unknown-resources-retained`. Nie wykonano ponowienia.
+
+Istniejące procedury recovery nie obsługują tego dokładnego zestawu dowodów:
+`stop-diagnostic-volume` wymaga awarii ownera i zadania `accepted`,
+`stop-held-retirement-volume` wymaga `failed`, a kwarantanna namespace wymaga
+zadania `accepted` oraz węższego inwentarza. Bieżący owner jest `ready`, zadanie
+jest `cancelled`, istnieją receipty procesu i intent anulowania. Idle restart
+odrzuca aktywną sesję; recreate wymaga uprzedniego poprawnego zatrzymania.
+Nie zmieniano markerów, nie usuwano sesji i nie zatrzymywano innych grup.
+
+Status zadania: **blocked** przed browser proof, merge i cleanup. Wymagany
+następny krok: jawnie obsługiwana procedura recovery dla anulowanego
+przygotowania ze zwolnionym lease i zachowanym niejednoznacznym receiptem
+aktywacji, następnie build poprawionego HEAD, nowa aktywacja bez Solve,
+porównanie API/przeglądarki, merge i cleanup. Zakres recovery przekazano do
+decyzji użytkownika. Worktree, grupa zadania i kontrolny wolumen dowodów
+pozostają zachowane; głównego checkoutu nie aktualizowano.
