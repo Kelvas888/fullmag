@@ -64,3 +64,55 @@ powielonych pinów oraz złych digestów. Testów Rust nie skompilowano ani nie
 wykonano. Wymagane są jeszcze build aplikacji, rzeczywisty odczyt dowodów,
 negatywne przypadki wejść, integracja launchera i kontrolowane recovery.
 Nie zastosowano migracji ownera. Nowe V/J/H i Universe nadal NOT VERIFIED.
+
+## Build i pierwsza rzeczywista diagnostyka
+
+Managed recovery-build `9d5c8a6f61164d299f621a50a9cde42e` zakończył się
+succeeded/exit0. Make: 636733 ms; pakowanie: 3599 ms / 24 pliki.
+Źródło: `ea1cb3ed807b37c7f21cc13149538d2100bf3317`, snapshot
+`30f655a6462697e0086291f4da34b98b0d413d84abc07fd134a326b8673a6b70`.
+Kandydat: `.backend-package-candidate-gvcf71no`, receipt SHA256
+`be2ef899c8a62cb8594ab02aa1cf26130df21499be2350e72eaf871451366b52`.
+Starszy kandydat `.backend-package-candidate-sexe5b82` jest zachowany w
+quarantine; bieżącego pakietu nie promowano i nie startowano runtime.
+
+W wolumenie kontrolnym, katalog
+`verification/terminal-history-recovery-v3-20261025/`, zachowano odtwarzalny
+`inspect-native-history.py`, `native-history-progress.json` i
+`native-history-diagnostics.json`. Nowy CLI rzeczywiście uruchomiono, lecz
+14/14 odczytów zatrzymała bramka `compiled source commit differs from runtime
+provenance`. Obecny backend prawidłowo poświadcza stary pakiet c0f3dc7e;
+nieopublikowany klient ea1cb3ed nie może udawać tego pakietu.
+Nie uzyskano jeszcze żadnego terminal_evidence_sha256 ani gotowych pinów recovery.
+Sprawdzono niezmienność 33 chronionych plików: config/owner/process/provenance,
+ledger oraz intent/catalog dla każdego z 14 runów.
+
+Negatywny raw config SHA i niebezpieczny run_id odmówiono we właściwych
+bramkach. Przypadek brakującego runu nie dotarł do kontroli istnienia, ponieważ
+wcześniej odmówiło provenance; nie jest zaliczonym testem tej gałęzi.
+Źródłowych testów Rust nadal nie kompilowano.
+
+Inventory obejmuje 14 terminalnych katalogów. 2027 pinów CAS odpowiada dokładnie
+2027 referencjom inputów z zachowanych intentów, o łącznym rozmiarze obiektów
+107196388 bajtów. To odczytowy pomiar, nie wykonanie pełnego natywnego walidatora
+CAS ani dowód zakończenia procesów. Limitów walidatora nie zmieniono.
+
+## Następna droga weryfikacji
+
+Odrzucono zmianę globalnego provenance działającego API oraz osłabienie bramki
+storage. Potrzebny jest osobny kanoniczny widok zbudowanego kandydata dla
+odczytowej diagnostyki: ten sam obraz i grupa, kandydat widoczny jako
+`/opt/fullmag/package`, jego zgodne provenance wyłącznie w technicznym
+podkatalogu kontrolnym, bez kompilacji/API/Solve. Dane hosta pozostają te same;
+natywne blokady i kontrola niezmienności są obowiązkowe. Taki helper musi zostać
+zintegrowany z zarządzaną receptą i przetestowany przed użyciem; sama ta propozycja
+nie jest działającą trasą ani zgodą na zmianę provenance starego API.
+
+Docker dokumentuje `volume-subpath` dla montowania istniejącego podkatalogu
+wolumenu: [Volumes](https://docs.docker.com/engine/storage/volumes/#mount-a-volume-subdirectory).
+Obsługę wprowadzono w Engine 26.0; wersję rzeczywistego silnika trzeba sprawdzić
+przed wdrożeniem helpera. Pakiet kandydata można odczytywać, zachowując globalny
+mount i provenance dotychczasowego backendu bez zmian.
+
+Odczyt silnika na tym hoście: Docker Engine `29.7.2`, API `1.55`.
+Wersja nie jest blokadą `volume-subpath`; sama nowa recepta nadal NOT VERIFIED.
