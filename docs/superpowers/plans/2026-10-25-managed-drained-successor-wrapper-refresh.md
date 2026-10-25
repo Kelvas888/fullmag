@@ -74,3 +74,16 @@ zatwierdzony budżet przed jednym Solve. Nie ponawiać operacji o nieznanym wyni
 Wyników przeglądarkowych/WebGL nie uzyskano; wcześniejsza blokada narzędzia
 pozostaje. Nowe obrazy, GREEN testów czy poprawny build nie są dowodem obliczenia
 pełnego pola ani kwalifikacji bazy LLG/FFT. Cel E0–E12 pozostaje nieukończony.
+
+## Doprecyzowanie granicy shell
+
+Pierwsze wywołanie nowego stop-only zostało odrzucone przez allowlistę shell
+przed wykonaniem lifecycle. Dopisano dokładną parę nowych flag recreate i
+przeniesiono istniejące opcjonalne stop-only poza grupę saved-authoring.
+Nie poszerzono dispatchu do dowolnego polecenia. Cztery nowe regresje wykonują
+rzeczywisty blok dispatchu z podstawionym wyjściem argv: ordinary stop-only,
+saved-authoring stop-only, obie pary pinów i odmowa niepełnych/nadmiarowych flag.
+Po tej korekcie cały moduł recreate: **57 testów PASS**, wraz z wcześniejszymi
+guardami native/owner/retained state. Bash syntax PASS. Raport:
+`verification/wrapper-refresh-20261025/native-focused-shell-final.json`.
+Wynik 1256 testów powyżej dotyczy wersji przed tą wąską korektą shell.

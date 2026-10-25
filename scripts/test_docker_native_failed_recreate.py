@@ -740,6 +740,59 @@ class CompletedRemovalNativeProofTests(unittest.TestCase):
         self.control.write.assert_not_called()
 
 
+class DrainedSuccessorShellBoundaryTests(unittest.TestCase):
+    def shell_argv(self, action, suffix):
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        shell = (root / 'scripts/just_storage_shell.sh').read_text()
+        start = shell.index('  *"scripts/docker_dev.py"*)')
+        end = shell.index('\n    ;;', start)
+        body = shell[shell.index('\n', start) + 1:end]
+        final = 'exec "${python_cmd}" "${script_dir}/docker_dev.py" "${docker_dev_args[@]}"'
+        self.assertEqual(body.count(final), 1)
+        body = body.replace(final, 'printf "%s' + chr(92) + 'n" "${docker_dev_args[@]}"')
+        recipe = ('python "D:/selected checkout/scripts/docker_dev.py" --repo-root "D:/selected checkout" '
+            + action + " --attempt '" + '1' * 32 + "' --config-sha256 '" + 'a' * 64
+            + "' --source-root 'D:/selected checkout' --port '3203'" + suffix)
+        result = subprocess.run(['/bin/bash', '-euc', "repo_root='D:/selected checkout'\nrecipe=$1\n" + body,
+                                 'fixture', recipe], capture_output=True)
+        return result, result.stdout.decode().splitlines()
+
+    def test_idle_stop_passes_without_saved_authoring_checkpoint(self):
+        result, args = self.shell_argv('restart-idle-volume', ' --stop-only')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(args[-1], '--stop-only')
+        self.assertEqual(args.count('--stop-only'), 1)
+        self.assertNotIn('--saved-authoring-checkpoint', args)
+
+    def test_saved_authoring_stop_preserves_its_exact_pins(self):
+        suffix = " --saved-authoring-checkpoint 'verification/checkpoint.json' --saved-authoring-checkpoint-sha256 '" + 'b' * 64 + "' --stop-only"
+        result, args = self.shell_argv('restart-idle-volume', suffix)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(args[-5:], ['--saved-authoring-checkpoint', 'verification/checkpoint.json',
+            '--saved-authoring-checkpoint-sha256', 'b' * 64, '--stop-only'])
+
+    def test_recreation_preserves_completed_and_drained_proof_pairs(self):
+        suffix = (" --completed-recreation-attempt '" + '2' * 32
+            + "' --completed-recreation-sha256 '" + 'b' * 64
+            + "' --drained-successor-proof '/opt/fullmag/control/verification/proof.json'"
+            + " --drained-successor-proof-sha256 '" + 'c' * 64 + "'")
+        result, args = self.shell_argv('recreate-volume', suffix)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(args[-8:], ['--completed-recreation-attempt', '2' * 32,
+            '--completed-recreation-sha256', 'b' * 64, '--drained-successor-proof',
+            '/opt/fullmag/control/verification/proof.json', '--drained-successor-proof-sha256', 'c' * 64])
+        self.assertEqual(args[args.index('--source-root') + 1], 'D:/selected checkout')
+
+    def test_unpaired_proof_and_unexpected_shell_tail_are_refused(self):
+        for suffix in (" --drained-successor-proof '/opt/fullmag/control/verification/proof.json'",
+                       ' --stop-only; echo injected'):
+            with self.subTest(suffix=suffix):
+                result, args = self.shell_argv('recreate-volume', suffix)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b'')
+
+
 class DrainedSuccessorDispatchTests(unittest.TestCase):
     def test_explicit_successor_validates_current_drain_without_replaying_old_failure(self):
         import docker_volume_drained_successor as successor

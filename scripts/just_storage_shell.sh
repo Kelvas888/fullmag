@@ -367,10 +367,10 @@ case "${recipe}" in
     docker_dev_resume_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" resume-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --restart-backend)?( --prestart-reconciliation '([0-9a-f]{32})' --prestart-reconciliation-sha256 '([0-9a-f]{64})')?[[:space:]]*$"
     docker_dev_discover_script_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" script --script '([^']+)'( --source-root '([^']+)')?( --port '([0-9]{4,5})')?( --request-id '([^']+)')?[[:space:]]*$"
     docker_dev_activate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" activate-script --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --script '([^']+)'( --request-id '([^']+)')?[[:space:]]*$"
-    docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'([[:space:]]+--recovery-authorization '([^']+)')?([[:space:]]+--fresh-state)?([[:space:]]+--completed-recreation-attempt '([0-9a-f]{32})'[[:space:]]+--completed-recreation-sha256 '([0-9a-f]{64})')?[[:space:]]*$"
+    docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'([[:space:]]+--recovery-authorization '([^']+)')?([[:space:]]+--fresh-state)?([[:space:]]+--completed-recreation-attempt '([0-9a-f]{32})'[[:space:]]+--completed-recreation-sha256 '([0-9a-f]{64})')?([[:space:]]+--drained-successor-proof '([a-zA-Z0-9_./-]+)'[[:space:]]+--drained-successor-proof-sha256 '([0-9a-f]{64})')?[[:space:]]*$"
     docker_dev_resume_recreation_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})' --resume-recreation '([0-9a-f]{32})'[[:space:]]*$"
     docker_dev_frontend_refresh_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" refresh-frontend-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'[[:space:]]*$"
-    docker_dev_idle_restart_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" restart-idle-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --saved-authoring-checkpoint '([a-zA-Z0-9_./-]+)' --saved-authoring-checkpoint-sha256 '([0-9a-f]{64})'( --stop-only)?)?[[:space:]]*$"
+    docker_dev_idle_restart_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" restart-idle-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --saved-authoring-checkpoint '([a-zA-Z0-9_./-]+)' --saved-authoring-checkpoint-sha256 '([0-9a-f]{64})')?( --stop-only)?[[:space:]]*$"
     docker_dev_args=(--repo-root "${repo_root}")
     if [[ "${recipe}" =~ ${docker_dev_codegen_pattern} ]]; then
       docker_dev_args+=(codegen-openapi)
@@ -429,6 +429,9 @@ case "${recipe}" in
       if [[ -n "${BASH_REMATCH[8]:-}" ]]; then
         docker_dev_args+=(--completed-recreation-attempt "${BASH_REMATCH[9]}" --completed-recreation-sha256 "${BASH_REMATCH[10]}")
       fi
+      if [[ -n "${BASH_REMATCH[11]:-}" ]]; then
+        docker_dev_args+=(--drained-successor-proof "${BASH_REMATCH[12]}" --drained-successor-proof-sha256 "${BASH_REMATCH[13]}")
+      fi
     elif [[ "${recipe}" =~ ${docker_dev_frontend_refresh_pattern} ]]; then
       docker_dev_args+=(refresh-frontend-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
         --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
@@ -438,8 +441,8 @@ case "${recipe}" in
       if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
         docker_dev_args+=(--saved-authoring-checkpoint "${BASH_REMATCH[6]}"
           --saved-authoring-checkpoint-sha256 "${BASH_REMATCH[7]}")
-        if [[ -n "${BASH_REMATCH[8]:-}" ]]; then docker_dev_args+=(--stop-only); fi
       fi
+      if [[ -n "${BASH_REMATCH[8]:-}" ]]; then docker_dev_args+=(--stop-only); fi
     else
       echo "[fullmag just] invalid direct Docker development recipe" >&2
       exit 2
