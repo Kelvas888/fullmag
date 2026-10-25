@@ -3869,18 +3869,10 @@ class MeshData:
             ir["mixed_layer_topology_certificate"] = (
                 mesh.mixed_layer_topology_certificate.to_dict()
             )
-        if mesh.per_domain_quality is not None:
-            legacy_quality = {}
-            for marker, q in mesh.per_domain_quality.items():
-                # The legacy MeshIR quality carrier cannot mark a partial
-                # gamma scope. Mixed family metrics are available through
-                # mesh_statistics.scopes[].quality_by_family instead.
-                if (
-                    q.gamma_element_count is not None
-                    and q.gamma_element_count != q.n_elements
-                ):
-                    continue
-                legacy_quality[str(marker)] = {
+        if _legacy_per_domain_quality_is_complete(mesh):
+            assert mesh.per_domain_quality is not None
+            ir["per_domain_quality"] = {
+                str(marker): {
                     "n_elements": q.n_elements,
                     "sicn_min": q.sicn_min,
                     "sicn_max": q.sicn_max,
@@ -3896,12 +3888,46 @@ class MeshData:
                     "volume_std": q.volume_std,
                     "avg_quality": q.avg_quality,
                 }
-            if legacy_quality:
-                ir["per_domain_quality"] = legacy_quality
+                for marker, q in mesh.per_domain_quality.items()
+            }
         mesh_statistics = mesh.statistics_ir(mesh_name)
         if mesh_statistics is not None:
             ir["mesh_statistics"] = mesh_statistics
         return ir
+
+
+def _legacy_per_domain_quality_is_complete(mesh: MeshData) -> bool:
+    """Whether the legacy gamma-bearing carrier covers every eligible marker."""
+    reports = mesh.per_domain_quality
+    if not reports:
+        return False
+
+    marker_ids, marker_counts = np.unique(mesh.element_markers, return_counts=True)
+    canonical_counts = {
+        int(marker): int(count)
+        for marker, count in zip(marker_ids, marker_counts, strict=True)
+    }
+    if set(reports) != set(canonical_counts):
+        return False
+
+    gamma_supported = np.isin(mesh.cell_types, ("tet4", "prism6"))
+    unsupported_markers = set(
+        int(marker)
+        for marker in np.unique(mesh.element_markers[~gamma_supported])
+    )
+    for marker, expected_count in canonical_counts.items():
+        report = reports[marker]
+        if (
+            report.n_elements != expected_count
+            or report.quality_source != "gmsh"
+            or marker in unsupported_markers
+            or (
+                report.gamma_element_count is not None
+                and report.gamma_element_count != expected_count
+            )
+        ):
+            return False
+    return True
 
 
 def _mesh_quality_report_from_serialized(value: object) -> MeshQualityReport | None:

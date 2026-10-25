@@ -282,6 +282,12 @@
       "responsibility": "Builds bounded global and marker-scope statistics with truthful per-family availability and volume/edge histograms."
     },
     {
+      "id": "legacy-marker-quality-serialization",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py",
+      "symbol": "_legacy_per_domain_quality_is_complete",
+      "responsibility": "Allows the gamma-bearing legacy marker map only when canonical marker coverage, counts, and Gmsh gamma eligibility are complete."
+    },
+    {
       "id": "mesh-size-histograms",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py",
       "symbol": "_size_histogram_bins",

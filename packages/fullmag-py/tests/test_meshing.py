@@ -1543,6 +1543,8 @@ class MeshScaffoldTests(unittest.TestCase):
         flatten_pyramid: bool = False,
         quality: MeshQualityReport | None = None,
         per_domain_quality: dict[int, MeshQualityReport] | None = None,
+        families: tuple[str, ...] = ("tet4", "prism6", "pyramid5", "hex8"),
+        family_markers: dict[str, int] | None = None,
     ) -> MeshData:
         coordinates_by_family = {
             "tet4": np.asarray(
@@ -1589,7 +1591,14 @@ class MeshScaffoldTests(unittest.TestCase):
         facet_nodes: list[int] = []
         nodes: list[NDArray[np.float64]] = []
         element_markers: list[int] = []
-        for family, marker in (("tet4", 0), ("prism6", 1), ("pyramid5", 2), ("hex8", 3)):
+        markers_by_family = family_markers or {
+            "tet4": 0,
+            "prism6": 1,
+            "pyramid5": 2,
+            "hex8": 3,
+        }
+        for family in families:
+            marker = markers_by_family[family]
             coordinates = coordinates_by_family[family]
             node_start = sum(block.shape[0] for block in nodes)
             nodes.append(coordinates)
@@ -1695,6 +1704,143 @@ class MeshScaffoldTests(unittest.TestCase):
             airbox["characteristic_size"]["definition"],
             "volume_equivalent_regular_tetrahedron",
         )
+
+    def test_legacy_per_domain_quality_is_all_or_nothing_for_mixed_markers(self) -> None:
+        def metric(value: float) -> dict[str, object]:
+            return {
+                "status": "available",
+                "source": "gmsh",
+                "min": value,
+                "p05": value,
+                "mean": value,
+                "max": value,
+            }
+
+        def report(
+            family: str,
+            value: float,
+            *,
+            gamma_element_count: int,
+            n_elements: int = 1,
+            quality_source: str = "gmsh",
+        ) -> MeshQualityReport:
+            gamma = (
+                metric(value)
+                if family in {"tet4", "prism6"}
+                else {"status": "unavailable", "reason": "Gmsh gamma is undefined."}
+            )
+            return MeshQualityReport(
+                n_elements=n_elements,
+                sicn_min=value,
+                sicn_max=value,
+                sicn_mean=value,
+                sicn_p5=value,
+                sicn_histogram=[0] * 20,
+                gamma_min=value,
+                gamma_mean=value,
+                gamma_histogram=[0] * 20,
+                volume_min=1.0 / 6.0,
+                volume_max=1.0 / 6.0,
+                volume_mean=1.0 / 6.0,
+                volume_std=0.0,
+                avg_quality=value,
+                quality_source=quality_source,
+                gamma_element_count=gamma_element_count,
+                quality_by_family={
+                    family: {
+                        "cell_count": n_elements,
+                        "source": "gmsh",
+                        "sicn": metric(value),
+                        "gamma": gamma,
+                    }
+                },
+            )
+
+        mixed_partial = self._regular_mixed_quality_statistics_mesh(
+            families=("pyramid5", "tet4"),
+            family_markers={"pyramid5": 0, "tet4": 1},
+            per_domain_quality={
+                0: report("pyramid5", 0.6, gamma_element_count=0),
+                1: report("tet4", 0.9, gamma_element_count=1),
+            },
+        )
+
+        partial_payload = mixed_partial.to_ir("mixed_partial_gamma")
+
+        self.assertNotIn("per_domain_quality", partial_payload)
+        partial_scopes = {
+            scope["marker"]: scope
+            for scope in partial_payload["mesh_statistics"]["scopes"]
+            if scope["marker"] is not None
+        }
+        pyramid_quality = partial_scopes[0]["quality_by_family"]["pyramid5"]
+        tet_quality = partial_scopes[1]["quality_by_family"]["tet4"]
+        self.assertEqual(pyramid_quality["sicn"]["status"], "available")
+        self.assertEqual(pyramid_quality["gamma"]["status"], "unavailable")
+        self.assertEqual(tet_quality["sicn"]["status"], "available")
+        self.assertEqual(tet_quality["gamma"]["status"], "available")
+
+        all_supported = self._regular_mixed_quality_statistics_mesh(
+            families=("prism6", "tet4"),
+            family_markers={"prism6": 0, "tet4": 1},
+            per_domain_quality={
+                0: report("prism6", 0.8, gamma_element_count=1),
+                1: report("tet4", 0.9, gamma_element_count=1),
+            },
+        )
+
+        supported_payload = all_supported.to_ir("all_supported_gamma")
+
+        self.assertEqual(
+            set(supported_payload["per_domain_quality"]),
+            {"0", "1"},
+        )
+
+        legacy_tet = self._regular_mixed_quality_statistics_mesh(
+            families=("tet4",),
+            family_markers={"tet4": 0},
+            per_domain_quality={
+                0: report("tet4", 0.9, gamma_element_count=None),
+            },
+        )
+        self.assertEqual(
+            set(legacy_tet.to_ir("legacy_tet")["per_domain_quality"]),
+            {"0"},
+        )
+
+        incomplete_reports = {
+            "missing_marker": {0: report("prism6", 0.8, gamma_element_count=1)},
+            "extra_marker": {
+                0: report("prism6", 0.8, gamma_element_count=1),
+                1: report("tet4", 0.9, gamma_element_count=1),
+                2: report("tet4", 0.9, gamma_element_count=1),
+            },
+            "partial_gamma": {
+                0: report("prism6", 0.8, gamma_element_count=0),
+                1: report("tet4", 0.9, gamma_element_count=1),
+            },
+            "non_gmsh_source": {
+                0: report(
+                    "prism6",
+                    0.8,
+                    gamma_element_count=1,
+                    quality_source="swept_topology_proxy",
+                ),
+                1: report("tet4", 0.9, gamma_element_count=1),
+            },
+            "misaligned_count": {
+                0: report("prism6", 0.8, gamma_element_count=1),
+                1: report("tet4", 0.9, gamma_element_count=2, n_elements=2),
+            },
+        }
+        for case, reports in incomplete_reports.items():
+            with self.subTest(case=case):
+                mesh = self._regular_mixed_quality_statistics_mesh(
+                    families=("prism6", "tet4"),
+                    family_markers={"prism6": 0, "tet4": 1},
+                    per_domain_quality=reports,
+                )
+                self.assertNotIn("per_domain_quality", mesh.to_ir(case))
 
     def test_mixed_mesh_statistics_count_inverted_and_degenerate_cells(self) -> None:
         mesh = self._regular_mixed_quality_statistics_mesh(

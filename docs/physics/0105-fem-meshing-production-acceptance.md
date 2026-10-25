@@ -324,6 +324,12 @@ marker counts alone do not partition those metrics. These descriptive
 summaries do not certify the FMMQ v2 production gates or change their sampling
 and acceptance rules.
 
+Starszy format `per_domain_quality` wymaga kompletnego pokrycia markerów i ich
+liczności. Jeżeli choć jeden marker nie ma pełnej obsługiwanej metryki gamma,
+publikacja pomija cały starszy format zamiast emitować niekompletny podzbiór.
+Nie usuwa to bogatych `mesh_statistics` ani dostępnych metryk per-family;
+nie wprowadza również sztucznych wartości gamma.
+
 The mixed-v2 Gmsh producer extracts these metrics when quality computation is
 requested and converts its scaled-coordinate volume channels back to SI before
 attaching them to `MeshData`. Marker reports are rekeyed only when the final
@@ -469,6 +475,7 @@ synthetic-only oracle albo niepowiązany fingerprint daje `not_qualified`.
 | Field stack | `packages/fullmag-py/src/fullmag/meshing/_size_field_plan.py` | `_build_field_stack` | current deterministic size-field descriptors | FEM CPU/GPU | implemented, complete evidence pending |
 | Gmsh metrics | `packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py` | `_extract_quality_metrics` | current SICN/gamma/volume extraction | FEM CPU/GPU | implemented for current report path |
 | Jacobian sampling | `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_cell_jacobian_determinants` | topology-aware determinant samples | FEM CPU/GPU | implemented certificate evidence |
+| Legacy marker quality serialization | `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_legacy_per_domain_quality_is_complete` | permits the gamma-bearing legacy map only for complete, count-aligned, gamma-eligible Gmsh marker reports | FEM CPU/GPU | implemented; mixed family metrics remain in `mesh_statistics` |
 | FMMQ v1 writer | `packages/fullmag-py/src/fullmag/meshing/remesh_cli.py` | `_write_quality_data_artifact_if_available` | writes active FMMQ v1 arrays without family/topology identity | FEM CPU/GPU transport | implemented v1; v2 planned |
 | FMMQ v1 TS reader | `apps/control-room/src/kernel/api/codecs/meshQualityDataCodec.ts` | `decodeMeshQualityData` | decodes active v1 layout; format identity is insufficient for mixed qualification | unified Control Room | implemented v1; v2 planned |
 | FMMQ v1 Rust reader | `crates/fullmag-api/src/fem_cross_section.rs` | `per_element_quality_metric_from_fmmq` | reads active v1 per-element arrays | API | implemented v1; v2 planned |
