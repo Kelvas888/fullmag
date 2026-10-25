@@ -88,10 +88,32 @@ jest `cancelled`, istnieją receipty procesu i intent anulowania. Idle restart
 odrzuca aktywną sesję; recreate wymaga uprzedniego poprawnego zatrzymania.
 Nie zmieniano markerów, nie usuwano sesji i nie zatrzymywano innych grup.
 
-Status zadania: **blocked** przed browser proof, merge i cleanup. Wymagany
+Status tego checkpointu: **blocked** przed browser proof, merge i cleanup. Wymagany
 następny krok: jawnie obsługiwana procedura recovery dla anulowanego
 przygotowania ze zwolnionym lease i zachowanym niejednoznacznym receiptem
 aktywacji, następnie build poprawionego HEAD, nowa aktywacja bez Solve,
 porównanie API/przeglądarki, merge i cleanup. Zakres recovery przekazano do
 decyzji użytkownika. Worktree, grupa zadania i kontrolny wolumen dowodów
 pozostają zachowane; głównego checkoutu nie aktualizowano.
+
+### Rozszerzenie zatwierdzone przez użytkownika
+
+Użytkownik zatwierdził naprawę recovery i dokończenie weryfikacji oraz merge.
+Rejestr zadania przywrócono do `wip`. Procedura przypina anulowaną aktywację,
+failed exit preparera i zwolniony lease, następnie wymaga potwierdzonego drain
+tej samej instancji backendu. Osobny świeży runtime może powstać dopiero przez
+zweryfikowaną archiwizację starego runtime-control, z zachowaniem state root.
+Stare żądanie i wznowienie starego runtime pozostają zablokowane. Zakres i
+inwarianty zapisano w ADR 0037. Przed wykonaniem wymagane są interpretowane
+regresje, niezależny review i podgląd rzeczywistych pinów. Ten wpis nie jest
+dowodem wykonania recovery ani dowodem działania przeglądarki.
+
+- 23 interpretowane regresje recovery i blokad startu: sukces. Review zamknął
+  niespójne identyfikatory kontenerów, przedwczesny stan `stop-issued` oraz
+  konflikt rekordu wcześniejszego recovery wykrywany dopiero po stopie.
+- Podgląd rzeczywistej próby: sukces, plan
+  `35d93c146eedfd9ab6791581d40bbbfa24500be3d85510d5df854ba7da7d0b30`.
+  Potwierdzono jawne uruchomienie skryptu, brak ukończonych task/stage receipts,
+  failed exit 1, sekwencje heartbeat launch 0 → exit/released lease 3, brak
+  admission i aktywnych zasobów solvera. `CurrentRun.total_steps=1` jest liczbą
+  zaplanowanych zadań (`step_ids.len()`), nie licznikiem wykonanych iteracji.
