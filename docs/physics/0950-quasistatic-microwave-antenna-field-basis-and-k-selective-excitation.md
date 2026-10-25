@@ -11082,6 +11082,73 @@ Ich przypięte SHA256 i tożsamość runtime zapisano w checkpointcie
 `docs/superpowers/plans/2026-10-25-terminal-history-recovery-v3.md`.
 Pełne Universe i UI pozostają nieukończone; wynik pozostaje inspection_only.
 
+#### Dokładne tożsamości liczników kątów — 25.10.2026
+
+Dla nieosobliwej, zorientowanej ściany Tet4 definiujemy poniższe wielkości
+przed dotychczasową normalizacją przez potęgę dwóch. Indeksy wierzchołków
+są cykliczne modulo trzy.
+
+```{math}
+:label: antenna-surface-exact-geometry-definitions
+\begin{aligned}
+\mathbf u_i&=\mathbf t-\mathbf a_i,&
+\mathbf e_i&=\mathbf a_{i+1}-\mathbf a_i,\\
+\mathbf N&=(\mathbf a_1-\mathbf a_0)\times(\mathbf a_2-\mathbf a_0),&
+S&=\mathbf N\cdot\mathbf N>0,\\
+h&=\mathbf N\cdot\mathbf u_0,&
+\mathbf q&=\frac{h\mathbf N}{S},\\
+d_i&=(\mathbf a_i-\mathbf t)\cdot(\mathbf e_i\times\mathbf N).
+\end{aligned}
+```
+
+| Dokładny symbol | Znaczenie | Jednostka SI |
+|---|---|---|
+| $i$ | Cykliczny indeks wierzchołka i krawędzi | $1$ |
+| $\mathbf a_i,\mathbf t$ | Wierzchołek ściany i target | $\mathrm m$ |
+| $\mathbf u_i,\mathbf e_i,\mathbf q$ | Wektory do targetu, krawędź i normalny rzut targetu | $\mathrm m$ |
+| $\mathbf N$ | Zorientowana, nieunormowana normalna ściany | $\mathrm{m^2}$ |
+| $S$ | Kwadrat normy normalnej | $\mathrm{m^4}$ |
+| $h$ | Podpisany iloczyn normalnej i wektora do targetu, nie odległość | $\mathrm{m^3}$ |
+| $d_i$ | Podpisany licznik współczynnika krawędzi | $\mathrm{m^4}$ |
+
+Ponieważ $\mathbf u_{i+1}=\mathbf u_i-\mathbf e_i$, cykliczna tożsamość
+iloczynu mieszanego daje
+$\mathbf N\cdot(\mathbf u_i\times\mathbf u_{i+1})=d_i$.
+W drugim wyznaczniku składniki zawierające dwukrotnie $\mathbf u_0$ znikają.
+Stąd dokładnie, również dla $h=0$ i obu orientacji ściany:
+
+```{math}
+:label: antenna-surface-exact-determinant-identities
+\begin{aligned}
+\mathbf q\cdot(\mathbf u_i\times\mathbf u_{i+1})&=\frac{h d_i}{S},\\
+\mathbf u_0\cdot(\mathbf u_1\times\mathbf u_2)&=h.
+\end{aligned}
+```
+
+`surface_rt0.cpp + geometry` może więc zastąpić wielokrotne dokładne
+iloczyny wektorowe i skalarne mnożeniem oraz dzieleniem już wyznaczonych
+liczb wymiernych. To tożsamość algebraiczna, bez przybliżenia, zmiany znaku,
+permutacji, progu zero lub redukcji precyzji. Normalizacja, predykaty,
+wszystkie passy binary64/80/120 i końcowe bramki pozostają obowiązkowe.
+Nie ma zmiany publicznych parametrów Python, ProblemIR ani capability:
+realizacja dotyczy tylko istniejącego prywatnego operatora FEM CPU.
+
+`scripts/test_antenna_rt0_surface_oracle.py + ExactSurfaceGeometryIdentityTests.test_signed_determinants_for_all_face_targets`
+wykonał 2160 dokładnych porównań w 540 konfiguracjach: wszystkie permutacje,
+nieomal współliniowa ściana, skale potęg dwóch, targety na ścianie, krawędzi,
+wierzchołku oraz po obu stronach. PASS nie jest dowodem wykonania native.
+Managed build iteracji `762850b9674b4e8cb49007b4101ad2be` zakończył się
+poprawnie. Publiczna próba `run-surface-exact-identities-20261025-01`
+zakończyła się Succeeded, a worker wyszedł z kodem zero. Ścisłe porównanie
+z poprzednim pakietem wykazało identyczność bajtową wszystkich 21 payloadów
+poza raportem pracy oraz identyczność pełnych diagnostyk trzech precyzji,
+limitów i tolerancji. Czas operatora spadł z 418.612782124 do 371.592043076 s
+w jednym pomiarze. Raport `exact-identities-result-comparison.json`
+zachowano w wolumenie kontrolnym grupy, pod
+`verification/surface-rt0-performance-20261025/`. Jest to wynik 14 targetów,
+nie całego Universe; nie stanowi statystycznej kwalifikacji wydajności
+ani potwierdzenia wizualizacji w UI.
+
 #### Pełne parametry prywatnego wywołania
 
 Poniższe typy C++ nie są nowym publicznym Python API. Wszystkie argumenty są

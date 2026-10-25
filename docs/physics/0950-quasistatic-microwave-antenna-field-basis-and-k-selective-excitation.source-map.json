@@ -1786,6 +1786,48 @@
       "latex": "s_{Ti}",
       "meaning": "Znak przejścia od normalnej kanonicznej do outward normal komórki",
       "si_unit": "1"
+    },
+    {
+      "id": "antenna-surface-exact-identity-index",
+      "latex": "$i$",
+      "meaning": "Cykliczny indeks wierzchołka i krawędzi",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-surface-exact-identity-positions",
+      "latex": "$\\mathbf a_i,\\mathbf t$",
+      "meaning": "Wierzchołek ściany i target",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "antenna-surface-exact-identity-vectors",
+      "latex": "$\\mathbf u_i,\\mathbf e_i,\\mathbf q$",
+      "meaning": "Wektory do targetu, krawędź i normalny rzut targetu",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "antenna-surface-exact-identity-normal",
+      "latex": "$\\mathbf N$",
+      "meaning": "Zorientowana, nieunormowana normalna ściany",
+      "si_unit": "$\\mathrm{m^2}$"
+    },
+    {
+      "id": "antenna-surface-exact-identity-normal-square",
+      "latex": "$S$",
+      "meaning": "Kwadrat normy normalnej",
+      "si_unit": "$\\mathrm{m^4}$"
+    },
+    {
+      "id": "antenna-surface-exact-identity-height",
+      "latex": "$h$",
+      "meaning": "Podpisany iloczyn normalnej i wektora do targetu, nie odległość",
+      "si_unit": "$\\mathrm{m^3}$"
+    },
+    {
+      "id": "antenna-surface-exact-identity-edge",
+      "latex": "$d_i$",
+      "meaning": "Podpisany licznik współczynnika krawędzi",
+      "si_unit": "$\\mathrm{m^4}$"
     }
   ],
   "equations": [
@@ -3388,6 +3430,38 @@
       "sources": [
         "antenna-cold-rt0-moments-owner",
         "antenna-cold-rt0-certificate-owner"
+      ]
+    },
+    {
+      "id": "antenna-surface-exact-geometry-definitions",
+      "symbols": [
+        "antenna-surface-exact-identity-index",
+        "antenna-surface-exact-identity-positions",
+        "antenna-surface-exact-identity-vectors",
+        "antenna-surface-exact-identity-normal",
+        "antenna-surface-exact-identity-normal-square",
+        "antenna-surface-exact-identity-height",
+        "antenna-surface-exact-identity-edge"
+      ],
+      "sources": [
+        "antenna-surface-exact-identity-geometry",
+        "antenna-surface-exact-identity-regression"
+      ]
+    },
+    {
+      "id": "antenna-surface-exact-determinant-identities",
+      "symbols": [
+        "antenna-surface-exact-identity-index",
+        "antenna-surface-exact-identity-positions",
+        "antenna-surface-exact-identity-vectors",
+        "antenna-surface-exact-identity-normal",
+        "antenna-surface-exact-identity-normal-square",
+        "antenna-surface-exact-identity-height",
+        "antenna-surface-exact-identity-edge"
+      ],
+      "sources": [
+        "antenna-surface-exact-identity-geometry",
+        "antenna-surface-exact-identity-regression"
       ]
     }
   ],
@@ -8533,6 +8607,20 @@
       "symbol": "current_at_target",
       "responsibility": "Dotychczasowa kolejność sumy czterech współczynników RT0, oddzielona od niezmiennego źródła.",
       "evidence_status": "runtime_parity_only"
+    },
+    {
+      "id": "antenna-surface-exact-identity-geometry",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "geometry",
+      "responsibility": "Dokładna geometria i liczniki formuł przed normalizacją.",
+      "evidence_status": "interpreted_identity_only"
+    },
+    {
+      "id": "antenna-surface-exact-identity-regression",
+      "path": "scripts/test_antenna_rt0_surface_oracle.py",
+      "symbol": "class ExactSurfaceGeometryIdentityTests",
+      "responsibility": "2160 porównań Fraction w 540 konfiguracjach, bez uruchomienia native.",
+      "evidence_status": "interpreted_identity_only"
     }
   ],
   "public_api": {

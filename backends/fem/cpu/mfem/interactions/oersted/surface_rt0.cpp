@@ -431,9 +431,10 @@ FaceGeometry geometry(const PreparedFace &face,
             if (e.compare(magnitude,maximum) > 0) maximum = magnitude;
         }
     }
+    // Exact triple-product identities, before the shared power-of-two scale.
     for (int i = 0; i < 3; ++i)
-        g.fan_numerators[i] = e.dot(g.qvector,e.cross(g.vectors[i],g.vectors[(i+1)%3]));
-    g.whole_numerator = e.dot(g.vectors[0],e.cross(g.vectors[1],g.vectors[2]));
+        g.fan_numerators[i] = e.div(e.mul(g.hnum,g.dnums[i]),g.normal_squared);
+    g.whole_numerator = g.hnum;
     const auto nb = e.bits(boost::multiprecision::numerator(maximum));
     const auto db = e.bits(boost::multiprecision::denominator(maximum));
     require(nb <= static_cast<std::uint64_t>(std::numeric_limits<int>::max()) &&

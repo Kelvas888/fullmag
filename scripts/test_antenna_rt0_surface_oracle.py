@@ -212,5 +212,59 @@ class RetainedRT0FieldTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'RT0 residual'):
             self.evaluate(data=bad)
 
+class ExactSurfaceGeometryIdentityTests(unittest.TestCase):
+    def test_signed_determinants_for_all_face_targets(self):
+        from fractions import Fraction as Q
+        from itertools import permutations
+
+        def sub(a, b):
+            return tuple(x-y for x, y in zip(a, b))
+
+        def cross(a, b):
+            return (a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2],
+                    a[0]*b[1]-a[1]*b[0])
+
+        def dot(a, b):
+            return sum(x*y for x, y in zip(a, b))
+
+        triangles = (
+            ((0, 0, 0), (1, 0, 0), (0, 1, 0)),
+            ((1, -2, 3), (3, 1, 4), (-1, 2, 5)),
+            ((0, 0, 0), (1, 0, 0), (1, Q(1, 2**50), 0)),
+        )
+        checked = 0
+        signed = set()
+        for triangle in triangles:
+            for exponent in (-300, 0, 300):
+                scale = Q(2)**exponent
+                vertices = tuple(tuple(Q(x)*scale for x in row) for row in triangle)
+                for order in permutations(range(3)):
+                    face = tuple(vertices[i] for i in order)
+                    normal = cross(sub(face[1], face[0]), sub(face[2], face[0]))
+                    squared = dot(normal, normal)
+                    self.assertGreater(squared, 0)
+                    targets = list(face)
+                    targets += [tuple((face[i][k]+face[(i+1)%3][k])/2 for k in range(3))
+                                for i in range(3)]
+                    targets += [tuple(sum(row[k] for row in face)/3 for k in range(3))]
+                    targets += [tuple(x*scale for x in row)
+                                for row in ((Q(1, 7), Q(-2, 3), Q(5, 11)),
+                                            (-7, 5, -3), (11, -13, 17))]
+                    for target in targets:
+                        vectors = tuple(sub(target, point) for point in face)
+                        height = dot(normal, vectors[0])
+                        signed.add((height > 0)-(height < 0))
+                        projection = tuple(x*height/squared for x in normal)
+                        self.assertEqual(dot(vectors[0], cross(vectors[1], vectors[2])), height)
+                        for i in range(3):
+                            edge = sub(face[(i+1)%3], face[i])
+                            coefficient = dot(sub(face[i], target), cross(edge, normal))
+                            direct = dot(projection, cross(vectors[i], vectors[(i+1)%3]))
+                            self.assertEqual(direct, height*coefficient/squared)
+                        checked += 1
+        self.assertEqual(checked, 540)
+        self.assertEqual(signed, {-1, 0, 1})
+
+
 if __name__ == '__main__':
     unittest.main()

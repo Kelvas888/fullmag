@@ -487,3 +487,38 @@ Przy aktualnym koszcie nie powtarzać ślepo pełnej próby 1154 targetów z lim
 6; nie traktować próby tej samej metody jako nowej naprawy. Następny krok to
 optymalizacja arytmetyki/operatora z zachowaniem kontroli błędu, nie zwiększanie
 limitów i nie zmniejszanie domeny. Wyniki, historie i cache pozostają.
+
+
+### Dokładne tożsamości liczników — wykonanie 25.10.2026
+
+Zastąpiono ponowne dokładne iloczyny mieszane w geometry równoważnymi
+h*d/S i h. Bez zmiany fizyki, trzech precyzji, formuł i tolerancji.
+Regresja Fraction: 540 konfiguracji, 2160 równości, PASS. Walidacja noty
+0950 i git diff --check PASS. Managed build iteracji
+762850b9674b4e8cb49007b4101ad2be PASS; nie kompilowano testów native/Rust.
+Publiczne submit 201 i materialization 200, run
+run-surface-exact-identities-20261025-01, task
+task-24e0507a41937d7288a6b1e94671da91a47eaa6deb617f0567df6b0705746785,
+attempt-3263891a38d64727b56b199e121ec7a4, epoch 1: Succeeded.
+Worker PID 3635, start token linux-starttime-14822938, receipt exit 0.
+Nowy bundle CAS:
+453bb352b0e4ed9458942bfbf13bd5b2a331ba01286c782451227b9e69300a6d.
+Output manifest CAS:
+271b311068ea27c8965aae5f48fed2076a0a53c77525fee943e544dcd231640d.
+
+Ścisłe porównanie PASS: 21 payloadów identycznych bajtowo, identyczne
+pełne diagnostyki precyzji, polityka i tolerancje. Czas operatora
+418.612782124 -> 371.592043076 s, speedup 1.1265386057752131;
+łącznie o 23.7427596% mniej niż 487.287556356 s przed obiema optymalizacjami.
+Operacje wymierne 20 491 713 -> 14 851 953, całkowite
+395 876 894 -> 297 494 414. Peak RSS 545902592 B.
+Raport control-volume verification/surface-rt0-performance-20261025/
+exact-identities-result-comparison.json, SHA256
+1a54515b223fc2eb63e25a28708b4003574b5f56faef59a1ccf83c16078fdb9e.
+Niezależna objętościowa referencja H pozostaje adekwatna, ponieważ H jest
+identyczne bajtowo. Nie powtarzano niezmienionej referencji.
+To pojedynczy pomiar 14 targetów, NIE pełne Universe ani wizualizacja UI.
+Wszystkie wyniki, receipty, cache i niezacommitowany plik użytkownika
+zachowano. Brak wykazanej zbędności danych: bez prune/usuwania.
+Następny krok: dalsze obniżenie kosztu dokładnego operatora przed ponowną
+pełną próbą; nie zwiększać limitów ani nie redukować domeny/jakości.
