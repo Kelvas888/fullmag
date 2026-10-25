@@ -480,5 +480,105 @@ class SupersededCandidateTests(unittest.TestCase):
             self.assertEqual((fixture.package/'backend-build-receipt.json').read_bytes(), fixture.previous[1])
 
 
+
+
+class DiagnosticBuildOnlyTests(unittest.TestCase):
+    def fixture(self):
+        ready = {'schema_version': 'runtime_service_owner.v1', 'state': 'ready',
+                 'pid': 102, 'owner_token': 'owner', 'heartbeat_at': 'before',
+                 'children': [{'role': 'compute', 'pid': 103, 'status': 'running'},
+                              {'role': 'preparation', 'pid': 104, 'status': 'running'}]}
+        owner = dict(ready, state='unknown', heartbeat_at='after', children=[
+            {'role': 'compute', 'pid': 103, 'status': 'running'},
+            {'role': 'preparation', 'pid': 104, 'status': 'exited_failure'}])
+        process = {'schema': 'fullmag.docker-process-tree.v1', 'state': 'failed_outcome_retained',
+                   'api_pid': 101, 'api_diagnostic_only': True, 'service_owner': ready,
+                   'error': 'runtime service owner observation failed during supervision: runtime service owner is not ready'}
+        return process, owner
+
+    def test_unknown_is_preserved_and_never_admitted_by_terminal_route(self):
+        process, owner = self.fixture()
+        before = json.dumps([process, owner], sort_keys=True)
+        repair.validate_diagnostic_build(process, owner)
+        self.assertEqual(json.dumps([process, owner], sort_keys=True), before)
+        with self.assertRaises(ValueError):
+            repair.validate_terminal(process, owner)
+
+    def test_changed_or_unfenced_identity_is_rejected(self):
+        for field, value in [('api_diagnostic_only', False), ('api_exit_code', 0),
+                             ('api_pid', True), ('state', 'drained'), ('error', 'other')]:
+            process, owner = self.fixture()
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                repair.validate_diagnostic_build(dict(process, **{field: value}), owner)
+        for field, value in [('state', 'ready'), ('owner_token', 'different'), ('pid', 999)]:
+            process, owner = self.fixture()
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                repair.validate_diagnostic_build(process, dict(owner, **{field: value}))
+
+    @contextlib.contextmanager
+    def observations(self):
+        import urllib.request
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proc = root/'proc'; proc.mkdir()
+            package = root/'package'; (package/'bin').mkdir(parents=True)
+            (package/'bin'/'fullmag-api').touch()
+            api = proc/'101'; api.mkdir()
+            (api/'exe').symlink_to(package/'bin'/'fullmag-api')
+            control = root/'control'; control.mkdir()
+            fence = control/('api-failure-'+'a'*32+'.json')
+            instance = '11111111-2222-3333-4444-555555555555'
+            fence.write_text(json.dumps({'schema': 'fullmag.api-runtime-failure-fence.v1',
+                'stage': 'runtime_supervision', 'api_pid': 101, 'api_instance_id': instance}))
+            (api/'environ').write_bytes(('FULLMAG_API_RUNTIME_FAILURE_FENCE='+str(fence)).encode()+b'\0')
+            ledger = root/'ledger'; ledger.mkdir()
+            (ledger/'HOST_RESOURCE_LEDGER.json').write_text(json.dumps({'reservations': [{'state': 'released'}]}))
+            def path(*parts):
+                value = Path(*parts)
+                return proc.joinpath(*value.parts[2:]) if value == Path('/proc') or str(value).startswith('/proc/') else value
+            health = SimpleNamespace(status=200, headers={'x-fullmag-api-instance': instance},
+                                     read=lambda _: b'{"status":"degraded"}')
+            response = contextlib.nullcontext(health)
+            namespace = dict(Path=path, os=os, re=__import__('re'), json=json, hashlib=hashlib,
+                require=repair.require, read=lambda p:p.read_bytes(),
+                backend=SimpleNamespace(PACKAGE_ROOT=package),
+                runtime=SimpleNamespace(_validate_terminal_owner=lambda *a, **k:None,
+                    process_receipt_path=lambda _:control/'process-tree.json'))
+            tree = ast.parse(repair.RUNTIME)
+            function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'diagnostic_api_evidence')
+            exec(compile(ast.Module(body=[function], type_ignores=[]), '<diagnostic-build>', 'exec'), namespace)
+            process, owner = self.fixture(); process['api_failure_fence'] = str(fence)
+            with patch.dict(os.environ, FULLMAG_HOST_LEDGER_ROOT=str(ledger)), patch.object(urllib.request, 'urlopen', return_value=response):
+                yield SimpleNamespace(check=lambda:namespace['diagnostic_api_evidence'](process,owner,None),
+                    proc=proc, health=health, fence=fence, ledger=ledger, api=api)
+
+    def test_live_process_lease_and_wrong_api_each_refuse_actual_probe(self):
+        with self.observations() as f:
+            self.assertEqual(len(f.check()), 2)
+            (f.proc/'103').mkdir()
+            with self.assertRaisesRegex(ValueError, 'still present'):
+                f.check()
+        with self.observations() as f:
+            (f.ledger/'HOST_RESOURCE_LEDGER.json').write_text('{"reservations":[{"state":"active"}]}')
+            with self.assertRaisesRegex(ValueError, 'reservation'):
+                f.check()
+        with self.observations() as f:
+            f.health.headers['x-fullmag-api-instance'] = 'other'
+            with self.assertRaisesRegex(ValueError, 'incarnation'):
+                f.check()
+        with self.observations() as f:
+            f.api.joinpath('environ').write_bytes(b'')
+            with self.assertRaisesRegex(ValueError, 'not fenced'):
+                f.check()
+
+    def test_inside_promotion_refuses_diagnostic_mode_before_mutation(self):
+        namespace = dict(require=repair.require)
+        tree = ast.parse(repair.RUNTIME)
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'inside_promote')
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<diagnostic-promote>', 'exec'), namespace)
+        with self.assertRaisesRegex(ValueError, 'cannot promote'):
+            namespace['inside_promote']({'diagnostic_api_only': True})
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -36,6 +36,35 @@ def validate_terminal(process, owner):
             'Both scheduler children must be terminal')
 
 
+def validate_diagnostic_build(process, owner):
+    """Admit build-only work; never reinterpret Unknown as Failed or Drained."""
+    require(process.get('schema') == 'fullmag.docker-process-tree.v1'
+            and process.get('state') == 'failed_outcome_retained'
+            and process.get('api_diagnostic_only') is True
+            and type(process.get('api_pid')) is int and process['api_pid'] > 0
+            and 'api_exit_code' not in process and 'terminal_service_owner' not in process
+            and process.get('runtime_pid') is None,
+            'An exact retained diagnostic API receipt is required')
+    require(process.get('error') == 'runtime service owner observation failed during supervision: runtime service owner is not ready',
+            'Diagnostic build requires the supported runtime supervision failure')
+    require(owner.get('schema_version') == 'runtime_service_owner.v1'
+            and owner.get('state') == 'unknown', 'Build-only recovery requires the unchanged Unknown owner')
+    pin = process.get('service_owner')
+    require(isinstance(pin, dict) and pin.get('state') == 'ready', 'The original Ready owner pin is required')
+    children = owner.get('children')
+    require(isinstance(children, list) and len(children) == 2
+            and all(isinstance(child, dict) and set(child) == {'role', 'pid', 'status'} for child in children)
+            and {child.get('role') for child in children} == {'compute', 'preparation'}
+            and all(type(child.get('pid')) is int and child['pid'] > 0
+                    and child.get('status') in {'running', 'unknown', 'exited_success', 'exited_failure'}
+                    for child in children), 'Unknown owner child identities are incomplete')
+    require({(child['role'], child['pid']) for child in children}
+            == {(child['role'], child['pid']) for child in pin.get('children', [])},
+            'Unknown owner children differ from the Ready pin')
+    expected = dict(pin, state='unknown', heartbeat_at=owner.get('heartbeat_at'), children=children)
+    require(owner == expected, 'Unknown owner differs from its original Ready identity')
+
+
 def validate_backend(actual, identity, backend_id, image_id):
     require(actual.get('Id') == backend_id and actual.get('Image') == image_id,
             'Backend container or image pin differs')
@@ -53,7 +82,7 @@ def validate_backend(actual, identity, backend_id, image_id):
 
 
 RUNTIME = r'''
-import argparse, contextlib, ctypes, fcntl, os, stat, subprocess, sys, tempfile, time
+import argparse, contextlib, ctypes, fcntl, os, re, stat, subprocess, sys, tempfile, time
 sys.path.insert(0, '/opt/fullmag')
 import backend_dev as backend
 import runtime_service as runtime
@@ -66,7 +95,7 @@ def read(path):
     return data
 
 
-def no_runtime(process, owner):
+def no_runtime(process, owner, diagnostic_api_only=False):
     forbidden = {process['api_pid'], owner['pid'], *(child['pid'] for child in owner['children'])}
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
@@ -79,9 +108,50 @@ def no_runtime(process, owner):
             program = Path(os.fsdecode(args[0])).name
         except (FileNotFoundError, ProcessLookupError):
             continue
+        if diagnostic_api_only and int(entry.name) == process['api_pid']:
+            continue
         require(int(entry.name) not in forbidden and not program.startswith('fullmag')
                 and program not in {'cargo', 'rustc', 'make', 'cmake', 'ninja', 'nvcc', 'cc1', 'cc1plus'},
                 'An API, owner, scheduler or native Fullmag process is still alive')
+
+
+def diagnostic_api_evidence(process, owner, paths):
+    import urllib.request
+    runtime._validate_terminal_owner(process['service_owner'], state='ready', name='diagnostic build Ready pin')
+    runtime._validate_terminal_owner(owner, state='unknown', name='diagnostic build Unknown owner',
+        allowed_child_statuses=('running', 'unknown', 'exited_success', 'exited_failure'))
+    require(all(not Path('/proc', str(pid)).exists()
+                for pid in [owner['pid'], *(child['pid'] for child in owner['children'])]),
+            'A native owner or scheduler is still present')
+    api = Path('/proc', str(process['api_pid']))
+    require((api/'exe').resolve(strict=True) == backend.PACKAGE_ROOT/'bin'/'fullmag-api',
+            'Diagnostic API executable differs')
+    fence = Path(process.get('api_failure_fence', ''))
+    require(fence.parent == runtime.process_receipt_path(paths).parent
+            and re.fullmatch(r'api-failure-[0-9a-f]{32}\.json', fence.name),
+            'Diagnostic API fence path differs')
+    raw = read(fence)
+    document = json.loads(raw)
+    require(document.get('schema') == 'fullmag.api-runtime-failure-fence.v1'
+            and document.get('stage') == 'runtime_supervision'
+            and document.get('api_pid') == process['api_pid'], 'Diagnostic API fence identity differs')
+    require(isinstance(document.get('api_instance_id'), str)
+            and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', document['api_instance_id']),
+            'Diagnostic API incarnation is missing or invalid')
+    require(('FULLMAG_API_RUNTIME_FAILURE_FENCE='+str(fence)).encode()
+            in (api/'environ').read_bytes().split(b'\0'), 'Diagnostic API environment is not fenced')
+    with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health', timeout=5) as response:
+        health = json.loads(response.read(256*1024))
+        require(response.status == 200 and health.get('status') == 'degraded'
+                and response.headers.get('x-fullmag-api-instance') == document.get('api_instance_id'),
+                'Diagnostic API health or incarnation differs')
+    ledger = Path(os.environ.get('FULLMAG_HOST_LEDGER_ROOT', '/host-ledger/ledger'))/'HOST_RESOURCE_LEDGER.json'
+    ledger_raw = read(ledger)
+    reservations = json.loads(ledger_raw).get('reservations')
+    require(isinstance(reservations, list)
+            and all(isinstance(row, dict) and row.get('state') == 'released' for row in reservations),
+            'Diagnostic build requires every retained host reservation to be released')
+    return {str(fence): hashlib.sha256(raw).hexdigest(), str(ledger): hashlib.sha256(ledger_raw).hexdigest()}
 
 
 def pinned_evidence(request, paths):
@@ -91,15 +161,22 @@ def pinned_evidence(request, paths):
             and hashlib.sha256(owner_raw).hexdigest() == request['owner_sha256'],
             'Pinned process receipt or Failed owner changed')
     process, owner = json.loads(process_raw), json.loads(owner_raw)
-    validate_terminal(process, owner)
-    runtime._validate_terminal_owner(owner, state='failed', name='repair build Failed owner',
-        allowed_child_statuses=('exited_success', 'exited_failure'))
+    diagnostic = request.get('diagnostic_api_only', False)
+    extra = {}
+    if diagnostic:
+        validate_diagnostic_build(process, owner)
+        extra = diagnostic_api_evidence(process, owner, paths)
+    else:
+        validate_terminal(process, owner)
+    if not diagnostic:
+        runtime._validate_terminal_owner(owner, state='failed', name='repair build Failed owner',
+            allowed_child_statuses=('exited_success', 'exited_failure'))
     require(process.get('accepted_store') == str(paths.store), 'Accepted store binding differs')
-    no_runtime(process, owner)
+    no_runtime(process, owner, diagnostic_api_only=diagnostic)
     records = [runtime.process_receipt_path(paths), runtime.runtime_services_root(paths)/'OWNER.json',
                paths.config, Path('/opt/fullmag/control/backend/runtime-provenance.json'),
                Path(os.environ.get('FULLMAG_HOST_LEDGER_ROOT', '/host-ledger/ledger'))/'HOST_RESOURCE_LEDGER.json']
-    return {str(path): hashlib.sha256(read(path)).hexdigest() for path in records}
+    return {**extra, **{str(path): hashlib.sha256(read(path)).hexdigest() for path in records}}
 
 
 def retained_unknown():
@@ -438,6 +515,7 @@ def publish_candidate(request, paths, before, status):
 
 
 def inside_promote(request):
+    require(not request.get('diagnostic_api_only', False), 'Diagnostic API mode cannot promote a candidate')
     status = {'mutated': False}
     try:
         require(os.environ.get('FULLMAG_COMPOSE_PROJECT') == request['compose_project'], 'Compose project differs')
@@ -463,7 +541,7 @@ def backend_control_path(path):
 
 def inside_code(promote=False):
     return ('import hashlib, json\nfrom pathlib import Path\n' + inspect.getsource(require)
-            + '\n' + inspect.getsource(validate_terminal) + '\n' + RUNTIME
+            + '\n' + inspect.getsource(validate_terminal) + '\n' + inspect.getsource(validate_diagnostic_build) + '\n' + RUNTIME
             + ('\ninside_promote(json.loads(sys.argv[1]))\n' if promote else '\ninside(json.loads(sys.argv[1]))\n'))
 
 
@@ -557,6 +635,8 @@ def run(args):
                            (args.owner_sha256, r'[0-9a-f]{64}')):
         require(re.fullmatch(pattern, value), 'Full immutable recovery pins are required')
     promote = bool(getattr(args, 'promote', False))
+    diagnostic = bool(getattr(args, 'diagnostic_api_only', False))
+    require(not (promote and diagnostic), 'Diagnostic API mode can only build an unpublished candidate')
     promotion_pins = ('candidate_basename', 'candidate_receipt_sha256', 'current_receipt_sha256', 'provenance_sha256')
     if promote:
         require(re.fullmatch(r'\.backend-package-candidate-[A-Za-z0-9._-]+', args.candidate_basename or ''),
@@ -612,6 +692,8 @@ def run(args):
                   source_commit=storage.git(selected, 'rev-parse', 'HEAD'),
                   backend_started_at=actual['State']['StartedAt'],
                   container_fingerprint=fingerprint(actual), controller_sha256=hashlib.sha256(inside_code(promote).encode()).hexdigest())
+    if diagnostic:
+        inputs['diagnostic_api_only'] = True
     if authority_pins:
         inputs['retained_authority'] = authority_pins
     if promote:
@@ -673,6 +755,7 @@ def main():
     parser.add_argument('--resume-terminal-sha256')
     for name in ('candidate-basename', 'marker-sha256', 'receipt-sha256', 'make-attempt-sha256'):
         parser.add_argument('--superseded-' + name)
+    parser.add_argument('--diagnostic-api-only', action='store_true')
     parser.add_argument('--promote', action='store_true')
     parser.add_argument('--candidate-basename')
     parser.add_argument('--candidate-receipt-sha256')
