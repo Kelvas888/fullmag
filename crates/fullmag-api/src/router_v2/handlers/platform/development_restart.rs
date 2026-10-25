@@ -413,13 +413,13 @@ fn validate_preparation(snapshot: &SessionStateResponse) -> Result<(), ApiError>
 }
 
 fn validate_current_mesh_workspace(snapshot: &SessionStateResponse) -> Result<(), ApiError> {
-    let Some(workspace) = snapshot.mesh_workspace.as_ref().and_then(Value::as_object) else {
-        return validate_mesh_workspace(snapshot.mesh_workspace.as_ref());
+    let Some(workspace) = snapshot.mesh_workspace.as_deref().and_then(Value::as_object) else {
+        return validate_mesh_workspace(snapshot.mesh_workspace.as_deref());
     };
     if workspace.get("schema_version").and_then(Value::as_str)
         != Some(crate::live_scene_preparation::LIVE_SCENE_PREPARATION_READ_MODEL_SCHEMA)
     {
-        return validate_mesh_workspace(snapshot.mesh_workspace.as_ref());
+        return validate_mesh_workspace(snapshot.mesh_workspace.as_deref());
     }
     // Accepted workers publish one completed receipt, rather than the legacy
     // FEM/grid mesher phase array. Validate that producer's run-bound shape;
@@ -1272,7 +1272,7 @@ mod tests {
             .await
             .as_mut()
             .unwrap()
-            .mesh_workspace = Some(serde_json::json!({"active_build": {"status": "running"}}));
+            .mesh_workspace = Some(serde_json::json!({"active_build": {"status": "running"}}).into());
         assert!(acquire_workspace_for_restart(&state).await.is_err());
 
         let state = scratch_state().await;
@@ -1283,7 +1283,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .mesh_workspace = Some(
-            serde_json::json!({"mesh_pipeline_status": [{"id": "remesh", "status": "queued"}]}),
+            serde_json::json!({"mesh_pipeline_status": [{"id": "remesh", "status": "queued"}]}).into(),
         );
         assert!(acquire_workspace_for_restart(&state).await.is_err());
     }
