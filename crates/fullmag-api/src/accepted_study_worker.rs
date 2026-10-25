@@ -529,13 +529,8 @@ fn validate_accepted_worker_parameters(
     }
 
     if let Some(policy) = parameters.get(fullmag_session::ACCEPTED_RUN_START_POLICY_KEY) {
-        let expected = serde_json::json!({
-            "schema_version": "accepted_run_start_policy.v1",
-            "mode": "manual",
-        });
-        if policy != &expected {
-            bail!("accepted worker received an unsupported run-start policy");
-        }
+        fullmag_session::accepted_run_start_policy_is_manual(policy)
+            .context("accepted worker received an unsupported run-start policy")?;
     }
 
     if let Some(live_workspace) = parameters.get("live_workspace") {

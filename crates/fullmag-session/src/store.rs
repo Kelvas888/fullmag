@@ -75,7 +75,9 @@ fn read_optional_bounded_regular_file(
 
 #[path = "accepted_start_gate.rs"]
 mod accepted_start_gate;
-pub use accepted_start_gate::{ACCEPTED_RUN_START_POLICY_KEY, AcceptedRunStartRelease};
+pub use accepted_start_gate::{
+    ACCEPTED_RUN_START_POLICY_KEY, AcceptedRunStartRelease, accepted_run_start_policy_is_manual,
+};
 mod development_commit;
 mod development_completion;
 mod development_fence;
