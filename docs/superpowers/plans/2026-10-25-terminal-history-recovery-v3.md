@@ -346,3 +346,49 @@ Autoryzacja v2 w wolumenie kontrolnym:
 SHA256 `3cf7b4c118249f4a25f1d966f61215b24c9a6e3f26ad9b4ce8e778cbae960a9a`.
 Frontend pozostaje uruchomiony do ponownej walidacji pod lifecycle lease.
 Recovery, uruchomienie nowego pakietu oraz Solve Universe nadal wymagają wykonania.
+
+## Rzeczywiste recovery v3 i nowa próba naukowa
+
+Managed recovery przez `just docker-dev-recover-container` succeeded.
+Development attempt `2c5c5be072564f54a656df0073f42b25`, konfiguracja
+`9c648952a1fa638b5f85a75c90c596de6206c18c8cb39d3834aaab43957666ad`.
+Nowy backend `597e3116dda99f957d23bfc081c5464a111cdc17629122f98c5ad3af693bb8bf`,
+obraz `sha256:b3eb4e5bf434b46acd633e4339962bffbcb9b6ccaac59ce5ebf444c4023cc10c`.
+Build aplikacji i walidacja 24 plików pakietu PASS. Źródło:
+`2357399e3b337e682bb96dc845202262346e7da4`, snapshot
+`1c26e58627276dc9229b1838bf1c70f2bdc72f71d6351ea3a7ebc43b4b1faeb4`.
+Cache zależności wykorzystano bez przebudowy CUDA/MFEM.
+
+Natywny receipt requestu
+`3ccca87d0dd46c0538b99af9202c36abf319889997104ea38bcafa9631b75a94`
+potwierdza `retained_terminal_runs_recovered`. SHA256 receiptu:
+`cde2a62b0a0620159a0714d719675be6018d10bfdbe1abc2ce41176e5d59aa5a`.
+Owner ready (PID 3526, dzieci 3529/3530), process-tree ready, API health
+200/ok. API nie miało aktywnej sesji, więc sam start nie przywrócił
+sceny do UI i nie jest dowodem wizualizacji.
+
+Retencja po recovery PASS: 70 plików starego V/J/H, dwa archiwa, sześć
+chronionych plików nieudanej próby Universe i niezmieniony FMS użytkownika.
+Dowód: `verification/terminal-history-recovery-v3-20261025/retention-after-native-recovery.json`.
+Przejściowy błąd połączenia `Wsl/Service/WSAETIMEDOUT` nie był błędem
+buildu: Docker Desktop potwierdził brak restartu i gotowość kontenera;
+łączność Ubuntu później wróciła. Nie restartowano Dockera/WSL ani buildu.
+
+Jawny publiczny POST retry poprzedniej małej próby został zaakceptowany
+202 z catalog revision 347 -> 348. Retry ID:
+`surface-rt0-after-recovery-20261025-01`, run
+`run-live-255fa587f4084d187d7e690f4d75076a4889fcf685a044ee02e4e8486a06b2da`,
+task `task-575d7ffbb1951afb4119ac548f4f51ae6f13682d01e522ccc9e4dea6abcc4e2c`.
+Nowy attempt `attempt-37daccd7aa964bc88f6143ad9613ba06`, epoch 2,
+worker PID 4333, start_ticks 14316498. Potwierdzono running i rosnący
+czas CPU (utime 16304 -> 27426 ticków), nie tylko zapis katalogu.
+Przydział: 3000 cpu_millis, 5637144576 B RAM, 7516192768 B storage.
+
+Request/ACK zachowano jako `after-recovery-retry-request.json` oraz
+`after-recovery-retry-response.json` w `verification/surface-rt0-performance-20261025`.
+Retry używa dokładnie zamrożonych wejść, w tym tych samych SHA siatek:
+1865 Tet4 przewodnika i 14 punktów pola, 26110 par. Nie odtwarzano siatki
+Gmsh ani nie ponawiano żądania po timeout. Na checkpointcie brak accepted H
+i brak artefaktów tego attemptu. Oczekiwanie dotyczy tego konkretnego
+żywego procesu; nie uruchamiać kolejnego retry bez rozpoznania jego wyniku.
+Pełne Universe i wizualizacja w UI pozostają niezrealizowane.
