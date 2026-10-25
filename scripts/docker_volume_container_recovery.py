@@ -41,6 +41,7 @@ from docker_build_control import (
 OPERATOR_AUTHORIZATION_SCHEMA = (
     "fullmag.docker-container-recovery-operator-authorization.v1"
 )
+TERMINAL_OPERATOR_SCHEMA = "fullmag.docker-container-recovery-operator-authorization.v2"
 AUTHORIZATION_SCHEMA = "fullmag.docker-container-recovery-authorization.v1"
 REQUEST_SCHEMA = "runtime_service_container_recovery_request.v1"
 RETAINED_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v2"
@@ -167,9 +168,14 @@ def validate_operator_authorization(value: Mapping[str, object]) -> dict[str, ob
         "prior_stop_journal_sha256", "process_receipt_sha256", "config_sha256",
         "owner_sha256", "launch_sha256",
     }
+    terminal_history = authorization.get("schema_version") == TERMINAL_OPERATOR_SCHEMA
+    if terminal_history:
+        required.add("retained_terminal_runs")
+        expected_recovery_outcome({"schema_version": TERMINAL_REQUEST_SCHEMA,
+                                   "retained_terminal_runs": authorization.get("retained_terminal_runs")})
     if set(authorization) != required:
-        _fail("operator authorization fields do not match the frozen v1 schema")
-    if authorization.get("schema_version") != OPERATOR_AUTHORIZATION_SCHEMA:
+        _fail("operator authorization fields do not match the frozen schema")
+    if authorization.get("schema_version") not in {OPERATOR_AUTHORIZATION_SCHEMA, TERMINAL_OPERATOR_SCHEMA}:
         _fail("unsupported container recovery operator authorization schema")
     request_id = authorization.get("request_id")
     if not isinstance(request_id, str) or REQUEST_ID_RE.fullmatch(request_id) is None:
@@ -1067,8 +1073,9 @@ def _inspect_pair(
     authorization: Mapping[str, object],
     project: str,
     compose: Mapping[str, object],
+    *, allow_live_frontend: bool = False,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Read and validate the exact stopped Compose pair before mutation."""
+    """Validate the pair; only terminal recovery may later stop its frontend."""
 
     from docker_volume_dev import _assert_private_restart_network, _validate_retained_service
 
@@ -1107,7 +1114,14 @@ def _inspect_pair(
         ):
             _fail(f"pinned {service} ownership differs")
         state = _require_mapping(item.get("State"), f"{service} state")
-        if state.get("Running") is True or state.get("Pid") not in (0, None):
+        live_frontend = (allow_live_frontend and service == "frontend"
+                         and authorization.get("schema_version") == TERMINAL_OPERATOR_SCHEMA)
+        if live_frontend and state.get("Running") is True:
+            if (state.get("Status") != "running" or type(state.get("Pid")) is not int
+                    or state["Pid"] <= 0 or state.get("Paused") is True
+                    or state.get("Restarting") is True):
+                _fail("pinned frontend is not one stable running incarnation")
+        elif state.get("Running") is True or state.get("Pid") not in (0, None):
             _fail(f"pinned {service} must remain stopped before recovery")
         try:
             _validate_retained_service(compose, item, service, image_config)
@@ -1132,6 +1146,50 @@ def _inspect_pair(
     return result["backend"], result["frontend"]
 
 
+def _validate_terminal_diagnostic_stop_journal(journal, authorization, attempt):
+    """Authenticate the stopped diagnostic API without asserting native drain."""
+    if (journal.get("schema") != "fullmag.docker-api-diagnostic-stop.v1"
+            or journal.get("state") != "stopped-execution-unknown"
+            or journal.get("attempt") != attempt
+            or journal.get("backend_container_id") != authorization["backend_container_id"]
+            or journal.get("frontend_container_id") != authorization["frontend_container_id"]
+            or journal.get("backend_image_id") != authorization["old_image_id"]
+            or journal.get("config_sha256") != authorization["compose_config_sha256"]
+            or journal.get("runtime_config_sha256") != authorization["config_sha256"]
+            or journal.get("failed_owner_sha256") != authorization["owner_sha256"]
+            or journal.get("terminal_process_receipt_sha256") != authorization["process_receipt_sha256"]
+            or journal.get("runtime_owner_state") != "unknown-preserved"
+            or journal.get("execution_state") != "unknown"
+            or journal.get("resource_leases") != "untouched"):
+        _fail("terminal recovery requires the exact stopped diagnostic API proof")
+    for key in ("backend_started_at", "backend_finished_at", "api_instance_id", "shutdown_error"):
+        _require_text(journal.get(key), "diagnostic stop " + key)
+    for key in ("failure_process_receipt_sha256", "api_failure_fence_sha256"):
+        _require_sha(journal.get(key), "diagnostic stop " + key)
+    for key in ("api_exit_code", "backend_exit_code"):
+        if type(journal.get(key)) is not int:
+            _fail("diagnostic stop lacks an exact exit code")
+    if journal["shutdown_error"] != "runtime service owner is not ready":
+        _fail("diagnostic stop has a different shutdown failure")
+    ready = _owner_for_native(journal.get("retained_ready_owner"))
+    if ready.get("state") != "ready":
+        _fail("diagnostic stop lacks the original Ready owner pin")
+
+
+def _validate_terminal_backend_incarnation(authorization, journal, backend):
+    if authorization.get("schema_version") != TERMINAL_OPERATOR_SCHEMA:
+        return
+    state = _require_mapping(backend.get("State"), "stopped diagnostic backend state")
+    if (backend.get("Id") != journal.get("backend_container_id")
+            or backend.get("Image") != journal.get("backend_image_id")
+            or state.get("StartedAt") != journal.get("backend_started_at")
+            or state.get("FinishedAt") != journal.get("backend_finished_at")
+            or state.get("ExitCode") != journal.get("backend_exit_code")
+            or state.get("Status") != "exited" or state.get("Running") is not False
+            or state.get("Pid") != 0 or state.get("OOMKilled") is not False):
+        _fail("backend incarnation differs from the pinned diagnostic stop")
+
+
 def _validate_pre_admission_stop_journal(
     journal: Mapping[str, object],
     authorization: Mapping[str, object],
@@ -1139,6 +1197,9 @@ def _validate_pre_admission_stop_journal(
 ) -> None:
     """Validate the immutable pre-admission proof for an unknown stop outcome."""
 
+    if authorization.get("schema_version") == TERMINAL_OPERATOR_SCHEMA:
+        _validate_terminal_diagnostic_stop_journal(journal, authorization, attempt)
+        return
     if journal.get("attempt") != attempt:
         _fail("stop journal does not bind the exact development attempt")
     state = journal.get("state")
@@ -1531,6 +1592,7 @@ def _revalidate_recovery_boundary(
     expected_launch_sha: str,
     expected_storage: Mapping[str, object],
     transition: Mapping[str, object] | None = None,
+    allow_live_frontend: bool = False,
 ) -> dict[str, object]:
     """Re-read every destructive-boundary proof under the lifecycle lease.
 
@@ -1568,7 +1630,10 @@ def _revalidate_recovery_boundary(
     if (transition is None) != (current_transition is None):
         _fail("recovery transition state changed before the destructive boundary")
     if transition is None:
-        backend, frontend = _inspect_pair(authorization, project, current_compose)
+        if allow_live_frontend:
+            backend, frontend = _inspect_pair(authorization, project, current_compose, allow_live_frontend=True)
+        else:
+            backend, frontend = _inspect_pair(authorization, project, current_compose)
         network_name = _network_name(backend, "backend")
         if network_name != _network_name(expected_backend, "backend"):
             _fail("private Compose network changed before the destructive boundary")
@@ -1590,6 +1655,7 @@ def _revalidate_recovery_boundary(
         )
         if backend.get("Id") != expected_backend.get("Id") or frontend.get("Id") != expected_frontend.get("Id"):
             _fail("prepared recovery manifest changed before the destructive boundary")
+    _validate_terminal_backend_incarnation(authorization, journal, backend)
     process_receipt, _, process_receipt_sha = _runtime_process_receipt(control)
     if process_receipt_sha != expected_process_receipt_sha:
         _fail("shutdown_unknown process receipt changed before the destructive boundary")
@@ -1636,7 +1702,8 @@ def _revalidate_recovery_boundary(
         _fail("Docker container images changed before the destructive boundary")
     if backend.get("Id") != expected_backend.get("Id") or frontend.get("Id") != expected_frontend.get("Id"):
         _fail("Docker inspection identities changed before the destructive boundary")
-    storage_proof = _ledger_and_store_snapshot(control, pinned_backend, compose=compose)
+    storage_proof = _ledger_and_store_snapshot(control, pinned_backend, compose=compose,
+        retained_terminal_runs=authorization.get("retained_terminal_runs"))
     for key in ("store_root_sha256", "ledger_root_sha256", "ledger_snapshot_sha256"):
         if storage_proof.get(key) != expected_storage.get(key):
             _fail(f"storage proof {key} changed before the destructive boundary")
@@ -1772,6 +1839,42 @@ def _recover_args(args: argparse.Namespace, selected: Path) -> argparse.Namespac
     return result
 
 
+def _stop_terminal_frontend(control, operation, authorization, expected):
+    """Stop only the pinned frontend after the complete recovery preflight."""
+    if authorization.get("schema_version") != TERMINAL_OPERATOR_SCHEMA:
+        _fail("frontend stop requires explicit terminal-history authorization")
+    identifier = authorization["frontend_container_id"]
+    records = json.loads(docker_capture("inspect", identifier).stdout)
+    if not isinstance(records, list) or len(records) != 1:
+        _fail("frontend stop inspection is ambiguous")
+    actual = records[0]
+    from docker_volume_reconcile import fingerprint
+    if (fingerprint(actual) != fingerprint(expected)
+            or actual.get("Id") != identifier
+            or actual.get("Image") != authorization["old_image_id"]
+            or actual.get("State", {}).get("StartedAt") != expected.get("State", {}).get("StartedAt")):
+        _fail("frontend incarnation changed before terminal recovery stop")
+    if actual.get("State", {}).get("Running") is True:
+        operation["daemon_pending"] = True
+        docker_capture("stop", "--time", "60", identifier, timeout=90)
+        records = json.loads(docker_capture("inspect", identifier).stdout)
+        if not isinstance(records, list) or len(records) != 1:
+            _fail("frontend stop outcome is ambiguous")
+        actual = records[0]
+    state = actual.get("State", {})
+    if (actual.get("Id") != identifier or actual.get("Image") != authorization["old_image_id"]
+            or state.get("StartedAt") != expected.get("State", {}).get("StartedAt")
+            or state.get("Status") != "exited" or state.get("Running") is not False
+            or state.get("Pid") != 0 or not state.get("FinishedAt")):
+        _fail("frontend namespace teardown is not confirmed")
+    operation["daemon_pending"] = False
+    control.write(operation["root"] + "/frontend-stop.json", {
+        "schema": "fullmag.terminal-recovery-frontend-stop.v1", "state": "exited",
+        "container_id": identifier, "image_id": actual["Image"],
+        "started_at": state["StartedAt"], "finished_at": state["FinishedAt"],
+    })
+
+
 def recover(args: argparse.Namespace) -> None:
     """Run one explicit pre-admission container recovery.
 
@@ -1838,11 +1941,15 @@ def recover(args: argparse.Namespace) -> None:
         control, authorization, control.project, compose
     )
     if transition is None:
-        backend, frontend = _inspect_pair(authorization, control.project, compose)
+        if authorization.get("schema_version") == TERMINAL_OPERATOR_SCHEMA:
+            backend, frontend = _inspect_pair(authorization, control.project, compose, allow_live_frontend=True)
+        else:
+            backend, frontend = _inspect_pair(authorization, control.project, compose)
         network_name = _network_name(backend, "backend")
     else:
         backend, frontend = transition["backend"], transition["frontend"]
         network_name = transition["network_name"]
+    _validate_terminal_backend_incarnation(authorization, journal, backend)
     process_receipt, process_receipt_raw, process_receipt_sha = _runtime_process_receipt(control)
     if process_receipt_sha != authorization["process_receipt_sha256"]:
         _fail("current shutdown_unknown process receipt differs from operator authorization")
@@ -1878,7 +1985,8 @@ def recover(args: argparse.Namespace) -> None:
         or pins[1]["image_id"] != authorization["old_image_id"]
     ):
         _fail("Docker container pins changed since authorization")
-    storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose)
+    storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose,
+        retained_terminal_runs=authorization.get("retained_terminal_runs"))
     manifest = transition["manifest"] if transition is not None else _manifest(
         authorization, engine_sha, backend, frontend, pins, device_release, device_mapping
     )
@@ -1945,7 +2053,16 @@ def recover(args: argparse.Namespace) -> None:
             expected_launch_sha=launch_sha,
             expected_storage=storage_proof,
             transition=transition,
+            allow_live_frontend=authorization.get("schema_version") == TERMINAL_OPERATOR_SCHEMA,
         )
+        if authorization.get("schema_version") == TERMINAL_OPERATOR_SCHEMA and transition is None:
+            _stop_terminal_frontend(control, operation, authorization, frontend)
+            fresh = _revalidate_recovery_boundary(
+                control, authorization, attempt, control.project, compose,
+                expected_backend=backend, expected_frontend=frontend, expected_owner=owner,
+                expected_process_receipt_sha=process_receipt_sha, expected_config_sha=config_sha,
+                expected_launch_sha=launch_sha, expected_storage=storage_proof, transition=transition,
+            )
         backend = fresh["backend"]
         frontend = fresh["frontend"]
         network_name = fresh["network_name"]
@@ -1993,6 +2110,7 @@ def recover(args: argparse.Namespace) -> None:
                 docker_engine_id_sha256=engine_sha,
                 manifest_sha256=manifest_sha,
                 containers=pins,
+                retained_terminal_runs=authorization.get("retained_terminal_runs"),
             )
             request_raw = _canonical(request)
             request_sha = _sha256(request_raw)

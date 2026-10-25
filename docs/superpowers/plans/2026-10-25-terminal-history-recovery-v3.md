@@ -282,3 +282,37 @@ promocji, recovery ani Solve. Pozostała integracja istniejącego operator
 authorization/prior-stop journal z diagnostycznym stopem i pełnymi pinami v3,
 a następnie pełny preview przed zatrzymaniem naszego backendu. Sama obsługa
 wersji w klientach nie dowodzi gotowej procedury odtworzenia instancji.
+
+## Integracja operatora z terminalną historią
+
+Dodano jawny `fullmag.docker-container-recovery-operator-authorization.v2`
+z kompletnymi pinami `retained_terminal_runs`. Stary operator v1 zachowuje
+ścisły zestaw pól. V2 wiąże dokładne SHA256 diagnostycznego journalu,
+konfiguracji Compose/runtime, ownera i końcowego process receipt. Wymaga
+`stopped-execution-unknown`, `unknown-preserved`, nietkniętych leases i
+zachowanego Ready pina; nie przyjmuje fikcyjnego Drained. Poprawiono też
+etykietę receiptu stopu, aby dla Unknown nie twierdziła failed-preserved.
+
+Główna istniejąca procedura `recover` przekazuje piny v3 do obu snapshotów
+store/ledgera i do natywnego requestu. Dla nowej autoryzacji może początkowo
+obejrzeć działający frontend tej samej grupy, lecz backend nadal musi być
+zatrzymany. Dopiero po przygotowaniu obrazów i pełnej ponownej walidacji
+pod lifecycle lease zatrzymuje dokładnie przypięty frontend. Sprawdza
+fingerprint, StartedAt, image/ID i faktyczny exited/PID0/FinishedAt, zapisuje
+dowód oraz ponawia pełny preflight. Nieznany wynik stopu zachowuje guard.
+Stara ścieżka nadal wymaga obu kontenerów zatrzymanych przed wejściem.
+
+108 interpretowanych testów PASS. Nowe regresje obejmują rozdzielenie
+autoryzacji v1/v2, dryft pinów journalu, odrzucenie zmiany inkarnacji
+frontendu oraz zachowanie lease przy nieznanym wyniku stopu.
+Nie uruchomiono jeszcze stopu, odtwarzania kontenera, recovery ani Solve.
+Pełny rzeczywisty preview całej procedury oraz zarządzany build obrazu
+pozostają wymagane przed wykonaniem mutacji.
+
+Stan naukowy bez zmian: pełna mapa H wokół anteny na siatce Universe
+i jej wizualizacja w UI nie zostały uzyskane. Stare zaakceptowane V/J/H
+na małym zbiorze punktów nie są dowodem realizacji tego wymagania.
+
+Dodatkowo oba preflighty porównują dokładną inkarnację backendu z journalem:
+ID/obraz, StartedAt, FinishedAt, exit code, exited/PID0 i brak OOM.
+Zmiana tych danych blokuje przejście, nawet przy zachowanym container ID.
