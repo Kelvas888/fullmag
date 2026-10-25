@@ -603,3 +603,44 @@ precyzji/MPFR, osobno mierzone i jawnie opisane; nie domniemany zysk z
 liczników i nie ponawianie pełnego Universe bez rozwiązania kosztu.
 
 Patch eksperymentu SHA256: d7cb7032954f315a45c1efeea83930347fbae450efd47f1a4530d29aa0d88ce7.
+
+
+### Przywrócenie runtime oraz kierunek GMP — 25.10.2026
+
+Managed restart iteration716ac13fa9cd40849b2c05a16590add9 zakończył się
+succeeded/exit0. Native make155061 ms, package5800 ms. Build commit:
+1b7cb42e49233befc3033cd272141e8ac7fb72e1, snapshot:
+e6556d55ca845c2cd22d49065adbcf2e8128bfb02b9c870e3978f0bb9dd92c0c.
+Kontener i obraz pozostają bez zmian. Odrzucony cache NIE jest już w
+aktywnym źródle/pakiecie. Zbudowany CPP zgodny z worktree, SHA256:
+fa4a4c074f99ee3632da14a2ba6ba7c06bbad211a127ce32647ed8a3d8b77568.
+API health statusok, active_sessionfalse. Odczyt starego zaakceptowanego
+Hraw po restarcie:200,336B,SHA256
+45313db6f67ce8b0a13d10127fe61412b3ffbdee3d41c3eb319467d2cf4f44d4,
+17.389496162 s. Stary attempt:409,1.102933194 s. Bez ponownego Solve.
+Raport centered-current-restored-http.json SHA256:
+e5c2e409527c048e46397c91243ba624939e1eb32cba97af54b236352fd5eb68.
+W /build wolne459756929024 B. Dane eksperymentu i poprzednie wyniki
+pozostają zachowane; brak wykazanej zbędności pakietów dla porównań/rollbacku.
+Nie wykonywano prune, usuwania, kompilacji testów jednostkowych ani browsera.
+
+Read-only inspekcja LOKALNYCH nagłówków Boost rozstrzyga wcześniejszą
+wątpliwość konwersji GMP: gmp.hpp eval_convert_to(double)2199-2211 oraz
+rational_adaptor.hpp eval_convert_to239-244 używają tego samego
+multiprecision/detail/generic_interconvert.hpp generic_convert_rational_to_float,
+z dokładnym divide_qr i nearest-even. Wrapper NIE używa mpq_get_d dla double.
+Zachować publiczne value.convert_to<double>(); bez własnego konwertera lub
+roundtripu tekstowego. Dla integer->cpp_dec_float obie ścieżki korzystają
+z generic_interconvert: limb,ldexp,add. Na tym Linux/amd64 oczekiwane fragmenty
+są64bit, ale wymaga to static_assert i rzeczywistego pomiaru nowego builda.
+To dowód źródłowy, NIE wykonany parytet GMP.
+
+Najmniejszy kolejny fragment: mpz_int/mpq_rational przy NIEZMIENIONYCH
+cpp_dec_float80/120, Arithmetic::number, jawnych exact multiply/sum,
+raw_preflight/watch/bitguards i rzeczywistych licznikach. Dodać libgmp-dev
+późnym osobnym RUN obrazu DEV (po ciężkich deps/Python), deklarować wersję
+w provenance i jawne linkowanie. Obecny obraz nie ma gmp.h/mpfr.h; niczego
+nie doinstalowywano w żywym kontenerze. MPFR to osobna kolejna realizacja,
+nie cicha zamiana arytmetyki pod starym kontraktem. BuildKit CACHED,
+konwersje tie/subnormal i pełne21payloads/diagnostyki wymagają wykonania.
+Pełny zakres E0-E12 nadal aktywny; Universe1154 i UI NIEUKOŃCZONE.
