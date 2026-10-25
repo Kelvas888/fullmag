@@ -316,3 +316,33 @@ na małym zbiorze punktów nie są dowodem realizacji tego wymagania.
 Dodatkowo oba preflighty porównują dokładną inkarnację backendu z journalem:
 ID/obraz, StartedAt, FinishedAt, exit code, exited/PID0 i brak OOM.
 Zmiana tych danych blokuje przejście, nawet przy zachowanym container ID.
+
+## Rzeczywiste przygotowanie i kontrolowany stop
+
+`just docker-dev-images` PASS: toolchain cache hit, próba
+`cc59b8d4184a4a6da7badd974d396a5d`. Nowy backend image:
+`sha256:b3eb4e5bf434b46acd633e4339962bffbcb9b6ccaac59ce5ebf444c4023cc10c`,
+image-backend `cec67e6f38c84a8587891636ae4a304a`. To przygotowanie obrazu,
+nie build aplikacji ani start solvera.
+
+Dodano brakującą receptę `just docker-dev-stop-diagnostic` ze ścisłym
+stałym argv i domyślnym `preview=true`. Preview ma własną fazę i blokadę
+BuildControl, odmawia abortowania pending activation i nie wykonuje
+rekoncyliacji nieznanego stopu. 6 testów interpretowanych PASS, w tym
+komendy złożone, dopisane flagi i zamiana fazy lease.
+
+Pełny rzeczywisty preview `1cbf8ee1c3d046019c0ecd52355b28cb` PASS.
+Świeży odczyt historii `9de2d65ff97240bb8cbc386c7c455d9b` PASS 14/14.
+Stop `242dc6e0c13340e394a20609ff811525` succeeded: API exit -15, backend
+exit 1, execution unknown i owner unknown-preserved. Wynik 1 pochodzi
+z zachowanej nieudanej obserwacji runtime; nie jest udanym native drain.
+Terminal process receipt SHA256:
+`60dbf4b3043e8f430bd6549eef4b99de28bc99e5736aead19b42c391a22dc40c`.
+
+Pełny post-stop preflight `1075dafa520a48a08b51244f9e2ca4df` PASS:
+zgodny backend/journal/config/owner i snapshot wszystkich 14 wejść.
+Autoryzacja v2 w wolumenie kontrolnym:
+`runtime-services/container-recovery/06e99e63-da04-4190-897e-d30cb8404a6a/operator.json`,
+SHA256 `3cf7b4c118249f4a25f1d966f61215b24c9a6e3f26ad9b4ce8e778cbae960a9a`.
+Frontend pozostaje uruchomiony do ponownej walidacji pod lifecycle lease.
+Recovery, uruchomienie nowego pakietu oraz Solve Universe nadal wymagają wykonania.

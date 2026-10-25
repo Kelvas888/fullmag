@@ -2631,6 +2631,7 @@ def _parser() -> argparse.ArgumentParser:
     stop_diagnostic.add_argument("--config-sha256", required=True)
     stop_diagnostic.add_argument("--source-root", type=Path, required=True)
     stop_diagnostic.add_argument("--port", type=int, required=True)
+    stop_diagnostic.add_argument("--preview", action="store_true")
     stop_diagnostic.add_argument(
         "--resume-attempt",
         help="exact successful retained resume attempt that pins the current backend start time",

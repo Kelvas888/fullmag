@@ -568,7 +568,10 @@ def _assert_group_consumers(control: BuildControl, operation, ids: Mapping[str, 
     command_text = " ".join(command) if isinstance(command, list) and all(
         isinstance(item, str) for item in command
     ) else ""
-    if ("/control/stop-diagnostic/attempts/" + attempt not in command_text
+    inputs = receipt.get("inputs", {})
+    expected_phase = "stop-diagnostic-preview" if inputs.get("preview_only") is True else "stop-diagnostic"
+    if (receipt.get("phase") != expected_phase
+            or "/control/" + expected_phase + "/attempts/" + attempt not in command_text
             or "until test -f" not in command_text or "/control/active" not in command_text):
         _fail("BuildControl helper is not holding this exact diagnostic stop lease")
     expected = set(ids.values()) | {helper["Id"]}
@@ -954,6 +957,9 @@ def stop_diagnostic(args: argparse.Namespace) -> dict[str, object]:
         not isinstance(resume_attempt, str) or ATTEMPT_RE.fullmatch(resume_attempt) is None
     ):
         _fail("Resume attempt is not a complete lowercase identity")
+    preview = bool(getattr(args, "preview", False))
+    if preview and getattr(args, "pending_activation", None) is not None:
+        _fail("Diagnostic preview cannot abort a pending activation")
     require_host()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root)
     identity = _compose_identity(layout)
@@ -1040,10 +1046,13 @@ def stop_diagnostic(args: argparse.Namespace) -> dict[str, object]:
             args, control, selected, identity, effective_previous, document,
             previous_root, operation_inputs, resume_pin,
         )
-    _reconcile_read_timeout_attempt(
-        args, control, selected, identity, effective_previous, document, operation_inputs
-    )
-    with control.operation("stop-diagnostic", operation_inputs) as operation:
+    if not preview:
+        _reconcile_read_timeout_attempt(
+            args, control, selected, identity, effective_previous, document, operation_inputs
+        )
+    operation_inputs["preview_only"] = preview
+    phase = "stop-diagnostic-preview" if preview else "stop-diagnostic"
+    with control.operation(phase, operation_inputs) as operation:
         from docker_volume_preparation_abort import pin_completed_fresh_archive
         pin_completed_fresh_archive(control)
         operation["receipt"].update(state="validating-diagnostic-api")
@@ -1122,6 +1131,12 @@ def stop_diagnostic(args: argparse.Namespace) -> dict[str, object]:
             )
         ):
             _fail("Original or resume terminal changed immediately before the backend stop")
+        if preview:
+            operation["receipt"].update(state="succeeded", stopped_backend=False, execution_state="unknown")
+            return {"state": "preview-passed", "stop_applied": False,
+                    "backend_container_id": ids["backend"], "frontend_container_id": ids["frontend"],
+                    "owner_state": before["failed_owner"]["state"],
+                    "preflight": operation["root"] + "/diagnostic-stop-preflight.json"}
         operation["daemon_pending"] = True
         docker_capture("stop", "--time", "60", ids["backend"], timeout=90)
         observed = json.loads(docker_capture("inspect", ids["backend"]).stdout)
@@ -1161,6 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config-sha256", required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--preview", action="store_true")
     parser.add_argument(
         "--resume-attempt",
         help="exact successful retained resume attempt that pins the current backend start time",

@@ -3,6 +3,9 @@ import ast
 import base64
 import copy
 import json
+import os
+from pathlib import Path
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -55,6 +58,29 @@ class DiagnosticUnknownStopTests(unittest.TestCase):
             owner,process=self.fixture();process[field]=value
             with self.subTest(field=field),self.assertRaises(BuildControlError):self.evidence(owner,process)
 
+    def test_preview_helper_must_hold_its_exact_phase_lease(self):
+        from types import SimpleNamespace
+        attempt='a'*32;helper_id='b'*64
+        ids={'backend':'c'*64,'frontend':'d'*64}
+        control=SimpleNamespace(image='image',project='project',volume='volume',identity={})
+        for preview in [True,False]:
+            phase='stop-diagnostic-preview' if preview else 'stop-diagnostic'
+            operation={'receipt':{'attempt':attempt,'helper_container':'fullmag-control-'+attempt,
+                                 'phase':phase,'inputs':{'preview_only':preview}}}
+            helper={'Id':helper_id,'Config':{'Image':'image','Labels':{
+                'com.docker.compose.project':'project','com.docker.compose.service':'build-control',
+                'org.fullmag.compose.project':'project'},'Cmd':['/control/'+phase+'/attempts/'+attempt+' until test -f /control/active']},
+                'State':{'Running':True},'HostConfig':{'NetworkMode':'none'},
+                'Mounts':[{'Destination':'/control','Type':'volume','Name':'volume'}]}
+            expected=set(ids.values())|{helper_id}
+            with patch.object(stop,'docker_capture',return_value=SimpleNamespace(stdout=json.dumps([helper]).encode())), \
+                 patch('docker_compose_identity.validate_source_labels'), \
+                 patch('docker_volume_unclaimed_cancellation._project_container_ids',return_value=expected), \
+                 patch('docker_volume_unclaimed_cancellation._volume_consumer_ids',return_value=expected):
+                self.assertEqual(stop._assert_group_consumers(control,operation,ids),helper_id)
+                operation['receipt']['inputs']['preview_only']=not preview
+                with self.assertRaises(BuildControlError):stop._assert_group_consumers(control,operation,ids)
+
     def test_serialized_guest_uses_the_same_identity_check(self):
         tree=ast.parse(stop._probe_script())
         branch=next(n for n in tree.body if isinstance(n,ast.If) and "owner.get('state') == 'unknown'" in ast.unparse(n.test))
@@ -65,6 +91,39 @@ class DiagnosticUnknownStopTests(unittest.TestCase):
         self.assertEqual(owner['state'],'unknown')
         scope['owner']={**owner,'owner_token':'other'}
         with self.assertRaises(ValueError):exec(compile(module,'guest-owner-check','exec'),scope)
+
+
+class DiagnosticStopShellTests(unittest.TestCase):
+    def dispatch(self,extra='',resume=True,preview=True):
+        source=(Path(__file__).parent/'just_storage_shell.sh').read_text()
+        body=source.split('  *"scripts/docker_dev.py"*" stop-diagnostic-volume "*)\n',1)[1].split('\n    ;;',1)[0]
+        recipe=('python "/ignored/scripts/docker_dev.py" --repo-root "/ignored" stop-diagnostic-volume '
+                "--attempt '"+'a'*32+"' --config-sha256 '"+'b'*64+"' --source-root '/selected/worktree' --port '3203'")
+        if resume:recipe+=" --resume-attempt '"+'c'*32+"'"
+        if preview:recipe+=' --preview'
+        recipe+=extra
+        program=('set -euo pipefail\nrecipe="$RECIPE_LITERAL"\n'
+                 'python_cmd="/recorded/python"\nscript_dir="/registered/scripts"\nrepo_root="/registered"\n'
+                 'exec() { printf \'%s\\0\' "$@"; }\n'+body)
+        return subprocess.run(['/bin/bash','--noprofile','--norc','-c',program],
+            env={**os.environ,'RECIPE_LITERAL':recipe},capture_output=True,timeout=15)
+
+    def test_exact_preview_and_mutation_argv(self):
+        for preview in [True,False]:
+            result=self.dispatch(preview=preview)
+            self.assertEqual(result.returncode,0,result.stderr)
+            argv=result.stdout.split(b'\0')[:-1]
+            self.assertIn(b'stop-diagnostic-volume',argv)
+            self.assertEqual(b'--preview' in argv,preview)
+            self.assertEqual(argv[argv.index(b'--resume-attempt')+1],b'c'*32)
+        result=self.dispatch(resume=False);self.assertEqual(result.returncode,0,result.stderr)
+        self.assertNotIn(b'--resume-attempt',result.stdout)
+
+    def test_composite_or_unknown_arguments_are_refused(self):
+        for extra in ['; printf injected',' && printf injected','\nprintf injected',' --force',' --preview']:
+            result=self.dispatch(extra)
+            self.assertEqual(result.returncode,2,result.stderr)
+            self.assertFalse(result.stdout)
 
 
 if __name__=='__main__':unittest.main()

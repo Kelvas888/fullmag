@@ -123,6 +123,10 @@ docker-dev-refresh-frontend attempt config_sha256 source_root port="3197":
 docker-dev-restart-idle attempt config_sha256 source_root port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" restart-idle-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}
 
+# Inspect or stop the exact fenced diagnostic API; preserve Unknown and all data.
+docker-dev-stop-diagnostic attempt config_sha256 source_root port="3197" resume_attempt="" preview="true":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" stop-diagnostic-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}{{if resume_attempt == "" { "" } else { " --resume-attempt " + quote(resume_attempt) }}}{{if preview == "true" { " --preview" } else if preview == "false" { "" } else { error("preview must be true or false") }}}
+
 # Drain an idle backend without starting it again; retain all data and cache.
 docker-dev-stop-idle attempt config_sha256 source_root port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" restart-idle-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}} --stop-only

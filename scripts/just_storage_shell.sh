@@ -360,6 +360,22 @@ case "${recipe}" in
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_dev_browser_qa.py" "${browser_qa_args[@]}"
     ;;
+  *"scripts/docker_dev.py"*" stop-diagnostic-volume "*)
+    diagnostic_stop_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" stop-diagnostic-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --resume-attempt '([0-9a-f]{32})')?( --preview)?[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${diagnostic_stop_pattern} ]]; then
+      echo "[fullmag just] invalid diagnostic stop recipe" >&2
+      exit 2
+    fi
+    diagnostic_stop_args=(--repo-root "${repo_root}" stop-diagnostic-volume --attempt "${BASH_REMATCH[1]}"
+      --config-sha256 "${BASH_REMATCH[2]}" --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
+    if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
+      diagnostic_stop_args+=(--resume-attempt "${BASH_REMATCH[6]}")
+    fi
+    if [[ -n "${BASH_REMATCH[7]:-}" ]]; then
+      diagnostic_stop_args+=(--preview)
+    fi
+    exec "${python_cmd}" -B "${script_dir}/docker_dev.py" "${diagnostic_stop_args[@]}"
+    ;;
   *"scripts/docker_dev.py"*" stop-unadmitted "*)
     volume_stop_unadmitted_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" stop-unadmitted --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --frontend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --failure-marker-sha256 '([0-9a-f]{64})' --process-receipt-sha256 '([0-9a-f]{64})' --source-sha256 '([0-9a-f]{64})' --request-id '([^']+)' --session-id '([^']+)'[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${volume_stop_unadmitted_pattern} ]]; then
