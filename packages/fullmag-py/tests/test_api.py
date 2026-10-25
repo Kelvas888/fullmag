@@ -23,6 +23,7 @@ from unittest.mock import patch
 import numpy as np
 
 import fullmag as fm
+import fullmag.model.problem as problem_model
 import fullmag.world as flat_world
 from fullmag.meshing.voxelization import VoxelMaskData
 from fullmag.runtime import cli as runtime_cli
@@ -319,6 +320,33 @@ class ProblemApiTests(unittest.TestCase):
             )
 
         self.assertEqual(realize.call_count, 2)
+
+    def test_shared_domain_cache_schema_invalidates_raw_air_marker_reports(self) -> None:
+        geometry = fm.Box(size=(10e-9, 10e-9, 10e-9), name="box")
+        hints = fm.FEM(order=1, maximum_element_size=2e-9)
+        kwargs = {
+            "study_universe": None,
+            "mesh_workflow": None,
+            "per_object_recipes": None,
+            "object_regions": None,
+            "cache_identity": None,
+        }
+
+        key, document = problem_model._fem_shared_domain_cache_document(
+            [geometry], hints, **kwargs
+        )
+        with patch.object(
+            problem_model,
+            "_FEM_SHARED_DOMAIN_CACHE_SCHEMA",
+            "fullmag.fem.shared-domain-cache.v1",
+        ):
+            old_key, old_document = problem_model._fem_shared_domain_cache_document(
+                [geometry], hints, **kwargs
+            )
+
+        self.assertEqual(document["schema"], "fullmag.fem.shared-domain-cache.v2")
+        self.assertEqual(old_document["schema"], "fullmag.fem.shared-domain-cache.v1")
+        self.assertNotEqual(key, old_key)
 
     def test_per_object_fem_cache_publish_is_atomic_and_reloadable(self) -> None:
         mesh = MeshData.from_legacy_tet4(

@@ -2000,7 +2000,7 @@ def _extract_element_markers_for_tags(
     gmsh: Any,
     all_tags: list[int],
 ) -> NDArray[np.int32] | None:
-    """Return physical-group markers aligned to ``all_tags`` order."""
+    """Return canonical semantic markers aligned to ``all_tags`` order."""
     if not all_tags:
         return np.zeros(0, dtype=np.int32)
     if len(set(int(tag) for tag in all_tags)) != len(all_tags):
@@ -2022,7 +2022,12 @@ def _extract_element_markers_for_tags(
         return None
     requested_tags = {int(tag) for tag in all_tags}
     for _dim, phys_tag in physical_groups:
-        marker = int(phys_tag)
+        physical_marker = int(phys_tag)
+        try:
+            physical_name = gmsh.model.getPhysicalName(3, phys_tag)
+        except Exception:
+            physical_name = None
+        marker = _semantic_marker_from_name(physical_name, physical_marker)
         try:
             entities = gmsh.model.getEntitiesForPhysicalGroup(3, phys_tag)
         except Exception:
@@ -2035,7 +2040,10 @@ def _extract_element_markers_for_tags(
             for block in tag_blocks:
                 for tag in block:
                     element_tag = int(tag)
-                    marker_sources.setdefault(element_tag, set()).add(marker)
+                    # Preserve raw physical-group identities for overlap
+                    # detection even when multiple names normalize to the same
+                    # semantic marker (for example, ``air`` -> marker 0).
+                    marker_sources.setdefault(element_tag, set()).add(physical_marker)
                     previous = tag_to_marker.get(element_tag)
                     if previous is not None and previous != marker:
                         # Keep collecting so the error reports all conflicting

@@ -340,6 +340,12 @@ starszymi diagnostykami workspace, a endpoint Airboxa wybiera wyłącznie
 scope markera 0. Brak nowego pola pozostaje zgodny ze starszymi artefaktami
 i uruchamia dotychczasowy fallback geometrii, bez tworzenia metryk Gmsh.
 
+Mapowanie fizycznych grup Gmsh na markery semantyczne musi być identyczne
+dla topologii i raportów jakości. W szczególności nazwy `air` i `airbox`
+oznaczają marker 0 niezależnie od surowego numeru grupy fizycznej. Surowe
+numery pozostają podstawą wykrywania nakładających się grup; normalizacja
+nie może ukrywać konfliktu przypisania elementu.
+
 The mixed-v2 Gmsh producer extracts these metrics when quality computation is
 requested and converts its scaled-coordinate volume channels back to SI before
 attaching them to `MeshData`. Marker reports are rekeyed only when the final

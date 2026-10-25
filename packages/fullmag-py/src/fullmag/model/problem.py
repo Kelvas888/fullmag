@@ -99,8 +99,10 @@ _FEM_M2_OPERATOR_VERSION = "fem_charge_spin_conforming_h1_p1.reciprocal_m2.v1"
 # neighboring geometry's size field after canonical owner binding changes.
 # v11 excludes isolated Gmsh construction points from mixed-v2 P1 state nodes.
 # Retain old artifacts, but never reuse their unbound zero-support state DOFs.
+# Shared-domain cache schema v2 also invalidates reports whose named Air
+# physical-group tag was not normalized to canonical marker 0.
 _FEM_MESH_CACHE_VERSION = "v11"
-_FEM_SHARED_DOMAIN_CACHE_SCHEMA = "fullmag.fem.shared-domain-cache.v1"
+_FEM_SHARED_DOMAIN_CACHE_SCHEMA = "fullmag.fem.shared-domain-cache.v2"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 

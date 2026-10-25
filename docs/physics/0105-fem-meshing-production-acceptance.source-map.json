@@ -300,6 +300,12 @@
       "responsibility": "Allows the gamma-bearing legacy marker map only when canonical marker coverage, counts, and Gmsh gamma eligibility are complete."
     },
     {
+      "id": "quality-semantic-marker-mapping",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py",
+      "symbol": "_extract_element_markers_for_tags",
+      "responsibility": "Uses the topology semantic marker mapping for quality scopes while detecting overlaps by raw physical group identity."
+    },
+    {
       "id": "mesh-size-histograms",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py",
       "symbol": "_size_histogram_bins",

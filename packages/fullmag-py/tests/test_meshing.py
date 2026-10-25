@@ -1361,6 +1361,156 @@ class MeshScaffoldTests(unittest.TestCase):
         assert by_marker is not None
         self.assertAlmostEqual(by_marker[7].gamma_min, 0.3)
 
+    def test_extract_quality_metrics_uses_canonical_air_marker(self) -> None:
+        element_blocks = {
+            101: (4, 10),  # magnetic ring tetrahedron
+            102: (4, 11),  # air tetrahedron
+            103: (6, 20),  # magnetic prism
+            104: (7, 30),  # air pyramid
+        }
+        group_entities = {1: [103], 2: [101], 3: [102, 104]}
+        group_names = {1: "magnetic_box", 2: "magnetic_ring", 3: "air"}
+        channel_values = {
+            "minSICN": {10: 0.7, 11: 0.8, 20: 0.9, 30: 0.2},
+            "gamma": {10: 0.4, 11: 0.6, 20: 0.5},
+            "volume": {10: 1.0, 11: 2.0, 20: 3.0, 30: 4.0},
+        }
+
+        class _MeshApi:
+            @staticmethod
+            def getElements(
+                dim: int,
+                entity: int | None = None,
+            ) -> tuple[list[int], list[np.ndarray], list[np.ndarray]]:
+                assert dim == 3
+                if entity is None:
+                    return (
+                        [4, 6, 7],
+                        [
+                            np.asarray([10, 11], dtype=np.int64),
+                            np.asarray([20], dtype=np.int64),
+                            np.asarray([30], dtype=np.int64),
+                        ],
+                        [np.zeros(8), np.zeros(6), np.zeros(5)],
+                    )
+                element_type, tag = element_blocks[entity]
+                return (
+                    [element_type],
+                    [np.asarray([tag], dtype=np.int64)],
+                    [np.zeros(4 if element_type == 4 else 6 if element_type == 6 else 5)],
+                )
+
+            @staticmethod
+            def getElementQualities(tags: list[int], metric: str) -> list[float]:
+                return [channel_values[metric][tag] for tag in tags]
+
+        class _Model:
+            mesh = _MeshApi()
+
+            @staticmethod
+            def getPhysicalGroups(dim: int) -> list[tuple[int, int]]:
+                assert dim == 3
+                return [(3, marker) for marker in (1, 2, 3)]
+
+            @staticmethod
+            def getPhysicalName(dim: int, marker: int) -> str:
+                assert dim == 3
+                return group_names[marker]
+
+            @staticmethod
+            def getEntitiesForPhysicalGroup(dim: int, marker: int) -> list[int]:
+                assert dim == 3
+                return group_entities[marker]
+
+        gmsh = SimpleNamespace(
+            model=_Model(),
+            option=SimpleNamespace(getNumber=lambda _name: 0.5),
+        )
+        quality, by_marker = _extract_quality_metrics(
+            gmsh,
+            MeshOptions(per_element_quality=True),
+        )
+
+        self.assertIsNotNone(by_marker)
+        assert by_marker is not None
+        self.assertEqual(set(by_marker), {0, 1, 2})
+        air_quality = by_marker[0]
+        self.assertEqual(air_quality.n_elements, 2)
+        self.assertAlmostEqual(air_quality.sicn_min, 0.2)
+        self.assertEqual(air_quality.gamma_element_count, 1)
+        self.assertEqual(
+            air_quality.quality_by_family["tet4"]["sicn"]["status"],
+            "available",
+        )
+        self.assertEqual(
+            air_quality.quality_by_family["tet4"]["gamma"]["status"],
+            "available",
+        )
+        self.assertEqual(
+            air_quality.quality_by_family["pyramid5"]["sicn"]["status"],
+            "available",
+        )
+        self.assertEqual(
+            air_quality.quality_by_family["pyramid5"]["gamma"]["status"],
+            "unavailable",
+        )
+
+        tet_coordinates = np.asarray(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float64
+        )
+        prism_coordinates = np.asarray(
+            [
+                [0, 0, 0], [1, 0, 0], [0, 1, 0],
+                [0, 0, 1], [1, 0, 1], [0, 1, 1],
+            ],
+            dtype=np.float64,
+        ) + [6, 0, 0]
+        pyramid_coordinates = np.asarray(
+            [[7, -1, 0], [9, -1, 0], [9, 1, 0], [7, 1, 0], [8, 0, 1]],
+            dtype=np.float64,
+        )
+        nodes = np.concatenate(
+            [
+                tet_coordinates,
+                tet_coordinates + [3, 0, 0],
+                prism_coordinates,
+                pyramid_coordinates,
+            ]
+        )
+        mesh = MeshData(
+            nodes=nodes,
+            cell_types=np.asarray(["tet4", "tet4", "prism6", "pyramid5"]),
+            cell_offsets=np.asarray([0, 4, 8, 14, 19], dtype=np.int64),
+            cell_nodes=np.arange(19, dtype=np.int32),
+            element_markers=np.asarray([2, 0, 1, 0], dtype=np.int32),
+            facet_types=np.asarray([], dtype=np.str_),
+            facet_roles=np.asarray([], dtype=np.str_),
+            facet_offsets=np.asarray([0], dtype=np.int64),
+            facet_nodes=np.asarray([], dtype=np.int32),
+            boundary_markers=np.asarray([], dtype=np.int32),
+            cell_global_ordinals=np.arange(4, dtype=np.int64),
+            facet_global_ordinals=np.asarray([], dtype=np.int64),
+            quality=quality,
+            per_domain_quality=by_marker,
+        )
+        mesh_ir = mesh.to_ir("mixed")
+        self.assertNotIn("per_domain_quality", mesh_ir)
+        statistics = mesh_ir["mesh_statistics"]
+        air_scope = next(
+            scope for scope in statistics["scopes"] if scope["marker"] == 0
+        )
+        self.assertAlmostEqual(air_scope["sicn"]["min"], 0.2)
+        self.assertIsNone(air_scope["gamma"])
+        self.assertEqual(air_scope["quality_by_family"]["tet4"]["source"], "gmsh")
+        self.assertEqual(
+            air_scope["quality_by_family"]["pyramid5"]["sicn"]["status"],
+            "available",
+        )
+        self.assertEqual(
+            air_scope["quality_by_family"]["pyramid5"]["gamma"]["status"],
+            "unavailable",
+        )
+
     def test_extract_quality_metrics_rejects_missing_and_nonfinite_channels(self) -> None:
         def extract(responses: dict[str, list[float]]) -> None:
             class _MeshApi:
