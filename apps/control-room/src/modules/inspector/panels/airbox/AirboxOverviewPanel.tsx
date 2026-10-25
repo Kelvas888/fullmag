@@ -7,7 +7,7 @@ import {
   useSceneResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
-import { shouldLoadRuntimeMeshManifest } from "@/kernel/resources/studyRuntimeResources";
+import { hasPublishedFemMeshEvidence, shouldLoadRuntimeMeshManifest, shouldLoadRuntimeMeshBuild } from "@/kernel/resources/studyRuntimeResources";
 import { useKernel } from "@/kernel/KernelContext";
 import { Button } from "@/shared/ui/Button";
 import { buildUniverseDomainPolicyPresentation } from "@/shared/domain/mesh/domainPresentation";
@@ -48,13 +48,13 @@ export function AirboxOverviewPanel({ selection }: InspectorPanelProps) {
   const kernel = useKernel();
   const runtimeStatus = useAirboxInspectorRuntimeStatus();
   const runtimeLane = resolveAirboxInspectorLane(selection, runtimeStatus);
-  const runtimeResolved = runtimeLane === "fdm" || runtimeLane === "fem";
+  const meshFactsAvailable = runtimeLane === "fdm" || runtimeLane === "fem" || hasPublishedFemMeshEvidence(runtimeStatus);
   const policy = useUniverseMeshPolicyResource();
   const manifest = useMeshSharedDomainManifestResource({
     enabled: shouldLoadRuntimeMeshManifest(true, runtimeStatus),
   });
-  const build = useMeshBuildCurrent({ enabled: runtimeResolved });
-  const scene = useSceneResource({ enabled: runtimeResolved });
+  const build = useMeshBuildCurrent({ enabled: shouldLoadRuntimeMeshBuild(true, runtimeStatus) });
+  const scene = useSceneResource();
   const visualization = useVisualizationStateResource();
   const airboxParts = findAirboxParts(manifest.data?.mesh_parts);
   const aggregate = aggregateAirboxMeshParts(airboxParts);
@@ -65,7 +65,7 @@ export function AirboxOverviewPanel({ selection }: InspectorPanelProps) {
     manifest: manifest.data,
     manifestStatus: manifest.status,
     policy: policy.data,
-    runtimeResolved,
+    runtimeResolved: meshFactsAvailable,
     sceneRevision: scene.data?.scene_revision ?? scene.data?.revision ?? null,
   });
   const modeValue = domainPolicy.authored.mode.value;

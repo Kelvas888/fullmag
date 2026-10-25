@@ -582,3 +582,53 @@ odpowiedzi fields/quantities przed Solve.
 Zachowano kolejność planu: nie uruchomiono ciężkiego Solve. Poproszono
 użytkownika o obserwację drzewa i siatki na 3203; brak odpowiedzi nie jest
 zaliczeniem bramki ani zgodą na pominięcie kontroli WebGL.
+
+
+### Etap 2 rozpoczęty — potwierdzenie widoku i poprawka inspektora
+
+Użytkownik 26.10.2026 potwierdził widoczność drzewa i siatki oraz przekazał
+zrzut ekranu z anteną i otoczeniem Universe. Etap 1 zaliczono w zakresie
+kontroli danych i ręcznej obserwacji obrazu. Automatyczny smoke WebGL
+(canvas/context/drawing buffer) pozostaje niewykonany i nie jest zastąpiony
+samą obserwacją użytkownika.
+
+Zrzut pokazał nieadekwatne statusy unknown i nierozwiązanej lane w inspektorze
+Airbox. Ustalono, że AntennaFieldOnly celowo nie publikuje BackendCapabilities
+zwykłego runtime LLG. Odczyt istniejącej siatki nie może od tego zależeć.
+Dodano jawny dowód opublikowanej siatki FEM: explicit_topology, dodatnia
+rewizja, domain FEM i zgodny jawny authored/resolved FEM. Pozwala to czytać
+manifest i pokazywać panele faktów bez rozstrzygania lane lub aktywacji fizyki.
+Brak dowodów i sprzeczne/stare wybory FDM nadal są odrzucane. Ocena aktualności
+nadal zależy od zasobów i rewizji w modelu domeny.
+
+Wspólny Quantity Source otrzymał jawny, wyłączony pusty stan i wyjaśnienie
+braku zgodnego opublikowanego pola. Dopasowanie opcji zachowuje kanoniczne
+aliasy; brak dopasowania nie pokazuje edytora dawnego tensora. Nie dodano
+pozornych quantities ani automatycznego Solve.
+
+Weryfikacja: pełny TypeScript exit 0 po końcowych poprawkach; focused ESLint
+7 plików exit 0; architecture hygiene exit 0. 21 interpretowanych asercji
+rzeczywistych helperów zasobów oraz 19 kontroli wyrażeń quantity/aliasów PASS.
+Przegląd wykrył i usunął konflikt starego zaznaczenia FDM oraz dosłowne
+porównanie aliasów. Dwa testy zasobów i trzy scenariusze SSR dodano w źródłach;
+nie kompilowano ani nie uruchamiano testów jednostkowych. Końcowy obraz
+zmienionego inspektora nadal wymaga obserwacji; nie deklarujemy kwalifikacji UI.
+
+### Pierwsze Solve na bieżącym katalogu
+
+Żądanie z precondition pobranym ze status.resources.stages_revision=2
+odrzucono kodem 409 przed przyjęciem komendy: autorytatywny zasób
+simulation/stages/execution miał revision=3. Run pozostał waiting_for_solve,
+liczba przyjętych komend wynosiła zero. Nie poluzowano warunków: następne
+żądanie użyło revision=3 bezpośrednio z zasobu wykonania oraz aktualnych
+rewizji sceny, siatki i komend.
+
+Przyjęto `fm-dca3b994-0740-48e3-bde8-2c2c49ddd691`, intent
+`antenna-universe-current-field-20261026-02`, dla runu
+`run-live-2f2f35216a3d2f071397d9524ecb3d62db1f517291bac27e64524428444a0ca0`.
+Run i etap mają status running; algorytm antenna_field_only; worker PID 6335
+rzeczywiście pracuje w backendzie. Ostatni odczyt: ok. 515 MiB RSS i brak
+ostrzeżeń solvera. Nie uruchomiono Run/Relax ani drugiego Solve. Zachowano
+profil, siatkę, tolerancje i limity. Wynik V/J/H nie jest jeszcze opublikowany;
+nie zaliczono bramki transportu ani pola.
+Dowody: `verification/antenna-universe-current-field-20261026/` w control volume.

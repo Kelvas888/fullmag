@@ -9,6 +9,7 @@ import {
   useFdmRegionMembershipResource,
   useSceneResource,
 } from "@/kernel/resources/geometryLifecycleResources";
+import { hasPublishedFemMeshEvidence } from "@/kernel/resources/studyRuntimeResources";
 import {
   buildDomainPresentation,
   deriveAuthoredFdmUniverseOutsideMagneticSupport,
@@ -61,6 +62,9 @@ function AirboxInspectorLanePanel({
   const runtimeStatus = useAirboxInspectorRuntimeStatus();
   const lane = resolveAirboxInspectorLane(selection, runtimeStatus);
   const authoringLane = resolveAirboxInspectorAuthoringLane(selection, runtimeStatus);
+  const publishedFemMesh = hasPublishedFemMeshEvidence(runtimeStatus);
+  const inspectionLane = lane === "unresolved" && publishedFemMesh && authoringLane === "conflict"
+    ? "conflict" : lane;
   const explicitFdm = lane === "fdm";
   const domain = useDomainMetaResource({ enabled: explicitFdm });
   const membership = useFdmRegionMembershipResource({ enabled: explicitFdm });
@@ -117,7 +121,7 @@ function AirboxInspectorLanePanel({
         selection={selection}
       />
     );
-  } else if (lane === "conflict") {
+  } else if (inspectionLane === "conflict") {
     content = (
       <AirboxLaneAvailabilityPanel
         heading="Airbox selection does not match the runtime lane"
@@ -128,7 +132,7 @@ function AirboxInspectorLanePanel({
     );
   } else if (lane === "unresolved") {
     const authoredMethod = runtimeStatus?.authoring.method ?? null;
-    if (overviewFallback && authoredMethod === "fem") {
+    if (publishedFemMesh || (overviewFallback && authoredMethod === "fem")) {
       content = <FemPanel selection={selection} />;
     } else if (overviewFallback && authoredMethod === "fdm") {
       content = <AirboxMeshParametersPanel lane="fdm" runtimeLane={null} selection={selection} />;
@@ -170,7 +174,7 @@ function AirboxInspectorLanePanel({
   }
 
   return (
-    <AirboxInspectorIdentityFrame lane={lane} selection={selection}>
+    <AirboxInspectorIdentityFrame lane={inspectionLane} publishedFemMesh={publishedFemMesh && inspectionLane !== "conflict"} selection={selection}>
       {content}
     </AirboxInspectorIdentityFrame>
   );

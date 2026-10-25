@@ -24,12 +24,12 @@ function laneLabel(lane: AirboxInspectorLane): string {
   return "runtime lane unresolved";
 }
 
-function statusForSelection(selection: Selection, lane: AirboxInspectorLane) {
+function statusForSelection(selection: Selection, lane: AirboxInspectorLane, publishedFemMesh: boolean) {
   const ref = selection.ref?.type === "airbox" ? selection.ref : null;
   return {
-    availability: ref?.availability ?? (lane === "conflict" ? "unsupported" : "unknown"),
-    execution: ref?.executionState ?? "unknown",
-    resource: ref?.resourceState ?? "unknown",
+    availability: ref?.availability ?? (lane === "conflict" ? "unsupported" : publishedFemMesh ? "mesh inspection available" : "unknown"),
+    execution: ref?.executionState ?? (publishedFemMesh && lane === "unresolved" ? "execution unresolved" : "unknown"),
+    resource: ref?.resourceState ?? (publishedFemMesh ? "mesh published" : "unknown"),
   };
 }
 
@@ -47,14 +47,16 @@ export function AirboxInspectorIdentityFrame({
   children,
   lane,
   owner = "airbox-inspector",
+  publishedFemMesh = false,
   selection,
 }: InspectorPanelProps & {
   children: ReactNode;
   lane: AirboxInspectorLane;
   owner?: string;
+  publishedFemMesh?: boolean;
 }) {
   const ref = selection.ref?.type === "airbox" ? selection.ref : null;
-  const status = statusForSelection(selection, lane);
+  const status = statusForSelection(selection, lane, publishedFemMesh);
   const title = TITLES[selection.kind ?? ""] ?? "Airbox Inspector";
   const target = ref?.visualizationTargetId ?? "airbox";
 
@@ -63,7 +65,7 @@ export function AirboxInspectorIdentityFrame({
       <ScientificInspectorTemplate
         breadcrumbs={["Model", "Airbox", title]}
         diagnostics={diagnosticsForSelection(selection, lane)}
-        methodLabel={laneLabel(lane)}
+        methodLabel={publishedFemMesh && lane === "unresolved" ? "FEM mesh · execution unresolved" : laneLabel(lane)}
         physicalLabel="Airbox"
         properties={[
           { label: "Target", mono: true, value: target },

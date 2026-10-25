@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const testState = vi.hoisted(() => ({
   calls: [] as boolean[],
+  publishedFemMesh: false,
   discretization: "fdm" as "fdm" | "fem" | null,
   authoringMethod: null as "fdm" | "fem" | null,
   resolvedDiscretization: null as "fdm" | "fem" | null,
@@ -22,13 +23,13 @@ vi.mock("@/kernel/resources/useSessionStatus", () => ({
     selector({
       data: testState.discretization === null ? null : {
         capabilities: {
-          explicit_topology: false,
+          explicit_topology: testState.publishedFemMesh,
           ...(testState.authoringMethod
             ? { active_lane: { authored: { discretization: testState.authoringMethod }, requested: { discretization: testState.authoringMethod }, resolved: testState.resolvedDiscretization ? { discretization: testState.resolvedDiscretization } : null } }
             : {}),
         },
         domain: { discretization: testState.discretization },
-        resources: { mesh_build_revision: 0, mesh_revision: 0 },
+        resources: { mesh_build_revision: 0, mesh_revision: testState.publishedFemMesh ? 2 : 0 },
       },
     }),
 }));
@@ -155,6 +156,7 @@ const staleAirboxSelection = {
 describe("AirboxInspectorLanePanel", () => {
   beforeEach(() => {
     testState.calls.length = 0;
+    testState.publishedFemMesh = false;
     parameterPanelLanes.values.length = 0;
     testState.discretization = "fdm";
     testState.authoringMethod = null;
@@ -230,6 +232,31 @@ describe("AirboxInspectorLanePanel", () => {
     expect(html).toContain("The accepted model method has not been published.");
     expect(html).not.toContain("runtime lane conflict");
   });
+
+  it("shows published FEM mesh facts before solver-lane resolution", () => {
+    testState.discretization = "fem";
+    testState.authoringMethod = "fem";
+    testState.publishedFemMesh = true;
+    const html = renderToStaticMarkup(<AirboxMeshStatisticsLanePanel selection={selection} />);
+    expect(html).toContain("FEM Airbox child");
+    expect(html).toContain("FEM mesh · execution unresolved");
+    expect(html).toContain("mesh published");
+  });
+
+  it.each(["airbox.multilayer.target", "mesh.grid.universe-outside-support"])(
+    "rejects stale FDM selection %s against a prepared FEM mesh",
+    (kind) => {
+      testState.discretization = "fem";
+      testState.authoringMethod = "fem";
+      testState.publishedFemMesh = true;
+      const html = renderToStaticMarkup(<AirboxOverviewLanePanel selection={{
+        ...explicitFdmSelection, kind,
+      }} />);
+      expect(html).toContain("Airbox selection does not match the runtime lane");
+      expect(html).not.toContain("FEM Airbox child");
+      expect(html).not.toContain("mesh published");
+    },
+  );
 
   it("keeps accepted requested FEM policy authoring available before runtime resolution", () => {
     testState.discretization = "fdm";

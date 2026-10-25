@@ -17,7 +17,7 @@ import {
   type QuantityCatalogResource,
 } from "@/kernel/api/apiTypes";
 import { isFlowMajorTensorDescriptor, normalizeTensorProjection } from "@/kernel/api/tensorFieldProjection";
-import { quantityUnitForColorbar, quantityCatalogEntrySpatialProjections } from "@/kernel/api/quantityIds";
+import { resolveCanonicalQuantityId, quantityUnitForColorbar, quantityCatalogEntrySpatialProjections } from "@/kernel/api/quantityIds";
 import { primitiveMonoColorForRole } from "@/kernel/visualization/primitiveSurfaceColor";
 import { Button } from "@/shared/ui/Button";
 import {
@@ -687,7 +687,16 @@ export function VisualizationQuantitySection({
   targetFieldAvailability?: ReadonlyMap<string, TargetFieldAvailability>;
   targetKind?: VisualizationTargetKind;
 }) {
-  const selectedQuantity = quantityCatalog?.quantities.find((entry) => entry.id === settings.activeQuantityId);
+  const quantityItems = visualizationQuantityItems(
+    settings.activeQuantityId, targetKind, fieldCatalog, quantityCatalog, targetFieldAvailability,
+  );
+  const selectedValue = quantityItems.find((item) =>
+    resolveCanonicalQuantityId(item.value) === resolveCanonicalQuantityId(settings.activeQuantityId),
+  )?.value ?? "";
+  const noQuantities = quantityItems.length === 0;
+  const selectedQuantity = selectedValue ? quantityCatalog?.quantities.find((entry) =>
+    resolveCanonicalQuantityId(entry.id) === resolveCanonicalQuantityId(selectedValue),
+  ) : undefined;
   const descriptor = selectedQuantity?.tensor;
   const tensorOptions = quantityCatalogEntrySpatialProjections(selectedQuantity);
   return (
@@ -696,12 +705,13 @@ export function VisualizationQuantitySection({
       disabled={
         isFieldPending("activeQuantityId") ||
         !settings.visible ||
-        fieldCatalogLoading
+        fieldCatalogLoading ||
+        noQuantities
       }
       inline
       label="Quantity Source"
       type="select"
-      value={settings.activeQuantityId}
+      value={selectedValue}
       onChange={(event) => {
         const patchValue = quantitySourcePatch(settings, event.target.value);
         const nextQuantity = quantityCatalog?.quantities.find((entry) => entry.id === event.target.value);
@@ -720,21 +730,19 @@ export function VisualizationQuantitySection({
         void patch(patchValue);
       }}
     >
-      {!settings.activeQuantityId ? <option disabled value="">
-        {fieldCatalogLoading ? "Loading quantities…" : "Select an available quantity"}
+      {!selectedValue ? <option disabled value="">
+        {fieldCatalogLoading ? "Loading quantities…" : noQuantities
+          ? "No compatible field available" : "Select an available quantity"}
       </option> : null}
-      {visualizationQuantityItems(
-        settings.activeQuantityId,
-        targetKind,
-        fieldCatalog,
-        quantityCatalog,
-        targetFieldAvailability,
-      ).map((quantity) => (
+      {quantityItems.map((quantity) => (
         <option disabled={quantity.disabled} key={quantity.value} value={quantity.value}>
           {quantity.label}
         </option>
       ))}
     </FormField>
+    {noQuantities && !fieldCatalogLoading ? <p role="status" className="fm-quantity-source-empty">
+      No compatible field has been published for this target. Compute the study or select a retained result.
+    </p> : null}
     {isFlowMajorTensorDescriptor(descriptor) ? (
       <>
       <FormField
