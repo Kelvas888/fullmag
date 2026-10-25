@@ -242,3 +242,43 @@ Nie kompilowano testów Rust, nie promowano pakietu i nie wykonano nowego Solve.
 Następny krok: integracja konsumenta v3 z kontrolowanym zatrzymaniem
 diagnostycznego API, świeżym dowodem teardown i ponowną natywną kontrolą
 całej terminalnej historii. Backend i Universe nadal nie są przywrócone.
+
+## Konsumenci v3 i odczytowy preview stopu Unknown
+
+Istniejący `scripts/docker_volume_container_recovery.py` rozpoznaje jawny
+request v3, waliduje pełne piny terminalne i przekazuje je do istniejącego
+producenta requestu oraz odczytowego snapshotu store/ledgera. Snapshot sprawdza
+dokładny inventory i bajty intent/catalog; nie zastępuje natywnej walidacji
+`terminal_evidence_sha256` pod blokadami. V1/V2 nie przyjmują pinów v3,
+V3 nie miesza pinów cancelled-only, a absence attestation pozostaje V2-only.
+
+Kod image-owned `docker/all-in-one/runtime_service.py` rozpoznaje ten sam
+outcome `retained_terminal_runs_recovered` i zachowuje wymaganie rzeczywistego
+teardown. Jest to zmiana źródeł obrazu, jeszcze niewdrożona do obecnego
+kontenera; wymaga zarządzanego buildu i weryfikacji przed użyciem recovery.
+
+Stop-probe w `scripts/docker_volume_stop_diagnostic.py` ponownie używa
+istniejącej walidacji dokładnej tożsamości Unknown vs zachowany Ready pin.
+To wyłącznie kontrola tożsamości: oddzielnie nadal wymagane są zgodny fence
+API i incarnation, zdegradowana odpowiedź HTTP, pełny census /proc oraz
+nieobecność ownera, schedulerów i workerów. Stop nie publikuje Failed ani
+Drained i nie zwalnia rezerwacji; legacy pole `failed_owner` zawiera
+niezmieniony dokument z rzeczywistym `state=unknown`.
+
+Odczytowy rzeczywisty preview PASS: API PID 3274, health degraded, owner
+3282 oraz dzieci 3285/3286 nieobecne. Nie wysłano sygnału stop. Dowód:
+`verification/terminal-history-recovery-v3-20261025/unknown-diagnostic-stop-preview.json`
+w wolumenie kontrolnym grupy. SHA256 serializowanego probe:
+`4392d452080f0613b1eebc300e94bc77ead46066d531e3dc7e05a97a388d73ce`.
+
+104 testy interpretowane PASS: diagnostyczny stop, dotychczasowy stop failed,
+recovery-build i host/runtime recovery. Wykryto i naprawiono nieaktualny
+fixture starego stopu: brak inicjalizacji `_active_operation` i przypięcia
+helpera, wymaganych przez bieżący BuildControl. Nie zmieniono oczekiwanej
+semantyki zatrzymania ani zachowania nieznanego wyniku.
+
+Nie skompilowano testów Rust, nie przebudowano obrazu, nie wykonano stopu,
+promocji, recovery ani Solve. Pozostała integracja istniejącego operator
+authorization/prior-stop journal z diagnostycznym stopem i pełnymi pinami v3,
+a następnie pełny preview przed zatrzymaniem naszego backendu. Sama obsługa
+wersji w klientach nie dowodzi gotowej procedury odtworzenia instancji.

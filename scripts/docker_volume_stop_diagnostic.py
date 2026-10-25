@@ -194,7 +194,13 @@ def _validate_resume_terminal(
 
 
 def _probe_script() -> str:
-    return r'''import base64, hashlib, json, os, pathlib, re, stat, sys, urllib.request
+    import inspect
+    from docker_dev_recovery_build import require, validate_diagnostic_build
+
+    # The shared check authenticates Unknown identity only. The probe below
+    # independently requires the exact fenced API and absence of every worker.
+    prefix = inspect.getsource(require) + "\n" + inspect.getsource(validate_diagnostic_build) + "\n"
+    return prefix + r'''import base64, hashlib, json, os, pathlib, re, stat, sys, urllib.request
 
 MAX=1024*1024
 PROCESS='/opt/fullmag/runtime-control/runtime-service/process-tree.json'
@@ -258,9 +264,12 @@ if (config.get('schema_version')!='runtime_service_config.v2'
 sys.path.insert(0,'/opt/fullmag')
 import runtime_service
 paths=runtime_service.canonical_paths()
-runtime_service._validate_terminal_owner(
-    owner,state='failed',name='retained failed runtime owner',
-    allowed_child_statuses=('exited_success','exited_failure'))
+if owner.get('state')=='unknown':
+    validate_diagnostic_build(process,owner)
+else:
+    runtime_service._validate_terminal_owner(
+        owner,state='failed',name='retained failed runtime owner',
+        allowed_child_statuses=('exited_success','exited_failure'))
 ready_owner=process['service_owner']
 runtime_service._validate_terminal_owner(ready_owner,state='ready',name='retained ready owner pin')
 if (runtime_service._owner_identity(ready_owner)!=runtime_service._owner_identity(owner)
@@ -422,9 +431,19 @@ def _probe_evidence(control: BuildControl, previous_root: str, probe: Mapping[st
             or config.get("target_id") != "docker-all"
             or config.get("store_root") != "/state/runs/docker-all/session-store"):
         _fail("Runtime configuration is not bound to the selected accepted store")
-    failed_owner = _validate_native_failed_owner(
-        owner, allowed_child_statuses=frozenset({"exited_success", "exited_failure"})
-    )
+    if owner.get("state") == "unknown":
+        from docker_dev_recovery_build import validate_diagnostic_build
+        try:
+            validate_diagnostic_build(process, owner)
+        except ValueError as error:
+            _fail("Unknown diagnostic owner identity differs: " + str(error))
+        # Preserve Unknown exactly; this is permission to stop the fenced API,
+        # never evidence of a native exit, release, Failed, or Drained state.
+        failed_owner = dict(owner)
+    else:
+        failed_owner = _validate_native_failed_owner(
+            owner, allowed_child_statuses=frozenset({"exited_success", "exited_failure"})
+        )
     if (process.get("schema") != "fullmag.docker-process-tree.v1"
             or process.get("state") != "failed_outcome_retained"
             or process.get("api_diagnostic_only") is not True

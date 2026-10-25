@@ -511,7 +511,8 @@ class SupervisionStopOperationTests(unittest.TestCase):
         proof={'schema':stop.SUPERVISION_FAILURE_SCHEMA,'process_receipt_sha256':'d'*64,'ready_pin_sha256':'e'*64,'failed_owner_sha256':'f'*64,'config_sha256':'c'*64,'windows_certificate_sha256':'a'*64,'accepted_store_id':'sha256:'+'2'*64,'api_pid':3227,'runtime_pid':3241,'terminal_children':[{'role':'compute','pid':3250,'status':'exited_success'},{'role':'preparation','pid':3251,'status':'exited_failure'}],'processes_absent':True,'runs_empty':True,'transients_empty':True,'affected_reservations_empty':True}
         services={name:{'Id':identifier,'Image':image,'State':{'StartedAt':'fixed-'+name,'Running':True,'Pid':100,'ExitCode':0}} for name,identifier in ids.items()}
         writes=[];stops=[];logger=Mock();logger.stdin=io.BytesIO();logger.wait.return_value=0
-        control=types.SimpleNamespace(project='fixture',volume='fixture-control',namespace=None)
+        control=types.SimpleNamespace(project='fixture',volume='fixture-control',namespace=None,
+                                      _active_operation=None,_pin_operation_helper=Mock(return_value='c'*64))
         control.path=lambda x:'/control/'+x;control.helper_args=lambda *a,**kw:['mock-helper'];control.space=lambda:{'available_bytes':100*1024**3};control._line=Mock(side_effect=['READY','LOGGED'])
         def read(path,optional=False):
             if path=='development/current.json' or path.endswith('/terminal.json'):return previous

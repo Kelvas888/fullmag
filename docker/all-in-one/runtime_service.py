@@ -3784,28 +3784,40 @@ def _container_recovery_owner_digest(paths: RuntimePaths) -> tuple[dict[str, Any
 
 
 def _container_recovery_expected_outcome(request: Mapping[str, Any]) -> str:
-    if request.get("schema_version") == CONTAINER_RECOVERY_REQUEST_SCHEMA:
-        if request.get("retained_cancelled_runs") is not None:
-            _fail("v1 container recovery cannot retain cancelled runs")
+    schema = request.get("schema_version")
+    cancelled = request.get("retained_cancelled_runs")
+    terminal = request.get("retained_terminal_runs")
+    if schema == CONTAINER_RECOVERY_REQUEST_SCHEMA:
+        if cancelled is not None or terminal is not None:
+            _fail("v1 container recovery cannot retain runs")
         return "empty_namespace_recovered"
-    if request.get("schema_version") != "runtime_service_container_recovery_request.v2":
+    if schema == "runtime_service_container_recovery_request.v2":
+        if terminal is not None:
+            _fail("v2 container recovery cannot consume terminal run evidence")
+        pins = cancelled
+        fields = {"run_id", "run_intent_sha256", "run_catalog_sha256"}
+        outcome = "retained_cancelled_runs_recovered"
+    elif schema == "runtime_service_container_recovery_request.v3":
+        if cancelled is not None:
+            _fail("v3 container recovery cannot mix cancelled-only and terminal run pins")
+        pins = terminal
+        fields = {"run_id", "run_intent_sha256", "run_catalog_sha256", "terminal_evidence_sha256"}
+        outcome = "retained_terminal_runs_recovered"
+    else:
         _fail("container recovery request schema is unsupported")
-    pins = request.get("retained_cancelled_runs")
     if not isinstance(pins, list) or not 1 <= len(pins) <= 128:
-        _fail("v2 container recovery requires 1..128 retained run pins")
+        _fail("retained container recovery requires 1..128 run pins")
     seen = set()
     for pin in pins:
-        if not isinstance(pin, dict) or set(pin) != {
-            "run_id", "run_intent_sha256", "run_catalog_sha256"
-        }:
-            _fail("invalid retained cancelled run pin")
+        if not isinstance(pin, dict) or set(pin) != fields:
+            _fail("invalid retained run pin")
         run_id = _recovery_store_id(pin.get("run_id"), "retained run id")
         if run_id in seen:
-            _fail("duplicate retained cancelled run pin")
+            _fail("duplicate retained run pin")
         seen.add(run_id)
-        _container_recovery_hex(pin.get("run_intent_sha256"), "retained run intent digest")
-        _container_recovery_hex(pin.get("run_catalog_sha256"), "retained run catalog digest")
-    return "retained_cancelled_runs_recovered"
+        for key in fields - {"run_id"}:
+            _container_recovery_hex(pin.get(key), "retained run " + key)
+    return outcome
 
 
 def _container_recovery_request_sources(

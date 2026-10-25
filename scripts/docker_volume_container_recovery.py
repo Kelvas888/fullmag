@@ -44,6 +44,7 @@ OPERATOR_AUTHORIZATION_SCHEMA = (
 AUTHORIZATION_SCHEMA = "fullmag.docker-container-recovery-authorization.v1"
 REQUEST_SCHEMA = "runtime_service_container_recovery_request.v1"
 RETAINED_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v2"
+TERMINAL_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v3"
 ATTESTATION_SCHEMA = "docker_namespace_teardown_attestation.v1"
 ABSENCE_ATTESTATION_SCHEMA = "docker_namespace_absence_attestation.v1"
 AUTHORIZATION_ENV = "FULLMAG_CONTAINER_RECOVERY_AUTHORIZATION"
@@ -331,31 +332,43 @@ def _validate_container_pins(pins: Sequence[object]) -> list[dict[str, object]]:
 
 
 def expected_recovery_outcome(request: Mapping[str, object]) -> str:
-    """Bind receipt semantics to the explicit request version, never its outcome alone."""
-    if request.get("schema_version") == REQUEST_SCHEMA:
-        if request.get("retained_cancelled_runs") is not None:
-            _fail("v1 recovery cannot retain cancelled runs")
+    """Bind receipt semantics to the explicit version and complete pinned history."""
+    schema = request.get("schema_version")
+    cancelled = request.get("retained_cancelled_runs")
+    terminal = request.get("retained_terminal_runs")
+    if schema == REQUEST_SCHEMA:
+        if cancelled is not None or terminal is not None:
+            _fail("v1 recovery cannot retain runs")
         return "empty_namespace_recovered"
-    if request.get("schema_version") != RETAINED_REQUEST_SCHEMA:
+    if schema == RETAINED_REQUEST_SCHEMA:
+        if terminal is not None:
+            _fail("v2 recovery cannot consume terminal run evidence")
+        pins = cancelled
+        fields = {"run_id", "run_intent_sha256", "run_catalog_sha256"}
+        outcome = "retained_cancelled_runs_recovered"
+    elif schema == TERMINAL_REQUEST_SCHEMA:
+        if cancelled is not None:
+            _fail("v3 recovery cannot mix cancelled-only and terminal run pins")
+        pins = terminal
+        fields = {"run_id", "run_intent_sha256", "run_catalog_sha256", "terminal_evidence_sha256"}
+        outcome = "retained_terminal_runs_recovered"
+    else:
         _fail("unsupported runtime service container recovery request schema")
-    pins = request.get("retained_cancelled_runs")
     if not isinstance(pins, list) or not 1 <= len(pins) <= 128:
-        _fail("v2 recovery requires 1..128 retained cancelled run pins")
+        _fail("retained recovery requires 1..128 run pins")
     seen = set()
     for pin in pins:
-        if not isinstance(pin, Mapping) or set(pin) != {
-            "run_id", "run_intent_sha256", "run_catalog_sha256"
-        }:
-            _fail("invalid retained cancelled run pin")
+        if not isinstance(pin, Mapping) or set(pin) != fields:
+            _fail("invalid retained run pin")
         run_id = _require_text(pin.get("run_id"), "retained run id", 128)
         if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", run_id) or run_id.endswith("."):
             _fail("unsafe retained run id")
         if run_id in seen:
-            _fail("duplicate retained cancelled run pin")
+            _fail("duplicate retained run pin")
         seen.add(run_id)
-        _require_sha(pin.get("run_intent_sha256"), "retained run intent digest")
-        _require_sha(pin.get("run_catalog_sha256"), "retained run catalog digest")
-    return "retained_cancelled_runs_recovered"
+        for key in fields - {"run_id"}:
+            _require_sha(pin.get(key), "retained run " + key)
+    return outcome
 
 
 def validate_request(value: Mapping[str, object]) -> dict[str, object]:
@@ -734,14 +747,18 @@ def _build_request(
     manifest_sha256: str,
     containers: Sequence[Mapping[str, object]],
     retained_cancelled_runs: Sequence[Mapping[str, object]] | None = None,
+    retained_terminal_runs: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
+    if retained_cancelled_runs is not None and retained_terminal_runs is not None:
+        _fail("recovery cannot mix cancelled-only and terminal run pins")
     device = _require_mapping(device_release, "device release")
     _require_text(device.get("resource_id"), "device release resource_id", 255)
     _require_sha(device.get("mapping_sha256"), "device release mapping_sha256")
     if device.get("mapping_detached") is not True:
         _fail("device release mapping is not detached")
     request = {
-        "schema_version": RETAINED_REQUEST_SCHEMA if retained_cancelled_runs is not None else REQUEST_SCHEMA,
+        "schema_version": (TERMINAL_REQUEST_SCHEMA if retained_terminal_runs is not None
+                           else RETAINED_REQUEST_SCHEMA if retained_cancelled_runs is not None else REQUEST_SCHEMA),
         "request_id": authorization["request_id"],
         "config_sha256": config_sha256,
         "owner_sha256": owner_sha256,
@@ -763,6 +780,8 @@ def _build_request(
             if retained_cancelled_runs is not None
             else {}
         ),
+        **({"retained_terminal_runs": [dict(item) for item in retained_terminal_runs]}
+           if retained_terminal_runs is not None else {}),
     }
     return validate_request(request)
 
@@ -880,15 +899,20 @@ def _ledger_and_store_snapshot(
     *,
     compose=None,
     retained_cancelled_runs: Sequence[Mapping[str, object]] | None = None,
+    retained_terminal_runs: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Read the exact accepted store and shared ledger through an isolated helper."""
 
+    if retained_cancelled_runs is not None and retained_terminal_runs is not None:
+        _fail("storage proof cannot mix cancelled-only and terminal run pins")
     retained_pins = None
-    if retained_cancelled_runs is not None:
-        retained_pins = [dict(pin) for pin in retained_cancelled_runs]
+    terminal = retained_terminal_runs is not None
+    supplied = retained_terminal_runs if terminal else retained_cancelled_runs
+    if supplied is not None:
+        retained_pins = [dict(pin) for pin in supplied]
         expected_recovery_outcome({
-            "schema_version": RETAINED_REQUEST_SCHEMA,
-            "retained_cancelled_runs": retained_pins,
+            "schema_version": TERMINAL_REQUEST_SCHEMA if terminal else RETAINED_REQUEST_SCHEMA,
+            "retained_terminal_runs" if terminal else "retained_cancelled_runs": retained_pins,
         })
     state_source = _bind_source(backend, "/state")
     ledger_mount, ledger_descriptor = _ledger_snapshot_mount(control, backend, compose)
@@ -943,7 +967,11 @@ for current, directories, files in os.walk(store, topdown=True, followlinks=Fals
         if name in {'run_intent.json','run_catalog.json'}:
             relative=path.relative_to(store).as_posix()
             records[relative]=hashlib.sha256(regular(path,'retained run record')).hexdigest()
-pins=observation.get('retained_cancelled_runs')
+pins=observation.get('retained_terminal_runs')
+terminal=pins is not None
+if not terminal: pins=observation.get('retained_cancelled_runs')
+pin_fields={'run_id','run_intent_sha256','run_catalog_sha256'}
+if terminal: pin_fields.add('terminal_evidence_sha256')
 if pins is None:
     if records: raise RuntimeError('accepted store contains admitted run records')
     run_records=[]
@@ -951,7 +979,7 @@ else:
     if not isinstance(pins,list) or not 1<=len(pins)<=128: raise RuntimeError('retained run pins are invalid or unbounded')
     expected={}
     for pin in pins:
-        if not isinstance(pin,dict) or set(pin)!={'run_id','run_intent_sha256','run_catalog_sha256'}: raise RuntimeError('retained run pin has an invalid shape')
+        if not isinstance(pin,dict) or set(pin)!=pin_fields: raise RuntimeError('retained run pin has an invalid shape')
         run_id=pin.get('run_id')
         if not isinstance(run_id,str) or not run_id or '/' in run_id or '..' in run_id: raise RuntimeError('retained run id is invalid')
         for key in ('run_intent_sha256','run_catalog_sha256'):
@@ -1006,7 +1034,8 @@ print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_
     ]
     args.append(canonical({
         "ledger_descriptor": ledger_descriptor,
-        "retained_cancelled_runs": retained_pins,
+        "retained_cancelled_runs": retained_pins if not terminal else None,
+        "retained_terminal_runs": retained_pins if terminal else None,
     }).decode("utf-8"))
     result = bounded_capture(args, data=b"", timeout=90)
     if result.returncode:
