@@ -392,3 +392,98 @@ Gmsh ani nie ponawiano żądania po timeout. Na checkpointcie brak accepted H
 i brak artefaktów tego attemptu. Oczekiwanie dotyczy tego konkretnego
 żywego procesu; nie uruchamiać kolejnego retry bez rozpoznania jego wyniku.
 Pełne Universe i wizualizacja w UI pozostają niezrealizowane.
+
+
+## Zaakceptowany benchmark i przygotowanie źródła — 25.10.2026
+
+Poprzedni attempt-37daccd7aa964bc88f6143ad9613ba06 zakończył się Succeeded.
+Bundle CAS 145824512f55385f015038172929619e6115f27a3ccf3db80e0ce944c810f9ee:
+22 payloady sprawdzone; V/J/H skończone, niezerowe i spójne; 14 punktów H,
+1865 Tet4. Osiem kontroli publicznego HTTP PASS (jednostki, SHA, ETag 304,
+odmowa starego attemptu 409). Raporty w control volume:
+verification/surface-rt0-performance-20261025/after-recovery-accepted-vjh-analysis.json
+oraz after-recovery-accepted-http.json. Native czas 487.287556356 s.
+Universe/UI i kwalifikacja LLG nadal NIEUKOŃCZONE, wynik inspection_only.
+
+Rzeczywisty build FEM to CMake Release, CXX -O3 -DNDEBUG. Załadowana
+biblioteka oraz artefakt cache FEM mają ten sam SHA256
+f31e500602891ceaff5d0fad61d8aea0601de1361e0fd72e4d8d80ba900814ef.
+Nieoptymalizowany cache pod FDM nie jest biblioteką używaną przez runtime.
+
+Optymalizacja surface_rt0.cpp przygotowuje dokładne wejścia, wyznacznik,
+outward winding, normalne i krawędzie raz na wywołanie. Kolejność sum,
+trzy precyzje i tolerancje pozostają. Walidator noty 0950 PASS; 41 testów
+interpretowanych kontraktu PASS. Managed build cf10673f01d04be788d8632db2346048
+PASS, API wróciło. Snapshot:
+b449e3aac9d713268355bf964d3734cd27620f609eb893912ebdc2fb0efbbe54.
+Zgodność wyniku i przyspieszenie po poprawce pozostają NOT VERIFIED.
+
+Nowe zlecenia zachowują te same definition/study/catalog CAS i 1973 assety.
+Run run-surface-prepared-source-20261025-01 ma historyczną manualną bramkę
+UI, nie jest zmaterializowany i nie wykonał Solve. Publiczne Submit oraz
+materialization run-surface-prepared-source-20261025-02 przeszły. Attempt
+attempt-56642ebad7874adfa9c9367a8945e319 zakończył się Failed PRZED solverem:
+worker odrzuca jawne automatic, dopuszczone przez wspólny start gate.
+Zachowano terminalny receipt i historię, nie ponowiono próby bez poprawki.
+
+Poprawka współdzieli ścisły decoder start gate między schedulerem i workerem.
+Wersja, zamknięte manual/automatic i kontrola trwałego grantu manual pozostają.
+Przygotowano regresję Rust obu trybów i odmów; nie kompilowano testów.
+Dalsze kroki: managed build, publiczne retry dokładnie próby 02, ścisłe
+porównanie 21 payloadów oraz pełnych diagnostyk trzech precyzji i pomiar czasu.
+Skrypt porównania: control volume, ten sam katalog verification,
+compare-prepared-source-results.py. Bez zmiany limitów, precyzji lub jakości.
+
+Retencja: wszystkie bieżące pakiety, cache i dowody są potrzebne do
+porównania lub rollbacku; nie wykazano zbędnego zasobu do usunięcia.
+Nie wykonano prune. Skill fullmag-build-stage-cleanup nie występuje w tym
+worktree; zastosowano regułę zachowania danych z build-storage governance.
+
+
+### Wykonanie po poprawce Start oraz porównanie — 25.10.2026
+
+Managed restart z development attempt 2c5c5be072564f54a656df0073f42b25
+zakończył iterację d3b549111d8c4fd29cb99a0f75184f72 kodem 0. Snapshot pakietu:
+90ed459db0e923935db35350f334b05bb6fdf72d0775a48a1e6bfabd6f8ce052.
+Błędne wcześniejsze użycie identyfikatora iteracji cf106... jako development
+attempt odmówiło odczytu przed zmianą usług; właściwy development pin
+zachowano. Nie ponawiano buildu po timeout obserwacji.
+
+Publiczne retry z catalog_revision 11 przyjęto 202: run
+run-surface-prepared-source-20261025-02, task
+task-6376539a6a15f6adad185839fded07d6df010f9fccd615f7e691721072b2f5a8,
+attempt-33df698e66944c87b9409baf0200c887, epoch 2. Potwierdzono żywy PID 3453,
+start_ticks 14639461 i rosnący czas CPU; następnie Completed i Succeeded.
+Nowy pakiet CAS cb8231675d3151513c17047dad6b0c6cf857e473bf1805d8c4ce0a70f7a00fc4.
+Poprawkę wspólnego parsera Start zapisano osobno:
+f5c9400ea1cc4a0456e4248a0cf8c04e61761f43.
+
+Ścisłe porównanie PASS: wszystkie 21 payloadów poza raportem powierzchniowym
+są identyczne bajtowo, w tym V/J/H raw i per-A; pełne dane diagnostyczne
+trzech precyzji, limity i tolerancje także identyczne. Operacje wymierne
+31 062 533 → 20 491 713, całkowite 585 607 487 → 395 876 894.
+Czas operatora 487.287556356 → 418.612782124 s: spadek o 14.0933%, speedup
+1.16405. Peak RSS 538046464 → 548306944 B. Nie obniżono precyzji ani jakości.
+Jeden pomiar nie stanowi statystycznej kwalifikacji wydajności.
+Raport prepared-source-result-comparison.json SHA256:
+8e9bd221bf36d4c5fa083cb20e71f564b641136be654560fc1c2a706270fc6c6.
+CPP w worktree jest identyczne z cieniem użytym do kompilacji; SHA256:
+e548646e81c7963f9bd9cd451e9bc74ed546bc19a95735cf059e1cee69751c50.
+
+Po potwierdzonym wyjściu workera uruchomiono niezależne całkowanie objętościowe
+Biota–Savarta zachowanego cell-local J. Rzędy 4/8/12/16/24 i tolerancję
+1e-9 A/m + 1e-5 normy H przypięto PRZED wykonaniem. Wynik PASS, exit 0;
+wszystkie 14 targetów poza source cells. Maksymalna różnica dla rzędu 24:
+5.147751632094446e-11 A/m. Czas 118.00734812399605 s. Weryfikacja nie
+przeprowadza ponownie transportu i nie dowodzi inside-source, całego Universe
+ani rygorystycznego certyfikatu błędu. Raport independent-volume-quadrature.json
+SHA256 247f57869e37d7aae761c4dac9a5246d5024135fd54079865864944e2208a3d0.
+Oba raporty i skrypty są zachowane w control volume, pod
+verification/surface-rt0-performance-20261025/.
+
+Pełne Universe, wizualizacja i kwalifikacja bazy LLG nadal nieukończone.
+Przy aktualnym koszcie nie powtarzać ślepo pełnej próby 1154 targetów z limitem
+1800 s. Starszy direct Universe miał odmowę regularnej kwadratury na głębokości
+6; nie traktować próby tej samej metody jako nowej naprawy. Następny krok to
+optymalizacja arytmetyki/operatora z zachowaniem kontroli błędu, nie zwiększanie
+limitów i nie zmniejszanie domeny. Wyniki, historie i cache pozostają.

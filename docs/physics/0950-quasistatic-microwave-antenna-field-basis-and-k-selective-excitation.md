@@ -11039,6 +11039,49 @@ polityki. Przed przyszłą aktywacją adapter musi jawnie powiązać zatwierdzon
 politykę z rzeczywistymi wartościami. Zgodność tych obliczeń **nie jest
 rygorystycznym certyfikatem błędu** ani niezależną referencją objętościową RT0.
 
+#### Przygotowanie niezmiennej geometrii źródła — 25.10.2026
+
+`surface_rt0.cpp + element`, `prepare_face` i `evaluate_surface_rt0`
+przygotowują dokładne wymierne wierzchołki, współczynniki, moduł wyznacznika,
+outward winding, normalne i krawędzie raz na wywołanie, przed pętlą targetów.
+`current_at_target` zachowuje dotychczasową kolejność czterech składników
+wzoru prądu. `geometry` kopiuje stałe ściany i nadal wyznacza wszystkie
+predykaty oraz normalizację zależne od targetu dokładnie, bez zaokrąglenia.
+Nie scala ścian wspólnych ani lokalnych prądów sąsiednich komórek.
+
+Zmiana dotyczy wyłącznie realizacji FEM CPU; publiczne parametry Python,
+ProblemIR, trzy obowiązkowe precyzje, kolejność sumowania pól i tolerancje
+pozostają zgodne z powyższym kontraktem. Pozostałe trzy lanes nie uzyskują
+nowej capability. Jednorazowe operacje przygotowania są w liczniku total,
+bez przypisania do targetu; pary i passy pozostają liczone dla każdego
+celu. Pojemność wektora jest sprawdzana przed rezerwacją, a limit czasu
+całkowitego i sampled RSS obejmuje również przygotowanie. Nie jest to
+ścisły limit alokatora ani pełne rozliczenie pamięci Boost.
+
+Bramka regresji wymaga porównania raw H, wszystkich wyników trzech precyzji
+i diagnostyk numerycznych dla zamrożonego źródła oraz targetów; liczniki
+pracy i czas powinny odzwierciedlać rzeczywiście mniejszą pracę. Managed build `d3b549111d8c4fd29cb99a0f75184f72` i publiczny
+Submit → materialization → retry → Succeeded potwierdziły wykonanie dla
+zamrożonych 1865 Tet4 i 14 targetów. Wszystkie 21 pozostałych payloadów,
+w tym raw/per-A V/J/H i certyfikat źródła, są identyczne bajtowo z baseline.
+Pełne diagnostyki trzech precyzji, tolerancje, limity i liczniki passów
+pozostają identyczne; zmieniły się tylko raporty rzeczywiście wykonanej pracy.
+Czas operatora spadł z 487,287556356 s do 418,612782124 s (14,09%).
+Jest to jeden pomiar porównawczy, nie statystyczna kwalifikacja wydajności.
+
+Niezależne całkowanie objętościowe zachowanego afinicznego prądu wykonano
+przez kwadraturę o rzędach 4, 8, 12, 16 i 24. Wszystkie 14 targetów leżą
+poza komórkami źródła. Przy rzędzie 24 maksymalna norma różnicy wektorów H wyniosła
+$5.147751632094446\times10^{-11}\,\mathrm{A/m}$, w zachowanej bramce
+$10^{-9}\,\mathrm{A/m}+10^{-5}\lVert\mathbf H\rVert_2$.
+Nie jest to rygorystyczny certyfikat błędu, kwalifikacja transportu ani dowód
+dla near/inside-source lub całego Universe. Dowody są w wolumenie kontrolnym
+tej grupy, `verification/surface-rt0-performance-20261025/`:
+`prepared-source-result-comparison.json` i `independent-volume-quadrature.json`.
+Ich przypięte SHA256 i tożsamość runtime zapisano w checkpointcie
+`docs/superpowers/plans/2026-10-25-terminal-history-recovery-v3.md`.
+Pełne Universe i UI pozostają nieukończone; wynik pozostaje inspection_only.
+
 #### Pełne parametry prywatnego wywołania
 
 Poniższe typy C++ nie są nowym publicznym Python API. Wszystkie argumenty są

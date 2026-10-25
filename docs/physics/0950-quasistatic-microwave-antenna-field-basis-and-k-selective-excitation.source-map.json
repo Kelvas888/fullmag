@@ -8519,6 +8519,20 @@
       "symbol": "canonical_moments_bind_rounded_tangential_current",
       "responsibility": "Golden exact Fraction, zmiana stable IDs i niezależna zmiana J/momentów; przygotowany test Rust, nie skompilowano ani nie wykonano.",
       "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-surface-prepared-face",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "prepare_face",
+      "responsibility": "Jednorazowe dokładne normalne, krawędzie i normalne krawędzi; bez scalenia ścian właścicieli.",
+      "evidence_status": "runtime_parity_only"
+    },
+    {
+      "id": "antenna-surface-prepared-current",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "current_at_target",
+      "responsibility": "Dotychczasowa kolejność sumy czterech współczynników RT0, oddzielona od niezmiennego źródła.",
+      "evidence_status": "runtime_parity_only"
     }
   ],
   "public_api": {

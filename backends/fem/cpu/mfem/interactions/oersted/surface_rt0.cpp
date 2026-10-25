@@ -385,22 +385,42 @@ struct FaceGeometry {
     bool h_zero;
 };
 
-FaceGeometry geometry(const std::array<ExactPoint, 3> &vertices,
+struct PreparedFace {
+    std::array<ExactPoint, 3> vertices, edges, edge_normals;
+    ExactPoint normal;
+    Exact normal_squared;
+};
+
+PreparedFace prepare_face(const std::array<ExactPoint, 3> &vertices, ExactArithmetic &e)
+{
+    PreparedFace face;
+    face.vertices = vertices;
+    face.normal = e.cross(e.subtract(vertices[1],vertices[0]),e.subtract(vertices[2],vertices[0]));
+    face.normal_squared = e.dot(face.normal,face.normal);
+    require(e.sign(face.normal_squared) > 0, "surface RT0 original face area is zero");
+    for (int i = 0; i < 3; ++i) {
+        face.edges[i] = e.subtract(vertices[(i+1)%3],vertices[i]);
+        require(e.sign(e.dot(face.edges[i],face.edges[i])) > 0, "surface RT0 original edge is zero");
+        face.edge_normals[i] = e.cross(face.edges[i],face.normal);
+    }
+    return face;
+}
+
+FaceGeometry geometry(const PreparedFace &face,
     const ExactPoint &target, ExactArithmetic &e)
 {
     FaceGeometry g;
-    g.normal = e.cross(e.subtract(vertices[1],vertices[0]),e.subtract(vertices[2],vertices[0]));
-    g.normal_squared = e.dot(g.normal,g.normal);
-    require(e.sign(g.normal_squared) > 0, "surface RT0 original face area is zero");
+    const auto &vertices = face.vertices;
+    g.normal = face.normal;
+    g.normal_squared = face.normal_squared;
     g.hnum = e.dot(g.normal,e.subtract(target,vertices[0])); g.h_zero = e.sign(g.hnum) == 0;
     for (int k = 0; k < 3; ++k) g.qvector[k] = e.div(e.mul(g.normal[k],g.hnum),g.normal_squared);
     Exact maximum = 0;
     for (int i = 0; i < 3; ++i) {
         g.vectors[i] = e.subtract(target,vertices[i]);
-        g.edges[i] = e.subtract(vertices[(i+1)%3],vertices[i]);
-        require(e.sign(e.dot(g.edges[i],g.edges[i])) > 0, "surface RT0 original edge is zero");
+        g.edges[i] = face.edges[i];
         g.radius_zero[i] = e.sign(e.dot(g.vectors[i],g.vectors[i])) == 0;
-        g.dnums[i] = e.dot(e.subtract(vertices[i],target),e.cross(g.edges[i],g.normal));
+        g.dnums[i] = e.dot(e.subtract(vertices[i],target),face.edge_normals[i]);
         g.d_zero[i] = e.sign(g.dnums[i]) == 0;
         for (const auto &value : g.vectors[i]) {
             const auto magnitude = e.absolute(value);
@@ -557,11 +577,13 @@ template<class R> struct FieldSum {
 
 struct ExactElement {
     std::array<ExactPoint,4> vertices;
-    ExactPoint current;
+    std::array<Exact,4> coefficients;
+    Exact determinant;
     int orientation;
+    std::array<PreparedFace,4> faces;
 };
 ExactElement element(const transport::AffineRt0Element::FrozenInput &input,
-    const ExactPoint &target, ExactArithmetic &e)
+    ExactArithmetic &e)
 {
     ExactElement result;
     for (int i = 0; i < 4; ++i) result.vertices[i] = e.point(input.vertices_m[i]);
@@ -570,15 +592,21 @@ ExactElement element(const transport::AffineRt0Element::FrozenInput &input,
     result.orientation = e.sign(determinant);
     require(result.orientation != 0, "surface RT0 source Tet4 is degenerate");
     if (result.orientation < 0) determinant = e.sub(Exact(0),determinant);
-    std::array<Exact,4> coefficients;
-    for (int i = 0; i < 4; ++i) coefficients[i] = e.input(input.signed_coefficients_a[i]);
+    result.determinant = std::move(determinant);
+    for (int i = 0; i < 4; ++i) result.coefficients[i] = e.input(input.signed_coefficients_a[i]);
+    return result;
+}
+
+ExactPoint current_at_target(const ExactElement &cell, const ExactPoint &target, ExactArithmetic &e)
+{
+    ExactPoint current;
     for (int k = 0; k < 3; ++k) {
         Exact sum = 0;
         for (int i = 0; i < 4; ++i)
-            sum = e.add(sum,e.mul(coefficients[i],e.sub(target[k],result.vertices[i][k])));
-        result.current[k] = e.div(sum,determinant);
+            sum = e.add(sum,e.mul(cell.coefficients[i],e.sub(target[k],cell.vertices[i][k])));
+        current[k] = e.div(sum,cell.determinant);
     }
-    return result;
+    return current;
 }
 
 std::array<ExactPoint,3> outward_face(const ExactElement &cell, int opposite, ExactArithmetic &e)
@@ -696,7 +724,23 @@ SurfaceRt0Result evaluate_surface_rt0(
     result.caller_source_digest = caller_source_digest;
     require(ordered_targets_m.size() <= result.targets.max_size(), "surface RT0 result vector size exceeds max_size");
     result.targets.reserve(ordered_targets_m.size());
+    // Source-only exact geometry is immutable throughout this invocation.
+    // Boost-owned limb allocations remain covered by sampled RSS guards.
+    std::vector<ExactElement> prepared;
+    require(source.size() <= prepared.max_size(), "surface RT0 prepared source size exceeds max_size");
+    require(product(source.size(),sizeof(ExactElement)) <= limits.maximum_lifetime_peak_rss_bytes,
+        "surface RT0 prepared source storage exceeds RSS budget");
     work.guard();
+    prepared.reserve(source.size());
+    ExactArithmetic source_exact(work);
+    for (const auto &input : source) {
+        work.guard();
+        auto cell = element(input,source_exact);
+        for (int opposite = 0; opposite < 4; ++opposite)
+            cell.faces[opposite] = prepare_face(outward_face(cell,opposite,source_exact),source_exact);
+        prepared.push_back(std::move(cell));
+        work.guard();
+    }
     for (std::size_t target_index = 0; target_index < ordered_targets_m.size(); ++target_index) {
         work.begin_target(target_index);
         ExactArithmetic exact(work);
@@ -710,19 +754,18 @@ SurfaceRt0Result evaluate_surface_rt0(
         Sum<Decimal120> local_precision_delta,local_formula_delta,local_medium_formula_delta,local_binary_delta,local_binary_formula_delta;
         bool binary_evaluated = true, binary_requires_high = false;
         std::string binary_refusal;
-        for (const auto &input : source) {
+        for (const auto &cell : prepared) {
             work.guard();
             work.charge(Kind::source_target_pairs);
-            const auto cell = element(input,target,exact);
+            const auto current = current_at_target(cell,target,exact);
             for (int opposite = 0; opposite < 4; ++opposite) {
                 work.guard();
-                const auto face = outward_face(cell,opposite,exact);
-                const auto g = geometry(face,target,exact);
+                const auto g = geometry(cell.faces[opposite],target,exact);
                 work.guard();
                 FacePass<double> low;
                 bool low_ok = false;
                 try {
-                    low = face_pass(g,cell.current,low_arithmetic,tolerances);
+                    low = face_pass(g,current,low_arithmetic,tolerances);
                     low_sum.add(low,low_arithmetic);
                     low_ok = true;
                 } catch (const NumericRefusal &error) {
@@ -730,8 +773,8 @@ SurfaceRt0Result evaluate_surface_rt0(
                     binary_requires_high = true;
                     remember_binary_refusal(binary_refusal,error,work);
                 }
-                const auto medium = face_pass(g,cell.current,medium_arithmetic,tolerances);
-                const auto high = face_pass(g,cell.current,high_arithmetic,tolerances);
+                const auto medium = face_pass(g,current,medium_arithmetic,tolerances);
+                const auto high = face_pass(g,current,high_arithmetic,tolerances);
                 scalar_agreement(g,medium,high,medium_arithmetic,high_arithmetic,tolerances);
                 medium_sum.add(medium,medium_arithmetic);
                 high_sum.add(high,high_arithmetic);
