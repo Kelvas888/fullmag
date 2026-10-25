@@ -507,3 +507,39 @@ przygotowania i odczytu siatek. Dwie regresje Rust pozostają niewykonane
 Bramka 1/5 jest częściowo zaliczona po stronie API; nie zamykamy jej jako
 pełnego etapu. Pełne H w Universe nadal nieobliczone. Retencja: bez usuwania,
 zachowano cache, wyniki, kopie sceny, pakiety i receipty.
+
+
+### P11/P13 — geometria i model drzewa na bieżących danych
+
+Dodatkowy audyt geometrii bieżącego katalogu `fe71c28c…` zakończył się PASS:
+- Global i źródło: poprawne indeksy, brak osieroconych węzłów i powtórzonych
+  komórek, dodatnie orientacje wszystkich Tet4, po 1–2 właścicieli ściany,
+  jedna składowa spójna przez wspólne ściany;
+- padding Universe 0,5 µm w każdym z sześciu kierunków;
+- 14 par zgodnych geometrycznie ścian przekroju źródła, każda po swojej
+  stronie rozcięcia jest ścianą brzegową; 26 węzłów o powtórzonej pozycji
+  (13 par) znajduje się wyłącznie na przekroju z = −0,3 µm;
+- cztery części signal/return/inlet/outlet pokrywają komórki dokładnie raz,
+  mają dodatnie przewodności i zgodne przypisania; brak obiektów magnetycznych.
+Dowód: `public-after-startup-metadata-fix/geometry-audit.json` w katalogu audytu.
+Dla obecnego katalogu liczba par źródło–target wynosi 1162 × 1859 = 2160158;
+historyczna liczba 2138289 z opisu etapu 3 dotyczy starszego katalogu.
+
+W stałym frontendzie wykonano produkcyjne funkcje
+`resolveCurrentFemAirboxEvidence` oraz `buildModelTree` na rzeczywistych
+zasobach scene/policy/summary/manifest pobranych przez API bieżącej sesji.
+Rewizja siatki 2; authoredPolicy=true, realizedCarrier=true. Drzewo zawiera
+po jednej gałęzi Mesh i Visualization, ścieżkę
+`model:session → model:universe → model:airbox → model:airbox:visualization`
+oraz status mesh-ready. Sesja nie zmieniła się w trakcie kontroli.
+Dowód w wolumenie frontendu:
+`/state/development/verification/antenna-universe-mesh-20261026/actual-explorer-model.json`.
+To wykonanie modelu danych, nie test przeglądarki. Wizualna bramka nadal otwarta;
+zgodnie z kolejnością planu nie uruchomiono ciężkiego Solve.
+
+Niezależny przegląd czterech plików publikacji Global/źródła nie wykazał
+blockerów. Sprawdzono przypięty CAS ProblemIR, digest i topologię, osobny
+nośnik źródła, zachowanie rewizji/runu/przygotowania oraz brak fikcyjnych
+liczności i agregowanych percentyli. Odczyty przed Solve są potwierdzone;
+po Solve i cold-load pozostają do weryfikacji. Commit poprawki finalizacji
+startup: `a5b0d38efd32a0e521a2d82a2c9df72267f8323e`.

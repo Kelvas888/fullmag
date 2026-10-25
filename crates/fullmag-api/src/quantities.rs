@@ -277,7 +277,15 @@ fn plan_is_rotated_dmi_only(plan: &ExecutionPlanIR) -> bool {
 pub(crate) fn extract_fem_mesh_from_metadata(metadata: &SharedJson) -> Option<FemMeshPayload> {
     let execution_plan = metadata.execution_plan()?;
     match &execution_plan.backend_plan {
-        BackendPlanIR::AntennaFieldOnly(plan) => Some(fullmag_runner::StageFemMeshAsset::build_from_antenna_field_only_plan(plan).payload),
+        BackendPlanIR::AntennaFieldOnly(plan) => {
+            // Global topology is owned by the pinned domain publication, not by
+            // the current-source plan. Missing domain data must stay missing.
+            if matches!(plan.field_sampling.domain, fullmag_ir::FieldTargetIR::Global {}) {
+                None
+            } else {
+                Some(fullmag_runner::StageFemMeshAsset::build_from_antenna_field_only_plan(plan).payload)
+            }
+        },
         BackendPlanIR::Fem(fem) => Some(FemMeshPayload::from(fem)),
         BackendPlanIR::FemEigen(fem) => Some(FemMeshPayload::from(fem)),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(FemMeshPayload::from(fem)),

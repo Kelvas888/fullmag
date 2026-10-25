@@ -6,6 +6,8 @@
 //! blocking SceneDocument -> ProblemIR -> PreparationReceipt work. Durable
 //! publication remains the caller's responsibility.
 
+mod antenna_domain;
+
 use anyhow::Context;
 use fullmag_application::{
     AcceptedPreparationReceipt, AcceptedRunPreparationSource, ClosedLoopPreparationReceipt,
@@ -48,6 +50,8 @@ pub(crate) struct LiveScenePreparationReadModel {
     pub plan_fingerprint: String,
     pub requested_execution: RequestedExecution,
     pub execution_plan: fullmag_ir::ExecutionPlanIR,
+    #[serde(skip)]
+    pub global_sampling_mesh: Option<fullmag_runner::FemMeshPayload>,
 }
 
 /// State identity used to keep accepted preparation work off the session
@@ -457,11 +461,24 @@ fn prepared_domain_publication(
     ) {
         metadata.remove("magnetic_state_present");
     }
+    let fem_mesh = if let fullmag_ir::BackendPlanIR::AntennaFieldOnly(plan) = &read_model.execution_plan.backend_plan {
+        if matches!(plan.field_sampling.domain, fullmag_ir::FieldTargetIR::Global {}) {
+            let mesh = read_model.global_sampling_mesh.clone().ok_or_else(|| ApiError::conflict_with_code(
+                "accepted_preparation_sampling_mesh_missing", "Global sampling requires its pinned domain mesh"))?;
+            metadata.insert("antenna_domain_publication".into(), antenna_domain::global_publication_binding(plan, &mesh));
+            Some(mesh)
+        } else {
+            metadata.remove("antenna_domain_publication");
+            prepared_fem_mesh(&read_model.execution_plan)
+        }
+    } else {
+        metadata.remove("antenna_domain_publication");
+        prepared_fem_mesh(&read_model.execution_plan)
+    };
     let metadata = Value::Object(metadata);
     // Keep the typed pinned plan as the authority for the binary topology.
     // The metadata JSON is a transport projection and must not replace the
     // already validated typed plan.
-    let fem_mesh = prepared_fem_mesh(&read_model.execution_plan);
     if matches!(
         &read_model.execution_plan.backend_plan,
         fullmag_ir::BackendPlanIR::AntennaFieldOnly(_)
@@ -1496,12 +1513,15 @@ pub(crate) async fn publish_accepted_task_preparation(
                     ),
                 )
             })?;
-        Ok::<_, ApiError>((receipt, execution_plan, specification.requested_execution))
+        let entry = accepted.catalog.entries().iter().find(|entry| entry.step_id() == step_id_for_worker)
+            .ok_or_else(|| ApiError::conflict("accepted preparation has no pinned ProblemIR"))?;
+        let global_sampling_mesh = antenna_domain::pinned_global_mesh(entry.problem(), &execution_plan)?;
+        Ok::<_, ApiError>((receipt, execution_plan, specification.requested_execution, global_sampling_mesh))
     })
     .await
     .map_err(|error| ApiError::internal(format!("accepted preparation task failed: {error}")))??;
 
-    let (receipt, execution_plan, requested_execution) = materialized;
+    let (receipt, execution_plan, requested_execution, global_sampling_mesh) = materialized;
     let validated_source =
         ValidatedAcceptedPreparationSource::from_validated_receipt(run_id, &receipt)?;
     let preparation_id = receipt.preparation_id().to_owned();
@@ -1522,6 +1542,7 @@ pub(crate) async fn publish_accepted_task_preparation(
         plan_fingerprint: plan_fingerprint.clone(),
         requested_execution,
         execution_plan,
+        global_sampling_mesh,
     };
 
     let now = u64::try_from(crate::session::unix_time_millis_now()).unwrap_or(u64::MAX);
@@ -2529,6 +2550,7 @@ pub(crate) async fn materialize_live_scene_preparation_model_with_fem_evidence(
             scene_revision: input.scene_revision,
             plan_fingerprint: receipt.plan_fingerprint.clone(),
             requested_execution: input.requested_execution,
+            global_sampling_mesh: antenna_domain::pinned_global_mesh(&problem, &execution_plan)?,
             execution_plan,
         };
         validate_live_read_model_binding(
@@ -3332,6 +3354,7 @@ mod tests {
         }
         LiveScenePreparationReadModel {
             schema_version: LIVE_SCENE_PREPARATION_READ_MODEL_SCHEMA,
+            global_sampling_mesh: None,
             preparation_id: "prep-domain".into(),
             scene_revision: 7,
             plan_fingerprint: digest('a'),
@@ -3379,7 +3402,7 @@ mod tests {
                 source_object_segments: Vec::new(),
                 source_mesh_parts: Vec::new(),
                 field_sampling: fullmag_ir::AntennaFieldSamplingPlanIR {
-                    domain: fullmag_ir::FieldTargetIR::Global {},
+                    domain: fullmag_ir::FieldTargetIR::Object { object_id: "sampling".into() },
                     carrier_kind: "points".into(),
                     location: "node".into(),
                     topology_digest: digest('b'),
@@ -3431,6 +3454,275 @@ mod tests {
         assert!(!crate::field_store::serialize_fem_mesh_topology_binary_v2(
             snapshot.fem_mesh.as_ref().unwrap(),
         ).unwrap().is_empty());
+    }
+
+    fn global_field_only_fixture() -> (fullmag_ir::ProblemIR, LiveScenePreparationReadModel) {
+        use sha2::{Digest, Sha256};
+        let mut model = prepared_field_only_read_model();
+        let fullmag_ir::BackendPlanIR::AntennaFieldOnly(plan) =
+            &mut model.execution_plan.backend_plan
+        else {
+            unreachable!()
+        };
+        let mut mesh = plan.source_mesh.clone();
+        mesh.mesh_name = "global-sampling".into();
+        mesh.nodes.push([0.0, 0.0, -1e-9]);
+        mesh.cells = fullmag_ir::FemConnectivityIR::from_tet4(vec![[0, 1, 2, 3], [0, 2, 1, 4]]);
+        mesh.element_markers = vec![1, 0];
+        mesh.facets = fullmag_ir::FemFacetConnectivityIR::from_tri3(vec![
+            [0, 1, 3],
+            [0, 3, 2],
+            [1, 2, 3],
+            [0, 2, 4],
+            [0, 4, 1],
+            [2, 1, 4],
+        ]);
+        mesh.boundary_markers = vec![1; 6];
+        plan.field_sampling.domain = fullmag_ir::FieldTargetIR::Global {};
+        plan.field_sampling.carrier_kind = "fem_domain_mesh_asset".into();
+        plan.field_sampling.positions_xyz_m = mesh.nodes.clone();
+        plan.field_sampling.cells = mesh.cells.clone();
+        plan.field_sampling.topology_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&mesh).unwrap())
+        );
+        let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        problem.magnets.clear();
+        let source_geometry = problem.geometry.entries[0].name().to_owned();
+        plan.source_object_id = source_geometry.clone();
+        plan.source_mesh.nodes = vec![
+            [0.0, 0.0, 0.0],
+            [1e-9, 0.0, 0.0],
+            [0.0, 1e-9, 0.0],
+            [0.0, 0.0, 1e-9],
+            [0.0, 0.0, 0.0],
+            [1e-9, 0.0, 0.0],
+            [0.0, 1e-9, 0.0],
+            [0.0, 0.0, -1e-9],
+        ];
+        plan.source_mesh.cells =
+            fullmag_ir::FemConnectivityIR::from_tet4(vec![[0, 1, 2, 3], [4, 6, 5, 7]]);
+        plan.source_mesh.element_markers = vec![1, 2];
+        plan.source_object_segments = vec![fullmag_ir::FemObjectSegmentIR {
+            object_id: source_geometry.clone(),
+            geometry_id: Some(source_geometry.clone()),
+            node_start: 0,
+            node_count: 8,
+            element_start: 0,
+            element_count: 2,
+            boundary_face_start: 0,
+            boundary_face_count: 0,
+        }];
+        problem.geometry_assets = Some(fullmag_ir::GeometryAssetsIR {
+            fem_domain_mesh_asset: Some(fullmag_ir::FemDomainMeshAssetIR {
+                mesh: Some(mesh),
+                mesh_source: None,
+                region_markers: vec![fullmag_ir::FemDomainRegionMarkerIR {
+                    geometry_name: source_geometry,
+                    marker: 1,
+                }],
+                object_region_markers: Vec::new(),
+                build_report: None,
+            }),
+            ..Default::default()
+        });
+        (problem, model)
+    }
+
+    #[test]
+    fn global_preparation_preserves_sampling_order_and_independent_source() {
+        let (problem, mut model) = global_field_only_fixture();
+        model.global_sampling_mesh =
+            antenna_domain::pinned_global_mesh(&problem, &model.execution_plan).unwrap();
+        let request = serde_json::from_value(serde_json::json!({"session_id":"global"})).unwrap();
+        let snapshot = crate::session::default_current_live_state(&request);
+        let (metadata, mesh) = prepared_domain_publication(&snapshot, &model).unwrap();
+        let mesh = mesh.unwrap();
+        let fullmag_ir::BackendPlanIR::AntennaFieldOnly(plan) = &model.execution_plan.backend_plan
+        else {
+            unreachable!()
+        };
+        assert_eq!(mesh.nodes, plan.field_sampling.positions_xyz_m);
+        assert_eq!(mesh.cells, plan.field_sampling.cells);
+        assert_eq!(mesh.element_markers, vec![1, 0]);
+        assert_eq!(mesh.facets.len(), 6);
+        assert_eq!(mesh.mesh_parts.len(), 2);
+        assert_eq!(mesh.mesh_parts[0].role, "conductor");
+        assert_eq!(
+            mesh.mesh_parts[0].object_id.as_deref(),
+            Some(plan.source_object_id.as_str())
+        );
+        assert_eq!(mesh.mesh_parts[1].role, "air");
+        assert_eq!(mesh.mesh_parts[1].element_start, 1);
+        assert_eq!(mesh.mesh_parts[1].node_indices, vec![0, 1, 2, 4]);
+        let source =
+            fullmag_runner::StageFemMeshAsset::build_from_antenna_field_only_plan(plan).payload;
+        assert_eq!(source.nodes.len(), 8);
+        assert_eq!(source.cells.len(), 2);
+        assert_eq!(source.nodes[0], source.nodes[4]);
+        assert_eq!(source.cells, plan.source_mesh.cells);
+        assert_ne!(mesh.generation_id, source.generation_id);
+        assert_eq!(
+            metadata["antenna_domain_publication"]["sampling_topology_digest"],
+            plan.field_sampling.topology_digest
+        );
+        assert!(
+            serde_json::to_value(&model)
+                .unwrap()
+                .get("global_sampling_mesh")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn global_preparation_preserves_explicit_magnetic_target_ownership() {
+        use sha2::{Digest, Sha256};
+        let (mut problem, mut model) = global_field_only_fixture();
+        let mut geometry = serde_json::to_value(&problem.geometry.entries[0]).unwrap();
+        geometry["name"] = json!("waveguide-geometry");
+        problem
+            .geometry
+            .entries
+            .push(serde_json::from_value(geometry).unwrap());
+        problem.regions.push(fullmag_ir::RegionIR {
+            name: "waveguide-region".into(),
+            geometry: "waveguide-geometry".into(),
+        });
+        problem.magnets.push(fullmag_ir::MagnetIR {
+            object_id: Some("waveguide".into()),
+            name: "waveguide".into(),
+            region: "waveguide-region".into(),
+            material: "magnetic-material".into(),
+            initial_magnetization: None,
+            absorbing_boundary: None,
+        });
+        let asset = problem
+            .geometry_assets
+            .as_mut()
+            .unwrap()
+            .fem_domain_mesh_asset
+            .as_mut()
+            .unwrap();
+        asset
+            .region_markers
+            .push(fullmag_ir::FemDomainRegionMarkerIR {
+                geometry_name: "waveguide-geometry".into(),
+                marker: 2,
+            });
+        let mesh = asset.mesh.as_mut().unwrap();
+        mesh.element_markers[1] = 2;
+        let fullmag_ir::BackendPlanIR::AntennaFieldOnly(plan) =
+            &mut model.execution_plan.backend_plan
+        else {
+            unreachable!()
+        };
+        plan.field_sampling.topology_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(mesh).unwrap())
+        );
+        let payload = antenna_domain::pinned_global_mesh(&problem, &model.execution_plan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload.mesh_parts[0].role, "conductor");
+        assert_eq!(payload.mesh_parts[1].role, "magnetic_object");
+        assert_eq!(
+            payload.mesh_parts[1].object_id.as_deref(),
+            Some("waveguide")
+        );
+        assert_eq!(payload.element_markers, vec![1, 2]);
+    }
+
+    #[test]
+    fn global_source_scope_retains_cut_and_rejects_stale_binding() {
+        let (problem, mut model) = global_field_only_fixture();
+        model.global_sampling_mesh =
+            antenna_domain::pinned_global_mesh(&problem, &model.execution_plan).unwrap();
+        let request = serde_json::from_value(json!({"session_id":"global-source"})).unwrap();
+        let mut snapshot = crate::session::default_current_live_state(&request);
+        let (metadata, mesh) = prepared_domain_publication(&snapshot, &model).unwrap();
+        let fullmag_ir::BackendPlanIR::AntennaFieldOnly(plan) = &model.execution_plan.backend_plan
+        else {
+            unreachable!()
+        };
+        let source_id = plan.source_object_id.clone();
+        let mut scene = fullmag_authoring::SceneDocument::default();
+        scene.revision = 7;
+        scene.study.requested_backend = "fem".into();
+        scene.objects.push(
+            serde_json::from_value(json!({
+                "id": source_id, "name": "Current source", "role": "antenna",
+                "geometry": {"geometry_kind":"Box", "geometry_params":{"size":[1e-9,1e-9,1e-9]}},
+                "material_ref":"", "magnetization_ref":null,
+            }))
+            .unwrap(),
+        );
+        snapshot.scene_document = Some(scene);
+        snapshot.metadata = Some(metadata.into());
+        snapshot.fem_mesh = mesh.map(Into::into);
+        snapshot.mesh_workspace = Some(
+            json!({
+                "schema_version": LIVE_SCENE_PREPARATION_READ_MODEL_SCHEMA,
+                "source_scene_revision":7, "preparation_id":"prep-domain", "status":"completed",
+                "execution_plan": model.execution_plan, "accepted_run_id": snapshot.session.run_id,
+            })
+            .into(),
+        );
+        snapshot.simulation_preparation = Some(crate::types::SimulationPreparationSnapshot {
+            preparation_id: "prep-domain".into(),
+            revision: 1,
+            status: "ready".into(),
+            active_stage_id: None,
+            started_at_unix_ms: 1,
+            completed_at_unix_ms: Some(2),
+            stages: Vec::new(),
+            log_tail: Vec::new(),
+            failure: None,
+        });
+        let resolve = crate::router_v2::handlers::meshing::mesh::field_only_source_payload;
+        let source = resolve(&snapshot, &source_id).unwrap().unwrap();
+        assert_eq!(source.nodes.len(), 8);
+        assert_eq!(source.nodes[0], source.nodes[4]);
+        assert_eq!(source.element_markers, vec![1, 2]);
+        snapshot.session.status = "completed".into();
+        assert!(resolve(&snapshot, &source_id).unwrap().is_some());
+        let metadata = snapshot.metadata.take();
+        assert!(resolve(&snapshot, &source_id).is_err());
+        snapshot.metadata = metadata;
+        snapshot.scene_document.as_mut().unwrap().revision += 1;
+        assert!(resolve(&snapshot, &source_id).is_err());
+    }
+
+    #[test]
+    fn global_preparation_rejects_missing_or_different_pinned_mesh() {
+        let (mut problem, model) = global_field_only_fixture();
+        problem
+            .geometry_assets
+            .as_mut()
+            .unwrap()
+            .fem_domain_mesh_asset
+            .as_mut()
+            .unwrap()
+            .mesh
+            .as_mut()
+            .unwrap()
+            .nodes[0][0] += 1e-12;
+        assert!(antenna_domain::pinned_global_mesh(&problem, &model.execution_plan).is_err());
+        problem
+            .geometry_assets
+            .as_mut()
+            .unwrap()
+            .fem_domain_mesh_asset
+            .as_mut()
+            .unwrap()
+            .mesh = None;
+        assert!(antenna_domain::pinned_global_mesh(&problem, &model.execution_plan).is_err());
+        let request =
+            serde_json::from_value(serde_json::json!({"session_id":"global-missing"})).unwrap();
+        let snapshot = crate::session::default_current_live_state(&request);
+        assert!(prepared_domain_publication(&snapshot, &model).is_err());
+        let metadata: crate::shared_json::SharedJson =
+            serde_json::json!({"execution_plan": model.execution_plan}).into();
+        assert!(crate::quantities::extract_fem_mesh_from_metadata(&metadata).is_none());
     }
 
     fn prepared_multilayer_read_model() -> LiveScenePreparationReadModel {
