@@ -375,6 +375,16 @@ pub(crate) enum RuntimeCommand {
         #[arg(long)]
         config_sha256: String,
     },
+    /// Read-only canonical terminal-run evidence for a pinned application.
+    #[command(name = "service-inspect-terminal-run", hide = true)]
+    ServiceInspectTerminalRun {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        config_sha256: String,
+        #[arg(long)]
+        run_id: String,
+    },
     /// Recover one exactly pinned unknown native service owner after a durable
     /// empty-store and host-quiescence proof.
     ServiceRecover {

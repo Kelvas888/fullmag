@@ -113,6 +113,14 @@ pub fn validate_retained_cancelled_runs(
     store: &SessionStore,
     pins: &[RetainedCancelledRunPin],
 ) -> Result<RetainedCancelledRunsPreflight> {
+    validate_retained_run_inputs(store, pins, None)
+}
+
+pub(super) fn validate_retained_run_inputs(
+    store: &SessionStore,
+    pins: &[RetainedCancelledRunPin],
+    terminal_validation: Option<&dyn Fn(&str) -> Result<()>>,
+) -> Result<RetainedCancelledRunsPreflight> {
     if pins.is_empty() || pins.len() > MAX_RETAINED_CANCELLED_RUN_PINS {
         bail!("retained-run pin count must be between 1 and {MAX_RETAINED_CANCELLED_RUN_PINS}");
     }
@@ -213,41 +221,45 @@ pub fn validate_retained_cancelled_runs(
             bail!("retained-run preflight exceeds its task limit");
         }
 
-        let mut tasks = BTreeMap::<String, &FmsTaskCatalogEntry>::new();
-        for task in &catalog.tasks {
-            if task.lifecycle != FmsTaskLifecycle::Cancelled
-                || task.attempt_id.is_some()
-                || task.resource_id.is_some()
-                || task.resolved_input_fingerprint.is_some()
-                || task.coordinator_genesis.is_some()
-                || task.coordinator_watermark.is_some()
-            {
-                bail!(
-                    "retained run `{run_id}` task `{}` is not cancelled and unclaimed",
-                    task.task_id
-                );
+        if let Some(validate_terminal) = terminal_validation {
+            validate_terminal(&run_id)?;
+        } else {
+            let mut tasks = BTreeMap::<String, &FmsTaskCatalogEntry>::new();
+            for task in &catalog.tasks {
+                if task.lifecycle != FmsTaskLifecycle::Cancelled
+                    || task.attempt_id.is_some()
+                    || task.resource_id.is_some()
+                    || task.resolved_input_fingerprint.is_some()
+                    || task.coordinator_genesis.is_some()
+                    || task.coordinator_watermark.is_some()
+                {
+                    bail!(
+                        "retained run `{run_id}` task `{}` is not cancelled and unclaimed",
+                        task.task_id
+                    );
+                }
+                if tasks.insert(task.task_id.clone(), task).is_some() {
+                    bail!("retained run `{run_id}` contains a duplicate task id");
+                }
             }
-            if tasks.insert(task.task_id.clone(), task).is_some() {
-                bail!("retained run `{run_id}` contains a duplicate task id");
-            }
-        }
 
-        let cancellations = read_cancellation_intents(store, &run_id, &tasks, &mut budget)?;
-        for (task_id, task) in &tasks {
-            let cancellation = cancellations
-                .get(task_id)
-                .context("cancelled task is missing its durable cancellation intent")?;
-            let mut expected_task = cancellation.task.clone();
-            expected_task.lifecycle = FmsTaskLifecycle::Cancelled;
-            if **task != expected_task {
-                bail!(
-                    "retained run `{run_id}` task `{task_id}` drifted from its cancellation snapshot"
-                );
+            let cancellations = read_cancellation_intents(store, &run_id, &tasks, &mut budget)?;
+            for (task_id, task) in &tasks {
+                let cancellation = cancellations
+                    .get(task_id)
+                    .context("cancelled task is missing its durable cancellation intent")?;
+                let mut expected_task = cancellation.task.clone();
+                expected_task.lifecycle = FmsTaskLifecycle::Cancelled;
+                if **task != expected_task {
+                    bail!(
+                        "retained run `{run_id}` task `{task_id}` drifted from its cancellation snapshot"
+                    );
+                }
+                cancellation.validate_task_scope(store, task, catalog.revision)?;
             }
-            cancellation.validate_task_scope(store, task, catalog.revision)?;
-        }
 
-        reject_matching_task_admissions(store, &run_id, &tasks, &cancellations, &mut budget)?;
+            reject_matching_task_admissions(store, &run_id, &tasks, &cancellations, &mut budget)?;
+        }
         reject_active_leases(store, &run_id, &mut budget)?;
     }
 

@@ -197,6 +197,18 @@ fn main() -> Result<()> {
                 )?)?
             );
         }
+        Command::Runtime(RuntimeCommand::ServiceInspectTerminalRun {
+            config, config_sha256, run_id,
+        }) => {
+            let digest = runtime_service_client::inspect_terminal_run_evidence(
+                &config, &config_sha256, &run_id,
+            )?;
+            println!("{}", serde_json::json!({
+                "schema_version": "runtime_service_terminal_run_evidence.v1",
+                "run_id": run_id, "terminal_evidence_sha256": digest,
+                "mutations_applied": false, "solve_replayed": false,
+            }));
+        }
         Command::Runtime(RuntimeCommand::ServiceRecover {
             config,
             request,

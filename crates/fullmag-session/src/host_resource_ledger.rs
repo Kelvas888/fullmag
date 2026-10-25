@@ -4111,9 +4111,28 @@ impl HostResourceLedger {
         operation: impl FnOnce(&HostResourceLedgerSnapshot, &str) -> Result<T>,
     ) -> Result<T> {
         crate::repository_path::validate_store_id(run_id)?;
-        let store_id = Self::store_id(store.root())?;
         let _host_writer = self.writer.acquire()?;
         let _store_writer = store.write_transaction()?;
+        let document = self.read_document_locked()?;
+        let evidence_sha256 = self.terminal_run_evidence_sha256_locked(store, run_id)?;
+        let snapshot = HostResourceLedgerSnapshot {
+            policy_history_sha256: document.policy_history_sha256()?,
+            policy: document.policy.clone(),
+            reservations: document.reservations.clone(),
+            node_policy: document.node_policy.clone(),
+        };
+        operation(&snapshot, &evidence_sha256)
+    }
+
+    /// Caller holds the host writer before the SessionStore writer for the
+    /// complete operation; this helper never acquires or releases either guard.
+    pub(crate) fn terminal_run_evidence_sha256_locked(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+    ) -> Result<String> {
+        crate::repository_path::validate_store_id(run_id)?;
+        let store_id = Self::store_id(store.root())?;
         let document = self.read_document_locked()?;
         let mut exact_rows = Vec::new();
         for row in document.reservations.iter().filter(|row| {
@@ -4339,13 +4358,7 @@ impl HostResourceLedger {
             "exact_host_rows": host_rows,
         });
         let evidence_sha256 = canonical_json_sha256(&evidence);
-        let snapshot = HostResourceLedgerSnapshot {
-            policy_history_sha256: document.policy_history_sha256()?,
-            policy: document.policy.clone(),
-            reservations: document.reservations.clone(),
-            node_policy: document.node_policy.clone(),
-        };
-        operation(&snapshot, &evidence_sha256)
+        Ok(evidence_sha256)
     }
 
     /// Reserve capacity tentatively. Exact retries return the existing record;
