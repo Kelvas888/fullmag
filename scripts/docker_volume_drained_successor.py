@@ -244,7 +244,15 @@ def retained_context(control, previous, document, actual, proof_path, proof_sha2
         _require(isinstance(snapshot_pin, str) and _DIGEST.fullmatch(snapshot_pin),
                  "ordinary stop has no immutable service snapshot")
         _, snapshot, _ = _record(control, stop_base + "/idle-stop-containers.json", expected=snapshot_pin)
-        _require(snapshot == actual, "ordinary stop service snapshot changed")
+        _require(set(snapshot) == set(actual), "ordinary stop services changed")
+        for service, observed in actual.items():
+            pinned = snapshot[service]
+            # Docker reorders Mounts. fingerprint validates unique canonical
+            # destinations and preserves every mount field while sorting them.
+            _require(fingerprint(pinned) == fingerprint(observed)
+                     and {key: value for key, value in pinned.items() if key != "Mounts"}
+                     == {key: value for key, value in observed.items() if key != "Mounts"},
+                     "ordinary stop service snapshot changed")
     _, drain, drain_sha = _record(control, stop_base + "/backend-drain.json")
     terminal_raw, terminal, terminal_sha = _record(control, "runtime-control/runtime-service/process-tree.json")
     _require(drain.get("schema") == "fullmag.docker-idle-restart-drain.v1"

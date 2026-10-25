@@ -21,7 +21,8 @@ BASE_IMPLEMENTATIONS = ('docker_build_control', 'docker_volume_dev', 'docker_vol
                         'docker_volume_stop_failed', 'docker_volume_checks')
 OPTIONAL_IMPLEMENTATIONS = ('docker_volume_activation_reconcile', 'docker_volume_accepted_reattach',
                             'docker_volume_pre_admission_recreate', 'docker_volume_pre_admission_selector',
-                            'docker_volume_pending_continuation', 'docker_volume_native_init_successor')
+                            'docker_volume_pending_continuation', 'docker_volume_native_init_successor',
+                            'docker_volume_drained_successor')
 
 
 _ORACLE_WHEEL_ROOT = Path('/opt/fullmag/control/verification')

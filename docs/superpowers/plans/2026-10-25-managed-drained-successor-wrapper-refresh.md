@@ -87,3 +87,20 @@ Po tej korekcie cały moduł recreate: **57 testów PASS**, wraz z wcześniejszy
 guardami native/owner/retained state. Bash syntax PASS. Raport:
 `verification/wrapper-refresh-20261025/native-focused-shell-final.json`.
 Wynik 1256 testów powyżej dotyczy wersji przed tą wąską korektą shell.
+
+## Kolejność mountów Docker
+
+Rzeczywisty readonly preview odmówił porównania pełnego inspect. Odczyt różnic
+potwierdził wyłącznie permutację Mounts; żadne ich pole nie zmieniło wartości.
+Walidator używa teraz istniejącego fingerprintu, który sprawdza unikalne
+kanoniczne destinations i sortuje mounty z zachowaniem wszystkich pól.
+Pozostała część inspect nadal wymaga dokładnej zgodności. Regresja dopuszcza
+permutację, lecz odrzuca zmianę flagi RW. Nowy helper wpisano również do
+opcjonalnego manifestu implementacji kontrolowanych przez offline checks.
+
+Zarządzane kontrole offline w grupowym helperze dla zatrzymanego backendu:
+**85 testów PASS**, 7.985 s, wejścia źródłowe stabilne, source readonly,
+control writable. Receipt:
+`verification/wrapper-refresh-20261025/offline-mount-order-85.json`.
+To końcowy zakres po korekcie kolejności mountów; nie jest dowodem startu
+nowych usług ani obliczenia Universe.

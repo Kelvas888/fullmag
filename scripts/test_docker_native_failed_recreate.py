@@ -915,6 +915,20 @@ class DrainedSuccessorProofTests(unittest.TestCase):
         self.assertNotEqual(context.witness["terminal_sha256"], "changed")
         self.control.write.assert_not_called()
 
+    def test_mount_order_is_nonsemantic_but_all_mount_fields_remain_pinned(self):
+        self.actual["backend"]["Mounts"] = [
+            {"Destination": "/alpha", "Type": "bind", "Source": "/source-a", "RW": False},
+            {"Destination": "/beta", "Type": "volume", "Name": "data", "RW": True}]
+        self.stop["idle_stop_containers_sha256"] = self.put(
+            self.stop_root + "/idle-stop-containers.json", self.copy(self.actual))
+        self.refresh_stop()
+        before = self.invoke().witness
+        self.actual["backend"]["Mounts"].reverse()
+        self.assertEqual(self.invoke().witness, before)
+        self.actual["backend"]["Mounts"][0]["RW"] = False
+        with self.assertRaisesRegex(dev.BuildControlError, "snapshot changed"):
+            self.invoke()
+
     def test_rejects_changed_or_missing_proof_and_closed_fields(self):
         for mutation in ("digest", "unknown", "no-config", "path"):
             with self.subTest(mutation=mutation):
