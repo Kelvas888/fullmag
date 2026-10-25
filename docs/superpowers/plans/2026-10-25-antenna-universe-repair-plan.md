@@ -543,3 +543,42 @@ nośnik źródła, zachowanie rewizji/runu/przygotowania oraz brak fikcyjnych
 liczności i agregowanych percentyli. Odczyty przed Solve są potwierdzone;
 po Solve i cold-load pozostają do weryfikacji. Commit poprawki finalizacji
 startup: `a5b0d38efd32a0e521a2d82a2c9df72267f8323e`.
+
+
+### P13 — zachowanie metadanych w publicznym eksporcie FMS
+
+Po commicie publikacji `d6fe432c82efa97aea3332f16623b6a51fa0a0af`
+sprawdzono zgodność pięciu zmienionych plików runtime z rzeczywiście
+zbudowanym cieniem `/build/workspace`: wszystkie identyczne bajtowo.
+Runtime nadal identyfikuje wejście buildu przez commit
+`1b276bd5d6842013a9036c497aac718fabdf1bb2` i snapshot
+`79037219b3e3f4c1f4e27a2edad8097dc3aa91ffaada3aaddea4f7b308034864`;
+nie przypisujemy mu nowszego commita ani nowego buildu.
+
+Publiczny eksport compact/balanced bieżącej przygotowanej sceny:
+31291773 B, SHA256
+`c05d8176471e7de2e8ef439375f362223a22e0023a6e64c1a267bde861f9ed87`.
+CRC wszystkich wpisów ZIP poprawne. Snapshot zachowuje `execution_plan`,
+`antenna_domain_publication`, `magnetic_state_present=false`, `capabilities`
+i `docker_startup`. Plan metadata i workspace jest identyczny. Sesja podczas
+eksportu pozostała stabilna, stan nadal waiting_for_solve. Dowody:
+`public-after-startup-metadata-fix/prepared-scene-after-metadata-fix.fms`
+i `archive-metadata-check.json` w katalogu audytu wolumenu kontrolnego.
+To dowód zapisu; nie wykonano importu i nie zaliczono cold-load.
+
+Katalog API przed Solve ma pusty zbiór opublikowanych fields.
+`m` i `frozen_spins` są magnetic_only, unsupported oraz mają
+requestable/renderable/materializable=false. Nie są oferowane jako wynik
+niemagnetycznej anteny. Dowód: `checkpoint-20261026.json` oraz zapisane
+odpowiedzi fields/quantities przed Solve.
+
+| Podzadanie etapu 1 | Bieżący status |
+|---|---|
+| 1.1 Przypięcie przypadku i tożsamości | PASS dla bieżącego katalogu i runtime |
+| 1.2 Audyt geometrii i siatek | PASS w opisanym zakresie topologii, SI, materiałów i przekroju |
+| 1.3 Publikacja i zarządzanie | API i model drzewa PASS; obraz UI/WebGL NOT VERIFIED |
+| Bramka całego etapu 1 | OTWARTA — brakuje kontroli siatki w UI |
+
+Zachowano kolejność planu: nie uruchomiono ciężkiego Solve. Poproszono
+użytkownika o obserwację drzewa i siatki na 3203; brak odpowiedzi nie jest
+zaliczeniem bramki ani zgodą na pominięcie kontroli WebGL.
