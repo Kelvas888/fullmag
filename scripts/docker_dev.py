@@ -2701,6 +2701,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     recreate_volume.add_argument("--completed-recreation-attempt", help="Continue this exact succeeded removal without repeating rm")
     recreate_volume.add_argument("--completed-recreation-sha256", help="SHA-256 of the completed removal terminal receipt")
+    recreate_volume.add_argument("--drained-successor-proof", help="Exact control-volume proof of a later successful managed drain")
+    recreate_volume.add_argument("--drained-successor-proof-sha256", help="SHA-256 of the exact drained-successor proof")
     recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the previous session and archive its runtime state before starting an empty session")
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
                                  include_untracked=None, script=None)

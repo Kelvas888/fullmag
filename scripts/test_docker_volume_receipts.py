@@ -890,12 +890,14 @@ class FrontendMetadataRefreshTests(IsolatedReceiptTests):
 
 
 
-    def run_refresh(self, fault=None):
+    def run_refresh(self, fault=None, *, linux=False):
         import copy,json,types
         import docker_volume_dev as dev
         import docker_dev_codegen as codegen
         import docker_development_inputs as frontend_inputs
-        import windows_folder_host,fullmag_storage,docker_volume_reconcile,docker_build_control
+        import windows_folder_host,linux_native_host,fullmag_storage,docker_volume_reconcile,docker_build_control
+        host = linux_native_host if linux else windows_folder_host
+        certificate_name = Path(host.HOST_CERT_PATH).name
         control=mock.Mock(spec=BuildControl);control.project='own';control.volume='control';control.namespace=''
         control._active_operation=None
         control.operation=types.MethodType(BuildControl.operation,control)
@@ -935,16 +937,17 @@ class FrontendMetadataRefreshTests(IsolatedReceiptTests):
         def compose(doc,*argv,**kwargs):return b'f'*64 if argv[0]=='ps' else b''
         reads={}
         def read_owner(path):
-            name=Path(path).name;reads[name]=reads.get(name,0)+1
-            raw=(b'{"owner":"same"}' if name=='windows-folder-host.json'
+            name=Path(path).name;self.assertIn(name,(certificate_name,host.OWNER_NAME));reads[name]=reads.get(name,0)+1
+            raw=(b'{"owner":"same"}' if name==certificate_name
                  else b'{\n  "owner": "same"\n}\n')
-            if reads[name]>1 and ((fault=='certificate-drift' and name=='windows-folder-host.json')
-                    or (fault=='owner-drift' and name=='.fullmag-windows-folder-owner.json')):
+            if reads[name]>1 and ((fault=='certificate-drift' and name==certificate_name)
+                    or (fault=='owner-drift' and name==host.OWNER_NAME)):
                 raw+=b' '
             return raw
         with mock.patch.object(docker_build_control.subprocess,'Popen',return_value=logger), \
              mock.patch.object(fullmag_storage,'validate_path',return_value=Path('/state')), \
-             mock.patch.object(windows_folder_host,'read_owned_regular',side_effect=read_owner), \
+             mock.patch.object(dev,'_session_host',return_value=host), \
+             mock.patch.object(host,'read_owned_regular',side_effect=read_owner), \
              mock.patch.object(dev,'_retained_startup_enabled',return_value=False), \
              mock.patch.object(dev,'docker_text',side_effect=text), \
              mock.patch.object(dev,'docker_capture',side_effect=stop) as stopped_call, \
@@ -985,6 +988,22 @@ class FrontendMetadataRefreshTests(IsolatedReceiptTests):
         self.assertEqual(lifecycle.args[0]['services']['backend'],{'same':'declaration'})
         self.assertEqual(lifecycle.args[0]['services']['frontend']['mem_limit'],'8589934592')
         self.assertTrue(any(path.endswith('/rollback-compose.json') for path in writes))
+
+    def test_linux_refresh_uses_native_certificate_and_preserves_backend(self):
+        writes,seeded,composed,logger=self.run_refresh(linux=True)
+        terminal=next(value for path,value in writes.items() if path.endswith('/terminal.json'))
+        self.assertEqual(terminal['state'],'succeeded')
+        self.assertEqual(terminal['backend_container'],'b'*64)
+        self.assertFalse(terminal['native_build_executed'])
+
+    def test_linux_refresh_retains_control_on_certificate_or_owner_byte_drift(self):
+        for fault in ('certificate-drift','owner-drift'):
+            with self.subTest(fault=fault):
+                writes,seeded,composed,logger=self.run_refresh(fault,linux=True)
+                self.assertFalse(any(path.endswith('/terminal.json') for path in writes))
+                receipt=next(value for path,value in writes.items() if path.endswith('/receipt.json'))
+                self.assertEqual(receipt['state'],'outcome-unknown-resources-retained')
+                logger.wait.assert_not_called()
 
     def test_source_mismatch_refuses_before_seeding_or_lifecycle(self):
         writes,seeded,composed,logger=self.run_refresh('source-mismatch')

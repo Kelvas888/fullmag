@@ -4723,6 +4723,7 @@ def _native_failed_stop_recovery_context(
 
 def _retained_recovery_context(
     control, previous, document, *, fresh_state, backend_id=None, removed_container_proof=None,
+    drained_successor=None, actual=None,
 ):
     """Carry pending recovery authority, or consume a completed proof once.
 
@@ -4732,6 +4733,12 @@ def _retained_recovery_context(
     A separate native-start-failure journal carries only reduced restart
     evidence and never mints a recovery authorization.
     """
+    if drained_successor is not None:
+        if fresh_state:
+            raise BuildControlError("Drained successor requires retained storage")
+        from docker_volume_drained_successor import retained_context
+        return retained_context(control, previous, document, actual, *drained_successor,
+                                removed_container_proof=removed_container_proof)
     import docker_volume_container_recovery as recovery_module
     from docker_volume_container_recovery import (
         AUTHORIZATION_ENV, AUTHORIZATION_SHA_ENV, CONTROL_ROOT,
@@ -5249,6 +5256,18 @@ def _validate_removed_recreation_proof(
         "container_state": container_state,
         "absence": absence_proof,
     }
+    successor_path = getattr(args, "drained_successor_proof", None)
+    successor_sha = getattr(args, "drained_successor_proof_sha256", None)
+    recorded_successor = operation_terminal.get("drained_successor")
+    if recorded_successor is not None:
+        if not isinstance(recorded_successor, Mapping):
+            raise BuildControlError("Completed recreation drained-successor witness is invalid")
+        recorded_pins = (recorded_successor.get("proof_path"), recorded_successor.get("proof_sha256"))
+        if ((successor_path or successor_sha) and (successor_path, successor_sha) != recorded_pins):
+            raise BuildControlError("Completed recreation drained-successor request pins differ")
+        successor_path, successor_sha = recorded_pins
+    if bool(successor_path) != bool(successor_sha):
+        raise BuildControlError("Completed recreation requires paired drained-successor pins")
     native_recovery_context = _retained_recovery_context(
         control,
         previous,
@@ -5256,7 +5275,14 @@ def _validate_removed_recreation_proof(
         fresh_state=False,
         backend_id=ids["backend"],
         removed_container_proof=proof,
+        drained_successor=((successor_path, successor_sha) if successor_path else None), actual=snapshot,
     )
+    from docker_volume_drained_successor import DrainedSuccessorContext
+    if isinstance(native_recovery_context, DrainedSuccessorContext):
+        witness = native_recovery_context.witness
+        if operation_terminal.get("drained_successor") != witness:
+            raise BuildControlError("Completed recreation drained-successor witness differs")
+        proof["drained_successor"] = witness
     proof["native_recovery_context"] = native_recovery_context
     return snapshot, proof, native_recovery_context
 
@@ -5706,17 +5732,20 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
     import docker_dev_codegen as codegen
     from docker_development_inputs import describe, frontend_view
     from docker_volume_reconcile import fingerprint
-    from windows_folder_host import read_owned_regular
+    host = _session_host()
+    read_owned_regular = host.read_owned_regular
     from docker_build_control import ControlOutcomeUnknown
-    state = storage.validate_path(Path(previous['state_root']), layout['runtime_root'], 'retained Windows sessions')
+    state = storage.validate_path(Path(previous['state_root']), layout['runtime_root'], 'retained sessions')
     if args.port != int(document['services']['frontend']['environment']['FULLMAG_FRONTEND_HOST_PORT']):
         raise BuildControlError('Frontend refresh port differs from retained published port')
     if _retained_startup_enabled(actual['backend']):
         raise BuildControlError('Frontend refresh will not repeat startup activation')
-    certificate = read_owned_regular(state / 'windows-folder-host.json')
-    owner = read_owned_regular(state / '.fullmag-windows-folder-owner.json')
+    certificate_path = _certificate_path(state)
+    owner_path = state / host.OWNER_NAME
+    certificate = read_owned_regular(certificate_path)
+    owner = read_owned_regular(owner_path)
     if canonical(json.loads(owner)) != canonical(json.loads(certificate)):
-        raise BuildControlError('Frontend refresh Windows owner/certificate differs')
+        raise BuildControlError('Frontend refresh owner/certificate differs')
     backend_pin = (actual['backend']['State']['StartedAt'], fingerprint(actual['backend']))
     old_frontend_pin = (actual['frontend']['State']['StartedAt'], fingerprint(actual['frontend']))
     oom_state = {key: actual['frontend']['State'].get(key)
@@ -5848,9 +5877,9 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
                 or again_binary != binary_provenance
                 or (not recover_oom and not codegen._source_matches(again_probe, backend_source))
                 or describe(selected, args.port)['files'] != seeded['files']
-                or read_owned_regular(state / 'windows-folder-host.json') != certificate
-                or read_owned_regular(state / '.fullmag-windows-folder-owner.json') != owner):
-            raise BuildControlError('Backend package/source, frontend seed or Windows storage changed during refresh')
+                or read_owned_regular(certificate_path) != certificate
+                or read_owned_regular(owner_path) != owner):
+            raise BuildControlError('Backend package/source, frontend seed or session storage changed during refresh')
         if recover_oom and _verified_frontend_recovery_image(control, selected) != (frontend_image, image_witness):
             raise BuildControlError('Frontend recovery image inputs changed after recreation')
         healthy_idle(); final = inspect_services(frontend_id)
@@ -5947,8 +5976,10 @@ def _completed_recreation_start_context(control, args, selected, layout):
         retained=retained, previous_raw=previous_raw, document_raw=document_raw,
         operator_probe_record=operator_probe_record,
     )
-    if (not recovery.get("previous_config_sha256") or not recovery.get("native_restart_metadata")
-            or recovery.get("recovery_environment") or recovery.get("recovery_metadata")):
+    from docker_volume_drained_successor import DrainedSuccessorContext
+    if (not isinstance(recovery, DrainedSuccessorContext)
+            and (not recovery.get("previous_config_sha256") or not recovery.get("native_restart_metadata")
+                 or recovery.get("recovery_environment") or recovery.get("recovery_metadata"))):
         raise BuildControlError("Completed recreation requires the exact managed failed-owner restart proof")
     reuse = {"state": state, "host_certificate": certificate_path,
         "owner_marker": owner_marker, "receipt": {"image_id": image},
@@ -6103,6 +6134,14 @@ def _retained_operation(
             raise BuildControlError("Recreation requires the retained GPU access intent")
         args.gpu_access = policy
         retained_device_access = _retained_device_access(previous, document)
+    successor_path = getattr(args, "drained_successor_proof", None)
+    successor_sha = getattr(args, "drained_successor_proof_sha256", None)
+    if bool(successor_path) != bool(successor_sha):
+        raise BuildControlError("Drained successor requires paired exact proof pins")
+    drained_successor_pins = (successor_path, successor_sha) if successor_path else None
+    if drained_successor_pins and (not recreate_services or getattr(args, "fresh_state", False)
+            or getattr(args, "recovery_authorization", None) or getattr(args, "script", None)):
+        raise BuildControlError("Drained successor only permits retained empty-workspace recreation")
     completed_attempt = getattr(args, "completed_recreation_attempt", None)
     completed_sha = getattr(args, "completed_recreation_sha256", None)
     if completed_attempt or completed_sha:
@@ -6298,6 +6337,17 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 "process_receipt": drained,
             })
             if stop_after_drain:
+                stopped_services = {service: json.loads(docker_text("inspect", identifier))[0]
+                                    for service, identifier in ids.items()}
+                for service, observed in stopped_services.items():
+                    if (observed.get("Id") != actual[service].get("Id")
+                            or observed.get("Image") != actual[service].get("Image")
+                            or observed.get("State", {}).get("StartedAt") != actual[service].get("State", {}).get("StartedAt")
+                            or observed.get("State", {}).get("Running") is not False):
+                        raise BuildControlError("Idle stop service incarnation or stopped state differs")
+                control.write(operation["root"] + "/idle-stop-containers.json", stopped_services)
+                operation["receipt"]["idle_stop_containers_sha256"] = hashlib.sha256(
+                    canonical(stopped_services) + b"\n").hexdigest()
                 operation["daemon_pending"] = False
                 operation["receipt"].update(
                     state="succeeded", idle_backend_stopped=True,
@@ -6350,7 +6400,10 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         recovery_context = {} if fresh_state else _retained_recovery_context(
             control, previous, document, fresh_state=False,
             backend_id=actual["backend"].get("Id"),
+            drained_successor=drained_successor_pins, actual=actual,
         )
+        from docker_volume_drained_successor import DrainedSuccessorContext
+        drained_successor = isinstance(recovery_context, DrainedSuccessorContext)
         from docker_volume_native_init_successor import NativeInitSuccessorContext
         native_init_successor = isinstance(recovery_context, NativeInitSuccessorContext)
         if native_init_successor:
@@ -6419,7 +6472,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             and native_restart.get("claim_pending") is False
         )
         if (not fresh_state and pre_activation_stop is None and not pre_api_stopped
-                and not original_after_ready_stop and not native_init_successor
+                and not original_after_ready_stop and not native_init_successor and not drained_successor
                 and certificate.get("restart_verified") is True):
             retained_environment = document["services"]["backend"]["environment"]
             retained_reattach_declared = (
@@ -6471,7 +6524,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         # This checkpoint already carries authenticated native recovery
         # authority. It must not enter the mutually exclusive no-native
         # pre-admission path merely because the old storage probe was limited.
-        if (not fresh_state and not pre_api_stopped and not native_init_successor
+        if (not fresh_state and not pre_api_stopped and not native_init_successor and not drained_successor
                 and not certificate.get("restart_verified")):
             retained_environment = document["services"]["backend"]["environment"]
             observed_environment = actual["backend"].get("Config", {}).get("Env") or []
@@ -6572,10 +6625,18 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 helper_ids.append(helper_document["Id"])
         with control.operation("recreate-services", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                                       **operator_probe_record}) as operation:
+            successor_actual = ({service: json.loads(docker_text("inspect", identifier))[0]
+                for service, identifier in ids.items()} if drained_successor else actual)
             leased_recovery_context = _retained_recovery_context(
                 control, previous, document, fresh_state=fresh_state,
                 backend_id=actual["backend"].get("Id"),
+                drained_successor=drained_successor_pins, actual=successor_actual,
             )
+            if drained_successor:
+                if (not isinstance(leased_recovery_context, DrainedSuccessorContext)
+                        or leased_recovery_context.witness != recovery_context.witness):
+                    raise BuildControlError("Drained-successor proof changed under recreate lease")
+                operation["receipt"]["drained_successor"] = recovery_context.witness
             if native_recovery_context != leased_recovery_context:
                 raise BuildControlError("Retained container recovery capability changed before recreation")
             if native_init_successor:
@@ -6618,7 +6679,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 ]
             if post_build_generation is not None:
                 operation["receipt"]["post_build_generation"] = post_build_generation
-            if post_build_generation is not None or native_init_successor:
+            if post_build_generation is not None or native_init_successor or drained_successor:
                 # The retained snapshot was observed before this lease. Pin
                 # both application services again under the recreate lease;
                 # the post-build proof must never authorize stop/rm from a

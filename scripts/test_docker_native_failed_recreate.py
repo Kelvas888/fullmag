@@ -546,6 +546,16 @@ class CompletedRecreationContinuationTests(unittest.TestCase):
             original=getattr(self.args,key);setattr(self.args,key,value)
             with self.subTest(key=key),self.assertRaisesRegex(dev.BuildControlError,'paired exact pins'):self.invoke()
             setattr(self.args,key,original)
+    def test_authenticated_drained_successor_continues_without_failed_owner_authority(self):
+        from docker_volume_drained_successor import DrainedSuccessorContext
+        self.recovery = DrainedSuccessorContext({"proof_sha256": "d" * 64})
+        context = self.invoke()
+        self.assertEqual(context["reuse_state"]["state"], self.state)
+        self.assertNotIn("native_restart_metadata", context)
+        self.assertNotIn("previous_config_sha256", context)
+        self.assertNotIn("recovery_environment", context)
+        self.control.write.assert_not_called()
+
     def test_missing_failed_owner_context_refuses(self):
         self.recovery={}
         with self.assertRaisesRegex(dev.BuildControlError,'failed-owner restart proof'):self.invoke()
@@ -563,7 +573,17 @@ class CompletedRecreationContinuationTests(unittest.TestCase):
         # before Compose ps/inspect tries to find the deliberately removed IDs.
         import types,docker_dev as cli,docker_build_control as build
         self.args.repo_root=self.root;self.args.source_root=self.selected;self.args.port=3202
-        self.control.read.side_effect=[self.previous,self.document]
+        def read_control(relative, *, optional=False):
+            records = {
+                'development/attempts/' + self.args.attempt + '/terminal.json': self.previous,
+                'development/attempts/' + self.args.attempt + '/compose.json': self.document,
+            }
+            if relative in records:
+                return records[relative]
+            if optional:
+                return None
+            raise AssertionError('unexpected required control read: ' + relative)
+        self.control.read.side_effect=read_control
         with patch.object(cli,'_require_native_windows'),patch.object(cli,'_select_source',return_value=(self.selected,{'runtime_root':self.root})),patch.object(cli,'_compose_identity',return_value={}),patch.object(build,'toolchain_configuration',return_value={'services':{'fem-gpu-toolchain':{'build':{'args':{'FULLMAG_CUDA_BASE_IMAGE':'fixture'}}}}}),patch.object(dev,'BuildControl',return_value=self.control),patch.object(dev,'_operator_probe_record_from_retained',return_value={}),patch.object(dev,'_completed_recreation_start_context',return_value={'reuse_state':{'state':self.state},**self.recovery}),patch.object(dev,'start',return_value='continued') as start,patch.object(dev,'compose_capture') as compose:
             result=dev._retained_operation(self.args,recreate_services=True)
         self.assertEqual(result,'continued');start.assert_called_once();compose.assert_not_called();self.assertEqual(self.args.gpu_access,'required')
@@ -718,6 +738,269 @@ class CompletedRemovalNativeProofTests(unittest.TestCase):
         context=self.invoke()
         self.assertEqual(context['native_restart_metadata']['container_id'],BACKEND_ID)
         self.control.write.assert_not_called()
+
+
+class DrainedSuccessorDispatchTests(unittest.TestCase):
+    def test_explicit_successor_validates_current_drain_without_replaying_old_failure(self):
+        import docker_volume_drained_successor as successor
+        context = successor.DrainedSuccessorContext({"terminal_sha256": "d" * 64})
+        control, previous, document, observed = Mock(), {}, {}, {"backend": {}, "frontend": {}}
+        pins = ("/opt/fullmag/control/verification/proof.json", "a" * 64)
+        with patch.object(successor, "retained_context", return_value=context) as validate, \
+                patch.object(dev, "_native_failed_stop_recovery_context") as legacy:
+            actual = dev._retained_recovery_context(control, previous, document, fresh_state=False,
+                actual=observed, drained_successor=pins)
+        self.assertIs(actual, context)
+        validate.assert_called_once_with(control, previous, document, observed, *pins,
+                                         removed_container_proof=None)
+        legacy.assert_not_called()
+        self.assertEqual(dict(actual), {})
+
+    def test_successor_never_authorizes_fresh_storage(self):
+        import docker_volume_drained_successor as successor
+        with patch.object(successor, "retained_context") as validate:
+            with self.assertRaisesRegex(dev.BuildControlError, "retained storage"):
+                dev._retained_recovery_context(Mock(), {}, {}, fresh_state=True,
+                    drained_successor=("proof", "a" * 64), actual={})
+        validate.assert_not_called()
+
+
+class DrainedSuccessorProofTests(unittest.TestCase):
+    """Historical failure is superseded only by this exact later native drain."""
+
+    def setUp(self):
+        import copy
+        import docker_volume_drained_successor as successor
+        self.successor = successor
+        self.copy = copy.deepcopy
+        self.control = Mock(project="fullmag-worktree-test", volume="test-control")
+        self.document = {"name": self.control.project, "services": {
+            "backend": {"image": IMAGE_ID}, "frontend": {"image": IMAGE_ID}}}
+        self.config_sha = self.sha(dev.canonical(self.document))
+        self.previous = {"attempt": "1" * 32, "state": "succeeded",
+            "compose_project": self.control.project, "config_sha256": self.config_sha,
+            "state_root": "/state", "inputs": {"source_root": "/checkout", "image_id": IMAGE_ID},
+            "backend_container": BACKEND_ID, "frontend_container": "f" * 64}
+        self.actual = {}
+        for service, identifier, exit_code in [("backend", BACKEND_ID, 0), ("frontend", "f" * 64, 1)]:
+            self.actual[service] = {"Id": identifier, "Image": IMAGE_ID, "Mounts": [],
+                "HostConfig": {}, "Config": {"Labels": {"com.docker.compose.project": self.control.project,
+                    "com.docker.compose.service": service}},
+                "State": {"Running": False, "OOMKilled": False, "Status": "exited", "ExitCode": exit_code,
+                    "StartedAt": "new-start", "FinishedAt": "new-finish"}}
+        ready = ready_owner()
+        ready["owner_token"] = "11111111-1111-4111-8111-111111111111"
+        ready["process_start_token"] = "22222222-2222-4222-8222-222222222222"
+        drained = self.copy(ready)
+        drained["state"] = "drained"
+        drained["children"] = [{**child, "status": "exited_success"} for child in drained["children"]]
+        self.terminal = {"schema": "fullmag.docker-process-tree.v1", "state": "drained",
+            "service_owner": ready, "terminal_service_owner": drained, "api_exit_code": 0}
+        self.records = {}
+        self.put("runtime-control/runtime-service/process-tree.json", self.terminal)
+        self.put("runtime-control/runtime-services/OWNER.json", drained)
+        self.put("runtime-control/runtime-services/docker-client-" + ready["owner_token"] + ".json", ready)
+        old_probe = after_ready_native_probe()
+        self.journal = {"schema": "fullmag.stop-failed-admission.v1", "state": "stopped-confirmed",
+            "failure_kind": "native-after-ready-failure", "container_id": BACKEND_ID, "image_id": IMAGE_ID,
+            "failure_receipt": {"sha256": "d" * 64, "receipt": old_probe["process_receipt"]},
+            "retained_ready_owner": old_probe["process_receipt"]["service_owner"],
+            "native_failure_probe": old_probe, "container_state": {"started_at": "old-start"}}
+        journal_sha = self.put("verification/stop-failed-" + BACKEND_ID + ".json", self.journal)
+        self.stop_root = "iteration/attempts/" + "2" * 32
+        snapshot_sha = self.put(self.stop_root + "/idle-stop-containers.json", self.actual)
+        self.put(self.stop_root + "/idle-preflight.json", {"status": "ok", "active_session": False})
+        self.drain = {"schema": "fullmag.docker-idle-restart-drain.v1",
+            "backend_container_id": BACKEND_ID, "process_receipt": self.terminal,
+            "process_receipt_sha256": self.sha(self.records["runtime-control/runtime-service/process-tree.json"])}
+        self.put(self.stop_root + "/backend-drain.json", self.drain)
+        self.stop = {"schema": "fullmag.docker-build-operation.v1", "phase": "iteration",
+            "state": "succeeded", "attempt": "2" * 32, "compose_project": self.control.project,
+            "control_volume": self.control.volume, "inputs": {"attempt": self.previous["attempt"],
+                "config_sha256": self.config_sha}, "backend_container": BACKEND_ID,
+            "frontend_container": "f" * 64, "idle_backend_stopped": True,
+            "config_sha256": self.config_sha, "idle_stop_containers_sha256": snapshot_sha}
+        self.request = {"schema": "fullmag.drained-successor-proof.v1",
+            "stop": {"attempt": "2" * 32, "terminal_sha256": "0" * 64},
+            "journal_sha256": journal_sha, "native_config_sha256": "c" * 64}
+        self.proof = "/opt/fullmag/control/verification/drained-proof.json"
+        self.refresh_stop()
+
+    @staticmethod
+    def sha(raw):
+        return hashlib.sha256(raw).hexdigest()
+
+    def put(self, path, value):
+        raw = dev.canonical(value)
+        self.records[path] = raw
+        return self.sha(raw)
+
+    def refresh_stop(self):
+        sha = self.put(self.stop_root + "/terminal.json", self.stop)
+        self.put(self.stop_root + "/receipt.json", self.stop)
+        self.request["stop"]["terminal_sha256"] = sha
+        self.proof_sha = self.put("verification/drained-proof.json", self.request)
+
+    def invoke(self, *, removed=None):
+        def read(_control, path, **kwargs):
+            if path not in self.records:
+                raise dev.BuildControlError("missing test record: " + path)
+            return self.records[path]
+        with patch.object(self.successor, "_control_bytes", side_effect=read), \
+                patch.object(self.successor, "_ledger_observation", return_value="e" * 64), \
+                patch.object(dev, "_read_runtime_config_digest", return_value="c" * 64):
+            return self.successor.retained_context(self.control, self.previous, self.document,
+                self.actual, self.proof, self.proof_sha, removed_container_proof=removed)
+
+    def test_exact_ordinary_drain_preserves_failed_frontend_without_authority(self):
+        context = self.invoke()
+        self.assertIsInstance(context, self.successor.DrainedSuccessorContext)
+        self.assertEqual(dict(context), {})
+        self.assertEqual(context.witness["containers"]["frontend"]["exit_code"], 1)
+        witness = context.witness
+        witness["terminal_sha256"] = "changed"
+        self.assertNotEqual(context.witness["terminal_sha256"], "changed")
+        self.control.write.assert_not_called()
+
+    def test_rejects_changed_or_missing_proof_and_closed_fields(self):
+        for mutation in ("digest", "unknown", "no-config", "path"):
+            with self.subTest(mutation=mutation):
+                original = self.copy(self.request)
+                old_sha, old_path = self.proof_sha, self.proof
+                if mutation == "digest": self.proof_sha = "9" * 64
+                if mutation == "unknown": self.request["unexpected"] = True; self.refresh_stop()
+                if mutation == "no-config": self.request.pop("native_config_sha256"); self.refresh_stop()
+                if mutation == "path": self.proof = "/opt/fullmag/control/verification/../drained-proof.json"
+                with self.assertRaises((dev.BuildControlError, KeyError)):
+                    self.invoke()
+                self.request = original
+                self.proof, self.proof_sha = old_path, old_sha
+                self.refresh_stop()
+
+    def test_rejects_stop_without_success_idle_observation_or_snapshot(self):
+        for field, value in (("state", "running"), ("idle_backend_stopped", False),
+                             ("config_sha256", "9" * 64), ("idle_stop_containers_sha256", None)):
+            with self.subTest(field=field):
+                old = self.stop[field]
+                self.stop[field] = value; self.refresh_stop()
+                with self.assertRaises(dev.BuildControlError): self.invoke()
+                self.stop[field] = old; self.refresh_stop()
+        self.put(self.stop_root + "/idle-preflight.json", {"status": "ok", "active_session": True})
+        with self.assertRaisesRegex(dev.BuildControlError, "inactive session"):
+            self.invoke()
+
+    def test_rejects_restarted_oom_running_or_nonzero_backend(self):
+        for field, value in (("StartedAt", "another"), ("FinishedAt", "another"), ("Running", True),
+                             ("OOMKilled", True), ("ExitCode", 1)):
+            with self.subTest(field=field):
+                old = self.actual["backend"]["State"][field]
+                self.actual["backend"]["State"][field] = value
+                with self.assertRaises(dev.BuildControlError): self.invoke()
+                self.actual["backend"]["State"][field] = old
+
+    def test_rejects_changed_current_drain_owner_ready_pin_and_native_config(self):
+        mutations = [
+            ("runtime-control/runtime-service/process-tree.json", {**self.terminal, "state": "shutdown_unknown"}),
+            ("runtime-control/runtime-services/OWNER.json", {**self.terminal["terminal_service_owner"], "state": "failed"}),
+            ("runtime-control/runtime-services/docker-client-" + self.terminal["service_owner"]["owner_token"] + ".json",
+             {**self.terminal["service_owner"], "pid": 999}),
+        ]
+        for path, value in mutations:
+            with self.subTest(path=path):
+                old = self.records[path]
+                self.put(path, value)
+                with self.assertRaises(dev.BuildControlError): self.invoke()
+                self.records[path] = old
+        self.request["native_config_sha256"] = "a" * 64; self.refresh_stop()
+        with self.assertRaisesRegex(dev.BuildControlError, "configuration"):
+            self.invoke()
+
+    def test_rejects_old_incarnation_even_with_consistent_new_request_hash(self):
+        self.journal["container_state"]["started_at"] = "new-start"
+        self.request["journal_sha256"] = self.put("verification/stop-failed-" + BACKEND_ID + ".json", self.journal)
+        self.refresh_stop()
+        with self.assertRaisesRegex(dev.BuildControlError, "later container incarnation"):
+            self.invoke()
+
+    def test_completed_recreation_requires_exact_drained_snapshot(self):
+        state = self.actual["backend"]["State"]
+        proof = {"schema": "fullmag.docker-removed-recreation-container.v1",
+            "container_id": BACKEND_ID, "frontend_container": "f" * 64, "image_id": IMAGE_ID,
+            "container_state": {"id": BACKEND_ID, "image": IMAGE_ID, "started_at": state["StartedAt"],
+                "finished_at": state["FinishedAt"], "exit_code": 0}}
+        context = self.invoke(removed=proof)
+        self.assertEqual(context.witness, self.invoke().witness)
+        for field in ("container_id", "frontend_container", "image_id", "container_state"):
+            with self.subTest(field=field):
+                changed = {**proof, field: None}
+                with self.assertRaisesRegex(dev.BuildControlError, "snapshot"):
+                    self.invoke(removed=changed)
+
+
+    def test_ledger_read_is_bound_readonly_and_rejects_active_reservations(self):
+        import docker_group_ledger as ledger
+        expected = {"volume_name": "fullmag-dev-ledger-test", "environment": {"LEDGER_BINDING": "test"}}
+        actual = self.copy(self.actual)
+        actual["backend"]["Mounts"] = [{"Destination": ledger.MOUNT_TARGET, "Type": "volume",
+            "Name": expected["volume_name"], "Driver": "local", "RW": True}]
+        actual["backend"]["Config"]["Env"] = ["LEDGER_BINDING=test"]
+        self.control.helper_args.return_value = ["docker", "run", "--entrypoint", "/bin/bash", "image"]
+        for state in ("released", "active", "unknown"):
+            with self.subTest(state=state), \
+                    patch.object(ledger, "retained_profile", return_value=expected), \
+                    patch.object(self.successor, "bounded_capture",
+                        return_value=CompletedProcess([], 0, json.dumps({"schema_version": "host_resource_ledger.v4", "reservations": [{"state": state}]}).encode(), b"")) as capture:
+                if state == "released":
+                    result = self.successor._ledger_observation(self.control, self.document, actual)
+                    self.assertRegex(result, r"^[0-9a-f]{64}$")
+                    self.assertIn("type=volume,src=fullmag-dev-ledger-test,dst=/ledger,readonly,volume-nocopy",
+                                  capture.call_args.args[0])
+                    self.assertIn("flock -n 9", self.control.helper_args.call_args.args[0])
+                else:
+                    with self.assertRaisesRegex(dev.BuildControlError, "reservation"):
+                        self.successor._ledger_observation(self.control, self.document, actual)
+
+    def test_ledger_foreign_mount_or_failed_reader_cannot_authorize_drain(self):
+        import docker_group_ledger as ledger
+        expected = {"volume_name": "fullmag-dev-ledger-test", "environment": {}}
+        with patch.object(ledger, "retained_profile", return_value=expected), \
+                patch.object(self.successor, "bounded_capture") as capture:
+            with self.assertRaisesRegex(dev.BuildControlError, "ledger mount"):
+                self.successor._ledger_observation(self.control, self.document, self.actual)
+            capture.assert_not_called()
+        actual = self.copy(self.actual)
+        actual["backend"]["Mounts"] = [{"Destination": ledger.MOUNT_TARGET, "Type": "volume",
+            "Name": expected["volume_name"], "Driver": "local", "RW": True}]
+        self.control.helper_args.return_value = ["docker", "run", "--entrypoint", "/bin/bash", "image"]
+        with patch.object(ledger, "retained_profile", return_value=expected), \
+                patch.object(self.successor, "bounded_capture", return_value=CompletedProcess([], 1, b"", b"locked")):
+            with self.assertRaisesRegex(dev.BuildControlError, "writer active"):
+                self.successor._ledger_observation(self.control, self.document, actual)
+
+
+
+    def test_ledger_unknown_schema_or_non_object_reservations_are_refused(self):
+        import docker_group_ledger as ledger
+        expected = {"volume_name": "fullmag-dev-ledger-test", "environment": {}}
+        actual = self.copy(self.actual)
+        actual["backend"]["Mounts"] = [{"Destination": ledger.MOUNT_TARGET, "Type": "volume",
+            "Name": expected["volume_name"], "Driver": "local", "RW": True}]
+        self.control.helper_args.side_effect = lambda script: [
+            "docker", "run", "--entrypoint", "/bin/bash", "image"]
+        cases = [
+            {"schema_version": "host_resource_ledger.v3", "reservations": []},
+            {"reservations": []},
+            {"schema_version": "host_resource_ledger.v4", "reservations": {}},
+            {"schema_version": "host_resource_ledger.v4", "reservations": [None]},
+            [],
+        ]
+        for value in cases:
+            with self.subTest(value=value), \
+                    patch.object(ledger, "retained_profile", return_value=expected), \
+                    patch.object(self.successor, "bounded_capture",
+                        return_value=CompletedProcess([], 0, json.dumps(value).encode(), b"")):
+                with self.assertRaises(dev.BuildControlError):
+                    self.successor._ledger_observation(self.control, self.document, actual)
 
 
 if __name__ == "__main__":

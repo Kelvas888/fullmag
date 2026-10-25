@@ -1,5 +1,17 @@
 # Anteny i transport — realizacja E0–E12, 11.10.2026
 
+## Bieżąca praca: wrapper i frontend WSL — 25.10.2026
+
+Zatwierdzona finalizacja 743a85 jest zakończona, stare wyniki zachowane.
+Przy przejściu do Universe ujawniono stale failed-stop journal po późniejszym
+poprawnym drain oraz Windows-only reader w frontend refresh. Backend po
+managed resume działa, lecz frontend odmówił startu; publiczny port 3203
+nie jest obecnie potwierdzony. Universe Solve nadal nie wykonano.
+Dokładny stan, scope i kontrole:
+[przegląd poprawki wrappera](2026-10-25-managed-drained-successor-wrapper-refresh.md).
+Poniższe checkpointy opisują wcześniejsze zakończone operacje.
+
+
 
 ## Aktualny checkpoint: recovery wykonane, API i inspekcja przywrócone — 25.10.2026
 

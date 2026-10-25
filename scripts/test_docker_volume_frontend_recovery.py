@@ -224,6 +224,7 @@ class LegacyFrontendRecoveryTests(unittest.TestCase):
 
         with mock.patch.object(build_control.subprocess, 'Popen', return_value=logger), \
              mock.patch.object(fullmag_storage, 'validate_path', return_value=Path('/state')), \
+             mock.patch.object(dev, '_session_host', return_value=windows_folder_host), \
              mock.patch.object(windows_folder_host, 'read_owned_regular', return_value=b'{"owner":"same"}'), \
              mock.patch.object(dev, '_retained_startup_enabled', return_value=False), \
              mock.patch.object(dev, 'docker_text', side_effect=text), \
