@@ -369,10 +369,17 @@ def _geometry_bounds(
         sx, sy, sz = geometry.size
         return (-sx / 2.0, -sy / 2.0, -sz / 2.0), (sx / 2.0, sy / 2.0, sz / 2.0)
     if isinstance(geometry, Cylinder):
-        d = 2.0 * geometry.radius
+        # Tight box of a cylinder along an arbitrary unit axis: per world
+        # axis, the cap disc spans r*sqrt(1 - a_i^2) and the axis h/2*|a_i|.
+        r = geometry.radius
+        half_height = geometry.height / 2.0
+        extents = tuple(
+            float(np.sqrt(r * r * (1.0 - a * a) + half_height * half_height * a * a))
+            for a in geometry.axis
+        )
         return (
-            (-d / 2.0, -d / 2.0, -geometry.height / 2.0),
-            (d / 2.0, d / 2.0, geometry.height / 2.0),
+            (-extents[0], -extents[1], -extents[2]),
+            (extents[0], extents[1], extents[2]),
         )
     if isinstance(geometry, SinWaveguide):
         half_length = geometry.length / 2.0
