@@ -191,6 +191,29 @@ pub(crate) fn atomic_write(dest: &Path, data: &[u8]) -> Result<()> {
     })
 }
 
+/// `atomic_write` whose parent-directory barrier is left to the caller, which
+/// must `sync_directory` that parent before relying on the publication. A
+/// batch of files in one directory then pays one barrier instead of one each.
+pub(crate) fn atomic_write_deferring_directory_barrier(dest: &Path, data: &[u8]) -> Result<()> {
+    let parent = dest
+        .parent()
+        .context("publication has no parent directory")?;
+    let temporary = parent.join(format!(".{}.part", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = File::create_new(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        consume_publication_failpoint()?;
+        fs::rename(&temporary, dest).with_context(|| format!("publishing {}", dest.display()))
+    })();
+    if result.is_err() {
+        // Only our uniquely-owned unpublished staging file may be removed.
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Publish writer-owner metadata atomically without consuming data fault
 /// injection. The lock descriptor itself is never replaced by this function.
 pub(crate) fn atomic_write_owner(dest: &Path, data: &[u8]) -> Result<()> {
