@@ -644,3 +644,451 @@ nie doinstalowywano w żywym kontenerze. MPFR to osobna kolejna realizacja,
 nie cicha zamiana arytmetyki pod starym kontraktem. BuildKit CACHED,
 konwersje tie/subnormal i pełne21payloads/diagnostyki wymagają wykonania.
 Pełny zakres E0-E12 nadal aktywny; Universe1154 i UI NIEUKOŃCZONE.
+
+
+### GMP-only — przygotowanie i żywy build obrazu 25.10.2026
+
+Baza92aa30f2bccab3b1e350732dcbee8ff57c106203. WIP obejmuje pięć plików:
+CPP surface_rt0, CMakeLists FEM, Dockerfile fem-gpu, notę0950 i source-map.
+ExactArithmetic i Arithmetic::number pozostały bez zmian; zmieniono tylko
+aliasty na mpz_int/mpq_rational, dodano gmp.hpp i static_assert zgodnej
+szerokości limb. Decimal80/120, wszystkie limity i publiczna fizyka pozostają.
+CMake wymaga pkgconfiggmp pod MFEM. Dockerfile dodaje późny libgmp-dev oraz
+inline actual.system_packages dla GMP/Boost, zgodnie z istniejącym wzorcem
+inline augmentacji. NIE zmieniono write_dependency_versions.py: jego
+COPY przed heavydeps unieważniłby ich cache. Konsumenci manifestu dopuszczają
+addytywne pole; pełny hash manifestu zmienia tożsamość toolchaina.
+
+Niezależny read-only review nie znalazł blokera kodu/quotingu. Faktyczny
+validator wykrył, że DOC-ANCHOR komentowany w CMake/Dockerfile nie jest
+obsługiwanym symbolem. Poprawiono mapę na pkg_check_modules i prawdziwą
+kotwicę Markdown planned_contract. Focused validator następnie PASS;
+git diff --check PASS. Native kompilacja GMP i benchmark nadal NOT VERIFIED.
+Nie kompilowano testów jednostkowych.
+
+Uruchomiono RAZ przez just docker-dev-toolchain w WSL, grupa:
+fullmag-worktree-antenna-transport-e2e-20261011-5d5deadcd16e0fb1.
+Żywa sesja unified exec63195, attempt89af5ad8e20747b69d6af243d1d00772,
+image tagfullmag/fem-gpu-toolchain:inputs-9a33cf8b9e3fb5070384604c.
+Pliki receiptu/logu/configu w control volume:
+toolchain/attempts/89af5ad8e20747b69d6af243d1d00772/.
+BuildKit wykazał CACHED dla CUDA normalization, hypre, PETSc i innych kroków,
+lecz MFEM GPU oraz finalne apt/Python muszą być przebudowane. Postęp62/269
+MFEM przy około491s; proces jest żywy, bez terminalu. Nie ponawiać buildu po
+samym timeout obserwacji; polling TEJ SAMEJ sesji lub receiptu/logu.
+
+Porównano faktyczne args nowego compose.json i poprzedniego receiptu:
+CUDA86-real;86-virtual, hypre86, PETSc86, MFEM_BUILD_JOBS2, fast_compile0;
+identyczne. Baza Dockerfile HEAD SHA256
+df16f69a94f503c0fd17c2314badf9f527f562577b4ee2ef5d5fd4c8bd3391e3
+jest identyczna z wejściem poprzedniego udanego toolchaina. Aktualny plik:
+1eee591bce4c63012c85e58b8e367fba131843e8298cdee1274023055acec88a.
+Cały prefiks instrukcji do późnego GMP jest identyczny bajtowo. Brak cache
+MFEM nie wynika z naszej zmiany wcześniejszych instrukcji/args; przyczyny
+niedostępności rekordu cache nie ustalono. NIE deklarować pełnego cachehit.
+Nie zmieniać wejść Dockerfile/compose/writera w czasie tego buildu.
+
+Stary backend597e3116dda99f957d23bfc081c5464a111cdc17629122f98c5ad3af693bb8bf
+pozostaje uruchomiony z poprzednim zweryfikowanym obrazem/pakietem. Nie
+odtwarzano usług ani nie uruchamiano nowego Solve. Nowy toolchain_image_id
+zmienia cache_key w docker_backend_volume_cache.py197-227: nowy izolowany
+cache aplikacji, poprzedni zachowany. Nie obchodzić tej granicy zgodności.
+Pomiar obecnego /build:11536240KiB; D wolne38.4GiB (bez zmiany podczas
+pierwszych etapów obrazu); E nie jest obecnie widoczne w tej sesji hosta.
+Nie tworzono nowych plików ext4 ani katalogów danych na C/E.
+
+Prerejestracja kolejnej próby jest zachowana, ALE NIE WYSŁANA do API:
+run-surface-gmp-20261025-01; requestgmp-submit-request.json SHA256
+68b59c064523746a31c64605ffc7e6e7c398ff666e2dae3177e76a85962da3d8.
+Archiwum/study/catalog/assetty i fizyka identyczne z baseline453bb352... .
+compare-gmp-results.py wymaga wszystkich21payloads, pełnych diagnostyk,
+niezmienionych total/by_precision/maxraw/maxreducedbits i czasu<371.592043076s.
+Pliki w verification/surface-rt0-performance-20261025/ control volume.
+
+Następnie: zakończyć i sprawdzić TEN build obrazu, odczytać actual.system_packages
+oraz faktyczne wersje narzędzi; przygotować wrappery tej samej grupy; sprawdzić
+miejsce i brak aktywnych zadań przed managed stop-idle/odtworzeniem do nowego
+obrazu. Nie używać fresh_state, nie zmieniać storage i nie powtarzać Solve.
+Dopiero po nowym buildzie aplikacji zweryfikować ldd/NEEDED i wysłać
+przypięty request GMP. Nie deklarować Universe na podstawie małego benchmarku.
+Wyniki, snapshoty, cache, stare obrazy i userFMS zachowane; bez prune.
+Skill cleanup nadal brak. WIP nie został zacommitowany jako gotowy etap.
+Pełny zakres E0-E12 pozostaje aktywny; Universe/UI nadal nieukończone.
+
+
+### Odczyt zaakceptowanego wyniku — przygotowanie regresji 25.10.2026
+
+WIP runtime-control obejmuje study_inspection_integrity.rs i wyłącznie komentarz
+helpera w study.rs. Cold-read używa istniejącego
+validate_study_task_completion_for_snapshot z już zweryfikowanym accepted,
+wewnątrz tej samej read_transaction. Pozostają świeży immutable intent fence,
+kontrole lifecycle/attempt/epoch, manifestu, jedynego typed outputu i ProblemIR.
+CAS wskazany pinem nadal jest odczytywany z limitem i rehashowany; decode nadal
+sprawdza neutralną domkniętą paczkę i thin-view bounds. Usunięto jedynie drugi
+identyczny validate_accepted_inspection_bytes. Oczekiwana redukcja pełnych
+walidacji przy GET: trzy do dwóch; nie deklarujemy jednej ani cache globalnego.
+Niezależny przegląd faktycznego diffu: bez blokujących uwag źródłowych.
+Kompilacja aplikacji i rzeczywisty pomiar poprawki nadal NOT VERIFIED.
+
+Zachowano odpowiedź 200 starego API dla run-surface-exact-identities-20261025-01,
+bez Solve: exact-identities-accepted-metadata-before-reader-change.json,
+SHA256 d2fa79b335570213b12b6218f7f073f32d8e7c05f1308f9ddbe3036fffd0ebf6.
+ETag jest tym samym hashem w cudzysłowie. Odczyt21.473009362s podczas budowy
+MFEM ma rolę diagnostyczną, nie stanowi nowej bazy wydajności.
+
+W verification/surface-rt0-performance-20261025/ control volume przygotowano
+accepted-reader-regression.py, SHA256
+bb90fb4cd1c56daf2224c482f5f79eebf161f3478535a4f1e87dda39a34d7c8e,
+oraz accepted-reader-regression-preregistration.json. Składnia Python PASS;
+regresja NIE URUCHOMIONA na nowym runtime. Wymaga identycznych metadanych/ETag,
+SHA i długości Hraw/Vraw/Jlocalraw, jednostek A/m, V, A/m^2, 304 bez body,
+409 dla nieaktualnego attempt/epoch/package. Prerejestrowany próg Hraw:
+15.650546545808902s (90% wcześniejszych17.38949616200989s). Pomiar dopiero po
+nowym buildzie aplikacji i zakończeniu workerów kompilacji/symulacji.
+Nie zmieniać zachowanego CAS w celu testowania korupcji.
+
+Ta sama sesja63195 nadal żywa: ostatnia obserwacja MFEM122/269 przy1432.7s.
+Nie uruchomiono drugiej budowy, nowej symulacji ani browsera. Źródła Dockerfile
+pozostają zamrożone na czas operacji. Wyniki, cache i userFMS zachowane.
+Pełny Universe i wizualizacja UI nadal nieukończone; E0-E12 pozostaje aktywne.
+
+
+Przegląd źródłowy zmiany obrazu: po terminalu toolchaina właściwa sekwencja to
+just docker-dev-images, przypięty docker-dev-stop-idle, następnie
+przypięty docker-dev-recreate-volume z fresh_state=false. W
+scripts/docker_volume_dev.py _retained_operation sprawdza stare usługi i drain,
+a start ponownie rozwiązuje aktualny toolchain/runtime images. Nie używać
+image override ani nowego state root. Zachować w środowisku
+FULLMAG_SCRIPT_OUTPUT_DIRECTORY=examples: nowy Compose renderuje mount od nowa.
+Requested GPU policy i resolved access są odczytywane ze starej konfiguracji
+i ponownie sprawdzane; brak dowodu GPU nie upoważnia do fallbacku CPU.
+Przed wykonaniem ponownie sprawdzić aktualne piny development/config, aktywne
+zadania, storage i miejsce. W razie przerwanej obserwacji nowego startu użyć
+przypiętego resume-recreation, nie ponawiać usuwania usług. To przegląd źródeł,
+nie wykonana migracja. Sprawdzono również target CMake fullmag_fem: SHARED;
+prywatne linkowanie GMP należy do tej biblioteki, Rust linkuje ją jako dylib.
+Rzeczywiste NEEDED/ldd nadal wymagają nowego builda.
+
+
+Doprecyzowano regresję przed jej pierwszym wykonaniem: odpowiedź304 musi
+zachować ten sam ETag. Przygotowany comparator GMP parsuje rzeczywisty
+baseline453bb352... (22payloads, formatFMACLB01/FM-RT0-SURF-V1), lecz nie
+wykonano porównania nowej realizacji. Kontrola wymaga teraz także identycznego
+work każdego z14targetów, current_target i current_target_index, zamiast
+porównywać tylko sumy i by_precision. Wymaganie zaostrzono przed wysłaniem
+Solve; request SHA pozostaje68b59c064523746a31c64605ffc7e6e7c398ff666e2dae3177e76a85962da3d8.
+Comparator SHA2562eabfc162fe1a476dd0627786436f63736c6cf7f561c21f6a8a76381b04f38fe.
+Hashy sześciu wejść pilnuje gmp-pending-regression-inputs.json w control volume.
+GMP preregistration nadal submitted=false. Żywa sesja63195: MFEM133/269
+przy1718.0s; bez terminalu, bez ponownej budowy. Nie zmieniano Dockerfile
+ani źródeł aplikacji podczas tej obserwacji. Pozostaje build aplikacji,
+rzeczywisty parytet/czas GMP, odczyt API, pełny Universe oraz UI.
+
+
+### Diagnostyka obciążenia bez aktywnej sesji — 25.10.2026
+
+Podczas tej samej budowy MFEM (sesja63195, ostatnio154/269) API health pozostaje
+ok/active_session=false. Lista procesów backendu nie zawiera naukowego workera;
+są API, runtime-service oraz schedulery compute/preparation. Trzy pomiary po2s
+z /proc/stat dla tych samych inkarnacji wykazały okresowe koszty CPU:
+compute7.99/88.84/16.47%, preparation26.45/24.96/9.98%,
+runtime8.49/13.48/12.98% pojedynczego rdzenia. Raport
+verification/scheduler-idle-cpu-20261025/observed-idle.json w control volume,
+SHA25698f2093cdae8f701fbd3bcf67c7b0ab8d6690f0c8a583599962c542e12c42050.
+To diagnostyka przy równoległym BuildKit, nie izolowany benchmark ani dowód
+przyczyny procentów. /proc/<pid>/io nie występuje w tym kernelu; brak metryki
+szybkości odczytu, nie przypisywać jej wartości. WSL MemAvailable11777588kB,
+memory.events OOM0/OOMkill0; memory/io pressure avg10=0; D wolne41189953536B.
+Nie zwiększano limitów i nie zatrzymywano procesów.
+
+Przegląd źródeł i uruchomionego commita1b7cb42... potwierdza prefiltry terminal
+przed pełnym accepted snapshotem w scheduler.rs. Nie ma podstaw twierdzić,
+że każdy terminalrun ponownie hashuje1973 pliki CAS w każdym pollu.
+Potwierdzono jednak wielokrotne list_run_intents/read_run_intent w discovery,
+queue/readiness/resume oraz host.reconcile_task_cancellations. Każdy
+FmsRunIntent::validate kanonizuje i hashuje pełny RunSpec oraz sprawdza mapy
+assetów. W store18intentów, razem12871825B, największe około717kB każdy.
+Są to koszty metadanych, a nie naukowe obliczenie pola.
+
+Najwęższy kandydat dalszej optymalizacji to ponowne użycie zweryfikowanej
+obserwacji intentu TYLKO w jednym pollu discovery; rzeczywiste admission/resume
+musi zachować świeży odczyt, katalogi, host/store fence i launch permit. Bez
+cache między pollami, pomijania błędów terminalnej historii ani zmiany
+interwałów. Nie wdrożono tej zmiany. Najpierw kończymy istniejący build GMP
+i jego pomiar, aby nie mieszać efektu arytmetyki z inną zmianą obciążenia CPU.
+Przyczyna kosztu runtime-service nie została w tym przeglądzie ustalona.
+
+
+### Pełny Universe a limit materializacji widoków — 25.10.2026
+
+Przegląd źródeł i prawdziwego baseline453bb352... wykazał bramkę przed UI:
+inspection_field_provider::from_closed naliczał16*sumę22payloadów+2MiB,
+choć tylko9payloadów tworzy geometrię/wartości V/J/H. LoadedInspection jest
+konsumowany, jego evidence/certificate/preimages/per-A arrays po utworzeniu
+widoków są zwalniane; VerifiedInspectionFields przechowuje4owned field views.
+insert osobno liczy rzeczywiste retained capacities, a caller/cache zachowują
+limit128MiB. Thin metadata64KiB nie obejmuje tablic per-target; prawdziwy
+mały widok ma13326B. Native evidence128MiB, manifest16MiB i bundle512MiB
+mają osobne limity; mniejszy budget konkretnego full-Universe claim nadal
+wymaga sprawdzenia. 22payloady nie mnożą się przez liczbętargetów.
+
+Rzeczywisty mały bundle6873467B, suma payloadów6859687B; direct_evidence55324B
+na14targetów, pojedyncze rows3761-3777B. Ekstrapolacja do1154 wskazuje kilka
+MiB nowych diagnostyk. W starym oszacowaniu payloadsum>8257536B przekraczał
+limit128MiB; to prawdopodobny kolejny blocker pełnego Universe po Solve,
+nie zmierzony wynik pełnego Universe.
+
+Zastosowano WIP WYŁĄCZNIE naliczania w kanonicznym providerze, dla ścieżek
+live i accepted: suma Vec::capacity wszystkich wejściowych payloadów raz
++16*suma długości9projektowanych payloadów+2MiB. Dziewięć kluczy:
+vertex_xyz, stable_vertex_ids, cells, v_raw, j_local_raw, j_center_raw,
+sample_xyz, sample_cells, h_raw. Wszystkie checked arithmetic, limit128MiB,
+pełna walidacja closure/diagnostyk i końcowe retained/cache gates pozostają.
+Nie zmieniono danych ani jakości siatki. Jest to oszacowanie admission dla
+materializacji, nie allocator hard cap ani pomiar RSS całego loadera.
+
+Raport field-view-admission-baseline-analysis.json w control volume,
+SHA2561abe0fe456daa9c36867a4894bf2156c469c477f455d3fdef56313c5f6889d5e:
+projektowane długości774176B, stary length-based bound111852144B,
+nowy length-based bound21343655B. Analiza Python mierzy długości serializacji,
+nie rzeczywiste capacities Rust. Nie konstruowano fikcyjnych scientific payloads.
+Diff check PASS; kompilacja, canonical field API i pełny Universe nadal
+NOT VERIFIED. WIP nie jest ukończonym etapem. Nie kompilowano unit tests.
+Ta sama budowa63195 nadal żywa: MFEM216/269 przy3155.3s; bez nowegoSolve.
+
+Porównanie wszystkich16wejść toolchaina zapisane jako
+toolchain-cache-input-comparison.json SHA256
+e9f3eb9074920507f57787084bb6d91236d2adc7a4079a15223e008f33b6e4f0.
+Różni się tylkoDockerfile; args/targetpozostałepliki identyczne. Poprzedni
+obraz faktycznie zbudował attempt ec4ba463986742e883c748b0e9c762e2;
+88f1f92115b24651a160f7e7e2baa85d był cachehit obrazu (log0B), nie osobnym
+buildemMFEM. Przyczyna braku cache warstwy nadal nieustalona. Odczyt builderów
+pokazuje WSLdefault/docker i Windowsdesktop-linux/docker; dodatkowy
+fullmag-windows/docker-container nie jest obecnie wybrany. Nie ma dowodu,
+że zmiana buildera była przyczyną. Nie zmieniano konfiguracji ani nieprunowano.
+
+
+### Odtworzenie accepted wyniku z ekranu startowego — RED i WIP 25.10.2026
+
+Audyt istniejącej drogi wskazał eksport historyczny profile=solved z accepted_run,
+następnie import restore_mode=visualization_only. projects/open sam nie
+aktywuje historycznej obserwacji. Istniejący smoke_antenna_artifact_fields.py
+zaczyna od legacy stage artifact_refs i może odmówić przed dotarciem do
+accepted CAS provider; właściwa regresja ma zaczynać od canonical
+/data/fields?stage_id=<immutable Study step> i locator pins.
+
+Zidentyfikowano i rzeczywiście odtworzono brak cold-open: historyczny eksport
+wymagał current workspace w routerze oraz core, ZANIM wybierał accepted source.
+Publiczny GET run-surface-exact-identities-20261025-01: catalog_revision310,
+jeden task Succeeded, task24e0507.../attempt326389.../epoch1. Katalog artefaktów
+z właściwego store ma revision1. POST exports z dokładnymi pinami zwrócił404
+w0.013740742s: no active local live workspace. Report
+accepted-export-idle-before-report.json, body
+accepted-export-idle-before-error.json (172B, SHA256
+3b7f4025392bbcadf8f87ac4d7e97bf2a07d6f75d7651e4ba54a812cb1d52340),
+request accepted-export-idle-request.json i obydwa katalogi zachowane w
+verification/surface-rt0-performance-20261025/. Nie wysłano importu ani Solve.
+Sam healthactive_sessionfalse nie dowodził tego błędu; dowodem jest odpowiedź404.
+
+WIP naprawia tylko dwa miejsca: router_v2/handlers/persistence/session.rs
+wybiera capture_optional_current_live_request_context wyłącznie dla
+accepted_run, zwykły eksport nadal wymaga bieżącego kontekstu. Core
+session_persistence.rs::export_session_with_context najpierw wybiera
+historyczny snapshot/epoch/skrypt albo bieżący snapshot; session_id i domyślna
+nazwa pochodzą z wybranego snapshotu, nie z obcego current. Zachowano transition
+lock, ograniczenie solved-download-only, wszystkie exact catalog pins,
+all-tasks-Succeeded, walidację closure/źródeł i rewalidację current scope,
+gdy workspace istnieje. Nie zmieniano middleware, formatu, endpointów ani
+mechanizmu importu. Niezależny source-review faktycznego diffu: bez blockerów;
+typ tuple i partial move req.name zgodne. Kompilacja/runtime NOT VERIFIED.
+
+Uwaga o skutkach: historyczny eksport nie uruchamia workera i nie publikuje
+current_live_state, lecz istniejący pack zapisuje manifesty w skonfigurowanym
+współdzielonym command-journal store; commit_session aktualizuje tam CURRENT
+przez nową immutable generation. Nie jest to prywatny scratch ani całkowicie
+bezstanowy odczyt. To wcześniejsze zachowanie exportu, nie nowość patcha.
+W odczytanych ścieżkach nie znaleziono API-startowego odtwarzania current
+workspace z tego wskaźnika; imported evidence czyta swój prywatny root.
+
+Po normalnym app buildzie i pomiarze GMP: ordinary export z current=None ma
+nadal404; historyczny dokładnie przypięty export ma200 bez Solve/aktywacji;
+błędne rewizje mają409. Dopiero potem importvisualization_only i sprawdzenie
+catalogfields/quantities oraz meta/vector/topology dla V_electric/J_charge/H_ant,
+z nowym x-fullmag-session-scope i exact stage/carrier/revision/generation.
+Dla H użyć locatorowego scope full, nie umownego airbox. Import ma stan
+completed/is_busyfalse/can_accept_commandsfalse i resetuje queue/replay;
+nie uruchamia main.py. Weryfikacja stale scope i niezmienionego current podczas
+historycznego eksportu nadal obowiązuje. Oryginalny userFMS pozostaje nietknięty.
+
+Osobny source-review naliczania from_closed potwierdził wszystkie9kluczy,
+przeniesienie wartości/carrier Arc bez sidecars i brak ukrytej alokacji zależnej
+od direct_evidence. 16x ma margines dla 400B wejścia/cell i48B/Htarget plus
+osobnej topologii. Nie jest to formalny peak całego loadera; pełny API test
+pozostaje wymagany. Wszystkie trzy WIP fragmenty wymagają normalnego appbuilda;
+nie kompilowano unit tests. Ta sama budowa toolchain63195: ostatnio MFEM228/269.
+
+
+Doprecyzowanie źródła regresji eksportu: ręcznie zamrożony run-surface-exact-
+identities-20261025-01 ma parameters wyłącznie fullmag.accepted_run_start,
+bez live_workspace. Jego404 wykazało precondition routera, ale NIE uprawnia
+do oczekiwania poprawnego eksportuFMS z wymyśloną historią sesji. Nie dopisano
+metadanych i nie zmieniono żadnego accepted intentu.
+
+Pozytywnym źródłem jest oryginalny run-live-255fa587f4084d187d7e690f4d75076a4889fcf685a044ee02e4e8486a06b2da,
+project-live-6fa2f6a713ca29e1da4078b34e27fa5d8c2c6109f69e788afd7cfe188ca92a95.
+Rzeczywisty publiczny katalog579, artifactcatalog1, task575d7ffb... Succeeded,
+attempt37daccd7aa964bc88f6143ad9613ba06/epoch2. Parametry zawierają source_session
+docker-startup-6cc6f209f94f3d014a3aedfc806b0670a206725a395b62bd953c394bca22094b,
+session_epoch1, scene_revision1; definition.scene.scene.name to
+fem_antenna_closed_loop_surface_benchmark. Ten poprawnie zakotwiczony export
+RÓWNIEŻ zwrócił404/noactiveworkspace (0.004361414s, ten sam172Bbodyhash).
+Report/request/catalogs mają prefix accepted-export-live-* w controlvolume.
+To właściwy RED dla naprawy cold-open. Wcześniejszy ręczny benchmark pozostaje
+przypadkiem arytmetyki/raw accepted reads, nie źródłem sfabrykowanego liveFMS.
+
+Przygotowano, lecz NIE uruchomiono accepted-export-idle-regression.py,
+SHA25616b310b27531c6616d656ee6071b0f68f974752728539305d5725c5320af2aab,
+i jego preregistration. Po nowym appbuildzie i końcu GMPworker kontroluje
+ordinary404 przed/po, fresh public task/attempt/epoch,409stale obu rewizji,
+200historycznego exportu/zgodny session_id/profile/rozmiarbase64 oraz health
+bez aktywacji. Zapisze archiveaccepted-export-idle-after.fms w controlvolume.
+Import i Solve nie są częścią tego skryptu. Nazwa przy unrelatedcurrent,
+stale scope i pełne import/data-plane nadal osobno wymagane. SkładniaPython
+PASS; runtimeNOTVERIFIED. Ta sama budowa63195 doszła doMFEM255/269.
+
+
+Stan dalszej obserwacji tej samej sesji63195: MFEM CUDA ukończył269/269,
+linkowanie i instalację Release około4317s etapu24. Następnie hypreCPU
+ukończył631/631 (DONE201.0s, etap31). Obraz nadal nie ma terminalu: trwa
+PETScCPU w etapie33, konfiguracja complete, jawne --with-cuda=0 i
+--with-precision=double; kompilacja kolejnych modułów postępuje. Nie
+przerwano ani nie ponowiono buildu. Pomiar D free41187766272B.
+
+Skrypt accepted-export-idle-regression.py (SHA256
+16b310b27531c6616d656ee6071b0f68f974752728539305d5725c5320af2aab)
+i preregistration są przygotowane w control volume; NIE wykonane na nowym
+runtime. Służą oryginalnemu run-live255fa... z realną historią live,
+nie zamrożonemu benchmarkowi bez live_workspace. Usunięto też wyłącznie
+helper current_session_id osierocony przez poprawkę eksportu; globalny
+word-search potwierdził brak jego konsumentów (pozostałe dwa wystąpienia
+w main.rs są lokalną zmienną). Diffcheck PASS. Nadal11trackedWIPpliki,
+userFMSnietknięty, bez commita niezweryfikowanego etapu i bez unitcompile.
+
+
+### Zakończenie toolchaina i kontrolowane przełączenie — 25.10.2026
+
+Ta sama obserwowana operacja63195 zakończyła się kodem0. Toolchain attempt
+89af5ad8e20747b69d6af243d1d00772 ma terminal succeeded, immutable image
+sha256:5bf6b247a3e479bc212a28076e7416988884ee67395d927d3615af19cc920cc7.
+GMP libgmp-dev2:6.2.1+dfsg-3ubuntu1 zainstalowano po istniejących ciężkich
+warstwach. Rzeczywista wersja z manifestu nowego runtime nadal do odczytu.
+Zarządzane docker-dev-images zakończyło się kodem0: image-dev attempt
+a1db071269184affbdbc4234c34b5b88 -> sha256:d7af9b25c9dad7fc6d08c0d4e97befe43489fc49eab94bbf94835f7f9f998901;
+image-backend attempt00028906ebbd45b4bbf589ecdb72d29c ->
+sha256:04d4e77d469461c3a4f7f25b677bb03a8ade7b30b364883dd6aec66e295a891e.
+
+Przed stopem rzeczywisty healthok/active_sessionfalse; Compose/config9c648952...
+i development2c5c5be0... nadal zgodne, Dfree>32GiB. Przypięte
+just docker-dev-stop-idle zakończyło się kodem0, iteration
+18c8f3259677433e8f26967b3976028e succeeded. Zachowany native drain i oba
+zatrzymane kontenery. Następny krok: recreate-volume z fresh_state=false,
+bez skryptu, z grantem procesu FULLMAG_SCRIPT_OUTPUT_DIRECTORY=examples.
+Nie usuwamy wolumenów, wyników, logów ani obrazów. Stary cache/ostatni pakiet
+są potrzebne do rollbacku; nowy cache wynika z rzeczywistej zmiany toolchaina.
+Brak ogólnego GC/quota nie został rozwiązany przez tę operację.
+
+Przegląd skryptu canonical field check wykrył brak przypięcia pliku FMS
+przed jedynym importem. Technical script w control volume poprawiono tak,
+aby przed markerem/POST wymagał passed export receipt, exact SHA/bytes/nazwy
+oraz bounded odczytu manifest/session.json i project/current_live_snapshot.json
+ze zgodnym accepted run/source session. Nowy SHA256
+658e4eedf93ee78eda0138de70e39f33152e9f65e4bf253c18d7294042ca738f,
+16017B; in-memory compile PASS, bez wykonania API/import/Solve. Źródła
+potwierdzają, że immutable Study step jest właściwym canonical stage_id.
+GMP parytet, API cold-open, full Universe i browser/WebGL nadal NOT VERIFIED.
+
+
+### Potwierdzone wykonanie GMP, odczytu i eksportu — 25.10.2026
+
+Poniższy checkpoint aktualizuje wcześniejsze statusy oczekujące; nie zmienia
+historii wykonania ani kwalifikacji całego E0–E12.
+
+Zarządzany build aplikacji `d30549fadeb14aadb517a0a491ca50b0` zakończył się
+kodem 0, podobnie jak zachowujące dane odtworzenie usług
+`bc95c3b4f6e240bb88379224f634bec7`. Backend
+`5ec8eb6671b2a51040521d7cc4f2c5f6c923af79ddc9f5efc35ccb9eb6fa6bb2`
+używa obrazu `04d4e77d469461c3a4f7f25b677bb03a8ade7b30b364883dd6aec66e295a891e`,
+konfiguracji `832e7f23ef586f21fbb8bd704f19e5e2c2c0aae93ba3e46f5aa57980d2e42c72`
+i snapshotu `d9e981ec02ce2b2480662d0a3b0918a52688c378271080e55a068d4887181c72`.
+Skompilowany HEAD to `92aa30f2bccab3b1e350732dcbee8ff57c106203` z przypiętymi
+zmianami roboczymi. Biblioteka FEM ma SHA256
+`a9aa45cdc5fc2a7391542184756637b2e1eebee1f155b42b217f1625d1218ceb`,
+NEEDED `libgmp.so.10`, bez brakujących zależności. GMP wynosi
+`2:6.2.1+dfsg-3ubuntu1`, Boost `1.74.0.3ubuntu7`, rustc
+`1.101.0-nightly (12433c307 2026-10-24)`. Nie kompilowano testów jednostkowych.
+Zachowano poprzednie wolumeny cache/package i wszystkie wyniki. Ciężkie
+warstwy zostały przebudowane, więc nie deklarujemy sukcesu bramki CACHED.
+
+Zaakceptowany `run-surface-gmp-20261025-01`, task
+`task-1a6ac9108ca7bb1f7fc280f4ea96cde7575d56c07b362b704f7dd8dee319f54c`,
+attempt `attempt-20472c191c6642cbb4c54e19b7701357`, epoch 1 ma lifecycle
+Succeeded, katalog 298; proces workera 21393 zakończył się. Bundle
+`fa991bac1f48f2abd08ef5b35af381f43558b112141d58d1e27cd8848fcb26f5`
+przeszedł prerejestrowane porównanie wszystkich 21 payloadów, diagnostyk
+trzech precyzji, liczników, maksymalnych długości liczb, tolerancji i limitów.
+Czas operatora: 346.505338649 s wobec 371.592043076 s. To pojedynczy pomiar
+14 punktów zewnętrznych, bez dowodu pełnego Universe lub UI.
+
+W tej samej grupie `accepted-reader-regression-result.json` ma PASS:
+metadane/ETag, V, J i H zachowane bajtowo; 304 zachowuje ETag i pustą treść;
+obcy attempt/epoch/package dają 409. Odczyt H trwał 10.622386762 s wobec
+17.389496162 s wcześniejszego pomiaru i przeszedł uprzednio zadany próg
+15.6505465458 s. To uzasadnia współdzielenie zweryfikowanego snapshotu w jednej
+transakcji odczytu, nie globalny cache ani pominięcie kontroli zakończenia.
+
+`accepted-export-idle-regression-result.json` również ma PASS. Bez bieżącego
+workspace zwykły eksport zwraca 404; historyczny eksport dokładnie przypiętego
+run-live-255fa… zwraca 200, z poprawną tożsamością źródła. Obie nieaktualne
+rewizje zwracają 409. Przed i po eksporcie health.active_session=false;
+nie wykonano importu ani Solve. Archiwum ma 102748559 B, SHA256
+`abe752d4ba223ec78724ad3c6de5238a8e2ae055f3e3c15cf707f56fc4157c3a`.
+Raporty i FMS znajdują się wyłącznie w wolumenie kontrolnym grupy pod
+`verification/surface-rt0-performance-20261025/`. Nie nadpisano FMS użytkownika.
+Kontrola po przerwaniu rozmowy potwierdziła terminalny PASS i brak procesu;
+nie ponawiano eksportu. Canonical import/data-plane po cold-load nadal wymaga
+osobnego wykonania przygotowanego harnessu.
+
+### Ponowne przygotowanie Universe i dalszy WIP — 25.10.2026
+
+Recepta `just docker-dev-script` dla
+`examples/antenna_universe/fem_antenna_closed_loop_universe_surface.py`,
+source-root bieżącego worktree, port 3203 i request
+`antenna-universe-gmp-20261025-prepare-01` zakończyła się kodem 0. Activation
+`0afeefc95f6c45cf89a0a815a163c193` zachowała ten sam backend i konfigurację.
+Sesja `docker-startup-3eceb8a77de5caf27abe222f3d58f4193350fc74c4c92e4f44a9a29308200f46`,
+run `run-live-1f51b0f075ff44ae6e640d0c043c840f825d8a7c6714e5c758c0ba365e933bc2`
+ma preparation=ready i solver=awaiting_command. Compute nie został uruchomiony.
+Rzeczywisty publikowany mesh shared-domain pokazuje przewodnik 677 węzłów /
+1861 Tet4; nie jest dowodem liczności osobnej siatki próbkowania Global.
+Nie przepisujemy do nowej próby historycznej liczby 1154 bez sprawdzenia jej
+własnego immutable input. Receipty mają prefiks universe-gmp-prepare-*.
+
+Po terminalu aktywacji zastosowano dwa przejrzane patche źródeł:
+- zero-copy bits/watch/sign: SHA256
+  `55b62ced7532f3140c29c1bcfa5edaf8d6684a26d60fc3cbf9f68461042e55e1`;
+- opcjonalny sample_carrier w kanonicznym locatorze: SHA256
+  `6bf5ca44a14e3a360d6b5d2ce58263ce5bd548dc125187748b6f605654974fd3`.
+Drugi uzupełniono o checked naliczanie rzeczywistej pojemności nowych stringów.
+Nie zmieniono polityki numerycznej, limitów czasu, precyzji ani tolerancji.
+Kod, OpenAPI/frontend i nowa kompilacja nie są jeszcze zweryfikowane.
+Walidator noty 0950 wykonał się w istniejącym backendzie, exit 0.
+
+Pełne Universe i jego widok browser/WebGL pozostają nieukończone. Właściwy
+model prezentacji to własna niezmienna siatka zaakceptowanego H z odrębną
+anteną jako źródłem. Sampling topology_digest (MeshIR) i bieżący
+mesh topology_fingerprint mają różne kontrakty; nie wolno porównać ich jak
+tożsamych hashy ani uznać scope=full za dowód Universe.
+
+D: ma 27164454912 B wolnego (~25.3 GiB), poniżej 32 GiB wymaganych do kolejnego
+buildu. Poproszono o zwolnienie 10–15 GiB albo wybór przeglądu konkretnych
+nieużywanych zasobów. Nie wykonano usuwania i nie obchodzono preflightu.

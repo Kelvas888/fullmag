@@ -2525,14 +2525,6 @@ mod accepted_fms_persistence_tests {
     }
 }
 
-async fn current_session_id(state: &AppState) -> Result<String, ApiError> {
-    let current = state.current_live_state.read().await;
-    current
-        .as_ref()
-        .map(|s| s.session.session_id.clone())
-        .ok_or_else(|| ApiError::not_found("no active workspace"))
-}
-
 const MAX_RETIREMENT_SCRIPT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Documents captured from the in-memory authoring/session projection for a
@@ -3079,39 +3071,24 @@ pub(crate) async fn export_session_with_context(
     let save_to_source = req.save_to_source.unwrap_or(false);
     let requested_target = req.target_path.as_deref();
     validate_session_output_request(requested_target, save_to_source)?;
-    let mut session_id = current_session_id(&state).await?;
     if req.accepted_run.is_some() && (req.profile != SaveProfile::Solved || save_to_source
         || req.ui_state.is_some() || requested_target.is_some()) {
         return Err(ApiError::bad_request("historical accepted_run export requires a solved download without UI override or output path"));
     }
 
-    let name = if let Some(n) = req.name {
-        n
-    } else {
-        let guard = state.current_live_state.read().await;
-        guard
-            .as_ref()
-            .map(|s| s.session.problem_name.clone())
-            .unwrap_or_else(|| "Untitled".into())
-    };
-
-    let export_profile = FmsExportProfile::for_profile(req.profile);
-    let mut snapshot = state
-        .current_live_state
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| ApiError::not_found("no active workspace"))?;
-    let mut historical_script = None;
-    let source_epoch = if let Some(source) = req.accepted_run.as_ref() {
+    // Historical downloads are sourced entirely from their pinned accepted run;
+    // they also work when no current workspace has been opened.
+    let (snapshot, source_epoch, historical_script) = if let Some(source) = req.accepted_run.as_ref() {
         let (historical, epoch, script) = historical_export_snapshot(&state, source)?;
-        historical_script = Some(script);
-        session_id = historical.session.session_id.clone();
-        snapshot = historical;
-        epoch
+        (historical, epoch, Some(script))
     } else {
-        state.current_live_session_epoch.load(std::sync::atomic::Ordering::Acquire)
+        let snapshot = state.current_live_state.read().await.clone()
+            .ok_or_else(|| ApiError::not_found("no active workspace"))?;
+        (snapshot, state.current_live_session_epoch.load(std::sync::atomic::Ordering::Acquire), None)
     };
+    let session_id = snapshot.session.session_id.clone();
+    let name = req.name.unwrap_or_else(|| snapshot.session.problem_name.clone());
+    let export_profile = FmsExportProfile::for_profile(req.profile);
     let save_target = if save_to_source {
         Some(resolve_session_output_target(
             Path::new(&snapshot.session.script_path),

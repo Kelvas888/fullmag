@@ -79,7 +79,8 @@ fn read_saved_inspection<T>(
     if manifests.len() != 1 { bail!("inspection has no unique typed completion manifest"); }
     store.cas().get_bounded(manifests[0].object_ref.as_deref().context("inspection manifest CAS missing")?, 4 * 1024 * 1024)?
         .context("inspection typed completion manifest missing")?;
-    crate::study::validate_study_task_completion(store, recovered.coordinator.claim())?;
+    crate::study::validate_study_task_completion_for_snapshot(
+        store, recovered.coordinator.claim(), &accepted)?;
     let artifacts = store.read_artifact_catalog(run.as_str())?.context("inspection artifacts missing")?;
     let outputs = artifacts.entries.iter().filter(|artifact| artifact.task_id == task_id
         && artifact.attempt_id == attempt_id && artifact.ownership_epoch == epoch
@@ -90,11 +91,11 @@ fn read_saved_inspection<T>(
         || output.object_ref.as_deref() != Some(expected_object) || output.content_sha256 != expected_object {
         bail!("inspection public CAS object differs from durable output");
     }
-    // Repeat the bounded CAS read against the explicitly supplied discovery pin.
+    // Completion validated this same sole typed output against the accepted
+    // ProblemIR. Re-hash its bytes against the discovery pin under this read lock;
+    // decoding still validates the neutral closure and thin-view bounds.
     let bytes = store.cas().get_bounded(expected_object, crate::study_inspection::inspection_bundle_budget(&claim)? as u64)?
         .context("inspection pinned CAS object missing")?;
-    let entry = accepted.catalog.entries().iter().find(|entry| entry.step_id() == step.step_id).context("inspection ProblemIR missing")?;
-    crate::study_inspection::validate_accepted_inspection_bytes(entry.problem(), step, &bytes, crate::study_inspection::inspection_bundle_budget(&claim)?)?;
     build(serde_json::json!({"schema":"fullmag.saved_inspection_integrity.v1","status":"pass",
         "project_id":project.as_str(),"run_id":run.as_str(),"task_id":task_id,"attempt_id":attempt_id,
         "ownership_epoch":epoch,"object_ref":expected_object,"byte_count":bytes.len(),

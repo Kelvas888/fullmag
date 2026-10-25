@@ -2071,8 +2071,9 @@ pub fn validate_study_task_completion(store: &SessionStore, claim: &TaskClaim) -
 }
 
 /// Validate completion against an already fully validated accepted snapshot.
-/// The fresh immutable intent fence must be checked while the caller holds the
-/// store writer; all mutable catalog, artifact and CAS checks remain here.
+/// The fresh immutable intent fence is checked while the caller holds the
+/// store writer or shared read transaction; all catalog, artifact and CAS checks
+/// remain here. A shared transaction excludes writers for the entire cold read.
 pub(crate) fn validate_study_task_completion_for_snapshot(
     store: &SessionStore,
     claim: &TaskClaim,
