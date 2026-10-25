@@ -1076,11 +1076,20 @@ pub fn try_compute_newell_kernels_shifted_pair(
         .chain(destination_cell)
         .fold(0.0_f64, f64::max);
     let far_field_radius = ASYMPTOTIC_DISTANCE as f64 * max_cell;
-    let pidx = |x: usize, y: usize, z: usize| z * py * px + y * px + x;
+    let slab_len = px * py;
+    // Each padded z slab holds exactly one signed z lag; slabs no lag reaches
+    // stay zero (the 2-D upper half and the Nyquist slab).
+    let mut lag_of_slab = vec![None; pz];
+    for &(z_lag, iz) in &z_lags {
+        lag_of_slab[iz] = Some(z_lag);
+    }
 
-    for &(x_lag, ix) in &x_lags {
-        for &(y_lag, iy) in &y_lags {
-            for &(z_lag, iz) in &z_lags {
+    // Every tensor depends only on its own lag, so slabs are filled
+    // independently (in parallel when enabled) with bitwise-identical values.
+    let fill_slab = |z_lag: isize, slabs: [&mut [f64]; 6]| -> Result<(), KernelBuildError> {
+        let [s_xx, s_yy, s_zz, s_xy, s_xz, s_yz] = slabs;
+        for &(x_lag, ix) in &x_lags {
+            for &(y_lag, iy) in &y_lags {
                 // For 2-D each layer is represented by one scratch z cell;
                 // source/destination thickness enters the exact pair integral,
                 // not the lag pitch.
@@ -1113,14 +1122,50 @@ pub fn try_compute_newell_kernels_shifted_pair(
                             .to_string(),
                     });
                 }
-                let p = pidx(ix, iy, iz);
-                n_xx[p] = tensor.xx;
-                n_yy[p] = tensor.yy;
-                n_zz[p] = tensor.zz;
-                n_xy[p] = tensor.xy;
-                n_xz[p] = tensor.xz;
-                n_yz[p] = tensor.yz;
+                let p = iy * px + ix;
+                s_xx[p] = tensor.xx;
+                s_yy[p] = tensor.yy;
+                s_zz[p] = tensor.zz;
+                s_xy[p] = tensor.xy;
+                s_xz[p] = tensor.xz;
+                s_yz[p] = tensor.yz;
             }
+        }
+        Ok(())
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        n_xx.par_chunks_mut(slab_len)
+            .zip(n_yy.par_chunks_mut(slab_len))
+            .zip(n_zz.par_chunks_mut(slab_len))
+            .zip(n_xy.par_chunks_mut(slab_len))
+            .zip(n_xz.par_chunks_mut(slab_len))
+            .zip(n_yz.par_chunks_mut(slab_len))
+            .zip(lag_of_slab.par_iter())
+            .try_for_each(|((((((s_xx, s_yy), s_zz), s_xy), s_xz), s_yz), z_lag)| {
+                z_lag.map_or(Ok(()), |z_lag| {
+                    fill_slab(z_lag, [s_xx, s_yy, s_zz, s_xy, s_xz, s_yz])
+                })
+            })?;
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for (iz, z_lag) in lag_of_slab.iter().enumerate() {
+            let Some(z_lag) = *z_lag else { continue };
+            let range = iz * slab_len..(iz + 1) * slab_len;
+            fill_slab(
+                z_lag,
+                [
+                    &mut n_xx[range.clone()],
+                    &mut n_yy[range.clone()],
+                    &mut n_zz[range.clone()],
+                    &mut n_xy[range.clone()],
+                    &mut n_xz[range.clone()],
+                    &mut n_yz[range],
+                ],
+            )?;
         }
     }
 
