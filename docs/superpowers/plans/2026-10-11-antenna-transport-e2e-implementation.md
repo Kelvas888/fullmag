@@ -1,17 +1,43 @@
 # Anteny i transport — realizacja E0–E12, 11.10.2026
 
-## Bieżąca praca: wrapper i frontend WSL — 25.10.2026
+## Bieżący checkpoint: grupa odtworzona, Universe w wykonaniu — 25.10.2026
 
-Zatwierdzona finalizacja 743a85 jest zakończona, stare wyniki zachowane.
-Przy przejściu do Universe ujawniono stale failed-stop journal po późniejszym
-poprawnym drain oraz Windows-only reader w frontend refresh. Backend po
-managed resume działa, lecz frontend odmówił startu; publiczny port 3203
-nie jest obecnie potwierdzony. Universe Solve nadal nie wykonano.
-Dokładny stan, scope i kontrole:
-[przegląd poprawki wrappera](2026-10-25-managed-drained-successor-wrapper-refresh.md).
-Poniższe checkpointy opisują wcześniejsze zakończone operacje.
+Zarządzane odtworzenie grupy zakończyło się sukcesem: removal
+`7d6f913f9349430ab78f5d81b721af56`, development
+`8ea82405252446628c12e041485547c3`, konfiguracja
+`60b3af127cc966b8bbe1add9addd7066ed75d10952dbfe082bf9f3190ecebfeb`.
+Obie rzeczywiste usługi używają obrazu
+`sha256:4b54ecd6b33649dda5532b6a185bc6e9547d077b80ac7bd7e159cf402a946b58`;
+obraz dev-wrapper `b7a46c24…` był przygotowany, lecz nie jest obrazem
+uruchomionego frontendu. API przez port 3203 odpowiada HTTP 200, usługi healthy.
+Pakiet pochodzi z `a71b4c628dd8e9f9fc6916caf5e834a791eb5d25`, snapshot
+`7bce56b94d281910c51ae984c916721e93f76c0656d0979f7993260fbca11c79`.
+Wyniki wcześniejszej próby: 70/70 plików i oba archiwa FMS bez zmian;
+ponowna walidacja publicznego HTTP V/J/H: 31 kontroli PASS.
+Nie jest to dowód wizualny UI/WebGL.
 
+Aktywacja skryptu Universe `84ad00cc34f0452c8145098a0cc59df3` zakończyła
+się sukcesem z `wait_for_solve(True)`. Odczyt niezmiennego katalogu CAS
+`47beccc34f358c02887cc18c157793657153e3d30d73ad77fd06302092fbc9bc`
+potwierdził oddzielne źródło 677 węzłów / 1862 Tet4 oraz globalną domenę
+1154 węzłów / 6503 Tet4 (4777 powietrza, 1726 przewodnika).
+Manifest aktualnie wybranego source mesh nie opisuje całego Universe.
+Nie wykonywano dodatkowego mesh_build. Budżet wejścia: 2148748 par < 4000000.
 
+Po ponownym sprawdzeniu ready receipt i rewizji wysłano dokładnie jeden Solve:
+`fm-20b49703-375a-4cf1-8eb6-4ce2fca64a0f`, client intent
+`antenna-universe-surface-20261025-solve-01`, HTTP 200 accepted.
+Run `run-live-ace433241f22879d2bc6fc8c5df1b24368fb4f68ecbd973799ec8e3460ab1992`,
+attempt `attempt-3519d1b2bee5418d8b17784621fd4fb0`, ownership epoch 1.
+Publiczny stan zadania jest running; nie ma jeszcze zaakceptowanego wyniku H.
+Nie ponawiać komendy ani nie zmieniać polityki w trakcie próby.
+Dowody: `verification/universe-surface-trial-20261025/` i
+`verification/wrapper-refresh-20261025/` w wolumenie kontrolnym grupy.
+
+Ponowny fetch potwierdził `origin/master`
+`f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`; nie został jeszcze scalony.
+Integracja nastąpi po terminalnym rozstrzygnięciu tej próby. E0–E12 pozostaje
+nieukończone: wykonanie próby nie oznacza kwalifikacji bazy, LLG/FFT ani BORIS.
 
 ## Aktualny checkpoint: recovery wykonane, API i inspekcja przywrócone — 25.10.2026
 
