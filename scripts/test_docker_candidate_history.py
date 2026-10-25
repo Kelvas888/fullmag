@@ -51,6 +51,24 @@ class CandidateHistoryMountTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.mounts(root='candidate-history/../backend')
 
 
+class CandidateHistoryStoreTests(unittest.TestCase):
+    def validate(self, changes, writer):
+        scope={}
+        exec(history.STORE_VALIDATION,scope)
+        return scope['validate_store_changes'](changes,writer)
+
+    def test_only_released_root_writer_metadata_can_change(self):
+        released={'schema':'fullmag.writer.v1','released':True}
+        row={'path':'WRITER.owner.json','before':'a'*64,'after':'b'*64}
+        self.assertEqual(self.validate([row],released),[row])
+        self.assertEqual(self.validate([],{}),[])
+        for path in ['runs/own/WRITER.owner.json','runs/own/run_catalog.json','objects/sha256/own','WRITER.lock']:
+            with self.subTest(path=path),self.assertRaises(ValueError):
+                self.validate([{**row,'path':path}],released)
+        for writer in [{}, {**released,'released':False}, {**released,'schema':'other'}]:
+            with self.assertRaises(ValueError):self.validate([row],writer)
+
+
 class CandidateHistoryShellTests(unittest.TestCase):
     def dispatch(self,extra='',digest='d'*64):
         source=(Path(__file__).parent/'just_storage_shell.sh').read_text()

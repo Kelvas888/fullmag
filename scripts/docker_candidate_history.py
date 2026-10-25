@@ -29,11 +29,22 @@ p=backend.PACKAGE_ROOT/'.development'/'candidates'/candidate_request['candidate'
 backend._validate_candidate_marker(p,backend.PACKAGE_ROOT,Path('/build'),state='ready')
 _,raw,_=backend._validated_package(p,'pinned diagnostic candidate',exclude_candidate_marker=True)
 repair.require(hashlib.sha256(raw).hexdigest()==candidate_request['receipt_sha256'],'Candidate receipt changed')
-print(json.dumps(ns['pinned_evidence'](request,paths),sort_keys=True))
+evidence=ns['pinned_evidence'](request,paths)
+evidence['linux_probe_sha256']=hashlib.sha256(Path('/state/.linux-native-probe.json').read_bytes()).hexdigest()
+print(json.dumps(evidence,sort_keys=True))
 '''
 
-RUNTIME = r'''
-import ctypes,hashlib,json,os,re,subprocess,sys
+STORE_VALIDATION = r'''
+def validate_store_changes(changes, writer):
+ if any(row['path']!='WRITER.owner.json' for row in changes):
+  raise ValueError('Native diagnostic changed retained scientific store bytes')
+ if changes and (writer.get('schema')!='fullmag.writer.v1' or writer.get('released') is not True):
+  raise ValueError('Diagnostic writer advisory record is not released')
+ return changes
+'''
+
+RUNTIME = STORE_VALIDATION + r'''
+import ctypes,hashlib,json,os,re,subprocess,sys,types
 from pathlib import Path
 sys.path.insert(0,'/opt/fullmag')
 import backend_dev as backend
@@ -52,6 +63,13 @@ require(backend.PROVENANCE_PATH==Path('/opt/fullmag/control/backend/runtime-prov
 receipt,raw,_=backend._validated_package(package,'candidate diagnostic package',exclude_candidate_marker=True)
 require(hashlib.sha256(raw).hexdigest()==request['candidate_receipt_sha256'],'Candidate receipt changed')
 backend._publish_runtime_provenance(package)
+probe_source=request['storage_probe_source']
+require(hashlib.sha256(probe_source.encode()).hexdigest()==request['storage_probe_sha256'],'Storage probe source differs')
+probe=types.ModuleType('candidate_linux_native_probe')
+exec(compile(probe_source,'linux_native_probe.py','exec'),probe.__dict__)
+probe_evidence=probe.run(True,evidence_path=Path('/evidence/linux-native-probe.json'))
+require(json.loads(Path('/state/.linux-native-probe.json').read_bytes())==probe_evidence,
+        'Private diagnostic probe mount does not expose its genuine evidence')
 store=Path('/state/runs/docker-all/session-store')
 config=Path('/opt/fullmag/runtime-control/runtime-service/docker-all.json')
 def sha(path):
@@ -100,14 +118,18 @@ after=inventory()
 Path('/evidence/store-after.json').write_text(json.dumps(after,sort_keys=True)+'\n')
 changes=[{'path':name,'before':before.get(name),'after':after.get(name)} for name in sorted(set(before)|set(after)) if before.get(name)!=after.get(name)]
 Path('/evidence/native-observations.json').write_text(json.dumps({'observations':rows,'negative_checks':negative,'store_changes':changes},indent=2)+'\n')
-require(not changes,'Store inventory changed (including writer metadata); see native-observations.json')
+writer={}
+if changes:
+ require((store/'WRITER.owner.json').stat().st_size<=65536,'Writer advisory record exceeds bounds')
+ writer=json.loads((store/'WRITER.owner.json').read_bytes())
+validate_store_changes(changes,writer)
 require(config_sha==sha(config),'Native diagnostic changed runtime config')
 passed=all(row['exit_code']==0 for row in rows) and all(row['expected_gate_reached'] for row in negative)
 report={'schema':'fullmag.candidate-terminal-history-diagnostics.v1',
  'state':'passed' if passed else 'history-not-fully-proven','build_attempt':request['build_attempt'],
  'candidate_receipt_sha256':request['candidate_receipt_sha256'],'source':receipt['source'],
  'run_count':len(rows),'passed_runs':sum(row['exit_code']==0 for row in rows),
- 'observations':rows,'negative_checks':negative,'unchanged_store_files':len(before),
+ 'observations':rows,'negative_checks':negative,'unchanged_store_files':len(before)-len(changes),'technical_writer_changes':changes,
  'recovery_pins':[row['pin'] for row in rows] if passed else None,
  'recovery_applied':False,'new_solve':False,'package_promoted':False,
  'driver_library_loaded':True,'driver_nodes':driver_nodes,'kernel':kernel}
@@ -154,6 +176,7 @@ def diagnostic_mounts(actual, volume, root, candidate):
         'type=volume,src='+volume+',dst=/opt/fullmag/control,readonly',
         'type=volume,src='+volume+',dst=/opt/fullmag/control/backend,volume-nocopy,volume-subpath='+root+'/backend',
         'type=volume,src='+volume+',dst=/evidence,volume-nocopy,volume-subpath='+root,
+        'type=volume,src='+volume+',dst=/state/.linux-native-probe.json,readonly,volume-nocopy,volume-subpath='+root+'/linux-native-probe.json',
     ])
     return mounts
 
@@ -185,12 +208,15 @@ def run(args):
     def donor():
         return json.loads(docker_capture('exec',args.backend_container_id,'/usr/local/bin/python3','-B','-c',DONOR_PROBE,json.dumps({'candidate':candidate.name,'receipt_sha256':args.candidate_receipt_sha256})).stdout)
     before=donor();original=fingerprint(actual)
+    probe_source=(selected/'docker/all-in-one/linux_native_probe.py').read_text()
     inputs={key:getattr(args,key) for key in ('backend_container_id','image_id','build_attempt','candidate_receipt_sha256')}
     inputs.update(source_root=str(selected),controller_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                  runtime_controller_sha256=hashlib.sha256(RUNTIME.encode()).hexdigest())
+                  runtime_controller_sha256=hashlib.sha256(RUNTIME.encode()).hexdigest(),
+                  storage_probe_sha256=hashlib.sha256(probe_source.encode()).hexdigest())
     with control.operation('candidate-history',inputs) as operation:
         root=operation['root']
         control.write(root+'/donor-before.json',before)
+        control.write(root+'/linux-native-probe.json',{})
         control.write(root+'/backend/scope.json',{'schema':'fullmag.candidate-history-scope.v1',**inputs})
         mounts=diagnostic_mounts(actual,control.volume,root,candidate.name)
         control.write(root+'/mounts.json',{'mounts':mounts,'source_root':str(selected)})
@@ -210,7 +236,7 @@ def run(args):
                 command+=['--env',item]
         command+=['--env','NVIDIA_VISIBLE_DEVICES=none','--env','NVIDIA_DRIVER_CAPABILITIES=compute,utility',
                   '--env','FULLMAG_DOCKER_DEVICE_ACCESS=cpu','--entrypoint','/usr/local/bin/python3',args.image_id,
-                  '-B','-c',RUNTIME,json.dumps(inputs)]
+                  '-B','-c',RUNTIME,json.dumps(dict(inputs,storage_probe_source=probe_source))]
         operation['daemon_pending']=True
         completed=docker_capture(*command,timeout=300,allow_failure=True)
         operation['logger'].stdin.write(completed.stdout+completed.stderr);operation['logger'].stdin.flush()

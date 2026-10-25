@@ -208,3 +208,37 @@ Fetch `origin/master` wskazał `f08fc7755acdf742c5fdcbcb6ce5bec7c40abe48`,
 który jest już przodkiem brancha zadania: brak nowych commitów do scalenia.
 Build aplikacji pozostaje wcześniejszym dowodem; nie jest dowodem recovery
 ani udanego Solve Universe.
+
+## Izolowany prawdziwy probe — wynik poprawki
+
+Dotychczasowy producent `docker/all-in-one/linux_native_probe.py` otrzymał
+opcjonalny `evidence_path`, wymagający zweryfikowanego restart readback.
+Zwykłe wywołania zachowują dotychczasową atomową publikację. Diagnostyka
+zapisuje dowód do jednego istniejącego pliku operacji w control volume,
+bez zmiany inode. Ten sam plik jest zamontowany jako readonly file subpath
+pod kanonicznym `/state/.linux-native-probe.json` wyłącznie w helperze.
+Nie skopiowano starego wyniku checks ani namespace: producent ponownie
+wykonał rzeczywiste fsync, atomic replace, process lock, no-follow, SQLite
+i restart readback na rzeczywistym `/state`. Natywny walidator nie zmienił się.
+Źródło producenta i runtime kontrolera są przypięte przez SHA256 w receipcie.
+
+Operacja `4d63e56a4948445984f7a1150a1aa59e` zakończyła się succeeded,
+wynik diagnostyki passed: 14/14 runów i 3/3 negatywne bramki.
+Gotowe piny są w `candidate-history/attempts/4d63e56a4948445984f7a1150a1aa59e/result.json`
+w wolumenie kontrolnym grupy. Nie są uprawnieniem do pominięcia ponownej
+walidacji pod blokadami w core recovery.
+
+5736 plików zachowało identyczne SHA256. Jedyną zmianą store jest
+korzeniowy `WRITER.owner.json`, sprawdzony osobno jako `fullmag.writer.v1`
+z `released=true`; zmiana dowolnej innej ścieżki, także podobnie nazwanego
+pliku w runie, nadal powoduje odmowę. Runtime owner, config, process receipt,
+ledger, globalne provenance i domyślny probe backendu pozostały identyczne.
+
+19 interpretowanych regresji producenta i diagnostyki PASS. Potwierdzono
+70 plików starego wyniku V/J/H, 2 archiwa i 6 chronionych plików błędnej
+próby oraz niezmieniony FMS użytkownika. Dowód retencji:
+`verification/terminal-history-recovery-v3-20261025/retention-after-private-probe.json`.
+Nie kompilowano testów Rust, nie promowano pakietu i nie wykonano nowego Solve.
+Następny krok: integracja konsumenta v3 z kontrolowanym zatrzymaniem
+diagnostycznego API, świeżym dowodem teardown i ponowną natywną kontrolą
+całej terminalnej historii. Backend i Universe nadal nie są przywrócone.
