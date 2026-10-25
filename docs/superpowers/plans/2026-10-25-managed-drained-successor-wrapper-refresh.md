@@ -178,3 +178,37 @@ historii zastanym archiwom. Create zwraca rewizję po inicjalizacji; klient
 musi używać zwróconej rewizji. Regresja HTTP obejmuje kolejne edycje, no-op
 i osiem przypadków niepewnych archiwów. Weryfikacja nowego pakietu pozostaje
 do wykonania; wynik cold-open obecnego pakietu jest FAIL.
+
+
+### Weryfikacja poprawki cold-open
+
+Commit aplikacji: `498a36ae53c36b79a2dda7aa06d4eed270e6c120`.
+Stop zapisanej sesji `4f4a9204bf134160af50ac3a335d38d3` przeszedł pełny
+preflight z 13 zachowanymi historiami. Resume/build
+`3abcda48ff874ad5ba8722a348298ea7` zakończył się sukcesem w tej samej grupie,
+snapshot `5c476c60ae72f5f169f68419fd147827ec15453b91fd316aa0e5b9f9ac85db22`.
+SHA256 terminalnego receiptu:
+`8d3ab1cb3451fa1a56487cec47dca186b8ed477be29ee25c1e6d2a810dccc88f`.
+
+Regresja HTTP: **PASS** — świeży projekt bez magnetyka, źródło Python,
+dwie kolejne edycje z zachowaniem wcześniejszych bajtów, cold-open, no-op,
+osiem przypadków niepewnego archiwum, obca tożsamość i nieaktualna rewizja.
+Aktywna sesja pozostała niezmieniona. Klient regresji poprawiono po buildzie:
+kanoniczny kodek zmienia formatowanie manifestu, dlatego test porównuje jego
+semantykę, a bajty wszystkich dokumentów nadal dokładnie. Końcowy SHA256
+walidatora: `3e3045cc832269b380c855c55edccfb05d9877e5e1224b61198cf6c9206bb2da`.
+Raport: `verification/antenna-authoring-source-20261025/validator-cold-open-canonical-metadata.json`.
+
+Odczyt wcześniejszych V/J/H: **31 kontroli PASS**, niezmienione skróty danych,
+bez ponownego Solve. Raport: `accepted-vjh-after-498a36ae.json` w tym samym
+katalogu kontrolnym. Przed bieżącym buildem potwierdzono 70 plików wyników,
+dwa archiwa i sześć niezmiennych dowodów nieudanej próby.
+
+Przywrócono scenę przez publiczne PUT model/scene w sesji
+`session-18e1bf739fabe3b800000d06`, rewizja 1. Obiekt ma rolę `antenna`,
+Universe i definicja etapu pola pozostały zachowane. Nowe archiwum użytkownika:
+`/state/runs/projects/antenna-universe-authoring-restored-498a36ae-20261025.fms`,
+8571 B, SHA256 `cae2d6a4c4044e07a9711ca4efa1b3a876fec4f1b93aa46d59742904a3c6166e`.
+Jego cold-open zwraca identyczną scenę. Nie wykonano nowego Solve.
+Kontrola UI/WebGL nadal NOT VERIFIED. Pełny wynik Universe nadal nie istnieje:
+ostatnia próba zakończyła się limitem czasu surface RT0.

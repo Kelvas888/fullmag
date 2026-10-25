@@ -107,6 +107,13 @@ def validate(base_url: str, authored: dict) -> dict:
         raise ValueError("No-op authoring changed archive contents or revision")
 
     def refuse_projection(modified):
+        modified = dict(modified)
+        manifest = json.loads(modified["manifest/project.json"])
+        opaque = set(manifest.get("opaque_documents", []))
+        opaque.intersection_update(modified)
+        opaque.update(name for name in modified if name not in content)
+        manifest["opaque_documents"] = sorted(opaque)
+        modified["manifest/project.json"] = json.dumps(manifest).encode()
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, value in modified.items():
@@ -115,8 +122,15 @@ def validate(base_url: str, authored: dict) -> dict:
         opened = cold_open(resource)
         if opened.get("authoring_scene_document") is not None:
             raise ValueError("Unsafe archive was projected into authoring")
-        if entries(opened) != modified:
-            raise ValueError("Evidence-only archive bytes were changed")
+        returned = entries(opened)
+        # Writable archives canonicalize transport metadata, not opaque evidence.
+        if json.loads(returned.pop("manifest/project.json")) != manifest:
+            raise ValueError("Cold open changed the declared archive entries")
+        modified.pop("manifest/project.json")
+        if returned != modified:
+            changed = sorted(name for name in returned.keys() | modified.keys()
+                             if returned.get(name) != modified.get(name))
+            raise ValueError(f"Evidence-only document bytes were changed: {changed}")
 
     history_path = next(iter(previous_sources))
     refuse_projection({**content, history_path: b"# altered source history\n"})
