@@ -1,5 +1,14 @@
 # Anteny i transport — realizacja E0–E12, 11.10.2026
 
+> Stan bieżący po próbie diagnostycznej 25.10.2026: benchmark surface RT0
+> run-live-255fa587… zakończył się Failed przez niezgodność certyfikatu
+> z lokalnym J. Osobno preparation zakończył się błędem brakującego CAS
+> snapshotu hosta. Nasza grupa 3203 ma runtime=unknown i API diagnostyczne;
+> nowe operacje są zablokowane. Nie ma nowego zaakceptowanego H ani
+> potwierdzenia zwolnienia rezerwacji. Szczegóły i następne kroki:
+> `2026-10-25-surface-rt0-quality-preserving-performance.md`, wynik terminalny.
+
+
 ## Bieżący checkpoint: grupa odtworzona, próba Universe nieudana — 25.10.2026
 
 Zarządzane odtworzenie grupy zakończyło się sukcesem: removal

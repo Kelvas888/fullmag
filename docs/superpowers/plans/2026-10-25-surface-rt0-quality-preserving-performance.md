@@ -86,3 +86,38 @@ Wszystkie powyższe receipty pomiaru: wolumen kontrolny grupy,
 
 Strukturalny baseline noty 0950 przeszedł istniejący validator (exit 0),
 bez zmiany noty lub kernela. Nie kompilowano natywnych testów jednostkowych.
+
+
+## Wynik terminalny — pierwszeństwo przed wcześniejszym Running
+
+Próba zakończyła się **Failed** 25.10.2026 o 11:06:49 UTC. PID 3830 już
+nie istnieje. Worker zakończył się kodem 1, timed_out=false i
+stop_requested=false. Nie powstał przyjęty wynik ani benchmark wydajności.
+Nie wykonywano ponowienia. Powód: `closed-loop field v2: certificate canonical
+flux differs from local J`. Zdarzenie końcowe ma sequence 171, ścieżkę
+`coordinator_journal/event/705a9b28213a4548847c301dd159a41e.json`.
+Nie ma opublikowanych artifact_ids.
+
+Przegląd kodu potwierdził dwie różne kontrole zgodności tych reprezentacji:
+`closed_loop_identity_v2.rs + verify_owned_geometry` uwzględnia skalę składników
+iloczynu J przez normalną, natomiast `closed_loop_balance_v2.rs +
+verify_balance_certificate` porównuje wynik względem samych prawie znoszących
+się strumieni. Natywny `AffineRt0Element::face_moment` liczy dokładnie
+z signed RT0 coefficients, a `retained_current_at` eksportuje zaokrąglone
+binary64 ślady. Sam ten przegląd nie ustala jeszcze wartości błędu konkretnej
+ściany. Następna praca: niezależny reproducer i właściwe powiązanie
+kanonicznych momentów RT0 ze śladami J; bez podnoszenia bramek fizycznych
+i bez pomijania kontroli źródła. Hoist pi pozostaje niewykonany.
+
+Osobny proces preparation wcześniej zakończył się błędem:
+`preparation scheduler: reconcile task cancellations: compute-node snapshot
+content-addressed payload is missing or invalid: No such file or directory`.
+OWNER wskazuje preparation=exited_failure, state=unknown. Backend pozostawił
+API w trybie diagnostycznym; compute/queue zwraca 503 runtime_unavailable.
+Nie wolno opisywać tego jako pustej kolejki lub dowodu zwolnienia rezerwacji.
+Nie wykonywano restartu ani ręcznego recovery po tym zdarzeniu.
+
+Dokładny checkpoint: `before-terminal-failure.json` w katalogu dowodów tego
+etapu. Zachowuje zdarzenie końcowe, receipt wyjścia, log preparation i
+rzeczywiste odpowiedzi API. Potwierdzenie zwolnienia rezerwacji pozostaje
+NOT VERIFIED. API diagnostyczne działa, ale nowe operacje są zablokowane.
