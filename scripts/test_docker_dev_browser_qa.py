@@ -27,6 +27,140 @@ def _load_qa_module():
     return module
 
 
+def _airbox_inspector_result_fixture(qa):
+    public_url = "http://127.0.0.1:3269"
+    browser_url = "http://frontend:8080"
+    script_sha256 = "a" * 64
+    expected_panels = [
+        ("root", "model:airbox", "airbox.root", "Airbox", "Airbox Overview"),
+        ("mesh", "model:airbox:mesh", "airbox.mesh", "Mesh", "Airbox Mesh Overview"),
+        ("parameters", "model:airbox:mesh:parameters", "airbox.mesh.parameters", "Parameters", "Canonical Authored Parameters"),
+        ("quality-gates", "model:airbox:mesh:quality-gates", "airbox.mesh.quality-gates", "Quality Gates", "Airbox Quality Gates"),
+        ("statistics", "model:airbox:mesh:statistics", "airbox.mesh.statistics", "Statistics", "Airbox Mesh Statistics"),
+        ("topology", "model:airbox:mesh:topology", "airbox.mesh.topology", "Topology", "Airbox Mesh Topology"),
+        ("build", "model:airbox:mesh:build", "airbox.mesh.build", "Build & Provenance", "Airbox Mesh Build"),
+    ]
+    synthetic_pass = {
+        "requests": 1,
+        "revision": 7,
+        "rendered_pass": True,
+        "revision_matches_live": True,
+    }
+    proof = {
+        "schema": "fullmag.airbox-inspector-browser-proof.v1",
+        "script_sha256": script_sha256,
+        "authored_method": "fem",
+        "published_fem_with_unresolved_runtime": True,
+        "generic_unknown_header_rejected": True,
+        "no_mutating_requests": True,
+        "unresolved_status_probe": {
+            "only_active_lane_resolved_changed": True,
+            "domain_discretization": "fem",
+            "domain_generation_id": "generation-1",
+            "mesh_revision": 11,
+            "topology_revision": 12,
+        },
+        "canvas": {
+            "visible": True,
+            "context_lost": False,
+            "drawing_buffer_width": 1440,
+            "drawing_buffer_height": 1000,
+        },
+        "panels": [
+            {
+                "id": panel_id,
+                "node_id": node_id,
+                "selection_kind": selection_kind,
+                "header": header,
+                "group": group,
+                "required_group": group,
+                "verified": True,
+            }
+            for panel_id, node_id, selection_kind, header, group in expected_panels
+        ],
+        "api_comparisons": {
+            "airbox_carrier_count": 2,
+            "node_count": 100,
+            "element_count": 80,
+            "boundary_face_count": 120,
+            "surface_face_count": 80,
+            "mixed_element_families": ["tet4", "prism6", "pyramid5"],
+            "counts_verified": True,
+            "length_units_verified": True,
+            "quality_scope": "airbox",
+            "quality_marker": 0,
+            "quality_source_verified": True,
+            "length_units": ["m"],
+        },
+        "initial_quality_loading": {
+            "resource_status": "loading",
+            "panel_status": "loading",
+            "gate_result": "unknown",
+            "live_response_preserved": True,
+            "recovered_to_ready": True,
+        },
+        "synthetic_quality_fault_injection": {
+            "live_baseline": {"resource_status": "ready", "gate_result": "unknown", "revision": 7},
+            "evidence_kind": "fault-injected-ui-only-not-scientific",
+            "synthetic_pass_control": deepcopy(synthetic_pass),
+            "delayed_live_get": {
+                "cached_synthetic_gate_status": "pass",
+                "resource_status": "stale",
+                "panel_status": "stale",
+                "gate_result": "unknown",
+                "live_response_preserved": True,
+                "live_response_status": 200,
+                "requests": 1,
+                "restored_to_live_unknown": True,
+            },
+            "synthetic_pass_control_for_error": deepcopy(synthetic_pass),
+            "synthetic_error_get": {
+                "cached_synthetic_gate_status": "pass",
+                "http_status": 503,
+                "resource_status": "error",
+                "gate_result": "unknown",
+                "requests": 1,
+                "restored_to_live_unknown": True,
+            },
+            "final_live_state": {
+                "resource_status": "ready",
+                "gate_result": "unknown",
+                "revision_matches_live": True,
+            },
+        },
+        "resource_refresh": {
+            "resource_path": "/v2/sessions/current/meshing/meshes/shared-domain/manifest",
+            "same_root": True,
+            "live_response_preserved": True,
+            "status": 200,
+            "request_count": 1,
+            "delay_ms": 350,
+        },
+    }
+    payload = {
+        "schema": qa.AIRBOX_INSPECTOR_RESULT_SCHEMA,
+        "state": "passed",
+        "scenario": "airbox-inspector",
+        "public_url": public_url,
+        "probe_url": browser_url,
+        "playwright_version": qa.PLAYWRIGHT_VERSION,
+        "browser_gpu_mode": "swiftshader-webgl-requested",
+        "page_errors": 0,
+        "console_errors": 0,
+        "request_failures": 0,
+        "http_errors": [],
+        "synthetic_http_errors": [
+            "503 GET /v2/sessions/current/meshing/meshes/universe/quality",
+        ],
+        "synthetic_console_errors": [],
+        "resource_responses": [
+            {"url": browser_url + "/v2/sessions/current/status", "status": 200},
+        ],
+        "inspector_proof": proof,
+    }
+    return payload, public_url, browser_url, script_sha256
+
+
 def _recovery_fixture(qa):
     selected = ROOT.resolve()
     identity = {
@@ -836,6 +970,142 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             "/state/development/workspace/apps/control-room/scripts",
         })
 
+    def test_airbox_inspector_compose_is_opt_in_and_uses_the_managed_readonly_runner(self):
+        identity = {
+            "project_name": "fullmag-worktree-fixture",
+            "network_name": "fullmag-worktree-fixture_fullmag",
+            "project_id": "fullmag",
+            "worktree_id": "fixture",
+            "checkout_kind": "worktree",
+            "source_root": str(ROOT),
+        }
+        standard = self.qa._compose_document(
+            ROOT, identity, self.qa.DEFAULT_BROWSER_IMAGE, "fullmag-frontend-state", 3269, 180,
+        )
+        self.assertNotIn("CONTROL_ROOM_BROWSER_QA_SCENARIO", standard["services"]["browser-qa"]["environment"])
+        self.assertEqual(standard["services"]["browser-qa"]["command"][-1],
+                         "/state/development/workspace/apps/control-room/scripts/docker-dev-browser-qa.mjs")
+
+        inspector = self.qa._compose_document(
+            ROOT, identity, self.qa.DEFAULT_BROWSER_IMAGE, "fullmag-frontend-state", 3269, 180,
+            airbox_inspector=True,
+        )
+        service = inspector["services"]["browser-qa"]
+        self.assertEqual(service["environment"]["CONTROL_ROOM_BROWSER_QA_SCENARIO"], "airbox-inspector")
+        self.assertEqual(service["command"], [
+            "node",
+            "/state/development/workspace/apps/control-room/scripts/verify-airbox-inspector.mjs",
+        ])
+        self.assertTrue(service["read_only"])
+        self.assertNotIn("ports", service)
+        self.assertTrue(all(mount["read_only"] for mount in service["volumes"]))
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._compose_document(
+                ROOT, identity, self.qa.DEFAULT_BROWSER_IMAGE, "fullmag-frontend-state", 3269, 180,
+                canvas_only=False,
+                airbox_inspector=True,
+            )
+
+        class FakeControl:
+            project = identity["project_name"]
+
+        browser_id = "sha256:" + "c" * 64
+        inspect_document = {
+            "Id": browser_id,
+            "Image": browser_id,
+            "Config": {
+                "User": "65532:65532",
+                "Cmd": service["command"],
+                "Env": [f"{key}={value}" for key, value in service["environment"].items()],
+                "Labels": {
+                    **self.qa.source_labels(identity),
+                    "com.docker.compose.project": identity["project_name"],
+                    "com.docker.compose.service": "browser-qa",
+                },
+            },
+            "HostConfig": {
+                "GroupAdd": self.qa._script_bind_groups(ROOT),
+                "ReadonlyRootfs": True,
+                "NetworkMode": identity["network_name"],
+                "PortBindings": None,
+                "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=256m"},
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges:true"],
+                "ExtraHosts": None,
+            },
+            "State": {"Running": False, "ExitCode": 0},
+            "NetworkSettings": {
+                "Networks": {identity["network_name"]: {}},
+                "Ports": {},
+            },
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Name": "fullmag-frontend-state",
+                    "Destination": "/state/development",
+                    "RW": False,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(ROOT / "apps/control-room/scripts"),
+                    "Destination": "/state/development/workspace/apps/control-room/scripts",
+                    "RW": False,
+                },
+            ],
+        }
+        self.qa._validate_browser_helper(
+            inspect_document, FakeControl(), identity, "fullmag-frontend-state",
+            browser_id, 0, ROOT, airbox_inspector=True,
+        )
+        wrong_command = deepcopy(inspect_document)
+        wrong_command["Config"]["Cmd"][-1] = "/state/development/workspace/apps/control-room/scripts/docker-dev-browser-qa.mjs"
+        with self.assertRaises(self.qa.ControlOutcomeUnknown):
+            self.qa._validate_browser_helper(
+                wrong_command, FakeControl(), identity, "fullmag-frontend-state",
+                browser_id, 0, ROOT, airbox_inspector=True,
+            )
+
+    def test_airbox_inspector_result_parser_requires_specific_routes_and_nonvacuous_quality_control(self):
+        payload, public_url, browser_url, script_sha256 = _airbox_inspector_result_fixture(self.qa)
+        encoded = lambda value: (json.dumps(value) + "\n").encode("utf-8")
+        parsed = self.qa._parse_airbox_inspector_result(
+            encoded(payload), public_url, browser_url, script_sha256,
+        )
+        self.assertEqual(parsed["inspector_proof"]["synthetic_quality_fault_injection"]["evidence_kind"],
+                         "fault-injected-ui-only-not-scientific")
+
+        generic_header = deepcopy(payload)
+        generic_header["inspector_proof"]["panels"][0]["header"] = "Inspector"
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._parse_airbox_inspector_result(
+                encoded(generic_header), public_url, browser_url, script_sha256,
+            )
+
+        stale_control = deepcopy(payload)
+        stale_control["inspector_proof"]["synthetic_quality_fault_injection"]["synthetic_pass_control"]["revision"] += 1
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._parse_airbox_inspector_result(
+                encoded(stale_control), public_url, browser_url, script_sha256,
+            )
+
+        scoped_console = deepcopy(payload)
+        scoped_console["synthetic_console_errors"] = [
+            "http://frontend:8080/v2/sessions/current/meshing/meshes/universe/quality: Failed to load resource: 503",
+        ]
+        parsed_scoped_console = self.qa._parse_airbox_inspector_result(
+            encoded(scoped_console), public_url, browser_url, script_sha256,
+        )
+        self.assertEqual(parsed_scoped_console["synthetic_console_errors"], scoped_console["synthetic_console_errors"])
+
+        unrelated_console = deepcopy(payload)
+        unrelated_console["synthetic_console_errors"] = [
+            "http://frontend:8080/v2/sessions/current/status: Failed to load resource: 503",
+        ]
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._parse_airbox_inspector_result(
+                encoded(unrelated_console), public_url, browser_url, script_sha256,
+            )
+
     def test_compose_fixture_keeps_owned_volume_readonly_to_matching_uid(self):
         identity = {
             "project_name": "fullmag-worktree-fixture",
@@ -1175,7 +1445,7 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
                 return SimpleNamespace(returncode=1, stdout=b"", stderr=b"not found")
             raise AssertionError(f"unexpected daemon command: {args!r}")
 
-        def fake_parse(*_args):
+        def fake_parse(*_args, **_kwargs):
             raise qa.BuildControlError("invalid canvas evidence")
 
         with patch.object(qa, "_probe_public_loopback", return_value={"state": "passed"}), \

@@ -1,0 +1,1182 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
+
+const timeout = Math.min(
+  Number.parseInt(process.env.CONTROL_ROOM_BROWSER_QA_TIMEOUT_MS ?? "180000", 10),
+  120_000,
+);
+const publicUrl = process.env.CONTROL_ROOM_PUBLIC_URL ?? "";
+const probeUrl = process.env.CONTROL_ROOM_URL ?? "http://frontend:8080";
+const expectedVersion = process.env.CONTROL_ROOM_EXPECTED_PLAYWRIGHT_VERSION ?? "1.62.1";
+const browserGpuMode = process.env.CONTROL_ROOM_BROWSER_GPU_MODE ?? "swiftshader-webgl-requested";
+const resultSchema = "fullmag.docker-dev-airbox-inspector-result.v1";
+const proofSchema = "fullmag.airbox-inspector-browser-proof.v1";
+const manifestPath = "/v2/sessions/current/meshing/meshes/shared-domain/manifest";
+const statusPath = "/v2/sessions/current/status";
+const timeoutMs = Number.isFinite(timeout) ? timeout : 120_000;
+const require = createRequire(import.meta.url);
+
+const panels = [
+  {
+    id: "root",
+    nodeId: "model:airbox",
+    selectionKind: "airbox.root",
+    label: "Airbox",
+    requiredGroup: "Airbox Overview",
+  },
+  {
+    id: "mesh",
+    nodeId: "model:airbox:mesh",
+    selectionKind: "airbox.mesh",
+    label: "Mesh",
+    requiredGroup: "Airbox Mesh Overview",
+  },
+  {
+    id: "parameters",
+    nodeId: "model:airbox:mesh:parameters",
+    selectionKind: "airbox.mesh.parameters",
+    label: "Parameters",
+    requiredGroup: "Canonical Authored Parameters",
+  },
+  {
+    id: "quality-gates",
+    nodeId: "model:airbox:mesh:quality-gates",
+    selectionKind: "airbox.mesh.quality-gates",
+    label: "Quality Gates",
+    requiredGroup: "Airbox Quality Gates",
+  },
+  {
+    id: "statistics",
+    nodeId: "model:airbox:mesh:statistics",
+    selectionKind: "airbox.mesh.statistics",
+    label: "Statistics",
+    requiredGroup: "Airbox Mesh Statistics",
+  },
+  {
+    id: "topology",
+    nodeId: "model:airbox:mesh:topology",
+    selectionKind: "airbox.mesh.topology",
+    label: "Topology",
+    requiredGroup: "Airbox Mesh Topology",
+  },
+  {
+    id: "build",
+    nodeId: "model:airbox:mesh:build",
+    selectionKind: "airbox.mesh.build",
+    label: "Build & Provenance",
+    requiredGroup: "Airbox Mesh Build",
+  },
+];
+
+const resourcePaths = {
+  sessionStatus: statusPath,
+  universePolicy: "/v2/sessions/current/meshing/policies/universe",
+  sharedDomainManifest: manifestPath,
+  universeQuality: "/v2/sessions/current/meshing/meshes/universe/quality",
+  universeReport: "/v2/sessions/current/meshing/meshes/universe/report",
+  currentBuild: "/v2/sessions/current/meshing/builds/current",
+  latestSuccessfulBuild: "/v2/sessions/current/meshing/builds/latest-successful",
+};
+
+const pageErrors = [];
+const consoleErrors = [];
+const requestFailures = [];
+const httpErrors = [];
+const mutationRequests = [];
+const resourceResponses = [];
+const syntheticQualityHttpErrors = [];
+const syntheticQualityConsoleErrors = [];
+const delayMs = 350;
+let statusOverrides = 0;
+let refreshCount = 0;
+let refreshStatus = null;
+let refreshBodyPreserved = false;
+let syntheticQualityErrorActive = false;
+let resourceInvalidationSequence = 0;
+
+const qualityPath = new URL(resourcePaths.universeQuality, probeUrl).pathname;
+
+function bounded(value, limit = 2048) {
+  return String(value).slice(0, limit);
+}
+
+function collect(target, value) {
+  if (target.length < 32) target.push(bounded(value));
+}
+
+function routeUrl(path) {
+  return new URL(path, probeUrl).toString();
+}
+
+function safeCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function assertPositiveCount(value, name) {
+  assert(Number.isSafeInteger(value) && value > 0, `${name} must be a positive safe integer`);
+}
+
+async function waitForResourceState(page, path, states) {
+  await page.waitForFunction(
+    ({ resourceKey, allowedStates }) => {
+      const snapshot = window.__FULLMAG_CONTROL_ROOM_AUDIT__?.readViewportAuditResource?.(resourceKey);
+      return allowedStates.includes(snapshot?.status);
+    },
+    { resourceKey: path, allowedStates: states },
+    { timeout: timeoutMs },
+  );
+  return page.evaluate((resourceKey) =>
+    window.__FULLMAG_CONTROL_ROOM_AUDIT__?.readViewportAuditResource?.(resourceKey) ?? null,
+  path);
+}
+
+function invalidateResource(page, resourceKey) {
+  const revision = Date.now() + ++resourceInvalidationSequence;
+  return page.evaluate(({ key, nextRevision }) => {
+    const audit = window.__FULLMAG_CONTROL_ROOM_AUDIT__;
+    if (!audit?.invalidateResource) throw new Error("managed audit resource invalidation hook is unavailable");
+    audit.invalidateResource(key, nextRevision);
+  }, { key: resourceKey, nextRevision: revision });
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function withTimeout(promise, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readResource(request, path, name, sessionScopeKey = null) {
+  const response = await request.get(routeUrl(path), {
+    timeout: timeoutMs,
+    headers: {
+      accept: "application/json",
+      ...(sessionScopeKey ? { "x-fullmag-session-scope": sessionScopeKey } : {}),
+    },
+  });
+  const headers = response.headers();
+  const url = response.url();
+  const record = {
+    url,
+    status: response.status(),
+    content_type: headers["content-type"] ?? null,
+    contract_version: headers["x-fullmag-contract-version"] ?? null,
+  };
+  if (resourceResponses.length < 32) resourceResponses.push(record);
+  assert.equal(response.status(), 200, `GET ${path} returned ${response.status()}`);
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw new Error(`${name} did not return JSON: ${bounded(error)}`);
+  }
+  assert(body && typeof body === "object" && !Array.isArray(body), `${name} response must be an object`);
+  return body;
+}
+
+function normalizeAirboxId(value) {
+  let id = String(value ?? "").trim().toLowerCase();
+  while (id.startsWith("part:") || id.startsWith("object:")) id = id.slice(id.indexOf(":") + 1);
+  if (id.endsWith("_geom")) id = id.slice(0, -5);
+  return new Set(["airbox", "__air__", "__airbox__"]).has(id);
+}
+
+function isAirboxPart(part) {
+  return [part?.role].some((value) => ["air", "airbox"].includes(String(value ?? "").trim().toLowerCase()))
+    || [part?.id, part?.object_id, part?.geometry_id].some(normalizeAirboxId);
+}
+
+function intervalCoverage(parts) {
+  if (!parts.length) return { count: null, exact: false };
+  const intervals = [];
+  for (const part of parts) {
+    const explicit = Array.isArray(part.node_indices) ? part.node_indices : [];
+    const declared = safeCount(part.node_count);
+    if (explicit.length > 0 && declared === explicit.length) {
+      const sorted = explicit.map(safeCount);
+      if (sorted.some((value) => value === null)) return { count: null, exact: false };
+      sorted.sort((left, right) => left - right);
+      let start = sorted[0];
+      let previous = sorted[0];
+      for (const index of sorted.slice(1)) {
+        if (index > previous + 1) {
+          intervals.push([start, previous + 1]);
+          start = index;
+        }
+        previous = index;
+      }
+      intervals.push([start, previous + 1]);
+      continue;
+    }
+    const start = safeCount(part.node_start);
+    const count = safeCount(part.node_count);
+    if (start === null || count === null || start > Number.MAX_SAFE_INTEGER - count) {
+      return { count: null, exact: false };
+    }
+    if (count > 0) intervals.push([start, start + count]);
+  }
+  intervals.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  let total = 0;
+  let begin = null;
+  let end = null;
+  for (const [nextBegin, nextEnd] of intervals) {
+    if (begin === null || end === null) {
+      begin = nextBegin;
+      end = nextEnd;
+    } else if (nextBegin > end) {
+      total += end - begin;
+      begin = nextBegin;
+      end = nextEnd;
+    } else if (nextEnd > end) {
+      end = nextEnd;
+    }
+  }
+  if (begin !== null && end !== null) total += end - begin;
+  return Number.isSafeInteger(total) ? { count: total, exact: true } : { count: null, exact: false };
+}
+
+function sumPartCount(parts, key) {
+  if (!parts.length) return null;
+  let total = 0;
+  for (const part of parts) {
+    const count = safeCount(part?.[key]);
+    if (count === null || total > Number.MAX_SAFE_INTEGER - count) return null;
+    total += count;
+  }
+  return total;
+}
+
+function aggregatePartTypeCounts(parts, manifest) {
+  if (!parts.length) return { scope: "unpublished", values: {} };
+  const aggregate = {};
+  let complete = true;
+  for (const part of parts) {
+    const counts = part.element_counts_by_type;
+    if (!counts || typeof counts !== "object" || Array.isArray(counts)) {
+      complete = false;
+      break;
+    }
+    for (const [family, rawCount] of Object.entries(counts)) {
+      const count = safeCount(rawCount);
+      if (count === null || (aggregate[family] ?? 0) > Number.MAX_SAFE_INTEGER - count) {
+        complete = false;
+        break;
+      }
+      aggregate[family] = (aggregate[family] ?? 0) + count;
+    }
+    if (!complete) break;
+  }
+  if (complete && Object.keys(aggregate).length) return { scope: "airbox-parts", values: aggregate };
+  const shared = manifest.element_counts_by_type;
+  if (!shared || typeof shared !== "object" || Array.isArray(shared)) return { scope: "unpublished", values: {} };
+  return { scope: "shared-domain", values: shared };
+}
+
+function readGlobalQuality(quality) {
+  const value = quality?.quality;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value.global ?? null;
+}
+
+function uiSnapshot() {
+  const root = document.querySelector('[data-inspector-owner="airbox-inspector"]');
+  if (!root) return null;
+  const heading = root.querySelector(".fm-scientific-inspector__heading h3")?.textContent?.trim() ?? "";
+  const groups = [...root.querySelectorAll('[data-slot="inspector-group"]')];
+  const groupRows = groups.map((section) => {
+    const group = section.querySelector('[data-slot="inspector-group-heading"] h3, [data-slot="inspector-group-header"] h3, [data-slot="inspector-group-trigger"] h3, [data-slot="inspector-group-trigger"] span')?.textContent?.trim() ?? "";
+    const rows = [...section.querySelectorAll(".fm-inspector-field-row")];
+    const fields = Object.fromEntries(rows.map((row) => {
+      const label = row.querySelector(".fm-inspector-field-row__label")?.textContent?.trim() ?? "";
+      const value = row.querySelector(".fm-inspector-field-row__value")?.textContent?.trim() ?? "";
+      return [label, value];
+    }).filter(([label]) => label));
+    const units = Object.fromEntries(rows.map((row) => {
+      const label = row.querySelector(".fm-inspector-field-row__label")?.textContent?.trim() ?? "";
+      const unit = row.querySelector(".fm-inspector-field-row__value small")?.textContent?.trim() ?? null;
+      return [label, unit];
+    }).filter(([label, unit]) => label && unit));
+    return { group, fields, units };
+  });
+  const inspectorText = root.innerText.slice(0, 24_000);
+  const kindRow = groupRows.flatMap((group) => Object.entries(group.fields)).find(([label]) => label === "Inspector kind");
+  return {
+    heading,
+    inspectorKind: kindRow?.[1] ?? null,
+    groupRows,
+    text: inspectorText,
+  };
+}
+
+async function readPanel(page, panel) {
+  const node = page.locator(`.fm-explorer [role="treeitem"][data-node-id="${panel.nodeId}"]`).first();
+  await node.waitFor({ state: "visible", timeout: timeoutMs });
+  if ((await node.getAttribute("aria-expanded")) === "false") {
+    await node.scrollIntoViewIfNeeded();
+    await node.dblclick({ timeout: timeoutMs });
+  }
+  await node.scrollIntoViewIfNeeded();
+  await node.click({ timeout: timeoutMs });
+  await page.waitForFunction(
+    ({ nodeId, selectionKind }) => {
+      const selected = document.querySelector(`.fm-explorer [role="treeitem"][data-node-id="${nodeId}"]`);
+      const inspector = document.querySelector('[data-inspector-owner="airbox-inspector"]');
+      return selected?.getAttribute("aria-selected") === "true"
+        && inspector?.querySelector(".fm-scientific-inspector__heading h3")
+        && [...inspector.querySelectorAll(".fm-inspector-field-row")].some((row) =>
+          row.querySelector(".fm-inspector-field-row__label")?.textContent?.trim() === "Inspector kind"
+          && row.querySelector(".fm-inspector-field-row__value")?.textContent?.trim() === selectionKind);
+    },
+    { nodeId: panel.nodeId, selectionKind: panel.selectionKind },
+    { timeout: timeoutMs },
+  );
+  const snapshot = await page.evaluate(uiSnapshot);
+  assert(snapshot, `Inspector route ${panel.id} did not render its dedicated root`);
+  assert.equal(snapshot.inspectorKind, panel.selectionKind, `Inspector kind differs for ${panel.id}`);
+  const group = snapshot.groupRows.find((item) => item.group === panel.requiredGroup);
+  assert(group, `Inspector route ${panel.id} is missing ${panel.requiredGroup}`);
+  assert.equal(snapshot.heading, panel.label, `Inspector route ${panel.id} did not retain its dedicated title`);
+  assert(snapshot.heading && !["unknown", "inspector", "airbox inspector", "details"].includes(snapshot.heading.toLowerCase()),
+    `Inspector route ${panel.id} used generic header ${snapshot.heading}`);
+  assert(snapshot.text.length <= 24_000, `Inspector route ${panel.id} text exceeded its capture bound`);
+  return {
+    id: panel.id,
+    node_id: panel.nodeId,
+    selection_kind: panel.selectionKind,
+    header: snapshot.heading,
+    group: group.group,
+    required_group: panel.requiredGroup,
+    fields: group.fields,
+    units: group.units,
+    verified: true,
+  };
+}
+
+function fieldValue(panelProof, panelId, _group, label) {
+  const record = panelProof.find((entry) => entry.id === panelId);
+  assert(record, `Missing panel proof ${panelId}`);
+  const value = record.fields[label];
+  assert(typeof value === "string", `${panelId} did not publish ${label}`);
+  return value;
+}
+
+function numberFromText(text) {
+  const match = String(text).replaceAll(",", "").match(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/i);
+  return match ? Number(match[0]) : null;
+}
+
+function assertDisplayedCount(panelProof, panelId, group, label, expected) {
+  assert(Number.isSafeInteger(expected) && expected >= 0, `API did not publish ${label}`);
+  const actualText = fieldValue(panelProof, panelId, group, label);
+  assert.equal(numberFromText(actualText), expected, `${panelId}.${label} differs from API-derived count`);
+}
+
+function deriveApiComparisons({ policy, manifest, quality, report, status, panels: panelProof }) {
+  const parts = Array.isArray(manifest.mesh_parts) ? manifest.mesh_parts : [];
+  const airboxParts = parts.filter(isAirboxPart);
+  assert(airboxParts.length > 0, "Live shared-domain manifest did not identify an Airbox carrier");
+  const nodeCoverage = intervalCoverage(airboxParts);
+  assert(nodeCoverage.exact && nodeCoverage.count !== null, "API Airbox carrier node coverage is not exact");
+  const elementCount = sumPartCount(airboxParts, "element_count");
+  const boundaryFaceCount = sumPartCount(airboxParts, "boundary_face_count");
+  assert(elementCount !== null && boundaryFaceCount !== null, "API Airbox carrier counts are incomplete");
+  assert(airboxParts.every((part) => Array.isArray(part.surface_faces)), "API did not publish surface-face counts for every Airbox carrier");
+  const surfaceFaceCount = airboxParts.reduce((total, part) => total + part.surface_faces.length, 0);
+  const byType = aggregatePartTypeCounts(airboxParts, manifest);
+  const mixedFamilies = Object.entries(manifest.element_counts_by_type ?? {})
+    .filter(([, count]) => safeCount(count) > 0)
+    .map(([family]) => family)
+    .sort();
+  assert(mixedFamilies.length >= 2, "Live shared-domain manifest does not contain mixed volume element families");
+  const canonical = airboxParts.find((part) => ["air", "airbox"].includes(String(part.role ?? "").trim().toLowerCase()))
+    ?? airboxParts.find((part) => normalizeAirboxId(part.id));
+  assert(canonical?.id, "API did not publish the canonical Airbox carrier id");
+
+  const topologyCounts = {
+    node_count: nodeCoverage.count,
+    element_count: elementCount,
+    boundary_face_count: boundaryFaceCount,
+    surface_face_count: surfaceFaceCount,
+  };
+  for (const [label, count] of Object.entries(topologyCounts)) {
+    const expectedLabel = {
+      node_count: "Nodes (unique across carriers)",
+      element_count: "Elements (all carriers)",
+      boundary_face_count: "Boundary faces (all carriers)",
+    }[label];
+    if (expectedLabel) assertDisplayedCount(panelProof, "root", "root", expectedLabel, count);
+  }
+  assert.equal(fieldValue(panelProof, "root", "root", "Mesh carrier"), canonical.id);
+  assertDisplayedCount(panelProof, "statistics", "statistics", "Points / nodes (unique across carriers)", nodeCoverage.count);
+  assertDisplayedCount(panelProof, "statistics", "statistics", "Volume elements (all carriers)", elementCount);
+  assertDisplayedCount(panelProof, "statistics", "statistics", "Boundary faces", boundaryFaceCount);
+  assertDisplayedCount(panelProof, "statistics", "statistics", "Surface faces", surfaceFaceCount);
+  assertDisplayedCount(panelProof, "root", "root", "Airbox carriers", airboxParts.length);
+  assertDisplayedCount(panelProof, "topology", "topology", "Carrier count", airboxParts.length);
+  assert.equal(fieldValue(panelProof, "statistics", "statistics", "Ownership"), "shared, not exclusive Airbox memory");
+  for (const [family, count] of Object.entries(byType.values)) {
+    assertDisplayedCount(
+      panelProof,
+      "statistics",
+      "statistics",
+      byType.scope === "shared-domain" ? `${family} (shared-domain)` : family,
+      count,
+    );
+  }
+
+  const qualityRecord = quality.quality ?? null;
+  assert(qualityRecord && typeof qualityRecord === "object", "Universe quality resource did not publish quality data");
+  const gates = qualityRecord.airbox_quality_gates;
+  assert(gates && gates.scope === "airbox" && gates.marker === 0 && typeof gates.source === "string" && gates.source.length > 0,
+    "Universe quality endpoint did not publish marker-0 Airbox-scoped quality gates");
+  assert.equal(fieldValue(panelProof, "quality-gates", "quality-gates", "Scope"), gates.scope);
+  assert.equal(fieldValue(panelProof, "quality-gates", "quality-gates", "Marker"), String(gates.marker));
+  assert.equal(fieldValue(panelProof, "quality-gates", "quality-gates", "Source"), gates.source);
+  assert.equal(fieldValue(panelProof, "quality-gates", "quality-gates", "Evidence"), "backend");
+  const structuralScope = fieldValue(panelProof, "quality-gates", "quality-gates", "Scope");
+  assert.equal(structuralScope, "airbox", "Quality Gates scope row is not Airbox-specific");
+  const globalQuality = readGlobalQuality(quality);
+  assert(globalQuality && typeof globalQuality === "object", "Universe quality resource omitted the quality statistics scope");
+  const statsScope = fieldValue(panelProof, "statistics", "statistics", "Scope");
+  const qualityLabel = typeof globalQuality.label === "string" ? globalQuality.label : "Airbox endpoint scope";
+  assert.equal(statsScope, qualityLabel, "Statistics panel quality scope differs from the API");
+  const statsMarker = globalQuality.marker == null ? "not published" : String(globalQuality.marker);
+  assert.equal(fieldValue(panelProof, "statistics", "statistics", "Marker"), statsMarker);
+  if (typeof qualityRecord.quality_source === "string") {
+    assert.equal(fieldValue(panelProof, "statistics", "statistics", "Quality source"), qualityRecord.quality_source);
+  }
+  if (globalQuality.element_count != null) {
+    assertDisplayedCount(panelProof, "statistics", "statistics", "Elements in quality statistics", globalQuality.element_count);
+  }
+
+  const policyConfig = policy.config ?? {};
+  const effective = policy.effective_config ?? {};
+  const parameterPolicyRevision = fieldValue(panelProof, "parameters", "parameters", "Policy revision");
+  assert.equal(numberFromText(parameterPolicyRevision), policy.revision, "Parameters revision differs from the universe policy API");
+  const units = [];
+  for (const [field, apiKey] of [["Maximum element size", "airbox_hmax"], ["Minimum element size", "airbox_hmin"]]) {
+    const value = numberFromText(panelProof.find((entry) => entry.id === "parameters")?.parameter_values?.[field]);
+    const expected = policyConfig[apiKey];
+    assert(typeof expected === "number" && Number.isFinite(expected), `Universe policy API omitted ${apiKey}`);
+    assert(value !== null && Math.abs(value - expected) <= Math.max(1e-12, Math.abs(expected) * 1e-9),
+      `Parameters ${field} differs from the SI API value`);
+    const unit = panelProof.find((entry) => entry.id === "parameters")?.parameter_units?.[field];
+    assert.equal(unit, "m", `${field} unit control is not SI metres`);
+    units.push(unit);
+  }
+  for (const [label, key] of [["Effective maximum element size", "airbox_hmax"], ["Effective minimum element size", "airbox_hmin"]]) {
+    const actual = numberFromText(panelProof.find((entry) => entry.id === "parameters")?.parameter_effective_fields?.[label]);
+    const expected = numberFromText(effective[key]);
+    assert(actual !== null && expected !== null
+      && Math.abs(actual - expected) <= Math.max(1e-12, Math.abs(expected) * 1e-9),
+    `Parameters ${label} differs from the effective SI API value`);
+  }
+  const hmax = numberFromText(fieldValue(panelProof, "mesh", "mesh", "Build target maximum element size"));
+  const expectedHmax = manifest ? Number(
+    ((panelProof.find((entry) => entry.id === "mesh")?.api_effective_target ?? {}).hmax)
+      ?? ((panelProof.find((entry) => entry.id === "mesh")?.api_effective_target ?? {}).maximum_element_size),
+  ) : NaN;
+  assert(Number.isFinite(hmax) && Number.isFinite(expectedHmax)
+    && Math.abs(hmax - expectedHmax) <= Math.max(1e-12, Math.abs(expectedHmax) * 1e-9),
+  "Mesh overview effective maximum element size differs from the active build API");
+  const meshUnits = panelProof.find((entry) => entry.id === "mesh")?.units ?? {};
+  assert.equal(meshUnits["Build target maximum element size"], "m", "Mesh overview maximum element size is not labelled in SI metres");
+  const topologyUnits = panelProof.find((entry) => entry.id === "topology")?.units ?? {};
+  assert.equal(topologyUnits["Bounds min (full Airbox extent)"], "m", "Topology minimum bounds are not labelled in SI metres");
+  assert.equal(topologyUnits["Bounds max (full Airbox extent)"], "m", "Topology maximum bounds are not labelled in SI metres");
+  const bounds = airboxParts.map((part) => ({ min: part.bounds_min, max: part.bounds_max }));
+  assert(bounds.every(({ min, max }) => Array.isArray(min) && min.length >= 3 && Array.isArray(max) && max.length >= 3),
+    "API did not publish full Airbox bounds for every carrier");
+  const apiBounds = {
+    min: [0, 1, 2].map((index) => Math.min(...bounds.map((part) => part.min[index]))),
+    max: [0, 1, 2].map((index) => Math.max(...bounds.map((part) => part.max[index]))),
+  };
+  const parseVector = (value) => String(value).split(",").map(numberFromText);
+  for (const [label, expected] of [["Bounds min (full Airbox extent)", apiBounds.min], ["Bounds max (full Airbox extent)", apiBounds.max]]) {
+    const actual = parseVector(fieldValue(panelProof, "topology", "topology", label));
+    assert(actual.length === 3 && actual.every((value, index) => value !== null
+      && Math.abs(value - expected[index]) <= Math.max(1e-15, Math.abs(expected[index]) * 1e-9)),
+    `Topology ${label} differs from the published SI bounds`);
+  }
+  const statisticsUnits = panelProof.find((entry) => entry.id === "statistics")?.units ?? {};
+  for (const [label, expectedUnit] of [["Equivalent tetrahedral size", "m"], ["Edge length", "m"], ["Element volume", "m³"]]) {
+    if (statisticsUnits[label] !== undefined) {
+      assert.equal(statisticsUnits[label], expectedUnit, `Statistics unit differs for ${label}`);
+      units.push(expectedUnit);
+    }
+  }
+  const topologyIdentity = panelProof.find((entry) => entry.id === "topology")?.topology_identity;
+  assert(topologyIdentity?.verified === true, "Airbox topology panel did not verify published FEM identity");
+  assert.equal(
+    fieldValue(panelProof, "topology", "topology", "Topology identity"),
+    "matches current published FEM generation",
+    "Topology panel did not render the current published FEM identity",
+  );
+  const buildIdentity = panelProof.find((entry) => entry.id === "build")?.build_identity;
+  assert(buildIdentity?.verified === true, "Airbox Build panel did not match published build resources");
+  const reportRecord = report.report ?? {};
+  return {
+    airbox_carrier_count: airboxParts.length,
+    canonical_carrier_id: canonical.id,
+    node_count: nodeCoverage.count,
+    element_count: elementCount,
+    boundary_face_count: boundaryFaceCount,
+    surface_face_count: surfaceFaceCount,
+    element_count_scope: byType.scope,
+    element_counts_by_type: byType.values,
+    mixed_element_families: mixedFamilies,
+    length_units: [...new Set(units)],
+    length_units_verified: true,
+    counts_verified: true,
+    quality_scope: gates.scope,
+    quality_marker: gates.marker,
+    quality_source_verified: true,
+    quality_status: gates.status ?? null,
+    quality_check_count: Array.isArray(gates.checks) ? gates.checks.length : 0,
+    quality_statistics_scope: qualityLabel,
+    quality_statistics_marker: statsMarker,
+    report_status: reportRecord.status ?? null,
+    policy_revision: policy.revision,
+    quality_revision: quality.revision,
+    topology_revision: manifest.revision,
+    active_lane_resolved: status.capabilities?.active_lane?.resolved?.discretization ?? null,
+  };
+}
+
+async function panelDataSnapshot(page) {
+  return page.evaluate(() => {
+    const root = document.querySelector('[data-inspector-owner="airbox-inspector"]');
+    if (!root) return null;
+    const groupByTitle = (title) => [...root.querySelectorAll('[data-slot="inspector-group"]')]
+      .find((section) => [...section.querySelectorAll("h3, [data-slot='inspector-group-trigger'] span")]
+        .some((heading) => heading.textContent?.trim() === title));
+    const fields = (title) => {
+      const group = groupByTitle(title);
+      if (!group) return {};
+      return Object.fromEntries([...group.querySelectorAll(".fm-inspector-field-row")].map((row) => {
+        const label = row.querySelector(".fm-inspector-field-row__label")?.textContent?.trim() ?? "";
+        const value = row.querySelector(".fm-inspector-field-row__value");
+        return [label, value?.textContent?.trim() ?? ""];
+      }).filter(([label]) => label));
+    };
+    return {
+      parametersFields: fields("Canonical Authored Parameters"),
+      parameterEffectiveFields: fields("Backend-effective Values"),
+      parameterUnits: Object.fromEntries(["Maximum element size", "Minimum element size"].map((label) => [
+        label,
+        root.querySelector(`[aria-label="${label} unit"]`)?.value ?? null,
+      ])),
+      parameterValues: Object.fromEntries(["Maximum element size", "Minimum element size"].map((label) => [
+        label,
+        root.querySelector(`[aria-label="${label}"]`)?.value ?? null,
+      ])),
+      meshFields: fields("Airbox Mesh Overview"),
+      topologyFields: fields("Airbox Mesh Topology"),
+      buildFields: fields("Airbox Mesh Build"),
+    };
+  });
+}
+
+async function inspectCanvas(page) {
+  const canvas = page.locator(".fm-viewport-3d canvas").first();
+  await canvas.waitFor({ state: "visible", timeout: timeoutMs });
+  return canvas.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const gl = element.getContext("webgl2") ?? element.getContext("webgl");
+    return {
+      visible: rect.width > 0 && rect.height > 0,
+      width: element.width,
+      height: element.height,
+      context_type: gl?.constructor?.name ?? null,
+      context_lost: gl?.isContextLost?.() ?? null,
+      drawing_buffer_width: gl?.drawingBufferWidth ?? 0,
+      drawing_buffer_height: gl?.drawingBufferHeight ?? 0,
+    };
+  });
+}
+
+async function expandNode(page, nodeId) {
+  const node = page.locator(`.fm-explorer [role="treeitem"][data-node-id="${nodeId}"]`).first();
+  await node.waitFor({ state: "visible", timeout: timeoutMs });
+  if ((await node.getAttribute("aria-expanded")) === "false") {
+    await node.scrollIntoViewIfNeeded();
+    await node.dblclick({ timeout: timeoutMs });
+    await page.waitForFunction(
+      (id) => document.querySelector(`.fm-explorer [role="treeitem"][data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true",
+      nodeId,
+      { timeout: timeoutMs },
+    );
+  }
+}
+
+async function installResolvedNullStatusRoute(page) {
+  let preserved = false;
+  await page.route(`**${statusPath}*`, async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    const response = await route.fetch();
+    const body = await response.json();
+    const baseline = structuredClone(body);
+    assert.equal(body?.capabilities?.active_lane?.authored?.discretization, "fem",
+      "Live status route no longer carries authored FEM identity");
+    assert.equal(body?.domain?.discretization, "fem", "Live status route no longer carries published FEM domain identity");
+    body.capabilities.active_lane.resolved = null;
+    const after = structuredClone(body);
+    after.capabilities.active_lane.resolved = baseline.capabilities.active_lane.resolved;
+    preserved = JSON.stringify(baseline) === JSON.stringify(after);
+    assert(preserved, "Resolved-null probe changed status fields outside active_lane.resolved");
+    statusOverrides += 1;
+    await route.fulfill({ response, body: JSON.stringify(body) });
+  });
+  await page.evaluate(() => {
+    const audit = window.__FULLMAG_CONTROL_ROOM_AUDIT__;
+    if (!audit?.invalidateResource) throw new Error("managed audit resource invalidation hook is unavailable");
+    audit.invalidateResource("session:status", Date.now());
+  });
+  await page.waitForFunction(() => {
+    const audit = window.__FULLMAG_CONTROL_ROOM_AUDIT__;
+    const snapshot = audit?.readViewportAuditResource?.("session:status");
+    return Boolean(snapshot?.status === "ready"
+      && snapshot?.data?.capabilities?.active_lane?.resolved === null
+      && snapshot?.data?.capabilities?.active_lane?.authored?.discretization === "fem"
+      && snapshot?.data?.domain?.discretization === "fem");
+  }, null, { timeout: timeoutMs });
+  assert(statusOverrides > 0, "Resolved-null status probe was not exercised through the application resource layer");
+  return { status_overrides: statusOverrides, other_fields_preserved: preserved };
+}
+
+async function triggerStableManifestRefresh(page, expectedManifest) {
+  const rootHandle = await page.locator('[data-inspector-owner="airbox-inspector"]').elementHandle();
+  assert(rootHandle, "Airbox Inspector root is missing before resource refresh");
+  await page.route(`**${manifestPath}*`, async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    refreshCount += 1;
+    const response = await route.fetch();
+    refreshStatus = response.status();
+    const actualBody = await response.body();
+    try {
+      refreshBodyPreserved = JSON.stringify(JSON.parse(actualBody.toString("utf8")))
+        === JSON.stringify(expectedManifest);
+    } catch {
+      refreshBodyPreserved = false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    await route.fulfill({ response, body: actualBody });
+  });
+  await page.evaluate(() => {
+    const audit = window.__FULLMAG_CONTROL_ROOM_AUDIT__;
+    if (!audit?.invalidateResource) throw new Error("managed audit resource invalidation hook is unavailable");
+    audit.invalidateResource("/v2/sessions/current/meshing/meshes/shared-domain/manifest", Date.now() + 1);
+  });
+  const refreshDeadline = Date.now() + timeoutMs;
+  while (refreshCount === 0 && Date.now() < refreshDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert(refreshCount > 0, "Manifest resource refresh did not issue a live GET");
+  await page.waitForTimeout(delayMs + 100);
+  const sameRoot = await page.evaluate((before) => before === document.querySelector('[data-inspector-owner="airbox-inspector"]'), rootHandle);
+  await rootHandle.dispose();
+  assert(sameRoot, "Airbox Inspector root remounted during manifest refresh");
+  assert(refreshCount >= 1 && refreshCount <= 4, `Expected bounded manifest refresh, saw ${refreshCount} requests`);
+  assert(refreshStatus >= 200 && refreshStatus < 300, `Manifest refresh returned ${refreshStatus}`);
+  assert(refreshBodyPreserved, "Manifest refresh did not preserve the live API response body");
+  return {
+    resource_path: manifestPath,
+    same_root: sameRoot,
+    live_response_preserved: refreshBodyPreserved,
+    status: refreshStatus,
+    request_count: refreshCount,
+    delay_ms: delayMs,
+  };
+}
+
+async function exerciseInitialQualityLoading(page, expectedQuality) {
+  const path = resourcePaths.universeQuality;
+  const pattern = `**${path}*`;
+  const refreshStarted = deferred();
+  const releaseRefresh = deferred();
+  let requestCount = 0;
+  let responseStatus = null;
+  let responsePreserved = false;
+  await page.route(pattern, async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    requestCount += 1;
+    const response = await route.fetch();
+    const body = await response.body();
+    responseStatus = response.status();
+    refreshStarted.resolve();
+    await releaseRefresh.promise;
+    try {
+      responsePreserved = JSON.stringify(JSON.parse(body.toString("utf8")))
+        === JSON.stringify(expectedQuality);
+    } catch {
+      responsePreserved = false;
+    }
+    await route.fulfill({ response, body });
+  });
+  let loadingPanel;
+  let loadingStatus;
+  try {
+    await readPanel(page, panels[0]);
+    await readPanel(page, panels[1]);
+    await withTimeout(refreshStarted.promise, "First Inspector quality GET did not start");
+    const pending = await waitForResourceState(page, path, ["loading"]);
+    loadingStatus = pending?.status ?? null;
+    loadingPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+    assert.equal(loadingPanel.fields["Quality resource"], "loading",
+      "Quality Gates panel did not expose the first-load state");
+    assert.equal(loadingPanel.fields["Airbox-scoped result"], "unknown",
+      "Airbox quality panel showed a pass/fail result while its resource was loading");
+  } finally {
+    releaseRefresh.resolve();
+    await page.unroute(pattern);
+  }
+  await waitForResourceState(page, path, ["ready"]);
+  const recovered = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+  assert.equal(recovered.fields["Quality resource"], "ready", "First live quality response did not reach the ready state");
+  assert(requestCount >= 1 && requestCount <= 4, `Initial quality GET count is out of bounds: ${requestCount}`);
+  assert(responseStatus >= 200 && responseStatus < 300, "Initial quality response was not successful live data");
+  assert(responsePreserved, "Initial quality GET did not preserve the live API response body");
+  return {
+    resource_status: loadingStatus,
+    panel_status: loadingPanel.fields["Quality resource"],
+    gate_result: loadingPanel.fields["Airbox-scoped result"],
+    live_response_preserved: responsePreserved,
+    live_response_status: responseStatus,
+    requests: requestCount,
+    recovered_to_ready: recovered.fields["Quality resource"] === "ready",
+  };
+}
+
+async function exerciseQualityReadStates(page) {
+  const path = resourcePaths.universeQuality;
+  const pattern = `**${path}*`;
+  const livePanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+  const liveSnapshot = await waitForResourceState(page, path, ["ready"]);
+  const liveGateResult = livePanel.fields["Airbox-scoped result"];
+  assert.equal(liveGateResult, "unknown",
+    "The mixed FEM fixture must retain the live unknown result for its incomplete mixed-family quality evidence");
+  assert.equal(livePanel.fields["Quality resource"], "ready", "Baseline Airbox quality resource is not live-ready");
+  const liveRevision = liveSnapshot?.data?.revision;
+  assert(Number.isSafeInteger(liveRevision) && liveRevision > 0, "Live quality response omitted its revision");
+  const liveQuality = liveSnapshot?.data?.quality;
+  const liveGates = liveQuality?.airbox_quality_gates;
+  assert(liveGates && liveGates.scope === "airbox" && liveGates.marker === 0,
+    "Live quality response omitted marker-0 Airbox gate provenance");
+
+  const syntheticPassData = JSON.parse(JSON.stringify(liveSnapshot.data));
+  syntheticPassData.quality.airbox_quality_gates = {
+    ...syntheticPassData.quality.airbox_quality_gates,
+    status: "pass",
+    reason: "Synthetic browser QA fault injection; not scientific quality evidence.",
+  };
+  const installSyntheticPass = async () => {
+    let requests = 0;
+    let upstreamStatus = null;
+    let revisionPreserved = false;
+    await page.route(pattern, async (route) => {
+      if (route.request().method() !== "GET") return route.continue();
+      requests += 1;
+      const response = await route.fetch();
+      upstreamStatus = response.status();
+      revisionPreserved = String(syntheticPassData?.revision) === String(liveRevision);
+      assert.equal(upstreamStatus, 200, "Synthetic pass control did not start from a successful live response");
+      assert(revisionPreserved, "Synthetic pass control does not match the live quality revision");
+      await route.fulfill({ response, body: JSON.stringify(syntheticPassData) });
+    });
+    try {
+      await invalidateResource(page, path);
+      const syntheticSnapshot = await waitForResourceState(page, path, ["ready"]);
+      const panel = await readPanel(page, panels.find((item) => item.id === "quality-gates"));
+      assert.equal(String(syntheticSnapshot?.data?.revision), String(liveRevision),
+        "Synthetic pass control changed the live quality revision");
+      assert.equal(syntheticSnapshot?.data?.quality?.airbox_quality_gates?.status, "pass",
+        "Synthetic pass response was not installed in the resource cache");
+      assert.equal(panel.fields["Quality resource"], "ready", "Synthetic pass control did not reach ready");
+      assert.equal(panel.fields["Airbox-scoped result"], "pass",
+        "Nonvacuous cached-pass control did not render pass before invalidation");
+    } finally {
+      await page.unroute(pattern);
+    }
+    assert(requests >= 1 && requests <= 4, `Synthetic pass control GET count is out of bounds: ${requests}`);
+    assert.equal(upstreamStatus, 200, "Synthetic pass control did not preserve a successful live response");
+    assert(revisionPreserved, "Synthetic pass control was not based on the matching live revision");
+    return { requests, revision: liveRevision, rendered_pass: true, revision_matches_live: true };
+  };
+
+  const syntheticPassControl = await installSyntheticPass();
+
+  const refreshStarted = deferred();
+  const releaseRefresh = deferred();
+  let delayedRequests = 0;
+  let delayedResponseStatus = null;
+  let delayedBodyPreserved = false;
+  await page.route(pattern, async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    delayedRequests += 1;
+    const response = await route.fetch();
+    const body = await response.body();
+    delayedResponseStatus = response.status();
+    refreshStarted.resolve();
+    await releaseRefresh.promise;
+    try {
+      delayedBodyPreserved = JSON.stringify(JSON.parse(body.toString("utf8")))
+        === JSON.stringify(liveSnapshot.data);
+    } catch {
+      delayedBodyPreserved = false;
+    }
+    await route.fulfill({ response, body });
+  });
+  let loadingPanel;
+  let loadingResourceStatus;
+  try {
+    await invalidateResource(page, path);
+    await withTimeout(refreshStarted.promise, "Delayed live quality GET did not start");
+    const pendingSnapshot = await waitForResourceState(page, path, ["stale", "loading", "pending"]);
+    loadingResourceStatus = pendingSnapshot?.status ?? null;
+    assert.equal(pendingSnapshot?.data?.quality?.airbox_quality_gates?.status, "pass",
+      "Delayed refresh did not retain the synthetic cached pass needed for a nonvacuous suppression check");
+    loadingPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+    assert(["stale", "loading", "pending"].includes(loadingPanel.fields["Quality resource"]),
+      "Quality panel did not expose its delayed loading/stale state");
+    assert.equal(loadingPanel.fields["Airbox-scoped result"], "unknown",
+      "Airbox quality panel showed a pass/fail result while its resource was stale or loading");
+  } finally {
+    releaseRefresh.resolve();
+    await page.unroute(pattern);
+  }
+  const restoredSnapshot = await waitForResourceState(page, path, ["ready"]);
+  const restoredPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+  assert.equal(restoredSnapshot?.data?.quality?.airbox_quality_gates?.status, "unknown",
+    "Delayed live response did not restore the actual unknown Airbox gate result");
+  assert.equal(restoredPanel.fields["Quality resource"], "ready", "Live quality GET did not restore the ready resource");
+  assert.equal(restoredPanel.fields["Airbox-scoped result"], liveGateResult,
+    "Delayed live quality response changed the Airbox gate result");
+  assert(delayedRequests >= 1 && delayedRequests <= 4, `Delayed quality GET count is out of bounds: ${delayedRequests}`);
+  assert(delayedResponseStatus >= 200 && delayedResponseStatus < 300, "Delayed quality response was not live successful data");
+  assert(delayedBodyPreserved, "Delayed quality response body was not preserved");
+
+  const syntheticPassControlForError = await installSyntheticPass();
+  let errorRequests = 0;
+  await page.route(pattern, async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    errorRequests += 1;
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "synthetic browser QA quality-resource failure" }),
+    });
+  });
+  syntheticQualityErrorActive = true;
+  let errorPanel;
+  let errorSnapshot;
+  try {
+    await invalidateResource(page, path);
+    errorSnapshot = await waitForResourceState(page, path, ["error"]);
+    assert.equal(errorSnapshot?.data?.quality?.airbox_quality_gates?.status, "pass",
+      "Synthetic error did not retain the matching cached pass needed for a nonvacuous suppression check");
+    errorPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+    assert.equal(errorPanel.fields["Quality resource"], "error", "Injected quality GET error did not reach the Inspector resource state");
+    assert.equal(errorPanel.fields["Airbox-scoped result"], "unknown",
+      "Airbox quality panel showed a pass/fail result after its quality resource failed");
+  } finally {
+    await page.unroute(pattern);
+    await page.waitForTimeout(50);
+    syntheticQualityErrorActive = false;
+  }
+  assert(errorRequests >= 1 && errorRequests <= 4, `Synthetic quality error GET count is out of bounds: ${errorRequests}`);
+  assert(syntheticQualityHttpErrors.some((item) => item.includes("503 GET /v2/sessions/current/meshing/meshes/universe/quality")),
+    "Synthetic quality failure response was not recorded separately from live API errors");
+
+  await invalidateResource(page, path);
+  const recoveredSnapshot = await waitForResourceState(page, path, ["ready"]);
+  const recoveredPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+  assert.equal(recoveredSnapshot?.data?.quality?.airbox_quality_gates?.status, "unknown",
+    "Live recovery did not restore the actual unknown Airbox gate result");
+  assert.equal(recoveredPanel.fields["Quality resource"], "ready", "Live quality GET did not recover after the isolated error route was removed");
+  assert.equal(recoveredPanel.fields["Airbox-scoped result"], liveGateResult,
+    "Live quality result did not recover after the isolated error route was removed");
+  assert.equal(String(recoveredSnapshot?.data?.revision), String(liveSnapshot?.data?.revision),
+    "Quality resource revision changed during read-only synthetic browser checks");
+
+  return {
+    live_baseline: { resource_status: "ready", gate_result: liveGateResult, revision: liveRevision },
+    evidence_kind: "fault-injected-ui-only-not-scientific",
+    synthetic_pass_control: syntheticPassControl,
+    delayed_live_get: {
+      resource_status: loadingResourceStatus,
+      panel_status: loadingPanel.fields["Quality resource"],
+      gate_result: loadingPanel.fields["Airbox-scoped result"],
+      live_response_preserved: delayedBodyPreserved,
+      live_response_status: delayedResponseStatus,
+      requests: delayedRequests,
+      cached_synthetic_gate_status: "pass",
+      restored_to_live_unknown: restoredPanel.fields["Airbox-scoped result"] === liveGateResult,
+    },
+    synthetic_pass_control_for_error: syntheticPassControlForError,
+    synthetic_error_get: {
+      http_status: 503,
+      resource_status: errorPanel.fields["Quality resource"],
+      gate_result: errorPanel.fields["Airbox-scoped result"],
+      requests: errorRequests,
+      cached_synthetic_gate_status: "pass",
+      restored_to_live_unknown: recoveredPanel.fields["Airbox-scoped result"] === liveGateResult,
+    },
+    final_live_state: {
+      resource_status: recoveredPanel.fields["Quality resource"],
+      gate_result: recoveredPanel.fields["Airbox-scoped result"],
+      revision_matches_live: String(recoveredSnapshot?.data?.revision) === String(liveRevision),
+    },
+  };
+}
+
+async function main() {
+  assert.equal(process.env.CONTROL_ROOM_BROWSER_QA_SCENARIO, "airbox-inspector",
+    "Airbox Inspector browser harness requires managed scenario admission");
+  assert(publicUrl.startsWith("http://127.0.0.1:"), "Managed browser QA did not pin the public loopback URL");
+  const playwrightVersion = require("playwright/package.json").version;
+  assert.equal(playwrightVersion, expectedVersion, "Playwright package does not match the pinned browser image");
+  const runnerPath = fileURLToPath(import.meta.url);
+  const scriptSha256 = createHash("sha256").update(await readFile(runnerPath)).digest("hex");
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--enable-unsafe-swiftshader", "--use-angle=swiftshader-webgl"],
+  });
+  let context;
+  let page;
+  let proof;
+  try {
+    context = await browser.newContext({
+      viewport: { width: 1440, height: 1000 },
+      deviceScaleFactor: 1,
+      serviceWorkers: "block",
+    });
+    await context.addInitScript(() => {
+      window.__FULLMAG_CONFIG__ = {
+        ...(window.__FULLMAG_CONFIG__ ?? {}),
+        enableAuditHooks: true,
+      };
+    });
+    page = await context.newPage();
+    page.setDefaultTimeout(timeoutMs);
+    page.on("pageerror", (error) => collect(pageErrors, error?.message ?? error));
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        const text = message.text();
+        const locationUrl = message.location()?.url;
+        let isSyntheticQualityConsoleError = false;
+        if (syntheticQualityErrorActive && typeof locationUrl === "string" && locationUrl) {
+          try {
+            isSyntheticQualityConsoleError = new URL(locationUrl).pathname === qualityPath;
+          } catch {
+            isSyntheticQualityConsoleError = false;
+          }
+        }
+        if (isSyntheticQualityConsoleError) {
+          collect(syntheticQualityConsoleErrors, `${locationUrl}: ${text}`);
+        } else {
+          collect(consoleErrors, text);
+        }
+      }
+    });
+    page.on("requestfailed", (request) => collect(requestFailures, `${request.method()} ${request.url()}: ${request.failure()?.errorText ?? "failed"}`));
+    page.on("request", (request) => {
+      const path = new URL(request.url()).pathname;
+      if (path.startsWith("/v2/sessions/current/") && !["GET", "HEAD"].includes(request.method())) {
+        collect(mutationRequests, `${request.method()} ${path}`);
+      }
+    });
+    page.on("response", (response) => {
+      if (response.status() >= 400) {
+        const item = `${response.status()} ${response.request().method()} ${new URL(response.url()).pathname}`;
+        if (syntheticQualityErrorActive
+          && response.status() === 503
+          && response.request().method() === "GET"
+          && new URL(response.url()).pathname === resourcePaths.universeQuality) {
+          collect(syntheticQualityHttpErrors, item);
+        } else {
+          collect(httpErrors, item);
+        }
+      }
+    });
+
+    await page.goto(new URL("/workspace", probeUrl).toString(), { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await page.locator(".fm-explorer").waitFor({ state: "visible", timeout: timeoutMs });
+    await page.locator("[data-node-id='model:airbox']").waitFor({ state: "visible", timeout: timeoutMs });
+    await page.waitForFunction(() => Boolean(window.__FULLMAG_CONTROL_ROOM_AUDIT__?.invalidateResource), null, { timeout: timeoutMs });
+
+    const status = await readResource(page.request, resourcePaths.sessionStatus, "current session status");
+    const authoredMethod = status.capabilities?.active_lane?.authored?.discretization ?? null;
+    const activeLaneStatus = status.capabilities?.active_lane ?? null;
+    const actualResolved = activeLaneStatus?.resolved?.discretization ?? null;
+    assert.equal(authoredMethod, "fem", "Live browser session is not authored as FEM");
+    assert.equal(status.domain?.discretization, "fem", "Live session does not publish FEM domain metadata");
+    assertPositiveCount(status.domain?.cell_count, "published FEM cell count");
+    assertPositiveCount(status.resources?.mesh_revision, "published FEM mesh revision");
+    assertPositiveCount(status.resources?.topology_revision, "published FEM topology revision");
+    assert.equal(status.resources?.domain_generation_id, status.domain?.generation_id,
+      "Live FEM status does not bind its domain generation to the resource identity");
+
+    const session = status.session;
+    assert(typeof session?.session_id === "string" && session.session_id.length > 0, "Live status omitted the session identity");
+    assert(typeof session?.session_epoch === "string" && session.session_epoch.length > 0, "Live status omitted the session epoch");
+    assert(typeof session?.request_scope_epoch === "string" && session.request_scope_epoch.length > 0, "Live status omitted the API scope epoch");
+    const sessionScopeKey = `session=${encodeURIComponent(session.session_id)}&epoch=${encodeURIComponent(session.session_epoch)}&request_scope_epoch=${encodeURIComponent(session.request_scope_epoch)}`;
+    const [policy, manifest, quality, report, currentBuild, latestBuild] = await Promise.all([
+      readResource(page.request, resourcePaths.universePolicy, "universe mesh policy", sessionScopeKey),
+      readResource(page.request, resourcePaths.sharedDomainManifest, "shared-domain manifest", sessionScopeKey),
+      readResource(page.request, resourcePaths.universeQuality, "universe quality", sessionScopeKey),
+      readResource(page.request, resourcePaths.universeReport, "universe report", sessionScopeKey),
+      readResource(page.request, resourcePaths.currentBuild, "current mesh build", sessionScopeKey),
+      readResource(page.request, resourcePaths.latestSuccessfulBuild, "latest successful mesh build", sessionScopeKey),
+    ]);
+    assert.equal(manifest.generation_id, status.domain.generation_id, "Manifest generation differs from live FEM status");
+    assert.equal(String(manifest.revision), String(status.resources.mesh_revision), "Manifest revision differs from live FEM mesh revision");
+    assert.equal(manifest.revision, status.resources.mesh_revision, "Manifest revision is not the current published mesh revision");
+    assert.equal(manifest.topology_fingerprint?.length > 0, true, "Manifest omitted topology fingerprint");
+    assert.equal(currentBuild.revision != null, true, "Current build resource omitted its revision");
+    assert.equal(latestBuild.last_success != null, true, "Latest successful build resource omitted its artifact");
+
+    const canvas = await inspectCanvas(page);
+    assert.equal(canvas.visible, true, "Workspace canvas is not visible");
+    assert.equal(canvas.context_lost, false, "Workspace WebGL context is lost or unknown");
+    assert(canvas.drawing_buffer_width > 0 && canvas.drawing_buffer_height > 0, "Workspace canvas has an empty drawing buffer");
+
+    await expandNode(page, "model:airbox");
+    await expandNode(page, "model:airbox:mesh");
+    const nullResolution = activeLaneStatus?.resolved === null
+      ? { status_overrides: 0, other_fields_preserved: true }
+      : await installResolvedNullStatusRoute(page);
+    assert.equal(nullResolution.other_fields_preserved, true, "Resolved-null status probe changed live API fields outside the lane");
+    const initialQualityLoading = await exerciseInitialQualityLoading(page, quality);
+
+    const panelProof = [];
+    for (const panel of panels) {
+      panelProof.push(await readPanel(page, panel));
+      const snapshot = await panelDataSnapshot(page);
+      assert(snapshot, `Inspector route ${panel.id} lost its root during panel evidence capture`);
+      if (panel.id === "parameters") {
+        panelProof[panelProof.length - 1].parameter_units = snapshot.parameterUnits;
+        panelProof[panelProof.length - 1].parameter_values = snapshot.parameterValues;
+        panelProof[panelProof.length - 1].parameter_effective_fields = snapshot.parameterEffectiveFields;
+      }
+      if (panel.id === "mesh") {
+        panelProof[panelProof.length - 1].api_effective_target = currentBuild.effective_airbox_target ?? currentBuild.last_build_summary?.effective_airbox_target ?? {};
+      }
+      if (panel.id === "topology") {
+        const identityMatches = status.domain.generation_id === status.resources.domain_generation_id
+          && status.domain.generation_id === manifest.generation_id
+          && status.domain.cell_count > 0
+          && status.resources.mesh_revision > 0
+          && status.resources.topology_revision > 0
+          && String(manifest.revision) === String(status.resources.mesh_revision);
+        panelProof[panelProof.length - 1].topology_identity = { verified: identityMatches, generation_id: manifest.generation_id, revision: manifest.revision };
+        assert(identityMatches, "Published FEM topology identity is incomplete");
+      }
+      if (panel.id === "build") {
+        const buildFields = snapshot.buildFields;
+        const buildIdentityMatches = numberFromText(buildFields["Current build revision"]) === currentBuild.revision
+          && numberFromText(buildFields["Universe report revision"]) === report.revision
+          && numberFromText(buildFields["Latest successful revision"]) === (latestBuild.revision ?? null);
+        panelProof[panelProof.length - 1].build_identity = { verified: buildIdentityMatches };
+        assert(buildIdentityMatches, "Airbox Build panel does not match live current/report/latest-success API resources");
+      }
+    }
+
+    // Return to the root to prove its DOM node survives a real GET refresh.
+    await readPanel(page, panels[0]);
+    const refresh = await triggerStableManifestRefresh(page, manifest);
+    const comparisons = deriveApiComparisons({ policy, manifest, quality, report, status, panels: panelProof });
+    const qualityStateProof = await exerciseQualityReadStates(page);
+    assert.equal(mutationRequests.length, 0, `Browser sent mutating session requests: ${mutationRequests.join(", ")}`);
+    assert.equal(pageErrors.length, 0, `Browser page errors: ${pageErrors.join(" | ")}`);
+    assert.equal(consoleErrors.length, 0, `Browser console errors: ${consoleErrors.join(" | ")}`);
+    assert.equal(requestFailures.length, 0, `Browser request failures: ${requestFailures.join(" | ")}`);
+    assert.equal(httpErrors.length, 0, `Browser HTTP errors: ${httpErrors.join(" | ")}`);
+
+    proof = {
+      schema: proofSchema,
+      script_sha256: scriptSha256,
+      authored_method: authoredMethod,
+      actual_resolved_discretization: actualResolved,
+      published_fem_with_unresolved_runtime: true,
+      unresolved_status_probe: {
+        source: actualResolved === null ? "live-session-status" : "single-field-status-route-overlay",
+        status_overrides: nullResolution.status_overrides,
+        only_active_lane_resolved_changed: nullResolution.other_fields_preserved,
+        domain_discretization: status.domain.discretization,
+        domain_generation_id: status.domain.generation_id,
+        mesh_revision: status.resources.mesh_revision,
+        topology_revision: status.resources.topology_revision,
+      },
+      generic_unknown_header_rejected: true,
+      no_mutating_requests: true,
+      canvas,
+      panels: panelProof,
+      api_comparisons: comparisons,
+      resource_refresh: refresh,
+      initial_quality_loading: initialQualityLoading,
+      synthetic_quality_fault_injection: qualityStateProof,
+    };
+
+    const output = {
+      schema: resultSchema,
+      state: "passed",
+      scenario: "airbox-inspector",
+      public_url: publicUrl,
+      probe_url: probeUrl,
+      playwright_version: playwrightVersion,
+      browser_gpu_mode: browserGpuMode,
+      page_errors: pageErrors.length,
+      console_errors: consoleErrors.length,
+      request_failures: requestFailures.length,
+      http_errors: httpErrors,
+      synthetic_http_errors: syntheticQualityHttpErrors,
+      synthetic_console_errors: syntheticQualityConsoleErrors,
+      resource_responses: resourceResponses,
+      inspector_proof: proof,
+    };
+    process.stdout.write(`${JSON.stringify(output)}\n`);
+  } catch (error) {
+    const failure = {
+      schema: resultSchema,
+      state: "failed",
+      scenario: "airbox-inspector",
+      public_url: publicUrl,
+      probe_url: probeUrl,
+      playwright_version: expectedVersion,
+      browser_gpu_mode: browserGpuMode,
+      page_errors: pageErrors.length,
+      console_errors: consoleErrors.length,
+      request_failures: requestFailures.length,
+      http_errors: httpErrors,
+      synthetic_http_errors: syntheticQualityHttpErrors,
+      synthetic_console_errors: syntheticQualityConsoleErrors,
+      resource_responses: resourceResponses,
+      error: bounded(error?.stack ?? error),
+      partial_inspector_proof: proof,
+    };
+    process.stdout.write(`${JSON.stringify(failure)}\n`);
+    process.exitCode = 1;
+  } finally {
+    await context?.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
+  }
+}
+
+await main();

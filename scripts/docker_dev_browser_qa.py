@@ -50,6 +50,7 @@ BROWSER_IMAGE_DIGESTS = frozenset({
     "941cc91e5022880ac1d14ae90b476b624deb6399dbbc28d612d5d5bd7928fcbd",
 })
 RESULT_SCHEMA = "fullmag.docker-dev-browser-qa-result.v1"
+AIRBOX_INSPECTOR_RESULT_SCHEMA = "fullmag.docker-dev-airbox-inspector-result.v1"
 OPERATION_SCHEMA = "fullmag.docker-dev-browser-qa.v1"
 BROWSER_IMAGE_RE = re.compile(
     r"^mcr\.microsoft\.com/playwright:v1\.62\.1-noble@sha256:([0-9a-f]{64})$"
@@ -664,6 +665,7 @@ def _compose_document(
     expect_live_field: str | None = None,
     expect_airbox_vectors: bool | None = None,
     expect_ambiguous_compute_fields: bool | None = None,
+    airbox_inspector: bool = False,
 ) -> dict[str, object]:
     if canvas_only is True and prepare_viewport_fixture:
         raise BuildControlError("Canvas-only browser QA cannot prepare a viewport fixture")
@@ -673,6 +675,14 @@ def _compose_document(
         raise BuildControlError("Airbox-vector expectation requires an expected live field")
     if expect_ambiguous_compute_fields is True and canvas_only is not True:
         raise BuildControlError("Ambiguous Compute Fields QA requires --canvas-only")
+    if airbox_inspector and (
+        prepare_viewport_fixture
+        or canvas_only is not None
+        or expect_live_field is not None
+        or expect_airbox_vectors is not None
+        or expect_ambiguous_compute_fields is not None
+    ):
+        raise BuildControlError("Airbox Inspector QA is a separate live-resource scenario")
     labels = {
         **source_labels(identity),
         "org.fullmag.browser-qa.schema": OPERATION_SCHEMA,
@@ -692,6 +702,8 @@ def _compose_document(
         "CONTROL_ROOM_BROWSER_QA_TIMEOUT_MS": str(timeout * 1000),
         "NVIDIA_VISIBLE_DEVICES": "void",
     }
+    if airbox_inspector:
+        environment["CONTROL_ROOM_BROWSER_QA_SCENARIO"] = "airbox-inspector"
     if prepare_viewport_fixture:
         environment["CONTROL_ROOM_PREPARE_VIEWPORT_FIXTURE"] = "1"
     if canvas_only is not None:
@@ -726,7 +738,8 @@ def _compose_document(
                 "working_dir": "/state/development/workspace/apps/control-room",
                 "command": [
                     "node",
-                    "/state/development/workspace/apps/control-room/scripts/docker-dev-browser-qa.mjs",
+                    "/state/development/workspace/apps/control-room/scripts/"
+                    + ("verify-airbox-inspector.mjs" if airbox_inspector else "docker-dev-browser-qa.mjs"),
                 ],
                 "volumes": [
                     {
@@ -769,6 +782,7 @@ def _validate_browser_helper(
     expect_live_field: str | None = None,
     expect_airbox_vectors: bool | None = None,
     expect_ambiguous_compute_fields: bool | None = None,
+    airbox_inspector: bool = False,
 ) -> None:
     try:
         validate_source_labels(document, identity)
@@ -798,6 +812,14 @@ def _validate_browser_helper(
         "NVIDIA_VISIBLE_DEVICES=void",
     } - environment:
         raise ControlOutcomeUnknown("Browser helper runtime environment differs")
+    if airbox_inspector:
+        if "CONTROL_ROOM_BROWSER_QA_SCENARIO=airbox-inspector" not in environment:
+            raise ControlOutcomeUnknown("Browser helper Airbox Inspector scenario differs")
+        if config.get("Cmd") != [
+            "node",
+            "/state/development/workspace/apps/control-room/scripts/verify-airbox-inspector.mjs",
+        ]:
+            raise ControlOutcomeUnknown("Browser helper did not run the selected Airbox Inspector harness")
     if canvas_only is not None:
         mode_environment = [
             entry for entry in environment
@@ -1150,6 +1172,220 @@ def _validate_resource_responses(value: object) -> None:
                 raise BuildControlError(f"Browser helper API resource response is malformed: {field}")
 
 
+def _parse_airbox_inspector_result(
+    output: bytes,
+    public_url: str,
+    browser_url: str,
+    expected_script_sha256: str,
+) -> dict[str, object]:
+    text = output.decode("utf-8", "replace")
+    payload = None
+    for line in reversed(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+    if not isinstance(payload, dict):
+        raise BuildControlError("Airbox Inspector helper did not emit one JSON result")
+    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_RESULT_BYTES:
+        raise BuildControlError("Airbox Inspector result exceeds its bounded evidence budget")
+    if (payload.get("schema") != AIRBOX_INSPECTOR_RESULT_SCHEMA
+            or payload.get("state") != "passed"
+            or payload.get("scenario") != "airbox-inspector"):
+        raise BuildControlError("Airbox Inspector helper reported a failed or unknown scenario")
+    if payload.get("public_url") != public_url or payload.get("probe_url") != browser_url:
+        raise BuildControlError("Airbox Inspector helper URL differs from the selected frontend")
+    if payload.get("playwright_version") != PLAYWRIGHT_VERSION:
+        raise BuildControlError("Airbox Inspector Playwright version differs from the lock pin")
+    if payload.get("browser_gpu_mode") != "swiftshader-webgl-requested":
+        raise BuildControlError("Airbox Inspector helper browser mode differs")
+    for key in ("page_errors", "console_errors", "request_failures"):
+        if type(payload.get(key)) is not int or payload[key] != 0:
+            raise BuildControlError(f"Airbox Inspector helper reported {key}")
+    if payload.get("http_errors") != []:
+        raise BuildControlError("Airbox Inspector helper reported HTTP errors")
+    synthetic_http_errors = payload.get("synthetic_http_errors")
+    if (not isinstance(synthetic_http_errors, list)
+            or len(synthetic_http_errors) > 8
+            or any(
+                not isinstance(item, str)
+                or item != "503 GET /v2/sessions/current/meshing/meshes/universe/quality"
+                for item in synthetic_http_errors
+            )
+            or not any(
+                isinstance(item, str)
+                and item == "503 GET /v2/sessions/current/meshing/meshes/universe/quality"
+                for item in synthetic_http_errors
+            )):
+        raise BuildControlError("Airbox Inspector helper omitted its isolated synthetic quality error evidence")
+    synthetic_console_errors = payload.get("synthetic_console_errors", [])
+    if not isinstance(synthetic_console_errors, list) or len(synthetic_console_errors) > 8:
+        raise BuildControlError("Airbox Inspector synthetic console evidence is malformed")
+    for item in synthetic_console_errors:
+        if not isinstance(item, str) or len(item) > 2048:
+            raise BuildControlError("Airbox Inspector synthetic console evidence is malformed")
+        location_url = item.split(": ", 1)[0]
+        if urlsplit(location_url).path != "/v2/sessions/current/meshing/meshes/universe/quality":
+            raise BuildControlError("Airbox Inspector suppressed a console error outside the exact quality endpoint")
+    proof = payload.get("inspector_proof")
+    if not isinstance(proof, Mapping):
+        raise BuildControlError("Airbox Inspector helper omitted its route and API proof")
+    if (proof.get("schema") != "fullmag.airbox-inspector-browser-proof.v1"
+            or proof.get("script_sha256") != expected_script_sha256
+            or proof.get("authored_method") != "fem"
+            or proof.get("published_fem_with_unresolved_runtime") is not True
+            or proof.get("generic_unknown_header_rejected") is not True
+            or proof.get("no_mutating_requests") is not True):
+        raise BuildControlError("Airbox Inspector helper did not prove the published FEM inspection case")
+    unresolved = proof.get("unresolved_status_probe")
+    if (not isinstance(unresolved, Mapping)
+            or unresolved.get("only_active_lane_resolved_changed") is not True
+            or unresolved.get("domain_discretization") != "fem"
+            or not isinstance(unresolved.get("domain_generation_id"), str)
+            or not unresolved["domain_generation_id"]
+            or type(unresolved.get("mesh_revision")) is not int
+            or unresolved["mesh_revision"] <= 0
+            or type(unresolved.get("topology_revision")) is not int
+            or unresolved["topology_revision"] <= 0):
+        raise BuildControlError("Airbox Inspector helper did not isolate the unresolved FEM runtime case")
+    canvas = proof.get("canvas")
+    if (not isinstance(canvas, Mapping)
+            or canvas.get("visible") is not True
+            or canvas.get("context_lost") is not False
+            or type(canvas.get("drawing_buffer_width")) is not int
+            or canvas["drawing_buffer_width"] <= 0
+            or type(canvas.get("drawing_buffer_height")) is not int
+            or canvas["drawing_buffer_height"] <= 0):
+        raise BuildControlError("Airbox Inspector helper did not retain a live visible WebGL canvas")
+
+    expected_panels = [
+        ("root", "model:airbox", "airbox.root", "Airbox", "Airbox Overview"),
+        ("mesh", "model:airbox:mesh", "airbox.mesh", "Mesh", "Airbox Mesh Overview"),
+        ("parameters", "model:airbox:mesh:parameters", "airbox.mesh.parameters", "Parameters", "Canonical Authored Parameters"),
+        ("quality-gates", "model:airbox:mesh:quality-gates", "airbox.mesh.quality-gates", "Quality Gates", "Airbox Quality Gates"),
+        ("statistics", "model:airbox:mesh:statistics", "airbox.mesh.statistics", "Statistics", "Airbox Mesh Statistics"),
+        ("topology", "model:airbox:mesh:topology", "airbox.mesh.topology", "Topology", "Airbox Mesh Topology"),
+        ("build", "model:airbox:mesh:build", "airbox.mesh.build", "Build & Provenance", "Airbox Mesh Build"),
+    ]
+    panels = proof.get("panels")
+    if not isinstance(panels, list) or len(panels) != len(expected_panels):
+        raise BuildControlError("Airbox Inspector helper did not visit all seven required panels")
+    for panel, expected in zip(panels, expected_panels):
+        if not isinstance(panel, Mapping):
+            raise BuildControlError("Airbox Inspector panel evidence is malformed")
+        panel_id, node_id, selection_kind, header, group = expected
+        if (panel.get("id") != panel_id or panel.get("node_id") != node_id
+                or panel.get("selection_kind") != selection_kind
+                or panel.get("header") != header
+                or panel.get("required_group") != group
+                or panel.get("verified") is not True):
+            raise BuildControlError(f"Airbox Inspector panel route was not verified: {panel_id}")
+        for field in ("header", "group"):
+            item = panel.get(field)
+            if not isinstance(item, str) or not item.strip() or len(item) > 256:
+                raise BuildControlError(f"Airbox Inspector panel {panel_id} omitted {field}")
+        if panel["header"].strip().lower() in {"unknown", "inspector", "airbox inspector", "details"}:
+            raise BuildControlError(f"Airbox Inspector panel {panel_id} used a generic header")
+
+    comparisons = proof.get("api_comparisons")
+    if not isinstance(comparisons, Mapping):
+        raise BuildControlError("Airbox Inspector helper omitted API count/unit comparisons")
+    for field in ("airbox_carrier_count", "node_count", "element_count", "boundary_face_count", "surface_face_count"):
+        value = comparisons.get(field)
+        if type(value) is not int or value < 0:
+            raise BuildControlError(f"Airbox Inspector API count is invalid: {field}")
+    families = comparisons.get("mixed_element_families")
+    if (not isinstance(families, list) or len(families) < 2
+            or any(not isinstance(item, str) or not item or len(item) > 128 for item in families)):
+        raise BuildControlError("Airbox Inspector proof does not contain mixed element families")
+    if (comparisons.get("counts_verified") is not True
+            or comparisons.get("length_units_verified") is not True
+            or comparisons.get("quality_scope") != "airbox"
+            or comparisons.get("quality_marker") != 0
+            or comparisons.get("quality_source_verified") is not True):
+        raise BuildControlError("Airbox Inspector API counts, SI units, or quality scope differ")
+    units = comparisons.get("length_units")
+    if not isinstance(units, list) or "m" not in units or any(not isinstance(item, str) for item in units):
+        raise BuildControlError("Airbox Inspector helper did not verify SI length units")
+
+    initial_loading = proof.get("initial_quality_loading")
+    if (not isinstance(initial_loading, Mapping)
+            or initial_loading.get("resource_status") != "loading"
+            or initial_loading.get("panel_status") != "loading"
+            or initial_loading.get("gate_result") != "unknown"
+            or initial_loading.get("live_response_preserved") is not True
+            or initial_loading.get("recovered_to_ready") is not True):
+        raise BuildControlError("Airbox Inspector showed an invalid gate result during the initial quality load")
+
+    quality_states = proof.get("synthetic_quality_fault_injection")
+    baseline = quality_states.get("live_baseline") if isinstance(quality_states, Mapping) else None
+    injection = quality_states
+    delayed = injection.get("delayed_live_get") if isinstance(injection, Mapping) else None
+    failed = injection.get("synthetic_error_get") if isinstance(injection, Mapping) else None
+    if (not isinstance(baseline, Mapping)
+            or baseline.get("resource_status") != "ready"
+            or baseline.get("gate_result") != "unknown"
+            or type(baseline.get("revision")) is not int
+            or baseline["revision"] <= 0):
+        raise BuildControlError("Airbox Inspector helper omitted the live quality baseline")
+    if (not isinstance(injection, Mapping)
+            or injection.get("evidence_kind") != "fault-injected-ui-only-not-scientific"):
+        raise BuildControlError("Airbox Inspector synthetic quality controls are not labeled as UI-only fault injection")
+    for control_name in ("synthetic_pass_control", "synthetic_pass_control_for_error"):
+        pass_control = injection.get(control_name)
+        if (not isinstance(pass_control, Mapping)
+                or type(pass_control.get("revision")) is not int
+                or pass_control["revision"] != baseline["revision"]
+                or pass_control.get("rendered_pass") is not True
+                or pass_control.get("revision_matches_live") is not True
+                or type(pass_control.get("requests")) is not int
+                or not 1 <= pass_control["requests"] <= 4):
+            raise BuildControlError("Airbox Inspector omitted the matching-revision synthetic pass control")
+    if (not isinstance(delayed, Mapping)
+            or delayed.get("cached_synthetic_gate_status") != "pass"
+            or delayed.get("resource_status") not in {"stale", "loading", "pending"}
+            or delayed.get("panel_status") not in {"stale", "loading", "pending"}
+            or delayed.get("gate_result") != "unknown"
+            or delayed.get("live_response_preserved") is not True
+            or type(delayed.get("live_response_status")) is not int
+            or not 200 <= delayed["live_response_status"] < 300
+            or delayed.get("restored_to_live_unknown") is not True):
+        raise BuildControlError("Airbox Inspector showed an invalid quality result during a delayed live GET")
+    if (not isinstance(failed, Mapping)
+            or failed.get("cached_synthetic_gate_status") != "pass"
+            or failed.get("http_status") != 503
+            or failed.get("resource_status") != "error"
+            or failed.get("gate_result") != "unknown"
+            or failed.get("restored_to_live_unknown") is not True):
+        raise BuildControlError("Airbox Inspector showed an invalid quality result after a synthetic resource failure")
+    final_live_state = injection.get("final_live_state")
+    if (not isinstance(final_live_state, Mapping)
+            or final_live_state.get("resource_status") != "ready"
+            or final_live_state.get("gate_result") != "unknown"
+            or final_live_state.get("revision_matches_live") is not True):
+        raise BuildControlError("Airbox Inspector did not restore the live unknown quality state after fault injection")
+
+    refresh = proof.get("resource_refresh")
+    if (not isinstance(refresh, Mapping)
+            or refresh.get("resource_path") != "/v2/sessions/current/meshing/meshes/shared-domain/manifest"
+            or refresh.get("same_root") is not True
+            or refresh.get("live_response_preserved") is not True
+            or type(refresh.get("status")) is not int
+            or not 200 <= refresh["status"] < 300
+            or type(refresh.get("request_count")) is not int
+            or not 1 <= refresh["request_count"] <= 4
+            or type(refresh.get("delay_ms")) is not int
+            or not 250 <= refresh["delay_ms"] <= 2000):
+        raise BuildControlError("Airbox Inspector root identity did not survive a bounded live resource refresh")
+    _validate_resource_responses(payload.get("resource_responses"))
+    return payload
+
+
 def _parse_result(
     output: bytes,
     public_url: str,
@@ -1304,10 +1540,12 @@ def _run(
     public_url: str,
     browser_url: str,
     timeout: int,
-    canvas_only: bool,
-    expect_live_field: str | None,
-    expect_airbox_vectors: bool,
-    expect_ambiguous_compute_fields: bool,
+    canvas_only: bool | None = False,
+    expect_live_field: str | None = None,
+    expect_airbox_vectors: bool = False,
+    expect_ambiguous_compute_fields: bool = False,
+    airbox_inspector: bool = False,
+    airbox_inspector_script_sha256: str | None = None,
 ) -> None:
     root = operation["root"]
     helper_name = "fullmag-browser-qa-" + operation["receipt"]["attempt"][:12]
@@ -1358,7 +1596,8 @@ def _run(
         canvas_only=canvas_only,
         expect_live_field=expect_live_field if expect_live_field is not None else None,
         expect_airbox_vectors=expect_airbox_vectors if expect_live_field is not None else None,
-        expect_ambiguous_compute_fields=expect_ambiguous_compute_fields)
+        expect_ambiguous_compute_fields=(expect_ambiguous_compute_fields if not airbox_inspector else None),
+        airbox_inspector=airbox_inspector)
     operation["receipt"]["browser_container_id"] = observed["Id"]
     control.write(root + "/receipt.json", operation["receipt"])
     raw = result.stdout
@@ -1370,9 +1609,16 @@ def _run(
     })
     operation["daemon_pending"] = True
     try:
-        payload = _parse_result(raw, public_url, browser_url, canvas_only=canvas_only,
-            expect_live_field=expect_live_field, expect_airbox_vectors=expect_airbox_vectors,
-            expect_ambiguous_compute_fields=expect_ambiguous_compute_fields)
+        if airbox_inspector:
+            if not airbox_inspector_script_sha256:
+                raise BuildControlError("Airbox Inspector helper source hash is missing")
+            payload = _parse_airbox_inspector_result(
+                raw, public_url, browser_url, airbox_inspector_script_sha256
+            )
+        else:
+            payload = _parse_result(raw, public_url, browser_url, canvas_only=canvas_only,
+                expect_live_field=expect_live_field, expect_airbox_vectors=expect_airbox_vectors,
+                expect_ambiguous_compute_fields=expect_ambiguous_compute_fields)
     except BuildControlError as error:
         control.write(root + "/result.json", {
             "schema": RESULT_SCHEMA,
@@ -1639,6 +1885,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Exercise one real Compute Fields command with its accepted response dropped (canvas-only)",
     )
+    parser.add_argument(
+        "--airbox-inspector",
+        action="store_true",
+        help="Run the read-only live Airbox mesh Inspector proof in the managed browser service",
+    )
     parser.add_argument("--reconcile-attempt")
     parser.add_argument("--expected-receipt-sha256")
     parser.add_argument("--expected-compose-sha256")
@@ -1671,6 +1922,14 @@ def main(argv: list[str] | None = None) -> int:
         raise BuildControlError("--expect-airbox-vectors requires --expect-live-field")
     if args.expect_ambiguous_compute_fields and not args.canvas_only:
         raise BuildControlError("--expect-ambiguous-compute-fields requires --canvas-only")
+    if args.airbox_inspector and (
+        args.prepare_viewport_fixture
+        or args.canvas_only
+        or args.expect_live_field is not None
+        or args.expect_airbox_vectors
+        or args.expect_ambiguous_compute_fields
+    ):
+        raise BuildControlError("--airbox-inspector cannot be combined with other browser QA scenarios")
     if not isinstance(args.browser_image, str) or not args.browser_image:
         raise BuildControlError("Browser QA requires a pinned Playwright image reference")
     _validate_browser_image_reference(args.browser_image)
@@ -1694,6 +1953,12 @@ def main(argv: list[str] | None = None) -> int:
         raise BuildControlError(f"Live development group validation failed: {error}") from error
     public_url = f"http://127.0.0.1:{args.port}"
     browser_url = "http://frontend:8080"
+    airbox_inspector_script_sha256 = None
+    if args.airbox_inspector:
+        harness = selected / "apps/control-room/scripts/verify-airbox-inspector.mjs"
+        if not harness.is_file():
+            raise BuildControlError("Selected checkout is missing the Airbox Inspector browser harness")
+        airbox_inspector_script_sha256 = hashlib.sha256(harness.read_bytes()).hexdigest()
     document = _compose_document(
         selected,
         identity,
@@ -1702,10 +1967,11 @@ def main(argv: list[str] | None = None) -> int:
         args.port,
         args.timeout,
         prepare_viewport_fixture=args.prepare_viewport_fixture,
-        canvas_only=args.canvas_only,
+        canvas_only=(None if args.airbox_inspector else args.canvas_only),
         expect_live_field=args.expect_live_field,
         expect_airbox_vectors=(args.expect_airbox_vectors if args.expect_live_field is not None else None),
-        expect_ambiguous_compute_fields=args.expect_ambiguous_compute_fields,
+        expect_ambiguous_compute_fields=(None if args.airbox_inspector else args.expect_ambiguous_compute_fields),
+        airbox_inspector=args.airbox_inspector,
     )
     source_commit = (current.get("source_commit") or (current.get("inputs") or {}).get("source_commit"))
     inputs = {
@@ -1735,6 +2001,8 @@ def main(argv: list[str] | None = None) -> int:
         "expect_live_field": args.expect_live_field,
         "expect_airbox_vectors": args.expect_airbox_vectors,
         "expect_ambiguous_compute_fields": args.expect_ambiguous_compute_fields,
+        "scenario": "airbox-inspector" if args.airbox_inspector else "standard",
+        "airbox_inspector_script_sha256": airbox_inspector_script_sha256,
     }
     with control.operation("browser-qa", inputs) as operation:
         live_fence = control.read("development/current.json")
@@ -1754,10 +2022,12 @@ def main(argv: list[str] | None = None) -> int:
             public_url,
             browser_url,
             args.timeout,
-            args.canvas_only,
+            (None if args.airbox_inspector else args.canvas_only),
             args.expect_live_field,
             args.expect_airbox_vectors,
             args.expect_ambiguous_compute_fields,
+            args.airbox_inspector,
+            airbox_inspector_script_sha256,
         )
     return 0
 
