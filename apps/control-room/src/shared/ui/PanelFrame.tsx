@@ -37,10 +37,11 @@ interface PanelFrameProps {
 
 export function PanelFrame({ id, title, visible, children, dockHandle, drawer = false, suspendWhenHidden = true, onDockChange, onHide, onMove }: PanelFrameProps) {
   const storageKey = `fullmag.workspace.panel.${id}.v1`;
-  // WorkspaceDockLayout mounts frames only after its hydration boundary.
+  // Keep this frame safe when rendered outside the workspace hydration boundary.
   const [initial] = useState(() => {
+    if (typeof window === "undefined") return { mode: "docked" as PanelMode, geometry: INITIAL_GEOMETRY };
     try {
-      const raw: unknown = JSON.parse(localStorage.getItem(storageKey) ?? "null");
+      const raw: unknown = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
       if (raw && typeof raw === "object") {
         const value = raw as { mode?: unknown; geometry?: Partial<Geometry> };
         const savedMode: PanelMode = value.mode === "floating" || value.mode === "maximized" ? value.mode : "docked";
