@@ -6333,9 +6333,8 @@ fn validate_ledger_document_body(document: &HostResourceLedgerDocument, root: &P
                 bail!("host reservation is bound to a future node policy revision");
             }
         }
-        if reservation.state == HostResourceReservationState::Released {
-            validate_release_proof(root, reservation_policy, reservation)?;
-        }
+        let consumes_solver_epoch =
+            reservation_consumes_solver_epoch(root, reservation_policy, reservation)?;
         if !identities.insert(reservation.identity.clone()) {
             bail!("host resource ledger contains a duplicate exact reservation identity");
         }
@@ -6353,7 +6352,7 @@ fn validate_ledger_document_body(document: &HostResourceLedgerDocument, root: &P
                 );
             }
         }
-        if reservation_consumes_solver_epoch(root, reservation_policy, reservation)? {
+        if consumes_solver_epoch {
             if let Some(epoch) = reservation.identity.owner.solver_epoch() {
                 let epochs = task_epochs.entry(task.clone()).or_default();
                 if !epochs.insert(epoch) {
@@ -6972,20 +6971,7 @@ fn reservation_consumes_solver_epoch(
     if reservation.state != HostResourceReservationState::Released {
         return Ok(true);
     }
-    validate_release_proof(root, policy, reservation)?;
-    let digest = reservation
-        .release_proof_sha256
-        .as_ref()
-        .context("released reservation has no proof digest")?;
-    let bytes = read_bounded_regular_file(
-        root,
-        &release_proof_relative_path(digest)?,
-        MAX_RELEASE_PROOF_BYTES,
-    )?;
-    if format!("{:x}", Sha256::digest(&bytes)) != *digest {
-        bail!("released reservation epoch certificate digest mismatch");
-    }
-    let proof: HostResourceReleaseProof = serde_json::from_slice(&bytes)?;
+    let proof = read_validated_release_proof(root, policy, reservation)?;
     Ok(proof.kind != HostResourceReleaseProofKind::AdmissionAbsent)
 }
 
@@ -7293,29 +7279,19 @@ fn validate_pre_admission_task_scope(
     intent.validate_task_scope(store, current, catalog.revision)
 }
 
-fn read_validated_release_proof(
-    root: &Path,
-    policy: &HostResourceLedgerPolicy,
-    reservation: &HostResourceReservation,
-) -> Result<HostResourceReleaseProof> {
-    validate_release_proof(root, policy, reservation)?;
-    let digest = reservation
-        .release_proof_sha256
-        .as_deref()
-        .context("released host reservation has no proof digest")?;
-    let relative = release_proof_relative_path(digest)?;
-    let bytes = read_bounded_regular_file(root, &relative, MAX_RELEASE_PROOF_BYTES)?;
-    if format!("{:x}", Sha256::digest(&bytes)) != digest {
-        bail!("host release proof changed after canonical validation");
-    }
-    serde_json::from_slice(&bytes).context("parsing validated host release proof")
-}
-
 fn validate_release_proof(
     root: &Path,
     policy: &HostResourceLedgerPolicy,
     reservation: &HostResourceReservation,
 ) -> Result<()> {
+    read_validated_release_proof(root, policy, reservation).map(|_| ())
+}
+
+fn read_validated_release_proof(
+    root: &Path,
+    policy: &HostResourceLedgerPolicy,
+    reservation: &HostResourceReservation,
+) -> Result<HostResourceReleaseProof> {
     let digest = reservation
         .release_proof_sha256
         .as_deref()
@@ -7518,7 +7494,8 @@ fn validate_release_proof(
                 .context("orphan teardown proof has no typed teardown evidence")?;
             validate_worker_orphan_release_proof_identity(root, policy, reservation, orphan)
         }
-    }
+    }?;
+    Ok(proof)
 }
 
 fn validate_worker_orphan_release_proof_identity(
