@@ -590,7 +590,7 @@ try {
     "Display mode label overflows its segmented-control item.",
   );
 
-  const panel = page.getByTestId("panel-right");
+  const panel = page.locator('[data-panel-frame="panel-right"]');
   const resizeHandle = page.getByRole("separator", { name: /Inspector/ }).last();
   await writeResizeDomSnapshot(page, outputDir, "before-hide");
   const visibleToggle = overview.getByRole("button", {

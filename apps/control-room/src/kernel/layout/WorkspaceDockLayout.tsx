@@ -111,6 +111,10 @@ export function WorkspaceDockLayout() {
     setDockedPanels(previous => previous[id] === docked ? previous : { ...previous, [id]: docked });
   }, []);
   const bottomDockChange = useCallback((docked: boolean) => onDockChange("panel-bottom", docked), [onDockChange]);
+  const resetInspectorWidth = useCallback(() => {
+    const initial = DEFAULT_WORKSPACE_LAYOUT.columns.find(column => column.slotId === "panel-right");
+    if (initial) panels.current["panel-right"]?.resize(initial.defaultSize);
+  }, []);
 
   useEffect(() => {
     for (const [id, panel] of Object.entries(panels.current)) {
@@ -141,7 +145,7 @@ export function WorkspaceDockLayout() {
               <ResizablePanel id={column.slotId} defaultSize={column.defaultSize} minSize={column.slotId === "panel-right" ? "240px" : "160px"} maxSize={column.slotId === "panel-right" ? "560px" : column.maxSize} groupResizeBehavior={column.resizeBehavior} collapsible collapsedSize={0} panelRef={handle => { panels.current[column.slotId] = handle; }}>
                 <SortableWorkspaceColumn column={column} visible={visible(column.slotId)} drawer={column.slotId === "panel-right" && windowWidth < 1180 || column.slotId === "panel-left" && windowWidth < 760} onDockChange={onDockChange} onHide={column.slotId === "panel-left" ? () => kernel.layout.setPanelVisible("left", false) : column.slotId === "panel-right" ? () => kernel.layout.setPanelVisible("right", false) : undefined} onMove={direction => move(column.slotId, direction)} />
               </ResizablePanel>
-              {index < columns.length - 1 ? <ResizableHandle className="fm-resize-handle--vertical" aria-label="Resize workspace panels" style={dockedPanels[column.slotId] === false || dockedPanels[columns[index + 1].slotId] === false ? { display: "none" } : undefined} /> : null}
+              {index < columns.length - 1 ? <ResizableHandle className="fm-resize-handle--vertical" aria-label={`Resize ${column.label} and ${columns[index + 1].label} panels`} onDoubleClick={column.slotId === "panel-right" || columns[index + 1].slotId === "panel-right" ? resetInspectorWidth : undefined} style={dockedPanels[column.slotId] === false || dockedPanels[columns[index + 1].slotId] === false ? { display: "none" } : undefined} /> : null}
             </Fragment>)}
           </ResizablePanelGroup>
         </SortableList>
