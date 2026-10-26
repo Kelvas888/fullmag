@@ -828,7 +828,6 @@ function isAbortError(error: unknown): boolean {
 function useVectorGlyphUpload({
   buildKey,
   glyphColors,
-  glyphCount,
   glyphTransforms,
   headRef,
   instanceColorAttr,
@@ -843,7 +842,6 @@ function useVectorGlyphUpload({
 }: {
   buildKey?: string | null;
   glyphColors: Float32Array | null;
-  glyphCount: number;
   glyphTransforms: VectorGlyphTransforms | null;
   headRef: RefObject<InstancedMesh | null>;
   instanceColorAttr: InstancedBufferAttribute | null;
@@ -871,100 +869,6 @@ function useVectorGlyphUpload({
   useEffect(() => {
     const shaft = shaftRef.current;
     const head = headRef.current;
-    if (!shaft || !head || !instanceColorAttr) return;
-
-    if (!glyphColors) {
-      syncVectorGlyphColorState({
-        hasInstanceColors: false,
-        head,
-        instanceColorAttr,
-        material,
-        materialColor,
-        shaft,
-      });
-      tracker.recordDirtyFrame("vector-glyph-colors");
-      invalidate();
-      return;
-    }
-
-    const colorArray = instanceColorAttr.array as Float32Array;
-    const batches = buildVectorGlyphUploadBatches(glyphCount);
-    const uploadKeys = buildKey
-      ? createVectorGlyphUploadKeys({
-          buildKey,
-          colorByteLength: glyphColors.byteLength,
-          glyphCount,
-          targetRevision: targetRevision ?? null,
-          transformByteLength: 0,
-        })
-      : null;
-    const abortController = new AbortController();
-    const startMark = markVectorGlyphWork(VECTOR_GLYPH_COLOR_UPLOAD_MEASURE);
-    let measured = false;
-    const rollbacks = batches.map((batch) =>
-      createVectorGlyphColorUploadRollback({
-        attribute: instanceColorAttr,
-        count: batch.end - batch.start,
-        head,
-        material,
-        shaft,
-        start: batch.start,
-      }),
-    );
-    instanceColorAttr.clearUpdateRanges();
-
-    const chunks: Viewport3DGpuUploadChunk[] = batches.map((batch, index) => ({
-      estimatedBytes:
-        (batch.end - batch.start) * 3 * Float32Array.BYTES_PER_ELEMENT,
-      itemCount: batch.end - batch.start,
-      upload: () => {
-        colorArray.set(
-          glyphColors.subarray(batch.start * 3, batch.end * 3),
-          batch.start * 3,
-        );
-      },
-      rollback: rollbacks[index],
-    }));
-
-    uploadManager.enqueue({
-      chunks,
-      estimatedBytes: glyphColors.byteLength,
-      key:
-        uploadKeys?.colorKey ??
-        `vector-glyph-colors:${glyphCount}:${glyphColors.byteLength}`,
-      lane: "vector-glyph",
-      onVisible: () => {
-        measureVectorGlyphWork(VECTOR_GLYPH_COLOR_UPLOAD_MEASURE, startMark);
-        measured = true;
-      },
-      signal: abortController.signal,
-      targetRevision: uploadKeys?.targetRevision ?? null,
-    });
-
-    return () => {
-      abortController.abort();
-      if (!measured) {
-        clearVectorGlyphWorkMark(startMark);
-      }
-    };
-  }, [
-    buildKey,
-    glyphColors,
-    glyphCount,
-    headRef,
-    instanceColorAttr,
-    invalidate,
-    material,
-    materialColor,
-    shaftRef,
-    targetRevision,
-    tracker,
-    uploadManager,
-  ]);
-
-  useEffect(() => {
-    const shaft = shaftRef.current;
-    const head = headRef.current;
     if (!glyphTransforms || !shaft || !head || !instanceColorAttr) return;
 
     const activeGlyphs = glyphTransforms;
@@ -977,16 +881,27 @@ function useVectorGlyphUpload({
     const batches = buildVectorGlyphUploadBatches(activeGlyphs.count);
     const { direction, matrix, position, quaternion, scale } = transformScratch;
     const startMark = markVectorGlyphWork(VECTOR_GLYPH_MATRIX_UPLOAD_MEASURE);
+    const colorStartMark = glyphColors ? markVectorGlyphWork(VECTOR_GLYPH_COLOR_UPLOAD_MEASURE) : null;
     let measured = false;
     const abortController = new AbortController();
-    const rollbacks = batches.map((batch) =>
-      createVectorGlyphMatrixUploadRollback({
+    const rollbacks = batches.map((batch) => {
+      const rollbackMatrices = createVectorGlyphMatrixUploadRollback({
         count: batch.end - batch.start,
         head: activeHead,
         shaft: activeShaft,
         start: batch.start,
-      }),
-    );
+      });
+      const rollbackColors = createVectorGlyphColorUploadRollback({
+        attribute: instanceColorAttr,
+        count: batch.end - batch.start,
+        head: activeHead,
+        material,
+        shaft: activeShaft,
+        start: batch.start,
+      });
+      return () => { rollbackMatrices(); rollbackColors(); };
+    });
+    instanceColorAttr.clearUpdateRanges();
     activeShaft.instanceMatrix.clearUpdateRanges();
     activeHead.instanceMatrix.clearUpdateRanges();
     const transformByteLength = estimateVectorGlyphTransformBytes(activeGlyphs);
@@ -1004,9 +919,14 @@ function useVectorGlyphUpload({
       const batchCount = batch.end - batch.start;
       return {
         estimatedBytes:
-          batchCount * 16 * Float32Array.BYTES_PER_ELEMENT * 2,
+          batchCount * Float32Array.BYTES_PER_ELEMENT * (32 + (glyphColors ? 3 : 0)),
         itemCount: batchCount,
         upload: () => {
+          if (glyphColors) {
+            (instanceColorAttr.array as Float32Array).set(
+              glyphColors.subarray(batch.start * 3, batch.end * 3), batch.start * 3,
+            );
+          }
           for (let index = batch.start; index < batch.end; index += 1) {
             const offset = index * 3;
             direction.set(
@@ -1049,8 +969,7 @@ function useVectorGlyphUpload({
 
     uploadManager.enqueue({
       chunks,
-      estimatedBytes:
-        activeGlyphs.count * 16 * Float32Array.BYTES_PER_ELEMENT * 2,
+      estimatedBytes: activeGlyphs.count * 32 * Float32Array.BYTES_PER_ELEMENT + (glyphColors?.byteLength ?? 0),
       key:
         uploadKeys?.matrixKey ??
         `vector-glyph-matrices:${activeGlyphs.count}:${activeGlyphs.directions.byteLength}`,
@@ -1086,6 +1005,7 @@ function useVectorGlyphUpload({
           activeGlyphs.count,
           16,
         );
+        if (colorStartMark) measureVectorGlyphWork(VECTOR_GLYPH_COLOR_UPLOAD_MEASURE, colorStartMark);
         measureVectorGlyphWork(VECTOR_GLYPH_MATRIX_UPLOAD_MEASURE, startMark);
         measured = true;
         tracker.recordDirtyFrame("vector-glyphs");
@@ -1101,6 +1021,9 @@ function useVectorGlyphUpload({
     return () => {
       abortController.abort();
       if (!measured) {
+        // Aborted upload tickets do not roll back their CPU buffers.
+        for (const rollback of rollbacks) rollback();
+        if (colorStartMark) clearVectorGlyphWorkMark(colorStartMark);
         clearVectorGlyphWorkMark(startMark);
       }
     };
@@ -1293,7 +1216,6 @@ export function VectorFieldLayer({
   useVectorGlyphUpload({
     buildKey: visibleGlyphBuild?.buildKey ?? null,
     glyphColors,
-    glyphCount,
     glyphTransforms,
     headRef,
     instanceColorAttr,
