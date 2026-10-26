@@ -104,3 +104,15 @@ PR/CI, merge, lokalne FF oraz cleanup nadal oczekują. Żaden z powyższych wyni
 Końcowy pełny `pnpm lint`: PASS, exit0. Produkcyjny typecheck: PASS. Po korekcie helperów i oczekiwań pełny Vitest nadal ma dokładnie jeden wyżej opisany mismatch generated route types w DEV, bez dodatkowych failing assertions. Żaden test nie został wyłączony z przebiegu. Wymagane kanoniczne CI po push/PR rozstrzyga gotowość do merge; PR nie będzie scalony przy czerwonych wymaganych kontrolach.
 
 Wykonywalne regresje zapisane w repo: check-design-audit-browser.mjs, check-ribbon-design-browser.mjs, check-panel-design-browser.mjs, check-design-interactions-browser.mjs, check-script-options-browser.mjs i check-inspector-ack-browser.mjs. Ich output kierowany wyłącznie do zarejestrowanego katalogu run zadania. Profile native zoom, fonty, clipboard stub i fixture hosta mają jawny zakres dowodu.
+
+## Uzupełnienie T4/T12 — rzeczywisty header z sesją
+
+Końcowe oględziny PNG wykryły przyciętą markę przy1440 px: header miał scrollWidth1518, a fokus menu powodował scroll całego slotu i left=-78. Fixture bez sesji nie obejmował tego przypadku. Nowa regresja active header odtworzyła RED. Root zachował elastyczną nazwę, przesunął próg etykiet quick actions do1800 px, szczegółów statusu do1600 px i zamiany menubar na compact menu do1440 px. Kontrolki transportu nadal są dostępne bez zmiany karty.
+
+`check-header-session-browser.mjs`: GREEN28 przypadków (2 theme × workspace/Home z sesją ×1920/1600/1440/1366/1180/900/450). Asercje obejmują scrollWidth, left/right całego nagłówka i położenie każdej z czterech kontrolek transportu. `header-active-green/result.json` potwierdza także brak overflow1440 oraz natywny zoom200%. Wcześniejsza uwaga o naprawie samego720 px nie zastępowała tego dowodu.
+
+`final-screens/result.json`: powrót 3D→2D→3D zachowuje position/target/up/projection kamery; po powrocie canvas widoczny, contextLost=false, buffer617×413, zero page errors. Zrzuty dotyczą rzeczywistego, oczekującego modelu QA; komunikat o niedostępnych danych pola pozostaje widoczny, bez udawania wykonania solvera.
+
+Dodatkowy stress test długiego projektu wykrył przepełnienie przy1600/450 px. Root dodał min-width0 grupy akcji, ograniczył wizualną nazwę projektu i rozdzielił nazwę od stałego tekstu `· unsaved`. Pełna nazwa/ścieżka pozostają w DOM i title; dirty marker nie podlega ellipsis. Osobny presenter ma2/2 testów SSR. Macierz nagłówka rozszerzona do84 wariantów: normalny stan oraz jawne DOM fixtures długiej nazwy clean/dirty. To pomiar długości prezentacji, nie dowód zapisania projektu w backendzie. Native przyciski statusu połączenia i readiness mają teraz min-height28 px; kontrola hit targetów obejmuje wszystkie native buttons nagłówka.
+
+Końcowy `header-matrix-final/result.json`: PASS84 wariantów, z kontrolą granic headera, pełnego transportu, native hit targets≥24 px i widoczności dirty marker. Targeted ESLint nowych plików PASS; ProjectDocumentStatus/AppMenuBar14/14 PASS. Poprzedni pełny lint pozostaje dowodem dla niezmienionych ścieżek; ostatni fragment ma własną kontrolę. Pełne CI nadal wymagane.

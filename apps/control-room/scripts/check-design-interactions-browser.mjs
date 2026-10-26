@@ -33,7 +33,8 @@ try{
  await page.keyboard.press('ArrowLeft');assert(await items.first().evaluate(e=>e===document.activeElement));checks.push('Ribbon toolbar ArrowRight/ArrowLeft/Home/End');
  await page.getByRole('button',{name:/^Ribbon density:/}).click();await page.getByRole('menuitemradio',{name:'Compact',exact:true}).click();
  await page.reload({waitUntil:'domcontentloaded'});await page.waitForFunction(()=>document.querySelector('.fm-ribbon')?.dataset.density==='compact');checks.push('Ribbon density persists after reload');
- const before=await page.evaluate(()=>({width:innerWidth,dpr:devicePixelRatio}));
+ const before=await page.evaluate(()=>({width:innerWidth,dpr:devicePixelRatio,headerWidth:document.querySelector('.fm-header').clientWidth,headerScroll:document.querySelector('.fm-header').scrollWidth,headerLeft:document.querySelector('.fm-header').getBoundingClientRect().left}));
+ assert(before.headerScroll<=before.headerWidth+1&&before.headerLeft>=-1,'Active session header must fit at 1440px');
  const zoom=await worker.evaluate(async expected=>{const tabs=await chrome.tabs.query({url:expected+'/*'});if(tabs.length!==1)throw Error('Expected exactly one isolated app tab: '+JSON.stringify(tabs.map(t=>({id:t.id,url:t.url}))));await chrome.tabs.setZoom(tabs[0].id,2);return chrome.tabs.getZoom(tabs[0].id);},new URL(url).origin);
  assert.equal(zoom,2);await page.waitForFunction(w=>innerWidth<=w/2+1,before.width);
  const after=await page.evaluate(()=>({width:innerWidth,dpr:devicePixelRatio,headerWidth:document.querySelector('.fm-header').clientWidth,headerScroll:document.querySelector('.fm-header').scrollWidth}));
