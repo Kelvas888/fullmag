@@ -28,7 +28,7 @@ As of 2026-08-03, `apps/control-room` registers these manifests through `src/mod
 
 The modules listed in later sections remain the target catalog. A target module that is not in this snapshot is deferred, not silently dropped. Cutover acceptance still depends on the required workflows in `21-cutover-acceptance.md`, not on this snapshot alone.
 
-Globalny przycisk **Start** otwiera ekran startowy przez idempotentną komendę
+Globalny przycisk **Home** otwiera ekran startowy przez idempotentną komendę
 `workspace.home`. Zakładka narzędzi symulacji na wstążce nosi nazwę **Workspace**,
 a pierwsza sekcja ekranu startowego — **Overview**. Podczas wizyty na ekranie
 startowym przycisk **Back to simulation** (lub **Back to project**) wykonuje
