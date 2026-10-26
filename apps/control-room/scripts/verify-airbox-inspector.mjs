@@ -21,6 +21,7 @@ const statusPath = "/v2/sessions/current/status";
 const planarMonitorsPath = "/v2/sessions/current/model/planar-monitors";
 const visualizationClientAcksPath = "/v2/sessions/current/visualization/client-acks";
 const timeoutMs = Number.isFinite(timeout) ? timeout : 120_000;
+const qualityReadinessTimeoutMs = Math.min(timeoutMs, 15_000);
 const require = createRequire(import.meta.url);
 
 const panels = [
@@ -84,11 +85,22 @@ const resourcePaths = {
   currentBuild: "/v2/sessions/current/meshing/builds/current",
   latestSuccessfulBuild: "/v2/sessions/current/meshing/builds/latest-successful",
 };
+const startupDiagnosticPaths = new Set([
+  "/v2/sessions/current/diagnostics/cpu",
+  "/v2/sessions/current/diagnostics/gpu",
+  "/v2/platform/compute/nodes",
+  "/v2/platform/health",
+  "/v2/sessions/current/model/planar-monitors",
+  "/v2/sessions/current/simulation/preparation",
+]);
 
 const pageErrors = [];
 const consoleErrors = [];
 const requestFailures = [];
 const requestCancellations = [];
+const startupRequestEvents = [];
+const startupRequestByRequest = new WeakMap();
+const startupUnmountCancellationProbes = [];
 const requestStartedAt = new WeakMap();
 const httpErrors = [];
 const mutationRequests = [];
@@ -107,6 +119,7 @@ let refreshBodyPreserved = false;
 let syntheticQualityErrorActive = false;
 let resourceInvalidationSequence = 0;
 const runStartedAt = Date.now();
+let startupRequestSequence = 0;
 let teardownStartedAt = null;
 let browserOrigin = null;
 let harnessPhase = "startup";
@@ -144,6 +157,40 @@ function safePageUrl(value) {
 
 function diagnosticSamples(values, limit = 8) {
   return values.slice(0, limit).map((value) => diagnosticText(value, 600));
+}
+
+function mutationRequestDiagnostic(request, path, phase) {
+  let payload;
+  try {
+    payload = JSON.parse(request.postData() ?? "null");
+  } catch {
+    return `${request.method()} ${path} [phase=${phase}; body=non-json]`;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return `${request.method()} ${path} [phase=${phase}; body=non-object-json]`;
+  }
+
+  const booleanFields = [];
+  function collectBooleanFields(value, prefix, depth = 0) {
+    if (booleanFields.length >= 12 || depth > 5 || value === null || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value).slice(0, 16)) {
+      const field = prefix ? `${prefix}.${key}` : key;
+      if (typeof child === "boolean") {
+        booleanFields.push(`${field}=${child}`);
+      } else if (child && typeof child === "object") {
+        if (Array.isArray(child)) {
+          child.slice(0, 4).forEach((item, index) => collectBooleanFields(item, `${field}[${index}]`, depth + 1));
+        } else {
+          collectBooleanFields(child, field, depth + 1);
+        }
+      }
+      if (booleanFields.length >= 12) break;
+    }
+  }
+  collectBooleanFields(payload, "");
+  const keys = Object.keys(payload).slice(0, 12).sort().join(",") || "none";
+  const booleans = booleanFields.join(",") || "none";
+  return `${request.method()} ${path} [phase=${phase}; json_keys=${keys}; boolean_fields=${booleans}]`;
 }
 
 function visualizationAckPayloadMetadata(request) {
@@ -313,6 +360,7 @@ function collectRequestFailure(request, errorText) {
   const startedAt = requestStartedAt.get(request) ?? null;
   const method = request.method();
   const path = new URL(request.url()).pathname;
+  const startupRequest = startupRequestByRequest.get(request);
   const planarMonitor = planarMonitorRequestByRequest.get(request);
   const acknowledgement = visualizationAckByRequest.get(request);
   if (acknowledgement) {
@@ -327,6 +375,12 @@ function collectRequestFailure(request, errorText) {
     request_duration_ms: startedAt === null ? null : Math.max(0, failedAt - startedAt),
     phase: harnessPhase,
   };
+  if (startupRequest) {
+    startupRequest.outcome = teardownStartedAt !== null ? "browser-context-shutdown" : "request-failed";
+    startupRequest.error = errorText;
+    startupRequest.failure_phase = teardownStartedAt !== null ? "browser-context-shutdown" : harnessPhase;
+    startupRequest.failure_elapsed_ms = Math.max(0, failedAt - runStartedAt);
+  }
   if (planarMonitor) {
     planarMonitor.settled = true;
     planarMonitor.settledAt = failedAt;
@@ -344,9 +398,134 @@ function collectRequestFailure(request, errorText) {
     }
     return;
   }
-  collect(requestFailures, diagnosticText(
+  const failureMessage = diagnosticText(
     `${method} ${path}: ${errorText} (phase ${harnessPhase}; run +${record.run_elapsed_ms}ms; request ${record.request_duration_ms ?? "unknown"}ms)`,
-  ));
+  );
+  if (startupRequest) startupRequest.failure_message = failureMessage;
+  collect(requestFailures, failureMessage);
+}
+
+function startupRequestEvidence() {
+  return startupRequestEvents.slice(0, 32).map((event) => ({ ...event }));
+}
+
+async function proveStartupUnmountCancellationFollowupReads(page, workspaceEntry) {
+  const candidates = startupRequestEvents.filter((event) =>
+    event.outcome === "request-failed"
+      && event.method === "GET"
+      && startupDiagnosticPaths.has(event.path)
+      && event.error === "net::ERR_ABORTED"
+      && event.started_phase === "workspace-navigation"
+      && event.failure_phase === "workspace-navigation"
+      && event.same_origin === true,
+  );
+  if (candidates.length === 0) return [];
+
+  workspaceEntry.home_overlay_visible = await page.locator('.fm-home-overlay[data-state="home-overlay"]').isVisible();
+  workspaceEntry.workspace_body_visible = await page.locator("#fm-main-content.fm-workspace-body").isVisible();
+  workspaceEntry.explorer_visible = await page.locator(".fm-explorer").isVisible();
+  assert(workspaceEntry.stage === "ready"
+    && workspaceEntry.workspace_body_visible === true
+    && workspaceEntry.explorer_visible === true
+    && workspaceEntry.home_overlay_visible === false,
+  "Startup diagnostic request cancellation cannot be probed before the workspace is ready without the home overlay");
+  assert(candidates.length <= startupDiagnosticPaths.size,
+    "Startup control-resource cancellations exceeded the explicit path probe bound");
+  assert.equal(new Set(candidates.map((event) => event.path)).size, candidates.length,
+    "Startup diagnostic cancellation evidence contains duplicate paths");
+
+  for (const cancelled of candidates) {
+    assert.equal(typeof cancelled.failure_elapsed_ms, "number");
+    assert.equal(typeof cancelled.failure_message, "string");
+    const firstNewEvent = startupRequestEvents.length;
+    const probeStartedAt = Date.now();
+    const response = await page.evaluate(async (path) => {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 10_000);
+      try {
+        const result = await window.fetch(path, {
+          method: "GET",
+          cache: "no-store",
+          credentials: "same-origin",
+          signal: controller.signal,
+        });
+        const reader = result.body?.getReader();
+        let bodyBytes = 0;
+        if (reader) {
+          while (true) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            bodyBytes += chunk.value?.byteLength ?? 0;
+            if (bodyBytes > 262_144) {
+              await reader.cancel();
+              throw new Error("Startup diagnostic read exceeded the 256 KiB body bound");
+            }
+          }
+        }
+        return { url: result.url, status: result.status, body_bytes: bodyBytes };
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }, cancelled.path);
+    const responseUrl = new URL(response.url);
+    assert.equal(responseUrl.origin, browserOrigin,
+      `Startup diagnostic follow-up escaped the browser origin: ${cancelled.path}`);
+    assert.equal(responseUrl.pathname, cancelled.path,
+      `Startup diagnostic follow-up changed the endpoint path: ${cancelled.path}`);
+    assert.equal(responseUrl.search, "",
+      `Startup diagnostic follow-up unexpectedly changed the endpoint query: ${cancelled.path}`);
+    assert(Number.isSafeInteger(response.body_bytes) && response.body_bytes >= 0 && response.body_bytes <= 262_144,
+      `Startup diagnostic follow-up exceeded the 256 KiB response bound: ${cancelled.path}`);
+
+    const requestEventDeadline = Date.now() + 2_000;
+    let matchingEvents = [];
+    do {
+      matchingEvents = startupRequestEvents.slice(firstNewEvent).filter((event) =>
+        event.method === "GET"
+          && event.path === cancelled.path
+          && event.started_phase === harnessPhase
+          && event.started_elapsed_ms > cancelled.failure_elapsed_ms
+          && event.resource_type === "fetch"
+          && event.same_origin === true
+          && event.outcome === "finished"
+          && event.finished === true
+          && event.response_status === response.status,
+      );
+      if (matchingEvents.length === 1 && matchingEvents[0].finished === true) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    } while (Date.now() < requestEventDeadline);
+    assert.equal(matchingEvents.length, 1,
+      `Startup diagnostic follow-up did not produce one finished same-origin browser fetch: ${cancelled.path}`);
+    const replacement = matchingEvents[0];
+    assert(response.status >= 200 && response.status < 300,
+      `Startup diagnostic follow-up returned HTTP ${response.status}: ${cancelled.path}`);
+    assert(replacement.finished_elapsed_ms >= replacement.started_elapsed_ms);
+    assert(probeStartedAt >= cancelled.failure_elapsed_ms + runStartedAt);
+
+    const failureIndex = requestFailures.indexOf(cancelled.failure_message);
+    assert(failureIndex >= 0,
+      `Startup diagnostic cancellation was not retained as a request failure before follow-up proof: ${cancelled.path}`);
+    requestFailures.splice(failureIndex, 1);
+    startupUnmountCancellationProbes.push({
+      classification: "startup-unmount-cancellation-followed-by-read-probe",
+      cancelled_request_id: cancelled.request_id,
+      probe_request_id: replacement.request_id,
+      method: "GET",
+      path: cancelled.path,
+      cancellation_error: cancelled.error,
+      cancellation_phase: cancelled.failure_phase,
+      cancellation_started_elapsed_ms: cancelled.started_elapsed_ms,
+      cancellation_failed_elapsed_ms: cancelled.failure_elapsed_ms,
+      probe_started_elapsed_ms: replacement.started_elapsed_ms,
+      probe_finished_elapsed_ms: replacement.finished_elapsed_ms,
+      probe_response_status: response.status,
+      probe_body_bytes: response.body_bytes,
+      probe_resource_type: replacement.resource_type,
+      workspace_ready: workspaceEntry.stage === "ready",
+      home_overlay_visible: workspaceEntry.home_overlay_visible,
+    });
+  }
+  return startupUnmountCancellationProbes.slice(0, startupDiagnosticPaths.size);
 }
 
 function routeUrl(path) {
@@ -534,6 +713,43 @@ function readGlobalQuality(quality) {
   return value.global ?? null;
 }
 
+function qualityStateReadiness(resourceStatus, gateStatus = "unknown") {
+  return [{
+    group: "Airbox Quality Gates",
+    fields: { "Quality resource": resourceStatus, "Airbox-scoped result": gateStatus },
+  }];
+}
+
+function qualityPanelReadiness(panel, quality) {
+  if (panel.id === "quality-gates") {
+    const gates = quality?.quality?.airbox_quality_gates;
+    assert(gates && gates.scope === "airbox" && gates.marker === 0 && typeof gates.source === "string" && gates.source.length > 0,
+      "Universe quality API did not provide the Airbox gate values needed for the live-panel readiness check");
+    return [{
+      group: panel.requiredGroup,
+      fields: {
+        Scope: gates.scope,
+        Marker: String(gates.marker),
+        Source: gates.source,
+      },
+    }];
+  }
+  if (panel.id === "statistics") {
+    const globalQuality = readGlobalQuality(quality);
+    assert(globalQuality && typeof globalQuality === "object" && !Array.isArray(globalQuality),
+      "Universe quality API omitted the global values needed for the live statistics-panel readiness check");
+    const fields = {
+      Scope: typeof globalQuality.label === "string" ? globalQuality.label : "Airbox endpoint scope",
+      Marker: globalQuality.marker == null ? "not published" : String(globalQuality.marker),
+    };
+    if (typeof quality.quality?.quality_source === "string") {
+      fields["Quality source"] = quality.quality.quality_source;
+    }
+    return [{ group: "Airbox Quality Distributions", fields }];
+  }
+  return [];
+}
+
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -569,12 +785,17 @@ function uiSnapshot() {
   };
 }
 
-async function readPanel(page, panel, { select = true } = {}) {
+async function readPanel(page, panel, { select = true, readiness = [] } = {}) {
   const node = page.locator(`.fm-explorer [role="treeitem"][data-node-id="${panel.nodeId}"]`).first();
   await node.waitFor({ state: "visible", timeout: timeoutMs });
   if (select && (await node.getAttribute("aria-expanded")) === "false") {
     await node.scrollIntoViewIfNeeded();
-    await node.dblclick({ timeout: timeoutMs });
+    await node.locator(".fm-explorer-tree-row__branch").click({ timeout: timeoutMs });
+    await page.waitForFunction(
+      (nodeId) => document.querySelector(`.fm-explorer [role="treeitem"][data-node-id="${nodeId}"]`)?.getAttribute("aria-expanded") === "true",
+      panel.nodeId,
+      { timeout: timeoutMs },
+    );
   }
   await node.scrollIntoViewIfNeeded();
   if (select) await node.click({ timeout: timeoutMs });
@@ -591,6 +812,42 @@ async function readPanel(page, panel, { select = true } = {}) {
     { nodeId: panel.nodeId, selectionKind: panel.selectionKind },
     { timeout: timeoutMs },
   );
+  if (readiness.length > 0) {
+    try {
+      await page.waitForFunction(
+        ({ nodeId, selectionKind, expectedGroups }) => {
+          const selected = document.querySelector(`.fm-explorer [role="treeitem"][data-node-id="${nodeId}"]`);
+          const inspector = document.querySelector('[data-inspector-owner="airbox-inspector"]');
+          const selectionReady = selected?.getAttribute("aria-selected") === "true"
+            && [...(inspector?.querySelectorAll(".fm-inspector-field-row") ?? [])].some((row) =>
+              row.querySelector(".fm-inspector-field-row__label")?.textContent?.trim() === "Inspector kind"
+              && row.querySelector(".fm-inspector-field-row__value")?.textContent?.trim() === selectionKind);
+          if (!selectionReady) return false;
+          return expectedGroups.every(({ group, fields }) => {
+            const section = [...inspector.querySelectorAll('[data-slot="inspector-group"]')].find((candidate) =>
+              candidate.querySelector('[data-slot="inspector-group-heading"] h3, [data-slot="inspector-group-header"] h3, [data-slot="inspector-group-trigger"] h3, [data-slot="inspector-group-trigger"] span')?.textContent?.trim() === group);
+            if (!section) return false;
+            const rows = [...section.querySelectorAll(".fm-inspector-field-row")];
+            return Object.entries(fields).every(([label, expected]) => {
+              const expectedValues = Array.isArray(expected) ? expected : [expected];
+              return rows.some((row) =>
+                row.querySelector(".fm-inspector-field-row__label")?.textContent?.trim() === label
+                && expectedValues.includes(row.querySelector(".fm-inspector-field-row__value")?.textContent?.trim()));
+            });
+          });
+        },
+        {
+          nodeId: panel.nodeId,
+          selectionKind: panel.selectionKind,
+          expectedGroups: readiness,
+        },
+        { timeout: qualityReadinessTimeoutMs, polling: 100 },
+      );
+    } catch (error) {
+      const expected = readiness.map(({ group, fields }) => `${group}: ${JSON.stringify(fields)}`).join("; ");
+      throw new Error(`Inspector ${panel.id} did not publish API-matching live resource values within ${qualityReadinessTimeoutMs} ms (${expected}): ${diagnosticText(error?.message ?? error, 400)}`);
+    }
+  }
   const snapshot = await page.evaluate(uiSnapshot);
   assert(snapshot, `Inspector route ${panel.id} did not render its dedicated root`);
   assert.equal(snapshot.inspectorKind, panel.selectionKind, `Inspector kind differs for ${panel.id}`);
@@ -1058,7 +1315,7 @@ async function expandNode(page, nodeId) {
   await node.waitFor({ state: "visible", timeout: timeoutMs });
   if ((await node.getAttribute("aria-expanded")) === "false") {
     await node.scrollIntoViewIfNeeded();
-    await node.dblclick({ timeout: timeoutMs });
+    await node.locator(".fm-explorer-tree-row__branch").click({ timeout: timeoutMs });
     await page.waitForFunction(
       (id) => document.querySelector(`.fm-explorer [role="treeitem"][data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true",
       nodeId,
@@ -1205,7 +1462,7 @@ async function exerciseInitialQualityLoading(page, expectedQuality) {
     await withTimeout(refreshStarted.promise, "First Inspector quality GET did not start");
     const pending = await waitForResourceState(page, path, ["loading"]);
     loadingStatus = pending?.status ?? null;
-    loadingPanel = await readPanel(page, qualityPanel, { select: false });
+    loadingPanel = await readPanel(page, qualityPanel, { select: false, readiness: qualityStateReadiness("loading") });
     assert.equal(loadingPanel.fields["Quality resource"], "loading",
       "Quality Gates panel did not expose the first-load state");
     assert.equal(loadingPanel.fields["Airbox-scoped result"], "unknown",
@@ -1242,7 +1499,9 @@ async function exerciseInitialQualityLoading(page, expectedQuality) {
     throw new Error(failures.join("\n"));
   }
   await waitForResourceState(page, path, ["ready"]);
-  const recovered = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+  const recovered = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"), {
+    select: false, readiness: qualityStateReadiness("ready"),
+  });
   assert.equal(recovered.fields["Quality resource"], "ready", "First live quality response did not reach the ready state");
   assert(requestCount >= 1 && requestCount <= 4, `Initial quality GET count is out of bounds: ${requestCount}`);
   assert(responseStatus >= 200 && responseStatus < 300, "Initial quality response was not successful live data");
@@ -1261,7 +1520,9 @@ async function exerciseInitialQualityLoading(page, expectedQuality) {
 async function exerciseQualityReadStates(page) {
   const path = resourcePaths.universeQuality;
   const pattern = `**${path}*`;
-  const livePanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+  const livePanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"), {
+    readiness: qualityStateReadiness("ready"),
+  });
   const liveSnapshot = await waitForResourceState(page, path, ["ready"]);
   const liveGateResult = livePanel.fields["Airbox-scoped result"];
   assert.equal(liveGateResult, "unknown",
@@ -1297,7 +1558,9 @@ async function exerciseQualityReadStates(page) {
     try {
       await invalidateResource(page, path);
       const syntheticSnapshot = await waitForResourceState(page, path, ["ready"]);
-      const panel = await readPanel(page, panels.find((item) => item.id === "quality-gates"));
+      const panel = await readPanel(page, panels.find((item) => item.id === "quality-gates"), {
+        select: false, readiness: qualityStateReadiness("ready", "pass"),
+      });
       assert.equal(String(syntheticSnapshot?.data?.revision), String(liveRevision),
         "Synthetic pass control changed the live quality revision");
       assert.equal(syntheticSnapshot?.data?.quality?.airbox_quality_gates?.status, "pass",
@@ -1346,7 +1609,9 @@ async function exerciseQualityReadStates(page) {
     loadingResourceStatus = pendingSnapshot?.status ?? null;
     assert.equal(pendingSnapshot?.data?.quality?.airbox_quality_gates?.status, "pass",
       "Delayed refresh did not retain the synthetic cached pass needed for a nonvacuous suppression check");
-    loadingPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+    loadingPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"), {
+      select: false, readiness: qualityStateReadiness(["stale", "loading", "pending"]),
+    });
     assert(["stale", "loading", "pending"].includes(loadingPanel.fields["Quality resource"]),
       "Quality panel did not expose its delayed loading/stale state");
     assert.equal(loadingPanel.fields["Airbox-scoped result"], "unknown",
@@ -1356,7 +1621,9 @@ async function exerciseQualityReadStates(page) {
     await page.unroute(pattern);
   }
   const restoredSnapshot = await waitForResourceState(page, path, ["ready"]);
-  const restoredPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+  const restoredPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"), {
+    select: false, readiness: qualityStateReadiness("ready", liveGateResult),
+  });
   assert.equal(restoredSnapshot?.data?.quality?.airbox_quality_gates?.status, "unknown",
     "Delayed live response did not restore the actual unknown Airbox gate result");
   assert.equal(restoredPanel.fields["Quality resource"], "ready", "Live quality GET did not restore the ready resource");
@@ -1379,28 +1646,73 @@ async function exerciseQualityReadStates(page) {
   });
   syntheticQualityErrorActive = true;
   let errorPanel;
+  let errorStatisticsPanel;
+  let errorQualityFields;
   let errorSnapshot;
   try {
     await invalidateResource(page, path);
     errorSnapshot = await waitForResourceState(page, path, ["error"]);
+    assert.equal(errorSnapshot?.status, "error", "Synthetic quality failure did not settle as a resource error");
+    assert(typeof errorSnapshot?.error === "string" && errorSnapshot.error.length > 0,
+      "Synthetic quality failure did not retain an observable resource error");
     assert.equal(errorSnapshot?.data?.quality?.airbox_quality_gates?.status, "pass",
       "Synthetic error did not retain the matching cached pass needed for a nonvacuous suppression check");
-    errorPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
-    assert.equal(errorPanel.fields["Quality resource"], "error", "Injected quality GET error did not reach the Inspector resource state");
+    const qualityPanel = panels.find((panel) => panel.id === "quality-gates");
+    assert(qualityPanel, "Quality Gates panel is not configured for the cached-refresh error check");
+    errorPanel = await readPanel(page, qualityPanel, {
+      select: false,
+      readiness: [{
+        group: "Airbox Quality Gates",
+        fields: {
+          "Airbox-scoped result": "unknown",
+          "Quality resource": ["error", "refresh error"],
+        },
+      }],
+    });
+    assert(["error", "refresh error"].includes(errorPanel.fields["Quality resource"]),
+      "Quality Gates panel did not expose its failed resource state");
+    assert.match(errorPanel.fields.Reason, /failed to load/i,
+      "Quality Gates panel did not explain that the cached refresh failed to load");
     assert.equal(errorPanel.fields["Airbox-scoped result"], "unknown",
       "Airbox quality panel showed a pass/fail result after its quality resource failed");
+
+    const statisticsPanel = panels.find((panel) => panel.id === "statistics");
+    assert(statisticsPanel, "Statistics panel is not configured for the cached-refresh error check");
+    errorStatisticsPanel = await readPanel(page, statisticsPanel, {
+      readiness: [{
+        group: "Airbox Quality Distributions",
+        fields: { "Quality resource": "refresh error" },
+      }],
+    });
+    const qualityDistributionFields = errorStatisticsPanel.groups.find(
+      (group) => group.group === "Airbox Quality Distributions",
+    )?.fields;
+    assert(qualityDistributionFields, "Statistics panel omitted its Airbox quality distribution evidence");
+    errorQualityFields = qualityDistributionFields;
+    assert.equal(qualityDistributionFields.Scope, "Airbox endpoint scope",
+      "Statistics panel retained a quality scope while the cached refresh had failed");
+    assert.equal(qualityDistributionFields.Marker, "not published",
+      "Statistics panel retained a quality marker while the cached refresh had failed");
+    assert.equal(qualityDistributionFields["Quality source"], "not published",
+      "Statistics panel retained a quality source while the cached refresh had failed");
+    assert.equal(qualityDistributionFields["Elements in quality statistics"], "unknown",
+      "Statistics panel retained quality element counts while the cached refresh had failed");
+    assert.equal(errorQualityFields["Quality resource"], "refresh error",
+      "A cached stale display was not accompanied by an explicit refresh-error signal");
   } finally {
     await page.unroute(pattern);
     await page.waitForTimeout(50);
     syntheticQualityErrorActive = false;
   }
-  assert(errorRequests >= 1 && errorRequests <= 4, `Synthetic quality error GET count is out of bounds: ${errorRequests}`);
+  assert(errorRequests >= 1 && errorRequests <= 6, `Synthetic quality error GET count is out of bounds: ${errorRequests}`);
   assert(syntheticQualityHttpErrors.some((item) => item.includes("503 GET /v2/sessions/current/meshing/meshes/universe/quality")),
     "Synthetic quality failure response was not recorded separately from live API errors");
 
   await invalidateResource(page, path);
   const recoveredSnapshot = await waitForResourceState(page, path, ["ready"]);
-  const recoveredPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"));
+  const recoveredPanel = await readPanel(page, panels.find((panel) => panel.id === "quality-gates"), {
+    readiness: qualityStateReadiness("ready", liveGateResult),
+  });
   assert.equal(recoveredSnapshot?.data?.quality?.airbox_quality_gates?.status, "unknown",
     "Live recovery did not restore the actual unknown Airbox gate result");
   assert.equal(recoveredPanel.fields["Quality resource"], "ready", "Live quality GET did not recover after the isolated error route was removed");
@@ -1426,8 +1738,13 @@ async function exerciseQualityReadStates(page) {
     synthetic_pass_control_for_error: syntheticPassControlForError,
     synthetic_error_get: {
       http_status: 503,
-      resource_status: errorPanel.fields["Quality resource"],
+      resource_status: errorSnapshot.status,
+      resource_error_observed: true,
+      panel_resource_status: errorPanel.fields["Quality resource"],
+      panel_reason_reports_failed_load: /failed to load/i.test(errorPanel.fields.Reason),
       gate_result: errorPanel.fields["Airbox-scoped result"],
+      refresh_error_visible_in_statistics: errorQualityFields["Quality resource"] === "refresh error",
+      cached_quality_withheld: true,
       requests: errorRequests,
       cached_synthetic_gate_status: "pass",
       restored_to_live_unknown: recoveredPanel.fields["Airbox-scoped result"] === liveGateResult,
@@ -1507,6 +1824,33 @@ async function main() {
       const startedAt = Date.now();
       requestStartedAt.set(request, startedAt);
       const path = new URL(request.url()).pathname;
+      if (startupDiagnosticPaths.has(path)) {
+        if (startupRequestEvents.length >= 32) {
+          collect(requestFailures, "Startup diagnostic request audit exceeded its 32-request bound");
+        } else {
+          const requestUrl = new URL(request.url());
+          const startupRequest = {
+            request_id: ++startupRequestSequence,
+            method: request.method(),
+            path,
+            resource_type: request.resourceType(),
+            same_origin: requestUrl.origin === browserOrigin,
+            started_phase: harnessPhase,
+            started_elapsed_ms: Math.max(0, startedAt - runStartedAt),
+            outcome: "pending",
+            response_status: null,
+            response_elapsed_ms: null,
+            finished: false,
+            finished_elapsed_ms: null,
+            error: null,
+            failure_phase: null,
+            failure_elapsed_ms: null,
+            failure_message: null,
+          };
+          startupRequestEvents.push(startupRequest);
+          startupRequestByRequest.set(request, startupRequest);
+        }
+      }
       if (request.method() === "GET" && path === planarMonitorsPath) {
         const monitorRequest = {
           done: deferred(),
@@ -1537,13 +1881,18 @@ async function main() {
             collect(requestFailures, "Visualization acknowledgement evidence exceeded its 16-request bound");
           }
         } else {
-          collect(mutationRequests, `${request.method()} ${path}`);
+          collect(mutationRequests, mutationRequestDiagnostic(request, path, harnessPhase));
         }
       }
     });
     page.on("requestfailed", (request) =>
       collectRequestFailure(request, request.failure()?.errorText ?? "failed"));
     page.on("response", (response) => {
+      const startupRequest = startupRequestByRequest.get(response.request());
+      if (startupRequest) {
+        startupRequest.response_status = response.status();
+        startupRequest.response_elapsed_ms = Math.max(0, Date.now() - runStartedAt);
+      }
       const acknowledgement = visualizationAckByRequest.get(response.request());
       if (acknowledgement) {
         acknowledgement.response_status = response.status();
@@ -1569,6 +1918,14 @@ async function main() {
         }
       }
     });
+    page.on("requestfinished", (request) => {
+      const startupRequest = startupRequestByRequest.get(request);
+      if (startupRequest) {
+        startupRequest.finished = true;
+        startupRequest.finished_elapsed_ms = Math.max(0, Date.now() - runStartedAt);
+        startupRequest.outcome = "finished";
+      }
+    });
 
     workspaceEntry.stage = "navigating";
     harnessPhase = "workspace-navigation";
@@ -1587,6 +1944,7 @@ async function main() {
       workspaceEntry.stage = "returning-from-home-overlay";
       await page.getByRole("button", { name: "Back to simulation", exact: true }).click();
       await homeOverlay.waitFor({ state: "hidden", timeout: timeoutMs });
+      workspaceEntry.home_overlay_visible = false;
       workspaceEntry.returned_from_home_overlay = true;
     } else {
       workspaceEntry.returned_from_home_overlay = false;
@@ -1660,7 +2018,8 @@ async function main() {
     harnessPhase = "inspector-panel-proof";
     const panelProof = [];
     for (const panel of panels) {
-      panelProof.push(await readPanel(page, panel));
+      harnessPhase = `inspector-panel:${panel.id}`;
+      panelProof.push(await readPanel(page, panel, { readiness: qualityPanelReadiness(panel, quality) }));
       const snapshot = await panelDataSnapshot(page);
       assert(snapshot, `Inspector route ${panel.id} lost its root during panel evidence capture`);
       if (panel.id === "parameters") {
@@ -1701,12 +2060,14 @@ async function main() {
     }
 
     // Return to the root to prove its DOM node survives a real GET refresh.
+    harnessPhase = "inspector-panel:root-refresh-check";
     await readPanel(page, panels[0]);
     harnessPhase = "manifest-refresh";
     const refresh = await triggerStableManifestRefresh(page, manifest);
     const comparisons = deriveApiComparisons({ policy, manifest, quality, report, status, panels: panelProof });
     harnessPhase = "quality-state-probes";
     const qualityStateProof = await exerciseQualityReadStates(page);
+    const startupCancellationProof = await proveStartupUnmountCancellationFollowupReads(page, workspaceEntry);
     assert.equal(mutationRequests.length, 0, `Browser sent mutating session requests: ${mutationRequests.join(", ")}`);
     const solveMutationRequests = mutationRequests.filter((request) =>
       /(?:^|\/)solve(?:\/|$)/i.test(request.slice(request.indexOf(" ") + 1)),
@@ -1751,6 +2112,7 @@ async function main() {
       resource_refresh: refresh,
       initial_quality_loading: initialQualityLoading,
       synthetic_quality_fault_injection: qualityStateProof,
+      startup_unmount_cancellation_probes: startupCancellationProof,
     };
 
     const output = {
@@ -1767,6 +2129,8 @@ async function main() {
       http_errors: httpErrors,
       synthetic_http_errors: syntheticQualityHttpErrors,
       synthetic_console_errors: syntheticQualityConsoleErrors,
+      startup_request_events: startupRequestEvidence(),
+      startup_unmount_cancellation_probes: startupCancellationProof,
       resource_responses: resourceResponses,
       visualization_client_acknowledgements: visualizationClientAcknowledgements,
       planar_monitor_requests: planarMonitorRequestEvidence(),
@@ -1789,6 +2153,8 @@ async function main() {
       http_errors: httpErrors,
       synthetic_http_errors: syntheticQualityHttpErrors,
       synthetic_console_errors: syntheticQualityConsoleErrors,
+      startup_request_events: startupRequestEvidence(),
+      startup_unmount_cancellation_probes: startupUnmountCancellationProbes.slice(0, startupDiagnosticPaths.size),
       resource_responses: resourceResponses,
       visualization_client_acknowledgements: visualizationClientAcknowledgements,
       planar_monitor_requests: planarMonitorRequestEvidence(),
@@ -1840,6 +2206,8 @@ async function main() {
     request_failures: requestFailures.length,
     request_failure_messages: diagnosticSamples(requestFailures),
     request_cancellations: requestCancellations.slice(0, 8),
+    startup_request_events: startupRequestEvidence(),
+    startup_unmount_cancellation_probes: startupUnmountCancellationProbes.slice(0, startupDiagnosticPaths.size),
     http_errors: httpErrors,
     browser_route: loopbackProxy ? {
       origin: loopbackProxy.origin,

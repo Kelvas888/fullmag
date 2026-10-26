@@ -1172,6 +1172,113 @@ def _validate_resource_responses(value: object) -> None:
                 raise BuildControlError(f"Browser helper API resource response is malformed: {field}")
 
 
+def _validate_startup_unmount_cancellation_probes(events_value: object, probes_value: object) -> None:
+    allowed_paths = {
+        "/v2/sessions/current/diagnostics/cpu",
+        "/v2/sessions/current/diagnostics/gpu",
+        "/v2/platform/compute/nodes",
+        "/v2/platform/health",
+        "/v2/sessions/current/model/planar-monitors",
+        "/v2/sessions/current/simulation/preparation",
+    }
+    if not isinstance(events_value, list) or len(events_value) > 32:
+        raise BuildControlError("Airbox Inspector startup request audit is malformed or over budget")
+    if not isinstance(probes_value, list) or len(probes_value) > len(allowed_paths):
+        raise BuildControlError("Airbox Inspector startup cancellation probes are malformed or over budget")
+
+    events: dict[int, Mapping[str, object]] = {}
+    failed_events: dict[int, Mapping[str, object]] = {}
+    for event in events_value:
+        if not isinstance(event, Mapping):
+            raise BuildControlError("Airbox Inspector startup request audit entry is malformed")
+        request_id = event.get("request_id")
+        path = event.get("path")
+        method = event.get("method")
+        if (type(request_id) is not int or request_id <= 0 or request_id in events
+                or not isinstance(path, str) or path not in allowed_paths
+                or method != "GET"
+                or event.get("same_origin") is not True
+                or not isinstance(event.get("resource_type"), str)
+                or not isinstance(event.get("started_phase"), str)
+                or type(event.get("started_elapsed_ms")) is not int
+                or event["started_elapsed_ms"] < 0):
+            raise BuildControlError("Airbox Inspector startup request audit identity is invalid")
+        events[request_id] = event
+        outcome = event.get("outcome")
+        if outcome == "finished":
+            if (event.get("finished") is not True
+                    or type(event.get("response_status")) is not int
+                    or not 100 <= event["response_status"] < 600
+                    or type(event.get("finished_elapsed_ms")) is not int
+                    or event["finished_elapsed_ms"] < event["started_elapsed_ms"]):
+                raise BuildControlError("Airbox Inspector startup request completion is malformed")
+        elif outcome == "request-failed":
+            failure_elapsed = event.get("failure_elapsed_ms")
+            if (not isinstance(event.get("error"), str) or not event["error"]
+                    or not isinstance(event.get("failure_phase"), str)
+                    or type(failure_elapsed) is not int
+                    or failure_elapsed < event["started_elapsed_ms"]):
+                raise BuildControlError("Airbox Inspector startup request failure evidence is malformed")
+            failed_events[request_id] = event
+        elif outcome == "browser-context-shutdown":
+            if (event.get("failure_phase") != "browser-context-shutdown"
+                    or event.get("finished") is not False):
+                raise BuildControlError("Airbox Inspector shutdown cancellation evidence is malformed")
+        else:
+            raise BuildControlError("Airbox Inspector retained an unsettled startup diagnostic request")
+
+    probes_by_cancelled_id: dict[int, Mapping[str, object]] = {}
+    probe_paths: set[str] = set()
+    for probe in probes_value:
+        if not isinstance(probe, Mapping):
+            raise BuildControlError("Airbox Inspector startup cancellation probe is malformed")
+        cancelled_id = probe.get("cancelled_request_id")
+        probe_id = probe.get("probe_request_id")
+        path = probe.get("path")
+        if (probe.get("classification") != "startup-unmount-cancellation-followed-by-read-probe"
+                or type(cancelled_id) is not int or type(probe_id) is not int
+                or cancelled_id == probe_id
+                or cancelled_id in probes_by_cancelled_id
+                or not isinstance(path, str) or path not in allowed_paths or path in probe_paths
+                or probe.get("method") != "GET"
+                or probe.get("cancellation_error") != "net::ERR_ABORTED"
+                or probe.get("cancellation_phase") != "workspace-navigation"
+                or probe.get("workspace_ready") is not True
+                or probe.get("home_overlay_visible") is not False
+                or probe.get("probe_resource_type") != "fetch"
+                or type(probe.get("probe_response_status")) is not int
+                or not 200 <= probe["probe_response_status"] < 300
+                or type(probe.get("probe_body_bytes")) is not int
+                or not 0 <= probe["probe_body_bytes"] <= 262_144):
+            raise BuildControlError("Airbox Inspector startup cancellation probe is not an exact bounded read")
+        cancelled = failed_events.get(cancelled_id)
+        replacement = events.get(probe_id)
+        started = probe.get("probe_started_elapsed_ms")
+        finished = probe.get("probe_finished_elapsed_ms")
+        if (cancelled is None or replacement is None
+                or cancelled.get("path") != path
+                or cancelled.get("method") != "GET"
+                or cancelled.get("error") != "net::ERR_ABORTED"
+                or cancelled.get("started_phase") != "workspace-navigation"
+                or cancelled.get("failure_phase") != "workspace-navigation"
+                or replacement.get("path") != path
+                or replacement.get("method") != "GET"
+                or replacement.get("resource_type") != "fetch"
+                or replacement.get("same_origin") is not True
+                or replacement.get("outcome") != "finished"
+                or replacement.get("response_status") != probe.get("probe_response_status")
+                or type(started) is not int or type(finished) is not int
+                or started <= cancelled.get("failure_elapsed_ms", -1)
+                or started != replacement.get("started_elapsed_ms")
+                or finished != replacement.get("finished_elapsed_ms")):
+            raise BuildControlError("Airbox Inspector startup cancellation lacks its later successful same-origin read")
+        probes_by_cancelled_id[cancelled_id] = probe
+        probe_paths.add(path)
+
+    if set(failed_events) != set(probes_by_cancelled_id):
+        raise BuildControlError("Airbox Inspector startup request failure was not resolved by an exact follow-up probe")
+
+
 def _parse_airbox_inspector_result(
     output: bytes,
     public_url: str,
@@ -1209,9 +1316,13 @@ def _parse_airbox_inspector_result(
             raise BuildControlError(f"Airbox Inspector helper reported {key}")
     if payload.get("http_errors") != []:
         raise BuildControlError("Airbox Inspector helper reported HTTP errors")
+    _validate_startup_unmount_cancellation_probes(
+        payload.get("startup_request_events"),
+        payload.get("startup_unmount_cancellation_probes"),
+    )
     synthetic_http_errors = payload.get("synthetic_http_errors")
     if (not isinstance(synthetic_http_errors, list)
-            or len(synthetic_http_errors) > 8
+            or len(synthetic_http_errors) > 6
             or any(
                 not isinstance(item, str)
                 or item != "503 GET /v2/sessions/current/meshing/meshes/universe/quality"
@@ -1224,7 +1335,7 @@ def _parse_airbox_inspector_result(
             )):
         raise BuildControlError("Airbox Inspector helper omitted its isolated synthetic quality error evidence")
     synthetic_console_errors = payload.get("synthetic_console_errors", [])
-    if not isinstance(synthetic_console_errors, list) or len(synthetic_console_errors) > 8:
+    if not isinstance(synthetic_console_errors, list) or len(synthetic_console_errors) > 6:
         raise BuildControlError("Airbox Inspector synthetic console evidence is malformed")
     for item in synthetic_console_errors:
         if not isinstance(item, str) or len(item) > 2048:
@@ -1382,6 +1493,13 @@ def _parse_airbox_inspector_result(
             or failed.get("cached_synthetic_gate_status") != "pass"
             or failed.get("http_status") != 503
             or failed.get("resource_status") != "error"
+            or failed.get("resource_error_observed") is not True
+            or failed.get("panel_resource_status") not in {"error", "refresh error"}
+            or failed.get("panel_reason_reports_failed_load") is not True
+            or failed.get("cached_quality_withheld") is not True
+            or failed.get("refresh_error_visible_in_statistics") is not True
+            or type(failed.get("requests")) is not int
+            or not 1 <= failed["requests"] <= 6
             or failed.get("gate_result") != "unknown"
             or failed.get("restored_to_live_unknown") is not True):
         raise BuildControlError("Airbox Inspector showed an invalid quality result after a synthetic resource failure")

@@ -63,13 +63,13 @@ export function AirboxMeshQualityGatesPanel({ selection }: InspectorPanelProps) 
       : "Quality gates require a matching published Airbox topology identity."
     : manifest.status !== "ready"
       ? `Cached Airbox topology resource is ${manifest.status}; gate status is unknown until refreshed.`
+    : quality.status === "error" || quality.error || quality.refreshError
+      ? "Airbox quality resource failed to load; gate status is unknown."
     : quality.status === "loading"
       ? "Airbox quality resource is loading; gate status is pending."
       : quality.status === "stale"
         ? "Cached Airbox quality resource is stale; gate status is unknown until refreshed."
-        : quality.status === "error" || quality.error || quality.refreshError
-          ? "Airbox quality resource failed to load; gate status is unknown."
-          : quality.status === "ready" && !qualityRevisionMatches
+        : quality.status === "ready" && !qualityRevisionMatches
             ? "Airbox quality revision does not match the current mesh revision; gate status is unknown."
           : model.qualityGates.reason;
 
@@ -82,7 +82,7 @@ export function AirboxMeshQualityGatesPanel({ selection }: InspectorPanelProps) 
         <FieldRow label="Scope" value={model.qualityGates.scope ?? "not published"} />
         <FieldRow label="Marker" value={String(model.qualityGates.marker ?? "not published")} />
         <FieldRow label="Source" value={model.qualityGates.source ?? "not published"} />
-        <FieldRow label="Quality resource" value={qualityEvidence ? quality.status : quality.status === "ready" && !qualityRevisionMatches ? "mesh revision mismatch" : quality.status} />
+        <FieldRow label="Quality resource" value={quality.refreshError ? "refresh error" : quality.error ? "error" : qualityEvidence ? quality.status : quality.status === "ready" && !qualityRevisionMatches ? "mesh revision mismatch" : quality.status} />
         {model.qualityGates.checks.map((check) => (
           <FieldRow
             key={check.id}

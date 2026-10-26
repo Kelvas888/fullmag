@@ -211,3 +211,60 @@ dowodem wykonania recovery ani dowodem działania przeglądarki.
   też PATCH visualization/state wymagający wyjaśnienia. Wynik **niezaliczony**,
   bez błędów strony, konsoli i transportu. Pełny browser proof i merge nadal
   oczekują na usunięcie przyczyn i zielone CI.
+
+- `3540e8dc3fa9e7415f68f9c0cffd545b3e6c2a06` i
+  `cef74f785502ae6c486c3b0ae0a566141b56cf09` korygują fixture’y recovery,
+  prawdziwe trzy tetraedry w przeglądarkowym fixture topologii oraz oczekiwania
+  zakresu jakości UI. Interpretowane testy idle-stop/pre-admission/receipts:
+  4/9/17 sukcesów; typecheck i lint zmienionych fixture’ów: sukces.
+  `2b03657e5644f45b7e9668c46935cef69e503a27` uzupełnia analogiczny brak
+  opcjonalnego rekordu w post-build fixture (3/3). Guard produkcyjny nadal
+  wykonuje się w testach. Review nie wykazało osłabienia zabezpieczeń.
+- CI `40246487110` zaliczyło kontrakty Rust oraz browser-fixture-smoke.
+  Pozostały błędy post-build fixture (poprawione powyżej) i ostatnie stare
+  etykiety rozkładu rozmiaru w jednym teście UI (8797 testów już zielonych).
+  Nowe asercje zostały porównane z rzeczywistym HTML zapisanym przez CI.
+- Live QA wykryło i pozwoliło poprawić prezentację Quality Gates podczas
+  retry: zasób `stale + refreshError` zachowuje dane cache, ale panel musi
+  jawnie zgłosić błąd odświeżenia i wycofać cached pass. Dodano regresję
+  renderowania i niezależną próbę syntetycznego 503. Harness czeka na dane
+  API po montowaniu panelu oraz rozwija drzewo przez przycisk gałęzi;
+  po tej zmianie nie występują mutacje visualization/state.
+- Próba `045443c4433b4905b69f328d95b2f85f` przeszła porównania API oraz
+  próby jakości i odzyskania danych, lecz końcowo odrzuciła trzy startup GET
+  `ERR_ABORTED` (diagnostics/cpu, diagnostics/gpu, platform/compute/nodes).
+  Page/console/HTTP errors: 0; mutacje: 0. Wynik nadal **niezaliczony** do
+  czasu potwierdzenia cyklu anulowania i zastępczych odpowiedzi tych zasobów.
+
+- **Browser proof zaliczony:** attempt `f383b9bce64945e6a16bd4df0f3cf970`,
+  exit 0, harness SHA-256
+  `90a99e1ee3e02f4ca9974ef87a883d4fa18350cb9a83a66a774a719fca0278ce`.
+  Wszystkie siedem paneli: root, mesh, parameters, quality-gates, statistics,
+  topology, build. Zweryfikowano 38161 komórek Airboxa, rodziny tet4/pyramid5,
+  7131 węzłów, 828 powierzchniowych ścian nośnika, 1407 węzłów interfejsów,
+  jednostki m/m³, marker 0, źródło jakości, 9 porównań rozkładów rozmiaru,
+  22 porównania metryk jakości i 3 percentyli. Osobny zakres globalnej siatki
+  obejmuje też prism6. Manifest i panel pozostają zgodne z opublikowaną
+  generacją przy unresolved runtime; nie przyznaje to możliwości Solve.
+- Odświeżenie rzeczywistym GET 200 zachowało ten sam korzeń DOM i oryginalną
+  odpowiedź. Pierwsze ładowanie, stale cached pass, błąd 503 (6 żądań przy
+  dwóch konsumentach i trzech próbach), jawny refresh error, wycofanie jakości
+  cache i odzyskanie żywego unknown przeszły. Syntetyczny pass służy wyłącznie
+  testowi UI; gamma pyramid5 pozostaje naukowo niedostępna.
+- Canvas widoczny, WebGL2 bez utraty kontekstu, drawing buffer 617×516.
+  Page/console/request/HTTP errors: 0; mutacje modelu i Solve: 0.
+  SwiftShader jest dowodem przeglądarki, nie sprzętowego GPU ani parytetu FEM.
+  Runtime backendu pozostaje zweryfikowanym buildem `35561e4c1...`; późniejsze
+  zmiany produkcyjne dotyczą wyłącznie prezentacji refresh error w frontendzie.
+- Regresje harnessu usunięto przez oczekiwanie na DOM po zmianie store oraz
+  jawne przekazanie stanu workspace. Test wykonania helpera potwierdził
+  aktualizację widoczności i korelację zakończonego odczytu. Wcześniejsze próby
+  pozostają niezaliczone w wolumenie kontrolnym. ResourceRuntimeStore
+  anuluje żądania po ostatnim unsubscribe; sześć jawnych ścieżek startowych
+  można rozliczyć tylko po zniknięciu Home i następczym GET 2xx z limitem
+  10 s/256 KiB. Zaliczony przebieg nie potrzebował tej klasyfikacji (0 probe).
+  Parser odrzuca brakujące i niezgodne dowody; interpretowane testy 26/26.
+- Ostatnie review panelu nie wykazało dalszych defektów. Uzgodniono limit 503
+  między runnerem i parserem oraz poprawiono dwa błędy zakresu/stanu helpera.
+  Typecheck/lint produkcyjnego panelu i testów oraz lint harnessu: sukces.
+  Pozostają końcowe CI, merge, aktualizacja głównego checkoutu i cleanup.

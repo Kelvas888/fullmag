@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Selection } from "@/kernel/selection/selectionTypes";
 import { Accordion } from "@/shared/ui/Accordion";
@@ -7,6 +7,13 @@ import { Accordion } from "@/shared/ui/Accordion";
 const mixedTopologyCapabilityStatus = vi.hoisted(() => ({
   value: "validated",
 }));
+const qualityResourceOverride = vi.hoisted(() => ({
+  value: null as unknown,
+}));
+
+afterEach(() => {
+  qualityResourceOverride.value = null;
+});
 
 vi.mock("../InspectorTabState", () => ({
   useInspectorActiveTab: () => "policy",
@@ -382,7 +389,7 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
     revision: 3,
     status: "ready",
   }),
-  useMeshUniverseQualityResource: () => ({
+  useMeshUniverseQualityResource: () => qualityResourceOverride.value ?? ({
     data: {
       quality: airboxQualityPayload,
       revision: 3,
@@ -774,7 +781,7 @@ describe("scoped mesh quality panels", () => {
     expect(html).toContain("Apply Airbox Policy");
   });
 
-  it("renders airbox quality histograms in the airbox mesh panel", () => {
+  it("renders scoped Airbox quality summaries and unique topology counts", () => {
     const html = renderToStaticMarkup(
       <AirboxMeshStatisticsPanel selection={airboxQualitySelection} />,
     );
@@ -785,11 +792,11 @@ describe("scoped mesh quality panels", () => {
     expect(html).toContain("SICN");
     expect(html).toContain("Gamma");
     expect(html).toContain("Below target");
-    expect(html).toContain("Element size distributions");
-    expect(html).toContain("Tetra size");
+    expect(html).toContain("Equivalent tetrahedral size");
+    expect(html).toMatch(/Equivalent tetrahedral size<\/span><span[^>]*>min 1e-9; mean 5e-9; max 9e-9/);
     expect(html).toContain("Airbox Mesh Statistics");
     expect(html).toContain("Points / nodes");
-    expect(html).toContain("12,345");
+    expect(html).toMatch(/Points \/ nodes \(unique across carriers\)<\/span><span[^>]*>12,345<\/span>/);
     expect(html).toContain("Volume elements");
     expect(html).toContain("59,244");
     expect(html).toContain("tet4");
@@ -854,6 +861,48 @@ describe("scoped mesh quality panels", () => {
     expect(html).toContain("unknown");
     expect(html).toContain("ui-derived");
     expect(html).toContain("Structural availability only; not an Airbox quality pass/fail.");
+  });
+
+  it("withholds a cached passing gate when refreshing stale quality fails", () => {
+    qualityResourceOverride.value = {
+      data: {
+        quality: {
+          airbox_quality_gates: {
+            checks: [{
+              comparison: ">=",
+              id: "sicn.minimum",
+              status: "pass",
+              threshold: 0.1,
+              unit: "dimensionless",
+              value: 0.8,
+            }],
+            marker: 0,
+            reason: "Backend reported an Airbox gate pass.",
+            scope: "airbox",
+            source: "backend-quality-gates.v1",
+            status: "pass",
+          },
+        },
+        revision: 3,
+      },
+      error: null,
+      refreshError: new Error("refresh failed"),
+      refetch: vi.fn(),
+      revision: 3,
+      status: "stale",
+    };
+
+    const html = renderToStaticMarkup(
+      <AirboxMeshQualityGatesPanel
+        selection={{ ...airboxSelection, kind: "airbox.mesh.quality-gates" }}
+      />,
+    );
+
+    expect(html).toMatch(/Airbox-scoped result<\/span><span[^>]*>unknown<\/span>/);
+    expect(html).toMatch(/Quality resource<\/span><span[^>]*>refresh error<\/span>/);
+    expect(html).toContain("Airbox quality resource failed to load; gate status is unknown.");
+    expect(html).not.toContain("Backend reported an Airbox gate pass.");
+    expect(html).not.toContain("sicn.minimum");
   });
 
   it("renders topology metadata from the manifest without a binary topology hook", () => {

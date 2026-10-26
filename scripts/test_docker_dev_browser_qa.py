@@ -120,7 +120,12 @@ def _airbox_inspector_result_fixture(qa):
                 "cached_synthetic_gate_status": "pass",
                 "http_status": 503,
                 "resource_status": "error",
+                "resource_error_observed": True,
+                "panel_resource_status": "refresh error",
+                "panel_reason_reports_failed_load": True,
                 "gate_result": "unknown",
+                "refresh_error_visible_in_statistics": True,
+                "cached_quality_withheld": True,
                 "requests": 1,
                 "restored_to_live_unknown": True,
             },
@@ -151,6 +156,8 @@ def _airbox_inspector_result_fixture(qa):
         "console_errors": 0,
         "request_failures": 0,
         "http_errors": [],
+        "startup_request_events": [],
+        "startup_unmount_cancellation_probes": [],
         "synthetic_http_errors": [
             "503 GET /v2/sessions/current/meshing/meshes/universe/quality",
         ],
@@ -1076,6 +1083,81 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
         self.assertEqual(parsed["inspector_proof"]["synthetic_quality_fault_injection"]["evidence_kind"],
                          "fault-injected-ui-only-not-scientific")
 
+        cancelled_path = "/v2/sessions/current/diagnostics/cpu"
+        startup_cancelled = deepcopy(payload)
+        startup_cancelled["startup_request_events"] = [
+            {
+                "request_id": 1,
+                "method": "GET",
+                "path": cancelled_path,
+                "resource_type": "fetch",
+                "same_origin": True,
+                "started_phase": "workspace-navigation",
+                "started_elapsed_ms": 2600,
+                "outcome": "request-failed",
+                "response_status": None,
+                "finished": False,
+                "finished_elapsed_ms": None,
+                "error": "net::ERR_ABORTED",
+                "failure_phase": "workspace-navigation",
+                "failure_elapsed_ms": 3000,
+                "failure_message": "GET " + cancelled_path + ": net::ERR_ABORTED",
+            },
+            {
+                "request_id": 2,
+                "method": "GET",
+                "path": cancelled_path,
+                "resource_type": "fetch",
+                "same_origin": True,
+                "started_phase": "quality-state-probes",
+                "started_elapsed_ms": 3900,
+                "outcome": "finished",
+                "response_status": 200,
+                "finished": True,
+                "finished_elapsed_ms": 4200,
+                "error": None,
+                "failure_phase": None,
+                "failure_elapsed_ms": None,
+                "failure_message": None,
+            },
+        ]
+        startup_cancelled["startup_unmount_cancellation_probes"] = [{
+            "classification": "startup-unmount-cancellation-followed-by-read-probe",
+            "cancelled_request_id": 1,
+            "probe_request_id": 2,
+            "method": "GET",
+            "path": cancelled_path,
+            "cancellation_error": "net::ERR_ABORTED",
+            "cancellation_phase": "workspace-navigation",
+            "cancellation_started_elapsed_ms": 2600,
+            "cancellation_failed_elapsed_ms": 3000,
+            "probe_started_elapsed_ms": 3900,
+            "probe_finished_elapsed_ms": 4200,
+            "probe_response_status": 200,
+            "probe_body_bytes": 128,
+            "probe_resource_type": "fetch",
+            "workspace_ready": True,
+            "home_overlay_visible": False,
+        }]
+        self.qa._parse_airbox_inspector_result(
+            encoded(startup_cancelled), public_url, browser_url, script_sha256,
+        )
+
+        missing_followup = deepcopy(startup_cancelled)
+        missing_followup["startup_unmount_cancellation_probes"] = []
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._parse_airbox_inspector_result(
+                encoded(missing_followup), public_url, browser_url, script_sha256,
+            )
+
+        followup_before_cancel = deepcopy(startup_cancelled)
+        followup_before_cancel["startup_request_events"][1]["started_elapsed_ms"] = 2900
+        followup_before_cancel["startup_unmount_cancellation_probes"][0]["probe_started_elapsed_ms"] = 2900
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._parse_airbox_inspector_result(
+                encoded(followup_before_cancel), public_url, browser_url, script_sha256,
+            )
+
         acknowledged = deepcopy(payload)
         acknowledgement = {
             "method": "POST",
@@ -1112,6 +1194,53 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
         with self.assertRaises(self.qa.BuildControlError):
             self.qa._parse_airbox_inspector_result(
                 encoded(stale_control), public_url, browser_url, script_sha256,
+            )
+
+        for field, invalid_value in (
+            ("resource_error_observed", False),
+            ("panel_resource_status", "stale"),
+            ("panel_reason_reports_failed_load", False),
+            ("cached_quality_withheld", False),
+            ("refresh_error_visible_in_statistics", False),
+        ):
+            with self.subTest(field=field, invalid="false"):
+                invalid_error_proof = deepcopy(payload)
+                invalid_error_proof["inspector_proof"]["synthetic_quality_fault_injection"]["synthetic_error_get"][field] = invalid_value
+                with self.assertRaises(self.qa.BuildControlError):
+                    self.qa._parse_airbox_inspector_result(
+                        encoded(invalid_error_proof), public_url, browser_url, script_sha256,
+                    )
+            with self.subTest(field=field, invalid="missing"):
+                invalid_error_proof = deepcopy(payload)
+                del invalid_error_proof["inspector_proof"]["synthetic_quality_fault_injection"]["synthetic_error_get"][field]
+                with self.assertRaises(self.qa.BuildControlError):
+                    self.qa._parse_airbox_inspector_result(
+                        encoded(invalid_error_proof), public_url, browser_url, script_sha256,
+                    )
+
+        over_budget_error_get = deepcopy(payload)
+        over_budget_error_get["inspector_proof"]["synthetic_quality_fault_injection"]["synthetic_error_get"]["requests"] = 7
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._parse_airbox_inspector_result(
+                encoded(over_budget_error_get), public_url, browser_url, script_sha256,
+            )
+
+        over_budget_http_errors = deepcopy(payload)
+        over_budget_http_errors["synthetic_http_errors"] = [
+            "503 GET /v2/sessions/current/meshing/meshes/universe/quality"
+        ] * 7
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._parse_airbox_inspector_result(
+                encoded(over_budget_http_errors), public_url, browser_url, script_sha256,
+            )
+
+        over_budget_console_errors = deepcopy(payload)
+        over_budget_console_errors["synthetic_console_errors"] = [
+            "http://frontend:8080/v2/sessions/current/meshing/meshes/universe/quality: Failed to load resource: 503",
+        ] * 7
+        with self.assertRaises(self.qa.BuildControlError):
+            self.qa._parse_airbox_inspector_result(
+                encoded(over_budget_console_errors), public_url, browser_url, script_sha256,
             )
 
         scoped_console = deepcopy(payload)
