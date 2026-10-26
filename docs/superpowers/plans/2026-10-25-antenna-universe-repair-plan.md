@@ -682,7 +682,7 @@ Nie jest to zaliczenie bramki UI ani obliczeń.
 ### Koszt aktualnej próby pełnego pola — audyt odczytowy
 
 Dla 2160158 par źródło–target operator wykonuje 8640632 wywołania geometrii
-ścian oraz 25921896 przejść ścian w double/80/120 bitach. Jest to policzona
+ścian oraz 25921896 przejść ścian w double oraz arytmetyce o 80 i 120 cyfrach dziesiętnych. Jest to policzona
 praca algorytmu, nie profil czasowy. Trzy precyzje i kontrole błędu pozostają
 obowiązkowe. Publikacja H następuje dopiero po zakończeniu całego operatora;
 brak częściowych payloadów podczas pracy nie dowodzi zawieszenia.
@@ -698,3 +698,43 @@ odmów numerycznych, liczników i limitów; nie zmniejszamy siatki ani jakości.
 Ostatni autorytatywny odczyt obecnej próby: około 1621 s od Solve, run
 running, algorytm antenna_field_only, warnings=[], worker 6335 obecny.
 Nie zaliczono V/J/H ani pełnego pola Universe.
+
+### Inspektor źródła wyniku — doprecyzowanie dostępności
+
+W roboczym ArtifactInspectionSource pokazujemy status wybranego etapu
+z aktualnych, zweryfikowanych właścicieli wykonania. Opis nośnika i H jest
+warunkowy: wybór wykonania nie oznacza, że jego payload został opublikowany.
+Rozdzielono status wykonania i dostęp tylko do odczytu. Zmiana pozostaje
+częścią roboczej integracji artefaktów; wcześniejszy wpis indeksu zachowano.
+Nie deklarujemy ukończenia całego tego fragmentu ani wizualnego odbioru.
+
+Po edycji: pełny TypeScript exit 0, focused ESLint exit 0; interpretowany
+check-artifact-field-selection.mjs w stałym frontendzie: 54 kontrole PASS.
+Kontrole obejmują właścicieli, zmianę quantity i zakresu oraz blokowanie
+niekompletnego/starego wyniku; nie renderują JSX i nie zastępują przeglądarki.
+Commit stopki: 6b1213700502055a929ddca4d4b7490340c5344b.
+
+### Wynik rzeczywistej próby Universe — niepowodzenie
+
+Komenda fm-dca3b994-0740-48e3-bde8-2c2c49ddd691 zakończyła się failed
+w Unix ms 1792972967665; czas od przyjęcia 1902,190 s obejmuje również
+pracę poza operatorem pola. Run i etap mają revision=5, failed; worker 6335
+nie istnieje. Pełna przyczyna z publicznego zasobu komendy i etapu:
+execute canonical full-volume inspection: prepared native call failed
+(Internal): surface RT0 wall-time exhausted. Przypięty limit samego operatora
+wynosił 1800 s. Katalog wyników etapu zwraca 404, engine-log ma zero wpisów.
+Nie uzyskano zaakceptowanego wyniku V/J/H tej próby i nie zaliczono etapu 2
+ani 3. Nie wydano kolejnego Solve, recovery ani zmiany tolerancji/polityki.
+Dowody terminalne zachowano w katalogu verification tej próby w wolumenie
+kontrolnym. Odczyt dedykowanego /failure metodą GET zwrócił 405; pełny
+błąd odczytano poprawnie z zasobu komendy i execution.
+
+Inspektor źródła otrzymuje również komunikat błędu wybranego, zweryfikowanego
+etapu z state_transition_reason; nie zastępuje go pustym Quantity Source.
+Następny krok numeryczny: pomiar i redukcja powtarzanej pracy operatora
+na zamrożonym wejściu z zachowaniem trzech precyzji i wszystkich bramek.
+
+Końcowa kontrola po dodaniu przyczyny błędu: pełny TypeScript exit 0,
+focused ESLint exit 0, git diff --check exit 0. Obraz inspektora po zmianach
+pozostaje NOT VERIFIED; brak nowej obserwacji użytkownika i automatycznego
+odczytu przeglądarki.
