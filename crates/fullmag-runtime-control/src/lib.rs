@@ -74,6 +74,19 @@ pub fn retry_store_writer_busy_within<T>(
     }
 }
 
+/// A store I/O failure that a later attempt can be expected to clear. A
+/// Windows-folder (9p/drvfs) store under load intermittently fails reads and
+/// writes with ENOMEM although the container has free memory; that failure
+/// changes no durable state, so a scheduler can defer and retry the pass.
+pub fn is_transient_store_io(error: &anyhow::Error) -> bool {
+    const ENOMEM: i32 = 12;
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(ENOMEM))
+    })
+}
+
 /// Worker retry for idempotent store operations: a busy writer is waited for
 /// up to `WORKER_STORE_WRITER_WAIT`, and a file that briefly reads as missing
 /// (an atomic replace seen through a Docker Desktop host folder) for a few
@@ -784,6 +797,16 @@ mod tests {
         FmsResourceLeaseState, FmsRunCatalog, FmsTaskCatalogEntry, FmsTaskLifecycle,
         FmsTaskReadiness, FMS_RESOURCE_LEASE_SCHEMA, FMS_RUN_CATALOG_SCHEMA,
     };
+
+    #[test]
+    fn only_enomem_store_io_is_transient() {
+        let enomem = anyhow::Error::from(std::io::Error::from_raw_os_error(12))
+            .context("reconcile released host reservations");
+        assert!(super::is_transient_store_io(&enomem));
+        let denied = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!super::is_transient_store_io(&denied));
+        assert!(!super::is_transient_store_io(&anyhow::anyhow!("lease identity differs")));
+    }
 
     #[test]
     fn accepted_task_stop_is_durable_idempotent_and_terminal_after_stopped_event() {

@@ -1138,10 +1138,13 @@ fn classify_scheduler_operation<T>(result: Result<T>) -> Result<SchedulerOperati
     }
 }
 
+/// Busy writer or a transient store I/O failure: either way the pass changed
+/// nothing it cannot resume, so it is deferred to the next iteration.
 fn is_store_writer_busy(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
+        || fullmag_runtime_control::is_transient_store_io(error)
 }
 
 fn is_stale_admission_candidate(error: &anyhow::Error) -> bool {
