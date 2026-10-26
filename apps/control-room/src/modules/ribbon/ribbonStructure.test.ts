@@ -457,7 +457,7 @@ describe("ribbon structure", () => {
     );
   });
 
-  it("wires Home workspace shortcuts to concrete workspace commands", () => {
+  it("keeps viewport surface selection out of Workspace while preserving its commands", () => {
     const commands = createControlRoomCommandRegistry();
     const layout = {
       get: () => ({
@@ -470,58 +470,56 @@ describe("ribbon structure", () => {
       }),
     } as unknown as CommandContext["layout"];
     const visualization = new ObjectVisualizationController();
+    const selection = {
+      kind: null,
+      label: null,
+      moduleSource: null,
+      nodeId: null,
+      objectId: null,
+      ref: null,
+    };
     const content = buildRibbonTabContent("home", {
       commands,
       commandContext: {
         layout,
         source: "test",
       },
-      selection: {
-        kind: null,
-        label: null,
-        moduleSource: null,
-        nodeId: null,
-        objectId: null,
-        ref: null,
-      },
+      selection,
       visualization,
       visualizationSnapshot: visualization.getSnapshot(),
     });
     const workspaceGroup = content?.groups.find(
       (group) => group.id === "workspace",
     );
-    const threeDimensionalAction = workspaceGroup?.actions.find(
-      (action) => action.id === "viewport-3d.open",
-    );
-    const twoDimensionalAction = workspaceGroup?.actions.find(
-      (action) => action.id === "ws-2d",
-    );
-    const analysisAction = workspaceGroup?.actions.find(
-      (action) => action.id === "ws-analyze",
-    );
-    const liveChartsAction = workspaceGroup?.actions.find(
-      (action) => action.id === "ws-live-charts",
-    );
+    const workspaceActionIds = workspaceGroup?.actions.map((action) => action.id) ?? [];
     const panelAction = workspaceGroup?.actions.find(
       (action) => action.id === "ws-panel",
     );
 
-    expect(twoDimensionalAction).toMatchObject({
-      commandId: "field-map.open",
+    for (const actionId of ["viewport-3d.open", "ws-2d", "ws-analyze", "ws-live-charts"]) {
+      expect(workspaceActionIds).not.toContain(actionId);
+    }
+    for (const commandId of [
+      "viewport-3d.open",
+      "field-map.open",
+      "analysis-plots.open",
+      "live-charts.open",
+    ]) {
+      expect(commands.get(commandId), commandId).toBeDefined();
+    }
+    const viewVisualization = new ObjectVisualizationController();
+    const view2dAction = buildRibbonTabContent("view", {
+      commands,
+      commandContext: { source: "test" },
+      selection,
+      visualization: viewVisualization,
+      visualizationSnapshot: viewVisualization.getSnapshot(),
+    })?.groups.flatMap((group) => group.actions)
+      .find((action) => action.id === "field-map.open");
+    expect(view2dAction).toMatchObject({
+      id: "field-map.open",
       disabled: false,
-    });
-    expect(threeDimensionalAction).toMatchObject({
-      id: "viewport-3d.open",
-      splitButton: true,
-    });
-    expect(analysisAction).toMatchObject({
-      commandId: "analysis-plots.open",
-      disabled: false,
-    });
-    expect(liveChartsAction).toMatchObject({
-      commandId: "live-charts.open",
-      disabled: false,
-      label: "Live Charts",
+      tooltip: "Open the active monitor in 2D View",
     });
     expect(panelAction).toMatchObject({
       disabled: false,
@@ -570,8 +568,8 @@ describe("ribbon structure", () => {
   });
 
   it("normalizes legacy utility icon colors to design tokens", () => {
-    expect(resolveRibbonIconColor("text-emerald-400")).toBe("var(--fm-success)");
-    expect(resolveRibbonIconColor("text-sky-300")).toBe("var(--fm-accent)");
+    expect(resolveRibbonIconColor("text-emerald-400")).toBe("var(--fm-category-solver)");
+    expect(resolveRibbonIconColor("text-sky-300")).toBe("var(--fm-category-runtime)");
     expect(resolveRibbonIconColor("text-muted-foreground")).toBe(
       "var(--fm-text-muted)",
     );
@@ -2401,32 +2399,31 @@ describe("ribbon structure", () => {
     }]);
   });
 
-  it("wires Physics Microstrip to the geometry antenna command", () => {
+  it("owns Microstrip and CPW once in Geometry while keeping their command IDs registered", () => {
+    const commands = createControlRoomCommandRegistry();
+    const geometryActions = ALL_TAB_CONTENT.geometry.groups.flatMap(
+      (group) => group.actions,
+    );
     const rfGroup = ALL_TAB_CONTENT.physics.groups.find(
       (group) => group.id === "rf-sources",
     );
-
-    const microstripAction = rfGroup?.actions.find(
-      (action) => action.id === "add-microstrip",
-    );
-
-    expect(microstripAction).toMatchObject({
-      commandId: "geometry.add-microstrip-antenna",
-    });
-    expect(microstripAction?.disabled).not.toBe(true);
-  });
-
-  it("wires Physics and Geometry CPW actions to one antenna command", () => {
-    const cpwAction = ALL_TAB_CONTENT.physics.groups.find(
-      (group) => group.id === "rf-sources",
-    )?.actions.find((action) => action.id === "add-cpw");
-    expect(cpwAction).toMatchObject({ commandId: "geometry.add-cpw-antenna" });
-    expect(cpwAction?.disabled).not.toBe(true);
-    const geometryAction = ALL_TAB_CONTENT.geometry.groups.flatMap(
-      (group) => group.actions,
-    ).find((action) => action.id === "geometry.add-cpw-antenna");
-    expect(geometryAction).toBeDefined();
-    expect(geometryAction?.disabled).not.toBe(true);
+    for (const commandId of [
+      "geometry.add-microstrip-antenna",
+      "geometry.add-cpw-antenna",
+    ]) {
+      expect(commands.get(commandId), commandId).toBeDefined();
+      expect(
+        geometryActions.filter((action) => action.id === commandId),
+        commandId,
+      ).toHaveLength(1);
+      expect(geometryActions.find((action) => action.id === commandId)?.disabled).not.toBe(true);
+      expect(
+        rfGroup?.actions.some(
+          (action) => action.id === commandId || action.commandId === commandId,
+        ),
+        commandId,
+      ).toBe(false);
+    }
   });
 
   it("wires global Surface and Texture ribbon menus to object and part display defaults", async () => {
@@ -4200,6 +4197,9 @@ describe("ribbon structure", () => {
       commandId: "viewport-3d.open-camera-dialog",
       label: "Camera parameters",
     });
+    expect(cameraAction).toMatchObject({
+      label: "Camera settings",
+    });
     expect(topographyAction).toMatchObject({
       disabled: true,
       label: "Topography",
@@ -4233,7 +4233,7 @@ describe("ribbon structure", () => {
     });
     expect(homeCameraAction).toMatchObject({
       active: true,
-      label: "Camera",
+      label: "Rotation mode",
     });
     expect(homeRotationNode).toMatchObject({
       value: "camera",
@@ -4996,6 +4996,9 @@ describe("ribbon structure", () => {
     const computeFieldsAction = content?.groups
       .find((group) => group.id === "control")
       ?.actions.find((action) => action.id === "study.compute-fields");
+    const computeEnergiesAction = content?.groups
+      .find((group) => group.id === "control")
+      ?.actions.find((action) => action.id === "study.compute-energies");
     const computeAction = content?.groups
       .find((group) => group.id === "control")
       ?.actions.find((action) => action.id === "study.run");
@@ -5006,6 +5009,10 @@ describe("ribbon structure", () => {
     expect(computeFieldsAction).toMatchObject({
       disabled: false,
       label: "Compute Fields",
+    });
+    expect(computeEnergiesAction).toMatchObject({
+      disabled: false,
+      label: "Compute Energies",
     });
     expect(prepareAction).toMatchObject({
       disabled: false,
@@ -5019,13 +5026,13 @@ describe("ribbon structure", () => {
     expect(computeAction?.menu).toBeUndefined();
   });
 
-  it("wires the Home Compute group to the study runtime command registry", () => {
+  it("keeps Study transport commands in the Study control group", () => {
     const commands = new CommandRegistry();
     for (const command of STUDY_RUNTIME_COMMANDS) {
       commands.register(command);
     }
 
-    const content = buildRibbonTabContent("home", {
+    const content = buildRibbonTabContent("study", {
       commands,
       commandContext: {
         api: { commands: { submit: vi.fn() } } as never,
@@ -5068,23 +5075,24 @@ describe("ribbon structure", () => {
       visualizationSnapshot: new ObjectVisualizationController().getSnapshot(),
     });
 
-    const computeGroup = content?.groups.find((group) => group.id === "compute");
-    const computeAction = computeGroup?.actions.find(
+    const controlGroup = content?.groups.find((group) => group.id === "control");
+    const computeAction = controlGroup?.actions.find(
       (action) => action.id === "study.run",
     );
-    const resumeAction = computeGroup?.actions.find(
+    const resumeAction = controlGroup?.actions.find(
       (action) => action.id === "study.resume",
     );
-    const discardAction = computeGroup?.actions.find(
+    const discardAction = controlGroup?.actions.find(
       (action) => action.id === "study.discard-paused-state",
     );
 
-    expect(computeGroup?.actions.some((action) => action.id === "run")).toBe(
+    expect(controlGroup?.actions.some((action) => action.id === "run")).toBe(
       false,
     );
     expect(computeAction).toMatchObject({
       disabled: false,
       label: "Compute",
+      shortcut: "F5",
     });
     expect(computeAction?.splitButton).toBeUndefined();
     expect(computeAction?.menu).toBeUndefined();
@@ -5098,13 +5106,13 @@ describe("ribbon structure", () => {
     });
   });
 
-  it("enables paused-state discard from the Home Compute group", () => {
+  it("enables paused-state discard from the Study control group", () => {
     const commands = new CommandRegistry();
     for (const command of STUDY_RUNTIME_COMMANDS) {
       commands.register(command);
     }
 
-    const content = buildRibbonTabContent("home", {
+    const content = buildRibbonTabContent("study", {
       commands,
       commandContext: {
         api: { commands: { submit: vi.fn() } } as never,
@@ -5147,7 +5155,7 @@ describe("ribbon structure", () => {
     });
 
     const discardAction = content?.groups
-      .find((group) => group.id === "compute")
+      .find((group) => group.id === "control")
       ?.actions.find((action) => action.id === "study.discard-paused-state");
 
     expect(discardAction).toMatchObject({
@@ -5156,7 +5164,7 @@ describe("ribbon structure", () => {
     });
   });
 
-  it("shows FEM mesh readiness reason on disabled Home and Study Compute actions", () => {
+  it("shows FEM mesh readiness reason on the Study Compute action without a duplicate Home group", () => {
     const commands = new CommandRegistry();
     for (const command of STUDY_RUNTIME_COMMANDS) {
       commands.register(command);
@@ -5213,18 +5221,11 @@ describe("ribbon structure", () => {
 
     const homeContent = buildRibbonTabContent("home", context);
     const studyContent = buildRibbonTabContent("study", context);
-    const homeComputeAction = homeContent?.groups
-      .find((group) => group.id === "compute")
-      ?.actions.find((action) => action.id === "study.run");
     const studyComputeAction = studyContent?.groups
       .find((group) => group.id === "control")
       ?.actions.find((action) => action.id === "study.run");
 
-    expect(homeComputeAction).toMatchObject({
-      disabled: true,
-      tooltip:
-        "Build a current shared-domain mesh before running. Open Mesh Jobs or Build Shared-Domain Mesh.",
-    });
+    expect(homeContent?.groups.some((group) => group.id === "compute")).toBe(false);
     expect(studyComputeAction).toMatchObject({
       disabled: true,
       tooltip:
@@ -5616,7 +5617,7 @@ function createVisualizationRibbonContext(
 describe("stripProductionRibbonPlaceholders", () => {
   const commands = createControlRoomCommandRegistry();
 
-  it("removes placeholder actions without a registered command and keeps command-backed actions", () => {
+  it("removes explicitly marked previews and keeps unmarked disabled actions", () => {
     const content: RibbonTabContent = {
       tabId: "home",
       groups: [
@@ -5629,6 +5630,13 @@ describe("stripProductionRibbonPlaceholders", () => {
               id: "builder-add-ellipsoid",
               icon: null,
               label: "Ellipsoid",
+              preview: true,
+              disabled: true,
+            },
+            {
+              id: "builder-add-future",
+              icon: null,
+              label: "Unavailable future command",
               disabled: true,
             },
           ],
@@ -5641,6 +5649,7 @@ describe("stripProductionRibbonPlaceholders", () => {
     expect(stripped.groups).toHaveLength(1);
     expect(stripped.groups[0].actions.map((action) => action.id)).toEqual([
       "study.run",
+      "builder-add-future",
     ]);
   });
 
@@ -5659,7 +5668,7 @@ describe("stripProductionRibbonPlaceholders", () => {
               splitButton: true,
               commandId: "geometry.add-box",
               menu: [
-                { type: "item", id: "geo:block", label: "Block" },
+                { type: "item", id: "geo:block", label: "Block", preview: true },
                 { type: "label", id: "geo:label", label: "Primitive" },
               ],
             },
@@ -5671,9 +5680,7 @@ describe("stripProductionRibbonPlaceholders", () => {
     const stripped = stripProductionRibbonPlaceholders(content, commands);
 
     expect(stripped.groups[0].actions).toHaveLength(1);
-    expect(stripped.groups[0].actions[0].menu).toEqual([
-      { type: "label", id: "geo:label", label: "Primitive" },
-    ]);
+    expect(stripped.groups[0].actions[0].menu).toEqual([]);
   });
 
   it("keeps informational status and label menus even without commands", () => {
@@ -5715,7 +5722,7 @@ describe("stripProductionRibbonPlaceholders", () => {
     expect(stripped.groups[0].actions[0].menu).toHaveLength(2);
   });
 
-  it("strips unregistered radio-group options and removes the group when empty", () => {
+  it("strips only explicitly marked radio previews", () => {
     const content: RibbonTabContent = {
       tabId: "home",
       groups: [
@@ -5735,7 +5742,8 @@ describe("stripProductionRibbonPlaceholders", () => {
                   value: "x",
                   items: [
                     { value: "x", label: "X", commandId: "study.run" },
-                    { value: "y", label: "Y" },
+                    { value: "y", label: "Y", preview: true },
+                    { value: "z", label: "Unavailable future option" },
                   ],
                 },
               ],
@@ -5750,7 +5758,7 @@ describe("stripProductionRibbonPlaceholders", () => {
     const radioGroup = stripped.groups[0].actions[0].menu?.[0];
     expect(radioGroup?.type).toBe("radio-group");
     if (radioGroup && radioGroup.type === "radio-group") {
-      expect(radioGroup.items.map((item) => item.value)).toEqual(["x"]);
+      expect(radioGroup.items.map((item) => item.value)).toEqual(["x", "z"]);
     }
   });
 });

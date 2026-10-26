@@ -453,7 +453,9 @@ describe("flattenVisibleExplorerRows", () => {
     expect(css).toContain("width: var(--fm-control-height-compact);");
     expect(explorerModuleSource).toContain('aria-label="Expand all explorer nodes"');
     expect(explorerModuleSource).toContain('aria-label="Collapse all explorer nodes"');
-    expect(explorerModuleSource).toContain('aria-label="Refresh explorer"');
+    expect(explorerModuleSource).toContain(
+      'aria-label="Reset explorer filter and expand nodes"',
+    );
   });
 
   it("renders active analysis fields as a separate explorer row state", () => {

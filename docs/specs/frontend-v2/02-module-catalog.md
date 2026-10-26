@@ -28,13 +28,33 @@ As of 2026-08-03, `apps/control-room` registers these manifests through `src/mod
 
 The modules listed in later sections remain the target catalog. A target module that is not in this snapshot is deferred, not silently dropped. Cutover acceptance still depends on the required workflows in `21-cutover-acceptance.md`, not on this snapshot alone.
 
-Globalny przycisk **Start** otwiera ekran startowy przez idempotentną komendę
+Globalny przycisk **Home** otwiera ekran startowy przez idempotentną komendę
 `workspace.home`. Zakładka narzędzi symulacji na wstążce nosi nazwę **Workspace**,
 a pierwsza sekcja ekranu startowego — **Overview**. Podczas wizyty na ekranie
 startowym przycisk **Back to simulation** (lub **Back to project**) wykonuje
 `workspace.return-to-workspace`. Zmienia wyłącznie widok: zachowuje sesję,
 kamerę, szkice i historię edycji. Nagłówek pozostaje widoczny, a ekran startowy
 wypełnia pozostałą wysokość bez przesuwania zamontowanego viewportu.
+
+Sekcja Overview umieszcza akcje tworzenia, szablonów i otwierania przed listą
+pozostałych instancji Fullmag. Przy szerokości okna do 760 px nawigacja zwija się
+do ikon z dostępnymi nazwami; odświeżanie hosta i przejście do ustawień obliczeń
+pozostają dostępne. Szczegóły po prawej są pokazywane w Overview tylko dla
+wybranego projektu, skryptu lub wyniku. Puste Overview nie rezerwuje tej
+kolumny, a Learn, About, Templates i Settings zachowują swój kontekstowy panel.
+Do 1180 px szczegóły są dostępne przez przycisk Details we wspólnej szufladzie
+Sheet zamiast ukrytej kolumny; jednocześnie istnieje jedna prezentacja szczegółów.
+Escape zamyka szufladę i przywraca fokus wyzwalacza. Przy przejściu do układu
+desktopowego lub utracie kontekstu fokus wraca do głównej treści, jeśli wyzwalacz
+nie jest już dostępny.
+Identyfikator hosta może być skrócony wyłącznie wizualnie: pełna wartość jest
+dostępna w podpowiedzi i przez akcję Copy. Daty i liczby interfejsu Home używają
+formatu en-US; eksport naukowy zachowuje kanoniczne formatowanie i wartości.
+
+Opcje przygotowanego uruchomienia skryptu należą do ticketu przygotowania,
+nie do montowania panelu. Device, wait-for-Compute i lokalizacja wyników
+przetrwają przejście między kolumną i szufladą oraz zamknięcie Details.
+Cancel/reset przygotowania usuwa ten lokalny draft; sam resize nie uruchamia skryptu.
 
 ## 1. Core Shell Modules
 

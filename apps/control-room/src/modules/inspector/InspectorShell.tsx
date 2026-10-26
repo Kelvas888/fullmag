@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useLayoutEffect, useRef, type ReactNode } from "react";
 
+import { PanelChrome } from "@/shared/ui/PanelFrame";
 import { Badge } from "@/shared/ui/Badge";
 import { Button } from "@/shared/ui/Button";
 import {
@@ -87,6 +88,7 @@ export function InspectorShell({
       className="fm-inspector"
       data-inspector-owner={descriptor.ownerId}
     >
+      <PanelChrome><span className="fm-panel-chrome__title">Inspector</span></PanelChrome>
       <header className="fm-inspector__header">
         {descriptor.breadcrumbs.length > 0 ? (
           <nav className="fm-inspector__breadcrumbs" aria-label="Selection path">

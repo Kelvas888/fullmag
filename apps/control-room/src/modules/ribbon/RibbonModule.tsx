@@ -3,6 +3,7 @@
 import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
 
 import type { LiveStatusResource } from "@/kernel/api/apiTypes";
+import type { CommandFeedbackNotice } from "@/kernel/commands/CommandFeedbackController";
 import {
   MESHING_BUILDS_LATEST_SUCCESSFUL_PATH,
   MESHING_CAPABILITIES_PATH,
@@ -85,7 +86,14 @@ import {
   ribbonTabNeedsSessionStatusResources,
 } from "./ribbonResourcePolicy";
 import { RibbonGroupsRow } from "./RibbonGroupsRow";
+import { RibbonDensityControl } from "./RibbonDensityControl";
 import { RibbonTabStrip } from "./RibbonTabStrip";
+import {
+  getRibbonDensity,
+  getServerRibbonDensity,
+  setRibbonDensity,
+  subscribeRibbonDensity,
+} from "./ribbonPreference";
 import {
   ANALYSIS_CONTEXT_TAB_ID,
   RIBBON_TABS,
@@ -113,6 +121,10 @@ type RibbonRuntimeStatus = {
   run: Pick<NonNullable<LiveStatusResource["run"]>, "run_id"> | null;
   session: Pick<LiveStatusResource["session"], "session_id">;
 };
+
+const EMPTY_COMMAND_FEEDBACK_NOTICES: readonly CommandFeedbackNotice[] =
+  Object.freeze([]);
+const noopSubscribe = () => () => {};
 
 function selectRibbonRuntimeStatus(status: {
   data: LiveStatusResource | null;
@@ -173,6 +185,25 @@ function ribbonRuntimeStatusEquals(
 }
 
 export default function RibbonModule({ kernel }: ModuleProps) {
+  const ribbonDensity = useSyncExternalStore(
+    subscribeRibbonDensity,
+    getRibbonDensity,
+    getServerRibbonDensity,
+  );
+  const subscribeCommandFeedback = useCallback(
+    (listener: () => void) =>
+      kernel.commandFeedback?.subscribe(listener) ?? noopSubscribe(),
+    [kernel.commandFeedback],
+  );
+  const getCommandFeedbackSnapshot = useCallback(
+    () => kernel.commandFeedback?.getSnapshot() ?? EMPTY_COMMAND_FEEDBACK_NOTICES,
+    [kernel.commandFeedback],
+  );
+  const commandFeedbackNotices = useSyncExternalStore(
+    subscribeCommandFeedback,
+    getCommandFeedbackSnapshot,
+    () => EMPTY_COMMAND_FEEDBACK_NOTICES,
+  );
   const [selectedCommandId, setSelectedCommandId] = useState<string | null>(null);
   const [pendingGlobalQuantity, setPendingGlobalQuantity] =
     useState<ApplyGlobalQuantityInput | null>(null);
@@ -454,6 +485,8 @@ export default function RibbonModule({ kernel }: ModuleProps) {
         activeAnalysisField,
         api: kernel.api,
         commandContext,
+        commandFeedback: commandFeedbackNotices,
+        commandQueue: commandQueue.data ?? null,
         commands: kernel.commands,
         fieldCatalog: fieldCatalog.data,
         quantityCatalog: quantityCatalog.data,
@@ -479,6 +512,8 @@ export default function RibbonModule({ kernel }: ModuleProps) {
       activeAnalysisField,
       activeViewportMainModuleId,
       activeTab,
+      commandFeedbackNotices,
+      commandQueue.data,
       contextTabActive,
       commandContext,
       commandVersion,
@@ -532,15 +567,19 @@ export default function RibbonModule({ kernel }: ModuleProps) {
 
   return (
     <WorkspaceRenderProfiler id="RibbonModule">
-      <div className="fm-ribbon">
-      <RibbonTabStrip
-        activeTabId={stripActiveTab}
-        tabs={stripTabs}
-        onTabClick={handleTabClick}
-      />
+      <div className="fm-ribbon" data-density={ribbonDensity}>
+      <div className="fm-ribbon__tabbar">
+        <RibbonTabStrip
+          activeTabId={stripActiveTab}
+          tabs={stripTabs}
+          onTabClick={handleTabClick}
+        />
+        <RibbonDensityControl density={ribbonDensity} onChange={setRibbonDensity} />
+      </div>
       <RibbonGroupsRow
         groups={groups}
         activeTabId={stripActiveTab}
+        density={ribbonDensity}
         onAction={handleAction}
         onCommandDetail={setSelectedCommandId}
       />
