@@ -67,6 +67,7 @@ mod field_render_png;
 mod field_slice;
 mod field_store;
 mod instance_discovery;
+mod imported_observation_retirement;
 mod live_command_journal;
 mod live_execution_binding;
 mod accepted_field_materialization;
