@@ -267,15 +267,7 @@ try {
   );
   gpuCheckpoints.push(makeGpuCheckpoint("after-first-unmount", firstUnmount.gpu));
   const unmountedBaselineRuntime = firstUnmount.runtime;
-  const viewport3DMenuItem = page.getByRole("menuitem", { name: "3D viewport" });
-  if (await viewport3DMenuItem.isVisible()) {
-    await viewport3DMenuItem.click();
-  } else {
-    await page.locator('[data-action-id="viewport-3d.open"]').click();
-  }
-  await page.evaluate(() => {
-    window.__FULLMAG_CONTROL_ROOM_AUDIT__?.setActiveViewportModule("viewport-3d");
-  });
+  await openThreeDimensionalViewport(page);
   await canvas.waitFor({ state: "visible", timeout: 10_000 });
   await page.keyboard.press("Escape");
   await waitForDiagnostics(viewport);
@@ -837,14 +829,22 @@ async function waitForFrameBoundary(page, message) {
   );
 }
 
-async function openFieldMapViewport(page) {
-  await page.getByRole("tab", { exact: true, name: "View" }).click();
-  const open2DAction = page.locator('[data-action-id="field-map.open"]');
-  await open2DAction.waitFor({
+async function clickRibbonAction(page, tabName, actionId) {
+  await page.getByRole("tab", { exact: true, name: tabName }).click();
+  const action = page.locator(`[data-action-id="${actionId}"]`);
+  await action.waitFor({
     state: "visible",
     timeout: VIEWPORT_2D_MOUNT_TIMEOUT_MS,
   });
-  await open2DAction.click({ timeout: VIEWPORT_2D_MOUNT_TIMEOUT_MS });
+  await action.click({ timeout: VIEWPORT_2D_MOUNT_TIMEOUT_MS });
+}
+
+async function openFieldMapViewport(page) {
+  await clickRibbonAction(page, "View", "field-map.open");
+}
+
+async function openThreeDimensionalViewport(page) {
+  await clickRibbonAction(page, "Mesh", "mesh-3d");
 }
 
 async function warmViewportForChurn(page, fixture, fixtureRequests, viewport) {
@@ -1146,9 +1146,7 @@ async function assertPartialMultilayerNativeMaskRendered(
     undefined,
     { timeout: 10_000 },
   );
-  await page.evaluate(() => {
-    window.__FULLMAG_CONTROL_ROOM_AUDIT__?.setActiveViewportModule("viewport-3d");
-  });
+  await openThreeDimensionalViewport(page);
   const viewport = page.locator(".fm-viewport-3d");
   const canvas = page.locator(".fm-viewport-3d canvas");
   await canvas.waitFor({ state: "visible", timeout: 10_000 });
