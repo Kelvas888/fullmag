@@ -4717,6 +4717,17 @@
           "owner": {
             "$ref": "#/components/schemas/ArtifactFieldOwnerBinding"
           },
+          "sample_carrier": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaSampleCarrierResource",
+                "description": "Verified producer sampling provenance, independent of the source conductor.\nAbsence preserves legacy inspection and provides no Universe mesh-adoption proof."
+              }
+            ]
+          },
           "sample_count": {
             "format": "int64",
             "minimum": 0,

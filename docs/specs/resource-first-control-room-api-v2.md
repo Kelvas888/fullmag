@@ -1305,6 +1305,24 @@ deklarowanych targetów, także równa jeden, nie zmienia tego stanu. Mapa
 podpisów targetów wewnątrz `signatures` pozostaje metadanymi zależności
 planowania i nie może być użyta jako dowód materializacji projekcji.
 
+Wspólny `ArtifactFieldLocatorResource` przenosi również opcjonalny
+`sample_carrier` zweryfikowanego wyniku zamkniętego obwodu. Dla `H_ant`
+wiąże on `domain`, `carrier_kind`, `location` i `topology_digest` producenta
+z własnymi próbkami wyniku. `Global` wymaga `fem_domain_mesh_asset` i scope
+`full`; `Object` wymaga `fem_mesh_asset:<geometry key>` i scope właściwego
+`object_id`. Klucz geometrii nie musi być identyfikatorem obiektu. V i J nie
+otrzymują opisu siatki H. Starszy locator bez tego pola pozostaje czytelny,
+ale nie stanowi dowodu domeny Universe.
+
+Inspekcja historycznego Universe może wyświetlać własną niezmienną siatkę
+zaakceptowanego wyniku, z jawną tożsamością runu, etapu i źródła. Wymaga
+zgodnych ownerów, sesji, próbek i topologii FMVP/FMMT tego samego carriera;
+nie przypisuje tych wartości do bieżącej, edytowalnej siatki. Zwykły
+`carrier_scope_kind=full`, liczba punktów ani nazwa nie potwierdzają Universe.
+`topology_digest` pełnego MeshIR producenta i `topology_fingerprint` bieżącej
+siatki mają różne definicje i nie mogą być porównywane jak ten sam hash.
+Adopcja do bieżącej geometrii nadal wymaga osobnego dowodu zgodności.
+
 Every field advertises a `domain_ref`: V and J live on conductor topology,
 field bases may live on an antenna inspection grid, and LLG projections live
 on a concrete magnetic target topology. Matching point counts do not make

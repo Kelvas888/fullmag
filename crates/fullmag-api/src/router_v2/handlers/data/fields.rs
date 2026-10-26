@@ -9276,7 +9276,7 @@ mod tests {
                 _ => unreachable!(),
             }).collect();
             let carrier = std::sync::Arc::new(ArtifactSampleCarrier {
-                owner, carrier_scope_kind: scope.into(),
+                owner, sample_carrier: None, carrier_scope_kind: scope.into(),
                 carrier_scope_id: (scope == "object").then(|| "antenna".into()),
                 indexing, positions_xyz_m: vec![[0., 0., 0.], [1e-6, 0., 0.],
                     [0., 1e-6, 0.], [0., 0., 1e-6]],

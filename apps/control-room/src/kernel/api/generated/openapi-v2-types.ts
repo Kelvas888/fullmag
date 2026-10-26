@@ -6112,6 +6112,7 @@ export interface components {
             coordinate_unit: string;
             indexing: components["schemas"]["ArtifactSampleIndexing"];
             owner: components["schemas"]["ArtifactFieldOwnerBinding"];
+            sample_carrier?: null | components["schemas"]["AntennaSampleCarrierResource"];
             /** Format: int64 */
             sample_count: number;
             topology_binary_schema: string;
