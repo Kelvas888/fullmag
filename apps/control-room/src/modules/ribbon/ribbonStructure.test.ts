@@ -570,8 +570,8 @@ describe("ribbon structure", () => {
   });
 
   it("normalizes legacy utility icon colors to design tokens", () => {
-    expect(resolveRibbonIconColor("text-emerald-400")).toBe("var(--fm-success)");
-    expect(resolveRibbonIconColor("text-sky-300")).toBe("var(--fm-accent)");
+    expect(resolveRibbonIconColor("text-emerald-400")).toBe("var(--fm-category-solver)");
+    expect(resolveRibbonIconColor("text-sky-300")).toBe("var(--fm-category-runtime)");
     expect(resolveRibbonIconColor("text-muted-foreground")).toBe(
       "var(--fm-text-muted)",
     );
@@ -5616,7 +5616,7 @@ function createVisualizationRibbonContext(
 describe("stripProductionRibbonPlaceholders", () => {
   const commands = createControlRoomCommandRegistry();
 
-  it("removes placeholder actions without a registered command and keeps command-backed actions", () => {
+  it("removes explicitly marked previews and keeps unmarked disabled actions", () => {
     const content: RibbonTabContent = {
       tabId: "home",
       groups: [
@@ -5629,6 +5629,13 @@ describe("stripProductionRibbonPlaceholders", () => {
               id: "builder-add-ellipsoid",
               icon: null,
               label: "Ellipsoid",
+              preview: true,
+              disabled: true,
+            },
+            {
+              id: "builder-add-future",
+              icon: null,
+              label: "Unavailable future command",
               disabled: true,
             },
           ],
@@ -5641,6 +5648,7 @@ describe("stripProductionRibbonPlaceholders", () => {
     expect(stripped.groups).toHaveLength(1);
     expect(stripped.groups[0].actions.map((action) => action.id)).toEqual([
       "study.run",
+      "builder-add-future",
     ]);
   });
 
@@ -5659,7 +5667,7 @@ describe("stripProductionRibbonPlaceholders", () => {
               splitButton: true,
               commandId: "geometry.add-box",
               menu: [
-                { type: "item", id: "geo:block", label: "Block" },
+                { type: "item", id: "geo:block", label: "Block", preview: true },
                 { type: "label", id: "geo:label", label: "Primitive" },
               ],
             },
@@ -5671,9 +5679,7 @@ describe("stripProductionRibbonPlaceholders", () => {
     const stripped = stripProductionRibbonPlaceholders(content, commands);
 
     expect(stripped.groups[0].actions).toHaveLength(1);
-    expect(stripped.groups[0].actions[0].menu).toEqual([
-      { type: "label", id: "geo:label", label: "Primitive" },
-    ]);
+    expect(stripped.groups[0].actions[0].menu).toEqual([]);
   });
 
   it("keeps informational status and label menus even without commands", () => {
@@ -5715,7 +5721,7 @@ describe("stripProductionRibbonPlaceholders", () => {
     expect(stripped.groups[0].actions[0].menu).toHaveLength(2);
   });
 
-  it("strips unregistered radio-group options and removes the group when empty", () => {
+  it("strips only explicitly marked radio previews", () => {
     const content: RibbonTabContent = {
       tabId: "home",
       groups: [
@@ -5735,7 +5741,8 @@ describe("stripProductionRibbonPlaceholders", () => {
                   value: "x",
                   items: [
                     { value: "x", label: "X", commandId: "study.run" },
-                    { value: "y", label: "Y" },
+                    { value: "y", label: "Y", preview: true },
+                    { value: "z", label: "Unavailable future option" },
                   ],
                 },
               ],
@@ -5750,7 +5757,7 @@ describe("stripProductionRibbonPlaceholders", () => {
     const radioGroup = stripped.groups[0].actions[0].menu?.[0];
     expect(radioGroup?.type).toBe("radio-group");
     if (radioGroup && radioGroup.type === "radio-group") {
-      expect(radioGroup.items.map((item) => item.value)).toEqual(["x"]);
+      expect(radioGroup.items.map((item) => item.value)).toEqual(["x", "z"]);
     }
   });
 });
