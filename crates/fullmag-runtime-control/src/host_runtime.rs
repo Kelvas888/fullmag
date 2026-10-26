@@ -1187,11 +1187,16 @@ impl HostRuntimeAdmission {
     pub fn reconcile_task_cancellations(&self, store: &SessionStore) -> Result<usize> {
         use fullmag_session::FmsTaskLifecycle;
         let mut applied = 0;
-        for run in store.list_run_intents()? {
-            let intents = store.list_task_cancellation_intents(&run.run_id)?;
+        for run_id in store.list_run_intent_ids()? {
+            let intents = store.list_task_cancellation_intents(&run_id)?;
             if intents.is_empty() {
                 continue;
             }
+            // ID discovery is not authority to reconcile a cancellation.
+            // Preserve immutable validation before existing task-scope guards.
+            store
+                .read_run_intent(&run_id)?
+                .context("cancellation reconciliation requires its immutable run intent")?;
             for intent in intents {
                 let catalog = store
                     .read_run_catalog(&intent.run_id)?

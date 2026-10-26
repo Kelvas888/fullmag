@@ -593,7 +593,28 @@ fn preparation_candidates(
     next_run_id: Option<&str>,
 ) -> Result<Vec<PreparationCandidate>> {
     let mut candidates = Vec::new();
-    for intent in store.list_run_intents()? {
+    for run_id in store.list_run_intent_ids()? {
+        let Some(catalog) = store.read_run_catalog(&run_id)? else {
+            continue;
+        };
+        // A catalog observation is not preparation authorization. It avoids
+        // loading immutable RunSpec data for runs with no preparation frontier.
+        if !catalog.tasks.iter().any(|task| {
+            task.lifecycle == FmsTaskLifecycle::Accepted
+                && matches!(
+                    &task.readiness,
+                    FmsTaskReadiness::Blocked { reason }
+                        if reason == FMS_TASK_AWAITING_PREPARATION_REASON
+                )
+                && task.attempt_id.is_none()
+                && task.ownership_epoch.is_none()
+                && task.resource_id.is_none()
+        }) {
+            continue;
+        }
+        let intent = store
+            .read_run_intent(&run_id)?
+            .context("preparation candidate requires its immutable run intent")?;
         let specification: RunSpecification = serde_json::from_value(intent.specification)
             .with_context(|| format!("run `{}` has an invalid RunSpec", intent.run_id))?;
         specification
@@ -602,9 +623,6 @@ fn preparation_candidates(
         if specification.run_id.as_str() != intent.run_id {
             bail!("run intent identity differs from its immutable RunSpec");
         }
-        let Some(catalog) = store.read_run_catalog(&intent.run_id)? else {
-            continue;
-        };
         for task in catalog.tasks {
             if task.lifecycle == FmsTaskLifecycle::Accepted
                 && matches!(

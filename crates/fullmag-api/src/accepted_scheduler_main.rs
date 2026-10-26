@@ -569,11 +569,10 @@ fn run_scheduler(
                         }
                     }
                     let mut discovered = store
-                        .list_run_intents()?
+                        .list_run_intent_ids()?
                         .into_iter()
-                        .map(|intent| {
-                            RunId::parse(intent.run_id)
-                                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                        .map(|run_id| {
+                            RunId::parse(run_id).map_err(|error| anyhow::anyhow!(error.to_string()))
                         })
                         .collect::<Result<Vec<_>>>()?;
                     discovered.sort();
@@ -974,6 +973,20 @@ fn build_run_queue_snapshot(
 ) -> Result<RunQueueSnapshot> {
     let mut queued = Vec::new();
     for run_id in run_ids {
+        let Some(catalog) = store.read_run_catalog(run_id.as_str())? else {
+            continue;
+        };
+        // This fresh observation only excludes runs with no possible queue
+        // candidate. Readiness and admission still reread their exact state.
+        if !catalog.tasks.iter().any(|task| {
+            matches!(
+                task.lifecycle,
+                fullmag_session::FmsTaskLifecycle::Accepted
+                    | fullmag_session::FmsTaskLifecycle::Queued
+            )
+        }) {
+            continue;
+        }
         let intent = store.read_run_intent(run_id.as_str())?.with_context(|| {
             format!(
                 "scheduler run `{}` has no immutable intent",

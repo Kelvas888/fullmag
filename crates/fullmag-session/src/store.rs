@@ -939,6 +939,44 @@ impl SessionStore {
         self.find_run_intent_unlocked(idempotency_key)
     }
 
+    /// Discover run identifiers without loading or authorizing their intents.
+    /// Every consumer that acts on a run must still read and validate its
+    /// immutable intent and current catalog at its existing authority boundary.
+    pub fn list_run_intent_ids(&self) -> Result<Vec<String>> {
+        let runs = checked_path(&self.root, "runs")?;
+        match fs::symlink_metadata(&runs) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => anyhow::bail!("runs path is not a directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("reading runs directory metadata"),
+        }
+        reject_link(&runs)?;
+        let mut run_ids = Vec::new();
+        for entry in fs::read_dir(&runs)? {
+            let entry = entry?;
+            reject_link(&entry.path())?;
+            if !entry.file_type()?.is_dir() {
+                anyhow::bail!("unsupported runs entry `{}`", entry.path().display());
+            }
+            let run_id = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 run identifier"))?;
+            validate_store_id(&run_id)?;
+            let path = checked_path(&self.root, &format!("runs/{run_id}/run_intent.json"))?;
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => anyhow::bail!("run intent path is not a file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("reading run intent metadata"),
+            }
+            reject_link(&path)?;
+            run_ids.push(run_id);
+        }
+        run_ids.sort();
+        Ok(run_ids)
+    }
+
     /// Enumerate accepted intents from the durable store without reading a
     /// mutable current-session pointer. Malformed or linked entries fail closed.
     pub fn list_run_intents(&self) -> Result<Vec<FmsRunIntent>> {
