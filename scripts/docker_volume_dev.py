@@ -226,6 +226,18 @@ else:
 """
 BACKEND_PROCESS_RECEIPT_SCRIPT = _PROCESS_RECEIPT_PROBE
 
+
+def _readiness_failure(process_receipt, logs):
+    """Report a closed startup admission even when the process receipt is historical."""
+    startup_prefix = "[fullmag-backend] Runtime startup failed; starting diagnostic API only: "
+    for line in reversed(logs.splitlines()):
+        if line.startswith(startup_prefix):
+            return "Runtime startup failed; diagnostic API only: " + line[len(startup_prefix):4096 + len(startup_prefix)]
+    if (str(process_receipt.get("state", "")).startswith("failed")
+            and "Startup or runtime failed; admission closed:" in logs):
+        return "Runtime admission failed; services retained: " + str(process_receipt.get("error", "unknown failure"))[:4096]
+    return None
+
 _NEW_WINDOWS_RUNTIME_STATE_DIRECTORIES = (
     Path("runs"),
     Path("runs/docker-all"),
@@ -2283,12 +2295,19 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
             if not observed.get("State", {}).get("Running"):
                 raise BuildControlError("DEV service exited before readiness: " + service)
         process_receipt = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", _PROCESS_RECEIPT_PROBE))
-        if str(process_receipt.get("state", "")).startswith("failed"):
+        if (str(process_receipt.get("state", "")).startswith("failed")
+                or services[0].get("State", {}).get("Health", {}).get("Status") != "healthy"):
             logs = docker_text("logs", "--since", operation["receipt"]["backend_started_at"],
                                "--tail", "100", backend_id, combined=True)
-            if "Startup or runtime failed; admission closed:" in logs:
+            failure = _readiness_failure(process_receipt, logs)
+            if failure:
                 control.write(operation["root"] + "/process-failure.json", process_receipt)
-                raise BuildControlError("Runtime admission failed; services retained: " + str(process_receipt.get("error", "unknown failure"))[:4096])
+                control.write(operation["root"] + "/readiness-failure.json", {
+                    "backend_container_id": backend_id,
+                    "backend_started_at": operation["receipt"]["backend_started_at"],
+                    "error": failure,
+                })
+                raise BuildControlError(failure)
         if all(service.get("State", {}).get("Health", {}).get("Status") == "healthy" for service in services):
             break
         time.sleep(3)
