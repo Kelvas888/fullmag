@@ -87,6 +87,7 @@ import { useViewport3DArtifactInspectionPresentation, manifestRenderableCarriers
 import type { InspectorPanelProps } from "../inspectorTypes";
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import { ViewportCameraControls } from "../visualization/ViewportCameraControls";
+import { ViewportClippingControls } from "../visualization/ViewportClippingControls";
 import {
   ScientificInspectorContext,
   ScientificInspectorIdentity,
@@ -1158,6 +1159,7 @@ function useObjectVisualizationPanelState(
           : "Ready";
 
   return {
+    visualizationState,
     meshState,
     artifactInspection,
     artifactPresentation,
@@ -1548,11 +1550,10 @@ function ObjectVisualizationPanelView({
               </p>
             }
             camera={<ViewportCameraControls />}
-            clipping={
-              <p className="m-0 text-fm-help leading-snug text-fm-muted">
-                Clipping controls are not available in this inspector.
-              </p>
-            }
+            clipping={<ViewportClippingControls
+              resource={panel.visualizationState}
+              ownerKey={`${panel.sessionIdentityKey ?? ""}:${visualizationTargetKey(target)}`}
+            />}
             dataState={dataState}
             display={
               <>

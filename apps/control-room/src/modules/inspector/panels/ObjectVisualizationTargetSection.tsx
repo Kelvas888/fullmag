@@ -741,7 +741,9 @@ export function VisualizationQuantitySection({
       ))}
     </FormField>
     {noQuantities && !fieldCatalogLoading ? <p role="status" className="fm-quantity-source-empty">
-      No compatible field has been published for this target. Compute the study or select a retained result.
+      {targetKind === "airbox"
+        ? "No verified field is available on the Universe sampling mesh. Visible geometry or mesh points alone do not contain field values. Check the selected execution and its sampling domain."
+        : "No compatible field is available for this target. Check the selected source, execution status, and sampling domain."}
     </p> : null}
     {isFlowMajorTensorDescriptor(descriptor) ? (
       <>
