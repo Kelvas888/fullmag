@@ -502,7 +502,17 @@ fn run_scheduler(
                         .pool_id
                         .as_deref()
                         .context("dynamic resource discovery requires a scheduler pool id")?;
-                    if let Some(discovered) = store.read_scheduler_resource_pool(pool_id)? {
+                    let discovered = match defer_scheduler_writer_busy(
+                        || store.read_scheduler_resource_pool(pool_id),
+                        || "compute scheduler: read resource pool".to_owned(),
+                    )? {
+                        SchedulerOperation::Completed(discovered) => discovered,
+                        SchedulerOperation::Deferred => {
+                            scheduling_deferred = true;
+                            break 'scheduling_pass;
+                        }
+                    };
+                    if let Some(discovered) = discovered {
                         if let Some(host_admission) = host_admission.as_ref() {
                             host_admission.validate_compute_pool(&discovered)?;
                         }
@@ -568,8 +578,17 @@ fn run_scheduler(
                             break 'scheduling_pass;
                         }
                     }
-                    let mut discovered = store
-                        .list_run_intents()?
+                    let intents = match defer_scheduler_writer_busy(
+                        || store.list_run_intents(),
+                        || "compute scheduler: list run intents".to_owned(),
+                    )? {
+                        SchedulerOperation::Completed(intents) => intents,
+                        SchedulerOperation::Deferred => {
+                            scheduling_deferred = true;
+                            break 'scheduling_pass;
+                        }
+                    };
+                    let mut discovered = intents
                         .into_iter()
                         .map(|intent| {
                             RunId::parse(intent.run_id)
