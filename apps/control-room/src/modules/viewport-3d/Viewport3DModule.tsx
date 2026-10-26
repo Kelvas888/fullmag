@@ -43,6 +43,7 @@ import {
   viewport3DOrbitDebugEnabledFromBrowserConfig,
 } from "@/kernel/browserFullmagConfig";
 import type { MeshSizeHistogramHighlight } from "@/kernel/events/eventTypes";
+import { useInstanceTabHidden } from "@/kernel/layout/instanceTabVisibility";
 import { useMeshHistogramBinElementsResource } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { sessionResourceIdentityKey, type SessionResourceIdentity } from "@/kernel/resources/sessionResourceIdentity";
@@ -2158,6 +2159,9 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     effectAntialias,
   );
   const canvasContextKey = `viewport-3d-canvas-aa:${canvasGlOptions.antialias ? "1" : "0"}-preserve:${canvasGlOptions.preserveDrawingBuffer ? "1" : "0"}`;
+  // A hidden instance tab renders nothing; the root, its WebGL context and the
+  // view stay, and going back to `demand` invalidates once (ADR 0069).
+  const canvasFrameloop = useInstanceTabHidden() ? "never" : VIEWPORT_3D_FRAMELOOP;
   const orbitDebugEnabled = viewport3DOrbitDebugEnabledFromBrowserConfig();
   const hysteresisReplayLabel = formatHysteresisReplayLabel(hysteresisReplayTarget);
   const [orbitDebugAngles, setOrbitDebugAngles] =
@@ -3021,7 +3025,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           className="fm-viewport-3d__canvas"
           dpr={canvasDpr}
           events={createCanvasEvents}
-          frameloop={VIEWPORT_3D_FRAMELOOP}
+          frameloop={canvasFrameloop}
           gl={canvasGlOptions}
           key={canvasContextKey}
           onCreated={handleCanvasCreated}
