@@ -89,8 +89,9 @@ pub fn is_transient_store_io(error: &anyhow::Error) -> bool {
 
 /// Worker retry for idempotent store operations: a busy writer is waited for
 /// up to `WORKER_STORE_WRITER_WAIT`, and a file that briefly reads as missing
-/// (an atomic replace seen through a Docker Desktop host folder) for a few
-/// seconds. A genuinely missing file still fails after that short bound.
+/// (an atomic replace seen through a Docker Desktop host folder) or a host
+/// folder returning ENOMEM under load for a few seconds. A genuinely missing
+/// file still fails after that short bound.
 pub fn retry_worker_store_transient<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
     use std::time::{Duration, Instant};
 
@@ -98,11 +99,13 @@ pub fn retry_worker_store_transient<T>(mut operation: impl FnMut() -> Result<T>)
     loop {
         match retry_store_writer_busy_within(WORKER_STORE_WRITER_WAIT, &mut operation) {
             Err(error)
-                if error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-                }) && Instant::now() < missing_deadline =>
+                if (is_transient_store_io(&error)
+                    || error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                    }))
+                    && Instant::now() < missing_deadline =>
             {
                 std::thread::sleep(Duration::from_millis(50));
             }
