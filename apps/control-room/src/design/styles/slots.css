@@ -266,6 +266,12 @@
 .fm-status-bar__item--clickable:hover {
   color: var(--fm-text-primary);
 }
+.fm-status-bar__preparation[data-tone="ready"] {
+  color: var(--fm-success);
+}
+.fm-status-bar__preparation[data-tone="failed"] {
+  color: var(--fm-danger);
+}
 .fm-status-bar__engine--clickable {
   cursor: pointer;
   transition: background var(--fm-transition-fast), border-color var(--fm-transition-fast);

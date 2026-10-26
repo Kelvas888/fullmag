@@ -27,6 +27,7 @@ import {
   buildStatusBarMeshModel,
   formatRuntimeBundleVersionLabel,
 } from "./statusBarModel";
+import { SimulationPreparationStatusEntry } from "./SimulationPreparationStatusEntry";
 
 function readString(value: unknown, fallback: string): string {
   return typeof value === "string" && value.length > 0 ? value : fallback;
@@ -195,6 +196,7 @@ export default function StatusBarModule() {
       >
         {mesh.label}
       </span>
+      <SimulationPreparationStatusEntry />
       <span className="fm-status-bar__spacer" aria-hidden="true" />
       <span
         className="fm-status-bar__engine fm-status-bar__engine--clickable"
