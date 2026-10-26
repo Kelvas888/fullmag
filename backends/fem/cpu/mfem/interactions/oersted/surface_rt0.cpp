@@ -11,6 +11,7 @@
 #include <utility>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -331,6 +332,11 @@ public:
         numeric(y != 0 || x != 0, "surface RT0 ambiguous angle");
         using std::atan2; return finite(R(atan2(y,x)));
     }
+    R four_pi()
+    {
+        if (!four_pi_) four_pi_ = R(4)*angle(R(0),R(-1));
+        return *four_pi_;
+    }
     R norm(const Vector<R> &v)
     {
         const R result = square_root(dot(v,v));
@@ -357,6 +363,7 @@ public:
     Work &work() { return work_; }
 private:
     Work &work_; int precision_;
+    std::optional<R> four_pi_;
 };
 
 template<class R> struct Sum {
@@ -494,6 +501,7 @@ template<class R> FacePass<R> face_pass(const FaceGeometry &g,
         d[i] = a.divide(a.number(g.dnums[i]),R(lengths[i]*norm));
     }
     FacePass<R> result;
+    std::optional<Vector<R>> qvector;
     for (int i = 0; i < 3; ++i) {
         work.charge(Kind::signed_fan_panels,1,a.precision());
         if (g.d_zero[i]) { result.fans[i] = 0; logs[i] = 0; omegas[i] = 0; continue; }
@@ -513,7 +521,8 @@ template<class R> FacePass<R> face_pass(const FaceGeometry &g,
         }
         if (g.h_zero) omegas[i] = 0;
         else {
-            const std::array<Vector<R>,3> fan{{a.point(g.qvector),vectors[i],vectors[j]}};
+            if (!qvector) qvector = a.point(g.qvector);
+            const std::array<Vector<R>,3> fan{{*qvector,vectors[i],vectors[j]}};
             omegas[i] = solid_angle(fan,std::array<R,3>{{absolute(h),radii[i],radii[j]}},g.fan_numerators[i],a);
         }
         result.fans[i] = d[i]*logs[i]-h*omegas[i];
@@ -540,7 +549,7 @@ template<class R> FacePass<R> face_pass(const FaceGeometry &g,
     const auto j = a.point(current);
     for (int k = 0; k < 3; ++k) result.unit_normal[k] = a.divide(normal[k],norm);
     auto weight = cross(j,result.unit_normal);
-    const R four_pi = R(4)*a.angle(R(0),R(-1));
+    const R four_pi = a.four_pi();
     for (auto &value : weight) value = a.divide(value,four_pi);
     for (int i = 0; i < 3; ++i) {
         result.fans[i] *= scale;

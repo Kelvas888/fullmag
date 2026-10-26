@@ -763,3 +763,64 @@ i stałe argv. Cztery interpretowane testy wrappera PASS w backendzie, w tym
 8 wariantów restartu: brak opt-in, jawny opt-in, stop-only oraz odrzucanie
 duplikatu, wartości, separatora, && i nowej linii. Trzy dry-run recepty:
 false/true zgodnie z oczekiwaniem, wartość niepoprawna odrzucona.
+
+### Wynik wariantu precision-local reuse — 26.10.2026
+
+Zarządzana iteracja 6b997f5376a14c0b9b212a6f2d593bef zakończyła się succeeded.
+Ten sam backend/frontend, konfiguracja 9f485607…; pakiet z commita
+ab59ccf55e53f95607551bb1cc08668a30acb5bd + dirty snapshot
+2e538682da2e073c79f6cc811f74da918ed4ffe6f958000fbfaf8aa2c0be9fa3.
+Operator źródłowy SHA256 9ce0ab7c769ea7c862196dc5b5afad5d2cc797a08198689de48d23d9a7782184
+identyczny w źródle i zbudowanym cieniu. Biblioteka FEM SHA256
+786708cff06a91c9fbbe2233ee2111dadc56a8eec72637927260ed12ecb2493d.
+Make/native/Rust: 335704 ms, exit 0. Nie kompilowano testów jednostkowych.
+Retencja pakietu deferred/outside-startup; niczego nie usunięto, brak nowej
+kwalifikacji odzyskanych bajtów.
+
+Osobny run-surface-reuse-20261026-01, task
+task-c9cdb225627d72d50f8c1103bd6130d0826a2c2dbe14f89a19401987d8cf8f49,
+próba attempt-33e65adc44de4fe48a6cfa213ab72596, epoch 1, zakończył succeeded.
+Wynik zaakceptowany w CAS
+9ff8b7f437419500c77effa1faf03867f7738a196890ca74ef0ecfbc6518d093.
+Porównanie z zamrożoną bazą 7cc8c593…: wszystkie 21 payloadów naukowych
+identyczne bajtowo; pełne diagnostyki trzech precyzji, kolejność, odmowy,
+limity i tolerancje identyczne. Zmienione są wyłącznie liczniki usuniętych
+operacji: exact_comparisons 22355103 → 20479467, real_divisions
+15408216 → 14157792, atan2 1564212 → 1250934. Pozostałe liczniki oraz
+maksymalne długości liczb identyczne.
+
+Czas samego operatora 354,299891255 → 336,657759964 s (−4,9794%).
+To pojedyncza obserwacja względem wcześniejszej bazy, nie ukończony pomiar
+baseline/candidate/baseline. Przyspieszenie kwalifikowane nadal NOT VERIFIED.
+Zakres: 14 targetów / 1865 komórek źródła; nie pełne 1162 węzły Universe.
+Nie ponowiono nieudanego Solve Universe. Kontrola publicznego HTTP przeszła
+31 sprawdzeń: V/J/H, SI, digest/rozmiar, finite/nonzero, ETag, zakresy bajtów,
+nieprawidłowe właściciele i niezmienność sceny/komend podczas odczytu.
+To nie kwalifikacja bazy na amper, FFT ani LLG. Dowody w control volume:
+verification/surface-rt0-reuse-20261026/.
+
+### Cold-load ujawnił P14 — źródło nie ma trwałego dowodu przygotowania
+
+Po restarcie nie było aktywnej sceny; dokładny FMS c05d8176… przeszedł
+inspekcję i import visualization_only bez ostrzeżeń. Przywrócono własny
+widok bez Solve. Global 1162/6548 wraca przez HTTP identycznie bajtowo,
+ale conductor zwraca 409 antenna_source_mesh_stale. Audyt: pierwsza odmowa
+to brak simulation_preparation w prepared_field_only_source_mesh.
+PersistedCurrentLiveSnapshot nie zapisuje tego pola i ustawia None przy
+odczycie. Pozostałe 18 sprawdzonych warunków wiązania pozostaje zgodne.
+
+Plan naprawy P14: zachować ścisły live guard (używa go także model/readiness),
+zaś importer po zweryfikowaniu accepted closure tworzy oddzielny, prywatny
+dowód historycznego odczytu źródła, związany z run/scene/plan/source/Global.
+Nie tworzyć aktywnego ready, nie ufać markerowi dostarczonemu w archiwum,
+nie używać pierwotnego aktywnego store zamiast prywatnego importu. Regresje:
+stary FMS bez preparation, byte-exact cut/markery obu siatek; nadal read-only;
+live bez przygotowania odrzucony; zmiany tożsamości/topologii/closure lub
+mesh:dirty odrzucone. P14 pozostaje niewdrożony, cold-load całości FAIL.
+
+Odczytowy audyt profilowania: obecny raport ma tylko łączny czas i liczniki,
+a set_solver_profile dla kroków nie mierzy AntennaFieldOnly. Brak narzędzi
+samplujących w obrazie; nie zmieniano uprawnień ani precyzji. Następny pomiar
+wymaga jawnej, domyślnie wyłączonej agregacji faz albo właściwego narzędzia;
+liczniki nie stanowią profilu czasowego. MPFR ma tylko bibliotekę wykonawczą,
+bez nagłówka/linku developerskiego; nie jest gotową ścieżką zamiany arytmetyki.
