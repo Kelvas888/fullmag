@@ -254,7 +254,7 @@ try {
     await captureViewportPerformanceSnapshot(page, "cold-baseline"),
   );
 
-  await page.locator('[data-action-id="ws-2d"]').click();
+  await openFieldMapViewport(page);
   await page.locator(".fm-viewport-3d canvas").waitFor({ state: "detached", timeout: 10_000 });
   first2DLayout = await waitForComparable2DViewport(
     page,
@@ -488,7 +488,7 @@ try {
       `Live WebGL buffers did not return to a post-warmup plateau: baseline=${baselineLiveBuffers}, after=${stressLiveBuffers}.`,
     );
   }
-  await page.locator('[data-action-id="ws-2d"]').click();
+  await openFieldMapViewport(page);
   await page.locator(".fm-viewport-3d canvas").waitFor({ state: "detached", timeout: 10_000 });
   final2DLayout = await waitForComparable2DViewport(
     page,
@@ -835,6 +835,16 @@ async function waitForFrameBoundary(page, message) {
     1_000,
     message,
   );
+}
+
+async function openFieldMapViewport(page) {
+  await page.getByRole("tab", { exact: true, name: "View" }).click();
+  const open2DAction = page.locator('[data-action-id="field-map.open"]');
+  await open2DAction.waitFor({
+    state: "visible",
+    timeout: VIEWPORT_2D_MOUNT_TIMEOUT_MS,
+  });
+  await open2DAction.click({ timeout: VIEWPORT_2D_MOUNT_TIMEOUT_MS });
 }
 
 async function warmViewportForChurn(page, fixture, fixtureRequests, viewport) {
