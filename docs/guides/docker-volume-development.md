@@ -314,6 +314,21 @@ kodem 2; nie oznacza wykonania symulacji. Raport zachowuje osobno identyfikator
 operacji oraz `development_attempt`. Długi komunikat błędu pozostaje ograniczony
 do 2048 znaków, lecz zachowuje początek i końcową przyczynę tracebacku.
 
+Wyjątek zgłoszony przez sam skrypt podczas ładowania (np. `ValueError` z walidacji
+DSL) helper SceneDocument zgłasza kopertą `fullmag.script-load-rejection.v1`
+(kod wyjścia 2). Trasa startupowa API zamienia wyłącznie tę kopertę na HTTP 422
+`validation_error`, zanim powstanie stan live, RunIntent lub wpis katalogu. Jest to
+więc terminalne odrzucenie: grupa pozostaje wolna dla kolejnego skryptu, a wynik
+`run-script` zawiera pole `rejection` z kodem i komunikatem API (wraz z numerem
+linii skryptu). Inne niepowodzenie helpera pozostaje HTTP 500 i nieznanym wynikiem.
+
+Grupa zablokowana tym błędem przed poprawką (receipt aktywacji
+`outcome-unknown-resources-retained` z `HTTP 500 ... python SceneDocument helper
+failed`) nie jest przeklasyfikowywana automatycznie i nie ma trasy zwalniającej
+tę kwarantannę: pozostaje zablokowana do wycofania grupy przez jej właściciela
+w cyklu sprzątania worktree (**NOT VERIFIED** jako trasa odzyskania). Nie usuwaj
+ręcznie `active`, markera ani lease.
+
 Każde jawne wywołanie otrzymuje nowy domyślny `request_id` w postaci
 `docker-volume-<uuid>`, zapisany w receipcie przed wysłaniem żądania. Dzięki temu
 ten sam plik może posłużyć do kolejnej symulacji. Jawny `request_id` pozostaje
