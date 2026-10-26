@@ -151,9 +151,12 @@ wie dlaczego.
 | Frontend w kontenerze `frontend` grupy: vitest (`quantityIds`, `ribbonTabViews`, `ObjectVisualizationPanelModel`) | 158/158 |
 | ESLint `--max-warnings=0` dla zmienionych plików | exit 0 |
 | `scripts/typecheck-control-room.mjs` (next typegen + tsc) | exit 0 |
-| Katalog wielkości przed Compute z nowym kodem (runtime) | **NOT VERIFIED** — aktywacja skryptu w grupie zadania utknęła w strażnikach launchera po zwykłym `docker restart` (bramka `worker-cgroup` odroczona, helper aktywacji trzyma lease, trasy `release-unknown-activation` i `stop-diagnostic-volume` odmawiają) |
+| Katalog wielkości przed Compute (runtime, grupa `fullmag-worktree-quantity-parity-verify-20261026-…`, commit `c26a792c6`, FDM CPU, `awaiting_command`) | 22 wielkości planu z `provider=available` (`torque`, `H_ex`, `H_demag`, `H_ext`, `H_ani`, `H_dmi`, `H_eff`, `eden_*`, `mat_ms/aex/alpha`, `E_*`); pola przestrzenne mają `materializable=false`, `accepted_state_required`. Przed zmianą: 56/56 `unknown` |
+| `m` przed Compute w FDM | `accepted_state_required` — ta baza nie publikuje przygotowanej domeny FDM przed Compute (domena 0 komórek; naprawa w PR #264, `1166e0073`), więc `m` nie było czytelne także przed zmianą |
+| `m` przed Compute w FEM | statycznie: przygotowane `m` w `latest_fields` jest rozwiązywane ogólną ścieżką (`resolved_current_field_source`, nośnik `fem:<topology>:full`); runtime **NOT VERIFIED** |
+| Pola po biegu (≥1 krok) i przeglądarka | **NOT VERIFIED** — runtime grupy przeszedł w tryb diagnostyczny tuż po starcie (`runtime service owner is not ready`, sonda live; ten sam objaw wystąpił chwilowo w pierwszej grupie), więc solve i odczyt katalogu z UI były zablokowane. Logika adopcji końcowego pakietu nie jest zmieniana tym branchem |
 | Testy jednostkowe Rust | nie dodane i nie uruchamiane — zakaz kompilacji testów jednostkowych |
-| Przeglądarka (WebGL, Inspector) | **NOT VERIFIED** — brak aktywnej sesji w grupie zadania |
+| CI PR #273 (`python-contracts`, `rust-contracts` i in.) | 17 zielonych, 0 czerwonych |
 
 ## Dalsze kroki (poza tym branchem)
 
