@@ -613,7 +613,7 @@ export function resolveArtifactFieldColorbars(model: ArtifactFieldOverlayModel |
     if (legend) result.push({ key: `${model.key}:${pass}`, legend: { ...legend, labelPrefix: `Historical ${pass}: ` } });
   };
   if (model.settings.shaderVisible && model.settings.surfaceColorSource !== "solid") append("surface", model.scalar ? "scalar" : model.settings.shaderColorMode, model.minimum, model.maximum);
-  if (!model.scalar && model.settings.vectorsVisible && model.glyphCount > 0 && model.settings.vectorColorMode === "magnitude") append("vectors", "magnitude", 0, model.maximumVectorNorm);
+  if (!model.scalar && model.settings.vectorsVisible && model.glyphCount > 0 && model.vectorColorRange) append("vectors", model.settings.vectorColorMode, model.vectorColorRange.min, model.vectorColorRange.max);
   return result;
 }
 

@@ -1,9 +1,9 @@
 import { artifactSurfaceProjection } from "./artifactSurfaceProjection";
 import { buildAveragedSurfaceNodeNormals, resolveVectorSurfaceOffsetDistance } from "../viewport3dRenderModel";
-import { buildVertexScalarColors } from "../viewport3dFieldMapping";
+import { buildVertexScalarColors, resolveScalarRange } from "../viewport3dFieldMapping";
 import type { Viewport3DArtifactInspectionPresentation } from "../viewport3dStore";
 import { artifactCarrierPresentationKey, artifactSurfaceRangeKey } from "@/kernel/visualization/artifactFieldSelection";
-import { scalarColorRgb } from "@/shared/visualization/scalarColorPalette";
+import { resolveViewport3DVectorColorRgb } from "../viewport3dVectorColoring";
 import type { VisualizationTargetSettings } from "@/kernel/visualization/ObjectVisualizationController";
 import { deviceBoundary, MAX_ANTENNA_DISPLAY_SAMPLES, MAX_ANTENNA_DISPLAY_CELLS, MAX_ANTENNA_DISPLAY_PAYLOAD_BYTES } from "./antennaFieldOverlayModel";
 import { admitArtifactFieldCarrier, parseArtifactFieldLocator } from "./artifactFieldCarrierModel";
@@ -104,13 +104,22 @@ export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtif
     }
   }
   if (segments?.some(v => !Number.isFinite(v))) throw new Error("Owned vector glyph cannot be represented.");
-  const glyphColors = new Float32Array(glyphCount * 3);
-  for (let i = 0; i < glyphCount; i++) glyphColors.set(scalarColorRgb(maximumNorm > 0 ? magnitudes[vectorSampleIndices[i]] / maximumNorm : .5, settings.scalarColorPalette), i * 3);
+  // Use the complete physical carrier, never display-segment lengths or the sampled glyph subset.
+  const vectorColorRange = scalar ? null : settings.vectorColorMode === "magnitude" ? { min: 0, max: maximumNorm }
+    : settings.vectorColorMode === "x" || settings.vectorColorMode === "y" || settings.vectorColorMode === "z"
+      ? resolveScalarRange(field, settings.vectorColorMode, settings.scalarColorPalette) : null;
+  const glyphColors = vectorColorRange ? new Float32Array(glyphCount * 3) : null;
+  if (glyphColors && vectorColorRange) for (let i = 0; i < glyphCount; i++) {
+    const source = vectorSampleIndices[i], offset = source * 3;
+    const rgb = resolveViewport3DVectorColorRgb(settings.vectorColorMode, field.values[offset], field.values[offset + 1], field.values[offset + 2],
+      vectorColorRange, maximumNorm > 0 ? magnitudes[source] / maximumNorm : .5, settings.scalarColorPalette);
+    if (rgb) glyphColors.set(rgb, i * 3);
+  }
   const vectorSegments = encodeAntennaGlyphSegments(segments, glyphCount);
   if (vectorSegments) for (let i = 0; i < glyphCount; i++) vectorSegments[i * 7 + 6] = maximumNorm > 0 ? magnitudes[vectorSampleIndices[i]] / maximumNorm : 0;
   const glyphSelectionKey = JSON.stringify([settings.geometryScope ?? "full", glyphCount]);
   const glyphStyleKey = JSON.stringify([settings.geometryScope, settings.vectorBudget, settings.scalarColorPalette, settings.vectorColorMode, settings.vectorLengthScale, settings.vectorCenteringEnabled, surfaceOffsetDistance]);
-  return { scalar, geometry: data, glyphColors, glyphSelectionKey, glyphStyleKey, key: `${locator.carrier_id}:${field.fieldGenerationId}:${field.sourceRevision}`, quantityId: field.quantityId as "H_ant" | "J_charge" | "V_electric", unit: scalar ? "V" : current ? "A/m^2" : "A/m",
+  return { scalar, geometry: data, glyphColors, vectorColorRange, glyphSelectionKey, glyphStyleKey, key: `${locator.carrier_id}:${field.fieldGenerationId}:${field.sourceRevision}`, quantityId: field.quantityId as "H_ant" | "J_charge" | "V_electric", unit: scalar ? "V" : current ? "A/m^2" : "A/m",
     status: "historical_inspection" as const, surface, locator, fieldRevision: field.sourceRevision ?? "", positions, scalarValues: scalars, vectorSegments, pointSampleIndices, vectorSampleIndices, glyphCount, surfaceOffsetDistance, availableGlyphCount: pointSampleIndices.length,
     surfaceTriangles, surfaceEdges, surfaceVectorValues, surfaceVectorScale, maximumVectorNorm: scalar ? 0 : maximumNorm, minimum: component === "magnitude" && settings.surfaceProjectionMode !== "surface_faces" ? 0 : minimum, maximum, count,
     intent: { component, palette: settings.scalarColorPalette }, settings };
