@@ -359,6 +359,7 @@ export function FallbackTopologyMeshLayer({
       tracker={tracker}
       vectorBuildReference={vectorLayerInput.buildReference}
       vectorColorMode={vectorColorMode}
+      vectorGlyphColors={vectorLayerInput.glyphColors ?? null}
       vectorSegments={vectorLayerInput.segments}
       vectorStyle={vectorStyle}
     />
@@ -382,6 +383,7 @@ function FallbackTopologyMeshPrimitives({
   tracker,
   vectorBuildReference,
   vectorColorMode,
+  vectorGlyphColors,
   vectorSegments,
   vectorStyle,
 }: {
@@ -401,6 +403,7 @@ function FallbackTopologyMeshPrimitives({
   tracker: Viewport3DResourceTracker;
   vectorBuildReference: Viewport3DFieldRenderModel["fullVectorBuild"];
   vectorColorMode: string;
+  vectorGlyphColors: Float32Array | null;
   vectorSegments: Viewport3DFieldRenderModel["fullVectorSegments"];
   vectorStyle: VectorFieldLayerVectorStyle;
 }) {
@@ -463,6 +466,7 @@ function FallbackTopologyMeshPrimitives({
       renderPlan.vectors.visible ? (
         <VectorFieldLayer
           buildReference={vectorBuildReference}
+          glyphColorsOverride={vectorGlyphColors}
           colors={colors}
           colorMode={vectorColorModeFromSettings(
             renderSettings,
