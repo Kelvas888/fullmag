@@ -179,6 +179,59 @@ pub(crate) fn confirm_publication(dest: &Path) -> Result<()> {
     result.map_err(|error| anyhow::Error::new(PublicationUncertain::new(dest.to_path_buf(), error)))
 }
 
+/// How long an operation failing with transient ENOMEM is repeated.
+const TRANSIENT_ENOMEM_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A Windows-folder (9p/drvfs) store intermittently fails opens, reads and
+/// writes with ENOMEM under load although the system has free memory.
+pub(crate) fn is_transient_enomem(error: &anyhow::Error) -> bool {
+    const ENOMEM: i32 = 12;
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(ENOMEM))
+    })
+}
+
+/// Repeat an operation that changes no durable state (a read, or staging
+/// before its publishing rename) while it fails with transient ENOMEM.
+pub(crate) fn retry_transient_enomem<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = std::time::Instant::now() + TRANSIENT_ENOMEM_WAIT;
+    loop {
+        match operation() {
+            Err(error) if is_transient_enomem(&error) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Create, fill and sync a fresh sibling staging file. Nothing is visible
+/// before the caller's rename, so transient ENOMEM restarts with a new file.
+fn stage_publication(
+    parent: &Path,
+    mut write_data: impl FnMut(&mut File) -> Result<()>,
+) -> Result<PathBuf> {
+    retry_transient_enomem(|| {
+        let temporary = parent.join(format!(".{}.part", uuid::Uuid::new_v4()));
+        let staged = (|| {
+            let mut file = File::create_new(&temporary)?;
+            write_data(&mut file)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        match staged {
+            Ok(()) => Ok(temporary),
+            Err(error) => {
+                // Only our uniquely-owned unpublished staging file may be removed.
+                let _ = fs::remove_file(&temporary);
+                Err(error)
+            }
+        }
+    })
+}
+
 /// Unique, exclusive staging beside the target; no shared `.part` pathname.
 ///
 /// This is the data publication path and therefore consumes the test fault
@@ -198,12 +251,11 @@ pub(crate) fn atomic_write_deferring_directory_barrier(dest: &Path, data: &[u8])
     let parent = dest
         .parent()
         .context("publication has no parent directory")?;
-    let temporary = parent.join(format!(".{}.part", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut file = File::create_new(&temporary)?;
+    let temporary = stage_publication(parent, |file| {
         file.write_all(data)?;
-        file.sync_all()?;
-        drop(file);
+        Ok(())
+    })?;
+    let result = (|| {
         consume_publication_failpoint()?;
         fs::rename(&temporary, dest).with_context(|| format!("publishing {}", dest.display()))
     })();
@@ -267,17 +319,13 @@ pub(crate) fn atomic_write_verified_file(
 fn atomic_write_impl(
     dest: &Path,
     consume_data_failpoint: bool,
-    write_data: impl FnOnce(&mut File) -> Result<()>,
+    write_data: impl FnMut(&mut File) -> Result<()>,
 ) -> Result<()> {
     let parent = dest
         .parent()
         .context("publication has no parent directory")?;
-    let temporary = parent.join(format!(".{}.part", uuid::Uuid::new_v4()));
+    let temporary = stage_publication(parent, write_data)?;
     let result = (|| {
-        let mut file = File::create_new(&temporary)?;
-        write_data(&mut file)?;
-        file.sync_all()?;
-        drop(file);
         if consume_data_failpoint {
             consume_publication_failpoint()?;
         }
@@ -463,6 +511,38 @@ pub fn publish_directory(staging: &Path, destination: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::{FmsSessionManifest, SaveProfile, SessionStore};
+
+    #[test]
+    fn staging_repeats_transient_enomem_and_publishes_one_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("record.json");
+        let mut attempts = 0;
+        atomic_write_impl(&destination, false, |file| {
+            attempts += 1;
+            if attempts < 3 {
+                return Err(std::io::Error::from_raw_os_error(12).into());
+            }
+            file.write_all(b"published")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(fs::read(&destination).unwrap(), b"published");
+        let leftovers = fs::read_dir(directory.path())
+            .unwrap()
+            .filter(|entry| is_atomic_write_staging_filename(&entry.as_ref().unwrap().file_name()))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        let mut denied = 0;
+        let error = retry_transient_enomem(|| -> Result<()> {
+            denied += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        })
+        .unwrap_err();
+        assert_eq!(denied, 1);
+        assert!(!is_transient_enomem(&error));
+    }
 
     #[test]
     fn interrupted_replacement_preserves_previous_bytes() {
