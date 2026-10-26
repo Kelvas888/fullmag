@@ -984,25 +984,6 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
           {object.mode === "committed" && (
             <>
               <Button
-                disabled={pending || Boolean(sceneMutationLockReason) || !inspectorDirty}
-                size="sm"
-                type="button"
-                title={sceneMutationLockReason}
-                onClick={() => void applyRegisteredDrafts()}
-              >
-                {identityDraftDirty && !objectEditDraftDirty ? "Apply Identity" : "Apply"}
-              </Button>
-              <Button
-                disabled={pending || Boolean(sceneMutationLockReason) || !inspectorDirty}
-                size="sm"
-                type="button"
-                variant="ghost"
-                title={sceneMutationLockReason}
-                onClick={revertAllDrafts}
-              >
-                Revert
-              </Button>
-              <Button
                 size="sm"
                 type="button"
                 variant="secondary"

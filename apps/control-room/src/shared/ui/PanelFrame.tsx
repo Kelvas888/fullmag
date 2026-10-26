@@ -102,11 +102,20 @@ export function PanelFrame({ id, title, visible, children, dockHandle, drawer = 
       scroll.current = Array.from(frame.current.querySelectorAll<HTMLElement>("*")).filter(e => e.scrollTop || e.scrollLeft).map(e => [e, e.scrollTop, e.scrollLeft]);
     }
     onHide?.();
+    requestAnimationFrame(() => document.querySelector<HTMLButtonElement>(`[data-restore-panel="${id}"]`)?.focus());
+  };
+  const interactionGeometry = (): Geometry => {
+    if (!drawer || mode !== "docked") return geometry;
+    const bounds = frame.current?.getBoundingClientRect();
+    setMode("floating");
+    return bounds ? { x: bounds.left, y: bounds.top, width: bounds.width, height: bounds.height } : geometry;
   };
   const begin = (event: ReactPointerEvent<HTMLButtonElement>, kind: "move" | "resize") => {
     if (event.button !== 0 || effectiveMode === "maximized") return;
     event.preventDefault();
-    gesture.current = { x: event.clientX, y: event.clientY, geometry, kind };
+    const current = interactionGeometry();
+    setGeometry(current);
+    gesture.current = { x: event.clientX, y: event.clientY, geometry: current, kind };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
   const move = (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -126,11 +135,12 @@ export function PanelFrame({ id, title, visible, children, dockHandle, drawer = 
     const dy = event.key === "ArrowDown" ? step : event.key === "ArrowUp" ? -step : 0;
     if (!dx && !dy) return;
     event.preventDefault(); event.stopPropagation();
-    setGeometry(g => constrain(kind === "move" ? { ...g, x: g.x + dx, y: g.y + dy } : { ...g, width: g.width + dx, height: g.height + dy }));
+    const current = interactionGeometry();
+    setGeometry(constrain(kind === "move" ? { ...current, x: current.x + dx, y: current.y + dy } : { ...current, width: current.width + dx, height: current.height + dy }));
   };
   const controls = {
     move: docked ? dockHandle : <Button size="icon" variant="ghost" aria-label={`Move ${title} with arrow keys`} disabled={effectiveMode === "maximized"} onPointerDown={e => begin(e, "move")} onPointerMove={move} onPointerUp={end} onPointerCancel={end} onKeyDown={e => keyboard(e, "move")}><GripVertical size={14} aria-hidden="true" /></Button>,
-    actions: <DropdownMenu><DropdownMenuTrigger asChild><Button size="icon" variant="ghost" aria-label={`${title} panel menu`}><MoreHorizontal size={15} aria-hidden="true" /></Button></DropdownMenuTrigger><DropdownMenuContent align="end">
+    actions: <DropdownMenu><DropdownMenuTrigger asChild><Button size="icon" variant="ghost" aria-label={`${title} panel menu`}><MoreHorizontal size={15} aria-hidden="true" /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" onCloseAutoFocus={event => { if (!visible) event.preventDefault(); }}>
       <DropdownMenuItem onSelect={() => setMode(mode === "floating" ? "docked" : "floating")}>{mode === "floating" ? "Dock panel" : "Float panel"}</DropdownMenuItem>
       <DropdownMenuItem onSelect={() => { if (mode === "maximized") setMode(restoreMode.current); else { restoreMode.current = mode; setMode("maximized"); } }}>{mode === "maximized" ? "Restore panel" : "Maximize panel"}</DropdownMenuItem>
       {onMove ? <><DropdownMenuItem onSelect={() => onMove(-1)}>Move panel left</DropdownMenuItem><DropdownMenuItem onSelect={() => onMove(1)}>Move panel right</DropdownMenuItem></> : null}
@@ -138,7 +148,7 @@ export function PanelFrame({ id, title, visible, children, dockHandle, drawer = 
     </DropdownMenuContent></DropdownMenu>,
   };
   return <section ref={frame} className="fm-panel-frame" data-panel-frame={id} data-panel-mode={effectiveMode} hidden={!visible} aria-label={`${title} panel`}
-    onFocusCapture={event => { if (!(event.target as HTMLElement).closest(".fm-panel-chrome")) previousFocus.current = event.target as HTMLElement; }}
+    onFocusCapture={event => { if (frame.current?.contains(event.target as HTMLElement) && !(event.target as HTMLElement).closest(".fm-panel-chrome")) previousFocus.current = event.target as HTMLElement; }}
     onScrollCapture={() => { if (visible && frame.current) scroll.current = Array.from(frame.current.querySelectorAll<HTMLElement>("*")).filter(e => e.scrollTop || e.scrollLeft).map(e => [e, e.scrollTop, e.scrollLeft]); }} style={!docked ? (effectiveMode === "maximized" ? maxBounds ?? { inset: 8 } : drawer && mode === "docked" ? { right: 8, top: 144, width: "min(416px, calc(100vw - 16px))", height: "calc(100dvh - 180px)" } : { left: geometry.x, top: geometry.y, width: geometry.width, height: geometry.height }) : undefined}>
     <ChromeContext.Provider value={controls}>
       <Activity mode={!visible && suspendWhenHidden ? "hidden" : "visible"}>{children}</Activity>

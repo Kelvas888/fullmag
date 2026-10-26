@@ -2793,7 +2793,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       data-antenna-field-sample-count={antennaFieldOverlay?.count}
       onPointerDown={() => kernel.layout.setFocusedSlot(slotId)}
     >
-      <div className="fm-viewport-3d__hud">
+      <div className="fm-viewport-3d__hud" role="group" aria-label="3D view controls">
         <Viewport3DAppearanceHud onOpenSettings={() => { void kernel.commands.execute("viewport-3d.open-settings", { source: "menu", layout: kernel.layout, selection: kernel.selection }); }} />
         {fieldDataIssue ? (
           <div className="fm-viewport-3d__issue-banner" role="status">
@@ -2834,7 +2834,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           </fieldset>
         ) : null}
         <Viewport3DFieldLabel quantityId={antennaFieldOverlay?.intent.quantity ?? quantityId} label={antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel} historical={!antennaFieldOverlay && artifactField.historical} model={artifactField.model} error={artifactField.error} liveDataAvailable={antennaFieldOverlay ? undefined : liveQuantityDataAvailable} />
-        <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
+        <span title={antennaFieldSourceLabel ?? selectedLabel}>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
         <span>{artifactField.model ? `${artifactField.model.count} owned samples · historical inspection · ${artifactField.model.unit}` : antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
         {!antennaFieldOverlay && artifactField.candidates.length > 0 ? (
