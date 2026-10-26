@@ -91,3 +91,51 @@ Dalsze bramki: aplikacyjny build w stałym backendzie, link/manifest MPFR,
 ponowny odczyt starych wyników, jedna próba14, prerejestrowane porównanie,
 szersza niezależna kwalifikacja i pełny Universe. Kontrole przeglądarki,
 pełna baza/projekcja/LLG/FFT/BORIS i E12 nadal nie są zaliczone.
+
+
+## Dokładne wejścia obecnego Universe — uzupełnienie
+
+Następny turn przyniósł konkretny postęp przygotowania rzeczywistej pełnej
+próby. Obecny manifest API ma 1162 nodes i 6548 Tet4, z czego 1726 conductor
+oraz 4822 air. Historyczna próba ace433… miała 1154 nodes i źródło1862;
+mały benchmark ma14 nodes i źródło1865. Nie są to te same siatki.
+Aktualny FMS zawiera źródło677 nodes/1859Tet4 i Global1162/6548, zgodne
+z zachowaną natywną preparation oraz bieżącą generacją
+1068f1dda14706c4ebbb5f81c280ae0d8025f70d1cbf5a4aaa8d834b69a9097b.
+
+Przygotowano pełny publiczny request w podkatalogu kontrolnym
+full-universe-replay/frozen-submit-request.json. SHA256:
+3dd66fe134bedbc66fb90fa40bfb510ac4aa2bbcb64953c2b5ce08620af7c6cb,
+41 684 035 B. Archiwum projektu SHA256:
+f8d8abafa021fb490c597692ccaa7b0a3c119aa143a2df51ebe336048b2bdbfc.
+Kontrola replay-input-validation.json przeszła: identyczne bity wszystkich
+punktów, connectivity/markery, generacja API, scena, ProblemIR, plan i katalog;
+ponownie sprawdzono hashe wszystkich1973 assetów. Zmieniono tylko run ID
+oraz metadata aktywacji samodzielnego runu. Nie wykonano remeshingu ani POST.
+Projekt10909b… ma katalog runów HTTP200 i zachowany run2f2f…; bare GET projektu
+nie jest kanoniczną trasą, więc jego404 nie dowodziło braku projektu.
+
+Pełna próba obejmuje 2 160 158 par przy niezmienionym limicie4 mln/1800s.
+run-full-universe-once.py wymaga najpierw wyniku21-payload parity z małego
+MPFR i zgodnego SHA biblioteki. Sprawdzono dwie rzeczywiste odmowy preflightu:
+mała próba nie startuje na starym pakiecie22c08…, pełna nie startuje bez
+zaliczonego małego porównania. Obie zakończyły się przed submission-started;
+żadnego Solve. Dowód trial-preflight-negative-checks.json.
+
+Odrębny audyt dokładnej geometrii zachowano w future-geometry-reuse-proof.py
+oraz JSON. 462 porównania Fraction wszystkich13 pól i sześciu permutacji
+przeszły; jeden degenerujący po binary64 trójkąt jawnie pominięto. Dla obecnego
+źródła jest7436 lokalnych ścian i4365 unikalnych trójkątów według bitów
+współrzędnych. Potencjał ograniczenia powtórzeń geometry wynosi41,30% przed
+narzutem. Nie zaimplementowano cache, nie współdzielono prądu/FacePass, nie
+sprawdzono native guards/RSS i nie uznano tego modelu algebraicznego za
+kwalifikację naukową. Najpierw osobny parytet MPFR; sam czas fazy exact z
+małego benchmarku sugeruje, że MPFR-only może nie wystarczyć dla1800s, lecz
+jest to ekstrapolacja, nie pomiar obecnego Universe.
+
+Build33865 pozostaje aktywny, ostatnia obserwacja MFEM205/269. Właściwa trasa
+DEV deleguje do build_volume_toolchain; końcowe piny znajdują się w
+ toolchain/attempts/<attempt>/terminal.json i toolchain/current.json lub
+verified.json. Stary toolchain/bootstrap-receipt.json nie jest producentem
+tej trasy. Nowy obraz, aplikacyjny build, mała próba i pełna mapa są nadal
+NOT VERIFIED. Źródła kernela pozostają wyłącznie kandydatem MPFR.
