@@ -445,6 +445,8 @@ pub async fn submit_run(
         request.study_problem_catalog.into_iter().collect(),
     ))
     .map_err(|error| ApiError::bad_request(format!("invalid_study_problem_catalog: {error}")))?;
+    crate::accepted_solver_profile::validate_study_profile(&intent.specification.parameters, &study)
+        .map_err(|error| ApiError::bad_request(format!("invalid_solver_profile: {error:#}")))?;
     if intent.specification.snapshot.project_id != project_id {
         return Err(ApiError::conflict(
             "run snapshot project_id differs from request path",
@@ -567,6 +569,8 @@ pub async fn submit_batch(
         request.study_problem_catalog.into_iter().collect(),
     ))
     .map_err(|error| ApiError::bad_request(format!("invalid_study_problem_catalog: {error}")))?;
+    crate::accepted_solver_profile::validate_study_profile(&batch_request.template.parameters, &study)
+        .map_err(|error| ApiError::bad_request(format!("invalid_solver_profile: {error:#}")))?;
     if batch_request.template.snapshot.project_id != project_id {
         return Err(ApiError::conflict(
             "batch template project_id differs from request path",

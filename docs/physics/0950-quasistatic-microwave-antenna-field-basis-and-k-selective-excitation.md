@@ -11149,6 +11149,350 @@ zachowano w wolumenie kontrolnym grupy, pod
 nie całego Universe; nie stanowi statystycznej kwalifikacji wydajności
 ani potwierdzenia wizualizacji w UI.
 
+(antenna-surface-gmp-dev-package)=
+#### Realizacja liczb dokładnych przez GMP — 25.10.2026
+
+Wariant FEM CPU zastępuje wewnętrzne `cpp_int/cpp_rational` typami
+`mpz_int/mpq_rational` przez publiczny wrapper Boost. Pozostają te same
+liczby wymierne, dokładne predykaty i jawne surowe iloczyny przed normalizacją.
+`surface_rt0.cpp + ExactArithmetic` nadal instrumentuje każdą swoją operację,
+kontroluje raw/reduced bits oraz rzeczywisty próbkowany peak RSS. Liczniki
+nie obejmują wszystkich wewnętrznych operacji gcd, konwersji i alokacji GMP.
+Nie zastępujemy wrappera bezpośrednim, nieinstrumentowanym `mpq_add/mpq_mul`.
+
+`surface_rt0.cpp + Arithmetic::number` zachowuje dotychczasową kolejność:
+`convert_to<double>()` dla binary64 oraz osobna konwersja licznika i mianownika
+z końcowym dzieleniem dla `cpp_dec_float<80/120>`. Lokalne nagłówki Boost
+kierują konwersję obu rational do tego samego algorytmu dokładnego ilorazu
+z zaokrągleniem nearest-even; wrapper GMP nie wywołuje tutaj `mpq_get_d`.
+Compile-time kontrola zgodnych szerokości limb zabezpiecza porównywaną
+ścieżkę integer→decimal na bieżącym Linux/amd64. To dowód źródłowy;
+zgodność zapisanych wartości musi dodatkowo potwierdzić publiczny benchmark.
+Nie zmieniamy realizacji dziesiętnej 80/120 cyfr na MPFR.
+
+`backends/fem/CMakeLists.txt + DOC-ANCHOR: antenna-surface-gmp-dependency`
+wymaga GMP wyłącznie w realizacji MFEM. Brak zależności powoduje błąd
+konfiguracji, bez fallbacku do innego dokładnego backendu. Docker DEV dodaje
+`libgmp-dev` późnym krokiem finalnego obrazu. Dotychczasowy writer i jego
+wczesny COPY pozostają bez zmian, aby nie unieważnić ciężkich warstw deps.
+Manifest obrazu zapisuje rzeczywiste wersje pakietów GMP i Boost w dodatkowym
+`actual.system_packages`; pełny hash manifestu identyfikuje toolchain.
+Nowy toolchain ma osobny cache aplikacji, a stary cache pozostaje zachowany.
+
+To zmiana prywatnej realizacji arytmetycznej, bez nowych parametrów Python,
+ProblemIR, capabilities, jednostek, tolerancji, limitów i wersji fizycznego
+operatora. Requested/resolved solver nadal oznacza FEM CPU. Dowody dla
+FDM CPU/GPU ani FEM GPU nie wynikają z tej zmiany. Dystrybucyjne notices GMP
+pozostają w obrazie; kompletność osobnego eksportu portable nie jest tu
+kwalifikowana. Nie deklarujemy nowego certyfikatu błędu lub gotowej bazy LLG.
+
+Zarządzany build aplikacji `d30549fadeb14aadb517a0a491ca50b0` zakończył
+się poprawnie. Biblioteka FEM wymaga `libgmp.so.10`; kontrola zależności nie
+wykazała brakujących bibliotek. Zaakceptowany benchmark
+`run-surface-gmp-20261025-01` zachował bajtowo wszystkie 21 payloadów,
+pełne diagnostyki trzech precyzji, liczniki, maksymalne długości liczb oraz
+limity i tolerancje. Czas operatora wyniósł 346.505338649 s wobec
+371.592043076 s poprzedniej realizacji. Raport
+`verification/surface-rt0-performance-20261025/gmp-result-comparison.json`
+w wolumenie kontrolnym dokumentuje ten pojedynczy pomiar dla 14 targetów.
+Nie dowodzi on wydajności pełnego Universe ani niezależnej kwalifikacji
+wszystkich położeń próbek. Ciężkie zależności zostały rzeczywiście
+przebudowane; nie deklarujemy dla tej operacji spełnienia bramki CACHED.
+
+Kolejna poprawka `ExactArithmetic::bits/watch/sign` odczytuje długość
+liczb przez `mpz_sizeinbase(...,2)` oraz pożycza numerator i denominator
+z GMP, bez tworzenia ich kopii. Jawnie zachowuje `bits(0)=0`, długość
+modułu liczby ujemnej oraz kolejność naliczania i kontroli raw/reduced.
+Nie zmienia surowych iloczynów, konwersji, formuł ani trzech precyzji.
+Ta poprawka wymaga nowego zarządzanego buildu, parytetu payloadów,
+diagnostyk, liczników i odmów oraz pomiaru czasu. Jej wykonanie,
+pełne Universe i browser/WebGL pozostają **NOT VERIFIED**.
+
+(antenna-surface-face-dot-reuse)=
+#### Kandydat FEM CPU: ponowne użycie iloczynów ściany — 26.10.2026
+
+`surface_rt0.cpp + face_pass` może ponownie wykorzystać trzy iloczyny
+sąsiednich wektorów i trzy iloczyny z rzutem normalnym. Signed-fan i whole-face
+używają tych samych zaokrąglonych wektorów w obrębie jednej ściany i jednej
+precyzji. Każdy iloczyn zachowuje istniejącą sumę trzech składników w tej
+samej kolejności, bez zamiany na analitycznie równoważne wyrażenie wysokości.
+Symetria mnożenia skończonych skalarów pozwala wykorzystać także odwróconą
+kolejność argumentów tego samego iloczynu. Pamięć jest lokalna dla wywołania;
+nie jest cache między targetami, komórkami ani precyzjami.
+
+Obliczenie jest leniwe: exact-zero fan nadal nie oblicza swojego kąta,
+exact-zero height nadal pomija wszystkie kąty, a `solid_angle` sprawdza
+niezerowy licznik przed żądaniem iloczynów mianownika. Nie zmieniają się
+predykaty wymierne, normalizacja, binary64/80/120, kompensowane sumowanie,
+równania, jednostki, Python, ProblemIR, capability ani polityka limitów.
+Jawne liczniki wrappera nie obejmowały tych iloczynów i pozostają porównywane
+bez ich redefinicji. Nie dodajemy nowego właściciela stanu ani alokacji heap.
+Pozostałe realizacje FDM CPU/GPU i FEM GPU nie otrzymują nowego operatora.
+
+Przed promocją kandydata wymagane są: zarządzany build tej samej grupy,
+identyczność bajtowa 21 naukowych payloadów retained benchmarku, zgodność
+pełnych diagnostyk precyzji, liczników, tolerancji i odmów, a następnie
+współczesne baseline–candidate–baseline dla czasu. Wynik na 14 punktach nie
+kwalifikuje pełnego Universe ani near/inside-source. Brak poprawy czasu lub
+naruszenie zgodności oznacza odrzucenie tej optymalizacji. Stan kandydata
+przed wykonaniem: **NOT VERIFIED**. Nie deklarujemy przyspieszenia na
+podstawie samej liczby pominiętych mnożeń.
+
+Zarządzana iteracja `ee866bdfe38f4b43a093d2f667467876` zbudowała kandydata;
+publiczny run `run-antenna-surface-dot-reuse-20261026-01` zakończył się
+succeeded. Biblioteka miała SHA256
+`304f9d38ee42b587201f44b8d360b7c926a2ce9e1f4cdedf320dea712c6b8839`.
+Wszystkie 21 naukowych payloadów, pełne diagnostyki trzech precyzji i liczniki
+pracy są identyczne z zachowaną referencją. Dziewięć faz profilu sumuje się
+prawidłowo. Raport `verification/antenna-surface-dot-reuse-20261026/on/comparison.json`
+w wolumenie kontrolnym wiąże bundle
+`12a533e071ef5d9163c934d24ab15c9bc7dff3f2043f365d5283c997e63b7dbd`
+z tym pojedynczym wykonaniem. Czas operatora wyniósł 371.441557726 s wobec
+401.198955137 s poprzedniej próby ON na tej samej geometrii. Te dwa pomiary
+nie wyodrębniają wpływu obciążenia nadzorców i nie spełniają prerejestracji
+baseline–candidate–baseline. Przyspieszenie pozostaje **NOT VERIFIED**;
+nie kwalifikujemy na tej podstawie pełnej siatki ani innych położeń targetów.
+
+(antenna-surface-mpfr-candidate)=
+#### Kandydat FEM CPU: MPFR ze stałą precyzją — prerejestracja 26.10.2026
+
+Profil publicznego runu `run-antenna-release-proof-20261026-01` wiąże
+bibliotekę `22c08a0585a5511d6737b9d429de180b9f22bdf4ed249382665ed7c42815c909`
+i bundle `6bacf94351693955f5b97ab7485613e5a23cc29e835ffaf02527cdb6389e0ca4`:
+14 targetów, 363,113 s operatora, z czego 306,656 s w dwóch wysokich
+precyzjach. Jest to punkt odniesienia dla kandydata, nie dowód czasu pełnego
+Universe. Źródło, kolejność targetów, signed current i wszystkie parametry
+polityki pozostają przypięte do zachowanego requestu tej próby.
+
+Nowa realizacja zachowuje dokładne GMP rational predykaty, formuły ścian,
+binary64, kompensowaną kolejność sumowania i wszystkie istniejące odmowy.
+Zastępuje wyłącznie wysokie typy arytmetyczne przez stałe MPFR. Jest to
+zmiana radix i reguły zaokrąglania, a nie neutralna podmiana biblioteki.
+Nie wolno przypisywać jej starej tożsamości operatora. Kandydat ma nazwę
+`fem_oersted_rt0_surface.mpfr128_160_rndn_etoff.inspection.v1`; stare archiwa
+`fem_oersted_rt0_surface.inspection.v1` nadal mają własną interpretację.
+Świeży native output wymaga aktualnej tożsamości; cold reader rozpoznaje
+wyłącznie te dwie jawne wersje, bez wildcard i bez zmiany znaczników
+inspection-only lub error-certificate.
+
+| Własność realizacji | Typ / wartość | Domyślnie / jednostka | Znaczenie i kontrola |
+|---|---|---|---|
+| Poziom logiczny 80 | `mpfr_float_backend<128, allocate_stack>` | stałe, $1$ | 427 bitów w zainstalowanym Boost 1.74; co najmniej 128 cyfr dziesiętnych. Static assertion wymaga nie mniej niż cała pojemność poprzedniego `cpp_dec_float<80>` wraz z guard limbs: 104 cyfry. |
+| Poziom logiczny 120 | `mpfr_float_backend<160, allocate_stack>` | stałe, $1$ | 533 bity; co najmniej 160 cyfr. Analogiczna kontrola względem 144 cyfr starego typu. |
+| Ewaluacja wyrażeń | `et_off` | stałe, $1$ | Jawne materializowanie wyników; brak automatycznego MPFR FMA z expression templates. Nie jest to deklaracja identyczności z dawnymi zaokrągleniami. |
+| Zaokrąglanie | `GMP_RNDN` w wrapperze Boost | stałe, $1$ | Nearest-even; bez zmiany globalnej precyzji lub zakresu wykładnika MPFR procesu. |
+| Konwersja exact → real | licznik, mianownik, następnie istniejące `divide` | bez nowego parametru, $1$ | Bez bezpośredniego `mpfr_set_q` i bez zmiany naliczania real divisions w pierwszym wariancie. |
+| Serializacja | dotychczasowy `Arithmetic::text` | ograniczona, $1$ | Więcej cyfr i inna rezerwacja bajtów wynikają z konkretnego typu. Dłuższy string nie stanowi certyfikatu błędu. |
+| Zależności | Boost 1.74, GMP 6.2.1, MPFR 4.1.0 | jawny obraz / $1$ | W obrazie development pakiet `libmpfr-dev=4.1.0-3build3` dopasowany do istniejącego runtime. Wersje dev/runtime w manifeście, CMake wymaga MPFR; brak zależności odmawia builda. |
+
+Pierwsza próba jest przypięta do istniejącej grupy Ubuntu 22.04 (Jammy),
+Boost 1.74 i pakietów MPFR `4.1.0-3build3`. Kanoniczna konfiguracja Compose
+tej grupy wybiera ten base jawnie. Alternatywne base, w tym fallback Ubuntu
+20.04 samego Dockerfile, nie są zakwalifikowane dla tego kandydata; brak
+przypiętego pakietu lub MPFR co najmniej 4.1 ma jawnie odmówić builda,
+a nie instalować nieprzypiętej wersji. Nie zmieniamy base ani systemowych
+bibliotek działającego backendu poza zarządzanym obrazem kandydata.
+
+Lokalny bufor mantysy nie dowodzi braku alokacji wewnątrz MPFR lub
+serializacji. Pozostają kontrole rzeczywistego lifetime peak RSS,
+rezerwowanych wyjść i wszystkich dotychczasowych limitów. Nie zwiększamy
+limitu par, operacji, czasu ani RAM. Pozostają te same tolerancje SI i
+underflow/finite/zero-denominator gates. Nowy typ ma inny zakres wykładnika;
+przypadki skrajne wymagają odrębnych testów odmowy.
+
+FDM CPU, FDM GPU i FEM GPU nie otrzymują nowego operatora. Nadal wykonujemy
+FEM CPU precompute; wykryte GPU ani biblioteka CUDA nie zmieniają tej
+klasyfikacji. Python i ProblemIR nie otrzymują nowego parametru, modelu
+źródła lub ukrytej fizyki. Istniejące `analytic_rt0_surface`, polityka i
+sampling zachowują autorstwo; resolved execution/evidence mają jawną nową
+tożsamość arytmetyczną. Runtime nadal publikuje atomowo jeden accepted V/J/H.
+
+Kryteria ustalone **przed uruchomieniem kandydata**:
+
+1. Zarządzany build i runtime wyłącznie w grupie Docker zadania. Zatrzymać
+   promocję przy błędzie builda, niejednoznacznych zależnościach lub wersji.
+2. Ten sam frozen request z innym run ID/idempotency key i przypiętą nową
+   biblioteką. Wszystkie 21 payloadów poza direct evidence muszą być
+   identyczne bajtowo, w tym raw H i per-A H. Każda rozbieżność zatrzymuje
+   tę pierwszą próbę promocji; nie zmieniamy progu po obejrzeniu wyniku.
+3. Evidence musi jawnie wskazywać nowy operator, zachować źródło, targety,
+   politykę, tolerancje, klasyfikację binary64 i wszystkie bramki lokalne /
+   globalne scalar, angle, field, cancellation oraz output quantization.
+   Decimal strings i reserved_output_bytes mogą się zmienić. Pozostałe
+   liczniki mają pozostać zgodne; oczekiwaną zmianę rezerwacji oblicza się
+   z pojemności nowych typów i tej samej liczby wywołań `text`, nie z
+   dopasowania po fakcie. Wszystkie wartości nadal muszą mieścić się w
+   niezmienionych limitach. Nie porównujemy strings jako dowodu naukowego.
+4. Przed szerszą kwalifikacją: dwa windingi, skale ekstremalne,
+   near/on-face/on-edge/on-vertex/inside-source, zera i binary refusal,
+   odmowy danych i limitów oraz niezależne całkowanie objętościowe RT0.
+   Zgodność dwóch przejść MPFR nie zastępuje niezależnej referencji.
+5. Przyspieszenie wymaga kontrolowanego baseline–candidate–baseline z
+   tymi samymi wejściami, czasami faz i całkowitymi, peak RSS oraz
+   licznikami. Pojedynczy wynik 14 punktów nie kwalifikuje Universe, bazy,
+   projekcji LLG ani innych geometrii. Nie obniżamy jakości wizualizacji.
+
+Dla zachowanej pierwszej próby wszystkie 14 przejść binary64 są evaluated.
+`Arithmetic::text` używa limitu `max_digits10 + 64`: stare wartości
+`max_digits10` to 104/144, nowe 131/163, a różnice pojemności wynoszą
+27/19 bajtów na wywołanie. Na target przypada 9 tekstów poziomu logicznego
+80 oraz 14 tekstów poziomu 120 (w tym roundoff przy ocenionym binary64).
+Oczekiwana zmiana wynosi więc dokładnie 509 bajtów na target i 7126 bajtów
+łącznie: total reserved output 90174 → 97300, ostatni target 5153 → 5662.
+Te wartości ustalono przed kandydatem w
+`verification/antenna-mpfr-20261026/comparison-expectations-v1.json` w wolumenie
+kontrolnym. Nie dotyczą automatycznie przypadków binary refusal.
+
+Mapa implementacji: `surface_rt0.cpp + Decimal80/Decimal120/Arithmetic`;
+`surface_rt0.hpp + surface_rt0_operator_version`;
+`accepted_surface_rt0.cpp + serialize`;
+`surface_rt0_evidence_v1.rs + SurfaceRt0Snapshot::validate`;
+`native_fem/surface_rt0.rs + SurfaceSnapshotBuffer::finish`;
+`backends/fem/CMakeLists.txt + pkg_check_modules`. Każdy path jest rozwinięty
+w sąsiedniej mapie źródeł. Stan przed wykonaniem: **implementation unqualified;
+runtime / parity / speed / scientific qualification NOT VERIFIED**.
+
+Podstawy biblioteczne: [Boost 1.74 MPFR](https://www.boost.org/doc/libs/1_74_0/libs/multiprecision/doc/html/boost_multiprecision/tut/floats/mpfr_float.html),
+[Boost 1.74 cpp_dec_float](https://www.boost.org/doc/libs/1_74_0/libs/multiprecision/doc/html/boost_multiprecision/tut/floats/cpp_dec_float.html)
+i [MPFR](https://www.mpfr.org/mpfr-current/mpfr.html). Semantyka lokalnego
+Boost została dodatkowo odczytana z nagłówków przypiętego obrazu.
+
+(antenna-mpfr-canonical-log-work-protocol)=
+#### Osobny protokół potwierdzający: dokładny model pracy gałęzi logarytmu
+
+Pierwsza próba MPFR z 26.10.2026 **nie przeszła prerejestrowanej promocji**.
+Zakończony run `run-antenna-mpfr-20261026-01` zachował 21/21 naukowych
+payloadów, ale zmienił `real_divisions` o 16 dla targetów 10–13 i nie ma
+kompletnego zachowanego dowodu obserwacji live. Tych braków nie uzupełniamy
+retrospektywnie. Poniższy protokół dotyczy oddzielnego badania
+potwierdzającego; nie zmienia operatora, tolerancji ani limitów.
+
+`face_pass` wybiera algebraicznie równoważne stabilizowane postacie na
+podstawie zaokrąglonych `xi < 0` i `xj > 0`. Zera oraz kasowanie
+w projekcjach mogą prowadzić do różnej liczby jawnych dzieleń; także dokładnie
+niezerowy iloczyn może po konwersji i zaokrągleniu dać zero lub przeciwny znak. Dla
+niezdegenerowanej krawędzi można niezależnie przewidzieć matematyczne znaki:
+
+```{math}
+:label: antenna-mpfr-exact-log-signs
+\begin{aligned}
+\mathbf r_i&=\mathbf x-\mathbf v_i,\quad
+\mathbf e_i=\mathbf v_j-\mathbf v_i=\mathbf r_i-\mathbf r_j,\quad
+L_i=\sqrt{\mathbf e_i\cdot\mathbf e_i}>0,\\
+\xi_i&=-\frac{\mathbf r_i\cdot\mathbf e_i}{L_i},\quad
+\eta_i=\xi_i+L_i=-\frac{\mathbf r_j\cdot\mathbf e_i}{L_i},\\
+b_i^L&=[\mathbf r_i\cdot\mathbf e_i>0],\quad
+b_i^R=[\mathbf r_j\cdot\mathbf e_i<0].
+\end{aligned}
+```
+
+| Token | Znaczenie | SI |
+|---|---|---|
+| $\tau,f,i,j,p$ | Target, ściana, skierowane końce krawędzi i poziom precyzji $p=0,1,2$. | $1$ |
+| $\mathbf x,\mathbf v_i,\mathbf v_j$ | Target i oryginalne wierzchołki, dokładnie z zachowanych binary64. | $\mathrm m$ |
+| $\mathbf r_i,\mathbf r_j,\mathbf e_i$ | Wektory target–wierzchołek oraz krawędź. | $\mathrm m$ |
+| $L_i,\xi_i,\eta_i$ | Długość krawędzi i dwie projekcje wzdłuż niej. | $\mathrm m$ |
+| $b_i^L,b_i^R$ | Matematyczne predykaty wyboru racjonalizowanej postaci; nawias oznacza wskaźnik logiczny. | $1$ |
+| $A_{\tau f}$ | Liczba aktywnych fanów, z pominięciem dokładnego `d_zero`. | $1$ |
+| $B_{\tau f}$ | Suma $b_i^L+b_i^R$ po aktywnych fanach. | $1$ |
+| $h_{\tau f}$ | Podpisana odległość od płaszczyzny ściany; zero odpowiada dokładnemu `hnum == 0`. | $\mathrm m$ |
+| $E_{\tau f}$ | Liczba warunkowych konwersji qvector i liczników kątów. | $1$ |
+| $D_{\tau p}$ | Przewidywana liczba jawnych `Arithmetic::divide` w targetcie i precyzji. | $1$ |
+
+Dodatnia normalizacja potęgą dwóch nie zmienia **dokładnych** znaków, lecz
+nie gwarantuje zachowania znaków po konwersji i sekwencyjnych działaniach.
+Model v1 używający tylko tych znaków przeszedł kontrolę sum globalnych,
+ale nie przeszedł preflightu per-target: targety 0/4 miały różnicę −2,
+a 8/9 +2. Nie wykonano submit v1. Niezależny odczytowy model binary64
+potwierdził te osiem krawędzi i wzajemne znoszenie różnic.
+
+Model v2 odtwarza wyłącznie projekcje gałęzi dla wszystkich aktywnych krawędzi:
+
+```{math}
+:label: antenna-mpfr-rounded-log-signs
+\begin{aligned}
+\widehat{\mathbf r}_i^{(p)}&=C_p(\mathbf r_i/s_{\tau f}),\quad
+\widehat{\mathbf e}_i^{(p)}=C_p(\mathbf e_i/s_{\tau f}),\\
+\widehat L_i^{(p)}&=\operatorname{fl}_p\!\left(\sqrt{\operatorname{fl}_{p,\Sigma}
+  (\widehat{\mathbf e}_i^{(p)}\cdot\widehat{\mathbf e}_i^{(p)})}\right),\\
+\widehat\xi_i^{(p)}&=\operatorname{fl}_p\!\left(
+  -\operatorname{fl}_{p,\Sigma}(\widehat{\mathbf r}_i^{(p)}\cdot\widehat{\mathbf e}_i^{(p)})/\widehat L_i^{(p)}\right),\\
+\widehat\eta_i^{(p)}&=\operatorname{fl}_p(\widehat\xi_i^{(p)}+\widehat L_i^{(p)}),\\
+B_{\tau f}^{(p)}&=\sum_{i\,\mathrm{active}}
+  \left([\widehat\xi_i^{(p)}<0]+[\widehat\eta_i^{(p)}>0]\right).
+\end{aligned}
+```
+
+| Token | Znaczenie | SI |
+|---|---|---|
+| $s_{\tau f}$ | Dokładna dodatnia potęga dwóch wybrana z maksymalnej składowej geometrii ściany i targetu. | $\mathrm m$ |
+| $\widehat{\mathbf r}_i^{(p)},\widehat{\mathbf e}_i^{(p)}$ | Skonwertowane i znormalizowane wektory dla danego poziomu arytmetyki. | $1$ |
+| $\widehat L_i^{(p)},\widehat\xi_i^{(p)},\widehat\eta_i^{(p)}$ | Zaokrąglona długość i projekcje użyte tylko do wyboru gałęzi. | $1$ |
+| $B_{\tau f}^{(p)}$ | Liczba wybranych racjonalizacji po aktywnych fanach w danej arytmetyce. | $1$ |
+| $C_p,\operatorname{fl}_p,\operatorname{fl}_{p,\Sigma}$ | Konwersja, zaokrąglenie najbliższe z ties-to-even i sekwencyjny iloczyn skalarny bez FMA. | $1$ |
+
+Weryfikator nadal wyznacza geometrię i exact-zero przez `Fraction` z oryginalnego
+bundle. Binary64 używa zwykłych sekwencyjnych operacji Python float. Dla obu
+wysokich poziomów wywołuje jedynie libmpfr przez ctypes, z 427/533 bitami i RNDN.
+Konwersja $C_0$ zaokrągla dokładną liczbę wymierną; $C_1$ i $C_2$ najpierw
+osobno zaokrąglają licznik i mianownik całkowity, a następnie ich iloraz,
+zgodnie z `Arithmetic::number`. Nie wolno zastępować tego przez bezpośrednie
+`mpfr_set_q`. Każde mnożenie i dodanie iloczynu skalarnego ma osobne
+zaokrąglenie. Model nie oblicza logarytmu, potencjału, prądu ani pola.
+Przypina wersję, hash i ścieżkę rzeczywiście załadowanej libmpfr oraz
+flagi kompilacji operatora wykluczające FMA/fast-math w tym pakiecie.
+
+Dla ukończonych wszystkich face passów, niezerowej powierzchni i
+$A_{\tau f}\geq1$ model pracy wynosi:
+
+```{math}
+:label: antenna-mpfr-canonical-log-divisions
+\begin{aligned}
+E_{\tau f}&=\begin{cases}A_{\tau f}+4,&h_{\tau f}\neq0,\\0,&h_{\tau f}=0,\end{cases}\\
+D_{\tau0}&=2+\sum_f(11+2A_{\tau f}+B_{\tau f}^{(0)}),\\
+D_{\tau1}&=1+\sum_f(41+2A_{\tau f}+B_{\tau f}^{(1)}+E_{\tau f}),\\
+D_{\tau2}&=2+\sum_f(42+2A_{\tau f}+B_{\tau f}^{(2)}+E_{\tau f}).
+\end{aligned}
+```
+
+Stała 11 obejmuje h, trzy d, cancellation, trzy składowe normalnej oraz trzy
+wagi pola. Każdy aktywny fan ma dzielenie projekcji i argumentu log1p.
+Wysoka precyzja konwertuje dodatkowo 29 stałych dokładnych na ścianę;
+$E_{\tau f}$ obejmuje trzy współrzędne qvector, aktywne kąty fanów i kąt
+whole. `scalar_agreement` dodaje jedną konwersję skali w obu wysokich
+precyzjach, a zgodność z binary64 jeszcze jedną w najwyższej. Końcowe
+stałe 2/1/2 obejmują cancellation w redukcji i `precision_result`.
+
+Dla zamrożonych 1865 komórek i 14 targetów model dokładnych znaków przewidział globalnie
+`[2109098, 5972088, 6076542]`. Wartości sum zgadzają się z zachowaną próbą MPFR;
+stara arytmetyka dziesiętna naliczyła o 32 więcej w każdym wysokim poziomie.
+To dowód zgodności sum z modelem, **nie wszystkich pojedynczych znaków**.
+Runtime zapisuje sumy per-target i globalne `by_precision`, a nie pełną
+zaobserwowaną macierz target × precision; różnice mogą się kompensować.
+Nie uznajemy tego modelu za certyfikat błędu pola lub ogólną kwalifikację.
+
+Przed nowym submit należy zamrozić hash weryfikatora, JSON oczekiwań,
+referencyjny bundle i input, bibliotekę, worker i receipt. Nowe badanie
+wymaga 21/21 identycznych payloadów naukowych, zachowania pozostałych
+niezmienników direct diagnostics i dotychczasowych diagnostyk binary64,
+wszystkich trzech `evaluated=true` bez refusal oraz zgodności każdej sumy
+targetu, globalnych trzech liczników precyzji i sumy globalnej z modelem.
+Pozostałe liczniki są równe referencji z wyjątkiem wcześniej wyprowadzonej
+rezerwacji 509 bajtów/target. Zachowujemy wszystkie lokalne/globalne bramki
+80/120, whole/fan, cancellation, SI, finite, underflow i kwantyzacji.
+Zmieniać mogą się wyłącznie jawna wersja arytmetyki, dozwolone teksty wysokiej
+precyzji, wyprowadzone liczniki, czas i RSS. Brak kompletnego dowodu jednej
+obserwacji rzeczywistego workera zatrzymuje promocję do Universe; receipt
+musi wiązać również załadowany SONAME z tym samym hashem pakietu.
+
+Mapa źródeł: `surface_rt0.cpp + face_pass/Arithmetic/scalar_agreement/evaluate_surface_rt0`
+oraz `scripts/test_antenna_surface_log_branch_model.py + canonical_division_counts/read_bundle`.
+Weryfikator jest narzędziem testowym, nie solverem ani publicznym parametrem.
+Python DSL, ProblemIR, planowanie, jednostki, źródło, publikacja i archiwa
+nie zmieniają semantyki. Zakres dotyczy FEM CPU; FDM CPU, FDM GPU i FEM GPU
+nie otrzymują realizacji lub kwalifikacji. Brak B–C–B i szerokich geometrii
+nadal blokuje deklarację ogólnego przyspieszenia i kwalifikacji naukowej.
+
 #### Pełne parametry prywatnego wywołania
 
 Poniższe typy C++ nie są nowym publicznym Python API. Wszystkie argumenty są
@@ -11222,12 +11566,12 @@ Pomiar RSS jest **próbkowaniem szczytu procesu, nie twardym limitem alokatora**
 Możliwe jest przekroczenie pomiędzy guardami. Konserwatywny bound surowych
 integer może odmówić jeszcze przed alokacją. Żaden licznik nie jest pełnym
 zliczeniem arytmetyki CPython/libmp/Boost, wszystkich kopii ani heap;
-`sizeof(cpp_rational)` nie jest deklarowany jako wykorzystanie pamięci.
+`sizeof(Exact)` nie jest deklarowany jako wykorzystanie pamięci.
 Błąd callbacku nie powoduje zastępczej metody ani pominięcia kontroli.
 
 | Realizacja | Stan tego rdzenia i pozostały dowód |
 |---|---|
-| FEM CPU | Źródła, przeglądy i zarządzana kompilacja wykonane; wywołanie, weighted RT0 i niezależna walidacja3D pozostają NOT VERIFIED. |
+| FEM CPU | Zarządzane wykonanie i parytet V/J/H dla 14 targetów potwierdzone; niezależne całkowanie retained J sprawdza te zewnętrzne punkty. Pełny Universe, próbki wewnątrz źródła i ogólna kwalifikacja pozostają NOT VERIFIED. |
 | FEM GPU | Brak realizacji surfaceRT0 i dowodów urządzeniowych; kompilacja wspólnej biblioteki nie oznacza parytetu GPU. |
 | FDM CPU | Nie jest nową ścieżką solvera FDM; brak aktywacji, przeniesienia i kwalifikacji przez sam rdzeń. |
 | FDM GPU | Brak realizacji i kwalifikacji urządzeniowej; bez cichego fallbacku. |

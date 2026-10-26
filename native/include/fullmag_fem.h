@@ -1498,6 +1498,31 @@ FULLMAG_FEM_API int fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1(
     fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
     fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source);
 
+/* Optional caller-owned diagnostics, separate from scientific surface evidence.
+ * The legacy symbol remains unprofiled. A profile is available after kernel
+ * entry even when the native call refuses; no partial H is thereby published.
+ * Phase order: source_prepare, exact_geometry, binary64, precision80,
+ * precision120, consistency, reduction, serialization, unattributed. */
+#define FULLMAG_FEM_SURFACE_RT0_PROFILE_ABI_VERSION 1u
+#define FULLMAG_FEM_SURFACE_RT0_PROFILE_PHASE_COUNT 9u
+typedef struct {
+    uint32_t abi_version, reserved_flags;
+    uint64_t struct_size;
+    uint64_t available, accounting_issue;
+    uint64_t operator_wall_time_ns;
+    uint64_t phase_wall_time_ns[9];
+} fullmag_fem_surface_rt0_profile_result_v1;
+#if defined(__cplusplus) && INTPTR_MAX == INT64_MAX
+static_assert(sizeof(fullmag_fem_surface_rt0_profile_result_v1) == 112, "surface profile ABI");
+static_assert(offsetof(fullmag_fem_surface_rt0_profile_result_v1, phase_wall_time_ns) == 40, "surface profile phase ABI");
+#endif
+FULLMAG_FEM_API int fullmag_fem_solve_prepared_closed_loop_rt0_surface_profiled_v1(
+    const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
+    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source,
+    fullmag_fem_surface_rt0_profile_result_v1 *profile);
+
 
 
 typedef struct {

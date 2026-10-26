@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const SCHEMA: &str = "fem_rt0_surface_evidence.v1";
 pub(crate) const SNAPSHOT_SCHEMA: &str = "fem_rt0_surface_snapshot.v1";
-pub(crate) const OPERATOR_VERSION: &str = "fem_oersted_rt0_surface.inspection.v1";
+pub(crate) const OPERATOR_VERSION: &str = "fem_oersted_rt0_surface.mpfr128_160_rndn_etoff.inspection.v1";
+const LEGACY_OPERATOR_VERSION: &str = "fem_oersted_rt0_surface.inspection.v1";
 pub(crate) const BASIS_VERSION: &str = "fem_generic_affine_rt0.v1";
 const MAGIC: &[u8; 16] = b"FM-RT0-SURF-V1\0\0";
 const HEADER: usize = 176;
@@ -276,7 +277,7 @@ impl SurfaceRt0Snapshot {
         let report = &self.work_report;
         let t = &self.tolerances;
         if self.schema_version != SNAPSHOT_SCHEMA
-            || self.operator_version != OPERATOR_VERSION
+            || !matches!(self.operator_version.as_str(), OPERATOR_VERSION | LEGACY_OPERATOR_VERSION)
             || self.basis_version != BASIS_VERSION
             || !self.inspection_only
             || self.error_certificate_available

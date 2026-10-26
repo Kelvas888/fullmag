@@ -40658,6 +40658,63 @@
         },
         "type": "object"
       },
+      "SolverProfileOperationResource": {
+        "properties": {
+          "accounting_issue": {
+            "type": "boolean"
+          },
+          "execution_config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SolverProfileCommandConfig",
+                "description": "Immutable configuration that produced this operation sample. The\nenclosing resource config may describe a later admission request."
+              }
+            ]
+          },
+          "native_operator_wall_ns": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "phases": {
+            "items": {
+              "$ref": "#/components/schemas/SolverProfilePhaseResource"
+            },
+            "type": "array"
+          },
+          "sequence": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_wall_time_ns": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "operation_id",
+          "outcome",
+          "total_wall_time_ns",
+          "phases",
+          "accounting_issue"
+        ],
+        "type": "object"
+      },
       "SolverProfileOverheadDiagnosticsResource": {
         "properties": {
           "heartbeat_seed_deep_clone_count": {
@@ -40809,6 +40866,12 @@
                 "$ref": "#/components/schemas/LivePublisherDiagnosticsResource"
               }
             ]
+          },
+          "operation_samples": {
+            "items": {
+              "$ref": "#/components/schemas/SolverProfileOperationResource"
+            },
+            "type": "array"
           },
           "overhead": {
             "$ref": "#/components/schemas/SolverProfileOverheadDiagnosticsResource"

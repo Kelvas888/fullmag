@@ -772,6 +772,72 @@ time. The profile resource is opt-in and bounded; missing timing samples are
 represented by zero counters plus an empty semantic list and are not evidence
 that a zero-time operation was measured.
 
+#### Opcjonalny profil zaakceptowanej operacji anteny
+
+Istniejące `set_solver_profile` oraz `diagnostics/solver-profile` obejmują
+również jednorazowe obliczenie zamkniętego obwodu z operatorem analytic RT0
+surface. Jest to diagnostyka, nie zmiana `ProblemIR`, fizyki, tolerancji,
+polityki pola ani naukowego bundla V/J/H. Brak konfiguracji zachowuje OFF:
+nie powstaje próbka operacji ani dodatkowy pomiar zegara natywnego profilera.
+Istniejący protokół poleceń workera v4 pozostaje niezmieniony.
+
+W runtime API-only polecenie konfiguruje **następne admission**, nigdy przyjęty
+już RunIntent. Znormalizowana konfiguracja jest utrwalana w istniejącym
+command journal. Przy admission kopiowana jest do niezmiennego
+`RunSpecification.parameters.solver_profile`:
+
+```json
+{"schema_version":"accepted_solver_profile.v1","config":{"enabled":true,"sample_every":1,"sample_interval_wall_ms":0,"max_samples":128,"emit_engine_log":false,"persist_artifact":true}}
+```
+
+Obsługiwane klucze konfiguracji są dokładnie kluczami `SolverProfileConfig`.
+Nieznane klucze lub wersja są odrzucane. Pierwsza realizacja accepted ON
+wymaga jawnego `persist_artifact=true` i odrzuca `emit_engine_log=true`.
+Obecność tego parametru jest dozwolona wyłącznie dla Study z aktywnymi etapami
+closed-loop inspection; dla LLG/FEM Run/Relax oraz external-lead należy
+usunąć parametr. Brak parametru nie zmienia ich dotychczasowego profilowania.
+
+`SolverProfileState` zachowuje osobny, ograniczony bufor `operation_samples`.
+Nie tworzy fikcyjnego kroku LLG, nie zmienia `latest_samples`, agregatów ani
+liczników szybkości LLG. Jedna zakończona operacja daje jedną próbkę, niezależnie
+od bramek `sample_every` i `sample_interval_wall_ms` dla kroków czasowych.
+Wynik operacji to `completed`, `failed` lub `cancelled`; kontrolowana odmowa
+operatora może zachować częściowe czasy diagnostyczne, bez publikacji
+częściowego wyniku naukowego.
+
+Próbka `antenna.closed_loop.inspect` zawiera całkowity czas monotoniczny
+w ns, opcjonalny czas natywnego operatora oraz wyłączne fazy:
+`antenna.surface.source_prepare`, `exact_geometry`, `binary64`, `precision80`,
+`precision120`, `consistency`, `reduction`, `serialization`, `unattributed`
+(każda nazwa po pierwszej ma ten sam prefiks `antenna.surface.`).
+`unattributed` obejmuje resztę całej operacji runnera, w tym transport i
+opakowanie artefaktów poza mierzonym jądrem. Brak natywnego pomiaru oznacza
+`native_operator_wall_ns=null`, nie pomiar zerowego czasu. Flaga
+`accounting_issue` ujawnia niespójność zegara/sumy zamiast ukrywać ją.
+
+Osobny `worker_operation_profile.v1.json` jest niezmiennym receiptem
+próby: wiąże Run/task/attempt/ownership epoch, tożsamość wykonania oraz digest
+znormalizowanej konfiguracji. Odczyt sprawdza te powiązania, kształt próbki,
+kolejność faz, sumę i procenty. Zapis następuje przed obsługą wyniku operacji;
+błąd zapisu jawnie włączonej diagnostyki blokuje publikację i zachowuje
+pierwotny typowany błąd native jako przyczynę, jeśli taki wystąpił.
+Do bieżącej sesji trafia wyłącznie profil jej własnej zaakceptowanej próby;
+nie wolno podstawiać wyniku obcego headless runu. Aktualna konfiguracja
+następnego admission i konfiguracja wykonanego pomiaru muszą pozostać
+rozróżnialne. Późniejsze Disable nie jest cofane przez projekcję historii.
+
+Właściciele: `accepted_study_worker::accepted_solver_profile::{config,validate_study_profile,persist,load_projection}`
+w `crates/fullmag-api/src/accepted_solver_profile.rs`,
+`execute_antenna_closed_loop_inspection_profiled_typed` w runnerze,
+`SolverProfileState` w `crates/fullmag-runner/src/solver_profile.rs`,
+`SurfaceRt0PhaseReport` w prywatnym jądrze
+`backends/fem/cpu/mfem/interactions/oersted/surface_rt0.hpp`.
+Dodatkowy C ABI `fullmag_fem_solve_prepared_closed_loop_rt0_surface_profiled_v1`
+przyjmuje osobny bufor profilu; stare struktury i stare wywołanie OFF zachowują
+układ. Alias bufora profilu z wejściem lub innym wyjściem jest odrzucany
+przed mutacją. Sam opis i przegląd kodu nie zastępują buildu oraz rzeczywistych
+porównań OFF/ON i pozytywnych/negatywnych sprawdzeń HTTP.
+
 The Study Explorer node and its Inspector consume these typed v2 resources
 through the generated transport, handwritten facade, and resource hooks. They
 do not construct endpoints or reinterpret torque units. HTTP v2 remains the

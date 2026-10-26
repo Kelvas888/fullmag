@@ -1196,18 +1196,27 @@ pub(crate) fn solve_native_fem_steady_transport_rt0(
         identity: Some(&view.identity), pins: Some(&view.pins), closure: &view.closure,
         algebraic_relative_tolerance:view.algebraic_relative_tolerance,physical_relative_gate:view.physical_relative_gate,
         physical_absolute_gate_a:view.physical_absolute_gate_a,reference_mpi_gather_broadcast:view.reference_mpi_gather_broadcast,
-    }, oersted_method,target_points,None,None,None,None)
+    }, oersted_method,target_points,None,None,None,None,None)
 }
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NativeFemSurfaceRt0Profile {
+    pub available: bool,
+    pub accounting_issue: bool,
+    pub operator_wall_time_ns: u64,
+    pub phase_wall_time_ns: [u64; 9],
+}
+
 pub(crate) fn solve_native_fem_prepared_closed_loop(
     request:&NativeFemPreparedClosedLoopChargeRequest,input:&fullmag_ir::ResolvedAntennaClosedLoopCurrentInputIR,
     binding:&PreparedClosedLoopRuntimeBinding,target_points:Option<&[[f64;3]]>,
 )->Result<NativeFemSteadyTransportRt0Result,RunError>{
-    solve_native_fem_prepared_closed_loop_classified(request,input,binding,target_points,None)
+    solve_native_fem_prepared_closed_loop_classified(request,input,binding,target_points,None,None)
 }
 pub(crate) fn solve_native_fem_prepared_closed_loop_classified(
     request:&NativeFemPreparedClosedLoopChargeRequest,input:&fullmag_ir::ResolvedAntennaClosedLoopCurrentInputIR,
     binding:&PreparedClosedLoopRuntimeBinding,target_points:Option<&[[f64;3]]>,
     native_failure:Option<&mut Option<crate::antenna_field_solution::closed_loop_execution::KnownNativeCallFailure>>,
+    surface_profile:Option<&mut NativeFemSurfaceRt0Profile>,
 )->Result<NativeFemSteadyTransportRt0Result,RunError>{
     let (method, direct_budget, surface_policy) = match input.stage.oersted_realization {
         fullmag_ir::AntennaOerstedRealizationIR::DirectTetraQuadrature => {
@@ -1253,11 +1262,14 @@ pub(crate) fn solve_native_fem_prepared_closed_loop_classified(
         }
         _ => return Err(RunError { message: "prepared closed-loop method is unsupported".into() }),
     };
+    if surface_profile.is_some() && method != NativeFemSteadyTransportOerstedMethod::AnalyticRt0Surface {
+        return Err(RunError { message: "operation profiling requires the analytic RT0 surface method".into() });
+    }
     let prepared=prepared_closed_loop::PreparedRequestBuffer::new(input,binding,request)?;
     solve_rt0_common(Rt0NumericInput{mesh:&request.mesh,charge_conductivity_spm_per_element:&request.charge_conductivity_spm_per_element,gauge:request.gauge,relative_tolerance:request.relative_tolerance,absolute_tolerance:request.absolute_tolerance,maximum_iterations:request.maximum_iterations,legacy:None},Rt0InputView{stable_vertex_ids:&input.source.stable_vertex_ids,boundary_faces:&input.boundary_roles,
         identity:None,pins:None,closure:&input.source.closure,algebraic_relative_tolerance:input.algebraic_relative_tolerance,
         physical_relative_gate:input.physical_relative_gate,physical_absolute_gate_a:input.physical_absolute_gate_a,
-        reference_mpi_gather_broadcast:false},method,target_points,Some(prepared),direct_budget,surface_policy,native_failure)
+        reference_mpi_gather_broadcast:false},method,target_points,Some(prepared),direct_budget,surface_policy,native_failure,surface_profile)
 }
 struct Rt0NumericInput<'a>{mesh:&'a MeshIR,charge_conductivity_spm_per_element:&'a [f64],gauge:NativeFemSteadyTransportGauge,relative_tolerance:f64,absolute_tolerance:f64,maximum_iterations:u32,legacy:Option<&'a NativeFemSteadyTransportRequest>}
 impl<'a> Rt0NumericInput<'a>{fn legacy(r:&'a NativeFemSteadyTransportRequest)->Self{Self{mesh:&r.mesh,charge_conductivity_spm_per_element:&r.charge_conductivity_spm_per_element,gauge:r.gauge,relative_tolerance:r.relative_tolerance,absolute_tolerance:r.absolute_tolerance,maximum_iterations:r.maximum_iterations,legacy:Some(r)}}}
@@ -1271,7 +1283,8 @@ fn solve_rt0_common(request:Rt0NumericInput<'_>,view:Rt0InputView<'_>,oersted_me
     target_points:Option<&[[f64;3]]>, mut prepared:Option<prepared_closed_loop::PreparedRequestBuffer<'_>>,
     direct_budget:Option<fullmag_ir::AntennaClosedLoopDirectBudgetIR>,
     surface_policy:Option<&fullmag_ir::AntennaSurfaceFieldPolicyIR>,
-    native_failure:Option<&mut Option<crate::antenna_field_solution::closed_loop_execution::KnownNativeCallFailure>>) -> Result<NativeFemSteadyTransportRt0Result,RunError> {
+    native_failure:Option<&mut Option<crate::antenna_field_solution::closed_loop_execution::KnownNativeCallFailure>>,
+    mut surface_profile:Option<&mut NativeFemSurfaceRt0Profile>) -> Result<NativeFemSteadyTransportRt0Result,RunError> {
     let surface = oersted_method == NativeFemSteadyTransportOerstedMethod::AnalyticRt0Surface;
     if surface && (prepared.is_none() || surface_policy.is_none() || target_points.is_none_or(|points| points.is_empty())) {
         return Err(RunError { message: "RT0 surface requires prepared closed-loop inspection, explicit policy and targets".into() });
@@ -1772,8 +1785,33 @@ fn solve_rt0_common(request:Rt0NumericInput<'_>,view:Rt0InputView<'_>,oersted_me
                 rt0:prepared.descriptor(&request_ffi), target_points_xyz:flat_points.as_ptr(),
                 target_points_xyz_len:flat_points.len() as u64, options:buffer.options(),
             };
-            let status = unsafe { ffi::fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1(
-                &surface_request, &mut buffer.header, &mut charge_snapshot_ffi, &mut prepared.outer) };
+            let status = if let Some(profile) = surface_profile.as_deref_mut() {
+                let mut native_profile = ffi::fullmag_fem_surface_rt0_profile_result_v1 {
+                    abi_version: ffi::FULLMAG_FEM_SURFACE_RT0_PROFILE_ABI_VERSION,
+                    reserved_flags: 0,
+                    struct_size: std::mem::size_of::<ffi::fullmag_fem_surface_rt0_profile_result_v1>() as u64,
+                    ..Default::default()
+                };
+                // The profile is a separate, disjoint fixed buffer. The native
+                // call fills it on controlled refusal as well as success.
+                let status = unsafe { ffi::fullmag_fem_solve_prepared_closed_loop_rt0_surface_profiled_v1(
+                    &surface_request, &mut buffer.header, &mut charge_snapshot_ffi, &mut prepared.outer,
+                    &mut native_profile) };
+                if native_profile.abi_version != ffi::FULLMAG_FEM_SURFACE_RT0_PROFILE_ABI_VERSION
+                    || native_profile.reserved_flags != 0
+                    || native_profile.struct_size != std::mem::size_of::<ffi::fullmag_fem_surface_rt0_profile_result_v1>() as u64
+                    || native_profile.available > 1 || native_profile.accounting_issue > 1 {
+                    return Err(RunError { message: "native surface profile ABI mismatch".into() });
+                }
+                profile.available = native_profile.available == 1;
+                profile.accounting_issue = native_profile.accounting_issue == 1;
+                profile.operator_wall_time_ns = native_profile.operator_wall_time_ns;
+                profile.phase_wall_time_ns = native_profile.phase_wall_time_ns;
+                status
+            } else {
+                unsafe { ffi::fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1(
+                    &surface_request, &mut buffer.header, &mut charge_snapshot_ffi, &mut prepared.outer) }
+            };
             result_ffi = buffer.header.rt0;
             surface_result_ffi = Some(buffer);
             status

@@ -15258,6 +15258,19 @@ export interface components {
             /** Format: int64 */
             sample_interval_wall_ms?: number;
         };
+        SolverProfileOperationResource: {
+            accounting_issue: boolean;
+            execution_config?: null | components["schemas"]["SolverProfileCommandConfig"];
+            /** Format: int64 */
+            native_operator_wall_ns?: number | null;
+            operation_id: string;
+            outcome: string;
+            phases: components["schemas"]["SolverProfilePhaseResource"][];
+            /** Format: int64 */
+            sequence: number;
+            /** Format: int64 */
+            total_wall_time_ns: number;
+        };
         SolverProfileOverheadDiagnosticsResource: {
             /** Format: int64 */
             heartbeat_seed_deep_clone_count?: number;
@@ -15304,6 +15317,7 @@ export interface components {
             config: components["schemas"]["SolverProfileCommandConfig"];
             latest_samples: components["schemas"]["SolverProfileStepSampleResource"][];
             live_publisher?: null | components["schemas"]["LivePublisherDiagnosticsResource"];
+            operation_samples?: components["schemas"]["SolverProfileOperationResource"][];
             overhead?: components["schemas"]["SolverProfileOverheadDiagnosticsResource"];
             persistence_failed?: boolean;
             preview_3d_disabled?: boolean;

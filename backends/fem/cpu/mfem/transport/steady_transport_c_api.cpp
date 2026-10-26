@@ -40,6 +40,8 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
+#include "cpu/mfem/interactions/oersted/surface_rt0.hpp"
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -2161,7 +2163,8 @@ int solve_rt0(
     const fullmag_fem_prepared_closed_loop_request_v2 *prepared_request = nullptr,
     fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *prepared_snapshot = nullptr,
     const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *surface_request = nullptr,
-    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *surface_result = nullptr)
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *surface_result = nullptr,
+    fullmag::fem::oersted::SurfaceRt0PhaseReport *phase_report = nullptr)
 {
     validate_rt0_header(request, result);
     const bool coincident = request.closure_kind == FULLMAG_FEM_STEADY_TRANSPORT_RT0_CLOSURE_CLOSED_GEOMETRY &&
@@ -2669,7 +2672,7 @@ int solve_rt0(
     if (surface_request && surface_result) {
         rt0_require(prepared_snapshot != nullptr,"surface RT0 requires the accepted prepared source snapshot");
         fullmag::fem::antenna_field_solve::evaluate_accepted_surface_rt0(*view,
-            prepared_snapshot->accepted_source_state_digest,*surface_request,*surface_result);
+            prepared_snapshot->accepted_source_state_digest,*surface_request,*surface_result,phase_report);
     }
     if (charge_snapshot != nullptr) {
         const auto &potential = *view->charge_potential_vertex_values_v();
@@ -3324,7 +3327,8 @@ bool surface_ranges_are_disjoint(
     const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,
     fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
     fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
-    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source)
+    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source,
+    fullmag_fem_surface_rt0_profile_result_v1 *profile)
 {
     if(!request || request->abi_version!=FULLMAG_FEM_SURFACE_RT0_ABI_VERSION ||
         request->reserved_flags!=0 || request->struct_size!=sizeof(*request))return false;
@@ -3337,6 +3341,8 @@ bool surface_ranges_are_disjoint(
     if(!result || !charge || !source || result->struct_size!=sizeof(*result) ||
         result->rt0.struct_size!=sizeof(result->rt0) || charge->struct_size!=sizeof(*charge) ||
         source->source.struct_size!=sizeof(*source))return false;
+    if(profile && (profile->abi_version!=FULLMAG_FEM_SURFACE_RT0_PROFILE_ABI_VERSION ||
+        profile->reserved_flags!=0 || profile->struct_size!=sizeof(*profile)))return false;
     struct Range {std::uintptr_t begin,end;};
     std::vector<Range> outputs;
     const auto range=[](const void *p,std::uint64_t n,std::uint64_t stride,Range &r){
@@ -3363,6 +3369,7 @@ bool surface_ranges_are_disjoint(
         !output(source->source.cells,source->source.cells_capacity,sizeof(*source->source.cells)) ||
         !output(source->source.paired_weak_reactions,source->source.paired_weak_reactions_capacity,sizeof(*source->source.paired_weak_reactions)) ||
         !output(source->canonical_balance_certificate_bytes,source->canonical_balance_certificate_capacity,1))return false;
+    if(profile && !output(profile,1,sizeof(*profile)))return false;
     const auto input=[&](const void *p,std::uint64_t n,std::uint64_t stride){
         if(n==0)return true;Range r{};if(!range(p,n,stride,r))return false;
         for(auto o:outputs)if(overlaps(o,r))return false;return true;
@@ -3505,16 +3512,37 @@ extern "C" int fullmag_fem_solve_prepared_closed_loop_rt0_oersted_v2(
     });
 }
 
-extern "C" int fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1(
+static int solve_prepared_closed_loop_rt0_surface(
     const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,
     fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
     fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
-    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source)
+    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source,
+    fullmag_fem_surface_rt0_profile_result_v1 *profile)
 {
     // Alias refusal is deliberately mutation-free, including error strings.
     try {
-        if(!surface_ranges_are_disjoint(request,result,charge,source))return FULLMAG_FEM_ERR_INVALID;
+        if(!surface_ranges_are_disjoint(request,result,charge,source,profile))return FULLMAG_FEM_ERR_INVALID;
     } catch (...) { return FULLMAG_FEM_ERR_INTERNAL; }
+    if(profile) {
+        profile->available=0;profile->accounting_issue=0;profile->operator_wall_time_ns=0;
+        std::memset(profile->phase_wall_time_ns,0,sizeof(profile->phase_wall_time_ns));
+    }
+#if FULLMAG_HAS_MFEM_STACK
+    std::optional<fullmag::fem::oersted::SurfaceRt0PhaseReport> phases;
+    if(profile)phases.emplace();
+    struct ProfileExport {
+        fullmag_fem_surface_rt0_profile_result_v1 *target;
+        fullmag::fem::oersted::SurfaceRt0PhaseReport *report;
+        ~ProfileExport() noexcept {
+            if(!target || !report)return;
+            static_assert(fullmag::fem::oersted::surface_rt0_phase_count==FULLMAG_FEM_SURFACE_RT0_PROFILE_PHASE_COUNT);
+            target->available=report->started?1:0;
+            target->accounting_issue=report->accounting_issue?1:0;
+            target->operator_wall_time_ns=report->total_wall_time_ns;
+            std::copy(report->wall_time_ns.begin(),report->wall_time_ns.end(),target->phase_wall_time_ns);
+        }
+    } profile_export{profile,phases?&*phases:nullptr};
+#endif
     // Headers may be malformed, but all complete, disjoint metadata is safe to
     // clear. In particular, an invalid source ABI must not retain old digests.
     set_error(result,"");set_error(charge,"");set_error(&source->source,"");
@@ -3541,10 +3569,31 @@ extern "C" int fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1(
         fullmag::fem::antenna_field_solve::validate_surface_rt0_request(*request);
         const auto adapter=prepared_rt0_adapter(request->rt0);
         return solve_rt0(adapter,result->rt0,nullptr,nullptr,nullptr,nullptr,charge,nullptr,
-            &source->source,&request->rt0,source,request,result);
+            &source->source,&request->rt0,source,request,result,phases?&*phases:nullptr);
 #else
         set_error(result,"surface RT0 requires FULLMAG_USE_MFEM_STACK=ON");
         return FULLMAG_FEM_ERR_UNAVAILABLE;
 #endif
     });
+}
+
+
+extern "C" int fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1(
+    const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
+    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source)
+{
+    return solve_prepared_closed_loop_rt0_surface(request,result,charge,source,nullptr);
+}
+
+extern "C" int fullmag_fem_solve_prepared_closed_loop_rt0_surface_profiled_v1(
+    const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
+    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source,
+    fullmag_fem_surface_rt0_profile_result_v1 *profile)
+{
+    if(!profile)return FULLMAG_FEM_ERR_INVALID;
+    return solve_prepared_closed_loop_rt0_surface(request,result,charge,source,profile);
 }

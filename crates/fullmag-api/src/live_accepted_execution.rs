@@ -292,6 +292,7 @@ pub(crate) async fn submit_live_command_with_transition(
     let captured_context = context.clone();
     let command = command.clone();
 
+    let solver_profile = next_solver_profile_admission_config(state, context).await?;
     let prepared = tokio::task::spawn_blocking(move || {
         prepare_live_accepted(
             &repo_root,
@@ -309,6 +310,7 @@ pub(crate) async fn submit_live_command_with_transition(
                 previous_run_id,
             },
             None,
+            solver_profile,
         )
     })
     .await
@@ -844,6 +846,7 @@ async fn prepare_live_study_with_source_paths(
     let api_instance_id = state.request_scope_instance_id.clone();
     let backlog_limit = state.submit_backlog_limit;
     let captured_context = context.clone();
+    let solver_profile = next_solver_profile_admission_config(state, context).await?;
     let prepared = tokio::task::spawn_blocking(move || {
         prepare_live_accepted(
             &repo_root,
@@ -862,6 +865,7 @@ async fn prepare_live_study_with_source_paths(
                 source_path,
             },
             progress_sender,
+            solver_profile,
         )
     })
     .await
@@ -1399,6 +1403,7 @@ fn materialize_live_accepted(
         source_script_path,
         submission,
         None,
+        None,
     )?;
     commit_prepared_live_accepted(&prepared)
 }
@@ -1506,6 +1511,7 @@ fn prepare_live_accepted(
     source_script_path: Option<PathBuf>,
     submission: LiveAcceptedSubmission,
     progress_sender: Option<tokio::sync::mpsc::Sender<crate::script::PythonHelperProgress>>,
+    solver_profile: Option<fullmag_runner::SolverProfileConfig>,
 ) -> Result<PreparedLiveAcceptedStudy, ApiError> {
     let queue_tasks = match &submission {
         LiveAcceptedSubmission::Command { .. } => true,
@@ -2107,6 +2113,12 @@ fn prepare_live_accepted(
             "startup_source_sha256": &startup_source_sha256,
         }
     });
+    if let Some(config) = solver_profile {
+        parameters.as_object_mut().expect("RunSpec parameters object").insert(
+            crate::accepted_solver_profile::PARAMETER.into(),
+            crate::accepted_solver_profile::parameter(config)
+                .map_err(|error| ApiError::unprocessable(error.to_string()))?);
+    }
     if let Some(initial_state) = initial_state {
         parameters["live_workspace"]
             .as_object_mut()
@@ -2125,6 +2137,8 @@ fn prepare_live_accepted(
                 }),
             );
     }
+    crate::accepted_solver_profile::validate_study_profile(&parameters, &study)
+        .map_err(|error| ApiError::unprocessable_with_code("accepted_solver_profile_unsupported", error.to_string()))?;
     let intent_id = request_idempotency_key
         .as_deref()
         .map(|key| format!("live-http-{}", fullmag_session::hex_sha256(key.as_bytes())))
@@ -3431,4 +3445,42 @@ fn has_closed_loop_inspection_pipeline(scene: &fullmag_authoring::SceneDocument)
         })
     }
     scene.study.study_pipeline.as_ref().is_some_and(|pipeline| enabled_closed_antenna(scene, &pipeline.nodes))
+}
+
+async fn next_solver_profile_admission_config(state: &Arc<crate::types::AppState>,
+    context: &crate::types::CurrentLiveRequestContext,
+) -> Result<Option<fullmag_runner::SolverProfileConfig>, crate::error::ApiError> {
+    let fallback_config = {
+        let guard = state.current_live_state.read().await;
+        let snapshot = guard.as_ref().ok_or_else(|| crate::error::ApiError::not_found("no current workspace"))?;
+        crate::ensure_current_live_request_context(snapshot, context,
+            state.current_live_session_epoch.load(std::sync::atomic::Ordering::Acquire))?;
+        snapshot.solver_profile.config.clone()
+    };
+    // The journal is recovered only for this exact session identity. Read its
+    // last completed configuration so a crash after the durable ACK cannot
+    // silently lose the requested next-admission diagnostics.
+    let configured = {
+        let ledger = state.current_command_ledger.lock().await;
+        ledger.iter().rev().find(|record| record.command.kind == "set_solver_profile"
+            && record.status == crate::types::CommandLifecycleState::Completed)
+            .and_then(|record| record.command.profile.clone())
+    };
+    // No live-state lock is held while awaiting the ledger. Refuse a session
+    // replacement that happened while waiting rather than borrowing its config.
+    crate::validate_current_live_request_context(state, context).await?;
+    let value = if let Some(value) = configured {
+        value
+    } else {
+        if !fallback_config.enabled { return Ok(None); }
+        serde_json::to_value(&fallback_config)
+            .map_err(|error| crate::error::ApiError::internal(error.to_string()))?
+    };
+    let configuration: fullmag_runner::SolverProfileConfig = serde_json::from_value(value)
+        .map_err(|error| crate::error::ApiError::internal(error.to_string()))?;
+    if !configuration.enabled { return Ok(None); }
+    let value = crate::accepted_solver_profile::parameter(configuration).map_err(|error| crate::error::ApiError::unprocessable(error.to_string()))?;
+    let mut parameters = serde_json::Map::new();
+    parameters.insert(crate::accepted_solver_profile::PARAMETER.into(), value);
+    crate::accepted_solver_profile::config(&serde_json::Value::Object(parameters)).map_err(|error| crate::error::ApiError::unprocessable(error.to_string()))
 }

@@ -11,6 +11,7 @@ mod accepted_observation_spool;
 mod error;
 #[path = "accepted_study_worker.rs"]
 mod accepted_study_worker;
+use accepted_study_worker::accepted_solver_profile;
 mod accepted_project_storage;
 
 mod worker_startup_gate;

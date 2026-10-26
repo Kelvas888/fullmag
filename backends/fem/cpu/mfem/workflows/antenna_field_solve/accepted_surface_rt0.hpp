@@ -11,5 +11,6 @@ void evaluate_accepted_surface_rt0(
     const transport::ConservativeCurrentView &view,
     const char *accepted_source_state_digest,
     const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 &request,
-    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 &result);
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 &result,
+    oersted::SurfaceRt0PhaseReport *phase_report = nullptr);
 } // namespace fullmag::fem::antenna_field_solve

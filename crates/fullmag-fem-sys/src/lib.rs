@@ -7122,6 +7122,25 @@ extern "C" {
 
 pub const FULLMAG_FEM_SURFACE_RT0_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_SURFACE_RT0_WORK_KIND_COUNT: usize = 14;
+pub const FULLMAG_FEM_SURFACE_RT0_PROFILE_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_SURFACE_RT0_PROFILE_PHASE_COUNT: usize = 9;
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fullmag_fem_surface_rt0_profile_result_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub available: u64,
+    pub accounting_issue: u64,
+    pub operator_wall_time_ns: u64,
+    pub phase_wall_time_ns: [u64; 9],
+}
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<fullmag_fem_surface_rt0_profile_result_v1>() == 112);
+    assert!(std::mem::offset_of!(fullmag_fem_surface_rt0_profile_result_v1, phase_wall_time_ns) == 40);
+};
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct fullmag_fem_surface_rt0_work_limits_v1 {
@@ -7197,5 +7216,12 @@ extern "C" {
         result: *mut fullmag_fem_prepared_closed_loop_rt0_surface_result_v1,
         charge: *mut fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
         source: *mut fullmag_fem_prepared_closed_loop_source_snapshot_result_v2,
+    ) -> i32;
+    pub fn fullmag_fem_solve_prepared_closed_loop_rt0_surface_profiled_v1(
+        request: *const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1,
+        result: *mut fullmag_fem_prepared_closed_loop_rt0_surface_result_v1,
+        charge: *mut fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
+        source: *mut fullmag_fem_prepared_closed_loop_source_snapshot_result_v2,
+        profile: *mut fullmag_fem_surface_rt0_profile_result_v1,
     ) -> i32;
 }

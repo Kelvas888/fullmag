@@ -23,6 +23,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[path = "accepted_solver_profile.rs"]
+pub(crate) mod accepted_solver_profile;
+
 #[path = "accepted_worker_execution_receipt.rs"]
 mod accepted_worker_execution_receipt;
 use accepted_worker_execution_receipt::{
@@ -518,12 +521,18 @@ fn accepted_live_magnetization_domain(
 fn validate_accepted_worker_parameters(
     parameters: &serde_json::Value,
     accepted_step_id: &str,
+    allow_operation_profile: bool,
 ) -> Result<()> {
+    if parameters.get(crate::accepted_solver_profile::PARAMETER).is_some() && !allow_operation_profile {
+        bail!("solver_profile is supported only for accepted closed-loop inspection");
+    }
+    crate::accepted_solver_profile::config(parameters)?;
     let parameters = parameters
         .as_object()
         .context("accepted worker RunSpec parameters must be an object")?;
     for key in parameters.keys() {
-        if key != "live_workspace" && key != fullmag_session::ACCEPTED_RUN_START_POLICY_KEY {
+        if key != "live_workspace" && key != fullmag_session::ACCEPTED_RUN_START_POLICY_KEY
+            && key != crate::accepted_solver_profile::PARAMETER {
             bail!("accepted worker has no binding for RunSpec parameter `{key}`");
         }
     }
@@ -1317,7 +1326,7 @@ fn ensure_real_child_directory(parent: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn existing_private_attempt_output_dir(
+pub(crate) fn existing_private_attempt_output_dir(
     store: &SessionStore,
     claim: &fullmag_application::TaskClaim,
 ) -> Result<PathBuf> {
@@ -1338,7 +1347,7 @@ fn existing_private_attempt_output_dir(
     require_real_directory(&attempt_root.join(format!("epoch-{}", claim.ownership_epoch.value())))
 }
 
-fn write_immutable_attempt_receipt<T: Serialize>(
+pub(crate) fn write_immutable_attempt_receipt<T: Serialize>(
     attempt_output_dir: &Path,
     file_name: &str,
     receipt: &T,
@@ -1360,7 +1369,7 @@ fn write_immutable_attempt_receipt<T: Serialize>(
     Ok(())
 }
 
-fn read_attempt_receipt<T: serde::de::DeserializeOwned>(
+pub(crate) fn read_attempt_receipt<T: serde::de::DeserializeOwned>(
     attempt_output_dir: &Path,
     file_name: &str,
 ) -> Result<Option<T>> {
@@ -1383,7 +1392,7 @@ fn read_attempt_receipt<T: serde::de::DeserializeOwned>(
     Ok(Some(receipt))
 }
 
-fn worker_execution_receipt_identity(
+pub(crate) fn worker_execution_receipt_identity(
     start: &fullmag_application::WorkerCommandEnvelope,
     accepted_step: &AcceptedWorkerStep,
     case_id: &str,
@@ -2423,7 +2432,7 @@ fn execute_accepted_worker_start_with_snapshot(
     }
     // Validate the same bounded RunSpec metadata before backend dispatch;
     // FEM must not bypass the live-workspace/start-policy binding guard.
-    validate_accepted_worker_parameters(&specification.parameters, &accepted_step.step_id)?;
+    validate_accepted_worker_parameters(&specification.parameters, &accepted_step.step_id, false)?;
     if request.backend == "fem" {
         crate::accepted_fem_study_worker::validate_declared_outputs(&study_step.outputs)
             .context("validate accepted FEM output contract before recovery or reservation")?;
@@ -2733,11 +2742,20 @@ pub(crate) fn validate_accepted_inspection_run_parameters(
     specification: &fullmag_application::RunSpecification,
     step_id: &str,
 ) -> Result<()> {
-    validate_accepted_worker_parameters(&specification.parameters, step_id)?;
+    validate_inspection_run_parameters(specification, step_id, false)
+}
+
+fn validate_inspection_run_parameters(
+    specification: &fullmag_application::RunSpecification,
+    step_id: &str,
+    allow_operation_profile: bool,
+) -> Result<()> {
+    validate_accepted_worker_parameters(&specification.parameters, step_id, allow_operation_profile)?;
     let parameters = specification.parameters.as_object()
         .context("inspection RunSpec parameters must be an object")?;
     if parameters.keys().any(|key| {
         key != "live_workspace" && key != fullmag_session::ACCEPTED_RUN_START_POLICY_KEY
+            && key != crate::accepted_solver_profile::PARAMETER
     }) {
         bail!("accepted inspection has no binding for physical RunSpec parameters");
     }
@@ -2815,7 +2833,7 @@ fn execute_accepted_closed_loop_worker_start(
         || !accepted.run.specification.seeds.is_empty() || !accepted_step.problem.problem_meta.seeds.is_empty() {
         bail!("accepted inspection requires v4 FEM CPU/auto strict double, one artifact, no horizon/state/seeds");
     }
-    validate_accepted_inspection_run_parameters(&accepted.run.specification, &study_step.step_id)?;
+    validate_inspection_run_parameters(&accepted.run.specification, &study_step.step_id, true)?;
     if !store.accepted_run_start_permitted(accepted.run.specification.run_id.as_str())? {
         bail!("accepted inspection refuses to execute before explicit Compute release");
     }
@@ -2850,7 +2868,23 @@ fn execute_accepted_closed_loop_worker_start(
     write_immutable_attempt_receipt(&attempt,WORKER_EXECUTION_STARTED_RECEIPT,&WorkerExecutionStartedReceipt {identity:identity.clone()})?;
     let mut storage=prepare_accepted_project_storage(&accepted_step.problem,store,accepted,accepted_step,&identity,&attempt)?;
     let execution:Result<AcceptedRunnerExecution>=(|| {
-        let artifacts=match fullmag_runner::execute_antenna_closed_loop_inspection_typed(&input,&requested_execution,&output_id,interrupt_requested) {
+        let result = if let Some(config) = crate::accepted_solver_profile::config(&accepted.run.specification.parameters)? {
+            let mut profile = fullmag_runner::SolverProfileState::new(config.clone());
+            let result = fullmag_runner::execute_antenna_closed_loop_inspection_profiled_typed(
+                &input, &requested_execution, &output_id, interrupt_requested, &config, &mut profile);
+            if let Err(error) = crate::accepted_solver_profile::persist(&attempt, &identity, &profile) {
+                // Explicit persisted profiling is a diagnostic contract. Refuse
+                // publication on failure, retaining the original native cause.
+                return Err(match result {
+                    Ok(_) => error.context("persist accepted operation diagnostics before terminal outcome"),
+                    Err(native) => anyhow::Error::new(native).context(format!("operation diagnostics persistence also failed: {error:#}")),
+                });
+            }
+            result
+        } else {
+            fullmag_runner::execute_antenna_closed_loop_inspection_typed(&input,&requested_execution,&output_id,interrupt_requested)
+        };
+        let artifacts=match result {
             Ok(artifacts)=>artifacts,
             Err(_error) if interrupt_requested.is_some_and(|flag|flag.load(Ordering::Acquire))=>return Ok(AcceptedRunnerExecution {
         terminal_publication: None,status:RunStatus::Cancelled,completed_step_count:0,outputs:vec![],attempt_output_dir:attempt.clone(),recovered_from_receipt:false,accepted_state_ref:None,observation_source:None}),

@@ -1828,6 +1828,96 @@
       "latex": "$d_i$",
       "meaning": "Podpisany licznik współczynnika krawędzi",
       "si_unit": "$\\mathrm{m^4}$"
+    },
+    {
+      "id": "antenna-mpfr-work-indices",
+      "latex": "$\\tau,f,i,j,p$",
+      "meaning": "Target, ściana, skierowane końce krawędzi i poziom precyzji $p=0,1,2$.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-positions",
+      "latex": "$\\mathbf x,\\mathbf v_i,\\mathbf v_j$",
+      "meaning": "Target i oryginalne wierzchołki, dokładnie z zachowanych binary64.",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "antenna-mpfr-work-vectors",
+      "latex": "$\\mathbf r_i,\\mathbf r_j,\\mathbf e_i$",
+      "meaning": "Wektory target–wierzchołek oraz krawędź.",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "antenna-mpfr-work-projections",
+      "latex": "$L_i,\\xi_i,\\eta_i$",
+      "meaning": "Długość krawędzi i dwie projekcje wzdłuż niej.",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "antenna-mpfr-work-branches",
+      "latex": "$b_i^L,b_i^R$",
+      "meaning": "Matematyczne predykaty wyboru racjonalizowanej postaci; nawias oznacza wskaźnik logiczny.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-active",
+      "latex": "$A_{\\tau f}$",
+      "meaning": "Liczba aktywnych fanów, z pominięciem dokładnego `d_zero`.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-branch-count",
+      "latex": "$B_{\\tau f}$",
+      "meaning": "Suma $b_i^L+b_i^R$ po aktywnych fanach.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-height",
+      "latex": "$h_{\\tau f}$",
+      "meaning": "Podpisana odległość od płaszczyzny ściany; zero odpowiada dokładnemu `hnum == 0`.",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "antenna-mpfr-work-conversions",
+      "latex": "$E_{\\tau f}$",
+      "meaning": "Liczba warunkowych konwersji qvector i liczników kątów.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-divisions",
+      "latex": "$D_{\\tau p}$",
+      "meaning": "Przewidywana liczba jawnych `Arithmetic::divide` w targetcie i precyzji.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-scale",
+      "latex": "$s_{\\tau f}$",
+      "meaning": "Dokładna dodatnia potęga dwóch wybrana z maksymalnej składowej geometrii ściany i targetu.",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "antenna-mpfr-work-rounded-vectors",
+      "latex": "$\\widehat{\\mathbf r}_i^{(p)},\\widehat{\\mathbf e}_i^{(p)}$",
+      "meaning": "Skonwertowane i znormalizowane wektory dla danego poziomu arytmetyki.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-rounded-projections",
+      "latex": "$\\widehat L_i^{(p)},\\widehat\\xi_i^{(p)},\\widehat\\eta_i^{(p)}$",
+      "meaning": "Zaokrąglona długość i projekcje użyte tylko do wyboru gałęzi.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-rounded-count",
+      "latex": "$B_{\\tau f}^{(p)}$",
+      "meaning": "Liczba wybranych racjonalizacji po aktywnych fanach w danej arytmetyce.",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "antenna-mpfr-work-rounding",
+      "latex": "$C_p,\\operatorname{fl}_p,\\operatorname{fl}_{p,\\Sigma}$",
+      "meaning": "Konwersja, zaokrąglenie najbliższe z ties-to-even i sekwencyjny iloczyn skalarny bez FMA.",
+      "si_unit": "$1$"
     }
   ],
   "equations": [
@@ -3462,6 +3552,73 @@
       "sources": [
         "antenna-surface-exact-identity-geometry",
         "antenna-surface-exact-identity-regression"
+      ]
+    },
+    {
+      "id": "antenna-mpfr-exact-log-signs",
+      "symbols": [
+        "antenna-mpfr-work-indices",
+        "antenna-mpfr-work-positions",
+        "antenna-mpfr-work-vectors",
+        "antenna-mpfr-work-projections",
+        "antenna-mpfr-work-branches",
+        "antenna-mpfr-work-active",
+        "antenna-mpfr-work-branch-count",
+        "antenna-mpfr-work-height",
+        "antenna-mpfr-work-conversions",
+        "antenna-mpfr-work-divisions"
+      ],
+      "sources": [
+        "antenna-mpfr-work-model",
+        "antenna-mpfr-work-face",
+        "antenna-mpfr-work-consistency"
+      ]
+    },
+    {
+      "id": "antenna-mpfr-canonical-log-divisions",
+      "symbols": [
+        "antenna-mpfr-work-indices",
+        "antenna-mpfr-work-positions",
+        "antenna-mpfr-work-vectors",
+        "antenna-mpfr-work-projections",
+        "antenna-mpfr-work-branches",
+        "antenna-mpfr-work-active",
+        "antenna-mpfr-work-branch-count",
+        "antenna-mpfr-work-height",
+        "antenna-mpfr-work-conversions",
+        "antenna-mpfr-work-divisions",
+        "antenna-mpfr-work-scale",
+        "antenna-mpfr-work-rounded-vectors",
+        "antenna-mpfr-work-rounded-projections",
+        "antenna-mpfr-work-rounded-count",
+        "antenna-mpfr-work-rounding"
+      ],
+      "sources": [
+        "antenna-mpfr-work-model",
+        "antenna-mpfr-work-face",
+        "antenna-mpfr-work-consistency",
+        "antenna-mpfr-work-rounding-model",
+        "antenna-mpfr-work-normalized-model",
+        "antenna-mpfr-work-binary-model"
+      ]
+    },
+    {
+      "id": "antenna-mpfr-rounded-log-signs",
+      "symbols": [
+        "antenna-mpfr-work-indices",
+        "antenna-mpfr-work-vectors",
+        "antenna-mpfr-work-active",
+        "antenna-mpfr-work-scale",
+        "antenna-mpfr-work-rounded-vectors",
+        "antenna-mpfr-work-rounded-projections",
+        "antenna-mpfr-work-rounded-count",
+        "antenna-mpfr-work-rounding"
+      ],
+      "sources": [
+        "antenna-mpfr-work-rounding-model",
+        "antenna-mpfr-work-normalized-model",
+        "antenna-mpfr-work-binary-model",
+        "antenna-mpfr-work-face"
       ]
     }
   ],
@@ -8621,6 +8778,118 @@
       "symbol": "class ExactSurfaceGeometryIdentityTests",
       "responsibility": "2160 porównań Fraction w 540 konfiguracjach, bez uruchomienia native.",
       "evidence_status": "interpreted_identity_only"
+    },
+    {
+      "id": "antenna-surface-gmp-exact-arithmetic",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "class ExactArithmetic",
+      "responsibility": "GMP-backed dokładne operacje z niezmienioną instrumentacją i bitguards.",
+      "evidence_status": "not_verified"
+    },
+    {
+      "id": "antenna-surface-gmp-native-link",
+      "path": "backends/fem/CMakeLists.txt",
+      "symbol": "pkg_check_modules",
+      "responsibility": "Wymagane zależności GMP i MPFR w natywnej realizacji MFEM.",
+      "evidence_status": "not_verified"
+    },
+    {
+      "id": "antenna-surface-gmp-image-package",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-surface-gmp-dev-package",
+      "responsibility": "Jawny kontrakt obrazu GMP, wersji i wymaganych przyszłych dowodów wykonania.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-surface-face-dot-reuse",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "face_pass",
+      "responsibility": "Leniwe lokalne ponowne użycie identycznych iloczynów skalarnych signed-fan i whole-face, bez zmiany precyzji lub równań.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-surface-mpfr-candidate",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-surface-mpfr-candidate",
+      "responsibility": "Preregisterowana realizacja MPFR128/160, jawna tożsamość, zachowanie polityki i obowiązkowe bramki przed promocją.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-surface-mpfr-types",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "evaluate_surface_rt0",
+      "responsibility": "Stałe MPFR128/160 z et_off i compile-time kontrolą pojemności względem dawnych guard limbs.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-surface-mpfr-identity",
+      "path": "backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_surface_rt0.cpp",
+      "symbol": "evaluate_accepted_surface_rt0",
+      "responsibility": "Właściciel ewaluacji i serializacji snapshotu z jawną tożsamością realizacji arytmetycznej.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-surface-mpfr-cold-reader",
+      "path": "crates/fullmag-runner/src/antenna_field_solution/surface_rt0_evidence_v1.rs",
+      "symbol": "SurfaceRt0Snapshot",
+      "responsibility": "Ścisłe rozpoznanie aktualnego i historycznego operatora przy niezmienionych walidacjach payloadu.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-surface-mpfr-native-binding",
+      "path": "crates/fullmag-runner/src/native_fem/surface_rt0.rs",
+      "symbol": "finish",
+      "responsibility": "Świeży output wymaga dokładnie bieżącej realizacji wraz z accepted source/policy/raw H binding.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-mpfr-work-model",
+      "path": "scripts/test_antenna_surface_log_branch_model.py",
+      "symbol": "canonical_division_counts",
+      "responsibility": "Niezależny model dokładnej geometrii i liczników dla ukończonych przebiegów.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-mpfr-work-reader",
+      "path": "scripts/test_antenna_surface_log_branch_model.py",
+      "symbol": "read_bundle",
+      "responsibility": "Przypięty odczyt wejścia testowego; bez solve.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-mpfr-work-face",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "face_pass",
+      "responsibility": "Jawne gałęzie i dzielenia operatora.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-mpfr-work-consistency",
+      "path": "backends/fem/cpu/mfem/interactions/oersted/surface_rt0.cpp",
+      "symbol": "evaluate_surface_rt0",
+      "responsibility": "Wywołania scalar_agreement i końcowe dzielenia redukcji w każdym targetcie.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-mpfr-work-rounding-model",
+      "path": "scripts/test_antenna_surface_log_branch_model.py",
+      "symbol": "class MpfrLogBranches",
+      "responsibility": "Niezależna arytmetyka samych predykatów MPFR przez ctypes.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-mpfr-work-normalized-model",
+      "path": "scripts/test_antenna_surface_log_branch_model.py",
+      "symbol": "normalized_face",
+      "responsibility": "Dokładna potęga dwóch i normalizacja geometrii oracle.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-mpfr-work-binary-model",
+      "path": "scripts/test_antenna_surface_log_branch_model.py",
+      "symbol": "rounded_dot",
+      "responsibility": "Sekwencyjny iloczyn skalarny binary64 bez FMA w oracle.",
+      "evidence_status": "implementation_unqualified"
     }
   ],
   "public_api": {

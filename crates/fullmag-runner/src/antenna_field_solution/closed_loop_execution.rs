@@ -1,6 +1,17 @@
 //! Prepared full-volume inspection through one native V/RT0/J/H owner.
 use super::closed_loop_v2::invalid;
 use crate::types::{AuxiliaryArtifact, RunError};
+use crate::solver_profile::{SolverProfileConfig, SolverProfileOperationOutcome, SolverProfileState};
+#[cfg(feature = "fem-gpu")]
+use crate::native_fem::NativeFemSurfaceRt0Profile;
+#[cfg(not(feature = "fem-gpu"))]
+#[derive(Default)]
+struct NativeFemSurfaceRt0Profile {
+    available: bool,
+    accounting_issue: bool,
+    operator_wall_time_ns: u64,
+    phase_wall_time_ns: [u64; 9],
+}
 use fullmag_ir::{BackendTarget, ExecutionDevice, ExecutionMode, ExecutionPrecision,
     RequestedTransportExecutionIR, ResolvedAntennaClosedLoopCurrentInputIR};
 use serde_json::json;
@@ -74,19 +85,59 @@ pub fn execute_antenna_closed_loop_inspection_typed(
     requested: &RequestedTransportExecutionIR, output_id: &str, cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<AuxiliaryArtifact>, ClosedLoopExecutionError> {
     let mut native_status = None;
-    execute_closed_loop(input, requested, output_id, cancelled, Some(&mut native_status))
+    execute_closed_loop(input, requested, output_id, cancelled, Some(&mut native_status), None)
         .map_err(|error| classify_execution_error(error, native_status))
+}
+
+/// Optional operation profiling does not create a synthetic LLG step or
+/// alter scientific artifacts. The report is retained on controlled failure.
+pub fn execute_antenna_closed_loop_inspection_profiled_typed(
+    input: &ResolvedAntennaClosedLoopCurrentInputIR,
+    requested: &RequestedTransportExecutionIR, output_id: &str, cancelled: Option<&AtomicBool>,
+    config: &SolverProfileConfig, profile: &mut SolverProfileState,
+) -> Result<Vec<AuxiliaryArtifact>, ClosedLoopExecutionError> {
+    if !config.enabled {
+        return execute_antenna_closed_loop_inspection_typed(input, requested, output_id, cancelled);
+    }
+    let config = config.clone().normalized();
+    if profile.config() != &config {
+        profile.set_config(config);
+    }
+    let started = std::time::Instant::now();
+    let mut native_status = None;
+    let mut native_profile = NativeFemSurfaceRt0Profile::default();
+    let result = execute_closed_loop(input, requested, output_id, cancelled,
+        Some(&mut native_status), Some(&mut native_profile));
+    let total_wall_time_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+    let outcome = if result.is_ok() {
+        SolverProfileOperationOutcome::Completed
+    } else if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        SolverProfileOperationOutcome::Cancelled
+    } else {
+        SolverProfileOperationOutcome::Failed
+    };
+    let mut phases = [0; 8];
+    let native_operator_wall_ns = if native_profile.available {
+        phases.copy_from_slice(&native_profile.phase_wall_time_ns[..8]);
+        Some(native_profile.operator_wall_time_ns)
+    } else {
+        None
+    };
+    profile.record_antenna_operation(outcome, total_wall_time_ns,
+        native_operator_wall_ns, phases, native_profile.accounting_issue);
+    result.map_err(|error| classify_execution_error(error, native_status))
 }
 
 pub fn execute_antenna_closed_loop_inspection(input: &ResolvedAntennaClosedLoopCurrentInputIR,
     requested: &RequestedTransportExecutionIR, output_id: &str, cancelled: Option<&AtomicBool>)
     -> Result<Vec<AuxiliaryArtifact>, RunError> {
-    execute_closed_loop(input, requested, output_id, cancelled, None)
+    execute_closed_loop(input, requested, output_id, cancelled, None, None)
 }
 
 fn execute_closed_loop(input: &ResolvedAntennaClosedLoopCurrentInputIR,
     requested: &RequestedTransportExecutionIR, output_id: &str, cancelled: Option<&AtomicBool>,
     native_failure: Option<&mut Option<KnownNativeCallFailure>>,
+    native_profile: Option<&mut NativeFemSurfaceRt0Profile>,
 ) -> Result<Vec<AuxiliaryArtifact>, RunError> {
     check_cancelled(cancelled)?;
     if let Err(reason) = input.validate_field_policy() {
@@ -158,12 +209,13 @@ fn execute_closed_loop(input: &ResolvedAntennaClosedLoopCurrentInputIR,
             if source_cut_ref == &source_cuts[0].id && orientation == "minus_outward") {
         return Err(invalid("port normalization must select the actual minus-outward source cut"));
     }
-    execute_native(input, output_id, cancelled, native_failure)
+    execute_native(input, output_id, cancelled, native_failure, native_profile)
 }
 
 #[cfg(feature = "fem-gpu")]
 fn execute_native(input: &ResolvedAntennaClosedLoopCurrentInputIR, output_id: &str,
-    cancelled: Option<&AtomicBool>, native_failure: Option<&mut Option<KnownNativeCallFailure>>) -> Result<Vec<AuxiliaryArtifact>, RunError> {
+    cancelled: Option<&AtomicBool>, native_failure: Option<&mut Option<KnownNativeCallFailure>>,
+    native_profile: Option<&mut NativeFemSurfaceRt0Profile>) -> Result<Vec<AuxiliaryArtifact>, RunError> {
     use crate::native_fem::{solve_native_fem_prepared_closed_loop_classified, NativeFemPreparedClosedLoopChargeRequest,
         PreparedClosedLoopRuntimeBinding, NativeFemSteadyTransportExecution, NativeFemSteadyTransportGauge};
     use super::closed_loop_v2::{ClosedLoopAcceptedSourceInputV2, ClosedLoopCurrentCellV2,
@@ -183,7 +235,7 @@ fn execute_native(input: &ResolvedAntennaClosedLoopCurrentInputIR, output_id: &s
         maximum_iterations:input.solver.linear.max_iterations};
     check_cancelled(cancelled)?;
     let mut returned_native_failure = None;
-    let solved = solve_native_fem_prepared_closed_loop_classified(&request,input,&binding,Some(&input.field_sampling.positions_xyz_m),Some(&mut returned_native_failure));
+    let solved = solve_native_fem_prepared_closed_loop_classified(&request,input,&binding,Some(&input.field_sampling.positions_xyz_m),Some(&mut returned_native_failure),native_profile);
     check_cancelled(cancelled)?;
     if solved.is_err() {
         if let Some(native_failure) = native_failure { *native_failure = returned_native_failure; }
@@ -312,7 +364,8 @@ fn execute_native(input: &ResolvedAntennaClosedLoopCurrentInputIR, output_id: &s
 
 #[cfg(not(feature = "fem-gpu"))]
 fn execute_native(_input: &ResolvedAntennaClosedLoopCurrentInputIR, _output_id: &str,
-    cancelled: Option<&AtomicBool>, _native_failure: Option<&mut Option<KnownNativeCallFailure>>) -> Result<Vec<AuxiliaryArtifact>, RunError> {
+    cancelled: Option<&AtomicBool>, _native_failure: Option<&mut Option<KnownNativeCallFailure>>,
+    _native_profile: Option<&mut NativeFemSurfaceRt0Profile>) -> Result<Vec<AuxiliaryArtifact>, RunError> {
     check_cancelled(cancelled)?;
     Err(invalid("native FEM prepared source feature unavailable; no fallback"))
 }

@@ -39,7 +39,7 @@ mod antenna_field_solution;
 mod antenna_spectrum;
 mod antenna_stage;
 pub use antenna_field_solution::{
-    execute_antenna_closed_loop_inspection, execute_antenna_closed_loop_inspection_typed, ClosedLoopExecutionError, KnownNativeCallFailure, verify_antenna_closed_loop_inspection_bytes,
+    execute_antenna_closed_loop_inspection, execute_antenna_closed_loop_inspection_typed, execute_antenna_closed_loop_inspection_profiled_typed, ClosedLoopExecutionError, KnownNativeCallFailure, verify_antenna_closed_loop_inspection_bytes,
     load_antenna_closed_loop_inspection_bytes,
     load_published_antenna_closed_loop_inspection, LoadedAntennaClosedLoopInspection,
     load_antenna_field_solution_samples, load_antenna_field_solution_samples_for_spectrum,
@@ -652,6 +652,7 @@ pub use runtime_registry::{
 pub use solver_profile::{
     current_thread_cpu_time_ns, elapsed_current_thread_cpu_ns, LivePublisherDiagnostics,
     RateMetric, SolverProfileAggregates, SolverProfileConfig, SolverProfileOverheadDiagnostics,
+    SolverProfileOperationSample, SolverProfileOperationOutcome,
     SolverProfilePhaseSample, SolverProfileSnapshot, SolverProfileState, SolverProfileStepSample,
     SolverProfileThreading, SolverProfileTimingSemantic, SolverProfileTimingSemanticKind,
     SolverRateDiagnostics,

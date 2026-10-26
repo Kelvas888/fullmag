@@ -117,7 +117,7 @@ void serialize(std::ostream &out,const SurfaceRt0Result &value,const SurfaceRt0W
     const std::string &view_digest,const char *accepted_digest)
 {
     out << "{\"schema_version\":\"fem_rt0_surface_snapshot.v1\"";
-    key(out,"operator_version","fem_oersted_rt0_surface.inspection.v1");
+    key(out,"operator_version",surface_rt0_operator_version);
     key(out,"basis_version",transport::AffineRt0Element::operator_version);
     key(out,"policy_version",policy);key(out,"source_view_identity_digest",view_digest);
     key(out,"accepted_source_state_digest",accepted_digest);
@@ -213,7 +213,8 @@ void validate_surface_rt0_request(const fullmag_fem_prepared_closed_loop_rt0_sur
 void evaluate_accepted_surface_rt0(const transport::ConservativeCurrentView &view,
     const char *accepted_source_state_digest,
     const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 &request,
-    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 &result)
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 &result,
+    SurfaceRt0PhaseReport *phase_report)
 {
     const auto source_digest=digest(view.identity().view_identity_digest.c_str());
     (void)digest(accepted_source_state_digest);
@@ -231,7 +232,7 @@ void evaluate_accepted_surface_rt0(const transport::ConservativeCurrentView &vie
     for(std::uint64_t i=0;i<request.target_points_xyz_len;i+=3)
         targets.push_back({request.target_points_xyz[i],request.target_points_xyz[i+1],request.target_points_xyz[i+2]});
     SurfaceRt0WorkReport report;
-    const auto evaluated=evaluate_surface_rt0(source,source_digest,targets,l,t,peak_rss,report);
+    const auto evaluated=evaluate_surface_rt0(source,source_digest,targets,l,t,peak_rss,report,phase_report);
     BoundedJson buffer(result.evidence_json_capacity);std::ostream out(&buffer);
     out.exceptions(std::ios::badbit|std::ios::failbit);out.imbue(std::locale::classic());
     out << std::setprecision(std::numeric_limits<double>::max_digits10);

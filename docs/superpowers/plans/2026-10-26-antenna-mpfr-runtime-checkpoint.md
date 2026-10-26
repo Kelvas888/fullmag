@@ -189,3 +189,158 @@ Stan wykonania: aktywny toolchain attempt 899638a17d5e4f5389cbfebcf3f8af69,
 uchwyt 33865; MFEM CUDA zakończony 269/269, hypre/PETSc/SLEPc CPU zbudowane,
 trwa MFEM CPU. Stare API nadal działa. Nowy pakiet aplikacji, próba MPFR i pełny
 Universe pozostają NOT VERIFIED. To kontynuacja aktywnego E0–E12, nie zakończenie zadania.
+
+## Zakończony toolchain i zarządzana zmiana obrazu — 26.10.2026
+
+Uchwyt 33865 zakończył się kodem 0; próba toolchain
+899638a17d5e4f5389cbfebcf3f8af69 ma state=succeeded. Zweryfikowano current,
+verified, terminal i rzeczywisty image ID:
+sha256:5cf062bca3cb250be119f043f7886fd2c2ed4f975033ffa8b909c2645c62d767.
+Installed manifest SHA256:
+e540daa06adab1de7177ef2019ebd10881fdab8731991ad932fd0671b9c2d054.
+Skopiowany JSON w kontrolnym wolumenie jest reserializowany; jego odmienny
+hash nie jest automatycznie błędem integralności instalowanego pliku.
+
+Porównanie dotyczy zagnieżdżonej sekcji `actual`, nie pól o tej samej nazwie
+na poziomie root, których tam nie ma. Commity hypre/libCEED/MFEM/PETSc/SLEPc
+pozostały zgodne. Boost/GMP oraz wersje CMake, Node, nvcc, pnpm i Python są
+zgodne; MPFR ma wersję 4.1.0-3build3. Rust jednak zmienił się z
+1.101.0-nightly (12433c307 2026-10-24) na
+1.101.0-nightly (76456a688 2026-10-25). Nie ma podstaw do twierdzenia, że
+cały toolchain jest identyczny, że cache Cargo nie zostanie unieważniony albo
+że ewentualne przyspieszenie całego zadania wynika wyłącznie z MPFR.
+Dokładny manifest i porównanie zachowano w
+verification/antenna-mpfr-pre-image-change-20261026-1d555f29/.
+
+Świeży preflight: API instance 57e3a412-7ca4-48fc-8925-2d72cbf97189,
+solver/session completed, is_busy=false, brak procesu scientific worker.
+Scena dokładnie równa zachowanemu FMS; canonical scene SHA256
+6329d1f4ff232383a9e46ef39c024e83c2695185fe5dfb0e61e082749e130ba7.
+Nie zastąpiono sceny ani wyników. `restart-idle-volume --allow-prepared-session
+--stop-only` zakończył się succeeded, attempt
+70248cdfa80b449a9966dc4f94d1e568, idle_backend_stopped=true.
+Obie przypięte usługi zatrzymane z ExitCode=0, bez OOM, PID=0.
+Dowód drain ma schema fullmag.docker-idle-restart-drain.v1 i process receipt
+SHA256 8025e0cc0bdbaf0c3206680f2cdf8339711330d734f75e64bc4fc0fba6731063.
+
+Pierwsza próba recreate 6b1b3332aa6447428d9b313a307845ff odmówiła w preflight:
+moje jawne PATH pominęło /usr/lib/wsl/lib, więc nie widziało nvidia-smi.
+Sprawdzono rzeczywiste nvidia-smi i GPU, a kolejne polecenia zachowują PATH.
+Recreate 1d1b49b70b38497c96da7f5c8bfdb919 zakończyło odtworzenie succeeded,
+ale dalszy start zatrzymał hostowy Python 3.8 na str.removeprefix.
+Nie ponawiano usuwania usług: użyto docker-dev-resume-recreation przypiętego
+do dokładnie tej zakończonej operacji. Sam override storage_python w just
+nie rozwiązał błędu, ponieważ just_storage_shell.sh wykonuje własny wybór
+interpretera i rekonstruuje argumenty docker_dev.py.
+
+Po drugim identycznym błędzie przeanalizowano warianty: (1) dopięcie istniejącego
+Pythona do PATH z zachowaniem narzędzi WSL, (2) dedykowany FULLMAG_STORAGE_PYTHON,
+(3) propagacja interpretera w wrapperze, (4) zgodny z Pythonem 3.8 zapis operacji
+na prefiksie. Wybrano istniejący, jawnie obsługiwany wariant (2):
+FULLMAG_STORAGE_PYTHON=/home/kking/.local/bin/python3, zweryfikowany 3.12.10.
+Nie instalowano nowego interpretera ani nie zmieniono .env, wrappera, polityki
+restartu lub trybu GPU. [Dokumentacja Pythona](https://docs.python.org/3.13/library/stdtypes.html#str.removeprefix)
+potwierdza wprowadzenie removeprefix w 3.9; [manual just](https://just.systems/man/en/setting-variables-from-the-command-line.html)
+rozróżnia override zmiennej receptury, zaś faktyczny wybór w tym repo dowodzi
+kod scripts/just_storage_shell.sh:30–55 i gałąź docker_dev.py.
+
+Wznowione polecenie ma uchwyt 45074. Toolchain attempt
+13522ca9565c48c6add0d271ee7e048d jest cache_hit=true i wskazuje powyższy image ID.
+Trwa zarządzany build development-dev:inputs-0259ccb9ab2c3d1d32d0cda2 na tym
+rodzicu, obecnie warstwa apt/ripgrep. To nie jest jeszcze ukończony aplikacyjny
+build ani działające API. Nowa para usług, rzeczywista biblioteka MPFR,
+próba14 i pełny Universe nadal wymagają dowodów. Nie uruchomiono kolejnego Solve.
+
+
+### 26.10.2026 — zakończenie buildu i pojedyncza próba kandydata
+
+Zarządzana operacja `4eca82a5aa7d4e86aec9a60e8e344e75` zakończyła się stanem `succeeded`, kodem 0, bez cache hit pakietu. Config SHA256: `d60d9d7e0a33f1fb2b0a268c006c372f3253d97ed2e61edb38ad94b65182039f`. Make ukończony kodem 0 po 2521,822 s; pakiet 24 plików przeszedł walidację oraz bramki linux-native-v1 i worker-cgroup. Backend i frontend uruchomiono w tej samej grupie WSL; pozostałe grupy nie były zmieniane.
+
+Nowa biblioteka FEM SHA256: `23a06fa8113074fdad31360b5795aa71155ef09287c62e286f1563e2d42121ba`; receipt pakietu: `ffd5f0b25bcadbcaf374500d0e703d96b9be32a04be37437d021d41262bf7c51`; native source identity: `1e91f8abbbc760034f69062822fc9d1fc6a2e86920af737deb1b82e12d9c9854`. Przeliczenie identity musi stosować dokładny format launchera, łącznie z końcowym znakiem nowej linii. Dynamiczne zależności obejmują libmpfr.so.6 i libgmp.so.10. Hash trzech źródeł operatora porównano z rzeczywistym cieniem kompilacji i receiptem.
+
+API inkarnacja `5a030fd0-fef6-4c52-82fd-9dee0a28c3dc` odpowiedziało health=ok. Przy braku aktywnej sesji zaimportowano zachowany FMS o SHA256 `c05d8176471e7de2e8ef439375f362223a22e0023a6e64c1a267bde861f9ed87` w trybie visualization_only, bez Solve; odpowiedź 200, bez ostrzeżeń, active_session=true. Zachowano wyniki i historię.
+
+Przed wysłaniem próby poprawiono błędne założenie narzędzia kontrolnego: zoptymalizowany ELF nie musi zawierać pełnego literału wersji jako ciągłych bajtów. Tożsamość pozostała przypięta do dokładnego native source identity oraz hashy biblioteki/workera/receiptu; pełny operator_version nadal musi przejść kontrolę w dowodach numerycznych. Nie zmieniono fizycznych wejść, tolerancji, budżetów ani zasad jednorazowego wysłania. Opis mechanizmów optymalizacji: [dokumentacja GCC](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Optimize-Options.html). Poprzednie narzędzia zachowano w `verification/antenna-mpfr-20261026/optimized-elf-preflight-amendment/`. Nowe SHA256: mały runner `2dce8647d6ef65b58d2087589a376db9cf68a85ba63963fa72efee0f7e5daa74`, pełny runner `ef79ae6c9068a40992d7734c4226d058fc5b8c372140f808d3fc520284dd4a00`.
+
+Mały run `run-antenna-mpfr-20261026-01` został przyjęty przez publiczne API i przeszedł do running; task `task-524870aa5f7414211a86aee5f24f7e74445538dd263b76cfff7620aecfefbe15`. Nie jest to jeszcze zaliczenie porównania 21 payloadów ani pełnego Universe. Kolejne kroki: zakończenie obserwacji i powiązania workera z biblioteką → porównanie → dopiero przy sukcesie jednokrotna pełna próba.
+
+
+### 26.10.2026 — wynik małej próby: ukończony Solve, niezaliczona promocja
+
+Run `run-antenna-mpfr-20261026-01`, task `task-524870aa5f7414211a86aee5f24f7e74445538dd263b76cfff7620aecfefbe15`, attempt `attempt-1cabdeeafb8b44c5a13cd10e31141404`, epoch 1 zakończył się `succeeded`. Pakiet wyniku CAS: `ed9e6ed4089d552ca7511408de9246f56f4d8a0d93b8bfd57e36fc1da2d1faf5`. Diagnostyczne porównanie potwierdziło byte-identical 21 z 21 naukowych payloadów i oczekiwany pełny operator_version MPFR. Czas operatora wyniósł 88,759490982 s wobec 363,112640028 s referencji; to pojedynczy pomiar, bez kwalifikacji wydajności i przy odnotowanej zmianie kompilatora.
+
+**Bramka promocji nie przeszła.** Pierwszy obserwator zatrzymał się na błędnej interpretacji SONAME: rzeczywisty worker mapował `lib/libfullmag_fem.so.0`, podczas gdy kontrola oczekiwała `lib/libfullmag_fem.so`. Odczyt żywego procesu PID 21879 pokazał zgodny hash `23a06fa8113074fdad31360b5795aa71155ef09287c62e286f1563e2d42121ba`, inode 3250814, device 08:40 oraz zgodny wpis receiptu. Nie zachowano jednak kompletnego pliku obserwacji obejmującego wszystkie prerejestrowane kontrole. Późniejsze wznowienie wyłącznie GET (bez POST) odczytało już wynik terminalny; nie sfabrykowano brakujących danych i nie oznaczono runtime_binding_verified=true.
+
+Obserwator poprawiono wyłącznie dla konkretnej, receipted kopii SONAME w tym samym pakiecie: identyczny digest/rozmiar, zgodny device/inode i niezmieniony receipt. Nadal odrzuca obcy plik, inny digest, niewłaściwy inode, usunięty plik i błędny/brakujący wpis receiptu. Nowy helper SHA256 `b454677785e741e0affe786e46a17984d4f4ff053d571b16b58d14dc98d979f0`; 88 lekkich sprawdzeń przeszło. Narzędzie wznowienia tylko obserwacji ma SHA256 `04c94d0a0caaebce8fe80a86fb45a8da46cd65c1f134d1c53b7f9f32b3012db1`. Poprzednie źródła zachowano w `verification/antenna-mpfr-20261026/soname-observer-amendment/`. Te sprawdzenia nie uzupełniają utraconego dowodu live.
+
+Niezależnie porównanie wykryło różnicę licznika `real_divisions`: targety 10–13 mają po 16 operacji mniej, pozostałe liczniki poza prerejestrowaną zmianą rozmiaru outputu pozostają do oceny. Nie zmieniono oczekiwań po obejrzeniu wyniku. Diagnostyka jest zapisana jako `on/failed-promotion-diagnostic.json`, status `not_qualified`; nie utworzono zielonego `comparison.json`. Pełnego Universe nie wysłano i nie powtórzono Solve. Następna praca: wyjaśnić ścieżkę tych dzielników, zachować kwalifikację osobno od zgodności raw payloadów i dopiero przygotować kolejną kontrolowaną próbę.
+
+
+## Kontynuacja 26.10.2026 — próba potwierdzająca v2 i wejście Universe
+
+Pierwszy run `run-antenna-mpfr-20261026-01` pozostaje niezakwalifikowany.
+Model dokładnych znaków v1 nie przeszedł późniejszego preflightu per-target;
+żaden run v1 potwierdzający nie został zgłoszony. Różnice −2/−2/+2/+2 dla
+punktów 0/4/8/9 wynikały z zaokrąglonych predykatów binary64. Niezależny
+odczytowy przegląd potwierdził osiem krawędzi; zgodność sum globalnych
+ukrywała lokalne różnice. Zachowano źródło, oczekiwania i status błędu v1.
+
+Model v2 wyznacza geometrię przez Fraction i oblicza wyłącznie predykaty
+logarytmicznych gałęzi w binary64 oraz libmpfr 427/533 bitów RNDN; nie
+rozwiązuje pola i nie odczytuje liczników nowego wyniku. Przypięto model,
+wyjściowy JSON, bibliotekę MPFR, flagi kompilacji, źródło konwersji Boost,
+FEM library/worker/receipt i referencję. Przeszło 351 kontroli dodatnich
+oraz mutacji liczników i odmów. Walidacja noty i source-map: kod 0.
+To orakel kontraktu pracy implementacji, nie niezależne potwierdzenie H.
+
+Nowy `run-antenna-mpfr-confirmatory-v2-20261026-01` zakończył się succeeded.
+Task: `task-7db7d7ae980867760d8aa1f0fddf7bef5ef4c7b168714be87ff88fbc3048305e`;
+attempt: `attempt-ffeb99a13c9043be8ca5919ddd115edf`, epoch 1.
+Bundle: `84e0867160f5911575d8e5b1357a898dee1b6f03006ad46f2af6d987ffee7873`.
+Porównanie: PASS; 21/21 naukowych payloadów byte-identical z referencją;
+liczniki według modelu; diagnostyki binary64 bez zmian; wszystkie pozostałe
+liczniki poza opisaną rezerwacją zgodne. Zachowano pełną obserwację żywego
+workera i jego mapowania FEM oraz dodatkową obserwację mapowania MPFR.
+Protokół: `57979088fd40a9bac6b65b0a81c2e8dac389dd79feeb6e387ad40438faf53c3e`.
+Porównanie: `5af42d2d8abd1a90dfa012520114dff05d3df08803d42ae7759275242644a83f`.
+Operator: 95.632500854 s, lifetime peak RSS 538775552 B. Nie wykonano B–C–B;
+nie deklarujemy ogólnej kwalifikacji wydajności lub nowych geometrii.
+Runtime nie publikuje macierzy target×precision; obserwowane są jej marginesy.
+Dowody: `verification/antenna-mpfr-confirmatory-v2-20261026/` w wolumenie grupy.
+
+Pierwszy Submit pełnego Universe `run-antenna-universe-mpfr-20261026-01`
+odrzucono HTTP400 przed utworzeniem runu (późniejszy autorytatywny GET404).
+Przyczyną był brak `study.execution_profile` w osobnym dokumencie sceny,
+który nie odpowiadał zamrożonej definicji. Nie obchodzono bramki archiwum.
+Dokument odtworzono z exact frozen definition.scene. Pozostałe wpisy ZIP,
+StudyPlan, ProblemIR, siatki, immutable assets i specyfikacja fizyczna są
+identyczne. Źródłowa definicja, a nie późniejszy widok FMS, jest właścicielem.
+Istniejący runtime-free endpoint `run-intent` potwierdził HTTP200 i RunSpec
+identyczny poza run_id. Przy porównywaniu ZIP trzeba otwierać świeże czytniki;
+przekazanie tego samego ZipInfo do writestr zmienia jego offset w pamięci.
+
+Naprawione wejście ma hash
+`923efd35b14f91a68bcaf1834f374f7e306db4c2bda3d16e7e06c60afb7c48f5`.
+Procedura dla `run-antenna-universe-mpfr-20261026-02` jest uruchomiona;
+przyjęcie i zakończenie wymagają odczytu bieżącego stanu, nie wynikają z tego
+wpisu. Bez automatycznych ponowień i bez zmiany limitów. Domena Global ma
+1162 węzły/6548 Tet4; niezależny przewodnik 677 węzłów/1859 Tet4. Pełne pole
+oraz jego wyświetlenie w UI nadal nie zostały potwierdzone.
+
+Osobny commit schedulera `c0dcc2d587c4ee97674be29899300d02f5246b68`
+obejmuje pięć przejrzanych plików i 127 kontroli źródłowych. Cztery źródła
+runtime są identyczne z już zbudowanym cieniem. Dwa wcześniejsze wpisy
+współdzielonego indeksu zachowano bez zmiany. Nie jest to osobny build
+czystego HEAD ani kwalifikacja wydajności schedulera.
+
+
+Bieżący odczyt po kanonicznej naprawie: HTTP201 Submit, HTTP200 materialization,
+`run-antenna-universe-mpfr-20261026-02` ma lifecycle **running**.
+Task `task-c26227af3111378b8457ac9191d567437edd0f857114e2b31330973d71a49124`,
+attempt `attempt-4db486ff90504edbadd497e6bd376c69`, epoch 1.
+Zachowano obserwację rzeczywistego workera PID32480 i FEM SONAME o przypiętym
+SHA256. W chwili odczytu proces był R, czas CPU80.65s, elapsed74s. To dowód
+trwającego wykonania, nie ukończonego pola. Monitor tego samego runu działa;
+nie wolno wnioskować o zakończeniu z wygaśnięcia obserwacji ani uruchamiać
+kolejnej próby automatycznie. Artefakty i status w
+`verification/antenna-mpfr-20261026/full-universe-canonical-scene-replay/`.

@@ -38,6 +38,7 @@ struct ProjectionPublicationFence {
     scene_revision: u64,
     state_version: u64,
     scalar_revision: u64,
+    solver_profile_revision: u64,
     mesh_revision: u64,
     mesh_build_revision: u64,
     field_catalog_revision: u64,
@@ -76,6 +77,7 @@ impl ProjectionPublicationFence {
             scene_revision,
             state_version: snapshot.state_version,
             scalar_revision: snapshot.scalar_revision,
+            solver_profile_revision: snapshot.solver_profile.revision,
             mesh_revision: snapshot.mesh_revision,
             mesh_build_revision: snapshot.mesh_build_revision,
             field_catalog_revision: snapshot.field_catalog_revision,
@@ -116,6 +118,7 @@ struct ProjectionCursor {
     run_revision: u64,
     artifact_revision: Option<u64>,
     status: &'static str,
+    solver_profile_identity: Option<String>,
     latest_output_identity: Option<String>,
     live_observation_identity: Option<String>,
     live_observation_sequence: Option<u64>,
@@ -156,6 +159,7 @@ struct DurableProjection {
     live_observation_identity: Option<String>,
     live_observation_sequence: Option<u64>,
     live_magnetization_sequence: Option<u64>,
+    solver_profile: Option<crate::schemas::diagnostics::SolverProfileResource>,
     stage_execution: crate::types::StageExecutionState,
 }
 
@@ -246,6 +250,7 @@ async fn poll_once(
         run_revision: projection.run_catalog_revision,
         artifact_revision: projection.artifact_catalog_revision,
         status: projection.status,
+        solver_profile_identity: projection.solver_profile.as_ref().map(profile_content_identity).transpose()?,
         latest_output_identity: projection.latest_output_identity.clone(),
         live_observation_identity: projection.live_observation_identity.clone(),
         live_observation_sequence: projection.live_observation_sequence,
@@ -763,7 +768,22 @@ fn load_durable_projection(
     } else {
         None
     };
+    let solver_profile = if intent.specification.pointer("/parameters/solver_profile").is_some() {
+        let profile_specification: fullmag_application::RunSpecification = serde_json::from_value(intent.specification.clone())
+            .map_err(|error| ApiError::conflict(format!("invalid accepted profile RunSpec: {error}")))?;
+        crate::accepted_solver_profile::load_projection(&store, &profile_specification, &run_catalog.tasks)
+            .and_then(|profile| profile.map(|profile| {
+                let mut resource: crate::schemas::diagnostics::SolverProfileResource =
+                    serde_json::from_value(serde_json::to_value(profile)?)?;
+                for sample in &mut resource.operation_samples {
+                    sample.execution_config = Some(resource.config.clone());
+                }
+                Ok::<_, anyhow::Error>(resource)
+            }).transpose())
+            .map_err(|error| ApiError::conflict(format!("invalid accepted operation diagnostics: {error:#}")))?
+    } else { None };
     Ok(Some(DurableProjection {
+        solver_profile,
         run_catalog_revision: run_catalog.revision,
         artifact_catalog_revision,
         terminal_without_outputs,
@@ -1931,6 +1951,24 @@ fn ensure_projection_context(
     Ok(())
 }
 
+fn profile_content_identity(profile: &crate::schemas::diagnostics::SolverProfileResource) -> Result<String, ApiError> {
+    let mut value = serde_json::to_value(profile)
+        .map_err(|error| ApiError::internal(format!("serialize operation diagnostics identity: {error}")))?;
+    value.as_object_mut().ok_or_else(|| ApiError::internal("solver profile resource must be an object"))?
+        .remove("revision");
+    Ok(fullmag_session::canonical_json_sha256(&value))
+}
+
+fn replace_operation_profile(
+    current: &mut crate::schemas::diagnostics::SolverProfileResource,
+    mut candidate: crate::schemas::diagnostics::SolverProfileResource,
+) -> Result<bool, ApiError> {
+    if profile_content_identity(&candidate)? == profile_content_identity(current)? { return Ok(false); }
+    candidate.revision = current.revision.wrapping_add(1);
+    *current = candidate;
+    Ok(true)
+}
+
 async fn apply_projection(
     state: &Arc<AppState>,
     context: &ProjectionContext,
@@ -1947,9 +1985,31 @@ async fn apply_projection(
     let publication_fence = ProjectionPublicationFence::capture(&next)?;
     let display_revision = state.current_display_selection.read().await.revision;
 
+    let profile_changed = if let Some(profile) = projection.solver_profile.as_ref() {
+        // The recovered journal, rather than a default startup frame, owns a
+        // later explicit next-admission config (including Disable).
+        let configured = state.current_command_ledger.lock().await.iter().rev()
+            .find(|record| record.command.kind == "set_solver_profile"
+                && record.status == crate::types::CommandLifecycleState::Completed)
+            .and_then(|record| record.command.profile.clone());
+        let config = match configured {
+            Some(value) => serde_json::from_value(value)
+                .map_err(|error| ApiError::conflict(format!("invalid recovered solver profile configuration: {error}")))?,
+            None => profile.config.clone(),
+        };
+        let mut candidate = profile.clone();
+        candidate.config = config;
+        candidate.state = if candidate.config.enabled { "enabled" } else { "disabled" }.into();
+        if !candidate.config.enabled { candidate.operation_samples.clear(); }
+        replace_operation_profile(&mut next.solver_profile, candidate)?
+    } else if !next.solver_profile.operation_samples.is_empty() {
+        next.solver_profile.operation_samples.clear();
+        next.solver_profile.revision = next.solver_profile.revision.wrapping_add(1);
+        true
+    } else { false };
     let previous_status = next.session.status.clone();
     let terminal = matches!(projection.status, "completed" | "failed" | "cancelled");
-    let mut changed = false;
+    let mut changed = profile_changed;
     if let Some(run) = next.run.as_mut() {
         if run.status != projection.status {
             run.status = projection.status.to_string();
@@ -3200,6 +3260,7 @@ mod tests {
             run_revision: 1,
             artifact_revision: Some(1),
             status: "running",
+            solver_profile_identity: None,
             latest_output_identity: None,
             live_observation_identity: None,
             live_observation_sequence: None,
@@ -3310,5 +3371,47 @@ mod tests {
             "stage-2",
             "sha256:other",
         ));
+    }
+}
+
+#[cfg(test)]
+mod operation_profile_projection_tests {
+    use super::{profile_content_identity, replace_operation_profile};
+    use crate::schemas::diagnostics::SolverProfileResource;
+
+    #[test]
+    fn identical_profile_does_not_advance_revision() {
+        let mut current = SolverProfileResource::default();
+        current.revision = 17;
+        let mut repeated = current.clone();
+        repeated.revision = 1;
+        assert_eq!(profile_content_identity(&current).unwrap(), profile_content_identity(&repeated).unwrap());
+        assert!(!replace_operation_profile(&mut current, repeated).unwrap());
+        assert_eq!(current.revision, 17);
+        let mut changed = current.clone();
+        changed.config.max_samples += 1;
+        assert!(replace_operation_profile(&mut current, changed.clone()).unwrap());
+        assert_eq!(current.revision, 18);
+        assert!(!replace_operation_profile(&mut current, changed).unwrap());
+        assert_eq!(current.revision, 18);
+    }
+
+    #[test]
+    fn execution_config_survives_next_admission_overlay() {
+        let mut profile = SolverProfileResource::default();
+        let execution = profile.config.clone();
+        let sample = serde_json::json!({"execution_config": execution,
+            "sequence": 0, "operation_id": "antenna.closed_loop.inspect", "outcome": "completed",
+            "total_wall_time_ns": 100, "native_operator_wall_ns": 80, "phases": [], "accounting_issue": false});
+        // This test exercises the resource merge only; the receipt reader
+        // independently validates all nine numerical timing phases.
+        profile.operation_samples.push(serde_json::from_value(sample).unwrap());
+        profile.config.max_samples += 1;
+        assert_ne!(serde_json::to_value(&profile.config).unwrap(),
+            serde_json::to_value(profile.operation_samples[0].execution_config.as_ref().unwrap()).unwrap());
+        let execution = serde_json::to_value(&profile.operation_samples[0].execution_config).unwrap();
+        let mut current = SolverProfileResource::default();
+        assert!(replace_operation_profile(&mut current, profile).unwrap());
+        assert_eq!(execution, serde_json::to_value(&current.operation_samples[0].execution_config).unwrap());
     }
 }

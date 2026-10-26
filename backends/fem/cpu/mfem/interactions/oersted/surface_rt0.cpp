@@ -3,6 +3,8 @@
 #include <boost/math/special_functions/fpclassify.hpp>
 #include <boost/multiprecision/cpp_dec_float.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
+#include <boost/multiprecision/gmp.hpp>
+#include <boost/multiprecision/mpfr.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -18,14 +20,90 @@
 
 namespace fullmag::fem::oersted {
 namespace {
-using Integer = boost::multiprecision::cpp_int;
-using Exact = boost::multiprecision::cpp_rational;
-using Decimal80 = boost::multiprecision::number<boost::multiprecision::cpp_dec_float<80>>;
-using Decimal120 = boost::multiprecision::number<boost::multiprecision::cpp_dec_float<120>>;
+using Integer = boost::multiprecision::mpz_int;
+using Exact = boost::multiprecision::mpq_rational;
+static_assert(std::numeric_limits<boost::multiprecision::limb_type>::digits ==
+    std::numeric_limits<unsigned long>::digits,
+    "GMP and cpp_int decimal conversion limb widths must match");
+// Logical 80/120 passes retain more digits than the former guard-limb capacities.
+// Disable expression-template FMA; keep explicit operation materialization.
+using Decimal80 = boost::multiprecision::number<
+    boost::multiprecision::mpfr_float_backend<128, boost::multiprecision::allocate_stack>,
+    boost::multiprecision::et_off>;
+using Decimal120 = boost::multiprecision::number<
+    boost::multiprecision::mpfr_float_backend<160, boost::multiprecision::allocate_stack>,
+    boost::multiprecision::et_off>;
+static_assert(std::numeric_limits<Decimal80>::digits10 >=
+    boost::multiprecision::cpp_dec_float<80>::cpp_dec_float_total_digits10);
+static_assert(std::numeric_limits<Decimal120>::digits10 >=
+    boost::multiprecision::cpp_dec_float<120>::cpp_dec_float_total_digits10);
 template<class R> using Vector = std::array<R, 3>;
 using ExactPoint = Vector<Exact>;
 using Clock = std::chrono::steady_clock;
 using Kind = SurfaceRt0WorkKind;
+
+// One active phase at a time, including exception unwinding. Disabled calls
+// perform no clock reads and never allocate, serialize or log diagnostics.
+class PhaseProfiler {
+public:
+    explicit PhaseProfiler(SurfaceRt0PhaseReport *report) noexcept : report_(report)
+    {
+        if (!report_) return;
+        *report_ = {};
+        report_->started = true;
+        started_ = last_ = Clock::now();
+    }
+    ~PhaseProfiler() noexcept
+    {
+        if (!report_) return;
+        const auto now = Clock::now();
+        record(now);
+        report_->total_wall_time_ns = elapsed(started_,now);
+        std::uint64_t attributed = 0;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(SurfaceRt0Phase::unattributed); ++i)
+            add(attributed,report_->wall_time_ns[i]);
+        const auto unattributed = static_cast<std::size_t>(SurfaceRt0Phase::unattributed);
+        if (attributed > report_->total_wall_time_ns) {
+            report_->accounting_issue = true;
+            report_->wall_time_ns[unattributed] = 0;
+        } else {
+            const auto remainder = report_->total_wall_time_ns-attributed;
+            if (report_->wall_time_ns[unattributed] != remainder)
+                report_->accounting_issue = true;
+            report_->wall_time_ns[unattributed] = remainder;
+        }
+    }
+    void phase(SurfaceRt0Phase phase) noexcept
+    {
+        if (!report_) return;
+        const auto now = Clock::now();
+        record(now);
+        active_ = phase;
+    }
+private:
+    std::uint64_t elapsed(Clock::time_point from, Clock::time_point to) noexcept
+    {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(to-from).count();
+        if (ns < 0) { report_->accounting_issue = true; return 0; }
+        return static_cast<std::uint64_t>(ns);
+    }
+    void add(std::uint64_t &value, std::uint64_t amount) noexcept
+    {
+        if (amount > std::numeric_limits<std::uint64_t>::max()-value) {
+            report_->accounting_issue = true;
+            value = std::numeric_limits<std::uint64_t>::max();
+        } else value += amount;
+    }
+    void record(Clock::time_point now) noexcept
+    {
+        add(report_->wall_time_ns[static_cast<std::size_t>(active_)],elapsed(last_,now));
+        last_ = now;
+    }
+    SurfaceRt0PhaseReport *report_;
+    SurfaceRt0Phase active_ = SurfaceRt0Phase::source_prepare;
+    Clock::time_point started_{};
+    Clock::time_point last_{};
+};
 
 class NumericRefusal : public std::runtime_error {
 public:
@@ -179,17 +257,19 @@ public:
         watch(result);
         return result;
     }
-    std::uint64_t bits(const Integer &value)
+    std::uint64_t bits(mpz_srcptr value)
     {
         work_.charge(Kind::exact_integer_operations);
-        Integer magnitude = value;
-        if (magnitude < 0) magnitude = -magnitude;
-        return magnitude == 0 ? 0 : static_cast<std::uint64_t>(boost::multiprecision::msb(magnitude)) + 1;
+        return mpz_sgn(value) == 0 ? 0 : static_cast<std::uint64_t>(mpz_sizeinbase(value,2));
+    }
+    std::uint64_t bits(const Integer &value)
+    {
+        return bits(value.backend().data());
     }
     void watch(const Exact &value)
     {
-        const auto n = bits(boost::multiprecision::numerator(value));
-        const auto d = bits(boost::multiprecision::denominator(value));
+        const auto n = bits(mpq_numref(value.backend().data()));
+        const auto d = bits(mpq_denref(value.backend().data()));
         work_.raw_bits(std::max(n, d));
         work_.reduced_bits(std::max(n, d));
     }
@@ -243,8 +323,7 @@ public:
     int sign(const Exact &a)
     {
         work_.charge(Kind::exact_comparisons); watch(a);
-        const Integer n = boost::multiprecision::numerator(a);
-        return n == 0 ? 0 : n > 0 ? 1 : -1;
+        return mpq_sgn(a.backend().data());
     }
     int compare(const Exact &a, const Exact &b)
     {
@@ -472,13 +551,15 @@ template<class R> struct FacePass {
     Vector<R> whole_h;
 };
 
-template<class R> R solid_angle(const std::array<Vector<R>, 3> &v,
-    const std::array<R, 3> &radii, const Exact &numerator, Arithmetic<R> &a)
+template<class R, class Products> R solid_angle(
+    const std::array<R, 3> &radii, const Exact &numerator, Arithmetic<R> &a,
+    Products products)
 {
     const R n = a.number(numerator);
     numeric(n != 0, "surface RT0 exact angle numerator rounded to zero");
-    const R d = radii[0]*radii[1]*radii[2] + radii[0]*dot(v[1],v[2]) +
-        radii[1]*dot(v[2],v[0]) + radii[2]*dot(v[0],v[1]);
+    const auto dots = products();
+    const R d = radii[0]*radii[1]*radii[2] + radii[0]*dots[0] +
+        radii[1]*dots[1] + radii[2]*dots[2];
     return R(2)*a.angle(n,d);
 }
 
@@ -502,6 +583,16 @@ template<class R> FacePass<R> face_pass(const FaceGeometry &g,
     }
     FacePass<R> result;
     std::optional<Vector<R>> qvector;
+    // Demand each product only after the angle numerator passed its guard.
+    std::array<std::optional<R>,3> neighbor_products, projection_products;
+    auto neighbor_product = [&](int i) -> const R & {
+        if (!neighbor_products[i]) neighbor_products[i] = dot(vectors[i],vectors[(i+1)%3]);
+        return *neighbor_products[i];
+    };
+    auto projection_product = [&](int i) -> const R & {
+        if (!projection_products[i]) projection_products[i] = dot(*qvector,vectors[i]);
+        return *projection_products[i];
+    };
     for (int i = 0; i < 3; ++i) {
         work.charge(Kind::signed_fan_panels,1,a.precision());
         if (g.d_zero[i]) { result.fans[i] = 0; logs[i] = 0; omegas[i] = 0; continue; }
@@ -522,13 +613,14 @@ template<class R> FacePass<R> face_pass(const FaceGeometry &g,
         if (g.h_zero) omegas[i] = 0;
         else {
             if (!qvector) qvector = a.point(g.qvector);
-            const std::array<Vector<R>,3> fan{{*qvector,vectors[i],vectors[j]}};
-            omegas[i] = solid_angle(fan,std::array<R,3>{{absolute(h),radii[i],radii[j]}},g.fan_numerators[i],a);
+            omegas[i] = solid_angle(std::array<R,3>{{absolute(h),radii[i],radii[j]}},g.fan_numerators[i],a,
+                [&] { return std::array<R,3>{{neighbor_product(i),projection_product(j),projection_product(i)}}; });
         }
         result.fans[i] = d[i]*logs[i]-h*omegas[i];
     }
     work.charge(Kind::whole_face_formulas,1,a.precision());
-    result.angle = g.h_zero ? R(0) : solid_angle(vectors,radii,g.whole_numerator,a);
+    result.angle = g.h_zero ? R(0) : solid_angle(radii,g.whole_numerator,a,
+        [&] { return std::array<R,3>{{neighbor_product(1),neighbor_product(2),neighbor_product(0)}}; });
     const R potential = summed(result.fans);
     std::array<R,3> edge_terms{{R(d[0]*logs[0]),R(d[1]*logs[1]),R(d[2]*logs[2])}};
     const R whole = summed(edge_terms)-h*result.angle;
@@ -723,8 +815,10 @@ SurfaceRt0Result evaluate_surface_rt0(
     const SurfaceRt0WorkLimits &limits,
     const SurfaceRt0Tolerances &tolerances,
     const SurfaceRt0PeakRss &peak_rss,
-    SurfaceRt0WorkReport &report)
+    SurfaceRt0WorkReport &report,
+    SurfaceRt0PhaseReport *phase_report)
 {
+    PhaseProfiler phases(phase_report);
     report = {};
     tolerances_valid(tolerances);
     Work work(limits,peak_rss,report);
@@ -752,6 +846,7 @@ SurfaceRt0Result evaluate_surface_rt0(
         work.guard();
     }
     for (std::size_t target_index = 0; target_index < ordered_targets_m.size(); ++target_index) {
+        phases.phase(SurfaceRt0Phase::exact_geometry);
         work.begin_target(target_index);
         ExactArithmetic exact(work);
         const auto target = exact.point(ordered_targets_m[target_index]);
@@ -767,24 +862,32 @@ SurfaceRt0Result evaluate_surface_rt0(
         for (const auto &cell : prepared) {
             work.guard();
             work.charge(Kind::source_target_pairs);
+            phases.phase(SurfaceRt0Phase::exact_geometry);
             const auto current = current_at_target(cell,target,exact);
             for (int opposite = 0; opposite < 4; ++opposite) {
                 work.guard();
+                phases.phase(SurfaceRt0Phase::exact_geometry);
                 const auto g = geometry(cell.faces[opposite],target,exact);
                 work.guard();
                 FacePass<double> low;
                 bool low_ok = false;
+                phases.phase(SurfaceRt0Phase::binary64);
                 try {
                     low = face_pass(g,current,low_arithmetic,tolerances);
+                    phases.phase(SurfaceRt0Phase::consistency);
                     low_sum.add(low,low_arithmetic);
                     low_ok = true;
                 } catch (const NumericRefusal &error) {
                     binary_evaluated = false;
                     binary_requires_high = true;
+                    phases.phase(SurfaceRt0Phase::serialization);
                     remember_binary_refusal(binary_refusal,error,work);
                 }
+                phases.phase(SurfaceRt0Phase::precision80);
                 const auto medium = face_pass(g,current,medium_arithmetic,tolerances);
+                phases.phase(SurfaceRt0Phase::precision120);
                 const auto high = face_pass(g,current,high_arithmetic,tolerances);
+                phases.phase(SurfaceRt0Phase::consistency);
                 scalar_agreement(g,medium,high,medium_arithmetic,high_arithmetic,tolerances);
                 medium_sum.add(medium,medium_arithmetic);
                 high_sum.add(high,high_arithmetic);
@@ -818,6 +921,7 @@ SurfaceRt0Result evaluate_surface_rt0(
                 work.guard();
             }
         }
+        phases.phase(SurfaceRt0Phase::reduction);
         const auto high_field = high_sum.field();
         const Decimal120 high_magnitude = high_arithmetic.norm(high_field);
         const Decimal120 gate = Decimal120(tolerances.absolute_field_apm)+Decimal120(tolerances.relative_field)*high_magnitude;
@@ -855,13 +959,16 @@ SurfaceRt0Result evaluate_surface_rt0(
                     local_binary_delta.value() > gate || local_binary_formula_delta.value() > gate || roundoff > gate ||
                     high_arithmetic.norm(subtract(promoted(low_sum.whole_field()),promoted(low_field))) > gate ||
                     high_arithmetic.norm(subtract(promoted(low_field),high_field)) > gate;
+                phases.phase(SurfaceRt0Phase::serialization);
                 output.precisions[0] = precision_result(low_sum,low_arithmetic,tolerances);
                 output.binary64_roundoff_indicator_apm = high_arithmetic.text(roundoff);
             } catch (const NumericRefusal &error) {
+                phases.phase(SurfaceRt0Phase::serialization);
                 binary_evaluated = false; binary_requires_high = true;
                 remember_binary_refusal(binary_refusal,error,work);
             }
         }
+        phases.phase(SurfaceRt0Phase::serialization);
         if (!binary_evaluated) {
             output.precisions[0].evaluated = false;
             output.precisions[0].refusal_reason = std::move(binary_refusal);
@@ -873,10 +980,12 @@ SurfaceRt0Result evaluate_surface_rt0(
         output.local_precision_delta_apm = high_arithmetic.text(local_precision_delta.value());
         output.local_formula_delta_apm = high_arithmetic.text(local_formula_delta.value());
         output.local_formula_delta_80_apm = high_arithmetic.text(local_medium_formula_delta.value());
+        phases.phase(SurfaceRt0Phase::reduction);
         output.work = work.target_counts();
         result.targets.push_back(std::move(output));
         work.guard();
     }
+    phases.phase(SurfaceRt0Phase::unattributed);
     work.guard();
     return result;
 }

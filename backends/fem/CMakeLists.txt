@@ -429,6 +429,10 @@ target_include_directories(fullmag_fem
 )
 
 if(FULLMAG_USE_MFEM_STACK)
+    # DOC-ANCHOR: antenna-surface-gmp-dependency
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FULLMAG_SURFACE_ARITHMETIC REQUIRED IMPORTED_TARGET gmp "mpfr>=4.1")
+    target_link_libraries(fullmag_fem PRIVATE PkgConfig::FULLMAG_SURFACE_ARITHMETIC)
     target_compile_definitions(fullmag_fem PUBLIC FULLMAG_HAS_MFEM_STACK=1)
     if(FULLMAG_ENABLE_CUDA)
         target_compile_definitions(fullmag_fem PUBLIC FULLMAG_HAS_CUDA_RUNTIME=1)

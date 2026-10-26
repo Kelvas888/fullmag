@@ -1,6 +1,6 @@
 //! Caller-owned buffers and policy binding for prepared RT0 surface inspection.
 use super::{NativeFemOerstedField, PreparedClosedLoopAcceptedSnapshot};
-use crate::antenna_field_solution::surface_rt0_evidence_v1::SurfaceRt0Snapshot;
+use crate::antenna_field_solution::surface_rt0_evidence_v1::{SurfaceRt0Snapshot, OPERATOR_VERSION};
 use crate::types::RunError;
 use fullmag_fem_sys as ffi;
 use fullmag_ir::AntennaSurfaceFieldPolicyIR;
@@ -69,7 +69,8 @@ impl SurfaceSnapshotBuffer {
         }
         let snapshot = SurfaceRt0Snapshot::from_native_json(&self.evidence[..h.evidence_json_len as usize])?;
         let expected_policy = serde_json::to_value(&self.policy).map_err(|_| bad("policy encoding"))?;
-        if snapshot.policy_binding() != expected_policy
+        if snapshot.operator_version != OPERATOR_VERSION
+            || snapshot.policy_binding() != expected_policy
             || snapshot.source_view_identity_digest != view_digest
             || snapshot.accepted_source_state_digest != source.accepted_source_state_digest
             || snapshot.targets_xyz_m.len() != points.len()

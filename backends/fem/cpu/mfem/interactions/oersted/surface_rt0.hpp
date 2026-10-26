@@ -11,6 +11,9 @@
 
 namespace fullmag::fem::oersted {
 
+inline constexpr char surface_rt0_operator_version[] =
+    "fem_oersted_rt0_surface.mpfr128_160_rndn_etoff.inspection.v1";
+
 // Private FEM CPU kernel; the accepted-source adapter owns ABI, dispatch and policy.
 enum class SurfaceRt0WorkKind : std::size_t {
     source_target_pairs,
@@ -67,13 +70,37 @@ struct SurfaceRt0WorkReport {
     SurfaceRt0WorkCounts total{};
     SurfaceRt0WorkCounts current_target{};
     // Precision-specific work only; shared exact preparation remains in total.
-    // Precision order: binary64, cpp_dec_float<80>, cpp_dec_float<120>.
+    // Precision order: binary64, MPFR128, MPFR160 (logical 80/120 passes).
     std::array<SurfaceRt0WorkCounts, 3> by_precision{};
     std::size_t current_target_index = 0;
     std::uint64_t maximum_raw_integer_bits = 0;
     std::uint64_t maximum_reduced_fraction_bits = 0;
     std::uint64_t last_sampled_lifetime_peak_rss_bytes = 0;
     double elapsed_seconds = 0.0;
+};
+
+// Private optional diagnostics; stable indices are separate from numerical work.
+enum class SurfaceRt0Phase : std::size_t {
+    source_prepare,
+    exact_geometry,
+    binary64,
+    precision80,
+    precision120,
+    consistency,
+    reduction,
+    serialization,
+    unattributed,
+    count
+};
+inline constexpr std::size_t surface_rt0_phase_count =
+    static_cast<std::size_t>(SurfaceRt0Phase::count);
+
+struct SurfaceRt0PhaseReport {
+    std::array<std::uint64_t, surface_rt0_phase_count> wall_time_ns{};
+    std::uint64_t total_wall_time_ns = 0;
+    bool started = false;
+    // Any clock reversal, overflow or inconsistent accounting is explicit.
+    bool accounting_issue = false;
 };
 
 struct SurfaceRt0PrecisionResult {
@@ -122,6 +149,7 @@ SurfaceRt0Result evaluate_surface_rt0(
     const SurfaceRt0WorkLimits &limits,
     const SurfaceRt0Tolerances &tolerances,
     const SurfaceRt0PeakRss &peak_rss,
-    SurfaceRt0WorkReport &report);
+    SurfaceRt0WorkReport &report,
+    SurfaceRt0PhaseReport *phase_report = nullptr);
 
 } // namespace fullmag::fem::oersted
