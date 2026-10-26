@@ -16,24 +16,17 @@ export function SimulationPreparationStatusEntry() {
   return (
     <>
       <span className="fm-status-bar__sep" aria-hidden="true" />
-      <span
+      <button
+        type="button"
         aria-label={`Show simulation preparation: ${preparation.title}`}
-        className="fm-status-bar__item fm-status-bar__item--clickable fm-status-bar__preparation"
+        className="fm-status-bar__button fm-status-bar__item fm-status-bar__item--clickable fm-status-bar__preparation"
         data-preparation-status-entry
         data-tone={preparation.tone}
         title={preparation.title}
-        role="button"
-        tabIndex={0}
         onClick={simulationPreparationWindow.open}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            simulationPreparationWindow.open();
-          }
-        }}
       >
         Preparation: {preparation.label}
-      </span>
+      </button>
     </>
   );
 }

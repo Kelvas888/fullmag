@@ -1,6 +1,7 @@
 "use client";
 
 import type { ExplorerTabId } from "./explorerTypes";
+import { PanelChrome } from "@/shared/ui/PanelFrame";
 import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/Tabs";
 
 const EXPLORER_TABS: Array<{ id: ExplorerTabId; label: string }> = [
@@ -23,13 +24,13 @@ export function ExplorerTabBar({ activeTab, onTabChange }: ExplorerTabBarProps) 
       value={activeTab}
       onValueChange={(value) => onTabChange(value as ExplorerTabId)}
     >
-      <TabsList aria-label="Explorer resource families">
+      <PanelChrome><TabsList aria-label="Explorer resource families">
         {EXPLORER_TABS.map((tab) => (
           <TabsTrigger key={tab.id} value={tab.id}>
             {tab.label}
           </TabsTrigger>
         ))}
-      </TabsList>
+      </TabsList></PanelChrome>
     </Tabs>
   );
 }

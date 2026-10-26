@@ -78,7 +78,7 @@ export default function PreparationWindowPreview() {
       <div className="fm-workspace-overlay-host">
         <SimulationStartupOverlayView state={state} />
       </div>
-      <div className="fm-status-bar" role="status" aria-label="Session status">
+      <div className="fm-status-bar" role="group" aria-label="Session status">
         <SimulationPreparationStatusEntry />
       </div>
     </KernelContext.Provider>

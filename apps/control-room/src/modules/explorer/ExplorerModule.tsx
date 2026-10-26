@@ -8,7 +8,6 @@ import {
   ChevronsUpDown,
   RefreshCw,
   Search,
-  SlidersHorizontal,
 } from "lucide-react";
 
 import type {
@@ -1101,7 +1100,6 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
             placeholder="Filter nodes..."
             type="search"
           />
-          <SlidersHorizontal size={13} aria-hidden="true" className="fm-explorer-filter__options-icon" />
         </label>
         <ExplorerTreeView
           activeNodeId={selectedNodeId}
@@ -1142,8 +1140,8 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           </button>
           <button
             className="fm-explorer-toolbar__action"
-            aria-label="Refresh explorer"
-            title="Refresh"
+            aria-label="Reset explorer filter and expand nodes"
+            title="Reset filter and expand nodes"
             type="button"
             onClick={() => {
               setExplorerFilterText("");
@@ -1151,7 +1149,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
             }}
           >
             <RefreshCw size={13} aria-hidden="true" />
-            <span>Refresh</span>
+            <span>Reset filter</span>
           </button>
         </footer>
       </section>
