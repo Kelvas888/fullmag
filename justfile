@@ -123,6 +123,10 @@ docker-dev-refresh-frontend attempt config_sha256 source_root port="3197":
 docker-dev-restart-idle attempt config_sha256 source_root port="3197" allow_prepared_session="false":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" restart-idle-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}{{if allow_prepared_session == "true" { " --allow-prepared-session" } else if allow_prepared_session == "false" { "" } else { error("allow_prepared_session must be true or false") } }}
 
+# Read-only pins for a pre-owner startup-fenced API; never stop or recover it.
+docker-dev-inspect-startup-diagnostic source_root backend_container_id image_id report:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_startup_diagnostic.py" --source-root {{quote(source_root)}} --backend-container-id {{quote(backend_container_id)}} --image-id {{quote(image_id)}} --report {{quote(report)}}
+
 # Inspect or stop the exact fenced diagnostic API; preserve Unknown and all data.
 docker-dev-stop-diagnostic attempt config_sha256 source_root port="3197" resume_attempt="" preview="true":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" stop-diagnostic-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}{{if resume_attempt == "" { "" } else { " --resume-attempt " + quote(resume_attempt) } }}{{if preview == "true" { " --preview" } else if preview == "false" { "" } else { error("preview must be true or false") } }}

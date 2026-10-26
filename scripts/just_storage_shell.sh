@@ -87,6 +87,16 @@ fi
 
 # Closed scientific route, before diagnostic/storage shortcuts; never eval argv.
 case "${recipe}" in
+  *"scripts/docker_volume_startup_diagnostic.py"*)
+    startup_inspection_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_startup_diagnostic.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --report '(verification/[A-Za-z0-9._/-]+\\.json)'[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${startup_inspection_pattern} ]]; then
+      echo "[fullmag just] invalid read-only startup diagnostic inspection recipe" >&2
+      exit 2
+    fi
+    exec "${python_cmd}" -B "${script_dir}/docker_volume_startup_diagnostic.py" \
+      --source-root "${BASH_REMATCH[1]}" --backend-container-id "${BASH_REMATCH[2]}" \
+      --image-id "${BASH_REMATCH[3]}" --report "${BASH_REMATCH[4]}"
+    ;;
   *"scripts/docker_dev_preclaim_cancel.py"*)
     preclaim_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_preclaim_cancel.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --candidate-basename '(published|\\.backend-package-candidate-[A-Za-z0-9._-]+)' --candidate-receipt-sha256 '([0-9a-f]{64})' --request '(verification/[A-Za-z0-9._/-]+)' --request-sha256 '([0-9a-f]{64})'( --apply)?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${preclaim_pattern} ]]; then
