@@ -601,6 +601,9 @@ async function assertCanvasHasFidelity(page) {
     const style = document.createElement("style");
     style.dataset.viewportAuditIsolation = "true";
     style.textContent = `
+      /* Render diagnostics is portalled outside the viewport root. Its changing
+         timings must not contaminate the drawing-buffer fidelity measurement. */
+      .fm-viewport-3d__render-details,
       .fm-viewport-3d *:not(canvas) { visibility: hidden !important; }
       .fm-viewport-3d canvas { visibility: visible !important; }
     `;
