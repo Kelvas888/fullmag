@@ -1,5 +1,6 @@
 "use client";
 
+import { PanelChrome } from "@/shared/ui/PanelFrame";
 import {
   Activity,
   CircleAlert,
@@ -73,7 +74,7 @@ function FooterModuleContent({ kernel }: ModuleProps) {
       }
       className="fm-footer"
     >
-      <div className="fm-footer__bar">
+      <PanelChrome className="fm-footer__bar">
         <TabsList className="fm-footer__tabs" aria-label="Bottom diagnostics">
           <TabsTrigger value="logs" className="fm-footer__tab">
             <Activity size={14} aria-hidden="true" />
