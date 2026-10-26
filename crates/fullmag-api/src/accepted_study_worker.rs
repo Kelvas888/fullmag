@@ -798,10 +798,12 @@ fn read_live_magnetization(
     Ok(Some((values, fields)))
 }
 
-// Claim validation is read-only and idempotent, but it can briefly contend
-// with the supervisor heartbeat writer. Keep this retry local to claim
-// validation; never replay worker startup or solver effects.
-const ACCEPTED_WORKER_CLAIM_RETRY_LIMIT: Duration = Duration::from_secs(30);
+// Claim validation is read-only and idempotent, but it contends with the
+// supervisor heartbeat, the scheduler, the API and this worker's own control
+// thread for the writer; on a Docker Desktop host folder 30 s was not enough.
+// Keep this retry local to claim validation; never replay worker startup or
+// solver effects.
+const ACCEPTED_WORKER_CLAIM_RETRY_LIMIT: Duration = fullmag_runtime_control::WORKER_STORE_WRITER_WAIT;
 const ACCEPTED_WORKER_CLAIM_RETRY_DELAY: Duration = Duration::from_millis(10);
 const ACCEPTED_WORKER_GPU_INVENTORY_RETRY_LIMIT: Duration = Duration::from_secs(30);
 const ACCEPTED_WORKER_GPU_INVENTORY_RETRY_DELAY: Duration = Duration::from_secs(1);
