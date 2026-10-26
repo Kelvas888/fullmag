@@ -139,3 +139,53 @@ DEV deleguje do build_volume_toolchain; końcowe piny znajdują się w
 verified.json. Stary toolchain/bootstrap-receipt.json nie jest producentem
 tej trasy. Nowy obraz, aplikacyjny build, mała próba i pełna mapa są nadal
 NOT VERIFIED. Źródła kernela pozostają wyłącznie kandydatem MPFR.
+
+
+## Bramka tożsamości wykonania — przed pierwszą próbą MPFR
+
+Niezależny przegląd wykrył lukę w przygotowanym comparatorze: porównywał
+21 payloadów, lecz nie wiązał ich dostatecznie z publicznym katalogiem,
+manifestem zakończonego zadania i biblioteką faktycznie załadowaną przez worker.
+Naprawiono lokalne narzędzia w wolumenie kontrolnym przed jakimkolwiek nowym Solve.
+Nie zmieniono fizycznych wejść, metod, tolerancji, limitów ani publicznego API.
+
+Nowa kontrola wiąże project/run/task/attempt/epoch/step/case, codec, artifact IDs,
+SHA256 obu obiektów CAS i rzeczywisty rozmiar bundle. Porównuje pełną identity
+started/completed/profile w pamięci; raportuje wyłącznie jej digest i jawne
+identyfikatory, bez wartości lease. Weryfikuje także zgodność żądania i konfiguracji
+profilera. Runner przypina nagłówek inkarnacji API we wszystkich odpowiedziach.
+
+W czasie rzeczywistej próby wymagany jest odczyt procesu dopasowanego po dokładnych
+argumentach store/run/task: PID i start_ticks, executable oraz mapowania biblioteki
+FEM muszą odpowiadać inode/device/hash przypiętych plików. Obserwacja wiąże również
+receipt rozpoczęcia workera. Przed próbą, w obserwacji i po zakończeniu sprawdzane
+są worker, biblioteka i hash receiptu pakietu. Jest to pojedyncza obserwacja procesu,
+nie ciągła attestation. Brak obserwacji odmawia promocji, bez automatycznego Solve.
+
+Zakres pinów pakietu jest jawny: dwa rzeczywiste pliki (worker i FEM library) oraz
+receipt. Nie jest to ponowny audyt rzeczywistych bajtów wszystkich pozostałych plików
+pakietu. Pełna próba wymaga tych samych pinów, pozytywnego małego porównania oraz
+własnej obserwacji workera. Przypięty runner porównuje fizyczne wejście z frozen
+request przed POST; comparator nie odtwarza samodzielnie całej tej transformacji.
+
+Weryfikacja narzędzi: 80 kontroli interpretowanych PASS, w tym binding rzeczywistego
+zachowanego wyniku i celowo podmienione identity, metadane i mapowania. Jawnie oznaczony
+fixture całego verifiera nie jest obserwacją żywego procesu. Dwie odmowy preflight
+PASS: stara biblioteka oraz brak pozytywnej małej próby. Po obu sprawdzono brak
+submission-started. Nie kompilowano testów jednostkowych. Niezależny ponowny przegląd
+nie znalazł blokera w zakresie exact worker/exact FEM; zachowano powyższe ograniczenia.
+
+Dowody: verification/antenna-mpfr-20261026/ w kontrolnym wolumenie grupy:
+trial_runtime_binding.py, check-trial-runtime-binding.py, runtime-binding-checks.json,
+runtime-binding-preregistration-v1.json i trial-preflight-negative-checks-v2.json.
+Klucz full_trial_requires_identical_package w prerejestracji oznacza porównanie
+wskazanych dwóch plików oraz receiptu, a nie pełny actual-file audit.
+SHA256 helpera: b1accf5776a22e54a953a8e9c186a074db81ee2101ba597b8c0f50862c6fc44e.
+SHA256 małego runnera: 5fff8f2390f2ba66e99dff044b5d6c977e0127ec345b8828af57c576350360c3.
+SHA256 comparatora: 661e1fc4ca431ca956f275dcb73763594a0e7be094d9e29c0cfd8f325d63c209.
+SHA256 pełnego runnera: 8bb0dce027c472a7b28875b41abe5b3741b6736b594ccbd41996e37fdbdb2315.
+
+Stan wykonania: aktywny toolchain attempt 899638a17d5e4f5389cbfebcf3f8af69,
+uchwyt 33865; MFEM CUDA zakończony 269/269, hypre/PETSc/SLEPc CPU zbudowane,
+trwa MFEM CPU. Stare API nadal działa. Nowy pakiet aplikacji, próba MPFR i pełny
+Universe pozostają NOT VERIFIED. To kontynuacja aktywnego E0–E12, nie zakończenie zadania.
