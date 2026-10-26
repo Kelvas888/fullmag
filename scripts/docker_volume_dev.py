@@ -2105,6 +2105,26 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
     raise BuildControlError("Backend publication observation timed out; services and volumes retained")
 
 
+_RUNTIME_ADMISSION_FAILED = "Startup or runtime failed; admission closed:"
+_RUNTIME_STARTUP_DIAGNOSTIC = "Runtime startup failed; starting diagnostic API only:"
+
+
+def _readiness_failure(process_receipt, logs):
+    """Return why this backend incarnation can never become healthy, or None."""
+    if (str(process_receipt.get("state", "")).startswith("failed")
+            and _RUNTIME_ADMISSION_FAILED in logs):
+        return ("Runtime admission failed; services retained: "
+                + str(process_receipt.get("error", "unknown failure"))[:4096])
+    # A runtime that fails before it owns anything serves a diagnostic API and
+    # keeps the previous incarnation's process receipt, so only this
+    # incarnation's log identifies it. It never turns healthy.
+    for line in logs.splitlines():
+        if _RUNTIME_STARTUP_DIAGNOSTIC in line:
+            reason = line.split(_RUNTIME_STARTUP_DIAGNOSTIC, 1)[1].strip()
+            return "Runtime startup failed; diagnostic API retained: " + reason[:4096]
+    return None
+
+
 def _finish(control, operation, document, backend_id, frontend_id, selected, state,
             certificate_path, certificate, cache, toolchain, image, git_common, ledger_profile, port):
     import fullmag_docker_runtime as runtime
@@ -2218,15 +2238,16 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
                 expected_started_at=operation["receipt"]["backend_started_at"] if service == "backend" else None)
             if not observed.get("State", {}).get("Running"):
                 raise BuildControlError("DEV service exited before readiness: " + service)
-        process_receipt = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", _PROCESS_RECEIPT_PROBE))
-        if str(process_receipt.get("state", "")).startswith("failed"):
-            logs = docker_text("logs", "--since", operation["receipt"]["backend_started_at"],
-                               "--tail", "100", backend_id, combined=True)
-            if "Startup or runtime failed; admission closed:" in logs:
-                control.write(operation["root"] + "/process-failure.json", process_receipt)
-                raise BuildControlError("Runtime admission failed; services retained: " + str(process_receipt.get("error", "unknown failure"))[:4096])
         if all(service.get("State", {}).get("Health", {}).get("Status") == "healthy" for service in services):
             break
+        process_receipt = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", _PROCESS_RECEIPT_PROBE))
+        logs = docker_text("logs", "--since", operation["receipt"]["backend_started_at"],
+                           "--tail", "100", backend_id, combined=True)
+        failure = _readiness_failure(process_receipt, logs)
+        if failure is not None:
+            if failure.startswith("Runtime admission failed"):
+                control.write(operation["root"] + "/process-failure.json", process_receipt)
+            raise BuildControlError(failure)
         time.sleep(3)
     else:
         raise BuildControlError("API/frontend readiness timed out; services and Docker data retained")
