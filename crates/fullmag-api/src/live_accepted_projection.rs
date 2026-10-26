@@ -332,6 +332,37 @@ async fn poll_once(
             return Err(error);
         }
     };
+    // A running stage whose latest observation carries only scalars (a FEM
+    // worker between field snapshots) executes the same accepted plan; its
+    // fields must stay requestable, so derive the capabilities from it too.
+    if running_capabilities.is_none()
+        && !matches!(projection.status, "completed" | "failed" | "cancelled")
+    {
+        if let Some((_, observation)) = projection.live_observation.as_ref() {
+            if let Ok(prepared) = ensure_stage_preparation_for_step(
+                state,
+                &context,
+                &observation.header.step_id,
+                None,
+            )
+            .await
+            {
+                running_capabilities = projection
+                    .accepted_runtime_problem
+                    .as_ref()
+                    .and_then(|problem| {
+                        running_runtime_capabilities(
+                            problem,
+                            &prepared.execution_plan,
+                            &observation.header.realization,
+                        )
+                    })
+                    .map(|capabilities| {
+                        (capabilities, prepared.execution_plan.common.execution_mode)
+                    });
+            }
+        }
+    }
     if let Some((capabilities, mode)) = running_capabilities {
         projection.accepted_runtime_capabilities = Some(capabilities);
         projection.accepted_runtime_mode = Some(mode);
