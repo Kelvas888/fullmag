@@ -84,10 +84,14 @@ export function FooterTelemetry({
   const status = useSessionStatusSelector(selectFooterTelemetryStatus, {
     isEqual: footerTelemetryStatusEquals,
   });
+  const solverStatus = useSolverStatusResource({ enabled: Boolean(status) });
+  const stageExecution = useStageExecutionResource({ enabled: Boolean(status) });
+  const antennaStage = resolveFooterAntennaStage(status, stageExecution.data);
+  const antennaNowMs = useAntennaStageClock(antennaStage?.clockKey ?? null);
   const liveSample = useFooterLiveScalarSample(bus);
   const scalarWindow = useScalarWindowResource({
     columns: FOOTER_SCALAR_COLUMNS,
-    enabled: Boolean(status),
+    enabled: Boolean(status) && !antennaStage,
     limit: 1,
     tail: true,
   });
@@ -103,14 +107,12 @@ export function FooterTelemetry({
     () => resolvePrimaryTelemetryObjectId(scene.data, selectedObjectId),
     [scene.data, selectedObjectId],
   );
-  const objectMetrics = useObjectMetricsResource(objectId);
-  const solverStatus = useSolverStatusResource({ enabled: Boolean(status) });
-  const stageExecution = useStageExecutionResource({ enabled: Boolean(status) });
+  const objectMetrics = useObjectMetricsResource(antennaStage ? null : objectId);
   const responseProgress = useFrequencyDomainResponseProgressResource({
-    enabled: Boolean(status),
+    enabled: Boolean(status) && !antennaStage,
   });
   const responseSweep = useFrequencyDomainResponseSweepResource({
-    enabled: Boolean(status),
+    enabled: Boolean(status) && !antennaStage,
   });
   const currentRun = useCurrentRunResource({ enabled: Boolean(status) });
   const userSolvePhase = status
@@ -141,6 +143,7 @@ export function FooterTelemetry({
     scalarResourceSample,
     {
       magneticModelPresent: resolveFooterMagneticModelPresent(scene),
+      nowMs: antennaNowMs,
       stageExecutionUnpublished,
       userSolvePhase,
     },
@@ -246,6 +249,8 @@ type FooterTelemetryStatus = {
     | "solver_time"
   > | null;
   sessionId: string;
+  sessionEpoch: string;
+  requestScopeEpoch: string;
   scalarsRevision: number;
   solver: Pick<
     LiveStatusResource["solver"],
@@ -287,6 +292,8 @@ export function selectFooterTelemetryStatus(
         }
       : null,
     sessionId: data.session.session_id,
+    sessionEpoch: data.session.session_epoch,
+    requestScopeEpoch: data.session.request_scope_epoch,
     scalarsRevision: data.resources.scalars_revision,
     solver: {
       converged: data.solver.converged ?? null,
@@ -308,6 +315,8 @@ export function footerTelemetryStatusEquals(
     Object.is(previous.metrics.steps_per_second, next.metrics.steps_per_second) &&
     Object.is(previous.metrics.total_steps, next.metrics.total_steps) &&
     Object.is(previous.sessionId, next.sessionId) &&
+    Object.is(previous.sessionEpoch, next.sessionEpoch) &&
+    Object.is(previous.requestScopeEpoch, next.requestScopeEpoch) &&
     Object.is(previous.scalarsRevision, next.scalarsRevision) &&
     Object.is(previous.run?.run_id ?? null, next.run?.run_id ?? null) &&
     Object.is(
@@ -377,10 +386,14 @@ export function buildFooterTelemetryModel(
   scalarResourceSample?: FooterScalarResourceSample | null,
   runtimePhase?: {
     magneticModelPresent?: boolean | null;
+    nowMs?: number | null;
     stageExecutionUnpublished?: boolean;
     userSolvePhase?: RuntimeUserSolvePhase | null;
   },
 ) {
+  const antennaStage = resolveFooterAntennaStage(status, stageExecution);
+  if (antennaStage) return buildAntennaSolveTelemetry(antennaStage, runtimePhase?.nowMs ?? null);
+
   const liveSampleForStatus = resolveLiveSampleForStatus(status, liveSample);
   const scalarSample = selectLatestFooterScalarSample(
     liveSampleForStatus,
@@ -657,6 +670,94 @@ export function buildFooterTelemetryModel(
     statusDetail: status ? "Runtime telemetry" : "Waiting for runtime",
     statusState: runtimeState,
     statusTitle,
+  };
+}
+
+type FooterAntennaStage = {
+  clockKey: string | null;
+  record: StageExecutionResource["stages"][number];
+};
+
+function resolveFooterAntennaStage(
+  status: FooterTelemetryStatus | null | undefined,
+  execution: StageExecutionResource | null | undefined,
+): FooterAntennaStage | null {
+  if (!status?.sessionId || !status.sessionEpoch || !status.requestScopeEpoch ||
+    !status.run?.run_id || !execution ||
+    execution.session_id !== status.sessionId ||
+    execution.session_epoch !== status.sessionEpoch ||
+    execution.request_scope_epoch !== status.requestScopeEpoch ||
+    execution.run_id !== status.run.run_id) return null;
+
+  // Accepted terminal/pending runs have no active index. Only a single-stage
+  // run is unambiguous in that case; never guess a multi-stage run's physics.
+  const index = execution.active_stage_index ?? (execution.stages.length === 1 ? 0 : null);
+  if (index === null || !Number.isInteger(index) || index < 0) return null;
+  const record = execution.stages[index];
+  if (!record || record.index !== index || !record.stage_id?.trim() ||
+    !record.antenna_solve_stage_id?.trim() ||
+    !["pending", "running", "completed", "failed", "cancelled"].includes(record.status)) return null;
+
+  const clockKey = record.status === "running" && execution.runtime_state === "running" &&
+    validStageTimestamp(record.started_at_unix_ms)
+    ? JSON.stringify([execution.session_id, execution.session_epoch,
+      execution.request_scope_epoch, execution.run_id, record.stage_id,
+      record.antenna_solve_stage_id, record.started_at_unix_ms])
+    : null;
+  return { clockKey, record };
+}
+
+function validStageTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function useAntennaStageClock(identity: string | null): number | null {
+  const [clock, setClock] = useState<{ identity: string; nowMs: number } | null>(null);
+  useEffect(() => {
+    if (!identity) return;
+    const timer = globalThis.setInterval(() => {
+      setClock({ identity, nowMs: Date.now() });
+    }, 1_000);
+    return () => globalThis.clearInterval(timer);
+  }, [identity]);
+  return clock?.identity === identity ? clock.nowMs : null;
+}
+
+function buildAntennaSolveTelemetry(stage: FooterAntennaStage, nowMs: number | null) {
+  const { record } = stage;
+  const state = record.status;
+  const label = state.charAt(0).toUpperCase() + state.slice(1);
+  const reason = record.state_transition_reason ?? record.reason ?? null;
+  const start = record.started_at_unix_ms;
+  const end = state === "running" ? nowMs : record.completed_at_unix_ms;
+  const elapsed = validStageTimestamp(start) && validStageTimestamp(end) && end >= start
+    ? formatDuration((end - start) / 1_000)
+    : "Not reported";
+  const percent = record.progress_percent;
+  const progress = typeof percent === "number" && Number.isFinite(percent) && percent >= 0 && percent <= 100
+    ? `${COMPACT_DECIMAL_FORMAT.format(percent)}%` : "Not reported";
+  const results = state === "running" ? "Awaiting result"
+    : state === "pending" ? "Awaiting execution"
+      : state === "completed" ? "Check saved results" : "Not completed";
+  const metric = (id: string, title: string, value: string, detail: string): FooterTelemetryMetric => ({
+    id, label: title, value, detail, subdetail: "Authoritative antenna stage execution",
+    icon: <Radio size={14} aria-hidden="true" />,
+  });
+  return {
+    awaitingCompute: false,
+    frequencyDomainProgress: null,
+    stageProgressNotice: null,
+    metrics: [
+      metric("antenna-state", "Solve state", label, reason ? String(reason) : "Antenna field solve lifecycle"),
+      metric("antenna-elapsed", "Stage elapsed", elapsed, "Wall-clock stage duration; not CPU time or LLG simulation time"),
+      metric("antenna-progress", "Progress", progress, record.progress_detail ?? record.progress_label ?? "No numerical progress estimate is asserted"),
+      metric("antenna-results", "Results", results, "Completion does not establish saved-result availability or verification"),
+    ],
+    onlineDetail: "Live session channel",
+    onlineTitle: state === "running" ? "Online / Active" : "Online / Antenna solve",
+    statusDetail: reason ? String(reason) : "Antenna field solve lifecycle",
+    statusState: state,
+    statusTitle: `System Status: Antenna solve — ${label}`,
   };
 }
 
