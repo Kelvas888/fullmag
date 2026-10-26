@@ -4,11 +4,12 @@ import type {
   ComputeNodeInventoryNodeSummary,
   ComputeNodeInventorySummary,
 } from "./model/types";
+import { CopyableIdentifier } from "./ui/CopyableIdentifier";
 
 const GIB = 1024 ** 3;
-const cpuFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
-const gibFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
-const sampleTimeFormat = new Intl.DateTimeFormat(undefined, {
+const cpuFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+const gibFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+const sampleTimeFormat = new Intl.DateTimeFormat("en-US", {
   dateStyle: "medium",
   timeStyle: "short",
 });
@@ -78,7 +79,7 @@ function NodeSummary({ node }: { readonly node: ComputeNodeInventoryNodeSummary 
       <div className="fm-start-node-summary__head">
         <div>
           <h3>Compute node</h3>
-          <p>{node.nodeId}</p>
+          <p><CopyableIdentifier label="compute host ID" value={node.nodeId} /></p>
         </div>
         <span className="fm-start-compute-settings__status" data-state={nodeStateTone(node.state)}>
           {stateLabel}
