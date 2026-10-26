@@ -146,3 +146,11 @@ Produkcja CI dla `3d971a97a8e4774145887cdcf516ffb7375c6e0e` zaliczyła pełny me
 Następny test FEM nie znajdował semantic-orphan. Root odtworzył ten sam RED w izolowanym semantic fixture: portaled diagnostics pozostało otwarte po odczycie i przechwytywało górne wiersze skanu clicków. Zamknięcie go normalnym Escape oraz oczekiwanie hidden przed pomiarem bounds daje GREEN wszystkich3 encji (Airbox, semantic-magnet, semantic-orphan) i Boundary Faces. Nie zmieniono siatki skanowania, danych, punktów, click actionability ani oczekiwanego zbioru encji.
 
 Pełny pomocniczy FEM topology upload audit po tej zmianie: PASS12 pomiarów (4 pass combinations ×1/10/100 części), position upload plateau, semantic picking3nodes i pre-canvas error boundary. Source syntax/diff checks PASS. Ślad RED i pełne GREEN zachowane w raporcie wdrożenia. Dowód jest z fixture'ów browserowych/SwiftShader, nie wykonania solvera FEM. Wymagane produkcyjne CI commita z zamknięciem popoveru pozostaje do wykonania.
+
+## Pełny Inspector smoke — właściwy właściciel akcji tekstury
+
+CI dla `6a4571fb4c32ef2bbd63b7f320094e6d96d9cb67` zaliczył memory-churn120 i FEM topology12; dalszy Inspector smoke szukał starego Save Texture w treści panelu. Edytowalne asset/region/transform mają staged session i centralny Apply, więc skorygowano wyłącznie selector do istniejącej stopki. Asercje transakcji, fokusu/scrolla/opacity, liczby requestów i budżet renderów<=3 pozostają bez zmian.
+
+Root uruchomił cały pomocniczy DEV smoke bez instalowania Three.js na hoście: oryginalna funkcja projekcji wykonuje się przez Node z istniejącą Three.js we frontendzie Compose, wynikJSON wraca do hostowego browser drivera. Pozostałe różnice orchestration to import/launch; żaden test nie jest pominięty. Nowy selector wykonuje zapis/ACK i zalicza stabilnyDOM/fokus/scroll/opacity, ale DEV dochodzi do4 renderów przy limicie3. Cały lokalny smoke pozostaje NIEZALICZONY; evidence zapisany. Niezależnie badamy ten wynik i wymagamy kanonicznego produkcyjnegoCI, bez podnoszenia limitu lub zmiany zakresu pomiaru.
+
+Pozostałe downstream fixtures: Adaptive Study i Analysis plots PASS lokalnie na mockowanymAPI, bez Solve. Pełny statyczny Home też ma wcześniejszy PASS. Nie rozszerzono autoryzacji testów na lokalną kompilację native unit tests.

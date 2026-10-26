@@ -1783,7 +1783,7 @@ async function qualifyMagneticTextureMutationStability(page, inspector, fixture)
   const preset = panel.locator('select[aria-label="Preset"]');
   const magnetizationRef = panel.locator('input[aria-label="Magnetization ref"]');
   const unrelatedControl = panel.locator('input[aria-label="Asset label"]');
-  const saveButton = panel.getByRole("button", { name: "Save Texture", exact: true });
+  const saveButton = inspector.locator(".fm-inspector__action-bar").getByRole("button", { name: "Apply", exact: true });
   await preset.selectOption("vortex_wall");
   await magnetizationRef.fill("mag:film:vortex_wall");
   await unrelatedControl.fill("Vortex wall browser regression");
