@@ -64,3 +64,32 @@ Brak skilla fullmag-build-stage-cleanup: zastosowano reguły governance.
 Zachowano wszystkie wyniki, historię, receipty, obecny i rollback pakiet oraz
 cache. Niczego nie usunięto. Ponowna ocena retencji po odbiorze całego etapu
 oraz potwierdzeniu, że starsze pakiety nie są potrzebne do rollbacku.
+
+
+## Uzupełnienie: rzeczywiste obliczenie nowego pakietu po commicie
+
+Po zapisaniu poprawki wykonano jedną nową próbę przez publiczne API, z dokładnie
+zachowanymi wejściami fizycznymi i blokadą ponowienia:
+`run-antenna-release-proof-20261026-01`, task
+`task-bc5bac4afdc77341761b1aef4ec3fceaf4ff1e8d324efff9f996c7f67044af39`,
+attempt `attempt-a3cf2ec7130045e7b75f21a1ce8e9026`, epoch 1. Stan Succeeded,
+obserwator i porównanie exit 0. Bundle:
+`6bacf94351693955f5b97ab7485613e5a23cc29e835ffaf02527cdb6389e0ca4`.
+Wszystkie 21 payloadów naukowych są identyczne z referencją
+`0c6d035aa25b2cf9dddf9794b4609ccbe9662efb0ca3a99175a4edd217fae1bf`.
+Pełne diagnostyki binary64/80/120 i liczniki pracy są zgodne po wyłączeniu
+pomiarów czasu/RSS. Profil ma dziewięć faz, dokładną sumę czasu i nie zgłasza
+accounting_issue. Receipt SHA256:
+`7373d691953aa597b0cb5e8d1affc5f496a7993a4e31fa3f4f7d7ae84312184f`.
+
+Operator: 363,113 s; całe działanie: 437,958 s. Fazy wysokiej precyzji:
+112,266 s i 194,390 s, łącznie około 84,5% native operatora. Dokładna geometria:
+31,339 s; consistency: 19,394 s. Nie deklarować przyspieszenia z pojedynczego
+porównania. Krótka próbka aktywnego workera: około 125% CPU przy limicie 3 CPU,
+brak throttlingu w tej próbce; nie jest to kwalifikacja całego czasu wykonania.
+
+Dowody tej próby w podkatalogu `on/` katalogu kontrolnego tego raportu:
+submit-request/response, materialization, run-latest, output-catalog,
+verified-profile-receipt i comparison. Osobno `active-worker-cpu.json`.
+Zakres naukowy pozostaje ograniczony: 14 targetów, nie pełny Universe.
+Nie uzyskano jeszcze kwalifikowanej bazy pola, sprzężenia LLG ani odbioru UI.
