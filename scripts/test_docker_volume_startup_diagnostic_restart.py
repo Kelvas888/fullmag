@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from docker_build_control import BuildControlError, canonical
@@ -123,6 +123,11 @@ class AuthenticationTests(unittest.TestCase):
             self.assertIsInstance(context, restart.StartupDiagnosticStopContext)
             self.assertEqual(set(context), {"previous_config_sha256", "startup_diagnostic_restart"})
             self.assertEqual(context["previous_config_sha256"], DIGEST)
+
+    def test_owner_digest_uses_canonical_overmounted_control_record(self):
+        control = Mock(); control.read_bytes.return_value = b"retained Failed owner"
+        self.assertEqual(restart._owner_digest(control), sha(control.read_bytes.return_value))
+        control.read_bytes.assert_called_once_with("runtime-control/runtime-services/OWNER.json", maximum=256 * 1024)
 
     def test_incomplete_native_recovery_is_rejected(self):
         with self.assertRaises(BuildControlError): Fixture().invoke(completed=False)

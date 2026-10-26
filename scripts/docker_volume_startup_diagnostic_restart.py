@@ -6,7 +6,7 @@ import json
 import re
 from typing import Mapping
 
-from docker_build_control import BuildControlError, canonical, docker_capture
+from docker_build_control import BuildControlError, canonical
 
 SCHEMA = "fullmag.docker-startup-diagnostic-restart.v1"
 STOP_SCHEMA = "fullmag.docker-startup-diagnostic-stop.v1"
@@ -47,30 +47,11 @@ def _read(control, relative, label):
     return _read_canonical_control_record(control, relative, label)
 
 
-def _owner_digest(control, actual):
-    from docker_volume_capture_failure_reconcile import _mount_arg
-    # Only hashes the retained Failed owner. No execution or repair is performed.
-    code = """import hashlib,os,stat
-p='/state/runs/docker-all/session-store/runtime-services/OWNER.json'
-f=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)
-try:
- s=os.fstat(f)
- if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1 or not 0<s.st_size<=262144: raise RuntimeError('invalid owner file')
- raw=os.read(f,262145)
- if len(raw)!=s.st_size: raise RuntimeError('owner changed')
- print(hashlib.sha256(raw).hexdigest())
-finally: os.close(f)
-"""
-    result = docker_capture("run", "--rm", "--pull", "never", "--network", "none", "--runtime", "runc",
-        "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-        "--user", "65532:65532", "--memory", "96m", "--pids-limit", "24",
-        "--label", "com.docker.compose.project=" + control.project,
-        "--label", "com.docker.compose.service=startup-diagnostic-readonly-probe",
-        "--mount", _mount_arg(actual, "/state"), "--entrypoint", "/usr/local/bin/python3",
-        actual["Image"], "-B", "-c", code, timeout=90)
-    digest = result.stdout.decode("ascii", "strict").strip()
-    _require(result.returncode == 0 and SHA.fullmatch(digest), "cannot pin retained owner")
-    return digest
+def _owner_digest(control):
+    # OWNER is in the canonical runtime-control tree, overmounted inside /state.
+    raw = control.read_bytes("runtime-control/runtime-services/OWNER.json", maximum=256 * 1024)
+    _require(bool(raw), "retained owner is empty")
+    return _sha(raw)
 
 
 def retained_context(control, previous, document, backend_id, *, fresh_state,
@@ -193,7 +174,7 @@ def retained_context(control, previous, document, backend_id, *, fresh_state,
     released = _released_snapshot(control, actual["backend"])
     _require(released.get("active_count") == 0 and released == journal.get("released_before")
              and released == journal.get("released_after"), "released resource inventory changed")
-    _require(_owner_digest(control, actual["backend"]) == journal["owner_sha256"]
+    _require(_owner_digest(control) == journal["owner_sha256"]
              and dev._read_runtime_config_digest(control) == journal["runtime_config_sha256"],
              "retained owner/runtime config changed")
     history_raw = recovery._control_bytes(control, "runtime-control/runtime-service/process-tree.json")
