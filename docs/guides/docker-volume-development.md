@@ -182,6 +182,14 @@ sprawdza prywatną sieć bez obcych konsumentów, restartuje backend i ponownie
 uruchamia ten sam frontend. Zachowuje cache oraz storage hosta. Nie jest komendą do przerywania obliczeń. Wymaga wyłącznego okna operatorskiego,
 bez równoległych klientów wysyłających polecenia do tej grupy; odczyt health
 nie jest dowodem opróżnienia wszystkich kolejek aplikacji.
+
+Opcjonalny ostatni argument `true` recepty `docker-dev-restart-idle` przekazuje
+istniejący tryb `--allow-prepared-session`. Pozwala zachować nigdy niewykonane,
+wstrzymane zadania Study również po zakończonym zadaniu. Nadal wymagane są
+sprawdzenie ich historii i brak aktywnych konsumentów oraz natywny drain;
+tryb nie zwalnia Solve i nie anuluje zadań. Domyślne `false` zachowuje
+restrykcyjny restart; inne wartości argumentu są odrzucane.
+
 Wyjątkiem od braku aktywnej sesji jest dokładnie przypięty model nieudanej
 aktywacji, którego przyjęte zadanie zostało jawnie anulowane przed rozpoczęciem
 przygotowania. Wymagany jest trwały dowód anulowania, brak rezerwacji i bieżącego

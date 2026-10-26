@@ -6,12 +6,11 @@ import unittest
 
 
 class DevelopmentRecoveryShellTests(unittest.TestCase):
-    def dispatch(self, recipe):
+    def dispatch(self, recipe, marker='  *"scripts/docker_volume_development_interrupted.py"*)\n'):
         source = globals().get('WRAPPER') or (Path(__file__).resolve().parent / 'just_storage_shell.sh').read_text()
-        marker = '  *"scripts/docker_volume_development_interrupted.py"*)\n'
         body = source.split(marker, 1)[1].split('\n    ;;', 1)[0]
         program = ('set -euo pipefail\nrecipe="$RECIPE_LITERAL"\n'
-                   'python_cmd="/recorded/python"\nscript_dir="/registered/checkout/scripts"\n'
+                   'python_cmd="/recorded/python"\nrepo_root="/registered/checkout"\nscript_dir="/registered/checkout/scripts"\n'
                    'exec() { printf \'%s\\0\' "$@"; }\n' + body)
         return subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', program],
             env={**os.environ, 'RECIPE_LITERAL': recipe}, capture_output=True, timeout=15)
@@ -51,6 +50,32 @@ class DevelopmentRecoveryShellTests(unittest.TestCase):
                 result = self.dispatch(recipe)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(result.stdout)
+
+
+    def test_idle_restart_preserves_explicit_prepared_session_flag(self):
+        recipe = ('python "/ignored/scripts/docker_dev.py" --repo-root "/ignored" '
+                  "restart-idle-volume --attempt '" + 'a' * 32 + "' --config-sha256 '" + 'b' * 64
+                  + "' --source-root '/selected/$(printf injected);worktree' --port '3203'")
+        marker = '  *"scripts/docker_dev.py"*)\n'
+        expected = [b'/recorded/python', b'/registered/checkout/scripts/docker_dev.py',
+                    b'--repo-root', b'/registered/checkout', b'restart-idle-volume',
+                    b'--attempt', b'a' * 32, b'--config-sha256', b'b' * 64,
+                    b'--source-root', b'/selected/$(printf injected);worktree', b'--port', b'3203']
+        for suffix in ('', ' --allow-prepared-session', ' --stop-only --allow-prepared-session'):
+            with self.subTest(suffix=suffix):
+                result = self.dispatch(recipe + suffix, marker=marker)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.split(b'\0')[:-1],
+                                 expected + [word.encode() for word in suffix.split()])
+        for suffix in (' --allow-prepared-session --allow-prepared-session',
+                       ' --allow-prepared-session true', ' --allow-prepared-session; printf injected',
+                       ' --allow-prepared-session && printf injected',
+                       ' --allow-prepared-session\nprintf injected'):
+            with self.subTest(suffix=suffix):
+                result = self.dispatch(recipe + suffix, marker=marker)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(result.stdout)
+
 
 
 if __name__ == '__main__':

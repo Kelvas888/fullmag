@@ -738,3 +738,28 @@ Końcowa kontrola po dodaniu przyczyny błędu: pełny TypeScript exit 0,
 focused ESLint exit 0, git diff --check exit 0. Obraz inspektora po zmianach
 pozostaje NOT VERIFIED; brak nowej obserwacji użytkownika i automatycznego
 odczytu przeglądarki.
+
+### Przygotowanie benchmarku ponownego użycia danych — 26.10.2026
+
+Zamrożono bazowy surface_rt0.cpp w control volume jako
+verification/surface-rt0-reuse-20261026/baseline-surface_rt0.cpp; SHA256
+86c0eac03929a3ccad406359c5fc56db94363b9c7b056b5c9dffea6e8bb1e1d4.
+Przed zmianą zapisano kryteria parytetu i pomiaru. Nowy WIP przechowuje
+4π osobno w Arithmetic każdej precyzji/targetu, a konwersję qvector wykonuje
+raz przy pierwszym faktycznym użyciu na ścianie. Kolejność sumowania, trzy
+precyzje, odmowy konwersji double, limity i tolerancje pozostają zachowane.
+Niezależny przegląd nie znalazł blokera; brak jeszcze buildu i pomiaru, więc
+przyspieszenie i parytet pozostają NOT VERIFIED. Liczniki usuniętych operacji
+mają rzeczywiście zmaleć, nie być sztucznie równe bazie.
+
+Pierwszy restart-idle odrzucono przed zatrzymaniem backendu: dwa starsze runy
+36bd5149… i 6a1ab0df… pozostają accepted i nigdy niewykonane. Frontend
+przywrócono. Istniejący CLI obsługuje allow-prepared-session z kontrolą
+historii i drain, ale recepta i ścisły dispatcher nie udostępniały flagi.
+Uzupełniono tylko przekazanie istniejącej flagi; domyślnie false, bez nowej
+polityki i bez pominięcia walidatora. Pierwsze wywołanie z flagą odrzucono
+w dispatcherze przed efektem; następnie uzupełniono jego dokładną gramatykę
+i stałe argv. Cztery interpretowane testy wrappera PASS w backendzie, w tym
+8 wariantów restartu: brak opt-in, jawny opt-in, stop-only oraz odrzucanie
+duplikatu, wartości, separatora, && i nowej linii. Trzy dry-run recepty:
+false/true zgodnie z oczekiwaniem, wartość niepoprawna odrzucona.
