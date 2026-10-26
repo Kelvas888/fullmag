@@ -174,6 +174,7 @@ def _result(
     session_epoch: str | None = None,
     request_scope_epoch: str | None = None,
     message: str | None = None,
+    rejection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     value: dict[str, Any] = {
         "schema": RESULT_SCHEMA,
@@ -193,6 +194,7 @@ def _result(
         ("session_epoch", session_epoch),
         ("request_scope_epoch", request_scope_epoch),
         ("message", message),
+        ("rejection", dict(rejection) if rejection is not None else None),
     ):
         if item is not None:
             value[key] = item
@@ -384,6 +386,11 @@ def run_script(
                 config_sha256=pins.config_sha256,
                 api_instance_id=api_instance_id,
                 message="The managed API rejected this script; the terminal receipt is retained.",
+                rejection=(
+                    getattr(error, "rejection")
+                    if isinstance(getattr(error, "rejection", None), Mapping)
+                    else None
+                ),
             )
         return _result(
             "unknown",
