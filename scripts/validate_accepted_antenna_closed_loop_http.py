@@ -14,6 +14,22 @@ import urllib.request
 from pathlib import Path
 
 
+def workspace_snapshot(request):
+    health = json.loads(request("/v2/platform/health")[0])
+    active = health.get("active_session")
+    if health.get("status") != "ok" or type(active) is not bool:
+        raise ValueError("Workspace presence is not authoritatively reported")
+    snapshot = {"active_session": active,
+                "sessions": json.loads(request("/v2/sessions")[0])}
+    for name, path in (("scene", "/v2/sessions/current/model/scene"),
+                       ("commands", "/v2/sessions/current/simulation/commands")):
+        value = json.loads(request(path, 200 if active else 404)[0])
+        if not active and value.get("code") != "not_found":
+            raise ValueError("Empty workspace did not return explicit absence")
+        snapshot[name] = value
+    return snapshot
+
+
 def validate(base_url: str, project_id: str, run_id: str) -> dict:
     results = []
 
@@ -42,10 +58,7 @@ def validate(base_url: str, project_id: str, run_id: str) -> dict:
                 return raw, response.headers
 
     def snapshot():
-        return {name: json.loads(request(path)[0]) for name, path in (
-            ("sessions", "/v2/sessions"),
-            ("scene", "/v2/sessions/current/model/scene"),
-            ("commands", "/v2/sessions/current/simulation/commands"))}
+        return workspace_snapshot(request)
 
     before = snapshot()
     base = f"/v2/persistence/projects/{urllib.parse.quote(project_id, safe='')}/runs/{urllib.parse.quote(run_id, safe='')}/antenna-inspections"
