@@ -127,6 +127,10 @@ docker-dev-restart-idle attempt config_sha256 source_root port="3197" allow_prep
 docker-dev-inspect-startup-diagnostic source_root backend_container_id image_id report:
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_startup_diagnostic.py" --source-root {{quote(source_root)}} --backend-container-id {{quote(backend_container_id)}} --image-id {{quote(image_id)}} --report {{quote(report)}}
 
+# Preview/apply a pinned pre-owner startup-diagnostic stop; never replay a script.
+docker-dev-stop-startup-diagnostic source_root image_id request request_sha256 apply="false":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_stop_startup_diagnostic.py" --source-root {{quote(source_root)}} --image-id {{quote(image_id)}} --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}}{{if apply == "true" { " --apply" } else if apply == "false" { "" } else { error("apply must be true or false") } }}
+
 # Inspect or stop the exact fenced diagnostic API; preserve Unknown and all data.
 docker-dev-stop-diagnostic attempt config_sha256 source_root port="3197" resume_attempt="" preview="true":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" stop-diagnostic-volume --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}} --port {{quote(port)}}{{if resume_attempt == "" { "" } else { " --resume-attempt " + quote(resume_attempt) } }}{{if preview == "true" { " --preview" } else if preview == "false" { "" } else { error("preview must be true or false") } }}

@@ -97,6 +97,17 @@ case "${recipe}" in
       --source-root "${BASH_REMATCH[1]}" --backend-container-id "${BASH_REMATCH[2]}" \
       --image-id "${BASH_REMATCH[3]}" --report "${BASH_REMATCH[4]}"
     ;;
+  *"scripts/docker_volume_stop_startup_diagnostic.py"*)
+    startup_stop_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_stop_startup_diagnostic.py\" --source-root '([^']+)' --image-id '(sha256:[0-9a-f]{64})' --request '(verification/[A-Za-z0-9._/-]+\\.json)' --request-sha256 '([0-9a-f]{64})'( --apply)?[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${startup_stop_pattern} ]]; then
+      echo "[fullmag just] invalid startup diagnostic stop recipe" >&2
+      exit 2
+    fi
+    startup_stop_args=(--source-root "${BASH_REMATCH[1]}" --image-id "${BASH_REMATCH[2]}"
+      --request "${BASH_REMATCH[3]}" --request-sha256 "${BASH_REMATCH[4]}")
+    if [[ -n "${BASH_REMATCH[5]:-}" ]]; then startup_stop_args+=(--apply); fi
+    exec "${python_cmd}" -B "${script_dir}/docker_volume_stop_startup_diagnostic.py" "${startup_stop_args[@]}"
+    ;;
   *"scripts/docker_dev_preclaim_cancel.py"*)
     preclaim_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_preclaim_cancel.py\" --source-root '([^']+)' --backend-container-id '([0-9a-f]{64})' --image-id '(sha256:[0-9a-f]{64})' --candidate-basename '(published|\\.backend-package-candidate-[A-Za-z0-9._-]+)' --candidate-receipt-sha256 '([0-9a-f]{64})' --request '(verification/[A-Za-z0-9._/-]+)' --request-sha256 '([0-9a-f]{64})'( --apply)?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${preclaim_pattern} ]]; then

@@ -1613,7 +1613,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
           recovery_environment=None, recovery_metadata=None, previous_config_sha256=None,
           native_restart_metadata=None, accepted_reattach_environment=None,
           accepted_reattach_metadata=None, recreation_resume_proof=None,
-          post_build_generation=None, retained_device_access=None, maintenance=None):
+          post_build_generation=None, retained_device_access=None, maintenance=None,
+          startup_diagnostic_restart=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -1628,7 +1629,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                 or any(value is not None for value in (
                     recovery_environment, recovery_metadata, native_restart_metadata,
                     accepted_reattach_environment, accepted_reattach_metadata,
-                    recreation_resume_proof, post_build_generation))):
+                    recreation_resume_proof, post_build_generation, startup_diagnostic_restart))):
             raise BuildControlError("Cancellation maintenance requires its owned operation and retained store, without runtime activation")
     if (provided_control is None) != (provided_operation is None):
         raise BuildControlError("Recovery start requires both control and operation")
@@ -1637,6 +1638,20 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     validated_recovery_environment = _validate_recovery_environment(recovery_environment)
     validated_recovery_metadata = _validate_recovery_metadata(recovery_metadata)
     validated_native_restart_metadata = _validate_recovery_metadata(native_restart_metadata)
+    validated_startup_diagnostic_restart = None
+    if startup_diagnostic_restart is not None:
+        from docker_volume_startup_diagnostic_restart import validate_metadata
+        validated_startup_diagnostic_restart = validate_metadata(startup_diagnostic_restart)
+        if (reuse_state is None or args.script is not None
+                or any(value is not None for value in (recovery_environment, recovery_metadata,
+                    native_restart_metadata, post_build_generation, accepted_reattach_metadata,
+                    accepted_reattach_environment))):
+            raise BuildControlError("Startup diagnostic restart requires the same store without activation or other recovery")
+        if (recreation_resume_proof is None
+                and not getattr(args, "completed_recreation_attempt", None)):
+            raise BuildControlError("Startup diagnostic restart requires an authenticated completed recreation")
+        if previous_config_sha256 != validated_startup_diagnostic_restart["runtime_config_sha256"]:
+            raise BuildControlError("Startup diagnostic restart runtime configuration differs")
     validated_post_build_generation = None
     if post_build_generation is not None:
         from docker_volume_post_build_generation import validate_continuation_metadata
@@ -1765,6 +1780,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         operation_inputs["native_failed_restart"] = validated_native_restart_metadata
     if validated_accepted_reattach_metadata is not None:
         operation_inputs["accepted_reattach"] = validated_accepted_reattach_metadata
+    if validated_startup_diagnostic_restart is not None:
+        operation_inputs["startup_diagnostic_restart"] = validated_startup_diagnostic_restart
     if validated_post_build_generation is not None:
         operation_inputs["post_build_generation"] = validated_post_build_generation
     if recreation_resume_proof is not None:
@@ -1784,14 +1801,23 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                          if provided_operation is None
                          else nullcontext(provided_operation))
     with operation_context as operation:
+        if validated_startup_diagnostic_restart is not None and recreation_resume_proof is not None:
+            leased_records = _validate_recreation_resume_records(
+                args, control, selected, identity, expected_proof=recreation_resume_proof
+            )
+            if leased_records["native_recovery_context"].get("startup_diagnostic_restart") != validated_startup_diagnostic_restart:
+                raise BuildControlError("Startup diagnostic recreation resume changed under start lease")
         if getattr(args, "completed_recreation_attempt", None):
             # Recheck the exact completed transition under the new development
             # lease before any state/cache/admission write or service creation.
             current = _completed_recreation_start_context(control, args, selected, layout)
-            if (current.pop("reuse_state") != reuse_state
-                    or current != {"previous_config_sha256": previous_config_sha256,
-                                   "native_restart_metadata": validated_native_restart_metadata,
-                                   "retained_device_access": retained_device_access}):
+            expected = {"previous_config_sha256": previous_config_sha256,
+                        "retained_device_access": retained_device_access}
+            if validated_startup_diagnostic_restart is not None:
+                expected["startup_diagnostic_restart"] = validated_startup_diagnostic_restart
+            else:
+                expected["native_restart_metadata"] = validated_native_restart_metadata
+            if (current.pop("reuse_state") != reuse_state or current != expected):
                 raise BuildControlError("Completed recreation handoff changed before start")
         operation["receipt"].update(operator_probe_record)
         if maintenance is not None:
@@ -1802,6 +1828,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             operation["receipt"]["container_recovery_environment"] = sorted(
                 validated_recovery_environment
             )
+        if validated_startup_diagnostic_restart is not None:
+            operation["receipt"]["startup_diagnostic_restart"] = validated_startup_diagnostic_restart
         if validated_accepted_reattach_metadata is not None:
             operation["receipt"]["accepted_reattach"] = validated_accepted_reattach_metadata
         if validated_post_build_generation is not None:
@@ -4830,6 +4858,14 @@ def _retained_recovery_context(
     if metadata != expected:
         raise BuildControlError("Retained container recovery metadata differs from authorization")
     if _validate_completed_recovery_receipt(control, authorization, recovery_module):
+        from docker_volume_startup_diagnostic_restart import retained_context as diagnostic_context
+        startup_stop = diagnostic_context(
+            control, previous, document, backend_id or previous.get("backend_container"),
+            fresh_state=fresh_state, authorization=authorization,
+            removed_container_proof=removed_container_proof, actual=actual,
+        )
+        if startup_stop is not None:
+            return startup_stop
         native_restart = _native_failed_stop_recovery_context(
             control, previous, backend_id=backend_id or previous.get("backend_container"),
             fresh_state=fresh_state, removed_container_proof=removed_container_proof,
@@ -5302,6 +5338,11 @@ def _validate_removed_recreation_proof(
         if operation_terminal.get("drained_successor") != witness:
             raise BuildControlError("Completed recreation drained-successor witness differs")
         proof["drained_successor"] = witness
+    from docker_volume_startup_diagnostic_restart import StartupDiagnosticStopContext
+    if isinstance(native_recovery_context, StartupDiagnosticStopContext):
+        if operation_terminal.get("startup_diagnostic_restart") != native_recovery_context["startup_diagnostic_restart"]:
+            raise BuildControlError("Completed recreation startup diagnostic witness differs")
+        proof["startup_diagnostic_restart"] = native_recovery_context["startup_diagnostic_restart"]
     proof["native_recovery_context"] = native_recovery_context
     return snapshot, proof, native_recovery_context
 
@@ -5996,7 +6037,8 @@ def _completed_recreation_start_context(control, args, selected, layout):
         operator_probe_record=operator_probe_record,
     )
     from docker_volume_drained_successor import DrainedSuccessorContext
-    if (not isinstance(recovery, DrainedSuccessorContext)
+    from docker_volume_startup_diagnostic_restart import StartupDiagnosticStopContext
+    if (not isinstance(recovery, (DrainedSuccessorContext, StartupDiagnosticStopContext))
             and (not recovery.get("previous_config_sha256") or not recovery.get("native_restart_metadata")
                  or recovery.get("recovery_environment") or recovery.get("recovery_metadata"))):
         raise BuildControlError("Completed recreation requires the exact managed failed-owner restart proof")
@@ -6425,6 +6467,11 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         drained_successor = isinstance(recovery_context, DrainedSuccessorContext)
         from docker_volume_native_init_successor import NativeInitSuccessorContext
         native_init_successor = isinstance(recovery_context, NativeInitSuccessorContext)
+        from docker_volume_startup_diagnostic_restart import StartupDiagnosticStopContext
+        startup_diagnostic_stopped = isinstance(recovery_context, StartupDiagnosticStopContext)
+        if startup_diagnostic_stopped and (args.script is not None or pre_activation_stop is not None
+                or certificate.get("restart_verified") is not True):
+            raise BuildControlError("Startup diagnostic restart requires verified retained storage without activation")
         if native_init_successor:
             if args.script is not None or pre_activation_stop is not None:
                 raise BuildControlError("Native init successor cannot activate a new script")
@@ -6492,6 +6539,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         )
         if (not fresh_state and pre_activation_stop is None and not pre_api_stopped
                 and not original_after_ready_stop and not native_init_successor and not drained_successor
+                and not startup_diagnostic_stopped
                 and certificate.get("restart_verified") is True):
             retained_environment = document["services"]["backend"]["environment"]
             retained_reattach_declared = (
@@ -6544,6 +6592,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         # authority. It must not enter the mutually exclusive no-native
         # pre-admission path merely because the old storage probe was limited.
         if (not fresh_state and not pre_api_stopped and not native_init_successor and not drained_successor
+                and not startup_diagnostic_stopped
                 and not certificate.get("restart_verified")):
             retained_environment = document["services"]["backend"]["environment"]
             observed_environment = actual["backend"].get("Config", {}).get("Env") or []
@@ -6656,6 +6705,10 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                         or leased_recovery_context.witness != recovery_context.witness):
                     raise BuildControlError("Drained-successor proof changed under recreate lease")
                 operation["receipt"]["drained_successor"] = recovery_context.witness
+            if startup_diagnostic_stopped:
+                if not isinstance(leased_recovery_context, StartupDiagnosticStopContext):
+                    raise BuildControlError("Startup diagnostic context changed under recreate lease")
+                operation["receipt"]["startup_diagnostic_restart"] = recovery_context["startup_diagnostic_restart"]
             if native_recovery_context != leased_recovery_context:
                 raise BuildControlError("Retained container recovery capability changed before recreation")
             if native_init_successor:
@@ -6698,7 +6751,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 ]
             if post_build_generation is not None:
                 operation["receipt"]["post_build_generation"] = post_build_generation
-            if post_build_generation is not None or native_init_successor or drained_successor:
+            if post_build_generation is not None or native_init_successor or drained_successor or startup_diagnostic_stopped:
                 # The retained snapshot was observed before this lease. Pin
                 # both application services again under the recreate lease;
                 # the post-build proof must never authorize stop/rm from a
@@ -6736,7 +6789,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                         retained_image_config,
                         allow_legacy_frontend=True,
                     )
-                    if native_init_successor and any(
+                    if (native_init_successor or startup_diagnostic_stopped) and any(
                         observed.get("State", {}).get(key) != before.get("State", {}).get(key)
                         for key in ("Running", "Status", "Pid", "StartedAt", "FinishedAt",
                                     "ExitCode", "OOMKilled")
@@ -6930,6 +6983,13 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             operation["daemon_pending"] = False
             operation["receipt"].update(state="succeeded", removed_containers=list(ids.values()),
                                         retained_volumes=previous["backend_volumes"], retained_frontend_volume=previous["frontend_volume"])
+        if startup_diagnostic_stopped:
+            args.completed_recreation_attempt = operation["receipt"]["attempt"]
+            args.completed_recreation_sha256 = hashlib.sha256(
+                canonical(operation["receipt"]) + b"\n"
+            ).hexdigest()
+            completed_context = _completed_recreation_start_context(control, args, selected, layout)
+            return start(args, **completed_context)
         if post_build_generation is not None:
             # The old namespace is now intentionally gone.  Reuse the same
             # terminal/snapshot/authoritative-Docker-absence validator used by

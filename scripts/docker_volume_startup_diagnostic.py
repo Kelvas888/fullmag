@@ -85,6 +85,8 @@ if (config.get("schema_version")!="runtime_service_config.v2"
     raise RuntimeError("unexpected managed runtime configuration")
 owner_path=paths.store/"runtime-services/OWNER.json"
 owner_raw=read(owner_path,"historical owner",256*1024);owner=obj(owner_raw)
+runtime._validate_terminal_owner(owner,state="failed",name="historical Failed owner",allowed_child_statuses=("exited_success","exited_failure"))
+history_path=runtime.process_receipt_path(paths);history_raw=read(history_path,"historical process receipt")
 if (owner.get("schema_version")!="runtime_service_owner.v1" or owner.get("state")!="failed"
         or owner.get("target_id")!="docker-all" or len(owner.get("children",[]))!=2
         or {child.get("role") for child in owner["children"]}!={"compute","preparation"}
@@ -135,13 +137,15 @@ if (proc(api_pid)!=api_proc or proc(supervisor["pid"])!=supervisor
         or read(owner_path,"historical owner",256*1024)!=owner_raw
         or read(paths.config,"runtime configuration",256*1024)!=config_raw
         or read(fence_path,"startup failure fence",256*1024)!=fence_raw
-        or read(ledger_path,"host ledger",4*1024*1024)!=ledger_raw):
+        or read(ledger_path,"host ledger",4*1024*1024)!=ledger_raw
+        or read(history_path,"historical process receipt")!=history_raw):
     raise RuntimeError("startup diagnostic identity changed during inspection")
 print(json.dumps({"schema":"fullmag.docker-startup-diagnostic-guest.v1",
     "api":api_proc,"supervisor":supervisor,"api_instance_id":instance,
     "api_instance_evidence":"live matching health/openapi/status headers; PID binds fence through process environment",
     "fence_path":str(fence_path),"fence_sha256":sha(fence_raw),"fence":fence,
     "owner_sha256":sha(owner_raw),"owner":owner,"runtime_config_sha256":sha(config_raw),
+    "historical_process_receipt_sha256":sha(history_raw),
     "ledger_sha256":sha(ledger_raw),"local_lease_digests":lease_digests,
     "provenance_sha256":sha(provenance_raw),"build_commit":commit,"build_snapshot":snapshot,
     "active_reservations":0,"active_local_leases":0,"historical_process_receipt_used_as_current":False},sort_keys=True))
