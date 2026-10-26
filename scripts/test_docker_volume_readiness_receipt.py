@@ -58,5 +58,27 @@ class ReadinessFailureTests(unittest.TestCase):
         logs = 'backend-dev: phase=api state=exec mode=backend\n[fullmag-backend] Ready: API and runtime service\n'
         self.assertIsNone(docker_volume_dev._readiness_failure({'state': 'not-published'}, logs))
 
+class ConsumerInventoryTests(unittest.TestCase):
+    def inventory(self, inspect_result):
+        listed = 'a' * 64 + '\n' + 'b' * 64 + '\n' + 'c' * 64 + '\n'
+        with patch.object(docker_volume_dev, 'docker_text', return_value=listed), \
+                patch.object(docker_volume_dev, 'docker_capture', return_value=inspect_result):
+            return docker_volume_dev.consumers()
+
+    def test_container_that_vanished_or_stopped_after_listing_is_not_a_consumer(self):
+        running = {'Id': 'a' * 64, 'State': {'Running': True}}
+        stopped = {'Id': 'c' * 64, 'State': {'Running': False}}
+        result = SimpleNamespace(
+            returncode=1,
+            stdout=json.dumps([running, stopped]).encode(),
+            stderr=('Error: No such object: ' + 'b' * 64 + '\n').encode(),
+        )
+        self.assertEqual(self.inventory(result), [running])
+
+    def test_other_inspection_failures_still_fail(self):
+        result = SimpleNamespace(returncode=1, stdout=b'[]', stderr=b'permission denied\n')
+        with self.assertRaises(docker_volume_dev.BuildControlError):
+            self.inventory(result)
+
 if __name__ == '__main__':
     unittest.main()
