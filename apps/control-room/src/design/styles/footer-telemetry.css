@@ -192,8 +192,8 @@
   border-color: color-mix(in srgb, var(--fm-metric-color) 55%, var(--fm-border-default));
   background: linear-gradient(
     160deg,
-    color-mix(in srgb, var(--fm-bg-panel-raised) 82%, var(--fm-metric-color)) 0%,
-    color-mix(in srgb, var(--fm-bg-panel-raised) 94%, var(--fm-metric-color)) 100%
+    color-mix(in srgb, var(--fm-bg-panel-raised) 92%, var(--fm-metric-color)) 0%,
+    color-mix(in srgb, var(--fm-bg-panel-raised) 97%, var(--fm-metric-color)) 100%
   );
   transform: translateY(-1px);
   box-shadow:
@@ -250,7 +250,7 @@
 }
 
 .fm-footer-telemetry__metric-unit {
-  color: var(--fm-text-muted);
+  color: var(--fm-text-tertiary);
   font-family: var(--fm-font-mono);
   font-size: var(--fm-font-size-2xs);
   font-weight: 500;
@@ -262,7 +262,7 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
-  color: var(--fm-text-muted);
+  color: var(--fm-text-tertiary);
   font-size: var(--fm-font-size-2xs);
   font-weight: 500;
   line-height: 1.35;
@@ -344,18 +344,11 @@
   }
 }
 
-/* ── Group color definitions (dark theme — Catppuccin Mocha) ── */
-
-.fm-footer-telemetry__metric[data-group="runtime"]      { --fm-metric-color: #89b4fa; } /* blue   */
-.fm-footer-telemetry__metric[data-group="solver"]       { --fm-metric-color: #a6e3a1; } /* green  */
-.fm-footer-telemetry__metric[data-group="magnetization"]{ --fm-metric-color: #cba6f7; } /* mauve  */
-.fm-footer-telemetry__metric[data-group="energy"]       { --fm-metric-color: #fab387; } /* peach  */
-
-/* Light theme overrides (Catppuccin Latte) */
-[data-fm-theme="light"] .fm-footer-telemetry__metric[data-group="runtime"]       { --fm-metric-color: #1e66f5; }
-[data-fm-theme="light"] .fm-footer-telemetry__metric[data-group="solver"]        { --fm-metric-color: #40a02b; }
-[data-fm-theme="light"] .fm-footer-telemetry__metric[data-group="magnetization"] { --fm-metric-color: #8839ef; }
-[data-fm-theme="light"] .fm-footer-telemetry__metric[data-group="energy"]        { --fm-metric-color: #fe640b; }
+/* Group hues are semantic UI categories, defined per theme in theme.css. */
+.fm-footer-telemetry__metric[data-group="runtime"] { --fm-metric-color: var(--fm-category-runtime); }
+.fm-footer-telemetry__metric[data-group="solver"] { --fm-metric-color: var(--fm-category-solver); }
+.fm-footer-telemetry__metric[data-group="magnetization"] { --fm-metric-color: var(--fm-category-magnetization); }
+.fm-footer-telemetry__metric[data-group="energy"] { --fm-metric-color: var(--fm-category-energy); }
 
 /* Compact tiers: reduce the 2px accent top border to 1px to keep chips tight */
 @container footer-metrics (height <= 112px) {
