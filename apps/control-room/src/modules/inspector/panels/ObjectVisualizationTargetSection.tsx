@@ -24,6 +24,7 @@ import {
   SegmentedControl,
 } from "@/shared/ui/SegmentedControl";
 import { Slider } from "@/shared/ui/Slider";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
 import { Switch } from "@/shared/ui/Switch";
 import { controlVariants } from "@/shared/ui/controlVariants";
 import { cn } from "@/shared/utils/className";
@@ -77,6 +78,7 @@ import {
   type TargetFieldAvailability,
   type RegionVisualizationCarrier,
   visualizationQuantityItems,
+  visualizationQuantitySelectionState,
   type ScalarColorbarDisplayUnit,
   colorPickerInputValue,
 } from "./ObjectVisualizationPanelModel";
@@ -667,8 +669,11 @@ function viewportRenderedRangeScopeKind(
 }
 
 export function VisualizationQuantitySection({
+  executionRequired = false,
   fieldCatalog,
   fieldCatalogLoading,
+  fieldCatalogError,
+  fieldCatalogRefreshWarning,
   quantityCatalog,
   onFieldCatalogRequest,
   patch,
@@ -677,8 +682,11 @@ export function VisualizationQuantitySection({
   targetFieldAvailability,
   targetKind,
 }: {
+  executionRequired?: boolean;
   fieldCatalog: FieldCatalogResource | null;
   fieldCatalogLoading: boolean;
+  fieldCatalogError?: string | null;
+  fieldCatalogRefreshWarning?: string | null;
   quantityCatalog: QuantityCatalogResource | null;
   onFieldCatalogRequest: () => void;
   patch: PatchVisualizationTarget;
@@ -690,9 +698,11 @@ export function VisualizationQuantitySection({
   const quantityItems = visualizationQuantityItems(
     settings.activeQuantityId, targetKind, fieldCatalog, quantityCatalog, targetFieldAvailability,
   );
-  const selectedValue = quantityItems.find((item) =>
-    resolveCanonicalQuantityId(item.value) === resolveCanonicalQuantityId(settings.activeQuantityId),
-  )?.value ?? "";
+  const { selectedValue, summary, status } = visualizationQuantitySelectionState({
+    activeQuantityId: settings.activeQuantityId, items: quantityItems,
+    loading: fieldCatalogLoading, error: fieldCatalogError, executionRequired,
+  });
+  const quantityFeedbackId = useId();
   const noQuantities = quantityItems.length === 0;
   const selectedQuantity = selectedValue ? quantityCatalog?.quantities.find((entry) =>
     resolveCanonicalQuantityId(entry.id) === resolveCanonicalQuantityId(selectedValue),
@@ -701,46 +711,51 @@ export function VisualizationQuantitySection({
   const tensorOptions = quantityCatalogEntrySpatialProjections(selectedQuantity);
   return (
     <>
-    <FormField
-      disabled={
-        isFieldPending("activeQuantityId") ||
-        !settings.visible ||
-        fieldCatalogLoading ||
-        noQuantities
-      }
-      inline
-      label="Quantity Source"
-      type="select"
-      value={selectedValue}
-      onChange={(event) => {
-        const patchValue = quantitySourcePatch(settings, event.target.value);
-        const nextQuantity = quantityCatalog?.quantities.find((entry) => entry.id === event.target.value);
-        if (isFlowMajorTensorDescriptor(nextQuantity?.tensor)) {
-          const options = quantityCatalogEntrySpatialProjections(nextQuantity);
-          if (options.length === 0) return;
-          patchValue.tensorProjection = options[0].value;
-          patchValue.surfaceColorSource = "colormap";
-          patchValue.vectorsVisible = false;
-        }
-        const nextSurfaceColorSource =
-          patchValue.surfaceColorSource ?? settings.surfaceColorSource;
-        if (nextSurfaceColorSource !== "solid") {
-          onFieldCatalogRequest();
-        }
-        void patch(patchValue);
-      }}
-    >
-      {!selectedValue ? <option disabled value="">
-        {fieldCatalogLoading ? "Loading quantities…" : noQuantities
-          ? "No compatible field available" : "Select an available quantity"}
-      </option> : null}
-      {quantityItems.map((quantity) => (
-        <option disabled={quantity.disabled} key={quantity.value} value={quantity.value}>
-          {quantity.label}
-        </option>
-      ))}
-    </FormField>
-    {noQuantities && !fieldCatalogLoading ? <p role="status" className="fm-quantity-source-empty">
+    <InspectorPropertyRow label="Quantity source" layout="stacked">
+      <div className="fm-quantity-source-control flex w-full min-w-0 flex-col gap-1">
+      <Select
+        disabled={executionRequired || isFieldPending("activeQuantityId") || !settings.visible || fieldCatalogLoading || Boolean(fieldCatalogError) || noQuantities}
+        value={selectedValue}
+        onValueChange={(quantityId) => {
+          const patchValue = quantitySourcePatch(settings, quantityId);
+          const nextQuantity = quantityCatalog?.quantities.find((entry) => entry.id === quantityId);
+          if (isFlowMajorTensorDescriptor(nextQuantity?.tensor)) {
+            const options = quantityCatalogEntrySpatialProjections(nextQuantity);
+            if (options.length === 0) return;
+            patchValue.tensorProjection = options[0].value;
+            patchValue.surfaceColorSource = "colormap";
+            patchValue.vectorsVisible = false;
+          }
+          const nextSurfaceColorSource =
+            patchValue.surfaceColorSource ?? settings.surfaceColorSource;
+          if (nextSurfaceColorSource !== "solid") {
+            onFieldCatalogRequest();
+          }
+          void patch(patchValue);
+        }}
+      >
+        <SelectTrigger aria-label="Quantity source" aria-describedby={quantityFeedbackId} aria-invalid={Boolean(fieldCatalogError) || undefined}>
+          <SelectValue placeholder={summary}>{summary}</SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {quantityItems.map((quantity) => (
+            <SelectItem disabled={quantity.disabled} key={quantity.value} value={quantity.value}>
+              {quantity.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <p id={quantityFeedbackId} role={fieldCatalogError ? "alert" : "status"} className="fm-quantity-source-help m-0 text-fm-help leading-snug text-fm-muted">
+        {fieldCatalogError ?? (fieldCatalogRefreshWarning
+          ? `Catalog refresh failed: ${fieldCatalogRefreshWarning}. Keeping the last verified catalog for this target.`
+          : status === "loading" ? "Loading the field catalog for this target…" : "Only fields supported on this target are listed. Display settings do not start a simulation.")}
+      </p>
+      </div>
+    </InspectorPropertyRow>
+    {status === "selected" && selectedQuantity?.unit ? <FieldRow label="Field unit" value={selectedQuantity.unit} /> : null}
+    {status === "execution-required" ? <p role="status" className="fm-quantity-source-empty">Select a source and execution above to load its field catalog. No simulation is started by this selection.</p> : null}
+    {status === "unavailable" ? <p role="status">The selected quantity is not available for this target. Choose an available field or check its computation status.</p> : null}
+    {status === "empty" ? <p role="status" className="fm-quantity-source-empty">
       {targetKind === "airbox"
         ? "No verified field is available on the Universe sampling mesh. Visible geometry or mesh points alone do not contain field values. Check the selected execution and its sampling domain."
         : "No compatible field is available for this target. Check the selected source, execution status, and sampling domain."}

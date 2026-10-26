@@ -2376,6 +2376,31 @@ export function visualizationQuantityItems(
   ];
 }
 
+/** Keep the selector and overview honest about catalog availability. */
+export function visualizationQuantitySelectionState({ activeQuantityId, items, loading, error, executionRequired = false }: {
+  activeQuantityId: string;
+  items: readonly { value: string; label: string; disabled?: boolean }[];
+  loading: boolean;
+  error?: string | null;
+  executionRequired?: boolean;
+}) {
+  const selected = items.find(item =>
+    resolveCanonicalQuantityId(item.value) === resolveCanonicalQuantityId(activeQuantityId));
+  const status = executionRequired ? "execution-required" : error ? "error" : loading ? "loading" : items.length === 0
+    ? "empty" : selected?.disabled ? "unavailable" : selected ? "selected" : "unselected";
+  const placeholder = status === "execution-required" ? "Select a source and execution"
+    : status === "error" ? "Field catalog unavailable"
+    : status === "loading" ? "Loading quantities…"
+      : status === "empty" ? "No compatible field available" : "Select an available quantity";
+  return {
+    status,
+    selectedValue: executionRequired ? "" : selected?.value ?? "",
+    placeholder,
+    summary: status === "selected" ? selected!.label
+      : status === "unavailable" ? `Unavailable / ${selected!.label}` : placeholder,
+  };
+}
+
 function mergeVisualizationQuantityItems(
   capabilityItems: Array<{ label: string; value: string }>,
   fieldItems: Array<{ label: string; value: string }>,

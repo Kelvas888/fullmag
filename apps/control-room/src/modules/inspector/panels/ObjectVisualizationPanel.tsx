@@ -98,6 +98,8 @@ import { InspectorGroup } from "../primitives/InspectorGroup";
 import { EmptyState } from "@/shared/ui/EmptyState";
 import {
   buildVisualizationPanelSections,
+  visualizationQuantityItems,
+  visualizationQuantitySelectionState,
   surfaceColorSourceFieldMetaComponent,
   vectorColorModeFieldMetaComponent,
   canonicalVisualizationStateForBaseline,
@@ -1162,6 +1164,8 @@ function useObjectVisualizationPanelState(
     visualizationState,
     meshState,
     artifactInspection,
+    catalogOwnerReady,
+    artifactExecutionSelected: Boolean(artifactInspectionOwner),
     artifactPresentation,
     sharedArtifactFieldMeta,
     artifactFieldBinding,
@@ -1528,7 +1532,28 @@ function ObjectVisualizationPanelView({
     displaySettings.pointsVisible,
   ].filter(Boolean).length;
   const capabilities = visualizationTargetCapabilities(target);
-  const fieldCatalogLoading = (fdmTarget || panel.artifactInspection) && (fieldCatalog.status !== "ready" || Boolean(fieldCatalog.refreshError) || panel.artifactInspection && (quantityCatalog.status !== "ready" || Boolean(quantityCatalog.refreshError)));
+  const executionRequired = panel.artifactInspection && !panel.artifactExecutionSelected;
+  const fieldCatalogError = fieldCatalog.error?.message ?? quantityCatalog.error?.message
+    ?? (panel.artifactInspection && panel.artifactExecutionSelected && fieldCatalog.data && !panel.catalogOwnerReady
+      ? "Field catalog differs from the selected immutable execution owner." : null)
+    ?? (!fieldCatalog.data ? fieldCatalog.refreshError?.message : null)
+    ?? (!quantityCatalog.data ? quantityCatalog.refreshError?.message : null) ?? null;
+  const fieldCatalogRefreshWarning = !fieldCatalogError
+    ? fieldCatalog.refreshError?.message ?? quantityCatalog.refreshError?.message ?? null : null;
+  const fieldCatalogLoading = !fieldCatalogError && (
+    fieldCatalog.status === "loading" && !fieldCatalog.data ||
+    quantityCatalog.status === "loading" && !quantityCatalog.data ||
+    (fdmTarget || panel.artifactInspection || target.kind === "airbox") &&
+      (fieldCatalog.status === "idle" && !fieldCatalog.data || quantityCatalog.status === "idle" && !quantityCatalog.data)
+  );
+  const quantityTargetKind = target.kind === "airbox" || isFdmUniverseOutsideSupportTarget(target) ? "airbox" : target.kind;
+  const quantitySelection = visualizationQuantitySelectionState({
+    activeQuantityId: settings.activeQuantityId,
+    items: visualizationQuantityItems(settings.activeQuantityId, quantityTargetKind, fieldCatalog.data, quantityCatalog.data, targetFieldAvailability),
+    loading: fieldCatalogLoading,
+    error: fieldCatalogError,
+    executionRequired,
+  });
   const fieldMetaTarget =
     fdmTarget &&
     target.kind !== "airbox" &&
@@ -1583,6 +1608,9 @@ function ObjectVisualizationPanelView({
                   <VisualizationQuantitySection
                     fieldCatalog={fieldCatalog.data}
                     fieldCatalogLoading={fieldCatalogLoading}
+                    fieldCatalogError={fieldCatalogError}
+                    fieldCatalogRefreshWarning={fieldCatalogRefreshWarning}
+                    executionRequired={executionRequired}
                     quantityCatalog={quantityCatalog.data}
                     targetFieldAvailability={targetFieldAvailability}
                     onFieldCatalogRequest={onFieldCatalogRequest}
@@ -1607,7 +1635,7 @@ function ObjectVisualizationPanelView({
                 ? "Not available"
                 : analysisFieldShown && shownAnalysisField
                   ? `Mode · ${shownAnalysisField.label}`
-                  : settings.activeQuantityId || "No quantity selected"
+                  : quantitySelection.summary
             }
             surfaceColoring={!capabilities.supportsFieldData || target.kind === "airbox" || isFdmUniverseOutsideSupportTarget(target) ? null : (
               <VisualizationSurfaceColoringSection
