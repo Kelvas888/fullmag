@@ -808,7 +808,9 @@ mod tests {
         assert!(super::is_transient_store_io(&enomem));
         let denied = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert!(!super::is_transient_store_io(&denied));
-        assert!(!super::is_transient_store_io(&anyhow::anyhow!("lease identity differs")));
+        assert!(!super::is_transient_store_io(&anyhow::anyhow!(
+            "lease identity differs"
+        )));
     }
 
     #[test]
