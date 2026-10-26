@@ -196,6 +196,9 @@ def retained_context(control, previous, document, backend_id, *, fresh_state,
     _require(_owner_digest(control, actual["backend"]) == journal["owner_sha256"]
              and dev._read_runtime_config_digest(control) == journal["runtime_config_sha256"],
              "retained owner/runtime config changed")
+    history_raw = recovery._control_bytes(control, "runtime-control/runtime-service/process-tree.json")
+    _require(_sha(history_raw) == journal["historical_process_receipt_sha256"],
+             "historical process receipt changed after diagnostic stop")
     metadata = validate_metadata({"schema": SCHEMA, "stop_journal_relative": relative,
         "stop_journal_sha256": _sha(raw), "backend_container_id": backend_id,
         "frontend_container_id": request["frontend_container_id"], "development_attempt": attempt,

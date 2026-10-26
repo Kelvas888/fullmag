@@ -665,7 +665,7 @@ class CompletedRemovalNativeProofTests(unittest.TestCase):
             'runtime-control/runtime-services/OWNER.json':owner_raw})
         self.calls=[]
 
-    def invoke(self, ordinary=False):
+    def invoke(self, ordinary=False, current_operation=None, expected_proof=None):
         import types,docker_volume_container_recovery as recovery
         def read(control,path,*,optional=False):
             if path in self.records:return self.records[path]
@@ -688,7 +688,8 @@ class CompletedRemovalNativeProofTests(unittest.TestCase):
              patch.object(dev,'_session_host',return_value=host):
             if ordinary:
                 self.args.resume_recreation=self.args.completed_recreation_attempt
-                return dev._validate_recreation_resume_records(self.args,self.control,self.selected,self.control.identity)
+                return dev._validate_recreation_resume_records(self.args,self.control,self.selected,self.control.identity,
+                    current_operation=current_operation,expected_proof=expected_proof)
             return dev._completed_recreation_start_context(self.control,self.args,self.selected,{'runtime_root':self.root})
 
     def test_completed_removal_revalidates_real_native_proof_without_stopped_inspection(self):
@@ -729,6 +730,60 @@ class CompletedRemovalNativeProofTests(unittest.TestCase):
     def test_runtime_config_digest_drift_is_refused(self):
         self.config_raw=b'{"changed":true}'
         with self.assertRaisesRegex(dev.BuildControlError,'runtime configuration digest differs'):self.invoke()
+
+    def owned_start_lease(self):
+        proof=self.invoke(ordinary=True)['proof']
+        token='8'*32
+        operation={'receipt':{'attempt':token,'phase':'development','state':'starting',
+            'compose_project':self.control.project,'control_volume':self.control.volume,
+            'inputs':{'recreation_resume':{'proof_sha256':hashlib.sha256(dev.canonical(proof)).hexdigest()}}},
+            'root':'development/attempts/'+token,'lease_ready':True,'helper_container_id':'9'*64}
+        self.records['active']=(token+'\n').encode()
+        self.records[operation['root']+'/receipt.json']=dev.canonical(operation['receipt'])+b'\n'
+        self.control._active_operation=operation
+        self.control._pin_operation_helper.return_value=operation['helper_container_id']
+        return operation,proof
+
+    def test_revalidation_accepts_exact_owned_active_start_lease(self):
+        operation,proof=self.owned_start_lease()
+        observed=self.invoke(ordinary=True,current_operation=operation,expected_proof=proof)
+        self.assertEqual(observed['proof'],proof)
+        self.control._pin_operation_helper.assert_called_once_with(operation)
+        self.control.write.assert_not_called()
+
+    def test_revalidation_refuses_foreign_active_start_lease(self):
+        operation,proof=self.owned_start_lease()
+        self.control._active_operation={}
+        with self.assertRaisesRegex(dev.BuildControlError,'exact active start lease'):
+            self.invoke(ordinary=True,current_operation=operation,expected_proof=proof)
+        self.control._pin_operation_helper.assert_not_called()
+
+    def test_revalidation_refuses_changed_owned_lease_receipt(self):
+        operation,proof=self.owned_start_lease()
+        self.records[operation['root']+'/receipt.json']=b'changed'
+        with self.assertRaisesRegex(dev.BuildControlError,'receipt/helper changed'):
+            self.invoke(ordinary=True,current_operation=operation,expected_proof=proof)
+
+    def test_revalidation_refuses_replaced_owned_lease_helper(self):
+        operation,proof=self.owned_start_lease()
+        self.control._pin_operation_helper.return_value='0'*64
+        with self.assertRaisesRegex(dev.BuildControlError,'receipt/helper changed'):
+            self.invoke(ordinary=True,current_operation=operation,expected_proof=proof)
+
+    def test_revalidation_refuses_helper_repin_that_mutates_operation(self):
+        operation,proof=self.owned_start_lease()
+        def replaced(current):
+            current['helper_container_id']='0'*64
+            return current['helper_container_id']
+        self.control._pin_operation_helper.side_effect=replaced
+        with self.assertRaisesRegex(dev.BuildControlError,'receipt/helper changed'):
+            self.invoke(ordinary=True,current_operation=operation,expected_proof=proof)
+
+    def test_revalidation_refuses_other_active_token(self):
+        operation,proof=self.owned_start_lease()
+        self.records['active']=b'0'*32+b'\n'
+        with self.assertRaisesRegex(dev.BuildControlError,'exact active start lease'):
+            self.invoke(ordinary=True,current_operation=operation,expected_proof=proof)
 
     def test_ordinary_resume_still_refuses_active_lease_before_removed_proof(self):
         self.records['active']=b'3'*32+b'\n'

@@ -1,5 +1,7 @@
 """Read-only restart authentication regressions; no Docker mutation is executed."""
-from contextlib import ExitStack
+import ast
+import inspect
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -31,6 +33,7 @@ class Fixture:
         self.control = SimpleNamespace(project="project", volume="control")
         self.auth = {"native_request_sha256": "e" * 64}
         self.auth_raw, self.receipt_raw = b"authorization", b"native-complete"
+        self.history_raw = b"historical process receipt"
         self.previous = {"attempt": ATTEMPT, "phase": "development", "compose_project": "project", "control_volume": "control", "inputs": {"source_root": "/source", "image_id": IMAGE}}
         self.document = {"services": {"backend": {"environment": {
             recovery.AUTHORIZATION_ENV: recovery.CONTROL_ROOT + "/authorization.json"}}}}
@@ -41,7 +44,7 @@ class Fixture:
         self.released = {"schema": "fullmag.pre-ack-released-observation.v1", "active_count": 0,
                          "reservations": [], "leases": []}
         self.guest = {"owner_sha256": DIGEST, "runtime_config_sha256": DIGEST,
-            "historical_process_receipt_sha256": DIGEST, "active_reservations": 0,
+            "historical_process_receipt_sha256": sha(self.history_raw), "active_reservations": 0,
             "active_local_leases": 0, "historical_process_receipt_used_as_current": False}
         self.inspection = {"schema": "fullmag.docker-startup-diagnostic-inspection.v1", "state": "inspected",
             "backend_container_id": B, "image_id": IMAGE, "backend_started_at": START, "guest": self.guest}
@@ -53,7 +56,7 @@ class Fixture:
             "request_id": "12345678-1234-4234-8234-123456789abc", "reason": "Stop our failed startup diagnostic",
             "development_attempt": ATTEMPT, "compose_config_sha256": sha(canonical(self.document)),
             "source_root": "/source", "compose_project": "project", "resume_attempt": RESUME,
-            "inspection_relative": "verification/inspection.json", "historical_process_receipt_sha256": DIGEST}
+            "inspection_relative": "verification/inspection.json", "historical_process_receipt_sha256": sha(self.history_raw)}
         for service in ("backend", "frontend"):
             actual = self.actual[service]
             self.request.update({service + "_container_id": actual["Id"], service + "_image_id": IMAGE,
@@ -96,6 +99,7 @@ class Fixture:
         def control_bytes(control, path, optional=False):
             if path == "activation/unresolved.json": return None
             if path == "authorization.json": return self.auth_raw
+            if path == "runtime-control/runtime-service/process-tree.json": return self.history_raw
             if path.endswith("/receipt.json"): return self.receipt_raw
             return self.records.get(path, (None, None))[0]
         with ExitStack() as stack:
@@ -146,6 +150,13 @@ class AuthenticationTests(unittest.TestCase):
         f = Fixture(); f.released = {**f.released, "leases": [["new", DIGEST]]}
         with self.assertRaises(BuildControlError): f.invoke()
 
+    def test_changed_historical_process_receipt_is_rejected(self):
+        for removed in (False, True):
+            f = Fixture(); f.history_raw = b"changed after successful stop"
+            if removed: f.actual["frontend"]["State"]["Running"] = False
+            with self.subTest(removed=removed), self.assertRaisesRegex(BuildControlError, "historical process receipt changed"):
+                f.invoke(removed=removed)
+
     def test_missing_immutable_stop_terminal_is_rejected(self):
         f = Fixture(); path = f.journal["stop_operation"]["root"] + "/terminal.json"
         raw, value = f.records[path]; value["state"] = "failed-confirmed"; f.record(path, value)
@@ -183,6 +194,28 @@ class AuthenticationTests(unittest.TestCase):
         with self.assertRaisesRegex(BuildControlError, "same store"):
             dev.start(SimpleNamespace(script=None), reuse_state=None,
                       previous_config_sha256=DIGEST, startup_diagnostic_restart=metadata)
+
+    def test_start_revalidates_with_exact_operation_inside_lease(self):
+        function = ast.parse(inspect.getsource(dev.start)).body[0]
+        leased = next(node for node in ast.walk(function) if isinstance(node, ast.With)
+            and isinstance(node.items[0].context_expr, ast.Name)
+            and node.items[0].context_expr.id == "operation_context")
+        # Execute the real startup-diagnostic branch from start, with its actual lease binding.
+        branch = ast.With(items=leased.items, body=[leased.body[0]], type_comment=None)
+        module = ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[]))
+        operation, metadata, proof = {}, {"schema": restart.SCHEMA}, {"proof": "pinned"}
+        calls = []
+        def validate(*args, **kwargs):
+            calls.append(kwargs)
+            self.assertIs(kwargs.get("current_operation"), operation)
+            self.assertIs(kwargs.get("expected_proof"), proof)
+            return {"native_recovery_context": {"startup_diagnostic_restart": metadata}}
+        scope = {"operation_context": nullcontext(operation), "validated_startup_diagnostic_restart": metadata,
+                 "recreation_resume_proof": proof, "_validate_recreation_resume_records": validate,
+                 "args": None, "control": None, "selected": None, "identity": None,
+                 "BuildControlError": BuildControlError}
+        exec(compile(module, dev.__file__, "exec"), scope)
+        self.assertEqual(len(calls), 1)
 
     def test_metadata_cannot_alias_native_stop_or_escape_control(self):
         context = Fixture().invoke()

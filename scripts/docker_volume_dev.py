@@ -1803,7 +1803,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     with operation_context as operation:
         if validated_startup_diagnostic_restart is not None and recreation_resume_proof is not None:
             leased_records = _validate_recreation_resume_records(
-                args, control, selected, identity, expected_proof=recreation_resume_proof
+                args, control, selected, identity, expected_proof=recreation_resume_proof,
+                current_operation=operation
             )
             if leased_records["native_recovery_context"].get("startup_diagnostic_restart") != validated_startup_diagnostic_restart:
                 raise BuildControlError("Startup diagnostic recreation resume changed under start lease")
@@ -5347,7 +5348,7 @@ def _validate_removed_recreation_proof(
     return snapshot, proof, native_recovery_context
 
 
-def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None):
+def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None, current_operation=None):
     """Revalidate one completed recreation and prove its old app IDs are absent."""
 
     from docker_volume_stop_unadmitted import _control_bytes
@@ -5425,8 +5426,29 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
     operator_probe_record = _operator_probe_record_from_retained(previous, document)
 
     active_raw = _control_bytes(control, "active", optional=True)
-    if active_raw is not None:
-        raise BuildControlError("A managed operation lease is still active; recreation resume is refused")
+    if current_operation is None:
+        if active_raw is not None:
+            raise BuildControlError("A managed operation lease is still active; recreation resume is refused")
+    else:
+        receipt = current_operation.get("receipt", {})
+        token = receipt.get("attempt")
+        helper_id = current_operation.get("helper_container_id")
+        if (control._active_operation is not current_operation
+                or current_operation.get("lease_ready") is not True
+                or not isinstance(helper_id, str) or _SHA256.fullmatch(helper_id) is None
+                or not isinstance(token, str) or _RECOVERY_ATTEMPT.fullmatch(token) is None
+                or active_raw != (token + "\n").encode()
+                or receipt.get("phase") != "development" or receipt.get("state") != "starting"
+                or receipt.get("compose_project") != control.project
+                or receipt.get("control_volume") != control.volume
+                or current_operation.get("root") != "development/attempts/" + token
+                or expected_proof is None
+                or receipt.get("inputs", {}).get("recreation_resume", {}).get("proof_sha256")
+                    != hashlib.sha256(canonical(expected_proof)).hexdigest()):
+            raise BuildControlError("Recreation revalidation does not own the exact active start lease")
+        if (_control_bytes(control, current_operation["root"] + "/receipt.json") != canonical(receipt) + b"\n"
+                or control._pin_operation_helper(current_operation) != helper_id):
+            raise BuildControlError("Recreation active start lease receipt/helper changed")
 
     operation_id = args.resume_recreation
     operation_root = "recreate-services/attempts/" + operation_id
