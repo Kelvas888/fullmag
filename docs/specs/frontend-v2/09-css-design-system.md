@@ -56,7 +56,7 @@ Dark and light themes are implemented through a `data-theme` attribute on `<html
 }
 ```
 
-The active theme is stored in user preferences (layout store). `prefers-color-scheme` sets the default. All components consume tokens, so theme switching is instantaneous with zero re-renders.
+Preferencja `light` / `dark` / `system` jest zapisywana pod dotychczasowym kluczem `fullmag.control-room.theme`. Skrypt w head ustala efektywny motyw przed parsowaniem body; System reaguje na `prefers-color-scheme` bez nadpisywania preferencji użytkownika. Style korzystają z tokenów, a komponent sterujący prezentuje wybór i efektywny motyw. Inter i JetBrains Mono są lokalnymi, licencjonowanymi zasobami w `public/fonts`; manifest zawiera źródła i SHA256.
 
 ## 2. Surface Model
 
