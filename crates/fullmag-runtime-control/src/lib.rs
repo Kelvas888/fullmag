@@ -773,6 +773,7 @@ pub use study_field_tensor::{
 mod study_dataset;
 
 mod study;
+mod study_snapshot_cache;
 mod study_completion;
 pub use study::{
     load_accepted_study_snapshot, load_accepted_worker_step, load_accepted_worker_step_for_start,
