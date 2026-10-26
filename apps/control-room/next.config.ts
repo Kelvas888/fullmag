@@ -354,6 +354,13 @@ export function instanceTabPortsClientValue(value: string | undefined): string {
   return `${first}-${last}`;
 }
 
+/**
+ * Addresses of Control Room tabs, served by the workspace page. A static
+ * export has no rewrites; its server answers unknown paths with the root
+ * page, which renders the same workspace.
+ */
+export const TAB_ROUTE_SOURCES = ["/home", "/session/:slug", "/instance/:port"] as const;
+
 function securityHeaders() {
   return [
     { key: "X-Content-Type-Options", value: "nosniff" },
@@ -423,6 +430,9 @@ const nextConfig: NextConfig = {
               source: "/v2/:path*",
               destination: `${apiTarget}/v2/:path*`,
             },
+            // Tab addresses (src/kernel/layout/tabRoutes.ts) all serve the
+            // workspace page; the page selects the tab from its address.
+            ...TAB_ROUTE_SOURCES.map((source) => ({ source, destination: "/workspace" })),
           ];
         },
       }),
