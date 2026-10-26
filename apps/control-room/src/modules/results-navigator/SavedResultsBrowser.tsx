@@ -18,6 +18,7 @@ import {
 } from "@/kernel/resources/solutionSetResources";
 import {
   pinnedMaterializedDatasetSelectionRef,
+  selectionRefEquals,
   type PinnedMaterializedDatasetSelectionRef,
 } from "@/kernel/selection/selectionTypes";
 import type {
@@ -583,6 +584,9 @@ function SavedMemberArtifacts({
       },
       moduleId,
     );
+    if (selectionRefEquals(kernel.selection.get().ref, ref)) {
+      kernel.visualization.setSavedFieldPresentation(ref, data.field.descriptor.quantity_id, data.field.coverage.component_count);
+    }
   };
 
   return (

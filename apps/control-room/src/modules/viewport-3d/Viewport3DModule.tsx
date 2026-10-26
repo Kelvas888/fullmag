@@ -8,7 +8,10 @@ import { useArtifactFieldOverlay } from "./hooks/useArtifactFieldOverlay";
 import { useAntennaFieldOverlay } from "./hooks/useAntennaFieldOverlay";
 import { antennaFieldDisplayLabel } from "@/kernel/visualization/antennaFieldIntent";
 
+import { returnToCurrentFieldView } from "@/kernel/visualization/savedFieldPresentation";
+import { updateVisibleColorScales, type Viewport3DVisibleColorScaleReport, type Viewport3DVisibleColorScales } from "./model/viewport3DVisibleColorScale";
 import { useThree } from "@react-three/fiber";
+import { useSavedFieldPresentation } from "@/kernel/visualization/useObjectVisualization";
 import {
   useCallback,
   useEffect,
@@ -614,6 +617,32 @@ export function resolveArtifactFieldColorbars(model: ArtifactFieldOverlayModel |
   };
   if (model.settings.shaderVisible && model.settings.surfaceColorSource !== "solid") append("surface", model.scalar ? "scalar" : model.settings.shaderColorMode, model.minimum, model.maximum);
   if (!model.scalar && model.settings.vectorsVisible && model.glyphCount > 0 && model.vectorColorRange) append("vectors", model.settings.vectorColorMode, model.vectorColorRange.min, model.vectorColorRange.max);
+  return result;
+}
+
+/** Saved surface and glyph colors may use different components and scales. */
+export function resolveSavedFieldColorbars({ scales, scopeKey, settings, quantityId, unit }: {
+  scales: Viewport3DVisibleColorScales;
+  scopeKey: string | null;
+  settings: VisualizationTargetSettings;
+  quantityId: string;
+  unit: string | null;
+}): Viewport3DScopedColorbarLegend[] {
+  if (!scopeKey || scales.scopeKey !== scopeKey || !settings.visible || !settings.viewportColorbarVisible) return [];
+  const result: Viewport3DScopedColorbarLegend[] = [];
+  for (const pass of ["surface", "vectors"] as const) {
+    if (pass === "surface" ? !settings.shaderVisible || settings.surfaceColorSource === "solid" : !settings.vectorsVisible) continue;
+    const scale = scales.passes[pass]?.scale;
+    if (!scale || scale.quantityId !== quantityId) continue;
+    const legend = resolveViewport3DColorbarLegend({ colorMode: scale.colorMode,
+      colorPalette: scale.colorPalette, quantityId: scale.quantityId, unit, range: scale.range });
+    if (!legend) continue;
+    const matching = result.find(item => item.legend.colorMode === legend.colorMode &&
+      item.legend.paletteGradient === legend.paletteGradient &&
+      item.legend.range?.min === scale.range.min && item.legend.range?.max === scale.range.max);
+    if (matching) matching.legend.labelPrefix = "Saved surface / vectors: ";
+    else result.push({ key: `saved:${pass}:${scale.colorMode}`, legend: { ...legend, labelPrefix: `Saved ${pass}: ` } });
+  }
   return result;
 }
 
@@ -1455,6 +1484,7 @@ interface Viewport3DFrameProps
     patch: NonNullable<VisualizationStatePatch["camera"]>,
   ) => void;
   onClearSelection: () => void;
+  onReturnToCurrentView: () => void;
   onFdmUniverseOverlayVisibilityChange: (visible: boolean) => void;
   onFrozenSpinsOverlayVisibilityChange: (visible: boolean) => void;
   onRegionOverlaySourceChange: (source: RegionDiagnosticOverlaySource) => void;
@@ -1466,6 +1496,7 @@ interface Viewport3DFrameProps
   renderedMeshRevision: number | string | null;
   scalarColorPalette: string;
   savedViewportActive: boolean;
+  savedFieldUnit: string | null;
   sessionIdentity: SessionResourceIdentity | null;
   sessionDiscretization: "fdm" | "fem" | null;
   selectedLabel: string;
@@ -1487,9 +1518,15 @@ export default function Viewport3DModule({
   const selection = useSelectionSelector((state) => state, {
     isEqual: selectionSnapshotEquals,
   });
-  const savedViewportSelectionActive =
-    selection.kind === "results.materialized_dataset" &&
-    selection.ref?.type === "materialized-dataset";
+  const { presentation: savedPresentation, projectId: savedProjectId } = useSavedFieldPresentation();
+  const savedViewportSelectionActive = savedPresentation !== null || (
+    selection.kind === "results.materialized_dataset" && selection.ref?.type === "materialized-dataset"
+  );
+  useEffect(() => {
+    if (savedPresentation && savedProjectId && savedProjectId !== savedPresentation.selection.projectId) {
+      kernel.visualization.clearSavedFieldPresentation();
+    }
+  }, [kernel.visualization, savedPresentation, savedProjectId]);
   const { select, clear } = useSelectionActions(moduleId);
   const tracker = useViewport3DResourceTracker();
   const sessionIdentityKey = sessionIdentity ? sessionResourceIdentityKey(sessionIdentity) : null;
@@ -1878,6 +1915,7 @@ export default function Viewport3DModule({
       fdmSelectionAnnouncement={fdmSelectionAnnouncement}
       onCameraPatch={patchCameraState}
       onClearSelection={clear}
+      onReturnToCurrentView={() => { returnToCurrentFieldView(kernel.visualization, kernel.selection, moduleId); }}
       onFdmUniverseOverlayVisibilityChange={changeFdmUniverseOverlayVisibility}
       frozenSpinsOverlayModel={effectiveFrozenSpinsOverlayModel}
       frozenSpinsOverlayVisible={frozenSpinsOverlayVisible}
@@ -2097,6 +2135,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   meshQualityRange,
   onCameraPatch,
   onClearSelection,
+  onReturnToCurrentView,
   onFdmUniverseOverlayVisibilityChange,
   onFrozenSpinsOverlayVisibilityChange,
   onRegionOverlaySourceChange,
@@ -2105,6 +2144,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   quantityId,
   quantityLabel,
   savedViewportActive,
+  savedFieldIdentity,
+  savedFieldUnit,
   sessionIdentity,
   sessionDiscretization,
   selectedLabel,
@@ -2115,8 +2156,14 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   visualizationDebugSource,
   ...sceneProps
 }: Viewport3DFrameProps) {
+  const savedScopeKey = savedFieldIdentity ?? null;
+  const [visibleSavedScales, setVisibleSavedScales] = useState<Viewport3DVisibleColorScales>(() => ({ scopeKey: savedScopeKey, passes: {} }));
+  if (visibleSavedScales.scopeKey !== savedScopeKey) setVisibleSavedScales({ scopeKey: savedScopeKey, passes: {} });
+  const onVisibleSavedColorScale = useCallback((report: Viewport3DVisibleColorScaleReport) => {
+    setVisibleSavedScales(previous => updateVisibleColorScales(previous, report));
+  }, []);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const antennaFieldOverlay = useAntennaFieldOverlay();
+  const antennaFieldOverlay = useAntennaFieldOverlay(!savedViewportActive);
   const artifactTarget = sceneProps.primitiveModel?.objects.find(object => object.objectId === sceneProps.selectedObjectId);
   const artifactSettings = artifactTarget ? sceneProps.getObjectSettings(artifactTarget) : sceneProps.fdmSettings;
   const artifactField = useArtifactFieldOverlay(quantityId, sceneProps.selectedObjectId, artifactSettings, Boolean(antennaFieldOverlay), artifactInspectionDefinitions);
@@ -2416,9 +2463,12 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       }),
     [colorbarLabelByTargetId, colorbarPlans],
   );
-  const displayedColorbarLegends = artifactField.historical ? resolveArtifactFieldColorbars(artifactField.model) : colorbarLegends;
+  const displayedColorbarLegends = useMemo(() => savedViewportActive
+    ? resolveSavedFieldColorbars({ scales: visibleSavedScales, scopeKey: savedScopeKey, settings: sceneProps.fallbackSettings, quantityId, unit: savedFieldUnit })
+    : artifactField.historical ? resolveArtifactFieldColorbars(artifactField.model) : colorbarLegends,
+  [artifactField.historical, artifactField.model, colorbarLegends, quantityId, savedFieldUnit, savedViewportActive, savedScopeKey, sceneProps.fallbackSettings, visibleSavedScales]);
   const renderedScalarRanges = useMemo(
-    () => artifactField.historical ? artifactRenderedSurfaceRanges(artifactField.model) :
+    () => savedViewportActive ? [] : artifactField.historical ? artifactRenderedSurfaceRanges(artifactField.model) :
       initialColorbarPlans.flatMap((plan) => {
         const range = colorbarRangeStates.get(plan.groupKey)?.range;
         if (!range) return [];
@@ -2438,12 +2488,12 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             : null,
         });
       }),
-    [artifactField.historical, artifactField.model, colorbarParts, colorbarRangeStates, initialColorbarPlans],
+    [artifactField.historical, artifactField.model, colorbarParts, colorbarRangeStates, initialColorbarPlans, savedViewportActive],
   );
   useEffect(() => {
     setRetainedViewport3DColorbarPlans(
       slotId,
-      savedViewportColorbarReady
+      savedViewportColorbarReady && !savedViewportActive
         ? resolveRetainedViewport3DColorbarPlansForStore({
             fieldIdentityCompatible: sceneProps.fdmFieldIdentityCompatible,
             planned: plannedColorbars,
@@ -2455,17 +2505,18 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         : EMPTY_VIEWPORT_3D_COLORBAR_PLANS,
     );
     viewport3dStore.setActiveScalarColorbarLegends(
-      colorbarLegends.map(({ legend }) => legend),
+      displayedColorbarLegends.map(({ legend }) => legend),
     );
     viewport3dStore.setRenderedScalarRanges(renderedScalarRanges);
   }, [
-    colorbarLegends,
+    displayedColorbarLegends,
     colorbarTargetPlanAvailable,
     plannedColorbars,
     renderSurfaceAvailable,
     retainedColorbarPlans,
     renderedScalarRanges,
     sceneProps.fdmFieldIdentityCompatible,
+    savedViewportActive,
     savedViewportColorbarReady,
     slotId,
     viewportColorbarRequested,
@@ -2820,14 +2871,14 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             {VIEWPORT_FIELD_FRESHNESS_LABEL[fieldPresentationFreshness]}
           </span>
         ) : null}
-        {savedViewportActive && sessionIdentity ? (
+        {savedViewportActive ? (
           <fieldset
             aria-label="Viewport source"
             className="fm-viewport-3d__region-modes"
           >
             <Button
               aria-label="Return to current view"
-              onClick={onClearSelection}
+              onClick={onReturnToCurrentView}
               size="sm"
               type="button"
               variant="secondary"
@@ -3038,6 +3089,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           />
           <Viewport3DScene
             {...sceneProps}
+            savedFieldIdentity={savedFieldIdentity}
+            onVisibleColorScale={savedViewportActive ? onVisibleSavedColorScale : undefined}
             antennaFieldOverlay={antennaFieldOverlay}
             artifactFieldOverlay={artifactField.model}
             fieldModel={artifactField.historical ? null : sceneProps.fieldModel}

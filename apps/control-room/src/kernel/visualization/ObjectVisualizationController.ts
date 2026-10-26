@@ -1,4 +1,5 @@
 import type { ArtifactFieldSelection } from "./artifactFieldSelection";
+import { validAntennaColorRange, type AntennaColorRange } from "./antennaColorRange";
 import { hasEmptyObjectMagneticModel } from "@/shared/domain/physics/objectMagneticModel";
 import { normalizeTensorProjection, type TensorProjectionToken } from "../api/tensorFieldProjection";
 import type {
@@ -19,6 +20,8 @@ import {
   visualizationPartScopeIdFromTargetId,
   visualizationTargetIdForSceneObject,
   type Selection,
+  type PinnedMaterializedDatasetSelectionRef,
+  selectionRefEquals,
 } from "../selection/selectionTypes";
 import {
   canonicalVisualizationTargetId as canonicalPublicVisualizationTargetId,
@@ -153,7 +156,14 @@ export interface ViewportTargetRenderingPreferences {
   vectorSurfaceOffsetScale?: number;
 }
 
+export interface SavedFieldPresentation {
+  selection: PinnedMaterializedDatasetSelectionRef;
+  settings: VisualizationTargetSettings;
+  colorRanges?: Partial<Record<"magnitude" | "x" | "y" | "z", AntennaColorRange>>;
+}
+
 export interface ObjectVisualizationSnapshot {
+  savedFieldPresentation?: SavedFieldPresentation | null;
   artifactFieldSelection?: ArtifactFieldSelection | null;
   antennaFieldIntent?: AntennaFieldIntent | null;
   antennaFieldDisplayStatus?: AntennaFieldDisplayStatus | null;
@@ -610,6 +620,65 @@ const DEFAULT_PART_VISUALIZATION: VisualizationTargetSettings = {
 
 
 export class ObjectVisualizationController {
+  private savedFieldPresentation: SavedFieldPresentation | null = null;
+
+  setSavedFieldPresentation(selection: PinnedMaterializedDatasetSelectionRef, quantityId: string, componentCount: string): void {
+    if (selectionRefEquals(this.savedFieldPresentation?.selection ?? null, selection)) return;
+    this.savedFieldPresentation = {
+      selection: { ...selection },
+      settings: {
+        ...DEFAULT_OBJECT_VISUALIZATION,
+        activeQuantityId: quantityId,
+        geometryScope: "full",
+        shaderVisible: componentCount !== "3",
+        vectorsVisible: componentCount === "3",
+        renderMode: componentCount === "3" ? "off" : "surface",
+        shaderColorMode: "magnitude",
+        surfaceColorSource: "magnitude",
+        viewportColorbarVisible: true,
+      },
+    };
+    this.bump();
+  }
+
+  patchSavedFieldPresentation(selection: PinnedMaterializedDatasetSelectionRef, patch: VisualizationTargetPatch): void {
+    const current = this.savedFieldPresentation;
+    if (!current || !selectionRefEquals(current.selection, selection)) return;
+    const settings = normalizeVisualizationSettings({
+      ...current.settings,
+      ...normalizePatch(patch),
+      activeQuantityId: current.settings.activeQuantityId,
+      geometryScope: "full",
+      surfaceProjectionMode: "raw_nodal",
+    });
+    if (JSON.stringify(settings) === JSON.stringify(current.settings)) return;
+    this.savedFieldPresentation = { ...current, settings };
+    this.bump();
+  }
+
+  setSavedFieldColorRange(
+    selection: PinnedMaterializedDatasetSelectionRef,
+    component: keyof NonNullable<SavedFieldPresentation["colorRanges"]>,
+    range: AntennaColorRange | undefined,
+  ): void {
+    const current = this.savedFieldPresentation;
+    if (!current || !selectionRefEquals(current.selection, selection) ||
+        !["magnitude", "x", "y", "z"].includes(component) || range && !validAntennaColorRange(range)) return;
+    const previous = current.colorRanges?.[component];
+    if (previous?.minimum === range?.minimum && previous?.maximum === range?.maximum) return;
+    const colorRanges = { ...current.colorRanges };
+    if (range) colorRanges[component] = { ...range };
+    else delete colorRanges[component];
+    this.savedFieldPresentation = { ...current, colorRanges };
+    this.bump();
+  }
+
+  clearSavedFieldPresentation(): void {
+    if (!this.savedFieldPresentation) return;
+    this.savedFieldPresentation = null;
+    this.bump();
+  }
+
   private artifactFieldSelection: ArtifactFieldSelection | null = null;
 
   setArtifactFieldSelection(selection: ArtifactFieldSelection | null): void {
@@ -968,6 +1037,7 @@ export class ObjectVisualizationController {
 
   private bump(): void {
     this.snapshot = {
+      savedFieldPresentation: this.savedFieldPresentation,
       artifactFieldSelection: this.artifactFieldSelection,
       antennaFieldIntent: this.antennaFieldIntent,
       antennaFieldDisplayStatus: this.antennaFieldDisplayStatus,

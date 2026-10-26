@@ -130,7 +130,7 @@ import {
   type VisualizationTargetRef,
   type VisualizationTargetSettings,
 } from "@/kernel/visualization/ObjectVisualizationController";
-import { useObjectVisualizationSelector } from "@/kernel/visualization/useObjectVisualization";
+import { useObjectVisualizationSelector, useSavedFieldPresentation } from "@/kernel/visualization/useObjectVisualization";
 import { useCameraRegistryCamera } from "@/kernel/visualization/useCameraRegistry";
 import {
   viewport3DFieldColorLayersEnabledFromBrowserConfig,
@@ -3051,10 +3051,9 @@ export function useViewport3DSceneModel({
   selection: Selection;
   tracker?: Viewport3DResourceTracker;
 }) {
-  const savedDatasetSelection = useMemo(
-    () => resolvePinnedMaterializedDatasetSelection(selection),
-    [selection],
-  );
+  const { presentation: savedPresentation, projectId: savedProjectId } = useSavedFieldPresentation();
+  const savedDatasetSelection = savedPresentation?.selection ?? resolvePinnedMaterializedDatasetSelection(selection);
+  const savedProjectMatches = savedDatasetSelection !== null && savedDatasetSelection.projectId === savedProjectId;
   const savedSelectionActive = savedDatasetSelection !== null;
   const liveViewportResourcesEnabled = !savedSelectionActive;
   const savedDatasetResource = useMaterializedDatasetResource(
@@ -3064,11 +3063,11 @@ export function useViewport3DSceneModel({
     savedDatasetSelection?.containingRevision,
     savedDatasetSelection?.memberId,
     savedDatasetSelection?.artifactId,
-    { enabled: savedSelectionActive },
+    { enabled: savedSelectionActive && savedProjectMatches },
   );
   const savedDatasetForViewport = savedDatasetMatchesSelection(
     savedDatasetSelection,
-    savedViewportResourceHasFreshData(savedDatasetResource)
+    savedProjectMatches && savedViewportResourceHasFreshData(savedDatasetResource)
       ? savedDatasetResource.data
       : null,
   )
@@ -3200,10 +3199,10 @@ export function useViewport3DSceneModel({
     selection,
     visualizationState: renderingState,
   });
-  const scalarColorPalette =
+  const scalarColorPalette = savedPresentation?.settings.scalarColorPalette ??
     renderingState?.quantity?.colormap ?? renderingState?.colormap ?? "viridis";
   const vectorStyleState = renderingState?.vector_style;
-  const vectorColorMode =
+  const vectorColorMode = savedPresentation?.settings.vectorColorMode ??
     vectorStyleState?.color_mode ?? "orientation";
   const vectorDomain = renderingState?.layers?.vectors?.domain ?? "auto";
   const vectorStyle = useMemo(
@@ -3977,9 +3976,16 @@ export function useViewport3DSceneModel({
   );
   const vectorScale = resolveViewport3DVectorScale(
     bounds?.size ?? [1e-6, 1e-6, 1e-6],
-    1,
-    maxInteractiveVectorGlyphs,
+    savedPresentation?.settings.vectorLengthScale ?? 1,
+    savedPresentation ? Math.min(savedPresentation.settings.vectorBudget, maxInteractiveVectorGlyphs,
+      Number(savedViewportResources.geometry.data?.active_node_count ?? 0)) : maxInteractiveVectorGlyphs,
   );
+  const savedShaderColorMode = savedPresentation?.settings.shaderColorMode;
+  const savedVectorBudget = savedPresentation?.settings.vectorBudget;
+  const savedFieldBuildSettings = useMemo(() => savedShaderColorMode !== undefined && savedVectorBudget !== undefined ? {
+    shaderColorMode: savedShaderColorMode,
+    vectorBudget: savedVectorBudget,
+  } : undefined, [savedShaderColorMode, savedVectorBudget]);
   const savedViewportSceneModel = useMemo(
     () => {
       if (
@@ -4001,6 +4007,9 @@ export function useViewport3DSceneModel({
         topology: savedViewportResources.topology.data,
         vectorColorMode,
         vectorScale,
+        settings: savedFieldBuildSettings,
+        colorRanges: savedPresentation?.colorRanges,
+        sceneVectorCap: maxInteractiveVectorGlyphs,
       });
     },
     [
@@ -4011,6 +4020,9 @@ export function useViewport3DSceneModel({
       savedViewportResources.geometry.data,
       savedViewportResources.support.data,
       savedViewportResources.topology.data,
+      savedFieldBuildSettings,
+      savedPresentation?.colorRanges,
+      maxInteractiveVectorGlyphs,
       scalarColorPalette,
       vectorColorMode,
       vectorScale,
@@ -6957,7 +6969,8 @@ export function useViewport3DSceneModel({
     (femLaneActive ? topologyFreshnessStatus ?? topology.status : null) ??
     "idle";
   const savedViewportStatus = savedSelectionActive
-    ? savedDatasetResource.error?.message ??
+    ? (!savedProjectMatches ? "Open the project that owns this pinned saved field." : null) ??
+      savedDatasetResource.error?.message ??
       savedDatasetResource.refreshError?.message ??
       (savedDatasetIdentityMismatch
         ? "Returned dataset does not match the selected immutable identity."
@@ -7014,18 +7027,19 @@ export function useViewport3DSceneModel({
       savedSelectionActive
         ? {
             ...fallbackSettings,
-            activeQuantityId: effectiveViewportQuantityId,
             renderMode: "surface" as const,
             shaderColorMode: "magnitude" as const,
             shaderVisible: true,
             surfaceColorSource: "magnitude" as const,
             surfaceOpacityPercent: 100,
-            surfaceProjectionMode: "raw_nodal" as const,
             viewportColorbarVisible: true,
             visible: true,
+            ...savedPresentation?.settings,
+            activeQuantityId: effectiveViewportQuantityId,
+            surfaceProjectionMode: "raw_nodal" as const,
           }
         : fallbackSettings,
-    [effectiveViewportQuantityId, fallbackSettings, savedSelectionActive],
+    [effectiveViewportQuantityId, fallbackSettings, savedSelectionActive, savedPresentation?.settings],
   );
   const effectiveViewportPartSettings = useCallback(
     (part: Viewport3DMeshPart) => savedSelectionActive
@@ -7394,7 +7408,7 @@ export function useViewport3DSceneModel({
     sessionDiscretization: savedSelectionActive ? null : sessionDiscretization,
     domainSummary: savedSelectionActive
       ? savedViewportSceneModel
-        ? "saved whole-domain carrier"
+        ? "saved sampling domain"
         : "saved domain unavailable"
       : domainSummary,
     fallbackSettings: effectiveViewportFallbackSettings,
@@ -7510,6 +7524,8 @@ export function useViewport3DSceneModel({
     regionOverlays: savedSelectionActive ? [] : regionOverlays,
     resourceFrameKey,
     savedViewportActive: savedSelectionActive,
+    savedFieldIdentity: savedSelectionActive ? savedPresentation?.selection.nodeId ?? savedDatasetSelection?.nodeId ?? null : null,
+    savedFieldUnit: savedSelectionActive ? savedDatasetResource.data?.field.descriptor.unit ?? null : null,
     selectedLabel,
     selectedObjectId: savedSelectionActive ? null : selectedObjectId,
     selectedRegionId: savedSelectionActive ? null : selectedRegionId,
@@ -7520,7 +7536,7 @@ export function useViewport3DSceneModel({
       ? EMPTY_SEMANTIC_RENDER_TARGET_CATALOG
       : semanticTargetCatalog,
     status: savedSelectionActive
-      ? savedViewportStatus ?? "Saved FEM field ready · representation not verified"
+      ? savedViewportStatus ?? "Saved field ready · representation not verified"
       : status,
     renderedMeshRevision: effectiveViewportTopologyModel?.meshRevision ?? null,
     topology: effectiveViewportTopology,
@@ -7533,7 +7549,11 @@ export function useViewport3DSceneModel({
     topologyModel: effectiveViewportTopologyModel,
     vectorColorMode: effectiveViewportVectorColorMode,
     vectorScale: savedSelectionActive ? vectorScale : fdmVectorScale,
-    vectorStyle,
+    vectorStyle: savedPresentation ? {
+      alpha: savedPresentation.settings.vectorAlphaPercent / 100,
+      monoColor: savedPresentation.settings.vectorMonoColor,
+      thickness: savedPresentation.settings.vectorThickness,
+    } : vectorStyle,
     visualizationEffectiveRenderMode,
     visualizationError: savedSelectionActive ? null : visualizationError,
     visualProfileId: commandState.visualProfileId,

@@ -124,6 +124,7 @@ import {
   SelectionHighlightLayer,
 } from "./BoundsLayers";
 import { FallbackTopologyMeshLayer } from "./FallbackTopologyMeshLayer";
+import type { Viewport3DVisibleColorScaleReport } from "../model/viewport3DVisibleColorScale";
 import { TopologyMeshLayer } from "./TopologyMeshLayer";
 import { MeshSizeHighlightLayer } from "./MeshSizeHighlightLayer";
 import {
@@ -295,6 +296,8 @@ interface Viewport3DSceneProps {
   orbitDebugRevision: number;
   fallbackSettings: VisualizationTargetSettings;
   savedViewportActive: boolean;
+  savedFieldIdentity?: string | null;
+  onVisibleColorScale?: (report: Viewport3DVisibleColorScaleReport) => void;
   primitiveModel: Viewport3DPrimitiveRenderModel | null;
   resetCameraRevision: number;
   requestDiagnostics: RequestDiagnosticsController;
@@ -1905,6 +1908,8 @@ export function Viewport3DScene({
   orbitDebugCommitRevision,
   orbitDebugRevision,
   savedViewportActive,
+  savedFieldIdentity,
+  onVisibleColorScale,
   primitiveModel,
   regionOverlayMode,
   regionOverlays,
@@ -2424,6 +2429,8 @@ export function Viewport3DScene({
         <group>
           <FallbackTopologyMeshLayer
             colors={colors}
+            colorScopeKey={savedFieldIdentity}
+            onVisibleColorScale={onVisibleColorScale}
             femDomain={femDomain}
             fallbackSettings={fallbackSettings}
             fieldModel={fieldModel}

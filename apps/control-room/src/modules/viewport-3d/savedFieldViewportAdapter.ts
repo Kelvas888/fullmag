@@ -1,4 +1,4 @@
-import type { VisualizationTargetSettings } from "@/kernel/visualization/ObjectVisualizationController";
+import type { SavedFieldPresentation, VisualizationTargetSettings } from "@/kernel/visualization/ObjectVisualizationController";
 import type { DecodedTopology } from "@/kernel/api/codecs";
 import type { SavedFieldGeometryResource } from "@/kernel/api/apiTypes";
 import {
@@ -237,6 +237,7 @@ export function buildSavedFieldViewportSceneModel({
   vectorColorMode,
   vectorScale,
   settings,
+  colorRanges,
   sceneVectorCap = 2048,
 }: {
   geometry: SavedFieldGeometryResource;
@@ -247,6 +248,7 @@ export function buildSavedFieldViewportSceneModel({
   vectorColorMode: string;
   vectorScale: number;
   settings?: Pick<VisualizationTargetSettings, "shaderColorMode" | "vectorBudget">;
+  colorRanges?: SavedFieldPresentation["colorRanges"];
   sceneVectorCap?: number;
 }): SavedFieldViewportSceneModel | null {
   if (
@@ -304,6 +306,8 @@ export function buildSavedFieldViewportSceneModel({
       scalarColorModes: new Set([scalarMode]),
       scalarColorPalette: palette,
       scalarColorsVisible: true,
+      scalarRangesByMode: colorRanges ? new Map(Object.entries(colorRanges).map(([mode, range]) =>
+        [mode, { min: range.minimum, max: range.maximum }])) : undefined,
       topologyRevision: field.savedScopeKey,
       vectorColorMode: quantityVectorColorMode,
     },

@@ -225,6 +225,7 @@ class VectorGlyphWorkerClient {
     const segments = new Float32Array(input.segments);
     const colorsOverride = input.colorsOverride ? new Float32Array(input.colorsOverride) : null;
     const request: VectorGlyphWorkerRequest = {
+      colorScale: input.colorScale,
       colorsOverride,
       colorMode: input.colorMode,
       headLengthRatio: input.headLengthRatio,

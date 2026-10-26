@@ -1,5 +1,8 @@
 "use client";
 
+import { useSavedFieldPresentation } from "@/kernel/visualization/useObjectVisualization";
+import { SavedFieldVisualizationInspector } from "../SavedFieldVisualizationPanel";
+
 import type { InspectorPanelProps } from "../../inspectorTypes";
 import {
   VisualizationTargetInspectorPanel,
@@ -15,7 +18,12 @@ const AIRBOX_VISUALIZATION_OWNER: VisualizationInspectorOwner = {
   title: "Airbox visualization",
 };
 
-export function AirboxVisualizationPanel({ selection }: InspectorPanelProps) {
+export function AirboxVisualizationPanel(props: InspectorPanelProps) {
+  const { presentation } = useSavedFieldPresentation();
+  return presentation ? <SavedFieldVisualizationInspector /> : <CurrentAirboxVisualizationPanel {...props} />;
+}
+
+function CurrentAirboxVisualizationPanel({ selection }: InspectorPanelProps) {
   return (
     <VisualizationTargetInspectorPanel
       owner={AIRBOX_VISUALIZATION_OWNER}

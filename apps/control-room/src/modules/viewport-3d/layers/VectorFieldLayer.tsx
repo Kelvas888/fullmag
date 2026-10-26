@@ -31,6 +31,7 @@ import { createViewport3DGpuUploadManager } from "../build-engine/gpu/viewport3d
 import type { Viewport3DGpuUploadChunk } from "../build-engine/gpu/viewport3dGpuUploadTypes";
 import type { Viewport3DVectorBuildReference } from "../viewport3dRenderModel";
 import type { Viewport3DColors } from "../viewport3dTypes";
+import type { Viewport3DVisibleColorScale, Viewport3DVisibleColorScaleReport } from "../model/viewport3DVisibleColorScale";
 import type { VectorGlyphTransforms } from "./vectorGlyphGeometry";
 import {
   buildViewport3DVectorGlyphsOffMainThread,
@@ -349,12 +350,14 @@ function glyphColorBufferKey(buffer: Float32Array | null | undefined): number | 
 function createVectorGlyphSemanticBuildKey({
   buildReference,
   colorMode,
+  colorScale,
   colorsOverride,
   headRadiusRatio,
   shaftRadiusRatio,
 }: {
   buildReference?: Viewport3DVectorBuildReference | null;
   colorMode: string;
+  colorScale?: Viewport3DVisibleColorScale | null;
   colorsOverride?: Float32Array | null;
   headRadiusRatio: number;
   shaftRadiusRatio: number;
@@ -364,6 +367,7 @@ function createVectorGlyphSemanticBuildKey({
     buildReference.buildKey,
     "colorBuffer=" + (glyphColorBufferKey(colorsOverride) ?? "derived"),
     `color=${colorMode}`,
+    ...(colorScale === undefined ? [] : [`colorScale=${JSON.stringify(colorScale)}`]),
     `head=${headRadiusRatio}`,
     `shaft=${shaftRadiusRatio}`,
   ].join(":");
@@ -606,6 +610,7 @@ function useVectorGlyphBuild({
   buildKey,
   buildReference,
   colorMode,
+  colorScale,
   colorsOverride,
   headRadiusRatio,
   invalidate,
@@ -616,6 +621,7 @@ function useVectorGlyphBuild({
   buildKey?: string;
   buildReference?: Viewport3DVectorBuildReference | null;
   colorMode: string;
+  colorScale?: Viewport3DVisibleColorScale | null;
   colorsOverride?: Float32Array | null;
   headRadiusRatio: number;
   invalidate: () => void;
@@ -638,13 +644,14 @@ function useVectorGlyphBuild({
       segments
         ? {
             colorMode,
+            colorScale,
             colorsOverride,
             headRadiusRatio,
             segments,
             shaftRadiusRatio,
           }
         : null,
-    [colorMode, colorsOverride, headRadiusRatio, segments, shaftRadiusRatio],
+    [colorMode, colorScale, colorsOverride, headRadiusRatio, segments, shaftRadiusRatio],
   );
   const snapshot = useSyncExternalStore(
     store.subscribe,
@@ -1051,6 +1058,9 @@ export function VectorFieldLayer({
   carrierId,
   colors,
   colorMode = "orientation",
+  colorScale,
+  colorScopeKey,
+  onVisibleColorScale,
   glyphColorsOverride,
   opacity = 1,
   segments,
@@ -1066,6 +1076,9 @@ export function VectorFieldLayer({
   carrierId?: string;
   colors: Viewport3DColors;
   colorMode?: string;
+  colorScale?: Viewport3DVisibleColorScale | null;
+  colorScopeKey?: string | null;
+  onVisibleColorScale?: (report: Viewport3DVisibleColorScaleReport) => void;
   /** Optional field-derived RGB values, one triplet per glyph. */
   glyphColorsOverride?: Float32Array | null;
   materialProfile?: Viewport3DMaterialProfile["glyphs"];
@@ -1091,6 +1104,7 @@ export function VectorFieldLayer({
       createVectorGlyphSemanticBuildKey({
         buildReference,
         colorMode,
+        colorScale,
         colorsOverride: glyphColorsOverride,
         headRadiusRatio: resolvedStyle.headRadiusRatio,
         shaftRadiusRatio: resolvedStyle.shaftRadiusRatio,
@@ -1098,6 +1112,7 @@ export function VectorFieldLayer({
     [
       buildReference,
       colorMode,
+      colorScale,
       glyphColorsOverride,
       resolvedStyle.headRadiusRatio,
       resolvedStyle.shaftRadiusRatio,
@@ -1107,6 +1122,7 @@ export function VectorFieldLayer({
     buildKey: vectorGlyphBuildKey,
     buildReference,
     colorMode,
+    colorScale,
     colorsOverride: glyphColorsOverride,
     headRadiusRatio: resolvedStyle.headRadiusRatio,
     invalidate,
@@ -1117,7 +1133,6 @@ export function VectorFieldLayer({
   const glyphBuild = visibleGlyphBuild?.result ?? null;
   const glyphTransforms = glyphBuild?.transforms ?? null;
   const glyphColors = glyphBuild?.colors ?? null;
-  const useInstanceColors = Boolean(glyphColors);
   const glyphCount = glyphTransforms?.count ?? 0;
   const transformScratch = useMemo(
     () => createVectorGlyphTransformScratch(),
@@ -1142,6 +1157,8 @@ export function VectorFieldLayer({
   const adoptionOwnerId = `vector-field:${useId()}`;
   const recordAdoption = useCallback(
     (byteLength: number) => {
+      if (colorScopeKey) onVisibleColorScale?.({ scopeKey: colorScopeKey,
+        ownerId: adoptionOwnerId, pass: "vectors", scale: glyphBuild?.colorScale ?? null });
       const sourceVectorBuildKey = resolveVectorFieldAdoptionBuildKey(glyphBuild);
       if (!adoptionRegistry || !carrierId || !sourceVectorBuildKey) return;
       lastAdoptionRef.current = {
@@ -1167,8 +1184,17 @@ export function VectorFieldLayer({
         sessionIdentity,
       });
     },
-    [adoptionOwnerId, adoptionRegistry, carrierId, fieldBufferId, glyphBuild, glyphCount, sessionIdentity],
+    [adoptionOwnerId, adoptionRegistry, carrierId, colorScopeKey, fieldBufferId, glyphBuild, glyphCount, onVisibleColorScale, sessionIdentity],
   );
+  useEffect(() => () => {
+    if (colorScopeKey) onVisibleColorScale?.({ scopeKey: colorScopeKey,
+      ownerId: adoptionOwnerId, pass: "vectors", scale: null, removed: true });
+  }, [adoptionOwnerId, colorScopeKey, onVisibleColorScale]);
+  useEffect(() => {
+    if (glyphBuild && glyphCount > 0 || !colorScopeKey) return;
+    onVisibleColorScale?.({ scopeKey: colorScopeKey, ownerId: adoptionOwnerId,
+      pass: "vectors", scale: null, removed: true });
+  }, [adoptionOwnerId, colorScopeKey, glyphBuild, glyphCount, onVisibleColorScale]);
   useEffect(() => {
     if (!adoptionRegistry || !carrierId) return;
     const unregister = adoptionRegistry.registerCarrierAdoptionReplay(carrierId, () => {
@@ -1193,7 +1219,7 @@ export function VectorFieldLayer({
     };
   }, [adoptionOwnerId, adoptionRegistry, carrierId]);
   useEffect(() => {
-    if (glyphBuild || !adoptionRegistry || !carrierId) return;
+    if (glyphBuild && glyphCount > 0 || !adoptionRegistry || !carrierId) return;
     const adoption = lastAdoptionRef.current;
     if (!adoption) return;
     adoptionRegistry.clearAdoption(
@@ -1201,7 +1227,7 @@ export function VectorFieldLayer({
       vectorFieldAdoptionIdentity({ ...adoption, carrierId }),
     );
     lastAdoptionRef.current = null;
-  }, [adoptionOwnerId, adoptionRegistry, carrierId, glyphBuild]);
+  }, [adoptionOwnerId, adoptionRegistry, carrierId, glyphBuild, glyphCount]);
 
   useVectorGlyphMaterialSync({
     glyphPolicy,
@@ -1211,7 +1237,7 @@ export function VectorFieldLayer({
     materialOpacity: resolvedStyle.materialOpacity,
     materialProfile,
     tracker,
-    useInstanceColors,
+    useInstanceColors: material.vertexColors,
   });
   useVectorGlyphUpload({
     buildKey: visibleGlyphBuild?.buildKey ?? null,
