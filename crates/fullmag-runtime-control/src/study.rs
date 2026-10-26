@@ -2079,6 +2079,34 @@ pub(crate) fn validate_study_task_completion_for_snapshot(
     claim: &TaskClaim,
     accepted: &AcceptedStudySnapshot,
 ) -> Result<()> {
+    read_study_task_completion_for_snapshot(store, claim, accepted, false).map(|_| ())
+}
+
+/// Immutable readers are released only after every completion fence succeeds.
+/// Fields stay private so callers cannot manufacture a verified completion.
+pub(crate) struct VerifiedStudyCompletion {
+    inspections: Vec<(String, usize, Option<fullmag_runner::LoadedAntennaClosedLoopInspection>)>,
+}
+
+impl VerifiedStudyCompletion {
+    pub(crate) fn into_inspection(self, expected_object: &str)
+        -> Result<(usize, Option<fullmag_runner::LoadedAntennaClosedLoopInspection>)> {
+        let mut inspections = self.inspections.into_iter();
+        let (object, byte_count, loaded) = inspections.next().context("completion has no verified inspection")?;
+        if inspections.next().is_some() || object != expected_object {
+            bail!("inspection public CAS object differs from verified completion");
+        }
+        Ok((byte_count, loaded))
+    }
+}
+
+pub(crate) fn read_study_task_completion_for_snapshot(
+    store: &SessionStore,
+    claim: &TaskClaim,
+    accepted: &AcceptedStudySnapshot,
+    retain_inspection: bool,
+) -> Result<VerifiedStudyCompletion> {
+    let mut inspections = Vec::new();
     let run_id = claim.run_id.as_str();
     let current_intent = store.read_run_intent(run_id)?;
     if current_intent.as_ref() != Some(&accepted.run.intent) {
@@ -2284,7 +2312,13 @@ pub(crate) fn validate_study_task_completion_for_snapshot(
         if let Some(maximum)=maximum {
             if output.codec_id!=fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_ID || output.codec_version!=fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION || output.case_id!="default" || manifest.accepted_state_ref.is_some() || manifest.observation_source.is_some() { bail!("inspection completion cannot accept solver outputs or state"); }
             let problem=accepted.catalog.entries().iter().find(|entry|entry.step_id()==source_step.step_id).context("inspection completion ProblemIR missing")?.problem();
-            crate::study_inspection::validate_accepted_inspection_bytes(problem,source_step,&output_bytes,maximum)?;
+            let loaded = if retain_inspection {
+                Some(crate::study_inspection::load_accepted_inspection_bytes(problem,source_step,&output_bytes,maximum)?)
+            } else {
+                crate::study_inspection::validate_accepted_inspection_bytes(problem,source_step,&output_bytes,maximum)?;
+                None
+            };
+            inspections.push((output.object_ref.clone(), output_bytes.len(), loaded));
         }
         let resolved_artifact = fullmag_application::ResolvedStudyArtifact {
             artifact_id: output.artifact_id.clone(),
@@ -2383,7 +2417,7 @@ pub(crate) fn validate_study_task_completion_for_snapshot(
             bail!("study completion found an observation artifact outside its manifest allow-list");
         }
     }
-    Ok(())
+    Ok(VerifiedStudyCompletion { inspections })
 }
 
 /// Bind the accepted StepOutput identity to the manifest and immutable bytes

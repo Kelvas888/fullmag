@@ -17,7 +17,7 @@ pub fn verify_saved_inspection(
     attempt_id: &str, epoch: u64, expected_object: &str,
 ) -> Result<serde_json::Value> {
     read_saved_inspection(store, project, run, task_id, attempt_id, epoch,
-        expected_object, |evidence, _, _, _| Ok(evidence))
+        expected_object, false, |evidence, _| Ok(evidence))
 }
 
 /// Same durable cold-read fence, returning verified field data without filesystem extraction.
@@ -26,16 +26,16 @@ pub fn load_saved_inspection(
     attempt_id: &str, epoch: u64, expected_object: &str,
 ) -> Result<(serde_json::Value, fullmag_runner::LoadedAntennaClosedLoopInspection)> {
     read_saved_inspection(store, project, run, task_id, attempt_id, epoch,
-        expected_object, |evidence, bytes, maximum, step| {
-            let loaded = decode_inspection(bytes, maximum, step)?;
-            Ok((evidence, loaded))
+        expected_object, true, |evidence, loaded| {
+            Ok((evidence, loaded.context("verified completion did not retain its inspection reader")?))
         })
 }
 
 fn read_saved_inspection<T>(
     store: &SessionStore, project: &ProjectId, run: &RunId, task_id: &str,
     attempt_id: &str, epoch: u64, expected_object: &str,
-    build: impl FnOnce(serde_json::Value, &[u8], usize, &fullmag_authoring::StudyStep) -> Result<T>,
+    retain_inspection: bool,
+    build: impl FnOnce(serde_json::Value, Option<fullmag_runner::LoadedAntennaClosedLoopInspection>) -> Result<T>,
 ) -> Result<T> {
     let transaction = store.read_transaction()
         .context("inspection cold-load requires a valid shared store snapshot")?;
@@ -79,8 +79,8 @@ fn read_saved_inspection<T>(
     if manifests.len() != 1 { bail!("inspection has no unique typed completion manifest"); }
     store.cas().get_bounded(manifests[0].object_ref.as_deref().context("inspection manifest CAS missing")?, 4 * 1024 * 1024)?
         .context("inspection typed completion manifest missing")?;
-    crate::study::validate_study_task_completion_for_snapshot(
-        store, recovered.coordinator.claim(), &accepted)?;
+    let completion = crate::study::read_study_task_completion_for_snapshot(
+        store, recovered.coordinator.claim(), &accepted, retain_inspection)?;
     let artifacts = store.read_artifact_catalog(run.as_str())?.context("inspection artifacts missing")?;
     let outputs = artifacts.entries.iter().filter(|artifact| artifact.task_id == task_id
         && artifact.attempt_id == attempt_id && artifact.ownership_epoch == epoch
@@ -91,17 +91,16 @@ fn read_saved_inspection<T>(
         || output.object_ref.as_deref() != Some(expected_object) || output.content_sha256 != expected_object {
         bail!("inspection public CAS object differs from durable output");
     }
-    // Completion validated this same sole typed output against the accepted
-    // ProblemIR. Re-hash its bytes against the discovery pin under this read lock;
-    // decoding still validates the neutral closure and thin-view bounds.
-    let bytes = store.cas().get_bounded(expected_object, crate::study_inspection::inspection_bundle_budget(&claim)? as u64)?
-        .context("inspection pinned CAS object missing")?;
+    // Completion already read and re-hashed this exact output under the same
+    // shared transaction. Reuse its fully verified immutable reader in this read
+    // only; every subsequent request repeats all durable and CAS fences.
+    let (byte_count, loaded) = completion.into_inspection(expected_object)?;
     build(serde_json::json!({"schema":"fullmag.saved_inspection_integrity.v1","status":"pass",
         "project_id":project.as_str(),"run_id":run.as_str(),"task_id":task_id,"attempt_id":attempt_id,
-        "ownership_epoch":epoch,"object_ref":expected_object,"byte_count":bytes.len(),
+        "ownership_epoch":epoch,"object_ref":expected_object,"byte_count":byte_count,
         "artifact_id":output.artifact_id,"preparation_id":preparation.preparation_id,
         "publication":"inspection_only","qualification":"not_verified","read_only":true}),
-        &bytes, crate::study_inspection::inspection_bundle_budget(&claim)?, step)
+        loaded)
 }
 
 fn decode_inspection(bytes: &[u8], maximum: usize, step: &fullmag_authoring::StudyStep)

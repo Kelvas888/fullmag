@@ -912,3 +912,22 @@ TypeScript exit0; focused ESLint po poprawce nazwy zmiennej w skrypcie exit0.
 testów jednostkowych. Przeglądarka/WebGL i zachowanie focus/scroll/ACK
 pozostają NOT VERIFIED z powodu wcześniej zablokowanej ścieżki odczytu.
 To fragment inspektora, nie ukończenie E7 ani pola Universe.
+
+
+### E5 — pojedyncza pełna walidacja w accepted cold-read (26.10.2026)
+
+Usunięto powtórne wczytanie i pełne sprawdzenie tego samego pakietu w jednym żądaniu. `study_inspection.rs::with_accepted_inspection_bytes` współdzieli niezmienione kontrole zaakceptowanej operacji między verify-only i loaderem. `study.rs::read_study_task_completion_for_snapshot` zwraca prywatny `VerifiedStudyCompletion` dopiero po ostatniej bramce completion. `study_inspection_integrity.rs::read_saved_inspection` odbiera dokładnie ten reader w tej samej transakcji zamiast drugiego CAS/decode/verify. Nie powstał cache między żądaniami ani nowy publiczny kontrakt. Dotychczasowy wrapper Result<()> zachowuje verify-only dla pozostałych konsumentów.
+
+Zachowano attempt/epoch, fingerprint, preparation, genesis, replay Completed, unikalny manifest, status publikacji, codec, zaakceptowany intent, odczyt i hashowanie CAS, allowlisty oraz kontrolę nadmiarowych artefaktów. Reader nie ma publicznego konstruktora ani Deserialize. Importowana ścieżka evidence nie jest jeszcze objęta tą optymalizacją; tam nadal istnieje powtórna walidacja.
+
+Dowody:
+
+- Regresja `scripts/check_saved_inspection_single_verification.py`: PASS; sprawdza strukturę wywołań i obecność bramek, nie jest dowodem runtime ani testem uszkodzonego CAS.
+- Managed build w istniejącej grupie Compose 3203: iteracja `7573a888a93a4858974afeb07b23e8a4`, succeeded, make exit0 w 462310ms, pakiet24plików, bramki Linux i worker-cgroup. Źródła HEAD `b6a29c2ee6a0bb4ddbabe8da82aca6955df891a7` z dirty snapshotem `47a9d5f810ea855c4340df58dd36a3bd9a293e4997eafb1f6e739a7880b19e87`. Trzy zmienione pliki Rust mają identyczne SHA256 w bind mouncie i cieniu źródeł buildu.
+- Publiczny, istniejący wynik `run-surface-face-cache-baseline-after-20261026-01`: 31 kontroli HTTP PASS. V:678wartości/5424B/V; J:22380/179040B/A/m²; H:42/336B/A/m. ETag304, Range206/416, błędne attempt/epoch/package409 i nieznany payload400. Scena, sesje i polecenia identyczne przed i po odczytach. To wynik14targetów, nie mapa całego Universe.
+- Metadane HTTP200 zachowały dokładnie13344B, SHA256 i ETag `204d876654a4abadeb411cdffdc9e21fca8cb9f52645f6646818ce7b1cb7bb37`. Pojedynczy odczyt przed:10,664s; po:9,221s. Obserwacje te nie kwalifikują statystycznie wydajności; interaktywny odczyt nadal jest zbyt wolny.
+- Po buildzie przywrócono uprzednio zatwierdzony FMS visualization_only wyłącznie po health active_session=false; importHTTP200 bez ostrzeżeń. Nie uruchomiono kolejnego Solve i nie kompilowano testów jednostkowych.
+
+Dowody trwałe: `verification/accepted-inspection-single-verify-20261026/{build-proof.json,before-read-timing.json,after-read-timing.json,public-http.json,scene-import-response.json}` w wolumenie kontrolnym grupy. Zachowano cache przyrostowy, zweryfikowany pakiet, rollback oraz wszystkie wyniki; bez usuwania danych. Przed buildem brak aktywnych workerów, dostępne411887210496B w filesystemie wolumenu (nie pomiar wolnego miejsca fizycznego dysku Windows).
+
+Następne kroki: kanoniczny, ograniczony reuse między żądaniami dopiero po każdorazowych kontrolach durable/CAS; osobne profilowanie faz pełnego operatora. Nie zastosowano zmiany arytmetyki MPFR ani redukcji precyzji. Pełny Universe H, jego kwalifikacja oraz browser/WebGL pozostają nieukończone. E0–E12 nadal nie są zakończone.

@@ -17,6 +17,23 @@ pub fn inspection_bundle_budget(claim: &TaskClaim) -> Result<usize> {
 }
 
 pub fn validate_accepted_inspection_bytes(problem:&ProblemIR, step:&StudyStep, bytes:&[u8], max_bytes:usize) -> Result<()> {
+    with_accepted_inspection_bytes(problem, step, bytes, max_bytes, |manifest, artifacts, stage, output, port, digest| {
+        fullmag_runner::verify_antenna_closed_loop_inspection_bytes(manifest, &artifacts, stage, output, port, digest, max_bytes)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    })
+}
+
+pub(crate) fn load_accepted_inspection_bytes(problem:&ProblemIR, step:&StudyStep, bytes:&[u8], max_bytes:usize)
+    -> Result<fullmag_runner::LoadedAntennaClosedLoopInspection> {
+    with_accepted_inspection_bytes(problem, step, bytes, max_bytes, |manifest, artifacts, stage, output, port, digest| {
+        fullmag_runner::load_antenna_closed_loop_inspection_bytes(manifest, artifacts, stage, output, port, digest, max_bytes)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    })
+}
+
+fn with_accepted_inspection_bytes<T>(problem:&ProblemIR, step:&StudyStep, bytes:&[u8], max_bytes:usize,
+    build: impl FnOnce(&[u8], Vec<fullmag_runner::AuxiliaryArtifact>, &str, &str, &str, &str) -> Result<T>,
+) -> Result<T> {
     let StudyStepKind::ClosedLoopInspection { stage_id, port_mode_id, output_id }=&step.kind else { bail!("inspection output cannot belong to a legacy solver step"); };
     let operation=fullmag_plan::validate_closed_loop_operation(problem,stage_id,port_mode_id,output_id)?;
     let fullmag_plan::AntennaFieldSolveExecutionPlan::ClosedLoopInspection { input, .. }=operation else { bail!("inspection output operation mismatch"); };
@@ -46,9 +63,7 @@ pub fn validate_accepted_inspection_bytes(problem:&ProblemIR, step:&StudyStep, b
     }
     let content_digest=manifest["content_digest"].as_str().context("inspection content identity missing")?;
     let artifacts=bundle.payloads.into_iter().map(|(relative_path,bytes)|fullmag_runner::AuxiliaryArtifact { relative_path,bytes }).collect::<Vec<_>>();
-    fullmag_runner::verify_antenna_closed_loop_inspection_bytes(&bundle.manifest_bytes,&artifacts,stage_id,output_id,port_mode_id,content_digest,max_bytes)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    Ok(())
+    build(&bundle.manifest_bytes, artifacts, stage_id, output_id, port_mode_id, content_digest)
 }
 
 #[cfg(test)]
