@@ -6,6 +6,7 @@ import {
 } from "./vectorGlyphGeometry";
 
 export interface VectorGlyphBuildRequest {
+  colorsOverride?: Float32Array | null;
   colorMode?: string;
   headLengthRatio?: number;
   headRadiusRatio?: number;
@@ -30,9 +31,14 @@ export function buildViewport3DVectorGlyphs(
     headRadiusRatio: request.headRadiusRatio,
     shaftRadiusRatio: request.shaftRadiusRatio,
   };
+  const transforms = buildVectorGlyphTransforms(request.segments, options);
+  if (request.colorsOverride && request.colorsOverride.length !== transforms.count * 3) {
+    throw new RangeError("Vector glyph colors do not match the source transforms");
+  }
   return {
-    colors: buildVectorGlyphColors(request.segments, request.colorMode),
-    transforms: buildVectorGlyphTransforms(request.segments, options),
+    // Own this copy: worker output transfer must not detach the input buffer.
+    colors: request.colorsOverride?.slice() ?? buildVectorGlyphColors(request.segments, request.colorMode),
+    transforms,
   };
 }
 

@@ -332,20 +332,37 @@ export function createVectorGlyphUploadKeys({
   };
 }
 
+// Local immutable buffer identity; physics provenance remains in buildReference.
+const glyphColorBufferKeys = new WeakMap<Float32Array, number>();
+let nextGlyphColorBufferKey = 0;
+
+function glyphColorBufferKey(buffer: Float32Array | null | undefined): number | null {
+  if (!buffer) return null;
+  let key = glyphColorBufferKeys.get(buffer);
+  if (key === undefined) {
+    key = ++nextGlyphColorBufferKey;
+    glyphColorBufferKeys.set(buffer, key);
+  }
+  return key;
+}
+
 function createVectorGlyphSemanticBuildKey({
   buildReference,
   colorMode,
+  colorsOverride,
   headRadiusRatio,
   shaftRadiusRatio,
 }: {
   buildReference?: Viewport3DVectorBuildReference | null;
   colorMode: string;
+  colorsOverride?: Float32Array | null;
   headRadiusRatio: number;
   shaftRadiusRatio: number;
 }): string | undefined {
   if (!buildReference) return undefined;
   return [
     buildReference.buildKey,
+    "colorBuffer=" + (glyphColorBufferKey(colorsOverride) ?? "derived"),
     `color=${colorMode}`,
     `head=${headRadiusRatio}`,
     `shaft=${shaftRadiusRatio}`,
@@ -589,6 +606,7 @@ function useVectorGlyphBuild({
   buildKey,
   buildReference,
   colorMode,
+  colorsOverride,
   headRadiusRatio,
   invalidate,
   segments,
@@ -598,6 +616,7 @@ function useVectorGlyphBuild({
   buildKey?: string;
   buildReference?: Viewport3DVectorBuildReference | null;
   colorMode: string;
+  colorsOverride?: Float32Array | null;
   headRadiusRatio: number;
   invalidate: () => void;
   segments: Float32Array | null;
@@ -619,12 +638,13 @@ function useVectorGlyphBuild({
       segments
         ? {
             colorMode,
+            colorsOverride,
             headRadiusRatio,
             segments,
             shaftRadiusRatio,
           }
         : null,
-    [colorMode, headRadiusRatio, segments, shaftRadiusRatio],
+    [colorMode, colorsOverride, headRadiusRatio, segments, shaftRadiusRatio],
   );
   const snapshot = useSyncExternalStore(
     store.subscribe,
@@ -1148,12 +1168,14 @@ export function VectorFieldLayer({
       createVectorGlyphSemanticBuildKey({
         buildReference,
         colorMode,
+        colorsOverride: glyphColorsOverride,
         headRadiusRatio: resolvedStyle.headRadiusRatio,
         shaftRadiusRatio: resolvedStyle.shaftRadiusRatio,
       }),
     [
       buildReference,
       colorMode,
+      glyphColorsOverride,
       resolvedStyle.headRadiusRatio,
       resolvedStyle.shaftRadiusRatio,
     ],
@@ -1162,6 +1184,7 @@ export function VectorFieldLayer({
     buildKey: vectorGlyphBuildKey,
     buildReference,
     colorMode,
+    colorsOverride: glyphColorsOverride,
     headRadiusRatio: resolvedStyle.headRadiusRatio,
     invalidate,
     segments,
@@ -1170,7 +1193,7 @@ export function VectorFieldLayer({
   });
   const glyphBuild = visibleGlyphBuild?.result ?? null;
   const glyphTransforms = glyphBuild?.transforms ?? null;
-  const glyphColors = glyphColorsOverride ?? glyphBuild?.colors ?? null;
+  const glyphColors = glyphBuild?.colors ?? null;
   const useInstanceColors = Boolean(glyphColors);
   const glyphCount = glyphTransforms?.count ?? 0;
   const transformScratch = useMemo(
