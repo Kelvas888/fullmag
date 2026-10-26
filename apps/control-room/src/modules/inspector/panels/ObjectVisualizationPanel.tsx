@@ -86,6 +86,7 @@ import { useViewport3DArtifactInspectionPresentation, manifestRenderableCarriers
 
 import type { InspectorPanelProps } from "../inspectorTypes";
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
+import { ViewportCameraControls } from "../visualization/ViewportCameraControls";
 import {
   ScientificInspectorContext,
   ScientificInspectorIdentity,
@@ -1546,14 +1547,10 @@ function ObjectVisualizationPanelView({
                 Advanced rendering uses the active viewport quality profile.
               </p>
             }
-            camera={
-              <p className="m-0 text-fm-help leading-snug text-fm-muted">
-                Camera framing follows the active viewport.
-              </p>
-            }
+            camera={<ViewportCameraControls />}
             clipping={
               <p className="m-0 text-fm-help leading-snug text-fm-muted">
-                No clipping plane is configured for this target.
+                Clipping controls are not available in this inspector.
               </p>
             }
             dataState={dataState}

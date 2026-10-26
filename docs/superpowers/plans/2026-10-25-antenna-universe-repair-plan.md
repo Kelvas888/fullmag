@@ -891,3 +891,24 @@ Universe był włączany wyłącznie dla aktywnego H_ant, podczas gdy pusty
 wybór i domyślne H_demag uniemożliwiały jego odkrycie. Naprawa tej kolejności
 pozostaje osobnym fragmentem; musi zachować pozytywny kontrakt live,
 przypiętego właściciela i filtr zaakceptowanej siatki Global.
+
+### Wspólne polecenia kamery w inspektorze Object/Airbox
+
+Zastąpiono opisową sekcję Camera & View rzeczywistym ViewportCameraControls:
+Fit scene, Reset camera oraz Camera parameters korzystają z istniejącego
+rejestru poleceń viewport-3d, bez nowej kamery, subskrypcji zasobów serwera
+ani obliczeń. Dawny eksport AntennaCameraControls pozostaje aliasem tej
+samej implementacji. SSR zachowuje disabled do gotowości rejestru,
+każde polecenie ma własną dostępność i świeży kontekst bieżącej sesji.
+Podsumowania nie deklarują nieodczytanych Perspective/Auto/Section Off;
+niezaimplementowana w tym wspólnym panelu kontrola clippingu jest jawna.
+
+Interpretowana regresja produkcyjnego komponentu i createCommandContext:
+10 kontroli PASS (w tym SSR, osobne disabled, obsługa błędu i nowy session scope).
+Rzeczywiste trzy command IDs potwierdzono w modules/viewport-3d/manifest.ts.
+TypeScript exit0; focused ESLint po poprawce nazwy zmiennej w skrypcie exit0.
+Źródła i cień frontendu identyczne. Dowody w technicznym wolumenie frontendu:
+/state/development/verification/universe-camera-20261026/. Nie kompilowano
+testów jednostkowych. Przeglądarka/WebGL i zachowanie focus/scroll/ACK
+pozostają NOT VERIFIED z powodu wcześniej zablokowanej ścieżki odczytu.
+To fragment inspektora, nie ukończenie E7 ani pola Universe.

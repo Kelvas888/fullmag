@@ -34,7 +34,7 @@ export function VisualizationInspectorOverview({
   advanced,
   camera,
   clipping,
-  clippingSummary = "Section: Off",
+  clippingSummary = "Viewport controls",
   context,
   dataState,
   display,
@@ -91,7 +91,7 @@ export function VisualizationInspectorOverview({
             defaultOpen: false,
             icon: <Camera size={16} strokeWidth={1.75} />,
             id: "camera",
-            summary: "Perspective • Auto",
+            summary: "Viewport controls",
             title: "Camera & View",
           },
           {
