@@ -1,7 +1,11 @@
 """Synthetic metadata fixtures; no native or scientific qualification."""
 import unittest
+import copy
+from hashlib import sha256
+import json
+import struct
 
-from smoke_antenna_closed_loop_inspection import validate_resource
+from smoke_antenna_closed_loop_inspection import validate_resource, verify_field_evidence
 from smoke_antenna_external_lead_inspection import SmokeError
 
 
@@ -51,6 +55,7 @@ def resource(sample_cells=24, target_count=14, source_cells=1867):
     }
     manifest = {
         "schema_version": "antenna_field_solution.v2", "status": "inspection_only",
+        "direct_evidence_schema": "fem_direct_oersted_evidence.v2",
         "validation_scope": "full_cold_bundle", "qualification": "NOT VERIFIED",
         "field_scope": "full_closed_loop.inspection_only.v2",
         "content_digest": digest, "solution_id": "output", "stage_id": "inspect_loop",
@@ -101,6 +106,14 @@ class ClosedLoopMetadataBoundsTests(unittest.TestCase):
                 self.assertEqual(digest, manifest["content_digest"])
                 self.assertEqual(len(manifest["payloads"]), 22)
 
+    def test_accepts_surface_evidence_descriptor(self):
+        value = resource(sample_cells=6428, target_count=1145, source_cells=1856)
+        manifest = value["closed_loop_manifest"]
+        manifest["direct_evidence_schema"] = "fem_rt0_surface_evidence.v1"
+        manifest["payloads"]["direct_evidence"].update(
+            layout="fem_rt0_surface_evidence.v1", byte_length=176 + 10000)
+        self.assertIs(validate_resource(value, "runtime-stage")[0], manifest)
+
     def test_rejects_invalid_sample_cell_counts(self):
         for count in (0, -1, True, 16385):
             with self.subTest(count=count):
@@ -136,6 +149,156 @@ class ClosedLoopMetadataBoundsTests(unittest.TestCase):
             value["closed_loop_manifest"]["payloads"][key]["byte_length"] = 16 << 20
         with self.assertRaisesRegex(SmokeError, "aggregate payload bound exceeded"):
             validate_resource(value, "runtime-stage")
+
+
+def evidence_fixture(targets=3, surface=True):
+    """Synthetic transport bindings, not a native numerical snapshot fixture."""
+    m = resource(target_count=targets)["closed_loop_manifest"]
+    positions = [[float(i), -0.0, 0.25] for i in range(targets)]
+    fields = [[-0.0, float(-i-1), 0.5] for i in range(targets)]
+    payloads = {"sample_xyz": b"".join(struct.pack("<3d", *v) for v in positions),
+                "h_raw": b"".join(struct.pack("<3d", *v) for v in fields)}
+    if not surface:
+        data = bytearray(296 + targets * 96)
+        data[:16] = b"FM-OEF1-Q3-V2\0\0\0"
+        data[16:80] = m["source"]["view_identity_digest"].encode()
+        data[80:144] = m["source"]["current_balance_certificate_digest"].encode()
+        struct.pack_into("<Q", data, 144, targets)
+        struct.pack_into("<3d", data, 272, 0.1, 10.0, 0.1)
+        for i, (p, h) in enumerate(zip(positions, fields)):
+            struct.pack_into("<9d3Q", data, 296 + 96*i, *p, *h, 0., 1., 0., 1, 1, 1)
+        payloads["direct_evidence"] = bytes(data)
+        return m, payloads, None
+    m["direct_evidence_schema"] = "fem_rt0_surface_evidence.v1"
+    policy = {"policy_version": "fixture", "limits": {}, "tolerances": {}}
+    for key in ("requested_intent", "resolved_execution"):
+        m[key]["surface_field_policy"] = copy.deepcopy(policy)
+    def precision(h):
+        return {"evaluated": True, "refusal_reason": "", "h_xyz_apm": [str(v) for v in h],
+                "whole_h_xyz_apm": [str(v) for v in h], "sum_local_norm_apm": "1",
+                "cancellation": "1", "maximum_face_cancellation": "1"}
+    snapshot = {"schema_version": "fem_rt0_surface_snapshot.v1",
+                "operator_version": "fem_oersted_rt0_surface.mpfr128_160_rndn_etoff.inspection.v1",
+                "basis_version": "fem_generic_affine_rt0.v1", "inspection_only": True,
+                "error_certificate_available": False, **policy,
+                "source_view_identity_digest": m["source"]["view_identity_digest"],
+                "accepted_source_state_digest": m["source"]["accepted_source_state_digest"],
+                "targets_xyz_m": positions, "targets": [
+                    {"h_xyz_apm": h, "precisions": [precision(h) for _ in range(3)],
+                     "binary64_requires_highprecision": False, "precision_budget_apm": "1e-9",
+                     "local_precision_delta_apm": "0", "local_formula_delta_apm": "0",
+                     "local_formula_delta_80_apm": "0", "binary64_roundoff_indicator_apm": "0"}
+                    for h in fields]}
+    return m, payloads, snapshot
+
+
+def encode_surface(m, payloads, snapshot):
+    raw = json.dumps(snapshot, separators=(",", ":")).encode()
+    ordered = sha256(b"antenna_rt0_surface_ordered_targets.v1" + struct.pack("<Q", m["target_count"]) + payloads["sample_xyz"]).hexdigest()
+    payloads["direct_evidence"] = (b"FM-RT0-SURF-V1\0\0" + struct.pack("<Q3d", len(raw),
+        m["source"]["source_current_a"], m["source"]["source_absolute_flux_a"], m["scale_per_a"])
+        + m["source"]["current_balance_certificate_digest"].encode() + ordered.encode() + raw)
+    m["payloads"]["direct_evidence"].update(layout=m["direct_evidence_schema"], byte_length=len(payloads["direct_evidence"]))
+
+
+class EvidenceTransportTests(unittest.TestCase):
+    def test_surface_and_legacy_preserve_signed_zero_and_independent_target_counts(self):
+        for surface in (False, True):
+            for count in (1, 14, 1145):
+                with self.subTest(surface=surface, targets=count):
+                    m, payloads, snapshot = evidence_fixture(count, surface)
+                    if surface: encode_surface(m, payloads, snapshot)
+                    verify_field_evidence(m, payloads)
+
+    def test_surface_accepts_actual_thin_named_counter_projection(self):
+        m, payloads, snapshot = evidence_fixture()
+        names = ("source_target_pairs", "face_precision_passes", "whole_face_formulas",
+                 "signed_fan_panels", "exact_fraction_operations", "exact_integer_operations",
+                 "exact_comparisons", "real_divisions", "copied_input_bytes",
+                 "reserved_output_bytes", "sqrt_calls", "log_calls", "log1p_calls", "atan2_calls")
+        snapshot["limits"] = {"total": list(range(1, 15)), "per_target": list(range(15, 29))}
+        m["surface_counter_encoding"] = "named_work_kind.v1"
+        for key in ("requested_intent", "resolved_execution"):
+            policy = {name: copy.deepcopy(snapshot[name]) for name in ("policy_version", "limits", "tolerances")}
+            for name in ("total", "per_target"):
+                policy["limits"][name] = dict(zip(names, snapshot["limits"][name]))
+            m[key]["surface_field_policy"] = policy
+        encode_surface(m, payloads, snapshot)
+        verify_field_evidence(m, payloads)
+        m["resolved_execution"]["surface_field_policy"]["limits"]["total"]["real_divisions"] += 1
+        with self.assertRaisesRegex(SmokeError, "policy differs"):
+            verify_field_evidence(m, payloads)
+
+    def test_surface_accepts_legacy_operator_and_legal_binary64_refusal(self):
+        m, payloads, snapshot = evidence_fixture()
+        snapshot["operator_version"] = "fem_oersted_rt0_surface.inspection.v1"
+        target = snapshot["targets"][0]
+        target["binary64_requires_highprecision"] = True
+        target["binary64_roundoff_indicator_apm"] = ""
+        precision = target["precisions"][0]
+        precision.update(evaluated=False, refusal_reason="fixture refusal", h_xyz_apm=[""]*3,
+                         whole_h_xyz_apm=[""]*3, sum_local_norm_apm="", cancellation="", maximum_face_cancellation="")
+        encode_surface(m, payloads, snapshot)
+        verify_field_evidence(m, payloads)
+
+    def test_surface_rejects_crossed_sources_policy_carriers_and_diagnostics(self):
+        mutations = [
+            lambda s: s.update(source_view_identity_digest="e"*64),
+            lambda s: s.update(accepted_source_state_digest="e"*64),
+            lambda s: s.update(schema_version="unknown"),
+            lambda s: s.update(operator_version="unknown"),
+            lambda s: s.update(inspection_only=False),
+            lambda s: s.update(error_certificate_available=True),
+            lambda s: s.update(policy_version="foreign"),
+            lambda s: s["targets"].pop(),
+            lambda s: s["targets_xyz_m"].pop(),
+            lambda s: s["targets_xyz_m"][0].__setitem__(0, 3.),
+            lambda s: s["targets"][0]["h_xyz_apm"].__setitem__(0, 0.),
+            lambda s: s["targets"][0]["h_xyz_apm"].__setitem__(0, float("inf")),
+            lambda s: s["targets"][0]["precisions"][2]["h_xyz_apm"].__setitem__(0, "0"),
+            lambda s: s["targets"][0]["precisions"][1].update(evaluated=False),
+            lambda s: s["targets"][0]["precisions"][1].update(refusal_reason="foreign"),
+            lambda s: s["targets"][0].update(local_precision_delta_apm="NaN"),
+            lambda s: s["targets"][0].update(local_formula_delta_apm="-1"),
+            lambda s: s["targets"][0].update(precision_budget_apm="1e2147483648"),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                m, payloads, snapshot = evidence_fixture()
+                mutate(snapshot); encode_surface(m, payloads, snapshot)
+                with self.assertRaises(SmokeError): verify_field_evidence(m, payloads)
+
+    def test_rejects_truncation_trailing_bytes_headers_and_legacy_counts(self):
+        for surface in (False, True):
+            m, payloads, snapshot = evidence_fixture(surface=surface)
+            if surface: encode_surface(m, payloads, snapshot)
+            raw = payloads["direct_evidence"]
+            offsets = (0, 16, 24, 48, 112) if surface else (0, 16, 80, 144, 168, 272)
+            variants = [raw[:-1], raw+b"x"]
+            for offset in offsets:
+                changed = bytearray(raw); changed[offset] ^= 1; variants.append(bytes(changed))
+            for index, changed in enumerate(variants):
+                with self.subTest(surface=surface, mutation=index):
+                    p = {**payloads, "direct_evidence": changed}
+                    with self.assertRaises(SmokeError): verify_field_evidence(m, p)
+
+    def test_surface_rejects_duplicate_json_and_nonfinite_numeric_overflow(self):
+        for suffix in (b',"inspection_only":true}', b',"unexpected":1e999}'):
+            m, payloads, snapshot = evidence_fixture(); encode_surface(m, payloads, snapshot)
+            raw = payloads["direct_evidence"]
+            body = raw[176:-1] + suffix
+            payloads["direct_evidence"] = raw[:16] + struct.pack("<Q", len(body)) + raw[24:176] + body
+            m["payloads"]["direct_evidence"]["byte_length"] = len(payloads["direct_evidence"])
+            with self.assertRaises(SmokeError): verify_field_evidence(m, payloads)
+
+    def test_rejects_unknown_or_crossed_metadata_schema_and_short_surface_header(self):
+        for schema, layout, length in (("unknown", "unknown", 1000),
+                ("fem_rt0_surface_evidence.v1", "fem_direct_oersted_evidence.v2", 1000),
+                ("fem_rt0_surface_evidence.v1", "fem_rt0_surface_evidence.v1", 176)):
+            value = resource(); manifest = value["closed_loop_manifest"]
+            manifest["direct_evidence_schema"] = schema
+            manifest["payloads"]["direct_evidence"].update(layout=layout, byte_length=length)
+            with self.assertRaises(SmokeError): validate_resource(value, "runtime-stage")
 
 
 if __name__ == "__main__":
