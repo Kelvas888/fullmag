@@ -2314,7 +2314,10 @@ export function visualizationQuantityItems(
         })
     : [];
   const baseItems = quantityCatalog
-    ? mergeVisualizationQuantityItems(capabilityItems, fieldItems)
+    ? mergeVisualizationQuantityItems<{ disabled?: boolean; label: string; value: string }>(
+        mergeVisualizationQuantityItems(capabilityItems, fieldItems),
+        targetKind === "airbox" ? pendingAirboxQuantityItems(quantityCatalog) : [],
+      )
     : targetKind === "airbox"
       ? fieldItems.filter((item) =>
           fieldCatalogQuantitySupportsAirbox(fieldCatalog, item.value),
@@ -2376,11 +2379,36 @@ export function visualizationQuantityItems(
   ];
 }
 
-function mergeVisualizationQuantityItems(
-  capabilityItems: Array<{ label: string; value: string }>,
-  fieldItems: Array<{ label: string; value: string }>,
-): Array<{ label: string; value: string }> {
-  const merged = new Map<string, { label: string; value: string }>();
+/**
+ * Full-domain fields the Airbox can show once the solver provides them
+ * (H_demag, H_ext, H_eff before or early in a run). Listing them disabled
+ * explains an otherwise empty Airbox quantity list.
+ */
+function pendingAirboxQuantityItems(
+  quantityCatalog: QuantityCatalogResource,
+): Array<{ disabled: true; label: string; value: string }> {
+  return quantityCatalog.quantities
+    .filter(
+      (quantity) =>
+        quantity.domain === "full_domain" &&
+        (quantity.shape === "vector_field" || quantity.shape === "spatial_scalar") &&
+        quantity.interactive_preview &&
+        !quantityCatalogEntrySupportsAirbox(quantity),
+    )
+    .map((quantity) => ({
+      disabled: true,
+      label: `${quantity.label || quantity.id} (not available yet)`,
+      value: quantity.id,
+    }));
+}
+
+function mergeVisualizationQuantityItems<
+  Item extends { disabled?: boolean; label: string; value: string },
+>(
+  capabilityItems: Item[],
+  fieldItems: Item[],
+): Item[] {
+  const merged = new Map<string, Item>();
   for (const item of capabilityItems) merged.set(item.value, item);
   for (const item of fieldItems) {
     if (!merged.has(item.value)) merged.set(item.value, item);
