@@ -1,16 +1,20 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
-import { useKernel } from "@/kernel/KernelContext";
 
-import {
-  useCurrentRunResource,
-  useSolverStatusResource,
-} from "@/kernel/resources/studyRuntimeResources";
+import { useKernel } from "@/kernel/KernelContext";
 import {
   useMeshBuildCurrent,
   useMeshSharedDomainManifestResource,
 } from "@/kernel/resources/geometryLifecycleResources";
+import type { ResourceStatus } from "@/kernel/resources/resourceTypes";
+import {
+  useCurrentRunResource,
+  useSolverStatusResource,
+} from "@/kernel/resources/studyRuntimeResources";
+import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import { useRealtimeConnection } from "@/kernel/realtime/useRealtimeConnection";
+
 import {
   formatRuntimeStateLabel,
   resolveEffectiveRuntimeState,
@@ -18,7 +22,6 @@ import {
 } from "@/kernel/runtime/runtimeStateDisplay";
 import { useAwaitingComputeCommand } from "@/kernel/runtime/useAwaitingComputeCommand";
 import { Button } from "@/shared/ui/Button";
-import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 
 import {
   buildStatusBarEngineModel,
@@ -50,8 +53,32 @@ function serverMountedSnapshot(): boolean {
   return false;
 }
 
+function formatRealtimeConnectionLabel(
+  status: ReturnType<typeof useRealtimeConnection>["status"],
+  disrupted: boolean,
+): string {
+  if (status === "connecting" && disrupted) return "reconnecting";
+  return status;
+}
+
+function formatStatusFreshnessLabel(status: ResourceStatus): string {
+  switch (status) {
+    case "ready":
+      return "ready";
+    case "stale":
+      return "stale";
+    case "loading":
+      return "loading";
+    case "error":
+      return "unavailable";
+    case "idle":
+      return "idle";
+  }
+}
+
 export default function StatusBarModule() {
   const kernel = useKernel();
+  const realtimeConnection = useRealtimeConnection();
   const mounted = useSyncExternalStore(
     subscribeToMounted,
     clientMountedSnapshot,
@@ -75,11 +102,11 @@ export default function StatusBarModule() {
     { enabled: mounted },
   );
   const meshRevision = useSessionStatusSelector(
-    (status) => status.data?.resources.mesh_revision ?? 0,
+    (status) => status.data?.resources.mesh_revision ?? null,
     { enabled: mounted },
   );
   const meshBuildRevision = useSessionStatusSelector(
-    (status) => status.data?.resources.mesh_build_revision ?? 0,
+    (status) => status.data?.resources.mesh_build_revision ?? null,
     { enabled: mounted },
   );
   const sceneRevision = useSessionStatusSelector(
@@ -143,75 +170,82 @@ export default function StatusBarModule() {
         readString(runtimeBundleVersion, "runtime unavailable"),
       )
     : "—";
-  const dotStatus = mounted ? sessionResourceStatus : "loading";
+  const statusFreshness = mounted ? sessionResourceStatus : "loading";
+  const realtimeLabel = formatRealtimeConnectionLabel(
+    realtimeConnection.status,
+    realtimeConnection.disrupted,
+  );
 
   const handleItemClick = (tab: "telemetry" | "operations" | "diagnostics") => {
     kernel.bus.emit("footer:tab-requested", { tab });
   };
-  const handleItemKeyDown = (event: React.KeyboardEvent, tab: "telemetry" | "operations" | "diagnostics") => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      handleItemClick(tab);
-    }
-  };
 
   return (
-    <div className="fm-status-bar" role="status" aria-label="Session status">
+    <div className="fm-status-bar" role="group" aria-label="Session status">
       <span
         className="fm-status-bar__dot"
-        data-status={dotStatus}
+        data-status={statusFreshness}
         aria-hidden="true"
       />
-      <span
-        className="fm-status-bar__item fm-status-bar__item--clickable"
-        role="button"
-        tabIndex={0}
+      <button
+        type="button"
+        className="fm-status-bar__button fm-status-bar__item fm-status-bar__item--clickable"
         onClick={() => handleItemClick("telemetry")}
-        onKeyDown={(e) => handleItemKeyDown(e, "telemetry")}
       >
         {sessionState}
-      </span>
+      </button>
       <span className="fm-status-bar__sep" aria-hidden="true" />
-      <span
-        className="fm-status-bar__item fm-status-bar__item--clickable"
-        role="button"
-        tabIndex={0}
+      <button
+        type="button"
+        className="fm-status-bar__button fm-status-bar__item fm-status-bar__item--clickable"
         onClick={() => handleItemClick("telemetry")}
-        onKeyDown={(e) => handleItemKeyDown(e, "telemetry")}
       >
         {sessionName}
-      </span>
+      </button>
       <span className="fm-status-bar__sep" aria-hidden="true" />
       <span className="fm-status-bar__item">{runtimeVersion}</span>
       <span className="fm-status-bar__sep" aria-hidden="true" />
-      <span
-        className="fm-status-bar__item fm-status-bar__item--clickable"
+      <button
+        type="button"
+        className="fm-status-bar__button fm-status-bar__item fm-status-bar__item--clickable"
         data-state={mesh.state}
         title={mesh.title}
-        role="button"
-        tabIndex={0}
+        aria-label={mesh.label}
         onClick={() => handleItemClick("operations")}
-        onKeyDown={(e) => handleItemKeyDown(e, "operations")}
       >
         {mesh.label}
-      </span>
+      </button>
       <span className="fm-status-bar__spacer" aria-hidden="true" />
       <span
-        className="fm-status-bar__engine fm-status-bar__engine--clickable"
+        className="fm-status-bar__axis fm-status-bar__axis--connection"
+        data-state={realtimeConnection.status}
+        aria-label={`Realtime connection ${realtimeLabel}`}
+        title={`WebSocket connection: ${realtimeLabel}. Session status data freshness is shown separately.`}
+      >
+        Realtime {realtimeLabel}
+      </span>
+      <span
+        className="fm-status-bar__axis fm-status-bar__axis--freshness"
+        data-state={statusFreshness}
+        aria-label={`Session status data ${formatStatusFreshnessLabel(statusFreshness)}`}
+        title={`Session status resource fetch state: ${formatStatusFreshnessLabel(statusFreshness)}. WebSocket connection is shown separately.`}
+      >
+        Status {formatStatusFreshnessLabel(statusFreshness)}
+      </span>
+      <button
+        type="button"
+        className="fm-status-bar__button fm-status-bar__engine fm-status-bar__engine--clickable"
         data-state={engine.state}
         data-tone={engine.tone}
         title={engine.title}
-        role="button"
-        tabIndex={0}
         onClick={() => handleItemClick("diagnostics")}
-        onKeyDown={(e) => handleItemKeyDown(e, "diagnostics")}
       >
         <span className="fm-status-bar__engine-label">{engine.label}</span>
         <span className="fm-status-bar__engine-sep" aria-hidden="true">
           {" | "}
         </span>
         <span className="fm-status-bar__engine-detail">{engine.detail}</span>
-      </span>
+      </button>
       {engine.awaitingCompute ? (
         <Button
           aria-disabled={compute.disabledReason !== null || compute.pending}
