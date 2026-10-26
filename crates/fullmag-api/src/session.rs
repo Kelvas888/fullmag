@@ -1696,6 +1696,7 @@ pub(crate) fn default_current_live_state(req: &CurrentLiveSnapshotRequest) -> Se
         run: None,
         live_state: None,
         coupled_checkpoint: req.coupled_checkpoint.clone(),
+        imported_antenna_mesh_proof: None,
         runtime_status: build_runtime_status_view(&status),
         capabilities: None,
         metadata: None,

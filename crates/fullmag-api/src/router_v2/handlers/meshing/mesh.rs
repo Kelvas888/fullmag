@@ -4158,7 +4158,7 @@ fn mesh_build_provenance(snapshot: &SessionStateResponse) -> MeshBuildProvenance
             document.pointer("/execution_plan/backend_plan/kind").and_then(Value::as_str)
                 == Some("antenna_field_only"));
     if field_only_publication {
-        return prepared_field_only_source_mesh(snapshot).map(|_| MeshBuildProvenance {
+        return field_only_source_mesh_for_inspection(snapshot).map(|_| MeshBuildProvenance {
             source_scene_revision: snapshot.scene_document.as_ref().map(|scene| scene.revision),
             geometry_realization_revision: None,
         }).unwrap_or_default();
@@ -4196,9 +4196,18 @@ pub(crate) fn mesh_source_scene_revision(snapshot: &SessionStateResponse) -> Opt
 
 
 pub(crate) fn prepared_field_only_source_mesh(snapshot: &SessionStateResponse) -> Option<&Value> {
+    let preparation = snapshot.simulation_preparation.as_ref()?;
+    let workspace = snapshot.mesh_workspace.as_ref()?;
+    if preparation.preparation_id.is_empty() || preparation.status != "ready"
+        || workspace["preparation_id"].as_str() != Some(preparation.preparation_id.as_str())
+    { return None; }
+    field_only_source_mesh_binding(snapshot)
+}
+
+// Persistent geometry identity alone never grants live execution readiness.
+pub(crate) fn field_only_source_mesh_binding(snapshot: &SessionStateResponse) -> Option<&Value> {
     let scene = snapshot.scene_document.as_ref()?;
     let workspace = snapshot.mesh_workspace.as_ref()?;
-    let preparation = snapshot.simulation_preparation.as_ref()?;
     let mesh = snapshot.fem_mesh.as_ref()?;
     let plan = workspace.pointer("/execution_plan/backend_plan")?;
     let metadata_plan = snapshot.metadata.as_ref()?.pointer("/execution_plan/backend_plan")?;
@@ -4207,9 +4216,7 @@ pub(crate) fn prepared_field_only_source_mesh(snapshot: &SessionStateResponse) -
             != Some(crate::live_scene_preparation::LIVE_SCENE_PREPARATION_READ_MODEL_SCHEMA)
         || workspace["status"].as_str() != Some("completed")
         || workspace["source_scene_revision"].as_u64() != Some(scene.revision)
-        || workspace["preparation_id"].as_str() != Some(preparation.preparation_id.as_str())
-        || preparation.preparation_id.is_empty()
-        || preparation.status != "ready"
+        || workspace["preparation_id"].as_str().is_none_or(str::is_empty)
         || workspace.get("accepted_run_id")
             .is_some_and(|run| run.as_str() != Some(snapshot.session.run_id.as_str()))
         || plan["kind"].as_str() != Some("antenna_field_only")
@@ -4253,6 +4260,14 @@ pub(crate) fn prepared_field_only_source_mesh(snapshot: &SessionStateResponse) -
         return None;
     }
     Some(plan)
+}
+
+fn field_only_source_mesh_for_inspection(snapshot: &SessionStateResponse) -> Option<&Value> {
+    prepared_field_only_source_mesh(snapshot).or_else(|| {
+        snapshot.imported_antenna_mesh_proof.as_ref()
+            .filter(|proof| proof.valid_for(snapshot))?;
+        field_only_source_mesh_binding(snapshot)
+    })
 }
 
 fn clean_scene_mesh_provenance(snapshot: &SessionStateResponse) -> Option<MeshBuildProvenance> {
@@ -4900,7 +4915,7 @@ pub(crate) fn field_only_source_payload(
     }
     // The guard also remains valid after Solve: it binds preparation, scene,
     // run and mesh identity, rather than requiring a running solver.
-    prepared_field_only_source_mesh(snapshot).ok_or_else(|| {
+    field_only_source_mesh_for_inspection(snapshot).ok_or_else(|| {
         ApiError::conflict_with_code(
             "antenna_source_mesh_stale",
             "current-source mesh has no valid preparation binding",

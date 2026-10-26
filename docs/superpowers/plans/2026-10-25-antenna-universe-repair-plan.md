@@ -14,7 +14,7 @@ wizualizacją w drzewie Universe/Airbox, również po zapisaniu i ponownym otwar
 Nie jest to jeszcze odtworzenie wyników publikacji ani kwalifikacja BORIS.
 
 Kolejne komunikaty mają zaczynać się od `Etap k/5:`. Numer oznacza bramkę
-realizacji, nie numer wiadomości. Aktualny etap: **1/5 — geometria i siatka**.
+realizacji, nie numer wiadomości. Aktualny etap: **2/5 — transport i przygotowanie pełnego pola**.
 Nie przechodzimy do ciężkich obliczeń następnego etapu, dopóki nie ma dowodu
 spełnienia poprzedniej bramki. Istniejące wyniki wykorzystujemy ponownie,
 jeżeli odpowiadają dokładnie przypiętym wejściom; nie powtarzamy Solve dla formalności.
@@ -31,15 +31,16 @@ ten raport nie wprowadza nowych równań ani polityki obliczeń.
 | ID | Obszar | Fakt / problem | Znaczenie |
 |---|---|---|---|
 | P1 | Tożsamość domeny | Historyczne H obejmuje 14 węzłów obiektu `sampling`, scope `object`, nie Global Universe. | Tego wyniku nie wolno przedstawiać jako pełnego pola wokół anteny ani przemianować jego metadanych. |
-| P2 | Siatka Universe | Przygotowano osobny przypadek 1149 węzłów / 6472 Tet4. Brak kompletnego dowodu jakości i widoku tej siatki w bieżącej obserwacji. | Istnienie danych siatki nie dowodzi, że UI pobiera właściwą topologię. |
-| P3 | Drzewo UI | Gałąź Airbox znikała bez rozpoznanej domeny/siatki; ustawienia wizualizacji stawały się niedostępne. | Poprawiono źródła: gałąź prezentacji pozostaje dostępna, brak siatki jest jawny. Browser NOT VERIFIED. |
+| P2 | Siatka Universe | Bieżący katalog ma Global 1162 węzły / 6548 Tet4; audyt topologii/jakości i ręczna obserwacja siatki przeszły. | Global przechodzi też cold-load; odczyt źródła po imporcie blokuje P14. |
+| P3 | Drzewo UI | Gałąź Airbox znikała bez rozpoznanej domeny/siatki; naprawiono dostępność oraz statusy inspektora i pusty Quantity Source. | Model API/drzewa i ręczny widok siatki PASS; automatyczny WebGL i końcowy obraz zmienionego panelu NOT VERIFIED. |
 | P4 | Transport | Istnieją rzeczywiste wyniki V/J/H dla małego przypadku; pełny przypadek ma inne wejście siatkowe. | Dowód małego przypadku nie kwalifikuje transportu na nowej siatce. |
-| P5 | Koszt pola | Ostatni benchmark: 354.300 s wobec 346.505 s, +2.2495%; 21 payloadów identycznych bajtowo. | Zgodność wyników PASS, przyspieszenie FAIL. Przyczyna różnicy czasu nieustalona. |
-| P6 | Pełne pole | Global Universe pozostaje nieobliczone. | Brak podstaw do oznaczenia żądanego zadania jako wykonanego. |
+| P5 | Koszt pola | Nowy wariant reuse: 336.658 s wobec 354.300 s, −4.9794%; 21 payloadów i diagnostyki identyczne. | Parytet na 14 targetach PASS. To pojedyncza obserwacja; kwalifikacja wydajności i profil faz NOT VERIFIED. |
+| P6 | Pełne pole | Rzeczywisty Solve Global zakończył się surface RT0 wall-time exhausted; brak zaakceptowanego V/J/H tej próby. | Pełne pole na 1162 węzłach pozostaje nieobliczone; nie ponowiono Solve po małej optymalizacji. |
 | P7 | Odtwarzanie | Eksport balanced i pojedynczy import przeszły. Test odczytu potwierdził H dla 14 punktów, lecz całość zakończyła się `HTTP inspection read failed`. | Cold-load V/J/H jako całość nie jest zaliczony; przyczyna HTTP wymaga zawężenia. |
 | P8 | Semantyka importu | Publiczny status po imporcie to `completed` z zakazem komend; wcześniejszy test oczekiwał `imported_read_only`. | Poprawiono interpretację testu; nie jest to dowód awarii samego importu. |
 | P9 | Typy i quantities | W historii występowały magnetyczne ustawienia dla anteny/Airbox; pełnej kwalifikacji UI nadal brak. | Trzeba sprawdzić cały katalog i routing, nie dopisywać pojedynczych wyjątków dla field ID. |
-| P10 | Przeglądarka | Brak zaakceptowanego dowodu widocznego canvasu i pola; wcześniejsza automatyczna kontrola blokowała odczyt karty. | TypeScript i HTTP 200 nie zastępują kontroli wizualnej. |
+| P10 | Przeglądarka | Użytkownik potwierdził drzewo i siatkę oraz przekazał zrzut; automatyczny odczyt był blokowany. Obrazu pełnego H nadal brak. | Kontrola canvas/context/drawing buffer i końcowa wizualizacja pola NOT VERIFIED. |
+| P14 | Cold-load źródła | FMS pomija simulation_preparation wymagane przez live guard; Global wraca identycznie, source HTTP 409. | Wymagany osobny zaufany dowód historycznego odczytu, bez nadania live readiness. |
 
 Ostatni managed build `39541a1e34754eddb244958a48a84897` zakończył się sukcesem.
 Nie wynika z tego poprawność całego przepływu naukowego. Pełna kontrola TypeScript
@@ -824,3 +825,69 @@ samplujących w obrazie; nie zmieniano uprawnień ani precyzji. Następny pomiar
 wymaga jawnej, domyślnie wyłączonej agregacji faz albo właściwego narzędzia;
 liczniki nie stanowią profilu czasowego. MPFR ma tylko bibliotekę wykonawczą,
 bez nagłówka/linku developerskiego; nie jest gotową ścieżką zamiany arytmetyki.
+
+### P14 — implementacja prywatnego poświadczenia importu, build rozpoczęty
+
+Dodano ImportedAntennaMeshProof jako prywatne pole serde(skip), bez
+Deserialize i bez serializacji w SessionStateResponse/FMS. Tworzy je tylko
+kanoniczny importer po walidacji accepted provenance i prywatnego destination.
+Wiąże kompletny typed plan, oba jego projekcyjne warianty, pełny scene/workspace
+i rzeczywistą siatkę Global oraz run/script/closure. Hashowanie strumieniowe
+nie tworzy kolejnej kopii dużych buforów. Każdy odczyt sprawdza aktualność;
+konieczny pomiar kosztu HTTP po buildzie.
+
+Rozdzielono wspólne trwałe wiązanie i prepared_field_only_source_mesh: live
+nadal wymaga prawdziwego ready i zgodnego preparation ID. Odczyt historyczny
+może korzystać z prywatnego proof tylko w imported_read_only z zakazem komend.
+Brak aktywnego przygotowania pozostaje faktem, nie uzupełnia się go z archiwum.
+Wszystkie sześć literałów SessionStateResponse inicjalizuje proof jako None.
+Trzy regresje źródłowe obejmują stary FMS i 19 mutacji oraz podmianę obu planów;
+nie były kompilowane ani wykonywane. Parser rustfmt sześciu plików PASS,
+diff--check PASS; root przejrzał helper i wszystkie runtime integracje.
+
+Do indeksu snapshotu dodano tylko nowy session_persistence_antenna_mesh_import.rs;
+pozostałe wpisy zachowano. Pierwsze wywołanie buildu dostało omyłkowo ID
+iteracji 6b997f… zamiast bazowego development b8caf945… i zostało odrzucone
+przed restartem. Odczyt development/current.json potwierdził właściwy pin;
+ponownie wywołano receptę z bazowym development i tą samą konfiguracją 9f4856…
+(dokument rozróżnia oba rodzaje ID). Na zapis tego checkpointu build jest
+w toku; proof/runtime P14 i ponowny odczyt starego FMS nadal NOT VERIFIED.
+Nie wydano nowego Solve i nie usunięto danych.
+
+### P14 — rzeczywisty build i odczyt po imporcie: PASS w zakresie geometrii
+
+Iteracja d84ee8cb05264bdb9abc95a7d32b94fb zakończyła się succeeded.
+Build z HEAD d7c9de3a14df18cd1b1e0bd700c3afae1bf76e89 + dirty snapshot
+3f7c71194ef3ca24d8e914ce6d95fe4c1f672db7b34991b4dc3a24bfcb433093;
+receipt SHA256 82468085e82a8d7397c8a7b2116605427a6e0ecf111cd7d9397244ae0578ed92.
+Zgodność źródło/cień wszystkich sześciu zmienionych plików API potwierdzona.
+Kompilacja 513471 ms, pakiet 24 pliki, walidacja i oba native gates PASS;
+bez kompilacji testów jednostkowych. Retencja deferred/outside-startup,
+nie usunięto żadnych danych.
+
+Po potwierdzeniu active_session=false ponownie zaimportowano dokładnie
+ten sam FMS c05d8176471e7de2e8ef439375f362223a22e0023a6e64c1a267bde861f9ed87
+w visualization_only. Import HTTP 200 bez ostrzeżeń, 97,927 s.
+Global 1162/6548 oraz conductor 677/1859 wróciły przez publiczne HTTP 200
+bajtowo identyczne z zachowanymi binarnymi payloadami sprzed importu
+(w tym cut, markery i ordinals). Czasy pojedynczych odczytów: Global 8,50 ms,
+conductor 27,07 ms, manifest 26,20 ms, source quality 28,17 ms. To obserwacje,
+nie benchmark opóźnień. Nieznany obiekt 404; sesja stabilna, komendy forbidden.
+Brak simulation_preparation potwierdza 404 z komunikatem
+simulation preparation unavailable. Pierwszy verifier błędnie oczekiwał
+200 również dla tego celowo nieobecnego zasobu; zachowano jego wynik FAIL,
+a oddzielny result-qualified.json jawnie sprawdza dokładny kod i treść 404.
+Nie nadpisano wcześniejszego dowodu conductor 409.
+
+Dowody: verification/surface-rt0-reuse-20261026/p14-after/ w wolumenie
+kontrolnym: build-proof, import-response, status, oba binarne payloady,
+manifest, source-quality, fields, quantities, preparation, commands,
+unknown oraz result/result-qualified. Katalog pól pozostaje pusty.
+Nie wykonano Solve, nie uzyskano pełnego H Universe i nie zaliczono
+WebGL ani wizualnego odbioru poprawionego inspektora.
+
+Audyt inspektora wykazał kolejną niezależną lukę: historyczny katalog
+Universe był włączany wyłącznie dla aktywnego H_ant, podczas gdy pusty
+wybór i domyślne H_demag uniemożliwiały jego odkrycie. Naprawa tej kolejności
+pozostaje osobnym fragmentem; musi zachować pozytywny kontrakt live,
+przypiętego właściciela i filtr zaakceptowanej siatki Global.

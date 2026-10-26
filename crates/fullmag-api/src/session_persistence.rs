@@ -2,6 +2,8 @@
 
 #[path = "session_persistence_antenna_import.rs"]
 mod antenna_import;
+#[path = "session_persistence_antenna_mesh_import.rs"]
+pub(crate) mod antenna_mesh_import;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
@@ -358,6 +360,7 @@ impl From<PersistedCurrentLiveSnapshot> for SessionStateResponse {
             run: value.run,
             live_state: value.live_state,
             coupled_checkpoint: None,
+            imported_antenna_mesh_proof: None,
             runtime_status: value.runtime_status,
             capabilities: value.capabilities,
             metadata: value.metadata,
@@ -3752,6 +3755,10 @@ pub(crate) async fn import_session_commit_with_context(
     if persisted.metadata.as_ref().is_some_and(|metadata| metadata.get("accepted_definition_projection").is_some()) {
         warnings.push(ACCEPTED_PROJECTION_WARNING.into());
     }
+    // An archive cannot supply the private, importer-issued geometry proof.
+    if let Some(metadata) = persisted.metadata.as_deref_mut().and_then(serde_json::Value::as_object_mut) {
+        metadata.remove("imported_antenna_mesh_proof");
+    }
     antenna_import::normalize_registered_refs(&mut persisted, &preflight)?;
     normalize_imported_read_only(&mut persisted);
     // Replace any archive-supplied marker with the reference just validated by
@@ -3782,8 +3789,12 @@ pub(crate) async fn import_session_commit_with_context(
     if let Some(run) = persisted.run.as_mut() {
         run.artifact_dir = restored_artifact_dir;
     }
-    let restored: SessionStateResponse = persisted.clone().into();
+    let mut restored: SessionStateResponse = persisted.clone().into();
     validate_imported_snapshot_run(&preflight, &persisted)?;
+    restored.imported_antenna_mesh_proof = antenna_mesh_import::issue(
+        &restored, preflight.session.accepted_provenance_ref.as_ref(),
+        &session_store_root(&state).join("imports"), &published_root,
+    )?;
     let restored_ui_state = preflight.read_document("project/ui_state.json")
         .map_err(|error| ApiError::bad_request(format!("invalid_fms_ui_state: {error}")))
         .map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())?;

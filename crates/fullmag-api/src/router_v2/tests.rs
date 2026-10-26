@@ -766,6 +766,7 @@ pub(crate) async fn test_app_state_with_live_session() -> Arc<AppState> {
         run: None,
         live_state: None,
         coupled_checkpoint: None,
+        imported_antenna_mesh_proof: None,
         runtime_status: RuntimeStatusView {
             kind: RuntimeStatus::AwaitingCommand,
             code: "awaiting_command".into(),
@@ -3078,6 +3079,7 @@ async fn test_router_with_session_state_and_artifact_dir() -> (axum::Router, Arc
         run: None,
         live_state: None,
         coupled_checkpoint: None,
+        imported_antenna_mesh_proof: None,
         runtime_status: RuntimeStatusView {
             kind: RuntimeStatus::AwaitingCommand,
             code: "awaiting_command".into(),
@@ -3288,6 +3290,7 @@ async fn test_router_with_session_store_state() -> (axum::Router, Arc<AppState>,
             },
         }),
         coupled_checkpoint: None,
+        imported_antenna_mesh_proof: None,
         runtime_status: RuntimeStatusView {
             kind: RuntimeStatus::AwaitingCommand,
             code: "awaiting_command".into(),
