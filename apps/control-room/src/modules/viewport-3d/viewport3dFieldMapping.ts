@@ -11,6 +11,7 @@ import { srgbToLinearChannel } from "./viewport3dColorSpace";
 
 import {
   normalizeViewport3DVectorColorMode,
+  normalizeViewport3DScalarColorValue,
   resolveViewport3DVectorColorRgb,
   resolveViewport3DVectorColorScalar,
   type Viewport3DScalarColorRange,
@@ -1873,18 +1874,7 @@ function normalizeScalarValue(
   value: number,
   range: Viewport3DScalarColorRange,
 ): number {
-  if (
-    !range ||
-    !Number.isFinite(value) ||
-    !Number.isFinite(range.min) ||
-    !Number.isFinite(range.max)
-  ) {
-    return 0.5;
-  }
-  const scale = Math.max(Math.abs(range.max), Math.abs(range.min));
-  const span = range.max - range.min;
-  if (span <= 1e-6 * Math.max(scale, 1)) return 0.5;
-  return Math.min(Math.max((value - range.min) / span, 0), 1);
+  return range ? normalizeViewport3DScalarColorValue(value, range) : 0.5;
 }
 
 /**
