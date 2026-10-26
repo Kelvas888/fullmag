@@ -300,7 +300,7 @@ function HeaderBrand({ subtitle }: { readonly subtitle: string }) {
       <FullmagMark size={20} className="fm-header__logo" />
       <span className="fm-header__brand-copy">
         <span className="fm-header__title">Fullmag</span>
-        <span className="fm-header__subtitle">{subtitle}</span>
+        <span className="fm-header__subtitle" title={subtitle}>{subtitle}</span>
       </span>
     </div>
   );

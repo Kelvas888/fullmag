@@ -103,7 +103,7 @@ Numer komunikatu to numer etapu T + 1, spośród 13 etapów.
 
 ## Bramka weryfikacji
 
-Wszystkie buildy wyłącznie we własnej grupie Compose. Zakaz kompilowania testów jednostkowych pozostaje w mocy; interpretowane kontrole źródeł, typecheck/lint aplikacji i browser checks mają odrębny zakres. Obowiązkowej bramki wymagającej zakazanej kompilacji nie oznaczamy jako PASS.
+Wszystkie buildy lokalne wyłącznie we własnej grupie Compose. Użytkownik dla tego wdrożenia jawnie dopuścił testy frontendu/Vitest oraz obowiązkowe automatyczne testy CI, także Rust/C++. Pozostały zakaz lokalnego kompilowania natywnych testów jednostkowych nadal obowiązuje. Interpretowane kontrole źródeł, typecheck/lint aplikacji i browser checks mają odrębny zakres. Brakującej bramki nie oznaczamy jako PASS.
 Nie uruchamiamy Solve przy inspekcji UI. Nie utożsamiamy działającego Home z kwalifikacją FDM/FEM CPU/GPU.
 
 ## Macierz odbioru

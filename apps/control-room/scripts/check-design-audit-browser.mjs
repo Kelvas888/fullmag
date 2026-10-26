@@ -72,11 +72,45 @@ try {
         await page.getByRole("menuitem", { name: "Home", exact: true }).waitFor();
         await page.getByRole("menuitem", { name: "File", exact: true }).waitFor();
         await page.keyboard.press("Escape");
+        await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Main menu", { timeout: 5000 });
         assert(await compact.evaluate((el) => el === document.activeElement), "Menu restores trigger focus");
       } else {
         await page.getByRole("button", { name: "File", exact: true }).click();
         await page.getByRole("menuitem", { name: /^New Project/ }).waitFor();
         await page.keyboard.press("Escape");
+      }
+      if (width === 450) {
+        await page.getByRole("button", { name: "Open compute environment settings", exact: true }).waitFor();
+        const layout = await page.evaluate(() => ({
+          rail: document.querySelector(".fm-start__rail")?.getBoundingClientRect().width,
+          contentWidth: document.querySelector(".fm-start__content")?.clientWidth,
+          contentScroll: document.querySelector(".fm-start__content")?.scrollWidth,
+          detailsHidden: getComputedStyle(document.querySelector(".fm-start-env__body")).display === "none",
+        }));
+        assert(layout.rail <= 64, "Narrow Home rail must release space to the content");
+        assert(layout.contentScroll <= layout.contentWidth, "Home content must not overflow");
+        assert(layout.detailsHidden, "Narrow rail keeps compute details in Settings");
+        assert(await page.getByRole("button", { name: "Open compute environment settings", exact: true }).isVisible());
+      }
+      if (width < 1180) {
+        await page.getByRole("button", { name: "Settings", exact: true }).click();
+        const details = page.getByRole("button", { name: "Details", exact: true });
+        await details.click();
+        await page.getByRole("dialog", { name: "Details", exact: true }).waitFor();
+        assert.equal(await page.locator(".fm-start__inspector").count(), 1, "One Home details presentation");
+        await page.keyboard.press("Escape");
+        await page.getByRole("dialog", { name: "Details", exact: true }).waitFor({ state: "hidden" });
+        await page.waitForFunction(() => document.activeElement?.hasAttribute("data-start-details-trigger"));
+        if (width === 900) {
+          await details.click();
+          await page.getByRole("dialog", { name: "Details", exact: true }).waitFor();
+          await page.setViewportSize({ width: 1440, height: 1000 });
+          await page.getByRole("dialog", { name: "Details", exact: true }).waitFor({ state: "hidden" });
+          await page.waitForFunction(() => document.activeElement?.matches("main.fm-start__content"));
+          assert.equal(await page.locator(".fm-start__inspector").count(), 1, "One desktop details presentation");
+          await page.setViewportSize({ width, height: 1000 });
+        }
+        await page.getByRole("button", { name: "Overview", exact: true }).click();
       }
       await page.screenshot({ path: resolve(output, `home-${theme}-${width}.png`) });
       results.push({ expectedTheme: theme, width, ...observed });

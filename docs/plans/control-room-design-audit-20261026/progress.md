@@ -51,3 +51,56 @@ Commit/PR/merge/aktualizacja master/cleanup: oczekują. Brak kwalifikacji runtim
 - `just docker-dev` wykazał błędną bramkę resume: `Retained start has no admissible terminal outcome` dla wcześniejszego `succeeded`, mimo późniejszej awarii wyłącznie frontendu. Poprawiono dopuszczenie historycznego udanego startu; dalsze kontrole nadal wymagają zgodności projektu/obrazu/source/mountów/ID oraz backend running + frontend stopped.
 - Pinned `just docker-dev-resume`: PASS, attempt `9f243df83ae64f2ab1ec554e61e7b525`, ten sam config i grupa. Docker: backend StartedAt nadal `2026-10-26T10:33:29.103180534Z`; frontend `2026-10-26T12:01:23.728005014Z`; oba healthy. Żaden backend restart ani ponowienie modelu/Solve.
 - Trzy interpretowane regresje `test_docker_volume_pending_resume.FrontendOnlyResumeTests` w stałym backendzie z `python3 -B`: PASS (0.067s). Udany start wznawia wyłącznie frontend; działający frontend i zatrzymany backend są odrzucane. Bez natywnej lub jednostkowej kompilacji testów.
+
+## Aktualny checkpoint po wznowieniu implementacji
+
+Użytkownik ponownie zlecił implementację po kontroli planistycznej. Kontynuacja korzysta z tego samego zarejestrowanego worktree i grupy Compose, bez resetowania WIP.
+
+| Zakres | Commit źródeł | Dowód / pozostałe bramki |
+|---|---|---|
+| T7, rama paneli | `42bfffd90be98e20e9fe4cf4603d9e8a609445da` | browser `panels/behavior.json`: zachowany draft i DOM przez float/maximize/hide/dock, move/resize keyboard, fokus inputa po Hide/Restore, drawer 900 px |
+| T8 i T9, Inspector i viewport chrome | `1dc7493c167fb8b84ed93c7785cd293c78755c4d` | Object draft/Revert, jedna tożsamość read-only Airbox; canvas widoczny, contextLost=false, buffer1176×605. T8/T9 zapisane w jednym logicznie powiązanym commicie; brak zmian solvera lub jakości |
+| T10, dock/telemetria/status | `19c61e8f76938eb4badd55d8f782a8c956f7544a` | wysokość metrics-grid 99 px przy scrollHeight136; osobne osie statusu i jednostki; browser scroll PASS |
+| T5/T6, ribbon | `e3d0b6397f8fe48e74cdef7bf3a7f9c188a97d98` | `ribbon/result.json`: 240 przypadków: 10 kart × 3 gęstości × 4 szerokości × 2 theme, nazwane toolbars, min. hit target24 px, overflow/Escape, Ctrl+F1; ten sam canvas, contextLost=false, buffer733×575 |
+| T11, Home | WIP, niecommitowane | `home-fixture/result.json`: 6 przypadków light/dark ×1440/900/450, Settings Details Sheet, Escape/fokus, resize do desktop, brak mutacji API; pełny Copy ID i selected item w końcowej kontroli |
+
+- Managed canvas/Home round trip: PASS attempt `79117d2f9f424c449801d003dc2f0404`; canvas_only=true, 0 console/page errors. To SwiftShader/browser proof, nie sprzętowe GPU ani nauka.
+- Pełny `pnpm lint` w stałym frontendzie: PASS, exit0. Produkcyjny `pnpm typecheck`: PASS, exit0. Późniejsza poprawka nagłówka wymaga adekwatnej kontroli źródeł i regresji zoomu.
+- Ręczny test ribbonu z wcześniejszym `--use-angle=swiftshader` zatrzymano po nadmiernym obciążeniu własnego procesu GPU; brak PASS dla tej próby. Kanoniczne flagi `--use-angle=swiftshader-webgl --use-gl=angle` pozwoliły zakończyć pełne 240 przypadków bez zmniejszenia jakości.
+- Review niezależne znalazło zbyt wysoką siatkę metryk, niefunkcjonalne uchwyty drawer i przechwytywanie fokusu portaled menuitem. Przyczyny poprawione, source/browser PASS. Końcowy reviewer czyta pozostały T11 i ribbon; nie dubluje zakończonego przeglądu.
+- React Doctor: historyczny parser oxlint INCOMPLETE; w shadow brak Git metadata dla changed scan. Nie zgłaszamy PASS. Hook staged zgłaszał także istniejące w bazie ostrzeżenia (index keys i nested interactive).
+- Zakaz kompilacji unit tests nadal obowiązuje; wysłano pytanie o wyjątek dla obowiązkowej bramki frontendu. CI PR zawiera ponadto testy natywne; bez rozstrzygnięcia ich zakresu nie uruchamiamy niezgodnego workflow.
+- Integracja PR/master i cleanup pozostają niewykonane. Niniejszy checkpoint nie oznacza ukończenia wdrożenia.
+
+## T11 — zapisany fragment i końcowe regresje
+
+- Commit `1bc72df1ab02255a36d452d1628d6409b7341224`: Home bez pustej prawej kolumny, Details Sheet do1180 px, rail do760 px, Copy pełnego host ID, jawne locale i zachowana pomoc/kontekst sekcji.
+- Końcowy review T11 wykrył utratę opcji przygotowanego skryptu przy zmianie kolumny na Sheet. Root przeniósł draft opcji do istniejącego store przygotowania, pod niezmiennym host ticket. Dismiss/reset i zmiana ticketu usuwają ten draft; brak localStorage, brak zmiany intent do backendu.
+- `ScriptRunPanel.test.tsx`: RED (as_authored zamiast cpu po remount) → GREEN, 13/13. Browser `script-options-red/resize.json` odtworzył reset Device/waitForSolve/results; `script-options-green/result.json` potwierdza zachowanie wszystkich trzech opcji przez resize, Escape/reopen i powrót do desktop. Most desktop jest jawnie syntetyczny; `script_run` nie został wywołany.
+- `extra/result.json`: natywny zoom Chromium 2.0 przez izolowane MV3 i chrome.tabs.getZoom; innerWidth1440→720, DPR1→2. Długa nazwa sesji początkowo powodowała scrollWidth722 przy width720; ograniczenie szerokości brandu i ellipsis z pełną podpowiedzią daje720/720. To rzeczywisty zoom przeglądarki, nie CSS zoom ani samo DPR.
+- Ten sam harness: ArrowLeft/Right/Home/End w toolbarze; density po reload; pełny Copy host ID przez stub schowka; embedded instance bez stripu i z osiągalnym Home. Zwykłe POST visualization/client-acks są zapisane osobno od komend; brak Solve/Compute Fields.
+- `inspector-ack-scroll/result.json`: rzeczywisty Object Name Apply→ACK→przywrócenie nazwy, oba PATCH HTTP200. Ten sam Inspector DOM, fokus Notes, scroll90→90, pola enabled i opacity1, zero opacity animations. Liczby requestów i receipty zachowane. Airbox read-only pozostaje pokryty osobnym browserem paneli; nie symulowano mutacji zasobu read-only.
+
+## T12 — aktualizacja bramek i kontrola integracji
+
+- Użytkownik dopuścił testy frontendu oraz obowiązkowe automatyczne CI dla tego PR; nie rozszerzono tego na lokalne natywne testy.
+- Pierwszy pełny Vitest: 840 plików PASS, 14 failed; 8786 testów PASS,30 failed,1 skipped. Naprawiono brakujący token przez użycie istniejącego radius-pill. Testy dostosowano do centralnego Apply, nowych nazw i prawidłowego ownership komend; żadnego nowego skip ani osłabienia gate.
+- Końcowy pełny Vitest w stałym frontendzie, maxWorkers2: 855 plików,854 z raportowanym statusem passed,1 failed; 8816 testów PASS,1 failed,1 istniejący skipped. Jedyny failure: dotychczasowy rootowy next.config.test.ts oczekuje .next/(dev/)types, a DEV zapisuje .next-control-room-8080/dev/types. Nie zmieniono ani nie pominięto tej asercji; pełna kanoniczna bramka CI pozostaje wymagana przed merge.
+- Cross-app kontrakt apps/web/dev-server.mjs czytany przez jawne FULLMAG_TEST_SOURCE_ROOT=/opt/fullmag/source: zarejestrowany readonly checkout, bez host builda i bez rozszerzania cienia źródeł aplikacji.
+- Punktowe regresje: ribbon118/118, rootowe source guards i ObjectGeneral24/24, fonty/polityki27/27 przed dodatkowym przypadkiem unresolved FEM. Architecture hygiene oraz idle performance PASS. Produkcyjny typecheck PASS po T11. Pełny lint PASS przed testowymi korektami; późniejsze owned paths ESLint PASS, końcowy pełny lint w toku.
+- Reviewer pokrył najważniejsze produkcyjne ścieżki paneli/Inspectora/viewportu/footer oraz pozostałe Home/ribbon i konsumentów. Trzy wcześniejsze findings i końcowy reset opcji skryptu poprawione z dowodami. Testy/QA/dokumentacja były oceniane selektywnie, nie deklarujemy pełnego niezależnego line-by-line review każdego pliku.
+- Ruling: odłożone R9/R17/R26/R36 pozostają odłożone zgodnie ze skorygowanym audytem. Nie wprowadzamy ogólnego refaktoru dużych plików, usuwania wszystkich literałów, zmiany domyślnych nakładek/scientific colormaps ani obniżenia jakości renderu.
+
+## Incydent przygotowania środowiska testów — zachowany ślad
+
+Ręczna synchronizacja rootowego pliku testu do chronionego shadow była błędem root-agenta: supervisor wykrył zmianę seed i zatrzymał tylko frontend. Wycofano wyłącznie własny regex edit w źródle; odzyskano pierwotne bajty z immutable frozen copy i sprawdzono ich zgodność z aktualnym readonly checkoutem oraz oczekiwanym SHA256 `333d72d4b2f7b2d3886632552e58ba40de6c5ed8daa9efb48cd971bda321f883`. Naprawiono wyłącznie tę kopię techniczną i jej tryb0644/właściciela; nie zmieniono manifestu, expected hash ani walidatora. Kontroler ponownie zweryfikował całość.
+
+Managed resume `008a8f5b5a97423384dd8dd341ec4b88`: succeeded, ten sam config/grupa. Frontend healthy; backend StartedAt nadal `2026-10-26T10:33:29.103180534Z`. Kolejna faza iteration komendy up zakończyła się osobnym `Current activation is not a failed accepted-then-cancelled terminal` (`447411b9aa804114a0230b1634a745a8`); nie ponawiano aktywacji, Solve ani recovery ownera. Nie przedstawiamy całej komendy up jako PASS. Zachowano cache, model, receipty i niezmienionego właściciela.
+
+PR/CI, merge, lokalne FF oraz cleanup nadal oczekują. Żaden z powyższych wyników nie jest dowodem sprzętowego GPU, solvera lub naukowej kwalifikacji.
+
+## Checkpoint przed PR
+
+Końcowy pełny `pnpm lint`: PASS, exit0. Produkcyjny typecheck: PASS. Po korekcie helperów i oczekiwań pełny Vitest nadal ma dokładnie jeden wyżej opisany mismatch generated route types w DEV, bez dodatkowych failing assertions. Żaden test nie został wyłączony z przebiegu. Wymagane kanoniczne CI po push/PR rozstrzyga gotowość do merge; PR nie będzie scalony przy czerwonych wymaganych kontrolach.
+
+Wykonywalne regresje zapisane w repo: check-design-audit-browser.mjs, check-ribbon-design-browser.mjs, check-panel-design-browser.mjs, check-design-interactions-browser.mjs, check-script-options-browser.mjs i check-inspector-ack-browser.mjs. Ich output kierowany wyłącznie do zarejestrowanego katalogu run zadania. Profile native zoom, fonty, clipboard stub i fixture hosta mają jawny zakres dowodu.

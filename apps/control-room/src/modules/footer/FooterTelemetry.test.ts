@@ -432,7 +432,7 @@ describe("FooterTelemetry", () => {
     expect(byId["active-runtime"]?.value).toBe("0.200 s");
     expect(byId.dt?.label).toBe("Pseudo dt");
     expect(byId.dt?.detail).toBe("Minimizer pseudotime step");
-    expect(byId.step?.subdetail).toBe("t=0 s");
+    expect(byId.step?.subdetail).toBe("t=0.000000e+0 s");
   });
 
   it("shows frequency-response sweep progress instead of time-step progress", () => {

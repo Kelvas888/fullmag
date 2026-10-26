@@ -2,7 +2,7 @@ import { chromium } from "playwright";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 (async()=>{const output=process.env.CONTROL_ROOM_DESIGN_REPORT_DIR;assert(output, "Set CONTROL_ROOM_DESIGN_REPORT_DIR to the task run directory");fs.mkdirSync(output,{recursive:true});
-const b=await chromium.launch({headless:true,args:['--use-angle=swiftshader','--enable-unsafe-swiftshader']});const p=await b.newPage({viewport:{width:1440,height:1100}});const errors=[];p.on('pageerror',e=>errors.push(e.message));try {
+const b=await chromium.launch({headless:true,args:['--headless=new','--disable-dev-shm-usage','--enable-unsafe-swiftshader','--ignore-gpu-blocklist','--no-sandbox','--use-angle=swiftshader-webgl','--use-gl=angle']});const p=await b.newPage({viewport:{width:1440,height:1100}});const errors=[];p.on('pageerror',e=>errors.push(e.message));try {
 await p.goto(process.env.CONTROL_ROOM_URL ?? "http://127.0.0.1:3230/workspace",{waitUntil:'domcontentloaded',timeout:120000});await p.getByRole('treeitem',{name:'mixed_p1_box_prism',exact:true}).waitFor({timeout:120000});await p.getByRole('treeitem',{name:'mixed_p1_box_prism',exact:true}).click();
 const panel=p.locator('[data-panel-frame="panel-right"]');await panel.locator('.fm-inspector__body input').first().waitFor({timeout:30000});
 const nameInput=panel.getByRole('textbox',{name:'Name',exact:true});const originalName=await nameInput.inputValue();const draftName=originalName+'_ui_draft';await nameInput.fill(draftName);

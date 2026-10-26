@@ -22,6 +22,7 @@
   align-items: center;
   gap: var(--fm-space-2);
   margin-right: var(--fm-space-2);
+  max-width: min(240px, 25vw);
   -webkit-app-region: no-drag;
 }
 
@@ -54,6 +55,8 @@
   color: var(--fm-text-muted);
   font-size: var(--fm-font-size-2xs);
   letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
