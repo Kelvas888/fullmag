@@ -62,7 +62,7 @@ Cancel/reset przygotowania usuwa ten lokalny draft; sam resize nie uruchamia skr
 |---|---|---|---|
 | `app-menu` | `app-menu` | Main menu renderer backed by command registry. | yes |
 | `ribbon` | `ribbon` | Context command groups and toolbars. | yes |
-| `status-bar` | `status-bar` | Connection, backend, precision, active session, revision summaries. | yes |
+| `status-bar` | `status-bar` | Connection, backend, precision, active session, revision summaries, and the latest simulation preparation state, which reopens the preparation window after it was closed or finished. | yes |
 | `command-palette` | `overlay` | Keyboard-driven command search and execution. | yes |
 | `notifications` | `overlay` | Toasts and command/error summaries. | yes |
 

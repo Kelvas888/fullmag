@@ -276,6 +276,14 @@
   text-align: start;
 }
 
+.fm-status-bar__button.fm-status-bar__preparation[data-tone="ready"] {
+  color: var(--fm-success);
+}
+
+.fm-status-bar__button.fm-status-bar__preparation[data-tone="failed"] {
+  color: var(--fm-danger);
+}
+
 .fm-status-bar__button.fm-status-bar__engine {
   font-family: var(--fm-font-mono);
   text-align: start;
