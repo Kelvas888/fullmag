@@ -20,6 +20,8 @@ mod owned_worker_process;
 mod compute_operator_env;
 use owned_worker_process::OwnedWorkerProcess;
 
+/// How long the read-only Stop poll may keep failing before the attempt ends.
+const STOP_POLL_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const SUPERVISOR_DIRECTORY: &str = "supervisor-slots";
 const LEGACY_SINGLE_WORKER_SLOT: &str = "slot-0";
 const SLOT_OWNER_FILE: &str = "owner.v2.json";
@@ -1475,6 +1477,7 @@ where
     let mut last_heartbeat = Instant::now();
     let mut heartbeat_enabled = heartbeat_interval.is_some();
     let mut stop_observed = false;
+    let mut stop_poll_failing_since: Option<Instant> = None;
 
     loop {
         if let Some(status) = child.try_wait().context("observe accepted worker exit")? {
@@ -1520,7 +1523,24 @@ where
             );
         }
         let stop_requested_now = match stop_requested() {
-            Ok(stop_requested) => stop_requested,
+            Ok(stop_requested) => {
+                stop_poll_failing_since = None;
+                stop_requested
+            }
+            // The Stop poll only reads the store. A read that fails briefly
+            // (a busy writer, or a Windows-folder store returning ENOMEM under
+            // load) observes nothing this tick; a later tick sees the Stop.
+            // Only a poll that keeps failing ends the attempt.
+            Err(error)
+                if stop_poll_failing_since
+                    .get_or_insert_with(Instant::now)
+                    .elapsed()
+                    < STOP_POLL_FAILURE_GRACE =>
+            {
+                tracing::warn!(error = %format!("{error:#}"), "durable worker Stop poll failed; retrying");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             Err(error) => {
                 let reason = format!("poll durable worker Stop request: {error:#}");
                 let _ = child.kill();
@@ -3245,7 +3265,7 @@ mod tests {
         let started = Instant::now();
         let outcome = observe_child(
             OwnedWorkerProcess::unowned_test_fixture(child),
-            Some(Duration::from_secs(5)),
+            Some(STOP_POLL_FAILURE_GRACE * 4),
             Some(Duration::from_millis(20)),
             || Ok(true),
             || bail!("controlled Stop polling failure"),
@@ -3258,7 +3278,41 @@ mod tests {
             .control_failure_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("controlled Stop polling failure")));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() >= STOP_POLL_FAILURE_GRACE);
+        assert!(started.elapsed() < STOP_POLL_FAILURE_GRACE * 4);
+    }
+
+    #[test]
+    fn transient_stop_poll_failures_do_not_end_the_worker() {
+        let current_test_process = std::env::current_exe().unwrap();
+        let child = Command::new(current_test_process)
+            .arg("--exact")
+            .arg("accepted_study_supervisor::tests::timeout_child_fixture")
+            .arg("--nocapture")
+            .env("FULLMAG_ACCEPTED_SUPERVISOR_TIMEOUT_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut polls = 0;
+        let outcome = observe_child(
+            OwnedWorkerProcess::unowned_test_fixture(child),
+            Some(Duration::from_secs(2)),
+            None,
+            || Ok(true),
+            || {
+                polls += 1;
+                if polls <= 3 {
+                    bail!("Cannot allocate memory (os error 12)")
+                }
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert!(polls > 3);
+        assert!(outcome.timed_out);
+        assert!(outcome.control_failure_reason.is_none());
     }
 
     #[test]
