@@ -202,8 +202,38 @@ on tylko tę instancję; sekcja innych instancji jest tam ukryta.
   - pętla `demand` → `never` → `demand` na tym samym korzeniu R3F;
   - zgodność okna klienta z CSP.
 - Dowód runtime: zob. niżej. **NOT VERIFIED:** viewport 3D w ramce po
-  przełączeniu zakładek (canvas, `isContextLost()`, bufor rysowania),
-  ponieważ sprawdzana instancja nie miała otwartej sesji z viewportem.
+  przełączeniu zakładek (canvas, `isContextLost()`, bufor rysowania)
+  oraz brak renderowania i zapytań w ukrytej ramce. Szczegóły w
+  „Dowód runtime (26.10.2026)”.
+
+### Dowód runtime (26.10.2026, grupy DEV 3221 i 3223)
+
+Dwie grupy z kodem `ecac0fff9`: host 3221 (worktree zadania) i ramka
+3223 (osobny worktree w tym samym commicie, sesja
+`fdm_cpu_relax_smoke`).
+
+Sprawdzone:
+- `GET /v2/platform/instances` z 3221 zwrócił 3223 z jej sesją.
+- Strona `http://localhost:3221` otworzyła zakładkę 3223. Ramka ma nazwę
+  `fullmag-instance-tab`, `src` `http://localhost:3223/workspace`, jest
+  aktywna i `visibility: visible`.
+- Żądania ramki są widoczne w logu sieci strony hosta, więc tym samym
+  logiem da się sprawdzić ciszę ukrytej ramki.
+- `next.config.test.ts` w grupie 3223 (świeży seed z nowym
+  `next.config.ts`): test zgodności okna klienta z CSP przechodzi.
+
+Nie sprawdzono (**NOT VERIFIED**):
+- Ani strona hosta, ani ramka nie skończyły hydratacji. Na hoście
+  działało wtedy 11 frontendów DEV na checkoutach Windows z odpytywaniem
+  9p. Serwer Next podawał 17–20 MB `app/workspace/page.js` z prędkością
+  50–60 KB/s (89–390 s), także wewnątrz kontenera. Webpack przerywa
+  ładowanie chunka po 120 s (`ChunkLoadError`).
+- Dlatego brak dowodu z przeglądarki dla wymiany `ready` i komunikatu
+  widoczności, wstrzymania pętli R3F i zapytań w ukrytej ramce oraz
+  canvas, `gl.isContextLost() === false` i niezerowego bufora rysowania
+  po powrocie.
+- Wariant z wejściem na 3223 bezpośrednio (z `window.name` ramki)
+  potrzebuje tego samego pakietu, więc też nie był wykonalny.
 
 ### Dowód runtime (24.10.2026, grupa DEV 3199)
 
