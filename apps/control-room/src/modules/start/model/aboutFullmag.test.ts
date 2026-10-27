@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   FULLMAG_AUTHORS,
   FULLMAG_BIBTEX,
+  FULLMAG_CAPABILITY_MATRIX_URL,
   FULLMAG_CITATION,
   FULLMAG_CITATION_NOTE,
   FULLMAG_COORDINATION,
@@ -57,5 +58,8 @@ describe("About page content", () => {
     expect(readme).toContain(FULLMAG_BIBTEX);
     expect(prose).toContain(flat(FULLMAG_LICENSE));
     expect(prose).toContain(flat(FULLMAG_FUNDING));
+    expect(FULLMAG_CAPABILITY_MATRIX_URL).toBe(
+      "https://fullmag.mzelent.pl/architecture/planner-and-capabilities.html",
+    );
   });
 });
