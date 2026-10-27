@@ -27,6 +27,7 @@ import {
   isScalarSpatialQuantityId,
   quantityCatalogEntrySupportsAirbox,
   quantityCatalogEntrySupportsSpatialVisualization,
+  quantityCatalogPickerItem,
   resolveCanonicalQuantityId,
 } from "@/kernel/api/quantityIds";
 import {
@@ -2291,10 +2292,9 @@ export function visualizationQuantityItems(
             ? quantityCatalogEntrySupportsAirbox
             : quantityCatalogEntrySupportsSpatialVisualization,
         )
-        .map((quantity) => ({
-          label: quantity.label || quantity.id,
-          value: quantity.id,
-        }))
+        .map((quantity) =>
+          quantityCatalogPickerItem(quantity, quantity.label || quantity.id),
+        )
     : [];
   const fieldItems = fieldCatalog
     ? fieldCatalog.quantities
