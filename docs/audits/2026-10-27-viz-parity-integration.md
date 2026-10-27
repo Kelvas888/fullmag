@@ -89,13 +89,47 @@ konfiguracji jawnego subnetu dla pojedynczej grupy.
 Własne obrazy BuildKit i wolumen kontrolny pozostają potrzebne do wznowienia
 oraz zachowania receiptów. Wolumeny build/package nie mają jeszcze
 zweryfikowanego następcy, więc nie kwalifikują się do usunięcia. Rejestr
-worktree pozostaje aktywny do wyjaśnienia blokady. Główny ext4 przy preflight
+worktree otrzymuje stan `blocked` do wyjaśnienia blokady. Główny ext4 przy preflight
 miał około 3.4 GiB wolnego; build-data nadal należą do wolumenów Docker,
 nie tego hostowego katalogu. Nie wykonano prune ani usuwania danych.
 
 ## Stan
 
-**BLOCKED przed merge**: potrzebna zgodna ścieżka uruchomienia grupy po
-rozwiązaniu wyczerpania pul adresowych Docker. Następnie build aplikacji,
+**BLOCKED przed merge**: potrzebna zgodna ścieżka odzyskania nieudanego
+startu grupy. Następnie build aplikacji,
 kontrole frontendu, runtime/browser/WebGL, CI i merge PR #264. Poprawki
 źródłowe oraz review nie zastępują tych brakujących dowodów.
+
+## Checkpoint końcowy próby
+
+Poprawka kernela i raport: `24d6ba876f788b4dd4d70ed813a69272eaa0643a`.
+Commity źródłowe wypchnięto zwykłym fast-forward na branch PR #264.
+
+Usunięto wyłącznie pustą sieć `fullmag-net-ee53e6fda06a6b8e`
+(ID `1b7b3c89db15e18a2f0a985d2a07a89d5ad2bf7b6ce9da6873e8f8e0f5b82dec`).
+Rejestr `storage/index/design-pr268-fixes-20261026.task.json` potwierdzał
+`completed`, merged PR #272, runtime i worktree usunięte; bezpośrednio przed
+operacją powtórnie potwierdzono zero endpointów i zero kontenerów projektu.
+Nie usuwano żadnych wolumenów ani danych użytkownika. To usunięcie pozostałej
+sieci, nie globalny prune ani cleanup innych danych.
+
+Po potwierdzeniu braku backendu i frontendu zadania podjęto jedną próbę `up`.
+Launcher odmówił przed mutacją:
+
+> DEV control volume has an active operation but no services; daemon outcome is unknown and resources were retained
+
+Odczyt oryginalnego receipt potwierdza brak `backend_container`,
+`frontend_container` i `config_sha256`; aktywny helper
+`fullmag-control-7d885a90260f4943bd23de9d3f96b055` zachowuje lease.
+Nie usunięto markera `active`, nie nadpisano receipt i nie przejęto ownera.
+Istniejące trasy resume/recreate wymagają receiptów i usług, których ten start
+nie utworzył; legacy orphan recovery jawnie nie kwalifikuje volume-only DEV.
+Potrzebne jest obsługiwane, przypięte odzyskanie nieudanego startu przed
+utworzeniem usług, z zachowaniem receiptów. Nie uruchamiać obejścia w obcej
+grupie ani hostowego Cargo.
+
+Review obu poprawek: brak actionable findings. Lokalne kontrole Python:
+7 geometrii + 73 retirement + 7 readiness = 87 PASS. CI uruchomione dla
+commita źródłowego; w chwili checkpointu część workflow nadal trwała.
+Aplikacja backendowa, pełne kontrole frontendu, runtime, WebGL i test Rust
+pozostają **NOT VERIFIED**. PR nie został scalony, master nie był zmieniany.
