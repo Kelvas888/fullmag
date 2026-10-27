@@ -5301,9 +5301,10 @@ def _read_optional_storage_attestation(path: Path, name: str) -> dict[str, Any] 
         value, _ = _read_json(path, name, 1024 * 1024)
     except BackendBuildError as error:
         # The host writer updates this bound file in place.  A read racing its
-        # truncate/write window is retryable; a parsed identity conflict below
-        # remains fail-closed.
-        if "not valid JSON" in str(error):
+        # truncate/write window (a torn document, or a file that changed while
+        # it was read) is retryable; a parsed identity conflict below remains
+        # fail-closed.
+        if "not valid JSON" in str(error) or str(error).endswith("changed while reading"):
             return None
         raise
     return value

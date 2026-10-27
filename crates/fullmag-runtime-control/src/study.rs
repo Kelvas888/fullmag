@@ -3541,16 +3541,7 @@ pub fn load_accepted_study_snapshot(
     project_id: &ProjectId,
 ) -> Result<AcceptedStudySnapshot> {
     let run = crate::load_accepted_run_snapshot(store, run_id, project_id)?;
-    load_accepted_study_snapshot_from_run(store.cas(), run)
-}
-
-/// Share canonical planning/input verification with an imported evidence-only CAS.
-pub fn load_accepted_study_snapshot_from_run(
-    cas: &fullmag_session::CasStore,
-    run: crate::AcceptedRunSnapshot,
-) -> Result<AcceptedStudySnapshot> {
     let intent = &run.intent;
-    let specification = &run.specification;
     let study_ref = intent
         .study_object_ref
         .as_deref()
@@ -3559,6 +3550,59 @@ pub fn load_accepted_study_snapshot_from_run(
         .study_catalog_object_ref
         .as_deref()
         .context("accepted run has no immutable study catalog object")?;
+    let key = crate::study_snapshot_cache::AcceptedStudyKey::new(
+        store.root(),
+        run_id.as_str(),
+        &intent.payload_sha256,
+        study_ref,
+        catalog_ref,
+    );
+    let validated = crate::study_snapshot_cache::get_or_try_insert(key, || {
+        validate_accepted_study_inputs(store.cas(), &run, study_ref, catalog_ref)
+    })?;
+    let (study, catalog, lowered) = (*validated).clone();
+    Ok(AcceptedStudySnapshot {
+        run,
+        study,
+        catalog,
+        lowered,
+    })
+}
+
+/// Share canonical planning/input verification with an imported evidence-only CAS.
+pub fn load_accepted_study_snapshot_from_run(
+    cas: &fullmag_session::CasStore,
+    run: crate::AcceptedRunSnapshot,
+) -> Result<AcceptedStudySnapshot> {
+    let study_ref = run
+        .intent
+        .study_object_ref
+        .as_deref()
+        .context("accepted run has no immutable study object")?;
+    let catalog_ref = run
+        .intent
+        .study_catalog_object_ref
+        .as_deref()
+        .context("accepted run has no immutable study catalog object")?;
+    let (study, catalog, lowered) =
+        validate_accepted_study_inputs(cas, &run, study_ref, catalog_ref)?;
+    Ok(AcceptedStudySnapshot {
+        run,
+        study,
+        catalog,
+        lowered,
+    })
+}
+
+/// Immutable validation is shared by native cached and imported evidence-only reads.
+fn validate_accepted_study_inputs(
+    cas: &fullmag_session::CasStore,
+    run: &crate::AcceptedRunSnapshot,
+    study_ref: &str,
+    catalog_ref: &str,
+) -> Result<crate::study_snapshot_cache::ValidatedAcceptedStudy> {
+    let intent = &run.intent;
+    let specification = &run.specification;
     let study_bytes = cas
         .get_bounded(study_ref, fullmag_session::MAX_TERMINAL_CATALOG_METADATA_BYTES)?
         .context("accepted run study object is missing")?;
@@ -3611,13 +3655,8 @@ pub fn load_accepted_study_snapshot_from_run(
     }
     let lowered = lower_study_plan_with_catalog(&study, &catalog)
         .context("lower immutable study through canonical planner")?;
-    validate_requested_execution(&specification, &catalog, &lowered)?;
-    Ok(AcceptedStudySnapshot {
-        run,
-        study,
-        catalog,
-        lowered,
-    })
+    validate_requested_execution(specification, &catalog, &lowered)?;
+    Ok((study, catalog, lowered))
 }
 
 pub fn validate_requested_execution(

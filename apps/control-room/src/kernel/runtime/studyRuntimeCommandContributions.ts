@@ -2440,9 +2440,12 @@ export const STUDY_RUNTIME_COMMANDS: CommandContribution[] = [
         ),
       });
       if (outcome.kind === "rejected") return outcome.result;
-      const result = outcome.resource;
+      const planFingerprint =
+        outcome.kind === "materialized"
+          ? outcome.resource.plan_fingerprint
+          : outcome.receipt.plan_fingerprint;
       return {
-        message: `Live preparation accepted (${result.plan_fingerprint.slice(0, 12)}…).`,
+        message: `Live preparation accepted (${planFingerprint.slice(0, 12)}…).`,
         status: "completed",
       };
     },

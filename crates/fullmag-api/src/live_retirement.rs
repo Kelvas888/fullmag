@@ -231,6 +231,27 @@ impl LiveRetirementRequest {
 /// trusts that lock as evidence: native owners re-read the execution store,
 /// leases and host ledger; observations revalidate their private import only.
 pub(crate) async fn retire_current_live(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: Json<LiveRetirementRequest>,
+) -> Result<Json<LiveRetirementResponse>, ApiError> {
+    let operation_id = request.operation_id.clone();
+    let result = retire_current_live_checked(state, headers, request).await;
+    // The launcher quarantines an activation on any rejection outside its
+    // no-mutation codes; keep the API's reason beside that receipt.
+    if let Err(error) = &result {
+        tracing::warn!(
+            operation_id = %operation_id,
+            status = %error.status,
+            code = ?error.code,
+            message = %error.message,
+            "live workspace retirement rejected"
+        );
+    }
+    result
+}
+
+async fn retire_current_live_checked(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(request): Json<LiveRetirementRequest>,
@@ -284,7 +305,7 @@ pub(crate) async fn retire_current_live(
             ApiError::conflict_with_code("live_retirement_predecessor_required", error.to_string())
         })?;
         let authority = RetirementAuthority::from_proof(&state, &proof)?;
-        authority.with_evidence(&state, &request.run_id, Some(&proof.terminal_outcome), |evidence| {
+        authority.read_evidence(&state, &request.run_id, Some(&proof.terminal_outcome), |evidence| {
             validate_evidence_for_proof(&proof, &evidence)
         })
         .map_err(|error| {
@@ -369,7 +390,7 @@ pub(crate) async fn retire_current_live(
         )));
     }
 
-    let initial_evidence = authority.with_evidence(&state, &request.run_id, Some(terminal_outcome), Ok)
+    let initial_evidence = authority.read_evidence(&state, &request.run_id, Some(terminal_outcome), Ok)
     .map_err(|error| {
         ApiError::conflict_with_code(
             "live_retirement_terminal_evidence_unknown",
@@ -480,6 +501,23 @@ impl RetirementAuthority {
         match &proof.imported_observation {
             Some(evidence) => Ok(Self::Imported(evidence.clone())),
             None => open_retirement_store(state).map(Self::Native),
+        }
+    }
+
+    /// Retry native contention only for callbacks that cannot mutate retirement state.
+    fn read_evidence<T>(
+        &self, state: &AppState, run_id: &str, expected_outcome: Option<&str>,
+        operation: impl Fn(TerminalRetirementEvidence) -> Result<T>,
+    ) -> Result<T> {
+        match self {
+            Self::Native(store) => read_retirement_evidence(
+                store,
+                run_id,
+                expected_outcome == Some(UNADMITTED_OUTCOME),
+                expected_outcome,
+                operation,
+            ),
+            Self::Imported(_) => self.with_evidence(state, run_id, expected_outcome, operation),
         }
     }
 
@@ -694,6 +732,28 @@ fn with_terminal_evidence_fence<T>(
         store,
         run_id,
         |snapshot, evidence_sha256| operation(snapshot, evidence_sha256),
+    )
+}
+
+/// How long a read-only evidence check waits for the host and store writers.
+const RETIREMENT_EVIDENCE_WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`with_retirement_evidence`] for a check that mutates nothing. The fence
+/// takes the host-ledger and session-store writers without waiting, and the
+/// schedulers hold the store writer most of the time on a Windows-folder
+/// store; a busy writer used to surface as `terminal_evidence_unknown`, a
+/// 409 the launcher must quarantine. Only a busy writer or transient store
+/// I/O is retried, for a bound well inside the launcher's request timeout.
+fn read_retirement_evidence<T>(
+    store: &fullmag_session::SessionStore,
+    run_id: &str,
+    unadmitted: bool,
+    expected_outcome: Option<&str>,
+    operation: impl Fn(TerminalRetirementEvidence) -> Result<T>,
+) -> Result<T> {
+    fullmag_runtime_control::retry_store_writer_busy_within(
+        RETIREMENT_EVIDENCE_WRITER_WAIT,
+        || with_retirement_evidence(store, run_id, unadmitted, expected_outcome, &operation),
     )
 }
 
