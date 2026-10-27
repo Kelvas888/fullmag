@@ -2521,6 +2521,17 @@ def _parser() -> argparse.ArgumentParser:
     empty_quarantine.add_argument("--activation", required=True)
     empty_quarantine.add_argument("--recovery-id", required=True)
     empty_quarantine.add_argument("--apply", action="store_true", help="commit after exact stopped-namespace and empty-store proofs; default is dry-run")
+    offline_reconcile = subparsers.add_parser(
+        "reconcile-offline-volume",
+        help="repair one stopped terminal-owner control lease while preserving sessions and unknown activation evidence",
+    )
+    offline_reconcile.add_argument("--source-root", type=Path, required=True)
+    offline_reconcile.add_argument("--attempt", required=True)
+    offline_reconcile.add_argument("--config-sha256", required=True)
+    offline_reconcile.add_argument("--operation-attempt", required=True)
+    offline_reconcile.add_argument("--port", type=int, required=True)
+    offline_reconcile.add_argument("--apply", action="store_true")
+    offline_reconcile.add_argument("--expected-plan-sha256")
     reattest = subparsers.add_parser("reattest-host-device-volume", help="explicitly reattest a stopped WSL group's renumbered host device")
     reattest.add_argument("--source-root", type=Path, required=True)
     reattest.add_argument("--attempt", required=True)
@@ -2731,6 +2742,10 @@ def _parser() -> argparse.ArgumentParser:
             "reference is passed unchanged to the volume-only recovery wrapper "
             "and is never resolved as a host path"
         ),
+    )
+    recreate_volume.add_argument(
+        "--offline-reconciliation", metavar="OPERATION_TOKEN",
+        help="consume the exact completed offline control repair without replaying its old operation",
     )
     recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the previous session and archive its runtime state before starting an empty session")
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
@@ -2970,6 +2985,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.allow_ui_reset or args.expected_plan_sha256 is not None:
                     raise _fail("Apply acknowledgement and plan digest require --apply")
                 result = plan(inspect_retirement(args))
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif args.action == "reconcile-offline-volume":
+            from docker_volume_offline_reconcile import apply, collect
+            if not args.apply and args.expected_plan_sha256 is not None:
+                raise _fail("A plan digest requires --apply")
+            result = apply(args) if args.apply else collect(args)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.action == "recover-cancelled-activation":
             from docker_volume_cancelled_activation import run as recover_cancelled_activation
