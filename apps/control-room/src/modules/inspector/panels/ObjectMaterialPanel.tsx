@@ -1,6 +1,12 @@
 "use client";
 
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import {
   acknowledgedAuthoringSceneRevision,
@@ -26,13 +32,24 @@ import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus"
 import { Button } from "@/shared/ui/Button";
 
 import type { InspectorPanelProps } from "../inspectorTypes";
-import { useRegisterInspectorEditSession } from "../InspectorEditSession";
+import { applyInspectorSessionWithHistory } from "../InspectorHistoryBridge";
+import {
+  createInspectorEditSessionStore,
+  InspectorEditSessionProvider,
+  type InspectorEditSession,
+  type InspectorEditSessionStore,
+} from "../InspectorEditSession";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FieldRow } from "../primitives/FieldRow";
 import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import { Vector3Field } from "../primitives/Vector3Field";
 import { ObjectAbsorbingBoundaryPanel } from "./ObjectAbsorbingBoundaryPanel";
+import { ObjectMaterialPanelEditSessionBridge } from "./ObjectMaterialPanelEditSessionBridge";
+import {
+  resolveObjectMaterialDraftApplyPolicy,
+  type ObjectMaterialDraftScope,
+} from "./ObjectMaterialPanelEditSession";
 import {
   initialInspectorDraftState,
   resolveInspectorDraftState,
@@ -1059,15 +1076,24 @@ function materialInspectorSections(selectionKind: string | null): string[] {
 
 export function ObjectMaterialPanel({ selection }: InspectorPanelProps) {
   const panel = useObjectMaterialPanelState(selection);
+  const [absorbingBoundaryEditSessionStore] = useState(createInspectorEditSessionStore);
   const sections = materialInspectorSections(selection.kind);
   const showSection = (section: string) => sections.includes(section);
-  return <ObjectMaterialPanelView panel={panel} showSection={showSection} />;
+  return (
+    <ObjectMaterialPanelView
+      absorbingBoundaryEditSessionStore={absorbingBoundaryEditSessionStore}
+      panel={panel}
+      showSection={showSection}
+    />
+  );
 }
 
 function ObjectMaterialPanelView({
+  absorbingBoundaryEditSessionStore,
   panel,
   showSection,
 }: {
+  absorbingBoundaryEditSessionStore: InspectorEditSessionStore;
   panel: ObjectMaterialPanelState;
   showSection: (section: string) => boolean;
 }) {
@@ -1117,7 +1143,35 @@ function ObjectMaterialPanelView({
     anisotropyDraft.axisY,
     anisotropyDraft.axisZ,
   ].every((value) => Number.isFinite(Number(value)));
+  const dirtyMaterialScopes: ObjectMaterialDraftScope[] = [
+    ...(parametersTargetChanged ? ["assignment" as const] : []),
+    ...(parametersDirty ? ["parameters" as const] : []),
+    ...(anisotropyDirty ? ["anisotropy" as const] : []),
+  ];
+  const assignmentApplyAvailable =
+    showSection("assignment") && object.mode === "committed";
+  const availableMaterialApplyScopes = new Set<ObjectMaterialDraftScope>([
+    ...(assignmentApplyAvailable ? ["assignment" as const] : []),
+    ...(showSection("material-parameters") &&
+    (materialData || (parametersTargetChanged && assignmentApplyAvailable))
+      ? ["parameters" as const]
+      : []),
+    ...(showSection("uniaxial-anisotropy") && object.mode === "committed"
+      ? ["anisotropy" as const]
+      : []),
+  ]);
+  const materialApplyPolicy = resolveObjectMaterialDraftApplyPolicy(
+    dirtyMaterialScopes,
+    availableMaterialApplyScopes,
+  );
   const applyInspectorDraft = useCallback(async () => {
+    if (materialApplyPolicy.directApplyFailureReason) {
+      setFeedback({
+        kind: "error",
+        message: materialApplyPolicy.directApplyFailureReason,
+      });
+      return false;
+    }
     if (parametersTargetChanged) {
       if (!(await applyMaterial({ recordHistory: false }))) return false;
       if (parametersDirty) {
@@ -1137,6 +1191,7 @@ function ObjectMaterialPanelView({
     applyAnisotropy,
     applyMaterial,
     applyParameters,
+    materialApplyPolicy.directApplyFailureReason,
     parametersDirty,
     parametersTargetChanged,
     setFeedback,
@@ -1162,19 +1217,49 @@ function ObjectMaterialPanelView({
     setDraftState,
     setFeedback,
   ]);
-  useRegisterInspectorEditSession(
-    "staged",
-    pendingOperations.has("assignment") ||
+  const { api, authoringHistory, commands } = useKernel();
+  const materialEditSession: InspectorEditSession = {
+    applyBlockReason: materialApplyPolicy.applyBlockReason,
+    apply: applyInspectorDraft,
+    applying:
+      pendingOperations.has("assignment") ||
       pendingOperations.has("parameters") ||
       pendingOperations.has("anisotropy"),
-    draftDirty || anisotropyDirty,
-    !("error" in parametersValidation) && anisotropyValid,
-    undefined,
-    applyInspectorDraft,
-    resetInspectorDraft,
-  );
+    dirty: draftDirty || anisotropyDirty,
+    mode: "staged",
+    reset: resetInspectorDraft,
+    valid: !("error" in parametersValidation) && anisotropyValid,
+  };
+  const applyMaterialDraftWithHistory = async (): Promise<boolean> => {
+    const sessionScopeKey = commands.getSessionScopeKey();
+    const historyGeneration = authoringHistory?.getGeneration?.();
+    const isCurrentSessionScope = () =>
+      commands.getSessionScopeKey() === sessionScopeKey;
+    const isCurrentHistoryGeneration = () =>
+      historyGeneration === undefined ||
+      authoringHistory?.getGeneration?.() === historyGeneration;
+    return applyInspectorSessionWithHistory(
+      materialEditSession,
+      { model: { scene: (options) => api.model.scene(options) } },
+      authoringHistory ?? null,
+      "Inspector changes",
+      {
+        isCurrent: isCurrentSessionScope,
+        isHistoryGenerationCurrent: isCurrentHistoryGeneration,
+        requestOptions: sessionScopeKey ? { sessionScopeKey } : undefined,
+      },
+    );
+  };
+  const materialSessionWithHistory: InspectorEditSession = {
+    ...materialEditSession,
+    apply: applyMaterialDraftWithHistory,
+  };
   return (
     <div className="fm-inspector-panel">
+      <ObjectMaterialPanelEditSessionBridge
+        absorbingBoundaryEditSessionStore={absorbingBoundaryEditSessionStore}
+        materialSession={materialSessionWithHistory}
+      />
       <div className="grid min-w-0 gap-fm-inspector-group">
           {showSection("parameters") ? (
             <InspectorGroup title="Magnetic Parameters" collapsible defaultOpen>
@@ -1383,10 +1468,12 @@ function ObjectMaterialPanelView({
           ) : null}
 
           {showSection("absorbing-boundary") && object.mode === "committed" ? (
-            <ObjectAbsorbingBoundaryPanel
-              objectId={object.objectId}
-              baseRevision={object.baseRevision}
-            />
+            <InspectorEditSessionProvider store={absorbingBoundaryEditSessionStore}>
+              <ObjectAbsorbingBoundaryPanel
+                objectId={object.objectId}
+                baseRevision={object.baseRevision}
+              />
+            </InspectorEditSessionProvider>
           ) : null}
 
           {showSection("uniaxial-anisotropy") ? (

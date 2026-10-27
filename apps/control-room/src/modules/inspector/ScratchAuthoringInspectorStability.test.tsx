@@ -1,4 +1,4 @@
-import { act } from "react";
+import { act, useEffect, useState } from "react";
 import { hydrateRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +22,17 @@ import { resolveMaterialResourceKey } from "@/kernel/resources/geometryLifecycle
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
 import type { KernelApi } from "@/kernel/types";
 import type { Selection } from "@/kernel/selection/selectionTypes";
+import { SelectionController } from "@/kernel/selection/SelectionController";
+import {
+  createInspectorEditSessionStore,
+  InspectorEditSessionProvider,
+  type InspectorEditSessionStore,
+} from "./InspectorEditSession";
+import { InspectorFooter } from "./InspectorFooter";
+import {
+  InspectorDirtySelectionGuard,
+  shouldGuardInspectorSelection,
+} from "./InspectorDirtySelectionGuard";
 import {
   findElement,
   findElements,
@@ -32,6 +43,18 @@ import {
 } from "@/kernel/layout/simulationPreparationTestDom.test-support";
 
 import { ObjectMaterialPanel } from "./panels/ObjectMaterialPanel";
+
+// The lightweight test DOM does not implement Radix portals. Keep the guard
+// and its buttons real while rendering the dialog inline for this test.
+vi.mock("@/shared/ui/Dialog", () => ({
+  Dialog: ({ children, open }: { children: React.ReactNode; open: boolean }) =>
+    open ? <>{children}</> : null,
+  DialogContent: ({ children }: { children: React.ReactNode }) => <section role="dialog">{children}</section>,
+  DialogDescription: ({ children }: { children: React.ReactNode }) => <p>{children}</p>,
+  DialogFooter: ({ children }: { children: React.ReactNode }) => <footer>{children}</footer>,
+  DialogHeader: ({ children }: { children: React.ReactNode }) => <header>{children}</header>,
+  DialogTitle: ({ children }: { children: React.ReactNode }) => <h2>{children}</h2>,
+}));
 
 const SESSION_STATUS = {
   resources: { scene_revision: 21 },
@@ -47,8 +70,11 @@ interface Fixture {
   invalidate: ReturnType<typeof vi.spyOn>;
   kernel: KernelApi;
   materialLoad: ReturnType<typeof vi.fn>;
+  patchMaterialAsset: ReturnType<typeof vi.fn>;
   patchObject: ReturnType<typeof vi.fn>;
+  patchObjectInteraction: ReturnType<typeof vi.fn>;
   resources: ResourceInvalidationController;
+  selection: SelectionController;
   sceneLoad: ReturnType<typeof vi.fn>;
   statusLoad: ReturnType<typeof vi.fn>;
 }
@@ -197,6 +223,132 @@ describe("scratch material Inspector stability", () => {
     }
   });
 
+  it("blocks global Apply for dirty parameters and anisotropy while separate local actions keep fresh history revisions", async () => {
+    const initialProperties = {
+      Aex: 1.3e-11,
+      Dbulk: null,
+      Dind: null,
+      Ms: 8e5,
+      alpha: 0.01,
+    };
+    let currentProperties: MaterialPropertiesResource = initialProperties;
+    let currentScene = materialScene(21, currentProperties);
+    const fixture = createFixture();
+    fixture.sceneLoad.mockImplementation(async () => currentScene);
+    fixture.materialLoad.mockImplementation(async () => ({
+      id: "mat:old",
+      name: "Old material",
+      properties: currentProperties,
+      scene_revision: currentScene.revision,
+    }));
+    fixture.interactionLoad.mockResolvedValue({
+      enabled: true,
+      interaction_kind: "uniaxial_anisotropy",
+      object_id: "object-a",
+      params: { axis: [0, 0, 1], ku1: 3e5 },
+      present: true,
+      scene_revision: 21,
+    });
+    const historyRecord = vi.fn();
+    Object.assign(fixture.kernel, {
+      authoringHistory: {
+        getGeneration: () => 0,
+        record: historyRecord,
+        subscribe: () => () => undefined,
+      },
+    });
+    fixture.patchMaterialAsset.mockImplementation(async (_materialId, patch) => {
+      currentProperties = { ...currentProperties, ...patch.properties };
+      currentScene = materialScene(22, currentProperties);
+      return {
+        committed_scene: currentScene,
+        scene_revision: 22,
+        transaction_kind: "patch_material",
+      } as unknown as AuthoringTransactionResponse;
+    });
+    fixture.patchObjectInteraction.mockImplementation(async () => {
+      currentScene = materialScene(23, currentProperties);
+      return {
+        committed_scene: currentScene,
+        scene_revision: 23,
+        transaction_kind: "patch_object_interaction",
+      } as unknown as AuthoringTransactionResponse;
+    });
+
+    const editSessionStore = createInspectorEditSessionStore();
+    const mounted = await mountFixture(
+      fixture,
+      { ...selectionA, kind: "object", nodeId: "object:object-a" },
+      { editSessionStore, withFooter: true, withGuard: true },
+    );
+    try {
+      await waitForText(mounted.container, "Old material");
+      await act(async () => {
+        changeInput(input(mounted.container, "Ms"), "1000000");
+        changeInput(input(mounted.container, "Ku1"), "400000");
+      });
+
+      const session = editSessionStore.getCurrentSession();
+      if (!session) throw new Error("ObjectMaterialPanel did not register its Inspector session");
+      expect(session.dirty).toBe(true);
+      expect(session.valid).toBe(true);
+      expect(session.applyBlockReason).toContain("Apply Parameters and Apply Anisotropy");
+      expect(shouldGuardInspectorSelection(session)).toBe(true);
+      expect(exactButton(mounted.container, "Apply").disabled).toBe(true);
+      expect(exactButton(mounted.container, "Revert").disabled).toBe(false);
+      await act(async () => {
+        fixture.selection.set({
+          kind: selectionB.kind,
+          label: selectionB.label,
+          nodeId: selectionB.nodeId,
+          objectId: selectionB.objectId,
+          ref: selectionB.ref,
+        }, "test");
+      });
+      expect(mounted.container.textContent).toContain("Unapplied Inspector changes");
+      expect(mounted.container.textContent).toContain("Apply Parameters and Apply Anisotropy");
+      expect(exactButton(mounted.container, "Apply and continue").disabled).toBe(true);
+      expect(exactButton(mounted.container, "Discard").disabled).toBe(false);
+      expect(fixture.selection.get().objectId).toBe("object-a");
+      await act(async () => exactButton(mounted.container, "Cancel").click());
+      expect(fixture.patchMaterialAsset).not.toHaveBeenCalled();
+      expect(fixture.patchObjectInteraction).not.toHaveBeenCalled();
+      await act(async () => exactButton(mounted.container, "Apply").click());
+      expect(fixture.patchMaterialAsset).not.toHaveBeenCalled();
+      expect(fixture.patchObjectInteraction).not.toHaveBeenCalled();
+
+      await act(async () => {
+        expect(await session.apply()).toBe(false);
+      });
+      expect(mounted.container.textContent).toContain(
+        "Use Apply Parameters and Apply Anisotropy as separate writes",
+      );
+      expect(fixture.patchMaterialAsset).not.toHaveBeenCalled();
+      expect(fixture.patchObjectInteraction).not.toHaveBeenCalled();
+
+      await act(async () => exactButton(mounted.container, "Apply Parameters").click());
+      await flushResource();
+      expect(fixture.patchMaterialAsset).toHaveBeenCalledOnce();
+      expect(fixture.patchMaterialAsset.mock.calls[0][0]).toBe("mat:old");
+      expect(fixture.patchMaterialAsset.mock.calls[0][2]).toMatchObject({
+        baseRevision: 21,
+        sessionScopeKey: SESSION_SCOPE_KEY,
+      });
+      expect(historyRecord).toHaveBeenCalledOnce();
+
+      await act(async () => exactButton(mounted.container, "Apply Anisotropy").click());
+      await flushResource();
+      expect(fixture.patchObjectInteraction).toHaveBeenCalledOnce();
+      expect(fixture.patchObjectInteraction.mock.calls[0][2]).toMatchObject({
+        base_revision: 22,
+        params: { axis: [0, 0, 1], ku1: 400000 },
+      });
+      expect(historyRecord).toHaveBeenCalledTimes(2);
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
   it("keeps invalid SI edits local and never retries a conflict from stale A after A→B→A", async () => {
     const fixture = createFixture();
     fixture.createMaterial.mockResolvedValue(createdMaterialAck("mat:free-layer"));
@@ -296,6 +448,7 @@ describe("scratch material Inspector stability", () => {
 
 function createFixture(): Fixture {
   const bus = new EventBus<KernelEventMap>();
+  const selection = new SelectionController(bus);
   const resources = new ResourceInvalidationController(bus);
   const sceneLoad = vi.fn().mockResolvedValue(scene(21));
   const statusLoad = vi.fn().mockResolvedValue(SESSION_STATUS);
@@ -311,6 +464,7 @@ function createFixture(): Fixture {
   const createMaterial = vi.fn();
   const patchObject = vi.fn();
   const patchObjectInteraction = vi.fn().mockResolvedValue({ scene_revision: 22 });
+  const patchMaterialAsset = vi.fn();
   const patchMaterial = vi.fn().mockResolvedValue({ scene_revision: 22 });
   const invalidate = vi.spyOn(resources, "invalidate");
   const kernel = {
@@ -320,6 +474,7 @@ function createFixture(): Fixture {
         material: materialLoad,
         objectInteraction: interactionLoad,
         patchMaterial,
+        patchMaterialAsset,
         patchObject,
         patchObjectInteraction,
         scene: sceneLoad,
@@ -338,6 +493,7 @@ function createFixture(): Fixture {
     commands: { getSessionScopeKey: () => SESSION_SCOPE_KEY },
     diagnosticRecorder: new DiagnosticRecorderController({ config: { enabled: false } }),
     resources,
+    selection,
   } as unknown as KernelApi;
   return {
     createMaterial,
@@ -346,17 +502,35 @@ function createFixture(): Fixture {
     kernel,
     materialLoad,
     patchObject,
+    patchMaterialAsset,
+    patchObjectInteraction,
     resources,
+    selection,
     sceneLoad,
     statusLoad,
   };
 }
 
-async function mountFixture(fixture: Fixture, selection: Selection) {
+async function mountFixture(
+  fixture: Fixture,
+  selection: Selection,
+  options: {
+    editSessionStore?: InspectorEditSessionStore;
+    withFooter?: boolean;
+    withGuard?: boolean;
+  } = {},
+) {
+  if (options.withGuard) {
+    fixture.selection.set({
+      kind: selection.kind,
+      label: selection.label,
+      nodeId: selection.nodeId,
+      objectId: selection.objectId,
+      ref: selection.ref,
+    }, selection.moduleSource);
+  }
   const serverHtml = renderToString(
-    <KernelContext.Provider value={fixture.kernel}>
-      <ObjectMaterialPanel selection={selection} />
-    </KernelContext.Provider>,
+    fixtureTree(fixture, selection, options),
   );
   const dom = installSimulationPreparationTestDom();
   const container = dom.document.createElement("div");
@@ -366,9 +540,7 @@ async function mountFixture(fixture: Fixture, selection: Selection) {
   await act(async () => {
     root = hydrateRoot(
       container as unknown as Element,
-      <KernelContext.Provider value={fixture.kernel}>
-        <ObjectMaterialPanel selection={selection} />
-      </KernelContext.Provider>,
+      fixtureTree(fixture, selection, options),
     );
     await Promise.resolve();
     await Promise.resolve();
@@ -390,6 +562,46 @@ async function mountFixture(fixture: Fixture, selection: Selection) {
   };
 }
 
+function fixtureTree(
+  fixture: Fixture,
+  selection: Selection,
+  options: {
+    editSessionStore?: InspectorEditSessionStore;
+    withFooter?: boolean;
+    withGuard?: boolean;
+  },
+) {
+  const panel = options.withGuard ? (
+    <GuardedMaterialPanel fixture={fixture} initialSelection={selection} />
+  ) : <ObjectMaterialPanel selection={selection} />;
+  const content = options.editSessionStore ? (
+    <InspectorEditSessionProvider store={options.editSessionStore}>
+      {panel}
+      {options.withFooter ? <InspectorFooter onFocus={() => undefined} /> : null}
+    </InspectorEditSessionProvider>
+  ) : panel;
+  return <KernelContext.Provider value={fixture.kernel}>{content}</KernelContext.Provider>;
+}
+
+function GuardedMaterialPanel({
+  fixture,
+  initialSelection,
+}: {
+  fixture: Fixture;
+  initialSelection: Selection;
+}) {
+  const [selection, setSelection] = useState(initialSelection);
+  useEffect(() => fixture.selection.subscribe(setSelection), [fixture]);
+  return (
+    <InspectorDirtySelectionGuard
+      controller={fixture.selection}
+      selection={selection}
+    >
+      {(guardedSelection) => <ObjectMaterialPanel selection={guardedSelection} />}
+    </InspectorDirtySelectionGuard>
+  );
+}
+
 function scene(revision: number): SceneResource {
   return {
     materials: [],
@@ -398,6 +610,20 @@ function scene(revision: number): SceneResource {
       sceneObject("object-b", "Object B"),
     ],
     revision,
+  } as unknown as SceneResource;
+}
+
+function materialScene(
+  revision: number,
+  properties: MaterialPropertiesResource,
+): SceneResource {
+  return {
+    ...scene(revision),
+    materials: [{ id: "mat:old", name: "Old material", properties, scene_revision: revision }],
+    objects: [
+      sceneObject("object-a", "Object A", "mat:old"),
+      sceneObject("object-b", "Object B"),
+    ],
   } as unknown as SceneResource;
 }
 
@@ -484,6 +710,14 @@ function button(root: TestNode, text: string): TestElement {
     root,
     (element) => element.tagName === "BUTTON" && element.textContent.includes(text),
     `button ${text}`,
+  );
+}
+
+function exactButton(root: TestNode, text: string): TestElement {
+  return findElement(
+    root,
+    (element) => element.tagName === "BUTTON" && element.textContent.trim() === text,
+    `button exactly named ${text}`,
   );
 }
 
