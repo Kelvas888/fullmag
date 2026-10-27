@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use fullmag_application::{CoordinatorPhase, TaskLifecycle, WorkerCommand, WorkerEvent};
 use fullmag_session::{
-    FmsResourceLease, FmsRetryAction, FmsRetryDecision, FmsRetryTrigger,
+    FmsCoordinatorWatermark, FmsResourceLease, FmsRetryAction, FmsRetryDecision, FmsRetryTrigger,
     FmsWorkerProcessExitReceipt, SessionStore, FMS_RETRY_DECISION_SCHEMA,
     FMS_WORKER_PROCESS_EXIT_RECEIPT_SCHEMA,
 };
@@ -657,6 +657,7 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
     #[cfg(not(target_os = "linux"))]
     let linux_cgroup = None;
     let mut active_lease = lease;
+    let mut pending_heartbeat = None;
     let host_launch_token = host
         .map(|host| authorize_host_worker_launch(host.ledger(), store, &active_lease))
         .transpose()?;
@@ -673,7 +674,7 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
         linux_cgroup,
         worker_timeout,
         heartbeat_interval,
-        || renew_resource_lease(store, &mut active_lease),
+        || renew_resource_lease(store, &mut active_lease, &mut pending_heartbeat),
         || task_stop_requested(store, run_id, task_id),
     ) {
         Ok(outcome) => outcome,
@@ -891,7 +892,13 @@ fn finish_host_worker_exit(
     Ok(())
 }
 
-fn task_is_terminal(store: &SessionStore, lease: &FmsResourceLease) -> Result<bool> {
+/// Lease-free catalog view for one heartbeat tick: `None` once the task is
+/// terminal, otherwise its projected coordinator watermark. Every journal
+/// transition projects that watermark under the same writer lease.
+fn heartbeat_task_watermark(
+    store: &SessionStore,
+    lease: &FmsResourceLease,
+) -> Result<Option<Option<FmsCoordinatorWatermark>>> {
     let catalog = store
         .read_run_catalog(&lease.run_id)?
         .context("accepted-worker heartbeat requires its run catalog")?;
@@ -900,14 +907,28 @@ fn task_is_terminal(store: &SessionStore, lease: &FmsResourceLease) -> Result<bo
         .iter()
         .find(|task| task.task_id == lease.task_id)
         .context("accepted-worker heartbeat task is missing")?;
-    Ok(matches!(
+    if matches!(
         task.lifecycle,
         fullmag_session::FmsTaskLifecycle::Succeeded
             | fullmag_session::FmsTaskLifecycle::Failed
             | fullmag_session::FmsTaskLifecycle::Cancelled
             | fullmag_session::FmsTaskLifecycle::Interrupted
-    ))
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(task.coordinator_watermark))
 }
+
+/// A heartbeat command still waiting for its acknowledgement, with the
+/// catalog watermark observed before the recovery that found it.
+struct PendingHeartbeatWatermark {
+    watermark: FmsCoordinatorWatermark,
+    observed_at: Instant,
+}
+
+/// Upper bound on skipping coordinator recovery while the watermark is
+/// unchanged, in case a catalog projection lags its journal entry.
+const PENDING_HEARTBEAT_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 fn task_stop_requested(store: &SessionStore, run_id: &str, task_id: &str) -> Result<bool> {
     let catalog = store
@@ -960,20 +981,46 @@ fn transiently_missing_store_file(error: &anyhow::Error) -> bool {
     })
 }
 
-fn renew_resource_lease(store: &SessionStore, lease: &mut FmsResourceLease) -> Result<bool> {
-    if task_is_terminal(store, lease)? {
+/// Coordinator recovery takes the session-store writer, and on a Docker
+/// Desktop host folder one recovery holds it for about a second. While the
+/// worker has not acknowledged the pending heartbeat and no journal entry has
+/// been added since, a recovery cannot change the outcome, so the tick reads
+/// only the catalog; otherwise these recoveries starved the worker's own
+/// acknowledgement of the writer.
+fn renew_resource_lease(
+    store: &SessionStore,
+    lease: &mut FmsResourceLease,
+    pending: &mut Option<PendingHeartbeatWatermark>,
+) -> Result<bool> {
+    let Some(watermark) = heartbeat_task_watermark(store, lease)? else {
         return Ok(false);
+    };
+    if let (Some(current), Some(waiting)) = (watermark, pending.as_ref()) {
+        if current == waiting.watermark
+            && waiting.observed_at.elapsed() < PENDING_HEARTBEAT_RECOVERY_INTERVAL
+        {
+            return Ok(true);
+        }
     }
+    *pending = None;
     let run_id = fullmag_application::RunId::parse(lease.run_id.clone())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let claim = load_claim_for_heartbeat(store, &run_id, &lease.task_id)
-        .context("load accepted-worker claim before heartbeat command")?;
-    if reconcile_acknowledged_resource_lease(store, &claim, lease)? {
-        return Ok(true);
-    }
+    let claim = match load_claim_for_heartbeat(store, &run_id, &lease.task_id) {
+        Ok(claim) => claim,
+        // The worker's terminal transition can land between the catalog read
+        // above and this claim load; a terminal task needs no heartbeat.
+        Err(_) if heartbeat_task_watermark(store, lease)?.is_none() => return Ok(false),
+        Err(error) => {
+            return Err(error).context("load accepted-worker claim before heartbeat command")
+        }
+    };
+    // One recovery serves both the acknowledgement check and the next command.
     let recovered =
         retry_store_writer_busy(|| fullmag_runtime_control::recover_coordinator(store, &claim))
             .context("recover accepted-worker coordinator before heartbeat command")?;
+    if reconcile_acknowledged_resource_lease_from(store, &recovered, lease)? {
+        return Ok(true);
+    }
     if recovered
         .events
         .iter()
@@ -998,6 +1045,12 @@ fn renew_resource_lease(store: &SessionStore, lease: &mut FmsResourceLease) -> R
             } if *lease_heartbeat_sequence > lease.heartbeat_sequence
         )
     }) {
+        // `watermark` was read before this recovery, so a journal entry
+        // added since then always ends the wait on the next tick.
+        *pending = watermark.map(|watermark| PendingHeartbeatWatermark {
+            watermark,
+            observed_at: Instant::now(),
+        });
         return Ok(true);
     }
     let next_sequence = lease
@@ -1017,6 +1070,15 @@ fn renew_resource_lease(store: &SessionStore, lease: &mut FmsResourceLease) -> R
         }
         return Err(error).context("persist accepted-worker heartbeat command");
     }
+    // The committed checkpoint is the watermark this transition projected.
+    let checkpoint = coordinator.checkpoint();
+    *pending = Some(PendingHeartbeatWatermark {
+        watermark: FmsCoordinatorWatermark {
+            command_sequence: checkpoint.command_sequence,
+            event_sequence: checkpoint.event_sequence,
+        },
+        observed_at: Instant::now(),
+    });
     Ok(true)
 }
 
@@ -1030,6 +1092,14 @@ fn reconcile_acknowledged_resource_lease(
     let recovered =
         retry_store_writer_busy(|| fullmag_runtime_control::recover_coordinator(store, claim))
             .context("recover accepted-worker heartbeat acknowledgement")?;
+    reconcile_acknowledged_resource_lease_from(store, &recovered, lease)
+}
+
+fn reconcile_acknowledged_resource_lease_from(
+    store: &SessionStore,
+    recovered: &fullmag_runtime_control::RecoveredCoordinator,
+    lease: &mut FmsResourceLease,
+) -> Result<bool> {
     let Some(pending_sequence) = recovered
         .commands
         .iter()
