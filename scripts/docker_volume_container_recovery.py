@@ -41,6 +41,9 @@ from docker_build_control import (
 OPERATOR_AUTHORIZATION_SCHEMA = (
     "fullmag.docker-container-recovery-operator-authorization.v1"
 )
+ABRUPT_OPERATOR_SCHEMA = "fullmag.docker-container-recovery-operator-authorization.v2"
+ABRUPT_PROOF_SCHEMA = "fullmag.docker-abrupt-stop-proof.v1"
+TERMINAL_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v3"
 AUTHORIZATION_SCHEMA = "fullmag.docker-container-recovery-authorization.v1"
 REQUEST_SCHEMA = "runtime_service_container_recovery_request.v1"
 RETAINED_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v2"
@@ -166,9 +169,13 @@ def validate_operator_authorization(value: Mapping[str, object]) -> dict[str, ob
         "prior_stop_journal_sha256", "process_receipt_sha256", "config_sha256",
         "owner_sha256", "launch_sha256",
     }
+    abrupt = authorization.get("schema_version") == ABRUPT_OPERATOR_SCHEMA
+    if abrupt:
+        required = (required - {"prior_stop_journal", "prior_stop_journal_sha256"}) | {
+            "abrupt_stop_proof", "abrupt_stop_proof_sha256"}
     if set(authorization) != required:
-        _fail("operator authorization fields do not match the frozen v1 schema")
-    if authorization.get("schema_version") != OPERATOR_AUTHORIZATION_SCHEMA:
+        _fail("operator authorization fields do not match the frozen schema")
+    if authorization.get("schema_version") not in {OPERATOR_AUTHORIZATION_SCHEMA, ABRUPT_OPERATOR_SCHEMA}:
         _fail("unsupported container recovery operator authorization schema")
     request_id = authorization.get("request_id")
     if not isinstance(request_id, str) or REQUEST_ID_RE.fullmatch(request_id) is None:
@@ -181,14 +188,16 @@ def validate_operator_authorization(value: Mapping[str, object]) -> dict[str, ob
     if not isinstance(project, str) or PROJECT_RE.fullmatch(project) is None:
         _fail("operator authorization Compose project is invalid")
     for key in (
-        "compose_config_sha256", "prior_stop_journal_sha256", "process_receipt_sha256",
+        "compose_config_sha256", "process_receipt_sha256",
         "config_sha256", "owner_sha256", "launch_sha256",
     ):
         _require_sha(authorization.get(key), f"operator authorization {key}")
     for key in ("backend_container_id", "frontend_container_id"):
         _require_container(authorization.get(key), f"operator authorization {key}")
     _require_image(authorization.get("old_image_id"), "operator authorization old_image_id")
-    prior_stop_journal = _relative_control_path(authorization.get("prior_stop_journal"))
+    proof_key = "abrupt_stop_proof" if abrupt else "prior_stop_journal"
+    proof_path = _relative_control_path(authorization.get(proof_key))
+    proof_sha = _require_sha(authorization.get(proof_key + "_sha256"), "operator proof SHA-256")
     if authorization["backend_container_id"] == authorization["frontend_container_id"]:
         _fail("operator authorization repeats the backend/frontend container")
     return {
@@ -198,13 +207,12 @@ def validate_operator_authorization(value: Mapping[str, object]) -> dict[str, ob
         "attempt": attempt,
         "source_root": source_root,
         "compose_project": project,
-        "stop_journal_path": prior_stop_journal,
-        "stop_journal_sha256": authorization["prior_stop_journal_sha256"],
-        # The stop journal is the immutable proof bundle.  It contains the
-        # last ready-owner reprobe and the empty-store/ledger observation.  Do
-        # not substitute the post-failure process receipt: that receipt only
-        # proves that the failed container reached shutdown_unknown.
-        "prior_ready_owner_proof_sha256": authorization["prior_stop_journal_sha256"],
+        "stop_journal_path": proof_path,
+        "stop_journal_sha256": proof_sha,
+        # The evidence digest is either the v1 journal or the v2 original
+        # abrupt-stop archive. The native transport retains its historical
+        # field names; v2 never manufactures a stop journal or process state.
+        "prior_ready_owner_proof_sha256": proof_sha,
         "services": {
             "backend": {
                 "container_id": authorization["backend_container_id"],
@@ -273,7 +281,7 @@ def _owner_for_native(owner: object) -> dict[str, object]:
         _fail("native container recovery cannot consume a drained or fabricated owner")
     for key in ("owner_token", "process_start_token", "target_id", "host", "protocol"):
         _require_text(owner.get(key), f"expected_owner.{key}", 255)
-    if not isinstance(owner.get("pid"), int) or owner["pid"] <= 0:
+    if type(owner.get("pid")) is not int or owner["pid"] <= 0:
         _fail("expected_owner.pid is not a live owner identity")
     children = owner.get("children")
     if not isinstance(children, list) or len(children) != 2:
@@ -332,6 +340,30 @@ def _validate_container_pins(pins: Sequence[object]) -> list[dict[str, object]]:
 
 def expected_recovery_outcome(request: Mapping[str, object]) -> str:
     """Bind receipt semantics to the explicit request version, never its outcome alone."""
+    if request.get("schema_version") == TERMINAL_REQUEST_SCHEMA:
+        if request.get("retained_cancelled_runs") is not None:
+            _fail("v3 recovery cannot carry cancelled-only pins")
+        pins = request.get("retained_terminal_runs")
+        if not isinstance(pins, list) or not 1 <= len(pins) <= 128:
+            _fail("v3 recovery requires 1..128 retained terminal run pins")
+        seen = set()
+        for pin in pins:
+            if not isinstance(pin, Mapping) or set(pin) != {
+                "run_id", "run_intent_sha256", "run_catalog_sha256", "artifact_catalog_sha256"}:
+                _fail("invalid retained terminal run pin")
+            run_id = _require_text(pin.get("run_id"), "retained terminal run id", 128)
+            if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", run_id) or run_id.endswith("."):
+                _fail("unsafe retained terminal run id")
+            if run_id in seen:
+                _fail("duplicate retained terminal run pin")
+            seen.add(run_id)
+            for key in ("run_intent_sha256", "run_catalog_sha256"):
+                _require_sha(pin.get(key), key)
+            if pin["artifact_catalog_sha256"] is not None:
+                _require_sha(pin["artifact_catalog_sha256"], "artifact_catalog_sha256")
+        return "retained_terminal_runs_recovered"
+    if request.get("retained_terminal_runs") is not None:
+        _fail("terminal run pins require v3 recovery")
     if request.get("schema_version") == REQUEST_SCHEMA:
         if request.get("retained_cancelled_runs") is not None:
             _fail("v1 recovery cannot retain cancelled runs")
@@ -637,7 +669,7 @@ def _runtime_config(control: BuildControl) -> tuple[dict[str, object], bytes, st
     return config, raw, _sha256(raw)
 
 
-def _runtime_process_receipt(control: BuildControl) -> tuple[dict[str, object], bytes, str]:
+def _runtime_process_receipt(control: BuildControl, *, abrupt: bool = False) -> tuple[dict[str, object], bytes, str]:
     receipt, raw = _control_json(
         control, f"{RUNTIME_CONTROL_RELATIVE}/runtime-service/process-tree.json"
     )
@@ -645,7 +677,7 @@ def _runtime_process_receipt(control: BuildControl) -> tuple[dict[str, object], 
         _fail("runtime-service process receipt is missing from the control volume")
     if receipt.get("schema") != "fullmag.docker-process-tree.v1":
         _fail("runtime-service process receipt schema differs from the image-owned schema")
-    if receipt.get("state") != "shutdown_unknown":
+    if receipt.get("state") not in ({"ready", "shutdown_unknown"} if abrupt else {"shutdown_unknown"}):
         _fail("container recovery requires the current shutdown_unknown process receipt")
     if "startup_activation" in receipt:
         _fail("container recovery cannot consume an internal startup activation receipt")
@@ -734,6 +766,7 @@ def _build_request(
     manifest_sha256: str,
     containers: Sequence[Mapping[str, object]],
     retained_cancelled_runs: Sequence[Mapping[str, object]] | None = None,
+    retained_terminal_runs: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     device = _require_mapping(device_release, "device release")
     _require_text(device.get("resource_id"), "device release resource_id", 255)
@@ -741,7 +774,7 @@ def _build_request(
     if device.get("mapping_detached") is not True:
         _fail("device release mapping is not detached")
     request = {
-        "schema_version": RETAINED_REQUEST_SCHEMA if retained_cancelled_runs is not None else REQUEST_SCHEMA,
+        "schema_version": TERMINAL_REQUEST_SCHEMA if retained_terminal_runs is not None else (RETAINED_REQUEST_SCHEMA if retained_cancelled_runs is not None else REQUEST_SCHEMA),
         "request_id": authorization["request_id"],
         "config_sha256": config_sha256,
         "owner_sha256": owner_sha256,
@@ -758,6 +791,8 @@ def _build_request(
         "device_release_mapping_sha256": device["mapping_sha256"],
         **({"device_release_gpu_uuid": device["gpu_uuid"]} if "gpu_uuid" in device else {}),
         "containers": [dict(item) for item in containers],
+        **({"retained_terminal_runs": [dict(item) for item in retained_terminal_runs]}
+           if retained_terminal_runs is not None else {}),
         **(
             {"retained_cancelled_runs": [dict(item) for item in retained_cancelled_runs]}
             if retained_cancelled_runs is not None
@@ -880,10 +915,17 @@ def _ledger_and_store_snapshot(
     *,
     compose=None,
     retained_cancelled_runs: Sequence[Mapping[str, object]] | None = None,
+    retained_terminal_runs: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Read the exact accepted store and shared ledger through an isolated helper."""
 
-    retained_pins = None
+    if retained_terminal_runs is not None and retained_cancelled_runs is not None:
+        _fail("cannot mix terminal and cancelled-only retained run pins")
+    terminal_mode = retained_terminal_runs is not None
+    retained_pins = [dict(pin) for pin in retained_terminal_runs] if terminal_mode else None
+    if terminal_mode:
+        expected_recovery_outcome({"schema_version": TERMINAL_REQUEST_SCHEMA,
+                                   "retained_terminal_runs": retained_pins})
     if retained_cancelled_runs is not None:
         retained_pins = [dict(pin) for pin in retained_cancelled_runs]
         expected_recovery_outcome({
@@ -891,6 +933,19 @@ def _ledger_and_store_snapshot(
             "retained_cancelled_runs": retained_pins,
         })
     state_source = _bind_source(backend, "/state")
+    if compose is not None and state_source.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"):
+        # The service validator must have bound this alias to the retained
+        # canonical Compose mount. Never create an alias or guess a fallback.
+        mounts = compose.get("services", {}).get("backend", {}).get("volumes", [])
+        candidates = [m for m in mounts if isinstance(m, Mapping) and m.get("target") == "/state"]
+        if len(candidates) != 1 or candidates[0].get("type") != "bind":
+            _fail("retained Compose has no unique canonical state bind")
+        pinned_alias = compose.get("services", {}).get("backend", {}).get("x-fullmag-daemon-binds", {}).get("/state")
+        if pinned_alias != state_source:
+            _fail("canonical state mount is not bound to the retained daemon alias")
+        state_source = _require_text(candidates[0].get("source"), "canonical Compose state source")
+        if not state_source.startswith("/") or ".." in PurePosixPath(state_source).parts:
+            _fail("canonical state mount is not an absolute host path")
     ledger_mount, ledger_descriptor = _ledger_snapshot_mount(control, backend, compose)
     script = r'''import fcntl, hashlib, json, os, pathlib, time
 MAX_ENTRIES=8192
@@ -940,7 +995,7 @@ for current, directories, files in os.walk(store, topdown=True, followlinks=Fals
         if count>MAX_ENTRIES: raise RuntimeError('accepted store inventory is unbounded')
         path=current_path/name
         if path.is_symlink() or not path.is_file(): raise RuntimeError('accepted store contains an invalid file')
-        if name in {'run_intent.json','run_catalog.json'}:
+        if name in ({'run_intent.json','run_catalog.json','artifact_catalog.json'} if observation.get('terminal_mode') else {'run_intent.json','run_catalog.json'}):
             relative=path.relative_to(store).as_posix()
             records[relative]=hashlib.sha256(regular(path,'retained run record')).hexdigest()
 pins=observation.get('retained_cancelled_runs')
@@ -951,7 +1006,7 @@ else:
     if not isinstance(pins,list) or not 1<=len(pins)<=128: raise RuntimeError('retained run pins are invalid or unbounded')
     expected={}
     for pin in pins:
-        if not isinstance(pin,dict) or set(pin)!={'run_id','run_intent_sha256','run_catalog_sha256'}: raise RuntimeError('retained run pin has an invalid shape')
+        if not isinstance(pin,dict) or set(pin)!=({'run_id','run_intent_sha256','run_catalog_sha256','artifact_catalog_sha256'} if observation.get('terminal_mode') else {'run_id','run_intent_sha256','run_catalog_sha256'}): raise RuntimeError('retained run pin has an invalid shape')
         run_id=pin.get('run_id')
         if not isinstance(run_id,str) or not run_id or '/' in run_id or '..' in run_id: raise RuntimeError('retained run id is invalid')
         for key in ('run_intent_sha256','run_catalog_sha256'):
@@ -964,9 +1019,84 @@ else:
     for run_id,pin in expected.items():
         expected_records['runs/'+run_id+'/run_intent.json']=pin['run_intent_sha256']
         expected_records['runs/'+run_id+'/run_catalog.json']=pin['run_catalog_sha256']
+        if observation.get('terminal_mode') and pin['artifact_catalog_sha256'] is not None:
+            expected_records['runs/'+run_id+'/artifact_catalog.json']=pin['artifact_catalog_sha256']
     if set(records)!=set(expected_records): raise RuntimeError('accepted store run-record inventory differs from retained pins')
     if records!=expected_records: raise RuntimeError('accepted store run-record bytes differ from retained pins')
-    run_records=[{'run_id':run_id,'run_intent_sha256':pin['run_intent_sha256'],'run_catalog_sha256':pin['run_catalog_sha256']} for run_id,pin in sorted(expected.items())]
+    run_records=[dict(pin) for run_id,pin in sorted(expected.items())]
+    if observation.get('terminal_mode'):
+        for folder in ('manifests','live_command_journals','recovery','temp','batches'):
+            root=store/folder
+            if root.exists():
+                if root.is_symlink() or not root.is_dir() or any(root.iterdir()): raise RuntimeError('pending or unknown runtime work: '+folder)
+        scheduler=store/'scheduler_pools'
+        if scheduler.exists():
+            if scheduler.is_symlink() or not scheduler.is_dir(): raise RuntimeError('invalid scheduler namespace')
+            for path in scheduler.iterdir():
+                checkpoint=json.loads(regular(path,'scheduler checkpoint'))
+                if any(run_id not in expected for run_id in checkpoint.get('run_ids',[])) or (checkpoint.get('next_run_id') is not None and checkpoint['next_run_id'] not in expected): raise RuntimeError('scheduler references unknown work')
+        referenced=set()
+        for run_id,pin in expected.items():
+            intent=json.loads(regular(runs/run_id/'run_intent.json','run intent'))
+            refs=[intent.get(key) for key in ('definition_object_ref','study_object_ref','study_catalog_object_ref')]
+            assets=intent.get('asset_object_refs',{})
+            if not isinstance(assets,dict): raise RuntimeError('retained input asset refs are invalid')
+            refs.extend(assets.values())
+            for ref in refs:
+                if ref is None: continue
+                if not isinstance(ref,str) or len(ref)!=64 or any(c not in '0123456789abcdef' for c in ref): raise RuntimeError('retained input CAS ref is invalid')
+                referenced.add(ref)
+            catalog=json.loads(regular(runs/run_id/'run_catalog.json','run catalog'))
+            tasks=catalog.get('tasks')
+            if not isinstance(tasks,list) or not tasks: raise RuntimeError('terminal run has no tasks')
+            if any(not isinstance(t,dict) or t.get('lifecycle') not in ('succeeded','failed','cancelled') for t in tasks): raise RuntimeError('run contains nonterminal tasks')
+            if pin['artifact_catalog_sha256'] is None and any(t.get('artifact_ids') for t in tasks): raise RuntimeError('terminal run outputs have no artifact catalog')
+            task_by_id={t.get('task_id'):t for t in tasks if isinstance(t.get('task_id'),str)}
+            if len(task_by_id)!=len(tasks): raise RuntimeError('terminal task identity inventory is invalid')
+            def current_attempt(record,label):
+                task=task_by_id.get(record.get('task_id'))
+                attempt=record.get('attempt_id')
+                if (task is None or not isinstance(attempt,str) or not attempt
+                        or task.get('attempt_id')!=attempt or record.get('run_id',run_id)!=run_id
+                        or record.get('ownership_epoch')!=task.get('ownership_epoch')):
+                    raise RuntimeError('unsupported historical retry: '+label+' differs from current terminal catalog attempt')
+                return task
+            for folder in ('resource_leases','preparation_resource_leases'):
+                root=runs/run_id/folder
+                if root.exists():
+                    if root.is_symlink() or not root.is_dir(): raise RuntimeError('invalid local lease directory')
+                    for path in root.rglob('*'):
+                        if path.is_symlink(): raise RuntimeError('local lease symlink')
+                        if path.is_file():
+                            lease=json.loads(regular(path,'local lease'))
+                            if lease.get('state')!='released': raise RuntimeError('active or unknown local lease')
+                            if folder=='resource_leases': current_attempt(lease,'retained solver lease')
+            admissions=runs/run_id/'task_admissions'
+            if admissions.exists():
+                if admissions.is_symlink() or not admissions.is_dir(): raise RuntimeError('invalid task admission directory')
+                for path in admissions.rglob('*'):
+                    if path.is_symlink(): raise RuntimeError('task admission symlink')
+                    if path.is_file():
+                        admission=json.loads(regular(path,'retained task admission'))
+                        task=admission.get('task'); lease=admission.get('lease')
+                        if not isinstance(task,dict) or not isinstance(lease,dict): raise RuntimeError('retained task admission has no task and lease')
+                        current_attempt(task,'retained task admission task')
+                        current_attempt(lease,'retained task admission lease')
+                        parts=path.relative_to(admissions).parts
+                        if len(parts)!=2 or parts[0]!=task.get('task_id') or parts[1]!=task.get('attempt_id')+'.json': raise RuntimeError('unsupported historical retry: retained task admission path differs from current terminal attempt')
+        pin_root=store/'objects/pins'
+        if pin_root.is_symlink() or not pin_root.is_dir(): raise RuntimeError('retained input CAS pins directory is missing')
+        for path in pin_root.iterdir():
+            pin=json.loads(regular(path,'retained input CAS pin',4096))
+            ref=path.name.removesuffix('.json')
+            if path.suffix!='.json' or set(pin)!={'schema','object_ref'} or pin['schema']!='fullmag.cas-pin.v1' or pin['object_ref']!=ref or ref not in referenced: raise RuntimeError('retained input CAS pin is not referenced by the retained intents')
+        total=0
+        for ref in sorted(referenced):
+            raw=regular(store/'objects/sha256'/ref,'retained input CAS object',128*1024*1024)
+            total+=len(raw)
+            if total>128*1024*1024: raise RuntimeError('retained input CAS budget exceeded')
+            if hashlib.sha256(raw).hexdigest()!=ref: raise RuntimeError('retained input CAS object bytes differ')
+
 print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_root_sha256':hashlib.sha256(b'/state/runs/docker-all/session-store').hexdigest(),'ledger_root_sha256':hashlib.sha256(b'/host-ledger/ledger').hexdigest(),'ledger_snapshot_sha256':ledger_digest,'store_file_count':count,'run_directories':sorted(run_dirs),'run_records':run_records,**({'host_ledger_volume_probe':volume_proof} if volume_proof is not None else {})},sort_keys=True))
 '''
     if ledger_descriptor is not None:
@@ -1007,6 +1137,7 @@ print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_
     args.append(canonical({
         "ledger_descriptor": ledger_descriptor,
         "retained_cancelled_runs": retained_pins,
+        "terminal_mode": terminal_mode,
     }).decode("utf-8"))
     result = bounded_capture(args, data=b"", timeout=90)
     if result.returncode:
@@ -1021,17 +1152,369 @@ print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_
         _require_sha(value.get(key), f"storage proof {key}")
     expected_records = []
     if retained_pins is not None:
-        expected_records = [
-            {
-                "run_id": pin["run_id"],
-                "run_intent_sha256": pin["run_intent_sha256"],
-                "run_catalog_sha256": pin["run_catalog_sha256"],
-            }
-            for pin in sorted(retained_pins, key=lambda item: item["run_id"])
-        ]
+        expected_records = [dict(pin) for pin in sorted(retained_pins, key=lambda item: item["run_id"])]
     if value.get("run_records") != expected_records:
         _fail("accepted store/ledger proof run records differ from retained pins")
     return dict(value)
+
+
+def _is_abrupt(authorization: Mapping[str, object]) -> bool:
+    return authorization.get("schema_version") == ABRUPT_OPERATOR_SCHEMA
+
+
+def _abrupt_pins(value: Mapping[str, object]) -> dict[str, object]:
+    """The input to preparation excludes the as-yet uncomputed proof digest."""
+    keys = {"request_id", "source_root", "compose_project", "development_attempt",
+            "compose_config_sha256", "backend_container_id", "frontend_container_id",
+            "old_image_id", "process_receipt_sha256", "config_sha256", "owner_sha256", "launch_sha256"}
+    pins = dict(value)
+    if set(pins) != keys:
+        _fail("abrupt preparation authorization_pins fields differ from the frozen schema")
+    if not REQUEST_ID_RE.fullmatch(str(pins["request_id"])) or not ATTEMPT_RE.fullmatch(str(pins["development_attempt"])):
+        _fail("abrupt preparation request/attempt identity is invalid")
+    _require_text(pins["source_root"], "abrupt source root")
+    if not isinstance(pins["compose_project"], str) or not PROJECT_RE.fullmatch(pins["compose_project"]):
+        _fail("abrupt preparation project is invalid")
+    for key in keys:
+        if key.endswith("_sha256"):
+            _require_sha(pins[key], key)
+    for key in ("backend_container_id", "frontend_container_id"):
+        _require_container(pins[key], key)
+    if pins["backend_container_id"] == pins["frontend_container_id"]:
+        _fail("abrupt preparation repeats a service identity")
+    _require_image(pins["old_image_id"], "abrupt old image")
+    return pins
+
+
+def _abrupt_authorization_pins(authorization):
+    return _abrupt_pins({key: authorization[key] for key in (
+        "request_id", "source_root", "compose_project", "development_attempt",
+        "compose_config_sha256", "backend_container_id", "frontend_container_id", "old_image_id",
+        "process_receipt_sha256", "config_sha256", "owner_sha256", "launch_sha256")})
+
+
+def _strict_stopped(container: Mapping[str, object]) -> None:
+    state = _require_mapping(container.get("State"), "abrupt Docker State")
+    if (state.get("Status") != "exited" or state.get("Running") is not False
+            or type(state.get("Pid")) is not int or state["Pid"] != 0
+            or type(state.get("ExitCode")) is not int
+            or not 0 <= state["ExitCode"] <= 255
+            or state.get("Restarting") is not False or state.get("Paused") is not False):
+        _fail("abrupt recovery requires an exact stopped, unpaused Docker namespace")
+    for key in ("StartedAt", "FinishedAt"):
+        timestamp = _require_text(state.get(key), f"stopped {key}", 128)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T[0-9:.]+Z", timestamp) or timestamp.startswith("0001-"):
+            _fail("abrupt Docker timestamps are not authoritative")
+    host = _require_mapping(container.get("HostConfig"), "abrupt HostConfig")
+    if host.get("PidMode") not in (None, "", "private") or host.get("IpcMode") not in ("private", ""):
+        _fail("abrupt recovery requires private PID and IPC namespaces")
+    name = _network_name(container, "stopped service")
+    if host.get("NetworkMode") != name:
+        _fail("abrupt recovery requires the exact private service network namespace")
+
+
+def _abrupt_network(backend, frontend, project):
+    from docker_stopped_network import observe_stopped_bridge
+    from docker_volume_dev import _assert_private_restart_network
+    try:
+        return observe_stopped_bridge(backend, frontend, project, capture=docker_capture,
+                                      validate_owned_bridge=_assert_private_restart_network)
+    except BuildControlError as error:
+        _fail(str(error))
+
+
+def _retained_compose_state_root(backend, compose):
+    if not isinstance(compose, Mapping) or compose.get("name") != "fullmag-master":
+        _fail("foreign alias proof has no retained master Compose identity")
+    service = compose.get("services", {}).get("backend", {})
+    volumes = service.get("volumes") if isinstance(service, Mapping) else None
+    candidates = [item for item in volumes if isinstance(item, Mapping)
+                  and item.get("target") == "/state"] if isinstance(volumes, list) else []
+    if len(candidates) != 1 or candidates[0].get("type") != "bind":
+        _fail("foreign alias proof has no unique retained canonical backend state bind")
+    source = candidates[0].get("source")
+    if (not isinstance(source, str) or not source.startswith("/")
+            or ".." in PurePosixPath(source).parts or str(PurePosixPath(source)) != source):
+        _fail("foreign alias proof retained state source is unsafe")
+    actual = [item for item in backend.get("Mounts", [])
+              if isinstance(item, Mapping) and item.get("Destination") == "/state"]
+    daemon_binds = service.get("x-fullmag-daemon-binds")
+    if (len(actual) != 1 or actual[0].get("Type") != "bind"
+            or not isinstance(actual[0].get("Source"), str)
+            or not isinstance(daemon_binds, Mapping)
+            or daemon_binds.get("/state") != actual[0].get("Source")):
+        _fail("foreign alias proof backend state mount differs from its retained daemon pin")
+    path = Path(source)
+    try:
+        if any(storage.is_link(item) for item in (path, *path.parents)):
+            _fail("foreign alias proof retained state traverses a symlink")
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        _fail("foreign alias proof retained state is unavailable: " + str(error))
+    if resolved != path or not path.is_dir():
+        _fail("foreign alias proof retained state is not a canonical directory")
+    image = backend.get("Image")
+    if not isinstance(image, str) or IMAGE_RE.fullmatch(image) is None:
+        _fail("foreign alias proof retained backend image is not immutable")
+    try:
+        documents = json.loads(docker_capture("image", "inspect", image, timeout=90).stdout)
+        if (not isinstance(documents, list) or len(documents) != 1
+                or documents[0].get("Id") != image):
+            _fail("foreign alias proof retained backend image is unavailable")
+        from docker_volume_dev import _validate_retained_service
+        _validate_retained_service(compose, backend, "backend", documents[0].get("Config", {}))
+    except (json.JSONDecodeError, TypeError, ValueError, BuildControlError) as error:
+        _fail("foreign alias proof retained backend service is not authenticated: " + str(error))
+    return path
+
+
+def _prove_foreign_alias_for_abrupt(control, backend, container, alias, compose):
+    from docker_bind_overlap_probe import prove_foreign_alias_disjoint
+    state_root = _retained_compose_state_root(backend, compose)
+    return prove_foreign_alias_disjoint(control, backend, container, alias, state_root)
+
+
+def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=None, *,
+                                         prove_foreign_disjoint=None):
+    """Fence every Docker consumer, including stopped containers able to restart."""
+    protected = set()
+    for container in (backend, frontend):
+        for mount in container.get("Mounts", []):
+            if mount.get("Destination") in {"/state", "/host-ledger", CONTROL_ROOT}:
+                protected.add((mount.get("Type"), mount.get("Name") if mount.get("Type") == "volume" else mount.get("Source")))
+    if compose is not None:
+        for service in ("backend", "frontend"):
+            for mount in compose.get("services", {}).get(service, {}).get("volumes", []):
+                if mount.get("type") == "bind" and mount.get("target") in {"/state", "/host-ledger", CONTROL_ROOT}:
+                    protected.add(("bind", mount.get("source")))
+    if not protected:
+        _fail("abrupt recovery has no protected runtime mount inventory")
+    listed = docker_capture("ps", "-aq", "--no-trunc", timeout=60).stdout.decode().split()
+    if len(listed) != len(set(listed)):
+        _fail("Docker consumer inventory contains duplicate IDs")
+    own = {backend["Id"], frontend["Id"]}
+    operation = getattr(control, "_active_operation", None)
+    if operation is not None:
+        # Only the exact helper holding this object's current lease is exempt.
+        # BuildControl revalidates its image, full command, namespace and every
+        # mount. Labels alone cannot authorize another control-volume consumer.
+        authenticate = getattr(control, "_pin_operation_helper", None)
+        if not callable(authenticate):
+            _fail("active recovery operation has no authenticated control helper")
+        helper_id = authenticate(operation)
+        own.add(_require_container(helper_id, "authenticated operation helper ID"))
+    foreign = sorted(set(listed) - own)
+    if not foreign:
+        return
+    if len(foreign) > 512:
+        _fail("Docker consumer inventory exceeds the observation budget")
+    for identifier in foreign:
+        _require_container(identifier, "foreign Docker consumer ID")
+    records = json.loads(docker_capture("inspect", *foreign, timeout=90).stdout)
+    if (not isinstance(records, list) or len(records) != len(foreign)
+            or any(not isinstance(item, Mapping) for item in records)
+            or {item.get("Id") for item in records} != set(foreign)):
+        _fail("foreign Docker consumer inventory changed during observation")
+    for item in records:
+        alias_mapping = None
+        alias_mapping_decided = False
+        mounts = item.get("Mounts")
+        if not isinstance(mounts, list):
+            _fail("foreign Docker consumer has no complete mount inventory")
+        for mount in mounts:
+            if not isinstance(mount, Mapping):
+                _fail("foreign Docker consumer mount is malformed")
+            kind = mount.get("Type")
+            if kind == "bind":
+                source = mount.get("Source")
+                if (not isinstance(source, str) or not source.startswith("/")
+                        or ".." in PurePosixPath(source).parts
+                        or str(PurePosixPath(source)) != source):
+                    _fail("foreign Docker consumer bind source is unsafe")
+                raw_key = (kind, source)
+            elif kind == "volume":
+                name = mount.get("Name")
+                if not isinstance(name, str) or not name:
+                    _fail("foreign Docker consumer volume identity is unresolved")
+                raw_key = (kind, name)
+            elif kind == "tmpfs":
+                raw_key = (kind, None)
+            else:
+                _fail("foreign Docker consumer mount type is unresolved")
+            key = raw_key
+            alias = raw_key[1] if raw_key[0] == "bind" else None
+            needs_physical_proof = False
+            # Preserve exact and ancestor/descendant source checks before any
+            # cross-group resolver or kernel probe is allowed to run.
+            raw_overlap = raw_key in protected
+            if raw_key[0] == "bind":
+                raw_source = PurePosixPath(raw_key[1])
+                raw_overlap = raw_overlap or any(kind == "bind" and isinstance(path, str)
+                    and (raw_source.is_relative_to(PurePosixPath(path))
+                         or PurePosixPath(path).is_relative_to(raw_source))
+                    for kind, path in protected)
+            if raw_overlap:
+                _fail("a foreign Docker container references the recovery store/control/ledger")
+            if (isinstance(alias, str)
+                    and alias.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/")):
+                # Alias hashes are not identities. A missing/denied registered
+                # mapping requires an independent physical kernel proof.
+                if not alias_mapping_decided:
+                    try:
+                        from docker_foreign_bind_identity import canonical_bind_sources
+                        alias_mapping = canonical_bind_sources(item)
+                    except Exception:
+                        alias_mapping = None
+                    alias_mapping_decided = True
+                if alias_mapping is None:
+                    needs_physical_proof = True
+                elif not isinstance(alias_mapping, dict):
+                    _fail("foreign Docker Desktop bind resolver returned a malformed mapping")
+                elif alias not in alias_mapping:
+                    needs_physical_proof = True
+                else:
+                    canonical_source = alias_mapping[alias]
+                    if (not isinstance(canonical_source, str) or not canonical_source.startswith("/")
+                            or ".." in PurePosixPath(canonical_source).parts
+                            or str(PurePosixPath(canonical_source)) != canonical_source):
+                        _fail("foreign registered bind source is not a canonical absolute path")
+                    key = ("bind", canonical_source)
+            if needs_physical_proof:
+                callback = prove_foreign_disjoint or (
+                    lambda current, current_alias: _prove_foreign_alias_for_abrupt(
+                        control, backend, current, current_alias, compose))
+                try:
+                    proof = callback(item, alias)
+                    from docker_bind_overlap_probe import validate_foreign_alias_disjoint_proof
+                    validate_foreign_alias_disjoint_proof(
+                        proof, alias=alias, container_id=item.get("Id"))
+                except Exception as error:
+                    _fail("foreign Docker Desktop bind alias has unresolved storage identity: " + str(error))
+                continue
+            overlap = key in protected
+            if key[0] == "bind" and isinstance(key[1], str):
+                source = PurePosixPath(key[1])
+                overlap = overlap or any(kind == "bind" and isinstance(path, str)
+                    and (source.is_relative_to(PurePosixPath(path)) or PurePosixPath(path).is_relative_to(source))
+                    for kind, path in protected)
+            if overlap:
+                _fail("a foreign Docker container references the recovery store/control/ledger")
+
+
+def prepare_abrupt_stop_proof(control, authorization_pins, compose, *, retained_terminal_runs=None):
+    """Observe without writes. Publish the returned immutable JSON in a control operation.
+
+    authorization_pins contains the twelve operator fields except schema_version,
+    abrupt_stop_proof and abrupt_stop_proof_sha256. This function never creates a
+    stop journal, modifies OWNER/process-tree, removes containers, or runs Solve.
+    """
+    pins = _abrupt_pins(authorization_pins)
+    engine_sha = _docker_engine_sha()
+    if retained_terminal_runs is not None:
+        retained_terminal_runs = [dict(item) for item in retained_terminal_runs]
+    if pins["compose_project"] != control.project or compose.get("name") != control.project:
+        _fail("abrupt proof belongs to another Compose project")
+    if _sha256(_canonical(compose)) != pins["compose_config_sha256"]:
+        _fail("abrupt retained Compose configuration digest differs")
+    auth = {**pins, "schema_version": ABRUPT_OPERATOR_SCHEMA,
+            "services": {service: {"container_id": pins[service + "_container_id"]} for service in ("backend", "frontend")}}
+    backend, frontend = _inspect_pair(auth, control.project, compose)
+    process, process_raw, process_sha = _runtime_process_receipt(control, abrupt=True)
+    owner, owner_raw, owner_sha = _runtime_owner(control)
+    launch, launch_raw, launch_sha = _runtime_launch(control)
+    config, config_raw, config_sha = _runtime_config(control)
+    _validate_process_receipt_owner(process, owner)
+    _validate_owner_host(owner, backend)
+    raw_records = {}
+    for key, raw, sha, path in (
+        ("process_receipt", process_raw, process_sha, "runtime-service/process-tree.json"),
+        ("owner", owner_raw, owner_sha, "runtime-services/OWNER.json"),
+        ("launch", launch_raw, launch_sha, "runtime-services/LAUNCH.json"),
+        ("config", config_raw, config_sha, "runtime-service/docker-all.json")):
+        if pins[key + "_sha256"] != sha:
+            _fail(f"abrupt {key} bytes differ from operator pins")
+        raw_records[key] = {"path": RUNTIME_CONTROL_RELATIVE + "/" + path,
+                            "raw_utf8": raw.decode("utf-8"), "sha256": sha}
+    _assert_no_foreign_storage_consumers(control, backend, frontend, compose)
+    storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose,
+                                              retained_terminal_runs=retained_terminal_runs)
+    if _docker_engine_sha() != engine_sha:
+        _fail("Docker engine changed during abrupt proof preparation")
+    return {"schema": ABRUPT_PROOF_SCHEMA, "authorization_pins": pins,
+            "docker_engine_id_sha256": engine_sha, "raw_records": raw_records,
+            "containers": {"backend": backend, "frontend": frontend},
+            "network": _abrupt_network(backend, frontend, control.project),
+            "storage_proof": storage_proof,
+            "retained_terminal_runs": copy.deepcopy(retained_terminal_runs)}
+
+
+def validate_abrupt_stop_proof(proof, authorization, *, control=None, compose=None, transition=None):
+    """Validate archived originals; with control/compose also CAS current evidence.
+
+    The caller holds the group operation lock for the destructive-boundary call.
+    A prepared retry compares its manifest to the original archived observations
+    and revalidates all remaining containers before any further removal.
+    """
+    if set(proof) != {"schema", "authorization_pins", "docker_engine_id_sha256", "raw_records", "containers", "network", "storage_proof", "retained_terminal_runs"} or proof.get("schema") != ABRUPT_PROOF_SCHEMA:
+        _fail("abrupt stop proof does not match its frozen schema")
+    if proof["authorization_pins"] != _abrupt_authorization_pins(authorization):
+        _fail("abrupt proof operator pins differ")
+    _require_sha(proof["docker_engine_id_sha256"], "abrupt engine digest")
+    terminal_pins = proof["retained_terminal_runs"]
+    if terminal_pins is not None:
+        expected_recovery_outcome({"schema_version": TERMINAL_REQUEST_SCHEMA, "retained_terminal_runs": terminal_pins})
+    records = _require_mapping(proof["raw_records"], "abrupt raw records")
+    if set(records) != {"process_receipt", "owner", "launch", "config"}:
+        _fail("abrupt raw record inventory differs")
+    expected_paths = {"process_receipt": "runtime-service/process-tree.json", "owner": "runtime-services/OWNER.json", "launch": "runtime-services/LAUNCH.json", "config": "runtime-service/docker-all.json"}
+    decoded = {}
+    for key, item in records.items():
+        if not isinstance(item, Mapping) or set(item) != {"path", "raw_utf8", "sha256"} or not isinstance(item["raw_utf8"], str):
+            _fail("abrupt original record has an invalid shape")
+        raw = item["raw_utf8"].encode("utf-8")
+        if item["path"] != RUNTIME_CONTROL_RELATIVE + "/" + expected_paths[key] or _sha256(raw) != authorization[key + "_sha256"] or item["sha256"] != _sha256(raw):
+            _fail("abrupt original record bytes or path differ")
+        decoded[key] = _parse_json(raw, "abrupt original " + key)
+        if control is not None and _control_bytes(control, item["path"]) != raw:
+            _fail("abrupt raw proof is stale: " + key)
+    process = decoded["process_receipt"]
+    if process.get("schema") != "fullmag.docker-process-tree.v1" or process.get("state") not in {"ready", "shutdown_unknown"} or "startup_activation" in process:
+        _fail("abrupt archived process state is unsupported")
+    owner = _owner_for_native(decoded["owner"])
+    _validate_process_receipt_owner(process, owner)
+    containers = _require_mapping(proof["containers"], "abrupt archived containers")
+    if set(containers) != {"backend", "frontend"}:
+        _fail("abrupt archived service inventory differs")
+    for service, item in containers.items():
+        _strict_stopped(item)
+        pin = _container_pin(item, service, authorization["compose_project"])
+        if pin["container_id"] != authorization[service + "_container_id"] or pin["image_id"] != authorization["old_image_id"]:
+            _fail("abrupt archived container differs from authorization")
+    _validate_owner_host(owner, containers["backend"])
+    if control is not None:
+        if _docker_engine_sha() != proof["docker_engine_id_sha256"]:
+            _fail("abrupt Docker engine changed")
+        if transition is None:
+            current = _inspect_pair(authorization, control.project, compose)
+            if {"backend": current[0], "frontend": current[1]} != containers:
+                _fail("abrupt Docker observations changed")
+            if _abrupt_network(*current, control.project) != proof["network"]:
+                _fail("abrupt private network observations changed")
+        else:
+            if {"backend": transition["backend"], "frontend": transition["frontend"]} != containers:
+                _fail("prepared retry differs from original abrupt observations")
+            for service, item in transition["present"].items():
+                _strict_stopped(item)
+                if item != containers[service]:
+                    _fail("prepared retry Docker observations changed")
+            # Old containers may now be absent; network can only be absent or
+            # the exact owned bridge without consumers other than the old pair.
+            _abrupt_network(containers["backend"], containers["frontend"], control.project)
+        _assert_no_foreign_storage_consumers(control, containers["backend"], containers["frontend"], compose)
+        observed = _ledger_and_store_snapshot(control, containers["backend"], compose=compose, retained_terminal_runs=terminal_pins)
+        if observed != proof["storage_proof"]:
+            _fail("abrupt store/ledger snapshot changed")
+    return proof
 
 
 def _inspect_pair(
@@ -1084,10 +1567,15 @@ def _inspect_pair(
             _validate_retained_service(compose, item, service, image_config)
         except Exception as error:
             _fail(f"pinned {service} configuration or mount proof failed: {error}")
+        if _is_abrupt(authorization):
+            _strict_stopped(item)
         result[service] = item
     actual = {"backend": result["backend"], "frontend": result["frontend"]}
     try:
-        _assert_private_restart_network(actual, identifiers, project)
+        if _is_abrupt(authorization):
+            _abrupt_network(actual["backend"], actual["frontend"], project)
+        else:
+            _assert_private_restart_network(actual, identifiers, project)
     except Exception as error:
         _fail(f"pinned private network proof failed: {error}")
     backend_networks = _require_mapping(
@@ -1179,14 +1667,26 @@ def _network_name(container: Mapping[str, object], service: str) -> str:
 
 
 def _verify_network_after_removal(
-    network_name: str, old_container_ids: Sequence[str], project: str
+    network_name: str, old_container_ids: Sequence[str], project: str, *, abrupt: bool = False
 ) -> str:
     """Prove that removing the pinned pair did not leave another consumer."""
 
+    def absent_from_inventory():
+        result = docker_capture("network", "ls", "--no-trunc", "--format", "{{json .}}", timeout=60)
+        try:
+            rows = [json.loads(line) for line in result.stdout.decode().splitlines() if line.strip()]
+        except (UnicodeDecodeError, ValueError) as error:
+            _fail(f"post-removal network inventory is invalid: {error}")
+        if any(not isinstance(row, dict) or not isinstance(row.get("Name"), str) or not isinstance(row.get("ID"), str) for row in rows):
+            _fail("post-removal network inventory identities are missing")
+        return all(row["Name"] != network_name for row in rows)
+    absent_before = absent_from_inventory() if abrupt else None
     observed = docker_capture("network", "inspect", network_name, allow_failure=True, timeout=60)
     if observed.returncode:
-        error = observed.stderr.decode("utf-8", "replace").lower()
-        if "no such network" in error or "network not found" in error:
+        from docker_stopped_network import authoritative_network_not_found
+        if authoritative_network_not_found(observed, network_name):
+            if abrupt and (not absent_before or not absent_from_inventory()):
+                _fail("post-removal network absence conflicts with Docker inventory")
             return "absent"
         _fail("private Compose network could not be re-inspected after removal")
     try:
@@ -1284,6 +1784,13 @@ def _load_recovery_transition(
     if absence is not None and absence.get("request_id") != authorization["request_id"]:
         _fail("recovery absence sidecar request differs from authorization")
     request = validate_request(request)
+    if _is_abrupt(authorization):
+        proof, proof_raw = _control_json(control, authorization["stop_journal_path"])
+        if proof is None or proof_raw is None or _sha256(proof_raw) != authorization["stop_journal_sha256"]:
+            _fail("prepared abrupt proof bytes changed")
+        validate_abrupt_stop_proof(proof, authorization)
+        if request.get("retained_terminal_runs") != proof["retained_terminal_runs"]:
+            _fail("prepared request terminal pins differ from abrupt proof")
     if request.get("request_id") != authorization["request_id"] or request.get("docker_manifest_sha256") != manifest_sha:
         _fail("recovery transition request is not bound to its manifest")
     pins = _validate_container_pins(request.get("containers"))
@@ -1364,6 +1871,8 @@ def _load_recovery_transition(
                 _validate_retained_service(compose, current, service, image_config)
             except Exception as error:
                 _fail(f"recovery transition current {service} configuration changed: {error}")
+        if _is_abrupt(authorization):
+            _strict_stopped(current)
         present[service] = current
 
     if absence is not None:
@@ -1372,7 +1881,7 @@ def _load_recovery_transition(
             _fail("recovery transition network name changed")
         for identifier in old_ids:
             _assert_container_absent(identifier)
-        network_state = _verify_network_after_removal(network_name, old_ids, project)
+        network_state = _verify_network_after_removal(network_name, old_ids, project, abrupt=_is_abrupt(authorization))
         if absence.get("network_state") != network_state:
             _fail("recovery transition network absence proof changed")
     else:
@@ -1531,7 +2040,10 @@ def _revalidate_recovery_boundary(
         _fail("retained Compose document changed before the destructive boundary")
     if terminal.get("phase") != "development" or terminal.get("attempt") != attempt:
         _fail("retained development attempt changed before the destructive boundary")
-    _validate_pre_admission_stop_journal(journal, authorization, attempt)
+    if _is_abrupt(authorization):
+        validate_abrupt_stop_proof(journal, authorization)
+    else:
+        _validate_pre_admission_stop_journal(journal, authorization, attempt)
 
     current_transition = _load_recovery_transition(
         control, authorization, project, current_compose
@@ -1561,7 +2073,7 @@ def _revalidate_recovery_boundary(
         )
         if backend.get("Id") != expected_backend.get("Id") or frontend.get("Id") != expected_frontend.get("Id"):
             _fail("prepared recovery manifest changed before the destructive boundary")
-    process_receipt, _, process_receipt_sha = _runtime_process_receipt(control)
+    process_receipt, _, process_receipt_sha = _runtime_process_receipt(control, abrupt=_is_abrupt(authorization))
     if process_receipt_sha != expected_process_receipt_sha:
         _fail("shutdown_unknown process receipt changed before the destructive boundary")
     owner, owner_raw, owner_sha = _runtime_owner(control)
@@ -1607,8 +2119,11 @@ def _revalidate_recovery_boundary(
         _fail("Docker container images changed before the destructive boundary")
     if backend.get("Id") != expected_backend.get("Id") or frontend.get("Id") != expected_frontend.get("Id"):
         _fail("Docker inspection identities changed before the destructive boundary")
-    storage_proof = _ledger_and_store_snapshot(control, pinned_backend, compose=compose)
-    for key in ("store_root_sha256", "ledger_root_sha256", "ledger_snapshot_sha256"):
+    terminal_pins = journal.get("retained_terminal_runs") if _is_abrupt(authorization) else None
+    if _is_abrupt(authorization):
+        validate_abrupt_stop_proof(journal, authorization, control=control, compose=current_compose, transition=current_transition)
+    storage_proof = _ledger_and_store_snapshot(control, pinned_backend, compose=compose, retained_terminal_runs=terminal_pins)
+    for key in (set(storage_proof) | set(expected_storage)):
         if storage_proof.get(key) != expected_storage.get(key):
             _fail(f"storage proof {key} changed before the destructive boundary")
     return {
@@ -1673,7 +2188,11 @@ def _write_record(control: BuildControl, relative: str, value: Mapping[str, obje
     raw = _canonical(value)
     if len(raw) > MAX_DOCUMENT_BYTES:
         _fail(f"recovery record {relative} exceeds the document budget")
-    control.write_bytes(relative, raw)
+    previous = _control_bytes(control, relative, optional=True)
+    if previous is not None and previous != raw:
+        _fail("recovery history already contains different bytes: " + relative)
+    if previous is None:
+        control.write_bytes(relative, raw)
     return _sha256(raw), raw
 
 
@@ -1711,7 +2230,7 @@ def _runtime_authorization(
         "attestation_sha256": attestation_sha256,
         "manifest_path": f"{CONTROL_ROOT}/{manifest_relative}",
         "manifest_sha256": manifest_sha256,
-        "prior_stop_journal_sha256": operator["prior_stop_journal_sha256"],
+        "prior_stop_journal_sha256": operator["stop_journal_sha256"],
     }
     return validate_runtime_authorization(value)
 
@@ -1798,7 +2317,10 @@ def recover(args: argparse.Namespace) -> None:
         _fail("retained development, Compose or stop proof is missing")
     if _sha256(_canonical(compose)) != authorization["compose_config_sha256"] or _sha256(journal_raw) != authorization["stop_journal_sha256"]:
         _fail("retained Compose or stop journal bytes differ from authorization")
-    _validate_pre_admission_stop_journal(journal, authorization, attempt)
+    if _is_abrupt(authorization):
+        validate_abrupt_stop_proof(journal, authorization)
+    else:
+        _validate_pre_admission_stop_journal(journal, authorization, attempt)
     if terminal.get("phase") != "development" or terminal.get("attempt") != attempt:
         _fail("retained attempt is not the selected development operation")
     if compose.get("name") != control.project:
@@ -1812,7 +2334,7 @@ def recover(args: argparse.Namespace) -> None:
     else:
         backend, frontend = transition["backend"], transition["frontend"]
         network_name = transition["network_name"]
-    process_receipt, process_receipt_raw, process_receipt_sha = _runtime_process_receipt(control)
+    process_receipt, process_receipt_raw, process_receipt_sha = _runtime_process_receipt(control, abrupt=_is_abrupt(authorization))
     if process_receipt_sha != authorization["process_receipt_sha256"]:
         _fail("current shutdown_unknown process receipt differs from operator authorization")
     owner, owner_raw, observed_owner_sha = _runtime_owner(control)
@@ -1847,7 +2369,10 @@ def recover(args: argparse.Namespace) -> None:
         or pins[1]["image_id"] != authorization["old_image_id"]
     ):
         _fail("Docker container pins changed since authorization")
-    storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose)
+    terminal_pins = journal.get("retained_terminal_runs") if _is_abrupt(authorization) else None
+    if _is_abrupt(authorization):
+        validate_abrupt_stop_proof(journal, authorization, control=control, compose=compose, transition=transition)
+    storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose, retained_terminal_runs=terminal_pins)
     manifest = transition["manifest"] if transition is not None else _manifest(
         authorization, engine_sha, backend, frontend, pins, device_release, device_mapping
     )
@@ -1897,6 +2422,8 @@ def recover(args: argparse.Namespace) -> None:
             if group_ledger.is_group_ledger_backend(
                 compose.get("services", {}).get("backend", {}).get("environment", {}))
             else "host-ledger-v1")
+        if _control_bytes(control, authorization_reference) != authorization_raw:
+            _fail("operator authorization changed before the destructive boundary")
         fresh = _revalidate_recovery_boundary(
             control,
             authorization,
@@ -1959,11 +2486,12 @@ def recover(args: argparse.Namespace) -> None:
                 docker_engine_id_sha256=engine_sha,
                 manifest_sha256=manifest_sha,
                 containers=pins,
+                retained_terminal_runs=terminal_pins,
             )
             request_raw = _canonical(request)
             request_sha = _sha256(request_raw)
             request_relative = transition_root + "/request.json"
-            control.write_bytes(request_relative, request_raw)
+            _write_record(control, request_relative, request)
             prepared_sha, _ = _write_record(
                 control,
                 transition_root + "/prepared.json",
@@ -2026,6 +2554,7 @@ def recover(args: argparse.Namespace) -> None:
                 network_name,
                 [pin["container_id"] for pin in pins],
                 control.project,
+                abrupt=_is_abrupt(authorization),
             )
             absence_sha, _ = _write_record(
                 control,
@@ -2127,6 +2656,11 @@ __all__ = [
     "AUTHORIZATION_SCHEMA",
     "ATTESTATION_SCHEMA",
     "OPERATOR_AUTHORIZATION_SCHEMA",
+    "ABRUPT_OPERATOR_SCHEMA",
+    "ABRUPT_PROOF_SCHEMA",
+    "TERMINAL_REQUEST_SCHEMA",
+    "prepare_abrupt_stop_proof",
+    "validate_abrupt_stop_proof",
     "REQUEST_SCHEMA",
     "ContainerRecoveryError",
     "validate_authorization",

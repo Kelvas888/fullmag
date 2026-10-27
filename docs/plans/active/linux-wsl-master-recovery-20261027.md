@@ -1,0 +1,72 @@
+# Recovery mastera po ponownym uruchomieniu WSL
+
+Cel: zachować bieżącą sesję i wyniki, uruchomić `fullmag-master` na 3198 i sprawdzić w przeglądarce picker Quantity Source Airboxa bez Solve/Compute Fields.
+
+## Uzgodniony podział
+
+Ten branch odpowiada za jawne ponowne przyjęcie obecnego magazynu Linux po zmianie `st_dev`; zwykłe strażniki pozostają ścisłe. Branch `codex/docker-session-recovery-20261027` odpowiada za natywne odzyskanie zatrzymanego runtime i terminalnych runów. Nie edytujemy jego modułów runtime ani offline reconciliation. Grupa master pozostaje wyłącznie w zakresie tego zadania.
+
+## Kontrakt
+
+Legacy certyfikat nie ma UUID filesystemu. Readmisja nie udaje historycznego dowodu UUID: jawnie przyjmuje wskazany istniejący store. Zachowuje ścieżkę, inode, engine, owner token, image i provenance; dopuszcza wyłącznie przypiętą zmianę numeru urządzenia. Bieżący UUID zapisuje jako nową obserwację.
+
+Przed publikacją wymagane są: zarejestrowane źródła/grupa, dokładne piny attempt/config, stopped backend/frontend i ich obrazy, brak innych aktywnych konsumentów magazynu, SHA surowych cert/marker/probe/sentinel/restart oraz natywnego ownera/process receipt. Operacja grupy i blokada OWNER muszą objąć ponowną walidację i oba zapisy. Readmisja nie zmienia natywnego OWNER, runów, leases ani journalu i nie ogłasza drain.
+
+Najpierw zachować niezmienione bajty dowodów w control volume i manifest prepared. Potem opublikować identyczny certyfikat i marker zmienione tylko o host_device, wykonać readback i receipt committed. Przerwanie między zapisami pozostaje fail-closed; osobna przypięta kontynuacja nie może nadpisać archiwum. Zwykły start nadal odmawia rozbieżnych dokumentów. Po readmisji wymagany świeży zarządzany storage probe przed API, ponieważ stary probe przypina surowy certyfikat i namespace.
+
+## Kolejność i dowody
+
+1. Czysta walidacja readmisji i regresje Python: obcy token/inode/engine, dodatkowe różnice, symlink, zmiana bajtów po planie, brak/zmiana sentinel, błędne piny muszą blokować operację.
+2. Przypięty kontroler readmisji z trwałym archiwum i wznowieniem; review przed mutacją. Bez kompilowania testów jednostkowych.
+3. Zintegrowana natywna ścieżka odzyskania bez sztucznego stop journalu i bez Solve. Jeżeli brakuje obsługiwanej ścieżki, pozostawić blokadę i wskazać dokładną brakującą bramkę.
+4. Build i start przez launcher Compose wybranego mastera; dowód źródeł, grupy, receiptu i świeżego probe. Zachować sesję i wyniki.
+5. Przeglądarka: realny Airbox Quantity Source zawiera H_demag/H_eff/H_ext i wyklucza m. Zapisać disabled/reason niezależnie od obliczenia pól, screenshot i WebGL canvas/context/buffer.
+
+Aktualny stan: diagnoza potwierdzona, brak mutacji runtime i certyfikatów; implementacja rozpoczęta. Dane buildu i receipty pozostają w Dockerze. Hostowy dokument zawiera wyłącznie plan operacyjny.
+
+## Checkpoint walidatora
+
+Commit `350cce8fd330c52461a87a7caeaca66b8f3bc4a8`: czysty planner i CAS readmisji. 18 regresji Python PASS; planner na rzeczywistych niezmienionych dowodach mastera PASS (wyłącznie odczyt). Żaden certyfikat, OWNER ani store nie został zmieniony. Kontroler publikacji i abrupt-stop nadal w implementacji.
+
+## Checkpoint kontrolerów
+
+- `6c388f394d7ce649c74f8b7a04e9bb008c05fb5d`: operator v2, autentyczny abrupt-stop proof, request v3, przygotowanie bez startu i kwalifikacja aliasów zarejestrowanych grup. Regresje hostowego recovery, wrappera i mapowania zielone; dwa P1 review poprawione i ponownie przejrzane.
+- `feb092575b44ac075bd77457a45a1facf0dd8d78`: bridge v3, faktyczny binary capability gate i atomowy immutable proof. 19 testów runtime service i 5 istniejących bridge PASS. P2 publikacji po częściowym zapisie poprawiony. Native v3 dostarcza skoordynowany branch; jego integracja jest osobną wymaganą bramką.
+- Kontroler readmisji: 15 regresji Python PASS; review wyścigu RELEASED i klasyfikacji unknown poprawione. Jeszcze bez wykonania na runtime.
+
+Odczyt magazynu wykazał 17 runów: 2 cancelled, 3 failed, 10 succeeded i 2 accepted. Po audycie właścicieli wycofano propozycję anulowania dwóch przyjętych runów; nie zmieniamy ich statusu i nie rozszerzamy v3 do accepted. Zachowano inwentarz 1240 plików (około 1,55 GB), SHA 44 katalogów runów/artefaktów oraz metadane plików. Wstępny odczyt nie wykazał innego compute attempt niż bieżący catalog.
+
+Kwalifikacja obcych konsumentów pozostaje ścisła: odrębne aliasy są dopuszczane dopiero po potwierdzeniu źródeł. Sześć aliasowych konsumentów spoza Fullmaga wymaga osobnego dowodu odrębności. Nie są zatrzymywane. Walidator kernelowego dowodu tylko do odczytu został dodany i przeszedł 19 regresji Python; pojedynczy rzeczywisty probe odrębnego mountu pliku zakończył się decyzją disjoint. Pełny dry-run pozostaje osobną bramką.
+
+Master API, świeży probe i UI Airbox: nadal NOT VERIFIED; nie uruchomiono Solve ani Compute Fields i nie zmieniono certyfikatów, natywnego OWNER ani danych magazynu.
+
+## Korekta po audycie właścicieli: zachować ręcznie przygotowane modele
+
+Propozycja anulowania dwóch Accepted została wycofana przed wykonaniem. Jeden run pochodzi z celowo zachowanego podglądu głębi viewportu, drugi z podglądu Inspectora Airboxa w innym czacie. Ten drugi nadal jest wskazany przez checkpoint schedulera preparation. Nie ma podstaw uznać ich za zbędne; brak żywego kontenera nie oznacza porzucenia modelu. Oba mają typed manual-start policy, brak start_release.json, zero compute lease/admission i zakończone przygotowanie. Wszystkie dotychczasowe runy, statusy, checkpointy i wyniki pozostają niezmienione.
+
+### Warianty i decyzja techniczna
+
+Anulowanie zmienia intencję właścicieli; świeży store narusza zachowanie sesji, a pominięcie runów omija inventory. Pozostawienie mastera stopped jest bezpiecznym stanem do czasu kwalifikacji. W ramach autoryzowanej naprawy zachowującej sesję wybieramy osobny, wąski kontrakt v4 dla manual-held Accepted. Dotychczasowe v1/v2/v3 nie są rozluźniane.
+
+### Request v4 i warunki przyjęcia
+
+- schema runtime_service_container_recovery_request.v4; istniejące piny owner/config/launch/store/ledger/Docker namespace bezzmian.
+- retained_terminal_runs: 0..128 pinów v3; retained_held_manual_runs: co najmniej jeden pin {run_id, run_intent_sha256, run_catalog_sha256, start_release: absent}. Cancelled list nieobecna; suma rozłącznych list dokładnie pokrywa inventory, łącznie najwyżej 128.
+- Held wymaga poprawnej immutable manual policy, braku release, tasków Accepted/Blocked bez attempt/resource/resolved input/coordinator/artifact IDs. Cancellation intent, compute lease/admission/journal blokuje operację. Immutable CAS oraz terminalne preparation receipts/exit proofs/released leases są walidowane pod natywnymi blokadami.
+- v3 validator nadal wymaga pełnego terminal inventory. Tylko wewnętrzny per-run validator i bounded inventory mogą być współdzielone z v4; nie wywołujemy v3 na niepełnym podzbiorze.
+- Scheduler references są sprawdzane względem sumy obu list. Nie czyścimy checkpointów. Compute scheduler i API restore korzystają z istniejącego durable manual gate; recovery nie tworzy start_release ani nie odtwarza script/Compute/Fields.
+- Oddzielny outcome retained_manual_held_runs_recovered; host, bridge, absence/replay i faktyczny native capability probe muszą jawnie obsługiwać v4. Brak wsparcia blokuje bez fallbacku.
+
+### Odbiór
+
+Źródłowe regresje negatywne obejmą automatic policy, release, claimed/queued task, cancellation intent, input CAS drift, niepełny inventory, aktywne zasoby i błędne checkpoint references. Lokalny zakaz kompilacji unit tests pozostaje; użytkownik dopuścił wymagane testy tej skoordynowanej naprawy wyłącznie w GitHub CI, co potwierdzono przez odczyt bezpośredniej odpowiedzi.
+
+Po zarządzanym starcie trzeba osobno potwierdzić: te same 17 runów, dwa nadal Accepted/manual-held, identyczne wyniki i checkpointy, ten sam model/sesja, waiting_for_solve, brak release i brak Compute/Solve. Preparation jest przez istniejącą politykę dopuszczone, więc jego ewentualny ponowny start wymaga osobnej obserwacji; nie będzie przedstawiany jako brak jakiejkolwiek pracy. Dopiero potem kontrola Quantity Source Airboxa i WebGL.
+
+## Checkpoint wspólnej ścieżki host/bridge
+
+Przed odrębną integracją host/bridge dodano kernelowy dowód odrębności obcych bindów, archiwizowany pod operacją grupy przed mutacją, i użyto wspólnego obserwatora zatrzymanego bridge. Review nie wykazało nowych P1/P2. Regresje Python helpera: 19 PASS; kontrolera readmisji po poprawkach opaque EngineID, RFC3339Nano na Python 3.10 oraz braku /state we frontendzie: 23 PASS; abrupt-stop: 19 PASS. Wcześniejsze zielone suite pozostały aktualne dla niezmienionych modułów. Nie wykonano publikacji readmisji ani odzyskania native runtime.
+
+Wariant v4 jest kolejnym etapem: rzeczywisty zestaw terminalnych referencji CAS przekracza agregat 128 MiB v3, więc v4 wymaga własnego ograniczonego budżetu agregatu 1 GiB przy zachowaniu limitu pojedynczego obiektu 128 MiB i niezmienionych limitów v1/v2/v3. Katalog całego store oraz CAS muszą być sprawdzane względem sumy terminalnych i held runów. Niepodłączony moduł v4 nie należy do pierwszego PR host/bridge.
+
+Pełny rzeczywisty dry-run kontrolera readmisji zatrzymał się bez zapisów na działających obcych kontenerach z literalnymi ścieżkami Windows w Docker Mounts.Source. Bieżący adapter nie kwalifikuje tych ścieżek na Linux/WSL. Bramka pozostaje fail-closed; należy dodać osobny kwalifikowany adapter albo uzyskać naturalne zatrzymanie tych konsumentów przed execute. Nie jest to podstawa do ich zatrzymania lub pominięcia.
