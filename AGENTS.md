@@ -184,6 +184,12 @@ Szczegóły: [Docker development architecture](docs/guides/docker-development-ar
 
 Nowy launcher używa project-scoped wolumenów `fullmag-shared-*` dla pakietów,
 Cargo i pnpm. Zasady oraz utrzymanie: [shared build storage](docs/guides/shared-build-storage.md).
+Retencję po gotowości API uruchamia nowy obraz również przy zwykłym restarcie
+kontenera. Starsze worktree migruj aktualnym launcherem przez przypiętą parę
+`--helper-source-root`/`--helper-source-commit`; nie nadpisuj ich źródeł aplikacji.
+Przed każdym recreate ponów kontrolę aktywności i receipts. Działające grupy
+innych wątków odłóż do ich naturalnego zatrzymania; brak drain lub osierocony
+lease wymaga właściwego recovery, bez kasowania markerów i powtarzania Solve.
 Kompilacja nadal należy do grupy wybranego checkoutu; Cargo target/CMake,
 node_modules i `.next` pozostają prywatne. Przy cleanupie pojedynczego zadania
 nie usuwaj całego `fullmag-shared-*`; prywatny package jest subpath

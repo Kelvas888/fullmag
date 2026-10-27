@@ -450,7 +450,14 @@ export async function ensureEmbedAssets(
   await mkdir(targetStaticDir, { recursive: true });
 
   await Promise.all(
-    ["fullmag-embed.css", "fullmag-embed.js", "fullmag-docs.css", "status-navigation.js"].map(
+    [
+      "fullmag-embed.css",
+      "fullmag-embed.js",
+      "fullmag-docs.css",
+      "documentation-changelog.css",
+      "page-last-modified.css",
+      "status-navigation.js",
+    ].map(
       async (assetName) => {
         const srcAsset = join(staticSourceDir, assetName);
         if (existsSync(srcAsset)) {
