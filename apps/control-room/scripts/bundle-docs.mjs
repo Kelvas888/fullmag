@@ -282,20 +282,17 @@ export async function findBuiltDocsSource({
     existsSync(resolve(currentRepoRoot, "public_docs/site/physics/index.md")) &&
     existsSync(resolve(currentRepoRoot, "public_docs/site/changelog/index.md"));
 
-  for (const candidate of candidates) {
-    if (!(await hasBuiltDocs(candidate))) {
-      continue;
-    }
-    if (
-      requiresV2Sections &&
-      (!existsSync(join(candidate, "physics/index.html")) ||
-        !existsSync(join(candidate, "changelog/index.html")))
-    ) {
-      continue;
-    }
-    return candidate;
-  }
-  return null;
+  const checks = await Promise.all(
+    candidates.map(async (candidate) => ({
+      candidate,
+      valid:
+        (await hasBuiltDocs(candidate)) &&
+        (!requiresV2Sections ||
+          (existsSync(join(candidate, "physics/index.html")) &&
+            existsSync(join(candidate, "changelog/index.html")))),
+    })),
+  );
+  return checks.find((entry) => entry.valid)?.candidate ?? null;
 }
 
 function findSphinxCommand(currentRepoRoot = repoRoot) {
@@ -429,17 +426,20 @@ export async function tryBuildSphinxDocs({
 
 async function collectHtmlFiles(dir, currentRel = "") {
   const entries = await readdir(dir, { withFileTypes: true });
-  const files = [];
-  for (const entry of entries) {
-    const relPath = currentRel ? `${currentRel}/${entry.name}` : entry.name;
-    const fullPath = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...(await collectHtmlFiles(fullPath, relPath)));
-    } else if (entry.isFile() && entry.name.endsWith(".html")) {
-      files.push({ fullPath, relPath });
-    }
-  }
-  return files;
+  const nested = await Promise.all(
+    entries.map(async (entry) => {
+      const relPath = currentRel ? `${currentRel}/${entry.name}` : entry.name;
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        return collectHtmlFiles(fullPath, relPath);
+      }
+      if (entry.isFile() && entry.name.endsWith(".html")) {
+        return [{ fullPath, relPath }];
+      }
+      return [];
+    }),
+  );
+  return nested.flat();
 }
 
 export async function ensureEmbedAssets(
@@ -449,23 +449,29 @@ export async function ensureEmbedAssets(
   const targetStaticDir = join(targetDir, "_static");
   await mkdir(targetStaticDir, { recursive: true });
 
-  for (const assetName of ["fullmag-embed.css", "fullmag-embed.js", "fullmag-docs.css", "status-navigation.js"]) {
-    const srcAsset = join(staticSourceDir, assetName);
-    if (existsSync(srcAsset)) {
-      await cp(srcAsset, join(targetStaticDir, assetName), { force: true });
-    }
-  }
+  await Promise.all(
+    ["fullmag-embed.css", "fullmag-embed.js", "fullmag-docs.css", "status-navigation.js"].map(
+      async (assetName) => {
+        const srcAsset = join(staticSourceDir, assetName);
+        if (existsSync(srcAsset)) {
+          await cp(srcAsset, join(targetStaticDir, assetName), { force: true });
+        }
+      },
+    ),
+  );
 
   const htmlFiles = await collectHtmlFiles(targetDir);
-  for (const { fullPath, relPath } of htmlFiles) {
-    const depth = relPath.split("/").length - 1;
-    const relativePrefix = depth > 0 ? "../".repeat(depth) : "";
-    const original = await readFile(fullPath, "utf-8");
-    const updated = injectEmbedAssetsHtml(original, relativePrefix);
-    if (updated !== original) {
-      await writeFile(fullPath, updated, "utf-8");
-    }
-  }
+  await Promise.all(
+    htmlFiles.map(async ({ fullPath, relPath }) => {
+      const depth = relPath.split("/").length - 1;
+      const relativePrefix = depth > 0 ? "../".repeat(depth) : "";
+      const original = await readFile(fullPath, "utf-8");
+      const updated = injectEmbedAssetsHtml(original, relativePrefix);
+      if (updated !== original) {
+        await writeFile(fullPath, updated, "utf-8");
+      }
+    }),
+  );
 }
 
 async function fetchWithTimeout(url, timeoutMs = 15_000) {
