@@ -759,6 +759,34 @@ def select_loopback_port(preferred, project, *, attempts=64):
     )
 
 
+_NO_SUCH_CONTAINER = re.compile(
+    r"(?:error(?: response from daemon)?: )?no such (?:object|container): [0-9a-f]{12,64}",
+    re.IGNORECASE,
+)
+
+
+def _inspect_running_containers(attempts=3):
+    """Inspect the running containers as one consistent snapshot.
+
+    Other DEV groups start and remove short-lived helper containers all the
+    time; one that disappears between ``docker ps`` and ``docker inspect``
+    makes the whole inspect fail although it can no longer own a port. Take a
+    fresh snapshot in that case; any other failure is reported unchanged.
+    """
+    for attempt in range(attempts):
+        running_ids = [value for value in docker("ps", "--quiet").splitlines() if value.strip()]
+        if not running_ids:
+            return []
+        try:
+            return json.loads(docker("inspect", *running_ids))
+        except ValueError as error:
+            lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+            vanished = bool(lines) and all(_NO_SUCH_CONTAINER.fullmatch(line) for line in lines)
+            if not vanished or attempt + 1 == attempts:
+                raise
+    raise AssertionError("unreachable")
+
+
 def assert_loopback_port_available(port, project):
     """Reject host listeners before any runtime state mutation."""
 
@@ -772,11 +800,8 @@ def assert_loopback_port_available(port, project):
             f"Requested loopback port {port} is already bound by native Windows: "
             + ", ".join(native_conflicts)
         )
-    running_ids = [value for value in docker("ps", "--quiet").splitlines() if value.strip()]
-    if not running_ids:
-        return
     try:
-        documents = json.loads(docker("inspect", *running_ids))
+        documents = _inspect_running_containers()
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise ValueError("Could not inspect running Docker containers for port ownership") from error
     if not isinstance(documents, list):

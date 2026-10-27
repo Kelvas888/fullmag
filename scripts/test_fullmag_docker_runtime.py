@@ -4323,6 +4323,33 @@ class DockerRuntimeContract(unittest.TestCase):
             mkdir.assert_not_called()
 
 
+class RunningContainerInspectionTests(unittest.TestCase):
+    def test_container_that_vanished_after_listing_takes_a_fresh_snapshot(self):
+        calls = []
+
+        def docker(*args, **kwargs):
+            calls.append(args)
+            if args[0] == "ps":
+                return "a" * 12 + "\n" + "b" * 12 if len(calls) == 1 else "a" * 12
+            if args[0] == "inspect" and len(args) == 3:
+                raise ValueError("Error: No such object: " + "b" * 12)
+            return json.dumps([{"Id": "a" * 12}])
+
+        with patch.object(runtime, "docker", side_effect=docker):
+            self.assertEqual(runtime._inspect_running_containers(), [{"Id": "a" * 12}])
+        self.assertEqual([call[0] for call in calls], ["ps", "inspect", "ps", "inspect"])
+
+    def test_other_inspection_failures_are_not_retried(self):
+        def docker(*args, **kwargs):
+            if args[0] == "ps":
+                return "a" * 12
+            raise ValueError("permission denied")
+
+        with patch.object(runtime, "docker", side_effect=docker):
+            with self.assertRaises(ValueError):
+                runtime._inspect_running_containers()
+
+
 class BackendBinaryAttestationTests(unittest.TestCase):
     """The in-container digest script accepts shared sealed hardlinks only."""
 
