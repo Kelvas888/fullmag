@@ -205,7 +205,9 @@ class DockerDevelopmentShellBoundaryTests(unittest.TestCase):
         stopped = self.dispatch(base + suffix + ' --stop-only')
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(json.loads(stopped.stdout)[-1], '--stop-only')
-        self.assertEqual(self.dispatch(base + ' --stop-only').returncode, 2)
+        plain_stop = self.dispatch(base + ' --stop-only')
+        self.assertEqual(plain_stop.returncode, 0, plain_stop.stderr)
+        self.assertEqual(json.loads(plain_stop.stdout)[-1], '--stop-only')
         for changed in (suffix.split(' --saved-authoring-checkpoint-sha256')[0],
                         suffix + '; printf injected', suffix.replace('c' * 64, 'bad')):
             result = self.dispatch(base + changed)

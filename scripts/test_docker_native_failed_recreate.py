@@ -572,6 +572,7 @@ class CompletedRecreationContinuationTests(unittest.TestCase):
         # Calling the real retained-operation branch must return through start
         # before Compose ps/inspect tries to find the deliberately removed IDs.
         import types,docker_dev as cli,docker_build_control as build
+        import docker_volume_cancelled_activation_guard as cancelled
         self.args.repo_root=self.root;self.args.source_root=self.selected;self.args.port=3202
         def read_control(relative, *, optional=False):
             records = {
@@ -584,9 +585,10 @@ class CompletedRecreationContinuationTests(unittest.TestCase):
                 return None
             raise AssertionError('unexpected required control read: ' + relative)
         self.control.read.side_effect=read_control
-        with patch.object(cli,'_require_native_windows'),patch.object(cli,'_select_source',return_value=(self.selected,{'runtime_root':self.root})),patch.object(cli,'_compose_identity',return_value={}),patch.object(build,'toolchain_configuration',return_value={'services':{'fem-gpu-toolchain':{'build':{'args':{'FULLMAG_CUDA_BASE_IMAGE':'fixture'}}}}}),patch.object(dev,'BuildControl',return_value=self.control),patch.object(dev,'_operator_probe_record_from_retained',return_value={}),patch.object(dev,'_completed_recreation_start_context',return_value={'reuse_state':{'state':self.state},**self.recovery}),patch.object(dev,'start',return_value='continued') as start,patch.object(dev,'compose_capture') as compose:
+        with patch.object(cli,'_require_native_windows'),patch.object(cli,'_select_source',return_value=(self.selected,{'runtime_root':self.root})),patch.object(cli,'_compose_identity',return_value={}),patch.object(build,'toolchain_configuration',return_value={'services':{'fem-gpu-toolchain':{'build':{'args':{'FULLMAG_CUDA_BASE_IMAGE':'fixture'}}}}}),patch.object(dev,'BuildControl',return_value=self.control),patch.object(dev,'_operator_probe_record_from_retained',return_value={}),patch.object(dev,'_completed_recreation_start_context',return_value={'reuse_state':{'state':self.state},**self.recovery}),patch.object(dev,'start',return_value='continued') as start,patch.object(dev,'compose_capture') as compose,patch.object(cancelled,'_read_control_bytes',return_value=None) as read_cancelled:
             result=dev._retained_operation(self.args,recreate_services=True)
         self.assertEqual(result,'continued');start.assert_called_once();compose.assert_not_called();self.assertEqual(self.args.gpu_access,'required')
+        read_cancelled.assert_called_once_with(self.control,cancelled.RECORD,optional=True)
     def test_fixed_shell_recipe_preserves_both_continuation_pins_with_spaces(self):
         import subprocess
         root=Path(__file__).resolve().parents[1];shell=(root/'scripts/just_storage_shell.sh').read_text()

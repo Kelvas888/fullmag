@@ -179,3 +179,50 @@ ponownego użycia istniejącego FMVP z obowiązkową maską są w control volume
 projekt: brak próbki musi pozostać brakiem, norma następuje po interpolacji
 wektora, cztery piny właściciela i maska muszą być spójne przed prezentacją.
 Nie wdrożono w tym przyroście nowego endpointu, codec ani przekroju UI.
+
+
+## Drugi CI i kolejne korekty fixture
+
+Dla wypchniętego HEAD `c76eaf2e0bf782c8e5b0c0807be7e38e77e275f0`
+potwierdzono w pełnych logach CI: source-contracts 1821 PASS, 0 FAIL,
+1 ignored; Control Room 873 pliki PASS, 1 skipped, 9117 testów PASS,
+13 skipped oraz osobne 3 microbench PASS. Przeszły także generated API,
+browser-fixture-smoke i inspector-actions-browser-smoke. To dowody CI dla
+wskazanego commita, a nie kwalifikacja rzeczywistego Saved viewportu.
+Ostatni dostępny odczyt całego zestawu: 19 success, 2 failure,
+10 skipped, 1 in progress; nie przedstawiamy go jako wyniku końcowego.
+
+Pozostałe zakończone błędy dotyczyły fixture Python i testu start-policy Rust.
+W tej korekcie nie zmieniono produkcyjnego runtime, parserów, bramki Compute,
+solverów ani tolerancji:
+
+- testy retained recreation uwzględniają opcjonalny odczyt rejestru cancelled
+  activation i sprawdzają dokładne wywołanie;
+- frontend resume odtwarza aktualny przypadek OOM, zachowuje backend/package/
+  process/incarnation fences, odrzuca non-OOM i sprawdza brak buildu oraz
+  zmiany generacji; prawdziwy helper resume pozostaje wykonywany;
+- test shell uznaje zwykłe `--stop-only`, które już generuje justfile;
+  niekompletne piny i shell injection pozostają odrzucane;
+- test źródła siatki odrzuca nie-NPZ, zgodnie z istniejącym owner-bound API,
+  zamiast twierdzić, że wszystkie importy siatki są niedostępne;
+- test inspekcji akceptuje oba kanoniczne tryby `manual`/`automatic`, a jako
+  błędne sprawdza null, obcy schemat, nieznany tryb i dodatkowe pole.
+  Durable exact Compute release i produkcyjny kod workera są niezmienione.
+
+Lokalne dowody: cztery rodziny Python 64 + 14 + 5 + 15 = 98 PASS,
+0 FAIL, 0 SKIP; pojedynczy test nie-NPZ 1 PASS. Parser Python i parser Rust
+(rustfmt emit stdout) PASS. Testów Rust nie kompilowano i nie uruchamiano
+lokalnie. Niezależny przegląd polityki startu: 0 Required/Blocker.
+Dowody w control volume pod `verification/pr247-ci-c76e-20261027/`:
+`frozen-four-fixtures-final-review.json` SHA256
+`c36b9021a8693db9945d0fbd1c815878eade0447ea2dbc0492642efbec6f373e`,
+`start-policy-review.json`, `start-policy-source-check.json`,
+`non-npz-source-focused.json` oraz pełne logi.
+
+Szerszy lokalny przegląd Python ujawnił ograniczenia środowiska (brak montażu
+wspólnej `.git`, różnice UID/cache oraz timeouty cięższych fixture).
+Nie zmieniono produkcji ani nie podmieniono metadanych Git w celu ich ukrycia.
+Pełny nowy CI jest nadal wymagany. Windows gh zwrócił HTTP 401; ważności
+logowania nie zakładamy. Odczyt `git ls-remote` potwierdził branch PR na c76e
+oraz nowszy master `cc91b2550767e73f3b059ff94fdff466a77e46ef`.
+Wyniki, FMS, cache, grupa 3203 i pełny zakres E0–E12 pozostają zachowane.

@@ -4522,10 +4522,12 @@ mod closed_loop_run_parameter_tests {
                 "sha256": "f".repeat(64),
             });
             validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
-            specification.parameters[fullmag_session::ACCEPTED_RUN_START_POLICY_KEY] = json!({
-                "schema_version": "accepted_run_start_policy.v1", "mode": "manual",
-            });
-            validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
+            for mode in ["manual", "automatic"] {
+                specification.parameters[fullmag_session::ACCEPTED_RUN_START_POLICY_KEY] = json!({
+                    "schema_version": "accepted_run_start_policy.v1", "mode": mode,
+                });
+                validate_accepted_inspection_run_parameters(&specification, "inspect").unwrap();
+            }
         }
     }
 
@@ -4545,11 +4547,16 @@ mod closed_loop_run_parameter_tests {
             specification.parameters["live_workspace"]["execution_input"] = identity;
             assert!(validate_accepted_inspection_run_parameters(&specification, "inspect").is_err());
         }
-        let mut specification = startup();
-        specification.parameters[fullmag_session::ACCEPTED_RUN_START_POLICY_KEY] = json!({
-            "schema_version": "accepted_run_start_policy.v1", "mode": "automatic",
-        });
-        assert!(validate_accepted_inspection_run_parameters(&specification, "inspect").is_err());
+        for policy in [
+            json!(null),
+            json!({"schema_version": "unknown", "mode": "manual"}),
+            json!({"schema_version": "accepted_run_start_policy.v1", "mode": "unknown"}),
+            json!({"schema_version": "accepted_run_start_policy.v1", "mode": "manual", "extra": true}),
+        ] {
+            let mut specification = startup();
+            specification.parameters[fullmag_session::ACCEPTED_RUN_START_POLICY_KEY] = policy;
+            assert!(validate_accepted_inspection_run_parameters(&specification, "inspect").is_err());
+        }
     }
 
     #[test]

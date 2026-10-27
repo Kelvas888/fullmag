@@ -10,6 +10,7 @@ from unittest import mock
 
 import docker_dev
 import docker_volume_dev as dev
+import docker_volume_cancelled_activation_guard as cancelled
 import fullmag_docker_runtime as runtime
 import test_docker_native_failed_recreate as completed_fixtures
 import test_docker_volume_pending_resume as resume_fixtures
@@ -167,6 +168,7 @@ class RetainedDeviceLifecycleTests(unittest.TestCase):
                     mock.patch.object(dev, '_completed_recreation_start_context', return_value=current),
                     mock.patch.object(dev.storage, 'validate_path', side_effect=AfterHandoff),
                     mock.patch.object(dev, '_start_compose_services'),
+                    mock.patch.object(cancelled, '_read_control_bytes', return_value=None),
                 ]
                 with ExitStack() as stack:
                     handles = [stack.enter_context(patch) for patch in patches]
@@ -179,6 +181,7 @@ class RetainedDeviceLifecycleTests(unittest.TestCase):
                             dev.start(args, reuse_state=reuse, retained_device_access='gpu')
                         handles[14].assert_not_called()
                 handles[15].assert_not_called()
+                handles[16].assert_called_once_with(control, cancelled.RECORD, optional=True)
                 control.write.assert_not_called()
                 self.assertEqual(args.gpu_access, 'auto')
 
