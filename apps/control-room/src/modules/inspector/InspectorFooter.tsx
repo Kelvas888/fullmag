@@ -38,7 +38,7 @@ export function InspectorFooter({
     setError(null);
     try {
       if (action === "apply") {
-        if (!(await owner.apply())) setError("Changes were not applied. Review the panel before trying again.");
+        if (!(await owner.apply())) setError("Apply did not finish. Review the panel before trying again.");
       } else {
         await owner.reset();
       }

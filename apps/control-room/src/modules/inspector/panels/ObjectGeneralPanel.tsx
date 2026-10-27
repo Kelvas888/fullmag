@@ -831,7 +831,19 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
       const hasGeometryChanges =
         !geometryDraftGeometryEquals(editState.draft, acknowledgedDraft) ||
         !geometryDraftTranslationEquals(editState.draft, acknowledgedDraft);
-      if (hasGeometryChanges) return applyObjectEditPatch(identityAck);
+      if (hasGeometryChanges) {
+        const geometryApplied = await applyObjectEditPatch(identityAck);
+        if (
+          !geometryApplied &&
+          (kernel.commands.getSessionScopeKey() ?? null) === sessionScopeKey &&
+          kernel.objectEditSession.getSnapshot().identity === editState.identity
+        ) {
+          throw new Error(
+            "Object identity was committed. Geometry and placement could not be confirmed. Review the draft and panel feedback before retrying Apply.",
+          );
+        }
+        return geometryApplied;
+      }
       return true;
     }
 
