@@ -120,7 +120,12 @@ def _ensure_no_links(root, relative):
 
 
 def _read_tree(root, commit, paths, *, recursive_scripts=False):
-    pathspecs = (["scripts"] if recursive_scripts else []) + [":(literal)" + name for name in paths]
+    # The recursive directory already covers every script. Repeating its full
+    # Python inventory can exceed CreateProcess command-line limits on Windows.
+    pathspecs = (["scripts"] if recursive_scripts else []) + [
+        ":(literal)" + name for name in paths
+        if not recursive_scripts or (name != "scripts" and not name.startswith("scripts/"))
+    ]
     raw = _git(root, "ls-tree", "-r", "-z", "--full-tree", commit, "--", *pathspecs)
     tree = {}
     for record in raw.split(b"\0"):
@@ -136,7 +141,12 @@ def _read_tree(root, commit, paths, *, recursive_scripts=False):
 
 
 def _read_index(root, paths, *, recursive_scripts=False):
-    pathspecs = (["scripts"] if recursive_scripts else []) + [":(literal)" + name for name in paths]
+    # The recursive directory already covers every script. Repeating its full
+    # Python inventory can exceed CreateProcess command-line limits on Windows.
+    pathspecs = (["scripts"] if recursive_scripts else []) + [
+        ":(literal)" + name for name in paths
+        if not recursive_scripts or (name != "scripts" and not name.startswith("scripts/"))
+    ]
     raw = _git(root, "ls-files", "--stage", "-z", "--", *pathspecs)
     index = {}
     for record in raw.split(b"\0"):
