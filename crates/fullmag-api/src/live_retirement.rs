@@ -224,6 +224,27 @@ impl LiveRetirementRequest {
 /// trusts that lock as a resource proof: it re-reads the native store, exact
 /// local leases, and host ledger itself.
 pub(crate) async fn retire_current_live(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: Json<LiveRetirementRequest>,
+) -> Result<Json<LiveRetirementResponse>, ApiError> {
+    let operation_id = request.operation_id.clone();
+    let result = retire_current_live_checked(state, headers, request).await;
+    // The launcher quarantines an activation on any rejection outside its
+    // no-mutation codes; keep the API's reason beside that receipt.
+    if let Err(error) = &result {
+        tracing::warn!(
+            operation_id = %operation_id,
+            status = %error.status,
+            code = ?error.code,
+            message = %error.message,
+            "live workspace retirement rejected"
+        );
+    }
+    result
+}
+
+async fn retire_current_live_checked(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(request): Json<LiveRetirementRequest>,
