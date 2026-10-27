@@ -97,6 +97,7 @@ import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FormField } from "../primitives/FormField";
 import { FieldRow } from "../primitives/FieldRow";
 import { InspectorGroup } from "../primitives/InspectorGroup";
+import { colorValueLabel, isThemeColorToken } from "@/shared/color/colorValueLabel";
 import { InspectorPropertyRow } from "../primitives/InspectorPropertyRow";
 
 const GEOMETRY_SCOPES = [
@@ -1290,8 +1291,10 @@ export function ColorField({
             controlVariants({ density: "compact" }),
           )}
           disabled={disabled}
+          placeholder={colorValueLabel(value)}
+          title={value}
           type="text"
-          value={value}
+          value={isThemeColorToken(value) ? "" : value}
           onChange={(event) => onChange(event.currentTarget.value)}
         />
       </div>

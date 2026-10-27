@@ -42,17 +42,18 @@ import {
   resolveRuntimeUserSolvePhase,
   type RuntimeUserSolvePhase,
 } from "@/kernel/runtime/runtimeStateDisplay";
-import { useAwaitingComputeCommand } from "@/kernel/runtime/useAwaitingComputeCommand";
-import { Button } from "@/shared/ui/Button";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
 import { formatTorqueT } from "@/shared/domain/physics/torqueUnits";
 import { hasEmptyObjectMagneticModel } from "@/shared/domain/physics/objectMagneticModel";
 
-const INTEGER_FORMAT = new Intl.NumberFormat("en-US", {
+// UI display locale only. Scientific values and exports keep their existing
+// invariant serialization and are not routed through this formatter.
+const UI_NUMBER_LOCALE = "en-US";
+const INTEGER_FORMAT = new Intl.NumberFormat(UI_NUMBER_LOCALE, {
   maximumFractionDigits: 0,
 });
-const COMPACT_DECIMAL_FORMAT = new Intl.NumberFormat("en-US", {
+const COMPACT_DECIMAL_FORMAT = new Intl.NumberFormat(UI_NUMBER_LOCALE, {
   maximumFractionDigits: 6,
 });
 
@@ -128,10 +129,6 @@ export function FooterTelemetry({
   const stageExecutionUnpublished =
     stageExecution.data === null &&
     (stageExecution.status === "ready" || stageExecution.status === "idle");
-  const compute = useAwaitingComputeCommand({
-    enabled: userSolvePhase === "awaiting_user_solve",
-    sourceDetail: "footer.awaiting-compute",
-  });
   const telemetry = buildFooterTelemetryModel(
     status,
     objectId && objectMetrics.data?.object_id === objectId ? objectMetrics.data : null,
@@ -150,7 +147,7 @@ export function FooterTelemetry({
   );
 
   return (
-    <div className="fm-footer-telemetry" role="status" aria-label="Live telemetry">
+    <div className="fm-footer-telemetry" role="region" aria-label="Simulation telemetry">
       <div className="fm-footer-telemetry__strip">
         <span
           className="fm-footer-telemetry__strip-dot"
@@ -164,19 +161,6 @@ export function FooterTelemetry({
         <span className="text-fm-xs text-fm-secondary whitespace-nowrap truncate">
           {telemetry.onlineTitle}
         </span>
-        {telemetry.awaitingCompute ? (
-          <Button
-            aria-disabled={compute.disabledReason !== null || compute.pending}
-            className="fm-footer-telemetry__compute-cta flex-shrink-0"
-            onClick={compute.run}
-            size="sm"
-            title={compute.title}
-            type="button"
-            variant="primary"
-          >
-            {compute.pending ? "Submitting…" : "Compute"}
-          </Button>
-        ) : null}
         {telemetry.frequencyDomainProgress ? (
           <>
             <span className="w-px h-3 bg-fm-subtle flex-shrink-0 mx-fm-1" aria-hidden="true" />
@@ -196,11 +180,11 @@ export function FooterTelemetry({
         ) : null}
       </div>
 
-      <div className="fm-footer-telemetry__metrics-grid" aria-label="Runtime metrics">
+      <div className="fm-footer-telemetry__metrics"><div className="fm-footer-telemetry__metrics-grid" aria-label="Runtime metrics">
         {telemetry.metrics.map((metric) => (
           <TelemetryMetric key={metric.id} group={metricGroup(metric.id)} {...metric} />
         ))}
-      </div>
+      </div></div>
     </div>
   );
 }
@@ -422,7 +406,7 @@ export function buildFooterTelemetryModel(
     scalarSampleNumber(liveRow, "time") ??
     solverStatus?.sim_time_seconds ??
     status?.run?.solver_time ??
-    0;
+    null;
   const pseudoTimeSeconds =
     scalarSampleNumber(liveRow, "pseudo_time_s") ??
     solverStatus?.pseudo_time_seconds ??
@@ -438,7 +422,7 @@ export function buildFooterTelemetryModel(
     solverStatus?.step_index ??
     status?.run?.solver_steps ??
     status?.metrics?.total_steps ??
-    0;
+    null;
   const stepsPerSecond = status?.metrics?.steps_per_second;
   const maxTorqueT =
     scalarSampleNumber(liveRow, "max_torque_T") ??
@@ -455,7 +439,10 @@ export function buildFooterTelemetryModel(
   const dtSuggested =
     scalarSampleNumber(liveRow, "dt_suggested") ?? solverStatus?.dt_suggested_seconds ?? null;
   const rejectedAttempts =
-    scalarSampleNumber(liveRow, "rejected_attempts") ?? solverStatus?.rejected_attempts ?? 0;
+    scalarSampleNumber(liveRow, "rejected_attempts") ?? solverStatus?.rejected_attempts ?? null;
+  const rejectedAttemptsLabel = rejectedAttempts === null
+    ? "Rejected attempts unavailable"
+    : `${formatInteger(rejectedAttempts)} rejected`;
   const converged = solverStatus?.converged ?? status?.solver?.converged;
   const scalarEnergy = {
     anisotropy: scalarSampleNumber(liveRow, "e_ani"),
@@ -506,12 +493,12 @@ export function buildFooterTelemetryModel(
     };
   };
   const timeSource = liveRow
-    ? `Scalar rev ${String(scalarSample?.revision ?? "")}`
+    ? `Scalar revision ${String(scalarSample?.revision ?? "unavailable")}`
     : solverStatus
-      ? "Last sync: solver status"
+      ? "Source: solver status"
       : status
-        ? "Last sync: status"
-        : "Last sync: pending";
+        ? "Source: session status"
+        : "Source unavailable";
   const frequencyDomainProgress = buildFrequencyDomainProgress({
     responseProgress,
     responseSweep,
@@ -539,7 +526,8 @@ export function buildFooterTelemetryModel(
         id: "time",
         label: usesPseudoTime ? "Pseudo time" : "Sim time",
         subdetail: timeSource,
-        value: formatDuration(primaryTimeSeconds),
+        unit: "s",
+        value: formatScientific(primaryTimeSeconds, "—"),
       },
       ...(usesPseudoTime
         ? [
@@ -549,7 +537,8 @@ export function buildFooterTelemetryModel(
               id: "sim-time",
               label: "Sim time",
               subdetail: timeSource,
-              value: formatDuration(simTimeSeconds),
+              unit: "s",
+              value: formatScientific(simTimeSeconds, "—"),
             },
           ]
         : []),
@@ -571,7 +560,8 @@ export function buildFooterTelemetryModel(
         id: "rate",
         label: "End-to-end rate",
         subdetail: `${formatInteger(totalSteps)} steps`,
-        value: formatFixed(stepsPerSecond, 1, "0.0"),
+        unit: "steps/s",
+        value: formatFixed(stepsPerSecond, 1, "—"),
       },
 
       {
@@ -583,11 +573,12 @@ export function buildFooterTelemetryModel(
           liveRow
             ? simTimeSeconds
             : objectMetrics?.time_seconds ?? simTimeSeconds,
-          "0.000000e+0",
+          "—",
         )} s`,
         value: formatInteger(
           liveRow ? totalSteps : objectMetrics?.step ?? totalSteps,
         ),
+        unit: "steps",
       },
       {
         detail: usesPseudoTime ? "Minimizer pseudotime step" : "Solver timestep",
@@ -605,8 +596,8 @@ export function buildFooterTelemetryModel(
               icon: <Gauge size={14} aria-hidden="true" />,
               id: "solver-error",
               label: "Error",
-              subdetail: `${formatInteger(rejectedAttempts)} rejected; next dt ${formatScientific(dtSuggested, "0.000000e+0")} s`,
-              value: formatScientific(errorEstimate, "0.000000e+0"),
+              subdetail: `${rejectedAttemptsLabel}; next dt ${formatScientific(dtSuggested, "—")} s`,
+              value: formatScientific(errorEstimate, "—"),
             },
             {
               detail: "Adaptive acceptance threshold",
@@ -616,7 +607,7 @@ export function buildFooterTelemetryModel(
               subdetail: errorEstimate !== null && maxError !== null
                 ? errorEstimate <= maxError ? "Within tolerance" : "Above tolerance"
                 : "Tolerance status unavailable",
-              value: formatScientific(maxError, "0.000000e+0"),
+              value: formatScientific(maxError, "—"),
             },
           ]
         : []),
@@ -671,14 +662,16 @@ export function buildFooterTelemetryModel(
       (metric.id !== "max-torque" && metricGroup(metric.id) !== "magnetization" &&
         metricGroup(metric.id) !== "energy"),
     ),
-    onlineDetail: status ? "Live session channel" : "Awaiting session",
+    onlineDetail: status ? "Session state" : "Awaiting session",
     onlineTitle: userSolvePhase === "preparing_model"
-      ? "Online / Preparing"
+      ? "Session / Preparing"
       : waitingForCompute
-      ? "Online / Waiting"
+      ? "Session / Waiting"
       : active
-        ? "Online / Active"
-        : "Local / Standby",
+        ? "Session / Active"
+        : status
+          ? "Session / Standby"
+          : "Awaiting session",
     statusDetail: status ? "Runtime telemetry" : "Waiting for runtime",
     statusState: runtimeState,
     statusTitle,
@@ -1363,16 +1356,18 @@ function scalarSampleMagnetization(
 }
 
 function formatDuration(seconds: number | null | undefined): string {
-  const totalSeconds = Math.max(
-    0,
-    Math.floor(
-      typeof seconds === "number" && Number.isFinite(seconds) ? seconds : 0,
-    ),
-  );
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "—";
+
+  const elapsedSeconds = Math.max(0, seconds);
+  if (elapsedSeconds < 60) return `${elapsedSeconds.toFixed(3)} s`;
+
+  const totalSeconds = Math.floor(elapsedSeconds);
   const hours = Math.floor(totalSeconds / 3_600);
   const minutes = Math.floor((totalSeconds % 3_600) / 60);
-  const remainingSeconds = totalSeconds % 60;
-  return `${String(hours).padStart(2, "0")}h ${String(minutes).padStart(2, "0")}m ${String(remainingSeconds).padStart(2, "0")}s`;
+  const remainingSeconds = (elapsedSeconds % 60).toFixed(3).padStart(6, "0");
+  return hours > 0
+    ? `${hours}h ${String(minutes).padStart(2, "0")}m ${remainingSeconds}s`
+    : `${minutes}m ${remainingSeconds}s`;
 }
 
 function formatFixed(
@@ -1388,7 +1383,7 @@ function formatFixed(
 function formatInteger(value: number | null | undefined): string {
   return typeof value === "number" && Number.isFinite(value)
     ? INTEGER_FORMAT.format(value)
-    : "0";
+    : "—";
 }
 
 function formatFrequencyGHz(valueHz: number): string {

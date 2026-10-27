@@ -39,6 +39,9 @@ const MANIFEST_PATH: &str = "project/retirement-manifest.json";
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+/// Outcome of a Docker startup workspace whose script was rejected before any
+/// RunIntent was accepted. Its evidence is exact run-store absence.
+const UNADMITTED_OUTCOME: &str = "startup_failed";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -485,9 +488,13 @@ impl RetirementAuthority {
         operation: impl FnOnce(TerminalRetirementEvidence) -> Result<T>,
     ) -> Result<T> {
         match self {
-            Self::Native(store) => with_terminal_evidence_fence(store, run_id, |snapshot, digest| {
-                operation(collect_terminal_evidence(store, snapshot, digest, run_id, expected_outcome)?)
-            }),
+            Self::Native(store) => with_retirement_evidence(
+                store,
+                run_id,
+                expected_outcome == Some(UNADMITTED_OUTCOME),
+                expected_outcome,
+                operation,
+            ),
             Self::Imported(evidence) => {
                 if evidence.run_id != run_id || expected_outcome != Some("observation_closed") {
                     bail!("imported observation retirement identity or outcome differs");
@@ -572,10 +579,16 @@ fn validate_current_request(
     if request.request_scope_epoch != current_scope {
         bail!("request scope belongs to another API incarnation or epoch");
     }
+    // An unadmitted startup failure has no run manifest; the session's
+    // placeholder run identity is the only one to fence.
+    let unadmitted = is_unadmitted_startup_failure(current)?;
     if current.session.session_id != request.session_id
         || current.session.run_id != request.run_id
-        || current.run.as_ref().map(|run| run.run_id.as_str()) != Some(request.run_id.as_str())
-        || current.run.as_ref().map(|run| run.session_id.as_str()) != Some(request.session_id.as_str())
+        || (!unadmitted
+            && (current.run.as_ref().map(|run| run.run_id.as_str())
+                != Some(request.run_id.as_str())
+                || current.run.as_ref().map(|run| run.session_id.as_str())
+                    != Some(request.session_id.as_str())))
     {
         bail!("session/run identity differs from the current workspace");
     }
@@ -585,7 +598,15 @@ fn validate_current_request(
     Ok(())
 }
 
+fn is_unadmitted_startup_failure(current: &SessionStateResponse) -> Result<bool> {
+    crate::router_v2::handlers::platform::development_restart::is_unadmitted_startup_failure(current)
+        .map_err(|error| anyhow::anyhow!(error.message))
+}
+
 fn terminal_snapshot_outcome(current: &SessionStateResponse) -> Result<&'static str> {
+    if is_unadmitted_startup_failure(current)? {
+        return Ok(UNADMITTED_OUTCOME);
+    }
     let outcome = match current.runtime_status.kind {
         fullmag_runner::RuntimeStatus::Completed => "completed",
         fullmag_runner::RuntimeStatus::Failed => "failed",
@@ -669,6 +690,52 @@ fn with_terminal_evidence_fence<T>(
         &str,
     ) -> Result<T>,
 ) -> Result<T> {
+    open_retirement_ledger(store)?.with_terminal_run_evidence_fence(
+        store,
+        run_id,
+        |snapshot, evidence_sha256| operation(snapshot, evidence_sha256),
+    )
+}
+
+/// Read retirement evidence for one run under its host-before-store fence.
+/// An unadmitted startup failure proves exact run absence instead of a
+/// terminal catalog; the callback sees the same evidence shape either way.
+fn with_retirement_evidence<T>(
+    store: &fullmag_session::SessionStore,
+    run_id: &str,
+    unadmitted: bool,
+    expected_outcome: Option<&str>,
+    operation: impl FnOnce(TerminalRetirementEvidence) -> Result<T>,
+) -> Result<T> {
+    if unadmitted {
+        return open_retirement_ledger(store)?.with_unadmitted_run_absence_fence(
+            store,
+            run_id,
+            |evidence_sha256| {
+                operation(TerminalRetirementEvidence {
+                    terminal_outcome: UNADMITTED_OUTCOME.to_string(),
+                    terminal_catalog_revision: 0,
+                    terminal_evidence_sha256: evidence_sha256.to_string(),
+                    host_released_reservations: Vec::new(),
+                    imported_observation: None,
+                })
+            },
+        );
+    }
+    with_terminal_evidence_fence(store, run_id, |snapshot, evidence_sha256| {
+        operation(collect_terminal_evidence(
+            store,
+            snapshot,
+            evidence_sha256,
+            run_id,
+            expected_outcome,
+        )?)
+    })
+}
+
+fn open_retirement_ledger(
+    store: &fullmag_session::SessionStore,
+) -> Result<fullmag_session::host_resource_ledger::HostResourceLedger> {
     let config_path = std::env::var_os("FULLMAG_RUNTIME_SERVICE_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| store.root().join("runtime-services/APPLICATION.json"));
@@ -678,13 +745,10 @@ fn with_terminal_evidence_fence<T>(
         bail!("runtime service configuration belongs to another session store");
     }
     let binding = config.host_execution.context("runtime service has no host binding")?;
-    let ledger = fullmag_session::host_resource_ledger::HostResourceLedger::open_for_current_application(
+    fullmag_session::host_resource_ledger::HostResourceLedger::open_for_current_application(
         &binding.ledger_root,
         binding.policy,
-    )?;
-    ledger.with_terminal_run_evidence_fence(store, run_id, |snapshot, evidence_sha256| {
-        operation(snapshot, evidence_sha256)
-    })
+    )
 }
 
 fn collect_terminal_evidence(
@@ -1010,12 +1074,16 @@ fn validate_proof_shape(proof: &LiveRetirementProof, operation_id: &str) -> Resu
     fullmag_session::repository_path::validate_store_id(&proof.run_id)?;
     validate_scope(&proof.request_scope_epoch, "proof request scope")?;
     if proof.session_epoch == 0 { bail!("retirement proof session epoch is zero"); }
-    if proof.terminal_catalog_revision == 0 {
+    if proof.terminal_outcome == UNADMITTED_OUTCOME {
+        if proof.terminal_catalog_revision != 0 || !proof.host_released_reservations.is_empty() {
+            bail!("unadmitted retirement proof carries run catalog or host evidence");
+        }
+    } else if proof.terminal_catalog_revision == 0 {
         bail!("retirement proof has no terminal catalog revision");
     }
     if let Some(observation) = observation {
         validate_imported_proof_binding(proof, observation)?;
-    } else if !matches!(proof.terminal_outcome.as_str(), "completed" | "failed" | "cancelled") {
+    } else if !matches!(proof.terminal_outcome.as_str(), "completed" | "failed" | "cancelled" | UNADMITTED_OUTCOME) {
         bail!("retirement proof terminal outcome is unsupported");
     }
     for digest in [proof.terminal_evidence_sha256.as_str()] {

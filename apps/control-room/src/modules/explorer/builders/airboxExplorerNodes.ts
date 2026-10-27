@@ -12,6 +12,7 @@ import {
   meshStatusBadge,
   visualizationDebugNode,
 } from "./explorerNodeContract";
+import { legacyStatusFacets } from "./explorerNodeState";
 import {
   meshFreshnessState,
   meshFreshnessStatus,
@@ -76,6 +77,17 @@ export function buildFdmAirboxNode(
             ? "degraded"
             : "mesh-ready";
   const cellCount = grid.totalCells;
+  const fdmStatusReason =
+    presentation.resourceStatus === "error"
+      ? "FDM Airbox descriptor or membership resource failed to load."
+      : presentation.resourceStatus === "loading"
+        ? "FDM Airbox descriptor or membership is still loading."
+        : presentation.resourceStatus === "stale" || presentation.resourceStatus === "incompatible"
+          ? "FDM Airbox membership does not match the current grid identity."
+          : presentation.resourceStatus === "authoring-grid" || presentation.resourceStatus === "missing"
+            ? "FDM descriptor is authored, but runtime membership is not materialized."
+            : undefined;
+  const fdmStateFacets = legacyStatusFacets(meshStatus);
   const multilayerTargetStatus: ExplorerNodeStatus =
     multilayerLayoutStatus === "loading" || multilayerLayoutStatus === "stale"
       ? "stale"
@@ -90,6 +102,8 @@ export function buildFdmAirboxNode(
     badge: "FDM universe",
     icon: "shield",
     status: meshStatus,
+    statusReason: fdmStatusReason,
+    ...fdmStateFacets,
     visualizationTargetId: "airbox",
     contextCommands: ["workspace.focus-selection"],
     children: [
@@ -101,6 +115,8 @@ export function buildFdmAirboxNode(
         badge: `${grid.shape.join(" × ")} / ${cellCount} cells`,
         icon: "mesh",
         status: meshStatus,
+        statusReason: fdmStatusReason,
+        ...fdmStateFacets,
         visualizationTargetId: "airbox",
         contextCommands: ["workspace.focus-selection"],
         children: [
@@ -112,6 +128,8 @@ export function buildFdmAirboxNode(
             badge: "read-only",
             icon: "settings",
             status: meshStatus,
+            statusReason: fdmStatusReason,
+            ...fdmStateFacets,
             visualizationTargetId: "airbox",
           },
           {
@@ -122,6 +140,8 @@ export function buildFdmAirboxNode(
             badge: "read-only",
             icon: "gauge",
             status: meshStatus,
+            statusReason: fdmStatusReason,
+            ...fdmStateFacets,
             visualizationTargetId: "airbox",
           },
           {
@@ -132,6 +152,8 @@ export function buildFdmAirboxNode(
             badge: "structured grid",
             icon: "activity",
             status: meshStatus,
+            statusReason: fdmStatusReason,
+            ...fdmStateFacets,
             visualizationTargetId: "airbox",
           },
           {
@@ -142,6 +164,8 @@ export function buildFdmAirboxNode(
             badge: "not applicable",
             icon: "mesh",
             status: "unsupported",
+            statusReason: "Explicit FEM element topology is not applicable to the structured FDM grid.",
+            ...legacyStatusFacets("unsupported"),
             visualizationTargetId: "airbox",
           },
           {
@@ -152,6 +176,8 @@ export function buildFdmAirboxNode(
             badge: "execution artifact",
             icon: "activity",
             status: meshStatus,
+            statusReason: fdmStatusReason,
+            ...fdmStateFacets,
             visualizationTargetId: "airbox",
           },
         ],
@@ -164,6 +190,7 @@ export function buildFdmAirboxNode(
         badge: "display",
         icon: "sparkles",
         status: "ready",
+        ...legacyStatusFacets("ready"),
         visualizationTargetId: "airbox",
         contextCommands: ["workspace.focus-selection"],
         children: [
@@ -172,6 +199,7 @@ export function buildFdmAirboxNode(
               kind: "airbox.visualization.debug",
               parentId: "model:airbox:visualization",
             }),
+            ...legacyStatusFacets("ready"),
             visualizationTargetId: "airbox",
           },
         ],
@@ -184,6 +212,7 @@ export function buildFdmAirboxNode(
         badge: `${multilayerTarget.cells.join(" × ")} · H_demag`,
         icon: "activity" as const,
         status: multilayerTargetStatus,
+        ...legacyStatusFacets(multilayerTargetStatus),
         visualizationTargetId: "airbox",
         nativeGrid: multilayerTarget.cells,
         nativeCellSize: multilayerTarget.cellSize,
@@ -217,6 +246,16 @@ export function buildFemAirboxNode(
             meshRootStatus(snapshot?.mesh),
           )
         : "mesh-stale";
+  const statusReason = status === "mesh-ready"
+    ? "Published FEM Airbox artifact is current with its source scene."
+    : status === "mesh-building"
+      ? "Shared-domain FEM mesh build is in progress."
+      : status === "mesh-failed"
+        ? snapshot?.mesh?.lastError ?? "Shared-domain FEM mesh build failed."
+        : snapshot?.mesh?.manifestSourceSceneRevision == null
+          ? "Published FEM mesh has no source-scene provenance; freshness is unknown."
+          : "Published FEM Airbox artifact is stale for the current source scene.";
+  const femStateFacets = legacyStatusFacets(status);
   const badge = snapshot?.airbox?.realizedCarrier
     ? "realized"
     : snapshot?.airbox?.authoredPolicy
@@ -233,6 +272,8 @@ export function buildFemAirboxNode(
     badge,
     icon: "shield",
     status,
+    statusReason,
+    ...femStateFacets,
     children: [
       {
         id: "model:airbox:mesh",
@@ -242,6 +283,8 @@ export function buildFemAirboxNode(
         badge: "mesh policy",
         icon: "mesh",
         status,
+        statusReason,
+        ...femStateFacets,
         contextCommands: ["workspace.focus-selection"],
         children: [
           {
@@ -251,6 +294,8 @@ export function buildFemAirboxNode(
             parentId: "model:airbox:mesh",
             icon: "settings",
             status,
+            statusReason,
+            ...femStateFacets,
           },
           {
             id: "model:airbox:mesh:quality-gates",
@@ -259,6 +304,8 @@ export function buildFemAirboxNode(
             parentId: "model:airbox:mesh",
             icon: "gauge",
             status,
+            statusReason,
+            ...femStateFacets,
           },
           {
             id: "model:airbox:mesh:statistics",
@@ -267,6 +314,8 @@ export function buildFemAirboxNode(
             parentId: "model:airbox:mesh",
             icon: "activity",
             status,
+            statusReason,
+            ...femStateFacets,
           },
           {
             id: "model:airbox:mesh:topology",
@@ -275,6 +324,8 @@ export function buildFemAirboxNode(
             parentId: "model:airbox:mesh",
             icon: "mesh",
             status,
+            statusReason,
+            ...femStateFacets,
           },
           {
             id: "model:airbox:mesh:build",
@@ -283,6 +334,8 @@ export function buildFemAirboxNode(
             parentId: "model:airbox:mesh",
             icon: "activity",
             status,
+            statusReason,
+            ...femStateFacets,
           },
         ],
       },
@@ -294,12 +347,19 @@ export function buildFemAirboxNode(
         badge: "display",
         icon: "sparkles",
         status,
+        statusReason,
+        ...femStateFacets,
         contextCommands: ["workspace.focus-selection"],
         children: [
-          visualizationDebugNode({
-            kind: "airbox.visualization.debug",
-            parentId: "model:airbox:visualization",
-          }),
+          {
+            ...visualizationDebugNode({
+              kind: "airbox.visualization.debug",
+              parentId: "model:airbox:visualization",
+            }),
+            status,
+            statusReason,
+            ...femStateFacets,
+          },
         ],
       },
     ],
@@ -309,13 +369,38 @@ export function buildFemAirboxNode(
 export function buildBoundaryFacesNode(
   snapshot: ModelTreeSnapshot | null,
 ): ExplorerNode {
-  const status: ExplorerNodeStatus =
-    (snapshot?.mesh?.outerBoundaryPartCount ?? 0) > 0
-      ? meshFreshnessStatus(
-          meshFreshnessState(snapshot?.mesh),
-          meshRootStatus(snapshot?.mesh),
-        )
-      : "unavailable";
+  const evidenceStatus = snapshot?.mesh?.outerBoundaryEvidenceStatus ?? "unknown";
+  const carrierCount = snapshot?.mesh?.outerBoundaryPartCount;
+  const currentCarrierInventoryVerified =
+    evidenceStatus === "verified" && typeof carrierCount === "number";
+  const hasCurrentCarrier = evidenceStatus === "verified" &&
+    typeof carrierCount === "number" && carrierCount > 0;
+  const verifiedNoCarrier = currentCarrierInventoryVerified && carrierCount === 0;
+  const status: ExplorerNodeStatus = hasCurrentCarrier
+    ? meshFreshnessStatus(
+        meshFreshnessState(snapshot?.mesh),
+        meshRootStatus(snapshot?.mesh),
+      )
+    : verifiedNoCarrier
+      ? "unavailable"
+      : evidenceStatus === "loading"
+        ? "mesh-building"
+        : evidenceStatus === "stale"
+          ? "mesh-stale"
+          : evidenceStatus === "error"
+            ? "mesh-failed"
+            : "unavailable";
+  const statusReason = verifiedNoCarrier
+    ? "The current published FEM manifest has no Universe outer-boundary carrier."
+    : evidenceStatus === "loading"
+      ? "The mesh manifest or current scene is loading; boundary-carrier availability is not known yet."
+      : evidenceStatus === "stale"
+        ? "The boundary manifest does not match the current mesh revision or source scene."
+        : evidenceStatus === "error"
+          ? "The mesh manifest or current scene failed to load; boundary-carrier availability is unknown."
+          : evidenceStatus === "unknown"
+            ? "The current mesh topology identity is incomplete or non-FEM, so boundary-carrier availability cannot be verified."
+            : undefined;
 
   return {
     id: "model:boundary-faces",
@@ -323,12 +408,15 @@ export function buildBoundaryFacesNode(
     label: "Boundary Faces",
     parentId: "model:universe",
     badge:
-      status === "mesh-ready"
+      hasCurrentCarrier && status === "mesh-ready"
         ? "realized"
-        : status === "unavailable"
-          ? "mesh required"
-          : meshStatusBadge(status),
+        : verifiedNoCarrier
+          ? "no carrier"
+          : evidenceStatus === "unknown"
+            ? "identity unknown"
+            : meshStatusBadge(status),
     icon: "mesh",
     status,
+    statusReason,
   };
 }

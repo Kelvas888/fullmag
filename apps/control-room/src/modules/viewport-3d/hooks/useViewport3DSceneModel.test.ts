@@ -79,7 +79,9 @@ import {
   resolveViewport3DFdmTargetFieldVectorForTarget,
   resolveViewport3DReplayFieldQuery,
   resolveViewport3DFieldDataIssue,
+  resolveViewport3DHudStatus,
   resolveViewport3DVisualizationQuantityId,
+  VIEWPORT3D_PRIMARY_FIELD_VECTOR_REQUEST_OPTIONS,
   resolveViewport3DFdmGridVectorScale,
   resolveViewport3DVectorScale,
   mergeViewport3DQuantityCapabilityIds,
@@ -796,7 +798,7 @@ describe("useViewport3DSceneModel", () => {
     expect(nativeLayerSettingsBlock).not.toContain("visualizationState: renderingState");
   });
 
-  it("uses canonical local Airbox settings for both FDM Airbox carriers", () => {
+  it("uses canonical Airbox settings only when the multilayer layout is unavailable", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     expect(source).toContain(
       "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: renderingState,",
@@ -805,7 +807,9 @@ describe("useViewport3DSceneModel", () => {
       source.indexOf("const fdmSingleGridAirboxSettings ="),
       source.indexOf("const fdmVectorScale =", source.indexOf("const fdmSingleGridAirboxSettings =")),
     );
-    expect(fdmSingleGridAirboxBlock).toContain("fdmMultilayerLayout.data?.available");
+    expect(fdmSingleGridAirboxBlock).toMatch(
+      /const fdmSingleGridAirboxSettings = fdmMultilayerLayout\.data\?\.available\s*\?\s*null\s*:\s*airboxSettings;/,
+    );
     expect(fdmSingleGridAirboxBlock).toContain(": airboxSettings");
     expect(fdmSingleGridAirboxBlock).not.toContain("fdmUniverseOutsideSupportSettings");
   });
@@ -5490,6 +5494,62 @@ describe("useViewport3DSceneModel", () => {
     expect(source).toContain("resolveViewport3DFieldVectorRequestResourceKey");
   });
 
+  it("keeps the issue banner as the single foreground surface for field-vector failures", () => {
+    const message =
+      "quantity 'm' is not requestable as a field vector: quantity_not_requestable";
+    const issue = { message };
+
+    expect(
+      resolveViewport3DHudStatus({
+        bannerOwnedMessages: [],
+        fieldDataIssue: issue,
+        status: ` ${message} `,
+      }),
+    ).toBe("");
+    expect(
+      resolveViewport3DHudStatus({
+        bannerOwnedMessages: ["FDM field degraded: fdm-carrier-identity-unknown"],
+        fieldDataIssue: { message: "Field grid does not match the FDM domain." },
+        status: "FDM field degraded: fdm-carrier-identity-unknown",
+      }),
+    ).toBe("");
+    // Higher-priority, unrelated failures stay visible next to the banner.
+    expect(
+      resolveViewport3DHudStatus({
+        bannerOwnedMessages: [],
+        fieldDataIssue: issue,
+        status: "topology request failed",
+      }),
+    ).toBe("topology request failed");
+    // Without a banner the HUD status is the only surface and is kept.
+    expect(
+      resolveViewport3DHudStatus({
+        bannerOwnedMessages: [message],
+        fieldDataIssue: null,
+        status: message,
+      }),
+    ).toBe(message);
+  });
+
+  it("does not raise a global toast for primary field-vector failures the banner owns", () => {
+    const source = readFileSync(sceneModelSourceUrl, "utf8").replace(/\r\n/g, "\n");
+
+    expect(VIEWPORT3D_PRIMARY_FIELD_VECTOR_REQUEST_OPTIONS).toEqual({
+      notifyOnError: false,
+    });
+    expect(source).toMatch(
+      /const liveFieldVector = useViewport3DFieldVectorRequest\([\s\S]*?VIEWPORT3D_PRIMARY_FIELD_VECTOR_REQUEST_OPTIONS,\n {2}\);/,
+    );
+    expect(source).toMatch(
+      /const observationFieldVector = useViewport3DObservationFrameMagnetization\([\s\S]*?VIEWPORT3D_PRIMARY_FIELD_VECTOR_REQUEST_OPTIONS,\n {2}\);/,
+    );
+    // Other field-vector consumers have no banner and keep the default toast.
+    expect(
+      source.match(/VIEWPORT3D_PRIMARY_FIELD_VECTOR_REQUEST_OPTIONS,\n/g),
+    ).toHaveLength(2);
+    expect(source).toContain(": hudStatus,");
+  });
+
   it("surfaces a retryable issue when an enabled field is settled without a payload", () => {
     const retry = () => undefined;
     const resourceKey = fieldVectorResourceRef("m", "full", "current");

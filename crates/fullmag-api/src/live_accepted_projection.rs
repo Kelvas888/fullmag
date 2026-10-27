@@ -30,7 +30,7 @@ struct ProjectionContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProjectionPublicationFence {
+pub(crate) struct ProjectionPublicationFence {
     session_id: String,
     session_status: String,
     run_id: String,
@@ -52,7 +52,7 @@ struct ProjectionPublicationFence {
 }
 
 impl ProjectionPublicationFence {
-    fn capture(snapshot: &SessionStateResponse) -> Result<Self, ApiError> {
+    pub(crate) fn capture(snapshot: &SessionStateResponse) -> Result<Self, ApiError> {
         let run = snapshot.run.as_ref().ok_or_else(|| {
             ApiError::conflict_with_code(
                 "accepted_projection_current_run_changed",
@@ -205,11 +205,12 @@ pub(crate) fn spawn(state: Arc<AppState>) {
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut cursor: Option<ProjectionCursor> = None;
+        let mut study_cache: Option<Arc<fullmag_runtime_control::AcceptedStudySnapshot>> = None;
         // The poll repeats every interval; report each distinct deferral once.
         let mut last_deferral: Option<String> = None;
         loop {
             interval.tick().await;
-            match poll_once(&state, &mut cursor).await {
+            match poll_once(&state, &mut cursor, &mut study_cache).await {
                 Ok(()) => {
                     last_deferral = None;
                     // This poller is the Docker runtime's publication path. A
@@ -240,6 +241,7 @@ pub(crate) fn spawn(state: Arc<AppState>) {
 async fn poll_once(
     state: &Arc<AppState>,
     cursor: &mut Option<ProjectionCursor>,
+    study_cache: &mut Option<Arc<fullmag_runtime_control::AcceptedStudySnapshot>>,
 ) -> Result<(), ApiError> {
     let Some(context) = capture_context(state).await? else {
         return Ok(());
@@ -253,6 +255,8 @@ async fn poll_once(
             && previous.session_epoch == context.session_epoch
             && matches!(previous.status, "completed" | "failed" | "cancelled")
     }) {
+        // Release the projected run's Study; a next run has its own intent.
+        *study_cache = None;
         return Ok(());
     }
     let Some(store_root) = state.submit_store_root.clone() else {
@@ -260,11 +264,20 @@ async fn poll_once(
     };
     let expected = context.clone();
     let previous_cursor = cursor.clone();
-    let projection = tokio::task::spawn_blocking(move || {
-        load_durable_projection(&store_root, &expected, previous_cursor.as_ref())
+    let mut cached_study = study_cache.take();
+    let (projection, cached_study) = tokio::task::spawn_blocking(move || {
+        let projection = load_durable_projection(
+            &store_root,
+            &expected,
+            previous_cursor.as_ref(),
+            &mut cached_study,
+        );
+        (projection, cached_study)
     })
     .await
-    .map_err(|error| ApiError::internal(format!("accepted projection task failed: {error}")))??;
+    .map_err(|error| ApiError::internal(format!("accepted projection task failed: {error}")))?;
+    *study_cache = cached_study;
+    let projection = projection?;
     let Some(mut projection) = projection else {
         return Ok(());
     };
@@ -423,6 +436,7 @@ fn load_durable_projection(
     store_root: &std::path::Path,
     context: &ProjectionContext,
     previous_cursor: Option<&ProjectionCursor>,
+    study_cache: &mut Option<Arc<fullmag_runtime_control::AcceptedStudySnapshot>>,
 ) -> Result<Option<DurableProjection>, ApiError> {
     let store = fullmag_session::SessionStore::open_existing(store_root).map_err(|error| {
         ApiError::with_status_and_code(
@@ -567,16 +581,7 @@ fn load_durable_projection(
             "accepted RunIntent specification differs from the current live run",
         ));
     }
-    let accepted = fullmag_runtime_control::load_accepted_study_snapshot(
-        &store,
-        &specification.run_id,
-        &specification.snapshot.project_id,
-    )
-    .map_err(|error| {
-        ApiError::conflict(format!(
-            "accepted Study snapshot cannot be loaded for projection: {error:#}"
-        ))
-    })?;
+    let accepted = cached_accepted_study_snapshot(&store, &intent, &specification, study_cache)?;
     let task_order = accepted
         .lowered
         .steps
@@ -798,8 +803,23 @@ fn load_durable_projection(
         .pointer("/parameters/live_workspace/command/kind")
         .and_then(Value::as_str)
         .is_some_and(|kind| kind != "startup_script");
-    let resolved_capabilities = if matches!(status, "completed" | "failed" | "cancelled") {
-        finished_step_capabilities(&accepted, &intent.specification)
+    // Provider truth belongs to the resolved plan, not to the run lifecycle.
+    // A prepared session waiting for Compute installs it too, so the catalog
+    // offers every active quantity instead of only the prepared m. A running
+    // stage is left to the worker-lane check on the live observation. Before
+    // a terminal state only a plan that provides m is installed: modal and
+    // frequency studies provide no magnetization, and the prepared m must
+    // stay readable there. A run's plan is immutable, so it is re-resolved
+    // only when durable state changes, never on each live observation.
+    let terminal_status = matches!(status, "completed" | "failed" | "cancelled");
+    let resolved_capabilities = if durable_changed && (terminal_status || active_task.is_none()) {
+        accepted_step_capabilities(&accepted, &intent.specification).filter(|capabilities| {
+            terminal_status
+                || capabilities
+                    .resolved_quantity_registry
+                    .as_ref()
+                    .is_some_and(|registry| registry.field_quantities.iter().any(|id| id == "m"))
+        })
     } else {
         None
     };
@@ -870,6 +890,35 @@ fn preclaim_cancelled_without_artifacts(
         })?;
     }
     Ok(true)
+}
+
+/// The accepted Study is a pure function of the immutable RunIntent and the
+/// content-addressed objects it names. Loading it reads, re-hashes, decodes
+/// and lowers the whole per-step ProblemIR catalog (tens of MB for a large
+/// grid or mesh), so a running task reuses the snapshot validated for the
+/// identical intent instead of rebuilding it on every poll.
+fn cached_accepted_study_snapshot(
+    store: &fullmag_session::SessionStore,
+    intent: &fullmag_session::FmsRunIntent,
+    specification: &fullmag_application::RunSpecification,
+    cache: &mut Option<Arc<fullmag_runtime_control::AcceptedStudySnapshot>>,
+) -> Result<Arc<fullmag_runtime_control::AcceptedStudySnapshot>, ApiError> {
+    if let Some(cached) = cache.as_ref().filter(|cached| cached.run.intent == *intent) {
+        return Ok(Arc::clone(cached));
+    }
+    let snapshot = fullmag_runtime_control::load_accepted_study_snapshot(
+        store,
+        &specification.run_id,
+        &specification.snapshot.project_id,
+    )
+    .map_err(|error| {
+        ApiError::conflict(format!(
+            "accepted Study snapshot cannot be loaded for projection: {error:#}"
+        ))
+    })?;
+    let snapshot = Arc::new(snapshot);
+    *cache = Some(Arc::clone(&snapshot));
+    Ok(snapshot)
 }
 
 /// Rebuild plan-scoped provider capabilities only after the accepted state has
@@ -1423,11 +1472,12 @@ fn validate_live_intent(
     Ok(())
 }
 
-/// Runtime capabilities of the step a finished accepted run executed. The
-/// in-process runner publishes these with its fields; an accepted run left the
-/// session with the scratch authoring capabilities, whose registry is not a
-/// resolved plan, so its published fields (m, H_eff, ...) were not readable.
-fn finished_step_capabilities(
+/// Runtime capabilities of the accepted step the RunIntent targets. The
+/// in-process runner publishes these with its fields; without them an
+/// accepted run keeps the scratch authoring capabilities, whose registry is
+/// not a resolved plan, so the quantity catalog and field routes refuse every
+/// field except the prepared m.
+fn accepted_step_capabilities(
     accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
     specification: &Value,
 ) -> Option<fullmag_runner::BackendCapabilities> {
@@ -2104,28 +2154,35 @@ async fn clear_stale_magnetization(
     context: &ProjectionContext,
 ) -> Result<(), ApiError> {
     let transition = state.current_live_session_transition.lock().await;
-    let mut current = state.current_live_state.write().await;
-    let snapshot = current
-        .as_mut()
+    // Build the cleared candidate from a read-side clone; the write lock is
+    // held only for the fenced swap so health/status readers do not queue
+    // behind the frame application on large domains.
+    let mut next = state
+        .current_live_state
+        .read()
+        .await
+        .as_ref()
+        .cloned()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
-    ensure_projection_context(state, context, snapshot)?;
-    if snapshot.latest_fields.get("m").is_none() {
+    ensure_projection_context(state, context, &next)?;
+    if next.latest_fields.get("m").is_none() {
         return Ok(());
     }
-    let mut fields = snapshot.latest_fields.clone();
+    let publication_fence = ProjectionPublicationFence::capture(&next)?;
+    let mut fields = next.latest_fields.clone();
     fields.remove("m");
     let stale = fields.entries().filter(|(_, value)| {
         value.pointer("/provenance/source").and_then(Value::as_str) == Some("accepted_live_observation")
     }).map(|(id, _)| id.clone()).collect::<Vec<_>>();
     for id in stale { fields.remove(&id); }
-    let sequence = snapshot
+    let sequence = next
         .terminal_field_generations
         .get(&context.run_id)
         .copied()
         .unwrap_or_default()
         .saturating_add(1);
-    crate::session::apply_current_live_field_frame(
-        snapshot,
+    crate::session::apply_current_live_field_frame_to_candidate(
+        &mut next,
         CurrentLiveFieldFrameRequest {
             session_id: context.session_id.clone(),
             latest_fields: Some(fields),
@@ -2137,14 +2194,30 @@ async fn clear_stale_magnetization(
             preview_fields: None,
             clear_preview_cache: true,
         },
+        None,
     )?;
-    let cleared = snapshot.clone();
-    drop(current);
-    drop(transition);
-    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
     let display_revision = state.current_display_selection.read().await.revision;
     let realtime_state =
-        crate::current_live_realtime_state_from_snapshot(state, &cleared, display_revision).await;
+        crate::current_live_realtime_state_from_snapshot(state, &next, display_revision).await;
+    let previous = {
+        let mut current = state.current_live_state.write().await;
+        let snapshot = current
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        ensure_projection_context(state, context, snapshot)?;
+        if ProjectionPublicationFence::capture(snapshot)? != publication_fence {
+            return Err(ApiError::conflict_with_code(
+                "accepted_projection_current_state_changed",
+                "current live resources changed while stale magnetization was being cleared",
+            ));
+        }
+        std::mem::replace(&mut *current, Some(next))
+    };
+    drop(transition);
+    if let Some(previous) = previous {
+        let _ = tokio::task::spawn_blocking(move || drop(previous));
+    }
+    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
     crate::publish_current_live_realtime_batch_changed(state, &realtime_state, true, 100).await
 }
 
@@ -3462,7 +3535,7 @@ mod tests {
         assert!(preclaim_cancelled_without_artifacts(&store, &catalog).unwrap());
         assert!(store.read_artifact_catalog(&context.run_id).unwrap().is_none());
         let before = std::fs::read(store.root().join(format!("runs/{}/run_catalog.json", context.run_id))).unwrap();
-        let projection = load_durable_projection(store.root(), &context, None).unwrap().unwrap();
+        let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
         assert_eq!(projection.status, "cancelled");
         assert_eq!(projection.command_id.as_deref(), Some("live-preparation-mesh-command"));
         assert_eq!(projection.artifact_catalog_revision, None);
@@ -3479,7 +3552,7 @@ mod tests {
     #[tokio::test]
     async fn preclaim_cancellation_completes_live_session_and_bound_mesh_command() {
         let (directory, store, context, _catalog) = preclaim_cancelled_fixture();
-        let projection = load_durable_projection(store.root(), &context, None).unwrap().unwrap();
+        let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
         let mut state = crate::router_v2::tests::test_app_state_with_live_session().await;
         let journal_root = directory.path().join("live-journal");
         Arc::get_mut(&mut state).unwrap().current_command_journal_store_root = Some(journal_root.clone());
@@ -3576,7 +3649,7 @@ mod tests {
             })).unwrap());
         }
         let _transition = state.current_live_session_transition.lock().await;
-        let projection = load_durable_projection(store.root(), &context, None).unwrap().unwrap();
+        let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
         assert_eq!(projection.status, "failed");
         assert!(projection.terminal_without_outputs);
         assert!(projection.preclaim_cancellations.is_empty());
@@ -3593,7 +3666,7 @@ mod tests {
             ledger[0].completed_at_unix_ms.unwrap()
         };
         assert!(completed_at > 0);
-        let projection = load_durable_projection(store.root(), &context, None).unwrap().unwrap();
+        let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
         apply_projection(&state, &context, projection).await.unwrap();
         assert_eq!(state.current_command_ledger.lock().await[0].completed_at_unix_ms, Some(completed_at));
         let current = state.current_live_state.read().await;
@@ -3637,7 +3710,7 @@ mod tests {
         catalog.tasks.pop();
         std::fs::write(store.root().join(format!("runs/{}/run_catalog.json", context.run_id)),
             serde_json::to_vec(&catalog).unwrap()).unwrap();
-        assert!(load_durable_projection(store.root(), &context, None).is_err());
+        assert!(load_durable_projection(store.root(), &context, None, &mut None).is_err());
         assert!(store.read_artifact_catalog(&context.run_id).unwrap().is_none());
     }
 
@@ -3680,7 +3753,7 @@ mod tests {
         assert!(preclaim_cancelled_without_artifacts(&store, &replaced).is_err());
         std::fs::remove_file(store.root().join(format!("runs/{}/task_cancellation_intents/{}.json",
             context.run_id, catalog.tasks[0].task_id))).unwrap();
-        let projection = load_durable_projection(store.root(), &context, None).unwrap().unwrap();
+        let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
         assert!(projection.terminal_without_outputs);
         assert!(projection.preclaim_cancellations.is_empty());
     }
@@ -3697,7 +3770,7 @@ mod tests {
                 "scene_revision" => stale.scene_revision += 1,
                 _ => stale.run_id = "other-run".into(),
             }
-            assert!(!matches!(load_durable_projection(store.root(), &stale, None), Ok(Some(_))));
+            assert!(!matches!(load_durable_projection(store.root(), &stale, None, &mut None), Ok(Some(_))));
         }
     }
 
@@ -3711,7 +3784,7 @@ mod tests {
                 revision, updated_at: chrono::Utc::now(), entries: Vec::new(),
             };
             std::fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
-            assert!(load_durable_projection(store.root(), &context, None).is_err());
+            assert!(load_durable_projection(store.root(), &context, None, &mut None).is_err());
         }
     }
 

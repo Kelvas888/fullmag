@@ -20,6 +20,8 @@ const BOUNDED_PYTHON_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 // Source capture hashes the complete bounded runtime closure before and after
 // export and separately revalidates every file; it is not a single DSL render.
 const BOUNDED_SOURCE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Code of a bounded helper that hit its deadline and was killed and reaped.
+pub(crate) const PYTHON_HELPER_TIMEOUT_CODE: &str = "python_helper_timeout";
 const BOUNDED_PYTHON_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const BOUNDED_PYTHON_HELPER_LOG_LIMIT: u64 = 1024 * 1024;
 const STREAMED_PYTHON_HELPER_LINE_LIMIT: usize = 16 * 1024;
@@ -1649,12 +1651,15 @@ fn run_bounded_python_helper_with_budget(
                 let now = Instant::now();
                 if now >= deadline {
                     let cleanup = stop_bounded_helper(&mut child);
-                    return Err(BoundedHelperError::Started(
-                        bounded_helper_failure_with_cleanup(
-                            &format!("Python helper exceeded the {} second deadline", budget.as_secs()),
-                            cleanup,
-                        ),
-                    ));
+                    let reaped = cleanup.is_ok();
+                    let mut error = bounded_helper_failure_with_cleanup(
+                        &format!("Python helper exceeded the {} second deadline", budget.as_secs()),
+                        cleanup,
+                    );
+                    if reaped {
+                        error.code = Some(PYTHON_HELPER_TIMEOUT_CODE.to_string());
+                    }
+                    return Err(BoundedHelperError::Started(error));
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 thread::sleep(std::cmp::min(

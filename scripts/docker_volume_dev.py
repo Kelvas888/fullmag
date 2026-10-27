@@ -1744,6 +1744,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     else:
         control = provided_control
         toolchain, images = _validate_prepared_start_context(prepared)
+    from docker_volume_cancelled_activation_guard import assert_start_allowed
+    assert_start_allowed(control, getattr(args, "request_id", None), reuse_state=reuse_state)
     image = images["backend"]["image_id"]
     if retained_device_access is None:
         device_access = _verify_docker_gpu_access(device_access, policy, image, control.project)
@@ -6185,7 +6187,7 @@ def _retained_operation(
     args, *, recreate_services, restart_idle_service=False, stop_after_drain=False,
     resume_recreation_id=None, refresh_frontend_service=False,
 ):
-    """Resume observation/admission of one exact failed start; never restart the backend."""
+    """Resume one exact retained start; a frontend-only recovery never restarts the backend."""
     from docker_dev import _select_source, _compose_identity
     require_host()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root)
@@ -6198,12 +6200,18 @@ def _retained_operation(
         raise BuildControlError("Resume requires an exact attempt UUID")
     previous_root = "development/attempts/" + args.attempt
     previous = control.read(previous_root + "/terminal.json")
+    # A successfully admitted group can subsequently lose its frontend (for
+    # example a Next.js heap failure). Resume still validates both exact
+    # container incarnations below and requires backend running/frontend
+    # stopped; the historical startup receipt must remain immutable.
     allowed = {"failed-confirmed", "succeeded"}
     if previous.get("state") not in allowed or previous.get("compose_project") != control.project:
         raise BuildControlError("Retained start has no admissible terminal outcome")
     document = control.read(previous_root + "/compose.json")
     if hashlib.sha256(canonical(document)).hexdigest() != args.config_sha256 or document.get("name") != control.project:
         raise BuildControlError("Resume Compose identity/CAS differs")
+    from docker_volume_cancelled_activation_guard import require_fresh_recreation
+    require_fresh_recreation(control, args, previous, recreate_services=recreate_services)
     from docker_volume_preparation_abort import require_fresh_archive
     preparation_abort = require_fresh_archive(control, args, previous, document, recreate_services=recreate_services)
     operator_probe_record = _operator_probe_record_from_retained(previous, document)
@@ -7120,6 +7128,9 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 "runtime_config"
             ]["sha256"]
             recovery_context["post_build_generation"] = post_build_generation
+        if fresh_state:
+            from docker_volume_cancelled_activation_guard import pin_archive
+            pin_archive(control)
         reuse = None if fresh_state else {"state": state, "host_certificate": certificate_path,
             "owner_marker": owner_path, "receipt": {"image_id": image},
             "operator_probe_environment_record": operator_probe_record}

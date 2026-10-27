@@ -19,6 +19,7 @@ import type { InspectorPanelProps } from "../../inspectorTypes";
 import { Button } from "@/shared/ui/Button";
 import { AirboxInspectorIdentityFrame } from "./AirboxInspectorIdentityFrame";
 import {
+  hasPublishedFemTopologyInspectionLane,
   resolveAirboxInspectorAuthoringLane,
   resolveAirboxInspectorLane,
   useAirboxInspectorRuntimeStatus,
@@ -62,7 +63,9 @@ function AirboxInspectorLanePanel({
   const runtimeStatus = useAirboxInspectorRuntimeStatus();
   const lane = resolveAirboxInspectorLane(selection, runtimeStatus);
   const authoringLane = resolveAirboxInspectorAuthoringLane(selection, runtimeStatus);
-  const publishedFemMesh = hasPublishedFemMeshEvidence(runtimeStatus);
+  const publishedFemMesh = lane === "fem"
+    ? hasPublishedFemMeshEvidence(runtimeStatus)
+    : hasPublishedFemTopologyInspectionLane(runtimeStatus);
   const inspectionLane = lane === "unresolved" && publishedFemMesh && authoringLane === "conflict"
     ? "conflict" : lane;
   const explicitFdm = lane === "fdm";
@@ -132,7 +135,12 @@ function AirboxInspectorLanePanel({
     );
   } else if (lane === "unresolved") {
     const authoredMethod = runtimeStatus?.authoring.method ?? null;
-    if (publishedFemMesh || (overviewFallback && authoredMethod === "fem")) {
+    if (
+      authoredMethod === "fem" &&
+      hasPublishedFemTopologyInspectionLane(runtimeStatus)
+    ) {
+      content = <FemPanel selection={selection} />;
+    } else if (overviewFallback && authoredMethod === "fem") {
       content = <FemPanel selection={selection} />;
     } else if (overviewFallback && authoredMethod === "fdm") {
       content = <AirboxMeshParametersPanel lane="fdm" runtimeLane={null} selection={selection} />;
@@ -174,7 +182,18 @@ function AirboxInspectorLanePanel({
   }
 
   return (
-    <AirboxInspectorIdentityFrame executionState={runtimeStatus?.executionState} lane={inspectionLane} publishedFemMesh={publishedFemMesh && inspectionLane !== "conflict"} selection={selection}>
+    <AirboxInspectorIdentityFrame
+      artifactLane={
+        !authoringPanel && inspectionLane !== "conflict" && hasPublishedFemTopologyInspectionLane(runtimeStatus)
+          ? "fem"
+          : null
+      }
+      executionState={runtimeStatus?.executionState}
+      lane={inspectionLane}
+      publishedFemMesh={publishedFemMesh && inspectionLane !== "conflict"}
+      runtimeReason={runtimeStatus?.authoring.reason}
+      selection={selection}
+    >
       {content}
     </AirboxInspectorIdentityFrame>
   );
