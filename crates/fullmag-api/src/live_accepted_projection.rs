@@ -17,6 +17,10 @@ use crate::types::{
 use fullmag_authoring::SceneExecutionInputIdentity;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Ceiling for retrying one unchanged deferral. Each retry reloads the run's
+/// durable outputs, which on a multi-million-cell grid kept a core busy and
+/// the API's memory high for as long as the deferral lasted.
+const MAX_DEFERRAL_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct ProjectionContext {
@@ -172,11 +176,13 @@ pub(crate) fn spawn(state: Arc<AppState>) {
         let mut study_cache: Option<Arc<fullmag_runtime_control::AcceptedStudySnapshot>> = None;
         // The poll repeats every interval; report each distinct deferral once.
         let mut last_deferral: Option<String> = None;
+        let mut repeated_deferrals: u32 = 0;
         loop {
             interval.tick().await;
             match poll_once(&state, &mut cursor, &mut study_cache).await {
                 Ok(()) => {
                     last_deferral = None;
+                    repeated_deferrals = 0;
                     // This poller is the Docker runtime's publication path. A
                     // finished run publishes nothing more, yet the path stays
                     // live; without this the session turned `disconnected`
@@ -195,6 +201,15 @@ pub(crate) fn spawn(state: Arc<AppState>) {
                             "accepted live read-model projection deferred"
                         );
                         last_deferral = Some(detail);
+                        repeated_deferrals = 0;
+                    } else {
+                        // Back off an unchanged deferral; a new run, session
+                        // or error still retries on the next interval.
+                        repeated_deferrals = repeated_deferrals.saturating_add(1);
+                        let backoff = POLL_INTERVAL
+                            .saturating_mul(1_u32 << repeated_deferrals.min(6))
+                            .min(MAX_DEFERRAL_BACKOFF);
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }
@@ -270,6 +285,7 @@ async fn poll_once(
     // Publish a stage-specific pinned domain before admitting the output.
     // Preparation performs catalog/plan validation outside the transition
     // fence and uses its own exact final CAS.
+    let mut running_capabilities = None;
     let stage_preparation = if projection.terminal_without_outputs {
         // A terminal catalog without outputs still carries authoritative
         // lifecycle state. Do not require preparation/materialization or clear
@@ -284,6 +300,19 @@ async fn poll_once(
             .await
         .and_then(|prepared| {
             validate_live_magnetization_domain(observation, &prepared.execution_plan)?;
+            if !matches!(projection.status, "completed" | "failed" | "cancelled") {
+                running_capabilities = projection
+                    .accepted_runtime_problem
+                    .as_ref()
+                    .and_then(|problem| {
+                        running_runtime_capabilities(
+                            problem,
+                            &prepared.execution_plan,
+                            &observation.header.realization,
+                        )
+                    })
+                    .map(|capabilities| (capabilities, prepared.execution_plan.common.execution_mode));
+            }
             Ok(None)
         })
     } else {
@@ -303,6 +332,41 @@ async fn poll_once(
             return Err(error);
         }
     };
+    // A running stage whose latest observation carries only scalars (a FEM
+    // worker between field snapshots) executes the same accepted plan; its
+    // fields must stay requestable, so derive the capabilities from it too.
+    if running_capabilities.is_none()
+        && !matches!(projection.status, "completed" | "failed" | "cancelled")
+    {
+        if let Some((_, observation)) = projection.live_observation.as_ref() {
+            if let Ok(prepared) = ensure_stage_preparation_for_step(
+                state,
+                &context,
+                &observation.header.step_id,
+                None,
+            )
+            .await
+            {
+                running_capabilities = projection
+                    .accepted_runtime_problem
+                    .as_ref()
+                    .and_then(|problem| {
+                        running_runtime_capabilities(
+                            problem,
+                            &prepared.execution_plan,
+                            &observation.header.realization,
+                        )
+                    })
+                    .map(|capabilities| {
+                        (capabilities, prepared.execution_plan.common.execution_mode)
+                    });
+            }
+        }
+    }
+    if let Some((capabilities, mode)) = running_capabilities {
+        projection.accepted_runtime_capabilities = Some(capabilities);
+        projection.accepted_runtime_mode = Some(mode);
+    }
     if matches!(projection.status, "completed" | "failed" | "cancelled") {
         if let Some(output) = projection.latest_state.as_ref() {
             if let fullmag_application::DecodedStudyArtifact::MagnetizationState(state_output) =
@@ -662,7 +726,16 @@ fn load_durable_projection(
                 .map(|entry| entry.problem().clone())
         })
     } else {
-        None
+        // A running stage publishes its planned capabilities from the same
+        // accepted problem the worker executes (see `running_runtime_capabilities`).
+        live_observation.as_ref().and_then(|(_, observation)| {
+            accepted
+                .catalog
+                .entries()
+                .iter()
+                .find(|entry| entry.step_id() == observation.header.step_id)
+                .map(|entry| entry.problem().clone())
+        })
     };
     let latest_total_energy = verified
         .iter()
@@ -800,6 +873,44 @@ fn cached_accepted_study_snapshot(
 /// been checked against the durable prepared stage. The actual worker engine
 /// and precision must agree with the runner's resolution of that immutable
 /// plan; requested intent alone never selects or promotes a provider.
+/// Capabilities of a running stage, resolved from the accepted immutable plan
+/// the worker executes. Without them every live field is unrequestable until
+/// the run ends and the viewport has nothing to colour. The worker's live
+/// observation names its realization lane; any other lane (a fallback)
+/// publishes nothing. Terminal projection re-derives them from the accepted
+/// state's provenance, or clears them.
+fn running_runtime_capabilities(
+    problem: &fullmag_ir::ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    realization: &str,
+) -> Option<fullmag_runner::BackendCapabilities> {
+    if !matches!(
+        &plan.backend_plan,
+        fullmag_ir::BackendPlanIR::Fdm(_)
+            | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
+            | fullmag_ir::BackendPlanIR::Fem(_)
+    ) {
+        return None;
+    }
+    let capabilities =
+        fullmag_runner::resolve_planned_runtime_capabilities(problem, plan).ok()?;
+    let registry = capabilities.resolved_quantity_registry.as_ref()?;
+    if registry.source != fullmag_runner::QuantityProviderRegistrySource::ResolvedPlan {
+        return None;
+    }
+    (planned_realization_lane(capabilities.engine_id)? == realization).then_some(capabilities)
+}
+
+fn planned_realization_lane(engine: fullmag_runner::RuntimeEngineId) -> Option<&'static str> {
+    match engine {
+        fullmag_runner::RuntimeEngineId::FdmCpuReference => Some("fdm_cpu"),
+        fullmag_runner::RuntimeEngineId::FdmCuda => Some("fdm_gpu"),
+        fullmag_runner::RuntimeEngineId::FemCpuNative => Some("fem_cpu"),
+        fullmag_runner::RuntimeEngineId::FemNativeGpu => Some("fem_gpu"),
+        _ => None,
+    }
+}
+
 fn accepted_runtime_capabilities_for_state(
     problem: &fullmag_ir::ProblemIR,
     plan: &fullmag_ir::ExecutionPlanIR,
@@ -2721,6 +2832,17 @@ mod tests {
         let mut stale = specification.clone();
         stale["parameters"]["live_workspace"]["scene_revision"] = json!(10);
         assert!(validate_live_intent(&context, &stale).is_err());
+    }
+
+    #[test]
+    fn running_capabilities_require_the_worker_realization_of_the_planned_engine() {
+        use fullmag_runner::RuntimeEngineId;
+        assert_eq!(planned_realization_lane(RuntimeEngineId::FdmCpuReference), Some("fdm_cpu"));
+        assert_eq!(planned_realization_lane(RuntimeEngineId::FdmCuda), Some("fdm_gpu"));
+        assert_eq!(planned_realization_lane(RuntimeEngineId::FemCpuNative), Some("fem_cpu"));
+        assert_eq!(planned_realization_lane(RuntimeEngineId::FemNativeGpu), Some("fem_gpu"));
+        // Eigen and frequency-response engines never stream live LLG fields.
+        assert_eq!(planned_realization_lane(RuntimeEngineId::FemEigenCpuBaseline), None);
     }
 
     #[test]
