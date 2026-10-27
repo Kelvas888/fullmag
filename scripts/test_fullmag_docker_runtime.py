@@ -1068,7 +1068,7 @@ class DockerRuntimeContract(unittest.TestCase):
             root = Path(directory)
             helpers = root / "capsule/tree/docker/all-in-one"
             helpers.mkdir(parents=True)
-            for name in ("Dockerfile", "Dockerfile.dev", "entrypoint.py", "windows_folder_probe.py", "linux_native_probe.py",
+            for name in ("Dockerfile", "Dockerfile.dev", "backend_auto_maintenance.py", "entrypoint.py", "windows_folder_probe.py", "linux_native_probe.py",
                          "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
                 (helpers / name).write_text(name)
             scripts = root / "capsule/tree/scripts"

@@ -62,19 +62,34 @@ Blokada pnpm pozostaje zajęta przy niepewnym zakończeniu procesu aż do dowodu
 
 ## Retencja i zakończenie pracy
 
-Po udanym starcie nowej grupy launcher automatycznie wykonuje retencję, już po
-osiągnięciu gotowości API/frontendu. Pod blokadą buildu zachowuje current oraz
+Kontener backendu z `FULLMAG_AUTO_CACHE_MAINTENANCE=1` automatycznie uruchamia
+retencję po zapisaniu gotowości API/runtime. Obejmuje to również zwykły Start lub
+Restart w Docker Desktop. Nadzorowany proces działa z niskim priorytetem; API
+pozostaje dostępne, a launcher nie uruchamia drugiej kopii sprzątania.
+Pod nieblokującą blokadą buildu zachowuje current oraz
 bezpośredni rollback, usuwa starszy zweryfikowany łańcuch i ogranicza prywatny
 Cargo incremental do 8 GiB zaalokowanych bloków plików. Usuwa najstarsze całe
 katalogi cache crate; następny build może odtworzyć brakujący incremental.
 Nie usuwa `deps`, native CMake ani źródeł. Zmiana układu Cargo, symlink lub obcy
 owner zatrzymuje operację zamiast rozszerzać zakres kasowania. Wynik trafia do
-`cache-maintenance.json` w receipcie startu. Zwykły restart kontenera poza
-launcherem nie uruchamia tego kroku.
+`runtime-service/cache-maintenance.json` w technicznym runtime control.
+Receipt zawiera identyfikator próby, PID API, klucz cache i rzeczywisty wynik;
+hostowy receipt zawiera odwołanie, nie deklaruje zakończenia przed workerem.
+Zajęta blokada grupy oznacza `deferred-busy`, błąd oznacza `failed`. Kolejny start
+ponawia próbę. Zatrzymanie kontenera najpierw zamyka admission API, następnie
+kończy maintenance w ograniczonym czasie i wykonuje zwykły native drain.
+Przerwane usuwanie historycznego backupu jest wznawiane z trwałego intentu;
+obce pliki lub zmieniona tożsamość zatrzymują sprzątanie. Bieżący pakiet i
+bezpośredni rollback pozostają nietknięte.
+
+Ta funkcja wymaga nowego obrazu oraz konfiguracji kontenera. `docker restart`
+nie zmienia obrazu, zmiennych ani mountów istniejącego kontenera. Stare grupy
+muszą przejść zarządzaną migrację; w szczególności działającej grupy nie wolno
+odtwarzać w trakcie pracy innego wątku.
 
 Wspólny cache gotowych pakietów zachowuje domyślnie do 8 wpisów i 64 GiB
 logicznych payloadów. Aktywna publikacja/użycie przez inną grupę odkłada globalny
-GC (`deferred-busy` w receipcie); kolejny udany zarządzany start ponawia próbę.
+GC (`deferred-busy` w receipcie); kolejny start kontenera ponawia próbę.
 Usunięcie wpisu cache nie usuwa hardlinków current/rollback innych grup. Te
 limity nie są kwotą całego dysku Docker ani całego Cargo target.
 
@@ -112,6 +127,49 @@ pozostałych części target i BuildKit.
 Dalsze migracje starych pakietów lub cleanup nieznanego stagingu wymagają
 inwentarza i jawnej kwalifikacji. Wiek wolumenu lub brak uruchomionego kontenera
 nie dowodzą, że dane nie są potrzebne.
+
+## Aktualizacja istniejącej grupy ze starszego worktree
+
+Kod aplikacji i wersja narzędzi operacyjnych mają osobne tożsamości. Przy
+zarządzanym `recreate-volume` można wskazać `--helper-source-root` oraz
+`--helper-source-commit` jako parę. Launcher musi pochodzić z tego przypiętego
+checkoutu helperów; pliki infrastruktury muszą odpowiadać jego commitowi,
+indeksowi Git i bajtom na dysku. Oba checkouty należą do tego samego Git common
+directory i korzystają z właściwego adaptera hosta: Windows lub Linux/WSL.
+
+```sh
+python <helpers>/scripts/docker_dev.py --repo-root <main-checkout> recreate-volume \
+  --source-root <app-worktree> --attempt <retained-attempt> \
+  --config-sha256 <retained-compose-sha256> --port <retained-port> \
+  --helper-source-root <helpers> --helper-source-commit <full-commit-sha>
+```
+
+Wskazanie helperów zmienia tylko obraz narzędzi oraz szablon Compose. Live
+source, Git aplikacji, jej tożsamość, toolchain, sesje i wybór cache nadal
+pochodzą z `--source-root`. Pin trafia do trwałych receipts przed usunięciem
+starych kontenerów i jest ponownie sprawdzany przy starcie oraz wznowieniu.
+Nie znosi żadnej bramki stopped/drain, kontroli ID i konfiguracji ani recovery.
+Nieobsługiwane kombinacje recovery są odrzucane przed mutacją.
+
+Nowy obraz przypina również bajty pary helperów aktywacji. Późniejsze operacje
+aktualnym launcherem mogą odczytać je ze wskazanego niezmiennego obrazu; nie
+wymagają zachowania tymczasowego worktree helperów. Zwykły restart kontenera
+używa wyłącznie już zainstalowanego obrazu i konfiguracji. Dalsze operacje
+hostowe na starym worktree wykonuj aktualnym launcherem: jego stara lokalna
+kopia nie otrzymuje nowych funkcji przez samą zmianę obrazu.
+
+Migracja jest sekwencyjna. Przed każdym krokiem ponownie sprawdź aktywność:
+inny wątek może uruchomić grupę po inwentaryzacji. Działającą grupę odłóż do
+naturalnego zatrzymania. Osierocony lease, brak potwierdzonego drain, niezgodne
+ID, niedostępny ledger lub brak receipts wymagają właściwego recovery;
+nie oznaczają zgody na `--fresh-state`, kasowanie markerów ani powtórzenie Solve.
+`recreate-volume` uruchamia nowe usługi i czeka na kwalifikację. Zachowanie
+grupy offline wymaga późniejszego zarządzanego zatrzymania z drain.
+
+Stare prywatne wolumeny pozostają do czasu kwalifikacji nowej grupy. Nie
+deklaruj odzyskanego miejsca ani współdzielenia na podstawie samego planu:
+sprawdź rzeczywiste mounty, nowy receipt, wynik retencji i konsumentów starych
+wolumenów przed ich oddzielnym kwalifikowanym usunięciem.
 
 ## Weryfikacja
 
