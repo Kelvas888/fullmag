@@ -105,6 +105,33 @@ class HelperSourceTests(unittest.TestCase):
                 include_script_python=True,
             )
 
+    def test_recursive_git_queries_fit_windows_command_line_with_large_script_inventory(self):
+        paths = [f"scripts/nested/package_{i:04d}/" + "long_name_" * 8 + ".py" for i in range(1000)]
+        paths += ["compose.dev.yaml", "docker/all-in-one/Dockerfile.backend", "scripts-extra/keep.py"]
+        original_git = helper_source._git
+        calls = []
+
+        def bounded_git(root, *arguments, **kwargs):
+            command = ["git", "-C", str(root), *arguments]
+            self.assertLess(len(subprocess.list2cmdline(command)), 32767)
+            self.assertIn(":(literal)scripts-extra/keep.py", arguments)
+            calls.append(arguments)
+            return original_git(root, *arguments, **kwargs)
+
+        with patch.object(helper_source, "_git", side_effect=bounded_git):
+            tree = helper_source._read_tree(self.root, self.commit, paths, recursive_scripts=True)
+            index = helper_source._read_index(self.root, paths, recursive_scripts=True)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(set(tree), set(self._files()))
+        self.assertEqual(set(index), set(self._files()))
+
+    def test_nonrecursive_git_queries_keep_explicit_script_pathspecs(self):
+        paths = ["scripts/docker_dev.py", "compose.dev.yaml"]
+        with patch.object(helper_source, "_git", return_value=b"") as query:
+            helper_source._read_index(self.root, paths)
+        self.assertIn(":(literal)scripts/docker_dev.py", query.call_args.args)
+        self.assertNotIn("scripts", query.call_args.args)
+
     def test_clean_pinned_helper_can_be_separate_from_app_worktree(self):
         binding = self._binding()
         self.assertEqual(binding["root"], str(self.root.resolve()))
