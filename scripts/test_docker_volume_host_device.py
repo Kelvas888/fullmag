@@ -216,5 +216,29 @@ class HostDeviceTests(unittest.TestCase):
             self.assertTrue((root/"active").exists())
             self.assertEqual((path/"terminal.json").read_bytes(),b"foreign")
 
+
+    def test_iteration_recovery_rejects_symlinked_run_directory(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            state=root/"state"
+            state.mkdir()
+            parent=state/"runs/docker-all/session-store"
+            parent.mkdir(parents=True)
+            outside=root/"outside"
+            outside.mkdir()
+            (parent/"runs").symlink_to(outside,target_is_directory=True)
+            token="a"*32
+            pins={"attempt":"b"*32,"config_sha256":"c"*64,"source_root":"/source"}
+            receipt={"schema":"fullmag.docker-build-operation.v1","phase":"iteration",
+                     "attempt":token,"state":"starting","compose_project":"owned",
+                     "control_volume":"control","helper_container":"fullmag-control-"+token,
+                     "inputs":pins}
+            control=Mock(project="owned",volume="control",namespace="")
+            control.read_bytes.side_effect=[(token+"\n").encode(),json.dumps(receipt).encode()]
+            with self.assertRaises(host.storage.StorageError):
+                recovery.reconcile_iteration(control,pins,{"state_root":str(state)},token)
+            control.helper_args.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

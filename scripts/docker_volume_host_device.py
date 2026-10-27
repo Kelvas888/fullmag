@@ -147,7 +147,8 @@ def reconcile_iteration(control, pins, proof, token):
             or receipt.get("helper_container") != "fullmag-control-" + token
             or any(inputs.get(key) != pins[key] for key in ("attempt","config_sha256","source_root"))):
         raise BuildControlError("Interrupted iteration receipt differs")
-    store_runs = Path(proof["state_root"]) / "runs/docker-all/session-store/runs"
+    state_root = Path(proof["state_root"])
+    store_runs = host.storage.validate_path(state_root / "runs/docker-all/session-store/runs", state_root, "retained run directory")
     if not store_runs.is_dir() or any(store_runs.iterdir()):
         raise BuildControlError("Interrupted iteration recovery requires no retained runs")
     absence = _probe_helper_absence("fullmag-control-" + token)
