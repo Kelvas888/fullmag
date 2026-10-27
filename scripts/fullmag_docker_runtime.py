@@ -2607,7 +2607,14 @@ for name in sys.argv[1:]:
     descriptor = os.open(path, FLAGS)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        # Shared build storage publishes sealed (read-only) artifacts as
+        # hardlinks between DEV groups; extra links are accepted only for a
+        # file nobody can write, and the digest below is read from this
+        # descriptor either way.
+        sealed = not metadata.st_mode & 0o222
+        if (not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink < 1
+                or (metadata.st_nlink != 1 and not sealed)):
             raise RuntimeError("runtime artifact is not one regular file")
         digest = hashlib.sha256()
         total = 0

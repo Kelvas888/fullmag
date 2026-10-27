@@ -4323,5 +4323,46 @@ class DockerRuntimeContract(unittest.TestCase):
             mkdir.assert_not_called()
 
 
+class BackendBinaryAttestationTests(unittest.TestCase):
+    """The in-container digest script accepts shared sealed hardlinks only."""
+
+    def run_script(self, mode, linked):
+        with tempfile.TemporaryDirectory() as directory:
+            binary_dir = Path(directory) / "bin"
+            binary_dir.mkdir()
+            binary = binary_dir / "fullmag-api"
+            binary.write_bytes(b"binary")
+            if linked:
+                os.link(binary, Path(directory) / "shared-copy")
+            os.chmod(binary, mode)
+            script = runtime._BACKEND_BINARY_DIGESTS_SCRIPT.replace(
+                '"/opt/fullmag/package/bin/"', repr(str(binary_dir) + "/")
+            )
+            try:
+                return subprocess.run(
+                    [sys.executable, "-c", script, "fullmag-api"],
+                    capture_output=True, text=True,
+                )
+            finally:
+                os.chmod(binary, 0o644)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits and hardlink counts")
+    def test_sealed_hardlinked_artifact_is_hashed(self):
+        result = self.run_script(0o555, linked=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"fullmag-api": hashlib.sha256(b"binary").hexdigest()})
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits and hardlink counts")
+    def test_writable_hardlinked_artifact_is_rejected(self):
+        result = self.run_script(0o755, linked=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("runtime artifact is not one regular file", result.stderr)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits and hardlink counts")
+    def test_single_writable_artifact_is_still_hashed(self):
+        self.assertEqual(self.run_script(0o755, linked=False).returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
