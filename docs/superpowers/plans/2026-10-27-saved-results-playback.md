@@ -10,6 +10,10 @@
 
 **Spec:** docs/specs/saved-results-playback.md
 
+## Stan wykonania
+
+Kod implementacji oraz managed scenariusz QA są zapisane na branchu zadania. Wcześniejszy build/API i frontend lint/typecheck przeszły w zakresie opisanym w [raporcie weryfikacji](../../specs/saved-results-playback-verification-20261027.md). Otwarte pozostają testy aplikacji, końcowa kontrola ochrony formularzy, React Doctor, przeglądarka/WebGL i integracja. Checkboxy łączące implementację z tymi bramkami pozostają niezaznaczone.
+
 ## Global Constraints
 
 - Źródła i wyniki pozostają niezmienne; bez uruchamiania skryptu ani solvera, bez przejmowania runtime.

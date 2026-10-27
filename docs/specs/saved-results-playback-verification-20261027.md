@@ -19,6 +19,7 @@ Obsługiwane są deskryptor playback.json i nieskompresowany Zarr v2 float64 LE,
 - Niezależne review wykryło warunkowy hook w shellu; poprawiono, a reviewer potwierdził poprawkę. Ostatnia ochrona pending forms wymaga jeszcze końcowej kontroli.
 - Aktualne testy interpretowanych helperów Python: python3 -B -m unittest scripts/test_docker_dev_codegen.py scripts/test_docker_dev_browser_qa.py — 45 testów, OK.
 - git diff --check: OK.
+- Hook commita uruchomił React Doctor, ale lint nie zakończył analizy: oxlint JS plugin zwrócił Unexpected discriminant 160 for TSNamespaceDeclarationKind. Commit powstał; wynik React Doctor jest NOT VERIFIED, a komunikat No issues found nie oznacza zaliczonej bramki.
 
 ## Otwarte bramki
 
