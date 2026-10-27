@@ -432,6 +432,16 @@ pub fn recover_coordinator(
     recover_coordinator_locked(store, claim)
 }
 
+/// Replay an exact coordinator under an existing shared store fence without repairs.
+pub fn recover_coordinator_readonly(
+    store: &SessionStore,
+    claim: &fullmag_application::TaskClaim,
+    transaction: &fullmag_session::ReadTransaction,
+) -> Result<RecoveredCoordinator> {
+    recover_coordinator_with_journal(store, claim, ||
+        store.read_coordinator_journal_readonly(claim.run_id.as_str(), transaction))
+}
+
 /// Caller already holds this store handle's native writer.
 pub(crate) fn recover_coordinator_locked(store: &SessionStore, claim: &fullmag_application::TaskClaim) -> Result<RecoveredCoordinator> {
     recover_coordinator_with_journal(store, claim, || store.read_coordinator_journal(claim.run_id.as_str()))
@@ -785,6 +795,7 @@ pub use scheduler::{
 };
 
 mod solution_set;
+pub use solution_set::publish_recovered_inspection_solution;
 mod study_field_tensor;
 pub use study_field_tensor::{
     read_pinned_study_tensor_snapshot, verify_pinned_native_fem_snapshot,

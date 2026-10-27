@@ -1,6 +1,6 @@
 # Stopka stacjonarnego obliczenia anteny — 26.10.2026
 
-Status 27.10.2026: odtworzony Failed oraz czas/powód etapu potwierdzone w działającym API i produkcyjnym modelu/SSR stopki. Pełna mapa H Universe nie powstała; browser/WebGL NOT VERIFIED.
+Status 27.10.2026: pełna mapa H Universe1145 została obliczona, odzyskana jako zapis inspekcyjny Failed/Unassessed i odczytana przez publiczne API. Telemetry/Antenna i ETA przeszły testy źródeł oraz SSR; browser/WebGL i live progress w bieżącym UI nadal NOT VERIFIED.
 
 Sekcje poniżej są chronologicznym rejestrem. Obowiązuje najnowszy checkpoint na końcu; wcześniejsze Running i brak sesji opisują wcześniejsze instancje.
 
@@ -999,3 +999,30 @@ interakcje klawiaturą w przeglądarce i live StageExecution dla nowego solve
 pozostają NOT VERIFIED z powodu wcześniejszej blokady dostępu do strony.
 Pełna mapa1145 nadal czeka na odzyskanie publikacji; nie jest to ukończenie
 wizualizacji Universe ani całego zakresu E0–E12.
+
+
+### Odzyskane pełne V/J/H Universe — 27.10.2026
+
+Zachowany pełny bundle1145 przeszedł kanoniczny natywny preview i został
+odzyskany do istniejącego SolutionSet bez Solve. Managed build:
+33ef2755a79347249532ffa86dd8c957, baza78136fb8feb0f57014d10cf171a1cec83ef55f62,
+snapshot4bebea9124ee772f7c624c8b02444ea4bce60c3ee0d12d5efbed83c195ad8252.
+Historia oryginalnego runu nadal Failed; nowy zapis jest Closed/Failed/Unassessed,
+recovered-solution-82e8f2e82ae2989cdd17519be89552b34085aa792e9d47b46285797bd9a1687a,
+revision1. To zapis odzyskanego wyniku inspekcyjnego, bez kwalifikacji bazy.
+
+Publiczny odczyt persistence potwierdził bitową zgodność V677, J7424 lokalnych
+śladów Tet4 i H1145 z oryginalnym pakietem, jednostki i skończoność danych.
+Wszystkie trzy owned geometries oraz FMMT/FMSP wróciły przez istniejące API;
+H obejmuje Global1145/6428. Trzy obce manifesty odmówiły409. Identyczny replay
+zachował revision1, graf artefaktów, dwa pliki katalogu i 1391 plików runu.
+Scena i current session pozostały bez zmian. Pełny Solve nie został ponowiony.
+
+Dowody: verification/completed-inspection-recovery-20261027/ we własnym
+wolumenie kontrolnym: heartbeat-postbuild-verification.json, native-preview-02/,
+apply-02/, http-04/field-report.json i replay-02/report.json.
+Szczegółowy kontrakt i granice:
+[Odzysk publikacji](2026-10-27-completed-inspection-publication-recovery.md).
+Wcześniejsze błędy samego kontrolera HTTP zachowano i opisano w tym dokumencie.
+Rzeczywisty widok pola w przeglądarce i live transport nowego progressbaru
+pozostają NOT VERIFIED. Nie jest to zakończenie E0–E12.

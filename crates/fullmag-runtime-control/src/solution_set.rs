@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 
 use crate::study::AcceptedStudySnapshot;
 
+mod recovered_inspection;
+pub use recovered_inspection::publish_recovered_inspection_solution;
+
 const RUNNING_ASSESSMENT_REASON: &str =
     "scientific assessment is pending while execution is running";
 
@@ -276,23 +279,7 @@ fn build_solution(
         .with_context(|| format!("accepted study step `{step_id}` has no resolved plan"))?;
 
     let solution_set_id = solution_set_id_for_claim(claim);
-    let provenance = SolutionSetProvenance {
-        run_spec_digest: prefixed_digest(accepted.run.specification.fingerprint()?),
-        model_digest: canonical_digest(&serde_json::json!({
-            "project_definition_sha256": accepted.run.specification.snapshot.definition_sha256,
-            "model": &step.model,
-        }))?,
-        physics_digest: canonical_digest(problem)?,
-        discretization_digest: canonical_digest(&step.discretization)?,
-        resolved_plan_digest: canonical_digest(resolved_plan)?,
-        acquisition_digest: canonical_digest(&serde_json::json!({
-            "policy": &step.acquisition,
-            "outputs": &step.outputs,
-        }))?,
-        seed_digest: (!accepted.run.specification.seeds.is_empty())
-            .then(|| canonical_digest(&accepted.run.specification.seeds))
-            .transpose()?,
-    };
+    let provenance = solution_provenance(accepted, step, problem, resolved_plan)?;
 
     let mut artifacts_by_case: BTreeMap<Option<String>, Vec<SolutionArtifactRef>> = BTreeMap::new();
     let mut coverage = Vec::new();
@@ -583,6 +570,31 @@ fn artifact_kind(data_kind: &str) -> SolutionArtifactKind {
         "table" | "scalar" => SolutionArtifactKind::Table,
         _ => SolutionArtifactKind::Other,
     }
+}
+
+fn solution_provenance(
+    accepted: &AcceptedStudySnapshot,
+    step: &fullmag_authoring::StudyStep,
+    problem: &fullmag_ir::ProblemIR,
+    resolved_plan: &fullmag_ir::ExecutionPlanIR,
+) -> Result<SolutionSetProvenance> {
+    Ok(SolutionSetProvenance {
+        run_spec_digest: prefixed_digest(accepted.run.specification.fingerprint()?),
+        model_digest: canonical_digest(&serde_json::json!({
+            "project_definition_sha256": accepted.run.specification.snapshot.definition_sha256,
+            "model": &step.model,
+        }))?,
+        physics_digest: canonical_digest(problem)?,
+        discretization_digest: canonical_digest(&step.discretization)?,
+        resolved_plan_digest: canonical_digest(resolved_plan)?,
+        acquisition_digest: canonical_digest(&serde_json::json!({
+            "policy": &step.acquisition,
+            "outputs": &step.outputs,
+        }))?,
+        seed_digest: (!accepted.run.specification.seeds.is_empty())
+            .then(|| canonical_digest(&accepted.run.specification.seeds))
+            .transpose()?,
+    })
 }
 
 fn canonical_digest(value: &impl Serialize) -> Result<String> {

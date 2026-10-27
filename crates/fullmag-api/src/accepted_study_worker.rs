@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 pub(crate) mod accepted_solver_profile;
 #[path = "accepted_antenna_progress.rs"]
 pub(crate) mod accepted_antenna_progress;
+#[path = "completed_inspection_recovery.rs"]
+pub(crate) mod completed_inspection_recovery;
 
 #[path = "accepted_worker_execution_receipt.rs"]
 mod accepted_worker_execution_receipt;

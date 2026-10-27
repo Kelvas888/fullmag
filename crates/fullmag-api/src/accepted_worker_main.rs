@@ -34,6 +34,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--recover-inspection-publication")) {
+        worker_startup_gate::verify_runtime_owner_build()?;
+        return accepted_study_worker::completed_inspection_recovery::run();
+    }
     let args = parse_args()?;
     worker_startup_gate::verify_runtime_owner_build()?;
     if args.startup_gate {
