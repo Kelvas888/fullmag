@@ -10,6 +10,8 @@ Inwentarz obejmuje dziesięć grup zakwalifikowanych wcześniej jako blocked-rec
 
 Transakcja pod blokadą kontrolną publikuje własny dowód offline, sprawdza CAS i zwalnia wyłącznie marker technicznej operacji. Nie tworzy fikcyjnego stop journal, nie zmienia OWNER, process-tree, katalogów runów ani wyników. Oryginalny receipt activation pozostaje unknown. Nowa aktywacja jest zablokowana; migracja bez skryptu może jawnie konsumować dowód przez `recreate-volume --offline-reconciliation <token>`.
 
+Brak dawnego bridge wymaga wspólnego dowodu: historycznego name+ID w obu zatrzymanych usługach, poprawnej izolacji PID/IPC i portów, dokładnego błędu not-found dla pełnego ID oraz dwóch zgodnych inwentarzy sieci. Błąd demona, ponowne użycie nazwy lub zmiana dowodu pod blokadą przerywa naprawę.
+
 Terminalne wyniki nie są traktowane jako held run i nie są automatycznie wznawiane. Po przerwaniu samej naprawy wznowienie używa tego samego zamiaru i pinned evidence; nie powstaje drugi dowód dla zmienionych danych.
 
 ## Pozostałe przypadki

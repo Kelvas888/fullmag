@@ -337,8 +337,10 @@ def _validate_container(row: object, *, container_id: str, service: str,
             or not isinstance(started, str) or not started
             or not isinstance(finished, str) or not finished):
         raise _fail("Only an actually stopped, bounded container incarnation is eligible")
-    if host.get("PidMode") not in (None, "") or host.get("Privileged") is not False:
-        raise _fail("Stopped service is not private-PID and unprivileged")
+    if (host.get("PidMode") not in (None, "", "private")
+            or host.get("IpcMode") not in ("", "private")
+            or host.get("Privileged") is not False):
+        raise _fail("Stopped service is not private-PID/private-IPC and unprivileged")
     if host.get("NetworkMode") in {"host", "none"} or host.get("Binds") not in (None, []):
         raise _fail("Stopped service uses a non-private network or unapproved host bind")
     mounts = row.get("Mounts", [])
@@ -398,6 +400,27 @@ def _validate_stopped_pair(actual: object, *, expected_ids: Mapping[str, object]
     if evidence["backend"]["network_names"] != evidence["frontend"]["network_names"]:
         raise _fail("Stopped backend/frontend pair does not share the same private network")
     return evidence
+
+
+def _validate_stopped_service_exposure(pair: Mapping[str, Mapping[str, Any]], *,
+                                       network_name: str, port: int) -> None:
+    """Validate service isolation and frontend loopback exposure with or without a bridge."""
+    if not isinstance(pair, Mapping) or set(pair) != {"backend", "frontend"}:
+        raise _fail("Stopped backend/frontend pair exposure is incomplete")
+    backend_host = pair["backend"].get("HostConfig")
+    frontend_host = pair["frontend"].get("HostConfig")
+    if not isinstance(backend_host, Mapping) or not isinstance(frontend_host, Mapping):
+        raise _fail("Stopped service host configuration is malformed")
+    if backend_host.get("PortBindings"):
+        raise _fail("Stopped backend is not unpublished")
+    expected_bindings = {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]}
+    if frontend_host.get("PortBindings") != expected_bindings:
+        raise _fail("Stopped frontend does not publish the exact loopback port")
+    for service, host in (("backend", backend_host), ("frontend", frontend_host)):
+        if (host.get("PidMode") not in (None, "", "private")
+                or host.get("IpcMode") not in ("", "private")
+                or host.get("NetworkMode") != network_name):
+            raise _fail("Stopped " + service + " does not retain private PID/IPC and canonical network namespaces")
 
 
 def _validate_private_network(row: object, *, project: str, network_name: str,
@@ -924,26 +947,63 @@ def _compose_pair(document: Mapping[str, Any], identity: Mapping[str, str], cont
         except (BuildControlError, KeyError, TypeError, ValueError) as error:
             raise _fail("Retained " + service + " service config differs: " + str(error)) from error
     pair = {service: by_id[actual_ids[service]] for service in actual_ids}
-    _validate_retained_network(
-        pair["backend"], pair["frontend"], actual_ids["backend"], actual_ids["frontend"],
-        control.project, identity["network_name"], _document_port(document),
-    )
     evidence = _validate_stopped_pair(
         pair,
         expected_ids=expected_ids,
         project=control.project,
         image_id=image_ids["backend"],
     )
-    networks = pair["backend"].get("NetworkSettings", {}).get("Networks", {})
-    network_name = evidence["backend"]["network_names"][0]
-    network_rows = json.loads(docker_capture("network", "inspect", network_name).stdout)
-    if len(network_rows) != 1 or not isinstance(network_rows[0], Mapping):
-        raise _fail("Retained application network inspection is incomplete")
-    network = network_rows[0]
-    network_evidence = _validate_private_network(
-        network, project=control.project, network_name=network_name,
-        expected_network_label="fullmag", allowed_ids=set(actual_ids.values()),
+    expected_port = _document_port(document)
+    _validate_stopped_service_exposure(
+        pair, network_name=identity["network_name"], port=expected_port,
     )
+
+    owned_bridge_evidence: dict[str, Any] = {}
+
+    def validate_owned_bridge(containers, ids, project):
+        if (project != control.project or ids != actual_ids
+                or set(containers) != {"backend", "frontend"}):
+            raise _fail("Owned bridge validation is not bound to the selected stopped pair")
+        _validate_retained_network(
+            containers["backend"], containers["frontend"], ids["backend"], ids["frontend"],
+            project, identity["network_name"], expected_port,
+        )
+        rows = json.loads(docker_capture(
+            "network", "inspect", identity["network_name"],
+        ).stdout)
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+            raise _fail("Retained application network inspection is incomplete")
+        owned_bridge_evidence.update(_validate_private_network(
+            rows[0], project=project, network_name=identity["network_name"],
+            expected_network_label="fullmag", allowed_ids=set(ids.values()),
+        ))
+
+    from docker_stopped_network import observe_stopped_bridge
+    try:
+        observed_bridge = observe_stopped_bridge(
+            pair["backend"], pair["frontend"], control.project,
+            capture=docker_capture, validate_owned_bridge=validate_owned_bridge,
+        )
+    except BuildControlError as error:
+        raise _fail("Stopped bridge identity could not be authenticated: " + str(error)) from error
+    if (not isinstance(observed_bridge, Mapping)
+            or observed_bridge.get("name") != identity["network_name"]
+            or not isinstance(observed_bridge.get("network_id"), str)
+            or CONTAINER_ID_RE.fullmatch(observed_bridge["network_id"]) is None
+            or observed_bridge.get("state") not in {"owned-bridge", "absent"}):
+        raise _fail("Stopped bridge observer returned malformed identity evidence")
+    backend_networks = pair["backend"].get("NetworkSettings", {}).get("Networks", {})
+    historical_endpoint = backend_networks.get(identity["network_name"])
+    if (not isinstance(historical_endpoint, Mapping)
+            or historical_endpoint.get("NetworkID") != observed_bridge["network_id"]):
+        raise _fail("Stopped bridge observer differs from the service's historical network ID")
+    network_evidence = dict(observed_bridge)
+    if observed_bridge["state"] == "owned-bridge":
+        if owned_bridge_evidence.get("id") != observed_bridge["network_id"]:
+            raise _fail("Owned bridge validation differs from the historical network ID")
+        network_evidence["ownership"] = owned_bridge_evidence
+    elif owned_bridge_evidence:
+        raise _fail("Absent bridge unexpectedly produced owned-network evidence")
     protected = {control.volume, ledger_volume}
     for value in (development.get("backend_volumes") or {}).values():
         if isinstance(value, str):

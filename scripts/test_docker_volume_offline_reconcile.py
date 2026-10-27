@@ -50,14 +50,14 @@ def stopped(service: str, *, identifier: str = CONTAINER, running: bool = False)
         "Id": identifier, "Image": IMAGE, "RestartCount": 2,
         "Config": {"Labels": {"com.docker.compose.project": "fullmag-demo",
                                "com.docker.compose.service": service}},
-        "HostConfig": {"PidMode": "", "Privileged": False,
+        "HostConfig": {"PidMode": "", "IpcMode": "private", "Privileged": False,
                        "NetworkMode": "fullmag-demo_fullmag", "Binds": []},
         "State": {"Status": "running" if running else "exited", "Running": running,
                   "Paused": False, "Restarting": False, "Dead": False,
                   "OOMKilled": False, "Pid": 123 if running else 0,
                   "StartedAt": "2026-10-27T00:00:00Z",
                   "FinishedAt": "2026-10-27T00:01:00Z", "ExitCode": 255},
-        "NetworkSettings": {"Networks": {"fullmag-demo_fullmag": {}}},
+        "NetworkSettings": {"Networks": {"fullmag-demo_fullmag": {"NetworkID": "e" * 64}}},
         "Mounts": [],
     }
 
@@ -337,7 +337,9 @@ class ProjectInventoryScopeTests(unittest.TestCase):
                     protected_volumes={"protected-control"}, state_root=Path("/workspace/state"),
                     ledger_volume="protected-ledger")
 
-    def test_compose_pair_uses_canonical_hashed_network_for_long_project_name(self) -> None:
+    def _invoke_compose_pair(self, project: str, *, bridge_state: str,
+                             frontend_port: int = 3198, backend_ipc: str | None = "private",
+                             include_ipc: bool = True):
         from unittest.mock import patch
         import docker_dev_up
         from docker_compose_identity import compose_network_name
@@ -355,10 +357,14 @@ class ProjectInventoryScopeTests(unittest.TestCase):
         for service, row in (("backend", backend), ("frontend", frontend)):
             row["Config"]["Labels"]["com.docker.compose.project"] = project
             row["HostConfig"]["NetworkMode"] = network_name
-            row["NetworkSettings"]["Networks"] = {network_name: {}}
+            if include_ipc:
+                row["HostConfig"]["IpcMode"] = backend_ipc if service == "backend" else "private"
+            else:
+                row["HostConfig"].pop("IpcMode", None)
+            row["NetworkSettings"]["Networks"] = {network_name: {"NetworkID": "8" * 64}}
         frontend["Image"] = frontend_image
         frontend["HostConfig"]["PortBindings"] = {
-            "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3198"}],
+            "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(frontend_port)}],
         }
         network = {"Name": network_name, "Id": "8" * 64, "Driver": "bridge",
                    "Labels": {"com.docker.compose.project": project,
@@ -379,7 +385,17 @@ class ProjectInventoryScopeTests(unittest.TestCase):
             if arguments[:2] == ("image", "inspect"):
                 image_id = IMAGE if arguments[-1] == "backend-ref" else frontend_image
                 return docker_result([{"Id": image_id, "Config": {}}])
+            if arguments[:2] == ("network", "ls"):
+                rows = [{"ID": "8" * 64, "Name": network_name}] if bridge_state == "owned-bridge" else []
+                return SimpleNamespace(returncode=0,
+                                       stdout=("\n".join(json.dumps(row) for row in rows) + "\n").encode(),
+                                       stderr=b"")
             if arguments[:2] == ("network", "inspect"):
+                if bridge_state == "absent":
+                    return SimpleNamespace(
+                        returncode=1, stdout=b"",
+                        stderr=f"Error response from daemon: network {arguments[-1]} not found".encode(),
+                    )
                 return docker_result([network])
             raise AssertionError(arguments)
 
@@ -400,9 +416,127 @@ class ProjectInventoryScopeTests(unittest.TestCase):
             evidence, _pair, inventory = module._compose_pair(
                 document, identity, control, development, state_root=Path("/workspace/state"),
                 ledger_volume="group-ledger")
+        return evidence, inventory, validate_network, network_name
+
+    def test_compose_pair_uses_canonical_hashed_network_for_long_project_name(self) -> None:
+        project = "fullmag-worktree-" + "a" * 80
+        evidence, inventory, validate_network, network_name = self._invoke_compose_pair(
+            project, bridge_state="owned-bridge")
         self.assertEqual(validate_network.call_args.args[5], network_name)
         self.assertEqual(evidence["containers"]["backend"]["network_names"], [network_name])
-        self.assertEqual(inventory, sorted([CONTAINER, frontend_id]))
+        self.assertEqual(evidence["network"]["state"], "owned-bridge")
+        self.assertEqual(evidence["network"]["network_id"], "8" * 64)
+        self.assertEqual(inventory, sorted([CONTAINER, "f" * 64]))
+
+    def test_compose_pair_records_shared_authoritative_absent_bridge_proof(self) -> None:
+        evidence, inventory, validate_network, network_name = self._invoke_compose_pair(
+            "fullmag-demo", bridge_state="absent")
+        self.assertEqual(evidence["network"], {
+            "name": network_name, "network_id": "8" * 64, "state": "absent",
+        })
+        validate_network.assert_not_called()
+        self.assertEqual(inventory, sorted([CONTAINER, "f" * 64]))
+
+    def test_bad_port_or_missing_ipc_evidence_rejects_absent_bridge_before_observation(self) -> None:
+        from unittest.mock import patch
+        import docker_stopped_network
+        observer = docker_stopped_network.observe_stopped_bridge
+        with patch.object(docker_stopped_network, "observe_stopped_bridge", wraps=observer) as observe:
+            with self.assertRaisesRegex(BuildControlError, "exact loopback port"):
+                self._invoke_compose_pair("fullmag-demo", bridge_state="absent", frontend_port=3197)
+            observe.assert_not_called()
+        with patch.object(docker_stopped_network, "observe_stopped_bridge", wraps=observer) as observe:
+            with self.assertRaisesRegex(BuildControlError, "private-PID/private-IPC"):
+                self._invoke_compose_pair("fullmag-demo", bridge_state="absent", include_ipc=False)
+            observe.assert_not_called()
+
+    def test_shared_observer_accepts_absence_only_after_authoritative_inspect_and_two_lists(self) -> None:
+        from docker_stopped_network import observe_stopped_bridge
+        project = "fullmag-demo"
+        network_name = "fullmag-demo_fullmag"
+        network_id = "8" * 64
+        backend, frontend = stopped("backend"), stopped("frontend", identifier="f" * 64)
+        for row in (backend, frontend):
+            row["HostConfig"]["NetworkMode"] = network_name
+            row["NetworkSettings"]["Networks"] = {network_name: {"NetworkID": network_id}}
+        calls = []
+
+        def capture(*arguments, **kwargs):
+            calls.append((arguments, kwargs))
+            if arguments[:2] == ("network", "ls"):
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+            if arguments[:2] == ("network", "inspect"):
+                self.assertTrue(kwargs.get("allow_failure"))
+                return SimpleNamespace(
+                    returncode=1, stdout=b"",
+                    stderr=f"Error response from daemon: network {network_id} not found".encode(),
+                )
+            raise AssertionError(arguments)
+
+        result = observe_stopped_bridge(
+            backend, frontend, project, capture=capture,
+            validate_owned_bridge=lambda *_: self.fail("absent bridge must not run owned validation"),
+        )
+        self.assertEqual(result, {"name": network_name, "network_id": network_id, "state": "absent"})
+        self.assertEqual(sum(call[0][:2] == ("network", "ls") for call in calls), 2)
+
+    def test_live_plan_rejects_bridge_proof_change_before_offline_commit(self) -> None:
+        from unittest.mock import patch
+        pair_ids = sorted([CONTAINER, "f" * 64])
+        helper_id = "3" * 64
+        old_pair = {"containers": {}, "network": {
+            "name": "fullmag-demo_fullmag", "network_id": "8" * 64, "state": "absent"}}
+        changed_pair = {"containers": {}, "network": {
+            "name": "fullmag-demo_fullmag", "network_id": "9" * 64, "state": "owned-bridge"}}
+        context = {
+            "plan": {"container_inventory_ids": pair_ids, "stopped_pair": old_pair,
+                     "docker_engine_id": "engine"},
+            "development": {}, "document": {}, "identity": {},
+            "control": SimpleNamespace(project="fullmag-demo"),
+            "state_root": Path("/workspace/state"), "ledger_volume": "group-ledger",
+        }
+        with patch.object(module, "_compose_pair",
+                          return_value=(changed_pair, {}, sorted([*pair_ids, helper_id]))) as inspect_pair, \
+                patch.object(module, "docker_capture",
+                             return_value=SimpleNamespace(stdout=b"engine")):
+            with self.assertRaisesRegex(BuildControlError, "Stopped service incarnation/network changed"):
+                module._current_live_plan(context, "fullmag-control-offline-test", helper_id)
+        self.assertEqual(inspect_pair.call_args.kwargs["helper_id"], helper_id)
+
+    def test_stopped_services_keep_port_and_private_ipc_checks_without_a_bridge(self) -> None:
+        backend, frontend = stopped("backend"), stopped("frontend", identifier="f" * 64)
+        frontend["HostConfig"]["PortBindings"] = {
+            "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3198"}],
+        }
+        pair = {"backend": backend, "frontend": frontend}
+        module._validate_stopped_service_exposure(
+            pair, network_name="fullmag-demo_fullmag", port=3198)
+        frontend["HostConfig"]["PortBindings"] = {
+            "8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "3198"}],
+        }
+        with self.assertRaisesRegex(BuildControlError, "exact loopback port"):
+            module._validate_stopped_service_exposure(
+                pair, network_name="fullmag-demo_fullmag", port=3198)
+        frontend["HostConfig"]["PortBindings"] = {
+            "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3198"}],
+        }
+        backend["HostConfig"]["IpcMode"] = "host"
+        with self.assertRaisesRegex(BuildControlError, "private-PID/private-IPC"):
+            module._validate_stopped_pair(
+                pair, expected_ids={"backend": CONTAINER, "frontend": "f" * 64},
+                project="fullmag-demo", image_id=IMAGE)
+        for ipc_mode in (None, "missing"):
+            with self.subTest(ipc_mode=ipc_mode):
+                invalid_backend = stopped("backend")
+                if ipc_mode == "missing":
+                    invalid_backend["HostConfig"].pop("IpcMode")
+                else:
+                    invalid_backend["HostConfig"]["IpcMode"] = None
+                with self.assertRaisesRegex(BuildControlError, "private-PID/private-IPC"):
+                    module._validate_stopped_pair(
+                        {"backend": invalid_backend, "frontend": frontend},
+                        expected_ids={"backend": CONTAINER, "frontend": "f" * 64},
+                        project="fullmag-demo", image_id=IMAGE)
 
     def test_rejects_unknown_or_terminal_marker_phase(self) -> None:
         with self.assertRaises(BuildControlError):
