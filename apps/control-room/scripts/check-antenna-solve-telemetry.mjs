@@ -80,6 +80,21 @@ assert.match(first.statusTitle, /Antenna solve/);
 console.log("PASS actual retained running antenna projection has honest status and no LLG zero counters");
 
 const value = (result, label) => result.metrics.find(metric => metric.label === label)?.value;
+const missing = build(null, null, null, {
+  sessionId: "previous-session", runId: "previous-run", revision: 99,
+  row: { step: 42, time: 2, mx: 1, my: 0, mz: 0 },
+}, stages);
+assert.deepEqual(missing.metrics, [], "Absent session telemetry must not publish zero or stale LLG counters");
+assert.equal(missing.statusTitle, "System Status: No live telemetry");
+assert.equal(missing.awaitingCompute, false);
+selectedStatus = null; selectedStages = stages; calls.length = 0;
+const missingMarkup = renderToStaticMarkup(React.createElement(mod.namespace.FooterTelemetry, { bus: { subscribe: () => () => {} } }));
+assert.ok(missingMarkup.includes("No live telemetry"));
+assert.ok(!missingMarkup.includes(">Step<") && !missingMarkup.includes("Sim time"));
+for (const name of ["useScalarWindowResource", "useFrequencyDomainResponseProgressResource", "useFrequencyDomainResponseSweepResource", "useStageExecutionResource", "useSolverStatusResource"]) {
+  assert.equal(calls.find(call => call.name === name).options.enabled, false, name);
+}
+console.log("PASS absent telemetry rejects stale samples and renders no fabricated zero counters");
 for (const state of ["pending", "running", "completed", "failed", "cancelled"]) {
   const record = { ...stages.stages[0], status: state, state_transition_reason: state === "failed" ? "Native solve time limit" : null };
   const resource = { ...stages, runtime_state: state, active_stage_index: state === "running" ? 0 : null, stages: [record] };
@@ -190,4 +205,4 @@ assert.equal(renderClock(null), null); assert.equal(timers.size, 0, "Terminal/mi
 renderClock("scopeC/stageA/start1000"); assert.equal(timers.size, 1); cleanup?.();
 assert.equal(timers.size, 0, "Unmount must dispose the timer");
 console.log("PASS actual clock hook hydration, identity fencing, terminal/idle and unmount cleanup without API polling");
-console.log(JSON.stringify({ status: "passed", groups: 7, scope: "interpreted production telemetry model, SSR and clock lifecycle", browser_verified: false, unit_test_compilation: false }));
+console.log(JSON.stringify({ status: "passed", groups: 8, scope: "interpreted production telemetry model, SSR and clock lifecycle", browser_verified: false, unit_test_compilation: false }));

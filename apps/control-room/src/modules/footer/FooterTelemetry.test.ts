@@ -163,6 +163,17 @@ const objectMetrics: ObjectMetricsResource = {
 };
 
 describe("FooterTelemetry", () => {
+  const currentStatus = selectFooterTelemetryStatus({
+    data: status, error: null, refetch: () => {}, revision: 1, status: "ready",
+  });
+
+  it("does not publish fabricated metrics without current session telemetry", () => {
+    const model = buildFooterTelemetryModel(null, objectMetrics);
+    expect(model.metrics).toEqual([]);
+    expect(model.statusTitle).toBe("System Status: No live telemetry");
+    expect(model.awaitingCompute).toBe(false);
+  });
+
   it("builds a responsive metric model from live status and object metrics", () => {
     const telemetryStatus = selectFooterTelemetryStatus({
       data: status,
@@ -190,7 +201,7 @@ describe("FooterTelemetry", () => {
     const scene = { objects: [{ id: "conductor", name: "Conductor" }], revision: 1 } satisfies SceneResource;
     const magneticModelPresent = resolveFooterMagneticModelPresent({ data: scene, status: "ready" });
     expect(magneticModelPresent).toBe(false);
-    const model = buildFooterTelemetryModel(null, objectMetrics, null, null, null, null, null, null, { magneticModelPresent });
+    const model = buildFooterTelemetryModel(currentStatus, objectMetrics, null, null, null, null, null, null, { magneticModelPresent });
     expect(model.metrics.some((metric) => metric.id.startsWith("avg-m") || metric.id.startsWith("energy-") || metric.id === "max-torque")).toBe(false);
     expect(model.metrics.some((metric) => metric.id === "time")).toBe(true);
   });
@@ -203,7 +214,7 @@ describe("FooterTelemetry", () => {
     expect(resolvePrimaryTelemetryObjectId(scene, "conductor")).toBeNull();
     const magneticModelPresent = resolveFooterMagneticModelPresent({ data: scene, status: "ready" });
     expect(magneticModelPresent).toBe(true);
-    const model = buildFooterTelemetryModel(null, null, null, null, null, null, null, null, { magneticModelPresent });
+    const model = buildFooterTelemetryModel(currentStatus, null, null, null, null, null, null, null, { magneticModelPresent });
     expect(model.metrics.some((metric) => metric.id === "avg-mx")).toBe(true);
     expect(model.metrics.some((metric) => metric.id === "energy-total")).toBe(true);
   });
@@ -212,7 +223,7 @@ describe("FooterTelemetry", () => {
     expect(resolveFooterMagneticModelPresent({ data: null, status: "loading" })).toBeNull();
     expect(resolveFooterMagneticModelPresent({ data: { revision: 1 }, status: "ready" })).toBeNull();
     expect(resolveFooterMagneticModelPresent({ data: { objects: [], revision: 1 }, status: "loading" })).toBeNull();
-    const model = buildFooterTelemetryModel(null, null, null, null, null, null, null, null, { magneticModelPresent: null });
+    const model = buildFooterTelemetryModel({ ...currentStatus!, solver: { state: "unknown", dt: null, max_torque_T: null } }, null, null, null, null, null, null, null, { magneticModelPresent: null });
     expect(model.metrics.find((metric) => metric.id === "max-torque")?.value).toBe("—");
     expect(model.metrics.find((metric) => metric.id === "dt")?.value).toBe("—");
   });

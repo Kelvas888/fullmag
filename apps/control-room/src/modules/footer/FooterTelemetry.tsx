@@ -391,6 +391,18 @@ export function buildFooterTelemetryModel(
     userSolvePhase?: RuntimeUserSolvePhase | null;
   },
 ) {
+  if (!status) return {
+    awaitingCompute: false,
+    frequencyDomainProgress: null,
+    stageProgressNotice: null,
+    metrics: [] as FooterTelemetryMetric[],
+    onlineDetail: "No current session telemetry",
+    onlineTitle: "Local / Standby",
+    statusDetail: "Waiting for current session telemetry",
+    statusState: "unknown",
+    statusTitle: "System Status: No live telemetry",
+  };
+
   const antennaStage = resolveFooterAntennaStage(status, stageExecution);
   if (antennaStage) return buildAntennaSolveTelemetry(antennaStage, runtimePhase?.nowMs ?? null);
 

@@ -62,3 +62,30 @@ PID 5124, stan R, CPU ticks 1121976 → 1122288 w 2 s,
 czas procesu około 9027 s, API Running, revision artefaktów 0.
 To dowód wykonywania pracy, nie procent wykonania ani gwarancja zakończenia.
 Pełny wynik V/J/H oraz obraz H w Universe nadal nie są potwierdzone.
+
+## Brak aktywnej telemetrii po restarcie — 27.10.2026
+
+Nowszy odczyt API potwierdził `health.status=ok`, `active_session=false`
+i pustą listę sesji. Historyczny pełny Solve zakończył się Failed z powodu
+`surface RT0 wall-time exhausted`; nie powstała mapa H całego Universe.
+Poprzednie datowane obserwacje Running są historią, nie stanem aktualnym.
+
+Dodatkowa regresja odtworzyła błąd: bez statusu bieżącej sesji stopka nadal
+budowała Step 0, a zachowany event starej sesji mógł dać nawet Step 42.
+`FooterTelemetry.tsx::buildFooterTelemetryModel` kończy teraz tę gałąź przed
+odczytem scalarów/metryk: pokazuje `No live telemetry` i nie publikuje liczników.
+Nie deklaruje ani uruchomionego solve, ani braku wszystkich historycznych wyników.
+Jawna gałąź anteny oraz rzeczywiste liczniki LLG pozostają bez zmian.
+
+RED: interpretowana regresja przed poprawką zakończyła się exit 1 na
+`Absent session telemetry must not publish zero or stale LLG counters`.
+GREEN: osiem grup modelu produkcyjnego/SSR/lifecycle przeszło exit 0.
+Sprawdzono także wyłączenie zależnych requestów przy braku statusu.
+Pełne `tsc --noEmit --incremental false` oraz lint trzech zmienionych plików
+z `--max-warnings=0` zakończyły się exit 0 w istniejącym kontenerze frontendu.
+Nie kompilowano ani nie uruchamiano suite jednostkowej aplikacji/Rust.
+
+Dowody: frontend volume `/state/development/verification/footer-missing-session-20261027/`:
+`result.json`, `green.stdout.log`, `green.stderr.log`, `typecheck.*.log`, `lint.*.log`.
+To korekta renderowania przy braku danych, nie odtworzenie historycznej sesji,
+nowy wynik solvera ani odbiór wizualny przeglądarki. Browser/WebGL nadal NOT VERIFIED.
