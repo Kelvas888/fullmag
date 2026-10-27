@@ -372,7 +372,8 @@ export function StartScreen({ kernel }: ModuleProps) {
       ? (results.state.items.find((item) => item.id === selectedResultId) ?? null)
       : null;
   const showInspector =
-    section !== "home" || Boolean(selectedEntry || selectedScript || selectedResult);
+    section !== "docs" &&
+    (section !== "home" || Boolean(selectedEntry || selectedScript || selectedResult));
   const isCompact = useSyncExternalStore(
     subscribeStartInspectorLayout,
     getStartInspectorLayout,
@@ -424,12 +425,14 @@ export function StartScreen({ kernel }: ModuleProps) {
   }, []);
 
   // A section change moves focus to the new content, except when it came from
-  // the rail, where the user is still navigating.
+  // the rail, where the user is still navigating, or when DocsSection focuses
+  // its own search input.
   useEffect(() => {
     if (previousSection.current === section) return;
     previousSection.current = section;
     const active = typeof document === "undefined" ? null : document.activeElement;
     if (active && railRef.current?.contains(active)) return;
+    if (section === "docs") return;
     mainRef.current?.focus();
   }, [section]);
 

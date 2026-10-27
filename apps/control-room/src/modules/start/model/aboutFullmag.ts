@@ -89,7 +89,7 @@ export const FULLMAG_CONTROL_ROOM_URL = "https://fullmag.mzelent.pl/frontend/con
 export const FULLMAG_PYTHON_API_URL = "https://fullmag.mzelent.pl/python-api/index.html";
 export const FULLMAG_PHYSICS_URL = "https://fullmag.mzelent.pl/physics/index.html";
 export const FULLMAG_NUMERICAL_URL = "https://fullmag.mzelent.pl/numerical-methods/index.html";
-export const FULLMAG_CAPABILITY_MATRIX_URL = "https://fullmag.mzelent.pl/docs/specs/capability-matrix-v0.md";
+export const FULLMAG_CAPABILITY_MATRIX_URL = "https://fullmag.mzelent.pl/architecture/planner-and-capabilities.html";
 
 export interface ExtendedAuthor extends FullmagAuthor {
   readonly role: string;

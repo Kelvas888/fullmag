@@ -1,4 +1,5 @@
-/** Central theme tokens and fallback styles for same-origin embedded docs. */
+export const EMBED_FALLBACK_STYLE_ID = "fullmag-embed-fallback-style";
+
 export const EMBED_FALLBACK_CSS = `
 :root,
 html[data-theme="light"] {
@@ -112,16 +113,18 @@ body,
   color: var(--fm-docs-text-primary);
 }
 
+html[data-fullmag-embedded] {
+  --header-height: 0px !important;
+  --announcement-height: 0px !important;
+}
+
+html[data-fullmag-embedded] #main-header,
+html[data-fullmag-embedded] #searchModal,
 html[data-fullmag-embedded] .fm-header-build-stamp,
 html[data-fullmag-embedded] .mode-select,
 html[data-fullmag-embedded] #announcement,
 html[data-fullmag-embedded] .announcement {
   display: none !important;
-}
-
-html[data-fullmag-embedded] #main-header {
-  background-color: var(--fm-docs-bg-app) !important;
-  border-bottom: 1px solid var(--fm-docs-border-subtle);
 }
 
 article > main div.highlight,
