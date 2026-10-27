@@ -2521,6 +2521,14 @@ def _parser() -> argparse.ArgumentParser:
     empty_quarantine.add_argument("--activation", required=True)
     empty_quarantine.add_argument("--recovery-id", required=True)
     empty_quarantine.add_argument("--apply", action="store_true", help="commit after exact stopped-namespace and empty-store proofs; default is dry-run")
+    reattest = subparsers.add_parser("reattest-host-device-volume", help="explicitly reattest a stopped WSL group's renumbered host device")
+    reattest.add_argument("--source-root", type=Path, required=True)
+    reattest.add_argument("--attempt", required=True)
+    reattest.add_argument("--config-sha256", required=True)
+    reattest.add_argument("--certificate-sha256", required=True)
+    reattest.add_argument("--expected-host-device", type=int, required=True)
+    reattest.add_argument("--apply", action="store_true")
+    reattest.add_argument("--interrupted-iteration", help="exact absent helper iteration to reconcile after an abrupt host stop")
     resume_parser = subparsers.add_parser("resume-volume", help="Observe one exact retained volume DEV start without restarting backend")
     resume_parser.add_argument("--attempt", required=True)
     resume_parser.add_argument("--config-sha256", required=True)
@@ -3003,6 +3011,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "quarantine-empty-stopped":
             from docker_volume_empty_quarantine import quarantine
             quarantine(args)
+        elif args.action == "reattest-host-device-volume":
+            from docker_volume_host_device import run as reattest_host_device
+            print(json.dumps(reattest_host_device(args), sort_keys=True))
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)
