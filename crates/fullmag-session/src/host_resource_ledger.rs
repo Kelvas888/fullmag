@@ -18,6 +18,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::canonical_json_sha256;
+
+/// The active compute-node owner has no current sample. The sampler publishes
+/// a fresh one periodically, so admission waits for it; this is never a fault
+/// of the request itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputeNodeSampleNotCurrent;
+
+impl std::fmt::Display for ComputeNodeSampleNotCurrent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("host admission requires a current sample for the active compute-node owner")
+    }
+}
+
+impl std::error::Error for ComputeNodeSampleNotCurrent {}
 use crate::compute_node_snapshot::{
     ComputeNodeSnapshot, EnforcementStatus, GpuPartition, Reported, UnavailableReason,
 };
@@ -3078,7 +3092,7 @@ impl HostResourceLedger {
             || snapshot.host_owner_epoch != Some(owner_epoch)
             || !snapshot.is_current_at(chrono::Utc::now())?
         {
-            bail!("host admission requires a current sample for the active compute-node owner");
+            return Err(anyhow::Error::new(ComputeNodeSampleNotCurrent));
         }
         Ok(())
     }
