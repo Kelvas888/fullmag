@@ -418,3 +418,27 @@ restart nadal NOT VERIFIED. Backend i frontend zatrzymane; oryginalny helper
 zachowuje lease. Nie wykonano cleanup, nowego Solve ani zmiany profilu GPU
 aplikacji. CPU ABI w helperze służy wyłącznie natywnemu odczytowi metadanych
 bez GPU; zgodność loadera wymaga rzeczywistego wykonania.
+
+
+## Rzeczywista walidacja dokumentu Compose i obserwacja native prepare
+
+Fragment recovery zapisano lokalnie w
+`98f36cbcb2456588949fa7bcdffff611e0d369a5`. Przed uruchomieniem helpera
+rzeczywisty `docker compose config` odtworzył błąd brakujących deklaracji
+wolumenów. Uzupełniono wyłącznie deklaracje istniejących named volumes jako
+`external:true` i dokładne `name`; bindy i subpath pozostały bez zmian.
+Ten sam schema check przeszedł z exit0, a 23 regresje zmienionego modułu
+przeszły ponownie przy stabilnych źródłach. Niezależny przegląd delty:
+0 Blocker/Required. Dowody w control volume:
+`verification/terminal-prestart-recovery-20261027/compose-schema-root-review.json`
+oraz `offline-terminal-external-volumes.json`. Starszy raport 80 PASS
+odnosi się do swoich wskazanych SHA; nie podmieniono go nowym wynikiem.
+
+Diagnostyczny prepare uruchomił rzeczywisty helper bez GPU i API. Klient
+przekroczył 180s obserwacji; stan należy traktować jako unknown, a nie
+terminalną awarię helpera. Ponowny odczyt potwierdził żywy kontener i postęp
+po kolejnych plikach pakietu. Nie uruchomiono nowej próby; dołączono obserwację
+logów tej samej instancji. `native-prepare-observation.json` zachowuje dokładny
+ID i StartedAt. Backend i frontend są nadal stopped, owner c037 zachowuje
+lease, nie wykonano reconcile, startup ani Solve. Wynik native prepare
+i kanoniczny preview nadal wymagają oceny.

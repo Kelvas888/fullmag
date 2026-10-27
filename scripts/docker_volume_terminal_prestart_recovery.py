@@ -335,7 +335,9 @@ def diagnostic_document(control, actual, payload):
     require(len(libraries) <= 1, "Ambiguous retained library path")
     labels = {"com.docker.compose.project": control.project,
               "com.docker.compose.service": "terminal-prestart-proof", **source_labels(control.identity)}
-    return {"name": control.project, "services": {"terminal-prestart-proof": {
+    volumes = {mount["source"]: {"external": True, "name": mount["source"]}
+               for mount in mounts if mount["type"] == "volume"}
+    return {"name": control.project, "volumes": volumes, "services": {"terminal-prestart-proof": {
         "image": actual["Image"], "pull_policy": "never", "runtime": "runc",
         "user": "65532:65532", "network_mode": "none", "read_only": True,
         "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],

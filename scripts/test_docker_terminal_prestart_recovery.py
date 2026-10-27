@@ -122,6 +122,10 @@ class RetainedMounts(unittest.TestCase):
         doc = recovery.diagnostic_document(control, actual, {})
         service = doc["services"]["terminal-prestart-proof"]
         mounts = {v["target"]: v for v in service["volumes"]}
+        volume_names = {mount["source"] for mount in service["volumes"] if mount["type"] == "volume"}
+        self.assertEqual(set(doc["volumes"]), volume_names)
+        for name in volume_names:
+            self.assertEqual(doc["volumes"][name], {"external": True, "name": name})
         self.assertEqual(mounts["/opt/fullmag/runtime-control"]["volume"]["subpath"], "runtime-control")
         self.assertEqual(mounts["/state/runs/docker-all/session-store/runtime-services"]["volume"]["subpath"],
                          "runtime-control/runtime-services")
