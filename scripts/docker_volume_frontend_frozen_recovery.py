@@ -140,8 +140,9 @@ def backend_observation(backend_id):
     import docker_volume_dev as dev
     value = dev._frontend_recovery_backend_observation(backend_id, allow_empty=True)
     if value["active_session"]:
-        probe = dev._terminal_session_restart_probe(backend_id)
-        require(probe is not None and probe.get("run", {}).get("run_id") == value["run_id"],
+        probe = dev._terminal_session_restart_probe(backend_id, allow_prepared=True)
+        require(probe is not None and probe.get("run", {}).get("run_id") == value["run_id"]
+                and probe.get("run", {}).get("status") in {"completed", "failed", "cancelled", "stopped"},
                 "Frontend recovery requires the exact terminal session")
     return value
 

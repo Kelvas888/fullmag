@@ -140,9 +140,13 @@ class SessionFenceContract(unittest.TestCase):
         import docker_volume_dev as dev
         observation = {"active_session": True, "run_id": "run"}
         with patch.object(dev, "_frontend_recovery_backend_observation", return_value=observation), \
-             patch.object(dev, "_terminal_session_restart_probe", return_value={"run": {"run_id": "run"}}):
+             patch.object(dev, "_terminal_session_restart_probe", return_value={"run": {"run_id": "run", "status": "failed"}}) as terminal:
             self.assertEqual(frozen.backend_observation("backend"), observation)
-        for terminal in (None, {"run": {"run_id": "foreign"}}):
+            terminal.assert_called_once_with("backend", allow_prepared=True)
+        for terminal in (None, {"run": {"run_id": "foreign", "status": "failed"}},
+                         {"run": {"run_id": "run", "status": "waiting_for_solve"}},
+                         {"run": {"run_id": "run", "status": "running"}},
+                         {"run": {"run_id": "run"}}):
             with patch.object(dev, "_frontend_recovery_backend_observation", return_value=observation), \
                  patch.object(dev, "_terminal_session_restart_probe", return_value=terminal):
                 with self.assertRaises(BuildControlError):
