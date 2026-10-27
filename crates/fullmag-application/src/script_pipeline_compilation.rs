@@ -138,28 +138,41 @@ pub(crate) fn authored_node<'a>(nodes:&'a [StudyPipelineNode], id:&str) -> Optio
     None
 }
 
-/// Dual representations are accepted only for complete ordered physical snapshots.
+/// Dual representations require complete ordered snapshots with matching authored selections.
 /// The existing explicit materializer owns numerical state; final base IR is never replayed over it.
 fn validate_physical_snapshot_coverage(document:&StudyPipelineDocument,nodes:&[ScriptPipelineNodeBinding],config:&ScriptExecutionConfig)->Result<()> {
-    let reject=||anyhow::anyhow!("pipeline compilation cannot mix explicit stages with study_pipeline unless complete ordered Relax/Run snapshots match authored nodes");
+    let reject=||anyhow::anyhow!("pipeline compilation cannot mix explicit stages with study_pipeline unless complete ordered Relax/Run or antenna_field_solve snapshots match authored nodes");
     if document.version!="study_pipeline.v1" {return Err(reject());}
     let mut ids=BTreeSet::new();
     for node in nodes {
         if node.authored_step_id.trim().is_empty() || !ids.insert(&node.authored_step_id) {return Err(reject());}
         match authored_node(&document.nodes,&node.authored_step_id) {
             Some(StudyPipelineNode::Group{..})=>{},
-            Some(StudyPipelineNode::Primitive{stage_kind,..}) if matches!(stage_kind.as_str(),"relax"|"run")=>{},
+            Some(StudyPipelineNode::Primitive{stage_kind,..}) if matches!(stage_kind.as_str(),"relax"|"run"|"antenna_field_solve")=>{},
             _=>return Err(reject()),
         }
     }
     let expected:Vec<_>=nodes.iter().filter(|node|node.kind==ScriptPipelineNodeKind::Primitive && node.effectively_enabled).collect();
     if config.stages.len()!=expected.len() {return Err(reject());}
     for (snapshot,binding) in config.stages.iter().zip(expected) {
-        if snapshot.action.is_some() || snapshot.ir.problem_meta.runtime_metadata.get("active_stage_id").and_then(serde_json::Value::as_str)!=Some(binding.authored_step_id.as_str()) {
+        if snapshot.ir.problem_meta.runtime_metadata.get("active_stage_id").and_then(serde_json::Value::as_str)!=Some(binding.authored_step_id.as_str()) {
             return Err(reject());
         }
-        let Some(StudyPipelineNode::Primitive{stage_kind,..})=authored_node(&document.nodes,&binding.authored_step_id) else {return Err(reject());};
-        if !matches!((stage_kind.as_str(),&snapshot.ir.study),("relax",fullmag_ir::StudyIR::Relaxation{..})|("run",fullmag_ir::StudyIR::TimeEvolution{..})) {return Err(reject());}
+        let Some(StudyPipelineNode::Primitive{stage_kind,payload,..})=authored_node(&document.nodes,&binding.authored_step_id) else {return Err(reject());};
+        match (stage_kind.as_str(), snapshot.action.as_ref(), &snapshot.ir.study) {
+            ("relax", None, fullmag_ir::StudyIR::Relaxation { .. })
+            | ("run", None, fullmag_ir::StudyIR::TimeEvolution { .. }) => {},
+            ("antenna_field_solve", Some(crate::script_stage_contract::ScriptExecutionStageAction::AntennaFieldSolve {
+                stage_id, port_mode_id, port_mode_ids,
+            }), _) => {
+                let (authored_stage_id, authored_port_id) =
+                    crate::script_stage_materialization::parse_antenna_solve_selection(payload)?;
+                let snapshot_port_id = crate::script_stage_materialization::select_antenna_port_reference(
+                    port_mode_id.as_deref(), port_mode_ids)?;
+                if stage_id != &authored_stage_id || snapshot_port_id != authored_port_id { return Err(reject()); }
+            },
+            _ => return Err(reject()),
+        }
     }
     Ok(())
 }

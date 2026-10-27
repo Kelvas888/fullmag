@@ -180,8 +180,10 @@ pub(crate) enum Command {
         /// Explicit CPU/memory/storage minimum reservation JSON.
         #[arg(long)] resources: PathBuf,
         #[arg(long)] idempotency_key: String,
-        #[arg(long)] api_url: String,
-        #[arg(long, default_value_t=false)] submit_only: bool,
+        #[arg(long, required_unless_present = "prepare_only")] api_url: Option<String>,
+        #[arg(long, default_value_t=false, conflicts_with = "prepare_only")] submit_only: bool,
+        /// Capture and compile the exact request without Submit or Solve; preparation may run Python/meshing.
+        #[arg(long, default_value_t=false)] prepare_only: bool,
     },
     /// Deprecated compatibility alias for `run-json`.
     #[command(hide = true)]

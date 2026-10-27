@@ -424,8 +424,8 @@ fn main() -> Result<()> {
                 serde_json::to_string_pretty(&direct_run_summary(&result, &output_dir))?
             );
         }
-        Command::RunScriptAccepted { script, project, execution_profile, resources, idempotency_key, api_url, submit_only } => {
-            let result=accepted_script_run::submit_script(&script,&project,&execution_profile,&resources,&idempotency_key,&api_url,submit_only)?;
+        Command::RunScriptAccepted { script, project, execution_profile, resources, idempotency_key, api_url, submit_only, prepare_only } => {
+            let result=accepted_script_run::submit_script(&script,&project,&execution_profile,&resources,&idempotency_key,api_url.as_deref(),submit_only,prepare_only)?;
             println!("{}",serde_json::to_string_pretty(&result)?);
         }
         Command::PrepareRunJson {
@@ -1035,6 +1035,8 @@ fn is_script_mode(raw_args: &[OsString]) -> bool {
         "validate-json",
         "plan-json",
         "run-json",
+        "prepare-run-json",
+        "run-script-accepted",
         "submit-run-json",
         "run-problem-json-direct",
         "resume-json",
@@ -2079,6 +2081,17 @@ mod tests {
             parsed.initial_magnetization_state.as_deref(),
             Some(std::path::Path::new("states/m_repeated_unit.json"))
         );
+    }
+
+    #[test]
+    fn accepted_run_producers_are_not_treated_as_script_mode() {
+        for command in ["prepare-run-json", "run-script-accepted"] {
+            assert!(!is_script_mode(&[
+                OsString::from("fullmag"),
+                OsString::from(command),
+                OsString::from("--help"),
+            ]));
+        }
     }
 
     #[test]

@@ -386,3 +386,82 @@ fn explicit_physical_snapshots_refuse_unknown_version_and_authored_duplicate() {
     let mut duplicate=physical_snapshots();let pipeline=duplicate.study_pipeline.as_mut().unwrap();pipeline.nodes.push(pipeline.nodes[0].clone());
     for config in [version,duplicate] {assert!(materialize_script_pipeline_with_output_policy_bounded(config,fullmag_ir::configure_project_autosave_policy,3).is_err());}
 }
+
+// These tests isolate the dual-representation coverage gate. Actual operation
+// planning remains owned by the existing explicit antenna materializer.
+fn antenna_action_snapshots() -> ScriptExecutionConfig {
+    use crate::script_stage_contract::{ScriptExecutionStage, ScriptExecutionStageAction};
+    let mut input = config();
+    input.study_pipeline = Some(serde_json::from_value(json!({
+        "version": "study_pipeline.v1", "nodes": [
+            {"node_kind": "primitive", "id": "first-owner", "label": "First", "stage_kind": "antenna_field_solve",
+                "payload": {"stage_id": "first-definition", "port_mode_id": "first-port"}},
+            {"node_kind": "primitive", "id": "second-owner", "label": "Second", "stage_kind": "antenna_field_solve",
+                "payload": {"stage_id": "second-definition", "port_mode_ids": ["second-port"]}}
+        ]
+    })).unwrap());
+    input.stages = [("first-owner", "first-definition", "first-port"),
+        ("second-owner", "second-definition", "second-port")].into_iter().map(|(owner, definition, port)| {
+        let mut ir = input.ir.clone();
+        ir.problem_meta.runtime_metadata.insert("active_stage_id".into(), json!(owner));
+        // Closed-loop capture precedes the action and legitimately retains its
+        // pre-action TimeEvolution StudyIR; this is not a synthetic LLG step.
+        ScriptExecutionStage { ir, default_until_seconds: None,
+            entrypoint_kind: "flat_antenna_field_solve".into(),
+            action: Some(ScriptExecutionStageAction::AntennaFieldSolve {
+                stage_id: definition.into(), port_mode_id: None, port_mode_ids: vec![port.into()],
+            }) }
+    }).collect();
+    input
+}
+
+fn validate_snapshot_gate(input: &ScriptExecutionConfig) -> Result<()> {
+    let document = input.study_pipeline.as_ref().unwrap();
+    let mut nodes = Vec::new();
+    collect_node_bindings(&document.nodes, &[], true, &mut nodes);
+    validate_physical_snapshot_coverage(document, &nodes, input)
+}
+
+#[test]
+fn antenna_action_snapshots_match_exact_selection_without_conflating_owner_id() {
+    assert!(validate_snapshot_gate(&antenna_action_snapshots()).is_ok());
+    assert!(validate_snapshot_gate(&physical_snapshots()).is_ok());
+}
+
+#[test]
+fn antenna_action_snapshots_reject_mismatched_selection_and_action() {
+    use crate::script_stage_contract::ScriptExecutionStageAction;
+    let mut wrong_stage = antenna_action_snapshots();
+    if let Some(ScriptExecutionStageAction::AntennaFieldSolve { stage_id, .. }) = &mut wrong_stage.stages[0].action {
+        *stage_id = "second-definition".into();
+    }
+    let mut wrong_port = antenna_action_snapshots();
+    if let Some(ScriptExecutionStageAction::AntennaFieldSolve { port_mode_ids, .. }) = &mut wrong_port.stages[0].action {
+        *port_mode_ids = vec!["second-port".into()];
+    }
+    let mut ambiguous_port = antenna_action_snapshots();
+    if let Some(ScriptExecutionStageAction::AntennaFieldSolve { port_mode_id, .. }) = &mut ambiguous_port.stages[0].action {
+        *port_mode_id = Some("first-port".into());
+    }
+    let mut unknown_payload = antenna_action_snapshots();
+    if let StudyPipelineNode::Primitive { payload, .. } = &mut unknown_payload.study_pipeline.as_mut().unwrap().nodes[0] {
+        payload.insert("unknown".into(), json!(true));
+    }
+    let mut wrong_action = antenna_action_snapshots();
+    wrong_action.stages[0].action = Some(ScriptExecutionStageAction::ChangeDevice { device: "cpu".into() });
+    let mut missing_action = antenna_action_snapshots();
+    missing_action.stages[0].action = None;
+    for input in [wrong_stage, wrong_port, ambiguous_port, unknown_payload, wrong_action, missing_action] {
+        assert!(validate_snapshot_gate(&input).is_err());
+    }
+}
+
+#[test]
+fn antenna_action_snapshots_preserve_complete_ordered_enabled_coverage() {
+    let mut missing = antenna_action_snapshots(); missing.stages.pop();
+    let mut duplicate = antenna_action_snapshots(); duplicate.stages[1] = duplicate.stages[0].clone();
+    let mut disabled = antenna_action_snapshots();
+    if let StudyPipelineNode::Primitive { enabled, .. } = &mut disabled.study_pipeline.as_mut().unwrap().nodes[0] { *enabled = false; }
+    let mut reordered = antenna_action_snapshots(); reordered.stages.swap(0, 1);
+    for input in [missing, duplicate, disabled, reordered] { assert!(validate_snapshot_gate(&input).is_err()); }
+}

@@ -192,3 +192,130 @@ Nie obchodzimy bramki źródła. Następny krok: poprawny publiczny skrypt z
 jawnymi wejściowymi siatkami źródła, Global i czterech targetów, prawdziwy
 source capture, dopiero potem ograniczona diagnostyka kosztu operatora.
 Pełny profil faz, mapa H Universe i browser/WebGL pozostają NOT VERIFIED.
+
+
+## Udana diagnostyka V/J/H na czterech punktach — 27.10.2026
+
+Pełny historyczny Universe pozostaje Failed. Nowa, odrębna próba diagnostyczna
+zakończyła się Succeeded i została odczytana przez publiczne API. Nie jest
+pełną mapą Universe ani kwalifikowaną bazą do LLG/FFT lub reprodukcją publikacji.
+Bieżąca scena UI nadal odpowiada historycznej próbie, a nie nowemu headless runowi.
+
+### Naprawione przyczyny przygotowania
+
+- Jawny `MeshData` NPZ przypisany do istniejącego ownera zachowuje surową
+  siatkę przewodnika obok Global i osobnego niemagnetycznego sampling.
+  Import obejmuje P1/Tet4; nie zmienia ścieżek bez source ani mixed topology.
+  Regresja częściowej mapy object IDs dała RED, potem 8 PASS w Pythonie.
+- Dispatch CLI rozpoznaje `prepare-run-json` i `run-script-accepted`.
+  `--prepare-only` używa tego samego capture, kompilatora i pełnego limitu
+  transportu co Submit; sam nie wysyła Submit/Solve. Wspólna walidacja
+  RunIntent obejmuje również ten tryb. Rzeczywiste help/parser checks: 5 PASS.
+  Rzeczywisty prepare-only odrzucił też pusty idempotency_key: exit 1, brak
+  requestu na stdout i brak HTTP/Solve; receipt invalid-idempotency-key-regression.json.
+- Kompilator dopuszcza jawne snapshoty `antenna_field_solve` tylko przy dokładnej
+  zgodności authored ID, definicji i portu. Wykorzystuje wspólny parser selektora;
+  kompletność, kolejność, enabled i późniejszy planner pozostają obowiązkowe.
+- Producent zachowuje rzeczywistą intencję skryptu przez kanoniczne adaptery
+  `for_problem`, `migrate_legacy_live_execution` i `bind_declared_execution`.
+  Typowane profile/warstwy pozostają chronione; heterogeniczne snapshoty są
+  odrzucane przed wspólnym bindingiem accepted v4.
+
+Pozostaje ogólny problem Auto/null: binding usuwa `cpu_threads:null` z preimage v2.
+Nie zmieniono tego podpisu ani jego walidatora. Nowy skrypt jawnie autoruje
+`study.threads(1)` i `CpuResources(threads=1)` przed przygotowaniem źródła.
+Native/BLAS/affinity pozostają Auto. Jawna polityka native/BLAS wymaga adaptera
+przydziału i została odrzucona w osobnym probe, nie wyłączono tej kontroli.
+
+### Build i pochodzenie wejść
+
+Trzy kolejne managed iteracje w tych samych backend/frontend przeszły:
+`50251e80681f43a98cadd96c8e3f5b3f` (Make 304233 ms),
+`faaeaabb66b444e1a7c406bab942d5d2` (233862 ms),
+`c234b558b01a4a298650e155b2f35f6f` (152194 ms).
+Najnowszy pakiet ma snapshot
+`37a1c2e90c97b54743af6f5ff52c9d07889c23058860d24a5b04ef1a61d38c0d`,
+HEAD przy buildzie `a3f8498a9ab9b32ef08112a0085febd65ddf50a5` + WIP.
+Przy pierwszej próbie ostatniej iteracji omyłkowo podano pin iteracji zamiast
+wdrożenia; odmowa nastąpiła przed zmianą usług. Prawidłowy pin recepty
+`docker-dev-restart-idle` pochodzi z `development/attempts/`, nie `iteration/`.
+
+Scenariusz wejściowy został następnie zmieniony wyłącznie o jawne authoring CPU
+i poprawny manifest. Jest osobnym wejściem istniejącego pakietu, nie przebudową
+solvera. Skrypt `examples/antenna_universe/rt0_profile_180s/fem_antenna_rt0_four_target_180s.py`
+ma SHA256 `7213dcfe8a70714c88bb9e3b9e19ed4269cc34b499dc13efe149f73327363bdb`;
+manifest `6cf677ce949c62e90077d3b3ad6be8b36cef1e1d9ace8ab86d9298299f7f990a`.
+Trzy assety pozostają bajtowo identyczne z wejściami referencyjnymi.
+Raw przewodnik: 664/1856; po cięciu: 677/1856; Global: 1145/6428;
+sampling: 4/1, dokładnie prerejestrowane wierzchołki komórki Global 1726.
+Nie dodano magnetów ani energii LLG.
+
+Prawdziwy capture i kompilacja z worktree: exit 0, 35.429 s;
+request 44172062 B, SHA256
+`74fd68ff51da3407c4418f0e3bd8f2efc0e53b1380e1603d67040def6cf97b07`.
+Profilera dodano przez istniejący publiczny producer RunIntent, exit 0, 4.185 s.
+Nie edytowano ręcznie fingerprintu ani zaakceptowanego stanu.
+Przy Submit klient przekroczył 30 s, lecz run był zapisany. Odczyt GET i ponowny
+czysty producer potwierdziły identyczny RunIntent/fingerprint; Submit nie ponowiono.
+Materialization wysłano raz: HTTP 200. API kolejno preparing → running → succeeded.
+
+### Trwała tożsamość i wynik
+
+- project: `project-1f48487cf16342ca9524e0795d39597b`
+- run: `run-9e08498d8f5bf1dbbac665ff3e261fd2c89ad689f7037199f77f6b712a982db6`
+- fingerprint: `2813bc4191c2310416213e33e058762f0d4bbdea2e2587f734c8dcbfa4fa9614`
+- task: `task-a6d400f350e83896790c9d83988e8e85e52c806addb41cf43ddf1730cd482c84`
+- attempt: `attempt-e33d397928a34e298444afa3f49b5a8f`, epoch 1
+- pakiet CAS: `9fa75fc1002b976d172fd151baed14551dda7e0a6bee7042f9ae611699135c76`
+
+API: katalog i przypięty zasób accepted inspection HTTP 200; zasób sprawdził
+`full_cold_bundle`. Binarne payloady V, J, H oraz pozycje pobrano przez publiczny
+endpoint z pinami attempt/epoch/package. SHA256 i długości odpowiadają manifestowi;
+wszystkie wartości są skończone, a cztery pozycje równe prerejestracji.
+V ma 677 wartości [V], J 1856 wektorów w centrach komórek [A/m²], H cztery
+wektory [A/m]. Potencjał źródła 0.25 V, prąd 0.14283655988114702 A,
+charge relative residual 8.271607187684167e-13. To rozwiązanie charge/Oersted,
+nie pola demag ani dynamiki magnetyzacji.
+
+### Zmierzony profil i jego ograniczenia
+
+Operacja `antenna.closed_loop.inspect` zakończona poprawnie: 94.288 s.
+Natywny operator pola: 26.717 s. To nie czas całego runu z publikacją.
+
+| Faza | Czas [s] |
+|---|---:|
+| Przygotowanie źródła | 1.159 |
+| Dokładna geometria | 7.899 |
+| Binary64 | 1.071 |
+| 80 cyfr | 6.622 |
+| 120 cyfr | 7.870 |
+| Kontrole zgodności | 2.044 |
+| Redukcja i serializacja | 0.006 |
+| Czas operacji nieprzypisany tym fazom | 67.617 |
+
+`accounting_issue=false`. Nie wolno automatycznie przypisać ostatniego czasu
+samemu solverowi prądu. Przygotowanie źródła nie dominuje w tym przypadku;
+w kosztach pola duże są geometria i obie ścieżki wysokiej precyzji.
+Cztery punkty nie uzasadniają ekstrapolacji czasu ani deklaracji przyspieszenia
+pełnego Universe. Następny krok to optymalizacja oparta o ten profil i osobna
+walidacja całego Global; nie ślepe ponowienie ani podniesienie timeoutu.
+
+Worker PID 5668 zakończony; jego lease został normalnie zwolniony
+2026-10-27T04:06:54.993011851Z. Minimum zasobów w RunIntent jest filtrem oferty,
+nie limitem pamięci na 1 bajt. Faktyczna oferta lease wynosiła 3000 millicpu,
+5637144576 B RAM i 7516192768 B storage; authoring solvera ma jeden wątek CPU.
+Nie zmieniono limitów kontenera ani polityki hosta.
+
+Dowody: control volume `verification/rt0-public-capture-20261027/`, w tym
+`wt-capture-receipt.json`, `wt-pre-submit-review.json`,
+`wt-submit-confirmed-fingerprint.json`, `wt-materialization.http.json`,
+`wt-inspection-catalog.http.json`, `wt-inspection-pinned-resource.http.json`,
+`wt-public-vjh-verification.json`, `wt-worker-operation-profile.v1.json`,
+`wt-resource-lease-records.json` i receipty managed buildów.
+Profil SHA256 `71cb1ca89b00297caba8a65db8667562fdab1f57ca7786acb4ec231d50bbcef1`.
+
+Kwalifikacja pozostaje `inspection_only` / `NOT VERIFIED`; API odmawia
+per-ampere basis, source FFT i LLG drive. Pełna mapa H Universe oraz widok
+przeglądarki/WebGL nadal NOT VERIFIED. Rust unit tests nie kompilowano.
+Retencja: bieżący pakiet i osiem backupów zachowane, bez kasowania cache,
+wyników i wolumenów; pełna kwalifikacja retencji nadal NOT VERIFIED.

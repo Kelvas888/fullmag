@@ -2,7 +2,7 @@
 
 - Status: proposed canonical physics and numerics contract
 - Owners: Fullmag core
-- Last updated: 2026-09-08
+- Last updated: 2026-10-27
 - Related ADRs:
   - `docs/adr/0004-backend-canonical-quantities.md`
   - `docs/adr/0011-resource-first-api.md`
@@ -2899,6 +2899,189 @@ wygładzonym RT0. Owned external-lead bundle pozostaje inspection-only do
 kwalifikacji pełnego obwodu. Dwie źródłowe regresje Rust obejmują charge-only
 oraz siedem kombinacji odmowy; nie były kompilowane ani uruchamiane.
 
+
+### E4: jawne źródło siatki przypisane do właściciela (kandydat, bez kwalifikacji wykonania)
+
+Ten kontrakt dodaje wejściową siatkę do istniejącego namespace
+`study.objects.mesh.by_id(object_id)(source="assets/antenna-raw.npz")`.
+Nie dodaje modelu fizycznego ani nie aktywuje transportu przez nazwę lub typ obiektu.
+AUTO z jawną konfiguracją FEM zachowuje source jako asset, bez wybierania runtime; FDM-only lub brak konfiguracji FEM odmawia źródła zamiast je ignorować. Właściciel musi istnieć w jawnej kolekcji geometrii; nieznany lub niejednoznaczny
+owner oraz sprzeczne źródła tego samego ownera są błędem. Osobne jawne siatki
+przewodnika i nośnika próbkowania pozostają dostępne obok wspólnej siatki Global.
+
+| Parametr Python | Typ | Default | SI | Walidacja i odmowa | Znaczenie | Backend support | ProblemIR |
+|---|---|---|---|---|---|---|---|
+| `GeometryMeshHandle.configure.source` | `str \| None` | `None` | $1$ | niepusta ścieżka MeshData NPZ; P1/Tet4; dodatnia orientacja; istniejący owner; brak fallbacku przy błędzie odczytu | jawny, niezmieniany plik wejściowy ownera | FEM CPU: kandydat authoring; FEM GPU/FDM CPU/FDM GPU: brak kwalifikacji tego przekazania | `problem_meta.runtime_metadata.mesh_workflow.per_geometry[].source oraz geometry_assets.fem_mesh_assets[]` |
+
+Przykład stanowi wykonywalny fragment konfiguracji istniejącego badania z jawnie
+utworzonymi ownerami `antenna` i `sampling`. Nie jest osobnym kompletnym badaniem:
+
+```python
+# %% Explicit owner-bound inputs in the existing study
+study.objects.mesh.by_id("antenna")(source="assets/antenna-raw.npz", order=1)
+study.objects.mesh.by_id("sampling")(source="assets/sampling.npz", order=1)
+```
+
+Nowy importer źródła obejmuje wyłącznie P1/Tet4. Nie zmienia istniejących ścieżek bez `source`, w tym ich dopuszczonych topologii mieszanych. MeshData NPZ jest wejściem użytkownika, nie wpisem wygenerowanego cache.
+Importer czyta go przy każdym obniżeniu, bez podstawiania klucza snapshotu,
+remeshingu, optymalizacji, odwracania orientacji lub naprawiania topologii.
+Dodatnia orientacja jest wymagana przed `to_ir`; niezgodność kończy operację.
+Współrzędne pozostają w metrach, indeksy/markery i retained vertex identity
+pozostają nienaruszone. Dla coincident source dotychczasowy
+`prepare_antenna_coincident_loop(raw_mesh=...)` nadal sprawdza rzeczywiste IDs,
+manifold seam, płaszczyznę autora, dodatnie Tet4 i rozszczepienie topologiczne.
+Nie wolno przekazać już przeciętej siatki jako surowej.
+
+Zamrożony przykład diagnostyczny ma raw source 664 węzły / 1856 Tet4,
+po istniejącym cięciu 677 / 1856, Global 1145 / 6428 i niezależny sampling 4 / 1.
+To prerejestrowane oczekiwania kontroli, nie dowód wykonania H ani reprodukcji
+publikacji. Nowa ścieżka wejściowa zmienia authored provenance i jego digesty;
+nie należy przywracać dawnych hashy dla pozoru zgodności. requested intent
+zachowuje plik i ownera, resolved execution musi powstać dopiero z normalnego
+planowania i admission. validation errors nie uruchamiają meshera zastępczego.
+unsupported combinations, m.in. źródło inne niż MeshData NPZ lub order != 1,
+kończą się jawną odmową. Wersja v4 Submit nadal wymaga prawdziwego compiler
+source capture i archiwum wszystkich wejść; ten kontrakt nie modyfikuje tej bramki.
+
+Bezpieczny przyszły capture zaczyna się od nowego skryptu i nowych jawnych
+assetów pod jego katalogiem `assets/`, kopiowanych bajtowo z zachowanych wejść
+z jawnymi SHA256. Istniejący `accepted_source_capture.inventory` obejmuje te
+pliki; nie przemianowuje się generated cache ani nie fabrykuje captured identity.
+Pełny capture i Submit pozostają NOT VERIFIED w tym podetapie. Kontrole
+interpretowane obejmują realny setter, importer, eksport oraz przygotowanie
+cięcia z mesherem odmawiającym każdego wywołania. Nie zastępują managed runtime,
+Rust validation, kwalifikacji fizyki ani dowodu czterech backend lanes.
+
+| Twierdzenie | Ścieżka | Symbol | Odpowiedzialność / dowód |
+|---|---|---|---|
+| Jawny setter | `packages/fullmag-py/src/fullmag/world.py` | `class GeometryMeshHandle` | metoda configure: typ, zapis source; kandydat |
+| Owner binding | `packages/fullmag-py/src/fullmag/meshing/_mesh_targets.py` | `_scope_per_geometry_entries` | nieznany i niejednoznaczny owner odrzucany |
+| Inline mesh | `packages/fullmag-py/src/fullmag/model/problem.py` | `build_geometry_assets_for_request` | odczyt jawnego NPZ poza generated cache |
+| Cut | `packages/fullmag-py/src/fullmag/meshing/_antenna_coincident_cut.py` | `prepare_antenna_coincident_loop` | istniejące geometry/IDs/seam validation bez zmian |
+| Eksport | `packages/fullmag-py/src/fullmag/runtime/script_builder.py` | `_render_object_id_mesh_workflow` | istniejący namespace i source bez nowego frameworka |
+| Capture | `packages/fullmag-py/src/fullmag/runtime/accepted_source_capture.py` | `inventory` | istniejący spis regularnych plików; pełna ścieżka NOT VERIFIED |
+
+
+### Zgodność jawnego snapshotu etapu antenowego — 27.10.2026
+
+Rzeczywisty capture skryptu czteropunktowego przeszedł po pominięciu
+opcjonalnej pustej tabeli `object_region_markers` w `study.domain_mesh`.
+Kompilator odmówił następnie podwójnej reprezentacji etapów, ponieważ jego
+kontrola pokrycia obejmowała wyłącznie Relax/Run. Nie jest to błąd obliczeń H:
+Submit i Solve nie zostały uruchomione.
+
+Naprawa zachowuje jednego materializera fizyki. Kontrola pokrycia dopuszcza
+jawne `antenna_field_solve` tylko wtedy, gdy snapshot zawiera tę samą typowaną
+akcję i dokładnie ten sam selektor definicji oraz portu co authored primitive.
+Obie reprezentacje korzystają z istniejącego wspólnego parsera selektora;
+nie ma alternatywnego parsera polityki pola. Liczba, kolejność, unikalność,
+stan enabled i tożsamość authored etapów pozostają obowiązkowe. Unknown
+payload, brak akcji, inny port lub inna definicja kończą kompilację odmową.
+
+| Pole | Typ / domyślnie | SI | Walidacja i znaczenie | Destination |
+|---|---|---|---|---|
+| `active_stage_id` | `str` / wymagane w snapshot | $1$ | dokładne ID authored primitive; nie musi równać się ID definicji rozwiązania | `ProblemIR.problem_meta.runtime_metadata.active_stage_id` |
+| `stage_id` | `str` / wymagane | $1$ | niepuste ID definicji, zgodne w akcji i authored payload | istniejący `ScriptExecutionStageAction::AntennaFieldSolve` oraz selektor materializowanego `StudyIR` |
+| `port_mode_id`, `port_mode_ids` | opcjonalny `str` lub lista `str` / brak i pusta lista | $1$ | istniejący parser wymaga jednego niepustego portu; sprzeczne singular/plural są błędem | ten sam istniejący selektor portu; brak nowego pola IR |
+
+Snapshot przed wykonaniem akcji może mieć jeszcze `StudyIR::TimeEvolution`.
+Nie wolno dodać fikcyjnego magnetu albo Relax/Run, aby ominąć tę różnicę.
+Istniejący `resolve_explicit_stage_action` wybiera rzeczywistą definicję,
+sprawdza inventory i dla obiektu bez magnetów ustawia `AntennaFieldSolve`.
+Następnie kanoniczny planner ustala zamknięty obwód i wykonanie FEM CPU.
+Pełny captured source i assety nadal są wymagane przez v4 Submit; capture,
+kompilacja, Submit i wykonanie pozostają osobnymi dowodami.
+
+Nie zmieniają się równania, jednostki V/J/H, topologia, tolerancje ani
+wymagania kwalifikacji. Ta poprawka kompilatora nie dodaje realizacji FEM GPU,
+FDM CPU ani FDM GPU; ich status w macierzy rozdziału pozostaje bez zmian.
+W FEM CPU naprawia przekazanie jawnego etapu do istniejącego planera, a nie
+kwalifikację wyniku. Regresje Rust są źródłowe, bez ich kompilowania.
+Zarządzany build, rzeczywisty capture z kompilacją i próba 4 punktów po tej
+poprawce pozostają NOT VERIFIED do zapisania odpowiednich receiptów.
+Próba 4 punktów, nawet poprawna, nie jest pełną mapą Universe.
+
+| Twierdzenie | Ścieżka + symbol | Status dowodu |
+|---|---|---|
+| Jeden parser selektora | `crates/fullmag-application/src/script_stage_materialization.rs` + `parse_antenna_solve_selection` | poprawka źródłowa; nie nowa fizyka |
+| Dokładne pokrycie snapshotów | `crates/fullmag-application/src/script_pipeline_compilation.rs` + `validate_physical_snapshot_coverage` | rzeczywisty RED na skrypcie; GREEN po buildzie do wykonania |
+| Kanoniczny lowering accepted | `crates/fullmag-application/src/script_pipeline_acceptance.rs` + `compile_accepted_closed_loop_pipeline` | istniejący właściciel profilu, ProblemIR i provenance |
+
+
+### Zachowanie authoringu wykonania przy profilu accepted — 27.10.2026
+
+Po buildzie poprawki snapshotów prawdziwy producer przeszedł ich kontrolę,
+ale odmówił planowania anteny: `requested_backend` zmienił się z jawnego `fem`
+na `auto`. CLI przekazywało pustą listę warstw do wiązania pustego profilu.
+ProblemIR miał historyczne jawne backend/device/precision/mode, lecz kontrola
+carried intent chroniła tylko profil i warstwy deklarowane strukturalnie.
+Nie wolno zmienić pustego profilu we współdzielonym katalogu ani wymusić FEM
+na podstawie typu obiektu, aby ukryć ten błąd producenta.
+
+Adapter producenta ma zachować zadeklarowany wybór przed wiązaniem profilu:
+dla historycznych pól używa istniejącego `RequestedExecution::for_problem`
+i `migrate_legacy_live_execution` z pochodzeniem `Script`; dla typowanych
+deklaracji zachowuje ich profil i uporządkowane warstwy przez istniejące
+`bind_declared_execution`. Inny dostarczony profil albo niezgodne deklaracje
+są konfliktem. Brak odczytu stanu hosta i brak automatycznego wyboru urządzenia.
+
+Obecny compiler v4 przypina wspólne warstwy wykonania do wszystkich jawnych
+snapshotów. Producent musi więc przed kompilacją odmówić snapshotów o innej
+zadeklarowanej intencji lub zasobach, zamiast nadpisać je ustawieniami końcowego
+modelu. Obsługa rzeczywiście różnych warstw per etap pozostaje osobnym zakresem;
+nie jest dodawana do diagnostyki pola. Ustawienia jawnego FEM CPU double strict
+mają zostać zachowane w warstwie authoringu i w późniejszym katalogu, a resolved
+wykonanie powstaje dopiero przez dotychczasowy planner/admission.
+
+| Wejście | Typ / domyślnie | SI | Zachowanie i destination |
+|---|---|---|---|
+| jawne backend/device/precision/mode skryptu | istniejące enumy / według authoringu | $1$ | bez podmiany; istniejąca warstwa `ExecutionRequestLayerIR` z pochodzeniem Script oraz `execution_materialization` |
+| profil przekazany producerowi | `ExecutionProfileIR` / wymagany plik | $1$ | zwalidowany i zgodny z carried profile; bez publikacji nowej polityki |
+| zasoby autora | istniejący `ComputeResourcesIR` / opcjonalne | $1$ dla identyfikatorów, $\mathrm{byte}$ dla pamięci | zachowany typed patch przez dotychczasowy adapter; ta poprawka nie podnosi limitów kontenera |
+
+Nie zmieniają się równania ani macierz realizacji fizyki. Dotyczy to kontraktu
+producenta accepted; nie kwalifikuje FDM CPU/GPU ani FEM GPU. Build snapshotów
+`faaeaabb66b444e1a7c406bab942d5d2` przeszedł, ale nie obejmował tej późniejszej
+poprawki authoringu. Nowy build, pełne przygotowanie i Solve nadal wymagają
+osobnych dowodów. Źródła: `crates/fullmag-cli/src/accepted_script_run.rs` +
+`submit_script`; `crates/fullmag-application/src/task_execution.rs` + `for_problem`;
+`crates/fullmag-application/src/legacy_live_execution.rs` +
+`migrate_legacy_live_execution`; `crates/fullmag-application/src/declared_execution.rs`
++ `bind_declared_execution`.
+
+
+### Ograniczenie Auto/null i jawny budżet diagnostyki — 27.10.2026
+
+Dokładne odtworzenie istniejącego preimage v2 potwierdziło, że binding usuwa
+`runtime_selection.cpu_threads: null` dla Auto. Zmienia to podpis przygotowanego
+źródła pomimo identycznej geometrii i fizycznej intencji FEM CPU double strict.
+Ogólna kolejność przygotowania dla Auto pozostaje nierozwiązana. Nie wolno
+przepisywać digestu, usuwać klucza z hashowania ani wyłączać walidacji v2.
+
+Diagnostyka ma od początku jawny budżet jednego CPU, odpowiadający minimum
+1000 millicpu w jej żądaniu. Istniejące publiczne `study.threads(1)` oraz
+`study.resources(fm.ComputeResources(cpu=fm.CpuResources(threads=1)))` poprzedzają
+przygotowanie źródła. Każdy parametr threads ma dodatni typ całkowity i jednostkę
+$1$; zapis trafia odpowiednio do `runtime_selection.cpu_threads` oraz
+`compute_resources.cpu.threads`, a potem do istniejącej warstwy wykonania.
+Polityki native_threads, blas_threads i affinity pozostają Auto; jawne ich
+przypięcie wymaga adaptera przydziału i jest na tym etapie planowania odrzucane.
+Nie zwiększa to CPU/RAM kontenera ani budżetu czasu pola.
+
+Prawdziwy guarded capture i canonical prepare-only izolowanego wariantu
+przeszły w 36.437 s, bez Submit i Solve. Odtworzenie preimage po bindingu
+odpowiadało dokładnie wygenerowanemu podpisowi źródła. Siatki: antena 677/1856,
+Global 1145/6428, sampling 4/1. Dowód: control volume,
+`verification/rt0-public-capture-20261027/explicit-thread-authoring-v2/evidence/`.
+To dowód wspieranej konfiguracji wejścia, nie ogólna naprawa Auto/null ani wynik H.
+Źródła: `packages/fullmag-py/src/fullmag/world.py` + `class StudyBuilder`,
+`packages/fullmag-py/src/fullmag/runtime/antenna_coincident_materialization.py` +
+`materialize_antenna_coincident_loops`,
+`crates/fullmag-application/src/execution_profile_binding.rs` +
+`bind_materialized_execution`, `crates/fullmag-plan/src/antenna_current_source.rs`
++ `materialize_antenna_closed_loop_current_input`.
+
+
 ### 8.3 Validation and normalization
 
 Validation requires:
@@ -3227,10 +3410,10 @@ pozostaje **NOT VERIFIED** do odrębnego uruchomienia właściwych bramek.
 | `AntennaPortBranch.signed_weight` | `float` | required | `$1$` | finite; one mode requires positive weights summing to one, negative return and total zero within 1e-12 | signed current share relative to the common positive orientation | backend-neutral contract | `antenna_port_modes[].branches[].signed_weight` |
 | `SolvedAntennaDrive.peak_current_a` | `float` | required | `$\mathrm A$` | finite; zero disables the drive without invalidating the spatial basis | signed peak multiplying the immutable per-ampere field basis | lane-specific artifact consumer | `solved_antenna_drives[].peak_current_a` |
 | `AntennaSpectrumRequest.sampling_plane` | `AntennaSpectrumSamplingPlane` | required | m for origin/extents; 1 for counts and frame | orthonormal in-plane axes, positive extents, at least two samples per axis; current executable lane requires valid tet4 P1 topology or unique identity-coordinate carrier matches and fails closed for unsupported interpolation | centred physical lattice on which the per-ampere source field is sampled before the spatial Fourier transform | immutable FEM antenna asset with tet4 P1 or legacy identity sampling; FDM trilinear, direct RT0 evaluation, mixed topology, and native MFEM transfer remain explicitly unsupported | `antenna_spectrum_requests[].sampling_plane` |
-| `AntennaSpectrumRequest.port_mode_id` | `str | None` | `None` | `$1$` | when present, nonempty and bound to the solve stage; omission is valid only when the solve has exactly one port | selects the immutable per-ampere field basis used by source-spectrum analysis | immutable FEM antenna asset; multi-port assets require explicit selection | `antenna_spectrum_requests[].port_mode_id` |
+| `AntennaSpectrumRequest.port_mode_id` | `str \| None` | `None` | `$1$` | when present, nonempty and bound to the solve stage; omission is valid only when the solve has exactly one port | selects the immutable per-ampere field basis used by source-spectrum analysis | immutable FEM antenna asset; multi-port assets require explicit selection | `antenna_spectrum_requests[].port_mode_id` |
 | `AntennaSpectrumRequest.component` | `str` | required | `$1$` | one of `x`, `y`, `z`, `u`, `v`, `normal`, `vector_power`, `transverse`; transverse requires an explicit valid equilibrium reference; runtime requires canonical verified owner context | selects the analysed field component or vector power | Cartesian/local-frame source spectra supported for certified FEM carrier; transverse source-only FEM CPU Tet4/double; native qualification NOT VERIFIED | `antenna_spectrum_requests[].component` |
 | `AntennaSpectrumRequest.equilibrium_ref` | `EquilibriumStageOutputRef \| EquilibriumArtifactRef \| str \| None` | `None` | `$1$` | valid only for `component="transverse"`; typed stage_output/artifact or immutable legacy identity; v7 runtime refuses without canonical owner context | identifies the equilibrium needed for the pointwise transverse source-field projection | source-only FEM CPU Tet4/double; other lanes unsupported | `antenna_spectrum_requests[].equilibrium_ref` |
-| `AntennaSpectrumRequest.mode_basis_ref` | `str | None` | `None` | `$1$` | any nonempty value is rejected by Python and ProblemIR until verified modal analysis exists | reserved identity of a future modal basis, not a source-field spectrum coefficient | unsupported in executable spectrum lane | `antenna_spectrum_requests[].mode_basis_ref` |
+| `AntennaSpectrumRequest.mode_basis_ref` | `str \| None` | `None` | `$1$` | any nonempty value is rejected by Python and ProblemIR until verified modal analysis exists | reserved identity of a future modal basis, not a source-field spectrum coefficient | unsupported in executable spectrum lane | `antenna_spectrum_requests[].mode_basis_ref` |
 
 (The optional `AntennaSpectrumRequest.port_mode_id` selects the immutable
 per-ampere basis used by the source-spectrum transform. It may be omitted only

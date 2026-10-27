@@ -8890,6 +8890,97 @@
       "symbol": "rounded_dot",
       "responsibility": "Sekwencyjny iloczyn skalarny binary64 bez FMA w oracle.",
       "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "e4-owner-source-setter",
+      "path": "packages/fullmag-py/src/fullmag/world.py",
+      "symbol": "class GeometryMeshHandle",
+      "responsibility": "Jawny owner-bound MeshData source; kandydat E4, bez nowej fizyki i bez kwalifikacji runtime.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "e4-owner-source-owner",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_mesh_targets.py",
+      "symbol": "_scope_per_geometry_entries",
+      "responsibility": "Jawny owner-bound MeshData source; kandydat E4, bez nowej fizyki i bez kwalifikacji runtime.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "e4-owner-source-import",
+      "path": "packages/fullmag-py/src/fullmag/model/problem.py",
+      "symbol": "build_geometry_assets_for_request",
+      "responsibility": "Jawny owner-bound MeshData source; kandydat E4, bez nowej fizyki i bez kwalifikacji runtime.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "e4-owner-source-cut",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_antenna_coincident_cut.py",
+      "symbol": "prepare_antenna_coincident_loop",
+      "responsibility": "Jawny owner-bound MeshData source; kandydat E4, bez nowej fizyki i bez kwalifikacji runtime.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "e4-owner-source-export",
+      "path": "packages/fullmag-py/src/fullmag/runtime/script_builder.py",
+      "symbol": "_render_object_id_mesh_workflow",
+      "responsibility": "Jawny owner-bound MeshData source; kandydat E4, bez nowej fizyki i bez kwalifikacji runtime.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "e4-owner-source-capture",
+      "path": "packages/fullmag-py/src/fullmag/runtime/accepted_source_capture.py",
+      "symbol": "inventory",
+      "responsibility": "Jawny owner-bound MeshData source; kandydat E4, bez nowej fizyki i bez kwalifikacji runtime.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-explicit-selector",
+      "path": "crates/fullmag-application/src/script_stage_materialization.rs",
+      "symbol": "parse_antenna_solve_selection",
+      "responsibility": "Zgodność jawnego etapu anteny z authored pipeline; wspólny selektor i zachowane pokrycie, bez nowej fizyki.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-explicit-coverage",
+      "path": "crates/fullmag-application/src/script_pipeline_compilation.rs",
+      "symbol": "validate_physical_snapshot_coverage",
+      "responsibility": "Zgodność jawnego etapu anteny z authored pipeline; wspólny selektor i zachowane pokrycie, bez nowej fizyki.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-explicit-acceptance",
+      "path": "crates/fullmag-application/src/script_pipeline_acceptance.rs",
+      "symbol": "compile_accepted_closed_loop_pipeline",
+      "responsibility": "Zgodność jawnego etapu anteny z authored pipeline; wspólny selektor i zachowane pokrycie, bez nowej fizyki.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-script-execution-producer",
+      "path": "crates/fullmag-cli/src/accepted_script_run.rs",
+      "symbol": "submit_script",
+      "responsibility": "Zachowanie authored execution w producerze accepted; brak zmiany fizyki i brak kwalifikacji solvera.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-authored-request",
+      "path": "crates/fullmag-application/src/task_execution.rs",
+      "symbol": "for_problem",
+      "responsibility": "Zachowanie authored execution w producerze accepted; brak zmiany fizyki i brak kwalifikacji solvera.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-legacy-script-layer",
+      "path": "crates/fullmag-application/src/legacy_live_execution.rs",
+      "symbol": "migrate_legacy_live_execution",
+      "responsibility": "Zachowanie authored execution w producerze accepted; brak zmiany fizyki i brak kwalifikacji solvera.",
+      "evidence_status": "implementation_unqualified"
+    },
+    {
+      "id": "antenna-declared-script-layer",
+      "path": "crates/fullmag-application/src/declared_execution.rs",
+      "symbol": "bind_declared_execution",
+      "responsibility": "Zachowanie authored execution w producerze accepted; brak zmiany fizyki i brak kwalifikacji solvera.",
+      "evidence_status": "implementation_unqualified"
     }
   ],
   "public_api": {
@@ -10443,6 +10534,16 @@
         "meaning": "polityka zaawansowanej metody wykonania",
         "backend_support": "prepared FEM CPU double strict inspection; GPU/FDM unsupported",
         "problem_ir": "antenna_field_solve_stages[].surface_field_policy"
+      },
+      {
+        "python": "GeometryMeshHandle.configure.source",
+        "type": "str | None",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "niepusta ścieżka MeshData NPZ; P1/Tet4; dodatnia orientacja; istniejący owner; brak fallbacku przy błędzie odczytu",
+        "meaning": "jawny, niezmieniany plik wejściowy ownera",
+        "backend_support": "FEM CPU: kandydat authoring; FEM GPU/FDM CPU/FDM GPU: brak kwalifikacji tego przekazania",
+        "problem_ir": "problem_meta.runtime_metadata.mesh_workflow.per_geometry[].source oraz geometry_assets.fem_mesh_assets[]"
       }
     ]
   }
