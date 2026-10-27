@@ -797,6 +797,17 @@ jobs:
         run: |
           python -B scripts/test_fullmag_docker_runtime.py -v
           python -B scripts/test_docker_backend_dev.py -v
+          python -B scripts/test_docker_shared_build_storage.py -v
+          python -B scripts/test_backend_shared_store.py -v
+          python -B scripts/test_backend_shared_integration.py -v
+          python -B scripts/test_backend_shared_recovery.py -v
+          python -B scripts/test_backend_group_retirement.py -v
+          python -B scripts/test_backend_compiler_cache.py -v
+          python -B scripts/test_backend_auto_maintenance.py -v
+          python -B scripts/test_docker_helper_source.py -v
+          python -B scripts/test_backend_package_backup_retirement.py -v
+          python -B scripts/test_docker_cache_retirement.py -v
+          python -B scripts/test_docker_worktree_finish.py -v
           python -B scripts/test_docker_backend_live_source.py -v
           python -B scripts/test_docker_candidate_retirement.py -v
           python -B scripts/test_docker_operator_capability.py -v

@@ -7583,3 +7583,7 @@ verify-fdm-gpu-solved-current-racetrack-production:
         --execution-audit "$evidence_root/execution-audit.v1.json" || true; \
       python3 scripts/verify_fdm_gpu_racetrack_qualification.py --evidence-root "$evidence_root" --source-snapshot "$source_snapshot"; \
       echo "production-qualified racetrack manifest: $evidence_root/fdm_gpu_solved_current_racetrack_qualification_v1.json"'
+
+# Explicit maintenance outside startup, bound to the successful DEV receipt.
+docker-dev-maintain-cache attempt config_sha256 source_root:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" maintain-cache --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}}

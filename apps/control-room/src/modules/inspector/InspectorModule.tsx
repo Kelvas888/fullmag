@@ -30,6 +30,7 @@ function PendingFormBridge() {
   const owner = useMemo(() => Symbol("inspector-pending-form"), []);
   const applying = session?.applying ?? false;
   const dirty = session?.dirty ?? false;
+  const applyBlockReason = session?.applyBlockReason;
   const lockReason = session?.lockReason;
   const mode = session?.mode ?? "immediate";
   const valid = session?.valid ?? true;
@@ -42,6 +43,7 @@ function PendingFormBridge() {
             dirty,
             lockReason,
             mode,
+            applyBlockReason,
             reset: session.reset,
             valid,
           }
@@ -50,6 +52,7 @@ function PendingFormBridge() {
       session,
       applying,
       dirty,
+      applyBlockReason,
       lockReason,
       mode,
       valid,

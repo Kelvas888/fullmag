@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
 import nextConfig, {
+  controlRoomDocsProxyTarget,
   DOCKER_DEV_WATCH_POLLING_DEFAULT_MS,
   INSTANCE_TAB_FRAME_ANCESTORS,
   instanceTabFrameSources,
@@ -32,6 +33,16 @@ describe("control-room Next dev proxy config", () => {
       source: "/",
       destination: "/workspace",
       permanent: false,
+    });
+  });
+
+  it("proxies /docs/:path* to the configured online documentation host when local static files are absent", async () => {
+    expect(controlRoomDocsProxyTarget()).toBe("https://fullmag.mzelent.pl");
+    const rewrites = await nextConfig.rewrites?.();
+    expect(Array.isArray(rewrites)).toBe(true);
+    expect(rewrites).toContainEqual({
+      source: "/docs/:path*",
+      destination: "https://fullmag.mzelent.pl/:path*",
     });
   });
 
