@@ -41,11 +41,16 @@ export function ColorValueField({
   const pickerRef = useRef<HTMLInputElement>(null);
   const themeToken = isThemeColorToken(value);
   const seedPicker = useCallback(() => {
-    const hex = swatchRef.current ? computedRgbToHex(getComputedStyle(swatchRef.current).backgroundColor) : null;
+    const hex = swatchRef.current && typeof getComputedStyle === "function"
+      ? computedRgbToHex(getComputedStyle(swatchRef.current)?.backgroundColor)
+      : null;
     if (hex && pickerRef.current) pickerRef.current.value = hex;
   }, []);
   useEffect(() => {
     seedPicker();
+    if (typeof MutationObserver !== "function" || typeof document === "undefined" || !document.documentElement) {
+      return undefined;
+    }
     const observer = new MutationObserver(seedPicker);
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     return () => observer.disconnect();
