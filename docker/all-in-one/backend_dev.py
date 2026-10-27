@@ -3558,9 +3558,8 @@ def _reject_partial_package_candidates(
     A rotation moves the package payload before the candidate marker is
     removed.  If the worker stops between those operations, the next start may
     remove that marker only after validating the current package's actual
-    receipt inventory. A complete unpublished candidate with a verified Make
-    receipt is retained while a new build proceeds. Other incomplete states
-    remain operator-visible failures. An empty owned directory is safe to remove: it is
+    receipt inventory.  Every other candidate state remains an operator-visible
+    failure.  An empty owned candidate directory is also safe to remove: it is
     the only state left by a crash after marker unlink and before ``rmdir``.
     """
 
@@ -3613,26 +3612,10 @@ def _reject_partial_package_candidates(
                 f"{entry.name}"
             )
         if len(child_entries) != 1 or child_entries[0].name != PACKAGE_CANDIDATE_MARKER:
-            receipt, _, _ = _validated_package(
-                entry, "retained backend candidate", exclude_candidate_marker=True,
+            _fail(
+                "ready backend package candidate retains payload or unknown entries: "
+                f"{entry.name}"
             )
-            _assert_direct_candidate_inventory(entry, receipt["artifacts"], include_receipt=True)
-            if marker["artifact_inventory_sha256"] != _sha256_bytes(_canonical(receipt["artifacts"])):
-                _fail("retained backend candidate inventory differs from its owner marker")
-            try:
-                attempt = _read_failed_make_attempt(build_root, entry)
-            except OSError as error:
-                _fail(f"cannot read retained backend candidate Make receipt: {error}")
-            if attempt is None or attempt[0]["state"] != "succeeded":
-                _fail("retained backend candidate has no successful Make receipt")
-            digest, log_metadata = _sha256_file(
-                entry / FAILED_MAKE_LOG_NAME, "retained Make diagnostic log", MAX_BUILD_LOG_BYTES,
-            )
-            if digest != attempt[0]["log_sha256"] or log_metadata.st_size != attempt[0]["log_size"]:
-                _fail("retained backend candidate log differs from its Make receipt")
-            _log_phase("package", "candidate-preserved", candidate=entry.name,
-                       reason="verified-unpublished-package")
-            continue
         marker_path = child_entries[0]
         marker_metadata = marker_path.lstat()
         if not stat.S_ISREG(marker_metadata.st_mode) or marker_metadata.st_nlink != 1:

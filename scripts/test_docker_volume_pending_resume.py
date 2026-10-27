@@ -306,11 +306,15 @@ class FrontendOnlyResumeTests(unittest.TestCase):
         with ExitStack() as stack:
             mocks = [stack.enter_context(patcher) for patcher in helper._patches(fixture, (b"", {}))]
             prepare = stack.enter_context(patch.object(docker_dev, "_frontend"))
+            # The exact stopped-incarnation proof and receipt repair have
+            # their own coverage in test_docker_frontend_restart.
+            recover = stack.enter_context(patch("docker_frontend_restart.recover_stopped_frontend"))
             stack.enter_context(patch.object(docker_dev, "_retained_ledger_profile", return_value={}))
             compose = stack.enter_context(patch.object(docker_dev, "compose_capture", side_effect=fixture.compose))
             docker_dev.resume(fixture.args)
             self.assertEqual(fixture.previous["state"], "succeeded")
             self.assertTrue(prepare.called)
+            recover.assert_called_once()
             mocks[-1].assert_called_once()
             self.assertEqual([call.args[1:] for call in compose.call_args_list if call.args[1:2] == ("start",)], [("start", "frontend")])
             self.assertFalse(any(event[0] == "stop" for event in fixture.events))

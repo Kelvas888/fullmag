@@ -3438,7 +3438,11 @@ class BackendPackageTests(unittest.TestCase):
                     "mutation probe",
                 )
 
-    def test_ready_candidate_payload_requires_complete_evidence_and_is_preserved(self):
+    def test_ready_candidate_payload_is_left_to_typed_retirement_and_preserved(self):
+        # The early guard never removes a ready payload. A complete candidate is
+        # rejected with the guard prefix that the typed retirement path
+        # (_qualify_ready_candidate_retirements) promotes or retires; tampered
+        # evidence fails the same way and keeps every byte for inspection.
         for mutation in (None, "payload", "marker", "log", "missing_receipt", "unknown"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 package, build_root, control, candidate, previous, _ = self._ready_rotation_fixture(
@@ -3465,15 +3469,14 @@ class BackendPackageTests(unittest.TestCase):
                 before = {path.relative_to(control): path.read_bytes()
                     for path in control.rglob("*") if path.is_file()}
                 log_before = log_path.read_bytes()
-                if mutation is None:
+                with self.assertRaises(backend.BackendBuildError) as raised:
                     backend._reject_partial_package_candidates(
                         package, control, build_root, current_package=previous,
                     )
-                else:
-                    with self.assertRaises(backend.BackendBuildError):
-                        backend._reject_partial_package_candidates(
-                            package, control, build_root, current_package=previous,
-                        )
+                if mutation is None:
+                    self.assertTrue(
+                        str(raised.exception).startswith(backend._CANDIDATE_PAYLOAD_GUARD_PREFIX)
+                    )
                 self.assertEqual(before, {path.relative_to(control): path.read_bytes()
                     for path in control.rglob("*") if path.is_file()})
                 self.assertEqual(log_path.read_bytes(), log_before)
