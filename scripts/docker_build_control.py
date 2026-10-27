@@ -37,7 +37,7 @@ CACHE_CONTROL_DOCUMENTS_PER_ATTEMPT = 6
 MIN_FREE_CONTROL_BYTES = CACHE_CONTROL_ATTEMPT_WINDOW * (
     MAX_LOG_BYTES + CACHE_CONTROL_DOCUMENTS_PER_ATTEMPT * MAX_DOCUMENT_BYTES
 )
-CACHE_ONLY_PHASES = frozenset(("toolchain", "image-dev", "image-backend"))
+CACHE_ONLY_PHASES = frozenset(("toolchain", "image-dev", "image-backend", "cache-maintenance"))
 LABEL_SCHEMA = "fullmag.build-control.v1"
 
 

@@ -279,7 +279,7 @@ def _log_phase(phase: str, state: str, **fields: object) -> None:
         pass
 
 
-def _sha256_file(path: Path, name: str, maximum: int | None = None) -> tuple[str, os.stat_result]:
+def _sha256_file(path: Path, name: str, maximum: int | None = None, *, package_artifact: bool = False) -> tuple[str, os.stat_result]:
     path = _absolute(path, name)
     descriptor = _open_regular(path, name, maximum)
     try:
@@ -295,7 +295,8 @@ def _sha256_file(path: Path, name: str, maximum: int | None = None) -> tuple[str
             if maximum is not None and total > maximum:
                 _fail(f"{name} exceeds its size bound")
         after = os.fstat(descriptor)
-        if _file_signature(before) != _file_signature(after):
+        signature = _package_file_signature if package_artifact else _file_signature
+        if signature(before) != signature(after):
             _fail(f"{name} changed while hashing")
         return digest.hexdigest(), before
     finally:
@@ -310,6 +311,16 @@ def _file_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def _package_file_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    # link/unlink in another group changes ctime, not sealed package bytes.
+    # Keep mode in this signature and still verify content against the receipt.
+    # Source files and writable metadata keep the strict ctime-based signature.
+    if stat.S_ISREG(metadata.st_mode) and not metadata.st_mode & 0o222:
+        return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+                metadata.st_mtime_ns, metadata.st_mode)
+    return _file_signature(metadata)
 
 
 def _absolute(path: Path, name: str) -> Path:
@@ -2006,6 +2017,17 @@ def _dev_cuda_architectures() -> str | None:
     return ";".join(f"{value}-real" for value in capabilities)
 
 
+def _cargo_home(build_root: Path) -> str:
+    value = os.environ.get("FULLMAG_SHARED_CARGO_HOME", "")
+    if not value:
+        return str(build_root / "cargo")
+    if value != "/opt/fullmag/shared-cargo":
+        _fail("shared Cargo cache must use the managed named-volume target")
+    _assert_no_links(Path(value), "shared Cargo cache")
+    _ensure_directory(Path(value), "shared Cargo cache")
+    return value
+
+
 def _build_environment(
     workspace: Path, build_root: Path, native: Mapping[str, Any], jobs: int,
     cargo_profile: str = BACKEND_CARGO_PROFILE,
@@ -2045,7 +2067,7 @@ def _build_environment(
             "CARGO_TARGET_DIR": "/workspace/.fullmag-build/cargo-targets/direct",
             "FULLMAG_CARGO_TARGET_ROOT": "/workspace/.fullmag-build/cargo-targets",
             "CARGO_TARGET_ROOT": "/workspace/.fullmag-build/cargo-targets",
-            "CARGO_HOME": str(build_root / "cargo"),
+            "CARGO_HOME": _cargo_home(build_root),
             "RUSTUP_HOME": "/root/.rustup",
             "RUSTUP_TOOLCHAIN": "nightly",
             "RUSTUP_AUTO_INSTALL": "0",
@@ -2077,6 +2099,8 @@ def _build_environment(
         }
     )
     if cargo_profile == BACKEND_CARGO_PROFILE:
+        environment.pop("FULLMAG_CUDA_ARCHITECTURES", None)
+        environment.pop("FULLMAG_FDM_CUDA_ARCHITECTURES", None)
         architectures = _dev_cuda_architectures()
         if architectures is not None:
             # FEM reads FULLMAG_CUDA_ARCHITECTURES; FDM has its own variable so
@@ -2116,7 +2140,7 @@ def _hash_package(root: Path) -> list[dict[str, Any]]:
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             _fail(f"built package contains an unsafe output: {path}")
-        digest, _ = _sha256_file(path, f"built package {path}", MAX_SOURCE_BYTES)
+        digest, _ = _sha256_file(path, f"built package {path}", MAX_SOURCE_BYTES, package_artifact=True)
         records.append(
             {
                 "path": path.relative_to(root).as_posix(),
@@ -2158,7 +2182,7 @@ def _package_children(
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 _fail(f"{name} candidate owner marker is not one regular file")
             continue
-        children[child.name] = _file_signature(metadata)
+        children[child.name] = _package_file_signature(metadata)
     return children
 
 
@@ -2383,7 +2407,17 @@ def _package_matches_fresh_live_manifest(
     if receipt.get("toolchain") != dict(toolchain):
         return False
     expected_build = _expected_backend_build_identity(cargo_profile)
-    return all(build.get(field) == expected_build[field] for field in BACKEND_BUILD_IDENTITY_FIELDS)
+    if not all(build.get(field) == expected_build[field] for field in BACKEND_BUILD_IDENTITY_FIELDS):
+        return False
+    if os.environ.get("FULLMAG_SHARED_BACKEND_STORE"):
+        import backend_shared_store as shared
+        architectures = _dev_cuda_architectures()
+        expected_key = shared.key_for(_shared_package_identity(manifest_path, toolchain, architectures))
+        binding = receipt.get("shared_package", {})
+        return (isinstance(binding, dict) and binding.get("schema") == shared.SCHEMA
+                and binding.get("key") == expected_key
+                and build.get("cuda_architectures") == architectures)
+    return True
 
 
 def _rename_package_child(source_root: Path, target_root: Path, name: str, label: str) -> None:
@@ -3464,6 +3498,14 @@ def _validate_candidate_marker(
     }
     if document.get("state") == "ready":
         required.add("artifact_inventory_sha256")
+    if "shared_restore" in document:
+        intent = document["shared_restore"]
+        if (document.get("state") != "building" or not isinstance(intent, dict)
+                or set(intent) not in ({"key", "artifacts"}, {"key", "artifacts", "diagnostics"})
+                or not isinstance(intent.get("key"), str) or not SHA256_RE.fullmatch(intent["key"])
+                or not isinstance(intent.get("artifacts"), list) or not intent["artifacts"]):
+            _fail("backend shared restore intent is invalid")
+        required.add("shared_restore")
     if set(document) != required:
         _fail("backend package candidate owner marker has unexpected fields")
     if (
@@ -3496,6 +3538,7 @@ def _write_candidate_marker(
     *,
     state: str,
     records: list[dict[str, Any]] | None = None,
+    shared_restore: dict[str, Any] | None = None,
 ) -> None:
     document: dict[str, Any] = {
         "schema": PACKAGE_CANDIDATE_SCHEMA,
@@ -3505,6 +3548,10 @@ def _write_candidate_marker(
         "build_root": str(_absolute(build_root, "backend build root")),
         "cargo_profile": BACKEND_CARGO_PROFILE,
     }
+    if shared_restore is not None:
+        if state != "building":
+            _fail("shared restore intent is reserved for building candidates")
+        document["shared_restore"] = shared_restore
     if records is not None:
         document["artifact_inventory_sha256"] = _sha256_bytes(_canonical(records))
     _write_json(
@@ -3513,6 +3560,22 @@ def _write_candidate_marker(
         "backend package candidate owner marker",
     )
     _fsync_directory(candidate, "backend package candidate directory")
+
+
+def _remove_shared_candidate(candidate: Path) -> None:
+    """Delete a qualified shared restore with its durable intent removed last."""
+    files, directories = _stage_tree_inventory(candidate)
+    for relative in sorted(files - {PACKAGE_CANDIDATE_MARKER}, reverse=True):
+        (candidate / relative).unlink()
+    for relative in sorted(directories, key=lambda item: (item.count("/"), item), reverse=True):
+        directory = candidate / relative
+        _fsync_directory(directory, "shared candidate directory before removal")
+        directory.rmdir()
+    _fsync_directory(candidate, "shared candidate payload removal")
+    (candidate / PACKAGE_CANDIDATE_MARKER).unlink()
+    _fsync_directory(candidate, "shared candidate marker removal")
+    candidate.rmdir()
+    _fsync_directory(candidate.parent, "shared candidate namespace")
 
 
 def _discard_interrupted_building_candidate(
@@ -3537,8 +3600,12 @@ def _discard_interrupted_building_candidate(
         except (BackendBuildError, OSError):
             # The attempt record stays as found; it never blocks a new build.
             pass
-    _remove_owned_tree(candidate)
-    _fsync_directory(candidate.parent, "backend package candidate directory")
+    marker, _ = _read_json(_candidate_marker_path(candidate), "candidate cleanup marker", 16 * 1024)
+    if "shared_restore" in marker:
+        _remove_shared_candidate(candidate)
+    else:
+        _remove_owned_tree(candidate)
+        _fsync_directory(candidate.parent, "backend package candidate directory")
     _log_phase("package", "candidate-discarded", reason="interrupted-build")
     return True
 
@@ -3908,9 +3975,49 @@ def _known_failed_candidate_path(relative: str) -> bool:
     )
 
 
+def _shared_restore_inventory_is_known(candidate: Path, intent: Mapping[str, Any]) -> bool:
+    """Qualify only the receipt-bound links of an interrupted shared restore."""
+    try:
+        import backend_shared_store as shared
+        records = intent["artifacts"]
+        diagnostics = intent.get("diagnostics", [])
+        if not isinstance(diagnostics, list):
+            return False
+        artifact_paths = {record["path"] for record in records}
+        paths = {}
+        for record in [*records, *diagnostics]:
+            relative = shared._relative(record["path"])
+            if not _known_failed_candidate_path(str(relative)) or str(relative) in paths:
+                return False
+            paths[str(relative)] = record
+        allowed_files = set(paths) | {PACKAGE_CANDIDATE_MARKER, "backend-build-receipt.json"}
+        allowed_directories = {str(parent) for name in paths
+            for parent in PurePosixPath(name).parents if str(parent) != "."}
+        actual_files, actual_directories = _stage_tree_inventory(candidate)
+        if actual_files - allowed_files or actual_directories - allowed_directories:
+            return False
+        for relative in actual_files:
+            path = candidate / relative
+            if relative in paths:
+                if relative not in artifact_paths and path.lstat().st_nlink != 1:
+                    return False
+                shared._verify(path, paths[relative], sealed=relative in artifact_paths)
+            elif path.lstat().st_nlink != 1:
+                return False
+        return True
+    except (BackendBuildError, shared.StoreError, OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def _failed_candidate_inventory_is_known(candidate: Path) -> bool:
     """Accept only bounded, marker-owned Make output for failure cleanup."""
 
+    try:
+        marker, _ = _read_json(_candidate_marker_path(candidate), "candidate recovery intent", 16 * 1024)
+        if "shared_restore" in marker:
+            return _shared_restore_inventory_is_known(candidate, marker["shared_restore"])
+    except (BackendBuildError, OSError):
+        return False
     allowed_files = {
         PACKAGE_CANDIDATE_MARKER,
         "direct-backend-build.log",
@@ -4250,8 +4357,12 @@ def _discard_failed_candidate_if_owned(
             return False
         if attempt is not None:
             _prune_failed_make_logs(build_root, package_root)
-        _remove_owned_tree(candidate)
-        _fsync_directory(candidate.parent, "backend package candidate directory")
+        marker, _ = _read_json(_candidate_marker_path(candidate), "candidate cleanup marker", 16 * 1024)
+        if "shared_restore" in marker:
+            _remove_shared_candidate(candidate)
+        else:
+            _remove_owned_tree(candidate)
+            _fsync_directory(candidate.parent, "backend package candidate directory")
         return True
     except (BackendBuildError, OSError):
         return False
@@ -4666,6 +4777,100 @@ def _run_canonical_make(command: list[str], workspace: Path, environment: Mappin
             duration_ms=round((time.monotonic() - started) * 1000),
         )
         _fail(f"cannot execute canonical Make target: {error}")
+
+
+def _shared_package_identity(manifest: Path, toolchain: Mapping[str, Any], architectures: str | None) -> dict[str, Any]:
+    document, _ = _read_json(manifest, "shared package source manifest", 64 * 1024 * 1024)
+    capsule, native, _, _ = _validate_live_manifest(document)
+    # The commit and native snapshot are compiled into fullmag-build-info.
+    # Never relabel a package from another commit as a newly compiled binary.
+    helpers = {}
+    for name in ("backend_dev.py", "backend_source.py", "backend_shared_store.py", "backend_shared_recovery.py"):
+        helpers[name] = _sha256_file(Path(__file__).with_name(name), "trusted builder helper")[0]
+    return {
+        "runtime_source_digest": _runtime_source_digest(capsule),
+        "resolved_commit": capsule["resolved_commit"],
+        "native_source_identity": native,
+        "toolchain": dict(toolchain),
+        "build": {**_expected_backend_build_identity(BACKEND_CARGO_PROFILE),
+                  "cuda_architectures": architectures},
+        "builder_helpers": helpers,
+        "compiler_environment": {key: os.environ.get(key, "") for key in (
+            "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CFLAGS", "CXXFLAGS", "CPPFLAGS",
+            "LDFLAGS", "CMAKE_BUILD_TYPE", "CUDAHOSTCXX", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS",
+        )},
+    }
+
+
+def _prepare_with_shared_package(args, build_root, output, jobs, toolchain, direct_install_root):
+    configured = os.environ.get("FULLMAG_SHARED_BACKEND_STORE", "")
+    if not configured:
+        return _prepare_locked(args, build_root, output, jobs, toolchain, direct_install_root)
+    import backend_shared_store as shared
+    if configured != str(shared.ROOT) or direct_install_root != output:
+        _fail("shared packages require the fixed managed volume and direct candidate")
+    architectures = _dev_cuda_architectures()
+    identity = _shared_package_identity(Path(args.manifest), toolchain, architectures)
+    try:
+        store = shared.Store(Path(configured))
+        alias = store.private_alias(PACKAGE_ROOT, output, os.environ.get("FULLMAG_SHARED_BACKEND_GROUP", ""))
+        _log_phase("shared-package", "waiting", key=shared.key_for(identity))
+        with store.claim(identity) as entry:
+            cached = entry.read()
+            if cached is not None:
+                producer = cached["receipt"]
+                if (not _package_matches_fresh_live_manifest(producer, Path(args.manifest), toolchain, BACKEND_CARGO_PROFILE)
+                        or producer.get("build", {}).get("cuda_architectures") != architectures):
+                    _fail("shared package receipt does not match its build inputs")
+                _validate_candidate_marker(output, PACKAGE_ROOT, build_root, state="building")
+                _assert_direct_candidate_empty_for_make(output)
+                _write_candidate_marker(output, PACKAGE_ROOT, build_root, state="building",
+                    shared_restore={"key": entry.key, "artifacts": producer["artifacts"]})
+                entry.restore(alias, cached)
+                document, raw = _read_json(Path(args.manifest), "shared package consumer manifest", 64 * 1024 * 1024)
+                capsule, native, _, live_hash = _validate_live_manifest(document)
+                receipt = dict(producer)
+                receipt["operation"] = "direct-compose-cache-reuse"
+                receipt["source"] = {
+                    "manifest_sha256": _sha256_bytes(raw), "source_mode": LIVE_SOURCE_MODE,
+                    "source_snapshot_sha256": native["source_snapshot_sha256"],
+                    "source_digest": capsule["source_digest"],
+                    "runtime_source_digest": _runtime_source_digest(capsule),
+                    "resolved_commit": capsule["resolved_commit"], "live_manifest_sha256": live_hash,
+                }
+                receipt["shared_package"] = {"schema": shared.SCHEMA, "key": entry.key,
+                    "producer_receipt_sha256": _sha256_bytes(shared.canonical(producer)),
+                    "inputs": identity, "reuse": "verified-hardlinks"}
+                records = _hash_package(output)
+                if records != producer["artifacts"]:
+                    _fail("shared package differs after linking")
+                _write_json(output / "backend-build-receipt.json", receipt, "shared package consumer receipt")
+                _assert_direct_candidate_inventory(output, records, include_receipt=True)
+                _write_candidate_marker(output, PACKAGE_ROOT, build_root, state="ready", records=records)
+                _log_phase("shared-package", "hit", key=entry.key)
+                return 0
+            # Freeze the probed architecture for the actual compiler invocation.
+            previous = os.environ.get(DEV_CUDA_ARCHITECTURES_ENV)
+            os.environ[DEV_CUDA_ARCHITECTURES_ENV] = architectures or "all"
+            try:
+                result = _prepare_locked(args, build_root, output, jobs, toolchain, direct_install_root)
+            finally:
+                if previous is None:
+                    os.environ.pop(DEV_CUDA_ARCHITECTURES_ENV, None)
+                else:
+                    os.environ[DEV_CUDA_ARCHITECTURES_ENV] = previous
+            if result == 0:
+                receipt, _, _ = _validated_package(output, "shared package publisher", exclude_candidate_marker=True)
+                if receipt["build"].get("cuda_architectures") != architectures:
+                    _fail("published CUDA target differs from shared build key")
+                receipt["shared_package"] = {"schema": shared.SCHEMA, "key": entry.key,
+                    "inputs": identity, "reuse": "publisher"}
+                _write_json(output / "backend-build-receipt.json", receipt, "shared package producer receipt")
+                entry.publish(alias, receipt)
+                _log_phase("shared-package", "published", key=entry.key)
+            return result
+    except shared.StoreError as error:
+        _fail(str(error))
 
 
 def _prepare_locked(
@@ -5101,6 +5306,9 @@ def _start(args: argparse.Namespace) -> int:
                 build_root,
                 previous_receipt,
             )
+            if os.environ.get("FULLMAG_SHARED_BACKEND_STORE"):
+                import backend_shared_recovery
+                backend_shared_recovery.recover_ready(sys.modules[__name__], output, control_root, build_root)
             ready_retirements = _qualify_ready_candidate_retirements(
                 output,
                 control_root,
@@ -5154,7 +5362,7 @@ def _start(args: argparse.Namespace) -> int:
                     state="building",
                 )
                 try:
-                    result = _prepare_locked(
+                    result = _prepare_with_shared_package(
                         start_args,
                         build_root,
                         candidate,
@@ -5631,6 +5839,34 @@ def _serve(extra: list[str]) -> int:
     return 0
 
 
+def _maintain_packages(args) -> int:
+    """Explicit maintenance: preserve current/direct rollback, never gate startup."""
+    if args.max_shared_entries < 0 or args.max_shared_bytes < 0:
+        _fail("shared cache limits must be nonnegative")
+    output, build_root = PACKAGE_ROOT, BUILD_ROOT
+    with _runtime_build_lock(build_root):
+        control = _ensure_package_development_root(output)
+        if (control / PACKAGE_ROTATION_JOURNAL_NAME).exists():
+            _fail("package rotation is pending; retention refused")
+        receipt, raw, _ = _validated_package(output, "current backend package", exclude_development_control=True)
+        _retain_package_backups(output, control, receipt, raw)
+        shared_result = None
+        configured = os.environ.get("FULLMAG_SHARED_BACKEND_STORE", "")
+        if configured:
+            import backend_shared_store as shared
+            if configured != str(shared.ROOT):
+                _fail("shared package maintenance requires the fixed managed volume")
+            try:
+                shared_result = shared.Store(Path(configured)).collect(
+                    max_entries=args.max_shared_entries, max_bytes=args.max_shared_bytes)
+            except shared.StoreError as error:
+                _fail(str(error))
+        print(json.dumps({"schema": "fullmag.package-maintenance.v1", "state": "succeeded",
+                  "current_receipt_sha256": _sha256_bytes(raw),
+                  "retained": ["current", "direct-rollback"], "shared_cache": shared_result}, sort_keys=True))
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="operation", required=True)
@@ -5665,6 +5901,9 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--output", default=PACKAGE_ROOT, type=Path)
     start.add_argument("--build-root", default=BUILD_ROOT, type=Path)
     start.add_argument("--jobs", default=int(os.environ.get("CARGO_BUILD_JOBS", "2")), type=int)
+    maintenance = subparsers.add_parser("maintain-packages", help="retain current/direct rollback and bound shared package cache")
+    maintenance.add_argument("--max-shared-entries", type=int, default=8)
+    maintenance.add_argument("--max-shared-bytes", type=int, default=64 * 1024**3)
     subparsers.add_parser("serve", help="serve the receipt-validated package")
     return parser
 
@@ -5681,6 +5920,10 @@ def main(argv: list[str] | None = None) -> int:
             if extra:
                 parser.error(f"unexpected arguments for start: {' '.join(extra)}")
             return _start(args)
+        if args.operation == "maintain-packages":
+            if extra:
+                parser.error("unexpected package-maintenance arguments")
+            return _maintain_packages(args)
         return _serve(extra)
     except BackendBuildError as error:
         print(f"backend-dev: {error}", file=sys.stderr)

@@ -449,3 +449,14 @@ worktree na innej głębokości, odmowę legacy/env/junction przed zapisem, reus
 profilu z blokadą, obowiązkowy stan po awarii, Windows Docker Desktop, Linux
 ext4/mount guard oraz różnicę inventory przed i po ręcznie uruchomionej recepcie
 `just`.
+
+## Wspólne zasoby grup Docker DEV
+
+Nowe rendery launchera współdzielą named volumes projektu dla Cargo registry/git,
+store pnpm i niezmiennych pakietów backendu. Zasady zgodności, blokady, recovery,
+retencję i migrację opisuje [shared build storage](shared-build-storage.md).
+Control, ledger, user storage i mutowalne katalogi kompilacji pozostają w swoich
+poprzednich granicach. Przy domykaniu zadania nie usuwaj wolumenu `fullmag-shared-*`;
+prywatny pakiet nowej grupy jest katalogiem `groups/<unit_key>`, a nie całym wolumenem.
+Wykonaj kwalifikowaną retencję przed zakończeniem etapu. Samo usunięcie worktree
+nie jest dowodem zwolnienia danych Docker.
